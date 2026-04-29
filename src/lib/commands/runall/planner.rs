@@ -459,7 +459,7 @@ impl Runall {
                 stages.push(StageSpec::MiAssign);
                 stages.push(StageSpec::Consensus {
                     factory: consensus_factory,
-                    call_overlapping_bases: self.consensus_opts.consensus_call_overlapping_bases,
+                    call_overlapping_bases: self.resolved_call_overlapping_bases(),
                 });
                 let filter_stats_state = if self.stop_after == StopAfter::Filter {
                     let (spec, state) = self.filter_stage_spec_with_stats(explain)?;
@@ -697,7 +697,7 @@ impl Runall {
             StageSpec::MiAssign,
             StageSpec::Consensus {
                 factory: consensus_factory,
-                call_overlapping_bases: self.consensus_opts.consensus_call_overlapping_bases,
+                call_overlapping_bases: self.resolved_call_overlapping_bases(),
             },
         ];
         let filter_stats_state = if self.stop_after == StopAfter::Filter {
@@ -800,7 +800,7 @@ impl Runall {
             StageSpec::MiAssign,
             StageSpec::Consensus {
                 factory: consensus_factory,
-                call_overlapping_bases: self.consensus_opts.consensus_call_overlapping_bases,
+                call_overlapping_bases: self.resolved_call_overlapping_bases(),
             },
         ];
         let filter_stats_state = if self.stop_after == StopAfter::Filter {

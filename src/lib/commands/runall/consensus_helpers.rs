@@ -113,6 +113,23 @@ impl Runall {
         let opts = self.build_consensus_factory_options(header);
         self.consensus_mode.build_factory(&opts)
     }
+
+    /// Whether the consensus stage should run overlapping-bases correction.
+    ///
+    /// CODEC mode never runs overlapping-bases correction in standalone
+    /// `fgumi codec` (see the `// CODEC does not support overlapping
+    /// consensus` comment in `commands/codec.rs`), so the runall plan must
+    /// also disable it whenever `--consensus codec` is selected — even if
+    /// `--consensus::call-overlapping-bases` is left at its default `true`.
+    /// For simplex/duplex modes, honor the user-facing flag.
+    pub(crate) fn resolved_call_overlapping_bases(&self) -> bool {
+        match self.consensus_mode {
+            ConsensusMode::Codec => false,
+            ConsensusMode::Simplex | ConsensusMode::Duplex => {
+                self.consensus_opts.consensus_call_overlapping_bases
+            }
+        }
+    }
 }
 
 /// Per-mode inputs for constructing a [`CallerFactory`], decoupled from the

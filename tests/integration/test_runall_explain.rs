@@ -280,6 +280,110 @@ fn runall_explain_stop_after_consensus_omits_filter() {
     }
 }
 
+/// Regression: `--consensus codec` must disable overlapping-bases consensus
+/// correction in the plan, matching standalone `fgumi codec` (which always
+/// disables it; see the `// CODEC does not support overlapping consensus`
+/// comment in `commands/codec.rs`).
+///
+/// Pre-fix: the planner unconditionally forwarded
+/// `self.consensus_opts.consensus_call_overlapping_bases` (default `true`)
+/// into `StageSpec::Consensus { call_overlapping_bases }` for every
+/// `ConsensusMode`, so a `runall --consensus codec` plan ran
+/// overlapping-bases correction that standalone codec never runs. Downstream
+/// effect: filter pass-through counts diverged dramatically (e.g.
+/// 8,051 vs. 264 records on a fixed input). The fix forces
+/// `call_overlapping_bases = false` whenever `consensus_mode == Codec`.
+///
+/// Covers all three planner call sites:
+///   * `plan_from_extract` -> `append_tail_from_unmapped_bam`
+///   * `plan_from_sort`
+///   * `plan_from_group`
+#[test]
+fn runall_explain_consensus_codec_disables_overlapping_bases() {
+    let cases: &[(&str, &str)] = &[("group", ""), ("sort", "ref"), ("extract", "extract")];
+
+    for &(start_from, profile) in cases {
+        let output_path =
+            scratch_output(&format!("codec_disables_overlap_{start_from}").replace('-', "_"));
+        let _ = std::fs::remove_file(&output_path);
+        let _ = std::fs::remove_file(output_path.with_extension("bam.tmp"));
+
+        let mut cmd = Command::new(fgumi_bin());
+        cmd.args(["runall", "--explain", "--start-from", start_from])
+            .args(["--consensus", "codec"]);
+
+        match profile {
+            "extract" => {
+                cmd.args(["--input", "r1.fq", "r2.fq"])
+                    .args(["--extract::sample", "s"])
+                    .args(["--extract::library", "l"])
+                    .args(["--extract::read-structures", "8M+T", "8M+T"])
+                    .args(["--reference", "ignored.fa"]);
+            }
+            "ref" => {
+                cmd.args(["--input", "ignored.bam"]).args(["--reference", "ignored.fa"]);
+            }
+            _ => {
+                cmd.args(["--input", "ignored.bam"]);
+            }
+        }
+        cmd.arg("--output").arg(&output_path);
+
+        let output = cmd.output().expect("spawn");
+        assert!(
+            output.status.success(),
+            "--explain failed for --start-from {start_from} --consensus codec: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+        assert!(
+            stdout.contains("call overlapping bases: false"),
+            "--consensus codec must plan with overlapping-bases disabled \
+             (--start-from {start_from}); got:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("call overlapping bases: true"),
+            "--consensus codec must not enable overlapping-bases anywhere in the plan \
+             (--start-from {start_from}); got:\n{stdout}"
+        );
+
+        assert_no_output_files(&output_path);
+    }
+}
+
+/// Companion to the codec regression above: simplex (the default) must keep
+/// overlapping-bases consensus correction enabled, so the codec-only fix does
+/// not silently disable it everywhere.
+#[test]
+fn runall_explain_consensus_simplex_keeps_overlapping_bases_enabled() {
+    let output_path = scratch_output("simplex_keeps_overlap_enabled");
+    let _ = std::fs::remove_file(&output_path);
+    let _ = std::fs::remove_file(output_path.with_extension("bam.tmp"));
+
+    let output = Command::new(fgumi_bin())
+        .args(["runall", "--explain", "--start-from", "group"])
+        .args(["--consensus", "simplex"])
+        .args(["--input", "ignored.bam"])
+        .arg("--output")
+        .arg(&output_path)
+        .output()
+        .expect("spawn");
+    assert!(
+        output.status.success(),
+        "--explain failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(
+        stdout.contains("call overlapping bases: true"),
+        "--consensus simplex must default to overlapping-bases enabled; got:\n{stdout}"
+    );
+
+    assert_no_output_files(&output_path);
+}
+
 /// Regression: `--start-from group --stop-after group` must produce a plan
 /// that writes the grouped BAM via `BgzfCompress` and stops, without
 /// reaching `Consensus` or `Filter`. Mirrors the analogous early-exit arm
