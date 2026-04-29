@@ -16,7 +16,11 @@ use anyhow::{Context, Result};
 /// Header written by [`PipelineStats::write_tsv`] and asserted by metrics-
 /// output tests. Single source of truth so format drift surfaces as a test
 /// failure rather than a silent schema divergence.
-pub const METRICS_TSV_HEADER: &str = "stage\twall_time_secs\trecords_in\trecords_out";
+pub const METRICS_TSV_HEADER: &str =
+    "stage\tkind\twall_time_secs\trecords_in\trecords_out\tbp_in\tbp_out\tseq_busy";
+
+/// Header written by [`PipelineStats::write_queue_tsv`].
+pub const QUEUES_TSV_HEADER: &str = "queue_idx\tempty_samples\tmax_depth\tmax_bytes";
 
 /// Shared across all workers and the driver. Atomic counters, no locks.
 pub struct PipelineStats {
@@ -65,8 +69,33 @@ pub struct PipelineStats {
     /// (proxy for starvation; sampled by backpressure refresh).
     queue_empty_samples: Vec<AtomicU64>,
 
+    /// Per-queue: the maximum number of items observed in the queue at
+    /// any single sample. Tracks contention/backup independent of empty
+    /// samples — a queue that is full half the time but never empty
+    /// has `queue_empty_samples=0` but a high `queue_max_depth`.
+    queue_max_depth: Vec<AtomicU64>,
+    /// Per-queue: the maximum number of bytes observed held in the queue
+    /// at any single sample.
+    queue_max_bytes: Vec<AtomicU64>,
+
     /// Count of drain-mode activations across all workers.
     drain_mode_activations: AtomicU64,
+
+    /// Per-special-stage wall-time in nanoseconds, keyed by name.
+    /// Populated by the driver around `SpecialStage::run_erased`. Special
+    /// stages have their own threads, so wall time is a single
+    /// total-elapsed measurement (start to finish), not an accumulated
+    /// busy-time. Stored with their name so consumers can join with the
+    /// pool-stage rows in TSV output.
+    special_stage_wall_ns: std::sync::Mutex<Vec<(String, u64)>>,
+    /// Per-special-stage records-in observed by the driver. Counted at
+    /// the wrapping queue layer (one increment per item entering the
+    /// stage's input queue while the special is consuming).
+    special_stage_records_in: std::sync::Mutex<Vec<(String, u64)>>,
+    /// Per-special-stage records-out observed by the driver. Counted at
+    /// the wrapping queue layer (one increment per item the special
+    /// stage emits to its output queue).
+    special_stage_records_out: std::sync::Mutex<Vec<(String, u64)>>,
 }
 
 impl PipelineStats {
@@ -90,8 +119,63 @@ impl PipelineStats {
             worker_step_count,
             worker_eager_count: mk_vec(num_workers),
             queue_empty_samples: mk_vec(num_queues),
+            queue_max_depth: mk_vec(num_queues),
+            queue_max_bytes: mk_vec(num_queues),
             drain_mode_activations: AtomicU64::new(0),
             stage_names: (0..num_stages).map(|_| String::new()).collect(),
+            special_stage_wall_ns: std::sync::Mutex::new(Vec::new()),
+            special_stage_records_in: std::sync::Mutex::new(Vec::new()),
+            special_stage_records_out: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Record the total wall-time spent in a SpecialStage's `run_erased`
+    /// call. Called once per Special stage, by the driver, after the
+    /// stage's thread has joined.
+    pub fn record_special_stage_wall(&self, name: &str, elapsed: Duration) {
+        let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        let mut lock = self.special_stage_wall_ns.lock().unwrap();
+        lock.push((name.to_string(), ns));
+    }
+
+    /// Record records_in for a Special stage (typically incremented once
+    /// per item the wrapping queue consumed during the stage's lifetime).
+    pub fn record_special_stage_records_in(&self, name: &str, count: u64) {
+        let mut lock = self.special_stage_records_in.lock().unwrap();
+        lock.push((name.to_string(), count));
+    }
+
+    /// Record records_out for a Special stage.
+    pub fn record_special_stage_records_out(&self, name: &str, count: u64) {
+        let mut lock = self.special_stage_records_out.lock().unwrap();
+        lock.push((name.to_string(), count));
+    }
+
+    /// Update the high-water mark for a queue's depth (item count) and
+    /// memory bytes. Called by `QueueSummary::summarize`-style code.
+    pub fn record_queue_depth_sample(&self, queue_idx: usize, depth: u64, bytes: u64) {
+        if queue_idx < self.queue_max_depth.len() {
+            // Atomic monotonic max via fetch_update.
+            let prev = self.queue_max_depth[queue_idx].load(Ordering::Relaxed);
+            if depth > prev {
+                let _ = self.queue_max_depth[queue_idx].compare_exchange(
+                    prev,
+                    depth,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
+        }
+        if queue_idx < self.queue_max_bytes.len() {
+            let prev = self.queue_max_bytes[queue_idx].load(Ordering::Relaxed);
+            if bytes > prev {
+                let _ = self.queue_max_bytes[queue_idx].compare_exchange(
+                    prev,
+                    bytes,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
         }
     }
 
@@ -262,6 +346,7 @@ impl PipelineStats {
         writeln!(w, "{METRICS_TSV_HEADER}")
             .with_context(|| format!("failed to write metrics TSV header to {}", path.display()))?;
 
+        // Pool-stage rows: one per stage in the pool stats arrays.
         #[allow(clippy::cast_precision_loss)]
         for i in 0..self.num_stages {
             let name = stage_names.get(i).copied().unwrap_or("?");
@@ -269,12 +354,62 @@ impl PipelineStats {
             let wall_time_secs = ns as f64 / 1_000_000_000.0;
             let records_in = self.step_records_in[i].load(Ordering::Relaxed);
             let records_out = self.step_records_out[i].load(Ordering::Relaxed);
-            writeln!(w, "{name}\t{wall_time_secs:.3}\t{records_in}\t{records_out}").with_context(
-                || format!("failed to write metrics TSV row to {}", path.display()),
-            )?;
+            let bp_in = self.step_bp_input[i].load(Ordering::Relaxed);
+            let bp_out = self.step_bp_output[i].load(Ordering::Relaxed);
+            let seq_busy = self.step_seq_busy[i].load(Ordering::Relaxed);
+            writeln!(
+                w,
+                "{name}\tpool\t{wall_time_secs:.3}\t{records_in}\t{records_out}\t{bp_in}\t{bp_out}\t{seq_busy}"
+            )
+            .with_context(|| format!("failed to write metrics TSV row to {}", path.display()))?;
+        }
+
+        // Special-stage rows: one per recorded special run.
+        #[allow(clippy::cast_precision_loss)]
+        {
+            let walls = self.special_stage_wall_ns.lock().unwrap();
+            let ins = self.special_stage_records_in.lock().unwrap();
+            let outs = self.special_stage_records_out.lock().unwrap();
+            for (i, (name, ns)) in walls.iter().enumerate() {
+                let wall_time_secs = (*ns as f64) / 1_000_000_000.0;
+                let records_in = ins.get(i).map(|x| x.1).unwrap_or(0);
+                let records_out = outs.get(i).map(|x| x.1).unwrap_or(0);
+                writeln!(
+                    w,
+                    "{name}\tspecial\t{wall_time_secs:.3}\t{records_in}\t{records_out}\t0\t0\t0"
+                )
+                .with_context(|| format!("failed to write metrics TSV row to {}", path.display()))?;
+            }
         }
 
         w.flush().with_context(|| format!("failed to flush metrics TSV to {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Write per-queue stats as a tab-separated file:
+    /// `queue_idx\tempty_samples\tmax_depth\tmax_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be created or written.
+    pub fn write_queue_tsv<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        let file = File::create(path)
+            .with_context(|| format!("failed to create queues TSV at {}", path.display()))?;
+        let mut w = BufWriter::new(file);
+        writeln!(w, "{QUEUES_TSV_HEADER}")
+            .with_context(|| format!("failed to write queues TSV header to {}", path.display()))?;
+
+        for i in 0..self.queue_empty_samples.len() {
+            let empty = self.queue_empty_samples[i].load(Ordering::Relaxed);
+            let max_depth = self.queue_max_depth[i].load(Ordering::Relaxed);
+            let max_bytes = self.queue_max_bytes[i].load(Ordering::Relaxed);
+            writeln!(w, "{i}\t{empty}\t{max_depth}\t{max_bytes}").with_context(|| {
+                format!("failed to write queues TSV row to {}", path.display())
+            })?;
+        }
+
+        w.flush().with_context(|| format!("failed to flush queues TSV to {}", path.display()))?;
         Ok(())
     }
 }
@@ -316,22 +451,26 @@ mod tests {
         assert_eq!(lines[0], METRICS_TSV_HEADER);
         assert_eq!(lines.len(), 4, "header + 3 stages");
 
+        // Row format: stage, kind, wall_time_secs, records_in, records_out, bp_in, bp_out, seq_busy
         let row_a: Vec<&str> = lines[1].split('\t').collect();
         assert_eq!(row_a[0], "StageA");
-        assert_eq!(row_a[2], "10");
-        assert_eq!(row_a[3], "10");
-        let secs_a: f64 = row_a[1].parse().unwrap();
+        assert_eq!(row_a[1], "pool");
+        let secs_a: f64 = row_a[2].parse().unwrap();
         assert!(secs_a >= 0.5 - 1e-6, "wall time should be ~0.5s, got {secs_a}");
+        assert_eq!(row_a[3], "10");
+        assert_eq!(row_a[4], "10");
 
         let row_b: Vec<&str> = lines[2].split('\t').collect();
         assert_eq!(row_b[0], "StageB");
-        assert_eq!(row_b[2], "10");
-        assert_eq!(row_b[3], "5");
+        assert_eq!(row_b[1], "pool");
+        assert_eq!(row_b[3], "10");
+        assert_eq!(row_b[4], "5");
 
         let row_c: Vec<&str> = lines[3].split('\t').collect();
         assert_eq!(row_c[0], "StageC");
-        assert_eq!(row_c[2], "0");
+        assert_eq!(row_c[1], "pool");
         assert_eq!(row_c[3], "0");
+        assert_eq!(row_c[4], "0");
     }
 
     #[test]

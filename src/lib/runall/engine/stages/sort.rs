@@ -45,7 +45,6 @@
 
 use std::path::PathBuf;
 
-use anyhow::Context;
 use noodles::sam::Header;
 
 use crate::runall::engine::cancel::CancelToken;
@@ -174,24 +173,26 @@ impl SpecialStage for SortStage {
         cancel: CancelToken,
     ) -> anyhow::Result<()> {
         // Phase 1: accumulate.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1024);
+        //
+        // Drainer forwards whole batch buffers (already length-prefixed by the
+        // upstream `SerializedBatch` framing) directly. The receiver flattens
+        // each batch into per-record `Vec<u8>` via `iter_length_prefixed` so
+        // the sort buffer still owns each record. Eliminates ~Nrec channel
+        // sends + the per-record drainer copy that the prior implementation
+        // performed before sending.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
 
         let cancel_for_drainer = cancel.clone();
         let drainer = std::thread::Builder::new().name("sort_drainer".into()).spawn(
-            move || -> anyhow::Result<u64> {
+            move || -> anyhow::Result<()> {
                 let mut backoff = crate::runall::engine::backoff::Backoff::new();
-                let mut count: u64 = 0;
                 loop {
                     if cancel_for_drainer.is_cancelled() {
                         break;
                     }
                     if let Some(item) = input.pop() {
-                        for record in iter_length_prefixed(&item.item.primary.data) {
-                            let record = record.context("SortStage: framed-BAM parse error")?;
-                            if tx.send(record.to_vec()).is_err() {
-                                return Ok(count);
-                            }
-                            count += 1;
+                        if tx.send(item.item.primary.data).is_err() {
+                            return Ok(());
                         }
                         backoff.reset();
                     } else if input.is_drained() {
@@ -201,7 +202,7 @@ impl SpecialStage for SortStage {
                     }
                 }
                 drop(tx);
-                Ok(count)
+                Ok(())
             },
         )?;
 
@@ -211,14 +212,25 @@ impl SpecialStage for SortStage {
         let sorter =
             if let Some(path) = self.temp_dir.clone() { sorter.temp_dir(path) } else { sorter };
 
-        let sort_result = sorter.sort_accumulate_from_iter(rx.into_iter(), &self.header);
+        let records_iter = rx.into_iter().flat_map(|batch_buf| {
+            // Collect per batch into owned record bytes for the sorter to
+            // consume. A framed-BAM parse error here is an internal data
+            // integrity bug (the upstream stage emitted a malformed batch),
+            // not a recoverable input-validation error — `expect` ensures
+            // the panic surfaces via `catch_unwind` rather than silently
+            // skipping records.
+            iter_length_prefixed(&batch_buf)
+                .map(|r| r.expect("SortStage: framed-BAM parse error in receiver").to_vec())
+                .collect::<Vec<_>>()
+        });
+        let sort_result = sorter.sort_accumulate_from_iter(records_iter, &self.header);
         if sort_result.is_err() {
             cancel.cancel();
         }
         let drainer_result =
             drainer.join().map_err(|_| anyhow::anyhow!("SortStage: drainer thread panicked"))?;
         let sorted_chunks = match (sort_result, drainer_result) {
-            (Ok(chunks), Ok(_count)) => chunks,
+            (Ok(chunks), Ok(())) => chunks,
             (Err(sort_err), _) => {
                 output.close();
                 return Err(sort_err);

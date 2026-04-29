@@ -862,8 +862,8 @@ impl Runall {
     fn consensus_config(&self, threads: usize) -> PipelineConfig {
         PipelineConfig {
             worker_threads: threads,
-            queue_capacity: 256,
-            queue_memory_limit: 128 * 1024 * 1024,
+            queue_capacity: 1024,
+            queue_memory_limit: 512 * 1024 * 1024,
             global_memory_limit: crate::runall::engine::DEFAULT_GLOBAL_MEMORY_LIMIT,
         }
     }

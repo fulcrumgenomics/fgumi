@@ -143,7 +143,11 @@ impl WorkerState {
         output: &Arc<ErasedQueue>,
         cancel: &CancelToken,
         pool_stats: &PipelineStats,
+        stage_offset: usize,
     ) -> StageAttemptResult {
+        // `idx` is segment-local (used for arrays here).
+        // `gidx` is the global stats index (idx + offset).
+        let gidx = idx + stage_offset;
         if cancel.is_cancelled() {
             return StageAttemptResult::Cancelled;
         }
@@ -159,8 +163,8 @@ impl WorkerState {
                     if self.held_output.get(&idx).is_some_and(VecDeque::is_empty) {
                         self.held_output.remove(&idx);
                     }
-                    pool_stats.record_stage_records_out(idx);
-                    crate::progress::records_out(pool_stats.stage_name(idx), 1);
+                    pool_stats.record_stage_records_out(gidx);
+                    crate::progress::records_out(pool_stats.stage_name(gidx), 1);
                     return StageAttemptResult::Progress;
                 }
                 Err(returned) => {
@@ -184,7 +188,7 @@ impl WorkerState {
                 }
                 return StageAttemptResult::BackpressureInput;
             };
-            pool_stats.record_stage_records_in(idx);
+            pool_stats.record_stage_records_in(gidx);
             popped
         };
         let seq = input_item.seq;
@@ -228,7 +232,7 @@ impl WorkerState {
                 drop(guard);
                 // 4. Push the first output. On full output queue, stash all
                 //    remaining (including the failed first) into held_output.
-                self.push_or_hold(idx, items, output, pool_stats)
+                self.push_or_hold(idx, gidx, items, output, pool_stats)
             }
             StageInvoker::Parallel(_) => {
                 let stage = self.parallel_instances[idx]
@@ -251,7 +255,7 @@ impl WorkerState {
                         SequencedItem::new(seq, v, mem)
                     })
                     .collect();
-                self.push_or_hold(idx, items, output, pool_stats)
+                self.push_or_hold(idx, gidx, items, output, pool_stats)
             }
         }
     }
@@ -262,6 +266,7 @@ impl WorkerState {
     fn push_or_hold(
         &mut self,
         idx: usize,
+        gidx: usize,
         mut items: VecDeque<SequencedItem<Box<dyn std::any::Any + Send>>>,
         output: &Arc<ErasedQueue>,
         pool_stats: &PipelineStats,
@@ -269,8 +274,8 @@ impl WorkerState {
         let first = items.pop_front().expect("items must be non-empty");
         match output.push(first) {
             Ok(()) => {
-                pool_stats.record_stage_records_out(idx);
-                crate::progress::records_out(pool_stats.stage_name(idx), 1);
+                pool_stats.record_stage_records_out(gidx);
+                crate::progress::records_out(pool_stats.stage_name(gidx), 1);
                 if !items.is_empty() {
                     self.held_output.insert(idx, items);
                 }
@@ -403,6 +408,8 @@ impl Pool {
         worker_threads: usize,
         _global_memory: Arc<MemoryTracker>,
         pool_stats: &Arc<PipelineStats>,
+        stage_offset: usize,
+        queue_offset: usize,
     ) -> Result<Self> {
         assert_eq!(
             queues.len(),
@@ -483,6 +490,8 @@ impl Pool {
                             &kinds_for_worker,
                             &stats_for_worker,
                             id,
+                            stage_offset,
+                            queue_offset,
                         )
                     })
                 })?;
@@ -573,6 +582,8 @@ fn run_worker_loop(
     parallelism: &[Parallelism],
     pool_stats: &PipelineStats,
     worker_id: usize,
+    stage_offset: usize,
+    queue_offset: usize,
 ) -> Result<()> {
     // BackpressureState needs a MemoryTracker for its `memory_high` /
     // `memory_drained` flags. Those flags only control drain-mode priority;
@@ -627,6 +638,7 @@ fn run_worker_loop(
                 output,
                 cancel,
                 pool_stats,
+                stage_offset,
             );
             let elapsed = t0.elapsed();
             match &result {
@@ -636,7 +648,7 @@ fn run_worker_loop(
                     if !was_draining && state.scheduler.is_draining() {
                         pool_stats.record_drain_activation();
                     }
-                    pool_stats.record_step_progress(worker_id, stage_idx, elapsed);
+                    pool_stats.record_step_progress(worker_id, stage_idx + stage_offset, elapsed);
                     pool_stats.record_eager_progress(worker_id);
                     state.backoff.reset();
                     any_progress = true;
@@ -651,8 +663,8 @@ fn run_worker_loop(
                     if !was_draining && state.scheduler.is_draining() {
                         pool_stats.record_drain_activation();
                     }
-                    pool_stats.record_bp_input(stage_idx);
-                    pool_stats.record_queue_empty_sample(stage_idx);
+                    pool_stats.record_bp_input(stage_idx + stage_offset);
+                    pool_stats.record_queue_empty_sample(stage_idx + queue_offset);
                 }
                 StageAttemptResult::BackpressureOutput => {
                     let was_draining = state.scheduler.is_draining();
@@ -664,7 +676,7 @@ fn run_worker_loop(
                     if !was_draining && state.scheduler.is_draining() {
                         pool_stats.record_drain_activation();
                     }
-                    pool_stats.record_bp_output(stage_idx);
+                    pool_stats.record_bp_output(stage_idx + stage_offset);
                 }
                 StageAttemptResult::SequentialBusy => {
                     let was_draining = state.scheduler.is_draining();
@@ -676,7 +688,7 @@ fn run_worker_loop(
                     if !was_draining && state.scheduler.is_draining() {
                         pool_stats.record_drain_activation();
                     }
-                    pool_stats.record_seq_busy(stage_idx);
+                    pool_stats.record_seq_busy(stage_idx + stage_offset);
                 }
                 StageAttemptResult::Drained => {
                     let was_draining = state.scheduler.is_draining();
@@ -684,7 +696,7 @@ fn run_worker_loop(
                     if !was_draining && state.scheduler.is_draining() {
                         pool_stats.record_drain_activation();
                     }
-                    pool_stats.record_drained(stage_idx);
+                    pool_stats.record_drained(stage_idx + stage_offset);
                 }
                 StageAttemptResult::Cancelled | StageAttemptResult::Error(_) => {}
             }
@@ -732,6 +744,7 @@ fn run_worker_loop(
                 output,
                 cancel,
                 pool_stats,
+                stage_offset,
             );
             let elapsed = t0.elapsed();
             match &result {
@@ -741,7 +754,7 @@ fn run_worker_loop(
                     if !was_draining && state.scheduler.is_draining() {
                         pool_stats.record_drain_activation();
                     }
-                    pool_stats.record_step_progress(worker_id, stage_idx, elapsed);
+                    pool_stats.record_step_progress(worker_id, stage_idx + stage_offset, elapsed);
                     state.backoff.reset();
                     any_progress = true;
                 }
@@ -755,8 +768,8 @@ fn run_worker_loop(
                     if !was_draining && state.scheduler.is_draining() {
                         pool_stats.record_drain_activation();
                     }
-                    pool_stats.record_bp_input(stage_idx);
-                    pool_stats.record_queue_empty_sample(stage_idx);
+                    pool_stats.record_bp_input(stage_idx + stage_offset);
+                    pool_stats.record_queue_empty_sample(stage_idx + queue_offset);
                 }
                 StageAttemptResult::BackpressureOutput => {
                     let was_draining = state.scheduler.is_draining();
@@ -768,7 +781,7 @@ fn run_worker_loop(
                     if !was_draining && state.scheduler.is_draining() {
                         pool_stats.record_drain_activation();
                     }
-                    pool_stats.record_bp_output(stage_idx);
+                    pool_stats.record_bp_output(stage_idx + stage_offset);
                 }
                 StageAttemptResult::SequentialBusy => {
                     let was_draining = state.scheduler.is_draining();
@@ -780,7 +793,7 @@ fn run_worker_loop(
                     if !was_draining && state.scheduler.is_draining() {
                         pool_stats.record_drain_activation();
                     }
-                    pool_stats.record_seq_busy(stage_idx);
+                    pool_stats.record_seq_busy(stage_idx + stage_offset);
                 }
                 StageAttemptResult::Drained => {
                     let was_draining = state.scheduler.is_draining();
@@ -788,7 +801,7 @@ fn run_worker_loop(
                     if !was_draining && state.scheduler.is_draining() {
                         pool_stats.record_drain_activation();
                     }
-                    pool_stats.record_drained(stage_idx);
+                    pool_stats.record_drained(stage_idx + stage_offset);
                 }
                 StageAttemptResult::Cancelled | StageAttemptResult::Error(_) => {}
             }
@@ -853,6 +866,7 @@ fn run_worker_loop(
                         output,
                         cancel,
                         pool_stats,
+                        stage_offset,
                     );
                 }
                 try_exit_stage(

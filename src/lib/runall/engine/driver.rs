@@ -865,30 +865,24 @@ where
         })
         .sum();
 
-    // Assign thread budgets to pool segments proportionally by stage count,
-    // minimum 1 each.
+    // Each pool segment gets the full `worker_threads` budget. Pool
+    // segments run concurrently with each other and with Special stages,
+    // but their execution timelines do NOT fully overlap — pre-align
+    // pool segments empty their input early in the run and exit, while
+    // post-align pool segments cannot start producing until the
+    // intervening Special barriers (Sort, PositionBatch, MiAssign) emit.
+    // Splitting threads proportionally across pool segments left the
+    // heaviest downstream segment (Consensus+Filter) with too few
+    // workers to keep up. Give each pool the full budget; idle workers
+    // in finished pools yield CPU to busy ones via the OS scheduler.
+    //
+    // `total_pool_stages` is no longer used for budget computation but
+    // is preserved as an input bound for tests; an underscore prefix
+    // here would change the public symbol so we just keep the binding.
+    let _ = total_pool_stages;
     let num_pool_segs: usize = segments.iter().filter(|s| matches!(s, Segment::Pool(_))).count();
-    let mut pool_thread_budgets: Vec<usize> = Vec::new();
-    if num_pool_segs > 0 {
-        let mut remaining_threads = cfg.worker_threads;
-        let pool_stage_counts: Vec<usize> = segments
-            .iter()
-            .filter_map(|s| if let Segment::Pool(v) = s { Some(v.len()) } else { None })
-            .collect();
-        for (idx, &stage_count) in pool_stage_counts.iter().enumerate() {
-            let threads = if idx == num_pool_segs - 1 {
-                // Last pool segment gets whatever threads remain (minimum 1).
-                remaining_threads.max(1)
-            } else {
-                // Proportional share, clamped so at least 1 thread remains for
-                // the segments that follow.
-                let share = (cfg.worker_threads * stage_count / total_pool_stages).max(1);
-                share.min(remaining_threads.saturating_sub(1).max(1))
-            };
-            pool_thread_budgets.push(threads);
-            remaining_threads = remaining_threads.saturating_sub(threads).max(1);
-        }
-    }
+    let pool_thread_budgets: Vec<usize> =
+        std::iter::repeat_n(cfg.worker_threads.max(1), num_pool_segs).collect();
 
     // === Spawn segment threads ===
     // We track: a list of (pool, queue_range) and special thread handles.
@@ -900,6 +894,16 @@ where
     // Track the queue index consumed by each segment's input side.
     // Segment i reads from erased_queues[i] and writes to erased_queues[i+1].
     let mut seg_queue_start: usize = 0; // index of the first queue for next segment
+    // Track the running count of pool stages consumed by previous Pool
+    // segments. Used as the global stats stage-index offset when spawning a
+    // Pool: the worker's segment-local stage_idx (0..seg_n) maps to
+    // pool_stage_offset..pool_stage_offset+seg_n in `PipelineStats`.
+    let mut pool_stage_offset: usize = 0;
+    // Side table: for each Special stage, remember (name, in_q_idx, out_q_idx)
+    // so after execution we can populate records_in/records_out from the
+    // queue's own counters. Special stages have their own threads and are
+    // not represented in `step_*` arrays of `PipelineStats`.
+    let mut special_table: Vec<(&'static str, usize, usize)> = Vec::new();
 
     for segment in segments {
         match segment {
@@ -921,10 +925,13 @@ where
                     thread_budget,
                     global_memory.clone(),
                     &stats,
+                    pool_stage_offset,
+                    seg_queue_start,
                 )?;
 
                 spawned.push(SpawnedSegment::Pool { pool, out_queue_idx });
                 seg_queue_start += seg_n;
+                pool_stage_offset += seg_n;
             }
             Segment::Special(special) => {
                 let in_q = erased_queues[seg_queue_start].clone();
@@ -932,15 +939,21 @@ where
                 let out_queue_idx = seg_queue_start + 1;
                 let cancel_for_special = cancel.clone();
                 let stage_name: &'static str = special.name();
+                let stats_for_special = stats.clone();
+                special_table.push((stage_name, seg_queue_start, seg_queue_start + 1));
 
                 let handle = thread::Builder::new()
                     .name(format!("pipeline_special_{stage_name}"))
                     .spawn(move || -> Result<()> {
-                        run_and_catch_panic_named(
+                        let t0 = std::time::Instant::now();
+                        let result = run_and_catch_panic_named(
                             &cancel_for_special.clone(),
                             Some(stage_name),
                             move || special.run_erased(in_q, out_q, cancel_for_special),
-                        )
+                        );
+                        let elapsed = t0.elapsed();
+                        stats_for_special.record_special_stage_wall(stage_name, elapsed);
+                        result
                     })
                     .context("failed to spawn special stage thread")?;
 
@@ -1021,6 +1034,27 @@ where
     // is validated by the sink's own reorder-buffer drain check.
     let _ = (&produced, &consumed, &cancel);
 
+    // Populate per-Special-stage records_in/records_out from the
+    // attribute-counter on each Special's input and output queue. The
+    // queue's `total_pop` is the count of items the Special consumed
+    // (records_in); `total_push` on its output queue is the count of items
+    // it emitted (records_out). The `record_special_stage_wall` call has
+    // already happened in the segment's spawned thread, so name order
+    // matches.
+    for (name, in_idx, out_idx) in &special_table {
+        let recs_in = erased_queues[*in_idx].total_pop() as u64;
+        let recs_out = erased_queues[*out_idx].total_push() as u64;
+        stats.record_special_stage_records_in(name, recs_in);
+        stats.record_special_stage_records_out(name, recs_out);
+    }
+
+    // Populate the queue depth high-water counters in PipelineStats from
+    // each erased queue's own observed maxima. Doing this after all stages
+    // have exited gives the final, race-free snapshot.
+    for (i, q) in erased_queues.iter().enumerate() {
+        stats.record_queue_depth_sample(i, q.max_depth() as u64, q.max_bytes() as u64);
+    }
+
     tracing::info!("{}", stats.format_summary(&pool_stage_names));
     // See accompanying note in `run_multi_stage` — this tracks bytes held in
     // queues, not process RSS.
@@ -1034,6 +1068,26 @@ where
         stats
             .write_tsv(path, &pool_stage_names)
             .with_context(|| format!("failed to write metrics TSV to {}", path.display()))?;
+        // Also write a sibling queues TSV (path with `.queues` infix) so the
+        // caller can correlate per-stage timing with which queues backed up.
+        let queue_path = {
+            let mut p = path.to_path_buf();
+            let stem = p
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let ext = p.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+            let new_name = if ext.is_empty() {
+                format!("{stem}.queues")
+            } else {
+                format!("{stem}.queues.{ext}")
+            };
+            p.set_file_name(new_name);
+            p
+        };
+        stats
+            .write_queue_tsv(&queue_path)
+            .with_context(|| format!("failed to write queues TSV to {}", queue_path.display()))?;
     }
 
     Ok(())

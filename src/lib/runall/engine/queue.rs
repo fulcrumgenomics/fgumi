@@ -33,6 +33,18 @@ pub struct StageQueue<T> {
     /// Optional progress counters for deadlock detection. When present,
     /// every successful push and pop is reported to the watchdog.
     progress: Option<Arc<QueueProgress>>,
+    /// Total successful pushes since construction. Increments inside
+    /// `push` after the item is admitted to `inner`. Used by the driver
+    /// to compute records-out for the producer side.
+    total_push: Arc<AtomicUsize>,
+    /// Total successful pops since construction. Increments inside
+    /// `pop`. Used by the driver to compute records-in for the consumer
+    /// side.
+    total_pop: Arc<AtomicUsize>,
+    /// High-water depth (items) and bytes observed during this queue's
+    /// lifetime. Updated by `summarize()` and on every push.
+    max_depth: Arc<AtomicUsize>,
+    max_bytes: Arc<AtomicUsize>,
 }
 
 impl<T> StageQueue<T> {
@@ -51,6 +63,10 @@ impl<T> StageQueue<T> {
             closed: Arc::new(AtomicBool::new(false)),
             name: name.into(),
             progress: None,
+            total_push: Arc::new(AtomicUsize::new(0)),
+            total_pop: Arc::new(AtomicUsize::new(0)),
+            max_depth: Arc::new(AtomicUsize::new(0)),
+            max_bytes: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -74,6 +90,10 @@ impl<T> StageQueue<T> {
             closed: Arc::new(AtomicBool::new(false)),
             name: name.into(),
             progress: Some(progress),
+            total_push: Arc::new(AtomicUsize::new(0)),
+            total_pop: Arc::new(AtomicUsize::new(0)),
+            max_depth: Arc::new(AtomicUsize::new(0)),
+            max_bytes: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -116,7 +136,29 @@ impl<T> StageQueue<T> {
         }
         match self.inner.push(item) {
             Ok(()) => {
-                self.queue_bytes.fetch_add(bytes, Ordering::Relaxed);
+                let new_bytes = self.queue_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+                self.total_push.fetch_add(1, Ordering::Relaxed);
+                let depth = self.inner.len();
+                // Monotonic max — best-effort; this is observability data
+                // so a missed update under contention is fine.
+                let prev_d = self.max_depth.load(Ordering::Relaxed);
+                if depth > prev_d {
+                    let _ = self.max_depth.compare_exchange(
+                        prev_d,
+                        depth,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
+                }
+                let prev_b = self.max_bytes.load(Ordering::Relaxed);
+                if new_bytes > prev_b {
+                    let _ = self.max_bytes.compare_exchange(
+                        prev_b,
+                        new_bytes,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
+                }
                 if let Some(progress) = &self.progress {
                     progress.note_push();
                 }
@@ -129,6 +171,30 @@ impl<T> StageQueue<T> {
                 Err(item)
             }
         }
+    }
+
+    /// Total successful pushes since construction.
+    #[must_use]
+    pub fn total_push(&self) -> usize {
+        self.total_push.load(Ordering::Relaxed)
+    }
+
+    /// Total successful pops since construction.
+    #[must_use]
+    pub fn total_pop(&self) -> usize {
+        self.total_pop.load(Ordering::Relaxed)
+    }
+
+    /// High-water mark of items observed in this queue.
+    #[must_use]
+    pub fn max_depth(&self) -> usize {
+        self.max_depth.load(Ordering::Relaxed)
+    }
+
+    /// High-water mark of bytes observed in this queue.
+    #[must_use]
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes.load(Ordering::Relaxed)
     }
 
     /// Push an item, retrying on a full queue until success or cancellation.
@@ -187,6 +253,7 @@ impl<T> StageQueue<T> {
             }
         }
         self.global_memory.sub(bytes);
+        self.total_pop.fetch_add(1, Ordering::Relaxed);
         if let Some(progress) = &self.progress {
             progress.note_pop();
         }
@@ -273,6 +340,10 @@ impl<T> Clone for StageQueue<T> {
             closed: self.closed.clone(),
             name: self.name.clone(),
             progress: self.progress.clone(),
+            total_push: self.total_push.clone(),
+            total_pop: self.total_pop.clone(),
+            max_depth: self.max_depth.clone(),
+            max_bytes: self.max_bytes.clone(),
         }
     }
 }

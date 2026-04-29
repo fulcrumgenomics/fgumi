@@ -60,7 +60,7 @@
 //! thread depends on aligner-internal scheduling. At aligner `-t 1`
 //! plus pool `-t 1`, runs are byte-identical.
 
-use std::io::{BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 
@@ -68,6 +68,44 @@ use anyhow::{Result, anyhow};
 use fgumi_raw_bam::RawRecord;
 use fgumi_umi::TagInfo;
 use noodles::sam::Header;
+
+/// Magic bytes that identify a BGZF block — the underlying compression
+/// format used by BAM. If the aligner's stdout starts with these bytes
+/// (with the FLG.EXTRA bit set, which `0x04` implies), we treat the
+/// stream as BAM-binary and parse it directly via `noodles::bam`. Most
+/// real aligners emit SAM text on stdout (`bwa mem`, `bwa-mem2`,
+/// `bowtie2`); this branch is used by benchmark replay-aligners and any
+/// custom aligner that emits BAM.
+const BGZF_MAGIC: [u8; 4] = [0x1f, 0x8b, 0x08, 0x04];
+
+/// Peek the first `BGZF_MAGIC.len()` bytes from `r` to classify it as
+/// BGZF (BAM) vs SAM text. Returns `(is_bgzf, restored_reader)` where
+/// `restored_reader` yields the peeked bytes followed by the rest of
+/// the stream so the chosen downstream parser sees the full input.
+///
+/// A single `read()` on a pipe may return fewer bytes than requested
+/// even when more data is coming (e.g. the aligner hasn't flushed its
+/// first BGZF block yet), so we loop until the peek buffer is full or
+/// EOF is reached. Mirrors the implementation in
+/// `crate::commands::zipper::peek_stdin_bgzf`.
+fn peek_aligner_stdout_bgzf(
+    mut stdout: Box<dyn Read + Send>,
+) -> Result<(bool, Box<dyn Read + Send>)> {
+    let mut prefix = [0u8; BGZF_MAGIC.len()];
+    let mut filled = 0usize;
+    while filled < prefix.len() {
+        match stdout.read(&mut prefix[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(anyhow::Error::from(e).context("peek aligner stdout")),
+        }
+    }
+    let is_bgzf = filled == BGZF_MAGIC.len() && prefix == BGZF_MAGIC;
+    let restored: Box<dyn Read + Send> =
+        Box::new(std::io::Cursor::new(prefix[..filled].to_vec()).chain(stdout));
+    Ok((is_bgzf, restored))
+}
 
 use crate::aligner::AlignerProcess;
 use crate::commands::zipper::{build_output_header, merge_raw as merge};
@@ -168,7 +206,13 @@ impl SpecialStage for AlignAndMerge {
         // 1. Spawn aligner subprocess.
         let mut aligner = AlignerProcess::spawn(&self.aligner_command, self.stderr_ring_size)?;
         let mut stdin = aligner.take_stdin().expect("aligner stdin was piped");
-        let stdout = aligner.take_stdout().expect("aligner stdout was piped");
+        let stdout_raw: Box<dyn Read + Send> =
+            Box::new(aligner.take_stdout().expect("aligner stdout was piped"));
+
+        // 1b. Detect whether the aligner emits BAM (BGZF magic) or SAM text.
+        // Most real aligners emit SAM; benchmark replay-aligners can emit
+        // BAM directly to skip the SAM serialize/deserialize round-trip.
+        let (aligner_is_bam, stdout) = peek_aligner_stdout_bgzf(stdout_raw)?;
 
         // 2. Channel for the mapped header: thread B -> thread C (single-shot).
         let (header_tx, header_rx) = std::sync::mpsc::sync_channel::<Header>(1);
@@ -355,33 +399,78 @@ impl SpecialStage for AlignAndMerge {
             },
         )?;
 
-        // Thread B: stdout reader (SAM parsing -> templates).
+        // Thread B: stdout reader (SAM/BAM parsing -> templates).
+        //
+        // Two parsing paths share a Template-iterator-driven channel push
+        // loop. The BAM path skips the SAM text serialize/deserialize +
+        // re-encode that the SAM path performs — a win for any aligner
+        // that emits BAM (typical for benchmark replay-aligners that
+        // stream a pre-computed BAM file). For SAM-emitting aligners
+        // (`bwa mem`, `bwa-mem2`, `bowtie2`), the existing SAM path is
+        // unchanged.
         let thread_b = thread::Builder::new().name("align_and_merge_stdout".into()).spawn(
             move || -> Result<()> {
-                let buf_reader = BufReader::with_capacity(256 * 1024, stdout);
-                let mut sam_reader = noodles::sam::io::Reader::new(buf_reader);
-                let mapped_header = sam_reader.read_header()?;
+                if aligner_is_bam {
+                    // Multi-threaded BGZF inflate: spawn worker threads
+                    // proportional to the user's pool budget so BGZF
+                    // decompression can keep up with downstream record
+                    // processing. Capped at 4 because:
+                    //   - Empirically, 4 BGZF workers saturate the
+                    //     single-threaded record-decode that Thread B
+                    //     does after the BGZF reader.
+                    //   - Pushing to 8 only adds CPU contention without
+                    //     additional wall-time benefit (subsample @4t
+                    //     went 12.0→13.5s).
+                    let buf_reader: Box<dyn Read + Send> =
+                        Box::new(BufReader::with_capacity(256 * 1024, stdout));
+                    let bgzf_workers = std::num::NonZero::new(4).expect("4 is non-zero");
+                    let bgzf = noodles::bgzf::io::MultithreadedReader::with_worker_count(
+                        bgzf_workers,
+                        buf_reader,
+                    );
+                    let mut bam_reader = noodles::bam::io::Reader::from(bgzf);
+                    let mapped_header = bam_reader.read_header()?;
+                    header_tx.send(mapped_header.clone()).map_err(|_| {
+                        anyhow!("AlignAndMerge: merge thread dropped header channel")
+                    })?;
 
-                header_tx
-                    .send(mapped_header.clone())
-                    .map_err(|_| anyhow!("AlignAndMerge: merge thread dropped header channel"))?;
-
-                let mh = mapped_header;
-                let mut encoder = fgumi_raw_bam::RecordBufEncoder::new(&mh);
-                let record_iter = sam_reader.record_bufs(&mh).map(move |r| {
-                    r.map_err(anyhow::Error::from).and_then(|rb| {
-                        encoder
-                            .encode(&rb)
-                            .map_err(|e| anyhow!("AlignAndMerge: encode failed: {e}"))
-                    })
-                });
-                let iter = crate::template::TemplateIterFromRecords::new(record_iter);
-                for template in iter {
-                    if cancel_b.is_cancelled() {
-                        break;
+                    let bgzf = bam_reader.into_inner();
+                    let raw = fgumi_raw_bam::RawBamReader::new(bgzf);
+                    let iter = crate::template::TemplateIterator::new(raw);
+                    for template in iter {
+                        if cancel_b.is_cancelled() {
+                            break;
+                        }
+                        if mapped_tx.send(template).is_err() {
+                            break;
+                        }
                     }
-                    if mapped_tx.send(template).is_err() {
-                        break; // thread C dropped
+                } else {
+                    let buf_reader = BufReader::with_capacity(256 * 1024, stdout);
+                    let mut sam_reader = noodles::sam::io::Reader::new(buf_reader);
+                    let mapped_header = sam_reader.read_header()?;
+
+                    header_tx.send(mapped_header.clone()).map_err(|_| {
+                        anyhow!("AlignAndMerge: merge thread dropped header channel")
+                    })?;
+
+                    let mh = mapped_header;
+                    let mut encoder = fgumi_raw_bam::RecordBufEncoder::new(&mh);
+                    let record_iter = sam_reader.record_bufs(&mh).map(move |r| {
+                        r.map_err(anyhow::Error::from).and_then(|rb| {
+                            encoder
+                                .encode(&rb)
+                                .map_err(|e| anyhow!("AlignAndMerge: encode failed: {e}"))
+                        })
+                    });
+                    let iter = crate::template::TemplateIterFromRecords::new(record_iter);
+                    for template in iter {
+                        if cancel_b.is_cancelled() {
+                            break;
+                        }
+                        if mapped_tx.send(template).is_err() {
+                            break;
+                        }
                     }
                 }
                 drop(mapped_tx); // signal thread C: no more mapped templates
