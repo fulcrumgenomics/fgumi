@@ -411,23 +411,25 @@ impl SpecialStage for AlignAndMerge {
         let thread_b = thread::Builder::new().name("align_and_merge_stdout".into()).spawn(
             move || -> Result<()> {
                 if aligner_is_bam {
-                    // Multi-threaded BGZF inflate: spawn worker threads
-                    // proportional to the user's pool budget so BGZF
-                    // decompression can keep up with downstream record
-                    // processing. Capped at 4 because:
-                    //   - Empirically, 4 BGZF workers saturate the
-                    //     single-threaded record-decode that Thread B
-                    //     does after the BGZF reader.
-                    //   - Pushing to 8 only adds CPU contention without
-                    //     additional wall-time benefit (subsample @4t
-                    //     went 12.0→13.5s).
-                    let buf_reader: Box<dyn Read + Send> =
-                        Box::new(BufReader::with_capacity(256 * 1024, stdout));
-                    let bgzf_workers = std::num::NonZero::new(4).expect("4 is non-zero");
-                    let bgzf = noodles::bgzf::io::MultithreadedReader::with_worker_count(
-                        bgzf_workers,
-                        buf_reader,
-                    );
+                    // Single-threaded BGZF inflate inline on this thread.
+                    //
+                    // We previously used `noodles::bgzf::MultithreadedReader`
+                    // with 4 dedicated workers; that gives ~17% of
+                    // AlignAndMerge wall to BGZF inflate but adds 4 OS
+                    // threads outside the runall work-stealing pool, which
+                    // contended with the main pool at low `--threads`
+                    // counts (iter 10 saw a 1.5s regression at 4t when we
+                    // bumped from 4 to 8 BGZF workers). The single-threaded
+                    // path replaces the dedicated thread pool with inline
+                    // libdeflate inflate on Thread B; Thread B already has
+                    // BAM-record-decode work to do downstream of the
+                    // inflate, so the extra inflate cost lands on a thread
+                    // that isn't the runtime bottleneck.
+                    //
+                    // Real `bwa mem` (SAM-emitting) is unchanged: it still
+                    // uses the SAM path on the `else` branch.
+                    let buf_reader = BufReader::with_capacity(256 * 1024, stdout);
+                    let bgzf = noodles::bgzf::io::Reader::new(buf_reader);
                     let mut bam_reader = noodles::bam::io::Reader::from(bgzf);
                     let mapped_header = bam_reader.read_header()?;
                     header_tx.send(mapped_header.clone()).map_err(|_| {
