@@ -112,6 +112,18 @@ fn run_v2_extract(r1: &Path, r2: &Path, out: &Path) {
     );
 }
 
+/// Count records in a BAM via noodles (no `samtools` PATH dependency).
+fn count_bam_records(path: &Path) -> usize {
+    let mut reader = noodles::bam::io::reader::Builder.build_from_path(path).expect("open BAM");
+    let header = reader.read_header().expect("read BAM header");
+    let mut record = noodles::sam::alignment::RecordBuf::default();
+    let mut count = 0usize;
+    while reader.read_record_buf(&header, &mut record).expect("read BAM record") != 0 {
+        count += 1;
+    }
+    count
+}
+
 /// Invoke `fgumi compare bams --command extract` as a subprocess.
 /// Returns true on exit status 0 (BAMs equivalent).
 fn compare_bams(a: &Path, b: &Path) -> bool {
@@ -145,6 +157,11 @@ fn test_extract_v2_matches_v1_paired_gzip() {
     write_paired_gzip_fastq(&r1, &r2, 100);
     run_v1_extract(&r1, &r2, &v1_out);
     run_v2_extract(&r1, &r2, &v2_out);
+
+    // Guard against vacuous parity: an empty-vs-empty BAM comparison is a
+    // pass for any extract bug.
+    assert!(count_bam_records(&v1_out) > 0, "v1 fgumi extract produced 0 records");
+    assert!(count_bam_records(&v2_out) > 0, "v2 runall extract produced 0 records");
 
     assert!(
         compare_bams(&v1_out, &v2_out),

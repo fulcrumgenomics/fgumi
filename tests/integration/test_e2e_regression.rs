@@ -173,6 +173,33 @@ fn compare_bams(bam1: &Path, bam2: &Path, mode: &str) -> Output {
     fgumi(args!["compare", "bams", bam1, bam2, "--mode", mode])
 }
 
+/// Count records in a BAM by reading it directly (avoids requiring `samtools`
+/// on PATH for this gate). Used to guard determinism comparisons against the
+/// trivial-pass case where both runs silently produce zero records.
+fn count_bam_records(path: &Path) -> usize {
+    let mut reader = bam::io::reader::Builder.build_from_path(path).expect("open BAM");
+    let header = reader.read_header().expect("read BAM header");
+    let mut record = noodles::sam::alignment::RecordBuf::default();
+    let mut count = 0usize;
+    while reader.read_record_buf(&header, &mut record).expect("read BAM record") != 0 {
+        count += 1;
+    }
+    count
+}
+
+/// Guard against vacuous parity / determinism comparisons: a `0 == 0` pass
+/// catches no consensus, group, or filter bug. Every comparison run on the
+/// full extract-to-filter pipeline should produce at least one record.
+#[track_caller]
+fn assert_bam_records_gt_zero(path: &Path, label: &str) {
+    let n = count_bam_records(path);
+    assert!(
+        n > 0,
+        "{label} produced 0 records at {} — comparison would be vacuous",
+        path.display()
+    );
+}
+
 /// Assert that two BAM files are identical according to the given compare mode.
 fn assert_bams_identical(bam1: &Path, bam2: &Path, mode: &str, context: &str) {
     let output = compare_bams(bam1, bam2, mode);
@@ -302,6 +329,13 @@ fn test_full_pipeline_extract_to_filter() {
         ]);
 
         let grouped = tmp.path().join(format!("grouped_{suffix}.bam"));
+        // `simulate fastq-reads` produces FASTQ that we extract directly to an
+        // unmapped BAM — there is no alignment step in this determinism test,
+        // so all records are flag=4 (unmapped). `fgumi group --allow-unmapped`
+        // is required, otherwise group's default `--allow-unmapped=false` drops
+        // every record and the downstream simplex+filter chain emits empty
+        // BAMs that compare trivially equal — turning the determinism check
+        // into a vacuous 0==0.
         fgumi_ok(args![
             "group",
             "--input",
@@ -312,6 +346,7 @@ fn test_full_pipeline_extract_to_filter() {
             "identity",
             "--edits",
             "0",
+            "--allow-unmapped",
         ]);
 
         let simplex = tmp.path().join(format!("simplex_{suffix}.bam"));
@@ -321,10 +356,24 @@ fn test_full_pipeline_extract_to_filter() {
         run_filter(&simplex, &filtered, 2, 10);
     }
 
+    let filtered_a = tmp.path().join("filtered_a.bam");
+    let filtered_b = tmp.path().join("filtered_b.bam");
+
+    // Guard against the vacuous-determinism trap: confirm each run produced
+    // at least one record before declaring the pipeline deterministic.
+    assert_bam_records_gt_zero(
+        &filtered_a,
+        "test_full_pipeline_extract_to_filter run-a final filtered BAM",
+    );
+    assert_bam_records_gt_zero(
+        &filtered_b,
+        "test_full_pipeline_extract_to_filter run-b final filtered BAM",
+    );
+
     // Compare the two independent pipeline runs
     assert_bams_identical(
-        &tmp.path().join("filtered_a.bam"),
-        &tmp.path().join("filtered_b.bam"),
+        &filtered_a,
+        &filtered_b,
         "content",
         "Two full pipeline runs should produce identical BAMs",
     );

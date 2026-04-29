@@ -117,6 +117,10 @@ fn test_fastq_v2_matches_v1() {
 
     let v1_bytes = std::fs::read(&v1_fastq).unwrap();
     let v2_bytes = std::fs::read(&v2_fastq).unwrap();
+    // Guard against vacuous parity: empty-vs-empty FASTQ comparison would
+    // pass trivially even if extract->fastq silently dropped every read.
+    assert!(!v1_bytes.is_empty(), "v1 fgumi fastq produced 0 bytes");
+    assert!(!v2_bytes.is_empty(), "v2 runall fastq produced 0 bytes");
     assert_eq!(
         v1_bytes.len(),
         v2_bytes.len(),

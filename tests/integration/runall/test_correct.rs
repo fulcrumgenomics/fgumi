@@ -192,6 +192,18 @@ fn run_v2_standalone(input: &Path, umi_file: &Path, out: &Path, rejects: &Path, 
     );
 }
 
+/// Count records in a BAM via noodles (no `samtools` PATH dependency).
+fn count_bam_records(path: &Path) -> usize {
+    let mut reader = noodles::bam::io::reader::Builder.build_from_path(path).expect("open BAM");
+    let header = reader.read_header().expect("read BAM header");
+    let mut record = noodles::sam::alignment::RecordBuf::default();
+    let mut count = 0usize;
+    while reader.read_record_buf(&header, &mut record).expect("read BAM record") != 0 {
+        count += 1;
+    }
+    count
+}
+
 fn compare_bams(a: &Path, b: &Path) -> bool {
     let output = std::process::Command::new(fgumi_bin())
         .args(["compare", "bams", a.to_str().unwrap(), b.to_str().unwrap(), "--command", "correct"])
@@ -226,6 +238,12 @@ fn test_correct_v2_inline_matches_v1() {
 
     run_v2_inline(&r1, &r2, &umi_file, &v2_corrected, &v2_rejects, &v2_metrics);
 
+    // Guard against vacuous parity: corrected primary output must contain
+    // records (rejects may legitimately be empty if all UMIs match the
+    // includelist, so we don't assert on the rejects count).
+    assert!(count_bam_records(&v1_corrected) > 0, "v1 fgumi correct produced 0 records");
+    assert!(count_bam_records(&v2_corrected) > 0, "v2 runall inline correct produced 0 records");
+
     assert!(compare_bams(&v1_corrected, &v2_corrected), "primary BAMs differ");
     assert!(compare_bams(&v1_rejects, &v2_rejects), "rejects BAMs differ");
     assert_eq!(
@@ -256,6 +274,12 @@ fn test_correct_v2_standalone_matches_v1() {
     run_v1_correct(&extracted, &umi_file, &v1_corrected, &v1_rejects, &v1_metrics);
 
     run_v2_standalone(&extracted, &umi_file, &v2_corrected, &v2_rejects, &v2_metrics);
+
+    assert!(count_bam_records(&v1_corrected) > 0, "v1 fgumi correct produced 0 records");
+    assert!(
+        count_bam_records(&v2_corrected) > 0,
+        "v2 runall standalone correct produced 0 records"
+    );
 
     assert!(compare_bams(&v1_corrected, &v2_corrected), "primary BAMs differ");
     assert!(compare_bams(&v1_rejects, &v2_rejects), "rejects BAMs differ");

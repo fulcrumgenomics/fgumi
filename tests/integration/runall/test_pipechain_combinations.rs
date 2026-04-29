@@ -343,6 +343,11 @@ fn test_correct_to_group() {
         "1",
         "--group::strategy",
         "adjacency",
+        // simulate correct-reads emits synthetic UMI-correction-test reads
+        // whose templates do not derive from PhiX; bwa-mem cannot align
+        // them, so without --group::allow-unmapped, group drops every
+        // record and the parity gate compares two empty BAMs.
+        "--group::allow-unmapped",
         "--threads",
         "1",
         "--compression-level",
@@ -403,6 +408,10 @@ fn test_correct_to_consensus() {
         "simplex",
         "--group::strategy",
         "adjacency",
+        // See test_correct_to_group: simulate correct-reads outputs are
+        // not alignable to PhiX; allow them through group so the parity
+        // comparison is non-trivial.
+        "--group::allow-unmapped",
         "--filter::min-reads",
         "1",
         "--threads",
@@ -439,7 +448,11 @@ fn test_correct_to_filter() {
     run_sort(&zipped, &sorted);
     run_group(&sorted, "adjacency", &grouped);
     run_simplex_consensus(&grouped, &consensus, 1);
-    run_filter(&consensus, &v1_out);
+    // simulate correct-reads outputs aren't alignable to PhiX, so the
+    // simplex consensus comes from singleton families and emits ~Phred 29
+    // qualities. Use a lower min-base-quality so records survive filter and
+    // the parity comparison is non-trivial; otherwise the gate is vacuous.
+    run_filter(&consensus, &v1_out, 2);
 
     // v2: runall correct..filter
     run_runall(&[
@@ -467,8 +480,12 @@ fn test_correct_to_filter() {
         "simplex",
         "--group::strategy",
         "adjacency",
+        // See test_correct_to_group: simulate correct-reads outputs are
+        // not alignable to PhiX; allow them through group so the parity
+        // comparison is non-trivial.
+        "--group::allow-unmapped",
         "--filter::min-base-quality",
-        "40",
+        "2",
         "--filter::max-read-error-rate",
         "0.025",
         "--filter::max-base-error-rate",
@@ -708,7 +725,7 @@ fn test_fastq_to_filter() {
     run_sort(&zipped, &sorted);
     run_group(&sorted, "adjacency", &grouped);
     run_simplex_consensus(&grouped, &consensus, 1);
-    run_filter(&consensus, &v1_out);
+    run_filter(&consensus, &v1_out, 40);
 
     run_runall(&[
         "--start-from",
@@ -885,7 +902,7 @@ fn test_sort_to_filter() {
     run_sort(&input_bam, &sorted);
     run_group(&sorted, "adjacency", &grouped);
     run_simplex_consensus(&grouped, &consensus, 1);
-    run_filter(&consensus, &v1_out);
+    run_filter(&consensus, &v1_out, 40);
 
     run_runall(&[
         "--start-from",
@@ -1021,7 +1038,7 @@ fn test_group_to_filter() {
     let consensus = tmp.path().join("v1_consensus.bam");
     run_group(&input_bam, "adjacency", &grouped);
     run_simplex_consensus(&grouped, &consensus, 1);
-    run_filter(&consensus, &v1_out);
+    run_filter(&consensus, &v1_out, 40);
 
     run_runall(&[
         "--start-from",

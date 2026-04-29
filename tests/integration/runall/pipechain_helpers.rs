@@ -332,6 +332,10 @@ pub(crate) fn run_sort(input: &Path, out: &Path) {
 }
 
 /// Run `fgumi group --strategy <strategy>` on a template-coordinate-sorted BAM.
+/// Run `fgumi group` on a sorted BAM with `--allow-unmapped` so unmapped
+/// inputs (e.g. `simulate correct-reads` outputs that don't align to the
+/// `PhiX` reference) are not silently dropped at the group stage and the
+/// downstream parity gate becomes a vacuous 0-vs-0 comparison.
 pub(crate) fn run_group(input: &Path, strategy: &str, out: &Path) {
     let output = Command::new(fgumi_bin())
         .args([
@@ -342,6 +346,7 @@ pub(crate) fn run_group(input: &Path, strategy: &str, out: &Path) {
             out.to_str().unwrap(),
             "--strategy",
             strategy,
+            "--allow-unmapped",
         ])
         .output()
         .expect("spawn fgumi group");
@@ -376,8 +381,13 @@ pub(crate) fn run_simplex_consensus(input: &Path, out: &Path, min_reads: usize) 
 }
 
 /// Run `fgumi filter` with the canonical simplex-stable parameter set used
-/// across these pipechain tests.
-pub(crate) fn run_filter(input: &Path, out: &Path) {
+/// across these pipechain tests. `min_base_quality` is parameterized so the
+/// `correct->filter` chain (whose simplex output for synthetic non-alignable
+/// `simulate correct-reads` fixtures sits around Phred 29) can use a lower
+/// threshold without dropping every record; the bwa-aligned chains (extract,
+/// fastq, sort, group) keep Phred 40 to match the v2 runall args.
+pub(crate) fn run_filter(input: &Path, out: &Path, min_base_quality: u8) {
+    let mbq = min_base_quality.to_string();
     let output = Command::new(fgumi_bin())
         .args([
             "filter",
@@ -386,7 +396,7 @@ pub(crate) fn run_filter(input: &Path, out: &Path) {
             "--output",
             out.to_str().unwrap(),
             "--min-base-quality",
-            "40",
+            &mbq,
             "--max-read-error-rate",
             "0.025",
             "--max-base-error-rate",
@@ -427,11 +437,45 @@ pub(crate) fn run_runall(args: &[&str]) {
     );
 }
 
+/// Count records in a BAM file using the `noodles` BAM reader. Used by
+/// `compare_bams` as a guard so that two empty BAMs cannot silently declare
+/// parity (an empty-vs-empty comparison catches no consensus, group, or
+/// filter bug).
+fn count_bam_records(path: &Path) -> usize {
+    let mut reader = noodles::bam::io::reader::Builder.build_from_path(path).expect("open BAM");
+    let header = reader.read_header().expect("read BAM header");
+    let mut record = noodles::sam::alignment::RecordBuf::default();
+    let mut count = 0usize;
+    while reader.read_record_buf(&header, &mut record).expect("read BAM record") != 0 {
+        count += 1;
+    }
+    count
+}
+
 /// Compare two BAM files using `fgumi compare bams --command <preset>`.
 ///
 /// Returns `true` if the comparator declared the files equivalent; on failure
 /// dumps the comparator's stdout/stderr so the test failure message is useful.
+///
+/// Panics with a clear diagnostic if either input has zero records: a
+/// pipechain parity gate that compares two empty BAMs would pass trivially
+/// regardless of any divergence in the pipeline stages, so an empty input
+/// is always a fixture failure rather than a meaningful comparison.
 pub(crate) fn compare_bams(a: &Path, b: &Path, command: &str) -> bool {
+    let a_count = count_bam_records(a);
+    let b_count = count_bam_records(b);
+    assert!(
+        a_count > 0 && b_count > 0,
+        "pipechain parity gate (--command {command}) cannot compare empty BAMs: \
+         v1={} ({} records), v2={} ({} records). An empty-vs-empty comparison \
+         would silently pass for any consensus/group/filter divergence; check \
+         upstream stages for silent record loss.",
+        a.display(),
+        a_count,
+        b.display(),
+        b_count
+    );
+
     let output = Command::new(fgumi_bin())
         .args(["compare", "bams", a.to_str().unwrap(), b.to_str().unwrap(), "--command", command])
         .output()
