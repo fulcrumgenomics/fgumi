@@ -28,6 +28,9 @@ pub use errors::PipelineError;
 pub mod stage;
 pub use stage::{Parallelism, SequencedItem, Stage};
 
+pub mod dual_input_stage;
+pub use dual_input_stage::DualInputStage;
+
 pub mod memory;
 pub use memory::MemoryTracker;
 
