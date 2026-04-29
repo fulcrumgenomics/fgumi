@@ -426,7 +426,10 @@ impl Runall {
                     self.build_zipper_sink_header_explain(unmapped_header, command_line, explain)?;
                 stages.push(self.align_and_merge_spec_explain(unmapped_header, explain)?);
                 stages.push(self.sort_spec(sink_header.clone()));
-                stages.push(StageSpec::PositionBatch { header: sink_header.clone() });
+                stages.push(StageSpec::PositionBatch {
+                    header: sink_header.clone(),
+                    include_secondary_supplementary: false,
+                });
                 stages.push(self.group_assign_spec());
                 stages.push(StageSpec::MiAssign);
                 stages.push(StageSpec::CoalesceMiGroup {
@@ -454,7 +457,10 @@ impl Runall {
 
                 stages.push(self.align_and_merge_spec_explain(unmapped_header, explain)?);
                 stages.push(self.sort_spec(zipper_header.clone()));
-                stages.push(StageSpec::PositionBatch { header: zipper_header.clone() });
+                stages.push(StageSpec::PositionBatch {
+                    header: zipper_header.clone(),
+                    include_secondary_supplementary: false,
+                });
                 stages.push(self.group_assign_spec());
                 stages.push(StageSpec::MiAssign);
                 stages.push(StageSpec::Consensus {
@@ -672,7 +678,10 @@ impl Runall {
         if self.stop_after == StopAfter::Group {
             let stages = vec![
                 self.sort_spec(header.clone()),
-                StageSpec::PositionBatch { header: header.clone() },
+                StageSpec::PositionBatch {
+                    header: header.clone(),
+                    include_secondary_supplementary: false,
+                },
                 self.group_assign_spec(),
                 StageSpec::MiAssign,
                 StageSpec::CoalesceMiGroup { target_chunk_size: default_coalesce_chunk_size() },
@@ -692,7 +701,10 @@ impl Runall {
 
         let mut stages: Vec<StageSpec> = vec![
             self.sort_spec(header.clone()),
-            StageSpec::PositionBatch { header: header.clone() },
+            StageSpec::PositionBatch {
+                header: header.clone(),
+                include_secondary_supplementary: false,
+            },
             self.group_assign_spec(),
             StageSpec::MiAssign,
             StageSpec::Consensus {
@@ -759,7 +771,10 @@ impl Runall {
         // `--start-from group`.
         if self.stop_after == StopAfter::Group {
             let stages = vec![
-                StageSpec::PositionBatch { header: header.clone() },
+                StageSpec::PositionBatch {
+                    header: header.clone(),
+                    include_secondary_supplementary: false,
+                },
                 self.group_assign_spec(),
                 StageSpec::MiAssign,
                 StageSpec::CoalesceMiGroup { target_chunk_size: default_coalesce_chunk_size() },
@@ -795,7 +810,10 @@ impl Runall {
         let consensus_factory = self.build_consensus_factory(&header)?;
 
         let mut stages: Vec<StageSpec> = vec![
-            StageSpec::PositionBatch { header: header.clone() },
+            StageSpec::PositionBatch {
+                header: header.clone(),
+                include_secondary_supplementary: false,
+            },
             self.group_assign_spec(),
             StageSpec::MiAssign,
             StageSpec::Consensus {

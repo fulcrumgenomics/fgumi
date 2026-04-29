@@ -148,6 +148,13 @@ pub enum StageSpec {
     // Group records by position key, emit PositionGroupBatch
     PositionBatch {
         header: Header,
+        /// When `true`, secondary (`0x100`) and supplementary (`0x800`)
+        /// alignments survive into the position groups. Mirrors standalone
+        /// `RecordPositionGrouper::with_secondary_supplementary`. The
+        /// consensus path always sets this to `false` so runall matches
+        /// standalone `fgumi group` byte-for-byte; reserved `true` for any
+        /// future dedup path that needs them in templates.
+        include_secondary_supplementary: bool,
     },
 
     // Group-assign: PositionGroupBatch → MiGroupBatch (local MoleculeIds,
@@ -412,8 +419,12 @@ impl Plan {
                             .unwrap_or_else(|| "(system temp)".to_string())
                     );
                 }
-                StageSpec::PositionBatch { header: _ } => {
+                StageSpec::PositionBatch { header: _, include_secondary_supplementary } => {
                     let _ = writeln!(out, "  {n:>2}. {name}");
+                    let _ = writeln!(
+                        out,
+                        "      include secondary/supplementary: {include_secondary_supplementary}"
+                    );
                 }
                 StageSpec::GroupAssign {
                     umi_tag,

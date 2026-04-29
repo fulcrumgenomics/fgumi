@@ -236,8 +236,14 @@ fn spec_to_entry(spec: StageSpec) -> StageEntry {
                 header,
             ))))
         }
-        StageSpec::PositionBatch { header } => {
-            StageEntry::Special(Box::new(TypedSpecialStage::new(PositionBatchStage::new(header))))
+        StageSpec::PositionBatch { header, include_secondary_supplementary } => {
+            let stage = PositionBatchStage::new(header);
+            let stage = if include_secondary_supplementary {
+                stage.with_secondary_supplementary()
+            } else {
+                stage
+            };
+            StageEntry::Special(Box::new(TypedSpecialStage::new(stage)))
         }
         StageSpec::GroupAssign { umi_tag, assign_tag, strategy, max_edits, filter_config } => {
             pool_clone(GroupAssignStage::new(
