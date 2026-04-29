@@ -62,12 +62,46 @@
 
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use fgumi_raw_bam::RawRecord;
 use fgumi_umi::TagInfo;
 use noodles::sam::Header;
+
+/// Per-thread busy/wait accounting for AlignAndMerge's three threads.
+///
+/// Three buckets per thread:
+/// - `busy`: time spent doing actual work (decode, encode, merge, ...)
+/// - `wait_input`: time blocked waiting for an upstream channel/queue
+/// - `wait_output`: time blocked waiting to send into a downstream
+///   channel/queue (aligner stdin pipe also counts here for Thread A)
+///
+/// Logged at thread exit via `tracing::info!` so a `--verbose` runall run
+/// surfaces each thread's bottleneck-pattern: if Thread B's `wait_output`
+/// dominates, B is faster than C; if `wait_input` dominates, B is starved
+/// by the aligner; if `busy` dominates, B itself is the bottleneck.
+#[derive(Default)]
+struct ThreadTimings {
+    busy: Duration,
+    wait_input: Duration,
+    wait_output: Duration,
+}
+
+impl ThreadTimings {
+    fn log(&self, name: &str) {
+        tracing::info!(
+            target: "align_and_merge_timings",
+            thread = name,
+            busy_ms = self.busy.as_millis() as u64,
+            wait_input_ms = self.wait_input.as_millis() as u64,
+            wait_output_ms = self.wait_output.as_millis() as u64,
+            "AlignAndMerge thread timings (ms)"
+        );
+    }
+}
 
 /// Magic bytes that identify a BGZF block — the underlying compression
 /// format used by BAM. If the aligner's stdout starts with these bytes
@@ -136,6 +170,11 @@ pub struct AlignAndMerge {
     stderr_ring_size: usize,
     /// Whether to suppress /1 /2 suffixes in FASTQ output.
     no_read_suffix: bool,
+    /// Pool worker thread budget for the surrounding pipeline. Used to
+    /// size AlignAndMerge's internal helper pools (BGZF inflate workers,
+    /// merge_raw helpers) so the total thread count remains a function
+    /// of the user's `--threads` rather than a hardcoded constant.
+    pool_threads: usize,
     /// Shared slot populated at runtime with the merged output header
     /// (built from unmapped + aligner-produced mapped header + dict). When
     /// the plan wires a [`BamSink`] via `with_deferred_header`, that sink
@@ -158,6 +197,7 @@ impl AlignAndMerge {
         tag_info: TagInfo,
         skip_pa_tags: bool,
         no_read_suffix: bool,
+        pool_threads: usize,
     ) -> Self {
         Self {
             aligner_command,
@@ -168,6 +208,7 @@ impl AlignAndMerge {
             skip_pa_tags,
             stderr_ring_size: 50,
             no_read_suffix,
+            pool_threads,
             deferred_header: None,
         }
     }
@@ -209,6 +250,20 @@ impl SpecialStage for AlignAndMerge {
         let stdout_raw: Box<dyn Read + Send> =
             Box::new(aligner.take_stdout().expect("aligner stdout was piped"));
 
+        // Default helper-pool sizes derived from the surrounding pool's
+        // thread budget. Empirical sweep on synthetic-pipeline-xlarge
+        // (subsample, replay-aligner cat path) found:
+        //   - 4 mergers wins at every threads in {4, 8, 16}
+        //   - 2 BGZF workers wins at threads=4 (avoids over-subscription)
+        //   - 4 BGZF workers wins at threads >= 8 (catches up with the
+        //     decode pipeline)
+        // The defaults below pick `min(threads / 2, 4)` for BGZF workers
+        // and a fixed 4 for mergers. Both can be overridden via env vars
+        // for ad-hoc sweeps.
+        let pool_threads = self.pool_threads.max(1);
+        let default_n_mergers: usize = 4;
+        let default_n_bgzf: usize = (pool_threads / 2).clamp(1, 4);
+
         // 1b. Detect whether the aligner emits BAM (BGZF magic) or SAM text.
         // Most real aligners emit SAM; benchmark replay-aligners can emit
         // BAM directly to skip the SAM serialize/deserialize round-trip.
@@ -244,6 +299,7 @@ impl SpecialStage for AlignAndMerge {
         let thread_a = thread::Builder::new().name("align_and_merge_stdin".into()).spawn(
             move || -> Result<()> {
                 let mut fastq_buf: Vec<u8> = Vec::with_capacity(256 * 1024);
+                let mut timings = ThreadTimings::default();
 
                 // Per-batch: convert to FASTQ, forward unmapped to merge,
                 // then write FASTQ to stdin. Forwarding before writing
@@ -255,7 +311,10 @@ impl SpecialStage for AlignAndMerge {
                 // Returns `Ok(false)` when we should stop the loop
                 // (merge thread dropped the unmapped channel, or the
                 // aligner's stdin has broken).
-                let mut process_batch = |batch: SerializedBatch| -> Result<bool> {
+                let mut process_batch = |batch: SerializedBatch,
+                                          timings: &mut ThreadTimings|
+                 -> Result<bool> {
+                    let busy_start = Instant::now();
                     fastq_buf.clear();
                     bam_records_to_fastq(
                         &batch.primary.data,
@@ -264,18 +323,28 @@ impl SpecialStage for AlignAndMerge {
                         DEFAULT_EXCLUDE_FLAGS,
                         0,
                     )?;
+                    timings.busy += busy_start.elapsed();
 
+                    // Forward unmapped to merge thread. Channel is unbounded,
+                    // so this should never block — counted under busy if it
+                    // does for some reason (allocation contention).
                     if unmapped_tx.send(batch.primary.data).is_err() {
-                        return Ok(false); // thread C dropped
+                        return Ok(false);
                     }
 
-                    if !fastq_buf.is_empty()
-                        && let Err(e) = stdin.write_all(&fastq_buf)
-                    {
-                        // Broken pipe = aligner died; the real error
-                        // surfaces via `wait()`.
-                        tracing::debug!("stdin write failed (aligner likely exited): {e}");
-                        return Ok(false);
+                    if !fastq_buf.is_empty() {
+                        // stdin.write_all blocks if the aligner's stdin pipe
+                        // buffer is full — that's "waiting for the aligner
+                        // to consume", attributed to wait_output.
+                        let out_start = Instant::now();
+                        let write_res = stdin.write_all(&fastq_buf);
+                        timings.wait_output += out_start.elapsed();
+                        if let Err(e) = write_res {
+                            tracing::debug!(
+                                "stdin write failed (aligner likely exited): {e}"
+                            );
+                            return Ok(false);
+                        }
                     }
 
                     Ok(true)
@@ -290,14 +359,17 @@ impl SpecialStage for AlignAndMerge {
                     if cancel_a.is_cancelled() {
                         break;
                     }
+                    let in_start = Instant::now();
                     let Some(item) = input.pop() else {
+                        timings.wait_input += in_start.elapsed();
                         if input.is_drained() {
                             break;
                         }
                         thread::yield_now();
                         continue;
                     };
-                    if !process_batch(item.item)? {
+                    timings.wait_input += in_start.elapsed();
+                    if !process_batch(item.item, &mut timings)? {
                         break;
                     }
                 }
@@ -340,7 +412,7 @@ impl SpecialStage for AlignAndMerge {
                         }
 
                         if let Some(batch) = reorder.pop_ready() {
-                            if !process_batch(batch)? {
+                            if !process_batch(batch, &mut timings)? {
                                 break 'outer;
                             }
                             backoff.reset();
@@ -367,8 +439,10 @@ impl SpecialStage for AlignAndMerge {
                             break;
                         }
 
+                        let in_start = Instant::now();
                         match input.pop() {
                             Some(item) => {
+                                timings.wait_input += in_start.elapsed();
                                 // Use `batch.ordinal` (contiguous 0..N from
                                 // the upstream batcher) rather than
                                 // `SequencedItem::seq`, which earlier
@@ -380,6 +454,7 @@ impl SpecialStage for AlignAndMerge {
                                 backoff.reset();
                             }
                             None => {
+                                timings.wait_input += in_start.elapsed();
                                 // Use snooze (vs. yield_now): on a deadlocked
                                 // pop_ready=None loop, yield_now burns a CPU
                                 // core; snooze parks the thread with
@@ -395,6 +470,7 @@ impl SpecialStage for AlignAndMerge {
 
                 drop(stdin); // close aligner stdin -> aligner sees EOF
                 drop(unmapped_tx); // signal thread C: no more unmapped records
+                timings.log("A_stdin");
                 Ok(())
             },
         )?;
@@ -410,26 +486,40 @@ impl SpecialStage for AlignAndMerge {
         // unchanged.
         let thread_b = thread::Builder::new().name("align_and_merge_stdout".into()).spawn(
             move || -> Result<()> {
+                let mut timings = ThreadTimings::default();
                 if aligner_is_bam {
-                    // Single-threaded BGZF inflate inline on this thread.
-                    //
-                    // We previously used `noodles::bgzf::MultithreadedReader`
-                    // with 4 dedicated workers; that gives ~17% of
-                    // AlignAndMerge wall to BGZF inflate but adds 4 OS
-                    // threads outside the runall work-stealing pool, which
-                    // contended with the main pool at low `--threads`
-                    // counts (iter 10 saw a 1.5s regression at 4t when we
-                    // bumped from 4 to 8 BGZF workers). The single-threaded
-                    // path replaces the dedicated thread pool with inline
-                    // libdeflate inflate on Thread B; Thread B already has
-                    // BAM-record-decode work to do downstream of the
-                    // inflate, so the extra inflate cost lands on a thread
-                    // that isn't the runtime bottleneck.
+                    // Multi-threaded BGZF inflate: 2 dedicated worker
+                    // threads. We previously inlined inflate on this
+                    // thread (iter-st-bgzf) when Thread C's zipper merge
+                    // was the AlignAndMerge gate — parallelizing inflate
+                    // didn't help because Thread B couldn't drain into
+                    // Thread C any faster. After parallelizing the merge
+                    // (M_merger workers), Thread B itself became the
+                    // gate, and inflate is a real fraction of its busy
+                    // time (~17% of total CPU on the BAM path). Two
+                    // workers is a modest count: enough to overlap with
+                    // Thread B's record-decode + template-group work,
+                    // few enough to avoid the iter-10 over-subscription
+                    // regression at small `--threads`.
                     //
                     // Real `bwa mem` (SAM-emitting) is unchanged: it still
                     // uses the SAM path on the `else` branch.
-                    let buf_reader = BufReader::with_capacity(256 * 1024, stdout);
-                    let bgzf = noodles::bgzf::io::Reader::new(buf_reader);
+                    let buf_reader: Box<dyn Read + Send> =
+                        Box::new(BufReader::with_capacity(256 * 1024, stdout));
+                    // BGZF inflate worker count: defaults to
+                    // `default_n_bgzf` (derived from pool threads).
+                    // `FGUMI_N_BGZF` env var overrides for sweep experiments.
+                    let n_bgzf: usize = std::env::var("FGUMI_N_BGZF")
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .filter(|&n| n > 0)
+                        .unwrap_or(default_n_bgzf);
+                    let bgzf_workers =
+                        std::num::NonZero::new(n_bgzf).expect("n_bgzf > 0");
+                    let bgzf = noodles::bgzf::io::MultithreadedReader::with_worker_count(
+                        bgzf_workers,
+                        buf_reader,
+                    );
                     let mut bam_reader = noodles::bam::io::Reader::from(bgzf);
                     let mapped_header = bam_reader.read_header()?;
                     header_tx.send(mapped_header.clone()).map_err(|_| {
@@ -438,12 +528,33 @@ impl SpecialStage for AlignAndMerge {
 
                     let bgzf = bam_reader.into_inner();
                     let raw = fgumi_raw_bam::RawBamReader::new(bgzf);
-                    let iter = crate::template::TemplateIterator::new(raw);
-                    for template in iter {
+                    let mut iter = crate::template::TemplateIterator::new(raw);
+                    loop {
                         if cancel_b.is_cancelled() {
                             break;
                         }
-                        if mapped_tx.send(template).is_err() {
+                        // Time spent in `iter.next()` is BGZF inflate +
+                        // BAM record decode + Template grouping. Treat as
+                        // busy: the iterator blocks on stdin only when
+                        // the aligner is slow to produce, which we count
+                        // separately as `wait_input`. To distinguish:
+                        // record the duration of `next()` and then check
+                        // `n_procs` of the aligner — if it's slow because
+                        // the aligner is producing slowly, this shows up
+                        // as a high busy time but low CPU usage. perf
+                        // record can disambiguate further.
+                        let busy_start = Instant::now();
+                        let next = iter.next();
+                        timings.busy += busy_start.elapsed();
+
+                        let template = match next {
+                            Some(t) => t,
+                            None => break,
+                        };
+                        let out_start = Instant::now();
+                        let send_res = mapped_tx.send(template);
+                        timings.wait_output += out_start.elapsed();
+                        if send_res.is_err() {
                             break;
                         }
                     }
@@ -465,27 +576,48 @@ impl SpecialStage for AlignAndMerge {
                                 .map_err(|e| anyhow!("AlignAndMerge: encode failed: {e}"))
                         })
                     });
-                    let iter = crate::template::TemplateIterFromRecords::new(record_iter);
-                    for template in iter {
+                    let mut iter = crate::template::TemplateIterFromRecords::new(record_iter);
+                    loop {
                         if cancel_b.is_cancelled() {
                             break;
                         }
-                        if mapped_tx.send(template).is_err() {
+                        let busy_start = Instant::now();
+                        let next = iter.next();
+                        timings.busy += busy_start.elapsed();
+
+                        let template = match next {
+                            Some(t) => t,
+                            None => break,
+                        };
+                        let out_start = Instant::now();
+                        let send_res = mapped_tx.send(template);
+                        timings.wait_output += out_start.elapsed();
+                        if send_res.is_err() {
                             break;
                         }
                     }
                 }
                 drop(mapped_tx); // signal thread C: no more mapped templates
+                timings.log("B_stdout");
                 Ok(())
             },
         )?;
 
-        // Thread C: zipper merge + output.
+        // Thread C: zipper-merge orchestrator. Spawns N helper threads
+        // that do the per-template merge_raw + BAM encode in parallel,
+        // and feeds them via an internal `merge_jobs` channel. The
+        // matcher loop here is what was previously the merge thread —
+        // minus the merge work, which moves to the helpers.
         let unmapped_header = self.unmapped_header;
         let dict_path = self.dict_path;
         let tag_info = self.tag_info;
         let skip_pa_tags = self.skip_pa_tags;
         let deferred_header = self.deferred_header.clone();
+
+        // Convert the boxed output queue to an Arc so multiple helper
+        // threads can each push to it. `OutputQueue<T>: Send + Sync` so
+        // sharing via Arc is safe.
+        let output_arc: Arc<dyn OutputQueue<SerializedBatch>> = Arc::from(output);
 
         let thread_c = thread::Builder::new().name("align_and_merge_merge".into()).spawn(
             move || -> Result<()> {
@@ -495,15 +627,16 @@ impl SpecialStage for AlignAndMerge {
                     header_rx,
                     unmapped_rx,
                     mapped_rx,
-                    &*output,
+                    output_arc.clone(),
                     &cancel_c,
                     &unmapped_header,
                     &dict_path,
                     &tag_info,
                     skip_pa_tags,
+                    default_n_mergers,
                     deferred_header.as_ref(),
                 );
-                output.close();
+                output_arc.close();
                 result
             },
         )?;
@@ -575,12 +708,13 @@ fn run_merge(
     header_rx: std::sync::mpsc::Receiver<Header>,
     unmapped_rx: crossbeam_channel::Receiver<Vec<u8>>,
     mapped_rx: crossbeam_channel::Receiver<Result<crate::template::Template>>,
-    output: &dyn OutputQueue<SerializedBatch>,
+    output: Arc<dyn OutputQueue<SerializedBatch>>,
     cancel: &CancelToken,
     unmapped_header: &Header,
     dict_path: &Path,
     tag_info: &TagInfo,
     skip_pa_tags: bool,
+    default_n_mergers: usize,
     deferred_header: Option<&crate::runall::engine::sink::DeferredHeader>,
 ) -> Result<()> {
     let mapped_header = header_rx.recv().map_err(|_| {
@@ -599,61 +733,188 @@ fn run_merge(
         let _ = slot.set(output_header);
     }
 
+    // Spawn N merge helpers. They consume `(ordinal, unmapped, mapped)`
+    // jobs from a fan-out channel, run merge_raw + BAM encode in
+    // parallel, and push the merged `SerializedBatch` directly to the
+    // shared output queue. Order is NOT preserved across helpers —
+    // downstream `SortStage` consumes batches via its own drainer that
+    // doesn't depend on input order, so reordering is unnecessary.
+    //
+    // Merger pool size: defaults to `default_n_mergers` (4 across all
+    // tested thread counts; sweep showed it doesn't over-subscribe).
+    // `FGUMI_N_MERGERS` env var overrides.
+    let n_mergers: usize = std::env::var("FGUMI_N_MERGERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default_n_mergers);
+    let (merge_jobs_tx, merge_jobs_rx) = crossbeam_channel::bounded::<(
+        u64,
+        crate::template::Template,
+        crate::template::Template,
+    )>(1024);
+
+    let mut helpers: Vec<thread::JoinHandle<Result<()>>> = Vec::with_capacity(n_mergers);
+    for i in 0..n_mergers {
+        let merge_jobs_rx = merge_jobs_rx.clone();
+        let output = output.clone();
+        let cancel = cancel.clone();
+        let tag_info = tag_info.clone();
+        helpers.push(
+            thread::Builder::new()
+                .name(format!("align_and_merge_helper_{i}"))
+                .spawn(move || -> Result<()> {
+                    let mut timings = ThreadTimings::default();
+                    loop {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        let in_start = Instant::now();
+                        let job = merge_jobs_rx.recv();
+                        timings.wait_input += in_start.elapsed();
+                        let (ordinal, unmapped_template, mut mapped_template) = match job {
+                            Ok(j) => j,
+                            Err(_) => break, // channel closed by matcher
+                        };
+
+                        let busy_start = Instant::now();
+                        merge(
+                            &unmapped_template,
+                            &mut mapped_template,
+                            &tag_info,
+                            skip_pa_tags,
+                        )?;
+                        let mut data: Vec<u8> = Vec::with_capacity(2 * 1024);
+                        let mut record_count: u64 = 0;
+                        for rec in mapped_template.records() {
+                            let raw: &[u8] = rec.as_ref();
+                            let block_size = u32::try_from(raw.len()).map_err(|_| {
+                                anyhow!("AlignAndMerge: encoded record exceeds u32::MAX bytes")
+                            })?;
+                            data.extend_from_slice(&block_size.to_le_bytes());
+                            data.extend_from_slice(raw);
+                            record_count += 1;
+                        }
+                        timings.busy += busy_start.elapsed();
+
+                        let mem_est = data.capacity();
+                        let batch = SerializedBatch {
+                            primary: RawBytes { data, record_count },
+                            secondary: None,
+                            ordinal,
+                        };
+                        let seq_item = SequencedItem::new(ordinal, batch, mem_est);
+                        let push_start = Instant::now();
+                        let push_res = output.push_until_cancelled(seq_item, &cancel);
+                        timings.wait_output += push_start.elapsed();
+                        if push_res.is_err() {
+                            break;
+                        }
+                    }
+                    timings.log(&format!("M_merger_{i}"));
+                    Ok(())
+                })?,
+        );
+    }
+    // Drop the receiver clone we held so when the matcher drops `merge_jobs_tx`
+    // the helpers see RecvError and exit.
+    drop(merge_jobs_rx);
+
     // Parse raw unmapped BAM chunks into RecordBuf and group into templates.
     let unmapped_record_iter = RawBamChunkIterator::new(unmapped_rx, unmapped_header);
-    let unmapped_templates = crate::template::TemplateIterFromRecords::new(unmapped_record_iter);
+    let mut unmapped_templates =
+        crate::template::TemplateIterFromRecords::new(unmapped_record_iter);
 
     let mut mapped_peek: Option<crate::template::Template> = None;
     let mut ordinal: u64 = 0;
 
-    for unmapped_result in unmapped_templates {
-        if cancel.is_cancelled() {
-            break;
-        }
-        let unmapped_template = unmapped_result?;
+    // Matcher (was Thread C). Splits its time into:
+    // - wait_input: blocked pulling from unmapped_rx or mapped_rx
+    // - busy: very small now — just template-name comparison + dispatch
+    // - wait_output: blocked dispatching to merge_jobs_tx (helpers full)
+    let mut timings = ThreadTimings::default();
 
-        if mapped_peek.is_none() {
-            mapped_peek = match mapped_rx.recv() {
-                Ok(Ok(t)) => Some(t),
-                Ok(Err(e)) => return Err(e),
-                Err(_) => None, // channel closed
+    let matcher_loop_result: Result<()> = (|| {
+        loop {
+            if cancel.is_cancelled() {
+                break Ok(());
+            }
+            let in_start = Instant::now();
+            let next_unmapped = unmapped_templates.next();
+            timings.wait_input += in_start.elapsed();
+
+            let unmapped_template = match next_unmapped {
+                Some(r) => r?,
+                None => break Ok(()),
             };
+
+            if mapped_peek.is_none() {
+                let m_start = Instant::now();
+                let recv = mapped_rx.recv();
+                timings.wait_input += m_start.elapsed();
+                mapped_peek = match recv {
+                    Ok(Ok(t)) => Some(t),
+                    Ok(Err(e)) => break Err(e),
+                    Err(_) => None, // channel closed
+                };
+            }
+
+            // Peek-by-name: keep the mapped template if names don't match
+            // (orphan unmapped — skip), consume it on a match.
+            let same_name = mapped_peek
+                .as_ref()
+                .map(|m| m.name == unmapped_template.name)
+                .unwrap_or(false);
+            if !same_name {
+                if mapped_peek.is_none() {
+                    break Ok(()); // mapped exhausted; remaining unmapped are orphans
+                }
+                continue; // mismatch: skip the unmapped, retain mapped_peek
+            }
+
+            let mapped_template =
+                mapped_peek.take().expect("just verified mapped_peek.is_some");
+
+            let out_start = Instant::now();
+            let send_res =
+                merge_jobs_tx.send((ordinal, unmapped_template, mapped_template));
+            timings.wait_output += out_start.elapsed();
+            if send_res.is_err() {
+                // helpers all exited (likely cancellation)
+                break Ok(());
+            }
+            ordinal += 1;
         }
+    })();
+    timings.log("C_matcher");
 
-        let Some(ref mut mapped_template) = mapped_peek else {
-            break; // no more mapped templates; remaining unmapped are orphans
-        };
+    // Close the jobs channel so helpers see RecvError and exit.
+    drop(merge_jobs_tx);
 
-        if mapped_template.name != unmapped_template.name {
-            // Orphan unmapped read: skip (matches zipper exclude_missing_reads=true).
-            continue;
+    // Join helpers; if any errored, surface that error (overriding the
+    // matcher's result, since helper errors are typically the proximate
+    // cause when a merge fails).
+    let mut helper_err: Option<anyhow::Error> = None;
+    for h in helpers {
+        match h.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                if helper_err.is_none() {
+                    helper_err = Some(e);
+                }
+            }
+            Err(p) => {
+                if helper_err.is_none() {
+                    helper_err =
+                        Some(anyhow!("AlignAndMerge merger thread panicked: {p:?}"));
+                }
+            }
         }
-
-        merge(&unmapped_template, mapped_template, tag_info, skip_pa_tags)?;
-
-        // Two to ~eight records per template (primary + supplementaries); at
-        // ~200 bytes each, 2 KiB covers the typical case without realloc.
-        let mut data: Vec<u8> = Vec::with_capacity(2 * 1024);
-        let mut record_count: u64 = 0;
-        for rec in mapped_template.records() {
-            let raw: &[u8] = rec.as_ref();
-            let block_size = u32::try_from(raw.len())
-                .map_err(|_| anyhow!("AlignAndMerge: encoded record exceeds u32::MAX bytes"))?;
-            data.extend_from_slice(&block_size.to_le_bytes());
-            data.extend_from_slice(raw);
-            record_count += 1;
-        }
-
-        let mem_est = data.capacity();
-        let batch =
-            SerializedBatch { primary: RawBytes { data, record_count }, secondary: None, ordinal };
-        let seq_item = SequencedItem::new(ordinal, batch, mem_est);
-        if output.push_until_cancelled(seq_item, cancel).is_err() {
-            break;
-        }
-        ordinal += 1;
-        mapped_peek = None;
     }
+    if let Some(e) = helper_err {
+        return Err(e);
+    }
+    matcher_loop_result?;
 
     // Sanity check: any leftover mapped templates mean the aligner emitted
     // a record whose QNAME wasn't found in the unmapped stream by the time
@@ -771,6 +1032,7 @@ mod tests {
             TagInfo::new(vec![], vec![], vec![]),
             false,
             false,
+            1,
         );
         assert_eq!(stage.name(), "AlignAndMerge");
     }
@@ -886,6 +1148,7 @@ mod tests {
             TagInfo::new(vec![], vec![], vec![]),
             true, // skip_pa_tags
             true, // no_read_suffix
+            1,
         );
 
         // Typed queues — Arc<StageQueue<T>> implements InputQueue<T> /
@@ -1028,6 +1291,7 @@ mod tests {
             TagInfo::new(vec![], vec![], vec![]),
             true,
             true,
+            1,
         );
 
         let tracker = Arc::new(MemoryTracker::new(100_000_000));
@@ -1137,6 +1401,7 @@ mod tests {
             TagInfo::new(vec![], vec![], vec![]),
             true,
             true,
+            1,
         );
 
         let tracker = Arc::new(MemoryTracker::new(10_000_000));
@@ -1263,6 +1528,7 @@ mod tests {
             TagInfo::new(vec![], vec![], vec![]),
             true,
             true,
+            1,
         );
 
         let tracker = Arc::new(MemoryTracker::new(100_000_000));

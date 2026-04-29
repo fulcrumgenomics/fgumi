@@ -928,6 +928,7 @@ impl Runall {
             tag_info,
             skip_pa_tags: self.zipper_opts.zipper_skip_pa_tags,
             no_read_suffix: false,
+            pool_threads: self.threads.max(1),
             deferred_header: None,
         })
     }

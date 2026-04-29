@@ -130,6 +130,10 @@ pub enum StageSpec {
         tag_info: TagInfo,
         skip_pa_tags: bool,
         no_read_suffix: bool,
+        /// Pool worker thread budget (`--threads`) — used by the stage
+        /// to size its internal helper pools (BGZF inflate workers,
+        /// merge_raw helpers).
+        pool_threads: usize,
         /// Shared slot the stage populates at runtime with the merged output
         /// header (built from unmapped + aligner-produced mapped header +
         /// dict). When paired with a `SinkSpec::BamSink` that has the same
@@ -394,6 +398,7 @@ impl Plan {
                     tag_info: _,
                     skip_pa_tags,
                     no_read_suffix,
+                    pool_threads,
                     unmapped_header: _,
                     deferred_header: _,
                 } => {
@@ -403,7 +408,7 @@ impl Plan {
                     let _ = writeln!(out, "      dict: {}", dict_path.display());
                     let _ = writeln!(
                         out,
-                        "      skip PA tags: {skip_pa_tags}   no read suffix: {no_read_suffix}"
+                        "      skip PA tags: {skip_pa_tags}   no read suffix: {no_read_suffix}   pool threads: {pool_threads}"
                     );
                 }
                 StageSpec::Sort { memory_limit, temp_dir, threads, header: _ } => {

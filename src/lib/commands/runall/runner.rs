@@ -212,6 +212,7 @@ fn spec_to_entry(spec: StageSpec) -> StageEntry {
             tag_info,
             skip_pa_tags,
             no_read_suffix,
+            pool_threads,
             deferred_header,
         } => {
             let mut stage = AlignAndMerge::new(
@@ -222,6 +223,7 @@ fn spec_to_entry(spec: StageSpec) -> StageEntry {
                 tag_info,
                 skip_pa_tags,
                 no_read_suffix,
+                pool_threads,
             );
             if let Some(slot) = deferred_header {
                 stage = stage.with_deferred_header(slot);
