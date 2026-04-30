@@ -157,12 +157,12 @@ fn open_fastq_reader(
     let open_reader = |path: &Path| -> Result<Box<dyn std::io::Read + Send>> {
         let file = File::open(path)?;
         if async_reader {
-            crate::os_hints::advise_sequential(&file);
+            fgumi_bam_io::os_hints::advise_sequential(&file);
             log::info!(
                 "async FASTQ reader enabled: spawning fgumi-prefetch thread for {}",
                 path.display()
             );
-            Ok(Box::new(crate::prefetch_reader::PrefetchReader::from_file(file)))
+            Ok(Box::new(fgumi_bam_io::prefetch_reader::PrefetchReader::from_file(file)))
         } else {
             Ok(Box::new(file))
         }

@@ -3709,13 +3709,13 @@ where
                 .iter()
                 .map(|p| {
                     let file = File::open(p)?;
-                    crate::os_hints::advise_sequential(&file);
+                    fgumi_bam_io::os_hints::advise_sequential(&file);
                     let inner: Box<dyn BufRead + Send> = if config.async_reader {
                         // PrefetchReader dedicates one OS thread per input file to
                         // issue reads ahead of the consumer, overlapping I/O with
                         // processing. For paired/indexed inputs this adds 2-4 extra
                         // threads beyond the pipeline worker count.
-                        let prefetch = crate::prefetch_reader::PrefetchReader::from_file(file);
+                        let prefetch = fgumi_bam_io::prefetch_reader::PrefetchReader::from_file(file);
                         Box::new(BufReader::with_capacity(256 * 1024, prefetch))
                     } else {
                         Box::new(BufReader::with_capacity(256 * 1024, file))
