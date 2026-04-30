@@ -55,6 +55,7 @@ memory-debug = []
 profile-adjacency = []  # carried forward from main crate for clippy compatibility
 
 [dev-dependencies]
+fgumi-bam-io = { workspace = true }
 fgumi-raw-bam = { workspace = true, features = ["test-utils", "noodles"] }
 fgumi-sam = { workspace = true }
 rstest = "0"

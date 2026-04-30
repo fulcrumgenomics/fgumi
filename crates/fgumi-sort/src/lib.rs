@@ -47,6 +47,7 @@ pub mod reader;
 pub mod read_ahead;
 pub(crate) mod segmented_buf;
 pub mod tmp_dir_alloc;
+pub mod verify;
 pub mod worker_pool;
 
 /// Buffer size for `BufReader` during merge phase.
@@ -146,6 +147,7 @@ pub use keys::{
 };
 pub use pipeline::{ParallelMergeConfig, parallel_merge, parallel_merge_buffered};
 pub use reader::RawBamRecordReader;
+pub use verify::{VerifySummary, verify_sort_order};
 
 #[cfg(test)]
 mod tests {
