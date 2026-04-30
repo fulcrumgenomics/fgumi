@@ -13,9 +13,9 @@
 
 pub mod header;
 pub mod mem_estimate;
-pub(crate) mod os_hints;
+pub mod os_hints;
 pub mod paths;
-pub(crate) mod prefetch_reader;
+pub mod prefetch_reader;
 pub mod progress;
 pub mod reader;
 pub mod reorder;

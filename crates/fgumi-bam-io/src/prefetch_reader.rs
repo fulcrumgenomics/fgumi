@@ -82,8 +82,7 @@ type Item = io::Result<Vec<u8>>;
 ///
 /// ```no_run
 /// use std::io::{Cursor, Read};
-/// // PrefetchReader is pub(crate) — available only within fgumi-bam-io.
-/// // This example shows the expected usage pattern.
+/// // Example showing the expected usage pattern.
 /// // let data: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
 /// // let mut reader = PrefetchReader::new(Cursor::new(data.clone()));
 /// // let mut out = Vec::new();
@@ -152,7 +151,7 @@ impl PrefetchReader {
     ///
     /// On Linux the producer thread will call
     /// `posix_fadvise(POSIX_FADV_WILLNEED)` after each chunk fill to
-    /// proactively page in the next [`WILLNEED_LOOKAHEAD`] bytes,
+    /// proactively page in the next 128 MiB of data,
     /// making the reader independent of the kernel's default read-ahead
     /// window (`read_ahead_kb`). On non-Linux platforms this behaves
     /// identically to [`new`](Self::new).
