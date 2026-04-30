@@ -5,7 +5,6 @@
 //! When a total is known, it also displays percentage complete and ETA using an exponential
 //! moving average (EMA) of the processing rate with bias correction (tqdm-style).
 
-use crate::logging::format_duration;
 use log::info;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,7 +69,23 @@ impl EmaState {
     }
 }
 
-/// Convert seconds (f64) to a formatted duration string via [`crate::logging::format_duration`].
+/// Formats a [`Duration`] as a human-readable string (e.g. `"2m 15s"`, `"1h 30m"`).
+fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        let mins = secs / 60;
+        let remaining_secs = secs % 60;
+        if remaining_secs == 0 { format!("{mins}m") } else { format!("{mins}m {remaining_secs}s") }
+    } else {
+        let hours = secs / 3600;
+        let mins = (secs % 3600) / 60;
+        if mins == 0 { format!("{hours}h") } else { format!("{hours}h {mins}m") }
+    }
+}
+
+/// Convert seconds (f64) to a formatted duration string.
 fn fmt_duration(secs: f64) -> String {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     format_duration(Duration::from_secs(secs.round() as u64))
