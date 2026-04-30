@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn test_add_pg_record_write_to_bam() {
-        use crate::bam_io::create_bam_writer;
+        use crate::writer::create_bam_writer;
         use tempfile::TempDir;
 
         let dir = TempDir::new().expect("creating temp file/dir should succeed");
@@ -377,7 +377,7 @@ mod tests {
 
     #[test]
     fn test_add_pg_record_chains_to_empty_program() {
-        use crate::bam_io::create_bam_writer;
+        use crate::writer::create_bam_writer;
         use tempfile::TempDir;
 
         // Simulate what SamBuilder does - adds an empty/default program

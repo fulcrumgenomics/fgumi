@@ -1,85 +1,29 @@
-//! BAM file I/O utilities.
+//! BAM writer factories and related types.
 //!
-//! This module provides common utilities for creating BAM readers and writers with consistent
-//! error handling and header management.
-//!
-//! # Threading Model
-//!
-//! BAM files use BGZF compression, which can be parallelized for both reading and writing:
-//!
-//! - **Single-threaded**: Use `threads=1` (lower overhead, good for small files)
-//! - **Multi-threaded**: Use `threads>1` (higher throughput for large files)
-//!
-//! Multi-threaded I/O is beneficial for:
-//! - Large BAM files where decompression/compression is a bottleneck
-//! - Systems with fast storage (SSD/NVMe) where I/O isn't the limiting factor
-//! - Pipelines that process many records in parallel
+//! This module provides writer factories for BAM output, including standard BAM writers,
+//! raw-bytes BAM writers, and an incremental-indexing BAM writer.
 
 use anyhow::{Context, Result};
+use bgzf::CompressionLevel;
 use noodles::bam::bai;
-// Use old VirtualPosition for compatibility with noodles_csi::Chunk
 use noodles::bgzf::VirtualPosition;
 use noodles::core::Position;
 use noodles::sam::Header;
-// Use noodles_bgzf for standard BGZF types
-use noodles_bgzf::io::{MultithreadedReader, Reader as BgzfReader, Writer as BgzfWriter};
-// Use vendored MultithreadedWriter with position tracking
-// (until https://github.com/zaeleus/noodles/pull/371 merges)
-use crate::vendored::{BlockInfoRx, MultithreadedWriter, MultithreadedWriterBuilder};
-// Use RawBamReader for raw byte access
-// (until https://github.com/zaeleus/noodles/pull/373 merges)
-use fgumi_raw_bam::RawBamReader;
-// Use bgzf crate for CompressionLevel
-use bgzf::CompressionLevel;
+use noodles_bgzf::io::Writer as BgzfWriter;
 use noodles_csi::binning_index::Indexer;
 use noodles_csi::binning_index::index::reference_sequence::bin::Chunk;
 use noodles_csi::binning_index::index::reference_sequence::index::LinearIndex;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Write};
 use std::num::NonZero;
 use std::path::Path;
 
+use crate::paths::is_stdout_path;
+use crate::vendored::{BlockInfoRx, MultithreadedWriter, MultithreadedWriterBuilder};
+
 /// Maximum uncompressed BGZF block size (64KB - 256 bytes for overhead).
 const MAX_BLOCK_SIZE: usize = 65280;
-
-/// Enum wrapping single-threaded and multi-threaded BGZF readers.
-///
-/// This allows functions to accept either reader type through a unified interface.
-pub enum BgzfReaderEnum {
-    /// Single-threaded BGZF reader (lower overhead for small files)
-    SingleThreaded(BgzfReader<Box<dyn Read + Send>>),
-    /// Multi-threaded BGZF reader (noodles built-in threading)
-    MultiThreaded(MultithreadedReader<Box<dyn Read + Send>>),
-}
-
-impl Read for BgzfReaderEnum {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            BgzfReaderEnum::SingleThreaded(r) => r.read(buf),
-            BgzfReaderEnum::MultiThreaded(r) => r.read(buf),
-        }
-    }
-}
-
-impl BufRead for BgzfReaderEnum {
-    fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        match self {
-            BgzfReaderEnum::SingleThreaded(r) => r.fill_buf(),
-            BgzfReaderEnum::MultiThreaded(r) => r.fill_buf(),
-        }
-    }
-
-    fn consume(&mut self, amt: usize) {
-        match self {
-            BgzfReaderEnum::SingleThreaded(r) => r.consume(amt),
-            BgzfReaderEnum::MultiThreaded(r) => r.consume(amt),
-        }
-    }
-}
-
-/// Type alias for a BAM reader that supports both single and multi-threaded BGZF.
-pub type BamReaderAuto = noodles::bam::io::Reader<BgzfReaderEnum>;
 
 /// Enum wrapping single-threaded and multi-threaded BGZF writers.
 ///
@@ -129,23 +73,13 @@ impl BgzfWriterEnum {
     }
 }
 
-/// Type alias for a BAM writer that supports both single and multi-threaded BGZF
+/// Type alias for a BAM writer that supports both single and multi-threaded BGZF.
 pub type BamWriter = noodles::bam::io::Writer<BgzfWriterEnum>;
-
-/// Create a [`BgzfReaderEnum`] from a file, selecting single- or multi-threaded based on `threads`.
-fn make_bgzf_reader(reader: Box<dyn Read + Send>, threads: usize) -> BgzfReaderEnum {
-    if threads > 1 {
-        let worker_count = NonZero::new(threads).expect("threads > 1 checked above");
-        BgzfReaderEnum::MultiThreaded(MultithreadedReader::with_worker_count(worker_count, reader))
-    } else {
-        BgzfReaderEnum::SingleThreaded(BgzfReader::new(reader))
-    }
-}
 
 /// Create a [`BgzfWriterEnum`] from a writer, selecting single- or multi-threaded based on
 /// `threads`.
 #[allow(clippy::cast_possible_truncation)]
-fn make_bgzf_writer(
+pub(crate) fn make_bgzf_writer(
     output: Box<dyn Write + Send>,
     threads: usize,
     compression_level: u32,
@@ -634,173 +568,23 @@ pub fn write_bai_index<P: AsRef<Path>>(path: P, index: &bai::Index) -> Result<()
     Ok(())
 }
 
-/// Create a BAM reader and read its header.
+/// Create a BAM writer and write the header in one operation.
 ///
 /// # Arguments
-/// * `path` - Path to the input BAM file
-/// * `threads` - Number of decompression threads (1 = single-threaded)
-///
-/// # Threading
-/// - `threads <= 1`: Single-threaded (lower overhead, good for small files)
-/// - `threads > 1`: Multi-threaded (higher throughput for large files)
-///
-/// # Returns
-/// A tuple of (BAM reader, header)
-///
-/// # Errors
-/// Returns an error if the file cannot be opened or the header cannot be read
-///
-/// # Panics
-/// Panics if `threads > 1` but `NonZero::new` fails (should not happen).
-///
-/// # Example
-/// ```no_run
-/// use fgumi_bam_io::bam_io::create_bam_reader;
-/// use std::path::Path;
-///
-/// // Single-threaded
-/// let (mut reader, header) = create_bam_reader(Path::new("input.bam"), 1).unwrap();
-///
-/// // Multi-threaded with 4 decompression threads
-/// let (mut reader, header) = create_bam_reader(Path::new("input.bam"), 4).unwrap();
-/// ```
-pub fn create_bam_reader<P: AsRef<Path>>(
-    path: P,
-    threads: usize,
-) -> Result<(BamReaderAuto, Header)> {
-    create_bam_reader_with_opts(path, threads, PipelineReaderOpts::default())
-}
-
-/// Variant of [`create_bam_reader`] that accepts [`PipelineReaderOpts`].
-///
-/// When `opts.async_reader` is true the file is wrapped in a
-/// [`PrefetchReader`](crate::prefetch_reader::PrefetchReader) before the BGZF
-/// decompression layer, overlapping disk I/O with BGZF decoding.
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be opened or the BAM header cannot be parsed.
-pub fn create_bam_reader_with_opts<P: AsRef<Path>>(
-    path: P,
-    threads: usize,
-    opts: PipelineReaderOpts,
-) -> Result<(BamReaderAuto, Header)> {
-    let path_ref = path.as_ref();
-    let file = File::open(path_ref)
-        .with_context(|| format!("Failed to open input BAM: {}", path_ref.display()))?;
-
-    crate::os_hints::advise_sequential(&file);
-    let reader: Box<dyn Read + Send> = if opts.async_reader {
-        log::info!(
-            "async BAM reader enabled: spawning fgumi-prefetch thread for {}",
-            path_ref.display()
-        );
-        Box::new(crate::prefetch_reader::PrefetchReader::from_file(file))
-    } else {
-        Box::new(file)
-    };
-    let bgzf_reader = make_bgzf_reader(reader, threads);
-
-    let mut reader = noodles::bam::io::Reader::from(bgzf_reader);
-    let header = reader
-        .read_header()
-        .with_context(|| format!("Failed to read header from: {}", path_ref.display()))?;
-
-    Ok((reader, header))
-}
-
-/// Type alias for a raw BAM reader that supports both single and multi-threaded BGZF.
-pub type RawBamReaderAuto = RawBamReader<BgzfReaderEnum>;
-
-/// Create a raw BAM reader that yields raw bytes instead of noodles Record.
-///
-/// This is used by the raw sorting pipeline for high-performance byte-level access
-/// without going through noodles' Record parsing.
-///
-/// # Arguments
-/// * `path` - Path to the input BAM file
-/// * `threads` - Number of threads for BGZF decompression (1 = single-threaded)
-///
-/// # Returns
-/// A tuple of (`raw_reader`, `header`)
-///
-/// # Errors
-/// Returns an error if the file cannot be opened or the header cannot be read
-///
-/// # Panics
-/// Panics if `threads > 1` but `NonZero::new` fails (should not happen).
-pub fn create_raw_bam_reader<P: AsRef<Path>>(
-    path: P,
-    threads: usize,
-) -> Result<(RawBamReaderAuto, Header)> {
-    create_raw_bam_reader_with_opts(path, threads, PipelineReaderOpts::default())
-}
-
-/// Variant of [`create_raw_bam_reader`] that accepts [`PipelineReaderOpts`].
-///
-/// When `opts.async_reader` is true the file is wrapped in a
-/// [`PrefetchReader`](crate::prefetch_reader::PrefetchReader) before the BGZF
-/// decompression layer, overlapping disk I/O with BGZF decoding.
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be opened or the BAM header cannot be parsed.
-pub fn create_raw_bam_reader_with_opts<P: AsRef<Path>>(
-    path: P,
-    threads: usize,
-    opts: PipelineReaderOpts,
-) -> Result<(RawBamReaderAuto, Header)> {
-    let path_ref = path.as_ref();
-    let file = File::open(path_ref)
-        .with_context(|| format!("Failed to open input BAM: {}", path_ref.display()))?;
-
-    crate::os_hints::advise_sequential(&file);
-    let reader: Box<dyn Read + Send> = if opts.async_reader {
-        log::info!(
-            "async raw BAM reader enabled: spawning fgumi-prefetch thread for {}",
-            path_ref.display()
-        );
-        Box::new(crate::prefetch_reader::PrefetchReader::from_file(file))
-    } else {
-        Box::new(file)
-    };
-    let bgzf_reader = make_bgzf_reader(reader, threads);
-
-    // Use noodles to read the header, then extract the BGZF reader
-    let mut noodles_reader = noodles::bam::io::Reader::from(bgzf_reader);
-    let header = noodles_reader
-        .read_header()
-        .with_context(|| format!("Failed to read header from: {}", path_ref.display()))?;
-
-    // Get back the BGZF reader (header has been consumed)
-    let bgzf_reader = noodles_reader.into_inner();
-
-    // Wrap in our raw reader
-    let raw_reader = RawBamReader::new(bgzf_reader);
-
-    Ok((raw_reader, header))
-}
-
-/// Create a BAM writer and write the header in one operation
-///
-/// # Arguments
-/// * `path` - Path for the output BAM file
+/// * `path` - Path for the output BAM file (use `-` or `/dev/stdout` for stdout)
 /// * `header` - SAM header to write
 /// * `threads` - Number of threads for BGZF compression (1 = single-threaded)
 /// * `compression_level` - Compression level (1-12)
 ///
 /// # Returns
-/// A BAM writer ready for writing records
+/// A BAM writer with the header already written.
 ///
 /// # Errors
-/// Returns an error if the file cannot be created or the header cannot be written
-///
-/// # Panics
-/// Panics if `threads > 1` but `NonZero::new` fails (should not happen).
+/// Returns an error if the file cannot be created or the header cannot be written.
 ///
 /// # Example
 /// ```no_run
-/// use fgumi_bam_io::bam_io::create_bam_writer;
+/// use fgumi_bam_io::writer::create_bam_writer;
 /// use noodles::sam::Header;
 /// use std::path::Path;
 ///
@@ -828,7 +612,7 @@ pub fn create_bam_writer<P: AsRef<Path>>(
     Ok(writer)
 }
 
-/// Create an optional BAM writer for rejects or filtered reads
+/// Create an optional BAM writer for rejects or filtered reads.
 ///
 /// This is a convenience function for commands that optionally output rejected/filtered reads.
 /// If the path is `None`, returns `None`. If the path is `Some`, creates a writer and writes
@@ -841,14 +625,14 @@ pub fn create_bam_writer<P: AsRef<Path>>(
 /// * `compression_level` - Compression level (1-12)
 ///
 /// # Returns
-/// An optional BAM writer, or None if path is None
+/// An optional BAM writer, or None if path is None.
 ///
 /// # Errors
-/// Returns an error if the file cannot be created or the header cannot be written
+/// Returns an error if the file cannot be created or the header cannot be written.
 ///
 /// # Example
 /// ```no_run
-/// use fgumi_bam_io::bam_io::create_optional_bam_writer;
+/// use fgumi_bam_io::writer::create_optional_bam_writer;
 /// use noodles::sam::Header;
 /// use std::path::PathBuf;
 ///
@@ -868,43 +652,7 @@ pub fn create_optional_bam_writer<P: AsRef<Path>>(
     }
 }
 
-/// Check if a path refers to stdin.
-///
-/// Returns true if the path is "-" or "/dev/stdin".
-///
-/// # Example
-/// ```
-/// use fgumi_bam_io::bam_io::is_stdin_path;
-/// use std::path::Path;
-///
-/// assert!(is_stdin_path(Path::new("-")));
-/// assert!(is_stdin_path(Path::new("/dev/stdin")));
-/// assert!(!is_stdin_path(Path::new("input.bam")));
-/// ```
-pub fn is_stdin_path<P: AsRef<Path>>(path: P) -> bool {
-    let path_str = path.as_ref().to_string_lossy();
-    path_str == "-" || path_str == "/dev/stdin"
-}
-
-/// Check if a path refers to stdout.
-///
-/// Returns true if the path is "-" or "/dev/stdout".
-///
-/// # Example
-/// ```
-/// use fgumi_bam_io::bam_io::is_stdout_path;
-/// use std::path::Path;
-///
-/// assert!(is_stdout_path(Path::new("-")));
-/// assert!(is_stdout_path(Path::new("/dev/stdout")));
-/// assert!(!is_stdout_path(Path::new("output.bam")));
-/// ```
-pub fn is_stdout_path<P: AsRef<Path>>(path: P) -> bool {
-    let path_str = path.as_ref().to_string_lossy();
-    path_str == "-" || path_str == "/dev/stdout"
-}
-
-/// Open an output writer for a path, supporting stdout via "-" or "/dev/stdout".
+/// Open an output writer for a path, supporting stdout via `-` or `/dev/stdout`.
 pub(crate) fn open_output_writer<P: AsRef<Path>>(path: P) -> Result<Box<dyn Write + Send>> {
     let path_ref = path.as_ref();
     if is_stdout_path(path_ref) {
@@ -913,191 +661,6 @@ pub(crate) fn open_output_writer<P: AsRef<Path>>(path: P) -> Result<Box<dyn Writ
         let file = File::create(path_ref)
             .with_context(|| format!("Failed to create output BAM: {}", path_ref.display()))?;
         Ok(Box::new(file))
-    }
-}
-
-/// A reader that buffers all bytes read through it.
-///
-/// This is used to capture raw bytes while parsing the BAM header,
-/// so they can be replayed to the pipeline.
-struct TeeReader<R> {
-    inner: R,
-    buffer: Vec<u8>,
-}
-
-impl<R: Read> TeeReader<R> {
-    fn new(inner: R) -> Self {
-        Self { inner, buffer: Vec::new() }
-    }
-
-    /// Consume the `TeeReader` and return the buffered bytes and inner reader.
-    fn into_parts(self) -> (Vec<u8>, R) {
-        (self.buffer, self.inner)
-    }
-}
-
-impl<R: Read> Read for TeeReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.buffer.extend_from_slice(&buf[..n]);
-        Ok(n)
-    }
-}
-
-/// A reader that chains buffered data with a remaining stream.
-///
-/// First yields all bytes from the buffer, then reads from the inner reader.
-pub(crate) struct ChainedReader<R> {
-    buffer: io::Cursor<Vec<u8>>,
-    inner: R,
-    buffer_exhausted: bool,
-}
-
-impl<R: Read> ChainedReader<R> {
-    /// Create a new chained reader from buffered data and an inner reader.
-    pub(crate) fn new(buffer: Vec<u8>, inner: R) -> Self {
-        Self { buffer: io::Cursor::new(buffer), inner, buffer_exhausted: false }
-    }
-}
-
-impl<R: Read> Read for ChainedReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if !self.buffer_exhausted {
-            let n = self.buffer.read(buf)?;
-            if n > 0 {
-                return Ok(n);
-            }
-            self.buffer_exhausted = true;
-        }
-        self.inner.read(buf)
-    }
-}
-
-/// Create a raw byte reader and header for pipeline use, supporting both files and stdin.
-///
-/// This function is designed for commands that need to pass a reader to the pipeline.
-/// Unlike `create_bam_reader`, this returns a raw byte reader (not a BAM reader) that
-/// can be passed directly to `run_bam_pipeline_*_from_reader` functions.
-///
-/// For files: Opens the file, reads the header, seeks back to start, returns the file.
-/// For stdin: Buffers all bytes read while parsing header, returns a chained reader
-///            that first yields the buffered bytes then continues from stdin.
-///
-/// This is a convenience wrapper that disables the async prefetch reader. Use
-/// [`create_bam_reader_for_pipeline_with_opts`] to opt in.
-///
-/// # Arguments
-/// * `path` - Path to the input BAM file, or "-" / "/dev/stdin" for stdin
-///
-/// # Returns
-/// A tuple of (boxed reader, header). The reader is positioned at the start of the file
-/// (including the header bytes) so the pipeline can parse the header again.
-///
-/// # Errors
-/// Returns an error if the file cannot be opened or the header cannot be read
-///
-/// # Example
-/// ```no_run
-/// use fgumi_bam_io::bam_io::create_bam_reader_for_pipeline;
-/// use std::path::Path;
-///
-/// // From file
-/// let (reader, header) = create_bam_reader_for_pipeline(Path::new("input.bam")).unwrap();
-///
-/// // From stdin
-/// let (reader, header) = create_bam_reader_for_pipeline(Path::new("-")).unwrap();
-/// ```
-pub fn create_bam_reader_for_pipeline<P: AsRef<Path>>(
-    path: P,
-) -> Result<(Box<dyn Read + Send>, Header)> {
-    create_bam_reader_for_pipeline_with_opts(path, PipelineReaderOpts::default())
-}
-
-/// Options controlling how [`create_bam_reader_for_pipeline_with_opts`] opens
-/// and wraps its input file.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PipelineReaderOpts {
-    /// If true, wrap inputs in a [`crate::prefetch_reader::PrefetchReader`]
-    /// so that disk reads happen on a dedicated I/O thread.
-    pub async_reader: bool,
-}
-
-/// Variant of [`create_bam_reader_for_pipeline`] that accepts tuning options.
-///
-/// For regular files, `POSIX_FADV_SEQUENTIAL` is applied to the file descriptor
-/// on Linux (a no-op elsewhere). If `opts.async_reader` is true the input is
-/// wrapped in a [`crate::prefetch_reader::PrefetchReader`] — for regular files
-/// using [`from_file`](crate::prefetch_reader::PrefetchReader::from_file) (with
-/// kernel WILLNEED hints), for stdin via the generic
-/// [`new`](crate::prefetch_reader::PrefetchReader::new) constructor.
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be opened or the header cannot be read.
-pub fn create_bam_reader_for_pipeline_with_opts<P: AsRef<Path>>(
-    path: P,
-    opts: PipelineReaderOpts,
-) -> Result<(Box<dyn Read + Send>, Header)> {
-    use std::io::{Seek, SeekFrom};
-
-    let path_ref = path.as_ref();
-
-    if is_stdin_path(path_ref) {
-        // Read from stdin with buffering
-        let stdin = io::stdin();
-        let tee_reader = TeeReader::new(stdin);
-        let bgzf_reader = BgzfReader::new(tee_reader);
-        let mut bam_reader = noodles::bam::io::Reader::from(bgzf_reader);
-
-        // Read header (this consumes and buffers the raw bytes)
-        let header =
-            bam_reader.read_header().with_context(|| "Failed to read header from stdin")?;
-
-        // Get the buffered bytes and remaining stdin
-        let bgzf_reader = bam_reader.into_inner();
-        let tee_reader = bgzf_reader.into_inner();
-        let (buffered_bytes, stdin) = tee_reader.into_parts();
-
-        // Create a chained reader: buffered bytes first, then remaining stdin
-        let chained = ChainedReader::new(buffered_bytes, stdin);
-
-        if opts.async_reader {
-            log::info!("async BAM reader enabled: spawning fgumi-prefetch thread for stdin");
-            let prefetch = crate::prefetch_reader::PrefetchReader::new(chained);
-            Ok((Box::new(prefetch), header))
-        } else {
-            Ok((Box::new(chained), header))
-        }
-    } else {
-        // Read from file - we can seek back
-        let mut file = File::open(path_ref)
-            .with_context(|| format!("Failed to open input BAM: {}", path_ref.display()))?;
-
-        // Tell the kernel to grow the per-fd read-ahead window. Best-effort;
-        // failure is logged and ignored. On non-Linux targets this is a no-op.
-        crate::os_hints::advise_sequential(&file);
-
-        // Read header using noodles
-        let bgzf_reader = BgzfReader::new(&file);
-        let mut bam_reader = noodles::bam::io::Reader::from(bgzf_reader);
-        let header = bam_reader
-            .read_header()
-            .with_context(|| format!("Failed to read header from: {}", path_ref.display()))?;
-
-        // Seek file back to start
-        file.seek(SeekFrom::Start(0))
-            .with_context(|| format!("Failed to seek in file: {}", path_ref.display()))?;
-
-        if opts.async_reader {
-            log::info!(
-                "async BAM reader enabled: spawning fgumi-prefetch thread for {}",
-                path_ref.display()
-            );
-            let prefetch = crate::prefetch_reader::PrefetchReader::from_file(file);
-            Ok((Box::new(prefetch), header))
-        } else {
-            Ok((Box::new(file), header))
-        }
     }
 }
 
@@ -1115,16 +678,6 @@ mod tests {
         );
         builder = builder.add_reference_sequence(b"chr1", ref_seq);
         builder.build()
-    }
-
-    #[test]
-    fn test_create_bam_reader_nonexistent_file() {
-        let result = create_bam_reader("/nonexistent/file.bam", 1);
-        assert!(result.is_err());
-        if let Err(e) = result {
-            let err_msg = e.to_string();
-            assert!(err_msg.contains("Failed to open input BAM"));
-        }
     }
 
     #[test]
@@ -1186,54 +739,6 @@ mod tests {
         let header = create_test_header();
         let result = create_optional_bam_writer(Some("/invalid/path/output.bam"), &header, 1, 6);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_roundtrip_write_and_read() -> Result<()> {
-        let temp_file = NamedTempFile::new()?;
-        let header = create_test_header();
-
-        // Write (single-threaded)
-        {
-            let _writer = create_bam_writer(temp_file.path(), &header, 1, 6)?;
-            // Writer is dropped, file is written
-        }
-
-        // Read (single-threaded)
-        let (mut reader, read_header) = create_bam_reader(temp_file.path(), 1)?;
-
-        // Verify header has our reference sequence
-        assert_eq!(read_header.reference_sequences().len(), 1);
-
-        // Verify we can iterate (even though there are no records)
-        let records: Result<Vec<_>, _> = reader.records().collect();
-        assert!(records.is_ok());
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_roundtrip_write_and_read_multithreaded() -> Result<()> {
-        let temp_file = NamedTempFile::new()?;
-        let header = create_test_header();
-
-        // Write (multi-threaded)
-        {
-            let _writer = create_bam_writer(temp_file.path(), &header, 4, 6)?;
-            // Writer is dropped, file is written
-        }
-
-        // Read (multi-threaded)
-        let (mut reader, read_header) = create_bam_reader(temp_file.path(), 4)?;
-
-        // Verify header has our reference sequence
-        assert_eq!(read_header.reference_sequences().len(), 1);
-
-        // Verify we can iterate (even though there are no records)
-        let records: Result<Vec<_>, _> = reader.records().collect();
-        assert!(records.is_ok());
-
-        Ok(())
     }
 
     #[test]
@@ -1341,281 +846,9 @@ mod tests {
     }
 
     #[test]
-    fn test_is_stdin_path() {
-        // Test stdin paths
-        assert!(is_stdin_path("-"));
-        assert!(is_stdin_path("/dev/stdin"));
-        assert!(is_stdin_path(Path::new("-")));
-        assert!(is_stdin_path(Path::new("/dev/stdin")));
-
-        // Test non-stdin paths
-        assert!(!is_stdin_path("input.bam"));
-        assert!(!is_stdin_path("/path/to/file.bam"));
-        assert!(!is_stdin_path(""));
-        assert!(!is_stdin_path("/dev/null"));
-    }
-
-    #[test]
-    fn test_create_bam_reader_for_pipeline_from_file() -> Result<()> {
-        let temp_file = NamedTempFile::new()?;
-        let header = create_test_header();
-
-        // Write a BAM file first
-        {
-            let _writer = create_bam_writer(temp_file.path(), &header, 1, 6)?;
-        }
-
-        // Read using create_bam_reader_for_pipeline
-        let (mut reader, read_header) = create_bam_reader_for_pipeline(temp_file.path())?;
-        assert_eq!(read_header.reference_sequences().len(), 1);
-
-        // The reader returns raw bytes, verify we can read something
-        let mut buf = [0u8; 16];
-        let n = reader.read(&mut buf)?;
-        assert!(n > 0, "Should read some bytes from the file");
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_create_bam_reader_for_pipeline_nonexistent_file() {
-        let result = create_bam_reader_for_pipeline("/nonexistent/file.bam");
-        assert!(result.is_err());
-        if let Err(e) = result {
-            let err_msg = e.to_string();
-            assert!(err_msg.contains("Failed to open input BAM"));
-        }
-    }
-
-    #[test]
-    fn test_chained_reader() {
-        let buffer = vec![1, 2, 3, 4, 5];
-        let remaining = io::Cursor::new(vec![6, 7, 8, 9, 10]);
-        let mut chained = ChainedReader::new(buffer, remaining);
-
-        let mut result = Vec::new();
-        chained.read_to_end(&mut result).expect("read_to_end should succeed");
-
-        assert_eq!(result, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-    }
-
-    #[test]
-    fn test_chained_reader_empty_buffer() {
-        let buffer = vec![];
-        let remaining = io::Cursor::new(vec![1, 2, 3]);
-        let mut chained = ChainedReader::new(buffer, remaining);
-
-        let mut result = Vec::new();
-        chained.read_to_end(&mut result).expect("read_to_end should succeed");
-
-        assert_eq!(result, vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn test_chained_reader_empty_remaining() {
-        let buffer = vec![1, 2, 3];
-        let remaining = io::Cursor::new(vec![]);
-        let mut chained = ChainedReader::new(buffer, remaining);
-
-        let mut result = Vec::new();
-        chained.read_to_end(&mut result).expect("read_to_end should succeed");
-
-        assert_eq!(result, vec![1, 2, 3]);
-    }
-
-    /// Create a minimal BAM record for testing.
-    ///
-    /// Creates a mapped record at the given reference and position with a simple CIGAR.
-    /// The read name is padded to ensure CIGAR alignment (the read name length must make
-    /// the CIGAR start at a 4-byte aligned offset from the record start).
-    #[allow(clippy::cast_possible_truncation)]
-    fn create_test_bam_record(ref_id: i32, pos: i32, read_name: &[u8]) -> Vec<u8> {
-        // BAM record structure (without block_size prefix):
-        // refID (4), pos (4), l_read_name (1), mapq (1), bin (2), n_cigar_op (2),
-        // flag (2), l_seq (4), next_refID (4), next_pos (4), tlen (4),
-        // read_name (l_read_name), cigar (n_cigar_op * 4), seq ((l_seq+1)/2), qual (l_seq)
-        //
-        // Fixed header is 32 bytes. CIGAR starts at 32 + l_read_name.
-        // For CIGAR to be 4-byte aligned, l_read_name must be a multiple of 4.
-
-        // Calculate padding needed to make l_read_name a multiple of 4
-        let name_with_null = read_name.len() + 1;
-        let padding = (4 - (name_with_null % 4)) % 4;
-        let l_read_name = (name_with_null + padding) as u8;
-
-        let mapq: u8 = 60;
-        let bin: u16 = 4681; // bin for small coordinates
-        let n_cigar_op: u16 = 1;
-        let flag: u16 = 0; // mapped, forward strand
-        let l_seq: u32 = 10;
-        let next_ref_id: i32 = -1;
-        let next_pos: i32 = -1;
-        let tlen: i32 = 0;
-
-        let mut record = Vec::new();
-
-        // Core fields
-        record.extend_from_slice(&ref_id.to_le_bytes());
-        record.extend_from_slice(&pos.to_le_bytes());
-        record.push(l_read_name);
-        record.push(mapq);
-        record.extend_from_slice(&bin.to_le_bytes());
-        record.extend_from_slice(&n_cigar_op.to_le_bytes());
-        record.extend_from_slice(&flag.to_le_bytes());
-        record.extend_from_slice(&l_seq.to_le_bytes());
-        record.extend_from_slice(&next_ref_id.to_le_bytes());
-        record.extend_from_slice(&next_pos.to_le_bytes());
-        record.extend_from_slice(&tlen.to_le_bytes());
-
-        // Read name + null terminator + padding (null bytes)
-        record.extend_from_slice(read_name);
-        record.push(0); // null terminator
-        record.extend(std::iter::repeat_n(0u8, padding));
-
-        // CIGAR: 10M = (10 << 4) = 160
-        let cigar_op: u32 = 10 << 4; // 10M
-        record.extend_from_slice(&cigar_op.to_le_bytes());
-
-        // Sequence: 10 bases = 5 bytes (4-bit encoded)
-        // AAAAAAAAAA = 0x11 0x11 0x11 0x11 0x11
-        record.extend_from_slice(&[0x11, 0x11, 0x11, 0x11, 0x11]);
-
-        // Quality: 10 bytes of qual 30
-        record.extend_from_slice(&[30u8; 10]);
-
-        record
-    }
-
-    #[test]
-    fn test_create_indexing_bam_writer() -> Result<()> {
-        let temp_file = NamedTempFile::new()?;
-        let header = create_test_header();
-
-        let writer = create_indexing_bam_writer(temp_file.path(), &header, 6, 2);
-        assert!(writer.is_ok());
-
-        // Just finish without writing records
-        let writer = writer.expect("creating writer should succeed");
-        let index = writer.finish();
-        assert!(index.is_ok());
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_indexing_bam_writer_with_records() -> Result<()> {
-        let temp_file = NamedTempFile::new()?;
-        let header = create_test_header();
-
-        let mut writer = create_indexing_bam_writer(temp_file.path(), &header, 6, 2)?;
-
-        // Write some test records
-        for i in 0..100 {
-            let record = create_test_bam_record(0, i * 100, format!("read{i}").as_bytes());
-            writer.write_raw_record(&record)?;
-        }
-
-        let index = writer.finish()?;
-
-        // Verify index has reference sequences
-        assert!(!index.reference_sequences().is_empty());
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_indexing_bam_writer_produces_valid_bam() -> Result<()> {
-        let temp_file = NamedTempFile::new()?;
-        let header = create_test_header();
-
-        // Write BAM with index
-        {
-            let mut writer = create_indexing_bam_writer(temp_file.path(), &header, 6, 2)?;
-
-            for i in 0..10 {
-                let record = create_test_bam_record(0, i * 100, format!("read{i}").as_bytes());
-                writer.write_raw_record(&record)?;
-            }
-
-            let _index = writer.finish()?;
-        }
-
-        // Read back and verify
-        let (mut reader, read_header) = create_bam_reader(temp_file.path(), 1)?;
-        assert_eq!(read_header.reference_sequences().len(), 1);
-
-        let records: Vec<_> = reader.records().collect();
-        assert_eq!(records.len(), 10);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_indexing_bam_writer_multithreaded() -> Result<()> {
-        let temp_file = NamedTempFile::new()?;
-        let header = create_test_header();
-
-        let mut writer = create_indexing_bam_writer(temp_file.path(), &header, 6, 4)?;
-
-        // Write enough records to potentially trigger multiple blocks
-        for i in 0..1000 {
-            let record = create_test_bam_record(0, i * 10, format!("read{i:04}").as_bytes());
-            writer.write_raw_record(&record)?;
-        }
-
-        let index = writer.finish()?;
-
-        // Verify index has reference sequences with bins
-        assert!(!index.reference_sequences().is_empty());
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_indexing_bam_writer_unmapped_records() -> Result<()> {
-        let temp_file = NamedTempFile::new()?;
-        let header = create_test_header();
-
-        let mut writer = create_indexing_bam_writer(temp_file.path(), &header, 6, 2)?;
-
-        // Write unmapped record (ref_id = -1)
-        let record = create_test_bam_record(-1, -1, b"unmapped_read");
-        writer.write_raw_record(&record)?;
-
-        // Write mapped record
-        let record = create_test_bam_record(0, 100, b"mapped_read");
-        writer.write_raw_record(&record)?;
-
-        let index = writer.finish()?;
-        assert!(!index.reference_sequences().is_empty());
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_write_raw_bytes() -> Result<()> {
-        let temp = tempfile::NamedTempFile::new()?;
-        let header = noodles::sam::Header::default();
-        let mut writer = create_raw_bam_writer(temp.path(), &header, 1, 1)?;
-
-        // Write pre-formatted BAM record bytes (4-byte LE length + record)
-        let record_bytes = vec![1, 2, 3, 4, 5];
-        let mut formatted = Vec::new();
-        #[allow(clippy::cast_possible_truncation)]
-        let len = record_bytes.len() as u32;
-        formatted.extend_from_slice(&len.to_le_bytes());
-        formatted.extend_from_slice(&record_bytes);
-
-        writer.write_raw_bytes(&formatted)?;
-        writer.finish()?;
-
-        // Verify file is non-empty (contains header + data + EOF)
-        assert!(temp.path().metadata()?.len() > 0);
-        Ok(())
-    }
-
-    #[test]
     fn test_is_stdout_path() {
+        use crate::paths::is_stdout_path;
+        use std::path::Path;
         assert!(is_stdout_path("-"));
         assert!(is_stdout_path("/dev/stdout"));
         assert!(is_stdout_path(Path::new("-")));
@@ -1636,31 +869,136 @@ mod tests {
         assert!(err.to_string().contains("stdout"));
     }
 
+    /// Create a minimal BAM record for testing.
+    ///
+    /// Creates a mapped record at the given reference and position with a simple CIGAR.
+    #[allow(clippy::cast_possible_truncation)]
+    fn create_test_bam_record(ref_id: i32, pos: i32, read_name: &[u8]) -> Vec<u8> {
+        let name_with_null = read_name.len() + 1;
+        let padding = (4 - (name_with_null % 4)) % 4;
+        let l_read_name = (name_with_null + padding) as u8;
+
+        let mapq: u8 = 60;
+        let bin: u16 = 4681;
+        let n_cigar_op: u16 = 1;
+        let flag: u16 = 0;
+        let l_seq: u32 = 10;
+        let next_ref_id: i32 = -1;
+        let next_pos: i32 = -1;
+        let tlen: i32 = 0;
+
+        let mut record = Vec::new();
+        record.extend_from_slice(&ref_id.to_le_bytes());
+        record.extend_from_slice(&pos.to_le_bytes());
+        record.push(l_read_name);
+        record.push(mapq);
+        record.extend_from_slice(&bin.to_le_bytes());
+        record.extend_from_slice(&n_cigar_op.to_le_bytes());
+        record.extend_from_slice(&flag.to_le_bytes());
+        record.extend_from_slice(&l_seq.to_le_bytes());
+        record.extend_from_slice(&next_ref_id.to_le_bytes());
+        record.extend_from_slice(&next_pos.to_le_bytes());
+        record.extend_from_slice(&tlen.to_le_bytes());
+
+        record.extend_from_slice(read_name);
+        record.push(0);
+        record.extend(std::iter::repeat_n(0u8, padding));
+
+        let cigar_op: u32 = 10 << 4;
+        record.extend_from_slice(&cigar_op.to_le_bytes());
+        record.extend_from_slice(&[0x11, 0x11, 0x11, 0x11, 0x11]);
+        record.extend_from_slice(&[30u8; 10]);
+
+        record
+    }
+
     #[test]
-    fn test_create_bam_reader_for_pipeline_with_async_reader() -> Result<()> {
+    fn test_create_indexing_bam_writer() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
         let header = create_test_header();
 
-        // Write a BAM file first
-        {
-            let _writer = create_bam_writer(temp_file.path(), &header, 1, 6)?;
+        let writer = create_indexing_bam_writer(temp_file.path(), &header, 6, 2);
+        assert!(writer.is_ok());
+
+        let writer = writer.expect("creating writer should succeed");
+        let index = writer.finish();
+        assert!(index.is_ok());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_indexing_bam_writer_with_records() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let header = create_test_header();
+
+        let mut writer = create_indexing_bam_writer(temp_file.path(), &header, 6, 2)?;
+
+        for i in 0..100 {
+            let record = create_test_bam_record(0, i * 100, format!("read{i}").as_bytes());
+            writer.write_raw_record(&record)?;
         }
 
-        // Read using async reader opts — exercises the PrefetchReader branch
-        let opts = PipelineReaderOpts { async_reader: true };
-        let (mut reader, read_header) =
-            create_bam_reader_for_pipeline_with_opts(temp_file.path(), opts)?;
-        assert_eq!(read_header.reference_sequences().len(), 1);
+        let index = writer.finish()?;
+        assert!(!index.reference_sequences().is_empty());
 
-        // The reader returns raw bytes; verify it is usable
-        let mut buf = [0u8; 16];
-        let n = reader.read(&mut buf)?;
-        assert!(n > 0, "Should read some bytes from the async reader");
+        Ok(())
+    }
 
-        // Ensure read_to_end works through the PrefetchReader
-        let mut rest = Vec::new();
-        reader.read_to_end(&mut rest)?;
+    #[test]
+    fn test_indexing_bam_writer_multithreaded() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let header = create_test_header();
 
+        let mut writer = create_indexing_bam_writer(temp_file.path(), &header, 6, 4)?;
+
+        for i in 0..1000 {
+            let record = create_test_bam_record(0, i * 10, format!("read{i:04}").as_bytes());
+            writer.write_raw_record(&record)?;
+        }
+
+        let index = writer.finish()?;
+        assert!(!index.reference_sequences().is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_indexing_bam_writer_unmapped_records() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let header = create_test_header();
+
+        let mut writer = create_indexing_bam_writer(temp_file.path(), &header, 6, 2)?;
+
+        let record = create_test_bam_record(-1, -1, b"unmapped_read");
+        writer.write_raw_record(&record)?;
+
+        let record = create_test_bam_record(0, 100, b"mapped_read");
+        writer.write_raw_record(&record)?;
+
+        let index = writer.finish()?;
+        assert!(!index.reference_sequences().is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_raw_bytes() -> Result<()> {
+        let temp = tempfile::NamedTempFile::new()?;
+        let header = noodles::sam::Header::default();
+        let mut writer = create_raw_bam_writer(temp.path(), &header, 1, 1)?;
+
+        let record_bytes = vec![1, 2, 3, 4, 5];
+        let mut formatted = Vec::new();
+        #[allow(clippy::cast_possible_truncation)]
+        let len = record_bytes.len() as u32;
+        formatted.extend_from_slice(&len.to_le_bytes());
+        formatted.extend_from_slice(&record_bytes);
+
+        writer.write_raw_bytes(&formatted)?;
+        writer.finish()?;
+
+        assert!(temp.path().metadata()?.len() > 0);
         Ok(())
     }
 }
