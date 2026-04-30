@@ -7,7 +7,7 @@
 //! # Example
 //!
 //! ```
-//! use fgumi_lib::reorder_buffer::ReorderBuffer;
+//! use fgumi_bam_io::reorder::ReorderBuffer;
 //!
 //! let mut buffer: ReorderBuffer<String> = ReorderBuffer::new();
 //!
@@ -176,7 +176,7 @@ impl<T> ReorderBuffer<T> {
     /// # Example
     ///
     /// ```
-    /// use fgumi_lib::reorder_buffer::ReorderBuffer;
+    /// use fgumi_bam_io::reorder::ReorderBuffer;
     ///
     /// let mut buffer: ReorderBuffer<i32> = ReorderBuffer::new();
     /// buffer.insert(0, 10);

@@ -80,15 +80,15 @@ type Item = io::Result<Vec<u8>>;
 ///
 /// # Example
 ///
-/// ```
+/// ```no_run
 /// use std::io::{Cursor, Read};
-/// use fgumi_lib::prefetch_reader::PrefetchReader;
-///
-/// let data: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
-/// let mut reader = PrefetchReader::new(Cursor::new(data.clone()));
-/// let mut out = Vec::new();
-/// reader.read_to_end(&mut out).unwrap();
-/// assert_eq!(out, data);
+/// // PrefetchReader is pub(crate) — available only within fgumi-bam-io.
+/// // This example shows the expected usage pattern.
+/// // let data: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
+/// // let mut reader = PrefetchReader::new(Cursor::new(data.clone()));
+/// // let mut out = Vec::new();
+/// // reader.read_to_end(&mut out).unwrap();
+/// // assert_eq!(out, data);
 /// ```
 #[derive(Debug)]
 pub struct PrefetchReader {

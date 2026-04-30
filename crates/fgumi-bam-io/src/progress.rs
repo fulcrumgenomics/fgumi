@@ -102,7 +102,7 @@ fn fmt_duration(secs: f64) -> String {
 ///
 /// # Example
 /// ```
-/// use fgumi_lib::progress::ProgressTracker;
+/// use fgumi_bam_io::progress::ProgressTracker;
 ///
 /// let tracker = ProgressTracker::new("Processed records")
 ///     .with_interval(100);
@@ -116,7 +116,7 @@ fn fmt_duration(secs: f64) -> String {
 ///
 /// # Multi-threaded Example
 /// ```
-/// use fgumi_lib::progress::ProgressTracker;
+/// use fgumi_bam_io::progress::ProgressTracker;
 /// use std::sync::Arc;
 ///
 /// let tracker = Arc::new(ProgressTracker::new("Processed records").with_interval(1000));

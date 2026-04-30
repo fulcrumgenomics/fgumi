@@ -655,7 +655,7 @@ pub fn write_bai_index<P: AsRef<Path>>(path: P, index: &bai::Index) -> Result<()
 ///
 /// # Example
 /// ```no_run
-/// use fgumi_lib::bam_io::create_bam_reader;
+/// use fgumi_bam_io::bam_io::create_bam_reader;
 /// use std::path::Path;
 ///
 /// // Single-threaded
@@ -781,153 +781,6 @@ pub fn create_raw_bam_reader_with_opts<P: AsRef<Path>>(
     Ok((raw_reader, header))
 }
 
-/// Create a raw BAM reader using the pool's Phase 1 integrated reading.
-///
-/// Workers in the pool do `ReadInputBlocks` + `DecompressInput`. The main thread
-/// consumes decompressed bytes via `PooledInputStream`.
-///
-/// When `async_reader` is false, no extra threads are spawned: the pool's block
-/// reader reads directly from the input file. When `async_reader` is true, the
-/// input file is wrapped in a `PrefetchReader`, which spawns one dedicated OS
-/// thread (`fgumi-prefetch`) that reads raw bytes ahead into a bounded queue so
-/// the pool's block reader never blocks on disk I/O. The prefetch thread lives
-/// for the duration of Phase 1 and is joined when the reader is dropped.
-///
-/// # Flow
-///
-/// 1. Parse header with noodles (first pass, single-threaded)
-/// 2. Open file again, set as pool's input file
-/// 3. Set pool to PHASE1 — workers start reading/decompressing
-/// 4. Main thread skips header bytes from decompressed stream
-/// 5. Returns `RawBamReader<PooledInputStream>` for direct record iteration
-///
-/// # Preconditions
-///
-/// The pool must be in the idle state (not already in PHASE1 with active workers).
-/// Call this function only once per sort operation; calling it while workers are
-/// actively reading will corrupt shared pool state.
-///
-/// # Errors
-///
-/// Returns an error if the BAM file cannot be opened, the header cannot be parsed,
-/// or header bytes cannot be skipped from the decompressed stream.
-pub fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
-    path: P,
-    pool: &std::sync::Arc<crate::sort::worker_pool::SortWorkerPool>,
-    async_reader: bool,
-) -> Result<(RawBamReader<crate::sort::read_ahead::PooledInputStream>, Header)> {
-    use crate::sort::read_ahead::PooledInputStream;
-    use crate::sort::worker_pool::phase;
-
-    let path_ref = path.as_ref();
-
-    // For stdin/FIFOs we cannot seek back after reading the header, so we use the
-    // TeeReader + ChainedReader pattern to buffer and replay the consumed bytes.
-    // For regular files we seek back to byte 0 (faster, no buffering needed).
-    let (header, reader): (Header, Box<dyn io::Read + Send>) = if is_stdin_path(path_ref) {
-        let stdin = io::stdin();
-        let tee = TeeReader::new(stdin);
-        let bgzf = BgzfReader::new(tee);
-        let mut noodles_reader = noodles::bam::io::Reader::from(bgzf);
-        let header =
-            noodles_reader.read_header().with_context(|| "Failed to read BAM header from stdin")?;
-
-        let bgzf = noodles_reader.into_inner();
-        let tee = bgzf.into_inner();
-        let (buffered_bytes, stdin) = tee.into_parts();
-        let chained = ChainedReader::new(buffered_bytes, stdin);
-        (header, Box::new(io::BufReader::with_capacity(2 * 1024 * 1024, chained)))
-    } else {
-        use std::io::{Seek, SeekFrom};
-        // Open once: reuse the same handle for header reading and pool input.
-        // Re-opening would break non-replayable inputs (FIFOs, process substitution).
-        let mut file = File::open(path_ref)
-            .with_context(|| format!("Failed to open input BAM: {}", path_ref.display()))?;
-
-        let header = {
-            let bgzf = BgzfReader::new(&mut file);
-            let mut noodles_reader = noodles::bam::io::Reader::from(bgzf);
-            noodles_reader
-                .read_header()
-                .with_context(|| format!("Failed to read header from: {}", path_ref.display()))?
-        };
-
-        // Rewind to start so pool workers read from byte 0
-        file.seek(SeekFrom::Start(0))
-            .with_context(|| format!("Failed to rewind input BAM: {}", path_ref.display()))?;
-
-        let reader: Box<dyn io::Read + Send> = if async_reader {
-            crate::os_hints::advise_sequential(&file);
-            log::info!(
-                "async sort reader enabled: spawning fgumi-prefetch thread for {}",
-                path_ref.display()
-            );
-            Box::new(crate::prefetch_reader::PrefetchReader::from_file(file))
-        } else {
-            Box::new(io::BufReader::with_capacity(2 * 1024 * 1024, file))
-        };
-        (header, reader)
-    };
-
-    // Set the input file for pool workers and activate Phase 1
-    pool.set_input_file(reader);
-    pool.set_phase(phase::PHASE1);
-
-    // Create the decompressed input stream for the main thread.
-    // Uses the shared ArrayQueue and flags from the pool's pipeline state.
-    let mut pooled_input = PooledInputStream::new(
-        pool.decompressed_input_queue(),
-        pool.decompressed_input_done_flag(),
-        pool.input_read_error_flag(),
-        pool.decompress_error_flag(),
-    );
-
-    // Skip BAM header from the decompressed stream
-    skip_bam_header(&mut pooled_input)
-        .with_context(|| format!("Failed to skip header from: {}", path_ref.display()))?;
-
-    let raw_reader = RawBamReader::new(pooled_input);
-    Ok((raw_reader, header))
-}
-
-/// Skip the BAM header from a reader positioned at the start of a BAM stream.
-///
-/// Reads and discards: magic (4 bytes), header text length + text, `n_ref` + reference entries.
-fn skip_bam_header<R: Read>(reader: &mut R) -> Result<()> {
-    let mut buf4 = [0u8; 4];
-
-    // Magic: "BAM\1"
-    reader.read_exact(&mut buf4)?;
-    anyhow::ensure!(&buf4 == b"BAM\x01", "Not a BAM file (bad magic)");
-
-    // Header text length + text
-    reader.read_exact(&mut buf4)?;
-    let l_text = u32::from_le_bytes(buf4) as usize;
-    let copied = io::copy(&mut reader.take(l_text as u64), &mut io::sink())?;
-    anyhow::ensure!(
-        copied == l_text as u64,
-        "BAM header text truncated: expected {l_text} bytes, got {copied}"
-    );
-
-    // Number of reference sequences
-    reader.read_exact(&mut buf4)?;
-    let n_ref = u32::from_le_bytes(buf4) as usize;
-
-    // Each reference: l_name (4 bytes) + name (l_name bytes) + l_ref (4 bytes)
-    for _ in 0..n_ref {
-        reader.read_exact(&mut buf4)?;
-        let l_name = u32::from_le_bytes(buf4) as usize;
-        let copied = io::copy(&mut reader.take(l_name as u64), &mut io::sink())?;
-        anyhow::ensure!(
-            copied == l_name as u64,
-            "BAM reference name truncated: expected {l_name} bytes, got {copied}"
-        );
-        reader.read_exact(&mut buf4)?; // l_ref (discard)
-    }
-
-    Ok(())
-}
-
 /// Create a BAM writer and write the header in one operation
 ///
 /// # Arguments
@@ -947,7 +800,7 @@ fn skip_bam_header<R: Read>(reader: &mut R) -> Result<()> {
 ///
 /// # Example
 /// ```no_run
-/// use fgumi_lib::bam_io::create_bam_writer;
+/// use fgumi_bam_io::bam_io::create_bam_writer;
 /// use noodles::sam::Header;
 /// use std::path::Path;
 ///
@@ -995,7 +848,7 @@ pub fn create_bam_writer<P: AsRef<Path>>(
 ///
 /// # Example
 /// ```no_run
-/// use fgumi_lib::bam_io::create_optional_bam_writer;
+/// use fgumi_bam_io::bam_io::create_optional_bam_writer;
 /// use noodles::sam::Header;
 /// use std::path::PathBuf;
 ///
@@ -1021,7 +874,7 @@ pub fn create_optional_bam_writer<P: AsRef<Path>>(
 ///
 /// # Example
 /// ```
-/// use fgumi_lib::bam_io::is_stdin_path;
+/// use fgumi_bam_io::bam_io::is_stdin_path;
 /// use std::path::Path;
 ///
 /// assert!(is_stdin_path(Path::new("-")));
@@ -1039,7 +892,7 @@ pub fn is_stdin_path<P: AsRef<Path>>(path: P) -> bool {
 ///
 /// # Example
 /// ```
-/// use fgumi_lib::bam_io::is_stdout_path;
+/// use fgumi_bam_io::bam_io::is_stdout_path;
 /// use std::path::Path;
 ///
 /// assert!(is_stdout_path(Path::new("-")));
@@ -1145,7 +998,7 @@ impl<R: Read> Read for ChainedReader<R> {
 ///
 /// # Example
 /// ```no_run
-/// use fgumi_lib::bam_io::create_bam_reader_for_pipeline;
+/// use fgumi_bam_io::bam_io::create_bam_reader_for_pipeline;
 /// use std::path::Path;
 ///
 /// // From file
