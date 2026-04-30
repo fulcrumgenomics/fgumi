@@ -33,22 +33,22 @@ use noodles::sam::header::record::value::Map;
 use noodles::sam::header::record::value::map::header::tag as header_tag;
 use tempfile::TempDir;
 
-pub mod bgzf_io;
+pub(crate) mod bgzf_io;
 pub mod external;
 pub mod inline;
 pub mod keys;
-pub mod loser_tree;
+pub(crate) mod loser_tree;
 pub(crate) mod memory_probe;
 pub mod pipeline;
-pub mod pooled_bam_writer;
-pub mod pooled_chunk_writer;
-pub mod radix;
+pub(crate) mod pooled_bam_writer;
+pub(crate) mod pooled_chunk_writer;
+pub(crate) mod radix;
 pub mod reader;
-pub mod read_ahead;
+pub(crate) mod read_ahead;
 pub(crate) mod segmented_buf;
-pub mod tmp_dir_alloc;
+pub(crate) mod tmp_dir_alloc;
 pub mod verify;
-pub mod worker_pool;
+pub(crate) mod worker_pool;
 
 /// Buffer size for `BufReader` during merge phase.
 const MERGE_BUFFER_SIZE: usize = 64 * 1024;
