@@ -36,7 +36,7 @@ use crate::bgzf_writer::InlineBgzfCompressor;
 use crate::fastq_parse::FastqRecord;
 use crate::grouper::FastqTemplate;
 use fgumi_bam_io::ProgressTracker;
-use crate::reorder_buffer::ReorderBuffer;
+use fgumi_bam_io::ReorderBuffer;
 use libdeflater::Decompressor;
 
 use super::base::{

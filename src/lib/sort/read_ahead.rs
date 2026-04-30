@@ -243,7 +243,7 @@ pub struct PooledInputStream {
     /// Shared flag: set when a worker failed to decompress a BGZF block.
     decompression_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Reorder buffer: holds out-of-order decompressed blocks until their serial is next.
-    reorder: crate::reorder_buffer::ReorderBuffer<Vec<u8>>,
+    reorder: fgumi_bam_io::ReorderBuffer<Vec<u8>>,
     /// Current buffer being read from.
     current_buf: Vec<u8>,
     /// Read position within `current_buf`.
@@ -264,7 +264,7 @@ impl PooledInputStream {
             decompressed_input_done,
             input_read_error,
             decompression_error,
-            reorder: crate::reorder_buffer::ReorderBuffer::new(),
+            reorder: fgumi_bam_io::ReorderBuffer::new(),
             current_buf: Vec::new(),
             current_pos: 0,
         }

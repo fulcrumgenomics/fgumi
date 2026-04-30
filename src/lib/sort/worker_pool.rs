@@ -44,7 +44,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-use crate::reorder_buffer::ReorderBuffer;
+use fgumi_bam_io::ReorderBuffer;
 
 // ============================================================================
 // Job and Result Types

@@ -20,7 +20,7 @@ use fgumi_bam_io::is_stdout_path;
 use crate::bgzf_reader::{BGZF_EOF, decompress_block_into, read_raw_blocks};
 use crate::bgzf_writer::InlineBgzfCompressor;
 use fgumi_bam_io::ProgressTracker;
-use crate::reorder_buffer::ReorderBuffer;
+use fgumi_bam_io::ReorderBuffer;
 use crate::sam::SamTag;
 use noodles::sam::alignment::record::data::field::Tag;
 
