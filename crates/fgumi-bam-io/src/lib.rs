@@ -14,6 +14,8 @@
 pub mod bam_io;
 pub mod header;
 pub mod mem_estimate;
+pub(crate) mod os_hints;
+pub(crate) mod prefetch_reader;
 pub mod progress;
 pub mod reorder;
 
