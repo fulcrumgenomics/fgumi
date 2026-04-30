@@ -25,7 +25,6 @@
 use noodles::sam::Header;
 use std::cmp::Ordering;
 
-use fgumi_raw_bam;
 use fgumi_raw_bam::RawRecordView;
 use std::io::{Read, Write};
 

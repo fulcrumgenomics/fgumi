@@ -28,6 +28,7 @@
 // `memory_probe::platform_ffi`, which is guarded by `#[allow(unsafe_code)]` on
 // that inner module. See CLAUDE.md "Approved non-stdlib FFI exceptions".
 #![deny(unsafe_code)]
+#![deny(missing_docs)]
 
 use std::path::Path;
 
@@ -38,21 +39,23 @@ use noodles::sam::header::record::value::Map;
 use noodles::sam::header::record::value::map::header::tag as header_tag;
 use tempfile::TempDir;
 
+// All sub-modules are crate-private. Items intended for external consumers are
+// re-exported at the crate root below.
 pub(crate) mod bgzf_io;
-pub mod external;
-pub mod inline;
-pub mod keys;
+pub(crate) mod external;
+pub(crate) mod inline;
+pub(crate) mod keys;
 pub(crate) mod loser_tree;
 pub(crate) mod memory_probe;
-pub mod pipeline;
+pub(crate) mod pipeline;
 pub(crate) mod pooled_bam_writer;
 pub(crate) mod pooled_chunk_writer;
 pub(crate) mod radix;
 pub(crate) mod read_ahead;
-pub mod reader;
+pub(crate) mod reader;
 pub(crate) mod segmented_buf;
 pub(crate) mod tmp_dir_alloc;
-pub mod verify;
+pub(crate) mod verify;
 pub(crate) mod worker_pool;
 
 /// Print mimalloc allocator statistics to stderr.
@@ -156,9 +159,8 @@ pub use external::{LibraryLookup, RawExternalSorter, cb_hasher, extract_template
 pub use inline::{TemplateKey, extract_coordinate_key_inline};
 pub use keys::{
     QuerynameComparator, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
-    SortContext, SortOrder, natural_compare, normalize_natural_key,
+    SortContext, SortOrder, natural_compare, natural_compare_nul, normalize_natural_key,
 };
-pub use pipeline::{ParallelMergeConfig, parallel_merge, parallel_merge_buffered};
 pub use reader::RawBamRecordReader;
 pub use verify::{VerifySummary, verify_sort_order};
 

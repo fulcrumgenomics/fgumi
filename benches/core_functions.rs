@@ -523,7 +523,7 @@ fn compare_strnum_samtools_prealloc(a: &[u8], b: &[u8]) -> Ordering {
 #[inline]
 fn compare_natural_nul_prealloc(a: &[u8], b: &[u8]) -> Ordering {
     // Assumes a and b are already null-terminated.
-    unsafe { fgumi_sort::keys::natural_compare_nul(a.as_ptr(), b.as_ptr()) }
+    unsafe { fgumi_sort::natural_compare_nul(a.as_ptr(), b.as_ptr()) }
 }
 
 /// Parse colon-delimited Illumina fields and compare as integers.
@@ -1016,14 +1016,14 @@ fn sort_natural_no_prefix(indices: &mut [usize], raw: &[Vec<u8>]) {
 /// (j) Natural sort with null-terminated pointer-walking comparator.
 fn sort_natural_nul(indices: &mut [usize], raw_nul: &[Vec<u8>]) {
     indices.sort_by(|&a, &b| unsafe {
-        fgumi_sort::keys::natural_compare_nul(raw_nul[a].as_ptr(), raw_nul[b].as_ptr())
+        fgumi_sort::natural_compare_nul(raw_nul[a].as_ptr(), raw_nul[b].as_ptr())
     });
 }
 
 /// (k) Natural sort with null-terminated comparator + digit-safe prefix stripping.
 fn sort_natural_nul_digit_safe(indices: &mut [usize], raw_nul: &[Vec<u8>], safe_prefix: usize) {
     indices.sort_by(|&a, &b| unsafe {
-        fgumi_sort::keys::natural_compare_nul(
+        fgumi_sort::natural_compare_nul(
             raw_nul[a].as_ptr().add(safe_prefix),
             raw_nul[b].as_ptr().add(safe_prefix),
         )

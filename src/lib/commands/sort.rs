@@ -1091,8 +1091,8 @@ mod tests {
 
     #[test]
     fn test_verify_coordinate_fails_on_unsorted() -> Result<()> {
+        use fgumi_sort::RawBamRecordReader;
         use fgumi_sort::extract_coordinate_key_inline;
-        use fgumi_sort::reader::RawBamRecordReader;
 
         // Build BAM with records deliberately out of coordinate order
         let mut builder = crate::sam::builder::SamBuilder::new();

@@ -8,11 +8,15 @@
 //! - Better cache locality - sequential memory access
 //! - Sort by index array, not by moving actual record data
 //! - ~24 bytes overhead per record vs ~110 bytes
+//!
+//! Some helpers (alternative buffer types, reference-array variants) are
+//! retained for benchmarking and are reachable only inside the crate.
+
+#![allow(dead_code)]
 
 use crate::keys::{RawCoordinateKey, RawSortKey, SortContext};
 use crate::radix::bytes_needed_u64;
 use crate::segmented_buf::SegmentedBuf;
-use fgumi_raw_bam;
 use fgumi_raw_bam::{RawRecord, RawRecordView};
 use std::cmp::Ordering;
 use std::io::{Read, Write};
@@ -679,6 +683,7 @@ impl TemplateInlineHeader {
     /// Serialize header to a byte array.
     #[inline]
     #[must_use]
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_bytes(&self) -> [u8; TEMPLATE_HEADER_SIZE] {
         let mut buf = [0u8; TEMPLATE_HEADER_SIZE];
         buf[0..8].copy_from_slice(&self.key.primary.to_le_bytes());
@@ -898,6 +903,7 @@ impl TemplateRecordBuffer {
     /// Get the key for a record reference (returns cached key from ref).
     #[inline]
     #[must_use]
+    #[allow(clippy::unused_self)]
     pub fn get_key(&self, r: &TemplateRecordRef) -> TemplateKey {
         r.key
     }

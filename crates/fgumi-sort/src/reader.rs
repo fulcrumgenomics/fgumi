@@ -4,6 +4,11 @@
 //! reading raw BAM bytes directly from BGZF blocks. This eliminates
 //! per-record allocation and deserialization overhead.
 //!
+//! `BatchedRawBamReader` is currently unused but retained as an alternative
+//! batched reader for future workloads that benefit from larger I/O units.
+
+#![allow(dead_code)]
+//!
 //! # Architecture
 //!
 //! ```text

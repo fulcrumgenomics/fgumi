@@ -4,6 +4,11 @@
 //! I/O with computation to maximize throughput during the merge phase of
 //! external sort.
 //!
+//! Currently superseded by the `worker_pool` + `loser_tree` merge path; the
+//! items below are retained for benchmarking and as a reference implementation.
+
+#![allow(dead_code)]
+//!
 //! # Architecture
 //!
 //! ```text

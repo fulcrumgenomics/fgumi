@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use fgumi_sam::SamBuilder;
-use fgumi_sort::keys::QuerynameComparator;
+use fgumi_sort::QuerynameComparator;
 use fgumi_sort::{
     RawBamRecordReader, RawExternalSorter, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
     SortContext, SortOrder, extract_coordinate_key_inline, verify_sort_order,

@@ -1,6 +1,13 @@
 //! Raw-bytes sorting implementation for BAM files.
 //!
-//! This module implements high-performance BAM sorting using lazy record parsing.
+//! Items in this module are reachable only via the crate-root re-exports
+//! ([`crate::RawExternalSorter`] etc.) and via siblings inside `fgumi-sort`.
+//! Some helpers (legacy spill-chunk writer, alternative readers) are retained
+//! for benchmarking and as fall-back paths.
+
+#![allow(dead_code)]
+
+// Pre-existing module body follows.
 //! Instead of fully decoding each BAM record into `RecordBuf`, it uses noodles'
 //! lazy `Record` type that stores raw bytes and only parses fields on-demand.
 //!
@@ -393,7 +400,7 @@ impl ChunkWriterInner {
 ///
 /// Works with any type implementing `RawSortKey`.
 /// Supports optional BGZF compression for reduced disk usage.
-pub struct GenericKeyedChunkWriter<K: RawSortKey> {
+pub(crate) struct GenericKeyedChunkWriter<K: RawSortKey> {
     writer: ChunkWriterInner,
     _marker: PhantomData<K>,
 }
@@ -507,7 +514,7 @@ fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> std::io::Result
 ///
 /// Works with any type implementing `RawSortKey`.
 /// Auto-detects BGZF compression via magic bytes.
-pub struct GenericKeyedChunkReader<K: RawSortKey + 'static> {
+pub(crate) struct GenericKeyedChunkReader<K: RawSortKey + 'static> {
     receiver: Receiver<ChunkReadResult<K>>,
     /// Return channel for empty buffers — the consumer sends its old buffer
     /// back so the producer can reuse the allocation instead of allocating.
@@ -526,6 +533,7 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
     /// # Errors
     ///
     /// Returns an error if the file cannot be opened.
+    #[allow(clippy::unnecessary_wraps)]
     pub fn open(path: &Path, concurrency_limit: Option<Arc<ChunkReaderSemaphore>>) -> Result<Self> {
         let (tx, rx) = bounded(MERGE_PREFETCH_SIZE);
         let (buf_tx, buf_rx) = bounded::<Vec<u8>>(MERGE_PREFETCH_SIZE);
@@ -3009,7 +3017,7 @@ pub fn extract_template_key_inline(
 }
 
 // SortStats is defined in crate root (lib.rs); alias it here for internal use.
-pub use crate::SortStats as RawSortStats;
+pub(crate) use crate::SortStats as RawSortStats;
 
 // ============================================================================
 // Pool-integrated BAM reader construction
