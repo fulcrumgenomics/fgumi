@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
 
 use super::MERGE_BUFFER_SIZE;
-use crate::bam_io::create_raw_bam_writer;
+use fgumi_bam_io::create_raw_bam_writer;
 
 /// Number of records to prefetch per chunk reader.
 const PREFETCH_BUFFER_SIZE: usize = 128;

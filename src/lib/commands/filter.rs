@@ -9,7 +9,7 @@
 //!    (min reads, max read error rate, max no-calls, min mean quality)
 
 use crate::alignment_tags::regenerate_alignment_tags_raw;
-use crate::bam_io::create_bam_reader_for_pipeline_with_opts;
+use fgumi_bam_io::create_bam_reader_for_pipeline_with_opts;
 #[cfg(feature = "simplex")]
 use crate::consensus_filter::resolve_ref_bases_for_record;
 use crate::consensus_filter::{

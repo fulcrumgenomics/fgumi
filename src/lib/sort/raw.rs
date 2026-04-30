@@ -17,7 +17,7 @@
 //! 3. Sort by keys while keeping raw records
 //! 4. Write raw record bytes to output
 
-use crate::bam_io::create_raw_bam_reader;
+use fgumi_bam_io::create_raw_bam_reader;
 use crate::progress::ProgressTracker;
 use crate::sam::SamTag;
 use crate::sort::inline_buffer::{
@@ -1519,7 +1519,7 @@ impl RawExternalSorter {
         // main thread reads records directly from PooledInputStream.
         info!("Phase 1: Pool-integrated input reading ({} workers, N+2 model)", pool.num_workers());
         let (record_source, header) = {
-            let (reader, header) = crate::bam_io::create_raw_bam_reader_pool_integrated(
+            let (reader, header) = fgumi_bam_io::create_raw_bam_reader_pool_integrated(
                 input,
                 &pool,
                 self.async_reader,
@@ -1644,7 +1644,7 @@ impl RawExternalSorter {
 
         if initial_keys.is_empty() {
             info!("Merge complete: 0 records merged");
-            let writer = crate::bam_io::create_raw_bam_writer(
+            let writer = fgumi_bam_io::create_raw_bam_writer(
                 output,
                 output_header,
                 self.threads,
@@ -1656,7 +1656,7 @@ impl RawExternalSorter {
 
         let mut tree = LoserTree::new(initial_keys);
 
-        let mut writer = crate::bam_io::create_raw_bam_writer(
+        let mut writer = fgumi_bam_io::create_raw_bam_writer(
             output,
             output_header,
             self.threads,
@@ -1908,7 +1908,7 @@ impl RawExternalSorter {
         output: &Path,
         alloc: &mut TmpDirAllocator,
     ) -> Result<RawSortStats> {
-        use crate::bam_io::{create_indexing_bam_writer, write_bai_index};
+        use fgumi_bam_io::{create_indexing_bam_writer, write_bai_index};
         use crate::sort::keys::RawCoordinateKey;
 
         info!("Indexing enabled: will write BAM index alongside output");
@@ -2784,7 +2784,7 @@ impl RawExternalSorter {
         total_records: u64,
         pool: &Arc<SortWorkerPool>,
     ) -> Result<noodles::bam::bai::Index> {
-        use crate::bam_io::create_indexing_bam_writer;
+        use fgumi_bam_io::create_indexing_bam_writer;
         use crate::sort::loser_tree::LoserTree;
 
         // Thread budget: writer gets all threads (merge is output-compression-bound),

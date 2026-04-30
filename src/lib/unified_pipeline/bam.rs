@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::bam_io::is_stdout_path;
+use fgumi_bam_io::is_stdout_path;
 use crate::bgzf_reader::{BGZF_EOF, decompress_block_into, read_raw_blocks};
 use crate::bgzf_writer::InlineBgzfCompressor;
 use crate::progress::ProgressTracker;
@@ -3243,7 +3243,7 @@ fn run_bam_pipeline_single_threaded<G, P>(
     mut grouper: Box<dyn Grouper<Group = G> + Send>,
     fns: PipelineFunctions<G, P>,
     group_key_config: GroupKeyConfig,
-    mut secondary_writer: Option<crate::bam_io::RawBamWriter>,
+    mut secondary_writer: Option<fgumi_bam_io::RawBamWriter>,
 ) -> io::Result<u64>
 where
     G: Send + 'static,
@@ -3476,7 +3476,7 @@ pub fn run_bam_pipeline<G, P>(
     grouper: Box<dyn Grouper<Group = G> + Send>,
     fns: PipelineFunctions<G, P>,
     group_key_config: GroupKeyConfig,
-    secondary_writer: Option<crate::bam_io::RawBamWriter>,
+    secondary_writer: Option<fgumi_bam_io::RawBamWriter>,
 ) -> io::Result<u64>
 where
     G: Send + BatchWeight + MemoryEstimate + 'static,
@@ -4288,7 +4288,7 @@ where
     let output = BufWriter::with_capacity(IO_BUFFER_SIZE, output);
 
     // Create secondary output (reject BAM) with its own BGZF compression
-    let secondary_writer = crate::bam_io::create_raw_bam_writer(
+    let secondary_writer = fgumi_bam_io::create_raw_bam_writer(
         secondary_output_path,
         &output_header,
         1, // single-threaded BGZF for secondary

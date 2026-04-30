@@ -41,7 +41,7 @@
 //! corrector.execute("test").expect("Failed to correct UMIs");
 //! ```
 
-use crate::bam_io::{
+use fgumi_bam_io::{
     BamWriter, RawBamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
     create_optional_bam_writer, create_raw_bam_reader_with_opts, create_raw_bam_writer,
 };

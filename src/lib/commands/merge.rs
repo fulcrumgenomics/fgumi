@@ -10,8 +10,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 #[cfg(test)]
-use crate::bam_io::create_bam_reader;
-use crate::bam_io::create_raw_bam_reader;
+use fgumi_bam_io::create_bam_reader;
+use fgumi_bam_io::create_raw_bam_reader;
 use crate::logging::OperationTimer;
 use crate::sort::RawExternalSorter;
 use crate::validation::validate_file_exists;

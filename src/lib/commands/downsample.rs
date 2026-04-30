@@ -5,7 +5,7 @@
 //!
 //! Requires input BAM to be in template-coordinate order (from group).
 
-use crate::bam_io::{RawBamWriter, create_raw_bam_reader, create_raw_bam_writer};
+use fgumi_bam_io::{RawBamWriter, create_raw_bam_reader, create_raw_bam_writer};
 use crate::logging::OperationTimer;
 use crate::progress::ProgressTracker;
 use crate::sam::{SamTag, is_template_coordinate_sorted};

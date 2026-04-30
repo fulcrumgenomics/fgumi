@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
-use crate::bam_io::{create_bam_reader_for_pipeline_with_opts, is_stdin_path};
+use fgumi_bam_io::{create_bam_reader_for_pipeline_with_opts, is_stdin_path};
 use crate::grouper::{
     FilterMetrics, RawPositionGroup, RecordPositionGrouper, build_templates_from_records,
 };

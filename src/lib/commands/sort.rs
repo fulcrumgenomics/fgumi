@@ -20,7 +20,7 @@
 //!
 //! Use `--verify` to check if a BAM file is correctly sorted without writing output.
 
-use crate::bam_io::create_raw_bam_reader;
+use fgumi_bam_io::create_raw_bam_reader;
 use crate::logging::OperationTimer;
 use crate::sam::SamTag;
 use crate::sort::{QuerynameComparator, RawExternalSorter, SortOrder};
@@ -1235,7 +1235,7 @@ mod tests {
 
         // Now verify
         let file = std::fs::File::open(&sorted_bam)?;
-        let (_, header) = crate::bam_io::create_bam_reader(&sorted_bam, 1)?;
+        let (_, header) = fgumi_bam_io::create_bam_reader(&sorted_bam, 1)?;
         let mut reader = RawBamRecordReader::new(file)?;
         reader.skip_header()?;
 
@@ -1320,7 +1320,7 @@ mod tests {
         // Verify with natural comparator — should detect violations
         // because lex order puts read10 before read2, but natural expects read2 before read10
         let file = std::fs::File::open(&sorted_bam)?;
-        let (_, header) = crate::bam_io::create_bam_reader(&sorted_bam, 1)?;
+        let (_, header) = fgumi_bam_io::create_bam_reader(&sorted_bam, 1)?;
         let mut reader = RawBamRecordReader::new(file)?;
         reader.skip_header()?;
 
@@ -1360,7 +1360,7 @@ mod tests {
         // Verify with lexicographic comparator — should detect violations
         // because natural puts read2 before read10, but lex expects read10 before read2
         let file = std::fs::File::open(&sorted_bam)?;
-        let (_, header) = crate::bam_io::create_bam_reader(&sorted_bam, 1)?;
+        let (_, header) = fgumi_bam_io::create_bam_reader(&sorted_bam, 1)?;
         let mut reader = RawBamRecordReader::new(file)?;
         reader.skip_header()?;
 
@@ -1409,7 +1409,7 @@ mod tests {
         builder.write_bam(&bam_path)?;
 
         let file = std::fs::File::open(&bam_path)?;
-        let (_, header) = crate::bam_io::create_bam_reader(&bam_path, 1)?;
+        let (_, header) = fgumi_bam_io::create_bam_reader(&bam_path, 1)?;
         let mut reader = RawBamRecordReader::new(file)?;
         reader.skip_header()?;
 

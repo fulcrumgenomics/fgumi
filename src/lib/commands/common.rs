@@ -7,7 +7,7 @@ use std::path::PathBuf;
 #[cfg(feature = "simplex")]
 use std::sync::Arc;
 
-use crate::bam_io::is_stdin_path;
+use fgumi_bam_io::is_stdin_path;
 #[cfg(feature = "simplex")]
 use crate::logging::OperationTimer;
 use crate::unified_pipeline::{BamPipelineConfig, SchedulerStrategy};
@@ -171,8 +171,8 @@ impl BamIoOptions {
     }
 
     /// Build [`PipelineReaderOpts`] from the async-reader flag.
-    pub fn pipeline_reader_opts(&self) -> crate::bam_io::PipelineReaderOpts {
-        crate::bam_io::PipelineReaderOpts { async_reader: self.async_reader }
+    pub fn pipeline_reader_opts(&self) -> fgumi_bam_io::PipelineReaderOpts {
+        fgumi_bam_io::PipelineReaderOpts { async_reader: self.async_reader }
     }
 
     /// Validates that the input file exists (skipped for stdin paths).

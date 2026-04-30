@@ -5,7 +5,7 @@
 //! 1. Single-strand consensus for /A and /B reads separately
 //! 2. Duplex consensus from paired single-strand consensuses
 
-use crate::bam_io::{
+use fgumi_bam_io::{
     RawBamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
     create_optional_bam_writer, create_raw_bam_reader_with_opts, create_raw_bam_writer,
 };
@@ -898,7 +898,7 @@ fn has_both_strands_raw(records: &[RawRecord]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bam_io::{create_bam_reader, create_bam_writer};
+    use fgumi_bam_io::{create_bam_reader, create_bam_writer};
     use anyhow::Result;
     use fgumi_raw_bam::{
         SamBuilder as RawSamBuilder, flags, raw_record_to_record_buf, testutil::encode_op,

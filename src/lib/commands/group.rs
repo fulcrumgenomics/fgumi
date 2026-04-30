@@ -1,7 +1,7 @@
 //! Groups reads by UMI to identify reads from the same original molecule.
 
 use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
-use crate::bam_io::{create_bam_reader_for_pipeline, create_bam_writer, is_stdin_path};
+use fgumi_bam_io::{create_bam_reader_for_pipeline, create_bam_writer, is_stdin_path};
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
@@ -1471,7 +1471,7 @@ impl GroupReadsByUmi {
         position_group_size_counter: &mut AHashMap<usize, u64>,
         next_mi_base: &mut u64,
         _header: &Header,
-        writer: &mut crate::bam_io::BamWriter,
+        writer: &mut fgumi_bam_io::BamWriter,
     ) -> Result<()> {
         // Build templates from raw records
         let all_templates = build_templates_from_records(group.records)?;

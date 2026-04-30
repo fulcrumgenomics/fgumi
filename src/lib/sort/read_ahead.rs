@@ -26,7 +26,7 @@
 use crossbeam_channel::{Receiver, Sender, bounded};
 use std::thread::{self, JoinHandle};
 
-use crate::bam_io::RawBamReaderAuto;
+use fgumi_bam_io::RawBamReaderAuto;
 use fgumi_raw_bam::{RawBamReader, RawRecord};
 use std::io::Read as IoRead;
 
@@ -494,7 +494,7 @@ mod tests {
     use std::num::NonZeroUsize;
     use tempfile::NamedTempFile;
 
-    use crate::bam_io::create_raw_bam_reader;
+    use fgumi_bam_io::create_raw_bam_reader;
 
     /// Create a temporary BAM file with the given number of unmapped records.
     /// Returns the temp file handle (keeps the file alive) and the header used.

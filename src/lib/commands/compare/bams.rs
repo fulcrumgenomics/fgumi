@@ -13,7 +13,7 @@
 //! - Zero-copy field comparisons where possible
 //! - Fast hashing with ahash
 
-use crate::bam_io::{RawBamReaderAuto, create_raw_bam_reader};
+use fgumi_bam_io::{RawBamReaderAuto, create_raw_bam_reader};
 use crate::logging::OperationTimer;
 use crate::progress::ProgressTracker;
 use crate::sam::SamTag;

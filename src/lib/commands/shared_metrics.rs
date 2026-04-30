@@ -5,7 +5,7 @@
 //! deterministic downsampling. Both `duplex_metrics` and `simplex_metrics` commands
 //! build on these shared primitives.
 
-use crate::bam_io::create_raw_bam_reader;
+use fgumi_bam_io::create_raw_bam_reader;
 use crate::progress::ProgressTracker;
 use crate::sam::SamTag;
 use crate::template::TemplateIterator;

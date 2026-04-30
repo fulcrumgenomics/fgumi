@@ -1,6 +1,6 @@
 //! Generate BAM and includelist for correct.
 
-use crate::bam_io::create_raw_bam_writer;
+use fgumi_bam_io::create_raw_bam_writer;
 use crate::commands::command::Command;
 use crate::commands::common::CompressionOptions;
 use crate::commands::simulate::common::generate_random_sequence;

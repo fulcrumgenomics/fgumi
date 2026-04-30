@@ -1719,7 +1719,7 @@ pub struct OutputPipelineQueues<G, P: MemoryEstimate> {
     /// Output file, mutex-protected for exclusive access.
     pub output: Mutex<Option<Box<dyn Write + Send>>>,
     /// Optional secondary output writer for dual-output pipelines (e.g., reject BAM).
-    pub secondary_output: Option<Mutex<Option<crate::bam_io::RawBamWriter>>>,
+    pub secondary_output: Option<Mutex<Option<fgumi_bam_io::RawBamWriter>>>,
 
     // ========== Completion and Error Tracking ==========
     /// Flag indicating an error occurred.
@@ -1781,7 +1781,7 @@ impl<G: Send, P: Send + MemoryEstimate> OutputPipelineQueues<G, P> {
     /// Set a secondary output writer for dual-output pipelines.
     ///
     /// Must be called before the pipeline is started.
-    pub fn set_secondary_output(&mut self, writer: crate::bam_io::RawBamWriter) {
+    pub fn set_secondary_output(&mut self, writer: fgumi_bam_io::RawBamWriter) {
         self.secondary_output = Some(Mutex::new(Some(writer)));
     }
 

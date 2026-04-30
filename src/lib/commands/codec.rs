@@ -6,7 +6,7 @@
 //! of the original duplex molecule. R1 comes from one strand, R2 from the opposite strand,
 //! allowing even a single read-pair to generate duplex consensus.
 
-use crate::bam_io::{
+use fgumi_bam_io::{
     RawBamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
     create_optional_bam_writer, create_raw_bam_reader_with_opts, create_raw_bam_writer,
 };

@@ -46,7 +46,7 @@
 //! - `TemplateIterator`: Groups raw BAM bytes from the unmapped reader into Templates
 //! - `TagInfo`: Holds sets of tags to remove/reverse/revcomp
 //! - `merge_raw()`: Core function that transfers metadata between templates using raw bytes
-use crate::bam_io::{
+use fgumi_bam_io::{
     RawBamReaderAuto, create_raw_bam_reader, create_raw_bam_writer, is_stdin_path,
 };
 use crate::batched_sam_reader::BatchedSamReader;

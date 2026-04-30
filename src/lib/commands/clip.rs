@@ -5,7 +5,7 @@
 //! overlapping portions of paired reads.
 
 use crate::alignment_tags::regenerate_alignment_tags_raw;
-use crate::bam_io::{
+use fgumi_bam_io::{
     create_bam_reader_for_pipeline, create_raw_bam_reader, create_raw_bam_writer, is_stdin_path,
 };
 use crate::clipper::{ClippingMode, RawRecordClipper};

@@ -74,7 +74,7 @@ impl PooledBamWriter {
         // Write BAM header into a temporary buffer then flush in BGZF-sized chunks.
         // Headers can exceed BGZF_MAX_BLOCK_SIZE; write_chunked handles the splitting.
         let mut header_buf = Vec::new();
-        crate::bam_io::write_bam_header(&mut header_buf, header)?;
+        fgumi_bam_io::write_bam_header(&mut header_buf, header)?;
         staging.write_chunked(&header_buf)?;
         staging.flush()?;
 

@@ -14,7 +14,7 @@
 //! Automatically detects and handles both Phred+33 (standard) and Phred+64 (Illumina 1.3-1.7)
 //! quality encodings.
 
-use crate::bam_io::{RawBamWriter, create_raw_bam_writer};
+use fgumi_bam_io::{RawBamWriter, create_raw_bam_writer};
 use crate::commands::command::Command;
 use crate::commands::common::{
     CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
@@ -37,7 +37,7 @@ use log::{debug, info};
 use noodles_bgzf::io::MultithreadedReader;
 
 #[cfg(test)]
-use crate::bam_io::create_bam_reader;
+use fgumi_bam_io::create_bam_reader;
 use fgumi_simd_fastq::SimdFastqReader;
 use noodles::sam::header::Header;
 use noodles::sam::header::record::value::Map;

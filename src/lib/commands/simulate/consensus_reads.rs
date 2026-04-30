@@ -1,6 +1,6 @@
 //! Generate consensus BAM with tags for filter.
 
-use crate::bam_io::create_raw_bam_writer;
+use fgumi_bam_io::create_raw_bam_writer;
 use crate::commands::command::Command;
 use crate::commands::common::{CompressionOptions, parse_bool};
 use crate::commands::simulate::common::{MethylationArgs, ReferenceGenome, StrandBiasArgs};
