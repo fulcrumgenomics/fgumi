@@ -259,10 +259,20 @@ fn filter_template(
     config: &DedupFilterConfig,
     metrics: &mut FilterMetrics,
 ) -> bool {
-    let raw_r1 = template.r1().filter(|r| r.len() >= fgumi_raw_bam::MIN_BAM_RECORD_LEN);
-    let raw_r2 = template.r2().filter(|r| r.len() >= fgumi_raw_bam::MIN_BAM_RECORD_LEN);
-
     metrics.total_templates += 1;
+
+    // Fail closed when a mate exists but is shorter than the minimum BAM record
+    // length: a truncated record indicates corrupt input, so the template must
+    // be rejected rather than have the malformed mate silently dropped.
+    let r1_truncated = template.r1().is_some_and(|r| r.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN);
+    let r2_truncated = template.r2().is_some_and(|r| r.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN);
+    if r1_truncated || r2_truncated {
+        metrics.discarded_poor_alignment += 1;
+        return false;
+    }
+
+    let raw_r1 = template.r1();
+    let raw_r2 = template.r2();
 
     if raw_r1.is_none() && raw_r2.is_none() {
         metrics.discarded_poor_alignment += 1;
@@ -1615,6 +1625,44 @@ mod tests {
 
         assert!(!filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_poor_alignment, 1);
+    }
+
+    /// Truncated mate must reject the template (fail closed) rather than
+    /// silently dropping the malformed record and proceeding on the remaining
+    /// valid mate. A truncated record indicates corrupt input.
+    #[test]
+    fn test_filter_template_rejects_truncated_mate() {
+        let config = default_filter_config();
+        let mut metrics = FilterMetrics::new();
+
+        // A valid R1 (full record) and a truncated R2 (16 bytes; below MIN_BAM_RECORD_LEN = 32).
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"q1")
+            .sequence(b"ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .ref_id(0)
+            .pos(99)
+            .cigar_ops(&[encode_op(0, 4)])
+            .mapq(30)
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT);
+        b.add_string_tag(SamTag::RX, b"ACGTACGT");
+        let valid_r1 = b.build();
+        let truncated_r2 = RawRecord::from(vec![0u8; 16]);
+        let template = Template {
+            name: b"q1".to_vec(),
+            records: vec![valid_r1, truncated_r2],
+            r1: Some((0, 1)),
+            r2: Some((1, 2)),
+            r1_supplementals: None,
+            r2_supplementals: None,
+            r1_secondaries: None,
+            r2_secondaries: None,
+            mi: crate::umi::MoleculeId::None,
+        };
+
+        assert!(!filter_template(&template, &config, &mut metrics));
+        assert_eq!(metrics.discarded_poor_alignment, 1, "truncated mate must fail closed");
+        assert_eq!(metrics.accepted_templates, 0);
     }
 
     #[test]

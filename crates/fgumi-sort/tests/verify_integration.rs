@@ -146,7 +146,15 @@ fn sort_and_verify_pass(order: SortOrder) -> Result<()> {
                 |key, prev| key < prev,
             )?
         }
-        SortOrder::TemplateCoordinate => return Ok(()),
+        SortOrder::TemplateCoordinate => {
+            // TemplateCoordinate verification needs LibraryLookup + cb_hasher
+            // wiring beyond what this round-trip helper sets up. Fail loudly so
+            // callers don't see a silent green when the path is uncovered.
+            return Err(anyhow::anyhow!(
+                "TemplateCoordinate verification is not exercised by sort_and_verify_pass; \
+                 add a dedicated test if coverage is needed"
+            ));
+        }
     };
 
     assert!(total > 0, "should have records for {order:?}");

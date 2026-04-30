@@ -141,20 +141,7 @@ pub fn create_bam_reader_with_opts<P: AsRef<Path>>(
     opts: PipelineReaderOpts,
 ) -> Result<(BamReaderAuto, Header)> {
     let path_ref = path.as_ref();
-    let file = File::open(path_ref)
-        .with_context(|| format!("Failed to open input BAM: {}", path_ref.display()))?;
-
-    crate::os_hints::advise_sequential(&file);
-    let reader: Box<dyn Read + Send> = if opts.async_reader {
-        log::info!(
-            "async BAM reader enabled: spawning fgumi-prefetch thread for {}",
-            path_ref.display()
-        );
-        Box::new(crate::prefetch_reader::PrefetchReader::from_file(file))
-    } else {
-        Box::new(file)
-    };
-    let bgzf_reader = make_bgzf_reader(reader, threads);
+    let bgzf_reader = open_bgzf_reader(path_ref, opts, threads, "BAM reader")?;
 
     let mut reader = noodles::bam::io::Reader::from(bgzf_reader);
     let header = reader
@@ -162,6 +149,34 @@ pub fn create_bam_reader_with_opts<P: AsRef<Path>>(
         .with_context(|| format!("Failed to read header from: {}", path_ref.display()))?;
 
     Ok((reader, header))
+}
+
+/// Open `path` and return a BGZF reader configured per `opts`.
+///
+/// Centralizes the file-open + `posix_fadvise` hint + optional `PrefetchReader`
+/// wrapping + `make_bgzf_reader` sequence shared by both [`create_bam_reader_with_opts`]
+/// and [`create_raw_bam_reader_with_opts`]. `label` distinguishes the two
+/// callers in the async-reader log line.
+fn open_bgzf_reader(
+    path: &Path,
+    opts: PipelineReaderOpts,
+    threads: usize,
+    label: &str,
+) -> Result<BgzfReaderEnum> {
+    let file = File::open(path)
+        .with_context(|| format!("Failed to open input BAM: {}", path.display()))?;
+    crate::os_hints::advise_sequential(&file);
+    let reader: Box<dyn Read + Send> = if opts.async_reader {
+        log::info!(
+            "async {} enabled: spawning fgumi-prefetch thread for {}",
+            label,
+            path.display()
+        );
+        Box::new(crate::prefetch_reader::PrefetchReader::from_file(file))
+    } else {
+        Box::new(file)
+    };
+    Ok(make_bgzf_reader(reader, threads))
 }
 
 /// Create a raw BAM reader that yields raw bytes instead of noodles Record.
@@ -202,20 +217,7 @@ pub fn create_raw_bam_reader_with_opts<P: AsRef<Path>>(
     opts: PipelineReaderOpts,
 ) -> Result<(RawBamReaderAuto, Header)> {
     let path_ref = path.as_ref();
-    let file = File::open(path_ref)
-        .with_context(|| format!("Failed to open input BAM: {}", path_ref.display()))?;
-
-    crate::os_hints::advise_sequential(&file);
-    let reader: Box<dyn Read + Send> = if opts.async_reader {
-        log::info!(
-            "async raw BAM reader enabled: spawning fgumi-prefetch thread for {}",
-            path_ref.display()
-        );
-        Box::new(crate::prefetch_reader::PrefetchReader::from_file(file))
-    } else {
-        Box::new(file)
-    };
-    let bgzf_reader = make_bgzf_reader(reader, threads);
+    let bgzf_reader = open_bgzf_reader(path_ref, opts, threads, "raw BAM reader")?;
 
     // Use noodles to read the header, then extract the BGZF reader
     let mut noodles_reader = noodles::bam::io::Reader::from(bgzf_reader);

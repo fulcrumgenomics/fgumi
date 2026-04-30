@@ -118,11 +118,23 @@ fn filter_template_raw(
     use fgumi_raw_bam;
     use fgumi_raw_bam::RawRecordView;
 
-    let raw_r1 = template.r1().filter(|r| r.len() >= fgumi_raw_bam::MIN_BAM_RECORD_LEN);
-    let raw_r2 = template.r2().filter(|r| r.len() >= fgumi_raw_bam::MIN_BAM_RECORD_LEN);
+    let primary_reads = u64::from(template.r1().is_some()) + u64::from(template.r2().is_some());
+    metrics.total_templates += primary_reads;
 
-    let num_primary_reads = raw_r1.is_some() as u64 + raw_r2.is_some() as u64;
-    metrics.total_templates += num_primary_reads;
+    // Fail closed when a primary mate exists but is shorter than the minimum
+    // BAM record length: a truncated record indicates corrupt input, so the
+    // whole template must be rejected (not silently treated as a single-read
+    // template).
+    let r1_truncated = template.r1().is_some_and(|r| r.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN);
+    let r2_truncated = template.r2().is_some_and(|r| r.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN);
+    if r1_truncated || r2_truncated {
+        metrics.discarded_poor_alignment += primary_reads;
+        return false;
+    }
+
+    let raw_r1 = template.r1();
+    let raw_r2 = template.r2();
+    let num_primary_reads = primary_reads;
 
     if raw_r1.is_none() && raw_r2.is_none() {
         metrics.discarded_poor_alignment += num_primary_reads;
@@ -221,10 +233,12 @@ fn filter_template_raw(
             }
         }
 
-        // Check mate MAPQ
+        // Check mate MAPQ. Compare in i64 so a malformed `MQ:i:-1` (or any
+        // negative value from a signed integer aux type) reads as below the
+        // threshold instead of wrapping into a large positive u8.
         if check_mq {
             if let Some(mq) = found_mq {
-                if (mq as u8) < config.min_mapq {
+                if mq < i64::from(config.min_mapq) {
                     metrics.discarded_poor_alignment += num_primary_reads;
                     return false;
                 }
@@ -5221,6 +5235,10 @@ mod tests {
         buf.extend_from_slice(umi);
         buf.push(0);
 
+        // Backfill block_size now that all bytes are appended.
+        let block_size = i32::try_from(buf.len() - 4).expect("BAM record fits in i32");
+        buf[0..4].copy_from_slice(&block_size.to_le_bytes());
+
         fgumi_raw_bam::RawRecord::from(buf)
     }
 
@@ -5375,24 +5393,123 @@ mod tests {
 
     #[test]
     fn test_group_filter_template_raw_truncated_record_treated_as_missing() {
-        // Construct a template that bypasses from_raw_records validation
-        // by directly building with a truncated raw record.
-        // The filter should treat records shorter than MIN_BAM_RECORD_LEN as missing.
-        let short_rec = [0u8; 16]; // Less than 32 bytes
+        // Construct a Template by bypassing from_records validation so that
+        // raw_records[0] is shorter than MIN_BAM_RECORD_LEN. filter_template_raw
+        // must reject the template, accounting for the missing primary read.
+        let short_rec = fgumi_raw_bam::RawRecord::from(vec![0u8; 16]);
         let valid_rec = make_raw_bam_for_group(
             b"rea",
             fgumi_raw_bam::flags::PAIRED
-                | fgumi_raw_bam::flags::FIRST_SEGMENT
+                | fgumi_raw_bam::flags::LAST_SEGMENT
                 | fgumi_raw_bam::flags::MATE_UNMAPPED,
             30,
             b"ACGT",
         );
-        // Build a template where raw_records[0] is too short — testing defense-in-depth
-        // We can't use from_raw_records (it validates), so test the constant is correct
+
+        // Sanity-check the size invariant the filter relies on.
         assert_eq!(fgumi_raw_bam::MIN_BAM_RECORD_LEN, 32);
-        // Verify the valid record passes and the short one would be caught by from_raw_records
-        assert!(valid_rec.len() >= fgumi_raw_bam::MIN_BAM_RECORD_LEN);
         assert!(short_rec.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN);
+        assert!(valid_rec.len() >= fgumi_raw_bam::MIN_BAM_RECORD_LEN);
+
+        // Direct field construction to skip from_records validation.
+        let template = Template {
+            name: b"rea".to_vec(),
+            records: vec![short_rec, valid_rec],
+            r1: Some((0, 1)),
+            r2: Some((1, 2)),
+            r1_supplementals: None,
+            r2_supplementals: None,
+            r1_secondaries: None,
+            r2_secondaries: None,
+            mi: crate::umi::MoleculeId::None,
+        };
+
+        let config = GroupFilterConfig {
+            umi_tag: [b'R', b'X'],
+            min_mapq: 0,
+            include_non_pf: false,
+            min_umi_length: None,
+            no_umi: false,
+            allow_unmapped: false,
+        };
+        let mut metrics = FilterMetrics::new();
+        assert!(
+            !filter_template_raw(&template, &config, &mut metrics),
+            "truncated R1 must cause the template to be rejected"
+        );
+    }
+
+    /// Negative `MQ:i:-1` mate-MQ aux values must be treated as below any
+    /// non-negative threshold, not wrapped to a large positive `u8` (which
+    /// would let malformed records slip past `min_mapq`).
+    #[test]
+    fn test_group_filter_template_raw_negative_mate_mq_rejected() {
+        // Build R1 + R2 where R2 carries an aux MQ:i:-1 (signed int aux type).
+        fn make_with_neg_mate_mq(name: &[u8], flag: u16, mapq: u8) -> fgumi_raw_bam::RawRecord {
+            let seq_len = 4usize;
+            let l_read_name = u8::try_from(name.len() + 1).expect("name fits in u8");
+            let cigar_ops: &[u32] = &[(seq_len as u32) << 4]; // 4M
+            let n_cigar_op = u16::try_from(cigar_ops.len()).expect("cigar fits in u16");
+            let seq_bytes = seq_len.div_ceil(2);
+            let total = 32 + l_read_name as usize + cigar_ops.len() * 4 + seq_bytes + seq_len;
+            let mut buf = vec![0u8; total];
+            buf[0..4].copy_from_slice(&0i32.to_le_bytes());
+            buf[4..8].copy_from_slice(&100i32.to_le_bytes());
+            buf[8] = l_read_name;
+            buf[9] = mapq;
+            buf[12..14].copy_from_slice(&n_cigar_op.to_le_bytes());
+            buf[14..16].copy_from_slice(&flag.to_le_bytes());
+            buf[16..20].copy_from_slice(&(seq_len as u32).to_le_bytes());
+            buf[20..24].copy_from_slice(&(-1i32).to_le_bytes());
+            buf[24..28].copy_from_slice(&(-1i32).to_le_bytes());
+            let name_start = 32;
+            buf[name_start..name_start + name.len()].copy_from_slice(name);
+            buf[name_start + name.len()] = 0;
+            let cigar_start = name_start + l_read_name as usize;
+            for (i, &op) in cigar_ops.iter().enumerate() {
+                let off = cigar_start + i * 4;
+                buf[off..off + 4].copy_from_slice(&op.to_le_bytes());
+            }
+            // RX:Z:ACGT\0 (UMI tag, required by the filter)
+            buf.extend_from_slice(b"RXZ");
+            buf.extend_from_slice(b"ACGT");
+            buf.push(0);
+            // MQ:i:-1 (signed 32-bit int aux type 'i').
+            buf.extend_from_slice(b"MQi");
+            buf.extend_from_slice(&(-1i32).to_le_bytes());
+            // Backfill block_size.
+            let block_size = i32::try_from(buf.len() - 4).expect("BAM record fits in i32");
+            buf[0..4].copy_from_slice(&block_size.to_le_bytes());
+            fgumi_raw_bam::RawRecord::from(buf)
+        }
+
+        let r1 = make_raw_bam_for_group(
+            b"q1",
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
+            30,
+            b"ACGT",
+        );
+        let r2 = make_with_neg_mate_mq(
+            b"q1",
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT,
+            30,
+        );
+        let template =
+            Template::from_records(vec![r1, r2]).expect("template construction should succeed");
+
+        let config = GroupFilterConfig {
+            umi_tag: [b'R', b'X'],
+            min_mapq: 20,
+            include_non_pf: false,
+            min_umi_length: None,
+            no_umi: false,
+            allow_unmapped: false,
+        };
+        let mut metrics = FilterMetrics::new();
+        assert!(
+            !filter_template_raw(&template, &config, &mut metrics),
+            "negative mate MQ must compare below min_mapq (signed semantics)"
+        );
     }
 
     #[test]

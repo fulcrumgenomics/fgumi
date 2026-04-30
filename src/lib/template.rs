@@ -188,7 +188,7 @@ impl Template {
         // Done before the fast path so mismatched names cannot slip past into a Template.
         for rec in raw_records.iter().skip(1) {
             if fgumi_raw_bam::read_name(rec) != name.as_slice() {
-                bail!("Template name mismatch in from_raw_records");
+                bail!("Template name mismatch in from_records");
             }
         }
 
@@ -227,12 +227,7 @@ impl Template {
             }
         }
 
-        // Verify all records share the same QNAME (matching Builder behavior)
-        for rec in raw_records.iter().skip(1) {
-            if fgumi_raw_bam::read_name(rec) != name.as_slice() {
-                bail!("Template name mismatch in from_records");
-            }
-        }
+        // QNAME consistency was already verified above before the fast path.
 
         // Categorize records into: r1, r2, r1_supp, r2_supp, r1_sec, r2_sec
         let mut r1_idx: Option<usize> = None;
@@ -820,7 +815,7 @@ where
 }
 
 impl<R: std::io::Read> TemplateIterator<R> {
-    /// Creates a new `RawTemplateIterator` from a [`fgumi_raw_bam::RawBamReader`].
+    /// Creates a new `TemplateIterator` from a [`fgumi_raw_bam::RawBamReader`].
     ///
     /// The reader must already have had its header consumed (e.g., via
     /// [`fgumi_bam_io::create_raw_bam_reader`]).

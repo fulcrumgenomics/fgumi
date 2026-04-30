@@ -3186,6 +3186,10 @@ mod tests {
         buf.extend_from_slice(umi);
         buf.push(0);
 
+        // Backfill the BAM block_size field (excludes the 4-byte block_size itself).
+        let block_size = i32::try_from(buf.len() - 4).expect("BAM record fits in i32");
+        buf[0..4].copy_from_slice(&block_size.to_le_bytes());
+
         RawRecord::from(buf)
     }
 
