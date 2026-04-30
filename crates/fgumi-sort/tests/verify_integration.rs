@@ -122,7 +122,8 @@ fn sort_and_verify_pass(order: SortOrder) -> Result<()> {
 
     let (total, violations, _) = match order {
         SortOrder::Coordinate => {
-            let nref = header.reference_sequences().len() as u32;
+            let nref = u32::try_from(header.reference_sequences().len())
+                .expect("reference sequence count fits in u32");
             verify_sort_order(
                 reader,
                 |bam| extract_coordinate_key_inline(bam, nref),
@@ -148,8 +149,8 @@ fn sort_and_verify_pass(order: SortOrder) -> Result<()> {
         SortOrder::TemplateCoordinate => return Ok(()),
     };
 
-    assert!(total > 0, "should have records for {:?}", order);
-    assert_eq!(violations, 0, "should be sorted for {:?}", order);
+    assert!(total > 0, "should have records for {order:?}");
+    assert_eq!(violations, 0, "should be sorted for {order:?}");
     Ok(())
 }
 
@@ -249,7 +250,8 @@ fn test_verify_coordinate_fails_on_unsorted() -> Result<()> {
     let mut reader = RawBamRecordReader::new(file)?;
     reader.skip_header()?;
 
-    let nref = header.reference_sequences().len() as u32;
+    let nref = u32::try_from(header.reference_sequences().len())
+        .expect("reference sequence count fits in u32");
     let (total, violations, _) = verify_sort_order(
         reader,
         |bam| extract_coordinate_key_inline(bam, nref),

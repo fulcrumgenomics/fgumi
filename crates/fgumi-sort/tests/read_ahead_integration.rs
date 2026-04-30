@@ -17,14 +17,14 @@ use fgumi_sort::{RawExternalSorter, SortOrder};
 /// records survive.
 #[test]
 fn test_pool_integrated_reader_round_trip_coordinate() {
-    let n_pairs = 10_u64;
+    let n_pairs: usize = 10;
     let mut builder = SamBuilder::new();
     for i in 0..n_pairs {
         let _ = builder
             .add_pair()
             .name(&format!("read{i}"))
-            .start1((i as usize) * 200 + 1)
-            .start2((i as usize) * 200 + 101)
+            .start1(i * 200 + 1)
+            .start2(i * 200 + 101)
             .build();
     }
 
@@ -41,29 +41,28 @@ fn test_pool_integrated_reader_round_trip_coordinate() {
         .sort(&input, &output)
         .expect("sort should succeed");
 
+    let expected = (n_pairs * 2) as u64;
     assert_eq!(
-        stats.total_records,
-        n_pairs * 2,
+        stats.total_records, expected,
         "expected {} records, got {}",
-        n_pairs * 2,
-        stats.total_records
+        expected, stats.total_records
     );
-    assert_eq!(stats.output_records, n_pairs * 2);
+    assert_eq!(stats.output_records, expected);
     assert_eq!(stats.chunks_written, 0, "tiny BAM should fit in memory");
 }
 
 /// Same round-trip but with template-coordinate sort order to exercise the
-/// TemplateKey extraction path.
+/// `TemplateKey` extraction path.
 #[test]
 fn test_pool_integrated_reader_round_trip_template_coordinate() {
-    let n_pairs = 10_u64;
+    let n_pairs: usize = 10;
     let mut builder = SamBuilder::new();
     for i in 0..n_pairs {
         let _ = builder
             .add_pair()
             .name(&format!("pair{i}"))
-            .start1((i as usize) * 300 + 1)
-            .start2((i as usize) * 300 + 151)
+            .start1(i * 300 + 1)
+            .start2(i * 300 + 151)
             .build();
     }
 
@@ -80,6 +79,7 @@ fn test_pool_integrated_reader_round_trip_template_coordinate() {
         .sort(&input, &output)
         .expect("template-coordinate sort should succeed");
 
-    assert_eq!(stats.total_records, n_pairs * 2);
-    assert_eq!(stats.output_records, n_pairs * 2);
+    let expected = (n_pairs * 2) as u64;
+    assert_eq!(stats.total_records, expected);
+    assert_eq!(stats.output_records, expected);
 }
