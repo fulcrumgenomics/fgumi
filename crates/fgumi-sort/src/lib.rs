@@ -43,7 +43,7 @@ pub mod external;
 pub mod inline;
 pub mod keys;
 pub(crate) mod loser_tree;
-pub(crate) mod memory_probe;
+pub mod memory_probe;
 pub mod pipeline;
 pub(crate) mod pooled_bam_writer;
 pub(crate) mod pooled_chunk_writer;

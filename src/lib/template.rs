@@ -157,7 +157,7 @@ impl Template {
     /// Returns an error if multiple primary R1s or R2s are found.
     #[allow(clippy::too_many_lines)]
     pub fn from_records(mut raw_records: Vec<RawRecord>) -> Result<Self> {
-        use crate::sort::bam_fields;
+        use fgumi_raw_bam;
 
         if raw_records.is_empty() {
             bail!("No records given to Template::from_records");
@@ -165,11 +165,11 @@ impl Template {
 
         // Guard against truncated records
         for (i, r) in raw_records.iter().enumerate() {
-            if r.len() < bam_fields::MIN_BAM_RECORD_LEN {
+            if r.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN {
                 bail!(
                     "Raw BAM record {i} too short to parse ({} < {})",
                     r.len(),
-                    bam_fields::MIN_BAM_RECORD_LEN
+                    fgumi_raw_bam::MIN_BAM_RECORD_LEN
                 );
             }
             let l_rn = r[8] as usize;
@@ -182,12 +182,12 @@ impl Template {
         }
 
         // Extract name from first record
-        let name = bam_fields::read_name(&raw_records[0]).to_vec();
+        let name = fgumi_raw_bam::read_name(&raw_records[0]).to_vec();
 
         // Verify all records share the same QNAME (matching Builder behavior).
         // Done before the fast path so mismatched names cannot slip past into a Template.
         for rec in raw_records.iter().skip(1) {
-            if bam_fields::read_name(rec) != name.as_slice() {
+            if fgumi_raw_bam::read_name(rec) != name.as_slice() {
                 bail!("Template name mismatch in from_raw_records");
             }
         }
@@ -197,13 +197,13 @@ impl Template {
             let f0 = RawRecordView::new(&raw_records[0]).flags();
             let f1 = RawRecordView::new(&raw_records[1]).flags();
             let neither_sec_supp =
-                (f0 | f1) & (bam_fields::flags::SECONDARY | bam_fields::flags::SUPPLEMENTARY) == 0;
+                (f0 | f1) & (fgumi_raw_bam::flags::SECONDARY | fgumi_raw_bam::flags::SUPPLEMENTARY) == 0;
             if neither_sec_supp {
                 // Use same R1/R2 logic as general path: R1 = !paired || first_segment
-                let is_r1_0 = (f0 & bam_fields::flags::PAIRED) == 0
-                    || (f0 & bam_fields::flags::FIRST_SEGMENT) != 0;
-                let is_r1_1 = (f1 & bam_fields::flags::PAIRED) == 0
-                    || (f1 & bam_fields::flags::FIRST_SEGMENT) != 0;
+                let is_r1_0 = (f0 & fgumi_raw_bam::flags::PAIRED) == 0
+                    || (f0 & fgumi_raw_bam::flags::FIRST_SEGMENT) != 0;
+                let is_r1_1 = (f1 & fgumi_raw_bam::flags::PAIRED) == 0
+                    || (f1 & fgumi_raw_bam::flags::FIRST_SEGMENT) != 0;
                 // Only use fast path if exactly one R1 and one R2
                 if is_r1_0 != is_r1_1 {
                     if !is_r1_0 {
@@ -228,7 +228,7 @@ impl Template {
 
         // Verify all records share the same QNAME (matching Builder behavior)
         for rec in raw_records.iter().skip(1) {
-            if bam_fields::read_name(rec) != name.as_slice() {
+            if fgumi_raw_bam::read_name(rec) != name.as_slice() {
                 bail!("Template name mismatch in from_records");
             }
         }
@@ -243,10 +243,10 @@ impl Template {
 
         for (i, rec) in raw_records.iter().enumerate() {
             let flg = RawRecordView::new(rec).flags();
-            let is_secondary = (flg & bam_fields::flags::SECONDARY) != 0;
-            let is_supplementary = (flg & bam_fields::flags::SUPPLEMENTARY) != 0;
-            let is_paired = (flg & bam_fields::flags::PAIRED) != 0;
-            let is_first = (flg & bam_fields::flags::FIRST_SEGMENT) != 0;
+            let is_secondary = (flg & fgumi_raw_bam::flags::SECONDARY) != 0;
+            let is_supplementary = (flg & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0;
+            let is_paired = (flg & fgumi_raw_bam::flags::PAIRED) != 0;
+            let is_first = (flg & fgumi_raw_bam::flags::FIRST_SEGMENT) != 0;
             let is_r1 = !is_paired || is_first;
 
             if is_r1 {
@@ -374,19 +374,19 @@ impl Template {
     /// ```
     #[must_use]
     pub fn pair_orientation(&self) -> Option<PairOrientation> {
-        use crate::sort::bam_fields;
+        use fgumi_raw_bam;
         let r1 = self.r1()?;
         let r2 = self.r2()?;
         let f1 = RawRecordView::new(r1).flags();
         let f2 = RawRecordView::new(r2).flags();
 
         // Both must be mapped
-        if (f1 & bam_fields::flags::UNMAPPED) != 0 || (f2 & bam_fields::flags::UNMAPPED) != 0 {
+        if (f1 & fgumi_raw_bam::flags::UNMAPPED) != 0 || (f2 & fgumi_raw_bam::flags::UNMAPPED) != 0 {
             return None;
         }
 
         // Must be on the same reference
-        if bam_fields::ref_id(r1) != bam_fields::ref_id(r2) {
+        if fgumi_raw_bam::ref_id(r1) != fgumi_raw_bam::ref_id(r2) {
             return None;
         }
 
@@ -409,7 +409,7 @@ impl Template {
     /// with well-formed templates).
     #[allow(clippy::too_many_lines)]
     pub fn fix_mate_info(&mut self) -> Result<()> {
-        use crate::sort::bam_fields;
+        use fgumi_raw_bam;
 
         let rr = &mut self.records;
 
@@ -420,13 +420,13 @@ impl Template {
         // Fix mate info for primary R1/R2 pair
         if let (Some((r1_i, _)), Some((r2_i, _))) = (self.r1, self.r2) {
             let r1_is_unmapped =
-                (RawRecordView::new(&rr[r1_i]).flags() & bam_fields::flags::UNMAPPED) != 0;
+                (RawRecordView::new(&rr[r1_i]).flags() & fgumi_raw_bam::flags::UNMAPPED) != 0;
             let r2_is_unmapped =
-                (RawRecordView::new(&rr[r2_i]).flags() & bam_fields::flags::UNMAPPED) != 0;
+                (RawRecordView::new(&rr[r2_i]).flags() & fgumi_raw_bam::flags::UNMAPPED) != 0;
 
             // Get alignment scores for mate score tags
-            let r1_as = bam_fields::find_int_tag(bam_fields::aux_data_slice(&rr[r1_i]), SamTag::AS);
-            let r2_as = bam_fields::find_int_tag(bam_fields::aux_data_slice(&rr[r2_i]), SamTag::AS);
+            let r1_as = fgumi_raw_bam::find_int_tag(fgumi_raw_bam::aux_data_slice(&rr[r1_i]), SamTag::AS);
+            let r2_as = fgumi_raw_bam::find_int_tag(fgumi_raw_bam::aux_data_slice(&rr[r2_i]), SamTag::AS);
 
             if !r1_is_unmapped && !r2_is_unmapped {
                 // Case 1: Both mapped
@@ -443,14 +443,14 @@ impl Template {
             let rr = &mut self.records;
             if let Some(as_value) = r2_as {
                 if let Ok(v) = i32::try_from(as_value) {
-                    bam_fields::remove_tag(rr[r1_i].as_mut_vec(), SamTag::MS);
-                    bam_fields::append_signed_int_tag(rr[r1_i].as_mut_vec(), SamTag::MS, v);
+                    fgumi_raw_bam::remove_tag(rr[r1_i].as_mut_vec(), SamTag::MS);
+                    fgumi_raw_bam::append_signed_int_tag(rr[r1_i].as_mut_vec(), SamTag::MS, v);
                 }
             }
             if let Some(as_value) = r1_as {
                 if let Ok(v) = i32::try_from(as_value) {
-                    bam_fields::remove_tag(rr[r2_i].as_mut_vec(), SamTag::MS);
-                    bam_fields::append_signed_int_tag(rr[r2_i].as_mut_vec(), SamTag::MS, v);
+                    fgumi_raw_bam::remove_tag(rr[r2_i].as_mut_vec(), SamTag::MS);
+                    fgumi_raw_bam::append_signed_int_tag(rr[r2_i].as_mut_vec(), SamTag::MS, v);
                 }
             }
         }
@@ -458,41 +458,41 @@ impl Template {
         // Fix mate info for R1 supplementals (mate is primary R2)
         if let Some((r2_i, _)) = self.r2 {
             let rr = &self.records;
-            let r2_ref_id = bam_fields::ref_id(&rr[r2_i]);
-            let r2_pos = bam_fields::pos(&rr[r2_i]);
+            let r2_ref_id = fgumi_raw_bam::ref_id(&rr[r2_i]);
+            let r2_pos = fgumi_raw_bam::pos(&rr[r2_i]);
             let r2_flags = RawRecordView::new(&rr[r2_i]).flags();
-            let r2_is_reverse = (r2_flags & bam_fields::flags::REVERSE) != 0;
-            let r2_is_unmapped = (r2_flags & bam_fields::flags::UNMAPPED) != 0;
-            let r2_tlen = bam_fields::template_length(&rr[r2_i]);
-            let r2_mapq = bam_fields::mapq(&rr[r2_i]);
-            let r2_cigar_str = bam_fields::cigar_to_string_from_raw(&rr[r2_i]);
-            let r2_as = bam_fields::find_int_tag(bam_fields::aux_data_slice(&rr[r2_i]), SamTag::AS);
+            let r2_is_reverse = (r2_flags & fgumi_raw_bam::flags::REVERSE) != 0;
+            let r2_is_unmapped = (r2_flags & fgumi_raw_bam::flags::UNMAPPED) != 0;
+            let r2_tlen = fgumi_raw_bam::template_length(&rr[r2_i]);
+            let r2_mapq = fgumi_raw_bam::mapq(&rr[r2_i]);
+            let r2_cigar_str = fgumi_raw_bam::cigar_to_string_from_raw(&rr[r2_i]);
+            let r2_as = fgumi_raw_bam::find_int_tag(fgumi_raw_bam::aux_data_slice(&rr[r2_i]), SamTag::AS);
 
             if let Some((start, end)) = self.r1_supplementals {
                 let rr = &mut self.records;
                 for rec in &mut rr[start..end] {
-                    bam_fields::set_mate_ref_id(rec, r2_ref_id);
-                    bam_fields::set_mate_pos(rec, r2_pos);
+                    fgumi_raw_bam::set_mate_ref_id(rec, r2_ref_id);
+                    fgumi_raw_bam::set_mate_pos(rec, r2_pos);
                     set_mate_flags(rec, r2_is_reverse, r2_is_unmapped);
-                    bam_fields::set_template_length(rec, -r2_tlen);
+                    fgumi_raw_bam::set_template_length(rec, -r2_tlen);
 
                     let mq_val = if r2_mapq == 255 { 255 } else { i32::from(r2_mapq) };
-                    bam_fields::update_int_tag(rec.as_mut_vec(), SamTag::MQ, mq_val);
+                    fgumi_raw_bam::update_int_tag(rec.as_mut_vec(), SamTag::MQ, mq_val);
 
                     if !r2_cigar_str.is_empty() && r2_cigar_str != "*" && !r2_is_unmapped {
-                        bam_fields::update_string_tag(
+                        fgumi_raw_bam::update_string_tag(
                             rec.as_mut_vec(),
                             SamTag::MC,
                             r2_cigar_str.as_bytes(),
                         );
                     } else {
-                        bam_fields::remove_tag(rec.as_mut_vec(), SamTag::MC);
+                        fgumi_raw_bam::remove_tag(rec.as_mut_vec(), SamTag::MC);
                     }
 
                     if let Some(as_value) = r2_as {
                         if let Ok(v) = i32::try_from(as_value) {
-                            bam_fields::remove_tag(rec.as_mut_vec(), SamTag::MS);
-                            bam_fields::append_signed_int_tag(rec.as_mut_vec(), SamTag::MS, v);
+                            fgumi_raw_bam::remove_tag(rec.as_mut_vec(), SamTag::MS);
+                            fgumi_raw_bam::append_signed_int_tag(rec.as_mut_vec(), SamTag::MS, v);
                         }
                     }
                 }
@@ -502,41 +502,41 @@ impl Template {
         // Fix mate info for R2 supplementals (mate is primary R1)
         if let Some((r1_i, _)) = self.r1 {
             let rr = &self.records;
-            let r1_ref_id = bam_fields::ref_id(&rr[r1_i]);
-            let r1_pos = bam_fields::pos(&rr[r1_i]);
+            let r1_ref_id = fgumi_raw_bam::ref_id(&rr[r1_i]);
+            let r1_pos = fgumi_raw_bam::pos(&rr[r1_i]);
             let r1_flags = RawRecordView::new(&rr[r1_i]).flags();
-            let r1_is_reverse = (r1_flags & bam_fields::flags::REVERSE) != 0;
-            let r1_is_unmapped = (r1_flags & bam_fields::flags::UNMAPPED) != 0;
-            let r1_tlen = bam_fields::template_length(&rr[r1_i]);
-            let r1_mapq = bam_fields::mapq(&rr[r1_i]);
-            let r1_cigar_str = bam_fields::cigar_to_string_from_raw(&rr[r1_i]);
-            let r1_as = bam_fields::find_int_tag(bam_fields::aux_data_slice(&rr[r1_i]), SamTag::AS);
+            let r1_is_reverse = (r1_flags & fgumi_raw_bam::flags::REVERSE) != 0;
+            let r1_is_unmapped = (r1_flags & fgumi_raw_bam::flags::UNMAPPED) != 0;
+            let r1_tlen = fgumi_raw_bam::template_length(&rr[r1_i]);
+            let r1_mapq = fgumi_raw_bam::mapq(&rr[r1_i]);
+            let r1_cigar_str = fgumi_raw_bam::cigar_to_string_from_raw(&rr[r1_i]);
+            let r1_as = fgumi_raw_bam::find_int_tag(fgumi_raw_bam::aux_data_slice(&rr[r1_i]), SamTag::AS);
 
             if let Some((start, end)) = self.r2_supplementals {
                 let rr = &mut self.records;
                 for rec in &mut rr[start..end] {
-                    bam_fields::set_mate_ref_id(rec, r1_ref_id);
-                    bam_fields::set_mate_pos(rec, r1_pos);
+                    fgumi_raw_bam::set_mate_ref_id(rec, r1_ref_id);
+                    fgumi_raw_bam::set_mate_pos(rec, r1_pos);
                     set_mate_flags(rec, r1_is_reverse, r1_is_unmapped);
-                    bam_fields::set_template_length(rec, -r1_tlen);
+                    fgumi_raw_bam::set_template_length(rec, -r1_tlen);
 
                     let mq_val = if r1_mapq == 255 { 255 } else { i32::from(r1_mapq) };
-                    bam_fields::update_int_tag(rec.as_mut_vec(), SamTag::MQ, mq_val);
+                    fgumi_raw_bam::update_int_tag(rec.as_mut_vec(), SamTag::MQ, mq_val);
 
                     if !r1_cigar_str.is_empty() && r1_cigar_str != "*" && !r1_is_unmapped {
-                        bam_fields::update_string_tag(
+                        fgumi_raw_bam::update_string_tag(
                             rec.as_mut_vec(),
                             SamTag::MC,
                             r1_cigar_str.as_bytes(),
                         );
                     } else {
-                        bam_fields::remove_tag(rec.as_mut_vec(), SamTag::MC);
+                        fgumi_raw_bam::remove_tag(rec.as_mut_vec(), SamTag::MC);
                     }
 
                     if let Some(as_value) = r1_as {
                         if let Ok(v) = i32::try_from(as_value) {
-                            bam_fields::remove_tag(rec.as_mut_vec(), SamTag::MS);
-                            bam_fields::append_signed_int_tag(rec.as_mut_vec(), SamTag::MS, v);
+                            fgumi_raw_bam::remove_tag(rec.as_mut_vec(), SamTag::MS);
+                            fgumi_raw_bam::append_signed_int_tag(rec.as_mut_vec(), SamTag::MS, v);
                         }
                     }
                 }
@@ -548,25 +548,25 @@ impl Template {
 
     /// Raw-byte: both reads mapped. Sets mate info, TLEN, MQ, MC.
     fn set_mate_info_both_mapped(&mut self, r1_i: usize, r2_i: usize) {
-        use crate::sort::bam_fields;
+        use fgumi_raw_bam;
 
         let rr = &self.records;
 
         // Get R2's info for R1
-        let r2_ref_id = bam_fields::ref_id(&rr[r2_i]);
-        let r2_pos = bam_fields::pos(&rr[r2_i]);
+        let r2_ref_id = fgumi_raw_bam::ref_id(&rr[r2_i]);
+        let r2_pos = fgumi_raw_bam::pos(&rr[r2_i]);
         let r2_is_reverse =
-            (RawRecordView::new(&rr[r2_i]).flags() & bam_fields::flags::REVERSE) != 0;
-        let r2_mapq = bam_fields::mapq(&rr[r2_i]);
-        let r2_cigar_str = bam_fields::cigar_to_string_from_raw(&rr[r2_i]);
+            (RawRecordView::new(&rr[r2_i]).flags() & fgumi_raw_bam::flags::REVERSE) != 0;
+        let r2_mapq = fgumi_raw_bam::mapq(&rr[r2_i]);
+        let r2_cigar_str = fgumi_raw_bam::cigar_to_string_from_raw(&rr[r2_i]);
 
         // Get R1's info for R2
-        let r1_ref_id = bam_fields::ref_id(&rr[r1_i]);
-        let r1_pos = bam_fields::pos(&rr[r1_i]);
+        let r1_ref_id = fgumi_raw_bam::ref_id(&rr[r1_i]);
+        let r1_pos = fgumi_raw_bam::pos(&rr[r1_i]);
         let r1_is_reverse =
-            (RawRecordView::new(&rr[r1_i]).flags() & bam_fields::flags::REVERSE) != 0;
-        let r1_mapq = bam_fields::mapq(&rr[r1_i]);
-        let r1_cigar_str = bam_fields::cigar_to_string_from_raw(&rr[r1_i]);
+            (RawRecordView::new(&rr[r1_i]).flags() & fgumi_raw_bam::flags::REVERSE) != 0;
+        let r1_mapq = fgumi_raw_bam::mapq(&rr[r1_i]);
+        let r1_cigar_str = fgumi_raw_bam::cigar_to_string_from_raw(&rr[r1_i]);
 
         // Compute insert size before mutating
         let insert_size = compute_insert_size_raw(&rr[r1_i], &rr[r2_i]);
@@ -574,172 +574,172 @@ impl Template {
         let rr = &mut self.records;
 
         // Set mate info on R1 from R2
-        bam_fields::set_mate_ref_id(&mut rr[r1_i], r2_ref_id);
-        bam_fields::set_mate_pos(&mut rr[r1_i], r2_pos);
+        fgumi_raw_bam::set_mate_ref_id(&mut rr[r1_i], r2_ref_id);
+        fgumi_raw_bam::set_mate_pos(&mut rr[r1_i], r2_pos);
         set_mate_flags(&mut rr[r1_i], r2_is_reverse, false);
         let r2_mq_val = if r2_mapq == 255 { 255 } else { i32::from(r2_mapq) };
-        bam_fields::update_int_tag(rr[r1_i].as_mut_vec(), SamTag::MQ, r2_mq_val);
+        fgumi_raw_bam::update_int_tag(rr[r1_i].as_mut_vec(), SamTag::MQ, r2_mq_val);
         if !r2_cigar_str.is_empty() && r2_cigar_str != "*" {
-            bam_fields::update_string_tag(
+            fgumi_raw_bam::update_string_tag(
                 rr[r1_i].as_mut_vec(),
                 SamTag::MC,
                 r2_cigar_str.as_bytes(),
             );
         } else {
-            bam_fields::remove_tag(rr[r1_i].as_mut_vec(), SamTag::MC);
+            fgumi_raw_bam::remove_tag(rr[r1_i].as_mut_vec(), SamTag::MC);
         }
 
         // Set mate info on R2 from R1
-        bam_fields::set_mate_ref_id(&mut rr[r2_i], r1_ref_id);
-        bam_fields::set_mate_pos(&mut rr[r2_i], r1_pos);
+        fgumi_raw_bam::set_mate_ref_id(&mut rr[r2_i], r1_ref_id);
+        fgumi_raw_bam::set_mate_pos(&mut rr[r2_i], r1_pos);
         set_mate_flags(&mut rr[r2_i], r1_is_reverse, false);
         let r1_mq_val = if r1_mapq == 255 { 255 } else { i32::from(r1_mapq) };
-        bam_fields::update_int_tag(rr[r2_i].as_mut_vec(), SamTag::MQ, r1_mq_val);
+        fgumi_raw_bam::update_int_tag(rr[r2_i].as_mut_vec(), SamTag::MQ, r1_mq_val);
         if !r1_cigar_str.is_empty() && r1_cigar_str != "*" {
-            bam_fields::update_string_tag(
+            fgumi_raw_bam::update_string_tag(
                 rr[r2_i].as_mut_vec(),
                 SamTag::MC,
                 r1_cigar_str.as_bytes(),
             );
         } else {
-            bam_fields::remove_tag(rr[r2_i].as_mut_vec(), SamTag::MC);
+            fgumi_raw_bam::remove_tag(rr[r2_i].as_mut_vec(), SamTag::MC);
         }
 
         // Set insert size
-        bam_fields::set_template_length(&mut rr[r1_i], insert_size);
-        bam_fields::set_template_length(&mut rr[r2_i], -insert_size);
+        fgumi_raw_bam::set_template_length(&mut rr[r1_i], insert_size);
+        fgumi_raw_bam::set_template_length(&mut rr[r2_i], -insert_size);
     }
 
     /// Raw-byte: both reads unmapped. Clears ref/pos, removes MQ/MC, TLEN=0.
     fn set_mate_info_both_unmapped(&mut self, r1_i: usize, r2_i: usize) {
-        use crate::sort::bam_fields;
+        use fgumi_raw_bam;
 
         let rr = &self.records;
         let r1_is_reverse =
-            (RawRecordView::new(&rr[r1_i]).flags() & bam_fields::flags::REVERSE) != 0;
+            (RawRecordView::new(&rr[r1_i]).flags() & fgumi_raw_bam::flags::REVERSE) != 0;
         let r2_is_reverse =
-            (RawRecordView::new(&rr[r2_i]).flags() & bam_fields::flags::REVERSE) != 0;
+            (RawRecordView::new(&rr[r2_i]).flags() & fgumi_raw_bam::flags::REVERSE) != 0;
 
         let rr = &mut self.records;
 
         // R1: set to unmapped coordinates
-        bam_fields::set_ref_id(&mut rr[r1_i], -1);
-        bam_fields::set_pos(&mut rr[r1_i], -1);
-        bam_fields::set_mate_ref_id(&mut rr[r1_i], -1);
-        bam_fields::set_mate_pos(&mut rr[r1_i], -1);
+        fgumi_raw_bam::set_ref_id(&mut rr[r1_i], -1);
+        fgumi_raw_bam::set_pos(&mut rr[r1_i], -1);
+        fgumi_raw_bam::set_mate_ref_id(&mut rr[r1_i], -1);
+        fgumi_raw_bam::set_mate_pos(&mut rr[r1_i], -1);
         set_mate_flags(&mut rr[r1_i], r2_is_reverse, true);
-        bam_fields::remove_tag(rr[r1_i].as_mut_vec(), SamTag::MQ);
-        bam_fields::remove_tag(rr[r1_i].as_mut_vec(), SamTag::MC);
-        bam_fields::set_template_length(&mut rr[r1_i], 0);
+        fgumi_raw_bam::remove_tag(rr[r1_i].as_mut_vec(), SamTag::MQ);
+        fgumi_raw_bam::remove_tag(rr[r1_i].as_mut_vec(), SamTag::MC);
+        fgumi_raw_bam::set_template_length(&mut rr[r1_i], 0);
 
         // R2: set to unmapped coordinates
-        bam_fields::set_ref_id(&mut rr[r2_i], -1);
-        bam_fields::set_pos(&mut rr[r2_i], -1);
-        bam_fields::set_mate_ref_id(&mut rr[r2_i], -1);
-        bam_fields::set_mate_pos(&mut rr[r2_i], -1);
+        fgumi_raw_bam::set_ref_id(&mut rr[r2_i], -1);
+        fgumi_raw_bam::set_pos(&mut rr[r2_i], -1);
+        fgumi_raw_bam::set_mate_ref_id(&mut rr[r2_i], -1);
+        fgumi_raw_bam::set_mate_pos(&mut rr[r2_i], -1);
         set_mate_flags(&mut rr[r2_i], r1_is_reverse, true);
-        bam_fields::remove_tag(rr[r2_i].as_mut_vec(), SamTag::MQ);
-        bam_fields::remove_tag(rr[r2_i].as_mut_vec(), SamTag::MC);
-        bam_fields::set_template_length(&mut rr[r2_i], 0);
+        fgumi_raw_bam::remove_tag(rr[r2_i].as_mut_vec(), SamTag::MQ);
+        fgumi_raw_bam::remove_tag(rr[r2_i].as_mut_vec(), SamTag::MC);
+        fgumi_raw_bam::set_template_length(&mut rr[r2_i], 0);
     }
 
     /// Raw-byte: one mapped, one unmapped. Places unmapped at mapped coords.
     fn set_mate_info_one_unmapped(&mut self, r1_i: usize, r2_i: usize, r1_is_unmapped: bool) {
-        use crate::sort::bam_fields;
+        use fgumi_raw_bam;
 
         let (mapped_i, unmapped_i) = if r1_is_unmapped { (r2_i, r1_i) } else { (r1_i, r2_i) };
 
         let rr = &self.records;
-        let mapped_ref_id = bam_fields::ref_id(&rr[mapped_i]);
-        let mapped_pos = bam_fields::pos(&rr[mapped_i]);
+        let mapped_ref_id = fgumi_raw_bam::ref_id(&rr[mapped_i]);
+        let mapped_pos = fgumi_raw_bam::pos(&rr[mapped_i]);
         let mapped_flags = RawRecordView::new(&rr[mapped_i]).flags();
-        let mapped_is_reverse = (mapped_flags & bam_fields::flags::REVERSE) != 0;
-        let mapped_mapq = bam_fields::mapq(&rr[mapped_i]);
-        let mapped_cigar_str = bam_fields::cigar_to_string_from_raw(&rr[mapped_i]);
+        let mapped_is_reverse = (mapped_flags & fgumi_raw_bam::flags::REVERSE) != 0;
+        let mapped_mapq = fgumi_raw_bam::mapq(&rr[mapped_i]);
+        let mapped_cigar_str = fgumi_raw_bam::cigar_to_string_from_raw(&rr[mapped_i]);
 
         let unmapped_is_reverse =
-            (RawRecordView::new(&rr[unmapped_i]).flags() & bam_fields::flags::REVERSE) != 0;
+            (RawRecordView::new(&rr[unmapped_i]).flags() & fgumi_raw_bam::flags::REVERSE) != 0;
 
         let rr = &mut self.records;
 
         // Place unmapped read at mapped read's coordinates
-        bam_fields::set_ref_id(&mut rr[unmapped_i], mapped_ref_id);
-        bam_fields::set_pos(&mut rr[unmapped_i], mapped_pos);
+        fgumi_raw_bam::set_ref_id(&mut rr[unmapped_i], mapped_ref_id);
+        fgumi_raw_bam::set_pos(&mut rr[unmapped_i], mapped_pos);
 
         // Set mate info on mapped read (mate is unmapped)
-        bam_fields::set_mate_ref_id(&mut rr[mapped_i], mapped_ref_id);
-        bam_fields::set_mate_pos(&mut rr[mapped_i], mapped_pos);
+        fgumi_raw_bam::set_mate_ref_id(&mut rr[mapped_i], mapped_ref_id);
+        fgumi_raw_bam::set_mate_pos(&mut rr[mapped_i], mapped_pos);
         set_mate_flags(&mut rr[mapped_i], unmapped_is_reverse, true);
-        bam_fields::remove_tag(rr[mapped_i].as_mut_vec(), SamTag::MQ);
-        bam_fields::remove_tag(rr[mapped_i].as_mut_vec(), SamTag::MC);
-        bam_fields::set_template_length(&mut rr[mapped_i], 0);
+        fgumi_raw_bam::remove_tag(rr[mapped_i].as_mut_vec(), SamTag::MQ);
+        fgumi_raw_bam::remove_tag(rr[mapped_i].as_mut_vec(), SamTag::MC);
+        fgumi_raw_bam::set_template_length(&mut rr[mapped_i], 0);
 
         // Set mate info on unmapped read (mate is mapped)
-        bam_fields::set_mate_ref_id(&mut rr[unmapped_i], mapped_ref_id);
-        bam_fields::set_mate_pos(&mut rr[unmapped_i], mapped_pos);
+        fgumi_raw_bam::set_mate_ref_id(&mut rr[unmapped_i], mapped_ref_id);
+        fgumi_raw_bam::set_mate_pos(&mut rr[unmapped_i], mapped_pos);
         set_mate_flags(&mut rr[unmapped_i], mapped_is_reverse, false);
         let mq_val = if mapped_mapq == 255 { 255 } else { i32::from(mapped_mapq) };
-        bam_fields::update_int_tag(rr[unmapped_i].as_mut_vec(), SamTag::MQ, mq_val);
+        fgumi_raw_bam::update_int_tag(rr[unmapped_i].as_mut_vec(), SamTag::MQ, mq_val);
         if !mapped_cigar_str.is_empty() && mapped_cigar_str != "*" {
-            bam_fields::update_string_tag(
+            fgumi_raw_bam::update_string_tag(
                 rr[unmapped_i].as_mut_vec(),
                 SamTag::MC,
                 mapped_cigar_str.as_bytes(),
             );
         } else {
-            bam_fields::remove_tag(rr[unmapped_i].as_mut_vec(), SamTag::MC);
+            fgumi_raw_bam::remove_tag(rr[unmapped_i].as_mut_vec(), SamTag::MC);
         }
-        bam_fields::set_template_length(&mut rr[unmapped_i], 0);
+        fgumi_raw_bam::set_template_length(&mut rr[unmapped_i], 0);
     }
 }
 
 /// Sets mate flags (`MATE_REVERSE`, `MATE_UNMAPPED`) on a raw BAM record.
 fn set_mate_flags(record: &mut [u8], mate_is_reverse: bool, mate_is_unmapped: bool) {
-    use crate::sort::bam_fields;
+    use fgumi_raw_bam;
     let mut f = RawRecordView::new(record).flags();
-    f &= !bam_fields::flags::MATE_REVERSE;
+    f &= !fgumi_raw_bam::flags::MATE_REVERSE;
     if mate_is_reverse {
-        f |= bam_fields::flags::MATE_REVERSE;
+        f |= fgumi_raw_bam::flags::MATE_REVERSE;
     }
-    f &= !bam_fields::flags::MATE_UNMAPPED;
+    f &= !fgumi_raw_bam::flags::MATE_UNMAPPED;
     if mate_is_unmapped {
-        f |= bam_fields::flags::MATE_UNMAPPED;
+        f |= fgumi_raw_bam::flags::MATE_UNMAPPED;
     }
-    bam_fields::set_flags(record, f);
+    fgumi_raw_bam::set_flags(record, f);
 }
 
 /// Computes insert size (TLEN) from two raw BAM records.
 ///
 /// Uses 0-based pos from BAM; converts to 1-based for the calculation.
 fn compute_insert_size_raw(rec1: &[u8], rec2: &[u8]) -> i32 {
-    use crate::sort::bam_fields;
+    use fgumi_raw_bam;
 
     let f1 = RawRecordView::new(rec1).flags();
     let f2 = RawRecordView::new(rec2).flags();
 
     // If either read is unmapped, return 0
-    if (f1 & bam_fields::flags::UNMAPPED) != 0 || (f2 & bam_fields::flags::UNMAPPED) != 0 {
+    if (f1 & fgumi_raw_bam::flags::UNMAPPED) != 0 || (f2 & fgumi_raw_bam::flags::UNMAPPED) != 0 {
         return 0;
     }
 
     // If reads are on different references, return 0
-    if bam_fields::ref_id(rec1) != bam_fields::ref_id(rec2) {
+    if fgumi_raw_bam::ref_id(rec1) != fgumi_raw_bam::ref_id(rec2) {
         return 0;
     }
 
     // pos is 0-based in BAM; convert to 1-based for the calculation
-    let pos1 = bam_fields::pos(rec1) + 1;
-    let pos2 = bam_fields::pos(rec2) + 1;
+    let pos1 = fgumi_raw_bam::pos(rec1) + 1;
+    let pos2 = fgumi_raw_bam::pos(rec2) + 1;
 
     // alignment end (1-based inclusive) = pos_1based + ref_len - 1
-    let ref_len1 = bam_fields::reference_length_from_raw_bam(rec1);
-    let ref_len2 = bam_fields::reference_length_from_raw_bam(rec2);
+    let ref_len1 = fgumi_raw_bam::reference_length_from_raw_bam(rec1);
+    let ref_len2 = fgumi_raw_bam::reference_length_from_raw_bam(rec2);
     let end1 = pos1 + ref_len1 - 1;
     let end2 = pos2 + ref_len2 - 1;
 
     // 5' position: forward=start, reverse=end
-    let first_5prime = if (f1 & bam_fields::flags::REVERSE) != 0 { end1 } else { pos1 };
-    let second_5prime = if (f2 & bam_fields::flags::REVERSE) != 0 { end2 } else { pos2 };
+    let first_5prime = if (f1 & fgumi_raw_bam::flags::REVERSE) != 0 { end1 } else { pos1 };
+    let second_5prime = if (f2 & fgumi_raw_bam::flags::REVERSE) != 0 { end2 } else { pos2 };
 
     let adjustment = if second_5prime >= first_5prime { 1 } else { -1 };
     second_5prime - first_5prime + adjustment
@@ -756,10 +756,10 @@ fn compute_insert_size_raw(rec1: &[u8], rec2: &[u8]) -> i32 {
 /// The pair orientation (FR, RF, or Tandem)
 #[allow(clippy::cast_possible_wrap)]
 fn get_pair_orientation_raw(record: &[u8]) -> PairOrientation {
-    use crate::sort::bam_fields;
+    use fgumi_raw_bam;
     let f = RawRecordView::new(record).flags();
-    let is_reverse = (f & bam_fields::flags::REVERSE) != 0;
-    let mate_reverse = (f & bam_fields::flags::MATE_REVERSE) != 0;
+    let is_reverse = (f & fgumi_raw_bam::flags::REVERSE) != 0;
+    let mate_reverse = (f & fgumi_raw_bam::flags::MATE_REVERSE) != 0;
 
     // Same strand = TANDEM
     if is_reverse == mate_reverse {
@@ -770,12 +770,12 @@ fn get_pair_orientation_raw(record: &[u8]) -> PairOrientation {
     // positiveStrandFivePrimePos = readIsOnReverseStrand ? mateStart : alignmentStart
     // negativeStrandFivePrimePos = readIsOnReverseStrand ? alignmentEnd : alignmentStart + insertSize
     // FR if positiveStrandFivePrimePos < negativeStrandFivePrimePos
-    let alignment_start = bam_fields::pos(record) + 1; // 0-based -> 1-based
-    let mate_start = bam_fields::mate_pos(record) + 1;
-    let insert_size = bam_fields::template_length(record);
+    let alignment_start = fgumi_raw_bam::pos(record) + 1; // 0-based -> 1-based
+    let mate_start = fgumi_raw_bam::mate_pos(record) + 1;
+    let insert_size = fgumi_raw_bam::template_length(record);
 
     let (positive_five_prime, negative_five_prime) = if is_reverse {
-        let ref_len = bam_fields::reference_length_from_raw_bam(record);
+        let ref_len = fgumi_raw_bam::reference_length_from_raw_bam(record);
         let end = alignment_start + ref_len - 1;
         (i64::from(mate_start), i64::from(end))
     } else {

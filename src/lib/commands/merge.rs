@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::logging::OperationTimer;
-use crate::sort::RawExternalSorter;
+use fgumi_sort::RawExternalSorter;
 use crate::validation::validate_file_exists;
 use anyhow::{Result, bail};
 use clap::Parser;

@@ -40,7 +40,7 @@ use super::deadlock::{
 };
 use super::scheduler::{BackpressureState, SchedulerStrategy};
 use crate::read_info::LibraryIndex;
-use crate::sort::bam_fields;
+use fgumi_raw_bam;
 use fgumi_raw_bam::RawRecordView;
 
 /// Buffer size for buffered I/O (8 MB).
@@ -118,7 +118,7 @@ impl BoundaryState {
         }
 
         // Check magic
-        if &data[0..4] != bam_fields::BAM_MAGIC {
+        if &data[0..4] != fgumi_raw_bam::BAM_MAGIC {
             // Not a valid BAM file, but let's not error here
             // Just return 0 so records start immediately
             return Some(0);
@@ -420,7 +420,7 @@ pub fn compute_group_key_from_raw(
     use super::base::GroupKey;
 
     // Extract name hash (match noodles path: empty name → None → hash 0)
-    let name = bam_fields::read_name(raw);
+    let name = fgumi_raw_bam::read_name(raw);
     let name_hash = if name.is_empty() {
         LibraryIndex::hash_name(None)
     } else {
@@ -429,23 +429,23 @@ pub fn compute_group_key_from_raw(
 
     // Check secondary/supplementary
     let flg = RawRecordView::new(raw).flags();
-    let is_secondary = (flg & bam_fields::flags::SECONDARY) != 0;
-    let is_supplementary = (flg & bam_fields::flags::SUPPLEMENTARY) != 0;
+    let is_secondary = (flg & fgumi_raw_bam::flags::SECONDARY) != 0;
+    let is_supplementary = (flg & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0;
     if is_secondary || is_supplementary {
         return GroupKey { name_hash, ..GroupKey::default() };
     }
 
     // Own position (1-based, matching noodles) — zero-allocation CIGAR iteration
-    let reverse = (flg & bam_fields::flags::REVERSE) != 0;
-    let own_pos = bam_fields::unclipped_5prime_from_raw_bam(raw);
+    let reverse = (flg & fgumi_raw_bam::flags::REVERSE) != 0;
+    let own_pos = fgumi_raw_bam::unclipped_5prime_from_raw_bam(raw);
 
-    let own_ref_id = bam_fields::ref_id(raw);
+    let own_ref_id = fgumi_raw_bam::ref_id(raw);
     let strand = u8::from(reverse);
 
     // Single-pass aux tag extraction (RG, cell barcode, MC)
-    let aux_data = bam_fields::aux_data_slice(raw);
+    let aux_data = fgumi_raw_bam::aux_data_slice(raw);
     let cell_tag_bytes = cell_tag.map_or([0u8; 2], |t| [t.as_ref()[0], t.as_ref()[1]]);
-    let aux_tags = bam_fields::extract_aux_string_tags(aux_data, cell_tag_bytes);
+    let aux_tags = fgumi_raw_bam::extract_aux_string_tags(aux_data, cell_tag_bytes);
 
     let library_idx = if let Some(rg) = aux_tags.rg {
         let rg_hash = LibraryIndex::hash_rg(rg);
@@ -458,17 +458,17 @@ pub fn compute_group_key_from_raw(
         if let Some(cb) = aux_tags.cell { LibraryIndex::hash_cell_barcode(Some(cb)) } else { 0 };
 
     // Check if paired
-    let is_paired = (flg & bam_fields::flags::PAIRED) != 0;
+    let is_paired = (flg & fgumi_raw_bam::flags::PAIRED) != 0;
     if !is_paired {
         return GroupKey::single(own_ref_id, own_pos, strand, library_idx, cell_hash, name_hash);
     }
 
     // Mate info — guard against MATE_UNMAPPED (matching noodles path)
-    let mate_unmapped = (flg & bam_fields::flags::MATE_UNMAPPED) != 0;
-    let mate_reverse = (flg & bam_fields::flags::MATE_REVERSE) != 0;
+    let mate_unmapped = (flg & fgumi_raw_bam::flags::MATE_UNMAPPED) != 0;
+    let mate_reverse = (flg & fgumi_raw_bam::flags::MATE_REVERSE) != 0;
     let mate_strand = u8::from(mate_reverse);
-    let raw_mate_ref_id = bam_fields::mate_ref_id(raw);
-    let raw_mate_pos = bam_fields::mate_pos(raw);
+    let raw_mate_ref_id = fgumi_raw_bam::mate_ref_id(raw);
+    let raw_mate_pos = fgumi_raw_bam::mate_pos(raw);
 
     // Get mate unclipped 5' position via MC tag (skip if mate is unmapped)
     let mate_pos_result = if mate_unmapped {
@@ -476,7 +476,7 @@ pub fn compute_group_key_from_raw(
     } else {
         aux_tags
             .mc
-            .map(|mc| bam_fields::mate_unclipped_5prime_1based(raw_mate_pos, mate_reverse, mc))
+            .map(|mc| fgumi_raw_bam::mate_unclipped_5prime_1based(raw_mate_pos, mate_reverse, mc))
     };
 
     match mate_pos_result {

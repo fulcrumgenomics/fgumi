@@ -32,7 +32,7 @@ use crate::overlapping_consensus::{
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::read_info::LibraryIndex;
 use crate::sam::{SamTag, header_as_unsorted};
-use crate::sort::bam_fields;
+use fgumi_raw_bam;
 use crate::umi::extract_mi_base;
 use crate::unified_pipeline::{
     GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
@@ -419,15 +419,15 @@ impl Command for Duplex {
                     Ok(_) => {
                         let flg = RawRecordView::new(&record).flags();
                         // Skip secondary and supplementary reads
-                        if flg & bam_fields::flags::SECONDARY != 0
-                            || flg & bam_fields::flags::SUPPLEMENTARY != 0
+                        if flg & fgumi_raw_bam::flags::SECONDARY != 0
+                            || flg & fgumi_raw_bam::flags::SUPPLEMENTARY != 0
                         {
                             continue;
                         }
                         // Only keep mapped reads or reads with mapped mates
-                        let is_mapped = flg & bam_fields::flags::UNMAPPED == 0;
-                        let has_mapped_mate = flg & bam_fields::flags::PAIRED != 0
-                            && flg & bam_fields::flags::MATE_UNMAPPED == 0;
+                        let is_mapped = flg & fgumi_raw_bam::flags::UNMAPPED == 0;
+                        let has_mapped_mate = flg & fgumi_raw_bam::flags::PAIRED != 0
+                            && flg & fgumi_raw_bam::flags::MATE_UNMAPPED == 0;
                         if is_mapped || has_mapped_mate {
                             return Some(Ok(record));
                         }
@@ -588,15 +588,15 @@ impl Duplex {
         let record_filter = |raw: &[u8]| -> bool {
             let flg = RawRecordView::new(raw).flags();
             // Skip secondary and supplementary reads
-            if flg & bam_fields::flags::SECONDARY != 0
-                || flg & bam_fields::flags::SUPPLEMENTARY != 0
+            if flg & fgumi_raw_bam::flags::SECONDARY != 0
+                || flg & fgumi_raw_bam::flags::SUPPLEMENTARY != 0
             {
                 return false;
             }
             // Only keep mapped reads or reads with mapped mates
-            let is_mapped = flg & bam_fields::flags::UNMAPPED == 0;
+            let is_mapped = flg & fgumi_raw_bam::flags::UNMAPPED == 0;
             let has_mapped_mate =
-                flg & bam_fields::flags::PAIRED != 0 && flg & bam_fields::flags::MATE_UNMAPPED == 0;
+                flg & fgumi_raw_bam::flags::PAIRED != 0 && flg & fgumi_raw_bam::flags::MATE_UNMAPPED == 0;
             is_mapped || has_mapped_mate
         };
 
@@ -866,7 +866,7 @@ fn has_both_strands_raw(records: &[RawRecord]) -> bool {
     let mut has_b = false;
 
     for raw in records {
-        if let Some(mi_bytes) = bam_fields::find_string_tag_in_record(raw, SamTag::MI) {
+        if let Some(mi_bytes) = fgumi_raw_bam::find_string_tag_in_record(raw, SamTag::MI) {
             // Strip trailing NUL if present (raw BAM Z-tags may be NUL-terminated)
             let mi_bytes = mi_bytes.strip_suffix(&[0]).unwrap_or(mi_bytes);
             if mi_bytes.len() >= 2 {

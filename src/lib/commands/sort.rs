@@ -22,7 +22,7 @@
 
 use crate::logging::OperationTimer;
 use crate::sam::SamTag;
-use crate::sort::{QuerynameComparator, RawExternalSorter, SortOrder};
+use fgumi_sort::{QuerynameComparator, RawExternalSorter, SortOrder};
 use crate::validation::validate_file_exists;
 use anyhow::{Result, bail};
 use bytesize::ByteSize;
@@ -366,7 +366,7 @@ pub(crate) fn parse_cell_tag(order: SortOrderArg) -> Result<Option<SamTag>> {
     if matches!(order, SortOrderArg::TemplateCoordinate) { Ok(Some(SamTag::CB)) } else { Ok(None) }
 }
 
-use fgumi_sort::{VerifySummary, verify_sort_order};
+use fgumi_sort::verify_sort_order;
 
 impl Command for Sort {
     fn execute(&self, command_line: &str) -> Result<()> {
@@ -615,7 +615,7 @@ impl Sort {
     /// Execute verify mode: read records and check sort order.
     fn execute_verify(&self) -> Result<()> {
         use fgumi_sort::RawBamRecordReader;
-        use crate::sort::{
+        use fgumi_sort::{
             LibraryLookup, RawQuerynameKey, RawQuerynameLexKey, RawSortKey, SortContext, cb_hasher,
             extract_coordinate_key_inline, extract_template_key_inline,
         };
@@ -1091,8 +1091,8 @@ mod tests {
 
     #[test]
     fn test_verify_coordinate_fails_on_unsorted() -> Result<()> {
-        use crate::sort::extract_coordinate_key_inline;
-        use crate::sort::raw_bam_reader::RawBamRecordReader;
+        use fgumi_sort::extract_coordinate_key_inline;
+        use fgumi_sort::reader::RawBamRecordReader;
 
         // Build BAM with records deliberately out of coordinate order
         let mut builder = crate::sam::builder::SamBuilder::new();

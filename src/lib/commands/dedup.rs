@@ -56,7 +56,7 @@ use crate::commands::common::{
     build_pipeline_config, parse_bool,
 };
 use crate::sam::TC_TAG;
-use crate::sort::bam_fields;
+use fgumi_raw_bam;
 use fgumi_raw_bam::RawRecordView;
 
 /// Duplicate flag bit in SAM flags (0x400)
@@ -234,8 +234,8 @@ fn score_template(template: &Template) -> i64 {
         if raw.len() < 32 {
             continue;
         }
-        let qo = bam_fields::qual_offset(raw);
-        let seq_len = bam_fields::l_seq(raw) as usize;
+        let qo = fgumi_raw_bam::qual_offset(raw);
+        let seq_len = fgumi_raw_bam::l_seq(raw) as usize;
         if qo >= raw.len() {
             continue;
         }
@@ -259,8 +259,8 @@ fn filter_template(
     config: &DedupFilterConfig,
     metrics: &mut FilterMetrics,
 ) -> bool {
-    let raw_r1 = template.r1().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
-    let raw_r2 = template.r2().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
+    let raw_r1 = template.r1().filter(|r| r.len() >= fgumi_raw_bam::MIN_BAM_RECORD_LEN);
+    let raw_r2 = template.r2().filter(|r| r.len() >= fgumi_raw_bam::MIN_BAM_RECORD_LEN);
 
     metrics.total_templates += 1;
 
@@ -270,9 +270,9 @@ fn filter_template(
     }
 
     let both_unmapped = raw_r1
-        .is_none_or(|r| (RawRecordView::new(r).flags() & bam_fields::flags::UNMAPPED) != 0)
+        .is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::UNMAPPED) != 0)
         && raw_r2
-            .is_none_or(|r| (RawRecordView::new(r).flags() & bam_fields::flags::UNMAPPED) != 0);
+            .is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::UNMAPPED) != 0);
     if both_unmapped {
         metrics.discarded_poor_alignment += 1;
         return false;
@@ -282,13 +282,13 @@ fn filter_template(
     for raw in [raw_r1, raw_r2].into_iter().flatten() {
         let flg = RawRecordView::new(raw).flags();
 
-        if !config.include_non_pf && (flg & bam_fields::flags::QC_FAIL) != 0 {
+        if !config.include_non_pf && (flg & fgumi_raw_bam::flags::QC_FAIL) != 0 {
             metrics.discarded_non_pf += 1;
             return false;
         }
 
-        if (flg & bam_fields::flags::UNMAPPED) == 0 {
-            let mapq = bam_fields::mapq(raw);
+        if (flg & fgumi_raw_bam::flags::UNMAPPED) == 0 {
+            let mapq = fgumi_raw_bam::mapq(raw);
             if mapq < config.min_mapq {
                 metrics.discarded_poor_alignment += 1;
                 return false;
@@ -299,8 +299,8 @@ fn filter_template(
     // Phase 2: Single-pass tag lookups (MQ + UMI in one aux scan)
     for raw in [raw_r1, raw_r2].into_iter().flatten() {
         let flg = RawRecordView::new(raw).flags();
-        let aux = bam_fields::aux_data_slice(raw);
-        let check_mq = (flg & bam_fields::flags::MATE_UNMAPPED) == 0;
+        let aux = fgumi_raw_bam::aux_data_slice(raw);
+        let check_mq = (flg & fgumi_raw_bam::flags::MATE_UNMAPPED) == 0;
         let check_umi = !config.no_umi;
 
         let mut found_mq: Option<i64> = None;
@@ -350,7 +350,7 @@ fn filter_template(
                 };
             }
 
-            if let Some(size) = bam_fields::tag_value_size(val_type, &aux[p + 3..]) {
+            if let Some(size) = fgumi_raw_bam::tag_value_size(val_type, &aux[p + 3..]) {
                 p += 3 + size;
             } else {
                 break;
@@ -449,22 +449,22 @@ fn umi_for_read(umi: &str, is_r1_earlier: bool, assigner: &dyn UmiAssigner) -> R
 fn get_pair_orientation(template: &Template) -> (bool, bool) {
     let r1_positive = template
         .r1()
-        .is_none_or(|r| (RawRecordView::new(r).flags() & bam_fields::flags::REVERSE) == 0);
+        .is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::REVERSE) == 0);
     let r2_positive = template
         .r2()
-        .is_none_or(|r| (RawRecordView::new(r).flags() & bam_fields::flags::REVERSE) == 0);
+        .is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::REVERSE) == 0);
     (r1_positive, r2_positive)
 }
 
 /// Check if R1 is genomically earlier than R2.
 fn is_r1_genomically_earlier_raw(r1: &[u8], r2: &[u8]) -> bool {
-    let ref1 = bam_fields::ref_id(r1);
-    let ref2 = bam_fields::ref_id(r2);
+    let ref1 = fgumi_raw_bam::ref_id(r1);
+    let ref2 = fgumi_raw_bam::ref_id(r2);
     if ref1 != ref2 {
         return ref1 < ref2;
     }
-    let r1_pos = bam_fields::unclipped_5prime_from_raw_bam(r1);
-    let r2_pos = bam_fields::unclipped_5prime_from_raw_bam(r2);
+    let r1_pos = fgumi_raw_bam::unclipped_5prime_from_raw_bam(r1);
+    let r2_pos = fgumi_raw_bam::unclipped_5prime_from_raw_bam(r2);
     r1_pos <= r2_pos
 }
 
@@ -505,11 +505,11 @@ fn assign_umi_groups_for_indices(
             String::new()
         } else {
             let umi_bytes = if let Some(r1_raw) = template.r1() {
-                let aux = bam_fields::aux_data_slice(r1_raw);
-                bam_fields::find_string_tag(aux, raw_tag)
+                let aux = fgumi_raw_bam::aux_data_slice(r1_raw);
+                fgumi_raw_bam::find_string_tag(aux, raw_tag)
             } else if let Some(r2_raw) = template.r2() {
-                let aux = bam_fields::aux_data_slice(r2_raw);
-                bam_fields::find_string_tag(aux, raw_tag)
+                let aux = fgumi_raw_bam::aux_data_slice(r2_raw);
+                fgumi_raw_bam::find_string_tag(aux, raw_tag)
             } else {
                 None
             };
@@ -660,7 +660,7 @@ fn mark_duplicates_in_family(templates: &mut [&mut Template], dedup_metrics: &mu
 fn mark_template_as_duplicate(template: &mut Template, dedup_metrics: &mut DedupMetrics) {
     for raw in template.records_mut().iter_mut() {
         let flg = RawRecordView::new(raw.as_ref()).flags();
-        bam_fields::set_flags(raw, flg | DUPLICATE_FLAG);
+        fgumi_raw_bam::set_flags(raw, flg | DUPLICATE_FLAG);
         dedup_metrics.duplicate_reads += 1;
     }
 }
@@ -709,7 +709,7 @@ fn process_position_group(
         .map(|mut t| {
             for raw in t.records_mut().iter_mut() {
                 let flg = RawRecordView::new(raw.as_ref()).flags();
-                bam_fields::set_flags(raw, flg & !DUPLICATE_FLAG);
+                fgumi_raw_bam::set_flags(raw, flg & !DUPLICATE_FLAG);
             }
             t
         })
@@ -768,8 +768,8 @@ fn process_position_group(
         for raw in template.records() {
             dedup_metrics.total_reads += 1;
             let flg = RawRecordView::new(raw.as_ref()).flags();
-            let is_secondary = (flg & bam_fields::flags::SECONDARY) != 0;
-            let is_supplementary = (flg & bam_fields::flags::SUPPLEMENTARY) != 0;
+            let is_secondary = (flg & fgumi_raw_bam::flags::SECONDARY) != 0;
+            let is_supplementary = (flg & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0;
 
             if is_secondary {
                 dedup_metrics.secondary_reads += 1;
@@ -778,8 +778,8 @@ fn process_position_group(
                 dedup_metrics.supplementary_reads += 1;
             }
             if is_secondary || is_supplementary {
-                let aux = bam_fields::aux_data_slice(raw);
-                if bam_fields::find_tag_type(aux, tc_tag_bytes).is_none() {
+                let aux = fgumi_raw_bam::aux_data_slice(raw);
+                if fgumi_raw_bam::find_tag_type(aux, tc_tag_bytes).is_none() {
                     dedup_metrics.missing_tc_tag += 1;
                 }
             }
@@ -1093,7 +1093,7 @@ impl Command for MarkDuplicates {
                         if has_mi {
                             scratch.clear();
                             scratch.extend_from_slice(raw);
-                            bam_fields::update_string_tag(
+                            fgumi_raw_bam::update_string_tag(
                                 &mut scratch,
                                 assign_tag_bytes,
                                 mi_buf.as_bytes(),
@@ -2295,7 +2295,7 @@ mod tests {
         rec[9] = 30; // mapq = 30 (passes the direct MAPQ check)
         rec[12..14].copy_from_slice(&1u16.to_le_bytes()); // n_cigar_op = 1
         // flags: PAIRED but NOT MATE_UNMAPPED (so mate MQ check triggers)
-        rec[14..16].copy_from_slice(&(crate::sort::bam_fields::flags::PAIRED).to_le_bytes());
+        rec[14..16].copy_from_slice(&(fgumi_raw_bam::flags::PAIRED).to_le_bytes());
         rec[16..20].copy_from_slice(&4u32.to_le_bytes()); // l_seq = 4
         rec[32..36].copy_from_slice(b"tst\0"); // read name
         rec[36..40].copy_from_slice(&(4u32 << 4).to_le_bytes()); // CIGAR: 4M
@@ -2342,10 +2342,10 @@ mod tests {
         qualities: &[u8],
         umi: &[u8],
     ) -> RawRecord {
-        use crate::sort::bam_fields;
+        use fgumi_raw_bam;
 
         let l_read_name = (name.len() + 1) as u8;
-        let cigar_ops: &[u32] = if (flag & bam_fields::flags::UNMAPPED) == 0 {
+        let cigar_ops: &[u32] = if (flag & fgumi_raw_bam::flags::UNMAPPED) == 0 {
             &[(seq_len as u32) << 4] // NM cigar
         } else {
             &[]
@@ -2376,7 +2376,7 @@ mod tests {
         }
 
         // Write quality scores
-        let qo = bam_fields::qual_offset(&buf);
+        let qo = fgumi_raw_bam::qual_offset(&buf);
         let copy_len = std::cmp::min(qualities.len(), seq_len);
         buf[qo..qo + copy_len].copy_from_slice(&qualities[..copy_len]);
 
@@ -2397,7 +2397,7 @@ mod tests {
         // 4 bases with quality 20 each, capped at 15 → 4 * 15 = 60
         let raw = make_raw_bam_for_dedup(
             b"rea",
-            crate::sort::bam_fields::flags::PAIRED | crate::sort::bam_fields::flags::FIRST_SEGMENT,
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
             30,
             4,
             &[20, 20, 20, 20],
@@ -2413,7 +2413,7 @@ mod tests {
         // 4 bases with quality 10 each, no capping → 4 * 10 = 40
         let raw = make_raw_bam_for_dedup(
             b"rea",
-            crate::sort::bam_fields::flags::PAIRED | crate::sort::bam_fields::flags::FIRST_SEGMENT,
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
             30,
             4,
             &[10, 10, 10, 10],
@@ -2429,7 +2429,7 @@ mod tests {
         // Paired: R1 (4 bases * 15) + R2 (4 bases * 10) = 60 + 40 = 100
         let r1 = make_raw_bam_for_dedup(
             b"rea",
-            crate::sort::bam_fields::flags::PAIRED | crate::sort::bam_fields::flags::FIRST_SEGMENT,
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
             30,
             4,
             &[20, 20, 20, 20],
@@ -2437,7 +2437,7 @@ mod tests {
         );
         let r2 = make_raw_bam_for_dedup(
             b"rea",
-            crate::sort::bam_fields::flags::PAIRED | crate::sort::bam_fields::flags::LAST_SEGMENT,
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT,
             30,
             4,
             &[10, 10, 10, 10],
@@ -2456,8 +2456,8 @@ mod tests {
         let template_raw = {
             let raw = make_raw_bam_for_dedup(
                 b"q01",
-                crate::sort::bam_fields::flags::PAIRED
-                    | crate::sort::bam_fields::flags::FIRST_SEGMENT,
+                fgumi_raw_bam::flags::PAIRED
+                    | fgumi_raw_bam::flags::FIRST_SEGMENT,
                 30,
                 4,
                 qualities,
@@ -2484,39 +2484,39 @@ mod tests {
 
     #[rstest]
     #[case::accepts_valid(
-        crate::sort::bam_fields::flags::PAIRED
-            | crate::sort::bam_fields::flags::FIRST_SEGMENT
-            | crate::sort::bam_fields::flags::MATE_UNMAPPED,
+        fgumi_raw_bam::flags::PAIRED
+            | fgumi_raw_bam::flags::FIRST_SEGMENT
+            | fgumi_raw_bam::flags::MATE_UNMAPPED,
         30, b"ACGTACGT", 20, None, true, FilterExpect::Accepted
     )]
     #[case::rejects_low_mapq(
-        crate::sort::bam_fields::flags::PAIRED
-            | crate::sort::bam_fields::flags::FIRST_SEGMENT
-            | crate::sort::bam_fields::flags::MATE_UNMAPPED,
+        fgumi_raw_bam::flags::PAIRED
+            | fgumi_raw_bam::flags::FIRST_SEGMENT
+            | fgumi_raw_bam::flags::MATE_UNMAPPED,
         10, b"ACGT", 20, None, false, FilterExpect::PoorAlignment
     )]
     #[case::rejects_qc_fail(
-        crate::sort::bam_fields::flags::PAIRED
-            | crate::sort::bam_fields::flags::FIRST_SEGMENT
-            | crate::sort::bam_fields::flags::MATE_UNMAPPED
-            | crate::sort::bam_fields::flags::QC_FAIL,
+        fgumi_raw_bam::flags::PAIRED
+            | fgumi_raw_bam::flags::FIRST_SEGMENT
+            | fgumi_raw_bam::flags::MATE_UNMAPPED
+            | fgumi_raw_bam::flags::QC_FAIL,
         30, b"ACGT", 0, None, false, FilterExpect::NonPf
     )]
     #[case::rejects_umi_with_n(
-        crate::sort::bam_fields::flags::PAIRED
-            | crate::sort::bam_fields::flags::FIRST_SEGMENT
-            | crate::sort::bam_fields::flags::MATE_UNMAPPED,
+        fgumi_raw_bam::flags::PAIRED
+            | fgumi_raw_bam::flags::FIRST_SEGMENT
+            | fgumi_raw_bam::flags::MATE_UNMAPPED,
         30, b"ANGT", 0, None, false, FilterExpect::NsInUmi
     )]
     #[case::rejects_short_umi(
-        crate::sort::bam_fields::flags::PAIRED
-            | crate::sort::bam_fields::flags::FIRST_SEGMENT
-            | crate::sort::bam_fields::flags::MATE_UNMAPPED,
+        fgumi_raw_bam::flags::PAIRED
+            | fgumi_raw_bam::flags::FIRST_SEGMENT
+            | fgumi_raw_bam::flags::MATE_UNMAPPED,
         30, b"AC", 0, Some(6), false, FilterExpect::UmiTooShort
     )]
     #[case::rejects_unmapped(
-        crate::sort::bam_fields::flags::UNMAPPED
-            | crate::sort::bam_fields::flags::MATE_UNMAPPED,
+        fgumi_raw_bam::flags::UNMAPPED
+            | fgumi_raw_bam::flags::MATE_UNMAPPED,
         0, b"ACGT", 0, None, false, FilterExpect::PoorAlignment
     )]
     fn test_filter_template_raw(
@@ -2555,23 +2555,23 @@ mod tests {
 
     #[test]
     fn test_set_duplicate_flag_on_raw_record() {
-        use crate::sort::bam_fields;
+        use fgumi_raw_bam;
         use fgumi_raw_bam::RawRecordView;
 
         let raw =
-            make_raw_bam_for_dedup(b"rea", bam_fields::flags::PAIRED, 30, 4, &[20; 4], b"ACGT");
+            make_raw_bam_for_dedup(b"rea", fgumi_raw_bam::flags::PAIRED, 30, 4, &[20; 4], b"ACGT");
         let mut rec = raw;
         let orig_flags = RawRecordView::new(&rec).flags();
-        assert_eq!(orig_flags & bam_fields::flags::DUPLICATE, 0);
+        assert_eq!(orig_flags & fgumi_raw_bam::flags::DUPLICATE, 0);
 
         // Set duplicate flag
-        bam_fields::set_flags(&mut rec, orig_flags | bam_fields::flags::DUPLICATE);
-        assert_ne!(RawRecordView::new(&rec).flags() & bam_fields::flags::DUPLICATE, 0);
+        fgumi_raw_bam::set_flags(&mut rec, orig_flags | fgumi_raw_bam::flags::DUPLICATE);
+        assert_ne!(RawRecordView::new(&rec).flags() & fgumi_raw_bam::flags::DUPLICATE, 0);
 
         // Clear duplicate flag
         let flags_with_dup = RawRecordView::new(&rec).flags();
-        bam_fields::set_flags(&mut rec, flags_with_dup & !bam_fields::flags::DUPLICATE);
-        assert_eq!(RawRecordView::new(&rec).flags() & bam_fields::flags::DUPLICATE, 0);
+        fgumi_raw_bam::set_flags(&mut rec, flags_with_dup & !fgumi_raw_bam::flags::DUPLICATE);
+        assert_eq!(RawRecordView::new(&rec).flags() & fgumi_raw_bam::flags::DUPLICATE, 0);
     }
 
     #[test]
@@ -2665,11 +2665,11 @@ mod tests {
         seq_len: usize,
         qualities: &[u8],
     ) -> RawRecord {
-        use crate::sort::bam_fields;
+        use fgumi_raw_bam;
 
         let l_read_name = (name.len() + 1) as u8;
         let cigar_ops: &[u32] =
-            if (flag & bam_fields::flags::UNMAPPED) == 0 { &[(seq_len as u32) << 4] } else { &[] };
+            if (flag & fgumi_raw_bam::flags::UNMAPPED) == 0 { &[(seq_len as u32) << 4] } else { &[] };
         let n_cigar_op = cigar_ops.len() as u16;
         let seq_bytes = seq_len.div_ceil(2);
         let total = 32 + l_read_name as usize + cigar_ops.len() * 4 + seq_bytes + seq_len;
@@ -2695,7 +2695,7 @@ mod tests {
             buf[off..off + 4].copy_from_slice(&op.to_le_bytes());
         }
 
-        let qo = bam_fields::qual_offset(&buf);
+        let qo = fgumi_raw_bam::qual_offset(&buf);
         let copy_len = std::cmp::min(qualities.len(), seq_len);
         buf[qo..qo + copy_len].copy_from_slice(&qualities[..copy_len]);
 
@@ -2706,9 +2706,9 @@ mod tests {
     fn test_filter_template_raw_accepts_missing_umi_when_no_umi_mode() {
         let raw = make_raw_bam_for_dedup_no_tags(
             b"rea",
-            crate::sort::bam_fields::flags::PAIRED
-                | crate::sort::bam_fields::flags::FIRST_SEGMENT
-                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
+            fgumi_raw_bam::flags::PAIRED
+                | fgumi_raw_bam::flags::FIRST_SEGMENT
+                | fgumi_raw_bam::flags::MATE_UNMAPPED,
             30,
             4,
             &[20, 20, 20, 20],
@@ -2733,9 +2733,9 @@ mod tests {
     fn test_filter_template_raw_accepts_umi_with_n_when_no_umi_mode() {
         let raw = make_raw_bam_for_dedup(
             b"rea",
-            crate::sort::bam_fields::flags::PAIRED
-                | crate::sort::bam_fields::flags::FIRST_SEGMENT
-                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
+            fgumi_raw_bam::flags::PAIRED
+                | fgumi_raw_bam::flags::FIRST_SEGMENT
+                | fgumi_raw_bam::flags::MATE_UNMAPPED,
             30,
             4,
             &[20, 20, 20, 20],
@@ -2761,9 +2761,9 @@ mod tests {
     fn test_filter_template_raw_accepts_short_umi_when_no_umi_mode() {
         let raw = make_raw_bam_for_dedup(
             b"rea",
-            crate::sort::bam_fields::flags::PAIRED
-                | crate::sort::bam_fields::flags::FIRST_SEGMENT
-                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
+            fgumi_raw_bam::flags::PAIRED
+                | fgumi_raw_bam::flags::FIRST_SEGMENT
+                | fgumi_raw_bam::flags::MATE_UNMAPPED,
             30,
             4,
             &[20, 20, 20, 20],

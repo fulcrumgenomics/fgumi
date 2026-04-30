@@ -10,7 +10,7 @@ use std::io;
 
 use noodles::sam::alignment::RecordBuf;
 
-use crate::sort::bam_fields;
+use fgumi_raw_bam;
 use crate::template::{Template, TemplateBatch};
 use crate::unified_pipeline::{BatchWeight, DecodedRecord, Grouper, MemoryEstimate};
 use fgumi_raw_bam::{RawRecord, raw_record_to_record_buf};
@@ -223,7 +223,7 @@ impl Grouper for TemplateGrouper {
         for decoded in records {
             let name_hash = decoded.key.name_hash;
             let raw = decoded.data;
-            let read_name = bam_fields::read_name(&raw);
+            let read_name = fgumi_raw_bam::read_name(&raw);
             let same_template = match (self.current_name_hash, self.current_name.as_deref()) {
                 (Some(h), Some(name)) => h == name_hash && name == read_name,
                 _ => false,
@@ -449,14 +449,14 @@ impl RecordPositionGrouper {
 
         let raw = &decoded.data;
         let flg = RawRecordView::new(raw).flags();
-        let is_paired = (flg & bam_fields::flags::PAIRED) != 0;
-        let is_secondary = (flg & bam_fields::flags::SECONDARY) != 0;
-        let is_supplementary = (flg & bam_fields::flags::SUPPLEMENTARY) != 0;
-        let is_unmapped = (flg & bam_fields::flags::UNMAPPED) != 0;
-        let is_mate_unmapped = (flg & bam_fields::flags::MATE_UNMAPPED) != 0;
+        let is_paired = (flg & fgumi_raw_bam::flags::PAIRED) != 0;
+        let is_secondary = (flg & fgumi_raw_bam::flags::SECONDARY) != 0;
+        let is_supplementary = (flg & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0;
+        let is_unmapped = (flg & fgumi_raw_bam::flags::UNMAPPED) != 0;
+        let is_mate_unmapped = (flg & fgumi_raw_bam::flags::MATE_UNMAPPED) != 0;
 
         if is_paired && !is_secondary && !is_supplementary && !is_unmapped && !is_mate_unmapped {
-            if bam_fields::find_mc_tag_in_record(raw).is_none() {
+            if fgumi_raw_bam::find_mc_tag_in_record(raw).is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "RecordPositionGrouper requires MC tags on paired-end reads. \
@@ -503,7 +503,7 @@ impl RecordPositionGrouper {
                     // Hash match is a fast pre-check; confirm QNAME bytes to guard
                     // against hash collisions merging unrelated templates.
                     last.key.name_hash == decoded.key.name_hash
-                        && bam_fields::read_name(&last.data) == bam_fields::read_name(&decoded.data)
+                        && fgumi_raw_bam::read_name(&last.data) == fgumi_raw_bam::read_name(&decoded.data)
                 }) =>
             {
                 // Different position but same template (name_hash + QNAME match with
@@ -600,7 +600,7 @@ fn group_by_name_and_build<T>(
 
     for decoded in records {
         let name_hash = decoded.key.name_hash;
-        let read_name = bam_fields::read_name(&decoded.data).to_vec();
+        let read_name = fgumi_raw_bam::read_name(&decoded.data).to_vec();
         let item = extract(decoded)?;
 
         // name_hash is a fast pre-check; confirm QNAME bytes to guard against
@@ -1458,16 +1458,16 @@ mod tests {
 
     #[test]
     fn test_build_templates_from_raw_bytes() {
-        use crate::sort::bam_fields;
+        use fgumi_raw_bam;
         use crate::unified_pipeline::{DecodedRecord, GroupKey};
 
         let key = GroupKey::single(0, 100, 0, 0, 0, 12345);
-        let raw = bam_fields::make_bam_bytes(
+        let raw = fgumi_raw_bam::make_bam_bytes(
             0,                                                            // tid
             100,                                                          // pos
-            bam_fields::flags::PAIRED | bam_fields::flags::FIRST_SEGMENT, // flags
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT, // flags
             b"read1",                                                     // name
-            &[bam_fields::encode_op(0, 4)],                               // 4M cigar
+            &[fgumi_raw_bam::encode_op(0, 4)],                               // 4M cigar
             4,                                                            // seq_len
             0,                                                            // mate_tid
             200,                                                          // mate_pos
@@ -1482,31 +1482,31 @@ mod tests {
 
     #[test]
     fn test_build_templates_from_raw_bytes_paired() {
-        use crate::sort::bam_fields;
+        use fgumi_raw_bam;
         use crate::unified_pipeline::{DecodedRecord, GroupKey};
 
         let key1 = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 12345);
         let key2 = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 12345);
 
-        let r1 = bam_fields::make_bam_bytes(
+        let r1 = fgumi_raw_bam::make_bam_bytes(
             0,
             100,
-            bam_fields::flags::PAIRED | bam_fields::flags::FIRST_SEGMENT,
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
             b"read1",
-            &[bam_fields::encode_op(0, 4)],
+            &[fgumi_raw_bam::encode_op(0, 4)],
             4,
             0,
             200,
             &[],
         );
-        let r2 = bam_fields::make_bam_bytes(
+        let r2 = fgumi_raw_bam::make_bam_bytes(
             0,
             200,
-            bam_fields::flags::PAIRED
-                | bam_fields::flags::LAST_SEGMENT
-                | bam_fields::flags::REVERSE,
+            fgumi_raw_bam::flags::PAIRED
+                | fgumi_raw_bam::flags::LAST_SEGMENT
+                | fgumi_raw_bam::flags::REVERSE,
             b"read1",
-            &[bam_fields::encode_op(0, 4)],
+            &[fgumi_raw_bam::encode_op(0, 4)],
             4,
             0,
             100,

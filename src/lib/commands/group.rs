@@ -115,11 +115,11 @@ fn filter_template_raw(
     config: &GroupFilterConfig,
     metrics: &mut FilterMetrics,
 ) -> bool {
-    use crate::sort::bam_fields;
+    use fgumi_raw_bam;
     use fgumi_raw_bam::RawRecordView;
 
-    let raw_r1 = template.r1().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
-    let raw_r2 = template.r2().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
+    let raw_r1 = template.r1().filter(|r| r.len() >= fgumi_raw_bam::MIN_BAM_RECORD_LEN);
+    let raw_r2 = template.r2().filter(|r| r.len() >= fgumi_raw_bam::MIN_BAM_RECORD_LEN);
 
     let num_primary_reads = raw_r1.is_some() as u64 + raw_r2.is_some() as u64;
     metrics.total_templates += num_primary_reads;
@@ -131,9 +131,9 @@ fn filter_template_raw(
 
     // Check if both reads are unmapped
     let both_unmapped = raw_r1
-        .is_none_or(|r| (RawRecordView::new(r).flags() & bam_fields::flags::UNMAPPED) != 0)
+        .is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::UNMAPPED) != 0)
         && raw_r2
-            .is_none_or(|r| (RawRecordView::new(r).flags() & bam_fields::flags::UNMAPPED) != 0);
+            .is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::UNMAPPED) != 0);
     if both_unmapped && !config.allow_unmapped {
         metrics.discarded_poor_alignment += num_primary_reads;
         return false;
@@ -143,12 +143,12 @@ fn filter_template_raw(
     for raw in [raw_r1, raw_r2].into_iter().flatten() {
         let flg = RawRecordView::new(raw).flags();
 
-        if !config.include_non_pf && (flg & bam_fields::flags::QC_FAIL) != 0 {
+        if !config.include_non_pf && (flg & fgumi_raw_bam::flags::QC_FAIL) != 0 {
             metrics.discarded_non_pf += num_primary_reads;
             return false;
         }
 
-        if (flg & bam_fields::flags::UNMAPPED) == 0 && bam_fields::mapq(raw) < config.min_mapq {
+        if (flg & fgumi_raw_bam::flags::UNMAPPED) == 0 && fgumi_raw_bam::mapq(raw) < config.min_mapq {
             metrics.discarded_poor_alignment += num_primary_reads;
             return false;
         }
@@ -157,8 +157,8 @@ fn filter_template_raw(
     // Phase 2: Single-pass tag lookups (MQ + UMI in one aux scan)
     for raw in [raw_r1, raw_r2].into_iter().flatten() {
         let flg = RawRecordView::new(raw).flags();
-        let aux = bam_fields::aux_data_slice(raw);
-        let check_mq = (flg & bam_fields::flags::MATE_UNMAPPED) == 0;
+        let aux = fgumi_raw_bam::aux_data_slice(raw);
+        let check_mq = (flg & fgumi_raw_bam::flags::MATE_UNMAPPED) == 0;
         let check_umi = !config.no_umi;
 
         // Single pass over aux data to find both MQ and UMI tags
@@ -210,7 +210,7 @@ fn filter_template_raw(
                 };
             }
 
-            if let Some(size) = bam_fields::tag_value_size(val_type, &aux[p + 3..]) {
+            if let Some(size) = fgumi_raw_bam::tag_value_size(val_type, &aux[p + 3..]) {
                 p += 3 + size;
             } else {
                 break;
@@ -266,29 +266,29 @@ fn filter_template_raw(
 /// Uses zero-allocation CIGAR iteration. Unmapped reads return position 0
 /// (matching noodles `unwrap_or(0)` behavior).
 fn is_r1_genomically_earlier_raw(r1: &[u8], r2: &[u8]) -> bool {
-    use crate::sort::bam_fields;
+    use fgumi_raw_bam;
 
-    let ref1 = bam_fields::ref_id(r1);
-    let ref2 = bam_fields::ref_id(r2);
+    let ref1 = fgumi_raw_bam::ref_id(r1);
+    let ref2 = fgumi_raw_bam::ref_id(r2);
     if ref1 != ref2 {
         return ref1 < ref2;
     }
-    let r1_pos = bam_fields::unclipped_5prime_from_raw_bam(r1);
-    let r2_pos = bam_fields::unclipped_5prime_from_raw_bam(r2);
+    let r1_pos = fgumi_raw_bam::unclipped_5prime_from_raw_bam(r1);
+    let r2_pos = fgumi_raw_bam::unclipped_5prime_from_raw_bam(r2);
     r1_pos <= r2_pos
 }
 
 /// Get pair orientation from raw-byte template.
 fn get_pair_orientation_raw(template: &Template) -> (bool, bool) {
-    use crate::sort::bam_fields;
+    use fgumi_raw_bam;
     use fgumi_raw_bam::RawRecordView;
 
     let r1_positive = template
         .r1()
-        .is_none_or(|r| (RawRecordView::new(r).flags() & bam_fields::flags::REVERSE) == 0);
+        .is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::REVERSE) == 0);
     let r2_positive = template
         .r2()
-        .is_none_or(|r| (RawRecordView::new(r).flags() & bam_fields::flags::REVERSE) == 0);
+        .is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::REVERSE) == 0);
     (r1_positive, r2_positive)
 }
 
@@ -447,15 +447,15 @@ fn assign_umi_groups_for_indices_impl(
         let processed_umi = if no_umi {
             String::new()
         } else {
-            use crate::sort::bam_fields;
+            use fgumi_raw_bam;
 
             let umi_bytes = if let Some(r1_raw) = template.r1() {
-                let aux = bam_fields::aux_data_slice(r1_raw);
-                bam_fields::find_string_tag(aux, raw_tag)
+                let aux = fgumi_raw_bam::aux_data_slice(r1_raw);
+                fgumi_raw_bam::find_string_tag(aux, raw_tag)
                     .ok_or_else(|| anyhow::anyhow!("Missing UMI tag"))?
             } else if let Some(r2_raw) = template.r2() {
-                let aux = bam_fields::aux_data_slice(r2_raw);
-                bam_fields::find_string_tag(aux, raw_tag)
+                let aux = fgumi_raw_bam::aux_data_slice(r2_raw);
+                fgumi_raw_bam::find_string_tag(aux, raw_tag)
                     .ok_or_else(|| anyhow::anyhow!("Missing UMI tag"))?
             } else {
                 bail!("Template has no reads");
@@ -1655,7 +1655,7 @@ fn emit_templates_raw_with_mi(
     mi_buf: &mut String,
     mut emit: impl FnMut(&[u8]) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    use crate::sort::bam_fields;
+    use fgumi_raw_bam;
     for template in templates {
         let mi = template.mi;
         let has_mi = mi.is_assigned();
@@ -1667,7 +1667,7 @@ fn emit_templates_raw_with_mi(
             if has_mi {
                 scratch.clear();
                 scratch.extend_from_slice(raw);
-                bam_fields::update_string_tag(scratch, assign_tag_bytes, mi_buf.as_bytes());
+                fgumi_raw_bam::update_string_tag(scratch, assign_tag_bytes, mi_buf.as_bytes());
                 let block_size = scratch.len() as u32;
                 emit(&block_size.to_le_bytes())?;
                 emit(scratch)?;
@@ -5181,11 +5181,11 @@ mod tests {
         mapq: u8,
         umi: &[u8],
     ) -> fgumi_raw_bam::RawRecord {
-        use crate::sort::bam_fields;
+        use fgumi_raw_bam;
 
         let seq_len = 4usize;
         let l_read_name = (name.len() + 1) as u8;
-        let cigar_ops: &[u32] = if (flag & bam_fields::flags::UNMAPPED) == 0 {
+        let cigar_ops: &[u32] = if (flag & fgumi_raw_bam::flags::UNMAPPED) == 0 {
             &[(seq_len as u32) << 4] // NM cigar
         } else {
             &[]
@@ -5227,9 +5227,9 @@ mod tests {
     fn test_group_filter_template_raw_accepts_valid() {
         let raw = make_raw_bam_for_group(
             b"rea",
-            crate::sort::bam_fields::flags::PAIRED
-                | crate::sort::bam_fields::flags::FIRST_SEGMENT
-                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
+            fgumi_raw_bam::flags::PAIRED
+                | fgumi_raw_bam::flags::FIRST_SEGMENT
+                | fgumi_raw_bam::flags::MATE_UNMAPPED,
             30,
             b"ACGTACGT",
         );
@@ -5252,9 +5252,9 @@ mod tests {
     fn test_group_filter_template_raw_rejects_low_mapq() {
         let raw = make_raw_bam_for_group(
             b"rea",
-            crate::sort::bam_fields::flags::PAIRED
-                | crate::sort::bam_fields::flags::FIRST_SEGMENT
-                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
+            fgumi_raw_bam::flags::PAIRED
+                | fgumi_raw_bam::flags::FIRST_SEGMENT
+                | fgumi_raw_bam::flags::MATE_UNMAPPED,
             10,
             b"ACGTACGT",
         );
@@ -5277,10 +5277,10 @@ mod tests {
     fn test_group_filter_template_raw_rejects_qc_fail() {
         let raw = make_raw_bam_for_group(
             b"rea",
-            crate::sort::bam_fields::flags::PAIRED
-                | crate::sort::bam_fields::flags::FIRST_SEGMENT
-                | crate::sort::bam_fields::flags::MATE_UNMAPPED
-                | crate::sort::bam_fields::flags::QC_FAIL,
+            fgumi_raw_bam::flags::PAIRED
+                | fgumi_raw_bam::flags::FIRST_SEGMENT
+                | fgumi_raw_bam::flags::MATE_UNMAPPED
+                | fgumi_raw_bam::flags::QC_FAIL,
             30,
             b"ACGT",
         );
@@ -5303,9 +5303,9 @@ mod tests {
     fn test_group_filter_template_raw_rejects_umi_with_n() {
         let raw = make_raw_bam_for_group(
             b"rea",
-            crate::sort::bam_fields::flags::PAIRED
-                | crate::sort::bam_fields::flags::FIRST_SEGMENT
-                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
+            fgumi_raw_bam::flags::PAIRED
+                | fgumi_raw_bam::flags::FIRST_SEGMENT
+                | fgumi_raw_bam::flags::MATE_UNMAPPED,
             30,
             b"ANGT",
         );
@@ -5328,9 +5328,9 @@ mod tests {
     fn test_group_filter_template_raw_rejects_short_umi() {
         let raw = make_raw_bam_for_group(
             b"rea",
-            crate::sort::bam_fields::flags::PAIRED
-                | crate::sort::bam_fields::flags::FIRST_SEGMENT
-                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
+            fgumi_raw_bam::flags::PAIRED
+                | fgumi_raw_bam::flags::FIRST_SEGMENT
+                | fgumi_raw_bam::flags::MATE_UNMAPPED,
             30,
             b"AC",
         );
@@ -5353,8 +5353,8 @@ mod tests {
     fn test_group_filter_template_raw_rejects_unmapped() {
         let raw = make_raw_bam_for_group(
             b"rea",
-            crate::sort::bam_fields::flags::UNMAPPED
-                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
+            fgumi_raw_bam::flags::UNMAPPED
+                | fgumi_raw_bam::flags::MATE_UNMAPPED,
             0,
             b"ACGT",
         );
@@ -5381,18 +5381,18 @@ mod tests {
         let short_rec = [0u8; 16]; // Less than 32 bytes
         let valid_rec = make_raw_bam_for_group(
             b"rea",
-            crate::sort::bam_fields::flags::PAIRED
-                | crate::sort::bam_fields::flags::FIRST_SEGMENT
-                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
+            fgumi_raw_bam::flags::PAIRED
+                | fgumi_raw_bam::flags::FIRST_SEGMENT
+                | fgumi_raw_bam::flags::MATE_UNMAPPED,
             30,
             b"ACGT",
         );
         // Build a template where raw_records[0] is too short — testing defense-in-depth
         // We can't use from_raw_records (it validates), so test the constant is correct
-        assert_eq!(crate::sort::bam_fields::MIN_BAM_RECORD_LEN, 32);
+        assert_eq!(fgumi_raw_bam::MIN_BAM_RECORD_LEN, 32);
         // Verify the valid record passes and the short one would be caught by from_raw_records
-        assert!(valid_rec.len() >= crate::sort::bam_fields::MIN_BAM_RECORD_LEN);
-        assert!(short_rec.len() < crate::sort::bam_fields::MIN_BAM_RECORD_LEN);
+        assert!(valid_rec.len() >= fgumi_raw_bam::MIN_BAM_RECORD_LEN);
+        assert!(short_rec.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN);
     }
 
     #[test]
@@ -5400,10 +5400,10 @@ mod tests {
         // Template with only supplementary records → no raw_r1/raw_r2
         let supp = make_raw_bam_for_group(
             b"rea",
-            crate::sort::bam_fields::flags::PAIRED
-                | crate::sort::bam_fields::flags::FIRST_SEGMENT
-                | crate::sort::bam_fields::flags::SUPPLEMENTARY
-                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
+            fgumi_raw_bam::flags::PAIRED
+                | fgumi_raw_bam::flags::FIRST_SEGMENT
+                | fgumi_raw_bam::flags::SUPPLEMENTARY
+                | fgumi_raw_bam::flags::MATE_UNMAPPED,
             30,
             b"ACGT",
         );

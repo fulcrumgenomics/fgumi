@@ -403,7 +403,7 @@ impl ReadInfo {
         cell_tag: Tag,
         library_lookup: &LibraryLookup,
     ) -> Result<Self> {
-        use crate::sort::bam_fields;
+        use fgumi_raw_bam;
         use fgumi_raw_bam::{RawRecord, RawRecordView, TagValue};
 
         // Get primary reads (Option<&RawRecord>)
@@ -440,12 +440,12 @@ impl ReadInfo {
         // Unmapped reads must use UNKNOWN sentinels rather than position 0 so
         // they sort after mapped reads (matching fgbio's case-class ordering).
         let is_unmapped =
-            |r: &RawRecord| (RawRecordView::new(r).flags() & bam_fields::flags::UNMAPPED) != 0;
+            |r: &RawRecord| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::UNMAPPED) != 0;
         let raw_info = |r: &RawRecord| -> Result<(i32, i32, u8)> {
             Ok((
-                bam_fields::ref_id(r.as_ref()),
+                fgumi_raw_bam::ref_id(r.as_ref()),
                 get_unclipped_position_raw(r)?,
-                u8::from((RawRecordView::new(r).flags() & bam_fields::flags::REVERSE) != 0),
+                u8::from((RawRecordView::new(r).flags() & fgumi_raw_bam::flags::REVERSE) != 0),
             ))
         };
 

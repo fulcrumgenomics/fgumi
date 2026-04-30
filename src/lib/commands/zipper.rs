@@ -52,7 +52,7 @@ use crate::commands::common::{CompressionOptions, parse_bool};
 use crate::logging::OperationTimer;
 use crate::reference::{ReferenceReader, find_dict_path};
 use crate::sam::{SamTag, TemplateCoordinateInfo, check_sort};
-use crate::sort::bam_fields;
+use fgumi_raw_bam;
 use crate::template::{Template, TemplateIterator};
 use crate::umi::TagInfo;
 use crate::validation::validate_file_exists;
@@ -260,7 +260,7 @@ fn add_template_coordinate_tags_raw(mapped: &mut Template) {
     // Fast path: check if there are any secondary/supplementary reads
     let has_sec_supp = rr.iter().any(|r| {
         let f = RawRecordView::new(r).flags();
-        (f & bam_fields::flags::SECONDARY) != 0 || (f & bam_fields::flags::SUPPLEMENTARY) != 0
+        (f & fgumi_raw_bam::flags::SECONDARY) != 0 || (f & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0
     });
     if !has_sec_supp {
         return;
@@ -270,12 +270,12 @@ fn add_template_coordinate_tags_raw(mapped: &mut Template) {
     let r1_info: Option<(i32, i32, bool)> = mapped.r1.and_then(|(i, _)| {
         let r = &rr[i];
         let f = RawRecordView::new(r).flags();
-        if (f & bam_fields::flags::UNMAPPED) != 0 {
+        if (f & fgumi_raw_bam::flags::UNMAPPED) != 0 {
             return None;
         }
-        let ref_id = bam_fields::ref_id(r);
-        let pos = bam_fields::unclipped_5prime_from_raw_bam(r);
-        let is_reverse = (f & bam_fields::flags::REVERSE) != 0;
+        let ref_id = fgumi_raw_bam::ref_id(r);
+        let pos = fgumi_raw_bam::unclipped_5prime_from_raw_bam(r);
+        let is_reverse = (f & fgumi_raw_bam::flags::REVERSE) != 0;
         Some((ref_id, pos, is_reverse))
     });
 
@@ -283,12 +283,12 @@ fn add_template_coordinate_tags_raw(mapped: &mut Template) {
     let r2_info: Option<(i32, i32, bool)> = mapped.r2.and_then(|(i, _)| {
         let r = &rr[i];
         let f = RawRecordView::new(r).flags();
-        if (f & bam_fields::flags::UNMAPPED) != 0 {
+        if (f & fgumi_raw_bam::flags::UNMAPPED) != 0 {
             return None;
         }
-        let ref_id = bam_fields::ref_id(r);
-        let pos = bam_fields::unclipped_5prime_from_raw_bam(r);
-        let is_reverse = (f & bam_fields::flags::REVERSE) != 0;
+        let ref_id = fgumi_raw_bam::ref_id(r);
+        let pos = fgumi_raw_bam::unclipped_5prime_from_raw_bam(r);
+        let is_reverse = (f & fgumi_raw_bam::flags::REVERSE) != 0;
         Some((ref_id, pos, is_reverse))
     });
 
@@ -322,9 +322,9 @@ fn add_template_coordinate_tags_raw(mapped: &mut Template) {
 
     for record in mapped.records.iter_mut() {
         let f = RawRecordView::new(record.as_ref()).flags();
-        if (f & bam_fields::flags::SECONDARY) != 0 || (f & bam_fields::flags::SUPPLEMENTARY) != 0 {
-            bam_fields::remove_tag(record.as_mut_vec(), tc_tag);
-            bam_fields::append_i32_array_tag(record.as_mut_vec(), tc_tag, &tc_values);
+        if (f & fgumi_raw_bam::flags::SECONDARY) != 0 || (f & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0 {
+            fgumi_raw_bam::remove_tag(record.as_mut_vec(), tc_tag);
+            fgumi_raw_bam::append_i32_array_tag(record.as_mut_vec(), tc_tag, &tc_values);
         }
     }
 }
@@ -382,7 +382,7 @@ pub fn merge_raw(
         for tag_str in &tag_info.remove {
             if tag_str.len() == 2 {
                 let tag_bytes: [u8; 2] = [tag_str.as_bytes()[0], tag_str.as_bytes()[1]];
-                bam_fields::remove_tag(record.as_mut_vec(), tag_bytes);
+                fgumi_raw_bam::remove_tag(record.as_mut_vec(), tag_bytes);
             }
         }
     }
@@ -391,8 +391,8 @@ pub fn merge_raw(
     let has_transforms = tag_info.has_revs_or_revcomps();
     for u in unmapped.primary_reads() {
         let u_flags = RawRecordView::new(u).flags();
-        let is_unpaired = (u_flags & bam_fields::flags::PAIRED) == 0;
-        let is_first = (u_flags & bam_fields::flags::FIRST_SEGMENT) != 0;
+        let is_unpaired = (u_flags & fgumi_raw_bam::flags::PAIRED) == 0;
+        let is_first = (u_flags & fgumi_raw_bam::flags::FIRST_SEGMENT) != 0;
 
         // Use template's known indices instead of scanning all mapped records
         let mapped_indices = collect_mapped_indices(mapped, is_unpaired || is_first);
@@ -403,7 +403,7 @@ pub fn merge_raw(
             let mut pos = false;
             let mut neg = false;
             for &i in &mapped_indices {
-                if (RawRecordView::new(&rr[i]).flags() & bam_fields::flags::REVERSE) == 0 {
+                if (RawRecordView::new(&rr[i]).flags() & fgumi_raw_bam::flags::REVERSE) == 0 {
                     pos = true;
                 } else {
                     neg = true;
@@ -423,11 +423,11 @@ pub fn merge_raw(
         if has_pos {
             let rr = mapped.records_mut();
             for &i in &mapped_indices {
-                if (RawRecordView::new(&rr[i]).flags() & bam_fields::flags::REVERSE) != 0 {
+                if (RawRecordView::new(&rr[i]).flags() & fgumi_raw_bam::flags::REVERSE) != 0 {
                     continue;
                 }
-                let aux = bam_fields::aux_data_slice(&rr[i]);
-                let has_pg = bam_fields::find_tag_type(aux, SamTag::PG).is_some();
+                let aux = fgumi_raw_bam::aux_data_slice(&rr[i]);
+                let has_pg = fgumi_raw_bam::find_tag_type(aux, SamTag::PG).is_some();
 
                 for entry in &u_tags {
                     if entry.tag == *SamTag::PG && has_pg {
@@ -438,7 +438,7 @@ pub fn merge_raw(
                     if tag_info.remove.contains(tag_str) {
                         continue;
                     }
-                    bam_fields::remove_tag(rr[i].as_mut_vec(), entry.tag);
+                    fgumi_raw_bam::remove_tag(rr[i].as_mut_vec(), entry.tag);
                     append_raw_tag_entry(rr[i].as_mut_vec(), entry);
                 }
             }
@@ -448,16 +448,16 @@ pub fn merge_raw(
         if has_neg {
             let rr = mapped.records_mut();
             for &i in &mapped_indices {
-                if (RawRecordView::new(&rr[i]).flags() & bam_fields::flags::REVERSE) == 0 {
+                if (RawRecordView::new(&rr[i]).flags() & fgumi_raw_bam::flags::REVERSE) == 0 {
                     continue;
                 }
-                let aux = bam_fields::aux_data_slice(&rr[i]);
-                let has_pg = bam_fields::find_tag_type(aux, SamTag::PG).is_some();
+                let aux = fgumi_raw_bam::aux_data_slice(&rr[i]);
+                let has_pg = fgumi_raw_bam::find_tag_type(aux, SamTag::PG).is_some();
 
                 // Aux offset is safe to cache here: `remove_tag` and `append_raw_tag_entry`
                 // only modify bytes within/after the aux region, so this offset stays valid.
                 let aux_offset =
-                    bam_fields::aux_data_offset_from_record(&rr[i]).unwrap_or(rr[i].len());
+                    fgumi_raw_bam::aux_data_offset_from_record(&rr[i]).unwrap_or(rr[i].len());
 
                 for entry in &u_tags {
                     if entry.tag == *SamTag::PG && has_pg {
@@ -468,7 +468,7 @@ pub fn merge_raw(
                         continue;
                     }
 
-                    bam_fields::remove_tag(rr[i].as_mut_vec(), entry.tag);
+                    fgumi_raw_bam::remove_tag(rr[i].as_mut_vec(), entry.tag);
                     append_raw_tag_entry(rr[i].as_mut_vec(), entry);
 
                     if has_transforms && tag_info.reverse.contains(tag_str) {
@@ -491,23 +491,23 @@ pub fn merge_raw(
         }
 
         // Step 4: Transfer QC pass/fail flag
-        let is_qc_fail = (u_flags & bam_fields::flags::QC_FAIL) != 0;
+        let is_qc_fail = (u_flags & fgumi_raw_bam::flags::QC_FAIL) != 0;
         let rr = mapped.records_mut();
         for &i in &mapped_indices {
             let mut f = RawRecordView::new(&rr[i]).flags();
             if is_qc_fail {
-                f |= bam_fields::flags::QC_FAIL;
+                f |= fgumi_raw_bam::flags::QC_FAIL;
             } else {
-                f &= !bam_fields::flags::QC_FAIL;
+                f &= !fgumi_raw_bam::flags::QC_FAIL;
             }
-            bam_fields::set_flags(&mut rr[i], f);
+            fgumi_raw_bam::set_flags(&mut rr[i], f);
         }
     }
 
     // Step 5: Normalize AS/XS tags
     for record in mapped.records_mut().iter_mut() {
-        bam_fields::normalize_int_tag_to_smallest_signed(record.as_mut_vec(), SamTag::AS);
-        bam_fields::normalize_int_tag_to_smallest_signed(record.as_mut_vec(), SamTag::XS);
+        fgumi_raw_bam::normalize_int_tag_to_smallest_signed(record.as_mut_vec(), SamTag::AS);
+        fgumi_raw_bam::normalize_int_tag_to_smallest_signed(record.as_mut_vec(), SamTag::XS);
     }
 
     // Step 6: Add PA tags
@@ -543,10 +543,10 @@ fn reverse_tag_in_place_raw_by_type(
 ) {
     match type_byte {
         b'Z' => {
-            bam_fields::reverse_string_tag_in_place(record, aux_offset, tag);
+            fgumi_raw_bam::reverse_string_tag_in_place(record, aux_offset, tag);
         }
         b'B' => {
-            bam_fields::reverse_array_tag_in_place(record, aux_offset, tag);
+            fgumi_raw_bam::reverse_array_tag_in_place(record, aux_offset, tag);
         }
         _ => {}
     }
@@ -566,13 +566,13 @@ fn revcomp_tag_in_place_raw_by_type(
 ) {
     match type_byte {
         b'Z' => {
-            bam_fields::reverse_complement_string_tag_in_place(record, aux_offset, tag);
+            fgumi_raw_bam::reverse_complement_string_tag_in_place(record, aux_offset, tag);
         }
         b'B' => {
             // For array tags, revcomp is the same as reverse (no base complement for
             // numeric arrays; arrays that hold base-encoded ints are rare and numeric
             // reversal matches the existing BufValue::Array branch behavior).
-            bam_fields::reverse_array_tag_in_place(record, aux_offset, tag);
+            fgumi_raw_bam::reverse_array_tag_in_place(record, aux_offset, tag);
         }
         _ => {}
     }

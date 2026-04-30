@@ -23,7 +23,7 @@ use crate::logging::OperationTimer;
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::read_info::LibraryIndex;
 use crate::reference::ReferenceReader;
-use crate::sort::bam_fields;
+use fgumi_raw_bam;
 use crate::tag_reversal::reverse_per_base_tags_raw;
 use crate::template::TemplateBatch;
 use crate::unified_pipeline::{
@@ -670,8 +670,8 @@ impl Filter {
 
                 for (idx, record) in template_records.into_iter().enumerate() {
                     let flags = RawRecordView::new(&record).flags();
-                    let is_primary = (flags & bam_fields::flags::SECONDARY) == 0
-                        && (flags & bam_fields::flags::SUPPLEMENTARY) == 0;
+                    let is_primary = (flags & fgumi_raw_bam::flags::SECONDARY) == 0
+                        && (flags & fgumi_raw_bam::flags::SUPPLEMENTARY) == 0;
 
                     if is_primary {
                         if template_pass {
@@ -759,7 +759,7 @@ impl Filter {
         // can invalidate NM/UQ/MD tags and we have no way to regenerate them.
         if reference.is_none() {
             let flags = RawRecordView::new(record).flags();
-            if (flags & bam_fields::flags::UNMAPPED) == 0 {
+            if (flags & fgumi_raw_bam::flags::UNMAPPED) == 0 {
                 bail!(
                     "--ref is required when filtering mapped reads \
                      to keep NM/UQ/MD tags consistent"
@@ -772,7 +772,7 @@ impl Filter {
         }
 
         let is_duplex = {
-            let aux = bam_fields::aux_data_slice(record);
+            let aux = fgumi_raw_bam::aux_data_slice(record);
             is_duplex_consensus(aux)
         };
 
@@ -855,7 +855,7 @@ impl Filter {
         }
 
         let mut pass = {
-            let aux = bam_fields::aux_data_slice(record);
+            let aux = fgumi_raw_bam::aux_data_slice(record);
             if is_duplex {
                 let (cc_thresh, ab_thresh, ba_thresh) = config
                     .duplex_thresholds()
@@ -917,7 +917,7 @@ impl Filter {
                 return false;
             }
         }
-        let seq_len = bam_fields::l_seq(bam) as usize;
+        let seq_len = fgumi_raw_bam::l_seq(bam) as usize;
         if max_no_call_frac >= 1.0 {
             // Count mode: threshold is an absolute base count
             (no_calls as f64) <= max_no_call_frac
@@ -4210,7 +4210,7 @@ mod tests {
         };
         let raw = raw_record.into_inner();
 
-        let aux = crate::sort::bam_fields::aux_data_slice(&raw);
+        let aux = fgumi_raw_bam::aux_data_slice(&raw);
         let thresholds =
             FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.1 };
 
@@ -4240,7 +4240,7 @@ mod tests {
         };
         let raw = raw_record.into_inner();
 
-        let aux = crate::sort::bam_fields::aux_data_slice(&raw);
+        let aux = fgumi_raw_bam::aux_data_slice(&raw);
         let thresholds =
             FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.1 };
 
@@ -4270,7 +4270,7 @@ mod tests {
         };
         let raw = raw_record.into_inner();
 
-        let aux = crate::sort::bam_fields::aux_data_slice(&raw);
+        let aux = fgumi_raw_bam::aux_data_slice(&raw);
         let thresholds =
             FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.1 };
 
@@ -4301,7 +4301,7 @@ mod tests {
         };
         let raw = raw_record.into_inner();
 
-        let aux = crate::sort::bam_fields::aux_data_slice(&raw);
+        let aux = fgumi_raw_bam::aux_data_slice(&raw);
         let thresholds =
             FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.1 };
 
