@@ -25,7 +25,7 @@
 
 use std::collections::VecDeque;
 
-use crate::unified_pipeline::MemoryEstimate;
+use crate::mem_estimate::MemoryEstimate;
 
 /// A buffer that releases items in sequential order.
 ///

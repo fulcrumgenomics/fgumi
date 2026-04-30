@@ -13,7 +13,10 @@
 
 pub mod bam_io;
 pub mod header;
+pub mod mem_estimate;
 pub mod progress;
 pub mod reorder;
 
 pub(crate) mod vendored;
+
+pub use mem_estimate::MemoryEstimate;
