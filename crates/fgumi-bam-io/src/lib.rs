@@ -12,5 +12,6 @@
 #![deny(unsafe_code)]
 
 pub mod bam_io;
+pub mod header;
 pub mod progress;
 pub mod reorder;
