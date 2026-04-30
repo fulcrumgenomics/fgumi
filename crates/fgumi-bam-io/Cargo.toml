@@ -36,7 +36,3 @@ tempfile = "3"
 rstest = "0"
 proptest = "1.10"
 criterion = { version = "0.8", features = ["html_reports"] }
-
-[[bench]]
-name = "reorder_buffer"
-harness = false
