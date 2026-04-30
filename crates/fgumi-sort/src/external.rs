@@ -6,7 +6,6 @@
 //! for benchmarking and as fall-back paths.
 
 #![allow(dead_code)]
-
 // Pre-existing module body follows.
 //! Instead of fully decoding each BAM record into `RecordBuf`, it uses noodles'
 //! lazy `Record` type that stores raw bytes and only parses fields on-demand.

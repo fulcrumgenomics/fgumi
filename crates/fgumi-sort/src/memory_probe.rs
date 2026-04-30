@@ -42,7 +42,8 @@ use bytesize::ByteSize;
 use log::{Level, info, log_enabled};
 
 #[cfg(feature = "memory-debug")]
-#[allow(unused_imports)] // consumed by main fgumi's unified_pipeline via the crate-root re-export
+#[allow(unused_imports)]
+// consumed by main fgumi's unified_pipeline via the crate-root re-export
 pub use platform_ffi::print_mi_stats;
 pub use platform_ffi::{force_mi_collect, process_rss_bytes};
 
