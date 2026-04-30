@@ -25,7 +25,7 @@
 use noodles::sam::Header;
 use std::cmp::Ordering;
 
-use crate::bam_fields;
+use fgumi_raw_bam;
 use fgumi_raw_bam::RawRecordView;
 use std::io::{Read, Write};
 
@@ -293,9 +293,9 @@ impl RawSortKey for RawCoordinateKey {
 
     #[inline]
     fn extract(bam: &[u8], ctx: &SortContext) -> Self {
-        let tid = bam_fields::ref_id(bam);
-        let pos = bam_fields::pos(bam);
-        let reverse = RawRecordView::new(bam).flags() & bam_fields::flags::REVERSE != 0;
+        let tid = fgumi_raw_bam::ref_id(bam);
+        let pos = fgumi_raw_bam::pos(bam);
+        let reverse = RawRecordView::new(bam).flags() & fgumi_raw_bam::flags::REVERSE != 0;
 
         // Create key based on tid (samtools behavior):
         // - tid >= 0: sort by (tid, pos, reverse) even if unmapped flag is set
@@ -305,12 +305,12 @@ impl RawSortKey for RawCoordinateKey {
 
     #[inline]
     fn extract_from_record(bam: &[u8]) -> Self {
-        let tid = bam_fields::ref_id(bam);
+        let tid = fgumi_raw_bam::ref_id(bam);
         if tid < 0 {
             return Self::unmapped();
         }
-        let pos = bam_fields::pos(bam);
-        let reverse = RawRecordView::new(bam).flags() & bam_fields::flags::REVERSE != 0;
+        let pos = fgumi_raw_bam::pos(bam);
+        let reverse = RawRecordView::new(bam).flags() & fgumi_raw_bam::flags::REVERSE != 0;
         // During merge we don't have nref, but for mapped records (tid >= 0)
         // nref is only used for unmapped handling, so any value > tid works.
         // Use tid+1 as a safe nref since tid is non-negative.

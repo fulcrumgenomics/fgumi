@@ -138,7 +138,7 @@ fn create_temp_dir(base: Option<&Path>) -> Result<TempDir> {
     }
 }
 
-pub use external::{LibraryLookup, RawExternalSorter, SortStats, cb_hasher, extract_template_key_inline};
+pub use external::{LibraryLookup, RawExternalSorter, cb_hasher, extract_template_key_inline};
 pub use inline::{TemplateKey, extract_coordinate_key_inline};
 pub use keys::{
     QuerynameComparator, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,

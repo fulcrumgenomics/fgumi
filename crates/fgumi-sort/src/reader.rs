@@ -25,7 +25,7 @@
 //! This module is currently not integrated into the sort pipeline.
 //! It provides infrastructure for future optimization.
 
-use crate::bgzf_reader::{decompress_block_into, read_raw_blocks};
+use fgumi_bgzf::reader::{decompress_block_into, read_raw_blocks};
 use libdeflater::Decompressor;
 use std::io::{self, BufReader, Read};
 

@@ -9,7 +9,7 @@
 //! - Sort by index array, not by moving actual record data
 //! - ~24 bytes overhead per record vs ~110 bytes
 
-use crate::bam_fields;
+use fgumi_raw_bam;
 use crate::keys::{RawCoordinateKey, RawSortKey, SortContext};
 use crate::radix::bytes_needed_u64;
 use crate::segmented_buf::SegmentedBuf;
@@ -421,9 +421,9 @@ impl ProbeableBuffer for RecordBuffer {
 #[inline]
 #[must_use]
 pub fn extract_coordinate_key_inline(bam: &[u8], nref: u32) -> u64 {
-    let tid = bam_fields::ref_id(bam);
-    let pos = bam_fields::pos(bam);
-    let reverse = RawRecordView::new(bam).flags() & bam_fields::flags::REVERSE != 0;
+    let tid = fgumi_raw_bam::ref_id(bam);
+    let pos = fgumi_raw_bam::pos(bam);
+    let reverse = RawRecordView::new(bam).flags() & fgumi_raw_bam::flags::REVERSE != 0;
 
     // Pack key based on tid (samtools behavior):
     // - tid >= 0: sort by (tid, pos, reverse) even if unmapped flag is set
@@ -1977,7 +1977,7 @@ mod tests {
         record.extend_from_slice(&0i32.to_le_bytes()); // tlen
         record.push(b'A'); // read name
         record.push(0); // null terminator
-        // Pad to at least 34 bytes (bam_fields::flags reads at offset 14-15)
+        // Pad to at least 34 bytes (fgumi_raw_bam::flags reads at offset 14-15)
         while record.len() < 40 {
             record.push(0);
         }

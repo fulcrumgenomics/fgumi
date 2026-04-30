@@ -17,7 +17,7 @@
 //! 3. Sort by keys while keeping raw records
 //! 4. Write raw record bytes to output
 
-use crate::sam::SamTag;
+use fgumi_raw_bam::SamTag;
 use crate::inline::{
     ProbeableBuffer, RecordBuffer, TemplateKey, TemplateRecordBuffer,
 };
@@ -2918,17 +2918,17 @@ pub fn extract_template_key_inline(
     cell_tag: Option<SamTag>,
     cb_hasher: &ahash::RandomState,
 ) -> TemplateKey {
-    use crate::bam_fields;
-    use bam_fields::{flags, mate_unclipped_5prime, unclipped_5prime_raw};
+    use fgumi_raw_bam;
+    use fgumi_raw_bam::{flags, mate_unclipped_5prime, unclipped_5prime_raw};
 
     // Single-pass extraction of all aux tags (MI, RG, cell barcode, MC)
-    let aux = bam_fields::extract_template_aux_tags(bam_bytes, cell_tag);
+    let aux = fgumi_raw_bam::extract_template_aux_tags(bam_bytes, cell_tag);
     let mi = aux.mi;
     let library = lib_lookup.ordinal_from_rg(aux.rg);
     let cb_hash = aux.cell.map_or(0u64, |cb_bytes| cb_hasher.hash_one(cb_bytes));
 
     // Extract fields from raw bytes
-    let v = bam_fields::RawRecordView::new(bam_bytes);
+    let v = fgumi_raw_bam::RawRecordView::new(bam_bytes);
     let tid = v.ref_id();
     let pos = v.pos();
     let l_read_name = v.l_read_name() as usize;
@@ -3010,8 +3010,8 @@ pub fn extract_template_key_inline(
     TemplateKey::new(tid1, pos1, neg1, tid2, pos2, neg2, cb_hash, library, mi, name_hash, is_upper)
 }
 
-// Use shared SortStats from the parent module.
-pub use super::SortStats as RawSortStats;
+// SortStats is defined in crate root (lib.rs); alias it here for internal use.
+pub use crate::SortStats as RawSortStats;
 
 // ============================================================================
 // Pool-integrated BAM reader construction
@@ -3151,7 +3151,7 @@ fn skip_bam_header<R: Read>(reader: &mut R) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sam::builder::SamBuilder;
+    use fgumi_raw_bam::builder::SamBuilder;
     use bstr::BString;
     use noodles::sam::header::record::value::Map;
     use noodles::sam::header::record::value::map::ReadGroup;
@@ -3562,7 +3562,7 @@ mod tests {
         #[case] sort_order: SortOrder,
         #[case] write_index: bool,
     ) {
-        use crate::sam::builder::SamBuilder;
+        use fgumi_raw_bam::builder::SamBuilder;
 
         let num_pairs = 30;
         let mut builder = SamBuilder::new();
@@ -3610,7 +3610,7 @@ mod tests {
     #[case::queryname_natural(SortOrder::Queryname(QuerynameComparator::Natural))]
     #[case::template_coordinate(SortOrder::TemplateCoordinate)]
     fn test_sort_many_chunks_with_semaphore(#[case] sort_order: SortOrder) {
-        use crate::sam::builder::SamBuilder;
+        use fgumi_raw_bam::builder::SamBuilder;
 
         let num_pairs = 200;
         let mut builder = SamBuilder::new();
@@ -3665,7 +3665,7 @@ mod tests {
     #[case::queryname_natural(SortOrder::Queryname(QuerynameComparator::Natural))]
     #[case::template_coordinate(SortOrder::TemplateCoordinate)]
     fn test_sort_sub_arrays_match_single_thread(#[case] sort_order: SortOrder) {
-        use crate::sam::builder::SamBuilder;
+        use fgumi_raw_bam::builder::SamBuilder;
 
         let num_pairs = 50;
         let mut builder = SamBuilder::new();
@@ -3720,7 +3720,7 @@ mod tests {
     #[case::queryname_natural(SortOrder::Queryname(QuerynameComparator::Natural))]
     #[case::template_coordinate(SortOrder::TemplateCoordinate)]
     fn test_sort_sub_arrays_in_memory_only(#[case] sort_order: SortOrder) {
-        use crate::sam::builder::SamBuilder;
+        use fgumi_raw_bam::builder::SamBuilder;
 
         let num_pairs = 20;
         let mut builder = SamBuilder::new();
@@ -4151,7 +4151,7 @@ mod tests {
     /// single-dir mode.
     #[test]
     fn test_sort_with_two_temp_dirs_matches_single_dir() {
-        use crate::sam::builder::SamBuilder;
+        use fgumi_raw_bam::builder::SamBuilder;
 
         let num_pairs = 200;
         let mut builder = SamBuilder::new();
