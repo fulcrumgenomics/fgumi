@@ -1,0 +1,42 @@
+[package]
+name = "fgumi-bam-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "BAM I/O factories and pipeline primitives for the fgumi family of crates"
+repository.workspace = true
+license.workspace = true
+readme = "README.md"
+categories = ["command-line-utilities", "science"]
+keywords = ["bioinformatics", "bam", "sequencing", "ngs"]
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+
+[dependencies]
+fgumi-raw-bam = { workspace = true, features = ["noodles"] }
+fgumi-bgzf = { workspace = true }
+noodles = { version = "0.106.0", features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
+noodles-bgzf = { version = "0.46.0", features = ["libdeflate"] }
+noodles-csi = "0.54.0"
+libdeflater = "1.22"
+crc32fast = "1.4"
+anyhow = "1.0.102"
+thiserror = "2"
+bstr = "1.12.1"
+bytes = "1"
+crossbeam-channel = "0.5"
+crossbeam-utils = "0.8.21"
+parking_lot = "0.12"
+log = "0"
+fgoxide = "0.6.0"
+
+[dev-dependencies]
+tempfile = "3"
+rstest = "0"
+proptest = "1.10"
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "reorder_buffer"
+harness = false
