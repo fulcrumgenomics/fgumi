@@ -74,7 +74,7 @@ pub type RawBamReaderAuto = RawBamReader<BgzfReaderEnum>;
 /// and wraps its input file.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PipelineReaderOpts {
-    /// If true, wrap inputs in a [`crate::prefetch_reader::PrefetchReader`]
+    /// If true, wrap inputs in a `PrefetchReader` background thread
     /// so that disk reads happen on a dedicated I/O thread.
     pub async_reader: bool,
 }
@@ -129,9 +129,8 @@ pub fn create_bam_reader<P: AsRef<Path>>(
 
 /// Variant of [`create_bam_reader`] that accepts [`PipelineReaderOpts`].
 ///
-/// When `opts.async_reader` is true the file is wrapped in a
-/// [`PrefetchReader`](crate::prefetch_reader::PrefetchReader) before the BGZF
-/// decompression layer, overlapping disk I/O with BGZF decoding.
+/// When `opts.async_reader` is true the file is wrapped in a `PrefetchReader`
+/// before the BGZF decompression layer, overlapping disk I/O with BGZF decoding.
 ///
 /// # Errors
 ///
@@ -191,9 +190,8 @@ pub fn create_raw_bam_reader<P: AsRef<Path>>(
 
 /// Variant of [`create_raw_bam_reader`] that accepts [`PipelineReaderOpts`].
 ///
-/// When `opts.async_reader` is true the file is wrapped in a
-/// [`PrefetchReader`](crate::prefetch_reader::PrefetchReader) before the BGZF
-/// decompression layer, overlapping disk I/O with BGZF decoding.
+/// When `opts.async_reader` is true the file is wrapped in a `PrefetchReader`
+/// before the BGZF decompression layer, overlapping disk I/O with BGZF decoding.
 ///
 /// # Errors
 ///
@@ -335,10 +333,8 @@ pub fn create_bam_reader_for_pipeline<P: AsRef<Path>>(
 ///
 /// For regular files, `POSIX_FADV_SEQUENTIAL` is applied to the file descriptor
 /// on Linux (a no-op elsewhere). If `opts.async_reader` is true the input is
-/// wrapped in a [`crate::prefetch_reader::PrefetchReader`] — for regular files
-/// using [`from_file`](crate::prefetch_reader::PrefetchReader::from_file) (with
-/// kernel WILLNEED hints), for stdin via the generic
-/// [`new`](crate::prefetch_reader::PrefetchReader::new) constructor.
+/// wrapped in a `PrefetchReader` background thread — for regular files this also
+/// applies kernel WILLNEED hints to the file descriptor before spawning the thread.
 ///
 /// # Errors
 ///

@@ -412,6 +412,7 @@ impl Builder {
     ///
     /// Must be <= `BGZF_BLOCK_SIZE` (65280).
     #[must_use]
+    #[allow(dead_code)]
     pub fn set_blocksize(mut self, size: usize) -> Self {
         self.blocksize = size.min(BGZF_BLOCK_SIZE);
         self

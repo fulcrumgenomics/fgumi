@@ -203,6 +203,7 @@ impl PrefetchReader {
 
     /// Total bytes served to callers of [`Read::read`] so far.
     #[must_use]
+    #[allow(dead_code)]
     pub fn bytes_consumed(&self) -> u64 {
         self.bytes_consumed
     }
@@ -211,6 +212,7 @@ impl PrefetchReader {
     /// to deliver the next chunk. Useful as a prototype-phase signal for
     /// whether [`DEFAULT_PREFETCH_DEPTH`] is large enough.
     #[must_use]
+    #[allow(dead_code)]
     pub fn consumer_stalls(&self) -> u64 {
         self.consumer_stalls
     }
