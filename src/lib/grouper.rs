@@ -40,12 +40,7 @@ impl BatchWeight for RawRecord {
     }
 }
 
-/// Heap size of a [`RawRecord`] is its buffer capacity.
-impl MemoryEstimate for RawRecord {
-    fn estimate_heap_size(&self) -> usize {
-        self.capacity()
-    }
-}
+// `impl MemoryEstimate for RawRecord` is provided by fgumi_bam_io::mem_estimate.
 
 /// Template batches have weight equal to the number of templates.
 impl BatchWeight for TemplateBatch {

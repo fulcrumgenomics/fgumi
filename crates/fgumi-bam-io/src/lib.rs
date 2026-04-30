@@ -27,12 +27,14 @@ pub use mem_estimate::MemoryEstimate;
 pub use paths::{is_stdin_path, is_stdout_path};
 pub use progress::ProgressTracker;
 pub use reader::{
-    BamReaderAuto, BgzfReaderEnum, PipelineReaderOpts, RawBamReaderAuto, create_bam_reader,
-    create_bam_reader_for_pipeline, create_bam_reader_for_pipeline_with_opts,
-    create_bam_reader_with_opts, create_raw_bam_reader, create_raw_bam_reader_with_opts,
+    BamReaderAuto, BgzfReaderEnum, ChainedReader, PipelineReaderOpts, RawBamReaderAuto,
+    TeeReader, create_bam_reader, create_bam_reader_for_pipeline,
+    create_bam_reader_for_pipeline_with_opts, create_bam_reader_with_opts,
+    create_raw_bam_reader, create_raw_bam_reader_with_opts,
 };
 pub use reorder::{DrainReady, ReorderBuffer};
 pub use writer::{
     BamWriter, BgzfWriterEnum, IndexingBamWriter, RawBamWriter, create_bam_writer,
     create_indexing_bam_writer, create_optional_bam_writer, create_raw_bam_writer, write_bai_index,
+    write_bam_header,
 };

@@ -93,7 +93,6 @@ use crate::read_info::LibraryIndex;
 use fgumi_bam_io::ReorderBuffer;
 use crate::sam::SamTag;
 use fgumi_raw_bam::RawRecord;
-use noodles::sam::alignment::RecordBuf;
 use noodles::sam::alignment::record::data::field::Tag;
 
 use super::scheduler::{BackpressureState, Scheduler, SchedulerStrategy, create_scheduler};
@@ -1485,57 +1484,14 @@ impl DecodedRecord {
     }
 }
 
-/// Estimates the heap allocation of a `RecordBuf`.
-///
-/// The inline struct overhead (flags, position, etc.) is accounted for by the caller
-/// via `capacity * size_of::<RecordBuf>()`, so we only count heap allocations here.
-pub(crate) fn estimate_record_buf_heap_size(record: &RecordBuf) -> usize {
-    let name_size = record.name().map_or(0, |n| n.len());
-    let seq_len = record.sequence().len();
-    let qual_len = record.quality_scores().len();
-    let cigar_ops = record.cigar().as_ref().len();
-    let cigar_size = cigar_ops * 4;
-    let data_fields = record.data().iter().count();
-    let entry_capacity = (data_fields * 115) / 100 + 1;
-    let entries_size = data_fields * 48;
-    let hash_table_size = entry_capacity * 16;
-    let value_heap_size = data_fields * 16;
-    let data_size = entries_size + hash_table_size + value_heap_size;
-    name_size + seq_len + qual_len + cigar_size + data_size
-}
-
 impl MemoryEstimate for DecodedRecord {
     fn estimate_heap_size(&self) -> usize {
         // RawRecord::capacity() returns the inner Vec<u8> capacity.
         self.data.capacity()
     }
 }
-
-impl MemoryEstimate for Vec<DecodedRecord> {
-    fn estimate_heap_size(&self) -> usize {
-        self.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>()
-            + self.capacity() * std::mem::size_of::<DecodedRecord>()
-    }
-}
-
-impl MemoryEstimate for RecordBuf {
-    fn estimate_heap_size(&self) -> usize {
-        estimate_record_buf_heap_size(self)
-    }
-}
-
-impl MemoryEstimate for Vec<RecordBuf> {
-    fn estimate_heap_size(&self) -> usize {
-        self.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>()
-            + self.capacity() * std::mem::size_of::<RecordBuf>()
-    }
-}
-
-impl MemoryEstimate for Vec<u8> {
-    fn estimate_heap_size(&self) -> usize {
-        self.capacity()
-    }
-}
+// Vec<DecodedRecord>, Vec<RecordBuf>, Vec<u8>, RecordBuf, () — all provided
+// by the blanket/foreign impls in fgumi_bam_io::mem_estimate.
 
 // ============================================================================
 // GroupKeyConfig - Configuration for computing `GroupKey` during Decode
@@ -2525,12 +2481,7 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipelineState
     }
 }
 
-/// Unit type always has zero heap size (used in tests).
-impl MemoryEstimate for () {
-    fn estimate_heap_size(&self) -> usize {
-        0
-    }
-}
+// `impl MemoryEstimate for ()` provided by fgumi_bam_io::mem_estimate.
 
 /// Configuration for the BAM pipeline.
 #[derive(Debug, Clone)]

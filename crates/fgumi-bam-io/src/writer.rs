@@ -112,7 +112,7 @@ pub(crate) fn make_bgzf_writer(
 /// produces subtly different output that causes read-back failures with
 /// some writer backends (e.g. `MultithreadedWriter`).
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-pub(crate) fn write_bam_header(writer: &mut impl Write, header: &Header) -> io::Result<()> {
+pub fn write_bam_header(writer: &mut impl Write, header: &Header) -> io::Result<()> {
     // BAM magic
     writer.write_all(fgumi_raw_bam::BAM_MAGIC)?;
 

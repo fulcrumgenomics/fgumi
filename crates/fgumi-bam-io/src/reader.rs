@@ -234,20 +234,24 @@ pub fn create_raw_bam_reader_with_opts<P: AsRef<Path>>(
 
 /// A reader that buffers all bytes read through it.
 ///
-/// This is used to capture raw bytes while parsing the BAM header,
-/// so they can be replayed to the pipeline.
-struct TeeReader<R> {
+/// Wraps an inner reader and tees every byte read into an internal buffer.
+/// Call [`into_parts`](Self::into_parts) to recover both the buffer and the
+/// original inner reader so the consumed bytes can be replayed.  Used to
+/// capture raw bytes while parsing a BAM header so they can be re-delivered
+/// to a downstream reader via [`ChainedReader`].
+pub struct TeeReader<R> {
     inner: R,
     buffer: Vec<u8>,
 }
 
 impl<R: Read> TeeReader<R> {
-    fn new(inner: R) -> Self {
+    /// Wrap `inner` in a tee reader.
+    pub fn new(inner: R) -> Self {
         Self { inner, buffer: Vec::new() }
     }
 
     /// Consume the `TeeReader` and return the buffered bytes and inner reader.
-    fn into_parts(self) -> (Vec<u8>, R) {
+    pub fn into_parts(self) -> (Vec<u8>, R) {
         (self.buffer, self.inner)
     }
 }
@@ -262,8 +266,11 @@ impl<R: Read> Read for TeeReader<R> {
 
 /// A reader that chains buffered data with a remaining stream.
 ///
-/// First yields all bytes from the buffer, then reads from the inner reader.
-pub(crate) struct ChainedReader<R> {
+/// First yields all bytes from the internal buffer, then transparently
+/// delegates to the wrapped inner reader.  Typically constructed with bytes
+/// captured by a [`TeeReader`] so that bytes consumed during header parsing
+/// can be replayed to a downstream reader.
+pub struct ChainedReader<R> {
     buffer: io::Cursor<Vec<u8>>,
     inner: R,
     buffer_exhausted: bool,
@@ -271,7 +278,7 @@ pub(crate) struct ChainedReader<R> {
 
 impl<R: Read> ChainedReader<R> {
     /// Create a new chained reader from buffered data and an inner reader.
-    pub(crate) fn new(buffer: Vec<u8>, inner: R) -> Self {
+    pub fn new(buffer: Vec<u8>, inner: R) -> Self {
         Self { buffer: io::Cursor::new(buffer), inner, buffer_exhausted: false }
     }
 }

@@ -19,6 +19,7 @@
 
 use fgumi_bam_io::create_raw_bam_reader;
 use fgumi_bam_io::ProgressTracker;
+use fgumi_bam_io::{ChainedReader, TeeReader, is_stdin_path};
 use crate::sam::SamTag;
 use crate::sort::inline_buffer::{
     ProbeableBuffer, RecordBuffer, TemplateKey, TemplateRecordBuffer,
@@ -28,10 +29,10 @@ use crate::sort::memory_probe::{
     BufferProbeStats, ConsumerProbeStats, MergeProbe, SpillProbe, force_mi_collect, log_snapshot,
 };
 use crate::sort::pooled_chunk_writer::PooledChunkWriter;
-use crate::sort::read_ahead::{RawReadAheadReader, RecordSource};
+use crate::sort::read_ahead::{PooledInputStream, RawReadAheadReader, RecordSource};
 use crate::sort::tmp_dir_alloc::TmpDirAllocator;
 use crate::sort::worker_pool::SortWorkerPool;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use log::{debug, info};
 use noodles::sam::Header;
@@ -1519,7 +1520,7 @@ impl RawExternalSorter {
         // main thread reads records directly from PooledInputStream.
         info!("Phase 1: Pool-integrated input reading ({} workers, N+2 model)", pool.num_workers());
         let (record_source, header) = {
-            let (reader, header) = fgumi_bam_io::create_raw_bam_reader_pool_integrated(
+            let (reader, header) = create_raw_bam_reader_pool_integrated(
                 input,
                 &pool,
                 self.async_reader,
@@ -3014,6 +3015,142 @@ pub fn extract_template_key_inline(
 
 // Use shared SortStats from the parent module.
 pub use super::SortStats as RawSortStats;
+
+// ============================================================================
+// Pool-integrated BAM reader construction
+//
+// This function uses sort-module-local types (SortWorkerPool, PooledInputStream,
+// phase) so it cannot live in fgumi-bam-io. It will move to fgumi-sort in
+// Phase D when the sort module is extracted.
+// ============================================================================
+
+/// Create a raw BAM reader using the pool's Phase 1 integrated reading.
+///
+/// Workers in the pool do `ReadInputBlocks` + `DecompressInput`. The main
+/// thread consumes decompressed bytes via `PooledInputStream`.
+///
+/// When `async_reader` is false, no extra threads are spawned: the pool's
+/// block reader reads directly from the input file. When `async_reader` is
+/// true, the input file is wrapped in a `PrefetchReader`, which spawns one
+/// dedicated OS thread (`fgumi-prefetch`) that reads raw bytes ahead into a
+/// bounded queue so the pool's block reader never blocks on disk I/O.
+///
+/// # Flow
+///
+/// 1. Parse header with noodles (first pass, single-threaded)
+/// 2. Open file again, set as pool's input file
+/// 3. Set pool to PHASE1 — workers start reading/decompressing
+/// 4. Main thread skips header bytes from decompressed stream
+/// 5. Returns `RawBamReader<PooledInputStream>` for direct record iteration
+///
+/// # Errors
+///
+/// Returns an error if the BAM file cannot be opened, the header cannot be
+/// parsed, or header bytes cannot be skipped from the decompressed stream.
+fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
+    path: P,
+    pool: &Arc<SortWorkerPool>,
+    async_reader: bool,
+) -> Result<(fgumi_raw_bam::RawBamReader<PooledInputStream>, Header)> {
+    use crate::sort::worker_pool::phase;
+    use std::io;
+
+    let path_ref = path.as_ref();
+
+    let (header, reader): (Header, Box<dyn io::Read + Send>) = if is_stdin_path(path_ref) {
+        let stdin = io::stdin();
+        let tee = TeeReader::new(stdin);
+        let bgzf = BgzfReader::new(tee);
+        let mut noodles_reader = noodles::bam::io::Reader::from(bgzf);
+        let header = noodles_reader
+            .read_header()
+            .with_context(|| "Failed to read BAM header from stdin")?;
+
+        let bgzf = noodles_reader.into_inner();
+        let tee = bgzf.into_inner();
+        let (buffered_bytes, stdin) = tee.into_parts();
+        let chained = ChainedReader::new(buffered_bytes, stdin);
+        (header, Box::new(io::BufReader::with_capacity(2 * 1024 * 1024, chained)))
+    } else {
+        let mut file = std::fs::File::open(path_ref)
+            .with_context(|| format!("Failed to open input BAM: {}", path_ref.display()))?;
+
+        let header = {
+            let bgzf = BgzfReader::new(&mut file);
+            let mut noodles_reader = noodles::bam::io::Reader::from(bgzf);
+            noodles_reader
+                .read_header()
+                .with_context(|| format!("Failed to read header from: {}", path_ref.display()))?
+        };
+
+        file.seek(SeekFrom::Start(0))
+            .with_context(|| format!("Failed to rewind input BAM: {}", path_ref.display()))?;
+
+        let reader: Box<dyn io::Read + Send> = if async_reader {
+            fgumi_bam_io::os_hints::advise_sequential(&file);
+            log::info!(
+                "async sort reader enabled: spawning fgumi-prefetch thread for {}",
+                path_ref.display()
+            );
+            Box::new(fgumi_bam_io::prefetch_reader::PrefetchReader::from_file(file))
+        } else {
+            Box::new(io::BufReader::with_capacity(2 * 1024 * 1024, file))
+        };
+        (header, reader)
+    };
+
+    pool.set_input_file(reader);
+    pool.set_phase(phase::PHASE1);
+
+    let mut pooled_input = PooledInputStream::new(
+        pool.decompressed_input_queue(),
+        pool.decompressed_input_done_flag(),
+        pool.input_read_error_flag(),
+        pool.decompress_error_flag(),
+    );
+
+    skip_bam_header(&mut pooled_input)
+        .with_context(|| format!("Failed to skip header from: {}", path_ref.display()))?;
+
+    let raw_reader = fgumi_raw_bam::RawBamReader::new(pooled_input);
+    Ok((raw_reader, header))
+}
+
+/// Skip the BAM header from a reader positioned at the start of a BAM stream.
+///
+/// Reads and discards: magic (4 bytes), header text length + text,
+/// `n_ref` + reference entries.
+fn skip_bam_header<R: Read>(reader: &mut R) -> Result<()> {
+    use std::io;
+    let mut buf4 = [0u8; 4];
+
+    reader.read_exact(&mut buf4)?;
+    anyhow::ensure!(&buf4 == b"BAM\x01", "Not a BAM file (bad magic)");
+
+    reader.read_exact(&mut buf4)?;
+    let l_text = u32::from_le_bytes(buf4) as usize;
+    let copied = io::copy(&mut reader.take(l_text as u64), &mut io::sink())?;
+    anyhow::ensure!(
+        copied == l_text as u64,
+        "BAM header text truncated: expected {l_text} bytes, got {copied}"
+    );
+
+    reader.read_exact(&mut buf4)?;
+    let n_ref = u32::from_le_bytes(buf4) as usize;
+
+    for _ in 0..n_ref {
+        reader.read_exact(&mut buf4)?;
+        let l_name = u32::from_le_bytes(buf4) as usize;
+        let copied = io::copy(&mut reader.take(l_name as u64), &mut io::sink())?;
+        anyhow::ensure!(
+            copied == l_name as u64,
+            "BAM reference name truncated: expected {l_name} bytes, got {copied}"
+        );
+        reader.read_exact(&mut buf4)?;
+    }
+
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

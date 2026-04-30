@@ -893,12 +893,8 @@ impl MemoryEstimate for Template {
     }
 }
 
-impl MemoryEstimate for TemplateBatch {
-    fn estimate_heap_size(&self) -> usize {
-        self.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>()
-            + self.capacity() * std::mem::size_of::<Template>()
-    }
-}
+// `impl MemoryEstimate for TemplateBatch` (= Vec<Template>) is provided by
+// the blanket `impl<T: MemoryEstimate> MemoryEstimate for Vec<T>` in fgumi_bam_io.
 
 #[cfg(test)]
 #[allow(clippy::similar_names)]
