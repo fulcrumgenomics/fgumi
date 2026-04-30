@@ -15,22 +15,15 @@ pedantic = { level = "deny", priority = -1 }
 
 [dependencies]
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
-fgumi-bgzf = { workspace = true }
 noodles = { version = "0.106.0", features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
 noodles-bgzf = { version = "0.46.0", features = ["libdeflate"] }
 noodles-csi = "0.54.0"
 bgzf = "0.3.0"
-libdeflater = "1.22"
-crc32fast = "1.4"
 anyhow = "1.0.102"
-thiserror = "2"
 bstr = "1.12.1"
 bytes = "1"
 crossbeam-channel = "0.5"
-crossbeam-utils = "0.8.21"
-parking_lot = "0.12"
 log = "0"
-fgoxide = "0.6.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.29", default-features = false, features = ["fs"] }
