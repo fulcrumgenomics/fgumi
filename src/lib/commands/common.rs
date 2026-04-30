@@ -170,7 +170,7 @@ impl BamIoOptions {
         Self { input: input.into(), output: output.into(), async_reader: false }
     }
 
-    /// Build [`PipelineReaderOpts`] from the async-reader flag.
+    /// Build [`fgumi_bam_io::PipelineReaderOpts`] from the async-reader flag.
     pub fn pipeline_reader_opts(&self) -> fgumi_bam_io::PipelineReaderOpts {
         fgumi_bam_io::PipelineReaderOpts { async_reader: self.async_reader }
     }

@@ -21,9 +21,9 @@
 //!
 //! ### Utilities
 //!
-//! - **[`bam_io`]** - BAM file I/O helpers for reading and writing
+//! - [`fgumi_bam_io`] - BAM file I/O helpers for reading and writing (separate crate)
 //! - **[`validation`]** - Input validation utilities for parameters and files
-//! - **[`progress`]** - Progress tracking and logging
+//! - [`fgumi_bam_io::progress`] - Progress tracking and logging (separate crate)
 //! - **[`logging`]** - Enhanced logging utilities with formatting
 //! - **[`metrics`]** - Structured metrics types and file writing utilities
 //! - **[`rejection`]** - Rejection reason tracking and statistics
@@ -39,7 +39,7 @@
 //! ### Reading and Writing BAM Files
 //!
 //! ```no_run
-//! use fgumi_lib::bam_io::{create_bam_reader, create_bam_writer};
+//! use fgumi_bam_io::{create_bam_reader, create_bam_writer};
 //!
 //! # fn main() -> anyhow::Result<()> {
 //! // Open input BAM and get header (path, threads)

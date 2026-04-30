@@ -9,7 +9,7 @@
 //! - [`RawCoordinateKey`]: Fixed-size genomic coordinate key (tid, pos, strand)
 //! - [`RawQuerynameKey`]: Read name with natural numeric ordering
 //! - [`RawQuerynameLexKey`]: Read name with lexicographic ordering
-//! - [`TemplateKey`](super::inline_buffer::TemplateKey): Template-level position for UMI grouping
+//! - [`TemplateKey`](crate::inline::TemplateKey): Template-level position for UMI grouping
 //!
 //! # Generic Sorting Abstraction
 //!

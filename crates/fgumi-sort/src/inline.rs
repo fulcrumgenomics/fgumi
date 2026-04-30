@@ -622,7 +622,7 @@ impl RawSortKey for TemplateKey {
 
     /// # Panics
     ///
-    /// Always panics. `TemplateKey` extraction requires a [`LibraryLookup`]
+    /// Always panics. `TemplateKey` extraction requires a [`LibraryLookup`](crate::external::LibraryLookup)
     /// context not available through the `RawSortKey` trait interface. All
     /// callers must use `extract_template_key_inline()` instead.
     fn extract(_bam: &[u8], _ctx: &SortContext) -> Self {

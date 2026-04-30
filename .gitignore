@@ -43,3 +43,6 @@ docs/src/metrics/
 
 # Benchmark data
 /tmp/
+
+# Heap profiling output produced when binaries are built with the dhat-heap feature
+dhat-heap.json

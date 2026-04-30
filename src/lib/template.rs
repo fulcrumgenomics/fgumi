@@ -820,10 +820,10 @@ where
 }
 
 impl<R: std::io::Read> TemplateIterator<R> {
-    /// Creates a new `RawTemplateIterator` from a [`RawBamReader`].
+    /// Creates a new `RawTemplateIterator` from a [`fgumi_raw_bam::RawBamReader`].
     ///
     /// The reader must already have had its header consumed (e.g., via
-    /// [`create_raw_bam_reader`]).
+    /// [`fgumi_bam_io::create_raw_bam_reader`]).
     pub fn new(reader: fgumi_raw_bam::RawBamReader<R>) -> Self {
         TemplateIterator { reader, pending: None, exhausted: false }
     }
