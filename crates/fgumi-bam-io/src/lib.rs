@@ -12,3 +12,4 @@
 #![deny(unsafe_code)]
 
 pub mod bam_io;
+pub mod progress;

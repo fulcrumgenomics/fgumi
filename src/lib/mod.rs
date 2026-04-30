@@ -147,7 +147,6 @@ pub mod os_hints;
 pub mod per_thread_accumulator;
 pub mod prefetch_reader;
 pub use fgumi_consensus::phred;
-pub mod progress;
 pub mod read_info;
 pub mod reference;
 pub use fgumi_metrics::rejection;
