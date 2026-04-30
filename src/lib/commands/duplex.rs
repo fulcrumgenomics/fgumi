@@ -32,13 +32,13 @@ use crate::overlapping_consensus::{
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::read_info::LibraryIndex;
 use crate::sam::{SamTag, header_as_unsorted};
-use fgumi_raw_bam;
 use crate::umi::extract_mi_base;
 use crate::unified_pipeline::{
     GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
 };
 use crate::validation::validate_file_exists;
 use fgumi_bam_io::ProgressTracker;
+use fgumi_raw_bam;
 use fgumi_raw_bam::{RawRecord, RawRecordView};
 use log::info;
 use noodles::sam::Header;
@@ -595,8 +595,8 @@ impl Duplex {
             }
             // Only keep mapped reads or reads with mapped mates
             let is_mapped = flg & fgumi_raw_bam::flags::UNMAPPED == 0;
-            let has_mapped_mate =
-                flg & fgumi_raw_bam::flags::PAIRED != 0 && flg & fgumi_raw_bam::flags::MATE_UNMAPPED == 0;
+            let has_mapped_mate = flg & fgumi_raw_bam::flags::PAIRED != 0
+                && flg & fgumi_raw_bam::flags::MATE_UNMAPPED == 0;
             is_mapped || has_mapped_mate
         };
 

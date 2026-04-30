@@ -199,7 +199,8 @@ mod tests {
 
         // Verify the cd tag was reversed: find it in the raw record's aux data
         let aux = fgumi_raw_bam::aux_data_slice(&raw);
-        let arr = fgumi_raw_bam::find_array_tag(aux, SamTag::CD_BASES).expect("cd tag should exist");
+        let arr =
+            fgumi_raw_bam::find_array_tag(aux, SamTag::CD_BASES).expect("cd tag should exist");
         let values = fgumi_raw_bam::array_tag_to_vec_u16(&arr);
         assert_eq!(values, vec![4, 3, 2, 1]);
     }

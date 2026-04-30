@@ -2456,8 +2456,7 @@ mod tests {
         let template_raw = {
             let raw = make_raw_bam_for_dedup(
                 b"q01",
-                fgumi_raw_bam::flags::PAIRED
-                    | fgumi_raw_bam::flags::FIRST_SEGMENT,
+                fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
                 30,
                 4,
                 qualities,
@@ -2668,8 +2667,11 @@ mod tests {
         use fgumi_raw_bam;
 
         let l_read_name = (name.len() + 1) as u8;
-        let cigar_ops: &[u32] =
-            if (flag & fgumi_raw_bam::flags::UNMAPPED) == 0 { &[(seq_len as u32) << 4] } else { &[] };
+        let cigar_ops: &[u32] = if (flag & fgumi_raw_bam::flags::UNMAPPED) == 0 {
+            &[(seq_len as u32) << 4]
+        } else {
+            &[]
+        };
         let n_cigar_op = cigar_ops.len() as u16;
         let seq_bytes = seq_len.div_ceil(2);
         let total = 32 + l_read_name as usize + cigar_ops.len() * 4 + seq_bytes + seq_len;

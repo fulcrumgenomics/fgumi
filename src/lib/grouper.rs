@@ -10,9 +10,9 @@ use std::io;
 
 use noodles::sam::alignment::RecordBuf;
 
-use fgumi_raw_bam;
 use crate::template::{Template, TemplateBatch};
 use crate::unified_pipeline::{BatchWeight, DecodedRecord, Grouper, MemoryEstimate};
+use fgumi_raw_bam;
 use fgumi_raw_bam::{RawRecord, raw_record_to_record_buf};
 
 // ============================================================================
@@ -503,7 +503,8 @@ impl RecordPositionGrouper {
                     // Hash match is a fast pre-check; confirm QNAME bytes to guard
                     // against hash collisions merging unrelated templates.
                     last.key.name_hash == decoded.key.name_hash
-                        && fgumi_raw_bam::read_name(&last.data) == fgumi_raw_bam::read_name(&decoded.data)
+                        && fgumi_raw_bam::read_name(&last.data)
+                            == fgumi_raw_bam::read_name(&decoded.data)
                 }) =>
             {
                 // Different position but same template (name_hash + QNAME match with
@@ -1458,20 +1459,20 @@ mod tests {
 
     #[test]
     fn test_build_templates_from_raw_bytes() {
-        use fgumi_raw_bam;
         use crate::unified_pipeline::{DecodedRecord, GroupKey};
+        use fgumi_raw_bam;
 
         let key = GroupKey::single(0, 100, 0, 0, 0, 12345);
         let raw = fgumi_raw_bam::make_bam_bytes(
-            0,                                                            // tid
-            100,                                                          // pos
+            0,                                                                  // tid
+            100,                                                                // pos
             fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT, // flags
-            b"read1",                                                     // name
-            &[fgumi_raw_bam::encode_op(0, 4)],                               // 4M cigar
-            4,                                                            // seq_len
-            0,                                                            // mate_tid
-            200,                                                          // mate_pos
-            &[],                                                          // aux
+            b"read1",                                                           // name
+            &[fgumi_raw_bam::encode_op(0, 4)],                                  // 4M cigar
+            4,                                                                  // seq_len
+            0,                                                                  // mate_tid
+            200,                                                                // mate_pos
+            &[],                                                                // aux
         );
         let decoded = DecodedRecord::from_raw_bytes(raw, key);
 
@@ -1482,8 +1483,8 @@ mod tests {
 
     #[test]
     fn test_build_templates_from_raw_bytes_paired() {
-        use fgumi_raw_bam;
         use crate::unified_pipeline::{DecodedRecord, GroupKey};
+        use fgumi_raw_bam;
 
         let key1 = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 12345);
         let key2 = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 12345);

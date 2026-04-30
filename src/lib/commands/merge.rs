@@ -10,13 +10,13 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::logging::OperationTimer;
-use fgumi_sort::RawExternalSorter;
 use crate::validation::validate_file_exists;
 use anyhow::{Result, bail};
 use clap::Parser;
 #[cfg(test)]
 use fgumi_bam_io::create_bam_reader;
 use fgumi_bam_io::create_raw_bam_reader;
+use fgumi_sort::RawExternalSorter;
 use log::info;
 use noodles::sam::Header;
 

@@ -196,8 +196,9 @@ impl Template {
         if raw_records.len() == 2 {
             let f0 = RawRecordView::new(&raw_records[0]).flags();
             let f1 = RawRecordView::new(&raw_records[1]).flags();
-            let neither_sec_supp =
-                (f0 | f1) & (fgumi_raw_bam::flags::SECONDARY | fgumi_raw_bam::flags::SUPPLEMENTARY) == 0;
+            let neither_sec_supp = (f0 | f1)
+                & (fgumi_raw_bam::flags::SECONDARY | fgumi_raw_bam::flags::SUPPLEMENTARY)
+                == 0;
             if neither_sec_supp {
                 // Use same R1/R2 logic as general path: R1 = !paired || first_segment
                 let is_r1_0 = (f0 & fgumi_raw_bam::flags::PAIRED) == 0
@@ -381,7 +382,8 @@ impl Template {
         let f2 = RawRecordView::new(r2).flags();
 
         // Both must be mapped
-        if (f1 & fgumi_raw_bam::flags::UNMAPPED) != 0 || (f2 & fgumi_raw_bam::flags::UNMAPPED) != 0 {
+        if (f1 & fgumi_raw_bam::flags::UNMAPPED) != 0 || (f2 & fgumi_raw_bam::flags::UNMAPPED) != 0
+        {
             return None;
         }
 
@@ -425,8 +427,10 @@ impl Template {
                 (RawRecordView::new(&rr[r2_i]).flags() & fgumi_raw_bam::flags::UNMAPPED) != 0;
 
             // Get alignment scores for mate score tags
-            let r1_as = fgumi_raw_bam::find_int_tag(fgumi_raw_bam::aux_data_slice(&rr[r1_i]), SamTag::AS);
-            let r2_as = fgumi_raw_bam::find_int_tag(fgumi_raw_bam::aux_data_slice(&rr[r2_i]), SamTag::AS);
+            let r1_as =
+                fgumi_raw_bam::find_int_tag(fgumi_raw_bam::aux_data_slice(&rr[r1_i]), SamTag::AS);
+            let r2_as =
+                fgumi_raw_bam::find_int_tag(fgumi_raw_bam::aux_data_slice(&rr[r2_i]), SamTag::AS);
 
             if !r1_is_unmapped && !r2_is_unmapped {
                 // Case 1: Both mapped
@@ -466,7 +470,8 @@ impl Template {
             let r2_tlen = fgumi_raw_bam::template_length(&rr[r2_i]);
             let r2_mapq = fgumi_raw_bam::mapq(&rr[r2_i]);
             let r2_cigar_str = fgumi_raw_bam::cigar_to_string_from_raw(&rr[r2_i]);
-            let r2_as = fgumi_raw_bam::find_int_tag(fgumi_raw_bam::aux_data_slice(&rr[r2_i]), SamTag::AS);
+            let r2_as =
+                fgumi_raw_bam::find_int_tag(fgumi_raw_bam::aux_data_slice(&rr[r2_i]), SamTag::AS);
 
             if let Some((start, end)) = self.r1_supplementals {
                 let rr = &mut self.records;
@@ -510,7 +515,8 @@ impl Template {
             let r1_tlen = fgumi_raw_bam::template_length(&rr[r1_i]);
             let r1_mapq = fgumi_raw_bam::mapq(&rr[r1_i]);
             let r1_cigar_str = fgumi_raw_bam::cigar_to_string_from_raw(&rr[r1_i]);
-            let r1_as = fgumi_raw_bam::find_int_tag(fgumi_raw_bam::aux_data_slice(&rr[r1_i]), SamTag::AS);
+            let r1_as =
+                fgumi_raw_bam::find_int_tag(fgumi_raw_bam::aux_data_slice(&rr[r1_i]), SamTag::AS);
 
             if let Some((start, end)) = self.r2_supplementals {
                 let rr = &mut self.records;

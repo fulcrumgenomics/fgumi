@@ -425,7 +425,7 @@ fn compare_u64_hash(a: &[u8], b: &[u8]) -> Ordering {
 /// Compare with common prefix stripped (caller pre-computes `prefix_len`).
 #[inline]
 fn natural_compare_prefix_stripped(a: &[u8], b: &[u8], prefix_len: usize) -> Ordering {
-    fgumi_lib::sort::natural_compare(&a[prefix_len..], &b[prefix_len..])
+    fgumi_sort::natural_compare(&a[prefix_len..], &b[prefix_len..])
 }
 
 /// Compute digit-safe common prefix length: back up to the last non-digit byte
@@ -456,7 +456,7 @@ fn digit_safe_prefix_len(names: &[Vec<u8>]) -> usize {
 /// Sort with digit-safe common prefix stripping + natural_compare.
 fn sort_natural_digit_safe_prefix(indices: &mut [usize], raw: &[Vec<u8>], safe_prefix: usize) {
     indices.sort_by(|&a, &b| {
-        fgumi_lib::sort::natural_compare(&raw[a][safe_prefix..], &raw[b][safe_prefix..])
+        fgumi_sort::natural_compare(&raw[a][safe_prefix..], &raw[b][safe_prefix..])
     });
 }
 
@@ -523,7 +523,7 @@ fn compare_strnum_samtools_prealloc(a: &[u8], b: &[u8]) -> Ordering {
 #[inline]
 fn compare_natural_nul_prealloc(a: &[u8], b: &[u8]) -> Ordering {
     // Assumes a and b are already null-terminated.
-    unsafe { fgumi_lib::sort::keys::natural_compare_nul(a.as_ptr(), b.as_ptr()) }
+    unsafe { fgumi_sort::keys::natural_compare_nul(a.as_ptr(), b.as_ptr()) }
 }
 
 /// Parse colon-delimited Illumina fields and compare as integers.
@@ -633,7 +633,7 @@ fn compare_normalized_prefix_with_fallback(
     a_norm_prefix: u64,
     b_norm_prefix: u64,
 ) -> Ordering {
-    a_norm_prefix.cmp(&b_norm_prefix).then_with(|| fgumi_lib::sort::natural_compare(a, b))
+    a_norm_prefix.cmp(&b_norm_prefix).then_with(|| fgumi_sort::natural_compare(a, b))
 }
 
 /// Pre-compute normalized key prefixes for benchmark pairs.
@@ -643,8 +643,8 @@ fn precompute_normalized_prefixes(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<(u64, u64
         .map(|(a, b)| {
             let mut norm_a = Vec::with_capacity(a.len() + 8);
             let mut norm_b = Vec::with_capacity(b.len() + 8);
-            fgumi_lib::sort::normalize_natural_key(a, &mut norm_a);
-            fgumi_lib::sort::normalize_natural_key(b, &mut norm_b);
+            fgumi_sort::normalize_natural_key(a, &mut norm_a);
+            fgumi_sort::normalize_natural_key(b, &mut norm_b);
             let a_prefix = {
                 let mut buf = [0u8; 8];
                 let n = norm_a.len().min(8);
@@ -687,7 +687,7 @@ fn bench_queryname_comparators(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("natural_compare", style), &pairs, |b, pairs| {
             b.iter(|| {
                 for (a, b_name) in pairs {
-                    black_box(fgumi_lib::sort::natural_compare(a, b_name));
+                    black_box(fgumi_sort::natural_compare(a, b_name));
                 }
             });
         });
@@ -722,7 +722,7 @@ fn bench_queryname_comparators(c: &mut Criterion) {
                 b.iter(|| {
                     for (a, _) in pairs {
                         buf.clear();
-                        fgumi_lib::sort::normalize_natural_key(black_box(a), &mut buf);
+                        fgumi_sort::normalize_natural_key(black_box(a), &mut buf);
                         black_box(&buf);
                     }
                 });
@@ -991,7 +991,7 @@ fn msd_radix_recurse(indices: &mut [usize], raw: &[Vec<u8>], depth: usize) {
 /// falls back to `natural_compare` when prefixes match.
 fn sort_natural_with_norm_prefix(entries: &mut [(u64, usize)], raw: &[Vec<u8>]) {
     entries.sort_by(|a, b| {
-        a.0.cmp(&b.0).then_with(|| fgumi_lib::sort::natural_compare(&raw[a.1], &raw[b.1]))
+        a.0.cmp(&b.0).then_with(|| fgumi_sort::natural_compare(&raw[a.1], &raw[b.1]))
     });
 }
 
@@ -1001,7 +1001,7 @@ fn precompute_norm_prefixes_for_sort(names: &[Vec<u8>]) -> Vec<u64> {
         .iter()
         .map(|n| {
             let mut buf = Vec::with_capacity(n.len() + 8);
-            fgumi_lib::sort::normalize_natural_key(n, &mut buf);
+            fgumi_sort::normalize_natural_key(n, &mut buf);
             name_prefix_u64(&buf)
         })
         .collect()
@@ -1010,20 +1010,20 @@ fn precompute_norm_prefixes_for_sort(names: &[Vec<u8>]) -> Vec<u64> {
 /// (g) Natural sort, no prefix — pure `natural_compare` on every comparison.
 /// This is what samtools effectively does.
 fn sort_natural_no_prefix(indices: &mut [usize], raw: &[Vec<u8>]) {
-    indices.sort_by(|&a, &b| fgumi_lib::sort::natural_compare(&raw[a], &raw[b]));
+    indices.sort_by(|&a, &b| fgumi_sort::natural_compare(&raw[a], &raw[b]));
 }
 
 /// (j) Natural sort with null-terminated pointer-walking comparator.
 fn sort_natural_nul(indices: &mut [usize], raw_nul: &[Vec<u8>]) {
     indices.sort_by(|&a, &b| unsafe {
-        fgumi_lib::sort::keys::natural_compare_nul(raw_nul[a].as_ptr(), raw_nul[b].as_ptr())
+        fgumi_sort::keys::natural_compare_nul(raw_nul[a].as_ptr(), raw_nul[b].as_ptr())
     });
 }
 
 /// (k) Natural sort with null-terminated comparator + digit-safe prefix stripping.
 fn sort_natural_nul_digit_safe(indices: &mut [usize], raw_nul: &[Vec<u8>], safe_prefix: usize) {
     indices.sort_by(|&a, &b| unsafe {
-        fgumi_lib::sort::keys::natural_compare_nul(
+        fgumi_sort::keys::natural_compare_nul(
             raw_nul[a].as_ptr().add(safe_prefix),
             raw_nul[b].as_ptr().add(safe_prefix),
         )

@@ -23,7 +23,6 @@ use crate::logging::OperationTimer;
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::read_info::LibraryIndex;
 use crate::reference::ReferenceReader;
-use fgumi_raw_bam;
 use crate::tag_reversal::reverse_per_base_tags_raw;
 use crate::template::TemplateBatch;
 use crate::unified_pipeline::{
@@ -35,6 +34,7 @@ use ahash::AHashMap;
 use anyhow::{Result, bail};
 use clap::Parser;
 use fgumi_bam_io::create_bam_reader_for_pipeline_with_opts;
+use fgumi_raw_bam;
 use fgumi_raw_bam::{RawRecord, RawRecordView};
 use log::info;
 use noodles::sam::Header;

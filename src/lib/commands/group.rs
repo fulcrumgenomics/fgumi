@@ -148,7 +148,8 @@ fn filter_template_raw(
             return false;
         }
 
-        if (flg & fgumi_raw_bam::flags::UNMAPPED) == 0 && fgumi_raw_bam::mapq(raw) < config.min_mapq {
+        if (flg & fgumi_raw_bam::flags::UNMAPPED) == 0 && fgumi_raw_bam::mapq(raw) < config.min_mapq
+        {
             metrics.discarded_poor_alignment += num_primary_reads;
             return false;
         }
@@ -5353,8 +5354,7 @@ mod tests {
     fn test_group_filter_template_raw_rejects_unmapped() {
         let raw = make_raw_bam_for_group(
             b"rea",
-            fgumi_raw_bam::flags::UNMAPPED
-                | fgumi_raw_bam::flags::MATE_UNMAPPED,
+            fgumi_raw_bam::flags::UNMAPPED | fgumi_raw_bam::flags::MATE_UNMAPPED,
             0,
             b"ACGT",
         );

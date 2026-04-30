@@ -22,12 +22,12 @@
 
 use crate::logging::OperationTimer;
 use crate::sam::SamTag;
-use fgumi_sort::{QuerynameComparator, RawExternalSorter, SortOrder};
 use crate::validation::validate_file_exists;
 use anyhow::{Result, bail};
 use bytesize::ByteSize;
 use clap::Parser;
 use fgumi_bam_io::create_raw_bam_reader;
+use fgumi_sort::{QuerynameComparator, RawExternalSorter, SortOrder};
 
 use log::info;
 use std::path::PathBuf;

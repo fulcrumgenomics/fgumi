@@ -52,7 +52,6 @@ use crate::commands::common::{CompressionOptions, parse_bool};
 use crate::logging::OperationTimer;
 use crate::reference::{ReferenceReader, find_dict_path};
 use crate::sam::{SamTag, TemplateCoordinateInfo, check_sort};
-use fgumi_raw_bam;
 use crate::template::{Template, TemplateIterator};
 use crate::umi::TagInfo;
 use crate::validation::validate_file_exists;
@@ -61,6 +60,7 @@ use bstr::ByteSlice;
 use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::{RawBamReaderAuto, create_raw_bam_reader, create_raw_bam_writer, is_stdin_path};
+use fgumi_raw_bam;
 use fgumi_raw_bam::{BAM_BASE_TO_ASCII, RawRecord, RawRecordView, RecordBufEncoder};
 use log::{debug, info, warn};
 use noodles::core::Position;
@@ -322,7 +322,9 @@ fn add_template_coordinate_tags_raw(mapped: &mut Template) {
 
     for record in mapped.records.iter_mut() {
         let f = RawRecordView::new(record.as_ref()).flags();
-        if (f & fgumi_raw_bam::flags::SECONDARY) != 0 || (f & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0 {
+        if (f & fgumi_raw_bam::flags::SECONDARY) != 0
+            || (f & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0
+        {
             fgumi_raw_bam::remove_tag(record.as_mut_vec(), tc_tag);
             fgumi_raw_bam::append_i32_array_tag(record.as_mut_vec(), tc_tag, &tc_values);
         }

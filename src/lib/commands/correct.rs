@@ -48,7 +48,6 @@ use crate::logging::OperationTimer;
 use crate::metrics::correct::UmiCorrectionMetrics;
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::sam::{SamTag, header_as_unsorted};
-use fgumi_raw_bam;
 use crate::template::TemplateBatch;
 use crate::unified_pipeline::{Grouper, MemoryEstimate, run_bam_pipeline_from_reader};
 use crate::validation::validate_file_exists;
@@ -60,6 +59,7 @@ use fgumi_bam_io::{
     BamWriter, RawBamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
     create_optional_bam_writer, create_raw_bam_reader_with_opts, create_raw_bam_writer,
 };
+use fgumi_raw_bam;
 use fgumi_raw_bam::RawRecord;
 use log::{info, warn};
 use lru::LruCache;
@@ -704,7 +704,11 @@ impl CorrectUmis {
         if correction.needs_correction {
             // Write corrected UMI first (in-place update avoids scanning past OX)
             if let Some(ref corrected) = correction.corrected_umi {
-                fgumi_raw_bam::update_string_tag(record.as_mut_vec(), umi_tag, corrected.as_bytes());
+                fgumi_raw_bam::update_string_tag(
+                    record.as_mut_vec(),
+                    umi_tag,
+                    corrected.as_bytes(),
+                );
             }
 
             // Store original UMI if there were actual mismatches
@@ -3247,9 +3251,7 @@ mod tests {
         let mut raw_bytes = vec![0u8; 42]; // minimal record
         raw_bytes[8] = 4; // l_read_name
         raw_bytes[14..16].copy_from_slice(
-            &(fgumi_raw_bam::flags::PAIRED
-                | fgumi_raw_bam::flags::FIRST_SEGMENT)
-                .to_le_bytes(),
+            &(fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT).to_le_bytes(),
         );
         raw_bytes[16..20].copy_from_slice(&4u32.to_le_bytes()); // l_seq = 4
         raw_bytes[32..36].copy_from_slice(b"rea\0");
