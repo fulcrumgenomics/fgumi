@@ -43,7 +43,7 @@ pub mod external;
 pub mod inline;
 pub mod keys;
 pub(crate) mod loser_tree;
-pub mod memory_probe;
+pub(crate) mod memory_probe;
 pub mod pipeline;
 pub(crate) mod pooled_bam_writer;
 pub(crate) mod pooled_chunk_writer;
@@ -54,6 +54,14 @@ pub(crate) mod segmented_buf;
 pub(crate) mod tmp_dir_alloc;
 pub mod verify;
 pub(crate) mod worker_pool;
+
+/// Print mimalloc allocator statistics to stderr.
+///
+/// This is a thin re-export of the internal FFI call, exposed for the main
+/// `fgumi` crate's memory-debug monitor loop. Only available when the
+/// `memory-debug` feature is enabled.
+#[cfg(feature = "memory-debug")]
+pub use memory_probe::print_mi_stats;
 
 /// Buffer size for `BufReader` during merge phase.
 const MERGE_BUFFER_SIZE: usize = 64 * 1024;

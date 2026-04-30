@@ -1,0 +1,1915 @@
+pub mod fgumi_sort
+pub use fgumi_sort::natural_compare
+pub mod fgumi_sort::external
+pub struct fgumi_sort::external::GenericKeyedChunkReader<K: fgumi_sort::keys::RawSortKey + 'static>
+impl<K: fgumi_sort::keys::RawSortKey + 'static> fgumi_sort::external::GenericKeyedChunkReader<K>
+pub fn fgumi_sort::external::GenericKeyedChunkReader<K>::next_record(&mut self, buf: &mut alloc::vec::Vec<u8>) -> anyhow::Result<core::option::Option<K>>
+pub fn fgumi_sort::external::GenericKeyedChunkReader<K>::open(path: &std::path::Path, concurrency_limit: core::option::Option<alloc::sync::Arc<(crossbeam_channel::channel::Sender<()>, crossbeam_channel::channel::Receiver<()>)>>) -> anyhow::Result<Self>
+pub fn fgumi_sort::external::GenericKeyedChunkReader<K>::try_next_record(&mut self) -> core::option::Option<anyhow::Result<core::option::Option<(K, alloc::vec::Vec<u8>)>>>
+impl<K> core::marker::Freeze for fgumi_sort::external::GenericKeyedChunkReader<K>
+impl<K> core::marker::Send for fgumi_sort::external::GenericKeyedChunkReader<K>
+impl<K> core::marker::Sync for fgumi_sort::external::GenericKeyedChunkReader<K>
+impl<K> core::marker::Unpin for fgumi_sort::external::GenericKeyedChunkReader<K> where K: core::marker::Unpin
+impl<K> !core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::external::GenericKeyedChunkReader<K>
+impl<K> !core::panic::unwind_safe::UnwindSafe for fgumi_sort::external::GenericKeyedChunkReader<K>
+impl<T, U> core::convert::Into<U> for fgumi_sort::external::GenericKeyedChunkReader<K> where U: core::convert::From<T>
+pub fn fgumi_sort::external::GenericKeyedChunkReader<K>::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::external::GenericKeyedChunkReader<K> where U: core::convert::Into<T>
+pub type fgumi_sort::external::GenericKeyedChunkReader<K>::Error = core::convert::Infallible
+pub fn fgumi_sort::external::GenericKeyedChunkReader<K>::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::external::GenericKeyedChunkReader<K> where U: core::convert::TryFrom<T>
+pub type fgumi_sort::external::GenericKeyedChunkReader<K>::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::external::GenericKeyedChunkReader<K>::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> core::any::Any for fgumi_sort::external::GenericKeyedChunkReader<K> where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::external::GenericKeyedChunkReader<K>::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::external::GenericKeyedChunkReader<K> where T: ?core::marker::Sized
+pub fn fgumi_sort::external::GenericKeyedChunkReader<K>::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::external::GenericKeyedChunkReader<K> where T: ?core::marker::Sized
+pub fn fgumi_sort::external::GenericKeyedChunkReader<K>::borrow_mut(&mut self) -> &mut T
+impl<T> core::convert::From<T> for fgumi_sort::external::GenericKeyedChunkReader<K>
+pub fn fgumi_sort::external::GenericKeyedChunkReader<K>::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::external::GenericKeyedChunkReader<K>
+pub type fgumi_sort::external::GenericKeyedChunkReader<K>::Init = T
+pub const fgumi_sort::external::GenericKeyedChunkReader<K>::ALIGN: usize
+pub unsafe fn fgumi_sort::external::GenericKeyedChunkReader<K>::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::external::GenericKeyedChunkReader<K>::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::external::GenericKeyedChunkReader<K>::drop(ptr: usize)
+pub unsafe fn fgumi_sort::external::GenericKeyedChunkReader<K>::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::external::GenericKeyedChunkReader<K>
+pub struct fgumi_sort::external::GenericKeyedChunkWriter<K: fgumi_sort::keys::RawSortKey>
+impl<K: fgumi_sort::keys::RawSortKey> fgumi_sort::external::GenericKeyedChunkWriter<K>
+pub fn fgumi_sort::external::GenericKeyedChunkWriter<K>::create(path: &std::path::Path, compression_level: u32, threads: usize) -> anyhow::Result<Self>
+pub fn fgumi_sort::external::GenericKeyedChunkWriter<K>::finish(self) -> anyhow::Result<()>
+pub fn fgumi_sort::external::GenericKeyedChunkWriter<K>::write_record(&mut self, key: &K, record: &[u8]) -> anyhow::Result<()>
+impl<K> core::marker::Freeze for fgumi_sort::external::GenericKeyedChunkWriter<K>
+impl<K> core::marker::Send for fgumi_sort::external::GenericKeyedChunkWriter<K>
+impl<K> core::marker::Sync for fgumi_sort::external::GenericKeyedChunkWriter<K>
+impl<K> core::marker::Unpin for fgumi_sort::external::GenericKeyedChunkWriter<K> where K: core::marker::Unpin
+impl<K> !core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::external::GenericKeyedChunkWriter<K>
+impl<K> !core::panic::unwind_safe::UnwindSafe for fgumi_sort::external::GenericKeyedChunkWriter<K>
+impl<T, U> core::convert::Into<U> for fgumi_sort::external::GenericKeyedChunkWriter<K> where U: core::convert::From<T>
+pub fn fgumi_sort::external::GenericKeyedChunkWriter<K>::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::external::GenericKeyedChunkWriter<K> where U: core::convert::Into<T>
+pub type fgumi_sort::external::GenericKeyedChunkWriter<K>::Error = core::convert::Infallible
+pub fn fgumi_sort::external::GenericKeyedChunkWriter<K>::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::external::GenericKeyedChunkWriter<K> where U: core::convert::TryFrom<T>
+pub type fgumi_sort::external::GenericKeyedChunkWriter<K>::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::external::GenericKeyedChunkWriter<K>::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> core::any::Any for fgumi_sort::external::GenericKeyedChunkWriter<K> where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::external::GenericKeyedChunkWriter<K>::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::external::GenericKeyedChunkWriter<K> where T: ?core::marker::Sized
+pub fn fgumi_sort::external::GenericKeyedChunkWriter<K>::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::external::GenericKeyedChunkWriter<K> where T: ?core::marker::Sized
+pub fn fgumi_sort::external::GenericKeyedChunkWriter<K>::borrow_mut(&mut self) -> &mut T
+impl<T> core::convert::From<T> for fgumi_sort::external::GenericKeyedChunkWriter<K>
+pub fn fgumi_sort::external::GenericKeyedChunkWriter<K>::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::external::GenericKeyedChunkWriter<K>
+pub type fgumi_sort::external::GenericKeyedChunkWriter<K>::Init = T
+pub const fgumi_sort::external::GenericKeyedChunkWriter<K>::ALIGN: usize
+pub unsafe fn fgumi_sort::external::GenericKeyedChunkWriter<K>::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::external::GenericKeyedChunkWriter<K>::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::external::GenericKeyedChunkWriter<K>::drop(ptr: usize)
+pub unsafe fn fgumi_sort::external::GenericKeyedChunkWriter<K>::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::external::GenericKeyedChunkWriter<K>
+pub struct fgumi_sort::external::LibraryLookup
+impl fgumi_sort::external::LibraryLookup
+pub fn fgumi_sort::external::LibraryLookup::from_header(header: &noodles_sam::header::Header) -> Self
+pub fn fgumi_sort::external::LibraryLookup::hash_name(&self, name: &[u8]) -> u64
+pub fn fgumi_sort::external::LibraryLookup::ordinal_from_rg(&self, rg: core::option::Option<&[u8]>) -> u32
+impl core::marker::Freeze for fgumi_sort::external::LibraryLookup
+impl core::marker::Send for fgumi_sort::external::LibraryLookup
+impl core::marker::Sync for fgumi_sort::external::LibraryLookup
+impl core::marker::Unpin for fgumi_sort::external::LibraryLookup
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::external::LibraryLookup
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::external::LibraryLookup
+impl<T, U> core::convert::Into<U> for fgumi_sort::external::LibraryLookup where U: core::convert::From<T>
+pub fn fgumi_sort::external::LibraryLookup::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::external::LibraryLookup where U: core::convert::Into<T>
+pub type fgumi_sort::external::LibraryLookup::Error = core::convert::Infallible
+pub fn fgumi_sort::external::LibraryLookup::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::external::LibraryLookup where U: core::convert::TryFrom<T>
+pub type fgumi_sort::external::LibraryLookup::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::external::LibraryLookup::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> core::any::Any for fgumi_sort::external::LibraryLookup where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::external::LibraryLookup::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::external::LibraryLookup where T: ?core::marker::Sized
+pub fn fgumi_sort::external::LibraryLookup::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::external::LibraryLookup where T: ?core::marker::Sized
+pub fn fgumi_sort::external::LibraryLookup::borrow_mut(&mut self) -> &mut T
+impl<T> core::convert::From<T> for fgumi_sort::external::LibraryLookup
+pub fn fgumi_sort::external::LibraryLookup::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::external::LibraryLookup
+pub type fgumi_sort::external::LibraryLookup::Init = T
+pub const fgumi_sort::external::LibraryLookup::ALIGN: usize
+pub unsafe fn fgumi_sort::external::LibraryLookup::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::external::LibraryLookup::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::external::LibraryLookup::drop(ptr: usize)
+pub unsafe fn fgumi_sort::external::LibraryLookup::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::external::LibraryLookup
+pub struct fgumi_sort::external::RawExternalSorter
+impl fgumi_sort::external::RawExternalSorter
+pub fn fgumi_sort::external::RawExternalSorter::async_reader(self, enabled: bool) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::cell_tag(self, tag: fgumi_tag::tag::SamTag) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::initial_capacity(self, bytes: usize) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::max_temp_files(self, max: usize) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::memory_limit(self, limit: usize) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::merge_bams(&self, inputs: &[std::path::PathBuf], header: &noodles_sam::header::Header, output: &std::path::Path) -> anyhow::Result<u64>
+pub fn fgumi_sort::external::RawExternalSorter::new(sort_order: fgumi_sort::keys::SortOrder) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::output_compression(self, level: u32) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::pg_info(self, version: alloc::string::String, command_line: alloc::string::String) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::sort(&self, input: &std::path::Path, output: &std::path::Path) -> anyhow::Result<fgumi_sort::SortStats>
+pub fn fgumi_sort::external::RawExternalSorter::temp_compression(self, level: u32) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::temp_dir(self, path: std::path::PathBuf) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::temp_dirs(self, paths: alloc::vec::Vec<std::path::PathBuf>) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::threads(self, threads: usize) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::write_index(self, enabled: bool) -> Self
+impl core::marker::Freeze for fgumi_sort::external::RawExternalSorter
+impl core::marker::Send for fgumi_sort::external::RawExternalSorter
+impl core::marker::Sync for fgumi_sort::external::RawExternalSorter
+impl core::marker::Unpin for fgumi_sort::external::RawExternalSorter
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::external::RawExternalSorter
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::external::RawExternalSorter
+impl<T, U> core::convert::Into<U> for fgumi_sort::external::RawExternalSorter where U: core::convert::From<T>
+pub fn fgumi_sort::external::RawExternalSorter::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::external::RawExternalSorter where U: core::convert::Into<T>
+pub type fgumi_sort::external::RawExternalSorter::Error = core::convert::Infallible
+pub fn fgumi_sort::external::RawExternalSorter::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::external::RawExternalSorter where U: core::convert::TryFrom<T>
+pub type fgumi_sort::external::RawExternalSorter::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::external::RawExternalSorter::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> core::any::Any for fgumi_sort::external::RawExternalSorter where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::external::RawExternalSorter::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::external::RawExternalSorter where T: ?core::marker::Sized
+pub fn fgumi_sort::external::RawExternalSorter::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::external::RawExternalSorter where T: ?core::marker::Sized
+pub fn fgumi_sort::external::RawExternalSorter::borrow_mut(&mut self) -> &mut T
+impl<T> core::convert::From<T> for fgumi_sort::external::RawExternalSorter
+pub fn fgumi_sort::external::RawExternalSorter::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::external::RawExternalSorter
+pub type fgumi_sort::external::RawExternalSorter::Init = T
+pub const fgumi_sort::external::RawExternalSorter::ALIGN: usize
+pub unsafe fn fgumi_sort::external::RawExternalSorter::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::external::RawExternalSorter::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::external::RawExternalSorter::drop(ptr: usize)
+pub unsafe fn fgumi_sort::external::RawExternalSorter::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::external::RawExternalSorter
+pub struct fgumi_sort::external::RawSortStats
+pub fgumi_sort::external::RawSortStats::chunks_written: usize
+pub fgumi_sort::external::RawSortStats::output_records: u64
+pub fgumi_sort::external::RawSortStats::total_records: u64
+impl core::default::Default for fgumi_sort::SortStats
+pub fn fgumi_sort::SortStats::default() -> fgumi_sort::SortStats
+impl core::fmt::Debug for fgumi_sort::SortStats
+pub fn fgumi_sort::SortStats::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for fgumi_sort::SortStats
+impl core::marker::Send for fgumi_sort::SortStats
+impl core::marker::Sync for fgumi_sort::SortStats
+impl core::marker::Unpin for fgumi_sort::SortStats
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::SortStats
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::SortStats
+impl<T, U> core::convert::Into<U> for fgumi_sort::SortStats where U: core::convert::From<T>
+pub fn fgumi_sort::SortStats::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::SortStats where U: core::convert::Into<T>
+pub type fgumi_sort::SortStats::Error = core::convert::Infallible
+pub fn fgumi_sort::SortStats::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::SortStats where U: core::convert::TryFrom<T>
+pub type fgumi_sort::SortStats::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::SortStats::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> core::any::Any for fgumi_sort::SortStats where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::SortStats::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::SortStats where T: ?core::marker::Sized
+pub fn fgumi_sort::SortStats::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::SortStats where T: ?core::marker::Sized
+pub fn fgumi_sort::SortStats::borrow_mut(&mut self) -> &mut T
+impl<T> core::convert::From<T> for fgumi_sort::SortStats
+pub fn fgumi_sort::SortStats::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::SortStats
+pub type fgumi_sort::SortStats::Init = T
+pub const fgumi_sort::SortStats::ALIGN: usize
+pub unsafe fn fgumi_sort::SortStats::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::SortStats::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::SortStats::drop(ptr: usize)
+pub unsafe fn fgumi_sort::SortStats::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::SortStats
+pub fn fgumi_sort::external::cb_hasher() -> ahash::random_state::RandomState
+pub fn fgumi_sort::external::extract_template_key_inline(bam_bytes: &[u8], lib_lookup: &fgumi_sort::external::LibraryLookup, cell_tag: core::option::Option<fgumi_tag::tag::SamTag>, cb_hasher: &ahash::random_state::RandomState) -> fgumi_sort::inline::TemplateKey
+pub mod fgumi_sort::inline
+#[repr(transparent)] pub struct fgumi_sort::inline::PackedCoordinateKey(pub u64)
+impl fgumi_sort::inline::PackedCoordinateKey
+pub fn fgumi_sort::inline::PackedCoordinateKey::new(tid: i32, pos: i32, reverse: bool, _nref: u32) -> Self
+pub fn fgumi_sort::inline::PackedCoordinateKey::unmapped() -> Self
+impl core::clone::Clone for fgumi_sort::inline::PackedCoordinateKey
+pub fn fgumi_sort::inline::PackedCoordinateKey::clone(&self) -> fgumi_sort::inline::PackedCoordinateKey
+impl core::cmp::Eq for fgumi_sort::inline::PackedCoordinateKey
+impl core::cmp::Ord for fgumi_sort::inline::PackedCoordinateKey
+pub fn fgumi_sort::inline::PackedCoordinateKey::cmp(&self, other: &fgumi_sort::inline::PackedCoordinateKey) -> core::cmp::Ordering
+impl core::cmp::PartialEq for fgumi_sort::inline::PackedCoordinateKey
+pub fn fgumi_sort::inline::PackedCoordinateKey::eq(&self, other: &fgumi_sort::inline::PackedCoordinateKey) -> bool
+impl core::cmp::PartialOrd for fgumi_sort::inline::PackedCoordinateKey
+pub fn fgumi_sort::inline::PackedCoordinateKey::partial_cmp(&self, other: &fgumi_sort::inline::PackedCoordinateKey) -> core::option::Option<core::cmp::Ordering>
+impl core::fmt::Debug for fgumi_sort::inline::PackedCoordinateKey
+pub fn fgumi_sort::inline::PackedCoordinateKey::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for fgumi_sort::inline::PackedCoordinateKey
+impl core::marker::StructuralPartialEq for fgumi_sort::inline::PackedCoordinateKey
+impl core::marker::Freeze for fgumi_sort::inline::PackedCoordinateKey
+impl core::marker::Send for fgumi_sort::inline::PackedCoordinateKey
+impl core::marker::Sync for fgumi_sort::inline::PackedCoordinateKey
+impl core::marker::Unpin for fgumi_sort::inline::PackedCoordinateKey
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::inline::PackedCoordinateKey
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::inline::PackedCoordinateKey
+impl<Q, K> equivalent::Comparable<K> for fgumi_sort::inline::PackedCoordinateKey where Q: core::cmp::Ord + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::inline::PackedCoordinateKey::compare(&self, key: &K) -> core::cmp::Ordering
+impl<Q, K> equivalent::Equivalent<K> for fgumi_sort::inline::PackedCoordinateKey where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::inline::PackedCoordinateKey::equivalent(&self, key: &K) -> bool
+impl<Q, K> hashbrown::Equivalent<K> for fgumi_sort::inline::PackedCoordinateKey where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::inline::PackedCoordinateKey::equivalent(&self, key: &K) -> bool
+impl<T, U> core::convert::Into<U> for fgumi_sort::inline::PackedCoordinateKey where U: core::convert::From<T>
+pub fn fgumi_sort::inline::PackedCoordinateKey::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::inline::PackedCoordinateKey where U: core::convert::Into<T>
+pub type fgumi_sort::inline::PackedCoordinateKey::Error = core::convert::Infallible
+pub fn fgumi_sort::inline::PackedCoordinateKey::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::inline::PackedCoordinateKey where U: core::convert::TryFrom<T>
+pub type fgumi_sort::inline::PackedCoordinateKey::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::inline::PackedCoordinateKey::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for fgumi_sort::inline::PackedCoordinateKey where T: core::clone::Clone
+pub type fgumi_sort::inline::PackedCoordinateKey::Owned = T
+pub fn fgumi_sort::inline::PackedCoordinateKey::clone_into(&self, target: &mut T)
+pub fn fgumi_sort::inline::PackedCoordinateKey::to_owned(&self) -> T
+impl<T> core::any::Any for fgumi_sort::inline::PackedCoordinateKey where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::inline::PackedCoordinateKey::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::inline::PackedCoordinateKey where T: ?core::marker::Sized
+pub fn fgumi_sort::inline::PackedCoordinateKey::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::inline::PackedCoordinateKey where T: ?core::marker::Sized
+pub fn fgumi_sort::inline::PackedCoordinateKey::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for fgumi_sort::inline::PackedCoordinateKey where T: core::clone::Clone
+pub unsafe fn fgumi_sort::inline::PackedCoordinateKey::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for fgumi_sort::inline::PackedCoordinateKey
+pub fn fgumi_sort::inline::PackedCoordinateKey::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::inline::PackedCoordinateKey
+pub type fgumi_sort::inline::PackedCoordinateKey::Init = T
+pub const fgumi_sort::inline::PackedCoordinateKey::ALIGN: usize
+pub unsafe fn fgumi_sort::inline::PackedCoordinateKey::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::inline::PackedCoordinateKey::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::inline::PackedCoordinateKey::drop(ptr: usize)
+pub unsafe fn fgumi_sort::inline::PackedCoordinateKey::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::inline::PackedCoordinateKey
+pub struct fgumi_sort::inline::RecordBuffer
+impl fgumi_sort::inline::RecordBuffer
+pub fn fgumi_sort::inline::RecordBuffer::allocated_capacity(&self) -> usize
+pub fn fgumi_sort::inline::RecordBuffer::clear(&mut self)
+pub fn fgumi_sort::inline::RecordBuffer::get_record(&self, r: &fgumi_sort::inline::RecordRef) -> &[u8]
+pub fn fgumi_sort::inline::RecordBuffer::is_empty(&self) -> bool
+pub fn fgumi_sort::inline::RecordBuffer::iter_sorted(&self) -> impl core::iter::traits::iterator::Iterator<Item = &[u8]>
+pub fn fgumi_sort::inline::RecordBuffer::len(&self) -> usize
+pub fn fgumi_sort::inline::RecordBuffer::memory_usage(&self) -> usize
+pub fn fgumi_sort::inline::RecordBuffer::nref(&self) -> u32
+pub fn fgumi_sort::inline::RecordBuffer::num_segments(&self) -> usize
+pub fn fgumi_sort::inline::RecordBuffer::par_sort(&mut self)
+pub fn fgumi_sort::inline::RecordBuffer::par_sort_into_chunks(&mut self, threads: usize) -> alloc::vec::Vec<alloc::vec::Vec<(fgumi_sort::keys::RawCoordinateKey, fgumi_raw_bam::raw_bam_record::RawRecord)>>
+pub fn fgumi_sort::inline::RecordBuffer::push_coordinate(&mut self, record: &[u8]) -> anyhow::Result<()>
+pub fn fgumi_sort::inline::RecordBuffer::refs(&self) -> &[fgumi_sort::inline::RecordRef]
+pub fn fgumi_sort::inline::RecordBuffer::sort(&mut self)
+pub fn fgumi_sort::inline::RecordBuffer::with_capacity(estimated_records: usize, estimated_bytes: usize, nref: u32) -> Self
+impl fgumi_sort::inline::ProbeableBuffer for fgumi_sort::inline::RecordBuffer
+pub fn fgumi_sort::inline::RecordBuffer::allocated_capacity(&self) -> usize
+pub fn fgumi_sort::inline::RecordBuffer::is_empty(&self) -> bool
+pub fn fgumi_sort::inline::RecordBuffer::len(&self) -> usize
+pub fn fgumi_sort::inline::RecordBuffer::memory_usage(&self) -> usize
+pub fn fgumi_sort::inline::RecordBuffer::num_segments(&self) -> usize
+impl core::marker::Freeze for fgumi_sort::inline::RecordBuffer
+impl core::marker::Send for fgumi_sort::inline::RecordBuffer
+impl core::marker::Sync for fgumi_sort::inline::RecordBuffer
+impl core::marker::Unpin for fgumi_sort::inline::RecordBuffer
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::inline::RecordBuffer
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::inline::RecordBuffer
+impl<T, U> core::convert::Into<U> for fgumi_sort::inline::RecordBuffer where U: core::convert::From<T>
+pub fn fgumi_sort::inline::RecordBuffer::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::inline::RecordBuffer where U: core::convert::Into<T>
+pub type fgumi_sort::inline::RecordBuffer::Error = core::convert::Infallible
+pub fn fgumi_sort::inline::RecordBuffer::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::inline::RecordBuffer where U: core::convert::TryFrom<T>
+pub type fgumi_sort::inline::RecordBuffer::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::inline::RecordBuffer::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> core::any::Any for fgumi_sort::inline::RecordBuffer where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::inline::RecordBuffer::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::inline::RecordBuffer where T: ?core::marker::Sized
+pub fn fgumi_sort::inline::RecordBuffer::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::inline::RecordBuffer where T: ?core::marker::Sized
+pub fn fgumi_sort::inline::RecordBuffer::borrow_mut(&mut self) -> &mut T
+impl<T> core::convert::From<T> for fgumi_sort::inline::RecordBuffer
+pub fn fgumi_sort::inline::RecordBuffer::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::inline::RecordBuffer
+pub type fgumi_sort::inline::RecordBuffer::Init = T
+pub const fgumi_sort::inline::RecordBuffer::ALIGN: usize
+pub unsafe fn fgumi_sort::inline::RecordBuffer::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::inline::RecordBuffer::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::inline::RecordBuffer::drop(ptr: usize)
+pub unsafe fn fgumi_sort::inline::RecordBuffer::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::inline::RecordBuffer
+#[repr(C)] pub struct fgumi_sort::inline::RecordRef
+pub fgumi_sort::inline::RecordRef::len: u32
+pub fgumi_sort::inline::RecordRef::offset: u64
+pub fgumi_sort::inline::RecordRef::sort_key: u64
+impl core::clone::Clone for fgumi_sort::inline::RecordRef
+pub fn fgumi_sort::inline::RecordRef::clone(&self) -> fgumi_sort::inline::RecordRef
+impl core::cmp::Eq for fgumi_sort::inline::RecordRef
+impl core::cmp::Ord for fgumi_sort::inline::RecordRef
+pub fn fgumi_sort::inline::RecordRef::cmp(&self, other: &Self) -> core::cmp::Ordering
+impl core::cmp::PartialEq for fgumi_sort::inline::RecordRef
+pub fn fgumi_sort::inline::RecordRef::eq(&self, other: &Self) -> bool
+impl core::cmp::PartialOrd for fgumi_sort::inline::RecordRef
+pub fn fgumi_sort::inline::RecordRef::partial_cmp(&self, other: &Self) -> core::option::Option<core::cmp::Ordering>
+impl core::fmt::Debug for fgumi_sort::inline::RecordRef
+pub fn fgumi_sort::inline::RecordRef::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for fgumi_sort::inline::RecordRef
+impl core::marker::Freeze for fgumi_sort::inline::RecordRef
+impl core::marker::Send for fgumi_sort::inline::RecordRef
+impl core::marker::Sync for fgumi_sort::inline::RecordRef
+impl core::marker::Unpin for fgumi_sort::inline::RecordRef
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::inline::RecordRef
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::inline::RecordRef
+impl<Q, K> equivalent::Comparable<K> for fgumi_sort::inline::RecordRef where Q: core::cmp::Ord + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::inline::RecordRef::compare(&self, key: &K) -> core::cmp::Ordering
+impl<Q, K> equivalent::Equivalent<K> for fgumi_sort::inline::RecordRef where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::inline::RecordRef::equivalent(&self, key: &K) -> bool
+impl<Q, K> hashbrown::Equivalent<K> for fgumi_sort::inline::RecordRef where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::inline::RecordRef::equivalent(&self, key: &K) -> bool
+impl<T, U> core::convert::Into<U> for fgumi_sort::inline::RecordRef where U: core::convert::From<T>
+pub fn fgumi_sort::inline::RecordRef::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::inline::RecordRef where U: core::convert::Into<T>
+pub type fgumi_sort::inline::RecordRef::Error = core::convert::Infallible
+pub fn fgumi_sort::inline::RecordRef::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::inline::RecordRef where U: core::convert::TryFrom<T>
+pub type fgumi_sort::inline::RecordRef::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::inline::RecordRef::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for fgumi_sort::inline::RecordRef where T: core::clone::Clone
+pub type fgumi_sort::inline::RecordRef::Owned = T
+pub fn fgumi_sort::inline::RecordRef::clone_into(&self, target: &mut T)
+pub fn fgumi_sort::inline::RecordRef::to_owned(&self) -> T
+impl<T> core::any::Any for fgumi_sort::inline::RecordRef where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::inline::RecordRef::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::inline::RecordRef where T: ?core::marker::Sized
+pub fn fgumi_sort::inline::RecordRef::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::inline::RecordRef where T: ?core::marker::Sized
+pub fn fgumi_sort::inline::RecordRef::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for fgumi_sort::inline::RecordRef where T: core::clone::Clone
+pub unsafe fn fgumi_sort::inline::RecordRef::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for fgumi_sort::inline::RecordRef
+pub fn fgumi_sort::inline::RecordRef::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::inline::RecordRef
+pub type fgumi_sort::inline::RecordRef::Init = T
+pub const fgumi_sort::inline::RecordRef::ALIGN: usize
+pub unsafe fn fgumi_sort::inline::RecordRef::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::inline::RecordRef::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::inline::RecordRef::drop(ptr: usize)
+pub unsafe fn fgumi_sort::inline::RecordRef::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::inline::RecordRef
+#[repr(C)] pub struct fgumi_sort::inline::TemplateInlineHeader
+pub fgumi_sort::inline::TemplateInlineHeader::key: fgumi_sort::inline::TemplateKey
+pub fgumi_sort::inline::TemplateInlineHeader::padding: u32
+pub fgumi_sort::inline::TemplateInlineHeader::record_len: u32
+impl fgumi_sort::inline::TemplateInlineHeader
+pub fn fgumi_sort::inline::TemplateInlineHeader::read_from(data: &[u8]) -> Self
+pub fn fgumi_sort::inline::TemplateInlineHeader::to_bytes(&self) -> [u8; 48]
+impl core::clone::Clone for fgumi_sort::inline::TemplateInlineHeader
+pub fn fgumi_sort::inline::TemplateInlineHeader::clone(&self) -> fgumi_sort::inline::TemplateInlineHeader
+impl core::fmt::Debug for fgumi_sort::inline::TemplateInlineHeader
+pub fn fgumi_sort::inline::TemplateInlineHeader::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for fgumi_sort::inline::TemplateInlineHeader
+impl core::marker::Freeze for fgumi_sort::inline::TemplateInlineHeader
+impl core::marker::Send for fgumi_sort::inline::TemplateInlineHeader
+impl core::marker::Sync for fgumi_sort::inline::TemplateInlineHeader
+impl core::marker::Unpin for fgumi_sort::inline::TemplateInlineHeader
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::inline::TemplateInlineHeader
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::inline::TemplateInlineHeader
+impl<T, U> core::convert::Into<U> for fgumi_sort::inline::TemplateInlineHeader where U: core::convert::From<T>
+pub fn fgumi_sort::inline::TemplateInlineHeader::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::inline::TemplateInlineHeader where U: core::convert::Into<T>
+pub type fgumi_sort::inline::TemplateInlineHeader::Error = core::convert::Infallible
+pub fn fgumi_sort::inline::TemplateInlineHeader::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::inline::TemplateInlineHeader where U: core::convert::TryFrom<T>
+pub type fgumi_sort::inline::TemplateInlineHeader::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::inline::TemplateInlineHeader::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for fgumi_sort::inline::TemplateInlineHeader where T: core::clone::Clone
+pub type fgumi_sort::inline::TemplateInlineHeader::Owned = T
+pub fn fgumi_sort::inline::TemplateInlineHeader::clone_into(&self, target: &mut T)
+pub fn fgumi_sort::inline::TemplateInlineHeader::to_owned(&self) -> T
+impl<T> core::any::Any for fgumi_sort::inline::TemplateInlineHeader where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateInlineHeader::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::inline::TemplateInlineHeader where T: ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateInlineHeader::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::inline::TemplateInlineHeader where T: ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateInlineHeader::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for fgumi_sort::inline::TemplateInlineHeader where T: core::clone::Clone
+pub unsafe fn fgumi_sort::inline::TemplateInlineHeader::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for fgumi_sort::inline::TemplateInlineHeader
+pub fn fgumi_sort::inline::TemplateInlineHeader::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::inline::TemplateInlineHeader
+pub type fgumi_sort::inline::TemplateInlineHeader::Init = T
+pub const fgumi_sort::inline::TemplateInlineHeader::ALIGN: usize
+pub unsafe fn fgumi_sort::inline::TemplateInlineHeader::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::inline::TemplateInlineHeader::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::inline::TemplateInlineHeader::drop(ptr: usize)
+pub unsafe fn fgumi_sort::inline::TemplateInlineHeader::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::inline::TemplateInlineHeader
+#[repr(C)] pub struct fgumi_sort::inline::TemplateKey
+pub fgumi_sort::inline::TemplateKey::cb_hash: u64
+pub fgumi_sort::inline::TemplateKey::name_hash_upper: u64
+pub fgumi_sort::inline::TemplateKey::primary: u64
+pub fgumi_sort::inline::TemplateKey::secondary: u64
+pub fgumi_sort::inline::TemplateKey::tertiary: u64
+impl fgumi_sort::inline::TemplateKey
+pub fn fgumi_sort::inline::TemplateKey::core_cmp(&self, other: &Self) -> core::cmp::Ordering
+impl fgumi_sort::inline::TemplateKey
+pub fn fgumi_sort::inline::TemplateKey::from_bytes(buf: &[u8; 40]) -> Self
+pub fn fgumi_sort::inline::TemplateKey::to_bytes(&self) -> [u8; 40]
+impl fgumi_sort::inline::TemplateKey
+pub fn fgumi_sort::inline::TemplateKey::new(tid1: i32, pos1: i32, neg1: bool, tid2: i32, pos2: i32, neg2: bool, cb_hash: u64, library: u32, mi: (u64, bool), name_hash: u64, is_upper: bool) -> Self
+pub fn fgumi_sort::inline::TemplateKey::unmapped(name_hash: u64, cb_hash: u64, is_read2: bool) -> Self
+pub fn fgumi_sort::inline::TemplateKey::zeroed() -> Self
+impl bytemuck::pod::Pod for fgumi_sort::inline::TemplateKey
+impl bytemuck::zeroable::Zeroable for fgumi_sort::inline::TemplateKey
+impl core::clone::Clone for fgumi_sort::inline::TemplateKey
+pub fn fgumi_sort::inline::TemplateKey::clone(&self) -> fgumi_sort::inline::TemplateKey
+impl core::cmp::Eq for fgumi_sort::inline::TemplateKey
+impl core::cmp::Ord for fgumi_sort::inline::TemplateKey
+pub fn fgumi_sort::inline::TemplateKey::cmp(&self, other: &Self) -> core::cmp::Ordering
+impl core::cmp::PartialEq for fgumi_sort::inline::TemplateKey
+pub fn fgumi_sort::inline::TemplateKey::eq(&self, other: &fgumi_sort::inline::TemplateKey) -> bool
+impl core::cmp::PartialOrd for fgumi_sort::inline::TemplateKey
+pub fn fgumi_sort::inline::TemplateKey::partial_cmp(&self, other: &Self) -> core::option::Option<core::cmp::Ordering>
+impl core::default::Default for fgumi_sort::inline::TemplateKey
+pub fn fgumi_sort::inline::TemplateKey::default() -> Self
+impl core::fmt::Debug for fgumi_sort::inline::TemplateKey
+pub fn fgumi_sort::inline::TemplateKey::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for fgumi_sort::inline::TemplateKey
+impl core::marker::StructuralPartialEq for fgumi_sort::inline::TemplateKey
+impl fgumi_sort::keys::RawSortKey for fgumi_sort::inline::TemplateKey
+pub const fgumi_sort::inline::TemplateKey::EMBEDDED_IN_RECORD: bool
+pub const fgumi_sort::inline::TemplateKey::SERIALIZED_SIZE: core::option::Option<usize>
+pub fn fgumi_sort::inline::TemplateKey::extract(_bam: &[u8], _ctx: &fgumi_sort::keys::SortContext) -> Self
+pub fn fgumi_sort::inline::TemplateKey::extract_from_record(_bam: &[u8]) -> Self
+pub fn fgumi_sort::inline::TemplateKey::read_from<R: std::io::Read>(reader: &mut R) -> std::io::error::Result<Self>
+pub fn fgumi_sort::inline::TemplateKey::write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::error::Result<()>
+impl core::marker::Freeze for fgumi_sort::inline::TemplateKey
+impl core::marker::Send for fgumi_sort::inline::TemplateKey
+impl core::marker::Sync for fgumi_sort::inline::TemplateKey
+impl core::marker::Unpin for fgumi_sort::inline::TemplateKey
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::inline::TemplateKey
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::inline::TemplateKey
+impl<Q, K> equivalent::Comparable<K> for fgumi_sort::inline::TemplateKey where Q: core::cmp::Ord + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateKey::compare(&self, key: &K) -> core::cmp::Ordering
+impl<Q, K> equivalent::Equivalent<K> for fgumi_sort::inline::TemplateKey where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateKey::equivalent(&self, key: &K) -> bool
+impl<Q, K> hashbrown::Equivalent<K> for fgumi_sort::inline::TemplateKey where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateKey::equivalent(&self, key: &K) -> bool
+impl<T, U> core::convert::Into<U> for fgumi_sort::inline::TemplateKey where U: core::convert::From<T>
+pub fn fgumi_sort::inline::TemplateKey::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::inline::TemplateKey where U: core::convert::Into<T>
+pub type fgumi_sort::inline::TemplateKey::Error = core::convert::Infallible
+pub fn fgumi_sort::inline::TemplateKey::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::inline::TemplateKey where U: core::convert::TryFrom<T>
+pub type fgumi_sort::inline::TemplateKey::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::inline::TemplateKey::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for fgumi_sort::inline::TemplateKey where T: core::clone::Clone
+pub type fgumi_sort::inline::TemplateKey::Owned = T
+pub fn fgumi_sort::inline::TemplateKey::clone_into(&self, target: &mut T)
+pub fn fgumi_sort::inline::TemplateKey::to_owned(&self) -> T
+impl<T> bytemuck::anybitpattern::AnyBitPattern for fgumi_sort::inline::TemplateKey where T: bytemuck::pod::Pod
+impl<T> bytemuck::checked::CheckedBitPattern for fgumi_sort::inline::TemplateKey where T: bytemuck::anybitpattern::AnyBitPattern
+pub type fgumi_sort::inline::TemplateKey::Bits = T
+pub fn fgumi_sort::inline::TemplateKey::is_valid_bit_pattern(_bits: &T) -> bool
+impl<T> bytemuck::no_uninit::NoUninit for fgumi_sort::inline::TemplateKey where T: bytemuck::pod::Pod
+impl<T> core::any::Any for fgumi_sort::inline::TemplateKey where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateKey::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::inline::TemplateKey where T: ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateKey::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::inline::TemplateKey where T: ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateKey::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for fgumi_sort::inline::TemplateKey where T: core::clone::Clone
+pub unsafe fn fgumi_sort::inline::TemplateKey::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for fgumi_sort::inline::TemplateKey
+pub fn fgumi_sort::inline::TemplateKey::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::inline::TemplateKey
+pub type fgumi_sort::inline::TemplateKey::Init = T
+pub const fgumi_sort::inline::TemplateKey::ALIGN: usize
+pub unsafe fn fgumi_sort::inline::TemplateKey::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::inline::TemplateKey::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::inline::TemplateKey::drop(ptr: usize)
+pub unsafe fn fgumi_sort::inline::TemplateKey::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::inline::TemplateKey
+pub struct fgumi_sort::inline::TemplateRecordBuffer
+impl fgumi_sort::inline::TemplateRecordBuffer
+pub fn fgumi_sort::inline::TemplateRecordBuffer::allocated_capacity(&self) -> usize
+pub fn fgumi_sort::inline::TemplateRecordBuffer::clear(&mut self)
+pub fn fgumi_sort::inline::TemplateRecordBuffer::get_key(&self, r: &fgumi_sort::inline::TemplateRecordRef) -> fgumi_sort::inline::TemplateKey
+pub fn fgumi_sort::inline::TemplateRecordBuffer::get_record(&self, r: &fgumi_sort::inline::TemplateRecordRef) -> &[u8]
+pub fn fgumi_sort::inline::TemplateRecordBuffer::is_empty(&self) -> bool
+pub fn fgumi_sort::inline::TemplateRecordBuffer::iter_sorted(&self) -> impl core::iter::traits::iterator::Iterator<Item = &[u8]>
+pub fn fgumi_sort::inline::TemplateRecordBuffer::iter_sorted_keyed(&self) -> impl core::iter::traits::iterator::Iterator<Item = (fgumi_sort::inline::TemplateKey, &[u8])>
+pub fn fgumi_sort::inline::TemplateRecordBuffer::len(&self) -> usize
+pub fn fgumi_sort::inline::TemplateRecordBuffer::memory_usage(&self) -> usize
+pub fn fgumi_sort::inline::TemplateRecordBuffer::num_segments(&self) -> usize
+pub fn fgumi_sort::inline::TemplateRecordBuffer::par_sort(&mut self)
+pub fn fgumi_sort::inline::TemplateRecordBuffer::par_sort_into_chunks(&mut self, threads: usize) -> alloc::vec::Vec<alloc::vec::Vec<(fgumi_sort::inline::TemplateKey, fgumi_raw_bam::raw_bam_record::RawRecord)>>
+pub fn fgumi_sort::inline::TemplateRecordBuffer::push(&mut self, record: &[u8], key: fgumi_sort::inline::TemplateKey) -> anyhow::Result<()>
+pub fn fgumi_sort::inline::TemplateRecordBuffer::refs(&self) -> &[fgumi_sort::inline::TemplateRecordRef]
+pub fn fgumi_sort::inline::TemplateRecordBuffer::sort(&mut self)
+pub fn fgumi_sort::inline::TemplateRecordBuffer::with_capacity(estimated_records: usize, estimated_bytes: usize) -> Self
+impl fgumi_sort::inline::ProbeableBuffer for fgumi_sort::inline::TemplateRecordBuffer
+pub fn fgumi_sort::inline::TemplateRecordBuffer::allocated_capacity(&self) -> usize
+pub fn fgumi_sort::inline::TemplateRecordBuffer::is_empty(&self) -> bool
+pub fn fgumi_sort::inline::TemplateRecordBuffer::len(&self) -> usize
+pub fn fgumi_sort::inline::TemplateRecordBuffer::memory_usage(&self) -> usize
+pub fn fgumi_sort::inline::TemplateRecordBuffer::num_segments(&self) -> usize
+impl core::marker::Freeze for fgumi_sort::inline::TemplateRecordBuffer
+impl core::marker::Send for fgumi_sort::inline::TemplateRecordBuffer
+impl core::marker::Sync for fgumi_sort::inline::TemplateRecordBuffer
+impl core::marker::Unpin for fgumi_sort::inline::TemplateRecordBuffer
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::inline::TemplateRecordBuffer
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::inline::TemplateRecordBuffer
+impl<T, U> core::convert::Into<U> for fgumi_sort::inline::TemplateRecordBuffer where U: core::convert::From<T>
+pub fn fgumi_sort::inline::TemplateRecordBuffer::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::inline::TemplateRecordBuffer where U: core::convert::Into<T>
+pub type fgumi_sort::inline::TemplateRecordBuffer::Error = core::convert::Infallible
+pub fn fgumi_sort::inline::TemplateRecordBuffer::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::inline::TemplateRecordBuffer where U: core::convert::TryFrom<T>
+pub type fgumi_sort::inline::TemplateRecordBuffer::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::inline::TemplateRecordBuffer::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> core::any::Any for fgumi_sort::inline::TemplateRecordBuffer where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateRecordBuffer::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::inline::TemplateRecordBuffer where T: ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateRecordBuffer::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::inline::TemplateRecordBuffer where T: ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateRecordBuffer::borrow_mut(&mut self) -> &mut T
+impl<T> core::convert::From<T> for fgumi_sort::inline::TemplateRecordBuffer
+pub fn fgumi_sort::inline::TemplateRecordBuffer::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::inline::TemplateRecordBuffer
+pub type fgumi_sort::inline::TemplateRecordBuffer::Init = T
+pub const fgumi_sort::inline::TemplateRecordBuffer::ALIGN: usize
+pub unsafe fn fgumi_sort::inline::TemplateRecordBuffer::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::inline::TemplateRecordBuffer::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::inline::TemplateRecordBuffer::drop(ptr: usize)
+pub unsafe fn fgumi_sort::inline::TemplateRecordBuffer::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::inline::TemplateRecordBuffer
+#[repr(C)] pub struct fgumi_sort::inline::TemplateRecordRef
+pub fgumi_sort::inline::TemplateRecordRef::key: fgumi_sort::inline::TemplateKey
+pub fgumi_sort::inline::TemplateRecordRef::len: u32
+pub fgumi_sort::inline::TemplateRecordRef::offset: u64
+pub fgumi_sort::inline::TemplateRecordRef::padding: u32
+impl core::clone::Clone for fgumi_sort::inline::TemplateRecordRef
+pub fn fgumi_sort::inline::TemplateRecordRef::clone(&self) -> fgumi_sort::inline::TemplateRecordRef
+impl core::cmp::Eq for fgumi_sort::inline::TemplateRecordRef
+impl core::cmp::Ord for fgumi_sort::inline::TemplateRecordRef
+pub fn fgumi_sort::inline::TemplateRecordRef::cmp(&self, other: &Self) -> core::cmp::Ordering
+impl core::cmp::PartialEq for fgumi_sort::inline::TemplateRecordRef
+pub fn fgumi_sort::inline::TemplateRecordRef::eq(&self, other: &Self) -> bool
+impl core::cmp::PartialOrd for fgumi_sort::inline::TemplateRecordRef
+pub fn fgumi_sort::inline::TemplateRecordRef::partial_cmp(&self, other: &Self) -> core::option::Option<core::cmp::Ordering>
+impl core::fmt::Debug for fgumi_sort::inline::TemplateRecordRef
+pub fn fgumi_sort::inline::TemplateRecordRef::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for fgumi_sort::inline::TemplateRecordRef
+impl core::marker::Freeze for fgumi_sort::inline::TemplateRecordRef
+impl core::marker::Send for fgumi_sort::inline::TemplateRecordRef
+impl core::marker::Sync for fgumi_sort::inline::TemplateRecordRef
+impl core::marker::Unpin for fgumi_sort::inline::TemplateRecordRef
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::inline::TemplateRecordRef
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::inline::TemplateRecordRef
+impl<Q, K> equivalent::Comparable<K> for fgumi_sort::inline::TemplateRecordRef where Q: core::cmp::Ord + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateRecordRef::compare(&self, key: &K) -> core::cmp::Ordering
+impl<Q, K> equivalent::Equivalent<K> for fgumi_sort::inline::TemplateRecordRef where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateRecordRef::equivalent(&self, key: &K) -> bool
+impl<Q, K> hashbrown::Equivalent<K> for fgumi_sort::inline::TemplateRecordRef where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateRecordRef::equivalent(&self, key: &K) -> bool
+impl<T, U> core::convert::Into<U> for fgumi_sort::inline::TemplateRecordRef where U: core::convert::From<T>
+pub fn fgumi_sort::inline::TemplateRecordRef::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::inline::TemplateRecordRef where U: core::convert::Into<T>
+pub type fgumi_sort::inline::TemplateRecordRef::Error = core::convert::Infallible
+pub fn fgumi_sort::inline::TemplateRecordRef::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::inline::TemplateRecordRef where U: core::convert::TryFrom<T>
+pub type fgumi_sort::inline::TemplateRecordRef::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::inline::TemplateRecordRef::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for fgumi_sort::inline::TemplateRecordRef where T: core::clone::Clone
+pub type fgumi_sort::inline::TemplateRecordRef::Owned = T
+pub fn fgumi_sort::inline::TemplateRecordRef::clone_into(&self, target: &mut T)
+pub fn fgumi_sort::inline::TemplateRecordRef::to_owned(&self) -> T
+impl<T> core::any::Any for fgumi_sort::inline::TemplateRecordRef where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateRecordRef::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::inline::TemplateRecordRef where T: ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateRecordRef::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::inline::TemplateRecordRef where T: ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateRecordRef::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for fgumi_sort::inline::TemplateRecordRef where T: core::clone::Clone
+pub unsafe fn fgumi_sort::inline::TemplateRecordRef::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for fgumi_sort::inline::TemplateRecordRef
+pub fn fgumi_sort::inline::TemplateRecordRef::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::inline::TemplateRecordRef
+pub type fgumi_sort::inline::TemplateRecordRef::Init = T
+pub const fgumi_sort::inline::TemplateRecordRef::ALIGN: usize
+pub unsafe fn fgumi_sort::inline::TemplateRecordRef::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::inline::TemplateRecordRef::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::inline::TemplateRecordRef::drop(ptr: usize)
+pub unsafe fn fgumi_sort::inline::TemplateRecordRef::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::inline::TemplateRecordRef
+pub const fgumi_sort::inline::TEMPLATE_HEADER_SIZE: usize
+pub trait fgumi_sort::inline::ProbeableBuffer
+pub fn fgumi_sort::inline::ProbeableBuffer::allocated_capacity(&self) -> usize
+pub fn fgumi_sort::inline::ProbeableBuffer::is_empty(&self) -> bool
+pub fn fgumi_sort::inline::ProbeableBuffer::len(&self) -> usize
+pub fn fgumi_sort::inline::ProbeableBuffer::memory_usage(&self) -> usize
+pub fn fgumi_sort::inline::ProbeableBuffer::num_segments(&self) -> usize
+impl fgumi_sort::inline::ProbeableBuffer for fgumi_sort::inline::RecordBuffer
+pub fn fgumi_sort::inline::RecordBuffer::allocated_capacity(&self) -> usize
+pub fn fgumi_sort::inline::RecordBuffer::is_empty(&self) -> bool
+pub fn fgumi_sort::inline::RecordBuffer::len(&self) -> usize
+pub fn fgumi_sort::inline::RecordBuffer::memory_usage(&self) -> usize
+pub fn fgumi_sort::inline::RecordBuffer::num_segments(&self) -> usize
+impl fgumi_sort::inline::ProbeableBuffer for fgumi_sort::inline::TemplateRecordBuffer
+pub fn fgumi_sort::inline::TemplateRecordBuffer::allocated_capacity(&self) -> usize
+pub fn fgumi_sort::inline::TemplateRecordBuffer::is_empty(&self) -> bool
+pub fn fgumi_sort::inline::TemplateRecordBuffer::len(&self) -> usize
+pub fn fgumi_sort::inline::TemplateRecordBuffer::memory_usage(&self) -> usize
+pub fn fgumi_sort::inline::TemplateRecordBuffer::num_segments(&self) -> usize
+pub fn fgumi_sort::inline::extract_coordinate_key_inline(bam: &[u8], nref: u32) -> u64
+pub fn fgumi_sort::inline::parallel_radix_sort_record_refs(refs: &mut [fgumi_sort::inline::RecordRef])
+pub fn fgumi_sort::inline::parallel_radix_sort_template_refs(refs: &mut [fgumi_sort::inline::TemplateRecordRef])
+pub fn fgumi_sort::inline::radix_sort_record_refs(refs: &mut [fgumi_sort::inline::RecordRef])
+pub fn fgumi_sort::inline::radix_sort_template_refs(refs: &mut [fgumi_sort::inline::TemplateRecordRef])
+pub mod fgumi_sort::keys
+pub use fgumi_sort::keys::natural_compare
+pub use fgumi_sort::keys::natural_compare_nul
+pub enum fgumi_sort::keys::QuerynameComparator
+pub fgumi_sort::keys::QuerynameComparator::Lexicographic
+pub fgumi_sort::keys::QuerynameComparator::Natural
+impl core::clone::Clone for fgumi_sort::keys::QuerynameComparator
+pub fn fgumi_sort::keys::QuerynameComparator::clone(&self) -> fgumi_sort::keys::QuerynameComparator
+impl core::cmp::Eq for fgumi_sort::keys::QuerynameComparator
+impl core::cmp::PartialEq for fgumi_sort::keys::QuerynameComparator
+pub fn fgumi_sort::keys::QuerynameComparator::eq(&self, other: &fgumi_sort::keys::QuerynameComparator) -> bool
+impl core::default::Default for fgumi_sort::keys::QuerynameComparator
+pub fn fgumi_sort::keys::QuerynameComparator::default() -> fgumi_sort::keys::QuerynameComparator
+impl core::fmt::Debug for fgumi_sort::keys::QuerynameComparator
+pub fn fgumi_sort::keys::QuerynameComparator::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for fgumi_sort::keys::QuerynameComparator
+pub fn fgumi_sort::keys::QuerynameComparator::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for fgumi_sort::keys::QuerynameComparator
+impl core::marker::StructuralPartialEq for fgumi_sort::keys::QuerynameComparator
+impl core::marker::Freeze for fgumi_sort::keys::QuerynameComparator
+impl core::marker::Send for fgumi_sort::keys::QuerynameComparator
+impl core::marker::Sync for fgumi_sort::keys::QuerynameComparator
+impl core::marker::Unpin for fgumi_sort::keys::QuerynameComparator
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::keys::QuerynameComparator
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::keys::QuerynameComparator
+impl<Q, K> equivalent::Equivalent<K> for fgumi_sort::keys::QuerynameComparator where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::QuerynameComparator::equivalent(&self, key: &K) -> bool
+impl<Q, K> hashbrown::Equivalent<K> for fgumi_sort::keys::QuerynameComparator where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::QuerynameComparator::equivalent(&self, key: &K) -> bool
+impl<T, U> core::convert::Into<U> for fgumi_sort::keys::QuerynameComparator where U: core::convert::From<T>
+pub fn fgumi_sort::keys::QuerynameComparator::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::keys::QuerynameComparator where U: core::convert::Into<T>
+pub type fgumi_sort::keys::QuerynameComparator::Error = core::convert::Infallible
+pub fn fgumi_sort::keys::QuerynameComparator::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::keys::QuerynameComparator where U: core::convert::TryFrom<T>
+pub type fgumi_sort::keys::QuerynameComparator::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::keys::QuerynameComparator::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for fgumi_sort::keys::QuerynameComparator where T: core::clone::Clone
+pub type fgumi_sort::keys::QuerynameComparator::Owned = T
+pub fn fgumi_sort::keys::QuerynameComparator::clone_into(&self, target: &mut T)
+pub fn fgumi_sort::keys::QuerynameComparator::to_owned(&self) -> T
+impl<T> alloc::string::ToString for fgumi_sort::keys::QuerynameComparator where T: core::fmt::Display + ?core::marker::Sized
+pub fn fgumi_sort::keys::QuerynameComparator::to_string(&self) -> alloc::string::String
+impl<T> core::any::Any for fgumi_sort::keys::QuerynameComparator where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::keys::QuerynameComparator::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::keys::QuerynameComparator where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::QuerynameComparator::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::keys::QuerynameComparator where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::QuerynameComparator::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for fgumi_sort::keys::QuerynameComparator where T: core::clone::Clone
+pub unsafe fn fgumi_sort::keys::QuerynameComparator::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for fgumi_sort::keys::QuerynameComparator
+pub fn fgumi_sort::keys::QuerynameComparator::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::keys::QuerynameComparator
+pub type fgumi_sort::keys::QuerynameComparator::Init = T
+pub const fgumi_sort::keys::QuerynameComparator::ALIGN: usize
+pub unsafe fn fgumi_sort::keys::QuerynameComparator::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::keys::QuerynameComparator::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::keys::QuerynameComparator::drop(ptr: usize)
+pub unsafe fn fgumi_sort::keys::QuerynameComparator::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::keys::QuerynameComparator
+pub enum fgumi_sort::keys::SortOrder
+pub fgumi_sort::keys::SortOrder::Coordinate
+pub fgumi_sort::keys::SortOrder::Queryname(fgumi_sort::keys::QuerynameComparator)
+pub fgumi_sort::keys::SortOrder::TemplateCoordinate
+impl fgumi_sort::keys::SortOrder
+pub fn fgumi_sort::keys::SortOrder::header_go_tag(&self) -> core::option::Option<&'static str>
+pub fn fgumi_sort::keys::SortOrder::header_so_tag(&self) -> &'static str
+pub fn fgumi_sort::keys::SortOrder::header_ss_tag(&self) -> core::option::Option<&'static str>
+pub fn fgumi_sort::keys::SortOrder::is_queryname(&self) -> bool
+pub fn fgumi_sort::keys::SortOrder::queryname_comparator(&self) -> core::option::Option<fgumi_sort::keys::QuerynameComparator>
+impl core::clone::Clone for fgumi_sort::keys::SortOrder
+pub fn fgumi_sort::keys::SortOrder::clone(&self) -> fgumi_sort::keys::SortOrder
+impl core::cmp::Eq for fgumi_sort::keys::SortOrder
+impl core::cmp::PartialEq for fgumi_sort::keys::SortOrder
+pub fn fgumi_sort::keys::SortOrder::eq(&self, other: &fgumi_sort::keys::SortOrder) -> bool
+impl core::fmt::Debug for fgumi_sort::keys::SortOrder
+pub fn fgumi_sort::keys::SortOrder::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for fgumi_sort::keys::SortOrder
+impl core::marker::StructuralPartialEq for fgumi_sort::keys::SortOrder
+impl core::marker::Freeze for fgumi_sort::keys::SortOrder
+impl core::marker::Send for fgumi_sort::keys::SortOrder
+impl core::marker::Sync for fgumi_sort::keys::SortOrder
+impl core::marker::Unpin for fgumi_sort::keys::SortOrder
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::keys::SortOrder
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::keys::SortOrder
+impl<Q, K> equivalent::Equivalent<K> for fgumi_sort::keys::SortOrder where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::SortOrder::equivalent(&self, key: &K) -> bool
+impl<Q, K> hashbrown::Equivalent<K> for fgumi_sort::keys::SortOrder where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::SortOrder::equivalent(&self, key: &K) -> bool
+impl<T, U> core::convert::Into<U> for fgumi_sort::keys::SortOrder where U: core::convert::From<T>
+pub fn fgumi_sort::keys::SortOrder::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::keys::SortOrder where U: core::convert::Into<T>
+pub type fgumi_sort::keys::SortOrder::Error = core::convert::Infallible
+pub fn fgumi_sort::keys::SortOrder::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::keys::SortOrder where U: core::convert::TryFrom<T>
+pub type fgumi_sort::keys::SortOrder::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::keys::SortOrder::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for fgumi_sort::keys::SortOrder where T: core::clone::Clone
+pub type fgumi_sort::keys::SortOrder::Owned = T
+pub fn fgumi_sort::keys::SortOrder::clone_into(&self, target: &mut T)
+pub fn fgumi_sort::keys::SortOrder::to_owned(&self) -> T
+impl<T> core::any::Any for fgumi_sort::keys::SortOrder where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::keys::SortOrder::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::keys::SortOrder where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::SortOrder::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::keys::SortOrder where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::SortOrder::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for fgumi_sort::keys::SortOrder where T: core::clone::Clone
+pub unsafe fn fgumi_sort::keys::SortOrder::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for fgumi_sort::keys::SortOrder
+pub fn fgumi_sort::keys::SortOrder::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::keys::SortOrder
+pub type fgumi_sort::keys::SortOrder::Init = T
+pub const fgumi_sort::keys::SortOrder::ALIGN: usize
+pub unsafe fn fgumi_sort::keys::SortOrder::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::keys::SortOrder::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::keys::SortOrder::drop(ptr: usize)
+pub unsafe fn fgumi_sort::keys::SortOrder::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::keys::SortOrder
+#[repr(C)] pub struct fgumi_sort::keys::RawCoordinateKey
+pub fgumi_sort::keys::RawCoordinateKey::sort_key: u64
+impl fgumi_sort::keys::RawCoordinateKey
+pub const fgumi_sort::keys::RawCoordinateKey::SIZE: usize
+pub fn fgumi_sort::keys::RawCoordinateKey::new(tid: i32, pos: i32, reverse: bool, nref: u32) -> Self
+pub fn fgumi_sort::keys::RawCoordinateKey::unmapped() -> Self
+pub fn fgumi_sort::keys::RawCoordinateKey::zeroed() -> Self
+impl bytemuck::pod::Pod for fgumi_sort::keys::RawCoordinateKey
+impl bytemuck::zeroable::Zeroable for fgumi_sort::keys::RawCoordinateKey
+impl core::clone::Clone for fgumi_sort::keys::RawCoordinateKey
+pub fn fgumi_sort::keys::RawCoordinateKey::clone(&self) -> fgumi_sort::keys::RawCoordinateKey
+impl core::cmp::Eq for fgumi_sort::keys::RawCoordinateKey
+impl core::cmp::Ord for fgumi_sort::keys::RawCoordinateKey
+pub fn fgumi_sort::keys::RawCoordinateKey::cmp(&self, other: &Self) -> core::cmp::Ordering
+impl core::cmp::PartialEq for fgumi_sort::keys::RawCoordinateKey
+pub fn fgumi_sort::keys::RawCoordinateKey::eq(&self, other: &fgumi_sort::keys::RawCoordinateKey) -> bool
+impl core::cmp::PartialOrd for fgumi_sort::keys::RawCoordinateKey
+pub fn fgumi_sort::keys::RawCoordinateKey::partial_cmp(&self, other: &Self) -> core::option::Option<core::cmp::Ordering>
+impl core::default::Default for fgumi_sort::keys::RawCoordinateKey
+pub fn fgumi_sort::keys::RawCoordinateKey::default() -> Self
+impl core::fmt::Debug for fgumi_sort::keys::RawCoordinateKey
+pub fn fgumi_sort::keys::RawCoordinateKey::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for fgumi_sort::keys::RawCoordinateKey
+impl core::marker::StructuralPartialEq for fgumi_sort::keys::RawCoordinateKey
+impl fgumi_sort::keys::RawSortKey for fgumi_sort::keys::RawCoordinateKey
+pub const fgumi_sort::keys::RawCoordinateKey::EMBEDDED_IN_RECORD: bool
+pub const fgumi_sort::keys::RawCoordinateKey::SERIALIZED_SIZE: core::option::Option<usize>
+pub fn fgumi_sort::keys::RawCoordinateKey::extract(bam: &[u8], ctx: &fgumi_sort::keys::SortContext) -> Self
+pub fn fgumi_sort::keys::RawCoordinateKey::extract_from_record(bam: &[u8]) -> Self
+pub fn fgumi_sort::keys::RawCoordinateKey::read_from<R: std::io::Read>(reader: &mut R) -> std::io::error::Result<Self>
+pub fn fgumi_sort::keys::RawCoordinateKey::write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::error::Result<()>
+impl core::marker::Freeze for fgumi_sort::keys::RawCoordinateKey
+impl core::marker::Send for fgumi_sort::keys::RawCoordinateKey
+impl core::marker::Sync for fgumi_sort::keys::RawCoordinateKey
+impl core::marker::Unpin for fgumi_sort::keys::RawCoordinateKey
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::keys::RawCoordinateKey
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::keys::RawCoordinateKey
+impl<Q, K> equivalent::Comparable<K> for fgumi_sort::keys::RawCoordinateKey where Q: core::cmp::Ord + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawCoordinateKey::compare(&self, key: &K) -> core::cmp::Ordering
+impl<Q, K> equivalent::Equivalent<K> for fgumi_sort::keys::RawCoordinateKey where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawCoordinateKey::equivalent(&self, key: &K) -> bool
+impl<Q, K> hashbrown::Equivalent<K> for fgumi_sort::keys::RawCoordinateKey where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawCoordinateKey::equivalent(&self, key: &K) -> bool
+impl<T, U> core::convert::Into<U> for fgumi_sort::keys::RawCoordinateKey where U: core::convert::From<T>
+pub fn fgumi_sort::keys::RawCoordinateKey::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::keys::RawCoordinateKey where U: core::convert::Into<T>
+pub type fgumi_sort::keys::RawCoordinateKey::Error = core::convert::Infallible
+pub fn fgumi_sort::keys::RawCoordinateKey::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::keys::RawCoordinateKey where U: core::convert::TryFrom<T>
+pub type fgumi_sort::keys::RawCoordinateKey::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::keys::RawCoordinateKey::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for fgumi_sort::keys::RawCoordinateKey where T: core::clone::Clone
+pub type fgumi_sort::keys::RawCoordinateKey::Owned = T
+pub fn fgumi_sort::keys::RawCoordinateKey::clone_into(&self, target: &mut T)
+pub fn fgumi_sort::keys::RawCoordinateKey::to_owned(&self) -> T
+impl<T> bytemuck::anybitpattern::AnyBitPattern for fgumi_sort::keys::RawCoordinateKey where T: bytemuck::pod::Pod
+impl<T> bytemuck::checked::CheckedBitPattern for fgumi_sort::keys::RawCoordinateKey where T: bytemuck::anybitpattern::AnyBitPattern
+pub type fgumi_sort::keys::RawCoordinateKey::Bits = T
+pub fn fgumi_sort::keys::RawCoordinateKey::is_valid_bit_pattern(_bits: &T) -> bool
+impl<T> bytemuck::no_uninit::NoUninit for fgumi_sort::keys::RawCoordinateKey where T: bytemuck::pod::Pod
+impl<T> core::any::Any for fgumi_sort::keys::RawCoordinateKey where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawCoordinateKey::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::keys::RawCoordinateKey where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::RawCoordinateKey::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::keys::RawCoordinateKey where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::RawCoordinateKey::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for fgumi_sort::keys::RawCoordinateKey where T: core::clone::Clone
+pub unsafe fn fgumi_sort::keys::RawCoordinateKey::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for fgumi_sort::keys::RawCoordinateKey
+pub fn fgumi_sort::keys::RawCoordinateKey::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::keys::RawCoordinateKey
+pub type fgumi_sort::keys::RawCoordinateKey::Init = T
+pub const fgumi_sort::keys::RawCoordinateKey::ALIGN: usize
+pub unsafe fn fgumi_sort::keys::RawCoordinateKey::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::keys::RawCoordinateKey::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::keys::RawCoordinateKey::drop(ptr: usize)
+pub unsafe fn fgumi_sort::keys::RawCoordinateKey::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::keys::RawCoordinateKey
+pub struct fgumi_sort::keys::RawQuerynameKey
+impl fgumi_sort::keys::RawQuerynameKey
+pub fn fgumi_sort::keys::RawQuerynameKey::name(&self) -> &[u8]
+pub fn fgumi_sort::keys::RawQuerynameKey::new(name: alloc::vec::Vec<u8>, flags: u16) -> Self
+impl core::clone::Clone for fgumi_sort::keys::RawQuerynameKey
+pub fn fgumi_sort::keys::RawQuerynameKey::clone(&self) -> fgumi_sort::keys::RawQuerynameKey
+impl core::cmp::Eq for fgumi_sort::keys::RawQuerynameKey
+impl core::cmp::Ord for fgumi_sort::keys::RawQuerynameKey
+pub fn fgumi_sort::keys::RawQuerynameKey::cmp(&self, other: &Self) -> core::cmp::Ordering
+impl core::cmp::PartialEq for fgumi_sort::keys::RawQuerynameKey
+pub fn fgumi_sort::keys::RawQuerynameKey::eq(&self, other: &Self) -> bool
+impl core::cmp::PartialOrd for fgumi_sort::keys::RawQuerynameKey
+pub fn fgumi_sort::keys::RawQuerynameKey::partial_cmp(&self, other: &Self) -> core::option::Option<core::cmp::Ordering>
+impl core::default::Default for fgumi_sort::keys::RawQuerynameKey
+pub fn fgumi_sort::keys::RawQuerynameKey::default() -> fgumi_sort::keys::RawQuerynameKey
+impl core::fmt::Debug for fgumi_sort::keys::RawQuerynameKey
+pub fn fgumi_sort::keys::RawQuerynameKey::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl fgumi_sort::keys::RawSortKey for fgumi_sort::keys::RawQuerynameKey
+pub const fgumi_sort::keys::RawQuerynameKey::EMBEDDED_IN_RECORD: bool
+pub const fgumi_sort::keys::RawQuerynameKey::SERIALIZED_SIZE: core::option::Option<usize>
+pub fn fgumi_sort::keys::RawQuerynameKey::extract(bam: &[u8], _ctx: &fgumi_sort::keys::SortContext) -> Self
+pub fn fgumi_sort::keys::RawQuerynameKey::extract_from_record(bam: &[u8]) -> Self
+pub fn fgumi_sort::keys::RawQuerynameKey::read_from<R: std::io::Read>(reader: &mut R) -> std::io::error::Result<Self>
+pub fn fgumi_sort::keys::RawQuerynameKey::write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::error::Result<()>
+impl core::marker::Freeze for fgumi_sort::keys::RawQuerynameKey
+impl core::marker::Send for fgumi_sort::keys::RawQuerynameKey
+impl core::marker::Sync for fgumi_sort::keys::RawQuerynameKey
+impl core::marker::Unpin for fgumi_sort::keys::RawQuerynameKey
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::keys::RawQuerynameKey
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::keys::RawQuerynameKey
+impl<Q, K> equivalent::Comparable<K> for fgumi_sort::keys::RawQuerynameKey where Q: core::cmp::Ord + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameKey::compare(&self, key: &K) -> core::cmp::Ordering
+impl<Q, K> equivalent::Equivalent<K> for fgumi_sort::keys::RawQuerynameKey where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameKey::equivalent(&self, key: &K) -> bool
+impl<Q, K> hashbrown::Equivalent<K> for fgumi_sort::keys::RawQuerynameKey where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameKey::equivalent(&self, key: &K) -> bool
+impl<T, U> core::convert::Into<U> for fgumi_sort::keys::RawQuerynameKey where U: core::convert::From<T>
+pub fn fgumi_sort::keys::RawQuerynameKey::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::keys::RawQuerynameKey where U: core::convert::Into<T>
+pub type fgumi_sort::keys::RawQuerynameKey::Error = core::convert::Infallible
+pub fn fgumi_sort::keys::RawQuerynameKey::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::keys::RawQuerynameKey where U: core::convert::TryFrom<T>
+pub type fgumi_sort::keys::RawQuerynameKey::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::keys::RawQuerynameKey::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for fgumi_sort::keys::RawQuerynameKey where T: core::clone::Clone
+pub type fgumi_sort::keys::RawQuerynameKey::Owned = T
+pub fn fgumi_sort::keys::RawQuerynameKey::clone_into(&self, target: &mut T)
+pub fn fgumi_sort::keys::RawQuerynameKey::to_owned(&self) -> T
+impl<T> core::any::Any for fgumi_sort::keys::RawQuerynameKey where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameKey::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::keys::RawQuerynameKey where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameKey::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::keys::RawQuerynameKey where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameKey::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for fgumi_sort::keys::RawQuerynameKey where T: core::clone::Clone
+pub unsafe fn fgumi_sort::keys::RawQuerynameKey::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for fgumi_sort::keys::RawQuerynameKey
+pub fn fgumi_sort::keys::RawQuerynameKey::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::keys::RawQuerynameKey
+pub type fgumi_sort::keys::RawQuerynameKey::Init = T
+pub const fgumi_sort::keys::RawQuerynameKey::ALIGN: usize
+pub unsafe fn fgumi_sort::keys::RawQuerynameKey::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::keys::RawQuerynameKey::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::keys::RawQuerynameKey::drop(ptr: usize)
+pub unsafe fn fgumi_sort::keys::RawQuerynameKey::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::keys::RawQuerynameKey
+pub struct fgumi_sort::keys::RawQuerynameLexKey
+impl fgumi_sort::keys::RawQuerynameLexKey
+pub fn fgumi_sort::keys::RawQuerynameLexKey::name(&self) -> &[u8]
+pub fn fgumi_sort::keys::RawQuerynameLexKey::new(name: alloc::vec::Vec<u8>, flags: u16) -> Self
+impl core::clone::Clone for fgumi_sort::keys::RawQuerynameLexKey
+pub fn fgumi_sort::keys::RawQuerynameLexKey::clone(&self) -> fgumi_sort::keys::RawQuerynameLexKey
+impl core::cmp::Eq for fgumi_sort::keys::RawQuerynameLexKey
+impl core::cmp::Ord for fgumi_sort::keys::RawQuerynameLexKey
+pub fn fgumi_sort::keys::RawQuerynameLexKey::cmp(&self, other: &Self) -> core::cmp::Ordering
+impl core::cmp::PartialEq for fgumi_sort::keys::RawQuerynameLexKey
+pub fn fgumi_sort::keys::RawQuerynameLexKey::eq(&self, other: &fgumi_sort::keys::RawQuerynameLexKey) -> bool
+impl core::cmp::PartialOrd for fgumi_sort::keys::RawQuerynameLexKey
+pub fn fgumi_sort::keys::RawQuerynameLexKey::partial_cmp(&self, other: &Self) -> core::option::Option<core::cmp::Ordering>
+impl core::default::Default for fgumi_sort::keys::RawQuerynameLexKey
+pub fn fgumi_sort::keys::RawQuerynameLexKey::default() -> fgumi_sort::keys::RawQuerynameLexKey
+impl core::fmt::Debug for fgumi_sort::keys::RawQuerynameLexKey
+pub fn fgumi_sort::keys::RawQuerynameLexKey::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for fgumi_sort::keys::RawQuerynameLexKey
+impl fgumi_sort::keys::RawSortKey for fgumi_sort::keys::RawQuerynameLexKey
+pub const fgumi_sort::keys::RawQuerynameLexKey::EMBEDDED_IN_RECORD: bool
+pub const fgumi_sort::keys::RawQuerynameLexKey::SERIALIZED_SIZE: core::option::Option<usize>
+pub fn fgumi_sort::keys::RawQuerynameLexKey::extract(bam: &[u8], _ctx: &fgumi_sort::keys::SortContext) -> Self
+pub fn fgumi_sort::keys::RawQuerynameLexKey::extract_from_record(bam: &[u8]) -> Self
+pub fn fgumi_sort::keys::RawQuerynameLexKey::read_from<R: std::io::Read>(reader: &mut R) -> std::io::error::Result<Self>
+pub fn fgumi_sort::keys::RawQuerynameLexKey::write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::error::Result<()>
+impl core::marker::Freeze for fgumi_sort::keys::RawQuerynameLexKey
+impl core::marker::Send for fgumi_sort::keys::RawQuerynameLexKey
+impl core::marker::Sync for fgumi_sort::keys::RawQuerynameLexKey
+impl core::marker::Unpin for fgumi_sort::keys::RawQuerynameLexKey
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::keys::RawQuerynameLexKey
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::keys::RawQuerynameLexKey
+impl<Q, K> equivalent::Comparable<K> for fgumi_sort::keys::RawQuerynameLexKey where Q: core::cmp::Ord + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameLexKey::compare(&self, key: &K) -> core::cmp::Ordering
+impl<Q, K> equivalent::Equivalent<K> for fgumi_sort::keys::RawQuerynameLexKey where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameLexKey::equivalent(&self, key: &K) -> bool
+impl<Q, K> hashbrown::Equivalent<K> for fgumi_sort::keys::RawQuerynameLexKey where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameLexKey::equivalent(&self, key: &K) -> bool
+impl<T, U> core::convert::Into<U> for fgumi_sort::keys::RawQuerynameLexKey where U: core::convert::From<T>
+pub fn fgumi_sort::keys::RawQuerynameLexKey::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::keys::RawQuerynameLexKey where U: core::convert::Into<T>
+pub type fgumi_sort::keys::RawQuerynameLexKey::Error = core::convert::Infallible
+pub fn fgumi_sort::keys::RawQuerynameLexKey::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::keys::RawQuerynameLexKey where U: core::convert::TryFrom<T>
+pub type fgumi_sort::keys::RawQuerynameLexKey::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::keys::RawQuerynameLexKey::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for fgumi_sort::keys::RawQuerynameLexKey where T: core::clone::Clone
+pub type fgumi_sort::keys::RawQuerynameLexKey::Owned = T
+pub fn fgumi_sort::keys::RawQuerynameLexKey::clone_into(&self, target: &mut T)
+pub fn fgumi_sort::keys::RawQuerynameLexKey::to_owned(&self) -> T
+impl<T> core::any::Any for fgumi_sort::keys::RawQuerynameLexKey where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameLexKey::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::keys::RawQuerynameLexKey where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameLexKey::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::keys::RawQuerynameLexKey where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameLexKey::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for fgumi_sort::keys::RawQuerynameLexKey where T: core::clone::Clone
+pub unsafe fn fgumi_sort::keys::RawQuerynameLexKey::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for fgumi_sort::keys::RawQuerynameLexKey
+pub fn fgumi_sort::keys::RawQuerynameLexKey::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::keys::RawQuerynameLexKey
+pub type fgumi_sort::keys::RawQuerynameLexKey::Init = T
+pub const fgumi_sort::keys::RawQuerynameLexKey::ALIGN: usize
+pub unsafe fn fgumi_sort::keys::RawQuerynameLexKey::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::keys::RawQuerynameLexKey::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::keys::RawQuerynameLexKey::drop(ptr: usize)
+pub unsafe fn fgumi_sort::keys::RawQuerynameLexKey::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::keys::RawQuerynameLexKey
+pub struct fgumi_sort::keys::SortContext
+pub fgumi_sort::keys::SortContext::nref: u32
+impl fgumi_sort::keys::SortContext
+pub fn fgumi_sort::keys::SortContext::from_header(header: &noodles_sam::header::Header) -> Self
+pub fn fgumi_sort::keys::SortContext::new(nref: u32) -> Self
+impl core::clone::Clone for fgumi_sort::keys::SortContext
+pub fn fgumi_sort::keys::SortContext::clone(&self) -> fgumi_sort::keys::SortContext
+impl core::marker::Freeze for fgumi_sort::keys::SortContext
+impl core::marker::Send for fgumi_sort::keys::SortContext
+impl core::marker::Sync for fgumi_sort::keys::SortContext
+impl core::marker::Unpin for fgumi_sort::keys::SortContext
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::keys::SortContext
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::keys::SortContext
+impl<T, U> core::convert::Into<U> for fgumi_sort::keys::SortContext where U: core::convert::From<T>
+pub fn fgumi_sort::keys::SortContext::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::keys::SortContext where U: core::convert::Into<T>
+pub type fgumi_sort::keys::SortContext::Error = core::convert::Infallible
+pub fn fgumi_sort::keys::SortContext::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::keys::SortContext where U: core::convert::TryFrom<T>
+pub type fgumi_sort::keys::SortContext::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::keys::SortContext::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for fgumi_sort::keys::SortContext where T: core::clone::Clone
+pub type fgumi_sort::keys::SortContext::Owned = T
+pub fn fgumi_sort::keys::SortContext::clone_into(&self, target: &mut T)
+pub fn fgumi_sort::keys::SortContext::to_owned(&self) -> T
+impl<T> core::any::Any for fgumi_sort::keys::SortContext where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::keys::SortContext::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::keys::SortContext where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::SortContext::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::keys::SortContext where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::SortContext::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for fgumi_sort::keys::SortContext where T: core::clone::Clone
+pub unsafe fn fgumi_sort::keys::SortContext::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for fgumi_sort::keys::SortContext
+pub fn fgumi_sort::keys::SortContext::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::keys::SortContext
+pub type fgumi_sort::keys::SortContext::Init = T
+pub const fgumi_sort::keys::SortContext::ALIGN: usize
+pub unsafe fn fgumi_sort::keys::SortContext::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::keys::SortContext::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::keys::SortContext::drop(ptr: usize)
+pub unsafe fn fgumi_sort::keys::SortContext::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::keys::SortContext
+pub trait fgumi_sort::keys::RawSortKey: core::cmp::Ord + core::clone::Clone + core::marker::Send + core::marker::Sync + core::marker::Sized
+pub const fgumi_sort::keys::RawSortKey::EMBEDDED_IN_RECORD: bool
+pub const fgumi_sort::keys::RawSortKey::SERIALIZED_SIZE: core::option::Option<usize>
+pub fn fgumi_sort::keys::RawSortKey::extract(bam: &[u8], ctx: &fgumi_sort::keys::SortContext) -> Self
+pub fn fgumi_sort::keys::RawSortKey::extract_from_record(_bam: &[u8]) -> Self
+pub fn fgumi_sort::keys::RawSortKey::read_from<R: std::io::Read>(reader: &mut R) -> std::io::error::Result<Self>
+pub fn fgumi_sort::keys::RawSortKey::write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::error::Result<()>
+impl fgumi_sort::keys::RawSortKey for fgumi_sort::inline::TemplateKey
+pub const fgumi_sort::inline::TemplateKey::EMBEDDED_IN_RECORD: bool
+pub const fgumi_sort::inline::TemplateKey::SERIALIZED_SIZE: core::option::Option<usize>
+pub fn fgumi_sort::inline::TemplateKey::extract(_bam: &[u8], _ctx: &fgumi_sort::keys::SortContext) -> Self
+pub fn fgumi_sort::inline::TemplateKey::extract_from_record(_bam: &[u8]) -> Self
+pub fn fgumi_sort::inline::TemplateKey::read_from<R: std::io::Read>(reader: &mut R) -> std::io::error::Result<Self>
+pub fn fgumi_sort::inline::TemplateKey::write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::error::Result<()>
+impl fgumi_sort::keys::RawSortKey for fgumi_sort::keys::RawCoordinateKey
+pub const fgumi_sort::keys::RawCoordinateKey::EMBEDDED_IN_RECORD: bool
+pub const fgumi_sort::keys::RawCoordinateKey::SERIALIZED_SIZE: core::option::Option<usize>
+pub fn fgumi_sort::keys::RawCoordinateKey::extract(bam: &[u8], ctx: &fgumi_sort::keys::SortContext) -> Self
+pub fn fgumi_sort::keys::RawCoordinateKey::extract_from_record(bam: &[u8]) -> Self
+pub fn fgumi_sort::keys::RawCoordinateKey::read_from<R: std::io::Read>(reader: &mut R) -> std::io::error::Result<Self>
+pub fn fgumi_sort::keys::RawCoordinateKey::write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::error::Result<()>
+impl fgumi_sort::keys::RawSortKey for fgumi_sort::keys::RawQuerynameKey
+pub const fgumi_sort::keys::RawQuerynameKey::EMBEDDED_IN_RECORD: bool
+pub const fgumi_sort::keys::RawQuerynameKey::SERIALIZED_SIZE: core::option::Option<usize>
+pub fn fgumi_sort::keys::RawQuerynameKey::extract(bam: &[u8], _ctx: &fgumi_sort::keys::SortContext) -> Self
+pub fn fgumi_sort::keys::RawQuerynameKey::extract_from_record(bam: &[u8]) -> Self
+pub fn fgumi_sort::keys::RawQuerynameKey::read_from<R: std::io::Read>(reader: &mut R) -> std::io::error::Result<Self>
+pub fn fgumi_sort::keys::RawQuerynameKey::write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::error::Result<()>
+impl fgumi_sort::keys::RawSortKey for fgumi_sort::keys::RawQuerynameLexKey
+pub const fgumi_sort::keys::RawQuerynameLexKey::EMBEDDED_IN_RECORD: bool
+pub const fgumi_sort::keys::RawQuerynameLexKey::SERIALIZED_SIZE: core::option::Option<usize>
+pub fn fgumi_sort::keys::RawQuerynameLexKey::extract(bam: &[u8], _ctx: &fgumi_sort::keys::SortContext) -> Self
+pub fn fgumi_sort::keys::RawQuerynameLexKey::extract_from_record(bam: &[u8]) -> Self
+pub fn fgumi_sort::keys::RawQuerynameLexKey::read_from<R: std::io::Read>(reader: &mut R) -> std::io::error::Result<Self>
+pub fn fgumi_sort::keys::RawQuerynameLexKey::write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::error::Result<()>
+pub fn fgumi_sort::keys::normalize_natural_key(name: &[u8], out: &mut alloc::vec::Vec<u8>)
+pub const fn fgumi_sort::keys::queryname_flag_order(flags: u16) -> u16
+pub mod fgumi_sort::pipeline
+pub struct fgumi_sort::pipeline::MergeEntry<K>
+pub fgumi_sort::pipeline::MergeEntry::chunk_idx: usize
+pub fgumi_sort::pipeline::MergeEntry::key: K
+pub fgumi_sort::pipeline::MergeEntry::record: fgumi_raw_bam::raw_bam_record::RawRecord
+impl<K: core::cmp::Eq> core::cmp::Eq for fgumi_sort::pipeline::MergeEntry<K>
+impl<K: core::cmp::Ord> core::cmp::Ord for fgumi_sort::pipeline::MergeEntry<K>
+pub fn fgumi_sort::pipeline::MergeEntry<K>::cmp(&self, other: &Self) -> core::cmp::Ordering
+impl<K: core::cmp::PartialEq> core::cmp::PartialEq for fgumi_sort::pipeline::MergeEntry<K>
+pub fn fgumi_sort::pipeline::MergeEntry<K>::eq(&self, other: &Self) -> bool
+impl<K: core::cmp::PartialOrd> core::cmp::PartialOrd for fgumi_sort::pipeline::MergeEntry<K>
+pub fn fgumi_sort::pipeline::MergeEntry<K>::partial_cmp(&self, other: &Self) -> core::option::Option<core::cmp::Ordering>
+impl<K> core::marker::Freeze for fgumi_sort::pipeline::MergeEntry<K> where K: core::marker::Freeze
+impl<K> core::marker::Send for fgumi_sort::pipeline::MergeEntry<K> where K: core::marker::Send
+impl<K> core::marker::Sync for fgumi_sort::pipeline::MergeEntry<K> where K: core::marker::Sync
+impl<K> core::marker::Unpin for fgumi_sort::pipeline::MergeEntry<K> where K: core::marker::Unpin
+impl<K> core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::pipeline::MergeEntry<K> where K: core::panic::unwind_safe::RefUnwindSafe
+impl<K> core::panic::unwind_safe::UnwindSafe for fgumi_sort::pipeline::MergeEntry<K> where K: core::panic::unwind_safe::UnwindSafe
+impl<Q, K> equivalent::Comparable<K> for fgumi_sort::pipeline::MergeEntry<K> where Q: core::cmp::Ord + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::pipeline::MergeEntry<K>::compare(&self, key: &K) -> core::cmp::Ordering
+impl<Q, K> equivalent::Equivalent<K> for fgumi_sort::pipeline::MergeEntry<K> where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::pipeline::MergeEntry<K>::equivalent(&self, key: &K) -> bool
+impl<Q, K> hashbrown::Equivalent<K> for fgumi_sort::pipeline::MergeEntry<K> where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::pipeline::MergeEntry<K>::equivalent(&self, key: &K) -> bool
+impl<T, U> core::convert::Into<U> for fgumi_sort::pipeline::MergeEntry<K> where U: core::convert::From<T>
+pub fn fgumi_sort::pipeline::MergeEntry<K>::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::pipeline::MergeEntry<K> where U: core::convert::Into<T>
+pub type fgumi_sort::pipeline::MergeEntry<K>::Error = core::convert::Infallible
+pub fn fgumi_sort::pipeline::MergeEntry<K>::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::pipeline::MergeEntry<K> where U: core::convert::TryFrom<T>
+pub type fgumi_sort::pipeline::MergeEntry<K>::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::pipeline::MergeEntry<K>::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> core::any::Any for fgumi_sort::pipeline::MergeEntry<K> where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::pipeline::MergeEntry<K>::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::pipeline::MergeEntry<K> where T: ?core::marker::Sized
+pub fn fgumi_sort::pipeline::MergeEntry<K>::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::pipeline::MergeEntry<K> where T: ?core::marker::Sized
+pub fn fgumi_sort::pipeline::MergeEntry<K>::borrow_mut(&mut self) -> &mut T
+impl<T> core::convert::From<T> for fgumi_sort::pipeline::MergeEntry<K>
+pub fn fgumi_sort::pipeline::MergeEntry<K>::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::pipeline::MergeEntry<K>
+pub type fgumi_sort::pipeline::MergeEntry<K>::Init = T
+pub const fgumi_sort::pipeline::MergeEntry<K>::ALIGN: usize
+pub unsafe fn fgumi_sort::pipeline::MergeEntry<K>::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::pipeline::MergeEntry<K>::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::pipeline::MergeEntry<K>::drop(ptr: usize)
+pub unsafe fn fgumi_sort::pipeline::MergeEntry<K>::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::pipeline::MergeEntry<K>
+pub struct fgumi_sort::pipeline::ParallelMergeConfig
+pub fgumi_sort::pipeline::ParallelMergeConfig::compression_level: u32
+pub fgumi_sort::pipeline::ParallelMergeConfig::reader_threads: usize
+pub fgumi_sort::pipeline::ParallelMergeConfig::writer_threads: usize
+impl core::default::Default for fgumi_sort::pipeline::ParallelMergeConfig
+pub fn fgumi_sort::pipeline::ParallelMergeConfig::default() -> Self
+impl core::marker::Freeze for fgumi_sort::pipeline::ParallelMergeConfig
+impl core::marker::Send for fgumi_sort::pipeline::ParallelMergeConfig
+impl core::marker::Sync for fgumi_sort::pipeline::ParallelMergeConfig
+impl core::marker::Unpin for fgumi_sort::pipeline::ParallelMergeConfig
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::pipeline::ParallelMergeConfig
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::pipeline::ParallelMergeConfig
+impl<T, U> core::convert::Into<U> for fgumi_sort::pipeline::ParallelMergeConfig where U: core::convert::From<T>
+pub fn fgumi_sort::pipeline::ParallelMergeConfig::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::pipeline::ParallelMergeConfig where U: core::convert::Into<T>
+pub type fgumi_sort::pipeline::ParallelMergeConfig::Error = core::convert::Infallible
+pub fn fgumi_sort::pipeline::ParallelMergeConfig::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::pipeline::ParallelMergeConfig where U: core::convert::TryFrom<T>
+pub type fgumi_sort::pipeline::ParallelMergeConfig::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::pipeline::ParallelMergeConfig::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> core::any::Any for fgumi_sort::pipeline::ParallelMergeConfig where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::pipeline::ParallelMergeConfig::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::pipeline::ParallelMergeConfig where T: ?core::marker::Sized
+pub fn fgumi_sort::pipeline::ParallelMergeConfig::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::pipeline::ParallelMergeConfig where T: ?core::marker::Sized
+pub fn fgumi_sort::pipeline::ParallelMergeConfig::borrow_mut(&mut self) -> &mut T
+impl<T> core::convert::From<T> for fgumi_sort::pipeline::ParallelMergeConfig
+pub fn fgumi_sort::pipeline::ParallelMergeConfig::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::pipeline::ParallelMergeConfig
+pub type fgumi_sort::pipeline::ParallelMergeConfig::Init = T
+pub const fgumi_sort::pipeline::ParallelMergeConfig::ALIGN: usize
+pub unsafe fn fgumi_sort::pipeline::ParallelMergeConfig::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::pipeline::ParallelMergeConfig::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::pipeline::ParallelMergeConfig::drop(ptr: usize)
+pub unsafe fn fgumi_sort::pipeline::ParallelMergeConfig::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::pipeline::ParallelMergeConfig
+pub fn fgumi_sort::pipeline::parallel_merge<K, F>(chunk_files: &[std::path::PathBuf], _header: &noodles_sam::header::Header, output_header: &noodles_sam::header::Header, output: &std::path::Path, extract_key: F, config: fgumi_sort::pipeline::ParallelMergeConfig) -> anyhow::Result<u64> where K: core::clone::Clone + core::marker::Send + core::marker::Sync + core::cmp::Ord, F: core::ops::function::Fn(&fgumi_raw_bam::raw_bam_record::RawRecord) -> K + core::marker::Send + core::marker::Sync
+pub fn fgumi_sort::pipeline::parallel_merge_buffered<K, F>(chunk_files: &[std::path::PathBuf], _header: &noodles_sam::header::Header, output_header: &noodles_sam::header::Header, output: &std::path::Path, extract_key: F, config: fgumi_sort::pipeline::ParallelMergeConfig) -> anyhow::Result<u64> where K: core::clone::Clone + core::marker::Send + core::marker::Sync + core::cmp::Ord, F: core::ops::function::Fn(&fgumi_raw_bam::raw_bam_record::RawRecord) -> K + core::marker::Send + core::marker::Sync
+pub mod fgumi_sort::reader
+pub struct fgumi_sort::reader::BatchedRawBamReader<R: std::io::Read>
+impl<R: std::io::Read> fgumi_sort::reader::BatchedRawBamReader<R>
+pub fn fgumi_sort::reader::BatchedRawBamReader<R>::new(reader: R, batch_size: usize) -> std::io::error::Result<Self>
+pub fn fgumi_sort::reader::BatchedRawBamReader<R>::next_batch(&mut self) -> std::io::error::Result<core::option::Option<alloc::vec::Vec<fgumi_raw_bam::raw_bam_record::RawRecord>>>
+pub fn fgumi_sort::reader::BatchedRawBamReader<R>::skip_header(&mut self) -> std::io::error::Result<alloc::vec::Vec<u8>>
+impl<R> core::marker::Freeze for fgumi_sort::reader::BatchedRawBamReader<R> where R: core::marker::Freeze
+impl<R> core::marker::Send for fgumi_sort::reader::BatchedRawBamReader<R> where R: core::marker::Send
+impl<R> core::marker::Sync for fgumi_sort::reader::BatchedRawBamReader<R> where R: core::marker::Sync
+impl<R> core::marker::Unpin for fgumi_sort::reader::BatchedRawBamReader<R> where R: core::marker::Unpin
+impl<R> core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::reader::BatchedRawBamReader<R> where R: core::panic::unwind_safe::RefUnwindSafe
+impl<R> core::panic::unwind_safe::UnwindSafe for fgumi_sort::reader::BatchedRawBamReader<R> where R: core::panic::unwind_safe::UnwindSafe
+impl<T, U> core::convert::Into<U> for fgumi_sort::reader::BatchedRawBamReader<R> where U: core::convert::From<T>
+pub fn fgumi_sort::reader::BatchedRawBamReader<R>::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::reader::BatchedRawBamReader<R> where U: core::convert::Into<T>
+pub type fgumi_sort::reader::BatchedRawBamReader<R>::Error = core::convert::Infallible
+pub fn fgumi_sort::reader::BatchedRawBamReader<R>::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::reader::BatchedRawBamReader<R> where U: core::convert::TryFrom<T>
+pub type fgumi_sort::reader::BatchedRawBamReader<R>::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::reader::BatchedRawBamReader<R>::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> core::any::Any for fgumi_sort::reader::BatchedRawBamReader<R> where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::reader::BatchedRawBamReader<R>::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::reader::BatchedRawBamReader<R> where T: ?core::marker::Sized
+pub fn fgumi_sort::reader::BatchedRawBamReader<R>::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::reader::BatchedRawBamReader<R> where T: ?core::marker::Sized
+pub fn fgumi_sort::reader::BatchedRawBamReader<R>::borrow_mut(&mut self) -> &mut T
+impl<T> core::convert::From<T> for fgumi_sort::reader::BatchedRawBamReader<R>
+pub fn fgumi_sort::reader::BatchedRawBamReader<R>::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::reader::BatchedRawBamReader<R>
+pub type fgumi_sort::reader::BatchedRawBamReader<R>::Init = T
+pub const fgumi_sort::reader::BatchedRawBamReader<R>::ALIGN: usize
+pub unsafe fn fgumi_sort::reader::BatchedRawBamReader<R>::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::reader::BatchedRawBamReader<R>::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::reader::BatchedRawBamReader<R>::drop(ptr: usize)
+pub unsafe fn fgumi_sort::reader::BatchedRawBamReader<R>::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::reader::BatchedRawBamReader<R>
+pub struct fgumi_sort::reader::RawBamRecordReader<R: std::io::Read>
+impl<R: std::io::Read> fgumi_sort::reader::RawBamRecordReader<R>
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::from_buf_reader(reader: std::io::buffered::bufreader::BufReader<R>) -> std::io::error::Result<Self>
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::new(reader: R) -> std::io::error::Result<Self>
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::next_record(&mut self) -> std::io::error::Result<core::option::Option<fgumi_raw_bam::raw_bam_record::RawRecord>>
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::skip_header(&mut self) -> std::io::error::Result<alloc::vec::Vec<u8>>
+impl<R: std::io::Read> core::iter::traits::iterator::Iterator for fgumi_sort::reader::RawBamRecordReader<R>
+pub type fgumi_sort::reader::RawBamRecordReader<R>::Item = core::result::Result<fgumi_raw_bam::raw_bam_record::RawRecord, std::io::error::Error>
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::next(&mut self) -> core::option::Option<Self::Item>
+impl<R> core::marker::Freeze for fgumi_sort::reader::RawBamRecordReader<R> where R: core::marker::Freeze
+impl<R> core::marker::Send for fgumi_sort::reader::RawBamRecordReader<R> where R: core::marker::Send
+impl<R> core::marker::Sync for fgumi_sort::reader::RawBamRecordReader<R> where R: core::marker::Sync
+impl<R> core::marker::Unpin for fgumi_sort::reader::RawBamRecordReader<R> where R: core::marker::Unpin
+impl<R> core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::reader::RawBamRecordReader<R> where R: core::panic::unwind_safe::RefUnwindSafe
+impl<R> core::panic::unwind_safe::UnwindSafe for fgumi_sort::reader::RawBamRecordReader<R> where R: core::panic::unwind_safe::UnwindSafe
+impl<I> core::iter::traits::collect::IntoIterator for fgumi_sort::reader::RawBamRecordReader<R> where I: core::iter::traits::iterator::Iterator
+pub type fgumi_sort::reader::RawBamRecordReader<R>::IntoIter = I
+pub type fgumi_sort::reader::RawBamRecordReader<R>::Item = <I as core::iter::traits::iterator::Iterator>::Item
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::into_iter(self) -> I
+impl<T, U> core::convert::Into<U> for fgumi_sort::reader::RawBamRecordReader<R> where U: core::convert::From<T>
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::reader::RawBamRecordReader<R> where U: core::convert::Into<T>
+pub type fgumi_sort::reader::RawBamRecordReader<R>::Error = core::convert::Infallible
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::reader::RawBamRecordReader<R> where U: core::convert::TryFrom<T>
+pub type fgumi_sort::reader::RawBamRecordReader<R>::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> core::any::Any for fgumi_sort::reader::RawBamRecordReader<R> where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::reader::RawBamRecordReader<R> where T: ?core::marker::Sized
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::reader::RawBamRecordReader<R> where T: ?core::marker::Sized
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::borrow_mut(&mut self) -> &mut T
+impl<T> core::convert::From<T> for fgumi_sort::reader::RawBamRecordReader<R>
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::reader::RawBamRecordReader<R>
+pub type fgumi_sort::reader::RawBamRecordReader<R>::Init = T
+pub const fgumi_sort::reader::RawBamRecordReader<R>::ALIGN: usize
+pub unsafe fn fgumi_sort::reader::RawBamRecordReader<R>::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::reader::RawBamRecordReader<R>::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::reader::RawBamRecordReader<R>::drop(ptr: usize)
+pub unsafe fn fgumi_sort::reader::RawBamRecordReader<R>::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::reader::RawBamRecordReader<R>
+pub mod fgumi_sort::verify
+pub fn fgumi_sort::verify::verify_sort_order<K>(raw_reader: fgumi_sort::reader::RawBamRecordReader<std::fs::File>, extract_key: impl core::ops::function::Fn(&[u8]) -> K, is_violation: impl core::ops::function::Fn(&K, &K) -> bool) -> anyhow::Result<fgumi_sort::verify::VerifySummary>
+pub type fgumi_sort::verify::VerifySummary = (u64, u64, core::option::Option<(u64, alloc::string::String)>)
+pub enum fgumi_sort::QuerynameComparator
+pub fgumi_sort::QuerynameComparator::Lexicographic
+pub fgumi_sort::QuerynameComparator::Natural
+impl core::clone::Clone for fgumi_sort::keys::QuerynameComparator
+pub fn fgumi_sort::keys::QuerynameComparator::clone(&self) -> fgumi_sort::keys::QuerynameComparator
+impl core::cmp::Eq for fgumi_sort::keys::QuerynameComparator
+impl core::cmp::PartialEq for fgumi_sort::keys::QuerynameComparator
+pub fn fgumi_sort::keys::QuerynameComparator::eq(&self, other: &fgumi_sort::keys::QuerynameComparator) -> bool
+impl core::default::Default for fgumi_sort::keys::QuerynameComparator
+pub fn fgumi_sort::keys::QuerynameComparator::default() -> fgumi_sort::keys::QuerynameComparator
+impl core::fmt::Debug for fgumi_sort::keys::QuerynameComparator
+pub fn fgumi_sort::keys::QuerynameComparator::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for fgumi_sort::keys::QuerynameComparator
+pub fn fgumi_sort::keys::QuerynameComparator::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for fgumi_sort::keys::QuerynameComparator
+impl core::marker::StructuralPartialEq for fgumi_sort::keys::QuerynameComparator
+impl core::marker::Freeze for fgumi_sort::keys::QuerynameComparator
+impl core::marker::Send for fgumi_sort::keys::QuerynameComparator
+impl core::marker::Sync for fgumi_sort::keys::QuerynameComparator
+impl core::marker::Unpin for fgumi_sort::keys::QuerynameComparator
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::keys::QuerynameComparator
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::keys::QuerynameComparator
+impl<Q, K> equivalent::Equivalent<K> for fgumi_sort::keys::QuerynameComparator where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::QuerynameComparator::equivalent(&self, key: &K) -> bool
+impl<Q, K> hashbrown::Equivalent<K> for fgumi_sort::keys::QuerynameComparator where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::QuerynameComparator::equivalent(&self, key: &K) -> bool
+impl<T, U> core::convert::Into<U> for fgumi_sort::keys::QuerynameComparator where U: core::convert::From<T>
+pub fn fgumi_sort::keys::QuerynameComparator::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::keys::QuerynameComparator where U: core::convert::Into<T>
+pub type fgumi_sort::keys::QuerynameComparator::Error = core::convert::Infallible
+pub fn fgumi_sort::keys::QuerynameComparator::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::keys::QuerynameComparator where U: core::convert::TryFrom<T>
+pub type fgumi_sort::keys::QuerynameComparator::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::keys::QuerynameComparator::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for fgumi_sort::keys::QuerynameComparator where T: core::clone::Clone
+pub type fgumi_sort::keys::QuerynameComparator::Owned = T
+pub fn fgumi_sort::keys::QuerynameComparator::clone_into(&self, target: &mut T)
+pub fn fgumi_sort::keys::QuerynameComparator::to_owned(&self) -> T
+impl<T> alloc::string::ToString for fgumi_sort::keys::QuerynameComparator where T: core::fmt::Display + ?core::marker::Sized
+pub fn fgumi_sort::keys::QuerynameComparator::to_string(&self) -> alloc::string::String
+impl<T> core::any::Any for fgumi_sort::keys::QuerynameComparator where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::keys::QuerynameComparator::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::keys::QuerynameComparator where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::QuerynameComparator::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::keys::QuerynameComparator where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::QuerynameComparator::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for fgumi_sort::keys::QuerynameComparator where T: core::clone::Clone
+pub unsafe fn fgumi_sort::keys::QuerynameComparator::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for fgumi_sort::keys::QuerynameComparator
+pub fn fgumi_sort::keys::QuerynameComparator::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::keys::QuerynameComparator
+pub type fgumi_sort::keys::QuerynameComparator::Init = T
+pub const fgumi_sort::keys::QuerynameComparator::ALIGN: usize
+pub unsafe fn fgumi_sort::keys::QuerynameComparator::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::keys::QuerynameComparator::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::keys::QuerynameComparator::drop(ptr: usize)
+pub unsafe fn fgumi_sort::keys::QuerynameComparator::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::keys::QuerynameComparator
+pub enum fgumi_sort::SortOrder
+pub fgumi_sort::SortOrder::Coordinate
+pub fgumi_sort::SortOrder::Queryname(fgumi_sort::keys::QuerynameComparator)
+pub fgumi_sort::SortOrder::TemplateCoordinate
+impl fgumi_sort::keys::SortOrder
+pub fn fgumi_sort::keys::SortOrder::header_go_tag(&self) -> core::option::Option<&'static str>
+pub fn fgumi_sort::keys::SortOrder::header_so_tag(&self) -> &'static str
+pub fn fgumi_sort::keys::SortOrder::header_ss_tag(&self) -> core::option::Option<&'static str>
+pub fn fgumi_sort::keys::SortOrder::is_queryname(&self) -> bool
+pub fn fgumi_sort::keys::SortOrder::queryname_comparator(&self) -> core::option::Option<fgumi_sort::keys::QuerynameComparator>
+impl core::clone::Clone for fgumi_sort::keys::SortOrder
+pub fn fgumi_sort::keys::SortOrder::clone(&self) -> fgumi_sort::keys::SortOrder
+impl core::cmp::Eq for fgumi_sort::keys::SortOrder
+impl core::cmp::PartialEq for fgumi_sort::keys::SortOrder
+pub fn fgumi_sort::keys::SortOrder::eq(&self, other: &fgumi_sort::keys::SortOrder) -> bool
+impl core::fmt::Debug for fgumi_sort::keys::SortOrder
+pub fn fgumi_sort::keys::SortOrder::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for fgumi_sort::keys::SortOrder
+impl core::marker::StructuralPartialEq for fgumi_sort::keys::SortOrder
+impl core::marker::Freeze for fgumi_sort::keys::SortOrder
+impl core::marker::Send for fgumi_sort::keys::SortOrder
+impl core::marker::Sync for fgumi_sort::keys::SortOrder
+impl core::marker::Unpin for fgumi_sort::keys::SortOrder
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::keys::SortOrder
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::keys::SortOrder
+impl<Q, K> equivalent::Equivalent<K> for fgumi_sort::keys::SortOrder where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::SortOrder::equivalent(&self, key: &K) -> bool
+impl<Q, K> hashbrown::Equivalent<K> for fgumi_sort::keys::SortOrder where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::SortOrder::equivalent(&self, key: &K) -> bool
+impl<T, U> core::convert::Into<U> for fgumi_sort::keys::SortOrder where U: core::convert::From<T>
+pub fn fgumi_sort::keys::SortOrder::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::keys::SortOrder where U: core::convert::Into<T>
+pub type fgumi_sort::keys::SortOrder::Error = core::convert::Infallible
+pub fn fgumi_sort::keys::SortOrder::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::keys::SortOrder where U: core::convert::TryFrom<T>
+pub type fgumi_sort::keys::SortOrder::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::keys::SortOrder::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for fgumi_sort::keys::SortOrder where T: core::clone::Clone
+pub type fgumi_sort::keys::SortOrder::Owned = T
+pub fn fgumi_sort::keys::SortOrder::clone_into(&self, target: &mut T)
+pub fn fgumi_sort::keys::SortOrder::to_owned(&self) -> T
+impl<T> core::any::Any for fgumi_sort::keys::SortOrder where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::keys::SortOrder::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::keys::SortOrder where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::SortOrder::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::keys::SortOrder where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::SortOrder::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for fgumi_sort::keys::SortOrder where T: core::clone::Clone
+pub unsafe fn fgumi_sort::keys::SortOrder::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for fgumi_sort::keys::SortOrder
+pub fn fgumi_sort::keys::SortOrder::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::keys::SortOrder
+pub type fgumi_sort::keys::SortOrder::Init = T
+pub const fgumi_sort::keys::SortOrder::ALIGN: usize
+pub unsafe fn fgumi_sort::keys::SortOrder::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::keys::SortOrder::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::keys::SortOrder::drop(ptr: usize)
+pub unsafe fn fgumi_sort::keys::SortOrder::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::keys::SortOrder
+pub struct fgumi_sort::LibraryLookup
+impl fgumi_sort::external::LibraryLookup
+pub fn fgumi_sort::external::LibraryLookup::from_header(header: &noodles_sam::header::Header) -> Self
+pub fn fgumi_sort::external::LibraryLookup::hash_name(&self, name: &[u8]) -> u64
+pub fn fgumi_sort::external::LibraryLookup::ordinal_from_rg(&self, rg: core::option::Option<&[u8]>) -> u32
+impl core::marker::Freeze for fgumi_sort::external::LibraryLookup
+impl core::marker::Send for fgumi_sort::external::LibraryLookup
+impl core::marker::Sync for fgumi_sort::external::LibraryLookup
+impl core::marker::Unpin for fgumi_sort::external::LibraryLookup
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::external::LibraryLookup
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::external::LibraryLookup
+impl<T, U> core::convert::Into<U> for fgumi_sort::external::LibraryLookup where U: core::convert::From<T>
+pub fn fgumi_sort::external::LibraryLookup::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::external::LibraryLookup where U: core::convert::Into<T>
+pub type fgumi_sort::external::LibraryLookup::Error = core::convert::Infallible
+pub fn fgumi_sort::external::LibraryLookup::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::external::LibraryLookup where U: core::convert::TryFrom<T>
+pub type fgumi_sort::external::LibraryLookup::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::external::LibraryLookup::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> core::any::Any for fgumi_sort::external::LibraryLookup where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::external::LibraryLookup::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::external::LibraryLookup where T: ?core::marker::Sized
+pub fn fgumi_sort::external::LibraryLookup::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::external::LibraryLookup where T: ?core::marker::Sized
+pub fn fgumi_sort::external::LibraryLookup::borrow_mut(&mut self) -> &mut T
+impl<T> core::convert::From<T> for fgumi_sort::external::LibraryLookup
+pub fn fgumi_sort::external::LibraryLookup::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::external::LibraryLookup
+pub type fgumi_sort::external::LibraryLookup::Init = T
+pub const fgumi_sort::external::LibraryLookup::ALIGN: usize
+pub unsafe fn fgumi_sort::external::LibraryLookup::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::external::LibraryLookup::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::external::LibraryLookup::drop(ptr: usize)
+pub unsafe fn fgumi_sort::external::LibraryLookup::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::external::LibraryLookup
+pub struct fgumi_sort::ParallelMergeConfig
+pub fgumi_sort::ParallelMergeConfig::compression_level: u32
+pub fgumi_sort::ParallelMergeConfig::reader_threads: usize
+pub fgumi_sort::ParallelMergeConfig::writer_threads: usize
+impl core::default::Default for fgumi_sort::pipeline::ParallelMergeConfig
+pub fn fgumi_sort::pipeline::ParallelMergeConfig::default() -> Self
+impl core::marker::Freeze for fgumi_sort::pipeline::ParallelMergeConfig
+impl core::marker::Send for fgumi_sort::pipeline::ParallelMergeConfig
+impl core::marker::Sync for fgumi_sort::pipeline::ParallelMergeConfig
+impl core::marker::Unpin for fgumi_sort::pipeline::ParallelMergeConfig
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::pipeline::ParallelMergeConfig
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::pipeline::ParallelMergeConfig
+impl<T, U> core::convert::Into<U> for fgumi_sort::pipeline::ParallelMergeConfig where U: core::convert::From<T>
+pub fn fgumi_sort::pipeline::ParallelMergeConfig::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::pipeline::ParallelMergeConfig where U: core::convert::Into<T>
+pub type fgumi_sort::pipeline::ParallelMergeConfig::Error = core::convert::Infallible
+pub fn fgumi_sort::pipeline::ParallelMergeConfig::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::pipeline::ParallelMergeConfig where U: core::convert::TryFrom<T>
+pub type fgumi_sort::pipeline::ParallelMergeConfig::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::pipeline::ParallelMergeConfig::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> core::any::Any for fgumi_sort::pipeline::ParallelMergeConfig where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::pipeline::ParallelMergeConfig::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::pipeline::ParallelMergeConfig where T: ?core::marker::Sized
+pub fn fgumi_sort::pipeline::ParallelMergeConfig::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::pipeline::ParallelMergeConfig where T: ?core::marker::Sized
+pub fn fgumi_sort::pipeline::ParallelMergeConfig::borrow_mut(&mut self) -> &mut T
+impl<T> core::convert::From<T> for fgumi_sort::pipeline::ParallelMergeConfig
+pub fn fgumi_sort::pipeline::ParallelMergeConfig::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::pipeline::ParallelMergeConfig
+pub type fgumi_sort::pipeline::ParallelMergeConfig::Init = T
+pub const fgumi_sort::pipeline::ParallelMergeConfig::ALIGN: usize
+pub unsafe fn fgumi_sort::pipeline::ParallelMergeConfig::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::pipeline::ParallelMergeConfig::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::pipeline::ParallelMergeConfig::drop(ptr: usize)
+pub unsafe fn fgumi_sort::pipeline::ParallelMergeConfig::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::pipeline::ParallelMergeConfig
+pub struct fgumi_sort::RawBamRecordReader<R: std::io::Read>
+impl<R: std::io::Read> fgumi_sort::reader::RawBamRecordReader<R>
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::from_buf_reader(reader: std::io::buffered::bufreader::BufReader<R>) -> std::io::error::Result<Self>
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::new(reader: R) -> std::io::error::Result<Self>
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::next_record(&mut self) -> std::io::error::Result<core::option::Option<fgumi_raw_bam::raw_bam_record::RawRecord>>
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::skip_header(&mut self) -> std::io::error::Result<alloc::vec::Vec<u8>>
+impl<R: std::io::Read> core::iter::traits::iterator::Iterator for fgumi_sort::reader::RawBamRecordReader<R>
+pub type fgumi_sort::reader::RawBamRecordReader<R>::Item = core::result::Result<fgumi_raw_bam::raw_bam_record::RawRecord, std::io::error::Error>
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::next(&mut self) -> core::option::Option<Self::Item>
+impl<R> core::marker::Freeze for fgumi_sort::reader::RawBamRecordReader<R> where R: core::marker::Freeze
+impl<R> core::marker::Send for fgumi_sort::reader::RawBamRecordReader<R> where R: core::marker::Send
+impl<R> core::marker::Sync for fgumi_sort::reader::RawBamRecordReader<R> where R: core::marker::Sync
+impl<R> core::marker::Unpin for fgumi_sort::reader::RawBamRecordReader<R> where R: core::marker::Unpin
+impl<R> core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::reader::RawBamRecordReader<R> where R: core::panic::unwind_safe::RefUnwindSafe
+impl<R> core::panic::unwind_safe::UnwindSafe for fgumi_sort::reader::RawBamRecordReader<R> where R: core::panic::unwind_safe::UnwindSafe
+impl<I> core::iter::traits::collect::IntoIterator for fgumi_sort::reader::RawBamRecordReader<R> where I: core::iter::traits::iterator::Iterator
+pub type fgumi_sort::reader::RawBamRecordReader<R>::IntoIter = I
+pub type fgumi_sort::reader::RawBamRecordReader<R>::Item = <I as core::iter::traits::iterator::Iterator>::Item
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::into_iter(self) -> I
+impl<T, U> core::convert::Into<U> for fgumi_sort::reader::RawBamRecordReader<R> where U: core::convert::From<T>
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::reader::RawBamRecordReader<R> where U: core::convert::Into<T>
+pub type fgumi_sort::reader::RawBamRecordReader<R>::Error = core::convert::Infallible
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::reader::RawBamRecordReader<R> where U: core::convert::TryFrom<T>
+pub type fgumi_sort::reader::RawBamRecordReader<R>::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> core::any::Any for fgumi_sort::reader::RawBamRecordReader<R> where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::reader::RawBamRecordReader<R> where T: ?core::marker::Sized
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::reader::RawBamRecordReader<R> where T: ?core::marker::Sized
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::borrow_mut(&mut self) -> &mut T
+impl<T> core::convert::From<T> for fgumi_sort::reader::RawBamRecordReader<R>
+pub fn fgumi_sort::reader::RawBamRecordReader<R>::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::reader::RawBamRecordReader<R>
+pub type fgumi_sort::reader::RawBamRecordReader<R>::Init = T
+pub const fgumi_sort::reader::RawBamRecordReader<R>::ALIGN: usize
+pub unsafe fn fgumi_sort::reader::RawBamRecordReader<R>::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::reader::RawBamRecordReader<R>::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::reader::RawBamRecordReader<R>::drop(ptr: usize)
+pub unsafe fn fgumi_sort::reader::RawBamRecordReader<R>::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::reader::RawBamRecordReader<R>
+#[repr(C)] pub struct fgumi_sort::RawCoordinateKey
+pub fgumi_sort::RawCoordinateKey::sort_key: u64
+impl fgumi_sort::keys::RawCoordinateKey
+pub const fgumi_sort::keys::RawCoordinateKey::SIZE: usize
+pub fn fgumi_sort::keys::RawCoordinateKey::new(tid: i32, pos: i32, reverse: bool, nref: u32) -> Self
+pub fn fgumi_sort::keys::RawCoordinateKey::unmapped() -> Self
+pub fn fgumi_sort::keys::RawCoordinateKey::zeroed() -> Self
+impl bytemuck::pod::Pod for fgumi_sort::keys::RawCoordinateKey
+impl bytemuck::zeroable::Zeroable for fgumi_sort::keys::RawCoordinateKey
+impl core::clone::Clone for fgumi_sort::keys::RawCoordinateKey
+pub fn fgumi_sort::keys::RawCoordinateKey::clone(&self) -> fgumi_sort::keys::RawCoordinateKey
+impl core::cmp::Eq for fgumi_sort::keys::RawCoordinateKey
+impl core::cmp::Ord for fgumi_sort::keys::RawCoordinateKey
+pub fn fgumi_sort::keys::RawCoordinateKey::cmp(&self, other: &Self) -> core::cmp::Ordering
+impl core::cmp::PartialEq for fgumi_sort::keys::RawCoordinateKey
+pub fn fgumi_sort::keys::RawCoordinateKey::eq(&self, other: &fgumi_sort::keys::RawCoordinateKey) -> bool
+impl core::cmp::PartialOrd for fgumi_sort::keys::RawCoordinateKey
+pub fn fgumi_sort::keys::RawCoordinateKey::partial_cmp(&self, other: &Self) -> core::option::Option<core::cmp::Ordering>
+impl core::default::Default for fgumi_sort::keys::RawCoordinateKey
+pub fn fgumi_sort::keys::RawCoordinateKey::default() -> Self
+impl core::fmt::Debug for fgumi_sort::keys::RawCoordinateKey
+pub fn fgumi_sort::keys::RawCoordinateKey::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for fgumi_sort::keys::RawCoordinateKey
+impl core::marker::StructuralPartialEq for fgumi_sort::keys::RawCoordinateKey
+impl fgumi_sort::keys::RawSortKey for fgumi_sort::keys::RawCoordinateKey
+pub const fgumi_sort::keys::RawCoordinateKey::EMBEDDED_IN_RECORD: bool
+pub const fgumi_sort::keys::RawCoordinateKey::SERIALIZED_SIZE: core::option::Option<usize>
+pub fn fgumi_sort::keys::RawCoordinateKey::extract(bam: &[u8], ctx: &fgumi_sort::keys::SortContext) -> Self
+pub fn fgumi_sort::keys::RawCoordinateKey::extract_from_record(bam: &[u8]) -> Self
+pub fn fgumi_sort::keys::RawCoordinateKey::read_from<R: std::io::Read>(reader: &mut R) -> std::io::error::Result<Self>
+pub fn fgumi_sort::keys::RawCoordinateKey::write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::error::Result<()>
+impl core::marker::Freeze for fgumi_sort::keys::RawCoordinateKey
+impl core::marker::Send for fgumi_sort::keys::RawCoordinateKey
+impl core::marker::Sync for fgumi_sort::keys::RawCoordinateKey
+impl core::marker::Unpin for fgumi_sort::keys::RawCoordinateKey
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::keys::RawCoordinateKey
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::keys::RawCoordinateKey
+impl<Q, K> equivalent::Comparable<K> for fgumi_sort::keys::RawCoordinateKey where Q: core::cmp::Ord + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawCoordinateKey::compare(&self, key: &K) -> core::cmp::Ordering
+impl<Q, K> equivalent::Equivalent<K> for fgumi_sort::keys::RawCoordinateKey where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawCoordinateKey::equivalent(&self, key: &K) -> bool
+impl<Q, K> hashbrown::Equivalent<K> for fgumi_sort::keys::RawCoordinateKey where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawCoordinateKey::equivalent(&self, key: &K) -> bool
+impl<T, U> core::convert::Into<U> for fgumi_sort::keys::RawCoordinateKey where U: core::convert::From<T>
+pub fn fgumi_sort::keys::RawCoordinateKey::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::keys::RawCoordinateKey where U: core::convert::Into<T>
+pub type fgumi_sort::keys::RawCoordinateKey::Error = core::convert::Infallible
+pub fn fgumi_sort::keys::RawCoordinateKey::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::keys::RawCoordinateKey where U: core::convert::TryFrom<T>
+pub type fgumi_sort::keys::RawCoordinateKey::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::keys::RawCoordinateKey::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for fgumi_sort::keys::RawCoordinateKey where T: core::clone::Clone
+pub type fgumi_sort::keys::RawCoordinateKey::Owned = T
+pub fn fgumi_sort::keys::RawCoordinateKey::clone_into(&self, target: &mut T)
+pub fn fgumi_sort::keys::RawCoordinateKey::to_owned(&self) -> T
+impl<T> bytemuck::anybitpattern::AnyBitPattern for fgumi_sort::keys::RawCoordinateKey where T: bytemuck::pod::Pod
+impl<T> bytemuck::checked::CheckedBitPattern for fgumi_sort::keys::RawCoordinateKey where T: bytemuck::anybitpattern::AnyBitPattern
+pub type fgumi_sort::keys::RawCoordinateKey::Bits = T
+pub fn fgumi_sort::keys::RawCoordinateKey::is_valid_bit_pattern(_bits: &T) -> bool
+impl<T> bytemuck::no_uninit::NoUninit for fgumi_sort::keys::RawCoordinateKey where T: bytemuck::pod::Pod
+impl<T> core::any::Any for fgumi_sort::keys::RawCoordinateKey where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawCoordinateKey::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::keys::RawCoordinateKey where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::RawCoordinateKey::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::keys::RawCoordinateKey where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::RawCoordinateKey::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for fgumi_sort::keys::RawCoordinateKey where T: core::clone::Clone
+pub unsafe fn fgumi_sort::keys::RawCoordinateKey::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for fgumi_sort::keys::RawCoordinateKey
+pub fn fgumi_sort::keys::RawCoordinateKey::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::keys::RawCoordinateKey
+pub type fgumi_sort::keys::RawCoordinateKey::Init = T
+pub const fgumi_sort::keys::RawCoordinateKey::ALIGN: usize
+pub unsafe fn fgumi_sort::keys::RawCoordinateKey::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::keys::RawCoordinateKey::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::keys::RawCoordinateKey::drop(ptr: usize)
+pub unsafe fn fgumi_sort::keys::RawCoordinateKey::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::keys::RawCoordinateKey
+pub struct fgumi_sort::RawExternalSorter
+impl fgumi_sort::external::RawExternalSorter
+pub fn fgumi_sort::external::RawExternalSorter::async_reader(self, enabled: bool) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::cell_tag(self, tag: fgumi_tag::tag::SamTag) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::initial_capacity(self, bytes: usize) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::max_temp_files(self, max: usize) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::memory_limit(self, limit: usize) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::merge_bams(&self, inputs: &[std::path::PathBuf], header: &noodles_sam::header::Header, output: &std::path::Path) -> anyhow::Result<u64>
+pub fn fgumi_sort::external::RawExternalSorter::new(sort_order: fgumi_sort::keys::SortOrder) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::output_compression(self, level: u32) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::pg_info(self, version: alloc::string::String, command_line: alloc::string::String) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::sort(&self, input: &std::path::Path, output: &std::path::Path) -> anyhow::Result<fgumi_sort::SortStats>
+pub fn fgumi_sort::external::RawExternalSorter::temp_compression(self, level: u32) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::temp_dir(self, path: std::path::PathBuf) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::temp_dirs(self, paths: alloc::vec::Vec<std::path::PathBuf>) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::threads(self, threads: usize) -> Self
+pub fn fgumi_sort::external::RawExternalSorter::write_index(self, enabled: bool) -> Self
+impl core::marker::Freeze for fgumi_sort::external::RawExternalSorter
+impl core::marker::Send for fgumi_sort::external::RawExternalSorter
+impl core::marker::Sync for fgumi_sort::external::RawExternalSorter
+impl core::marker::Unpin for fgumi_sort::external::RawExternalSorter
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::external::RawExternalSorter
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::external::RawExternalSorter
+impl<T, U> core::convert::Into<U> for fgumi_sort::external::RawExternalSorter where U: core::convert::From<T>
+pub fn fgumi_sort::external::RawExternalSorter::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::external::RawExternalSorter where U: core::convert::Into<T>
+pub type fgumi_sort::external::RawExternalSorter::Error = core::convert::Infallible
+pub fn fgumi_sort::external::RawExternalSorter::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::external::RawExternalSorter where U: core::convert::TryFrom<T>
+pub type fgumi_sort::external::RawExternalSorter::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::external::RawExternalSorter::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> core::any::Any for fgumi_sort::external::RawExternalSorter where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::external::RawExternalSorter::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::external::RawExternalSorter where T: ?core::marker::Sized
+pub fn fgumi_sort::external::RawExternalSorter::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::external::RawExternalSorter where T: ?core::marker::Sized
+pub fn fgumi_sort::external::RawExternalSorter::borrow_mut(&mut self) -> &mut T
+impl<T> core::convert::From<T> for fgumi_sort::external::RawExternalSorter
+pub fn fgumi_sort::external::RawExternalSorter::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::external::RawExternalSorter
+pub type fgumi_sort::external::RawExternalSorter::Init = T
+pub const fgumi_sort::external::RawExternalSorter::ALIGN: usize
+pub unsafe fn fgumi_sort::external::RawExternalSorter::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::external::RawExternalSorter::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::external::RawExternalSorter::drop(ptr: usize)
+pub unsafe fn fgumi_sort::external::RawExternalSorter::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::external::RawExternalSorter
+pub struct fgumi_sort::RawQuerynameKey
+impl fgumi_sort::keys::RawQuerynameKey
+pub fn fgumi_sort::keys::RawQuerynameKey::name(&self) -> &[u8]
+pub fn fgumi_sort::keys::RawQuerynameKey::new(name: alloc::vec::Vec<u8>, flags: u16) -> Self
+impl core::clone::Clone for fgumi_sort::keys::RawQuerynameKey
+pub fn fgumi_sort::keys::RawQuerynameKey::clone(&self) -> fgumi_sort::keys::RawQuerynameKey
+impl core::cmp::Eq for fgumi_sort::keys::RawQuerynameKey
+impl core::cmp::Ord for fgumi_sort::keys::RawQuerynameKey
+pub fn fgumi_sort::keys::RawQuerynameKey::cmp(&self, other: &Self) -> core::cmp::Ordering
+impl core::cmp::PartialEq for fgumi_sort::keys::RawQuerynameKey
+pub fn fgumi_sort::keys::RawQuerynameKey::eq(&self, other: &Self) -> bool
+impl core::cmp::PartialOrd for fgumi_sort::keys::RawQuerynameKey
+pub fn fgumi_sort::keys::RawQuerynameKey::partial_cmp(&self, other: &Self) -> core::option::Option<core::cmp::Ordering>
+impl core::default::Default for fgumi_sort::keys::RawQuerynameKey
+pub fn fgumi_sort::keys::RawQuerynameKey::default() -> fgumi_sort::keys::RawQuerynameKey
+impl core::fmt::Debug for fgumi_sort::keys::RawQuerynameKey
+pub fn fgumi_sort::keys::RawQuerynameKey::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl fgumi_sort::keys::RawSortKey for fgumi_sort::keys::RawQuerynameKey
+pub const fgumi_sort::keys::RawQuerynameKey::EMBEDDED_IN_RECORD: bool
+pub const fgumi_sort::keys::RawQuerynameKey::SERIALIZED_SIZE: core::option::Option<usize>
+pub fn fgumi_sort::keys::RawQuerynameKey::extract(bam: &[u8], _ctx: &fgumi_sort::keys::SortContext) -> Self
+pub fn fgumi_sort::keys::RawQuerynameKey::extract_from_record(bam: &[u8]) -> Self
+pub fn fgumi_sort::keys::RawQuerynameKey::read_from<R: std::io::Read>(reader: &mut R) -> std::io::error::Result<Self>
+pub fn fgumi_sort::keys::RawQuerynameKey::write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::error::Result<()>
+impl core::marker::Freeze for fgumi_sort::keys::RawQuerynameKey
+impl core::marker::Send for fgumi_sort::keys::RawQuerynameKey
+impl core::marker::Sync for fgumi_sort::keys::RawQuerynameKey
+impl core::marker::Unpin for fgumi_sort::keys::RawQuerynameKey
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::keys::RawQuerynameKey
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::keys::RawQuerynameKey
+impl<Q, K> equivalent::Comparable<K> for fgumi_sort::keys::RawQuerynameKey where Q: core::cmp::Ord + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameKey::compare(&self, key: &K) -> core::cmp::Ordering
+impl<Q, K> equivalent::Equivalent<K> for fgumi_sort::keys::RawQuerynameKey where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameKey::equivalent(&self, key: &K) -> bool
+impl<Q, K> hashbrown::Equivalent<K> for fgumi_sort::keys::RawQuerynameKey where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameKey::equivalent(&self, key: &K) -> bool
+impl<T, U> core::convert::Into<U> for fgumi_sort::keys::RawQuerynameKey where U: core::convert::From<T>
+pub fn fgumi_sort::keys::RawQuerynameKey::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::keys::RawQuerynameKey where U: core::convert::Into<T>
+pub type fgumi_sort::keys::RawQuerynameKey::Error = core::convert::Infallible
+pub fn fgumi_sort::keys::RawQuerynameKey::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::keys::RawQuerynameKey where U: core::convert::TryFrom<T>
+pub type fgumi_sort::keys::RawQuerynameKey::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::keys::RawQuerynameKey::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for fgumi_sort::keys::RawQuerynameKey where T: core::clone::Clone
+pub type fgumi_sort::keys::RawQuerynameKey::Owned = T
+pub fn fgumi_sort::keys::RawQuerynameKey::clone_into(&self, target: &mut T)
+pub fn fgumi_sort::keys::RawQuerynameKey::to_owned(&self) -> T
+impl<T> core::any::Any for fgumi_sort::keys::RawQuerynameKey where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameKey::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::keys::RawQuerynameKey where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameKey::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::keys::RawQuerynameKey where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameKey::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for fgumi_sort::keys::RawQuerynameKey where T: core::clone::Clone
+pub unsafe fn fgumi_sort::keys::RawQuerynameKey::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for fgumi_sort::keys::RawQuerynameKey
+pub fn fgumi_sort::keys::RawQuerynameKey::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::keys::RawQuerynameKey
+pub type fgumi_sort::keys::RawQuerynameKey::Init = T
+pub const fgumi_sort::keys::RawQuerynameKey::ALIGN: usize
+pub unsafe fn fgumi_sort::keys::RawQuerynameKey::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::keys::RawQuerynameKey::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::keys::RawQuerynameKey::drop(ptr: usize)
+pub unsafe fn fgumi_sort::keys::RawQuerynameKey::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::keys::RawQuerynameKey
+pub struct fgumi_sort::RawQuerynameLexKey
+impl fgumi_sort::keys::RawQuerynameLexKey
+pub fn fgumi_sort::keys::RawQuerynameLexKey::name(&self) -> &[u8]
+pub fn fgumi_sort::keys::RawQuerynameLexKey::new(name: alloc::vec::Vec<u8>, flags: u16) -> Self
+impl core::clone::Clone for fgumi_sort::keys::RawQuerynameLexKey
+pub fn fgumi_sort::keys::RawQuerynameLexKey::clone(&self) -> fgumi_sort::keys::RawQuerynameLexKey
+impl core::cmp::Eq for fgumi_sort::keys::RawQuerynameLexKey
+impl core::cmp::Ord for fgumi_sort::keys::RawQuerynameLexKey
+pub fn fgumi_sort::keys::RawQuerynameLexKey::cmp(&self, other: &Self) -> core::cmp::Ordering
+impl core::cmp::PartialEq for fgumi_sort::keys::RawQuerynameLexKey
+pub fn fgumi_sort::keys::RawQuerynameLexKey::eq(&self, other: &fgumi_sort::keys::RawQuerynameLexKey) -> bool
+impl core::cmp::PartialOrd for fgumi_sort::keys::RawQuerynameLexKey
+pub fn fgumi_sort::keys::RawQuerynameLexKey::partial_cmp(&self, other: &Self) -> core::option::Option<core::cmp::Ordering>
+impl core::default::Default for fgumi_sort::keys::RawQuerynameLexKey
+pub fn fgumi_sort::keys::RawQuerynameLexKey::default() -> fgumi_sort::keys::RawQuerynameLexKey
+impl core::fmt::Debug for fgumi_sort::keys::RawQuerynameLexKey
+pub fn fgumi_sort::keys::RawQuerynameLexKey::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for fgumi_sort::keys::RawQuerynameLexKey
+impl fgumi_sort::keys::RawSortKey for fgumi_sort::keys::RawQuerynameLexKey
+pub const fgumi_sort::keys::RawQuerynameLexKey::EMBEDDED_IN_RECORD: bool
+pub const fgumi_sort::keys::RawQuerynameLexKey::SERIALIZED_SIZE: core::option::Option<usize>
+pub fn fgumi_sort::keys::RawQuerynameLexKey::extract(bam: &[u8], _ctx: &fgumi_sort::keys::SortContext) -> Self
+pub fn fgumi_sort::keys::RawQuerynameLexKey::extract_from_record(bam: &[u8]) -> Self
+pub fn fgumi_sort::keys::RawQuerynameLexKey::read_from<R: std::io::Read>(reader: &mut R) -> std::io::error::Result<Self>
+pub fn fgumi_sort::keys::RawQuerynameLexKey::write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::error::Result<()>
+impl core::marker::Freeze for fgumi_sort::keys::RawQuerynameLexKey
+impl core::marker::Send for fgumi_sort::keys::RawQuerynameLexKey
+impl core::marker::Sync for fgumi_sort::keys::RawQuerynameLexKey
+impl core::marker::Unpin for fgumi_sort::keys::RawQuerynameLexKey
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::keys::RawQuerynameLexKey
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::keys::RawQuerynameLexKey
+impl<Q, K> equivalent::Comparable<K> for fgumi_sort::keys::RawQuerynameLexKey where Q: core::cmp::Ord + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameLexKey::compare(&self, key: &K) -> core::cmp::Ordering
+impl<Q, K> equivalent::Equivalent<K> for fgumi_sort::keys::RawQuerynameLexKey where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameLexKey::equivalent(&self, key: &K) -> bool
+impl<Q, K> hashbrown::Equivalent<K> for fgumi_sort::keys::RawQuerynameLexKey where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameLexKey::equivalent(&self, key: &K) -> bool
+impl<T, U> core::convert::Into<U> for fgumi_sort::keys::RawQuerynameLexKey where U: core::convert::From<T>
+pub fn fgumi_sort::keys::RawQuerynameLexKey::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::keys::RawQuerynameLexKey where U: core::convert::Into<T>
+pub type fgumi_sort::keys::RawQuerynameLexKey::Error = core::convert::Infallible
+pub fn fgumi_sort::keys::RawQuerynameLexKey::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::keys::RawQuerynameLexKey where U: core::convert::TryFrom<T>
+pub type fgumi_sort::keys::RawQuerynameLexKey::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::keys::RawQuerynameLexKey::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for fgumi_sort::keys::RawQuerynameLexKey where T: core::clone::Clone
+pub type fgumi_sort::keys::RawQuerynameLexKey::Owned = T
+pub fn fgumi_sort::keys::RawQuerynameLexKey::clone_into(&self, target: &mut T)
+pub fn fgumi_sort::keys::RawQuerynameLexKey::to_owned(&self) -> T
+impl<T> core::any::Any for fgumi_sort::keys::RawQuerynameLexKey where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameLexKey::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::keys::RawQuerynameLexKey where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameLexKey::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::keys::RawQuerynameLexKey where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::RawQuerynameLexKey::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for fgumi_sort::keys::RawQuerynameLexKey where T: core::clone::Clone
+pub unsafe fn fgumi_sort::keys::RawQuerynameLexKey::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for fgumi_sort::keys::RawQuerynameLexKey
+pub fn fgumi_sort::keys::RawQuerynameLexKey::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::keys::RawQuerynameLexKey
+pub type fgumi_sort::keys::RawQuerynameLexKey::Init = T
+pub const fgumi_sort::keys::RawQuerynameLexKey::ALIGN: usize
+pub unsafe fn fgumi_sort::keys::RawQuerynameLexKey::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::keys::RawQuerynameLexKey::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::keys::RawQuerynameLexKey::drop(ptr: usize)
+pub unsafe fn fgumi_sort::keys::RawQuerynameLexKey::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::keys::RawQuerynameLexKey
+pub struct fgumi_sort::SortContext
+pub fgumi_sort::SortContext::nref: u32
+impl fgumi_sort::keys::SortContext
+pub fn fgumi_sort::keys::SortContext::from_header(header: &noodles_sam::header::Header) -> Self
+pub fn fgumi_sort::keys::SortContext::new(nref: u32) -> Self
+impl core::clone::Clone for fgumi_sort::keys::SortContext
+pub fn fgumi_sort::keys::SortContext::clone(&self) -> fgumi_sort::keys::SortContext
+impl core::marker::Freeze for fgumi_sort::keys::SortContext
+impl core::marker::Send for fgumi_sort::keys::SortContext
+impl core::marker::Sync for fgumi_sort::keys::SortContext
+impl core::marker::Unpin for fgumi_sort::keys::SortContext
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::keys::SortContext
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::keys::SortContext
+impl<T, U> core::convert::Into<U> for fgumi_sort::keys::SortContext where U: core::convert::From<T>
+pub fn fgumi_sort::keys::SortContext::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::keys::SortContext where U: core::convert::Into<T>
+pub type fgumi_sort::keys::SortContext::Error = core::convert::Infallible
+pub fn fgumi_sort::keys::SortContext::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::keys::SortContext where U: core::convert::TryFrom<T>
+pub type fgumi_sort::keys::SortContext::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::keys::SortContext::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for fgumi_sort::keys::SortContext where T: core::clone::Clone
+pub type fgumi_sort::keys::SortContext::Owned = T
+pub fn fgumi_sort::keys::SortContext::clone_into(&self, target: &mut T)
+pub fn fgumi_sort::keys::SortContext::to_owned(&self) -> T
+impl<T> core::any::Any for fgumi_sort::keys::SortContext where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::keys::SortContext::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::keys::SortContext where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::SortContext::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::keys::SortContext where T: ?core::marker::Sized
+pub fn fgumi_sort::keys::SortContext::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for fgumi_sort::keys::SortContext where T: core::clone::Clone
+pub unsafe fn fgumi_sort::keys::SortContext::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for fgumi_sort::keys::SortContext
+pub fn fgumi_sort::keys::SortContext::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::keys::SortContext
+pub type fgumi_sort::keys::SortContext::Init = T
+pub const fgumi_sort::keys::SortContext::ALIGN: usize
+pub unsafe fn fgumi_sort::keys::SortContext::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::keys::SortContext::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::keys::SortContext::drop(ptr: usize)
+pub unsafe fn fgumi_sort::keys::SortContext::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::keys::SortContext
+pub struct fgumi_sort::SortStats
+pub fgumi_sort::SortStats::chunks_written: usize
+pub fgumi_sort::SortStats::output_records: u64
+pub fgumi_sort::SortStats::total_records: u64
+impl core::default::Default for fgumi_sort::SortStats
+pub fn fgumi_sort::SortStats::default() -> fgumi_sort::SortStats
+impl core::fmt::Debug for fgumi_sort::SortStats
+pub fn fgumi_sort::SortStats::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for fgumi_sort::SortStats
+impl core::marker::Send for fgumi_sort::SortStats
+impl core::marker::Sync for fgumi_sort::SortStats
+impl core::marker::Unpin for fgumi_sort::SortStats
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::SortStats
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::SortStats
+impl<T, U> core::convert::Into<U> for fgumi_sort::SortStats where U: core::convert::From<T>
+pub fn fgumi_sort::SortStats::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::SortStats where U: core::convert::Into<T>
+pub type fgumi_sort::SortStats::Error = core::convert::Infallible
+pub fn fgumi_sort::SortStats::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::SortStats where U: core::convert::TryFrom<T>
+pub type fgumi_sort::SortStats::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::SortStats::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> core::any::Any for fgumi_sort::SortStats where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::SortStats::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::SortStats where T: ?core::marker::Sized
+pub fn fgumi_sort::SortStats::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::SortStats where T: ?core::marker::Sized
+pub fn fgumi_sort::SortStats::borrow_mut(&mut self) -> &mut T
+impl<T> core::convert::From<T> for fgumi_sort::SortStats
+pub fn fgumi_sort::SortStats::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::SortStats
+pub type fgumi_sort::SortStats::Init = T
+pub const fgumi_sort::SortStats::ALIGN: usize
+pub unsafe fn fgumi_sort::SortStats::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::SortStats::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::SortStats::drop(ptr: usize)
+pub unsafe fn fgumi_sort::SortStats::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::SortStats
+#[repr(C)] pub struct fgumi_sort::TemplateKey
+pub fgumi_sort::TemplateKey::cb_hash: u64
+pub fgumi_sort::TemplateKey::name_hash_upper: u64
+pub fgumi_sort::TemplateKey::primary: u64
+pub fgumi_sort::TemplateKey::secondary: u64
+pub fgumi_sort::TemplateKey::tertiary: u64
+impl fgumi_sort::inline::TemplateKey
+pub fn fgumi_sort::inline::TemplateKey::core_cmp(&self, other: &Self) -> core::cmp::Ordering
+impl fgumi_sort::inline::TemplateKey
+pub fn fgumi_sort::inline::TemplateKey::from_bytes(buf: &[u8; 40]) -> Self
+pub fn fgumi_sort::inline::TemplateKey::to_bytes(&self) -> [u8; 40]
+impl fgumi_sort::inline::TemplateKey
+pub fn fgumi_sort::inline::TemplateKey::new(tid1: i32, pos1: i32, neg1: bool, tid2: i32, pos2: i32, neg2: bool, cb_hash: u64, library: u32, mi: (u64, bool), name_hash: u64, is_upper: bool) -> Self
+pub fn fgumi_sort::inline::TemplateKey::unmapped(name_hash: u64, cb_hash: u64, is_read2: bool) -> Self
+pub fn fgumi_sort::inline::TemplateKey::zeroed() -> Self
+impl bytemuck::pod::Pod for fgumi_sort::inline::TemplateKey
+impl bytemuck::zeroable::Zeroable for fgumi_sort::inline::TemplateKey
+impl core::clone::Clone for fgumi_sort::inline::TemplateKey
+pub fn fgumi_sort::inline::TemplateKey::clone(&self) -> fgumi_sort::inline::TemplateKey
+impl core::cmp::Eq for fgumi_sort::inline::TemplateKey
+impl core::cmp::Ord for fgumi_sort::inline::TemplateKey
+pub fn fgumi_sort::inline::TemplateKey::cmp(&self, other: &Self) -> core::cmp::Ordering
+impl core::cmp::PartialEq for fgumi_sort::inline::TemplateKey
+pub fn fgumi_sort::inline::TemplateKey::eq(&self, other: &fgumi_sort::inline::TemplateKey) -> bool
+impl core::cmp::PartialOrd for fgumi_sort::inline::TemplateKey
+pub fn fgumi_sort::inline::TemplateKey::partial_cmp(&self, other: &Self) -> core::option::Option<core::cmp::Ordering>
+impl core::default::Default for fgumi_sort::inline::TemplateKey
+pub fn fgumi_sort::inline::TemplateKey::default() -> Self
+impl core::fmt::Debug for fgumi_sort::inline::TemplateKey
+pub fn fgumi_sort::inline::TemplateKey::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for fgumi_sort::inline::TemplateKey
+impl core::marker::StructuralPartialEq for fgumi_sort::inline::TemplateKey
+impl fgumi_sort::keys::RawSortKey for fgumi_sort::inline::TemplateKey
+pub const fgumi_sort::inline::TemplateKey::EMBEDDED_IN_RECORD: bool
+pub const fgumi_sort::inline::TemplateKey::SERIALIZED_SIZE: core::option::Option<usize>
+pub fn fgumi_sort::inline::TemplateKey::extract(_bam: &[u8], _ctx: &fgumi_sort::keys::SortContext) -> Self
+pub fn fgumi_sort::inline::TemplateKey::extract_from_record(_bam: &[u8]) -> Self
+pub fn fgumi_sort::inline::TemplateKey::read_from<R: std::io::Read>(reader: &mut R) -> std::io::error::Result<Self>
+pub fn fgumi_sort::inline::TemplateKey::write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::error::Result<()>
+impl core::marker::Freeze for fgumi_sort::inline::TemplateKey
+impl core::marker::Send for fgumi_sort::inline::TemplateKey
+impl core::marker::Sync for fgumi_sort::inline::TemplateKey
+impl core::marker::Unpin for fgumi_sort::inline::TemplateKey
+impl core::panic::unwind_safe::RefUnwindSafe for fgumi_sort::inline::TemplateKey
+impl core::panic::unwind_safe::UnwindSafe for fgumi_sort::inline::TemplateKey
+impl<Q, K> equivalent::Comparable<K> for fgumi_sort::inline::TemplateKey where Q: core::cmp::Ord + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateKey::compare(&self, key: &K) -> core::cmp::Ordering
+impl<Q, K> equivalent::Equivalent<K> for fgumi_sort::inline::TemplateKey where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateKey::equivalent(&self, key: &K) -> bool
+impl<Q, K> hashbrown::Equivalent<K> for fgumi_sort::inline::TemplateKey where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateKey::equivalent(&self, key: &K) -> bool
+impl<T, U> core::convert::Into<U> for fgumi_sort::inline::TemplateKey where U: core::convert::From<T>
+pub fn fgumi_sort::inline::TemplateKey::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for fgumi_sort::inline::TemplateKey where U: core::convert::Into<T>
+pub type fgumi_sort::inline::TemplateKey::Error = core::convert::Infallible
+pub fn fgumi_sort::inline::TemplateKey::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for fgumi_sort::inline::TemplateKey where U: core::convert::TryFrom<T>
+pub type fgumi_sort::inline::TemplateKey::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn fgumi_sort::inline::TemplateKey::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for fgumi_sort::inline::TemplateKey where T: core::clone::Clone
+pub type fgumi_sort::inline::TemplateKey::Owned = T
+pub fn fgumi_sort::inline::TemplateKey::clone_into(&self, target: &mut T)
+pub fn fgumi_sort::inline::TemplateKey::to_owned(&self) -> T
+impl<T> bytemuck::anybitpattern::AnyBitPattern for fgumi_sort::inline::TemplateKey where T: bytemuck::pod::Pod
+impl<T> bytemuck::checked::CheckedBitPattern for fgumi_sort::inline::TemplateKey where T: bytemuck::anybitpattern::AnyBitPattern
+pub type fgumi_sort::inline::TemplateKey::Bits = T
+pub fn fgumi_sort::inline::TemplateKey::is_valid_bit_pattern(_bits: &T) -> bool
+impl<T> bytemuck::no_uninit::NoUninit for fgumi_sort::inline::TemplateKey where T: bytemuck::pod::Pod
+impl<T> core::any::Any for fgumi_sort::inline::TemplateKey where T: 'static + ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateKey::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for fgumi_sort::inline::TemplateKey where T: ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateKey::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for fgumi_sort::inline::TemplateKey where T: ?core::marker::Sized
+pub fn fgumi_sort::inline::TemplateKey::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for fgumi_sort::inline::TemplateKey where T: core::clone::Clone
+pub unsafe fn fgumi_sort::inline::TemplateKey::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for fgumi_sort::inline::TemplateKey
+pub fn fgumi_sort::inline::TemplateKey::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for fgumi_sort::inline::TemplateKey
+pub type fgumi_sort::inline::TemplateKey::Init = T
+pub const fgumi_sort::inline::TemplateKey::ALIGN: usize
+pub unsafe fn fgumi_sort::inline::TemplateKey::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn fgumi_sort::inline::TemplateKey::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn fgumi_sort::inline::TemplateKey::drop(ptr: usize)
+pub unsafe fn fgumi_sort::inline::TemplateKey::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> either::into_either::IntoEither for fgumi_sort::inline::TemplateKey
+pub trait fgumi_sort::RawSortKey: core::cmp::Ord + core::clone::Clone + core::marker::Send + core::marker::Sync + core::marker::Sized
+pub const fgumi_sort::RawSortKey::EMBEDDED_IN_RECORD: bool
+pub const fgumi_sort::RawSortKey::SERIALIZED_SIZE: core::option::Option<usize>
+pub fn fgumi_sort::RawSortKey::extract(bam: &[u8], ctx: &fgumi_sort::keys::SortContext) -> Self
+pub fn fgumi_sort::RawSortKey::extract_from_record(_bam: &[u8]) -> Self
+pub fn fgumi_sort::RawSortKey::read_from<R: std::io::Read>(reader: &mut R) -> std::io::error::Result<Self>
+pub fn fgumi_sort::RawSortKey::write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::error::Result<()>
+impl fgumi_sort::keys::RawSortKey for fgumi_sort::inline::TemplateKey
+pub const fgumi_sort::inline::TemplateKey::EMBEDDED_IN_RECORD: bool
+pub const fgumi_sort::inline::TemplateKey::SERIALIZED_SIZE: core::option::Option<usize>
+pub fn fgumi_sort::inline::TemplateKey::extract(_bam: &[u8], _ctx: &fgumi_sort::keys::SortContext) -> Self
+pub fn fgumi_sort::inline::TemplateKey::extract_from_record(_bam: &[u8]) -> Self
+pub fn fgumi_sort::inline::TemplateKey::read_from<R: std::io::Read>(reader: &mut R) -> std::io::error::Result<Self>
+pub fn fgumi_sort::inline::TemplateKey::write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::error::Result<()>
+impl fgumi_sort::keys::RawSortKey for fgumi_sort::keys::RawCoordinateKey
+pub const fgumi_sort::keys::RawCoordinateKey::EMBEDDED_IN_RECORD: bool
+pub const fgumi_sort::keys::RawCoordinateKey::SERIALIZED_SIZE: core::option::Option<usize>
+pub fn fgumi_sort::keys::RawCoordinateKey::extract(bam: &[u8], ctx: &fgumi_sort::keys::SortContext) -> Self
+pub fn fgumi_sort::keys::RawCoordinateKey::extract_from_record(bam: &[u8]) -> Self
+pub fn fgumi_sort::keys::RawCoordinateKey::read_from<R: std::io::Read>(reader: &mut R) -> std::io::error::Result<Self>
+pub fn fgumi_sort::keys::RawCoordinateKey::write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::error::Result<()>
+impl fgumi_sort::keys::RawSortKey for fgumi_sort::keys::RawQuerynameKey
+pub const fgumi_sort::keys::RawQuerynameKey::EMBEDDED_IN_RECORD: bool
+pub const fgumi_sort::keys::RawQuerynameKey::SERIALIZED_SIZE: core::option::Option<usize>
+pub fn fgumi_sort::keys::RawQuerynameKey::extract(bam: &[u8], _ctx: &fgumi_sort::keys::SortContext) -> Self
+pub fn fgumi_sort::keys::RawQuerynameKey::extract_from_record(bam: &[u8]) -> Self
+pub fn fgumi_sort::keys::RawQuerynameKey::read_from<R: std::io::Read>(reader: &mut R) -> std::io::error::Result<Self>
+pub fn fgumi_sort::keys::RawQuerynameKey::write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::error::Result<()>
+impl fgumi_sort::keys::RawSortKey for fgumi_sort::keys::RawQuerynameLexKey
+pub const fgumi_sort::keys::RawQuerynameLexKey::EMBEDDED_IN_RECORD: bool
+pub const fgumi_sort::keys::RawQuerynameLexKey::SERIALIZED_SIZE: core::option::Option<usize>
+pub fn fgumi_sort::keys::RawQuerynameLexKey::extract(bam: &[u8], _ctx: &fgumi_sort::keys::SortContext) -> Self
+pub fn fgumi_sort::keys::RawQuerynameLexKey::extract_from_record(bam: &[u8]) -> Self
+pub fn fgumi_sort::keys::RawQuerynameLexKey::read_from<R: std::io::Read>(reader: &mut R) -> std::io::error::Result<Self>
+pub fn fgumi_sort::keys::RawQuerynameLexKey::write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::error::Result<()>
+pub fn fgumi_sort::cb_hasher() -> ahash::random_state::RandomState
+pub fn fgumi_sort::extract_coordinate_key_inline(bam: &[u8], nref: u32) -> u64
+pub fn fgumi_sort::extract_template_key_inline(bam_bytes: &[u8], lib_lookup: &fgumi_sort::external::LibraryLookup, cell_tag: core::option::Option<fgumi_tag::tag::SamTag>, cb_hasher: &ahash::random_state::RandomState) -> fgumi_sort::inline::TemplateKey
+pub fn fgumi_sort::normalize_natural_key(name: &[u8], out: &mut alloc::vec::Vec<u8>)
+pub fn fgumi_sort::parallel_merge<K, F>(chunk_files: &[std::path::PathBuf], _header: &noodles_sam::header::Header, output_header: &noodles_sam::header::Header, output: &std::path::Path, extract_key: F, config: fgumi_sort::pipeline::ParallelMergeConfig) -> anyhow::Result<u64> where K: core::clone::Clone + core::marker::Send + core::marker::Sync + core::cmp::Ord, F: core::ops::function::Fn(&fgumi_raw_bam::raw_bam_record::RawRecord) -> K + core::marker::Send + core::marker::Sync
+pub fn fgumi_sort::parallel_merge_buffered<K, F>(chunk_files: &[std::path::PathBuf], _header: &noodles_sam::header::Header, output_header: &noodles_sam::header::Header, output: &std::path::Path, extract_key: F, config: fgumi_sort::pipeline::ParallelMergeConfig) -> anyhow::Result<u64> where K: core::clone::Clone + core::marker::Send + core::marker::Sync + core::cmp::Ord, F: core::ops::function::Fn(&fgumi_raw_bam::raw_bam_record::RawRecord) -> K + core::marker::Send + core::marker::Sync
+pub fn fgumi_sort::verify_sort_order<K>(raw_reader: fgumi_sort::reader::RawBamRecordReader<std::fs::File>, extract_key: impl core::ops::function::Fn(&[u8]) -> K, is_violation: impl core::ops::function::Fn(&K, &K) -> bool) -> anyhow::Result<fgumi_sort::verify::VerifySummary>
+pub type fgumi_sort::VerifySummary = (u64, u64, core::option::Option<(u64, alloc::string::String)>)

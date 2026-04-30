@@ -385,7 +385,7 @@ pub fn start_memory_monitor(
                     && peak_rss > 4_000_000_000
                 {
                     log::info!("=== MIMALLOC STATS AT PEAK (no mi_collect) ===");
-                    fgumi_sort::memory_probe::print_mi_stats();
+                    fgumi_sort::print_mi_stats();
                     stats_printed = true;
                 }
                 if current_rss > peak_rss {

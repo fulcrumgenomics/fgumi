@@ -110,7 +110,7 @@ duplex = ["simplex", "fgumi-consensus/duplex"]
 codec = ["simplex", "fgumi-consensus/codec"]
 dhat-heap = ["dep:dhat"]
 # Enable comprehensive memory debugging infrastructure (monitor thread, hot-path atomics, CLI args)
-memory-debug = []
+memory-debug = ["fgumi-sort/memory-debug"]
 # Enable compare subcommand with bams and metrics (developer tools)
 compare = []
 # Enable simulate commands for generating synthetic test data
