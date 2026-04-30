@@ -3,12 +3,12 @@
 //! This tool reads a BAM file and outputs interleaved FASTQ to stdout for piping to aligners.
 //! Input should be queryname-sorted or template-coordinate sorted.
 
-use fgumi_bam_io::create_raw_bam_reader;
 use crate::commands::common::parse_bool;
 use crate::logging::OperationTimer;
 use crate::validation::validate_file_exists;
 use anyhow::Result;
 use clap::Parser;
+use fgumi_bam_io::create_raw_bam_reader;
 use fgumi_raw_bam::{
     RawRecord, extract_sequence_into, quality_scores_slice, read_name as raw_read_name,
 };

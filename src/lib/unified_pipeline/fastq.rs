@@ -3690,40 +3690,41 @@ where
         decompressed_readers.is_some(),
         config.inputs_are_bgzf,
     );
-    let stream_readers: Vec<StreamReader<Box<dyn BufRead + Send>>> =
-        if let Some(readers) = decompressed_readers {
-            // Gzip/plain: wrap each reader as StreamReader::Decompressed
-            let num_readers = readers.len();
-            log::debug!("run_fastq_pipeline: using {num_readers} Decompressed readers");
-            readers.into_iter().map(StreamReader::Decompressed).collect()
-        } else {
-            // BGZF: open each file as StreamReader::Bgzf. Advise sequential
-            // unconditionally on Linux to enlarge the per-fd read-ahead window, and
-            // optionally wrap in a userspace async prefetch reader when enabled.
-            log::debug!(
-                "run_fastq_pipeline: using {} BGZF readers (async_reader={})",
-                fastq_paths.len(),
-                config.async_reader,
-            );
-            fastq_paths
-                .iter()
-                .map(|p| {
-                    let file = File::open(p)?;
-                    fgumi_bam_io::os_hints::advise_sequential(&file);
-                    let inner: Box<dyn BufRead + Send> = if config.async_reader {
-                        // PrefetchReader dedicates one OS thread per input file to
-                        // issue reads ahead of the consumer, overlapping I/O with
-                        // processing. For paired/indexed inputs this adds 2-4 extra
-                        // threads beyond the pipeline worker count.
-                        let prefetch = fgumi_bam_io::prefetch_reader::PrefetchReader::from_file(file);
-                        Box::new(BufReader::with_capacity(256 * 1024, prefetch))
-                    } else {
-                        Box::new(BufReader::with_capacity(256 * 1024, file))
-                    };
-                    Ok(StreamReader::Bgzf(inner))
-                })
-                .collect::<io::Result<Vec<_>>>()?
-        };
+    let stream_readers: Vec<StreamReader<Box<dyn BufRead + Send>>> = if let Some(readers) =
+        decompressed_readers
+    {
+        // Gzip/plain: wrap each reader as StreamReader::Decompressed
+        let num_readers = readers.len();
+        log::debug!("run_fastq_pipeline: using {num_readers} Decompressed readers");
+        readers.into_iter().map(StreamReader::Decompressed).collect()
+    } else {
+        // BGZF: open each file as StreamReader::Bgzf. Advise sequential
+        // unconditionally on Linux to enlarge the per-fd read-ahead window, and
+        // optionally wrap in a userspace async prefetch reader when enabled.
+        log::debug!(
+            "run_fastq_pipeline: using {} BGZF readers (async_reader={})",
+            fastq_paths.len(),
+            config.async_reader,
+        );
+        fastq_paths
+            .iter()
+            .map(|p| {
+                let file = File::open(p)?;
+                fgumi_bam_io::os_hints::advise_sequential(&file);
+                let inner: Box<dyn BufRead + Send> = if config.async_reader {
+                    // PrefetchReader dedicates one OS thread per input file to
+                    // issue reads ahead of the consumer, overlapping I/O with
+                    // processing. For paired/indexed inputs this adds 2-4 extra
+                    // threads beyond the pipeline worker count.
+                    let prefetch = fgumi_bam_io::prefetch_reader::PrefetchReader::from_file(file);
+                    Box::new(BufReader::with_capacity(256 * 1024, prefetch))
+                } else {
+                    Box::new(BufReader::with_capacity(256 * 1024, file))
+                };
+                Ok(StreamReader::Bgzf(inner))
+            })
+            .collect::<io::Result<Vec<_>>>()?
+    };
 
     // Create state
     log::debug!("run_fastq_pipeline: creating pipeline state");

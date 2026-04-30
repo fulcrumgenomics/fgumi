@@ -23,7 +23,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
-use fgumi_bam_io::{create_bam_reader_for_pipeline_with_opts, is_stdin_path};
 use crate::grouper::{
     FilterMetrics, RawPositionGroup, RecordPositionGrouper, build_templates_from_records,
 };
@@ -43,6 +42,7 @@ use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fgoxide::io::DelimFile;
+use fgumi_bam_io::{create_bam_reader_for_pipeline_with_opts, is_stdin_path};
 
 use log::info;
 use noodles::sam::Header;

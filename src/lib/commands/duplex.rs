@@ -5,13 +5,13 @@
 //! 1. Single-strand consensus for /A and /B reads separately
 //! 2. Duplex consensus from paired single-strand consensuses
 
+use anyhow::{Context, Result, bail};
+use clap::Parser;
+use fgoxide::io::DelimFile;
 use fgumi_bam_io::{
     RawBamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
     create_optional_bam_writer, create_raw_bam_reader_with_opts, create_raw_bam_writer,
 };
-use anyhow::{Context, Result, bail};
-use clap::Parser;
-use fgoxide::io::DelimFile;
 
 use super::common::{
     BamIoOptions, CompressionOptions, ConsensusCallingOptions, OverlappingConsensusOptions,
@@ -30,7 +30,6 @@ use crate::overlapping_consensus::{
     apply_overlapping_consensus,
 };
 use crate::per_thread_accumulator::PerThreadAccumulator;
-use fgumi_bam_io::ProgressTracker;
 use crate::read_info::LibraryIndex;
 use crate::sam::{SamTag, header_as_unsorted};
 use crate::sort::bam_fields;
@@ -39,6 +38,7 @@ use crate::unified_pipeline::{
     GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
 };
 use crate::validation::validate_file_exists;
+use fgumi_bam_io::ProgressTracker;
 use fgumi_raw_bam::{RawRecord, RawRecordView};
 use log::info;
 use noodles::sam::Header;
@@ -898,8 +898,8 @@ fn has_both_strands_raw(records: &[RawRecord]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fgumi_bam_io::{create_bam_reader, create_bam_writer};
     use anyhow::Result;
+    use fgumi_bam_io::{create_bam_reader, create_bam_writer};
     use fgumi_raw_bam::{
         SamBuilder as RawSamBuilder, flags, raw_record_to_record_buf, testutil::encode_op,
     };

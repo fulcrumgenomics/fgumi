@@ -111,6 +111,11 @@ pub(crate) fn make_bgzf_writer(
 /// `noodles::bam::io::Writer::write_header` because the noodles encoder
 /// produces subtly different output that causes read-back failures with
 /// some writer backends (e.g. `MultithreadedWriter`).
+///
+/// # Errors
+///
+/// Returns an [`io::Error`] if writing to `writer` fails or if noodles
+/// cannot serialize the SAM header text.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 pub fn write_bam_header(writer: &mut impl Write, header: &Header) -> io::Result<()> {
     // BAM magic

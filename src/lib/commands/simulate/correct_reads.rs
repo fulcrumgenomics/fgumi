@@ -1,15 +1,15 @@
 //! Generate BAM and includelist for correct.
 
-use fgumi_bam_io::create_raw_bam_writer;
 use crate::commands::command::Command;
 use crate::commands::common::CompressionOptions;
 use crate::commands::simulate::common::generate_random_sequence;
-use fgumi_bam_io::ProgressTracker;
 use crate::sam::SamTag;
 use crate::simulate::create_rng;
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::bounded;
+use fgumi_bam_io::ProgressTracker;
+use fgumi_bam_io::create_raw_bam_writer;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
 use log::info;
 use noodles::sam::header::Header;

@@ -41,17 +41,12 @@
 //! corrector.execute("test").expect("Failed to correct UMIs");
 //! ```
 
-use fgumi_bam_io::{
-    BamWriter, RawBamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
-    create_optional_bam_writer, create_raw_bam_reader_with_opts, create_raw_bam_writer,
-};
 use crate::bitenc::BitEnc;
 use crate::dna::reverse_complement_str;
 use crate::grouper::TemplateGrouper;
 use crate::logging::OperationTimer;
 use crate::metrics::correct::UmiCorrectionMetrics;
 use crate::per_thread_accumulator::PerThreadAccumulator;
-use fgumi_bam_io::ProgressTracker;
 use crate::sam::{SamTag, header_as_unsorted};
 use crate::sort::bam_fields;
 use crate::template::TemplateBatch;
@@ -60,6 +55,11 @@ use crate::validation::validate_file_exists;
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use fgumi_bam_io::ProgressTracker;
+use fgumi_bam_io::{
+    BamWriter, RawBamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
+    create_optional_bam_writer, create_raw_bam_reader_with_opts, create_raw_bam_writer,
+};
 use fgumi_raw_bam::RawRecord;
 use log::{info, warn};
 use lru::LruCache;

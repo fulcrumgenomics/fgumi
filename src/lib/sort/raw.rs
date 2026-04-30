@@ -17,9 +17,6 @@
 //! 3. Sort by keys while keeping raw records
 //! 4. Write raw record bytes to output
 
-use fgumi_bam_io::create_raw_bam_reader;
-use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::{ChainedReader, TeeReader, is_stdin_path};
 use crate::sam::SamTag;
 use crate::sort::inline_buffer::{
     ProbeableBuffer, RecordBuffer, TemplateKey, TemplateRecordBuffer,
@@ -34,6 +31,9 @@ use crate::sort::tmp_dir_alloc::TmpDirAllocator;
 use crate::sort::worker_pool::SortWorkerPool;
 use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
+use fgumi_bam_io::ProgressTracker;
+use fgumi_bam_io::create_raw_bam_reader;
+use fgumi_bam_io::{ChainedReader, TeeReader, is_stdin_path};
 use log::{debug, info};
 use noodles::sam::Header;
 use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
@@ -1520,11 +1520,8 @@ impl RawExternalSorter {
         // main thread reads records directly from PooledInputStream.
         info!("Phase 1: Pool-integrated input reading ({} workers, N+2 model)", pool.num_workers());
         let (record_source, header) = {
-            let (reader, header) = create_raw_bam_reader_pool_integrated(
-                input,
-                &pool,
-                self.async_reader,
-            )?;
+            let (reader, header) =
+                create_raw_bam_reader_pool_integrated(input, &pool, self.async_reader)?;
             (RecordSource::direct(reader), header)
         };
 
@@ -1909,8 +1906,8 @@ impl RawExternalSorter {
         output: &Path,
         alloc: &mut TmpDirAllocator,
     ) -> Result<RawSortStats> {
-        use fgumi_bam_io::{create_indexing_bam_writer, write_bai_index};
         use crate::sort::keys::RawCoordinateKey;
+        use fgumi_bam_io::{create_indexing_bam_writer, write_bai_index};
 
         info!("Indexing enabled: will write BAM index alongside output");
 
@@ -2785,8 +2782,8 @@ impl RawExternalSorter {
         total_records: u64,
         pool: &Arc<SortWorkerPool>,
     ) -> Result<noodles::bam::bai::Index> {
-        use fgumi_bam_io::create_indexing_bam_writer;
         use crate::sort::loser_tree::LoserTree;
+        use fgumi_bam_io::create_indexing_bam_writer;
 
         // Thread budget: writer gets all threads (merge is output-compression-bound),
         // readers use semaphore concurrency of 1. Same split as merge_chunks_generic.
@@ -3062,9 +3059,8 @@ fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
         let tee = TeeReader::new(stdin);
         let bgzf = BgzfReader::new(tee);
         let mut noodles_reader = noodles::bam::io::Reader::from(bgzf);
-        let header = noodles_reader
-            .read_header()
-            .with_context(|| "Failed to read BAM header from stdin")?;
+        let header =
+            noodles_reader.read_header().with_context(|| "Failed to read BAM header from stdin")?;
 
         let bgzf = noodles_reader.into_inner();
         let tee = bgzf.into_inner();

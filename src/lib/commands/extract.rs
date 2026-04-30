@@ -14,7 +14,6 @@
 //! Automatically detects and handles both Phred+33 (standard) and Phred+64 (Illumina 1.3-1.7)
 //! quality encodings.
 
-use fgumi_bam_io::{RawBamWriter, create_raw_bam_writer};
 use crate::commands::command::Command;
 use crate::commands::common::{
     CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
@@ -24,13 +23,14 @@ use crate::fastq::FastqSet;
 use crate::fastq::ReadSetIterator;
 use crate::grouper::FastqTemplate;
 use crate::logging::OperationTimer;
-use fgumi_bam_io::ProgressTracker;
 use crate::sam::SamTag;
 use crate::unified_pipeline::{FastqPipelineConfig, MemoryEstimate, run_fastq_pipeline};
 use crate::validation::validate_file_exists;
 use anyhow::{Result, bail, ensure};
 use bstr::{BString, ByteSlice};
 use clap::Parser;
+use fgumi_bam_io::ProgressTracker;
+use fgumi_bam_io::{RawBamWriter, create_raw_bam_writer};
 use fgumi_raw_bam::UnmappedSamBuilder;
 use fgumi_raw_bam::fields::flags;
 use log::{debug, info};

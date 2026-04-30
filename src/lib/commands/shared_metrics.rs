@@ -5,11 +5,11 @@
 //! deterministic downsampling. Both `duplex_metrics` and `simplex_metrics` commands
 //! build on these shared primitives.
 
-use fgumi_bam_io::create_raw_bam_reader;
-use fgumi_bam_io::ProgressTracker;
 use crate::sam::SamTag;
 use crate::template::TemplateIterator;
 use anyhow::{Context, Result};
+use fgumi_bam_io::ProgressTracker;
+use fgumi_bam_io::create_raw_bam_reader;
 use fgumi_raw_bam::{
     AsTagBytes, RawRecord, alignment_end_from_raw, aux_data_slice, find_string_tag_in_record,
     find_tag_type, flags as raw_flags, unclipped_5prime_from_raw_bam,

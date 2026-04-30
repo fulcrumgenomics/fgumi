@@ -7,13 +7,13 @@ use std::path::PathBuf;
 #[cfg(feature = "simplex")]
 use std::sync::Arc;
 
-use fgumi_bam_io::is_stdin_path;
 #[cfg(feature = "simplex")]
 use crate::logging::OperationTimer;
 use crate::unified_pipeline::{BamPipelineConfig, SchedulerStrategy};
 use crate::validation::validate_file_exists;
 use bytesize::ByteSize;
 use clap::Args;
+use fgumi_bam_io::is_stdin_path;
 #[cfg(feature = "simplex")]
 use fgumi_consensus::methylation::RefBaseProvider;
 #[cfg(feature = "simplex")]

@@ -5,10 +5,10 @@
 
 use crate::commands::common::parse_bool;
 use crate::logging::OperationTimer;
-use fgumi_bam_io::ProgressTracker;
 use crate::validation::validate_file_exists;
 use anyhow::Result;
 use clap::Parser;
+use fgumi_bam_io::ProgressTracker;
 use log::info;
 use std::fs::File;
 use std::io::{BufRead, BufReader};

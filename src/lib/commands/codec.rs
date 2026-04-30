@@ -6,16 +6,16 @@
 //! of the original duplex molecule. R1 comes from one strand, R2 from the opposite strand,
 //! allowing even a single read-pair to generate duplex consensus.
 
-use fgumi_bam_io::{
-    RawBamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
-    create_optional_bam_writer, create_raw_bam_reader_with_opts, create_raw_bam_writer,
-};
 use crate::commands::command::Command;
 use crate::commands::consensus_runner::{ConsensusStatsOps, create_unmapped_consensus_header};
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fgoxide::io::DelimFile;
+use fgumi_bam_io::{
+    RawBamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
+    create_optional_bam_writer, create_raw_bam_reader_with_opts, create_raw_bam_writer,
+};
 
 use super::common::{
     BamIoOptions, CompressionOptions, ConsensusCallingOptions, QueueMemoryOptions,
@@ -28,11 +28,11 @@ use crate::consensus::codec_caller::{
 use crate::consensus_caller::{ConsensusCaller, ConsensusOutput};
 use crate::logging::{OperationTimer, log_consensus_summary};
 use crate::mi_group::{MiGroup, MiGroupBatch, MiGroupIterator, MiGrouper};
-use fgumi_bam_io::ProgressTracker;
 use crate::read_info::LibraryIndex;
 use crate::unified_pipeline::{
     GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
 };
+use fgumi_bam_io::ProgressTracker;
 use fgumi_raw_bam::RawRecord;
 // RejectionTracker now used via ConsensusStatsOps trait in consensus_runner
 use crate::sam::{SamTag, header_as_unsorted};

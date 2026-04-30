@@ -1,7 +1,6 @@
 //! Groups reads by UMI to identify reads from the same original molecule.
 
 use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
-use fgumi_bam_io::{create_bam_reader_for_pipeline, create_bam_writer, is_stdin_path};
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
@@ -14,7 +13,6 @@ use crate::grouper::{
 use crate::logging::{OperationTimer, log_umi_grouping_summary};
 use crate::metrics::group::{FamilySizeMetrics, PositionGroupSizeMetrics, UmiGroupingMetrics};
 use crate::per_thread_accumulator::PerThreadAccumulator;
-use fgumi_bam_io::ProgressTracker;
 use crate::read_info::LibraryIndex;
 use crate::sam::{is_sorted, is_template_coordinate_sorted};
 use crate::template::Template;
@@ -32,6 +30,8 @@ use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fgoxide::io::DelimFile;
+use fgumi_bam_io::ProgressTracker;
+use fgumi_bam_io::{create_bam_reader_for_pipeline, create_bam_writer, is_stdin_path};
 // MemoryEstimate is gated because it's only used in memory-debug blocks below
 use crate::sam::SamTag;
 #[cfg(feature = "memory-debug")]

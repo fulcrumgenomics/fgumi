@@ -46,14 +46,10 @@
 //! - `TemplateIterator`: Groups raw BAM bytes from the unmapped reader into Templates
 //! - `TagInfo`: Holds sets of tags to remove/reverse/revcomp
 //! - `merge_raw()`: Core function that transfers metadata between templates using raw bytes
-use fgumi_bam_io::{
-    RawBamReaderAuto, create_raw_bam_reader, create_raw_bam_writer, is_stdin_path,
-};
 use crate::batched_sam_reader::BatchedSamReader;
 use crate::commands::command::Command;
 use crate::commands::common::{CompressionOptions, parse_bool};
 use crate::logging::OperationTimer;
-use fgumi_bam_io::ProgressTracker;
 use crate::reference::{ReferenceReader, find_dict_path};
 use crate::sam::{SamTag, TemplateCoordinateInfo, check_sort};
 use crate::sort::bam_fields;
@@ -63,6 +59,8 @@ use crate::validation::validate_file_exists;
 use anyhow::{Context, Result};
 use bstr::ByteSlice;
 use clap::Parser;
+use fgumi_bam_io::ProgressTracker;
+use fgumi_bam_io::{RawBamReaderAuto, create_raw_bam_reader, create_raw_bam_writer, is_stdin_path};
 use fgumi_raw_bam::{BAM_BASE_TO_ASCII, RawRecord, RawRecordView, RecordBufEncoder};
 use log::{debug, info, warn};
 use noodles::core::Position;

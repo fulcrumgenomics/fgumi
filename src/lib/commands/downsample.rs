@@ -5,13 +5,13 @@
 //!
 //! Requires input BAM to be in template-coordinate order (from group).
 
-use fgumi_bam_io::{RawBamWriter, create_raw_bam_reader, create_raw_bam_writer};
 use crate::logging::OperationTimer;
-use fgumi_bam_io::ProgressTracker;
 use crate::sam::{SamTag, is_template_coordinate_sorted};
 use crate::validation::validate_file_exists;
 use anyhow::{Result, bail};
 use clap::Parser;
+use fgumi_bam_io::ProgressTracker;
+use fgumi_bam_io::{RawBamWriter, create_raw_bam_reader, create_raw_bam_writer};
 use fgumi_raw_bam::{
     RawBamReader, RawRecord, aux_data_slice, find_int_tag, find_string_tag, read_name,
 };

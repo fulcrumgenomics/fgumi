@@ -9,7 +9,6 @@
 //!    (min reads, max read error rate, max no-calls, min mean quality)
 
 use crate::alignment_tags::regenerate_alignment_tags_raw;
-use fgumi_bam_io::create_bam_reader_for_pipeline_with_opts;
 #[cfg(feature = "simplex")]
 use crate::consensus_filter::resolve_ref_bases_for_record;
 use crate::consensus_filter::{
@@ -35,6 +34,7 @@ use crate::validation::validate_file_exists;
 use ahash::AHashMap;
 use anyhow::{Result, bail};
 use clap::Parser;
+use fgumi_bam_io::create_bam_reader_for_pipeline_with_opts;
 use fgumi_raw_bam::{RawRecord, RawRecordView};
 use log::info;
 use noodles::sam::Header;

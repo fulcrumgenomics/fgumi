@@ -90,8 +90,8 @@ use super::deadlock::{DeadlockAction, DeadlockState, QueueSnapshot, check_deadlo
 
 use crate::bgzf_reader::{RawBgzfBlock, decompress_block_into, read_raw_blocks};
 use crate::read_info::LibraryIndex;
-use fgumi_bam_io::ReorderBuffer;
 use crate::sam::SamTag;
+use fgumi_bam_io::ReorderBuffer;
 use fgumi_raw_bam::RawRecord;
 use noodles::sam::alignment::record::data::field::Tag;
 
