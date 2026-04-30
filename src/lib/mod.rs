@@ -148,7 +148,6 @@ pub mod read_info;
 pub mod reference;
 pub use fgumi_metrics::rejection;
 pub mod sam;
-pub mod sort;
 pub mod system;
 pub mod tag_reversal;
 pub mod template;
