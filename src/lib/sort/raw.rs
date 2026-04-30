@@ -1529,7 +1529,7 @@ impl RawExternalSorter {
 
         // Add @PG record if pg_info was provided
         let header = if let Some((ref version, ref command_line)) = self.pg_info {
-            crate::header::add_pg_record(header, version, command_line)?
+            fgumi_bam_io::header::add_pg_record(header, version, command_line)?
         } else {
             header
         };

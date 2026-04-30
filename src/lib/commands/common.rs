@@ -107,19 +107,19 @@ pub fn load_methylation_reference(
 
 /// Add a @PG record to an existing header, using the current fgumi version.
 ///
-/// Wraps [`crate::header::add_pg_record`] with the binary's version string.
+/// Wraps [`fgumi_bam_io::header::add_pg_record`] with the binary's version string.
 pub fn add_pg_record(header: Header, command_line: &str) -> anyhow::Result<Header> {
-    crate::header::add_pg_record(header, crate::version::VERSION.as_str(), command_line)
+    fgumi_bam_io::header::add_pg_record(header, crate::version::VERSION.as_str(), command_line)
 }
 
 /// Add a @PG record to a header builder, using the current fgumi version.
 ///
-/// Wraps [`crate::header::add_pg_to_builder`] with the binary's version string.
+/// Wraps [`fgumi_bam_io::header::add_pg_to_builder`] with the binary's version string.
 pub fn add_pg_to_builder(
     builder: noodles::sam::header::Builder,
     command_line: &str,
 ) -> anyhow::Result<noodles::sam::header::Builder> {
-    crate::header::add_pg_to_builder(builder, crate::version::VERSION.as_str(), command_line)
+    fgumi_bam_io::header::add_pg_to_builder(builder, crate::version::VERSION.as_str(), command_line)
 }
 
 /// EM-Seq methylation-aware consensus calling options.
