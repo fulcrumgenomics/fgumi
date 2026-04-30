@@ -25,28 +25,42 @@ use crate::vendored::{BlockInfoRx, MultithreadedWriter, MultithreadedWriterBuild
 /// Maximum uncompressed BGZF block size (64KB - 256 bytes for overhead).
 const MAX_BLOCK_SIZE: usize = 65280;
 
-/// Enum wrapping single-threaded and multi-threaded BGZF writers.
+/// Opaque wrapper over either a single- or multi-threaded BGZF writer.
 ///
-/// Uses `Box<dyn Write + Send>` to support both file and stdout output.
-pub enum BgzfWriterEnum {
-    /// Single-threaded BGZF writer
+/// Uses `Box<dyn Write + Send>` to support both file and stdout output. The
+/// internal representation is intentionally private so that the choice of
+/// underlying multi-threaded BGZF writer is not part of the public API.
+pub struct BgzfWriterEnum {
+    inner: BgzfWriterImpl,
+}
+
+enum BgzfWriterImpl {
     SingleThreaded(BgzfWriter<Box<dyn Write + Send>>),
-    /// Multi-threaded BGZF writer
     MultiThreaded(MultithreadedWriter<Box<dyn Write + Send>>),
+}
+
+impl BgzfWriterEnum {
+    pub(crate) fn single_threaded(writer: BgzfWriter<Box<dyn Write + Send>>) -> Self {
+        Self { inner: BgzfWriterImpl::SingleThreaded(writer) }
+    }
+
+    pub(crate) fn multi_threaded(writer: MultithreadedWriter<Box<dyn Write + Send>>) -> Self {
+        Self { inner: BgzfWriterImpl::MultiThreaded(writer) }
+    }
 }
 
 impl Write for BgzfWriterEnum {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            BgzfWriterEnum::SingleThreaded(w) => w.write(buf),
-            BgzfWriterEnum::MultiThreaded(w) => w.write(buf),
+        match &mut self.inner {
+            BgzfWriterImpl::SingleThreaded(w) => w.write(buf),
+            BgzfWriterImpl::MultiThreaded(w) => w.write(buf),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        match self {
-            BgzfWriterEnum::SingleThreaded(w) => w.flush(),
-            BgzfWriterEnum::MultiThreaded(w) => w.flush(),
+        match &mut self.inner {
+            BgzfWriterImpl::SingleThreaded(w) => w.flush(),
+            BgzfWriterImpl::MultiThreaded(w) => w.flush(),
         }
     }
 }
@@ -59,13 +73,13 @@ impl BgzfWriterEnum {
     /// # Errors
     /// Returns an error if flushing or finalizing the writer fails.
     pub fn finish(self) -> io::Result<()> {
-        match self {
-            BgzfWriterEnum::SingleThreaded(mut w) => {
+        match self.inner {
+            BgzfWriterImpl::SingleThreaded(mut w) => {
                 w.flush()?;
                 // Single-threaded writer writes EOF on drop
                 Ok(())
             }
-            BgzfWriterEnum::MultiThreaded(mut w) => {
+            BgzfWriterImpl::MultiThreaded(mut w) => {
                 w.finish().map_err(|e| io::Error::other(e.to_string()))?;
                 Ok(())
             }
@@ -92,14 +106,14 @@ pub(crate) fn make_bgzf_writer(
             builder = builder.set_compression_level(cl);
         }
 
-        BgzfWriterEnum::MultiThreaded(builder.build_from_writer(output))
+        BgzfWriterEnum::multi_threaded(builder.build_from_writer(output))
     } else {
         let level = noodles_bgzf::io::writer::CompressionLevel::new(compression_level as u8)
             .unwrap_or_default();
         let writer = noodles_bgzf::io::writer::Builder::default()
             .set_compression_level(level)
             .build_from_writer(output);
-        BgzfWriterEnum::SingleThreaded(writer)
+        BgzfWriterEnum::single_threaded(writer)
     }
 }
 
@@ -750,7 +764,7 @@ mod tests {
     fn test_bgzf_writer_flush_single_threaded() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
         let output_file: Box<dyn Write + Send> = Box::new(File::create(temp_file.path())?);
-        let mut writer = BgzfWriterEnum::SingleThreaded(BgzfWriter::new(output_file));
+        let mut writer = BgzfWriterEnum::single_threaded(BgzfWriter::new(output_file));
 
         // Write some data and flush
         writer.write_all(b"test data")?;
@@ -766,7 +780,7 @@ mod tests {
         let output_file: Box<dyn Write + Send> = Box::new(File::create(temp_file.path())?);
         let worker_count = NonZero::new(2).expect("2 is non-zero");
         let compression_level = CompressionLevel::new(6).expect("valid compression level");
-        let mut writer = BgzfWriterEnum::MultiThreaded(MultithreadedWriter::with_worker_count(
+        let mut writer = BgzfWriterEnum::multi_threaded(MultithreadedWriter::with_worker_count(
             worker_count,
             output_file,
             compression_level,
@@ -784,7 +798,7 @@ mod tests {
     fn test_bgzf_writer_finish_single_threaded() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
         let output_file: Box<dyn Write + Send> = Box::new(File::create(temp_file.path())?);
-        let mut writer = BgzfWriterEnum::SingleThreaded(BgzfWriter::new(output_file));
+        let mut writer = BgzfWriterEnum::single_threaded(BgzfWriter::new(output_file));
 
         // Write some data
         writer.write_all(b"test data")?;
@@ -802,7 +816,7 @@ mod tests {
         let output_file: Box<dyn Write + Send> = Box::new(File::create(temp_file.path())?);
         let worker_count = NonZero::new(2).expect("2 is non-zero");
         let compression_level = CompressionLevel::new(6).expect("valid compression level");
-        let mut writer = BgzfWriterEnum::MultiThreaded(MultithreadedWriter::with_worker_count(
+        let mut writer = BgzfWriterEnum::multi_threaded(MultithreadedWriter::with_worker_count(
             worker_count,
             output_file,
             compression_level,
@@ -822,7 +836,7 @@ mod tests {
     fn test_bgzf_writer_write_single_threaded() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
         let output_file: Box<dyn Write + Send> = Box::new(File::create(temp_file.path())?);
-        let mut writer = BgzfWriterEnum::SingleThreaded(BgzfWriter::new(output_file));
+        let mut writer = BgzfWriterEnum::single_threaded(BgzfWriter::new(output_file));
 
         // Test writing via the Write trait
         let bytes_written = writer.write(b"test")?;
@@ -837,7 +851,7 @@ mod tests {
         let output_file: Box<dyn Write + Send> = Box::new(File::create(temp_file.path())?);
         let worker_count = NonZero::new(2).expect("2 is non-zero");
         let compression_level = CompressionLevel::new(6).expect("valid compression level");
-        let mut writer = BgzfWriterEnum::MultiThreaded(MultithreadedWriter::with_worker_count(
+        let mut writer = BgzfWriterEnum::multi_threaded(MultithreadedWriter::with_worker_count(
             worker_count,
             output_file,
             compression_level,

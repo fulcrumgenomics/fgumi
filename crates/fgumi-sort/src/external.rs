@@ -3022,9 +3022,9 @@ pub(crate) use crate::SortStats as RawSortStats;
 // ============================================================================
 // Pool-integrated BAM reader construction
 //
-// This function uses sort-module-local types (SortWorkerPool, PooledInputStream,
-// phase) so it cannot live in fgumi-bam-io. It will move to fgumi-sort in
-// Phase D when the sort module is extracted.
+// This function depends on sort-internal types (`SortWorkerPool`,
+// `PooledInputStream`, `phase`), which is why it lives here in `fgumi-sort`
+// rather than in `fgumi-bam-io`.
 // ============================================================================
 
 /// Create a raw BAM reader using the pool's Phase 1 integrated reading.

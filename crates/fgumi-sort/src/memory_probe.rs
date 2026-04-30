@@ -42,12 +42,16 @@ use bytesize::ByteSize;
 use log::{Level, info, log_enabled};
 
 #[cfg(feature = "memory-debug")]
-#[allow(unused_imports)] // re-exported for main crate's unified_pipeline (Phase E)
+#[allow(unused_imports)] // consumed by main fgumi's unified_pipeline via the crate-root re-export
 pub use platform_ffi::print_mi_stats;
 pub use platform_ffi::{force_mi_collect, process_rss_bytes};
 
-/// Log target for the memory probe. Enable with
-/// `RUST_LOG=fgumi_lib::sort::memory_probe=info`.
+/// Log target for the memory probe.
+///
+/// Intentionally retained as `fgumi_lib::sort::memory_probe` (the pre-extraction
+/// path) so existing operator runbooks continue to work. Enable with
+/// `RUST_LOG=fgumi_lib::sort::memory_probe=info`. Do not "fix" this string to
+/// match the new module path — that would silently break in-flight log filters.
 const TARGET: &str = "fgumi_lib::sort::memory_probe";
 
 /// Platform-specific FFI helpers isolated from the main module to contain the
@@ -73,7 +77,7 @@ mod platform_ffi {
     /// `mi_stats_print_out(None, null_mut())` uses mimalloc's internal synchronization,
     /// making it safe to call concurrently with allocation/deallocation on other threads.
     #[cfg(feature = "memory-debug")]
-    #[allow(dead_code)] // called by the main crate's unified_pipeline (Phase E)
+    #[allow(dead_code)] // consumed by main fgumi's unified_pipeline via the crate-root re-export
     pub fn print_mi_stats() {
         // SAFETY: mimalloc synchronizes stats collection internally.
         unsafe {

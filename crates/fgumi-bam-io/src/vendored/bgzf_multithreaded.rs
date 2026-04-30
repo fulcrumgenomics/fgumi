@@ -4,6 +4,11 @@
 //! that maintains block ordering and supports position tracking for building indexes
 //! during concurrent writes.
 //!
+//! Some accessors and constructors are only exercised by tests; the
+//! `dead_code` allow at module scope keeps them available for the test harness.
+
+#![allow(dead_code)]
+//!
 //! # Position Tracking
 //!
 //! The writer provides APIs to track compressed file positions, enabling construction
