@@ -91,6 +91,8 @@ jobs:
             fgumi-simd-fastq
             fgumi-tag
             fgumi-raw-bam
+            fgumi-bam-io
+            fgumi-sort
             fgumi-umi
             fgumi-sam
             fgumi-metrics
