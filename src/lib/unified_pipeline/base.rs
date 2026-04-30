@@ -84,7 +84,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::progress::ProgressTracker;
+use fgumi_bam_io::ProgressTracker;
 
 use super::deadlock::{DeadlockAction, DeadlockState, QueueSnapshot, check_deadlock_and_restore};
 

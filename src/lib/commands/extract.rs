@@ -24,7 +24,7 @@ use crate::fastq::FastqSet;
 use crate::fastq::ReadSetIterator;
 use crate::grouper::FastqTemplate;
 use crate::logging::OperationTimer;
-use crate::progress::ProgressTracker;
+use fgumi_bam_io::ProgressTracker;
 use crate::sam::SamTag;
 use crate::unified_pipeline::{FastqPipelineConfig, MemoryEstimate, run_fastq_pipeline};
 use crate::validation::validate_file_exists;

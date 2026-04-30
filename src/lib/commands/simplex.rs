@@ -17,7 +17,7 @@ use crate::overlapping_consensus::{
     AgreementStrategy, CorrectionStats, DisagreementStrategy, OverlappingBasesConsensusCaller,
     apply_overlapping_consensus,
 };
-use crate::progress::ProgressTracker;
+use fgumi_bam_io::ProgressTracker;
 use crate::read_info::LibraryIndex;
 use crate::unified_pipeline::{
     GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,

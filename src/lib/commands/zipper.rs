@@ -53,7 +53,7 @@ use crate::batched_sam_reader::BatchedSamReader;
 use crate::commands::command::Command;
 use crate::commands::common::{CompressionOptions, parse_bool};
 use crate::logging::OperationTimer;
-use crate::progress::ProgressTracker;
+use fgumi_bam_io::ProgressTracker;
 use crate::reference::{ReferenceReader, find_dict_path};
 use crate::sam::{SamTag, TemplateCoordinateInfo, check_sort};
 use crate::sort::bam_fields;

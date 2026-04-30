@@ -6,7 +6,7 @@ use crate::commands::simulate::common::{
     FamilySizeArgs, InsertSizeArgs, MethylationArgs, MethylationConfig, QualityArgs,
     ReferenceGenome, SimulationCommon, apply_methylation_conversion, generate_random_sequence,
 };
-use crate::progress::ProgressTracker;
+use fgumi_bam_io::ProgressTracker;
 use crate::simulate::{FastqWriter, create_rng};
 use anyhow::{Context, Result, bail};
 use clap::Parser;

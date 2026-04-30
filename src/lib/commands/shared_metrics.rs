@@ -6,7 +6,7 @@
 //! build on these shared primitives.
 
 use fgumi_bam_io::create_raw_bam_reader;
-use crate::progress::ProgressTracker;
+use fgumi_bam_io::ProgressTracker;
 use crate::sam::SamTag;
 use crate::template::TemplateIterator;
 use anyhow::{Context, Result};

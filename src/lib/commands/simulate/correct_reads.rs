@@ -4,7 +4,7 @@ use fgumi_bam_io::create_raw_bam_writer;
 use crate::commands::command::Command;
 use crate::commands::common::CompressionOptions;
 use crate::commands::simulate::common::generate_random_sequence;
-use crate::progress::ProgressTracker;
+use fgumi_bam_io::ProgressTracker;
 use crate::sam::SamTag;
 use crate::simulate::create_rng;
 use anyhow::{Context, Result};

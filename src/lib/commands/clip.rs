@@ -14,7 +14,7 @@ use crate::logging::OperationTimer;
 use crate::metrics::clip::{ClipCounts, ClippingMetricsCollection};
 use crate::metrics::writer::write_metrics as write_metrics_tsv;
 use crate::per_thread_accumulator::PerThreadAccumulator;
-use crate::progress::ProgressTracker;
+use fgumi_bam_io::ProgressTracker;
 use crate::reference::ReferenceReader;
 use crate::sam::SamTag;
 use crate::template::{TemplateBatch, TemplateIterator};

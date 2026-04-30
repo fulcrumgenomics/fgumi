@@ -28,7 +28,7 @@ use crate::consensus::codec_caller::{
 use crate::consensus_caller::{ConsensusCaller, ConsensusOutput};
 use crate::logging::{OperationTimer, log_consensus_summary};
 use crate::mi_group::{MiGroup, MiGroupBatch, MiGroupIterator, MiGrouper};
-use crate::progress::ProgressTracker;
+use fgumi_bam_io::ProgressTracker;
 use crate::read_info::LibraryIndex;
 use crate::unified_pipeline::{
     GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,

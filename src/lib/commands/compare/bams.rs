@@ -15,7 +15,7 @@
 
 use fgumi_bam_io::{RawBamReaderAuto, create_raw_bam_reader};
 use crate::logging::OperationTimer;
-use crate::progress::ProgressTracker;
+use fgumi_bam_io::ProgressTracker;
 use crate::sam::SamTag;
 use crate::validation::validate_file_exists;
 use ahash::{AHashMap, AHashSet};

@@ -51,7 +51,7 @@ use crate::grouper::TemplateGrouper;
 use crate::logging::OperationTimer;
 use crate::metrics::correct::UmiCorrectionMetrics;
 use crate::per_thread_accumulator::PerThreadAccumulator;
-use crate::progress::ProgressTracker;
+use fgumi_bam_io::ProgressTracker;
 use crate::sam::{SamTag, header_as_unsorted};
 use crate::sort::bam_fields;
 use crate::template::TemplateBatch;

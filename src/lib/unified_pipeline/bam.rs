@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use fgumi_bam_io::is_stdout_path;
 use crate::bgzf_reader::{BGZF_EOF, decompress_block_into, read_raw_blocks};
 use crate::bgzf_writer::InlineBgzfCompressor;
-use crate::progress::ProgressTracker;
+use fgumi_bam_io::ProgressTracker;
 use crate::reorder_buffer::ReorderBuffer;
 use crate::sam::SamTag;
 use noodles::sam::alignment::record::data::field::Tag;

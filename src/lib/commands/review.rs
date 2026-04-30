@@ -6,7 +6,7 @@
 
 use crate::commands::common::parse_bool;
 use crate::logging::OperationTimer;
-use crate::progress::ProgressTracker;
+use fgumi_bam_io::ProgressTracker;
 use crate::reference::find_dict_path;
 use crate::sam::SamTag;
 use crate::umi::extract_mi_base;

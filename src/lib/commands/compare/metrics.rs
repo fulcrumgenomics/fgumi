@@ -5,7 +5,7 @@
 
 use crate::commands::common::parse_bool;
 use crate::logging::OperationTimer;
-use crate::progress::ProgressTracker;
+use fgumi_bam_io::ProgressTracker;
 use crate::validation::validate_file_exists;
 use anyhow::Result;
 use clap::Parser;

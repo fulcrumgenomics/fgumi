@@ -18,7 +18,7 @@
 //! 4. Write raw record bytes to output
 
 use fgumi_bam_io::create_raw_bam_reader;
-use crate::progress::ProgressTracker;
+use fgumi_bam_io::ProgressTracker;
 use crate::sam::SamTag;
 use crate::sort::inline_buffer::{
     ProbeableBuffer, RecordBuffer, TemplateKey, TemplateRecordBuffer,

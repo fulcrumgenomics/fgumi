@@ -7,7 +7,7 @@
 
 use fgumi_bam_io::{RawBamWriter, create_raw_bam_reader, create_raw_bam_writer};
 use crate::logging::OperationTimer;
-use crate::progress::ProgressTracker;
+use fgumi_bam_io::ProgressTracker;
 use crate::sam::{SamTag, is_template_coordinate_sorted};
 use crate::validation::validate_file_exists;
 use anyhow::{Result, bail};

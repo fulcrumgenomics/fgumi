@@ -15,7 +15,7 @@ use crate::commands::simulate::common::{
 };
 use crate::commands::simulate::region_to_bin;
 use crate::dna::reverse_complement;
-use crate::progress::ProgressTracker;
+use fgumi_bam_io::ProgressTracker;
 use crate::sam::SamTag;
 use crate::simulate::{
     FamilySizeDistribution, InsertSizeModel, PositionQualityModel, ReadPairQualityBias,

@@ -30,7 +30,7 @@ use crate::overlapping_consensus::{
     apply_overlapping_consensus,
 };
 use crate::per_thread_accumulator::PerThreadAccumulator;
-use crate::progress::ProgressTracker;
+use fgumi_bam_io::ProgressTracker;
 use crate::read_info::LibraryIndex;
 use crate::sam::{SamTag, header_as_unsorted};
 use crate::sort::bam_fields;
