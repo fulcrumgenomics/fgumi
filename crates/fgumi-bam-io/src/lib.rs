@@ -22,3 +22,4 @@ pub mod reorder;
 pub(crate) mod vendored;
 
 pub use mem_estimate::MemoryEstimate;
+pub use reorder::{DrainReady, ReorderBuffer};

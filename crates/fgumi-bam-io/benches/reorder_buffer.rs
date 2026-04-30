@@ -17,7 +17,7 @@ use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
-use fgumi_lib::reorder_buffer::ReorderBuffer;
+use fgumi_bam_io::ReorderBuffer;
 
 /// Number of inserts per bench iteration. Large enough that per-call overhead
 /// is amortized, small enough to keep the bench quick.

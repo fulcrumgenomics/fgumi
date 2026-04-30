@@ -151,10 +151,6 @@ harness = false
 name = "raw_bam"
 harness = false
 
-[[bench]]
-name = "reorder_buffer"
-harness = false
-
 [build-dependencies]
 built = { version = "0", features = ["git2"] }
 
