@@ -9,10 +9,10 @@
 //! - Sort by index array, not by moving actual record data
 //! - ~24 bytes overhead per record vs ~110 bytes
 
-use fgumi_raw_bam;
 use crate::keys::{RawCoordinateKey, RawSortKey, SortContext};
 use crate::radix::bytes_needed_u64;
 use crate::segmented_buf::SegmentedBuf;
+use fgumi_raw_bam;
 use fgumi_raw_bam::{RawRecord, RawRecordView};
 use std::cmp::Ordering;
 use std::io::{Read, Write};

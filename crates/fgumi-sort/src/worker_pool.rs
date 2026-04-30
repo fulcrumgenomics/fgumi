@@ -315,6 +315,7 @@ impl BufferPool {
 
     /// Returns true if no buffers are currently available in the pool.
     #[must_use]
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.rx.is_empty()
     }
@@ -1707,6 +1708,7 @@ impl SortWorkerPool {
     ///
     /// The result channel stays as `crossbeam_channel::bounded()` because the
     /// I/O writer thread needs blocking `recv()`.
+    #[allow(dead_code)]
     pub fn compress_result_channel(&self) -> (Sender<CompressResult>, Receiver<CompressResult>) {
         bounded(self.num_workers * 2)
     }

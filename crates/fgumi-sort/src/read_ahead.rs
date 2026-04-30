@@ -411,6 +411,7 @@ impl IoRead for PooledInputStream {
 /// or a direct `RawBamReader<PooledInputStream>` (pool path, no extra threads).
 pub enum RecordSource {
     /// Legacy path: background thread prefetches records.
+    #[allow(dead_code)] // retained for potential future use / benchmarking
     ReadAhead(RawReadAheadReader),
     /// Pool path: main thread reads directly from pool's decompressed stream.
     ///

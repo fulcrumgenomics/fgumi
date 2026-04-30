@@ -8,6 +8,10 @@
 //! Uses LSD (Least Significant Digit) radix sort with 8-bit radix (256 buckets).
 //! Adaptive: only sorts the bytes actually needed based on max values in dataset.
 
+// Several helpers are written for future use or benchmarking; suppress dead-code
+// warnings for the whole module rather than annotating each item individually.
+#![allow(dead_code)]
+
 use std::cmp::Ordering;
 
 /// Threshold below which we use insertion sort instead of radix sort.

@@ -222,8 +222,8 @@ impl Drop for SpillWriteHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inline::TemplateKey;
     use crate::external::GenericKeyedChunkReader;
+    use crate::inline::TemplateKey;
     use tempfile::TempDir;
 
     /// Create a test `TemplateKey` with distinct values for roundtrip verification.

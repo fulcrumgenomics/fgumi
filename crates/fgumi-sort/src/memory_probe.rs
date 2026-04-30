@@ -42,6 +42,7 @@ use bytesize::ByteSize;
 use log::{Level, info, log_enabled};
 
 #[cfg(feature = "memory-debug")]
+#[allow(unused_imports)] // re-exported for main crate's unified_pipeline (Phase E)
 pub use platform_ffi::print_mi_stats;
 pub use platform_ffi::{force_mi_collect, process_rss_bytes};
 
@@ -72,6 +73,7 @@ mod platform_ffi {
     /// `mi_stats_print_out(None, null_mut())` uses mimalloc's internal synchronization,
     /// making it safe to call concurrently with allocation/deallocation on other threads.
     #[cfg(feature = "memory-debug")]
+    #[allow(dead_code)] // called by the main crate's unified_pipeline (Phase E)
     pub fn print_mi_stats() {
         // SAFETY: mimalloc synchronizes stats collection internally.
         unsafe {

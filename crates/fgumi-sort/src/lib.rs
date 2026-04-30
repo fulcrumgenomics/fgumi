@@ -24,6 +24,11 @@
 //! 4. **Spill phase**: Compress and write sorted chunk to temp file
 //! 5. **Merge phase**: K-way merge of sorted temp files using a loser tree
 
+// Unsafe code is prohibited at the crate level. The sole approved exception is
+// `memory_probe::platform_ffi`, which is guarded by `#[allow(unsafe_code)]` on
+// that inner module. See CLAUDE.md "Approved non-stdlib FFI exceptions".
+#![deny(unsafe_code)]
+
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -43,8 +48,8 @@ pub mod pipeline;
 pub(crate) mod pooled_bam_writer;
 pub(crate) mod pooled_chunk_writer;
 pub(crate) mod radix;
-pub mod reader;
 pub(crate) mod read_ahead;
+pub mod reader;
 pub(crate) mod segmented_buf;
 pub(crate) mod tmp_dir_alloc;
 pub mod verify;

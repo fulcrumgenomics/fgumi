@@ -4,9 +4,7 @@
 //! and [`PooledChunkWriter`](super::pooled_chunk_writer), and the staging buffer logic for
 //! accumulating data into ~64KB blocks before submitting compression jobs.
 
-use crate::worker_pool::{
-    BufferPool, CompressJob, CompressResult, PermitPool, SortWorkerPool,
-};
+use crate::worker_pool::{BufferPool, CompressJob, CompressResult, PermitPool, SortWorkerPool};
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
 use fgumi_bgzf::{BGZF_EOF, BGZF_MAX_BLOCK_SIZE};

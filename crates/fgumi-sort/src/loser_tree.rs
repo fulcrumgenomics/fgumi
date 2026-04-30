@@ -169,6 +169,7 @@ impl<K: Ord> LoserTree<K> {
     /// Number of sources in the tree (including exhausted ones).
     #[inline]
     #[must_use]
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.k
     }
@@ -179,6 +180,7 @@ impl<K: Ord> LoserTree<K> {
     /// Exists solely to satisfy clippy's `len_without_is_empty` lint.
     #[inline]
     #[must_use]
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.k == 0
     }

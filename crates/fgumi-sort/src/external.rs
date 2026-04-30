@@ -17,10 +17,7 @@
 //! 3. Sort by keys while keeping raw records
 //! 4. Write raw record bytes to output
 
-use fgumi_raw_bam::SamTag;
-use crate::inline::{
-    ProbeableBuffer, RecordBuffer, TemplateKey, TemplateRecordBuffer,
-};
+use crate::inline::{ProbeableBuffer, RecordBuffer, TemplateKey, TemplateRecordBuffer};
 use crate::keys::{QuerynameComparator, RawSortKey, SortOrder};
 use crate::memory_probe::{
     BufferProbeStats, ConsumerProbeStats, MergeProbe, SpillProbe, force_mi_collect, log_snapshot,
@@ -34,6 +31,7 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::create_raw_bam_reader;
 use fgumi_bam_io::{ChainedReader, TeeReader, is_stdin_path};
+use fgumi_raw_bam::SamTag;
 use log::{debug, info};
 use noodles::sam::Header;
 use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
@@ -3151,8 +3149,8 @@ fn skip_bam_header<R: Read>(reader: &mut R) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fgumi_sam::SamBuilder;
     use bstr::BString;
+    use fgumi_sam::SamBuilder;
     use noodles::sam::header::record::value::Map;
     use noodles::sam::header::record::value::map::ReadGroup;
 
