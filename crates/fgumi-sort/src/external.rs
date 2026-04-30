@@ -3151,7 +3151,7 @@ fn skip_bam_header<R: Read>(reader: &mut R) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fgumi_raw_bam::builder::SamBuilder;
+    use fgumi_sam::SamBuilder;
     use bstr::BString;
     use noodles::sam::header::record::value::Map;
     use noodles::sam::header::record::value::map::ReadGroup;
@@ -3562,7 +3562,7 @@ mod tests {
         #[case] sort_order: SortOrder,
         #[case] write_index: bool,
     ) {
-        use fgumi_raw_bam::builder::SamBuilder;
+        use fgumi_sam::SamBuilder;
 
         let num_pairs = 30;
         let mut builder = SamBuilder::new();
@@ -3610,7 +3610,7 @@ mod tests {
     #[case::queryname_natural(SortOrder::Queryname(QuerynameComparator::Natural))]
     #[case::template_coordinate(SortOrder::TemplateCoordinate)]
     fn test_sort_many_chunks_with_semaphore(#[case] sort_order: SortOrder) {
-        use fgumi_raw_bam::builder::SamBuilder;
+        use fgumi_sam::SamBuilder;
 
         let num_pairs = 200;
         let mut builder = SamBuilder::new();
@@ -3665,7 +3665,7 @@ mod tests {
     #[case::queryname_natural(SortOrder::Queryname(QuerynameComparator::Natural))]
     #[case::template_coordinate(SortOrder::TemplateCoordinate)]
     fn test_sort_sub_arrays_match_single_thread(#[case] sort_order: SortOrder) {
-        use fgumi_raw_bam::builder::SamBuilder;
+        use fgumi_sam::SamBuilder;
 
         let num_pairs = 50;
         let mut builder = SamBuilder::new();
@@ -3720,7 +3720,7 @@ mod tests {
     #[case::queryname_natural(SortOrder::Queryname(QuerynameComparator::Natural))]
     #[case::template_coordinate(SortOrder::TemplateCoordinate)]
     fn test_sort_sub_arrays_in_memory_only(#[case] sort_order: SortOrder) {
-        use fgumi_raw_bam::builder::SamBuilder;
+        use fgumi_sam::SamBuilder;
 
         let num_pairs = 20;
         let mut builder = SamBuilder::new();
@@ -4151,7 +4151,7 @@ mod tests {
     /// single-dir mode.
     #[test]
     fn test_sort_with_two_temp_dirs_matches_single_dir() {
-        use fgumi_raw_bam::builder::SamBuilder;
+        use fgumi_sam::SamBuilder;
 
         let num_pairs = 200;
         let mut builder = SamBuilder::new();
