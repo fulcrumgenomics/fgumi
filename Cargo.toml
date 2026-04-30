@@ -91,6 +91,7 @@ fgumi-sam = { workspace = true }
 fgumi-simd-fastq = { workspace = true }
 fgumi-umi = { workspace = true }
 fgumi-consensus = { workspace = true }
+fgumi-bam-io = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.6"

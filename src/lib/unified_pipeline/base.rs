@@ -426,28 +426,7 @@ pub trait BatchWeight {
 // Memory Estimate Trait (for memory-based queue limits)
 // ============================================================================
 
-/// Trait for types that can estimate their heap memory usage.
-///
-/// This is used by memory-bounded queues to track how much memory is
-/// consumed by items in the queue. The estimate should include heap
-/// allocations (Vec contents, String data, etc.) but not the struct itself.
-///
-/// # Example
-///
-/// For a batch containing a `Vec<u8>` with 1000 bytes, `estimate_heap_size()`
-/// returns approximately 1000 (the Vec's heap allocation).
-pub trait MemoryEstimate {
-    /// Returns an estimate of the heap memory used by this value in bytes.
-    ///
-    /// This should include:
-    /// - Vec/String heap allocations (capacity, not just len)
-    /// - Nested struct heap allocations
-    ///
-    /// This should NOT include:
-    /// - The size of the struct itself (stack size)
-    /// - Shared/reference-counted data (counted once, not per-reference)
-    fn estimate_heap_size(&self) -> usize;
-}
+pub use fgumi_bam_io::MemoryEstimate;
 
 // ============================================================================
 // Memory Tracking for Queues
