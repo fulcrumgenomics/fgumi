@@ -150,7 +150,6 @@ pub use fgumi_consensus::phred;
 pub mod read_info;
 pub mod reference;
 pub use fgumi_metrics::rejection;
-pub mod reorder_buffer;
 pub mod sam;
 pub mod sort;
 pub mod system;

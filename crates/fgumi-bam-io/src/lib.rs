@@ -13,3 +13,4 @@
 
 pub mod bam_io;
 pub mod progress;
+pub mod reorder;
