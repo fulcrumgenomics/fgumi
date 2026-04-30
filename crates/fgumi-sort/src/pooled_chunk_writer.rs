@@ -21,9 +21,9 @@
 //! `BufWriter`), blocking the main thread when the budget is exhausted rather than
 //! accumulating blocks in an unbounded reorder buffer.
 
-use crate::sort::bgzf_io::{StagingBuffer, io_writer_loop};
-use crate::sort::keys::RawSortKey;
-use crate::sort::worker_pool::{CompressResult, PermitPool, SortWorkerPool};
+use crate::bgzf_io::{StagingBuffer, io_writer_loop};
+use crate::keys::RawSortKey;
+use crate::worker_pool::{CompressResult, PermitPool, SortWorkerPool};
 use anyhow::Result;
 use crossbeam_channel::bounded;
 use fgumi_bgzf::BGZF_MAX_BLOCK_SIZE;
@@ -222,8 +222,8 @@ impl Drop for SpillWriteHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sort::inline_buffer::TemplateKey;
-    use crate::sort::raw::GenericKeyedChunkReader;
+    use crate::inline::TemplateKey;
+    use crate::external::GenericKeyedChunkReader;
     use tempfile::TempDir;
 
     /// Create a test `TemplateKey` with distinct values for roundtrip verification.

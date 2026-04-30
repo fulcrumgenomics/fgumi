@@ -18,17 +18,17 @@
 //! 4. Write raw record bytes to output
 
 use crate::sam::SamTag;
-use crate::sort::inline_buffer::{
+use crate::inline::{
     ProbeableBuffer, RecordBuffer, TemplateKey, TemplateRecordBuffer,
 };
-use crate::sort::keys::{QuerynameComparator, RawSortKey, SortOrder};
-use crate::sort::memory_probe::{
+use crate::keys::{QuerynameComparator, RawSortKey, SortOrder};
+use crate::memory_probe::{
     BufferProbeStats, ConsumerProbeStats, MergeProbe, SpillProbe, force_mi_collect, log_snapshot,
 };
-use crate::sort::pooled_chunk_writer::PooledChunkWriter;
-use crate::sort::read_ahead::{PooledInputStream, RawReadAheadReader, RecordSource};
-use crate::sort::tmp_dir_alloc::TmpDirAllocator;
-use crate::sort::worker_pool::SortWorkerPool;
+use crate::pooled_chunk_writer::PooledChunkWriter;
+use crate::read_ahead::{PooledInputStream, RawReadAheadReader, RecordSource};
+use crate::tmp_dir_alloc::TmpDirAllocator;
+use crate::worker_pool::SortWorkerPool;
 use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use fgumi_bam_io::ProgressTracker;
@@ -827,7 +827,7 @@ impl SourceParserState {
 /// `K` is the sort key type (`RawCoordinateKey`, `TemplateKey`, etc.).
 pub(crate) struct MainThreadChunkConsumer<K: RawSortKey + 'static> {
     /// Snapshot of the pool's Phase 2 file vector. Indexed by `source_id`.
-    files: Arc<Vec<crate::sort::worker_pool::Phase2FileState>>,
+    files: Arc<Vec<crate::worker_pool::Phase2FileState>>,
     /// Per-source parser state.
     parser_state: Vec<SourceParserState>,
     /// Set by a pool worker when BGZF decompression of a chunk block fails.
@@ -843,7 +843,7 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
     /// Create a new consumer for the given pool file snapshot.
     #[must_use]
     pub(crate) fn new(
-        files: Arc<Vec<crate::sort::worker_pool::Phase2FileState>>,
+        files: Arc<Vec<crate::worker_pool::Phase2FileState>>,
         decompression_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
         chunk_read_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
         worker_panicked: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1123,7 +1123,7 @@ impl<'a> ChunkNamer<'a> {
 /// reads the next batch. The chunk path is stored alongside the handle so it
 /// can be pushed to `chunk_files` only after the write completes.
 struct PendingSpill {
-    handle: crate::sort::pooled_chunk_writer::SpillWriteHandle,
+    handle: crate::pooled_chunk_writer::SpillWriteHandle,
     chunk_path: PathBuf,
 }
 
@@ -1200,7 +1200,7 @@ impl<K: RawSortKey + 'static> Phase2Guard<'_, K> {
     fn deactivate(&mut self) {
         if self.active {
             drop(self.consumer.take());
-            self.pool.set_phase(crate::sort::worker_pool::phase::LEGACY);
+            self.pool.set_phase(crate::worker_pool::phase::LEGACY);
             self.pool.clear_phase2_files();
             self.active = false;
         }
@@ -1385,7 +1385,7 @@ impl RawExternalSorter {
         stats: &mut RawSortStats,
         timer: &mut SortPhaseTimer,
         namer: &mut ChunkNamer<'_>,
-        pool: &std::sync::Arc<crate::sort::worker_pool::SortWorkerPool>,
+        pool: &std::sync::Arc<crate::worker_pool::SortWorkerPool>,
     ) -> Result<()> {
         if let Some(prev) = pending.take() {
             prev.handle.wait()?;
@@ -1409,7 +1409,7 @@ impl RawExternalSorter {
         namer: &mut ChunkNamer<'_>,
         pool: &Arc<SortWorkerPool>,
     ) -> Result<()> {
-        use crate::sort::loser_tree::LoserTree;
+        use crate::loser_tree::LoserTree;
 
         if self.max_temp_files == 0 || chunk_files.len() < self.max_temp_files {
             return Ok(());
@@ -1558,8 +1558,8 @@ impl RawExternalSorter {
     ///
     /// Returns an error if any input cannot be opened, or writing fails.
     pub fn merge_bams(&self, inputs: &[PathBuf], header: &Header, output: &Path) -> Result<u64> {
-        use crate::sort::inline_buffer::extract_coordinate_key_inline;
-        use crate::sort::keys::{
+        use crate::inline::extract_coordinate_key_inline;
+        use crate::keys::{
             QuerynameComparator, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
             SortContext,
         };
@@ -1622,7 +1622,7 @@ impl RawExternalSorter {
         output: &Path,
         extract_key: impl Fn(&[u8]) -> K,
     ) -> Result<u64> {
-        use crate::sort::loser_tree::LoserTree;
+        use crate::loser_tree::LoserTree;
 
         // Initialize: collect first record + key from each reader using
         // reusable per-source buffers (one allocation per source, not per record).
@@ -1718,7 +1718,7 @@ impl RawExternalSorter {
         output: &Path,
         alloc: &mut TmpDirAllocator,
     ) -> Result<RawSortStats> {
-        use crate::sort::keys::RawCoordinateKey;
+        use crate::keys::RawCoordinateKey;
 
         let mut stats = RawSortStats::default();
         let mut timer = SortPhaseTimer::new();
@@ -1828,7 +1828,7 @@ impl RawExternalSorter {
             });
 
             timer.time_write_output(|| {
-                use crate::sort::pooled_bam_writer::PooledBamWriter;
+                use crate::pooled_bam_writer::PooledBamWriter;
                 let output_header = self.create_output_header(header);
                 let mut writer = PooledBamWriter::new(Arc::clone(&pool), output, &output_header)?;
 
@@ -1906,7 +1906,7 @@ impl RawExternalSorter {
         output: &Path,
         alloc: &mut TmpDirAllocator,
     ) -> Result<RawSortStats> {
-        use crate::sort::keys::RawCoordinateKey;
+        use crate::keys::RawCoordinateKey;
         use fgumi_bam_io::{create_indexing_bam_writer, write_bai_index};
 
         info!("Indexing enabled: will write BAM index alongside output");
@@ -2096,7 +2096,7 @@ impl RawExternalSorter {
         alloc: &mut TmpDirAllocator,
         comparator: QuerynameComparator,
     ) -> Result<RawSortStats> {
-        use crate::sort::keys::{RawQuerynameKey, RawQuerynameLexKey};
+        use crate::keys::{RawQuerynameKey, RawQuerynameLexKey};
         info!("Using queryname sort with {comparator} comparator");
         match comparator {
             QuerynameComparator::Lexicographic => self.sort_queryname_keyed::<RawQuerynameLexKey>(
@@ -2126,7 +2126,7 @@ impl RawExternalSorter {
         output: &Path,
         alloc: &mut TmpDirAllocator,
     ) -> Result<RawSortStats> {
-        use crate::sort::keys::SortContext;
+        use crate::keys::SortContext;
 
         let mut stats = RawSortStats::default();
         let mut timer = SortPhaseTimer::new();
@@ -2236,7 +2236,7 @@ impl RawExternalSorter {
             });
 
             timer.time_write_output(|| {
-                use crate::sort::pooled_bam_writer::PooledBamWriter;
+                use crate::pooled_bam_writer::PooledBamWriter;
                 let output_header = self.create_output_header(header);
                 let mut writer = PooledBamWriter::new(Arc::clone(&pool), output, &output_header)?;
 
@@ -2444,7 +2444,7 @@ impl RawExternalSorter {
             });
 
             timer.time_write_output(|| {
-                use crate::sort::pooled_bam_writer::PooledBamWriter;
+                use crate::pooled_bam_writer::PooledBamWriter;
                 let output_header = self.create_output_header(header);
                 let mut writer = PooledBamWriter::new(Arc::clone(&pool), output, &output_header)?;
 
@@ -2587,9 +2587,9 @@ impl RawExternalSorter {
         total_records: u64,
         pool: &Arc<SortWorkerPool>,
     ) -> Result<u64> {
-        use crate::sort::loser_tree::LoserTree;
-        use crate::sort::pooled_bam_writer::PooledBamWriter;
-        use crate::sort::worker_pool::phase;
+        use crate::loser_tree::LoserTree;
+        use crate::pooled_bam_writer::PooledBamWriter;
+        use crate::worker_pool::phase;
 
         let reader_concurrency: usize = 1;
         let num_disk = chunk_files.len();
@@ -2782,7 +2782,7 @@ impl RawExternalSorter {
         total_records: u64,
         pool: &Arc<SortWorkerPool>,
     ) -> Result<noodles::bam::bai::Index> {
-        use crate::sort::loser_tree::LoserTree;
+        use crate::loser_tree::LoserTree;
         use fgumi_bam_io::create_indexing_bam_writer;
 
         // Thread budget: writer gets all threads (merge is output-compression-bound),
@@ -2918,7 +2918,7 @@ pub fn extract_template_key_inline(
     cell_tag: Option<SamTag>,
     cb_hasher: &ahash::RandomState,
 ) -> TemplateKey {
-    use crate::sort::bam_fields;
+    use crate::bam_fields;
     use bam_fields::{flags, mate_unclipped_5prime, unclipped_5prime_raw};
 
     // Single-pass extraction of all aux tags (MI, RG, cell barcode, MC)
@@ -3049,7 +3049,7 @@ fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
     pool: &Arc<SortWorkerPool>,
     async_reader: bool,
 ) -> Result<(fgumi_raw_bam::RawBamReader<PooledInputStream>, Header)> {
-    use crate::sort::worker_pool::phase;
+    use crate::worker_pool::phase;
     use std::io;
 
     let path_ref = path.as_ref();
@@ -3541,7 +3541,7 @@ mod tests {
 
     /// Count records in a BAM file by reading with the raw BAM reader.
     fn count_bam_records(path: &std::path::Path) -> u64 {
-        use crate::sort::read_ahead::RawReadAheadReader;
+        use crate::read_ahead::RawReadAheadReader;
         let (reader, _) = create_raw_bam_reader(path, 1).expect("failed to create raw BAM reader");
         RawReadAheadReader::new(reader).count() as u64
     }
@@ -3789,7 +3789,7 @@ mod tests {
 
     /// Collect all read names from a BAM file as strings.
     fn collect_read_names(path: &Path) -> Vec<String> {
-        use crate::sort::read_ahead::RawReadAheadReader;
+        use crate::read_ahead::RawReadAheadReader;
         let (reader, _) = create_raw_bam_reader(path, 1).expect("failed to create raw BAM reader");
         RawReadAheadReader::new(reader)
             .map(|rec| {
@@ -3801,7 +3801,7 @@ mod tests {
 
     /// Collect (`ref_id`, pos) tuples for every record in a BAM.
     fn collect_positions(path: &Path) -> Vec<(i32, i32)> {
-        use crate::sort::read_ahead::RawReadAheadReader;
+        use crate::read_ahead::RawReadAheadReader;
         let (reader, _) = create_raw_bam_reader(path, 1).expect("failed to create raw BAM reader");
         RawReadAheadReader::new(reader)
             .map(|rec| {

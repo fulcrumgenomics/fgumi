@@ -20,8 +20,8 @@
 //!                                              ──────► write ordered
 //! ```
 
-use crate::sort::bgzf_io::{StagingBuffer, io_writer_loop};
-use crate::sort::worker_pool::{CompressResult, PermitPool, SortWorkerPool};
+use crate::bgzf_io::{StagingBuffer, io_writer_loop};
+use crate::worker_pool::{CompressResult, PermitPool, SortWorkerPool};
 use anyhow::Result;
 use crossbeam_channel::bounded;
 use fgumi_bgzf::BGZF_MAX_BLOCK_SIZE;

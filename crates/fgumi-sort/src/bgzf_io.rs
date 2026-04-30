@@ -4,7 +4,7 @@
 //! and [`PooledChunkWriter`](super::pooled_chunk_writer), and the staging buffer logic for
 //! accumulating data into ~64KB blocks before submitting compression jobs.
 
-use crate::sort::worker_pool::{
+use crate::worker_pool::{
     BufferPool, CompressJob, CompressResult, PermitPool, SortWorkerPool,
 };
 use anyhow::Result;

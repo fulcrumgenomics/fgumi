@@ -33,9 +33,9 @@ use noodles::sam::header::record::value::Map;
 use noodles::sam::header::record::value::map::header::tag as header_tag;
 use tempfile::TempDir;
 
-pub use fgumi_raw_bam as bam_fields;
 pub mod bgzf_io;
-pub mod inline_buffer;
+pub mod external;
+pub mod inline;
 pub mod keys;
 pub mod loser_tree;
 pub(crate) mod memory_probe;
@@ -43,8 +43,7 @@ pub mod pipeline;
 pub mod pooled_bam_writer;
 pub mod pooled_chunk_writer;
 pub mod radix;
-pub mod raw;
-pub mod raw_bam_reader;
+pub mod reader;
 pub mod read_ahead;
 pub(crate) mod segmented_buf;
 pub mod tmp_dir_alloc;
@@ -139,13 +138,14 @@ fn create_temp_dir(base: Option<&Path>) -> Result<TempDir> {
     }
 }
 
-pub use inline_buffer::{TemplateKey, extract_coordinate_key_inline};
+pub use external::{LibraryLookup, RawExternalSorter, SortStats, cb_hasher, extract_template_key_inline};
+pub use inline::{TemplateKey, extract_coordinate_key_inline};
 pub use keys::{
     QuerynameComparator, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
     SortContext, SortOrder, natural_compare, normalize_natural_key,
 };
 pub use pipeline::{ParallelMergeConfig, parallel_merge, parallel_merge_buffered};
-pub use raw::{LibraryLookup, RawExternalSorter, cb_hasher, extract_template_key_inline};
+pub use reader::RawBamRecordReader;
 
 #[cfg(test)]
 mod tests {

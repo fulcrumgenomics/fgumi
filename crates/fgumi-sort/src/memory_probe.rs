@@ -21,7 +21,7 @@
 //! # Usage
 //!
 //! ```ignore
-//! use crate::sort::memory_probe::{BufferProbeStats, SpillProbe, log_snapshot};
+//! use crate::memory_probe::{BufferProbeStats, SpillProbe, log_snapshot};
 //!
 //! let mut probe = SpillProbe::new("phase1");
 //! // ... inside spill loop:

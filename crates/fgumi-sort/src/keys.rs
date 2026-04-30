@@ -25,7 +25,7 @@
 use noodles::sam::Header;
 use std::cmp::Ordering;
 
-use crate::sort::bam_fields;
+use crate::bam_fields;
 use fgumi_raw_bam::RawRecordView;
 use std::io::{Read, Write};
 

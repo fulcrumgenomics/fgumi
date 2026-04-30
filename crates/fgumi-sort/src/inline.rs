@@ -9,10 +9,10 @@
 //! - Sort by index array, not by moving actual record data
 //! - ~24 bytes overhead per record vs ~110 bytes
 
-use crate::sort::bam_fields;
-use crate::sort::keys::{RawCoordinateKey, RawSortKey, SortContext};
-use crate::sort::radix::bytes_needed_u64;
-use crate::sort::segmented_buf::SegmentedBuf;
+use crate::bam_fields;
+use crate::keys::{RawCoordinateKey, RawSortKey, SortContext};
+use crate::radix::bytes_needed_u64;
+use crate::segmented_buf::SegmentedBuf;
 use fgumi_raw_bam::{RawRecord, RawRecordView};
 use std::cmp::Ordering;
 use std::io::{Read, Write};
@@ -1080,7 +1080,7 @@ pub fn parallel_radix_sort_record_refs(refs: &mut [RecordRef]) {
 
 /// Merge k sorted chunks in place using auxiliary storage.
 fn merge_sorted_chunks(refs: &mut [RecordRef], chunk_ranges: &[std::ops::Range<usize>]) {
-    use crate::sort::radix::{heap_make, heap_sift_down};
+    use crate::radix::{heap_make, heap_sift_down};
 
     // Heap entry: (sort_key, chunk_idx, position_in_chunk)
     struct HeapEntry {
@@ -1348,7 +1348,7 @@ fn merge_sorted_template_chunks(
     refs: &mut [TemplateRecordRef],
     chunk_ranges: &[std::ops::Range<usize>],
 ) {
-    use crate::sort::radix::{heap_make, heap_sift_down};
+    use crate::radix::{heap_make, heap_sift_down};
 
     struct HeapEntry {
         key: TemplateKey,
