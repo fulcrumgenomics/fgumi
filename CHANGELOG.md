@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Refactor
+
+- Extracted the sort engine into the new `fgumi-sort` crate and the BAM-pipeline I/O layer into the new `fgumi-bam-io` crate. The main `fgumi` binary now consumes both as workspace dependencies; behavior is unchanged.
+
 ## [0.2.0] - 2026-04-22
 
 ### Bug Fixes
