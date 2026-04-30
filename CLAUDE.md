@@ -127,12 +127,12 @@ Uses `mimalloc` as global allocator for performance.
 
 The following external FFI calls are approved because they back core infrastructure:
 
-- **`libmimalloc_sys`** (`src/lib/sort/memory_probe.rs`) — mimalloc is the configured
+- **`libmimalloc_sys`** (`crates/fgumi-sort/src/memory_probe.rs`) — mimalloc is the configured
   global allocator. The FFI wrappers (`force_mi_collect`, `process_rss_bytes`, and the
   `memory-debug`-gated `print_mi_stats` calling `mi_stats_print_out`) are isolated to
   a single `#[allow(unsafe_code)]` sub-module. mimalloc synchronizes these calls
   internally, so they are safe to invoke concurrently.
-- **`mach2`** (`src/lib/sort/memory_probe.rs`, macOS only) — `task_info(TASK_VM_INFO)`
+- **`mach2`** (`crates/fgumi-sort/src/memory_probe.rs`, macOS only) — `task_info(TASK_VM_INFO)`
   is the only way to read `phys_footprint` (the RSS metric mimalloc reports accurately).
   Isolated to the same sub-module as the mimalloc FFI.
 
