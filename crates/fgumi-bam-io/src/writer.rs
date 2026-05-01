@@ -25,6 +25,40 @@ use crate::vendored::{BlockInfoRx, MultithreadedWriter, MultithreadedWriterBuild
 /// Maximum uncompressed BGZF block size (64KB - 256 bytes for overhead).
 const MAX_BLOCK_SIZE: usize = 65280;
 
+/// Resolve the end virtual position for a BAM record that begins in
+/// `start_block` at offset `start_block_start` in the compressed stream.
+///
+/// `end_offset` is the uncompressed offset (relative to `start_block`) one byte
+/// past the record's last byte. If the record fits in `start_block`, returns
+/// `(start_block_start, end_offset)`. Otherwise walks forward through the
+/// `block_positions` map `MAX_BLOCK_SIZE` bytes at a time until the remaining
+/// overflow fits in a single block. Returns `None` if any required subsequent
+/// block hasn't been completed yet (caller should defer the entry).
+#[allow(clippy::cast_possible_truncation)]
+fn compute_end_vpos(
+    block_positions: &HashMap<u64, u64>,
+    start_block: u64,
+    start_block_start: u64,
+    end_offset: usize,
+) -> Option<VirtualPosition> {
+    if end_offset <= MAX_BLOCK_SIZE {
+        return Some(
+            VirtualPosition::try_from((start_block_start, end_offset as u16))
+                .unwrap_or(VirtualPosition::MIN),
+        );
+    }
+
+    let mut overflow = end_offset - MAX_BLOCK_SIZE;
+    let mut block = start_block + 1;
+    while overflow > MAX_BLOCK_SIZE {
+        overflow -= MAX_BLOCK_SIZE;
+        block += 1;
+    }
+
+    let &block_start = block_positions.get(&block)?;
+    Some(VirtualPosition::try_from((block_start, overflow as u16)).unwrap_or(VirtualPosition::MIN))
+}
+
 /// Opaque wrapper over either a single- or multi-threaded BGZF writer.
 ///
 /// Uses `Box<dyn Write + Send>` to support both file and stdout output. The
@@ -404,23 +438,19 @@ impl IndexingBamWriter {
                     VirtualPosition::try_from((block_start, entry.offset_in_block as u16))
                         .unwrap_or(VirtualPosition::MIN);
 
-                // End position: might be in same block or next
+                // End position: same block, next block, or any block further
+                // along (long reads / large aux payloads can span more than two
+                // BGZF blocks).
                 let end_offset = entry.offset_in_block + entry.record_len;
-                let end_vpos = if end_offset <= MAX_BLOCK_SIZE {
-                    VirtualPosition::try_from((block_start, end_offset as u16))
-                        .unwrap_or(VirtualPosition::MIN)
-                } else {
-                    // Record spans block boundary - need next block position
-                    let next_block = entry.block_number + 1;
-                    if let Some(&next_start) = self.block_positions.get(&next_block) {
-                        let overflow = end_offset - MAX_BLOCK_SIZE;
-                        VirtualPosition::try_from((next_start, overflow as u16))
-                            .unwrap_or(VirtualPosition::MIN)
-                    } else {
-                        // Next block not ready yet - skip for now
-                        i += 1;
-                        continue;
-                    }
+                let Some(end_vpos) = compute_end_vpos(
+                    &self.block_positions,
+                    entry.block_number,
+                    block_start,
+                    end_offset,
+                ) else {
+                    // A later block isn't ready yet — defer this entry.
+                    i += 1;
+                    continue;
                 };
 
                 let chunk = Chunk::new(start_vpos, end_vpos);
@@ -622,13 +652,14 @@ pub fn create_bam_writer<P: AsRef<Path>>(
     let path_ref = path.as_ref();
     let output = open_output_writer(path_ref)?;
 
-    let bgzf_writer = make_bgzf_writer(output, threads, compression_level);
+    let mut bgzf_writer = make_bgzf_writer(output, threads, compression_level);
 
-    let mut writer = noodles::bam::io::Writer::from(bgzf_writer);
-    writer
-        .write_header(header)
+    // Write the header with the libdeflate-backed helper rather than the
+    // noodles encoder: noodles' `Writer::write_header` corrupts the leading
+    // BAM bytes when the underlying writer is `MultithreadedWriter`.
+    write_bam_header(&mut bgzf_writer, header)
         .with_context(|| format!("Failed to write header to: {}", path_ref.display()))?;
-    Ok(writer)
+    Ok(noodles::bam::io::Writer::from(bgzf_writer))
 }
 
 /// Create an optional BAM writer for rejects or filtered reads.
@@ -999,6 +1030,102 @@ mod tests {
         assert!(!index.reference_sequences().is_empty());
 
         Ok(())
+    }
+
+    // ========================================================================
+    // compute_end_vpos: BAI end-position resolution across BGZF blocks
+    // ========================================================================
+
+    /// Build a `block_positions` map mapping `[0..n)` to deterministic
+    /// compressed offsets so virtual positions are easy to assert against.
+    fn make_block_positions(n: u64) -> HashMap<u64, u64> {
+        // Use 0x10000-step starts so each block is at a distinct, recognizable
+        // virtual offset.
+        (0..n).map(|i| (i, i * 0x1_0000)).collect()
+    }
+
+    fn vpos(compressed: u64, uncompressed: u16) -> VirtualPosition {
+        VirtualPosition::try_from((compressed, uncompressed))
+            .expect("test inputs must form a valid VirtualPosition")
+    }
+
+    #[test]
+    fn test_compute_end_vpos_in_block() {
+        let positions = make_block_positions(1);
+        let v = compute_end_vpos(&positions, 0, 0, 1024).expect("in-block must resolve");
+        assert_eq!(v, vpos(0, 1024));
+    }
+
+    #[test]
+    fn test_compute_end_vpos_at_block_boundary_stays_in_starting_block() {
+        // end_offset == MAX_BLOCK_SIZE means the record's last byte fills the
+        // start block exactly; the end_vpos sits at the end of that block.
+        let positions = make_block_positions(1);
+        let v =
+            compute_end_vpos(&positions, 0, 0, MAX_BLOCK_SIZE).expect("boundary case must resolve");
+        #[allow(clippy::cast_possible_truncation)]
+        let expected = vpos(0, MAX_BLOCK_SIZE as u16);
+        assert_eq!(v, expected);
+    }
+
+    #[test]
+    fn test_compute_end_vpos_two_block_record() {
+        let positions = make_block_positions(2);
+        let v = compute_end_vpos(&positions, 0, 0, MAX_BLOCK_SIZE + 100)
+            .expect("two-block case must resolve");
+        assert_eq!(v, vpos(0x1_0000, 100));
+    }
+
+    #[test]
+    fn test_compute_end_vpos_three_block_record() {
+        // Long read / large aux payload spans three BGZF blocks.
+        let positions = make_block_positions(3);
+        let v = compute_end_vpos(&positions, 0, 0, 2 * MAX_BLOCK_SIZE + 50)
+            .expect("three-block case must resolve");
+        assert_eq!(
+            v,
+            vpos(0x2_0000, 50),
+            "end_vpos should land in block 2 (skipping fully-consumed block 1)"
+        );
+    }
+
+    #[test]
+    fn test_compute_end_vpos_multi_block_lookup_uses_terminal_block() {
+        // A record that spans blocks 5..7 (start block 5, ends in block 7).
+        let mut positions = HashMap::new();
+        positions.insert(5u64, 0x5_0000u64);
+        // Block 6 missing on purpose — we only need the terminal block start.
+        positions.insert(7u64, 0x7_0000u64);
+
+        let v = compute_end_vpos(&positions, 5, 0x5_0000, 2 * MAX_BLOCK_SIZE + 7)
+            .expect("terminal block start is sufficient");
+        assert_eq!(v, vpos(0x7_0000, 7));
+    }
+
+    #[test]
+    fn test_compute_end_vpos_returns_none_when_terminal_block_unknown() {
+        // Record spans into block 1 but block 1's start hasn't been recorded.
+        let positions = make_block_positions(1);
+        let v = compute_end_vpos(&positions, 0, 0, MAX_BLOCK_SIZE + 100);
+        assert!(v.is_none(), "must defer when the end block isn't ready");
+    }
+
+    #[test]
+    fn test_compute_end_vpos_offset_within_starting_block() {
+        // Start somewhere in the middle of block 3; record extends into block 4.
+        let mut positions = HashMap::new();
+        positions.insert(3u64, 0x3_0000u64);
+        positions.insert(4u64, 0x4_0000u64);
+
+        let start_offset = 60_000usize;
+        let record_len = 10_000usize; // crosses one boundary (60000 + 10000 = 70000)
+        let end_offset = start_offset + record_len;
+        let v = compute_end_vpos(&positions, 3, 0x3_0000, end_offset)
+            .expect("two-block case with non-zero start offset");
+        // overflow = end_offset - MAX_BLOCK_SIZE = 70000 - 65280 = 4720
+        #[allow(clippy::cast_possible_truncation)]
+        let expected = vpos(0x4_0000, 4720u16);
+        assert_eq!(v, expected);
     }
 
     #[test]

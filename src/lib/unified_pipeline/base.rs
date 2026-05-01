@@ -84,14 +84,13 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fgumi_bam_io::ProgressTracker;
+pub use fgumi_bam_io::{ProgressTracker, RawBamWriter, ReorderBuffer};
 
 use super::deadlock::{DeadlockAction, DeadlockState, QueueSnapshot, check_deadlock_and_restore};
 
 use crate::bgzf_reader::{RawBgzfBlock, decompress_block_into, read_raw_blocks};
 use crate::read_info::LibraryIndex;
 use crate::sam::SamTag;
-use fgumi_bam_io::ReorderBuffer;
 use fgumi_raw_bam::RawRecord;
 use noodles::sam::alignment::record::data::field::Tag;
 
@@ -1675,7 +1674,7 @@ pub struct OutputPipelineQueues<G, P: MemoryEstimate> {
     /// Output file, mutex-protected for exclusive access.
     pub output: Mutex<Option<Box<dyn Write + Send>>>,
     /// Optional secondary output writer for dual-output pipelines (e.g., reject BAM).
-    pub secondary_output: Option<Mutex<Option<fgumi_bam_io::RawBamWriter>>>,
+    pub secondary_output: Option<Mutex<Option<RawBamWriter>>>,
 
     // ========== Completion and Error Tracking ==========
     /// Flag indicating an error occurred.
@@ -1737,7 +1736,7 @@ impl<G: Send, P: Send + MemoryEstimate> OutputPipelineQueues<G, P> {
     /// Set a secondary output writer for dual-output pipelines.
     ///
     /// Must be called before the pipeline is started.
-    pub fn set_secondary_output(&mut self, writer: fgumi_bam_io::RawBamWriter) {
+    pub fn set_secondary_output(&mut self, writer: RawBamWriter) {
         self.secondary_output = Some(Mutex::new(Some(writer)));
     }
 

@@ -261,12 +261,12 @@ fn filter_template(
 ) -> bool {
     metrics.total_templates += 1;
 
-    // Fail closed when a mate exists but is shorter than the minimum BAM record
-    // length: a truncated record indicates corrupt input, so the template must
-    // be rejected rather than have the malformed mate silently dropped.
-    let r1_truncated = template.r1().is_some_and(|r| r.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN);
-    let r2_truncated = template.r2().is_some_and(|r| r.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN);
-    if r1_truncated || r2_truncated {
+    // Fail closed when *any* record (primary, secondary, or supplementary) is
+    // shorter than the minimum BAM record length: a truncated record indicates
+    // corrupt input, so the template must be rejected rather than have the
+    // malformed record silently dropped (and later panic in RawRecordView::new
+    // on the dedup/serialize path).
+    if template.records().iter().any(|r| r.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN) {
         metrics.discarded_poor_alignment += 1;
         return false;
     }
@@ -1662,6 +1662,58 @@ mod tests {
 
         assert!(!filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_poor_alignment, 1, "truncated mate must fail closed");
+        assert_eq!(metrics.accepted_templates, 0);
+    }
+
+    /// A truncated secondary or supplementary alignment must also reject the
+    /// whole template. The previous r1()/r2()-only guard let truncated
+    /// non-primary records slip through and later panic in `RawRecordView::new`.
+    #[test]
+    fn test_filter_template_rejects_truncated_secondary() {
+        let config = default_filter_config();
+        let mut metrics = FilterMetrics::new();
+
+        let mut b1 = RawSamBuilder::new();
+        b1.read_name(b"q1")
+            .sequence(b"ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .ref_id(0)
+            .pos(99)
+            .cigar_ops(&[encode_op(0, 4)])
+            .mapq(30)
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT);
+        b1.add_string_tag(SamTag::RX, b"ACGTACGT");
+        let valid_r1 = b1.build();
+
+        let mut b2 = RawSamBuilder::new();
+        b2.read_name(b"q1")
+            .sequence(b"ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .ref_id(0)
+            .pos(199)
+            .cigar_ops(&[encode_op(0, 4)])
+            .mapq(30)
+            .flags(flags::PAIRED | flags::LAST_SEGMENT);
+        b2.add_string_tag(SamTag::RX, b"ACGTACGT");
+        let valid_r2 = b2.build();
+
+        // 16 bytes is below MIN_BAM_RECORD_LEN = 32.
+        let truncated_secondary = RawRecord::from(vec![0u8; 16]);
+
+        let template = Template {
+            name: b"q1".to_vec(),
+            records: vec![valid_r1, valid_r2, truncated_secondary],
+            r1: Some((0, 1)),
+            r2: Some((1, 2)),
+            r1_supplementals: None,
+            r2_supplementals: None,
+            r1_secondaries: Some((2, 3)),
+            r2_secondaries: None,
+            mi: crate::umi::MoleculeId::None,
+        };
+
+        assert!(!filter_template(&template, &config, &mut metrics));
+        assert_eq!(metrics.discarded_poor_alignment, 1, "truncated secondary must fail closed");
         assert_eq!(metrics.accepted_templates, 0);
     }
 
