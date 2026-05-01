@@ -15,9 +15,9 @@ pedantic = { level = "deny", priority = -1 }
 
 [dependencies]
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
-noodles = { version = "0.106.0", features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
+noodles = { version = "0.109.0", features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
 noodles-bgzf = { version = "0.46.0", features = ["libdeflate"] }
-noodles-csi = "0.54.0"
+noodles-csi = "0.55.0"
 bgzf = "0.3.0"
 anyhow = "1.0.102"
 bstr = "1.12.1"
@@ -26,7 +26,7 @@ crossbeam-channel = "0.5"
 log = "0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.29", default-features = false, features = ["fs"] }
+nix = { version = "0.31", default-features = false, features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3"

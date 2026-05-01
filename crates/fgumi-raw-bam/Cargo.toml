@@ -8,7 +8,7 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-noodles = { version = "0.106.0", features = ["bam", "bgzf", "core", "csi", "sam"], optional = true }
+noodles = { version = "0.109.0", features = ["bam", "bgzf", "core", "csi", "sam"], optional = true }
 anyhow = { version = "1.0.102", optional = true }
 bytemuck = { workspace = true }
 fgumi-tag = { workspace = true }
