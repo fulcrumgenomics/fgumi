@@ -6,7 +6,7 @@
 use anyhow::{Result, bail};
 
 use crate::consensus_tags::per_base;
-use crate::sort::bam_fields;
+use fgumi_raw_bam;
 use fgumi_raw_bam::RawRecordView;
 
 /// Reverses per-base tags for a negative-strand read using raw BAM bytes.
@@ -25,19 +25,19 @@ use fgumi_raw_bam::RawRecordView;
 ///
 /// Returns an error if the record is too short to be a valid BAM record.
 pub fn reverse_per_base_tags_raw(record: &mut [u8]) -> Result<bool> {
-    if record.len() < bam_fields::MIN_BAM_RECORD_LEN {
+    if record.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN {
         bail!(
             "BAM record too short ({} bytes, minimum {})",
             record.len(),
-            bam_fields::MIN_BAM_RECORD_LEN
+            fgumi_raw_bam::MIN_BAM_RECORD_LEN
         );
     }
     let flg = RawRecordView::new(record).flags();
-    if (flg & bam_fields::flags::REVERSE) == 0 {
+    if (flg & fgumi_raw_bam::flags::REVERSE) == 0 {
         return Ok(false);
     }
 
-    let aux_off = bam_fields::aux_data_offset_from_record(record).unwrap_or(record.len());
+    let aux_off = fgumi_raw_bam::aux_data_offset_from_record(record).unwrap_or(record.len());
     if aux_off >= record.len() {
         return Ok(true);
     }
@@ -46,13 +46,13 @@ pub fn reverse_per_base_tags_raw(record: &mut [u8]) -> Result<bool> {
     // These may be B-type arrays or Z-type strings (aq, bq are Phred+33 strings)
     for tag in per_base::tags_to_reverse() {
         // Check tag type to determine reversal method
-        let tag_type = bam_fields::find_tag_type(&record[aux_off..], tag);
+        let tag_type = fgumi_raw_bam::find_tag_type(&record[aux_off..], tag);
         match tag_type {
             Some(b'B') => {
-                bam_fields::reverse_array_tag_in_place(record, aux_off, tag);
+                fgumi_raw_bam::reverse_array_tag_in_place(record, aux_off, tag);
             }
             Some(b'Z') => {
-                bam_fields::reverse_string_tag_in_place(record, aux_off, tag);
+                fgumi_raw_bam::reverse_string_tag_in_place(record, aux_off, tag);
             }
             _ => {} // Tag not found or unsupported type — skip
         }
@@ -60,7 +60,7 @@ pub fn reverse_per_base_tags_raw(record: &mut [u8]) -> Result<bool> {
 
     // Tags to reverse-complement: ac, bc
     for tag in per_base::tags_to_reverse_complement() {
-        bam_fields::reverse_complement_string_tag_in_place(record, aux_off, tag);
+        fgumi_raw_bam::reverse_complement_string_tag_in_place(record, aux_off, tag);
     }
 
     Ok(true)
@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn test_reverse_per_base_tags_raw_string_tag_aq() {
         // Verify aq Z-type tag is reversed via the raw path too
-        use crate::sort::bam_fields;
+        use fgumi_raw_bam;
 
         let mut b = RawSamBuilder::new();
         b.sequence(b"ACGT").qualities(&[30; 4]).flags(raw_flags::REVERSE);
@@ -121,8 +121,8 @@ mod tests {
             reverse_per_base_tags_raw(&mut raw).expect("reverse_per_base_tags_raw should succeed");
         assert!(result);
 
-        let aux = bam_fields::aux_data_slice(&raw);
-        let s = bam_fields::find_string_tag(aux, SamTag::AQ).expect("aq tag should exist");
+        let aux = fgumi_raw_bam::aux_data_slice(&raw);
+        let s = fgumi_raw_bam::find_string_tag(aux, SamTag::AQ).expect("aq tag should exist");
         assert_eq!(s, b"GHII");
     }
 
@@ -131,7 +131,7 @@ mod tests {
     #[case(SamTag::BC_BASES)]
     fn test_reverse_per_base_tags_raw_revcomp_string_tags(#[case] tag: SamTag) {
         // Verify ac/bc Z-type tags are reverse-complemented on the raw path.
-        use crate::sort::bam_fields;
+        use fgumi_raw_bam;
 
         let mut b = RawSamBuilder::new();
         b.sequence(b"ACGT").qualities(&[30; 4]).flags(raw_flags::REVERSE);
@@ -147,8 +147,8 @@ mod tests {
             reverse_per_base_tags_raw(&mut raw).expect("reverse_per_base_tags_raw should succeed");
         assert!(result);
 
-        let aux = bam_fields::aux_data_slice(&raw);
-        let s = bam_fields::find_string_tag(aux, tag).expect("tag should exist");
+        let aux = fgumi_raw_bam::aux_data_slice(&raw);
+        let s = fgumi_raw_bam::find_string_tag(aux, tag).expect("tag should exist");
         assert_eq!(s, b"TCGT");
     }
 
@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn test_reverse_per_base_tags_raw_negative_strand() {
         // Build a valid raw record on negative strand with a cd tag — should reverse it
-        use crate::sort::bam_fields;
+        use fgumi_raw_bam;
 
         let mut b = RawSamBuilder::new();
         b.sequence(b"ACGT").qualities(&[30; 4]).flags(raw_flags::REVERSE);
@@ -198,9 +198,10 @@ mod tests {
         assert!(result.expect("result should be Ok")); // negative strand => true
 
         // Verify the cd tag was reversed: find it in the raw record's aux data
-        let aux = bam_fields::aux_data_slice(&raw);
-        let arr = bam_fields::find_array_tag(aux, SamTag::CD_BASES).expect("cd tag should exist");
-        let values = bam_fields::array_tag_to_vec_u16(&arr);
+        let aux = fgumi_raw_bam::aux_data_slice(&raw);
+        let arr =
+            fgumi_raw_bam::find_array_tag(aux, SamTag::CD_BASES).expect("cd tag should exist");
+        let values = fgumi_raw_bam::array_tag_to_vec_u16(&arr);
         assert_eq!(values, vec![4, 3, 2, 1]);
     }
 }

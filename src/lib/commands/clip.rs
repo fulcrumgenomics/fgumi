@@ -5,16 +5,12 @@
 //! overlapping portions of paired reads.
 
 use crate::alignment_tags::regenerate_alignment_tags_raw;
-use crate::bam_io::{
-    create_bam_reader_for_pipeline, create_raw_bam_reader, create_raw_bam_writer, is_stdin_path,
-};
 use crate::clipper::{ClippingMode, RawRecordClipper};
 use crate::grouper::TemplateGrouper;
 use crate::logging::OperationTimer;
 use crate::metrics::clip::{ClipCounts, ClippingMetricsCollection};
 use crate::metrics::writer::write_metrics as write_metrics_tsv;
 use crate::per_thread_accumulator::PerThreadAccumulator;
-use crate::progress::ProgressTracker;
 use crate::reference::ReferenceReader;
 use crate::sam::SamTag;
 use crate::template::{TemplateBatch, TemplateIterator};
@@ -24,6 +20,10 @@ use crate::unified_pipeline::{
 use crate::validation::validate_file_exists;
 use anyhow::Result;
 use clap::Parser;
+use fgumi_bam_io::ProgressTracker;
+use fgumi_bam_io::{
+    create_bam_reader_for_pipeline, create_raw_bam_reader, create_raw_bam_writer, is_stdin_path,
+};
 use fgumi_raw_bam::RawRecord;
 use log::info;
 use noodles::sam::Header;

@@ -13,15 +13,15 @@
 //! - Zero-copy field comparisons where possible
 //! - Fast hashing with ahash
 
-use crate::bam_io::{RawBamReaderAuto, create_raw_bam_reader};
 use crate::logging::OperationTimer;
-use crate::progress::ProgressTracker;
 use crate::sam::SamTag;
 use crate::validation::validate_file_exists;
 use ahash::{AHashMap, AHashSet};
 use anyhow::{Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 use crossbeam_channel::{Receiver, bounded};
+use fgumi_bam_io::ProgressTracker;
+use fgumi_bam_io::{RawBamReaderAuto, create_raw_bam_reader};
 use fgumi_raw_bam::fields as raw_fields;
 use fgumi_raw_bam::{RawRecord, find_int_tag, find_string_tag};
 use itertools::Itertools;

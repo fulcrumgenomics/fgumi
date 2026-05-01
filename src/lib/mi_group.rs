@@ -110,7 +110,7 @@ type RecordFilterFn = Box<dyn Fn(&[u8]) -> bool + Send + Sync>;
 /// A Grouper that groups raw-byte BAM records by MI tag.
 ///
 /// Records arrive as raw BAM bytes (see [`DecodedRecord::from_raw_bytes`]). MI tags are
-/// extracted directly from the raw bytes using `bam_fields::find_string_tag_in_record()`
+/// extracted directly from the raw bytes using `fgumi_raw_bam::find_string_tag_in_record()`
 /// without parsing into `RecordBuf`.
 pub struct MiGrouper {
     /// The MI tag bytes to search for
@@ -202,8 +202,8 @@ impl MiGrouper {
     ///
     /// When `cell_tag` is set, returns a composite key of `"MI\tCELL"`.
     fn get_mi_tag(&self, bam: &[u8]) -> Option<String> {
-        use crate::sort::bam_fields;
-        let value = bam_fields::find_string_tag_in_record(bam, self.tag)?;
+        use fgumi_raw_bam;
+        let value = fgumi_raw_bam::find_string_tag_in_record(bam, self.tag)?;
         let mut key = if let Some(ref transform) = self.mi_transform {
             transform(value)
         } else {
@@ -211,7 +211,7 @@ impl MiGrouper {
         };
         if let Some(ct) = &self.cell_tag {
             key.push('\t');
-            if let Some(cell_value) = bam_fields::find_string_tag_in_record(bam, ct) {
+            if let Some(cell_value) = fgumi_raw_bam::find_string_tag_in_record(bam, ct) {
                 key.push_str(&String::from_utf8_lossy(cell_value));
             }
         }
@@ -389,8 +389,8 @@ where
     /// When `cell_tag` is set, returns a composite key of `"MI\tCELL"`.
     /// Otherwise returns just the MI tag value.
     fn get_mi(&self, bam: &[u8]) -> Option<String> {
-        use crate::sort::bam_fields;
-        let value = bam_fields::find_string_tag_in_record(bam, self.tag)?;
+        use fgumi_raw_bam;
+        let value = fgumi_raw_bam::find_string_tag_in_record(bam, self.tag)?;
         let mut key = if let Some(ref transform) = self.mi_transform {
             transform(value)
         } else {
@@ -398,7 +398,7 @@ where
         };
         if let Some(ct) = &self.cell_tag {
             key.push('\t');
-            if let Some(cell_value) = bam_fields::find_string_tag_in_record(bam, ct) {
+            if let Some(cell_value) = fgumi_raw_bam::find_string_tag_in_record(bam, ct) {
                 key.push_str(&String::from_utf8_lossy(cell_value));
             }
         }
@@ -1159,9 +1159,9 @@ mod tests {
         // Output records must be unchanged (composite key not written back as a tag).
         for group in &final_batch.groups {
             for raw in &group.records {
-                use crate::sort::bam_fields;
+                use fgumi_raw_bam;
                 // MI tag still holds the original value, not the composite key
-                let mi_val = bam_fields::find_string_tag_in_record(raw, SamTag::MI);
+                let mi_val = fgumi_raw_bam::find_string_tag_in_record(raw, SamTag::MI);
                 assert_eq!(mi_val, Some(b"1".as_ref()), "MI tag must retain original value");
             }
         }

@@ -1,17 +1,17 @@
 //! Generate consensus BAM with tags for filter.
 
-use crate::bam_io::create_raw_bam_writer;
 use crate::commands::command::Command;
 use crate::commands::common::{CompressionOptions, parse_bool};
 use crate::commands::simulate::common::{MethylationArgs, ReferenceGenome, StrandBiasArgs};
 use crate::commands::simulate::region_to_bin;
 use crate::dna::reverse_complement;
-use crate::progress::ProgressTracker;
 use crate::sam::SamTag;
 use crate::simulate::{StrandBiasModel, create_rng};
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::bounded;
+use fgumi_bam_io::ProgressTracker;
+use fgumi_bam_io::create_raw_bam_writer;
 use fgumi_consensus::MethylationMode;
 use fgumi_consensus::methylation::{
     MethylationAnnotation, MethylationEvidence, build_mm_ml_tags, is_cpg_context,

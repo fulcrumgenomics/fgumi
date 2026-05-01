@@ -121,20 +121,48 @@ Uses `mimalloc` as global allocator for performance.
 
 ## Unsafe Code
 
-`#![deny(unsafe_code)]` - only standard library unsafe is permitted.
+`#![deny(unsafe_code)]` is set at the crate root of every workspace member. Targeted
+`#[allow(unsafe_code)]` blocks are permitted only at the documented sites listed below;
+any new `unsafe` block requires updating this section with a written justification.
 
 ### Approved non-stdlib FFI exceptions
 
 The following external FFI calls are approved because they back core infrastructure:
 
-- **`libmimalloc_sys`** (`src/lib/sort/memory_probe.rs`) — mimalloc is the configured
+- **`libmimalloc_sys`** (`crates/fgumi-sort/src/memory_probe.rs`) — mimalloc is the configured
   global allocator. The FFI wrappers (`force_mi_collect`, `process_rss_bytes`, and the
   `memory-debug`-gated `print_mi_stats` calling `mi_stats_print_out`) are isolated to
   a single `#[allow(unsafe_code)]` sub-module. mimalloc synchronizes these calls
   internally, so they are safe to invoke concurrently.
-- **`mach2`** (`src/lib/sort/memory_probe.rs`, macOS only) — `task_info(TASK_VM_INFO)`
+- **`mach2`** (`crates/fgumi-sort/src/memory_probe.rs`, macOS only) — `task_info(TASK_VM_INFO)`
   is the only way to read `phys_footprint` (the RSS metric mimalloc reports accurately).
   Isolated to the same sub-module as the mimalloc FFI.
+
+### Approved hot-path unsafe (sort engine)
+
+The radix-sort, in-memory record buffer, and natural-order comparator hot paths in
+`fgumi-sort` use `unsafe` for performance. Each site is `#[allow(unsafe_code)]` and
+covered by a `// SAFETY:` comment that documents the invariant. These are approved
+because the hot path runs once per record (BAM workloads are millions to billions
+of records) and a safe rewrite measurably regresses sort throughput.
+
+- **`crates/fgumi-sort/src/inline.rs`** — three `#[allow(unsafe_code)]` regions:
+  the `radix_sort_record_refs` and `radix_sort_template_refs` LSD radix sorts use
+  `Vec::set_len` to skip per-element initialization on the auxiliary scratch
+  buffer, plus raw-pointer slice swaps to avoid double-borrow restrictions across
+  the source/destination ping-pong. SAFETY relies on (a) the buffer being written
+  exactly once per pass before being read, and (b) the pointers always referring
+  to disjoint, properly-aligned `Vec<RecordRef>`/`Vec<TemplateRecordRef>` storage.
+- **`crates/fgumi-sort/src/keys.rs`** — `RawQuerynameKey::cmp` calls
+  `natural_compare_nul` over raw `*const u8` pointers. SAFETY: the names that
+  back these pointers are always null-terminated by construction (see
+  `extract_queryname_key` and `RawQuerynameKey::new`).
+- **`crates/fgumi-sort/src/radix.rs`** — internal radix-sort helpers; see file
+  comments for the `SAFETY:` invariants.
+
+Any new sort-engine `unsafe` site must extend this list and explain why the safe
+alternative is unacceptable. Do not introduce `unsafe` outside `fgumi-sort` or
+`memory_probe`.
 
 ## Benchmarking Notes
 

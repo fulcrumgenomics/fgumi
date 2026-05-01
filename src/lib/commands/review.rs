@@ -6,7 +6,6 @@
 
 use crate::commands::common::parse_bool;
 use crate::logging::OperationTimer;
-use crate::progress::ProgressTracker;
 use crate::reference::find_dict_path;
 use crate::sam::SamTag;
 use crate::umi::extract_mi_base;
@@ -16,6 +15,7 @@ use crate::variant_review::{
 };
 use anyhow::{Result, bail};
 use clap::Parser;
+use fgumi_bam_io::ProgressTracker;
 use fgumi_raw_bam::{
     BAM_BASE_TO_ASCII, CigarKind, IndexedRawBamReader, RawBamReader, RawRecord,
     find_string_tag_in_record, write_raw_record,

@@ -7,13 +7,13 @@ use std::path::PathBuf;
 #[cfg(feature = "simplex")]
 use std::sync::Arc;
 
-use crate::bam_io::is_stdin_path;
 #[cfg(feature = "simplex")]
 use crate::logging::OperationTimer;
 use crate::unified_pipeline::{BamPipelineConfig, SchedulerStrategy};
 use crate::validation::validate_file_exists;
 use bytesize::ByteSize;
 use clap::Args;
+use fgumi_bam_io::is_stdin_path;
 #[cfg(feature = "simplex")]
 use fgumi_consensus::methylation::RefBaseProvider;
 #[cfg(feature = "simplex")]
@@ -107,19 +107,19 @@ pub fn load_methylation_reference(
 
 /// Add a @PG record to an existing header, using the current fgumi version.
 ///
-/// Wraps [`crate::header::add_pg_record`] with the binary's version string.
+/// Wraps [`fgumi_bam_io::header::add_pg_record`] with the binary's version string.
 pub fn add_pg_record(header: Header, command_line: &str) -> anyhow::Result<Header> {
-    crate::header::add_pg_record(header, crate::version::VERSION.as_str(), command_line)
+    fgumi_bam_io::header::add_pg_record(header, crate::version::VERSION.as_str(), command_line)
 }
 
 /// Add a @PG record to a header builder, using the current fgumi version.
 ///
-/// Wraps [`crate::header::add_pg_to_builder`] with the binary's version string.
+/// Wraps [`fgumi_bam_io::header::add_pg_to_builder`] with the binary's version string.
 pub fn add_pg_to_builder(
     builder: noodles::sam::header::Builder,
     command_line: &str,
 ) -> anyhow::Result<noodles::sam::header::Builder> {
-    crate::header::add_pg_to_builder(builder, crate::version::VERSION.as_str(), command_line)
+    fgumi_bam_io::header::add_pg_to_builder(builder, crate::version::VERSION.as_str(), command_line)
 }
 
 /// EM-Seq methylation-aware consensus calling options.
@@ -170,9 +170,9 @@ impl BamIoOptions {
         Self { input: input.into(), output: output.into(), async_reader: false }
     }
 
-    /// Build [`PipelineReaderOpts`] from the async-reader flag.
-    pub fn pipeline_reader_opts(&self) -> crate::bam_io::PipelineReaderOpts {
-        crate::bam_io::PipelineReaderOpts { async_reader: self.async_reader }
+    /// Build [`fgumi_bam_io::PipelineReaderOpts`] from the async-reader flag.
+    pub fn pipeline_reader_opts(&self) -> fgumi_bam_io::PipelineReaderOpts {
+        fgumi_bam_io::PipelineReaderOpts { async_reader: self.async_reader }
     }
 
     /// Validates that the input file exists (skipped for stdin paths).

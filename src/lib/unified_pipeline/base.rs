@@ -84,16 +84,15 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::progress::ProgressTracker;
+use fgumi_bam_io::ProgressTracker;
 
 use super::deadlock::{DeadlockAction, DeadlockState, QueueSnapshot, check_deadlock_and_restore};
 
 use crate::bgzf_reader::{RawBgzfBlock, decompress_block_into, read_raw_blocks};
 use crate::read_info::LibraryIndex;
-use crate::reorder_buffer::ReorderBuffer;
 use crate::sam::SamTag;
+use fgumi_bam_io::ReorderBuffer;
 use fgumi_raw_bam::RawRecord;
-use noodles::sam::alignment::RecordBuf;
 use noodles::sam::alignment::record::data::field::Tag;
 
 use super::scheduler::{BackpressureState, Scheduler, SchedulerStrategy, create_scheduler};
@@ -386,7 +385,7 @@ pub fn start_memory_monitor(
                     && peak_rss > 4_000_000_000
                 {
                     log::info!("=== MIMALLOC STATS AT PEAK (no mi_collect) ===");
-                    crate::sort::memory_probe::print_mi_stats();
+                    fgumi_sort::print_mi_stats();
                     stats_printed = true;
                 }
                 if current_rss > peak_rss {
@@ -426,28 +425,7 @@ pub trait BatchWeight {
 // Memory Estimate Trait (for memory-based queue limits)
 // ============================================================================
 
-/// Trait for types that can estimate their heap memory usage.
-///
-/// This is used by memory-bounded queues to track how much memory is
-/// consumed by items in the queue. The estimate should include heap
-/// allocations (Vec contents, String data, etc.) but not the struct itself.
-///
-/// # Example
-///
-/// For a batch containing a `Vec<u8>` with 1000 bytes, `estimate_heap_size()`
-/// returns approximately 1000 (the Vec's heap allocation).
-pub trait MemoryEstimate {
-    /// Returns an estimate of the heap memory used by this value in bytes.
-    ///
-    /// This should include:
-    /// - Vec/String heap allocations (capacity, not just len)
-    /// - Nested struct heap allocations
-    ///
-    /// This should NOT include:
-    /// - The size of the struct itself (stack size)
-    /// - Shared/reference-counted data (counted once, not per-reference)
-    fn estimate_heap_size(&self) -> usize;
-}
+pub use fgumi_bam_io::MemoryEstimate;
 
 // ============================================================================
 // Memory Tracking for Queues
@@ -1506,57 +1484,14 @@ impl DecodedRecord {
     }
 }
 
-/// Estimates the heap allocation of a `RecordBuf`.
-///
-/// The inline struct overhead (flags, position, etc.) is accounted for by the caller
-/// via `capacity * size_of::<RecordBuf>()`, so we only count heap allocations here.
-pub(crate) fn estimate_record_buf_heap_size(record: &RecordBuf) -> usize {
-    let name_size = record.name().map_or(0, |n| n.len());
-    let seq_len = record.sequence().len();
-    let qual_len = record.quality_scores().len();
-    let cigar_ops = record.cigar().as_ref().len();
-    let cigar_size = cigar_ops * 4;
-    let data_fields = record.data().iter().count();
-    let entry_capacity = (data_fields * 115) / 100 + 1;
-    let entries_size = data_fields * 48;
-    let hash_table_size = entry_capacity * 16;
-    let value_heap_size = data_fields * 16;
-    let data_size = entries_size + hash_table_size + value_heap_size;
-    name_size + seq_len + qual_len + cigar_size + data_size
-}
-
 impl MemoryEstimate for DecodedRecord {
     fn estimate_heap_size(&self) -> usize {
         // RawRecord::capacity() returns the inner Vec<u8> capacity.
         self.data.capacity()
     }
 }
-
-impl MemoryEstimate for Vec<DecodedRecord> {
-    fn estimate_heap_size(&self) -> usize {
-        self.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>()
-            + self.capacity() * std::mem::size_of::<DecodedRecord>()
-    }
-}
-
-impl MemoryEstimate for RecordBuf {
-    fn estimate_heap_size(&self) -> usize {
-        estimate_record_buf_heap_size(self)
-    }
-}
-
-impl MemoryEstimate for Vec<RecordBuf> {
-    fn estimate_heap_size(&self) -> usize {
-        self.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>()
-            + self.capacity() * std::mem::size_of::<RecordBuf>()
-    }
-}
-
-impl MemoryEstimate for Vec<u8> {
-    fn estimate_heap_size(&self) -> usize {
-        self.capacity()
-    }
-}
+// Vec<DecodedRecord>, Vec<RecordBuf>, Vec<u8>, RecordBuf, () — all provided
+// by the blanket/foreign impls in fgumi_bam_io::mem_estimate.
 
 // ============================================================================
 // GroupKeyConfig - Configuration for computing `GroupKey` during Decode
@@ -1740,7 +1675,7 @@ pub struct OutputPipelineQueues<G, P: MemoryEstimate> {
     /// Output file, mutex-protected for exclusive access.
     pub output: Mutex<Option<Box<dyn Write + Send>>>,
     /// Optional secondary output writer for dual-output pipelines (e.g., reject BAM).
-    pub secondary_output: Option<Mutex<Option<crate::bam_io::RawBamWriter>>>,
+    pub secondary_output: Option<Mutex<Option<fgumi_bam_io::RawBamWriter>>>,
 
     // ========== Completion and Error Tracking ==========
     /// Flag indicating an error occurred.
@@ -1802,7 +1737,7 @@ impl<G: Send, P: Send + MemoryEstimate> OutputPipelineQueues<G, P> {
     /// Set a secondary output writer for dual-output pipelines.
     ///
     /// Must be called before the pipeline is started.
-    pub fn set_secondary_output(&mut self, writer: crate::bam_io::RawBamWriter) {
+    pub fn set_secondary_output(&mut self, writer: fgumi_bam_io::RawBamWriter) {
         self.secondary_output = Some(Mutex::new(Some(writer)));
     }
 
@@ -2546,12 +2481,7 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipelineState
     }
 }
 
-/// Unit type always has zero heap size (used in tests).
-impl MemoryEstimate for () {
-    fn estimate_heap_size(&self) -> usize {
-        0
-    }
-}
+// `impl MemoryEstimate for ()` provided by fgumi_bam_io::mem_estimate.
 
 /// Configuration for the BAM pipeline.
 #[derive(Debug, Clone)]

@@ -6,7 +6,7 @@
 //! 3. Rejected reads output
 //! 4. Quality filtering options
 
-use fgumi_lib::bam_io::create_raw_bam_writer;
+use fgumi_bam_io::create_raw_bam_writer;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
 use noodles::bam;

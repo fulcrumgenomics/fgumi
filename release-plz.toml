@@ -9,3 +9,9 @@ pr_labels = ["release"]
 git_release_enable = false
 # disable running `cargo-semver-checks` until after the first release
 semver_check = false
+
+[[package]]
+name = "fgumi-bam-io"
+
+[[package]]
+name = "fgumi-sort"

@@ -20,14 +20,14 @@
 //!
 //! Use `--verify` to check if a BAM file is correctly sorted without writing output.
 
-use crate::bam_io::create_raw_bam_reader;
 use crate::logging::OperationTimer;
 use crate::sam::SamTag;
-use crate::sort::{QuerynameComparator, RawExternalSorter, SortOrder};
 use crate::validation::validate_file_exists;
 use anyhow::{Result, bail};
 use bytesize::ByteSize;
 use clap::Parser;
+use fgumi_bam_io::create_raw_bam_reader;
+use fgumi_sort::{QuerynameComparator, RawExternalSorter, SortOrder};
 
 use log::info;
 use std::path::PathBuf;
@@ -366,46 +366,7 @@ pub(crate) fn parse_cell_tag(order: SortOrderArg) -> Result<Option<SamTag>> {
     if matches!(order, SortOrderArg::TemplateCoordinate) { Ok(Some(SamTag::CB)) } else { Ok(None) }
 }
 
-/// Summary of sort-order verification: `(total_records, violations, first_violation)`.
-type VerifySummary = (u64, u64, Option<(u64, String)>);
-
-/// Verify that records from a raw BAM reader are in sorted order.
-///
-/// Iterates all records, extracting a sort key from each and checking that
-/// consecutive keys satisfy the ordering invariant (no violations).
-fn verify_sort_order<K>(
-    raw_reader: crate::sort::raw_bam_reader::RawBamRecordReader<std::fs::File>,
-    extract_key: impl Fn(&[u8]) -> K,
-    is_violation: impl Fn(&K, &K) -> bool,
-) -> Result<VerifySummary> {
-    let mut total_records: u64 = 0;
-    let mut violations: u64 = 0;
-    let mut first_violation: Option<(u64, String)> = None;
-    let mut prev_key: Option<K> = None;
-
-    for result in raw_reader {
-        let record_bytes = result?;
-        total_records += 1;
-        let bam: &[u8] = &record_bytes;
-
-        let key = extract_key(bam);
-
-        if let Some(ref prev) = prev_key {
-            if is_violation(&key, prev) {
-                violations += 1;
-                if first_violation.is_none() {
-                    let name =
-                        String::from_utf8_lossy(fgumi_raw_bam::RawRecordView::new(bam).read_name())
-                            .to_string();
-                    first_violation = Some((total_records, name));
-                }
-            }
-        }
-        prev_key = Some(key);
-    }
-
-    Ok((total_records, violations, first_violation))
-}
+use fgumi_sort::verify_sort_order;
 
 impl Command for Sort {
     fn execute(&self, command_line: &str) -> Result<()> {
@@ -653,8 +614,8 @@ impl Sort {
 
     /// Execute verify mode: read records and check sort order.
     fn execute_verify(&self) -> Result<()> {
-        use crate::sort::raw_bam_reader::RawBamRecordReader;
-        use crate::sort::{
+        use fgumi_sort::RawBamRecordReader;
+        use fgumi_sort::{
             LibraryLookup, RawQuerynameKey, RawQuerynameLexKey, RawSortKey, SortContext, cb_hasher,
             extract_coordinate_key_inline, extract_template_key_inline,
         };
@@ -1111,272 +1072,6 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_sort_order_sorted() -> Result<()> {
-        use crate::sam::builder::SamBuilder;
-        use crate::sort::raw_bam_reader::RawBamRecordReader;
-
-        let mut builder = SamBuilder::new();
-        // Add records with names in sorted order
-        let _ = builder.add_pair().name("aaa").build();
-        let _ = builder.add_pair().name("bbb").build();
-        let _ = builder.add_pair().name("ccc").build();
-
-        let dir = tempfile::tempdir()?;
-        let bam_path = dir.path().join("sorted.bam");
-        builder.write_bam(&bam_path)?;
-
-        let file = std::fs::File::open(&bam_path)?;
-        let mut reader = RawBamRecordReader::new(file)?;
-        reader.skip_header()?;
-
-        let (total, violations, first_violation) = verify_sort_order(
-            reader,
-            |bam| fgumi_raw_bam::RawRecordView::new(bam).read_name().to_vec(),
-            |key, prev| key < prev,
-        )?;
-
-        assert_eq!(total, 6); // 3 pairs = 6 records
-        assert_eq!(violations, 0);
-        assert!(first_violation.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn test_verify_sort_order_unsorted() -> Result<()> {
-        use crate::sam::builder::SamBuilder;
-        use crate::sort::raw_bam_reader::RawBamRecordReader;
-
-        let mut builder = SamBuilder::new();
-        // Add records with names out of order (pairs are interleaved)
-        let _ = builder.add_pair().name("ccc").build();
-        let _ = builder.add_pair().name("aaa").build();
-        let _ = builder.add_pair().name("bbb").build();
-
-        let dir = tempfile::tempdir()?;
-        let bam_path = dir.path().join("unsorted.bam");
-        builder.write_bam(&bam_path)?;
-
-        let file = std::fs::File::open(&bam_path)?;
-        let mut reader = RawBamRecordReader::new(file)?;
-        reader.skip_header()?;
-
-        let (total, violations, first_violation) = verify_sort_order(
-            reader,
-            |bam| fgumi_raw_bam::RawRecordView::new(bam).read_name().to_vec(),
-            |key, prev| key < prev,
-        )?;
-
-        assert_eq!(total, 6);
-        assert!(violations > 0);
-        assert!(first_violation.is_some());
-        let (record_num, name) =
-            first_violation.expect("first violation should be present for unsorted file");
-        assert!(record_num > 1); // violation can't be on first record
-        assert!(!name.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn test_verify_sort_order_empty() -> Result<()> {
-        use crate::sam::builder::SamBuilder;
-        use crate::sort::raw_bam_reader::RawBamRecordReader;
-
-        let builder = SamBuilder::new();
-
-        let dir = tempfile::tempdir()?;
-        let bam_path = dir.path().join("empty.bam");
-        builder.write_bam(&bam_path)?;
-
-        let file = std::fs::File::open(&bam_path)?;
-        let mut reader = RawBamRecordReader::new(file)?;
-        reader.skip_header()?;
-
-        let (total, violations, first_violation) = verify_sort_order(
-            reader,
-            |bam| fgumi_raw_bam::RawRecordView::new(bam).read_name().to_vec(),
-            |key, prev| key < prev,
-        )?;
-
-        assert_eq!(total, 0);
-        assert_eq!(violations, 0);
-        assert!(first_violation.is_none());
-        Ok(())
-    }
-
-    // ========================================================================
-    // Verify sort order tests (passing and failing) for all orders + sub-sorts
-    // ========================================================================
-
-    /// Helper: build a BAM, sort it with the given order, then verify it passes.
-    fn sort_and_verify_pass(order_str: &str) -> Result<()> {
-        use crate::sort::raw_bam_reader::RawBamRecordReader;
-        use crate::sort::{
-            RawExternalSorter, RawQuerynameKey, RawQuerynameLexKey, RawSortKey, SortContext,
-            extract_coordinate_key_inline,
-        };
-
-        let mut builder = crate::sam::builder::SamBuilder::new();
-        // Add pairs with names that sort differently under natural vs lexicographic
-        let _ = builder.add_pair().name("read2").contig(0).start1(200).build();
-        let _ = builder.add_pair().name("read10").contig(0).start1(100).build();
-        let _ = builder.add_pair().name("read1").contig(1).start1(50).build();
-
-        let dir = tempfile::tempdir()?;
-        let input_bam = dir.path().join("input.bam");
-        let sorted_bam = dir.path().join("sorted.bam");
-        builder.write_bam(&input_bam)?;
-
-        let order_arg =
-            SortOrderArg::parse(order_str).expect("parse should succeed for valid sort order");
-        let sort_order: SortOrder = order_arg.into();
-
-        let sorter = RawExternalSorter::new(sort_order).threads(1).output_compression(6);
-        sorter.sort(&input_bam, &sorted_bam)?;
-
-        // Now verify
-        let file = std::fs::File::open(&sorted_bam)?;
-        let (_, header) = crate::bam_io::create_bam_reader(&sorted_bam, 1)?;
-        let mut reader = RawBamRecordReader::new(file)?;
-        reader.skip_header()?;
-
-        let (total, violations, _) = match order_arg {
-            SortOrderArg::Coordinate => {
-                let nref = header.reference_sequences().len() as u32;
-                verify_sort_order(
-                    reader,
-                    |bam| extract_coordinate_key_inline(bam, nref),
-                    |key, prev| key < prev,
-                )?
-            }
-            SortOrderArg::Queryname => {
-                let ctx = SortContext::from_header(&header);
-                verify_sort_order(
-                    reader,
-                    |bam| RawQuerynameLexKey::extract(bam, &ctx),
-                    |key, prev| key < prev,
-                )?
-            }
-            SortOrderArg::QuerynameNatural => {
-                let ctx = SortContext::from_header(&header);
-                verify_sort_order(
-                    reader,
-                    |bam| RawQuerynameKey::extract(bam, &ctx),
-                    |key, prev| key < prev,
-                )?
-            }
-            SortOrderArg::TemplateCoordinate => {
-                // Skip template-coordinate verify — requires more complex setup
-                return Ok(());
-            }
-        };
-
-        assert!(total > 0, "should have records for {order_str}");
-        assert_eq!(violations, 0, "should be sorted for {order_str}");
-        Ok(())
-    }
-
-    #[test]
-    fn test_verify_coordinate_sorted_pass() -> Result<()> {
-        sort_and_verify_pass("coordinate")
-    }
-
-    #[test]
-    fn test_verify_queryname_default_sorted_pass() -> Result<()> {
-        sort_and_verify_pass("queryname")
-    }
-
-    #[test]
-    fn test_verify_queryname_lexicographic_sorted_pass() -> Result<()> {
-        sort_and_verify_pass("queryname::lexicographic")
-    }
-
-    #[test]
-    fn test_verify_queryname_natural_sorted_pass() -> Result<()> {
-        sort_and_verify_pass("queryname::natural")
-    }
-
-    #[test]
-    fn test_verify_queryname_lex_fails_with_natural_verifier() -> Result<()> {
-        use crate::sort::raw_bam_reader::RawBamRecordReader;
-        use crate::sort::{RawExternalSorter, RawQuerynameKey, RawSortKey, SortContext};
-
-        // Build BAM with names that differ between lex and natural ordering
-        let mut builder = crate::sam::builder::SamBuilder::new();
-        let _ = builder.add_pair().name("read2").contig(0).start1(100).build();
-        let _ = builder.add_pair().name("read10").contig(0).start1(200).build();
-
-        let dir = tempfile::tempdir()?;
-        let input_bam = dir.path().join("input.bam");
-        let sorted_bam = dir.path().join("sorted.bam");
-        builder.write_bam(&input_bam)?;
-
-        // Sort with lexicographic order (read10 < read2 in lex)
-        let sorter =
-            RawExternalSorter::new(SortOrder::Queryname(QuerynameComparator::Lexicographic))
-                .threads(1)
-                .output_compression(6);
-        sorter.sort(&input_bam, &sorted_bam)?;
-
-        // Verify with natural comparator — should detect violations
-        // because lex order puts read10 before read2, but natural expects read2 before read10
-        let file = std::fs::File::open(&sorted_bam)?;
-        let (_, header) = crate::bam_io::create_bam_reader(&sorted_bam, 1)?;
-        let mut reader = RawBamRecordReader::new(file)?;
-        reader.skip_header()?;
-
-        let ctx = SortContext::from_header(&header);
-        let (total, violations, _) = verify_sort_order(
-            reader,
-            |bam| RawQuerynameKey::extract(bam, &ctx),
-            |key, prev| key < prev,
-        )?;
-
-        assert!(total > 0);
-        assert!(violations > 0, "lex-sorted file should fail natural verify");
-        Ok(())
-    }
-
-    #[test]
-    fn test_verify_queryname_natural_fails_with_lex_verifier() -> Result<()> {
-        use crate::sort::raw_bam_reader::RawBamRecordReader;
-        use crate::sort::{RawExternalSorter, RawQuerynameLexKey, RawSortKey, SortContext};
-
-        // Build BAM with names that differ between lex and natural ordering
-        let mut builder = crate::sam::builder::SamBuilder::new();
-        let _ = builder.add_pair().name("read2").contig(0).start1(100).build();
-        let _ = builder.add_pair().name("read10").contig(0).start1(200).build();
-
-        let dir = tempfile::tempdir()?;
-        let input_bam = dir.path().join("input.bam");
-        let sorted_bam = dir.path().join("sorted.bam");
-        builder.write_bam(&input_bam)?;
-
-        // Sort with natural order (read2 < read10 in natural)
-        let sorter = RawExternalSorter::new(SortOrder::Queryname(QuerynameComparator::Natural))
-            .threads(1)
-            .output_compression(6);
-        sorter.sort(&input_bam, &sorted_bam)?;
-
-        // Verify with lexicographic comparator — should detect violations
-        // because natural puts read2 before read10, but lex expects read10 before read2
-        let file = std::fs::File::open(&sorted_bam)?;
-        let (_, header) = crate::bam_io::create_bam_reader(&sorted_bam, 1)?;
-        let mut reader = RawBamRecordReader::new(file)?;
-        reader.skip_header()?;
-
-        let ctx = SortContext::from_header(&header);
-        let (total, violations, _) = verify_sort_order(
-            reader,
-            |bam| RawQuerynameLexKey::extract(bam, &ctx),
-            |key, prev| key < prev,
-        )?;
-
-        assert!(total > 0);
-        assert!(violations > 0, "natural-sorted file should fail lex verify");
-        Ok(())
-    }
-
-    #[test]
     fn test_verify_conflicts_with_output() {
         let sort = Sort {
             verify: true,
@@ -1396,8 +1091,8 @@ mod tests {
 
     #[test]
     fn test_verify_coordinate_fails_on_unsorted() -> Result<()> {
-        use crate::sort::extract_coordinate_key_inline;
-        use crate::sort::raw_bam_reader::RawBamRecordReader;
+        use fgumi_sort::RawBamRecordReader;
+        use fgumi_sort::extract_coordinate_key_inline;
 
         // Build BAM with records deliberately out of coordinate order
         let mut builder = crate::sam::builder::SamBuilder::new();
@@ -1409,7 +1104,7 @@ mod tests {
         builder.write_bam(&bam_path)?;
 
         let file = std::fs::File::open(&bam_path)?;
-        let (_, header) = crate::bam_io::create_bam_reader(&bam_path, 1)?;
+        let (_, header) = fgumi_bam_io::create_bam_reader(&bam_path, 1)?;
         let mut reader = RawBamRecordReader::new(file)?;
         reader.skip_header()?;
 

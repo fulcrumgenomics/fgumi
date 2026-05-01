@@ -1,0 +1,56 @@
+[package]
+name = "fgumi-sort"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "High-performance external merge-sort engine for BAM files"
+repository.workspace = true
+license.workspace = true
+readme = "README.md"
+categories = ["command-line-utilities", "science"]
+keywords = ["bioinformatics", "bam", "sort", "sequencing", "ngs"]
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+
+[dependencies]
+fgumi-raw-bam = { workspace = true, features = ["noodles"] }
+fgumi-bgzf = { workspace = true }
+fgumi-bam-io = { workspace = true }
+noodles = { version = "0.106.0", features = ["bam", "sam", "core", "csi"] }
+noodles-bgzf = { version = "0.46.0", features = ["libdeflate"] }
+libdeflater = "1.22"
+libmimalloc-sys = { version = "0.1.44", features = ["extended"] }
+rayon = "1.10"
+crossbeam-channel = "0.5"
+crossbeam-queue = "0.3"
+crossbeam-utils = "0.8.21"
+parking_lot = "0.12"
+tempfile = "3.3.0"
+bytemuck = { workspace = true }
+ahash = "0.8"
+anyhow = "1.0.102"
+bstr = "1.12.1"
+bytes = "1"
+bytesize = "2.3"
+fs4 = { version = "0.13", default-features = false, features = ["sync"] }
+log = "0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.6"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", default-features = false, features = ["fs"] }
+
+[features]
+default = []
+memory-debug = []
+
+[dev-dependencies]
+fgumi-bam-io = { workspace = true }
+fgumi-raw-bam = { workspace = true, features = ["test-utils", "noodles"] }
+fgumi-sam = { workspace = true }
+rstest = "0"
+proptest = "1.10"
+criterion = { version = "0.8", features = ["html_reports"] }
+tempfile = "3"

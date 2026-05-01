@@ -14,7 +14,6 @@
 //! Automatically detects and handles both Phred+33 (standard) and Phred+64 (Illumina 1.3-1.7)
 //! quality encodings.
 
-use crate::bam_io::{RawBamWriter, create_raw_bam_writer};
 use crate::commands::command::Command;
 use crate::commands::common::{
     CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
@@ -24,20 +23,21 @@ use crate::fastq::FastqSet;
 use crate::fastq::ReadSetIterator;
 use crate::grouper::FastqTemplate;
 use crate::logging::OperationTimer;
-use crate::progress::ProgressTracker;
 use crate::sam::SamTag;
 use crate::unified_pipeline::{FastqPipelineConfig, MemoryEstimate, run_fastq_pipeline};
 use crate::validation::validate_file_exists;
 use anyhow::{Result, bail, ensure};
 use bstr::{BString, ByteSlice};
 use clap::Parser;
+use fgumi_bam_io::ProgressTracker;
+use fgumi_bam_io::{RawBamWriter, create_raw_bam_writer};
 use fgumi_raw_bam::UnmappedSamBuilder;
 use fgumi_raw_bam::fields::flags;
 use log::{debug, info};
 use noodles_bgzf::io::MultithreadedReader;
 
 #[cfg(test)]
-use crate::bam_io::create_bam_reader;
+use fgumi_bam_io::create_bam_reader;
 use fgumi_simd_fastq::SimdFastqReader;
 use noodles::sam::header::Header;
 use noodles::sam::header::record::value::Map;
@@ -157,12 +157,12 @@ fn open_fastq_reader(
     let open_reader = |path: &Path| -> Result<Box<dyn std::io::Read + Send>> {
         let file = File::open(path)?;
         if async_reader {
-            crate::os_hints::advise_sequential(&file);
+            fgumi_bam_io::os_hints::advise_sequential(&file);
             log::info!(
                 "async FASTQ reader enabled: spawning fgumi-prefetch thread for {}",
                 path.display()
             );
-            Ok(Box::new(crate::prefetch_reader::PrefetchReader::from_file(file)))
+            Ok(Box::new(fgumi_bam_io::prefetch_reader::PrefetchReader::from_file(file)))
         } else {
             Ok(Box::new(file))
         }

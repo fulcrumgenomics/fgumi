@@ -41,25 +41,25 @@
 //! corrector.execute("test").expect("Failed to correct UMIs");
 //! ```
 
-use crate::bam_io::{
-    BamWriter, RawBamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
-    create_optional_bam_writer, create_raw_bam_reader_with_opts, create_raw_bam_writer,
-};
 use crate::bitenc::BitEnc;
 use crate::dna::reverse_complement_str;
 use crate::grouper::TemplateGrouper;
 use crate::logging::OperationTimer;
 use crate::metrics::correct::UmiCorrectionMetrics;
 use crate::per_thread_accumulator::PerThreadAccumulator;
-use crate::progress::ProgressTracker;
 use crate::sam::{SamTag, header_as_unsorted};
-use crate::sort::bam_fields;
 use crate::template::TemplateBatch;
 use crate::unified_pipeline::{Grouper, MemoryEstimate, run_bam_pipeline_from_reader};
 use crate::validation::validate_file_exists;
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use fgumi_bam_io::ProgressTracker;
+use fgumi_bam_io::{
+    BamWriter, RawBamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
+    create_optional_bam_writer, create_raw_bam_reader_with_opts, create_raw_bam_writer,
+};
+use fgumi_raw_bam;
 use fgumi_raw_bam::RawRecord;
 use log::{info, warn};
 use lru::LruCache;
@@ -643,7 +643,7 @@ impl CorrectUmis {
         raw_records: &[RawRecord],
         umi_tag: [u8; 2],
     ) -> anyhow::Result<Option<String>> {
-        use crate::sort::bam_fields;
+        use fgumi_raw_bam;
 
         if raw_records.is_empty() {
             return Ok(None);
@@ -654,13 +654,13 @@ impl CorrectUmis {
             return Ok(None);
         }
 
-        let first_aux = bam_fields::aux_data_slice(&raw_records[0]);
+        let first_aux = fgumi_raw_bam::aux_data_slice(&raw_records[0]);
         // Work with &[u8] slices to avoid per-record String allocation
-        let first_umi_bytes = bam_fields::find_string_tag(first_aux, umi_tag);
+        let first_umi_bytes = fgumi_raw_bam::find_string_tag(first_aux, umi_tag);
 
         // If tag exists but is not a Z-type string, return an error
         if first_umi_bytes.is_none() {
-            if let Some(tag_type) = bam_fields::find_tag_type(first_aux, umi_tag) {
+            if let Some(tag_type) = fgumi_raw_bam::find_tag_type(first_aux, umi_tag) {
                 anyhow::bail!(
                     "UMI tag {:?} exists but has non-string type '{}', expected 'Z'",
                     std::str::from_utf8(&umi_tag).unwrap_or("??"),
@@ -670,8 +670,8 @@ impl CorrectUmis {
         }
 
         for raw in &raw_records[1..] {
-            let aux = bam_fields::aux_data_slice(raw);
-            let current_umi_bytes = bam_fields::find_string_tag(aux, umi_tag);
+            let aux = fgumi_raw_bam::aux_data_slice(raw);
+            let current_umi_bytes = fgumi_raw_bam::find_string_tag(aux, umi_tag);
 
             match (first_umi_bytes, current_umi_bytes) {
                 (Some(first), Some(current)) if first != current => {
@@ -699,18 +699,22 @@ impl CorrectUmis {
         umi_tag: [u8; 2],
         dont_store_original_umis: bool,
     ) {
-        use crate::sort::bam_fields;
+        use fgumi_raw_bam;
 
         if correction.needs_correction {
             // Write corrected UMI first (in-place update avoids scanning past OX)
             if let Some(ref corrected) = correction.corrected_umi {
-                bam_fields::update_string_tag(record.as_mut_vec(), umi_tag, corrected.as_bytes());
+                fgumi_raw_bam::update_string_tag(
+                    record.as_mut_vec(),
+                    umi_tag,
+                    corrected.as_bytes(),
+                );
             }
 
             // Store original UMI if there were actual mismatches
             // Use update_string_tag to avoid duplicate OX tags
             if !dont_store_original_umis && correction.has_mismatches {
-                bam_fields::update_string_tag(
+                fgumi_raw_bam::update_string_tag(
                     record.as_mut_vec(),
                     SamTag::OX,
                     correction.original_umi.as_bytes(),
@@ -1209,7 +1213,7 @@ impl CorrectUmis {
             let flush = if eof {
                 !current_template.is_empty()
             } else {
-                let name = bam_fields::read_name(record.as_ref());
+                let name = fgumi_raw_bam::read_name(record.as_ref());
                 current_name.as_deref().is_some_and(|cn| cn != name)
             };
 
@@ -1314,7 +1318,7 @@ impl CorrectUmis {
             }
 
             // Accumulate current record — move the reader's buffer instead of copying.
-            current_name = Some(bam_fields::read_name(record.as_ref()).to_vec());
+            current_name = Some(fgumi_raw_bam::read_name(record.as_ref()).to_vec());
             let taken = std::mem::take(&mut record);
             current_template.push(taken);
         }
@@ -3147,7 +3151,7 @@ mod tests {
     fn make_raw_bam_for_correct(name: &[u8], flag: u16, umi: &[u8]) -> RawRecord {
         let l_read_name = (name.len() + 1) as u8;
         let seq_len = 4usize;
-        let cigar_ops: &[u32] = if (flag & crate::sort::bam_fields::flags::UNMAPPED) == 0 {
+        let cigar_ops: &[u32] = if (flag & fgumi_raw_bam::flags::UNMAPPED) == 0 {
             &[(seq_len as u32) << 4]
         } else {
             &[]
@@ -3182,6 +3186,10 @@ mod tests {
         buf.extend_from_slice(umi);
         buf.push(0);
 
+        // Backfill the BAM block_size field (excludes the 4-byte block_size itself).
+        let block_size = i32::try_from(buf.len() - 4).expect("BAM record fits in i32");
+        buf[0..4].copy_from_slice(&block_size.to_le_bytes());
+
         RawRecord::from(buf)
     }
 
@@ -3193,7 +3201,7 @@ mod tests {
     fn test_extract_and_validate_template_umi_raw_single_record() {
         let raw = make_raw_bam_for_correct(
             b"rea",
-            crate::sort::bam_fields::flags::PAIRED | crate::sort::bam_fields::flags::FIRST_SEGMENT,
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
             b"AAAAAA",
         );
         let result =
@@ -3205,12 +3213,12 @@ mod tests {
     fn test_extract_and_validate_template_umi_raw_matching_pair() {
         let r1 = make_raw_bam_for_correct(
             b"rea",
-            crate::sort::bam_fields::flags::PAIRED | crate::sort::bam_fields::flags::FIRST_SEGMENT,
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
             b"ACGTAC",
         );
         let r2 = make_raw_bam_for_correct(
             b"rea",
-            crate::sort::bam_fields::flags::PAIRED | crate::sort::bam_fields::flags::LAST_SEGMENT,
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT,
             b"ACGTAC",
         );
         let result =
@@ -3222,12 +3230,12 @@ mod tests {
     fn test_extract_and_validate_template_umi_raw_mismatch_errors() {
         let r1 = make_raw_bam_for_correct(
             b"rea",
-            crate::sort::bam_fields::flags::PAIRED | crate::sort::bam_fields::flags::FIRST_SEGMENT,
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
             b"AAAAAA",
         );
         let r2 = make_raw_bam_for_correct(
             b"rea",
-            crate::sort::bam_fields::flags::PAIRED | crate::sort::bam_fields::flags::LAST_SEGMENT,
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT,
             b"CCCCCC",
         );
         let err =
@@ -3247,9 +3255,7 @@ mod tests {
         let mut raw_bytes = vec![0u8; 42]; // minimal record
         raw_bytes[8] = 4; // l_read_name
         raw_bytes[14..16].copy_from_slice(
-            &(crate::sort::bam_fields::flags::PAIRED
-                | crate::sort::bam_fields::flags::FIRST_SEGMENT)
-                .to_le_bytes(),
+            &(fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT).to_le_bytes(),
         );
         raw_bytes[16..20].copy_from_slice(&4u32.to_le_bytes()); // l_seq = 4
         raw_bytes[32..36].copy_from_slice(b"rea\0");
@@ -3265,11 +3271,11 @@ mod tests {
 
     #[test]
     fn test_apply_correction_to_raw_corrects_umi() {
-        use crate::sort::bam_fields;
+        use fgumi_raw_bam;
 
         let mut raw = make_raw_bam_for_correct(
             b"rea",
-            bam_fields::flags::PAIRED | bam_fields::flags::FIRST_SEGMENT,
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
             b"AAAAAG", // original UMI with 1 mismatch
         );
 
@@ -3286,21 +3292,21 @@ mod tests {
         CorrectUmis::apply_correction_to_raw(&mut raw, &correction, *SamTag::RX, false);
 
         // Verify corrected UMI
-        let umi = bam_fields::find_string_tag_in_record(&raw, SamTag::RX);
+        let umi = fgumi_raw_bam::find_string_tag_in_record(&raw, SamTag::RX);
         assert_eq!(umi, Some(b"AAAAAA".as_ref()));
 
         // Verify OX tag with original UMI
-        let ox = bam_fields::find_string_tag_in_record(&raw, SamTag::OX);
+        let ox = fgumi_raw_bam::find_string_tag_in_record(&raw, SamTag::OX);
         assert_eq!(ox, Some(b"AAAAAG".as_ref()));
     }
 
     #[test]
     fn test_apply_correction_to_raw_no_correction_needed() {
-        use crate::sort::bam_fields;
+        use fgumi_raw_bam;
 
         let mut raw = make_raw_bam_for_correct(
             b"rea",
-            bam_fields::flags::PAIRED | bam_fields::flags::FIRST_SEGMENT,
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
             b"AAAAAA",
         );
         let orig_len = raw.len();
@@ -3319,7 +3325,7 @@ mod tests {
 
         // Record should be unchanged
         assert_eq!(raw.len(), orig_len);
-        let umi = bam_fields::find_string_tag_in_record(&raw, SamTag::RX);
+        let umi = fgumi_raw_bam::find_string_tag_in_record(&raw, SamTag::RX);
         assert_eq!(umi, Some(b"AAAAAA".as_ref()));
     }
 
@@ -3506,11 +3512,11 @@ mod tests {
 
     #[test]
     fn test_apply_correction_to_raw_dont_store_original() {
-        use crate::sort::bam_fields;
+        use fgumi_raw_bam;
 
         let mut raw = make_raw_bam_for_correct(
             b"rea",
-            bam_fields::flags::PAIRED | bam_fields::flags::FIRST_SEGMENT,
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
             b"AAAAAG",
         );
 
@@ -3527,11 +3533,11 @@ mod tests {
         CorrectUmis::apply_correction_to_raw(&mut raw, &correction, *SamTag::RX, true);
 
         // Corrected UMI should be present
-        let umi = bam_fields::find_string_tag_in_record(&raw, SamTag::RX);
+        let umi = fgumi_raw_bam::find_string_tag_in_record(&raw, SamTag::RX);
         assert_eq!(umi, Some(b"AAAAAA".as_ref()));
 
         // OX tag should NOT be present (dont_store_original_umis = true)
-        let ox = bam_fields::find_string_tag_in_record(&raw, SamTag::OX);
+        let ox = fgumi_raw_bam::find_string_tag_in_record(&raw, SamTag::OX);
         assert!(ox.is_none());
     }
 }

@@ -4,10 +4,6 @@
 //! consensus reads using a likelihood-based model that accounts for sequencing errors and
 //! errors introduced during sample preparation.
 
-use crate::bam_io::{
-    RawBamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
-    create_optional_bam_writer, create_raw_bam_reader_with_opts, create_raw_bam_writer,
-};
 use crate::consensus_caller::{
     ConsensusCaller, ConsensusCallingStats, ConsensusOutput, RejectionReason,
 };
@@ -17,7 +13,6 @@ use crate::overlapping_consensus::{
     AgreementStrategy, CorrectionStats, DisagreementStrategy, OverlappingBasesConsensusCaller,
     apply_overlapping_consensus,
 };
-use crate::progress::ProgressTracker;
 use crate::read_info::LibraryIndex;
 use crate::unified_pipeline::{
     GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
@@ -25,6 +20,11 @@ use crate::unified_pipeline::{
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fgoxide::io::DelimFile;
+use fgumi_bam_io::ProgressTracker;
+use fgumi_bam_io::{
+    RawBamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
+    create_optional_bam_writer, create_raw_bam_reader_with_opts, create_raw_bam_writer,
+};
 use fgumi_raw_bam::RawRecord;
 // RejectionTracker now used via ConsensusStatsOps trait in consensus_runner
 use crate::per_thread_accumulator::PerThreadAccumulator;

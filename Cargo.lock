@@ -644,7 +644,6 @@ dependencies = [
  "ahash",
  "anyhow",
  "approx",
- "bgzf",
  "bstr 1.12.1",
  "built",
  "bytemuck",
@@ -661,6 +660,7 @@ dependencies = [
  "enum_dispatch",
  "env_logger",
  "fgoxide",
+ "fgumi-bam-io",
  "fgumi-bgzf",
  "fgumi-consensus",
  "fgumi-dna",
@@ -668,6 +668,7 @@ dependencies = [
  "fgumi-raw-bam",
  "fgumi-sam",
  "fgumi-simd-fastq",
+ "fgumi-sort",
  "fgumi-umi",
  "flate2",
  "fs4",
@@ -683,7 +684,6 @@ dependencies = [
  "nix",
  "noodles",
  "noodles-bgzf",
- "noodles-csi",
  "num_cpus",
  "parking_lot",
  "proptest",
@@ -697,7 +697,27 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "thiserror 2.0.18",
- "wide 1.3.0",
+]
+
+[[package]]
+name = "fgumi-bam-io"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "bgzf",
+ "bstr 1.12.1",
+ "bytes",
+ "criterion",
+ "crossbeam-channel",
+ "fgumi-raw-bam",
+ "log",
+ "nix",
+ "noodles",
+ "noodles-bgzf",
+ "noodles-csi",
+ "proptest",
+ "rstest",
+ "tempfile",
 ]
 
 [[package]]
@@ -786,6 +806,39 @@ dependencies = [
  "proptest",
  "rstest",
  "seq_io",
+]
+
+[[package]]
+name = "fgumi-sort"
+version = "0.2.0"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "bstr 1.12.1",
+ "bytemuck",
+ "bytes",
+ "bytesize",
+ "criterion",
+ "crossbeam-channel",
+ "crossbeam-queue",
+ "crossbeam-utils",
+ "fgumi-bam-io",
+ "fgumi-bgzf",
+ "fgumi-raw-bam",
+ "fgumi-sam",
+ "fs4",
+ "libdeflater",
+ "libmimalloc-sys",
+ "log",
+ "mach2",
+ "nix",
+ "noodles",
+ "noodles-bgzf",
+ "parking_lot",
+ "proptest",
+ "rayon",
+ "rstest",
+ "tempfile",
 ]
 
 [[package]]

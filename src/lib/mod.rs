@@ -21,9 +21,9 @@
 //!
 //! ### Utilities
 //!
-//! - **[`bam_io`]** - BAM file I/O helpers for reading and writing
+//! - [`fgumi_bam_io`] - BAM file I/O helpers for reading and writing (separate crate)
 //! - **[`validation`]** - Input validation utilities for parameters and files
-//! - **[`progress`]** - Progress tracking and logging
+//! - [`fgumi_bam_io::progress`] - Progress tracking and logging (separate crate)
 //! - **[`logging`]** - Enhanced logging utilities with formatting
 //! - **[`metrics`]** - Structured metrics types and file writing utilities
 //! - **[`rejection`]** - Rejection reason tracking and statistics
@@ -39,7 +39,7 @@
 //! ### Reading and Writing BAM Files
 //!
 //! ```no_run
-//! use fgumi_lib::bam_io::{create_bam_reader, create_bam_writer};
+//! use fgumi_bam_io::{create_bam_reader, create_bam_writer};
 //!
 //! # fn main() -> anyhow::Result<()> {
 //! // Open input BAM and get header (path, threads)
@@ -126,7 +126,6 @@
 //! - [fgbio](https://github.com/fulcrumgenomics/fgbio) - Scala implementation
 //! - [noodles](https://github.com/zaeleus/noodles) - Rust bioinformatics I/O
 
-pub mod bam_io;
 pub mod batched_sam_reader;
 pub mod commands;
 pub mod version;
@@ -140,21 +139,15 @@ pub mod errors;
 pub mod fastq;
 pub mod fastq_parse;
 pub mod grouper;
-pub mod header;
 pub mod logging;
 pub mod metrics;
 pub mod mi_group;
-pub mod os_hints;
 pub mod per_thread_accumulator;
-pub mod prefetch_reader;
 pub use fgumi_consensus::phred;
-pub mod progress;
 pub mod read_info;
 pub mod reference;
 pub use fgumi_metrics::rejection;
-pub mod reorder_buffer;
 pub mod sam;
-pub mod sort;
 pub mod system;
 pub mod tag_reversal;
 pub mod template;
@@ -162,8 +155,6 @@ pub mod umi;
 pub mod unified_pipeline;
 pub mod validation;
 pub mod variant_review;
-#[doc(hidden)]
-pub mod vendored;
 
 #[cfg(feature = "simulate")]
 pub mod simulate;
