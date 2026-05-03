@@ -228,7 +228,7 @@ fn test_correct_command_rejects_streaming_threaded_integrity() {
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 
     crate::helpers::assertions::assert_has_bgzf_eof(&rejects_bam);
-    crate::helpers::assertions::assert_header_unsorted(&rejects_bam);
+    crate::helpers::assertions::assert_rejects_header_matches_input(&rejects_bam, &input_bam);
 
     let mut reader = bam::io::Reader::new(fs::File::open(&rejects_bam).unwrap());
     let _header = reader.read_header().unwrap();

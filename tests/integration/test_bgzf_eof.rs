@@ -15,7 +15,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
-use crate::helpers::assertions::{assert_has_bgzf_eof, assert_header_unsorted};
+use crate::helpers::assertions::{
+    assert_has_bgzf_eof, assert_header_unsorted, assert_rejects_header_matches_input,
+};
 use crate::helpers::bam_generator::{
     create_minimal_header, create_test_reference, create_umi_family, to_record_buf,
 };
@@ -808,7 +810,7 @@ fn test_correct_rejects_has_bgzf_eof() {
     assert!(status.success(), "correct command with rejects failed");
     assert_has_bgzf_eof(&output_bam);
     assert_has_bgzf_eof(&rejects_bam);
-    assert_header_unsorted(&rejects_bam);
+    assert_rejects_header_matches_input(&rejects_bam, &input_bam);
 }
 
 #[test]
@@ -850,4 +852,5 @@ fn test_correct_single_threaded_rejects_has_bgzf_eof() {
     assert_has_bgzf_eof(&rejects_bam);
     // Single-threaded correct writes rejects in input order, so it keeps the
     // input header as-is rather than marking it SO:unsorted.
+    assert_rejects_header_matches_input(&rejects_bam, &input_bam);
 }
