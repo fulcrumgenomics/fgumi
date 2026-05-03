@@ -56,21 +56,27 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-const BUFFER_SIZE: usize = 1024 * 1024;
-const QUALITY_DETECTION_SAMPLE_SIZE: usize = 400;
+/// I/O buffer size for FASTQ readers.
+pub(crate) const BUFFER_SIZE: usize = 1024 * 1024;
+/// Number of records sampled when auto-detecting FASTQ quality encoding.
+pub(crate) const QUALITY_DETECTION_SAMPLE_SIZE: usize = 400;
 
 /// Pre-serialized batch of BAM records for the pipeline output type.
 ///
 /// Contains raw BAM record bytes with `block_size` prefixes, ready for
 /// the compress step. Replaces `Vec<RecordBuf>` as the pipeline `P` type.
-struct ExtractedBatch {
+///
+/// Exposed at `pub(crate)` for the runall extract chain runner so the
+/// chain can hand the same type to `unified_pipeline::fastq::run_fastq_pipeline`
+/// — this is the type the `MemoryEstimate` bound on `P` selects.
+pub(crate) struct RawExtractedRecords {
     /// BAM records with `block_size` prefixes, ready for compress step.
-    data: Vec<u8>,
+    pub(crate) data: Vec<u8>,
     /// Number of records in this batch.
-    num_records: u64,
+    pub(crate) num_records: u64,
 }
 
-impl MemoryEstimate for ExtractedBatch {
+impl MemoryEstimate for RawExtractedRecords {
     fn estimate_heap_size(&self) -> usize {
         self.data.capacity()
     }
@@ -78,7 +84,7 @@ impl MemoryEstimate for ExtractedBatch {
 
 /// Compression format detected from file header
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum CompressionFormat {
+pub(crate) enum CompressionFormat {
     /// BGZF format (blocked gzip, can be parallelized)
     Bgzf,
     /// Standard gzip format (cannot be parallelized)
@@ -96,7 +102,7 @@ enum CompressionFormat {
 /// - Extra field with SI1='B' (0x42), SI2='C' (0x43)
 ///
 /// Regular gzip files have the magic number but don't have the BGZF extra field.
-fn detect_compression_format(path: &Path) -> Result<CompressionFormat> {
+pub(crate) fn detect_compression_format(path: &Path) -> Result<CompressionFormat> {
     let mut file = File::open(path)?;
     let mut header = [0u8; 18];
 
@@ -144,7 +150,7 @@ fn detect_compression_format(path: &Path) -> Result<CompressionFormat> {
 ///
 /// # Returns
 /// A boxed reader that implements `BufRead` + `Send`
-fn open_fastq_reader(
+pub(crate) fn open_fastq_reader(
     path: &Path,
     threads: usize,
     async_reader: bool,
@@ -194,14 +200,14 @@ fn open_fastq_reader(
 
 /// Quality encoding type
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum QualityEncoding {
+pub(crate) enum QualityEncoding {
     Standard, // Phred+33 (Sanger)
     Illumina, // Phred+64 (Illumina 1.3-1.7)
 }
 
 impl QualityEncoding {
     /// Convert quality scores to standard numeric format (Phred+33)
-    fn to_standard_numeric(self, quals: &[u8]) -> Vec<u8> {
+    pub(crate) fn to_standard_numeric(self, quals: &[u8]) -> Vec<u8> {
         match self {
             QualityEncoding::Standard => quals.iter().map(|&q| q.saturating_sub(33)).collect(),
             QualityEncoding::Illumina => quals.iter().map(|&q| q.saturating_sub(64)).collect(),
@@ -215,7 +221,7 @@ impl QualityEncoding {
     /// - Checks for quality scores in the Sanger/Illumina 1.8+ range (33-126)
     /// - Handles edge cases like empty reads or very short reads
     /// - Provides informative error messages for invalid encodings
-    fn detect(records: &[Vec<u8>]) -> Result<Self> {
+    pub(crate) fn detect(records: &[Vec<u8>]) -> Result<Self> {
         if records.is_empty() {
             bail!("Cannot detect quality encoding: no records provided");
         }
@@ -515,6 +521,83 @@ pub struct Extract {
     pub async_reader: bool,
 }
 
+/// Borrowed metadata fields for the extract read group, consumed by
+/// [`build_extract_header`].
+///
+/// Mirrors the field-by-field shape of the corresponding optional flags on
+/// `Extract` so the standalone command and the runall extract chain runner
+/// produce byte-identical headers.
+pub(crate) struct ExtractHeaderMetadata<'a> {
+    pub(crate) barcode: Option<&'a str>,
+    pub(crate) platform: &'a str,
+    pub(crate) platform_unit: Option<&'a str>,
+    pub(crate) platform_model: Option<&'a str>,
+    pub(crate) sequencing_center: Option<&'a str>,
+    pub(crate) predicted_insert_size: Option<u32>,
+    pub(crate) description: Option<&'a str>,
+    pub(crate) run_date: Option<&'a str>,
+}
+
+/// Build the unmapped BAM header for the extract stage.
+///
+/// Produces the same header bytes that the standalone `fgumi extract`
+/// command emits via [`Extract::create_header`]: query-grouped, unsorted,
+/// with the configured read group, optional comments, and a `@PG` record
+/// for the supplied command line. Used by both the standalone command and
+/// the runall extract chain runner.
+pub(crate) fn build_extract_header(
+    read_group_id: &str,
+    sample: &str,
+    library: &str,
+    comments: &[String],
+    metadata: &ExtractHeaderMetadata<'_>,
+    command_line: &str,
+) -> Result<Header> {
+    let mut header = Header::builder();
+
+    // Sort and group order
+    let HeaderTag::Other(so_tag) = HeaderTag::from([b'S', b'O']) else { unreachable!() };
+    let HeaderTag::Other(go_tag) = HeaderTag::from([b'G', b'O']) else { unreachable!() };
+    let map = HeaderRecordMap::<HeaderRecord>::builder()
+        .insert(so_tag, sort_order::UNSORTED)
+        .insert(go_tag, group_order::QUERY)
+        .build()?;
+    header = header.set_header(map);
+
+    // Add comments
+    for comment in comments {
+        header = header.add_comment(comment.clone());
+    }
+
+    // Create read group, mirroring `Extract::add_to_read_group` field-for-field.
+    let mut rg = Map::<ReadGroup>::builder();
+    let insert_str =
+        |rg: Builder<ReadGroup>,
+         tag: noodles::sam::header::record::value::map::tag::Other<rg_tag::Standard>,
+         value: Option<&str>|
+         -> Builder<ReadGroup> {
+            if let Some(v) = value { rg.insert(tag, v.to_owned()) } else { rg }
+        };
+    rg = insert_str(rg, rg_tag::SAMPLE, Some(sample));
+    rg = insert_str(rg, rg_tag::LIBRARY, Some(library));
+    rg = insert_str(rg, rg_tag::BARCODE, metadata.barcode);
+    rg = insert_str(rg, rg_tag::PLATFORM, Some(metadata.platform));
+    rg = insert_str(rg, rg_tag::PLATFORM_UNIT, metadata.platform_unit);
+    rg = insert_str(rg, rg_tag::PLATFORM_MODEL, metadata.platform_model);
+    rg = insert_str(rg, rg_tag::SEQUENCING_CENTER, metadata.sequencing_center);
+    let pis_owned = metadata.predicted_insert_size.map(|i| i.to_string());
+    rg = insert_str(rg, rg_tag::PREDICTED_MEDIAN_INSERT_SIZE, pis_owned.as_deref());
+    rg = insert_str(rg, rg_tag::DESCRIPTION, metadata.description);
+    rg = insert_str(rg, rg_tag::PRODUCED_AT, metadata.run_date);
+
+    header = header.add_read_group(read_group_id.to_owned(), rg.build()?);
+
+    // Add @PG record
+    header = crate::commands::common::add_pg_to_builder(header, command_line)?;
+
+    Ok(header.build())
+}
+
 impl Extract {
     /// Get actual read structures (default to +T if none provided for 1-2 FASTQs)
     fn get_read_structures(&self) -> Result<Vec<ReadStructure>> {
@@ -580,68 +663,26 @@ impl Extract {
         Ok(())
     }
 
-    /// Helper to conditionally add a tag/value pair to a read group
-    ///
-    /// If the value is Some, inserts the tag with the value into the read group builder.
-    /// If the value is None, returns the builder unchanged.
-    ///
-    /// # Arguments
-    /// * `rg` - The read group builder
-    /// * `tag` - The tag to insert
-    /// * `value` - Optional value to insert
-    ///
-    /// # Returns
-    /// The read group builder, potentially with the tag added
-    fn add_to_read_group(
-        rg: Builder<ReadGroup>,
-        tag: noodles::sam::header::record::value::map::tag::Other<rg_tag::Standard>,
-        value: Option<&String>,
-    ) -> Builder<ReadGroup> {
-        if let Some(v) = value { rg.insert(tag, v.clone()) } else { rg }
-    }
-
     /// Create SAM header
     fn create_header(&self, command_line: &str) -> Result<Header> {
-        let mut header = Header::builder();
-
-        // Sort and group order
-        let HeaderTag::Other(so_tag) = HeaderTag::from([b'S', b'O']) else { unreachable!() };
-        let HeaderTag::Other(go_tag) = HeaderTag::from([b'G', b'O']) else { unreachable!() };
-        let map = HeaderRecordMap::<HeaderRecord>::builder()
-            .insert(so_tag, sort_order::UNSORTED)
-            .insert(go_tag, group_order::QUERY)
-            .build()?;
-        header = header.set_header(map);
-
-        // Add comments
-        for comment in &self.comment {
-            header = header.add_comment(comment.clone());
-        }
-
-        // Create read group
-        let mut rg = Map::<ReadGroup>::builder();
-        rg = Self::add_to_read_group(rg, rg_tag::SAMPLE, Some(&self.sample.clone()));
-        rg = Self::add_to_read_group(rg, rg_tag::LIBRARY, Some(&self.library.clone()));
-        rg = Self::add_to_read_group(rg, rg_tag::BARCODE, self.barcode.as_ref());
-        rg = Self::add_to_read_group(rg, rg_tag::PLATFORM, Some(&self.platform));
-        rg = Self::add_to_read_group(rg, rg_tag::PLATFORM_UNIT, self.platform_unit.as_ref());
-        rg = Self::add_to_read_group(rg, rg_tag::PLATFORM_MODEL, self.platform_model.as_ref());
-        rg =
-            Self::add_to_read_group(rg, rg_tag::SEQUENCING_CENTER, self.sequencing_center.as_ref());
-        rg = Self::add_to_read_group(
-            rg,
-            rg_tag::PREDICTED_MEDIAN_INSERT_SIZE,
-            self.predicted_insert_size.map(|i| i.to_string()).as_ref(),
-        );
-        rg = Self::add_to_read_group(rg, rg_tag::DESCRIPTION, self.description.as_ref());
-        rg = Self::add_to_read_group(rg, rg_tag::PRODUCED_AT, self.run_date.as_ref());
-
-        header = header.add_read_group(self.read_group_id.clone(), rg.build()?);
-
-        // Add @PG record
-        header = crate::commands::common::add_pg_to_builder(header, command_line)?;
-
-        Ok(header.build())
+        let metadata = ExtractHeaderMetadata {
+            barcode: self.barcode.as_deref(),
+            platform: &self.platform,
+            platform_unit: self.platform_unit.as_deref(),
+            platform_model: self.platform_model.as_deref(),
+            sequencing_center: self.sequencing_center.as_deref(),
+            predicted_insert_size: self.predicted_insert_size,
+            description: self.description.as_deref(),
+            run_date: self.run_date.as_deref(),
+        };
+        build_extract_header(
+            &self.read_group_id,
+            &self.sample,
+            &self.library,
+            &self.comment,
+            &metadata,
+            command_line,
+        )
     }
 
     /// Joins byte slices with a separator, pre-allocating capacity.
@@ -1018,8 +1059,8 @@ impl Extract {
             decompressed_readers,
             header,
             output,
-            // process_fn: FastqTemplate → ExtractedBatch
-            move |template: FastqTemplate| -> std::io::Result<ExtractedBatch> {
+            // process_fn: FastqTemplate → RawExtractedRecords
+            move |template: FastqTemplate| -> std::io::Result<RawExtractedRecords> {
                 // Debug: Log template record count
                 if template.records.len() != read_structures.len() {
                     log::warn!(
@@ -1081,8 +1122,8 @@ impl Extract {
 
                 Ok(result)
             },
-            // serialize_fn: ExtractedBatch → copy pre-serialized bytes to buffer
-            |batch: ExtractedBatch, _header: &Header, buffer: &mut Vec<u8>| {
+            // serialize_fn: RawExtractedRecords → copy pre-serialized bytes to buffer
+            |batch: RawExtractedRecords, _header: &Header, buffer: &mut Vec<u8>| {
                 buffer.extend_from_slice(&batch.data);
                 Ok(batch.num_records)
             },
@@ -1095,25 +1136,29 @@ impl Extract {
 
 /// Cloneable config for the extract pipeline closure, capturing all user options
 /// needed by `make_raw_records_static` so they aren't hardcoded.
+///
+/// Exposed at `pub(crate)` for the runall extract chain runner so the
+/// chain runner can build its own pipeline closure without re-deriving
+/// the `Extract` struct's encoding logic.
 #[derive(Clone)]
 #[allow(clippy::struct_excessive_bools)]
-struct ExtractConfig {
-    read_group_id: String,
-    store_umi_quals: bool,
-    store_cell_quals: bool,
-    single_tag: Option<SamTag>,
-    annotate_read_names: bool,
-    extract_umis_from_read_names: bool,
-    store_sample_barcode_qualities: bool,
+pub(crate) struct ExtractConfig {
+    pub(crate) read_group_id: String,
+    pub(crate) store_umi_quals: bool,
+    pub(crate) store_cell_quals: bool,
+    pub(crate) single_tag: Option<SamTag>,
+    pub(crate) annotate_read_names: bool,
+    pub(crate) extract_umis_from_read_names: bool,
+    pub(crate) store_sample_barcode_qualities: bool,
 }
 
 /// Build raw BAM records from a `FastqSet` without requiring `&self`.
 /// Uses the provided `ExtractConfig` for all user-configurable options.
-fn make_raw_records_static(
+pub(crate) fn make_raw_records_static(
     read_set: &FastqSet,
     encoding: QualityEncoding,
     cfg: &ExtractConfig,
-) -> Result<ExtractedBatch> {
+) -> Result<RawExtractedRecords> {
     let templates: Vec<&FastqSegment> = read_set.template_segments().collect();
 
     let read_name = String::from_utf8_lossy(&read_set.header);
@@ -1241,7 +1286,7 @@ fn make_raw_records_static(
         builder.clear();
     }
 
-    Ok(ExtractedBatch { data, num_records: num_templates as u64 })
+    Ok(RawExtractedRecords { data, num_records: num_templates as u64 })
 }
 
 impl Command for Extract {
@@ -1332,7 +1377,7 @@ impl Command for Extract {
 ///
 /// This is used to validate that reads at the same position in synchronized FASTQs
 /// have matching names. Returns a slice of the name without the suffix.
-fn strip_read_suffix_extract(name: &[u8]) -> &[u8] {
+pub(crate) fn strip_read_suffix_extract(name: &[u8]) -> &[u8] {
     // First strip any space-separated comment suffix (e.g., "read/1 extra" -> "read/1")
     let name = if let Some(space_pos) = name.iter().position(|&b| b == b' ') {
         &name[..space_pos]

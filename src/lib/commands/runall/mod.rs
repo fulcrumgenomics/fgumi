@@ -217,12 +217,17 @@ pub struct Runall {
 }
 
 impl Runall {
-    /// Build the chain registry. PR 1 only registers
-    /// [`chains::NotImplementedRunner`]; PRs 2/3 push real runners
-    /// onto the front via the same builder pattern. Tests can build
-    /// custom registries via [`Runall::build_chain_registry_with`].
+    /// Build the chain registry.
+    ///
+    /// PR 2 registers [`chains::ExtractChainRunner`] for the
+    /// `(Extract, Extract)` shape; PR 3 will add the correct and
+    /// extract→correct runners ahead of it. Real runners are pushed
+    /// onto the front so their `supports()` checks fire before the
+    /// catch-all [`chains::NotImplementedRunner`] fallback.
     fn build_chain_registry(&self) -> ChainRegistry {
-        ChainRegistry::new().register(Box::new(chains::NotImplementedRunner))
+        ChainRegistry::new()
+            .register(Box::new(chains::ExtractChainRunner::from_runall(self)))
+            .register(Box::new(chains::NotImplementedRunner))
     }
 
     /// Build a [`DispatchContext`] borrow that captures the CLI

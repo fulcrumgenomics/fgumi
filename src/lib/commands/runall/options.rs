@@ -332,6 +332,7 @@ impl Default for ConsensusOptions {
 /// Options for FASTQ extraction from input reads.
 #[multi_options("extract", "Extract Options")]
 #[derive(Args, Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ExtractOptions {
     /// Sample name (required for --start-from extract).
     #[arg(long)]
@@ -391,6 +392,23 @@ pub struct ExtractOptions {
           default_missing_value = "true", action = clap::ArgAction::Set,
           value_parser = parse_bool)]
     pub store_sample_barcode_qualities: bool,
+    /// Store UMI quality scores in the QX tag. Conflicts with
+    /// `--extract::extract-umis-from-read-names`.
+    #[arg(long, short = 'q', default_value = "false", num_args = 0..=1,
+          default_missing_value = "true", action = clap::ArgAction::Set,
+          value_parser = parse_bool)]
+    pub store_umi_quals: bool,
+    /// Store cell barcode quality scores in the CY tag.
+    #[arg(long, short = 'C', default_value = "false", num_args = 0..=1,
+          default_missing_value = "true", action = clap::ArgAction::Set,
+          value_parser = parse_bool)]
+    pub store_cell_quals: bool,
+    /// Clipping attribute name (e.g. `XS`). For FASTQ inputs this flag is a
+    /// no-op (there's no existing alignment clipping to adjust); kept for
+    /// CLI parity with standalone `fgumi extract` so callers can pass the
+    /// same args to runall and the standalone command.
+    #[arg(long)]
+    pub clipping_attribute: Option<String>,
 }
 
 impl Default for ExtractOptions {
@@ -412,6 +430,9 @@ impl Default for ExtractOptions {
             single_tag: None,
             annotate_read_names: false,
             store_sample_barcode_qualities: false,
+            store_umi_quals: false,
+            store_cell_quals: false,
+            clipping_attribute: None,
         }
     }
 }
