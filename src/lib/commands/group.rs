@@ -121,13 +121,12 @@ fn filter_template_raw(
     let primary_reads = u64::from(template.r1().is_some()) + u64::from(template.r2().is_some());
     metrics.total_templates += primary_reads;
 
-    // Fail closed when a primary mate exists but is shorter than the minimum
-    // BAM record length: a truncated record indicates corrupt input, so the
-    // whole template must be rejected (not silently treated as a single-read
-    // template).
-    let r1_truncated = template.r1().is_some_and(|r| r.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN);
-    let r2_truncated = template.r2().is_some_and(|r| r.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN);
-    if r1_truncated || r2_truncated {
+    // Fail closed when *any* record (primary, secondary, or supplementary) is
+    // shorter than the minimum BAM record length: a truncated record indicates
+    // corrupt input, so the whole template must be rejected (not silently
+    // treated as a single-read template, and never reaching RawRecordView::new
+    // on a malformed slice).
+    if template.records().iter().any(|r| r.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN) {
         metrics.discarded_poor_alignment += primary_reads;
         return false;
     }
@@ -5389,6 +5388,53 @@ mod tests {
         let mut metrics = FilterMetrics::new();
         assert!(!filter_template_raw(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_poor_alignment, 1);
+    }
+
+    /// A truncated secondary or supplementary alignment must reject the whole
+    /// template too — the previous r1()/r2()-only guard let truncated
+    /// non-primary records slip through.
+    #[test]
+    fn test_group_filter_template_raw_truncated_secondary_rejected() {
+        let valid_r1 = make_raw_bam_for_group(
+            b"rea",
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
+            30,
+            b"ACGT",
+        );
+        let valid_r2 = make_raw_bam_for_group(
+            b"rea",
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT,
+            30,
+            b"ACGT",
+        );
+        let truncated_secondary = fgumi_raw_bam::RawRecord::from(vec![0u8; 16]);
+
+        let template = Template {
+            name: b"rea".to_vec(),
+            records: vec![valid_r1, valid_r2, truncated_secondary],
+            r1: Some((0, 1)),
+            r2: Some((1, 2)),
+            r1_supplementals: None,
+            r2_supplementals: None,
+            r1_secondaries: Some((2, 3)),
+            r2_secondaries: None,
+            mi: crate::umi::MoleculeId::None,
+        };
+
+        let config = GroupFilterConfig {
+            umi_tag: [b'R', b'X'],
+            min_mapq: 0,
+            include_non_pf: false,
+            min_umi_length: None,
+            no_umi: false,
+            allow_unmapped: false,
+        };
+        let mut metrics = FilterMetrics::new();
+        assert!(
+            !filter_template_raw(&template, &config, &mut metrics),
+            "truncated secondary must cause the template to be rejected"
+        );
+        assert_eq!(metrics.discarded_poor_alignment, 2);
     }
 
     #[test]

@@ -154,15 +154,39 @@ of records) and a safe rewrite measurably regresses sort throughput.
   exactly once per pass before being read, and (b) the pointers always referring
   to disjoint, properly-aligned `Vec<RecordRef>`/`Vec<TemplateRecordRef>` storage.
 - **`crates/fgumi-sort/src/keys.rs`** — `RawQuerynameKey::cmp` calls
-  `natural_compare_nul` over raw `*const u8` pointers. SAFETY: the names that
-  back these pointers are always null-terminated by construction (see
-  `extract_queryname_key` and `RawQuerynameKey::new`).
+  `natural_compare_nul` (defined in `fgumi-raw-bam`) over raw `*const u8`
+  pointers. SAFETY: the names that back these pointers are always
+  null-terminated by construction (see `extract_queryname_key` and
+  `RawQuerynameKey::new`).
 - **`crates/fgumi-sort/src/radix.rs`** — internal radix-sort helpers; see file
   comments for the `SAFETY:` invariants.
 
-Any new sort-engine `unsafe` site must extend this list and explain why the safe
-alternative is unacceptable. Do not introduce `unsafe` outside `fgumi-sort` or
-`memory_probe`.
+### Approved natural-order comparator (fgumi-raw-bam)
+
+`natural_compare` and `natural_compare_nul` (the samtools-compatible queryname
+comparator) live in `crates/fgumi-raw-bam/src/sort.rs` because they operate on
+raw BAM read-name bytes; both are called from `fgumi-sort` via
+`RawQuerynameKey::cmp`. They use `unsafe` for the same reason as the sort hot
+path: the comparator runs once per sort-key comparison, and the safe form
+(re-bounds-checking every byte / re-validating the null terminator) measurably
+regresses `samtools sort -n`–style throughput.
+
+- **`crates/fgumi-raw-bam/src/sort.rs`** — four `#[allow(unsafe_code)]` sites:
+  - `natural_compare` (line ~80) — `get_unchecked` over `&[u8]` in the digit-run
+    hot loop. SAFETY: indices are bounded by the loop invariants `pa < alen` /
+    `pb < blen`, asserted in `debug_assert!` for the `at` helper.
+  - `natural_compare_nul` (line ~180) — raw `*const u8` walk that mirrors
+    samtools' `strnum_cmp`. SAFETY: caller guarantees both pointers are
+    null-terminated; `RawQuerynameKey::new` enforces this for every production
+    call site.
+  - `compare_nul` test helper and the `proptest` agreement test (lines ~273 and
+    ~300) — push an explicit NUL into a `Vec<u8>` then take `as_ptr()`.
+    SAFETY: the buffers are `to_vec()` + push, so the pointer is valid and
+    null-terminated for the call's lifetime.
+
+Any new `unsafe` site must extend this list and explain why the safe
+alternative is unacceptable. Do not introduce `unsafe` outside the crates
+listed in this section.
 
 ## Benchmarking Notes
 

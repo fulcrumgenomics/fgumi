@@ -67,7 +67,7 @@
 //! ### Progress Tracking
 //!
 //! ```no_run
-//! use fgumi_lib::progress::ProgressTracker;
+//! use fgumi_bam_io::progress::ProgressTracker;
 //!
 //! # fn main() -> anyhow::Result<()> {
 //! let tracker = ProgressTracker::new("Processing records")

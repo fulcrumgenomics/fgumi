@@ -673,6 +673,18 @@ impl CorrectUmis {
             let aux = fgumi_raw_bam::aux_data_slice(raw);
             let current_umi_bytes = fgumi_raw_bam::find_string_tag(aux, umi_tag);
 
+            // Mirror the first-record check: reject any record whose UMI tag
+            // exists with a non-string type instead of treating it as missing.
+            if current_umi_bytes.is_none() {
+                if let Some(tag_type) = fgumi_raw_bam::find_tag_type(aux, umi_tag) {
+                    anyhow::bail!(
+                        "UMI tag {:?} exists but has non-string type '{}', expected 'Z'",
+                        std::str::from_utf8(&umi_tag).unwrap_or("??"),
+                        tag_type as char,
+                    );
+                }
+            }
+
             match (first_umi_bytes, current_umi_bytes) {
                 (Some(first), Some(current)) if first != current => {
                     anyhow::bail!(
@@ -3263,6 +3275,88 @@ mod tests {
         let result =
             CorrectUmis::extract_and_validate_template_umi_raw(&[raw], *SamTag::RX).unwrap();
         assert!(result.is_none());
+    }
+
+    /// Build a record whose RX tag has integer type ('i') instead of the expected
+    /// string type ('Z'). Used to verify that non-`Z` aux types are rejected.
+    fn make_raw_bam_for_correct_with_int_rx(name: &[u8], flag: u16, value: i32) -> RawRecord {
+        let l_read_name = (name.len() + 1) as u8;
+        let seq_len = 4usize;
+        let cigar_ops: &[u32] = if (flag & fgumi_raw_bam::flags::UNMAPPED) == 0 {
+            &[(seq_len as u32) << 4]
+        } else {
+            &[]
+        };
+        let n_cigar_op = cigar_ops.len() as u16;
+        let seq_bytes = seq_len.div_ceil(2);
+        let total = 32 + l_read_name as usize + cigar_ops.len() * 4 + seq_bytes + seq_len;
+        let mut buf = vec![0u8; total];
+
+        buf[4..8].copy_from_slice(&100i32.to_le_bytes());
+        buf[8] = l_read_name;
+        buf[9] = 30; // mapq
+        buf[12..14].copy_from_slice(&n_cigar_op.to_le_bytes());
+        buf[14..16].copy_from_slice(&flag.to_le_bytes());
+        buf[16..20].copy_from_slice(&(seq_len as u32).to_le_bytes());
+        buf[20..24].copy_from_slice(&(-1i32).to_le_bytes());
+        buf[24..28].copy_from_slice(&(-1i32).to_le_bytes());
+
+        let name_start = 32;
+        buf[name_start..name_start + name.len()].copy_from_slice(name);
+        buf[name_start + name.len()] = 0;
+
+        let cigar_start = name_start + l_read_name as usize;
+        for (i, &op) in cigar_ops.iter().enumerate() {
+            let off = cigar_start + i * 4;
+            buf[off..off + 4].copy_from_slice(&op.to_le_bytes());
+        }
+
+        // Append RX as an integer aux tag: RX:i:<value>
+        buf.extend_from_slice(b"RXi");
+        buf.extend_from_slice(&value.to_le_bytes());
+
+        let block_size = i32::try_from(buf.len() - 4).expect("BAM record fits in i32");
+        buf[0..4].copy_from_slice(&block_size.to_le_bytes());
+
+        RawRecord::from(buf)
+    }
+
+    #[test]
+    fn test_extract_and_validate_template_umi_raw_rejects_non_string_rx_on_first_record() {
+        // The first-record check has always rejected non-Z types; keep it covered.
+        let raw = make_raw_bam_for_correct_with_int_rx(
+            b"rea",
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
+            42,
+        );
+        let err =
+            CorrectUmis::extract_and_validate_template_umi_raw(&[raw], *SamTag::RX).unwrap_err();
+        assert!(
+            err.to_string().contains("non-string type"),
+            "expected non-string-type error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_extract_and_validate_template_umi_raw_rejects_non_string_rx_on_second_record() {
+        // Regression: a non-Z RX on a *later* record was previously treated as
+        // missing and could fall through silently.
+        let r1 = make_raw_bam_for_correct(
+            b"rea",
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
+            b"AAAAAA",
+        );
+        let r2 = make_raw_bam_for_correct_with_int_rx(
+            b"rea",
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT,
+            42,
+        );
+        let err =
+            CorrectUmis::extract_and_validate_template_umi_raw(&[r1, r2], *SamTag::RX).unwrap_err();
+        assert!(
+            err.to_string().contains("non-string type"),
+            "expected non-string-type error on second record, got: {err}"
+        );
     }
 
     // ========================================================================
