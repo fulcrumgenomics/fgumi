@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-tag", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/fgumi-bam-io", "crates/fgumi-sort", "crates/xtask"]
+members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-tag", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/fgumi-bam-io", "crates/fgumi-sort", "crates/fgumi-derive", "crates/xtask"]
 resolver = "2"
 
 [workspace.package]
@@ -13,6 +13,7 @@ license = "MIT"
 fgumi-bam-io = { version = "0.2.0", path = "crates/fgumi-bam-io" }
 fgumi-bgzf = { version = "0.2.0", path = "crates/fgumi-bgzf" }
 fgumi-consensus = { version = "0.2.0", path = "crates/fgumi-consensus", default-features = false }
+fgumi-derive = { version = "0.2.0", path = "crates/fgumi-derive" }
 fgumi-dna = { version = "0.2.0", path = "crates/fgumi-dna" }
 fgumi-metrics = { version = "0.2.0", path = "crates/fgumi-metrics" }
 fgumi-raw-bam = { version = "0.2.0", path = "crates/fgumi-raw-bam" }
@@ -81,6 +82,7 @@ rand_distr = "0.6"
 flate2 = "1.1"
 dhat = { version = "0.3", optional = true }
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
+fgumi-derive = { workspace = true }
 fgumi-dna = { workspace = true }
 fgumi-bgzf = { workspace = true }
 fgumi-metrics = { workspace = true }
@@ -90,6 +92,7 @@ fgumi-umi = { workspace = true }
 fgumi-consensus = { workspace = true }
 fgumi-bam-io = { workspace = true }
 fgumi-sort = { workspace = true }
+ctrlc = { version = "3.4", features = ["termination"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.6"
