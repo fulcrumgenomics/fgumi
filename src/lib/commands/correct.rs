@@ -5,6 +5,12 @@
 //! observed UMIs to match the expected set based on mismatch tolerance and minimum
 //! distance requirements.
 //!
+//! When `--rejects` is set, the threaded pipeline routes rejected records through
+//! the unified pipeline's first-class secondary output (see
+//! [`crate::unified_pipeline::run_bam_pipeline_from_reader_with_secondary`]).
+//! Rejects land in batch-input order rather than mutex-acquisition order, and the
+//! rejects BAM inherits the input header. The pattern matches `commands::filter`.
+//!
 //! # Example
 //!
 //! ```no_run

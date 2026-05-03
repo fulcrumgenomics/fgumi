@@ -4,6 +4,14 @@
 //! duplex consensus reads by performing two-stage consensus calling:
 //! 1. Single-strand consensus for /A and /B reads separately
 //! 2. Duplex consensus from paired single-strand consensuses
+//!
+//! When `--rejects` is set, the threaded pipeline routes rejected records through
+//! the unified pipeline's first-class secondary output (see
+//! [`crate::unified_pipeline::run_bam_pipeline_from_reader_with_secondary`]).
+//! Caller-emitted rejects flow through a per-batch buffer and land in batch-input
+//! order. The rejects BAM advertises the input header so raw-input RG/PG/contig
+//! metadata is preserved. The pattern matches `commands::filter`,
+//! `commands::correct`, and `commands::simplex`.
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;

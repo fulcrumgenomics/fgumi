@@ -3,6 +3,14 @@
 //! This tool takes reads that have been grouped by UMI (via `group`) and generates
 //! consensus reads using a likelihood-based model that accounts for sequencing errors and
 //! errors introduced during sample preparation.
+//!
+//! When `--rejects` is set, the threaded pipeline routes rejected records through
+//! the unified pipeline's first-class secondary output (see
+//! [`crate::unified_pipeline::run_bam_pipeline_from_reader_with_secondary`]).
+//! Both reject sources (input-record skips below `--min-reads` and caller-emitted
+//! rejects) flow through the same per-batch buffer and land in batch-input order.
+//! The rejects BAM advertises the input header so raw-input RG/PG/contig metadata
+//! is preserved. The pattern matches `commands::filter` and `commands::correct`.
 
 use crate::consensus_caller::{
     ConsensusCaller, ConsensusCallingStats, ConsensusOutput, RejectionReason,

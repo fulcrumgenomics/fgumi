@@ -5,6 +5,15 @@
 //! CODEC (Bae et al 2023) is a sequencing protocol where each read-pair sequences both strands
 //! of the original duplex molecule. R1 comes from one strand, R2 from the opposite strand,
 //! allowing even a single read-pair to generate duplex consensus.
+//!
+//! When `--rejects` is set, the threaded pipeline routes rejected records through
+//! the unified pipeline's first-class secondary output (see
+//! [`crate::unified_pipeline::run_bam_pipeline_from_reader_with_secondary`]).
+//! Both reject paths (success and duplex-disagreement recovery) flow through a
+//! per-batch buffer and land in batch-input order. The rejects BAM advertises
+//! the input header so raw-input RG/PG/contig metadata is preserved. The pattern
+//! matches `commands::filter`, `commands::correct`, `commands::simplex`, and
+//! `commands::duplex`.
 
 use crate::commands::command::Command;
 use crate::commands::consensus_runner::{ConsensusStatsOps, create_unmapped_consensus_header};
