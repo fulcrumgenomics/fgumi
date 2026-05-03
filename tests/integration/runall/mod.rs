@@ -6,6 +6,8 @@
 //! integration tests guard against CLI-parsing regressions and
 //! verify the binary's user-visible behaviour.
 
+mod test_correct_chain_parity;
 mod test_extract_chain_parity;
+mod test_extract_correct_chain_parity;
 mod test_runall_dispatch_errors;
 mod test_runall_explain;

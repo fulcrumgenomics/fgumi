@@ -68,7 +68,7 @@ use noodles::sam::alignment::record::data::field::Tag;
 use parking_lot::Mutex;
 use std::io;
 use std::num::NonZero;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -261,8 +261,13 @@ pub struct CorrectUmis {
     pub queue_memory: QueueMemoryOptions,
 }
 
+/// Reason a UMI correction was rejected.
+///
+/// Exposed at `pub(crate)` so the runall correct chain runners can share the
+/// same template-level correction primitives that the standalone
+/// [`CorrectUmis`] command uses.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum RejectionReason {
+pub(crate) enum RejectionReason {
     WrongLength,
     Mismatched,
     #[default]
@@ -273,22 +278,26 @@ enum RejectionReason {
 ///
 /// This struct holds the result of correcting a UMI once for an entire template,
 /// which can then be applied to all records in that template.
+///
+/// Exposed at `pub(crate)` so the runall correct chain runners can call
+/// [`CorrectUmis::compute_template_correction`] /
+/// [`CorrectUmis::apply_correction_to_raw`] directly.
 #[derive(Debug)]
-struct TemplateCorrection {
+pub(crate) struct TemplateCorrection {
     /// Whether the UMI matched successfully.
-    matched: bool,
+    pub(crate) matched: bool,
     /// The corrected UMI string (if matched).
-    corrected_umi: Option<String>,
+    pub(crate) corrected_umi: Option<String>,
     /// The original UMI string.
-    original_umi: String,
+    pub(crate) original_umi: String,
     /// Whether correction was needed (mismatches > 0 or revcomp).
-    needs_correction: bool,
+    pub(crate) needs_correction: bool,
     /// Whether there were actual mismatches (not just revcomp).
-    has_mismatches: bool,
+    pub(crate) has_mismatches: bool,
     /// Match details for metrics.
-    matches: Vec<UmiMatch>,
+    pub(crate) matches: Vec<UmiMatch>,
     /// Rejection reason if not matched.
-    rejection_reason: RejectionReason,
+    pub(crate) rejection_reason: RejectionReason,
 }
 
 // ============================================================================
@@ -536,7 +545,7 @@ impl CorrectUmis {
 
     /// Compute UMI correction for a template (called once per template).
     #[allow(clippy::too_many_arguments)]
-    fn compute_template_correction(
+    pub(crate) fn compute_template_correction(
         umi: &str,
         umi_length: usize,
         revcomp: bool,
@@ -639,7 +648,7 @@ impl CorrectUmis {
     /// - Records have different UMIs
     /// - Some records have UMIs and others don't
     /// - UMI tag has non-string type
-    fn extract_and_validate_template_umi_raw(
+    pub(crate) fn extract_and_validate_template_umi_raw(
         raw_records: &[RawRecord],
         umi_tag: [u8; 2],
     ) -> anyhow::Result<Option<String>> {
@@ -693,7 +702,7 @@ impl CorrectUmis {
     }
 
     /// Apply UMI correction to a raw BAM record.
-    fn apply_correction_to_raw(
+    pub(crate) fn apply_correction_to_raw(
         record: &mut RawRecord,
         correction: &TemplateCorrection,
         umi_tag: [u8; 2],
@@ -728,44 +737,14 @@ impl CorrectUmis {
         umi_metrics: &mut AHashMap<String, UmiCorrectionMetrics>,
         unmatched_umi: &str,
     ) -> Result<()> {
-        // Calculate totals
-        let total: u64 = umi_metrics.values().map(|m| m.total_matches).sum();
-        let matched_total: u64 = umi_metrics
-            .iter()
-            .filter(|(umi, _)| *umi != unmatched_umi)
-            .map(|(_, m)| m.total_matches)
-            .sum();
-
-        // Calculate fractions (allow NaN when total is 0, matching fgbio behavior)
-        #[allow(clippy::cast_precision_loss)]
-        for metric in umi_metrics.values_mut() {
-            metric.fraction_of_matches = metric.total_matches as f64 / total as f64;
-        }
-
-        // Calculate representations (allow NaN/Infinity, matching fgbio behavior)
-        let umi_count = umi_metrics.keys().filter(|umi| *umi != unmatched_umi).count();
-
-        #[allow(clippy::cast_precision_loss)]
-        let mean = matched_total as f64 / umi_count as f64;
-        for metric in umi_metrics.values_mut() {
-            metric.representation = metric.total_matches as f64 / mean;
-        }
-
-        // Write metrics if requested
-        if let Some(path) = &self.metrics {
-            let mut metrics: Vec<UmiCorrectionMetrics> = umi_metrics.values().cloned().collect();
-            metrics.sort_by(|a, b| a.umi.cmp(&b.umi));
-            UmiCorrectionMetrics::write_metrics(&metrics, path)?;
-        }
-
-        Ok(())
+        finalize_correct_metrics(self.metrics.as_deref(), umi_metrics, unmatched_umi)
     }
 
     /// Execute using the 7-step unified pipeline.
     ///
-    /// This method uses the template-based grouper to process records in batches,
-    /// with parallel decompression, processing, and compression.
-    #[allow(clippy::too_many_lines)]
+    /// Thin wrapper around the free [`run_correct_pipeline`] function so the
+    /// runall correct chain runner can drive the same pipeline body without
+    /// holding a [`CorrectUmis`] instance.
     fn execute_threads_mode(
         &self,
         num_threads: usize,
@@ -775,358 +754,27 @@ impl CorrectUmis {
         umi_length: usize,
         track_rejects: bool,
     ) -> Result<u64> {
-        // Configure pipeline - correct is ReaderHeavy (70% in decompression)
-        let mut pipeline_config = build_pipeline_config(
-            &self.scheduler_opts,
-            &self.compression,
-            &self.queue_memory,
+        run_correct_pipeline(CorrectPipelineParams {
             num_threads,
-        )?;
-
-        // Enable raw-byte mode (correct uses TemplateGrouper, no cell tag needed)
-        {
-            use crate::read_info::LibraryIndex;
-            use crate::unified_pipeline::GroupKeyConfig;
-
-            let library_index = LibraryIndex::from_header(&header);
-            pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw_no_cell(library_index));
-        }
-
-        // Per-thread metrics accumulator: bounded memory, no unbounded queue.
-        let collected_metrics = PerThreadAccumulator::<CollectedCorrectMetrics>::new(num_threads);
-        let collected_for_serialize = Arc::clone(&collected_metrics);
-
-        // Open rejects writer up front. Rejected records are streamed straight
-        // to disk from process_fn, per-template, so no batch-level buffering.
-        // Because workers flush under a mutex rather than through the ordered
-        // serialize stage, reject records are emitted in mutex-acquisition
-        // order, not input order; mark the rejects header as SO:unsorted so
-        // downstream tools don't assume the input's sort order carried over.
-        let rejects_writer: Option<Arc<Mutex<Option<RawBamWriter>>>> = if track_rejects {
-            if let Some(path) = self.rejects_opts.rejects.as_ref() {
-                let writer_threads = self.threading.num_threads();
-                let rejects_header = header_as_unsorted(&header);
-                let w = create_raw_bam_writer(
-                    path,
-                    &rejects_header,
-                    writer_threads,
-                    self.compression.compression_level,
-                )?;
-                Some(Arc::new(Mutex::new(Some(w))))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let rejects_writer_for_process = rejects_writer.as_ref().map(Arc::clone);
-
-        // Configuration for closures
-        const BATCH_SIZE: usize = 1000; // Templates per batch
-        let max_mismatches = self.max_mismatches;
-        let min_distance_diff = self.min_distance_diff;
-        let umi_tag = Tag::from(SamTag::RX);
-        let revcomp = self.revcomp;
-        let cache_size = self.cache_size;
-        let dont_store_original_umis = self.dont_store_original_umis;
-
-        // Progress tracking
-        let progress_counter = Arc::new(AtomicU64::new(0));
-        let progress_for_process = Arc::clone(&progress_counter);
-
-        // Unmatched UMI string for rejected reads (matches fgbio behavior)
-        let unmatched_umi = "N".repeat(umi_length);
-        let unmatched_umi_for_process = unmatched_umi.clone();
-
-        // Clone the UMI set for post-aggregation use (before closure moves original)
-        let encoded_umi_set_for_metrics = Arc::clone(&encoded_umi_set);
-
-        // Grouper: batch templates by QNAME
-        let grouper_fn = move |_header: &Header| {
-            Box::new(TemplateGrouper::new(BATCH_SIZE))
-                as Box<dyn Grouper<Group = TemplateBatch> + Send>
-        };
-
-        // Process function: correct UMIs in each template batch
-        let process_fn = move |batch: TemplateBatch| -> io::Result<CorrectProcessedBatch> {
-            // Per-thread LRU cache for UMI matching
-            thread_local! {
-                static CACHE: std::cell::RefCell<Option<LruCache<Vec<u8>, UmiMatch>>> = const { std::cell::RefCell::new(None) };
-            }
-
-            CACHE.with(|cache_cell| {
-                let mut cache_ref = cache_cell.borrow_mut();
-                if cache_ref.is_none() && cache_size > 0 {
-                    *cache_ref = Some(LruCache::new(
-                        NonZero::new(cache_size).expect("cache_size > 0 checked above"),
-                    ));
-                }
-
-                let mut kept_raw_records: Vec<RawRecord> = Vec::new();
-                let mut missing_umis = 0u64;
-                let mut wrong_length = 0u64;
-                let mut mismatched = 0u64;
-                let mut umi_matches_map: AHashMap<String, UmiCorrectionMetrics> = AHashMap::new();
-                let templates_count = batch.len() as u64;
-                // Count ALL input records for progress tracking (not just kept/rejected)
-                let mut total_input_records = 0u64;
-                let umi_tag_bytes: [u8; 2] = [umi_tag.as_ref()[0], umi_tag.as_ref()[1]];
-
-                // Stream rejected records straight to disk so they don't
-                // accumulate in a batch-level Vec. The mutex only serializes
-                // the raw-byte append; BGZF compression runs on the writer's
-                // own thread pool.
-                let flush_raw_records = |recs: Vec<RawRecord>| -> io::Result<()> {
-                    if let Some(ref rw_arc) = rejects_writer_for_process {
-                        if !recs.is_empty() {
-                            let mut guard = rw_arc.lock();
-                            if let Some(w) = guard.as_mut() {
-                                for raw in &recs {
-                                    w.write_raw_record(raw.as_ref())?;
-                                }
-                            }
-                        }
-                    }
-                    Ok(())
-                };
-
-                for template in batch {
-                    // Count input records BEFORE processing
-                    total_input_records += template.read_count() as u64;
-
-                    {
-                        let raw_records: Vec<RawRecord> = template.into_records();
-                        let umi_opt = Self::extract_and_validate_template_umi_raw(
-                            &raw_records,
-                            umi_tag_bytes,
-                        )
-                        .map_err(io::Error::other)?;
-
-                        match umi_opt {
-                            None => {
-                                let num_records = raw_records.len() as u64;
-                                missing_umis += num_records;
-                                let entry = umi_matches_map
-                                    .entry(unmatched_umi_for_process.clone())
-                                    .or_insert_with(|| {
-                                        UmiCorrectionMetrics::new(unmatched_umi_for_process.clone())
-                                    });
-                                entry.total_matches += num_records;
-                                if track_rejects {
-                                    flush_raw_records(raw_records)?;
-                                }
-                            }
-                            Some(umi) => {
-                                let correction = Self::compute_template_correction(
-                                    &umi,
-                                    umi_length,
-                                    revcomp,
-                                    max_mismatches,
-                                    min_distance_diff,
-                                    &encoded_umi_set,
-                                    &mut cache_ref,
-                                );
-                                let num_records = raw_records.len() as u64;
-
-                                if correction.matched {
-                                    for m in &correction.matches {
-                                        if m.matched {
-                                            let entry = umi_matches_map
-                                                .entry(m.umi.clone())
-                                                .or_insert_with(|| {
-                                                    UmiCorrectionMetrics::new(m.umi.clone())
-                                                });
-                                            entry.total_matches += num_records;
-                                            match m.mismatches {
-                                                0 => entry.perfect_matches += num_records,
-                                                1 => entry.one_mismatch_matches += num_records,
-                                                2 => entry.two_mismatch_matches += num_records,
-                                                _ => entry.other_matches += num_records,
-                                            }
-                                        }
-                                    }
-
-                                    for mut raw in raw_records {
-                                        Self::apply_correction_to_raw(
-                                            &mut raw,
-                                            &correction,
-                                            umi_tag_bytes,
-                                            dont_store_original_umis,
-                                        );
-                                        kept_raw_records.push(raw);
-                                    }
-                                } else {
-                                    match correction.rejection_reason {
-                                        RejectionReason::WrongLength => {
-                                            wrong_length += num_records;
-                                        }
-                                        RejectionReason::Mismatched => {
-                                            mismatched += num_records;
-                                        }
-                                        RejectionReason::None => {}
-                                    }
-                                    let entry = umi_matches_map
-                                        .entry(unmatched_umi_for_process.clone())
-                                        .or_insert_with(|| {
-                                            UmiCorrectionMetrics::new(
-                                                unmatched_umi_for_process.clone(),
-                                            )
-                                        });
-                                    entry.total_matches += num_records;
-                                    if track_rejects {
-                                        flush_raw_records(raw_records)?;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Progress logging (count ALL input records, not just output)
-                let count = progress_for_process.fetch_add(total_input_records, Ordering::Relaxed);
-                if (count + total_input_records) / 1_000_000 > count / 1_000_000 {
-                    info!("Processed {} records", count + total_input_records);
-                }
-
-                Ok(CorrectProcessedBatch {
-                    kept_raw_records,
-                    templates_count,
-                    missing_umis,
-                    wrong_length,
-                    mismatched,
-                    umi_matches: umi_matches_map,
-                })
-            })
-        };
-
-        // Serialize function: convert records to bytes and collect metrics
-        let serialize_fn = move |mut processed: CorrectProcessedBatch,
-                                 _header: &Header,
-                                 output: &mut Vec<u8>|
-              -> io::Result<u64> {
-            // Rejects were already streamed to disk in process_fn.
-            // Merge per-batch counts + UMI matches into this worker's
-            // accumulator slot.
-            let umi_matches = std::mem::take(&mut processed.umi_matches);
-            collected_for_serialize.with_slot(|m| {
-                m.templates_processed += processed.templates_count;
-                m.missing_umis += processed.missing_umis;
-                m.wrong_length += processed.wrong_length;
-                m.mismatched += processed.mismatched;
-                for (umi, counts) in umi_matches {
-                    merge_umi_counts(&mut m.umi_matches, umi, &counts);
-                }
-            });
-
-            // Serialize kept records
-            let mut kept_count = 0u64;
-            for raw in &processed.kept_raw_records {
-                let block_size = raw.len() as u32;
-                output.extend_from_slice(&block_size.to_le_bytes());
-                output.extend_from_slice(raw);
-                kept_count += 1;
-            }
-            // Return KEPT record count (not input count, to avoid double-counting)
-            Ok(kept_count)
-        };
-
-        // Run the 7-step pipeline with the already-opened reader (supports streaming)
-        let pipeline_result = run_bam_pipeline_from_reader(
-            pipeline_config,
             reader,
             header,
-            &self.io.output,
-            None, // Use input header for output
-            grouper_fn,
-            process_fn,
-            serialize_fn,
-        );
-
-        // Always finalize the rejects writer, even if the pipeline failed, so any
-        // partially written rejects BAM still gets a valid BGZF EOF block. Surface
-        // finish() failures alongside any pipeline error so neither is silently
-        // dropped.
-        let rejects_finish_result = rejects_writer
-            .and_then(|rw_arc| rw_arc.lock().take())
-            .map(|writer| writer.finish().context("Failed to finish rejects file"));
-
-        let records_written = match (pipeline_result, rejects_finish_result) {
-            (Ok(records_written), Some(Ok(()))) => {
-                info!("Rejected records streamed to rejects file during processing");
-                records_written
-            }
-            (Ok(records_written), None) => records_written,
-            (Ok(_), Some(Err(finish_err))) => return Err(finish_err),
-            (Err(pipeline_err), Some(Err(finish_err))) => {
-                return Err(anyhow::anyhow!(
-                    "Pipeline error: {pipeline_err}; additionally failed to finish rejects file: {finish_err}"
-                ));
-            }
-            (Err(pipeline_err), _) => return Err(pipeline_err.into()),
-        };
-
-        // ========== Post-pipeline: Aggregate metrics ==========
-        let mut total_templates = 0u64;
-        let mut total_missing = 0u64;
-        let mut total_wrong_length = 0u64;
-        let mut total_mismatched = 0u64;
-        let mut merged_umi_matches: AHashMap<String, UmiCorrectionMetrics> = AHashMap::new();
-
-        for slot in collected_metrics.slots() {
-            let mut m = slot.lock();
-            total_templates += m.templates_processed;
-            total_missing += m.missing_umis;
-            total_wrong_length += m.wrong_length;
-            total_mismatched += m.mismatched;
-
-            for (umi, counts) in m.umi_matches.drain() {
-                merge_umi_counts(&mut merged_umi_matches, umi, &counts);
-            }
-        }
-
-        // Ensure ALL UMI rows are present (even with zero counts) - matches fgbio behavior
-        for umi in encoded_umi_set_for_metrics.strings.iter().chain(std::iter::once(&unmatched_umi))
-        {
-            merged_umi_matches
-                .entry(umi.clone())
-                .or_insert_with(|| UmiCorrectionMetrics::new(umi.clone()));
-        }
-
-        // Finalize and write metrics if requested
-        self.finalize_metrics(&mut merged_umi_matches, &unmatched_umi)?;
-
-        // Log summary (records_written = kept records only)
-        let rejected = total_missing + total_wrong_length + total_mismatched;
-        let total_records = records_written + rejected;
-        info!("Read {total_records}; kept {records_written} and rejected {rejected}");
-        info!("Total templates processed: {total_templates}");
-
-        if total_missing > 0 || total_wrong_length > 0 {
-            warn!("###################################################################");
-            if total_missing > 0 {
-                warn!("# {total_missing} were missing UMI attributes in the BAM file!");
-            }
-            if total_wrong_length > 0 {
-                warn!(
-                    "# {total_wrong_length} had unexpected UMIs of differing lengths in the BAM file!"
-                );
-            }
-            warn!("###################################################################");
-        }
-
-        // Check minimum correction ratio
-        if let Some(min) = self.min_corrected {
-            #[allow(clippy::cast_precision_loss)]
-            let ratio_kept = records_written as f64 / total_records as f64;
-            if ratio_kept < min {
-                bail!(
-                    "Final ratio of reads kept / total was {ratio_kept:.2} (user specified minimum was {min:.2}). \
-                    This could indicate a mismatch between library preparation and the provided UMI file."
-                );
-            }
-        }
-
-        Ok(total_records)
+            encoded_umi_set,
+            umi_length,
+            track_rejects,
+            scheduler_opts: &self.scheduler_opts,
+            compression: &self.compression,
+            queue_memory: &self.queue_memory,
+            threading: &self.threading,
+            rejects_path: self.rejects_opts.rejects.as_deref(),
+            output_path: &self.io.output,
+            metrics_path: self.metrics.as_deref(),
+            max_mismatches: self.max_mismatches,
+            min_distance_diff: self.min_distance_diff,
+            revcomp: self.revcomp,
+            cache_size: self.cache_size,
+            dont_store_original_umis: self.dont_store_original_umis,
+            min_corrected: self.min_corrected,
+        })
     }
 
     /// Execute using single-threaded mode with template-level UMI correction.
@@ -1367,6 +1015,451 @@ impl CorrectUmis {
     }
 }
 
+/// Parameter bundle for [`run_correct_pipeline`].
+///
+/// Owned and borrowed inputs are mixed deliberately: the reader and header are
+/// consumed by the pipeline; the option references are read for pipeline-config
+/// / writer construction.
+///
+/// `pub(crate)` so the runall correct chain runner can build it without
+/// going through [`CorrectUmis`].
+pub(crate) struct CorrectPipelineParams<'a> {
+    /// Number of pipeline threads.
+    pub num_threads: usize,
+    /// Already-opened input BAM reader. Consumed by the pipeline.
+    pub reader: Box<dyn std::io::Read + Send>,
+    /// Output BAM header (with `@PG` already stamped). Consumed by the pipeline.
+    pub header: Header,
+    /// Encoded set of allowed UMI sequences.
+    pub encoded_umi_set: Arc<EncodedUmiSet>,
+    /// Length of every UMI segment in `encoded_umi_set`.
+    pub umi_length: usize,
+    /// Whether to write rejected templates to a separate BAM.
+    pub track_rejects: bool,
+    /// Scheduler / pipeline-stats options.
+    pub scheduler_opts: &'a SchedulerOptions,
+    /// Output BAM compression options.
+    pub compression: &'a CompressionOptions,
+    /// Queue-memory options for the unified pipeline.
+    pub queue_memory: &'a QueueMemoryOptions,
+    /// Threading mode (used to size the rejects writer's threads).
+    pub threading: &'a ThreadingOptions,
+    /// Path for the rejects BAM. Required when `track_rejects` is true.
+    pub rejects_path: Option<&'a Path>,
+    /// Path for the output BAM.
+    pub output_path: &'a Path,
+    /// Path for the per-UMI metrics TSV. `None` skips writing metrics.
+    pub metrics_path: Option<&'a Path>,
+    /// Maximum allowed mismatches between observed and matched UMI.
+    pub max_mismatches: usize,
+    /// Minimum mismatch difference between best and second-best matches.
+    pub min_distance_diff: usize,
+    /// Whether to reverse-complement UMI segments before matching.
+    pub revcomp: bool,
+    /// Per-worker LRU cache size for UMI matching. `0` disables caching.
+    pub cache_size: usize,
+    /// Whether to skip stamping the original UMI in the OX tag.
+    pub dont_store_original_umis: bool,
+    /// Optional minimum kept-records / total-records ratio. Failure to meet it
+    /// produces an error after pipeline completion.
+    pub min_corrected: Option<f64>,
+}
+
+/// Run the multi-threaded UMI-correction pipeline on a pre-opened BAM reader.
+///
+/// Shared between the standalone `fgumi correct` command (via
+/// [`CorrectUmis::execute_threads_mode`]) and the runall `correct` chain
+/// runner. Consumes the reader and header inside [`CorrectPipelineParams`].
+///
+/// Returns the total record count read from the input (kept + rejected).
+///
+/// # Errors
+/// Returns an error if the pipeline configuration is invalid, if any pipeline
+/// stage fails, if the metrics file cannot be written, or if the
+/// `min_corrected` ratio is not met.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn run_correct_pipeline(params: CorrectPipelineParams<'_>) -> Result<u64> {
+    let CorrectPipelineParams {
+        num_threads,
+        reader,
+        header,
+        encoded_umi_set,
+        umi_length,
+        track_rejects,
+        scheduler_opts,
+        compression,
+        queue_memory,
+        threading,
+        rejects_path,
+        output_path,
+        metrics_path,
+        max_mismatches,
+        min_distance_diff,
+        revcomp,
+        cache_size,
+        dont_store_original_umis,
+        min_corrected,
+    } = params;
+
+    // Configure pipeline - correct is ReaderHeavy (70% in decompression)
+    let mut pipeline_config =
+        build_pipeline_config(scheduler_opts, compression, queue_memory, num_threads)?;
+
+    // Enable raw-byte mode (correct uses TemplateGrouper, no cell tag needed)
+    {
+        use crate::read_info::LibraryIndex;
+        use crate::unified_pipeline::GroupKeyConfig;
+
+        let library_index = LibraryIndex::from_header(&header);
+        pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw_no_cell(library_index));
+    }
+
+    // Per-thread metrics accumulator: bounded memory, no unbounded queue.
+    let collected_metrics = PerThreadAccumulator::<CollectedCorrectMetrics>::new(num_threads);
+    let collected_for_serialize = Arc::clone(&collected_metrics);
+
+    // Open rejects writer up front (see standalone command for rationale).
+    let rejects_writer: Option<Arc<Mutex<Option<RawBamWriter>>>> = if track_rejects {
+        if let Some(path) = rejects_path {
+            let writer_threads = threading.num_threads();
+            let rejects_header = header_as_unsorted(&header);
+            let w = create_raw_bam_writer(
+                path,
+                &rejects_header,
+                writer_threads,
+                compression.compression_level,
+            )?;
+            Some(Arc::new(Mutex::new(Some(w))))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let rejects_writer_for_process = rejects_writer.as_ref().map(Arc::clone);
+
+    // Configuration for closures
+    const BATCH_SIZE: usize = 1000; // Templates per batch
+    let umi_tag = Tag::from(SamTag::RX);
+
+    // Progress tracking
+    let progress_counter = Arc::new(AtomicU64::new(0));
+    let progress_for_process = Arc::clone(&progress_counter);
+
+    // Unmatched UMI string for rejected reads (matches fgbio behavior)
+    let unmatched_umi = "N".repeat(umi_length);
+    let unmatched_umi_for_process = unmatched_umi.clone();
+
+    // Clone the UMI set for post-aggregation use (before closure moves original)
+    let encoded_umi_set_for_metrics = Arc::clone(&encoded_umi_set);
+
+    // Grouper: batch templates by QNAME
+    let grouper_fn = move |_header: &Header| {
+        Box::new(TemplateGrouper::new(BATCH_SIZE)) as Box<dyn Grouper<Group = TemplateBatch> + Send>
+    };
+
+    // Process function: correct UMIs in each template batch
+    let process_fn = move |batch: TemplateBatch| -> io::Result<CorrectProcessedBatch> {
+        // Per-thread LRU cache for UMI matching
+        thread_local! {
+            static CACHE: std::cell::RefCell<Option<LruCache<Vec<u8>, UmiMatch>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        CACHE.with(|cache_cell| {
+            let mut cache_ref = cache_cell.borrow_mut();
+            if cache_ref.is_none() && cache_size > 0 {
+                *cache_ref = Some(LruCache::new(
+                    NonZero::new(cache_size).expect("cache_size > 0 checked above"),
+                ));
+            }
+
+            let mut kept_raw_records: Vec<RawRecord> = Vec::new();
+            let mut missing_umis = 0u64;
+            let mut wrong_length = 0u64;
+            let mut mismatched = 0u64;
+            let mut umi_matches_map: AHashMap<String, UmiCorrectionMetrics> = AHashMap::new();
+            let templates_count = batch.len() as u64;
+            let mut total_input_records = 0u64;
+            let umi_tag_bytes: [u8; 2] = [umi_tag.as_ref()[0], umi_tag.as_ref()[1]];
+
+            // Stream rejected records straight to disk so they don't accumulate
+            // in a batch-level Vec.
+            let flush_raw_records = |recs: Vec<RawRecord>| -> io::Result<()> {
+                if let Some(ref rw_arc) = rejects_writer_for_process {
+                    if !recs.is_empty() {
+                        let mut guard = rw_arc.lock();
+                        if let Some(w) = guard.as_mut() {
+                            for raw in &recs {
+                                w.write_raw_record(raw.as_ref())?;
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            };
+
+            for template in batch {
+                total_input_records += template.read_count() as u64;
+
+                let raw_records: Vec<RawRecord> = template.into_records();
+                let umi_opt =
+                    CorrectUmis::extract_and_validate_template_umi_raw(&raw_records, umi_tag_bytes)
+                        .map_err(io::Error::other)?;
+
+                match umi_opt {
+                    None => {
+                        let num_records = raw_records.len() as u64;
+                        missing_umis += num_records;
+                        let entry = umi_matches_map
+                            .entry(unmatched_umi_for_process.clone())
+                            .or_insert_with(|| {
+                                UmiCorrectionMetrics::new(unmatched_umi_for_process.clone())
+                            });
+                        entry.total_matches += num_records;
+                        if track_rejects {
+                            flush_raw_records(raw_records)?;
+                        }
+                    }
+                    Some(umi) => {
+                        let correction = CorrectUmis::compute_template_correction(
+                            &umi,
+                            umi_length,
+                            revcomp,
+                            max_mismatches,
+                            min_distance_diff,
+                            &encoded_umi_set,
+                            &mut cache_ref,
+                        );
+                        let num_records = raw_records.len() as u64;
+
+                        if correction.matched {
+                            for m in &correction.matches {
+                                if m.matched {
+                                    let entry =
+                                        umi_matches_map.entry(m.umi.clone()).or_insert_with(|| {
+                                            UmiCorrectionMetrics::new(m.umi.clone())
+                                        });
+                                    entry.total_matches += num_records;
+                                    match m.mismatches {
+                                        0 => entry.perfect_matches += num_records,
+                                        1 => entry.one_mismatch_matches += num_records,
+                                        2 => entry.two_mismatch_matches += num_records,
+                                        _ => entry.other_matches += num_records,
+                                    }
+                                }
+                            }
+
+                            for mut raw in raw_records {
+                                CorrectUmis::apply_correction_to_raw(
+                                    &mut raw,
+                                    &correction,
+                                    umi_tag_bytes,
+                                    dont_store_original_umis,
+                                );
+                                kept_raw_records.push(raw);
+                            }
+                        } else {
+                            match correction.rejection_reason {
+                                RejectionReason::WrongLength => {
+                                    wrong_length += num_records;
+                                }
+                                RejectionReason::Mismatched => {
+                                    mismatched += num_records;
+                                }
+                                RejectionReason::None => {}
+                            }
+                            let entry = umi_matches_map
+                                .entry(unmatched_umi_for_process.clone())
+                                .or_insert_with(|| {
+                                    UmiCorrectionMetrics::new(unmatched_umi_for_process.clone())
+                                });
+                            entry.total_matches += num_records;
+                            if track_rejects {
+                                flush_raw_records(raw_records)?;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Progress logging (count ALL input records, not just output)
+            let count = progress_for_process.fetch_add(total_input_records, Ordering::Relaxed);
+            if (count + total_input_records) / 1_000_000 > count / 1_000_000 {
+                info!("Processed {} records", count + total_input_records);
+            }
+
+            Ok(CorrectProcessedBatch {
+                kept_raw_records,
+                templates_count,
+                missing_umis,
+                wrong_length,
+                mismatched,
+                umi_matches: umi_matches_map,
+            })
+        })
+    };
+
+    // Serialize function: convert records to bytes and collect metrics
+    let serialize_fn = move |mut processed: CorrectProcessedBatch,
+                             _header: &Header,
+                             output: &mut Vec<u8>|
+          -> io::Result<u64> {
+        let umi_matches = std::mem::take(&mut processed.umi_matches);
+        collected_for_serialize.with_slot(|m| {
+            m.templates_processed += processed.templates_count;
+            m.missing_umis += processed.missing_umis;
+            m.wrong_length += processed.wrong_length;
+            m.mismatched += processed.mismatched;
+            for (umi, counts) in umi_matches {
+                merge_umi_counts(&mut m.umi_matches, umi, &counts);
+            }
+        });
+
+        let mut kept_count = 0u64;
+        for raw in &processed.kept_raw_records {
+            let block_size = raw.len() as u32;
+            output.extend_from_slice(&block_size.to_le_bytes());
+            output.extend_from_slice(raw);
+            kept_count += 1;
+        }
+        Ok(kept_count)
+    };
+
+    // Run the 7-step pipeline with the already-opened reader.
+    let pipeline_result = run_bam_pipeline_from_reader(
+        pipeline_config,
+        reader,
+        header,
+        output_path,
+        None,
+        grouper_fn,
+        process_fn,
+        serialize_fn,
+    );
+
+    let rejects_finish_result = rejects_writer
+        .and_then(|rw_arc| rw_arc.lock().take())
+        .map(|writer| writer.finish().context("Failed to finish rejects file"));
+
+    let records_written = match (pipeline_result, rejects_finish_result) {
+        (Ok(records_written), Some(Ok(()))) => {
+            info!("Rejected records streamed to rejects file during processing");
+            records_written
+        }
+        (Ok(records_written), None) => records_written,
+        (Ok(_), Some(Err(finish_err))) => return Err(finish_err),
+        (Err(pipeline_err), Some(Err(finish_err))) => {
+            return Err(anyhow::anyhow!(
+                "Pipeline error: {pipeline_err}; additionally failed to finish rejects file: {finish_err}"
+            ));
+        }
+        (Err(pipeline_err), _) => return Err(pipeline_err.into()),
+    };
+
+    // ========== Post-pipeline: Aggregate metrics ==========
+    let mut total_templates = 0u64;
+    let mut total_missing = 0u64;
+    let mut total_wrong_length = 0u64;
+    let mut total_mismatched = 0u64;
+    let mut merged_umi_matches: AHashMap<String, UmiCorrectionMetrics> = AHashMap::new();
+
+    for slot in collected_metrics.slots() {
+        let mut m = slot.lock();
+        total_templates += m.templates_processed;
+        total_missing += m.missing_umis;
+        total_wrong_length += m.wrong_length;
+        total_mismatched += m.mismatched;
+
+        for (umi, counts) in m.umi_matches.drain() {
+            merge_umi_counts(&mut merged_umi_matches, umi, &counts);
+        }
+    }
+
+    // Ensure ALL UMI rows are present (even with zero counts) - matches fgbio behavior
+    for umi in encoded_umi_set_for_metrics.strings().iter().chain(std::iter::once(&unmatched_umi)) {
+        merged_umi_matches
+            .entry(umi.clone())
+            .or_insert_with(|| UmiCorrectionMetrics::new(umi.clone()));
+    }
+
+    finalize_correct_metrics(metrics_path, &mut merged_umi_matches, &unmatched_umi)?;
+
+    // Log summary
+    let rejected = total_missing + total_wrong_length + total_mismatched;
+    let total_records = records_written + rejected;
+    info!("Read {total_records}; kept {records_written} and rejected {rejected}");
+    info!("Total templates processed: {total_templates}");
+
+    if total_missing > 0 || total_wrong_length > 0 {
+        warn!("###################################################################");
+        if total_missing > 0 {
+            warn!("# {total_missing} were missing UMI attributes in the BAM file!");
+        }
+        if total_wrong_length > 0 {
+            warn!(
+                "# {total_wrong_length} had unexpected UMIs of differing lengths in the BAM file!"
+            );
+        }
+        warn!("###################################################################");
+    }
+
+    if let Some(min) = min_corrected {
+        #[allow(clippy::cast_precision_loss)]
+        let ratio_kept = records_written as f64 / total_records as f64;
+        if ratio_kept < min {
+            bail!(
+                "Final ratio of reads kept / total was {ratio_kept:.2} (user specified minimum was {min:.2}). \
+                This could indicate a mismatch between library preparation and the provided UMI file."
+            );
+        }
+    }
+
+    Ok(total_records)
+}
+
+/// Free-function form of [`CorrectUmis::finalize_metrics`].
+///
+/// Takes the metrics output path explicitly so [`run_correct_pipeline`] can be
+/// called from contexts that don't own a [`CorrectUmis`]. No behaviour change.
+pub(crate) fn finalize_correct_metrics(
+    metrics_path: Option<&Path>,
+    umi_metrics: &mut AHashMap<String, UmiCorrectionMetrics>,
+    unmatched_umi: &str,
+) -> Result<()> {
+    // Calculate totals
+    let total: u64 = umi_metrics.values().map(|m| m.total_matches).sum();
+    let matched_total: u64 = umi_metrics
+        .iter()
+        .filter(|(umi, _)| *umi != unmatched_umi)
+        .map(|(_, m)| m.total_matches)
+        .sum();
+
+    // Calculate fractions (allow NaN when total is 0, matching fgbio behavior)
+    #[allow(clippy::cast_precision_loss)]
+    for metric in umi_metrics.values_mut() {
+        metric.fraction_of_matches = metric.total_matches as f64 / total as f64;
+    }
+
+    // Calculate representations (allow NaN/Infinity, matching fgbio behavior)
+    let umi_count = umi_metrics.keys().filter(|umi| *umi != unmatched_umi).count();
+
+    #[allow(clippy::cast_precision_loss)]
+    let mean = matched_total as f64 / umi_count as f64;
+    for metric in umi_metrics.values_mut() {
+        metric.representation = metric.total_matches as f64 / mean;
+    }
+
+    // Write metrics if requested
+    if let Some(path) = metrics_path {
+        let mut metrics: Vec<UmiCorrectionMetrics> = umi_metrics.values().cloned().collect();
+        metrics.sort_by(|a, b| a.umi.cmp(&b.umi));
+        UmiCorrectionMetrics::write_metrics(&metrics, path)?;
+    }
+
+    Ok(())
+}
+
 /// Merges `counts` into `dst[umi]`, creating a zero-initialized entry if the
 /// key is absent. Uses `or_insert_with_key` so `umi` is only cloned on insert,
 /// not on hit.
@@ -1467,6 +1560,15 @@ impl EncodedUmiSet {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
+    }
+
+    /// Borrow the original (uppercase) UMI strings.
+    ///
+    /// `pub(crate)` so the runall correct chain runners can iterate the
+    /// allowed UMIs when populating per-UMI metric rows.
+    #[inline]
+    pub(crate) fn strings(&self) -> &[String] {
+        &self.strings
     }
 }
 

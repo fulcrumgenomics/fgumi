@@ -219,14 +219,18 @@ pub struct Runall {
 impl Runall {
     /// Build the chain registry.
     ///
-    /// PR 2 registers [`chains::ExtractChainRunner`] for the
-    /// `(Extract, Extract)` shape; PR 3 will add the correct and
-    /// extract→correct runners ahead of it. Real runners are pushed
-    /// onto the front so their `supports()` checks fire before the
-    /// catch-all [`chains::NotImplementedRunner`] fallback.
+    /// PR 2 registered [`chains::ExtractChainRunner`] for the
+    /// `(Extract, Extract)` shape; PR 3 adds
+    /// [`chains::CorrectChainRunner`] for `(Correct, Correct)` and
+    /// [`chains::ExtractCorrectChainRunner`] for the fused
+    /// `(Extract, Correct)`. Real runners are pushed onto the front so
+    /// their `supports()` checks fire before the catch-all
+    /// [`chains::NotImplementedRunner`] fallback.
     fn build_chain_registry(&self) -> ChainRegistry {
         ChainRegistry::new()
             .register(Box::new(chains::ExtractChainRunner::from_runall(self)))
+            .register(Box::new(chains::ExtractCorrectChainRunner::from_runall(self)))
+            .register(Box::new(chains::CorrectChainRunner::from_runall(self)))
             .register(Box::new(chains::NotImplementedRunner))
     }
 
