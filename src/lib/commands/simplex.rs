@@ -51,7 +51,7 @@ use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, ConsensusCallingOptions, OverlappingConsensusOptions,
     QueueMemoryOptions, ReadGroupOptions, RejectsOptions, SchedulerOptions, StatsOptions,
-    ThreadingOptions, build_pipeline_config,
+    ThreadingOptions, build_pipeline_config, serialize_raw_bam_records,
 };
 use crate::commands::consensus_runner::{
     ConsensusStatsOps, create_unmapped_consensus_header, log_overlapping_stats,
@@ -608,20 +608,14 @@ impl Simplex {
                     continue;
                 }
 
-                // Apply overlapping consensus if enabled (modifies raw bytes in-place)
+                // Apply overlapping consensus if enabled (modifies raw bytes in-place).
+                // Propagate errors to match the single-threaded path (line ~410),
+                // which treats overlapping-consensus failures as fatal via `?`.
                 if let Some(ref mut oc) = overlapping_caller {
                     oc.reset_stats();
-                    if apply_overlapping_consensus(&mut raw_records, oc).is_err() {
-                        batch_overlapping.merge(oc.stats());
-                        batch_stats.record_input(raw_records.len());
-                        batch_stats.record_rejection(RejectionReason::Other, raw_records.len());
-                        if track_rejects {
-                            for raw in &raw_records {
-                                rejected_records.push(raw.as_ref().to_vec());
-                            }
-                        }
-                        continue;
-                    }
+                    apply_overlapping_consensus(&mut raw_records, oc).map_err(|e| {
+                        io::Error::other(format!("Overlapping consensus error for MI {mi}: {e}"))
+                    })?;
                     batch_overlapping.merge(oc.stats());
                 }
 
@@ -674,27 +668,17 @@ impl Simplex {
         };
 
         // ========== secondary_serialize_fn: Drain rejected records ==========
-        let secondary_serialize_fn = |batch: &SimplexProcessedBatch,
-                                      buf: &mut Vec<u8>|
-         -> io::Result<u64> {
-            for raw in &batch.rejected_records {
-                let block_size = u32::try_from(raw.len()).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("BAM record too large ({} bytes) for u32 block_size", raw.len()),
-                    )
-                })?;
-                buf.extend_from_slice(&block_size.to_le_bytes());
-                buf.extend_from_slice(raw);
-            }
-            Ok(batch.rejected_records.len() as u64)
-        };
+        let secondary_serialize_fn =
+            |batch: &SimplexProcessedBatch, buf: &mut Vec<u8>| -> io::Result<u64> {
+                serialize_raw_bam_records(&batch.rejected_records, buf)
+            };
 
         // Run the 7-step pipeline with the already-opened reader (supports streaming).
         // When `--rejects` is set, route rejects through the unified pipeline's
         // first-class secondary output so they land in input/batch-serial order
         // and the rejects BAM carries the input header.
-        let groups_processed = if let Some(rejects_path) = self.rejects_opts.rejects.as_ref() {
+        let consensus_reads_written = if let Some(rejects_path) = self.rejects_opts.rejects.as_ref()
+        {
             let secondary_header = input_header.clone();
             run_bam_pipeline_from_reader_with_secondary(
                 pipeline_config,
@@ -746,7 +730,7 @@ impl Simplex {
         // Log statistics and write to file
         info!("Consensus calling complete");
         info!("Total MI groups processed: {total_groups}");
-        info!("Total groups processed by pipeline: {groups_processed}");
+        info!("Total consensus reads written by pipeline: {consensus_reads_written}");
 
         let metrics = merged_stats.to_metrics();
         let consensus_count = metrics.consensus_reads;
@@ -1639,35 +1623,30 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_simplex_processed_batch_memory_estimate() {
-        let mut data = Vec::with_capacity(1024);
-        data.extend_from_slice(&[0u8; 100]);
+    #[rstest]
+    #[case::empty_rejects(1024, 100, vec![])]
+    #[case::non_empty_rejects(64, 32, vec![256, 128])]
+    fn test_simplex_processed_batch_memory_estimate(
+        #[case] consensus_capacity: usize,
+        #[case] consensus_len: usize,
+        #[case] rej_capacities: Vec<usize>,
+    ) {
+        let mut data = Vec::with_capacity(consensus_capacity);
+        data.resize(consensus_len, 0u8);
 
-        let batch = SimplexProcessedBatch {
-            consensus_output: ConsensusOutput { data, count: 1 },
-            rejected_records: Vec::new(),
-            groups_count: 1,
-            stats: ConsensusCallingStats::default(),
-            overlapping_stats: None,
-        };
-
-        let estimate = batch.estimate_heap_size();
-        // Should use capacity (1024) not len (100); rejected_records is empty.
-        assert_eq!(estimate, 1024, "estimate should match consensus_output capacity");
-    }
-
-    #[test]
-    fn test_simplex_processed_batch_memory_estimate_with_rejects() {
-        let mut data = Vec::with_capacity(64);
-        data.extend_from_slice(&[0u8; 32]);
-
-        let mut rej_a = Vec::with_capacity(256);
-        rej_a.extend_from_slice(&[1u8; 8]);
-        let mut rej_b = Vec::with_capacity(128);
-        rej_b.extend_from_slice(&[2u8; 8]);
-        let rejected_records: Vec<Vec<u8>> = vec![rej_a, rej_b];
+        let rejected_records: Vec<Vec<u8>> = rej_capacities
+            .iter()
+            .map(|&cap| {
+                let mut v = Vec::with_capacity(cap);
+                v.extend_from_slice(&[1u8; 8]);
+                v
+            })
+            .collect();
         let rej_outer_capacity = rejected_records.capacity();
+        // Vec::with_capacity(n) only guarantees AT LEAST n; the allocator may
+        // round up. Read the observed capacities back so the expected value
+        // matches what was actually allocated under any allocator.
+        let rej_inner_total: usize = rejected_records.iter().map(Vec::capacity).sum();
 
         let batch = SimplexProcessedBatch {
             consensus_output: ConsensusOutput { data, count: 0 },
@@ -1677,12 +1656,15 @@ mod tests {
             overlapping_stats: None,
         };
 
-        // 64 (consensus capacity) + 256 + 128 (per-rej capacities) + outer-vec capacity * size_of::<Vec<u8>>()
-        let expected = 64 + 256 + 128 + rej_outer_capacity * std::mem::size_of::<Vec<u8>>();
-        let estimate = batch.estimate_heap_size();
+        // Heap = consensus capacity + sum of per-reject inner capacities
+        // + outer-vec capacity * size_of::<Vec<u8>>().
+        let expected = consensus_capacity
+            + rej_inner_total
+            + rej_outer_capacity * std::mem::size_of::<Vec<u8>>();
         assert_eq!(
-            estimate, expected,
-            "estimate should include rejected_records capacities and outer-vec overhead",
+            batch.estimate_heap_size(),
+            expected,
+            "estimate should account for consensus capacity, rejects inner capacities, and outer-vec overhead",
         );
     }
 

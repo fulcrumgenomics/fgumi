@@ -759,6 +759,70 @@ impl QueueMemoryOptions {
     }
 }
 
+/// Frame raw BAM record bytes into the pipeline's serialize buffer.
+///
+/// Each element of `records` is treated as the body of a BAM record (no
+/// `block_size` prefix). This function writes `<u32 LE block_size><body>`
+/// for each record, matching BAM's on-disk record framing. The pipeline's
+/// downstream BGZF compression stage operates on the framed bytes verbatim.
+///
+/// Used by command-level `serialize_fn` and `secondary_serialize_fn`
+/// closures that produce raw record bytes (e.g. `commands::filter`,
+/// the `--rejects` paths in `commands::correct`/`simplex`/`duplex`/`codec`).
+///
+/// Generic over `R: AsRef<[u8]>` so callers can pass either
+/// `&[fgumi_raw_bam::RawRecord]` or `&[Vec<u8>]` without copying.
+///
+/// # Errors
+///
+/// Returns [`std::io::ErrorKind::InvalidData`] if:
+/// - a record body exceeds `u32::MAX` bytes (BAM records cannot be larger
+///   than ~4 GiB by spec), or
+/// - the summed framed size of `records` overflows `usize` (only reachable
+///   on pathological inputs; surfaces as a hard error instead of wrapping
+///   silently in release builds).
+///
+/// Both error paths are checked in a single up-front validation pass, so
+/// `output` is never partially appended on error: either every record is
+/// written or none of `output`'s bytes are touched.
+pub(crate) fn serialize_raw_bam_records<R: AsRef<[u8]>>(
+    records: &[R],
+    output: &mut Vec<u8>,
+) -> std::io::Result<u64> {
+    // Reserve total framed size up front so the per-record extend_from_slice
+    // loop doesn't repeatedly grow `output`. Validates each record's body fits
+    // a `u32` `block_size` *and* that the summed framed size fits `usize` in
+    // this same pass: by the time we start writing, every record is known
+    // good, so the write loop cannot fail and leave `output` partially
+    // appended. Either no bytes are written on error or all records are.
+    let additional = records.iter().try_fold(0usize, |acc, record| {
+        let len = record.as_ref().len();
+        u32::try_from(len).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("BAM record too large ({len} bytes) for u32 block_size"),
+            )
+        })?;
+        len.checked_add(4).and_then(|frame| acc.checked_add(frame)).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "serialized BAM batch size overflowed usize",
+            )
+        })
+    })?;
+    output.reserve(additional);
+
+    for record in records {
+        let body = record.as_ref();
+        // Pre-validated in the first pass above; `body.len()` is known to fit
+        // a `u32`, so this conversion cannot fail.
+        let block_size = u32::try_from(body.len()).expect("body length pre-validated to fit u32");
+        output.extend_from_slice(&block_size.to_le_bytes());
+        output.extend_from_slice(body);
+    }
+    Ok(records.len() as u64)
+}
+
 /// Parses a boolean value from a string, accepting: true/false, yes/no, y/n, t/f
 /// (case-insensitive). Matches sopt/fgbio behavior.
 pub(crate) fn parse_bool(s: &str) -> Result<bool, String> {
@@ -1260,5 +1324,66 @@ mod tests {
             total <= sysinfo_total,
             "cgroup-limited total {total} exceeded sysinfo total {sysinfo_total}"
         );
+    }
+
+    #[test]
+    fn test_serialize_raw_bam_records_empty() {
+        let records: Vec<Vec<u8>> = Vec::new();
+        let mut output = Vec::new();
+        let count = serialize_raw_bam_records(&records, &mut output).unwrap();
+        assert_eq!(count, 0);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn test_serialize_raw_bam_records_single_frames_correctly() {
+        let records = vec![vec![0xDEu8, 0xAD, 0xBE, 0xEF]];
+        let mut output = Vec::new();
+        let count = serialize_raw_bam_records(&records, &mut output).unwrap();
+        assert_eq!(count, 1);
+        // <u32 LE block_size = 4><body = DE AD BE EF>
+        assert_eq!(output, vec![0x04, 0x00, 0x00, 0x00, 0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn test_serialize_raw_bam_records_multiple_frames_concatenated() {
+        let records = vec![vec![0x11u8, 0x22], vec![0x33u8, 0x44, 0x55]];
+        let mut output = Vec::new();
+        let count = serialize_raw_bam_records(&records, &mut output).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(
+            output,
+            vec![0x02, 0x00, 0x00, 0x00, 0x11, 0x22, 0x03, 0x00, 0x00, 0x00, 0x33, 0x44, 0x55],
+        );
+    }
+
+    #[test]
+    fn test_serialize_raw_bam_records_reserves_capacity_upfront() {
+        // Build a batch large enough that a naive per-record extend would
+        // trigger at least one realloc growth of `output`. We then assert
+        // that after one call `output.capacity()` is at least the exact
+        // serialized size — proof that the upfront reserve happened.
+        let records: Vec<Vec<u8>> = (0..32).map(|i| vec![i as u8; 64]).collect();
+        let expected_size: usize = records.iter().map(|r| 4 + r.len()).sum();
+
+        let mut output = Vec::new();
+        serialize_raw_bam_records(&records, &mut output).unwrap();
+        assert_eq!(output.len(), expected_size);
+        assert!(
+            output.capacity() >= expected_size,
+            "capacity {} should be >= expected serialized size {expected_size}",
+            output.capacity(),
+        );
+    }
+
+    #[test]
+    fn test_serialize_raw_bam_records_preserves_existing_output_content() {
+        // Reserve must extend, not clear: writing into a non-empty buffer
+        // (as the pipeline can do when reusing serialization scratch
+        // buffers) must leave the existing prefix untouched.
+        let mut output = vec![0xAAu8, 0xBB];
+        let records = vec![vec![0x01u8]];
+        serialize_raw_bam_records(&records, &mut output).unwrap();
+        assert_eq!(output, vec![0xAA, 0xBB, 0x01, 0x00, 0x00, 0x00, 0x01]);
     }
 }

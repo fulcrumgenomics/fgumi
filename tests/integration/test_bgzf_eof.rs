@@ -848,7 +848,5 @@ fn test_correct_single_threaded_rejects_has_bgzf_eof() {
     assert!(status.success(), "correct single-threaded with rejects failed");
     assert_has_bgzf_eof(&output_bam);
     assert_has_bgzf_eof(&rejects_bam);
-    // Single-threaded correct writes rejects in input order, so it keeps the
-    // input header as-is rather than marking it SO:unsorted.
     assert_rejects_header_matches_input(&rejects_bam, &input_bam);
 }

@@ -83,7 +83,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, RejectsOptions, SchedulerOptions,
-    ThreadingOptions, build_pipeline_config, parse_bool,
+    ThreadingOptions, build_pipeline_config, parse_bool, serialize_raw_bam_records,
 };
 
 /// Result of matching an observed UMI to an expected UMI.
@@ -906,8 +906,11 @@ impl CorrectUmis {
                                     });
                                 entry.total_matches += num_records;
                                 if track_rejects {
-                                    for raw in &raw_records {
-                                        rejected_records.push(raw.as_ref().to_vec());
+                                    // Move out of `raw_records` (consumed here) to
+                                    // avoid a per-record clone+memcpy on the rejects
+                                    // hot path.
+                                    for raw in raw_records {
+                                        rejected_records.push(raw.into_inner());
                                     }
                                 }
                             }
@@ -969,8 +972,10 @@ impl CorrectUmis {
                                         });
                                     entry.total_matches += num_records;
                                     if track_rejects {
-                                        for raw in &raw_records {
-                                            rejected_records.push(raw.as_ref().to_vec());
+                                        // Move out of `raw_records` (consumed
+                                        // here) to avoid a per-record clone.
+                                        for raw in raw_records {
+                                            rejected_records.push(raw.into_inner());
                                         }
                                     }
                                 }
@@ -997,14 +1002,12 @@ impl CorrectUmis {
             })
         };
 
-        // Serialize function: convert records to bytes and collect metrics
+        // Serialize function: convert kept records to bytes and collect metrics.
+        // Rejects are drained by `secondary_serialize_fn` separately.
         let serialize_fn = move |mut processed: CorrectProcessedBatch,
                                  _header: &Header,
                                  output: &mut Vec<u8>|
               -> io::Result<u64> {
-            // Rejects were already streamed to disk in process_fn.
-            // Merge per-batch counts + UMI matches into this worker's
-            // accumulator slot.
             let umi_matches = std::mem::take(&mut processed.umi_matches);
             collected_for_serialize.with_slot(|m| {
                 m.templates_processed += processed.templates_count;
@@ -1016,38 +1019,18 @@ impl CorrectUmis {
                 }
             });
 
-            // Serialize kept records
-            let mut kept_count = 0u64;
-            for raw in &processed.kept_raw_records {
-                let block_size = raw.len() as u32;
-                output.extend_from_slice(&block_size.to_le_bytes());
-                output.extend_from_slice(raw);
-                kept_count += 1;
-            }
-            // Return KEPT record count (not input count, to avoid double-counting)
-            Ok(kept_count)
+            // Return KEPT record count (not input count, to avoid double-counting).
+            serialize_raw_bam_records(&processed.kept_raw_records, output)
         };
 
         // Secondary serialize: drains the per-batch rejected_records into the
-        // pipeline's secondary output buffer (BAM-framed: u32 little-endian
-        // block_size + record bytes). The pipeline reorders by batch serial,
-        // so rejects land in input order and the secondary writer is finalized
-        // automatically inside the pipeline.
-        let secondary_serialize_fn = |batch: &CorrectProcessedBatch,
-                                      buf: &mut Vec<u8>|
-         -> io::Result<u64> {
-            for raw in &batch.rejected_records {
-                let block_size = u32::try_from(raw.len()).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("BAM record too large ({} bytes) for u32 block_size", raw.len()),
-                    )
-                })?;
-                buf.extend_from_slice(&block_size.to_le_bytes());
-                buf.extend_from_slice(raw);
-            }
-            Ok(batch.rejected_records.len() as u64)
-        };
+        // pipeline's secondary output buffer. The pipeline reorders by batch
+        // serial, so rejects land in input order and the secondary writer is
+        // finalized automatically inside the pipeline.
+        let secondary_serialize_fn =
+            |batch: &CorrectProcessedBatch, buf: &mut Vec<u8>| -> io::Result<u64> {
+                serialize_raw_bam_records(&batch.rejected_records, buf)
+            };
 
         // Run the 7-step pipeline with the already-opened reader (supports streaming).
         // When `--rejects` is set, route rejects through the unified pipeline's
@@ -3635,5 +3618,60 @@ mod tests {
         // OX tag should NOT be present (dont_store_original_umis = true)
         let ox = fgumi_raw_bam::find_string_tag_in_record(&raw, SamTag::OX);
         assert!(ox.is_none());
+    }
+
+    /// Verifies `CorrectProcessedBatch::estimate_heap_size` accounts for both
+    /// `kept_raw_records` (consensus path) and `rejected_records` (secondary
+    /// rejects path), plus the outer-vec capacity overhead for each. The
+    /// non-empty-rejects case in particular guards against a regression where
+    /// the buffered rejects branch added by the secondary-output migration is
+    /// dropped from the estimate (which would mis-throttle the pipeline).
+    #[rstest]
+    #[case::empty_rejects(vec![1024], vec![])]
+    #[case::non_empty_rejects(vec![64, 128], vec![256, 512])]
+    fn test_correct_processed_batch_memory_estimate(
+        #[case] kept_capacities: Vec<usize>,
+        #[case] rej_capacities: Vec<usize>,
+    ) {
+        let kept_raw_records: Vec<RawRecord> =
+            kept_capacities.iter().map(|&cap| RawRecord::with_capacity(cap)).collect();
+        let kept_outer_capacity = kept_raw_records.capacity();
+        // RawRecord::with_capacity / Vec::with_capacity(n) only guarantee AT
+        // LEAST n; the allocator may round up. Read the observed capacities
+        // back so the expected value matches what was actually allocated
+        // under any allocator.
+        let kept_inner_total: usize = kept_raw_records.iter().map(RawRecord::capacity).sum();
+
+        let rejected_records: Vec<Vec<u8>> = rej_capacities
+            .iter()
+            .map(|&cap| {
+                let mut v = Vec::with_capacity(cap);
+                v.extend_from_slice(&[1u8; 8]);
+                v
+            })
+            .collect();
+        let rej_outer_capacity = rejected_records.capacity();
+        let rej_inner_total: usize = rejected_records.iter().map(Vec::capacity).sum();
+
+        let batch = CorrectProcessedBatch {
+            kept_raw_records,
+            rejected_records,
+            templates_count: 0,
+            missing_umis: 0,
+            wrong_length: 0,
+            mismatched: 0,
+            umi_matches: AHashMap::new(),
+        };
+
+        let expected = kept_inner_total
+            + kept_outer_capacity * std::mem::size_of::<RawRecord>()
+            + rej_inner_total
+            + rej_outer_capacity * std::mem::size_of::<Vec<u8>>();
+        assert_eq!(
+            batch.estimate_heap_size(),
+            expected,
+            "estimate should account for kept-record capacities, rejects inner capacities, \
+             and both outer-vec overheads",
+        );
     }
 }

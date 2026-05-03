@@ -4255,6 +4255,17 @@ fn resolve_secondary_header(
 /// The secondary serialize function is called with a borrow of the processed batch
 /// BEFORE the primary serialize function consumes it.
 ///
+/// # Parameters
+///
+/// - `output_header`: header for the primary output BAM. `None` reuses
+///   `input_header`.
+/// - `secondary_output_header`: header for the rejects (secondary) BAM. `None`
+///   reuses the resolved primary `output_header` — the filter-style case where
+///   primary and secondary share a header. Consensus commands pass
+///   `Some(input_header)` so the rejects BAM advertises the raw-input header
+///   (with the input's RG/PG/contig metadata and sort order) instead of the
+///   transformed primary output header.
+///
 /// # Errors
 ///
 /// Returns an I/O error if any pipeline step or file I/O fails.
@@ -4814,20 +4825,18 @@ mod tests {
         assert!(!state.q2b_boundaries.is_empty(), "Q2b should not have been popped");
     }
 
-    #[test]
-    fn test_resolve_secondary_header_defaults_to_primary() {
+    #[rstest]
+    #[case::none_falls_back_to_primary(None, "primary")]
+    #[case::some_overrides_primary(Some("rejects"), "rejects")]
+    fn test_resolve_secondary_header(
+        #[case] override_comment: Option<&str>,
+        #[case] expected_comment: &str,
+    ) {
         let primary = Header::builder().add_comment("primary").build();
-        let resolved = resolve_secondary_header(None, &primary);
-        assert_eq!(resolved, primary);
-    }
-
-    #[test]
-    fn test_resolve_secondary_header_uses_override_when_provided() {
-        let primary = Header::builder().add_comment("primary").build();
-        let override_header = Header::builder().add_comment("rejects").build();
-        let resolved = resolve_secondary_header(Some(&override_header), &primary);
-        assert_eq!(resolved, override_header);
-        assert_ne!(resolved, primary);
+        let override_header = override_comment.map(|c| Header::builder().add_comment(c).build());
+        let resolved = resolve_secondary_header(override_header.as_ref(), &primary);
+        let expected = Header::builder().add_comment(expected_comment).build();
+        assert_eq!(resolved, expected);
     }
 
     #[test]

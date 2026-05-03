@@ -58,6 +58,10 @@ pub fn assert_rejects_header_matches_input(
     }
 
     fn read_sort_fields(path: &std::path::Path) -> SortFields {
+        use noodles::sam::header::record::value::map::header::tag::{
+            GROUP_ORDER, SORT_ORDER, SUBSORT_ORDER,
+        };
+
         let mut reader = noodles::bam::io::Reader::new(
             std::fs::File::open(path).expect("Failed to open BAM for header check"),
         );
@@ -66,11 +70,14 @@ pub fn assert_rejects_header_matches_input(
         let Some(hdr_map) = header.header() else {
             return SortFields { so: None, go: None, ss: None };
         };
+        // Use typed `Other` tag constants rather than raw byte slices so this
+        // keeps working if noodles ever promotes these to first-class fields
+        // on `Map<Header>` (currently 0.82 keeps them in `other_fields`).
         let other = hdr_map.other_fields();
         SortFields {
-            so: other.get(b"SO").map(|v| v.to_vec()),
-            go: other.get(b"GO").map(|v| v.to_vec()),
-            ss: other.get(b"SS").map(|v| v.to_vec()),
+            so: other.get(&SORT_ORDER).map(|v| v.to_vec()),
+            go: other.get(&GROUP_ORDER).map(|v| v.to_vec()),
+            ss: other.get(&SUBSORT_ORDER).map(|v| v.to_vec()),
         }
     }
 
@@ -218,6 +225,30 @@ mod tests {
     use super::*;
     use crate::helpers::bam_generator::to_record_buf;
     use fgumi_raw_bam::{SamBuilder, flags};
+
+    /// Locks down the noodles behavior that `assert_rejects_header_matches_input`
+    /// relies on: SO/GO/SS are accessible via the typed `Other` tag constants on
+    /// `Map<Header>::other_fields()`. If noodles ever moves these to first-class
+    /// fields on `Map<Header>`, this test will fail and the helper above must be
+    /// updated to use the new accessors instead.
+    #[test]
+    fn sort_fields_are_readable_from_other_fields() {
+        use noodles::sam::header::record::value::map::header::tag::{
+            GROUP_ORDER, SORT_ORDER, SUBSORT_ORDER,
+        };
+
+        let header_text =
+            "@HD\tVN:1.6\tSO:queryname\tGO:none\tSS:queryname:natural\n@PG\tID:test\tPN:test\n";
+        let header: noodles::sam::Header = header_text.parse().unwrap();
+        let hdr_map = header.header().expect("@HD should be present");
+        let other = hdr_map.other_fields();
+        assert_eq!(other.get(&SORT_ORDER).map(|v| v.to_vec()), Some(b"queryname".to_vec()),);
+        assert_eq!(other.get(&GROUP_ORDER).map(|v| v.to_vec()), Some(b"none".to_vec()));
+        assert_eq!(
+            other.get(&SUBSORT_ORDER).map(|v| v.to_vec()),
+            Some(b"queryname:natural".to_vec()),
+        );
+    }
 
     #[test]
     fn test_assert_mi_tag() {
