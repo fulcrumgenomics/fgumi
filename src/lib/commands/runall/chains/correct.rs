@@ -8,18 +8,23 @@
 //! `min_corrected` check, metrics file finalisation) lives exactly once,
 //! in `crate::commands::correct`.
 //!
-//! Gate: matches `(Correct, Correct)` only when none of the
-//! chain-runner-incompatible per-`--correct::` flags are set
-//! (`--correct::rejects`, `--correct::metrics`, `--correct::min-corrected`)
-//! and a UMI source is provided (inline UMIs or a UMI file). The top-level
-//! `--metrics` flag IS supported: the runner times its
-//! `run_correct_pipeline` call and writes a single
-//! `MetricsRow { stage: "correct", ... }` row to the supplied TSV path.
+//! Gate: matches `(Correct, Correct)` whenever a UMI source is provided
+//! (inline UMIs or a UMI file). The `--correct::metrics` and
+//! `--correct::min-corrected` flags are forwarded directly to
+//! [`run_correct_pipeline`] (which already implements both). The
+//! `--correct::rejects` flag remains unsupported pending upstream
+//! refactors (fulcrumgenomics/fgumi#329 +
+//! fulcrumgenomics/fgumi#330) — when set, the runner still matches the
+//! chain shape so the user sees a specific error rather than the generic
+//! "not yet implemented" fallthrough. The top-level `--metrics` flag is
+//! also honoured: the runner times its `run_correct_pipeline` call and
+//! writes a single `MetricsRow { stage: "correct", ... }` row to the
+//! supplied TSV path.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::commands::common::{
     CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions, add_pg_record,
@@ -40,27 +45,32 @@ pub(crate) const CORRECT_CHAIN_RUNNER_NAME: &str = "CorrectChainRunner";
 /// `Runall` fields needed to drive [`run_correct_pipeline`]. Cloning keeps
 /// the runner `'static` (so it can be pushed into the trait-object
 /// registry) without leaking `Runall` lifetimes.
-#[allow(clippy::struct_excessive_bools)] // gate flags + correction toggles
+#[allow(clippy::struct_excessive_bools)] // correction toggles
 pub(crate) struct CorrectChainRunner {
-    input: std::path::PathBuf,
+    input: PathBuf,
     threads: usize,
     compression_level: u32,
     umis: Vec<String>,
-    umi_files: Vec<std::path::PathBuf>,
+    umi_files: Vec<PathBuf>,
     max_mismatches: usize,
     min_distance_diff: usize,
     cache_size: usize,
     revcomp: bool,
     dont_store_original_umis: bool,
-    /// `--correct::rejects`. Chain-runner-incompatible: must be unset for
-    /// `supports()` to match. (Wiring deferred to PR #329.)
-    rejects_unset: bool,
-    /// `--correct::metrics`. Chain-runner-incompatible. (Wiring deferred
-    /// to PR #329; the top-level `--metrics` is supported here.)
-    metrics_unset: bool,
-    /// `--correct::min-corrected`. Chain-runner-incompatible. (Wiring
-    /// deferred to PR #329.)
-    min_corrected_unset: bool,
+    /// `--correct::rejects`. Still unsupported at the runall layer pending
+    /// fulcrumgenomics/fgumi#329 (migrate hand-rolled rejects writers to
+    /// first-class `secondary_output`). When set, [`run_chain`] bails with
+    /// a specific error pointing at that issue rather than silently
+    /// falling through to the not-implemented runner.
+    rejects: Option<PathBuf>,
+    /// `--correct::metrics`. Forwarded to [`run_correct_pipeline`] via
+    /// [`CorrectPipelineParams::metrics_path`]; the per-UMI metrics TSV
+    /// is written by [`finalize_correct_metrics`] inside the pipeline.
+    correct_metrics: Option<PathBuf>,
+    /// `--correct::min-corrected`. Forwarded to [`run_correct_pipeline`]
+    /// via [`CorrectPipelineParams::min_corrected`]; the post-pipeline
+    /// kept/total-records ratio check is performed there.
+    correct_min_corrected: Option<f64>,
     /// `--queue-memory` / `--queue-memory-per-thread` from the top-level
     /// `Runall`. Cloned (rather than per-field-decomposed) so the runner
     /// can call `QueueMemoryOptions::calculate_memory_limit` and
@@ -92,9 +102,9 @@ impl CorrectChainRunner {
             cache_size: opts.correct_cache_size,
             revcomp: opts.correct_revcomp,
             dont_store_original_umis: opts.correct_dont_store_original_umis,
-            rejects_unset: opts.correct_rejects.is_none(),
-            metrics_unset: opts.correct_metrics.is_none(),
-            min_corrected_unset: opts.correct_min_corrected.is_none(),
+            rejects: opts.correct_rejects.clone(),
+            correct_metrics: opts.correct_metrics.clone(),
+            correct_min_corrected: opts.correct_min_corrected,
             queue_memory: runall.queue_memory.clone(),
         }
     }
@@ -104,12 +114,12 @@ impl CorrectChainRunner {
     ///
     /// When `metrics_path` is `Some`, writes a single
     /// [`MetricsRow`] tagged `"correct"` with wall-clock duration and
-    /// `records_in == records_out`. The simplification is exact for the
-    /// supported chain configurations: without `--correct::rejects`,
-    /// rejected records are still emitted (with the original UMI), and
-    /// without `--correct::min-corrected`, no records are dropped
-    /// post-correction. PR #329 will wire those flags and split
-    /// `records_in` / `records_out` accordingly.
+    /// `records_in == records_out` (the total record count returned by
+    /// [`run_correct_pipeline`], which equals kept + rejected). Once
+    /// `--correct::rejects` lands (fulcrumgenomics/fgumi#329 +
+    /// fulcrumgenomics/fgumi#330), this row should split `records_in` /
+    /// `records_out` so the dropped count is visible in the top-level
+    /// metrics TSV.
     fn run_chain(
         &self,
         command_line: &str,
@@ -124,6 +134,21 @@ impl CorrectChainRunner {
             !self.umis.is_empty() || !self.umi_files.is_empty(),
             "CorrectChainRunner: --correct::umis or --correct::umi-files is required",
         );
+        if self.rejects.is_some() {
+            // Wiring `--correct::rejects` through the runall correct chain
+            // requires the standalone command's hand-rolled
+            // `Arc<Mutex<Option<RawBamWriter>>>` to first migrate to the
+            // unified pipeline's `secondary_output` (issue #329); the fused
+            // extract→correct chain additionally needs FASTQ-pipeline
+            // secondary-output support (issue #330's phase 1). Until both
+            // land we fail with a specific error so users get a pointer to
+            // the tracking work rather than the generic "not yet
+            // implemented" fallthrough.
+            bail!(
+                "--correct::rejects is not yet supported by the runall correct chain; \
+                 tracked in fulcrumgenomics/fgumi#329 and fulcrumgenomics/fgumi#330"
+            );
+        }
 
         // Load the UMI list from inline strings + files, deduped + uppercased,
         // matching the standalone `fgumi correct` loader.
@@ -147,7 +172,7 @@ impl CorrectChainRunner {
         let threading = ThreadingOptions { threads: Some(self.threads) };
 
         let start = std::time::Instant::now();
-        let records_out = run_correct_pipeline(CorrectPipelineParams {
+        let total_records = run_correct_pipeline(CorrectPipelineParams {
             num_threads: self.threads,
             reader,
             header,
@@ -160,31 +185,30 @@ impl CorrectChainRunner {
             threading: &threading,
             rejects_path: None,
             output_path: output,
-            metrics_path: None,
+            metrics_path: self.correct_metrics.as_deref(),
             max_mismatches: self.max_mismatches,
             min_distance_diff: self.min_distance_diff,
             revcomp: self.revcomp,
             cache_size: self.cache_size,
             dont_store_original_umis: self.dont_store_original_umis,
-            min_corrected: None,
+            min_corrected: self.correct_min_corrected,
         })
         .with_context(|| format!("CorrectChainRunner pipeline writing to {}", output.display()))?;
         let wall_time_secs = start.elapsed().as_secs_f64();
 
         if let Some(path) = metrics_path {
-            // Without `--correct::rejects` rejected records are still emitted
-            // (with their original UMI) and without `--correct::min-corrected`
-            // no records are dropped post-correction, so `records_in` and
-            // `records_out` are equal. PR #329 wires those flags and will
-            // start populating `records_in` independently.
+            // Until `--correct::rejects` is wired (issues #329 + #330) we
+            // can't separate the kept count from the total here, so both
+            // columns carry the total record count returned by
+            // `run_correct_pipeline`.
             let mut writer = MetricsWriter::create(path)
                 .with_context(|| format!("opening --metrics path {} for write", path.display()))?;
             writer
                 .write_row(&MetricsRow {
                     stage: "correct".into(),
                     wall_time_secs,
-                    records_in: records_out,
-                    records_out,
+                    records_in: total_records,
+                    records_out: total_records,
                 })
                 .with_context(|| format!("writing correct metrics row to {}", path.display()))?;
         }
@@ -198,21 +222,22 @@ impl ChainRunner for CorrectChainRunner {
         CORRECT_CHAIN_RUNNER_NAME
     }
 
-    /// Match `(Correct, Correct)` when:
-    /// * a UMI source is provided (inline `--correct::umis` or
-    ///   `--correct::umi-files`); and
-    /// * none of the `--correct::rejects`, `--correct::metrics`, or
-    ///   `--correct::min-corrected` flags are set (those still gate the
-    ///   runner off so those invocations fall through to the
-    ///   `NotImplementedRunner`; PR #329 will wire them).
+    /// Match `(Correct, Correct)` whenever a UMI source is provided
+    /// (inline `--correct::umis` or `--correct::umi-files`).
+    ///
+    /// `--correct::metrics` and `--correct::min-corrected` are forwarded
+    /// directly to [`run_correct_pipeline`] (which already owns both
+    /// behaviours), so they don't gate the runner.
+    ///
+    /// `--correct::rejects` ALSO does not gate `supports()` — when set we
+    /// still want this runner to win over `NotImplementedRunner` so the
+    /// user sees the specific "tracked in #329 / #330" error from
+    /// [`run_chain`] instead of the generic fallthrough message.
     ///
     /// The top-level `--metrics` flag does NOT gate this runner — it is
     /// honoured directly by `run_chain`, which writes a single
     /// `correct` row to the supplied TSV.
     fn supports(&self, ctx: &DispatchContext<'_>) -> bool {
-        if !self.rejects_unset || !self.metrics_unset || !self.min_corrected_unset {
-            return false;
-        }
         if self.umis.is_empty() && self.umi_files.is_empty() {
             return false;
         }
@@ -344,7 +369,11 @@ mod tests {
     }
 
     #[test]
-    fn does_not_support_when_correct_rejects_set() {
+    fn supports_when_correct_rejects_set_so_run_can_emit_specific_error() {
+        // Lifted gate (this PR): we want the runner to claim the chain
+        // shape even when `--correct::rejects` is set, so the user sees
+        // the specific "tracked in #329 / #330" error from `run_chain`
+        // rather than the generic NotImplementedRunner fallthrough.
         let dir = tempfile::TempDir::new().unwrap();
         let mut runall = runall_for_correct(
             dir.path().join("in.bam"),
@@ -354,13 +383,16 @@ mod tests {
         runall.correct_opts.correct_rejects = Some(dir.path().join("rejects.bam"));
         let runner = CorrectChainRunner::from_runall(&runall);
         assert!(
-            !runner.supports(&dispatch_ctx(StartFrom::Correct, StopAfter::Correct)),
-            "--correct::rejects must keep gating the runner off (PR #329)"
+            runner.supports(&dispatch_ctx(StartFrom::Correct, StopAfter::Correct)),
+            "--correct::rejects must NOT gate supports() — it routes through run_chain to fail \
+             with a specific error pointing at issues #329 and #330"
         );
     }
 
     #[test]
-    fn does_not_support_when_correct_metrics_set() {
+    fn supports_with_correct_metrics_set() {
+        // `--correct::metrics` is now forwarded directly to
+        // `run_correct_pipeline`; the runner should claim the chain shape.
         let dir = tempfile::TempDir::new().unwrap();
         let mut runall = runall_for_correct(
             dir.path().join("in.bam"),
@@ -370,13 +402,15 @@ mod tests {
         runall.correct_opts.correct_metrics = Some(dir.path().join("correct-metrics.tsv"));
         let runner = CorrectChainRunner::from_runall(&runall);
         assert!(
-            !runner.supports(&dispatch_ctx(StartFrom::Correct, StopAfter::Correct)),
-            "--correct::metrics must keep gating the runner off (PR #329)"
+            runner.supports(&dispatch_ctx(StartFrom::Correct, StopAfter::Correct)),
+            "--correct::metrics must no longer gate supports() (this PR)"
         );
     }
 
     #[test]
-    fn does_not_support_when_correct_min_corrected_set() {
+    fn supports_with_correct_min_corrected_set() {
+        // `--correct::min-corrected` is now forwarded directly to
+        // `run_correct_pipeline`; the runner should claim the chain shape.
         let dir = tempfile::TempDir::new().unwrap();
         let mut runall = runall_for_correct(
             dir.path().join("in.bam"),
@@ -386,8 +420,36 @@ mod tests {
         runall.correct_opts.correct_min_corrected = Some(0.5);
         let runner = CorrectChainRunner::from_runall(&runall);
         assert!(
-            !runner.supports(&dispatch_ctx(StartFrom::Correct, StopAfter::Correct)),
-            "--correct::min-corrected must keep gating the runner off (PR #329)"
+            runner.supports(&dispatch_ctx(StartFrom::Correct, StopAfter::Correct)),
+            "--correct::min-corrected must no longer gate supports() (this PR)"
+        );
+    }
+
+    #[test]
+    fn rejects_set_returns_specific_error_pointing_at_issues_329_330() {
+        // Lifted gate (this PR) means `supports()` is now true; the
+        // specific error must surface from `run_chain` itself.
+        let dir = tempfile::TempDir::new().unwrap();
+        let in_bam = dir.path().join("in.bam");
+        write_test_bam(&in_bam, 1, &[b"AAAAAAAA"]);
+        let mut runall = runall_for_correct(
+            in_bam.clone(),
+            dir.path().join("out.bam"),
+            vec!["AAAAAAAA".to_string()],
+        );
+        runall.correct_opts.correct_rejects = Some(dir.path().join("rejects.bam"));
+        let runner = CorrectChainRunner::from_runall(&runall);
+        let err = runner
+            .run_chain("fgumi runall", &dir.path().join("ignored.bam"), None)
+            .expect_err("run_chain must bail when --correct::rejects is set");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("fulcrumgenomics/fgumi#329"),
+            "error must mention upstream issue #329; got: {msg}"
+        );
+        assert!(
+            msg.contains("fulcrumgenomics/fgumi#330"),
+            "error must mention upstream issue #330; got: {msg}"
         );
     }
 

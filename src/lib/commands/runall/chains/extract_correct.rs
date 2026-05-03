@@ -12,20 +12,35 @@
 //! `thread_local!` storage, mirroring the standalone `fgumi correct`
 //! pipeline.
 //!
-//! When the caller passes `--metrics`, the runner times its
+//! When the caller passes `--correct::metrics`, the closure also records
+//! per-template correction outcomes into a
+//! [`crate::per_thread_accumulator::PerThreadAccumulator`] of
+//! [`crate::commands::correct::CollectedCorrectMetrics`] (mirroring
+//! standalone `fgumi correct`); after the pipeline returns, the runner
+//! aggregates the slots and calls
+//! [`crate::commands::correct::finalize_correct_metrics`] to write the same
+//! TSV the standalone command does.
+//!
+//! `--correct::min-corrected` is enforced post-pipeline against the same
+//! accumulator: `kept_records` / `total_records` (where total = kept +
+//! missing/wrong-length/mismatched). Failure to meet the threshold returns
+//! the same `bail!()` text as standalone `fgumi correct`.
+//!
+//! When the caller passes `--metrics` (the top-level runall metrics flag,
+//! not the per-stage `--correct::metrics`), the runner times its
 //! `run_fastq_pipeline` call and emits two
 //! [`crate::commands::runall::infra::metrics::MetricsRow`]s to the supplied
-//! TSV: an `extract` row followed by a `correct` row. Per-stage wall time
-//! and `records_in` / `records_out` are simplifications until the fused
-//! `process_fn` grows per-stage accumulators (PR #329 wires
-//! `--correct::metrics`, which exposes that infrastructure):
+//! TSV: an `extract` row followed by a `correct` row. Both rows currently
+//! share the total wall-clock duration; per-stage timing and a separate
+//! pre-correction record count would require splitting the fused
+//! `process_fn`, which is out of scope for this PR.
 //!
-//! * Both rows share the total wall-clock duration of the fused pipeline.
-//! * Both rows have `records_in == records_out` set to the post-correction
-//!   record count emitted by `run_fastq_pipeline`. (Without
-//!   `--correct::rejects` rejected templates are silently dropped, but the
-//!   chain runner does not expose a separate dropped-record counter today;
-//!   PR #329 adds that path.)
+//! `--correct::rejects` remains unsupported — it would require either
+//! migrating standalone correct's hand-rolled rejects writer to
+//! `secondary_output` (issue #329) or adding `secondary_output` support to
+//! the FASTQ pipeline (issue #330's phase 1+). When set, [`run_chain`]
+//! bails with a specific error pointing at both issues rather than
+//! silently falling through to the not-implemented runner.
 
 use std::cell::RefCell;
 use std::fs::File;
@@ -35,13 +50,17 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use ahash::AHashMap;
+use anyhow::{Context, Result, bail};
 use lru::LruCache;
 use noodles::sam::Header;
 use read_structure::ReadStructure;
 
 use crate::commands::common::{QueueMemoryOptions, add_pg_record};
-use crate::commands::correct::{CorrectUmis, EncodedUmiSet, TemplateCorrection, UmiMatch};
+use crate::commands::correct::{
+    CollectedCorrectMetrics, CorrectUmis, EncodedUmiSet, RejectionReason, TemplateCorrection,
+    UmiMatch, finalize_correct_metrics, merge_umi_counts,
+};
 use crate::commands::extract::{
     BUFFER_SIZE, CompressionFormat, ExtractConfig, ExtractHeaderMetadata,
     QUALITY_DETECTION_SAMPLE_SIZE, QualityEncoding, RawExtractedRecords, build_extract_header,
@@ -55,6 +74,8 @@ use crate::commands::runall::infra::metrics::{MetricsRow, MetricsWriter};
 use crate::commands::runall::options::{StartFrom, StopAfter};
 use crate::fastq::FastqSet;
 use crate::grouper::FastqTemplate;
+use crate::metrics::UmiCorrectionMetrics;
+use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::sam::SamTag;
 use crate::unified_pipeline::{FastqPipelineConfig, run_fastq_pipeline};
 use fgumi_raw_bam::{aux_data_slice, find_string_tag, update_string_tag};
@@ -99,10 +120,19 @@ pub(crate) struct ExtractCorrectChainRunner {
     cache_size: usize,
     revcomp: bool,
     dont_store_original_umis: bool,
-    // Chain-runner-incompatible flags (gated off; PR #329 will wire them).
-    rejects_unset: bool,
-    metrics_unset: bool,
-    min_corrected_unset: bool,
+    /// `--correct::rejects`. Still unsupported pending issues #329 + #330;
+    /// when set, [`run_chain`] bails with a specific error rather than
+    /// falling through to `NotImplementedRunner`.
+    rejects: Option<PathBuf>,
+    /// `--correct::metrics`. When set, the fused process closure records
+    /// per-template correction outcomes into a per-thread accumulator and
+    /// the runner calls [`finalize_correct_metrics`] post-pipeline to
+    /// emit the same TSV the standalone `fgumi correct` does.
+    correct_metrics: Option<PathBuf>,
+    /// `--correct::min-corrected`. Enforced post-pipeline against the same
+    /// per-thread accumulator using the same threshold formula and error
+    /// text standalone `fgumi correct` uses.
+    correct_min_corrected: Option<f64>,
     /// `--queue-memory` / `--queue-memory-per-thread` from the top-level
     /// `Runall`. Cloned so the runner can build a `FastqPipelineConfig`
     /// with the same memory budget the standalone `fgumi extract` /
@@ -143,9 +173,9 @@ impl ExtractCorrectChainRunner {
             cache_size: correct_opts.correct_cache_size,
             revcomp: correct_opts.correct_revcomp,
             dont_store_original_umis: correct_opts.correct_dont_store_original_umis,
-            rejects_unset: correct_opts.correct_rejects.is_none(),
-            metrics_unset: correct_opts.correct_metrics.is_none(),
-            min_corrected_unset: correct_opts.correct_min_corrected.is_none(),
+            rejects: correct_opts.correct_rejects.clone(),
+            correct_metrics: correct_opts.correct_metrics.clone(),
+            correct_min_corrected: correct_opts.correct_min_corrected,
             queue_memory: runall.queue_memory.clone(),
         }
     }
@@ -211,6 +241,14 @@ impl ExtractCorrectChainRunner {
     /// 4. either drop the template (UMI not matched) or apply the correction
     ///    in-place to every record's RX (and OX) tag.
     ///
+    /// When `metrics_acc` is `Some`, the closure also records per-template
+    /// correction outcomes into the accumulator, mirroring the
+    /// `umi_matches_map` / `missing_umis` / `wrong_length` / `mismatched`
+    /// counters standalone `fgumi correct` keeps. Passing `None` skips
+    /// metric recording entirely (the per-thread accumulator is a free
+    /// allocation only when the user actually requested metrics or
+    /// `--correct::min-corrected`).
+    ///
     /// The returned closure is `Send + Sync + 'static` and plugs directly
     /// into the FASTQ pipeline's `process_fn` slot.
     #[allow(clippy::too_many_arguments)]
@@ -225,10 +263,13 @@ impl ExtractCorrectChainRunner {
         min_distance_diff: usize,
         dont_store_original_umis: bool,
         cache_size: usize,
+        unmatched_umi: String,
+        metrics_acc: Option<Arc<PerThreadAccumulator<CollectedCorrectMetrics>>>,
     ) -> impl Fn(FastqTemplate) -> io::Result<RawExtractedRecords> + Send + Sync + 'static {
         let read_structures = Arc::new(read_structures);
         let cfg = Arc::new(cfg);
         let umi_tag: [u8; 2] = *SamTag::RX;
+        let unmatched_umi = Arc::new(unmatched_umi);
 
         move |template: FastqTemplate| -> io::Result<RawExtractedRecords> {
             // Validate paired read names match across streams (mirrors the
@@ -269,8 +310,12 @@ impl ExtractCorrectChainRunner {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
             if extracted.num_records == 0 {
+                if let Some(ref acc) = metrics_acc {
+                    acc.with_slot(|m| m.templates_processed += 1);
+                }
                 return Ok(extracted);
             }
+            let template_record_count = extracted.num_records;
 
             // Step 2: read the UMI from the first record. If any record lacks
             // an RX tag, drop the whole template — matches standalone
@@ -285,6 +330,17 @@ impl ExtractCorrectChainRunner {
             };
             let aux = aux_data_slice(first_record);
             let Some(umi_bytes) = find_string_tag(aux, umi_tag) else {
+                if let Some(ref acc) = metrics_acc {
+                    acc.with_slot(|m| {
+                        m.templates_processed += 1;
+                        m.missing_umis += template_record_count;
+                        let entry =
+                            m.umi_matches.entry(unmatched_umi.as_str().to_string()).or_insert_with(
+                                || UmiCorrectionMetrics::new(unmatched_umi.as_str().to_string()),
+                            );
+                        entry.total_matches += template_record_count;
+                    });
+                }
                 return Ok(RawExtractedRecords { data: Vec::new(), num_records: 0 });
             };
             let umi_str = match std::str::from_utf8(umi_bytes) {
@@ -322,7 +378,50 @@ impl ExtractCorrectChainRunner {
 
             if !correction.matched {
                 // Drop all records in this template (no `--rejects` support yet).
+                if let Some(ref acc) = metrics_acc {
+                    acc.with_slot(|m| {
+                        m.templates_processed += 1;
+                        match correction.rejection_reason {
+                            RejectionReason::WrongLength => {
+                                m.wrong_length += template_record_count;
+                            }
+                            RejectionReason::Mismatched => {
+                                m.mismatched += template_record_count;
+                            }
+                            RejectionReason::None => {}
+                        }
+                        let entry =
+                            m.umi_matches.entry(unmatched_umi.as_str().to_string()).or_insert_with(
+                                || UmiCorrectionMetrics::new(unmatched_umi.as_str().to_string()),
+                            );
+                        entry.total_matches += template_record_count;
+                    });
+                }
                 return Ok(RawExtractedRecords { data: Vec::new(), num_records: 0 });
+            }
+
+            // Record per-UMI match outcomes (mirrors standalone correct
+            // exactly: per match segment, increment the bucket matching the
+            // mismatch count, and accumulate `total_matches` per UMI).
+            if let Some(ref acc) = metrics_acc {
+                acc.with_slot(|m| {
+                    m.templates_processed += 1;
+                    for sub in &correction.matches {
+                        if sub.matched {
+                            let entry = m
+                                .umi_matches
+                                .entry(sub.umi.clone())
+                                .or_insert_with(|| UmiCorrectionMetrics::new(sub.umi.clone()));
+                            entry.total_matches += template_record_count;
+                            match sub.mismatches {
+                                0 => entry.perfect_matches += template_record_count,
+                                1 => entry.one_mismatch_matches += template_record_count,
+                                2 => entry.two_mismatch_matches += template_record_count,
+                                _ => entry.other_matches += template_record_count,
+                            }
+                        }
+                    }
+                });
             }
 
             // Step 4: apply correction to every record in the template,
@@ -365,14 +464,25 @@ impl ExtractCorrectChainRunner {
     /// Run the chain end-to-end against the prepared
     /// [`ChainContext::tmp_output`] path.
     ///
-    /// When `metrics_path` is `Some`, writes two rows: an `extract` row
-    /// followed by a `correct` row. Both rows currently share the total
-    /// wall-clock duration of the fused pipeline and the same
-    /// `records_in == records_out` value (the post-correction count
-    /// emitted by `run_fastq_pipeline`). Per-stage timing and a separate
-    /// pre-correction record count require the fused `process_fn` to grow
-    /// per-stage accumulators — that infrastructure lands with PR #329's
-    /// `--correct::metrics` wiring.
+    /// When `metrics_path` is `Some` (top-level `--metrics`), writes two
+    /// rows: an `extract` row followed by a `correct` row. Both rows
+    /// currently share the total wall-clock duration of the fused
+    /// pipeline. The `extract` row's `records_in` / `records_out` reflects
+    /// the pre-correction record count (templates × segments) and the
+    /// `correct` row's reflect the post-correction count emitted by
+    /// `run_fastq_pipeline` — these are equal unless a template is
+    /// dropped by failing UMI correction.
+    ///
+    /// When `--correct::metrics` is set on `self`, the runner additionally
+    /// builds a [`PerThreadAccumulator<CollectedCorrectMetrics>`], threads
+    /// a clone into the fused process closure, and after the pipeline
+    /// returns calls [`finalize_correct_metrics`] to write the same
+    /// per-UMI TSV the standalone command does.
+    ///
+    /// When `--correct::min-corrected` is set, the runner enforces the
+    /// same threshold standalone correct does (`kept_records` /
+    /// `total_records` ≥ min) and bails with the same error text on
+    /// failure.
     fn run_chain(
         &self,
         command_line: &str,
@@ -387,6 +497,17 @@ impl ExtractCorrectChainRunner {
             !self.umis.is_empty() || !self.umi_files.is_empty(),
             "ExtractCorrectChainRunner: --correct::umis or --correct::umi-files is required"
         );
+        if self.rejects.is_some() {
+            // Wiring rejects through the fused chain requires both the
+            // standalone correct rejects-writer migration (issue #329) and
+            // FASTQ-pipeline secondary-output support (issue #330's
+            // phase 1). Bail with a specific pointer rather than
+            // falling through to the generic NotImplementedRunner error.
+            bail!(
+                "--correct::rejects is not yet supported by the runall extract→correct chain; \
+                 tracked in fulcrumgenomics/fgumi#329 and fulcrumgenomics/fgumi#330"
+            );
+        }
         let sample = self.sample.as_deref().ok_or_else(|| {
             anyhow::anyhow!("--extract::sample is required for the extract→correct chain")
         })?;
@@ -473,6 +594,23 @@ impl ExtractCorrectChainRunner {
             )
         };
 
+        // Per-thread metrics accumulator. Allocated whenever the user
+        // requested either `--correct::metrics` (TSV emission) or
+        // `--correct::min-corrected` (kept/total ratio check); both reuse
+        // the same standalone-correct CollectedCorrectMetrics shape so the
+        // post-pipeline code path is shared.
+        let want_metrics_acc =
+            self.correct_metrics.is_some() || self.correct_min_corrected.is_some();
+        let unmatched_umi: String = "N".repeat(umi_length);
+        let metrics_acc: Option<Arc<PerThreadAccumulator<CollectedCorrectMetrics>>> =
+            if want_metrics_acc {
+                Some(PerThreadAccumulator::<CollectedCorrectMetrics>::new(pipeline_threads))
+            } else {
+                None
+            };
+        let metrics_acc_for_closure = metrics_acc.as_ref().map(Arc::clone);
+        let encoded_umi_set_for_metrics = Arc::clone(&encoded_umi_set);
+
         let process_fn = Self::build_process_fn(
             read_structures,
             encoding,
@@ -484,6 +622,8 @@ impl ExtractCorrectChainRunner {
             self.min_distance_diff,
             self.dont_store_original_umis,
             self.cache_size,
+            unmatched_umi.clone(),
+            metrics_acc_for_closure,
         );
         let serialize_fn = Self::build_serialize_fn();
 
@@ -507,29 +647,83 @@ impl ExtractCorrectChainRunner {
         })?;
         let total_wall = start.elapsed().as_secs_f64();
 
+        // Aggregate the per-thread accumulator (if any). We compute the
+        // standalone-correct totals (kept = records_out, rejected =
+        // missing + wrong_length + mismatched) up-front so both metrics
+        // emission and the min-corrected check share one reduce.
+        let mut total_missing = 0u64;
+        let mut total_wrong_length = 0u64;
+        let mut total_mismatched = 0u64;
+        let mut merged_umi_matches: AHashMap<String, UmiCorrectionMetrics> = AHashMap::new();
+        if let Some(ref acc) = metrics_acc {
+            for slot in acc.slots() {
+                let mut m = slot.lock();
+                total_missing += m.missing_umis;
+                total_wrong_length += m.wrong_length;
+                total_mismatched += m.mismatched;
+                for (umi, counts) in m.umi_matches.drain() {
+                    merge_umi_counts(&mut merged_umi_matches, umi, &counts);
+                }
+            }
+            // Guarantee every allowed UMI (and the unmatched-UMI sentinel)
+            // shows up in the output, even with zero counts — same
+            // post-aggregation invariant standalone correct enforces.
+            for umi in
+                encoded_umi_set_for_metrics.strings().iter().chain(std::iter::once(&unmatched_umi))
+            {
+                merged_umi_matches
+                    .entry(umi.clone())
+                    .or_insert_with(|| UmiCorrectionMetrics::new(umi.clone()));
+            }
+            finalize_correct_metrics(
+                self.correct_metrics.as_deref(),
+                &mut merged_umi_matches,
+                &unmatched_umi,
+            )?;
+        }
+
+        // `--correct::min-corrected`: replicate standalone correct's
+        // formula and bail!() text byte-for-byte so existing user-facing
+        // error messages match. `records_out` from `run_fastq_pipeline` is
+        // the post-correction (kept) record count; rejected = sum of the
+        // three rejection counters from the accumulator.
+        if let Some(min) = self.correct_min_corrected {
+            let rejected = total_missing + total_wrong_length + total_mismatched;
+            let total_records = records_out + rejected;
+            #[allow(clippy::cast_precision_loss)]
+            let ratio_kept = records_out as f64 / total_records as f64;
+            if ratio_kept < min {
+                bail!(
+                    "Final ratio of reads kept / total was {ratio_kept:.2} (user specified minimum was {min:.2}). \
+                    This could indicate a mismatch between library preparation and the provided UMI file."
+                );
+            }
+        }
+
         if let Some(path) = metrics_path {
-            // The fused process_fn does not yet expose per-stage
-            // accumulators, so both rows share the total wall time and a
-            // single records_in / records_out value (the post-correction
-            // record count). PR #329 wires per-stage counters via
-            // `--correct::metrics`; once those land, this block should
-            // split the timings and populate `extract.records_out` /
-            // `correct.records_in` from the pre-correction count.
+            // Both rows share the total wall time today; the `extract` row
+            // reflects the pre-correction record count (templates ×
+            // segments) and the `correct` row reflects the post-correction
+            // count. When no template is dropped these are equal; when
+            // templates are dropped by failing UMI correction the
+            // `extract` row shows the larger number.
+            let rejected = total_missing + total_wrong_length + total_mismatched;
+            let pre_correction = records_out + rejected;
             let mut writer = MetricsWriter::create(path)
                 .with_context(|| format!("opening --metrics path {} for write", path.display()))?;
             writer
                 .write_row(&MetricsRow {
                     stage: "extract".into(),
                     wall_time_secs: total_wall,
-                    records_in: records_out,
-                    records_out,
+                    records_in: pre_correction,
+                    records_out: pre_correction,
                 })
                 .with_context(|| format!("writing extract metrics row to {}", path.display()))?;
             writer
                 .write_row(&MetricsRow {
                     stage: "correct".into(),
                     wall_time_secs: total_wall,
-                    records_in: records_out,
+                    records_in: pre_correction,
                     records_out,
                 })
                 .with_context(|| format!("writing correct metrics row to {}", path.display()))?;
@@ -544,21 +738,22 @@ impl ChainRunner for ExtractCorrectChainRunner {
         EXTRACT_CORRECT_CHAIN_RUNNER_NAME
     }
 
-    /// Match `(Extract, Correct)` when:
-    /// * a UMI source is provided (inline `--correct::umis` or
-    ///   `--correct::umi-files`); and
-    /// * none of the `--correct::rejects`, `--correct::metrics`, or
-    ///   `--correct::min-corrected` flags are set (those still gate the
-    ///   runner off and fall through to `NotImplementedRunner`; PR #329
-    ///   will wire them).
+    /// Match `(Extract, Correct)` whenever a UMI source is provided
+    /// (inline `--correct::umis` or `--correct::umi-files`).
+    ///
+    /// `--correct::metrics` and `--correct::min-corrected` are wired
+    /// through to per-thread accumulators inside `run_chain`, so they
+    /// don't gate the runner.
+    ///
+    /// `--correct::rejects` ALSO does not gate `supports()` — when set we
+    /// still want this runner to win over `NotImplementedRunner` so the
+    /// user sees the specific "tracked in #329 / #330" error from
+    /// [`run_chain`] instead of the generic fallthrough message.
     ///
     /// The top-level `--metrics` flag does NOT gate this runner — it is
     /// honoured directly by `run_chain`, which writes one `extract` row
     /// followed by one `correct` row to the supplied TSV.
     fn supports(&self, ctx: &DispatchContext<'_>) -> bool {
-        if !self.rejects_unset || !self.metrics_unset || !self.min_corrected_unset {
-            return false;
-        }
         if self.umis.is_empty() && self.umi_files.is_empty() {
             return false;
         }
@@ -755,7 +950,11 @@ mod tests {
     }
 
     #[test]
-    fn does_not_support_when_correct_rejects_set() {
+    fn supports_when_correct_rejects_set_so_run_can_emit_specific_error() {
+        // Lifted gate (this PR): we want the runner to claim the chain
+        // shape even when `--correct::rejects` is set, so the user sees
+        // the specific "tracked in #329 / #330" error from `run_chain`
+        // rather than the generic NotImplementedRunner fallthrough.
         let dir = tempfile::TempDir::new().unwrap();
         let mut runall = runall_for_extract_correct(
             vec![dir.path().join("r1.fq.gz"), dir.path().join("r2.fq.gz")],
@@ -765,13 +964,16 @@ mod tests {
         runall.correct_opts.correct_rejects = Some(dir.path().join("rejects.bam"));
         let runner = ExtractCorrectChainRunner::from_runall(&runall);
         assert!(
-            !runner.supports(&dispatch_ctx(StartFrom::Extract, StopAfter::Correct)),
-            "--correct::rejects must keep gating the runner off (PR #329)"
+            runner.supports(&dispatch_ctx(StartFrom::Extract, StopAfter::Correct)),
+            "--correct::rejects must NOT gate supports() — it routes through run_chain to fail \
+             with a specific error pointing at issues #329 and #330"
         );
     }
 
     #[test]
-    fn does_not_support_when_correct_metrics_set() {
+    fn supports_with_correct_metrics_set() {
+        // `--correct::metrics` is now wired through a per-thread accumulator
+        // in run_chain; the runner should claim the chain shape.
         let dir = tempfile::TempDir::new().unwrap();
         let mut runall = runall_for_extract_correct(
             vec![dir.path().join("r1.fq.gz"), dir.path().join("r2.fq.gz")],
@@ -781,13 +983,15 @@ mod tests {
         runall.correct_opts.correct_metrics = Some(dir.path().join("correct-metrics.tsv"));
         let runner = ExtractCorrectChainRunner::from_runall(&runall);
         assert!(
-            !runner.supports(&dispatch_ctx(StartFrom::Extract, StopAfter::Correct)),
-            "--correct::metrics must keep gating the runner off (PR #329)"
+            runner.supports(&dispatch_ctx(StartFrom::Extract, StopAfter::Correct)),
+            "--correct::metrics must no longer gate supports() (this PR)"
         );
     }
 
     #[test]
-    fn does_not_support_when_correct_min_corrected_set() {
+    fn supports_with_correct_min_corrected_set() {
+        // `--correct::min-corrected` is now enforced post-pipeline against
+        // the same accumulator; the runner should claim the chain shape.
         let dir = tempfile::TempDir::new().unwrap();
         let mut runall = runall_for_extract_correct(
             vec![dir.path().join("r1.fq.gz"), dir.path().join("r2.fq.gz")],
@@ -797,8 +1001,35 @@ mod tests {
         runall.correct_opts.correct_min_corrected = Some(0.5);
         let runner = ExtractCorrectChainRunner::from_runall(&runall);
         assert!(
-            !runner.supports(&dispatch_ctx(StartFrom::Extract, StopAfter::Correct)),
-            "--correct::min-corrected must keep gating the runner off (PR #329)"
+            runner.supports(&dispatch_ctx(StartFrom::Extract, StopAfter::Correct)),
+            "--correct::min-corrected must no longer gate supports() (this PR)"
+        );
+    }
+
+    #[test]
+    fn rejects_set_returns_specific_error_pointing_at_issues_329_330() {
+        // `supports()` now matches; the specific error must surface from
+        // `run_chain` itself (no need to actually open the FASTQs because
+        // the rejects check fires before any I/O).
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut runall = runall_for_extract_correct(
+            vec![dir.path().join("r1.fq.gz"), dir.path().join("r2.fq.gz")],
+            dir.path().join("out.bam"),
+            vec!["AAAAAAAA".to_string()],
+        );
+        runall.correct_opts.correct_rejects = Some(dir.path().join("rejects.bam"));
+        let runner = ExtractCorrectChainRunner::from_runall(&runall);
+        let err = runner
+            .run_chain("fgumi runall", &dir.path().join("ignored.bam"), None)
+            .expect_err("run_chain must bail when --correct::rejects is set");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("fulcrumgenomics/fgumi#329"),
+            "error must mention upstream issue #329; got: {msg}"
+        );
+        assert!(
+            msg.contains("fulcrumgenomics/fgumi#330"),
+            "error must mention upstream issue #330; got: {msg}"
         );
     }
 

@@ -329,18 +329,23 @@ impl MemoryEstimate for CorrectProcessedBatch {
 }
 
 /// Metrics collected from UMI correction processing, aggregated post-pipeline.
+///
+/// `pub(crate)` so the runall correct chain runners can build the same
+/// per-thread accumulator the standalone command uses, then call
+/// [`finalize_correct_metrics`] / replicate the `--min-corrected` threshold
+/// check without diverging from this command's behaviour.
 #[derive(Default)]
-struct CollectedCorrectMetrics {
+pub(crate) struct CollectedCorrectMetrics {
     /// Total templates processed.
-    templates_processed: u64,
+    pub(crate) templates_processed: u64,
     /// Records with missing UMI tag.
-    missing_umis: u64,
+    pub(crate) missing_umis: u64,
     /// Records with wrong UMI length.
-    wrong_length: u64,
+    pub(crate) wrong_length: u64,
     /// Records that didn't match any fixed UMI.
-    mismatched: u64,
+    pub(crate) mismatched: u64,
     /// Per-UMI match counts (for metrics file).
-    umi_matches: AHashMap<String, UmiCorrectionMetrics>,
+    pub(crate) umi_matches: AHashMap<String, UmiCorrectionMetrics>,
 }
 
 impl Command for CorrectUmis {
@@ -1463,7 +1468,11 @@ pub(crate) fn finalize_correct_metrics(
 /// Merges `counts` into `dst[umi]`, creating a zero-initialized entry if the
 /// key is absent. Uses `or_insert_with_key` so `umi` is only cloned on insert,
 /// not on hit.
-fn merge_umi_counts(
+///
+/// `pub(crate)` so the runall correct chain runners can reduce their own
+/// per-thread accumulators with the same semantics the standalone command
+/// uses.
+pub(crate) fn merge_umi_counts(
     dst: &mut AHashMap<String, UmiCorrectionMetrics>,
     umi: String,
     counts: &UmiCorrectionMetrics,
