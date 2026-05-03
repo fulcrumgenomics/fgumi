@@ -499,6 +499,7 @@ impl Filter {
                 &self.io.output,
                 None,
                 rejects_path,
+                None, // secondary uses resolved primary output header
                 grouper_fn,
                 process_fn,
                 serialize_fn,
