@@ -9,8 +9,8 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fgoxide::io::DelimFile;
 use fgumi_bam_io::{
-    RawBamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
-    create_optional_bam_writer, create_raw_bam_reader_with_opts, create_raw_bam_writer,
+    create_bam_reader_for_pipeline_with_opts, create_bam_writer, create_optional_bam_writer,
+    create_raw_bam_reader_with_opts,
 };
 
 use super::common::{
@@ -31,10 +31,11 @@ use crate::overlapping_consensus::{
 };
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::read_info::LibraryIndex;
-use crate::sam::{SamTag, header_as_unsorted};
+use crate::sam::SamTag;
 use crate::umi::extract_mi_base;
 use crate::unified_pipeline::{
     GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
+    run_bam_pipeline_from_reader_with_secondary,
 };
 use crate::validation::validate_file_exists;
 use fgumi_bam_io::ProgressTracker;
@@ -43,7 +44,6 @@ use fgumi_raw_bam::{RawRecord, RawRecordView};
 use log::info;
 use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
-use parking_lot::Mutex;
 use std::io;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
@@ -60,6 +60,9 @@ use super::common::{MethylationRef, load_methylation_reference};
 struct DuplexProcessedBatch {
     /// Consensus reads to write to output BAM
     consensus_output: ConsensusOutput,
+    /// Raw-byte rejected records (consensus-caller rejects), in batch-input
+    /// order. Empty unless `track_rejects` is true.
+    rejected_records: Vec<Vec<u8>>,
     /// Number of MI groups in this batch
     groups_count: u64,
     /// Consensus calling statistics for this batch
@@ -70,7 +73,9 @@ struct DuplexProcessedBatch {
 
 impl MemoryEstimate for DuplexProcessedBatch {
     fn estimate_heap_size(&self) -> usize {
-        self.consensus_output.data.capacity()
+        let rej_size: usize = self.rejected_records.iter().map(Vec::capacity).sum();
+        let rej_vec_overhead = self.rejected_records.capacity() * std::mem::size_of::<Vec<u8>>();
+        self.consensus_output.data.capacity() + rej_size + rej_vec_overhead
     }
 }
 
@@ -606,206 +611,187 @@ impl Duplex {
             extract_mi_base(&mi_str).to_string()
         };
 
-        // Open rejects writer up front. Rejected records are streamed straight
-        // to disk from process_fn, per-MI-group, so no batch-level buffering.
-        // Because workers flush under a mutex rather than through the ordered
-        // serialize stage, reject records are emitted in mutex-acquisition
-        // order, not input order; mark the rejects header as SO:unsorted so
-        // downstream tools don't assume the input's sort order carried over.
-        let rejects_writer: Option<Arc<Mutex<Option<RawBamWriter>>>> = if track_rejects {
-            if let Some(path) = self.rejects_opts.rejects.as_ref() {
-                let writer_threads = self.threading.num_threads();
-                let rejects_header = header_as_unsorted(&input_header);
-                let w = create_raw_bam_writer(
-                    path,
-                    &rejects_header,
-                    writer_threads,
-                    self.compression.compression_level,
-                )?;
-                Some(Arc::new(Mutex::new(Some(w))))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let rejects_writer_for_process = rejects_writer.as_ref().map(Arc::clone);
+        // Rejects flow through the unified pipeline's first-class secondary
+        // output (see correct.rs / simplex.rs / filter.rs for the shared
+        // pattern). `process_fn` collects caller-emitted rejects into
+        // `DuplexProcessedBatch::rejected_records`; the pipeline's
+        // `secondary_serialize_fn` writes them in batch-input order with the
+        // input header.
 
         let library_index = LibraryIndex::from_header(&input_header);
         pipeline_config.group_key_config = Some(GroupKeyConfig::new(library_index, cell_tag));
 
-        // Run the 7-step pipeline with the already-opened reader (supports streaming)
-        let pipeline_result = run_bam_pipeline_from_reader(
-            pipeline_config,
-            reader,
-            input_header,
-            &self.io.output,
-            Some(output_header.clone()),
-            // ========== grouper_fn: Create MiGrouper with filter, transform, and cell tag ==========
-            move |_header: &Header| {
-                Box::new(
-                    MiGrouper::with_filter_and_transform(
-                        "MI",
-                        batch_size,
-                        record_filter,
-                        mi_transform,
-                    )
+        // ========== grouper_fn ==========
+        let grouper_fn = move |_header: &Header| {
+            Box::new(
+                MiGrouper::with_filter_and_transform("MI", batch_size, record_filter, mi_transform)
                     .with_cell_tag(Some(*SamTag::CB)),
-                ) as Box<dyn Grouper<Group = MiGroupBatch> + Send>
-            },
-            // ========== process_fn: Duplex consensus calling ==========
-            move |batch: MiGroupBatch| -> io::Result<DuplexProcessedBatch> {
-                // Create per-thread duplex consensus caller
-                let mut caller = DuplexConsensusCaller::new(
-                    read_name_prefix.clone(),
-                    read_group_id.clone(),
-                    min_reads.clone(),
-                    min_input_base_quality,
-                    output_per_base_tags,
-                    trim,
-                    max_reads_per_strand,
-                    Some(cell_tag),
-                    track_rejects,
-                    error_rate_pre_umi,
-                    error_rate_post_umi,
-                )
-                .map_err(|e| {
-                    io::Error::other(format!("Failed to create DuplexConsensusCaller: {e}"))
+            ) as Box<dyn Grouper<Group = MiGroupBatch> + Send>
+        };
+
+        // ========== process_fn: Duplex consensus calling ==========
+        let process_fn = move |batch: MiGroupBatch| -> io::Result<DuplexProcessedBatch> {
+            // Create per-thread duplex consensus caller
+            let mut caller = DuplexConsensusCaller::new(
+                read_name_prefix.clone(),
+                read_group_id.clone(),
+                min_reads.clone(),
+                min_input_base_quality,
+                output_per_base_tags,
+                trim,
+                max_reads_per_strand,
+                Some(cell_tag),
+                track_rejects,
+                error_rate_pre_umi,
+                error_rate_post_umi,
+            )
+            .map_err(|e| {
+                io::Error::other(format!("Failed to create DuplexConsensusCaller: {e}"))
+            })?;
+
+            // Set reference for methylation-aware consensus if enabled
+            if let Some((ref reference, ref ref_names)) = methylation_ref {
+                caller.set_reference(
+                    Arc::clone(reference),
+                    Arc::clone(ref_names),
+                    methylation_mode,
+                );
+            }
+
+            // Create overlapping caller if enabled
+            let mut overlapping_caller = if overlapping_enabled {
+                Some(OverlappingBasesConsensusCaller::new(
+                    AgreementStrategy::Consensus,
+                    DisagreementStrategy::Consensus,
+                ))
+            } else {
+                None
+            };
+
+            let mut all_output = ConsensusOutput::default();
+            let mut batch_stats = ConsensusCallingStats::new();
+            let mut batch_overlapping = CorrectionStats::new();
+            let groups_count = batch.groups.len() as u64;
+            // Caller-emitted rejects collected per-batch and drained by the
+            // pipeline's secondary serializer.
+            let mut rejected_records: Vec<Vec<u8>> = Vec::new();
+
+            for MiGroup { mi, records: mut group_reads } in batch.groups {
+                caller.clear();
+
+                // Apply overlapping consensus if enabled (modifies raw bytes in-place).
+                // Skip if group doesn't have both strands — no duplex possible anyway.
+                // Propagate errors to match single-threaded behavior; silent drops here
+                // would turn real failures into output gaps in --threads mode only.
+                if let Some(ref mut oc) = overlapping_caller {
+                    if has_both_strands_raw(&group_reads) {
+                        oc.reset_stats();
+                        apply_overlapping_consensus(&mut group_reads, oc).map_err(|e| {
+                            io::Error::other(format!(
+                                "Overlapping consensus error for MI {mi}: {e}"
+                            ))
+                        })?;
+                        batch_overlapping.merge(oc.stats());
+                    }
+                }
+
+                // Call duplex consensus directly — records are already RawRecord values.
+                // Propagate errors to match single-threaded behavior; a warn-and-drop here
+                // would silently turn real failures (OOM, malformed records, etc.) into
+                // output gaps in --threads mode only.
+                let batch_output = caller.consensus_reads(group_reads).map_err(|e| {
+                    io::Error::other(format!("Duplex consensus error for MI {mi}: {e}"))
                 })?;
-
-                // Set reference for methylation-aware consensus if enabled
-                if let Some((ref reference, ref ref_names)) = methylation_ref {
-                    caller.set_reference(
-                        Arc::clone(reference),
-                        Arc::clone(ref_names),
-                        methylation_mode,
-                    );
-                }
-
-                // Create overlapping caller if enabled
-                let mut overlapping_caller = if overlapping_enabled {
-                    Some(OverlappingBasesConsensusCaller::new(
-                        AgreementStrategy::Consensus,
-                        DisagreementStrategy::Consensus,
-                    ))
-                } else {
-                    None
-                };
-
-                let mut all_output = ConsensusOutput::default();
-                let mut batch_stats = ConsensusCallingStats::new();
-                let mut batch_overlapping = CorrectionStats::new();
-                let groups_count = batch.groups.len() as u64;
-
-                // Stream per-MI-group rejects straight to disk so they don't
-                // accumulate in a batch-level Vec. The mutex only serializes the
-                // raw-byte append; BGZF compression runs on the writer's own
-                // thread pool.
-                let flush_byte_records = |recs: &[Vec<u8>]| -> io::Result<()> {
-                    if let Some(ref rw_arc) = rejects_writer_for_process {
-                        if !recs.is_empty() {
-                            let mut guard = rw_arc.lock();
-                            if let Some(w) = guard.as_mut() {
-                                for raw in recs {
-                                    w.write_raw_record(raw)?;
-                                }
-                            }
-                        }
-                    }
-                    Ok(())
-                };
-
-                for MiGroup { mi, records: mut group_reads } in batch.groups {
-                    caller.clear();
-
-                    // Apply overlapping consensus if enabled (modifies raw bytes in-place).
-                    // Skip if group doesn't have both strands — no duplex possible anyway.
-                    // Propagate errors to match single-threaded behavior; silent drops here
-                    // would turn real failures into output gaps in --threads mode only.
-                    if let Some(ref mut oc) = overlapping_caller {
-                        if has_both_strands_raw(&group_reads) {
-                            oc.reset_stats();
-                            apply_overlapping_consensus(&mut group_reads, oc).map_err(|e| {
-                                io::Error::other(format!(
-                                    "Overlapping consensus error for MI {mi}: {e}"
-                                ))
-                            })?;
-                            batch_overlapping.merge(oc.stats());
-                        }
-                    }
-
-                    // Call duplex consensus directly — records are already RawRecord values.
-                    // Propagate errors to match single-threaded behavior; a warn-and-drop here
-                    // would silently turn real failures (OOM, malformed records, etc.) into
-                    // output gaps in --threads mode only.
-                    let batch_output = caller.consensus_reads(group_reads).map_err(|e| {
-                        io::Error::other(format!("Duplex consensus error for MI {mi}: {e}"))
-                    })?;
-                    all_output.merge(batch_output);
-                    batch_stats.merge(&caller.statistics());
-                    if track_rejects {
-                        flush_byte_records(&caller.take_rejected_reads())?;
+                all_output.merge(batch_output);
+                batch_stats.merge(&caller.statistics());
+                if track_rejects {
+                    for raw in caller.take_rejected_reads() {
+                        rejected_records.push(raw);
                     }
                 }
-
-                Ok(DuplexProcessedBatch {
-                    consensus_output: all_output,
-                    groups_count,
-                    stats: batch_stats,
-                    overlapping_stats: if overlapping_enabled {
-                        Some(batch_overlapping)
-                    } else {
-                        None
-                    },
-                })
-            },
-            // ========== serialize_fn: Serialize + collect metrics ==========
-            move |processed: DuplexProcessedBatch,
-                  _header: &Header,
-                  output: &mut Vec<u8>|
-                  -> io::Result<u64> {
-                // Rejects were already streamed to disk in process_fn.
-                // Merge per-batch metrics into this worker's accumulator slot
-                let batch_stats = processed.stats;
-                let batch_overlapping = processed.overlapping_stats;
-                let groups_count = processed.groups_count;
-                collected_metrics_for_serialize.with_slot(|m| {
-                    m.stats.merge(&batch_stats);
-                    if let Some(o) = batch_overlapping {
-                        m.overlapping_stats.get_or_insert_with(CorrectionStats::new).merge(&o);
-                    }
-                    m.groups_processed += groups_count;
-                });
-
-                let count = processed.consensus_output.count as u64;
-                output.extend_from_slice(&processed.consensus_output.data);
-                Ok(count)
-            },
-        );
-
-        // Always finalize the rejects writer, even if the pipeline failed, so any
-        // partially written rejects BAM still gets a valid BGZF EOF block. Surface
-        // finish() failures alongside any pipeline error so neither is silently
-        // dropped.
-        let rejects_finish_result = rejects_writer
-            .and_then(|rw_arc| rw_arc.lock().take())
-            .map(|writer| writer.finish().context("Failed to finish rejects file"));
-
-        let groups_processed = match (pipeline_result, rejects_finish_result) {
-            (Ok(groups_processed), Some(Ok(()))) => {
-                info!("Rejected reads streamed to rejects file during processing");
-                groups_processed
             }
-            (Ok(groups_processed), None) => groups_processed,
-            (Ok(_), Some(Err(finish_err))) => return Err(finish_err),
-            (Err(pipeline_err), Some(Err(finish_err))) => {
-                return Err(anyhow::anyhow!(
-                    "Pipeline error: {pipeline_err}; additionally failed to finish rejects file: {finish_err}"
-                ));
+
+            Ok(DuplexProcessedBatch {
+                consensus_output: all_output,
+                rejected_records,
+                groups_count,
+                stats: batch_stats,
+                overlapping_stats: if overlapping_enabled { Some(batch_overlapping) } else { None },
+            })
+        };
+
+        // ========== serialize_fn: Serialize + collect metrics ==========
+        let serialize_fn = move |processed: DuplexProcessedBatch,
+                                 _header: &Header,
+                                 output: &mut Vec<u8>|
+              -> io::Result<u64> {
+            // Merge per-batch metrics into this worker's accumulator slot.
+            // Rejects are drained by `secondary_serialize_fn` separately.
+            let batch_stats = processed.stats;
+            let batch_overlapping = processed.overlapping_stats;
+            let groups_count = processed.groups_count;
+            collected_metrics_for_serialize.with_slot(|m| {
+                m.stats.merge(&batch_stats);
+                if let Some(o) = batch_overlapping {
+                    m.overlapping_stats.get_or_insert_with(CorrectionStats::new).merge(&o);
+                }
+                m.groups_processed += groups_count;
+            });
+
+            let count = processed.consensus_output.count as u64;
+            output.extend_from_slice(&processed.consensus_output.data);
+            Ok(count)
+        };
+
+        // ========== secondary_serialize_fn: Drain rejected records ==========
+        let secondary_serialize_fn = |batch: &DuplexProcessedBatch,
+                                      buf: &mut Vec<u8>|
+         -> io::Result<u64> {
+            for raw in &batch.rejected_records {
+                let block_size = u32::try_from(raw.len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("BAM record too large ({} bytes) for u32 block_size", raw.len()),
+                    )
+                })?;
+                buf.extend_from_slice(&block_size.to_le_bytes());
+                buf.extend_from_slice(raw);
             }
-            (Err(pipeline_err), _) => {
-                return Err(anyhow::anyhow!("Pipeline error: {pipeline_err}"));
-            }
+            Ok(batch.rejected_records.len() as u64)
+        };
+
+        // Run the 7-step pipeline with the already-opened reader (supports streaming).
+        // When `--rejects` is set, route rejects through the unified pipeline's
+        // first-class secondary output so they land in input/batch-serial order
+        // and the rejects BAM carries the input header.
+        let groups_processed = if let Some(rejects_path) = self.rejects_opts.rejects.as_ref() {
+            let secondary_header = input_header.clone();
+            run_bam_pipeline_from_reader_with_secondary(
+                pipeline_config,
+                reader,
+                input_header,
+                &self.io.output,
+                Some(output_header.clone()),
+                rejects_path,
+                Some(secondary_header),
+                grouper_fn,
+                process_fn,
+                serialize_fn,
+                secondary_serialize_fn,
+            )
+            .map_err(|e| anyhow::anyhow!("Pipeline error: {e}"))?
+        } else {
+            run_bam_pipeline_from_reader(
+                pipeline_config,
+                reader,
+                input_header,
+                &self.io.output,
+                Some(output_header.clone()),
+                grouper_fn,
+                process_fn,
+                serialize_fn,
+            )
+            .map_err(|e| anyhow::anyhow!("Pipeline error: {e}"))?
         };
 
         // ========== Post-pipeline: Aggregate metrics ==========
@@ -1723,6 +1709,7 @@ mod tests {
 
         let batch = DuplexProcessedBatch {
             consensus_output: ConsensusOutput { data, count: 1 },
+            rejected_records: Vec::new(),
             groups_count: 1,
             stats: ConsensusCallingStats::default(),
             overlapping_stats: None,
@@ -1730,6 +1717,35 @@ mod tests {
 
         let estimate = batch.estimate_heap_size();
         assert_eq!(estimate, 1024, "estimate should match consensus_output capacity");
+    }
+
+    #[test]
+    fn test_duplex_processed_batch_memory_estimate_with_rejects() {
+        let mut data = Vec::with_capacity(64);
+        data.extend_from_slice(&[0u8; 32]);
+
+        let mut rej_a = Vec::with_capacity(256);
+        rej_a.extend_from_slice(&[1u8; 8]);
+        let mut rej_b = Vec::with_capacity(128);
+        rej_b.extend_from_slice(&[2u8; 8]);
+        let rejected_records: Vec<Vec<u8>> = vec![rej_a, rej_b];
+        let rej_outer_capacity = rejected_records.capacity();
+
+        let batch = DuplexProcessedBatch {
+            consensus_output: ConsensusOutput { data, count: 0 },
+            rejected_records,
+            groups_count: 0,
+            stats: ConsensusCallingStats::default(),
+            overlapping_stats: None,
+        };
+
+        // 64 (consensus capacity) + 256 + 128 (per-rej capacities) + outer-vec capacity * size_of::<Vec<u8>>()
+        let expected = 64 + 256 + 128 + rej_outer_capacity * std::mem::size_of::<Vec<u8>>();
+        let estimate = batch.estimate_heap_size();
+        assert_eq!(
+            estimate, expected,
+            "estimate should include rejected_records capacities and outer-vec overhead",
+        );
     }
 
     #[rstest]

@@ -723,7 +723,7 @@ fn test_duplex_rejects_has_bgzf_eof() {
     assert!(status.success(), "duplex command with rejects failed");
     assert_has_bgzf_eof(&output_bam);
     assert_has_bgzf_eof(&rejects_bam);
-    assert_header_unsorted(&rejects_bam);
+    assert_rejects_header_matches_input(&rejects_bam, &input_bam);
 }
 
 #[test]

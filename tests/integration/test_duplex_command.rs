@@ -195,9 +195,9 @@ fn test_duplex_command_basic() {
 /// Runs the multi-threaded pipeline with `--min-reads 2` and a singleton /A
 /// template that fails the single-strand `min-reads` check. Verifies that:
 ///
-/// 1. The rejects BAM is created and has its `@HD` header rewritten to
-///    `SO:unsorted` because reject writes are emitted in mutex-acquisition
-///    order rather than input order.
+/// 1. The rejects BAM is created and its `@HD` sort fields (`SO`/`GO`/`SS`)
+///    match the input BAM, because rejects flow through the unified
+///    pipeline's secondary output in batch/input order.
 /// 2. The singleton template's raw records are actually streamed to the
 ///    rejects BAM rather than being silently dropped.
 #[test]
@@ -235,7 +235,7 @@ fn test_duplex_command_with_rejects() {
     assert!(status.success(), "Duplex command with rejects failed");
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 
-    crate::helpers::assertions::assert_header_unsorted(&rejects_bam);
+    crate::helpers::assertions::assert_rejects_header_matches_input(&rejects_bam, &input_bam);
 
     // The singleton /A template (R1 + R2) should be streamed to the rejects BAM.
     let mut reader = bam::io::Reader::new(fs::File::open(&rejects_bam).unwrap());
@@ -314,7 +314,7 @@ fn test_duplex_command_rejects_contain_no_duplicates() {
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 
     crate::helpers::assertions::assert_has_bgzf_eof(&rejects_bam);
-    crate::helpers::assertions::assert_header_unsorted(&rejects_bam);
+    crate::helpers::assertions::assert_rejects_header_matches_input(&rejects_bam, &input_bam);
 
     let mut reader = bam::io::Reader::new(fs::File::open(&rejects_bam).unwrap());
     let _header = reader.read_header().unwrap();
