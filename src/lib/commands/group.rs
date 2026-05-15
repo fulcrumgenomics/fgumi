@@ -14,7 +14,7 @@ use crate::logging::{OperationTimer, log_umi_grouping_summary};
 use crate::metrics::group::{FamilySizeMetrics, PositionGroupSizeMetrics, UmiGroupingMetrics};
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::read_info::LibraryIndex;
-use crate::sam::{is_sorted, is_template_coordinate_sorted};
+use crate::sam::is_template_coordinate_sorted;
 use crate::template::Template;
 use crate::umi::parallel_assigner::{
     ParallelAdjacencyAssigner, ParallelEditAssigner, ParallelIdentityAssigner,
@@ -41,7 +41,6 @@ use fgumi_raw_bam::{RawBamReader, RawRecord};
 use log::{info, warn};
 use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
-use noodles::sam::header::record::value::map::header::sort_order::QUERY_NAME;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -516,18 +515,18 @@ are grouped by template, and then templates are sorted by the 5' mapping positio
 the reads from the template, used from earliest mapping position to latest. Reads that
 have the same end positions are then sub-grouped by UMI sequence.
 
-Accepts reads in any order (including unsorted) and outputs reads sorted by:
+Requires input to be template-coordinate sorted (header must advertise
+SO:unsorted, GO:query, and SS:template-coordinate). Sort upstream sources
+(`fgumi extract`, `samtools sort -n`, `fgumi merge --order queryname`, etc.)
+with `fgumi sort -i input.bam -o sorted.bam --order template-coordinate`
+before piping into this tool. Output is always written in template-coordinate
+order, sorted by:
 
    1. The lower genome coordinate of the two outer ends of the templates (strand-aware)
    2. The sequencing library
    3. The cell barcode (CB tag, if present)
    4. The assigned UMI tag
    5. Read Name
-
-It is recommended to sort the reads into template-coordinate order prior to running
-this tool to avoid re-sorting the input. Use `fgumi sort --order template-coordinate`
-for the pre-sorting. The output will always be written
-in template-coordinate order.
 
 During grouping, reads and templates are filtered out as follows:
 
@@ -612,11 +611,15 @@ pub struct GroupReadsByUmi {
     #[arg(short = 'n', long = "include-non-pf-reads", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub include_non_pf_reads: bool,
 
-    /// Allow fully unmapped templates (both reads unmapped).
+    /// Allow fully unmapped templates (both reads unmapped). Input must be
+    /// template-coordinate sorted (`fgumi sort --order template-coordinate`).
     ///
     /// Groups unmapped reads by UMI only within each library/cell barcode.
     /// Useful for ribosome display or other protocols with unmapped reads.
-    /// When enabled, queryname-sorted input is also accepted.
+    /// Template-coordinate sort clusters unmapped reads by library/cell-barcode,
+    /// which is what the streaming grouper needs to see consecutive same-cell
+    /// reads. Queryname-sorted or FASTQ-order input (e.g. `fgumi extract`
+    /// output) is rejected — pipe through `fgumi sort` first.
     ///
     /// IMPORTANT: All unmapped reads are placed in a single position group,
     /// meaning reads with identical/similar UMIs will be grouped together
@@ -808,32 +811,22 @@ impl Command for GroupReadsByUmi {
         info!("Reading input BAM");
         let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
 
-        // Check sort order - template-coordinate sorted is required,
-        // but queryname-sorted is also accepted when --allow-unmapped is set
-        let is_tc_sorted = is_template_coordinate_sorted(&header);
-        let is_qname_sorted = is_sorted(&header, QUERY_NAME);
-
-        if !(is_tc_sorted || self.allow_unmapped && is_qname_sorted) {
-            if self.allow_unmapped {
-                bail!(
-                    "Input BAM must be template-coordinate sorted or queryname sorted \
-                    when --allow-unmapped is enabled.\n\n\
-                    To queryname sort your BAM file, run:\n  \
-                    samtools sort -n input.bam -o sorted.bam"
-                );
-            } else {
-                bail!(
-                    "Input BAM must be template-coordinate sorted.\n\n\
-                    To sort your BAM file, run:\n  \
-                    fgumi sort -i input.bam -o sorted.bam --order template-coordinate"
-                );
-            }
+        // Sort order: template-coordinate is the only accepted ordering. The streaming
+        // `RecordPositionGrouper` emits a group whenever the position key changes between
+        // consecutive records, so any input where records sharing a position key aren't
+        // already adjacent (queryname-sorted, coordinate-sorted, FASTQ-order, etc.) would
+        // be split into many small groups and assigned distinct MoleculeIds — silently
+        // wrong. Template-coordinate sort is what makes adjacency match the grouping key.
+        if !is_template_coordinate_sorted(&header) {
+            bail!(
+                "Input BAM must be template-coordinate sorted (header must advertise \
+                 SO:unsorted, GO:query, and SS:template-coordinate).\n\n\
+                 To sort your BAM file, run:\n  \
+                 fgumi sort -i input.bam -o sorted.bam --order template-coordinate"
+            );
         }
-
-        if is_tc_sorted {
-            info!("Input is template-coordinate sorted");
-        } else {
-            info!("Input is queryname sorted (accepted with --allow-unmapped)");
+        info!("Input is template-coordinate sorted");
+        if self.allow_unmapped {
             info!("All unmapped reads will form a single position group per library/cell");
         }
 
@@ -5589,8 +5582,11 @@ mod tests {
     // Tests for --allow-unmapped feature
     // ========================================================================
 
-    /// Create a minimal SAM header for testing with queryname sort order
-    fn create_queryname_sorted_header() -> sam::Header {
+    /// Create a minimal SAM header advertising template-coordinate sort order
+    /// (SO:unsorted GO:query SS:template-coordinate). Used by `--allow-unmapped`
+    /// tests now that template-coordinate is the only accepted sort order for
+    /// `fgumi group`.
+    fn create_template_coordinate_sorted_header() -> sam::Header {
         use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
         use noodles::sam::header::record::value::{
             Map as HeaderRecordMap,
@@ -5599,11 +5595,14 @@ mod tests {
 
         let mut builder = sam::Header::builder();
 
-        // Add header with queryname sort order
         let HeaderTag::Other(so_tag) = HeaderTag::from([b'S', b'O']) else { unreachable!() };
+        let HeaderTag::Other(go_tag) = HeaderTag::from([b'G', b'O']) else { unreachable!() };
+        let HeaderTag::Other(ss_tag) = HeaderTag::from([b'S', b'S']) else { unreachable!() };
 
         let map = HeaderRecordMap::<HeaderRecord>::builder()
-            .insert(so_tag, "queryname")
+            .insert(so_tag, "unsorted")
+            .insert(go_tag, "query")
+            .insert(ss_tag, "template-coordinate")
             .build()
             .expect("valid header record");
         builder = builder.set_header(map);
@@ -5616,6 +5615,38 @@ mod tests {
             ),
         );
 
+        builder.build()
+    }
+
+    /// Create a minimal SAM header advertising the given SO/GO/SS triple. Used by
+    /// rejection tests to cover every non-template-coordinate ordering `fgumi group`
+    /// is expected to reject.
+    fn create_header_with_sort_tags(so: &str, go: Option<&str>, ss: Option<&str>) -> sam::Header {
+        use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
+        use noodles::sam::header::record::value::{
+            Map as HeaderRecordMap,
+            map::{Header as HeaderRecord, Tag as HeaderTag},
+        };
+
+        let mut builder = sam::Header::builder();
+        let HeaderTag::Other(so_tag) = HeaderTag::from([b'S', b'O']) else { unreachable!() };
+        let HeaderTag::Other(go_tag) = HeaderTag::from([b'G', b'O']) else { unreachable!() };
+        let HeaderTag::Other(ss_tag) = HeaderTag::from([b'S', b'S']) else { unreachable!() };
+
+        let mut map_builder = HeaderRecordMap::<HeaderRecord>::builder().insert(so_tag, so);
+        if let Some(go_val) = go {
+            map_builder = map_builder.insert(go_tag, go_val);
+        }
+        if let Some(ss_val) = ss {
+            map_builder = map_builder.insert(ss_tag, ss_val);
+        }
+        builder = builder.set_header(map_builder.build().expect("valid header record"));
+        builder = builder.add_reference_sequence(
+            BString::from("chr1"),
+            Map::<ReferenceSequence>::new(
+                NonZeroUsize::new(248_956_422).expect("non-zero chr1 length"),
+            ),
+        );
         builder.build()
     }
 
@@ -5644,12 +5675,14 @@ mod tests {
         (r1, r2)
     }
 
-    /// Write records to a temporary BAM file with queryname sorted header
-    fn create_queryname_sorted_test_bam(
+    /// Write records to a temporary BAM file advertising template-coordinate sort order.
+    /// Used by `--allow-unmapped` tests — template-coordinate is the only accepted
+    /// input sort order for `fgumi group`.
+    fn create_template_coordinate_sorted_test_bam(
         records: Vec<fgumi_raw_bam::RawRecord>,
     ) -> Result<NamedTempFile> {
         let temp_file = NamedTempFile::new()?;
-        let header = create_queryname_sorted_header();
+        let header = create_template_coordinate_sorted_header();
 
         let mut writer = bam::io::writer::Builder.build_from_path(temp_file.path())?;
 
@@ -5663,6 +5696,29 @@ mod tests {
 
         drop(writer); // Ensure file is flushed
 
+        Ok(temp_file)
+    }
+
+    /// Write records to a temporary BAM file with the given SO/GO/SS sort tags.
+    /// Used by rejection tests to cover every non-template-coordinate ordering
+    /// `fgumi group` is expected to reject.
+    fn create_test_bam_with_sort_tags(
+        records: Vec<fgumi_raw_bam::RawRecord>,
+        so: &str,
+        go: Option<&str>,
+        ss: Option<&str>,
+    ) -> Result<NamedTempFile> {
+        let temp_file = NamedTempFile::new()?;
+        let header = create_header_with_sort_tags(so, go, ss);
+
+        let mut writer = bam::io::writer::Builder.build_from_path(temp_file.path())?;
+        writer.write_header(&header)?;
+        for record in &records {
+            let record_buf =
+                raw_record_to_record_buf(record, &header).map_err(std::io::Error::other)?;
+            writer.write_alignment_record(&header, &record_buf)?;
+        }
+        drop(writer);
         Ok(temp_file)
     }
 
@@ -5737,7 +5793,7 @@ mod tests {
         records.push(r1_d);
         records.push(r2_d);
 
-        let input = create_queryname_sorted_test_bam(records)?;
+        let input = create_template_coordinate_sorted_test_bam(records)?;
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
@@ -5774,7 +5830,7 @@ mod tests {
         records.push(r1_b);
         records.push(r2_b);
 
-        let input = create_queryname_sorted_test_bam(records)?;
+        let input = create_template_coordinate_sorted_test_bam(records)?;
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
@@ -5888,7 +5944,7 @@ mod tests {
             records.push(r2);
         }
 
-        let input = create_queryname_sorted_test_bam(records)?;
+        let input = create_template_coordinate_sorted_test_bam(records)?;
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
@@ -5910,6 +5966,61 @@ mod tests {
         // All records with same UMI should be in one group
         let unique_groups = count_unique_mi_tags(&output_records);
         assert_eq!(unique_groups, 1, "All records with same UMI should be in 1 group");
+
+        Ok(())
+    }
+
+    /// `fgumi group` only accepts template-coordinate-sorted input — even with
+    /// `--allow-unmapped`. Every non-template-coordinate header (queryname,
+    /// extract-style `SO:unsorted GO:query` without `SS`, or `SS` set to anything
+    /// other than `template-coordinate`) must be rejected with a clear error
+    /// pointing at `fgumi sort`. Both `--allow-unmapped` modes are exercised so
+    /// the rejection is not gated on that flag.
+    ///
+    /// The `extract_style_no_ss` case is the direct regression test for the
+    /// silent-acceptance bug: `fgumi extract` emits `SO:unsorted GO:query` with
+    /// no `SS`, and the previous lenient check treated that as template-coordinate.
+    #[rstest]
+    #[case::queryname("queryname", None, None)]
+    #[case::extract_style_no_ss("unsorted", Some("query"), None)]
+    #[case::wrong_ss_value("unsorted", Some("query"), Some("coordinate"))]
+    #[case::wrong_so_with_ss("coordinate", Some("query"), Some("template-coordinate"))]
+    #[case::missing_go_with_ss("unsorted", None, Some("template-coordinate"))]
+    fn test_group_rejects_non_template_coordinate_input(
+        #[case] so: &str,
+        #[case] go: Option<&str>,
+        #[case] ss: Option<&str>,
+        #[values(true, false)] allow_unmapped: bool,
+    ) -> Result<()> {
+        let (r1, r2) = build_unmapped_test_pair("read_a", "AAAAAA");
+        let input = create_test_bam_with_sort_tags(vec![r1, r2], so, go, ss)?;
+        let paths = TestPaths::new()?;
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
+            allow_unmapped,
+            ..test_group_cmd(Strategy::Identity, 0)
+        };
+
+        let err =
+            cmd.execute("test").expect_err("non-template-coordinate-sorted input must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("template-coordinate"),
+            "error should mention template-coordinate: {msg}",
+        );
+        assert!(
+            msg.contains("SS:template-coordinate"),
+            "error should mention the SS:template-coordinate tag specifically: {msg}",
+        );
+        assert!(
+            msg.contains("fgumi sort"),
+            "error should point at `fgumi sort` as the remediation: {msg}",
+        );
 
         Ok(())
     }

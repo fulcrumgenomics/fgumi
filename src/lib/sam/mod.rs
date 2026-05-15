@@ -15,9 +15,12 @@ pub use fgumi_sam::SamTag;
 // Re-export TC (template-coordinate) sort-key tag and parser
 pub use fgumi_sam::{TC_TAG, TemplateCoordinateInfo};
 
-// Re-export top-level functions from fgumi-sam
+// Re-export top-level functions from fgumi-sam.
+// `is_sorted` stays public in fgumi-sam (published crate) but is no longer
+// re-exported here — nothing in the `fgumi` binary uses it directly, and
+// `check_sort` calls it internally within fgumi-sam.
 pub use fgumi_sam::{
-    buf_value_to_smallest_signed_int, check_sort, header_as_unsorted, is_sorted,
+    buf_value_to_smallest_signed_int, check_sort, header_as_unsorted,
     is_template_coordinate_sorted, revcomp_buf_value, reverse_buf_value, to_smallest_signed_int,
 };
 

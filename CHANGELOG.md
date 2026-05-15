@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- [**breaking**] `fgumi group`, `fgumi dedup`, and `fgumi downsample` now strictly require template-coordinate sorted input — the header must advertise `SO:unsorted`, `GO:query`, **and** `SS:template-coordinate`. The previous implementation accepted any `SO:unsorted GO:query` header even without `SS:template-coordinate`, which caused `fgumi extract` output (FASTQ-order, no `SS`) and other queryname-grouped BAMs to be silently treated as template-coordinate sorted. Because the streaming `RecordPositionGrouper` requires records sharing a position key to be consecutive, this could split a single true molecule across multiple position groups and assign distinct `MI` tags to reads that should share one. The `--allow-unmapped` queryname-sort shortcut has also been removed for the same reason. To migrate: insert `fgumi sort --order template-coordinate` between extract (or any non-TC source) and `fgumi group`/`dedup`/`downsample`.
+
 ### Refactor
 
 - Extracted the sort engine into the new `fgumi-sort` crate and the BAM-pipeline I/O layer into the new `fgumi-bam-io` crate. The main `fgumi` binary now consumes both as workspace dependencies; behavior is unchanged.
