@@ -93,6 +93,51 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use std::cmp::{max, min};
 use std::collections::HashMap;
+use thiserror::Error;
+
+/// Typed errors returned by [`CodecConsensusCaller::consensus_reads_typed`].
+///
+/// The two `DuplexDisagreement*` variants are *recoverable rejects* — callers
+/// (see `src/lib/commands/codec.rs`) drop the offending MI group and keep
+/// processing. Any other failure is wrapped in [`CodecConsensusError::Other`]
+/// and treated as fatal.
+///
+/// Discriminating these from genuine errors via [`Self::is_duplex_disagreement`]
+/// avoids matching on `to_string()` substrings: see issue #338.
+#[derive(Debug, Error)]
+pub enum CodecConsensusError {
+    /// Number of duplex disagreements exceeded `max_duplex_disagreements`.
+    #[error("High duplex disagreement: {disagreements} disagreements")]
+    DuplexDisagreementCount {
+        /// Observed disagreement count.
+        disagreements: usize,
+    },
+    /// Rate of duplex disagreements exceeded `max_duplex_disagreement_rate`.
+    #[error("High duplex disagreement rate: {rate:.4}")]
+    DuplexDisagreementRate {
+        /// Observed disagreement rate, in [0.0, 1.0].
+        rate: f64,
+    },
+    /// Any other failure during consensus calling (parsing, malformed records,
+    /// option validation, etc.). Not recoverable by the call sites.
+    ///
+    /// The payload is an opaque [`anyhow::Error`]; downstream consumers should
+    /// treat this variant as fatal and propagate it (e.g. via
+    /// [`anyhow::Error::from`]) rather than introspect it further. Embedding
+    /// `anyhow::Error` keeps the existing fgumi call sites zero-cost; if
+    /// `fgumi-consensus` is ever consumed standalone this boundary may need to
+    /// be revisited.
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+impl CodecConsensusError {
+    /// Returns `true` if this error is a recoverable duplex-disagreement reject.
+    #[must_use]
+    pub fn is_duplex_disagreement(&self) -> bool {
+        matches!(self, Self::DuplexDisagreementCount { .. } | Self::DuplexDisagreementRate { .. })
+    }
+}
 
 /// Options for CODEC consensus calling
 #[derive(Debug, Clone)]
@@ -528,7 +573,10 @@ impl CodecConsensusCaller {
         clippy::too_many_lines,
         reason = "consensus pipeline has many sequential steps that are clearest in one function"
     )]
-    fn consensus_reads_raw(&mut self, records: &[RawRecord]) -> Result<ConsensusOutput> {
+    fn consensus_reads_raw(
+        &mut self,
+        records: &[RawRecord],
+    ) -> std::result::Result<ConsensusOutput, CodecConsensusError> {
         self.stats.total_input_reads += records.len() as u64;
 
         if records.is_empty() {
@@ -1026,11 +1074,15 @@ impl CodecConsensusCaller {
     ///
     /// Single-strand positions (where only one strand has data) preserve their
     /// original qualities from the single-strand consensus, matching fgbio's behavior.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "per-position duplex consensus folds together base-call resolution, quality math, and disagreement bookkeeping; splitting would obscure the per-position state machine"
+    )]
     fn build_duplex_consensus_from_padded(
         &mut self,
         ss_a: &SingleStrandConsensus,
         ss_b: &SingleStrandConsensus,
-    ) -> Result<SingleStrandConsensus> {
+    ) -> std::result::Result<SingleStrandConsensus, CodecConsensusError> {
         let len = ss_a.bases.len();
         assert_eq!(ss_b.bases.len(), len, "Padded consensuses must be the same length");
 
@@ -1158,10 +1210,14 @@ impl CodecConsensusCaller {
             self.stats.duplex_disagreement_base_count += duplex_disagreements as u64;
 
             if duplex_disagreements > self.options.max_duplex_disagreements {
-                anyhow::bail!("High duplex disagreement: {duplex_disagreements} disagreements");
+                return Err(CodecConsensusError::DuplexDisagreementCount {
+                    disagreements: duplex_disagreements,
+                });
             }
             if duplex_error_rate > self.options.max_duplex_disagreement_rate {
-                anyhow::bail!("High duplex disagreement rate: {duplex_error_rate:.4}");
+                return Err(CodecConsensusError::DuplexDisagreementRate {
+                    rate: duplex_error_rate,
+                });
             }
         }
 
@@ -1372,20 +1428,39 @@ impl CodecConsensusCaller {
         *self.stats.rejection_reasons.entry(reason).or_insert(0) += count;
         self.stats.reads_filtered += count as u64;
     }
-}
 
-/// Implementation of the `ConsensusCaller` trait for CODEC consensus calling.
-///
-/// This allows `CodecConsensusCaller` to be used polymorphically with other
-/// consensus callers (e.g., `VanillaUmiConsensusCaller`, `DuplexConsensusCaller`).
-impl ConsensusCaller for CodecConsensusCaller {
-    fn consensus_reads(&mut self, records: Vec<RawRecord>) -> Result<ConsensusOutput> {
+    /// Calls consensus and returns a typed [`CodecConsensusError`] so callers can
+    /// distinguish recoverable duplex disagreements (see
+    /// [`CodecConsensusError::is_duplex_disagreement`]) from fatal failures
+    /// without matching on `to_string()` substrings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecConsensusError::DuplexDisagreementCount`] or
+    /// [`CodecConsensusError::DuplexDisagreementRate`] when the consensus
+    /// exceeds the configured disagreement thresholds (recoverable), or
+    /// [`CodecConsensusError::Other`] for any other failure (fatal).
+    pub fn consensus_reads_typed(
+        &mut self,
+        records: Vec<RawRecord>,
+    ) -> std::result::Result<ConsensusOutput, CodecConsensusError> {
         let result = self.consensus_reads_raw(&records)?;
         // When a group fails to produce consensus, all its records are rejected
         if self.track_rejects && result.count == 0 && !records.is_empty() {
             self.rejected_reads.extend(records.into_iter().map(RawRecord::into_inner));
         }
         Ok(result)
+    }
+}
+
+/// Implementation of the `ConsensusCaller` trait for CODEC consensus calling.
+///
+/// This allows `CodecConsensusCaller` to be used polymorphically with other
+/// consensus callers (e.g., `VanillaUmiConsensusCaller`, `DuplexConsensusCaller`).
+/// The typed-error entry point is [`CodecConsensusCaller::consensus_reads_typed`].
+impl ConsensusCaller for CodecConsensusCaller {
+    fn consensus_reads(&mut self, records: Vec<RawRecord>) -> Result<ConsensusOutput> {
+        self.consensus_reads_typed(records).map_err(anyhow::Error::from)
     }
 
     #[expect(
@@ -2584,6 +2659,80 @@ mod tests {
         // (positions covered by only one strand count as disagreements)
         let cons2 = caller_strict.consensus_reads_from_sam_records(reads2);
         assert!(cons2.is_err(), "Should reject consensus with strict disagreement settings");
+    }
+
+    /// Builds the same FR pair used by `test_not_emit_consensus_high_disagreement`
+    /// — single-strand positions (10 on each side of the overlap) count as
+    /// disagreements, so the fixture produces >0 disagreement count and a
+    /// non-zero disagreement rate. The two `test_consensus_reads_typed_*`
+    /// tests rely on this to pin down which variant fires.
+    fn duplex_disagreement_fixture() -> Vec<RawRecord> {
+        create_fr_pair(
+            "read1",
+            1,
+            11,
+            30,
+            35,
+            &[(Kind::Match, 30)],
+            &[(Kind::Match, 30)],
+            "hi",
+            Some("ACC-TGA"),
+            false,
+            true,
+        )
+    }
+
+    /// Verifies that `consensus_reads_typed` returns the typed
+    /// [`CodecConsensusError::DuplexDisagreementCount`] variant when the
+    /// count threshold is the limiting factor — the contract relied on by
+    /// `src/lib/commands/codec.rs` (issue #338).
+    #[test]
+    fn test_consensus_reads_typed_disagreement_count() {
+        // Permissive rate (1.0) ensures the count check at codec_caller.rs's
+        // `duplex_disagreements > max_duplex_disagreements` is the only thing
+        // that can fire; max=0 with >0 disagreements forces the Count variant.
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            min_duplex_length: 1,
+            max_duplex_disagreements: 0,
+            max_duplex_disagreement_rate: 1.0,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        let Err(err) = caller.consensus_reads_typed(duplex_disagreement_fixture()) else {
+            panic!("zero-tolerance count threshold should produce an error");
+        };
+        assert!(
+            matches!(err, CodecConsensusError::DuplexDisagreementCount { .. }),
+            "expected DuplexDisagreementCount, got: {err:?}"
+        );
+        assert!(err.is_duplex_disagreement());
+    }
+
+    /// Verifies that `consensus_reads_typed` returns the typed
+    /// [`CodecConsensusError::DuplexDisagreementRate`] variant when the rate
+    /// threshold is the limiting factor (count threshold set high enough to
+    /// not fire first).
+    #[test]
+    fn test_consensus_reads_typed_disagreement_rate() {
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            min_duplex_length: 1,
+            max_duplex_disagreements: usize::MAX,
+            max_duplex_disagreement_rate: 0.0,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        let Err(err) = caller.consensus_reads_typed(duplex_disagreement_fixture()) else {
+            panic!("zero-tolerance rate threshold should produce an error");
+        };
+        assert!(
+            matches!(err, CodecConsensusError::DuplexDisagreementRate { .. }),
+            "expected DuplexDisagreementRate, got: {err:?}"
+        );
+        assert!(err.is_duplex_disagreement());
     }
 
     /// Port of fgbio test: "make a consensus where R2 has a deletion outside of the overlap region"
