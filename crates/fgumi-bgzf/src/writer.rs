@@ -69,16 +69,17 @@ impl InlineBgzfCompressor {
     ///
     /// # Arguments
     ///
-    /// * `compression_level` - Compression level (1-12, higher = smaller but slower).
-    ///   Level 1 is fastest compression, level 6 is a good balance.
+    /// * `compression_level` - Compression level (0-12, higher = smaller but slower).
+    ///   Level 0 disables compression (stored deflate blocks), level 1 is the
+    ///   fastest compression, and level 6 is a good balance. Values outside
+    ///   `0..=12` fall back to level 6.
     ///
     /// # Panics
     ///
     /// Panics if compression level 6 is rejected by the bgzf library (should never happen).
     #[must_use]
     pub fn new(compression_level: u32) -> Self {
-        let level = u8::try_from(compression_level.clamp(1, 12))
-            .expect("value in [1, 12] always fits in u8");
+        let level = u8::try_from(compression_level).unwrap_or(u8::MAX);
         let compression_level_obj = CompressionLevel::new(level)
             .unwrap_or_else(|_| CompressionLevel::new(6).expect("compression level 6 is valid"));
         let compressor = BgzfCompressor::new(compression_level_obj);
@@ -372,6 +373,44 @@ mod tests {
 
         // Should be empty since no data was written
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn test_compression_level_zero_is_uncompressed() {
+        // Highly compressible data: 32 KiB of zeros. At any real compression level
+        // (>= 1) this collapses to a tiny block. At level 0 libdeflate emits stored
+        // deflate blocks, so the BGZF payload is at least as large as the input.
+        // If level 0 is silently clamped up to level 1, the size assertion fails.
+        let data = vec![0u8; 32 * 1024];
+
+        let mut compressor_l0 = InlineBgzfCompressor::new(0);
+        compressor_l0.write_all(&data).expect("level 0 write should succeed");
+        compressor_l0.flush().expect("level 0 flush should succeed");
+        let blocks_l0 = compressor_l0.take_blocks();
+        assert_eq!(blocks_l0.len(), 1, "expected a single BGZF block");
+        let size_l0 = blocks_l0[0].data.len();
+
+        let mut compressor_l1 = InlineBgzfCompressor::new(1);
+        compressor_l1.write_all(&data).expect("level 1 write should succeed");
+        compressor_l1.flush().expect("level 1 flush should succeed");
+        let blocks_l1 = compressor_l1.take_blocks();
+        let size_l1 = blocks_l1[0].data.len();
+
+        assert!(
+            size_l1 < 1024,
+            "sanity: level 1 must compress 32 KiB of zeros to < 1 KiB (got {size_l1} bytes)"
+        );
+        assert!(
+            size_l0 >= data.len(),
+            "level 0 must be uncompressed (>= {} bytes), got {size_l0} bytes",
+            data.len()
+        );
+
+        let mut decompressor = libdeflater::Decompressor::new();
+        let mut out = Vec::new();
+        crate::reader::decompress_block_slice_into(&blocks_l0[0].data, &mut decompressor, &mut out)
+            .expect("decompression of level-0 block should succeed");
+        assert_eq!(out, data, "level-0 BGZF block must round-trip to the input");
     }
 
     #[test]
