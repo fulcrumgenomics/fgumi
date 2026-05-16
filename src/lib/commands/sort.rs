@@ -276,7 +276,7 @@ pub struct Sort {
     /// ratios for BAM-record data; we default to zstd because spill files
     /// are internal to the sort and never read by other tools. Pass `bgzf`
     /// to fall back to the legacy on-disk format.
-    #[arg(long = "temp-codec", default_value = "bgzf")]
+    #[arg(long = "temp-codec", default_value = "zstd")]
     pub temp_codec: fgumi_sort::SpillCodec,
 
     /// Write BAM index (.bai) alongside output.
@@ -811,6 +811,22 @@ mod tests {
         assert_eq!(sort.tmp_dirs, expected);
     }
 
+    /// Pin the `--temp-codec` parser default and explicit override so a flipped
+    /// default (or a removed `default_value`) fails at unit-test time.
+    #[rstest]
+    #[case::default_omitted(&[], fgumi_sort::SpillCodec::Zstd)]
+    #[case::explicit_zstd(&["--temp-codec", "zstd"], fgumi_sort::SpillCodec::Zstd)]
+    #[case::explicit_bgzf(&["--temp-codec", "bgzf"], fgumi_sort::SpillCodec::Bgzf)]
+    fn test_clap_temp_codec_default(
+        #[case] extra: &[&str],
+        #[case] expected: fgumi_sort::SpillCodec,
+    ) {
+        let base = ["sort", "-i", "in.bam", "-o", "out.bam", "--order", "coordinate"];
+        let args: Vec<&str> = base.iter().copied().chain(extra.iter().copied()).collect();
+        let sort = Sort::try_parse_from(args).expect("parse should succeed");
+        assert_eq!(sort.temp_codec, expected);
+    }
+
     /// Helper to construct a `Sort` struct with a given order.
     fn make_sort(order: SortOrderArg) -> Sort {
         Sort {
@@ -1116,6 +1132,24 @@ mod tests {
         let sort = Sort { verify: true, write_index: true, ..make_sort(SortOrderArg::Coordinate) };
         let err = sort.execute("test").unwrap_err();
         assert!(err.to_string().contains("--write-index cannot be used with --verify"));
+    }
+
+    #[test]
+    fn test_temp_compression_zero_with_zstd_rejected() {
+        let sort = Sort {
+            output: Some(PathBuf::from("out.bam")),
+            temp_compression: 0,
+            temp_codec: fgumi_sort::SpillCodec::Zstd,
+            ..make_sort(SortOrderArg::Coordinate)
+        };
+        // Call execute_sort directly to bypass the input-file existence check
+        // in execute(); the codec validation lives inside execute_sort.
+        let err = sort.execute_sort("test").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--temp-compression 0 is only supported with --temp-codec bgzf"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
