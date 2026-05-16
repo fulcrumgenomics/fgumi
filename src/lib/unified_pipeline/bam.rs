@@ -3311,22 +3311,24 @@ where
                 // Step 6: Process
                 let processed = (fns.process_fn)(group)?;
 
-                // Step 7a: Secondary serialize (borrows processed)
-                buffers.secondary.clear();
-                if let Some(ref secondary_fn) = fns.secondary_serialize_fn {
-                    (secondary_fn)(&processed, &mut buffers.secondary)?;
-                }
-
-                // Step 7b: Primary serialize (consumes processed, reuse buffer).
-                // Run the optional MI Assign hook first so any per-template
-                // rewriting it does is reflected in the bytes serialize
-                // emits.
-                buffers.serialized.clear();
+                // Step 7a: Run the optional MI Assign hook so any per-template
+                // rewriting it does is reflected in BOTH outputs. The parallel
+                // path runs MI Assign before secondary_serialize, so doing it
+                // here keeps single-threaded byte-for-byte equivalent.
                 let processed = run_mi_assign_single_threaded(
                     fns.mi_assign_fn.as_deref(),
                     &mut next_serial,
                     processed,
                 )?;
+
+                // Step 7b: Secondary serialize (borrows processed)
+                buffers.secondary.clear();
+                if let Some(ref secondary_fn) = fns.secondary_serialize_fn {
+                    (secondary_fn)(&processed, &mut buffers.secondary)?;
+                }
+
+                // Step 7c: Primary serialize (consumes processed, reuse buffer).
+                buffers.serialized.clear();
                 let record_count = (fns.serialize_fn)(processed, &mut buffers.serialized)?;
 
                 // Step 8: Compress (only when buffer reaches 64KB)
@@ -3357,17 +3359,20 @@ where
             for group in groups {
                 let processed = (fns.process_fn)(group)?;
 
+                // Run MI Assign first so secondary_serialize sees the same
+                // post-assign state as the parallel path (matches Step 7 above).
+                let processed = run_mi_assign_single_threaded(
+                    fns.mi_assign_fn.as_deref(),
+                    &mut next_serial,
+                    processed,
+                )?;
+
                 buffers.secondary.clear();
                 if let Some(ref secondary_fn) = fns.secondary_serialize_fn {
                     (secondary_fn)(&processed, &mut buffers.secondary)?;
                 }
 
                 buffers.serialized.clear();
-                let processed = run_mi_assign_single_threaded(
-                    fns.mi_assign_fn.as_deref(),
-                    &mut next_serial,
-                    processed,
-                )?;
                 let record_count = (fns.serialize_fn)(processed, &mut buffers.serialized)?;
                 compressor.write_all(&buffers.serialized)?;
                 compressor.maybe_compress()?;
@@ -3389,21 +3394,22 @@ where
         // Step 6: Process
         let processed = (fns.process_fn)(final_group)?;
 
-        // Step 7a: Secondary serialize (borrows processed)
-        buffers.secondary.clear();
-        if let Some(ref secondary_fn) = fns.secondary_serialize_fn {
-            (secondary_fn)(&processed, &mut buffers.secondary)?;
-        }
-
-        // Step 7b: Primary serialize (consumes processed, reuse buffer).
-        // Run the MI Assign hook first so the bytes reflect any per-template
-        // rewriting it performs.
-        buffers.serialized.clear();
+        // Step 7a: Run MI Assign first so per-template rewriting is reflected
+        // in BOTH outputs and matches the parallel path's ordering.
         let processed = run_mi_assign_single_threaded(
             fns.mi_assign_fn.as_deref(),
             &mut next_serial,
             processed,
         )?;
+
+        // Step 7b: Secondary serialize (borrows processed)
+        buffers.secondary.clear();
+        if let Some(ref secondary_fn) = fns.secondary_serialize_fn {
+            (secondary_fn)(&processed, &mut buffers.secondary)?;
+        }
+
+        // Step 7c: Primary serialize (consumes processed, reuse buffer).
+        buffers.serialized.clear();
         let record_count = (fns.serialize_fn)(processed, &mut buffers.serialized)?;
 
         // Step 8: Compress (only when buffer reaches 64KB)
@@ -4229,11 +4235,36 @@ where
 
 /// Run a BAM pipeline from an already-opened reader, with a secondary output file.
 ///
+/// Pick the header that the rejects (secondary) BAM should advertise.
+///
+/// `None` falls back to the resolved primary output header — that matches
+/// `filter.rs`'s prior behavior, where rejects share the primary's header.
+/// Consensus commands pass `Some(input_header)` so the rejects BAM carries
+/// the raw-input header rather than the consensus output header.
+#[inline]
+fn resolve_secondary_header(
+    secondary_output_header: Option<&Header>,
+    primary_output_header: &Header,
+) -> Header {
+    secondary_output_header.cloned().unwrap_or_else(|| primary_output_header.clone())
+}
+
 /// This variant routes rejected/secondary records through the pipeline's ordering
 /// infrastructure so both primary and secondary output files maintain input order.
 ///
 /// The secondary serialize function is called with a borrow of the processed batch
 /// BEFORE the primary serialize function consumes it.
+///
+/// # Parameters
+///
+/// - `output_header`: header for the primary output BAM. `None` reuses
+///   `input_header`.
+/// - `secondary_output_header`: header for the rejects (secondary) BAM. `None`
+///   reuses the resolved primary `output_header` — the filter-style case where
+///   primary and secondary share a header. Consensus commands pass
+///   `Some(input_header)` so the rejects BAM advertises the raw-input header
+///   (with the input's RG/PG/contig metadata and sort order) instead of the
+///   transformed primary output header.
 ///
 /// # Errors
 ///
@@ -4254,6 +4285,7 @@ pub fn run_bam_pipeline_from_reader_with_secondary<
     output_path: &Path,
     output_header: Option<Header>,
     secondary_output_path: &Path,
+    secondary_output_header: Option<Header>,
     grouper_fn: GrouperFn,
     process_fn: ProcessFn,
     serialize_fn: SerializeFn,
@@ -4270,6 +4302,14 @@ where
 {
     // Use output_header if provided, otherwise clone input_header
     let output_header = output_header.unwrap_or_else(|| input_header.clone());
+
+    // Resolve which header the rejects (secondary) BAM should advertise.
+    // Defaults to the primary output header to match prior behavior; consensus
+    // commands override this with the input header so rejects carry raw-input
+    // RG/PG/contig metadata and the input's claimed sort order (rejects are
+    // emitted in input order, so the input sort order remains valid).
+    let secondary_header =
+        resolve_secondary_header(secondary_output_header.as_ref(), &output_header);
 
     // Create primary output BAM and write the output header
     let output_writer = open_pipeline_output(output_path)?;
@@ -4290,7 +4330,7 @@ where
     // Create secondary output (reject BAM) with its own BGZF compression
     let secondary_writer = fgumi_bam_io::create_raw_bam_writer(
         secondary_output_path,
-        &output_header,
+        &secondary_header,
         1, // single-threaded BGZF for secondary
         config.compression_level,
     )
@@ -4783,6 +4823,20 @@ mod tests {
         assert!(!state.has_error(), "should NOT set error; got: {:?}", state.take_error());
         assert!(worker.held_decoded.is_some(), "held batch should be preserved");
         assert!(!state.q2b_boundaries.is_empty(), "Q2b should not have been popped");
+    }
+
+    #[rstest]
+    #[case::none_falls_back_to_primary(None, "primary")]
+    #[case::some_overrides_primary(Some("rejects"), "rejects")]
+    fn test_resolve_secondary_header(
+        #[case] override_comment: Option<&str>,
+        #[case] expected_comment: &str,
+    ) {
+        let primary = Header::builder().add_comment("primary").build();
+        let override_header = override_comment.map(|c| Header::builder().add_comment(c).build());
+        let resolved = resolve_secondary_header(override_header.as_ref(), &primary);
+        let expected = Header::builder().add_comment(expected_comment).build();
+        assert_eq!(resolved, expected);
     }
 
     #[test]

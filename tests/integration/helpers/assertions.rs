@@ -33,34 +33,63 @@ pub fn assert_has_bgzf_eof(path: &std::path::Path) {
     );
 }
 
-/// Asserts that a BAM file's `@HD` line has `SO:unsorted` and no `GO` or `SS`
-/// tags, matching the contract of `fgumi_lib::sam::header_as_unsorted`.
+/// Asserts that a rejects BAM's `@HD` sort-order fields (`SO`, `GO`, `SS`)
+/// match those of the input BAM.
 ///
-/// Use this on rejects BAMs produced by the pipeline commands, whose records
-/// are emitted in mutex-acquisition order rather than input order.
+/// Pipeline commands route rejects through the unified pipeline's first-class
+/// secondary output, which emits rejects in batch-input order (a subset of an
+/// SO-X stream is still SO-X). The rejects BAM therefore inherits the input
+/// header verbatim — including whatever sort-order claim the input made (or
+/// the absence of one).
 ///
 /// # Panics
 ///
-/// Panics if the file cannot be opened, the header cannot be read, or the
-/// sort-order tags do not match the unsorted contract.
-pub fn assert_header_unsorted(path: &std::path::Path) {
-    let mut reader = noodles::bam::io::Reader::new(
-        std::fs::File::open(path).expect("Failed to open BAM for header check"),
-    );
-    let header = reader.read_header().expect("Failed to read BAM header");
-    let hdr_map = header.header().expect("BAM header is missing an @HD line");
-    let other_fields = hdr_map.other_fields();
+/// Panics if either file cannot be opened, the header cannot be read, or the
+/// sort-order fields differ.
+pub fn assert_rejects_header_matches_input(
+    rejects_path: &std::path::Path,
+    input_path: &std::path::Path,
+) {
+    #[derive(Debug, Eq, PartialEq)]
+    struct SortFields {
+        so: Option<Vec<u8>>,
+        go: Option<Vec<u8>>,
+        ss: Option<Vec<u8>>,
+    }
 
-    let so =
-        other_fields.get(b"SO").unwrap_or_else(|| panic!("@HD missing SO in {}", path.display()));
+    fn read_sort_fields(path: &std::path::Path) -> SortFields {
+        use noodles::sam::header::record::value::map::header::tag::{
+            GROUP_ORDER, SORT_ORDER, SUBSORT_ORDER,
+        };
+
+        let mut reader = noodles::bam::io::Reader::new(
+            std::fs::File::open(path).expect("Failed to open BAM for header check"),
+        );
+        let header = reader.read_header().expect("Failed to read BAM header");
+        // `@HD` is optional in noodles' Header — treat its absence as "no fields".
+        let Some(hdr_map) = header.header() else {
+            return SortFields { so: None, go: None, ss: None };
+        };
+        // Use typed `Other` tag constants rather than raw byte slices so this
+        // keeps working if noodles ever promotes these to first-class fields
+        // on `Map<Header>` (currently 0.82 keeps them in `other_fields`).
+        let other = hdr_map.other_fields();
+        SortFields {
+            so: other.get(&SORT_ORDER).map(|v| v.to_vec()),
+            go: other.get(&GROUP_ORDER).map(|v| v.to_vec()),
+            ss: other.get(&SUBSORT_ORDER).map(|v| v.to_vec()),
+        }
+    }
+
+    let actual = read_sort_fields(rejects_path);
+    let expected = read_sort_fields(input_path);
     assert_eq!(
-        <_ as AsRef<[u8]>>::as_ref(so),
-        b"unsorted",
-        "SO should be 'unsorted' in {}",
-        path.display()
+        actual,
+        expected,
+        "rejects @HD sort fields should match input ({} vs {})",
+        rejects_path.display(),
+        input_path.display()
     );
-    assert!(other_fields.get(b"GO").is_none(), "GO should be cleared in {}", path.display());
-    assert!(other_fields.get(b"SS").is_none(), "SS should be cleared in {}", path.display());
 }
 
 /// Asserts that a record has a specific MI (molecule ID) tag value.
@@ -196,6 +225,30 @@ mod tests {
     use super::*;
     use crate::helpers::bam_generator::to_record_buf;
     use fgumi_raw_bam::{SamBuilder, flags};
+
+    /// Locks down the noodles behavior that `assert_rejects_header_matches_input`
+    /// relies on: SO/GO/SS are accessible via the typed `Other` tag constants on
+    /// `Map<Header>::other_fields()`. If noodles ever moves these to first-class
+    /// fields on `Map<Header>`, this test will fail and the helper above must be
+    /// updated to use the new accessors instead.
+    #[test]
+    fn sort_fields_are_readable_from_other_fields() {
+        use noodles::sam::header::record::value::map::header::tag::{
+            GROUP_ORDER, SORT_ORDER, SUBSORT_ORDER,
+        };
+
+        let header_text =
+            "@HD\tVN:1.6\tSO:queryname\tGO:none\tSS:queryname:natural\n@PG\tID:test\tPN:test\n";
+        let header: noodles::sam::Header = header_text.parse().unwrap();
+        let hdr_map = header.header().expect("@HD should be present");
+        let other = hdr_map.other_fields();
+        assert_eq!(other.get(&SORT_ORDER).map(|v| v.to_vec()), Some(b"queryname".to_vec()),);
+        assert_eq!(other.get(&GROUP_ORDER).map(|v| v.to_vec()), Some(b"none".to_vec()));
+        assert_eq!(
+            other.get(&SUBSORT_ORDER).map(|v| v.to_vec()),
+            Some(b"queryname:natural".to_vec()),
+        );
+    }
 
     #[test]
     fn test_assert_mi_tag() {

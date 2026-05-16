@@ -278,3 +278,95 @@ fn test_simplex_command_collapses_read_group_attributes() {
         "PL tag should be uppercased and deduplicated",
     );
 }
+
+/// Verifies that the rejects BAM advertises the **input** header (RGs included),
+/// while the primary output BAM advertises the **consensus** header (RGs collapsed).
+///
+/// This is the end-to-end check for the `secondary_output_header` parameter on
+/// [`run_bam_pipeline_from_reader_with_secondary`][rbprws]. A regression where a
+/// caller accidentally passes the primary `output_header` (consensus header) for
+/// the secondary would collapse rejects' RGs to "A" — this test catches that.
+///
+/// [rbprws]: fgumi_lib::unified_pipeline::run_bam_pipeline_from_reader_with_secondary
+#[test]
+fn test_simplex_command_rejects_inherits_input_read_groups() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+
+    // Build an input with two distinct read groups (RG1, RG2) that the
+    // consensus header would collapse to a single RG "A".
+    let header = create_header_with_read_groups("chr1", 10000);
+    // One family that passes consensus (kept), one singleton that doesn't (rejected).
+    let kept = create_umi_family("ACGT", 5, "kept", "ACGTACGT", 30);
+    let rejected = create_umi_family("TGCA", 1, "reject_singleton", "TTTTAAAA", 30);
+    create_grouped_bam_with_header(&input_bam, &header, vec![("1", kept), ("2", rejected)]);
+
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "simplex",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--rejects",
+            rejects_bam.to_str().unwrap(),
+            "--min-reads",
+            "2",
+            "--threads",
+            "2",
+            "--compression-level",
+            "1",
+        ])
+        .status()
+        .expect("Failed to run simplex command");
+    assert!(status.success(), "Simplex command with rejects failed");
+
+    // Primary output BAM: consensus header collapses RG1+RG2 -> single "A".
+    let primary_header =
+        bam::io::Reader::new(fs::File::open(&output_bam).unwrap()).read_header().unwrap();
+    let primary_rgs: Vec<BString> = primary_header.read_groups().keys().cloned().collect();
+    assert_eq!(
+        primary_rgs,
+        vec![BString::from("A")],
+        "primary output should have the collapsed consensus RG 'A'",
+    );
+
+    // Rejects BAM: input header preserved verbatim — both RG1 and RG2 present.
+    let mut reader = bam::io::Reader::new(fs::File::open(&rejects_bam).unwrap());
+    let rejects_header = reader.read_header().unwrap();
+    let mut rejects_rgs: Vec<BString> = rejects_header.read_groups().keys().cloned().collect();
+    rejects_rgs.sort();
+    assert_eq!(
+        rejects_rgs,
+        vec![BString::from("RG1"), BString::from("RG2")],
+        "rejects BAM should inherit the input header's read groups verbatim",
+    );
+
+    // Sanity-check that the rejection path actually fired: the singleton
+    // input record (TGCA family, depth=1) must land in the rejects BAM.
+    // Assert the read *name* (not just the count) so a regression that
+    // rejects the wrong family (e.g. the kept "ACGT" family instead of the
+    // singleton "TGCA" family) is caught — a count-only check would still
+    // pass on a swap.
+    let reject_names: Vec<String> = reader
+        .records()
+        .map(|result| {
+            result
+                .expect("Failed to read rejects record")
+                .name()
+                .expect("reject record missing read name")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        reject_names.len(),
+        1,
+        "rejects BAM should contain the singleton record dropped by --min-reads",
+    );
+    assert!(
+        reject_names[0].starts_with("reject_singleton"),
+        "expected the singleton family in rejects, got {reject_names:?}",
+    );
+}

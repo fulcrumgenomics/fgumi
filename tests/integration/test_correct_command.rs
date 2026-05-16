@@ -163,8 +163,9 @@ fn test_correct_command_with_rejects() {
 
 /// Exercises the multi-threaded rejects-streaming path end-to-end and asserts:
 /// 1. The rejects BAM is a valid BGZF stream with the terminating EOF block.
-/// 2. The `@HD` header reports `SO:unsorted` because rejects are emitted in
-///    mutex-acquisition order rather than input order.
+/// 2. The `@HD` sort fields (`SO`/`GO`/`SS`) match the input BAM, because
+///    rejects flow through the unified pipeline's secondary output in
+///    batch/input order (a subset of an SO-X stream is still SO-X).
 /// 3. Every uncorrectable input record appears exactly once in the rejects
 ///    BAM — the writer does not drop records under worker contention and does
 ///    not emit duplicates.
@@ -189,13 +190,16 @@ fn test_correct_command_rejects_streaming_threaded_integrity() {
     let far_c = create_umi_family("CCCCCCCC", far_family_size as usize, "far_c", "AAAAGGGG", 30);
 
     // Expected reject names mirror `create_umi_family`'s "{base_name}_{i}"
-    // convention for the three uncorrectable families.
-    let mut expected_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for base in ["far_a", "far_b", "far_c"] {
-        for i in 0..far_family_size {
-            expected_names.insert(format!("{base}_{i}"));
-        }
-    }
+    // convention for the three uncorrectable families. The vector encodes the
+    // batch-input order the pipeline now guarantees for rejects (far_a, then
+    // far_b, then far_c — each family's records emitted in their original
+    // 0..far_family_size order).
+    let expected_order: Vec<String> = ["far_a", "far_b", "far_c"]
+        .into_iter()
+        .flat_map(|base| (0..far_family_size).map(move |i| format!("{base}_{i}")))
+        .collect();
+    let expected_names: std::collections::HashSet<String> =
+        expected_order.iter().cloned().collect();
     let expected_rejects = expected_names.len();
 
     create_umi_bam(&input_bam, vec![corr_small, corr_big, far_a, far_b, far_c]);
@@ -228,30 +232,27 @@ fn test_correct_command_rejects_streaming_threaded_integrity() {
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 
     crate::helpers::assertions::assert_has_bgzf_eof(&rejects_bam);
-    crate::helpers::assertions::assert_header_unsorted(&rejects_bam);
+    crate::helpers::assertions::assert_rejects_header_matches_input(&rejects_bam, &input_bam);
 
     let mut reader = bam::io::Reader::new(fs::File::open(&rejects_bam).unwrap());
     let _header = reader.read_header().unwrap();
-    let mut seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    let mut total: usize = 0;
+    let mut observed_order: Vec<String> = Vec::with_capacity(expected_rejects);
     for result in reader.records() {
         let record = result.expect("Failed to read reject record");
         let name = record.name().expect("reject record missing read name").to_string();
-        *seen.entry(name).or_insert(0) += 1;
-        total += 1;
+        observed_order.push(name);
     }
 
     assert_eq!(
-        total, expected_rejects,
+        observed_order.len(),
+        expected_rejects,
         "rejects BAM should contain one record per uncorrectable input read",
     );
-    assert_eq!(seen.len(), expected_rejects, "unexpected reject-name set size");
-    for name in &expected_names {
-        assert_eq!(
-            seen.remove(name),
-            Some(1),
-            "expected uncorrectable record {name} exactly once in the rejects BAM",
-        );
-    }
-    assert!(seen.is_empty(), "rejects BAM contained unexpected records: {seen:?}");
+    // Strict equality on the full sequence catches both drops/dupes (covered
+    // by the count check) and a regression to mutex-acquisition (or any other
+    // non-input) ordering.
+    assert_eq!(observed_order, expected_order, "rejects should be emitted in batch-input order",);
+    let observed_names: std::collections::HashSet<String> =
+        observed_order.iter().cloned().collect();
+    assert_eq!(observed_names, expected_names, "unexpected reject-name set");
 }

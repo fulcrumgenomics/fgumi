@@ -47,7 +47,7 @@ use std::time::Instant;
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    build_pipeline_config, parse_bool,
+    build_pipeline_config, parse_bool, serialize_raw_bam_records,
 };
 
 /// Filters and masks consensus reads based on various quality metrics.
@@ -243,21 +243,6 @@ impl MemoryEstimate for FilterProcessedBatchRaw {
         let rejected_inner: usize = self.rejected_records.iter().map(RawRecord::capacity).sum();
         kept_outer + kept_inner + rejected_outer + rejected_inner
     }
-}
-
-/// Serialize raw BAM records directly (bypasses `bam_codec` encoder).
-fn serialize_raw_records(records: &[RawRecord], output: &mut Vec<u8>) -> io::Result<u64> {
-    for record in records {
-        let len = u32::try_from(record.len()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("BAM record too large ({} bytes) for u32 block_size", record.len()),
-            )
-        })?;
-        output.extend_from_slice(&len.to_le_bytes());
-        output.extend_from_slice(record);
-    }
-    Ok(records.len() as u64)
 }
 
 /// Per-thread accumulator merged into final counts after pipeline completion.
@@ -482,14 +467,14 @@ impl Filter {
                 m.total_bases_masked += processed.bases_masked;
             });
 
-            serialize_raw_records(&processed.kept_records, output)
+            serialize_raw_bam_records(&processed.kept_records, output)
         };
 
         if let Some(rejects_path) = &self.rejects {
             // Secondary serialize: write rejected records
             let secondary_serialize_fn =
                 |batch: &FilterProcessedBatchRaw, buf: &mut Vec<u8>| -> io::Result<u64> {
-                    serialize_raw_records(&batch.rejected_records, buf)
+                    serialize_raw_bam_records(&batch.rejected_records, buf)
                 };
 
             run_bam_pipeline_from_reader_with_secondary(
@@ -499,6 +484,7 @@ impl Filter {
                 &self.io.output,
                 None,
                 rejects_path,
+                None, // secondary uses resolved primary output header
                 grouper_fn,
                 process_fn,
                 serialize_fn,

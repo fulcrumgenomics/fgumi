@@ -5,6 +5,12 @@
 //! observed UMIs to match the expected set based on mismatch tolerance and minimum
 //! distance requirements.
 //!
+//! When `--rejects` is set, the threaded pipeline routes rejected records through
+//! the unified pipeline's first-class secondary output (see
+//! [`crate::unified_pipeline::run_bam_pipeline_from_reader_with_secondary`]).
+//! Rejects land in batch-input order rather than mutex-acquisition order, and the
+//! rejects BAM inherits the input header. The pattern matches `commands::filter`.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -47,17 +53,20 @@ use crate::grouper::TemplateGrouper;
 use crate::logging::OperationTimer;
 use crate::metrics::correct::UmiCorrectionMetrics;
 use crate::per_thread_accumulator::PerThreadAccumulator;
-use crate::sam::{SamTag, header_as_unsorted};
+use crate::sam::SamTag;
 use crate::template::TemplateBatch;
-use crate::unified_pipeline::{Grouper, MemoryEstimate, run_bam_pipeline_from_reader};
+use crate::unified_pipeline::{
+    Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
+    run_bam_pipeline_from_reader_with_secondary,
+};
 use crate::validation::validate_file_exists;
 use ahash::AHashMap;
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::{
-    BamWriter, RawBamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
-    create_optional_bam_writer, create_raw_bam_reader_with_opts, create_raw_bam_writer,
+    BamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
+    create_optional_bam_writer, create_raw_bam_reader_with_opts,
 };
 use fgumi_raw_bam;
 use fgumi_raw_bam::RawRecord;
@@ -65,7 +74,6 @@ use log::{info, warn};
 use lru::LruCache;
 use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
-use parking_lot::Mutex;
 use std::io;
 use std::num::NonZero;
 use std::path::PathBuf;
@@ -75,7 +83,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, RejectsOptions, SchedulerOptions,
-    ThreadingOptions, build_pipeline_config, parse_bool,
+    ThreadingOptions, build_pipeline_config, parse_bool, serialize_raw_bam_records,
 };
 
 /// Result of matching an observed UMI to an expected UMI.
@@ -299,6 +307,9 @@ struct TemplateCorrection {
 struct CorrectProcessedBatch {
     /// Raw-byte kept records.
     kept_raw_records: Vec<RawRecord>,
+    /// Raw-byte rejected records, in batch-input order. Empty unless the
+    /// pipeline was configured with a `--rejects` output.
+    rejected_records: Vec<Vec<u8>>,
     /// Number of templates processed.
     templates_count: u64,
     /// Number of missing UMI records.
@@ -315,7 +326,9 @@ impl MemoryEstimate for CorrectProcessedBatch {
     fn estimate_heap_size(&self) -> usize {
         let raw_size: usize = self.kept_raw_records.iter().map(RawRecord::capacity).sum();
         let raw_vec_overhead = self.kept_raw_records.capacity() * std::mem::size_of::<RawRecord>();
-        raw_size + raw_vec_overhead
+        let rej_size: usize = self.rejected_records.iter().map(Vec::capacity).sum();
+        let rej_vec_overhead = self.rejected_records.capacity() * std::mem::size_of::<Vec<u8>>();
+        raw_size + raw_vec_overhead + rej_size + rej_vec_overhead
     }
 }
 
@@ -808,30 +821,12 @@ impl CorrectUmis {
         let collected_metrics = PerThreadAccumulator::<CollectedCorrectMetrics>::new(num_threads);
         let collected_for_serialize = Arc::clone(&collected_metrics);
 
-        // Open rejects writer up front. Rejected records are streamed straight
-        // to disk from process_fn, per-template, so no batch-level buffering.
-        // Because workers flush under a mutex rather than through the ordered
-        // serialize stage, reject records are emitted in mutex-acquisition
-        // order, not input order; mark the rejects header as SO:unsorted so
-        // downstream tools don't assume the input's sort order carried over.
-        let rejects_writer: Option<Arc<Mutex<Option<RawBamWriter>>>> = if track_rejects {
-            if let Some(path) = self.rejects_opts.rejects.as_ref() {
-                let writer_threads = self.threading.num_threads();
-                let rejects_header = header_as_unsorted(&header);
-                let w = create_raw_bam_writer(
-                    path,
-                    &rejects_header,
-                    writer_threads,
-                    self.compression.compression_level,
-                )?;
-                Some(Arc::new(Mutex::new(Some(w))))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let rejects_writer_for_process = rejects_writer.as_ref().map(Arc::clone);
+        // Rejects (`--rejects`) flow through the unified pipeline's first-class
+        // secondary output (see `run_bam_pipeline_from_reader_with_secondary` in
+        // `unified_pipeline/bam.rs`). `process_fn` collects rejected raw bytes
+        // into `CorrectProcessedBatch::rejected_records`; the pipeline's
+        // `secondary_serialize_fn` writes them in batch-input order. This
+        // matches the pattern used by `commands/filter.rs`.
 
         // Configuration for closures
         const BATCH_SIZE: usize = 1000; // Templates per batch
@@ -875,6 +870,10 @@ impl CorrectUmis {
                 }
 
                 let mut kept_raw_records: Vec<RawRecord> = Vec::new();
+                // Rejected records are collected per-batch and drained by the
+                // unified pipeline's secondary serializer; empty unless
+                // `track_rejects` is true.
+                let mut rejected_records: Vec<Vec<u8>> = Vec::new();
                 let mut missing_umis = 0u64;
                 let mut wrong_length = 0u64;
                 let mut mismatched = 0u64;
@@ -883,24 +882,6 @@ impl CorrectUmis {
                 // Count ALL input records for progress tracking (not just kept/rejected)
                 let mut total_input_records = 0u64;
                 let umi_tag_bytes: [u8; 2] = [umi_tag.as_ref()[0], umi_tag.as_ref()[1]];
-
-                // Stream rejected records straight to disk so they don't
-                // accumulate in a batch-level Vec. The mutex only serializes
-                // the raw-byte append; BGZF compression runs on the writer's
-                // own thread pool.
-                let flush_raw_records = |recs: Vec<RawRecord>| -> io::Result<()> {
-                    if let Some(ref rw_arc) = rejects_writer_for_process {
-                        if !recs.is_empty() {
-                            let mut guard = rw_arc.lock();
-                            if let Some(w) = guard.as_mut() {
-                                for raw in &recs {
-                                    w.write_raw_record(raw.as_ref())?;
-                                }
-                            }
-                        }
-                    }
-                    Ok(())
-                };
 
                 for template in batch {
                     // Count input records BEFORE processing
@@ -925,7 +906,12 @@ impl CorrectUmis {
                                     });
                                 entry.total_matches += num_records;
                                 if track_rejects {
-                                    flush_raw_records(raw_records)?;
+                                    // Move out of `raw_records` (consumed here) to
+                                    // avoid a per-record clone+memcpy on the rejects
+                                    // hot path.
+                                    for raw in raw_records {
+                                        rejected_records.push(raw.into_inner());
+                                    }
                                 }
                             }
                             Some(umi) => {
@@ -986,7 +972,11 @@ impl CorrectUmis {
                                         });
                                     entry.total_matches += num_records;
                                     if track_rejects {
-                                        flush_raw_records(raw_records)?;
+                                        // Move out of `raw_records` (consumed
+                                        // here) to avoid a per-record clone.
+                                        for raw in raw_records {
+                                            rejected_records.push(raw.into_inner());
+                                        }
                                     }
                                 }
                             }
@@ -1002,6 +992,7 @@ impl CorrectUmis {
 
                 Ok(CorrectProcessedBatch {
                     kept_raw_records,
+                    rejected_records,
                     templates_count,
                     missing_umis,
                     wrong_length,
@@ -1011,14 +1002,12 @@ impl CorrectUmis {
             })
         };
 
-        // Serialize function: convert records to bytes and collect metrics
+        // Serialize function: convert kept records to bytes and collect metrics.
+        // Rejects are drained by `secondary_serialize_fn` separately.
         let serialize_fn = move |mut processed: CorrectProcessedBatch,
                                  _header: &Header,
                                  output: &mut Vec<u8>|
               -> io::Result<u64> {
-            // Rejects were already streamed to disk in process_fn.
-            // Merge per-batch counts + UMI matches into this worker's
-            // accumulator slot.
             let umi_matches = std::mem::take(&mut processed.umi_matches);
             collected_for_serialize.with_slot(|m| {
                 m.templates_processed += processed.templates_count;
@@ -1030,51 +1019,47 @@ impl CorrectUmis {
                 }
             });
 
-            // Serialize kept records
-            let mut kept_count = 0u64;
-            for raw in &processed.kept_raw_records {
-                let block_size = raw.len() as u32;
-                output.extend_from_slice(&block_size.to_le_bytes());
-                output.extend_from_slice(raw);
-                kept_count += 1;
-            }
-            // Return KEPT record count (not input count, to avoid double-counting)
-            Ok(kept_count)
+            // Return KEPT record count (not input count, to avoid double-counting).
+            serialize_raw_bam_records(&processed.kept_raw_records, output)
         };
 
-        // Run the 7-step pipeline with the already-opened reader (supports streaming)
-        let pipeline_result = run_bam_pipeline_from_reader(
-            pipeline_config,
-            reader,
-            header,
-            &self.io.output,
-            None, // Use input header for output
-            grouper_fn,
-            process_fn,
-            serialize_fn,
-        );
+        // Secondary serialize: drains the per-batch rejected_records into the
+        // pipeline's secondary output buffer. The pipeline reorders by batch
+        // serial, so rejects land in input order and the secondary writer is
+        // finalized automatically inside the pipeline.
+        let secondary_serialize_fn =
+            |batch: &CorrectProcessedBatch, buf: &mut Vec<u8>| -> io::Result<u64> {
+                serialize_raw_bam_records(&batch.rejected_records, buf)
+            };
 
-        // Always finalize the rejects writer, even if the pipeline failed, so any
-        // partially written rejects BAM still gets a valid BGZF EOF block. Surface
-        // finish() failures alongside any pipeline error so neither is silently
-        // dropped.
-        let rejects_finish_result = rejects_writer
-            .and_then(|rw_arc| rw_arc.lock().take())
-            .map(|writer| writer.finish().context("Failed to finish rejects file"));
-
-        let records_written = match (pipeline_result, rejects_finish_result) {
-            (Ok(records_written), Some(Ok(()))) => {
-                info!("Rejected records streamed to rejects file during processing");
-                records_written
-            }
-            (Ok(records_written), None) => records_written,
-            (Ok(_), Some(Err(finish_err))) => return Err(finish_err),
-            (Err(pipeline_err), Some(Err(finish_err))) => {
-                return Err(anyhow::anyhow!(
-                    "Pipeline error: {pipeline_err}; additionally failed to finish rejects file: {finish_err}"
-                ));
-            }
-            (Err(pipeline_err), _) => return Err(pipeline_err.into()),
+        // Run the 7-step pipeline with the already-opened reader (supports streaming).
+        // When `--rejects` is set, route rejects through the unified pipeline's
+        // first-class secondary output so they land in input/batch-serial order.
+        let records_written = if let Some(rejects_path) = self.rejects_opts.rejects.as_ref() {
+            run_bam_pipeline_from_reader_with_secondary(
+                pipeline_config,
+                reader,
+                header,
+                &self.io.output,
+                None, // primary uses input header
+                rejects_path,
+                None, // secondary uses resolved primary header (== input header for correct)
+                grouper_fn,
+                process_fn,
+                serialize_fn,
+                secondary_serialize_fn,
+            )?
+        } else {
+            run_bam_pipeline_from_reader(
+                pipeline_config,
+                reader,
+                header,
+                &self.io.output,
+                None, // Use input header for output
+                grouper_fn,
+                process_fn,
+                serialize_fn,
+            )?
         };
 
         // ========== Post-pipeline: Aggregate metrics ==========
@@ -3633,5 +3618,60 @@ mod tests {
         // OX tag should NOT be present (dont_store_original_umis = true)
         let ox = fgumi_raw_bam::find_string_tag_in_record(&raw, SamTag::OX);
         assert!(ox.is_none());
+    }
+
+    /// Verifies `CorrectProcessedBatch::estimate_heap_size` accounts for both
+    /// `kept_raw_records` (consensus path) and `rejected_records` (secondary
+    /// rejects path), plus the outer-vec capacity overhead for each. The
+    /// non-empty-rejects case in particular guards against a regression where
+    /// the buffered rejects branch added by the secondary-output migration is
+    /// dropped from the estimate (which would mis-throttle the pipeline).
+    #[rstest]
+    #[case::empty_rejects(vec![1024], vec![])]
+    #[case::non_empty_rejects(vec![64, 128], vec![256, 512])]
+    fn test_correct_processed_batch_memory_estimate(
+        #[case] kept_capacities: Vec<usize>,
+        #[case] rej_capacities: Vec<usize>,
+    ) {
+        let kept_raw_records: Vec<RawRecord> =
+            kept_capacities.iter().map(|&cap| RawRecord::with_capacity(cap)).collect();
+        let kept_outer_capacity = kept_raw_records.capacity();
+        // RawRecord::with_capacity / Vec::with_capacity(n) only guarantee AT
+        // LEAST n; the allocator may round up. Read the observed capacities
+        // back so the expected value matches what was actually allocated
+        // under any allocator.
+        let kept_inner_total: usize = kept_raw_records.iter().map(RawRecord::capacity).sum();
+
+        let rejected_records: Vec<Vec<u8>> = rej_capacities
+            .iter()
+            .map(|&cap| {
+                let mut v = Vec::with_capacity(cap);
+                v.extend_from_slice(&[1u8; 8]);
+                v
+            })
+            .collect();
+        let rej_outer_capacity = rejected_records.capacity();
+        let rej_inner_total: usize = rejected_records.iter().map(Vec::capacity).sum();
+
+        let batch = CorrectProcessedBatch {
+            kept_raw_records,
+            rejected_records,
+            templates_count: 0,
+            missing_umis: 0,
+            wrong_length: 0,
+            mismatched: 0,
+            umi_matches: AHashMap::new(),
+        };
+
+        let expected = kept_inner_total
+            + kept_outer_capacity * std::mem::size_of::<RawRecord>()
+            + rej_inner_total
+            + rej_outer_capacity * std::mem::size_of::<Vec<u8>>();
+        assert_eq!(
+            batch.estimate_heap_size(),
+            expected,
+            "estimate should account for kept-record capacities, rejects inner capacities, \
+             and both outer-vec overheads",
+        );
     }
 }
