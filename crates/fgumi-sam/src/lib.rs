@@ -148,9 +148,19 @@ pub fn is_sorted(header: &Header, sort_order: &[u8]) -> bool {
 /// This sort order is indicated in the SAM header by:
 /// - SO:unsorted (not coordinate sorted)
 /// - GO:query (grouped by query name)
-/// - SS:template-coordinate (optional, but must match if present)
+/// - SS:template-coordinate (required — without SS, GO:query alone only means
+///   reads with the same QNAME are grouped, not that templates are
+///   template-coordinate ordered)
 ///
-/// This matches the behavior of fgbio's `GroupReadsByUmi` output format.
+/// All three tags must be present. A header advertising only `SO:unsorted GO:query`
+/// is queryname-grouped but **not** template-coordinate sorted: that's what
+/// `fgumi extract` (and any tool that emits FASTQ-order BAMs) writes, and treating
+/// it as template-coordinate sorted leads to incorrect grouping in the streaming
+/// `RecordPositionGrouper` because templates that share a position key are not
+/// guaranteed to be consecutive.
+///
+/// This matches fgbio's `SamOrder.apply` (`bam/api/SamOrder.scala`), which
+/// requires the `SS` sub-sort tag for exact match.
 ///
 /// # Arguments
 ///
@@ -180,18 +190,22 @@ pub fn is_template_coordinate_sorted(header: &Header) -> bool {
         let is_query_grouped =
             other_fields.get(b"GO").is_some_and(|go| <_ as AsRef<[u8]>>::as_ref(go) == b"query");
 
-        // Check SS tag - if present, must be "template-coordinate" (or "SO:template-coordinate"), but it's optional
-        // The SS tag may be prefixed with the sort order (e.g., "unsorted:template-coordinate")
-        // per the SAM spec, so we need to extract the part after the colon
-        let ss_matches = other_fields.get(b"SS").is_none_or(|ss| {
+        // Check SS tag - must be present and equal to "template-coordinate" (or
+        // "<so>:template-coordinate", per the SAM spec, e.g. "unsorted:template-coordinate").
+        //
+        // The SAM spec defines SS as the single colon-delimited pair `<SO>:<sub>` (§1.3),
+        // so we split on the FIRST colon and exact-match the suffix. This matches fgbio's
+        // `SamOrder.apply` (`s.substring(s.indexOf(':') + 1)`), so values written by fgbio
+        // and accepted by it are accepted here. Plain `template-coordinate` (no prefix) is
+        // also accepted because some writers emit the bare sub-sort.
+        let ss_matches = other_fields.get(b"SS").is_some_and(|ss| {
             let ss_bytes = <_ as AsRef<[u8]>>::as_ref(ss);
-            // Find the last colon and take everything after it, or use the whole value if no colon
             if let Some(colon_pos) = ss_bytes.iter().position(|&b| b == b':') {
                 &ss_bytes[colon_pos + 1..] == b"template-coordinate"
             } else {
                 ss_bytes == b"template-coordinate"
             }
-        }); // If SS is missing, that's acceptable
+        });
 
         is_unsorted && is_query_grouped && ss_matches
     } else {
@@ -785,10 +799,13 @@ mod tests {
     }
 
     #[test]
-    fn test_is_template_coordinate_sorted_valid_minimal() {
-        // SO:unsorted + GO:query (no SS)
+    fn test_is_template_coordinate_sorted_missing_ss_is_rejected() {
+        // SO:unsorted + GO:query without SS is queryname-grouped, NOT template-coordinate
+        // sorted. This is what `fgumi extract` and other FASTQ-order writers emit, and
+        // treating it as template-coordinate sorted leads to silently wrong grouping
+        // because templates sharing a position key aren't guaranteed to be consecutive.
         let header = create_template_coord_header("unsorted", Some("query"), None);
-        assert!(is_template_coordinate_sorted(&header));
+        assert!(!is_template_coordinate_sorted(&header));
     }
 
     #[test]

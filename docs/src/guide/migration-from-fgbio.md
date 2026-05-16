@@ -55,6 +55,14 @@ fgumi merge --order template-coordinate --output merged.bam \
   lane1.bam lane2.bam lane3.bam
 ```
 
+If you produce a queryname-sorted output from `fgumi merge` (or from any
+other source — `fgumi extract`, `samtools sort -n`, etc.), insert a
+`fgumi sort --order template-coordinate` step before `fgumi group`,
+`fgumi dedup`, or `fgumi downsample`. Unlike fgbio's `GroupReadsByUmi`,
+`fgumi group` does not sort internally — it requires its input to be
+template-coordinate sorted with the `SS:template-coordinate` header tag,
+and rejects any other sort order with an actionable error.
+
 ### Simplex QC Metrics
 
 fgbio has no equivalent to `fgumi simplex-metrics`. This command provides yield curves,

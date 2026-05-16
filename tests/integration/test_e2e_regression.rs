@@ -301,11 +301,24 @@ fn test_full_pipeline_extract_to_filter() {
             "test_lib",
         ]);
 
+        // Extract emits SO:unsorted GO:query (no SS); `fgumi group` requires
+        // template-coordinate sorted input, so put the sort step between them.
+        let sorted = tmp.path().join(format!("sorted_{suffix}.bam"));
+        fgumi_ok(args![
+            "sort",
+            "--input",
+            &extracted,
+            "--output",
+            &sorted,
+            "--order",
+            "template-coordinate",
+        ]);
+
         let grouped = tmp.path().join(format!("grouped_{suffix}.bam"));
         fgumi_ok(args![
             "group",
             "--input",
-            &extracted,
+            &sorted,
             "--output",
             &grouped,
             "--strategy",
@@ -327,6 +340,83 @@ fn test_full_pipeline_extract_to_filter() {
         &tmp.path().join("filtered_b.bam"),
         "content",
         "Two full pipeline runs should produce identical BAMs",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Strict template-coordinate input: extract → group must fail without sort
+// ---------------------------------------------------------------------------
+
+/// CLI-level regression test for the strict template-coordinate sort
+/// requirement. `fgumi extract` writes `SO:unsorted GO:query` with no `SS`
+/// tag; piping that directly into `fgumi group` must fail with an actionable
+/// error message naming `SS:template-coordinate` and pointing at `fgumi sort`.
+///
+/// This test runs the actual `fgumi` binary (via `CARGO_BIN_EXE_fgumi`)
+/// instead of calling `cmd.execute(...)` in-process so that it pins the
+/// user-visible behavior — exit status and stderr — that downstream tooling
+/// and CI pipelines depend on.
+#[test]
+fn test_group_rejects_extract_output_without_sort_step() {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let reference = create_test_reference(tmp.path());
+
+    let r1 = tmp.path().join("r1.fq.gz");
+    let r2 = tmp.path().join("r2.fq.gz");
+    let truth = tmp.path().join("truth.tsv");
+    simulate_fastq_reads(&r1, &r2, &truth, &reference, 42, 50);
+
+    let extracted = tmp.path().join("extracted.bam");
+    fgumi_ok(args![
+        "extract",
+        "--inputs",
+        &r1,
+        &r2,
+        "--output",
+        &extracted,
+        "--read-structures",
+        "6M94T",
+        "100T",
+        "--sample",
+        "test_sample",
+        "--library",
+        "test_lib",
+    ]);
+
+    // Run `fgumi group` on the extract output directly — must fail.
+    let grouped = tmp.path().join("grouped.bam");
+    let output = fgumi(args![
+        "group",
+        "--input",
+        &extracted,
+        "--output",
+        &grouped,
+        "--strategy",
+        "identity",
+        "--edits",
+        "0",
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "fgumi group must reject extract output (non-template-coordinate sorted); \
+         got exit status {:?}\nstdout: {}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("template-coordinate"),
+        "stderr should mention template-coordinate: {stderr}",
+    );
+    assert!(
+        stderr.contains("SS:template-coordinate"),
+        "stderr should name the SS:template-coordinate tag specifically: {stderr}",
+    );
+    assert!(
+        stderr.contains("fgumi sort"),
+        "stderr should point at `fgumi sort` as the remediation: {stderr}",
     );
 }
 

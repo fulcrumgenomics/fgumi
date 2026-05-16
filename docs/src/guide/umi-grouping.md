@@ -141,12 +141,20 @@ large position groups may indicate high on-target duplication or UMI exhaustion.
 
 ## Template-Coordinate Sort Order
 
-If the input is not sorted in template-coordinate order, `fgumi group` will internally sort the
-reads. To avoid this overhead, pre-sort with:
+`fgumi group` requires its input to be template-coordinate sorted. The header must advertise
+`SO:unsorted`, `GO:query`, and `SS:template-coordinate`; without `SS:template-coordinate` the
+input is treated as queryname-grouped (e.g. FASTQ-order output from `fgumi extract`) and
+rejected with an actionable error pointing back here. `fgumi group` does **not** sort
+internally — pre-sort with:
 
 ```bash
 fgumi sort --order template-coordinate --input aligned.bam --output sorted.bam
 ```
+
+The streaming grouper relies on records that share a position key being consecutive in the
+input, which is what template-coordinate sort guarantees. Any other ordering (queryname,
+coordinate, FASTQ-order) would split each true molecule across many small groups and assign
+distinct `MI` values to reads that should share one.
 
 For single-cell data, the `CB` cell barcode tag is automatically incorporated in the sort key,
 keeping templates from different cells at the same locus separate:

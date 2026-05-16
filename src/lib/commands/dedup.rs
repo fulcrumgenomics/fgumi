@@ -980,10 +980,11 @@ impl Command for MarkDuplicates {
 
         if !is_template_coordinate_sorted(&header) {
             bail!(
-                "Input BAM must be template-coordinate sorted.\n\n\
-                To prepare your BAM file, run:\n  \
-                fgumi zipper -i mapped.bam -u unmapped.bam -r reference.fa -o merged.bam\n  \
-                fgumi sort -i merged.bam -o sorted.bam --order template-coordinate"
+                "Input BAM must be template-coordinate sorted (header must advertise \
+                 SO:unsorted, GO:query, and SS:template-coordinate).\n\n\
+                 To prepare your BAM file, run:\n  \
+                 fgumi zipper -i mapped.bam -u unmapped.bam -r reference.fa -o merged.bam\n  \
+                 fgumi sort -i merged.bam -o sorted.bam --order template-coordinate"
             );
         }
         info!("Template-coordinate sorted");
