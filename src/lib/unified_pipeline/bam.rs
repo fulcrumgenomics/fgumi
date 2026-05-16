@@ -396,10 +396,40 @@ pub fn decode_records(
             &group_key_config.library_index,
             group_key_config.cell_tag,
         );
-        records.push(DecodedRecord::from_raw_bytes(raw, key));
+        let mut decoded = DecodedRecord::from_raw_bytes(raw, key);
+        if let Some(umi_tag) = group_key_config.umi_tag {
+            cache_umi_position(&mut decoded, umi_tag);
+        }
+        records.push(decoded);
     }
 
     Ok(records)
+}
+
+/// Cache the UMI tag's value position on a `DecodedRecord`.
+///
+/// Looks up the configured UMI tag in the record's aux data and, if present,
+/// stores the record-relative offset of its value bytes (excluding the trailing
+/// NUL terminator). When the UMI tag is absent or not Z-typed, the record's
+/// cache remains in the uninitialized `UMI_OFFSET_UNCACHED` state and
+/// downstream code must fall back to scanning aux data.
+fn cache_umi_position(decoded: &mut DecodedRecord, umi_tag: [u8; 2]) {
+    let raw = decoded.raw_bytes();
+    let Some(aux_offset) = fgumi_raw_bam::aux_data_offset_from_record(raw) else {
+        return;
+    };
+    let aux = &raw[aux_offset..];
+    let Some((value_off_in_aux, value_len)) = fgumi_raw_bam::find_string_tag_position(aux, umi_tag)
+    else {
+        return;
+    };
+    let Ok(aux_offset_u32) = u32::try_from(aux_offset) else {
+        return;
+    };
+    let Some(value_offset) = aux_offset_u32.checked_add(value_off_in_aux) else {
+        return;
+    };
+    decoded.set_cached_umi(value_offset, value_len);
 }
 
 /// Compute a `GroupKey` directly from raw BAM bytes, matching `compute_group_key()` exactly.
@@ -4367,6 +4397,7 @@ where
 mod tests {
     use super::*;
     use crate::read_info::LibraryIndex;
+    use crate::unified_pipeline::GroupKey;
     use rstest::rstest;
 
     // ========================================================================
@@ -4837,6 +4868,105 @@ mod tests {
         let resolved = resolve_secondary_header(override_header.as_ref(), &primary);
         let expected = Header::builder().add_comment(expected_comment).build();
         assert_eq!(resolved, expected);
+    }
+
+    // ========================================================================
+    // UMI position caching during Decode (issue #334)
+    // ========================================================================
+
+    /// Build a raw BAM record carrying an RX UMI tag for cache tests.
+    fn raw_record_with_rx(umi: &[u8]) -> fgumi_raw_bam::RawRecord {
+        use fgumi_raw_bam::{SamBuilder as RawSamBuilder, flags as raw_flags};
+
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGT")
+            .qualities(&[30u8; 4])
+            .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT)
+            .ref_id(0)
+            .pos(0)
+            .mapq(30)
+            .cigar_ops(&[4u32 << 4]);
+        b.add_string_tag(SamTag::RX, umi);
+        b.build()
+    }
+
+    #[test]
+    fn test_cache_umi_position_records_value_offset_and_len() {
+        let raw = raw_record_with_rx(b"ACGTACGT");
+        let mut decoded = DecodedRecord::from_raw_bytes(raw.as_ref().to_vec(), GroupKey::default());
+        cache_umi_position(&mut decoded, *SamTag::RX);
+
+        // The cached slice must equal the canonical find_string_tag answer.
+        let aux = fgumi_raw_bam::aux_data_slice(decoded.raw_bytes());
+        let expected = fgumi_raw_bam::find_string_tag(aux, SamTag::RX).unwrap();
+        assert_eq!(decoded.cached_umi(), Some(expected));
+        assert_eq!(decoded.cached_umi().unwrap(), b"ACGTACGT");
+    }
+
+    #[test]
+    fn test_cache_umi_position_leaves_cache_unset_when_tag_missing() {
+        use fgumi_raw_bam::{SamBuilder as RawSamBuilder, flags as raw_flags};
+
+        // Record with no RX tag — caching should be a no-op.
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGT")
+            .qualities(&[30u8; 4])
+            .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT)
+            .ref_id(0)
+            .pos(0)
+            .mapq(30)
+            .cigar_ops(&[4u32 << 4]);
+        let raw = b.build();
+
+        let mut decoded = DecodedRecord::from_raw_bytes(raw.as_ref().to_vec(), GroupKey::default());
+        cache_umi_position(&mut decoded, *SamTag::RX);
+
+        assert!(decoded.cached_umi().is_none());
+        assert_eq!(decoded.cached_umi_position().0, DecodedRecord::UMI_OFFSET_UNCACHED);
+    }
+
+    #[test]
+    fn test_decode_records_populates_umi_cache_when_configured() {
+        // Build a BoundaryBatch holding one record (with the 4-byte block_size
+        // prefix BAM records carry on disk) and decode it with a GroupKeyConfig
+        // that asks for RX caching.
+        let raw = raw_record_with_rx(b"CACHEDUMI");
+        let mut buffer = Vec::with_capacity(raw.as_ref().len() + 4);
+        let block_size = u32::try_from(raw.as_ref().len()).unwrap();
+        buffer.extend_from_slice(&block_size.to_le_bytes());
+        buffer.extend_from_slice(raw.as_ref());
+        let offsets = vec![0usize, buffer.len()];
+        let batch = BoundaryBatch { buffer, offsets };
+
+        let header = Header::default();
+        let library_index = LibraryIndex::from_header(&header);
+        let cfg = GroupKeyConfig::new(library_index, SamTag::CB.into()).with_umi_tag(*SamTag::RX);
+
+        let decoded = decode_records(&batch, &cfg).expect("decode succeeds");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].cached_umi(), Some(b"CACHEDUMI".as_ref()));
+    }
+
+    #[test]
+    fn test_decode_records_leaves_umi_cache_unset_when_disabled() {
+        let raw = raw_record_with_rx(b"CACHEDUMI");
+        let mut buffer = Vec::with_capacity(raw.as_ref().len() + 4);
+        let block_size = u32::try_from(raw.as_ref().len()).unwrap();
+        buffer.extend_from_slice(&block_size.to_le_bytes());
+        buffer.extend_from_slice(raw.as_ref());
+        let offsets = vec![0usize, buffer.len()];
+        let batch = BoundaryBatch { buffer, offsets };
+
+        let header = Header::default();
+        let library_index = LibraryIndex::from_header(&header);
+        // No `with_umi_tag` → caching is disabled.
+        let cfg = GroupKeyConfig::new(library_index, SamTag::CB.into());
+
+        let decoded = decode_records(&batch, &cfg).expect("decode succeeds");
+        assert_eq!(decoded.len(), 1);
+        assert!(decoded[0].cached_umi().is_none());
     }
 
     #[test]

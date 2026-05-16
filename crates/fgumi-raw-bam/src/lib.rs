@@ -112,9 +112,10 @@ pub use tags::{
     TagValue, TemplateAuxTags, append_i32_array_tag, append_signed_int_tag, array_tag_element_u16,
     array_tag_to_vec_u16, extract_aux_string_tags, extract_template_aux_tags, find_array_tag,
     find_float_tag, find_int_tag, find_mc_tag_in_record, find_string_tag,
-    find_string_tag_in_record, find_tag_type, find_uint8_tag, normalize_int_tag_to_smallest_signed,
-    remove_tag, reverse_array_tag_in_place, reverse_complement_string_tag_in_place,
-    reverse_string_tag_in_place, update_int_tag, update_string_tag,
+    find_string_tag_in_record, find_string_tag_position, find_tag_type, find_uint8_tag,
+    normalize_int_tag_to_smallest_signed, remove_tag, reverse_array_tag_in_place,
+    reverse_complement_string_tag_in_place, reverse_string_tag_in_place, update_int_tag,
+    update_string_tag,
 };
 
 #[cfg(any(test, feature = "test-utils"))]

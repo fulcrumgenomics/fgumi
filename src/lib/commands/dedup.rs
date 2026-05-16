@@ -1659,6 +1659,7 @@ mod tests {
             r1_secondaries: None,
             r2_secondaries: None,
             mi: crate::umi::MoleculeId::None,
+            cached_umi_position: None,
         };
 
         assert!(!filter_template(&template, &config, &mut metrics));
@@ -1711,6 +1712,7 @@ mod tests {
             r1_secondaries: Some((2, 3)),
             r2_secondaries: None,
             mi: crate::umi::MoleculeId::None,
+            cached_umi_position: None,
         };
 
         assert!(!filter_template(&template, &config, &mut metrics));
