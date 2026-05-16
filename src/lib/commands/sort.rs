@@ -247,8 +247,8 @@ pub struct Sort {
 
     /// Number of threads for parallel operations.
     ///
-    /// Used for parallel sorting of in-memory chunks and
-    /// multi-threaded BGZF compression.
+    /// Used for parallel sorting of in-memory chunks and parallel temp-chunk
+    /// (BGZF or zstd) compression.
     #[arg(short = '@', short_alias = 't', long = "threads", default_value = "1")]
     pub threads: usize,
 
@@ -258,11 +258,26 @@ pub struct Sort {
 
     /// Compression level for temporary chunk files (0-9).
     ///
-    /// Level 0 disables compression (fastest, uses most disk space).
+    /// Applies to the codec selected by `--temp-codec`:
+    ///   * For `bgzf`, level 0 produces uncompressed (stored) BGZF blocks
+    ///     (fastest, uses most disk space); 1..=9 are libdeflate levels.
+    ///   * For `zstd`, only 1..=9 are valid; level 0 is rejected because zstd
+    ///     has no equivalent "stored" mode and silently remapping it to 1
+    ///     would surprise users counting on uncompressed spill.
+    ///
     /// Level 1 (default) provides fast compression with reasonable space savings.
     /// Higher levels (up to 9) provide better compression but are slower.
     #[arg(long = "temp-compression", default_value = "1", value_parser = clap::value_parser!(u32).range(0..=9))]
     pub temp_compression: u32,
+
+    /// Codec used for temporary spill chunks: `zstd` (default) or `bgzf`.
+    ///
+    /// zstd is significantly faster than bgzf at comparable compression
+    /// ratios for BAM-record data; we default to zstd because spill files
+    /// are internal to the sort and never read by other tools. Pass `bgzf`
+    /// to fall back to the legacy on-disk format.
+    #[arg(long = "temp-codec", default_value = "bgzf")]
+    pub temp_codec: fgumi_sort::SpillCodec,
 
     /// Write BAM index (.bai) alongside output.
     ///
@@ -518,6 +533,18 @@ impl Sort {
             bail!("--write-index is only valid for coordinate sort");
         }
 
+        // zstd has no level-0 "stored" mode; silently remapping to 1 would
+        // surprise users who pass --temp-compression 0 to disable temp
+        // compression (which works for BGZF). Reject the combination
+        // explicitly.
+        if self.temp_compression == 0 && matches!(self.temp_codec, fgumi_sort::SpillCodec::Zstd) {
+            bail!(
+                "--temp-compression 0 is only supported with --temp-codec bgzf; \
+                 zstd does not have an uncompressed mode. Pass --temp-codec bgzf \
+                 to keep level-0 spill, or pick a zstd level >= 1."
+            );
+        }
+
         let timer = OperationTimer::new("Sorting BAM");
 
         // Resolve memory limit (auto-detect or fixed)
@@ -572,6 +599,7 @@ impl Sort {
             .threads(self.threads)
             .output_compression(self.compression.compression_level)
             .temp_compression(self.temp_compression)
+            .spill_codec(self.temp_codec)
             .write_index(self.write_index)
             .async_reader(self.async_reader)
             .pg_info(crate::version::VERSION.to_string(), command_line.to_string());
@@ -797,6 +825,7 @@ mod tests {
             threads: 1,
             compression: CompressionOptions::default(),
             temp_compression: 1,
+            temp_codec: fgumi_sort::SpillCodec::default(),
             write_index: false,
             async_reader: false,
         }
