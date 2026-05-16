@@ -134,6 +134,12 @@ pub struct ProgressTracker {
     message: String,
     /// Internal count of items processed (thread-safe).
     count: AtomicU64,
+    /// Next count value at which a milestone should be logged. Monotonically
+    /// advanced by the slow path under the EMA mutex. Reading this on the fast
+    /// path (instead of dividing `count` by `interval`) cuts ~30-60 cycles per
+    /// call — at ~32 M `log_if_needed(1)` calls/s on a 16-thread sort that
+    /// shows up as ~1 % of total CPU in profiles.
+    next_threshold: AtomicU64,
     /// Optional total count for percentage and ETA display.
     total: Option<u64>,
     /// Time the tracker was created (for elapsed time in final message).
@@ -151,10 +157,12 @@ impl ProgressTracker {
     /// * `message` - Message prefix for progress logs (e.g., "Processed records")
     #[must_use]
     pub fn new(message: impl Into<String>) -> Self {
+        let interval = 10_000;
         Self {
-            interval: 10_000,
+            interval,
             message: message.into(),
             count: AtomicU64::new(0),
+            next_threshold: AtomicU64::new(interval),
             total: None,
             start_time: Instant::now(),
             ema: Mutex::new(EmaState::new()),
@@ -171,6 +179,10 @@ impl ProgressTracker {
     #[must_use]
     pub fn with_interval(mut self, interval: u64) -> Self {
         self.interval = interval;
+        // `with_interval` is part of the builder chain (single-threaded), so a
+        // non-atomic write to `next_threshold` would be sound here, but a
+        // `store` is just as cheap and keeps the field's invariant local.
+        self.next_threshold.store(interval, Ordering::Relaxed);
         self
     }
 
@@ -202,10 +214,9 @@ impl ProgressTracker {
     /// `true` if the final count is exactly a multiple of the interval,
     /// `false` otherwise. This is useful for `log_final()` to know if a
     /// final message is needed.
-    #[allow(clippy::cast_precision_loss)]
     pub fn log_if_needed(&self, additional: u64) -> bool {
         if additional == 0 {
-            // No change, just check if current count is on interval
+            // Cold path: only called from `log_final`. The modulo is fine here.
             let count = self.count.load(Ordering::Relaxed);
             return count > 0 && count.is_multiple_of(self.interval);
         }
@@ -213,40 +224,62 @@ impl ProgressTracker {
         let prev = self.count.fetch_add(additional, Ordering::Relaxed);
         let new_count = prev + additional;
 
-        // Calculate how many interval boundaries we crossed
-        let prev_intervals = prev / self.interval;
-        let new_intervals = new_count / self.interval;
-
-        if new_intervals > prev_intervals {
-            // We crossed at least one interval — update EMA and log.
-            // Compute rate once from the final new_count.
-            let rate = if self.total.is_some() {
-                if let Ok(mut ema) = self.ema.lock() { ema.update(new_count) } else { 0.0 }
-            } else {
-                0.0
-            };
-
-            for i in (prev_intervals + 1)..=new_intervals {
-                let milestone = i * self.interval;
-                if let Some(total) = self.total {
-                    let pct = (milestone as f64 / total as f64) * 100.0;
-                    // Derive remaining work from milestone, not new_count, so each
-                    // logged line shows the ETA appropriate for that milestone.
-                    let eta_suffix = if rate > 0.0 {
-                        let remaining = total.saturating_sub(milestone) as f64;
-                        format!(", ETA ~{}", fmt_duration(remaining / rate))
-                    } else {
-                        String::new()
-                    };
-                    info!("{} {} / {} ({:.1}%{})", self.message, milestone, total, pct, eta_suffix);
-                } else {
-                    info!("{} {}", self.message, milestone);
-                }
-            }
+        // Fast path: count is monotonically non-decreasing and the interval
+        // is fixed, so the thresholds form an arithmetic sequence (interval,
+        // 2*interval, ...). We only need to know the next one and compare.
+        // The common case is "haven't crossed yet" — predicted not-taken.
+        let threshold = self.next_threshold.load(Ordering::Relaxed);
+        if new_count < threshold {
+            return false;
         }
 
-        // Return true if we landed exactly on an interval
-        new_count.is_multiple_of(self.interval)
+        self.handle_crossing(new_count)
+    }
+
+    /// Slow path: log every milestone we just crossed, advance `next_threshold`.
+    #[cold]
+    #[allow(clippy::cast_precision_loss)]
+    fn handle_crossing(&self, new_count: u64) -> bool {
+        // Take the EMA lock first — it serializes both the EMA update and the
+        // `next_threshold` advance, so concurrent crossings can't double-log.
+        let Ok(mut ema) = self.ema.lock() else {
+            // Mutex poisoned — give up on logging this call. Should never
+            // happen in practice since the slow path doesn't panic.
+            return false;
+        };
+
+        // Re-read under the lock: another thread may have advanced past us
+        // while we were waiting. If so, our milestones were already logged.
+        let mut threshold = self.next_threshold.load(Ordering::Relaxed);
+        if new_count < threshold {
+            return false;
+        }
+
+        let rate = if self.total.is_some() { ema.update(new_count) } else { 0.0 };
+
+        while threshold <= new_count {
+            let milestone = threshold;
+            if let Some(total) = self.total {
+                let pct = (milestone as f64 / total as f64) * 100.0;
+                // Derive remaining work from milestone, not new_count, so each
+                // logged line shows the ETA appropriate for that milestone.
+                let eta_suffix = if rate > 0.0 {
+                    let remaining = total.saturating_sub(milestone) as f64;
+                    format!(", ETA ~{}", fmt_duration(remaining / rate))
+                } else {
+                    String::new()
+                };
+                info!("{} {} / {} ({:.1}%{})", self.message, milestone, total, pct, eta_suffix);
+            } else {
+                info!("{} {}", self.message, milestone);
+            }
+            threshold += self.interval;
+        }
+        self.next_threshold.store(threshold, Ordering::Relaxed);
+
+        // True iff `new_count` landed exactly on the most recently logged
+        // milestone, which is `threshold - self.interval` after the advance.
+        new_count + self.interval == threshold
     }
 
     /// Log final progress.
