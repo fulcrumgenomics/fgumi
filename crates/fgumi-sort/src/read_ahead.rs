@@ -26,6 +26,7 @@
 use crossbeam_channel::{Receiver, Sender, bounded};
 use std::thread::{self, JoinHandle};
 
+use crate::worker_pool::BufferPool;
 use fgumi_bam_io::RawBamReaderAuto;
 use fgumi_raw_bam::{RawBamReader, RawRecord};
 use std::io::Read as IoRead;
@@ -248,6 +249,11 @@ pub struct PooledInputStream {
     current_buf: Vec<u8>,
     /// Read position within `current_buf`.
     current_pos: usize,
+    /// Recycling pool for decompressed BGZF block buffers. The previous
+    /// `current_buf` is returned here when a new block is loaded, so workers
+    /// can reuse the allocation on subsequent decompressions instead of
+    /// faulting in fresh anonymous pages (`clear_page_erms` in profiles).
+    decompress_buffer_pool: BufferPool,
 }
 
 impl PooledInputStream {
@@ -258,6 +264,7 @@ impl PooledInputStream {
         decompressed_input_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
         input_read_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
         decompression_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        decompress_buffer_pool: BufferPool,
     ) -> Self {
         Self {
             decompressed_input,
@@ -267,6 +274,7 @@ impl PooledInputStream {
             reorder: fgumi_bam_io::ReorderBuffer::new(),
             current_buf: Vec::new(),
             current_pos: 0,
+            decompress_buffer_pool,
         }
     }
 
@@ -377,9 +385,22 @@ impl IoRead for PooledInputStream {
             let n = data.len().min(buf.len());
             buf[..n].copy_from_slice(&data[..n]);
             if n < data.len() {
-                self.current_buf = data;
+                // Replace current_buf with the new block; return the prior
+                // buffer to the pool so a worker can reuse it. Skip the
+                // checkin if the prior buffer was the placeholder
+                // `Vec::new()` from initial construction — recycling a
+                // zero-capacity slot would dilute the pre-warmed pool.
+                let old = std::mem::replace(&mut self.current_buf, data);
+                if old.capacity() > 0 {
+                    self.decompress_buffer_pool.checkin(old);
+                }
                 self.current_pos = n;
             } else {
+                // The block was fully consumed in one read; return it to
+                // the pool directly. Keep current_buf empty (its capacity
+                // is preserved by `clear` so a subsequent partial-block
+                // read will still recycle into the pool).
+                self.decompress_buffer_pool.checkin(data);
                 self.current_buf.clear();
                 self.current_pos = 0;
             }

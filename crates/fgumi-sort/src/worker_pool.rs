@@ -32,9 +32,10 @@
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use crossbeam_queue::ArrayQueue;
+use fgumi_bgzf::reader::decompress_block_into;
 use fgumi_bgzf::reader::read_raw_blocks;
 use fgumi_bgzf::writer::InlineBgzfCompressor;
-use fgumi_bgzf::{RawBgzfBlock, decompress_block};
+use fgumi_bgzf::{BGZF_MAX_BLOCK_SIZE, RawBgzfBlock};
 use log::info;
 use std::collections::VecDeque;
 use std::fmt::Write as FmtWrite;
@@ -301,6 +302,22 @@ impl BufferPool {
         Self { tx, rx }
     }
 
+    /// Create a buffer pool pre-filled with `capacity` buffers, each
+    /// `Vec::with_capacity(buf_capacity)`.
+    ///
+    /// Useful when callers will overwrite buffer contents on every use, so the
+    /// first checkout returns a buffer that's already sized to avoid the
+    /// initial grow-through-capacity-classes seen by `Vec::new()` callers.
+    #[must_use]
+    pub fn pre_warmed(capacity: usize, buf_capacity: usize) -> Self {
+        let (tx, rx) = bounded(capacity);
+        for _ in 0..capacity {
+            tx.try_send(Vec::with_capacity(buf_capacity))
+                .expect("fresh bounded channel has room for initial pre-warm");
+        }
+        Self { tx, rx }
+    }
+
     /// Get a buffer from the pool, or allocate a new one if the pool is empty.
     #[must_use]
     pub fn checkout(&self) -> Vec<u8> {
@@ -547,6 +564,18 @@ pub struct SortWorkerPool {
     pub(crate) stats: PoolStats,
     pub(crate) pipeline_stats: Arc<SortPipelineStats>,
     pub buffer_pool: BufferPool,
+    /// Recycling pool for decompressed BGZF block buffers.
+    ///
+    /// Workers check a buffer out before each call to `decompress_block_into`;
+    /// the consumer (`PooledInputStream` or `MainThreadChunkConsumer`) returns
+    /// the previous block's buffer when it advances. Pre-warmed at
+    /// `BGZF_MAX_BLOCK_SIZE` (~65 KiB) so the very first checkout lands at the
+    /// final size and avoids the grow-through-capacity-classes that previously
+    /// charged ~1.9 % of total CPU to `RawVec::finish_grow` /
+    /// `mi_theap_malloc_zero_aligned_at_overalloc`. Pool memory budget is
+    /// `pool_capacity * BGZF_MAX_BLOCK_SIZE` (≈ 2 MiB / worker — 16 MiB at
+    /// `--threads 8`, 64 MiB at `--threads 32`).
+    pub(crate) decompress_buffer_pool: BufferPool,
     num_workers: usize,
 }
 
@@ -624,6 +653,11 @@ pub(crate) struct SharedPipelineState {
     /// Number of workers (for `low_water` threshold in backpressure).
     num_workers: usize,
 
+    /// Recycling pool for decompressed BGZF block buffers (clone of
+    /// `SortWorkerPool::decompress_buffer_pool`). Workers borrow buffers from
+    /// this pool inside `try_decompress_input` and `try_phase2_file_work`.
+    pub(crate) decompress_buffer_pool: BufferPool,
+
     /// Main thread handle for `park()`/`unpark()` notification.
     /// Workers call `unpark()` after inserting into `decompressed_input`
     /// (Phase 1) or into a per-file `Phase2FileState.decompressed` reorder
@@ -633,7 +667,11 @@ pub(crate) struct SharedPipelineState {
 }
 
 impl SharedPipelineState {
-    fn new(num_workers: usize, main_thread_handle: std::thread::Thread) -> Self {
+    fn new(
+        num_workers: usize,
+        main_thread_handle: std::thread::Thread,
+        decompress_buffer_pool: BufferPool,
+    ) -> Self {
         let data_queue_cap = num_workers * 8;
         let compress_queue_cap = num_workers * 4;
 
@@ -660,6 +698,7 @@ impl SharedPipelineState {
             compress_queue: Arc::new(ArrayQueue::new(compress_queue_cap)),
 
             num_workers,
+            decompress_buffer_pool,
             main_thread_handle,
         }
     }
@@ -877,10 +916,34 @@ impl SortWorkerPool {
     #[must_use]
     pub fn new(num_workers: usize, temp_compression: u32, output_compression: u32) -> Self {
         let buffer_pool = BufferPool::new(num_workers * 4);
+        // Pre-warm a decompress pool sized to cover the Phase 1 working set
+        // with margin. Counts of buffers the pool must hold to avoid
+        // fallback `Vec::new()` allocations:
+        //
+        //   Phase 1 (writing N workers, queue, reorder, consumer):
+        //     N         workers mid-decompression (1 each)
+        //   + N * 8     decompressed_input ArrayQueue cap (= data_queue_cap)
+        //   + N * 16    PooledInputStream reorder buffer soft cap (= 2× queue
+        //               cap; see `read_ahead::PooledInputStream::drain_queue`)
+        //   + 1         PooledInputStream::current_buf
+        //   = N * 25 + 1
+        //
+        //   Phase 2 (per-file caps × K spill files):
+        //     K * PHASE2_DECOMP_CAP (= 8) + K current_bufs = K * 9
+        //
+        // `N * 32` covers Phase 1 with ~25 % margin. When Phase 2 K exceeds
+        // ~`N * 3`, excess decompressions fall back to `BufferPool::checkout`'s
+        // empty-Vec path — graceful degradation, not a correctness issue (the
+        // original pre-PR behavior on every block).
+        let decompress_buffer_pool = BufferPool::pre_warmed(num_workers * 32, BGZF_MAX_BLOCK_SIZE);
         let stats = PoolStats::default();
         let pipeline_stats = Arc::new(SortPipelineStats::new(num_workers));
         let main_thread_handle = std::thread::current();
-        let shared = Arc::new(SharedPipelineState::new(num_workers, main_thread_handle));
+        let shared = Arc::new(SharedPipelineState::new(
+            num_workers,
+            main_thread_handle,
+            decompress_buffer_pool.clone(),
+        ));
 
         let workers: Vec<JoinHandle<()>> = (0..num_workers)
             .map(|worker_id| {
@@ -905,7 +968,15 @@ impl SortWorkerPool {
             })
             .collect();
 
-        Self { shared, workers: Some(workers), stats, pipeline_stats, buffer_pool, num_workers }
+        Self {
+            shared,
+            workers: Some(workers),
+            stats,
+            pipeline_stats,
+            buffer_pool,
+            decompress_buffer_pool,
+            num_workers,
+        }
     }
 
     // ========================================================================
@@ -1289,15 +1360,16 @@ impl SortWorkerPool {
             return StepResult::InputEmpty;
         };
 
-        let data = match decompress_block(&block, &mut worker.decompressor) {
-            Ok(d) => d,
-            Err(e) => {
-                log::error!("BGZF decompression error (input block serial {serial}): {e}");
-                shared.decompression_error.store(true, Ordering::Release);
-                shared.main_thread_handle.unpark();
-                return StepResult::InputEmpty;
-            }
-        };
+        let mut data = shared.decompress_buffer_pool.checkout();
+        if let Err(e) = decompress_block_into(&block, &mut worker.decompressor, &mut data) {
+            log::error!("BGZF decompression error (input block serial {serial}): {e}");
+            // Return the buffer to the pool so we don't leak the pre-warmed
+            // allocation on the error path.
+            shared.decompress_buffer_pool.checkin(data);
+            shared.decompression_error.store(true, Ordering::Release);
+            shared.main_thread_handle.unpark();
+            return StepResult::InputEmpty;
+        }
 
         let input_eof = shared.input_eof.load(Ordering::Acquire);
         let raw_empty = shared.raw_input_blocks.is_empty();
@@ -1386,20 +1458,20 @@ impl SortWorkerPool {
             // error path) to keep the counter balanced.
             let popped = Self::try_pop_raw_for_decompress(file);
             if let Some((serial, raw_block)) = popped {
-                let data = match decompress_block(&raw_block, &mut worker.decompressor) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        log::error!(
-                            "BGZF decompression error (chunk source {i} serial {serial}): {e}"
-                        );
-                        shared.decompression_error.store(true, Ordering::Release);
-                        // Balance the in-flight increment from try_pop_raw_for_decompress.
-                        file.decomp_in_flight.fetch_sub(1, Ordering::AcqRel);
-                        shared.main_thread_handle.unpark();
-                        worker.phase2_file_cursor = (i + 1) % n;
-                        return StepResult::Success;
-                    }
-                };
+                let mut data = shared.decompress_buffer_pool.checkout();
+                if let Err(e) =
+                    decompress_block_into(&raw_block, &mut worker.decompressor, &mut data)
+                {
+                    log::error!("BGZF decompression error (chunk source {i} serial {serial}): {e}");
+                    // Return the buffer to the pool to avoid leaking pre-warmed capacity.
+                    shared.decompress_buffer_pool.checkin(data);
+                    shared.decompression_error.store(true, Ordering::Release);
+                    // Balance the in-flight increment from try_pop_raw_for_decompress.
+                    file.decomp_in_flight.fetch_sub(1, Ordering::AcqRel);
+                    shared.main_thread_handle.unpark();
+                    worker.phase2_file_cursor = (i + 1) % n;
+                    return StepResult::Success;
+                }
                 let now_poppable = {
                     let mut dec_guard =
                         file.decompressed.lock().expect("phase2 decompressed mutex poisoned");
@@ -1585,6 +1657,13 @@ impl SortWorkerPool {
         &self,
     ) -> Arc<crossbeam_queue::ArrayQueue<(u64, Vec<u8>)>> {
         Arc::clone(&self.shared.decompressed_input)
+    }
+
+    /// Get a clone of the decompress buffer pool so consumers can return
+    /// buffers when they advance past a block.
+    #[must_use]
+    pub(crate) fn decompress_buffer_pool(&self) -> BufferPool {
+        self.decompress_buffer_pool.clone()
     }
 
     /// Get a clone of the decompressed input done flag for `PooledInputStream`.
@@ -1836,6 +1915,113 @@ mod tests {
         // Buffer should be cleared but retain capacity
         assert!(recycled.is_empty());
         assert!(recycled.capacity() >= 1024);
+    }
+
+    #[test]
+    fn test_buffer_pool_pre_warmed_yields_sized_buffers() {
+        let pool = BufferPool::pre_warmed(3, 8 * 1024);
+        assert_eq!(pool.len(), 3, "pool should be filled to `capacity`");
+
+        for _ in 0..3 {
+            let buf = pool.checkout();
+            assert!(buf.is_empty(), "pre-warmed buffer has length 0");
+            assert!(
+                buf.capacity() >= 8 * 1024,
+                "pre-warmed buffer should land at the requested capacity, got {}",
+                buf.capacity()
+            );
+        }
+
+        // Exhausted pool falls back to a fresh empty Vec (capacity 0).
+        let fallback = pool.checkout();
+        assert!(fallback.is_empty());
+        assert_eq!(fallback.capacity(), 0);
+    }
+
+    #[test]
+    fn test_buffer_pool_concurrent_recycle_no_leak() {
+        // Mirror the worker → consumer pattern used in the decompress
+        // pipeline: P "worker" threads checkout and (fake) fill a buffer,
+        // hand it across a channel to a "consumer" thread that checks it
+        // back in. Verify that the pool's free count stays bounded
+        // (no growth beyond capacity) and recovers to its pre-warmed size
+        // once all in-flight buffers are returned.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const POOL_CAP: usize = 16;
+        const BUF_CAP: usize = 8 * 1024;
+        const PRODUCERS: usize = 4;
+        const ITEMS_PER_PRODUCER: usize = 64;
+
+        let pool = BufferPool::pre_warmed(POOL_CAP, BUF_CAP);
+        assert_eq!(pool.len(), POOL_CAP);
+
+        let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(POOL_CAP);
+        let returned = Arc::new(AtomicUsize::new(0));
+
+        let consumer_pool = pool.clone();
+        let consumer_returned = Arc::clone(&returned);
+        let consumer = std::thread::spawn(move || {
+            while let Ok(buf) = rx.recv() {
+                consumer_pool.checkin(buf);
+                consumer_returned.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let producers: Vec<_> = (0..PRODUCERS)
+            .map(|_| {
+                let p = pool.clone();
+                let t = tx.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..ITEMS_PER_PRODUCER {
+                        let mut buf = p.checkout();
+                        // Simulate decompress filling the buffer.
+                        buf.resize(BUF_CAP, 0xAB);
+                        t.send(buf).expect("consumer receiver alive");
+                    }
+                })
+            })
+            .collect();
+        drop(tx);
+
+        for p in producers {
+            p.join().expect("producer should not panic");
+        }
+        consumer.join().expect("consumer should not panic");
+
+        assert_eq!(returned.load(Ordering::Relaxed), PRODUCERS * ITEMS_PER_PRODUCER);
+        assert!(
+            pool.len() <= POOL_CAP,
+            "pool should never exceed its capacity; got {}",
+            pool.len()
+        );
+        // After all producers finish and all consumers drain, the pool
+        // should be at its full capacity again (every buffer either fell
+        // through a checkout/checkin cycle or was retained by `try_send`
+        // succeeding into a free slot).
+        assert_eq!(pool.len(), POOL_CAP);
+    }
+
+    #[test]
+    fn test_buffer_pool_pre_warmed_round_trip_preserves_capacity() {
+        let pool = BufferPool::pre_warmed(2, 4 * 1024);
+        let mut buf = pool.checkout();
+        let initial_cap = buf.capacity();
+        assert!(initial_cap >= 4 * 1024);
+
+        // Simulate decompress filling the buffer.
+        buf.extend_from_slice(&[0u8; 4 * 1024]);
+        pool.checkin(buf);
+
+        let recycled = pool.checkout();
+        assert!(recycled.is_empty(), "checkin clears length");
+        assert!(
+            recycled.capacity() >= initial_cap,
+            "round-trip should not shrink capacity: got {}, expected >= {}",
+            recycled.capacity(),
+            initial_cap
+        );
     }
 
     #[test]

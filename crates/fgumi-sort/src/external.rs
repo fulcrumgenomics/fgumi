@@ -31,7 +31,7 @@ use crate::memory_probe::{
 use crate::pooled_chunk_writer::PooledChunkWriter;
 use crate::read_ahead::{PooledInputStream, RawReadAheadReader, RecordSource};
 use crate::tmp_dir_alloc::TmpDirAllocator;
-use crate::worker_pool::SortWorkerPool;
+use crate::worker_pool::{BufferPool, SortWorkerPool};
 use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use fgumi_bam_io::ProgressTracker;
@@ -841,6 +841,10 @@ pub(crate) struct MainThreadChunkConsumer<K: RawSortKey + 'static> {
     chunk_read_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Set by `do_shutdown` when a worker thread panicked unexpectedly.
     worker_panicked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Recycling pool for decompressed BGZF block buffers. The previous
+    /// `current_buf` of each parser-state slot is returned here when a new
+    /// block is pulled from the reorder buffer.
+    decompress_buffer_pool: BufferPool,
     _phantom: std::marker::PhantomData<K>,
 }
 
@@ -852,6 +856,7 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
         decompression_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
         chunk_read_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
         worker_panicked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        decompress_buffer_pool: BufferPool,
     ) -> Self {
         let parser_state = (0..files.len()).map(|_| SourceParserState::new()).collect();
         Self {
@@ -860,6 +865,7 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
             decompression_error,
             chunk_read_error,
             worker_panicked,
+            decompress_buffer_pool,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -902,7 +908,15 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
                 if let Some(data) = guard.try_pop_next() {
                     drop(guard);
                     let st = &mut self.parser_state[source_id];
-                    st.current_buf = data;
+                    // Return the previous block's buffer to the pool so a
+                    // worker can reuse it on the next decompression. Skip
+                    // the checkin if the prior buffer was the placeholder
+                    // `Vec::new()` from `SourceParserState::new` — recycling
+                    // a zero-capacity slot would dilute the pre-warmed pool.
+                    let old = std::mem::replace(&mut st.current_buf, data);
+                    if old.capacity() > 0 {
+                        self.decompress_buffer_pool.checkin(old);
+                    }
                     st.current_pos = 0;
                     return Ok(true);
                 }
@@ -2629,6 +2643,7 @@ impl RawExternalSorter {
                 pool.decompress_error_flag(),
                 pool.chunk_read_error_flag(),
                 pool.worker_panicked_flag(),
+                pool.decompress_buffer_pool(),
             );
             pool.set_phase(phase::PHASE2);
             Phase2Guard { pool, consumer: Some(consumer), active: true }
@@ -3108,6 +3123,7 @@ fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
         pool.decompressed_input_done_flag(),
         pool.input_read_error_flag(),
         pool.decompress_error_flag(),
+        pool.decompress_buffer_pool(),
     );
 
     skip_bam_header(&mut pooled_input)
