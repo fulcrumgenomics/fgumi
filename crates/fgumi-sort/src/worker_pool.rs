@@ -17,8 +17,11 @@
 //!   Phase 1: `DecompressInput` > `ReadInputBlocks` > `CompressSpill`.
 //!   Phase 2: `Phase2FileWork` (read+decompress the next block of any file that has
 //!   room in its reorder buffer) > `CompressOutput`.
-//! - **Per-worker state**: Each worker owns an `InlineBgzfCompressor` and a
-//!   `libdeflater::Decompressor`, avoiding cross-thread synchronization.
+//! - **Per-worker state**: Each worker owns an `InlineBgzfCompressor`, a
+//!   `libdeflater::Decompressor`, a `zstd::bulk::Compressor`, and a
+//!   `zstd::bulk::Decompressor` (the latter pair are used only when the
+//!   selected spill codec is `Zstd`). Per-worker contexts avoid cross-thread
+//!   synchronization on the compression hot path.
 //! - **Per-file work-stealing (Phase 2)**: Each spill file has its own `Phase2FileState`
 //!   with a `Mutex`-guarded reader, a raw-block FIFO, and a decompressed reorder buffer.
 //!   Workers scan the shared snapshot, pick a file with work to do, and advance it
@@ -30,6 +33,7 @@
 //! - **Bounded backpressure**: All channels are bounded to prevent unbounded memory
 //!   growth when producers outpace consumers.
 
+use crate::codec::{SpillCodec, ZSPILL_MAGIC};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use crossbeam_queue::ArrayQueue;
 use fgumi_bgzf::reader::read_raw_blocks;
@@ -39,18 +43,101 @@ use log::info;
 use std::collections::VecDeque;
 use std::fmt::Write as FmtWrite;
 use std::io::{BufReader, Read};
+use std::io::{Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
+use zstd::bulk::{Compressor as ZstdCompressor, Decompressor as ZstdDecompressor};
 
 use fgumi_bam_io::ReorderBuffer;
+
+/// Read up to `n` length-prefixed zstd frames from `reader`.
+///
+/// On-disk format for a zstd spill file is the four-byte file magic followed
+/// by a sequence of `[u32 LE compressed-len][zstd frame bytes]` records. The
+/// magic is consumed by `set_phase2_files`, so `reader` is positioned at the
+/// first length prefix on entry.
+///
+/// Returns the frames read. Stops cleanly at a frame boundary on EOF and
+/// returns an error if the file is truncated inside a length prefix or frame
+/// body, or if a length prefix exceeds `MAX_ZSTD_FRAME_BYTES`.
+pub(crate) fn read_raw_zstd_frames<R: std::io::Read + ?Sized>(
+    reader: &mut R,
+    n: usize,
+) -> std::io::Result<Vec<Vec<u8>>> {
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(n);
+    for _ in 0..n {
+        match read_length_prefix(reader)? {
+            None => break,
+            Some(frame_len) => {
+                let mut frame = vec![0u8; frame_len];
+                reader.read_exact(&mut frame)?;
+                out.push(frame);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Read a `u32 LE` length prefix and validate it against `MAX_ZSTD_FRAME_BYTES`.
+///
+/// Returns `Ok(None)` only when the reader is at a clean frame boundary (no
+/// bytes consumed before EOF). A 1–3-byte partial prefix surfaces as
+/// `UnexpectedEof` so truncation is not silently treated as a clean stop.
+pub(crate) fn read_length_prefix<R: std::io::Read + ?Sized>(
+    reader: &mut R,
+) -> std::io::Result<Option<usize>> {
+    use std::io::ErrorKind;
+    let mut first = [0u8; 1];
+    match reader.read(&mut first)? {
+        0 => return Ok(None),
+        1 => {}
+        n => {
+            return Err(std::io::Error::other(format!(
+                "Read returned {n} bytes for a 1-byte buffer",
+            )));
+        }
+    }
+    let mut rest = [0u8; 3];
+    reader.read_exact(&mut rest)?;
+    let len_buf = [first[0], rest[0], rest[1], rest[2]];
+    let frame_len = u32::from_le_bytes(len_buf) as usize;
+    if frame_len > MAX_ZSTD_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "zstd spill frame length {frame_len} exceeds MAX_ZSTD_FRAME_BYTES ({MAX_ZSTD_FRAME_BYTES}): file likely corrupted",
+            ),
+        ));
+    }
+    Ok(Some(frame_len))
+}
+
+/// Cap on uncompressed size of a zstd spill frame. Production frames are
+/// bounded by the staging buffer (`BGZF_MAX_BLOCK_SIZE` + padding ~= 68 KB);
+/// this leaves slack but stays small enough that per-frame allocations don't
+/// dominate the merge phase when there are many tens of thousands of frames.
+const ZSTD_FRAME_DECOMP_CAP: usize = 256 * 1024;
+
+/// Hard cap on the `u32 LE` length prefix of any zstd spill frame. Frames are
+/// produced one per ~64 KiB of input by `handle_compress_job`; even
+/// pathological expansion can't reach this. Beyond it, we treat the value as
+/// corruption rather than allocate gigabytes.
+pub(crate) const MAX_ZSTD_FRAME_BYTES: usize = 2 * 1024 * 1024;
+
+/// Maximum zstd compression level recognized by the `zstd` crate.
+const ZSTD_MAX_CLEVEL: u32 = 22;
 
 // ============================================================================
 // Job and Result Types
 // ============================================================================
 
-/// A compression job: compress uncompressed data into a BGZF block.
+/// A compression job: compress uncompressed data into one compressed block.
+///
+/// The codec determines the output framing:
+/// - `SpillCodec::Bgzf` produces one BGZF block (header + deflate + footer).
+/// - `SpillCodec::Zstd` produces `[u32 LE frame-len][zstd frame]`.
 pub struct CompressJob {
     /// Uncompressed data to compress.
     pub data: Vec<u8>,
@@ -58,6 +145,8 @@ pub struct CompressJob {
     pub serial: u64,
     /// Channel to send the compressed result back.
     pub result_tx: Sender<CompressResult>,
+    /// Codec to use when compressing.
+    pub codec: SpillCodec,
 }
 
 /// Result of a compression job.
@@ -400,12 +489,14 @@ const INPUT_READ_BATCH_SIZE: usize = 16;
 /// Bounds disk read-ahead memory: K files × `PHASE2_RAW_CAP` × ~64 KB.
 pub(crate) const PHASE2_RAW_CAP: usize = 8;
 
-/// Number of decompressed BGZF blocks the per-file reorder buffer may hold
-/// before workers stop decompressing more for that file.
+/// Number of decompressed blocks the per-file reorder buffer may hold before
+/// workers stop decompressing more for that file.
 ///
-/// Bounds in-flight decompressed memory: K files × `PHASE2_DECOMP_CAP` × ~256 KB.
-/// This is a soft cap — the "always accept the next-expected serial" rule lets
-/// it transiently exceed by up to ~`num_workers` blocks per file.
+/// Bounds in-flight decompressed memory: K files × `PHASE2_DECOMP_CAP` ×
+/// payload size. Payload size is ~64 KB for BGZF (one block) and up to
+/// `ZSTD_FRAME_DECOMP_CAP` (256 KB) for zstd frames. This is a soft cap — the
+/// "always accept the next-expected serial" rule lets it transiently exceed by
+/// up to ~`num_workers` blocks per file.
 pub(crate) const PHASE2_DECOMP_CAP: usize = 8;
 
 /// Number of raw blocks to read from disk per `ReadRawBlocks` call.
@@ -432,8 +523,12 @@ pub(crate) struct Phase2FileState {
     /// without touching the reader mutex (called per decompressed block on
     /// the hot Phase 2 path).
     pub(crate) reader_eof: AtomicBool,
-    /// Raw BGZF blocks read from disk, in serial order. FIFO.
-    pub(crate) raw_blocks: Mutex<VecDeque<(u64, RawBgzfBlock)>>,
+    /// Codec used to compress this file. Detected at open time from magic.
+    pub(crate) codec: SpillCodec,
+    /// Raw compressed blocks read from disk, in serial order. For BGZF, each
+    /// entry is the raw block bytes (header + deflate + footer). For zstd,
+    /// each entry is one complete zstd frame's bytes.
+    pub(crate) raw_blocks: Mutex<VecDeque<(u64, Vec<u8>)>>,
     /// Decompressed blocks reordered by serial. Main thread pops the next-in-order
     /// block here when its parser exhausts the current buffer.
     pub(crate) decompressed: Mutex<ReorderBuffer<Vec<u8>>>,
@@ -445,10 +540,11 @@ pub(crate) struct Phase2FileState {
 }
 
 impl Phase2FileState {
-    pub(crate) fn new(reader: BufReader<std::fs::File>) -> Self {
+    pub(crate) fn new(reader: BufReader<std::fs::File>, codec: SpillCodec) -> Self {
         Self {
             reader: Mutex::new(Phase2Reader { inner: reader, next_serial: 0, eof: false }),
             reader_eof: AtomicBool::new(false),
+            codec,
             raw_blocks: Mutex::new(VecDeque::with_capacity(PHASE2_RAW_CAP)),
             decompressed: Mutex::new(ReorderBuffer::new()),
             decomp_in_flight: AtomicUsize::new(0),
@@ -548,6 +644,7 @@ pub struct SortWorkerPool {
     pub(crate) pipeline_stats: Arc<SortPipelineStats>,
     pub buffer_pool: BufferPool,
     num_workers: usize,
+    pub(crate) spill_codec: SpillCodec,
 }
 
 /// Shared state visible to all workers and the main thread.
@@ -698,6 +795,13 @@ struct SortWorkerState {
     compressor: InlineBgzfCompressor,
     /// Compressor used for Phase 2 merge output (output compression level).
     output_compressor: InlineBgzfCompressor,
+    /// Zstd compressor reused across spill frames when `SpillCodec::Zstd`.
+    zstd_compressor: ZstdCompressor<'static>,
+    /// Zstd decompressor reused across Phase 2 frames when `SpillCodec::Zstd`.
+    zstd_decompressor: ZstdDecompressor<'static>,
+    /// Scratch buffer reused across zstd frame decompressions to avoid
+    /// allocating a fresh Vec for every frame on the merge hot path.
+    zstd_decompress_buf: Vec<u8>,
     decompressor: libdeflater::Decompressor,
     /// Phase 2 file scan cursor — starts at `worker_id` and advances on success
     /// for cache locality and reduced lock contention. Workers no longer own a
@@ -874,8 +978,14 @@ impl SortWorkerPool {
     ///
     /// - `temp_compression`: BGZF level for Phase 1 spill writes (typically 1 for speed).
     /// - `output_compression`: BGZF level for Phase 2 merge output (typically 6 for size).
+    /// - `spill_codec`: codec used for spill chunks (BGZF or Zstd). Output is always BGZF.
     #[must_use]
-    pub fn new(num_workers: usize, temp_compression: u32, output_compression: u32) -> Self {
+    pub fn new(
+        num_workers: usize,
+        temp_compression: u32,
+        output_compression: u32,
+        spill_codec: SpillCodec,
+    ) -> Self {
         let buffer_pool = BufferPool::new(num_workers * 4);
         let stats = PoolStats::default();
         let pipeline_stats = Arc::new(SortPipelineStats::new(num_workers));
@@ -888,10 +998,21 @@ impl SortWorkerPool {
                 let shared = Arc::clone(&shared);
 
                 thread::spawn(move || {
+                    let zstd_level =
+                        i32::try_from(temp_compression.clamp(1, ZSTD_MAX_CLEVEL)).expect("clamped");
+                    let zstd_decompress_buf = if matches!(spill_codec, SpillCodec::Zstd) {
+                        vec![0u8; ZSTD_FRAME_DECOMP_CAP]
+                    } else {
+                        Vec::new()
+                    };
                     let mut worker = SortWorkerState {
                         worker_id,
                         compressor: InlineBgzfCompressor::new(temp_compression),
                         output_compressor: InlineBgzfCompressor::new(output_compression),
+                        zstd_compressor: ZstdCompressor::new(zstd_level)
+                            .expect("zstd compressor init"),
+                        zstd_decompressor: ZstdDecompressor::new().expect("zstd decompressor init"),
+                        zstd_decompress_buf,
                         decompressor: libdeflater::Decompressor::new(),
                         phase2_file_cursor: worker_id,
                         held_raw_input_blocks: Vec::new(),
@@ -905,7 +1026,15 @@ impl SortWorkerPool {
             })
             .collect();
 
-        Self { shared, workers: Some(workers), stats, pipeline_stats, buffer_pool, num_workers }
+        Self {
+            shared,
+            workers: Some(workers),
+            stats,
+            pipeline_stats,
+            buffer_pool,
+            num_workers,
+            spill_codec,
+        }
     }
 
     // ========================================================================
@@ -1140,8 +1269,14 @@ impl SortWorkerPool {
             // the race where a worker pops a spill job then set_phase(PHASE2) fires
             // before the compressor is chosen, causing spill data to be compressed
             // at the output level.
-            SortStep::CompressSpill => Self::try_compress(shared, &mut worker.compressor),
-            SortStep::CompressOutput => Self::try_compress(shared, &mut worker.output_compressor),
+            SortStep::CompressSpill => {
+                Self::try_compress(shared, &mut worker.compressor, &mut worker.zstd_compressor)
+            }
+            SortStep::CompressOutput => Self::try_compress(
+                shared,
+                &mut worker.output_compressor,
+                &mut worker.zstd_compressor,
+            ),
             SortStep::Phase2FileWork => Self::try_phase2_file_work(shared, worker),
         }
     }
@@ -1364,6 +1499,7 @@ impl SortWorkerPool {
     /// raw FIFO's head matches the buffer's `next_seq` and the buffer is stuck
     /// (`!can_pop`). That is the gap-filler the main thread is waiting for, and
     /// failing to admit it would deadlock the merge.
+    #[allow(clippy::too_many_lines)]
     fn try_phase2_file_work(
         shared: &SharedPipelineState,
         worker: &mut SortWorkerState,
@@ -1385,19 +1521,54 @@ impl SortWorkerPool {
             // decrement after inserting into the reorder buffer (or on the
             // error path) to keep the counter balanced.
             let popped = Self::try_pop_raw_for_decompress(file);
-            if let Some((serial, raw_block)) = popped {
-                let data = match decompress_block(&raw_block, &mut worker.decompressor) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        log::error!(
-                            "BGZF decompression error (chunk source {i} serial {serial}): {e}"
-                        );
-                        shared.decompression_error.store(true, Ordering::Release);
-                        // Balance the in-flight increment from try_pop_raw_for_decompress.
-                        file.decomp_in_flight.fetch_sub(1, Ordering::AcqRel);
-                        shared.main_thread_handle.unpark();
-                        worker.phase2_file_cursor = (i + 1) % n;
-                        return StepResult::Success;
+            if let Some((serial, raw_bytes)) = popped {
+                let data = match file.codec {
+                    SpillCodec::Bgzf => {
+                        let raw_block = RawBgzfBlock { data: raw_bytes };
+                        match decompress_block(&raw_block, &mut worker.decompressor) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                log::error!(
+                                    "BGZF decompression error (chunk source {i} serial {serial}): {e}"
+                                );
+                                shared.decompression_error.store(true, Ordering::Release);
+                                file.decomp_in_flight.fetch_sub(1, Ordering::AcqRel);
+                                shared.main_thread_handle.unpark();
+                                worker.phase2_file_cursor = (i + 1) % n;
+                                return StepResult::Success;
+                            }
+                        }
+                    }
+                    SpillCodec::Zstd => {
+                        // Allocate the scratch buffer lazily so BGZF-only sorts
+                        // don't pay 256 KiB × num_workers of dead memory.
+                        if worker.zstd_decompress_buf.len() < ZSTD_FRAME_DECOMP_CAP {
+                            worker.zstd_decompress_buf.resize(ZSTD_FRAME_DECOMP_CAP, 0);
+                        }
+                        match worker
+                            .zstd_decompressor
+                            .decompress_to_buffer(&raw_bytes, &mut worker.zstd_decompress_buf)
+                        {
+                            Ok(n) => {
+                                // Copy the `n` decompressed bytes (≤ one
+                                // staging-buffer's worth, typically ~65 KB)
+                                // into a fresh Vec for the consumer. The
+                                // scratch buffer keeps its 256 KiB capacity
+                                // so the next frame on this worker reuses it
+                                // without reallocating.
+                                worker.zstd_decompress_buf[..n].to_vec()
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    "zstd decompression error (chunk source {i} serial {serial}): {e}"
+                                );
+                                shared.decompression_error.store(true, Ordering::Release);
+                                file.decomp_in_flight.fetch_sub(1, Ordering::AcqRel);
+                                shared.main_thread_handle.unpark();
+                                worker.phase2_file_cursor = (i + 1) % n;
+                                return StepResult::Success;
+                            }
+                        }
                     }
                 };
                 let now_poppable = {
@@ -1441,21 +1612,40 @@ impl SortWorkerPool {
                 continue;
             }
 
-            let blocks = match read_raw_blocks(&mut reader_guard.inner, PHASE2_READ_BATCH) {
-                Ok(b) => b,
-                Err(e) => {
-                    log::error!("I/O error reading chunk file (source {i}): {e}");
-                    shared.chunk_read_error.store(true, Ordering::Release);
-                    file.mark_reader_eof(&mut reader_guard);
-                    drop(reader_guard);
-                    shared.main_thread_handle.unpark();
-                    Self::maybe_mark_all_eof(shared);
-                    worker.phase2_file_cursor = (i + 1) % n;
-                    return StepResult::Success;
+            let raw_bytes: Vec<Vec<u8>> = match file.codec {
+                SpillCodec::Bgzf => {
+                    match read_raw_blocks(&mut reader_guard.inner, PHASE2_READ_BATCH) {
+                        Ok(blocks) => blocks.into_iter().map(|b| b.data).collect(),
+                        Err(e) => {
+                            log::error!("I/O error reading chunk file (source {i}): {e}");
+                            shared.chunk_read_error.store(true, Ordering::Release);
+                            file.mark_reader_eof(&mut reader_guard);
+                            drop(reader_guard);
+                            shared.main_thread_handle.unpark();
+                            Self::maybe_mark_all_eof(shared);
+                            worker.phase2_file_cursor = (i + 1) % n;
+                            return StepResult::Success;
+                        }
+                    }
+                }
+                SpillCodec::Zstd => {
+                    match read_raw_zstd_frames(&mut reader_guard.inner, PHASE2_READ_BATCH) {
+                        Ok(frames) => frames,
+                        Err(e) => {
+                            log::error!("I/O error reading zstd chunk file (source {i}): {e}");
+                            shared.chunk_read_error.store(true, Ordering::Release);
+                            file.mark_reader_eof(&mut reader_guard);
+                            drop(reader_guard);
+                            shared.main_thread_handle.unpark();
+                            Self::maybe_mark_all_eof(shared);
+                            worker.phase2_file_cursor = (i + 1) % n;
+                            return StepResult::Success;
+                        }
+                    }
                 }
             };
 
-            if blocks.is_empty() {
+            if raw_bytes.is_empty() {
                 file.mark_reader_eof(&mut reader_guard);
                 drop(reader_guard);
                 shared.main_thread_handle.unpark();
@@ -1474,8 +1664,8 @@ impl SortWorkerPool {
             // nested-lock path in this function.
             let mut raw_guard = file.raw_blocks.lock().expect("phase2 raw_blocks mutex poisoned");
             let start_serial = reader_guard.next_serial;
-            reader_guard.next_serial += blocks.len() as u64;
-            for (idx, b) in blocks.into_iter().enumerate() {
+            reader_guard.next_serial += raw_bytes.len() as u64;
+            for (idx, b) in raw_bytes.into_iter().enumerate() {
                 raw_guard.push_back((start_serial + idx as u64, b));
             }
             drop(raw_guard);
@@ -1501,7 +1691,7 @@ impl SortWorkerPool {
     /// `is_drained()` check correctly reflects the in-progress decompression.
     /// The caller is responsible for the matching decrement after inserting
     /// (or on the decompression-error path).
-    fn try_pop_raw_for_decompress(file: &Phase2FileState) -> Option<(u64, RawBgzfBlock)> {
+    fn try_pop_raw_for_decompress(file: &Phase2FileState) -> Option<(u64, Vec<u8>)> {
         let mut raw_guard = file.raw_blocks.try_lock().ok()?;
         let head_serial = raw_guard.front().map(|(s, _)| *s)?;
 
@@ -1539,12 +1729,13 @@ impl SortWorkerPool {
     /// `set_phase(PHASE2)` fires before the compressor is selected.
     fn try_compress(
         shared: &SharedPipelineState,
-        compressor: &mut InlineBgzfCompressor,
+        bgzf_compressor: &mut InlineBgzfCompressor,
+        zstd_compressor: &mut ZstdCompressor<'static>,
     ) -> StepResult {
         let Some(job) = shared.compress_queue.pop() else {
             return StepResult::InputEmpty;
         };
-        Self::handle_compress_job(shared, job, compressor);
+        Self::handle_compress_job(shared, job, bgzf_compressor, zstd_compressor);
         StepResult::Success
     }
 
@@ -1569,6 +1760,12 @@ impl SortWorkerPool {
     /// Number of worker threads in the pool.
     pub fn num_workers(&self) -> usize {
         self.num_workers
+    }
+
+    /// Codec used to compress Phase 1 spill chunks.
+    #[must_use]
+    pub fn spill_codec(&self) -> SpillCodec {
+        self.spill_codec
     }
 
     /// Phase 1 input pipeline queue depths: `(raw_input_blocks, decompressed_input, buffer_pool)`.
@@ -1659,11 +1856,38 @@ impl SortWorkerPool {
 
         let mut states: Vec<Phase2FileState> = Vec::with_capacity(total_sources);
         for path in files {
-            let file = std::fs::File::open(path).map_err(|e| {
+            let mut file = std::fs::File::open(path).map_err(|e| {
                 anyhow::anyhow!("Failed to open chunk file {}: {e}", path.display())
             })?;
+            // Detect codec by peeking at the first 4 bytes. BGZF starts with
+            // 0x1f 0x8b; zstd-spill starts with "ZSP1". On zstd, consume the
+            // four magic bytes so the reader is positioned at the first frame.
+            //
+            // Use `read_exact_or_eof` so a short `read()` (legal for `Read`)
+            // can't truncate `ZSPILL_MAGIC` and silently misroute a zstd spill
+            // through the BGZF fallback. Clean EOF preserves the existing
+            // BGZF-fallback behavior (empty file → BGZF reader will error).
+            let mut magic = [0u8; 4];
+            let read_n =
+                if crate::external::read_exact_or_eof(&mut file, &mut magic).map_err(|e| {
+                    anyhow::anyhow!("Failed to read chunk magic {}: {e}", path.display())
+                })? {
+                    4
+                } else {
+                    0
+                };
+            let codec = SpillCodec::from_magic(&magic[..read_n]).unwrap_or(SpillCodec::Bgzf);
+            // Zstd consumes the magic itself; BGZF wants the file rewound to
+            // byte 0 since its decoder reads the gzip header.
+            let body_start = match codec {
+                SpillCodec::Bgzf => 0,
+                SpillCodec::Zstd => ZSPILL_MAGIC.len() as u64,
+            };
+            file.seek(SeekFrom::Start(body_start)).map_err(|e| {
+                anyhow::anyhow!("Failed to seek chunk file {}: {e}", path.display())
+            })?;
             let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
-            states.push(Phase2FileState::new(reader));
+            states.push(Phase2FileState::new(reader, codec));
         }
 
         let mut guard = self.shared.phase2_files.write().expect("phase2_files rwlock poisoned");
@@ -1756,18 +1980,35 @@ impl SortWorkerPool {
     fn handle_compress_job(
         shared: &SharedPipelineState,
         job: CompressJob,
-        compressor: &mut InlineBgzfCompressor,
+        bgzf_compressor: &mut InlineBgzfCompressor,
+        zstd_compressor: &mut ZstdCompressor<'static>,
     ) {
-        compressor
-            .write_all(&job.data)
-            .expect("BGZF compression write should not fail for valid data");
-        compressor.flush().expect("BGZF compression flush should not fail");
-
-        let blocks = compressor.take_blocks();
-        let mut compressed = Vec::new();
-        for block in &blocks {
-            compressed.extend_from_slice(&block.data);
-        }
+        let compressed: Vec<u8> = match job.codec {
+            SpillCodec::Bgzf => {
+                bgzf_compressor
+                    .write_all(&job.data)
+                    .expect("BGZF compression write should not fail for valid data");
+                bgzf_compressor.flush().expect("BGZF compression flush should not fail");
+                let blocks = bgzf_compressor.take_blocks();
+                let mut out = Vec::with_capacity(blocks.iter().map(|b| b.data.len()).sum());
+                for block in &blocks {
+                    out.extend_from_slice(&block.data);
+                }
+                out
+            }
+            SpillCodec::Zstd => {
+                // One self-contained zstd frame per job, length-prefixed so the
+                // reader can split frames without scanning the stream.
+                let frame =
+                    zstd_compressor.compress(&job.data).expect("zstd compression should not fail");
+                let frame_len = u32::try_from(frame.len())
+                    .expect("zstd frame larger than 4 GiB cannot fit in a u32 length prefix");
+                let mut out = Vec::with_capacity(4 + frame.len());
+                out.extend_from_slice(&frame_len.to_le_bytes());
+                out.extend_from_slice(&frame);
+                out
+            }
+        };
 
         let mut recycled = job.data;
         recycled.clear();
@@ -1849,12 +2090,12 @@ mod tests {
 
     #[test]
     fn test_pool_compress_roundtrip() {
-        let pool = SortWorkerPool::new(2, 1, 6);
+        let pool = SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf);
         let (result_tx, result_rx) = pool.compress_result_channel();
 
         // Submit a compress job
         let data = vec![b'A'; 1000];
-        pool.submit_compress(CompressJob { data, serial: 0, result_tx });
+        pool.submit_compress(CompressJob { data, serial: 0, result_tx, codec: SpillCodec::Bgzf });
 
         // Wait for result
         let result = result_rx.recv().expect("should receive compress result");
@@ -1870,7 +2111,7 @@ mod tests {
 
     #[test]
     fn test_pool_many_jobs() {
-        let pool = SortWorkerPool::new(4, 1, 6);
+        let pool = SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf);
         let (result_tx, result_rx) = pool.compress_result_channel();
 
         let num_jobs = 100usize;
@@ -1886,6 +2127,7 @@ mod tests {
                     data,
                     serial: i as u64,
                     result_tx: submit_tx.clone(),
+                    codec: SpillCodec::Bgzf,
                 });
             }
             drop(submit_tx);
@@ -1905,11 +2147,16 @@ mod tests {
 
     #[test]
     fn test_pool_stats() {
-        let pool = SortWorkerPool::new(2, 1, 6);
+        let pool = SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf);
         let (c_tx, c_rx) = pool.compress_result_channel();
 
         // Submit one compress job
-        pool.submit_compress(CompressJob { data: vec![b'A'; 100], serial: 0, result_tx: c_tx });
+        pool.submit_compress(CompressJob {
+            data: vec![b'A'; 100],
+            serial: 0,
+            result_tx: c_tx,
+            codec: SpillCodec::Bgzf,
+        });
         let _ = c_rx.recv();
 
         assert_eq!(pool.stats.compress_jobs_submitted.load(Ordering::Relaxed), 1);
@@ -2070,7 +2317,7 @@ mod tests {
 
     #[test]
     fn test_worker_pool_num_workers() {
-        let pool = SortWorkerPool::new(3, 1, 6);
+        let pool = SortWorkerPool::new(3, 1, 6, crate::codec::SpillCodec::Bgzf);
         assert_eq!(pool.num_workers(), 3);
         pool.shutdown();
     }
@@ -2085,12 +2332,12 @@ mod tests {
     fn empty_phase2_file() -> Phase2FileState {
         let tmp = tempfile::tempfile().expect("failed to create tempfile");
         let reader = BufReader::with_capacity(1024, tmp);
-        Phase2FileState::new(reader)
+        Phase2FileState::new(reader, SpillCodec::Bgzf)
     }
 
-    /// Build a tiny placeholder `RawBgzfBlock` whose contents we never decode.
-    fn dummy_raw_block(byte: u8) -> RawBgzfBlock {
-        RawBgzfBlock { data: vec![byte; 8] }
+    /// Build a tiny placeholder raw block whose contents we never decode.
+    fn dummy_raw_block(byte: u8) -> Vec<u8> {
+        vec![byte; 8]
     }
 
     #[test]
@@ -2210,5 +2457,178 @@ mod tests {
         file.mark_reader_eof(&mut file.reader.lock().expect("reader lock"));
         file.decompressed.lock().expect("dec lock").insert(0, vec![1, 2, 3]);
         assert!(!file.is_drained(), "decompressed blocks pending must keep is_drained=false");
+    }
+
+    // ========================================================================
+    // Zstd-framing parser tests
+    //
+    // `read_length_prefix` and `read_raw_zstd_frames` are the workhorses of the
+    // ZSP1 reader path; both are reused by `ZspillStreamReader`. These tests
+    // pin the boundary behaviour (clean EOF vs. truncation, oversized length
+    // cap) that the file-format invariants rely on.
+    // ========================================================================
+
+    use rstest::rstest;
+    use std::io::Cursor;
+
+    #[test]
+    fn test_read_length_prefix_clean_eof_returns_none() {
+        // No bytes available at all → clean stream end.
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let got = read_length_prefix(&mut reader).expect("clean EOF must not be an error");
+        assert!(got.is_none(), "empty reader must yield Ok(None), got {got:?}");
+    }
+
+    #[rstest]
+    #[case(1)]
+    #[case(2)]
+    #[case(3)]
+    fn test_read_length_prefix_partial_prefix_is_unexpected_eof(#[case] partial: usize) {
+        // 1–3 bytes after a frame boundary is a truncated length prefix, not a
+        // clean EOF; the parser must surface UnexpectedEof so corruption is not
+        // silently swallowed.
+        let bytes = vec![0xABu8; partial];
+        let err = read_length_prefix(&mut Cursor::new(bytes))
+            .expect_err("partial prefix must error, partial={partial}");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof, "partial={partial}, got {err:?}");
+    }
+
+    #[test]
+    fn test_read_length_prefix_oversized_is_invalid_data() {
+        let bogus_len: u32 =
+            u32::try_from(MAX_ZSTD_FRAME_BYTES).expect("MAX_ZSTD_FRAME_BYTES fits u32") + 1;
+        let buf = bogus_len.to_le_bytes().to_vec();
+        let err =
+            read_length_prefix(&mut Cursor::new(buf)).expect_err("oversized length must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_read_length_prefix_valid() {
+        let valid_len: u32 = 1234;
+        let buf = valid_len.to_le_bytes().to_vec();
+        let got = read_length_prefix(&mut Cursor::new(buf)).expect("valid prefix");
+        assert_eq!(got, Some(valid_len as usize));
+    }
+
+    #[test]
+    fn test_read_raw_zstd_frames_clean_eof_returns_empty() {
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let frames = read_raw_zstd_frames(&mut reader, 4).expect("clean EOF should be Ok");
+        assert!(frames.is_empty(), "no frames in an empty stream");
+    }
+
+    #[test]
+    fn test_read_raw_zstd_frames_truncated_body_is_unexpected_eof() {
+        // Length prefix promises N body bytes, but only N/2 are present.
+        let body = b"hello there, this is a frame body".to_vec();
+        let frame_len = u32::try_from(body.len()).expect("fits");
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&frame_len.to_le_bytes());
+        buf.extend_from_slice(&body[..body.len() / 2]);
+
+        let err =
+            read_raw_zstd_frames(&mut Cursor::new(buf), 1).expect_err("truncated body must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn test_read_raw_zstd_frames_reads_multiple_frames() {
+        // Two opaque "frames" — the parser does not decompress, so any bytes
+        // serve as a stand-in for a real zstd frame.
+        let first_frame = b"frame zero".to_vec();
+        let second_frame = b"frame one (slightly longer)".to_vec();
+        let mut buf: Vec<u8> = Vec::new();
+        for f in [&first_frame, &second_frame] {
+            let len = u32::try_from(f.len()).expect("fits");
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(f);
+        }
+        let frames = read_raw_zstd_frames(&mut Cursor::new(buf), 8).expect("two frames");
+        assert_eq!(frames, vec![first_frame, second_frame]);
+    }
+
+    // ========================================================================
+    // set_phase2_files codec-detection tests
+    //
+    // After `set_phase2_files`, each file's `Phase2FileState.codec` reflects
+    // the codec implied by its 4-byte magic, and the underlying reader is
+    // positioned past the magic for zstd (which consumes it) and at byte 0
+    // for BGZF (whose decoder reads the gzip header itself).
+    // ========================================================================
+
+    /// Snapshot the file position by locking the per-file reader. `BufReader`'s
+    /// `stream_position` accounts for any buffered bytes — for a fresh
+    /// `BufReader` whose buffer hasn't been filled this equals the underlying
+    /// `File`'s seek position.
+    fn phase2_file_position(state: &Phase2FileState) -> u64 {
+        let mut guard = state.reader.lock().expect("reader lock");
+        guard.inner.stream_position().expect("stream_position")
+    }
+
+    #[test]
+    fn test_set_phase2_files_detects_zstd_magic_and_seeks_past_it() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("zstd-spill.zsp");
+        let mut file = std::fs::File::create(&path).expect("create");
+        file.write_all(&ZSPILL_MAGIC).expect("write magic");
+        file.write_all(&[0xAA, 0xBB, 0xCC]).expect("write body");
+        drop(file);
+
+        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf);
+        pool.set_phase2_files(std::slice::from_ref(&path)).expect("set_phase2_files");
+        let files = pool.phase2_files();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].codec, SpillCodec::Zstd, "ZSPILL_MAGIC must select zstd codec");
+        assert_eq!(
+            phase2_file_position(&files[0]),
+            ZSPILL_MAGIC.len() as u64,
+            "zstd reader must be positioned past the 4-byte magic"
+        );
+        pool.shutdown();
+    }
+
+    #[test]
+    fn test_set_phase2_files_detects_bgzf_magic_and_keeps_position_zero() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bgzf-spill.bgzf");
+        let mut file = std::fs::File::create(&path).expect("create");
+        // BGZF/gzip magic followed by junk; from_magic only inspects the first
+        // two bytes and the decoder is not invoked here.
+        file.write_all(&[0x1f, 0x8b, 0x00, 0x00, 0x55, 0x66]).expect("write magic");
+        drop(file);
+
+        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Zstd);
+        pool.set_phase2_files(std::slice::from_ref(&path)).expect("set_phase2_files");
+        let files = pool.phase2_files();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].codec, SpillCodec::Bgzf, "BGZF magic must select bgzf codec");
+        assert_eq!(
+            phase2_file_position(&files[0]),
+            0,
+            "bgzf reader must be rewound to byte 0 so the decoder sees the header"
+        );
+        pool.shutdown();
+    }
+
+    #[test]
+    fn test_set_phase2_files_empty_file_falls_back_to_bgzf() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("empty.spill");
+        std::fs::File::create(&path).expect("create empty");
+
+        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Zstd);
+        pool.set_phase2_files(std::slice::from_ref(&path)).expect("set_phase2_files");
+        let files = pool.phase2_files();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].codec,
+            SpillCodec::Bgzf,
+            "no magic must fall back to bgzf (the legacy decoder reports the truncation)"
+        );
+        assert_eq!(phase2_file_position(&files[0]), 0);
+        pool.shutdown();
     }
 }

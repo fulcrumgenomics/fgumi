@@ -12,7 +12,7 @@
 //! - **N+2 worker pool**: Dedicated reader, writer, and N sort workers stream
 //!   chunks through the pipeline; in-memory sort uses parallel radix sort
 //! - **Buffer recycling**: Reuses buffers via channel-based allocation patterns
-//! - **Fast compression**: Uses libdeflate for temporary file compression
+//! - **Fast compression**: Uses zstd (default) or BGZF/libdeflate for temporary file compression
 //!
 //! # Architecture
 //!
@@ -58,6 +58,7 @@ pub(crate) mod segmented_buf;
 pub(crate) mod tmp_dir_alloc;
 pub(crate) mod verify;
 pub(crate) mod worker_pool;
+pub(crate) mod zspill_stream;
 
 /// Print mimalloc allocator statistics to stderr.
 ///

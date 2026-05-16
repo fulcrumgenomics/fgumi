@@ -1,8 +1,9 @@
-//! Parallel chunk writer using `SortWorkerPool` for BGZF compression.
+//! Parallel chunk writer using `SortWorkerPool` for spill compression.
 //!
 //! `PooledChunkWriter` replaces single-threaded `GenericKeyedChunkWriter` during spill,
-//! distributing BGZF block compression across the shared worker pool. This targets the
-//! #1 bottleneck: spill write is 62-80% of total sort wall time.
+//! distributing per-block compression (BGZF or zstd, picked at construction time)
+//! across the shared worker pool. This targets the #1 bottleneck: spill write is
+//! 62-80% of total sort wall time.
 //!
 //! # Architecture
 //!
@@ -22,6 +23,7 @@
 //! accumulating blocks in an unbounded reorder buffer.
 
 use crate::bgzf_io::{StagingBuffer, io_writer_loop};
+use crate::codec::{SpillCodec, ZSPILL_MAGIC};
 use crate::keys::RawSortKey;
 use crate::worker_pool::{CompressResult, PermitPool, SortWorkerPool};
 use anyhow::Result;
@@ -33,7 +35,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-/// A chunk writer that uses `SortWorkerPool` for parallel BGZF compression.
+/// A chunk writer that uses `SortWorkerPool` for parallel spill compression.
 ///
 /// Records are buffered into ~64KB staging blocks, then submitted to the pool
 /// for compression. An I/O thread receives compressed blocks and writes them
@@ -48,17 +50,23 @@ pub struct PooledChunkWriter<K: RawSortKey> {
 }
 
 impl<K: RawSortKey> PooledChunkWriter<K> {
-    /// Create a new pooled chunk writer.
+    /// Create a new pooled chunk writer with an explicit spill codec.
     ///
     /// Opens the output file and spawns an I/O writer thread that receives
-    /// compressed blocks and writes them in serial order.
+    /// compressed blocks and writes them in serial order. Zstd-format spill
+    /// files start with the four-byte `ZSPILL_MAGIC` so the reader can detect
+    /// the format without consulting external state.
     ///
     /// # Errors
     ///
     /// Returns an error if the output file cannot be created.
-    pub fn new(pool: Arc<SortWorkerPool>, path: &Path) -> Result<Self> {
+    pub fn new(pool: Arc<SortWorkerPool>, path: &Path, codec: SpillCodec) -> Result<Self> {
         let file = std::fs::File::create(path)?;
-        let writer = BufWriter::with_capacity(256 * 1024, file);
+        let mut writer = BufWriter::with_capacity(256 * 1024, file);
+        if matches!(codec, SpillCodec::Zstd) {
+            use std::io::Write;
+            writer.write_all(&ZSPILL_MAGIC)?;
+        }
 
         let reorder_capacity = pool.num_workers() * 4;
         let (result_tx, result_rx) = bounded::<CompressResult>(reorder_capacity);
@@ -66,10 +74,11 @@ impl<K: RawSortKey> PooledChunkWriter<K> {
         let permit_pool = Arc::new(PermitPool::new(reorder_capacity));
 
         let pp = Arc::clone(&permit_pool);
-        let io_handle = thread::spawn(move || io_writer_loop(writer, result_rx, buffer_pool, pp));
+        let io_handle =
+            thread::spawn(move || io_writer_loop(writer, result_rx, buffer_pool, pp, codec));
 
         Ok(Self {
-            staging: Some(StagingBuffer::new(pool, result_tx, permit_pool)),
+            staging: Some(StagingBuffer::new(pool, result_tx, permit_pool, codec)),
             key_buf: Vec::new(),
             io_handle: Some(io_handle),
             _phantom: PhantomData,
@@ -246,10 +255,14 @@ mod tests {
 
     #[test]
     #[allow(clippy::cast_possible_truncation)]
-    fn test_pooled_writer_roundtrip() {
+    fn test_pooled_writer_roundtrip_zstd() {
+        // Mirror of `test_pooled_writer_roundtrip` but exercising the zstd
+        // spill path: the file must start with `ZSPILL_MAGIC` and round-trip
+        // identical records back through `GenericKeyedChunkReader`, which
+        // auto-detects the magic and routes to `ZspillStreamReader`.
         let dir = TempDir::new().unwrap();
-        let chunk_path = dir.path().join("test_chunk.keyed");
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6));
+        let chunk_path = dir.path().join("test_chunk_zstd.keyed");
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Zstd));
 
         let records: Vec<(TemplateKey, Vec<u8>)> = (0..100)
             .map(|i| {
@@ -260,8 +273,73 @@ mod tests {
             .collect();
 
         {
-            let mut writer = PooledChunkWriter::<TemplateKey>::new(Arc::clone(&pool), &chunk_path)
-                .expect("create writer");
+            let mut writer = PooledChunkWriter::<TemplateKey>::new(
+                Arc::clone(&pool),
+                &chunk_path,
+                SpillCodec::Zstd,
+            )
+            .expect("create writer");
+
+            for (key, record) in &records {
+                writer.write_record(key, record).expect("write record");
+            }
+            writer.finish().expect("finish writer");
+        }
+
+        // The first four bytes must be the ZSPILL magic so readers (and
+        // future debugging tools) can route the file via the zstd path.
+        let bytes = std::fs::read(&chunk_path).expect("read chunk file");
+        assert!(bytes.len() >= ZSPILL_MAGIC.len(), "zstd spill file too short to hold magic");
+        assert_eq!(
+            &bytes[..ZSPILL_MAGIC.len()],
+            &ZSPILL_MAGIC[..],
+            "zstd spill file missing ZSPILL_MAGIC prefix"
+        );
+
+        let mut reader =
+            GenericKeyedChunkReader::<TemplateKey>::open(&chunk_path, None).expect("open reader");
+
+        let mut buf = Vec::new();
+        let mut read_records = Vec::new();
+        while let Some(key) = reader.next_record(&mut buf).expect("read record") {
+            read_records.push((key, buf.clone()));
+        }
+
+        assert_eq!(records.len(), read_records.len(), "record count mismatch");
+        for (i, ((expected_key, expected_data), (actual_key, actual_data))) in
+            records.iter().zip(read_records.iter()).enumerate()
+        {
+            assert_eq!(*expected_key, *actual_key, "key mismatch at {i}");
+            assert_eq!(expected_data, actual_data, "data mismatch at {i}");
+        }
+
+        if let Ok(pool) = Arc::try_unwrap(pool) {
+            pool.shutdown();
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn test_pooled_writer_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let chunk_path = dir.path().join("test_chunk.keyed");
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
+
+        let records: Vec<(TemplateKey, Vec<u8>)> = (0..100)
+            .map(|i| {
+                let key = make_key(i);
+                let record = vec![(i % 256) as u8; 200 + (i as usize % 50)];
+                (key, record)
+            })
+            .collect();
+
+        {
+            let mut writer = PooledChunkWriter::<TemplateKey>::new(
+                Arc::clone(&pool),
+                &chunk_path,
+                SpillCodec::Bgzf,
+            )
+            .expect("create writer");
 
             for (key, record) in &records {
                 writer.write_record(key, record).expect("write record");
@@ -295,11 +373,15 @@ mod tests {
     fn test_pooled_writer_empty() {
         let dir = TempDir::new().unwrap();
         let chunk_path = dir.path().join("empty_chunk.keyed");
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         {
-            let writer = PooledChunkWriter::<TemplateKey>::new(Arc::clone(&pool), &chunk_path)
-                .expect("create writer");
+            let writer = PooledChunkWriter::<TemplateKey>::new(
+                Arc::clone(&pool),
+                &chunk_path,
+                SpillCodec::Bgzf,
+            )
+            .expect("create writer");
             writer.finish().expect("finish empty writer");
         }
 
@@ -317,7 +399,7 @@ mod tests {
     fn test_pooled_writer_large_records() {
         let dir = TempDir::new().unwrap();
         let chunk_path = dir.path().join("large_chunk.keyed");
-        let pool = Arc::new(SortWorkerPool::new(4, 1, 6));
+        let pool = Arc::new(SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         let records: Vec<(TemplateKey, Vec<u8>)> = (0..500)
             .map(|i| {
@@ -328,8 +410,12 @@ mod tests {
             .collect();
 
         {
-            let mut writer = PooledChunkWriter::<TemplateKey>::new(Arc::clone(&pool), &chunk_path)
-                .expect("create writer");
+            let mut writer = PooledChunkWriter::<TemplateKey>::new(
+                Arc::clone(&pool),
+                &chunk_path,
+                SpillCodec::Bgzf,
+            )
+            .expect("create writer");
 
             for (key, record) in &records {
                 writer.write_record(key, record).expect("write record");
@@ -361,14 +447,18 @@ mod tests {
         // `handle.wait()` must join it and surface any errors.
         let dir = TempDir::new().unwrap();
         let chunk_path = dir.path().join("pipelined_chunk.keyed");
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         let records: Vec<(TemplateKey, Vec<u8>)> =
             (0..50).map(|i| (make_key(i), vec![(i % 256) as u8; 100])).collect();
 
         let handle = {
-            let mut writer = PooledChunkWriter::<TemplateKey>::new(Arc::clone(&pool), &chunk_path)
-                .expect("create writer");
+            let mut writer = PooledChunkWriter::<TemplateKey>::new(
+                Arc::clone(&pool),
+                &chunk_path,
+                SpillCodec::Bgzf,
+            )
+            .expect("create writer");
             for (key, record) in &records {
                 writer.write_record(key, record).expect("write record");
             }
@@ -400,11 +490,15 @@ mod tests {
         // the `Drop` impl joins the thread and logs any error.
         let dir = TempDir::new().unwrap();
         let chunk_path = dir.path().join("dropped_chunk.keyed");
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         let handle = {
-            let mut writer = PooledChunkWriter::<TemplateKey>::new(Arc::clone(&pool), &chunk_path)
-                .expect("create writer");
+            let mut writer = PooledChunkWriter::<TemplateKey>::new(
+                Arc::clone(&pool),
+                &chunk_path,
+                SpillCodec::Bgzf,
+            )
+            .expect("create writer");
             writer.write_record(&make_key(0), &[1, 2, 3]).expect("write");
             writer.start_finish().expect("start_finish")
         };
@@ -427,11 +521,15 @@ mod tests {
         // deadlock — the Drop impl signals the I/O thread and joins it.
         let dir = TempDir::new().unwrap();
         let chunk_path = dir.path().join("dropped_writer.keyed");
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         {
-            let mut writer = PooledChunkWriter::<TemplateKey>::new(Arc::clone(&pool), &chunk_path)
-                .expect("create writer");
+            let mut writer = PooledChunkWriter::<TemplateKey>::new(
+                Arc::clone(&pool),
+                &chunk_path,
+                SpillCodec::Bgzf,
+            )
+            .expect("create writer");
             writer.write_record(&make_key(0), &[1, 2, 3]).expect("write");
             // Drop without calling finish() — exercises the Drop impl
         }

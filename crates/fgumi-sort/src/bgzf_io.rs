@@ -4,6 +4,7 @@
 //! and [`PooledChunkWriter`](super::pooled_chunk_writer), and the staging buffer logic for
 //! accumulating data into ~64KB blocks before submitting compression jobs.
 
+use crate::codec::SpillCodec;
 use crate::worker_pool::{BufferPool, CompressJob, CompressResult, PermitPool, SortWorkerPool};
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
@@ -22,6 +23,7 @@ pub(crate) struct StagingBuffer {
     next_serial: u64,
     result_tx: Sender<CompressResult>,
     permit_pool: Arc<PermitPool>,
+    codec: SpillCodec,
 }
 
 impl StagingBuffer {
@@ -31,6 +33,7 @@ impl StagingBuffer {
         pool: Arc<SortWorkerPool>,
         result_tx: Sender<CompressResult>,
         permit_pool: Arc<PermitPool>,
+        codec: SpillCodec,
     ) -> Self {
         Self {
             pool,
@@ -38,6 +41,7 @@ impl StagingBuffer {
             next_serial: 0,
             result_tx,
             permit_pool,
+            codec,
         }
     }
 
@@ -80,7 +84,12 @@ impl StagingBuffer {
         let serial = self.next_serial;
         self.next_serial += 1;
 
-        self.pool.submit_compress(CompressJob { data, serial, result_tx: self.result_tx.clone() });
+        self.pool.submit_compress(CompressJob {
+            data,
+            serial,
+            result_tx: self.result_tx.clone(),
+            codec: self.codec,
+        });
         Ok(())
     }
 
@@ -134,8 +143,9 @@ pub(crate) fn io_writer_loop(
     result_rx: Receiver<CompressResult>,
     buffer_pool: BufferPool,
     permit_pool: Arc<PermitPool>,
+    codec: SpillCodec,
 ) -> Result<()> {
-    let result = io_writer_loop_inner(&mut writer, &result_rx, &buffer_pool, &permit_pool);
+    let result = io_writer_loop_inner(&mut writer, &result_rx, &buffer_pool, &permit_pool, codec);
     if result.is_err() {
         // Unblock any producers waiting on acquire() so they don't park forever.
         permit_pool.close();
@@ -148,6 +158,7 @@ fn io_writer_loop_inner(
     result_rx: &Receiver<CompressResult>,
     buffer_pool: &BufferPool,
     permit_pool: &Arc<PermitPool>,
+    codec: SpillCodec,
 ) -> Result<()> {
     let mut next_expected: u64 = 0;
     let mut reorder_buf: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
@@ -186,7 +197,9 @@ fn io_writer_loop_inner(
         }
     }
 
-    writer.write_all(&BGZF_EOF)?;
+    if matches!(codec, SpillCodec::Bgzf) {
+        writer.write_all(&BGZF_EOF)?;
+    }
     writer.flush()?;
 
     Ok(())
@@ -195,6 +208,7 @@ fn io_writer_loop_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -203,22 +217,28 @@ mod tests {
     }
 
     /// Build a round-trip helper: write `data` via `StagingBuffer` → `io_writer_loop` → read back raw bytes.
-    fn roundtrip_data(data: &[u8]) -> Vec<u8> {
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6));
+    ///
+    /// `io_writer_loop` is the unit under test, so the output is the raw stream
+    /// produced by the loop for the given codec — for zstd that means the
+    /// sequence of `[u32 LE frame-len][zstd frame]` blocks the worker emits,
+    /// without the `ZSPILL_MAGIC` prefix (which a real chunk writer would write
+    /// before invoking the loop).
+    fn roundtrip_data(data: &[u8], codec: SpillCodec) -> Vec<u8> {
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, codec));
         let (result_tx, result_rx) = pool.compress_result_channel();
         let buffer_pool = pool.buffer_pool.clone();
         let permit_pool = make_permit_pool(&pool);
 
         let dir = TempDir::new().unwrap();
-        let out_path = dir.path().join("out.bgzf");
+        let out_path = dir.path().join("out.spill");
 
         let out_file = std::fs::File::create(&out_path).unwrap();
         let writer = std::io::BufWriter::new(out_file);
         let pp = Arc::clone(&permit_pool);
         let io_handle =
-            std::thread::spawn(move || io_writer_loop(writer, result_rx, buffer_pool, pp));
+            std::thread::spawn(move || io_writer_loop(writer, result_rx, buffer_pool, pp, codec));
 
-        let mut staging = StagingBuffer::new(Arc::clone(&pool), result_tx, permit_pool);
+        let mut staging = StagingBuffer::new(Arc::clone(&pool), result_tx, permit_pool, codec);
         staging.write_chunked(data).unwrap();
         staging.flush().unwrap();
         drop(staging); // closes result_tx senders → io_writer_loop exits
@@ -231,13 +251,15 @@ mod tests {
         std::fs::read(&out_path).unwrap()
     }
 
-    #[test]
-    fn test_staging_buffer_flush_empty_is_noop() {
-        let pool = Arc::new(SortWorkerPool::new(1, 1, 6));
+    #[rstest]
+    #[case(SpillCodec::Bgzf)]
+    #[case(SpillCodec::Zstd)]
+    fn test_staging_buffer_flush_empty_is_noop(#[case] codec: SpillCodec) {
+        let pool = Arc::new(SortWorkerPool::new(1, 1, 6, codec));
         let (result_tx, _result_rx) = pool.compress_result_channel();
         let permit_pool = make_permit_pool(&pool);
 
-        let mut staging = StagingBuffer::new(Arc::clone(&pool), result_tx, permit_pool);
+        let mut staging = StagingBuffer::new(Arc::clone(&pool), result_tx, permit_pool, codec);
         // Flush with empty buffer: should not submit a compress job
         staging.flush().unwrap();
 
@@ -251,12 +273,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_staging_buffer_is_full() {
-        let pool = Arc::new(SortWorkerPool::new(1, 1, 6));
+    #[rstest]
+    #[case(SpillCodec::Bgzf)]
+    #[case(SpillCodec::Zstd)]
+    fn test_staging_buffer_is_full(#[case] codec: SpillCodec) {
+        let pool = Arc::new(SortWorkerPool::new(1, 1, 6, codec));
         let (result_tx, _result_rx) = pool.compress_result_channel();
         let permit_pool = make_permit_pool(&pool);
-        let mut staging = StagingBuffer::new(Arc::clone(&pool), result_tx, permit_pool);
+        let mut staging = StagingBuffer::new(Arc::clone(&pool), result_tx, permit_pool, codec);
 
         assert!(!staging.is_full(), "empty buffer should not be full");
         staging.buf().extend(vec![0u8; BGZF_MAX_BLOCK_SIZE]);
@@ -267,24 +291,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_staging_buffer_write_chunked_large_data() {
+    #[rstest]
+    #[case(SpillCodec::Bgzf)]
+    #[case(SpillCodec::Zstd)]
+    fn test_staging_buffer_write_chunked_large_data(#[case] codec: SpillCodec) {
         // Data larger than BGZF_MAX_BLOCK_SIZE must be split into multiple compress jobs.
         let large = vec![b'A'; BGZF_MAX_BLOCK_SIZE * 2 + 1000];
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, codec));
         let (result_tx, result_rx) = pool.compress_result_channel();
         let buffer_pool = pool.buffer_pool.clone();
         let permit_pool = make_permit_pool(&pool);
 
         let dir = TempDir::new().unwrap();
-        let out_path = dir.path().join("large.bgzf");
+        let out_path = dir.path().join("large.spill");
         let out_file = std::fs::File::create(&out_path).unwrap();
         let writer = std::io::BufWriter::new(out_file);
         let pp = Arc::clone(&permit_pool);
         let io_handle =
-            std::thread::spawn(move || io_writer_loop(writer, result_rx, buffer_pool, pp));
+            std::thread::spawn(move || io_writer_loop(writer, result_rx, buffer_pool, pp, codec));
 
-        let mut staging = StagingBuffer::new(Arc::clone(&pool), result_tx, permit_pool);
+        let mut staging = StagingBuffer::new(Arc::clone(&pool), result_tx, permit_pool, codec);
         staging.write_chunked(&large).unwrap();
         staging.flush().unwrap();
         drop(staging);
@@ -302,58 +328,96 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_io_writer_loop_reorders_out_of_order_blocks() {
+    #[rstest]
+    #[case(SpillCodec::Bgzf)]
+    #[case(SpillCodec::Zstd)]
+    fn test_io_writer_loop_reorders_out_of_order_blocks(#[case] codec: SpillCodec) {
         // Write blocks out of order; io_writer_loop must reassemble them correctly.
         let data1 = b"first block data".to_vec();
         let data2 = b"second block data".to_vec();
 
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, codec));
         let (result_tx, result_rx) = pool.compress_result_channel();
         let buffer_pool = pool.buffer_pool.clone();
         let permit_pool = Arc::new(PermitPool::new(4));
 
         let dir = TempDir::new().unwrap();
-        let out_path = dir.path().join("reorder.bgzf");
+        let out_path = dir.path().join("reorder.spill");
         let out_file = std::fs::File::create(&out_path).unwrap();
         let writer = std::io::BufWriter::new(out_file);
         let pp = Arc::clone(&permit_pool);
         let io_handle =
-            std::thread::spawn(move || io_writer_loop(writer, result_rx, buffer_pool, pp));
+            std::thread::spawn(move || io_writer_loop(writer, result_rx, buffer_pool, pp, codec));
 
         // Submit block 1 first, then block 0 (out of order).
         // Each needs a pre-acquired permit since they bypass StagingBuffer::flush().
         permit_pool.acquire().unwrap();
-        pool.submit_compress(CompressJob { data: data2, serial: 1, result_tx: result_tx.clone() });
+        pool.submit_compress(CompressJob {
+            data: data2,
+            serial: 1,
+            result_tx: result_tx.clone(),
+            codec,
+        });
         permit_pool.acquire().unwrap();
-        pool.submit_compress(CompressJob { data: data1, serial: 0, result_tx });
+        pool.submit_compress(CompressJob { data: data1, serial: 0, result_tx, codec });
 
         // Wait for both compress results to be received by io_writer_loop
         io_handle.join().unwrap().unwrap();
 
-        // Output file exists and contains the BGZF EOF marker
+        // Bgzf appends an EOF marker, zstd does not.
         let bytes = std::fs::read(&out_path).unwrap();
-        assert!(bytes.ends_with(&BGZF_EOF), "output should end with BGZF EOF marker");
+        match codec {
+            SpillCodec::Bgzf => {
+                assert!(bytes.ends_with(&BGZF_EOF), "bgzf output should end with BGZF EOF marker");
+            }
+            SpillCodec::Zstd => {
+                assert!(!bytes.is_empty(), "zstd output should contain the two compressed frames");
+                assert!(
+                    !bytes.ends_with(&BGZF_EOF),
+                    "zstd output must not append the BGZF EOF marker"
+                );
+            }
+        }
 
         if let Ok(p) = Arc::try_unwrap(pool) {
             p.shutdown();
         }
     }
 
-    #[test]
-    fn test_roundtrip_small_data() {
+    #[rstest]
+    #[case(SpillCodec::Bgzf)]
+    #[case(SpillCodec::Zstd)]
+    fn test_roundtrip_small_data(#[case] codec: SpillCodec) {
         let data = b"hello world from bgzf_io";
-        let output = roundtrip_data(data);
-        // Output is a valid BGZF stream ending with the EOF marker
-        assert!(output.ends_with(&BGZF_EOF), "must end with BGZF EOF");
-        // Non-empty (has at least the compressed data block + EOF)
-        assert!(output.len() > BGZF_EOF.len());
+        let output = roundtrip_data(data, codec);
+        match codec {
+            SpillCodec::Bgzf => {
+                // Valid BGZF stream ending with the EOF marker, plus a compressed data block.
+                assert!(output.ends_with(&BGZF_EOF), "bgzf output must end with BGZF EOF");
+                assert!(output.len() > BGZF_EOF.len());
+            }
+            SpillCodec::Zstd => {
+                // Zstd output is `[u32 LE frame-len][zstd frame]`; no EOF marker is appended.
+                assert!(!output.is_empty(), "zstd output must contain the compressed frame");
+                assert!(!output.ends_with(&BGZF_EOF), "zstd output must not append BGZF EOF");
+            }
+        }
     }
 
-    #[test]
-    fn test_roundtrip_empty_data() {
-        // No data: flush() is a no-op, so io_writer_loop writes only the EOF marker
-        let output = roundtrip_data(b"");
-        assert_eq!(output, BGZF_EOF.to_vec(), "empty input → only BGZF EOF marker");
+    #[rstest]
+    #[case(SpillCodec::Bgzf)]
+    #[case(SpillCodec::Zstd)]
+    fn test_roundtrip_empty_data(#[case] codec: SpillCodec) {
+        // No data: flush() is a no-op, so the loop sees zero compress results.
+        // Bgzf still writes the EOF marker; zstd writes nothing.
+        let output = roundtrip_data(b"", codec);
+        match codec {
+            SpillCodec::Bgzf => {
+                assert_eq!(output, BGZF_EOF.to_vec(), "empty bgzf input → only BGZF EOF marker");
+            }
+            SpillCodec::Zstd => {
+                assert!(output.is_empty(), "empty zstd input → empty output (no EOF marker)");
+            }
+        }
     }
 }

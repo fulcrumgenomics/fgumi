@@ -487,7 +487,7 @@ type ChunkReadResult<K> = Result<Option<(K, Vec<u8>)>>;
 ///
 /// Returns `Ok(true)` when `buf` is fully filled, `Ok(false)` when zero bytes are
 /// available (clean EOF), and `Err` for any partial read or I/O error.
-fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<bool> {
+pub(crate) fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<bool> {
     let mut offset = 0;
     while offset < buf.len() {
         match reader.read(&mut buf[offset..]) {
@@ -551,27 +551,53 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
             };
             let mut buf_reader = BufReader::with_capacity(2 * 1024 * 1024, file);
 
-            // Check for gzip/BGZF magic bytes: 0x1f 0x8b
-            let mut magic = [0u8; 2];
-            let is_compressed = if buf_reader.read_exact(&mut magic).is_ok() {
-                magic == [0x1f, 0x8b]
-            } else {
-                false
+            // Detect magic bytes at file start:
+            //   BGZF/gzip  : 0x1f 0x8b
+            //   ZSP1 spill : ASCII "ZSP1" followed by [u32 LE len][zstd frame]+
+            //
+            // Use `read_exact_or_eof` so a short `read()` (legal for `Read`)
+            // can't truncate `ZSPILL_MAGIC` into a `None` and silently route a
+            // zstd spill through the uncompressed path. Clean EOF (empty file)
+            // is preserved as `read_n == 0` — same behavior as before.
+            let mut magic = [0u8; 4];
+            let read_n = match read_exact_or_eof(&mut buf_reader, &mut magic) {
+                Ok(true) => 4,
+                Ok(false) => 0,
+                Err(e) => {
+                    let _ = tx.send(Err(anyhow::anyhow!(
+                        "Failed to read keyed chunk magic {}: {e}",
+                        path.display()
+                    )));
+                    return;
+                }
             };
+            let codec = crate::codec::SpillCodec::from_magic(&magic[..read_n]);
 
-            // Seek back to start
+            // Seek back to start so each decoder consumes the magic itself.
             if buf_reader.seek(SeekFrom::Start(0)).is_err() {
                 let _ = tx
                     .send(Err(anyhow::anyhow!("Failed to seek in keyed chunk {}", path.display())));
                 return;
             }
 
-            // Read using appropriate decoder
-            if is_compressed {
-                let bgzf_reader = BgzfReader::new(buf_reader);
-                Self::read_records(bgzf_reader, tx, buf_rx, concurrency_limit);
-            } else {
-                Self::read_records(buf_reader, tx, buf_rx, concurrency_limit);
+            match codec {
+                Some(crate::codec::SpillCodec::Zstd) => {
+                    match crate::zspill_stream::ZspillStreamReader::new(buf_reader) {
+                        Ok(rdr) => Self::read_records(rdr, tx, buf_rx, concurrency_limit),
+                        Err(e) => {
+                            let _ =
+                                tx.send(Err(anyhow::anyhow!("zstd spill reader open failed: {e}")));
+                        }
+                    }
+                }
+                Some(crate::codec::SpillCodec::Bgzf) => {
+                    let bgzf_reader = BgzfReader::new(buf_reader);
+                    Self::read_records(bgzf_reader, tx, buf_rx, concurrency_limit);
+                }
+                None => {
+                    // Treat as uncompressed (existing test behavior).
+                    Self::read_records(buf_reader, tx, buf_rx, concurrency_limit);
+                }
             }
         });
 
@@ -1166,6 +1192,8 @@ pub struct RawExternalSorter {
     output_compression: u32,
     /// Compression level for temporary chunk files (0 = uncompressed).
     temp_compression: u32,
+    /// Codec used for temporary chunk files (Bgzf or Zstd).
+    spill_codec: crate::codec::SpillCodec,
     /// Whether to write BAM index alongside output (coordinate sort only).
     write_index: bool,
     /// Program record info (version, `command_line`) for @PG header.
@@ -1229,6 +1257,7 @@ impl RawExternalSorter {
             threads: 1,
             output_compression: 6,
             temp_compression: 1, // Default: fast compression
+            spill_codec: crate::codec::SpillCodec::default(),
             write_index: false,
             pg_info: None,
             max_temp_files: DEFAULT_MAX_TEMP_FILES,
@@ -1281,12 +1310,27 @@ impl RawExternalSorter {
 
     /// Set compression level for temporary chunk files.
     ///
-    /// Level 0 disables compression (fastest, uses most disk space).
+    /// For [`SpillCodec::Bgzf`], level 0 disables compression (fastest, uses
+    /// most disk space). For [`SpillCodec::Zstd`] there is no level-0 "stored"
+    /// mode; pass a level >= 1 or [`Self::sort`] will reject the combination.
     /// Level 1 (default) provides fast compression with reasonable space savings.
     /// Higher levels provide better compression but are slower.
+    ///
+    /// [`SpillCodec::Bgzf`]: crate::codec::SpillCodec::Bgzf
+    /// [`SpillCodec::Zstd`]: crate::codec::SpillCodec::Zstd
     #[must_use]
     pub fn temp_compression(mut self, level: u32) -> Self {
         self.temp_compression = level;
+        self
+    }
+
+    /// Set the codec used for temporary chunk files.
+    ///
+    /// Defaults to [`SpillCodec::Zstd`] which is significantly faster than
+    /// BGZF at comparable ratios for BAM-record data.
+    #[must_use]
+    pub fn spill_codec(mut self, codec: crate::codec::SpillCodec) -> Self {
+        self.spill_codec = codec;
         self
     }
 
@@ -1446,7 +1490,10 @@ impl RawExternalSorter {
             .collect::<Result<Vec<_>>>()?;
 
         // Use pooled writer for parallel compression during consolidation.
-        let mut writer = PooledChunkWriter::<K>::new(Arc::clone(pool), &merged_path)?;
+        // Match the pool's spill codec so the merged file is the same format
+        // as the per-chunk spill files it consolidates.
+        let mut writer =
+            PooledChunkWriter::<K>::new(Arc::clone(pool), &merged_path, pool.spill_codec())?;
 
         // Initialize loser tree with first record from each reader
         let mut initial_keys: Vec<K> = Vec::with_capacity(readers.len());
@@ -1509,6 +1556,19 @@ impl RawExternalSorter {
     ///
     /// Returns an error if reading, sorting, or writing the BAM file fails.
     pub fn sort(&self, input: &Path, output: &Path) -> Result<RawSortStats> {
+        // zstd has no level-0 "stored" mode; silently remapping to 1 would
+        // surprise API callers who set temp_compression(0) expecting an
+        // uncompressed spill (which works for BGZF). Mirror the CLI guard so
+        // direct RawExternalSorter callers cannot reach a misconfigured pool.
+        anyhow::ensure!(
+            !(self.temp_compression == 0
+                && matches!(self.spill_codec, crate::codec::SpillCodec::Zstd)),
+            "temp_compression=0 is only supported with SpillCodec::Bgzf; \
+             zstd does not have an uncompressed mode. Pass \
+             spill_codec(SpillCodec::Bgzf) to keep level-0 spill, or pick a \
+             zstd level >= 1."
+        );
+
         info!("Starting raw-bytes sort with order: {:?}", self.sort_order);
         info!("Memory limit: {} MB", self.memory_limit / (1024 * 1024));
         info!("Threads: {}", self.threads);
@@ -1518,6 +1578,7 @@ impl RawExternalSorter {
             self.threads.max(1),
             self.temp_compression,
             self.output_compression,
+            self.spill_codec,
         ));
 
         // Open input BAM and create record source
@@ -1788,8 +1849,11 @@ impl RawExternalSorter {
                 // Use start_finish() for pipelining: I/O continues in background
                 // while we read the next batch.
                 let handle = timer.time_spill_write(|| {
-                    let mut writer =
-                        PooledChunkWriter::<RawCoordinateKey>::new(Arc::clone(&pool), &chunk_path)?;
+                    let mut writer = PooledChunkWriter::<RawCoordinateKey>::new(
+                        Arc::clone(&pool),
+                        &chunk_path,
+                        pool.spill_codec(),
+                    )?;
                     for r in buffer.refs() {
                         let key = RawCoordinateKey { sort_key: r.sort_key };
                         let record_bytes = buffer.get_record(r);
@@ -1966,8 +2030,11 @@ impl RawExternalSorter {
                 });
 
                 let handle = timer.time_spill_write(|| {
-                    let mut writer =
-                        PooledChunkWriter::<RawCoordinateKey>::new(Arc::clone(&pool), &chunk_path)?;
+                    let mut writer = PooledChunkWriter::<RawCoordinateKey>::new(
+                        Arc::clone(&pool),
+                        &chunk_path,
+                        pool.spill_codec(),
+                    )?;
                     for r in buffer.refs() {
                         let key = RawCoordinateKey { sort_key: r.sort_key };
                         let record_bytes = buffer.get_record(r);
@@ -2198,7 +2265,11 @@ impl RawExternalSorter {
 
                 // Write keyed temp file with parallel BGZF compression via worker pool.
                 let handle = timer.time_spill_write(|| {
-                    let mut writer = PooledChunkWriter::<K>::new(Arc::clone(&pool), &chunk_path)?;
+                    let mut writer = PooledChunkWriter::<K>::new(
+                        Arc::clone(&pool),
+                        &chunk_path,
+                        pool.spill_codec(),
+                    )?;
                     for (key, record) in entries.drain(..) {
                         writer.write_record(&key, record.as_ref())?;
                     }
@@ -2406,8 +2477,11 @@ impl RawExternalSorter {
 
                 // Write keyed chunk with parallel BGZF compression via worker pool.
                 let handle = timer.time_spill_write(|| {
-                    let mut writer =
-                        PooledChunkWriter::<TemplateKey>::new(Arc::clone(&pool), &chunk_path)?;
+                    let mut writer = PooledChunkWriter::<TemplateKey>::new(
+                        Arc::clone(&pool),
+                        &chunk_path,
+                        pool.spill_codec(),
+                    )?;
                     for (key, record) in buffer.iter_sorted_keyed() {
                         writer.write_record(&key, record)?;
                     }
@@ -3290,6 +3364,35 @@ mod tests {
         assert_eq!(sorter.temp_compression, 0);
     }
 
+    /// `RawExternalSorter::sort` rejects `temp_compression=0` + `SpillCodec::Zstd`
+    /// before doing any work, mirroring the CLI guard in `commands::sort`. zstd
+    /// has no level-0 "stored" mode, and silently remapping to 1 would surprise
+    /// API callers who pass 0 expecting uncompressed spills.
+    #[test]
+    fn test_raw_sorter_sort_rejects_temp_compression_zero_with_zstd() {
+        use fgumi_sam::SamBuilder;
+
+        let mut builder = SamBuilder::new();
+        let _ = builder.add_pair().name("read0").start1(1).start2(101).build();
+
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
+        let input = dir.path().join("input.bam");
+        let output = dir.path().join("output.bam");
+        builder.write_bam(&input).expect("failed to write BAM");
+
+        let err = RawExternalSorter::new(SortOrder::Coordinate)
+            .spill_codec(crate::codec::SpillCodec::Zstd)
+            .temp_compression(0)
+            .sort(&input, &output)
+            .expect_err("sort should reject temp_compression=0 + zstd");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("temp_compression=0 is only supported with SpillCodec::Bgzf"),
+            "unexpected error: {msg}"
+        );
+        assert!(!output.exists(), "no output should be produced on validation failure");
+    }
+
     #[test]
     fn test_raw_sorter_max_temp_files() {
         let sorter = RawExternalSorter::new(SortOrder::Coordinate).max_temp_files(0);
@@ -3557,15 +3660,67 @@ mod tests {
     /// consolidation. Before the fix (chunk files named by `chunk_files.len()`),
     /// consolidation would drain entries from the vector, shrinking its length,
     /// causing new chunks to collide with existing non-consolidated chunk files.
+    ///
+    /// Parameterized over both spill codecs so the consolidation merge writer
+    /// path is exercised for each format. zstd uses `temp_compression(1)` since
+    /// zstd has no level-0 "stored" mode (the CLI rejects 0+zstd; here we make
+    /// the same choice explicitly so the test matches user-facing behavior).
     #[rstest::rstest]
-    #[case::coordinate(SortOrder::Coordinate, false)]
-    #[case::coordinate_with_index(SortOrder::Coordinate, true)]
-    #[case::queryname(SortOrder::Queryname(QuerynameComparator::default()), false)]
-    #[case::queryname_natural(SortOrder::Queryname(QuerynameComparator::Natural), false)]
-    #[case::template_coordinate(SortOrder::TemplateCoordinate, false)]
+    #[case::coordinate_bgzf(SortOrder::Coordinate, false, crate::codec::SpillCodec::Bgzf, 0)]
+    #[case::coordinate_with_index_bgzf(
+        SortOrder::Coordinate,
+        true,
+        crate::codec::SpillCodec::Bgzf,
+        0
+    )]
+    #[case::queryname_bgzf(
+        SortOrder::Queryname(QuerynameComparator::default()),
+        false,
+        crate::codec::SpillCodec::Bgzf,
+        0
+    )]
+    #[case::queryname_natural_bgzf(
+        SortOrder::Queryname(QuerynameComparator::Natural),
+        false,
+        crate::codec::SpillCodec::Bgzf,
+        0
+    )]
+    #[case::template_coordinate_bgzf(
+        SortOrder::TemplateCoordinate,
+        false,
+        crate::codec::SpillCodec::Bgzf,
+        0
+    )]
+    #[case::coordinate_zstd(SortOrder::Coordinate, false, crate::codec::SpillCodec::Zstd, 1)]
+    #[case::coordinate_with_index_zstd(
+        SortOrder::Coordinate,
+        true,
+        crate::codec::SpillCodec::Zstd,
+        1
+    )]
+    #[case::queryname_zstd(
+        SortOrder::Queryname(QuerynameComparator::default()),
+        false,
+        crate::codec::SpillCodec::Zstd,
+        1
+    )]
+    #[case::queryname_natural_zstd(
+        SortOrder::Queryname(QuerynameComparator::Natural),
+        false,
+        crate::codec::SpillCodec::Zstd,
+        1
+    )]
+    #[case::template_coordinate_zstd(
+        SortOrder::TemplateCoordinate,
+        false,
+        crate::codec::SpillCodec::Zstd,
+        1
+    )]
     fn test_sort_with_consolidation_preserves_all_records(
         #[case] sort_order: SortOrder,
         #[case] write_index: bool,
+        #[case] spill_codec: crate::codec::SpillCodec,
+        #[case] temp_compression: u32,
     ) {
         use fgumi_sam::SamBuilder;
 
@@ -3589,7 +3744,8 @@ mod tests {
         let stats = RawExternalSorter::new(sort_order)
             .memory_limit(1024) // 1 KB — each chunk holds very few records
             .max_temp_files(4)
-            .temp_compression(0)
+            .spill_codec(spill_codec)
+            .temp_compression(temp_compression)
             .output_compression(0)
             .write_index(write_index)
             .sort(&input, &output)
@@ -3642,6 +3798,7 @@ mod tests {
             .memory_limit(32 * 1024)
             .max_temp_files(0) // disable consolidation
             .threads(2) // semaphore allows 2 concurrent readers
+            .spill_codec(crate::codec::SpillCodec::Bgzf) // level 0 = stored mode (zstd has no level 0)
             .temp_compression(0)
             .output_compression(0)
             .sort(&input, &output)
@@ -3693,6 +3850,7 @@ mod tests {
         RawExternalSorter::new(sort_order)
             .memory_limit(16 * 1024) // force spill (50 pairs × ~300B ≈ 15KB) so merge path is exercised
             .threads(1)
+            .spill_codec(crate::codec::SpillCodec::Bgzf) // level 0 = stored mode (zstd has no level 0)
             .temp_compression(0)
             .output_compression(0)
             .sort(&input, &output_st)
@@ -3702,6 +3860,7 @@ mod tests {
         RawExternalSorter::new(sort_order)
             .memory_limit(16 * 1024)
             .threads(2)
+            .spill_codec(crate::codec::SpillCodec::Bgzf)
             .temp_compression(0)
             .output_compression(0)
             .sort(&input, &output_mt)
@@ -4182,6 +4341,7 @@ mod tests {
         let stats_multi = RawExternalSorter::new(SortOrder::Coordinate)
             .memory_limit(8 * 1024)
             .threads(1)
+            .spill_codec(crate::codec::SpillCodec::Bgzf) // level 0 = stored mode (zstd has no level 0)
             .temp_compression(0)
             .output_compression(0)
             .temp_dirs(vec![tmp_a.path().to_path_buf(), tmp_b.path().to_path_buf()])
@@ -4193,6 +4353,7 @@ mod tests {
         RawExternalSorter::new(SortOrder::Coordinate)
             .memory_limit(8 * 1024)
             .threads(1)
+            .spill_codec(crate::codec::SpillCodec::Bgzf)
             .temp_compression(0)
             .output_compression(0)
             .sort(&input, &output_single)
@@ -4205,5 +4366,77 @@ mod tests {
             names_multi, names_single,
             "multi-dir and single-dir sort produced different record orders"
         );
+    }
+
+    // ========================================================================
+    // read_exact_or_eof tests
+    // ========================================================================
+
+    /// A `Read` impl that returns at most one byte per `read()` call. This is
+    /// legal for `Read` (which may return any `0 < n <= buf.len()`) and is what
+    /// motivates using `read_exact_or_eof` over a single `read()` call for
+    /// fixed-size magic-byte detection.
+    struct OneBytePerRead<'a> {
+        bytes: &'a [u8],
+        pos: usize,
+    }
+    impl std::io::Read for OneBytePerRead<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() || self.pos >= self.bytes.len() {
+                return Ok(0);
+            }
+            buf[0] = self.bytes[self.pos];
+            self.pos += 1;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn test_read_exact_or_eof_clean_eof() {
+        // Empty stream -> Ok(false), buffer untouched.
+        let mut src: &[u8] = &[];
+        let mut buf = [0u8; 4];
+        let filled = read_exact_or_eof(&mut src, &mut buf).expect("clean eof");
+        assert!(!filled, "clean EOF should return Ok(false)");
+        assert_eq!(buf, [0u8; 4]);
+    }
+
+    #[test]
+    fn test_read_exact_or_eof_full_read() {
+        // Source has exactly buf.len() bytes -> Ok(true), buffer filled.
+        let mut src: &[u8] = b"ZSP1";
+        let mut buf = [0u8; 4];
+        let filled = read_exact_or_eof(&mut src, &mut buf).expect("full read");
+        assert!(filled, "full read should return Ok(true)");
+        assert_eq!(&buf, b"ZSP1");
+    }
+
+    #[test]
+    fn test_read_exact_or_eof_short_reads_fill_buffer() {
+        // Regression: a `Read` impl that returns 1 byte per call must still
+        // fill the 4-byte buffer. A naive single `read()` would only get 1
+        // byte and `SpillCodec::from_magic` would return None, silently
+        // routing a real ZSP1 spill through the uncompressed fallback path.
+        let mut src = OneBytePerRead { bytes: b"ZSP1", pos: 0 };
+        let mut buf = [0u8; 4];
+        let filled = read_exact_or_eof(&mut src, &mut buf).expect("short-read source");
+        assert!(filled, "partial reads should still fill the buffer");
+        assert_eq!(&buf, b"ZSP1");
+        // And `from_magic` correctly identifies the codec from the filled
+        // buffer — proving the original bug is fixed end-to-end.
+        assert_eq!(
+            crate::codec::SpillCodec::from_magic(&buf),
+            Some(crate::codec::SpillCodec::Zstd)
+        );
+    }
+
+    #[test]
+    fn test_read_exact_or_eof_truncated_is_error() {
+        // Source has fewer bytes than requested but is non-empty:
+        // must error with UnexpectedEof (not silently report short fill).
+        let mut src: &[u8] = b"ZSP"; // only 3 of 4 bytes
+        let mut buf = [0u8; 4];
+        let err = read_exact_or_eof(&mut src, &mut buf).expect_err("truncated read should error");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 }

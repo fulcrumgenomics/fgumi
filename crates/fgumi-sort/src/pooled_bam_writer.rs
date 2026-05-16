@@ -21,6 +21,7 @@
 //! ```
 
 use crate::bgzf_io::{StagingBuffer, io_writer_loop};
+use crate::codec::SpillCodec;
 use crate::worker_pool::{CompressResult, PermitPool, SortWorkerPool};
 use anyhow::Result;
 use crossbeam_channel::bounded;
@@ -67,9 +68,11 @@ impl PooledBamWriter {
         let permit_pool = Arc::new(PermitPool::new(reorder_capacity));
 
         let pp = Arc::clone(&permit_pool);
-        let io_handle = thread::spawn(move || io_writer_loop(writer, result_rx, buffer_pool, pp));
+        let io_handle = thread::spawn(move || {
+            io_writer_loop(writer, result_rx, buffer_pool, pp, SpillCodec::Bgzf)
+        });
 
-        let mut staging = StagingBuffer::new(pool, result_tx, permit_pool);
+        let mut staging = StagingBuffer::new(pool, result_tx, permit_pool, SpillCodec::Bgzf);
 
         // Write BAM header into a temporary buffer then flush in BGZF-sized chunks.
         // Headers can exceed BGZF_MAX_BLOCK_SIZE; write_chunked handles the splitting.
@@ -223,7 +226,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let bam_path = dir.path().join("test.bam");
         let header = test_header();
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         let num_records = 200;
         let records: Vec<Vec<u8>> = (0..num_records)
@@ -262,7 +265,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let bam_path = dir.path().join("empty.bam");
         let header = test_header();
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         {
             let writer =
@@ -292,7 +295,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let bam_path = dir.path().join("many.bam");
         let header = test_header();
-        let pool = Arc::new(SortWorkerPool::new(4, 1, 6));
+        let pool = Arc::new(SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         let num_records = 5000;
         {
@@ -326,7 +329,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let bam_path = dir.path().join("raw_match.bam");
         let header = test_header();
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         let records: Vec<Vec<u8>> =
             (0..50).map(|i| make_test_record(format!("r{i}").as_bytes(), 30)).collect();
@@ -363,7 +366,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let bam_path = dir.path().join("oversized.bam");
         let header = test_header();
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         // A sequence of BGZF_MAX_BLOCK_SIZE bytes exceeds the threshold.
         let oversized_rec = make_test_record(b"oversized_read", BGZF_MAX_BLOCK_SIZE);
@@ -398,7 +401,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let bam_path = dir.path().join("dropped_writer.bam");
         let header = test_header();
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         {
             let mut writer =

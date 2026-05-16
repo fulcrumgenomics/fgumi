@@ -10,7 +10,7 @@
 //! exercises the integrated reader path through a complete sort round-trip.
 
 use fgumi_sam::SamBuilder;
-use fgumi_sort::{RawExternalSorter, SortOrder};
+use fgumi_sort::{RawExternalSorter, SortOrder, SpillCodec};
 
 /// Builds a small BAM file with `n_pairs` paired-end reads, sorts it
 /// coordinate-order via the pool-integrated reader path, and verifies all
@@ -36,6 +36,7 @@ fn test_pool_integrated_reader_round_trip_coordinate() {
     let stats = RawExternalSorter::new(SortOrder::Coordinate)
         .threads(2)
         .memory_limit(64 * 1024 * 1024) // 64 MiB — fits in memory, no spill
+        .spill_codec(SpillCodec::Bgzf) // level 0 = stored mode (zstd has no level 0)
         .temp_compression(0)
         .output_compression(0)
         .sort(&input, &output)
@@ -74,6 +75,7 @@ fn test_pool_integrated_reader_round_trip_template_coordinate() {
     let stats = RawExternalSorter::new(SortOrder::TemplateCoordinate)
         .threads(2)
         .memory_limit(64 * 1024 * 1024)
+        .spill_codec(SpillCodec::Bgzf) // level 0 = stored mode (zstd has no level 0)
         .temp_compression(0)
         .output_compression(0)
         .sort(&input, &output)
