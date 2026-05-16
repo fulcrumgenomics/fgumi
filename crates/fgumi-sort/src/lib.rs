@@ -42,6 +42,7 @@ use tempfile::TempDir;
 // All sub-modules are crate-private. Items intended for external consumers are
 // re-exported at the crate root below.
 pub(crate) mod bgzf_io;
+pub mod codec;
 pub(crate) mod external;
 pub(crate) mod inline;
 pub(crate) mod keys;
@@ -155,6 +156,7 @@ fn create_temp_dir(base: Option<&Path>) -> Result<TempDir> {
     }
 }
 
+pub use codec::SpillCodec;
 pub use external::{LibraryLookup, RawExternalSorter, cb_hasher, extract_template_key_inline};
 pub use inline::{TemplateKey, extract_coordinate_key_inline};
 pub use keys::{
