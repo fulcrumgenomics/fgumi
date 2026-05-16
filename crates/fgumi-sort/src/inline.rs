@@ -17,9 +17,108 @@
 use crate::keys::{RawCoordinateKey, RawSortKey, SortContext};
 use crate::radix::bytes_needed_u64;
 use crate::segmented_buf::SegmentedBuf;
-use fgumi_raw_bam::{RawRecord, RawRecordView};
+use fgumi_raw_bam::RawRecordView;
 use std::cmp::Ordering;
 use std::io::{Read, Write};
+use std::sync::Arc;
+
+// ============================================================================
+// In-memory sorted chunk (shared-buffer)
+// ============================================================================
+
+/// A sorted in-memory chunk produced by `par_sort_into_chunks`.
+///
+/// All chunks produced by a single sort share the original
+/// `RecordBuffer`'s `SegmentedBuf` via `Arc`, instead of each record
+/// owning its own `Vec<u8>`. The previous design called
+/// `RawRecord::from(buffer.get_record(r).to_vec())` once per record,
+/// paying one `mi_malloc` + memcpy per record (~16 M of each for the
+/// twist-umi sort). The shared-buffer design pays zero per-record
+/// allocations and reads record bytes directly out of the shared
+/// segments at merge time.
+///
+/// The merge consumer still copies record bytes into its own scratch
+/// `Vec<u8>` via `extend_from_slice` — the original `mem::swap`
+/// zero-copy bridge no longer applies because the bytes are now
+/// borrowed from the shared `SegmentedBuf`, not owned per record.
+/// In exchange, materialization is allocation-free and the peak
+/// memory of the sort drops by ~1× (the materialization no longer
+/// transiently doubles the buffer).
+pub(crate) struct InMemoryChunk<K> {
+    /// Shared backing store for record bytes (the original sort
+    /// buffer's `SegmentedBuf`). All sibling chunks from one
+    /// `par_sort_into_chunks` call share this Arc, so the segments
+    /// are freed only when the last chunk drops. The buffer stays
+    /// resident for the entire merge phase, unlike the pre-PR
+    /// behavior where per-record `Vec<u8>`s could free incrementally
+    /// as the merge consumed them — steady-state RSS during the
+    /// merge is slightly higher, but the materialization-peak
+    /// memory drops by ~1× (pre-PR transiently held both the buffer
+    /// and a full copy in per-record `Vec<u8>`s).
+    data: Arc<SegmentedBuf>,
+    /// `(sort_key, byte_offset_in_data, len)` per record, in sorted
+    /// order. `offset` is `u64` because a single `SegmentedBuf` can
+    /// exceed 4 GiB at high `--max-memory` × `--threads`; `len` is
+    /// `u32` because individual BAM records are < 4 GiB.
+    records: Vec<(K, u64, u32)>,
+}
+
+impl<K> InMemoryChunk<K> {
+    /// Construct an empty chunk backed by an empty shared buffer.
+    #[must_use]
+    pub(crate) fn empty() -> Self {
+        Self { data: Arc::new(SegmentedBuf::default()), records: Vec::new() }
+    }
+
+    /// Construct a chunk holding the given records, all referencing
+    /// the same shared data buffer.
+    #[must_use]
+    pub(crate) fn from_parts(data: Arc<SegmentedBuf>, records: Vec<(K, u64, u32)>) -> Self {
+        Self { data, records }
+    }
+
+    /// Number of records in the chunk.
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Whether the chunk is empty.
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Borrow the `i`th record's bytes from the shared data buffer.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // offset/len fit in usize on all supported targets
+    pub(crate) fn record_bytes(&self, i: usize) -> &[u8] {
+        let (_, offset, len) = &self.records[i];
+        self.data.slice(*offset as usize, *len as usize)
+    }
+
+    /// Borrow the `i`th record's sort key.
+    #[must_use]
+    pub(crate) fn key_at(&self, i: usize) -> &K {
+        &self.records[i].0
+    }
+
+    /// Move out the `i`th record's key (replaces it with
+    /// `K::default()`). Used by the merge loop after the
+    /// loser-tree consumes the key.
+    pub(crate) fn take_key(&mut self, i: usize) -> K
+    where
+        K: Default,
+    {
+        std::mem::take(&mut self.records[i].0)
+    }
+}
+
+impl<K> Default for InMemoryChunk<K> {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
 
 // ============================================================================
 // Buffer Probe Trait
@@ -184,22 +283,34 @@ const SORT_SEGMENT_SIZE: usize = 256 * 1024 * 1024;
 
 /// Shared implementation for `par_sort_into_chunks` on both buffer types.
 ///
-/// Factors out the threshold check, chunk sizing, parallel radix sort, and
-/// materialization into a single macro so tuning and fixes stay in one place.
+/// Sorts refs in place (parallel radix sort, partitioned by `chunk_size`),
+/// then drains `self.data` into a single `Arc<SegmentedBuf>` shared
+/// across all produced chunks. Each chunk's `records` Vec is built from
+/// its refs' `(key, offset + header_size, len)` triples — no per-record
+/// allocation or memcpy.
+///
+/// `$header_size` is the byte distance from each ref's `offset` field
+/// to the start of its actual record bytes inside `data`
+/// (`HEADER_SIZE` for `RecordBuffer`, `TEMPLATE_HEADER_SIZE` for
+/// `TemplateRecordBuffer`).
 macro_rules! par_sort_into_chunks_impl {
-    ($self:expr, $threads:expr, $sort_fn:ident, $key_fn:expr) => {{
+    ($self:expr, $threads:expr, $sort_fn:ident, $header_size:expr, $key_fn:expr) => {{
         use rayon::prelude::*;
+        use std::sync::Arc;
 
         let n = $self.refs.len();
+        let header_size: u64 = $header_size as u64;
 
         if $threads <= 1 || n < RADIX_THRESHOLD * 2 || n <= 10_000 {
             $sort_fn(&mut $self.refs);
-            let chunk = $self
-                .refs
-                .iter()
-                .map(|r| ($key_fn(r), RawRecord::from($self.get_record(r).to_vec())))
-                .collect();
-            return vec![chunk];
+            let data = Arc::new(std::mem::take(&mut $self.data));
+            let records: Vec<_> =
+                $self.refs.iter().map(|r| ($key_fn(r), r.offset + header_size, r.len)).collect();
+            // Clear refs so any subsequent `get_record` / `iter_sorted`
+            // on this buffer fails-fast at the index bound rather than
+            // silently slicing an empty `SegmentedBuf`.
+            $self.refs.clear();
+            return vec![InMemoryChunk::from_parts(data, records)];
         }
 
         let chunk_size = n.div_ceil($threads);
@@ -208,16 +319,21 @@ macro_rules! par_sort_into_chunks_impl {
             $sort_fn(chunk);
         });
 
-        $self
+        let data = Arc::new(std::mem::take(&mut $self.data));
+
+        let chunks: Vec<_> = $self
             .refs
             .chunks(chunk_size)
-            .map(|chunk| {
-                chunk
+            .map(|chunk_refs| {
+                let records: Vec<_> = chunk_refs
                     .iter()
-                    .map(|r| ($key_fn(r), RawRecord::from($self.get_record(r).to_vec())))
-                    .collect()
+                    .map(|r| ($key_fn(r), r.offset + header_size, r.len))
+                    .collect();
+                InMemoryChunk::from_parts(Arc::clone(&data), records)
             })
-            .collect()
+            .collect();
+        $self.refs.clear();
+        chunks
     }};
 }
 
@@ -314,17 +430,52 @@ impl RecordBuffer {
     ///
     /// Instead of merging the parallel sort sub-arrays back into one sorted
     /// buffer (as `par_sort` does), this returns each sub-array as its own
-    /// `Vec<(RawCoordinateKey, RawRecord)>` so they can be passed as separate
+    /// `InMemoryChunk<RawCoordinateKey>` so they can be passed as separate
     /// merge sources to the k-way merge, avoiding the intermediate merge step.
     ///
     /// When `threads <= 1`, returns a single chunk.
-    pub fn par_sort_into_chunks(
+    ///
+    /// After this returns, `self.data` and `self.refs` are both empty —
+    /// the produced chunks share the original data via `Arc<SegmentedBuf>`.
+    /// The caller must drop the buffer; `get_record` and `iter_sorted`
+    /// will index-panic if called.
+    pub(crate) fn par_sort_into_chunks(
         &mut self,
         threads: usize,
-    ) -> Vec<Vec<(RawCoordinateKey, RawRecord)>> {
-        par_sort_into_chunks_impl!(self, threads, radix_sort_record_refs, |r: &RecordRef| {
-            RawCoordinateKey { sort_key: r.sort_key }
-        })
+    ) -> Vec<InMemoryChunk<RawCoordinateKey>> {
+        par_sort_into_chunks_impl!(
+            self,
+            threads,
+            radix_sort_record_refs,
+            HEADER_SIZE,
+            |r: &RecordRef| RawCoordinateKey { sort_key: r.sort_key }
+        )
+    }
+
+    /// Drain the (already-sorted) buffer into a single in-memory chunk
+    /// whose records share an `Arc<SegmentedBuf>` backing store.
+    ///
+    /// Used by sort entry points that call `par_sort` directly (e.g.
+    /// the single-thread non-rayon path) and then need to hand the
+    /// sorted records to the merge as one chunk. After this returns,
+    /// both `self.data` and `self.refs` are empty; the caller must
+    /// drop the buffer. Clearing `refs` ensures `get_record` or
+    /// `iter_sorted` fail-fast (index out of bounds) rather than
+    /// silently slicing an empty `SegmentedBuf` if a caller forgets
+    /// to drop.
+    #[must_use]
+    pub(crate) fn drain_into_single_chunk(&mut self) -> InMemoryChunk<RawCoordinateKey> {
+        let data = Arc::new(std::mem::take(&mut self.data));
+        let records: Vec<_> = self
+            .refs
+            .iter()
+            .map(|r| {
+                let key = RawCoordinateKey { sort_key: r.sort_key };
+                (key, r.offset + HEADER_SIZE as u64, r.len)
+            })
+            .collect();
+        self.refs.clear();
+        InMemoryChunk::from_parts(data, records)
     }
 
     /// Get record bytes by reference.
@@ -924,17 +1075,44 @@ impl TemplateRecordBuffer {
     ///
     /// Instead of merging the parallel sort sub-arrays back into one sorted
     /// buffer (as `par_sort` does), this returns each sub-array as its own
-    /// `Vec<(TemplateKey, RawRecord)>` so they can be passed as separate merge
+    /// `InMemoryChunk<TemplateKey>` so they can be passed as separate merge
     /// sources to the k-way merge, avoiding the intermediate merge step.
     ///
     /// When `threads <= 1`, returns a single chunk.
-    pub fn par_sort_into_chunks(&mut self, threads: usize) -> Vec<Vec<(TemplateKey, RawRecord)>> {
+    ///
+    /// After this returns, `self.data` and `self.refs` are both empty —
+    /// the produced chunks share the original data via `Arc<SegmentedBuf>`.
+    /// The caller must drop the buffer; `get_record` and `iter_sorted`
+    /// will index-panic if called.
+    pub(crate) fn par_sort_into_chunks(
+        &mut self,
+        threads: usize,
+    ) -> Vec<InMemoryChunk<TemplateKey>> {
         par_sort_into_chunks_impl!(
             self,
             threads,
             radix_sort_template_refs,
+            TEMPLATE_HEADER_SIZE,
             |r: &TemplateRecordRef| r.key
         )
+    }
+
+    /// Drain the (already-sorted) buffer into a single in-memory chunk
+    /// whose records share an `Arc<SegmentedBuf>` backing store.
+    ///
+    /// See [`RecordBuffer::drain_into_single_chunk`] for usage and
+    /// lifetime notes — both `data` and `refs` are cleared after this
+    /// call (`get_record` would index-panic on stale refs).
+    #[must_use]
+    pub(crate) fn drain_into_single_chunk(&mut self) -> InMemoryChunk<TemplateKey> {
+        let data = Arc::new(std::mem::take(&mut self.data));
+        let records: Vec<_> = self
+            .refs
+            .iter()
+            .map(|r| (r.key, r.offset + TEMPLATE_HEADER_SIZE as u64, r.len))
+            .collect();
+        self.refs.clear();
+        InMemoryChunk::from_parts(data, records)
     }
 }
 
@@ -1907,7 +2085,7 @@ mod tests {
         // Verify the chunk is sorted
         for i in 1..chunks[0].len() {
             assert!(
-                chunks[0][i - 1].0 <= chunks[0][i].0,
+                chunks[0].key_at(i - 1) <= chunks[0].key_at(i),
                 "single chunk should be sorted at index {i}"
             );
         }
@@ -1958,12 +2136,15 @@ mod tests {
         // Verify each chunk is individually sorted
         for (ci, chunk) in chunks.iter().enumerate() {
             for i in 1..chunk.len() {
-                assert!(chunk[i - 1].0 <= chunk[i].0, "chunk {ci} not sorted at index {i}");
+                assert!(
+                    chunk.key_at(i - 1) <= chunk.key_at(i),
+                    "chunk {ci} not sorted at index {i}"
+                );
             }
         }
 
         // Verify total record count across all chunks matches input
-        let total: usize = chunks.iter().map(Vec::len).sum();
+        let total: usize = chunks.iter().map(InMemoryChunk::len).sum();
         assert_eq!(total, n, "total records across chunks should equal input count");
     }
 
@@ -2012,7 +2193,7 @@ mod tests {
         // Verify the chunk is sorted by key
         for i in 1..chunks[0].len() {
             assert!(
-                chunks[0][i - 1].0 <= chunks[0][i].0,
+                chunks[0].key_at(i - 1) <= chunks[0].key_at(i),
                 "single chunk should be sorted at index {i}"
             );
         }
@@ -2051,13 +2232,178 @@ mod tests {
         // Verify each chunk is individually sorted
         for (ci, chunk) in chunks.iter().enumerate() {
             for i in 1..chunk.len() {
-                assert!(chunk[i - 1].0 <= chunk[i].0, "chunk {ci} not sorted at index {i}");
+                assert!(
+                    chunk.key_at(i - 1) <= chunk.key_at(i),
+                    "chunk {ci} not sorted at index {i}"
+                );
             }
         }
 
         // Verify total record count across all chunks matches input
-        let total: usize = chunks.iter().map(Vec::len).sum();
+        let total: usize = chunks.iter().map(InMemoryChunk::len).sum();
         assert_eq!(total, n, "total records across chunks should equal input count");
+    }
+
+    /// Helper: build a `SegmentedBuf` containing the given byte chunks
+    /// concatenated, plus a vec of `(offset, len)` for each chunk.
+    fn build_segmented_buf_with_records(records: &[&[u8]]) -> (SegmentedBuf, Vec<(u64, u32)>) {
+        let total_bytes: usize = records.iter().map(|r| r.len()).sum();
+        let mut buf = SegmentedBuf::with_capacity(total_bytes.max(1), total_bytes.max(1));
+        let mut offsets = Vec::with_capacity(records.len());
+        let mut cursor: u64 = 0;
+        for r in records {
+            buf.extend_in_place(r);
+            offsets.push((cursor, u32::try_from(r.len()).unwrap()));
+            cursor += r.len() as u64;
+        }
+        (buf, offsets)
+    }
+
+    #[test]
+    fn test_in_memory_chunk_from_parts_reads_records() {
+        let (buf, offsets) =
+            build_segmented_buf_with_records(&[b"first", b"second-record", b"third"]);
+        let data = Arc::new(buf);
+        let records = vec![
+            (10u32, offsets[0].0, offsets[0].1),
+            (20u32, offsets[1].0, offsets[1].1),
+            (30u32, offsets[2].0, offsets[2].1),
+        ];
+        let chunk = InMemoryChunk::<u32>::from_parts(data, records);
+
+        assert_eq!(chunk.len(), 3);
+        assert!(!chunk.is_empty());
+        assert_eq!(chunk.record_bytes(0), b"first");
+        assert_eq!(chunk.record_bytes(1), b"second-record");
+        assert_eq!(chunk.record_bytes(2), b"third");
+        assert_eq!(chunk.key_at(0), &10);
+        assert_eq!(chunk.key_at(1), &20);
+        assert_eq!(chunk.key_at(2), &30);
+    }
+
+    #[test]
+    fn test_in_memory_chunk_take_key_replaces_with_default() {
+        let (buf, offsets) = build_segmented_buf_with_records(&[b"payload"]);
+        let chunk = InMemoryChunk::<u32>::from_parts(
+            Arc::new(buf),
+            vec![(42u32, offsets[0].0, offsets[0].1)],
+        );
+        let mut chunk = chunk;
+        let k = chunk.take_key(0);
+        assert_eq!(k, 42);
+        // Subsequent take returns the default, which is what the merge
+        // loop relies on once a record has been consumed.
+        assert_eq!(chunk.take_key(0), 0);
+    }
+
+    #[test]
+    fn test_in_memory_chunk_shared_arc_across_sibling_chunks() {
+        // The whole point of the shared-buffer design: sibling chunks
+        // from a single par_sort_into_chunks call share one
+        // Arc<SegmentedBuf>, so the data isn't duplicated and is freed
+        // only when the last chunk drops.
+        let (buf, offsets) = build_segmented_buf_with_records(&[b"alpha", b"beta", b"gamma"]);
+        let data = Arc::new(buf);
+        let chunk_a = InMemoryChunk::<u32>::from_parts(
+            Arc::clone(&data),
+            vec![(1, offsets[0].0, offsets[0].1)],
+        );
+        let chunk_b = InMemoryChunk::<u32>::from_parts(
+            Arc::clone(&data),
+            vec![(2, offsets[1].0, offsets[1].1), (3, offsets[2].0, offsets[2].1)],
+        );
+        assert_eq!(Arc::strong_count(&data), 3, "data + 2 chunks share the Arc");
+        assert_eq!(chunk_a.record_bytes(0), b"alpha");
+        assert_eq!(chunk_b.record_bytes(0), b"beta");
+        assert_eq!(chunk_b.record_bytes(1), b"gamma");
+
+        drop(chunk_a);
+        assert_eq!(Arc::strong_count(&data), 2);
+        drop(chunk_b);
+        assert_eq!(Arc::strong_count(&data), 1);
+    }
+
+    #[test]
+    fn test_in_memory_chunk_empty_default() {
+        let chunk = InMemoryChunk::<u32>::empty();
+        assert_eq!(chunk.len(), 0);
+        assert!(chunk.is_empty());
+        // Default produces an empty chunk too.
+        let chunk_default: InMemoryChunk<u32> = InMemoryChunk::default();
+        assert!(chunk_default.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn test_drain_into_single_chunk_round_trips_record_bytes() {
+        // End-to-end: insert records into a real RecordBuffer, sort,
+        // drain into a single chunk, and verify that record_bytes(i)
+        // returns the same bytes the original input held (offset +
+        // HEADER_SIZE arithmetic must be correct).
+        let nref = 4u32;
+        let n: usize = 32;
+        let mut buffer = RecordBuffer::with_capacity(n, n * 64, nref);
+
+        let mut originals: Vec<Vec<u8>> = Vec::with_capacity(n);
+        for i in 0..n {
+            // Reverse position so the sort is non-trivial.
+            let rec = make_coordinate_bam_record(0, (n - i) as i32);
+            originals.push(rec.clone());
+            buffer.push_coordinate(&rec).expect("push_coordinate should succeed");
+        }
+
+        buffer.par_sort();
+        let chunk = buffer.drain_into_single_chunk();
+
+        // Buffer's refs and data must both be empty after the drain.
+        assert!(buffer.refs().is_empty(), "refs cleared after drain");
+        assert!(buffer.is_empty());
+
+        assert_eq!(chunk.len(), n);
+
+        // The chunk contains the same byte multisets as the input. Use
+        // a sorted compare since the input order was reversed.
+        let mut chunk_bytes: Vec<Vec<u8>> =
+            (0..chunk.len()).map(|i| chunk.record_bytes(i).to_vec()).collect();
+        chunk_bytes.sort();
+        originals.sort();
+        assert_eq!(chunk_bytes, originals, "chunk records round-trip input bytes");
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn test_par_sort_into_chunks_shares_arc_across_siblings() {
+        // Multi-thread path: verify all returned chunks share the same
+        // Arc<SegmentedBuf>, i.e. the macro really does avoid duplicating
+        // the source data into per-chunk owned buffers.
+        let nref = 4u32;
+        let n: usize = 10_500;
+        let pool =
+            rayon::ThreadPoolBuilder::new().num_threads(4).build().expect("rayon pool build");
+
+        let chunks = pool.install(|| {
+            let mut buffer = RecordBuffer::with_capacity(n, n * 64, nref);
+            for i in 0..n {
+                let rec = make_coordinate_bam_record(0, (n - i) as i32);
+                buffer.push_coordinate(&rec).expect("push_coordinate");
+            }
+            buffer.par_sort_into_chunks(4)
+        });
+
+        assert!(chunks.len() > 1, "expected multiple chunks");
+
+        // All chunks must point at the same Arc. ptr_eq compares the
+        // Arc allocation address.
+        let first_data = Arc::as_ptr(&chunks[0].data);
+        for (i, c) in chunks.iter().enumerate().skip(1) {
+            assert!(
+                std::ptr::eq(Arc::as_ptr(&c.data), first_data),
+                "chunk {i} should share the same Arc as chunk 0"
+            );
+        }
+        // Strong count = number of chunks (after the macro's local `data`
+        // binding has been dropped).
+        assert_eq!(Arc::strong_count(&chunks[0].data), chunks.len());
     }
 
     mod proptest_msd {

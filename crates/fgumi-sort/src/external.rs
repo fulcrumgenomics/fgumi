@@ -23,7 +23,9 @@
 //! 3. Sort by keys while keeping raw records
 //! 4. Write raw record bytes to output
 
-use crate::inline::{ProbeableBuffer, RecordBuffer, TemplateKey, TemplateRecordBuffer};
+use crate::inline::{
+    InMemoryChunk, ProbeableBuffer, RecordBuffer, TemplateKey, TemplateRecordBuffer,
+};
 use crate::keys::{QuerynameComparator, RawSortKey, SortOrder};
 use crate::memory_probe::{
     BufferProbeStats, ConsumerProbeStats, MergeProbe, SpillProbe, force_mi_collect, log_snapshot,
@@ -733,12 +735,63 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
     }
 }
 
+/// Container for the in-memory chunks passed into the merge.
+///
+/// Inline-buffer sorts (coordinate, template) produce
+/// `Shared` chunks that share an `Arc<SegmentedBuf>` backing store —
+/// zero per-record allocation, one memcpy per record at merge time.
+///
+/// The queryname streaming path accumulates records upstream as
+/// individual `RawRecord`s and produces `Owned` chunks — the
+/// per-record allocation is sunk cost, so we preserve the original
+/// zero-copy `mem::swap` merge bridge.
+pub(crate) enum MemorySources<K: RawSortKey + Default + 'static> {
+    Shared(Vec<InMemoryChunk<K>>),
+    Owned(Vec<Vec<(K, fgumi_raw_bam::RawRecord)>>),
+}
+
+impl<K: RawSortKey + Default + 'static> MemorySources<K> {
+    fn num_non_empty(&self) -> usize {
+        match self {
+            Self::Shared(chunks) => chunks.iter().filter(|c| !c.is_empty()).count(),
+            Self::Owned(chunks) => chunks.iter().filter(|c| !c.is_empty()).count(),
+        }
+    }
+
+    fn push_into(self, sources: &mut Vec<ChunkSource<K>>) {
+        match self {
+            Self::Shared(chunks) => {
+                for chunk in chunks {
+                    if !chunk.is_empty() {
+                        sources.push(ChunkSource::Memory { chunk, idx: 0 });
+                    }
+                }
+            }
+            Self::Owned(chunks) => {
+                for records in chunks {
+                    if !records.is_empty() {
+                        sources.push(ChunkSource::MemoryOwned { records, idx: 0 });
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Source for keyed chunks during merge (disk or in-memory).
 enum ChunkSource<K: RawSortKey + Default + 'static> {
     /// Disk-based chunk with prefetching reader (legacy path with per-source threads).
     Disk(GenericKeyedChunkReader<K>),
-    /// In-memory sorted records from the inline buffer.
-    Memory { records: Vec<(K, fgumi_raw_bam::RawRecord)>, idx: usize },
+    /// In-memory chunk from an inline-buffer sort (coordinate /
+    /// template). All records borrow their bytes from a shared
+    /// `Arc<SegmentedBuf>`; merge bridges via `extend_from_slice`.
+    Memory { chunk: InMemoryChunk<K>, idx: usize },
+    /// In-memory chunk from a queryname-style sort, where each record
+    /// was already accumulated upstream as its own `RawRecord` (owned
+    /// `Vec<u8>`). Merge bridges via `mem::swap` to preserve the
+    /// zero-copy bridge that the streaming path already pays an
+    /// allocation for upstream.
+    MemoryOwned { records: Vec<(K, fgumi_raw_bam::RawRecord)>, idx: usize },
     /// Pool-integrated disk source — workers read and decompress, main thread parses.
     /// The `source_id` maps to the `MainThreadChunkConsumer`'s per-source buffer.
     PoolDisk { source_id: usize },
@@ -756,12 +809,32 @@ impl<K: RawSortKey + Default + 'static> ChunkSource<K> {
     ) -> Result<Option<K>> {
         match self {
             ChunkSource::Disk(reader) => reader.next_record(buf),
-            ChunkSource::Memory { records, idx } => {
+            ChunkSource::Memory { chunk, idx } => {
+                if *idx < chunk.len() {
+                    // Copy record bytes out of the shared backing
+                    // `SegmentedBuf` into the merge scratch. The
+                    // previous owned-`RawRecord`-per-record design
+                    // could `mem::swap` here, but paid one heap
+                    // allocation per record at materialization time;
+                    // sharing the backing store eliminates the
+                    // per-record allocation in exchange for one
+                    // memcpy at merge time.
+                    let bytes = chunk.record_bytes(*idx);
+                    buf.clear();
+                    buf.extend_from_slice(bytes);
+                    let key = chunk.take_key(*idx);
+                    *idx += 1;
+                    Ok(Some(key))
+                } else {
+                    Ok(None)
+                }
+            }
+            ChunkSource::MemoryOwned { records, idx } => {
                 if *idx < records.len() {
                     let (ref mut key, ref mut data) = records[*idx];
-                    // Bridge: RawRecord wraps Vec<u8>; swap via the inner vec to avoid
-                    // re-allocating. The caller's buf is a plain Vec<u8> (merge scratch).
-                    // TODO: change merge scratch to RawRecord to eliminate this bridge.
+                    // Zero-copy bridge: swap the owned `RawRecord`'s
+                    // inner Vec into the merge scratch. The caller's
+                    // scratch becomes the now-stale previous record.
                     std::mem::swap(buf, data.as_mut_vec());
                     let key = std::mem::take(key);
                     *idx += 1;
@@ -1861,9 +1934,7 @@ impl RawExternalSorter {
             // Sort remaining records into separate sub-array chunks (avoids
             // intermediate merge back into a single sorted buffer); each
             // chunk becomes its own in-memory merge source.
-            let memory_chunks: Vec<Vec<(RawCoordinateKey, fgumi_raw_bam::RawRecord)>> = if buffer
-                .is_empty()
-            {
+            let memory_chunks: Vec<InMemoryChunk<RawCoordinateKey>> = if buffer.is_empty() {
                 Vec::new()
             } else if self.threads > 1 {
                 timer.time_sort(|| rayon_pool.install(|| buffer.par_sort_into_chunks(self.threads)))
@@ -1871,18 +1942,11 @@ impl RawExternalSorter {
                 timer.time_sort(|| {
                     rayon_pool.install(|| buffer.par_sort());
                 });
-                let chunk = buffer
-                    .refs()
-                    .iter()
-                    .map(|r| {
-                        let key = RawCoordinateKey { sort_key: r.sort_key };
-                        (key, fgumi_raw_bam::RawRecord::from(buffer.get_record(r).to_vec()))
-                    })
-                    .collect();
-                vec![chunk]
+                vec![buffer.drain_into_single_chunk()]
             };
 
-            let n_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
+            let memory_chunks = MemorySources::Shared(memory_chunks);
+            let n_memory = memory_chunks.num_non_empty();
             info!(
                 "Phase 2: Merging {} chunks (keyed O(1) comparisons)...",
                 chunk_files.len() + n_memory
@@ -2047,9 +2111,7 @@ impl RawExternalSorter {
             })?;
         } else {
             // Sort remaining records into separate sub-array chunks
-            let memory_chunks: Vec<Vec<(RawCoordinateKey, fgumi_raw_bam::RawRecord)>> = if buffer
-                .is_empty()
-            {
+            let memory_chunks: Vec<InMemoryChunk<RawCoordinateKey>> = if buffer.is_empty() {
                 Vec::new()
             } else if self.threads > 1 {
                 timer.time_sort(|| rayon_pool.install(|| buffer.par_sort_into_chunks(self.threads)))
@@ -2057,18 +2119,11 @@ impl RawExternalSorter {
                 timer.time_sort(|| {
                     rayon_pool.install(|| buffer.par_sort());
                 });
-                let chunk = buffer
-                    .refs()
-                    .iter()
-                    .map(|r| {
-                        let key = RawCoordinateKey { sort_key: r.sort_key };
-                        (key, fgumi_raw_bam::RawRecord::from(buffer.get_record(r).to_vec()))
-                    })
-                    .collect();
-                vec![chunk]
+                vec![buffer.drain_into_single_chunk()]
             };
 
-            let n_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
+            let memory_chunks = MemorySources::Shared(memory_chunks);
+            let n_memory = memory_chunks.num_non_empty();
             info!(
                 "Phase 2: Merging {} chunks with index generation...",
                 chunk_files.len() + n_memory
@@ -2267,8 +2322,13 @@ impl RawExternalSorter {
             })?;
         } else {
             // Sort remaining records into separate sub-array chunks (avoids
-            // intermediate merge back into a single sorted buffer)
-            let memory_chunks: Vec<Vec<(K, fgumi_raw_bam::RawRecord)>> = if entries.is_empty() {
+            // intermediate merge back into a single sorted buffer). The
+            // queryname path accumulates records as individual `RawRecord`
+            // allocations upstream (per-record alloc already paid), so we
+            // sort the keyed Vecs in place and then convert each chunk
+            // into an `InMemoryChunk` at the boundary to match the merge
+            // interface.
+            let keyed_chunks: Vec<Vec<(K, fgumi_raw_bam::RawRecord)>> = if entries.is_empty() {
                 Vec::new()
             } else if self.threads > 1 {
                 timer.time_sort(|| {
@@ -2305,8 +2365,9 @@ impl RawExternalSorter {
                 });
                 vec![entries]
             };
+            let memory_chunks = MemorySources::Owned(keyed_chunks);
 
-            let n_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
+            let n_memory = memory_chunks.num_non_empty();
             info!(
                 "Phase 2: Merging {} chunks (keyed comparisons)...",
                 chunk_files.len() + n_memory
@@ -2476,9 +2537,7 @@ impl RawExternalSorter {
         } else {
             // Sort remaining records into separate sub-array chunks (avoids
             // intermediate merge back into a single sorted buffer)
-            let memory_chunks: Vec<Vec<(TemplateKey, fgumi_raw_bam::RawRecord)>> = if buffer
-                .is_empty()
-            {
+            let memory_chunks: Vec<InMemoryChunk<TemplateKey>> = if buffer.is_empty() {
                 Vec::new()
             } else if self.threads > 1 {
                 timer.time_sort(|| rayon_pool.install(|| buffer.par_sort_into_chunks(self.threads)))
@@ -2486,14 +2545,11 @@ impl RawExternalSorter {
                 timer.time_sort(|| {
                     rayon_pool.install(|| buffer.par_sort());
                 });
-                let chunk = buffer
-                    .iter_sorted_keyed()
-                    .map(|(k, r)| (k, fgumi_raw_bam::RawRecord::from(r.to_vec())))
-                    .collect();
-                vec![chunk]
+                vec![buffer.drain_into_single_chunk()]
             };
 
-            let n_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
+            let memory_chunks = MemorySources::Shared(memory_chunks);
+            let n_memory = memory_chunks.num_non_empty();
             info!("Phase 2: Merging {} chunks...", chunk_files.len() + n_memory);
 
             // Merge using O(1) key comparisons
@@ -2530,13 +2586,13 @@ impl RawExternalSorter {
     /// does not yet support pool-integrated decompression.
     fn build_chunk_sources<K: RawSortKey + Default + 'static>(
         chunk_files: &[PathBuf],
-        memory_chunks: Vec<Vec<(K, fgumi_raw_bam::RawRecord)>>,
+        memory_chunks: MemorySources<K>,
         reader_concurrency: usize,
         pool_decompress: bool,
         pool: &Arc<SortWorkerPool>,
     ) -> Result<Vec<ChunkSource<K>>> {
         let num_disk = chunk_files.len();
-        let num_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
+        let num_memory = memory_chunks.num_non_empty();
         let mut sources: Vec<ChunkSource<K>> = Vec::with_capacity(num_disk + num_memory);
 
         if pool_decompress && !chunk_files.is_empty() {
@@ -2559,11 +2615,7 @@ impl RawExternalSorter {
             }
         }
 
-        for chunk in memory_chunks {
-            if !chunk.is_empty() {
-                sources.push(ChunkSource::Memory { records: chunk, idx: 0 });
-            }
-        }
+        memory_chunks.push_into(&mut sources);
 
         Ok(sources)
     }
@@ -2575,7 +2627,7 @@ impl RawExternalSorter {
     fn merge_chunks_keyed(
         &self,
         chunk_files: &[PathBuf],
-        memory_chunks: Vec<Vec<(TemplateKey, fgumi_raw_bam::RawRecord)>>,
+        memory_chunks: MemorySources<TemplateKey>,
         header: &Header,
         output: &Path,
         total_records: u64,
@@ -2600,7 +2652,7 @@ impl RawExternalSorter {
     fn merge_chunks_generic<K: RawSortKey + Default + 'static>(
         &self,
         chunk_files: &[PathBuf],
-        memory_chunks: Vec<Vec<(K, fgumi_raw_bam::RawRecord)>>,
+        memory_chunks: MemorySources<K>,
         header: &Header,
         output: &Path,
         total_records: u64,
@@ -2769,26 +2821,6 @@ impl RawExternalSorter {
         Ok(records_merged)
     }
 
-    /// Test helper: merge keyed chunk files into a BAM.
-    ///
-    /// Exposes `merge_chunks_generic` for use in tests where the spill pipeline
-    /// produces chunk files that need merging.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if merging fails.
-    #[cfg(test)]
-    pub fn merge_chunks_for_test<K: RawSortKey + Default + 'static>(
-        &self,
-        chunk_files: &[PathBuf],
-        memory_chunks: Vec<Vec<(K, fgumi_raw_bam::RawRecord)>>,
-        header: &Header,
-        output: &Path,
-        pool: &Arc<SortWorkerPool>,
-    ) -> Result<u64> {
-        self.merge_chunks_generic::<K>(chunk_files, memory_chunks, header, output, 0, pool)
-    }
-
     /// Merge keyed chunks with BAM index generation.
     ///
     /// Similar to `merge_chunks_generic` but uses `IndexingBamWriter` to build
@@ -2796,7 +2828,7 @@ impl RawExternalSorter {
     fn merge_chunks_with_index<K: RawSortKey + Default + 'static>(
         &self,
         chunk_files: &[PathBuf],
-        memory_chunks: Vec<Vec<(K, fgumi_raw_bam::RawRecord)>>,
+        memory_chunks: MemorySources<K>,
         header: &Header,
         output: &Path,
         total_records: u64,
