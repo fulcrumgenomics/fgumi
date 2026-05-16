@@ -10,7 +10,34 @@
 //!   below a minimum threshold are dropped from rotation automatically.
 
 use anyhow::{Result, anyhow, bail};
+use log::warn;
 use std::path::{Path, PathBuf};
+
+/// Best-effort check: is the path on a tmpfs (RAM-backed) filesystem?
+///
+/// Spilling to tmpfs defeats the entire memory-management purpose of external
+/// sort — every byte spilled comes back out of RAM, so peak RSS climbs as
+/// if `--max-memory` were ignored and the process eventually OOMs on small
+/// hosts. Most users learn this the hard way when the default `/tmp` on
+/// Amazon Linux 2023 turns out to be tmpfs sized at 50 % of RAM.
+///
+/// Returns `Ok(true)` only when we positively identify the filesystem as
+/// tmpfs. Returns `Ok(false)` for any other filesystem, and `Ok(false)` on
+/// non-Linux targets where we don't probe the filesystem type. Returns
+/// `Err` if the `statfs(2)` call itself fails.
+#[cfg(target_os = "linux")]
+fn is_tmpfs(path: &Path) -> std::io::Result<bool> {
+    use nix::sys::statfs::{TMPFS_MAGIC, statfs};
+    statfs(path)
+        .map(|s| s.filesystem_type() == TMPFS_MAGIC)
+        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps)]
+fn is_tmpfs(_path: &Path) -> std::io::Result<bool> {
+    Ok(false)
+}
 
 /// Minimum free bytes a directory must have to remain in rotation.
 pub const DEFAULT_MIN_FREE_BYTES: u64 = 1 << 30; // 1 GiB
@@ -73,7 +100,15 @@ impl TmpDirAllocator {
         let mut active = Vec::with_capacity(dirs.len());
         for dir in dirs {
             match probe(&dir) {
-                Ok(free) if free >= min_free_bytes => active.push(dir),
+                Ok(free) if free >= min_free_bytes => {
+                    if let Ok(true) = is_tmpfs(&dir) {
+                        warn!(
+                            "Temp dir {} is on tmpfs (RAM-backed): spill files will consume                              RAM not disk, defeating --max-memory. Pass -T <path-on-disk>                              to use a real filesystem.",
+                            dir.display()
+                        );
+                    }
+                    active.push(dir);
+                }
                 Ok(free) => log::warn!(
                     "Temp dir {} dropped: only {} free (need {})",
                     dir.display(),
