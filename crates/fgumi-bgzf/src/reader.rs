@@ -132,22 +132,41 @@ impl RawBgzfBlock {
     pub fn crc32(&self) -> u32 {
         crc32_from_slice(&self.data)
     }
+
+    /// Take ownership of the block's raw byte buffer, leaving the
+    /// block with an empty `Vec<u8>`.
+    ///
+    /// Use this to return the underlying allocation to a recycling
+    /// buffer pool once the block has been decompressed.
+    #[must_use]
+    pub fn take_data(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.data)
+    }
 }
 
 // ============================================================================
 // Reading Functions
 // ============================================================================
 
-/// Read a single raw BGZF block from the input.
+/// Read a single raw BGZF block from the input, sourcing its byte
+/// storage from `get_buf` (only invoked once a block header is
+/// successfully read).
 ///
-/// Returns `Ok(Some(block))` if a block was read, `Ok(None)` at EOF,
-/// or an error if reading failed or the data is invalid.
+/// This is the buffer-recycling variant of [`read_raw_block`]: callers
+/// can pass a closure that pulls from a `Vec<u8>` recycling pool to
+/// avoid the per-block `mi_malloc` that the convenience entry point
+/// pays. On clean EOF (`Ok(None)`) the closure is *not* called, so the
+/// pool is never charged for a wasted checkout.
 ///
 /// # Errors
 ///
 /// Returns an error if the block header is invalid or reading fails.
-fn read_raw_block<R: Read + ?Sized>(reader: &mut R) -> io::Result<Option<RawBgzfBlock>> {
-    // Read the 18-byte header
+fn read_raw_block_into<R, F>(reader: &mut R, get_buf: F) -> io::Result<Option<RawBgzfBlock>>
+where
+    R: Read + ?Sized,
+    F: FnOnce() -> Vec<u8>,
+{
+    // Read the 18-byte header (or detect clean EOF).
     let mut header = [0u8; BGZF_HEADER_SIZE];
     match reader.read_exact(&mut header) {
         Ok(()) => {}
@@ -155,7 +174,7 @@ fn read_raw_block<R: Read + ?Sized>(reader: &mut R) -> io::Result<Option<RawBgzf
         Err(e) => return Err(e),
     }
 
-    // Validate gzip magic bytes
+    // Validate header (same checks as `read_raw_block`).
     if header[0] != 0x1f || header[1] != 0x8b {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -165,21 +184,15 @@ fn read_raw_block<R: Read + ?Sized>(reader: &mut R) -> io::Result<Option<RawBgzf
             ),
         ));
     }
-
-    // Validate compression method (deflate)
     if header[2] != 0x08 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Invalid compression method: expected 0x08, got 0x{:02x}", header[2]),
         ));
     }
-
-    // Validate FEXTRA flag
     if header[3] & 0x04 == 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "BGZF block missing FEXTRA flag"));
     }
-
-    // Validate BC subfield identifier
     if header[12] != b'B' || header[13] != b'C' {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -190,12 +203,8 @@ fn read_raw_block<R: Read + ?Sized>(reader: &mut R) -> io::Result<Option<RawBgzf
         ));
     }
 
-    // Get block size from BSIZE field (bytes 16-17, little-endian)
-    // BSIZE = total_block_size - 1
-    // BSIZE is u16, so block_size fits in usize on all platforms
     let bsize = usize::from(u16::from_le_bytes([header[16], header[17]]));
     let block_size = bsize + 1;
-
     if block_size < BGZF_HEADER_SIZE + BGZF_FOOTER_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -203,14 +212,32 @@ fn read_raw_block<R: Read + ?Sized>(reader: &mut R) -> io::Result<Option<RawBgzf
         ));
     }
 
-    // Allocate buffer and copy header
-    let mut data = vec![0u8; block_size];
+    // Acquire a buffer from the caller-supplied source only now —
+    // after a valid header has been read, so a checkout never charges
+    // for a wasted-on-EOF cycle.
+    let mut data = get_buf();
+    data.clear();
+    data.resize(block_size, 0);
     data[..BGZF_HEADER_SIZE].copy_from_slice(&header);
-
-    // Read remaining block data
     reader.read_exact(&mut data[BGZF_HEADER_SIZE..])?;
 
     Ok(Some(RawBgzfBlock { data }))
+}
+
+/// Read a single raw BGZF block from the input, allocating a fresh
+/// `Vec<u8>` per block. Convenience wrapper around
+/// [`read_raw_block_into`] for callers that do not want to manage a
+/// recycling buffer pool.
+///
+/// Returns `Ok(Some(block))` if a block was read, `Ok(None)` at EOF,
+/// or an error if reading failed or the data is invalid.
+///
+/// # Errors
+///
+/// Returns an error if the block header is invalid or reading fails.
+#[cfg(test)]
+fn read_raw_block<R: Read + ?Sized>(reader: &mut R) -> io::Result<Option<RawBgzfBlock>> {
+    read_raw_block_into(reader, Vec::new)
 }
 
 /// Read multiple raw BGZF blocks as a batch.
@@ -235,12 +262,55 @@ pub fn read_raw_blocks<R: Read + ?Sized>(
     reader: &mut R,
     max_blocks: usize,
 ) -> io::Result<Vec<RawBgzfBlock>> {
+    // No recycling pool to feed; discard the EOF marker's buffer.
+    read_raw_blocks_into(reader, max_blocks, Vec::new, |_| {})
+}
+
+/// Read multiple raw BGZF blocks as a batch, sourcing each block's
+/// byte storage from `get_buf` and routing any discarded blocks'
+/// buffers through `recycle`.
+///
+/// The buffer-recycling variant of [`read_raw_blocks`]: pass a
+/// closure that pulls `Vec<u8>` from a recycling pool to avoid the
+/// per-block `mi_malloc` that the convenience entry point pays.
+///
+/// `get_buf` is invoked only when a block header is successfully
+/// read, so clean EOF detection does not waste a checkout.
+/// `recycle` is invoked for the BGZF EOF marker block that closes
+/// every stream — its buffer is consumed via `get_buf` to read the
+/// trailer bytes but is not returned to the caller in the result
+/// `Vec`. Without the `recycle` callback the EOF marker would
+/// silently lose one pooled buffer per file (a 1-buffer-per-stream
+/// pool drain across Phase 2's K spill files).
+///
+/// # Errors
+///
+/// Returns an error if reading or validation fails. On a mid-block
+/// I/O error the freshly-checked-out buffer for the failing block
+/// is dropped (not routed through `recycle`); this is acceptable
+/// because the pool's `try_send`-based `checkin` already drops
+/// excess buffers, and a mid-block error aborts the whole sort.
+pub fn read_raw_blocks_into<R, F, G>(
+    reader: &mut R,
+    max_blocks: usize,
+    mut get_buf: F,
+    mut recycle: G,
+) -> io::Result<Vec<RawBgzfBlock>>
+where
+    R: Read + ?Sized,
+    F: FnMut() -> Vec<u8>,
+    G: FnMut(Vec<u8>),
+{
     let mut blocks = Vec::with_capacity(max_blocks);
     for _ in 0..max_blocks {
-        match read_raw_block(reader)? {
-            Some(block) => {
-                // Skip EOF marker blocks
-                if !block.is_eof() {
+        match read_raw_block_into(reader, &mut get_buf)? {
+            Some(mut block) => {
+                if block.is_eof() {
+                    // Skip the EOF marker block; return its buffer
+                    // through the recycle callback so the pool
+                    // does not lose one slot per stream.
+                    recycle(block.take_data());
+                } else {
                     blocks.push(block);
                 }
             }
@@ -513,6 +583,120 @@ mod tests {
         let mut reader = Cursor::new(Vec::<u8>::new());
         let result = read_raw_block(&mut reader).expect("reading raw BGZF block should succeed");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_read_raw_block_into_reuses_buffer() {
+        // Build a single-block BGZF stream by compressing a payload
+        // and concatenating its raw bytes.
+        use crate::writer::InlineBgzfCompressor;
+        let payload = b"hello, recycled buffer";
+        let mut compressor = InlineBgzfCompressor::new(6);
+        compressor.write_all(payload).expect("write");
+        compressor.flush().expect("flush");
+        let blocks = compressor.take_blocks();
+        assert_eq!(blocks.len(), 1, "small payload fits in one BGZF block");
+        let stream = blocks.into_iter().next().unwrap().data;
+
+        // Pre-warm a buffer with capacity well above the block size
+        // so we can prove the buffer is reused, not freshly allocated.
+        let recycled = Vec::with_capacity(64 * 1024);
+        let recycled_ptr = recycled.as_ptr();
+        let recycled_cap = recycled.capacity();
+
+        let mut reader = std::io::Cursor::new(stream);
+        let mut buf_holder = Some(recycled);
+        let block = read_raw_block_into(&mut reader, || buf_holder.take().expect("buf consumed"))
+            .expect("read should succeed")
+            .expect("one block before EOF");
+
+        // The returned block's data Vec is exactly the one we supplied:
+        // same allocation (ptr equal at offset 0) and capacity preserved.
+        assert!(block.data.capacity() >= recycled_cap);
+        assert!(std::ptr::eq(block.data.as_ptr(), recycled_ptr));
+
+        // Decompresses back to the original payload.
+        let mut decompressor = Decompressor::new();
+        let out = decompress_block(&block, &mut decompressor).expect("decompress");
+        assert_eq!(out.as_slice(), payload);
+    }
+
+    #[test]
+    fn test_read_raw_block_into_skips_callback_on_eof() {
+        // get_buf must not be invoked when the reader is already at
+        // clean EOF (no header bytes available).
+        let mut reader = std::io::Cursor::new(Vec::<u8>::new());
+        let called = std::cell::Cell::new(false);
+        let result = read_raw_block_into(&mut reader, || {
+            called.set(true);
+            Vec::new()
+        })
+        .expect("EOF should not be an error");
+        assert!(result.is_none(), "clean EOF returns None");
+        assert!(!called.get(), "get_buf should not be invoked on EOF");
+    }
+
+    #[test]
+    fn test_take_data_extracts_owned_buffer() {
+        let mut block = RawBgzfBlock { data: vec![1, 2, 3, 4, 5] };
+        let data = block.take_data();
+        assert_eq!(data, vec![1, 2, 3, 4, 5]);
+        assert!(block.data.is_empty(), "block's data should be drained");
+    }
+
+    #[test]
+    fn test_read_raw_blocks_into_recycles_eof_marker_and_iterates_get_buf() {
+        // Build a 3-block stream + EOF marker by compressing three
+        // payloads separately. Each `flush` emits the buffered bytes
+        // as its own BGZF block, so three flushes produce three blocks
+        // even though the payloads are small.
+        use crate::writer::InlineBgzfCompressor;
+        let payloads: [&[u8]; 3] = [b"alpha", b"beta!", b"gamma!!"];
+        let mut stream: Vec<u8> = Vec::new();
+        for p in payloads {
+            let mut compressor = InlineBgzfCompressor::new(6);
+            compressor.write_all(p).expect("write");
+            compressor.flush().expect("flush");
+            let blocks = compressor.take_blocks();
+            assert_eq!(blocks.len(), 1);
+            stream.extend_from_slice(&blocks[0].data);
+        }
+        // Append the BGZF EOF marker so the reader produces an
+        // EOF-marker block that `read_raw_blocks_into` must recycle.
+        stream.extend_from_slice(&BGZF_EOF);
+
+        let mut reader = std::io::Cursor::new(stream);
+        let get_calls = std::cell::Cell::new(0usize);
+        let recycled = std::cell::RefCell::new(Vec::<Vec<u8>>::new());
+
+        let blocks = read_raw_blocks_into(
+            &mut reader,
+            8, // max_blocks
+            || {
+                get_calls.set(get_calls.get() + 1);
+                Vec::with_capacity(64 * 1024)
+            },
+            |buf| recycled.borrow_mut().push(buf),
+        )
+        .expect("read");
+
+        // 3 payload blocks returned (EOF marker skipped).
+        assert_eq!(blocks.len(), 3, "3 payload blocks returned");
+        // `get_buf` was called once per block including the EOF marker = 4 times.
+        assert_eq!(get_calls.get(), 4, "get_buf called once per real block");
+        // The EOF marker's buffer was routed through `recycle`.
+        assert_eq!(recycled.borrow().len(), 1, "EOF marker buffer recycled once");
+        assert!(
+            recycled.borrow()[0].capacity() >= 64 * 1024,
+            "recycled buffer preserves original capacity"
+        );
+
+        // Payload bytes round-trip via decompress_block.
+        let mut decompressor = Decompressor::new();
+        for (block, expected) in blocks.iter().zip(payloads.iter()) {
+            let out = decompress_block(block, &mut decompressor).expect("decompress");
+            assert_eq!(out.as_slice(), *expected);
+        }
     }
 
     #[test]

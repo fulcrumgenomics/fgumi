@@ -33,7 +33,7 @@
 use crossbeam_channel::{Receiver, Sender, bounded};
 use crossbeam_queue::ArrayQueue;
 use fgumi_bgzf::reader::decompress_block_into;
-use fgumi_bgzf::reader::read_raw_blocks;
+use fgumi_bgzf::reader::read_raw_blocks_into;
 use fgumi_bgzf::writer::InlineBgzfCompressor;
 use fgumi_bgzf::{BGZF_MAX_BLOCK_SIZE, RawBgzfBlock};
 use log::info;
@@ -658,6 +658,12 @@ pub(crate) struct SharedPipelineState {
     /// this pool inside `try_decompress_input` and `try_phase2_file_work`.
     pub(crate) decompress_buffer_pool: BufferPool,
 
+    /// Recycling pool for raw (compressed) BGZF block buffers (clone of
+    /// `SortWorkerPool::raw_block_buffer_pool`). Disk readers source
+    /// each block's byte buffer here; decompress workers return the
+    /// buffer after `decompress_block_into` completes.
+    pub(crate) raw_block_buffer_pool: BufferPool,
+
     /// Main thread handle for `park()`/`unpark()` notification.
     /// Workers call `unpark()` after inserting into `decompressed_input`
     /// (Phase 1) or into a per-file `Phase2FileState.decompressed` reorder
@@ -671,6 +677,7 @@ impl SharedPipelineState {
         num_workers: usize,
         main_thread_handle: std::thread::Thread,
         decompress_buffer_pool: BufferPool,
+        raw_block_buffer_pool: BufferPool,
     ) -> Self {
         let data_queue_cap = num_workers * 8;
         let compress_queue_cap = num_workers * 4;
@@ -699,6 +706,7 @@ impl SharedPipelineState {
 
             num_workers,
             decompress_buffer_pool,
+            raw_block_buffer_pool,
             main_thread_handle,
         }
     }
@@ -936,6 +944,17 @@ impl SortWorkerPool {
         // empty-Vec path — graceful degradation, not a correctness issue (the
         // original pre-PR behavior on every block).
         let decompress_buffer_pool = BufferPool::pre_warmed(num_workers * 32, BGZF_MAX_BLOCK_SIZE);
+        // The raw-block pool covers in-flight compressed block buffers:
+        //   Phase 1: N workers reading (1 each, via held_raw_input_blocks
+        //            staging) + N*8 raw_input_blocks ArrayQueue cap
+        //            + N workers mid-decompress (block still alive until
+        //            checkin) = ~N * 10
+        //   Phase 2: K files × PHASE2_RAW_CAP (= 8) + in-flight decompress
+        //            = ~K * 9 (overflow falls back to fresh alloc, same
+        //            graceful-degradation as the decompress pool).
+        // `N * 32` matches the decompress pool sizing for symmetry; the
+        // typical Phase 1 working set is well under this cap.
+        let raw_block_buffer_pool = BufferPool::pre_warmed(num_workers * 32, BGZF_MAX_BLOCK_SIZE);
         let stats = PoolStats::default();
         let pipeline_stats = Arc::new(SortPipelineStats::new(num_workers));
         let main_thread_handle = std::thread::current();
@@ -943,6 +962,7 @@ impl SortWorkerPool {
             num_workers,
             main_thread_handle,
             decompress_buffer_pool.clone(),
+            raw_block_buffer_pool.clone(),
         ));
 
         let workers: Vec<JoinHandle<()>> = (0..num_workers)
@@ -1289,8 +1309,17 @@ impl SortWorkerPool {
             return StepResult::InputEmpty; // No input file set
         };
 
-        // Read a batch of raw BGZF blocks
-        let blocks = match read_raw_blocks(reader.as_mut(), INPUT_READ_BATCH_SIZE) {
+        // Read a batch of raw BGZF blocks, sourcing each block's
+        // byte buffer from the recycling pool (so the decompress
+        // worker can return it after `decompress_block_into`). The
+        // EOF-marker block's buffer is recycled back via the
+        // `recycle` callback so we do not drain one slot per stream.
+        let blocks = match read_raw_blocks_into(
+            reader.as_mut(),
+            INPUT_READ_BATCH_SIZE,
+            || shared.raw_block_buffer_pool.checkout(),
+            |buf| shared.raw_block_buffer_pool.checkin(buf),
+        ) {
             Ok(b) => b,
             Err(e) => {
                 log::error!("I/O error reading input BAM: {e}");
@@ -1341,7 +1370,7 @@ impl SortWorkerPool {
             return StepResult::OutputFull;
         }
 
-        let Some((serial, block)) = shared.raw_input_blocks.pop() else {
+        let Some((serial, mut block)) = shared.raw_input_blocks.pop() else {
             // No blocks to decompress. Check if all blocks are done — the EOF
             // condition can only be detected here (not after a successful pop)
             // when the last block was already queued before input_eof was set.
@@ -1363,13 +1392,17 @@ impl SortWorkerPool {
         let mut data = shared.decompress_buffer_pool.checkout();
         if let Err(e) = decompress_block_into(&block, &mut worker.decompressor, &mut data) {
             log::error!("BGZF decompression error (input block serial {serial}): {e}");
-            // Return the buffer to the pool so we don't leak the pre-warmed
-            // allocation on the error path.
+            // Return both buffers to their pools so we don't leak
+            // pre-warmed allocations on the error path.
             shared.decompress_buffer_pool.checkin(data);
+            shared.raw_block_buffer_pool.checkin(block.take_data());
             shared.decompression_error.store(true, Ordering::Release);
             shared.main_thread_handle.unpark();
             return StepResult::InputEmpty;
         }
+        // Return the raw (compressed) buffer to the pool now that
+        // decompression has consumed its bytes.
+        shared.raw_block_buffer_pool.checkin(block.take_data());
 
         let input_eof = shared.input_eof.load(Ordering::Acquire);
         let raw_empty = shared.raw_input_blocks.is_empty();
@@ -1457,14 +1490,16 @@ impl SortWorkerPool {
             // decrement after inserting into the reorder buffer (or on the
             // error path) to keep the counter balanced.
             let popped = Self::try_pop_raw_for_decompress(file);
-            if let Some((serial, raw_block)) = popped {
+            if let Some((serial, mut raw_block)) = popped {
                 let mut data = shared.decompress_buffer_pool.checkout();
                 if let Err(e) =
                     decompress_block_into(&raw_block, &mut worker.decompressor, &mut data)
                 {
                     log::error!("BGZF decompression error (chunk source {i} serial {serial}): {e}");
-                    // Return the buffer to the pool to avoid leaking pre-warmed capacity.
+                    // Return both buffers to their pools to avoid
+                    // leaking pre-warmed capacity on the error path.
                     shared.decompress_buffer_pool.checkin(data);
+                    shared.raw_block_buffer_pool.checkin(raw_block.take_data());
                     shared.decompression_error.store(true, Ordering::Release);
                     // Balance the in-flight increment from try_pop_raw_for_decompress.
                     file.decomp_in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -1472,6 +1507,9 @@ impl SortWorkerPool {
                     worker.phase2_file_cursor = (i + 1) % n;
                     return StepResult::Success;
                 }
+                // Return the raw (compressed) buffer to the pool now
+                // that decompression has consumed its bytes.
+                shared.raw_block_buffer_pool.checkin(raw_block.take_data());
                 let now_poppable = {
                     let mut dec_guard =
                         file.decompressed.lock().expect("phase2 decompressed mutex poisoned");
@@ -1513,7 +1551,12 @@ impl SortWorkerPool {
                 continue;
             }
 
-            let blocks = match read_raw_blocks(&mut reader_guard.inner, PHASE2_READ_BATCH) {
+            let blocks = match read_raw_blocks_into(
+                &mut reader_guard.inner,
+                PHASE2_READ_BATCH,
+                || shared.raw_block_buffer_pool.checkout(),
+                |buf| shared.raw_block_buffer_pool.checkin(buf),
+            ) {
                 Ok(b) => b,
                 Err(e) => {
                     log::error!("I/O error reading chunk file (source {i}): {e}");
