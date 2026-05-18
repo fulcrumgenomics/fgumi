@@ -9,19 +9,23 @@
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Command;
 use tempfile::TempDir;
+
+use clap::Parser;
+use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::sort::Sort;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn fgumi_binary() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_BIN_EXE_fgumi"))
-}
-
-fn fgumi(args: &[OsString]) -> Output {
-    Command::new(fgumi_binary()).args(args).output().expect("failed to execute fgumi")
+fn fgumi_sort_in_process(args: &[OsString]) -> anyhow::Result<()> {
+    // `clap::Parser::try_parse_from` accepts any iterator of `Into<OsString>`
+    // values, so feeding `OsString` through avoids a UTF-8 round-trip that
+    // would panic on a non-UTF-8 temp-dir path.
+    let cmd = Sort::try_parse_from(args.iter().cloned()).expect("failed to parse sort args");
+    cmd.execute("test")
 }
 
 fn samtools_available() -> bool {
@@ -100,7 +104,7 @@ fn create_test_bam(dir: &Path, num_reads: usize) -> std::path::PathBuf {
 
 /// Run `fgumi sort --verify` and return whether the file is correctly sorted.
 fn verify_sorted(bam_path: &Path, order: &str) -> bool {
-    let mut cmd_args: Vec<OsString> = vec![
+    let cmd_args: Vec<OsString> = vec![
         "sort".into(),
         "--verify".into(),
         "-i".into(),
@@ -108,12 +112,7 @@ fn verify_sorted(bam_path: &Path, order: &str) -> bool {
         "--order".into(),
         order.into(),
     ];
-    if order == "template-coordinate" {
-        cmd_args.push("--cell-tag".into());
-        cmd_args.push("CB".into());
-    }
-    let output = fgumi(&cmd_args);
-    output.status.success()
+    fgumi_sort_in_process(&cmd_args).is_ok()
 }
 
 /// Count records in a BAM using samtools.
@@ -157,19 +156,12 @@ fn sort_bam_with_args(
         "--temp-compression".into(),
         "1".into(),
     ];
-    if order == "template-coordinate" {
-        cmd_args.push("--cell-tag".into());
-        cmd_args.push("CB".into());
-    }
     for arg in extra_args {
         cmd_args.push((*arg).into());
     }
-    let output_result = fgumi(&cmd_args);
-    assert!(
-        output_result.status.success(),
-        "fgumi sort failed for order={order} threads={threads} memory={max_memory}:\nstderr: {}",
-        String::from_utf8_lossy(&output_result.stderr),
-    );
+    fgumi_sort_in_process(&cmd_args).unwrap_or_else(|e| {
+        panic!("fgumi sort failed for order={order} threads={threads} memory={max_memory}: {e:#}")
+    });
 }
 
 // ---------------------------------------------------------------------------
