@@ -1273,7 +1273,7 @@ impl CompareBams {
             Ok(stats.bam1_count)
         } else {
             info!("BAM files differ");
-            std::process::exit(1);
+            Err(super::CompareMismatch("BAM files differ".to_owned()).into())
         }
     }
 
@@ -1565,7 +1565,8 @@ impl CompareBams {
             Ok(stats.bam1_count)
         } else {
             info!("BAM files differ");
-            std::process::exit(1);
+            Err(super::CompareMismatch("BAM files differ (content and groupings)".to_owned())
+                .into())
         }
     }
 
@@ -1868,7 +1869,7 @@ impl CompareBams {
             Ok(stats.total_records)
         } else {
             info!("BAM groupings differ");
-            std::process::exit(1);
+            Err(super::CompareMismatch("BAM groupings differ".to_owned()).into())
         }
     }
 
@@ -2058,7 +2059,8 @@ impl CompareBams {
             Ok(stats.total_bam1 + stats.total_bam2)
         } else {
             info!("BAM groupings differ");
-            std::process::exit(1);
+            Err(super::CompareMismatch("BAM groupings differ (order-independent)".to_owned())
+                .into())
         }
     }
 }
