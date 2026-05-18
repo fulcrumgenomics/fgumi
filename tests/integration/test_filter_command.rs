@@ -99,7 +99,7 @@ fn test_filter_command_basic() {
         "1",
     ])
     .expect("failed to parse filter args");
-    cmd.execute("test").expect("Filter command failed");
+    cmd.execute("fgumi filter").expect("Filter command failed");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // Verify output has records (reads may have masked bases but should still be present)
@@ -168,7 +168,7 @@ fn test_filter_command_rejects_low_depth() {
         "1",
     ])
     .expect("failed to parse filter args");
-    cmd.execute("test").expect("Filter command with rejects failed");
+    cmd.execute("fgumi filter").expect("Filter command with rejects failed");
     assert!(output_bam.exists(), "Output BAM not created");
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 
@@ -226,7 +226,7 @@ fn test_filter_command_with_stats() {
         "1",
     ])
     .expect("failed to parse filter args");
-    cmd.execute("test").expect("Filter command with stats failed");
+    cmd.execute("fgumi filter").expect("Filter command with stats failed");
     assert!(stats_path.exists(), "Stats file not created");
     let content = fs::read_to_string(&stats_path).expect("Failed to read stats file");
     assert!(!content.trim().is_empty(), "Stats file should not be empty");
@@ -275,7 +275,7 @@ fn test_filter_command_no_ref_unmapped_reads() {
         "1",
     ])
     .expect("failed to parse filter args");
-    cmd.execute("test").expect("Filter command without --ref failed");
+    cmd.execute("fgumi filter").expect("Filter command without --ref failed");
     assert!(output_bam.exists(), "Output BAM not created");
 
     let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
@@ -328,7 +328,7 @@ fn test_filter_command_no_ref_with_rejects() {
         "1",
     ])
     .expect("failed to parse filter args");
-    cmd.execute("test").expect("Filter command without --ref with rejects failed");
+    cmd.execute("fgumi filter").expect("Filter command without --ref with rejects failed");
     assert!(output_bam.exists(), "Output BAM not created");
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 
@@ -386,7 +386,7 @@ fn test_filter_command_no_ref_mapped_reads_fails() {
         "1",
     ])
     .expect("failed to parse filter args");
-    let result = cmd.execute("test");
+    let result = cmd.execute("fgumi filter");
     assert!(result.is_err(), "Filter command should fail for mapped reads without --ref");
     let err_msg = format!("{:#}", result.unwrap_err());
     assert!(

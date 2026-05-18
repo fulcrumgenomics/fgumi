@@ -109,7 +109,7 @@ fn test_dedup_command_basic() {
         "1",
     ])
     .expect("failed to parse dedup args");
-    cmd.execute("test").expect("Dedup command failed");
+    cmd.execute("fgumi dedup").expect("Dedup command failed");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // All reads should be present (duplicates are marked, not removed)
@@ -144,7 +144,7 @@ fn test_dedup_command_with_metrics() {
         "1",
     ])
     .expect("failed to parse dedup args");
-    cmd.execute("test").expect("Dedup command with metrics failed");
+    cmd.execute("fgumi dedup").expect("Dedup command with metrics failed");
     assert!(metrics_path.exists(), "Metrics file not created");
 }
 
@@ -172,7 +172,7 @@ fn test_dedup_command_remove_duplicates() {
         "1",
     ])
     .expect("failed to parse dedup args");
-    cmd.execute("test").expect("Dedup command with --remove-duplicates failed");
+    cmd.execute("fgumi dedup").expect("Dedup command with --remove-duplicates failed");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // With remove-duplicates, only the best pair should remain
@@ -301,7 +301,7 @@ fn test_dedup_no_umi_large_position_group() {
         "1",
     ])
     .expect("failed to parse dedup args");
-    cmd.execute("test").expect("dedup --no-umi should succeed with large position group");
+    cmd.execute("fgumi dedup").expect("dedup --no-umi should succeed with large position group");
 
     assert!(output_bam.exists(), "output BAM should be created");
 

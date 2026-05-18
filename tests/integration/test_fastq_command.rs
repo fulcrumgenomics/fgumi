@@ -108,7 +108,7 @@ fn test_fastq_basic() {
         output_fq.to_str().unwrap(),
     ])
     .expect("failed to parse fastq args");
-    cmd.execute("test").expect("fastq command failed");
+    cmd.execute("fgumi fastq").expect("fastq command failed");
 
     // Verify output
     let records = parse_fastq_records(&output_fq);
@@ -154,7 +154,7 @@ fn test_fastq_reverse_complement() {
         output_fq.to_str().unwrap(),
     ])
     .expect("failed to parse fastq args");
-    cmd.execute("test").expect("fastq command failed");
+    cmd.execute("fgumi fastq").expect("fastq command failed");
 
     let records = parse_fastq_records(&output_fq);
     assert_eq!(records.len(), 2);
@@ -184,7 +184,7 @@ fn test_fastq_no_suffix() {
         output_fq.to_str().unwrap(),
     ])
     .expect("failed to parse fastq args");
-    cmd.execute("test").expect("fastq command failed");
+    cmd.execute("fgumi fastq").expect("fastq command failed");
 
     let records = parse_fastq_records(&output_fq);
     assert_eq!(records.len(), 2);
@@ -215,7 +215,7 @@ fn test_fastq_quality_encoding() {
         output_fq.to_str().unwrap(),
     ])
     .expect("failed to parse fastq args");
-    cmd.execute("test").expect("fastq command failed");
+    cmd.execute("fgumi fastq").expect("fastq command failed");
 
     let records = parse_fastq_records(&output_fq);
     assert_eq!(records.len(), 2);
@@ -300,7 +300,7 @@ fn test_fastq_exclude_flags() {
         output_fq.to_str().unwrap(),
     ])
     .expect("failed to parse fastq args");
-    cmd.execute("test").expect("fastq command failed");
+    cmd.execute("fgumi fastq").expect("fastq command failed");
 
     let records = parse_fastq_records(&output_fq);
     assert_eq!(
@@ -338,7 +338,7 @@ fn test_fastq_multithreaded() {
         output_fq.to_str().unwrap(),
     ])
     .expect("failed to parse fastq args");
-    cmd.execute("test").expect("fastq command failed");
+    cmd.execute("fgumi fastq").expect("fastq command failed");
 
     let records = parse_fastq_records(&output_fq);
     assert_eq!(records.len(), 20, "Should have 20 FASTQ records (10 pairs)");
@@ -364,7 +364,7 @@ fn test_fastq_hex_flags() {
         output_fq.to_str().unwrap(),
     ])
     .expect("failed to parse fastq args");
-    cmd.execute("test").expect("fastq command failed");
+    cmd.execute("fgumi fastq").expect("fastq command failed");
 
     let records = parse_fastq_records(&output_fq);
     assert_eq!(records.len(), 2);
@@ -388,7 +388,8 @@ fn test_fastq_output_same_as_input_rejected() {
         input_bam.to_str().unwrap(),
     ])
     .expect("failed to parse fastq args");
-    let err = cmd.execute("test").expect_err("execute must reject identical --input/--output");
+    let err =
+        cmd.execute("fgumi fastq").expect_err("execute must reject identical --input/--output");
     assert!(err.to_string().contains("must differ"), "unexpected error message: {err}");
 
     // Most importantly: the input BAM must not have been truncated.

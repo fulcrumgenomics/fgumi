@@ -111,7 +111,7 @@ fn test_downsample_basic() {
         "1",
     ])
     .expect("failed to parse downsample args");
-    cmd.execute("test").expect("Downsample command failed");
+    cmd.execute("fgumi downsample").expect("Downsample command failed");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // Verify that some families were kept (with seed 42 and fraction 0.5, should be around 5)
@@ -153,7 +153,7 @@ fn test_downsample_with_rejects() {
         "1",
     ])
     .expect("failed to parse downsample args");
-    cmd.execute("test").expect("Downsample command failed");
+    cmd.execute("fgumi downsample").expect("Downsample command failed");
     assert!(output_bam.exists(), "Output BAM not created");
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 
@@ -193,7 +193,7 @@ fn test_downsample_deterministic() {
             "1",
         ])
         .expect("failed to parse downsample args");
-        cmd.execute("test").expect("Downsample command failed");
+        cmd.execute("fgumi downsample").expect("Downsample command failed");
     }
 
     // Both outputs should be identical
@@ -263,7 +263,7 @@ fn test_downsample_histograms() {
         "1",
     ])
     .expect("failed to parse downsample args");
-    cmd.execute("test").expect("Downsample command failed");
+    cmd.execute("fgumi downsample").expect("Downsample command failed");
     assert!(hist_kept.exists(), "Kept histogram not created");
     assert!(hist_rejected.exists(), "Rejected histogram not created");
 
@@ -297,7 +297,7 @@ fn test_downsample_keep_all() {
         "1",
     ])
     .expect("failed to parse downsample args");
-    cmd.execute("test").expect("Downsample command failed");
+    cmd.execute("fgumi downsample").expect("Downsample command failed");
 
     // All records should be kept
     let output_records = read_bam_records(&output_bam);
@@ -329,5 +329,5 @@ fn test_downsample_invalid_fraction(#[case] fraction: &str, #[case] output_name:
         "1",
     ])
     .expect("failed to parse downsample args");
-    assert!(cmd.execute("test").is_err(), "Fraction={fraction} should fail");
+    assert!(cmd.execute("fgumi downsample").is_err(), "Fraction={fraction} should fail");
 }

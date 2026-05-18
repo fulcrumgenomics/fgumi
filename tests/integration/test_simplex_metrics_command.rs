@@ -132,7 +132,7 @@ fn test_simplex_metrics_command_creates_output_files() {
         output_prefix.to_str().unwrap(),
     ])
     .expect("failed to parse simplex-metrics args");
-    cmd.execute("test").expect("simplex-metrics command failed");
+    cmd.execute("fgumi simplex-metrics").expect("simplex-metrics command failed");
 
     let family_sizes_path = format!("{}.family_sizes.txt", output_prefix.display());
     let yield_metrics_path = format!("{}.simplex_yield_metrics.txt", output_prefix.display());
@@ -163,7 +163,7 @@ fn test_simplex_metrics_command_family_sizes() {
         output_prefix.to_str().unwrap(),
     ])
     .expect("failed to parse simplex-metrics args");
-    cmd.execute("test").expect("simplex-metrics command failed");
+    cmd.execute("fgumi simplex-metrics").expect("simplex-metrics command failed");
 
     let family_sizes_path = format!("{}.family_sizes.txt", output_prefix.display());
     let metrics: Vec<SimplexFamilySizeMetric> =
@@ -199,7 +199,7 @@ fn test_simplex_metrics_command_yield_metrics() {
         output_prefix.to_str().unwrap(),
     ])
     .expect("failed to parse simplex-metrics args");
-    cmd.execute("test").expect("simplex-metrics command failed");
+    cmd.execute("fgumi simplex-metrics").expect("simplex-metrics command failed");
 
     let yield_path = format!("{}.simplex_yield_metrics.txt", output_prefix.display());
     let metrics: Vec<SimplexYieldMetric> =
@@ -231,7 +231,7 @@ fn test_simplex_metrics_command_umi_metrics() {
         output_prefix.to_str().unwrap(),
     ])
     .expect("failed to parse simplex-metrics args");
-    cmd.execute("test").expect("simplex-metrics command failed");
+    cmd.execute("fgumi simplex-metrics").expect("simplex-metrics command failed");
 
     let umi_counts_path = format!("{}.umi_counts.txt", output_prefix.display());
     let metrics: Vec<UmiMetric> =
@@ -261,7 +261,7 @@ fn test_simplex_metrics_min_reads_parameter() {
         output_default.to_str().unwrap(),
     ])
     .expect("failed to parse simplex-metrics args");
-    cmd.execute("test").expect("simplex-metrics (default) command failed");
+    cmd.execute("fgumi simplex-metrics").expect("simplex-metrics (default) command failed");
 
     // Run with min-reads=3
     let cmd = SimplexMetrics::try_parse_from([
@@ -274,7 +274,7 @@ fn test_simplex_metrics_min_reads_parameter() {
         "3",
     ])
     .expect("failed to parse simplex-metrics args");
-    cmd.execute("test").expect("simplex-metrics (strict) command failed");
+    cmd.execute("fgumi simplex-metrics").expect("simplex-metrics (strict) command failed");
 
     let default_yield_path = format!("{}.simplex_yield_metrics.txt", output_default.display());
     let strict_yield_path = format!("{}.simplex_yield_metrics.txt", output_strict.display());

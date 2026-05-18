@@ -90,7 +90,7 @@ fn test_clip_command_basic() {
         "1",
     ])
     .expect("failed to parse clip args");
-    cmd.execute("test").expect("Clip command failed");
+    cmd.execute("fgumi clip").expect("Clip command failed");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // Verify output has the reads
@@ -159,6 +159,6 @@ fn test_clip_command_with_metrics() {
         "1",
     ])
     .expect("failed to parse clip args");
-    cmd.execute("test").expect("Clip command with metrics failed");
+    cmd.execute("fgumi clip").expect("Clip command with metrics failed");
     assert!(metrics_path.exists(), "Metrics file not created");
 }

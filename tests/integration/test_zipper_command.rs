@@ -142,7 +142,7 @@ fn test_zipper_basic_merge() {
         "1",
     ])
     .expect("failed to parse zipper args");
-    cmd.execute("test").expect("Zipper command failed");
+    cmd.execute("fgumi zipper").expect("Zipper command failed");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // Verify output records have UMI tags transferred
@@ -209,7 +209,7 @@ fn test_zipper_tag_removal() {
         "1",
     ])
     .expect("failed to parse zipper args");
-    cmd.execute("test").expect("Zipper command with --tags-to-remove failed");
+    cmd.execute("fgumi zipper").expect("Zipper command with --tags-to-remove failed");
 
     // Verify XY tag was removed but RX tag was kept
     let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
@@ -245,7 +245,7 @@ fn test_zipper_missing_input() {
         output_bam.to_str().unwrap(),
     ])
     .expect("failed to parse zipper args");
-    assert!(cmd.execute("test").is_err(), "Zipper should fail for nonexistent input");
+    assert!(cmd.execute("fgumi zipper").is_err(), "Zipper should fail for nonexistent input");
 }
 
 /// Test zipper accepts BAM as mapped input (--input).

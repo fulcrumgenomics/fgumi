@@ -68,7 +68,7 @@ fn test_simplex_command_basic_consensus() {
         "1",
     ])
     .expect("failed to parse simplex args");
-    cmd.execute("test").expect("Simplex command failed");
+    cmd.execute("fgumi simplex").expect("Simplex command failed");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // Read output and verify consensus reads were produced
@@ -110,7 +110,7 @@ fn test_simplex_command_with_stats() {
         "1",
     ])
     .expect("failed to parse simplex args");
-    cmd.execute("test").expect("Simplex command with stats failed");
+    cmd.execute("fgumi simplex").expect("Simplex command with stats failed");
     assert!(stats_path.exists(), "Stats file not created");
 }
 
@@ -141,7 +141,7 @@ fn test_simplex_command_with_rejects() {
         "1",
     ])
     .expect("failed to parse simplex args");
-    cmd.execute("test").expect("Simplex command with rejects failed");
+    cmd.execute("fgumi simplex").expect("Simplex command with rejects failed");
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 }
 
@@ -236,7 +236,7 @@ fn test_simplex_command_collapses_read_group_attributes() {
         "1",
     ])
     .expect("failed to parse simplex args");
-    cmd.execute("test").expect("Simplex command failed");
+    cmd.execute("fgumi simplex").expect("Simplex command failed");
 
     // Read the output header and verify collapsed read group attributes
     let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
@@ -309,7 +309,7 @@ fn test_simplex_command_rejects_inherits_input_read_groups() {
         "1",
     ])
     .expect("failed to parse simplex args");
-    cmd.execute("test").expect("Simplex command with rejects failed");
+    cmd.execute("fgumi simplex").expect("Simplex command with rejects failed");
 
     // Primary output BAM: consensus header collapses RG1+RG2 -> single "A".
     let primary_header =

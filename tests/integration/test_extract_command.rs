@@ -120,7 +120,7 @@ fn test_extract_gzip_single_threaded() {
         "1",
     ])
     .expect("failed to parse extract args");
-    cmd.execute("test").expect("Extract command failed");
+    cmd.execute("fgumi extract").expect("Extract command failed");
 
     // Verify output
     let records = read_bam_records(&output);
@@ -157,7 +157,7 @@ fn test_extract_gzip_multithreaded() {
         "1",
     ])
     .expect("failed to parse extract args");
-    cmd.execute("test").expect("Extract command with --threads failed");
+    cmd.execute("fgumi extract").expect("Extract command with --threads failed");
 
     // Verify output
     let records = read_bam_records(&output);
@@ -194,7 +194,7 @@ fn test_extract_gzip_threads_mode() {
         "1",
     ])
     .expect("failed to parse extract args");
-    cmd.execute("test").expect("Extract command with --threads failed");
+    cmd.execute("fgumi extract").expect("Extract command with --threads failed");
 
     // Verify output
     let records = read_bam_records(&output);
@@ -233,7 +233,7 @@ fn test_extract_bgzf_single_threaded() {
         "1",
     ])
     .expect("failed to parse extract args");
-    cmd.execute("test").expect("Extract command with BGZF input failed");
+    cmd.execute("fgumi extract").expect("Extract command with BGZF input failed");
 
     // Verify output
     let records = read_bam_records(&output);
@@ -270,7 +270,7 @@ fn test_extract_bgzf_multithreaded() {
         "1",
     ])
     .expect("failed to parse extract args");
-    cmd.execute("test").expect("Extract command with BGZF + --threads failed");
+    cmd.execute("fgumi extract").expect("Extract command with BGZF + --threads failed");
 
     // Verify output
     let records = read_bam_records(&output);
@@ -307,7 +307,7 @@ fn test_extract_bgzf_threads_mode() {
         "1",
     ])
     .expect("failed to parse extract args");
-    cmd.execute("test").expect("Extract command with BGZF + --threads failed");
+    cmd.execute("fgumi extract").expect("Extract command with BGZF + --threads failed");
 
     // Verify output
     let records = read_bam_records(&output);
@@ -361,7 +361,7 @@ fn test_extract_gzip_verifies_umi_extraction() {
         "1",
     ])
     .expect("failed to parse extract args");
-    cmd.execute("test").expect("Failed to execute extract command");
+    cmd.execute("fgumi extract").expect("Failed to execute extract command");
 
     let records = read_bam_records(&output);
     assert_eq!(records.len(), 2);
@@ -421,7 +421,7 @@ fn test_extract_bgzf_verifies_umi_extraction() {
         "1",
     ])
     .expect("failed to parse extract args");
-    cmd.execute("test").expect("Failed to execute extract command");
+    cmd.execute("fgumi extract").expect("Failed to execute extract command");
 
     let records = read_bam_records(&output);
     assert_eq!(records.len(), 2);
@@ -468,7 +468,7 @@ fn test_extract_mixed_gzip_and_bgzf() {
         "1",
     ])
     .expect("failed to parse extract args");
-    cmd.execute("test").expect("Extract with mixed gzip/BGZF should succeed");
+    cmd.execute("fgumi extract").expect("Extract with mixed gzip/BGZF should succeed");
 
     let records = read_bam_records(&output);
     assert_eq!(records.len(), 6, "Should have 6 records");
@@ -502,7 +502,7 @@ fn test_extract_plain_and_compressed() {
         "1",
     ])
     .expect("failed to parse extract args");
-    cmd.execute("test").expect("Extract with plain/gzip mix should succeed");
+    cmd.execute("fgumi extract").expect("Extract with plain/gzip mix should succeed");
 
     let records = read_bam_records(&output);
     assert_eq!(records.len(), 6, "Should have 6 records");
@@ -560,7 +560,7 @@ fn test_parallel_parse_output_equivalence_across_threads() {
             "1",
         ])
         .expect("failed to parse extract args");
-        cmd.execute("test")
+        cmd.execute("fgumi extract")
             .unwrap_or_else(|e| panic!("Extract with {threads} threads failed: {e}"));
 
         let records = read_bam_records(&output);
@@ -630,7 +630,7 @@ fn test_parallel_parse_determinism() {
             "1",
         ])
         .expect("failed to parse extract args");
-        cmd.execute("test").unwrap_or_else(|e| panic!("Run {run} failed: {e}"));
+        cmd.execute("fgumi extract").unwrap_or_else(|e| panic!("Run {run} failed: {e}"));
         outputs.push(read_bam_records(&output));
     }
 
@@ -706,7 +706,7 @@ fn test_bgzf_sync_multithreaded_matches_single_threaded() {
         "1",
     ])
     .expect("failed to parse extract args");
-    cmd.execute("test").expect("Failed to execute single-threaded extract");
+    cmd.execute("fgumi extract").expect("Failed to execute single-threaded extract");
 
     // Run multithreaded (BGZF+sync through unified pipeline)
     let output_threaded = tmp.path().join("output_mt.bam");
@@ -730,7 +730,7 @@ fn test_bgzf_sync_multithreaded_matches_single_threaded() {
         "1",
     ])
     .expect("failed to parse extract args");
-    cmd.execute("test").expect("Failed to execute multithreaded extract");
+    cmd.execute("fgumi extract").expect("Failed to execute multithreaded extract");
 
     // Compare record content (not just count)
     let st_records = read_bam_records(&output_st);
@@ -800,7 +800,7 @@ fn test_variable_length_reads_gzip() {
         "1",
     ])
     .expect("failed to parse extract args");
-    cmd.execute("test").expect("Extract with variable-length reads failed");
+    cmd.execute("fgumi extract").expect("Extract with variable-length reads failed");
 
     let records = read_bam_records(&output);
     assert_eq!(records.len(), 8, "Should have 8 records (4 pairs × 2 reads)");
@@ -850,7 +850,7 @@ fn test_variable_length_reads_bgzf() {
         "1",
     ])
     .expect("failed to parse extract args");
-    cmd.execute("test").expect("BGZF extract with variable-length reads failed");
+    cmd.execute("fgumi extract").expect("BGZF extract with variable-length reads failed");
 
     let records = read_bam_records(&output);
     assert_eq!(records.len(), 8, "Should have 8 records (4 pairs × 2 reads)");
@@ -892,7 +892,7 @@ fn test_extract_multithreaded_custom_options() {
         "--annotate-read-names",
     ])
     .expect("failed to parse extract args");
-    cmd.execute("test").expect("Multi-threaded extract with custom options failed");
+    cmd.execute("fgumi extract").expect("Multi-threaded extract with custom options failed");
 
     let records = read_bam_records(&output);
     assert_eq!(records.len(), 2);
@@ -961,7 +961,8 @@ fn run_bgzf_extract(
 
     let cmd = Extract::try_parse_from(args.iter().map(String::as_str))
         .expect("failed to parse extract args");
-    cmd.execute("test").unwrap_or_else(|e| panic!("extract t{threads} {tag_suffix} failed: {e}"));
+    cmd.execute("fgumi extract")
+        .unwrap_or_else(|e| panic!("extract t{threads} {tag_suffix} failed: {e}"));
     read_bam_records(&output)
 }
 
@@ -1205,7 +1206,7 @@ fn test_extract_bgzf_unequal_block_counts() {
             "1",
         ])
         .expect("failed to parse extract args");
-        cmd.execute("test").unwrap_or_else(|e| {
+        cmd.execute("fgumi extract").unwrap_or_else(|e| {
             panic!("Extract with unequal BGZF block counts should succeed at T{threads}: {e}")
         });
 

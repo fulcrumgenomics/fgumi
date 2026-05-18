@@ -69,7 +69,7 @@ fn test_correct_command_basic() {
         "1",
     ])
     .expect("failed to parse correct args");
-    cmd.execute("test").expect("Correct command failed");
+    cmd.execute("fgumi correct").expect("Correct command failed");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // Verify output has records
@@ -110,7 +110,7 @@ fn test_correct_command_with_metrics() {
         "1",
     ])
     .expect("failed to parse correct args");
-    cmd.execute("test").expect("Correct command with metrics failed");
+    cmd.execute("fgumi correct").expect("Correct command with metrics failed");
     assert!(metrics.exists(), "Metrics file not created");
 
     let content = fs::read_to_string(&metrics).unwrap();
@@ -150,7 +150,7 @@ fn test_correct_command_with_rejects() {
         "1",
     ])
     .expect("failed to parse correct args");
-    cmd.execute("test").expect("Correct command with rejects failed");
+    cmd.execute("fgumi correct").expect("Correct command with rejects failed");
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 }
 
@@ -218,7 +218,7 @@ fn test_correct_command_rejects_streaming_threaded_integrity() {
         "1",
     ])
     .expect("failed to parse correct args");
-    cmd.execute("test").expect("Correct command with threaded rejects failed");
+    cmd.execute("fgumi correct").expect("Correct command with threaded rejects failed");
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 
     crate::helpers::assertions::assert_has_bgzf_eof(&rejects_bam);

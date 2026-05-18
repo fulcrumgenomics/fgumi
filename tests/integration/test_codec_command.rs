@@ -135,7 +135,7 @@ fn test_codec_command_basic_consensus() {
         "1",
     ])
     .expect("failed to parse codec args");
-    cmd.execute("test").expect("Failed to run codec command");
+    cmd.execute("fgumi codec").expect("Failed to run codec command");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // Read output and verify consensus was created
@@ -210,7 +210,7 @@ fn test_codec_command_with_stats() {
         "1",
     ])
     .expect("failed to parse codec args");
-    cmd.execute("test").expect("Failed to run codec command");
+    cmd.execute("fgumi codec").expect("Failed to run codec command");
     assert!(stats_file.exists(), "Stats file not created");
 
     // Verify stats file has content
@@ -276,7 +276,7 @@ fn test_codec_command_with_rejects() {
         "1",
     ])
     .expect("failed to parse codec args");
-    cmd.execute("test").expect("Failed to run codec command");
+    cmd.execute("fgumi codec").expect("Failed to run codec command");
     assert!(output_bam.exists(), "Output BAM not created");
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 
@@ -336,7 +336,7 @@ fn test_codec_command_min_duplex_length() {
         "1",
     ])
     .expect("failed to parse codec args");
-    cmd.execute("test").expect("Failed to run codec command");
+    cmd.execute("fgumi codec").expect("Failed to run codec command");
 
     // Should produce no consensus due to insufficient duplex length
     let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
@@ -386,7 +386,7 @@ fn test_codec_command_per_base_tags() {
         "1",
     ])
     .expect("failed to parse codec args");
-    cmd.execute("test").expect("Failed to run codec command");
+    cmd.execute("fgumi codec").expect("Failed to run codec command");
 
     // Verify per-base tags exist
     let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
@@ -443,7 +443,7 @@ fn test_codec_command_cell_barcode_preservation() {
         "1",
     ])
     .expect("failed to parse codec args");
-    cmd.execute("test").expect("Failed to run codec command");
+    cmd.execute("fgumi codec").expect("Failed to run codec command");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // Read output and verify cell barcode is preserved
@@ -560,7 +560,7 @@ fn test_codec_command_recovers_from_duplex_disagreement() {
         "1",
     ])
     .expect("failed to parse codec args");
-    cmd.execute("test")
+    cmd.execute("fgumi codec")
         .expect("Codec command must succeed when only failure is a recoverable reject");
 
     let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
@@ -603,7 +603,7 @@ fn test_codec_command_recovers_from_duplex_disagreement_threaded() {
         "1",
     ])
     .expect("failed to parse codec args");
-    cmd.execute("test")
+    cmd.execute("fgumi codec")
         .expect("Threaded codec command must succeed when only failure is a recoverable reject");
 
     let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());

@@ -87,7 +87,7 @@ fn simulate_grouped_reads(
         OsStr::new("2"),
     ])
     .expect("failed to parse grouped-reads args");
-    cmd.execute("test").expect("simulate grouped-reads failed");
+    cmd.execute("fgumi simulate grouped-reads").expect("simulate grouped-reads failed");
 }
 
 /// Generate FASTQ reads using simulate with deterministic seed.
@@ -127,7 +127,7 @@ fn simulate_fastq_reads(
         OsStr::new("2"),
     ])
     .expect("failed to parse fastq-reads args");
-    cmd.execute("test").expect("simulate fastq-reads failed");
+    cmd.execute("fgumi simulate fastq-reads").expect("simulate fastq-reads failed");
 }
 
 // ---------------------------------------------------------------------------
@@ -149,7 +149,7 @@ fn run_simplex(input: &Path, output: &Path, min_reads: u32) {
         OsStr::new(&min_reads_str),
     ])
     .expect("failed to parse simplex args");
-    cmd.execute("test").expect("simplex failed");
+    cmd.execute("fgumi simplex").expect("simplex failed");
 }
 
 /// Run filter on a consensus BAM.
@@ -168,7 +168,7 @@ fn run_filter(input: &Path, output: &Path, min_reads: u32, min_base_quality: u32
         OsStr::new(&min_base_quality_str),
     ])
     .expect("failed to parse filter args");
-    cmd.execute("test").expect("filter failed");
+    cmd.execute("fgumi filter").expect("filter failed");
 }
 
 /// Run dedup on a grouped BAM.
@@ -181,7 +181,7 @@ fn run_dedup(input: &Path, output: &Path) {
         output.as_os_str(),
     ])
     .expect("failed to parse dedup args");
-    cmd.execute("test").expect("dedup failed");
+    cmd.execute("fgumi dedup").expect("dedup failed");
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +200,7 @@ fn compare_bams_in_process(bam1: &Path, bam2: &Path, mode: &str) -> bool {
         OsStr::new(mode),
     ])
     .expect("failed to parse compare bams args");
-    match cmd.execute("test") {
+    match cmd.execute("fgumi compare bams") {
         Ok(()) => true,
         Err(e) if e.is::<CompareMismatch>() => false,
         Err(e) => panic!("compare bams hit unexpected error: {e:#}"),
@@ -330,7 +330,7 @@ fn test_full_pipeline_extract_to_filter() {
             OsStr::new("test_lib"),
         ])
         .expect("failed to parse extract args")
-        .execute("test")
+        .execute("fgumi extract")
         .expect("extract failed");
 
         // Extract emits SO:unsorted GO:query (no SS); `fgumi group` requires
@@ -346,7 +346,7 @@ fn test_full_pipeline_extract_to_filter() {
             OsStr::new("template-coordinate"),
         ])
         .expect("failed to parse sort args")
-        .execute("test")
+        .execute("fgumi sort")
         .expect("sort failed");
 
         let grouped = tmp.path().join(format!("grouped_{suffix}.bam"));
@@ -362,7 +362,7 @@ fn test_full_pipeline_extract_to_filter() {
             OsStr::new("0"),
         ])
         .expect("failed to parse group args")
-        .execute("test")
+        .execute("fgumi group")
         .expect("group failed");
 
         let simplex = tmp.path().join(format!("simplex_{suffix}.bam"));
@@ -421,7 +421,7 @@ fn test_group_rejects_extract_output_without_sort_step() {
         OsStr::new("test_lib"),
     ])
     .expect("failed to parse extract args")
-    .execute("test")
+    .execute("fgumi extract")
     .expect("extract failed");
 
     // Run `fgumi group` on the extract output directly — must fail.
@@ -546,7 +546,7 @@ fn test_e2e_methylation_pipeline() {
         OsStr::new("em-seq"),
     ])
     .expect("failed to parse grouped-reads args")
-    .execute("test")
+    .execute("fgumi simulate grouped-reads")
     .expect("simulate grouped-reads failed");
 
     // Run simplex consensus with methylation mode
@@ -567,7 +567,7 @@ fn test_e2e_methylation_pipeline() {
         ref_path.as_os_str(),
     ])
     .expect("failed to parse simplex args")
-    .execute("test")
+    .execute("fgumi simplex")
     .expect("simplex failed");
 
     // Verify the simplex output actually carries methylation emission.
