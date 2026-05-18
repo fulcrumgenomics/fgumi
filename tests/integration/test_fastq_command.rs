@@ -381,3 +381,32 @@ fn test_fastq_hex_flags() {
     let records = parse_fastq_records(&output_fq);
     assert_eq!(records.len(), 2);
 }
+
+/// `--output` pointing at the same file as `--input` must fail before any
+/// truncation, since `File::create` would otherwise clobber the BAM data.
+#[test]
+fn test_fastq_output_same_as_input_rejected() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+
+    create_paired_bam(&input_bam, vec![("read1", "ACGT", "IIII", "TGCA", "IIII", false)]);
+    let input_size_before = std::fs::metadata(&input_bam).expect("stat input").len();
+
+    let cmd = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-o",
+        input_bam.to_str().unwrap(),
+    ])
+    .expect("failed to parse fastq args");
+    let err = cmd.execute("test").expect_err("execute must reject identical --input/--output");
+    assert!(err.to_string().contains("must differ"), "unexpected error message: {err}");
+
+    // Most importantly: the input BAM must not have been truncated.
+    let input_size_after = std::fs::metadata(&input_bam).expect("stat input").len();
+    assert_eq!(
+        input_size_before, input_size_after,
+        "input BAM was truncated/clobbered by --output=--input"
+    );
+}

@@ -74,6 +74,11 @@ pub struct Fastq {
     #[arg(short = 'i', long = "input")]
     pub input: PathBuf,
 
+    /// Output FASTQ file. If omitted, the FASTQ stream is written to stdout
+    /// (the default, intended for piping straight to an aligner).
+    #[arg(short = 'o', long = "output")]
+    pub output: Option<PathBuf>,
+
     /// Don't append /1 and /2 to read names.
     #[arg(short = 'n', long = "no-read-suffix", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub no_suffix: bool,
@@ -105,10 +110,12 @@ fn parse_flags(s: &str) -> Result<u16, String> {
     }
 }
 
-impl Command for Fastq {
-    fn execute(&self, _command_line: &str) -> Result<()> {
-        validate_file_exists(&self.input, "Input BAM")?;
-
+impl Fastq {
+    /// Run the BAM-to-FASTQ conversion loop against the given writer.
+    ///
+    /// Extracted so `execute` can dispatch between stdout (the default piping
+    /// path) and a file (`--output`) without duplicating the conversion loop.
+    fn run_with_writer<W: Write>(&self, mut writer: W) -> Result<()> {
         let timer = OperationTimer::new("Converting BAM to FASTQ");
 
         info!("Input: {}", self.input.display());
@@ -119,9 +126,6 @@ impl Command for Fastq {
         info!("BWA chunk size: {} bases", self.bwa_chunk_size);
 
         let (mut reader, _header) = create_raw_bam_reader(&self.input, self.threads)?;
-
-        // Use 64MB buffer for efficient pipe throughput
-        let mut writer = BufWriter::with_capacity(64 * 1024 * 1024, stdout().lock());
 
         let mut total_records: u64 = 0;
         let mut written_records: u64 = 0;
@@ -184,6 +188,35 @@ impl Command for Fastq {
         info!("Read {total_records} records, wrote {written_records} FASTQ records");
         timer.log_completion(written_records);
         Ok(())
+    }
+}
+
+impl Command for Fastq {
+    fn execute(&self, _command_line: &str) -> Result<()> {
+        validate_file_exists(&self.input, "Input BAM")?;
+
+        // Refuse to clobber the input BAM. `File::create(path)` truncates
+        // before the input is opened in `run_with_writer`, so an `--output`
+        // pointing at the same file silently destroys the input data.
+        if let Some(output) = &self.output
+            && output == &self.input
+        {
+            anyhow::bail!(
+                "--output {} must differ from --input {} (would truncate the input BAM)",
+                output.display(),
+                self.input.display()
+            );
+        }
+
+        // Use 64MB buffer for efficient pipe throughput.
+        const BUF_CAPACITY: usize = 64 * 1024 * 1024;
+        match &self.output {
+            Some(path) => {
+                let file = std::fs::File::create(path)?;
+                self.run_with_writer(BufWriter::with_capacity(BUF_CAPACITY, file))
+            }
+            None => self.run_with_writer(BufWriter::with_capacity(BUF_CAPACITY, stdout().lock())),
+        }
     }
 }
 
