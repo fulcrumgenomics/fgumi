@@ -5,6 +5,9 @@
 //! verifying outputs with `compare`.  No golden files are checked in — expected
 //! output is generated fresh each run.
 
+use clap::Parser;
+use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::compare::{CompareBams, CompareMismatch};
 use fgumi_lib::sam::SamTag;
 use noodles::bam;
 use std::ffi::OsString;
@@ -168,20 +171,29 @@ fn run_dedup(input: &Path, output: &Path) {
 // Helpers: compare
 // ---------------------------------------------------------------------------
 
-/// Compare two BAM files using the given mode, returning the full output.
-fn compare_bams(bam1: &Path, bam2: &Path, mode: &str) -> Output {
-    fgumi(args!["compare", "bams", bam1, bam2, "--mode", mode])
+/// Run `CompareBams::execute()` in-process. Returns true on match
+/// (IDENTICAL or EQUIVALENT), false on `CompareMismatch` (DIFFER); panics on
+/// any other anyhow error.
+fn compare_bams_in_process(bam1: &Path, bam2: &Path, mode: &str) -> bool {
+    let cmd = CompareBams::try_parse_from([
+        "bams",
+        bam1.to_str().unwrap(),
+        bam2.to_str().unwrap(),
+        "--mode",
+        mode,
+    ])
+    .expect("failed to parse compare bams args");
+    match cmd.execute("test") {
+        Ok(()) => true,
+        Err(e) if e.is::<CompareMismatch>() => false,
+        Err(e) => panic!("compare bams hit unexpected error: {e:#}"),
+    }
 }
 
-/// Assert that two BAM files are identical according to the given compare mode.
+/// Assert that two BAM files are identical (or equivalent) according to the
+/// given compare mode.
 fn assert_bams_identical(bam1: &Path, bam2: &Path, mode: &str, context: &str) {
-    let output = compare_bams(bam1, bam2, mode);
-    assert!(
-        output.status.success(),
-        "{context}:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    assert!(compare_bams_in_process(bam1, bam2, mode), "{context}: compare bams reported DIFFER");
 }
 
 // ---------------------------------------------------------------------------
@@ -457,14 +469,9 @@ fn test_different_seeds_produce_different_output() {
     simulate_grouped_reads(&bam1, &truth1, &reference, 42, 100);
     simulate_grouped_reads(&bam2, &truth2, &reference, 99, 100);
 
-    let output = compare_bams(&bam1, &bam2, "content");
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "Expected compare to report content differences (exit 1), got {:?}\nstdout: {}\nstderr: {}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
+    assert!(
+        !compare_bams_in_process(&bam1, &bam2, "content"),
+        "Expected compare bams to report content differences between distinct seeds",
     );
 }
 
