@@ -1,16 +1,18 @@
-//! End-to-end CLI tests for the clip command.
+//! End-to-end tests for the clip command.
 //!
-//! These tests run the actual `fgumi clip` binary and validate:
+//! These tests invoke `Clip::execute()` in-process and validate:
 //! 1. Basic read clipping
 //! 2. Fixed clipping (5' and 3' ends)
 //! 3. Metrics output
 
+use clap::Parser;
+use fgumi_lib::commands::clip::Clip;
+use fgumi_lib::commands::command::Command as FgumiCommand;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, create_test_reference, to_record_buf};
@@ -72,26 +74,23 @@ fn test_clip_command_basic() {
 
     create_paired_bam(&input_bam, vec![(r1, r2)]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "clip",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--reference",
-            ref_path.to_str().unwrap(),
-            "--read-one-five-prime",
-            "1",
-            "--read-one-three-prime",
-            "1",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run clip command");
-
-    assert!(status.success(), "Clip command failed");
+    let cmd = Clip::try_parse_from([
+        "clip",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--reference",
+        ref_path.to_str().unwrap(),
+        "--read-one-five-prime",
+        "1",
+        "--read-one-three-prime",
+        "1",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse clip args");
+    cmd.execute("test").expect("Clip command failed");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // Verify output has the reads
@@ -144,25 +143,22 @@ fn test_clip_command_with_metrics() {
 
     create_paired_bam(&input_bam, vec![(r1, r2)]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "clip",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--reference",
-            ref_path.to_str().unwrap(),
-            "--read-one-five-prime",
-            "2",
-            "--metrics",
-            metrics_path.to_str().unwrap(),
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run clip command");
-
-    assert!(status.success(), "Clip command with metrics failed");
+    let cmd = Clip::try_parse_from([
+        "clip",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--reference",
+        ref_path.to_str().unwrap(),
+        "--read-one-five-prime",
+        "2",
+        "--metrics",
+        metrics_path.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse clip args");
+    cmd.execute("test").expect("Clip command with metrics failed");
     assert!(metrics_path.exists(), "Metrics file not created");
 }
