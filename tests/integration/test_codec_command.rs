@@ -1,19 +1,21 @@
-//! End-to-end CLI tests for the codec command.
+//! End-to-end in-process tests for the codec command.
 //!
-//! These tests run the actual `fgumi codec` binary and validate:
+//! These tests invoke the `Codec` command's `execute()` method in-process and validate:
 //! 1. Basic consensus calling from CODEC read pairs
 //! 2. Statistics output
 //! 3. Rejected reads output
 //! 4. Quality filtering options
 
+use clap::Parser;
 use fgumi_bam_io::create_raw_bam_writer;
 use fgumi_dna::reverse_complement;
+use fgumi_lib::commands::codec::Codec;
+use fgumi_lib::commands::command::Command as FgumiCommand;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
 use noodles::bam;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::create_minimal_header;
@@ -119,24 +121,21 @@ fn test_codec_command_basic_consensus() {
     create_codec_test_bam(&input_bam, pairs);
 
     // Run codec command
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "codec",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--min-reads",
-            "1",
-            "--min-duplex-length",
-            "1",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run codec command");
-
-    assert!(status.success(), "Codec command failed");
+    let cmd = Codec::try_parse_from([
+        "codec",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--min-duplex-length",
+        "1",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse codec args");
+    cmd.execute("test").expect("Failed to run codec command");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // Read output and verify consensus was created
@@ -195,26 +194,23 @@ fn test_codec_command_with_stats() {
     create_codec_test_bam(&input_bam, pairs);
 
     // Run codec command with stats
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "codec",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--stats",
-            stats_file.to_str().unwrap(),
-            "--min-reads",
-            "1",
-            "--min-duplex-length",
-            "1",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run codec command");
-
-    assert!(status.success(), "Codec command failed");
+    let cmd = Codec::try_parse_from([
+        "codec",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--stats",
+        stats_file.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--min-duplex-length",
+        "1",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse codec args");
+    cmd.execute("test").expect("Failed to run codec command");
     assert!(stats_file.exists(), "Stats file not created");
 
     // Verify stats file has content
@@ -264,26 +260,23 @@ fn test_codec_command_with_rejects() {
     create_codec_test_bam(&input_bam, pairs);
 
     // Run codec command with rejects output and high min-reads
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "codec",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--rejects",
-            rejects_bam.to_str().unwrap(),
-            "--min-reads",
-            "3",
-            "--min-duplex-length",
-            "1",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run codec command");
-
-    assert!(status.success(), "Codec command failed");
+    let cmd = Codec::try_parse_from([
+        "codec",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--min-reads",
+        "3",
+        "--min-duplex-length",
+        "1",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse codec args");
+    cmd.execute("test").expect("Failed to run codec command");
     assert!(output_bam.exists(), "Output BAM not created");
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 
@@ -325,24 +318,21 @@ fn test_codec_command_min_duplex_length() {
     create_codec_test_bam(&input_bam, pairs);
 
     // Run codec command with high min-duplex-length (should reject)
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "codec",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--min-reads",
-            "1",
-            "--min-duplex-length",
-            "100", // Much longer than our 8bp reads
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run codec command");
-
-    assert!(status.success(), "Codec command failed");
+    let cmd = Codec::try_parse_from([
+        "codec",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--min-duplex-length",
+        "100", // Much longer than our 8bp reads
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse codec args");
+    cmd.execute("test").expect("Failed to run codec command");
 
     // Should produce no consensus due to insufficient duplex length
     let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
@@ -377,25 +367,22 @@ fn test_codec_command_per_base_tags() {
     create_codec_test_bam(&input_bam, pairs);
 
     // Run codec command with per-base tags
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "codec",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--min-reads",
-            "1",
-            "--min-duplex-length",
-            "1",
-            "--output-per-base-tags",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run codec command");
-
-    assert!(status.success(), "Codec command failed");
+    let cmd = Codec::try_parse_from([
+        "codec",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--min-duplex-length",
+        "1",
+        "--output-per-base-tags",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse codec args");
+    cmd.execute("test").expect("Failed to run codec command");
 
     // Verify per-base tags exist
     let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
@@ -438,24 +425,21 @@ fn test_codec_command_cell_barcode_preservation() {
     create_codec_test_bam(&input_bam, pairs);
 
     // Run codec command with cell-tag option
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "codec",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--min-reads",
-            "1",
-            "--min-duplex-length",
-            "1",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run codec command");
-
-    assert!(status.success(), "Codec command failed");
+    let cmd = Codec::try_parse_from([
+        "codec",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--min-duplex-length",
+        "1",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse codec args");
+    cmd.execute("test").expect("Failed to run codec command");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // Read output and verify cell barcode is preserved
@@ -553,32 +537,27 @@ fn test_codec_command_recovers_from_duplex_disagreement() {
     let (r1, r2) = create_offset_codec_pair("disagree_read", "UMI_DISAGREE");
     create_codec_test_bam(&input_bam, vec![(r1, r2)]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "codec",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--min-reads",
-            "1",
-            "--min-duplex-length",
-            "1",
-            // Strict: any disagreement rejects the molecule. Forces
-            // `is_duplex_disagreement()` to return true so the loop
-            // continues instead of returning the wrapped error.
-            "--max-duplex-disagreements",
-            "0",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run codec command");
-
-    assert!(
-        status.success(),
-        "Codec command must succeed when only failure is a recoverable reject"
-    );
+    let cmd = Codec::try_parse_from([
+        "codec",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--min-duplex-length",
+        "1",
+        // Strict: any disagreement rejects the molecule. Forces
+        // `is_duplex_disagreement()` to return true so the loop
+        // continues instead of returning the wrapped error.
+        "--max-duplex-disagreements",
+        "0",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse codec args");
+    cmd.execute("test")
+        .expect("Codec command must succeed when only failure is a recoverable reject");
 
     let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
     let _header = reader.read_header().unwrap();
@@ -600,33 +579,28 @@ fn test_codec_command_recovers_from_duplex_disagreement_threaded() {
     let (r1, r2) = create_offset_codec_pair("disagree_read_mt", "UMI_DISAGREE_MT");
     create_codec_test_bam(&input_bam, vec![(r1, r2)]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "codec",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--rejects",
-            rejects_bam.to_str().unwrap(),
-            "--threads",
-            "2",
-            "--min-reads",
-            "1",
-            "--min-duplex-length",
-            "1",
-            "--max-duplex-disagreements",
-            "0",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run codec command");
-
-    assert!(
-        status.success(),
-        "Threaded codec command must succeed when only failure is a recoverable reject"
-    );
+    let cmd = Codec::try_parse_from([
+        "codec",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--threads",
+        "2",
+        "--min-reads",
+        "1",
+        "--min-duplex-length",
+        "1",
+        "--max-duplex-disagreements",
+        "0",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse codec args");
+    cmd.execute("test")
+        .expect("Threaded codec command must succeed when only failure is a recoverable reject");
 
     let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
     let _header = reader.read_header().unwrap();
