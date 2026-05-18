@@ -47,6 +47,31 @@ pub fn find_string_tag(aux_data: &[u8], tag: impl AsTagBytes) -> Option<&[u8]> {
     Some(&aux_data[start..start + end])
 }
 
+/// Find a string (Z-type) tag and return its value position as `(offset, len)` —
+/// where `offset` is the offset into `aux_data` of the first value byte (after the
+/// 2-byte tag identifier and 1-byte type byte) and `len` is the value length in
+/// bytes, excluding the NUL terminator.
+///
+/// Used to cache a Z-tag's position so a later caller can slice the value without
+/// re-scanning aux data.
+///
+/// Returns `None` if the tag is absent, is not Z-type, has no NUL terminator, or
+/// would not fit in the returned types (`u32` offset, `u16` length). BAM records
+/// are bounded well under 4 GiB and aux tag values well under 64 KiB, so the
+/// width-fit checks are defensive only.
+#[inline]
+#[must_use]
+pub fn find_string_tag_position(aux_data: &[u8], tag: impl AsTagBytes) -> Option<(u32, u16)> {
+    let tag = tag.as_tag_bytes();
+    let (p, val_type) = find_tag_position(aux_data, *tag)?;
+    if val_type != b'Z' {
+        return None;
+    }
+    let start = p + 3;
+    let len = aux_data[start..].iter().position(|&b| b == 0)?;
+    Some((u32::try_from(start).ok()?, u16::try_from(len).ok()?))
+}
+
 /// Check whether a tag exists in auxiliary data, returning its type byte if found.
 ///
 /// Returns `Some(type_byte)` (e.g. `b'Z'`, `b'C'`, `b'i'`) if the tag is present,
@@ -2052,6 +2077,64 @@ mod tests {
         // RX:Z:hello but no null terminator — should return None
         let aux = b"RXZhello";
         assert_eq!(find_string_tag(aux, SamTag::RX), None);
+    }
+
+    // ========================================================================
+    // find_string_tag_position tests
+    // ========================================================================
+
+    #[test]
+    fn test_find_string_tag_position_first_tag() {
+        // "RXZACGT\0" — tag header occupies bytes 0..3; value occupies 3..7; NUL at 7
+        let aux = b"RXZACGT\x00";
+        let (offset, len) =
+            find_string_tag_position(aux, SamTag::RX).expect("UMI tag should be present");
+        assert_eq!(offset, 3);
+        assert_eq!(len, 4);
+        let bytes = &aux[offset as usize..offset as usize + len as usize];
+        assert_eq!(bytes, b"ACGT");
+        assert_eq!(bytes, find_string_tag(aux, SamTag::RX).unwrap());
+    }
+
+    #[test]
+    fn test_find_string_tag_position_after_other_tags() {
+        // NM:C:5 then RX:Z:ACGT — the UMI value should be located after the NM entry.
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"NMC");
+        aux.push(5);
+        aux.extend_from_slice(b"RXZACGT\x00");
+        let (offset, len) = find_string_tag_position(&aux, SamTag::RX).unwrap();
+        assert_eq!(&aux[offset as usize..offset as usize + len as usize], b"ACGT");
+        assert_eq!(len, 4);
+    }
+
+    #[test]
+    fn test_find_string_tag_position_empty_value() {
+        // RX:Z: (empty UMI) — len should be 0 with a valid offset.
+        let aux = b"RXZ\x00";
+        let (offset, len) = find_string_tag_position(aux, SamTag::RX).unwrap();
+        assert_eq!(offset, 3);
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn test_find_string_tag_position_absent_returns_none() {
+        let aux = b"RGZsample1\x00";
+        assert_eq!(find_string_tag_position(aux, SamTag::RX), None);
+    }
+
+    #[test]
+    fn test_find_string_tag_position_non_z_returns_none() {
+        // Tag matches but type is 'C' (uint8), not 'Z'.
+        let aux = [b'R', b'X', b'C', 42];
+        assert_eq!(find_string_tag_position(&aux, SamTag::RX), None);
+    }
+
+    #[test]
+    fn test_find_string_tag_position_truncated_no_nul() {
+        // RX:Z:hello but no NUL terminator — should return None.
+        let aux = b"RXZhello";
+        assert_eq!(find_string_tag_position(aux, SamTag::RX), None);
     }
 
     // --- Per-type find_string_tag tests ---

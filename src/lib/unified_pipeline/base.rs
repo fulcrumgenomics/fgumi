@@ -1458,16 +1458,65 @@ pub struct DecodedRecord {
     pub key: GroupKey,
     /// Raw BAM record bytes.
     pub(crate) data: RawRecord,
+    /// Cached record-relative offset of the UMI tag's value bytes (i.e. the
+    /// first byte after the 2-byte tag header and the 1-byte type byte). The
+    /// slice `data[umi_value_offset..umi_value_offset + umi_value_len]` yields
+    /// the UMI bytes without the trailing NUL.
+    ///
+    /// Set to `Self::UMI_OFFSET_UNCACHED` when no UMI position was cached
+    /// during decode (UMI tag missing, not Z-typed, or caching disabled).
+    pub(crate) umi_value_offset: u32,
+    /// Cached UMI value length in bytes, paired with `umi_value_offset`.
+    pub(crate) umi_value_len: u16,
 }
 
 impl DecodedRecord {
+    /// Sentinel value for `umi_value_offset` indicating no cached UMI position.
+    /// Chosen as `u32::MAX` so it can never collide with a real BAM record
+    /// offset (BAM records are bounded well under 4 GiB).
+    pub const UMI_OFFSET_UNCACHED: u32 = u32::MAX;
+
     /// Create a decoded record from raw bytes, skipping noodles decode.
     ///
     /// Accepts anything that converts `Into<RawRecord>` (e.g. a bare `Vec<u8>` or
     /// an already-constructed `RawRecord`).
     #[must_use]
     pub fn from_raw_bytes(raw: impl Into<RawRecord>, key: GroupKey) -> Self {
-        Self { key, data: raw.into() }
+        Self {
+            key,
+            data: raw.into(),
+            umi_value_offset: Self::UMI_OFFSET_UNCACHED,
+            umi_value_len: 0,
+        }
+    }
+
+    /// Attach a cached UMI value position to this decoded record.
+    ///
+    /// `umi_value_offset` is the record-relative offset of the first UMI value
+    /// byte (after the tag header), and `umi_value_len` is the value length
+    /// (excluding any trailing NUL).
+    pub fn set_cached_umi(&mut self, umi_value_offset: u32, umi_value_len: u16) {
+        self.umi_value_offset = umi_value_offset;
+        self.umi_value_len = umi_value_len;
+    }
+
+    /// Returns the cached UMI bytes (without trailing NUL) if a position was
+    /// recorded during decode and still falls within the raw record bytes.
+    /// Returns `None` if no cache is set or the cached position is out of range.
+    #[must_use]
+    pub fn cached_umi(&self) -> Option<&[u8]> {
+        if self.umi_value_offset == Self::UMI_OFFSET_UNCACHED {
+            return None;
+        }
+        let start = self.umi_value_offset as usize;
+        let end = start.checked_add(self.umi_value_len as usize)?;
+        self.data.as_ref().get(start..end)
+    }
+
+    /// Returns the cached UMI offset (`UMI_OFFSET_UNCACHED` when absent) and length.
+    #[must_use]
+    pub fn cached_umi_position(&self) -> (u32, u16) {
+        (self.umi_value_offset, self.umi_value_len)
     }
 
     /// Returns a reference to the raw bytes.
@@ -1508,19 +1557,30 @@ pub struct GroupKeyConfig {
     pub library_index: Arc<LibraryIndex>,
     /// Tag used for cell barcode extraction. None skips cell extraction.
     pub cell_tag: Option<Tag>,
+    /// UMI tag (raw 2-byte form) whose value position should be cached on each
+    /// `DecodedRecord` during decode. None disables caching — downstream code
+    /// must fall back to scanning aux data.
+    pub umi_tag: Option<[u8; 2]>,
 }
 
 impl GroupKeyConfig {
     /// Create a new `GroupKeyConfig`.
     #[must_use]
     pub fn new(library_index: LibraryIndex, cell_tag: Tag) -> Self {
-        Self { library_index: Arc::new(library_index), cell_tag: Some(cell_tag) }
+        Self { library_index: Arc::new(library_index), cell_tag: Some(cell_tag), umi_tag: None }
     }
 
     /// Create a `GroupKeyConfig` without cell barcode extraction.
     #[must_use]
     pub fn new_raw_no_cell(library_index: LibraryIndex) -> Self {
-        Self { library_index: Arc::new(library_index), cell_tag: None }
+        Self { library_index: Arc::new(library_index), cell_tag: None, umi_tag: None }
+    }
+
+    /// Enable UMI position caching for the given raw 2-byte UMI tag (e.g. `*b"RX"`).
+    #[must_use]
+    pub fn with_umi_tag(mut self, umi_tag: [u8; 2]) -> Self {
+        self.umi_tag = Some(umi_tag);
+        self
     }
 }
 
@@ -1529,6 +1589,7 @@ impl Default for GroupKeyConfig {
         Self {
             library_index: Arc::new(LibraryIndex::default()),
             cell_tag: Some(Tag::from(SamTag::CB)), // Default cell barcode tag
+            umi_tag: None,
         }
     }
 }
@@ -5914,6 +5975,37 @@ mod tests {
     fn test_decoded_record_raw_accessor() {
         let raw = DecodedRecord::from_raw_bytes(vec![0u8; 32], GroupKey::default());
         assert!(!raw.raw_bytes().is_empty());
+    }
+
+    #[test]
+    fn test_decoded_record_cached_umi_default_absent() {
+        let raw = DecodedRecord::from_raw_bytes(vec![0u8; 32], GroupKey::default());
+        assert!(raw.cached_umi().is_none());
+        let (offset, len) = raw.cached_umi_position();
+        assert_eq!(offset, DecodedRecord::UMI_OFFSET_UNCACHED);
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn test_decoded_record_cached_umi_round_trip() {
+        // Build a payload where bytes [3..7] hold "ACGT" so we can verify the
+        // cached offset/len slice yields exactly those bytes.
+        let mut buf = vec![0u8; 16];
+        buf[3..7].copy_from_slice(b"ACGT");
+        let mut decoded = DecodedRecord::from_raw_bytes(buf, GroupKey::default());
+        decoded.set_cached_umi(3, 4);
+
+        assert_eq!(decoded.cached_umi(), Some(b"ACGT".as_ref()));
+        assert_eq!(decoded.cached_umi_position(), (3, 4));
+    }
+
+    #[test]
+    fn test_decoded_record_cached_umi_out_of_range_returns_none() {
+        // Offset+len falls outside the record bytes — the accessor must reject
+        // rather than panic.
+        let mut decoded = DecodedRecord::from_raw_bytes(vec![0u8; 4], GroupKey::default());
+        decoded.set_cached_umi(2, 10);
+        assert!(decoded.cached_umi().is_none());
     }
 
     #[test]

@@ -462,7 +462,12 @@ fn assign_umi_groups_for_indices_impl(
         } else {
             use fgumi_raw_bam;
 
-            let umi_bytes = if let Some(r1_raw) = template.r1() {
+            // Prefer the UMI position cached during the parallel Decode step.
+            // The fallback exists for templates built outside the Decode path
+            // (e.g. tests) and for cases where the cache was disabled.
+            let umi_bytes = if let Some(cached) = template.cached_umi() {
+                cached
+            } else if let Some(r1_raw) = template.r1() {
                 let aux = fgumi_raw_bam::aux_data_slice(r1_raw);
                 fgumi_raw_bam::find_string_tag(aux, raw_tag)
                     .ok_or_else(|| anyhow::anyhow!("Missing UMI tag"))?
@@ -931,7 +936,11 @@ impl Command for GroupReadsByUmi {
         // This provides consistent batch sizes across datasets with varying templates-per-group ratios.
 
         let library_index = LibraryIndex::from_header(&header);
-        pipeline_config.group_key_config = Some(GroupKeyConfig::new(library_index, cell_tag));
+        // Cache the UMI tag's value position on each DecodedRecord so the Process
+        // step's UMI-assignment pass can slice the value without re-scanning aux
+        // data (issue #334).
+        pipeline_config.group_key_config =
+            Some(GroupKeyConfig::new(library_index, cell_tag).with_umi_tag(raw_tag));
 
         // Short-circuit support for memory bisection debugging.
         // Set FGUMI_SHORT_CIRCUIT=process|serialize|compress to skip downstream steps.
@@ -5412,6 +5421,7 @@ mod tests {
             r1_secondaries: Some((2, 3)),
             r2_secondaries: None,
             mi: crate::umi::MoleculeId::None,
+            cached_umi_position: None,
         };
 
         let config = GroupFilterConfig {
@@ -5461,6 +5471,7 @@ mod tests {
             r1_secondaries: None,
             r2_secondaries: None,
             mi: crate::umi::MoleculeId::None,
+            cached_umi_position: None,
         };
 
         let config = GroupFilterConfig {
