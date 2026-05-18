@@ -1,9 +1,13 @@
-//! End-to-end CLI tests for the review command.
+//! In-process tests for the review command.
 //!
-//! These tests run the actual `fgumi review` binary and validate:
-//! 1. Missing required arguments produce a clear error
-//! 2. Basic execution with minimal valid inputs
+//! These tests invoke the Review command directly via in-process calls and validate:
+//! 1. Missing required arguments produce a clap parse error
+//! 2. Missing input files produce a validation error
+//! 3. Basic execution with minimal valid inputs
 
+use clap::Parser;
+use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::review::Review;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder};
 use noodles::bam;
@@ -11,7 +15,6 @@ use noodles::sam::alignment::io::Write as AlignmentWrite;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::process::Command;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{
@@ -52,20 +55,17 @@ fn create_test_vcf(path: &Path) {
     vcf.flush().unwrap();
 }
 
-/// Test that missing required arguments produce a non-zero exit code.
+/// Test that missing required arguments produce a clap parse error.
 #[test]
 fn test_review_missing_required_args() {
     // No arguments at all — should fail with clap error
-    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args(["review"])
-        .output()
-        .expect("Failed to run review command");
-
-    assert!(!output.status.success(), "Review should fail without required args");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("required") || stderr.contains("Usage") || stderr.contains("error"),
-        "Stderr should mention missing required arguments, got: {stderr}"
+    let err =
+        Review::try_parse_from(["review"]).expect_err("Review should fail without required args");
+    assert_eq!(
+        err.kind(),
+        clap::error::ErrorKind::MissingRequiredArgument,
+        "Expected MissingRequiredArgument, got {:?}: {err}",
+        err.kind()
     );
 }
 
@@ -74,24 +74,26 @@ fn test_review_missing_required_args() {
 fn test_review_missing_input_files() {
     let temp_dir = TempDir::new().unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "review",
-            "--input",
-            "/nonexistent/variants.vcf",
-            "--consensus-bam",
-            "/nonexistent/consensus.bam",
-            "--grouped-bam",
-            "/nonexistent/grouped.bam",
-            "--ref",
-            "/nonexistent/ref.fa",
-            "--output",
-            temp_dir.path().join("output").to_str().unwrap(),
-        ])
-        .output()
-        .expect("Failed to run review command");
-
-    assert!(!output.status.success(), "Review should fail for nonexistent input files");
+    let cmd = Review::try_parse_from([
+        "review",
+        "--input",
+        "/nonexistent/variants.vcf",
+        "--consensus-bam",
+        "/nonexistent/consensus.bam",
+        "--grouped-bam",
+        "/nonexistent/grouped.bam",
+        "--ref",
+        "/nonexistent/ref.fa",
+        "--output",
+        temp_dir.path().join("output").to_str().unwrap(),
+    ])
+    .expect("failed to parse review args");
+    let err = cmd.execute("test").expect_err("Review should fail for nonexistent input files");
+    let err_msg = format!("{err:#}");
+    assert!(
+        err_msg.contains("does not exist"),
+        "Validation error should mention missing file, got: {err_msg}"
+    );
 }
 
 /// Test basic review execution with valid inputs.
@@ -155,28 +157,21 @@ fn test_review_basic_execution() {
     ];
     create_indexed_bam(&grouped_bam, &grouped_records);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "review",
-            "--input",
-            vcf_path.to_str().unwrap(),
-            "--consensus-bam",
-            consensus_bam.to_str().unwrap(),
-            "--grouped-bam",
-            grouped_bam.to_str().unwrap(),
-            "--ref",
-            ref_path.to_str().unwrap(),
-            "--output",
-            output_prefix.to_str().unwrap(),
-        ])
-        .output()
-        .expect("Failed to run review command");
-
-    assert!(
-        output.status.success(),
-        "Review command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let cmd = Review::try_parse_from([
+        "review",
+        "--input",
+        vcf_path.to_str().unwrap(),
+        "--consensus-bam",
+        consensus_bam.to_str().unwrap(),
+        "--grouped-bam",
+        grouped_bam.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--output",
+        output_prefix.to_str().unwrap(),
+    ])
+    .expect("failed to parse review args");
+    cmd.execute("test").unwrap_or_else(|e| panic!("Review command failed: {e:#}"));
 
     // Verify output files were created
     let consensus_out = output_prefix.with_extension("consensus.bam");
