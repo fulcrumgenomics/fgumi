@@ -1,6 +1,10 @@
 //! Integration tests for the simplex-metrics command.
+//! Tests invoke the in-process `Command::execute()` implementation.
 
+use clap::Parser;
 use fgoxide::io::DelimFile;
+use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::simplex_metrics::SimplexMetrics;
 use fgumi_lib::metrics::shared::UmiMetric;
 use fgumi_lib::metrics::simplex::{SimplexFamilySizeMetric, SimplexYieldMetric};
 use fgumi_lib::sam::SamTag;
@@ -10,7 +14,6 @@ use noodles::sam::Header;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
@@ -121,18 +124,15 @@ fn test_simplex_metrics_command_creates_output_files() {
     let header = create_minimal_header("chr1", 10000);
     create_simplex_test_bam(&input_bam, &header);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "simplex-metrics",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_prefix.to_str().unwrap(),
-        ])
-        .status()
-        .expect("Failed to run simplex-metrics command");
-
-    assert!(status.success(), "simplex-metrics command failed");
+    let cmd = SimplexMetrics::try_parse_from([
+        "simplex-metrics",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_prefix.to_str().unwrap(),
+    ])
+    .expect("failed to parse simplex-metrics args");
+    cmd.execute("test").expect("simplex-metrics command failed");
 
     let family_sizes_path = format!("{}.family_sizes.txt", output_prefix.display());
     let yield_metrics_path = format!("{}.simplex_yield_metrics.txt", output_prefix.display());
@@ -155,18 +155,15 @@ fn test_simplex_metrics_command_family_sizes() {
     let header = create_minimal_header("chr1", 10000);
     create_simplex_test_bam(&input_bam, &header);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "simplex-metrics",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_prefix.to_str().unwrap(),
-        ])
-        .status()
-        .expect("Failed to run simplex-metrics command");
-
-    assert!(status.success());
+    let cmd = SimplexMetrics::try_parse_from([
+        "simplex-metrics",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_prefix.to_str().unwrap(),
+    ])
+    .expect("failed to parse simplex-metrics args");
+    cmd.execute("test").expect("simplex-metrics command failed");
 
     let family_sizes_path = format!("{}.family_sizes.txt", output_prefix.display());
     let metrics: Vec<SimplexFamilySizeMetric> =
@@ -194,18 +191,15 @@ fn test_simplex_metrics_command_yield_metrics() {
     let header = create_minimal_header("chr1", 10000);
     create_simplex_test_bam(&input_bam, &header);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "simplex-metrics",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_prefix.to_str().unwrap(),
-        ])
-        .status()
-        .expect("Failed to run simplex-metrics command");
-
-    assert!(status.success());
+    let cmd = SimplexMetrics::try_parse_from([
+        "simplex-metrics",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_prefix.to_str().unwrap(),
+    ])
+    .expect("failed to parse simplex-metrics args");
+    cmd.execute("test").expect("simplex-metrics command failed");
 
     let yield_path = format!("{}.simplex_yield_metrics.txt", output_prefix.display());
     let metrics: Vec<SimplexYieldMetric> =
@@ -229,18 +223,15 @@ fn test_simplex_metrics_command_umi_metrics() {
     let header = create_minimal_header("chr1", 10000);
     create_simplex_test_bam(&input_bam, &header);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "simplex-metrics",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_prefix.to_str().unwrap(),
-        ])
-        .status()
-        .expect("Failed to run simplex-metrics command");
-
-    assert!(status.success());
+    let cmd = SimplexMetrics::try_parse_from([
+        "simplex-metrics",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_prefix.to_str().unwrap(),
+    ])
+    .expect("failed to parse simplex-metrics args");
+    cmd.execute("test").expect("simplex-metrics command failed");
 
     let umi_counts_path = format!("{}.umi_counts.txt", output_prefix.display());
     let metrics: Vec<UmiMetric> =
@@ -262,32 +253,28 @@ fn test_simplex_metrics_min_reads_parameter() {
     create_simplex_test_bam(&input_bam, &header);
 
     // Run with default min-reads=1
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "simplex-metrics",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_default.to_str().unwrap(),
-        ])
-        .status()
-        .expect("Failed to run simplex-metrics (default)");
-    assert!(status.success());
+    let cmd = SimplexMetrics::try_parse_from([
+        "simplex-metrics",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_default.to_str().unwrap(),
+    ])
+    .expect("failed to parse simplex-metrics args");
+    cmd.execute("test").expect("simplex-metrics (default) command failed");
 
     // Run with min-reads=3
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "simplex-metrics",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_strict.to_str().unwrap(),
-            "--min-reads",
-            "3",
-        ])
-        .status()
-        .expect("Failed to run simplex-metrics (strict)");
-    assert!(status.success());
+    let cmd = SimplexMetrics::try_parse_from([
+        "simplex-metrics",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_strict.to_str().unwrap(),
+        "--min-reads",
+        "3",
+    ])
+    .expect("failed to parse simplex-metrics args");
+    cmd.execute("test").expect("simplex-metrics (strict) command failed");
 
     let default_yield_path = format!("{}.simplex_yield_metrics.txt", output_default.display());
     let strict_yield_path = format!("{}.simplex_yield_metrics.txt", output_strict.display());
