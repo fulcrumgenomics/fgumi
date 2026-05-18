@@ -6,6 +6,9 @@ use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 
+use clap::Parser;
+use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::extract::Extract;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use noodles::bam;
@@ -99,28 +102,25 @@ fn test_extract_gzip_single_threaded() {
     let output = tmp.path().join("output.bam");
 
     // Run extract command (single-threaded)
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "extract",
-            "--inputs",
-            r1.to_str().unwrap(),
-            r2.to_str().unwrap(),
-            "--output",
-            output.to_str().unwrap(),
-            "--read-structures",
-            "5M+T",
-            "5M+T",
-            "--sample",
-            "test_sample",
-            "--library",
-            "test_library",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to execute extract command");
-
-    assert!(status.success(), "Extract command failed");
+    let cmd = Extract::try_parse_from([
+        "extract",
+        "--inputs",
+        r1.to_str().unwrap(),
+        r2.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--read-structures",
+        "5M+T",
+        "5M+T",
+        "--sample",
+        "test_sample",
+        "--library",
+        "test_library",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse extract args");
+    cmd.execute("test").expect("Extract command failed");
 
     // Verify output
     let records = read_bam_records(&output);
@@ -137,30 +137,27 @@ fn test_extract_gzip_multithreaded() {
     let output = tmp.path().join("output.bam");
 
     // Run extract command with --threads 4
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "extract",
-            "--inputs",
-            r1.to_str().unwrap(),
-            r2.to_str().unwrap(),
-            "--output",
-            output.to_str().unwrap(),
-            "--read-structures",
-            "5M+T",
-            "5M+T",
-            "--sample",
-            "test_sample",
-            "--library",
-            "test_library",
-            "--threads",
-            "4",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to execute extract command");
-
-    assert!(status.success(), "Extract command with --threads failed");
+    let cmd = Extract::try_parse_from([
+        "extract",
+        "--inputs",
+        r1.to_str().unwrap(),
+        r2.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--read-structures",
+        "5M+T",
+        "5M+T",
+        "--sample",
+        "test_sample",
+        "--library",
+        "test_library",
+        "--threads",
+        "4",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse extract args");
+    cmd.execute("test").expect("Extract command with --threads failed");
 
     // Verify output
     let records = read_bam_records(&output);
@@ -177,30 +174,27 @@ fn test_extract_gzip_threads_mode() {
     let output = tmp.path().join("output.bam");
 
     // Run extract command with --threads 4
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "extract",
-            "--inputs",
-            r1.to_str().unwrap(),
-            r2.to_str().unwrap(),
-            "--output",
-            output.to_str().unwrap(),
-            "--read-structures",
-            "5M+T",
-            "5M+T",
-            "--sample",
-            "test_sample",
-            "--library",
-            "test_library",
-            "--threads",
-            "4",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to execute extract command");
-
-    assert!(status.success(), "Extract command with --threads failed");
+    let cmd = Extract::try_parse_from([
+        "extract",
+        "--inputs",
+        r1.to_str().unwrap(),
+        r2.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--read-structures",
+        "5M+T",
+        "5M+T",
+        "--sample",
+        "test_sample",
+        "--library",
+        "test_library",
+        "--threads",
+        "4",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse extract args");
+    cmd.execute("test").expect("Extract command with --threads failed");
 
     // Verify output
     let records = read_bam_records(&output);
@@ -221,28 +215,25 @@ fn test_extract_bgzf_single_threaded() {
     let output = tmp.path().join("output.bam");
 
     // Run extract command (single-threaded)
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "extract",
-            "--inputs",
-            r1.to_str().unwrap(),
-            r2.to_str().unwrap(),
-            "--output",
-            output.to_str().unwrap(),
-            "--read-structures",
-            "5M+T",
-            "5M+T",
-            "--sample",
-            "test_sample",
-            "--library",
-            "test_library",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to execute extract command");
-
-    assert!(status.success(), "Extract command with BGZF input failed");
+    let cmd = Extract::try_parse_from([
+        "extract",
+        "--inputs",
+        r1.to_str().unwrap(),
+        r2.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--read-structures",
+        "5M+T",
+        "5M+T",
+        "--sample",
+        "test_sample",
+        "--library",
+        "test_library",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse extract args");
+    cmd.execute("test").expect("Extract command with BGZF input failed");
 
     // Verify output
     let records = read_bam_records(&output);
@@ -259,30 +250,27 @@ fn test_extract_bgzf_multithreaded() {
     let output = tmp.path().join("output.bam");
 
     // Run extract command with --threads 4
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "extract",
-            "--inputs",
-            r1.to_str().unwrap(),
-            r2.to_str().unwrap(),
-            "--output",
-            output.to_str().unwrap(),
-            "--read-structures",
-            "5M+T",
-            "5M+T",
-            "--sample",
-            "test_sample",
-            "--library",
-            "test_library",
-            "--threads",
-            "4",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to execute extract command");
-
-    assert!(status.success(), "Extract command with BGZF + --threads failed");
+    let cmd = Extract::try_parse_from([
+        "extract",
+        "--inputs",
+        r1.to_str().unwrap(),
+        r2.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--read-structures",
+        "5M+T",
+        "5M+T",
+        "--sample",
+        "test_sample",
+        "--library",
+        "test_library",
+        "--threads",
+        "4",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse extract args");
+    cmd.execute("test").expect("Extract command with BGZF + --threads failed");
 
     // Verify output
     let records = read_bam_records(&output);
@@ -299,30 +287,27 @@ fn test_extract_bgzf_threads_mode() {
     let output = tmp.path().join("output.bam");
 
     // Run extract command with --threads 4
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "extract",
-            "--inputs",
-            r1.to_str().unwrap(),
-            r2.to_str().unwrap(),
-            "--output",
-            output.to_str().unwrap(),
-            "--read-structures",
-            "5M+T",
-            "5M+T",
-            "--sample",
-            "test_sample",
-            "--library",
-            "test_library",
-            "--threads",
-            "4",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to execute extract command");
-
-    assert!(status.success(), "Extract command with BGZF + --threads failed");
+    let cmd = Extract::try_parse_from([
+        "extract",
+        "--inputs",
+        r1.to_str().unwrap(),
+        r2.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--read-structures",
+        "5M+T",
+        "5M+T",
+        "--sample",
+        "test_sample",
+        "--library",
+        "test_library",
+        "--threads",
+        "4",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse extract args");
+    cmd.execute("test").expect("Extract command with BGZF + --threads failed");
 
     // Verify output
     let records = read_bam_records(&output);
@@ -358,28 +343,25 @@ fn test_extract_gzip_verifies_umi_extraction() {
     );
     let output = tmp.path().join("output.bam");
 
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "extract",
-            "--inputs",
-            r1.to_str().unwrap(),
-            r2.to_str().unwrap(),
-            "--output",
-            output.to_str().unwrap(),
-            "--read-structures",
-            "5M+T",
-            "5M+T",
-            "--sample",
-            "test_sample",
-            "--library",
-            "test_library",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to execute extract command");
-
-    assert!(status.success());
+    let cmd = Extract::try_parse_from([
+        "extract",
+        "--inputs",
+        r1.to_str().unwrap(),
+        r2.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--read-structures",
+        "5M+T",
+        "5M+T",
+        "--sample",
+        "test_sample",
+        "--library",
+        "test_library",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse extract args");
+    cmd.execute("test").expect("Failed to execute extract command");
 
     let records = read_bam_records(&output);
     assert_eq!(records.len(), 2);
@@ -421,28 +403,25 @@ fn test_extract_bgzf_verifies_umi_extraction() {
     );
     let output = tmp.path().join("output.bam");
 
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "extract",
-            "--inputs",
-            r1.to_str().unwrap(),
-            r2.to_str().unwrap(),
-            "--output",
-            output.to_str().unwrap(),
-            "--read-structures",
-            "5M+T",
-            "5M+T",
-            "--sample",
-            "test_sample",
-            "--library",
-            "test_library",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to execute extract command");
-
-    assert!(status.success());
+    let cmd = Extract::try_parse_from([
+        "extract",
+        "--inputs",
+        r1.to_str().unwrap(),
+        r2.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--read-structures",
+        "5M+T",
+        "5M+T",
+        "--sample",
+        "test_sample",
+        "--library",
+        "test_library",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse extract args");
+    cmd.execute("test").expect("Failed to execute extract command");
 
     let records = read_bam_records(&output);
     assert_eq!(records.len(), 2);
@@ -469,30 +448,27 @@ fn test_extract_mixed_gzip_and_bgzf() {
     let r2 = create_bgzf_fastq(&tmp, "r2.fq.bgz", &r2_records);
     let output = tmp.path().join("output.bam");
 
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "extract",
-            "--inputs",
-            r1.to_str().unwrap(),
-            r2.to_str().unwrap(),
-            "--output",
-            output.to_str().unwrap(),
-            "--read-structures",
-            "5M+T",
-            "5M+T",
-            "--sample",
-            "test_sample",
-            "--library",
-            "test_library",
-            "--threads",
-            "4",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to execute extract command");
-
-    assert!(status.success(), "Extract with mixed gzip/BGZF should succeed");
+    let cmd = Extract::try_parse_from([
+        "extract",
+        "--inputs",
+        r1.to_str().unwrap(),
+        r2.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--read-structures",
+        "5M+T",
+        "5M+T",
+        "--sample",
+        "test_sample",
+        "--library",
+        "test_library",
+        "--threads",
+        "4",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse extract args");
+    cmd.execute("test").expect("Extract with mixed gzip/BGZF should succeed");
 
     let records = read_bam_records(&output);
     assert_eq!(records.len(), 6, "Should have 6 records");
@@ -508,28 +484,25 @@ fn test_extract_plain_and_compressed() {
     let r2 = create_gzip_fastq(&tmp, "r2.fq.gz", &r2_records);
     let output = tmp.path().join("output.bam");
 
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "extract",
-            "--inputs",
-            r1.to_str().unwrap(),
-            r2.to_str().unwrap(),
-            "--output",
-            output.to_str().unwrap(),
-            "--read-structures",
-            "5M+T",
-            "5M+T",
-            "--sample",
-            "test_sample",
-            "--library",
-            "test_library",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to execute extract command");
-
-    assert!(status.success(), "Extract with plain/gzip mix should succeed");
+    let cmd = Extract::try_parse_from([
+        "extract",
+        "--inputs",
+        r1.to_str().unwrap(),
+        r2.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--read-structures",
+        "5M+T",
+        "5M+T",
+        "--sample",
+        "test_sample",
+        "--library",
+        "test_library",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse extract args");
+    cmd.execute("test").expect("Extract with plain/gzip mix should succeed");
 
     let records = read_bam_records(&output);
     assert_eq!(records.len(), 6, "Should have 6 records");
@@ -567,30 +540,28 @@ fn test_parallel_parse_output_equivalence_across_threads() {
     for threads in [1, 2, 4, 8] {
         let output = tmp.path().join(format!("output_t{threads}.bam"));
 
-        let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
-            .args([
-                "extract",
-                "--inputs",
-                r1.to_str().unwrap(),
-                r2.to_str().unwrap(),
-                "--output",
-                output.to_str().unwrap(),
-                "--read-structures",
-                "5M+T",
-                "5M+T",
-                "--sample",
-                "test",
-                "--library",
-                "test",
-                "--threads",
-                &threads.to_string(),
-                "--compression-level",
-                "1",
-            ])
-            .status()
-            .expect("Failed to execute extract command");
-
-        assert!(status.success(), "Extract with {threads} threads failed");
+        let cmd = Extract::try_parse_from([
+            "extract",
+            "--inputs",
+            r1.to_str().unwrap(),
+            r2.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--read-structures",
+            "5M+T",
+            "5M+T",
+            "--sample",
+            "test",
+            "--library",
+            "test",
+            "--threads",
+            &threads.to_string(),
+            "--compression-level",
+            "1",
+        ])
+        .expect("failed to parse extract args");
+        cmd.execute("test")
+            .unwrap_or_else(|e| panic!("Extract with {threads} threads failed: {e}"));
 
         let records = read_bam_records(&output);
         outputs.push(records);
@@ -639,30 +610,27 @@ fn test_parallel_parse_determinism() {
     for run in 0..3 {
         let output = tmp.path().join(format!("output_run{run}.bam"));
 
-        let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
-            .args([
-                "extract",
-                "--inputs",
-                r1.to_str().unwrap(),
-                r2.to_str().unwrap(),
-                "--output",
-                output.to_str().unwrap(),
-                "--read-structures",
-                "5M+T",
-                "5M+T",
-                "--sample",
-                "test",
-                "--library",
-                "test",
-                "--threads",
-                "4",
-                "--compression-level",
-                "1",
-            ])
-            .status()
-            .expect("Failed to execute extract command");
-
-        assert!(status.success(), "Run {run} failed");
+        let cmd = Extract::try_parse_from([
+            "extract",
+            "--inputs",
+            r1.to_str().unwrap(),
+            r2.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--read-structures",
+            "5M+T",
+            "5M+T",
+            "--sample",
+            "test",
+            "--library",
+            "test",
+            "--threads",
+            "4",
+            "--compression-level",
+            "1",
+        ])
+        .expect("failed to parse extract args");
+        cmd.execute("test").unwrap_or_else(|e| panic!("Run {run} failed: {e}"));
         outputs.push(read_bam_records(&output));
     }
 
@@ -718,55 +686,51 @@ fn test_bgzf_sync_multithreaded_matches_single_threaded() {
 
     // Run single-threaded (fast-path)
     let output_st = tmp.path().join("output_st.bam");
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "extract",
-            "--inputs",
-            r1.to_str().unwrap(),
-            r2.to_str().unwrap(),
-            "--output",
-            output_st.to_str().unwrap(),
-            "--read-structures",
-            "5M+T",
-            "5M+T",
-            "--sample",
-            "test_sample",
-            "--library",
-            "test_library",
-            "--threads",
-            "1",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to execute single-threaded extract");
-    assert!(status.success(), "Single-threaded extract failed");
+    let cmd = Extract::try_parse_from([
+        "extract",
+        "--inputs",
+        r1.to_str().unwrap(),
+        r2.to_str().unwrap(),
+        "--output",
+        output_st.to_str().unwrap(),
+        "--read-structures",
+        "5M+T",
+        "5M+T",
+        "--sample",
+        "test_sample",
+        "--library",
+        "test_library",
+        "--threads",
+        "1",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse extract args");
+    cmd.execute("test").expect("Failed to execute single-threaded extract");
 
     // Run multithreaded (BGZF+sync through unified pipeline)
     let output_threaded = tmp.path().join("output_mt.bam");
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "extract",
-            "--inputs",
-            r1.to_str().unwrap(),
-            r2.to_str().unwrap(),
-            "--output",
-            output_threaded.to_str().unwrap(),
-            "--read-structures",
-            "5M+T",
-            "5M+T",
-            "--sample",
-            "test_sample",
-            "--library",
-            "test_library",
-            "--threads",
-            "4",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to execute multithreaded extract");
-    assert!(status.success(), "Multithreaded extract failed");
+    let cmd = Extract::try_parse_from([
+        "extract",
+        "--inputs",
+        r1.to_str().unwrap(),
+        r2.to_str().unwrap(),
+        "--output",
+        output_threaded.to_str().unwrap(),
+        "--read-structures",
+        "5M+T",
+        "5M+T",
+        "--sample",
+        "test_sample",
+        "--library",
+        "test_library",
+        "--threads",
+        "4",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse extract args");
+    cmd.execute("test").expect("Failed to execute multithreaded extract");
 
     // Compare record content (not just count)
     let st_records = read_bam_records(&output_st);
@@ -816,30 +780,27 @@ fn test_variable_length_reads_gzip() {
     let output = tmp.path().join("output.bam");
 
     // Run multithreaded (exercises RecordCount reader for gzip+sync)
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "extract",
-            "--inputs",
-            r1.to_str().unwrap(),
-            r2.to_str().unwrap(),
-            "--output",
-            output.to_str().unwrap(),
-            "--read-structures",
-            "+T",
-            "+T",
-            "--sample",
-            "test_sample",
-            "--library",
-            "test_library",
-            "--threads",
-            "4",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to execute extract command");
-
-    assert!(status.success(), "Extract with variable-length reads failed");
+    let cmd = Extract::try_parse_from([
+        "extract",
+        "--inputs",
+        r1.to_str().unwrap(),
+        r2.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--read-structures",
+        "+T",
+        "+T",
+        "--sample",
+        "test_sample",
+        "--library",
+        "test_library",
+        "--threads",
+        "4",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse extract args");
+    cmd.execute("test").expect("Extract with variable-length reads failed");
 
     let records = read_bam_records(&output);
     assert_eq!(records.len(), 8, "Should have 8 records (4 pairs × 2 reads)");
@@ -869,30 +830,27 @@ fn test_variable_length_reads_bgzf() {
     let r2 = create_bgzf_fastq(&tmp, "r2.fq.bgz", &records_r2);
     let output = tmp.path().join("output.bam");
 
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "extract",
-            "--inputs",
-            r1.to_str().unwrap(),
-            r2.to_str().unwrap(),
-            "--output",
-            output.to_str().unwrap(),
-            "--read-structures",
-            "+T",
-            "+T",
-            "--sample",
-            "test_sample",
-            "--library",
-            "test_library",
-            "--threads",
-            "4",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to execute extract command");
-
-    assert!(status.success(), "BGZF extract with variable-length reads failed");
+    let cmd = Extract::try_parse_from([
+        "extract",
+        "--inputs",
+        r1.to_str().unwrap(),
+        r2.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--read-structures",
+        "+T",
+        "+T",
+        "--sample",
+        "test_sample",
+        "--library",
+        "test_library",
+        "--threads",
+        "4",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse extract args");
+    cmd.execute("test").expect("BGZF extract with variable-length reads failed");
 
     let records = read_bam_records(&output);
     assert_eq!(records.len(), 8, "Should have 8 records (4 pairs × 2 reads)");
@@ -911,33 +869,30 @@ fn test_extract_multithreaded_custom_options() {
     let r2 = create_gzip_fastq(&tmp, "r2.fq.gz", &[("read1", "TGCATAAAAAAA", "IIIIIIIIIIII")]);
     let output = tmp.path().join("output.bam");
 
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "extract",
-            "--inputs",
-            r1.to_str().unwrap(),
-            r2.to_str().unwrap(),
-            "--output",
-            output.to_str().unwrap(),
-            "--read-structures",
-            "5M+T",
-            "5M+T",
-            "--sample",
-            "test_sample",
-            "--library",
-            "test_library",
-            "--threads",
-            "4",
-            "--compression-level",
-            "1",
-            "--read-group-id",
-            "MyRG",
-            "--annotate-read-names",
-        ])
-        .status()
-        .expect("Failed to execute extract command");
-
-    assert!(status.success(), "Multi-threaded extract with custom options failed");
+    let cmd = Extract::try_parse_from([
+        "extract",
+        "--inputs",
+        r1.to_str().unwrap(),
+        r2.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--read-structures",
+        "5M+T",
+        "5M+T",
+        "--sample",
+        "test_sample",
+        "--library",
+        "test_library",
+        "--threads",
+        "4",
+        "--compression-level",
+        "1",
+        "--read-group-id",
+        "MyRG",
+        "--annotate-read-names",
+    ])
+    .expect("failed to parse extract args");
+    cmd.execute("test").expect("Multi-threaded extract with custom options failed");
 
     let records = read_bam_records(&output);
     assert_eq!(records.len(), 2);
@@ -1004,12 +959,9 @@ fn run_bgzf_extract(
         "1".to_string(),
     ]);
 
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args(&args)
-        .status()
-        .expect("Failed to execute extract command");
-
-    assert!(status.success(), "extract t{threads} {tag_suffix} failed");
+    let cmd = Extract::try_parse_from(args.iter().map(String::as_str))
+        .expect("failed to parse extract args");
+    cmd.execute("test").unwrap_or_else(|e| panic!("extract t{threads} {tag_suffix} failed: {e}"));
     read_bam_records(&output)
 }
 
@@ -1233,33 +1185,29 @@ fn test_extract_bgzf_unequal_block_counts() {
 
     for threads in [1, 4, 8] {
         let output = tmp.path().join(format!("out_unequal_t{threads}.bam"));
-        let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
-            .args([
-                "extract",
-                "--inputs",
-                r1.to_str().unwrap(),
-                r2.to_str().unwrap(),
-                "--output",
-                output.to_str().unwrap(),
-                "--read-structures",
-                "5M+T",
-                "5M+T",
-                "--sample",
-                "test",
-                "--library",
-                "test",
-                "--threads",
-                &threads.to_string(),
-                "--compression-level",
-                "1",
-            ])
-            .status()
-            .expect("Failed to execute extract command");
-
-        assert!(
-            status.success(),
-            "Extract with unequal BGZF block counts should succeed at T{threads}"
-        );
+        let cmd = Extract::try_parse_from([
+            "extract",
+            "--inputs",
+            r1.to_str().unwrap(),
+            r2.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--read-structures",
+            "5M+T",
+            "5M+T",
+            "--sample",
+            "test",
+            "--library",
+            "test",
+            "--threads",
+            &threads.to_string(),
+            "--compression-level",
+            "1",
+        ])
+        .expect("failed to parse extract args");
+        cmd.execute("test").unwrap_or_else(|e| {
+            panic!("Extract with unequal BGZF block counts should succeed at T{threads}: {e}")
+        });
 
         let records = read_bam_records(&output);
         assert_eq!(
