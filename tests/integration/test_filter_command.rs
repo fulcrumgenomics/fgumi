@@ -1,17 +1,19 @@
-//! End-to-end CLI tests for the filter command.
+//! End-to-end tests for the filter command.
 //!
-//! These tests run the actual `fgumi filter` binary and validate:
+//! These tests invoke `Filter::execute()` in-process and validate:
 //! 1. Basic consensus read filtering
 //! 2. Rejected reads output
 //! 3. Statistics output
 
+use clap::Parser;
+use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::filter::Filter;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, create_test_reference};
@@ -81,26 +83,23 @@ fn test_filter_command_basic() {
 
     create_consensus_bam(&input_bam, vec![r1, r2]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "filter",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--ref",
-            ref_path.to_str().unwrap(),
-            "--min-reads",
-            "1",
-            "--max-no-call-fraction",
-            "1.0",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run filter command");
-
-    assert!(status.success(), "Filter command failed");
+    let cmd = Filter::try_parse_from([
+        "filter",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--max-no-call-fraction",
+        "1.0",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse filter args");
+    cmd.execute("test").expect("Filter command failed");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // Verify output has records (reads may have masked bases but should still be present)
@@ -153,26 +152,23 @@ fn test_filter_command_rejects_low_depth() {
 
     create_consensus_bam(&input_bam, vec![good, low_depth]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "filter",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--ref",
-            ref_path.to_str().unwrap(),
-            "--min-reads",
-            "3",
-            "--rejects",
-            rejects_bam.to_str().unwrap(),
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run filter command");
-
-    assert!(status.success(), "Filter command with rejects failed");
+    let cmd = Filter::try_parse_from([
+        "filter",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--min-reads",
+        "3",
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse filter args");
+    cmd.execute("test").expect("Filter command with rejects failed");
     assert!(output_bam.exists(), "Output BAM not created");
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 
@@ -214,26 +210,23 @@ fn test_filter_command_with_stats() {
 
     create_consensus_bam(&input_bam, vec![record]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "filter",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--ref",
-            ref_path.to_str().unwrap(),
-            "--min-reads",
-            "1",
-            "--stats",
-            stats_path.to_str().unwrap(),
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run filter command");
-
-    assert!(status.success(), "Filter command with stats failed");
+    let cmd = Filter::try_parse_from([
+        "filter",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--stats",
+        stats_path.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse filter args");
+    cmd.execute("test").expect("Filter command with stats failed");
     assert!(stats_path.exists(), "Stats file not created");
     let content = fs::read_to_string(&stats_path).expect("Failed to read stats file");
     assert!(!content.trim().is_empty(), "Stats file should not be empty");
@@ -268,24 +261,21 @@ fn test_filter_command_no_ref_unmapped_reads() {
     create_consensus_bam(&input_bam, vec![r1, r2]);
 
     // Run filter WITHOUT --ref
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "filter",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--min-reads",
-            "1",
-            "--max-no-call-fraction",
-            "1.0",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run filter command");
-
-    assert!(status.success(), "Filter command without --ref failed");
+    let cmd = Filter::try_parse_from([
+        "filter",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--max-no-call-fraction",
+        "1.0",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse filter args");
+    cmd.execute("test").expect("Filter command without --ref failed");
     assert!(output_bam.exists(), "Output BAM not created");
 
     let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
@@ -324,24 +314,21 @@ fn test_filter_command_no_ref_with_rejects() {
     create_consensus_bam(&input_bam, vec![good, low_depth]);
 
     // Run filter WITHOUT --ref, with --rejects
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "filter",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--min-reads",
-            "3",
-            "--rejects",
-            rejects_bam.to_str().unwrap(),
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run filter command");
-
-    assert!(status.success(), "Filter command without --ref with rejects failed");
+    let cmd = Filter::try_parse_from([
+        "filter",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "3",
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse filter args");
+    cmd.execute("test").expect("Filter command without --ref with rejects failed");
     assert!(output_bam.exists(), "Output BAM not created");
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 
@@ -385,27 +372,25 @@ fn test_filter_command_no_ref_mapped_reads_fails() {
     create_consensus_bam(&input_bam, vec![mapped]);
 
     // Run filter WITHOUT --ref on mapped reads — should fail
-    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "filter",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--min-reads",
-            "1",
-            "--max-no-call-fraction",
-            "1.0",
-            "--compression-level",
-            "1",
-        ])
-        .output()
-        .expect("Failed to run filter command");
-
-    assert!(!output.status.success(), "Filter command should fail for mapped reads without --ref");
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let cmd = Filter::try_parse_from([
+        "filter",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--max-no-call-fraction",
+        "1.0",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse filter args");
+    let result = cmd.execute("test");
+    assert!(result.is_err(), "Filter command should fail for mapped reads without --ref");
+    let err_msg = format!("{:#}", result.unwrap_err());
     assert!(
-        stderr.contains("--ref is required"),
-        "Error should mention --ref requirement, got stderr: {stderr}"
+        err_msg.contains("--ref is required"),
+        "Error should mention --ref requirement, got: {err_msg}"
     );
 }
