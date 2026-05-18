@@ -320,7 +320,13 @@ pub fn decompress_block(
     block: &RawBgzfBlock,
     decompressor: &mut Decompressor,
 ) -> io::Result<Vec<u8>> {
-    let mut output = Vec::new();
+    // Pre-size to one BGZF block. Avoids the multi-step `RawVec::finish_grow`
+    // we see in profiles (~1.9% of decompress CPU on the merge hot path):
+    // starting from capacity 0, the resize inside `decompress_and_verify` has
+    // to grow through several capacity classes before reaching the final
+    // ~64 KiB. A single `with_capacity` lands at the right size on the first
+    // allocation.
+    let mut output = Vec::with_capacity(crate::BGZF_MAX_BLOCK_SIZE);
     decompress_block_into(block, decompressor, &mut output)?;
     Ok(output)
 }
