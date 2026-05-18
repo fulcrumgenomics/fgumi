@@ -1,12 +1,16 @@
 //! Integration tests for the fastq command.
+//!
+//! These tests invoke the fastq command in-process via `Command::execute()`.
 
+use clap::Parser;
+use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::fastq::Fastq;
 use fgumi_raw_bam::{SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::Command;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
@@ -95,20 +99,16 @@ fn test_fastq_basic() {
         ],
     );
 
-    // Run fastq command with output redirected to file
-    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args(["fastq", "-i", input_bam.to_str().unwrap()])
-        .output()
-        .expect("Failed to run fastq command");
-
-    assert!(
-        output.status.success(),
-        "Fastq command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    // Write stdout to file for parsing
-    fs::write(&output_fq, &output.stdout).expect("Failed to write output");
+    // Run fastq command with output written directly to file
+    let cmd = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-o",
+        output_fq.to_str().unwrap(),
+    ])
+    .expect("failed to parse fastq args");
+    cmd.execute("test").expect("fastq command failed");
 
     // Verify output
     let records = parse_fastq_records(&output_fq);
@@ -146,18 +146,15 @@ fn test_fastq_reverse_complement() {
         ],
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args(["fastq", "-i", input_bam.to_str().unwrap()])
-        .output()
-        .expect("Failed to run fastq command");
-
-    assert!(
-        output.status.success(),
-        "Fastq command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    fs::write(&output_fq, &output.stdout).expect("Failed to write output");
+    let cmd = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-o",
+        output_fq.to_str().unwrap(),
+    ])
+    .expect("failed to parse fastq args");
+    cmd.execute("test").expect("fastq command failed");
 
     let records = parse_fastq_records(&output_fq);
     assert_eq!(records.len(), 2);
@@ -178,19 +175,16 @@ fn test_fastq_no_suffix() {
 
     create_paired_bam(&input_bam, vec![("read1", "ACGT", "IIII", "TGCA", "IIII", false)]);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "fastq",
-            "-i",
-            input_bam.to_str().unwrap(),
-            "-n", // no suffix
-        ])
-        .output()
-        .expect("Failed to run fastq command");
-
-    assert!(output.status.success());
-
-    fs::write(&output_fq, &output.stdout).expect("Failed to write output");
+    let cmd = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-n",
+        "-o",
+        output_fq.to_str().unwrap(),
+    ])
+    .expect("failed to parse fastq args");
+    cmd.execute("test").expect("fastq command failed");
 
     let records = parse_fastq_records(&output_fq);
     assert_eq!(records.len(), 2);
@@ -213,14 +207,15 @@ fn test_fastq_quality_encoding() {
     // ASCII '~' (126) - 33 = quality 93 (max)
     create_paired_bam(&input_bam, vec![("read1", "ACGT", "!I?~", "TGCA", "IIII", false)]);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args(["fastq", "-i", input_bam.to_str().unwrap()])
-        .output()
-        .expect("Failed to run fastq command");
-
-    assert!(output.status.success());
-
-    fs::write(&output_fq, &output.stdout).expect("Failed to write output");
+    let cmd = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-o",
+        output_fq.to_str().unwrap(),
+    ])
+    .expect("failed to parse fastq args");
+    cmd.execute("test").expect("fastq command failed");
 
     let records = parse_fastq_records(&output_fq);
     assert_eq!(records.len(), 2);
@@ -297,18 +292,15 @@ fn test_fastq_exclude_flags() {
     create_bam_with_flags(&input_bam);
 
     // Run with default flags (excludes secondary and supplementary)
-    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args(["fastq", "-i", input_bam.to_str().unwrap()])
-        .output()
-        .expect("Failed to run fastq command");
-
-    assert!(
-        output.status.success(),
-        "Fastq command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    fs::write(&output_fq, &output.stdout).expect("Failed to write output");
+    let cmd = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-o",
+        output_fq.to_str().unwrap(),
+    ])
+    .expect("failed to parse fastq args");
+    cmd.execute("test").expect("fastq command failed");
 
     let records = parse_fastq_records(&output_fq);
     assert_eq!(
@@ -336,18 +328,17 @@ fn test_fastq_multithreaded() {
 
     create_paired_bam(&input_bam, read_pairs);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args(["fastq", "-i", input_bam.to_str().unwrap(), "-@", "4"])
-        .output()
-        .expect("Failed to run fastq command");
-
-    assert!(
-        output.status.success(),
-        "Multithreaded fastq failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    fs::write(&output_fq, &output.stdout).expect("Failed to write output");
+    let cmd = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-@",
+        "4",
+        "-o",
+        output_fq.to_str().unwrap(),
+    ])
+    .expect("failed to parse fastq args");
+    cmd.execute("test").expect("fastq command failed");
 
     let records = parse_fastq_records(&output_fq);
     assert_eq!(records.len(), 20, "Should have 20 FASTQ records (10 pairs)");
@@ -363,20 +354,17 @@ fn test_fastq_hex_flags() {
     create_paired_bam(&input_bam, vec![("read1", "ACGT", "IIII", "TGCA", "IIII", false)]);
 
     // Use hex notation for flags
-    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "fastq",
-            "-i",
-            input_bam.to_str().unwrap(),
-            "-F",
-            "0x900", // hex notation
-        ])
-        .output()
-        .expect("Failed to run fastq command");
-
-    assert!(output.status.success());
-
-    fs::write(&output_fq, &output.stdout).expect("Failed to write output");
+    let cmd = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-F",
+        "0x900", // hex notation
+        "-o",
+        output_fq.to_str().unwrap(),
+    ])
+    .expect("failed to parse fastq args");
+    cmd.execute("test").expect("fastq command failed");
 
     let records = parse_fastq_records(&output_fq);
     assert_eq!(records.len(), 2);
