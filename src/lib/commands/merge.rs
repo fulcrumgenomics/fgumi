@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::logging::OperationTimer;
+use crate::sam::SamTag;
 use crate::validation::validate_file_exists;
 use anyhow::{Result, bail};
 use clap::Parser;
@@ -89,6 +90,13 @@ pub struct Merge {
     /// Level 12 produces smallest files but is slowest.
     #[arg(long = "compression-level", default_value_t = 6)]
     pub compression_level: u32,
+
+    /// Two-character SAM tag carrying the cell barcode for `template-coordinate` merge.
+    ///
+    /// Defaults to `CB`. Only valid with `--order template-coordinate`. See the
+    /// corresponding `fgumi sort --cell-tag` flag for context.
+    #[arg(long = "cell-tag", value_parser = clap::value_parser!(SamTag))]
+    pub cell_tag: Option<SamTag>,
 }
 
 impl Command for Merge {
@@ -129,7 +137,7 @@ impl Command for Merge {
             }
         }
 
-        let cell_tag = crate::commands::sort::parse_cell_tag(self.order)?;
+        let cell_tag = crate::commands::sort::parse_cell_tag(self.order, self.cell_tag)?;
 
         let timer = OperationTimer::new("Merging BAMs");
 
@@ -420,6 +428,7 @@ mod tests {
             order: SortOrderArg::Coordinate,
             threads: 1,
             compression_level: 6,
+            cell_tag: None,
         };
 
         let result = merge.execute("test");
@@ -442,6 +451,7 @@ mod tests {
             order: SortOrderArg::Coordinate,
             threads: 1,
             compression_level: 6,
+            cell_tag: None,
         };
 
         let result = merge.execute("test");

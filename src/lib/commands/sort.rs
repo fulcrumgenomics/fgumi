@@ -279,6 +279,15 @@ pub struct Sort {
     /// on disk. Prototype flag; defaults to off.
     #[arg(long = "async-reader", default_value_t = false, hide = true)]
     pub async_reader: bool,
+
+    /// Two-character SAM tag carrying the cell barcode for `template-coordinate` sort.
+    ///
+    /// Templates with different values of this tag sort into disjoint cell groups,
+    /// matching the samtools `--template-coordinate` behavior with cell-aware data
+    /// (e.g. 10x single-cell). Defaults to `CB`. Only valid with
+    /// `--order template-coordinate`; passing it for any other order is an error.
+    #[arg(long = "cell-tag", value_parser = clap::value_parser!(SamTag))]
+    pub cell_tag: Option<SamTag>,
 }
 
 /// Represents the memory limit configuration for sorting.
@@ -360,10 +369,24 @@ pub(crate) fn parse_memory_reserve(s: &str) -> Result<MemoryReserve, String> {
     Ok(MemoryReserve::Fixed(bytes))
 }
 
-/// Parse the cell tag for template-coordinate sort/verify, returning `None`
-/// for other sort orders.
-pub(crate) fn parse_cell_tag(order: SortOrderArg) -> Result<Option<SamTag>> {
-    if matches!(order, SortOrderArg::TemplateCoordinate) { Ok(Some(SamTag::CB)) } else { Ok(None) }
+/// Parse the cell tag for template-coordinate sort/verify.
+///
+/// For `template-coordinate`, returns the user-supplied `override_tag` if any,
+/// otherwise the default `CB`. For any other sort order, returns `None` after
+/// erroring if the user explicitly passed `--cell-tag` (which only makes sense
+/// for template-coordinate sort).
+pub(crate) fn parse_cell_tag(
+    order: SortOrderArg,
+    override_tag: Option<SamTag>,
+) -> Result<Option<SamTag>> {
+    if matches!(order, SortOrderArg::TemplateCoordinate) {
+        Ok(Some(override_tag.unwrap_or(SamTag::CB)))
+    } else {
+        if override_tag.is_some() {
+            bail!("--cell-tag is only valid with --order template-coordinate");
+        }
+        Ok(None)
+    }
 }
 
 use fgumi_sort::verify_sort_order;
@@ -506,7 +529,7 @@ impl Sort {
     /// Parse the cell tag for template-coordinate sort/verify, returning `None`
     /// for other sort orders.
     fn parse_cell_tag(&self) -> Result<Option<SamTag>> {
-        parse_cell_tag(self.order)
+        parse_cell_tag(self.order, self.cell_tag)
     }
 
     /// Execute sort mode: read, sort, and write output.
@@ -799,6 +822,7 @@ mod tests {
             temp_compression: 1,
             write_index: false,
             async_reader: false,
+            cell_tag: None,
         }
     }
 
@@ -809,6 +833,30 @@ mod tests {
     fn test_parse_cell_tag(#[case] order: SortOrderArg, #[case] expected: Option<SamTag>) {
         let sort = make_sort(order);
         assert_eq!(sort.parse_cell_tag().expect("parse_cell_tag should succeed"), expected);
+    }
+
+    #[test]
+    fn test_parse_cell_tag_with_override() {
+        use std::str::FromStr;
+        let mut sort = make_sort(SortOrderArg::TemplateCoordinate);
+        let cr = SamTag::from_str("CR").expect("CR is a valid SAM tag");
+        sort.cell_tag = Some(cr);
+        assert_eq!(
+            sort.parse_cell_tag().expect("parse_cell_tag should succeed"),
+            Some(cr),
+            "user-supplied --cell-tag must override the CB default",
+        );
+    }
+
+    #[test]
+    fn test_parse_cell_tag_override_rejected_for_non_template_coordinate() {
+        let mut sort = make_sort(SortOrderArg::Coordinate);
+        sort.cell_tag = Some(SamTag::CB);
+        let err = sort.parse_cell_tag().expect_err("--cell-tag with non-tc sort should error");
+        assert!(
+            err.to_string().contains("--cell-tag is only valid with --order template-coordinate"),
+            "got error: {err}",
+        );
     }
 
     #[test]
