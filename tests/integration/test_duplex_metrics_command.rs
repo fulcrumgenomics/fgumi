@@ -2,7 +2,7 @@
 
 use clap::Parser;
 use fgoxide::io::DelimFile;
-use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::duplex_metrics::DuplexMetrics;
 use fgumi_lib::metrics::duplex::{DuplexFamilySizeMetric, FamilySizeMetric};
 use fgumi_lib::metrics::shared::UmiMetric;

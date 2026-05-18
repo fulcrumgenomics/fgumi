@@ -7,7 +7,7 @@
 
 use clap::Parser;
 use fgumi_lib::commands::clip::Clip;
-use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::command::Command;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;

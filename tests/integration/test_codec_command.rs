@@ -10,7 +10,7 @@ use clap::Parser;
 use fgumi_bam_io::create_raw_bam_writer;
 use fgumi_dna::reverse_complement;
 use fgumi_lib::commands::codec::Codec;
-use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::command::Command;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
 use noodles::bam;

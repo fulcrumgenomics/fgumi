@@ -6,7 +6,7 @@
 //! 3. Rejected reads output
 
 use clap::Parser;
-use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::duplex::Duplex;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};

@@ -3,7 +3,7 @@
 //! These tests invoke the fastq command in-process via `Command::execute()`.
 
 use clap::Parser;
-use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::fastq::Fastq;
 use fgumi_raw_bam::{SamBuilder, flags};
 use noodles::bam;

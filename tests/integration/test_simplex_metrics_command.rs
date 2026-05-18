@@ -3,7 +3,7 @@
 
 use clap::Parser;
 use fgoxide::io::DelimFile;
-use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::simplex_metrics::SimplexMetrics;
 use fgumi_lib::metrics::shared::UmiMetric;
 use fgumi_lib::metrics::simplex::{SimplexFamilySizeMetric, SimplexYieldMetric};

@@ -6,7 +6,7 @@
 //! 3. Statistics output
 
 use clap::Parser;
-use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::filter::Filter;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags};

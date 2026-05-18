@@ -4,7 +4,7 @@
 //! the actual `fgumi downsample` binary.
 
 use clap::Parser;
-use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::downsample::Downsample;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::SamBuilder;

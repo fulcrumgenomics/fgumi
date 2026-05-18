@@ -4,7 +4,7 @@
 
 use clap::Parser;
 use fgoxide::io::DelimFile;
-use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::group::GroupReadsByUmi;
 use fgumi_lib::metrics::UmiGroupingMetrics;
 use noodles::bam;

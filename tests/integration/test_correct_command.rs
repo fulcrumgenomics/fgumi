@@ -6,7 +6,7 @@
 //! 3. Rejected reads output
 
 use clap::Parser;
-use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::correct::CorrectUmis;
 use fgumi_raw_bam::RawRecord;
 use noodles::bam;

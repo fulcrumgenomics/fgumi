@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use clap::Parser;
-use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::extract::Extract;
 use flate2::Compression;
 use flate2::write::GzEncoder;
