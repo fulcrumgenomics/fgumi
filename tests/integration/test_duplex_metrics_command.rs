@@ -1,6 +1,9 @@
 //! Integration tests for the duplex-metrics command.
 
+use clap::Parser;
 use fgoxide::io::DelimFile;
+use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::duplex_metrics::DuplexMetrics;
 use fgumi_lib::metrics::duplex::{DuplexFamilySizeMetric, FamilySizeMetric};
 use fgumi_lib::metrics::shared::UmiMetric;
 use fgumi_lib::sam::SamTag;
@@ -10,7 +13,6 @@ use noodles::sam::Header;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
@@ -189,18 +191,15 @@ fn test_duplex_metrics_command_creates_output_files() {
     let header = create_minimal_header("chr1", 10000);
     create_duplex_test_bam(&input_bam, &header);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "duplex-metrics",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_prefix.to_str().unwrap(),
-        ])
-        .status()
-        .expect("Failed to run duplex-metrics command");
-
-    assert!(status.success(), "duplex-metrics command failed");
+    let cmd = DuplexMetrics::try_parse_from([
+        "duplex-metrics",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_prefix.to_str().unwrap(),
+    ])
+    .expect("failed to parse duplex-metrics args");
+    cmd.execute("test").expect("duplex-metrics command failed");
 
     // Verify all expected output files exist
     let family_sizes_path = format!("{}.family_sizes.txt", output_prefix.display());
@@ -230,18 +229,15 @@ fn test_duplex_metrics_command_family_sizes() {
     let header = create_minimal_header("chr1", 10000);
     create_duplex_test_bam(&input_bam, &header);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "duplex-metrics",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_prefix.to_str().unwrap(),
-        ])
-        .status()
-        .expect("Failed to run duplex-metrics command");
-
-    assert!(status.success(), "duplex-metrics command failed");
+    let cmd = DuplexMetrics::try_parse_from([
+        "duplex-metrics",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_prefix.to_str().unwrap(),
+    ])
+    .expect("failed to parse duplex-metrics args");
+    cmd.execute("test").expect("duplex-metrics command failed");
 
     // Read and validate family size metrics
     let family_sizes_path = format!("{}.family_sizes.txt", output_prefix.display());
@@ -270,18 +266,15 @@ fn test_duplex_metrics_command_duplex_family_sizes() {
     let header = create_minimal_header("chr1", 10000);
     create_duplex_test_bam(&input_bam, &header);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "duplex-metrics",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_prefix.to_str().unwrap(),
-        ])
-        .status()
-        .expect("Failed to run duplex-metrics command");
-
-    assert!(status.success(), "duplex-metrics command failed");
+    let cmd = DuplexMetrics::try_parse_from([
+        "duplex-metrics",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_prefix.to_str().unwrap(),
+    ])
+    .expect("failed to parse duplex-metrics args");
+    cmd.execute("test").expect("duplex-metrics command failed");
 
     // Read and validate duplex family size metrics
     let duplex_family_sizes_path = format!("{}.duplex_family_sizes.txt", output_prefix.display());
@@ -310,18 +303,15 @@ fn test_duplex_metrics_command_umi_metrics() {
     let header = create_minimal_header("chr1", 10000);
     create_duplex_test_bam(&input_bam, &header);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "duplex-metrics",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_prefix.to_str().unwrap(),
-        ])
-        .status()
-        .expect("Failed to run duplex-metrics command");
-
-    assert!(status.success(), "duplex-metrics command failed");
+    let cmd = DuplexMetrics::try_parse_from([
+        "duplex-metrics",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_prefix.to_str().unwrap(),
+    ])
+    .expect("failed to parse duplex-metrics args");
+    cmd.execute("test").expect("duplex-metrics command failed");
 
     // Read and validate UMI metrics
     let umi_counts_path = format!("{}.umi_counts.txt", output_prefix.display());
@@ -347,19 +337,16 @@ fn test_duplex_metrics_command_with_duplex_umi_counts() {
     let header = create_minimal_header("chr1", 10000);
     create_duplex_test_bam(&input_bam, &header);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "duplex-metrics",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_prefix.to_str().unwrap(),
-            "--duplex-umi-counts",
-        ])
-        .status()
-        .expect("Failed to run duplex-metrics command");
-
-    assert!(status.success(), "duplex-metrics command failed with --duplex-umi-counts");
+    let cmd = DuplexMetrics::try_parse_from([
+        "duplex-metrics",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_prefix.to_str().unwrap(),
+        "--duplex-umi-counts",
+    ])
+    .expect("failed to parse duplex-metrics args");
+    cmd.execute("test").expect("duplex-metrics command failed with --duplex-umi-counts");
 
     // Verify the additional duplex UMI counts file exists
     let duplex_umi_counts_path = format!("{}.duplex_umi_counts.txt", output_prefix.display());
@@ -381,36 +368,30 @@ fn test_duplex_metrics_command_min_reads_parameters() {
     create_duplex_test_bam(&input_bam, &header);
 
     // Run with default parameters (min-ab=1, min-ba=1)
-    let status_default = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "duplex-metrics",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_prefix_default.to_str().unwrap(),
-        ])
-        .status()
-        .expect("Failed to run duplex-metrics command (default)");
-
-    assert!(status_default.success(), "duplex-metrics command failed (default)");
+    let cmd_default = DuplexMetrics::try_parse_from([
+        "duplex-metrics",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_prefix_default.to_str().unwrap(),
+    ])
+    .expect("failed to parse duplex-metrics args (default)");
+    cmd_default.execute("test").expect("duplex-metrics command failed (default)");
 
     // Run with stricter parameters (min-ab=2, min-ba=2)
-    let status_strict = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "duplex-metrics",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_prefix_strict.to_str().unwrap(),
-            "--min-ab-reads",
-            "2",
-            "--min-ba-reads",
-            "2",
-        ])
-        .status()
-        .expect("Failed to run duplex-metrics command (strict)");
-
-    assert!(status_strict.success(), "duplex-metrics command failed (strict)");
+    let cmd_strict = DuplexMetrics::try_parse_from([
+        "duplex-metrics",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_prefix_strict.to_str().unwrap(),
+        "--min-ab-reads",
+        "2",
+        "--min-ba-reads",
+        "2",
+    ])
+    .expect("failed to parse duplex-metrics args (strict)");
+    cmd_strict.execute("test").expect("duplex-metrics command failed (strict)");
 
     // Read both duplex family size files
     let default_path = format!("{}.duplex_family_sizes.txt", output_prefix_default.display());
