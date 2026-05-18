@@ -256,15 +256,28 @@ pub struct AuxStringTags<'a> {
     pub rg: Option<&'a [u8]>,
     pub cell: Option<&'a [u8]>,
     pub mc: Option<&'a str>,
+    /// Aux-relative `(value_offset, value_len)` of the UMI tag's value bytes
+    /// (excluding NUL terminator), when the caller supplied a `umi_tag` to look
+    /// for. `None` when no `umi_tag` was supplied, or when the tag is absent
+    /// or non-Z-typed. Aux-relative — to convert to record-relative for use
+    /// with `update_string_tag_at_position` etc., add the record's aux offset.
+    pub umi_position: Option<(u32, u16)>,
 }
 
-/// Extract RG, cell barcode, and MC tags in a single pass over the aux data.
+/// Extract RG, cell barcode, MC, and optionally UMI tag position in a single
+/// pass over the aux data.
 #[inline]
 #[must_use]
-pub fn extract_aux_string_tags(aux_data: &[u8], cell_tag: impl AsTagBytes) -> AuxStringTags<'_> {
+pub fn extract_aux_string_tags(
+    aux_data: &[u8],
+    cell_tag: impl AsTagBytes,
+    umi_tag: Option<[u8; 2]>,
+) -> AuxStringTags<'_> {
     let cell_tag = cell_tag.as_tag_bytes();
-    let mut result = AuxStringTags { rg: None, cell: None, mc: None };
-    let mut found = 0u8; // bit 0=RG, bit 1=cell, bit 2=MC
+    let mut result = AuxStringTags { rg: None, cell: None, mc: None, umi_position: None };
+    let mut found = 0u8; // bit 0=RG, bit 1=cell, bit 2=MC, bit 3=UMI
+    // Early-exit mask: only require UMI if the caller asked for it.
+    let target = 7u8 | if umi_tag.is_some() { 8 } else { 0 };
     let mut p = 0;
     while p + 3 <= aux_data.len() {
         let t = [aux_data[p], aux_data[p + 1]];
@@ -283,8 +296,15 @@ pub fn extract_aux_string_tags(aux_data: &[u8], cell_tag: impl AsTagBytes) -> Au
                 } else if t == SamTag::MC {
                     result.mc = std::str::from_utf8(value).ok();
                     found |= 4;
+                } else if matches!(umi_tag, Some(ut) if t == ut) {
+                    // Width checks are defensive only (BAM records < 4 GiB,
+                    // aux values < 64 KiB); silently skip if they fail.
+                    if let (Ok(off_u32), Ok(len_u16)) = (u32::try_from(start), u16::try_from(end)) {
+                        result.umi_position = Some((off_u32, len_u16));
+                        found |= 8;
+                    }
                 }
-                if found == 7 {
+                if found == target {
                     return result;
                 }
                 p = start + end + 1;
@@ -1253,11 +1273,16 @@ impl<'a> IntoIterator for &RawTagsView<'a> {
 }
 
 impl<'a> RawTagsView<'a> {
-    /// Single-pass extraction of (RG, cell, MC) string tags from this aux section.
+    /// Single-pass extraction of (RG, cell, MC) string tags from this aux
+    /// section, optionally also capturing the UMI tag's position.
     #[inline]
     #[must_use]
-    pub fn extract_string_batch(&self, cell_tag: impl AsTagBytes) -> AuxStringTags<'a> {
-        extract_aux_string_tags(self.0, cell_tag)
+    pub fn extract_string_batch(
+        &self,
+        cell_tag: impl AsTagBytes,
+        umi_tag: Option<[u8; 2]>,
+    ) -> AuxStringTags<'a> {
+        extract_aux_string_tags(self.0, cell_tag, umi_tag)
     }
 }
 
@@ -2607,7 +2632,7 @@ mod tests {
         aux.extend_from_slice(b"RGZsample1\x00");
         aux.extend_from_slice(b"CBZcell42\x00");
         aux.extend_from_slice(b"MCZ10M5S\x00");
-        let result = extract_aux_string_tags(&aux, SamTag::CB);
+        let result = extract_aux_string_tags(&aux, SamTag::CB, None);
         assert_eq!(result.rg, Some(b"sample1".as_ref()));
         assert_eq!(result.cell, Some(b"cell42".as_ref()));
         assert_eq!(result.mc, Some("10M5S"));
@@ -2622,7 +2647,7 @@ mod tests {
         aux.extend_from_slice(b"MCZ5M\x00");
         // Add extra tags that should never be reached
         aux.extend_from_slice(&[b'X', b'Y', b'C', 99]);
-        let result = extract_aux_string_tags(&aux, SamTag::CB);
+        let result = extract_aux_string_tags(&aux, SamTag::CB, None);
         assert_eq!(result.rg, Some(b"rg1".as_ref()));
         assert_eq!(result.cell, Some(b"bc1".as_ref()));
         assert_eq!(result.mc, Some("5M"));
@@ -2632,7 +2657,7 @@ mod tests {
     fn test_extract_aux_string_tags_partial() {
         // Only RG present, others missing
         let aux = b"RGZsample\x00";
-        let result = extract_aux_string_tags(aux, SamTag::CB);
+        let result = extract_aux_string_tags(aux, SamTag::CB, None);
         assert_eq!(result.rg, Some(b"sample".as_ref()));
         assert!(result.cell.is_none());
         assert!(result.mc.is_none());
@@ -2646,7 +2671,7 @@ mod tests {
         aux.extend_from_slice(b"RGZlib1\x00"); // RG:Z:lib1
         aux.extend_from_slice(&[b'A', b'S', b'C', 30]); // AS:C:30
         aux.extend_from_slice(b"MCZ20M\x00"); // MC:Z:20M
-        let result = extract_aux_string_tags(&aux, SamTag::CB);
+        let result = extract_aux_string_tags(&aux, SamTag::CB, None);
         assert_eq!(result.rg, Some(b"lib1".as_ref()));
         assert!(result.cell.is_none());
         assert_eq!(result.mc, Some("20M"));
@@ -2654,7 +2679,7 @@ mod tests {
 
     #[test]
     fn test_extract_aux_string_tags_empty() {
-        let result = extract_aux_string_tags(&[], SamTag::CB);
+        let result = extract_aux_string_tags(&[], SamTag::CB, None);
         assert!(result.rg.is_none());
         assert!(result.cell.is_none());
         assert!(result.mc.is_none());
@@ -2667,7 +2692,7 @@ mod tests {
         aux.extend_from_slice(b"MCZ");
         aux.extend_from_slice(&[0xFF, 0xFE, 0xFD]); // invalid UTF-8
         aux.push(0); // null terminator
-        let result = extract_aux_string_tags(&aux, SamTag::CB);
+        let result = extract_aux_string_tags(&aux, SamTag::CB, None);
         assert!(result.mc.is_none()); // from_utf8 fails
     }
 
@@ -2675,8 +2700,39 @@ mod tests {
     fn test_extract_aux_string_tags_truncated_z() {
         // RG:Z:lib1 with no null → should break out, no tags found
         let aux = b"RGZlib1";
-        let result = extract_aux_string_tags(aux, SamTag::CB);
+        let result = extract_aux_string_tags(aux, SamTag::CB, None);
         assert!(result.rg.is_none());
+    }
+
+    #[test]
+    fn test_extract_aux_string_tags_captures_umi_position() {
+        // Build aux: NM:i:5  RX:Z:ACGT  RG:Z:lib1
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"NMC");
+        aux.push(5);
+        aux.extend_from_slice(b"RXZACGT\x00");
+        aux.extend_from_slice(b"RGZlib1\x00");
+        let result = extract_aux_string_tags(&aux, SamTag::CB, Some(*SamTag::RX));
+        assert_eq!(result.rg, Some(b"lib1".as_ref()));
+        let (off, len) = result.umi_position.expect("UMI position should be captured");
+        assert_eq!(&aux[off as usize..off as usize + len as usize], b"ACGT");
+    }
+
+    #[test]
+    fn test_extract_aux_string_tags_umi_none_when_tag_absent() {
+        // Aux has RG but no RX.
+        let aux = b"RGZlib1\x00";
+        let result = extract_aux_string_tags(aux, SamTag::CB, Some(*SamTag::RX));
+        assert!(result.rg.is_some());
+        assert!(result.umi_position.is_none());
+    }
+
+    #[test]
+    fn test_extract_aux_string_tags_umi_skipped_when_caller_disinterested() {
+        // RX present but caller passed umi_tag=None — must not capture.
+        let aux = b"RXZACGT\x00";
+        let result = extract_aux_string_tags(aux, SamTag::CB, None);
+        assert!(result.umi_position.is_none());
     }
 
     // ========================================================================
@@ -3664,7 +3720,7 @@ mod tests {
         use crate::fields::RawRecordView;
         let aux = b"RGZmygrp\0BCZACGT\0MCZ50M\0";
         let rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, aux);
-        let s = RawRecordView::new(&rec).tags().extract_string_batch(SamTag::BC);
+        let s = RawRecordView::new(&rec).tags().extract_string_batch(SamTag::BC, None);
         assert_eq!(s.rg, Some(b"mygrp".as_slice()));
         assert_eq!(s.cell, Some(b"ACGT".as_slice()));
         assert_eq!(s.mc, Some("50M"));

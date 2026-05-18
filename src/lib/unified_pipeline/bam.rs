@@ -391,14 +391,17 @@ pub fn decode_records(
                 ),
             ));
         }
-        let key = compute_group_key_from_raw(
+        let (key, umi_position) = compute_group_key_from_raw(
             &raw,
             &group_key_config.library_index,
             group_key_config.cell_tag,
+            group_key_config.umi_tag,
         );
         let mut decoded = DecodedRecord::from_raw_bytes(raw, key);
-        if let Some(umi_tag) = group_key_config.umi_tag {
-            cache_umi_position(&mut decoded, umi_tag);
+        // The UMI position returned above is record-relative (already converted
+        // from aux-relative inside `compute_group_key_from_raw`).
+        if let Some((value_offset, value_len)) = umi_position {
+            decoded.set_cached_umi(value_offset, value_len);
         }
         records.push(decoded);
     }
@@ -406,35 +409,17 @@ pub fn decode_records(
     Ok(records)
 }
 
-/// Cache the UMI tag's value position on a `DecodedRecord`.
-///
-/// Looks up the configured UMI tag in the record's aux data and, if present,
-/// stores the record-relative offset of its value bytes (excluding the trailing
-/// NUL terminator). When the UMI tag is absent or not Z-typed, the record's
-/// cache remains in the uninitialized `UMI_OFFSET_UNCACHED` state and
-/// downstream code must fall back to scanning aux data.
-fn cache_umi_position(decoded: &mut DecodedRecord, umi_tag: [u8; 2]) {
-    let raw = decoded.raw_bytes();
-    let Some(aux_offset) = fgumi_raw_bam::aux_data_offset_from_record(raw) else {
-        return;
-    };
-    let aux = &raw[aux_offset..];
-    let Some((value_off_in_aux, value_len)) = fgumi_raw_bam::find_string_tag_position(aux, umi_tag)
-    else {
-        return;
-    };
-    let Ok(aux_offset_u32) = u32::try_from(aux_offset) else {
-        return;
-    };
-    let Some(value_offset) = aux_offset_u32.checked_add(value_off_in_aux) else {
-        return;
-    };
-    decoded.set_cached_umi(value_offset, value_len);
-}
-
 /// Compute a `GroupKey` directly from raw BAM bytes, matching `compute_group_key()` exactly.
 ///
 /// Uses 1-based coordinate helpers to produce identical keys to the noodles path.
+///
+/// When `umi_tag` is `Some`, the same aux-data scan that locates RG, the cell
+/// barcode, and MC also locates the UMI tag's value. The returned tuple's
+/// second element is the **record-relative** `(value_offset, value_len)` of
+/// the UMI tag's value bytes (excluding NUL terminator), suitable for
+/// `DecodedRecord::set_cached_umi`. It is `None` when no `umi_tag` was
+/// supplied, when the tag is absent or non-Z-typed, or when the record's aux
+/// offset cannot be resolved.
 ///
 /// # Panics
 ///
@@ -446,7 +431,8 @@ pub fn compute_group_key_from_raw(
     raw: &[u8],
     library_index: &LibraryIndex,
     cell_tag: Option<noodles::sam::alignment::record::data::field::Tag>,
-) -> super::base::GroupKey {
+    umi_tag: Option<[u8; 2]>,
+) -> (super::base::GroupKey, Option<(u32, u16)>) {
     use super::base::GroupKey;
 
     // Extract name hash (match noodles path: empty name → None → hash 0)
@@ -462,7 +448,7 @@ pub fn compute_group_key_from_raw(
     let is_secondary = (flg & fgumi_raw_bam::flags::SECONDARY) != 0;
     let is_supplementary = (flg & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0;
     if is_secondary || is_supplementary {
-        return GroupKey { name_hash, ..GroupKey::default() };
+        return (GroupKey { name_hash, ..GroupKey::default() }, None);
     }
 
     // Own position (1-based, matching noodles) — zero-allocation CIGAR iteration
@@ -472,10 +458,20 @@ pub fn compute_group_key_from_raw(
     let own_ref_id = fgumi_raw_bam::ref_id(raw);
     let strand = u8::from(reverse);
 
-    // Single-pass aux tag extraction (RG, cell barcode, MC)
-    let aux_data = fgumi_raw_bam::aux_data_slice(raw);
+    // Single-pass aux tag extraction (RG, cell barcode, MC, optional UMI).
+    // Resolve aux_offset once so we can both slice aux data and convert the
+    // returned UMI position from aux-relative to record-relative.
+    let aux_offset = fgumi_raw_bam::aux_data_offset_from_record(raw).unwrap_or(raw.len());
+    let aux_data = &raw[aux_offset..];
     let cell_tag_bytes = cell_tag.map_or([0u8; 2], |t| [t.as_ref()[0], t.as_ref()[1]]);
-    let aux_tags = fgumi_raw_bam::extract_aux_string_tags(aux_data, cell_tag_bytes);
+    let aux_tags = fgumi_raw_bam::extract_aux_string_tags(aux_data, cell_tag_bytes, umi_tag);
+
+    // Convert UMI position from aux-relative to record-relative.
+    let umi_position = aux_tags.umi_position.and_then(|(value_off_in_aux, value_len)| {
+        let aux_offset_u32 = u32::try_from(aux_offset).ok()?;
+        let value_offset = aux_offset_u32.checked_add(value_off_in_aux)?;
+        Some((value_offset, value_len))
+    });
 
     let library_idx = if let Some(rg) = aux_tags.rg {
         let rg_hash = LibraryIndex::hash_rg(rg);
@@ -490,7 +486,10 @@ pub fn compute_group_key_from_raw(
     // Check if paired
     let is_paired = (flg & fgumi_raw_bam::flags::PAIRED) != 0;
     if !is_paired {
-        return GroupKey::single(own_ref_id, own_pos, strand, library_idx, cell_hash, name_hash);
+        return (
+            GroupKey::single(own_ref_id, own_pos, strand, library_idx, cell_hash, name_hash),
+            umi_position,
+        );
     }
 
     // Mate info — guard against MATE_UNMAPPED (matching noodles path)
@@ -509,7 +508,7 @@ pub fn compute_group_key_from_raw(
             .map(|mc| fgumi_raw_bam::mate_unclipped_5prime_1based(raw_mate_pos, mate_reverse, mc))
     };
 
-    match mate_pos_result {
+    let key = match mate_pos_result {
         Some(mp) => GroupKey::paired(
             own_ref_id,
             own_pos,
@@ -525,7 +524,8 @@ pub fn compute_group_key_from_raw(
             // No MC tag — fall back to single-end behavior
             GroupKey::single(own_ref_id, own_pos, strand, library_idx, cell_hash, name_hash)
         }
-    }
+    };
+    (key, umi_position)
 }
 
 // ============================================================================
@@ -4397,7 +4397,6 @@ where
 mod tests {
     use super::*;
     use crate::read_info::LibraryIndex;
-    use crate::unified_pipeline::GroupKey;
     use rstest::rstest;
 
     // ========================================================================
@@ -4889,42 +4888,6 @@ mod tests {
             .cigar_ops(&[4u32 << 4]);
         b.add_string_tag(SamTag::RX, umi);
         b.build()
-    }
-
-    #[test]
-    fn test_cache_umi_position_records_value_offset_and_len() {
-        let raw = raw_record_with_rx(b"ACGTACGT");
-        let mut decoded = DecodedRecord::from_raw_bytes(raw.as_ref().to_vec(), GroupKey::default());
-        cache_umi_position(&mut decoded, *SamTag::RX);
-
-        // The cached slice must equal the canonical find_string_tag answer.
-        let aux = fgumi_raw_bam::aux_data_slice(decoded.raw_bytes());
-        let expected = fgumi_raw_bam::find_string_tag(aux, SamTag::RX).unwrap();
-        assert_eq!(decoded.cached_umi(), Some(expected));
-        assert_eq!(decoded.cached_umi().unwrap(), b"ACGTACGT");
-    }
-
-    #[test]
-    fn test_cache_umi_position_leaves_cache_unset_when_tag_missing() {
-        use fgumi_raw_bam::{SamBuilder as RawSamBuilder, flags as raw_flags};
-
-        // Record with no RX tag — caching should be a no-op.
-        let mut b = RawSamBuilder::new();
-        b.read_name(b"read1")
-            .sequence(b"ACGT")
-            .qualities(&[30u8; 4])
-            .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT)
-            .ref_id(0)
-            .pos(0)
-            .mapq(30)
-            .cigar_ops(&[4u32 << 4]);
-        let raw = b.build();
-
-        let mut decoded = DecodedRecord::from_raw_bytes(raw.as_ref().to_vec(), GroupKey::default());
-        cache_umi_position(&mut decoded, *SamTag::RX);
-
-        assert!(decoded.cached_umi().is_none());
-        assert_eq!(decoded.cached_umi_position().0, DecodedRecord::UMI_OFFSET_UNCACHED);
     }
 
     #[test]

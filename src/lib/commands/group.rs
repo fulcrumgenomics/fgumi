@@ -938,9 +938,14 @@ impl Command for GroupReadsByUmi {
         let library_index = LibraryIndex::from_header(&header);
         // Cache the UMI tag's value position on each DecodedRecord so the Process
         // step's UMI-assignment pass can slice the value without re-scanning aux
-        // data (issue #334).
-        pipeline_config.group_key_config =
-            Some(GroupKeyConfig::new(library_index, cell_tag).with_umi_tag(raw_tag));
+        // data (issue #334). Skip the cache in --no-umi mode where the assignment
+        // site emits String::new() and never reads the cache.
+        let group_key_config = GroupKeyConfig::new(library_index, cell_tag);
+        pipeline_config.group_key_config = Some(if self.no_umi {
+            group_key_config
+        } else {
+            group_key_config.with_umi_tag(raw_tag)
+        });
 
         // Short-circuit support for memory bisection debugging.
         // Set FGUMI_SHORT_CIRCUIT=process|serialize|compress to skip downstream steps.
@@ -1401,8 +1406,11 @@ impl GroupReadsByUmi {
                 break; // EOF
             }
 
-            // Compute GroupKey directly from raw bytes — no noodles decode needed
-            let key = compute_group_key_from_raw(&raw_rec, &library_index, Some(cell_tag));
+            // Compute GroupKey directly from raw bytes — no noodles decode needed.
+            // This caller does not need UMI position caching (the group command's
+            // hot path goes through `decode_records`, which threads the umi_tag).
+            let (key, _umi_position) =
+                compute_group_key_from_raw(&raw_rec, &library_index, Some(cell_tag), None);
             let decoded = DecodedRecord::from_raw_bytes(raw_rec.clone(), key);
 
             // Feed to RecordPositionGrouper - may emit a completed group
