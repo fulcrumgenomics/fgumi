@@ -718,6 +718,43 @@ mod tests {
         assert_eq!(metrics[2].ba_size, 3);
     }
 
+    /// Regression test for the sparse-vs-dense bug that OOM'd `fgumi
+    /// duplex-metrics` on cfDNA inputs. With a single duplex family at
+    /// `(50_000, 50_000)`, the previous dense-grid implementation would
+    /// allocate a `(50_001 × 50_001) × usize` scratch grid (~20 GiB) to
+    /// compute the cumulative fractions. The sparse implementation
+    /// iterates only the three observed `(ab, ba)` entries and computes
+    /// `fraction_gt_or_eq_size` correctly in microseconds.
+    ///
+    /// The assertions verify behaviour; the implicit assertion is that
+    /// the test completes without OOM, which guards against any future
+    /// refactor reintroducing an `O(max_ab × max_ba)` allocation.
+    #[test]
+    fn test_duplex_family_size_metrics_sparse_hot_spot() {
+        let mut collector = DuplexMetricsCollector::new(false);
+        collector.record_duplex_family(2, 1);
+        collector.record_duplex_family(5, 3);
+        collector.record_duplex_family(50_000, 50_000);
+
+        let metrics = collector.duplex_family_size_metrics();
+        assert_eq!(metrics.len(), 3, "exactly 3 sparse entries, not max_ab × max_ba");
+
+        // Sorted ascending by (ab, ba): (2,1) → (5,3) → (50000, 50000).
+        let total = 3.0_f64;
+        // (2, 1): all three entries have ab≥2 ∧ ba≥1.
+        assert_eq!(metrics[0].ab_size, 2);
+        assert_eq!(metrics[0].ba_size, 1);
+        assert!((metrics[0].fraction_gt_or_eq_size - 3.0 / total).abs() < 1e-9);
+        // (5, 3): only (5, 3) and (50000, 50000) satisfy.
+        assert_eq!(metrics[1].ab_size, 5);
+        assert_eq!(metrics[1].ba_size, 3);
+        assert!((metrics[1].fraction_gt_or_eq_size - 2.0 / total).abs() < 1e-9);
+        // (50000, 50000): only itself satisfies.
+        assert_eq!(metrics[2].ab_size, 50_000);
+        assert_eq!(metrics[2].ba_size, 50_000);
+        assert!((metrics[2].fraction_gt_or_eq_size - 1.0 / total).abs() < 1e-9);
+    }
+
     #[test]
     fn test_duplex_umi_expected_frequency() {
         let mut collector = DuplexMetricsCollector::new(true);
