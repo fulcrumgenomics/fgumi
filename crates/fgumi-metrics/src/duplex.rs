@@ -386,32 +386,33 @@ impl DuplexMetricsCollector {
 
         metrics.sort();
 
-        // Calculate 2D cumulative fractions: fraction of families with AB >= ab AND BA >= ba
-        // This matches fgbio's definition in DuplexFamilySizeMetric
+        // Calculate 2D cumulative fractions: fraction of families with AB >= ab AND BA >= ba.
+        // This matches fgbio's definition in DuplexFamilySizeMetric.
         //
-        // Build a 2D suffix sum grid to avoid O(n²) per-metric iteration.
+        // The previous implementation built a dense `(max_ab+1) × (max_ba+1)` `usize`
+        // grid and ran 2D suffix sums over it. That `O(max_ab × max_ba)` allocation
+        // OOM'd `fgumi duplex-metrics` on real cfDNA inputs whose hottest duplex
+        // family lands in the tens-of-thousands of reads per strand — e.g.
+        // `max_ab = max_ba = 50_000` yields a 20 GiB scratch grid before any
+        // metric is computed.
+        //
+        // `duplex_family_sizes` is sparse: the HashMap typically holds well under
+        // a thousand distinct `(ab, ba)` pairs even on cfDNA-scale inputs, while
+        // `max_ab × max_ba` can run into the billions. Computing each entry's
+        // suffix sum by direct sparse iteration is `O(N²)` in the number of
+        // distinct pairs — for N≈1000 that's ≈10⁶ comparisons, dwarfed by the
+        // I/O cost of getting here, and the grid allocation is gone.
         if total > 0 {
-            let max_ab = self.duplex_family_sizes.keys().map(|(a, _)| *a).max().unwrap_or(0);
-            let max_ba = self.duplex_family_sizes.keys().map(|(_, b)| *b).max().unwrap_or(0);
-            let cols = max_ba + 1;
-            let mut grid = vec![0usize; (max_ab + 1) * cols];
-            for (&(a, b), &count) in &self.duplex_family_sizes {
-                grid[a * cols + b] = count;
-            }
-            // Accumulate suffix sums: first along ba (columns right-to-left),
-            // then along ab (rows bottom-to-top)
-            for a in 0..=max_ab {
-                for b in (0..max_ba).rev() {
-                    grid[a * cols + b] += grid[a * cols + b + 1];
-                }
-            }
-            for b in 0..=max_ba {
-                for a in (0..max_ab).rev() {
-                    grid[a * cols + b] += grid[(a + 1) * cols + b];
-                }
-            }
+            // Snapshot the sparse `(key, count)` pairs once so the inner loop
+            // doesn't re-borrow the HashMap on every iteration.
+            let entries: Vec<((usize, usize), usize)> =
+                self.duplex_family_sizes.iter().map(|(&k, &v)| (k, v)).collect();
             for metric in &mut metrics {
-                let cumulative_count = grid[metric.ab_size * cols + metric.ba_size];
+                let cumulative_count: usize = entries
+                    .iter()
+                    .filter(|((a, b), _)| *a >= metric.ab_size && *b >= metric.ba_size)
+                    .map(|(_, count)| *count)
+                    .sum();
                 metric.fraction_gt_or_eq_size = frac(cumulative_count, total);
             }
         }

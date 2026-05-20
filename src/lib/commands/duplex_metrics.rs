@@ -8,7 +8,7 @@
 
 use crate::commands::common::parse_bool;
 use crate::logging::OperationTimer;
-use crate::metrics::duplex::{DuplexMetricsCollector, DuplexYieldMetric};
+use crate::metrics::duplex::{DuplexMetricsCollector, DuplexYieldMetric, FamilySizeMetric};
 use crate::simple_umi_consensus::SimpleUmiConsensusCaller;
 use crate::umi::extract_mi_base;
 use crate::validation::validate_file_exists;
@@ -425,12 +425,17 @@ impl DuplexMetrics {
             .map(|m| m.count)
             .sum();
 
-        // Calculate ideal fraction
-        let ds_family_sizes: Vec<usize> =
-            family_size_metrics.iter().flat_map(|m| vec![m.family_size; m.ds_count]).collect();
-
-        let ideal_fraction = Self::calculate_ideal_duplex_fraction(
-            &ds_family_sizes,
+        // Calculate ideal fraction directly from the per-size DS counts. The
+        // previous implementation flat-mapped each `family_size_metric` into a
+        // `Vec<usize>` containing `m.family_size` repeated `m.ds_count` times,
+        // then iterated that flat Vec computing one `Binomial::cdf` per entry.
+        // For inputs with even one family that ran into the tens-of-thousands
+        // of reads the flat Vec adds tens of MB and the inner loop recomputes
+        // the *same* binomial probability `ds_count` times for every distinct
+        // family size. Iterating the per-size buckets is mathematically
+        // equivalent: each family size's contribution is `prob × ds_count`.
+        let ideal_fraction = Self::calculate_ideal_duplex_fraction_per_size(
+            &family_size_metrics,
             self.min_ab_reads,
             self.min_ba_reads,
         );
@@ -466,36 +471,47 @@ impl DuplexMetrics {
         }
     }
 
-    /// Calculates the ideal duplex fraction using binomial model.
+    /// Calculates the ideal duplex fraction directly from per-family-size
+    /// counts, weighting each family size's probability by its DS count
+    /// instead of materializing a flat `Vec<usize>` of repeated sizes.
     ///
-    /// For each family of size N, calculates the probability that both strands
-    /// have sufficient reads (A >= `min_ab` AND B >= `min_ba` where A + B = N).
-    /// Assumes each read has 0.5 probability of being on each strand.
-    fn calculate_ideal_duplex_fraction(
-        family_sizes: &[usize],
+    /// For each family size N with `ds_count` observations, calculates the
+    /// probability that both strands have sufficient reads
+    /// (A >= `min_ab` AND B >= `min_ba` where A + B = N), assuming each read
+    /// has 0.5 probability of being on each strand. The numerator
+    /// accumulates `prob × ds_count` per unique size; the denominator is the
+    /// total number of DS family observations.
+    ///
+    /// This is mathematically equivalent to the previous
+    /// `calculate_ideal_duplex_fraction(&[usize])` form but avoids both the
+    /// `vec![size; ds_count]` allocation and the redundant `Binomial::cdf`
+    /// recomputation for repeated family sizes.
+    fn calculate_ideal_duplex_fraction_per_size(
+        family_size_metrics: &[FamilySizeMetric],
         min_ab: usize,
         min_ba: usize,
     ) -> f64 {
-        if family_sizes.is_empty() {
+        let total_families: usize = family_size_metrics.iter().map(|m| m.ds_count).sum();
+        if total_families == 0 {
             return 0.0;
         }
 
         let mut ideal_duplexes = 0.0;
-        let total_families = family_sizes.len() as f64;
 
-        for &size in family_sizes {
+        for m in family_size_metrics {
+            if m.ds_count == 0 {
+                continue;
+            }
+            let size = m.family_size;
             if size < min_ab + min_ba {
                 // Impossible to form a duplex with this family size
                 continue;
             }
 
             // Calculate P(A >= min_ab AND B >= min_ba) where A ~ Binomial(n=size, p=0.5)
-            // and B = size - A
-            //
-            // This is equivalent to: P(min_ba <= A <= size - min_ab)
-            // = P(A <= size - min_ab) - P(A < min_ba)
-            // = CDF(size - min_ab) - CDF(min_ba - 1)
-
+            // and B = size - A. Equivalent to:
+            //   P(min_ba <= A <= size - min_ab)
+            //   = CDF(size - min_ab) - CDF(min_ba - 1)
             let binomial = match Binomial::new(0.5, size as u64) {
                 Ok(b) => b,
                 Err(_) => continue, // Skip if binomial creation fails
@@ -504,7 +520,6 @@ impl DuplexMetrics {
             let upper_bound = size - min_ba;
             let lower_bound = min_ab;
 
-            // P(A >= lower_bound AND A <= upper_bound)
             let prob = if upper_bound >= lower_bound {
                 let p_upper = binomial.cdf(upper_bound as u64);
                 let p_lower =
@@ -514,10 +529,10 @@ impl DuplexMetrics {
                 0.0
             };
 
-            ideal_duplexes += prob;
+            ideal_duplexes += prob * (m.ds_count as f64);
         }
 
-        ideal_duplexes / total_families
+        ideal_duplexes / (total_families as f64)
     }
 
     /// Updates UMI metrics for a duplex family
