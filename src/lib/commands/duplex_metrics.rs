@@ -305,12 +305,18 @@ impl DuplexMetrics {
         // Pre-compute metadata once for the entire group
         let metadata = compute_template_metadata(group);
 
-        // Hoist scratch buffers outside the 20-fraction loop so we reuse each
-        // HashMap/Vec's bucket allocation across iterations instead of
-        // allocating-and-dropping 20× per coordinate group. This matches what
-        // `simplex_metrics::process_coordinate_group` already does with its
-        // `ss_groups` map, and is the single biggest source of allocator
-        // churn observed on real cfDNA inputs (millions of coordinate groups).
+        // Hoist scratch buffers outside the 20-fraction loop. `HashMap::clear()`
+        // preserves the outer bucket array across iterations — that's the
+        // dominant allocator win on real cfDNA inputs with millions of
+        // coordinate groups, and is the same pattern
+        // `simplex_metrics::process_coordinate_group` already uses for its
+        // `ss_groups` map.
+        //
+        // The inner `Vec<(&str, &str)>` stored as `ds_groups` entry.2 is
+        // still freed per entry on `.clear()`. Combined with the
+        // `is_full_fraction` gate below, that inner Vec now allocates exactly
+        // once per coordinate group (at the 100% fraction) rather than once
+        // per fraction × per `or_default()` slot.
         let mut downsampled: Vec<&TemplateMetadata> = Vec::new();
         let mut ss_groups: HashMap<&str, usize> = HashMap::new();
         #[allow(clippy::type_complexity)]
