@@ -305,11 +305,22 @@ impl DuplexMetrics {
         // Pre-compute metadata once for the entire group
         let metadata = compute_template_metadata(group);
 
+        // Hoist scratch buffers outside the 20-fraction loop so we reuse each
+        // HashMap/Vec's bucket allocation across iterations instead of
+        // allocating-and-dropping 20× per coordinate group. This matches what
+        // `simplex_metrics::process_coordinate_group` already does with its
+        // `ss_groups` map, and is the single biggest source of allocator
+        // churn observed on real cfDNA inputs (millions of coordinate groups).
+        let mut downsampled: Vec<&TemplateMetadata> = Vec::new();
+        let mut ss_groups: HashMap<&str, usize> = HashMap::new();
+        #[allow(clippy::type_complexity)]
+        let mut ds_groups: HashMap<&str, (usize, usize, Vec<(&str, &str)>)> = HashMap::new();
+
         // For each fraction: filter ONCE, then groupBy (like fgbio)
         for (idx, &fraction) in fractions.iter().enumerate() {
             // Filter once per fraction - equivalent to fgbio's downsampledGroup
-            let downsampled: Vec<&TemplateMetadata> =
-                metadata.iter().filter(|m| m.template.hash_fraction <= fraction).collect();
+            downsampled.clear();
+            downsampled.extend(metadata.iter().filter(|m| m.template.hash_fraction <= fraction));
 
             if downsampled.is_empty() {
                 continue;
@@ -319,8 +330,10 @@ impl DuplexMetrics {
             fraction_template_counts[idx] += downsampled.len();
             collectors[idx].record_cs_family(downsampled.len());
 
+            let is_full_fraction = (fraction - 1.0_f64).abs() < 0.01;
+
             // Group by MI tag for SS families (like fgbio's groupBy)
-            let mut ss_groups: HashMap<&str, usize> = HashMap::new();
+            ss_groups.clear();
             for m in &downsampled {
                 *ss_groups.entry(m.template.mi.as_str()).or_default() += 1;
             }
@@ -328,10 +341,12 @@ impl DuplexMetrics {
                 collectors[idx].record_ss_family(ss_size);
             }
 
-            // Group by base_umi for DS families with strand counts
-            // HashMap value: (a_count, b_count, mi_rx_pairs for UMI metrics)
-            #[allow(clippy::type_complexity)]
-            let mut ds_groups: HashMap<&str, (usize, usize, Vec<(&str, &str)>)> = HashMap::new();
+            // Group by base_umi for DS families with strand counts.
+            // HashMap value: (a_count, b_count, mi_rx_pairs for UMI metrics).
+            // The mi/rx pair vec is consumed only at the 100% fraction by
+            // `update_umi_metrics`; skip populating it on downsampled fractions
+            // to avoid O(group_size) wasted pushes per non-full fraction.
+            ds_groups.clear();
             for m in &downsampled {
                 let entry = ds_groups.entry(m.base_umi).or_default();
                 if m.is_a_strand {
@@ -339,11 +354,10 @@ impl DuplexMetrics {
                 } else if m.is_b_strand {
                     entry.1 += 1;
                 }
-                // Collect mi/rx pairs for UMI metrics (only used at 100% fraction)
-                entry.2.push((m.template.mi.as_str(), m.template.rx.as_str()));
+                if is_full_fraction {
+                    entry.2.push((m.template.mi.as_str(), m.template.rx.as_str()));
+                }
             }
-
-            let is_full_fraction = (fraction - 1.0_f64).abs() < 0.01;
 
             for (base_umi, (a_count, b_count, mi_rx_pairs)) in &ds_groups {
                 let ds_size = a_count + b_count;
@@ -354,17 +368,15 @@ impl DuplexMetrics {
 
                 collectors[idx].record_duplex_family(ab_count, ba_count);
 
-                // Only collect UMI metrics for the 100% fraction
+                // Only collect UMI metrics for the 100% fraction. Pass the
+                // (&str, &str) pairs directly — the underlying String storage
+                // lives in `group`, which outlives this call, so the previous
+                // `Vec<(String, String)>` clone was pure overhead.
                 if is_full_fraction {
-                    let owned_pairs: Vec<(String, String)> = mi_rx_pairs
-                        .iter()
-                        .map(|(mi, rx)| ((*mi).to_string(), (*rx).to_string()))
-                        .collect();
-
                     metrics.update_umi_metrics(
                         &mut collectors[idx],
                         umi_consensus_caller,
-                        &owned_pairs,
+                        mi_rx_pairs.as_slice(),
                         base_umi,
                         *a_count,
                         *b_count,
@@ -516,7 +528,7 @@ impl DuplexMetrics {
         &self,
         collector: &mut DuplexMetricsCollector,
         umi_consensus_caller: &mut SimpleUmiConsensusCaller,
-        group_pairs: &[(String, String)],
+        group_pairs: &[(&str, &str)],
         base_umi: &str,
         _a_count: usize,
         _b_count: usize,
@@ -527,7 +539,7 @@ impl DuplexMetrics {
         let mut umi1s = Vec::new();
         let mut umi2s = Vec::new();
 
-        for (mi, rx) in group_pairs {
+        for &(mi, rx) in group_pairs {
             // Check if this MI tag belongs to the current base_umi family
             let mi_base = extract_mi_base(mi);
 
@@ -548,7 +560,9 @@ impl DuplexMetrics {
                 continue;
             }
 
-            // Add UMI parts based on strand
+            // Add UMI parts based on strand. The String allocations here are
+            // bounded by the consensus caller's `&[String]` signature; only the
+            // post-filter (base-matching, non-empty parts) subset is cloned.
             if mi.ends_with("/A") {
                 // For /A strand: u1 goes to umi1s, u2 goes to umi2s
                 umi1s.push(parts[0].to_string());
@@ -591,9 +605,11 @@ impl DuplexMetrics {
             let expected_duplex2 = format!("{}-{}", consensus_umis[1], consensus_umis[0]);
             let error_count = group_pairs
                 .iter()
-                .filter(|(mi, rx)| {
+                .filter(|&&(mi, rx)| {
                     let mi_base = extract_mi_base(mi);
-                    mi_base == base_umi && *rx != expected_duplex1 && *rx != expected_duplex2
+                    mi_base == base_umi
+                        && rx != expected_duplex1.as_str()
+                        && rx != expected_duplex2.as_str()
                 })
                 .count();
 
