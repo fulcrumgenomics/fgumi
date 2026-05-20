@@ -344,10 +344,6 @@ fn test_zipper_bam_mapped_input() {
     for record in &records {
         assert!(record.data().get(&rx_tag).is_some(), "Output record should have RX tag");
     }
-
-    // Verify warning about BAM input was emitted
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("BAM input detected"), "Should warn about BAM input. stderr: {stderr}");
 }
 
 /// Test zipper accepts BAM piped to stdin (auto-detected via BGZF magic bytes).

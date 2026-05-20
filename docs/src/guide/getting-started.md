@@ -52,9 +52,11 @@ This pipes reads through:
 3. `zipper` — merges aligned reads with original unmapped BAM to restore UMI tags
 4. `sort` — sorts into template-coordinate order for grouping
 
-> **Note:** `fgumi zipper` accepts SAM input (piped from the aligner) or a BAM file via `--input`.
-> Piping SAM directly from the aligner is preferred for best performance; BAM input is
-> functional but involves an extra decode step.
+> **Note:** `fgumi zipper` accepts SAM or BAM input, on stdin or via `--input`. For best
+> performance, pipe uncompressed BAM from the aligner (e.g. `bwa-mem3 mem --bam=0`) — this
+> skips both the SAM text formatting on the aligner side and the SAM parsing on the zipper
+> side. SAM is fine for aligners that can't emit BAM; compressed BAM on a pipe is not
+> recommended (wasted CPU on both ends).
 
 For single-cell data, the `CB` cell barcode tag is automatically included in the
 template-coordinate sort key, keeping templates from different cells at the same locus separate:

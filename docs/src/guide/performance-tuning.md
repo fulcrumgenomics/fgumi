@@ -342,8 +342,11 @@ Requested memory 16GB exceeds 90% of system memory (14.4GB)
 - Compression level affects output size significantly
 
 ### Zipper
-- For best throughput, pipe SAM directly from the aligner rather than writing and re-reading a BAM
-- BAM file input is supported via `--input` but adds an extra decode step
+- For best throughput, pipe uncompressed BAM from the aligner (e.g. `bwa-mem3 mem --bam=0`).
+  Uncompressed BAM skips SAM text formatting on the aligner side and SAM parsing on the zipper
+  side, and adds only ~26 bytes of BGZF framing per ~64 KiB block
+- SAM input is fine for aligners that can't emit BAM; compressed BAM on a pipe wastes CPU on
+  both ends for data the sort step will re-compress anyway
 - The zipper pipeline uses raw-byte merging internally: aligned records are not fully decoded and
   re-encoded unless the record actually needs modification, which eliminates a significant CPU
   bottleneck on high-throughput runs
