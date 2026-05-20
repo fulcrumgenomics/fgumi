@@ -819,7 +819,7 @@ impl FastqPipelineConfig {
     /// # Arguments
     /// * `num_threads` - Number of worker threads (minimum 1)
     /// * `inputs_are_bgzf` - True if inputs are BGZF-compressed
-    /// * `compression_level` - BGZF compression level (1-12)
+    /// * `compression_level` - BGZF compression level (0-12; 0 = uncompressed)
     #[must_use]
     pub fn new(num_threads: usize, inputs_are_bgzf: bool, compression_level: u32) -> Self {
         let threads = num_threads.max(1);
@@ -850,13 +850,6 @@ impl FastqPipelineConfig {
     #[must_use]
     pub fn with_stats(mut self, enabled: bool) -> Self {
         self.collect_stats = enabled;
-        self
-    }
-
-    /// Set the compression level for output.
-    #[must_use]
-    pub fn with_compression_level(mut self, level: u32) -> Self {
-        self.compression_level = level.min(12);
         self
     }
 

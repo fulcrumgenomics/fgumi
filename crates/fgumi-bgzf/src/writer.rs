@@ -70,18 +70,20 @@ impl InlineBgzfCompressor {
     /// # Arguments
     ///
     /// * `compression_level` - Compression level (0-12, higher = smaller but slower).
-    ///   Level 0 disables compression (stored deflate blocks), level 1 is the
-    ///   fastest compression, and level 6 is a good balance. Values outside
-    ///   `0..=12` fall back to level 6.
+    ///   Level 0 writes uncompressed (stored) BGZF blocks, level 1 is fastest DEFLATE,
+    ///   level 6 is a good balance.
     ///
     /// # Panics
     ///
-    /// Panics if compression level 6 is rejected by the bgzf library (should never happen).
+    /// Panics if `compression_level` is outside `0..=12`.
     #[must_use]
     pub fn new(compression_level: u32) -> Self {
-        let level = u8::try_from(compression_level).unwrap_or(u8::MAX);
+        let level = u8::try_from(compression_level)
+            .ok()
+            .filter(|&l| l <= 12)
+            .unwrap_or_else(|| panic!("compression level {compression_level} is outside 0..=12"));
         let compression_level_obj = CompressionLevel::new(level)
-            .unwrap_or_else(|_| CompressionLevel::new(6).expect("compression level 6 is valid"));
+            .unwrap_or_else(|_| panic!("bgzf rejected compression level {level}"));
         let compressor = BgzfCompressor::new(compression_level_obj);
         Self {
             buffer: Vec::with_capacity(BGZF_MAX_BLOCK_SIZE),
@@ -434,5 +436,11 @@ mod tests {
         let blocks2 = compressor.take_blocks();
         assert_eq!(blocks2.len(), 1);
         assert_eq!(blocks2[0].serial, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside 0..=12")]
+    fn test_compress_level_out_of_range_panics() {
+        let _ = InlineBgzfCompressor::new(13);
     }
 }
