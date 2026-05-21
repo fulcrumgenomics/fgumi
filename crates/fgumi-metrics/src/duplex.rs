@@ -386,32 +386,33 @@ impl DuplexMetricsCollector {
 
         metrics.sort();
 
-        // Calculate 2D cumulative fractions: fraction of families with AB >= ab AND BA >= ba
-        // This matches fgbio's definition in DuplexFamilySizeMetric
+        // Calculate 2D cumulative fractions: fraction of families with AB >= ab AND BA >= ba.
+        // This matches fgbio's definition in DuplexFamilySizeMetric.
         //
-        // Build a 2D suffix sum grid to avoid O(n²) per-metric iteration.
+        // The previous implementation built a dense `(max_ab+1) × (max_ba+1)` `usize`
+        // grid and ran 2D suffix sums over it. That `O(max_ab × max_ba)` allocation
+        // OOM'd `fgumi duplex-metrics` on real cfDNA inputs whose hottest duplex
+        // family lands in the tens-of-thousands of reads per strand — e.g.
+        // `max_ab = max_ba = 50_000` yields a 20 GiB scratch grid before any
+        // metric is computed.
+        //
+        // `duplex_family_sizes` is sparse: the HashMap typically holds well under
+        // a thousand distinct `(ab, ba)` pairs even on cfDNA-scale inputs, while
+        // `max_ab × max_ba` can run into the billions. Computing each entry's
+        // suffix sum by direct sparse iteration is `O(N²)` in the number of
+        // distinct pairs — for N≈1000 that's ≈10⁶ comparisons, dwarfed by the
+        // I/O cost of getting here, and the grid allocation is gone.
         if total > 0 {
-            let max_ab = self.duplex_family_sizes.keys().map(|(a, _)| *a).max().unwrap_or(0);
-            let max_ba = self.duplex_family_sizes.keys().map(|(_, b)| *b).max().unwrap_or(0);
-            let cols = max_ba + 1;
-            let mut grid = vec![0usize; (max_ab + 1) * cols];
-            for (&(a, b), &count) in &self.duplex_family_sizes {
-                grid[a * cols + b] = count;
-            }
-            // Accumulate suffix sums: first along ba (columns right-to-left),
-            // then along ab (rows bottom-to-top)
-            for a in 0..=max_ab {
-                for b in (0..max_ba).rev() {
-                    grid[a * cols + b] += grid[a * cols + b + 1];
-                }
-            }
-            for b in 0..=max_ba {
-                for a in (0..max_ab).rev() {
-                    grid[a * cols + b] += grid[(a + 1) * cols + b];
-                }
-            }
+            // Snapshot the sparse `(key, count)` pairs once so the inner loop
+            // doesn't re-borrow the HashMap on every iteration.
+            let entries: Vec<((usize, usize), usize)> =
+                self.duplex_family_sizes.iter().map(|(&k, &v)| (k, v)).collect();
             for metric in &mut metrics {
-                let cumulative_count = grid[metric.ab_size * cols + metric.ba_size];
+                let cumulative_count: usize = entries
+                    .iter()
+                    .filter(|((a, b), _)| *a >= metric.ab_size && *b >= metric.ba_size)
+                    .map(|(_, count)| *count)
+                    .sum();
                 metric.fraction_gt_or_eq_size = frac(cumulative_count, total);
             }
         }
@@ -715,6 +716,43 @@ mod tests {
         assert_eq!(metrics[1].ba_size, 2);
         assert_eq!(metrics[2].ab_size, 5);
         assert_eq!(metrics[2].ba_size, 3);
+    }
+
+    /// Regression test for the sparse-vs-dense bug that OOM'd `fgumi
+    /// duplex-metrics` on cfDNA inputs. With a single duplex family at
+    /// `(50_000, 50_000)`, the previous dense-grid implementation would
+    /// allocate a `(50_001 × 50_001) × usize` scratch grid (~20 GiB) to
+    /// compute the cumulative fractions. The sparse implementation
+    /// iterates only the three observed `(ab, ba)` entries and computes
+    /// `fraction_gt_or_eq_size` correctly in microseconds.
+    ///
+    /// The assertions verify behaviour; the implicit assertion is that
+    /// the test completes without OOM, which guards against any future
+    /// refactor reintroducing an `O(max_ab × max_ba)` allocation.
+    #[test]
+    fn test_duplex_family_size_metrics_sparse_hot_spot() {
+        let mut collector = DuplexMetricsCollector::new(false);
+        collector.record_duplex_family(2, 1);
+        collector.record_duplex_family(5, 3);
+        collector.record_duplex_family(50_000, 50_000);
+
+        let metrics = collector.duplex_family_size_metrics();
+        assert_eq!(metrics.len(), 3, "exactly 3 sparse entries, not max_ab × max_ba");
+
+        // Sorted ascending by (ab, ba): (2,1) → (5,3) → (50000, 50000).
+        let total = 3.0_f64;
+        // (2, 1): all three entries have ab≥2 ∧ ba≥1.
+        assert_eq!(metrics[0].ab_size, 2);
+        assert_eq!(metrics[0].ba_size, 1);
+        assert!((metrics[0].fraction_gt_or_eq_size - 3.0 / total).abs() < 1e-9);
+        // (5, 3): only (5, 3) and (50000, 50000) satisfy.
+        assert_eq!(metrics[1].ab_size, 5);
+        assert_eq!(metrics[1].ba_size, 3);
+        assert!((metrics[1].fraction_gt_or_eq_size - 2.0 / total).abs() < 1e-9);
+        // (50000, 50000): only itself satisfies.
+        assert_eq!(metrics[2].ab_size, 50_000);
+        assert_eq!(metrics[2].ba_size, 50_000);
+        assert!((metrics[2].fraction_gt_or_eq_size - 1.0 / total).abs() < 1e-9);
     }
 
     #[test]

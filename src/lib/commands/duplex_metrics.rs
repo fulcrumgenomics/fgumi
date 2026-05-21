@@ -8,7 +8,7 @@
 
 use crate::commands::common::parse_bool;
 use crate::logging::OperationTimer;
-use crate::metrics::duplex::{DuplexMetricsCollector, DuplexYieldMetric};
+use crate::metrics::duplex::{DuplexMetricsCollector, DuplexYieldMetric, FamilySizeMetric};
 use crate::simple_umi_consensus::SimpleUmiConsensusCaller;
 use crate::umi::extract_mi_base;
 use crate::validation::validate_file_exists;
@@ -305,11 +305,28 @@ impl DuplexMetrics {
         // Pre-compute metadata once for the entire group
         let metadata = compute_template_metadata(group);
 
+        // Hoist scratch buffers outside the 20-fraction loop. `HashMap::clear()`
+        // preserves the outer bucket array across iterations — that's the
+        // dominant allocator win on real cfDNA inputs with millions of
+        // coordinate groups, and is the same pattern
+        // `simplex_metrics::process_coordinate_group` already uses for its
+        // `ss_groups` map.
+        //
+        // The inner `Vec<(&str, &str)>` stored as `ds_groups` entry.2 is
+        // still freed per entry on `.clear()`. Combined with the
+        // `is_full_fraction` gate below, that inner Vec now allocates exactly
+        // once per coordinate group (at the 100% fraction) rather than once
+        // per fraction × per `or_default()` slot.
+        let mut downsampled: Vec<&TemplateMetadata> = Vec::new();
+        let mut ss_groups: HashMap<&str, usize> = HashMap::new();
+        #[allow(clippy::type_complexity)]
+        let mut ds_groups: HashMap<&str, (usize, usize, Vec<(&str, &str)>)> = HashMap::new();
+
         // For each fraction: filter ONCE, then groupBy (like fgbio)
         for (idx, &fraction) in fractions.iter().enumerate() {
             // Filter once per fraction - equivalent to fgbio's downsampledGroup
-            let downsampled: Vec<&TemplateMetadata> =
-                metadata.iter().filter(|m| m.template.hash_fraction <= fraction).collect();
+            downsampled.clear();
+            downsampled.extend(metadata.iter().filter(|m| m.template.hash_fraction <= fraction));
 
             if downsampled.is_empty() {
                 continue;
@@ -319,8 +336,10 @@ impl DuplexMetrics {
             fraction_template_counts[idx] += downsampled.len();
             collectors[idx].record_cs_family(downsampled.len());
 
+            let is_full_fraction = (fraction - 1.0_f64).abs() < 0.01;
+
             // Group by MI tag for SS families (like fgbio's groupBy)
-            let mut ss_groups: HashMap<&str, usize> = HashMap::new();
+            ss_groups.clear();
             for m in &downsampled {
                 *ss_groups.entry(m.template.mi.as_str()).or_default() += 1;
             }
@@ -328,10 +347,12 @@ impl DuplexMetrics {
                 collectors[idx].record_ss_family(ss_size);
             }
 
-            // Group by base_umi for DS families with strand counts
-            // HashMap value: (a_count, b_count, mi_rx_pairs for UMI metrics)
-            #[allow(clippy::type_complexity)]
-            let mut ds_groups: HashMap<&str, (usize, usize, Vec<(&str, &str)>)> = HashMap::new();
+            // Group by base_umi for DS families with strand counts.
+            // HashMap value: (a_count, b_count, mi_rx_pairs for UMI metrics).
+            // The mi/rx pair vec is consumed only at the 100% fraction by
+            // `update_umi_metrics`; skip populating it on downsampled fractions
+            // to avoid O(group_size) wasted pushes per non-full fraction.
+            ds_groups.clear();
             for m in &downsampled {
                 let entry = ds_groups.entry(m.base_umi).or_default();
                 if m.is_a_strand {
@@ -339,11 +360,10 @@ impl DuplexMetrics {
                 } else if m.is_b_strand {
                     entry.1 += 1;
                 }
-                // Collect mi/rx pairs for UMI metrics (only used at 100% fraction)
-                entry.2.push((m.template.mi.as_str(), m.template.rx.as_str()));
+                if is_full_fraction {
+                    entry.2.push((m.template.mi.as_str(), m.template.rx.as_str()));
+                }
             }
-
-            let is_full_fraction = (fraction - 1.0_f64).abs() < 0.01;
 
             for (base_umi, (a_count, b_count, mi_rx_pairs)) in &ds_groups {
                 let ds_size = a_count + b_count;
@@ -354,17 +374,15 @@ impl DuplexMetrics {
 
                 collectors[idx].record_duplex_family(ab_count, ba_count);
 
-                // Only collect UMI metrics for the 100% fraction
+                // Only collect UMI metrics for the 100% fraction. Pass the
+                // (&str, &str) pairs directly — the underlying String storage
+                // lives in `group`, which outlives this call, so the previous
+                // `Vec<(String, String)>` clone was pure overhead.
                 if is_full_fraction {
-                    let owned_pairs: Vec<(String, String)> = mi_rx_pairs
-                        .iter()
-                        .map(|(mi, rx)| ((*mi).to_string(), (*rx).to_string()))
-                        .collect();
-
                     metrics.update_umi_metrics(
                         &mut collectors[idx],
                         umi_consensus_caller,
-                        &owned_pairs,
+                        mi_rx_pairs.as_slice(),
                         base_umi,
                         *a_count,
                         *b_count,
@@ -407,12 +425,17 @@ impl DuplexMetrics {
             .map(|m| m.count)
             .sum();
 
-        // Calculate ideal fraction
-        let ds_family_sizes: Vec<usize> =
-            family_size_metrics.iter().flat_map(|m| vec![m.family_size; m.ds_count]).collect();
-
-        let ideal_fraction = Self::calculate_ideal_duplex_fraction(
-            &ds_family_sizes,
+        // Calculate ideal fraction directly from the per-size DS counts. The
+        // previous implementation flat-mapped each `family_size_metric` into a
+        // `Vec<usize>` containing `m.family_size` repeated `m.ds_count` times,
+        // then iterated that flat Vec computing one `Binomial::cdf` per entry.
+        // For inputs with even one family that ran into the tens-of-thousands
+        // of reads the flat Vec adds tens of MB and the inner loop recomputes
+        // the *same* binomial probability `ds_count` times for every distinct
+        // family size. Iterating the per-size buckets is mathematically
+        // equivalent: each family size's contribution is `prob × ds_count`.
+        let ideal_fraction = Self::calculate_ideal_duplex_fraction_per_size(
+            &family_size_metrics,
             self.min_ab_reads,
             self.min_ba_reads,
         );
@@ -448,36 +471,47 @@ impl DuplexMetrics {
         }
     }
 
-    /// Calculates the ideal duplex fraction using binomial model.
+    /// Calculates the ideal duplex fraction directly from per-family-size
+    /// counts, weighting each family size's probability by its DS count
+    /// instead of materializing a flat `Vec<usize>` of repeated sizes.
     ///
-    /// For each family of size N, calculates the probability that both strands
-    /// have sufficient reads (A >= `min_ab` AND B >= `min_ba` where A + B = N).
-    /// Assumes each read has 0.5 probability of being on each strand.
-    fn calculate_ideal_duplex_fraction(
-        family_sizes: &[usize],
+    /// For each family size N with `ds_count` observations, calculates the
+    /// probability that both strands have sufficient reads
+    /// (A >= `min_ab` AND B >= `min_ba` where A + B = N), assuming each read
+    /// has 0.5 probability of being on each strand. The numerator
+    /// accumulates `prob × ds_count` per unique size; the denominator is the
+    /// total number of DS family observations.
+    ///
+    /// This is mathematically equivalent to the previous
+    /// `calculate_ideal_duplex_fraction(&[usize])` form but avoids both the
+    /// `vec![size; ds_count]` allocation and the redundant `Binomial::cdf`
+    /// recomputation for repeated family sizes.
+    fn calculate_ideal_duplex_fraction_per_size(
+        family_size_metrics: &[FamilySizeMetric],
         min_ab: usize,
         min_ba: usize,
     ) -> f64 {
-        if family_sizes.is_empty() {
+        let total_families: usize = family_size_metrics.iter().map(|m| m.ds_count).sum();
+        if total_families == 0 {
             return 0.0;
         }
 
         let mut ideal_duplexes = 0.0;
-        let total_families = family_sizes.len() as f64;
 
-        for &size in family_sizes {
+        for m in family_size_metrics {
+            if m.ds_count == 0 {
+                continue;
+            }
+            let size = m.family_size;
             if size < min_ab + min_ba {
                 // Impossible to form a duplex with this family size
                 continue;
             }
 
             // Calculate P(A >= min_ab AND B >= min_ba) where A ~ Binomial(n=size, p=0.5)
-            // and B = size - A
-            //
-            // This is equivalent to: P(min_ba <= A <= size - min_ab)
-            // = P(A <= size - min_ab) - P(A < min_ba)
-            // = CDF(size - min_ab) - CDF(min_ba - 1)
-
+            // and B = size - A. Equivalent to:
+            //   P(min_ba <= A <= size - min_ab)
+            //   = CDF(size - min_ab) - CDF(min_ba - 1)
             let binomial = match Binomial::new(0.5, size as u64) {
                 Ok(b) => b,
                 Err(_) => continue, // Skip if binomial creation fails
@@ -486,7 +520,6 @@ impl DuplexMetrics {
             let upper_bound = size - min_ba;
             let lower_bound = min_ab;
 
-            // P(A >= lower_bound AND A <= upper_bound)
             let prob = if upper_bound >= lower_bound {
                 let p_upper = binomial.cdf(upper_bound as u64);
                 let p_lower =
@@ -496,10 +529,10 @@ impl DuplexMetrics {
                 0.0
             };
 
-            ideal_duplexes += prob;
+            ideal_duplexes += prob * (m.ds_count as f64);
         }
 
-        ideal_duplexes / total_families
+        ideal_duplexes / (total_families as f64)
     }
 
     /// Updates UMI metrics for a duplex family
@@ -516,7 +549,7 @@ impl DuplexMetrics {
         &self,
         collector: &mut DuplexMetricsCollector,
         umi_consensus_caller: &mut SimpleUmiConsensusCaller,
-        group_pairs: &[(String, String)],
+        group_pairs: &[(&str, &str)],
         base_umi: &str,
         _a_count: usize,
         _b_count: usize,
@@ -527,7 +560,7 @@ impl DuplexMetrics {
         let mut umi1s = Vec::new();
         let mut umi2s = Vec::new();
 
-        for (mi, rx) in group_pairs {
+        for &(mi, rx) in group_pairs {
             // Check if this MI tag belongs to the current base_umi family
             let mi_base = extract_mi_base(mi);
 
@@ -548,7 +581,9 @@ impl DuplexMetrics {
                 continue;
             }
 
-            // Add UMI parts based on strand
+            // Add UMI parts based on strand. The String allocations here are
+            // bounded by the consensus caller's `&[String]` signature; only the
+            // post-filter (base-matching, non-empty parts) subset is cloned.
             if mi.ends_with("/A") {
                 // For /A strand: u1 goes to umi1s, u2 goes to umi2s
                 umi1s.push(parts[0].to_string());
@@ -591,9 +626,11 @@ impl DuplexMetrics {
             let expected_duplex2 = format!("{}-{}", consensus_umis[1], consensus_umis[0]);
             let error_count = group_pairs
                 .iter()
-                .filter(|(mi, rx)| {
+                .filter(|&&(mi, rx)| {
                     let mi_base = extract_mi_base(mi);
-                    mi_base == base_umi && *rx != expected_duplex1 && *rx != expected_duplex2
+                    mi_base == base_umi
+                        && rx != expected_duplex1.as_str()
+                        && rx != expected_duplex2.as_str()
                 })
                 .count();
 
