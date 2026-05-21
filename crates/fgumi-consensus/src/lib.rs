@@ -87,4 +87,6 @@ pub(crate) use vanilla_caller::{
 pub use duplex_caller::{DuplexConsensusCaller, DuplexConsensusRead};
 
 #[cfg(feature = "codec")]
-pub use codec_caller::{CodecConsensusCaller, CodecConsensusOptions, CodecConsensusStats};
+pub use codec_caller::{
+    CodecConsensusCaller, CodecConsensusError, CodecConsensusOptions, CodecConsensusStats,
+};

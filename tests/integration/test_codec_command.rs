@@ -7,6 +7,7 @@
 //! 4. Quality filtering options
 
 use fgumi_bam_io::create_raw_bam_writer;
+use fgumi_dna::reverse_complement;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
 use noodles::bam;
@@ -475,4 +476,177 @@ fn test_codec_command_cell_barcode_preservation() {
     }
 
     assert!(consensus_count > 0, "Should have produced at least one consensus read");
+}
+
+/// Builds an FR CODEC pair with R1 and R2 covering an offset window so that
+/// `start2 - start1` positions on each side fall outside the duplex overlap and
+/// register as duplex disagreements (matching the unit-level `create_fr_pair`
+/// in `crates/fgumi-consensus/src/codec_caller.rs`). Used by the
+/// duplex-disagreement reject tests to drive `Codec::run` end-to-end through
+/// the typed `CodecConsensusError` recovery path (issue #338).
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn create_offset_codec_pair(name: &str, umi: &str) -> (RawRecord, RawRecord) {
+    // 40bp synthetic reference; R1 covers ref[0..30] (positions 1..30),
+    // R2 covers ref[10..40] (positions 11..40). Overlap is ref[10..30] = 20bp;
+    // 10 single-strand positions on each side count as duplex disagreements.
+    const REF: &[u8; 40] = b"AAAAAAAAAACCCCCCCCCCGGGGGGGGGGTTTTTTTTTT";
+    const READ_LEN: usize = 30;
+    const QUAL: u8 = 35;
+
+    let r1_seq = REF[..READ_LEN].to_vec();
+    let r2_seq_fwd = REF[10..10 + READ_LEN].to_vec();
+    // R2 is the reverse strand; BAM stores its sequence as reverse-complement
+    // of the reference window so that single-strand consensus matches REF.
+    let r2_seq = reverse_complement(&r2_seq_fwd);
+    let cigar_op = (READ_LEN as u32) << 4; // 30M
+
+    let r1_pos = 0_i32; // 0-based pos for ref position 1
+    let r2_pos = 10_i32; // 0-based pos for ref position 11
+    let mc_tag = format!("{READ_LEN}M");
+    // Insert size from leftmost (R1) to rightmost (R2 + read length).
+    let template_len = (10 + READ_LEN) as i32;
+
+    let mut b1 = SamBuilder::new();
+    b1.read_name(name.as_bytes())
+        .sequence(&r1_seq)
+        .qualities(&[QUAL; READ_LEN])
+        .cigar_ops(&[cigar_op])
+        .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT | raw_flags::MATE_REVERSE)
+        .ref_id(0)
+        .pos(r1_pos)
+        .mapq(60)
+        .mate_ref_id(0)
+        .mate_pos(r2_pos)
+        .template_length(template_len)
+        .add_string_tag(SamTag::MI, umi.as_bytes())
+        .add_string_tag(SamTag::MC, mc_tag.as_bytes());
+
+    let mut b2 = SamBuilder::new();
+    b2.read_name(name.as_bytes())
+        .sequence(&r2_seq)
+        .qualities(&[QUAL; READ_LEN])
+        .cigar_ops(&[cigar_op])
+        .flags(raw_flags::PAIRED | raw_flags::LAST_SEGMENT | raw_flags::REVERSE)
+        .ref_id(0)
+        .pos(r2_pos)
+        .mapq(60)
+        .mate_ref_id(0)
+        .mate_pos(r1_pos)
+        .template_length(-template_len)
+        .add_string_tag(SamTag::MI, umi.as_bytes())
+        .add_string_tag(SamTag::MC, mc_tag.as_bytes());
+
+    (b1.build(), b2.build())
+}
+
+/// Verifies that the single-threaded `Codec::run` path recovers from a
+/// duplex-disagreement molecule via the typed `CodecConsensusError` instead
+/// of bailing — covers `src/lib/commands/codec.rs:383-397` (issue #338).
+#[test]
+fn test_codec_command_recovers_from_duplex_disagreement() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    // Single offset pair → 20 single-strand positions = 20 disagreements,
+    // which trips the count threshold below.
+    let (r1, r2) = create_offset_codec_pair("disagree_read", "UMI_DISAGREE");
+    create_codec_test_bam(&input_bam, vec![(r1, r2)]);
+
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "codec",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--min-reads",
+            "1",
+            "--min-duplex-length",
+            "1",
+            // Strict: any disagreement rejects the molecule. Forces
+            // `is_duplex_disagreement()` to return true so the loop
+            // continues instead of returning the wrapped error.
+            "--max-duplex-disagreements",
+            "0",
+            "--compression-level",
+            "1",
+        ])
+        .status()
+        .expect("Failed to run codec command");
+
+    assert!(
+        status.success(),
+        "Codec command must succeed when only failure is a recoverable reject"
+    );
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let _header = reader.read_header().unwrap();
+    let consensus_count = reader.records().count();
+    assert_eq!(consensus_count, 0, "Disagreeing molecule should produce no consensus");
+}
+
+/// Verifies that the parallel `Codec::execute_threads_mode` path recovers
+/// from a duplex-disagreement molecule via the typed `CodecConsensusError`
+/// — covers `src/lib/commands/codec.rs:617-630` (issue #338) which the
+/// single-threaded test above does not exercise.
+#[test]
+fn test_codec_command_recovers_from_duplex_disagreement_threaded() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+
+    let (r1, r2) = create_offset_codec_pair("disagree_read_mt", "UMI_DISAGREE_MT");
+    create_codec_test_bam(&input_bam, vec![(r1, r2)]);
+
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "codec",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--rejects",
+            rejects_bam.to_str().unwrap(),
+            "--threads",
+            "2",
+            "--min-reads",
+            "1",
+            "--min-duplex-length",
+            "1",
+            "--max-duplex-disagreements",
+            "0",
+            "--compression-level",
+            "1",
+        ])
+        .status()
+        .expect("Failed to run codec command");
+
+    assert!(
+        status.success(),
+        "Threaded codec command must succeed when only failure is a recoverable reject"
+    );
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let _header = reader.read_header().unwrap();
+    let consensus_count = reader.records().count();
+    assert_eq!(consensus_count, 0, "Disagreeing molecule should produce no consensus");
+
+    // Exercising --rejects forces the parallel-mode `flush_byte_records`
+    // call inside the typed-disagreement arm (`is_duplex_disagreement()`
+    // branch in `execute_threads_mode`). The current behavior is that the
+    // disagreement short-circuit in `consensus_reads_typed` returns the
+    // typed error before populating `rejected_reads`, so the file is
+    // created but stays empty — match that here without baking the
+    // open question (whether disagreement-failed reads *should* land in
+    // --rejects) into the test.
+    assert!(rejects_bam.exists(), "Rejects BAM file should be created");
+    let mut rejects_reader = bam::io::Reader::new(fs::File::open(&rejects_bam).unwrap());
+    let _ = rejects_reader.read_header().unwrap();
+    let reject_count = rejects_reader.records().count();
+    assert_eq!(
+        reject_count, 0,
+        "Disagreement short-circuits before reject tracking; rejects file is empty"
+    );
 }

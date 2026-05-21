@@ -29,4 +29,6 @@ pub use fgumi_consensus::{
 pub use fgumi_consensus::{DuplexConsensusCaller, DuplexConsensusRead};
 
 #[cfg(feature = "codec")]
-pub use fgumi_consensus::{CodecConsensusCaller, CodecConsensusOptions, CodecConsensusStats};
+pub use fgumi_consensus::{
+    CodecConsensusCaller, CodecConsensusError, CodecConsensusOptions, CodecConsensusStats,
+};

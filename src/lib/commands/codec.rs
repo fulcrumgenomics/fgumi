@@ -32,9 +32,9 @@ use super::common::{
     build_pipeline_config, serialize_raw_bam_records,
 };
 use crate::consensus::codec_caller::{
-    CodecConsensusCaller, CodecConsensusOptions, CodecConsensusStats,
+    CodecConsensusCaller, CodecConsensusError, CodecConsensusOptions, CodecConsensusStats,
 };
-use crate::consensus_caller::{ConsensusCaller, ConsensusOutput};
+use crate::consensus_caller::ConsensusOutput;
 use crate::logging::{OperationTimer, log_consensus_summary};
 use crate::mi_group::{MiGroup, MiGroupBatch, MiGroupIterator, MiGrouper};
 use crate::read_info::LibraryIndex;
@@ -241,6 +241,25 @@ pub struct Codec {
     pub queue_memory: QueueMemoryOptions,
 }
 
+/// Decide how the single-thread codec loop should handle a typed
+/// [`CodecConsensusError`]: silently swallow recoverable duplex-disagreement
+/// rejects (so the loop continues) and surface any other variant as a fatal
+/// `anyhow::Error` with UMI context.
+///
+/// Extracted from the inline `match` arm so the `Other`-variant branch can be
+/// unit-tested. That branch is unreachable from valid CLI input today —
+/// `consensus_reads_raw` only returns `Other` when `ss_caller.consensus_call`
+/// propagates an error, and the public API gates against the conditions that
+/// trigger it (see `crates/fgumi-consensus/src/vanilla_caller.rs`).
+fn recover_or_propagate_codec_error(e: CodecConsensusError, umi: &str) -> Result<()> {
+    if e.is_duplex_disagreement() {
+        Ok(())
+    } else {
+        Err(anyhow::Error::from(e))
+            .with_context(|| format!("Failed to call consensus for UMI: {umi}"))
+    }
+}
+
 impl Command for Codec {
     fn execute(&self, command_line: &str) -> Result<()> {
         // Validate inputs
@@ -392,7 +411,11 @@ impl Command for Codec {
             let (umi, records) = result.context("Failed to read MI group")?;
 
             // Call consensus directly — records are already RawRecord values.
-            let result: anyhow::Result<ConsensusOutput> = caller.consensus_reads(records);
+            // `consensus_reads_typed` returns a typed `CodecConsensusError` so we
+            // can distinguish recoverable duplex disagreements from genuine
+            // failures without string matching (see issue #338).
+            let result: std::result::Result<ConsensusOutput, CodecConsensusError> =
+                caller.consensus_reads_typed(records);
             match result {
                 Ok(output) => {
                     let batch_size = output.count;
@@ -403,12 +426,7 @@ impl Command for Codec {
                         .context("Failed to write consensus read")?;
                     progress.log_if_needed(batch_size as u64);
                 }
-                Err(e) => {
-                    if !e.to_string().contains("duplex disagreement") {
-                        return Err(e)
-                            .with_context(|| format!("Failed to call consensus for UMI: {umi}"));
-                    }
-                }
+                Err(e) => recover_or_propagate_codec_error(e, &umi)?,
             }
 
             // Write rejected reads if tracking is enabled (already raw BAM bytes)
@@ -585,7 +603,11 @@ impl Codec {
                 caller.clear();
 
                 // Call CODEC consensus directly — records are already RawRecord values.
-                let result: anyhow::Result<ConsensusOutput> = caller.consensus_reads(records);
+                // `consensus_reads_typed` returns a typed `CodecConsensusError` so we
+                // can distinguish recoverable duplex disagreements from genuine
+                // failures without string matching (see issue #338).
+                let result: std::result::Result<ConsensusOutput, CodecConsensusError> =
+                    caller.consensus_reads_typed(records);
                 match result {
                     Ok(batch_output) => {
                         all_output.merge(batch_output);
@@ -599,7 +621,7 @@ impl Codec {
                     Err(e) => {
                         // Handle duplex disagreement errors by merging stats and
                         // preserving rejects so --rejects output matches single-threaded mode.
-                        if e.to_string().contains("duplex disagreement") {
+                        if e.is_duplex_disagreement() {
                             batch_stats.merge(caller.statistics());
                             if track_rejects {
                                 for raw in caller.take_rejected_reads() {
@@ -1314,5 +1336,43 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// `recover_or_propagate_codec_error` must let
+    /// [`CodecConsensusError::DuplexDisagreementCount`] flow through as `Ok(())`
+    /// so the single-thread codec loop continues processing the next MI group.
+    #[test]
+    fn test_recover_or_propagate_codec_error_swallows_disagreement_count() {
+        let err = CodecConsensusError::DuplexDisagreementCount { disagreements: 42 };
+        recover_or_propagate_codec_error(err, "UMI_X")
+            .expect("disagreement-count must be recoverable");
+    }
+
+    /// Same as above for the rate variant.
+    #[test]
+    fn test_recover_or_propagate_codec_error_swallows_disagreement_rate() {
+        let err = CodecConsensusError::DuplexDisagreementRate { rate: 0.42 };
+        recover_or_propagate_codec_error(err, "UMI_Y")
+            .expect("disagreement-rate must be recoverable");
+    }
+
+    /// The `Other` variant (any non-disagreement failure) must be propagated as
+    /// a fatal `anyhow::Error` with the UMI threaded into the context. Covers
+    /// the codec.rs propagation branch that's unreachable from valid CLI input
+    /// today (issue #338).
+    #[test]
+    fn test_recover_or_propagate_codec_error_propagates_other_with_umi_context() {
+        let err = CodecConsensusError::Other(anyhow::anyhow!("synthetic upstream failure"));
+        let result = recover_or_propagate_codec_error(err, "UMI_FATAL");
+        let propagated = result.expect_err("non-disagreement variant must propagate");
+        let chain = format!("{propagated:#}");
+        assert!(
+            chain.contains("Failed to call consensus for UMI: UMI_FATAL"),
+            "context must include the UMI; got: {chain}"
+        );
+        assert!(
+            chain.contains("synthetic upstream failure"),
+            "underlying source must be preserved; got: {chain}"
+        );
     }
 }

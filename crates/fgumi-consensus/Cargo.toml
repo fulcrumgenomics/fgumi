@@ -15,6 +15,7 @@ bstr = "1.12.1"
 log = "0"
 noodles = { version = "0.106.0", features = ["bam", "sam", "core"] }
 rand = "0.10"
+thiserror = "2"
 wide = "1.1"
 fgumi-dna = { workspace = true }
 fgumi-sam = { workspace = true }
