@@ -153,8 +153,9 @@ Key points:
 - `-K 150000000` sets batch size (improves reproducibility)
 - **`-Y` is critical**: Use soft-clipping for supplementary alignments to preserve bases
 - `fgumi zipper` transfers tags from unmapped BAM to aligned reads
-- `fgumi zipper` accepts SAM piped from the aligner (preferred) or a BAM file via `--input`;
-  piping SAM avoids an extra encode/decode step
+- `fgumi zipper` accepts SAM or BAM on stdin or `--input`. For best performance, pipe
+  uncompressed BAM from the aligner (e.g. `bwa-mem3 mem --bam=0`); SAM is fine for aligners
+  that can't emit BAM
 
 For large files, add threading:
 

@@ -38,7 +38,7 @@ fgumi fastq --input unaligned.bam \
   | fgumi sort --output sorted.bam --order template-coordinate
 ```
 
-This replaces multiple separate fgbio/picard steps (SortBam, ZipperBams/MergeBamAlignment) with a single streaming pass. `fgumi zipper` accepts SAM piped from the aligner (preferred) or a BAM file via `--input`.
+This replaces multiple separate fgbio/picard steps (SortBam, ZipperBams/MergeBamAlignment) with a single streaming pass. `fgumi zipper` accepts SAM or BAM on stdin or via `--input`; for best performance, pipe uncompressed BAM from the aligner (e.g. `bwa-mem3 mem --bam=0`).
 
 ### Merging Multiple BAMs
 

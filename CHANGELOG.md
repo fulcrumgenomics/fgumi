@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Documentation
+
+- Recommend uncompressed BAM (`bwa-mem3 mem --bam=0`) as the preferred `fgumi zipper` input format for streaming pipelines, with SAM kept as a fallback for aligners that can't emit BAM. Replaced the misleading "BAM input is discouraged" `warn!` on the stdin-BAM path with a neutral `info!`, and dropped the equivalent warning on the file-BAM path. Updated `zipper` CLI help/long_about and the getting-started, best-practices, performance-tuning, and migration-from-fgbio guides accordingly.
+
 ### Bug Fixes
 
 - [**breaking**] `fgumi group`, `fgumi dedup`, and `fgumi downsample` now strictly require template-coordinate sorted input — the header must advertise `SO:unsorted`, `GO:query`, **and** `SS:template-coordinate`. The previous implementation accepted any `SO:unsorted GO:query` header even without `SS:template-coordinate`, which caused `fgumi extract` output (FASTQ-order, no `SS`) and other queryname-grouped BAMs to be silently treated as template-coordinate sorted. Because the streaming `RecordPositionGrouper` requires records sharing a position key to be consecutive, this could split a single true molecule across multiple position groups and assign distinct `MI` tags to reads that should share one. The `--allow-unmapped` queryname-sort shortcut has also been removed for the same reason. To migrate: insert `fgumi sort --order template-coordinate` between extract (or any non-TC source) and `fgumi group`/`dedup`/`downsample`.

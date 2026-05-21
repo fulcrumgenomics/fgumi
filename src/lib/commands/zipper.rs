@@ -62,7 +62,7 @@ use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::{RawBamReaderAuto, create_raw_bam_reader, create_raw_bam_writer, is_stdin_path};
 use fgumi_raw_bam;
 use fgumi_raw_bam::{BAM_BASE_TO_ASCII, RawRecord, RawRecordView, RecordBufEncoder};
-use log::{debug, info, warn};
+use log::{debug, info};
 use noodles::core::Position;
 use noodles::sam::Header;
 use std::collections::HashSet;
@@ -105,13 +105,25 @@ Named tag sets like "Consensus" are automatically expanded to their constituent 
 By default, input is read from stdin and output is written to stdout, allowing for streaming
 workflows like:
 
-  bwa mem -t 8 -p -K 150000000 -Y ref.fa reads.fq | fgumi zipper -u unmapped.bam -r ref.fa | fgumi sort -i /dev/stdin -o output.bam --order template-coordinate
+  # Recommended when the aligner can emit uncompressed BAM:
+  bwa-mem3 mem --bam=0 -t 16 -p -K 150000000 -Y ref.fa reads.fq | fgumi zipper -u unmapped.bam -r ref.fa | fgumi sort -i /dev/stdin -o output.bam --order template-coordinate
+
+  # SAM-only aligners (e.g. classic bwa mem, bwa-mem2):
+  bwa mem -t 16 -p -K 150000000 -Y ref.fa reads.fq | fgumi zipper -u unmapped.bam -r ref.fa | fgumi sort -i /dev/stdin -o output.bam --order template-coordinate
+
+Uncompressed BAM avoids the SAM text formatting/parsing round-trip in both processes
+and adds only ~26 bytes of BGZF framing per ~64 KiB block. Compressed BAM on a pipe
+is not recommended — it burns CPU on the writer and reader for data the sort step
+will re-compress anyway.
 "#
 )]
 #[command(verbatim_doc_comment)]
 pub struct Zipper {
     /// Input mapped SAM or BAM file (or `-` for stdin; SAM or BAM is auto-detected).
-    /// BAM input is discouraged; prefer piping SAM directly from the aligner for best performance.
+    /// For streaming pipelines, uncompressed BAM (e.g. `bwa-mem3 mem --bam=0`) is the
+    /// fastest option — it skips both SAM text formatting on the aligner side and SAM
+    /// parsing on this side. SAM is fine if your aligner can't emit BAM. Compressed
+    /// BAM on a pipe wastes CPU on both ends.
     #[arg(short = 'i', long, default_value = "-")]
     pub input: PathBuf,
 
@@ -1055,10 +1067,7 @@ impl Command for Zipper {
             let (is_bgzf, stdin) = peek_stdin_bgzf(stdin)?;
             let buffered = BufReader::with_capacity(64 * 1024, stdin);
             if is_bgzf {
-                warn!(
-                    "BAM input detected on stdin. For best performance, pipe SAM directly \
-                     from the aligner (e.g. bwa mem ... | fgumi zipper ...)."
-                );
+                info!("Reading BAM from stdin");
                 let bgzf = noodles::bgzf::io::Reader::new(buffered);
                 let mut bam_reader = noodles::bam::io::Reader::from(bgzf);
                 let header = bam_reader.read_header()?;
@@ -1076,11 +1085,6 @@ impl Command for Zipper {
                 (MappedReader::Sam(sam_reader), header)
             }
         } else if self.input.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("bam")) {
-            // BAM file input — functional but discouraged
-            warn!(
-                "BAM input detected for --input. For best performance, pipe SAM directly \
-                 from the aligner (e.g. bwa mem ... | fgumi zipper ...)."
-            );
             let (raw_reader, header) = create_raw_bam_reader(&self.input, self.threads)?;
             (MappedReader::Bam(raw_reader), header)
         } else {
