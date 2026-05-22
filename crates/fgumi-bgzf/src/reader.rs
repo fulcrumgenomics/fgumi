@@ -2,7 +2,10 @@
 //!
 //! This module provides low-level functions for reading raw BGZF blocks
 //! without decompressing them, and for decompressing blocks using libdeflater.
-//! This enables parallel decompression in worker threads.
+//! For deflate **stored** blocks (`BTYPE = 00`), the payload is copied
+//! directly into the output buffer without invoking libdeflater — see
+//! [`decompress_block_into`]. This separation also enables parallel
+//! decompression in worker threads.
 //!
 //! # BGZF Format
 //!
@@ -302,7 +305,9 @@ fn verify_decompression(
 
 /// Decompress a raw BGZF block.
 ///
-/// Uses libdeflater for high-performance decompression.
+/// Uses libdeflater for high-performance decompression, with a fast path that
+/// skips libdeflater for deflate stored blocks (`BTYPE = 00`) — see
+/// [`decompress_block_into`] for details.
 ///
 /// # Arguments
 ///
@@ -315,7 +320,7 @@ fn verify_decompression(
 ///
 /// # Errors
 ///
-/// Returns an error if decompression fails.
+/// Returns an error if decompression fails or CRC32 verification fails.
 pub fn decompress_block(
     block: &RawBgzfBlock,
     decompressor: &mut Decompressor,
@@ -336,6 +341,16 @@ pub fn decompress_block(
 /// This variant avoids allocation by reusing the provided buffer.
 /// The decompressed data is appended to `output`, which should be pre-sized
 /// or have sufficient capacity.
+///
+/// Blocks whose deflate payload is a single **stored** sub-block
+/// (`BTYPE = 00`) take a fast path: the LEN bytes of payload are copied
+/// straight into `output`, skipping the libdeflater call. Real producers
+/// that emit stored blocks include `samtools view -u`, htsjdk's level-0
+/// writer, and our own [`InlineBgzfCompressor::new(0)`](crate::writer::InlineBgzfCompressor::new).
+/// CRC32 verification against the BGZF footer still runs on the copied bytes;
+/// a CRC or size mismatch leaves `output` rolled back to its original length.
+///
+/// EOF marker blocks and blocks with `ISIZE == 0` are no-ops.
 ///
 /// # Arguments
 ///
@@ -368,7 +383,12 @@ pub fn decompress_block_into(
 /// Decompress a BGZF block from raw bytes into a provided buffer.
 ///
 /// This variant accepts a raw byte slice directly, avoiding the need to
-/// construct a `RawBgzfBlock` (and its associated allocation).
+/// construct a `RawBgzfBlock` (and its associated allocation). Like
+/// [`decompress_block_into`], it transparently picks the stored-block fast
+/// path for deflate `BTYPE = 00` blocks.
+///
+/// Slices that are too short to contain a BGZF header + footer, or whose
+/// footer reports `ISIZE == 0`, are no-ops.
 ///
 /// # Arguments
 ///
@@ -378,7 +398,7 @@ pub fn decompress_block_into(
 ///
 /// # Errors
 ///
-/// Returns an error if decompression fails.
+/// Returns an error if decompression fails or CRC32 verification fails.
 pub fn decompress_block_slice_into(
     data: &[u8],
     decompressor: &mut Decompressor,
@@ -403,10 +423,35 @@ pub fn decompress_block_slice_into(
     )
 }
 
-/// Decompress raw deflate data into the output buffer and verify the result.
+/// Decompress (or copy, for deflate stored blocks) BGZF block data into the
+/// output buffer and verify the result.
 ///
 /// This is the shared implementation for both [`decompress_block_into`] and
-/// [`decompress_block_slice_into`], consolidating the decompress + resize + verify logic.
+/// [`decompress_block_slice_into`], consolidating the decompress + resize +
+/// verify logic.
+///
+/// Includes a fast path for deflate **stored** blocks (`BTYPE = 00`): the
+/// uncompressed payload is copied straight into `output` (delegated to
+/// [`copy_stored_and_verify`]), bypassing libdeflater. Producers like
+/// `samtools view -u`, htsjdk's level-0 writer, and our own
+/// [`InlineBgzfCompressor::new(0)`](crate::writer::InlineBgzfCompressor::new)
+/// emit these. CRC32 verification still runs on the copied bytes.
+///
+/// On any error (decompress failure, size mismatch, CRC mismatch, malformed
+/// stored framing), `output` is rolled back to its original length so partial
+/// data never leaks to callers.
+///
+/// # Arguments
+///
+/// * `compressed` - The deflate-framed payload between the BGZF header and
+///   footer (i.e. what [`RawBgzfBlock::compressed_data`] returns).
+/// * `uncompressed_size` - The expected decompressed length, from the BGZF
+///   footer's ISIZE field.
+/// * `expected_crc` - The expected CRC32, from the BGZF footer.
+/// * `block_len` - Total BGZF block length, used only for error messages.
+/// * `decompressor` - Reusable libdeflater decompressor (unused on the
+///   stored-block path).
+/// * `output` - Buffer that the decompressed bytes are appended to.
 fn decompress_and_verify(
     compressed: &[u8],
     uncompressed_size: usize,
@@ -415,6 +460,26 @@ fn decompress_and_verify(
     decompressor: &mut Decompressor,
     output: &mut Vec<u8>,
 ) -> io::Result<()> {
+    // Stored-block fast path. The deflate frame for a stored block is:
+    //   byte 0   : BFINAL | BTYPE | (5 padding bits to next byte boundary)
+    //   bytes 1-2: LEN  (little-endian, u16)
+    //   bytes 3-4: NLEN (one's complement of LEN; not checked here — the
+    //              BGZF footer's CRC32/ISIZE are authoritative)
+    //   bytes 5..: LEN bytes of uncompressed payload
+    // BTYPE lives in bits 1-2 of the first byte, so `b & 0b110 == 0` means
+    // "stored". `payload_len == LEN + 5` is the structural guarantee that
+    // there's exactly one stored sub-block spanning the BGZF payload — the
+    // form every real level-0 producer emits.
+    if !compressed.is_empty() && compressed[0] & 0b110 == 0 {
+        return copy_stored_and_verify(
+            compressed,
+            uncompressed_size,
+            expected_crc,
+            block_len,
+            output,
+        );
+    }
+
     let start = output.len();
     output.resize(start + uncompressed_size, 0);
 
@@ -435,6 +500,86 @@ fn decompress_and_verify(
         )
     })();
 
+    if result.is_err() {
+        output.truncate(start);
+    }
+    result
+}
+
+/// Decompress a deflate **stored** sub-block by copying its payload directly
+/// into `output`, skipping libdeflater.
+///
+/// The caller is responsible for confirming that `compressed[0]` has
+/// `BTYPE = 00` before calling — this function then validates the rest of
+/// the stored framing:
+///
+/// * `compressed.len() >= 5` (room for the BFINAL/BTYPE byte + LEN + NLEN).
+/// * `LEN + 5 == compressed.len()` — exactly one stored sub-block fills the
+///   BGZF payload. Every real level-0 producer (`samtools view -u`, htsjdk,
+///   [`InlineBgzfCompressor`](crate::writer::InlineBgzfCompressor)) emits
+///   this shape. We intentionally do **not** fall back to libdeflater if
+///   this check fails: the input is either malformed or uses a multi-sub-
+///   block stored stream we have no real-world reason to support, and a
+///   loud error beats silently papering over corruption.
+/// * `LEN == uncompressed_size` — the deflate frame's LEN agrees with the
+///   BGZF footer's ISIZE field.
+///
+/// NLEN (one's complement of LEN) is not checked. NLEN doesn't cover the
+/// payload bytes, so a corrupt NLEN with an intact payload would pass the
+/// framing check anyway; the BGZF footer's CRC32 is the authoritative
+/// integrity check on the data itself.
+///
+/// CRC32 verification against the BGZF footer is still performed on the
+/// copied bytes (the BGZF spec mandates it, and the bypass is intended to
+/// skip the libdeflater call, not the integrity check).
+///
+/// On any framing or verification failure, `output` is rolled back to its
+/// original length.
+fn copy_stored_and_verify(
+    compressed: &[u8],
+    uncompressed_size: usize,
+    expected_crc: u32,
+    block_len: usize,
+    output: &mut Vec<u8>,
+) -> io::Result<()> {
+    // Deflate framing is 5 bytes (BFINAL/BTYPE byte + LEN + NLEN).
+    if compressed.len() < 5 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "BGZF stored block too small: {} bytes (need >= 5 for deflate framing)",
+                compressed.len()
+            ),
+        ));
+    }
+    let len = usize::from(u16::from_le_bytes([compressed[1], compressed[2]]));
+    // For a well-formed level-0 BGZF block, the entire payload is one stored
+    // sub-block: 5 framing bytes + LEN payload bytes. If this doesn't hold,
+    // the file is malformed (or contains a multi-sub-block stream, which no
+    // real producer emits at level 0).
+    if len + 5 != compressed.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("BGZF stored block size mismatch: LEN={len}, payload={}", compressed.len()),
+        ));
+    }
+    if len != uncompressed_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("BGZF stored block ISIZE mismatch: footer={uncompressed_size}, LEN={len}"),
+        ));
+    }
+
+    let start = output.len();
+    // `len + 5 == compressed.len()` is checked above, so `&compressed[5..]`
+    // is exactly the LEN payload bytes.
+    output.extend_from_slice(&compressed[5..]);
+    let result = verify_decompression(
+        &output[start..start + len],
+        uncompressed_size,
+        expected_crc,
+        block_len,
+    );
     if result.is_err() {
         output.truncate(start);
     }
@@ -615,5 +760,197 @@ mod tests {
         assert!(result.is_err());
         // The output buffer should be rolled back to its original length
         assert_eq!(output, vec![1, 2, 3]);
+    }
+
+    /// Level-0 BGZF blocks contain a deflate **stored** sub-block — the reader
+    /// must round-trip these without invoking libdeflater.
+    #[test]
+    fn test_decompress_stored_block_roundtrip() {
+        use crate::writer::InlineBgzfCompressor;
+
+        // Picked to span more than one BGZF block so we exercise multi-block decode.
+        let original: Vec<u8> = (0u32..(100 * 1024)).map(|i| (i % 251) as u8).collect();
+        let mut compressor = InlineBgzfCompressor::new(0);
+        compressor.write_all(&original).expect("write");
+        compressor.flush().expect("flush");
+        let blocks = compressor.take_blocks();
+        assert!(blocks.len() >= 2, "expected at least two blocks for >64 KiB at level 0");
+
+        // Sanity: each block's payload should look like a stored deflate frame —
+        // first byte's BTYPE bits (1-2) are 00.
+        for cb in &blocks {
+            let block = RawBgzfBlock { data: cb.data.clone() };
+            let payload = block.compressed_data();
+            assert!(!payload.is_empty(), "stored block payload must be non-empty");
+            assert_eq!(payload[0] & 0b110, 0, "stored block should have BTYPE=00");
+        }
+
+        let mut decompressor = Decompressor::new();
+        let mut out = Vec::with_capacity(original.len());
+        for cb in &blocks {
+            let block = RawBgzfBlock { data: cb.data.clone() };
+            decompress_block_into(&block, &mut decompressor, &mut out).expect("decompress");
+        }
+        assert_eq!(out, original);
+    }
+
+    /// Same round-trip via [`decompress_block_slice_into`], which is on the
+    /// hot path for fastq pipelines (avoids materialising a `RawBgzfBlock`).
+    #[test]
+    fn test_decompress_stored_block_slice_into_roundtrip() {
+        use crate::writer::InlineBgzfCompressor;
+
+        let original = b"stored slice payload bytes here";
+        let mut compressor = InlineBgzfCompressor::new(0);
+        compressor.write_all(original).expect("write");
+        compressor.flush().expect("flush");
+        let blocks = compressor.take_blocks();
+        assert_eq!(blocks.len(), 1);
+
+        let mut decompressor = Decompressor::new();
+        let mut out = Vec::new();
+        decompress_block_slice_into(&blocks[0].data, &mut decompressor, &mut out)
+            .expect("decompress");
+        assert_eq!(out.as_slice(), original.as_slice());
+    }
+
+    /// A stored block whose `LEN` field disagrees with the BGZF payload size
+    /// is malformed; the fast path should reject it (rather than silently
+    /// truncating or falling through to libdeflater). This exercises the
+    /// `len + 5 != compressed.len()` branch in `copy_stored_and_verify`.
+    #[test]
+    fn test_decompress_stored_block_rejects_bad_len() {
+        use crate::writer::InlineBgzfCompressor;
+
+        let original = b"stored len mismatch case";
+        let mut compressor = InlineBgzfCompressor::new(0);
+        compressor.write_all(original).expect("write");
+        compressor.flush().expect("flush");
+        let blocks = compressor.take_blocks();
+        let mut data = blocks[0].data.clone();
+
+        // Corrupt LEN inside the deflate frame (compressed payload starts at
+        // BGZF_HEADER_SIZE; the LEN field is bytes 1-2 of the deflate frame).
+        let len_off = BGZF_HEADER_SIZE + 1;
+        data[len_off] = data[len_off].wrapping_add(1);
+
+        let mut decompressor = Decompressor::new();
+        let mut out = vec![0xAA, 0xBB];
+        let err = decompress_block_slice_into(&data, &mut decompressor, &mut out)
+            .expect_err("expected malformed stored block to be rejected");
+        assert!(
+            err.to_string().contains("stored block"),
+            "error should mention stored block: {err}"
+        );
+        // Output buffer must be rolled back on failure.
+        assert_eq!(out, vec![0xAA, 0xBB]);
+    }
+
+    /// A stored block whose payload bytes round-trip cleanly through the
+    /// framing checks but whose BGZF footer CRC32 is wrong must still be
+    /// rejected — the bypass skips libdeflater, not the integrity check.
+    /// Exercises `verify_decompression` failure on the stored-block path,
+    /// including the output-buffer rollback in `copy_stored_and_verify`.
+    #[test]
+    fn test_decompress_stored_block_rejects_bad_crc() {
+        use crate::writer::InlineBgzfCompressor;
+
+        let original = b"stored crc check payload bytes";
+        let mut compressor = InlineBgzfCompressor::new(0);
+        compressor.write_all(original).expect("write");
+        compressor.flush().expect("flush");
+        let blocks = compressor.take_blocks();
+        let mut data = blocks[0].data.clone();
+
+        // Corrupt the CRC32 field in the footer (last 8 bytes; CRC32 is the
+        // first 4 of those, ISIZE is the last 4). Flipping a single bit is
+        // enough to make verification fail.
+        let crc_off = data.len() - BGZF_FOOTER_SIZE;
+        data[crc_off] ^= 0x01;
+
+        let mut decompressor = Decompressor::new();
+        let mut out = vec![0xDE, 0xAD];
+        let err = decompress_block_slice_into(&data, &mut decompressor, &mut out)
+            .expect_err("expected CRC mismatch to be rejected");
+        assert!(err.to_string().contains("CRC32"), "error should mention CRC32: {err}");
+        // Output buffer must be rolled back on failure.
+        assert_eq!(out, vec![0xDE, 0xAD]);
+    }
+
+    /// A stored block whose deflate LEN agrees with the wire payload size
+    /// but disagrees with the BGZF footer's ISIZE must be rejected.
+    /// Exercises the `len != uncompressed_size` branch in
+    /// `copy_stored_and_verify`.
+    #[test]
+    fn test_decompress_stored_block_rejects_isize_mismatch() {
+        use crate::writer::InlineBgzfCompressor;
+
+        let original = b"stored isize mismatch case";
+        let mut compressor = InlineBgzfCompressor::new(0);
+        compressor.write_all(original).expect("write");
+        compressor.flush().expect("flush");
+        let blocks = compressor.take_blocks();
+        let mut data = blocks[0].data.clone();
+
+        // Corrupt the low byte of ISIZE in the footer (last 4 bytes of the
+        // 8-byte footer). LEN inside the deflate frame and the wire payload
+        // size remain consistent, so we land in the `len != uncompressed_size`
+        // check rather than the framing-size check.
+        let isize_off = data.len() - 4;
+        data[isize_off] = data[isize_off].wrapping_add(1);
+
+        let mut decompressor = Decompressor::new();
+        let mut out = Vec::new();
+        let err = decompress_block_slice_into(&data, &mut decompressor, &mut out)
+            .expect_err("expected ISIZE mismatch to be rejected");
+        assert!(
+            err.to_string().contains("ISIZE mismatch"),
+            "error should mention ISIZE mismatch: {err}"
+        );
+        assert!(out.is_empty(), "output should be rolled back on failure");
+    }
+
+    /// A BGZF block whose compressed payload is fewer than 5 bytes can't
+    /// contain a valid deflate stored frame (BFINAL/BTYPE byte + LEN + NLEN
+    /// = 5 bytes minimum). The bypass guards against this. We can't
+    /// construct such an input via `InlineBgzfCompressor` (which always
+    /// emits valid frames), so we synthesise one byte by byte.
+    #[test]
+    fn test_decompress_stored_block_rejects_truncated_framing() {
+        // Build a BGZF block with a 4-byte compressed payload (zeros — first
+        // byte has BTYPE=00 so we enter the stored fast path), an ISIZE of 1
+        // in the footer so the wrapper doesn't short-circuit on
+        // `uncompressed_size == 0`, and a CRC of 0 (we never reach the CRC
+        // check). Layout: 18-byte header + 4-byte payload + 8-byte footer
+        // = 30 bytes total.
+        const BLOCK_SIZE: usize = BGZF_HEADER_SIZE + 4 + BGZF_FOOTER_SIZE;
+        let mut data = vec![0u8; BLOCK_SIZE];
+        // gzip magic + deflate method + FEXTRA flag.
+        data[0] = 0x1f;
+        data[1] = 0x8b;
+        data[2] = 0x08;
+        data[3] = 0x04;
+        // BC subfield ID.
+        data[12] = b'B';
+        data[13] = b'C';
+        // BSIZE = total_block_size - 1, little-endian u16 at offset 16.
+        let bsize_bytes = u16::try_from(BLOCK_SIZE - 1).expect("block fits in u16").to_le_bytes();
+        data[16] = bsize_bytes[0];
+        data[17] = bsize_bytes[1];
+        // Payload bytes 18..22 stay zero from the vec init — first byte's
+        // BTYPE bits (1-2) are 00 so we enter the stored-block fast path.
+        // Footer: CRC32 = 0 (unused — we error before checking it). ISIZE = 1
+        // so `decompress_block_into` doesn't skip on `isize == 0`.
+        data[BLOCK_SIZE - 4] = 1;
+
+        let mut decompressor = Decompressor::new();
+        let mut out = Vec::new();
+        let err = decompress_block_slice_into(&data, &mut decompressor, &mut out)
+            .expect_err("expected truncated stored framing to be rejected");
+        assert!(
+            err.to_string().contains("stored block too small"),
+            "error should mention truncated stored framing: {err}"
+        );
+        assert!(out.is_empty(), "output should be rolled back on failure");
     }
 }
