@@ -1,12 +1,16 @@
 //! Integration tests for the group command with new metrics infrastructure.
+//!
+//! These tests invoke `GroupReadsByUmi::execute()` in-process.
 
+use clap::Parser;
 use fgoxide::io::DelimFile;
+use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::group::GroupReadsByUmi;
 use fgumi_lib::metrics::UmiGroupingMetrics;
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, create_umi_family, to_record_buf};
@@ -23,26 +27,23 @@ fn test_group_command_writes_new_metrics() {
     create_test_input_bam(&input_bam);
 
     // Run the group command
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "group",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--strategy",
-            "identity",
-            "--edits",
-            "0",
-            "--grouping-metrics",
-            metrics_file.to_str().unwrap(),
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run group command");
-
-    assert!(status.success(), "Group command failed");
+    let cmd = GroupReadsByUmi::try_parse_from([
+        "group",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--edits",
+        "0",
+        "--grouping-metrics",
+        metrics_file.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse group args");
+    cmd.execute("test").expect("Failed to run group command");
     assert!(output_bam.exists(), "Output BAM not created");
     assert!(metrics_file.exists(), "Metrics file not created");
 
@@ -78,26 +79,23 @@ fn test_group_command_rejects_n_bases_in_umi() {
     // Create BAM with UMIs containing N bases
     create_test_bam_with_n_umis(&input_bam);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "group",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--strategy",
-            "identity",
-            "--edits",
-            "0",
-            "--grouping-metrics",
-            metrics_file.to_str().unwrap(),
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run group command");
-
-    assert!(status.success());
+    let cmd = GroupReadsByUmi::try_parse_from([
+        "group",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--edits",
+        "0",
+        "--grouping-metrics",
+        metrics_file.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse group args");
+    cmd.execute("test").expect("Failed to run group command");
 
     // Read metrics and verify N rejection tracking
     let metrics: Vec<UmiGroupingMetrics> =

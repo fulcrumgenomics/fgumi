@@ -1,19 +1,21 @@
-//! End-to-end CLI tests for the correct command.
+//! End-to-end tests for the correct command.
 //!
-//! These tests run the actual `fgumi correct` binary and validate:
+//! These tests invoke `CorrectUmis::execute()` in-process and validate:
 //! 1. Basic UMI correction against a whitelist
 //! 2. Metrics output
 //! 3. Rejected reads output
 
+use clap::Parser;
+use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::correct::CorrectUmis;
+use fgumi_raw_bam::RawRecord;
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, create_umi_family, to_record_buf};
-use fgumi_raw_bam::RawRecord;
 
 /// Write a BAM with UMI-tagged reads.
 fn create_umi_bam(path: &PathBuf, families: Vec<Vec<RawRecord>>) {
@@ -51,26 +53,23 @@ fn test_correct_command_basic() {
     create_umi_bam(&input_bam, vec![correct_reads, error_reads]);
     create_whitelist(&whitelist, &["ACGTACGT"]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "correct",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--umi-files",
-            whitelist.to_str().unwrap(),
-            "--max-mismatches",
-            "1",
-            "--min-distance",
-            "1",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run correct command");
-
-    assert!(status.success(), "Correct command failed");
+    let cmd = CorrectUmis::try_parse_from([
+        "correct",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--umi-files",
+        whitelist.to_str().unwrap(),
+        "--max-mismatches",
+        "1",
+        "--min-distance",
+        "1",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse correct args");
+    cmd.execute("test").expect("Correct command failed");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // Verify output has records
@@ -93,28 +92,25 @@ fn test_correct_command_with_metrics() {
     create_umi_bam(&input_bam, vec![reads]);
     create_whitelist(&whitelist, &["ACGTACGT"]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "correct",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--umi-files",
-            whitelist.to_str().unwrap(),
-            "--max-mismatches",
-            "1",
-            "--min-distance",
-            "1",
-            "--metrics",
-            metrics.to_str().unwrap(),
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run correct command");
-
-    assert!(status.success(), "Correct command with metrics failed");
+    let cmd = CorrectUmis::try_parse_from([
+        "correct",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--umi-files",
+        whitelist.to_str().unwrap(),
+        "--max-mismatches",
+        "1",
+        "--min-distance",
+        "1",
+        "--metrics",
+        metrics.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse correct args");
+    cmd.execute("test").expect("Correct command with metrics failed");
     assert!(metrics.exists(), "Metrics file not created");
 
     let content = fs::read_to_string(&metrics).unwrap();
@@ -136,28 +132,25 @@ fn test_correct_command_with_rejects() {
     create_umi_bam(&input_bam, vec![correctable, uncorrectable]);
     create_whitelist(&whitelist, &["ACGTACGT"]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "correct",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--umi-files",
-            whitelist.to_str().unwrap(),
-            "--max-mismatches",
-            "1",
-            "--min-distance",
-            "1",
-            "--rejects",
-            rejects_bam.to_str().unwrap(),
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run correct command");
-
-    assert!(status.success(), "Correct command with rejects failed");
+    let cmd = CorrectUmis::try_parse_from([
+        "correct",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--umi-files",
+        whitelist.to_str().unwrap(),
+        "--max-mismatches",
+        "1",
+        "--min-distance",
+        "1",
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse correct args");
+    cmd.execute("test").expect("Correct command with rejects failed");
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 }
 
@@ -205,30 +198,27 @@ fn test_correct_command_rejects_streaming_threaded_integrity() {
     create_umi_bam(&input_bam, vec![corr_small, corr_big, far_a, far_b, far_c]);
     create_whitelist(&whitelist, &["ACGTACGT"]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "correct",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--umi-files",
-            whitelist.to_str().unwrap(),
-            "--max-mismatches",
-            "1",
-            "--min-distance",
-            "1",
-            "--rejects",
-            rejects_bam.to_str().unwrap(),
-            "--threads",
-            "4",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run correct command");
-
-    assert!(status.success(), "Correct command with threaded rejects failed");
+    let cmd = CorrectUmis::try_parse_from([
+        "correct",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--umi-files",
+        whitelist.to_str().unwrap(),
+        "--max-mismatches",
+        "1",
+        "--min-distance",
+        "1",
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--threads",
+        "4",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse correct args");
+    cmd.execute("test").expect("Correct command with threaded rejects failed");
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 
     crate::helpers::assertions::assert_has_bgzf_eof(&rejects_bam);

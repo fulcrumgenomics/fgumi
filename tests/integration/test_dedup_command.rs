@@ -1,17 +1,19 @@
-//! End-to-end CLI tests for the dedup command.
+//! End-to-end tests for the dedup command.
 //!
-//! These tests run the actual `fgumi dedup` binary and validate:
+//! These tests invoke `MarkDuplicates::execute()` in-process and validate:
 //! 1. Basic duplicate marking
 //! 2. Metrics output
 //! 3. Remove duplicates mode
 
+use clap::Parser;
+use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::dedup::MarkDuplicates;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
@@ -95,22 +97,19 @@ fn test_dedup_command_basic() {
     records.extend(create_duplicate_group("dup2", "TGCATGCA", 2, 500));
     create_sorted_bam(&input_bam, records);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "dedup",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--strategy",
-            "identity",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run dedup command");
-
-    assert!(status.success(), "Dedup command failed");
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+    cmd.execute("test").expect("Dedup command failed");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // All reads should be present (duplicates are marked, not removed)
@@ -131,24 +130,21 @@ fn test_dedup_command_with_metrics() {
     let records = create_duplicate_group("dup1", "ACGTACGT", 3, 100);
     create_sorted_bam(&input_bam, records);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "dedup",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--strategy",
-            "identity",
-            "--metrics",
-            metrics_path.to_str().unwrap(),
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run dedup command");
-
-    assert!(status.success(), "Dedup command with metrics failed");
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--metrics",
+        metrics_path.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+    cmd.execute("test").expect("Dedup command with metrics failed");
     assert!(metrics_path.exists(), "Metrics file not created");
 }
 
@@ -163,23 +159,20 @@ fn test_dedup_command_remove_duplicates() {
     let records = create_duplicate_group("dup1", "ACGTACGT", 3, 100);
     create_sorted_bam(&input_bam, records);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "dedup",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--strategy",
-            "identity",
-            "--remove-duplicates",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run dedup command");
-
-    assert!(status.success(), "Dedup command with --remove-duplicates failed");
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--remove-duplicates",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+    cmd.execute("test").expect("Dedup command with --remove-duplicates failed");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // With remove-duplicates, only the best pair should remain
@@ -200,9 +193,6 @@ fn test_dedup_command_remove_duplicates() {
 #[allow(clippy::too_many_lines)]
 fn test_dedup_no_umi_large_position_group() {
     use bstr::BString;
-    use clap::Parser;
-    use fgumi_lib::commands::command::Command as FgumiCommand;
-    use fgumi_lib::commands::dedup::MarkDuplicates;
     use fgumi_raw_bam::raw_record_to_record_buf;
     use fgumi_raw_bam::{SamBuilder as RawSamBuilder, flags, testutil::encode_op};
     use noodles::sam::Header;
