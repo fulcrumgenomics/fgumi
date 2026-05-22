@@ -198,14 +198,20 @@ impl Command for Fastq {
         // Refuse to clobber the input BAM. `File::create(path)` truncates
         // before the input is opened in `run_with_writer`, so an `--output`
         // pointing at the same file silently destroys the input data.
-        if let Some(output) = &self.output
-            && output == &self.input
-        {
-            anyhow::bail!(
-                "--output {} must differ from --input {} (would truncate the input BAM)",
-                output.display(),
-                self.input.display()
-            );
+        // Lexical equality catches the obvious case; canonicalising both
+        // sides also catches `./in.bam` vs `in.bam`, symlinks, and absolute
+        // vs relative paths pointing at the same file.
+        if let Some(output) = &self.output {
+            let same_path = output == &self.input
+                || (output.exists()
+                    && std::fs::canonicalize(output)? == std::fs::canonicalize(&self.input)?);
+            if same_path {
+                anyhow::bail!(
+                    "--output {} must differ from --input {} (would truncate the input BAM)",
+                    output.display(),
+                    self.input.display()
+                );
+            }
         }
 
         // Use 64MB buffer for efficient pipe throughput.
