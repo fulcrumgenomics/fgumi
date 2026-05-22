@@ -55,7 +55,7 @@ fn compress_block(
 pub struct ParallelGzipConfig {
     /// Number of compression threads.
     pub compression_threads: usize,
-    /// Compression level (1-12, default 6).
+    /// Compression level (0-12, default 6; 0 = uncompressed).
     pub compression_level: u8,
     /// Queue size for pending blocks (default: 2 * threads).
     pub queue_size: Option<usize>,

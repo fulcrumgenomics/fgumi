@@ -552,7 +552,7 @@ impl IndexingBamWriter {
 /// # Arguments
 /// * `path` - Path for the output BAM file
 /// * `header` - SAM header (must have coordinate sort order)
-/// * `compression_level` - BGZF compression level (1-12)
+/// * `compression_level` - BGZF compression level (0-12; 0 = uncompressed)
 /// * `threads` - Number of compression threads (minimum 1)
 ///
 /// # Returns
@@ -623,7 +623,7 @@ pub fn write_bai_index<P: AsRef<Path>>(path: P, index: &bai::Index) -> Result<()
 /// * `path` - Path for the output BAM file (use `-` or `/dev/stdout` for stdout)
 /// * `header` - SAM header to write
 /// * `threads` - Number of threads for BGZF compression (1 = single-threaded)
-/// * `compression_level` - Compression level (1-12)
+/// * `compression_level` - Compression level (0-12; 0 = uncompressed)
 ///
 /// # Returns
 /// A BAM writer with the header already written.
@@ -672,7 +672,7 @@ pub fn create_bam_writer<P: AsRef<Path>>(
 /// * `path` - Optional path for the output BAM file
 /// * `header` - SAM header to write
 /// * `threads` - Number of threads for BGZF compression (1 = single-threaded)
-/// * `compression_level` - Compression level (1-12)
+/// * `compression_level` - Compression level (0-12; 0 = uncompressed)
 ///
 /// # Returns
 /// An optional BAM writer, or None if path is None.

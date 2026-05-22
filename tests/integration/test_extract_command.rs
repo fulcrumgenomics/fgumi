@@ -14,6 +14,7 @@ use flate2::write::GzEncoder;
 use noodles::bam;
 use noodles::sam::alignment::RecordBuf;
 use noodles_bgzf::io::Writer as BgzfWriter;
+use rstest::rstest;
 use tempfile::TempDir;
 
 /// Type alias for FASTQ test records (name, sequence, quality).
@@ -1218,4 +1219,91 @@ fn test_extract_bgzf_unequal_block_counts() {
             records.len()
         );
     }
+}
+
+// ============================================================================
+// Compression Level Boundary Tests (issue #360)
+// ============================================================================
+
+/// `--compression-level 0` must produce a valid, readable BAM through both the
+/// single- and multi-threaded unified-pipeline paths. Byte-level correctness
+/// (stored vs DEFLATE blocks) is asserted by the `InlineBgzfCompressor` unit
+/// tests in `crates/fgumi-bgzf`.
+#[rstest]
+#[case::single_threaded(1)]
+#[case::multi_threaded(4)]
+fn test_extract_compression_level_zero(#[case] threads: usize) {
+    let tmp = TempDir::new().unwrap();
+    let (r1_records, r2_records) = paired_end_records();
+    let r1 = create_gzip_fastq(&tmp, "r1.fq.gz", &r1_records);
+    let r2 = create_gzip_fastq(&tmp, "r2.fq.gz", &r2_records);
+    let output = tmp.path().join("output.bam");
+
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "extract",
+            "--inputs",
+            r1.to_str().unwrap(),
+            r2.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--read-structures",
+            "5M+T",
+            "5M+T",
+            "--sample",
+            "test_sample",
+            "--library",
+            "test_library",
+            "--threads",
+            &threads.to_string(),
+            "--compression-level",
+            "0",
+        ])
+        .status()
+        .expect("Failed to execute extract command");
+
+    assert!(status.success(), "Extract with --compression-level 0 failed at T{threads}");
+
+    let records = read_bam_records(&output);
+    assert_eq!(records.len(), 6, "Expected 6 records at T{threads}");
+}
+
+/// `--compression-level` values outside `0..=12` must be rejected by clap
+/// before any work is done, with a range-validation error on stderr.
+#[test]
+fn test_extract_compression_level_out_of_range_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let (r1_records, r2_records) = paired_end_records();
+    let r1 = create_gzip_fastq(&tmp, "r1.fq.gz", &r1_records);
+    let r2 = create_gzip_fastq(&tmp, "r2.fq.gz", &r2_records);
+    let output = tmp.path().join("output.bam");
+
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "extract",
+            "--inputs",
+            r1.to_str().unwrap(),
+            r2.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--read-structures",
+            "5M+T",
+            "5M+T",
+            "--sample",
+            "test_sample",
+            "--library",
+            "test_library",
+            "--compression-level",
+            "13",
+        ])
+        .output()
+        .expect("Failed to execute extract command");
+
+    assert!(!result.status.success(), "Extract with --compression-level 13 should have failed");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("0..=12") || stderr.contains("invalid value"),
+        "Expected clap range-validation error mentioning `0..=12` or `invalid value`, \
+         got stderr: {stderr}"
+    );
 }

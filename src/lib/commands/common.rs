@@ -418,11 +418,13 @@ pub struct ThreadingOptions {
 /// Controls BGZF compression level for BAM output files.
 #[derive(Debug, Clone, Default, Args)]
 pub struct CompressionOptions {
-    /// Compression level for output BAM (1-12).
+    /// Compression level for output BAM (0-12).
     ///
-    /// Level 1 is fastest with larger files.
+    /// Level 0 writes uncompressed BGZF (valid BAM, no DEFLATE) — useful for
+    /// piped/intermediate outputs where downstream tools will recompress.
+    /// Level 1 is fastest DEFLATE with larger files.
     /// Level 12 produces smallest files but is slowest.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(0..=12))]
     pub compression_level: u32,
 }
 
