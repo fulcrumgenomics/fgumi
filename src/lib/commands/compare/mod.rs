@@ -14,6 +14,17 @@ use clap::{Parser, Subcommand};
 pub use bams::CompareBams;
 pub use metrics::CompareMetrics;
 
+/// Marker error returned when a compare subcommand detects a mismatch between
+/// the two inputs.
+///
+/// The CLI maps this to exit code 1 so the shell contract is preserved.
+/// In-process callers (e.g. integration tests running under `cargo-llvm-cov`) can
+/// downcast an `anyhow::Error` to this type to distinguish "mismatch found" from a
+/// genuine I/O or logic error.
+#[derive(Debug, thiserror::Error)]
+#[error("compare detected a mismatch: {0}")]
+pub struct CompareMismatch(pub String);
+
 /// Compare files for testing and validation.
 #[derive(Parser, Debug)]
 #[command(

@@ -227,7 +227,11 @@ impl Command for CompareMetrics {
                             line_num
                         );
                     }
-                    std::process::exit(1);
+                    return Err(super::CompareMismatch(format!(
+                        "metrics files differ: {} has extra lines",
+                        self.file1.display()
+                    ))
+                    .into());
                 }
                 (None, Some(_)) => {
                     // File2 has more lines
@@ -240,7 +244,11 @@ impl Command for CompareMetrics {
                             line_num
                         );
                     }
-                    std::process::exit(1);
+                    return Err(super::CompareMismatch(format!(
+                        "metrics files differ: {} has extra lines",
+                        self.file2.display()
+                    ))
+                    .into());
                 }
                 (Some(Err(e)), _) | (_, Some(Err(e))) => {
                     return Err(anyhow::anyhow!(
@@ -275,7 +283,7 @@ impl Command for CompareMetrics {
             Ok(())
         } else {
             info!("Metrics files differ");
-            std::process::exit(1);
+            Err(super::CompareMismatch("metrics files differ".to_owned()).into())
         }
     }
 }

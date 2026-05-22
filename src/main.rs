@@ -17,6 +17,8 @@ use fgumi_lib::commands::codec::Codec;
 use fgumi_lib::commands::command::Command;
 #[cfg(feature = "compare")]
 use fgumi_lib::commands::compare::Compare;
+#[cfg(feature = "compare")]
+use fgumi_lib::commands::compare::CompareMismatch;
 use fgumi_lib::commands::correct::CorrectUmis;
 use fgumi_lib::commands::dedup::MarkDuplicates;
 use fgumi_lib::commands::downsample::Downsample;
@@ -205,5 +207,15 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or(default_level)).init();
 
     info!("Running fgumi version {}", fgumi_lib::version::VERSION.as_str());
-    args.subcommand.execute(&command_line)
+
+    let result = args.subcommand.execute(&command_line);
+
+    #[cfg(feature = "compare")]
+    if let Err(ref e) = result {
+        if e.downcast_ref::<CompareMismatch>().is_some() {
+            std::process::exit(1);
+        }
+    }
+
+    result
 }

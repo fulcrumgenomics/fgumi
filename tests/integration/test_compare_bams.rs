@@ -3,6 +3,9 @@
 //! These tests exercise all three compare modes (content, full, grouping)
 //! using the raw byte comparison path.
 
+use clap::Parser;
+use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::compare::{CompareBams, CompareMismatch};
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
@@ -28,7 +31,11 @@ fn write_bam(path: &Path, header: &Header, records: &[RawRecord]) {
     writer.try_finish().expect("Failed to finish BAM");
 }
 
-/// Runs `fgumi compare bams` and returns (success, stdout).
+/// Runs `fgumi compare bams` via subprocess and returns (success, stdout).
+///
+/// Used by tests that assert on specific substrings in the diagnostic report
+/// (e.g. EQUIVALENT vs IDENTICAL, mismatch counts). For tests that only need
+/// to know whether the BAMs matched, prefer `run_compare_in_process`.
 fn run_compare(bam1: &Path, bam2: &Path, mode: &str, extra_args: &[&str]) -> (bool, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
         .args(["compare", "bams"])
@@ -41,6 +48,22 @@ fn run_compare(bam1: &Path, bam2: &Path, mode: &str, extra_args: &[&str]) -> (bo
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     (output.status.success(), stdout)
+}
+
+/// Runs `CompareBams::execute()` in-process and returns true on match
+/// (IDENTICAL or EQUIVALENT), false on `CompareMismatch` (DIFFER).
+///
+/// Panics if `execute` returns any other error.
+fn run_compare_in_process(bam1: &Path, bam2: &Path, mode: &str, extra_args: &[&str]) -> bool {
+    let mut args: Vec<&str> =
+        vec!["bams", bam1.to_str().unwrap(), bam2.to_str().unwrap(), "--mode", mode];
+    args.extend(extra_args);
+    let cmd = CompareBams::try_parse_from(args).expect("failed to parse compare bams args");
+    match cmd.execute("test") {
+        Ok(()) => true,
+        Err(e) if e.is::<CompareMismatch>() => false,
+        Err(e) => panic!("compare bams hit unexpected error: {e:#}"),
+    }
 }
 
 /// Builds a simple mapped record with a given name and position.
@@ -83,9 +106,10 @@ fn test_content_mode_identical_bams() {
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
 
-    let (success, stdout) = run_compare(&bam1, &bam2, "content", &[]);
-    assert!(success, "Expected success for identical BAMs, stdout:\n{stdout}");
-    assert!(stdout.contains("IDENTICAL"), "Expected IDENTICAL in output, got:\n{stdout}");
+    assert!(
+        run_compare_in_process(&bam1, &bam2, "content", &[]),
+        "Expected match for identical BAMs in content mode"
+    );
 }
 
 #[test]
@@ -101,9 +125,10 @@ fn test_content_mode_different_position() {
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
-    let (success, stdout) = run_compare(&bam1, &bam2, "content", &[]);
-    assert!(!success, "Expected failure for different BAMs, stdout:\n{stdout}");
-    assert!(stdout.contains("DIFFER"), "Expected DIFFER in output, got:\n{stdout}");
+    assert!(
+        !run_compare_in_process(&bam1, &bam2, "content", &[]),
+        "Expected mismatch for different positions in content mode"
+    );
 }
 
 #[test]
@@ -119,9 +144,10 @@ fn test_content_mode_different_record_count() {
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
-    let (success, stdout) = run_compare(&bam1, &bam2, "content", &[]);
-    assert!(!success, "Expected failure for different record counts, stdout:\n{stdout}");
-    assert!(stdout.contains("DIFFER"), "Expected DIFFER in output, got:\n{stdout}");
+    assert!(
+        !run_compare_in_process(&bam1, &bam2, "content", &[]),
+        "Expected mismatch for different record counts in content mode"
+    );
 }
 
 #[test]
@@ -136,9 +162,10 @@ fn test_content_mode_multithreaded() {
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
 
-    let (success, stdout) = run_compare(&bam1, &bam2, "content", &["-t", "4"]);
-    assert!(success, "Expected success for identical BAMs with threads, stdout:\n{stdout}");
-    assert!(stdout.contains("IDENTICAL"), "Expected IDENTICAL in output, got:\n{stdout}");
+    assert!(
+        run_compare_in_process(&bam1, &bam2, "content", &["-t", "4"]),
+        "Expected match for identical BAMs with --threads 4"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -160,9 +187,10 @@ fn test_full_mode_identical_bams() {
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
 
-    let (success, stdout) = run_compare(&bam1, &bam2, "full", &[]);
-    assert!(success, "Expected success for identical BAMs in full mode, stdout:\n{stdout}");
-    assert!(stdout.contains("IDENTICAL"), "Expected IDENTICAL in output, got:\n{stdout}");
+    assert!(
+        run_compare_in_process(&bam1, &bam2, "full", &[]),
+        "Expected match for identical BAMs in full mode"
+    );
 }
 
 #[test]
@@ -180,9 +208,10 @@ fn test_full_mode_different_mi_tags() {
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
-    let (success, stdout) = run_compare(&bam1, &bam2, "full", &[]);
-    assert!(!success, "Expected failure for different MI tags in full mode, stdout:\n{stdout}");
-    assert!(stdout.contains("DIFFER"), "Expected DIFFER in output, got:\n{stdout}");
+    assert!(
+        !run_compare_in_process(&bam1, &bam2, "full", &[]),
+        "Expected mismatch for different MI tags in full mode"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -513,12 +542,10 @@ fn test_full_mode_fails_when_mi_missing_in_both_bams() {
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
 
-    let (success, stdout) = run_compare(&bam1, &bam2, "full", &[]);
     assert!(
-        !success,
-        "Expected failure when MI tags are missing in both BAMs (full mode), stdout:\n{stdout}"
+        !run_compare_in_process(&bam1, &bam2, "full", &[]),
+        "Expected mismatch when MI tags are missing in both BAMs (full mode)"
     );
-    assert!(stdout.contains("DIFFER"), "Expected DIFFER in output, got:\n{stdout}");
 }
 
 #[test]
@@ -532,12 +559,10 @@ fn test_grouping_unordered_fails_when_mi_missing_in_both_bams() {
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
 
-    let (success, stdout) = run_compare(&bam1, &bam2, "grouping", &["--ignore-order"]);
     assert!(
-        !success,
-        "Expected failure when MI tags are missing in both BAMs (ignore-order), stdout:\n{stdout}"
+        !run_compare_in_process(&bam1, &bam2, "grouping", &["--ignore-order"]),
+        "Expected mismatch when MI tags are missing in both BAMs (ignore-order)"
     );
-    assert!(stdout.contains("DIFFER"), "Expected DIFFER in output, got:\n{stdout}");
 }
 
 // ---------------------------------------------------------------------------
