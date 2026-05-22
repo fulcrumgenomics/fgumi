@@ -14,9 +14,9 @@
 //! # Overhead
 //!
 //! All sampling and formatting is gated on
-//! `log::log_enabled!(target: "fgumi_lib::sort::memory_probe", Info)`, so when
+//! `log::log_enabled!(target: "fgumi_lib::sort::memory_probe", Debug)`, so when
 //! probe logging is off the hooks are a single atomic load. Enable with
-//! `RUST_LOG=fgumi_lib::sort::memory_probe=info` (or at the crate level).
+//! `RUST_LOG=fgumi_lib::sort::memory_probe=debug` (or at the crate level).
 //!
 //! # Usage
 //!
@@ -39,7 +39,7 @@
 //! ```
 
 use bytesize::ByteSize;
-use log::{Level, info, log_enabled};
+use log::{Level, debug, log_enabled};
 
 #[cfg(feature = "memory-debug")]
 #[allow(unused_imports)]
@@ -51,7 +51,7 @@ pub use platform_ffi::{force_mi_collect, process_rss_bytes};
 ///
 /// Intentionally retained as `fgumi_lib::sort::memory_probe` (the pre-extraction
 /// path) so existing operator runbooks continue to work. Enable with
-/// `RUST_LOG=fgumi_lib::sort::memory_probe=info`. Do not "fix" this string to
+/// `RUST_LOG=fgumi_lib::sort::memory_probe=debug`. Do not "fix" this string to
 /// match the new module path — that would silently break in-flight log filters.
 const TARGET: &str = "fgumi_lib::sort::memory_probe";
 
@@ -157,7 +157,7 @@ mod platform_ffi {
 #[must_use]
 #[inline]
 pub fn enabled() -> bool {
-    log_enabled!(target: TARGET, Level::Info)
+    log_enabled!(target: TARGET, Level::Debug)
 }
 
 /// Format a byte count as a human-readable value using the `bytesize` crate.
@@ -218,14 +218,14 @@ pub fn log_snapshot(label: &str, tracked_bytes: u64) {
             let residual = r.saturating_sub(tracked_bytes);
             let residual_str = fmt_bytes(residual);
             let pct = if r == 0 { 0 } else { (residual * 100) / r };
-            info!(
+            debug!(
                 target: TARGET,
                 "MEM[{label}] rss={} post_collect={} collected={} tracked={tracked_str} residual={residual_str} residual_pct={pct}%",
                 snap.rss_str, snap.post_collect_str, snap.collected_str,
             );
         }
         None => {
-            info!(
+            debug!(
                 target: TARGET,
                 "MEM[{label}] rss=? tracked={tracked_str} residual=? residual_pct=?"
             );
@@ -292,7 +292,7 @@ fn log_phase1_snapshot(
         }
         None => " residual=? residual_pct=?".to_string(),
     };
-    info!(
+    debug!(
         target: TARGET,
         "MEM[{label}] rss={} post_collect={} collected={}{buf_str}{pool_str}{residual_str}",
         snap.rss_str, snap.post_collect_str, snap.collected_str,
@@ -508,7 +508,7 @@ impl MergeProbe {
                 ),
                 None => String::new(),
             };
-            info!(
+            debug!(
                 target: TARGET,
                 "MEM[phase2.mid_{}] rss={} post_collect={} collected={} raw_q={raw_q} decomp_q={decomp_q} buf_q={buf_q}{consumer_str}",
                 self.sample_idx, snap.rss_str, snap.post_collect_str, snap.collected_str,

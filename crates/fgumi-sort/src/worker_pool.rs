@@ -39,7 +39,7 @@ use crossbeam_queue::ArrayQueue;
 use fgumi_bgzf::reader::read_raw_blocks;
 use fgumi_bgzf::writer::InlineBgzfCompressor;
 use fgumi_bgzf::{RawBgzfBlock, decompress_block};
-use log::info;
+use log::debug;
 use std::collections::VecDeque;
 use std::fmt::Write as FmtWrite;
 use std::io::{BufReader, Read};
@@ -172,7 +172,7 @@ pub(crate) struct PoolStats {
 impl PoolStats {
     pub fn log_summary(&self) {
         let compress = self.compress_jobs_submitted.load(Ordering::Relaxed);
-        info!("  Pool stats: {compress} compress jobs");
+        debug!("  Pool stats: {compress} compress jobs");
     }
 }
 
@@ -349,7 +349,7 @@ impl SortPipelineStats {
 
         // Log as a single multiline message
         for line in s.trim_end().lines() {
-            info!("{line}");
+            debug!("{line}");
         }
     }
 }

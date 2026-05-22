@@ -1546,7 +1546,7 @@ impl RawExternalSorter {
         let n_to_merge = (self.max_temp_files / 2).max(2).min(chunk_files.len());
         let files_to_merge: Vec<PathBuf> = chunk_files.drain(..n_to_merge).collect();
 
-        info!(
+        debug!(
             "Consolidating {} temp files into 1 (total was {})...",
             n_to_merge,
             n_to_merge + chunk_files.len()
@@ -1618,7 +1618,7 @@ impl RawExternalSorter {
             let _ = std::fs::remove_file(path);
         }
 
-        info!("Consolidation complete, {} temp files remain", chunk_files.len());
+        debug!("Consolidation complete, {} temp files remain", chunk_files.len());
 
         Ok(())
     }
@@ -1642,9 +1642,9 @@ impl RawExternalSorter {
              zstd level >= 1."
         );
 
-        info!("Starting raw-bytes sort with order: {:?}", self.sort_order);
-        info!("Memory limit: {} MB", self.memory_limit / (1024 * 1024));
-        info!("Threads: {}", self.threads);
+        debug!("Starting raw-bytes sort with order: {:?}", self.sort_order);
+        debug!("Memory limit: {} MB", self.memory_limit / (1024 * 1024));
+        debug!("Threads: {}", self.threads);
 
         // Shared worker pool for parallel BGZF compress/decompress across all phases
         let pool = Arc::new(SortWorkerPool::new(
@@ -1657,7 +1657,10 @@ impl RawExternalSorter {
         // Open input BAM and create record source
         // N+2 model: workers do ReadInputBlocks + DecompressInput,
         // main thread reads records directly from PooledInputStream.
-        info!("Phase 1: Pool-integrated input reading ({} workers, N+2 model)", pool.num_workers());
+        debug!(
+            "Phase 1: Pool-integrated input reading ({} workers, N+2 model)",
+            pool.num_workers()
+        );
         let (record_source, header) = {
             let (reader, header) =
                 create_raw_bam_reader_pool_integrated(input, &pool, self.async_reader)?;
@@ -1703,7 +1706,7 @@ impl RawExternalSorter {
             SortContext,
         };
 
-        info!("Starting k-way merge of {} BAM files", inputs.len());
+        debug!("Starting k-way merge of {} BAM files", inputs.len());
 
         let mut readers = Self::open_bam_prefetch_readers(inputs)?;
         let output_header = self.create_output_header(header);
@@ -1780,7 +1783,7 @@ impl RawExternalSorter {
         }
 
         if initial_keys.is_empty() {
-            info!("Merge complete: 0 records merged");
+            debug!("Merge complete: 0 records merged");
             let writer = fgumi_bam_io::create_raw_bam_writer(
                 output,
                 output_header,
@@ -1880,7 +1883,7 @@ impl RawExternalSorter {
         let rayon_pool = self.build_sort_rayon_pool()?;
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
-        info!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
+        debug!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
         let mut probe = SpillProbe::new("phase1");
 
         for record in record_source.by_ref() {
@@ -1963,7 +1966,7 @@ impl RawExternalSorter {
 
         if chunk_files.is_empty() {
             // All records fit in memory - no merge needed
-            info!("All records fit in memory, performing in-memory sort");
+            debug!("All records fit in memory, performing in-memory sort");
 
             timer.time_sort(|| {
                 rayon_pool.install(|| buffer.par_sort());
@@ -1997,7 +2000,7 @@ impl RawExternalSorter {
 
             let memory_chunks = MemorySources::Shared(memory_chunks);
             let n_memory = memory_chunks.num_non_empty();
-            info!(
+            debug!(
                 "Phase 2: Merging {} chunks (keyed O(1) comparisons)...",
                 chunk_files.len() + n_memory
             );
@@ -2020,7 +2023,7 @@ impl RawExternalSorter {
             pool.shutdown();
         }
         timer.log_summary(self.threads);
-        info!("Sort complete: {} records processed", stats.total_records);
+        debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
     }
@@ -2042,7 +2045,7 @@ impl RawExternalSorter {
         use crate::keys::RawCoordinateKey;
         use fgumi_bam_io::{create_indexing_bam_writer, write_bai_index};
 
-        info!("Indexing enabled: will write BAM index alongside output");
+        debug!("Indexing enabled: will write BAM index alongside output");
 
         let mut stats = RawSortStats::default();
         let mut timer = SortPhaseTimer::new();
@@ -2059,7 +2062,7 @@ impl RawExternalSorter {
         let mut pending_spill: Option<PendingSpill> = None;
         let rayon_pool = self.build_sort_rayon_pool()?;
 
-        info!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
+        debug!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
         let mut probe = SpillProbe::new("phase1");
 
         for record in record_source.by_ref() {
@@ -2117,7 +2120,7 @@ impl RawExternalSorter {
         }
 
         timer.end_read_span();
-        info!("Read {} records total", stats.total_records);
+        debug!("Read {} records total", stats.total_records);
         if let Some(err) = record_source.take_error() {
             return Err(anyhow::Error::from(err));
         }
@@ -2137,7 +2140,7 @@ impl RawExternalSorter {
 
         if chunk_files.is_empty() {
             // All records fit in memory - no merge needed
-            info!("All records fit in memory, performing in-memory sort");
+            debug!("All records fit in memory, performing in-memory sort");
 
             timer.time_sort(|| {
                 rayon_pool.install(|| buffer.par_sort());
@@ -2177,7 +2180,7 @@ impl RawExternalSorter {
 
             let memory_chunks = MemorySources::Shared(memory_chunks);
             let n_memory = memory_chunks.num_non_empty();
-            info!(
+            debug!(
                 "Phase 2: Merging {} chunks with index generation...",
                 chunk_files.len() + n_memory
             );
@@ -2204,7 +2207,7 @@ impl RawExternalSorter {
             pool.shutdown();
         }
         timer.log_summary(self.threads);
-        info!("Sort complete: {} records processed", stats.total_records);
+        debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
     }
@@ -2224,7 +2227,7 @@ impl RawExternalSorter {
         comparator: QuerynameComparator,
     ) -> Result<RawSortStats> {
         use crate::keys::{RawQuerynameKey, RawQuerynameLexKey};
-        info!("Using queryname sort with {comparator} comparator");
+        debug!("Using queryname sort with {comparator} comparator");
         match comparator {
             QuerynameComparator::Lexicographic => self.sort_queryname_keyed::<RawQuerynameLexKey>(
                 record_source,
@@ -2272,7 +2275,7 @@ impl RawExternalSorter {
         let rayon_pool = self.build_sort_rayon_pool()?;
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
-        info!("Phase 1: Reading and sorting chunks (keyed output)...");
+        debug!("Phase 1: Reading and sorting chunks (keyed output)...");
         let mut probe = SpillProbe::new("phase1");
 
         for record in record_source.by_ref() {
@@ -2359,7 +2362,7 @@ impl RawExternalSorter {
 
         if chunk_files.is_empty() {
             // All records fit in memory
-            info!("All records fit in memory, performing in-memory sort");
+            debug!("All records fit in memory, performing in-memory sort");
 
             timer.time_sort(|| {
                 use rayon::prelude::*;
@@ -2426,7 +2429,7 @@ impl RawExternalSorter {
             let memory_chunks = MemorySources::Owned(keyed_chunks);
 
             let n_memory = memory_chunks.num_non_empty();
-            info!(
+            debug!(
                 "Phase 2: Merging {} chunks (keyed comparisons)...",
                 chunk_files.len() + n_memory
             );
@@ -2449,7 +2452,7 @@ impl RawExternalSorter {
             pool.shutdown();
         }
         timer.log_summary(self.threads);
-        info!("Sort complete: {} records processed", stats.total_records);
+        debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
     }
@@ -2496,7 +2499,7 @@ impl RawExternalSorter {
         let rayon_pool = self.build_sort_rayon_pool()?;
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
-        info!("Phase 1: Reading and sorting chunks (inline buffer)...");
+        debug!("Phase 1: Reading and sorting chunks (inline buffer)...");
         let mut probe = SpillProbe::new("phase1");
 
         for record in record_source.by_ref() {
@@ -2578,7 +2581,7 @@ impl RawExternalSorter {
 
         if chunk_files.is_empty() {
             // All records fit in memory
-            info!("All records fit in memory, performing in-memory sort");
+            debug!("All records fit in memory, performing in-memory sort");
 
             timer.time_sort(|| {
                 rayon_pool.install(|| buffer.par_sort());
@@ -2611,7 +2614,7 @@ impl RawExternalSorter {
 
             let memory_chunks = MemorySources::Shared(memory_chunks);
             let n_memory = memory_chunks.num_non_empty();
-            info!("Phase 2: Merging {} chunks...", chunk_files.len() + n_memory);
+            debug!("Phase 2: Merging {} chunks...", chunk_files.len() + n_memory);
 
             // Merge using O(1) key comparisons
             timer.time_merge(|| {
@@ -2631,7 +2634,7 @@ impl RawExternalSorter {
             pool.shutdown();
         }
         timer.log_summary(self.threads);
-        info!("Sort complete: {} records processed", stats.total_records);
+        debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
     }
@@ -2727,7 +2730,7 @@ impl RawExternalSorter {
         let num_disk = chunk_files.len();
 
         if num_disk > 0 {
-            info!(
+            debug!(
                 "Pool-integrated merge: {} disk sources, {} pool workers (N+2 model)",
                 num_disk,
                 pool.num_workers()
@@ -2743,7 +2746,7 @@ impl RawExternalSorter {
         )?;
 
         let num_sources = sources.len();
-        info!("Merging from {num_sources} sources...");
+        debug!("Merging from {num_sources} sources...");
 
         // Create pool consumer for PoolDisk sources and activate Phase 2.
         // The consumer holds an Arc snapshot of the pool's per-file Phase 2
@@ -2780,7 +2783,7 @@ impl RawExternalSorter {
         }
 
         if initial_keys.is_empty() {
-            info!("Merge complete: 0 records merged");
+            debug!("Merge complete: 0 records merged");
             guard.deactivate();
             let writer = PooledBamWriter::new(Arc::clone(pool), output, &output_header)?;
             writer.finish()?;
@@ -2789,7 +2792,7 @@ impl RawExternalSorter {
 
         let mut tree = LoserTree::new(initial_keys);
 
-        info!("Merge thread budget: {} pool workers + 1 I/O + 1 main (N+2)", pool.num_workers());
+        debug!("Merge thread budget: {} pool workers + 1 I/O + 1 main (N+2)", pool.num_workers());
         let mut writer = PooledBamWriter::new(Arc::clone(pool), output, &output_header)?;
 
         let mut records_merged = 0u64;
@@ -2916,11 +2919,11 @@ impl RawExternalSorter {
         )?;
 
         let num_sources = sources.len();
-        info!(
+        debug!(
             "Merge thread budget (indexing): {writer_threads} writer + {reader_concurrency} reader + 1 main = {} total",
             writer_threads + reader_concurrency + 1
         );
-        info!("Merging from {num_sources} sources (indexing)...");
+        debug!("Merging from {num_sources} sources (indexing)...");
 
         let output_header = self.create_output_header(header);
 
@@ -2946,7 +2949,7 @@ impl RawExternalSorter {
                 writer_threads,
             )?;
             let index = writer.finish()?;
-            info!("Merge complete: 0 records merged");
+            debug!("Merge complete: 0 records merged");
             return Ok(index);
         }
 
@@ -3196,7 +3199,7 @@ fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
 
         let reader: Box<dyn io::Read + Send> = if async_reader {
             fgumi_bam_io::os_hints::advise_sequential(&file);
-            log::info!(
+            log::debug!(
                 "async sort reader enabled: spawning fgumi-prefetch thread for {}",
                 path_ref.display()
             );
