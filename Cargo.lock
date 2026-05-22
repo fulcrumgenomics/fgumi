@@ -726,6 +726,7 @@ version = "0.2.0"
 dependencies = [
  "bgzf",
  "crc32fast",
+ "criterion",
  "libdeflater",
 ]
 
