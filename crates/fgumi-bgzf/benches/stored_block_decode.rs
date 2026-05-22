@@ -109,10 +109,12 @@ fn decode_stream_via_libdeflater(stream: &[u8], scratch: &mut Vec<u8>) {
 }
 
 /// Decompress a single block via libdeflater, with no stored-block bypass —
-/// the path the reader took before this bench was added. Includes the same
-/// CRC32 verification the production code performs, so the comparison to
-/// the bypass row stays apples-to-apples (the bypass measures the cost of
-/// libdeflater's stored-block memcpy, not whether we verify the CRC).
+/// the path the reader took before this bench was added. Mirrors the
+/// pre-bypass production behavior: zero-length blocks are short-circuited
+/// (no decode, no CRC — there are no bytes to hash), and non-empty blocks
+/// are CRC32-verified just like the bypass path. The bypass row therefore
+/// measures the cost of libdeflater's stored-block memcpy, not a difference
+/// in whether we verify the CRC.
 fn decompress_block_libdeflater(
     block: &RawBgzfBlock,
     decompressor: &mut Decompressor,
