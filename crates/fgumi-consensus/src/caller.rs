@@ -195,6 +195,20 @@ impl ConsensusOutput {
         self.data.append(&mut other.data);
         self.count += other.count;
     }
+
+    /// Estimated heap memory owned by this `ConsensusOutput`, in bytes.
+    ///
+    /// Returned value is the sum of every owned heap allocation this struct
+    /// holds (currently `data.capacity()`). Callers in batch
+    /// `MemoryEstimate` impls (`SimplexProcessedBatch`,
+    /// `DuplexProcessedBatch`, `CodecProcessedBatch`) call this method
+    /// rather than reaching into `data.capacity()` directly, so any future
+    /// owned heap field added here is accounted for in pipeline
+    /// backpressure without touching every consumer.
+    #[must_use]
+    pub fn estimate_heap_size(&self) -> usize {
+        self.data.capacity()
+    }
 }
 
 /// The main trait for consensus callers that generate consensus reads from groups of raw reads.
@@ -493,6 +507,21 @@ pub fn make_prefix_from_header(header: &Header) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_consensus_output_estimate_heap_size_empty() {
+        let out = ConsensusOutput::default();
+        assert_eq!(out.estimate_heap_size(), 0);
+    }
+
+    #[test]
+    fn test_consensus_output_estimate_heap_size_matches_data_capacity() {
+        let mut data = Vec::with_capacity(1024);
+        data.resize(100, 0u8);
+        let cap = data.capacity();
+        let out = ConsensusOutput { data, count: 1 };
+        assert_eq!(out.estimate_heap_size(), cap);
+    }
 
     #[test]
     fn test_rejection_reason_codes() {
