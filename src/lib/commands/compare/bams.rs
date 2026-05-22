@@ -462,17 +462,43 @@ struct GroupingCompareResult {
 // Types and MI map helpers (using ahash)
 // ============================================================================
 
-/// Compact read key using hash - saves ~70 bytes per entry vs (String, bool)
-type ReadKeyHash = u64;
+/// Compact read key using a 128-bit composite hash (saves ~50 bytes per entry
+/// vs `(Vec<u8>, bool)` while making the birthday-paradox collision
+/// probability negligible at any realistic BAM size).
+///
+/// A 64-bit key was previously used here; the birthday-paradox collision
+/// probability is `n² / 2^65`, which becomes non-trivial above ~10⁸ reads
+/// (~2.7×10⁻⁴ at 100M, ~2.7×10⁻² at 1B). On a real disagreement near a
+/// collision the comparator could report "equivalent" when the files
+/// actually differ. 128-bit makes that probability astronomical (`n² /
+/// 2^129`) for any realistic BAM.
+type ReadKeyHash = u128;
 
-/// Compute a hash for a read key from raw bytes (avoids String allocation).
+/// Compute a 128-bit composite hash for a read key from raw bytes.
+///
+/// Two passes of `ahash::AHasher` with distinct domain-separator prefixes
+/// produce independent 64-bit halves that we concatenate. `ahash::AHasher`'s
+/// avalanche property means the prefix byte change is sufficient to make
+/// the two halves uncorrelated; combining them gives 128 bits of effective
+/// entropy.
 #[inline]
 fn hash_read_key_raw(name: &[u8], is_read1: bool) -> ReadKeyHash {
     use std::hash::{Hash, Hasher};
-    let mut hasher = ahash::AHasher::default();
-    name.hash(&mut hasher);
-    is_read1.hash(&mut hasher);
-    hasher.finish()
+    let lo = {
+        let mut hasher = ahash::AHasher::default();
+        0u8.hash(&mut hasher);
+        name.hash(&mut hasher);
+        is_read1.hash(&mut hasher);
+        hasher.finish()
+    };
+    let hi = {
+        let mut hasher = ahash::AHasher::default();
+        1u8.hash(&mut hasher);
+        name.hash(&mut hasher);
+        is_read1.hash(&mut hasher);
+        hasher.finish()
+    };
+    (u128::from(hi) << 64) | u128::from(lo)
 }
 
 /// Key used to group records by molecular identifier during comparison.
@@ -2075,6 +2101,39 @@ mod tests {
         let mut argv = vec!["bams", "a.bam", "b.bam"];
         argv.extend_from_slice(args);
         CompareBams::try_parse_from(argv).expect("parse")
+    }
+
+    #[test]
+    fn hash_read_key_raw_is_deterministic() {
+        let h1 = hash_read_key_raw(b"read_one", true);
+        let h2 = hash_read_key_raw(b"read_one", true);
+        assert_eq!(h1, h2, "same input must yield same hash");
+    }
+
+    #[test]
+    fn hash_read_key_raw_distinguishes_read1_vs_read2() {
+        let h_r1 = hash_read_key_raw(b"read_one", true);
+        let h_r2 = hash_read_key_raw(b"read_one", false);
+        assert_ne!(h_r1, h_r2, "is_read1 flag must affect the hash");
+    }
+
+    #[test]
+    fn hash_read_key_raw_distinguishes_different_names() {
+        let h_a = hash_read_key_raw(b"read_a", true);
+        let h_b = hash_read_key_raw(b"read_b", true);
+        assert_ne!(h_a, h_b, "different names must yield different hashes");
+    }
+
+    #[test]
+    fn hash_read_key_raw_uses_full_128_bits() {
+        // High and low 64-bit halves come from independently-seeded ahash
+        // passes; they should not collapse to the same value (which would
+        // indicate the domain separator is being ignored and the hash is
+        // effectively 64-bit again).
+        let h = hash_read_key_raw(b"some_realistic_read_name_1234", true);
+        let lo = h as u64;
+        let hi = (h >> 64) as u64;
+        assert_ne!(lo, hi, "lo and hi halves must come from independent hashes");
     }
 
     #[rstest]
