@@ -1,13 +1,8 @@
 //! End-to-end CLI tests for the zipper command.
 //!
-//! These tests invoke `Zipper::execute()` in-process, except two tests that
-//! intentionally stay on the subprocess path for process-level observability:
-//!
-//! - `test_zipper_bam_stdin_input` — exercises the `std::io::stdin()` pipe path
-//!   inside zipper, which only exists at the process boundary.
-//! - `test_zipper_bam_mapped_input` — asserts on a `log::warn!` "BAM input
-//!   detected" message captured from stderr; capturing that in-process would
-//!   require global-logger plumbing in the test harness.
+//! These tests invoke `Zipper::execute()` in-process, except
+//! `test_zipper_bam_stdin_input`, which exercises the `std::io::stdin()` pipe
+//! path inside zipper and only exists at the process boundary.
 
 use clap::Parser;
 use fgumi_lib::commands::command::Command as FgumiCommand;
@@ -142,7 +137,7 @@ fn test_zipper_basic_merge() {
         "1",
     ])
     .expect("failed to parse zipper args");
-    cmd.execute("test").expect("Zipper command failed");
+    cmd.execute("fgumi zipper").expect("Zipper command failed");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // Verify output records have UMI tags transferred
@@ -209,7 +204,7 @@ fn test_zipper_tag_removal() {
         "1",
     ])
     .expect("failed to parse zipper args");
-    cmd.execute("test").expect("Zipper command with --tags-to-remove failed");
+    cmd.execute("fgumi zipper").expect("Zipper command with --tags-to-remove failed");
 
     // Verify XY tag was removed but RX tag was kept
     let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
@@ -245,7 +240,7 @@ fn test_zipper_missing_input() {
         output_bam.to_str().unwrap(),
     ])
     .expect("failed to parse zipper args");
-    assert!(cmd.execute("test").is_err(), "Zipper should fail for nonexistent input");
+    assert!(cmd.execute("fgumi zipper").is_err(), "Zipper should fail for nonexistent input");
 }
 
 /// Test zipper accepts BAM as mapped input (--input).
@@ -308,32 +303,21 @@ fn test_zipper_bam_mapped_input() {
     ];
     create_mapped_bam(&mapped_bam, &mapped_header, &mapped_records);
 
-    // Stays on the subprocess path because the assertion below checks that
-    // zipper emits a `BAM input detected` warning via log::warn!, which is
-    // only observable via captured stderr — capturing in-process would
-    // require setting up a global logger handler in the test harness.
-    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "zipper",
-            "--input",
-            mapped_bam.to_str().unwrap(),
-            "--unmapped",
-            unmapped_bam.to_str().unwrap(),
-            "--reference",
-            ref_path.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--compression-level",
-            "1",
-        ])
-        .output()
-        .expect("Failed to run zipper command");
-
-    assert!(
-        output.status.success(),
-        "Zipper command failed with BAM input: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let cmd = Zipper::try_parse_from([
+        "zipper",
+        "--input",
+        mapped_bam.to_str().unwrap(),
+        "--unmapped",
+        unmapped_bam.to_str().unwrap(),
+        "--reference",
+        ref_path.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse zipper args");
+    cmd.execute("fgumi zipper").expect("Zipper command failed with BAM input");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // Verify output records have UMI tags transferred

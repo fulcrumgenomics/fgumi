@@ -97,7 +97,7 @@ fn test_sort_write_index() {
     ])
     .expect("failed to parse sort args");
 
-    cmd.execute("test").expect("fgumi sort --write-index failed");
+    cmd.execute("fgumi sort").expect("fgumi sort --write-index failed");
     assert!(sorted_bam_path.exists(), "Output BAM not created");
     assert!(index_path.exists(), "Output BAI not created");
 
@@ -136,7 +136,7 @@ fn test_sort_write_index_multithreaded() {
     ])
     .expect("failed to parse sort args");
 
-    cmd.execute("test").expect("fgumi sort --write-index -@ 4 failed");
+    cmd.execute("fgumi sort").expect("fgumi sort --write-index -@ 4 failed");
     assert!(sorted_bam_path.exists(), "Output BAM not created");
     assert!(index_path.exists(), "Output BAI not created");
 
@@ -163,7 +163,7 @@ fn test_write_index_requires_coordinate_sort() {
     ])
     .expect("failed to parse sort args");
 
-    let result = cmd.execute("test");
+    let result = cmd.execute("fgumi sort");
     assert!(result.is_err(), "fgumi sort --order queryname --write-index should fail");
 
     let err_msg = format!("{:#}", result.unwrap_err());

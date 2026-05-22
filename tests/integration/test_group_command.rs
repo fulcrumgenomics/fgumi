@@ -4,7 +4,7 @@
 
 use clap::Parser;
 use fgoxide::io::DelimFile;
-use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::group::GroupReadsByUmi;
 use fgumi_lib::metrics::UmiGroupingMetrics;
 use noodles::bam;
@@ -43,7 +43,7 @@ fn test_group_command_writes_new_metrics() {
         "1",
     ])
     .expect("failed to parse group args");
-    cmd.execute("test").expect("Failed to run group command");
+    cmd.execute("fgumi group").expect("Failed to run group command");
     assert!(output_bam.exists(), "Output BAM not created");
     assert!(metrics_file.exists(), "Metrics file not created");
 
@@ -95,7 +95,7 @@ fn test_group_command_rejects_n_bases_in_umi() {
         "1",
     ])
     .expect("failed to parse group args");
-    cmd.execute("test").expect("Failed to run group command");
+    cmd.execute("fgumi group").expect("Failed to run group command");
 
     // Read metrics and verify N rejection tracking
     let metrics: Vec<UmiGroupingMetrics> =

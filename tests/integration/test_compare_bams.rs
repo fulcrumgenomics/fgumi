@@ -59,7 +59,7 @@ fn run_compare_in_process(bam1: &Path, bam2: &Path, mode: &str, extra_args: &[&s
         vec!["bams", bam1.to_str().unwrap(), bam2.to_str().unwrap(), "--mode", mode];
     args.extend(extra_args);
     let cmd = CompareBams::try_parse_from(args).expect("failed to parse compare bams args");
-    match cmd.execute("test") {
+    match cmd.execute("fgumi compare bams") {
         Ok(()) => true,
         Err(e) if e.is::<CompareMismatch>() => false,
         Err(e) => panic!("compare bams hit unexpected error: {e:#}"),

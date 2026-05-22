@@ -2,7 +2,7 @@
 
 use clap::Parser;
 use fgoxide::io::DelimFile;
-use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::duplex_metrics::DuplexMetrics;
 use fgumi_lib::metrics::duplex::{DuplexFamilySizeMetric, FamilySizeMetric};
 use fgumi_lib::metrics::shared::UmiMetric;
@@ -199,7 +199,7 @@ fn test_duplex_metrics_command_creates_output_files() {
         output_prefix.to_str().unwrap(),
     ])
     .expect("failed to parse duplex-metrics args");
-    cmd.execute("test").expect("duplex-metrics command failed");
+    cmd.execute("fgumi duplex-metrics").expect("duplex-metrics command failed");
 
     // Verify all expected output files exist
     let family_sizes_path = format!("{}.family_sizes.txt", output_prefix.display());
@@ -237,7 +237,7 @@ fn test_duplex_metrics_command_family_sizes() {
         output_prefix.to_str().unwrap(),
     ])
     .expect("failed to parse duplex-metrics args");
-    cmd.execute("test").expect("duplex-metrics command failed");
+    cmd.execute("fgumi duplex-metrics").expect("duplex-metrics command failed");
 
     // Read and validate family size metrics
     let family_sizes_path = format!("{}.family_sizes.txt", output_prefix.display());
@@ -274,7 +274,7 @@ fn test_duplex_metrics_command_duplex_family_sizes() {
         output_prefix.to_str().unwrap(),
     ])
     .expect("failed to parse duplex-metrics args");
-    cmd.execute("test").expect("duplex-metrics command failed");
+    cmd.execute("fgumi duplex-metrics").expect("duplex-metrics command failed");
 
     // Read and validate duplex family size metrics
     let duplex_family_sizes_path = format!("{}.duplex_family_sizes.txt", output_prefix.display());
@@ -311,7 +311,7 @@ fn test_duplex_metrics_command_umi_metrics() {
         output_prefix.to_str().unwrap(),
     ])
     .expect("failed to parse duplex-metrics args");
-    cmd.execute("test").expect("duplex-metrics command failed");
+    cmd.execute("fgumi duplex-metrics").expect("duplex-metrics command failed");
 
     // Read and validate UMI metrics
     let umi_counts_path = format!("{}.umi_counts.txt", output_prefix.display());
@@ -346,7 +346,8 @@ fn test_duplex_metrics_command_with_duplex_umi_counts() {
         "--duplex-umi-counts",
     ])
     .expect("failed to parse duplex-metrics args");
-    cmd.execute("test").expect("duplex-metrics command failed with --duplex-umi-counts");
+    cmd.execute("fgumi duplex-metrics")
+        .expect("duplex-metrics command failed with --duplex-umi-counts");
 
     // Verify the additional duplex UMI counts file exists
     let duplex_umi_counts_path = format!("{}.duplex_umi_counts.txt", output_prefix.display());
@@ -376,7 +377,7 @@ fn test_duplex_metrics_command_min_reads_parameters() {
         output_prefix_default.to_str().unwrap(),
     ])
     .expect("failed to parse duplex-metrics args (default)");
-    cmd_default.execute("test").expect("duplex-metrics command failed (default)");
+    cmd_default.execute("fgumi duplex-metrics").expect("duplex-metrics command failed (default)");
 
     // Run with stricter parameters (min-ab=2, min-ba=2)
     let cmd_strict = DuplexMetrics::try_parse_from([
@@ -391,7 +392,7 @@ fn test_duplex_metrics_command_min_reads_parameters() {
         "2",
     ])
     .expect("failed to parse duplex-metrics args (strict)");
-    cmd_strict.execute("test").expect("duplex-metrics command failed (strict)");
+    cmd_strict.execute("fgumi duplex-metrics").expect("duplex-metrics command failed (strict)");
 
     // Read both duplex family size files
     let default_path = format!("{}.duplex_family_sizes.txt", output_prefix_default.display());

@@ -3,7 +3,22 @@
 //!
 //! GitHub issue #125: BAM files written by pipeline-based commands were missing
 //! the BGZF EOF block, causing `samtools quickcheck` to fail.
+//!
+//! All single-command tests invoke `<Cmd>::execute()` in-process.
+//! `test_piped_simplex_to_filter_has_bgzf_eof` remains on the subprocess path
+//! because it pipes simplex's stdout into filter's stdin via `Stdio::piped()`,
+//! which is a genuine multi-process pipeline feature.
 
+use clap::Parser;
+use fgumi_lib::commands::clip::Clip;
+use fgumi_lib::commands::codec::Codec;
+use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::correct::CorrectUmis;
+use fgumi_lib::commands::dedup::MarkDuplicates;
+use fgumi_lib::commands::duplex::Duplex;
+use fgumi_lib::commands::filter::Filter;
+use fgumi_lib::commands::group::GroupReadsByUmi;
+use fgumi_lib::commands::simplex::Simplex;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
@@ -258,26 +273,23 @@ fn test_group_output_has_bgzf_eof() {
     let family = create_umi_family("AAAAAAAA", 5, "fam", "ACGTACGT", 30);
     write_test_bam(&input_bam, &family);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "group",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--strategy",
-            "identity",
-            "--edits",
-            "0",
-            "--threads",
-            "2",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run group command");
-
-    assert!(status.success(), "group command failed");
+    let cmd = GroupReadsByUmi::try_parse_from([
+        "group",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--edits",
+        "0",
+        "--threads",
+        "2",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse group args");
+    cmd.execute("fgumi group").expect("group command failed");
     assert_has_bgzf_eof(&output_bam);
 }
 
@@ -291,22 +303,19 @@ fn test_dedup_output_has_bgzf_eof() {
     records.extend(create_dedup_reads(b"dup_1", "ACGTACGT", 100));
     write_test_bam(&input_bam, &records);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "dedup",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--strategy",
-            "identity",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run dedup command");
-
-    assert!(status.success(), "dedup command failed");
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("dedup command failed");
     assert_has_bgzf_eof(&output_bam);
 }
 
@@ -319,24 +328,21 @@ fn test_simplex_output_has_bgzf_eof() {
     let family = create_umi_family("ACGT", 5, "fam", "ACGTACGT", 30);
     write_grouped_bam(&input_bam, &[("1", &family)]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "simplex",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--min-reads",
-            "2",
-            "--threads",
-            "2",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run simplex command");
-
-    assert!(status.success(), "simplex command failed");
+    let cmd = Simplex::try_parse_from([
+        "simplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "2",
+        "--threads",
+        "2",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse simplex args");
+    cmd.execute("fgumi simplex").expect("simplex command failed");
     assert_has_bgzf_eof(&output_bam);
 }
 
@@ -362,24 +368,21 @@ fn test_duplex_output_has_bgzf_eof() {
     }
     write_test_bam(&input_bam, &records);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "duplex",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--min-reads",
-            "1",
-            "--threads",
-            "2",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run duplex command");
-
-    assert!(status.success(), "duplex command failed");
+    let cmd = Duplex::try_parse_from([
+        "duplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--threads",
+        "2",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse duplex args");
+    cmd.execute("fgumi duplex").expect("duplex command failed");
     assert_has_bgzf_eof(&output_bam);
 }
 
@@ -397,24 +400,21 @@ fn test_codec_output_has_bgzf_eof() {
     }
     write_test_bam(&input_bam, &records);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "codec",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--min-reads",
-            "1",
-            "--threads",
-            "2",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run codec command");
-
-    assert!(status.success(), "codec command failed");
+    let cmd = Codec::try_parse_from([
+        "codec",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--threads",
+        "2",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse codec args");
+    cmd.execute("fgumi codec").expect("codec command failed");
     assert_has_bgzf_eof(&output_bam);
 }
 
@@ -441,26 +441,23 @@ fn test_filter_output_has_bgzf_eof() {
 
     write_test_bam(&input_bam, &[record]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "filter",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--ref",
-            ref_path.to_str().unwrap(),
-            "--min-reads",
-            "1",
-            "--max-no-call-fraction",
-            "1.0",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run filter command");
-
-    assert!(status.success(), "filter command failed");
+    let cmd = Filter::try_parse_from([
+        "filter",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--max-no-call-fraction",
+        "1.0",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse filter args");
+    cmd.execute("fgumi filter").expect("filter command failed");
     assert_has_bgzf_eof(&output_bam);
 }
 
@@ -505,28 +502,25 @@ fn test_clip_output_has_bgzf_eof() {
 
     write_test_bam(&input_bam, &[r1, r2]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "clip",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--reference",
-            ref_path.to_str().unwrap(),
-            "--read-one-five-prime",
-            "1",
-            "--read-one-three-prime",
-            "1",
-            "--threads",
-            "2",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run clip command");
-
-    assert!(status.success(), "clip command failed");
+    let cmd = Clip::try_parse_from([
+        "clip",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--reference",
+        ref_path.to_str().unwrap(),
+        "--read-one-five-prime",
+        "1",
+        "--read-one-three-prime",
+        "1",
+        "--threads",
+        "2",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse clip args");
+    cmd.execute("fgumi clip").expect("clip command failed");
     assert_has_bgzf_eof(&output_bam);
 }
 
@@ -541,28 +535,25 @@ fn test_correct_output_has_bgzf_eof() {
     write_test_bam(&input_bam, &reads);
     fs::write(&whitelist, "ACGTACGT").expect("Failed to write whitelist");
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "correct",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--umi-files",
-            whitelist.to_str().unwrap(),
-            "--max-mismatches",
-            "1",
-            "--min-distance",
-            "1",
-            "--threads",
-            "2",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run correct command");
-
-    assert!(status.success(), "correct command failed");
+    let cmd = CorrectUmis::try_parse_from([
+        "correct",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--umi-files",
+        whitelist.to_str().unwrap(),
+        "--max-mismatches",
+        "1",
+        "--min-distance",
+        "1",
+        "--threads",
+        "2",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse correct args");
+    cmd.execute("fgumi correct").expect("correct command failed");
     assert_has_bgzf_eof(&output_bam);
 }
 
@@ -647,26 +638,23 @@ fn test_simplex_rejects_has_bgzf_eof() {
     let rejected = create_rejected_family(b"reject", "TTTT", 500);
     write_grouped_bam(&input_bam, &[("1", &kept), ("2", &rejected)]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "simplex",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--rejects",
-            rejects_bam.to_str().unwrap(),
-            "--min-reads",
-            "2",
-            "--threads",
-            "2",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run simplex command");
-
-    assert!(status.success(), "simplex command with rejects failed");
+    let cmd = Simplex::try_parse_from([
+        "simplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--min-reads",
+        "2",
+        "--threads",
+        "2",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse simplex args");
+    cmd.execute("fgumi simplex").expect("simplex command with rejects failed");
     assert_has_bgzf_eof(&output_bam);
     assert_has_bgzf_eof(&rejects_bam);
     assert_rejects_header_matches_input(&rejects_bam, &input_bam);
@@ -699,26 +687,23 @@ fn test_duplex_rejects_has_bgzf_eof() {
     records.push(r2);
     write_test_bam(&input_bam, &records);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "duplex",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--rejects",
-            rejects_bam.to_str().unwrap(),
-            "--min-reads",
-            "2",
-            "--threads",
-            "2",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run duplex command");
-
-    assert!(status.success(), "duplex command with rejects failed");
+    let cmd = Duplex::try_parse_from([
+        "duplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--min-reads",
+        "2",
+        "--threads",
+        "2",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse duplex args");
+    cmd.execute("fgumi duplex").expect("duplex command with rejects failed");
     assert_has_bgzf_eof(&output_bam);
     assert_has_bgzf_eof(&rejects_bam);
     assert_rejects_header_matches_input(&rejects_bam, &input_bam);
@@ -743,26 +728,23 @@ fn test_codec_rejects_has_bgzf_eof() {
     records.push(r2);
     write_test_bam(&input_bam, &records);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "codec",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--rejects",
-            rejects_bam.to_str().unwrap(),
-            "--min-reads",
-            "2",
-            "--threads",
-            "2",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run codec command");
-
-    assert!(status.success(), "codec command with rejects failed");
+    let cmd = Codec::try_parse_from([
+        "codec",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--min-reads",
+        "2",
+        "--threads",
+        "2",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse codec args");
+    cmd.execute("fgumi codec").expect("codec command with rejects failed");
     assert_has_bgzf_eof(&output_bam);
     assert_has_bgzf_eof(&rejects_bam);
     assert_rejects_header_matches_input(&rejects_bam, &input_bam);
@@ -782,30 +764,27 @@ fn test_correct_rejects_has_bgzf_eof() {
     write_test_bam(&input_bam, &records);
     fs::write(&whitelist, "ACGTACGT").expect("Failed to write whitelist");
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "correct",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--rejects",
-            rejects_bam.to_str().unwrap(),
-            "--umi-files",
-            whitelist.to_str().unwrap(),
-            "--max-mismatches",
-            "1",
-            "--min-distance",
-            "1",
-            "--threads",
-            "2",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run correct command");
-
-    assert!(status.success(), "correct command with rejects failed");
+    let cmd = CorrectUmis::try_parse_from([
+        "correct",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--umi-files",
+        whitelist.to_str().unwrap(),
+        "--max-mismatches",
+        "1",
+        "--min-distance",
+        "1",
+        "--threads",
+        "2",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse correct args");
+    cmd.execute("fgumi correct").expect("correct command with rejects failed");
     assert_has_bgzf_eof(&output_bam);
     assert_has_bgzf_eof(&rejects_bam);
     assert_rejects_header_matches_input(&rejects_bam, &input_bam);
@@ -824,28 +803,25 @@ fn test_correct_single_threaded_rejects_has_bgzf_eof() {
     write_test_bam(&input_bam, &records);
     fs::write(&whitelist, "ACGTACGT").expect("Failed to write whitelist");
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "correct",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--rejects",
-            rejects_bam.to_str().unwrap(),
-            "--umi-files",
-            whitelist.to_str().unwrap(),
-            "--max-mismatches",
-            "1",
-            "--min-distance",
-            "1",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run correct command");
-
-    assert!(status.success(), "correct single-threaded with rejects failed");
+    let cmd = CorrectUmis::try_parse_from([
+        "correct",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--umi-files",
+        whitelist.to_str().unwrap(),
+        "--max-mismatches",
+        "1",
+        "--min-distance",
+        "1",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse correct args");
+    cmd.execute("fgumi correct").expect("correct single-threaded with rejects failed");
     assert_has_bgzf_eof(&output_bam);
     assert_has_bgzf_eof(&rejects_bam);
     assert_rejects_header_matches_input(&rejects_bam, &input_bam);

@@ -3,7 +3,7 @@
 //! These tests invoke the fastq command in-process via `Command::execute()`.
 
 use clap::Parser;
-use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::fastq::Fastq;
 use fgumi_raw_bam::{SamBuilder, flags};
 use noodles::bam;
@@ -108,7 +108,7 @@ fn test_fastq_basic() {
         output_fq.to_str().unwrap(),
     ])
     .expect("failed to parse fastq args");
-    cmd.execute("test").expect("fastq command failed");
+    cmd.execute("fgumi fastq").expect("fastq command failed");
 
     // Verify output
     let records = parse_fastq_records(&output_fq);
@@ -154,7 +154,7 @@ fn test_fastq_reverse_complement() {
         output_fq.to_str().unwrap(),
     ])
     .expect("failed to parse fastq args");
-    cmd.execute("test").expect("fastq command failed");
+    cmd.execute("fgumi fastq").expect("fastq command failed");
 
     let records = parse_fastq_records(&output_fq);
     assert_eq!(records.len(), 2);
@@ -184,7 +184,7 @@ fn test_fastq_no_suffix() {
         output_fq.to_str().unwrap(),
     ])
     .expect("failed to parse fastq args");
-    cmd.execute("test").expect("fastq command failed");
+    cmd.execute("fgumi fastq").expect("fastq command failed");
 
     let records = parse_fastq_records(&output_fq);
     assert_eq!(records.len(), 2);
@@ -215,7 +215,7 @@ fn test_fastq_quality_encoding() {
         output_fq.to_str().unwrap(),
     ])
     .expect("failed to parse fastq args");
-    cmd.execute("test").expect("fastq command failed");
+    cmd.execute("fgumi fastq").expect("fastq command failed");
 
     let records = parse_fastq_records(&output_fq);
     assert_eq!(records.len(), 2);
@@ -300,7 +300,7 @@ fn test_fastq_exclude_flags() {
         output_fq.to_str().unwrap(),
     ])
     .expect("failed to parse fastq args");
-    cmd.execute("test").expect("fastq command failed");
+    cmd.execute("fgumi fastq").expect("fastq command failed");
 
     let records = parse_fastq_records(&output_fq);
     assert_eq!(
@@ -338,7 +338,7 @@ fn test_fastq_multithreaded() {
         output_fq.to_str().unwrap(),
     ])
     .expect("failed to parse fastq args");
-    cmd.execute("test").expect("fastq command failed");
+    cmd.execute("fgumi fastq").expect("fastq command failed");
 
     let records = parse_fastq_records(&output_fq);
     assert_eq!(records.len(), 20, "Should have 20 FASTQ records (10 pairs)");
@@ -364,7 +364,7 @@ fn test_fastq_hex_flags() {
         output_fq.to_str().unwrap(),
     ])
     .expect("failed to parse fastq args");
-    cmd.execute("test").expect("fastq command failed");
+    cmd.execute("fgumi fastq").expect("fastq command failed");
 
     let records = parse_fastq_records(&output_fq);
     assert_eq!(records.len(), 2);
@@ -388,7 +388,8 @@ fn test_fastq_output_same_as_input_rejected() {
         input_bam.to_str().unwrap(),
     ])
     .expect("failed to parse fastq args");
-    let err = cmd.execute("test").expect_err("execute must reject identical --input/--output");
+    let err =
+        cmd.execute("fgumi fastq").expect_err("execute must reject identical --input/--output");
     assert!(err.to_string().contains("must differ"), "unexpected error message: {err}");
 
     // Most importantly: the input BAM must not have been truncated.
@@ -396,5 +397,39 @@ fn test_fastq_output_same_as_input_rejected() {
     assert_eq!(
         input_size_before, input_size_after,
         "input BAM was truncated/clobbered by --output=--input"
+    );
+}
+
+/// `--output` pointing at a symlink that resolves to `--input` must also be
+/// rejected. Lexical `PathBuf` comparison misses this case, so the validator
+/// also canonicalises both sides when the output already exists.
+#[cfg(unix)]
+#[test]
+fn test_fastq_output_symlink_to_input_rejected() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_link = temp_dir.path().join("output.bam");
+
+    create_paired_bam(&input_bam, vec![("read1", "ACGT", "IIII", "TGCA", "IIII", false)]);
+    std::os::unix::fs::symlink(&input_bam, &output_link).expect("create symlink");
+    let input_size_before = std::fs::metadata(&input_bam).expect("stat input").len();
+
+    let cmd = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-o",
+        output_link.to_str().unwrap(),
+    ])
+    .expect("failed to parse fastq args");
+    let err =
+        cmd.execute("fgumi fastq").expect_err("execute must reject --output symlinked to --input");
+    assert!(err.to_string().contains("must differ"), "unexpected error message: {err}");
+
+    // The input BAM must not have been truncated through the symlink.
+    let input_size_after = std::fs::metadata(&input_bam).expect("stat input").len();
+    assert_eq!(
+        input_size_before, input_size_after,
+        "input BAM was truncated/clobbered through symlinked --output"
     );
 }

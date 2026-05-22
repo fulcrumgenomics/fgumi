@@ -6,7 +6,7 @@
 //! 3. Rejected reads output
 
 use clap::Parser;
-use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::duplex::Duplex;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
@@ -173,7 +173,7 @@ fn test_duplex_command_basic() {
         "1",
     ])
     .expect("failed to parse duplex args");
-    cmd.execute("test").expect("Duplex command failed");
+    cmd.execute("fgumi duplex").expect("Duplex command failed");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // Verify consensus reads were produced
@@ -228,7 +228,7 @@ fn test_duplex_command_with_rejects() {
         "1",
     ])
     .expect("failed to parse duplex args");
-    cmd.execute("test").expect("Duplex command with rejects failed");
+    cmd.execute("fgumi duplex").expect("Duplex command with rejects failed");
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 
     crate::helpers::assertions::assert_rejects_header_matches_input(&rejects_bam, &input_bam);
@@ -303,7 +303,7 @@ fn test_duplex_command_rejects_contain_no_duplicates() {
         "1",
     ])
     .expect("failed to parse duplex args");
-    cmd.execute("test").expect("Duplex command with rejects failed");
+    cmd.execute("fgumi duplex").expect("Duplex command with rejects failed");
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 
     crate::helpers::assertions::assert_has_bgzf_eof(&rejects_bam);
@@ -358,6 +358,6 @@ fn test_duplex_command_with_stats() {
         "1",
     ])
     .expect("failed to parse duplex args");
-    cmd.execute("test").expect("Duplex command with stats failed");
+    cmd.execute("fgumi duplex").expect("Duplex command with stats failed");
     assert!(stats_path.exists(), "Stats file not created");
 }

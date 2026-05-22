@@ -6,7 +6,7 @@
 //! 3. Basic execution with minimal valid inputs
 
 use clap::Parser;
-use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::review::Review;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder};
@@ -88,7 +88,8 @@ fn test_review_missing_input_files() {
         temp_dir.path().join("output").to_str().unwrap(),
     ])
     .expect("failed to parse review args");
-    let err = cmd.execute("test").expect_err("Review should fail for nonexistent input files");
+    let err =
+        cmd.execute("fgumi review").expect_err("Review should fail for nonexistent input files");
     let err_msg = format!("{err:#}");
     assert!(
         err_msg.contains("does not exist"),
@@ -171,7 +172,7 @@ fn test_review_basic_execution() {
         output_prefix.to_str().unwrap(),
     ])
     .expect("failed to parse review args");
-    cmd.execute("test").unwrap_or_else(|e| panic!("Review command failed: {e:#}"));
+    cmd.execute("fgumi review").unwrap_or_else(|e| panic!("Review command failed: {e:#}"));
 
     // Verify output files were created
     let consensus_out = output_prefix.with_extension("consensus.bam");

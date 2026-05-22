@@ -25,7 +25,7 @@ fn fgumi_sort_in_process(args: &[OsString]) -> anyhow::Result<()> {
     // values, so feeding `OsString` through avoids a UTF-8 round-trip that
     // would panic on a non-UTF-8 temp-dir path.
     let cmd = Sort::try_parse_from(args.iter().cloned()).expect("failed to parse sort args");
-    cmd.execute("test")
+    cmd.execute("fgumi sort")
 }
 
 fn samtools_available() -> bool {
