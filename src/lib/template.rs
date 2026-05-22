@@ -128,6 +128,10 @@ impl Template {
 
     /// Returns mutable access to all records.
     pub fn records_mut(&mut self) -> &mut [RawRecord] {
+        // Mutating raw record bytes can rewrite aux data and shift the offsets
+        // captured by `cached_umi_position`. Clear the cache so `cached_umi()`
+        // does not return stale slices afterward.
+        self.cached_umi_position = None;
         &mut self.records
     }
 
@@ -454,6 +458,11 @@ impl Template {
     #[allow(clippy::too_many_lines)]
     pub fn fix_mate_info(&mut self) -> Result<()> {
         use fgumi_raw_bam;
+
+        // remove_tag / append_*_tag below rewrite MS/MC/MQ aux entries on
+        // primary records, which can shift RX bytes. Drop any cached UMI
+        // offset so `cached_umi()` does not return stale slices.
+        self.cached_umi_position = None;
 
         let rr = &mut self.records;
 
@@ -2697,5 +2706,42 @@ mod tests {
         let decoded = vec![decoded_with_cached_umi(supp), decoded_with_cached_umi(primary)];
         let template = Template::from_decoded_records(decoded).expect("template builds");
         assert_eq!(template.cached_umi(), Some(b"PRIMARYY".as_ref()));
+    }
+
+    #[test]
+    fn test_records_mut_invalidates_umi_cache() {
+        // Handing out mutable access to the primary record bytes can shift
+        // aux data, so the cached UMI offset must be cleared defensively.
+        let r1 =
+            build_raw_with_umi(b"read1", raw_flags::PAIRED | raw_flags::FIRST_SEGMENT, b"ACGTACGT");
+        let template = Template::from_decoded_records(vec![decoded_with_cached_umi(r1)])
+            .expect("template builds");
+        assert_eq!(template.cached_umi(), Some(b"ACGTACGT".as_ref()));
+
+        let mut template = template;
+        let _ = template.records_mut();
+        assert!(template.cached_umi_position.is_none());
+        assert!(template.cached_umi().is_none());
+    }
+
+    #[test]
+    fn test_fix_mate_info_invalidates_umi_cache() {
+        // fix_mate_info rewrites MS/MC/MQ aux tags on primary records via
+        // remove_tag / append_*_tag, which can shift RX bytes. The cached
+        // offset must be cleared so cached_umi() does not return stale slices.
+        let r1 =
+            build_raw_with_umi(b"read1", raw_flags::PAIRED | raw_flags::FIRST_SEGMENT, b"ACGTACGT");
+        let r2 =
+            build_raw_with_umi(b"read1", raw_flags::PAIRED | raw_flags::LAST_SEGMENT, b"OTHERUMI");
+        let mut template = Template::from_decoded_records(vec![
+            decoded_with_cached_umi(r1),
+            decoded_with_cached_umi(r2),
+        ])
+        .expect("template builds");
+        assert_eq!(template.cached_umi(), Some(b"ACGTACGT".as_ref()));
+
+        template.fix_mate_info().expect("fix_mate_info succeeds");
+        assert!(template.cached_umi_position.is_none());
+        assert!(template.cached_umi().is_none());
     }
 }

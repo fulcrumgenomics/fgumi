@@ -209,7 +209,7 @@ fn bench_tags_read(c: &mut Criterion) {
     c.bench_function("tags::extract_string_batch", |b| {
         b.iter(|| {
             let v = RawRecordView::new(black_box(&bytes));
-            black_box(v.tags().extract_string_batch(b"CR"))
+            black_box(v.tags().extract_string_batch(b"CR", None))
         });
     });
 }

@@ -514,16 +514,23 @@ fn assign_umi_groups_for_indices(
         let processed_umi = if no_umi {
             String::new()
         } else {
-            let umi_bytes = if let Some(r1_raw) = template.r1() {
+            // Prefer the UMI position cached during the parallel Decode step
+            // (enabled via GroupKeyConfig::with_umi_tag). The fallback exists
+            // for templates built outside the Decode path and for cases where
+            // the cache was disabled.
+            let umi_bytes = if let Some(cached) = template.cached_umi() {
+                cached
+            } else if let Some(r1_raw) = template.r1() {
                 let aux = fgumi_raw_bam::aux_data_slice(r1_raw);
                 fgumi_raw_bam::find_string_tag(aux, raw_tag)
+                    .ok_or_else(|| anyhow::anyhow!("Missing UMI tag"))?
             } else if let Some(r2_raw) = template.r2() {
                 let aux = fgumi_raw_bam::aux_data_slice(r2_raw);
                 fgumi_raw_bam::find_string_tag(aux, raw_tag)
+                    .ok_or_else(|| anyhow::anyhow!("Missing UMI tag"))?
             } else {
-                None
+                bail!("Template has no reads");
             };
-            let umi_bytes = umi_bytes.ok_or_else(|| anyhow::anyhow!("No UMI tag found"))?;
             let umi_str = std::str::from_utf8(umi_bytes)
                 .map_err(|e| anyhow::anyhow!("Invalid UTF-8: {e}"))?;
             let is_r1_earlier = if let (Some(r1), Some(r2)) = (template.r1(), template.r2()) {
@@ -1029,7 +1036,17 @@ impl Command for MarkDuplicates {
         info!("Using pipeline with {num_threads} threads");
 
         let library_index = LibraryIndex::from_header(&header);
-        pipeline_config.group_key_config = Some(GroupKeyConfig::new(library_index, cell_tag));
+        // Cache the UMI tag's value position on each DecodedRecord so the
+        // Process step's UMI-assignment pass can slice the value without
+        // re-scanning aux data (issue #334). In `--no-umi` mode the
+        // assignment site emits `String::new()` and never reads the cache,
+        // so populating it during decode would be pure overhead.
+        let group_key_config = GroupKeyConfig::new(library_index, cell_tag);
+        pipeline_config.group_key_config = Some(if self.no_umi {
+            group_key_config
+        } else {
+            group_key_config.with_umi_tag(*raw_tag)
+        });
 
         // Cumulative MoleculeId counter, advanced **only** by the
         // serial-ordered MI Assign hook installed below. Mirrors the
