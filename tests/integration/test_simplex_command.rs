@@ -1,11 +1,14 @@
 //! End-to-end CLI tests for the simplex command.
 //!
-//! These tests run the actual `fgumi simplex` binary and validate:
+//! These tests invoke `Simplex::execute()` in-process and validate:
 //! 1. Basic simplex consensus calling from grouped reads
 //! 2. Statistics output
 //! 3. Rejected reads output
 
 use bstr::BString;
+use clap::Parser;
+use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::simplex::Simplex;
 use fgumi_lib::sam::SamTag;
 use noodles::bam;
 use noodles::sam::Header;
@@ -16,7 +19,6 @@ use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::process::Command;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, create_umi_family, to_record_buf};
@@ -54,22 +56,19 @@ fn test_simplex_command_basic_consensus() {
     let family2 = create_umi_family("TGCA", 5, "fam2", "TTTTAAAA", 30);
     create_grouped_bam(&input_bam, vec![("1", family1), ("2", family2)]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "simplex",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--min-reads",
-            "2",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run simplex command");
-
-    assert!(status.success(), "Simplex command failed");
+    let cmd = Simplex::try_parse_from([
+        "simplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "2",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse simplex args");
+    cmd.execute("test").expect("Simplex command failed");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // Read output and verify consensus reads were produced
@@ -97,24 +96,21 @@ fn test_simplex_command_with_stats() {
     let family = create_umi_family("ACGT", 5, "fam1", "ACGTACGT", 30);
     create_grouped_bam(&input_bam, vec![("1", family)]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "simplex",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--min-reads",
-            "1",
-            "--stats",
-            stats_path.to_str().unwrap(),
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run simplex command");
-
-    assert!(status.success(), "Simplex command with stats failed");
+    let cmd = Simplex::try_parse_from([
+        "simplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--stats",
+        stats_path.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse simplex args");
+    cmd.execute("test").expect("Simplex command with stats failed");
     assert!(stats_path.exists(), "Stats file not created");
 }
 
@@ -131,24 +127,21 @@ fn test_simplex_command_with_rejects() {
     let family2 = create_umi_family("TGCA", 1, "fam2", "TTTTAAAA", 30);
     create_grouped_bam(&input_bam, vec![("1", family1), ("2", family2)]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "simplex",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--min-reads",
-            "2",
-            "--rejects",
-            rejects_bam.to_str().unwrap(),
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run simplex command");
-
-    assert!(status.success(), "Simplex command with rejects failed");
+    let cmd = Simplex::try_parse_from([
+        "simplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "2",
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse simplex args");
+    cmd.execute("test").expect("Simplex command with rejects failed");
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 }
 
@@ -231,22 +224,19 @@ fn test_simplex_command_collapses_read_group_attributes() {
     let family = create_umi_family("ACGT", 5, "fam1", "ACGTACGT", 30);
     create_grouped_bam_with_header(&input_bam, &header, vec![("1", family)]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "simplex",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--min-reads",
-            "2",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run simplex command");
-
-    assert!(status.success(), "Simplex command failed");
+    let cmd = Simplex::try_parse_from([
+        "simplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "2",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse simplex args");
+    cmd.execute("test").expect("Simplex command failed");
 
     // Read the output header and verify collapsed read group attributes
     let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
@@ -303,25 +293,23 @@ fn test_simplex_command_rejects_inherits_input_read_groups() {
     let rejected = create_umi_family("TGCA", 1, "reject_singleton", "TTTTAAAA", 30);
     create_grouped_bam_with_header(&input_bam, &header, vec![("1", kept), ("2", rejected)]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "simplex",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--rejects",
-            rejects_bam.to_str().unwrap(),
-            "--min-reads",
-            "2",
-            "--threads",
-            "2",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run simplex command");
-    assert!(status.success(), "Simplex command with rejects failed");
+    let cmd = Simplex::try_parse_from([
+        "simplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--min-reads",
+        "2",
+        "--threads",
+        "2",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse simplex args");
+    cmd.execute("test").expect("Simplex command with rejects failed");
 
     // Primary output BAM: consensus header collapses RG1+RG2 -> single "A".
     let primary_header =

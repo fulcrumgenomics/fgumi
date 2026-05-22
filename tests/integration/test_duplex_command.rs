@@ -1,17 +1,19 @@
 //! End-to-end CLI tests for the duplex command.
 //!
-//! These tests run the actual `fgumi duplex` binary and validate:
+//! These tests invoke `Duplex::execute()` in-process and validate:
 //! 1. Basic duplex consensus calling from paired-UMI grouped reads
 //! 2. Statistics output
 //! 3. Rejected reads output
 
+use clap::Parser;
+use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::duplex::Duplex;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
@@ -159,22 +161,19 @@ fn test_duplex_command_basic() {
     let molecule = create_duplex_molecule("1", "ACGTACGT", 30, 100, 3);
     create_duplex_bam(&input_bam, vec![molecule]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "duplex",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--min-reads",
-            "1",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run duplex command");
-
-    assert!(status.success(), "Duplex command failed");
+    let cmd = Duplex::try_parse_from([
+        "duplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse duplex args");
+    cmd.execute("test").expect("Duplex command failed");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // Verify consensus reads were produced
@@ -213,26 +212,23 @@ fn test_duplex_command_with_rejects() {
     let singleton = vec![create_duplex_read_pair("solo", "2/A", "ACGTACGT", 30, 500, false)];
     create_duplex_bam(&input_bam, vec![kept, singleton]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "duplex",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--rejects",
-            rejects_bam.to_str().unwrap(),
-            "--min-reads",
-            "2",
-            "--threads",
-            "2",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run duplex command");
-
-    assert!(status.success(), "Duplex command with rejects failed");
+    let cmd = Duplex::try_parse_from([
+        "duplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--min-reads",
+        "2",
+        "--threads",
+        "2",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse duplex args");
+    cmd.execute("test").expect("Duplex command with rejects failed");
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 
     crate::helpers::assertions::assert_rejects_header_matches_input(&rejects_bam, &input_bam);
@@ -291,26 +287,23 @@ fn test_duplex_command_rejects_contain_no_duplicates() {
     molecules.extend(singletons);
     create_duplex_bam(&input_bam, molecules);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "duplex",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--rejects",
-            rejects_bam.to_str().unwrap(),
-            "--min-reads",
-            "2",
-            "--threads",
-            "2",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run duplex command");
-
-    assert!(status.success(), "Duplex command with rejects failed");
+    let cmd = Duplex::try_parse_from([
+        "duplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--min-reads",
+        "2",
+        "--threads",
+        "2",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse duplex args");
+    cmd.execute("test").expect("Duplex command with rejects failed");
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 
     crate::helpers::assertions::assert_has_bgzf_eof(&rejects_bam);
@@ -351,23 +344,20 @@ fn test_duplex_command_with_stats() {
     let molecule = create_duplex_molecule("1", "ACGTACGT", 30, 100, 3);
     create_duplex_bam(&input_bam, vec![molecule]);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "duplex",
-            "--input",
-            input_bam.to_str().unwrap(),
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--min-reads",
-            "1",
-            "--stats",
-            stats_path.to_str().unwrap(),
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run duplex command");
-
-    assert!(status.success(), "Duplex command with stats failed");
+    let cmd = Duplex::try_parse_from([
+        "duplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--stats",
+        stats_path.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse duplex args");
+    cmd.execute("test").expect("Duplex command with stats failed");
     assert!(stats_path.exists(), "Stats file not created");
 }
