@@ -35,6 +35,7 @@ bytes = "1"
 bytesize = "2.3"
 fs4 = { version = "0.13", default-features = false, features = ["sync"] }
 log = "0"
+zstd = "0.13"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.6"
