@@ -1,5 +1,11 @@
 //! Integration tests for the downsample command.
+//!
+//! These tests invoke the downsample `Command::execute()` in-process rather than spawning
+//! the actual `fgumi downsample` binary.
 
+use clap::Parser;
+use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::downsample::Downsample;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::SamBuilder;
 use noodles::bam;
@@ -8,7 +14,6 @@ use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::create_minimal_header;
@@ -92,24 +97,21 @@ fn test_downsample_basic() {
     create_grouped_bam(&input_bam, families);
 
     // Run downsample with fraction=0.5 and seed for reproducibility
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "downsample",
-            "-i",
-            input_bam.to_str().unwrap(),
-            "-o",
-            output_bam.to_str().unwrap(),
-            "-f",
-            "0.5",
-            "--seed",
-            "42",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run downsample command");
-
-    assert!(status.success(), "Downsample command failed");
+    let cmd = Downsample::try_parse_from([
+        "downsample",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-o",
+        output_bam.to_str().unwrap(),
+        "-f",
+        "0.5",
+        "--seed",
+        "42",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse downsample args");
+    cmd.execute("test").expect("Downsample command failed");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // Verify that some families were kept (with seed 42 and fraction 0.5, should be around 5)
@@ -135,26 +137,23 @@ fn test_downsample_with_rejects() {
         (0..10).map(|i| (Box::leak(format!("{i}").into_boxed_str()) as &str, 5)).collect();
     create_grouped_bam(&input_bam, families);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "downsample",
-            "-i",
-            input_bam.to_str().unwrap(),
-            "-o",
-            output_bam.to_str().unwrap(),
-            "-f",
-            "0.5",
-            "--seed",
-            "42",
-            "--rejects",
-            rejects_bam.to_str().unwrap(),
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run downsample command");
-
-    assert!(status.success(), "Downsample command failed");
+    let cmd = Downsample::try_parse_from([
+        "downsample",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-o",
+        output_bam.to_str().unwrap(),
+        "-f",
+        "0.5",
+        "--seed",
+        "42",
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse downsample args");
+    cmd.execute("test").expect("Downsample command failed");
     assert!(output_bam.exists(), "Output BAM not created");
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 
@@ -180,24 +179,21 @@ fn test_downsample_deterministic() {
 
     // Run twice with same seed
     for output in [&output1_bam, &output2_bam] {
-        let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-            .args([
-                "downsample",
-                "-i",
-                input_bam.to_str().unwrap(),
-                "-o",
-                output.to_str().unwrap(),
-                "-f",
-                "0.3",
-                "--seed",
-                "12345",
-                "--compression-level",
-                "1",
-            ])
-            .status()
-            .expect("Failed to run downsample command");
-
-        assert!(status.success(), "Downsample command failed");
+        let cmd = Downsample::try_parse_from([
+            "downsample",
+            "-i",
+            input_bam.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "-f",
+            "0.3",
+            "--seed",
+            "12345",
+            "--compression-level",
+            "1",
+        ])
+        .expect("failed to parse downsample args");
+        cmd.execute("test").expect("Downsample command failed");
     }
 
     // Both outputs should be identical
@@ -249,28 +245,25 @@ fn test_downsample_histograms() {
     let families = vec![("0", 1), ("1", 2), ("2", 3), ("3", 4), ("4", 5)];
     create_grouped_bam(&input_bam, families);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "downsample",
-            "-i",
-            input_bam.to_str().unwrap(),
-            "-o",
-            output_bam.to_str().unwrap(),
-            "-f",
-            "0.5",
-            "--seed",
-            "42",
-            "--histogram-kept",
-            hist_kept.to_str().unwrap(),
-            "--histogram-rejected",
-            hist_rejected.to_str().unwrap(),
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run downsample command");
-
-    assert!(status.success(), "Downsample command failed");
+    let cmd = Downsample::try_parse_from([
+        "downsample",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-o",
+        output_bam.to_str().unwrap(),
+        "-f",
+        "0.5",
+        "--seed",
+        "42",
+        "--histogram-kept",
+        hist_kept.to_str().unwrap(),
+        "--histogram-rejected",
+        hist_rejected.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse downsample args");
+    cmd.execute("test").expect("Downsample command failed");
     assert!(hist_kept.exists(), "Kept histogram not created");
     assert!(hist_rejected.exists(), "Rejected histogram not created");
 
@@ -292,70 +285,49 @@ fn test_downsample_keep_all() {
     let families = vec![("0", 5), ("1", 3), ("2", 7)];
     create_grouped_bam(&input_bam, families);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "downsample",
-            "-i",
-            input_bam.to_str().unwrap(),
-            "-o",
-            output_bam.to_str().unwrap(),
-            "-f",
-            "1.0",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run downsample command");
-
-    assert!(status.success(), "Downsample command failed");
+    let cmd = Downsample::try_parse_from([
+        "downsample",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-o",
+        output_bam.to_str().unwrap(),
+        "-f",
+        "1.0",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse downsample args");
+    cmd.execute("test").expect("Downsample command failed");
 
     // All records should be kept
     let output_records = read_bam_records(&output_bam);
     assert_eq!(output_records.len(), 15, "All 15 records should be kept with fraction=1.0");
 }
 
-/// Test error handling for invalid fraction.
-#[test]
-fn test_downsample_invalid_fraction() {
+/// Test error handling for invalid fractions. Each case writes to a
+/// distinct output path so an artifact left by one case can never make a
+/// later assertion pass by accident.
+#[rstest::rstest]
+#[case::zero("0.0", "output_zero.bam")]
+#[case::greater_than_one("1.5", "output_gt1.bam")]
+fn test_downsample_invalid_fraction(#[case] fraction: &str, #[case] output_name: &str) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let input_bam = temp_dir.path().join("input.bam");
-    let output_bam = temp_dir.path().join("output.bam");
+    let output_bam = temp_dir.path().join(output_name);
 
     create_grouped_bam(&input_bam, vec![("0", 5)]);
 
-    // Test fraction = 0.0
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "downsample",
-            "-i",
-            input_bam.to_str().unwrap(),
-            "-o",
-            output_bam.to_str().unwrap(),
-            "-f",
-            "0.0",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run downsample command");
-
-    assert!(!status.success(), "Fraction=0.0 should fail");
-
-    // Test fraction > 1.0
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "downsample",
-            "-i",
-            input_bam.to_str().unwrap(),
-            "-o",
-            output_bam.to_str().unwrap(),
-            "-f",
-            "1.5",
-            "--compression-level",
-            "1",
-        ])
-        .status()
-        .expect("Failed to run downsample command");
-
-    assert!(!status.success(), "Fraction>1.0 should fail");
+    let cmd = Downsample::try_parse_from([
+        "downsample",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-o",
+        output_bam.to_str().unwrap(),
+        "-f",
+        fraction,
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse downsample args");
+    assert!(cmd.execute("test").is_err(), "Fraction={fraction} should fail");
 }

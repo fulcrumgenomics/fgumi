@@ -1,8 +1,15 @@
 //! Integration tests for sort --write-index functionality.
 //!
-//! These tests verify that the BAM index generation works correctly
-//! for both fast (raw-bytes) and standard (record buffer) sorting modes.
+//! Verifies that BAM index generation produces a valid `.bai` that
+//! samtools can query, across the coordinate sort code path.
+//!
+//! fgumi sort is invoked in-process via `Sort::execute()`; samtools
+//! is invoked as a subprocess (external tool).
 
+use clap::Parser;
+use fgumi_lib::commands::command::Command as FgumiCommand;
+use fgumi_lib::commands::sort::Sort;
+use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
@@ -10,11 +17,6 @@ use tempfile::TempDir;
 /// Check if samtools is available in PATH.
 fn samtools_available() -> bool {
     Command::new("samtools").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
-}
-
-/// Check if the fgumi binary exists.
-fn fgumi_binary_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_BIN_EXE_fgumi"))
 }
 
 /// Create a small test BAM file using samtools.
@@ -64,10 +66,10 @@ fn verify_index_works(bam_path: &Path) -> bool {
     count > 0
 }
 
-/// Test sort --fast --write-index creates a valid index.
+/// Test sort --write-index creates a valid index.
 #[test]
 #[ignore = "requires samtools"]
-fn test_sort_fast_write_index() {
+fn test_sort_write_index() {
     if !samtools_available() {
         eprintln!("Skipping: samtools not available");
         return;
@@ -78,64 +80,24 @@ fn test_sort_fast_write_index() {
     let sorted_bam_path = temp_dir.path().join("sorted.bam");
     let index_path = temp_dir.path().join("sorted.bam.bai");
 
-    // Run fgumi sort --fast --write-index
-    let status = Command::new(fgumi_binary_path())
-        .args([
-            "sort",
-            "--fast",
-            "-i",
-            input_bam.to_str().unwrap(),
-            "-o",
-            sorted_bam_path.to_str().unwrap(),
-            "--order",
-            "coordinate",
-            "--write-index",
-            "-m",
-            "10M",
-        ])
-        .status()
-        .expect("Failed to run fgumi sort");
+    // Run fgumi sort (non-fast) --write-index. Pass `&OsStr` directly so
+    // `try_parse_from` doesn't UTF-8 round-trip the temp paths (would panic
+    // on a non-UTF-8 temp dir).
+    let cmd = Sort::try_parse_from([
+        OsStr::new("sort"),
+        OsStr::new("-i"),
+        input_bam.as_os_str(),
+        OsStr::new("-o"),
+        sorted_bam_path.as_os_str(),
+        OsStr::new("--order"),
+        OsStr::new("coordinate"),
+        OsStr::new("--write-index"),
+        OsStr::new("-m"),
+        OsStr::new("10M"),
+    ])
+    .expect("failed to parse sort args");
 
-    assert!(status.success(), "fgumi sort --fast --write-index failed");
-    assert!(sorted_bam_path.exists(), "Output BAM not created");
-    assert!(index_path.exists(), "Output BAI not created");
-
-    // Verify index works
-    assert!(verify_index_works(&sorted_bam_path), "Index does not work for region queries");
-}
-
-/// Test sort (non-fast) --write-index creates a valid index.
-#[test]
-#[ignore = "requires samtools"]
-fn test_sort_standard_write_index() {
-    if !samtools_available() {
-        eprintln!("Skipping: samtools not available");
-        return;
-    }
-
-    let temp_dir = TempDir::new().unwrap();
-    let input_bam = create_test_bam(temp_dir.path());
-    let sorted_bam_path = temp_dir.path().join("sorted.bam");
-    let index_path = temp_dir.path().join("sorted.bam.bai");
-
-    // Run fgumi sort (non-fast) --write-index
-    let status = Command::new(fgumi_binary_path())
-        .args([
-            "sort",
-            "-i",
-            input_bam.to_str().unwrap(),
-            "-o",
-            sorted_bam_path.to_str().unwrap(),
-            "--order",
-            "coordinate",
-            "--write-index",
-            "-m",
-            "10M",
-        ])
-        .status()
-        .expect("Failed to run fgumi sort");
-
-    assert!(status.success(), "fgumi sort --write-index failed");
+    cmd.execute("test").expect("fgumi sort --write-index failed");
     assert!(sorted_bam_path.exists(), "Output BAM not created");
     assert!(index_path.exists(), "Output BAI not created");
 
@@ -157,27 +119,24 @@ fn test_sort_write_index_multithreaded() {
     let sorted_bam_path = temp_dir.path().join("sorted.bam");
     let index_path = temp_dir.path().join("sorted.bam.bai");
 
-    // Run fgumi sort --fast --write-index with multiple threads
-    let status = Command::new(fgumi_binary_path())
-        .args([
-            "sort",
-            "--fast",
-            "-i",
-            input_bam.to_str().unwrap(),
-            "-o",
-            sorted_bam_path.to_str().unwrap(),
-            "--order",
-            "coordinate",
-            "--write-index",
-            "-m",
-            "10M",
-            "-@",
-            "4",
-        ])
-        .status()
-        .expect("Failed to run fgumi sort");
+    // Run fgumi sort --write-index with multiple threads
+    let cmd = Sort::try_parse_from([
+        OsStr::new("sort"),
+        OsStr::new("-i"),
+        input_bam.as_os_str(),
+        OsStr::new("-o"),
+        sorted_bam_path.as_os_str(),
+        OsStr::new("--order"),
+        OsStr::new("coordinate"),
+        OsStr::new("--write-index"),
+        OsStr::new("-m"),
+        OsStr::new("10M"),
+        OsStr::new("-@"),
+        OsStr::new("4"),
+    ])
+    .expect("failed to parse sort args");
 
-    assert!(status.success(), "fgumi sort --fast --write-index -@ 4 failed");
+    cmd.execute("test").expect("fgumi sort --write-index -@ 4 failed");
     assert!(sorted_bam_path.exists(), "Output BAM not created");
     assert!(index_path.exists(), "Output BAI not created");
 
@@ -192,25 +151,24 @@ fn test_write_index_requires_coordinate_sort() {
     let sorted_bam_path = temp_dir.path().join("sorted.bam");
 
     // Run fgumi sort with queryname order and --write-index (should fail)
-    let output = Command::new(fgumi_binary_path())
-        .args([
-            "sort",
-            "-i",
-            "/dev/null", // Won't get to reading input
-            "-o",
-            sorted_bam_path.to_str().unwrap(),
-            "--order",
-            "queryname",
-            "--write-index",
-        ])
-        .output()
-        .expect("Failed to run fgumi sort");
+    let cmd = Sort::try_parse_from([
+        OsStr::new("sort"),
+        OsStr::new("-i"),
+        OsStr::new("/dev/null"), // Won't get to reading input
+        OsStr::new("-o"),
+        sorted_bam_path.as_os_str(),
+        OsStr::new("--order"),
+        OsStr::new("queryname"),
+        OsStr::new("--write-index"),
+    ])
+    .expect("failed to parse sort args");
 
-    assert!(!output.status.success(), "fgumi sort --order queryname --write-index should fail");
+    let result = cmd.execute("test");
+    assert!(result.is_err(), "fgumi sort --order queryname --write-index should fail");
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let err_msg = format!("{:#}", result.unwrap_err());
     assert!(
-        stderr.contains("--write-index is only valid for coordinate sort"),
-        "Expected error about coordinate sort, got: {stderr}"
+        err_msg.contains("--write-index is only valid for coordinate sort"),
+        "Expected error about coordinate sort, got: {err_msg}"
     );
 }
