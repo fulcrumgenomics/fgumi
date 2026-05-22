@@ -512,10 +512,15 @@ impl DuplexMetrics {
             // and B = size - A. Equivalent to:
             //   P(min_ba <= A <= size - min_ab)
             //   = CDF(size - min_ab) - CDF(min_ba - 1)
-            let binomial = match Binomial::new(0.5, size as u64) {
-                Ok(b) => b,
-                Err(_) => continue, // Skip if binomial creation fails
-            };
+
+            // `Binomial::new(p, n)` only returns `Err` when `p` is NaN or
+            // outside `[0, 1]` (statrs 0.18 `BinomialError::ProbabilityInvalid`).
+            // With `p = 0.5` hardcoded the `Err` arm is statically unreachable;
+            // expect rather than silently skip so a future refactor that lets
+            // `p` become dynamic surfaces immediately instead of silently
+            // dropping families from the ideal-fraction calculation.
+            let binomial = Binomial::new(0.5, size as u64)
+                .expect("p = 0.5 is always a valid probability for Binomial::new");
 
             let upper_bound = size - min_ba;
             let lower_bound = min_ab;
