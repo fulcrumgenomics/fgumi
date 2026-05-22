@@ -35,6 +35,7 @@ use anyhow::{Result, anyhow};
 use fgumi_simd_fastq::SimdFastqReader;
 use read_structure::ReadStructure;
 use read_structure::SegmentType;
+use read_structure::SkipHandling;
 use std::fmt::Display;
 use std::io::BufRead;
 use std::iter::Filter;
@@ -253,24 +254,36 @@ impl FastqSet {
             );
         }
 
-        // Extract segments according to the read structure
-        for (segment_index, read_segment) in read_structure.iter().enumerate() {
-            let (seq, quals) =
-                read_segment.extract_bases_and_quals(sequence, quality).map_err(|e| {
-                    let read_name_str = String::from_utf8_lossy(header);
-                    anyhow::anyhow!(
-                        "Error extracting bases (len: {}) or quals (len: {}) for the {}th \
-                         segment ({}) in read structure ({}) from record {}; {}",
-                        sequence.len(),
-                        quality.len(),
-                        segment_index,
-                        read_segment,
-                        read_structure,
-                        read_name_str,
-                        e
-                    )
-                })?;
+        // Zero-length reads paired with a variable-length structure (e.g. `+T`)
+        // are valid inputs that downstream code converts to "N" @ Q2. The 0.3
+        // `extract` API rejects these because the `+` segment must contribute at
+        // least one base; emit empty segments directly to preserve 0.2 behavior.
+        if sequence.is_empty() {
+            for read_segment in read_structure.iter() {
+                segments.push(FastqSegment {
+                    seq: Vec::new(),
+                    quals: Vec::new(),
+                    segment_type: read_segment.kind,
+                });
+            }
+            return Ok(Self { header: header.to_vec(), segments, skip_reason: None });
+        }
 
+        let extracted =
+            read_structure.extract(sequence, quality, SkipHandling::Include).map_err(|e| {
+                let read_name_str = String::from_utf8_lossy(header);
+                anyhow::anyhow!(
+                    "Error extracting bases (len: {}) or quals (len: {}) in read structure ({}) \
+                     from record {}; {}",
+                    sequence.len(),
+                    quality.len(),
+                    read_structure,
+                    read_name_str,
+                    e
+                )
+            })?;
+
+        for (read_segment, seq, quals) in extracted {
             segments.push(FastqSegment {
                 seq: seq.to_vec(),
                 quals: quals.to_vec(),

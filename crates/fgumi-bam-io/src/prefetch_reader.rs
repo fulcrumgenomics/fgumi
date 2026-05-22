@@ -171,8 +171,8 @@ impl PrefetchReader {
     /// Panics if `chunk_size == 0` or `prefetch_depth == 0`.
     #[must_use]
     pub fn from_file_with_config(file: File, chunk_size: usize, prefetch_depth: usize) -> Self {
-        let hint_fd = crate::os_hints::hint_fd(&file);
-        Self::build(file, chunk_size, prefetch_depth, hint_fd)
+        let hint_file = crate::os_hints::hint_file(&file);
+        Self::build(file, chunk_size, prefetch_depth, hint_file)
     }
 
     /// Shared construction logic.
@@ -180,7 +180,7 @@ impl PrefetchReader {
         inner: R,
         chunk_size: usize,
         prefetch_depth: usize,
-        hint_fd: Option<i32>,
+        hint_file: Option<File>,
     ) -> Self {
         assert!(chunk_size > 0, "PrefetchReader chunk_size must be > 0");
         assert!(prefetch_depth > 0, "PrefetchReader prefetch_depth must be > 0");
@@ -188,7 +188,7 @@ impl PrefetchReader {
         let (tx, rx) = bounded::<Item>(prefetch_depth);
         let handle = thread::Builder::new()
             .name("fgumi-prefetch".to_string())
-            .spawn(move || producer_main(inner, chunk_size, hint_fd, &tx))
+            .spawn(move || producer_main(inner, chunk_size, hint_file.as_ref(), &tx))
             .expect("failed to spawn fgumi-prefetch thread");
 
         Self {
@@ -220,10 +220,15 @@ impl PrefetchReader {
 /// Entry point for the producer thread. Wraps [`producer_loop`] so that a
 /// panic inside the inner reader surfaces on the consumer side as an
 /// [`io::Error`] instead of a silently-truncated stream.
-fn producer_main<R: Read>(inner: R, chunk_size: usize, hint_fd: Option<i32>, tx: &Sender<Item>) {
+fn producer_main<R: Read>(
+    inner: R,
+    chunk_size: usize,
+    hint_file: Option<&File>,
+    tx: &Sender<Item>,
+) {
     let tx_for_panic = tx.clone();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        producer_loop(inner, chunk_size, hint_fd, tx);
+        producer_loop(inner, chunk_size, hint_file, tx);
     }));
     if let Err(payload) = result {
         let msg = match payload.downcast_ref::<&'static str>() {
@@ -246,14 +251,14 @@ fn producer_main<R: Read>(inner: R, chunk_size: usize, hint_fd: Option<i32>, tx:
 /// channel traffic. Tolerates `Interrupted` errors. Exits on EOF, I/O error,
 /// or when the consumer drops the receiver.
 ///
-/// When `hint_fd` is `Some`, the loop calls
+/// When `hint_file` is `Some`, the loop calls
 /// `posix_fadvise(POSIX_FADV_WILLNEED)` after each chunk to proactively page
 /// in the next [`WILLNEED_LOOKAHEAD`] bytes. This removes the
 /// dependence on the kernel's default `read_ahead_kb` setting.
 fn producer_loop<R: Read>(
     mut inner: R,
     chunk_size: usize,
-    hint_fd: Option<i32>,
+    hint_file: Option<&File>,
     tx: &Sender<Item>,
 ) {
     let mut position: i64 = 0;
@@ -298,8 +303,8 @@ fn producer_loop<R: Read>(
         // Ask the kernel to start paging in bytes ahead of our current
         // position. The call is non-blocking — the kernel initiates the I/O
         // and returns immediately.
-        if let Some(fd) = hint_fd {
-            crate::os_hints::advise_willneed_raw(fd, position, WILLNEED_LOOKAHEAD);
+        if let Some(file) = hint_file {
+            crate::os_hints::advise_willneed(file, position, WILLNEED_LOOKAHEAD);
         }
 
         buf.truncate(filled);

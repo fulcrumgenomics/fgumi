@@ -27,63 +27,56 @@ pub fn advise_sequential(file: &File) {
     let _ = file;
 }
 
-/// Hint to the kernel that `len` bytes starting at `offset` on raw file
-/// descriptor `fd` will be needed soon. On Linux this triggers asynchronous
-/// page-in via `posix_fadvise(POSIX_FADV_WILLNEED)` — the kernel starts I/O
-/// immediately and returns without blocking. On other platforms this is a
-/// no-op.
+/// Hint to the kernel that `len` bytes starting at `offset` on `file` will be
+/// needed soon. On Linux this triggers asynchronous page-in via
+/// `posix_fadvise(POSIX_FADV_WILLNEED)` — the kernel starts I/O immediately
+/// and returns without blocking. On other platforms this is a no-op.
 ///
-/// This is the raw-fd variant for use inside the [`PrefetchReader`] producer
-/// thread, which owns the `File` and cannot lend a reference back. The fd
-/// remains valid because the producer thread keeps the `File` alive for the
-/// duration of its loop.
+/// Used inside the [`PrefetchReader`] producer thread, which owns a clone of
+/// the underlying file and uses it solely to issue these hints.
 ///
 /// [`PrefetchReader`]: crate::prefetch_reader::PrefetchReader
-pub fn advise_willneed_raw(fd: i32, offset: i64, len: i64) {
-    // Intentionally takes a bare `i32` rather than `RawFd` so callers outside
-    // `cfg(unix)` can still compile without importing platform-specific types.
+pub fn advise_willneed(file: &File, offset: i64, len: i64) {
     #[cfg(target_os = "linux")]
-    linux::advise_willneed_raw(fd, offset, len);
+    linux::advise_willneed(file, offset, len);
     #[cfg(not(target_os = "linux"))]
-    let _ = (fd, offset, len);
+    let _ = (file, offset, len);
 }
 
-/// Extract the raw file descriptor from `file` on Linux so it can be passed to
-/// [`advise_willneed_raw`] from a thread that owns the `File`. Returns `None`
-/// on non-Linux platforms where `posix_fadvise` is unavailable.
+/// Clone `file` for use as a separate fd that the prefetch producer can keep
+/// alive solely to issue `posix_fadvise` hints against. Returns `None` on
+/// non-Linux platforms (where the hint is a no-op) and on Linux if the clone
+/// fails — the reader still works, the hint is simply skipped.
 #[must_use]
 #[cfg(target_os = "linux")]
-pub fn hint_fd(file: &File) -> Option<i32> {
-    use std::os::fd::AsRawFd;
-    Some(file.as_raw_fd())
+pub fn hint_file(file: &File) -> Option<File> {
+    file.try_clone().ok()
 }
 
 /// Non-Linux stub — always returns `None`.
 #[must_use]
 #[cfg(not(target_os = "linux"))]
-pub fn hint_fd(_file: &File) -> Option<i32> {
+pub fn hint_file(_file: &File) -> Option<File> {
     None
 }
 
 #[cfg(target_os = "linux")]
 mod linux {
     use std::fs::File;
-    use std::os::fd::AsRawFd;
 
     use nix::fcntl::{PosixFadviseAdvice, posix_fadvise};
 
     pub(super) fn advise_sequential(file: &File) {
         // offset = 0, len = 0 applies the hint to the entire file (current and
         // future contents). Errors are non-fatal — log and move on.
-        let fd = file.as_raw_fd();
-        if let Err(e) = posix_fadvise(fd, 0, 0, PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL) {
-            log::debug!("posix_fadvise(POSIX_FADV_SEQUENTIAL) failed on fd {fd}: {e}");
+        if let Err(e) = posix_fadvise(file, 0, 0, PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL) {
+            log::debug!("posix_fadvise(POSIX_FADV_SEQUENTIAL) failed: {e}");
         }
     }
 
-    pub(super) fn advise_willneed_raw(fd: i32, offset: i64, len: i64) {
-        if let Err(e) = posix_fadvise(fd, offset, len, PosixFadviseAdvice::POSIX_FADV_WILLNEED) {
-            log::debug!("posix_fadvise(POSIX_FADV_WILLNEED) failed on fd {fd}: {e}");
+    pub(super) fn advise_willneed(file: &File, offset: i64, len: i64) {
+        if let Err(e) = posix_fadvise(file, offset, len, PosixFadviseAdvice::POSIX_FADV_WILLNEED) {
+            log::debug!("posix_fadvise(POSIX_FADV_WILLNEED) failed: {e}");
         }
     }
 }

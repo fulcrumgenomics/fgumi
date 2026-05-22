@@ -20,7 +20,7 @@ fgumi-bam-io = { workspace = true }
 noodles = { version = "0.110.0", features = ["bam", "sam", "core", "csi"] }
 noodles-bgzf = { version = "0.47.0", features = ["libdeflate"] }
 libdeflater = "1.22"
-libmimalloc-sys = { version = "0.1.44", features = ["extended"] }
+libmimalloc-sys = { version = "0.1.48", features = ["extended"] }
 rayon = "1.10"
 crossbeam-channel = "0.5"
 crossbeam-queue = "0.3"
