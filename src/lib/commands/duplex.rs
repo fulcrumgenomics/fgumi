@@ -83,7 +83,7 @@ impl MemoryEstimate for DuplexProcessedBatch {
     fn estimate_heap_size(&self) -> usize {
         let rej_size: usize = self.rejected_records.iter().map(Vec::capacity).sum();
         let rej_vec_overhead = self.rejected_records.capacity() * std::mem::size_of::<Vec<u8>>();
-        self.consensus_output.data.capacity() + rej_size + rej_vec_overhead
+        self.consensus_output.estimate_heap_size() + rej_size + rej_vec_overhead
     }
 }
 
