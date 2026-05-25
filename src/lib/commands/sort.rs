@@ -29,7 +29,7 @@ use clap::Parser;
 use fgumi_bam_io::create_raw_bam_reader;
 use fgumi_sort::{QuerynameComparator, RawExternalSorter, SortOrder};
 
-use log::info;
+use log::{debug, info};
 use std::path::PathBuf;
 
 use crate::commands::command::Command;
@@ -483,7 +483,7 @@ fn resolve_memory_limit(
                         ByteSize(margin as u64),
                     );
                 }
-                info!(
+                debug!(
                     "Auto memory: using {} of {} ({}/thread x {} threads, reserve {})",
                     ByteSize(budget as u64),
                     ByteSize(total as u64),
@@ -494,7 +494,7 @@ fn resolve_memory_limit(
                 budget
             } else {
                 let budget = available.max(MIN_MEMORY_PER_THREAD);
-                info!(
+                debug!(
                     "Auto memory: using {} of {} (fixed total, reserve {})",
                     ByteSize(budget as u64),
                     ByteSize(total as u64),
@@ -557,7 +557,7 @@ impl Sort {
 
         let cell_tag = self.parse_cell_tag()?;
 
-        info!("Starting Sort");
+        debug!("Starting Sort");
         info!("Input: {}", self.input.display());
         info!("Output: {}", output.display());
         info!("Sort order: {:?}", self.order);
@@ -654,7 +654,7 @@ impl Sort {
 
         let timer = OperationTimer::new("Verifying BAM sort order");
 
-        info!("Starting Sort Verification");
+        debug!("Starting Sort Verification");
         info!("Input: {}", self.input.display());
         info!("Expected order: {:?}", self.order);
         if let Some(ct) = cell_tag {
