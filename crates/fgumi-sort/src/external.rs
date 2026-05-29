@@ -789,14 +789,14 @@ impl<K: RawSortKey + Default + 'static> MemorySources<K> {
             Self::Shared(chunks) => {
                 for chunk in chunks {
                     if !chunk.is_empty() {
-                        sources.push(ChunkSource::Memory { chunk, idx: 0 });
+                        sources.push(ChunkSource::Memory { chunk, idx: usize::MAX });
                     }
                 }
             }
             Self::Owned(chunks) => {
                 for records in chunks {
                     if !records.is_empty() {
-                        sources.push(ChunkSource::MemoryOwned { records, idx: 0 });
+                        sources.push(ChunkSource::MemoryOwned { records, idx: usize::MAX });
                     }
                 }
             }
@@ -805,78 +805,100 @@ impl<K: RawSortKey + Default + 'static> MemorySources<K> {
 }
 
 /// Source for keyed chunks during merge (disk or in-memory).
+///
+/// Each variant owns its "current record" state internally so the merge loop
+/// can borrow the current record's bytes via [`Self::current_bytes`] without
+/// copying. Disk-backed variants own a `scratch: Vec<u8>` holding the most
+/// recently read record's bytes; `Memory`/`MemoryOwned` borrow directly from
+/// their backing store, eliminating the per-record memcpy on the in-memory path.
 enum ChunkSource<K: RawSortKey + Default + 'static> {
     /// Disk-based chunk with prefetching reader (legacy path with per-source threads).
-    Disk(GenericKeyedChunkReader<K>),
-    /// In-memory chunk from an inline-buffer sort (coordinate /
-    /// template). All records borrow their bytes from a shared
-    /// `Arc<SegmentedBuf>`; merge bridges via `extend_from_slice`.
+    Disk {
+        reader: GenericKeyedChunkReader<K>,
+        /// Bytes for the current record (filled by the most recent `advance`).
+        scratch: Vec<u8>,
+    },
+    /// In-memory chunk from an inline-buffer sort (coordinate / template).
+    /// All records borrow their bytes from a shared `Arc<SegmentedBuf>`;
+    /// `current_bytes` borrows them directly (zero-copy).
+    ///
+    /// `idx` is the index of the CURRENT record. Sentinel `usize::MAX` means
+    /// "no record loaded yet"; the first `advance` lands on 0.
     Memory { chunk: InMemoryChunk<K>, idx: usize },
-    /// In-memory chunk from a queryname-style sort, where each record
-    /// was already accumulated upstream as its own `RawRecord` (owned
-    /// `Vec<u8>`). Merge bridges via `mem::swap` to preserve the
-    /// zero-copy bridge that the streaming path already pays an
-    /// allocation for upstream.
+    /// In-memory chunk from a queryname-style sort (each record an owned
+    /// `RawRecord`). `current_bytes` borrows `records[idx].1` directly.
+    ///
+    /// `idx` uses the same `usize::MAX` sentinel as `Memory`.
     MemoryOwned { records: Vec<(K, fgumi_raw_bam::RawRecord)>, idx: usize },
     /// Pool-integrated disk source — workers read and decompress, main thread parses.
-    /// The `source_id` maps to the `MainThreadChunkConsumer`'s per-source buffer.
-    PoolDisk { source_id: usize },
+    PoolDisk {
+        source_id: usize,
+        /// Bytes for the current record (filled by the most recent `advance`).
+        scratch: Vec<u8>,
+    },
 }
 
 impl<K: RawSortKey + Default + 'static> ChunkSource<K> {
-    /// Fill `buf` with the next record's bytes and return the sort key,
-    /// or `None` at EOF.
+    /// Advance to the next record. Returns its key, or `None` at EOF.
     ///
-    /// For `PoolDisk` sources, `consumer` must be `Some`.
-    fn next_record(
-        &mut self,
-        buf: &mut Vec<u8>,
-        consumer: Option<&mut MainThreadChunkConsumer<K>>,
-    ) -> Result<Option<K>> {
+    /// For `PoolDisk` sources, `consumer` must be `Some`. After this returns
+    /// `Some(_)`, callers may invoke [`Self::current_bytes`] to borrow the
+    /// record's bytes without copying.
+    fn advance(&mut self, consumer: Option<&mut MainThreadChunkConsumer<K>>) -> Result<Option<K>> {
         match self {
-            ChunkSource::Disk(reader) => reader.next_record(buf),
+            ChunkSource::Disk { reader, scratch } => reader.next_record(scratch),
+            ChunkSource::PoolDisk { source_id, scratch } => {
+                let c = consumer.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "PoolDisk source (id {source_id}) requires a MainThreadChunkConsumer \
+                         but none was provided — this is a bug in the sort pipeline"
+                    )
+                })?;
+                c.next_record(*source_id, scratch)
+            }
             ChunkSource::Memory { chunk, idx } => {
-                if *idx < chunk.len() {
-                    // Copy record bytes out of the shared backing
-                    // `SegmentedBuf` into the merge scratch. The
-                    // previous owned-`RawRecord`-per-record design
-                    // could `mem::swap` here, but paid one heap
-                    // allocation per record at materialization time;
-                    // sharing the backing store eliminates the
-                    // per-record allocation in exchange for one
-                    // memcpy at merge time.
-                    let bytes = chunk.record_bytes(*idx);
-                    buf.clear();
-                    buf.extend_from_slice(bytes);
-                    let key = chunk.take_key(*idx);
-                    *idx += 1;
+                // Sentinel `usize::MAX` → first advance lands on 0.
+                let next = if *idx == usize::MAX { 0 } else { *idx + 1 };
+                if next < chunk.len() {
+                    let key = chunk.take_key(next);
+                    *idx = next;
                     Ok(Some(key))
                 } else {
                     Ok(None)
                 }
             }
             ChunkSource::MemoryOwned { records, idx } => {
-                if *idx < records.len() {
-                    let (ref mut key, ref mut data) = records[*idx];
-                    // Zero-copy bridge: swap the owned `RawRecord`'s
-                    // inner Vec into the merge scratch. The caller's
-                    // scratch becomes the now-stale previous record.
-                    std::mem::swap(buf, data.as_mut_vec());
-                    let key = std::mem::take(key);
-                    *idx += 1;
+                let next = if *idx == usize::MAX { 0 } else { *idx + 1 };
+                if next < records.len() {
+                    let key = std::mem::take(&mut records[next].0);
+                    *idx = next;
                     Ok(Some(key))
                 } else {
                     Ok(None)
                 }
             }
-            ChunkSource::PoolDisk { source_id } => consumer
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "PoolDisk source (id {source_id}) requires a MainThreadChunkConsumer \
-                         but none was provided — this is a bug in the sort pipeline"
-                    )
-                })?
-                .next_record(*source_id, buf),
+        }
+    }
+
+    /// Bytes for the current record (the one whose key was returned by the
+    /// most recent successful [`Self::advance`]).
+    ///
+    /// Caller MUST have received `Some(_)` from a prior `advance`. The merge
+    /// loops uphold this: the init loop only retains a source whose first
+    /// `advance` returned `Some`, and the main loop only calls this on the
+    /// active tree winner — so the `Disk`/`PoolDisk` empty-scratch case is
+    /// unreachable.
+    fn current_bytes(&self) -> &[u8] {
+        match self {
+            ChunkSource::Disk { scratch, .. } | ChunkSource::PoolDisk { scratch, .. } => scratch,
+            ChunkSource::Memory { chunk, idx } => {
+                debug_assert!(*idx != usize::MAX, "current_bytes called before advance");
+                chunk.record_bytes(*idx)
+            }
+            ChunkSource::MemoryOwned { records, idx } => {
+                debug_assert!(*idx != usize::MAX, "current_bytes called before advance");
+                &records[*idx].1[..]
+            }
         }
     }
 }
@@ -2666,16 +2688,16 @@ impl RawExternalSorter {
             pool.set_phase2_files(chunk_files)?;
 
             for source_id in 0..num_disk {
-                sources.push(ChunkSource::PoolDisk { source_id });
+                sources.push(ChunkSource::PoolDisk { source_id, scratch: Vec::new() });
             }
         } else {
             // Legacy path: per-source reader threads (used by indexing path)
             let sem = make_reader_semaphore(reader_concurrency);
             for path in chunk_files {
-                sources.push(ChunkSource::Disk(GenericKeyedChunkReader::<K>::open(
-                    path,
-                    Some(Arc::clone(&sem)),
-                )?));
+                sources.push(ChunkSource::Disk {
+                    reader: GenericKeyedChunkReader::<K>::open(path, Some(Arc::clone(&sem)))?,
+                    scratch: Vec::new(),
+                });
             }
         }
 
@@ -2768,16 +2790,15 @@ impl RawExternalSorter {
 
         let output_header = self.create_output_header(header);
 
-        // Initialize loser tree with first record from each source
+        // Initialize loser tree with first record from each source.
+        // Each source owns its current-record state internally; no
+        // intermediate `records: Vec<Vec<u8>>` is needed.
         let mut initial_keys: Vec<K> = Vec::with_capacity(sources.len());
-        let mut records: Vec<Vec<u8>> = Vec::with_capacity(sources.len());
         let mut source_map: Vec<usize> = Vec::with_capacity(sources.len());
 
         for (idx, source) in sources.iter_mut().enumerate() {
-            let mut record = Vec::new();
-            if let Some(key) = source.next_record(&mut record, guard.consumer_mut())? {
+            if let Some(key) = source.advance(guard.consumer_mut())? {
                 initial_keys.push(key);
-                records.push(record);
                 source_map.push(idx);
             }
         }
@@ -2813,14 +2834,15 @@ impl RawExternalSorter {
 
         while tree.winner_is_active() {
             let winner = tree.winner();
+            let src_idx = source_map[winner];
             let sample_this = debug_timing && records_merged.is_multiple_of(merge_sample_interval);
 
             if sample_this {
                 let t0 = Instant::now();
-                writer.write_raw_record(&records[winner])?;
+                writer.write_raw_record(sources[src_idx].current_bytes())?;
                 merge_write_secs += t0.elapsed().as_secs_f64();
             } else {
-                writer.write_raw_record(&records[winner])?;
+                writer.write_raw_record(sources[src_idx].current_bytes())?;
             }
 
             records_merged += 1;
@@ -2832,12 +2854,9 @@ impl RawExternalSorter {
                 merge_probe.log_mid_with_depths(depths, consumer_stats);
             }
 
-            let src_idx = source_map[winner];
-
             if sample_this {
                 let t0 = Instant::now();
-                let next =
-                    sources[src_idx].next_record(&mut records[winner], guard.consumer_mut())?;
+                let next = sources[src_idx].advance(guard.consumer_mut())?;
                 merge_read_secs += t0.elapsed().as_secs_f64();
 
                 let t0 = Instant::now();
@@ -2849,8 +2868,7 @@ impl RawExternalSorter {
                 merge_tree_secs += t0.elapsed().as_secs_f64();
                 samples_taken += 1;
             } else {
-                let next =
-                    sources[src_idx].next_record(&mut records[winner], guard.consumer_mut())?;
+                let next = sources[src_idx].advance(guard.consumer_mut())?;
                 if let Some(key) = next {
                     tree.replace_winner(key);
                 } else {
@@ -2927,16 +2945,13 @@ impl RawExternalSorter {
 
         let output_header = self.create_output_header(header);
 
-        // Initialize loser tree with first record from each source
+        // Initialize loser tree with first record from each source.
         let mut initial_keys: Vec<K> = Vec::with_capacity(sources.len());
-        let mut records: Vec<Vec<u8>> = Vec::with_capacity(sources.len());
         let mut source_map: Vec<usize> = Vec::with_capacity(sources.len());
 
         for (idx, source) in sources.iter_mut().enumerate() {
-            let mut record = Vec::new();
-            if let Some(key) = source.next_record(&mut record, None)? {
+            if let Some(key) = source.advance(None)? {
                 initial_keys.push(key);
-                records.push(record);
                 source_map.push(idx);
             }
         }
@@ -2967,11 +2982,11 @@ impl RawExternalSorter {
 
         while tree.winner_is_active() {
             let winner = tree.winner();
-            writer.write_raw_record(&records[winner])?;
+            let src_idx = source_map[winner];
+            writer.write_raw_record(sources[src_idx].current_bytes())?;
             merge_progress.log_if_needed(1);
 
-            let src_idx = source_map[winner];
-            if let Some(key) = sources[src_idx].next_record(&mut records[winner], None)? {
+            if let Some(key) = sources[src_idx].advance(None)? {
                 tree.replace_winner(key);
             } else {
                 tree.remove_winner();
@@ -4402,6 +4417,51 @@ mod tests {
             names_multi, names_single,
             "multi-dir and single-dir sort produced different record orders"
         );
+    }
+
+    #[test]
+    fn test_sort_coordinate_with_index_spilled_preserves_records() {
+        use fgumi_sam::SamBuilder;
+
+        // Enough pairs that an 8 KiB memory limit forces multiple spills,
+        // so the index-emitting merge runs over Disk sources + the in-memory
+        // chunk simultaneously (the mixed-source path the refactor must keep
+        // byte-identical).
+        let num_pairs = 300;
+        let mut builder = SamBuilder::new();
+        for i in 0..num_pairs {
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i:05}"))
+                .start1(i * 200 + 1)
+                .start2(i * 200 + 101)
+                .build();
+        }
+
+        let workdir = tempfile::tempdir().expect("workdir");
+        let input = workdir.path().join("input.bam");
+        let output = workdir.path().join("output.bam");
+        builder.write_bam(&input).expect("write bam");
+
+        let stats = RawExternalSorter::new(SortOrder::Coordinate)
+            .memory_limit(8 * 1024) // tiny → forces several spills
+            .threads(1)
+            .write_index(true) // routes through sort_coordinate_with_index → merge_chunks_with_index
+            .spill_codec(crate::codec::SpillCodec::Bgzf)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&input, &output)
+            .expect("indexed coordinate sort should succeed");
+
+        assert!(stats.chunks_written >= 2, "expected multiple spill chunks");
+
+        // All records preserved.
+        let names = collect_read_names(&output);
+        assert_eq!(names.len(), num_pairs * 2, "record count mismatch");
+
+        // A .bai index was produced alongside the output.
+        let bai = output.with_extension("bam.bai");
+        assert!(bai.exists() || output.with_extension("bai").exists(), "index file should exist");
     }
 
     // ========================================================================
