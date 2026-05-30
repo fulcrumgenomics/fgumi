@@ -150,6 +150,10 @@ harness = false
 name = "raw_bam"
 harness = false
 
+[[bench]]
+name = "umi_assigner_threshold"
+harness = false
+
 [build-dependencies]
 built = { version = "0", features = ["git2"] }
 
