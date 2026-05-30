@@ -1893,7 +1893,7 @@ impl RawExternalSorter {
         // Estimate capacity from initial_capacity (not memory_limit) to avoid
         // huge upfront allocations when auto-detecting memory.
         let init_cap = self.effective_initial_capacity();
-        // Per-record footprint: ~200 bytes BAM + 16 header + 24 ref = ~240 bytes
+        // Per-record footprint: ~200 bytes BAM + 8 header + 24 ref ≈ 232 bytes (rounded to 240 for headroom)
         let estimated_records = init_cap / 240;
         // Data bytes = init_cap minus ref overhead (24 bytes/record)
         let estimated_data_bytes = init_cap.saturating_sub(estimated_records * 24);
@@ -2074,7 +2074,7 @@ impl RawExternalSorter {
 
         let nref = header.reference_sequences().len() as u32;
         let init_cap = self.effective_initial_capacity();
-        // Per-record footprint: ~200 bytes BAM + 16 header + 24 ref = ~240 bytes
+        // Per-record footprint: ~200 bytes BAM + 8 header + 24 ref ≈ 232 bytes (rounded to 240 for headroom)
         let estimated_records = init_cap / 240;
         let estimated_data_bytes = init_cap.saturating_sub(estimated_records * 24);
 

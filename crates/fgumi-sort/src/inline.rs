@@ -238,20 +238,26 @@ impl Ord for RecordRef {
 
 /// Inline record header stored in buffer before raw BAM data.
 ///
-/// This header is written once when the record is added and contains
-/// pre-computed sort keys for efficient sorting.
+/// This header is written once when the record is added and records the
+/// length of the BAM bytes that follow it. The sort key is *not* stored
+/// here: it is cached in the parallel `RecordRef` index, which is the only
+/// place the sort reads it from. Record bytes are accessed via
+/// `offset + HEADER_SIZE`, so the header itself is never read back during
+/// sorting or merge — only its 8-byte footprint matters.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 struct InlineHeader {
-    /// Pre-computed packed sort key.
-    sort_key: u64,
     /// Length of following raw BAM data.
     record_len: u32,
     /// Padding for 8-byte alignment.
     padding: u32,
 }
 
-const HEADER_SIZE: usize = std::mem::size_of::<InlineHeader>(); // 16 bytes
+const HEADER_SIZE: usize = std::mem::size_of::<InlineHeader>(); // 8 bytes
+const _: () = assert!(
+    std::mem::size_of::<InlineHeader>() == HEADER_SIZE,
+    "HEADER_SIZE must match size_of::<InlineHeader>()"
+);
 
 // ============================================================================
 // RecordBuffer - Main Data Structure
@@ -389,15 +395,16 @@ impl RecordBuffer {
         let len = u32::try_from(record.len())
             .map_err(|_| anyhow::anyhow!("record length {} exceeds u32::MAX", record.len()))?;
 
-        // Extract sort key from raw BAM bytes
+        // Extract sort key from raw BAM bytes. The key is cached only in the
+        // `RecordRef` index below (the live reader); it is intentionally not
+        // stored in the inline header, which now records only the length.
         let sort_key = extract_coordinate_key_inline(record, self.nref);
 
         // Reserve contiguous space for header + record
         let offset = self.data.reserve_contiguous(total_bytes) as u64;
 
-        // Write inline header (16 bytes)
-        let header = InlineHeader { sort_key, record_len: len, padding: 0 };
-        self.data.extend_in_place(&header.sort_key.to_le_bytes());
+        // Write inline header (8 bytes: record_len + padding)
+        let header = InlineHeader { record_len: len, padding: 0 };
         self.data.extend_in_place(&header.record_len.to_le_bytes());
         self.data.extend_in_place(&header.padding.to_le_bytes());
 
@@ -803,22 +810,19 @@ impl RawSortKey for TemplateKey {
 }
 
 /// Inline header stored before each record in the data buffer.
-/// This allows us to use a minimal ref structure while still having
-/// fast access to the full sort key.
 ///
-/// Layout (48 bytes total):
-/// - primary: 8 bytes (u64)
-/// - secondary: 8 bytes (u64)
-/// - `cb_hash`: 8 bytes (u64)
-/// - tertiary: 8 bytes (u64)
-/// - `name_hash_upper`: 8 bytes (u64)
+/// The header records only the length of the BAM bytes that follow it. The
+/// full sort key is cached in the parallel `TemplateRecordRef` index, which
+/// is the only place the sort reads it from. Record bytes are accessed via
+/// `offset + TEMPLATE_HEADER_SIZE`, so the header itself is never read back
+/// during sorting or merge — only its 8-byte footprint matters.
+///
+/// Layout (8 bytes total):
 /// - `record_len`: 4 bytes (u32)
 /// - padding: 4 bytes (u32)
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct TemplateInlineHeader {
-    /// Full sort key for comparison.
-    pub key: TemplateKey,
     /// Length of following raw BAM data.
     pub record_len: u32,
     /// Padding for 8-byte alignment.
@@ -826,7 +830,7 @@ pub struct TemplateInlineHeader {
 }
 
 /// Size of `TemplateInlineHeader` in bytes.
-pub const TEMPLATE_HEADER_SIZE: usize = 48; // 5 * 8 (key) + 4 + 4
+pub const TEMPLATE_HEADER_SIZE: usize = 8; // 4 (record_len) + 4 (padding)
 const _: () = assert!(
     std::mem::size_of::<TemplateInlineHeader>() == TEMPLATE_HEADER_SIZE,
     "TEMPLATE_HEADER_SIZE must match size_of::<TemplateInlineHeader>()"
@@ -837,15 +841,10 @@ impl TemplateInlineHeader {
     #[inline]
     #[must_use]
     #[allow(clippy::wrong_self_convention)]
-    pub fn to_bytes(&self) -> [u8; TEMPLATE_HEADER_SIZE] {
+    pub fn to_bytes(self) -> [u8; TEMPLATE_HEADER_SIZE] {
         let mut buf = [0u8; TEMPLATE_HEADER_SIZE];
-        buf[0..8].copy_from_slice(&self.key.primary.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.key.secondary.to_le_bytes());
-        buf[16..24].copy_from_slice(&self.key.cb_hash.to_le_bytes());
-        buf[24..32].copy_from_slice(&self.key.tertiary.to_le_bytes());
-        buf[32..40].copy_from_slice(&self.key.name_hash_upper.to_le_bytes());
-        buf[40..44].copy_from_slice(&self.record_len.to_le_bytes());
-        buf[44..48].copy_from_slice(&self.padding.to_le_bytes());
+        buf[0..4].copy_from_slice(&self.record_len.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.padding.to_le_bytes());
         buf
     }
 
@@ -853,28 +852,8 @@ impl TemplateInlineHeader {
     #[inline]
     #[must_use]
     pub fn read_from(data: &[u8]) -> Self {
-        let primary = u64::from_le_bytes([
-            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-        ]);
-        let secondary = u64::from_le_bytes([
-            data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
-        ]);
-        let cb_hash = u64::from_le_bytes([
-            data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23],
-        ]);
-        let tertiary = u64::from_le_bytes([
-            data[24], data[25], data[26], data[27], data[28], data[29], data[30], data[31],
-        ]);
-        let name_hash_upper = u64::from_le_bytes([
-            data[32], data[33], data[34], data[35], data[36], data[37], data[38], data[39],
-        ]);
-        let record_len = u32::from_le_bytes([data[40], data[41], data[42], data[43]]);
-
-        Self {
-            key: TemplateKey { primary, secondary, cb_hash, tertiary, name_hash_upper },
-            record_len,
-            padding: 0,
-        }
+        let record_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        Self { record_len, padding: 0 }
     }
 }
 
@@ -974,8 +953,10 @@ impl TemplateRecordBuffer {
         // Reserve contiguous space for header + record
         let offset = self.data.reserve_contiguous(total_bytes) as u64;
 
-        // Write inline header
-        let header = TemplateInlineHeader { key, record_len, padding: 0 };
+        // Write inline header (8 bytes: record_len + padding). The full sort
+        // key is cached only in the `TemplateRecordRef` index below (the live
+        // reader); it is intentionally not stored in the inline header.
+        let header = TemplateInlineHeader { record_len, padding: 0 };
         self.data.extend_in_place(&header.to_bytes());
 
         // Write raw BAM data
