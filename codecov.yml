@@ -1,0 +1,15 @@
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        # Tolerate small, cosmetic dips in total coverage. Refactors that move
+        # code around can shift codecov's line attribution and nudge the project
+        # ratio down by a few hundredths of a percent even when the new code is
+        # fully tested. Without a threshold, codecov's default 0% gate fails the
+        # project status on these dips. 0.5% absorbs that noise while still
+        # catching meaningful regressions.
+        threshold: 0.5%
+    patch:
+      default:
+        target: 90%
