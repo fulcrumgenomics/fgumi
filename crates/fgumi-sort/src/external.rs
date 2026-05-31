@@ -24,7 +24,9 @@
 //! 4. Write raw record bytes to output
 
 use crate::inline::{
-    InMemoryChunk, ProbeableBuffer, RecordBuffer, TemplateKey, TemplateRecordBuffer,
+    CbKey32, InMemoryChunk, ProbeableBuffer, RecordBuffer, TEMPLATE_HEADER_SIZE, TemplateKey,
+    TemplateKey24, TemplateKey40, TemplateLaneKey, TemplateRecordBuffer, TemplateRecordRef,
+    TertKey32,
 };
 use crate::keys::{QuerynameComparator, RawSortKey, SortOrder};
 use crate::memory_probe::{
@@ -326,6 +328,12 @@ const MERGE_PREFETCH_SIZE: usize = 1024;
 /// Maximum number of temp files before consolidation (like samtools).
 /// When this limit is reached, oldest files are merged to reduce file count.
 const DEFAULT_MAX_TEMP_FILES: usize = 64;
+
+/// Working estimate of the raw BAM bytes per template-coordinate record (excluding the
+/// inline header and the `TemplateRecordRef<K>` index entry).  Used by the capacity
+/// estimator in `sort_template_coordinate_impl` to split `effective_initial_capacity`
+/// between the data arena and the ref index.
+const EST_BAM_BYTES_PER_TEMPLATE_RECORD: usize = 250;
 
 /// Counting semaphore for limiting concurrent chunk reader I/O.
 /// Pre-filled with N tokens; readers acquire before decompressing, release after.
@@ -1306,6 +1314,11 @@ pub struct RawExternalSorter {
     initial_capacity: Option<usize>,
     /// When true, wrap input in a `PrefetchReader` for async I/O.
     async_reader: bool,
+    /// Which optional template-key lanes to retain (template-coordinate only).
+    ///
+    /// Defaults to [`KeyTypesSpec::Auto`], which provisions the narrowest key
+    /// that fits the first record's optional lanes.
+    key_types: KeyTypesSpec,
 }
 
 /// RAII guard that ensures Phase 2 teardown runs on every exit path between
@@ -1359,6 +1372,7 @@ impl RawExternalSorter {
             cell_tag: None,
             initial_capacity: None,
             async_reader: false,
+            key_types: KeyTypesSpec::default(),
         }
     }
 
@@ -1476,6 +1490,18 @@ impl RawExternalSorter {
     #[must_use]
     pub fn initial_capacity(mut self, bytes: usize) -> Self {
         self.initial_capacity = Some(bytes);
+        self
+    }
+
+    /// Set which optional template-key lanes to retain.
+    ///
+    /// Only affects the template-coordinate sort order. The default
+    /// ([`KeyTypesSpec::Auto`]) provisions the narrowest key consistent with the
+    /// first record's optional lanes; the decode-time verify guarantees the
+    /// dropped lanes are constant across all records.
+    #[must_use]
+    pub fn key_types(mut self, spec: KeyTypesSpec) -> Self {
+        self.key_types = spec;
         self
     }
 
@@ -2486,7 +2512,6 @@ impl RawExternalSorter {
     ///
     /// Writes keyed temp chunks that preserve pre-computed sort keys, enabling O(1)
     /// comparisons during merge (instead of expensive CIGAR/aux parsing).
-    #[allow(clippy::too_many_lines)]
     fn sort_template_coordinate(
         &self,
         mut record_source: RecordSource,
@@ -2495,27 +2520,134 @@ impl RawExternalSorter {
         output: &Path,
         alloc: &mut TmpDirAllocator,
     ) -> Result<RawSortStats> {
-        let mut stats = RawSortStats::default();
-        let mut timer = SortPhaseTimer::new();
-
-        // Build library lookup ONCE before sorting for O(1) ordinal lookups
         let lib_lookup = LibraryLookup::from_header(header);
         let cb_hasher = cb_hasher();
 
-        // Estimate capacity from initial_capacity to avoid huge upfront allocations.
-        // Memory layout per record:
-        //   - data: 48 bytes (inline header) + ~250 bytes (BAM record) = 298 bytes
-        //   - refs: 56 bytes (TemplateKey + u64 offset + u32 len + u32 pad)
-        //   - Total: ~354 bytes per record
+        // Peek the first record to provision the variant (extraction stays
+        // full-width). The first record is handed (by reference) to the impl,
+        // which processes it before draining the rest of `record_source`; the
+        // wrapper only extracts `first_key` to choose `K` — it does not re-chain
+        // the record into the iterator.
+        let first_record = record_source.by_ref().next();
+        let first_key = first_record.as_ref().map(|r| {
+            extract_template_key_inline(r.as_ref(), &lib_lookup, self.cell_tag, &cb_hasher)
+        });
+        let variant = select_template_variant(first_key.as_ref(), self.key_types);
+
+        debug!(
+            "template-coordinate variant: {} lanes (cb={}, tertiary={})",
+            variant.lanes(),
+            variant.cb,
+            variant.tertiary
+        );
+
+        match (variant.cb, variant.tertiary) {
+            (false, false) => self.sort_template_coordinate_impl::<TemplateKey24>(
+                record_source,
+                first_record.as_ref(),
+                first_key,
+                variant,
+                pool,
+                header,
+                output,
+                alloc,
+                &lib_lookup,
+                &cb_hasher,
+            ),
+            (true, false) => self.sort_template_coordinate_impl::<CbKey32>(
+                record_source,
+                first_record.as_ref(),
+                first_key,
+                variant,
+                pool,
+                header,
+                output,
+                alloc,
+                &lib_lookup,
+                &cb_hasher,
+            ),
+            (false, true) => self.sort_template_coordinate_impl::<TertKey32>(
+                record_source,
+                first_record.as_ref(),
+                first_key,
+                variant,
+                pool,
+                header,
+                output,
+                alloc,
+                &lib_lookup,
+                &cb_hasher,
+            ),
+            (true, true) => self.sort_template_coordinate_impl::<TemplateKey40>(
+                record_source,
+                first_record.as_ref(),
+                first_key,
+                variant,
+                pool,
+                header,
+                output,
+                alloc,
+                &lib_lookup,
+                &cb_hasher,
+            ),
+        }
+    }
+
+    /// Generic template-coordinate sort body, monomorphized over the chosen
+    /// lane-key type `K`.
+    ///
+    /// The dispatch wrapper [`Self::sort_template_coordinate`] peeks the first
+    /// record to choose `K`, then hands the captured `first_record` (already
+    /// pulled out of `record_source`, borrowed here) plus the rest of the
+    /// iterator. This impl processes `first_record` in a pre-loop block and
+    /// drains the remainder in the read loop. `first_key` is the full key of the
+    /// first record; the decode-time verify compares every subsequent record's
+    /// dropped lanes against it.
+    #[allow(clippy::too_many_lines)]
+    // The generic body keeps the same parameter shape as the legacy function
+    // plus the peeked-first-record handoff; the existing code already allows
+    // this pattern for the merge helpers.
+    #[allow(clippy::too_many_arguments)]
+    fn sort_template_coordinate_impl<K: TemplateLaneKey + RawSortKey + Default + 'static>(
+        &self,
+        mut record_source: RecordSource,
+        first_record: Option<&fgumi_raw_bam::RawRecord>,
+        first_key: Option<TemplateKey>,
+        variant: TemplateKeyVariant,
+        pool: Arc<SortWorkerPool>,
+        header: &Header,
+        output: &Path,
+        alloc: &mut TmpDirAllocator,
+        lib_lookup: &LibraryLookup,
+        cb_hasher: &ahash::RandomState,
+    ) -> Result<RawSortStats> {
+        let mut stats = RawSortStats::default();
+        let mut timer = SortPhaseTimer::new();
+
+        // The full key the decode-time verify compares dropped lanes against.
+        // On empty input, `first_record` is `None` so the pre-loop push is
+        // skipped and the read loop runs zero times — `first` is never read in
+        // that case, so a default (all-zero) key is a harmless placeholder that
+        // lets the function fall through to the post-loop empty-output path
+        // (header-only BAM), matching the coordinate and queryname orders.
+        let first = first_key.unwrap_or_default();
+
+        // Per-record arena footprint (data side: inline header + BAM bytes; ref side:
+        // the cached key + offset/len/pad). Ref size tracks the chosen key width K:
+        //   K=TemplateKey24 → ref=40 B, bpr=298 B, data%≈86.6%
+        //   K=TemplateKey32 → ref=48 B, bpr=306 B, data%≈84.3%
+        //   K=TemplateKey40 → ref=56 B, bpr=314 B, data%≈82.2%
+        let ref_bytes = std::mem::size_of::<TemplateRecordRef<K>>();
+        let data_bytes_per_record = TEMPLATE_HEADER_SIZE + EST_BAM_BYTES_PER_TEMPLATE_RECORD;
+        let bytes_per_record = data_bytes_per_record + ref_bytes;
+
         let init_cap = self.effective_initial_capacity();
-        let bytes_per_record = 354;
-        let estimated_records = init_cap / bytes_per_record;
-        // Allocate ~86% for data, ~14% for refs (48/338 ≈ 14%)
-        let estimated_data_bytes = init_cap * 86 / 100;
+        let estimated_records = (init_cap / bytes_per_record).max(1);
+        let estimated_data_bytes = init_cap * data_bytes_per_record / bytes_per_record;
 
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut buffer =
-            TemplateRecordBuffer::with_capacity(estimated_records, estimated_data_bytes);
+            TemplateRecordBuffer::<K>::with_capacity(estimated_records, estimated_data_bytes);
         let mut namer = ChunkNamer::new(alloc);
         let mut pending_spill: Option<PendingSpill> = None;
         let rayon_pool = self.build_sort_rayon_pool()?;
@@ -2524,15 +2656,43 @@ impl RawExternalSorter {
         debug!("Phase 1: Reading and sorting chunks (inline buffer)...");
         let mut probe = SpillProbe::new("phase1");
 
+        // Process the captured first record before draining the rest: extract its
+        // full key, verify the dropped lanes match `first` (trivially true for the
+        // first record itself), and push the narrowed key. A single record cannot
+        // exceed the memory limit, so no spill check is needed here.
+        if let Some(record) = first_record {
+            stats.total_records += 1;
+            progress.log_if_needed(1);
+
+            let bam_bytes = record.as_ref();
+            let full = extract_template_key_inline(bam_bytes, lib_lookup, self.cell_tag, cb_hasher);
+            if let Some(violation) = verify_dropped_lanes(&first, &full, variant) {
+                let name = String::from_utf8_lossy(
+                    fgumi_raw_bam::RawRecordView::new(bam_bytes).read_name(),
+                )
+                .into_owned();
+                return Err(dropped_lane_error(&name, violation));
+            }
+            buffer.push(bam_bytes, K::from_full(&full))?;
+        }
+
         for record in record_source.by_ref() {
             stats.total_records += 1;
             progress.log_if_needed(1);
 
-            // Extract template key and push to buffer
+            // Extract the full template key, verify the lanes the chosen variant
+            // dropped are constant relative to the first record, then push the
+            // narrowed key.
             let bam_bytes = record.as_ref();
-            let key =
-                extract_template_key_inline(bam_bytes, &lib_lookup, self.cell_tag, &cb_hasher);
-            buffer.push(bam_bytes, key)?;
+            let full = extract_template_key_inline(bam_bytes, lib_lookup, self.cell_tag, cb_hasher);
+            if let Some(violation) = verify_dropped_lanes(&first, &full, variant) {
+                let name = String::from_utf8_lossy(
+                    fgumi_raw_bam::RawRecordView::new(bam_bytes).read_name(),
+                )
+                .into_owned();
+                return Err(dropped_lane_error(&name, violation));
+            }
+            buffer.push(bam_bytes, K::from_full(&full))?;
 
             if probe.should_sample_read(stats.total_records) {
                 probe.log_mid_read(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
@@ -2546,7 +2706,7 @@ impl RawExternalSorter {
                 probe.pre_spill(bstats, depths);
 
                 // Wait for any previous spill to complete
-                self.drain_pending_spill::<TemplateKey>(
+                self.drain_pending_spill::<K>(
                     &mut pending_spill,
                     &mut chunk_files,
                     &mut stats,
@@ -2564,7 +2724,7 @@ impl RawExternalSorter {
 
                 // Write keyed chunk with parallel BGZF compression via worker pool.
                 let handle = timer.time_spill_write(|| {
-                    let mut writer = PooledChunkWriter::<TemplateKey>::new(
+                    let mut writer = PooledChunkWriter::<K>::new(
                         Arc::clone(&pool),
                         &chunk_path,
                         pool.spill_codec(),
@@ -2591,7 +2751,7 @@ impl RawExternalSorter {
         }
 
         // Drain any pending spill before merge
-        self.drain_pending_spill::<TemplateKey>(
+        self.drain_pending_spill::<K>(
             &mut pending_spill,
             &mut chunk_files,
             &mut stats,
@@ -2623,7 +2783,7 @@ impl RawExternalSorter {
         } else {
             // Sort remaining records into separate sub-array chunks (avoids
             // intermediate merge back into a single sorted buffer)
-            let memory_chunks: Vec<InMemoryChunk<TemplateKey>> = if buffer.is_empty() {
+            let memory_chunks: Vec<InMemoryChunk<K>> = if buffer.is_empty() {
                 Vec::new()
             } else if self.threads > 1 {
                 timer.time_sort(|| rayon_pool.install(|| buffer.par_sort_into_chunks(self.threads)))
@@ -2640,7 +2800,7 @@ impl RawExternalSorter {
 
             // Merge using O(1) key comparisons
             timer.time_merge(|| {
-                self.merge_chunks_keyed(
+                self.merge_chunks_generic::<K>(
                     &chunk_files,
                     memory_chunks,
                     header,
@@ -2704,29 +2864,6 @@ impl RawExternalSorter {
         memory_chunks.push_into(&mut sources);
 
         Ok(sources)
-    }
-
-    /// Merge keyed chunks using O(1) key comparisons (delegates to generic merge).
-    ///
-    /// `memory_chunks` is a list of sorted in-memory sub-arrays, each of which
-    /// becomes a separate merge source.
-    fn merge_chunks_keyed(
-        &self,
-        chunk_files: &[PathBuf],
-        memory_chunks: MemorySources<TemplateKey>,
-        header: &Header,
-        output: &Path,
-        total_records: u64,
-        pool: &Arc<SortWorkerPool>,
-    ) -> Result<u64> {
-        self.merge_chunks_generic::<TemplateKey>(
-            chunk_files,
-            memory_chunks,
-            header,
-            output,
-            total_records,
-            pool,
-        )
     }
 
     /// Generic merge for keyed chunks using `O(1)` key comparisons.
@@ -3278,6 +3415,136 @@ fn skip_bam_header<R: Read>(reader: &mut R) -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// Template-key variant selection
+// ============================================================================
+
+/// Which optional lanes a chosen template key retains.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TemplateKeyVariant {
+    /// Retain the `cb_hash` lane.
+    pub cb: bool,
+    /// Retain the tertiary (library|mi) lane.
+    pub tertiary: bool,
+}
+
+impl TemplateKeyVariant {
+    /// Number of u64 lanes: 3 + cb + tertiary.
+    #[must_use]
+    pub fn lanes(self) -> usize {
+        3 + usize::from(self.cb) + usize::from(self.tertiary)
+    }
+}
+
+/// Parsed `--key-types` spec controlling which optional sort-key lanes are kept.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum KeyTypesSpec {
+    /// Auto-detect from the first record (default).
+    #[default]
+    Auto,
+    /// Force all lanes (N=5).
+    Full,
+    /// Force no optional lanes (N=3).
+    None,
+    /// Force a specific optional set.
+    Explicit {
+        /// Retain the `cb_hash` lane.
+        cb: bool,
+        /// Retain the tertiary (library|mi) lane.
+        tertiary: bool,
+    },
+}
+
+/// Choose the template-key variant for this sort.
+///
+/// `first_key` is the full key extracted from the first record (`None` for an
+/// empty input — then the variant is irrelevant; default to lite). `spec` is the
+/// parsed `--key-types` override. Selection only provisions the variant; the
+/// decode-time verify (fill loop) guarantees the dropped lanes are constant.
+#[must_use]
+pub fn select_template_variant(
+    first_key: Option<&TemplateKey>,
+    spec: KeyTypesSpec,
+) -> TemplateKeyVariant {
+    match spec {
+        KeyTypesSpec::Full => TemplateKeyVariant { cb: true, tertiary: true },
+        KeyTypesSpec::None => TemplateKeyVariant { cb: false, tertiary: false },
+        KeyTypesSpec::Explicit { cb, tertiary } => TemplateKeyVariant { cb, tertiary },
+        KeyTypesSpec::Auto => match first_key {
+            None => TemplateKeyVariant { cb: false, tertiary: false },
+            Some(k) => TemplateKeyVariant { cb: k.cb_hash != 0, tertiary: k.tertiary != 0 },
+        },
+    }
+}
+
+// ============================================================================
+// Dropped-lane violation detection
+// ============================================================================
+
+/// A dropped-lane violation discovered during decode-time verify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DroppedLaneViolation {
+    /// A record carried a CB tag absent from the first record.
+    Cb,
+    /// A record carried an MI value differing from the first record.
+    Mi,
+    /// A record's realized library ordinal differed from the first record.
+    Library,
+}
+
+impl DroppedLaneViolation {
+    /// The `--key-types` token that re-includes this lane.
+    #[must_use]
+    pub fn key_types_token(self) -> &'static str {
+        match self {
+            DroppedLaneViolation::Cb => "cb",
+            DroppedLaneViolation::Mi => "mi",
+            DroppedLaneViolation::Library => "library",
+        }
+    }
+}
+
+/// Verify that the lanes the chosen `variant` dropped are constant for `cur`
+/// relative to the sort's `first` full key. Returns the first violation found,
+/// or `None` if all dropped lanes match.
+///
+/// Tertiary sub-fields are decoded only to attribute the violation: the high 16
+/// bits are the library ordinal; the low 48 bits are `mi_value|!mi_suffix`.
+#[must_use]
+pub fn verify_dropped_lanes(
+    first: &TemplateKey,
+    cur: &TemplateKey,
+    variant: TemplateKeyVariant,
+) -> Option<DroppedLaneViolation> {
+    if !variant.cb && cur.cb_hash != first.cb_hash {
+        return Some(DroppedLaneViolation::Cb);
+    }
+    if !variant.tertiary && cur.tertiary != first.tertiary {
+        // Attribute: library is the high 16 bits, mi the low 48.
+        let lib_changed = (cur.tertiary >> 48) != (first.tertiary >> 48);
+        return Some(if lib_changed {
+            DroppedLaneViolation::Library
+        } else {
+            DroppedLaneViolation::Mi
+        });
+    }
+    None
+}
+
+/// Build the actionable error message for a dropped-lane violation.
+fn dropped_lane_error(name: &str, v: DroppedLaneViolation) -> anyhow::Error {
+    let field = match v {
+        DroppedLaneViolation::Cb => "CB",
+        DroppedLaneViolation::Mi => "MI",
+        DroppedLaneViolation::Library => "library",
+    };
+    anyhow::anyhow!(
+        "record {name} carries a {field} value absent from the input's first record; \
+         re-run with --key-types {}",
+        v.key_types_token(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3554,6 +3821,34 @@ mod tests {
     fn test_raw_sorter_cell_tag_builder() {
         let sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate).cell_tag(SamTag::CB);
         assert_eq!(sorter.cell_tag, Some(SamTag::CB));
+    }
+
+    /// Smoke test: an auto-detected lite (no-CB, no-tertiary) template-coordinate
+    /// sort runs end-to-end and preserves the record count. With the default
+    /// `KeyTypesSpec::Auto`, records lacking CB/MI/multi-library auxiliary data
+    /// select the narrow `TemplateKey24` lane key; this exercises that path
+    /// through Phase 1 and Phase 2 and confirms output completeness.
+    #[test]
+    fn template_sort_auto_lite_roundtrips_record_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sorted, names) =
+            create_sorted_bam(dir.path(), "lite", 50, 0, SortOrder::TemplateCoordinate);
+        assert_eq!(collect_read_names(&sorted).len(), names.len() * 2);
+    }
+
+    /// Regression: a 0-record template-coordinate sort must still write a valid
+    /// header-only output BAM (matching the coordinate and queryname orders),
+    /// not skip the output entirely. The empty-input path skips the pre-loop
+    /// first-record push, runs the read loop zero times, and falls through to
+    /// the `chunk_files.is_empty()` fast path that writes the header-only BAM.
+    #[test]
+    fn template_sort_empty_input_writes_header_only_bam() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sorted, names) =
+            create_sorted_bam(dir.path(), "empty", 0, 0, SortOrder::TemplateCoordinate);
+        assert!(names.is_empty());
+        assert!(sorted.exists(), "empty-input sort must still produce an output file");
+        assert_eq!(count_bam_records(&sorted), 0, "output must contain only the header");
     }
 
     // ========================================================================
@@ -4534,5 +4829,133 @@ mod tests {
         let mut buf = [0u8; 4];
         let err = read_exact_or_eof(&mut src, &mut buf).expect_err("truncated read should error");
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    // ========================================================================
+    // verify_dropped_lanes / dropped_lane_error tests
+    // ========================================================================
+
+    fn full_key(cb: u64, tertiary: u64) -> TemplateKey {
+        TemplateKey { primary: 0, secondary: 0, cb_hash: cb, tertiary, name_hash_upper: 0 }
+    }
+
+    const LITE: TemplateKeyVariant = TemplateKeyVariant { cb: false, tertiary: false };
+
+    #[test]
+    fn verify_detects_cb_appearing() {
+        let v = verify_dropped_lanes(&full_key(0, 0), &full_key(123, 0), LITE);
+        assert_eq!(v, Some(DroppedLaneViolation::Cb));
+        assert_eq!(v.unwrap().key_types_token(), "cb");
+    }
+
+    #[test]
+    fn verify_detects_mi_change() {
+        let first = full_key(0, 0);
+        let cur = full_key(0, 0b10); // mi_value bit set, library still 0
+        assert_eq!(verify_dropped_lanes(&first, &cur, LITE), Some(DroppedLaneViolation::Mi));
+    }
+
+    #[test]
+    fn verify_detects_library_change() {
+        let first = full_key(0, 0);
+        let cur = full_key(0, 1u64 << 48); // library ordinal 1
+        assert_eq!(verify_dropped_lanes(&first, &cur, LITE), Some(DroppedLaneViolation::Library));
+    }
+
+    #[test]
+    fn verify_passes_when_dropped_lanes_constant() {
+        let variant = TemplateKeyVariant { cb: true, tertiary: false };
+        assert_eq!(verify_dropped_lanes(&full_key(1, 5), &full_key(2, 5), variant), None);
+    }
+
+    #[test]
+    fn verify_error_message_names_field_and_token() {
+        let e = dropped_lane_error("read42", DroppedLaneViolation::Library);
+        let msg = e.to_string();
+        assert!(
+            msg.contains("read42")
+                && msg.contains("library")
+                && msg.contains("--key-types library"),
+            "{msg}"
+        );
+    }
+
+    // ========================================================================
+    // select_template_variant tests
+    // ========================================================================
+
+    fn key(cb: u64, tertiary: u64) -> TemplateKey {
+        TemplateKey { primary: 1, secondary: 2, cb_hash: cb, tertiary, name_hash_upper: 3 }
+    }
+
+    #[test]
+    fn auto_lite_when_no_cb_no_tertiary() {
+        let v = select_template_variant(Some(&key(0, 0)), KeyTypesSpec::Auto);
+        assert_eq!(v, TemplateKeyVariant { cb: false, tertiary: false });
+        assert_eq!(v.lanes(), 3);
+    }
+
+    #[test]
+    fn auto_cb_only_when_first_record_has_cb() {
+        let v = select_template_variant(Some(&key(42, 0)), KeyTypesSpec::Auto);
+        assert_eq!(v, TemplateKeyVariant { cb: true, tertiary: false });
+        assert_eq!(v.lanes(), 4);
+    }
+
+    #[test]
+    fn auto_tertiary_only_when_first_record_has_mi_or_library() {
+        let v = select_template_variant(Some(&key(0, 0xABCD)), KeyTypesSpec::Auto);
+        assert_eq!(v, TemplateKeyVariant { cb: false, tertiary: true });
+        assert_eq!(v.lanes(), 4);
+    }
+
+    #[test]
+    fn auto_full_when_both_present() {
+        let v = select_template_variant(Some(&key(7, 9)), KeyTypesSpec::Auto);
+        assert_eq!(v, TemplateKeyVariant { cb: true, tertiary: true });
+        assert_eq!(v.lanes(), 5);
+    }
+
+    #[test]
+    fn none_forces_lite() {
+        assert_eq!(select_template_variant(Some(&key(99, 99)), KeyTypesSpec::None).lanes(), 3);
+    }
+
+    #[test]
+    fn full_forces_all_lanes() {
+        assert_eq!(select_template_variant(Some(&key(0, 0)), KeyTypesSpec::Full).lanes(), 5);
+    }
+
+    #[test]
+    fn explicit_spec_passthrough() {
+        assert_eq!(
+            select_template_variant(None, KeyTypesSpec::Explicit { cb: true, tertiary: false })
+                .lanes(),
+            4
+        );
+    }
+
+    #[test]
+    fn empty_input_defaults_to_lite() {
+        assert_eq!(select_template_variant(None, KeyTypesSpec::Auto).lanes(), 3);
+    }
+
+    // ========================================================================
+    // Capacity estimator consistency tests (T8)
+    // ========================================================================
+
+    #[test]
+    fn estimator_bytes_per_record_matches_ref_size() {
+        use crate::inline::TemplateKey32;
+        for (actual, expected) in [
+            (std::mem::size_of::<TemplateRecordRef<TemplateKey24>>(), 40usize),
+            (std::mem::size_of::<TemplateRecordRef<TemplateKey32>>(), 48),
+            (std::mem::size_of::<TemplateRecordRef<TemplateKey40>>(), 56),
+        ] {
+            assert_eq!(actual, expected, "ref size must equal key + 16 B offset/len/pad");
+        }
+        let bpr_lite = (TEMPLATE_HEADER_SIZE + EST_BAM_BYTES_PER_TEMPLATE_RECORD)
+            + std::mem::size_of::<TemplateRecordRef<TemplateKey24>>();
+        assert_eq!(bpr_lite, 8 + 250 + 40);
     }
 }

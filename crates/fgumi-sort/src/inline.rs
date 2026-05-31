@@ -1003,6 +1003,269 @@ impl Ord for TemplateKey32 {
     }
 }
 
+impl RawSortKey for TemplateKey24 {
+    const SERIALIZED_SIZE: Option<usize> = Some(24);
+
+    /// # Panics
+    ///
+    /// Always panics. Narrow template keys are derived from a full extracted
+    /// key via `from_full`, never extracted directly; extraction is full-width
+    /// only (see [`TemplateKey::extract`]).
+    fn extract(_bam: &[u8], _ctx: &SortContext) -> Self {
+        unreachable!(
+            "TemplateKey24::extract() should not be called directly. \
+             Narrow keys are derived from a full TemplateKey40 via from_full()."
+        )
+    }
+
+    #[inline]
+    fn write_to<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        writer.write_all(&self.to_bytes())
+    }
+
+    #[inline]
+    fn read_from<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+        let mut buf = [0u8; 24];
+        reader.read_exact(&mut buf)?;
+        Ok(Self::from_bytes(&buf))
+    }
+}
+
+impl RawSortKey for TemplateKey32 {
+    const SERIALIZED_SIZE: Option<usize> = Some(32);
+
+    /// # Panics
+    ///
+    /// Always panics. Narrow template keys are derived from a full extracted
+    /// key via `from_full`, never extracted directly; extraction is full-width
+    /// only (see [`TemplateKey::extract`]).
+    fn extract(_bam: &[u8], _ctx: &SortContext) -> Self {
+        unreachable!(
+            "TemplateKey32::extract() should not be called directly. \
+             Narrow keys are derived from a full TemplateKey40 via from_full()."
+        )
+    }
+
+    #[inline]
+    fn write_to<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        writer.write_all(&self.to_bytes())
+    }
+
+    #[inline]
+    fn read_from<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+        let mut buf = [0u8; 32];
+        reader.read_exact(&mut buf)?;
+        Ok(Self::from_bytes(&buf))
+    }
+}
+
+/// Lane-addressable template key usable by the generic radix and buffer.
+///
+/// `primary` is always lane 0 (radix phase 1). `remaining_fields` lists the
+/// post-primary lanes in sort precedence, of arity `LANES - 1`.
+pub trait TemplateLaneKey:
+    Copy + Clone + Ord + Default + bytemuck::Pod + Send + Sync + 'static
+{
+    /// Number of u64 lanes (3, 4, or 5).
+    const LANES: usize;
+    /// The primary (first) lane — radix phase 1 always sorts on this.
+    fn primary(&self) -> u64;
+    /// Post-primary lanes, in sort precedence (length `LANES - 1`).
+    fn remaining_fields() -> &'static [fn(&Self) -> u64];
+    /// Build from a full extracted key (drops constant lanes).
+    fn from_full(full: &TemplateKey40) -> Self;
+}
+
+impl TemplateLaneKey for TemplateKey24 {
+    const LANES: usize = 3;
+
+    #[inline]
+    fn primary(&self) -> u64 {
+        self.primary
+    }
+
+    fn remaining_fields() -> &'static [fn(&Self) -> u64] {
+        const F: [fn(&TemplateKey24) -> u64; 2] = [|k| k.secondary, |k| k.name_hash_upper];
+        &F
+    }
+
+    #[inline]
+    fn from_full(full: &TemplateKey40) -> Self {
+        TemplateKey24::from_full(full)
+    }
+}
+
+impl TemplateLaneKey for TemplateKey32 {
+    const LANES: usize = 4;
+
+    #[inline]
+    fn primary(&self) -> u64 {
+        self.primary
+    }
+
+    fn remaining_fields() -> &'static [fn(&Self) -> u64] {
+        const F: [fn(&TemplateKey32) -> u64; 3] =
+            [|k| k.secondary, |k| k.opt, |k| k.name_hash_upper];
+        &F
+    }
+
+    /// `TemplateKey32` is retained as the byte/`Ord`/radix substrate (and is
+    /// exercised directly by the radix-sort tests). The production cb-vs-tertiary
+    /// dispatch uses the `CbKey32` / `TertKey32` newtypes instead, so this
+    /// `from_full` is not on the production sort path; it sources `opt` from
+    /// `cb_hash` (`from_full_cb`) only so the trait is total. The radix/`Ord` are
+    /// independent of which optional field `opt` carries.
+    #[inline]
+    fn from_full(full: &TemplateKey40) -> Self {
+        TemplateKey32::from_full_cb(full)
+    }
+}
+
+impl TemplateLaneKey for TemplateKey40 {
+    const LANES: usize = 5;
+
+    #[inline]
+    fn primary(&self) -> u64 {
+        self.primary
+    }
+
+    fn remaining_fields() -> &'static [fn(&Self) -> u64] {
+        const F: [fn(&TemplateKey40) -> u64; 4] =
+            [|k| k.secondary, |k| k.cb_hash, |k| k.tertiary, |k| k.name_hash_upper];
+        &F
+    }
+
+    #[inline]
+    fn from_full(full: &TemplateKey40) -> Self {
+        *full
+    }
+}
+
+// ============================================================================
+// Single-optional newtype monomorphizations (CbKey32 / TertKey32)
+//
+// Both wrap `TemplateKey32` transparently and have identical byte layout, `Ord`,
+// and radix behavior. They differ only in which optional lane the `opt` word is
+// sourced from at extraction: `CbKey32::from_full` uses `cb_hash`, while
+// `TertKey32::from_full` uses the tertiary (library<<48 | mi) word. Two distinct
+// types let the dispatch in `sort_template_coordinate` pick the right source via
+// monomorphization, with zero runtime cost (the inner key is `#[repr(C)]` Pod and
+// the wrapper is `#[repr(transparent)]`, so `bytemuck::Pod` is sound to derive).
+// ============================================================================
+
+/// 32-byte single-optional template key whose `opt` lane carries `cb_hash`.
+///
+/// Used when exactly the `cb_hash` lane is non-constant (single-cell, pre-group).
+#[repr(transparent)]
+#[derive(
+    Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Default, bytemuck::Pod, bytemuck::Zeroable,
+)]
+pub struct CbKey32(pub TemplateKey32);
+
+/// 32-byte single-optional template key whose `opt` lane carries the tertiary
+/// (library<<48 | mi) word.
+///
+/// Used when exactly the tertiary lane is non-constant (post-group / multi-library).
+#[repr(transparent)]
+#[derive(
+    Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Default, bytemuck::Pod, bytemuck::Zeroable,
+)]
+pub struct TertKey32(pub TemplateKey32);
+
+impl TemplateLaneKey for CbKey32 {
+    const LANES: usize = 4;
+
+    #[inline]
+    fn primary(&self) -> u64 {
+        self.0.primary
+    }
+
+    fn remaining_fields() -> &'static [fn(&Self) -> u64] {
+        const F: [fn(&CbKey32) -> u64; 3] =
+            [|k| k.0.secondary, |k| k.0.opt, |k| k.0.name_hash_upper];
+        &F
+    }
+
+    #[inline]
+    fn from_full(full: &TemplateKey40) -> Self {
+        CbKey32(TemplateKey32::from_full_cb(full))
+    }
+}
+
+impl TemplateLaneKey for TertKey32 {
+    const LANES: usize = 4;
+
+    #[inline]
+    fn primary(&self) -> u64 {
+        self.0.primary
+    }
+
+    fn remaining_fields() -> &'static [fn(&Self) -> u64] {
+        const F: [fn(&TertKey32) -> u64; 3] =
+            [|k| k.0.secondary, |k| k.0.opt, |k| k.0.name_hash_upper];
+        &F
+    }
+
+    #[inline]
+    fn from_full(full: &TemplateKey40) -> Self {
+        TertKey32(TemplateKey32::from_full_tertiary(full))
+    }
+}
+
+impl RawSortKey for CbKey32 {
+    const SERIALIZED_SIZE: Option<usize> = Some(32);
+
+    /// # Panics
+    ///
+    /// Always panics. Narrow template keys are derived from a full extracted
+    /// key via `from_full`, never extracted directly.
+    fn extract(_bam: &[u8], _ctx: &SortContext) -> Self {
+        unreachable!(
+            "CbKey32::extract() should not be called directly. \
+             Narrow keys are derived from a full TemplateKey40 via from_full()."
+        )
+    }
+
+    #[inline]
+    fn write_to<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        writer.write_all(&self.0.to_bytes())
+    }
+
+    #[inline]
+    fn read_from<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+        let mut buf = [0u8; 32];
+        reader.read_exact(&mut buf)?;
+        Ok(CbKey32(TemplateKey32::from_bytes(&buf)))
+    }
+}
+
+impl RawSortKey for TertKey32 {
+    const SERIALIZED_SIZE: Option<usize> = Some(32);
+
+    /// # Panics
+    ///
+    /// Always panics. Narrow template keys are derived from a full extracted
+    /// key via `from_full`, never extracted directly.
+    fn extract(_bam: &[u8], _ctx: &SortContext) -> Self {
+        unreachable!(
+            "TertKey32::extract() should not be called directly. \
+             Narrow keys are derived from a full TemplateKey40 via from_full()."
+        )
+    }
+
+    #[inline]
+    fn write_to<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        writer.write_all(&self.0.to_bytes())
+    }
+
+    #[inline]
+    fn read_from<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+        let mut buf = [0u8; 32];
+        reader.read_exact(&mut buf)?;
+        Ok(TertKey32(TemplateKey32::from_bytes(&buf)))
+    }
+}
+
 /// Inline header stored before each record in the data buffer.
 ///
 /// The header records only the length of the BAM bytes that follow it. The
@@ -1053,15 +1316,16 @@ impl TemplateInlineHeader {
 
 /// Record reference for template-coordinate sorting with cached key.
 ///
-/// Caches the full `TemplateKey` inline for O(1) comparisons during sort.
-/// This trades memory (48 bytes vs 16 bytes per ref) for cache locality -
-/// all comparison data is in the ref itself, avoiding random access to
-/// the multi-GB data buffer during sorting.
+/// Generic over `K: TemplateLaneKey`; caches the sort key `K` inline for
+/// O(1) comparisons during sort. The cached-key width varies with the chosen
+/// key type: 24 bytes for `TemplateKey24`, 32 for `TemplateKey32`, 40 for
+/// `TemplateKey40`. All comparison data is in the ref itself, avoiding random
+/// access to the multi-GB data buffer during sorting.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-pub struct TemplateRecordRef {
+pub struct TemplateRecordRef<K: TemplateLaneKey> {
     /// Cached sort key for O(1) comparisons without data buffer access.
-    pub key: TemplateKey,
+    pub key: K,
     /// Offset to inline header in data buffer.
     pub offset: u64,
     /// Length of raw BAM data (excluding inline header).
@@ -1070,31 +1334,33 @@ pub struct TemplateRecordRef {
     pub padding: u32,
 }
 
-impl PartialEq for TemplateRecordRef {
+impl<K: TemplateLaneKey> PartialEq for TemplateRecordRef<K> {
     fn eq(&self, other: &Self) -> bool {
         self.offset == other.offset
     }
 }
 
-impl Eq for TemplateRecordRef {}
+impl<K: TemplateLaneKey> Eq for TemplateRecordRef<K> {}
 
-impl PartialOrd for TemplateRecordRef {
+impl<K: TemplateLaneKey> PartialOrd for TemplateRecordRef<K> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for TemplateRecordRef {
+impl<K: TemplateLaneKey> Ord for TemplateRecordRef<K> {
     fn cmp(&self, other: &Self) -> Ordering {
         // Note: This Ord impl is NOT used for sorting - we use sort_by with data access
         self.offset.cmp(&other.offset)
     }
 }
 
-/// Template-coordinate record buffer with inline headers.
+/// Template-coordinate record buffer with inline headers, generic over the lane-key type `K`.
 ///
-/// Uses inline headers to store full sort keys in the data buffer,
-/// allowing minimal refs (16 bytes) while maintaining fast comparison.
+/// Inline headers (8 bytes each) store only record lengths; sort keys are cached
+/// in the parallel `TemplateRecordRef<K>` index for O(1) comparison. Ref size
+/// varies with `K`: 40 bytes for `TemplateKey24`, 48 for `TemplateKey32`,
+/// 56 for `TemplateKey40`.
 ///
 /// Memory layout:
 /// ```text
@@ -1103,17 +1369,17 @@ impl Ord for TemplateRecordRef {
 /// ```
 ///
 /// During sorting, we use a custom comparator that:
-/// 1. Compares primary keys from refs (fast, O(1))
-/// 2. On ties, fetches full keys from inline headers
-pub struct TemplateRecordBuffer {
+/// 1. Compares sort keys cached in refs (fast, O(1))
+/// 2. On ties, uses the full `K: Ord` ordering
+pub struct TemplateRecordBuffer<K: TemplateLaneKey> {
     /// Segmented byte storage: inline headers + record data.
     data: SegmentedBuf,
     /// Minimal index for sorting.
-    refs: Vec<TemplateRecordRef>,
+    refs: Vec<TemplateRecordRef<K>>,
 }
 
 //
-impl TemplateRecordBuffer {
+impl<K: TemplateLaneKey> TemplateRecordBuffer<K> {
     /// Create a new buffer with estimated capacity.
     #[must_use]
     pub fn with_capacity(estimated_records: usize, estimated_bytes: usize) -> Self {
@@ -1131,7 +1397,7 @@ impl TemplateRecordBuffer {
     /// Returns an error if the record (plus header) exceeds the segment size
     /// (256 MiB) or if the record length exceeds `u32::MAX`.
     #[inline]
-    pub fn push(&mut self, record: &[u8], key: TemplateKey) -> anyhow::Result<()> {
+    pub fn push(&mut self, record: &[u8], key: K) -> anyhow::Result<()> {
         let total_bytes = TEMPLATE_HEADER_SIZE + record.len();
         anyhow::ensure!(
             total_bytes <= SORT_SEGMENT_SIZE,
@@ -1182,7 +1448,7 @@ impl TemplateRecordBuffer {
     #[inline]
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn get_record(&self, r: &TemplateRecordRef) -> &[u8] {
+    pub fn get_record(&self, r: &TemplateRecordRef<K>) -> &[u8] {
         self.data.slice(r.offset as usize + TEMPLATE_HEADER_SIZE, r.len as usize)
     }
 
@@ -1193,21 +1459,21 @@ impl TemplateRecordBuffer {
 
     /// Get the record references.
     #[must_use]
-    pub fn refs(&self) -> &[TemplateRecordRef] {
+    pub fn refs(&self) -> &[TemplateRecordRef<K>] {
         &self.refs
     }
 
     /// Memory usage in bytes (actual data stored, not capacity).
     #[must_use]
     pub fn memory_usage(&self) -> usize {
-        self.data.len() + self.refs.len() * std::mem::size_of::<TemplateRecordRef>()
+        self.data.len() + self.refs.len() * std::mem::size_of::<TemplateRecordRef<K>>()
     }
 
     /// Total allocated capacity in bytes (data segments + refs Vec).
     #[must_use]
     pub fn allocated_capacity(&self) -> usize {
         self.data.allocated_capacity()
-            + self.refs.capacity() * std::mem::size_of::<TemplateRecordRef>()
+            + self.refs.capacity() * std::mem::size_of::<TemplateRecordRef<K>>()
     }
 
     /// Number of data segments in the underlying buffer.
@@ -1232,13 +1498,13 @@ impl TemplateRecordBuffer {
     #[inline]
     #[must_use]
     #[allow(clippy::unused_self)]
-    pub fn get_key(&self, r: &TemplateRecordRef) -> TemplateKey {
+    pub fn get_key(&self, r: &TemplateRecordRef<K>) -> K {
         r.key
     }
 
     /// Iterate over sorted (key, record) pairs.
     /// Used for writing keyed temp chunks that preserve sort keys.
-    pub fn iter_sorted_keyed(&self) -> impl Iterator<Item = (TemplateKey, &[u8])> {
+    pub fn iter_sorted_keyed(&self) -> impl Iterator<Item = (K, &[u8])> {
         self.refs.iter().map(|r| (self.get_key(r), self.get_record(r)))
     }
 
@@ -1263,16 +1529,13 @@ impl TemplateRecordBuffer {
     /// zero records and `get_record()` called with a stale
     /// `TemplateRecordRef` would index-panic against the empty
     /// `SegmentedBuf`.
-    pub(crate) fn par_sort_into_chunks(
-        &mut self,
-        threads: usize,
-    ) -> Vec<InMemoryChunk<TemplateKey>> {
+    pub(crate) fn par_sort_into_chunks(&mut self, threads: usize) -> Vec<InMemoryChunk<K>> {
         par_sort_into_chunks_impl!(
             self,
             threads,
             radix_sort_template_refs,
             TEMPLATE_HEADER_SIZE,
-            |r: &TemplateRecordRef| r.key
+            |r: &TemplateRecordRef<K>| r.key
         )
     }
 
@@ -1285,7 +1548,7 @@ impl TemplateRecordBuffer {
     /// `get_record()` called with a stale `TemplateRecordRef` would
     /// index-panic against the empty `SegmentedBuf`.
     #[must_use]
-    pub(crate) fn drain_into_single_chunk(&mut self) -> InMemoryChunk<TemplateKey> {
+    pub(crate) fn drain_into_single_chunk(&mut self) -> InMemoryChunk<K> {
         let data = Arc::new(std::mem::take(&mut self.data));
         let records: Vec<_> = self
             .refs
@@ -1297,7 +1560,7 @@ impl TemplateRecordBuffer {
     }
 }
 
-impl ProbeableBuffer for TemplateRecordBuffer {
+impl<K: TemplateLaneKey> ProbeableBuffer for TemplateRecordBuffer<K> {
     fn memory_usage(&self) -> usize {
         self.memory_usage()
     }
@@ -1538,46 +1801,50 @@ fn insertion_sort_refs(refs: &mut [RecordRef]) {
 /// This avoids full O(n) passes for fields 2–5 when most records are already
 /// resolved by the primary field alone.
 #[allow(clippy::uninit_vec, unsafe_code)]
-pub fn radix_sort_template_refs(refs: &mut [TemplateRecordRef]) {
+pub fn radix_sort_template_refs<K: TemplateLaneKey>(refs: &mut [TemplateRecordRef<K>]) {
     let n = refs.len();
     if n < RADIX_THRESHOLD {
         insertion_sort_template_refs(refs);
         return;
     }
 
-    // Allocate auxiliary buffer (reused across phases)
-    let mut aux: Vec<TemplateRecordRef> = Vec::with_capacity(n);
+    // Allocate auxiliary buffer (reused across phases).
+    let mut aux: Vec<TemplateRecordRef<K>> = Vec::with_capacity(n);
+    // SAFETY: `aux` is written exactly once per radix pass (the scatter loop in
+    // `radix_sort_template_field`) before any element is read; `TemplateRecordRef<K>`
+    // is `Copy`/`Pod`, so leaving it uninitialized until the first scatter is sound.
+    // (Unchanged invariant from the non-generic version — see CLAUDE.md
+    // "Approved hot-path unsafe".)
     unsafe {
         aux.set_len(n);
     }
 
-    // Phase 1: Radix sort by primary field
-    let max_primary = refs.iter().map(|r| r.key.primary).max().unwrap_or(0);
+    // Phase 1: Radix sort by primary field. The lane accessor is a `fn(&K) -> u64`
+    // pointer (non-capturing closure coercion), keeping the field-getter type fixed
+    // across the recursive `sub_sort_runs` calls below — a capturing closure would
+    // grow a fresh type per recursion level and blow the monomorphization recursion
+    // limit.
+    let primary: fn(&K) -> u64 = |k| k.primary();
+    let max_primary = refs.iter().map(|r| primary(&r.key)).max().unwrap_or(0);
     let bytes_needed = bytes_needed_u64(max_primary);
     if bytes_needed > 0 {
-        radix_sort_template_field(refs, &mut aux, |r| r.key.primary, bytes_needed);
+        radix_sort_template_field(refs, &mut aux, primary, bytes_needed);
     }
 
     // Phase 2: Find equal-primary runs and sub-sort by remaining fields
-    sub_sort_runs(refs, &mut aux, |r| r.key.primary, &REMAINING_FIELDS_AFTER_PRIMARY);
+    sub_sort_runs(refs, &mut aux, primary, K::remaining_fields());
 }
-
-/// Remaining `TemplateKey` fields after `primary`, in sort precedence order.
-const REMAINING_FIELDS_AFTER_PRIMARY: [fn(&TemplateRecordRef) -> u64; 4] =
-    [|r| r.key.secondary, |r| r.key.cb_hash, |r| r.key.tertiary, |r| r.key.name_hash_upper];
 
 /// Threshold for sub-sort runs: below this, use insertion sort.
 const SUB_SORT_INSERTION_THRESHOLD: usize = 64;
 
 /// Find runs of equal values for `run_field` and sub-sort each run by `remaining_fields`.
-fn sub_sort_runs<F>(
-    refs: &mut [TemplateRecordRef],
-    aux: &mut [TemplateRecordRef],
-    run_field: F,
-    remaining_fields: &[fn(&TemplateRecordRef) -> u64],
-) where
-    F: Fn(&TemplateRecordRef) -> u64,
-{
+fn sub_sort_runs<K: TemplateLaneKey>(
+    refs: &mut [TemplateRecordRef<K>],
+    aux: &mut [TemplateRecordRef<K>],
+    run_field: fn(&K) -> u64,
+    remaining_fields: &[fn(&K) -> u64],
+) {
     if remaining_fields.is_empty() {
         return;
     }
@@ -1585,9 +1852,9 @@ fn sub_sort_runs<F>(
     let n = refs.len();
     let mut start = 0;
     while start < n {
-        let val = run_field(&refs[start]);
+        let val = run_field(&refs[start].key);
         let mut end = start + 1;
-        while end < n && run_field(&refs[end]) == val {
+        while end < n && run_field(&refs[end].key) == val {
             end += 1;
         }
 
@@ -1598,7 +1865,7 @@ fn sub_sort_runs<F>(
                 insertion_sort_template_refs(run);
             } else {
                 let next_field = remaining_fields[0];
-                let max_val = run.iter().map(next_field).max().unwrap_or(0);
+                let max_val = run.iter().map(|r| next_field(&r.key)).max().unwrap_or(0);
                 let bytes_needed = bytes_needed_u64(max_val);
                 if bytes_needed > 0 {
                     let run_aux = &mut aux[start..end];
@@ -1616,19 +1883,22 @@ fn sub_sort_runs<F>(
 
 /// Radix sort a single u64 field of `TemplateRecordRef` using raw pointers.
 #[allow(clippy::uninit_vec, unsafe_code)]
-fn radix_sort_template_field<F>(
-    refs: &mut [TemplateRecordRef],
-    aux: &mut [TemplateRecordRef],
-    get_field: F,
+fn radix_sort_template_field<K: TemplateLaneKey>(
+    refs: &mut [TemplateRecordRef<K>],
+    aux: &mut [TemplateRecordRef<K>],
+    get_field: fn(&K) -> u64,
     bytes_needed: usize,
-) where
-    F: Fn(&TemplateRecordRef) -> u64,
-{
+) {
     let n = refs.len();
 
-    // Use raw pointers to avoid borrow checker issues with swapping
-    let mut src = refs as *mut [TemplateRecordRef];
-    let mut dst = aux as *mut [TemplateRecordRef];
+    // Use raw pointers to avoid borrow checker issues with swapping.
+    // SAFETY: `src`/`dst` always point at the disjoint, properly-aligned
+    // `[TemplateRecordRef<K>]` storage of `refs`/`aux` (same length `n`); each
+    // pass writes every `dst` slot exactly once (the scatter loop) before that
+    // buffer is read as `src` on the next pass. Unchanged invariant from the
+    // non-generic version — see CLAUDE.md "Approved hot-path unsafe".
+    let mut src = refs as *mut [TemplateRecordRef<K>];
+    let mut dst = aux as *mut [TemplateRecordRef<K>];
 
     for byte_idx in 0..bytes_needed {
         let src_slice = unsafe { &*src };
@@ -1637,7 +1907,7 @@ fn radix_sort_template_field<F>(
         // Count occurrences of each byte value
         let mut counts = [0usize; 256];
         for r in src_slice {
-            let byte = ((get_field(r) >> (byte_idx * 8)) & 0xFF) as usize;
+            let byte = ((get_field(&r.key) >> (byte_idx * 8)) & 0xFF) as usize;
             counts[byte] += 1;
         }
 
@@ -1651,7 +1921,7 @@ fn radix_sort_template_field<F>(
 
         // Scatter elements to destination
         for item in src_slice.iter().take(n) {
-            let byte = ((get_field(item) >> (byte_idx * 8)) & 0xFF) as usize;
+            let byte = ((get_field(&item.key) >> (byte_idx * 8)) & 0xFF) as usize;
             let dest_idx = counts[byte];
             counts[byte] += 1;
             dst_slice[dest_idx] = *item;
@@ -1671,7 +1941,7 @@ fn radix_sort_template_field<F>(
 /// Parallel radix sort for `TemplateRecordRef` arrays.
 ///
 /// Uses stable radix sort per chunk with stable k-way merge (`chunk_idx` tie-breaker).
-pub fn parallel_radix_sort_template_refs(refs: &mut [TemplateRecordRef]) {
+pub fn parallel_radix_sort_template_refs<K: TemplateLaneKey>(refs: &mut [TemplateRecordRef<K>]) {
     use rayon::prelude::*;
 
     let n = refs.len();
@@ -1709,14 +1979,14 @@ pub fn parallel_radix_sort_template_refs(refs: &mut [TemplateRecordRef]) {
 /// Merge k sorted chunks of `TemplateRecordRef` in place.
 ///
 /// Uses `chunk_idx` as tie-breaker for stable merge (preserves input order for equal keys).
-fn merge_sorted_template_chunks(
-    refs: &mut [TemplateRecordRef],
+fn merge_sorted_template_chunks<K: TemplateLaneKey>(
+    refs: &mut [TemplateRecordRef<K>],
     chunk_ranges: &[std::ops::Range<usize>],
 ) {
     use crate::radix::{heap_make, heap_sift_down};
 
-    struct HeapEntry {
-        key: TemplateKey,
+    struct HeapEntry<K> {
+        key: K,
         chunk_idx: usize,
         pos: usize,
     }
@@ -1726,9 +1996,9 @@ fn merge_sorted_template_chunks(
     }
 
     let n = refs.len();
-    let mut result: Vec<TemplateRecordRef> = Vec::with_capacity(n);
+    let mut result: Vec<TemplateRecordRef<K>> = Vec::with_capacity(n);
 
-    let mut heap: Vec<HeapEntry> = Vec::with_capacity(chunk_ranges.len());
+    let mut heap: Vec<HeapEntry<K>> = Vec::with_capacity(chunk_ranges.len());
     for (chunk_idx, range) in chunk_ranges.iter().enumerate() {
         if !range.is_empty() {
             heap.push(HeapEntry { key: refs[range.start].key, chunk_idx, pos: range.start });
@@ -1740,7 +2010,7 @@ fn merge_sorted_template_chunks(
     }
 
     // Min-heap with chunk_idx tie-breaker for stability
-    let lt = |a: &HeapEntry, b: &HeapEntry| -> bool {
+    let lt = |a: &HeapEntry<K>, b: &HeapEntry<K>| -> bool {
         match a.key.cmp(&b.key) {
             std::cmp::Ordering::Greater => true,
             std::cmp::Ordering::Less => false,
@@ -1775,7 +2045,7 @@ fn merge_sorted_template_chunks(
 }
 
 /// Binary insertion sort for small arrays of `TemplateRecordRef`.
-fn insertion_sort_template_refs(refs: &mut [TemplateRecordRef]) {
+fn insertion_sort_template_refs<K: TemplateLaneKey>(refs: &mut [TemplateRecordRef<K>]) {
     for i in 1..refs.len() {
         let key = &refs[i].key;
         let insert_pos = refs[..i].partition_point(|r| r.key <= *key);
@@ -1998,6 +2268,99 @@ mod tests {
         }
     }
 
+    /// Build a `TemplateRecordBuffer<K>` of the given keys, sort it, and assert
+    /// the resulting key order equals the keys sorted by `K: Ord`. Each record's
+    /// payload is its insertion index so the buffer accepts a distinct push.
+    fn assert_buffer_sorts<K: TemplateLaneKey + std::fmt::Debug>(keys: &[K]) {
+        let mut buf = TemplateRecordBuffer::<K>::with_capacity(keys.len(), keys.len() * 8);
+        for (i, k) in keys.iter().enumerate() {
+            // Payload is the insertion index; its value is irrelevant to the sort
+            // (only the cached key drives ordering) — it just makes each push distinct.
+            let rec = (i as u64).to_le_bytes();
+            buf.push(&rec, *k).expect("push");
+        }
+        buf.sort();
+        let got: Vec<K> = buf.refs().iter().map(|r| r.key).collect();
+        let mut expect = keys.to_vec();
+        expect.sort();
+        assert_eq!(got, expect, "radix sort must match Ord");
+    }
+
+    #[test]
+    fn radix_sorts_template_key24() {
+        // Large n (>= RADIX_THRESHOLD) exercises the radix path.
+        // `name_hash_upper` uses a large odd constant so the lane spans the full
+        // u64 width and drives an 8-byte radix pass (exercises `bytes_needed_u64`
+        // for wide values on the narrow key type).
+        let keys: Vec<TemplateKey24> = (0..5000u64)
+            .map(|i| TemplateKey24 {
+                primary: i.wrapping_mul(2_654_435_761) % 97,
+                secondary: i % 13,
+                name_hash_upper: i.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            })
+            .collect();
+        assert_buffer_sorts(&keys);
+
+        // Small n (< RADIX_THRESHOLD) exercises the insertion-sort path.
+        let small: Vec<TemplateKey24> = (0..16u64)
+            .map(|i| TemplateKey24 { primary: (17 - i) % 5, secondary: i % 3, name_hash_upper: i })
+            .collect();
+        assert_buffer_sorts(&small);
+    }
+
+    #[test]
+    fn radix_sorts_template_key32() {
+        // `name_hash_upper` uses a large odd constant so the lane spans the full
+        // u64 width and drives an 8-byte radix pass (exercises `bytes_needed_u64`
+        // for wide values on the narrow key type).
+        let keys: Vec<TemplateKey32> = (0..5000u64)
+            .map(|i| TemplateKey32 {
+                primary: i.wrapping_mul(2_654_435_761) % 97,
+                secondary: i % 13,
+                opt: i.wrapping_mul(40503) % 31,
+                name_hash_upper: i.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            })
+            .collect();
+        assert_buffer_sorts(&keys);
+
+        let small: Vec<TemplateKey32> = (0..16u64)
+            .map(|i| TemplateKey32 {
+                primary: (17 - i) % 5,
+                secondary: i % 3,
+                opt: (7 - i % 7),
+                name_hash_upper: i,
+            })
+            .collect();
+        assert_buffer_sorts(&small);
+    }
+
+    #[test]
+    fn radix_sorts_template_key40() {
+        // `name_hash_upper` uses a large odd constant so the lane spans the full
+        // u64 width and drives an 8-byte radix pass.
+        let keys: Vec<TemplateKey40> = (0..5000u64)
+            .map(|i| TemplateKey40 {
+                primary: i.wrapping_mul(2_654_435_761) % 97,
+                secondary: i % 13,
+                cb_hash: i.wrapping_mul(6_364_136_223_846_793_005) % 53,
+                tertiary: i.wrapping_mul(40503) % 31,
+                name_hash_upper: i.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            })
+            .collect();
+        assert_buffer_sorts(&keys);
+
+        let small: Vec<TemplateKey40> = (0..16u64)
+            .map(|i| TemplateKey40 {
+                primary: (17 - i) % 5,
+                secondary: i % 3,
+                cb_hash: (11 - i % 11),
+                tertiary: (7 - i % 7),
+                name_hash_upper: i,
+            })
+            .collect();
+        assert_buffer_sorts(&small);
+    }
+
     #[test]
     #[allow(clippy::cast_sign_loss)]
     fn test_radix_sort_template_refs_stability() {
@@ -2005,7 +2368,7 @@ mod tests {
         // Create refs with identical TemplateKey but different offsets to track order
         let key = TemplateKey::new(0, 100, false, 0, 200, false, 0, 0, (1, true), 12345, false);
 
-        let mut refs: Vec<TemplateRecordRef> = (0..500)
+        let mut refs: Vec<TemplateRecordRef<TemplateKey>> = (0..500)
             .map(|i| TemplateRecordRef {
                 key,              // All same key
                 offset: i as u64, // Use offset to track original order
@@ -2033,7 +2396,7 @@ mod tests {
     fn test_parallel_radix_sort_template_refs_stability() {
         // Test that parallel template sort maintains stability for equal keys
         // Use groups of records with same key to verify stability within groups
-        let mut refs: Vec<TemplateRecordRef> = (0..20_000)
+        let mut refs: Vec<TemplateRecordRef<TemplateKey>> = (0..20_000)
             .map(|i| {
                 // Create groups of 100 with same key (different lib_name_hash for each group)
                 let group = i / 100;
@@ -2685,7 +3048,7 @@ mod tests {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
-        fn make_ref(key: TemplateKey, offset: u64) -> TemplateRecordRef {
+        fn make_ref(key: TemplateKey, offset: u64) -> TemplateRecordRef<TemplateKey> {
             TemplateRecordRef { key, offset, len: 10, padding: 0 }
         }
 
@@ -2709,7 +3072,7 @@ mod tests {
 
                 // Build 300+ refs (above RADIX_THRESHOLD) with random keys sharing primaries
                 let n = 300;
-                let mut refs: Vec<TemplateRecordRef> = Vec::with_capacity(n);
+                let mut refs: Vec<TemplateRecordRef<TemplateKey>> = Vec::with_capacity(n);
                 for i in 0..n {
                     let h = hash_pair(seed, (i + n_primaries) as u64);
                     let primary = primaries[i % n_primaries];
@@ -2743,7 +3106,7 @@ mod tests {
                 seed in proptest::num::u64::ANY,
             ) {
                 let n = 500;
-                let mut refs: Vec<TemplateRecordRef> = Vec::with_capacity(n);
+                let mut refs: Vec<TemplateRecordRef<TemplateKey>> = Vec::with_capacity(n);
                 for i in 0..n {
                     let h = hash_pair(seed, i as u64);
                     let key = TemplateKey {
