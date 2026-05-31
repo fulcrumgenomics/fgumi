@@ -3550,7 +3550,7 @@ fn dropped_lane_error(name: &str, v: DroppedLaneViolation) -> anyhow::Error {
 mod tests {
     use super::*;
     use bstr::BString;
-    use fgumi_sam::SamBuilder;
+    use fgumi_sam::{PairBuilder, SamBuilder};
     use noodles::sam::header::record::value::Map;
     use noodles::sam::header::record::value::map::ReadGroup;
 
@@ -4958,5 +4958,537 @@ mod tests {
         let bpr_lite = (TEMPLATE_HEADER_SIZE + EST_BAM_BYTES_PER_TEMPLATE_RECORD)
             + std::mem::size_of::<TemplateRecordRef<TemplateKey24>>();
         assert_eq!(bpr_lite, 8 + 250 + 40);
+    }
+
+    // ========================================================================
+    // T10: narrow-key byte-identity correctness proof
+    // ========================================================================
+    //
+    // The whole point of `--key-types`: a narrow-key template-coordinate sort
+    // must produce a record stream byte-identical to the full-key (`--key-types
+    // full`) baseline on the same input. These tests build one unsorted BAM per
+    // mode (with genuinely varying tags so the narrowed lane actually matters),
+    // sort it under both the narrow spec and the full spec, and compare the
+    // per-record BAM bodies in file order. They are non-vacuous: a sanity helper
+    // asserts the constructed input produces the nonzero cb_hash / tertiary that
+    // the mode claims, and the bonus `*_lite_sort_hard_errors` assertions prove a
+    // mis-narrowed (lite) sort of the same input would refuse to run rather than
+    // silently mis-sort.
+
+    /// Number of distinct-position pairs per mode input — large enough that the
+    /// spill-forced variant crosses a tiny memory limit and exercises the Phase-2
+    /// k-way merge. Tied clusters (see `CLUSTER_SIZE` / `CLUSTER_COUNT`) are added
+    /// on top of these.
+    const T10_DISTINCT_PAIRS: usize = 300;
+
+    /// Number of records in each coordinate-tied cluster. Within a cluster every
+    /// record shares the same primary (tid, start1) AND secondary (start2, strands)
+    /// and differs ONLY in the kept optional lane (`cb_hash` or tertiary), so that
+    /// lane is the load-bearing tiebreaker above `name_hash_upper`. Made large so
+    /// the chance that `name_hash` order coincidentally equals kept-lane order for
+    /// every cluster (which would re-vacuate the test) is negligible.
+    const CLUSTER_SIZE: usize = 8;
+
+    /// Number of coordinate-tied clusters, each at a distinct shared coordinate.
+    /// Several clusters further drive the coincidence probability to zero.
+    const CLUSTER_COUNT: usize = 4;
+
+    /// Total pairs (distinct + clustered) each mode input contains.
+    const T10_PAIRS: usize = T10_DISTINCT_PAIRS + CLUSTER_SIZE * CLUSTER_COUNT;
+
+    /// Collect each record's raw BAM bytes (excluding the header) in file order.
+    ///
+    /// Compares at the record-stream level rather than the file level: BGZF block
+    /// batching is nondeterministic, so two semantically identical BAMs can differ
+    /// byte-for-byte on disk while their decoded record bodies are identical.
+    fn collect_record_bytes(path: &Path) -> Vec<Vec<u8>> {
+        use crate::read_ahead::RawReadAheadReader;
+        let (reader, _) = create_raw_bam_reader(path, 1).expect("reader");
+        RawReadAheadReader::new(reader).map(|rec| rec.as_ref().to_vec()).collect()
+    }
+
+    /// Sort `input` with the given key-types spec and return the record-byte stream.
+    ///
+    /// `cell_tag(SamTag::CB)` is REQUIRED: `RawExternalSorter::new` defaults the
+    /// cell tag to `None`, so without this the CB lane is never populated and any
+    /// single-cell assertion would pass vacuously (`cb_hash` stays 0). This mirrors
+    /// the CLI's `parse_cell_tag`.
+    fn sort_and_collect(input: &Path, dir: &Path, tag: &str, spec: KeyTypesSpec) -> Vec<Vec<u8>> {
+        let out = dir.join(format!("{tag}.bam"));
+        RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .output_compression(0)
+            .cell_tag(SamTag::CB)
+            .key_types(spec)
+            .sort(input, &out)
+            .expect("sort");
+        collect_record_bytes(&out)
+    }
+
+    /// Insert a read group carrying an `LB:` (library) field into a builder header.
+    ///
+    /// Used by the multi-library inputs to realize two distinct library ordinals
+    /// (sorted alphabetically, then 1-based) so the tertiary lane genuinely varies.
+    fn add_rg_with_library(header: &mut Header, rg_id: &str, library: &str) {
+        let rg = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from(library))
+            .build()
+            .expect("valid read group");
+        header.read_groups_mut().insert(BString::from(rg_id), rg);
+    }
+
+    /// Extract the full-width template key for the first record of a BAM, using a
+    /// fresh `LibraryLookup` from its header. Lets a builder sanity-check that the
+    /// tags it wrote actually produce the nonzero `cb_hash` / tertiary it claims.
+    fn first_record_full_key(path: &Path) -> TemplateKey40 {
+        use crate::read_ahead::RawReadAheadReader;
+        let (reader, header) = create_raw_bam_reader(path, 1).expect("reader");
+        let lib = LibraryLookup::from_header(&header);
+        let first = RawReadAheadReader::new(reader).next().expect("at least one record");
+        extract_template_key_inline(first.as_ref(), &lib, Some(SamTag::CB), &cb_hasher())
+    }
+
+    /// Scramble a cluster member's slot index into a kept-lane value index so the
+    /// kept-lane order is a NON-identity permutation of the name order within the
+    /// cluster. `7` is coprime to `CLUSTER_SIZE` (8), so this is a bijection that
+    /// fixes no element to its name position (the `+3` shift removes the only fixed
+    /// point). This anti-correlates the kept lane with `name_hash` so a wrong
+    /// narrowing that falls back to `name_hash` cannot coincidentally reproduce the
+    /// correct (kept-lane) order.
+    fn scrambled_lane_index(member: usize) -> usize {
+        (member * 7 + 3) % CLUSTER_SIZE
+    }
+
+    /// Shared start1 for cluster `c`. Far above any distinct-position record
+    /// (`i * 200` for `i < T10_DISTINCT_PAIRS`, i.e. below ~`60_000`) so clusters
+    /// never collide with the general path and each cluster sits at its own
+    /// coordinate. All members of a cluster share this exact coordinate.
+    fn cluster_start1(c: usize) -> usize {
+        10_000_000 + c * 10_000
+    }
+
+    /// Build an unsorted BAM with `T10_DISTINCT_PAIRS` uniquely-positioned pairs
+    /// PLUS `CLUSTER_COUNT` coordinate-tied clusters of `CLUSTER_SIZE` pairs each.
+    ///
+    /// `tagger` decorates a uniquely-positioned pair (CB/MI/RG). `cluster_tagger`
+    /// decorates a cluster member, receiving the scrambled lane index so the caller
+    /// can set the kept optional lane (CB / MI / RG) to a value whose order is
+    /// anti-correlated with the member's name. The uniquely-positioned records
+    /// exercise the general sort/spill path; the clusters make the kept lane the
+    /// load-bearing tiebreaker (shared primary+secondary, differ only in kept lane).
+    fn build_mode_bam(
+        dir: &Path,
+        name: &str,
+        mut header: Header,
+        tagger: impl Fn(PairBuilder<'_>, usize) -> PairBuilder<'_>,
+        cluster_tagger: impl Fn(PairBuilder<'_>, usize) -> PairBuilder<'_>,
+    ) -> PathBuf {
+        let mut builder = SamBuilder::new();
+        builder.header = std::mem::take(&mut header);
+
+        // Coordinate-tied clusters first: each member shares start1/start2/strands
+        // with its cluster siblings and differs only in the kept optional lane.
+        for c in 0..CLUSTER_COUNT {
+            let start1 = cluster_start1(c);
+            let start2 = start1 + 100;
+            for member in 0..CLUSTER_SIZE {
+                let pair = builder
+                    .add_pair()
+                    .name(&format!("read_c{c}_{member:02}"))
+                    .start1(start1)
+                    .start2(start2);
+                let _ = cluster_tagger(pair, scrambled_lane_index(member)).build();
+            }
+        }
+
+        // Uniquely-positioned pairs: interleave positions (even i ascend, odd i
+        // descend) so file order is far from template-coordinate order.
+        for i in 0..T10_DISTINCT_PAIRS {
+            let pos = if i % 2 == 0 { i * 200 } else { (T10_DISTINCT_PAIRS - i) * 200 };
+            let pair =
+                builder.add_pair().name(&format!("read{i:05}")).start1(pos + 1).start2(pos + 101);
+            let _ = tagger(pair, i).build();
+        }
+
+        let path = dir.join(format!("{name}.bam"));
+        builder.write_bam(&path).expect("write bam");
+        path
+    }
+
+    /// Distinct CB barcodes, one per cluster slot, so a tied cluster's members get
+    /// distinct `cb_hash` values (the load-bearing single-cell tiebreaker).
+    const CLUSTER_BARCODES: [&str; CLUSTER_SIZE] = [
+        "AAAACCCC", "GGGGTTTT", "ACGTACGT", "TTTTGGGG", "CCCCAAAA", "TTTTACGT", "GACTGACT",
+        "TGCATGCA",
+    ];
+
+    /// bulk (lite): no CB, no MI, single default read group. No load-bearing opt
+    /// lane, so the clusters carry no distinguishing tag — bulk byte-identity is
+    /// inherently about the general path, and the cluster members tie down to
+    /// `name_hash` in both baseline and narrow (lite drops both lanes anyway).
+    fn build_bulk_bam(dir: &Path) -> PathBuf {
+        build_mode_bam(
+            dir,
+            "bulk",
+            SamBuilder::new().header.clone(),
+            |pair, _| pair,
+            |pair, _| pair,
+        )
+    }
+
+    /// single-cell: every pair carries `CB:Z:<barcode>`; no MI. Cluster members get
+    /// DISTINCT barcodes (scrambled vs name) so `cb_hash` is the load-bearing lane.
+    fn build_single_cell_bam(dir: &Path) -> PathBuf {
+        const BARCODES: [&str; 4] = ["AAAACCCC", "GGGGTTTT", "ACGTACGT", "TTTTGGGG"];
+        build_mode_bam(
+            dir,
+            "single_cell",
+            SamBuilder::new().header.clone(),
+            |pair, i| pair.attr("CB", BARCODES[i % BARCODES.len()]),
+            |pair, lane| pair.attr("CB", CLUSTER_BARCODES[lane]),
+        )
+    }
+
+    /// post-group: every pair carries `MI:Z:<id>`; no CB; single library. Cluster
+    /// members get DISTINCT MI ids (scrambled vs name), so the tertiary lane
+    /// (MI bits) is the load-bearing tiebreaker. Ids are `1..=CLUSTER_SIZE` so
+    /// tertiary != 0 for every member.
+    fn build_post_group_bam(dir: &Path) -> PathBuf {
+        build_mode_bam(
+            dir,
+            "post_group",
+            SamBuilder::new().header.clone(),
+            |pair, i| pair.attr("MI", format!("{}", (i % 5) + 1)),
+            |pair, lane| pair.attr("MI", format!("{}", lane + 1)),
+        )
+    }
+
+    /// multi-lib: header with TWO `@RG` lines whose `LB:` differ; pairs split across
+    /// the two RGs; no CB, no MI. The two libraries realize ordinals 1 and 2. Within
+    /// a cluster, members alternate read groups by the SCRAMBLED lane index so the
+    /// tertiary library bits (high-16) vary load-bearingly across the cluster and
+    /// the library order is anti-correlated with the name order.
+    fn build_multi_lib_bam(dir: &Path) -> PathBuf {
+        let mut header = SamBuilder::new().header.clone();
+        add_rg_with_library(&mut header, "rgA", "LibAlpha");
+        add_rg_with_library(&mut header, "rgB", "LibBeta");
+        build_mode_bam(
+            dir,
+            "multi_lib",
+            header,
+            |pair, i| pair.attr("RG", if i % 2 == 0 { "rgA" } else { "rgB" }),
+            |pair, lane| pair.attr("RG", if lane % 2 == 0 { "rgA" } else { "rgB" }),
+        )
+    }
+
+    /// full: CB + MI + multi-library together — all optional lanes vary. Cluster
+    /// members get distinct CB and MI (scrambled vs name) plus alternating RG.
+    /// Baseline (full) == narrow (full) so this mode is inherently trivial, but the
+    /// clusters keep it meaningful (the kept lanes still vary load-bearingly).
+    fn build_full_bam(dir: &Path) -> PathBuf {
+        const BARCODES: [&str; 4] = ["AAAACCCC", "GGGGTTTT", "ACGTACGT", "TTTTGGGG"];
+        let mut header = SamBuilder::new().header.clone();
+        add_rg_with_library(&mut header, "rgA", "LibAlpha");
+        add_rg_with_library(&mut header, "rgB", "LibBeta");
+        build_mode_bam(
+            dir,
+            "full",
+            header,
+            |pair, i| {
+                pair.attr("CB", BARCODES[i % BARCODES.len()])
+                    .attr("MI", format!("{}", i % 5))
+                    .attr("RG", if i % 2 == 0 { "rgA" } else { "rgB" })
+            },
+            |pair, lane| {
+                pair.attr("CB", CLUSTER_BARCODES[lane])
+                    .attr("MI", format!("{}", lane + 1))
+                    .attr("RG", if lane % 2 == 0 { "rgA" } else { "rgB" })
+            },
+        )
+    }
+
+    /// For each mode, the narrow-key sort must produce a record stream IDENTICAL to
+    /// the `--key-types full` baseline, and the `Auto`-detected variant must match
+    /// it too. The narrow spec is the minimal one for the mode; an over-narrow
+    /// (lite) sort of single-cell / post-group / multi-lib inputs would instead
+    /// hard-error (see `*_lite_sort_hard_errors`), proving these are not vacuous.
+    #[rstest::rstest]
+    #[case::bulk(build_bulk_bam as fn(&Path) -> PathBuf, KeyTypesSpec::None)]
+    #[case::single_cell(
+        build_single_cell_bam as fn(&Path) -> PathBuf,
+        KeyTypesSpec::Explicit { cb: true, tertiary: false }
+    )]
+    #[case::post_group(
+        build_post_group_bam as fn(&Path) -> PathBuf,
+        KeyTypesSpec::Explicit { cb: false, tertiary: true }
+    )]
+    #[case::multi_lib(
+        build_multi_lib_bam as fn(&Path) -> PathBuf,
+        KeyTypesSpec::Explicit { cb: false, tertiary: true }
+    )]
+    #[case::full(build_full_bam as fn(&Path) -> PathBuf, KeyTypesSpec::Full)]
+    fn narrow_key_sort_byte_identical_to_full(
+        #[case] build: fn(&Path) -> PathBuf,
+        #[case] narrow: KeyTypesSpec,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let input = build(dir.path());
+
+        let baseline = sort_and_collect(&input, dir.path(), "full_baseline", KeyTypesSpec::Full);
+        assert_eq!(baseline.len(), T10_PAIRS * 2, "baseline must retain every record");
+
+        let narrowed = sort_and_collect(&input, dir.path(), "narrow", narrow);
+        assert_eq!(narrowed, baseline, "narrow-key record stream must equal full-key stream");
+
+        let auto = sort_and_collect(&input, dir.path(), "auto", KeyTypesSpec::Auto);
+        assert_eq!(auto, baseline, "auto-detected variant must equal full-key stream");
+    }
+
+    /// Spill-forced byte-identity: a tiny memory limit forces Phase 1 to spill and
+    /// Phase 2 to k-way merge `PooledChunkWriter::<K>` chunks. This is the path
+    /// where the serialized narrow-key width must match the Phase-1 width; a
+    /// mismatch would corrupt the merge. Asserted on the bulk (lite) input.
+    #[test]
+    fn narrow_key_sort_byte_identical_when_spilling() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = build_bulk_bam(dir.path());
+
+        let sort_spilling = |tag: &str, spec: KeyTypesSpec| -> (Vec<Vec<u8>>, usize) {
+            let out = dir.path().join(format!("{tag}.bam"));
+            let stats = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+                .memory_limit(32 * 1024)
+                .max_temp_files(0)
+                .spill_codec(crate::codec::SpillCodec::Bgzf)
+                .temp_compression(0)
+                .output_compression(0)
+                .cell_tag(SamTag::CB)
+                .key_types(spec)
+                .sort(&input, &out)
+                .expect("sort");
+            (collect_record_bytes(&out), stats.chunks_written)
+        };
+
+        let (baseline, base_chunks) = sort_spilling("spill_full", KeyTypesSpec::Full);
+        let (narrowed, narrow_chunks) = sort_spilling("spill_narrow", KeyTypesSpec::None);
+
+        assert!(base_chunks >= 2, "baseline must spill multiple chunks, got {base_chunks}");
+        assert!(narrow_chunks >= 2, "narrow must spill multiple chunks, got {narrow_chunks}");
+        assert_eq!(narrowed, baseline, "spilled narrow stream must equal spilled full stream");
+    }
+
+    /// Sanity (anti-vacuity): each mode's input must produce the nonzero `cb_hash` /
+    /// tertiary it claims on its first record, otherwise the byte-identity tests
+    /// would compare two identically-narrowed streams and prove nothing.
+    #[test]
+    fn mode_inputs_realize_claimed_lanes() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let bulk = first_record_full_key(&build_bulk_bam(dir.path()));
+        assert_eq!(bulk.cb_hash, 0, "bulk must have no CB");
+        assert_eq!(bulk.tertiary, 0, "bulk must have no MI/library");
+
+        let cell = first_record_full_key(&build_single_cell_bam(dir.path()));
+        assert_ne!(cell.cb_hash, 0, "single-cell first record must have nonzero cb_hash");
+        assert_eq!(cell.tertiary, 0, "single-cell must have no MI/library");
+
+        let pg = first_record_full_key(&build_post_group_bam(dir.path()));
+        assert_eq!(pg.cb_hash, 0, "post-group must have no CB");
+        assert_ne!(pg.tertiary, 0, "post-group first record must have nonzero MI tertiary");
+        assert_eq!(pg.tertiary >> 48, 0, "post-group must have no library (ordinal 0)");
+
+        let multi = first_record_full_key(&build_multi_lib_bam(dir.path()));
+        assert_eq!(multi.cb_hash, 0, "multi-lib must have no CB");
+        assert_ne!(multi.tertiary >> 48, 0, "multi-lib first record must have nonzero library");
+
+        let full = first_record_full_key(&build_full_bam(dir.path()));
+        assert_ne!(full.cb_hash, 0, "full first record must have nonzero cb_hash");
+        assert_ne!(full.tertiary, 0, "full first record must have nonzero tertiary");
+        assert_ne!(full.tertiary >> 48, 0, "full first record must have nonzero library ordinal");
+    }
+
+    /// Guard the single-cell cluster against a silent `cb_hash` collision: every
+    /// barcode in `CLUSTER_BARCODES` must hash to a DISTINCT `cb_hash` value under
+    /// `cb_hasher()`, otherwise two cluster members would share the same sort key
+    /// and the tiebreaker designed to make the narrow-key test non-vacuous would
+    /// silently collapse.
+    ///
+    /// Uses `cb_hasher().hash_one(bc.as_bytes())` — exactly the expression in
+    /// `extract_template_key_inline` (`cb_hasher.hash_one(cb_bytes)` where
+    /// `cb_bytes` is the raw string value of the CB aux tag, i.e. ASCII barcode
+    /// bytes without NUL terminator).
+    #[test]
+    fn cluster_barcodes_have_distinct_cb_hashes() {
+        let hasher = cb_hasher();
+        let mut hash_vals: Vec<u64> =
+            CLUSTER_BARCODES.iter().map(|bc| hasher.hash_one(bc.as_bytes())).collect();
+        let n = hash_vals.len();
+        hash_vals.sort_unstable();
+        hash_vals.dedup();
+        assert_eq!(
+            hash_vals.len(),
+            n,
+            "cluster barcodes must hash to distinct cb_hash values, else the single-cell \
+             cluster is vacuous"
+        );
+    }
+
+    /// A narrow (tertiary-only) sort output must re-verify correct at FULL width via
+    /// `core_cmp`. This locks the consistency between the narrowed key used for
+    /// sorting and the full key used by `fgumi sort --verify`: if narrowing dropped
+    /// ordering information the merge depended on, the full-width re-check would
+    /// find a violation.
+    #[test]
+    fn narrow_sort_output_passes_full_width_verify() {
+        use std::cmp::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = build_post_group_bam(dir.path());
+        let out = dir.path().join("narrow.bam");
+        RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .output_compression(0)
+            .cell_tag(SamTag::CB)
+            .key_types(KeyTypesSpec::Explicit { cb: false, tertiary: true })
+            .sort(&input, &out)
+            .expect("sort");
+
+        // Header only (for LibraryLookup); the auto reader is dropped immediately.
+        let (_, header) = create_raw_bam_reader(&out, 1).expect("header");
+        let lib = LibraryLookup::from_header(&header);
+        let hasher = cb_hasher();
+
+        // verify_sort_order wants RawBamRecordReader<File> — build it like execute_verify.
+        let file = std::fs::File::open(&out).expect("open");
+        let mut raw_reader = crate::reader::RawBamRecordReader::new(file).expect("reader");
+        raw_reader.skip_header().expect("skip header");
+
+        let (total, violations, first) = crate::verify::verify_sort_order(
+            raw_reader,
+            |bam| extract_template_key_inline(bam, &lib, Some(SamTag::CB), &hasher),
+            |cur: &TemplateKey40, prev: &TemplateKey40| cur.core_cmp(prev) == Ordering::Less,
+        )
+        .expect("verify runs");
+
+        assert_eq!(total, (T10_PAIRS * 2) as u64, "verify must see every record");
+        assert_eq!(
+            violations, 0,
+            "narrow output must re-verify at full width (first={first:?}, total={total})"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // T6 (deferred) hard-error integration tests
+    //
+    // Build a BAM whose FIRST pair lacks an optional field and a LATER pair
+    // carries/changes it, then sort with the over-narrow spec that drops that
+    // lane. The decode-time `verify_dropped_lanes` check must hard-error with a
+    // message naming the `--key-types <token>` that re-includes the lane, rather
+    // than silently mis-sorting. Each test forces the relevant lane to vary
+    // across records while holding the dropped lanes constant; attribution
+    // (cb / mi / library) follows `verify_dropped_lanes`.
+    // ------------------------------------------------------------------------
+
+    /// Build a two-pair BAM where the first pair omits a tag the second supplies.
+    fn build_first_then_appears(
+        dir: &Path,
+        name: &str,
+        header: Header,
+        first: impl Fn(PairBuilder<'_>) -> PairBuilder<'_>,
+        second: impl Fn(PairBuilder<'_>) -> PairBuilder<'_>,
+    ) -> PathBuf {
+        let mut builder = SamBuilder::new();
+        builder.header = header;
+        let _ = first(builder.add_pair().name("read00000").start1(1).start2(101)).build();
+        let _ = second(builder.add_pair().name("read00001").start1(201).start2(301)).build();
+        let path = dir.join(format!("{name}.bam"));
+        builder.write_bam(&path).expect("write bam");
+        path
+    }
+
+    /// CB appears after the first record under `--key-types none` → hard error
+    /// instructing `--key-types cb`.
+    #[test]
+    fn lite_sort_hard_errors_when_cb_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = build_first_then_appears(
+            dir.path(),
+            "cb_appears",
+            SamBuilder::new().header.clone(),
+            |pair| pair,
+            |pair| pair.attr("CB", "AAAACCCC"),
+        );
+        let out = dir.path().join("out.bam");
+        let err = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .output_compression(0)
+            .cell_tag(SamTag::CB)
+            .key_types(KeyTypesSpec::None)
+            .sort(&input, &out)
+            .expect_err("CB appearing after a CB-free first record must hard-error under lite");
+        let msg = err.to_string();
+        assert!(msg.contains("--key-types cb"), "expected --key-types cb guidance, got: {msg}");
+    }
+
+    /// MI appears/changes after the first record under `--key-types none` → hard
+    /// error instructing `--key-types mi`.
+    #[test]
+    fn lite_sort_hard_errors_when_mi_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = build_first_then_appears(
+            dir.path(),
+            "mi_appears",
+            SamBuilder::new().header.clone(),
+            |pair| pair,
+            |pair| pair.attr("MI", "7"),
+        );
+        let out = dir.path().join("out.bam");
+        let err = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .output_compression(0)
+            .cell_tag(SamTag::CB)
+            .key_types(KeyTypesSpec::None)
+            .sort(&input, &out)
+            .expect_err("MI appearing after an MI-free first record must hard-error under lite");
+        let msg = err.to_string();
+        assert!(msg.contains("--key-types mi"), "expected --key-types mi guidance, got: {msg}");
+    }
+
+    /// Library differs after the first record under `--key-types none` → hard error
+    /// instructing `--key-types library`. The first pair carries a read group whose
+    /// `LB:` realizes ordinal 1; the second pair carries NO RG tag, realizing
+    /// ordinal 0 — exercising the "header undercounts realized libraries" case
+    /// where a later record drops to an unseen library ordinal.
+    #[test]
+    fn lite_sort_hard_errors_when_library_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        // Header has exactly one read group (with LB) → ordinal 1; the default
+        // SamBuilder "A" group is replaced so the only library is LibAlpha.
+        let mut header = Header::builder()
+            .add_reference_sequence(
+                BString::from("chr1"),
+                Map::<noodles::sam::header::record::value::map::ReferenceSequence>::new(
+                    std::num::NonZeroUsize::new(200_000_000).expect("nonzero"),
+                ),
+            )
+            .build();
+        add_rg_with_library(&mut header, "rgA", "LibAlpha");
+
+        // First pair: RG=rgA (ordinal 1). Second pair: RG points at an id absent
+        // from the header → realized ordinal 0, differing from the first.
+        let input = build_first_then_appears(
+            dir.path(),
+            "library_differs",
+            header,
+            |pair| pair.attr("RG", "rgA"),
+            |pair| pair.attr("RG", "rgUnknown"),
+        );
+        let out = dir.path().join("out.bam");
+        let err = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .output_compression(0)
+            .cell_tag(SamTag::CB)
+            .key_types(KeyTypesSpec::None)
+            .sort(&input, &out)
+            .expect_err("a differing library ordinal must hard-error under lite");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--key-types library"),
+            "expected --key-types library guidance, got: {msg}"
+        );
     }
 }
