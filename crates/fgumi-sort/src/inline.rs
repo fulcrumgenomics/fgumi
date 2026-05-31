@@ -781,6 +781,12 @@ impl TemplateKey {
     }
 }
 
+/// Full 5-lane template-coordinate key (alias of [`TemplateKey`]).
+///
+/// Used as the canonical full-width key from which narrow keys are derived and
+/// against which decode-time verify compares. Identical layout / `Ord` / radix.
+pub type TemplateKey40 = TemplateKey;
+
 impl RawSortKey for TemplateKey {
     const SERIALIZED_SIZE: Option<usize> = Some(40);
 
@@ -806,6 +812,194 @@ impl RawSortKey for TemplateKey {
         let mut buf = [0u8; 40];
         reader.read_exact(&mut buf)?;
         Ok(Self::from_bytes(&buf))
+    }
+}
+
+/// Lite template-coordinate key: only the always-present lanes
+/// (`primary`, `secondary`, `name_hash_upper`). 24 bytes.
+///
+/// Valid only when neither optional word (`cb_hash`, `tertiary`) varies across
+/// records — verified at decode time. Lanes are in canonical sort precedence.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TemplateKey24 {
+    /// Packed coordinate primary lane (tid1<<48 | tid2<<32 | pos1).
+    pub primary: u64,
+    /// Packed secondary lane (pos2<<32 | !neg1<<1 | !neg2).
+    pub secondary: u64,
+    /// Packed (`name_hash`<<1 | `is_upper`).
+    pub name_hash_upper: u64,
+}
+
+impl TemplateKey24 {
+    /// Serialize to bytes for storage in keyed temp files.
+    #[inline]
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; 24] {
+        let mut buf = [0u8; 24];
+        buf[0..8].copy_from_slice(&self.primary.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.secondary.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.name_hash_upper.to_le_bytes());
+        buf
+    }
+
+    /// Deserialize from bytes read from keyed temp files.
+    #[inline]
+    #[must_use]
+    pub fn from_bytes(buf: &[u8; 24]) -> Self {
+        Self {
+            primary: u64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]),
+            secondary: u64::from_le_bytes([
+                buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+            ]),
+            name_hash_upper: u64::from_le_bytes([
+                buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+            ]),
+        }
+    }
+
+    /// Build a lite key from a full extracted key, dropping the optional lanes.
+    /// Valid only when `cb_hash` and `tertiary` are constant across all records.
+    #[inline]
+    #[must_use]
+    pub fn from_full(full: &TemplateKey40) -> Self {
+        Self {
+            primary: full.primary,
+            secondary: full.secondary,
+            name_hash_upper: full.name_hash_upper,
+        }
+    }
+
+    /// Compare only the non-tie-breaker lanes (everything except `name_hash_upper`).
+    #[inline]
+    #[must_use]
+    pub fn core_cmp(&self, other: &Self) -> Ordering {
+        self.primary.cmp(&other.primary).then_with(|| self.secondary.cmp(&other.secondary))
+    }
+}
+
+impl PartialOrd for TemplateKey24 {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TemplateKey24 {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.primary
+            .cmp(&other.primary)
+            .then_with(|| self.secondary.cmp(&other.secondary))
+            .then_with(|| self.name_hash_upper.cmp(&other.name_hash_upper))
+    }
+}
+
+/// Single-optional template key: `primary`, `secondary`, one optional lane
+/// (`opt` = `cb_hash` OR tertiary), `name_hash_upper`. 32 bytes.
+///
+/// Used when exactly one optional word is non-constant. The `opt` lane source
+/// (`cb_hash` vs tertiary) is fixed by the constructor chosen at sort start; the
+/// layout and `Ord` are identical for both — see `from_full_cb` / `from_full_tertiary` (T3).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TemplateKey32 {
+    /// Packed coordinate primary lane (tid1<<48 | tid2<<32 | pos1).
+    pub primary: u64,
+    /// Packed secondary lane (pos2<<32 | !neg1<<1 | !neg2).
+    pub secondary: u64,
+    /// The single retained optional lane (`cb_hash` or tertiary).
+    pub opt: u64,
+    /// Packed (`name_hash`<<1 | `is_upper`).
+    pub name_hash_upper: u64,
+}
+
+impl TemplateKey32 {
+    /// Serialize to bytes for storage in keyed temp files.
+    #[inline]
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; 32] {
+        let mut buf = [0u8; 32];
+        buf[0..8].copy_from_slice(&self.primary.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.secondary.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.opt.to_le_bytes());
+        buf[24..32].copy_from_slice(&self.name_hash_upper.to_le_bytes());
+        buf
+    }
+
+    /// Deserialize from bytes read from keyed temp files.
+    #[inline]
+    #[must_use]
+    pub fn from_bytes(buf: &[u8; 32]) -> Self {
+        Self {
+            primary: u64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]),
+            secondary: u64::from_le_bytes([
+                buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+            ]),
+            opt: u64::from_le_bytes([
+                buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+            ]),
+            name_hash_upper: u64::from_le_bytes([
+                buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
+            ]),
+        }
+    }
+
+    /// Build a single-optional key keeping `cb_hash` in the `opt` lane
+    /// (single-cell, pre-group). Valid only when `tertiary` is constant.
+    #[inline]
+    #[must_use]
+    pub fn from_full_cb(full: &TemplateKey40) -> Self {
+        Self {
+            primary: full.primary,
+            secondary: full.secondary,
+            opt: full.cb_hash,
+            name_hash_upper: full.name_hash_upper,
+        }
+    }
+
+    /// Build a single-optional key keeping `tertiary` (library<<48 | mi) in the
+    /// `opt` lane (post-group / multi-library). Valid only when `cb_hash` is constant.
+    #[inline]
+    #[must_use]
+    pub fn from_full_tertiary(full: &TemplateKey40) -> Self {
+        Self {
+            primary: full.primary,
+            secondary: full.secondary,
+            opt: full.tertiary,
+            name_hash_upper: full.name_hash_upper,
+        }
+    }
+
+    /// Compare only the non-tie-breaker lanes (everything except `name_hash_upper`).
+    ///
+    /// Includes `opt` because it is a core sort lane (either `cb_hash` or tertiary,
+    /// both core fields in `TemplateKey40::core_cmp`).
+    #[inline]
+    #[must_use]
+    pub fn core_cmp(&self, other: &Self) -> Ordering {
+        self.primary
+            .cmp(&other.primary)
+            .then_with(|| self.secondary.cmp(&other.secondary))
+            .then_with(|| self.opt.cmp(&other.opt))
+    }
+}
+
+impl PartialOrd for TemplateKey32 {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TemplateKey32 {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.primary
+            .cmp(&other.primary)
+            .then_with(|| self.secondary.cmp(&other.secondary))
+            .then_with(|| self.opt.cmp(&other.opt))
+            .then_with(|| self.name_hash_upper.cmp(&other.name_hash_upper))
     }
 }
 
@@ -2331,6 +2525,158 @@ mod tests {
         // Strong count = number of chunks (after the macro's local `data`
         // binding has been dropped).
         assert_eq!(Arc::strong_count(&chunks[0].data), chunks.len());
+    }
+
+    mod template_key32 {
+        use super::*;
+
+        #[test]
+        fn template_key32_ord_is_lexicographic_over_lanes() {
+            let a = TemplateKey32 { primary: 1, secondary: 1, opt: 1, name_hash_upper: 1 };
+            let b = TemplateKey32 { primary: 1, secondary: 1, opt: 1, name_hash_upper: 2 };
+            let c = TemplateKey32 { primary: 1, secondary: 1, opt: 2, name_hash_upper: 0 };
+            let d = TemplateKey32 { primary: 1, secondary: 2, opt: 0, name_hash_upper: 0 };
+            assert!(a < b && b < c && c < d);
+        }
+
+        #[test]
+        fn template_key32_to_from_bytes_roundtrip() {
+            let k = TemplateKey32 {
+                primary: 0xDEAD_BEEF_CAFE_1234,
+                secondary: 0xABCD_0001_0002_0003,
+                opt: 0x0102_0304_0506_0708,
+                name_hash_upper: 0xFFFF_DEAD_BEEF_0099,
+            };
+            assert_eq!(TemplateKey32::from_bytes(&k.to_bytes()), k);
+        }
+
+        #[test]
+        fn template_key32_core_cmp_includes_opt_excludes_name_hash() {
+            let a = TemplateKey32 { primary: 1, secondary: 1, opt: 1, name_hash_upper: 5 };
+            let b = TemplateKey32 { primary: 1, secondary: 1, opt: 2, name_hash_upper: 0 };
+            let c = TemplateKey32 { primary: 1, secondary: 1, opt: 1, name_hash_upper: 9 };
+            assert_eq!(a.core_cmp(&b), std::cmp::Ordering::Less, "opt is a core lane");
+            assert_eq!(a.core_cmp(&c), std::cmp::Ordering::Equal, "name_hash ignored in core_cmp");
+        }
+    }
+
+    mod template_key24 {
+        use super::*;
+
+        #[test]
+        fn template_key24_ord_is_lexicographic_over_lanes() {
+            let a = TemplateKey24 { primary: 1, secondary: 5, name_hash_upper: 9 };
+            let b = TemplateKey24 { primary: 1, secondary: 5, name_hash_upper: 10 };
+            let c = TemplateKey24 { primary: 1, secondary: 6, name_hash_upper: 0 };
+            let d = TemplateKey24 { primary: 2, secondary: 0, name_hash_upper: 0 };
+            assert!(a < b, "name_hash breaks ties");
+            assert!(b < c, "secondary dominates name_hash");
+            assert!(c < d, "primary dominates all");
+            assert_eq!(a.cmp(&a), std::cmp::Ordering::Equal);
+        }
+
+        #[test]
+        fn template_key24_to_from_bytes_roundtrip() {
+            let k = TemplateKey24 {
+                primary: 0xDEAD_BEEF_CAFE_1234,
+                secondary: 0xABCD_0001_0002_0003,
+                name_hash_upper: 0xFFFF_DEAD_BEEF_0099,
+            };
+            assert_eq!(TemplateKey24::from_bytes(&k.to_bytes()), k);
+        }
+
+        #[test]
+        fn template_key24_core_cmp_ignores_name_hash() {
+            let a = TemplateKey24 { primary: 1, secondary: 2, name_hash_upper: 100 };
+            let b = TemplateKey24 { primary: 1, secondary: 2, name_hash_upper: 200 };
+            assert_eq!(a.core_cmp(&b), std::cmp::Ordering::Equal);
+        }
+    }
+
+    mod from_full {
+        use super::*;
+
+        #[test]
+        fn template_key24_from_full_drops_optional_lanes() {
+            let full = TemplateKey40 {
+                primary: 11,
+                secondary: 22,
+                cb_hash: 99,
+                tertiary: 88,
+                name_hash_upper: 33,
+            };
+            let lite = TemplateKey24::from_full(&full);
+            assert_eq!(lite, TemplateKey24 { primary: 11, secondary: 22, name_hash_upper: 33 });
+        }
+
+        #[test]
+        fn template_key32_from_full_cb_uses_cb_hash_as_opt() {
+            let full = TemplateKey40 {
+                primary: 1,
+                secondary: 2,
+                cb_hash: 7,
+                tertiary: 0,
+                name_hash_upper: 4,
+            };
+            let k = TemplateKey32::from_full_cb(&full);
+            assert_eq!(k, TemplateKey32 { primary: 1, secondary: 2, opt: 7, name_hash_upper: 4 });
+        }
+
+        #[test]
+        fn template_key32_from_full_tertiary_uses_tertiary_as_opt() {
+            let full = TemplateKey40 {
+                primary: 1,
+                secondary: 2,
+                cb_hash: 0,
+                tertiary: 55,
+                name_hash_upper: 4,
+            };
+            let k = TemplateKey32::from_full_tertiary(&full);
+            assert_eq!(k, TemplateKey32 { primary: 1, secondary: 2, opt: 55, name_hash_upper: 4 });
+        }
+
+        #[test]
+        fn narrow_ord_matches_full_when_dropped_lanes_constant() {
+            let recs = [
+                TemplateKey40 {
+                    primary: 2,
+                    secondary: 0,
+                    cb_hash: 5,
+                    tertiary: 5,
+                    name_hash_upper: 0,
+                },
+                TemplateKey40 {
+                    primary: 1,
+                    secondary: 9,
+                    cb_hash: 5,
+                    tertiary: 5,
+                    name_hash_upper: 1,
+                },
+                TemplateKey40 {
+                    primary: 1,
+                    secondary: 9,
+                    cb_hash: 5,
+                    tertiary: 5,
+                    name_hash_upper: 0,
+                },
+                TemplateKey40 {
+                    primary: 1,
+                    secondary: 1,
+                    cb_hash: 5,
+                    tertiary: 5,
+                    name_hash_upper: 9,
+                },
+            ];
+            for a in &recs {
+                for b in &recs {
+                    assert_eq!(
+                        TemplateKey24::from_full(a).cmp(&TemplateKey24::from_full(b)),
+                        a.cmp(b),
+                        "lite ordering must match full when cb/tertiary constant",
+                    );
+                }
+            }
+        }
     }
 
     mod proptest_msd {
