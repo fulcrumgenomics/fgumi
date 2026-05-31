@@ -3509,7 +3509,8 @@ impl DroppedLaneViolation {
 /// or `None` if all dropped lanes match.
 ///
 /// Tertiary sub-fields are decoded only to attribute the violation: the high 16
-/// bits are the library ordinal; the low 48 bits are `mi_value|!mi_suffix`.
+/// bits are the library ordinal; the low 48 bits are `(mi_value << 1) | !mi_suffix`
+/// (`mi_value` occupies bits 47..1; `!mi_suffix` is bit 0).
 #[must_use]
 pub fn verify_dropped_lanes(
     first: &TemplateKey,

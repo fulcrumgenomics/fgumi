@@ -147,12 +147,19 @@ because the hot path runs once per record (BAM workloads are millions to billion
 of records) and a safe rewrite measurably regresses sort throughput.
 
 - **`crates/fgumi-sort/src/inline.rs`** — three `#[allow(unsafe_code)]` regions:
-  the `radix_sort_record_refs` and `radix_sort_template_refs` LSD radix sorts use
-  `Vec::set_len` to skip per-element initialization on the auxiliary scratch
-  buffer, plus raw-pointer slice swaps to avoid double-borrow restrictions across
-  the source/destination ping-pong. SAFETY relies on (a) the buffer being written
-  exactly once per pass before being read, and (b) the pointers always referring
-  to disjoint, properly-aligned `Vec<RecordRef>`/`Vec<TemplateRecordRef>` storage.
+  the `radix_sort_record_refs` (coordinate) and `radix_sort_template_refs` /
+  `radix_sort_template_field` (template) LSD radix sorts use `Vec::set_len` to
+  skip per-element initialization on the auxiliary scratch buffer, plus
+  raw-pointer slice swaps to avoid double-borrow restrictions across the
+  source/destination ping-pong. The template path is now generic over the
+  `TemplateLaneKey` trait (`TemplateKey24`/`32`/`40`), so the buffers are
+  `Vec<TemplateRecordRef<K>>`; the field scatter was extracted into
+  `radix_sort_template_field` to keep the per-field getter type fixed across the
+  generic recursion. The unsafe invariant is unchanged by going generic. SAFETY
+  relies on (a) the buffer being written exactly once per pass before being read,
+  and (b) the pointers always referring to disjoint, properly-aligned
+  `Vec<RecordRef>` / `Vec<TemplateRecordRef<K>>` storage (`TemplateRecordRef<K>`
+  is `Copy`/`Pod` for any `K: TemplateLaneKey`).
 - **`crates/fgumi-sort/src/keys.rs`** — `RawQuerynameKey::cmp` calls
   `natural_compare_nul` (defined in `fgumi-raw-bam`) over raw `*const u8`
   pointers. SAFETY: the names that back these pointers are always
