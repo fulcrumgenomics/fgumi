@@ -5275,6 +5275,74 @@ mod tests {
         assert_eq!(narrowed, baseline, "spilled narrow stream must equal spilled full stream");
     }
 
+    /// Spill-forced byte-identity for ALL key widths: a tiny memory limit forces Phase 1
+    /// to spill and Phase 2 to k-way merge `PooledChunkWriter::<K>` chunks across all four
+    /// key widths (24-byte lite, 32-byte `CbKey32`, 32-byte `TertKey32`, 40-byte `TemplateKey40`).
+    ///
+    /// The existing `narrow_key_sort_byte_identical_when_spilling` test only covers the
+    /// 24-byte (bulk/lite) path. A width/serialization regression in the 32- or 40-byte
+    /// Phase-2 merge path would not be caught by that test alone. This test closes the gap
+    /// by asserting both that each width's narrow-key spilled stream is byte-identical to
+    /// the Full baseline spilled stream, AND that both runs actually spilled (>=2 chunks),
+    /// so the Phase-2 merge path at each key width is genuinely exercised.
+    #[rstest::rstest]
+    #[case::bulk(build_bulk_bam as fn(&Path) -> PathBuf, KeyTypesSpec::None)]
+    #[case::single_cell(
+        build_single_cell_bam as fn(&Path) -> PathBuf,
+        KeyTypesSpec::Explicit { cb: true, tertiary: false }
+    )]
+    #[case::post_group(
+        build_post_group_bam as fn(&Path) -> PathBuf,
+        KeyTypesSpec::Explicit { cb: false, tertiary: true }
+    )]
+    #[case::multi_lib(
+        build_multi_lib_bam as fn(&Path) -> PathBuf,
+        KeyTypesSpec::Explicit { cb: false, tertiary: true }
+    )]
+    #[case::full(build_full_bam as fn(&Path) -> PathBuf, KeyTypesSpec::Full)]
+    fn narrow_key_spill_merge_byte_identical_all_widths(
+        #[case] build: fn(&Path) -> PathBuf,
+        #[case] narrow: KeyTypesSpec,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let input = build(dir.path());
+
+        let sort_spilling = |tag: &str, spec: KeyTypesSpec| -> (Vec<Vec<u8>>, usize) {
+            let out = dir.path().join(format!("{tag}.bam"));
+            let stats = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+                .memory_limit(32 * 1024)
+                .max_temp_files(0)
+                .spill_codec(crate::codec::SpillCodec::Bgzf)
+                .temp_compression(0)
+                .output_compression(0)
+                .cell_tag(SamTag::CB)
+                .key_types(spec)
+                .sort(&input, &out)
+                .expect("sort");
+            (collect_record_bytes(&out), stats.chunks_written)
+        };
+
+        let (baseline, base_chunks) = sort_spilling("spill_full_baseline", KeyTypesSpec::Full);
+        let (narrowed, narrow_chunks) = sort_spilling("spill_narrow", narrow);
+
+        assert!(
+            base_chunks >= 2,
+            "Full-key baseline must spill multiple chunks (Phase-2 merge must run), \
+             got {base_chunks}"
+        );
+        assert!(
+            narrow_chunks >= 2,
+            "Narrow-key sort must spill multiple chunks (Phase-2 merge must run at this \
+             key width), got {narrow_chunks}"
+        );
+        assert_eq!(
+            narrowed, baseline,
+            "Narrow-key spilled record stream must be byte-identical to Full-key spilled \
+             record stream — a mismatch indicates a width/serialization regression in the \
+             Phase-2 merge path"
+        );
+    }
+
     /// Sanity (anti-vacuity): each mode's input must produce the nonzero `cb_hash` /
     /// tertiary it claims on its first record, otherwise the byte-identity tests
     /// would compare two identically-narrowed streams and prove nothing.
