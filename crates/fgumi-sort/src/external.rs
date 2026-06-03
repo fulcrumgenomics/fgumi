@@ -49,7 +49,7 @@ use noodles_bgzf::io::{
     MultithreadedWriter, Reader as BgzfReader, Writer as BgzfWriter, multithreaded_writer,
     writer::CompressionLevel,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
@@ -318,6 +318,18 @@ impl LibraryLookup {
     #[must_use]
     pub fn ordinal_from_rg(&self, rg: Option<&[u8]>) -> u32 {
         rg.and_then(|rg| self.rg_to_ordinal.get(rg)).copied().unwrap_or(0)
+    }
+
+    /// Number of distinct library ordinals realized by the header's read groups.
+    ///
+    /// Used to decide whether the template-key `tertiary` library lane can vary:
+    /// `<= 1` means every header read group maps to the same library ordinal, so
+    /// the lane is provisionally constant (decode-time verify still backstops the
+    /// case where a record carries an RG absent from the header → ordinal 0).
+    /// Returns 0 when the header declares no read groups.
+    #[must_use]
+    pub fn distinct_header_ordinals(&self) -> usize {
+        self.rg_to_ordinal.values().copied().collect::<HashSet<u32>>().len()
     }
 }
 
@@ -2532,7 +2544,9 @@ impl RawExternalSorter {
         let first_key = first_record.as_ref().map(|r| {
             extract_template_key_inline(r.as_ref(), &lib_lookup, self.cell_tag, &cb_hasher)
         });
-        let variant = select_template_variant(first_key.as_ref(), self.key_types);
+        let header_library_varies = lib_lookup.distinct_header_ordinals() > 1;
+        let variant =
+            select_template_variant(first_key.as_ref(), self.key_types, header_library_varies);
 
         debug!(
             "template-coordinate variant: {} lanes (cb={}, tertiary={})",
@@ -3455,16 +3469,32 @@ pub enum KeyTypesSpec {
     },
 }
 
+/// Mask for the MI component of the `tertiary` key lane (low 48 bits).
+/// `tertiary` packs `library_ordinal << 48 | (mi_value << 1 | !mi_suffix)`, so the
+/// high 16 bits are the library ordinal and the low 48 bits encode MI. A nonzero
+/// low-48 region means the first record carries an MI tag.
+const TERTIARY_MI_MASK: u64 = (1u64 << 48) - 1;
+
 /// Choose the template-key variant for this sort.
 ///
 /// `first_key` is the full key extracted from the first record (`None` for an
 /// empty input — then the variant is irrelevant; default to lite). `spec` is the
-/// parsed `--key-types` override. Selection only provisions the variant; the
-/// decode-time verify (fill loop) guarantees the dropped lanes are constant.
+/// parsed `--key-types` override. `header_library_varies` is `true` when the
+/// header realizes more than one distinct library ordinal (see
+/// [`LibraryLookup::distinct_header_ordinals`]).
+///
+/// Selection only *provisions* the variant; the decode-time verify (fill loop)
+/// still *guarantees* the dropped lanes are constant. Under `Auto`, the tertiary
+/// library lane is kept only when it can actually vary: the first record carries
+/// an MI tag, or the header realizes more than one library ordinal. A single,
+/// constant library ordinal in the high bits is droppable — the header informs
+/// provisioning, while verify backstops the rare case of a record whose RG is
+/// absent from the header (which realizes ordinal 0).
 #[must_use]
 pub fn select_template_variant(
     first_key: Option<&TemplateKey>,
     spec: KeyTypesSpec,
+    header_library_varies: bool,
 ) -> TemplateKeyVariant {
     match spec {
         KeyTypesSpec::Full => TemplateKeyVariant { cb: true, tertiary: true },
@@ -3472,7 +3502,18 @@ pub fn select_template_variant(
         KeyTypesSpec::Explicit { cb, tertiary } => TemplateKeyVariant { cb, tertiary },
         KeyTypesSpec::Auto => match first_key {
             None => TemplateKeyVariant { cb: false, tertiary: false },
-            Some(k) => TemplateKeyVariant { cb: k.cb_hash != 0, tertiary: k.tertiary != 0 },
+            Some(k) => {
+                // Keep the tertiary lane only if it can actually vary: MI present on
+                // the first record (low-48 bits), or the header realizes more than
+                // one library ordinal. A single (constant) library ordinal in the
+                // high bits is droppable — decode-time verify backstops the rare
+                // case of a record whose RG is absent from the header (ordinal 0).
+                let mi_present = (k.tertiary & TERTIARY_MI_MASK) != 0;
+                TemplateKeyVariant {
+                    cb: k.cb_hash != 0,
+                    tertiary: mi_present || header_library_varies,
+                }
+            }
         },
     }
 }
@@ -3613,6 +3654,71 @@ mod tests {
         assert_eq!(rg2, 1); // LibA
         assert_eq!(rg3, 2); // LibB
         assert_eq!(rg1, 3); // LibC
+    }
+
+    #[test]
+    fn test_distinct_header_ordinals() {
+        // (i) no read groups -> 0.
+        let empty = LibraryLookup::from_header(&Header::builder().build());
+        assert_eq!(empty.distinct_header_ordinals(), 0);
+
+        // (ii) one RG with an LB -> 1.
+        let rg_a = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibA"))
+            .build()
+            .expect("valid");
+        let one = LibraryLookup::from_header(
+            &Header::builder().add_read_group(BString::from("rg1"), rg_a).build(),
+        );
+        assert_eq!(one.distinct_header_ordinals(), 1);
+
+        // (iii) two RGs with two different LBs -> 2.
+        let rg_b = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibA"))
+            .build()
+            .expect("valid");
+        let rg_c = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibB"))
+            .build()
+            .expect("valid");
+        let two = LibraryLookup::from_header(
+            &Header::builder()
+                .add_read_group(BString::from("rg1"), rg_b)
+                .add_read_group(BString::from("rg2"), rg_c)
+                .build(),
+        );
+        assert_eq!(two.distinct_header_ordinals(), 2);
+
+        // (iv) two RGs with the SAME LB -> 1.
+        let rg_d = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibA"))
+            .build()
+            .expect("valid");
+        let rg_e = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibA"))
+            .build()
+            .expect("valid");
+        let same = LibraryLookup::from_header(
+            &Header::builder()
+                .add_read_group(BString::from("rg1"), rg_d)
+                .add_read_group(BString::from("rg2"), rg_e)
+                .build(),
+        );
+        assert_eq!(same.distinct_header_ordinals(), 1);
+
+        // (v) one RG with an LB + one RG WITHOUT an LB -> 2 (ordinals {1, 0}).
+        let rg_f = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibA"))
+            .build()
+            .expect("valid");
+        let rg_no_lb = Map::<ReadGroup>::builder().build().expect("valid");
+        let mixed = LibraryLookup::from_header(
+            &Header::builder()
+                .add_read_group(BString::from("rg1"), rg_f)
+                .add_read_group(BString::from("rg2"), rg_no_lb)
+                .build(),
+        );
+        assert_eq!(mixed.distinct_header_ordinals(), 2);
     }
 
     #[test]
@@ -4891,54 +4997,89 @@ mod tests {
 
     #[test]
     fn auto_lite_when_no_cb_no_tertiary() {
-        let v = select_template_variant(Some(&key(0, 0)), KeyTypesSpec::Auto);
+        let v = select_template_variant(Some(&key(0, 0)), KeyTypesSpec::Auto, false);
         assert_eq!(v, TemplateKeyVariant { cb: false, tertiary: false });
         assert_eq!(v.lanes(), 3);
     }
 
     #[test]
     fn auto_cb_only_when_first_record_has_cb() {
-        let v = select_template_variant(Some(&key(42, 0)), KeyTypesSpec::Auto);
+        let v = select_template_variant(Some(&key(42, 0)), KeyTypesSpec::Auto, false);
         assert_eq!(v, TemplateKeyVariant { cb: true, tertiary: false });
         assert_eq!(v.lanes(), 4);
     }
 
     #[test]
     fn auto_tertiary_only_when_first_record_has_mi_or_library() {
-        let v = select_template_variant(Some(&key(0, 0xABCD)), KeyTypesSpec::Auto);
+        // 0xABCD is in the low-48 bits => MI present => keep tertiary, even though
+        // the header library does not vary.
+        let v = select_template_variant(Some(&key(0, 0xABCD)), KeyTypesSpec::Auto, false);
         assert_eq!(v, TemplateKeyVariant { cb: false, tertiary: true });
         assert_eq!(v.lanes(), 4);
     }
 
     #[test]
     fn auto_full_when_both_present() {
-        let v = select_template_variant(Some(&key(7, 9)), KeyTypesSpec::Auto);
+        let v = select_template_variant(Some(&key(7, 9)), KeyTypesSpec::Auto, false);
         assert_eq!(v, TemplateKeyVariant { cb: true, tertiary: true });
         assert_eq!(v.lanes(), 5);
     }
 
+    // tertiary high bits only = a single library ordinal, no MI. With a non-varying
+    // header, the constant library lane is dropped -> lite.
+    #[test]
+    fn auto_drops_constant_single_library_lane() {
+        let k = key(0, 1u64 << 48); // library ordinal 1, no MI
+        let v = select_template_variant(Some(&k), KeyTypesSpec::Auto, false);
+        assert_eq!(v, TemplateKeyVariant { cb: false, tertiary: false });
+        assert_eq!(v.lanes(), 3);
+    }
+
+    #[test]
+    fn auto_keeps_tertiary_when_header_library_varies() {
+        let k = key(0, 1u64 << 48); // library ordinal 1, no MI
+        let v = select_template_variant(Some(&k), KeyTypesSpec::Auto, true); // >1 library
+        assert_eq!(v, TemplateKeyVariant { cb: false, tertiary: true });
+        assert_eq!(v.lanes(), 4);
+    }
+
+    #[test]
+    fn auto_keeps_tertiary_for_mi_even_with_constant_library() {
+        // MI present (low bits) -> keep tertiary even though header library is constant.
+        let k = key(0, (1u64 << 48) | 0b10); // library ordinal 1 + MI value bit
+        let v = select_template_variant(Some(&k), KeyTypesSpec::Auto, false);
+        assert_eq!(v, TemplateKeyVariant { cb: false, tertiary: true });
+    }
+
     #[test]
     fn none_forces_lite() {
-        assert_eq!(select_template_variant(Some(&key(99, 99)), KeyTypesSpec::None).lanes(), 3);
+        assert_eq!(
+            select_template_variant(Some(&key(99, 99)), KeyTypesSpec::None, true).lanes(),
+            3
+        );
     }
 
     #[test]
     fn full_forces_all_lanes() {
-        assert_eq!(select_template_variant(Some(&key(0, 0)), KeyTypesSpec::Full).lanes(), 5);
+        assert_eq!(select_template_variant(Some(&key(0, 0)), KeyTypesSpec::Full, false).lanes(), 5);
     }
 
     #[test]
     fn explicit_spec_passthrough() {
         assert_eq!(
-            select_template_variant(None, KeyTypesSpec::Explicit { cb: true, tertiary: false })
-                .lanes(),
+            select_template_variant(
+                None,
+                KeyTypesSpec::Explicit { cb: true, tertiary: false },
+                false
+            )
+            .lanes(),
             4
         );
     }
 
     #[test]
     fn empty_input_defaults_to_lite() {
-        assert_eq!(select_template_variant(None, KeyTypesSpec::Auto).lanes(), 3);
+        assert_eq!(select_template_variant(None, KeyTypesSpec::Auto, false).lanes(), 3);
     }
 
     // ========================================================================
@@ -5241,6 +5382,63 @@ mod tests {
 
         let auto = sort_and_collect(&input, dir.path(), "auto", KeyTypesSpec::Auto);
         assert_eq!(auto, baseline, "auto-detected variant must equal full-key stream");
+    }
+
+    /// single-library: one `@RG` carrying an `LB:`, every pair assigned to it; no CB,
+    /// no MI. The lone library realizes ordinal 1, so the first record's tertiary is
+    /// nonzero (high bits) yet the library lane is CONSTANT across every record — the
+    /// WES/WGS scenario. `Auto` must therefore drop the tertiary lane to the 24-byte
+    /// lite key while staying byte-identical to the full-key baseline.
+    fn build_single_library_bam(dir: &Path) -> PathBuf {
+        // Attach a library to the builder's single default read group ("A") so the
+        // header realizes exactly ONE distinct library ordinal (1). Reads default to
+        // RG "A", so every record maps to that lone library — the tertiary high bits
+        // are a constant nonzero ordinal, with no MI and no CB.
+        let mut header = SamBuilder::new().header.clone();
+        let rg = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibSolo"))
+            .build()
+            .expect("valid read group");
+        // The builder defaults to a single read group "A"; replace it in place with a
+        // library-bearing one so there is exactly one read group (one ordinal).
+        header.read_groups_mut().clear();
+        header.read_groups_mut().insert(BString::from("A"), rg);
+        build_mode_bam(dir, "single_library", header, |pair, _| pair, |pair, _| pair)
+    }
+
+    /// WES/WGS regression: a single-library input (one constant library ordinal, no
+    /// CB, no MI) must auto-narrow to the 3-lane lite key AND sort byte-identically to
+    /// the full-key baseline. Proves the constant library lane is provisionally
+    /// droppable under `Auto` and that dropping it does not change the record stream.
+    #[test]
+    fn auto_drops_constant_library_lane_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = build_single_library_bam(dir.path());
+
+        // Production provisioning logic, reproduced: the first record carries a
+        // nonzero (library) tertiary, but the header realizes a single ordinal, so
+        // Auto must pick the 3-lane lite variant.
+        let first = first_record_full_key(&input);
+        let (_, header) = create_raw_bam_reader(&input, 1).expect("reader");
+        let lib_lookup = LibraryLookup::from_header(&header);
+        let header_library_varies = lib_lookup.distinct_header_ordinals() > 1;
+        assert!(!header_library_varies, "single-library header must not vary");
+        assert_ne!(first.tertiary, 0, "first record carries a (constant) library ordinal");
+
+        let variant =
+            select_template_variant(Some(&first), KeyTypesSpec::Auto, header_library_varies);
+        assert_eq!(variant.lanes(), 3, "auto must narrow a single-library input to the lite key");
+
+        // Byte-identity: auto (lite) == full-key baseline.
+        let baseline = sort_and_collect(&input, dir.path(), "full_baseline", KeyTypesSpec::Full);
+        assert_eq!(baseline.len(), T10_PAIRS * 2, "baseline must retain every record");
+        let auto = sort_and_collect(&input, dir.path(), "auto", KeyTypesSpec::Auto);
+        assert_eq!(auto, baseline, "auto (lite) record stream must equal full-key stream");
+
+        // Cross-check: an explicit lite (`--key-types none`) sort is also identical,
+        // proving the lite key is genuinely valid for this input.
+        let lite = sort_and_collect(&input, dir.path(), "lite", KeyTypesSpec::None);
+        assert_eq!(lite, baseline, "explicit lite record stream must equal full-key stream");
     }
 
     /// Spill-forced byte-identity: a tiny memory limit forces Phase 1 to spill and
