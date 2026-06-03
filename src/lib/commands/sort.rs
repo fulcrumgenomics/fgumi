@@ -27,7 +27,9 @@ use anyhow::{Result, bail};
 use bytesize::ByteSize;
 use clap::Parser;
 use fgumi_bam_io::create_raw_bam_reader;
-use fgumi_sort::{QuerynameComparator, RawExternalSorter, SortOrder};
+use fgumi_sort::{
+    KeyTypesSpec, QuerynameComparator, RawExternalSorter, SortOrder, verify_sort_order,
+};
 
 use log::{debug, info};
 use std::path::PathBuf;
@@ -199,6 +201,21 @@ pub struct Sort {
     ///   `queryname::natural`         Natural numeric ordering (samtools-compatible)
     #[arg(long = "order", default_value = "template-coordinate", value_parser = SortOrderArg::parse)]
     pub order: SortOrderArg,
+
+    /// Which optional lanes to keep in the template-coordinate sort key.
+    ///
+    /// Smaller keys use less memory and spill less. Only meaningful for
+    /// `--order template-coordinate`; ignored for other orders.
+    ///
+    ///   (omitted)            Auto-detect from the first record + verify (default).
+    ///   full                 Keep all lanes (CB + library/MI). Largest key.
+    ///   none                 Drop all optional lanes (smallest, bulk pre-group).
+    ///   cb,library,mi        Comma/space list; keep the named lanes.
+    ///
+    /// A record carrying a value in a dropped lane aborts the sort with a message
+    /// naming the field and the token to re-include it.
+    #[arg(long = "key-types", value_parser = parse_key_types)]
+    pub key_types: Option<KeyTypesSpec>,
 
     /// Maximum memory for in-memory sorting.
     ///
@@ -381,7 +398,35 @@ pub(crate) fn parse_cell_tag(order: SortOrderArg) -> Result<Option<SamTag>> {
     if matches!(order, SortOrderArg::TemplateCoordinate) { Ok(Some(SamTag::CB)) } else { Ok(None) }
 }
 
-use fgumi_sort::verify_sort_order;
+/// Parse `--key-types` into a [`KeyTypesSpec`].
+///
+/// `full` | `none`/`""` | comma/space list of `cb`,`library`,`mi`. Unknown
+/// tokens are rejected. `library`, `mi`, and `library,mi` all map to the shared
+/// `tertiary` lane.
+pub(crate) fn parse_key_types(s: &str) -> Result<KeyTypesSpec, String> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("full") {
+        return Ok(KeyTypesSpec::Full);
+    }
+    if s.is_empty() || s.eq_ignore_ascii_case("none") {
+        return Ok(KeyTypesSpec::None);
+    }
+    let mut cb = false;
+    let mut tertiary = false;
+    for tok in s.split([',', ' ']).filter(|t| !t.is_empty()) {
+        match tok.to_ascii_lowercase().as_str() {
+            "cb" => cb = true,
+            "library" | "mi" => tertiary = true,
+            other => {
+                return Err(format!(
+                    "unknown --key-types token '{other}', expected 'full', 'none', \
+                     or a list of 'cb','library','mi'"
+                ));
+            }
+        }
+    }
+    Ok(KeyTypesSpec::Explicit { cb, tertiary })
+}
 
 impl Command for Sort {
     fn execute(&self, command_line: &str) -> Result<()> {
@@ -619,6 +664,12 @@ impl Sort {
             sorter = sorter.cell_tag(ct);
         }
 
+        let key_types = self.key_types.unwrap_or_default(); // Auto
+        if !matches!(self.order, SortOrderArg::TemplateCoordinate) && self.key_types.is_some() {
+            info!("--key-types is ignored for --order {:?}", self.order);
+        }
+        sorter = sorter.key_types(key_types);
+
         if !resolved_tmp_dirs.is_empty() {
             sorter = sorter.temp_dirs(resolved_tmp_dirs);
         }
@@ -834,6 +885,7 @@ mod tests {
             output: None,
             verify: false,
             order,
+            key_types: None,
             max_memory: MemoryLimit::Fixed(512 * 1024 * 1024),
             memory_reserve: MemoryReserve::Auto,
             memory_per_thread: true,
@@ -1241,5 +1293,40 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    // ========================================================================
+    // parse_key_types tests
+    // ========================================================================
+
+    #[rstest]
+    #[case("full", KeyTypesSpec::Full)]
+    #[case("none", KeyTypesSpec::None)]
+    #[case("", KeyTypesSpec::None)]
+    #[case("cb", KeyTypesSpec::Explicit { cb: true, tertiary: false })]
+    #[case("library", KeyTypesSpec::Explicit { cb: false, tertiary: true })]
+    #[case("mi", KeyTypesSpec::Explicit { cb: false, tertiary: true })]
+    #[case("library,mi", KeyTypesSpec::Explicit { cb: false, tertiary: true })]
+    #[case("cb,mi", KeyTypesSpec::Explicit { cb: true, tertiary: true })]
+    #[case("cb library", KeyTypesSpec::Explicit { cb: true, tertiary: true })]
+    #[case("FULL", KeyTypesSpec::Full)]
+    #[case("None", KeyTypesSpec::None)]
+    #[case("CB", KeyTypesSpec::Explicit { cb: true, tertiary: false })]
+    #[case("Cb,MI", KeyTypesSpec::Explicit { cb: true, tertiary: true })]
+    fn test_parse_key_types_ok(#[case] input: &str, #[case] expected: KeyTypesSpec) {
+        assert_eq!(parse_key_types(input).expect("valid"), expected);
+    }
+
+    #[rstest]
+    #[case("bogus")]
+    #[case("cb,bogus")]
+    fn test_parse_key_types_err(#[case] input: &str) {
+        assert!(parse_key_types(input).is_err());
+    }
+
+    #[test]
+    fn test_key_types_clap_default_is_none_option() {
+        let sort = Sort::try_parse_from(["sort", "-i", "in.bam", "-o", "out.bam"]).expect("parse");
+        assert!(sort.key_types.is_none());
     }
 }

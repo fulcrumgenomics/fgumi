@@ -24,7 +24,9 @@
 //! 4. Write raw record bytes to output
 
 use crate::inline::{
-    InMemoryChunk, ProbeableBuffer, RecordBuffer, TemplateKey, TemplateRecordBuffer,
+    CbKey32, InMemoryChunk, ProbeableBuffer, RecordBuffer, TEMPLATE_HEADER_SIZE, TemplateKey,
+    TemplateKey24, TemplateKey40, TemplateLaneKey, TemplateRecordBuffer, TemplateRecordRef,
+    TertKey32,
 };
 use crate::keys::{QuerynameComparator, RawSortKey, SortOrder};
 use crate::memory_probe::{
@@ -47,7 +49,7 @@ use noodles_bgzf::io::{
     MultithreadedWriter, Reader as BgzfReader, Writer as BgzfWriter, multithreaded_writer,
     writer::CompressionLevel,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
@@ -317,6 +319,18 @@ impl LibraryLookup {
     pub fn ordinal_from_rg(&self, rg: Option<&[u8]>) -> u32 {
         rg.and_then(|rg| self.rg_to_ordinal.get(rg)).copied().unwrap_or(0)
     }
+
+    /// Number of distinct library ordinals realized by the header's read groups.
+    ///
+    /// Used to decide whether the template-key `tertiary` library lane can vary:
+    /// `<= 1` means every header read group maps to the same library ordinal, so
+    /// the lane is provisionally constant (decode-time verify still backstops the
+    /// case where a record carries an RG absent from the header → ordinal 0).
+    /// Returns 0 when the header declares no read groups.
+    #[must_use]
+    pub fn distinct_header_ordinals(&self) -> usize {
+        self.rg_to_ordinal.values().copied().collect::<HashSet<u32>>().len()
+    }
 }
 
 /// Number of records to prefetch per chunk during merge.
@@ -326,6 +340,12 @@ const MERGE_PREFETCH_SIZE: usize = 1024;
 /// Maximum number of temp files before consolidation (like samtools).
 /// When this limit is reached, oldest files are merged to reduce file count.
 const DEFAULT_MAX_TEMP_FILES: usize = 64;
+
+/// Working estimate of the raw BAM bytes per template-coordinate record (excluding the
+/// inline header and the `TemplateRecordRef<K>` index entry).  Used by the capacity
+/// estimator in `sort_template_coordinate_impl` to split `effective_initial_capacity`
+/// between the data arena and the ref index.
+const EST_BAM_BYTES_PER_TEMPLATE_RECORD: usize = 250;
 
 /// Counting semaphore for limiting concurrent chunk reader I/O.
 /// Pre-filled with N tokens; readers acquire before decompressing, release after.
@@ -789,14 +809,14 @@ impl<K: RawSortKey + Default + 'static> MemorySources<K> {
             Self::Shared(chunks) => {
                 for chunk in chunks {
                     if !chunk.is_empty() {
-                        sources.push(ChunkSource::Memory { chunk, idx: 0 });
+                        sources.push(ChunkSource::Memory { chunk, idx: usize::MAX });
                     }
                 }
             }
             Self::Owned(chunks) => {
                 for records in chunks {
                     if !records.is_empty() {
-                        sources.push(ChunkSource::MemoryOwned { records, idx: 0 });
+                        sources.push(ChunkSource::MemoryOwned { records, idx: usize::MAX });
                     }
                 }
             }
@@ -805,78 +825,100 @@ impl<K: RawSortKey + Default + 'static> MemorySources<K> {
 }
 
 /// Source for keyed chunks during merge (disk or in-memory).
+///
+/// Each variant owns its "current record" state internally so the merge loop
+/// can borrow the current record's bytes via [`Self::current_bytes`] without
+/// copying. Disk-backed variants own a `scratch: Vec<u8>` holding the most
+/// recently read record's bytes; `Memory`/`MemoryOwned` borrow directly from
+/// their backing store, eliminating the per-record memcpy on the in-memory path.
 enum ChunkSource<K: RawSortKey + Default + 'static> {
     /// Disk-based chunk with prefetching reader (legacy path with per-source threads).
-    Disk(GenericKeyedChunkReader<K>),
-    /// In-memory chunk from an inline-buffer sort (coordinate /
-    /// template). All records borrow their bytes from a shared
-    /// `Arc<SegmentedBuf>`; merge bridges via `extend_from_slice`.
+    Disk {
+        reader: GenericKeyedChunkReader<K>,
+        /// Bytes for the current record (filled by the most recent `advance`).
+        scratch: Vec<u8>,
+    },
+    /// In-memory chunk from an inline-buffer sort (coordinate / template).
+    /// All records borrow their bytes from a shared `Arc<SegmentedBuf>`;
+    /// `current_bytes` borrows them directly (zero-copy).
+    ///
+    /// `idx` is the index of the CURRENT record. Sentinel `usize::MAX` means
+    /// "no record loaded yet"; the first `advance` lands on 0.
     Memory { chunk: InMemoryChunk<K>, idx: usize },
-    /// In-memory chunk from a queryname-style sort, where each record
-    /// was already accumulated upstream as its own `RawRecord` (owned
-    /// `Vec<u8>`). Merge bridges via `mem::swap` to preserve the
-    /// zero-copy bridge that the streaming path already pays an
-    /// allocation for upstream.
+    /// In-memory chunk from a queryname-style sort (each record an owned
+    /// `RawRecord`). `current_bytes` borrows `records[idx].1` directly.
+    ///
+    /// `idx` uses the same `usize::MAX` sentinel as `Memory`.
     MemoryOwned { records: Vec<(K, fgumi_raw_bam::RawRecord)>, idx: usize },
     /// Pool-integrated disk source — workers read and decompress, main thread parses.
-    /// The `source_id` maps to the `MainThreadChunkConsumer`'s per-source buffer.
-    PoolDisk { source_id: usize },
+    PoolDisk {
+        source_id: usize,
+        /// Bytes for the current record (filled by the most recent `advance`).
+        scratch: Vec<u8>,
+    },
 }
 
 impl<K: RawSortKey + Default + 'static> ChunkSource<K> {
-    /// Fill `buf` with the next record's bytes and return the sort key,
-    /// or `None` at EOF.
+    /// Advance to the next record. Returns its key, or `None` at EOF.
     ///
-    /// For `PoolDisk` sources, `consumer` must be `Some`.
-    fn next_record(
-        &mut self,
-        buf: &mut Vec<u8>,
-        consumer: Option<&mut MainThreadChunkConsumer<K>>,
-    ) -> Result<Option<K>> {
+    /// For `PoolDisk` sources, `consumer` must be `Some`. After this returns
+    /// `Some(_)`, callers may invoke [`Self::current_bytes`] to borrow the
+    /// record's bytes without copying.
+    fn advance(&mut self, consumer: Option<&mut MainThreadChunkConsumer<K>>) -> Result<Option<K>> {
         match self {
-            ChunkSource::Disk(reader) => reader.next_record(buf),
+            ChunkSource::Disk { reader, scratch } => reader.next_record(scratch),
+            ChunkSource::PoolDisk { source_id, scratch } => {
+                let c = consumer.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "PoolDisk source (id {source_id}) requires a MainThreadChunkConsumer \
+                         but none was provided — this is a bug in the sort pipeline"
+                    )
+                })?;
+                c.next_record(*source_id, scratch)
+            }
             ChunkSource::Memory { chunk, idx } => {
-                if *idx < chunk.len() {
-                    // Copy record bytes out of the shared backing
-                    // `SegmentedBuf` into the merge scratch. The
-                    // previous owned-`RawRecord`-per-record design
-                    // could `mem::swap` here, but paid one heap
-                    // allocation per record at materialization time;
-                    // sharing the backing store eliminates the
-                    // per-record allocation in exchange for one
-                    // memcpy at merge time.
-                    let bytes = chunk.record_bytes(*idx);
-                    buf.clear();
-                    buf.extend_from_slice(bytes);
-                    let key = chunk.take_key(*idx);
-                    *idx += 1;
+                // Sentinel `usize::MAX` → first advance lands on 0.
+                let next = if *idx == usize::MAX { 0 } else { *idx + 1 };
+                if next < chunk.len() {
+                    let key = chunk.take_key(next);
+                    *idx = next;
                     Ok(Some(key))
                 } else {
                     Ok(None)
                 }
             }
             ChunkSource::MemoryOwned { records, idx } => {
-                if *idx < records.len() {
-                    let (ref mut key, ref mut data) = records[*idx];
-                    // Zero-copy bridge: swap the owned `RawRecord`'s
-                    // inner Vec into the merge scratch. The caller's
-                    // scratch becomes the now-stale previous record.
-                    std::mem::swap(buf, data.as_mut_vec());
-                    let key = std::mem::take(key);
-                    *idx += 1;
+                let next = if *idx == usize::MAX { 0 } else { *idx + 1 };
+                if next < records.len() {
+                    let key = std::mem::take(&mut records[next].0);
+                    *idx = next;
                     Ok(Some(key))
                 } else {
                     Ok(None)
                 }
             }
-            ChunkSource::PoolDisk { source_id } => consumer
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "PoolDisk source (id {source_id}) requires a MainThreadChunkConsumer \
-                         but none was provided — this is a bug in the sort pipeline"
-                    )
-                })?
-                .next_record(*source_id, buf),
+        }
+    }
+
+    /// Bytes for the current record (the one whose key was returned by the
+    /// most recent successful [`Self::advance`]).
+    ///
+    /// Caller MUST have received `Some(_)` from a prior `advance`. The merge
+    /// loops uphold this: the init loop only retains a source whose first
+    /// `advance` returned `Some`, and the main loop only calls this on the
+    /// active tree winner — so the `Disk`/`PoolDisk` empty-scratch case is
+    /// unreachable.
+    fn current_bytes(&self) -> &[u8] {
+        match self {
+            ChunkSource::Disk { scratch, .. } | ChunkSource::PoolDisk { scratch, .. } => scratch,
+            ChunkSource::Memory { chunk, idx } => {
+                debug_assert!(*idx != usize::MAX, "current_bytes called before advance");
+                chunk.record_bytes(*idx)
+            }
+            ChunkSource::MemoryOwned { records, idx } => {
+                debug_assert!(*idx != usize::MAX, "current_bytes called before advance");
+                &records[*idx].1[..]
+            }
         }
     }
 }
@@ -1284,6 +1326,11 @@ pub struct RawExternalSorter {
     initial_capacity: Option<usize>,
     /// When true, wrap input in a `PrefetchReader` for async I/O.
     async_reader: bool,
+    /// Which optional template-key lanes to retain (template-coordinate only).
+    ///
+    /// Defaults to [`KeyTypesSpec::Auto`], which provisions the narrowest key
+    /// that fits the first record's optional lanes.
+    key_types: KeyTypesSpec,
 }
 
 /// RAII guard that ensures Phase 2 teardown runs on every exit path between
@@ -1337,6 +1384,7 @@ impl RawExternalSorter {
             cell_tag: None,
             initial_capacity: None,
             async_reader: false,
+            key_types: KeyTypesSpec::default(),
         }
     }
 
@@ -1454,6 +1502,18 @@ impl RawExternalSorter {
     #[must_use]
     pub fn initial_capacity(mut self, bytes: usize) -> Self {
         self.initial_capacity = Some(bytes);
+        self
+    }
+
+    /// Set which optional template-key lanes to retain.
+    ///
+    /// Only affects the template-coordinate sort order. The default
+    /// ([`KeyTypesSpec::Auto`]) provisions the narrowest key consistent with the
+    /// first record's optional lanes; the decode-time verify guarantees the
+    /// dropped lanes are constant across all records.
+    #[must_use]
+    pub fn key_types(mut self, spec: KeyTypesSpec) -> Self {
+        self.key_types = spec;
         self
     }
 
@@ -1871,7 +1931,7 @@ impl RawExternalSorter {
         // Estimate capacity from initial_capacity (not memory_limit) to avoid
         // huge upfront allocations when auto-detecting memory.
         let init_cap = self.effective_initial_capacity();
-        // Per-record footprint: ~200 bytes BAM + 16 header + 24 ref = ~240 bytes
+        // Per-record footprint: ~200 bytes BAM + 8 header + 24 ref ≈ 232 bytes (rounded to 240 for headroom)
         let estimated_records = init_cap / 240;
         // Data bytes = init_cap minus ref overhead (24 bytes/record)
         let estimated_data_bytes = init_cap.saturating_sub(estimated_records * 24);
@@ -2052,7 +2112,7 @@ impl RawExternalSorter {
 
         let nref = header.reference_sequences().len() as u32;
         let init_cap = self.effective_initial_capacity();
-        // Per-record footprint: ~200 bytes BAM + 16 header + 24 ref = ~240 bytes
+        // Per-record footprint: ~200 bytes BAM + 8 header + 24 ref ≈ 232 bytes (rounded to 240 for headroom)
         let estimated_records = init_cap / 240;
         let estimated_data_bytes = init_cap.saturating_sub(estimated_records * 24);
 
@@ -2464,7 +2524,6 @@ impl RawExternalSorter {
     ///
     /// Writes keyed temp chunks that preserve pre-computed sort keys, enabling O(1)
     /// comparisons during merge (instead of expensive CIGAR/aux parsing).
-    #[allow(clippy::too_many_lines)]
     fn sort_template_coordinate(
         &self,
         mut record_source: RecordSource,
@@ -2473,27 +2532,136 @@ impl RawExternalSorter {
         output: &Path,
         alloc: &mut TmpDirAllocator,
     ) -> Result<RawSortStats> {
-        let mut stats = RawSortStats::default();
-        let mut timer = SortPhaseTimer::new();
-
-        // Build library lookup ONCE before sorting for O(1) ordinal lookups
         let lib_lookup = LibraryLookup::from_header(header);
         let cb_hasher = cb_hasher();
 
-        // Estimate capacity from initial_capacity to avoid huge upfront allocations.
-        // Memory layout per record:
-        //   - data: 48 bytes (inline header) + ~250 bytes (BAM record) = 298 bytes
-        //   - refs: 56 bytes (TemplateKey + u64 offset + u32 len + u32 pad)
-        //   - Total: ~354 bytes per record
+        // Peek the first record to provision the variant (extraction stays
+        // full-width). The first record is handed (by reference) to the impl,
+        // which processes it before draining the rest of `record_source`; the
+        // wrapper only extracts `first_key` to choose `K` — it does not re-chain
+        // the record into the iterator.
+        let first_record = record_source.by_ref().next();
+        let first_key = first_record.as_ref().map(|r| {
+            extract_template_key_inline(r.as_ref(), &lib_lookup, self.cell_tag, &cb_hasher)
+        });
+        let header_library_varies = lib_lookup.distinct_header_ordinals() > 1;
+        let variant =
+            select_template_variant(first_key.as_ref(), self.key_types, header_library_varies);
+
+        debug!(
+            "template-coordinate variant: {} lanes (cb={}, tertiary={})",
+            variant.lanes(),
+            variant.cb,
+            variant.tertiary
+        );
+
+        match (variant.cb, variant.tertiary) {
+            (false, false) => self.sort_template_coordinate_impl::<TemplateKey24>(
+                record_source,
+                first_record.as_ref(),
+                first_key,
+                variant,
+                pool,
+                header,
+                output,
+                alloc,
+                &lib_lookup,
+                &cb_hasher,
+            ),
+            (true, false) => self.sort_template_coordinate_impl::<CbKey32>(
+                record_source,
+                first_record.as_ref(),
+                first_key,
+                variant,
+                pool,
+                header,
+                output,
+                alloc,
+                &lib_lookup,
+                &cb_hasher,
+            ),
+            (false, true) => self.sort_template_coordinate_impl::<TertKey32>(
+                record_source,
+                first_record.as_ref(),
+                first_key,
+                variant,
+                pool,
+                header,
+                output,
+                alloc,
+                &lib_lookup,
+                &cb_hasher,
+            ),
+            (true, true) => self.sort_template_coordinate_impl::<TemplateKey40>(
+                record_source,
+                first_record.as_ref(),
+                first_key,
+                variant,
+                pool,
+                header,
+                output,
+                alloc,
+                &lib_lookup,
+                &cb_hasher,
+            ),
+        }
+    }
+
+    /// Generic template-coordinate sort body, monomorphized over the chosen
+    /// lane-key type `K`.
+    ///
+    /// The dispatch wrapper [`Self::sort_template_coordinate`] peeks the first
+    /// record to choose `K`, then hands the captured `first_record` (already
+    /// pulled out of `record_source`, borrowed here) plus the rest of the
+    /// iterator. This impl processes `first_record` in a pre-loop block and
+    /// drains the remainder in the read loop. `first_key` is the full key of the
+    /// first record; the decode-time verify compares every subsequent record's
+    /// dropped lanes against it.
+    #[allow(clippy::too_many_lines)]
+    // The generic body keeps the same parameter shape as the legacy function
+    // plus the peeked-first-record handoff; the existing code already allows
+    // this pattern for the merge helpers.
+    #[allow(clippy::too_many_arguments)]
+    fn sort_template_coordinate_impl<K: TemplateLaneKey + RawSortKey + Default + 'static>(
+        &self,
+        mut record_source: RecordSource,
+        first_record: Option<&fgumi_raw_bam::RawRecord>,
+        first_key: Option<TemplateKey>,
+        variant: TemplateKeyVariant,
+        pool: Arc<SortWorkerPool>,
+        header: &Header,
+        output: &Path,
+        alloc: &mut TmpDirAllocator,
+        lib_lookup: &LibraryLookup,
+        cb_hasher: &ahash::RandomState,
+    ) -> Result<RawSortStats> {
+        let mut stats = RawSortStats::default();
+        let mut timer = SortPhaseTimer::new();
+
+        // The full key the decode-time verify compares dropped lanes against.
+        // On empty input, `first_record` is `None` so the pre-loop push is
+        // skipped and the read loop runs zero times — `first` is never read in
+        // that case, so a default (all-zero) key is a harmless placeholder that
+        // lets the function fall through to the post-loop empty-output path
+        // (header-only BAM), matching the coordinate and queryname orders.
+        let first = first_key.unwrap_or_default();
+
+        // Per-record arena footprint (data side: inline header + BAM bytes; ref side:
+        // the cached key + offset/len/pad). Ref size tracks the chosen key width K:
+        //   K=TemplateKey24 → ref=40 B, bpr=298 B, data%≈86.6%
+        //   K=TemplateKey32 → ref=48 B, bpr=306 B, data%≈84.3%
+        //   K=TemplateKey40 → ref=56 B, bpr=314 B, data%≈82.2%
+        let ref_bytes = std::mem::size_of::<TemplateRecordRef<K>>();
+        let data_bytes_per_record = TEMPLATE_HEADER_SIZE + EST_BAM_BYTES_PER_TEMPLATE_RECORD;
+        let bytes_per_record = data_bytes_per_record + ref_bytes;
+
         let init_cap = self.effective_initial_capacity();
-        let bytes_per_record = 354;
-        let estimated_records = init_cap / bytes_per_record;
-        // Allocate ~86% for data, ~14% for refs (48/338 ≈ 14%)
-        let estimated_data_bytes = init_cap * 86 / 100;
+        let estimated_records = (init_cap / bytes_per_record).max(1);
+        let estimated_data_bytes = init_cap * data_bytes_per_record / bytes_per_record;
 
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut buffer =
-            TemplateRecordBuffer::with_capacity(estimated_records, estimated_data_bytes);
+            TemplateRecordBuffer::<K>::with_capacity(estimated_records, estimated_data_bytes);
         let mut namer = ChunkNamer::new(alloc);
         let mut pending_spill: Option<PendingSpill> = None;
         let rayon_pool = self.build_sort_rayon_pool()?;
@@ -2502,15 +2670,43 @@ impl RawExternalSorter {
         debug!("Phase 1: Reading and sorting chunks (inline buffer)...");
         let mut probe = SpillProbe::new("phase1");
 
+        // Process the captured first record before draining the rest: extract its
+        // full key, verify the dropped lanes match `first` (trivially true for the
+        // first record itself), and push the narrowed key. A single record cannot
+        // exceed the memory limit, so no spill check is needed here.
+        if let Some(record) = first_record {
+            stats.total_records += 1;
+            progress.log_if_needed(1);
+
+            let bam_bytes = record.as_ref();
+            let full = extract_template_key_inline(bam_bytes, lib_lookup, self.cell_tag, cb_hasher);
+            if let Some(violation) = verify_dropped_lanes(&first, &full, variant) {
+                let name = String::from_utf8_lossy(
+                    fgumi_raw_bam::RawRecordView::new(bam_bytes).read_name(),
+                )
+                .into_owned();
+                return Err(dropped_lane_error(&name, violation));
+            }
+            buffer.push(bam_bytes, K::from_full(&full))?;
+        }
+
         for record in record_source.by_ref() {
             stats.total_records += 1;
             progress.log_if_needed(1);
 
-            // Extract template key and push to buffer
+            // Extract the full template key, verify the lanes the chosen variant
+            // dropped are constant relative to the first record, then push the
+            // narrowed key.
             let bam_bytes = record.as_ref();
-            let key =
-                extract_template_key_inline(bam_bytes, &lib_lookup, self.cell_tag, &cb_hasher);
-            buffer.push(bam_bytes, key)?;
+            let full = extract_template_key_inline(bam_bytes, lib_lookup, self.cell_tag, cb_hasher);
+            if let Some(violation) = verify_dropped_lanes(&first, &full, variant) {
+                let name = String::from_utf8_lossy(
+                    fgumi_raw_bam::RawRecordView::new(bam_bytes).read_name(),
+                )
+                .into_owned();
+                return Err(dropped_lane_error(&name, violation));
+            }
+            buffer.push(bam_bytes, K::from_full(&full))?;
 
             if probe.should_sample_read(stats.total_records) {
                 probe.log_mid_read(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
@@ -2524,7 +2720,7 @@ impl RawExternalSorter {
                 probe.pre_spill(bstats, depths);
 
                 // Wait for any previous spill to complete
-                self.drain_pending_spill::<TemplateKey>(
+                self.drain_pending_spill::<K>(
                     &mut pending_spill,
                     &mut chunk_files,
                     &mut stats,
@@ -2542,7 +2738,7 @@ impl RawExternalSorter {
 
                 // Write keyed chunk with parallel BGZF compression via worker pool.
                 let handle = timer.time_spill_write(|| {
-                    let mut writer = PooledChunkWriter::<TemplateKey>::new(
+                    let mut writer = PooledChunkWriter::<K>::new(
                         Arc::clone(&pool),
                         &chunk_path,
                         pool.spill_codec(),
@@ -2569,7 +2765,7 @@ impl RawExternalSorter {
         }
 
         // Drain any pending spill before merge
-        self.drain_pending_spill::<TemplateKey>(
+        self.drain_pending_spill::<K>(
             &mut pending_spill,
             &mut chunk_files,
             &mut stats,
@@ -2601,7 +2797,7 @@ impl RawExternalSorter {
         } else {
             // Sort remaining records into separate sub-array chunks (avoids
             // intermediate merge back into a single sorted buffer)
-            let memory_chunks: Vec<InMemoryChunk<TemplateKey>> = if buffer.is_empty() {
+            let memory_chunks: Vec<InMemoryChunk<K>> = if buffer.is_empty() {
                 Vec::new()
             } else if self.threads > 1 {
                 timer.time_sort(|| rayon_pool.install(|| buffer.par_sort_into_chunks(self.threads)))
@@ -2618,7 +2814,7 @@ impl RawExternalSorter {
 
             // Merge using O(1) key comparisons
             timer.time_merge(|| {
-                self.merge_chunks_keyed(
+                self.merge_chunks_generic::<K>(
                     &chunk_files,
                     memory_chunks,
                     header,
@@ -2666,45 +2862,22 @@ impl RawExternalSorter {
             pool.set_phase2_files(chunk_files)?;
 
             for source_id in 0..num_disk {
-                sources.push(ChunkSource::PoolDisk { source_id });
+                sources.push(ChunkSource::PoolDisk { source_id, scratch: Vec::new() });
             }
         } else {
             // Legacy path: per-source reader threads (used by indexing path)
             let sem = make_reader_semaphore(reader_concurrency);
             for path in chunk_files {
-                sources.push(ChunkSource::Disk(GenericKeyedChunkReader::<K>::open(
-                    path,
-                    Some(Arc::clone(&sem)),
-                )?));
+                sources.push(ChunkSource::Disk {
+                    reader: GenericKeyedChunkReader::<K>::open(path, Some(Arc::clone(&sem)))?,
+                    scratch: Vec::new(),
+                });
             }
         }
 
         memory_chunks.push_into(&mut sources);
 
         Ok(sources)
-    }
-
-    /// Merge keyed chunks using O(1) key comparisons (delegates to generic merge).
-    ///
-    /// `memory_chunks` is a list of sorted in-memory sub-arrays, each of which
-    /// becomes a separate merge source.
-    fn merge_chunks_keyed(
-        &self,
-        chunk_files: &[PathBuf],
-        memory_chunks: MemorySources<TemplateKey>,
-        header: &Header,
-        output: &Path,
-        total_records: u64,
-        pool: &Arc<SortWorkerPool>,
-    ) -> Result<u64> {
-        self.merge_chunks_generic::<TemplateKey>(
-            chunk_files,
-            memory_chunks,
-            header,
-            output,
-            total_records,
-            pool,
-        )
     }
 
     /// Generic merge for keyed chunks using `O(1)` key comparisons.
@@ -2768,16 +2941,15 @@ impl RawExternalSorter {
 
         let output_header = self.create_output_header(header);
 
-        // Initialize loser tree with first record from each source
+        // Initialize loser tree with first record from each source.
+        // Each source owns its current-record state internally; no
+        // intermediate `records: Vec<Vec<u8>>` is needed.
         let mut initial_keys: Vec<K> = Vec::with_capacity(sources.len());
-        let mut records: Vec<Vec<u8>> = Vec::with_capacity(sources.len());
         let mut source_map: Vec<usize> = Vec::with_capacity(sources.len());
 
         for (idx, source) in sources.iter_mut().enumerate() {
-            let mut record = Vec::new();
-            if let Some(key) = source.next_record(&mut record, guard.consumer_mut())? {
+            if let Some(key) = source.advance(guard.consumer_mut())? {
                 initial_keys.push(key);
-                records.push(record);
                 source_map.push(idx);
             }
         }
@@ -2813,14 +2985,15 @@ impl RawExternalSorter {
 
         while tree.winner_is_active() {
             let winner = tree.winner();
+            let src_idx = source_map[winner];
             let sample_this = debug_timing && records_merged.is_multiple_of(merge_sample_interval);
 
             if sample_this {
                 let t0 = Instant::now();
-                writer.write_raw_record(&records[winner])?;
+                writer.write_raw_record(sources[src_idx].current_bytes())?;
                 merge_write_secs += t0.elapsed().as_secs_f64();
             } else {
-                writer.write_raw_record(&records[winner])?;
+                writer.write_raw_record(sources[src_idx].current_bytes())?;
             }
 
             records_merged += 1;
@@ -2832,12 +3005,9 @@ impl RawExternalSorter {
                 merge_probe.log_mid_with_depths(depths, consumer_stats);
             }
 
-            let src_idx = source_map[winner];
-
             if sample_this {
                 let t0 = Instant::now();
-                let next =
-                    sources[src_idx].next_record(&mut records[winner], guard.consumer_mut())?;
+                let next = sources[src_idx].advance(guard.consumer_mut())?;
                 merge_read_secs += t0.elapsed().as_secs_f64();
 
                 let t0 = Instant::now();
@@ -2849,8 +3019,7 @@ impl RawExternalSorter {
                 merge_tree_secs += t0.elapsed().as_secs_f64();
                 samples_taken += 1;
             } else {
-                let next =
-                    sources[src_idx].next_record(&mut records[winner], guard.consumer_mut())?;
+                let next = sources[src_idx].advance(guard.consumer_mut())?;
                 if let Some(key) = next {
                     tree.replace_winner(key);
                 } else {
@@ -2927,16 +3096,13 @@ impl RawExternalSorter {
 
         let output_header = self.create_output_header(header);
 
-        // Initialize loser tree with first record from each source
+        // Initialize loser tree with first record from each source.
         let mut initial_keys: Vec<K> = Vec::with_capacity(sources.len());
-        let mut records: Vec<Vec<u8>> = Vec::with_capacity(sources.len());
         let mut source_map: Vec<usize> = Vec::with_capacity(sources.len());
 
         for (idx, source) in sources.iter_mut().enumerate() {
-            let mut record = Vec::new();
-            if let Some(key) = source.next_record(&mut record, None)? {
+            if let Some(key) = source.advance(None)? {
                 initial_keys.push(key);
-                records.push(record);
                 source_map.push(idx);
             }
         }
@@ -2967,11 +3133,11 @@ impl RawExternalSorter {
 
         while tree.winner_is_active() {
             let winner = tree.winner();
-            writer.write_raw_record(&records[winner])?;
+            let src_idx = source_map[winner];
+            writer.write_raw_record(sources[src_idx].current_bytes())?;
             merge_progress.log_if_needed(1);
 
-            let src_idx = source_map[winner];
-            if let Some(key) = sources[src_idx].next_record(&mut records[winner], None)? {
+            if let Some(key) = sources[src_idx].advance(None)? {
                 tree.replace_winner(key);
             } else {
                 tree.remove_winner();
@@ -3263,11 +3429,169 @@ fn skip_bam_header<R: Read>(reader: &mut R) -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// Template-key variant selection
+// ============================================================================
+
+/// Which optional lanes a chosen template key retains.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TemplateKeyVariant {
+    /// Retain the `cb_hash` lane.
+    pub cb: bool,
+    /// Retain the tertiary (library|mi) lane.
+    pub tertiary: bool,
+}
+
+impl TemplateKeyVariant {
+    /// Number of u64 lanes: 3 + cb + tertiary.
+    #[must_use]
+    pub fn lanes(self) -> usize {
+        3 + usize::from(self.cb) + usize::from(self.tertiary)
+    }
+}
+
+/// Parsed `--key-types` spec controlling which optional sort-key lanes are kept.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum KeyTypesSpec {
+    /// Auto-detect from the first record (default).
+    #[default]
+    Auto,
+    /// Force all lanes (N=5).
+    Full,
+    /// Force no optional lanes (N=3).
+    None,
+    /// Force a specific optional set.
+    Explicit {
+        /// Retain the `cb_hash` lane.
+        cb: bool,
+        /// Retain the tertiary (library|mi) lane.
+        tertiary: bool,
+    },
+}
+
+/// Mask for the MI component of the `tertiary` key lane (low 48 bits).
+/// `tertiary` packs `library_ordinal << 48 | (mi_value << 1 | !mi_suffix)`, so the
+/// high 16 bits are the library ordinal and the low 48 bits encode MI. A nonzero
+/// low-48 region means the first record carries an MI tag.
+const TERTIARY_MI_MASK: u64 = (1u64 << 48) - 1;
+
+/// Choose the template-key variant for this sort.
+///
+/// `first_key` is the full key extracted from the first record (`None` for an
+/// empty input — then the variant is irrelevant; default to lite). `spec` is the
+/// parsed `--key-types` override. `header_library_varies` is `true` when the
+/// header realizes more than one distinct library ordinal (see
+/// [`LibraryLookup::distinct_header_ordinals`]).
+///
+/// Selection only *provisions* the variant; the decode-time verify (fill loop)
+/// still *guarantees* the dropped lanes are constant. Under `Auto`, the tertiary
+/// library lane is kept only when it can actually vary: the first record carries
+/// an MI tag, or the header realizes more than one library ordinal. A single,
+/// constant library ordinal in the high bits is droppable — the header informs
+/// provisioning, while verify backstops the rare case of a record whose RG is
+/// absent from the header (which realizes ordinal 0).
+#[must_use]
+pub fn select_template_variant(
+    first_key: Option<&TemplateKey>,
+    spec: KeyTypesSpec,
+    header_library_varies: bool,
+) -> TemplateKeyVariant {
+    match spec {
+        KeyTypesSpec::Full => TemplateKeyVariant { cb: true, tertiary: true },
+        KeyTypesSpec::None => TemplateKeyVariant { cb: false, tertiary: false },
+        KeyTypesSpec::Explicit { cb, tertiary } => TemplateKeyVariant { cb, tertiary },
+        KeyTypesSpec::Auto => match first_key {
+            None => TemplateKeyVariant { cb: false, tertiary: false },
+            Some(k) => {
+                // Keep the tertiary lane only if it can actually vary: MI present on
+                // the first record (low-48 bits), or the header realizes more than
+                // one library ordinal. A single (constant) library ordinal in the
+                // high bits is droppable — decode-time verify backstops the rare
+                // case of a record whose RG is absent from the header (ordinal 0).
+                let mi_present = (k.tertiary & TERTIARY_MI_MASK) != 0;
+                TemplateKeyVariant {
+                    cb: k.cb_hash != 0,
+                    tertiary: mi_present || header_library_varies,
+                }
+            }
+        },
+    }
+}
+
+// ============================================================================
+// Dropped-lane violation detection
+// ============================================================================
+
+/// A dropped-lane violation discovered during decode-time verify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DroppedLaneViolation {
+    /// A record carried a CB tag absent from the first record.
+    Cb,
+    /// A record carried an MI value differing from the first record.
+    Mi,
+    /// A record's realized library ordinal differed from the first record.
+    Library,
+}
+
+impl DroppedLaneViolation {
+    /// The `--key-types` token that re-includes this lane.
+    #[must_use]
+    pub fn key_types_token(self) -> &'static str {
+        match self {
+            DroppedLaneViolation::Cb => "cb",
+            DroppedLaneViolation::Mi => "mi",
+            DroppedLaneViolation::Library => "library",
+        }
+    }
+}
+
+/// Verify that the lanes the chosen `variant` dropped are constant for `cur`
+/// relative to the sort's `first` full key. Returns the first violation found,
+/// or `None` if all dropped lanes match.
+///
+/// Tertiary sub-fields are decoded only to attribute the violation: the high 16
+/// bits are the library ordinal; the low 48 bits are `(mi_value << 1) | !mi_suffix`
+/// (`mi_value` occupies bits 47..1; `!mi_suffix` is bit 0).
+#[must_use]
+pub fn verify_dropped_lanes(
+    first: &TemplateKey,
+    cur: &TemplateKey,
+    variant: TemplateKeyVariant,
+) -> Option<DroppedLaneViolation> {
+    if !variant.cb && cur.cb_hash != first.cb_hash {
+        return Some(DroppedLaneViolation::Cb);
+    }
+    if !variant.tertiary && cur.tertiary != first.tertiary {
+        // Attribute: library is the high 16 bits, mi the low 48.
+        let lib_changed = (cur.tertiary >> 48) != (first.tertiary >> 48);
+        return Some(if lib_changed {
+            DroppedLaneViolation::Library
+        } else {
+            DroppedLaneViolation::Mi
+        });
+    }
+    None
+}
+
+/// Build the actionable error message for a dropped-lane violation.
+fn dropped_lane_error(name: &str, v: DroppedLaneViolation) -> anyhow::Error {
+    let field = match v {
+        DroppedLaneViolation::Cb => "CB",
+        DroppedLaneViolation::Mi => "MI",
+        DroppedLaneViolation::Library => "library",
+    };
+    anyhow::anyhow!(
+        "record {name} carries a {field} value absent from the input's first record; \
+         re-run with --key-types {}",
+        v.key_types_token(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bstr::BString;
-    use fgumi_sam::SamBuilder;
+    use fgumi_sam::{PairBuilder, SamBuilder};
     use noodles::sam::header::record::value::Map;
     use noodles::sam::header::record::value::map::ReadGroup;
 
@@ -3330,6 +3654,71 @@ mod tests {
         assert_eq!(rg2, 1); // LibA
         assert_eq!(rg3, 2); // LibB
         assert_eq!(rg1, 3); // LibC
+    }
+
+    #[test]
+    fn test_distinct_header_ordinals() {
+        // (i) no read groups -> 0.
+        let empty = LibraryLookup::from_header(&Header::builder().build());
+        assert_eq!(empty.distinct_header_ordinals(), 0);
+
+        // (ii) one RG with an LB -> 1.
+        let rg_a = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibA"))
+            .build()
+            .expect("valid");
+        let one = LibraryLookup::from_header(
+            &Header::builder().add_read_group(BString::from("rg1"), rg_a).build(),
+        );
+        assert_eq!(one.distinct_header_ordinals(), 1);
+
+        // (iii) two RGs with two different LBs -> 2.
+        let rg_b = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibA"))
+            .build()
+            .expect("valid");
+        let rg_c = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibB"))
+            .build()
+            .expect("valid");
+        let two = LibraryLookup::from_header(
+            &Header::builder()
+                .add_read_group(BString::from("rg1"), rg_b)
+                .add_read_group(BString::from("rg2"), rg_c)
+                .build(),
+        );
+        assert_eq!(two.distinct_header_ordinals(), 2);
+
+        // (iv) two RGs with the SAME LB -> 1.
+        let rg_d = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibA"))
+            .build()
+            .expect("valid");
+        let rg_e = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibA"))
+            .build()
+            .expect("valid");
+        let same = LibraryLookup::from_header(
+            &Header::builder()
+                .add_read_group(BString::from("rg1"), rg_d)
+                .add_read_group(BString::from("rg2"), rg_e)
+                .build(),
+        );
+        assert_eq!(same.distinct_header_ordinals(), 1);
+
+        // (v) one RG with an LB + one RG WITHOUT an LB -> 2 (ordinals {1, 0}).
+        let rg_f = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibA"))
+            .build()
+            .expect("valid");
+        let rg_no_lb = Map::<ReadGroup>::builder().build().expect("valid");
+        let mixed = LibraryLookup::from_header(
+            &Header::builder()
+                .add_read_group(BString::from("rg1"), rg_f)
+                .add_read_group(BString::from("rg2"), rg_no_lb)
+                .build(),
+        );
+        assert_eq!(mixed.distinct_header_ordinals(), 2);
     }
 
     #[test]
@@ -3539,6 +3928,34 @@ mod tests {
     fn test_raw_sorter_cell_tag_builder() {
         let sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate).cell_tag(SamTag::CB);
         assert_eq!(sorter.cell_tag, Some(SamTag::CB));
+    }
+
+    /// Smoke test: an auto-detected lite (no-CB, no-tertiary) template-coordinate
+    /// sort runs end-to-end and preserves the record count. With the default
+    /// `KeyTypesSpec::Auto`, records lacking CB/MI/multi-library auxiliary data
+    /// select the narrow `TemplateKey24` lane key; this exercises that path
+    /// through Phase 1 and Phase 2 and confirms output completeness.
+    #[test]
+    fn template_sort_auto_lite_roundtrips_record_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sorted, names) =
+            create_sorted_bam(dir.path(), "lite", 50, 0, SortOrder::TemplateCoordinate);
+        assert_eq!(collect_read_names(&sorted).len(), names.len() * 2);
+    }
+
+    /// Regression: a 0-record template-coordinate sort must still write a valid
+    /// header-only output BAM (matching the coordinate and queryname orders),
+    /// not skip the output entirely. The empty-input path skips the pre-loop
+    /// first-record push, runs the read loop zero times, and falls through to
+    /// the `chunk_files.is_empty()` fast path that writes the header-only BAM.
+    #[test]
+    fn template_sort_empty_input_writes_header_only_bam() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sorted, names) =
+            create_sorted_bam(dir.path(), "empty", 0, 0, SortOrder::TemplateCoordinate);
+        assert!(names.is_empty());
+        assert!(sorted.exists(), "empty-input sort must still produce an output file");
+        assert_eq!(count_bam_records(&sorted), 0, "output must contain only the header");
     }
 
     // ========================================================================
@@ -4404,6 +4821,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_sort_coordinate_with_index_spilled_preserves_records() {
+        use fgumi_sam::SamBuilder;
+
+        // Enough pairs that an 8 KiB memory limit forces multiple spills,
+        // so the index-emitting merge runs over Disk sources + the in-memory
+        // chunk simultaneously (the mixed-source path the refactor must keep
+        // byte-identical).
+        let num_pairs = 300;
+        let mut builder = SamBuilder::new();
+        for i in 0..num_pairs {
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i:05}"))
+                .start1(i * 200 + 1)
+                .start2(i * 200 + 101)
+                .build();
+        }
+
+        let workdir = tempfile::tempdir().expect("workdir");
+        let input = workdir.path().join("input.bam");
+        let output = workdir.path().join("output.bam");
+        builder.write_bam(&input).expect("write bam");
+
+        let stats = RawExternalSorter::new(SortOrder::Coordinate)
+            .memory_limit(8 * 1024) // tiny → forces several spills
+            .threads(1)
+            .write_index(true) // routes through sort_coordinate_with_index → merge_chunks_with_index
+            .spill_codec(crate::codec::SpillCodec::Bgzf)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&input, &output)
+            .expect("indexed coordinate sort should succeed");
+
+        assert!(stats.chunks_written >= 2, "expected multiple spill chunks");
+
+        // All records preserved.
+        let names = collect_read_names(&output);
+        assert_eq!(names.len(), num_pairs * 2, "record count mismatch");
+
+        // A .bai index was produced alongside the output.
+        let bai = output.with_extension("bam.bai");
+        assert!(bai.exists() || output.with_extension("bai").exists(), "index file should exist");
+    }
+
     // ========================================================================
     // read_exact_or_eof tests
     // ========================================================================
@@ -4474,5 +4936,825 @@ mod tests {
         let mut buf = [0u8; 4];
         let err = read_exact_or_eof(&mut src, &mut buf).expect_err("truncated read should error");
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    // ========================================================================
+    // verify_dropped_lanes / dropped_lane_error tests
+    // ========================================================================
+
+    fn full_key(cb: u64, tertiary: u64) -> TemplateKey {
+        TemplateKey { primary: 0, secondary: 0, cb_hash: cb, tertiary, name_hash_upper: 0 }
+    }
+
+    const LITE: TemplateKeyVariant = TemplateKeyVariant { cb: false, tertiary: false };
+
+    #[test]
+    fn verify_detects_cb_appearing() {
+        let v = verify_dropped_lanes(&full_key(0, 0), &full_key(123, 0), LITE);
+        assert_eq!(v, Some(DroppedLaneViolation::Cb));
+        assert_eq!(v.unwrap().key_types_token(), "cb");
+    }
+
+    #[test]
+    fn verify_detects_mi_change() {
+        let first = full_key(0, 0);
+        let cur = full_key(0, 0b10); // mi_value bit set, library still 0
+        assert_eq!(verify_dropped_lanes(&first, &cur, LITE), Some(DroppedLaneViolation::Mi));
+    }
+
+    #[test]
+    fn verify_detects_library_change() {
+        let first = full_key(0, 0);
+        let cur = full_key(0, 1u64 << 48); // library ordinal 1
+        assert_eq!(verify_dropped_lanes(&first, &cur, LITE), Some(DroppedLaneViolation::Library));
+    }
+
+    #[test]
+    fn verify_passes_when_dropped_lanes_constant() {
+        let variant = TemplateKeyVariant { cb: true, tertiary: false };
+        assert_eq!(verify_dropped_lanes(&full_key(1, 5), &full_key(2, 5), variant), None);
+    }
+
+    #[test]
+    fn verify_error_message_names_field_and_token() {
+        let e = dropped_lane_error("read42", DroppedLaneViolation::Library);
+        let msg = e.to_string();
+        assert!(
+            msg.contains("read42")
+                && msg.contains("library")
+                && msg.contains("--key-types library"),
+            "{msg}"
+        );
+    }
+
+    // ========================================================================
+    // select_template_variant tests
+    // ========================================================================
+
+    fn key(cb: u64, tertiary: u64) -> TemplateKey {
+        TemplateKey { primary: 1, secondary: 2, cb_hash: cb, tertiary, name_hash_upper: 3 }
+    }
+
+    #[test]
+    fn auto_lite_when_no_cb_no_tertiary() {
+        let v = select_template_variant(Some(&key(0, 0)), KeyTypesSpec::Auto, false);
+        assert_eq!(v, TemplateKeyVariant { cb: false, tertiary: false });
+        assert_eq!(v.lanes(), 3);
+    }
+
+    #[test]
+    fn auto_cb_only_when_first_record_has_cb() {
+        let v = select_template_variant(Some(&key(42, 0)), KeyTypesSpec::Auto, false);
+        assert_eq!(v, TemplateKeyVariant { cb: true, tertiary: false });
+        assert_eq!(v.lanes(), 4);
+    }
+
+    #[test]
+    fn auto_tertiary_only_when_first_record_has_mi_or_library() {
+        // 0xABCD is in the low-48 bits => MI present => keep tertiary, even though
+        // the header library does not vary.
+        let v = select_template_variant(Some(&key(0, 0xABCD)), KeyTypesSpec::Auto, false);
+        assert_eq!(v, TemplateKeyVariant { cb: false, tertiary: true });
+        assert_eq!(v.lanes(), 4);
+    }
+
+    #[test]
+    fn auto_full_when_both_present() {
+        let v = select_template_variant(Some(&key(7, 9)), KeyTypesSpec::Auto, false);
+        assert_eq!(v, TemplateKeyVariant { cb: true, tertiary: true });
+        assert_eq!(v.lanes(), 5);
+    }
+
+    // tertiary high bits only = a single library ordinal, no MI. With a non-varying
+    // header, the constant library lane is dropped -> lite.
+    #[test]
+    fn auto_drops_constant_single_library_lane() {
+        let k = key(0, 1u64 << 48); // library ordinal 1, no MI
+        let v = select_template_variant(Some(&k), KeyTypesSpec::Auto, false);
+        assert_eq!(v, TemplateKeyVariant { cb: false, tertiary: false });
+        assert_eq!(v.lanes(), 3);
+    }
+
+    #[test]
+    fn auto_keeps_tertiary_when_header_library_varies() {
+        let k = key(0, 1u64 << 48); // library ordinal 1, no MI
+        let v = select_template_variant(Some(&k), KeyTypesSpec::Auto, true); // >1 library
+        assert_eq!(v, TemplateKeyVariant { cb: false, tertiary: true });
+        assert_eq!(v.lanes(), 4);
+    }
+
+    #[test]
+    fn auto_keeps_tertiary_for_mi_even_with_constant_library() {
+        // MI present (low bits) -> keep tertiary even though header library is constant.
+        let k = key(0, (1u64 << 48) | 0b10); // library ordinal 1 + MI value bit
+        let v = select_template_variant(Some(&k), KeyTypesSpec::Auto, false);
+        assert_eq!(v, TemplateKeyVariant { cb: false, tertiary: true });
+    }
+
+    #[test]
+    fn none_forces_lite() {
+        assert_eq!(
+            select_template_variant(Some(&key(99, 99)), KeyTypesSpec::None, true).lanes(),
+            3
+        );
+    }
+
+    #[test]
+    fn full_forces_all_lanes() {
+        assert_eq!(select_template_variant(Some(&key(0, 0)), KeyTypesSpec::Full, false).lanes(), 5);
+    }
+
+    #[test]
+    fn explicit_spec_passthrough() {
+        assert_eq!(
+            select_template_variant(
+                None,
+                KeyTypesSpec::Explicit { cb: true, tertiary: false },
+                false
+            )
+            .lanes(),
+            4
+        );
+    }
+
+    #[test]
+    fn empty_input_defaults_to_lite() {
+        assert_eq!(select_template_variant(None, KeyTypesSpec::Auto, false).lanes(), 3);
+    }
+
+    // ========================================================================
+    // Capacity estimator consistency tests (T8)
+    // ========================================================================
+
+    #[test]
+    fn estimator_bytes_per_record_matches_ref_size() {
+        use crate::inline::TemplateKey32;
+        for (actual, expected) in [
+            (std::mem::size_of::<TemplateRecordRef<TemplateKey24>>(), 40usize),
+            (std::mem::size_of::<TemplateRecordRef<TemplateKey32>>(), 48),
+            (std::mem::size_of::<TemplateRecordRef<TemplateKey40>>(), 56),
+        ] {
+            assert_eq!(actual, expected, "ref size must equal key + 16 B offset/len/pad");
+        }
+        let bpr_lite = (TEMPLATE_HEADER_SIZE + EST_BAM_BYTES_PER_TEMPLATE_RECORD)
+            + std::mem::size_of::<TemplateRecordRef<TemplateKey24>>();
+        assert_eq!(bpr_lite, 8 + 250 + 40);
+    }
+
+    // ========================================================================
+    // T10: narrow-key byte-identity correctness proof
+    // ========================================================================
+    //
+    // The whole point of `--key-types`: a narrow-key template-coordinate sort
+    // must produce a record stream byte-identical to the full-key (`--key-types
+    // full`) baseline on the same input. These tests build one unsorted BAM per
+    // mode (with genuinely varying tags so the narrowed lane actually matters),
+    // sort it under both the narrow spec and the full spec, and compare the
+    // per-record BAM bodies in file order. They are non-vacuous: a sanity helper
+    // asserts the constructed input produces the nonzero cb_hash / tertiary that
+    // the mode claims, and the bonus `*_lite_sort_hard_errors` assertions prove a
+    // mis-narrowed (lite) sort of the same input would refuse to run rather than
+    // silently mis-sort.
+
+    /// Number of distinct-position pairs per mode input — large enough that the
+    /// spill-forced variant crosses a tiny memory limit and exercises the Phase-2
+    /// k-way merge. Tied clusters (see `CLUSTER_SIZE` / `CLUSTER_COUNT`) are added
+    /// on top of these.
+    const T10_DISTINCT_PAIRS: usize = 300;
+
+    /// Number of records in each coordinate-tied cluster. Within a cluster every
+    /// record shares the same primary (tid, start1) AND secondary (start2, strands)
+    /// and differs ONLY in the kept optional lane (`cb_hash` or tertiary), so that
+    /// lane is the load-bearing tiebreaker above `name_hash_upper`. Made large so
+    /// the chance that `name_hash` order coincidentally equals kept-lane order for
+    /// every cluster (which would re-vacuate the test) is negligible.
+    const CLUSTER_SIZE: usize = 8;
+
+    /// Number of coordinate-tied clusters, each at a distinct shared coordinate.
+    /// Several clusters further drive the coincidence probability to zero.
+    const CLUSTER_COUNT: usize = 4;
+
+    /// Total pairs (distinct + clustered) each mode input contains.
+    const T10_PAIRS: usize = T10_DISTINCT_PAIRS + CLUSTER_SIZE * CLUSTER_COUNT;
+
+    /// Collect each record's raw BAM bytes (excluding the header) in file order.
+    ///
+    /// Compares at the record-stream level rather than the file level: BGZF block
+    /// batching is nondeterministic, so two semantically identical BAMs can differ
+    /// byte-for-byte on disk while their decoded record bodies are identical.
+    fn collect_record_bytes(path: &Path) -> Vec<Vec<u8>> {
+        use crate::read_ahead::RawReadAheadReader;
+        let (reader, _) = create_raw_bam_reader(path, 1).expect("reader");
+        RawReadAheadReader::new(reader).map(|rec| rec.as_ref().to_vec()).collect()
+    }
+
+    /// Sort `input` with the given key-types spec and return the record-byte stream.
+    ///
+    /// `cell_tag(SamTag::CB)` is REQUIRED: `RawExternalSorter::new` defaults the
+    /// cell tag to `None`, so without this the CB lane is never populated and any
+    /// single-cell assertion would pass vacuously (`cb_hash` stays 0). This mirrors
+    /// the CLI's `parse_cell_tag`.
+    fn sort_and_collect(input: &Path, dir: &Path, tag: &str, spec: KeyTypesSpec) -> Vec<Vec<u8>> {
+        let out = dir.join(format!("{tag}.bam"));
+        RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .output_compression(0)
+            .cell_tag(SamTag::CB)
+            .key_types(spec)
+            .sort(input, &out)
+            .expect("sort");
+        collect_record_bytes(&out)
+    }
+
+    /// Insert a read group carrying an `LB:` (library) field into a builder header.
+    ///
+    /// Used by the multi-library inputs to realize two distinct library ordinals
+    /// (sorted alphabetically, then 1-based) so the tertiary lane genuinely varies.
+    fn add_rg_with_library(header: &mut Header, rg_id: &str, library: &str) {
+        let rg = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from(library))
+            .build()
+            .expect("valid read group");
+        header.read_groups_mut().insert(BString::from(rg_id), rg);
+    }
+
+    /// Extract the full-width template key for the first record of a BAM, using a
+    /// fresh `LibraryLookup` from its header. Lets a builder sanity-check that the
+    /// tags it wrote actually produce the nonzero `cb_hash` / tertiary it claims.
+    fn first_record_full_key(path: &Path) -> TemplateKey40 {
+        use crate::read_ahead::RawReadAheadReader;
+        let (reader, header) = create_raw_bam_reader(path, 1).expect("reader");
+        let lib = LibraryLookup::from_header(&header);
+        let first = RawReadAheadReader::new(reader).next().expect("at least one record");
+        extract_template_key_inline(first.as_ref(), &lib, Some(SamTag::CB), &cb_hasher())
+    }
+
+    /// Scramble a cluster member's slot index into a kept-lane value index so the
+    /// kept-lane order is a NON-identity permutation of the name order within the
+    /// cluster. `7` is coprime to `CLUSTER_SIZE` (8), so this is a bijection that
+    /// fixes no element to its name position (the `+3` shift removes the only fixed
+    /// point). This anti-correlates the kept lane with `name_hash` so a wrong
+    /// narrowing that falls back to `name_hash` cannot coincidentally reproduce the
+    /// correct (kept-lane) order.
+    fn scrambled_lane_index(member: usize) -> usize {
+        (member * 7 + 3) % CLUSTER_SIZE
+    }
+
+    /// Shared start1 for cluster `c`. Far above any distinct-position record
+    /// (`i * 200` for `i < T10_DISTINCT_PAIRS`, i.e. below ~`60_000`) so clusters
+    /// never collide with the general path and each cluster sits at its own
+    /// coordinate. All members of a cluster share this exact coordinate.
+    fn cluster_start1(c: usize) -> usize {
+        10_000_000 + c * 10_000
+    }
+
+    /// Build an unsorted BAM with `T10_DISTINCT_PAIRS` uniquely-positioned pairs
+    /// PLUS `CLUSTER_COUNT` coordinate-tied clusters of `CLUSTER_SIZE` pairs each.
+    ///
+    /// `tagger` decorates a uniquely-positioned pair (CB/MI/RG). `cluster_tagger`
+    /// decorates a cluster member, receiving the scrambled lane index so the caller
+    /// can set the kept optional lane (CB / MI / RG) to a value whose order is
+    /// anti-correlated with the member's name. The uniquely-positioned records
+    /// exercise the general sort/spill path; the clusters make the kept lane the
+    /// load-bearing tiebreaker (shared primary+secondary, differ only in kept lane).
+    fn build_mode_bam(
+        dir: &Path,
+        name: &str,
+        mut header: Header,
+        tagger: impl Fn(PairBuilder<'_>, usize) -> PairBuilder<'_>,
+        cluster_tagger: impl Fn(PairBuilder<'_>, usize) -> PairBuilder<'_>,
+    ) -> PathBuf {
+        let mut builder = SamBuilder::new();
+        builder.header = std::mem::take(&mut header);
+
+        // Coordinate-tied clusters first: each member shares start1/start2/strands
+        // with its cluster siblings and differs only in the kept optional lane.
+        for c in 0..CLUSTER_COUNT {
+            let start1 = cluster_start1(c);
+            let start2 = start1 + 100;
+            for member in 0..CLUSTER_SIZE {
+                let pair = builder
+                    .add_pair()
+                    .name(&format!("read_c{c}_{member:02}"))
+                    .start1(start1)
+                    .start2(start2);
+                let _ = cluster_tagger(pair, scrambled_lane_index(member)).build();
+            }
+        }
+
+        // Uniquely-positioned pairs: interleave positions (even i ascend, odd i
+        // descend) so file order is far from template-coordinate order.
+        for i in 0..T10_DISTINCT_PAIRS {
+            let pos = if i % 2 == 0 { i * 200 } else { (T10_DISTINCT_PAIRS - i) * 200 };
+            let pair =
+                builder.add_pair().name(&format!("read{i:05}")).start1(pos + 1).start2(pos + 101);
+            let _ = tagger(pair, i).build();
+        }
+
+        let path = dir.join(format!("{name}.bam"));
+        builder.write_bam(&path).expect("write bam");
+        path
+    }
+
+    /// Distinct CB barcodes, one per cluster slot, so a tied cluster's members get
+    /// distinct `cb_hash` values (the load-bearing single-cell tiebreaker).
+    const CLUSTER_BARCODES: [&str; CLUSTER_SIZE] = [
+        "AAAACCCC", "GGGGTTTT", "ACGTACGT", "TTTTGGGG", "CCCCAAAA", "TTTTACGT", "GACTGACT",
+        "TGCATGCA",
+    ];
+
+    /// bulk (lite): no CB, no MI, single default read group. No load-bearing opt
+    /// lane, so the clusters carry no distinguishing tag — bulk byte-identity is
+    /// inherently about the general path, and the cluster members tie down to
+    /// `name_hash` in both baseline and narrow (lite drops both lanes anyway).
+    fn build_bulk_bam(dir: &Path) -> PathBuf {
+        build_mode_bam(
+            dir,
+            "bulk",
+            SamBuilder::new().header.clone(),
+            |pair, _| pair,
+            |pair, _| pair,
+        )
+    }
+
+    /// single-cell: every pair carries `CB:Z:<barcode>`; no MI. Cluster members get
+    /// DISTINCT barcodes (scrambled vs name) so `cb_hash` is the load-bearing lane.
+    fn build_single_cell_bam(dir: &Path) -> PathBuf {
+        const BARCODES: [&str; 4] = ["AAAACCCC", "GGGGTTTT", "ACGTACGT", "TTTTGGGG"];
+        build_mode_bam(
+            dir,
+            "single_cell",
+            SamBuilder::new().header.clone(),
+            |pair, i| pair.attr("CB", BARCODES[i % BARCODES.len()]),
+            |pair, lane| pair.attr("CB", CLUSTER_BARCODES[lane]),
+        )
+    }
+
+    /// post-group: every pair carries `MI:Z:<id>`; no CB; single library. Cluster
+    /// members get DISTINCT MI ids (scrambled vs name), so the tertiary lane
+    /// (MI bits) is the load-bearing tiebreaker. Ids are `1..=CLUSTER_SIZE` so
+    /// tertiary != 0 for every member.
+    fn build_post_group_bam(dir: &Path) -> PathBuf {
+        build_mode_bam(
+            dir,
+            "post_group",
+            SamBuilder::new().header.clone(),
+            |pair, i| pair.attr("MI", format!("{}", (i % 5) + 1)),
+            |pair, lane| pair.attr("MI", format!("{}", lane + 1)),
+        )
+    }
+
+    /// multi-lib: header with TWO `@RG` lines whose `LB:` differ; pairs split across
+    /// the two RGs; no CB, no MI. The two libraries realize ordinals 1 and 2. Within
+    /// a cluster, members alternate read groups by the SCRAMBLED lane index so the
+    /// tertiary library bits (high-16) vary load-bearingly across the cluster and
+    /// the library order is anti-correlated with the name order.
+    fn build_multi_lib_bam(dir: &Path) -> PathBuf {
+        let mut header = SamBuilder::new().header.clone();
+        add_rg_with_library(&mut header, "rgA", "LibAlpha");
+        add_rg_with_library(&mut header, "rgB", "LibBeta");
+        build_mode_bam(
+            dir,
+            "multi_lib",
+            header,
+            |pair, i| pair.attr("RG", if i % 2 == 0 { "rgA" } else { "rgB" }),
+            |pair, lane| pair.attr("RG", if lane % 2 == 0 { "rgA" } else { "rgB" }),
+        )
+    }
+
+    /// full: CB + MI + multi-library together — all optional lanes vary. Cluster
+    /// members get distinct CB and MI (scrambled vs name) plus alternating RG.
+    /// Baseline (full) == narrow (full) so this mode is inherently trivial, but the
+    /// clusters keep it meaningful (the kept lanes still vary load-bearingly).
+    fn build_full_bam(dir: &Path) -> PathBuf {
+        const BARCODES: [&str; 4] = ["AAAACCCC", "GGGGTTTT", "ACGTACGT", "TTTTGGGG"];
+        let mut header = SamBuilder::new().header.clone();
+        add_rg_with_library(&mut header, "rgA", "LibAlpha");
+        add_rg_with_library(&mut header, "rgB", "LibBeta");
+        build_mode_bam(
+            dir,
+            "full",
+            header,
+            |pair, i| {
+                pair.attr("CB", BARCODES[i % BARCODES.len()])
+                    .attr("MI", format!("{}", i % 5))
+                    .attr("RG", if i % 2 == 0 { "rgA" } else { "rgB" })
+            },
+            |pair, lane| {
+                pair.attr("CB", CLUSTER_BARCODES[lane])
+                    .attr("MI", format!("{}", lane + 1))
+                    .attr("RG", if lane % 2 == 0 { "rgA" } else { "rgB" })
+            },
+        )
+    }
+
+    /// For each mode, the narrow-key sort must produce a record stream IDENTICAL to
+    /// the `--key-types full` baseline, and the `Auto`-detected variant must match
+    /// it too. The narrow spec is the minimal one for the mode; an over-narrow
+    /// (lite) sort of single-cell / post-group / multi-lib inputs would instead
+    /// hard-error (see `*_lite_sort_hard_errors`), proving these are not vacuous.
+    #[rstest::rstest]
+    #[case::bulk(build_bulk_bam as fn(&Path) -> PathBuf, KeyTypesSpec::None)]
+    #[case::single_cell(
+        build_single_cell_bam as fn(&Path) -> PathBuf,
+        KeyTypesSpec::Explicit { cb: true, tertiary: false }
+    )]
+    #[case::post_group(
+        build_post_group_bam as fn(&Path) -> PathBuf,
+        KeyTypesSpec::Explicit { cb: false, tertiary: true }
+    )]
+    #[case::multi_lib(
+        build_multi_lib_bam as fn(&Path) -> PathBuf,
+        KeyTypesSpec::Explicit { cb: false, tertiary: true }
+    )]
+    #[case::full(build_full_bam as fn(&Path) -> PathBuf, KeyTypesSpec::Full)]
+    fn narrow_key_sort_byte_identical_to_full(
+        #[case] build: fn(&Path) -> PathBuf,
+        #[case] narrow: KeyTypesSpec,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let input = build(dir.path());
+
+        let baseline = sort_and_collect(&input, dir.path(), "full_baseline", KeyTypesSpec::Full);
+        assert_eq!(baseline.len(), T10_PAIRS * 2, "baseline must retain every record");
+
+        let narrowed = sort_and_collect(&input, dir.path(), "narrow", narrow);
+        assert_eq!(narrowed, baseline, "narrow-key record stream must equal full-key stream");
+
+        let auto = sort_and_collect(&input, dir.path(), "auto", KeyTypesSpec::Auto);
+        assert_eq!(auto, baseline, "auto-detected variant must equal full-key stream");
+    }
+
+    /// single-library: one `@RG` carrying an `LB:`, every pair assigned to it; no CB,
+    /// no MI. The lone library realizes ordinal 1, so the first record's tertiary is
+    /// nonzero (high bits) yet the library lane is CONSTANT across every record — the
+    /// WES/WGS scenario. `Auto` must therefore drop the tertiary lane to the 24-byte
+    /// lite key while staying byte-identical to the full-key baseline.
+    fn build_single_library_bam(dir: &Path) -> PathBuf {
+        // Attach a library to the builder's single default read group ("A") so the
+        // header realizes exactly ONE distinct library ordinal (1). Reads default to
+        // RG "A", so every record maps to that lone library — the tertiary high bits
+        // are a constant nonzero ordinal, with no MI and no CB.
+        let mut header = SamBuilder::new().header.clone();
+        let rg = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibSolo"))
+            .build()
+            .expect("valid read group");
+        // The builder defaults to a single read group "A"; replace it in place with a
+        // library-bearing one so there is exactly one read group (one ordinal).
+        header.read_groups_mut().clear();
+        header.read_groups_mut().insert(BString::from("A"), rg);
+        build_mode_bam(dir, "single_library", header, |pair, _| pair, |pair, _| pair)
+    }
+
+    /// WES/WGS regression: a single-library input (one constant library ordinal, no
+    /// CB, no MI) must auto-narrow to the 3-lane lite key AND sort byte-identically to
+    /// the full-key baseline. Proves the constant library lane is provisionally
+    /// droppable under `Auto` and that dropping it does not change the record stream.
+    #[test]
+    fn auto_drops_constant_library_lane_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = build_single_library_bam(dir.path());
+
+        // Production provisioning logic, reproduced: the first record carries a
+        // nonzero (library) tertiary, but the header realizes a single ordinal, so
+        // Auto must pick the 3-lane lite variant.
+        let first = first_record_full_key(&input);
+        let (_, header) = create_raw_bam_reader(&input, 1).expect("reader");
+        let lib_lookup = LibraryLookup::from_header(&header);
+        let header_library_varies = lib_lookup.distinct_header_ordinals() > 1;
+        assert!(!header_library_varies, "single-library header must not vary");
+        assert_ne!(first.tertiary, 0, "first record carries a (constant) library ordinal");
+
+        let variant =
+            select_template_variant(Some(&first), KeyTypesSpec::Auto, header_library_varies);
+        assert_eq!(variant.lanes(), 3, "auto must narrow a single-library input to the lite key");
+
+        // Byte-identity: auto (lite) == full-key baseline.
+        let baseline = sort_and_collect(&input, dir.path(), "full_baseline", KeyTypesSpec::Full);
+        assert_eq!(baseline.len(), T10_PAIRS * 2, "baseline must retain every record");
+        let auto = sort_and_collect(&input, dir.path(), "auto", KeyTypesSpec::Auto);
+        assert_eq!(auto, baseline, "auto (lite) record stream must equal full-key stream");
+
+        // Cross-check: an explicit lite (`--key-types none`) sort is also identical,
+        // proving the lite key is genuinely valid for this input.
+        let lite = sort_and_collect(&input, dir.path(), "lite", KeyTypesSpec::None);
+        assert_eq!(lite, baseline, "explicit lite record stream must equal full-key stream");
+    }
+
+    /// Spill-forced byte-identity: a tiny memory limit forces Phase 1 to spill and
+    /// Phase 2 to k-way merge `PooledChunkWriter::<K>` chunks. This is the path
+    /// where the serialized narrow-key width must match the Phase-1 width; a
+    /// mismatch would corrupt the merge. Asserted on the bulk (lite) input.
+    #[test]
+    fn narrow_key_sort_byte_identical_when_spilling() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = build_bulk_bam(dir.path());
+
+        let sort_spilling = |tag: &str, spec: KeyTypesSpec| -> (Vec<Vec<u8>>, usize) {
+            let out = dir.path().join(format!("{tag}.bam"));
+            let stats = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+                .memory_limit(32 * 1024)
+                .max_temp_files(0)
+                .spill_codec(crate::codec::SpillCodec::Bgzf)
+                .temp_compression(0)
+                .output_compression(0)
+                .cell_tag(SamTag::CB)
+                .key_types(spec)
+                .sort(&input, &out)
+                .expect("sort");
+            (collect_record_bytes(&out), stats.chunks_written)
+        };
+
+        let (baseline, base_chunks) = sort_spilling("spill_full", KeyTypesSpec::Full);
+        let (narrowed, narrow_chunks) = sort_spilling("spill_narrow", KeyTypesSpec::None);
+
+        assert!(base_chunks >= 2, "baseline must spill multiple chunks, got {base_chunks}");
+        assert!(narrow_chunks >= 2, "narrow must spill multiple chunks, got {narrow_chunks}");
+        assert_eq!(narrowed, baseline, "spilled narrow stream must equal spilled full stream");
+    }
+
+    /// Spill-forced byte-identity for ALL key widths: a tiny memory limit forces Phase 1
+    /// to spill and Phase 2 to k-way merge `PooledChunkWriter::<K>` chunks across all four
+    /// key widths (24-byte lite, 32-byte `CbKey32`, 32-byte `TertKey32`, 40-byte `TemplateKey40`).
+    ///
+    /// The existing `narrow_key_sort_byte_identical_when_spilling` test only covers the
+    /// 24-byte (bulk/lite) path. A width/serialization regression in the 32- or 40-byte
+    /// Phase-2 merge path would not be caught by that test alone. This test closes the gap
+    /// by asserting both that each width's narrow-key spilled stream is byte-identical to
+    /// the Full baseline spilled stream, AND that both runs actually spilled (>=2 chunks),
+    /// so the Phase-2 merge path at each key width is genuinely exercised.
+    #[rstest::rstest]
+    #[case::bulk(build_bulk_bam as fn(&Path) -> PathBuf, KeyTypesSpec::None)]
+    #[case::single_cell(
+        build_single_cell_bam as fn(&Path) -> PathBuf,
+        KeyTypesSpec::Explicit { cb: true, tertiary: false }
+    )]
+    #[case::post_group(
+        build_post_group_bam as fn(&Path) -> PathBuf,
+        KeyTypesSpec::Explicit { cb: false, tertiary: true }
+    )]
+    #[case::multi_lib(
+        build_multi_lib_bam as fn(&Path) -> PathBuf,
+        KeyTypesSpec::Explicit { cb: false, tertiary: true }
+    )]
+    #[case::full(build_full_bam as fn(&Path) -> PathBuf, KeyTypesSpec::Full)]
+    fn narrow_key_spill_merge_byte_identical_all_widths(
+        #[case] build: fn(&Path) -> PathBuf,
+        #[case] narrow: KeyTypesSpec,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let input = build(dir.path());
+
+        let sort_spilling = |tag: &str, spec: KeyTypesSpec| -> (Vec<Vec<u8>>, usize) {
+            let out = dir.path().join(format!("{tag}.bam"));
+            let stats = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+                .memory_limit(32 * 1024)
+                .max_temp_files(0)
+                .spill_codec(crate::codec::SpillCodec::Bgzf)
+                .temp_compression(0)
+                .output_compression(0)
+                .cell_tag(SamTag::CB)
+                .key_types(spec)
+                .sort(&input, &out)
+                .expect("sort");
+            (collect_record_bytes(&out), stats.chunks_written)
+        };
+
+        let (baseline, base_chunks) = sort_spilling("spill_full_baseline", KeyTypesSpec::Full);
+        let (narrowed, narrow_chunks) = sort_spilling("spill_narrow", narrow);
+
+        assert!(
+            base_chunks >= 2,
+            "Full-key baseline must spill multiple chunks (Phase-2 merge must run), \
+             got {base_chunks}"
+        );
+        assert!(
+            narrow_chunks >= 2,
+            "Narrow-key sort must spill multiple chunks (Phase-2 merge must run at this \
+             key width), got {narrow_chunks}"
+        );
+        assert_eq!(
+            narrowed, baseline,
+            "Narrow-key spilled record stream must be byte-identical to Full-key spilled \
+             record stream — a mismatch indicates a width/serialization regression in the \
+             Phase-2 merge path"
+        );
+    }
+
+    /// Sanity (anti-vacuity): each mode's input must produce the nonzero `cb_hash` /
+    /// tertiary it claims on its first record, otherwise the byte-identity tests
+    /// would compare two identically-narrowed streams and prove nothing.
+    #[test]
+    fn mode_inputs_realize_claimed_lanes() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let bulk = first_record_full_key(&build_bulk_bam(dir.path()));
+        assert_eq!(bulk.cb_hash, 0, "bulk must have no CB");
+        assert_eq!(bulk.tertiary, 0, "bulk must have no MI/library");
+
+        let cell = first_record_full_key(&build_single_cell_bam(dir.path()));
+        assert_ne!(cell.cb_hash, 0, "single-cell first record must have nonzero cb_hash");
+        assert_eq!(cell.tertiary, 0, "single-cell must have no MI/library");
+
+        let pg = first_record_full_key(&build_post_group_bam(dir.path()));
+        assert_eq!(pg.cb_hash, 0, "post-group must have no CB");
+        assert_ne!(pg.tertiary, 0, "post-group first record must have nonzero MI tertiary");
+        assert_eq!(pg.tertiary >> 48, 0, "post-group must have no library (ordinal 0)");
+
+        let multi = first_record_full_key(&build_multi_lib_bam(dir.path()));
+        assert_eq!(multi.cb_hash, 0, "multi-lib must have no CB");
+        assert_ne!(multi.tertiary >> 48, 0, "multi-lib first record must have nonzero library");
+
+        let full = first_record_full_key(&build_full_bam(dir.path()));
+        assert_ne!(full.cb_hash, 0, "full first record must have nonzero cb_hash");
+        assert_ne!(full.tertiary, 0, "full first record must have nonzero tertiary");
+        assert_ne!(full.tertiary >> 48, 0, "full first record must have nonzero library ordinal");
+    }
+
+    /// Guard the single-cell cluster against a silent `cb_hash` collision: every
+    /// barcode in `CLUSTER_BARCODES` must hash to a DISTINCT `cb_hash` value under
+    /// `cb_hasher()`, otherwise two cluster members would share the same sort key
+    /// and the tiebreaker designed to make the narrow-key test non-vacuous would
+    /// silently collapse.
+    ///
+    /// Uses `cb_hasher().hash_one(bc.as_bytes())` — exactly the expression in
+    /// `extract_template_key_inline` (`cb_hasher.hash_one(cb_bytes)` where
+    /// `cb_bytes` is the raw string value of the CB aux tag, i.e. ASCII barcode
+    /// bytes without NUL terminator).
+    #[test]
+    fn cluster_barcodes_have_distinct_cb_hashes() {
+        let hasher = cb_hasher();
+        let mut hash_vals: Vec<u64> =
+            CLUSTER_BARCODES.iter().map(|bc| hasher.hash_one(bc.as_bytes())).collect();
+        let n = hash_vals.len();
+        hash_vals.sort_unstable();
+        hash_vals.dedup();
+        assert_eq!(
+            hash_vals.len(),
+            n,
+            "cluster barcodes must hash to distinct cb_hash values, else the single-cell \
+             cluster is vacuous"
+        );
+    }
+
+    /// A narrow (tertiary-only) sort output must re-verify correct at FULL width via
+    /// `core_cmp`. This locks the consistency between the narrowed key used for
+    /// sorting and the full key used by `fgumi sort --verify`: if narrowing dropped
+    /// ordering information the merge depended on, the full-width re-check would
+    /// find a violation.
+    #[test]
+    fn narrow_sort_output_passes_full_width_verify() {
+        use std::cmp::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = build_post_group_bam(dir.path());
+        let out = dir.path().join("narrow.bam");
+        RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .output_compression(0)
+            .cell_tag(SamTag::CB)
+            .key_types(KeyTypesSpec::Explicit { cb: false, tertiary: true })
+            .sort(&input, &out)
+            .expect("sort");
+
+        // Header only (for LibraryLookup); the auto reader is dropped immediately.
+        let (_, header) = create_raw_bam_reader(&out, 1).expect("header");
+        let lib = LibraryLookup::from_header(&header);
+        let hasher = cb_hasher();
+
+        // verify_sort_order wants RawBamRecordReader<File> — build it like execute_verify.
+        let file = std::fs::File::open(&out).expect("open");
+        let mut raw_reader = crate::reader::RawBamRecordReader::new(file).expect("reader");
+        raw_reader.skip_header().expect("skip header");
+
+        let (total, violations, first) = crate::verify::verify_sort_order(
+            raw_reader,
+            |bam| extract_template_key_inline(bam, &lib, Some(SamTag::CB), &hasher),
+            |cur: &TemplateKey40, prev: &TemplateKey40| cur.core_cmp(prev) == Ordering::Less,
+        )
+        .expect("verify runs");
+
+        assert_eq!(total, (T10_PAIRS * 2) as u64, "verify must see every record");
+        assert_eq!(
+            violations, 0,
+            "narrow output must re-verify at full width (first={first:?}, total={total})"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // T6 (deferred) hard-error integration tests
+    //
+    // Build a BAM whose FIRST pair lacks an optional field and a LATER pair
+    // carries/changes it, then sort with the over-narrow spec that drops that
+    // lane. The decode-time `verify_dropped_lanes` check must hard-error with a
+    // message naming the `--key-types <token>` that re-includes the lane, rather
+    // than silently mis-sorting. Each test forces the relevant lane to vary
+    // across records while holding the dropped lanes constant; attribution
+    // (cb / mi / library) follows `verify_dropped_lanes`.
+    // ------------------------------------------------------------------------
+
+    /// Build a two-pair BAM where the first pair omits a tag the second supplies.
+    fn build_first_then_appears(
+        dir: &Path,
+        name: &str,
+        header: Header,
+        first: impl Fn(PairBuilder<'_>) -> PairBuilder<'_>,
+        second: impl Fn(PairBuilder<'_>) -> PairBuilder<'_>,
+    ) -> PathBuf {
+        let mut builder = SamBuilder::new();
+        builder.header = header;
+        let _ = first(builder.add_pair().name("read00000").start1(1).start2(101)).build();
+        let _ = second(builder.add_pair().name("read00001").start1(201).start2(301)).build();
+        let path = dir.join(format!("{name}.bam"));
+        builder.write_bam(&path).expect("write bam");
+        path
+    }
+
+    /// CB appears after the first record under `--key-types none` → hard error
+    /// instructing `--key-types cb`.
+    #[test]
+    fn lite_sort_hard_errors_when_cb_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = build_first_then_appears(
+            dir.path(),
+            "cb_appears",
+            SamBuilder::new().header.clone(),
+            |pair| pair,
+            |pair| pair.attr("CB", "AAAACCCC"),
+        );
+        let out = dir.path().join("out.bam");
+        let err = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .output_compression(0)
+            .cell_tag(SamTag::CB)
+            .key_types(KeyTypesSpec::None)
+            .sort(&input, &out)
+            .expect_err("CB appearing after a CB-free first record must hard-error under lite");
+        let msg = err.to_string();
+        assert!(msg.contains("--key-types cb"), "expected --key-types cb guidance, got: {msg}");
+    }
+
+    /// MI appears/changes after the first record under `--key-types none` → hard
+    /// error instructing `--key-types mi`.
+    #[test]
+    fn lite_sort_hard_errors_when_mi_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = build_first_then_appears(
+            dir.path(),
+            "mi_appears",
+            SamBuilder::new().header.clone(),
+            |pair| pair,
+            |pair| pair.attr("MI", "7"),
+        );
+        let out = dir.path().join("out.bam");
+        let err = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .output_compression(0)
+            .cell_tag(SamTag::CB)
+            .key_types(KeyTypesSpec::None)
+            .sort(&input, &out)
+            .expect_err("MI appearing after an MI-free first record must hard-error under lite");
+        let msg = err.to_string();
+        assert!(msg.contains("--key-types mi"), "expected --key-types mi guidance, got: {msg}");
+    }
+
+    /// Library differs after the first record under `--key-types none` → hard error
+    /// instructing `--key-types library`. The first pair carries a read group whose
+    /// `LB:` realizes ordinal 1; the second pair carries NO RG tag, realizing
+    /// ordinal 0 — exercising the "header undercounts realized libraries" case
+    /// where a later record drops to an unseen library ordinal.
+    #[test]
+    fn lite_sort_hard_errors_when_library_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        // Header has exactly one read group (with LB) → ordinal 1; the default
+        // SamBuilder "A" group is replaced so the only library is LibAlpha.
+        let mut header = Header::builder()
+            .add_reference_sequence(
+                BString::from("chr1"),
+                Map::<noodles::sam::header::record::value::map::ReferenceSequence>::new(
+                    std::num::NonZeroUsize::new(200_000_000).expect("nonzero"),
+                ),
+            )
+            .build();
+        add_rg_with_library(&mut header, "rgA", "LibAlpha");
+
+        // First pair: RG=rgA (ordinal 1). Second pair: RG points at an id absent
+        // from the header → realized ordinal 0, differing from the first.
+        let input = build_first_then_appears(
+            dir.path(),
+            "library_differs",
+            header,
+            |pair| pair.attr("RG", "rgA"),
+            |pair| pair.attr("RG", "rgUnknown"),
+        );
+        let out = dir.path().join("out.bam");
+        let err = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .output_compression(0)
+            .cell_tag(SamTag::CB)
+            .key_types(KeyTypesSpec::None)
+            .sort(&input, &out)
+            .expect_err("a differing library ordinal must hard-error under lite");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--key-types library"),
+            "expected --key-types library guidance, got: {msg}"
+        );
     }
 }
