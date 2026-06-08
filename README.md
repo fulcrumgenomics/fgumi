@@ -217,17 +217,18 @@ fgumi filter \
 fgumi supports multi-threading and memory management for optimal performance:
 
 - **Threading**: `--threads N` for parallel processing
-- **Memory**: `--queue-memory 768` (plain numbers are MB; supports human-readable formats like `2GB`)
+- **Memory**: `--max-memory 768` (plain numbers are MiB; supports human-readable formats like `2GB`; pass `auto` to size to the host)
 - **Compression**: `--compression-level 1-12` for speed vs size trade-offs
 
 > **Memory Model — Important for fgbio users:**
 > Unlike fgbio's JVM `-Xmx` which sets a hard ceiling on total process memory,
-> fgumi's `--queue-memory` controls pipeline queue backpressure only. Two things
+> fgumi's `--max-memory` controls pipeline queue backpressure only. Two things
 > to be aware of:
 >
-> 1. **Per-thread scaling (default):** `--queue-memory 768 --threads 8` allocates
->    768 MB **per thread** = ~6 GB total queue memory. Use `--queue-memory-per-thread false`
->    for a fixed total budget.
+> 1. **Per-thread scaling (default):** `--max-memory 768 --threads 8` allocates
+>    768 MiB **per thread** = ~6 GB total queue memory. Use `--memory-per-thread false`
+>    for a fixed total budget, or `--max-memory auto` to size the budget to the host
+>    (cgroup-aware, minus `--memory-reserve`) so the command self-throttles instead of OOM-ing.
 > 2. **Queue memory < total process memory:** Actual RSS will be higher due to
 >    UMI data structures, decompressors, thread stacks, and working buffers.
 >

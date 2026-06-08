@@ -41,7 +41,7 @@ Thread allocation is automatically optimized per-command based on workload profi
 
 ### Memory
 
-fgumi's memory model differs significantly from fgbio's JVM `-Xmx`. In particular, `--queue-memory` is per-thread by default and controls only pipeline queue backpressure — actual process memory will be higher. See the [Performance Tuning Guide](performance-tuning.md) for detailed guidance, including a comparison table for fgbio users.
+fgumi's memory model differs significantly from fgbio's JVM `-Xmx`. In particular, `--max-memory` is per-thread by default and controls only pipeline queue backpressure — actual process memory will be higher. On a fixed-RAM host, pass `--max-memory auto` to size the budget to the host. See the [Performance Tuning Guide](performance-tuning.md) for detailed guidance, including a comparison table for fgbio users.
 
 ### Boolean Flags
 

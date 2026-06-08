@@ -8,19 +8,19 @@ If you're used to fgbio's JVM-based memory model (`java -Xmx4g`), there are impo
 
 | | fgbio (JVM) | fgumi |
 |---|---|---|
-| **Memory control** | `-Xmx` sets a hard ceiling on the entire process | `--queue-memory` controls pipeline queue backpressure |
+| **Memory control** | `-Xmx` sets a hard ceiling on the entire process | `--max-memory` controls pipeline queue backpressure |
 | **Enforcement** | Hard limit — JVM throws `OutOfMemoryError` at the ceiling | Soft limit — triggers backpressure to slow producers |
 | **Scope** | Total process memory (heap + off-heap) | Queue memory only; does not cover UMI data structures, decompressors, thread stacks, or working buffers |
-| **Scaling** | Fixed regardless of threads | Per-thread by default (`--queue-memory 768 --threads 8` = ~6 GB) |
-| **Recommendation** | Set once and forget | Monitor RSS and adjust; use `--queue-memory-per-thread false` for a fixed total budget |
+| **Scaling** | Fixed regardless of threads | Per-thread by default (`--max-memory 768 --threads 8` = ~6 GB) |
+| **Recommendation** | Set once and forget | Monitor RSS and adjust; use `--max-memory auto` (or `--memory-per-thread false`) for a host-aware/fixed total budget |
 
-**Key takeaway:** fgumi's actual process memory (RSS) will be higher than the `--queue-memory` value. When estimating memory needs, account for:
-- Queue memory (controlled by `--queue-memory`)
+**Key takeaway:** fgumi's actual process memory (RSS) will be higher than the `--max-memory` value. When estimating memory needs, account for:
+- Queue memory (controlled by `--max-memory`)
 - UMI grouping data structures (scales with UMI diversity and position depth)
 - Per-thread decompressor and compressor instances
 - Thread stacks and I/O buffers
 
-For memory-constrained environments, start with `--queue-memory-per-thread false` and a conservative total budget, then increase if throughput is too low.
+For memory-constrained environments, pass `--max-memory auto` to detect (cgroup-aware) host memory and subtract `--memory-reserve`, so the budget shrinks to fit the host. Alternatively, start with `--memory-per-thread false` and a conservative total budget, then increase if throughput is too low.
 
 ## Threading Options
 
@@ -43,34 +43,46 @@ For memory-constrained environments, start with `--queue-memory-per-thread false
 
 fgumi's unified memory management controls pipeline queue memory to prevent out-of-memory conditions while maintaining throughput.
 
-### Queue Memory Options
+### Memory Options
 
 ```bash
-# Basic usage (768MB per thread - default)
-fgumi filter --queue-memory 768 --queue-memory-per-thread true
+# Basic usage (768 MiB per thread - default; plain numbers are MiB)
+fgumi filter --max-memory 768 --memory-per-thread true
 
 # Human-readable formats
-fgumi filter --queue-memory 2GB
-fgumi filter --queue-memory 1024MiB
+fgumi filter --max-memory 2GB
+fgumi filter --max-memory 1024MiB
 
 # Fixed total memory (no per-thread scaling)
-fgumi filter --queue-memory 4096 --queue-memory-per-thread false
+fgumi filter --max-memory 4096 --memory-per-thread false
+
+# Host-aware: detect (cgroup-aware) RAM and subtract --memory-reserve
+fgumi filter --max-memory auto
+fgumi filter --max-memory auto --memory-reserve 12GiB
 ```
+
+This is the same `--max-memory` surface as `fgumi sort`. The default is opt-in:
+the budget stays 768 MiB/thread unless you pass `auto`, so on a fixed-RAM host
+(e.g. a 30 GiB container at `--threads 16`) prefer `--max-memory auto` or a fixed
+total budget to avoid OOM.
 
 ### Memory Scaling Behavior
 
 | Threads | Per-thread Mode | Fixed Mode |
 |---------|----------------|------------|
-| 1       | 768MB          | 768MB      |
-| 4       | 3GB            | 768MB      |
-| 8       | 6GB            | 768MB      |
-| 16      | 12GB           | 768MB      |
+| 1       | 768 MiB        | 768 MiB    |
+| 4       | 3 GiB          | 768 MiB    |
+| 8       | 6 GiB          | 768 MiB    |
+| 16      | 12 GiB         | 768 MiB    |
 
-### Memory Validation
+With `--max-memory auto`, the total budget is instead `host RAM − reserve`
+(divided across threads when per-thread), so it never scales past the host.
 
-- **System check**: Warns if requesting >90% of available system memory
-- **Overflow protection**: Prevents integer overflow with checked arithmetic
-- **Decimal support**: Accepts formats like `1.5GB` in addition to integers
+### Deprecated flags
+
+`--queue-memory`, `--queue-memory-per-thread`, and `--queue-memory-limit-mb`
+remain accepted as hidden aliases of `--max-memory` / `--memory-per-thread` for
+backward compatibility, but new scripts should use the `--max-memory` flags.
 
 ## Compression Options
 
@@ -157,7 +169,7 @@ before spending on higher provisioned throughput.
 ```bash
 fgumi filter \
   --threads 16 \
-  --queue-memory 1GB \
+  --max-memory 1GB \
   --compression-level 3 \
   --input large_dataset.bam \
   --output filtered.bam
@@ -174,8 +186,8 @@ fgumi filter \
 ```bash
 fgumi filter \
   --threads 8 \
-  --queue-memory 512 \
-  --queue-memory-per-thread false \
+  --max-memory 512 \
+  --memory-per-thread false \
   --compression-level 6 \
   --input dataset.bam \
   --output filtered.bam
@@ -192,7 +204,7 @@ fgumi filter \
 ```bash
 fgumi filter \
   --threads 8 \
-  --queue-memory 2GB \
+  --max-memory 2GB \
   --compression-level 1 \
   --input dataset.bam \
   --output filtered.bam
@@ -209,7 +221,7 @@ fgumi filter \
 fgumi filter \
   --async-reader \
   --threads 4 \
-  --queue-memory 512 \
+  --max-memory 512 \
   --compression-level 9 \
   --input dataset.bam \
   --output filtered.bam
@@ -226,7 +238,7 @@ fgumi filter \
 
 ```bash
 fgumi filter \
-  --queue-memory 256 \
+  --max-memory 256 \
   --compression-level 1 \
   --input small_test.bam \
   --output test_output.bam
@@ -294,7 +306,7 @@ With `--deadlock-recover`, the pipeline progressively doubles queue memory limit
 ### Memory Usage
 - Monitor system memory usage during execution
 - Watch for "exceeds available memory" warnings
-- Adjust `--queue-memory` if seeing swap activity
+- Adjust `--max-memory` if seeing swap activity (or pass `--max-memory auto`)
 
 ### Thread Utilization
 - Use `htop` or similar to monitor CPU usage
@@ -310,13 +322,13 @@ With `--deadlock-recover`, the pipeline progressively doubles queue memory limit
 ## Troubleshooting
 
 ### Out of Memory Errors
-1. Reduce `--queue-memory`
-2. Set `--queue-memory-per-thread false` for fixed limits
+1. Pass `--max-memory auto` to size the budget to the host, or reduce `--max-memory`
+2. Set `--memory-per-thread false` for a fixed total budget
 3. Reduce `--threads`
 
 ### Poor Performance
 1. Increase `--threads` if CPU usage is low
-2. Increase `--queue-memory` if I/O bound
+2. Increase `--max-memory` if I/O bound
 3. Reduce `--compression-level` if CPU bound
 4. Check OS readahead and EBS throughput if disk I/O is the bottleneck (see [I/O and Storage Tuning](#io-and-storage-tuning))
 
@@ -333,7 +345,7 @@ If a command hangs without producing output:
 Requested memory 16GB exceeds 90% of system memory (14.4GB)
 ```
 - Reduce memory allocation or add more RAM
-- Consider using `--queue-memory-per-thread false`
+- Consider using `--memory-per-thread false` (or `--max-memory auto`)
 
 ## Command-Specific Considerations
 
@@ -384,14 +396,20 @@ Requested memory 16GB exceeds 90% of system memory (14.4GB)
 
 ## Migration from Legacy Parameters
 
-If using deprecated `--queue-memory-limit-mb`:
+The `--queue-memory`, `--queue-memory-per-thread`, and `--queue-memory-limit-mb`
+flags are deprecated (but still accepted as hidden aliases). Migrate to the
+`--max-memory` family, which matches `fgumi sort`:
 
 ```bash
 # Old (deprecated)
 fgumi group --queue-memory-limit-mb 4096
+fgumi group --queue-memory 4096 --queue-memory-per-thread false
 
 # New (recommended)
-fgumi group --queue-memory 4096 --queue-memory-per-thread false
+fgumi group --max-memory 4096 --memory-per-thread false
+
+# Or let fgumi size the budget to the host:
+fgumi group --max-memory auto
 ```
 
-The new parameters provide better control and human-readable formats while maintaining backward compatibility.
+The new parameters provide host-aware (`auto`) sizing and human-readable formats while maintaining backward compatibility.
