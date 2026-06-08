@@ -2085,11 +2085,7 @@ mod tests {
             index_threshold: 100,
             no_umi: false,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions {
-                queue_memory: "768".to_string(),
-                queue_memory_per_thread: true,
-                queue_memory_limit_mb: None,
-            },
+            queue_memory: QueueMemoryOptions::default(),
             allow_unmapped: false,
             parallel_group_min_templates: None,
             #[cfg(feature = "memory-debug")]
