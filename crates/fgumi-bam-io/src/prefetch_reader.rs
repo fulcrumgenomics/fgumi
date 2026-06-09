@@ -180,7 +180,7 @@ impl PrefetchReader {
         inner: R,
         chunk_size: usize,
         prefetch_depth: usize,
-        hint_fd: Option<i32>,
+        hint_fd: Option<crate::os_hints::HintFd>,
     ) -> Self {
         assert!(chunk_size > 0, "PrefetchReader chunk_size must be > 0");
         assert!(prefetch_depth > 0, "PrefetchReader prefetch_depth must be > 0");
@@ -188,7 +188,10 @@ impl PrefetchReader {
         let (tx, rx) = bounded::<Item>(prefetch_depth);
         let handle = thread::Builder::new()
             .name("fgumi-prefetch".to_string())
-            .spawn(move || producer_main(inner, chunk_size, hint_fd, &tx))
+            // The producer thread owns `hint_fd` for its entire lifetime (the
+            // duplicated descriptor must stay open while WILLNEED hints are
+            // issued) and lends a reference down the call chain.
+            .spawn(move || producer_main(inner, chunk_size, hint_fd.as_ref(), &tx))
             .expect("failed to spawn fgumi-prefetch thread");
 
         Self {
@@ -220,7 +223,12 @@ impl PrefetchReader {
 /// Entry point for the producer thread. Wraps [`producer_loop`] so that a
 /// panic inside the inner reader surfaces on the consumer side as an
 /// [`io::Error`] instead of a silently-truncated stream.
-fn producer_main<R: Read>(inner: R, chunk_size: usize, hint_fd: Option<i32>, tx: &Sender<Item>) {
+fn producer_main<R: Read>(
+    inner: R,
+    chunk_size: usize,
+    hint_fd: Option<&crate::os_hints::HintFd>,
+    tx: &Sender<Item>,
+) {
     let tx_for_panic = tx.clone();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         producer_loop(inner, chunk_size, hint_fd, tx);
@@ -253,7 +261,7 @@ fn producer_main<R: Read>(inner: R, chunk_size: usize, hint_fd: Option<i32>, tx:
 fn producer_loop<R: Read>(
     mut inner: R,
     chunk_size: usize,
-    hint_fd: Option<i32>,
+    hint_fd: Option<&crate::os_hints::HintFd>,
     tx: &Sender<Item>,
 ) {
     let mut position: i64 = 0;
@@ -299,7 +307,7 @@ fn producer_loop<R: Read>(
         // position. The call is non-blocking — the kernel initiates the I/O
         // and returns immediately.
         if let Some(fd) = hint_fd {
-            crate::os_hints::advise_willneed_raw(fd, position, WILLNEED_LOOKAHEAD);
+            crate::os_hints::advise_willneed(fd, position, WILLNEED_LOOKAHEAD);
         }
 
         buf.truncate(filled);

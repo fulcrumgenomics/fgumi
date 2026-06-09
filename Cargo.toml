@@ -22,7 +22,7 @@ fgumi-sort = { version = "0.2.0", path = "crates/fgumi-sort" }
 fgumi-tag = { version = "0.2.0", path = "crates/fgumi-tag" }
 fgumi-umi = { version = "0.2.0", path = "crates/fgumi-umi" }
 bytemuck = { version = "1.14", features = ["derive"] }
-wide = "1.3"
+wide = "1.5"
 
 [package]
 name = "fgumi"
@@ -43,19 +43,19 @@ rust-version.workspace = true
 clap = { version = "4", features = ["derive", "string"] }
 log = "0"
 thiserror = "2"
-noodles = { version = "0.106.0", features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
-noodles-bgzf = { version = "0.46.0", features = ["libdeflate"] }
-mimalloc = { version = "0.1.48", default-features = false }
+noodles = { version = "0.111.0", features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
+noodles-bgzf = { version = "0.47.0", features = ["libdeflate"] }
+mimalloc = { version = "0.1.52", default-features = false }
 libmimalloc-sys = { version = "0.1.44", features = ["extended"] }
 env_logger = "0.11.8"
 enum_dispatch = "0.3.13"
 anyhow = "1.0.102"
-read-structure = "0.2.0"
+read-structure = "0.2.0" # held at 0.2 because 0.3 is a breaking API + behavior change (zero-length-read handling) that needs a dedicated migration PR
 bstr = "1.12.1"
 bytes = "1"
 fgoxide = "0.6.0"
 tempfile = "3.3.0"
-lru = "0.16.3"
+lru = "0.18.0"
 crc32fast = "1.4"
 crossbeam-channel = "0.5"
 crossbeam-queue = "0.3"
@@ -70,8 +70,8 @@ csv = "1.1"
 memchr = "2"
 statrs = "0.18"
 bytesize = "2.3"
-sysinfo = { version = "0.38", default-features = false, features = ["system"] } # unconditionally used by validate_against_system_memory
-fs4 = { version = "0.13", default-features = false, features = ["sync"] } # cross-platform filesystem free-space queries
+sysinfo = { version = "0.38", default-features = false, features = ["system"] } # unconditionally used by validate_against_system_memory; held at 0.38 because sysinfo >=0.39 requires rustc 1.95 > our MSRV (rust-toolchain.toml pins 1.93)
+fs4 = { version = "1.1", default-features = false, features = ["sync"] } # cross-platform filesystem free-space queries
 num_cpus = "1.16"
 rayon = "1.10"
 approx = "0.5.1"
@@ -95,7 +95,7 @@ fgumi-sort = { workspace = true }
 mach2 = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.29", default-features = false, features = ["fs"] }
+nix = { version = "0.31", default-features = false, features = ["fs"] }
 
 [features]
 default = ["simplex", "duplex", "codec"]
@@ -122,7 +122,7 @@ rstest = "0"
 proptest = "1.10"
 criterion = { version = "0.8", features = ["html_reports"] }
 fgumi-raw-bam = { workspace = true, features = ["test-utils", "noodles"] }
-noodles = { version = "0.106.0", features = ["bam", "sam"] }
+noodles = { version = "0.111.0", features = ["bam", "sam"] }
 
 [[bench]]
 name = "core_functions"
