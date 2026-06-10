@@ -78,7 +78,13 @@ approx = "0.5.1"
 ahash = "0.8"
 bytemuck = { workspace = true }
 rand_distr = "0.6"
-flate2 = "1.1"
+# `zlib-rs` selects flate2's fast Rust-zlib DEFLATE backend for gzipped FASTQ
+# decompression (used by `fgumi extract`). It must be requested explicitly: the
+# backend is otherwise chosen by Cargo feature unification, and a transitive
+# change can silently drop it back to the ~2x slower `miniz_oxide` default —
+# which regressed extract throughput ~1.6x at high thread counts. Keep this
+# feature pinned so the producer-thread decompressor stays on zlib-rs.
+flate2 = { version = "1.1", features = ["zlib-rs"] }
 dhat = { version = "0.3", optional = true }
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
 fgumi-dna = { workspace = true }
