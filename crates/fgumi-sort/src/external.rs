@@ -3255,9 +3255,12 @@ pub fn extract_template_key_inline(
             );
         }
 
-        // Completely unmapped - sort to end
+        // Completely unmapped - sort to end. Still carry the read's library and
+        // MI lanes so a fully-unmapped read realizes the same tertiary as its
+        // mapped, same-library peers (otherwise the dropped-lane verify treats a
+        // single-library file as if the library varied; see #375).
         let is_read2 = (flag & 0x80) != 0; // is_last_segment flag
-        return TemplateKey::unmapped(name_hash, cb_hash, is_read2);
+        return TemplateKey::unmapped(name_hash, cb_hash, library, mi, is_read2);
     }
 
     // Calculate unclipped 5' position for this read (zero-alloc: reads cigar directly)
@@ -5756,5 +5759,111 @@ mod tests {
             msg.contains("--key-types library"),
             "expected --key-types library guidance, got: {msg}"
         );
+    }
+
+    /// Regression (#375): a single-library header with MULTIPLE read groups (all
+    /// sharing one `LB:`) must sort under auto `--key-types` WITHOUT a false
+    /// dropped-lane "library" violation.
+    ///
+    /// Every read group realizes the SAME library ordinal, so
+    /// `distinct_header_ordinals() == 1`, the tertiary library lane is genuinely
+    /// constant, and auto correctly drops it. Decode-time verify must therefore
+    /// see a constant library ordinal across records even though they carry
+    /// DIFFERENT (but same-library) RG tags. Mirrors production multi-lane WGS
+    /// BAMs (e.g. 12 `@RG` lines, one `LB`) that regressed to a spurious
+    /// "carries a library value absent from the input's first record" error.
+    #[test]
+    fn auto_single_library_multi_readgroup_sorts_without_false_violation() {
+        let dir = tempfile::tempdir().unwrap();
+        // Build the header from scratch (no SamBuilder default read group, which
+        // would add a second library) so the ONLY libraries are the ones we add.
+        let mut header = Header::builder()
+            .add_reference_sequence(
+                BString::from("chr1"),
+                Map::<noodles::sam::header::record::value::map::ReferenceSequence>::new(
+                    std::num::NonZeroUsize::new(200_000_000).expect("nonzero"),
+                ),
+            )
+            .build();
+        // Two read groups, SAME library -> exactly one distinct library ordinal.
+        add_rg_with_library(&mut header, "rgA", "LibAlpha");
+        add_rg_with_library(&mut header, "rgB", "LibAlpha");
+        assert_eq!(
+            LibraryLookup::from_header(&header).distinct_header_ordinals(),
+            1,
+            "two read groups sharing one library must realize a single ordinal"
+        );
+
+        // Pairs split across the two read groups; both resolve to LibAlpha.
+        let input = build_mode_bam(
+            dir.path(),
+            "single_lib_multi_rg",
+            header,
+            |pair, i| pair.attr("RG", if i % 2 == 0 { "rgA" } else { "rgB" }),
+            |pair, lane| pair.attr("RG", if lane % 2 == 0 { "rgA" } else { "rgB" }),
+        );
+        let out = dir.path().join("out.bam");
+        RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .output_compression(0)
+            .cell_tag(SamTag::CB)
+            .key_types(KeyTypesSpec::Auto)
+            .sort(&input, &out)
+            .expect(
+                "single-library input with multiple read groups must sort without a \
+                 false dropped-lane library violation",
+            );
+    }
+
+    /// Regression (#375): a single-library input that contains a COMPLETELY
+    /// UNMAPPED read (both mates unmapped) must sort under auto `--key-types`
+    /// WITHOUT a spurious dropped-lane "library" violation.
+    ///
+    /// `extract_template_key_inline` packs the read's library ordinal into the
+    /// full key for mapped reads (and for unmapped-with-mapped-mate reads), but
+    /// `TemplateKey::unmapped` zeroed the whole `tertiary` lane — so a
+    /// fully-unmapped read carrying a valid RG realized library ordinal 0 while
+    /// its mapped, same-library peers realized ordinal 1. With a single library
+    /// the auto path drops the (provably-constant) library lane, and decode-time
+    /// verify then saw 1 (the mapped first record) vs 0 (the unmapped read) and
+    /// hard-errored with "carries a library value absent from the input's first
+    /// record". Reproduces the 1kg WGS regression (unmapped pairs at the tail).
+    #[test]
+    fn auto_single_library_unmapped_read_sorts_without_false_violation() {
+        let dir = tempfile::tempdir().unwrap();
+        // Single read group with a library -> exactly one library ordinal, so the
+        // auto path drops the tertiary library lane and relies on decode verify.
+        let mut header = Header::builder()
+            .add_reference_sequence(
+                BString::from("chr1"),
+                Map::<noodles::sam::header::record::value::map::ReferenceSequence>::new(
+                    std::num::NonZeroUsize::new(200_000_000).expect("nonzero"),
+                ),
+            )
+            .build();
+        add_rg_with_library(&mut header, "rgA", "LibAlpha");
+        assert_eq!(LibraryLookup::from_header(&header).distinct_header_ordinals(), 1);
+
+        let mut builder = SamBuilder::new();
+        builder.header = header;
+        // A normal mapped pair (library ordinal 1) ...
+        let _ =
+            builder.add_pair().name("mapped").start1(1_000).start2(1_100).attr("RG", "rgA").build();
+        // ... and a COMPLETELY unmapped pair carrying the same RG. Its realized
+        // library ordinal is also 1, but the old unmapped key zeroed it.
+        let _ =
+            builder.add_pair().name("unmapped").unmapped1().unmapped2().attr("RG", "rgA").build();
+        let input = dir.path().join("in.bam");
+        builder.write_bam(&input).expect("write bam");
+
+        let out = dir.path().join("out.bam");
+        RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .output_compression(0)
+            .cell_tag(SamTag::CB)
+            .key_types(KeyTypesSpec::Auto)
+            .sort(&input, &out)
+            .expect(
+                "a completely-unmapped read in a single-library input must not trigger a \
+                 false dropped-lane library violation",
+            );
     }
 }

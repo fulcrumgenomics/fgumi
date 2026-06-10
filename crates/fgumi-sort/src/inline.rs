@@ -684,13 +684,32 @@ impl TemplateKey {
     }
 
     /// Create a key for completely unmapped records.
+    ///
+    /// `library` and `mi` are packed into `tertiary` identically to
+    /// [`TemplateKey::new`] so a fully-unmapped read realizes the same library
+    /// and MI lanes as its mapped, same-template peers. Zeroing `tertiary` here
+    /// (the prior behavior) made an unmapped read carrying a valid RG realize
+    /// library ordinal 0 while its mapped same-library peers realized ordinal N,
+    /// which the auto `--key-types` dropped-lane verify then flagged as a
+    /// spurious "library" violation on single-library inputs (#375).
     #[must_use]
-    pub fn unmapped(name_hash: u64, cb_hash: u64, is_read2: bool) -> Self {
+    pub fn unmapped(
+        name_hash: u64,
+        cb_hash: u64,
+        library: u32,
+        mi: (u64, bool),
+        is_read2: bool,
+    ) -> Self {
+        // Pack tertiary identically to `new`: library (high 16), mi_value
+        // (middle), mi_suffix (bit 0).
+        let tertiary = ((u64::from(library) & 0xFFFF) << 48)
+            | ((mi.0 & 0xFFFF_FFFF_FFFF) << 1)
+            | u64::from(!mi.1);
         Self {
             primary: u64::MAX,
             secondary: u64::MAX,
             cb_hash,
-            tertiary: 0,
+            tertiary,
             name_hash_upper: (name_hash << 1) | u64::from(is_read2),
         }
     }
@@ -2540,11 +2559,26 @@ mod tests {
 
     #[test]
     fn test_template_key_unmapped_with_cb_hash() {
-        let key = TemplateKey::unmapped(12345, 0xCAFE, false);
+        let key = TemplateKey::unmapped(12345, 0xCAFE, 0, (0, true), false);
         assert_eq!(key.primary, u64::MAX);
         assert_eq!(key.secondary, u64::MAX);
         assert_eq!(key.cb_hash, 0xCAFE, "unmapped should preserve cb_hash");
-        assert_eq!(key.tertiary, 0);
+        assert_eq!(key.tertiary, 0, "no library/MI -> zero tertiary");
+    }
+
+    /// `TemplateKey::unmapped` must pack the library ordinal (and MI) into
+    /// `tertiary` exactly as `TemplateKey::new` does, so a fully-unmapped read
+    /// realizes the same lanes as its mapped, same-library peers (#375).
+    #[test]
+    fn test_template_key_unmapped_packs_library_and_mi() {
+        let unmapped = TemplateKey::unmapped(1, 0, 3, (7, true), false);
+        assert_eq!(unmapped.tertiary >> 48, 3, "library ordinal occupies tertiary high-16");
+        // Same library + MI fed to `new` must produce the same tertiary.
+        let mapped = TemplateKey::new(0, 100, false, 0, 200, false, 0, 3, (7, true), 1, false);
+        assert_eq!(
+            unmapped.tertiary, mapped.tertiary,
+            "unmapped must pack library/MI identically to TemplateKey::new"
+        );
     }
 
     #[test]
