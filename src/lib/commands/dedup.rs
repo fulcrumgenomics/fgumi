@@ -19,48 +19,33 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
-use crate::grouper::{
-    FilterMetrics, RawPositionGroup, RecordPositionGrouper, build_templates_from_records,
-};
-use crate::logging::OperationTimer;
+use crate::batch_weight::BatchWeight;
+use crate::grouper::{FilterMetrics, RawPositionGroup, build_templates_from_records};
 use crate::metrics::group::FamilySizeMetrics;
-use crate::read_info::LibraryIndex;
 use crate::sam::SamTag;
-use crate::sam::is_template_coordinate_sorted;
 use crate::template::Template;
 use crate::umi::{UmiValidation, validate_umi};
-use crate::unified_pipeline::{
-    BatchWeight, GroupKeyConfig, Grouper, MemoryEstimate,
-    run_bam_pipeline_from_reader_with_mi_assign,
-};
-use crate::validation::validate_file_exists;
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fgoxide::io::DelimFile;
-use fgumi_bam_io::{create_bam_reader_for_pipeline_with_opts, is_stdin_path};
+use fgumi_bam_io::MemoryEstimate;
 
-use log::info;
-use noodles::sam::Header;
-use noodles::sam::alignment::record::data::field::Tag;
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    build_pipeline_config, parse_bool,
+    parse_bool,
 };
 use crate::sam::TC_TAG;
 use fgumi_raw_bam;
 use fgumi_raw_bam::RawRecordView;
 
 /// Duplicate flag bit in SAM flags (0x400)
-const DUPLICATE_FLAG: u16 = 0x400;
+pub(crate) const DUPLICATE_FLAG: u16 = 0x400;
 
 //////////////////////////////////////////////////////////////////////////////
 // Metrics
@@ -155,11 +140,11 @@ impl From<&DedupMetrics> for DedupMetricsOutput {
 
 /// Metrics collected per position group, aggregated after pipeline completion.
 #[derive(Default, Debug)]
-struct CollectedDedupMetrics {
+pub(crate) struct CollectedDedupMetrics {
     /// Dedup-specific metrics
-    dedup_metrics: DedupMetrics,
+    pub(crate) dedup_metrics: DedupMetrics,
     /// Family size counts
-    family_sizes: AHashMap<usize, u64>,
+    pub(crate) family_sizes: AHashMap<usize, u64>,
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -198,23 +183,45 @@ impl MemoryEstimate for ProcessedDedupGroup {
     }
 }
 
+/// A batch of `ProcessedDedupGroup`s carrying a monotonic ordinal so the
+/// downstream `mi_assign` + `serialize` steps preserve input order. Same
+/// shape as `BatchedProcessedPositionGroups` (used by group); see
+/// `pipeline::steps::group::position` for the rationale.
+pub struct BatchedProcessedDedupGroups {
+    pub batch_serial: u64,
+    pub groups: Vec<ProcessedDedupGroup>,
+}
+
+impl crate::pipeline::core::item::HeapSize for BatchedProcessedDedupGroups {
+    fn heap_size(&self) -> usize {
+        self.groups.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>()
+            + self.groups.capacity() * std::mem::size_of::<ProcessedDedupGroup>()
+    }
+}
+
+impl crate::pipeline::core::item::Ordered for BatchedProcessedDedupGroups {
+    fn ordinal(&self) -> u64 {
+        self.batch_serial
+    }
+}
+
 //////////////////////////////////////////////////////////////////////////////
 // Configuration
 //////////////////////////////////////////////////////////////////////////////
 
 /// Configuration for template filtering during deduplication.
 #[derive(Clone)]
-struct DedupFilterConfig {
+pub(crate) struct DedupFilterConfig {
     /// UMI tag bytes (e.g., [b'R', b'X']).
-    umi_tag: [u8; 2],
+    pub(crate) umi_tag: [u8; 2],
     /// Minimum mapping quality.
-    min_mapq: u8,
+    pub(crate) min_mapq: u8,
     /// Whether to include non-PF reads.
-    include_non_pf: bool,
+    pub(crate) include_non_pf: bool,
     /// Minimum UMI length.
-    min_umi_length: Option<usize>,
+    pub(crate) min_umi_length: Option<usize>,
     /// Skip UMI validation (position-only grouping).
-    no_umi: bool,
+    pub(crate) no_umi: bool,
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -514,23 +521,23 @@ fn assign_umi_groups_for_indices(
         let processed_umi = if no_umi {
             String::new()
         } else {
-            // Prefer the UMI position cached during the parallel Decode step
-            // (enabled via GroupKeyConfig::with_umi_tag). The fallback exists
-            // for templates built outside the Decode path and for cases where
-            // the cache was disabled.
-            let umi_bytes = if let Some(cached) = template.cached_umi() {
-                cached
-            } else if let Some(r1_raw) = template.r1() {
-                let aux = fgumi_raw_bam::aux_data_slice(r1_raw);
-                fgumi_raw_bam::find_string_tag(aux, raw_tag)
-                    .ok_or_else(|| anyhow::anyhow!("Missing UMI tag"))?
-            } else if let Some(r2_raw) = template.r2() {
-                let aux = fgumi_raw_bam::aux_data_slice(r2_raw);
-                fgumi_raw_bam::find_string_tag(aux, raw_tag)
-                    .ok_or_else(|| anyhow::anyhow!("Missing UMI tag"))?
-            } else {
-                bail!("Template has no reads");
-            };
+            // Look for the UMI tag on R1 first, then fall back to R2. A
+            // template whose R1 is present but carries no tag must still pick
+            // up a tag on R2 rather than report "No UMI tag found".
+            let umi_bytes = template
+                .r1()
+                .and_then(|r1_raw| {
+                    fgumi_raw_bam::find_string_tag(fgumi_raw_bam::aux_data_slice(r1_raw), raw_tag)
+                })
+                .or_else(|| {
+                    template.r2().and_then(|r2_raw| {
+                        fgumi_raw_bam::find_string_tag(
+                            fgumi_raw_bam::aux_data_slice(r2_raw),
+                            raw_tag,
+                        )
+                    })
+                });
+            let umi_bytes = umi_bytes.ok_or_else(|| anyhow::anyhow!("No UMI tag found"))?;
             let umi_str = std::str::from_utf8(umi_bytes)
                 .map_err(|e| anyhow::anyhow!("Invalid UTF-8: {e}"))?;
             let is_r1_earlier = if let (Some(r1), Some(r2)) = (template.r1(), template.r2()) {
@@ -687,7 +694,7 @@ fn mark_template_as_duplicate(template: &mut Template, dedup_metrics: &mut Dedup
 //////////////////////////////////////////////////////////////////////////////
 
 /// Process a position group for deduplication.
-fn process_position_group(
+pub(crate) fn process_position_group(
     group: RawPositionGroup,
     filter_config: &DedupFilterConfig,
     assigner: &dyn UmiAssigner,
@@ -827,7 +834,7 @@ fn process_position_group(
 //////////////////////////////////////////////////////////////////////////////
 
 /// UMI-aware duplicate marking command.
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(
     name = "dedup",
     about = "\x1b[38;5;151m[DEDUP]\x1b[0m         \x1b[36mMark or remove PCR duplicates using UMI information\x1b[0m",
@@ -860,27 +867,6 @@ genomic position are partitioned by cell barcode before deduplication. This ensu
 different cells are never marked as duplicates of each other, even if they share a UMI sequence and
 mapping position. The cell barcode is read from the standard `CB` tag. No
 correction or error-handling is performed on cell barcodes; they must be corrected upstream.
-
-# Memory
-
-dedup streams the input and processes one genomic position group at a time, so memory scales with
-parallelism, not input size. The two contributors are:
-
-  - Pipeline queue: bounded by --max-memory, which is per thread by default. With the default
-    (768 MiB/thread), --threads 16 budgets ~12 GiB of queue alone and --threads 8 budgets ~6 GiB.
-  - Per-worker working set: each worker transiently holds the templates of the group it is
-    processing (building, scoring, sorting). This is on top of the queue budget, so peak RSS is
-    higher than --max-memory; empirically ~1-2 GiB/thread on WGS-scale input.
-
-A practical rule of thumb for WGS-scale input is to budget ~2 GiB per thread of total RSS. On a
-fixed-RAM host, prefer one of:
-
-  fgumi dedup ... --threads 16 --max-memory auto              # detect host RAM, self-throttle
-  fgumi dedup ... --threads 16 --max-memory 16G --memory-per-thread false   # fixed total budget
-
---max-memory is a budget for the controllable consumer (the queue), not a hard RSS cap: a single
-pathological high-coverage position group is still processed whole. The legacy --queue-memory /
---queue-memory-per-thread flags remain accepted as hidden aliases.
 "#
 )]
 pub struct MarkDuplicates {
@@ -948,288 +934,29 @@ pub struct MarkDuplicates {
 
 impl Command for MarkDuplicates {
     fn execute(&self, command_line: &str) -> Result<()> {
-        // Validate strategy/min-umi-length combination
+        use crate::pipeline::chains::{ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag};
+
+        // Top-level CLI-flag validations that produce a friendly error before
+        // the pipeline is even constructed.
         if self.min_umi_length.is_some() && matches!(self.strategy, Strategy::Paired) {
             bail!("Paired strategy cannot be used with --min-umi-length");
         }
-
-        // Validate --no-umi is not used with paired strategy
         if self.no_umi && matches!(self.strategy, Strategy::Paired) {
             bail!("--no-umi cannot be used with --strategy paired");
         }
-
-        // Handle --no-umi mode: force identity strategy
-        let (effective_strategy, no_umi_edits_override) = if self.no_umi {
-            if !matches!(self.strategy, Strategy::Identity) {
-                info!("--no-umi mode: overriding strategy to identity");
-            }
-            (Strategy::Identity, true)
-        } else {
-            (self.strategy, false)
+        let spec = ChainSpec {
+            async_reader: self.io.async_reader,
+            stages: vec![Stage::Dedup],
+            source: SourceSpec::Bam(self.io.input.clone()),
+            sink: SinkSpec::Bam(self.io.output.clone()),
+            stage_opts: StageOptionsBag { dedup: Some(self.clone()), ..Default::default() },
+            threading: self.threading.clone(),
+            compression: self.compression.clone(),
+            scheduler: self.scheduler_opts.clone(),
+            queue_memory: self.queue_memory.clone(),
+            command_line: command_line.to_string(),
         };
-
-        // Validate input file exists
-        if !is_stdin_path(&self.io.input) {
-            validate_file_exists(&self.io.input, "input BAM file")?;
-        }
-
-        let min_mapq: u8 = self.min_map_q.unwrap_or(0);
-
-        // Identity strategy requires edits=0, others use the configured value
-        // Also force edits=0 in no-umi mode
-        let effective_edits =
-            if no_umi_edits_override || matches!(effective_strategy, Strategy::Identity) {
-                0
-            } else {
-                self.edits
-            };
-
-        let timer = OperationTimer::new("Marking duplicates");
-
-        info!("Starting dedup");
-        info!("Input: {}", self.io.input.display());
-        info!("Output: {}", self.io.output.display());
-        info!("Strategy: {effective_strategy:?}");
-        info!("Edits: {effective_edits}");
-        info!("Remove duplicates: {}", self.remove_duplicates);
-        if self.no_umi {
-            info!("No-UMI mode: deduplicating by position only");
-        }
-        if matches!(effective_strategy, Strategy::Adjacency | Strategy::Paired) {
-            info!("Index threshold: {}", self.index_threshold);
-        }
-        info!("{}", self.threading.log_message());
-
-        // Open input BAM
-        let (reader, header) = create_bam_reader_for_pipeline_with_opts(
-            &self.io.input,
-            self.io.pipeline_reader_opts(),
-        )?;
-
-        if !is_template_coordinate_sorted(&header) {
-            bail!(
-                "Input BAM must be template-coordinate sorted (header must advertise \
-                 SO:unsorted, GO:query, and SS:template-coordinate).\n\n\
-                 To prepare your BAM file, run:\n  \
-                 fgumi zipper -i mapped.bam -u unmapped.bam -r reference.fa -o merged.bam\n  \
-                 fgumi sort -i merged.bam -o sorted.bam --order template-coordinate"
-            );
-        }
-        info!("Template-coordinate sorted");
-
-        // Add @PG record
-        let header = crate::commands::common::add_pg_record(header, command_line)?;
-
-        // Tag constants per SAM specification
-        let raw_tag = SamTag::RX;
-        let cell_tag = Tag::from(SamTag::CB);
-        let assign_tag_bytes: [u8; 2] = *SamTag::MI;
-
-        let filter_config = DedupFilterConfig {
-            umi_tag: *raw_tag,
-            min_mapq,
-            include_non_pf: self.include_non_pf_reads,
-            min_umi_length: self.min_umi_length,
-            no_umi: self.no_umi,
-        };
-
-        // Shared state for collecting metrics
-        let collected_metrics: Arc<Mutex<CollectedDedupMetrics>> =
-            Arc::new(Mutex::new(CollectedDedupMetrics::default()));
-
-        // Clone values needed by closures
-        let strategy = effective_strategy;
-        let index_threshold = self.index_threshold;
-        let min_umi_length = self.min_umi_length;
-        let no_umi = self.no_umi;
-        let remove_duplicates = self.remove_duplicates;
-        let collected_metrics_clone = Arc::clone(&collected_metrics);
-
-        // Configure pipeline
-        let num_threads = self.threading.num_threads();
-        let mut pipeline_config = build_pipeline_config(
-            &self.scheduler_opts,
-            &self.compression,
-            &self.queue_memory,
-            num_threads,
-        )?;
-        info!("Scheduler: {:?}", self.scheduler_opts.strategy());
-        info!("Using pipeline with {num_threads} threads");
-
-        let library_index = LibraryIndex::from_header(&header);
-        // Cache the UMI tag's value position on each DecodedRecord so the
-        // Process step's UMI-assignment pass can slice the value without
-        // re-scanning aux data (issue #334). In `--no-umi` mode the
-        // assignment site emits `String::new()` and never reads the cache,
-        // so populating it during decode would be pure overhead.
-        let group_key_config = GroupKeyConfig::new(library_index, cell_tag);
-        pipeline_config.group_key_config = Some(if self.no_umi {
-            group_key_config
-        } else {
-            group_key_config.with_umi_tag(*raw_tag)
-        });
-
-        // Cumulative MoleculeId counter, advanced **only** by the
-        // serial-ordered MI Assign hook installed below. Mirrors the
-        // pattern used by `fgumi group`; see
-        // `docs/design/deterministic-mi-numbering.md` for why this lives
-        // in the hook rather than in `serialize_fn`. The `Arc` is owned
-        // by the hook closure; nothing outside the closure needs to read
-        // its final value.
-        let next_mi_base_for_hook = Arc::new(AtomicU64::new(0));
-
-        // Run the pipeline
-        let _records_processed = run_bam_pipeline_from_reader_with_mi_assign(
-            pipeline_config,
-            reader,
-            header,
-            &self.io.output,
-            None,
-            // Grouper factory - use with_secondary_supplementary to include all reads
-            move |_header: &Header| {
-                Box::new(RecordPositionGrouper::with_secondary_supplementary())
-                    as Box<dyn Grouper<Group = RawPositionGroup> + Send>
-            },
-            // Process function (parallel) — builds templates from raw records
-            move |group: RawPositionGroup| -> io::Result<ProcessedDedupGroup> {
-                let assigner = strategy.new_assigner_full(effective_edits, 1, index_threshold);
-                process_position_group(
-                    group,
-                    &filter_config,
-                    assigner.as_ref(),
-                    raw_tag,
-                    min_umi_length,
-                    no_umi,
-                )
-            },
-            // Serialize function (parallel, output ordered by serial numbers)
-            move |processed: ProcessedDedupGroup,
-                  _header: &Header,
-                  output: &mut Vec<u8>|
-                  -> io::Result<u64> {
-                // Collect metrics
-                {
-                    let mut agg = collected_metrics_clone.lock();
-                    agg.dedup_metrics.merge(&processed.dedup_metrics);
-                    for (size, count) in &processed.family_sizes {
-                        *agg.family_sizes.entry(*size).or_insert(0) += count;
-                    }
-                }
-
-                let input_record_count = processed.input_record_count;
-
-                // Templates already carry their final global `MoleculeId`s
-                // because the MI Assign hook (installed below) ran in
-                // serial order before this closure was called, so we pass
-                // `base_mi = 0` to `write_with_offset`.
-                // Pre-allocate output buffer: ~2 records/template × ~400 bytes/record
-                output.reserve(processed.templates.len() * 2 * 400);
-                let mut scratch = Vec::with_capacity(512);
-                let mut mi_buf = String::with_capacity(16);
-                for template in &processed.templates {
-                    let mi = template.mi;
-                    let has_mi = mi.is_assigned();
-                    if has_mi {
-                        mi.write_with_offset(0, &mut mi_buf);
-                    }
-                    for raw in template.records() {
-                        // Skip duplicates if remove mode
-                        if remove_duplicates
-                            && (RawRecordView::new(raw).flags() & DUPLICATE_FLAG) != 0
-                        {
-                            continue;
-                        }
-                        if has_mi {
-                            scratch.clear();
-                            scratch.extend_from_slice(raw);
-                            fgumi_raw_bam::update_string_tag(
-                                &mut scratch,
-                                assign_tag_bytes,
-                                mi_buf.as_bytes(),
-                            );
-                            let block_size = scratch.len() as u32;
-                            output.extend_from_slice(&block_size.to_le_bytes());
-                            output.extend_from_slice(&scratch);
-                        } else {
-                            let block_size = raw.len() as u32;
-                            output.extend_from_slice(&block_size.to_le_bytes());
-                            output.extend_from_slice(raw);
-                        }
-                    }
-                }
-
-                Ok(input_record_count)
-            },
-            // mi_assign_fn: called in serial order by the MI Assign zone
-            // before each item's `serialize_fn`. Folds a cumulative offset
-            // into every template's local `MoleculeId`. Advances the counter
-            // by `distinct_mi_count` so the offset matches what `serialize_fn`
-            // emits even when families contain multiple templates.
-            //
-            // `fetch_update` + `checked_add` so wraparound is detected and surfaced
-            // rather than silently reusing MI integers (which would defeat
-            // `MoleculeId::with_offset`'s own overflow check on the per-template add).
-            move |_ord, processed: &mut ProcessedDedupGroup| {
-                let base = next_mi_base_for_hook
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                        current.checked_add(processed.distinct_mi_count)
-                    })
-                    .map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "MoleculeId offset overflow: cumulative MI counter exceeded u64::MAX",
-                        )
-                    })?;
-                for template in &mut processed.templates {
-                    template.mi = template.mi.with_offset(base);
-                }
-                Ok(())
-            },
-        )?;
-
-        // Aggregate metrics
-        let aggregated = Arc::try_unwrap(collected_metrics)
-            .expect("bug: metrics Arc still shared after pipeline join")
-            .into_inner();
-        let final_metrics = aggregated.dedup_metrics;
-        let final_family_sizes = aggregated.family_sizes;
-
-        // Write metrics file
-        if let Some(metrics_path) = &self.metrics {
-            write_dedup_metrics(&final_metrics, metrics_path)?;
-        }
-
-        // Write family size histogram
-        if let Some(histogram_path) = &self.family_size_histogram {
-            write_family_size_histogram(&final_family_sizes, histogram_path)?;
-        }
-
-        // Log summary
-        info!(
-            "Deduplication complete: {} templates ({} unique, {} duplicates, {:.2}% duplicate rate)",
-            final_metrics.total_templates,
-            final_metrics.unique_templates,
-            final_metrics.duplicate_templates,
-            final_metrics.duplicate_rate() * 100.0
-        );
-
-        if final_metrics.missing_tc_tag > 0 {
-            bail!(
-                "{} secondary/supplementary reads are missing the `tc` tag.\n\n\
-                The `tc` tag is required for correct UMI-aware deduplication of \
-                secondary and supplementary alignments. This tag is added by \
-                `fgumi zipper` during the merge of unmapped and mapped BAMs.\n\n\
-                To fix this, re-run your pipeline starting from `fgumi zipper`:\n  \
-                fgumi zipper -i aligned.bam --unmapped unmapped.bam -r reference.fa -o merged.bam\n  \
-                fgumi sort -i merged.bam -o sorted.bam --order template-coordinate\n  \
-                fgumi dedup -i sorted.bam -o deduped.bam",
-                final_metrics.missing_tc_tag
-            );
-        }
-
-        timer.log_completion(final_metrics.total_reads);
-
-        Ok(())
+        crate::pipeline::chains::build_for(spec)?.run()
     }
 }
 
@@ -1237,7 +964,7 @@ impl Command for MarkDuplicates {
 // Metrics writing
 //////////////////////////////////////////////////////////////////////////////
 
-fn write_dedup_metrics(metrics: &DedupMetrics, path: &PathBuf) -> Result<()> {
+pub(crate) fn write_dedup_metrics(metrics: &DedupMetrics, path: &PathBuf) -> Result<()> {
     let output: DedupMetricsOutput = metrics.into();
     DelimFile::default()
         .write_tsv(path, [output])
@@ -1245,7 +972,10 @@ fn write_dedup_metrics(metrics: &DedupMetrics, path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn write_family_size_histogram(family_sizes: &AHashMap<usize, u64>, path: &PathBuf) -> Result<()> {
+pub(crate) fn write_family_size_histogram(
+    family_sizes: &AHashMap<usize, u64>,
+    path: &PathBuf,
+) -> Result<()> {
     let metrics = FamilySizeMetrics::from_size_counts(family_sizes.iter().map(|(&s, &c)| (s, c)));
     DelimFile::default()
         .write_tsv(path, metrics)
@@ -1697,7 +1427,6 @@ mod tests {
             r1_secondaries: None,
             r2_secondaries: None,
             mi: crate::umi::MoleculeId::None,
-            cached_umi_position: None,
         };
 
         assert!(!filter_template(&template, &config, &mut metrics));
@@ -1750,7 +1479,6 @@ mod tests {
             r1_secondaries: Some((2, 3)),
             r2_secondaries: None,
             mi: crate::umi::MoleculeId::None,
-            cached_umi_position: None,
         };
 
         assert!(!filter_template(&template, &config, &mut metrics));

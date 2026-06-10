@@ -11,7 +11,7 @@ use crate::validation::validate_file_exists;
 use anyhow::{Result, bail};
 use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::{RawBamWriter, create_raw_bam_reader, create_raw_bam_writer};
+use fgumi_bam_io::{RawBamWriter, create_raw_bam_reader_with_opts, create_raw_bam_writer};
 use fgumi_raw_bam::{
     RawBamReader, RawRecord, aux_data_slice, find_int_tag, find_string_tag, read_name,
 };
@@ -121,7 +121,8 @@ impl Command for Downsample {
             None => rand::make_rng(),
         };
 
-        let (reader, header) = create_raw_bam_reader(&self.io.input, 1)?;
+        let (reader, header) =
+            create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())?;
 
         // Validate header - input must be template-coordinate sorted (output from group)
         if !is_template_coordinate_sorted(&header) {
@@ -399,7 +400,7 @@ mod tests {
         BamIoOptions {
             input: PathBuf::from("input.bam"),
             output: PathBuf::from("output.bam"),
-            async_reader: false,
+            ..Default::default()
         }
     }
 

@@ -188,6 +188,401 @@ fn test_simplex_command_with_piped_input() {
     compare_bam_records(&output_from_file, &output_from_pipe);
 }
 
+/// Convert a BAM file to a parallel SAM text file containing the same
+/// records. Lets `fgumi group --input foo.sam` reuse the same record
+/// set as the BAM-input baseline for parity tests.
+fn convert_bam_to_sam(bam_path: &PathBuf, sam_path: &PathBuf) {
+    use noodles::sam::alignment::io::Write as _;
+    let mut bam_reader = bam::io::reader::Builder.build_from_path(bam_path).expect("open bam");
+    let header = bam_reader.read_header().expect("read bam header");
+    let mut sam_writer =
+        noodles::sam::io::Writer::new(fs::File::create(sam_path).expect("create sam"));
+    sam_writer.write_header(&header).expect("write sam header");
+    for record in bam_reader.records() {
+        let record = record.expect("bam record");
+        sam_writer.write_alignment_record(&header, &record).expect("write sam record");
+    }
+}
+
+/// SAM-input parity for the new typed-step pipeline. Generates a SAM file
+/// from the same record set as the BAM baseline, runs `fgumi group
+/// --use-new-pipeline --input foo.sam`, and compares the output BAMs.
+/// Exercises the `ReadSamChunks` + `ParseSamChunk` parallel-parse path.
+#[test]
+fn test_group_command_with_sam_input_new_pipeline_matches_bam_baseline() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let bam_path = temp_dir.path().join("input.bam");
+    let sam_path = temp_dir.path().join("input.sam");
+    let out_bam_baseline = temp_dir.path().join("output_bam.bam");
+    let out_sam = temp_dir.path().join("output_sam.bam");
+
+    create_test_input_bam(&bam_path);
+    convert_bam_to_sam(&bam_path, &sam_path);
+
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "group",
+            "--input",
+            bam_path.to_str().unwrap(),
+            "--output",
+            out_bam_baseline.to_str().unwrap(),
+            "--strategy",
+            "identity",
+            "--edits",
+            "0",
+            "--compression-level",
+            "1",
+            "--threads",
+            "2",
+        ])
+        .status()
+        .expect("Failed to run group --use-new-pipeline with BAM input");
+    assert!(status.success(), "BAM-input baseline failed");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "group",
+            "--input",
+            sam_path.to_str().unwrap(),
+            "--output",
+            out_sam.to_str().unwrap(),
+            "--strategy",
+            "identity",
+            "--edits",
+            "0",
+            "--compression-level",
+            "1",
+            "--threads",
+            "2",
+        ])
+        .status()
+        .expect("Failed to run group --use-new-pipeline with SAM input");
+    assert!(status.success(), "SAM-input run failed");
+
+    compare_bam_records(&out_bam_baseline, &out_sam);
+}
+
+/// SAM-input parity for simplex. Generates a SAM from the same grouped
+/// records as the BAM baseline (with MI tags), runs simplex on both,
+/// compares the consensus outputs.
+#[test]
+fn test_simplex_command_with_sam_input_new_pipeline_matches_bam_baseline() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let bam_path = temp_dir.path().join("input.bam");
+    let sam_path = temp_dir.path().join("input.sam");
+    let out_bam_baseline = temp_dir.path().join("output_bam.bam");
+    let out_sam = temp_dir.path().join("output_sam.bam");
+
+    create_grouped_test_bam(&bam_path);
+    convert_bam_to_sam(&bam_path, &sam_path);
+
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "simplex",
+            "--input",
+            bam_path.to_str().unwrap(),
+            "--output",
+            out_bam_baseline.to_str().unwrap(),
+            "--min-reads",
+            "1",
+            "--min-consensus-base-quality",
+            "0",
+            "--compression-level",
+            "1",
+            "--threads",
+            "2",
+        ])
+        .status()
+        .expect("BAM baseline run");
+    assert!(status.success(), "simplex BAM baseline failed");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "simplex",
+            "--input",
+            sam_path.to_str().unwrap(),
+            "--output",
+            out_sam.to_str().unwrap(),
+            "--min-reads",
+            "1",
+            "--min-consensus-base-quality",
+            "0",
+            "--compression-level",
+            "1",
+            "--threads",
+            "2",
+        ])
+        .status()
+        .expect("SAM run");
+    assert!(status.success(), "simplex SAM run failed");
+
+    compare_bam_records(&out_bam_baseline, &out_sam);
+}
+
+/// SAM-input parity for `correct` — exercises the `(Sam, true)` arm of
+/// correct.rs's 4-way match (the `into_multi()` shape that emits both
+/// kept records and rejects on parallel branches).
+#[test]
+fn test_correct_command_with_sam_input_new_pipeline_with_rejects_matches_bam_baseline() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let bam_path = temp_dir.path().join("input.bam");
+    let sam_path = temp_dir.path().join("input.sam");
+    let umi_file = temp_dir.path().join("umis.txt");
+    let out_bam_baseline = temp_dir.path().join("output_bam.bam");
+    let out_bam_rejects_baseline = temp_dir.path().join("rejects_bam.bam");
+    let out_sam = temp_dir.path().join("output_sam.bam");
+    let out_sam_rejects = temp_dir.path().join("rejects_sam.bam");
+
+    create_test_input_bam(&bam_path);
+    convert_bam_to_sam(&bam_path, &sam_path);
+    // The UMIs used by `create_umi_family` are AAAAAAAA and CCCCCCCC.
+    std::fs::write(&umi_file, b"AAAAAAAA\nCCCCCCCC\n").expect("write umi file");
+
+    for (input, output, rejects, label) in [
+        (&bam_path, &out_bam_baseline, &out_bam_rejects_baseline, "BAM"),
+        (&sam_path, &out_sam, &out_sam_rejects, "SAM"),
+    ] {
+        let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+            .args([
+                "correct",
+                "--input",
+                input.to_str().unwrap(),
+                "--output",
+                output.to_str().unwrap(),
+                "--rejects",
+                rejects.to_str().unwrap(),
+                "--umi-files",
+                umi_file.to_str().unwrap(),
+                "--max-mismatches",
+                "1",
+                "--min-distance",
+                "1",
+                "--compression-level",
+                "1",
+                "--threads",
+                "2",
+            ])
+            .status()
+            .unwrap_or_else(|_| panic!("Failed to run correct {label}"));
+        assert!(status.success(), "correct {label} failed");
+    }
+    compare_bam_records(&out_bam_baseline, &out_sam);
+    compare_bam_records(&out_bam_rejects_baseline, &out_sam_rejects);
+}
+
+/// Build an unmapped-consensus BAM with depth tags so filter accepts it
+/// without `--ref` (mapped reads would require ref for NM/UQ/MD tag
+/// regeneration). Mirrors the fixture in `test_filter_command.rs`.
+fn create_unmapped_consensus_bam(path: &PathBuf) {
+    use fgumi_lib::sam::SamTag;
+    use fgumi_raw_bam::{SamBuilder as RawSamBuilder, flags};
+
+    let header = create_minimal_header("chr1", 10000);
+    let records: Vec<_> = ["good1", "good2", "low_depth"]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let depth = if *name == "low_depth" { 1u16 } else { 10u16 };
+            let mut b = RawSamBuilder::new();
+            b.read_name(name.as_bytes())
+                .flags(flags::UNMAPPED)
+                .sequence(b"ACGTACGT")
+                .qualities(&[35; 8]);
+            b.add_array_u16(SamTag::CD_BASES, &[depth; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
+            let _ = i; // silence unused
+            b.build()
+        })
+        .collect();
+
+    let mut writer =
+        bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
+    writer.write_header(&header).expect("Failed to write header");
+    for raw in records {
+        let rec =
+            fgumi_raw_bam::raw_record_to_record_buf(&raw, &header).expect("raw -> record_buf");
+        writer.write_alignment_record(&header, &rec).expect("Failed to write record");
+    }
+    writer.try_finish().expect("Failed to finish BAM");
+}
+
+/// SAM-input parity for `filter --rejects` — exercises the `(Sam, ...)`
+/// arm of `execute_single_read_with_rejects_new` (the `into_multi()`
+/// fan-out shape that emits kept + rejected on parallel branches).
+#[test]
+fn test_filter_command_with_rejects_sam_input_matches_bam_baseline() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let bam_path = temp_dir.path().join("input.bam");
+    let sam_path = temp_dir.path().join("input.sam");
+    let out_bam_baseline = temp_dir.path().join("output_bam.bam");
+    let out_bam_rejects_baseline = temp_dir.path().join("rejects_bam.bam");
+    let out_sam = temp_dir.path().join("output_sam.bam");
+    let out_sam_rejects = temp_dir.path().join("rejects_sam.bam");
+
+    create_unmapped_consensus_bam(&bam_path);
+    convert_bam_to_sam(&bam_path, &sam_path);
+
+    for (input, output, rejects, label) in [
+        (&bam_path, &out_bam_baseline, &out_bam_rejects_baseline, "BAM"),
+        (&sam_path, &out_sam, &out_sam_rejects, "SAM"),
+    ] {
+        let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+            .args([
+                "filter",
+                "--input",
+                input.to_str().unwrap(),
+                "--output",
+                output.to_str().unwrap(),
+                "--rejects",
+                rejects.to_str().unwrap(),
+                "--min-mean-base-quality",
+                "0",
+                "--min-reads",
+                "3",
+                "--compression-level",
+                "1",
+                "--threads",
+                "2",
+            ])
+            .status()
+            .unwrap_or_else(|_| panic!("Failed to run filter {label}"));
+        assert!(status.success(), "filter {label} failed");
+    }
+    compare_bam_records(&out_bam_baseline, &out_sam);
+    compare_bam_records(&out_bam_rejects_baseline, &out_sam_rejects);
+}
+
+/// SAM-on-stdin parity (`cat foo.sam | fgumi group --input -`). The
+/// `InputSource::open` magic-byte peek picks the SAM-chunks source for
+/// stdin (no `\x1f` BGZF magic, falls through to text parsing).
+#[test]
+fn test_group_command_with_sam_stdin_new_pipeline_matches_bam_baseline() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let bam_path = temp_dir.path().join("input.bam");
+    let sam_path = temp_dir.path().join("input.sam");
+    let out_bam_baseline = temp_dir.path().join("output_bam.bam");
+    let out_sam_stdin = temp_dir.path().join("output_sam_stdin.bam");
+
+    create_test_input_bam(&bam_path);
+    convert_bam_to_sam(&bam_path, &sam_path);
+
+    // BAM baseline (file input).
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "group",
+            "--input",
+            bam_path.to_str().unwrap(),
+            "--output",
+            out_bam_baseline.to_str().unwrap(),
+            "--strategy",
+            "identity",
+            "--edits",
+            "0",
+            "--compression-level",
+            "1",
+            "--threads",
+            "2",
+        ])
+        .status()
+        .expect("BAM baseline run");
+    assert!(status.success(), "BAM-input baseline failed");
+
+    // SAM piped through stdin.
+    let cat_child = Command::new("cat")
+        .arg(sam_path.to_str().unwrap())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn cat");
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "group",
+            "--input",
+            "-",
+            "--output",
+            out_sam_stdin.to_str().unwrap(),
+            "--strategy",
+            "identity",
+            "--edits",
+            "0",
+            "--compression-level",
+            "1",
+            "--threads",
+            "2",
+        ])
+        .stdin(cat_child.stdout.unwrap())
+        .status()
+        .expect("SAM stdin run");
+    assert!(status.success(), "SAM-stdin run failed");
+
+    compare_bam_records(&out_bam_baseline, &out_sam_stdin);
+}
+
+/// Same shape as `test_group_command_with_piped_input` but routed through
+/// the typed-step pipeline (`--use-new-pipeline`). Exercises the
+/// `read_bam_auto` dispatcher introduced for issue #330 Phase 1 T1.3.4:
+/// when the input path is `-`, the source step is `read_bam_stdin`
+/// (which buffers the BAM header via `TeeReader` and replays it ahead
+/// of the remaining stdin stream).
+#[test]
+fn test_group_command_with_piped_input_new_pipeline() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_from_file = temp_dir.path().join("output_file.bam");
+    let output_from_pipe = temp_dir.path().join("output_pipe.bam");
+
+    create_test_input_bam(&input_bam);
+
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "group",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_from_file.to_str().unwrap(),
+            "--strategy",
+            "identity",
+            "--edits",
+            "0",
+            "--compression-level",
+            "1",
+            "--threads",
+            "2",
+        ])
+        .status()
+        .expect("Failed to run group --use-new-pipeline with file input");
+    assert!(status.success(), "group --use-new-pipeline (file) failed");
+    assert!(output_from_file.exists(), "file-input output not created");
+
+    let cat_child = Command::new("cat")
+        .arg(input_bam.to_str().unwrap())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn cat");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "group",
+            "--input",
+            "-",
+            "--output",
+            output_from_pipe.to_str().unwrap(),
+            "--strategy",
+            "identity",
+            "--edits",
+            "0",
+            "--compression-level",
+            "1",
+            "--threads",
+            "2",
+        ])
+        .stdin(cat_child.stdout.unwrap())
+        .status()
+        .expect("Failed to run group --use-new-pipeline with piped input");
+    assert!(status.success(), "group --use-new-pipeline (stdin) failed");
+    assert!(output_from_pipe.exists(), "stdin output not created");
+
+    compare_bam_records(&output_from_file, &output_from_pipe);
+}
+
 /// Helper to read file contents for comparison.
 #[allow(dead_code)]
 fn read_file_contents(path: &PathBuf) -> Vec<u8> {

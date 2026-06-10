@@ -8,9 +8,10 @@ use anyhow::Result;
 use fgumi_raw_bam::RawRecord;
 use std::io;
 
-use crate::unified_pipeline::{BatchWeight, DecodedRecord, MemoryEstimate};
+use crate::batch_weight::BatchWeight;
+use fgumi_bam_io::{DecodedRecord, MemoryEstimate};
 
-use crate::unified_pipeline::Grouper;
+use fgumi_bam_io::Grouper;
 use std::collections::VecDeque;
 
 // ============================================================================
@@ -921,14 +922,14 @@ mod tests {
     /// Helper: create a `DecodedRecord` from raw bytes with a dummy group key.
     fn make_raw_decoded_record(tag_name: &str, tag_value: &str) -> DecodedRecord {
         let raw = make_raw_bam_with_tag(tag_name, tag_value);
-        let key = crate::unified_pipeline::GroupKey::single(0, 0, 0, 0, 0, 0);
+        let key = fgumi_bam_io::GroupKey::single(0, 0, 0, 0, 0, 0);
         DecodedRecord::from_raw_bytes(raw, key)
     }
 
     /// Helper: create a `DecodedRecord` from raw bytes with no tags.
     fn make_raw_decoded_record_no_tag() -> DecodedRecord {
         let raw = make_raw_bam_without_tag();
-        let key = crate::unified_pipeline::GroupKey::single(0, 0, 0, 0, 0, 0);
+        let key = fgumi_bam_io::GroupKey::single(0, 0, 0, 0, 0, 0);
         DecodedRecord::from_raw_bytes(raw, key)
     }
 
@@ -1105,7 +1106,7 @@ mod tests {
 
         let rec_b = make_raw_bam_with_tag("MI", "1/B");
 
-        let key = crate::unified_pipeline::GroupKey::single(0, 0, 0, 0, 0, 0);
+        let key = fgumi_bam_io::GroupKey::single(0, 0, 0, 0, 0, 0);
         let records = vec![
             DecodedRecord::from_raw_bytes(rec_primary, key),
             DecodedRecord::from_raw_bytes(rec_secondary, key),
@@ -1130,7 +1131,7 @@ mod tests {
         // `MiGroup::mi` for logging but never written back to the output records.
         fn make_two_tag_decoded(mi: &str, cb: &str) -> DecodedRecord {
             let raw = make_raw_bam_with_two_tags("MI", mi, "CB", cb);
-            let key = crate::unified_pipeline::GroupKey::single(0, 0, 0, 0, 0, 0);
+            let key = fgumi_bam_io::GroupKey::single(0, 0, 0, 0, 0, 0);
             DecodedRecord::from_raw_bytes(raw, key)
         }
 

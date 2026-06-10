@@ -27,6 +27,7 @@ Session.vim
 *.iml
 .vscode
 .claude
+session.json
 
 # Snakemake
 .snakemake/
@@ -46,3 +47,12 @@ docs/src/metrics/
 
 # Heap profiling output produced when binaries are built with the dhat-heap feature
 dhat-heap.json
+
+# Internal design notes, benchmark artifacts, and dev scripts (keep local, don't commit)
+docs/bench/
+docs/design/*
+!docs/design/deterministic-mi-numbering.md
+scripts/bench-*.sh
+scripts/parity-*.sh
+/TRACKER.md
+/resume.md

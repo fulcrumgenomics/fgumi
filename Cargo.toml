@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-tag", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/fgumi-bam-io", "crates/fgumi-sort", "crates/xtask"]
+members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-tag", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/fgumi-bam-io", "crates/fgumi-sort", "crates/fgumi-cli-macros", "crates/xtask"]
 resolver = "2"
 
 [workspace.package]
@@ -12,6 +12,7 @@ license = "MIT"
 [workspace.dependencies]
 fgumi-bam-io = { version = "0.3.0", path = "crates/fgumi-bam-io" }
 fgumi-bgzf = { version = "0.3.0", path = "crates/fgumi-bgzf" }
+fgumi-cli-macros = { version = "0.3.0", path = "crates/fgumi-cli-macros" }
 fgumi-consensus = { version = "0.3.0", path = "crates/fgumi-consensus", default-features = false }
 fgumi-dna = { version = "0.3.0", path = "crates/fgumi-dna" }
 fgumi-metrics = { version = "0.3.0", path = "crates/fgumi-metrics" }
@@ -73,6 +74,7 @@ bytesize = "2.3"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] } # unconditionally used by validate_against_system_memory; held at 0.38 because sysinfo >=0.39 requires rustc 1.95 > our MSRV (rust-toolchain.toml pins 1.93)
 fs4 = { version = "1.1", default-features = false, features = ["sync"] } # cross-platform filesystem free-space queries
 num_cpus = "1.16"
+which = "8"
 rayon = "1.10"
 approx = "0.5.1"
 ahash = "0.8"
@@ -89,6 +91,7 @@ dhat = { version = "0.3", optional = true }
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
 fgumi-dna = { workspace = true }
 fgumi-bgzf = { workspace = true }
+fgumi-cli-macros = { workspace = true }
 fgumi-metrics = { workspace = true }
 fgumi-sam = { workspace = true }
 fgumi-simd-fastq = { workspace = true }
@@ -129,6 +132,7 @@ proptest = "1.10"
 criterion = { version = "0.8", features = ["html_reports"] }
 fgumi-raw-bam = { workspace = true, features = ["test-utils", "noodles"] }
 noodles = { version = "0.111.0", features = ["bam", "sam"] }
+trybuild = "1.0"
 
 [[bench]]
 name = "core_functions"
@@ -170,7 +174,11 @@ codegen-units = 1
 
 [profile.profiling]
 inherits = "release"
-debug = "line-tables-only"
+# Full debug info so sampling profilers (samply, instruments) can resolve
+# function names. `line-tables-only` strips function symbols, leaving
+# only hex offsets in flame graphs.
+debug = "full"
+strip = false
 
 [lib]
 name = "fgumi_lib"

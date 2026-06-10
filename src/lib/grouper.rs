@@ -10,8 +10,9 @@ use std::io;
 
 use noodles::sam::alignment::RecordBuf;
 
+use crate::batch_weight::BatchWeight;
 use crate::template::{Template, TemplateBatch};
-use crate::unified_pipeline::{BatchWeight, DecodedRecord, Grouper, MemoryEstimate};
+use fgumi_bam_io::{DecodedRecord, Grouper, MemoryEstimate};
 use fgumi_raw_bam;
 use fgumi_raw_bam::{RawRecord, raw_record_to_record_buf};
 
@@ -149,7 +150,7 @@ use std::collections::VecDeque;
 ///
 /// ```ignore
 /// use fgumi_lib::grouper::TemplateGrouper;
-/// use fgumi_lib::unified_pipeline::Grouper;
+/// use fgumi_lib::pipeline::Grouper;
 ///
 /// let grouper = TemplateGrouper::new(1000); // 1000 templates per batch
 /// // Use with run_bam_pipeline_with_grouper...
@@ -222,7 +223,7 @@ impl Grouper for TemplateGrouper {
         // records into the same template.
         for decoded in records {
             let name_hash = decoded.key.name_hash;
-            let raw = decoded.data;
+            let raw = decoded.into_raw_bytes();
             let read_name = fgumi_raw_bam::read_name(&raw);
             let same_template = match (self.current_name_hash, self.current_name.as_deref()) {
                 (Some(h), Some(name)) => h == name_hash && name == read_name,
@@ -265,7 +266,7 @@ impl Grouper for TemplateGrouper {
     }
 }
 
-use crate::unified_pipeline::GroupKey;
+use fgumi_bam_io::GroupKey;
 
 impl MemoryEstimate for ProcessedPositionGroup {
     fn estimate_heap_size(&self) -> usize {
@@ -447,7 +448,7 @@ impl RecordPositionGrouper {
     fn validate_mc_tag(&mut self, decoded: &DecodedRecord) -> io::Result<()> {
         use fgumi_raw_bam::RawRecordView;
 
-        let raw = &decoded.data;
+        let raw = decoded.raw_bytes();
         let flg = RawRecordView::new(raw).flags();
         let is_paired = (flg & fgumi_raw_bam::flags::PAIRED) != 0;
         let is_secondary = (flg & fgumi_raw_bam::flags::SECONDARY) != 0;
@@ -503,8 +504,8 @@ impl RecordPositionGrouper {
                     // Hash match is a fast pre-check; confirm QNAME bytes to guard
                     // against hash collisions merging unrelated templates.
                     last.key.name_hash == decoded.key.name_hash
-                        && fgumi_raw_bam::read_name(&last.data)
-                            == fgumi_raw_bam::read_name(&decoded.data)
+                        && fgumi_raw_bam::read_name(last.raw_bytes())
+                            == fgumi_raw_bam::read_name(decoded.raw_bytes())
                 }) =>
             {
                 // Different position but same template (name_hash + QNAME match with
@@ -601,13 +602,18 @@ fn group_by_name_and_build<T>(
 
     for decoded in records {
         let name_hash = decoded.key.name_hash;
-        let read_name = fgumi_raw_bam::read_name(&decoded.data).to_vec();
-        let item = extract(decoded)?;
 
         // name_hash is a fast pre-check; confirm QNAME bytes to guard against
-        // hash collisions merging unrelated templates.
-        let same = current_name_hash == Some(name_hash)
-            && current_name.as_deref() == Some(read_name.as_slice());
+        // hash collisions merging unrelated templates. Compare the borrowed
+        // QNAME slice directly and only clone it on a new-template boundary —
+        // cloning every record's name is the common case otherwise (one
+        // allocation per record vs. one per template).
+        let read_name = fgumi_raw_bam::read_name(decoded.raw_bytes());
+        let same =
+            current_name_hash == Some(name_hash) && current_name.as_deref() == Some(read_name);
+        let owned_name = if same { None } else { Some(read_name.to_vec()) };
+        let item = extract(decoded)?;
+
         if same {
             current_items.push(item);
         } else if current_name_hash.is_some() {
@@ -615,11 +621,11 @@ fn group_by_name_and_build<T>(
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             templates.push(template);
             current_name_hash = Some(name_hash);
-            current_name = Some(read_name);
+            current_name = owned_name;
             current_items.push(item);
         } else {
             current_name_hash = Some(name_hash);
-            current_name = Some(read_name);
+            current_name = owned_name;
             current_items.push(item);
         }
     }
@@ -643,7 +649,7 @@ fn group_by_name_and_build<T>(
 ///
 /// Returns an error if template construction from records fails.
 pub fn build_templates_from_records(records: Vec<DecodedRecord>) -> io::Result<Vec<Template>> {
-    group_by_name_and_build(records, Ok, Template::from_decoded_records)
+    group_by_name_and_build(records, |d| Ok(d.into_raw_bytes()), Template::from_records)
 }
 
 use crate::fastq_parse::{FastqRecord, parse_fastq_records, strip_read_suffix};
@@ -665,6 +671,15 @@ pub struct FastqTemplate {
 impl MemoryEstimate for FastqTemplate {
     fn estimate_heap_size(&self) -> usize {
         let records_heap: usize = self.records.iter().map(MemoryEstimate::estimate_heap_size).sum();
+        let records_vec_overhead = self.records.capacity() * std::mem::size_of::<FastqRecord>();
+        self.name.capacity() + records_heap + records_vec_overhead
+    }
+}
+
+impl crate::pipeline::core::item::HeapSize for FastqTemplate {
+    fn heap_size(&self) -> usize {
+        let records_heap: usize =
+            self.records.iter().map(crate::pipeline::core::item::HeapSize::heap_size).sum();
         let records_vec_overhead = self.records.capacity() * std::mem::size_of::<FastqRecord>();
         self.name.capacity() + records_heap + records_vec_overhead
     }
@@ -917,7 +932,7 @@ mod tests {
 
     #[test]
     fn test_single_raw_record_grouper_emits_each_record() {
-        use crate::unified_pipeline::{DecodedRecord, GroupKey};
+        use fgumi_bam_io::{DecodedRecord, GroupKey};
 
         let mut grouper = SingleRawRecordGrouper::new();
         let raw1 = RawRecord::from(vec![1u8; 36]);
@@ -1459,7 +1474,7 @@ mod tests {
 
     #[test]
     fn test_build_templates_from_raw_bytes() {
-        use crate::unified_pipeline::{DecodedRecord, GroupKey};
+        use fgumi_bam_io::{DecodedRecord, GroupKey};
         use fgumi_raw_bam;
 
         let key = GroupKey::single(0, 100, 0, 0, 0, 12345);
@@ -1483,7 +1498,7 @@ mod tests {
 
     #[test]
     fn test_build_templates_from_raw_bytes_paired() {
-        use crate::unified_pipeline::{DecodedRecord, GroupKey};
+        use fgumi_bam_io::{DecodedRecord, GroupKey};
         use fgumi_raw_bam;
 
         let key1 = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 12345);
