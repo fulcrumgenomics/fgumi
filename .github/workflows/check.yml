@@ -6,6 +6,12 @@ on:
       - main
   pull_request:
 
+# Least-privilege default token: every job here only checks out the repo and
+# runs cargo; Codecov uploads with its own CODECOV_TOKEN secret. Read-only
+# contents is all that's needed, and it overrides the broad repo default.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -26,8 +32,40 @@ jobs:
         uses: taiki-e/install-action@0631aa6515c7d545823c67cfae7ef4fc7f490154 # v2.81.8
         with:
           tool: nextest
+      # Install bwa + bwa-mem3 from bioconda for the AAM
+      # (--start-from align-and-merge) integration tests. Local dev
+      # without these binaries gets gracefully-skipped tests via
+      # `which::which` checks in the test code; CI installs them so
+      # the real-aligner parity tests actually exercise the chain.
+      - name: Install aligners (bwa-mem3, bwa) from bioconda
+        uses: mamba-org/setup-micromamba@06375d89d211a1232ef63355742e9e2e564bc7f7 # v2.0.7
+        with:
+          micromamba-version: '2.0.5-0'
+          environment-name: fgumi-aligners
+          create-args: >-
+            -c bioconda -c conda-forge
+            bwa
+            bwa-mem3
+          init-shell: bash
+          cache-environment: true
+          cache-downloads: true
+      - name: Verify aligner binaries on PATH
+        shell: bash -el {0}
+        run: |
+          which bwa
+          which bwa-mem3
+          bwa 2>&1 | head -3 || true
+          bwa-mem3 2>&1 | head -3 || true
       - name: Unit tests
+        shell: bash -el {0}
         run: cargo ci-test
+      # The AAM real-aligner parity tests are `#[ignore]`'d because
+      # they need bwa / bwa-mem3 on PATH. CI installed them above,
+      # so run the ignored ones explicitly here.
+      - name: AAM real-aligner parity tests
+        shell: bash -el {0}
+        run: cargo nextest run --features compare,simulate,profile-adjacency
+            --locked --run-ignored only -E 'test(aam_parity)'
   
   lint:
     runs-on: ubuntu-latest

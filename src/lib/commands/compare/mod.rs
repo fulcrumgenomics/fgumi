@@ -3,6 +3,7 @@
 //! This module provides commands to compare BAM files and metrics files
 //! for testing and validation of fgumi output against other tools.
 
+pub mod bam_roundtrip;
 pub mod bams;
 pub mod metrics;
 pub(crate) mod raw_compare;
@@ -11,6 +12,7 @@ use crate::commands::command::Command;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+pub use bam_roundtrip::CompareBamRoundtrip;
 pub use bams::CompareBams;
 pub use metrics::CompareMetrics;
 
@@ -45,6 +47,7 @@ impl Command for Compare {
 #[derive(Subcommand, Debug)]
 pub enum CompareCommand {
     Bams(CompareBams),
+    BamRoundtrip(CompareBamRoundtrip),
     Metrics(CompareMetrics),
 }
 
@@ -52,6 +55,7 @@ impl CompareCommand {
     fn execute(&self, command_line: &str) -> Result<()> {
         match self {
             Self::Bams(cmd) => cmd.execute(command_line),
+            Self::BamRoundtrip(cmd) => cmd.execute(command_line),
             Self::Metrics(cmd) => cmd.execute(command_line),
         }
     }

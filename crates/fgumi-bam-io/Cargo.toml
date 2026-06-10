@@ -21,6 +21,7 @@ noodles-csi = "0.56.0"
 bgzf = "0.3.0"
 anyhow = "1.0.102"
 bstr = "1.12.1"
+ahash = "0.8"
 bytes = "1"
 crossbeam-channel = "0.5"
 log = "0"
@@ -29,7 +30,7 @@ log = "0"
 nix = { version = "0.31", default-features = false, features = ["fs"] }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "3.4"
 rstest = "0"
 proptest = "1.10"
 criterion = { version = "0.8", features = ["html_reports"] }

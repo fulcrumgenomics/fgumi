@@ -59,6 +59,32 @@ pub fn reverse_complement(seq: &[u8]) -> Vec<u8> {
     seq.iter().rev().map(|&base| complement_base(base)).collect()
 }
 
+/// Reverse-complements a DNA sequence **in place** (no allocation).
+///
+/// Byte-for-byte equivalent to [`reverse_complement`] (case-normalized to
+/// uppercase, with N/n preserved), but mutates `seq` instead of allocating a
+/// fresh `Vec`. Used on the per-read consensus path for negative-strand reads,
+/// mirroring the in-place `quals.reverse()` alongside it.
+///
+/// # Examples
+///
+/// ```
+/// use fgumi_dna::dna::reverse_complement_in_place;
+///
+/// let mut s = b"ACGTN".to_vec();
+/// reverse_complement_in_place(&mut s);
+/// assert_eq!(s, b"NACGT");
+/// let mut s = b"acgt".to_vec();
+/// reverse_complement_in_place(&mut s);
+/// assert_eq!(s, b"ACGT"); // normalized to uppercase, same as reverse_complement
+/// ```
+pub fn reverse_complement_in_place(seq: &mut [u8]) {
+    seq.reverse();
+    for base in seq.iter_mut() {
+        *base = complement_base(*base);
+    }
+}
+
 /// Complements a single DNA base, preserving case.
 ///
 /// Returns the Watson-Crick complement: A<->T, C<->G.
@@ -144,6 +170,41 @@ mod tests {
         // Special characters unchanged
         for c in [b'.', b'-', b'*', b'0', b'X'] {
             assert_eq!(complement_base(c), c);
+        }
+    }
+
+    #[test]
+    fn test_reverse_complement_in_place_matches_reverse_complement() {
+        // Deterministic equivalence: in-place RC must equal the allocating RC
+        // byte-for-byte (including uppercase normalization and N/n preservation)
+        // over a range of inputs (empty, odd/even length, mixed case, N/n,
+        // IUPAC, separators).
+        let cases: &[&[u8]] = &[
+            b"",
+            b"A",
+            b"N",
+            b"n",
+            b"ACGT",
+            b"ACGTN",
+            b"acgtn",
+            b"AcGtN-n",
+            b"GGGGGCCCCC",
+            b"ACGTRYSWKMBDHV",
+        ];
+        for seq in cases {
+            let expected = reverse_complement(seq);
+            let mut got = seq.to_vec();
+            reverse_complement_in_place(&mut got);
+            assert_eq!(got, expected, "mismatch for input {:?}", String::from_utf8_lossy(seq));
+            // Idempotency of the round-trip mirrors reverse_complement's.
+        }
+        // Exhaustive over all single bytes.
+        for b in 0u8..=255 {
+            let s = [b];
+            let expected = reverse_complement(&s);
+            let mut got = s.to_vec();
+            reverse_complement_in_place(&mut got);
+            assert_eq!(got, expected, "single-byte mismatch for 0x{b:02x}");
         }
     }
 

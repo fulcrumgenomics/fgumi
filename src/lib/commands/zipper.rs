@@ -46,28 +46,138 @@
 //! - `TemplateIterator`: Groups raw BAM bytes from the unmapped reader into Templates
 //! - `TagInfo`: Holds sets of tags to remove/reverse/revcomp
 //! - `merge_raw()`: Core function that transfers metadata between templates using raw bytes
-use crate::batched_sam_reader::BatchedSamReader;
 use crate::commands::command::Command;
 use crate::commands::common::{CompressionOptions, parse_bool};
-use crate::logging::OperationTimer;
-use crate::reference::{ReferenceReader, find_dict_path};
-use crate::sam::{SamTag, TemplateCoordinateInfo, check_sort};
-use crate::template::{Template, TemplateIterator};
+use crate::reference::ReferenceReader;
+use crate::sam::{SamTag, TemplateCoordinateInfo};
+use crate::template::Template;
 use crate::umi::TagInfo;
-use crate::validation::validate_file_exists;
 use anyhow::{Context, Result};
 use bstr::ByteSlice;
-use clap::Parser;
-use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::{RawBamReaderAuto, create_raw_bam_reader, create_raw_bam_writer, is_stdin_path};
+use clap::{Args, Parser};
+use fgumi_cli_macros::multi_options;
 use fgumi_raw_bam;
-use fgumi_raw_bam::{BAM_BASE_TO_ASCII, RawRecord, RawRecordView, RecordBufEncoder};
-use log::{debug, info};
+use fgumi_raw_bam::{BAM_BASE_TO_ASCII, RawRecord, RawRecordView};
 use noodles::core::Position;
 use noodles::sam::Header;
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+
+/// Log line emitted by [`Zipper::execute_new_pipeline`] on entry.
+/// Pinned as a `pub const` so integration tests that assert the new
+/// typed-step path was taken (e.g. `runall_zipper_self_pair_uses_new_pipeline`)
+/// share a single source of truth with the log site and cannot drift.
+pub const NEW_PIPELINE_START_LOG: &str = "Starting zipper (new pipeline)";
+
+/// Default for the deprecated `-K`/`--bwa-chunk-size` flag (bwa's common
+/// `-K 150000000`). Kept as a named constant so the arg default and the
+/// "did the user override it?" deprecation check share one source of truth.
+pub const DEFAULT_BWA_CHUNK_SIZE: u64 = 150_000_000;
+
+/// Emit a deprecation warning if the zipper `-K`/`--bwa-chunk-size` (or
+/// runall's `--zipper::bwa-chunk-size`) was set to a non-default value.
+///
+/// The flag is ignored by the new pipeline (see [`ZipperOptions::bwa_chunk_size`]):
+/// the zipper stage consumes already-aligned SAM and never spawns the aligner,
+/// so a bwa batch size has no meaning here. (The genuinely-used `-K` for
+/// runall's align stage is `--aligner::chunk-size`, a separate flag.) Shared by
+/// the standalone `Zipper::execute` and runall's zipper-stage wiring so both
+/// surfaces nudge identically.
+pub fn warn_if_bwa_chunk_size_overridden(bwa_chunk_size: u64) {
+    if bwa_chunk_size != DEFAULT_BWA_CHUNK_SIZE {
+        log::warn!(
+            "--bwa-chunk-size ({bwa_chunk_size}) is deprecated and ignored; SAM ingest \
+             backpressure is governed by the pipeline memory budget. This flag will be \
+             removed in a future release."
+        );
+    }
+}
+
+/// Per-stage tuning knobs for the `zipper` step.
+///
+/// These are the flags that apply only to the merge/zip step itself
+/// (tag manipulation, channel buffer sizing, BWA stdin batching, EM-seq
+/// post-processing). The mapped/unmapped/reference/output paths and
+/// the threading/compression options stay on the standalone [`Zipper`]
+/// command struct because they are also surfaced directly by `runall`
+/// (the latter as part of `BamIoOptions` / `ThreadingOptions` /
+/// `CompressionOptions`).
+///
+/// The `#[multi_options("zipper", "Zipper Options")]` attribute
+/// generates a `MultiZipperOptions` companion struct whose flags are
+/// re-exposed by `fgumi runall` as `--zipper::<flag>` (e.g.
+/// `--zipper::tags-to-remove`, `--zipper::buffer`, …).
+#[multi_options("zipper", "Zipper Options")]
+#[derive(Args, Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct ZipperOptions {
+    /// Tags to remove from mapped reads before copying unmapped tags
+    #[arg(long, value_delimiter = ',')]
+    pub tags_to_remove: Vec<String>,
+
+    /// Tags to reverse for reads mapped to negative strand
+    #[arg(long, value_delimiter = ',')]
+    pub tags_to_reverse: Vec<String>,
+
+    /// Tags to reverse complement for reads mapped to negative strand
+    #[arg(long, value_delimiter = ',')]
+    pub tags_to_revcomp: Vec<String>,
+
+    /// Buffer size for template channel.
+    #[arg(short = 'b', long, default_value_t = 50000)]
+    pub buffer: usize,
+
+    /// Deprecated and ignored. Previously sized the stdin SAM read buffer to
+    /// bwa's `-K` batch (bases per batch). The new pipeline reads SAM as
+    /// fixed-size newline-aligned chunks parsed in parallel, with backpressure
+    /// governed by the pipeline's memory budget rather than a bwa-batch-sized
+    /// buffer, so this value is no longer consulted. Accepted for backward
+    /// compatibility — it appears mid-pipe in the canonical
+    /// `bwa mem … -K … | fgumi zipper …` invocation — but has no effect; it
+    /// will be removed in a future release.
+    #[arg(short = 'K', long = "bwa-chunk-size", default_value_t = DEFAULT_BWA_CHUNK_SIZE)]
+    pub bwa_chunk_size: u64,
+
+    /// Exclude reads from the unmapped BAM that are not present in the aligned BAM.
+    /// Useful when reads were intentionally removed (e.g., by adapter trimming) prior to alignment.
+    #[arg(long = "exclude-missing-reads", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    pub exclude_missing_reads: bool,
+
+    /// Skip adding `pa` (primary alignment) tags to secondary/supplementary reads.
+    /// By default, zipper adds a `pa` tag containing the primary alignment's template
+    /// sort key coordinates, which enables correct template-coordinate sorting and
+    /// deduplication of these reads. Use this flag if you don't need this functionality.
+    #[arg(long = "skip-pa-tags", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    pub skip_tc_tags: bool,
+
+    /// Restore unconverted bases in EM-seq consensus reads after bwameth re-alignment.
+    ///
+    /// In EM-seq, unmethylated cytosines are converted to thymine (top strand) or
+    /// adenine (bottom strand). After bwameth re-alignment, this flag replaces converted
+    /// bases back to their unconverted reference form at reference C (top strand) or
+    /// reference G (bottom strand) positions. Uses the bwameth `YD` tag to determine
+    /// the bisulfite strand.
+    ///
+    /// This produces a final BAM where the sequence shows the original (unconverted) bases,
+    /// while methylation state is preserved in MM/ML tags and cu/ct count tags.
+    #[arg(long = "restore-unconverted-bases", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    pub restore_unconverted_bases: bool,
+}
+
+impl Default for ZipperOptions {
+    fn default() -> Self {
+        Self {
+            tags_to_remove: Vec::new(),
+            tags_to_reverse: Vec::new(),
+            tags_to_revcomp: Vec::new(),
+            buffer: 50_000,
+            bwa_chunk_size: DEFAULT_BWA_CHUNK_SIZE,
+            exclude_missing_reads: false,
+            skip_tc_tags: false,
+            restore_unconverted_bases: false,
+        }
+    }
+}
 
 /// Command-line arguments for `zipper`
 ///
@@ -105,25 +215,13 @@ Named tag sets like "Consensus" are automatically expanded to their constituent 
 By default, input is read from stdin and output is written to stdout, allowing for streaming
 workflows like:
 
-  # Recommended when the aligner can emit uncompressed BAM:
-  bwa-mem3 mem --bam=0 -t 16 -p -K 150000000 -Y ref.fa reads.fq | fgumi zipper -u unmapped.bam -r ref.fa | fgumi sort -i /dev/stdin -o output.bam --order template-coordinate
-
-  # SAM-only aligners (e.g. classic bwa mem, bwa-mem2):
-  bwa mem -t 16 -p -K 150000000 -Y ref.fa reads.fq | fgumi zipper -u unmapped.bam -r ref.fa | fgumi sort -i /dev/stdin -o output.bam --order template-coordinate
-
-Uncompressed BAM avoids the SAM text formatting/parsing round-trip in both processes
-and adds only ~26 bytes of BGZF framing per ~64 KiB block. Compressed BAM on a pipe
-is not recommended — it burns CPU on the writer and reader for data the sort step
-will re-compress anyway.
+  bwa mem -t 8 -p -K 150000000 -Y ref.fa reads.fq | fgumi zipper -u unmapped.bam -r ref.fa | fgumi sort -i /dev/stdin -o output.bam --order template-coordinate
 "#
 )]
 #[command(verbatim_doc_comment)]
 pub struct Zipper {
     /// Input mapped SAM or BAM file (or `-` for stdin; SAM or BAM is auto-detected).
-    /// For streaming pipelines, uncompressed BAM (e.g. `bwa-mem3 mem --bam=0`) is the
-    /// fastest option — it skips both SAM text formatting on the aligner side and SAM
-    /// parsing on this side. SAM is fine if your aligner can't emit BAM. Compressed
-    /// BAM on a pipe wastes CPU on both ends.
+    /// BAM input is discouraged; prefer piping SAM directly from the aligner for best performance.
     #[arg(short = 'i', long, default_value = "-")]
     pub input: PathBuf,
 
@@ -139,22 +237,6 @@ pub struct Zipper {
     #[arg(short = 'o', long, default_value = "-")]
     pub output: PathBuf,
 
-    /// Tags to remove from mapped reads before copying unmapped tags
-    #[arg(long, value_delimiter = ',')]
-    pub tags_to_remove: Vec<String>,
-
-    /// Tags to reverse for reads mapped to negative strand
-    #[arg(long, value_delimiter = ',')]
-    pub tags_to_reverse: Vec<String>,
-
-    /// Tags to reverse complement for reads mapped to negative strand
-    #[arg(long, value_delimiter = ',')]
-    pub tags_to_revcomp: Vec<String>,
-
-    /// Buffer size for template channel (default: 50000)
-    #[arg(short = 'b', long, default_value = "50000")]
-    pub buffer: usize,
-
     /// Number of threads to use for processing (default: 1, single-threaded)
     #[arg(long, short = 't', default_value = "1")]
     pub threads: usize,
@@ -163,36 +245,9 @@ pub struct Zipper {
     #[command(flatten)]
     pub compression: CompressionOptions,
 
-    /// BWA -K parameter value (bases per batch). Used to optimize buffer sizing
-    /// for stdin input. The buffer grows adaptively based on observed bytes per batch.
-    /// Default matches common bwa mem usage.
-    #[arg(short = 'K', long = "bwa-chunk-size", default_value = "150000000")]
-    pub bwa_chunk_size: u64,
-
-    /// Exclude reads from the unmapped BAM that are not present in the aligned BAM.
-    /// Useful when reads were intentionally removed (e.g., by adapter trimming) prior to alignment.
-    #[arg(long = "exclude-missing-reads", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
-    pub exclude_missing_reads: bool,
-
-    /// Skip adding `pa` (primary alignment) tags to secondary/supplementary reads.
-    /// By default, zipper adds a `pa` tag containing the primary alignment's template
-    /// sort key coordinates, which enables correct template-coordinate sorting and
-    /// deduplication of these reads. Use this flag if you don't need this functionality.
-    #[arg(long = "skip-pa-tags", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
-    pub skip_tc_tags: bool,
-
-    /// Restore unconverted bases in EM-seq consensus reads after bwameth re-alignment.
-    ///
-    /// In EM-seq, unmethylated cytosines are converted to thymine (top strand) or
-    /// adenine (bottom strand). After bwameth re-alignment, this flag replaces converted
-    /// bases back to their unconverted reference form at reference C (top strand) or
-    /// reference G (bottom strand) positions. Uses the bwameth `YD` tag to determine
-    /// the bisulfite strand.
-    ///
-    /// This produces a final BAM where the sequence shows the original (unconverted) bases,
-    /// while methylation state is preserved in MM/ML tags and cu/ct count tags.
-    #[arg(long = "restore-unconverted-bases", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
-    pub restore_unconverted_bases: bool,
+    /// Per-stage zipper tuning (tag manipulation, buffer sizes, EM-seq).
+    #[command(flatten)]
+    pub options: ZipperOptions,
 }
 
 /// Builds the output BAM header from unmapped and mapped headers
@@ -614,13 +669,39 @@ const YD_REVERSE: &[u8] = b"r";
 /// - Bottom strand (`YD:Z:r`): at reference-G positions, A→G
 ///
 /// Skips unmapped reads and reads without a `YD` tag.
-fn restore_unconverted_bases_in_raw_template(
+pub(crate) fn restore_unconverted_bases_in_raw_template(
     template: &mut Template,
     reference: &ReferenceReader,
     header: &Header,
 ) -> Result<()> {
     for rec in template.records_mut().iter_mut() {
         restore_unconverted_bases_in_raw_record(rec, reference, header)?;
+    }
+    Ok(())
+}
+
+/// Apply the full zipper merge body to a single (unmapped, mapped)
+/// template pair. Runs `merge_raw`, then (when `reference` is `Some`)
+/// `restore_unconverted_bases_in_raw_template` for the bisulfite path.
+///
+/// Returned errors are bare — callers add their own context (e.g. the
+/// caller's step name) via `.map_err`/`?` at the call site so the
+/// surfaced error is attributable to the dispatching context.
+///
+/// Used by:
+/// - `ZipperMergeStep::emit_merged` (typed-step zipper)
+/// - `AlignAndMergeStep::merge_zipper_batch` (AAM dispatcher)
+pub(crate) fn merge_one_template(
+    unmapped: &Template,
+    mapped: &mut Template,
+    tag_info: &TagInfo,
+    skip_tc_tags: bool,
+    reference: Option<&ReferenceReader>,
+    output_header: &Header,
+) -> Result<()> {
+    merge_raw(unmapped, mapped, tag_info, skip_tc_tags)?;
+    if let Some(ref_reader) = reference {
+        restore_unconverted_bases_in_raw_template(mapped, ref_reader, output_header)?;
     }
     Ok(())
 }
@@ -761,252 +842,8 @@ fn restore_unconverted_bases_in_raw_record(
     Ok(())
 }
 
-/// Groups consecutive `RecordBuf` records by query name into `Template` objects.
-///
-/// Used for the mapped (SAM/BAM) reader path where noodles decodes records as `RecordBuf`.
-/// Each group is encoded to raw bytes via [`RecordBufEncoder`] and assembled into a
-/// [`Template`] via [`Template::from_records`].
-fn record_bufs_to_templates<'a, I>(
-    iter: I,
-    header: &'a Header,
-) -> impl Iterator<Item = Result<Template>> + 'a
-where
-    I: Iterator<Item = Result<noodles::sam::alignment::RecordBuf>> + 'a,
-{
-    let mut encoder = RecordBufEncoder::new(header);
-    let mut pending: Option<noodles::sam::alignment::RecordBuf> = None;
-    let mut exhausted = false;
-    let mut iter = iter;
-
-    std::iter::from_fn(move || {
-        if exhausted && pending.is_none() {
-            return None;
-        }
-
-        let mut batch: Vec<noodles::sam::alignment::RecordBuf> = Vec::with_capacity(2);
-
-        if let Some(p) = pending.take() {
-            batch.push(p);
-        }
-
-        loop {
-            if exhausted {
-                break;
-            }
-            match iter.next() {
-                Some(Ok(rec)) => {
-                    if batch.is_empty() {
-                        batch.push(rec);
-                    } else {
-                        let first_name = batch[0].name().map(|n| n.to_vec());
-                        let this_name = rec.name().map(|n| n.to_vec());
-                        if first_name == this_name {
-                            batch.push(rec);
-                        } else {
-                            pending = Some(rec);
-                            break;
-                        }
-                    }
-                }
-                Some(Err(e)) => return Some(Err(e)),
-                None => {
-                    exhausted = true;
-                    break;
-                }
-            }
-        }
-
-        if batch.is_empty() {
-            return None;
-        }
-
-        let mut raw_records = Vec::with_capacity(batch.len());
-        for rec in &batch {
-            match encoder.encode(rec) {
-                Ok(raw) => raw_records.push(raw),
-                Err(e) => return Some(Err(anyhow::anyhow!("Failed to encode record: {e}"))),
-            }
-        }
-        Some(Template::from_records(raw_records))
-    })
-}
-
-impl Zipper {
-    /// Process templates using raw-byte merge path with BGZF compression.
-    ///
-    /// Thread count is controlled by `self.threads` (1 = single-threaded).
-    fn process_raw<U, M>(
-        &self,
-        unmapped_iter: U,
-        mut mapped_iter: M,
-        output_header: &Header,
-        tag_info: &TagInfo,
-        reference: Option<&ReferenceReader>,
-    ) -> Result<u64>
-    where
-        U: Iterator<Item = Result<Template>>,
-        M: Iterator<Item = Result<Template>>,
-    {
-        let mut writer = create_raw_bam_writer(
-            &self.output,
-            output_header,
-            self.threads,
-            self.compression.compression_level,
-        )?;
-
-        let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
-        let mut mapped_peek: Option<Template> = None;
-        let mut templates_not_in_mapped_bam: u64 = 0;
-
-        for unmapped_result in unmapped_iter {
-            let unmapped_template = unmapped_result?;
-
-            if mapped_peek.is_none() {
-                mapped_peek = mapped_iter.next().transpose()?;
-            }
-
-            if let Some(ref mut mapped_template) = mapped_peek {
-                if mapped_template.name == unmapped_template.name {
-                    merge_raw(&unmapped_template, mapped_template, tag_info, self.skip_tc_tags)?;
-                    if let Some(ref_reader) = reference {
-                        // EM-seq: restore converted bases in-place on packed 4-bit nibbles.
-                        restore_unconverted_bases_in_raw_template(
-                            mapped_template,
-                            ref_reader,
-                            output_header,
-                        )?;
-                    }
-                    for rec in mapped_template.records() {
-                        writer.write_raw_record(rec)?;
-                        progress.log_if_needed(1);
-                    }
-                    mapped_peek = None;
-                } else {
-                    debug!(
-                        "Found unmapped read with no corresponding mapped \
-                         read: {}",
-                        String::from_utf8_lossy(&unmapped_template.name)
-                    );
-                    if self.exclude_missing_reads {
-                        templates_not_in_mapped_bam += 1;
-                    } else {
-                        let raw =
-                            encode_unmapped_template_records(&unmapped_template, output_header)?;
-                        for rec in &raw {
-                            writer.write_raw_record(rec)?;
-                            progress.log_if_needed(1);
-                        }
-                    }
-                }
-            } else {
-                debug!(
-                    "Found unmapped read with no corresponding mapped \
-                     read: {}",
-                    String::from_utf8_lossy(&unmapped_template.name)
-                );
-                if self.exclude_missing_reads {
-                    templates_not_in_mapped_bam += 1;
-                } else {
-                    let raw = encode_unmapped_template_records(&unmapped_template, output_header)?;
-                    for rec in &raw {
-                        writer.write_raw_record(rec)?;
-                        progress.log_if_needed(1);
-                    }
-                }
-            }
-        }
-
-        progress.log_final();
-
-        // Check for leftover mapped reads
-        if let Some(remaining) = mapped_peek {
-            anyhow::bail!(
-                "Error: processed all unmapped reads but there are mapped \
-                 reads remaining. Found template '{}'. Please ensure the \
-                 unmapped and mapped reads have the same set of read names \
-                 in the same order, and reads with the same name are \
-                 consecutive (grouped) in each input.",
-                String::from_utf8_lossy(&remaining.name)
-            );
-        }
-        if let Some(remaining) = mapped_iter.next() {
-            let remaining = remaining?;
-            anyhow::bail!(
-                "Error: processed all unmapped reads but there are mapped \
-                 reads remaining. Found template '{}'. Please ensure the \
-                 unmapped and mapped reads have the same set of read names \
-                 in the same order, and reads with the same name are \
-                 consecutive (grouped) in each input.",
-                String::from_utf8_lossy(&remaining.name)
-            );
-        }
-
-        if self.exclude_missing_reads && templates_not_in_mapped_bam > 0 {
-            info!(
-                "Excluded {templates_not_in_mapped_bam} templates that \
-                 were not present in the aligned BAM."
-            );
-        }
-
-        writer.finish()?;
-        Ok(progress.count())
-    }
-}
-
-/// Raw BAM reader for stdin: single-threaded BGZF over a buffered `Box<dyn Read + Send>`.
-///
-/// Stdin is non-seekable, so we use a single-threaded BGZF reader. `BufReader` wraps
-/// stdin so we can peek the BGZF magic bytes for format auto-detection without
-/// consuming them.
-type RawBamStdinReader =
-    fgumi_raw_bam::RawBamReader<noodles::bgzf::io::Reader<BufReader<Box<dyn Read + Send>>>>;
-
-/// Wraps SAM and BAM readers so the mapped-reader thread can handle either format.
-/// Moved into the thread that iterates records, since the iterator owns the reader.
-///
-/// The SAM arm decodes via noodles `RecordBuf` (text-mode SAM has no raw-byte path).
-/// Both BAM arms use `RawBamReader` so records are yielded as raw bytes and fed
-/// directly to `TemplateIterator` without a decode/encode round-trip.
-enum MappedReader {
-    Sam(noodles::sam::io::Reader<Box<dyn BufRead + Send>>),
-    Bam(RawBamReaderAuto),
-    StdinBam(RawBamStdinReader),
-}
-
-/// First four bytes of a BGZF stream (gzip magic + extra-flag byte unique to BGZF).
-const BGZF_MAGIC: [u8; 4] = [0x1f, 0x8b, 0x08, 0x04];
-
-/// Peeks up to [`BGZF_MAGIC.len()`] bytes from `stdin` to classify it as BGZF (BAM) vs SAM text.
-///
-/// A single `read()` on a pipe may return fewer bytes than requested even when more
-/// data is coming (e.g. the aligner hasn't flushed its first block yet), so this loops
-/// until the peek buffer is full or EOF is reached. The peeked bytes are then chained
-/// back onto the stream so downstream parsers see the complete input.
-///
-/// # Returns
-///
-/// `(is_bgzf, reader)` where `reader` yields the peeked bytes followed by the rest of
-/// the original stream.
-fn peek_stdin_bgzf(mut stdin: Box<dyn Read + Send>) -> Result<(bool, Box<dyn Read + Send>)> {
-    let mut prefix = [0u8; BGZF_MAGIC.len()];
-    let mut filled = 0usize;
-    while filled < prefix.len() {
-        match stdin.read(&mut prefix[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e).context("Failed to peek stdin"),
-        }
-    }
-    let is_bgzf = filled == BGZF_MAGIC.len() && prefix == BGZF_MAGIC;
-    // Prepend the peeked bytes back onto the stream so the chosen reader sees them.
-    let restored: Box<dyn Read + Send> =
-        Box::new(std::io::Cursor::new(prefix[..filled].to_vec()).chain(stdin));
-    Ok((is_bgzf, restored))
-}
-
 impl Command for Zipper {
-    /// Executes the `zipper` command
+    /// Executes the `zipper` command via `chains::build_for`.
     ///
     /// Main workflow:
     /// 1. Opens and validates input BAM files
@@ -1029,168 +866,480 @@ impl Command for Zipper {
     /// - Input files have different sets of read names
     /// - I/O errors occur during reading or writing
     fn execute(&self, command_line: &str) -> Result<()> {
-        info!("Starting zipper");
+        use crate::commands::common::{QueueMemoryOptions, SchedulerOptions, ThreadingOptions};
+        use crate::pipeline::chains::{ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag};
 
-        let timer = OperationTimer::new("Zipping BAMs");
+        // `-K`/`--bwa-chunk-size` is deprecated and ignored by the new pipeline
+        // (see the field doc). Nudge users who explicitly set a non-default
+        // value so they know it has no effect.
+        warn_if_bwa_chunk_size_overridden(self.options.bwa_chunk_size);
 
-        // Validate input files exist
-        validate_file_exists(&self.unmapped, "unmapped BAM file")?;
-        validate_file_exists(&self.reference, "reference FASTA file")?;
-        let dict_path = find_dict_path(&self.reference).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Reference dictionary file not found. Tried:\n  \
-                - {}\n  \
-                - {}.dict\n\
-                Please run: samtools dict {} -o {}",
-                self.reference.with_extension("dict").display(),
-                self.reference.display(),
-                self.reference.display(),
-                self.reference.with_extension("dict").display()
-            )
-        })?;
+        let spec = ChainSpec {
+            async_reader: false,
+            stages: vec![Stage::Zipper],
+            source: SourceSpec::PairedBams {
+                unmapped: self.unmapped.clone(),
+                mapped: self.input.clone(),
+                reference: self.reference.clone(),
+            },
+            sink: SinkSpec::Bam(self.output.clone()),
+            stage_opts: StageOptionsBag {
+                zipper: Some(self.options.clone()),
+                ..Default::default()
+            },
+            threading: ThreadingOptions::new(self.threads),
+            compression: self.compression.clone(),
+            scheduler: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+            command_line: command_line.to_string(),
+        };
+        crate::pipeline::chains::build_for(spec)?.run()
+    }
+}
 
-        let (unmapped_raw_reader, unmapped_header) = create_raw_bam_reader(&self.unmapped, 1)?;
+/// Typed-step pipeline merger for the `--use-new-pipeline` path.
+///
+/// Implements [`Step2`] over two `BamTemplateBatch` streams (unmapped
+/// `InputA` and mapped `InputB`) and emits merged
+/// [`BamTemplateBatch`]es ready for downstream
+/// `SerializeBamRecords → BgzfCompress → WriteBgzfFile`. Body is the
+/// same `merge_raw` (+ optional EM-seq base restoration + missing-mapped
+/// handling) used by the legacy iterator-driven path; only the iteration
+/// driver changes — the new framework keeps two cursors into the most
+/// recently popped batch on each branch and advances them per-pair under
+/// the framework-owned Serial mutex.
+pub(crate) mod merge_step {
+    use std::io;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-        // Read mapped input — detect format by extension.
-        // The reader and header are separated here; record_bufs() is called inside
-        // the spawned thread (it borrows &self, so the reader must live there).
-        let (mapped_reader, mapped_header) = if is_stdin_path(&self.input) {
-            // Auto-detect BAM (BGZF magic) vs SAM text on stdin so callers can pipe either,
-            // matching the file-input path. Without this, piping `samtools view -b ...` to
-            // zipper crashes with a confusing "invalid flags / lexical parse error" because
-            // the SAM text parser misreads the binary BGZF stream.
-            //
-            // `peek_stdin_bgzf` reads up to the magic length in a loop (a single `read()` on
-            // a pipe may return fewer bytes than requested) and returns a reader that prepends
-            // the peeked bytes back onto the stream for the chosen downstream reader.
-            let stdin: Box<dyn Read + Send> = Box::new(std::io::stdin());
-            let (is_bgzf, stdin) = peek_stdin_bgzf(stdin)?;
-            let buffered = BufReader::with_capacity(64 * 1024, stdin);
-            if is_bgzf {
-                info!("Reading BAM from stdin");
-                let bgzf = noodles::bgzf::io::Reader::new(buffered);
-                let mut bam_reader = noodles::bam::io::Reader::from(bgzf);
-                let header = bam_reader.read_header()?;
-                let bgzf = bam_reader.into_inner();
-                (MappedReader::StdinBam(fgumi_raw_bam::RawBamReader::new(bgzf)), header)
+    use noodles::sam::Header;
+
+    use crate::pipeline::core::Unpushed;
+    use crate::pipeline::core::held::HeldSlot;
+    use crate::pipeline::core::outputs::OrderedBytesSingle;
+    use crate::pipeline::core::queues::QueueSpec;
+    use crate::pipeline::core::reorder::BranchOrdering;
+    use crate::pipeline::core::step::{Step2, StepCtx2, StepKind, StepOutcome, StepProfile};
+    use crate::pipeline::steps::types::BamTemplateBatch;
+    use crate::reference::ReferenceReader;
+    use crate::template::Template;
+    use crate::umi::TagInfo;
+
+    /// Cap on the number of templates one `try_run` call processes
+    /// before yielding. Bounds per-call wall time so the Serial mutex
+    /// doesn't starve other workers. Mirrors the
+    /// `MAX_BATCHES_PER_LOCK` discipline used by `GroupByQueryname`,
+    /// but in template-units since the merge body's work is
+    /// per-template.
+    const MAX_TEMPLATES_PER_CALL: usize = 1024;
+
+    /// Immutable configuration shared by the step.
+    ///
+    /// Cloning is one `Arc` clone per field — cheap; intentionally
+    /// crammed into one struct so the call-site builder stays small.
+    #[derive(Clone)]
+    pub struct ZipperMergeConfig {
+        pub tag_info: Arc<TagInfo>,
+        pub skip_tc_tags: bool,
+        pub exclude_missing_reads: bool,
+        pub reference: Option<Arc<ReferenceReader>>,
+        pub output_header: Arc<Header>,
+        /// Counter for unmapped templates that had no mapped match.
+        /// Exposed back to the command after `Pipeline::run` so the
+        /// summary log (`"Excluded N templates..."`) reflects the
+        /// final missing-mapped count.
+        pub missing_count: Arc<AtomicU64>,
+        /// Counter for records pushed into the output stream (matched
+        /// merges + unmapped-only emits). Exposed back to the command
+        /// after `Pipeline::run` so the final `log_completion` line
+        /// reports a real throughput number instead of zero.
+        pub records_emitted: Arc<AtomicU64>,
+        pub target_batch_count: usize,
+        pub output_byte_limit: u64,
+    }
+
+    /// One batch in flight on a branch + the cursor into it.
+    struct PendingBatch {
+        batch: BamTemplateBatch,
+        cursor: usize,
+    }
+
+    impl PendingBatch {
+        fn new(batch: BamTemplateBatch) -> Self {
+            Self { batch, cursor: 0 }
+        }
+
+        fn current(&self) -> Option<&Template> {
+            self.batch.templates.get(self.cursor)
+        }
+
+        fn take_current(&mut self) -> Option<Template> {
+            let i = self.cursor;
+            if i >= self.batch.templates.len() {
+                return None;
+            }
+            self.cursor += 1;
+            // Replace the slot with an empty placeholder so the
+            // surrounding `Vec` can keep its length without the
+            // `Template: Default` bound (Template carries a
+            // `MoleculeId` enum that has no canonical default).
+            Some(std::mem::replace(&mut self.batch.templates[i], Template::new(Vec::new())))
+        }
+
+        fn is_exhausted(&self) -> bool {
+            self.cursor >= self.batch.templates.len()
+        }
+    }
+
+    /// `Serial + ByItemOrdinal` Step2 merger that pairs unmapped
+    /// (`InputA`) and mapped (`InputB`) templates by queryname order
+    /// and emits merged [`BamTemplateBatch`]es.
+    pub struct ZipperMergeStep {
+        cfg: ZipperMergeConfig,
+        pending_a: Option<PendingBatch>,
+        pending_b: Option<PendingBatch>,
+        accumulator: Vec<Template>,
+        next_ordinal: u64,
+        held: HeldSlot<Unpushed<BamTemplateBatch>>,
+        name: &'static str,
+    }
+
+    impl ZipperMergeStep {
+        #[must_use]
+        pub fn new(cfg: ZipperMergeConfig) -> Self {
+            let target = cfg.target_batch_count.max(1);
+            Self {
+                cfg,
+                pending_a: None,
+                pending_b: None,
+                accumulator: Vec::with_capacity(target),
+                next_ordinal: 0,
+                held: HeldSlot::new(),
+                name: "ZipperMerge",
+            }
+        }
+
+        /// Push a fully-merged template into the accumulator and emit
+        /// a batch if the target count is reached. Increments the
+        /// records-emitted counter by the template's record count so
+        /// the post-run `log_completion` reports an accurate throughput
+        /// number.
+        fn push_template(
+            &mut self,
+            template: Template,
+            ctx: &mut StepCtx2<'_, Self>,
+        ) -> Option<StepOutcome> {
+            self.cfg.records_emitted.fetch_add(template.read_count() as u64, Ordering::Relaxed);
+            self.accumulator.push(template);
+            if self.accumulator.len() >= self.cfg.target_batch_count {
+                Some(self.emit_batch(ctx))
             } else {
-                info!(
-                    "Reading SAM from stdin with adaptive buffer (bwa -K {})",
-                    self.bwa_chunk_size
-                );
-                let reader: Box<dyn BufRead + Send> =
-                    Box::new(BatchedSamReader::new(buffered, self.bwa_chunk_size));
-                let mut sam_reader = noodles::sam::io::Reader::new(reader);
-                let header = sam_reader.read_header()?;
-                (MappedReader::Sam(sam_reader), header)
+                None
             }
-        } else if self.input.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("bam")) {
-            let (raw_reader, header) = create_raw_bam_reader(&self.input, self.threads)?;
-            (MappedReader::Bam(raw_reader), header)
-        } else {
-            // SAM file input
-            let reader: Box<dyn BufRead + Send> = Box::new(BufReader::with_capacity(
-                256 * 1024,
-                std::fs::File::open(&self.input).context("Failed to open mapped SAM")?,
-            ));
-            let mut sam_reader = noodles::sam::io::Reader::new(reader);
-            let header = sam_reader.read_header()?;
-            (MappedReader::Sam(sam_reader), header)
-        };
-
-        check_sort(&unmapped_header, &self.unmapped, "unmapped");
-        check_sort(&mapped_header, &self.input, "mapped");
-
-        let output_header = build_output_header(&unmapped_header, &mapped_header, &dict_path)?;
-
-        // Add @PG record with PP chaining
-        let output_header = crate::commands::common::add_pg_record(output_header, command_line)?;
-
-        let tag_info = TagInfo::new(
-            self.tags_to_remove.clone(),
-            self.tags_to_reverse.clone(),
-            self.tags_to_revcomp.clone(),
-        );
-
-        if !tag_info.remove.is_empty() {
-            info!("Tags for removal: {:?}", tag_info.remove);
-        }
-        if !tag_info.reverse.is_empty() {
-            info!("Tags being reversed: {:?}", tag_info.reverse);
-        }
-        if !tag_info.revcomp.is_empty() {
-            info!("Tags being reverse complemented: {:?}", tag_info.revcomp);
         }
 
-        // Load reference FASTA if restoring unconverted bases
-        let reference = if self.restore_unconverted_bases {
-            info!("Loading reference FASTA for unconverted base restoration");
-            Some(ReferenceReader::new(&self.reference)?)
-        } else {
-            None
-        };
+        /// Both input branches are drained and every template has been
+        /// processed: flush the final partial accumulator (if any) and report
+        /// `Finished`. A bounced flush is parked in `held` and retried by
+        /// `try_run`'s held-drain preamble on the next pass (which then
+        /// re-reaches this path with an empty accumulator → `Finished`).
+        fn finish_accumulator(&mut self, ctx: &mut StepCtx2<'_, Self>) -> StepOutcome {
+            if self.accumulator.is_empty() {
+                return StepOutcome::Finished;
+            }
+            self.emit_batch(ctx)
+        }
 
-        // Create async unmapped reader - spawn thread to read ahead
-        let (unmapped_tx, unmapped_rx) =
-            std::sync::mpsc::sync_channel::<Result<Template>>(self.buffer);
-        std::thread::spawn(move || {
-            let unmapped_iter = TemplateIterator::new(unmapped_raw_reader);
-            for template in unmapped_iter {
-                if unmapped_tx.send(template).is_err() {
-                    break; // Receiver dropped, main thread done
+        /// Package the accumulator into a [`BamTemplateBatch`] and
+        /// emit. On rejection, hold; retry on the next `try_run`.
+        fn emit_batch(&mut self, ctx: &mut StepCtx2<'_, Self>) -> StepOutcome {
+            let serial = self.next_ordinal;
+            self.next_ordinal += 1;
+            let templates = std::mem::replace(
+                &mut self.accumulator,
+                Vec::with_capacity(self.cfg.target_batch_count),
+            );
+            let out = BamTemplateBatch::new(serial, templates);
+            if let Err(unpushed) = ctx.outputs.push(out) {
+                self.held.put(unpushed);
+            }
+            StepOutcome::Progress
+        }
+
+        /// Emit an unmapped-only template (missing-mapped path).
+        fn emit_unmapped_only(
+            &mut self,
+            unmapped: Template,
+            ctx: &mut StepCtx2<'_, Self>,
+        ) -> io::Result<Option<StepOutcome>> {
+            if self.cfg.exclude_missing_reads {
+                self.cfg.missing_count.fetch_add(1, Ordering::Relaxed);
+                Ok(None)
+            } else {
+                let records =
+                    super::encode_unmapped_template_records(&unmapped, &self.cfg.output_header)
+                        .map_err(|e| {
+                            io::Error::other(format!("encode_unmapped_template_records: {e}"))
+                        })?;
+                let template = Template::from_records(records).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Template::from_records for unmapped-only: {e}"),
+                    )
+                })?;
+                Ok(self.push_template(template, ctx))
+            }
+        }
+
+        /// Apply the merge body to a matched (unmapped, mapped) pair
+        /// and emit the merged mapped template.
+        fn emit_merged(
+            &mut self,
+            unmapped: Template,
+            mut mapped: Template,
+            ctx: &mut StepCtx2<'_, Self>,
+        ) -> io::Result<Option<StepOutcome>> {
+            super::merge_one_template(
+                &unmapped,
+                &mut mapped,
+                &self.cfg.tag_info,
+                self.cfg.skip_tc_tags,
+                self.cfg.reference.as_deref(),
+                &self.cfg.output_header,
+            )
+            .map_err(|e| io::Error::other(format!("ZipperMergeStep: {e}")))?;
+            Ok(self.push_template(mapped, ctx))
+        }
+    }
+
+    impl Step2 for ZipperMergeStep {
+        type InputA = BamTemplateBatch;
+        type InputB = BamTemplateBatch;
+        type Outputs = OrderedBytesSingle<BamTemplateBatch>;
+
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: self.name,
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded {
+                    limit_bytes: self.cfg.output_byte_limit,
+                }],
+                branch_ordering: vec![BranchOrdering::ByItemOrdinal],
+            }
+        }
+
+        fn try_run(&mut self, ctx: &mut StepCtx2<'_, Self>) -> io::Result<StepOutcome> {
+            // 1. Drain held output slot first.
+            if let Some(unpushed) = self.held.take() {
+                match ctx.outputs.retry(unpushed) {
+                    Ok(()) => {}
+                    Err(again) => {
+                        self.held.put(again);
+                        return Ok(StepOutcome::Contention);
+                    }
                 }
             }
-        });
-        let unmapped_iter = std::iter::from_fn(move || unmapped_rx.recv().ok());
 
-        // Create async mapped reader - spawn thread to read ahead and prevent backpressure on stdin
-        // (e.g., when reading piped output from bwa)
-        let (mapped_tx, mapped_rx) = std::sync::mpsc::sync_channel::<Result<Template>>(self.buffer);
-        let mapped_header_for_reader = mapped_header.clone();
-        std::thread::spawn(move || {
-            // The reader is owned by this thread so its record iterator
-            // outlives each iteration.
-            match mapped_reader {
-                MappedReader::Sam(mut r) => {
-                    let record_iter = r
-                        .record_bufs(&mapped_header_for_reader)
-                        .map(|rec| rec.map_err(anyhow::Error::from));
-                    for template in record_bufs_to_templates(record_iter, &mapped_header_for_reader)
-                    {
-                        if mapped_tx.send(template).is_err() {
-                            break;
+            // 2. If the accumulator is already full, emit before pulling more input.
+            if self.accumulator.len() >= self.cfg.target_batch_count {
+                return Ok(self.emit_batch(ctx));
+            }
+
+            let mut did_work = false;
+
+            // 3. Process up to `MAX_TEMPLATES_PER_CALL` templates per try_run.
+            for _ in 0..MAX_TEMPLATES_PER_CALL {
+                // Ensure pending_a has a non-exhausted current template.
+                loop {
+                    match self.pending_a.as_ref() {
+                        Some(pa) if !pa.is_exhausted() => break,
+                        Some(_) => self.pending_a = None,
+                        None => {
+                            if let Some(b) = ctx.a.pop() {
+                                self.pending_a = Some(PendingBatch::new(b));
+                            } else {
+                                // Unmapped queue is empty right now. If A is
+                                // also fully drained (producer signalled
+                                // end-of-stream) we'll never get another
+                                // unmapped template, so check for leftover
+                                // mapped reads *now*: the both-branches-drained
+                                // completion below only fires once B is drained
+                                // too, but B may still hold records here, so
+                                // surfacing the mismatch eagerly avoids looping
+                                // forever returning `NoProgress`.
+                                if ctx.a.is_drained() {
+                                    let leftover_b = self
+                                        .pending_b
+                                        .as_ref()
+                                        .and_then(|pb| pb.current())
+                                        .map(|t| t.name.clone())
+                                        .or_else(|| {
+                                            ctx.b.pop().and_then(|batch| {
+                                                batch.templates.first().map(|t| t.name.clone())
+                                            })
+                                        });
+                                    if let Some(name) = leftover_b {
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            format!(
+                                                "Error: processed all unmapped reads but there are mapped reads remaining. \
+                                                 Found template '{}'. Please ensure the unmapped and mapped reads have the \
+                                                 same set of read names in the same order, and reads with the same name \
+                                                 are consecutive (grouped) in each input.",
+                                                String::from_utf8_lossy(&name)
+                                            ),
+                                        ));
+                                    }
+                                    // Unmapped fully consumed and no mapped
+                                    // remaining. If the mapped branch is also
+                                    // drained the merge is complete — flush the
+                                    // final partial accumulator and report
+                                    // `Finished`. Otherwise (B still open) fall
+                                    // through and wait for more mapped reads.
+                                    if ctx.b.is_drained() {
+                                        return Ok(self.finish_accumulator(ctx));
+                                    }
+                                }
+                                // A not yet drained, or B still open — no input
+                                // ready right now.
+                                return Ok(if did_work {
+                                    StepOutcome::Progress
+                                } else {
+                                    StepOutcome::NoProgress
+                                });
+                            }
                         }
                     }
                 }
-                MappedReader::Bam(r) => {
-                    for template in TemplateIterator::new(r) {
-                        if mapped_tx.send(template).is_err() {
-                            break;
-                        }
+
+                // Ensure pending_b has a non-exhausted current template
+                // (or set to None if its queue is currently empty).
+                loop {
+                    match self.pending_b.as_ref() {
+                        Some(pb) if !pb.is_exhausted() => break,
+                        Some(_) => self.pending_b = None,
+                        None => match ctx.b.pop() {
+                            Some(b) => self.pending_b = Some(PendingBatch::new(b)),
+                            None => break, // No mapped available right now; fall through.
+                        },
                     }
                 }
-                MappedReader::StdinBam(r) => {
-                    for template in TemplateIterator::new(r) {
-                        if mapped_tx.send(template).is_err() {
-                            break;
-                        }
+
+                // Peek both currents.
+                let pa_name: Vec<u8> = self
+                    .pending_a
+                    .as_ref()
+                    .and_then(|pa| pa.current())
+                    .expect("pending_a guaranteed non-exhausted above")
+                    .name
+                    .clone();
+                let pb_name: Option<Vec<u8>> =
+                    self.pending_b.as_ref().and_then(|pb| pb.current()).map(|t| t.name.clone());
+
+                let mapped_drained = self.pending_b.is_none() && ctx.b.is_drained();
+
+                let outcome = match pb_name {
+                    Some(ref n) if n == &pa_name => {
+                        // MERGE PATH — match.
+                        let unmapped = self.pending_a.as_mut().unwrap().take_current().unwrap();
+                        let mapped = self.pending_b.as_mut().unwrap().take_current().unwrap();
+                        self.emit_merged(unmapped, mapped, ctx)?
                     }
+                    Some(ref n) => {
+                        // MISMATCH. Mapped is expected to be a subsequence of
+                        // unmapped in the same queryname order, so the mapped
+                        // head must never sort *before* the unmapped head: if
+                        // it does, a mapped read has no corresponding unmapped
+                        // read (or the inputs are out of order), which is
+                        // corruption — fail rather than silently emitting the
+                        // unmapped read as missing-mapped.
+                        if fgumi_raw_bam::sort::natural_compare(n, &pa_name)
+                            == std::cmp::Ordering::Less
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "Error: mapped read '{}' sorts before unmapped read '{}'; the \
+                                     mapped input has a read with no corresponding unmapped read, or \
+                                     the inputs are not in the same queryname order. Please ensure the \
+                                     unmapped and mapped reads have the same set of read names in the \
+                                     same order, and reads with the same name are consecutive (grouped) \
+                                     in each input.",
+                                    String::from_utf8_lossy(n),
+                                    String::from_utf8_lossy(&pa_name),
+                                ),
+                            ));
+                        }
+                        // Mapped head sorts after the unmapped head: the current
+                        // unmapped read is missing from mapped. Consume the
+                        // unmapped only; leave pending_b cursor where it is.
+                        let unmapped = self.pending_a.as_mut().unwrap().take_current().unwrap();
+                        self.emit_unmapped_only(unmapped, ctx)?
+                    }
+                    None if mapped_drained => {
+                        // No more mapped will ever arrive.
+                        let unmapped = self.pending_a.as_mut().unwrap().take_current().unwrap();
+                        self.emit_unmapped_only(unmapped, ctx)?
+                    }
+                    None => {
+                        // No mapped right now, but ctx.b not drained — wait.
+                        return Ok(if did_work {
+                            StepOutcome::Progress
+                        } else {
+                            StepOutcome::NoProgress
+                        });
+                    }
+                };
+
+                did_work = true;
+
+                // If `emit_*` filled the accumulator and dispatched a
+                // batch, the next iteration starts with an empty
+                // accumulator — that's fine. The early-return below
+                // makes the per-call work bound predictable.
+                if let Some(stepwise) = outcome {
+                    debug_assert_eq!(stepwise, StepOutcome::Progress);
+                    return Ok(StepOutcome::Progress);
                 }
             }
-        });
-        let mapped_iter = std::iter::from_fn(move || mapped_rx.recv().ok());
 
-        let total_records = self.process_raw(
-            unmapped_iter,
-            mapped_iter,
-            &output_header,
-            &tag_info,
-            reference.as_ref(),
-        )?;
+            Ok(if did_work { StepOutcome::Progress } else { StepOutcome::NoProgress })
+        }
+    }
 
-        info!("zipper completed successfully");
-        timer.log_completion(total_records);
-        Ok(())
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::pipeline::core::reorder::BranchOrdering;
+        use crate::umi::TagInfo;
+        use noodles::sam::Header;
+        use std::sync::Arc;
+
+        fn make_cfg(exclude: bool) -> ZipperMergeConfig {
+            ZipperMergeConfig {
+                tag_info: Arc::new(TagInfo::new(vec![], vec![], vec![])),
+                skip_tc_tags: true,
+                exclude_missing_reads: exclude,
+                reference: None,
+                output_header: Arc::new(Header::default()),
+                missing_count: Arc::new(AtomicU64::new(0)),
+                records_emitted: Arc::new(AtomicU64::new(0)),
+                target_batch_count: 4,
+                output_byte_limit: 1024 * 1024,
+            }
+        }
+
+        #[test]
+        fn profile_advertises_serial_byordinal() {
+            let s = ZipperMergeStep::new(make_cfg(false));
+            let p = s.profile();
+            assert_eq!(p.name, "ZipperMerge");
+            assert_eq!(p.kind, StepKind::Serial);
+            assert!(!p.sticky);
+            assert_eq!(p.branch_ordering, vec![BranchOrdering::ByItemOrdinal]);
+        }
     }
 }
 
@@ -1211,7 +1360,6 @@ mod tests {
     use noodles::sam::alignment::record_buf::data::field::Value as BufValue;
     use rstest::rstest;
     use std::collections::HashMap;
-    use std::io::Read;
     use tempfile::TempDir;
 
     /// Convert a `RawRecord` built with [`RawSamBuilder`] into a noodles `RecordBuf`.
@@ -1248,81 +1396,6 @@ mod tests {
             pos2: read_i32(4),
             neg2: read_i32(5) != 0,
         })
-    }
-
-    /// A `Read` implementation that returns at most one byte per `read` call,
-    /// mimicking the behavior of a slow pipe or small kernel buffer. Used to
-    /// regression-test `peek_stdin_bgzf`, which must tolerate short reads.
-    struct TrickleReader(std::collections::VecDeque<u8>);
-
-    impl Read for TrickleReader {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            if buf.is_empty() {
-                return Ok(0);
-            }
-            match self.0.pop_front() {
-                Some(b) => {
-                    buf[0] = b;
-                    Ok(1)
-                }
-                None => Ok(0),
-            }
-        }
-    }
-
-    fn trickle(bytes: &[u8]) -> Box<dyn Read + Send> {
-        Box::new(TrickleReader(bytes.iter().copied().collect()))
-    }
-
-    /// Regression: `BufReader::fill_buf` can return fewer than `BGZF_MAGIC.len()`
-    /// bytes on a pipe even when more data is coming. Before the fix, that caused
-    /// BAM-on-stdin to be misclassified as SAM. Simulate it with a reader that
-    /// returns one byte per `read` call and confirm classification + stream
-    /// reconstruction both work.
-    #[test]
-    fn test_peek_stdin_bgzf_classifies_bam_under_short_reads() -> Result<()> {
-        let mut stream = BGZF_MAGIC.to_vec();
-        stream.extend_from_slice(b"rest-of-bgzf-stream");
-        let (is_bgzf, mut restored) = peek_stdin_bgzf(trickle(&stream))?;
-        assert!(is_bgzf);
-        let mut round_trip = Vec::new();
-        restored.read_to_end(&mut round_trip)?;
-        assert_eq!(round_trip, stream);
-        Ok(())
-    }
-
-    #[test]
-    fn test_peek_stdin_bgzf_classifies_sam_text() -> Result<()> {
-        let stream = b"@HD\tVN:1.6\tSO:queryname\n".to_vec();
-        let (is_bgzf, mut restored) = peek_stdin_bgzf(trickle(&stream))?;
-        assert!(!is_bgzf);
-        let mut round_trip = Vec::new();
-        restored.read_to_end(&mut round_trip)?;
-        assert_eq!(round_trip, stream);
-        Ok(())
-    }
-
-    #[test]
-    fn test_peek_stdin_bgzf_handles_stream_shorter_than_magic() -> Result<()> {
-        // Fewer bytes than BGZF_MAGIC.len() — must not be misclassified as BAM,
-        // and the short prefix must still be recoverable from the returned reader.
-        let stream = b"@H".to_vec();
-        let (is_bgzf, mut restored) = peek_stdin_bgzf(trickle(&stream))?;
-        assert!(!is_bgzf);
-        let mut round_trip = Vec::new();
-        restored.read_to_end(&mut round_trip)?;
-        assert_eq!(round_trip, stream);
-        Ok(())
-    }
-
-    #[test]
-    fn test_peek_stdin_bgzf_handles_empty_stream() -> Result<()> {
-        let (is_bgzf, mut restored) = peek_stdin_bgzf(Box::new(std::io::empty()))?;
-        assert!(!is_bgzf);
-        let mut round_trip = Vec::new();
-        restored.read_to_end(&mut round_trip)?;
-        assert!(round_trip.is_empty());
-        Ok(())
     }
 
     /// Runs `zipper-bams` and returns the output records
@@ -1369,16 +1442,15 @@ mod tests {
             unmapped: unmapped_path.clone(),
             reference: dict_path,
             output: output_path.clone(),
-            tags_to_remove,
-            tags_to_reverse,
-            tags_to_revcomp,
-            buffer: 5000,
             threads: 1,
             compression: CompressionOptions { compression_level: 1 },
-            bwa_chunk_size: 150_000_000,
-            exclude_missing_reads: false,
-            skip_tc_tags: false,
-            restore_unconverted_bases: false,
+            options: ZipperOptions {
+                tags_to_remove,
+                tags_to_reverse,
+                tags_to_revcomp,
+                buffer: 5000,
+                ..ZipperOptions::default()
+            },
         };
 
         zipper.execute("test")?;
@@ -2116,16 +2188,9 @@ mod tests {
             unmapped: unmapped_path.clone(),
             reference: dict_path,
             output: output_path.clone(),
-            tags_to_remove: vec![],
-            tags_to_reverse: vec![],
-            tags_to_revcomp: vec![],
-            buffer: 5000,
             threads: 4,
             compression: CompressionOptions { compression_level: 1 },
-            bwa_chunk_size: 150_000_000,
-            exclude_missing_reads: false,
-            skip_tc_tags: false,
-            restore_unconverted_bases: false,
+            options: ZipperOptions { buffer: 5000, ..ZipperOptions::default() },
         };
 
         zipper.execute("test")?;
@@ -2324,16 +2389,13 @@ mod tests {
             unmapped: unmapped_path.clone(),
             reference: dict_path,
             output: output_path.clone(),
-            tags_to_remove: vec![],
-            tags_to_reverse: vec![],
-            tags_to_revcomp: vec![],
-            buffer: 5000,
             threads: 1,
             compression: CompressionOptions { compression_level: 1 },
-            bwa_chunk_size: 150_000_000,
-            exclude_missing_reads,
-            skip_tc_tags: false,
-            restore_unconverted_bases: false,
+            options: ZipperOptions {
+                buffer: 5000,
+                exclude_missing_reads,
+                ..ZipperOptions::default()
+            },
         };
 
         zipper.execute("test")?;
@@ -2411,16 +2473,9 @@ mod tests {
             unmapped: unmapped_path.clone(),
             reference: dir.path().join("ref.fa"),
             output: output_path,
-            tags_to_remove: vec![],
-            tags_to_reverse: vec![],
-            tags_to_revcomp: vec![],
-            buffer: 5000,
             threads: 1,
             compression: CompressionOptions { compression_level: 1 },
-            bwa_chunk_size: 150_000_000,
-            exclude_missing_reads: false,
-            skip_tc_tags: false,
-            restore_unconverted_bases: false,
+            options: ZipperOptions { buffer: 5000, ..ZipperOptions::default() },
         };
 
         let result = zipper.execute("test");
@@ -3655,7 +3710,7 @@ mod tests {
     #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--exclude-missing-reads=false"], false)]
     fn test_exclude_missing_reads_parsing(#[case] args: &[&str], #[case] expected: bool) {
         let cmd = Zipper::try_parse_from(args).expect("failed to parse Zipper arguments");
-        assert_eq!(cmd.exclude_missing_reads, expected);
+        assert_eq!(cmd.options.exclude_missing_reads, expected);
     }
 
     #[rstest]
@@ -3668,7 +3723,7 @@ mod tests {
     #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags=false"], false)]
     fn test_skip_tc_tags_parsing(#[case] args: &[&str], #[case] expected: bool) {
         let cmd = Zipper::try_parse_from(args).expect("failed to parse Zipper arguments");
-        assert_eq!(cmd.skip_tc_tags, expected);
+        assert_eq!(cmd.options.skip_tc_tags, expected);
     }
 
     #[rstest]
@@ -3681,7 +3736,7 @@ mod tests {
     #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--restore-unconverted-bases=false"], false)]
     fn test_restore_unconverted_bases_parsing(#[case] args: &[&str], #[case] expected: bool) {
         let cmd = Zipper::try_parse_from(args).expect("failed to parse Zipper arguments");
-        assert_eq!(cmd.restore_unconverted_bases, expected);
+        assert_eq!(cmd.options.restore_unconverted_bases, expected);
     }
 
     /// Helper: decode the sequence from a `RawRecord` to ASCII bytes.

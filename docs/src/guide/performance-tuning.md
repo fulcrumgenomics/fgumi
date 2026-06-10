@@ -271,22 +271,6 @@ fgumi group --pipeline-stats --input reads.bam --output grouped.bam
 
 Prints detailed per-step timing, throughput, contention metrics, and per-thread work distribution at completion.
 
-### Scheduler Strategy
-
-```bash
-fgumi group --scheduler balanced-chase-drain --input reads.bam --output grouped.bam
-```
-
-Controls which scheduling strategy threads use for work assignment. The default (`balanced-chase-drain`) is recommended for most workloads. Available strategies:
-
-| Strategy | Description |
-|----------|-------------|
-| `balanced-chase-drain` | Default. Balanced work distribution with output drain mode. |
-| `fixed-priority` | Static thread roles (reader, writer, workers). Simple baseline. |
-| `chase-bottleneck` | Threads dynamically follow work through the pipeline. |
-
-Other experimental strategies are available (`thompson-sampling`, `ucb`, `epsilon-greedy`, etc.) but are not recommended for production use.
-
 ### Deadlock Detection
 
 ```bash

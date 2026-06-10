@@ -126,6 +126,8 @@
 //! - [fgbio](https://github.com/fulcrumgenomics/fgbio) - Scala implementation
 //! - [noodles](https://github.com/zaeleus/noodles) - Rust bioinformatics I/O
 
+pub mod aligner;
+pub mod batch_weight;
 pub mod batched_sam_reader;
 pub mod commands;
 pub mod version;
@@ -144,6 +146,7 @@ pub mod metrics;
 pub mod mi_group;
 pub mod per_thread_accumulator;
 pub use fgumi_consensus::phred;
+pub mod pipeline;
 pub mod read_info;
 pub mod reference;
 pub use fgumi_metrics::rejection;
@@ -152,7 +155,6 @@ pub mod system;
 pub mod tag_reversal;
 pub mod template;
 pub mod umi;
-pub mod unified_pipeline;
 pub mod validation;
 pub mod variant_review;
 

@@ -105,10 +105,16 @@ pub fn regenerate_alignment_tags(
         return Ok(true);
     }
 
-    // Fetch entire reference span in one call
+    // Fetch entire reference span in one call. `fetch_borrowed` returns
+    // `Cow::Borrowed(&[u8])` for in-memory references (the production
+    // `ReferenceReader` impl) — zero-copy. The previous `fetch` call
+    // allocated a fresh `Vec<u8>` per record; on a 16M-record workload
+    // this dominated `libsystem_platform.dylib` (memcpy/memmove) at
+    // ~19% of total CPU. With borrowed-slice we drop the alloc + copy
+    // entirely.
     let ref_end = Position::new(usize::from(ref_start) + ref_span - 1)
         .context("Invalid reference end position")?;
-    let all_ref_bases = reference.fetch(ref_name, ref_start, ref_end)?;
+    let all_ref_bases = reference.fetch_borrowed(ref_name, ref_start, ref_end)?;
 
     // Calculate edit distance and mismatch quality
     let mut nm = 0; // Edit distance
@@ -306,10 +312,16 @@ pub fn regenerate_alignment_tags_raw(
         return Ok(true);
     }
 
-    // Fetch entire reference span in one call
+    // Fetch entire reference span in one call. `fetch_borrowed` returns
+    // `Cow::Borrowed(&[u8])` for in-memory references (the production
+    // `ReferenceReader` impl) — zero-copy. The previous `fetch` call
+    // allocated a fresh `Vec<u8>` per record; on a 16M-record workload
+    // this dominated `libsystem_platform.dylib` (memcpy/memmove) at
+    // ~19% of total CPU. With borrowed-slice we drop the alloc + copy
+    // entirely.
     let ref_end = Position::new(usize::from(ref_start) + ref_span - 1)
         .context("Invalid reference end position")?;
-    let all_ref_bases = reference.fetch(ref_name, ref_start, ref_end)?;
+    let all_ref_bases = reference.fetch_borrowed(ref_name, ref_start, ref_end)?;
 
     // Get seq/qual offsets and validate bounds
     let seq_off = fgumi_raw_bam::seq_offset(record);

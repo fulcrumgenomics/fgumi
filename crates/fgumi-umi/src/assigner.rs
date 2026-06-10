@@ -809,6 +809,21 @@ pub trait UmiAssigner: Send + Sync {
     ///
     /// Reference to self as `&dyn Any`
     fn as_any(&self) -> &dyn Any;
+
+    /// Reset any internal counter / per-group state so the assigner can
+    /// be reused for a new group.
+    ///
+    /// Implementations that hold an `AtomicU64` molecule-id counter
+    /// reset it to `0`; stateless implementations override to a no-op.
+    /// Default is no-op so that adding new assigners doesn't break the
+    /// trait surface for existing callers that don't share assigners.
+    ///
+    /// Safe to call between groups but **not** while another thread
+    /// is mid-`assign`. Group commands construct the assigner once per
+    /// batch, then call `reset()` between groups in a sequential loop —
+    /// see `commands/group.rs::execute_threads_mode_new`'s
+    /// `process_step` closure.
+    fn reset(&self) {}
 }
 
 /// Identity UMI assigner - only exact matches
@@ -879,6 +894,10 @@ impl UmiAssigner for IdentityUmiAssigner {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn reset(&self) {
+        self.counter.store(0, Ordering::SeqCst);
     }
 }
 
@@ -1009,6 +1028,10 @@ impl UmiAssigner for SimpleErrorUmiAssigner {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn reset(&self) {
+        self.counter.store(0, Ordering::SeqCst);
     }
 }
 
@@ -1559,6 +1582,10 @@ impl UmiAssigner for AdjacencyUmiAssigner {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn reset(&self) {
+        self.counter.store(0, Ordering::SeqCst);
+    }
 }
 
 /// Paired UMI assigner for UMIs of form A-B
@@ -1882,6 +1909,10 @@ impl UmiAssigner for PairedUmiAssigner {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn reset(&self) {
+        self.adjacency.reset();
     }
 }
 
