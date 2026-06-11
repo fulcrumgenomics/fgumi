@@ -128,6 +128,48 @@ pub struct GroupOptions {
     #[arg(long = "no-umi", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub no_umi: bool,
 
+    /// Enable the parallel UMI assigner for position groups with at least this
+    /// many templates. Useful for amplicon and other workflows where individual
+    /// mapped position groups are very large; the default for normal
+    /// whole-genome data is to stay sequential. Has an effect only when
+    /// `--threads` is greater than 1: with `--threads 1` the assigner always
+    /// falls back to the sequential implementation.
+    ///
+    /// Accepts either `auto` or an integer. `auto` selects per-strategy
+    /// empirical thresholds derived from `benches/umi_assigner_threshold.rs`:
+    ///
+    /// - Identity:  never go parallel (sequential always wins, including at
+    ///   16k templates)
+    /// - Edit:      1536 templates
+    /// - Adjacency: 3072 templates
+    /// - Paired:    128 templates (parallel is 95x faster at 4k, 390x at 16k)
+    ///
+    /// An integer applies that single threshold uniformly to *every* strategy,
+    /// including Identity (which `auto` keeps sequential): with a fixed `N`,
+    /// any group whose template count reaches `N` uses the parallel assigner
+    /// regardless of strategy.
+    ///
+    /// When `--allow-unmapped` is also set, *every* position group uses the
+    /// parallel assigner regardless of this flag. This is intentional:
+    /// allow-unmapped workflows (e.g. ribosome display) are essentially
+    /// all-unmapped reads forming one large position group, where parallel
+    /// always wins, so the run-wide flag is a good proxy. For mixed inputs that
+    /// also contain many small mapped groups, prefer
+    /// `--parallel-group-min-templates` over `--allow-unmapped`'s blanket
+    /// parallelization.
+    ///
+    /// WARNING: each parallel assigner constructs its own `rayon::ThreadPool`
+    /// of size `--threads`, which is independent of the pipeline's worker
+    /// threads. As an example, one pipeline worker overlapping a single parallel
+    /// assigner briefly runs ~2 * `--threads` OS threads; this is not an upper
+    /// bound, because multiple pipeline workers can each spawn a `--threads`-sized
+    /// pool concurrently, pushing the live thread count higher still. For amplicon
+    /// data (few large groups, pipeline threads mostly idle) the over-subscription
+    /// is harmless; for mixed workloads with many concurrent groups it can
+    /// contend. Tune `--threads` accordingly.
+    #[arg(long = "parallel-group-min-templates", value_name = "N|auto")]
+    pub parallel_group_min_templates: Option<ParallelMinTemplates>,
+
     // ── Chain-builder slots (populated by GroupReadsByUmi::execute, not by
     // clap). Invisible to the CLI; `Multi<GroupOptions>::validate()` fills
     // them from `GroupOptions::default()`. ──────────────────────────────────
@@ -184,6 +226,7 @@ impl Default for GroupOptions {
             min_umi_length: None,
             index_threshold: 100,
             no_umi: false,
+            parallel_group_min_templates: None,
             effective_strategy: Strategy::Identity,
             effective_edits: 0,
             family_size_histogram: None,
@@ -489,6 +532,113 @@ fn get_pair_orientation_impl(template: &Template) -> (bool, bool) {
     get_pair_orientation_raw(template)
 }
 
+/// CLI value for `--parallel-group-min-templates`.
+///
+/// Either the literal `auto`, which selects per-strategy empirical thresholds
+/// (see `parallel_threshold` for the table), or an explicit non-negative
+/// integer applied uniformly to every strategy. A fixed `0` means "always
+/// parallel" (every group reaches the threshold).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParallelMinTemplates {
+    /// Use the per-strategy empirical thresholds (see `parallel_threshold`).
+    Auto,
+    /// Apply this threshold uniformly to every strategy.
+    Fixed(usize),
+}
+
+impl std::str::FromStr for ParallelMinTemplates {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("auto") {
+            Ok(Self::Auto)
+        } else {
+            s.parse::<usize>()
+                .map(Self::Fixed)
+                .map_err(|e| format!("expected 'auto' or a non-negative integer, got '{s}': {e}"))
+        }
+    }
+}
+
+/// Empirical minimum group size at which the parallel assigner is at least as
+/// fast as the sequential one. Below this threshold the per-group rayon
+/// `ThreadPool` construction cost (~120 us) dominates the per-template work
+/// and sequential wins.
+///
+/// Crossover points were measured on Apple M2 Max, 8 threads, via
+/// `benches/umi_assigner_threshold.rs`. See `ParallelMinTemplates`.
+pub(crate) fn parallel_threshold(strategy: Strategy, opt: &ParallelMinTemplates) -> usize {
+    match opt {
+        ParallelMinTemplates::Fixed(n) => *n,
+        ParallelMinTemplates::Auto => match strategy {
+            // Sequential wins at every measured size up to 16k templates. Per-
+            // template work is so small that pool startup cannot be amortized.
+            Strategy::Identity => usize::MAX,
+            // Crossover ~1536 templates (par 0.94x seq), 0.64x at 2k.
+            Strategy::Edit => 1536,
+            // Crossover ~3072 templates (par 0.94x seq), 0.75x at 4k.
+            Strategy::Adjacency => 3072,
+            // Crossover ~128 templates (par 0.93x seq). The win grows fast:
+            // 20x at 1k, 95x at 4k, 390x at 16k.
+            Strategy::Paired => 128,
+        },
+    }
+}
+
+/// Decide whether a position group should use the parallel UMI assigner.
+///
+/// Shared by the streaming pipeline path (the chain `GroupProcess` step) and the
+/// single-threaded path (`process_and_write_position_group`) so the two stay in
+/// lockstep. Two independent triggers enable the parallel path:
+///
+/// 1. `allow_unmapped` is set (the `--allow-unmapped` flag). Such workflows
+///    (e.g. ribosome display) are essentially all-unmapped reads forming one
+///    large position group, where the parallel assigner always wins; the
+///    run-wide flag is a deliberate proxy for "this run is dominated by one
+///    huge group", so *every* group in the run takes the parallel path.
+/// 2. `parallel_group_min_templates` is set and this group has at least the
+///    per-strategy threshold number of templates (see `parallel_threshold`).
+pub(crate) fn should_use_parallel(
+    allow_unmapped: bool,
+    template_count: usize,
+    strategy: Strategy,
+    parallel_group_min_templates: Option<&ParallelMinTemplates>,
+) -> bool {
+    allow_unmapped
+        || parallel_group_min_templates
+            .is_some_and(|opt| template_count >= parallel_threshold(strategy, opt))
+}
+
+/// Construct a UMI assigner, choosing between the parallel and sequential
+/// variants based on `use_parallel`. Centralizes the four-arm strategy match
+/// shared by the chain `GroupProcess` step (streaming pipeline path) and
+/// `process_and_write_position_group` (single-threaded path).
+///
+/// A parallel assigner is only built when `num_threads > 1`: a one-thread rayon
+/// pool delivers no parallelism while still paying pool-construction overhead,
+/// so `--threads 1` and `execute_single_threaded` (which passes `threads = 1`)
+/// always fall back to the sequential assigner regardless of `use_parallel`.
+pub(crate) fn create_umi_assigner(
+    strategy: Strategy,
+    effective_edits: u32,
+    index_threshold: usize,
+    num_threads: usize,
+    use_parallel: bool,
+) -> Box<dyn UmiAssigner> {
+    if use_parallel && num_threads > 1 {
+        match strategy {
+            Strategy::Identity => Box::new(ParallelIdentityAssigner::new(num_threads)),
+            Strategy::Edit => Box::new(ParallelEditAssigner::new(effective_edits, num_threads)),
+            Strategy::Adjacency => {
+                Box::new(ParallelAdjacencyAssigner::new(effective_edits, num_threads))
+            }
+            Strategy::Paired => Box::new(ParallelPairedAssigner::new(effective_edits, num_threads)),
+        }
+    } else {
+        strategy.new_assigner_full(effective_edits, 1, index_threshold)
+    }
+}
+
 /// Assign UMI groups to templates (static implementation).
 pub(crate) fn assign_umi_groups_impl(
     templates: &mut [Template],
@@ -683,10 +833,17 @@ different cells are never grouped together, even if they share a UMI sequence an
 The cell barcode is read from the standard `CB` tag. No correction or
 error-handling is performed on cell barcodes; they must be corrected upstream.
 
-Multi-threaded operation is supported via --threads N which spawns exactly N threads.
-Threads are allocated based on the command's workload profile to optimize performance.
+Multi-threaded operation is supported via --threads N, which spawns N pipeline threads
+allocated based on the command's workload profile to optimize performance.
 
-Example: --threads 8 spawns exactly 8 threads (2 reader, 4 workers, 2 writer)
+Example: --threads 8 spawns 8 pipeline threads (2 reader, 4 workers, 2 writer)
+
+Note: when --parallel-group-min-templates (or --allow-unmapped) engages the parallel UMI
+assigner, each parallel assigner constructs its own rayon thread pool of size --threads,
+independent of the pipeline threads above. As an example, one pipeline worker overlapping a
+single parallel assigner briefly runs ~2 * --threads OS threads; this is not an upper bound,
+because multiple pipeline workers can each spawn a --threads-sized pool concurrently and push
+the live thread count higher still. See --parallel-group-min-templates for details.
 "#
 )]
 #[allow(clippy::struct_excessive_bools)]
@@ -1036,6 +1193,7 @@ impl GroupReadsByUmi {
                     effective_edits,
                     self.options.index_threshold,
                     1, // Single-threaded mode
+                    self.options.parallel_group_min_templates.as_ref(),
                     raw_tag,
                     assign_tag_bytes,
                     &mut total_filter_metrics,
@@ -1059,6 +1217,7 @@ impl GroupReadsByUmi {
                 effective_edits,
                 self.options.index_threshold,
                 1, // Single-threaded mode
+                self.options.parallel_group_min_templates.as_ref(),
                 raw_tag,
                 assign_tag_bytes,
                 &mut total_filter_metrics,
@@ -1102,6 +1261,7 @@ impl GroupReadsByUmi {
         effective_edits: u32,
         index_threshold: usize,
         threads: usize,
+        parallel_group_min_templates: Option<&ParallelMinTemplates>,
         raw_tag: [u8; 2],
         assign_tag_bytes: [u8; 2],
         total_filter_metrics: &mut FilterMetrics,
@@ -1129,21 +1289,17 @@ impl GroupReadsByUmi {
             return Ok(());
         }
 
-        // Create UMI assigner
-        // Use parallel assigner when allow_unmapped is enabled (large single groups)
-        let assigner: Box<dyn UmiAssigner> = if filter_config.allow_unmapped {
-            match strategy {
-                Strategy::Identity => Box::new(ParallelIdentityAssigner::new(threads)),
-                Strategy::Edit => Box::new(ParallelEditAssigner::new(effective_edits, threads)),
-                Strategy::Adjacency => {
-                    Box::new(ParallelAdjacencyAssigner::new(effective_edits, threads))
-                }
-                Strategy::Paired => Box::new(ParallelPairedAssigner::new(effective_edits, threads)),
-            }
-        } else {
-            // Use existing sequential assigner for mapped data
-            strategy.new_assigner_full(effective_edits, 1, index_threshold)
-        };
+        // Create UMI assigner. See `should_use_parallel` for the full
+        // rationale; this is the equivalent decision on the single-threaded
+        // path, kept in lockstep with the chain path via the shared helper.
+        let use_parallel = should_use_parallel(
+            filter_config.allow_unmapped,
+            filtered_templates.len(),
+            strategy,
+            parallel_group_min_templates,
+        );
+        let assigner =
+            create_umi_assigner(strategy, effective_edits, index_threshold, threads, use_parallel);
 
         // Assign UMI groups
         let mut templates = filtered_templates;
@@ -1338,7 +1494,180 @@ mod tests {
     use noodles::sam::alignment::io::Write as AlignmentWrite;
     use rstest::rstest;
     use std::num::NonZeroUsize;
+    use std::str::FromStr;
     use tempfile::{NamedTempFile, TempDir};
+
+    #[rstest]
+    #[case("auto")]
+    #[case("AUTO")]
+    #[case("Auto")]
+    #[case("aUtO")]
+    fn parallel_min_templates_parses_auto_case_insensitively(#[case] s: &str) {
+        assert_eq!(
+            ParallelMinTemplates::from_str(s).unwrap(),
+            ParallelMinTemplates::Auto,
+            "expected Auto for '{s}'"
+        );
+    }
+
+    #[test]
+    fn parallel_min_templates_parses_non_negative_integer() {
+        assert_eq!(ParallelMinTemplates::from_str("0").unwrap(), ParallelMinTemplates::Fixed(0));
+        assert_eq!(
+            ParallelMinTemplates::from_str("1536").unwrap(),
+            ParallelMinTemplates::Fixed(1536)
+        );
+    }
+
+    #[test]
+    fn parallel_min_templates_rejects_garbage() {
+        let err = ParallelMinTemplates::from_str("not-a-number").unwrap_err();
+        assert!(err.contains("expected 'auto' or a non-negative integer"), "got: {err}");
+        // Negative is rejected (usize parse fails).
+        assert!(ParallelMinTemplates::from_str("-1").is_err());
+    }
+
+    #[test]
+    fn parallel_threshold_auto_matches_empirical_table() {
+        assert_eq!(parallel_threshold(Strategy::Identity, &ParallelMinTemplates::Auto), usize::MAX);
+        assert_eq!(parallel_threshold(Strategy::Edit, &ParallelMinTemplates::Auto), 1536);
+        assert_eq!(parallel_threshold(Strategy::Adjacency, &ParallelMinTemplates::Auto), 3072);
+        assert_eq!(parallel_threshold(Strategy::Paired, &ParallelMinTemplates::Auto), 128);
+    }
+
+    #[rstest]
+    #[case(Strategy::Identity)]
+    #[case(Strategy::Edit)]
+    #[case(Strategy::Adjacency)]
+    #[case(Strategy::Paired)]
+    fn parallel_threshold_fixed_applies_uniformly(#[case] strategy: Strategy) {
+        let opt = ParallelMinTemplates::Fixed(500);
+        assert_eq!(parallel_threshold(strategy, &opt), 500, "strategy {strategy:?}");
+    }
+
+    /// With `use_parallel = true`, `create_umi_assigner` must build the parallel
+    /// variant for every strategy (not just the ones exercised by end-to-end tests).
+    #[rstest]
+    #[case(Strategy::Identity)]
+    #[case(Strategy::Edit)]
+    #[case(Strategy::Adjacency)]
+    #[case(Strategy::Paired)]
+    fn create_umi_assigner_parallel_builds_parallel_variant(#[case] strategy: Strategy) {
+        let assigner = create_umi_assigner(strategy, 1, 0, 2, true);
+        let any = assigner.as_any();
+        let is_parallel = match strategy {
+            Strategy::Identity => any.is::<ParallelIdentityAssigner>(),
+            Strategy::Edit => any.is::<ParallelEditAssigner>(),
+            Strategy::Adjacency => any.is::<ParallelAdjacencyAssigner>(),
+            Strategy::Paired => any.is::<ParallelPairedAssigner>(),
+        };
+        assert!(is_parallel, "expected parallel assigner for {strategy:?}");
+    }
+
+    /// Even with `use_parallel = true`, a single worker thread must not build a
+    /// parallel assigner: a one-thread rayon pool is pure startup overhead with
+    /// zero parallelism. The `--threads 1` pipeline path and `execute_single_threaded`
+    /// (which passes `threads = 1`) both reach `create_umi_assigner` with
+    /// `num_threads == 1`, so this guards against spawning a useless pool there.
+    #[rstest]
+    #[case(Strategy::Identity)]
+    #[case(Strategy::Edit)]
+    #[case(Strategy::Adjacency)]
+    #[case(Strategy::Paired)]
+    fn create_umi_assigner_single_thread_builds_non_parallel_variant(#[case] strategy: Strategy) {
+        // num_threads = 1 with use_parallel = true must still fall back to sequential.
+        let assigner = create_umi_assigner(strategy, 0, 0, 1, true);
+        let any = assigner.as_any();
+        assert!(
+            !any.is::<ParallelIdentityAssigner>()
+                && !any.is::<ParallelEditAssigner>()
+                && !any.is::<ParallelAdjacencyAssigner>()
+                && !any.is::<ParallelPairedAssigner>(),
+            "expected sequential assigner for {strategy:?} when num_threads == 1"
+        );
+    }
+
+    /// With `use_parallel = false`, `create_umi_assigner` must build a sequential
+    /// (non-parallel) assigner.
+    #[rstest]
+    #[case(Strategy::Identity)]
+    #[case(Strategy::Edit)]
+    #[case(Strategy::Adjacency)]
+    #[case(Strategy::Paired)]
+    fn create_umi_assigner_sequential_builds_non_parallel_variant(#[case] strategy: Strategy) {
+        // Identity requires zero edits; the other strategies accept zero too.
+        let assigner = create_umi_assigner(strategy, 0, 0, 2, false);
+        let any = assigner.as_any();
+        assert!(
+            !any.is::<ParallelIdentityAssigner>()
+                && !any.is::<ParallelEditAssigner>()
+                && !any.is::<ParallelAdjacencyAssigner>()
+                && !any.is::<ParallelPairedAssigner>(),
+            "expected sequential assigner for {strategy:?}"
+        );
+    }
+
+    #[rstest]
+    // `--allow-unmapped` forces the parallel path for every group, regardless of
+    // template count, strategy, or whether a threshold opt is present.
+    #[case(true, 0, Strategy::Identity, None, true)]
+    #[case(true, 0, Strategy::Paired, Some(ParallelMinTemplates::Fixed(usize::MAX)), true)]
+    // No `--allow-unmapped` and no threshold opt: never parallel, even for a huge group.
+    #[case(false, 1_000_000, Strategy::Paired, None, false)]
+    // Fixed threshold applies uniformly, including to Identity: parallel iff count >= N.
+    // Fixed(0) means "always parallel": every count (including 0) clears the threshold.
+    #[case(false, 0, Strategy::Identity, Some(ParallelMinTemplates::Fixed(0)), true)]
+    #[case(false, 500, Strategy::Identity, Some(ParallelMinTemplates::Fixed(500)), true)]
+    #[case(false, 499, Strategy::Identity, Some(ParallelMinTemplates::Fixed(500)), false)]
+    // Auto thresholds, at the per-strategy crossover and just below it.
+    #[case(false, 128, Strategy::Paired, Some(ParallelMinTemplates::Auto), true)]
+    #[case(false, 127, Strategy::Paired, Some(ParallelMinTemplates::Auto), false)]
+    #[case(false, 1536, Strategy::Edit, Some(ParallelMinTemplates::Auto), true)]
+    #[case(false, 1535, Strategy::Edit, Some(ParallelMinTemplates::Auto), false)]
+    #[case(false, 3072, Strategy::Adjacency, Some(ParallelMinTemplates::Auto), true)]
+    #[case(false, 3071, Strategy::Adjacency, Some(ParallelMinTemplates::Auto), false)]
+    // Auto keeps Identity sequential even at very large group sizes.
+    #[case(false, 1_000_000, Strategy::Identity, Some(ParallelMinTemplates::Auto), false)]
+    fn should_use_parallel_covers_all_triggers(
+        #[case] allow_unmapped: bool,
+        #[case] template_count: usize,
+        #[case] strategy: Strategy,
+        #[case] opt: Option<ParallelMinTemplates>,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            should_use_parallel(allow_unmapped, template_count, strategy, opt.as_ref()),
+            expected,
+        );
+    }
+
+    /// Regression guard for the CLI wiring of the new `--parallel-group-min-templates`
+    /// flag: clap must parse it (via `ParallelMinTemplates`'s `FromStr`) into
+    /// `GroupOptions::parallel_group_min_templates`, and absence must leave it `None`
+    /// (so the thread-count-aware default applies). The runall-prefixed
+    /// `--group::parallel-group-min-templates` surface rides the same
+    /// `MultiGroupOptions` mechanism exercised by `--group::strategy` in
+    /// `test_runall_parity`.
+    #[rstest]
+    #[case::absent(&["group", "-i", "in.bam", "-o", "out.bam", "--strategy", "identity"], None)]
+    #[case::auto(
+        &["group", "-i", "in.bam", "-o", "out.bam", "--strategy", "edit",
+          "--parallel-group-min-templates", "auto"],
+        Some(ParallelMinTemplates::Auto)
+    )]
+    #[case::fixed(
+        &["group", "-i", "in.bam", "-o", "out.bam", "--strategy", "adjacency",
+          "--parallel-group-min-templates", "256"],
+        Some(ParallelMinTemplates::Fixed(256))
+    )]
+    fn parallel_group_min_templates_cli_parses_into_group_options(
+        #[case] args: &[&str],
+        #[case] expected: Option<ParallelMinTemplates>,
+    ) {
+        let cmd = <GroupReadsByUmi as clap::Parser>::try_parse_from(args)
+            .expect("group args should parse");
+        assert_eq!(cmd.options.parallel_group_min_templates, expected);
+    }
 
     /// Helper struct for managing temporary test file paths.
     /// Keeps `TempDir` alive for the lifetime of the struct.
