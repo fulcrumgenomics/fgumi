@@ -797,7 +797,17 @@ impl<'a> ChainBuilder<'a> {
         use noodles::sam::alignment::record::data::field::Tag;
         let cell_tag = Tag::from(SamTag::CB);
         let library_index = fgumi_bam_io::LibraryIndex::from_header(&self.header);
-        fgumi_bam_io::GroupKeyConfig::new(library_index, cell_tag)
+        let config = fgumi_bam_io::GroupKeyConfig::new(library_index, cell_tag);
+        // When a Group stage is in the chain, cache the UMI (RX) value position
+        // during decode so `fgumi group`'s per-template UMI-assignment lookup can
+        // slice it without re-scanning aux data (#334). Group's UMI tag is fixed
+        // to RX (see `add_group`'s `raw_tag`). Chains without a Group stage skip
+        // the cache to avoid the extra per-record aux scan.
+        if self.spec.stages.contains(&Stage::Group) {
+            config.with_umi_tag(*SamTag::RX)
+        } else {
+            config
+        }
     }
 
     /// Group-key config for the **source preamble's** `DecodeRecords`.
@@ -1940,10 +1950,7 @@ impl<'a> ChainBuilder<'a> {
             use crate::pipeline::steps::serialize_record_batch::SerializeRecordBatch;
             use crate::pipeline::steps::sort::{SortAndSpill, SortMerge, SortSpillDecompress};
             use crate::sam::SamTag;
-            use fgumi_bam_io::GroupKeyConfig;
-            use fgumi_bam_io::LibraryIndex;
             use fgumi_sort::{RawExternalSorter, SortOrder};
-            use noodles::sam::alignment::record::data::field::Tag;
 
             // Auto isn't supported in a fused chain (sort shares the budget with
             // the other stages); require a fixed value.
@@ -2042,9 +2049,11 @@ impl<'a> ChainBuilder<'a> {
                 }
             } else {
                 // Intermediate: decode to DecodedRecordBatch for downstream stages.
-                let cell_tag = Tag::from(SamTag::CB);
-                let library_index = LibraryIndex::from_header(&self.header);
-                let group_key_config = GroupKeyConfig::new(library_index, cell_tag);
+                // Route through `bam_group_key_config` so a `[Sort, Group]` chain
+                // still caches the UMI (RX) value position during this decode —
+                // otherwise group would re-scan aux per template and lose the
+                // #334/#343 optimization on the sort→group path.
+                let group_key_config = self.bam_group_key_config();
                 let tail = self.pipeline.append_step(
                     DecodeFromRecords::new(group_key_config, self.tuning.per_step_byte_limit),
                     merge_tail,

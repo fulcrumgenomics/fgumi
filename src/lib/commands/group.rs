@@ -719,7 +719,12 @@ fn assign_umi_groups_for_indices_impl(
         } else {
             use fgumi_raw_bam;
 
-            let umi_bytes = if let Some(r1_raw) = template.r1() {
+            // Prefer the UMI position cached during the parallel Decode step
+            // (#334). The fallback exists for templates built outside the Decode
+            // path (e.g. tests, SAM input) and when the cache was not recorded.
+            let umi_bytes = if let Some(cached) = template.cached_umi() {
+                cached
+            } else if let Some(r1_raw) = template.r1() {
                 let aux = fgumi_raw_bam::aux_data_slice(r1_raw);
                 fgumi_raw_bam::find_string_tag(aux, raw_tag)
                     .ok_or_else(|| anyhow::anyhow!("Missing UMI tag"))?
@@ -5339,6 +5344,7 @@ mod tests {
             r1_secondaries: Some((2, 3)),
             r2_secondaries: None,
             mi: crate::umi::MoleculeId::None,
+            cached_umi_position: None,
         };
 
         let config = GroupFilterConfig {
@@ -5388,6 +5394,7 @@ mod tests {
             r1_secondaries: None,
             r2_secondaries: None,
             mi: crate::umi::MoleculeId::None,
+            cached_umi_position: None,
         };
 
         let config = GroupFilterConfig {
