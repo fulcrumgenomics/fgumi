@@ -92,10 +92,10 @@ jobs:
             fgumi-tag
             fgumi-raw-bam
             fgumi-bam-io
-            fgumi-sort
             fgumi-umi
             fgumi-sam
             fgumi-metrics
+            fgumi-sort
             fgumi-consensus
             fgumi
           )
@@ -119,6 +119,43 @@ jobs:
             echo "ERROR: CRATES publish list contains entries not in workspace:"
             echo "$EXTRA"
             echo "Remove or rename stale entries before publishing."
+            exit 1
+          fi
+
+          # Verify the CRATES list is in valid topological order: every
+          # workspace dependency of a crate must appear EARLIER in the list.
+          # `cargo publish` resolves each crate's dependencies against the
+          # crates.io index, so a dependency published later does not yet
+          # exist when its dependent is published.  Catching this here -- as a
+          # pure list check, before any upload -- prevents a mid-publish
+          # failure that would leave a partially released version on crates.io
+          # (published versions cannot be deleted, only yanked).
+          META=$(cargo metadata --no-deps --format-version 1)
+          WS_JSON=$(echo "$META" | jq '[.packages[] | select(.publish != []) | .name]')
+          index_of() {
+            local target="$1" i
+            for i in "${!CRATES[@]}"; do
+              if [ "${CRATES[$i]}" = "$target" ]; then echo "$i"; return; fi
+            done
+            echo "-1"
+          }
+          ORDER_ERRORS=""
+          for i in "${!CRATES[@]}"; do
+            crate="${CRATES[$i]}"
+            DEPS=$(echo "$META" | jq -r --arg c "$crate" --argjson ws "$WS_JSON" '
+              .packages[] | select(.name == $c) | .dependencies[].name
+              | select(. as $d | $ws | index($d))' | sort -u)
+            for dep in $DEPS; do
+              j=$(index_of "$dep")
+              if [ "$j" -ge "$i" ]; then
+                ORDER_ERRORS="${ORDER_ERRORS}  ${crate} depends on ${dep}, which must be listed earlier\n"
+              fi
+            done
+          done
+          if [ -n "$ORDER_ERRORS" ]; then
+            echo "ERROR: CRATES publish list is not in valid dependency order:"
+            printf "%b" "$ORDER_ERRORS"
+            echo "Reorder the CRATES array so every dependency precedes its dependents."
             exit 1
           fi
 
