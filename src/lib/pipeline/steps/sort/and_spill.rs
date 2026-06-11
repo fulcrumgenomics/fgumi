@@ -140,6 +140,17 @@ fn finalize_queryname_natural(
 }
 
 fn build_stream(sorter: RawExternalSorter, header: &Header) -> Result<SortStream> {
+    // Pin the spill codec to BGZF for the entire streaming-sort path. The
+    // downstream `SortSpillDecompress` step reads spill chunks as raw BGZF
+    // blocks (`fgumi_bgzf::reader::read_raw_blocks` + per-block inflate); main's
+    // default zstd spill codec (#341) uses an incompatible length-prefixed frame
+    // format that the block-wise read loop would decode to garbage. Enforcing it
+    // here — the single chokepoint for every streaming sorter (chain builder and
+    // tests alike) — makes the invariant impossible to violate at a call site.
+    // Standalone `fgumi sort` keeps zstd via its own sorter in `build_sort_step`;
+    // teaching `SortSpillDecompress` to stream-decode zstd frames is a tracked
+    // perf follow-up.
+    let sorter = sorter.spill_codec(fgumi_sort::SpillCodec::Bgzf);
     match sorter.sort_order() {
         SortOrder::Coordinate => Ok(SortStream::Coordinate(sorter.into_coordinate_stream(header)?)),
         SortOrder::Queryname(_) => Ok(SortStream::Queryname(sorter.into_queryname_stream(header)?)),
