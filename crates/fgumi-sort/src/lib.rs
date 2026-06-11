@@ -56,6 +56,7 @@ pub(crate) mod radix;
 pub(crate) mod read_ahead;
 pub(crate) mod reader;
 pub(crate) mod segmented_buf;
+pub(crate) mod spill_block_reader;
 pub(crate) mod tmp_dir_alloc;
 pub(crate) mod verify;
 pub(crate) mod worker_pool;
@@ -177,6 +178,7 @@ pub use keys::{
 };
 pub use merge_slots::{PHASE2_DECOMP_CAP, SortMergeSlot};
 pub use reader::RawBamRecordReader;
+pub use spill_block_reader::SpillBlockDecompressor;
 pub use verify::{VerifySummary, verify_sort_order};
 
 #[cfg(test)]

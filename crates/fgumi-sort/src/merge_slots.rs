@@ -68,6 +68,8 @@ use std::io::BufReader;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::codec::SpillCodec;
+
 /// Per-slot decompressed-block queue cap. Bounds in-flight
 /// decompressed memory: `num_slots × PHASE2_DECOMP_CAP × ~256 KB`.
 /// Matches `worker_pool::PHASE2_DECOMP_CAP` numerically.
@@ -99,6 +101,11 @@ pub struct SortMergeSlot {
     /// `file_id` so the `LoserTree` tie-break for equal sort keys
     /// is deterministic and matches the legacy chunk-files order.
     pub file_id: u32,
+    /// Spill codec of this chunk's file, detected from the file magic when the
+    /// slot is opened (`slots_for_chunk_files`). The `SortSpillDecompress` step
+    /// reads it to decompress BGZF blocks or zstd frames; `reader` is already
+    /// positioned past any codec file-magic.
+    pub codec: SpillCodec,
     /// Disk reader. Held only while reading raw bytes from disk.
     /// One worker at a time per slot via `try_lock`.
     pub reader: Mutex<SortMergeReader>,
@@ -129,11 +136,13 @@ pub struct SortMergeSlot {
 }
 
 impl SortMergeSlot {
-    /// Construct an empty slot for `file_id` backed by `reader`.
+    /// Construct an empty slot for `file_id` backed by `reader` (positioned
+    /// past any codec file-magic) with the detected `codec`.
     #[must_use]
-    pub fn new(file_id: u32, reader: BufReader<File>) -> Self {
+    pub fn new(file_id: u32, reader: BufReader<File>, codec: SpillCodec) -> Self {
         Self {
             file_id,
+            codec,
             reader: Mutex::new(SortMergeReader { inner: reader }),
             decompressed: Mutex::new(VecDeque::with_capacity(PHASE2_DECOMP_CAP)),
             queue_eof: AtomicBool::new(false),
@@ -227,7 +236,7 @@ mod tests {
 
     #[test]
     fn new_slot_starts_empty_and_not_drained() {
-        let slot = SortMergeSlot::new(0, empty_reader());
+        let slot = SortMergeSlot::new(0, empty_reader(), SpillCodec::Bgzf);
         assert_eq!(slot.file_id, 0);
         assert!(!slot.is_drained(), "fresh slot not drained until queue_eof");
         let (pending_blocks, pending_bytes, active) = slot.probe_stats();
@@ -238,7 +247,7 @@ mod tests {
 
     #[test]
     fn drained_when_queue_eof_and_empty() {
-        let slot = SortMergeSlot::new(0, empty_reader());
+        let slot = SortMergeSlot::new(0, empty_reader(), SpillCodec::Bgzf);
 
         // Push a decompressed block; not drained even if queue_eof.
         slot.decompressed.lock().unwrap().push_back(vec![0xAB, 0xCD]);
@@ -253,7 +262,7 @@ mod tests {
 
     #[test]
     fn probe_stats_counts_decompressed_only() {
-        let slot = SortMergeSlot::new(0, empty_reader());
+        let slot = SortMergeSlot::new(0, empty_reader(), SpillCodec::Bgzf);
         slot.decompressed.lock().unwrap().push_back(vec![0u8; 1024]);
         slot.decompressed.lock().unwrap().push_back(vec![0u8; 512]);
 
@@ -265,7 +274,7 @@ mod tests {
 
     #[test]
     fn fifo_order() {
-        let slot = SortMergeSlot::new(7, empty_reader());
+        let slot = SortMergeSlot::new(7, empty_reader(), SpillCodec::Bgzf);
         // Push in order; pop must yield in same order.
         slot.decompressed.lock().unwrap().push_back(vec![0]);
         slot.decompressed.lock().unwrap().push_back(vec![1]);
@@ -281,7 +290,7 @@ mod tests {
 
     #[test]
     fn decomp_error_flag_set_and_read() {
-        let slot = SortMergeSlot::new(0, empty_reader());
+        let slot = SortMergeSlot::new(0, empty_reader(), SpillCodec::Bgzf);
         assert!(!slot.decomp_error.load(Ordering::Acquire));
         slot.decomp_error.store(true, Ordering::Release);
         assert!(slot.decomp_error.load(Ordering::Acquire));
@@ -289,7 +298,7 @@ mod tests {
 
     #[test]
     fn errored_slot_is_not_drained() {
-        let slot = SortMergeSlot::new(0, empty_reader());
+        let slot = SortMergeSlot::new(0, empty_reader(), SpillCodec::Bgzf);
 
         // Mark EOF with an empty queue but a decompression error set: this
         // must NOT be reported as a clean drain, otherwise a caller using
@@ -303,7 +312,7 @@ mod tests {
 
     #[test]
     fn clean_eof_reports_no_error() {
-        let slot = SortMergeSlot::new(0, empty_reader());
+        let slot = SortMergeSlot::new(0, empty_reader(), SpillCodec::Bgzf);
         slot.queue_eof.store(true, Ordering::Release);
         assert!(slot.is_drained(), "clean empty + queue_eof is drained");
         assert!(!slot.has_error(), "clean drain has no error");
