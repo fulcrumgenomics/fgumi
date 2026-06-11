@@ -7744,4 +7744,33 @@ mod from_slots_merge_tests {
         let emitted = drain_merge_driver_bytes(driver);
         assert_eq!(emitted, vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
     }
+
+    #[test]
+    fn from_slots_records_merged_equals_emitted_total() {
+        // `records_merged()` (surfaced by `SortMerge` at completion) must equal
+        // the number of records actually emitted across all sources.
+        let f0: Vec<(TestKey, Vec<u8>)> =
+            (0u64..15).map(|i| (TestKey(i * 2), format!("a-{i:02}").into_bytes())).collect();
+        let f1: Vec<(TestKey, Vec<u8>)> =
+            (0u64..15).map(|i| (TestKey(i * 2 + 1), format!("b-{i:02}").into_bytes())).collect();
+        let total = (f0.len() + f1.len()) as u64;
+
+        let slots = vec![populated_slot(0, &f0, 3), populated_slot(1, &f1, 2)];
+        let mut driver = MergeDriver::<TestKey>::from_slots(slots, Vec::new(), total);
+
+        let mut emitted = 0u64;
+        loop {
+            match driver.try_step().expect("try_step") {
+                MergeStep::Produced(_) => emitted += 1,
+                MergeStep::Done => break,
+                MergeStep::Stalled => panic!("unexpected Stalled on pre-populated EOF slots"),
+            }
+        }
+        assert_eq!(emitted, total, "should emit every input record");
+        assert_eq!(
+            driver.records_merged(),
+            total,
+            "records_merged must equal the emitted record count"
+        );
+    }
 }

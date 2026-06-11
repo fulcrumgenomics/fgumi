@@ -165,8 +165,10 @@ enum NextBatch {
     /// The merge driver stalled on a not-yet-ready slot. Carries any
     /// partially-filled batch to flush before yielding.
     Stalled(Option<RecordBatch>),
-    /// The merge is exhausted. Carries any final partial batch to flush.
-    Done(Option<RecordBatch>),
+    /// The merge is exhausted. Carries any final partial batch to flush, plus
+    /// the driver's total `records_merged()` — read in `next_batch` while the
+    /// driver is still in scope — for the completion log.
+    Done(Option<RecordBatch>, u64),
 }
 
 /// Three-phase state machine for [`SortMerge`].
@@ -474,7 +476,10 @@ impl SortMerge {
                     return Ok(NextBatch::Stalled(flush_partial(builder, next_ordinal)));
                 }
                 MergeStep::Done => {
-                    return Ok(NextBatch::Done(flush_partial(builder, next_ordinal)));
+                    return Ok(NextBatch::Done(
+                        flush_partial(builder, next_ordinal),
+                        driver.records_merged(),
+                    ));
                 }
             }
         }
@@ -529,7 +534,7 @@ impl SortMerge {
                         StepOutcome::Contention
                     });
                 }
-                NextBatch::Done(partial) => {
+                NextBatch::Done(partial, merged) => {
                     if let Some(batch) = partial {
                         if let Err(unpushed) = ctx.outputs.push(batch) {
                             self.held.put(unpushed);
@@ -539,6 +544,10 @@ impl SortMerge {
                         }
                         delivered += 1;
                     }
+                    // Surface the merged-record count carried up from `next_batch`
+                    // (where the driver was in scope). The streaming sort's
+                    // analogue of standalone sort's Records-written summary.
+                    log::info!("Sort merge complete: {merged} records merged");
                     self.state = SortMergeState::Done;
                     return Ok(if delivered > 0 {
                         StepOutcome::Progress
