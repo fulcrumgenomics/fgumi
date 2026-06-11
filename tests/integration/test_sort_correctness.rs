@@ -128,6 +128,30 @@ fn count_records(bam_path: &Path) -> u64 {
         .expect("samtools view -c output should be a valid integer")
 }
 
+/// Decode a BAM's records to SAM text (via `samtools view`) and return the
+/// record lines in a canonical, order-independent order (sorted lexically).
+///
+/// Sorting reorders records but must not alter their content, so two BAMs that
+/// hold the same records — regardless of sort order or output compression
+/// codec — produce identical results here. Comparing the input against a sorted
+/// output therefore asserts byte-identical record preservation through the
+/// write path, which a record-count check alone cannot (a truncated or mangled
+/// record with the right count would slip past a count assertion).
+fn record_lines_canonical(bam_path: &Path) -> Vec<String> {
+    let output = Command::new("samtools")
+        .args(["view", bam_path.to_str().unwrap()])
+        .output()
+        .expect("samtools view");
+    assert!(output.status.success(), "samtools view failed for {}", bam_path.display());
+    let mut lines: Vec<String> = String::from_utf8(output.stdout)
+        .expect("samtools view output is valid UTF-8")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    lines.sort();
+    lines
+}
+
 /// Sort a BAM file with fgumi and return the output path.
 fn sort_bam(input: &Path, output: &Path, order: &str, threads: usize, max_memory: &str) {
     sort_bam_with_args(input, output, order, threads, max_memory, &[]);
@@ -182,6 +206,39 @@ fn test_sort_coordinate_in_memory() {
     sort_bam(&input, &output, "coordinate", 2, "100M");
     assert!(verify_sorted(&output, "coordinate"), "coordinate sort verification failed");
     assert_eq!(count_records(&input), count_records(&output), "record count mismatch");
+}
+
+/// `--compression-level 0` must produce a valid, readable, correctly-sorted BAM
+/// that preserves every input record byte-for-byte.
+/// Level 0 routes through the `BgzfCompress`/`WriteBgzfFile` path with
+/// `InlineBgzfCompressor::new(0)`, which emits uncompressed (stored) BGZF blocks
+/// (#361). Guards that the #330 pipeline honours level 0 rather than rejecting or
+/// silently remapping it. Run with spills so the level-0 setting flows through to
+/// the final BAM write; the spill path keeps the helper's default
+/// `--temp-compression 1` (a separate knob from `--compression-level`).
+#[test]
+#[ignore = "requires samtools"]
+fn test_sort_compression_level_zero() {
+    if !samtools_available() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let input = create_test_bam(dir.path(), 2000);
+    let output = dir.path().join("sorted_l0.bam");
+
+    // Small memory forces spills; -c 0 is the uncompressed output level.
+    sort_bam_with_args(&input, &output, "coordinate", 2, "50K", &["--compression-level", "0"]);
+    assert!(verify_sorted(&output, "coordinate"), "level-0 coordinate sort verification failed");
+
+    // Content preservation: the level-0 (uncompressed-BGZF) write path must round-trip
+    // every record intact. Compare the input against the sorted output order-independently
+    // — sorting reorders records but must not alter them — so a dropped, truncated, or
+    // mangled record fails here even when the count happens to match.
+    assert_eq!(
+        record_lines_canonical(&input),
+        record_lines_canonical(&output),
+        "level-0 output records differ from the input (uncompressed-BGZF write corrupted content?)"
+    );
 }
 
 #[test]
