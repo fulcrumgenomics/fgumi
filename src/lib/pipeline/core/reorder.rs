@@ -174,6 +174,12 @@ const REORDER_OVERFLOW_UNBOUNDED: u64 = u64::MAX;
 pub trait ReorderCapHandle: Send + Sync {
     /// Set the overflow byte cap (`u64::MAX` = unbounded).
     fn set_max_overflow_bytes(&self, bytes: u64);
+
+    /// Bytes currently held in the must-accept overflow stash. The deadlock
+    /// monitor sums this across branches (with the transport queues) to tell a
+    /// real wedge (work stuck) from upstream starvation (everything empty); the
+    /// cap-enforcement tests use it to observe stash growth.
+    fn current_buffer_bytes(&self) -> u64;
 }
 
 impl<T: Send + HeapSize + 'static> ReorderCapHandle for ReorderStage<T> {
@@ -183,6 +189,10 @@ impl<T: Send + HeapSize + 'static> ReorderCapHandle for ReorderStage<T> {
         // value is only read on the must-accept slow path under `state.lock()`.
         self.max_overflow_bytes.store(bytes, Ordering::Relaxed);
     }
+
+    fn current_buffer_bytes(&self) -> u64 {
+        self.state.lock().buffer_bytes
+    }
 }
 
 #[cfg(test)]
@@ -191,13 +201,6 @@ impl<T: Send + HeapSize + 'static> ReorderStage<T> {
     /// lets the budget-wiring test assert `apply_initial_queue_budget` set it.
     pub(crate) fn current_max_overflow_bytes(&self) -> u64 {
         self.max_overflow_bytes.load(Ordering::Relaxed)
-    }
-
-    /// Read the current stash (overflow buffer) byte count. Test-only — lets
-    /// the cap-enforcement tests observe the stash size without the production
-    /// peak-tracking diagnostics.
-    pub(crate) fn current_buffer_bytes(&self) -> u64 {
-        self.state.lock().buffer_bytes
     }
 }
 

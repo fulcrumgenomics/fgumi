@@ -443,7 +443,11 @@ pub struct SchedulerOptions {
     /// Timeout in seconds for deadlock detection (default: 10, 0 = disabled).
     ///
     /// When no progress is made for this duration, a warning is logged with
-    /// diagnostic info (queue depths, memory usage, per-queue timestamps).
+    /// diagnostic info (queue depths, memory usage, per-queue timestamps). If
+    /// the stall persists with work still in flight, the run fails fast with a
+    /// timeout error after 6× this duration (~60s at the default) — long enough
+    /// that a single large dispatch (busy-locus group, large sort merge) is not
+    /// mistaken for a wedge.
     #[arg(long = "deadlock-timeout", default_value_t = 10, hide = true)]
     pub deadlock_timeout: u64,
 

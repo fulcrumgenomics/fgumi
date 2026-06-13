@@ -199,6 +199,9 @@ pub fn run_fused_single_thread(
         Some(PipelineError::NotEnoughThreads { required, available }) => {
             Err(PipelineError::NotEnoughThreads { required: *required, available: *available })
         }
+        Some(PipelineError::TimedOut { stalled_secs }) => {
+            Err(PipelineError::TimedOut { stalled_secs: *stalled_secs })
+        }
         None => Ok(()),
     }
 }

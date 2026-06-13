@@ -20,6 +20,10 @@ pub enum PipelineError {
     Cancelled,
     /// The chain has more `Exclusive` steps than the configured thread count.
     NotEnoughThreads { required: usize, available: usize },
+    /// The deadlock monitor observed no global progress for `stalled_secs`
+    /// while work was still stuck in queues/reorder buffers — a wedge. The
+    /// pipeline is failed fast rather than left to hang forever.
+    TimedOut { stalled_secs: u64 },
 }
 
 impl std::fmt::Display for PipelineError {
@@ -30,6 +34,10 @@ impl std::fmt::Display for PipelineError {
             Self::NotEnoughThreads { required, available } => write!(
                 f,
                 "pipeline requires {required} threads for Exclusive steps, only {available} available"
+            ),
+            Self::TimedOut { stalled_secs } => write!(
+                f,
+                "pipeline deadlock detected: no progress for {stalled_secs}s with work still in flight"
             ),
         }
     }
