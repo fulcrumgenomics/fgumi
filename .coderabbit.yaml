@@ -1,0 +1,122 @@
+# yaml-language-server: $schema=https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+#
+# CodeRabbit review configuration for fgumi (high-performance UMI processing).
+#
+# fgumi is correctness-critical and throughput-critical: its outputs (grouping,
+# consensus, sort order, corrected UMIs) are validated for identity against
+# fgbio / samtools, it runs a hand-rolled concurrent pipeline whose liveness and
+# memory bounds are subtle, and it carries a small, documented set of `unsafe`
+# hot paths under an otherwise crate-wide `#![deny(unsafe_code)]`. The
+# `assertive` profile + the path instructions below aim the review at the failure
+# modes that actually bite here (output divergence vs fgbio, pipeline
+# deadlock/unbounded memory, FFI/`unsafe` unsoundness, doc/contract drift) rather
+# than generic style.
+
+language: en-US
+
+# Terse, technical, no praise or filler — match the codebase's review style.
+# NB: CodeRabbit caps tone_instructions at 250 characters — keep this terse.
+tone_instructions: >-
+  Concise and technical. Skip praise and restating the code. Lead with the risk
+  and a one-line fix. Favor correctness, output identity vs fgbio/samtools,
+  concurrency soundness, and memory bounds over style. Skip clippy/rustfmt nits;
+  CI enforces them.
+
+reviews:
+  # Surface borderline correctness/soundness findings, not just high-confidence
+  # ones. For a tool whose output is checked byte-for-byte against fgbio, a false
+  # positive is cheaper than a missed output divergence.
+  profile: assertive
+  high_level_summary: true
+  poem: false
+  collapse_walkthrough: false
+  # Review automatically on push; don't review draft PRs.
+  auto_review:
+    enabled: true
+    drafts: false
+  # Never auto-block merges on a review verdict; findings are advisory.
+  request_changes_workflow: false
+
+  # Don't spend review budget on build output, fixtures, or vendored lockfiles.
+  path_filters:
+    - "!**/target/**"
+    - "!**/*.lock"
+
+  # MAINTENANCE: these instructions name specific modules, invariants, and code
+  # constructs. Re-read and update them whenever those modules are refactored or
+  # renamed — stale instructions silently misdirect the reviewer. (Both the
+  # `unified_pipeline` and `pipeline` paths are listed: issue #330 renames the
+  # former to the latter, so the same instructions apply to whichever is present.)
+  path_instructions:
+    - path: "src/lib/{unified_pipeline,pipeline}/**/*.rs"
+      instructions: >-
+        This is the hand-rolled concurrent step pipeline; its bugs are deadlocks,
+        lost output, and unbounded memory, not style. Treat any change to the
+        reorder stage, queue push/pop, backpressure, or producer gating as
+        liveness- and memory-critical. Require that the must-accept `next_serial`
+        exemption is preserved (the producer of `next_serial` can never be
+        backpressured — refusing it can deadlock), and that no path lets a
+        transport queue or reorder overflow stash grow without a byte bound
+        (memory must be a function of config, not input size). Flag: a byte/size
+        cap that is checked only on one sub-condition (e.g. only when transport is
+        full) so a consumer relocation can bypass it; capping a consumer drain
+        loop (must stay unbounded — bound producers instead); a Parallel step
+        whose drain-counter / output-close accounting can leave the shared output
+        unclosed; error/cancel paths that don't propagate via the shared signal so
+        `is_done()` is observed; and any new `unsafe` in the typed-step dispatch
+        hot path not matching the documented `#[allow(unsafe_code)]` sites.
+    - path: "crates/fgumi-sort/**/*.rs"
+      instructions: >-
+        This is the sort engine, including approved `unsafe` hot paths (LSD radix
+        sort with `Vec::set_len` + raw-pointer ping-pong in inline.rs, and the
+        natural-order queryname comparator). For every `unsafe` block require a
+        `// SAFETY:` comment whose invariant actually holds (buffer written exactly
+        once before read; pointers disjoint and properly aligned; read names
+        null-terminated by construction) AND a corresponding entry in the unsafe
+        allowlist in CLAUDE.md — flag new `unsafe` that lacks either. Treat the
+        sort-order comparators (coordinate, queryname, template-coordinate) as
+        output-identity-critical vs `samtools sort`: a change to key extraction or
+        comparison needs a test pinning identity. Flag off-by-one in radix passes,
+        `usize`/`u64` narrowing in key math, and external-merge / spill logic that
+        can drop or duplicate records under memory pressure.
+    - path: "crates/fgumi-raw-bam/**/*.rs"
+      instructions: >-
+        This is zero-copy raw-BAM byte handling and the samtools-compatible
+        natural-order comparator (`natural_compare` / `natural_compare_nul`), which
+        use `get_unchecked` / raw `*const u8` walks under `#[allow(unsafe_code)]`.
+        Require each unchecked access to be bounded by a loop invariant
+        (`debug_assert!`-ed) or a caller-guaranteed null terminator, with a SAFETY
+        comment and an allowlist entry. Flag record field-offset / endianness
+        errors, and any parser that trusts a length or offset from the BAM bytes
+        without validating it against the record/block bounds (fail closed on
+        malformed input, never read past the buffer).
+    - path: "crates/{fgumi-consensus,fgumi-umi,fgumi-metrics}/**/*.rs"
+      instructions: >-
+        These are the consensus callers, UMI assignment (identity / edit-distance /
+        adjacency / paired), and QC metrics — the output that is validated against
+        fgbio. Treat any change to consensus base/quality math, UMI grouping /
+        edit-distance / adjacency assignment, or a metric formula as
+        output-changing: require a test asserting identity (or documented,
+        intentional divergence) against the fgbio baseline, generated
+        programmatically. Flag silent behavior changes on the edge cases that
+        differ between tools: ties in adjacency/edit-distance, single-read or empty
+        families, min/max family-size thresholds, and quality-score capping /
+        rounding.
+    - path: "src/lib/umi/parallel_assigner.rs"
+      instructions: >-
+        Parallel UMI-assignment strategies (identity / edit-distance / adjacency /
+        paired) that must produce output identical to the sequential assigners in
+        `crates/fgumi-umi`. Treat any change to grouping/assignment as
+        output-changing: require parity coverage (or documented, intentional
+        divergence) against both the sequential code path and the fgbio baseline,
+        generated programmatically. Flag tie-breaking, empty/single-read family,
+        and threshold-boundary behavior changes, plus correctness of the lock-free
+        union-find and partition-merge concurrency.
+    - path: "**/tests/**/*.rs"
+      instructions: >-
+        Generate test data programmatically (SamBuilder / fgpyo-style builders); do
+        not add committed BAM/fixture files. New correctness-critical behavior
+        needs an INDEPENDENT oracle (e.g. parity against the fgbio baseline or a
+        second code path), not just a self-consistency check. Flag assertions
+        weaker than the stated contract, and end-to-end tests that assert a record
+        count but not record identity.
