@@ -246,3 +246,53 @@ fn test_correct_command_rejects_streaming_threaded_integrity() {
         observed_order.iter().cloned().collect();
     assert_eq!(observed_names, expected_names, "unexpected reject-name set");
 }
+
+/// Smoke check — `fgumi correct` runs to completion via the typed-step
+/// framework entry point (`execute_new_pipeline`) and emits its
+/// distinctive log line. The legacy iterator path was deleted in Phase 1
+/// T1.9; this test now verifies the surviving path runs end-to-end.
+/// `RUST_LOG=info` is injected on the spawned process so an ambient
+/// stricter env (e.g. `RUST_LOG=warn`) on the developer's shell cannot
+/// silently mask the log line.
+#[test]
+fn correct_emits_new_pipeline_log() {
+    use fgumi_lib::commands::correct::NEW_PIPELINE_START_LOG;
+
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let whitelist = temp_dir.path().join("whitelist.txt");
+
+    // One family with an exact-match UMI so the command completes successfully.
+    let reads = create_umi_family("ACGTACGT", 2, "read", "AAAAGGGG", 30);
+    create_umi_bam(&input_bam, vec![reads]);
+    create_whitelist(&whitelist, &["ACGTACGT"]);
+
+    let r = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .env("RUST_LOG", "info")
+        .args([
+            "correct",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--umi-files",
+            whitelist.to_str().unwrap(),
+            "--min-distance",
+            "1",
+            "--threads",
+            "2",
+        ])
+        .output()
+        .expect("failed to execute fgumi");
+
+    assert!(r.status.success(), "correct: {}", String::from_utf8_lossy(&r.stderr));
+
+    let stderr = String::from_utf8_lossy(&r.stderr);
+    assert!(
+        stderr.contains(NEW_PIPELINE_START_LOG),
+        "fgumi correct should emit the typed-step framework startup log line, \
+         but the new-pipeline log line ({NEW_PIPELINE_START_LOG:?}) is absent. \
+         Stderr:\n{stderr}"
+    );
+}

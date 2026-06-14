@@ -183,6 +183,92 @@ fn test_dedup_command_remove_duplicates() {
     assert!(count >= 2, "Should keep at least one pair");
 }
 
+/// SAM-input parity: dedup's typed-step path accepts both BAM and SAM via
+/// `InputSource::open_with_opts`. Writes the same record set to both `.bam`
+/// and `.sam`, runs `fgumi dedup` on each, and confirms the output BAMs
+/// agree on record name + flags (duplicate flag 0x400 is the load-bearing
+/// bit dedup mutates).
+#[test]
+fn test_dedup_command_with_sam_input_matches_bam_baseline() {
+    let temp_dir = TempDir::new().unwrap();
+    let bam_input = temp_dir.path().join("input.bam");
+    let sam_input = temp_dir.path().join("input.sam");
+    let out_bam_baseline = temp_dir.path().join("output_bam.bam");
+    let out_sam = temp_dir.path().join("output_sam.bam");
+
+    // Mirror `test_dedup_command_basic` so we exercise the same shape:
+    // two distinct UMI families at two positions.
+    let mut records = create_duplicate_group("dup1", "ACGTACGT", 3, 100);
+    records.extend(create_duplicate_group("dup2", "TGCATGCA", 2, 500));
+    create_sorted_bam(&bam_input, records);
+
+    // Convert BAM → SAM by replaying records through the noodles SAM writer.
+    {
+        use noodles::sam::alignment::io::Write as _;
+        let mut bam_reader =
+            bam::io::reader::Builder.build_from_path(&bam_input).expect("open bam");
+        let header = bam_reader.read_header().expect("read bam header");
+        let mut sam_writer =
+            noodles::sam::io::Writer::new(fs::File::create(&sam_input).expect("create sam"));
+        sam_writer.write_header(&header).expect("write sam header");
+        for record in bam_reader.records() {
+            let record = record.expect("bam record");
+            sam_writer.write_alignment_record(&header, &record).expect("write sam record");
+        }
+    }
+
+    let run_dedup = |input: &PathBuf, output: &PathBuf| {
+        let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
+            .args([
+                "dedup",
+                "--input",
+                input.to_str().unwrap(),
+                "--output",
+                output.to_str().unwrap(),
+                "--strategy",
+                "identity",
+                "--compression-level",
+                "1",
+                "--threads",
+                "2",
+            ])
+            .status()
+            .expect("Failed to run dedup");
+        assert!(status.success(), "dedup failed on {}", input.display());
+    };
+
+    run_dedup(&bam_input, &out_bam_baseline);
+    run_dedup(&sam_input, &out_sam);
+
+    // Compare record name + flags between the two outputs. The duplicate
+    // flag (0x400) is set by dedup's mark step, so identical flags across
+    // both runs proves the SAM source preamble feeds the same records
+    // into the chain as the BAM preamble.
+    let read_records = |path: &PathBuf| {
+        let mut reader = bam::io::reader::Builder.build_from_path(path).expect("open bam");
+        let _header = reader.read_header().expect("read header");
+        reader.records().map(|r| r.expect("read record")).collect::<Vec<_>>()
+    };
+    let bam_records = read_records(&out_bam_baseline);
+    let sam_records = read_records(&out_sam);
+
+    assert_eq!(
+        bam_records.len(),
+        sam_records.len(),
+        "BAM and SAM inputs produced different record counts ({} vs {})",
+        bam_records.len(),
+        sam_records.len(),
+    );
+    for (i, (bam_rec, sam_rec)) in bam_records.iter().zip(sam_records.iter()).enumerate() {
+        assert_eq!(bam_rec.name(), sam_rec.name(), "Record {i} name mismatch");
+        assert_eq!(
+            bam_rec.flags(),
+            sam_rec.flags(),
+            "Record {i} flag mismatch (duplicate-flag 0x400 disagrees between BAM and SAM input)",
+        );
+    }
+}
+
 /// Regression test for OOM with large position groups in `--no-umi` mode.
 ///
 /// WES data can have extreme depth pileups at capture targets, creating positions

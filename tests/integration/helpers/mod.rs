@@ -9,6 +9,8 @@
 
 pub mod assertions;
 pub mod bam_generator;
+pub mod cli_runner;
+pub mod parity;
 
 pub use assertions::*;
 pub use bam_generator::*;

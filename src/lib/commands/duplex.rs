@@ -4,55 +4,35 @@
 //! duplex consensus reads by performing two-stage consensus calling:
 //! 1. Single-strand consensus for /A and /B reads separately
 //! 2. Duplex consensus from paired single-strand consensuses
-//!
-//! When `--rejects` is set, the threaded pipeline routes rejected records through
-//! the unified pipeline's first-class secondary output (see
-//! [`crate::unified_pipeline::run_bam_pipeline_from_reader_with_secondary`]).
-//! Caller-emitted rejects flow through a per-batch buffer and land in batch-input
-//! order. The rejects BAM advertises the input header so raw-input RG/PG/contig
-//! metadata is preserved. The pattern matches `commands::filter`,
-//! `commands::correct`, and `commands::simplex`.
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fgoxide::io::DelimFile;
 use fgumi_bam_io::{
-    create_bam_reader_for_pipeline_with_opts, create_bam_writer, create_optional_bam_writer,
-    create_raw_bam_reader_with_opts,
+    create_bam_writer, create_optional_bam_writer, create_raw_bam_reader_with_opts,
 };
 
 use super::common::{
     BamIoOptions, CompressionOptions, ConsensusCallingOptions, OverlappingConsensusOptions,
     QueueMemoryOptions, ReadGroupOptions, RejectsOptions, SchedulerOptions, StatsOptions,
-    ThreadingOptions, build_pipeline_config, serialize_raw_bam_records,
+    ThreadingOptions,
 };
-use crate::commands::consensus_runner::{
-    ConsensusStatsOps, create_unmapped_consensus_header, log_overlapping_stats,
-};
-use crate::consensus_caller::{ConsensusCaller, ConsensusCallingStats, ConsensusOutput};
+use crate::commands::consensus_runner::{ConsensusStatsOps, log_overlapping_stats};
+use crate::consensus_caller::ConsensusCaller;
 use crate::duplex_consensus_caller::DuplexConsensusCaller;
 use crate::logging::{OperationTimer, log_consensus_summary};
-use crate::mi_group::{MiGroup, MiGroupBatch, MiGroupIterator, MiGrouper};
+use crate::mi_group::MiGroupIterator;
 use crate::overlapping_consensus::{
     AgreementStrategy, CorrectionStats, DisagreementStrategy, OverlappingBasesConsensusCaller,
     apply_overlapping_consensus,
 };
-use crate::per_thread_accumulator::PerThreadAccumulator;
-use crate::read_info::LibraryIndex;
 use crate::sam::SamTag;
 use crate::umi::extract_mi_base;
-use crate::unified_pipeline::{
-    GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
-    run_bam_pipeline_from_reader_with_secondary,
-};
 use crate::validation::validate_file_exists;
 use fgumi_bam_io::ProgressTracker;
-use fgumi_raw_bam;
 use fgumi_raw_bam::{RawRecord, RawRecordView};
 use log::info;
-use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
-use std::io;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
 
@@ -60,42 +40,139 @@ use super::command::Command;
 
 use super::common::{MethylationRef, load_methylation_reference};
 
-// ============================================================================
-// Types for 7-step pipeline processing
-// ============================================================================
+/// Duplex-specific tuning, flattened into both the standalone `Duplex`
+/// command (as bare `--max-reads-per-strand`, `--error-rate-pre-umi`,
+/// `--min-reads`, …) and the `RunAll` command (as
+/// `--duplex::max-reads-per-strand`, `--duplex::error-rate-pre-umi`,
+/// `--duplex::min-reads`, … via the `MultiDuplexOptions` companion
+/// struct).
+///
+/// The consensus-calling and overlapping-consensus knobs are inlined as
+/// direct `#[arg]` fields (rather than nested `#[command(flatten)]`
+/// structs) because `#[multi_options]` cannot re-prefix the fields of a
+/// flattened sub-struct. `consensus()` / `overlapping()` reconstruct the
+/// shared option structs for the rest of the codebase.
+///
+/// `Default` must match each field's clap `default_value` exactly.
+#[fgumi_cli_macros::multi_options("duplex", "Duplex Options")]
+#[derive(clap::Args, Debug, Clone)]
+pub struct DuplexOptions {
+    // ── Consensus-calling options (inlined from ConsensusCallingOptions). ──
+    /// Phred-scaled error rate prior to UMI integration
+    #[arg(short = '1', long = "error-rate-pre-umi", default_value = "45")]
+    pub error_rate_pre_umi: u8,
 
-/// Result from processing a batch of MI groups through duplex consensus calling.
-struct DuplexProcessedBatch {
-    /// Consensus reads to write to output BAM
-    consensus_output: ConsensusOutput,
-    /// Raw-byte rejected records (consensus-caller rejects), in batch-input
-    /// order. Empty unless `track_rejects` is true.
-    rejected_records: Vec<Vec<u8>>,
-    /// Number of MI groups in this batch
-    groups_count: u64,
-    /// Consensus calling statistics for this batch
-    stats: ConsensusCallingStats,
-    /// Overlapping correction stats for this batch (if enabled)
-    overlapping_stats: Option<CorrectionStats>,
+    /// Phred-scaled error rate post UMI integration
+    #[arg(short = '2', long = "error-rate-post-umi", default_value = "40")]
+    pub error_rate_post_umi: u8,
+
+    /// Minimum base quality in raw reads to use for consensus
+    #[arg(short = 'm', long = "min-input-base-quality", default_value = "10")]
+    pub min_input_base_quality: u8,
+
+    /// Produce per-base tags (cd, ce) in addition to per-read tags
+    #[arg(short = 'B', long = "output-per-base-tags", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = super::common::parse_bool)]
+    pub output_per_base_tags: bool,
+
+    /// Quality-trim reads before consensus calling (removes low-quality bases from ends)
+    #[arg(long = "trim", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = super::common::parse_bool)]
+    pub trim: bool,
+
+    /// Minimum consensus base quality (output consensus bases below this are masked to N)
+    #[arg(long = "min-consensus-base-quality", default_value = "2")]
+    pub min_consensus_base_quality: u8,
+
+    // ── Overlapping-consensus options (inlined from OverlappingConsensusOptions). ──
+    /// Consensus call overlapping bases in read pairs before UMI consensus calling
+    #[arg(long = "consensus-call-overlapping-bases", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = super::common::parse_bool)]
+    pub consensus_call_overlapping_bases: bool,
+
+    // ── Duplex-specific tuning. ──
+    /// Minimum reads for consensus calling.
+    /// Can specify 1-3 values: \[duplex\] or \[duplex, AB/BA\] or \[duplex, AB, BA\]
+    #[arg(short = 'M', long = "min-reads", value_delimiter = ',', default_value = "1")]
+    pub min_reads: Vec<usize>,
+
+    /// Maximum reads per strand (downsample if exceeded).
+    #[arg(long = "max-reads-per-strand")]
+    pub max_reads_per_strand: Option<usize>,
+
+    // ── Chain-builder slots (populated by Duplex::execute, not by clap).
+    // Invisible to the CLI; carried so build_duplex_chain can access the
+    // full command configuration without holding a reference back to the
+    // Duplex struct. ────────────────────────────────────────────────────
+    /// Input / output BAM paths. Populated by `Duplex::execute`.
+    #[arg(skip)]
+    pub io: super::common::BamIoOptions,
+
+    /// Rejects output options. Populated by `Duplex::execute`.
+    #[arg(skip)]
+    pub rejects_opts: super::common::RejectsOptions,
+
+    /// Statistics output options. Populated by `Duplex::execute`.
+    #[arg(skip)]
+    pub stats_opts: super::common::StatsOptions,
+
+    /// Read group / read name prefix options. Populated by `Duplex::execute`.
+    #[arg(skip)]
+    pub read_group: super::common::ReadGroupOptions,
+
+    /// Methylation mode (if any). Populated by `Duplex::execute`.
+    #[arg(skip)]
+    pub methylation_mode: Option<super::common::MethylationModeArg>,
+
+    /// Reference FASTA path (if any). Populated by `Duplex::execute`.
+    #[arg(skip)]
+    pub reference: Option<std::path::PathBuf>,
 }
 
-impl MemoryEstimate for DuplexProcessedBatch {
-    fn estimate_heap_size(&self) -> usize {
-        let rej_size: usize = self.rejected_records.iter().map(Vec::capacity).sum();
-        let rej_vec_overhead = self.rejected_records.capacity() * std::mem::size_of::<Vec<u8>>();
-        self.consensus_output.estimate_heap_size() + rej_size + rej_vec_overhead
+impl Default for DuplexOptions {
+    fn default() -> Self {
+        let consensus = ConsensusCallingOptions::default();
+        let overlapping = OverlappingConsensusOptions::default();
+        Self {
+            error_rate_pre_umi: consensus.error_rate_pre_umi,
+            error_rate_post_umi: consensus.error_rate_post_umi,
+            min_input_base_quality: consensus.min_input_base_quality,
+            output_per_base_tags: consensus.output_per_base_tags,
+            trim: consensus.trim,
+            min_consensus_base_quality: consensus.min_consensus_base_quality,
+            consensus_call_overlapping_bases: overlapping.consensus_call_overlapping_bases,
+            min_reads: vec![1],
+            max_reads_per_strand: None,
+            io: super::common::BamIoOptions::default(),
+            rejects_opts: super::common::RejectsOptions::default(),
+            stats_opts: super::common::StatsOptions::default(),
+            read_group: super::common::ReadGroupOptions::default(),
+            methylation_mode: None,
+            reference: None,
+        }
     }
 }
 
-/// Metrics collected from each batch during parallel processing.
-#[derive(Default)]
-struct CollectedDuplexMetrics {
-    /// Consensus calling statistics
-    stats: ConsensusCallingStats,
-    /// Overlapping consensus stats (if enabled)
-    overlapping_stats: Option<CorrectionStats>,
-    /// Number of MI groups processed
-    groups_processed: u64,
+impl DuplexOptions {
+    /// Reconstruct the shared [`ConsensusCallingOptions`] from the inlined
+    /// flat fields.
+    #[must_use]
+    pub fn consensus(&self) -> ConsensusCallingOptions {
+        ConsensusCallingOptions {
+            error_rate_pre_umi: self.error_rate_pre_umi,
+            error_rate_post_umi: self.error_rate_post_umi,
+            min_input_base_quality: self.min_input_base_quality,
+            output_per_base_tags: self.output_per_base_tags,
+            trim: self.trim,
+            min_consensus_base_quality: self.min_consensus_base_quality,
+        }
+    }
+
+    /// Reconstruct the shared [`OverlappingConsensusOptions`] from the
+    /// inlined flat field.
+    #[must_use]
+    pub fn overlapping(&self) -> OverlappingConsensusOptions {
+        OverlappingConsensusOptions {
+            consensus_call_overlapping_bases: self.consensus_call_overlapping_bases,
+        }
+    }
 }
 
 /// Call duplex consensus reads from grouped reads with /A and /B MI tags
@@ -171,13 +248,13 @@ pub struct Duplex {
     #[command(flatten)]
     pub read_group: ReadGroupOptions,
 
-    /// Consensus calling options
+    /// Per-stage duplex tuning. Flattened so the standalone command
+    /// exposes `--error-rate-pre-umi`, `--min-reads`,
+    /// `--max-reads-per-strand`, etc. directly and `runall` exposes them
+    /// as `--duplex::error-rate-pre-umi`, `--duplex::min-reads`,
+    /// `--duplex::max-reads-per-strand`, etc.
     #[command(flatten)]
-    pub consensus: ConsensusCallingOptions,
-
-    /// Overlapping consensus options
-    #[command(flatten)]
-    pub overlapping: OverlappingConsensusOptions,
+    pub options: DuplexOptions,
 
     /// Threading options for parallel processing
     #[command(flatten)]
@@ -186,15 +263,6 @@ pub struct Duplex {
     /// Compression options for output BAM.
     #[command(flatten)]
     pub compression: CompressionOptions,
-
-    /// Minimum reads for consensus calling.
-    /// Can specify 1-3 values: \[duplex\] or \[duplex, AB/BA\] or \[duplex, AB, BA\]
-    #[arg(short = 'M', long = "min-reads", value_delimiter = ',', default_value = "1")]
-    pub min_reads: Vec<usize>,
-
-    /// Maximum reads per strand (downsample if exceeded)
-    #[arg(long = "max-reads-per-strand")]
-    pub max_reads_per_strand: Option<usize>,
 
     /// Scheduler and pipeline stats options
     #[command(flatten)]
@@ -246,11 +314,10 @@ impl Command for Duplex {
     /// # Example
     ///
     /// ```no_run
-    /// # use fgumi_lib::commands::duplex::Duplex;
+    /// # use fgumi_lib::commands::duplex::{Duplex, DuplexOptions};
     /// # use fgumi_lib::commands::command::Command;
     /// # use fgumi_lib::commands::common::{
-    /// #     BamIoOptions, CompressionOptions, ConsensusCallingOptions,
-    /// #     OverlappingConsensusOptions, QueueMemoryOptions, ReadGroupOptions, RejectsOptions,
+    /// #     BamIoOptions, CompressionOptions, QueueMemoryOptions, ReadGroupOptions, RejectsOptions,
     /// #     SchedulerOptions, StatsOptions, ThreadingOptions,
     /// # };
     /// # use std::path::PathBuf;
@@ -258,7 +325,7 @@ impl Command for Duplex {
     ///     io: BamIoOptions {
     ///         input: PathBuf::from("grouped.bam"),
     ///         output: PathBuf::from("duplex.bam"),
-    ///         async_reader: false,
+    ///         ..Default::default()
     ///     },
     ///     rejects_opts: RejectsOptions::default(),
     ///     stats_opts: StatsOptions::default(),
@@ -266,15 +333,14 @@ impl Command for Duplex {
     ///         read_name_prefix: Some("consensus".to_string()),
     ///         read_group_id: "duplex".to_string(),
     ///     },
-    ///     consensus: ConsensusCallingOptions {
+    ///     options: DuplexOptions {
     ///         output_per_base_tags: false,
-    ///         ..ConsensusCallingOptions::default()
+    ///         min_reads: vec![1],
+    ///         max_reads_per_strand: None,
+    ///         ..DuplexOptions::default()
     ///     },
-    ///     overlapping: OverlappingConsensusOptions::default(),
     ///     threading: ThreadingOptions::none(),
     ///     compression: CompressionOptions::default(),
-    ///     min_reads: vec![1],
-    ///     max_reads_per_strand: None,
     ///     scheduler_opts: SchedulerOptions::default(),
     ///     queue_memory: QueueMemoryOptions::default(),
     ///     methylation_mode: None,
@@ -288,27 +354,30 @@ impl Command for Duplex {
         // Start timing
         let timer = OperationTimer::new("Calling duplex consensus");
 
-        // Validate input file exists
-        validate_file_exists(&self.io.input, "Input BAM")?;
+        // Validate input file exists (skip for stdin paths — `-` / `/dev/stdin`)
+        if !fgumi_bam_io::is_stdin_path(&self.io.input) {
+            validate_file_exists(&self.io.input, "Input BAM")?;
+        }
 
         // Get threading configuration (duplex is worker-heavy with consensus calling)
-        let reader_threads = self.threading.num_threads();
-        let worker_threads = self.threading.num_threads();
         let writer_threads = self.threading.num_threads();
+
+        // Reconstruct the shared option structs from the inlined DuplexOptions
+        // flat fields.
+        let consensus = self.options.consensus();
+        let overlapping = self.options.overlapping();
 
         info!("Duplex");
         info!("  Input: {}", self.io.input.display());
         info!("  Output: {}", self.io.output.display());
-        info!("  Min reads: {:?}", self.min_reads);
-        info!("  Min base quality: {}", self.consensus.min_input_base_quality);
-        info!("  Output per-base tags: {}", self.consensus.output_per_base_tags);
-        info!("  Worker threads: {worker_threads}");
-        info!("  Reader threads: {reader_threads}");
-        info!("  Trim reads: {}", self.consensus.trim);
-        info!("  Max reads per strand: {:?}", self.max_reads_per_strand);
+        info!("  Min reads: {:?}", self.options.min_reads);
+        info!("  Min base quality: {}", consensus.min_input_base_quality);
+        info!("  Output per-base tags: {}", consensus.output_per_base_tags);
+        info!("  Trim reads: {}", consensus.trim);
+        info!("  Max reads per strand: {:?}", self.options.max_reads_per_strand);
         info!(
             "  Consensus call overlapping bases: {}",
-            self.overlapping.consensus_call_overlapping_bases
+            overlapping.consensus_call_overlapping_bases
         );
 
         // Cell barcode tag is fixed to the SAM standard CB tag
@@ -324,7 +393,7 @@ impl Command for Duplex {
             crate::commands::common::resolve_methylation_mode(self.methylation_mode);
 
         // Track overlapping consensus settings (callers created per-thread in threaded mode)
-        let overlapping_enabled = self.overlapping.consensus_call_overlapping_bases;
+        let overlapping_enabled = overlapping.consensus_call_overlapping_bases;
         if overlapping_enabled {
             info!("Overlapping consensus calling enabled");
         }
@@ -333,33 +402,38 @@ impl Command for Duplex {
         info!("Processing reads...");
 
         // ============================================================
-        // --threads N mode: Use 7-step unified pipeline
-        // None: Use single-threaded fast path
+        // --threads N mode: route through chains::build_for.
+        // None: Use single-threaded fast path (below).
         // ============================================================
-        // IMPORTANT: Check threading BEFORE opening any reader so we only open
-        // the input once — opening twice wastes I/O and breaks stdin streaming.
-        if let Some(threads) = self.threading.threads {
-            let (reader, header) = create_bam_reader_for_pipeline_with_opts(
-                &self.io.input,
-                self.io.pipeline_reader_opts(),
-            )?;
-            let header = crate::commands::common::add_pg_record(header, command_line)?;
-            let read_name_prefix = self.read_group.prefix_or_from_header(&header);
-            let methylation_ref: MethylationRef =
-                load_methylation_reference(methylation_mode, &self.reference, &header)?;
+        // IMPORTANT: Do NOT open the source here — the chain builder opens
+        // it once. This avoids double-open (wastes I/O, breaks stdin).
+        if self.threading.threads.is_some() {
+            use crate::pipeline::chains::{
+                ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag,
+            };
+            // Populate the #[arg(skip)] chain-builder slots on a clone of
+            // DuplexOptions before handing it to the ChainSpec.
+            let mut options = self.options.clone();
+            options.io.clone_from(&self.io);
+            options.rejects_opts.clone_from(&self.rejects_opts);
+            options.stats_opts.clone_from(&self.stats_opts);
+            options.read_group.clone_from(&self.read_group);
+            options.methylation_mode = self.methylation_mode;
+            options.reference.clone_from(&self.reference);
 
-            let result = self.execute_threads_mode(
-                threads,
-                reader,
-                header,
-                read_name_prefix,
-                track_rejects,
-                command_line,
-                methylation_ref,
-                methylation_mode,
-            );
-            timer.log_completion(0); // Completion logged in execute_threads_mode
-            return result;
+            let spec = ChainSpec {
+                async_reader: self.io.async_reader,
+                stages: vec![Stage::Duplex],
+                source: SourceSpec::Bam(self.io.input.clone()),
+                sink: SinkSpec::Bam(self.io.output.clone()),
+                stage_opts: StageOptionsBag { duplex: Some(options), ..Default::default() },
+                threading: self.threading.clone(),
+                compression: self.compression.clone(),
+                scheduler: self.scheduler_opts.clone(),
+                queue_memory: self.queue_memory.clone(),
+                command_line: command_line.to_string(),
+            };
+            return crate::pipeline::chains::build_for(spec)?.run();
         }
 
         // Single-threaded fast path: open the raw reader once and derive the header from it.
@@ -395,15 +469,15 @@ impl Command for Duplex {
         let mut consensus_caller = DuplexConsensusCaller::new(
             read_name_prefix.clone(),
             self.read_group.read_group_id.clone(),
-            self.min_reads.clone(),
-            self.consensus.min_input_base_quality,
-            self.consensus.output_per_base_tags,
-            self.consensus.trim,
-            self.max_reads_per_strand,
+            self.options.min_reads.clone(),
+            consensus.min_input_base_quality,
+            consensus.output_per_base_tags,
+            consensus.trim,
+            self.options.max_reads_per_strand,
             Some(cell_tag),
             track_rejects,
-            self.consensus.error_rate_pre_umi,
-            self.consensus.error_rate_post_umi,
+            consensus.error_rate_pre_umi,
+            consensus.error_rate_post_umi,
         )?;
 
         // Set reference for methylation-aware consensus if enabled
@@ -546,302 +620,13 @@ impl Command for Duplex {
     }
 }
 
-impl Duplex {
-    /// Execute using 7-step unified pipeline with --threads.
-    ///
-    /// This method is called when `--threads N` is specified with N > 1.
-    /// It uses the lock-free 7-step unified pipeline for maximum performance.
-    #[expect(clippy::too_many_arguments, reason = "pipeline setup needs all configuration")]
-    fn execute_threads_mode(
-        &self,
-        num_threads: usize,
-        reader: Box<dyn std::io::Read + Send>,
-        input_header: Header,
-        read_name_prefix: String,
-        track_rejects: bool,
-        command_line: &str,
-        methylation_ref: MethylationRef,
-        methylation_mode: fgumi_consensus::MethylationMode,
-    ) -> Result<()> {
-        // Create output header (for duplex, output is unmapped like simplex)
-        let output_header = create_unmapped_consensus_header(
-            &input_header,
-            &self.read_group.read_group_id,
-            "Read group",
-            command_line,
-        )?;
-
-        // Configure pipeline
-        let mut pipeline_config = build_pipeline_config(
-            &self.scheduler_opts,
-            &self.compression,
-            &self.queue_memory,
-            num_threads,
-        )?;
-
-        // Per-thread metrics accumulator: bounded metric memory, no unbounded
-        // queue. Rejects buffering semantics are preserved (see follow-up).
-        let collected_metrics = PerThreadAccumulator::<CollectedDuplexMetrics>::new(num_threads);
-        let collected_metrics_for_serialize = Arc::clone(&collected_metrics);
-
-        // Capture configuration for closures
-        let min_reads = self.min_reads.clone();
-        let min_input_base_quality = self.consensus.min_input_base_quality;
-        let output_per_base_tags = self.consensus.output_per_base_tags;
-        let trim = self.consensus.trim;
-        let max_reads_per_strand = self.max_reads_per_strand;
-        let error_rate_pre_umi = self.consensus.error_rate_pre_umi;
-        let error_rate_post_umi = self.consensus.error_rate_post_umi;
-        let overlapping_enabled = self.overlapping.consensus_call_overlapping_bases;
-        let read_group_id = self.read_group.read_group_id.clone();
-        let cell_tag = Tag::from(SamTag::CB);
-        let batch_size = 100; // MI groups per batch
-
-        // Record filter for duplex on raw bytes: skip secondary/supplementary, keep mapped or mate-mapped
-        let record_filter = |raw: &[u8]| -> bool {
-            let flg = RawRecordView::new(raw).flags();
-            // Skip secondary and supplementary reads
-            if flg & fgumi_raw_bam::flags::SECONDARY != 0
-                || flg & fgumi_raw_bam::flags::SUPPLEMENTARY != 0
-            {
-                return false;
-            }
-            // Only keep mapped reads or reads with mapped mates
-            let is_mapped = flg & fgumi_raw_bam::flags::UNMAPPED == 0;
-            let has_mapped_mate = flg & fgumi_raw_bam::flags::PAIRED != 0
-                && flg & fgumi_raw_bam::flags::MATE_UNMAPPED == 0;
-            is_mapped || has_mapped_mate
-        };
-
-        // MI transform for raw bytes: strip /A and /B suffixes for duplex grouping
-        let mi_transform = |mi_bytes: &[u8]| -> String {
-            let mi_str = String::from_utf8_lossy(mi_bytes);
-            extract_mi_base(&mi_str).to_string()
-        };
-
-        // Rejects flow through the unified pipeline's first-class secondary
-        // output (see correct.rs / simplex.rs / filter.rs for the shared
-        // pattern). `process_fn` collects caller-emitted rejects into
-        // `DuplexProcessedBatch::rejected_records`; the pipeline's
-        // `secondary_serialize_fn` writes them in batch-input order with the
-        // input header.
-
-        let library_index = LibraryIndex::from_header(&input_header);
-        pipeline_config.group_key_config = Some(GroupKeyConfig::new(library_index, cell_tag));
-
-        // ========== grouper_fn ==========
-        let grouper_fn = move |_header: &Header| {
-            Box::new(
-                MiGrouper::with_filter_and_transform("MI", batch_size, record_filter, mi_transform)
-                    .with_cell_tag(Some(*SamTag::CB)),
-            ) as Box<dyn Grouper<Group = MiGroupBatch> + Send>
-        };
-
-        // ========== process_fn: Duplex consensus calling ==========
-        let process_fn = move |batch: MiGroupBatch| -> io::Result<DuplexProcessedBatch> {
-            // Create per-thread duplex consensus caller
-            let mut caller = DuplexConsensusCaller::new(
-                read_name_prefix.clone(),
-                read_group_id.clone(),
-                min_reads.clone(),
-                min_input_base_quality,
-                output_per_base_tags,
-                trim,
-                max_reads_per_strand,
-                Some(cell_tag),
-                track_rejects,
-                error_rate_pre_umi,
-                error_rate_post_umi,
-            )
-            .map_err(|e| {
-                io::Error::other(format!("Failed to create DuplexConsensusCaller: {e}"))
-            })?;
-
-            // Set reference for methylation-aware consensus if enabled
-            if let Some((ref reference, ref ref_names)) = methylation_ref {
-                caller.set_reference(
-                    Arc::clone(reference),
-                    Arc::clone(ref_names),
-                    methylation_mode,
-                );
-            }
-
-            // Create overlapping caller if enabled
-            let mut overlapping_caller = if overlapping_enabled {
-                Some(OverlappingBasesConsensusCaller::new(
-                    AgreementStrategy::Consensus,
-                    DisagreementStrategy::Consensus,
-                ))
-            } else {
-                None
-            };
-
-            let mut all_output = ConsensusOutput::default();
-            let mut batch_stats = ConsensusCallingStats::new();
-            let mut batch_overlapping = CorrectionStats::new();
-            let groups_count = batch.groups.len() as u64;
-            // Caller-emitted rejects collected per-batch and drained by the
-            // pipeline's secondary serializer.
-            let mut rejected_records: Vec<Vec<u8>> = Vec::new();
-
-            for MiGroup { mi, records: mut group_reads } in batch.groups {
-                caller.clear();
-
-                // Apply overlapping consensus if enabled (modifies raw bytes in-place).
-                // Skip if group doesn't have both strands — no duplex possible anyway.
-                // Propagate errors to match single-threaded behavior; silent drops here
-                // would turn real failures into output gaps in --threads mode only.
-                if let Some(ref mut oc) = overlapping_caller {
-                    if has_both_strands_raw(&group_reads) {
-                        oc.reset_stats();
-                        apply_overlapping_consensus(&mut group_reads, oc).map_err(|e| {
-                            io::Error::other(format!(
-                                "Overlapping consensus error for MI {mi}: {e}"
-                            ))
-                        })?;
-                        batch_overlapping.merge(oc.stats());
-                    }
-                }
-
-                // Call duplex consensus directly — records are already RawRecord values.
-                // Propagate errors to match single-threaded behavior; a warn-and-drop here
-                // would silently turn real failures (OOM, malformed records, etc.) into
-                // output gaps in --threads mode only.
-                let batch_output = caller.consensus_reads(group_reads).map_err(|e| {
-                    io::Error::other(format!("Duplex consensus error for MI {mi}: {e}"))
-                })?;
-                all_output.merge(batch_output);
-                batch_stats.merge(&caller.statistics());
-                if track_rejects {
-                    for raw in caller.take_rejected_reads() {
-                        rejected_records.push(raw);
-                    }
-                }
-            }
-
-            Ok(DuplexProcessedBatch {
-                consensus_output: all_output,
-                rejected_records,
-                groups_count,
-                stats: batch_stats,
-                overlapping_stats: if overlapping_enabled { Some(batch_overlapping) } else { None },
-            })
-        };
-
-        // ========== serialize_fn: Serialize + collect metrics ==========
-        let serialize_fn = move |processed: DuplexProcessedBatch,
-                                 _header: &Header,
-                                 output: &mut Vec<u8>|
-              -> io::Result<u64> {
-            // Merge per-batch metrics into this worker's accumulator slot.
-            // Rejects are drained by `secondary_serialize_fn` separately.
-            let batch_stats = processed.stats;
-            let batch_overlapping = processed.overlapping_stats;
-            let groups_count = processed.groups_count;
-            collected_metrics_for_serialize.with_slot(|m| {
-                m.stats.merge(&batch_stats);
-                if let Some(o) = batch_overlapping {
-                    m.overlapping_stats.get_or_insert_with(CorrectionStats::new).merge(&o);
-                }
-                m.groups_processed += groups_count;
-            });
-
-            let count = processed.consensus_output.count as u64;
-            output.extend_from_slice(&processed.consensus_output.data);
-            Ok(count)
-        };
-
-        // ========== secondary_serialize_fn: Drain rejected records ==========
-        let secondary_serialize_fn =
-            |batch: &DuplexProcessedBatch, buf: &mut Vec<u8>| -> io::Result<u64> {
-                serialize_raw_bam_records(&batch.rejected_records, buf)
-            };
-
-        // Run the 7-step pipeline with the already-opened reader (supports streaming).
-        // When `--rejects` is set, route rejects through the unified pipeline's
-        // first-class secondary output so they land in input/batch-serial order
-        // and the rejects BAM carries the input header.
-        let consensus_reads_written = if let Some(rejects_path) = self.rejects_opts.rejects.as_ref()
-        {
-            let secondary_header = input_header.clone();
-            run_bam_pipeline_from_reader_with_secondary(
-                pipeline_config,
-                reader,
-                input_header,
-                &self.io.output,
-                Some(output_header.clone()),
-                rejects_path,
-                Some(secondary_header),
-                grouper_fn,
-                process_fn,
-                serialize_fn,
-                secondary_serialize_fn,
-            )
-            .map_err(|e| anyhow::anyhow!("Pipeline error: {e}"))?
-        } else {
-            run_bam_pipeline_from_reader(
-                pipeline_config,
-                reader,
-                input_header,
-                &self.io.output,
-                Some(output_header.clone()),
-                grouper_fn,
-                process_fn,
-                serialize_fn,
-            )
-            .map_err(|e| anyhow::anyhow!("Pipeline error: {e}"))?
-        };
-
-        // ========== Post-pipeline: Aggregate metrics ==========
-        let mut total_groups = 0u64;
-        let mut merged_stats = ConsensusCallingStats::new();
-        let mut merged_overlapping_stats = CorrectionStats::new();
-
-        for slot in collected_metrics.slots() {
-            let m = slot.lock();
-            total_groups += m.groups_processed;
-            merged_stats.merge(&m.stats);
-            if let Some(ref ocs) = m.overlapping_stats {
-                merged_overlapping_stats.merge(ocs);
-            }
-        }
-
-        // Log overlapping consensus statistics if enabled
-        if self.overlapping.consensus_call_overlapping_bases {
-            log_overlapping_stats(&merged_overlapping_stats);
-        }
-
-        // Log statistics
-        info!("Duplex consensus calling complete");
-        info!("Total MI groups processed: {total_groups}");
-        info!("Total consensus reads written by pipeline: {consensus_reads_written}");
-
-        let metrics = merged_stats.to_metrics();
-        let consensus_count = metrics.consensus_reads;
-        log_consensus_summary(&metrics);
-
-        // Write statistics file if requested
-        if let Some(stats_path) = &self.stats_opts.stats {
-            let kv_metrics = metrics.to_kv_metrics();
-            DelimFile::default()
-                .write_tsv(stats_path, kv_metrics)
-                .with_context(|| format!("Failed to write statistics: {}", stats_path.display()))?;
-            info!("Wrote statistics to: {}", stats_path.display());
-        }
-
-        info!("Wrote {consensus_count} duplex consensus reads");
-
-        Ok(())
-    }
-}
-
 /// Check if a group of raw-byte BAM records has both /A and /B strands.
 ///
 /// This is the raw-byte equivalent of `DuplexConsensusCaller::has_both_strands`.
 /// It examines the MI tag of each record to check for /A and /B suffixes.
 /// Returns `true` only if there is at least one read with /A suffix AND at least
 /// one read with /B suffix.
-fn has_both_strands_raw(records: &[RawRecord]) -> bool {
+pub(crate) fn has_both_strands_raw(records: &[RawRecord]) -> bool {
     if records.len() < 2 {
         return false;
     }
@@ -921,23 +706,21 @@ mod tests {
     /// Uses sensible test defaults: disabled per-base tags, disabled overlapping consensus.
     fn create_duplex_with_paths(input: PathBuf, output: PathBuf) -> Duplex {
         Duplex {
-            io: BamIoOptions { input, output, async_reader: false },
+            io: BamIoOptions { input, output, ..Default::default() },
             rejects_opts: RejectsOptions::default(),
             stats_opts: StatsOptions::default(),
             read_group: ReadGroupOptions {
                 read_name_prefix: Some("consensus".to_string()),
                 read_group_id: "duplex".to_string(),
             },
-            consensus: ConsensusCallingOptions {
+            options: DuplexOptions {
                 output_per_base_tags: false,
                 min_consensus_base_quality: 0,
-                ..ConsensusCallingOptions::default()
+                min_reads: vec![1],
+                ..DuplexOptions::default()
             },
-            overlapping: OverlappingConsensusOptions::default(),
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
-            min_reads: vec![1],
-            max_reads_per_strand: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             methylation_mode: None,
@@ -1134,37 +917,37 @@ mod tests {
         let duplex =
             create_duplex_with_paths(PathBuf::from("test.bam"), PathBuf::from("output.bam"));
 
-        assert_eq!(duplex.min_reads, vec![1]);
-        assert_eq!(duplex.consensus.min_input_base_quality, 10);
+        assert_eq!(duplex.options.min_reads, vec![1]);
+        assert_eq!(duplex.options.min_input_base_quality, 10);
         assert!(duplex.threading.is_single_threaded());
-        assert!(!duplex.consensus.trim);
+        assert!(!duplex.options.trim);
     }
 
     #[test]
     fn test_custom_min_reads_single_value() {
         let mut duplex =
             create_duplex_with_paths(PathBuf::from("test.bam"), PathBuf::from("output.bam"));
-        duplex.min_reads = vec![5];
+        duplex.options.min_reads = vec![5];
 
-        assert_eq!(duplex.min_reads, vec![5]);
+        assert_eq!(duplex.options.min_reads, vec![5]);
     }
 
     #[test]
     fn test_custom_min_reads_three_values() {
         let mut duplex =
             create_duplex_with_paths(PathBuf::from("test.bam"), PathBuf::from("output.bam"));
-        duplex.min_reads = vec![10, 5, 3];
+        duplex.options.min_reads = vec![10, 5, 3];
 
-        assert_eq!(duplex.min_reads, vec![10, 5, 3]);
+        assert_eq!(duplex.options.min_reads, vec![10, 5, 3]);
     }
 
     #[test]
     fn test_output_per_base_tags_enabled() {
         let mut duplex =
             create_duplex_with_paths(PathBuf::from("test.bam"), PathBuf::from("output.bam"));
-        duplex.consensus.output_per_base_tags = true;
+        duplex.options.output_per_base_tags = true;
 
-        assert!(duplex.consensus.output_per_base_tags);
+        assert!(duplex.options.output_per_base_tags);
     }
 
     #[test]
@@ -1180,11 +963,11 @@ mod tests {
     fn test_trim_and_downsample_options() {
         let mut duplex =
             create_duplex_with_paths(PathBuf::from("test.bam"), PathBuf::from("output.bam"));
-        duplex.consensus.trim = true;
-        duplex.max_reads_per_strand = Some(100);
+        duplex.options.trim = true;
+        duplex.options.max_reads_per_strand = Some(100);
 
-        assert!(duplex.consensus.trim);
-        assert_eq!(duplex.max_reads_per_strand, Some(100));
+        assert!(duplex.options.trim);
+        assert_eq!(duplex.options.max_reads_per_strand, Some(100));
     }
 
     // ========================================================================
@@ -1352,7 +1135,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let mut cmd = create_duplex_with_paths(input.path().to_path_buf(), paths.output.clone());
-        cmd.min_reads = vec![3, 3, 3]; // duplex=3, AB=3, BA=3
+        cmd.options.min_reads = vec![3, 3, 3]; // duplex=3, AB=3, BA=3
 
         cmd.execute("test")?;
 
@@ -1417,7 +1200,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let mut cmd = create_duplex_with_paths(input.path().to_path_buf(), paths.output.clone());
-        cmd.consensus.output_per_base_tags = true; // Enable per-base tags
+        cmd.options.output_per_base_tags = true; // Enable per-base tags
 
         cmd.execute("test")?;
 
@@ -1698,51 +1481,6 @@ mod tests {
         assert!(&paths.output.exists());
 
         Ok(())
-    }
-
-    #[rstest]
-    #[case::empty_rejects(1024, 100, vec![])]
-    #[case::non_empty_rejects(64, 32, vec![256, 128])]
-    fn test_duplex_processed_batch_memory_estimate(
-        #[case] consensus_capacity: usize,
-        #[case] consensus_len: usize,
-        #[case] rej_capacities: Vec<usize>,
-    ) {
-        let mut data = Vec::with_capacity(consensus_capacity);
-        data.resize(consensus_len, 0u8);
-
-        let rejected_records: Vec<Vec<u8>> = rej_capacities
-            .iter()
-            .map(|&cap| {
-                let mut v = Vec::with_capacity(cap);
-                v.extend_from_slice(&[1u8; 8]);
-                v
-            })
-            .collect();
-        let rej_outer_capacity = rejected_records.capacity();
-        // Vec::with_capacity(n) only guarantees AT LEAST n; the allocator may
-        // round up. Read the observed capacities back so the expected value
-        // matches what was actually allocated under any allocator.
-        let rej_inner_total: usize = rejected_records.iter().map(Vec::capacity).sum();
-
-        let batch = DuplexProcessedBatch {
-            consensus_output: ConsensusOutput { data, count: 0 },
-            rejected_records,
-            groups_count: 0,
-            stats: ConsensusCallingStats::default(),
-            overlapping_stats: None,
-        };
-
-        // Heap = consensus capacity + sum of per-reject inner capacities
-        // + outer-vec capacity * size_of::<Vec<u8>>().
-        let expected = consensus_capacity
-            + rej_inner_total
-            + rej_outer_capacity * std::mem::size_of::<Vec<u8>>();
-        assert_eq!(
-            batch.estimate_heap_size(),
-            expected,
-            "estimate should account for consensus capacity, rejects inner capacities, and outer-vec overhead",
-        );
     }
 
     #[rstest]

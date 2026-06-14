@@ -296,6 +296,50 @@ fn test_simplex_filter_pipeline_deterministic() {
     );
 }
 
+/// `fgumi runall --start-from filter --stop-after filter` must produce
+/// the same output as standalone `fgumi filter` on the same consensus
+/// BAM, exercising the `--filter::*` Multi-options surface and the
+/// `Stage::Filter` runall wiring.
+#[test]
+fn test_runall_filter_self_pair_matches_standalone_filter() {
+    let (tmp, grouped) = setup_grouped_reads(123, 200);
+
+    let simplex = tmp.path().join("simplex.bam");
+    run_simplex(&grouped, &simplex, 1);
+
+    // Standalone `fgumi filter`.
+    let standalone = tmp.path().join("standalone.bam");
+    run_filter(&simplex, &standalone, 2, 10);
+
+    // `fgumi runall --start-from filter --stop-after filter`, with the
+    // same tuning via `--filter::*`.
+    let runall = tmp.path().join("runall.bam");
+    fgumi_ok(args![
+        "runall",
+        "--start-from",
+        "filter",
+        "--stop-after",
+        "filter",
+        "--input",
+        &simplex,
+        "--output",
+        &runall,
+        "--threads",
+        "1",
+        "--filter::min-reads",
+        "2",
+        "--filter::min-base-quality",
+        "10",
+    ]);
+
+    assert_bams_identical(
+        &standalone,
+        &runall,
+        "content",
+        "runall --start-from filter --stop-after filter must match standalone fgumi filter",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Full pipeline: fastq -> extract -> group -> simplex -> filter
 // ---------------------------------------------------------------------------

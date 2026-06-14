@@ -1,0 +1,53 @@
+error[E0277]: the trait bound `HeapNoOrdered: Ordered` is not satisfied
+  --> tests/compile-fail/ordered_bytes_single_requires_ordered.rs:17:47
+   |
+17 | fn _instantiate() -> std::marker::PhantomData<OrderedBytesSingle<HeapNoOrdered>> {
+   |                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `Ordered` is not implemented for `HeapNoOrdered`
+  --> tests/compile-fail/ordered_bytes_single_requires_ordered.rs:7:1
+   |
+ 7 | struct HeapNoOrdered {
+   | ^^^^^^^^^^^^^^^^^^^^
+   = help: the following other types implement trait `Ordered`:
+             BamTemplateBatch
+             BatchedMiGroups
+             BatchedProcessedDedupGroups
+             BatchedProcessedPositionGroups
+             BatchedRawPositionGroups
+             BgzfBlock
+             DecodedRecordBatch
+             DecompressedBlock
+           and $N others
+note: required by a bound in `OrderedBytesSingle`
+  --> src/lib/pipeline/core/outputs.rs
+   |
+   | pub struct OrderedBytesSingle<T: Send + HeapSize + Ordered + 'static>(PhantomData<fn() -> T>);
+   |                                                    ^^^^^^^ required by this bound in `OrderedBytesSingle`
+
+error[E0277]: the trait bound `HeapNoOrdered: Ordered` is not satisfied
+  --> tests/compile-fail/ordered_bytes_single_requires_ordered.rs:19:5
+   |
+19 |     std::marker::PhantomData
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `Ordered` is not implemented for `HeapNoOrdered`
+  --> tests/compile-fail/ordered_bytes_single_requires_ordered.rs:7:1
+   |
+ 7 | struct HeapNoOrdered {
+   | ^^^^^^^^^^^^^^^^^^^^
+   = help: the following other types implement trait `Ordered`:
+             BamTemplateBatch
+             BatchedMiGroups
+             BatchedProcessedDedupGroups
+             BatchedProcessedPositionGroups
+             BatchedRawPositionGroups
+             BgzfBlock
+             DecodedRecordBatch
+             DecompressedBlock
+           and $N others
+note: required by a bound in `OrderedBytesSingle`
+  --> src/lib/pipeline/core/outputs.rs
+   |
+   | pub struct OrderedBytesSingle<T: Send + HeapSize + Ordered + 'static>(PhantomData<fn() -> T>);
+   |                                                    ^^^^^^^ required by this bound in `OrderedBytesSingle`

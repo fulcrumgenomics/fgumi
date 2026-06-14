@@ -16,7 +16,7 @@ clap = { version = "4", features = ["derive"] }
 log = "0"
 anyhow = "1.0"
 fgumi-dna = { workspace = true }
-tempfile = "3.3.0"
+tempfile = "3.4"
 
 [dev-dependencies]
 fgumi-raw-bam = { workspace = true, features = ["test-utils"] }

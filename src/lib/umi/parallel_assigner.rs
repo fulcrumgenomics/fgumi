@@ -360,9 +360,11 @@ impl UmiAssigner for ParallelEditAssigner {
         let mut umi_to_original: Vec<Option<BitEnc>> = Vec::with_capacity(raw_umis.len());
 
         for umi in raw_umis {
-            let umi_upper = umi.to_uppercase();
-            // Use from_umi_str to handle paired UMIs with dashes (e.g., "ACGT-TGCA")
-            if let Some(enc) = BitEnc::from_umi_str(&umi_upper) {
+            // `BitEnc::from_umi_str` is case-insensitive (`encode_base` maps
+            // a/A, c/C, … identically) and skips dashes (e.g. "ACGT-TGCA"), so
+            // the previous per-read `to_uppercase()` allocation was redundant —
+            // feed the raw UMI directly.
+            if let Some(enc) = BitEnc::from_umi_str(umi) {
                 *umi_counts.entry(enc).or_insert(0) += 1;
                 umi_to_original.push(Some(enc));
             } else {
@@ -617,7 +619,10 @@ impl ParallelPairedAssigner {
 
     /// Check if a UMI matches the canonical form (vs its reverse).
     fn matches_canonical(umi: &str, canonical: &str) -> bool {
-        umi.to_uppercase() == canonical
+        // `canonical` is already uppercase and UMIs are printable ASCII (SAM
+        // 'Z'-type RX/OX charset), so an allocation-free ASCII case-insensitive
+        // compare replaces the previous `to_uppercase()`-then-compare.
+        umi.eq_ignore_ascii_case(canonical)
     }
 }
 
