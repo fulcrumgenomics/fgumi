@@ -39,7 +39,6 @@ pub use reader::{
 };
 pub use reorder::{DrainReady, ReorderBuffer};
 pub use writer::{
-    BamWriter, BgzfWriterEnum, IndexingBamWriter, RawBamWriter, create_bam_writer,
-    create_indexing_bam_writer, create_optional_bam_writer, create_raw_bam_writer, write_bai_index,
-    write_bam_header,
+    BamWriter, BgzfWriterEnum, RawBamWriter, create_bam_writer, create_optional_bam_writer,
+    create_raw_bam_writer, write_bai_index, write_bam_header,
 };
