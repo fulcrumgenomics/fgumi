@@ -436,9 +436,17 @@ impl Command for Duplex {
             return crate::pipeline::chains::build_for(spec)?.run();
         }
 
-        // Single-threaded fast path: open the raw reader once and derive the header from it.
+        // Single-threaded fast path is BAM-only: open the raw reader once and
+        // derive the header from it. SAM input (not BGZF) fails the header read
+        // here; surface the --threads hint instead of a cryptic BGZF-magic error
+        // (mirrors the codec/simplex single-threaded paths).
         let (mut raw_reader, header) =
-            create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())?;
+            create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())
+                .with_context(|| {
+                    "Failed to open input as BAM. The single-threaded duplex path is BAM-only; \
+                     if this is SAM input, pass --threads N to use the SAM-capable \
+                     multi-threaded path (ReadSamChunks + ParseSamChunk)."
+                })?;
         let header = crate::commands::common::add_pg_record(header, command_line)?;
         let read_name_prefix = self.read_group.prefix_or_from_header(&header);
         let methylation_ref: MethylationRef =
