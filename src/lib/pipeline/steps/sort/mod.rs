@@ -57,8 +57,10 @@ use crate::pipeline::core::step::{Step, StepCtx, StepKind, StepOutcome, StepProf
 /// vs legacy. The wrapping exists purely so the operation is
 /// composable.
 ///
-/// Supports `--write-index` transparently via the `write_index` flag
-/// on the underlying `RawExternalSorter`.
+/// `--write-index` is *not* handled by this step: BAI generation is
+/// decoupled into the chain-builder's `IndexBamFinalizeHook`, which runs
+/// as a post-pipeline pass over the finished coordinate-sorted BAM. This
+/// step only produces the sorted BGZF stream.
 pub struct SortBamFile {
     /// `Some` until the first `try_run` consumes it; `None` after.
     /// Guards against a second `try_run` doing the sort again — once the step
@@ -78,10 +80,11 @@ pub struct SortBamFile {
 
 impl SortBamFile {
     /// Build a `SortBamFile` step. The `sorter` should be fully
-    /// configured (`memory_limit`, `threads`, `temp_compression`,
-    /// `output_compression`, `temp_dirs`, `cell_tag`, `write_index`,
-    /// `pg_info`, `initial_capacity`, `async_reader`) — the same way
-    /// the standalone `Sort::execute_sort` path configures its sorter.
+    /// configured identically to the standalone `Sort::execute_sort`
+    /// path (memory limit, threads, temp/output compression, spill
+    /// codec, temp dirs, max temp files, cell tag, key types, `@PG`
+    /// info, initial capacity, async reader) — `SortBamFile` does not
+    /// touch any of the sorter's tuning knobs.
     ///
     /// `stats_out` is the slot the step writes its `SortStats` into
     /// after `sorter.sort()` returns. Pass `Arc::clone(&slot)` here and

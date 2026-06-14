@@ -1309,8 +1309,6 @@ pub struct RawExternalSorter {
     temp_compression: u32,
     /// Codec used for temporary chunk files (Bgzf or Zstd).
     spill_codec: crate::codec::SpillCodec,
-    /// Whether to write BAM index alongside output (coordinate sort only).
-    write_index: bool,
     /// Program record info (version, `command_line`) for @PG header.
     pg_info: Option<(String, String)>,
     /// Maximum temp files before consolidation (0 = unlimited).
@@ -1378,7 +1376,6 @@ impl RawExternalSorter {
             output_compression: 6,
             temp_compression: 1, // Default: fast compression
             spill_codec: crate::codec::SpillCodec::default(),
-            write_index: false,
             pg_info: None,
             max_temp_files: DEFAULT_MAX_TEMP_FILES,
             cell_tag: None,
@@ -1452,17 +1449,6 @@ impl RawExternalSorter {
     #[must_use]
     pub fn spill_codec(mut self, codec: crate::codec::SpillCodec) -> Self {
         self.spill_codec = codec;
-        self
-    }
-
-    /// Enable writing BAM index alongside output.
-    ///
-    /// Only valid for coordinate sort. When enabled, writes `<output>.bai`
-    /// alongside the output BAM file. Uses single-threaded compression
-    /// for accurate virtual position tracking.
-    #[must_use]
-    pub fn write_index(mut self, enabled: bool) -> Self {
-        self.write_index = enabled;
         self
     }
 
@@ -1740,7 +1726,7 @@ impl RawExternalSorter {
         // Sort based on order
         match self.sort_order {
             SortOrder::Coordinate => {
-                self.sort_coordinate(record_source, pool, &header, output, &mut alloc)
+                self.sort_coordinate_optimized(record_source, pool, &header, output, &mut alloc)
             }
             SortOrder::Queryname(comparator) => {
                 self.sort_queryname(record_source, pool, &header, output, &mut alloc, comparator)
@@ -1889,22 +1875,6 @@ impl RawExternalSorter {
         merge_progress.log_final();
 
         Ok(records_merged)
-    }
-
-    /// Sort by coordinate order using optimized radix sort for large arrays.
-    fn sort_coordinate(
-        &self,
-        record_source: RecordSource,
-        pool: Arc<SortWorkerPool>,
-        header: &Header,
-        output: &Path,
-        alloc: &mut TmpDirAllocator,
-    ) -> Result<RawSortStats> {
-        if self.write_index {
-            self.sort_coordinate_with_index(record_source, pool, header, output, alloc)
-        } else {
-            self.sort_coordinate_optimized(record_source, pool, header, output, alloc)
-        }
     }
 
     /// Optimized coordinate sort using inline buffer for reduced memory overhead.
@@ -2075,190 +2045,6 @@ impl RawExternalSorter {
                     stats.total_records,
                     &pool,
                 )
-            })?;
-        }
-
-        stats.output_records = stats.total_records;
-        if let Ok(pool) = Arc::try_unwrap(pool) {
-            pool.shutdown();
-        }
-        timer.log_summary(self.threads);
-        debug!("Sort complete: {} records processed", stats.total_records);
-
-        Ok(stats)
-    }
-
-    /// Coordinate sort with BAM index generation.
-    ///
-    /// Similar to `sort_coordinate_optimized` but uses `IndexingBamWriter` to
-    /// build the BAI index incrementally during write. Uses single-threaded
-    /// compression for accurate virtual position tracking.
-    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
-    fn sort_coordinate_with_index(
-        &self,
-        mut record_source: RecordSource,
-        pool: Arc<SortWorkerPool>,
-        header: &Header,
-        output: &Path,
-        alloc: &mut TmpDirAllocator,
-    ) -> Result<RawSortStats> {
-        use crate::keys::RawCoordinateKey;
-        use fgumi_bam_io::{create_indexing_bam_writer, write_bai_index};
-
-        debug!("Indexing enabled: will write BAM index alongside output");
-
-        let mut stats = RawSortStats::default();
-        let mut timer = SortPhaseTimer::new();
-
-        let nref = header.reference_sequences().len() as u32;
-        let init_cap = self.effective_initial_capacity();
-        // Per-record footprint: ~200 bytes BAM + 8 header + 24 ref ≈ 232 bytes (rounded to 240 for headroom)
-        let estimated_records = init_cap / 240;
-        let estimated_data_bytes = init_cap.saturating_sub(estimated_records * 24);
-
-        let mut chunk_files: Vec<PathBuf> = Vec::new();
-        let mut buffer = RecordBuffer::with_capacity(estimated_records, estimated_data_bytes, nref);
-        let mut namer = ChunkNamer::new(alloc);
-        let mut pending_spill: Option<PendingSpill> = None;
-        let rayon_pool = self.build_sort_rayon_pool()?;
-
-        debug!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
-        let mut probe = SpillProbe::new("phase1");
-
-        for record in record_source.by_ref() {
-            stats.total_records += 1;
-            buffer.push_coordinate(record.as_ref())?;
-
-            if probe.should_sample_read(stats.total_records) {
-                probe.log_mid_read(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
-            }
-
-            if buffer.memory_usage() >= self.memory_limit {
-                timer.end_read_span();
-                let bstats = probe_stats(&buffer);
-                let depths = Some(pool.phase1_queue_depths());
-                probe.pre_spill(bstats, depths);
-
-                // Wait for any previous spill to complete
-                self.drain_pending_spill::<RawCoordinateKey>(
-                    &mut pending_spill,
-                    &mut chunk_files,
-                    &mut stats,
-                    &mut timer,
-                    &mut namer,
-                    &pool,
-                )?;
-                probe.post_drain(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
-
-                let chunk_path = namer.next_chunk_path()?;
-
-                timer.time_sort(|| {
-                    rayon_pool.install(|| buffer.par_sort());
-                });
-
-                let handle = timer.time_spill_write(|| {
-                    let mut writer = PooledChunkWriter::<RawCoordinateKey>::new(
-                        Arc::clone(&pool),
-                        &chunk_path,
-                        pool.spill_codec(),
-                    )?;
-                    for r in buffer.refs() {
-                        let key = RawCoordinateKey { sort_key: r.sort_key };
-                        let record_bytes = buffer.get_record(r);
-                        writer.write_record(&key, record_bytes)?;
-                    }
-                    writer.start_finish()
-                })?;
-
-                pending_spill = Some(PendingSpill { handle, chunk_path });
-
-                buffer.clear();
-                force_mi_collect();
-                probe.post_spill(Some(pool.phase1_queue_depths()));
-                timer.begin_read_span();
-            }
-        }
-
-        timer.end_read_span();
-        debug!("Read {} records total", stats.total_records);
-        if let Some(err) = record_source.take_error() {
-            return Err(anyhow::Error::from(err));
-        }
-
-        // Drain any pending spill before merge
-        self.drain_pending_spill::<RawCoordinateKey>(
-            &mut pending_spill,
-            &mut chunk_files,
-            &mut stats,
-            &mut timer,
-            &mut namer,
-            &pool,
-        )?;
-        probe.phase1_end(buffer.memory_usage() as u64);
-
-        let output_header = self.create_output_header(header);
-
-        if chunk_files.is_empty() {
-            // All records fit in memory - no merge needed
-            debug!("All records fit in memory, performing in-memory sort");
-
-            timer.time_sort(|| {
-                rayon_pool.install(|| buffer.par_sort());
-            });
-
-            timer.time_write_output(|| {
-                let mut writer = create_indexing_bam_writer(
-                    output,
-                    &output_header,
-                    self.output_compression,
-                    self.threads,
-                )?;
-
-                for record_bytes in buffer.iter_sorted() {
-                    writer.write_raw_record(record_bytes)?;
-                }
-
-                let index = writer.finish()?;
-
-                let index_path = output.with_extension("bam.bai");
-                write_bai_index(&index_path, &index)?;
-                info!("Wrote BAM index: {}", index_path.display());
-                Ok(())
-            })?;
-        } else {
-            // Sort remaining records into separate sub-array chunks
-            let memory_chunks: Vec<InMemoryChunk<RawCoordinateKey>> = if buffer.is_empty() {
-                Vec::new()
-            } else if self.threads > 1 {
-                timer.time_sort(|| rayon_pool.install(|| buffer.par_sort_into_chunks(self.threads)))
-            } else {
-                timer.time_sort(|| {
-                    rayon_pool.install(|| buffer.par_sort());
-                });
-                vec![buffer.drain_into_single_chunk()]
-            };
-
-            let memory_chunks = MemorySources::Shared(memory_chunks);
-            let n_memory = memory_chunks.num_non_empty();
-            debug!(
-                "Phase 2: Merging {} chunks with index generation...",
-                chunk_files.len() + n_memory
-            );
-
-            timer.time_merge(|| {
-                let index = self.merge_chunks_with_index::<RawCoordinateKey>(
-                    &chunk_files,
-                    memory_chunks,
-                    header,
-                    output,
-                    stats.total_records,
-                    &pool,
-                )?;
-
-                let index_path = output.with_extension("bam.bai");
-                write_bai_index(&index_path, &index)?;
-                info!("Wrote BAM index: {}", index_path.display());
-                Ok(())
             })?;
         }
 
@@ -3053,102 +2839,6 @@ impl RawExternalSorter {
         Ok(records_merged)
     }
 
-    /// Merge keyed chunks with BAM index generation.
-    ///
-    /// Similar to `merge_chunks_generic` but uses `IndexingBamWriter` to build
-    /// the BAI index incrementally during the merge. Returns the generated index.
-    fn merge_chunks_with_index<K: RawSortKey + Default + 'static>(
-        &self,
-        chunk_files: &[PathBuf],
-        memory_chunks: MemorySources<K>,
-        header: &Header,
-        output: &Path,
-        total_records: u64,
-        pool: &Arc<SortWorkerPool>,
-    ) -> Result<noodles::bam::bai::Index> {
-        use crate::loser_tree::LoserTree;
-        use fgumi_bam_io::create_indexing_bam_writer;
-
-        // Thread budget: writer gets all threads (merge is output-compression-bound),
-        // readers use semaphore concurrency of 1. Same split as merge_chunks_generic.
-        // TODO: Replace create_indexing_bam_writer with PooledIndexingBamWriter
-        let writer_threads = self.threads;
-        let reader_concurrency: usize = 1;
-
-        // The indexing path uses a non-pooled writer and has no pool consumer set up,
-        // so use GenericKeyedChunkReader (pool_decompress=false).
-        // TODO: Replace create_indexing_bam_writer with PooledIndexingBamWriter to
-        // enable pool-integrated decompression for the indexing path.
-        let mut sources = Self::build_chunk_sources::<K>(
-            chunk_files,
-            memory_chunks,
-            reader_concurrency,
-            false,
-            pool,
-        )?;
-
-        let num_sources = sources.len();
-        debug!(
-            "Merge thread budget (indexing): {writer_threads} writer + {reader_concurrency} reader + 1 main = {} total",
-            writer_threads + reader_concurrency + 1
-        );
-        debug!("Merging from {num_sources} sources (indexing)...");
-
-        let output_header = self.create_output_header(header);
-
-        // Initialize loser tree with first record from each source.
-        let mut initial_keys: Vec<K> = Vec::with_capacity(sources.len());
-        let mut source_map: Vec<usize> = Vec::with_capacity(sources.len());
-
-        for (idx, source) in sources.iter_mut().enumerate() {
-            if let Some(key) = source.advance(None)? {
-                initial_keys.push(key);
-                source_map.push(idx);
-            }
-        }
-
-        if initial_keys.is_empty() {
-            let writer = create_indexing_bam_writer(
-                output,
-                &output_header,
-                self.output_compression,
-                writer_threads,
-            )?;
-            let index = writer.finish()?;
-            debug!("Merge complete: 0 records merged");
-            return Ok(index);
-        }
-
-        let mut tree = LoserTree::new(initial_keys);
-
-        let mut writer = create_indexing_bam_writer(
-            output,
-            &output_header,
-            self.output_compression,
-            writer_threads,
-        )?;
-        let merge_progress = ProgressTracker::new("Merged records")
-            .with_interval(1_000_000)
-            .with_total(total_records);
-
-        while tree.winner_is_active() {
-            let winner = tree.winner();
-            let src_idx = source_map[winner];
-            writer.write_raw_record(sources[src_idx].current_bytes())?;
-            merge_progress.log_if_needed(1);
-
-            if let Some(key) = sources[src_idx].advance(None)? {
-                tree.replace_winner(key);
-            } else {
-                tree.remove_winner();
-            }
-        }
-
-        let index = writer.finish()?;
-        merge_progress.log_final();
-        Ok(index)
-    }
-
     /// Create output header with appropriate sort order tags.
     fn create_output_header(&self, header: &Header) -> Header {
         super::create_output_header(self.sort_order, header)
@@ -3753,7 +3443,6 @@ mod tests {
         assert_eq!(sorter.threads, 1);
         assert_eq!(sorter.output_compression, 6);
         assert_eq!(sorter.temp_compression, 1);
-        assert!(!sorter.write_index);
         assert!(sorter.pg_info.is_none());
         assert_eq!(sorter.max_temp_files, DEFAULT_MAX_TEMP_FILES);
     }
@@ -3766,7 +3455,6 @@ mod tests {
             .threads(8)
             .output_compression(9)
             .temp_compression(3)
-            .write_index(true)
             .pg_info("1.0".to_string(), "fgumi sort".to_string())
             .max_temp_files(128);
 
@@ -3775,7 +3463,6 @@ mod tests {
         assert_eq!(sorter.threads, 8);
         assert_eq!(sorter.output_compression, 9);
         assert_eq!(sorter.temp_compression, 3);
-        assert!(sorter.write_index);
         assert_eq!(sorter.pg_info, Some(("1.0".to_string(), "fgumi sort".to_string())));
         assert_eq!(sorter.max_temp_files, 128);
     }
@@ -4122,59 +3809,40 @@ mod tests {
     /// zstd has no level-0 "stored" mode (the CLI rejects 0+zstd; here we make
     /// the same choice explicitly so the test matches user-facing behavior).
     #[rstest::rstest]
-    #[case::coordinate_bgzf(SortOrder::Coordinate, false, crate::codec::SpillCodec::Bgzf, 0)]
-    #[case::coordinate_with_index_bgzf(
-        SortOrder::Coordinate,
-        true,
-        crate::codec::SpillCodec::Bgzf,
-        0
-    )]
+    #[case::coordinate_bgzf(SortOrder::Coordinate, crate::codec::SpillCodec::Bgzf, 0)]
     #[case::queryname_bgzf(
         SortOrder::Queryname(QuerynameComparator::default()),
-        false,
         crate::codec::SpillCodec::Bgzf,
         0
     )]
     #[case::queryname_natural_bgzf(
         SortOrder::Queryname(QuerynameComparator::Natural),
-        false,
         crate::codec::SpillCodec::Bgzf,
         0
     )]
     #[case::template_coordinate_bgzf(
         SortOrder::TemplateCoordinate,
-        false,
         crate::codec::SpillCodec::Bgzf,
         0
     )]
-    #[case::coordinate_zstd(SortOrder::Coordinate, false, crate::codec::SpillCodec::Zstd, 1)]
-    #[case::coordinate_with_index_zstd(
-        SortOrder::Coordinate,
-        true,
-        crate::codec::SpillCodec::Zstd,
-        1
-    )]
+    #[case::coordinate_zstd(SortOrder::Coordinate, crate::codec::SpillCodec::Zstd, 1)]
     #[case::queryname_zstd(
         SortOrder::Queryname(QuerynameComparator::default()),
-        false,
         crate::codec::SpillCodec::Zstd,
         1
     )]
     #[case::queryname_natural_zstd(
         SortOrder::Queryname(QuerynameComparator::Natural),
-        false,
         crate::codec::SpillCodec::Zstd,
         1
     )]
     #[case::template_coordinate_zstd(
         SortOrder::TemplateCoordinate,
-        false,
         crate::codec::SpillCodec::Zstd,
         1
     )]
     fn test_sort_with_consolidation_preserves_all_records(
         #[case] sort_order: SortOrder,
-        #[case] write_index: bool,
         #[case] spill_codec: crate::codec::SpillCodec,
         #[case] temp_compression: u32,
     ) {
@@ -4203,7 +3871,6 @@ mod tests {
             .spill_codec(spill_codec)
             .temp_compression(temp_compression)
             .output_compression(0)
-            .write_index(write_index)
             .sort(&input, &output)
             .expect("sort should succeed");
 
@@ -4822,51 +4489,6 @@ mod tests {
             names_multi, names_single,
             "multi-dir and single-dir sort produced different record orders"
         );
-    }
-
-    #[test]
-    fn test_sort_coordinate_with_index_spilled_preserves_records() {
-        use fgumi_sam::SamBuilder;
-
-        // Enough pairs that an 8 KiB memory limit forces multiple spills,
-        // so the index-emitting merge runs over Disk sources + the in-memory
-        // chunk simultaneously (the mixed-source path the refactor must keep
-        // byte-identical).
-        let num_pairs = 300;
-        let mut builder = SamBuilder::new();
-        for i in 0..num_pairs {
-            let _ = builder
-                .add_pair()
-                .name(&format!("read{i:05}"))
-                .start1(i * 200 + 1)
-                .start2(i * 200 + 101)
-                .build();
-        }
-
-        let workdir = tempfile::tempdir().expect("workdir");
-        let input = workdir.path().join("input.bam");
-        let output = workdir.path().join("output.bam");
-        builder.write_bam(&input).expect("write bam");
-
-        let stats = RawExternalSorter::new(SortOrder::Coordinate)
-            .memory_limit(8 * 1024) // tiny → forces several spills
-            .threads(1)
-            .write_index(true) // routes through sort_coordinate_with_index → merge_chunks_with_index
-            .spill_codec(crate::codec::SpillCodec::Bgzf)
-            .temp_compression(0)
-            .output_compression(0)
-            .sort(&input, &output)
-            .expect("indexed coordinate sort should succeed");
-
-        assert!(stats.chunks_written >= 2, "expected multiple spill chunks");
-
-        // All records preserved.
-        let names = collect_read_names(&output);
-        assert_eq!(names.len(), num_pairs * 2, "record count mismatch");
-
-        // A .bai index was produced alongside the output.
-        let bai = output.with_extension("bam.bai");
-        assert!(bai.exists() || output.with_extension("bai").exists(), "index file should exist");
     }
 
     // ========================================================================
