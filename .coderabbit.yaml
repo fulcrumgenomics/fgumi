@@ -15,11 +15,12 @@
 language: en-US
 
 # Terse, technical, no praise or filler — match the codebase's review style.
+# NB: CodeRabbit caps tone_instructions at 250 characters — keep this terse.
 tone_instructions: >-
-  Be concise and technical. Skip praise and summaries of what the code does. Lead
-  with the concrete risk and a one-line fix. Favor correctness, output identity
-  (vs fgbio / samtools), concurrency soundness, and memory bounds over style. Do
-  not restate clippy/rustfmt findings — CI enforces those.
+  Concise and technical. Skip praise and restating the code. Lead with the risk
+  and a one-line fix. Favor correctness, output identity vs fgbio/samtools,
+  concurrency soundness, and memory bounds over style. Skip clippy/rustfmt nits;
+  CI enforces them.
 
 reviews:
   # Surface borderline correctness/soundness findings, not just high-confidence
