@@ -9,6 +9,4 @@
 pub mod bgzf_multithreaded;
 
 // Re-export MultithreadedWriter types
-pub use bgzf_multithreaded::{
-    BlockInfoRx, Builder as MultithreadedWriterBuilder, MultithreadedWriter,
-};
+pub use bgzf_multithreaded::{Builder as MultithreadedWriterBuilder, MultithreadedWriter};

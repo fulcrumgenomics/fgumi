@@ -20,7 +20,8 @@ use std::num::NonZero;
 use std::path::Path;
 
 use crate::paths::is_stdout_path;
-use crate::vendored::{BlockInfoRx, MultithreadedWriter, MultithreadedWriterBuilder};
+use crate::vendored::bgzf_multithreaded::BlockInfoRx;
+use crate::vendored::{MultithreadedWriter, MultithreadedWriterBuilder};
 
 /// Maximum uncompressed BGZF block size (64KB - 256 bytes for overhead).
 const MAX_BLOCK_SIZE: usize = 65280;

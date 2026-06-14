@@ -27,18 +27,14 @@ use anyhow::{Result, bail};
 use bytesize::ByteSize;
 use clap::Parser;
 use fgumi_bam_io::create_raw_bam_reader;
-use fgumi_sort::{
-    KeyTypesSpec, QuerynameComparator, RawExternalSorter, SortOrder, verify_sort_order,
-};
+use fgumi_sort::{QuerynameComparator, SortOrder};
 
-use log::{debug, info};
+use log::info;
 use std::path::PathBuf;
 
 use crate::commands::command::Command;
-use crate::commands::common::{
-    CompressionOptions, MemoryLimit, MemoryReserve, parse_bool, parse_memory, parse_memory_reserve,
-    resolve_memory_budget,
-};
+use crate::commands::common::{CompressionOptions, detect_total_memory, parse_bool};
+use crate::validation::parse_memory_size;
 
 /// Sort order for BAM files.
 ///
@@ -46,7 +42,7 @@ use crate::commands::common::{
 /// - `queryname` — lexicographic ordering (default, fast)
 /// - `queryname::lexicographic` — explicit lexicographic ordering
 /// - `queryname::natural` — natural numeric ordering (samtools-compatible)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortOrderArg {
     /// Coordinate sort (tid → pos → strand)
     Coordinate,
@@ -55,6 +51,7 @@ pub enum SortOrderArg {
     /// Queryname sort with natural numeric ordering
     QuerynameNatural,
     /// Template-coordinate sort (for UMI grouping)
+    #[default]
     TemplateCoordinate,
 }
 
@@ -187,6 +184,12 @@ pub struct Sort {
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
 
+    /// Wrap the input in a userspace async prefetch reader: a background
+    /// thread reads ahead so disk I/O overlaps sorting/compression. Helps
+    /// on slow or networked storage. Defaults to off.
+    #[arg(long = "async-reader", default_value_t = false, hide = true)]
+    pub async_reader: bool,
+
     /// Verify the input file is correctly sorted (no output written).
     ///
     /// Reads records sequentially and checks that each record's sort key
@@ -204,21 +207,125 @@ pub struct Sort {
     #[arg(long = "order", default_value = "template-coordinate", value_parser = SortOrderArg::parse)]
     pub order: SortOrderArg,
 
-    /// Which optional lanes to keep in the template-coordinate sort key.
-    ///
-    /// Smaller keys use less memory and spill less. Only meaningful for
-    /// `--order template-coordinate`; ignored for other orders.
-    ///
-    ///   (omitted)            Auto-detect from the first record + verify (default).
-    ///   full                 Keep all lanes (CB + library/MI). Largest key.
-    ///   none                 Drop all optional lanes (smallest, bulk pre-group).
-    ///   cb,library,mi        Comma/space list; keep the named lanes.
-    ///
-    /// A record carrying a value in a dropped lane aborts the sort with a message
-    /// naming the field and the token to re-include it.
-    #[arg(long = "key-types", value_parser = parse_key_types)]
-    pub key_types: Option<KeyTypesSpec>,
+    /// Per-stage sort tuning knobs (max memory, tmp dirs, etc.).
+    /// Flattened here so `fgumi sort` exposes them as unprefixed
+    /// flags (`--max-memory`, `-T`, …) and `fgumi runall` exposes
+    /// them as prefixed `--sort::*` via `MultiSortOptions`.
+    #[command(flatten)]
+    pub options: SortOptions,
 
+    /// Number of threads for parallel operations.
+    ///
+    /// Used for parallel sorting of in-memory chunks and
+    /// multi-threaded BGZF compression.
+    #[arg(short = '@', short_alias = 't', long = "threads", default_value = "1")]
+    pub threads: usize,
+
+    /// Compression options for output BAM.
+    #[command(flatten)]
+    pub compression: CompressionOptions,
+
+    /// Write BAM index (.bai) alongside output.
+    ///
+    /// Only valid for coordinate sort. The index file is written to
+    /// `<output>.bam.bai` after sort completes, by re-reading the
+    /// finished BAM (a post-pipeline pass). The BAM itself uses the
+    /// same multi-threaded BGZF compression as a non-`--write-index`
+    /// run, so output bytes are identical between the two; only the
+    /// extra BAI sidecar distinguishes them.
+    #[arg(long = "write-index", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    pub write_index: bool,
+}
+
+/// Represents the memory limit configuration for sorting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryLimit {
+    /// Automatically detect system memory and compute an optimal limit.
+    Auto,
+    /// Use a fixed memory limit in bytes.
+    Fixed(usize),
+}
+
+impl Default for MemoryLimit {
+    /// Matches the clap `default_value = "768M"` on `Sort::max_memory`
+    /// (also used by `SortOptions::max_memory`).
+    fn default() -> Self {
+        Self::Fixed(768 * 1024 * 1024)
+    }
+}
+
+impl std::fmt::Display for MemoryLimit {
+    /// Round-trips through `parse_memory`. `Fixed(N)` is rendered in
+    /// the largest unit that divides cleanly (`G` → `M` → `K` → `B`)
+    /// so `--help` shows e.g. `"768M"` rather than `"805306368B"`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Fixed(bytes) => format_binary_bytes(*bytes, f),
+        }
+    }
+}
+
+/// Represents how much memory to reserve for other processes (OS, aligners, etc.)
+/// when `--max-memory=auto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryReserve {
+    /// Automatic: `min(10 GiB, 50% of system memory)`.
+    Auto,
+    /// Reserve a fixed number of bytes.
+    Fixed(usize),
+}
+
+impl Default for MemoryReserve {
+    /// Matches the clap `default_value = "auto"` on `Sort::memory_reserve`.
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl std::fmt::Display for MemoryReserve {
+    /// Round-trips through `parse_memory_reserve`. See [`MemoryLimit`]'s
+    /// `Display` for the formatting rule.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Fixed(bytes) => format_binary_bytes(*bytes, f),
+        }
+    }
+}
+
+/// Format a byte count in the largest binary unit that divides
+/// cleanly (`G` → `M` → `K` → `B`). Used by `MemoryLimit::Display`
+/// and `MemoryReserve::Display` so that `parse_memory` /
+/// `parse_memory_reserve` round-trip the result.
+fn format_binary_bytes(bytes: usize, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    const K: usize = 1024;
+    const M: usize = K * 1024;
+    const G: usize = M * 1024;
+    if bytes >= G && bytes.is_multiple_of(G) {
+        write!(f, "{}G", bytes / G)
+    } else if bytes >= M && bytes.is_multiple_of(M) {
+        write!(f, "{}M", bytes / M)
+    } else if bytes >= K && bytes.is_multiple_of(K) {
+        write!(f, "{}K", bytes / K)
+    } else {
+        write!(f, "{bytes}B")
+    }
+}
+
+/// Per-stage sort tuning options, flattened into both the standalone
+/// `Sort` command (as bare `--max-memory`, `-T`, … flags) and the
+/// `RunAll` command (as prefixed `--sort::max-memory`, `--sort::tmp-dir`
+/// flags via the `MultiSortOptions` companion struct generated by
+/// `#[multi_options]`).
+///
+/// `Default` must match each field's clap `default_value` exactly —
+/// `MultiSortOptions`' generated `default_value_t` reads from
+/// `SortOptions::default().field`, and clap requires the default
+/// shown in `--help` to round-trip through the value-parser.
+#[fgumi_cli_macros::multi_options("sort", "Sort Options")]
+#[derive(clap::Args, Debug, Clone)]
+pub struct SortOptions {
     /// Maximum memory for in-memory sorting.
     ///
     /// Default is "768M" per thread (matching samtools behavior). Pass "auto"
@@ -264,60 +371,61 @@ pub struct Sort {
     #[arg(short = 'T', long = "tmp-dir", action = clap::ArgAction::Append)]
     pub tmp_dirs: Vec<PathBuf>,
 
-    /// Number of threads for parallel operations.
-    ///
-    /// Used for parallel sorting of in-memory chunks and parallel temp-chunk
-    /// (BGZF or zstd) compression.
-    #[arg(short = '@', short_alias = 't', long = "threads", default_value = "1")]
-    pub threads: usize,
-
-    /// Compression options for output BAM.
-    #[command(flatten)]
-    pub compression: CompressionOptions,
-
     /// Compression level for temporary chunk files (0-9).
     ///
-    /// Applies to the codec selected by `--temp-codec`:
-    ///   * For `bgzf`, level 0 produces uncompressed (stored) BGZF blocks
-    ///     (fastest, uses most disk space); 1..=9 are libdeflate levels.
-    ///   * For `zstd`, only 1..=9 are valid; level 0 is rejected because zstd
-    ///     has no equivalent "stored" mode and silently remapping it to 1
-    ///     would surprise users counting on uncompressed spill.
-    ///
+    /// Level 0 disables compression (fastest, uses most disk space).
     /// Level 1 (default) provides fast compression with reasonable space savings.
     /// Higher levels (up to 9) provide better compression but are slower.
     #[arg(long = "temp-compression", default_value = "1", value_parser = clap::value_parser!(u32).range(0..=9))]
     pub temp_compression: u32,
 
-    /// Codec used for temporary spill chunks: `zstd` (default) or `bgzf`.
+    /// Sort order (chain-builder slot).
     ///
-    /// zstd is significantly faster than bgzf at comparable compression
-    /// ratios for BAM-record data; we default to zstd because spill files
-    /// are internal to the sort and never read by other tools. Pass `bgzf`
-    /// to fall back to the legacy on-disk format.
-    #[arg(long = "temp-codec", default_value = "zstd")]
-    pub temp_codec: fgumi_sort::SpillCodec,
+    /// Carried here so the chain builder can read it from the bag without
+    /// needing a separate out-of-band parameter. Populated by `Sort::execute`
+    /// from `Sort::order` before constructing the `ChainSpec`.
+    #[arg(skip)]
+    pub order: SortOrderArg,
+}
 
-    /// Write BAM index (.bai) alongside output.
-    ///
-    /// Only valid for coordinate sort. The index file will be written to
-    /// `<output>.bai`. Uses single-threaded compression for accurate virtual
-    /// position tracking.
-    #[arg(long = "write-index", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
-    pub write_index: bool,
+impl Default for SortOptions {
+    fn default() -> Self {
+        Self {
+            max_memory: MemoryLimit::default(),
+            memory_reserve: MemoryReserve::default(),
+            memory_per_thread: true,
+            tmp_dirs: Vec::new(),
+            temp_compression: 1,
+            order: SortOrderArg::TemplateCoordinate,
+        }
+    }
+}
 
-    /// Enable async userspace prefetch on the input BAM.
-    ///
-    /// Spawns a dedicated I/O thread that reads raw bytes into a bounded
-    /// queue ahead of the decompression step, so pool workers do not block
-    /// on disk. Prototype flag; defaults to off.
-    #[arg(long = "async-reader", default_value_t = false, hide = true)]
-    pub async_reader: bool,
+/// Parse a memory size string into `usize` bytes, suitable for use in clap
+/// value parsers.
+///
+/// Delegates to [`parse_memory_size`] for numeric parsing. Plain numbers are
+/// interpreted as MiB (e.g. "768" = 768 MiB). Supports human-readable formats
+/// like "2GB", "1GiB", "512MiB". See [`parse_memory_size`] for full details.
+fn parse_memory_bytes(s: &str, label: &str) -> Result<usize, String> {
+    let bytes = parse_memory_size(s).map_err(|e| e.to_string())?;
+    usize::try_from(bytes).map_err(|_| format!("{label} too large: {bytes}"))
+}
+
+/// Parse memory size string (e.g., "512M", "1G", "2G", "auto").
+pub(crate) fn parse_memory(s: &str) -> Result<MemoryLimit, String> {
+    let s = s.trim();
+
+    if s.eq_ignore_ascii_case("auto") {
+        return Ok(MemoryLimit::Auto);
+    }
+
+    Ok(MemoryLimit::Fixed(parse_memory_bytes(s, "Memory size")?))
 }
 
 /// Environment variable name for the fallback temp-dir list, parsed as a
 /// `PATH`-style list when no `-T/--tmp-dir` flags are passed.
-const TMP_DIRS_ENV: &str = "FGUMI_TMP_DIRS";
+pub(crate) const TMP_DIRS_ENV: &str = "FGUMI_TMP_DIRS";
 
 /// Resolve the final list of temp directories for a sort run.
 ///
@@ -341,41 +449,25 @@ pub(crate) fn resolve_tmp_dirs(cli: &[PathBuf], env_value: Option<&str>) -> Vec<
         .collect()
 }
 
+/// Parse memory reserve string (e.g., "10G", "auto").
+pub(crate) fn parse_memory_reserve(s: &str) -> Result<MemoryReserve, String> {
+    let s = s.trim();
+
+    if s.eq_ignore_ascii_case("auto") {
+        return Ok(MemoryReserve::Auto);
+    }
+
+    let bytes = parse_memory_bytes(s, "Memory reserve")?;
+    Ok(MemoryReserve::Fixed(bytes))
+}
+
 /// Parse the cell tag for template-coordinate sort/verify, returning `None`
 /// for other sort orders.
 pub(crate) fn parse_cell_tag(order: SortOrderArg) -> Result<Option<SamTag>> {
     if matches!(order, SortOrderArg::TemplateCoordinate) { Ok(Some(SamTag::CB)) } else { Ok(None) }
 }
 
-/// Parse `--key-types` into a [`KeyTypesSpec`].
-///
-/// `full` | `none`/`""` | comma/space list of `cb`,`library`,`mi`. Unknown
-/// tokens are rejected. `library`, `mi`, and `library,mi` all map to the shared
-/// `tertiary` lane.
-pub(crate) fn parse_key_types(s: &str) -> Result<KeyTypesSpec, String> {
-    let s = s.trim();
-    if s.eq_ignore_ascii_case("full") {
-        return Ok(KeyTypesSpec::Full);
-    }
-    if s.is_empty() || s.eq_ignore_ascii_case("none") {
-        return Ok(KeyTypesSpec::None);
-    }
-    let mut cb = false;
-    let mut tertiary = false;
-    for tok in s.split([',', ' ']).filter(|t| !t.is_empty()) {
-        match tok.to_ascii_lowercase().as_str() {
-            "cb" => cb = true,
-            "library" | "mi" => tertiary = true,
-            other => {
-                return Err(format!(
-                    "unknown --key-types token '{other}', expected 'full', 'none', \
-                     or a list of 'cb','library','mi'"
-                ));
-            }
-        }
-    }
-    Ok(KeyTypesSpec::Explicit { cb, tertiary })
-}
+use fgumi_sort::verify_sort_order;
 
 impl Command for Sort {
     fn execute(&self, command_line: &str) -> Result<()> {
@@ -395,11 +487,171 @@ impl Command for Sort {
         }
 
         if self.verify {
+            // --verify is a standalone read-and-check path: no
+            // `ChainSpec`, no `Pipeline`, just a raw record-stream walk
+            // that compares each key to the previous (see
+            // `execute_verify`). It is intentionally NOT modeled as a
+            // `SinkSpec` variant because there is no BAM/BAI output —
+            // the path emits only log lines + a nonzero exit on
+            // violations.
             return self.execute_verify();
         }
 
-        self.execute_sort(command_line)
+        // Route the non-verify sort path through chains::build_for.
+        let output = self.output.as_ref().expect("output required for sort mode");
+
+        // BAI is only defined for coordinate sort. The cross-stage validator
+        // (Rule 3 in `chains::validate`) catches the spec-level constraint
+        // "BamWithIndex requires Stage::Sort terminal"; this CLI check
+        // enforces the file-format-physics constraint "BAI indexes
+        // coordinate-sorted BGZF offsets specifically, not template-coordinate
+        // or queryname". Together they cover both axes (chain shape and sort
+        // order) of the indexability invariant.
+        if self.write_index && !matches!(self.order, SortOrderArg::Coordinate) {
+            bail!("--write-index is only valid for coordinate sort");
+        }
+
+        // Copy order into SortOptions so the chain builder can read it from
+        // the bag. `--write-index` no longer rides on SortOptions: it routes
+        // through the sink variant below so the chain-builder's
+        // `IndexBamFinalizeHook` (registered by `add_sort`) owns BAI
+        // generation as a post-pipeline step, decoupled from the BGZF
+        // compression path.
+        let mut sort_opts = self.options.clone();
+        sort_opts.order = self.order;
+
+        let sink = if self.write_index {
+            crate::pipeline::chains::SinkSpec::BamWithIndex(output.clone())
+        } else {
+            crate::pipeline::chains::SinkSpec::Bam(output.clone())
+        };
+
+        let spec = crate::pipeline::chains::ChainSpec {
+            stages: vec![crate::pipeline::chains::Stage::Sort],
+            source: crate::pipeline::chains::SourceSpec::Bam(self.input.clone()),
+            sink,
+            stage_opts: crate::pipeline::chains::StageOptionsBag {
+                sort: Some(sort_opts),
+                ..Default::default()
+            },
+            threading: crate::commands::common::ThreadingOptions::new(self.threads),
+            compression: self.compression.clone(),
+            scheduler: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
+            async_reader: self.async_reader,
+            command_line: command_line.to_string(),
+        };
+        crate::pipeline::chains::build_for(spec)?.run()
     }
+}
+
+/// The minimum per-thread memory budget (256 MiB).
+const MIN_MEMORY_PER_THREAD: usize = 256 * 1024 * 1024;
+
+/// Default auto-reserve cap: 10 GiB.
+const AUTO_RESERVE_CAP: usize = 10 * 1024 * 1024 * 1024;
+
+/// Resolve a [`MemoryReserve`] to a concrete byte count given total system memory.
+fn resolve_reserve(reserve: MemoryReserve, total_memory: usize) -> usize {
+    match reserve {
+        MemoryReserve::Fixed(bytes) => bytes,
+        MemoryReserve::Auto => {
+            // min(10 GiB, 50% of system memory)
+            AUTO_RESERVE_CAP.min(total_memory / 2)
+        }
+    }
+}
+
+/// Resolves a [`MemoryLimit`] to a concrete byte count.
+///
+/// For [`MemoryLimit::Auto`]: detects total system memory (cgroup-aware via
+/// [`detect_total_memory`]), subtracts the reserve (via [`MemoryReserve`]),
+/// and divides by thread count (when `memory_per_thread` is true). The result
+/// is clamped to a minimum of 256 MiB per thread.
+///
+/// For [`MemoryLimit::Fixed`]: applies the same `memory_per_thread`
+/// multiplication as before. The reserve is ignored.
+///
+/// # Note
+///
+/// Calls [`detect_total_memory`] exactly once regardless of `limit` variant.
+/// That function invokes `sysinfo` (creates a `System` instance and refreshes
+/// memory counters), so repeated calls add unnecessary overhead.
+pub(crate) fn resolve_memory_limit(
+    limit: MemoryLimit,
+    reserve: MemoryReserve,
+    threads: usize,
+    memory_per_thread: bool,
+) -> Result<usize> {
+    if threads == 0 {
+        bail!("--threads must be at least 1");
+    }
+
+    // Call once — detect_total_memory() invokes sysinfo, which is not free.
+    let total = detect_total_memory();
+
+    let total_budget = match limit {
+        MemoryLimit::Fixed(bytes) => {
+            if memory_per_thread {
+                bytes
+                    .checked_mul(threads)
+                    .ok_or_else(|| anyhow::anyhow!("--max-memory × --threads overflowed"))?
+            } else {
+                bytes
+            }
+        }
+        MemoryLimit::Auto => {
+            let margin = resolve_reserve(reserve, total);
+            let available = total.saturating_sub(margin);
+
+            if memory_per_thread {
+                let per_thread = (available / threads).max(MIN_MEMORY_PER_THREAD);
+                let budget = per_thread
+                    .checked_mul(threads)
+                    .ok_or_else(|| anyhow::anyhow!("auto memory budget overflowed"))?;
+                if budget > available {
+                    log::warn!(
+                        "Auto memory: total budget {} exceeds available {} \
+                         ({}/thread x {} threads, reserve {}); may spill to disk earlier than expected",
+                        ByteSize(budget as u64),
+                        ByteSize(available as u64),
+                        ByteSize(per_thread as u64),
+                        threads,
+                        ByteSize(margin as u64),
+                    );
+                }
+                info!(
+                    "Auto memory: using {} of {} ({}/thread x {} threads, reserve {})",
+                    ByteSize(budget as u64),
+                    ByteSize(total as u64),
+                    ByteSize(per_thread as u64),
+                    threads,
+                    ByteSize(margin as u64),
+                );
+                budget
+            } else {
+                let budget = available.max(MIN_MEMORY_PER_THREAD);
+                info!(
+                    "Auto memory: using {} of {} (fixed total, reserve {})",
+                    ByteSize(budget as u64),
+                    ByteSize(total as u64),
+                    ByteSize(margin as u64),
+                );
+                budget
+            }
+        }
+    };
+
+    // Post-resolution sanity check: warn if budget exceeds the effective memory limit.
+    if total_budget > total {
+        log::warn!(
+            "Memory budget {} exceeds total system memory {}; spill-to-disk is likely",
+            ByteSize(total_budget as u64),
+            ByteSize(total as u64),
+        );
+    }
+
+    Ok(total_budget)
 }
 
 impl Sort {
@@ -407,128 +659,6 @@ impl Sort {
     /// for other sort orders.
     fn parse_cell_tag(&self) -> Result<Option<SamTag>> {
         parse_cell_tag(self.order)
-    }
-
-    /// Execute sort mode: read, sort, and write output.
-    fn execute_sort(&self, command_line: &str) -> Result<()> {
-        let output = self.output.as_ref().expect("output required for sort mode");
-
-        // --write-index only valid for coordinate sort
-        if self.write_index && !matches!(self.order, SortOrderArg::Coordinate) {
-            bail!("--write-index is only valid for coordinate sort");
-        }
-
-        // zstd has no level-0 "stored" mode; silently remapping to 1 would
-        // surprise users who pass --temp-compression 0 to disable temp
-        // compression (which works for BGZF). Reject the combination
-        // explicitly.
-        if self.temp_compression == 0 && matches!(self.temp_codec, fgumi_sort::SpillCodec::Zstd) {
-            bail!(
-                "--temp-compression 0 is only supported with --temp-codec bgzf; \
-                 zstd does not have an uncompressed mode. Pass --temp-codec bgzf \
-                 to keep level-0 spill, or pick a zstd level >= 1."
-            );
-        }
-
-        let timer = OperationTimer::new("Sorting BAM");
-
-        // Resolve memory limit (auto-detect or fixed)
-        let effective_memory = resolve_memory_budget(
-            self.max_memory,
-            self.memory_reserve,
-            self.threads,
-            self.memory_per_thread,
-        )?;
-
-        let cell_tag = self.parse_cell_tag()?;
-
-        debug!("Starting Sort");
-        info!("Input: {}", self.input.display());
-        info!("Output: {}", output.display());
-        info!("Sort order: {:?}", self.order);
-        if let Some(ct) = cell_tag {
-            let ct_bytes = *ct;
-            info!("Cell tag: {}{}", ct_bytes[0] as char, ct_bytes[1] as char);
-        }
-        if let MemoryLimit::Fixed(per_thread) = self.max_memory {
-            if self.memory_per_thread {
-                info!(
-                    "Max memory: {} ({}/thread x {} threads)",
-                    ByteSize(effective_memory as u64),
-                    ByteSize(per_thread as u64),
-                    self.threads
-                );
-            } else {
-                info!("Max memory: {} (fixed)", ByteSize(effective_memory as u64));
-            }
-        }
-        info!("Threads: {}", self.threads);
-        info!("Temp compression level: {}", self.temp_compression);
-        if self.write_index {
-            info!("Write index: enabled");
-        }
-        let env_value = std::env::var(TMP_DIRS_ENV).ok();
-        let resolved_tmp_dirs = resolve_tmp_dirs(&self.tmp_dirs, env_value.as_deref());
-        if !resolved_tmp_dirs.is_empty() {
-            let joined = resolved_tmp_dirs
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            info!("Temp directories: {joined}");
-        }
-
-        // Sort using raw-bytes sorter for optimal memory efficiency and speed
-        let mut sorter = RawExternalSorter::new(self.order.into())
-            .memory_limit(effective_memory)
-            .threads(self.threads)
-            .output_compression(self.compression.compression_level)
-            .temp_compression(self.temp_compression)
-            .spill_codec(self.temp_codec)
-            .write_index(self.write_index)
-            .async_reader(self.async_reader)
-            .pg_info(crate::version::VERSION.to_string(), command_line.to_string());
-
-        // For auto mode, cap initial buffer pre-allocation at 768 MiB/thread
-        // (matching samtools default) to avoid huge upfront allocations.
-        // The buffer will grow on demand up to memory_limit.
-        if matches!(self.max_memory, MemoryLimit::Auto) {
-            let init = 768_usize
-                .checked_mul(1024 * 1024)
-                .and_then(|b| b.checked_mul(self.threads))
-                .ok_or_else(|| anyhow::anyhow!("initial auto buffer size overflowed"))?;
-            sorter = sorter.initial_capacity(effective_memory.min(init));
-        }
-
-        if let Some(ct) = cell_tag {
-            sorter = sorter.cell_tag(ct);
-        }
-
-        let key_types = self.key_types.unwrap_or_default(); // Auto
-        if !matches!(self.order, SortOrderArg::TemplateCoordinate) && self.key_types.is_some() {
-            info!("--key-types is ignored for --order {:?}", self.order);
-        }
-        sorter = sorter.key_types(key_types);
-
-        if !resolved_tmp_dirs.is_empty() {
-            sorter = sorter.temp_dirs(resolved_tmp_dirs);
-        }
-
-        let stats = sorter.sort(&self.input, output)?;
-        let (total_records, output_records, chunks_written) =
-            (stats.total_records, stats.output_records, stats.chunks_written);
-
-        // Summary
-        info!("=== Summary ===");
-        info!("Records processed: {total_records}");
-        info!("Records written: {output_records}");
-        if chunks_written > 0 {
-            info!("Temporary chunks: {chunks_written}");
-        }
-        info!("Output: {}", output.display());
-
-        timer.log_completion(total_records);
-        Ok(())
     }
 
     /// Execute verify mode: read records and check sort order.
@@ -545,7 +675,7 @@ impl Sort {
 
         let timer = OperationTimer::new("Verifying BAM sort order");
 
-        debug!("Starting Sort Verification");
+        info!("Starting Sort Verification");
         info!("Input: {}", self.input.display());
         info!("Expected order: {:?}", self.order);
         if let Some(ct) = cell_tag {
@@ -623,9 +753,6 @@ impl Sort {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Memory-budget helpers moved to `commands::common`; import the `pub(crate)`
-    // items these tests exercise that are not re-exported through `super::*`.
-    use crate::commands::common::{MIN_MEMORY_PER_THREAD, detect_total_memory, resolve_reserve};
     use clap::Parser;
     use rstest::rstest;
 
@@ -702,23 +829,7 @@ mod tests {
         let base = ["sort", "-i", "in.bam", "-o", "out.bam", "--order", "coordinate"];
         let args: Vec<&str> = base.iter().copied().chain(extra.iter().copied()).collect();
         let sort = Sort::try_parse_from(args).expect("parse should succeed");
-        assert_eq!(sort.tmp_dirs, expected);
-    }
-
-    /// Pin the `--temp-codec` parser default and explicit override so a flipped
-    /// default (or a removed `default_value`) fails at unit-test time.
-    #[rstest]
-    #[case::default_omitted(&[], fgumi_sort::SpillCodec::Zstd)]
-    #[case::explicit_zstd(&["--temp-codec", "zstd"], fgumi_sort::SpillCodec::Zstd)]
-    #[case::explicit_bgzf(&["--temp-codec", "bgzf"], fgumi_sort::SpillCodec::Bgzf)]
-    fn test_clap_temp_codec_default(
-        #[case] extra: &[&str],
-        #[case] expected: fgumi_sort::SpillCodec,
-    ) {
-        let base = ["sort", "-i", "in.bam", "-o", "out.bam", "--order", "coordinate"];
-        let args: Vec<&str> = base.iter().copied().chain(extra.iter().copied()).collect();
-        let sort = Sort::try_parse_from(args).expect("parse should succeed");
-        assert_eq!(sort.temp_codec, expected);
+        assert_eq!(sort.options.tmp_dirs, expected);
     }
 
     /// Helper to construct a `Sort` struct with a given order.
@@ -726,19 +837,20 @@ mod tests {
         Sort {
             input: PathBuf::from("test.bam"),
             output: None,
+            async_reader: false,
             verify: false,
             order,
-            key_types: None,
-            max_memory: MemoryLimit::Fixed(512 * 1024 * 1024),
-            memory_reserve: MemoryReserve::Auto,
-            memory_per_thread: true,
-            tmp_dirs: Vec::new(),
+            options: SortOptions {
+                max_memory: MemoryLimit::Fixed(512 * 1024 * 1024),
+                memory_reserve: MemoryReserve::Auto,
+                memory_per_thread: true,
+                tmp_dirs: Vec::new(),
+                temp_compression: 1,
+                order,
+            },
             threads: 1,
             compression: CompressionOptions::default(),
-            temp_compression: 1,
-            temp_codec: fgumi_sort::SpillCodec::default(),
             write_index: false,
-            async_reader: false,
         }
     }
 
@@ -838,7 +950,7 @@ mod tests {
         let fixed = MemoryLimit::Fixed(1024 * 1024 * 1024); // 1 GiB
         // Reserve is ignored for fixed limits
         let resolved =
-            resolve_memory_budget(fixed, MemoryReserve::Auto, 4, true).expect("should succeed");
+            resolve_memory_limit(fixed, MemoryReserve::Auto, 4, true).expect("should succeed");
         // Fixed + memory_per_thread: total = 1 GiB * 4 = 4 GiB
         assert_eq!(resolved, 4 * 1024 * 1024 * 1024);
     }
@@ -847,7 +959,7 @@ mod tests {
     fn test_resolve_memory_limit_fixed_no_per_thread() {
         let fixed = MemoryLimit::Fixed(4 * 1024 * 1024 * 1024); // 4 GiB
         let resolved =
-            resolve_memory_budget(fixed, MemoryReserve::Auto, 4, false).expect("should succeed");
+            resolve_memory_limit(fixed, MemoryReserve::Auto, 4, false).expect("should succeed");
         // Fixed + no per-thread: total = 4 GiB
         assert_eq!(resolved, 4 * 1024 * 1024 * 1024);
     }
@@ -856,7 +968,7 @@ mod tests {
     fn test_resolve_memory_limit_auto() {
         let total = detect_total_memory();
 
-        let resolved = resolve_memory_budget(MemoryLimit::Auto, MemoryReserve::Auto, 4, true)
+        let resolved = resolve_memory_limit(MemoryLimit::Auto, MemoryReserve::Auto, 4, true)
             .expect("should succeed");
         // Must be at least the per-thread minimum floor (256 MiB * 4 threads)
         let min_expected = MIN_MEMORY_PER_THREAD.saturating_mul(4).min(total);
@@ -873,7 +985,7 @@ mod tests {
 
     #[test]
     fn test_resolve_memory_limit_auto_no_per_thread() {
-        let resolved = resolve_memory_budget(MemoryLimit::Auto, MemoryReserve::Auto, 8, false)
+        let resolved = resolve_memory_limit(MemoryLimit::Auto, MemoryReserve::Auto, 8, false)
             .expect("should succeed");
         // Auto + no per-thread: should be total budget, not divided by threads
         // Must be at least the minimum floor (256 MB)
@@ -917,14 +1029,14 @@ mod tests {
         // With a larger fixed reserve, auto should return less memory.
         // Use modest reserve sizes (128 MiB vs 512 MiB) to stay well within
         // CI runner RAM and avoid the per-thread floor clamping both results.
-        let large_reserve = resolve_memory_budget(
+        let large_reserve = resolve_memory_limit(
             MemoryLimit::Auto,
             MemoryReserve::Fixed(512 * 1024 * 1024),
             4,
             true,
         )
         .expect("should succeed");
-        let small_reserve = resolve_memory_budget(
+        let small_reserve = resolve_memory_limit(
             MemoryLimit::Auto,
             MemoryReserve::Fixed(128 * 1024 * 1024),
             4,
@@ -1030,24 +1142,6 @@ mod tests {
     }
 
     #[test]
-    fn test_temp_compression_zero_with_zstd_rejected() {
-        let sort = Sort {
-            output: Some(PathBuf::from("out.bam")),
-            temp_compression: 0,
-            temp_codec: fgumi_sort::SpillCodec::Zstd,
-            ..make_sort(SortOrderArg::Coordinate)
-        };
-        // Call execute_sort directly to bypass the input-file existence check
-        // in execute(); the codec validation lives inside execute_sort.
-        let err = sort.execute_sort("test").unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("--temp-compression 0 is only supported with --temp-codec bgzf"),
-            "unexpected error: {msg}"
-        );
-    }
-
-    #[test]
     fn test_verify_coordinate_fails_on_unsorted() -> Result<()> {
         use fgumi_sort::RawBamRecordReader;
         use fgumi_sort::extract_coordinate_key_inline;
@@ -1136,40 +1230,5 @@ mod tests {
         );
 
         Ok(())
-    }
-
-    // ========================================================================
-    // parse_key_types tests
-    // ========================================================================
-
-    #[rstest]
-    #[case("full", KeyTypesSpec::Full)]
-    #[case("none", KeyTypesSpec::None)]
-    #[case("", KeyTypesSpec::None)]
-    #[case("cb", KeyTypesSpec::Explicit { cb: true, tertiary: false })]
-    #[case("library", KeyTypesSpec::Explicit { cb: false, tertiary: true })]
-    #[case("mi", KeyTypesSpec::Explicit { cb: false, tertiary: true })]
-    #[case("library,mi", KeyTypesSpec::Explicit { cb: false, tertiary: true })]
-    #[case("cb,mi", KeyTypesSpec::Explicit { cb: true, tertiary: true })]
-    #[case("cb library", KeyTypesSpec::Explicit { cb: true, tertiary: true })]
-    #[case("FULL", KeyTypesSpec::Full)]
-    #[case("None", KeyTypesSpec::None)]
-    #[case("CB", KeyTypesSpec::Explicit { cb: true, tertiary: false })]
-    #[case("Cb,MI", KeyTypesSpec::Explicit { cb: true, tertiary: true })]
-    fn test_parse_key_types_ok(#[case] input: &str, #[case] expected: KeyTypesSpec) {
-        assert_eq!(parse_key_types(input).expect("valid"), expected);
-    }
-
-    #[rstest]
-    #[case("bogus")]
-    #[case("cb,bogus")]
-    fn test_parse_key_types_err(#[case] input: &str) {
-        assert!(parse_key_types(input).is_err());
-    }
-
-    #[test]
-    fn test_key_types_clap_default_is_none_option() {
-        let sort = Sort::try_parse_from(["sort", "-i", "in.bam", "-o", "out.bam"]).expect("parse");
-        assert!(sort.key_types.is_none());
     }
 }

@@ -62,6 +62,27 @@ pub trait ReferenceProvider {
         start: noodles::core::Position,
         end: noodles::core::Position,
     ) -> anyhow::Result<Vec<u8>>;
+
+    /// Borrowed-slice variant of [`fetch`]. Implementations backed by an
+    /// in-memory sequence (e.g., `ReferenceReader`) override this to return
+    /// `Cow::Borrowed` and skip the per-call `Vec<u8>` allocation that
+    /// dominates hot per-record loops (see `alignment_tags::regenerate_alignment_tags_raw`,
+    /// which is called once per BAM record).
+    ///
+    /// Default implementation delegates to [`fetch`] and wraps the result
+    /// in `Cow::Owned`, preserving correctness for impls that can't borrow.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`fetch`].
+    fn fetch_borrowed<'a>(
+        &'a self,
+        chrom: &str,
+        start: noodles::core::Position,
+        end: noodles::core::Position,
+    ) -> anyhow::Result<std::borrow::Cow<'a, [u8]>> {
+        Ok(std::borrow::Cow::Owned(self.fetch(chrom, start, end)?))
+    }
 }
 
 impl<T: std::ops::Deref> ReferenceProvider for T
@@ -75,6 +96,15 @@ where
         end: noodles::core::Position,
     ) -> anyhow::Result<Vec<u8>> {
         self.deref().fetch(chrom, start, end)
+    }
+
+    fn fetch_borrowed<'a>(
+        &'a self,
+        chrom: &str,
+        start: noodles::core::Position,
+        end: noodles::core::Position,
+    ) -> anyhow::Result<std::borrow::Cow<'a, [u8]>> {
+        self.deref().fetch_borrowed(chrom, start, end)
     }
 }
 

@@ -227,8 +227,12 @@ impl Command for Fastq {
 }
 
 /// Write a single FASTQ record to the writer.
+///
+/// `pub(crate)` so the runall AAM chain (`crate::align_and_merge`)
+/// can reuse the same BAM→FASTQ logic the standalone `fgumi fastq`
+/// command uses, instead of duplicating the encoding.
 #[inline]
-fn write_fastq_record<W: Write>(
+pub(crate) fn write_fastq_record<W: Write>(
     writer: &mut W,
     record: &RawRecord,
     flags: u16,

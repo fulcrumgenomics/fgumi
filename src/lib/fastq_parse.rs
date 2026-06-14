@@ -6,7 +6,7 @@
 
 use std::io;
 
-use crate::unified_pipeline::MemoryEstimate;
+use fgumi_bam_io::MemoryEstimate;
 
 /// A parsed FASTQ record stored as a single heap allocation.
 ///
@@ -136,6 +136,12 @@ impl FastqRecord {
 
 impl MemoryEstimate for FastqRecord {
     fn estimate_heap_size(&self) -> usize {
+        self.data.capacity()
+    }
+}
+
+impl crate::pipeline::core::item::HeapSize for FastqRecord {
+    fn heap_size(&self) -> usize {
         self.data.capacity()
     }
 }

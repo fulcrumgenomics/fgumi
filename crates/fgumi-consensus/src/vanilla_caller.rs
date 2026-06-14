@@ -12,7 +12,7 @@ use crate::phred::{
 };
 use crate::simple_umi::consensus_umis;
 use anyhow::{Result, anyhow, bail};
-use fgumi_dna::dna::reverse_complement;
+use fgumi_dna::dna::reverse_complement_in_place;
 use fgumi_raw_bam::{RawRecord, RawRecordView, UnmappedSamBuilder, flags};
 use fgumi_sam::SamTag;
 use fgumi_sam::clipper::cigar_utils::{self, SimplifiedCigar};
@@ -553,7 +553,7 @@ impl VanillaUmiConsensusCaller {
         }
 
         if is_negative_strand {
-            bases = reverse_complement(&bases);
+            reverse_complement_in_place(&mut bases);
             quals.reverse();
         }
 
@@ -891,7 +891,7 @@ impl VanillaUmiConsensusCaller {
 
         // If negative strand, reverse complement bases and reverse quals
         if is_negative_strand {
-            bases = reverse_complement(&bases);
+            reverse_complement_in_place(&mut bases);
             quals.reverse();
         }
 

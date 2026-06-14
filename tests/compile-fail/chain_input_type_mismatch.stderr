@@ -1,0 +1,21 @@
+error[E0271]: type mismatch resolving `<U64Sink as Step>::Input == u32`
+  --> tests/compile-fail/chain_input_type_mismatch.rs:53:44
+   |
+53 |     let _ = builder.chain(U32Source).chain(U64Sink);
+   |                                      ----- ^^^^^^^ type mismatch resolving `<U64Sink as Step>::Input == u32`
+   |                                      |
+   |                                      required by a bound introduced by this call
+   |
+note: expected this to be `u32`
+  --> tests/compile-fail/chain_input_type_mismatch.rs:34:18
+   |
+34 |     type Input = u64; // mismatch with U32Source's Single<u32> output
+   |                  ^^^
+note: required by a bound in `fgumi_lib::pipeline::core::Chain::<'b, fgumi_lib::pipeline::core::Single<T>>::chain`
+  --> src/lib/pipeline/core/builder.rs
+   |
+   |     pub fn chain<S>(self, step: S) -> Chain<'b, S::Outputs>
+   |            ----- required by a bound in this associated function
+   |     where
+   |         S: Step<Input = T>,
+   |                 ^^^^^^^^^ required by this bound in `Chain::<'b, Single<T>>::chain`

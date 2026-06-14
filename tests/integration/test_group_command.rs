@@ -105,6 +105,19 @@ fn test_group_command_rejects_n_bases_in_umi() {
     assert!(metric.discarded_ns_in_umi > 0, "Should have discarded reads with N in UMI");
 }
 
+// Two `--use-new-pipeline` parity smoke tests once lived here:
+//   - test_group_command_use_new_pipeline_smoke (record-count parity)
+//   - test_group_command_use_new_pipeline_grouping_metrics_parity
+//
+// Both compared the new typed-step path against the legacy 7-step path
+// behind the hidden `--use-new-pipeline` flag. Phase 1 T1.5 deletes the
+// legacy path entirely, so the comparisons became tautologies (new vs
+// new). Per the Phase 1 entry decision D3 they're removed here rather
+// than converted; ongoing regression coverage for the typed-step path
+// is provided by the other tests in this file plus
+// `test_streaming_input::test_group_command_*` which now run against
+// the only group execution path.
+
 /// Helper function to create a test BAM file with multiple UMI families.
 fn create_test_input_bam(path: &PathBuf) {
     let header = create_minimal_header("chr1", 10000);
