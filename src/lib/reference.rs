@@ -376,6 +376,19 @@ impl fgumi_sam::ReferenceProvider for ReferenceReader {
     ) -> anyhow::Result<Vec<u8>> {
         self.fetch(chrom, start, end)
     }
+
+    fn fetch_borrowed<'a>(
+        &'a self,
+        chrom: &str,
+        start: noodles::core::Position,
+        end: noodles::core::Position,
+    ) -> anyhow::Result<std::borrow::Cow<'a, [u8]>> {
+        // Zero-copy borrow into the in-memory sequence map. Avoids the
+        // per-call `Vec<u8>` allocation that dominates the
+        // `regenerate_alignment_tags_raw` hot loop (16M+ calls per
+        // production clip / consensus run).
+        Ok(std::borrow::Cow::Borrowed(self.fetch_slice(chrom, start, end)?))
+    }
 }
 
 #[cfg(feature = "simplex")]

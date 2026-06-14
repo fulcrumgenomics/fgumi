@@ -33,6 +33,8 @@ use fgumi_lib::commands::group::GroupReadsByUmi;
 use fgumi_lib::commands::merge::Merge;
 use fgumi_lib::commands::review::Review;
 #[cfg(feature = "simplex")]
+use fgumi_lib::commands::runall::RunAll;
+#[cfg(feature = "simplex")]
 use fgumi_lib::commands::simplex::Simplex;
 #[cfg(feature = "simplex")]
 use fgumi_lib::commands::simplex_metrics::SimplexMetrics;
@@ -117,6 +119,9 @@ enum Subcommand {
     #[cfg(feature = "codec")]
     #[command(display_order = 11)]
     Codec(Codec),
+    #[cfg(feature = "simplex")]
+    #[command(display_order = 11)]
+    Runall(RunAll),
 
     // Post-consensus
     #[command(display_order = 12)]
@@ -160,6 +165,8 @@ impl Subcommand {
             Self::Duplex(cmd) => cmd.execute(command_line),
             #[cfg(feature = "codec")]
             Self::Codec(cmd) => cmd.execute(command_line),
+            #[cfg(feature = "simplex")]
+            Self::Runall(cmd) => cmd.execute(command_line),
             Self::Filter(cmd) => cmd.execute(command_line),
             Self::Clip(cmd) => cmd.execute(command_line),
             #[cfg(feature = "duplex")]

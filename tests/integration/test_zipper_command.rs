@@ -1,12 +1,10 @@
 //! End-to-end CLI tests for the zipper command.
 //!
-//! These tests invoke `Zipper::execute()` in-process, except
-//! `test_zipper_bam_stdin_input`, which exercises the `std::io::stdin()` pipe
-//! path inside zipper and only exists at the process boundary.
+//! These tests run the actual `fgumi zipper` binary and validate:
+//! 1. Basic merge of unmapped + mapped BAMs with tag transfer
+//! 2. Tag removal via `--tags-to-remove`
+//! 3. Error on missing input files
 
-use clap::Parser;
-use fgumi_lib::commands::command::Command as FgumiCommand;
-use fgumi_lib::commands::zipper::Zipper;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
@@ -123,21 +121,24 @@ fn test_zipper_basic_merge() {
     ];
     create_mapped_sam(&mapped_sam, &mapped_header, &mapped_records);
 
-    let cmd = Zipper::try_parse_from([
-        "zipper",
-        "--input",
-        mapped_sam.to_str().unwrap(),
-        "--unmapped",
-        unmapped_bam.to_str().unwrap(),
-        "--reference",
-        ref_path.to_str().unwrap(),
-        "--output",
-        output_bam.to_str().unwrap(),
-        "--compression-level",
-        "1",
-    ])
-    .expect("failed to parse zipper args");
-    cmd.execute("fgumi zipper").expect("Zipper command failed");
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "zipper",
+            "--input",
+            mapped_sam.to_str().unwrap(),
+            "--unmapped",
+            unmapped_bam.to_str().unwrap(),
+            "--reference",
+            ref_path.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--compression-level",
+            "1",
+        ])
+        .status()
+        .expect("Failed to run zipper command");
+
+    assert!(status.success(), "Zipper command failed");
     assert!(output_bam.exists(), "Output BAM not created");
 
     // Verify output records have UMI tags transferred
@@ -188,23 +189,26 @@ fn test_zipper_tag_removal() {
     }];
     create_mapped_sam(&mapped_sam, &mapped_header, &mapped_records);
 
-    let cmd = Zipper::try_parse_from([
-        "zipper",
-        "--input",
-        mapped_sam.to_str().unwrap(),
-        "--unmapped",
-        unmapped_bam.to_str().unwrap(),
-        "--reference",
-        ref_path.to_str().unwrap(),
-        "--output",
-        output_bam.to_str().unwrap(),
-        "--tags-to-remove",
-        "XY",
-        "--compression-level",
-        "1",
-    ])
-    .expect("failed to parse zipper args");
-    cmd.execute("fgumi zipper").expect("Zipper command with --tags-to-remove failed");
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "zipper",
+            "--input",
+            mapped_sam.to_str().unwrap(),
+            "--unmapped",
+            unmapped_bam.to_str().unwrap(),
+            "--reference",
+            ref_path.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--tags-to-remove",
+            "XY",
+            "--compression-level",
+            "1",
+        ])
+        .status()
+        .expect("Failed to run zipper command");
+
+    assert!(status.success(), "Zipper command with --tags-to-remove failed");
 
     // Verify XY tag was removed but RX tag was kept
     let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
@@ -228,19 +232,22 @@ fn test_zipper_missing_input() {
     let missing_mapped = temp_dir.path().join("missing.mapped.sam");
     let missing_unmapped = temp_dir.path().join("missing.unmapped.bam");
 
-    let cmd = Zipper::try_parse_from([
-        "zipper",
-        "--input",
-        missing_mapped.to_str().unwrap(),
-        "--unmapped",
-        missing_unmapped.to_str().unwrap(),
-        "--reference",
-        ref_path.to_str().unwrap(),
-        "--output",
-        output_bam.to_str().unwrap(),
-    ])
-    .expect("failed to parse zipper args");
-    assert!(cmd.execute("fgumi zipper").is_err(), "Zipper should fail for nonexistent input");
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "zipper",
+            "--input",
+            missing_mapped.to_str().unwrap(),
+            "--unmapped",
+            missing_unmapped.to_str().unwrap(),
+            "--reference",
+            ref_path.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+        ])
+        .status()
+        .expect("Failed to run zipper command");
+
+    assert!(!status.success(), "Zipper should fail for nonexistent input");
 }
 
 /// Test zipper accepts BAM as mapped input (--input).
@@ -303,21 +310,28 @@ fn test_zipper_bam_mapped_input() {
     ];
     create_mapped_bam(&mapped_bam, &mapped_header, &mapped_records);
 
-    let cmd = Zipper::try_parse_from([
-        "zipper",
-        "--input",
-        mapped_bam.to_str().unwrap(),
-        "--unmapped",
-        unmapped_bam.to_str().unwrap(),
-        "--reference",
-        ref_path.to_str().unwrap(),
-        "--output",
-        output_bam.to_str().unwrap(),
-        "--compression-level",
-        "1",
-    ])
-    .expect("failed to parse zipper args");
-    cmd.execute("fgumi zipper").expect("Zipper command failed with BAM input");
+    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "zipper",
+            "--input",
+            mapped_bam.to_str().unwrap(),
+            "--unmapped",
+            unmapped_bam.to_str().unwrap(),
+            "--reference",
+            ref_path.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--compression-level",
+            "1",
+        ])
+        .output()
+        .expect("Failed to run zipper command");
+
+    assert!(
+        output.status.success(),
+        "Zipper command failed with BAM input: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(output_bam.exists(), "Output BAM not created");
 
     // Verify output records have UMI tags transferred
@@ -330,6 +344,25 @@ fn test_zipper_bam_mapped_input() {
     for record in &records {
         assert!(record.data().get(&rx_tag).is_some(), "Output record should have RX tag");
     }
+
+    // Verify warning about BAM input was emitted — the typed-step
+    // pipeline parses BAM and SAM with equivalent parallel decompression
+    // so the perf gap is smaller than under the legacy path, but the
+    // SAM-from-aligner recommendation still stands and the warning is
+    // restored in the new path.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("BAM input detected"), "Should warn about BAM input. stderr: {stderr}");
+
+    // Verify queryname-sort check fires on this fixture (its SO:unsorted
+    // header is recognized as not-queryname-sorted via `check_sort`).
+    // The check itself only warns, not errors — zipper continues — but
+    // the warning is the user-facing signal that input is mis-sorted.
+    // This was previously asserted by the now-deleted parity_*_new_vs_legacy
+    // unit tests; restored here as the surviving regression gate.
+    assert!(
+        stderr.contains("does not appear to be queryname sorted"),
+        "Should warn about queryname-sort mismatch. stderr: {stderr}"
+    );
 }
 
 /// Test zipper accepts BAM piped to stdin (auto-detected via BGZF magic bytes).

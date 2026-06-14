@@ -5,17 +5,11 @@
 //! observed UMIs to match the expected set based on mismatch tolerance and minimum
 //! distance requirements.
 //!
-//! When `--rejects` is set, the threaded pipeline routes rejected records through
-//! the unified pipeline's first-class secondary output (see
-//! [`crate::unified_pipeline::run_bam_pipeline_from_reader_with_secondary`]).
-//! Rejects land in batch-input order rather than mutex-acquisition order, and the
-//! rejects BAM inherits the input header. The pattern matches `commands::filter`.
-//!
 //! # Example
 //!
 //! ```no_run
 //! use std::path::PathBuf;
-//! use fgumi_lib::commands::correct::CorrectUmis;
+//! use fgumi_lib::commands::correct::{CorrectOptions, CorrectUmis};
 //! use fgumi_lib::commands::command::Command;
 //! use fgumi_lib::commands::common::{
 //!     BamIoOptions, CompressionOptions, QueueMemoryOptions, RejectsOptions,
@@ -26,18 +20,21 @@
 //!     io: BamIoOptions {
 //!         input: PathBuf::from("input.bam"),
 //!         output: PathBuf::from("corrected.bam"),
-//!         async_reader: false,
+//!         ..Default::default()
 //!     },
 //!     rejects_opts: RejectsOptions { rejects: Some(PathBuf::from("rejects.bam")) },
-//!     metrics: Some(PathBuf::from("metrics.txt")),
-//!     max_mismatches: 2,
-//!     min_distance_diff: 2,
-//!     umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
-//!     umi_files: vec![],
-//!     dont_store_original_umis: false,
-//!     cache_size: 100_000,
-//!     min_corrected: None,
-//!     revcomp: false,
+//!     options: CorrectOptions {
+//!         metrics: Some(PathBuf::from("metrics.txt")),
+//!         max_mismatches: 2,
+//!         min_distance_diff: 2,
+//!         umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
+//!         umi_files: vec![],
+//!         dont_store_original_umis: false,
+//!         cache_size: 100_000,
+//!         min_corrected: None,
+//!         revcomp: false,
+//!         rejects_path: None,
+//!     },
 //!     threading: ThreadingOptions::new(4),
 //!     compression: CompressionOptions::default(),
 //!     scheduler_opts: SchedulerOptions::default(),
@@ -49,41 +46,28 @@
 
 use crate::bitenc::BitEnc;
 use crate::dna::reverse_complement_str;
-use crate::grouper::TemplateGrouper;
-use crate::logging::OperationTimer;
 use crate::metrics::correct::UmiCorrectionMetrics;
-use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::sam::SamTag;
-use crate::template::TemplateBatch;
-use crate::unified_pipeline::{
-    Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
-    run_bam_pipeline_from_reader_with_secondary,
-};
+use crate::validation::validate_file_exists;
 use ahash::AHashMap;
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::Parser;
-use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::{
-    BamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
-    create_optional_bam_writer,
-};
-use fgumi_raw_bam;
-use fgumi_raw_bam::{RawBamReader, RawRecord};
+use fgumi_raw_bam::RawRecord;
 use log::{info, warn};
 use lru::LruCache;
-use noodles::sam::Header;
-use noodles::sam::alignment::record::data::field::Tag;
-use std::io;
-use std::num::NonZero;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, RejectsOptions, SchedulerOptions,
-    ThreadingOptions, build_pipeline_config, parse_bool, serialize_raw_bam_records,
+    ThreadingOptions, parse_bool,
 };
+
+/// Log line emitted by `build_correct_chain` on entry.
+/// Pinned as a `pub const` so integration tests that assert the
+/// typed-step path was taken share a single source of truth with the
+/// log site and cannot drift. Mirrors `commands::zipper::NEW_PIPELINE_START_LOG`.
+pub const NEW_PIPELINE_START_LOG: &str = "Starting correct (new pipeline)";
 
 /// Result of matching an observed UMI to an expected UMI.
 ///
@@ -122,7 +106,7 @@ pub struct UmiMatch {
 /// # Example
 ///
 /// ```no_run
-/// # use fgumi_lib::commands::correct::CorrectUmis;
+/// # use fgumi_lib::commands::correct::{CorrectOptions, CorrectUmis};
 /// # use fgumi_lib::commands::command::Command;
 /// # use fgumi_lib::commands::common::{
 /// #     BamIoOptions, CompressionOptions, QueueMemoryOptions, RejectsOptions,
@@ -133,18 +117,21 @@ pub struct UmiMatch {
 ///     io: BamIoOptions {
 ///         input: PathBuf::from("input.bam"),
 ///         output: PathBuf::from("corrected.bam"),
-///         async_reader: false,
+///         ..Default::default()
 ///     },
 ///     rejects_opts: RejectsOptions { rejects: Some(PathBuf::from("rejects.bam")) },
-///     metrics: Some(PathBuf::from("metrics.txt")),
-///     max_mismatches: 2,
-///     min_distance_diff: 2,
-///     umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
-///     umi_files: vec![],
-///     dont_store_original_umis: false,
-///     cache_size: 100_000,
-///     min_corrected: None,
-///     revcomp: false,
+///     options: CorrectOptions {
+///         metrics: Some(PathBuf::from("metrics.txt")),
+///         max_mismatches: 2,
+///         min_distance_diff: 2,
+///         umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
+///         umi_files: vec![],
+///         dont_store_original_umis: false,
+///         cache_size: 100_000,
+///         min_corrected: None,
+///         revcomp: false,
+///         rejects_path: None,
+///     },
 ///     threading: ThreadingOptions::new(4),
 ///     compression: CompressionOptions::default(),
 ///     scheduler_opts: SchedulerOptions::default(),
@@ -215,6 +202,47 @@ pub struct CorrectUmis {
     #[command(flatten)]
     pub rejects_opts: RejectsOptions,
 
+    /// Per-stage UMI-correction tuning. Flattened into the standalone
+    /// `correct` command (as bare `--max-mismatches`, `-u`, … flags)
+    /// and the `RunAll` command (as prefixed `--correct::*` flags via
+    /// the `MultiCorrectOptions` companion struct generated by
+    /// `#[multi_options]`).
+    #[command(flatten)]
+    pub options: CorrectOptions,
+
+    /// Threading options for parallel processing.
+    #[command(flatten)]
+    pub threading: ThreadingOptions,
+
+    /// Compression options for output BAM.
+    #[command(flatten)]
+    pub compression: CompressionOptions,
+
+    /// Scheduler and pipeline stats options
+    #[command(flatten)]
+    pub scheduler_opts: SchedulerOptions,
+
+    /// Queue memory options.
+    #[command(flatten)]
+    pub queue_memory: QueueMemoryOptions,
+}
+
+/// Per-stage UMI-correction tuning options, flattened into both the
+/// standalone `correct` command (as bare `--max-mismatches`, `-u`, …
+/// flags) and the `RunAll` command (as prefixed
+/// `--correct::max-mismatches`, `--correct::umis`, … flags via the
+/// `MultiCorrectOptions` companion struct generated by
+/// `#[multi_options]`).
+///
+/// `Default` must match each field's clap `default_value` exactly —
+/// `MultiCorrectOptions`' generated `default_value_t` reads from
+/// `CorrectOptions::default().field`. `min_distance_diff` has no clap
+/// default (it is required); its `Default::default()` value is a
+/// placeholder that is never read at clap-init time because the
+/// macro generates `Option<usize>` for required fields.
+#[fgumi_cli_macros::multi_options("correct", "Correct Options")]
+#[derive(clap::Args, Debug, Clone)]
+pub struct CorrectOptions {
     /// Optional output path for metrics TSV file.
     #[arg(short = 'M', long)]
     pub metrics: Option<PathBuf>,
@@ -251,25 +279,91 @@ pub struct CorrectUmis {
     #[arg(long, default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub revcomp: bool,
 
-    /// Threading options for parallel processing.
-    #[command(flatten)]
-    pub threading: ThreadingOptions,
+    // ── Chain-builder slot (populated by CorrectUmis::execute, not by clap).
+    // Invisible to the CLI; carried so build_correct_chain can access the
+    // rejects output path without holding a reference back to CorrectUmis.
+    /// Rejects output path. Populated by `CorrectUmis::execute`.
+    #[arg(skip)]
+    pub rejects_path: Option<PathBuf>,
+}
 
-    /// Compression options for output BAM.
-    #[command(flatten)]
-    pub compression: CompressionOptions,
+impl Default for CorrectOptions {
+    fn default() -> Self {
+        Self {
+            metrics: None,
+            max_mismatches: 2,
+            // Placeholder: `min_distance_diff` is required (no clap
+            // `default_value`) so the macro wraps it in
+            // `Option<usize>` on the Multi side and never reads this
+            // Default value at clap-init time. We use `1` rather than
+            // `0` because `check_umi_distances` computes
+            // `min_distance_diff - 1` — if a future caller ever picks
+            // up `CorrectOptions::default()` via struct-update syntax
+            // and forgets to override, `0` would underflow (wrap on
+            // release, panic on debug). `1` saturates to `0` there,
+            // which is harmless.
+            min_distance_diff: 1,
+            umis: Vec::new(),
+            umi_files: Vec::new(),
+            dont_store_original_umis: false,
+            cache_size: 100_000,
+            min_corrected: None,
+            revcomp: false,
+            rejects_path: None,
+        }
+    }
+}
 
-    /// Scheduler and pipeline stats options
-    #[command(flatten)]
-    pub scheduler_opts: SchedulerOptions,
+impl CorrectOptions {
+    /// Validate semantic constraints the `multi_options` macro can't
+    /// express:
+    ///
+    /// - At least one of `umis` / `umi_files` is provided (the macro
+    ///   only sees each as a separately optional `Vec<>`, so it
+    ///   cannot enforce "at least one of two Vecs must be non-empty").
+    /// - `min_corrected`, when set, lies in `[0.0, 1.0]`.
+    ///
+    /// `CorrectUmis::validate` invokes this on the standalone CLI.
+    /// The follow-up EC-C2/EC-C3 commits will plumb the same check
+    /// into runall via the `MultiCorrectOptions::validate()`
+    /// round-trip when `--start-from <= correct`.
+    pub fn validate(&self) -> Result<()> {
+        if self.umis.is_empty() && self.umi_files.is_empty() {
+            bail!(
+                "At least one UMI or UMI file must be provided \
+                 (via --umis / --umi-files for `fgumi correct`, or \
+                 --correct::umis / --correct::umi-files for `fgumi runall`)."
+            );
+        }
+        if self.min_distance_diff == 0 {
+            bail!(
+                "--min-distance must be >= 1 \
+                 (a value of 0 would disable the ambiguity check and underflow \
+                 the `min_distance_diff - 1` distance window)."
+            );
+        }
+        if let Some(min) = self.min_corrected {
+            if !(0.0..=1.0).contains(&min) {
+                bail!("--min-corrected must be between 0 and 1.");
+            }
+        }
+        Ok(())
+    }
+}
 
-    /// Queue memory options.
-    #[command(flatten)]
-    pub queue_memory: QueueMemoryOptions,
+impl MultiCorrectOptions {
+    /// Returns `true` if the user supplied a UMI source — at least one of
+    /// `--correct::umi-files` or `--correct::umis`. Used by
+    /// [`crate::commands::runall::RunAll::extract_chain_wants_correct`] to
+    /// decide whether to splice `Stage::Correct` between Extract and Align.
+    #[must_use]
+    pub fn has_umi_source(&self) -> bool {
+        !self.correct_umi_files.is_empty() || !self.correct_umis.is_empty()
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum RejectionReason {
+pub(crate) enum RejectionReason {
     WrongLength,
     Mismatched,
     #[default]
@@ -281,69 +375,102 @@ enum RejectionReason {
 /// This struct holds the result of correcting a UMI once for an entire template,
 /// which can then be applied to all records in that template.
 #[derive(Debug)]
-struct TemplateCorrection {
+pub(crate) struct TemplateCorrection {
     /// Whether the UMI matched successfully.
-    matched: bool,
+    pub(crate) matched: bool,
     /// The corrected UMI string (if matched).
-    corrected_umi: Option<String>,
+    pub(crate) corrected_umi: Option<String>,
     /// The original UMI string.
-    original_umi: String,
+    pub(crate) original_umi: String,
     /// Whether correction was needed (mismatches > 0 or revcomp).
-    needs_correction: bool,
+    pub(crate) needs_correction: bool,
     /// Whether there were actual mismatches (not just revcomp).
-    has_mismatches: bool,
+    pub(crate) has_mismatches: bool,
     /// Match details for metrics.
-    matches: Vec<UmiMatch>,
+    pub(crate) matches: Vec<UmiMatch>,
     /// Rejection reason if not matched.
-    rejection_reason: RejectionReason,
+    pub(crate) rejection_reason: RejectionReason,
 }
 
 // ============================================================================
 // 7-Step Pipeline Types
 // ============================================================================
 
-/// Result from processing a batch of templates through UMI correction.
-struct CorrectProcessedBatch {
-    /// Raw-byte kept records.
-    kept_raw_records: Vec<RawRecord>,
-    /// Raw-byte rejected records, in batch-input order. Empty unless the
-    /// pipeline was configured with a `--rejects` output.
-    rejected_records: Vec<Vec<u8>>,
-    /// Number of templates processed.
-    templates_count: u64,
-    /// Number of missing UMI records.
-    missing_umis: u64,
-    /// Number of wrong length UMI records.
-    wrong_length: u64,
-    /// Number of mismatched UMI records.
-    mismatched: u64,
-    /// Per-UMI match counts for metrics.
-    umi_matches: AHashMap<String, UmiCorrectionMetrics>,
-}
-
-impl MemoryEstimate for CorrectProcessedBatch {
-    fn estimate_heap_size(&self) -> usize {
-        let raw_size: usize = self.kept_raw_records.iter().map(RawRecord::capacity).sum();
-        let raw_vec_overhead = self.kept_raw_records.capacity() * std::mem::size_of::<RawRecord>();
-        let rej_size: usize = self.rejected_records.iter().map(Vec::capacity).sum();
-        let rej_vec_overhead = self.rejected_records.capacity() * std::mem::size_of::<Vec<u8>>();
-        raw_size + raw_vec_overhead + rej_size + rej_vec_overhead
-    }
-}
-
 /// Metrics collected from UMI correction processing, aggregated post-pipeline.
 #[derive(Default)]
-struct CollectedCorrectMetrics {
+pub(crate) struct CollectedCorrectMetrics {
     /// Total templates processed.
-    templates_processed: u64,
+    pub(crate) templates_processed: u64,
     /// Records with missing UMI tag.
-    missing_umis: u64,
+    pub(crate) missing_umis: u64,
     /// Records with wrong UMI length.
-    wrong_length: u64,
+    pub(crate) wrong_length: u64,
     /// Records that didn't match any fixed UMI.
-    mismatched: u64,
+    pub(crate) mismatched: u64,
     /// Per-UMI match counts (for metrics file).
-    umi_matches: AHashMap<String, UmiCorrectionMetrics>,
+    pub(crate) umi_matches: AHashMap<String, UmiCorrectionMetrics>,
+}
+
+// Methods called by `pipeline::steps::correct::CorrectStep`.
+// The typed-step path body uses these to fold per-template correction
+// outcomes into a `CollectedCorrectMetrics` slot.
+impl CollectedCorrectMetrics {
+    /// Bump per-UMI metrics from a matched template's `TemplateCorrection`.
+    /// `num_records` is the record count for the template (all records
+    /// share the same UMI match outcome).
+    ///
+    /// Mirrors the inline bookkeeping in the legacy `process_fn`
+    /// (matched-arm at `correct.rs:~1101-1117`). Call from
+    /// `pipeline::steps::correct::CorrectStep`.
+    pub(crate) fn merge_match(&mut self, correction: &TemplateCorrection, num_records: u64) {
+        self.templates_processed += 1;
+        for m in &correction.matches {
+            if m.matched {
+                let entry = self
+                    .umi_matches
+                    .entry(m.umi.clone())
+                    .or_insert_with(|| UmiCorrectionMetrics::new(m.umi.clone()));
+                entry.total_matches += num_records;
+                match m.mismatches {
+                    0 => entry.perfect_matches += num_records,
+                    1 => entry.one_mismatch_matches += num_records,
+                    2 => entry.two_mismatch_matches += num_records,
+                    _ => entry.other_matches += num_records,
+                }
+            }
+        }
+    }
+
+    /// Bump the unmatched-UMI bucket. Used by the rejected and missing-RX
+    /// arms in the step body. Mirrors `correct.rs:~1079-1084` (missing RX)
+    /// and `~1138-1145` (mismatched).
+    ///
+    /// NOTE: this method does NOT bump `templates_processed`. The legacy
+    /// path counts ALL templates (matched + unmatched + missing) via a
+    /// single `templates_count = batch.len()` at the end of `process_fn`.
+    /// The new step body must either call this in addition to a separate
+    /// `templates_processed += 1` per unmatched template, or sum the
+    /// total post-loop. Otherwise `templates_processed` will undercount.
+    pub(crate) fn merge_unmatched(&mut self, unmatched_umi: &str, num_records: u64) {
+        let entry = self
+            .umi_matches
+            .entry(unmatched_umi.to_string())
+            .or_insert_with(|| UmiCorrectionMetrics::new(unmatched_umi.to_string()));
+        entry.total_matches += num_records;
+    }
+
+    /// Drain `other` into `self`, summing counts. Used during post-pipeline
+    /// slot aggregation by `CorrectStep`'s caller. Mirrors the loop at
+    /// `correct.rs:~1180-1189`.
+    pub(crate) fn merge_into(&mut self, other: &mut CollectedCorrectMetrics) {
+        self.templates_processed += other.templates_processed;
+        self.missing_umis += other.missing_umis;
+        self.wrong_length += other.wrong_length;
+        self.mismatched += other.mismatched;
+        for (umi, counts) in other.umi_matches.drain() {
+            merge_umi_counts(&mut self.umi_matches, umi, &counts);
+        }
+    }
 }
 
 impl Command for CorrectUmis {
@@ -373,7 +500,7 @@ impl Command for CorrectUmis {
     /// # Example
     ///
     /// ```no_run
-    /// # use fgumi_lib::commands::correct::CorrectUmis;
+    /// # use fgumi_lib::commands::correct::{CorrectOptions, CorrectUmis};
     /// # use fgumi_lib::commands::common::{
     /// #     BamIoOptions, CompressionOptions, QueueMemoryOptions, RejectsOptions,
     /// #     SchedulerOptions, ThreadingOptions,
@@ -382,17 +509,20 @@ impl Command for CorrectUmis {
     /// # use fgumi_lib::commands::command::Command;
     /// let corrector = CorrectUmis {
     ///     /* ... field initialization ... */
-    /// #   io: BamIoOptions { input: PathBuf::new(), output: PathBuf::new(), async_reader: false },
+    /// #   io: BamIoOptions {  input: PathBuf::new(), output: PathBuf::new(), ..Default::default() },
     /// #   rejects_opts: RejectsOptions::default(),
-    /// #   metrics: None,
-    /// #   max_mismatches: 2,
-    /// #   min_distance_diff: 2,
-    /// #   umis: vec![],
-    /// #   umi_files: vec![],
-    /// #   dont_store_original_umis: false,
-    /// #   cache_size: 100_000,
-    /// #   min_corrected: None,
-    /// #   revcomp: false,
+    /// #   options: CorrectOptions {
+    /// #       metrics: None,
+    /// #       max_mismatches: 2,
+    /// #       min_distance_diff: 2,
+    /// #       umis: vec![],
+    /// #       umi_files: vec![],
+    /// #       dont_store_original_umis: false,
+    /// #       cache_size: 100_000,
+    /// #       min_corrected: None,
+    /// #       revcomp: false,
+    /// #       rejects_path: None,
+    /// #   },
     /// #   threading: ThreadingOptions::new(4),
     /// #   compression: CompressionOptions::default(),
     /// #   scheduler_opts: SchedulerOptions::default(),
@@ -403,79 +533,52 @@ impl Command for CorrectUmis {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     fn execute(&self, command_line: &str) -> Result<()> {
+        use crate::pipeline::chains::{ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag};
+
+        // Top-level validations (input file, semantic option checks).
         self.validate()?;
 
-        let timer = OperationTimer::new("Correcting UMIs");
+        // Populate the #[arg(skip)] rejects_path slot on a clone of
+        // CorrectOptions so the chain builder can access it without
+        // holding a reference back to CorrectUmis.
+        let mut opts = self.options.clone();
+        opts.rejects_path.clone_from(&self.rejects_opts.rejects);
 
-        // Load UMI sequences
-        let (umi_sequences, umi_length) = self.load_umi_sequences()?;
-        // Create encoded UMI set for fast comparison
-        let encoded_umi_set = EncodedUmiSet::new(&umi_sequences);
-
-        // Warn about UMIs that are too close together
-        self.check_umi_distances(&umi_sequences);
-
-        // Open input using streaming-capable reader for pipeline use
-        let (reader, header) = create_bam_reader_for_pipeline_with_opts(
-            &self.io.input,
-            self.io.pipeline_reader_opts(),
-        )?;
-
-        // Add @PG record with PP chaining to input's last program
-        let header = crate::commands::common::add_pg_record(header, command_line)?;
-
-        // Dispatch based on thread count:
-        // - Some(threads) -> 7-step pipeline
-        // - None -> single-threaded fast path
-        let total_records = if let Some(threads) = self.threading.threads {
-            // Multi-threaded: 7-step pipeline
-            self.execute_threads_mode(
-                threads,
-                reader,
-                header,
-                Arc::new(encoded_umi_set),
-                umi_length,
-                self.rejects_opts.rejects.is_some(),
-            )?
-        } else {
-            // Single-threaded: reuse the already-opened reader (required for stdin —
-            // re-opening would double-consume a pipe). Mirrors group::execute_single_threaded.
-            self.execute_single_thread_mode(
-                reader,
-                header,
-                encoded_umi_set,
-                umi_length,
-                self.rejects_opts.rejects.is_some(),
-            )?
+        let spec = ChainSpec {
+            async_reader: self.io.async_reader,
+            stages: vec![Stage::Correct],
+            source: SourceSpec::Bam(self.io.input.clone()),
+            sink: SinkSpec::Bam(self.io.output.clone()),
+            stage_opts: StageOptionsBag { correct: Some(opts), ..Default::default() },
+            threading: self.threading.clone(),
+            compression: self.compression.clone(),
+            scheduler: self.scheduler_opts.clone(),
+            queue_memory: self.queue_memory.clone(),
+            command_line: command_line.to_string(),
         };
-
-        timer.log_completion(total_records);
-        Ok(())
+        crate::pipeline::chains::build_for(spec)?.run()
     }
 }
 
 impl CorrectUmis {
     /// Validates input parameters.
     ///
-    /// Checks that:
-    /// - At least one UMI is provided
+    /// Checks (in order):
+    /// - At least one UMI is provided (via `CorrectOptions::validate`)
+    /// - `min_corrected` is between 0 and 1 if specified (via `CorrectOptions::validate`)
     /// - Input file exists
-    /// - `min_corrected` is between 0 and 1 if specified
     ///
     /// # Errors
     ///
     /// Returns an error if any validation check fails.
     fn validate(&self) -> Result<()> {
-        if self.umis.is_empty() && self.umi_files.is_empty() {
-            bail!("At least one UMI or UMI file must be provided.");
-        }
-        // Validate the input exists (stdin paths are exempt — the reader
-        // streams them in a single pass).
-        self.io.validate()?;
-        if let Some(min) = self.min_corrected {
-            if !(0.0..=1.0).contains(&min) {
-                bail!("--min-corrected must be between 0 and 1.");
-            }
+        // Semantic option-level checks (UMI source presence + numeric
+        // ranges) live on `CorrectOptions::validate` so `RunAll` can
+        // invoke the same logic via the macro-generated
+        // `MultiCorrectOptions::validate()` round-trip.
+        self.options.validate()?;
+        if !fgumi_bam_io::is_stdin_path(&self.io.input) {
+            validate_file_exists(&self.io.input, "input BAM file")?;
         }
         Ok(())
     }
@@ -495,11 +598,11 @@ impl CorrectUmis {
     /// - No UMIs are provided
     /// - UMI files cannot be read
     /// - UMIs have different lengths
-    fn load_umi_sequences(&self) -> Result<(Vec<String>, usize)> {
+    pub(crate) fn load_umi_sequences(&self) -> Result<(Vec<String>, usize)> {
         let mut umi_set: std::collections::HashSet<String> =
-            self.umis.iter().map(|s| s.to_uppercase()).collect();
+            self.options.umis.iter().map(|s| s.to_uppercase()).collect();
 
-        for file in &self.umi_files {
+        for file in &self.options.umi_files {
             let content = std::fs::read_to_string(file)?;
             for line in content.lines() {
                 let umi = line.trim().to_uppercase();
@@ -534,8 +637,15 @@ impl CorrectUmis {
     /// # Arguments
     ///
     /// * `umi_sequences` - Slice of UMI sequences to check
-    fn check_umi_distances(&self, umi_sequences: &[String]) {
-        let pairs = find_umi_pairs_within_distance(umi_sequences, self.min_distance_diff - 1);
+    pub(crate) fn check_umi_distances(&self, umi_sequences: &[String]) {
+        let pairs = find_umi_pairs_within_distance(
+            umi_sequences,
+            // `saturating_sub` guards the chain path: the CLI rejects
+            // `--min-distance 0` in `CorrectOptions::validate`, but a direct
+            // chain caller could still construct `min_distance_diff == 0`,
+            // which would otherwise underflow (panic on debug, wrap on release).
+            self.options.min_distance_diff.saturating_sub(1),
+        );
 
         if !pairs.is_empty() {
             warn!("###################################################################");
@@ -550,7 +660,7 @@ impl CorrectUmis {
 
     /// Compute UMI correction for a template (called once per template).
     #[allow(clippy::too_many_arguments)]
-    fn compute_template_correction(
+    pub(crate) fn compute_template_correction(
         umi: &str,
         umi_length: usize,
         revcomp: bool,
@@ -653,7 +763,7 @@ impl CorrectUmis {
     /// - Records have different UMIs
     /// - Some records have UMIs and others don't
     /// - UMI tag has non-string type
-    fn extract_and_validate_template_umi_raw(
+    pub(crate) fn extract_and_validate_template_umi_raw(
         raw_records: &[RawRecord],
         umi_tag: [u8; 2],
     ) -> anyhow::Result<Option<String>> {
@@ -719,7 +829,7 @@ impl CorrectUmis {
     }
 
     /// Apply UMI correction to a raw BAM record.
-    fn apply_correction_to_raw(
+    pub(crate) fn apply_correction_to_raw(
         record: &mut RawRecord,
         correction: &TemplateCorrection,
         umi_tag: [u8; 2],
@@ -749,7 +859,7 @@ impl CorrectUmis {
         }
     }
 
-    fn finalize_metrics(
+    pub(crate) fn finalize_metrics(
         &self,
         umi_metrics: &mut AHashMap<String, UmiCorrectionMetrics>,
         unmatched_umi: &str,
@@ -778,7 +888,7 @@ impl CorrectUmis {
         }
 
         // Write metrics if requested
-        if let Some(path) = &self.metrics {
+        if let Some(path) = &self.options.metrics {
             let mut metrics: Vec<UmiCorrectionMetrics> = umi_metrics.values().cloned().collect();
             metrics.sort_by(|a, b| a.umi.cmp(&b.umi));
             UmiCorrectionMetrics::write_metrics(&metrics, path)?;
@@ -786,594 +896,12 @@ impl CorrectUmis {
 
         Ok(())
     }
-
-    /// Execute using the 7-step unified pipeline.
-    ///
-    /// This method uses the template-based grouper to process records in batches,
-    /// with parallel decompression, processing, and compression.
-    #[allow(clippy::too_many_lines)]
-    fn execute_threads_mode(
-        &self,
-        num_threads: usize,
-        reader: Box<dyn std::io::Read + Send>,
-        header: Header,
-        encoded_umi_set: Arc<EncodedUmiSet>,
-        umi_length: usize,
-        track_rejects: bool,
-    ) -> Result<u64> {
-        // Configure pipeline - correct is ReaderHeavy (70% in decompression)
-        let mut pipeline_config = build_pipeline_config(
-            &self.scheduler_opts,
-            &self.compression,
-            &self.queue_memory,
-            num_threads,
-        )?;
-
-        // Enable raw-byte mode (correct uses TemplateGrouper, no cell tag needed)
-        {
-            use crate::read_info::LibraryIndex;
-            use crate::unified_pipeline::GroupKeyConfig;
-
-            let library_index = LibraryIndex::from_header(&header);
-            pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw_no_cell(library_index));
-        }
-
-        // Per-thread metrics accumulator: bounded memory, no unbounded queue.
-        let collected_metrics = PerThreadAccumulator::<CollectedCorrectMetrics>::new(num_threads);
-        let collected_for_serialize = Arc::clone(&collected_metrics);
-
-        // Rejects (`--rejects`) flow through the unified pipeline's first-class
-        // secondary output (see `run_bam_pipeline_from_reader_with_secondary` in
-        // `unified_pipeline/bam.rs`). `process_fn` collects rejected raw bytes
-        // into `CorrectProcessedBatch::rejected_records`; the pipeline's
-        // `secondary_serialize_fn` writes them in batch-input order. This
-        // matches the pattern used by `commands/filter.rs`.
-
-        // Configuration for closures
-        const BATCH_SIZE: usize = 1000; // Templates per batch
-        let max_mismatches = self.max_mismatches;
-        let min_distance_diff = self.min_distance_diff;
-        let umi_tag = Tag::from(SamTag::RX);
-        let revcomp = self.revcomp;
-        let cache_size = self.cache_size;
-        let dont_store_original_umis = self.dont_store_original_umis;
-
-        // Progress tracking
-        let progress_counter = Arc::new(AtomicU64::new(0));
-        let progress_for_process = Arc::clone(&progress_counter);
-
-        // Unmatched UMI string for rejected reads (matches fgbio behavior)
-        let unmatched_umi = "N".repeat(umi_length);
-        let unmatched_umi_for_process = unmatched_umi.clone();
-
-        // Clone the UMI set for post-aggregation use (before closure moves original)
-        let encoded_umi_set_for_metrics = Arc::clone(&encoded_umi_set);
-
-        // Grouper: batch templates by QNAME
-        let grouper_fn = move |_header: &Header| {
-            Box::new(TemplateGrouper::new(BATCH_SIZE))
-                as Box<dyn Grouper<Group = TemplateBatch> + Send>
-        };
-
-        // Process function: correct UMIs in each template batch
-        let process_fn = move |batch: TemplateBatch| -> io::Result<CorrectProcessedBatch> {
-            // Per-thread LRU cache for UMI matching
-            thread_local! {
-                static CACHE: std::cell::RefCell<Option<LruCache<Vec<u8>, UmiMatch>>> = const { std::cell::RefCell::new(None) };
-            }
-
-            CACHE.with(|cache_cell| {
-                let mut cache_ref = cache_cell.borrow_mut();
-                if cache_ref.is_none() && cache_size > 0 {
-                    *cache_ref = Some(LruCache::new(
-                        NonZero::new(cache_size).expect("cache_size > 0 checked above"),
-                    ));
-                }
-
-                let mut kept_raw_records: Vec<RawRecord> = Vec::new();
-                // Rejected records are collected per-batch and drained by the
-                // unified pipeline's secondary serializer; empty unless
-                // `track_rejects` is true.
-                let mut rejected_records: Vec<Vec<u8>> = Vec::new();
-                let mut missing_umis = 0u64;
-                let mut wrong_length = 0u64;
-                let mut mismatched = 0u64;
-                let mut umi_matches_map: AHashMap<String, UmiCorrectionMetrics> = AHashMap::new();
-                let templates_count = batch.len() as u64;
-                // Count ALL input records for progress tracking (not just kept/rejected)
-                let mut total_input_records = 0u64;
-                let umi_tag_bytes: [u8; 2] = [umi_tag.as_ref()[0], umi_tag.as_ref()[1]];
-
-                for template in batch {
-                    // Count input records BEFORE processing
-                    total_input_records += template.read_count() as u64;
-
-                    {
-                        let raw_records: Vec<RawRecord> = template.into_records();
-                        let umi_opt = Self::extract_and_validate_template_umi_raw(
-                            &raw_records,
-                            umi_tag_bytes,
-                        )
-                        .map_err(io::Error::other)?;
-
-                        match umi_opt {
-                            None => {
-                                let num_records = raw_records.len() as u64;
-                                missing_umis += num_records;
-                                let entry = umi_matches_map
-                                    .entry(unmatched_umi_for_process.clone())
-                                    .or_insert_with(|| {
-                                        UmiCorrectionMetrics::new(unmatched_umi_for_process.clone())
-                                    });
-                                entry.total_matches += num_records;
-                                if track_rejects {
-                                    // Move out of `raw_records` (consumed here) to
-                                    // avoid a per-record clone+memcpy on the rejects
-                                    // hot path.
-                                    for raw in raw_records {
-                                        rejected_records.push(raw.into_inner());
-                                    }
-                                }
-                            }
-                            Some(umi) => {
-                                let correction = Self::compute_template_correction(
-                                    &umi,
-                                    umi_length,
-                                    revcomp,
-                                    max_mismatches,
-                                    min_distance_diff,
-                                    &encoded_umi_set,
-                                    &mut cache_ref,
-                                );
-                                let num_records = raw_records.len() as u64;
-
-                                if correction.matched {
-                                    for m in &correction.matches {
-                                        if m.matched {
-                                            let entry = umi_matches_map
-                                                .entry(m.umi.clone())
-                                                .or_insert_with(|| {
-                                                    UmiCorrectionMetrics::new(m.umi.clone())
-                                                });
-                                            entry.total_matches += num_records;
-                                            match m.mismatches {
-                                                0 => entry.perfect_matches += num_records,
-                                                1 => entry.one_mismatch_matches += num_records,
-                                                2 => entry.two_mismatch_matches += num_records,
-                                                _ => entry.other_matches += num_records,
-                                            }
-                                        }
-                                    }
-
-                                    for mut raw in raw_records {
-                                        Self::apply_correction_to_raw(
-                                            &mut raw,
-                                            &correction,
-                                            umi_tag_bytes,
-                                            dont_store_original_umis,
-                                        );
-                                        kept_raw_records.push(raw);
-                                    }
-                                } else {
-                                    match correction.rejection_reason {
-                                        RejectionReason::WrongLength => {
-                                            wrong_length += num_records;
-                                        }
-                                        RejectionReason::Mismatched => {
-                                            mismatched += num_records;
-                                        }
-                                        RejectionReason::None => {}
-                                    }
-                                    let entry = umi_matches_map
-                                        .entry(unmatched_umi_for_process.clone())
-                                        .or_insert_with(|| {
-                                            UmiCorrectionMetrics::new(
-                                                unmatched_umi_for_process.clone(),
-                                            )
-                                        });
-                                    entry.total_matches += num_records;
-                                    if track_rejects {
-                                        // Move out of `raw_records` (consumed
-                                        // here) to avoid a per-record clone.
-                                        for raw in raw_records {
-                                            rejected_records.push(raw.into_inner());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Progress logging (count ALL input records, not just output)
-                let count = progress_for_process.fetch_add(total_input_records, Ordering::Relaxed);
-                if (count + total_input_records) / 1_000_000 > count / 1_000_000 {
-                    info!("Processed {} records", count + total_input_records);
-                }
-
-                Ok(CorrectProcessedBatch {
-                    kept_raw_records,
-                    rejected_records,
-                    templates_count,
-                    missing_umis,
-                    wrong_length,
-                    mismatched,
-                    umi_matches: umi_matches_map,
-                })
-            })
-        };
-
-        // Serialize function: convert kept records to bytes and collect metrics.
-        // Rejects are drained by `secondary_serialize_fn` separately.
-        let serialize_fn = move |mut processed: CorrectProcessedBatch,
-                                 _header: &Header,
-                                 output: &mut Vec<u8>|
-              -> io::Result<u64> {
-            let umi_matches = std::mem::take(&mut processed.umi_matches);
-            collected_for_serialize.with_slot(|m| {
-                m.templates_processed += processed.templates_count;
-                m.missing_umis += processed.missing_umis;
-                m.wrong_length += processed.wrong_length;
-                m.mismatched += processed.mismatched;
-                for (umi, counts) in umi_matches {
-                    merge_umi_counts(&mut m.umi_matches, umi, &counts);
-                }
-            });
-
-            // Return KEPT record count (not input count, to avoid double-counting).
-            serialize_raw_bam_records(&processed.kept_raw_records, output)
-        };
-
-        // Secondary serialize: drains the per-batch rejected_records into the
-        // pipeline's secondary output buffer. The pipeline reorders by batch
-        // serial, so rejects land in input order and the secondary writer is
-        // finalized automatically inside the pipeline.
-        let secondary_serialize_fn =
-            |batch: &CorrectProcessedBatch, buf: &mut Vec<u8>| -> io::Result<u64> {
-                serialize_raw_bam_records(&batch.rejected_records, buf)
-            };
-
-        // Run the 7-step pipeline with the already-opened reader (supports streaming).
-        // When `--rejects` is set, route rejects through the unified pipeline's
-        // first-class secondary output so they land in input/batch-serial order.
-        let records_written = if let Some(rejects_path) = self.rejects_opts.rejects.as_ref() {
-            run_bam_pipeline_from_reader_with_secondary(
-                pipeline_config,
-                reader,
-                header,
-                &self.io.output,
-                None, // primary uses input header
-                rejects_path,
-                None, // secondary uses resolved primary header (== input header for correct)
-                grouper_fn,
-                process_fn,
-                serialize_fn,
-                secondary_serialize_fn,
-            )?
-        } else {
-            run_bam_pipeline_from_reader(
-                pipeline_config,
-                reader,
-                header,
-                &self.io.output,
-                None, // Use input header for output
-                grouper_fn,
-                process_fn,
-                serialize_fn,
-            )?
-        };
-
-        // ========== Post-pipeline: Aggregate metrics ==========
-        let mut total_templates = 0u64;
-        let mut total_missing = 0u64;
-        let mut total_wrong_length = 0u64;
-        let mut total_mismatched = 0u64;
-        let mut merged_umi_matches: AHashMap<String, UmiCorrectionMetrics> = AHashMap::new();
-
-        for slot in collected_metrics.slots() {
-            let mut m = slot.lock();
-            total_templates += m.templates_processed;
-            total_missing += m.missing_umis;
-            total_wrong_length += m.wrong_length;
-            total_mismatched += m.mismatched;
-
-            for (umi, counts) in m.umi_matches.drain() {
-                merge_umi_counts(&mut merged_umi_matches, umi, &counts);
-            }
-        }
-
-        // Ensure ALL UMI rows are present (even with zero counts) - matches fgbio behavior
-        for umi in encoded_umi_set_for_metrics.strings.iter().chain(std::iter::once(&unmatched_umi))
-        {
-            merged_umi_matches
-                .entry(umi.clone())
-                .or_insert_with(|| UmiCorrectionMetrics::new(umi.clone()));
-        }
-
-        // Finalize and write metrics if requested
-        self.finalize_metrics(&mut merged_umi_matches, &unmatched_umi)?;
-
-        // Log summary (records_written = kept records only)
-        let rejected = total_missing + total_wrong_length + total_mismatched;
-        let total_records = records_written + rejected;
-        info!("Read {total_records}; kept {records_written} and rejected {rejected}");
-        info!("Total templates processed: {total_templates}");
-
-        if total_missing > 0 || total_wrong_length > 0 {
-            warn!("###################################################################");
-            if total_missing > 0 {
-                warn!("# {total_missing} were missing UMI attributes in the BAM file!");
-            }
-            if total_wrong_length > 0 {
-                warn!(
-                    "# {total_wrong_length} had unexpected UMIs of differing lengths in the BAM file!"
-                );
-            }
-            warn!("###################################################################");
-        }
-
-        // Check minimum correction ratio
-        if let Some(min) = self.min_corrected {
-            #[allow(clippy::cast_precision_loss)]
-            let ratio_kept = records_written as f64 / total_records as f64;
-            if ratio_kept < min {
-                bail!(
-                    "Final ratio of reads kept / total was {ratio_kept:.2} (user specified minimum was {min:.2}). \
-                    This could indicate a mismatch between library preparation and the provided UMI file."
-                );
-            }
-        }
-
-        Ok(total_records)
-    }
-
-    /// Execute using single-threaded mode with template-level UMI correction.
-    ///
-    /// This method runs entirely on the main thread with no pipeline overhead.
-    /// It reads raw BAM records and groups them by QNAME, applying UMI correction
-    /// once per template, then applies the correction to all records in the template.
-    #[allow(clippy::too_many_lines)]
-    fn execute_single_thread_mode(
-        &self,
-        reader: Box<dyn std::io::Read + Send>,
-        header: Header,
-        encoded_umi_set: EncodedUmiSet,
-        umi_length: usize,
-        track_rejects: bool,
-    ) -> Result<u64> {
-        info!("Using single-threaded mode with template-level UMI correction");
-
-        // Reuse the already-opened reader (required for stdin: re-opening a pipe
-        // double-consumes it). Skip past the BAM header to reach records, then
-        // wrap in RawBamReader for zero-copy processing.
-        let buf_reader = std::io::BufReader::new(reader);
-        let mut noodles_reader = noodles::bam::io::Reader::new(buf_reader);
-        let _ = noodles_reader.read_header().context("Failed to skip BAM header")?;
-        let mut bam_reader = RawBamReader::new(noodles_reader.into_inner());
-
-        // Open output writer (single-threaded)
-        let mut writer =
-            create_bam_writer(&self.io.output, &header, 1, self.compression.compression_level)?;
-        let mut reject_writer = create_optional_bam_writer(
-            self.rejects_opts.rejects.as_ref(),
-            &header,
-            1,
-            self.compression.compression_level,
-        )?;
-
-        // LRU cache (single thread, no thread_local needed)
-        let mut cache: Option<LruCache<Vec<u8>, UmiMatch>> = if self.cache_size > 0 {
-            Some(LruCache::new(
-                NonZero::new(self.cache_size).expect("cache_size > 0 checked above"),
-            ))
-        } else {
-            None
-        };
-
-        // Initialize metrics
-        let unmatched_umi = "N".repeat(umi_length);
-        let umi_sequences = encoded_umi_set.strings.clone();
-        let mut umi_metrics: AHashMap<String, UmiCorrectionMetrics> = umi_sequences
-            .iter()
-            .chain(std::iter::once(&unmatched_umi))
-            .map(|umi| (umi.clone(), UmiCorrectionMetrics::new(umi.clone())))
-            .collect();
-
-        // Counters
-        let mut total_records = 0u64;
-        let mut total_templates = 0u64;
-        let mut missing_umis = 0u64;
-        let mut wrong_length = 0u64;
-        let mut mismatched = 0u64;
-        let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
-
-        let umi_tag_bytes: [u8; 2] = SamTag::RX.into();
-        let max_mismatches = self.max_mismatches;
-        let min_distance_diff = self.min_distance_diff;
-        let revcomp = self.revcomp;
-        let dont_store_original_umis = self.dont_store_original_umis;
-
-        // Helper to write a raw BAM record to a noodles BamWriter
-        #[allow(clippy::cast_possible_truncation)]
-        fn write_raw(writer: &mut BamWriter, raw: &[u8]) -> Result<()> {
-            use std::io::Write;
-            let block_size = raw.len() as u32;
-            writer.get_mut().write_all(&block_size.to_le_bytes())?;
-            writer.get_mut().write_all(raw)?;
-            Ok(())
-        }
-
-        // Read raw records and group by QNAME
-        let mut record = RawRecord::new();
-        let mut current_template: Vec<RawRecord> = Vec::new();
-        let mut current_name: Option<Vec<u8>> = None;
-
-        loop {
-            let bytes_read = bam_reader.read_record(&mut record)?;
-            let eof = bytes_read == 0;
-
-            // Determine if we need to flush the current template
-            let flush = if eof {
-                !current_template.is_empty()
-            } else {
-                let name = fgumi_raw_bam::read_name(record.as_ref());
-                current_name.as_deref().is_some_and(|cn| cn != name)
-            };
-
-            if flush {
-                let mut raw_records = std::mem::take(&mut current_template);
-
-                #[allow(clippy::cast_possible_truncation)]
-                let num_records = raw_records.len() as u64;
-                total_records += num_records;
-                total_templates += 1;
-
-                // Template-level UMI correction
-                let umi_opt = CorrectUmis::extract_and_validate_template_umi_raw(
-                    &raw_records,
-                    umi_tag_bytes,
-                )?;
-
-                match umi_opt {
-                    None => {
-                        // No UMI in any record - reject all records
-                        missing_umis += num_records;
-                        umi_metrics
-                            .get_mut(&unmatched_umi)
-                            .expect("unmatched_umi key initialized in metrics map")
-                            .total_matches += num_records;
-
-                        if track_rejects {
-                            if let Some(rw) = reject_writer.as_mut() {
-                                for raw in raw_records.drain(..) {
-                                    write_raw(rw, &raw)?;
-                                }
-                            }
-                        }
-                    }
-                    Some(umi) => {
-                        // Correct UMI once for the template
-                        let correction = CorrectUmis::compute_template_correction(
-                            &umi,
-                            umi_length,
-                            revcomp,
-                            max_mismatches,
-                            min_distance_diff,
-                            &encoded_umi_set,
-                            &mut cache,
-                        );
-
-                        if correction.matched {
-                            // Update metrics for matched UMIs (count per-read, not per-template)
-                            for m in &correction.matches {
-                                if m.matched {
-                                    let entry = umi_metrics.get_mut(&m.umi).expect(
-                                        "UMI key initialized in metrics map from allowed UMIs",
-                                    );
-                                    entry.total_matches += num_records;
-                                    match m.mismatches {
-                                        0 => entry.perfect_matches += num_records,
-                                        1 => entry.one_mismatch_matches += num_records,
-                                        2 => entry.two_mismatch_matches += num_records,
-                                        _ => entry.other_matches += num_records,
-                                    }
-                                }
-                            }
-
-                            // Apply correction to all records in template and write
-                            for mut raw in raw_records.drain(..) {
-                                CorrectUmis::apply_correction_to_raw(
-                                    &mut raw,
-                                    &correction,
-                                    umi_tag_bytes,
-                                    dont_store_original_umis,
-                                );
-                                write_raw(&mut writer, &raw)?;
-                            }
-                        } else {
-                            // Rejection - update counters based on reason
-                            match correction.rejection_reason {
-                                RejectionReason::WrongLength => wrong_length += num_records,
-                                RejectionReason::Mismatched => mismatched += num_records,
-                                RejectionReason::None => {}
-                            }
-                            umi_metrics
-                                .get_mut(&unmatched_umi)
-                                .expect("unmatched_umi key initialized in metrics map")
-                                .total_matches += num_records;
-
-                            if track_rejects {
-                                if let Some(rw) = reject_writer.as_mut() {
-                                    for raw in raw_records.drain(..) {
-                                        write_raw(rw, &raw)?;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                progress.log_if_needed(num_records);
-            }
-
-            if eof {
-                break;
-            }
-
-            // Accumulate current record — move the reader's buffer instead of copying.
-            current_name = Some(fgumi_raw_bam::read_name(record.as_ref()).to_vec());
-            let taken = std::mem::take(&mut record);
-            current_template.push(taken);
-        }
-
-        progress.log_final();
-
-        // Finish writers
-        writer.into_inner().finish()?;
-        if let Some(rw) = reject_writer {
-            rw.into_inner().finish()?;
-        }
-
-        // Finalize and write metrics
-        self.finalize_metrics(&mut umi_metrics, &unmatched_umi)?;
-
-        // Log summary
-        let rejected = missing_umis + wrong_length + mismatched;
-        let kept = total_records - rejected;
-        info!("Read {total_records}; kept {kept} and rejected {rejected}");
-        info!("Total templates processed: {total_templates}");
-
-        if missing_umis > 0 || wrong_length > 0 {
-            warn!("###################################################################");
-            if missing_umis > 0 {
-                warn!("# {missing_umis} were missing UMI attributes in the BAM file!");
-            }
-            if wrong_length > 0 {
-                warn!("# {wrong_length} had unexpected UMIs of differing lengths in the BAM file!");
-            }
-            warn!("###################################################################");
-        }
-
-        // Check minimum correction ratio
-        if let Some(min) = self.min_corrected {
-            #[allow(clippy::cast_precision_loss)]
-            let ratio_kept = kept as f64 / total_records as f64;
-            if ratio_kept < min {
-                bail!(
-                    "Final ratio of reads kept / total was {ratio_kept:.2} (user specified minimum was {min:.2}). \
-                    This could indicate a mismatch between library preparation and the provided UMI file."
-                );
-            }
-        }
-
-        Ok(total_records)
-    }
 }
 
 /// Merges `counts` into `dst[umi]`, creating a zero-initialized entry if the
 /// key is absent. Uses `or_insert_with_key` so `umi` is only cloned on insert,
 /// not on hit.
-fn merge_umi_counts(
+pub(crate) fn merge_umi_counts(
     dst: &mut AHashMap<String, UmiCorrectionMetrics>,
     umi: String,
     counts: &UmiCorrectionMetrics,
@@ -1440,7 +968,7 @@ pub struct EncodedUmiSet {
     /// Bit-encoded sequences for fast comparison (None if encoding failed)
     encoded: Vec<Option<BitEnc>>,
     /// Original strings for output
-    strings: Vec<String>,
+    pub(crate) strings: Vec<String>,
 }
 
 impl EncodedUmiSet {
@@ -1590,6 +1118,7 @@ mod tests {
     use super::*;
     use noodles::sam;
     use noodles::sam::alignment::io::Write as SamWrite;
+    use noodles::sam::alignment::record::data::field::Tag;
     use noodles::sam::alignment::record_buf::RecordBuf;
     use rstest::rstest;
     use std::{io::Write as IoWrite, path::Path};
@@ -1846,18 +1375,21 @@ mod tests {
             io: BamIoOptions {
                 input: input_file.path().to_path_buf(),
                 output: paths.output.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions { rejects: Some(paths.rejects.clone()) },
-            metrics: None,
-            max_mismatches: 2,
-            min_distance_diff: 2,
-            umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: None,
+                max_mismatches: 2,
+                min_distance_diff: 2,
+                umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1881,18 +1413,21 @@ mod tests {
             io: BamIoOptions {
                 input: temp_input.path().to_path_buf(),
                 output: temp_output.path().to_path_buf(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions::default(),
-            metrics: None,
-            max_mismatches: 2,
-            min_distance_diff: 2,
-            umis: vec!["AAAAAA".to_string(), "CCC".to_string()],
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: None,
+                max_mismatches: 2,
+                min_distance_diff: 2,
+                umis: vec!["AAAAAA".to_string(), "CCC".to_string()],
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1913,18 +1448,21 @@ mod tests {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: output.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions { rejects: Some(rejects.clone()) },
-            metrics: None,
-            max_mismatches: 2,
-            min_distance_diff: 2,
-            umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: None,
+                max_mismatches: 2,
+                min_distance_diff: 2,
+                umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1963,23 +1501,26 @@ mod tests {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: output.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions { rejects: Some(rejects.clone()) },
-            metrics: Some(metrics.clone()),
-            max_mismatches: 3,
-            min_distance_diff: 2,
-            umis: vec![
-                "AAAAAA".to_string(),
-                "CCCCCC".to_string(),
-                "GGGGGG".to_string(),
-                "TTTTTT".to_string(),
-            ],
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: Some(metrics.clone()),
+                max_mismatches: 3,
+                min_distance_diff: 2,
+                umis: vec![
+                    "AAAAAA".to_string(),
+                    "CCCCCC".to_string(),
+                    "GGGGGG".to_string(),
+                    "TTTTTT".to_string(),
+                ],
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2029,23 +1570,26 @@ mod tests {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: output.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions { rejects: Some(rejects.clone()) },
-            metrics: None,
-            max_mismatches: 3,
-            min_distance_diff: 2,
-            umis: vec![
-                "AAAAAA".to_string(),
-                "CCCCCC".to_string(),
-                "GGGGGG".to_string(),
-                "TTTTTT".to_string(),
-            ],
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: None,
+                max_mismatches: 3,
+                min_distance_diff: 2,
+                umis: vec![
+                    "AAAAAA".to_string(),
+                    "CCCCCC".to_string(),
+                    "GGGGGG".to_string(),
+                    "TTTTTT".to_string(),
+                ],
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2089,23 +1633,26 @@ mod tests {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: output1.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions::default(),
-            metrics: Some(metrics1.clone()),
-            max_mismatches: 3,
-            min_distance_diff: 2,
-            umis: vec![
-                "AAAAAA".to_string(),
-                "CCCCCC".to_string(),
-                "GGGGGG".to_string(),
-                "TTTTTT".to_string(),
-            ],
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: Some(metrics1.clone()),
+                max_mismatches: 3,
+                min_distance_diff: 2,
+                umis: vec![
+                    "AAAAAA".to_string(),
+                    "CCCCCC".to_string(),
+                    "GGGGGG".to_string(),
+                    "TTTTTT".to_string(),
+                ],
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2118,18 +1665,21 @@ mod tests {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: output2.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions::default(),
-            metrics: Some(metrics2.clone()),
-            max_mismatches: 3,
-            min_distance_diff: 2,
-            umis: vec![],
-            umi_files: vec![umi_file.path().to_path_buf()],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: Some(metrics2.clone()),
+                max_mismatches: 3,
+                min_distance_diff: 2,
+                umis: vec![],
+                umi_files: vec![umi_file.path().to_path_buf()],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2163,18 +1713,21 @@ mod tests {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: output.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions::default(),
-            metrics: None,
-            max_mismatches: 2,
-            min_distance_diff: 2,
-            umis: vec!["AAAAAA".to_string(), "TTTTTT".to_string(), "CCCCCC".to_string()],
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: None,
+                max_mismatches: 2,
+                min_distance_diff: 2,
+                umis: vec!["AAAAAA".to_string(), "TTTTTT".to_string(), "CCCCCC".to_string()],
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2206,18 +1759,21 @@ mod tests {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: output2.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions::default(),
-            metrics: None,
-            max_mismatches: 2,
-            min_distance_diff: 2,
-            umis: vec!["AAAAAA".to_string(), "TTTTTT".to_string(), "CCCCCC".to_string()],
-            umi_files: vec![],
-            dont_store_original_umis: true,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: None,
+                max_mismatches: 2,
+                min_distance_diff: 2,
+                umis: vec!["AAAAAA".to_string(), "TTTTTT".to_string(), "CCCCCC".to_string()],
+                umi_files: vec![],
+                dont_store_original_umis: true,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2250,18 +1806,21 @@ mod tests {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions::default(),
-            metrics: None,
-            max_mismatches: 2,
-            min_distance_diff: 2,
-            umis: vec!["AAAAAA".to_string(), "TTTTTT".to_string(), "CCCCCC".to_string()],
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: true,
+            options: CorrectOptions {
+                metrics: None,
+                max_mismatches: 2,
+                min_distance_diff: 2,
+                umis: vec!["AAAAAA".to_string(), "TTTTTT".to_string(), "CCCCCC".to_string()],
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: true,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2307,18 +1866,21 @@ mod tests {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions { rejects: Some(paths.rejects.clone()) },
-            metrics: None,
-            max_mismatches: 0, // Exact match only
-            min_distance_diff: 1,
-            umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: None,
+                max_mismatches: 0, // Exact match only
+                min_distance_diff: 1,
+                umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2355,23 +1917,26 @@ mod tests {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions { rejects: Some(paths.rejects.clone()) },
-            metrics: Some(paths.metrics.clone()),
-            max_mismatches: 2,
-            min_distance_diff: 2,
-            umis: vec![
-                "AAAAAA".to_string(),
-                "CCCCCC".to_string(),
-                "GGGGGG".to_string(),
-                "TTTTTT".to_string(),
-            ],
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: Some(paths.metrics.clone()),
+                max_mismatches: 2,
+                min_distance_diff: 2,
+                umis: vec![
+                    "AAAAAA".to_string(),
+                    "CCCCCC".to_string(),
+                    "GGGGGG".to_string(),
+                    "TTTTTT".to_string(),
+                ],
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2414,18 +1979,21 @@ mod tests {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions { rejects: Some(paths.rejects.clone()) },
-            metrics: None,
-            max_mismatches: 2,
-            min_distance_diff: 2,
-            umis: vec!["AAAAAA".to_string()], // Only one UMI
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: None,
+                max_mismatches: 2,
+                min_distance_diff: 2,
+                umis: vec!["AAAAAA".to_string()], // Only one UMI
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2459,18 +2027,21 @@ mod tests {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions { rejects: Some(paths.rejects.clone()) },
-            metrics: None,
-            max_mismatches: 2,
-            min_distance_diff: 2,
-            umis: vec!["AAAAAA".to_string()],
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: None,
+                max_mismatches: 2,
+                min_distance_diff: 2,
+                umis: vec!["AAAAAA".to_string()],
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2503,18 +2074,21 @@ mod tests {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions { rejects: Some(paths.rejects.clone()) },
-            metrics: None,
-            max_mismatches: 1,
-            min_distance_diff: 5, // Large distance for long UMIs
-            umis: vec!["AAAAAAAAAAAAAAAAAAAA".to_string(), "CCCCCCCCCCCCCCCCCCCC".to_string()],
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: None,
+                max_mismatches: 1,
+                min_distance_diff: 5, // Large distance for long UMIs
+                umis: vec!["AAAAAAAAAAAAAAAAAAAA".to_string(), "CCCCCCCCCCCCCCCCCCCC".to_string()],
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2546,18 +2120,21 @@ mod tests {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions::default(),
-            metrics: None,
-            max_mismatches: 1,
-            min_distance_diff: 2,
-            umis: vec!["AAAAAA".to_string()],
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: Some(0.75), // Require 75% of reads to pass
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: None,
+                max_mismatches: 1,
+                min_distance_diff: 2,
+                umis: vec!["AAAAAA".to_string()],
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: Some(0.75), // Require 75% of reads to pass
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2583,18 +2160,21 @@ mod tests {
             io: BamIoOptions {
                 input: input2.path().to_path_buf(),
                 output: output2.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions::default(),
-            metrics: None,
-            max_mismatches: 1,
-            min_distance_diff: 2,
-            umis: vec!["AAAAAA".to_string()],
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: Some(0.75), // Require 75% but only 25% will pass
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: None,
+                max_mismatches: 1,
+                min_distance_diff: 2,
+                umis: vec!["AAAAAA".to_string()],
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: Some(0.75), // Require 75% but only 25% will pass
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2624,18 +2204,21 @@ mod tests {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions::default(),
-            metrics: None,
-            max_mismatches: 0, // Exact match
-            min_distance_diff: 1,
-            umis: vec!["AAAAAA".to_string()],
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: None,
+                max_mismatches: 0, // Exact match
+                min_distance_diff: 1,
+                umis: vec!["AAAAAA".to_string()],
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2676,23 +2259,26 @@ mod tests {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: output.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions::default(),
-            metrics: None,
-            max_mismatches: 2,
-            min_distance_diff: 2,
-            umis: vec![
-                "AAAAAA".to_string(),
-                "CCCCCC".to_string(),
-                "GGGGGG".to_string(),
-                "TTTTTT".to_string(),
-            ],
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: None,
+                max_mismatches: 2,
+                min_distance_diff: 2,
+                umis: vec![
+                    "AAAAAA".to_string(),
+                    "CCCCCC".to_string(),
+                    "GGGGGG".to_string(),
+                    "TTTTTT".to_string(),
+                ],
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::new(4), // Multiple threads
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2738,23 +2324,26 @@ mod tests {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: output.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions::default(),
-            metrics: None,
-            max_mismatches: 2,
-            min_distance_diff: 2,
-            umis: vec![
-                "AAAAAA".to_string(),
-                "CCCCCC".to_string(),
-                "GGGGGG".to_string(),
-                "TTTTTT".to_string(),
-            ],
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: None,
+                max_mismatches: 2,
+                min_distance_diff: 2,
+                umis: vec![
+                    "AAAAAA".to_string(),
+                    "CCCCCC".to_string(),
+                    "GGGGGG".to_string(),
+                    "TTTTTT".to_string(),
+                ],
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::new(8), // 8 threads
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2900,18 +2489,21 @@ mod tests {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions::default(),
-            metrics: Some(paths.metrics.clone()),
-            max_mismatches: 1, // Strict matching
-            min_distance_diff: 2,
-            umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: Some(paths.metrics.clone()),
+                max_mismatches: 1, // Strict matching
+                min_distance_diff: 2,
+                umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2959,22 +2551,25 @@ mod tests {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions::default(),
-            metrics: Some(paths.metrics.clone()),
-            max_mismatches: 1,
-            min_distance_diff: 2,
-            umis: vec![
-                "AAAAAA".to_string(),
-                "CCCCCC".to_string(), // No reads match this
-                "GGGGGG".to_string(), // No reads match this
-            ],
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: Some(paths.metrics.clone()),
+                max_mismatches: 1,
+                min_distance_diff: 2,
+                umis: vec![
+                    "AAAAAA".to_string(),
+                    "CCCCCC".to_string(), // No reads match this
+                    "GGGGGG".to_string(), // No reads match this
+                ],
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -3023,7 +2618,8 @@ mod tests {
     #[test]
     fn test_metrics_unmatched_row_with_multithreaded() -> Result<()> {
         // Test that unmatched UMI row is correct with multi-threaded processing
-        // This specifically tests the bug fix in execute_threads_mode
+        // (regression test for an unmatched-UMI counting bug previously
+        // surfaced in the multi-thread metrics aggregation path).
         let mut records: Vec<(&str, Option<&str>)> = Vec::new();
 
         // Create a mix of correctable and uncorrectable reads
@@ -3048,18 +2644,21 @@ mod tests {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions::default(),
-            metrics: Some(paths.metrics.clone()),
-            max_mismatches: 1,
-            min_distance_diff: 2,
-            umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: Some(paths.metrics.clone()),
+                max_mismatches: 1,
+                min_distance_diff: 2,
+                umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::new(4), // Multi-threaded!
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -3120,18 +2719,21 @@ mod tests {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: output.path().to_path_buf(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions::default(),
-            metrics: None,
-            max_mismatches: 2,
-            min_distance_diff: 2,
-            umis: FIXED_UMIS.iter().map(|s| (*s).to_string()).collect(),
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: None,
+                max_mismatches: 2,
+                min_distance_diff: 2,
+                umis: FIXED_UMIS.iter().map(|s| (*s).to_string()).collect(),
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
             threading,
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -3189,9 +2791,11 @@ mod tests {
         buf.extend_from_slice(umi);
         buf.push(0);
 
-        // Backfill the BAM block_size field (excludes the 4-byte block_size itself).
-        let block_size = i32::try_from(buf.len() - 4).expect("BAM record fits in i32");
-        buf[0..4].copy_from_slice(&block_size.to_le_bytes());
+        // No block_size backfill: fgumi_raw_bam's RawRecord buffer does NOT
+        // include the 4-byte BAM container `block_size` prefix; bytes 0..4
+        // are `ref_id`. The previous backfill clobbered ref_id with the
+        // record's byte length, breaking any test that reads ref_id from
+        // the resulting RawRecord.
 
         RawRecord::from(buf)
     }
@@ -3414,7 +3018,8 @@ mod tests {
         assert_eq!(umi, Some(b"AAAAAA".as_ref()));
     }
 
-    /// Characterization test for the single-thread mode (`execute_single_thread_mode`).
+    /// Characterization test for single-thread mode (`threads: None` →
+    /// `Pipeline::run(PipelineConfig { threads: 1, ... })`).
     ///
     /// Exercises the streaming path triggered by `threads: None` with paired-end reads,
     /// verifying that UMI correction produces the expected output:
@@ -3490,18 +3095,21 @@ mod tests {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             rejects_opts: RejectsOptions { rejects: Some(paths.rejects.clone()) },
-            metrics: Some(paths.metrics.clone()),
-            max_mismatches: 2,
-            min_distance_diff: 2,
-            umis: FIXED_UMIS.iter().map(|s| (*s).to_string()).collect(),
-            umi_files: vec![],
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
+            options: CorrectOptions {
+                metrics: Some(paths.metrics.clone()),
+                max_mismatches: 2,
+                min_distance_diff: 2,
+                umis: FIXED_UMIS.iter().map(|s| (*s).to_string()).collect(),
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 100_000,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -3626,58 +3234,24 @@ mod tests {
         assert!(ox.is_none());
     }
 
-    /// Verifies `CorrectProcessedBatch::estimate_heap_size` accounts for both
-    /// `kept_raw_records` (consensus path) and `rejected_records` (secondary
-    /// rejects path), plus the outer-vec capacity overhead for each. The
-    /// non-empty-rejects case in particular guards against a regression where
-    /// the buffered rejects branch added by the secondary-output migration is
-    /// dropped from the estimate (which would mis-throttle the pipeline).
-    #[rstest]
-    #[case::empty_rejects(vec![1024], vec![])]
-    #[case::non_empty_rejects(vec![64, 128], vec![256, 512])]
-    fn test_correct_processed_batch_memory_estimate(
-        #[case] kept_capacities: Vec<usize>,
-        #[case] rej_capacities: Vec<usize>,
-    ) {
-        let kept_raw_records: Vec<RawRecord> =
-            kept_capacities.iter().map(|&cap| RawRecord::with_capacity(cap)).collect();
-        let kept_outer_capacity = kept_raw_records.capacity();
-        // RawRecord::with_capacity / Vec::with_capacity(n) only guarantee AT
-        // LEAST n; the allocator may round up. Read the observed capacities
-        // back so the expected value matches what was actually allocated
-        // under any allocator.
-        let kept_inner_total: usize = kept_raw_records.iter().map(RawRecord::capacity).sum();
-
-        let rejected_records: Vec<Vec<u8>> = rej_capacities
-            .iter()
-            .map(|&cap| {
-                let mut v = Vec::with_capacity(cap);
-                v.extend_from_slice(&[1u8; 8]);
-                v
-            })
-            .collect();
-        let rej_outer_capacity = rejected_records.capacity();
-        let rej_inner_total: usize = rejected_records.iter().map(Vec::capacity).sum();
-
-        let batch = CorrectProcessedBatch {
-            kept_raw_records,
-            rejected_records,
-            templates_count: 0,
-            missing_umis: 0,
-            wrong_length: 0,
-            mismatched: 0,
-            umi_matches: AHashMap::new(),
+    #[test]
+    fn validate_rejects_min_distance_zero() {
+        let opts = CorrectOptions {
+            umis: vec!["AAAAAA".to_string()],
+            min_distance_diff: 0,
+            ..CorrectOptions::default()
         };
+        let err = opts.validate().expect_err("min-distance 0 must be rejected");
+        assert!(err.to_string().contains("--min-distance must be >= 1"), "{err}");
+    }
 
-        let expected = kept_inner_total
-            + kept_outer_capacity * std::mem::size_of::<RawRecord>()
-            + rej_inner_total
-            + rej_outer_capacity * std::mem::size_of::<Vec<u8>>();
-        assert_eq!(
-            batch.estimate_heap_size(),
-            expected,
-            "estimate should account for kept-record capacities, rejects inner capacities, \
-             and both outer-vec overheads",
-        );
+    #[test]
+    fn validate_accepts_min_distance_one() {
+        let opts = CorrectOptions {
+            umis: vec!["AAAAAA".to_string()],
+            min_distance_diff: 1,
+            ..CorrectOptions::default()
+        };
+        assert!(opts.validate().is_ok());
     }
 }

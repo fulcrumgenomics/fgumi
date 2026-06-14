@@ -36,8 +36,8 @@
 //! ```
 
 use crate::sam::SamTag;
-use crate::unified_pipeline::{DecodedRecord, MemoryEstimate};
 use anyhow::{Result, bail};
+use fgumi_bam_io::MemoryEstimate;
 use fgumi_raw_bam::{RawRecord, RawRecordView};
 
 // Re-export PairOrientation from sam module for backwards compatibility
@@ -75,12 +75,6 @@ pub struct Template {
     pub r2_secondaries: Option<(usize, usize)>,
     /// Assigned molecule ID from UMI grouping (set during group command)
     pub mi: MoleculeId,
-    /// Cached UMI value position `(record_relative_offset, len)` for the primary
-    /// read returned by `r1().or(r2())`. Populated by
-    /// [`Template::from_decoded_records`] when the decode step recorded a UMI
-    /// position; left `None` by [`Template::from_records`] so callers fall back
-    /// to `find_string_tag`. See [`Template::cached_umi`] for the accessor.
-    pub cached_umi_position: Option<(u32, u16)>,
 }
 
 /// A batch of templates for parallel processing.
@@ -104,8 +98,17 @@ impl Template {
             r1_secondaries: None,
             r2_secondaries: None,
             mi: MoleculeId::None,
-            cached_umi_position: None,
         }
+    }
+
+    /// Approximate heap footprint in bytes — the sum of all member records'
+    /// byte lengths plus the queryname's byte length. Used by the new
+    /// pipeline framework's `BamTemplateBatch` for byte-bounded queue
+    /// budgeting.
+    #[must_use]
+    pub fn heap_size(&self) -> usize {
+        let records_bytes: usize = self.records.iter().map(RawRecord::len).sum();
+        records_bytes + self.name.len()
     }
 
     /// Returns the primary R1 record if present.
@@ -128,10 +131,6 @@ impl Template {
 
     /// Returns mutable access to all records.
     pub fn records_mut(&mut self) -> &mut [RawRecord] {
-        // Mutating raw record bytes can rewrite aux data and shift the offsets
-        // captured by `cached_umi_position`. Clear the cache so `cached_umi()`
-        // does not return stale slices afterward.
-        self.cached_umi_position = None;
         &mut self.records
     }
 
@@ -232,7 +231,6 @@ impl Template {
                         r1_secondaries: None,
                         r2_secondaries: None,
                         mi: MoleculeId::None,
-                        cached_umi_position: None,
                     });
                 }
                 // Both R1 or both R2 — fall through to general path for error handling
@@ -354,46 +352,7 @@ impl Template {
             r1_secondaries: r1_sec_pair,
             r2_secondaries: r2_sec_pair,
             mi: MoleculeId::None,
-            cached_umi_position: None,
         })
-    }
-
-    /// Build a [`Template`] from decoded records, preserving the UMI value
-    /// position cached on the primary read during the decode step.
-    ///
-    /// The primary read is chosen with the same priority used by
-    /// [`Template::r1`] / [`Template::r2`]: the first non-secondary,
-    /// non-supplementary R1 (or, failing that, R2). When that record carries a
-    /// cached UMI position, it is recorded on the returned template so
-    /// downstream UMI lookups can slice the value directly via
-    /// [`Template::cached_umi`] without re-scanning aux data.
-    ///
-    /// # Errors
-    ///
-    /// Propagates any error from [`Template::from_records`].
-    pub fn from_decoded_records(records: Vec<DecodedRecord>) -> Result<Self> {
-        let cached = primary_read_cached_umi(&records);
-
-        let raw_records: Vec<RawRecord> =
-            records.into_iter().map(DecodedRecord::into_raw_bytes).collect();
-        let mut template = Self::from_records(raw_records)?;
-        template.cached_umi_position = cached;
-        Ok(template)
-    }
-
-    /// Returns the cached UMI value bytes (without trailing NUL) for this
-    /// template's primary read, if a position was recorded during decode and
-    /// still falls within the primary record's bytes.
-    ///
-    /// Returns `None` when no UMI cache is set, when neither R1 nor R2 is
-    /// present, or when the cached position would slice outside the record.
-    #[must_use]
-    pub fn cached_umi(&self) -> Option<&[u8]> {
-        let (offset, len) = self.cached_umi_position?;
-        let raw = self.r1().or_else(|| self.r2())?;
-        let start = offset as usize;
-        let end = start.checked_add(len as usize)?;
-        raw.as_ref().get(start..end)
     }
 
     /// Returns the pair orientation if both R1 and R2 are present and mapped to the same chromosome.
@@ -458,11 +417,6 @@ impl Template {
     #[allow(clippy::too_many_lines)]
     pub fn fix_mate_info(&mut self) -> Result<()> {
         use fgumi_raw_bam;
-
-        // remove_tag / append_*_tag below rewrite MS/MC/MQ aux entries on
-        // primary records, which can shift RX bytes. Drop any cached UMI
-        // offset so `cached_umi()` does not return stale slices.
-        self.cached_umi_position = None;
 
         let rr = &mut self.records;
 
@@ -748,47 +702,6 @@ impl Template {
         }
         fgumi_raw_bam::set_template_length(&mut rr[unmapped_i], 0);
     }
-}
-
-/// Pick the cached UMI position from the primary read that
-/// [`Template::cached_umi`] will resolve against.
-///
-/// Mirrors the priority used by [`Template::from_records`]: the first
-/// non-secondary, non-supplementary R1 (or, if no R1 is present, the first
-/// non-secondary, non-supplementary R2). Records without a cached UMI position
-/// return `None` even when found, so the downstream consumer falls back to
-/// scanning aux data.
-fn primary_read_cached_umi(records: &[DecodedRecord]) -> Option<(u32, u16)> {
-    use fgumi_raw_bam;
-
-    let mut primary_r2: Option<&DecodedRecord> = None;
-
-    for decoded in records {
-        let flg = RawRecordView::new(decoded.raw_bytes()).flags();
-        let is_secondary = (flg & fgumi_raw_bam::flags::SECONDARY) != 0;
-        let is_supplementary = (flg & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0;
-        if is_secondary || is_supplementary {
-            continue;
-        }
-        let is_paired = (flg & fgumi_raw_bam::flags::PAIRED) != 0;
-        let is_first = (flg & fgumi_raw_bam::flags::FIRST_SEGMENT) != 0;
-        let is_r1 = !is_paired || is_first;
-
-        if is_r1 {
-            let (offset, len) = decoded.cached_umi_position();
-            if offset == DecodedRecord::UMI_OFFSET_UNCACHED {
-                return None;
-            }
-            return Some((offset, len));
-        }
-        if primary_r2.is_none() {
-            primary_r2 = Some(decoded);
-        }
-    }
-
-    let r2 = primary_r2?;
-    let (offset, len) = r2.cached_umi_position();
-    if offset == DecodedRecord::UMI_OFFSET_UNCACHED { None } else { Some((offset, len)) }
 }
 
 /// Sets mate flags (`MATE_REVERSE`, `MATE_UNMAPPED`) on a raw BAM record.
@@ -2615,133 +2528,5 @@ mod tests {
             let result = mi.write_with_offset(100, &mut buf);
             assert_eq!(result, expected.as_bytes(), "Mismatch for {mi:?}");
         }
-    }
-
-    // ========================================================================
-    // Template::from_decoded_records / cached_umi tests (issue #334)
-    // ========================================================================
-
-    use crate::unified_pipeline::{DecodedRecord, GroupKey};
-
-    fn build_raw_with_umi(name: &[u8], flags: u16, umi: &[u8]) -> RawRecord {
-        let mut b = RawSamBuilder::new();
-        b.read_name(name)
-            .sequence(b"ACGT")
-            .qualities(&[30; 4])
-            .flags(flags)
-            .ref_id(0)
-            .pos(0)
-            .mapq(30)
-            .cigar_ops(&[4u32 << 4]);
-        b.add_string_tag(SamTag::RX, umi);
-        b.build()
-    }
-
-    fn decoded_with_cached_umi(raw: RawRecord) -> DecodedRecord {
-        let raw_bytes = raw.as_ref();
-        let aux_offset =
-            fgumi_raw_bam::aux_data_offset_from_record(raw_bytes).expect("aux offset present");
-        let aux = &raw_bytes[aux_offset..];
-        let (value_off_in_aux, len) = fgumi_raw_bam::find_string_tag_position(aux, SamTag::RX)
-            .expect("RX tag must be present for this test helper");
-        let offset = u32::try_from(aux_offset).unwrap() + value_off_in_aux;
-        let mut d = DecodedRecord::from_raw_bytes(raw, GroupKey::default());
-        d.set_cached_umi(offset, len);
-        d
-    }
-
-    #[test]
-    fn test_template_from_decoded_records_propagates_r1_umi_cache() {
-        // R1 carries RX:Z:ACGTACGT, R2 carries RX:Z:OTHER; assigner reads from
-        // R1 first, so the cached slice must match R1's UMI.
-        let r1 =
-            build_raw_with_umi(b"read1", raw_flags::PAIRED | raw_flags::FIRST_SEGMENT, b"ACGTACGT");
-        let r2 =
-            build_raw_with_umi(b"read1", raw_flags::PAIRED | raw_flags::LAST_SEGMENT, b"OTHERUMI");
-
-        let decoded = vec![decoded_with_cached_umi(r1), decoded_with_cached_umi(r2)];
-        let template = Template::from_decoded_records(decoded).expect("template builds");
-
-        assert_eq!(template.cached_umi(), Some(b"ACGTACGT".as_ref()));
-    }
-
-    #[test]
-    fn test_template_from_decoded_records_falls_back_to_r2_when_no_r1() {
-        // Only an R2 primary is present; cache must come from that record.
-        let r2 =
-            build_raw_with_umi(b"read1", raw_flags::PAIRED | raw_flags::LAST_SEGMENT, b"R2ONLY");
-        let decoded = vec![decoded_with_cached_umi(r2)];
-        let template = Template::from_decoded_records(decoded).expect("template builds");
-
-        assert_eq!(template.cached_umi(), Some(b"R2ONLY".as_ref()));
-    }
-
-    #[test]
-    fn test_template_from_decoded_records_no_cache_when_primary_uncached() {
-        // R1 has the UMI tag but no cached position; the resulting template
-        // must report no cached UMI so callers fall back to find_string_tag.
-        let r1 =
-            build_raw_with_umi(b"read1", raw_flags::PAIRED | raw_flags::FIRST_SEGMENT, b"ACGT");
-        let mut decoded = DecodedRecord::from_raw_bytes(r1, GroupKey::default());
-        // Explicitly leave the cache uninitialised.
-        decoded.set_cached_umi(DecodedRecord::UMI_OFFSET_UNCACHED, 0);
-
-        let template = Template::from_decoded_records(vec![decoded]).expect("template builds");
-        assert!(template.cached_umi().is_none());
-        assert!(template.cached_umi_position.is_none());
-    }
-
-    #[test]
-    fn test_template_from_decoded_records_ignores_supplementary() {
-        // The first record is a supplementary alignment whose cache must be
-        // ignored; the second is the primary R1 and its cache must be used.
-        let supp = build_raw_with_umi(
-            b"read1",
-            raw_flags::PAIRED | raw_flags::FIRST_SEGMENT | raw_flags::SUPPLEMENTARY,
-            b"SUPPUMI",
-        );
-        let primary =
-            build_raw_with_umi(b"read1", raw_flags::PAIRED | raw_flags::FIRST_SEGMENT, b"PRIMARYY");
-
-        let decoded = vec![decoded_with_cached_umi(supp), decoded_with_cached_umi(primary)];
-        let template = Template::from_decoded_records(decoded).expect("template builds");
-        assert_eq!(template.cached_umi(), Some(b"PRIMARYY".as_ref()));
-    }
-
-    #[test]
-    fn test_records_mut_invalidates_umi_cache() {
-        // Handing out mutable access to the primary record bytes can shift
-        // aux data, so the cached UMI offset must be cleared defensively.
-        let r1 =
-            build_raw_with_umi(b"read1", raw_flags::PAIRED | raw_flags::FIRST_SEGMENT, b"ACGTACGT");
-        let template = Template::from_decoded_records(vec![decoded_with_cached_umi(r1)])
-            .expect("template builds");
-        assert_eq!(template.cached_umi(), Some(b"ACGTACGT".as_ref()));
-
-        let mut template = template;
-        let _ = template.records_mut();
-        assert!(template.cached_umi_position.is_none());
-        assert!(template.cached_umi().is_none());
-    }
-
-    #[test]
-    fn test_fix_mate_info_invalidates_umi_cache() {
-        // fix_mate_info rewrites MS/MC/MQ aux tags on primary records via
-        // remove_tag / append_*_tag, which can shift RX bytes. The cached
-        // offset must be cleared so cached_umi() does not return stale slices.
-        let r1 =
-            build_raw_with_umi(b"read1", raw_flags::PAIRED | raw_flags::FIRST_SEGMENT, b"ACGTACGT");
-        let r2 =
-            build_raw_with_umi(b"read1", raw_flags::PAIRED | raw_flags::LAST_SEGMENT, b"OTHERUMI");
-        let mut template = Template::from_decoded_records(vec![
-            decoded_with_cached_umi(r1),
-            decoded_with_cached_umi(r2),
-        ])
-        .expect("template builds");
-        assert_eq!(template.cached_umi(), Some(b"ACGTACGT".as_ref()));
-
-        template.fix_mate_info().expect("fix_mate_info succeeds");
-        assert!(template.cached_umi_position.is_none());
-        assert!(template.cached_umi().is_none());
     }
 }

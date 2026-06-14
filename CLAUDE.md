@@ -89,6 +89,9 @@ Commands implement the `Command` trait dispatched via enum:
 - **Streaming I/O:** Large files processed without full loading
 - **Thread Pooling:** Work-stealing with per-command thread optimization
 - **2-bit Encoding:** DNA bases packed efficiently for fast operations
+- **Typed-Step Pipeline Framework (`unified_pipeline::core`):** All multi-threaded commands run through the typed-step framework (`Pipeline::builder().chain(step1).chain(step2).…build().run(...)`). Steps declare `StepKind` (Serial/Parallel/Exclusive), input/output handle types, and an `on_input_drained` callback for end-of-stream cleanup. The `--use-new-pipeline` flag and the legacy `run_bam_pipeline_from_reader{,_with_mi_assign}` drivers were removed in Phase 1 of issue #330; the typed-step framework is the execution mechanism for sort, group, simplex, duplex, codec, correct, zipper, clip, filter, and dedup. New commands should follow the typed-step pattern.
+- **Chain-builder façade (`unified_pipeline::chains`):** Phase 2 introduced a single declarative chain-construction entry point — `chains::build_for(spec) -> Result<BuiltPipeline>`. Phase 3 introduced the stage-by-stage `ChainBuilder`: `build_for` validates the spec, then constructs a `ChainBuilder`, calls `add_source()`, walks `spec.stages` calling `chain.add_stage(stage, position)` for each, and finishes with `add_sink()` + `build()`. Each `add_<stage>` method (one per `Stage` variant — `add_dedup`, `add_filter`, `add_clip`, `add_sort`, `add_group`, `add_simplex`, `add_duplex`, `add_codec`, `add_correct`, `add_zipper`, `add_align`) reads `spec.stage_opts.<stage>` (already validated present), pushes the canonical step sequence via factories in `chains::commands::<command>::build_*_step`, and registers a `<Command>FinalizeHook`. `StagePosition::{Terminal, Intermediate}` gates the serialize step so intermediate stages leave their typed output for the next `add_<stage>`. Shared config wiring (threads, deadlock_timeout, queue_memory, pipeline stats) lives in `chains::build_helpers::build_pipeline_config_for_chain`. The chain-level `StageTimingFinalizeHook` is registered by `ChainBuilder::build()`; `PipelineStatsFinalizeHook` (gated on `--pipeline-stats`) is the next hook in order. `BuiltPipeline::run()` executes the pipeline then drains hooks in registration order. **New commands MUST add: one `Stage` variant, one bag slot, one validator entry, one `add_<stage>` method, and one factory per per-stage step. Do NOT construct chains inline in command `execute` methods.** Phase 3 also partially-rerouted `runall::execute` through `build_for` for chain shapes that don't require intermediate sort; fused chains containing intermediate Sort fall back to the legacy `execute_*_then_*` dispatchers in `commands::runall` until a follow-up extension teaches `ChainBuilder::add_sort` an intermediate (in-pipeline, not file-to-file) mode.
+- **Multi-Options Macro (`crates/fgumi-cli-macros`):** Per-stage tuning options used by both a standalone command (`fgumi sort`, `fgumi group`, …) and the fused `fgumi runall` command live in a single `<Stage>Options` struct annotated with `#[multi_options("stage", "Help Heading")]`. The standalone command flattens `<Stage>Options` directly so its CLI surface is unchanged (`--max-memory`, `--strategy`, …). The proc-macro generates a sibling `Multi<Stage>Options` struct that runall flattens, exposing the same fields as prefixed `--<stage>::<flag>` flags (`--sort::max-memory`, `--group::strategy`, …) grouped under a `--help` heading. The Multi struct carries a `validate(self) -> Result<<Stage>Options>` method that runall calls before executing a stage; required-without-default fields (e.g. `--group::strategy`) become `Option<T>` on the Multi side and the validator surfaces a clear "required when `<stage>` is selected" error if missing. The convention is established in `commands::{sort,group,duplex,codec}` and is the way to expose new per-stage options on runall going forward.
 
 ## Development Practices
 
@@ -190,6 +193,32 @@ regresses `samtools sort -n`–style throughput.
     ~300) — push an explicit NUL into a `Vec<u8>` then take `as_ptr()`.
     SAFETY: the buffers are `to_vec()` + push, so the pointer is valid and
     null-terminated for the call's lifetime.
+
+### Approved typed-step DSL hot path (issue-330 framework)
+
+`TypedStep<S>::resolve_input` / `resolve_outputs` in
+`src/lib/pipeline/core/erased.rs` cache the typed downcast of
+each step's `ctx.input` / `ctx.outputs` after the first dispatch.
+`Any::downcast_ref` accounts for ~1.6% of CPU on the dispatch hot path
+(profile-measured on a 4-thread CODEC 8M group benchmark), and the
+boxes are owned by `ChainContexts` (an `Arc` held alive for the entire
+`Pipeline::run` call) which guarantees they outlive every
+`TypedStep<S>` instance. Caching is sound because every dispatch passes
+the same box reference for a given `step_idx` (see
+`run_worker_loop`'s `contexts.inputs[step_idx.0].as_ref()`).
+
+- **`src/lib/pipeline/core/erased.rs`** — two
+  `#[allow(unsafe_code)]` sites:
+  - `TypedStep::resolve_input` (≈line 152) — `mem::transmute` between
+    `&'static BranchInputHandle<S::Input>` (cache slot type) and
+    `&'a BranchInputHandle<S::Input>` (dispatch lifetime). SAFETY: the
+    cached box outlives every `TypedStep<S>` (point 2 in the type-level
+    doc); dispatches always pass the same box for the same `step_idx`
+    (point 3). The cache is per-`TypedStep<S>` instance — `Parallel`
+    clones get fresh caches via `clone_boxed`'s `TypedStep::new` call.
+  - `TypedStep::resolve_outputs` (≈line 180) — same pattern, same
+    safety argument applied to the typed `OutputHandles<S::Outputs>`
+    view.
 
 Any new `unsafe` site must extend this list and explain why the safe
 alternative is unacceptable. Do not introduce `unsafe` outside the crates

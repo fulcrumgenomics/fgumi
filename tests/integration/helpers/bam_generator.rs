@@ -88,6 +88,14 @@ pub fn create_paired_umi_family(
     let r1_cigar = u32::try_from(r1_seq.len()).expect("r1_seq.len() fits u32") << 4;
     let r2_cigar = u32::try_from(r2_seq.len()).expect("r2_seq.len() fits u32") << 4;
 
+    // MC tag (mate-cigar) as SAM-style text. Each read carries its
+    // mate's CIGAR — what `samtools fixmate` / `fgumi zipper` would
+    // produce. `GroupByPosition` requires MC on paired-end inputs so
+    // template span can be computed without a second pass over the
+    // BAM.
+    let r1_mc = format!("{}M", r2_seq.len());
+    let r2_mc = format!("{}M", r1_seq.len());
+
     // R1 at pos 99 (0-based); R2 at pos 199. Template spans from R1 start through end
     // of R2 — 100bp gap + R2 length — and R2 carries the negated length.
     let template_len = i32::try_from(100 + r2_seq.len()).expect("template length fits i32");
@@ -110,7 +118,8 @@ pub fn create_paired_umi_family(
             .cigar_ops(&[r1_cigar])
             .sequence(r1_seq)
             .qualities(&vec![quality; r1_seq.len()])
-            .add_string_tag(SamTag::RX, umi.as_bytes());
+            .add_string_tag(SamTag::RX, umi.as_bytes())
+            .add_string_tag(SamTag::MC, r1_mc.as_bytes());
         records.push(b1.build());
 
         // R2: paired + last segment
@@ -126,7 +135,79 @@ pub fn create_paired_umi_family(
             .cigar_ops(&[r2_cigar])
             .sequence(r2_seq)
             .qualities(&vec![quality; r2_seq.len()])
-            .add_string_tag(SamTag::RX, umi.as_bytes());
+            .add_string_tag(SamTag::RX, umi.as_bytes())
+            .add_string_tag(SamTag::MC, r2_mc.as_bytes());
+        records.push(b2.build());
+    }
+
+    records
+}
+
+/// Like [`create_paired_umi_family`] but maps the pair at an explicit
+/// reference position so callers can spread families across many distinct
+/// template-coordinate groups (one position → one `GroupByPosition` group).
+/// Useful for building fixtures with enough distinct templates to span
+/// multiple consensus batches / parallel workers.
+///
+/// R1 is placed at `r1_pos` (0-based) and R2 at `r1_pos + 100`, mirroring the
+/// fixed-position helper's 100bp insert.
+#[allow(clippy::too_many_arguments)]
+pub fn create_paired_umi_family_at(
+    umi: &str,
+    depth: usize,
+    base_name: &str,
+    r1_sequence: &str,
+    r2_sequence: &str,
+    quality: u8,
+    r1_pos: usize,
+) -> Vec<RawRecord> {
+    let r1_seq = r1_sequence.as_bytes();
+    let r2_seq = r2_sequence.as_bytes();
+    let r1_cigar = u32::try_from(r1_seq.len()).expect("r1_seq.len() fits u32") << 4;
+    let r2_cigar = u32::try_from(r2_seq.len()).expect("r2_seq.len() fits u32") << 4;
+
+    let r1_mc = format!("{}M", r2_seq.len());
+    let r2_mc = format!("{}M", r1_seq.len());
+
+    let r1_pos_i = i32::try_from(r1_pos).expect("r1_pos fits i32");
+    let r2_pos = r1_pos + 100;
+    let r2_pos_i = i32::try_from(r2_pos).expect("r2_pos fits i32");
+    let template_len = i32::try_from(100 + r2_seq.len()).expect("template length fits i32");
+
+    let mut records = Vec::new();
+    for i in 0..depth {
+        let read_name = format!("{base_name}_{i}");
+
+        let mut b1 = SamBuilder::new();
+        b1.read_name(read_name.as_bytes())
+            .ref_id(0)
+            .pos(r1_pos_i)
+            .mapq(60)
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+            .mate_ref_id(0)
+            .mate_pos(r2_pos_i)
+            .template_length(template_len)
+            .cigar_ops(&[r1_cigar])
+            .sequence(r1_seq)
+            .qualities(&vec![quality; r1_seq.len()])
+            .add_string_tag(SamTag::RX, umi.as_bytes())
+            .add_string_tag(SamTag::MC, r1_mc.as_bytes());
+        records.push(b1.build());
+
+        let mut b2 = SamBuilder::new();
+        b2.read_name(read_name.as_bytes())
+            .ref_id(0)
+            .pos(r2_pos_i)
+            .mapq(60)
+            .flags(flags::PAIRED | flags::LAST_SEGMENT)
+            .mate_ref_id(0)
+            .mate_pos(r1_pos_i)
+            .template_length(-template_len)
+            .cigar_ops(&[r2_cigar])
+            .sequence(r2_seq)
+            .qualities(&vec![quality; r2_seq.len()])
+            .add_string_tag(SamTag::RX, umi.as_bytes())
+            .add_string_tag(SamTag::MC, r2_mc.as_bytes());
         records.push(b2.build());
     }
 
@@ -302,6 +383,41 @@ pub fn create_test_reference(dir: &std::path::Path) -> std::path::PathBuf {
     dict.flush().unwrap();
 
     ref_path
+}
+
+/// Build an aligner index next to the test reference FASTA. Used
+/// by AAM parity tests to satisfy `AlignerPreset::validate`'s
+/// index-file check before invoking runall with
+/// `--aligner::preset {bwa-mem3|bwa}`.
+///
+/// Returns `Ok(())` if the binary is on `PATH` and indexing
+/// succeeded; `Err` with a clear message if the binary is missing
+/// (the caller can use this to skip the test gracefully).
+///
+/// `binary_name` is `"bwa-mem3"` or `"bwa"`.
+///
+/// Index-progress output from the aligner is suppressed (both
+/// binaries write to stderr by default; piping to `Stdio::null`
+/// keeps nextest output clean).
+pub(crate) fn build_aligner_index(
+    reference: &std::path::Path,
+    binary_name: &str,
+) -> Result<(), String> {
+    if which::which(binary_name).is_err() {
+        return Err(format!(
+            "{binary_name} not found on PATH; skipping (install via bioconda for CI)"
+        ));
+    }
+    let status = std::process::Command::new(binary_name)
+        .args(["index", reference.to_string_lossy().as_ref()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("failed to run `{binary_name} index`: {e}"))?;
+    if !status.success() {
+        return Err(format!("`{binary_name} index` failed with status {status}"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

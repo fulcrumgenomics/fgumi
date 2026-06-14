@@ -1,0 +1,29 @@
+[package]
+name = "fgumi-cli-macros"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Proc-macro support crate for fgumi CLI option re-exposure (multi_options)"
+repository.workspace = true
+license.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+
+[dev-dependencies]
+clap = { version = "4", features = ["derive"] }
+anyhow = "1.0"
+
+# cargo-release: don't tag from this crate. The workspace `release.toml`
+# (if/when configured) should create a single tag from the main `fgumi`
+# crate; this override prevents a duplicate-tag abort.
+[package.metadata.release]
+tag = false
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }

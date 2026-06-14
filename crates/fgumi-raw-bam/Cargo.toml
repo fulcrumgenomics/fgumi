@@ -23,4 +23,4 @@ test-utils = []
 bstr = "1.12.1"
 proptest = "1.10"
 rstest = "0"
-tempfile = "3"
+tempfile = "3.4"

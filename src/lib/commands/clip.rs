@@ -6,38 +6,30 @@
 
 use crate::alignment_tags::regenerate_alignment_tags_raw;
 use crate::clipper::{ClippingMode, RawRecordClipper};
-use crate::grouper::TemplateGrouper;
 use crate::logging::OperationTimer;
 use crate::metrics::clip::{ClipCounts, ClippingMetricsCollection};
 use crate::metrics::writer::write_metrics as write_metrics_tsv;
-use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::reference::ReferenceReader;
 use crate::sam::SamTag;
-use crate::template::{TemplateBatch, TemplateIterator};
-use crate::unified_pipeline::{
-    GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
-};
+use crate::template::TemplateIterator;
 use crate::validation::validate_file_exists;
 use anyhow::Result;
 use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::{create_bam_reader_for_pipeline, create_raw_bam_reader, create_raw_bam_writer};
+use fgumi_bam_io::{create_raw_bam_reader, create_raw_bam_writer};
 use fgumi_raw_bam::RawRecord;
 use log::info;
 use noodles::sam::Header;
-use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::command::Command;
 use super::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    build_pipeline_config, parse_bool,
+    parse_bool,
 };
 
 /// Clips reads in a BAM file to remove overlaps
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     name = "clip",
     about = "\x1b[38;5;173m[POST-CONSENSUS]\x1b[0m \x1b[36mClip overlapping reads in BAM files\x1b[0m",
@@ -156,76 +148,27 @@ pub struct Clip {
     pub queue_memory: QueueMemoryOptions,
 }
 
-// ============================================================================
-// Types for 7-step pipeline processing
-// ============================================================================
-
-/// Result from processing a batch of templates through clipping.
-struct ClipProcessedBatch {
-    /// Clipped records to write to output BAM.
-    clipped_records: Vec<RawRecord>,
-    /// Number of templates processed.
-    templates_count: u64,
-    /// Number of templates with overlap clipping applied.
-    overlap_clipped_count: u64,
-    /// Number of templates with mate extension clipping applied.
-    extend_clipped_count: u64,
-}
-
-impl MemoryEstimate for ClipProcessedBatch {
-    fn estimate_heap_size(&self) -> usize {
-        self.clipped_records.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>()
-            + self.clipped_records.capacity() * std::mem::size_of::<RawRecord>()
-    }
-}
-
-/// Metrics collected from clipping processing, aggregated post-pipeline.
-#[derive(Default)]
-struct CollectedClipMetrics {
-    /// Total templates processed.
-    total_templates: u64,
-    /// Templates with overlap clipping.
-    overlap_clipped: u64,
-    /// Templates with mate extension clipping.
-    extend_clipped: u64,
-}
-
 impl Command for Clip {
-    #[allow(clippy::too_many_lines)]
     fn execute(&self, command_line: &str) -> Result<()> {
-        // Validate the input exists (stdin paths are exempt).
+        // Validate input files exist (skips stdin internally).
         self.io.validate()?;
         validate_file_exists(&self.reference, "Reference FASTA")?;
 
-        info!("Clip");
-        info!("  Input: {}", self.io.input.display());
-        info!("  Output: {}", self.io.output.display());
-        info!("  Clipping mode: {}", self.clipping_mode);
-        info!("  Clip overlapping reads: {}", self.clip_overlapping_reads);
-        info!("  Clip extending past mate: {}", self.clip_extending_past_mate);
-        info!("  {}", self.threading.log_message());
-
-        let timer = OperationTimer::new("Clipping reads");
-
-        let mode = self.clipping_mode;
-
-        // Validate clipping parameters
-        if self.upgrade_clipping
-            || self.clip_overlapping_reads
-            || self.clip_extending_past_mate
-            || self.read_one_five_prime > 0
-            || self.read_one_three_prime > 0
-            || self.read_two_five_prime > 0
-            || self.read_two_three_prime > 0
+        // Validate that at least one clipping operation is requested.
+        if !self.upgrade_clipping
+            && !self.clip_overlapping_reads
+            && !self.clip_extending_past_mate
+            && self.read_one_five_prime == 0
+            && self.read_one_three_prime == 0
+            && self.read_two_five_prime == 0
+            && self.read_two_three_prime == 0
         {
-            // At least one clipping option is active
-        } else {
             anyhow::bail!("At least one clipping option is required");
         }
 
-        // --metrics is not produced in --threads mode; fail fast rather than
-        // silently dropping a user-requested output file.
-        if self.threading.threads.is_some() {
+        if let Some(threads) = self.threading.threads {
+            // --metrics is not produced in --threads mode; fail fast rather than
+            // silently dropping a user-requested output file.
             if let Some(path) = &self.metrics {
                 anyhow::bail!(
                     "--metrics {} cannot be used with --threads: detailed clipping metrics \
@@ -233,34 +176,31 @@ impl Command for Clip {
                     path.display()
                 );
             }
-        }
 
-        // ========================================================================
-        // CRITICAL: Check --threads mode BEFORE creating any file handles.
-        // The 7-step pipeline manages its own I/O and writer lifecycle, so we
-        // must not create a writer here if we're going to use the pipeline.
-        // Route: Some(threads) -> pipeline, None -> single-threaded fast path
-        // ========================================================================
-        let total_records = if let Some(threads) = self.threading.threads {
-            // Read header for the 7-step pipeline (supports stdin)
-            let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
-
-            // Load reference (always required for clip)
-            let reference = Arc::new(ReferenceReader::new(&self.reference)?);
-
-            // Update header sort order if specified
-            let header = self.update_header_sort_order(header)?;
-
-            // Add @PG record with PP chaining to input's last program
-            let header = crate::commands::common::add_pg_record(header, command_line)?;
-
-            self.execute_threads_mode(reader, threads, header, reference)?
+            // Route through the unified chains façade.
+            use crate::pipeline::chains::{
+                ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag, build_for,
+            };
+            let _ = threads; // threading is captured in ChainSpec via self.threading.clone()
+            let spec = ChainSpec {
+                async_reader: self.io.async_reader,
+                stages: vec![Stage::Clip],
+                source: SourceSpec::Bam(self.io.input.clone()),
+                sink: SinkSpec::Bam(self.io.output.clone()),
+                stage_opts: StageOptionsBag { clip: Some(self.clone()), ..Default::default() },
+                threading: self.threading.clone(),
+                compression: self.compression.clone(),
+                scheduler: self.scheduler_opts.clone(),
+                queue_memory: self.queue_memory.clone(),
+                command_line: command_line.to_owned(),
+            };
+            build_for(spec)?.run()
         } else {
-            self.execute_single_threaded(mode, command_line)?
-        };
-
-        timer.log_completion(total_records);
-        Ok(())
+            let timer = OperationTimer::new("Clipping reads");
+            let total_records = self.execute_single_threaded(self.clipping_mode, command_line)?;
+            timer.log_completion(total_records);
+            Ok(())
+        }
     }
 }
 
@@ -576,7 +516,7 @@ impl Clip {
     }
 
     /// Updates the header sort order if specified via command line option.
-    fn update_header_sort_order(&self, header: Header) -> Result<Header> {
+    pub(crate) fn update_header_sort_order(&self, header: Header) -> Result<Header> {
         if let Some(ref sort_order) = self.sort_order {
             use bstr::BString;
             use noodles::sam::header::record::value::Map;
@@ -617,228 +557,6 @@ impl Clip {
             Ok(header)
         }
     }
-
-    /// Execute using the 7-step unified pipeline with multi-threading.
-    ///
-    /// Uses `TemplateGrouper` to batch records by template (QNAME) for parallel processing.
-    #[allow(clippy::too_many_lines)]
-    fn execute_threads_mode(
-        &self,
-        reader: Box<dyn std::io::Read + Send>,
-        num_threads: usize,
-        header: Header,
-        reference: Arc<ReferenceReader>,
-    ) -> Result<u64> {
-        // Configure pipeline - clip is writer-heavy workload
-        let mut pipeline_config = build_pipeline_config(
-            &self.scheduler_opts,
-            &self.compression,
-            &self.queue_memory,
-            num_threads,
-        )?;
-        // Clip uses raw-byte mode so TemplateGrouper receives RawRecord items.
-        pipeline_config.group_key_config =
-            Some(GroupKeyConfig::new_raw_no_cell(crate::read_info::LibraryIndex::default()));
-
-        // Per-thread metrics accumulator: bounded memory, no unbounded queue.
-        let collected_metrics = PerThreadAccumulator::<CollectedClipMetrics>::new(num_threads);
-        let collected_for_serialize = Arc::clone(&collected_metrics);
-
-        // Configuration for closures
-        const BATCH_SIZE: usize = 1000;
-        let clipping_mode = self.clipping_mode;
-        let auto_clip_attributes = self.auto_clip_attributes;
-        let upgrade_clipping = self.upgrade_clipping;
-        let clip_overlapping_reads = self.clip_overlapping_reads;
-        let clip_extending_past_mate = self.clip_extending_past_mate;
-        let read_one_five_prime = self.read_one_five_prime;
-        let read_one_three_prime = self.read_one_three_prime;
-        let read_two_five_prime = self.read_two_five_prime;
-        let read_two_three_prime = self.read_two_three_prime;
-        let reference_for_process = Arc::clone(&reference);
-        let header_for_process = header.clone();
-
-        // Progress tracking
-        let progress_counter = Arc::new(AtomicU64::new(0));
-        let progress_for_process = Arc::clone(&progress_counter);
-
-        // Grouper: batch records by template (QNAME)
-        let grouper_fn = move |_header: &Header| {
-            Box::new(TemplateGrouper::new(BATCH_SIZE))
-                as Box<dyn Grouper<Group = TemplateBatch> + Send>
-        };
-
-        // Process function: clip each template batch
-        let process_fn = move |batch: TemplateBatch| -> io::Result<ClipProcessedBatch> {
-            // Create per-worker clipper
-            let clipper = if auto_clip_attributes {
-                RawRecordClipper::with_auto_clip(clipping_mode, true)
-            } else {
-                RawRecordClipper::new(clipping_mode)
-            };
-
-            let mut clipped_records = Vec::new();
-            let mut templates_count = 0u64;
-            let mut overlap_clipped_count = 0u64;
-            let mut extend_clipped_count = 0u64;
-
-            for template in batch {
-                templates_count += 1;
-                let mut records: Vec<RawRecord> = template.into_records();
-
-                #[allow(clippy::len_zero)]
-                if records.len() == 1 {
-                    // Fragment - apply fixed-position clipping
-                    let record = &mut records[0];
-                    if upgrade_clipping {
-                        clipper.upgrade_all_clipping_raw(record).map_err(io::Error::other)?;
-                    }
-                    if read_one_five_prime > 0 {
-                        clipper.clip_5_prime_end_of_alignment(record, read_one_five_prime);
-                    }
-                    if read_one_three_prime > 0 {
-                        clipper.clip_3_prime_end_of_alignment(record, read_one_three_prime);
-                    }
-                } else if records.len() == 2 {
-                    // Paired reads
-                    let (r1_slice, r2_slice) = records.split_at_mut(1);
-                    let r1 = &mut r1_slice[0];
-                    let r2 = &mut r2_slice[0];
-
-                    if upgrade_clipping {
-                        clipper.upgrade_all_clipping_raw(r1).map_err(io::Error::other)?;
-                        clipper.upgrade_all_clipping_raw(r2).map_err(io::Error::other)?;
-                    }
-
-                    // Determine read types (raw flags)
-                    let is_r1_first = r1.is_first_segment();
-                    let is_r2_last = r2.is_last_segment();
-
-                    // Apply fixed-position clipping for R1
-                    if is_r1_first && read_one_five_prime > 0 {
-                        clipper.clip_5_prime_end_of_alignment(r1, read_one_five_prime);
-                    } else if !is_r1_first && read_two_five_prime > 0 {
-                        clipper.clip_5_prime_end_of_alignment(r1, read_two_five_prime);
-                    }
-                    if is_r1_first && read_one_three_prime > 0 {
-                        clipper.clip_3_prime_end_of_alignment(r1, read_one_three_prime);
-                    } else if !is_r1_first && read_two_three_prime > 0 {
-                        clipper.clip_3_prime_end_of_alignment(r1, read_two_three_prime);
-                    }
-
-                    // Apply fixed-position clipping for R2
-                    if is_r2_last && read_two_five_prime > 0 {
-                        clipper.clip_5_prime_end_of_alignment(r2, read_two_five_prime);
-                    } else if !is_r2_last && read_one_five_prime > 0 {
-                        clipper.clip_5_prime_end_of_alignment(r2, read_one_five_prime);
-                    }
-                    if is_r2_last && read_two_three_prime > 0 {
-                        clipper.clip_3_prime_end_of_alignment(r2, read_two_three_prime);
-                    } else if !is_r2_last && read_one_three_prime > 0 {
-                        clipper.clip_3_prime_end_of_alignment(r2, read_one_three_prime);
-                    }
-
-                    // Clip overlapping reads
-                    if clip_overlapping_reads {
-                        let (num_r1, num_r2) = clipper.clip_overlapping_reads(r1, r2);
-                        if num_r1 > 0 || num_r2 > 0 {
-                            overlap_clipped_count += 1;
-                        }
-                    }
-
-                    // Clip reads extending past mate
-                    if clip_extending_past_mate {
-                        let (num_r1, num_r2) = clipper.clip_extending_past_mate_ends(r1, r2);
-                        if num_r1 > 0 || num_r2 > 0 {
-                            extend_clipped_count += 1;
-                        }
-                    }
-
-                    // Update mate info (MC and MQ tags) using raw tag API
-                    update_mate_info_raw(r1, r2);
-                    update_mate_info_raw(r2, r1);
-                }
-
-                // Regenerate alignment tags (always done to match fgbio behavior)
-                for record in &mut records {
-                    regenerate_alignment_tags_raw(
-                        record.as_mut_vec(),
-                        &header_for_process,
-                        &reference_for_process,
-                    )
-                    .map_err(io::Error::other)?;
-                }
-
-                clipped_records.extend(records);
-            }
-
-            // Progress logging (count records, not templates)
-            let records_count = clipped_records.len() as u64;
-            let count = progress_for_process.fetch_add(records_count, Ordering::Relaxed);
-            if (count + records_count) / 1_000_000 > count / 1_000_000 {
-                info!("Processed {} records", count + records_count);
-            }
-
-            Ok(ClipProcessedBatch {
-                clipped_records,
-                templates_count,
-                overlap_clipped_count,
-                extend_clipped_count,
-            })
-        };
-
-        // Serialize function: write raw records directly into the output buffer
-        let serialize_fn = move |processed: ClipProcessedBatch,
-                                 _header: &Header,
-                                 output: &mut Vec<u8>|
-              -> io::Result<u64> {
-            // Merge per-batch counts into this worker's accumulator slot
-            collected_for_serialize.with_slot(|m| {
-                m.total_templates += processed.templates_count;
-                m.overlap_clipped += processed.overlap_clipped_count;
-                m.extend_clipped += processed.extend_clipped_count;
-            });
-
-            // Write raw records directly (4-byte block_size + bytes per record)
-            let count = processed.clipped_records.len() as u64;
-            fgumi_raw_bam::write_raw_records(output, &processed.clipped_records)?;
-            Ok(count)
-        };
-
-        // Run the 7-step pipeline
-        let records_written = run_bam_pipeline_from_reader(
-            pipeline_config,
-            reader,
-            header.clone(),
-            &self.io.output,
-            None, // Use input header for output
-            grouper_fn,
-            process_fn,
-            serialize_fn,
-        )?;
-
-        // ========== Post-pipeline: Aggregate metrics ==========
-        let mut total_templates = 0u64;
-        let mut total_overlap_clipped = 0u64;
-        let mut total_extend_clipped = 0u64;
-
-        for slot in collected_metrics.slots() {
-            let m = slot.lock();
-            total_templates += m.total_templates;
-            total_overlap_clipped += m.overlap_clipped;
-            total_extend_clipped += m.extend_clipped;
-        }
-
-        info!("Total templates processed: {total_templates}");
-        info!("Templates with overlap clipping: {total_overlap_clipped}");
-        info!("Templates with mate extension clipping: {total_extend_clipped}");
-
-        // `--metrics` with `--threads` is rejected in `execute()` before we ever
-        // reach this path, so no per-pipeline metrics file is written here.
-
-        info!("Done!");
-        Ok(records_written)
-    }
 }
 
 /// Updates mate information tags (MC and MQ) for a read based on its mate.
@@ -855,7 +573,7 @@ impl Clip {
 ///
 /// * `record` - The record to update (mutable)
 /// * `mate` - The mate record to read information from
-fn update_mate_info_raw(record: &mut RawRecord, mate: &RawRecord) {
+pub(crate) fn update_mate_info_raw(record: &mut RawRecord, mate: &RawRecord) {
     // Update MC tag: build CIGAR string from raw bytes
     let cigar_str = mate.cigar_to_string();
     let mut editor = record.tags_editor();
@@ -892,7 +610,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
@@ -924,7 +642,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
@@ -957,7 +675,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
@@ -989,7 +707,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::SoftWithMask,
@@ -1021,7 +739,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
@@ -1052,7 +770,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
@@ -1088,7 +806,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Soft,
@@ -1118,7 +836,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
@@ -1148,7 +866,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Soft,
@@ -1182,7 +900,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
@@ -1214,7 +932,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
@@ -1246,7 +964,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
@@ -1278,7 +996,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
@@ -1310,7 +1028,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
@@ -1344,7 +1062,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::SoftWithMask,
@@ -1376,7 +1094,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
@@ -1410,7 +1128,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
@@ -1443,7 +1161,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Soft,
@@ -1468,7 +1186,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::SoftWithMask,
@@ -1493,7 +1211,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
@@ -1526,7 +1244,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
@@ -1556,7 +1274,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
@@ -1586,7 +1304,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
@@ -1620,7 +1338,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
@@ -1652,7 +1370,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Soft,
@@ -1725,7 +1443,7 @@ mod tests {
             io: BamIoOptions {
                 input: input_path,
                 output: output_path.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
@@ -1776,7 +1494,7 @@ mod tests {
             io: BamIoOptions {
                 input: input_path,
                 output: output_path.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             reference: ref_path,
             clipping_mode: ClippingMode::Soft,
@@ -1826,7 +1544,7 @@ mod tests {
             io: BamIoOptions {
                 input: input_path,
                 output: output_path.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             reference: ref_path,
             clipping_mode: ClippingMode::SoftWithMask,
@@ -1876,7 +1594,7 @@ mod tests {
             io: BamIoOptions {
                 input: input_path,
                 output: output_path.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
@@ -1926,7 +1644,7 @@ mod tests {
             io: BamIoOptions {
                 input: input_path,
                 output: output_path.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
@@ -1976,7 +1694,7 @@ mod tests {
             io: BamIoOptions {
                 input: input_path,
                 output: output_path.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
@@ -2027,7 +1745,7 @@ mod tests {
             io: BamIoOptions {
                 input: input_path,
                 output: output_path.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
@@ -2078,7 +1796,7 @@ mod tests {
             io: BamIoOptions {
                 input: input_path,
                 output: output_path.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
@@ -2128,7 +1846,7 @@ mod tests {
             io: BamIoOptions {
                 input: input_path,
                 output: output_path.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
@@ -2179,7 +1897,7 @@ mod tests {
             io: BamIoOptions {
                 input: input_path,
                 output: output_path.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
@@ -2230,7 +1948,7 @@ mod tests {
             io: BamIoOptions {
                 input: input_path,
                 output: output_path.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
@@ -2278,7 +1996,7 @@ mod tests {
         builder.write(&input_path).expect("failed to write test BAM");
 
         let clip = Clip {
-            io: BamIoOptions { input: input_path, output: output_path, async_reader: false },
+            io: BamIoOptions { input: input_path, output: output_path, ..Default::default() },
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -2334,7 +2052,7 @@ mod tests {
             io: BamIoOptions {
                 input: input_path,
                 output: output_path.clone(),
-                async_reader: false,
+                ..Default::default()
             },
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
@@ -2362,29 +2080,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_clip_processed_batch_memory_estimate() {
-        let record =
-            fgumi_raw_bam::SamBuilder::new().sequence(b"ACGT").qualities(&[30, 30, 30, 30]).build();
-        let mut records = Vec::with_capacity(10);
-        records.push(record);
-
-        let batch = ClipProcessedBatch {
-            clipped_records: records,
-            templates_count: 1,
-            overlap_clipped_count: 0,
-            extend_clipped_count: 0,
-        };
-
-        let estimate = batch.estimate_heap_size();
-        // Should include Vec overhead for capacity * size_of::<RawRecord>()
-        let vec_overhead = 10 * std::mem::size_of::<RawRecord>();
-        assert!(
-            estimate >= vec_overhead,
-            "estimate {estimate} should include Vec<RawRecord> overhead {vec_overhead}"
-        );
-    }
-
     /// Helper to create a `Clip` struct with specified clipping parameters and
     /// all other fields set to sensible defaults.
     fn make_clip(
@@ -2397,7 +2092,7 @@ mod tests {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
-                async_reader: false,
+                ..Default::default()
             },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Soft,
