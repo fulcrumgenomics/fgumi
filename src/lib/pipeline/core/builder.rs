@@ -854,13 +854,26 @@ impl Pipeline {
                 let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let stop_clone = Arc::clone(&stop);
                 let stats_clone = Arc::clone(stats);
-                let timeout = std::time::Duration::from_secs(deadlock_timeout_secs);
+                let contexts_clone = Arc::clone(&contexts);
+                let signal_clone = Arc::clone(&signal);
+                let warn_timeout = std::time::Duration::from_secs(deadlock_timeout_secs);
+                let fatal_timeout = std::time::Duration::from_secs(
+                    deadlock_timeout_secs.saturating_mul(DEADLOCK_FATAL_MULTIPLE),
+                );
                 let poll_interval =
                     std::time::Duration::from_secs(deadlock_timeout_secs.max(4) / 4);
                 let handle = thread::Builder::new()
                     .name("fgumi-deadlock-monitor".to_string())
                     .spawn(move || {
-                        run_deadlock_monitor(&stop_clone, &stats_clone, timeout, poll_interval);
+                        run_deadlock_monitor(
+                            &stop_clone,
+                            &stats_clone,
+                            &contexts_clone,
+                            &signal_clone,
+                            warn_timeout,
+                            fatal_timeout,
+                            poll_interval,
+                        );
                     })
                     .expect("failed to spawn deadlock monitor thread");
                 (Some(stop), Some(handle))
@@ -1017,53 +1030,177 @@ impl Pipeline {
             Some(PipelineError::NotEnoughThreads { required, available }) => {
                 Err(PipelineError::NotEnoughThreads { required: *required, available: *available })
             }
+            Some(PipelineError::TimedOut { stalled_secs }) => {
+                Err(PipelineError::TimedOut { stalled_secs: *stalled_secs })
+            }
             None => Ok(()),
         }
     }
 }
 
-/// Background deadlock monitor body. Polls `stats` every `poll_interval`
-/// and tracks the cumulative `progress + finished` counter across all
-/// steps. If no step has advanced for `timeout`, logs the snapshot at
-/// `warn` level (once per stall window) and resets the watermark so a
-/// long-running stall keeps emitting periodic diagnostics rather than
-/// only one. Exits when `stop` is set (typically by the main thread
-/// after workers join).
+/// Default multiple of the warn window (`--deadlock-timeout`) after which a
+/// persistent stall *with work still in flight* is treated as a fatal wedge.
+/// Diverges from the legacy single-window kill: a single huge dispatch
+/// (busy-locus group, large sort merge) can legitimately flatten progress for
+/// many seconds, so we only fail after the stall persists well past the warn
+/// window. A real deadlock hangs forever, so waiting longer to be sure is free.
+const DEADLOCK_FATAL_MULTIPLE: u64 = 6;
+
+/// Total bytes currently held across the **byte-bounded** transport queues and
+/// their reorder overflow stashes. Non-zero means work is stuck on a byte-bounded
+/// edge; zero means those edges are idle (e.g. waiting on a slow upstream pipe).
+/// This is the signal that distinguishes a real wedge from upstream starvation
+/// on byte-bounded edges.
+///
+/// LIMITATION: only `ByteBounded` branches register a queue handle (see
+/// `build_chain_contexts_inner`), so `CountBounded`/`Unbounded` transports — and
+/// any reorder stash on such a branch — do not contribute here. The only current
+/// `CountBounded` user is the sort spill→merge path, whose `SortMerge` is
+/// deadlock-free by construction (the cooperative slot-refill that fixed issue
+/// #330 BUG #3), so a wedge there is not reachable and the monitor correctly
+/// stays quiet during a slow merge (where in-flight on byte-bounded edges is 0).
+/// Extending the probe to count-based queues for defense-in-depth is tracked
+/// separately.
+fn in_flight_bytes(contexts: &crate::pipeline::core::runtime::contexts::ChainContexts) -> u64 {
+    contexts
+        .bounded_queues
+        .iter()
+        .map(|rq| {
+            rq.handle.current_bytes()
+                + rq.reorder_cap.as_ref().map_or(0, |r| r.current_buffer_bytes())
+        })
+        .sum()
+}
+
+/// Background deadlock monitor body. Polls `stats` every `poll_interval`,
+/// tracking the cumulative `progress + finished` counter across all steps.
+///
+/// On a stall (no advance), it consults [`in_flight_bytes`] to tell a real
+/// wedge from upstream starvation (mirrors legacy `check_deadlock_and_restore`):
+///   - idle with nothing in flight → starvation, reset the clock, keep watching;
+///   - stuck work past `warn_timeout` → `warn` snapshot, once per warn window;
+///   - stuck work past `fatal_timeout` → record [`PipelineError::TimedOut`] and
+///     `cancel()`, so workers observe `is_done()` and the run fails fast instead
+///     of hanging forever.
+///
+/// Exits when `stop` is set (workers joined) or the pipeline is already done.
 fn run_deadlock_monitor(
     stop: &Arc<std::sync::atomic::AtomicBool>,
     stats: &Arc<PipelineStats>,
-    timeout: std::time::Duration,
+    contexts: &Arc<crate::pipeline::core::runtime::contexts::ChainContexts>,
+    signal: &Arc<PipelineSignal>,
+    warn_timeout: std::time::Duration,
+    fatal_timeout: std::time::Duration,
     poll_interval: std::time::Duration,
 ) {
-    let mut last_advance = std::time::Instant::now();
-    let mut last_total = total_progress(stats);
+    let mut mon_state = StallMonitorState {
+        last_total: total_progress(stats),
+        stall_start: std::time::Instant::now(),
+        last_warn: None,
+    };
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         sleep_until_stop(stop, poll_interval);
-        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) || signal.is_done() {
             break;
         }
+        let now = std::time::Instant::now();
         let now_total = total_progress(stats);
-        if now_total != last_total {
-            last_total = now_total;
-            last_advance = std::time::Instant::now();
-            continue;
+        let progressed = now_total != mon_state.last_total;
+        let stall_secs = now.duration_since(mon_state.stall_start).as_secs();
+        let stuck = in_flight_bytes(contexts);
+        let verdict = classify_stall(
+            progressed,
+            stall_secs,
+            warn_timeout.as_secs(),
+            fatal_timeout.as_secs(),
+            stuck,
+        );
+        if apply_stall_verdict(
+            verdict,
+            now,
+            now_total,
+            stall_secs,
+            stuck,
+            warn_timeout,
+            stats,
+            signal,
+            &mut mon_state,
+        ) {
+            break;
         }
-        if last_advance.elapsed() >= timeout {
-            // Stalled — emit diagnostics. Reset the watermark so we
-            // continue logging on each `timeout` window if the stall
-            // persists, instead of going silent after one warning.
-            log::warn!(
-                "Pipeline stall detected: no step has progressed in {:.0}s. \
-                 Snapshot follows.",
-                last_advance.elapsed().as_secs_f64()
+    }
+}
+
+/// Rolling state the deadlock monitor carries across poll iterations.
+struct StallMonitorState {
+    last_total: u64,
+    stall_start: std::time::Instant,
+    last_warn: Option<std::time::Instant>,
+}
+
+/// React to one classified [`StallVerdict`], mutating the rolling monitor
+/// `mon_state` and performing the verdict's side effect (a warn snapshot, or
+/// recording a fatal [`PipelineError::TimedOut`] + `cancel`). Extracted from
+/// [`run_deadlock_monitor`]'s poll loop so each per-verdict action is
+/// unit-testable without spawning a thread or waiting on wall-clock time —
+/// mirroring the pure `classify_stall` / `in_flight_bytes` split. Returns
+/// `true` when a fatal wedge was recorded and the monitor should stop.
+#[allow(clippy::too_many_arguments)]
+fn apply_stall_verdict(
+    verdict: StallVerdict,
+    now: std::time::Instant,
+    now_total: u64,
+    stall_secs: u64,
+    stuck: u64,
+    warn_timeout: std::time::Duration,
+    stats: &PipelineStats,
+    signal: &PipelineSignal,
+    mon_state: &mut StallMonitorState,
+) -> bool {
+    use super::signal::PipelineError;
+    match verdict {
+        StallVerdict::Progressing => {
+            mon_state.last_total = now_total;
+            mon_state.stall_start = now;
+            mon_state.last_warn = None;
+        }
+        StallVerdict::Starving => {
+            // Idle, waiting on a slow upstream — not a deadlock. Reset the
+            // stall clock so an idle gap never accumulates toward a fatal.
+            mon_state.stall_start = now;
+            mon_state.last_warn = None;
+        }
+        StallVerdict::Watching => {}
+        StallVerdict::Stalled => {
+            // Warn at most once per warn window: a long stall emits periodic
+            // diagnostics without spamming every poll.
+            if mon_state.last_warn.is_none_or(|w| now.duration_since(w) >= warn_timeout) {
+                log::warn!(
+                    "Pipeline stall: no progress for {stall_secs}s with {stuck} bytes \
+                     still in flight. Snapshot follows."
+                );
+                let snapshot = stats.snapshot();
+                for line in format!("{snapshot}").lines() {
+                    log::warn!("{line}");
+                }
+                mon_state.last_warn = Some(now);
+            }
+        }
+        StallVerdict::Wedged => {
+            log::error!(
+                "Pipeline deadlock: no progress for {stall_secs}s with {stuck} bytes \
+                 stuck in flight; failing the pipeline. Snapshot follows."
             );
             let snapshot = stats.snapshot();
             for line in format!("{snapshot}").lines() {
-                log::warn!("{line}");
+                log::error!("{line}");
             }
-            last_advance = std::time::Instant::now();
+            signal.record_error(PipelineError::TimedOut { stalled_secs: stall_secs });
+            signal.cancel();
+            return true;
         }
     }
+    false
 }
 
 /// Sum of `progress_count + finished_count` across all steps. The
@@ -1095,6 +1232,63 @@ fn sleep_until_stop(stop: &std::sync::atomic::AtomicBool, dur: std::time::Durati
         }
         std::thread::sleep(SLICE.min(deadline - now));
     }
+}
+
+/// What the deadlock monitor should do after one poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallVerdict {
+    /// Global progress advanced since the last poll — reset and keep watching.
+    Progressing,
+    /// No progress, but nothing is in flight: the pipeline is idle waiting on
+    /// a slow upstream (e.g. a stdin pipe), not deadlocked. Reset the stall
+    /// clock and keep watching. Mirrors legacy `check_deadlock_and_restore`'s
+    /// starvation guard (an empty pipeline is never a deadlock).
+    Starving,
+    /// No progress with work stuck, but below the warn threshold — no-op.
+    Watching,
+    /// No progress with work stuck past the warn (but below the fatal)
+    /// threshold — log a diagnostic snapshot and keep watching.
+    Stalled,
+    /// No progress with work stuck past the fatal threshold — a genuine wedge.
+    /// Fail the pipeline fast instead of hanging forever.
+    Wedged,
+}
+
+/// Classify one deadlock-monitor poll.
+///
+/// - `progressed`: did the global progress counter advance since the last poll?
+/// - `stall_secs`: how long progress has been flat (0 if it just advanced).
+/// - `warn_secs` / `fatal_secs`: the warn and fatal stall thresholds.
+/// - `in_flight_bytes`: bytes currently held across transport queues **and**
+///   reorder buffers.
+///
+/// The starvation guard (no progress + nothing in flight ⇒ not a deadlock) and
+/// fatal-on-stuck-work behavior mirror the legacy pipeline's
+/// `check_deadlock_and_restore`. The split warn/fatal thresholds diverge from
+/// legacy's single 10s kill: a single huge dispatch (busy-locus group, large
+/// sort merge) can legitimately flatten progress for many seconds with work
+/// stuck in queues, so we only fail after the stall persists well past the warn
+/// window.
+fn classify_stall(
+    progressed: bool,
+    stall_secs: u64,
+    warn_secs: u64,
+    fatal_secs: u64,
+    in_flight_bytes: u64,
+) -> StallVerdict {
+    if progressed {
+        return StallVerdict::Progressing;
+    }
+    if in_flight_bytes == 0 {
+        return StallVerdict::Starving;
+    }
+    if stall_secs >= fatal_secs {
+        return StallVerdict::Wedged;
+    }
+    if stall_secs >= warn_secs {
+        return StallVerdict::Stalled;
+    }
+    StallVerdict::Watching
 }
 
 /// Per-queue floor: never let the rebalancer take a queue below this
@@ -1950,5 +2144,213 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(elapsed >= std::time::Duration::from_millis(95), "returned too early: {elapsed:?}");
         assert!(elapsed < std::time::Duration::from_secs(2), "ran far too long: {elapsed:?}");
+    }
+
+    #[test]
+    fn classify_stall_progress_is_healthy() {
+        // Any advance in the global progress counter clears the stall,
+        // regardless of how long the prior stall was or what is in flight.
+        assert_eq!(classify_stall(true, 999, 10, 60, 1_000_000), StallVerdict::Progressing);
+    }
+
+    #[test]
+    fn classify_stall_empty_pipeline_is_starvation_not_deadlock() {
+        // No progress, but nothing is stuck anywhere: the pipeline is idle
+        // waiting on a slow upstream (e.g. a stdin pipe). Never fatal — mirrors
+        // legacy `check_deadlock_and_restore`'s starvation guard.
+        assert_eq!(classify_stall(false, 120, 10, 60, 0), StallVerdict::Starving);
+    }
+
+    #[test]
+    fn classify_stall_stuck_work_below_fatal_only_warns() {
+        // No progress with work stuck, but the stall has not persisted long
+        // enough to be sure it is a wedge rather than one slow dispatch.
+        assert_eq!(classify_stall(false, 15, 10, 60, 4096), StallVerdict::Stalled);
+    }
+
+    #[test]
+    fn classify_stall_below_warn_threshold_keeps_watching() {
+        // Stalled with stuck work but not yet past the warn threshold: no-op.
+        assert_eq!(classify_stall(false, 5, 10, 60, 4096), StallVerdict::Watching);
+    }
+
+    #[test]
+    fn classify_stall_stuck_work_past_fatal_is_wedged() {
+        // No progress with work stuck for >= the fatal threshold: a genuine
+        // wedge — fail fast instead of hanging forever.
+        assert_eq!(classify_stall(false, 60, 10, 60, 4096), StallVerdict::Wedged);
+    }
+
+    #[test]
+    fn apply_stall_verdict_wedged_records_timeout_and_cancels() {
+        use crate::pipeline::core::signal::PipelineError;
+        let stats = PipelineStats::new(vec![]);
+        let signal = PipelineSignal::new();
+        let now = std::time::Instant::now();
+        let mut mon_state = StallMonitorState { last_total: 0, stall_start: now, last_warn: None };
+
+        let stop = apply_stall_verdict(
+            StallVerdict::Wedged,
+            now,
+            0,
+            60,
+            4096,
+            std::time::Duration::from_secs(10),
+            &stats,
+            &signal,
+            &mut mon_state,
+        );
+
+        assert!(stop, "a wedge must stop the monitor");
+        assert!(signal.is_done(), "a wedge must make workers observe is_done()");
+        match signal.outcome() {
+            Some(PipelineError::TimedOut { stalled_secs }) => assert_eq!(*stalled_secs, 60),
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+        // Exercises the `TimedOut` Display arm.
+        assert!(signal.outcome().unwrap().to_string().contains("no progress"));
+    }
+
+    #[test]
+    fn apply_stall_verdict_stalled_warns_once_per_window() {
+        let stats = PipelineStats::new(vec![]);
+        let signal = PipelineSignal::new();
+        let now = std::time::Instant::now();
+        let mut mon_state = StallMonitorState { last_total: 0, stall_start: now, last_warn: None };
+        let warn = std::time::Duration::from_secs(10);
+
+        // First stall in the window arms the throttle without failing the run.
+        let stop = apply_stall_verdict(
+            StallVerdict::Stalled,
+            now,
+            0,
+            15,
+            4096,
+            warn,
+            &stats,
+            &signal,
+            &mut mon_state,
+        );
+        assert!(!stop);
+        assert!(mon_state.last_warn.is_some(), "a stall must arm the warn throttle");
+        assert!(!signal.is_done(), "a stall must not fail the run");
+
+        // A second stall inside the same window must not re-arm (no re-warn).
+        let armed = mon_state.last_warn;
+        let stop2 = apply_stall_verdict(
+            StallVerdict::Stalled,
+            now,
+            0,
+            16,
+            4096,
+            warn,
+            &stats,
+            &signal,
+            &mut mon_state,
+        );
+        assert!(!stop2);
+        assert_eq!(mon_state.last_warn, armed, "must not re-warn within the same window");
+    }
+
+    #[test]
+    fn apply_stall_verdict_progressing_and_starving_reset_the_clock() {
+        let stats = PipelineStats::new(vec![]);
+        let signal = PipelineSignal::new();
+        let t0 = std::time::Instant::now();
+        let warn = std::time::Duration::from_secs(10);
+        let mut mon_state =
+            StallMonitorState { last_total: 0, stall_start: t0, last_warn: Some(t0) };
+
+        // Progress advances the watermark and clears the warn throttle.
+        let later = t0 + std::time::Duration::from_secs(5);
+        let stop = apply_stall_verdict(
+            StallVerdict::Progressing,
+            later,
+            42,
+            0,
+            0,
+            warn,
+            &stats,
+            &signal,
+            &mut mon_state,
+        );
+        assert!(!stop);
+        assert_eq!(mon_state.last_total, 42);
+        assert_eq!(mon_state.stall_start, later);
+        assert!(mon_state.last_warn.is_none());
+        assert!(!signal.is_done());
+
+        // Starvation (nothing in flight) resets the clock without failing.
+        mon_state.last_warn = Some(t0);
+        let even_later = later + std::time::Duration::from_secs(5);
+        let stop2 = apply_stall_verdict(
+            StallVerdict::Starving,
+            even_later,
+            99,
+            0,
+            0,
+            warn,
+            &stats,
+            &signal,
+            &mut mon_state,
+        );
+        assert!(!stop2);
+        assert_eq!(mon_state.stall_start, even_later);
+        assert!(mon_state.last_warn.is_none());
+        assert!(!signal.is_done());
+    }
+
+    #[test]
+    fn in_flight_bytes_counts_transport_and_reorder_stash() {
+        // The wedge-vs-starvation signal must include the reorder overflow
+        // stash, not just transport queues — items can sit in a reorder buffer
+        // (waiting for a missing serial) while every transport reads empty.
+        use crate::pipeline::core::item::HeapSize;
+        use crate::pipeline::core::queues::{
+            BoundedQueueHandle, ByteBoundedQueue, CountBoundedQueue, ItemQueue,
+        };
+        use crate::pipeline::core::reorder::{ReorderCapHandle, ReorderStage, Sequenced};
+        use crate::pipeline::core::runtime::contexts::{ChainContexts, RegisteredQueue};
+        use crate::pipeline::core::topology::{BranchIdx, StepIdx};
+
+        #[derive(Debug)]
+        struct Heavy(Vec<u8>);
+        impl HeapSize for Heavy {
+            fn heap_size(&self) -> usize {
+                self.0.len()
+            }
+        }
+
+        // Transport queue holding 200 bytes.
+        let transport = Arc::new(ByteBoundedQueue::<Heavy>::new(10_000));
+        transport.try_push(Heavy(vec![0u8; 200])).unwrap();
+        assert_eq!(transport.current_bytes(), 200);
+
+        // Reorder stage with 300 bytes stuck in its overflow stash: with
+        // next_serial (0) absent and the inner transport (cap 1) full, the
+        // second push overflows into the buffer.
+        let inner: Arc<dyn ItemQueue<Sequenced<Heavy>>> =
+            Arc::new(CountBoundedQueue::<Sequenced<Heavy>>::new(1));
+        let reorder = Arc::new(ReorderStage::with_max_overflow_bytes(inner, 100_000));
+        reorder.try_push(5, Heavy(vec![0u8; 100])).unwrap(); // -> inner transport
+        reorder.try_push(6, Heavy(vec![0u8; 300])).unwrap(); // -> overflow stash
+        assert_eq!(reorder.current_buffer_bytes(), 300);
+
+        let handle: Arc<dyn BoundedQueueHandle> = transport.clone();
+        let cap: Arc<dyn ReorderCapHandle> = reorder.clone();
+        let rq = RegisteredQueue {
+            producer_step_name: "test",
+            producer_step: StepIdx(0),
+            branch: BranchIdx(0),
+            handle,
+            reorder_cap: Some(cap),
+        };
+        let contexts = ChainContexts { inputs: vec![], outputs: vec![], bounded_queues: vec![rq] };
+        // 200 (transport) + 300 (reorder stash).
+        assert_eq!(in_flight_bytes(&contexts), 500);
+
+        // An empty registry reads zero — the starvation (idle) signal.
+        let empty = ChainContexts { inputs: vec![], outputs: vec![], bounded_queues: vec![] };
+        assert_eq!(in_flight_bytes(&empty), 0);
     }
 }
