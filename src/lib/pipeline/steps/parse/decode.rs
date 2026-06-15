@@ -40,6 +40,34 @@ use crate::pipeline::steps::parse::bam::parse_records;
 use crate::pipeline::steps::types::{DecodedRecordBatch, DecompressedBlock, RecordBatch};
 use fgumi_bam_io::{DecodedRecord, GroupKeyConfig, compute_group_key_from_raw, name_hash_key};
 
+/// Cache the UMI tag's value position on a `DecodedRecord` during decode.
+///
+/// Looks up `umi_tag` in the record's aux data and, when present and Z-typed,
+/// stores the record-relative offset of its value bytes (excluding the trailing
+/// NUL) via [`DecodedRecord::set_cached_umi`]. The UMI-assignment step can then
+/// slice the value through [`DecodedRecord::cached_umi`] instead of re-scanning
+/// aux data once per template. When the tag is absent or not Z-typed the cache
+/// is left in the `UMI_OFFSET_UNCACHED` state and downstream code falls back to
+/// scanning aux data. Issue #334.
+fn cache_umi_position(decoded: &mut DecodedRecord, umi_tag: [u8; 2]) {
+    let raw = decoded.raw_bytes();
+    let Some(aux_offset) = fgumi_raw_bam::aux_data_offset_from_record(raw) else {
+        return;
+    };
+    let aux = &raw[aux_offset..];
+    let Some((value_off_in_aux, value_len)) = fgumi_raw_bam::find_string_tag_position(aux, umi_tag)
+    else {
+        return;
+    };
+    let Ok(aux_offset_u32) = u32::try_from(aux_offset) else {
+        return;
+    };
+    let Some(value_offset) = aux_offset_u32.checked_add(value_off_in_aux) else {
+        return;
+    };
+    decoded.set_cached_umi(value_offset, value_len);
+}
+
 /// `Parallel + ByItemOrdinal` parse + decode. `DecompressedBlock →
 /// DecodedRecordBatch`.
 pub struct DecodeRecords {
@@ -113,6 +141,7 @@ impl Step for DecodeRecords {
         let library_index: &Arc<_> = &self.key_config.library_index;
         let cell_tag = self.key_config.cell_tag;
         let name_hash_only = self.key_config.name_hash_only;
+        let umi_tag = self.key_config.umi_tag;
         let decoded: Vec<DecodedRecord> = records
             .into_iter()
             .map(|raw| {
@@ -123,7 +152,13 @@ impl Step for DecodeRecords {
                 } else {
                     compute_group_key_from_raw(raw.as_ref(), library_index, cell_tag)
                 };
-                DecodedRecord::from_raw_bytes(raw, key)
+                let mut decoded = DecodedRecord::from_raw_bytes(raw, key);
+                // Cache the UMI value position so the Group step's assignment
+                // pass can slice it without re-scanning aux data (#334).
+                if let Some(umi_tag) = umi_tag {
+                    cache_umi_position(&mut decoded, umi_tag);
+                }
+                decoded
             })
             .collect();
 
@@ -215,6 +250,7 @@ impl Step for DecodeFromRecords {
 
         let library_index: &Arc<_> = &self.key_config.library_index;
         let cell_tag = self.key_config.cell_tag;
+        let umi_tag = self.key_config.umi_tag;
         // `DecodedRecord` owns its bytes (via `RawRecord`), so we materialize
         // a heap-allocated copy here. The `RecordBatch`'s shared backing
         // buffer is dropped once this batch is consumed.
@@ -222,7 +258,16 @@ impl Step for DecodeFromRecords {
             .iter_record_bytes()
             .map(|bytes| {
                 let key = compute_group_key_from_raw(bytes, library_index, cell_tag);
-                DecodedRecord::from_raw_bytes(fgumi_raw_bam::RawRecord::from(bytes.to_vec()), key)
+                let mut decoded = DecodedRecord::from_raw_bytes(
+                    fgumi_raw_bam::RawRecord::from(bytes.to_vec()),
+                    key,
+                );
+                // Cache the UMI value position so the Group step's assignment
+                // pass can slice it without re-scanning aux data (#334).
+                if let Some(umi_tag) = umi_tag {
+                    cache_umi_position(&mut decoded, umi_tag);
+                }
+                decoded
             })
             .collect();
 
@@ -307,5 +352,54 @@ mod tests {
                 "name_hash_only must leave all non-name fields at default"
             );
         }
+    }
+
+    // ========================================================================
+    // UMI position caching during Decode (issue #334)
+    // ========================================================================
+
+    #[test]
+    fn cache_umi_position_records_value_offset_matching_fallback() {
+        use crate::sam::SamTag;
+        use fgumi_bam_io::GroupKey;
+        use fgumi_raw_bam::{SamBuilder, flags};
+
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGT")
+            .qualities(&[30u8; 4])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT);
+        b.add_string_tag(SamTag::RX, b"ACGTACGT");
+        let raw = b.build();
+
+        let mut decoded = DecodedRecord::from_raw_bytes(raw, GroupKey::default());
+        cache_umi_position(&mut decoded, *SamTag::RX);
+
+        // The cached slice must equal the canonical find_string_tag answer.
+        let aux = fgumi_raw_bam::aux_data_slice(decoded.raw_bytes());
+        let expected = fgumi_raw_bam::find_string_tag(aux, *SamTag::RX).expect("RX present");
+        assert_eq!(decoded.cached_umi(), Some(expected));
+        assert_eq!(decoded.cached_umi().unwrap(), b"ACGTACGT");
+    }
+
+    #[test]
+    fn cache_umi_position_leaves_cache_unset_when_tag_missing() {
+        use crate::sam::SamTag;
+        use fgumi_bam_io::GroupKey;
+        use fgumi_raw_bam::{SamBuilder, flags};
+
+        // Record with no RX tag — caching must be a no-op.
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGT")
+            .qualities(&[30u8; 4])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT);
+        let raw = b.build();
+
+        let mut decoded = DecodedRecord::from_raw_bytes(raw, GroupKey::default());
+        cache_umi_position(&mut decoded, *SamTag::RX);
+
+        assert!(decoded.cached_umi().is_none());
+        assert_eq!(decoded.cached_umi_position().0, DecodedRecord::UMI_OFFSET_UNCACHED);
     }
 }
