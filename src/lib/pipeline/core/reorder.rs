@@ -192,6 +192,13 @@ impl<T: Send + HeapSize + 'static> ReorderStage<T> {
     pub(crate) fn current_max_overflow_bytes(&self) -> u64 {
         self.max_overflow_bytes.load(Ordering::Relaxed)
     }
+
+    /// Read the current stash (overflow buffer) byte count. Test-only — lets
+    /// the cap-enforcement tests observe the stash size without the production
+    /// peak-tracking diagnostics.
+    pub(crate) fn current_buffer_bytes(&self) -> u64 {
+        self.state.lock().buffer_bytes
+    }
 }
 
 struct ReorderState<T> {
@@ -324,25 +331,33 @@ impl<T: Send + HeapSize + 'static> ReorderStage<T> {
         let seq = Sequenced { ordinal, item };
 
         if must_accept {
+            // Apply the byte-aware overflow cap *before* attempting the
+            // transport push, not only when transport is full. The consumer's
+            // `try_pop_in_order` drain loop relocates the entire transport into
+            // the stash while `next_serial` is absent, so a cap that only fires
+            // on transport-full never binds — the consumer keeps transport
+            // non-full — and the stash grows without bound (#330 zipper OOM:
+            // 7.7 GB of reorder stash vs 466 MB of transport). Gating the push
+            // on `buffer_bytes >= cap` regardless of transport room bounds the
+            // stash to roughly `cap + one transport-worth`.
+            //
+            // Liveness preserved: `next_serial` is exempt (always accepted),
+            // so the producer of `next_serial` can never be backpressured by
+            // this cap and the consumer can always make progress. Any cap value
+            // is deadlock-free (see `concurrent_tiny_cap_drains_all_in_order`,
+            // which proves this with a 1-byte cap).
+            let landed_next = ordinal == state.next_serial;
+            let cap = self.max_overflow_bytes.load(Ordering::Relaxed);
+            if !landed_next && cap != REORDER_OVERFLOW_UNBOUNDED && state.buffer_bytes >= cap {
+                let Sequenced { ordinal, item } = seq;
+                return Err((ordinal, item));
+            }
             match self.transport.try_push(seq) {
                 Ok(()) => Ok(()),
                 Err(seq) => {
-                    let landed_next = seq.ordinal == state.next_serial;
-                    // Apply byte-aware overflow cap: reject the push if
-                    // the buffer is at the byte cap AND this isn't the
-                    // next_serial we need to make progress. Producer
-                    // holds via its `held_slot` and retries. Liveness
-                    // preserved: next_serial always gets in (the
-                    // producer of next_serial cannot itself be
-                    // backpressured by this cap, so the consumer can
-                    // always make progress).
-                    let cap = self.max_overflow_bytes.load(Ordering::Relaxed);
-                    if !landed_next
-                        && cap != REORDER_OVERFLOW_UNBOUNDED
-                        && state.buffer_bytes >= cap
-                    {
-                        return Err((seq.ordinal, seq.item));
-                    }
+                    // Transport full: overflow into the stash. The cap was
+                    // already checked above; `next_serial` is exempt either
+                    // way, so the must-accept liveness guarantee holds.
                     let item_bytes = seq.item.heap_size() as u64;
                     state.buffer.insert(seq.ordinal, (seq.item, item_bytes));
                     state.buffer_bytes = state.buffer_bytes.saturating_add(item_bytes);
@@ -522,6 +537,52 @@ mod tests {
         // After buffer drains, we can finally push the rejected 6.
         s.try_push(6, Heavy(60)).unwrap();
         assert_eq!(s.try_pop_in_order(), Some(Heavy(60)));
+    }
+
+    #[test]
+    fn drain_into_stash_respects_cap_on_success_path() {
+        // Regression for the zipper reorder-stash OOM (issue #330). When
+        // `next_serial` is withheld by a lagging producer, the consumer's
+        // `try_pop_in_order` drain loop relocates the *entire* transport into
+        // the stash hunting for the absent serial. If the must-accept push
+        // only consults the byte cap on the transport-FULL path, the cap never
+        // fires — the consumer keeps transport non-full — and the stash grows
+        // without bound (measured: 7.7 GB on a 60M-read zipper run). The cap
+        // must gate non-`next_serial` pushes regardless of transport room.
+        #[derive(Debug, PartialEq)]
+        struct Heavy(u32);
+        impl HeapSize for Heavy {
+            fn heap_size(&self) -> usize {
+                100
+            }
+        }
+
+        // Transport capacity 1 item (≤100 B in flight); stash byte cap 200 B.
+        let q: Arc<dyn ItemQueue<Sequenced<Heavy>>> =
+            Arc::new(CountBoundedQueue::<Sequenced<Heavy>>::new(1));
+        let s = ReorderStage::with_max_overflow_bytes(q, 200);
+
+        // Serial 0 is never pushed (the lagging worker). Push ordinals 1..=50
+        // in order, polling the consumer after each push — the poll returns
+        // None (serial 0 absent) but drains transport into the stash as a side
+        // effect, which is the relocation that bypassed the cap. Track the peak
+        // stash size after each drain.
+        let mut rejected = 0u32;
+        let mut peak_stash = 0u64;
+        for ord in 1u32..=50 {
+            if s.try_push(u64::from(ord), Heavy(ord)).is_err() {
+                rejected += 1;
+            }
+            assert_eq!(s.try_pop_in_order(), None, "serial 0 absent → no item releases");
+            peak_stash = peak_stash.max(s.current_buffer_bytes());
+        }
+
+        // The cap must fire (without the fix, the success path bypasses it
+        // entirely and `rejected` stays 0).
+        assert!(rejected > 0, "stash cap never fired: drain-into-stash bypassed the byte cap");
+        // Peak stash is bounded by the cap (200 B) plus at most one
+        // transport-worth (100 B) of overshoot.
+        assert!(peak_stash <= 300, "stash grew past cap + one transport-worth: {peak_stash} B");
     }
 
     #[test]

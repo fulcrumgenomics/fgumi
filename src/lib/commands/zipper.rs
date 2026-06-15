@@ -47,7 +47,7 @@
 //! - `TagInfo`: Holds sets of tags to remove/reverse/revcomp
 //! - `merge_raw()`: Core function that transfers metadata between templates using raw bytes
 use crate::commands::command::Command;
-use crate::commands::common::{CompressionOptions, parse_bool};
+use crate::commands::common::{CompressionOptions, QueueMemoryOptions, parse_bool};
 use crate::reference::ReferenceReader;
 use crate::sam::{SamTag, TemplateCoordinateInfo};
 use crate::template::Template;
@@ -248,6 +248,16 @@ pub struct Zipper {
     /// Per-stage zipper tuning (tag manipulation, buffer sizes, EM-seq).
     #[command(flatten)]
     pub options: ZipperOptions,
+
+    /// Queue-memory budget for the pipeline (`--max-memory`).
+    ///
+    /// Zipper is a streaming two-input merge. At higher `--threads` the default
+    /// per-thread budget (`768 MiB × threads`) over-provisions it; pass
+    /// `--max-memory` (e.g. `512MiB`, or `auto` to fit a cgroup) to bound
+    /// queue + reorder memory — the budget drives both the transport queues and
+    /// the reorder overflow cap.
+    #[command(flatten)]
+    pub queue_memory: QueueMemoryOptions,
 }
 
 /// Builds the output BAM header from unmapped and mapped headers
@@ -866,7 +876,7 @@ impl Command for Zipper {
     /// - Input files have different sets of read names
     /// - I/O errors occur during reading or writing
     fn execute(&self, command_line: &str) -> Result<()> {
-        use crate::commands::common::{QueueMemoryOptions, SchedulerOptions, ThreadingOptions};
+        use crate::commands::common::{SchedulerOptions, ThreadingOptions};
         use crate::pipeline::chains::{ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag};
 
         // `-K`/`--bwa-chunk-size` is deprecated and ignored by the new pipeline
@@ -890,7 +900,7 @@ impl Command for Zipper {
             threading: ThreadingOptions::new(self.threads),
             compression: self.compression.clone(),
             scheduler: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            queue_memory: self.queue_memory.clone(),
             command_line: command_line.to_string(),
         };
         crate::pipeline::chains::build_for(spec)?.run()
@@ -1362,6 +1372,29 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::TempDir;
 
+    /// Zipper must expose the standard `--max-memory` budget lever like the
+    /// other pipeline commands. Without it, zipper is pinned to the
+    /// `768 MiB × threads` default with no way for a user to bound its queue
+    /// memory — the gap behind the streaming-merge OOM (#330): a 2-input merge
+    /// provisioned at 6 GiB (t8) and no knob to shrink it.
+    #[test]
+    fn exposes_max_memory_budget_lever() {
+        let zipper = Zipper::try_parse_from([
+            "zipper",
+            "-u",
+            "unmapped.bam",
+            "-r",
+            "ref.fa",
+            "--max-memory",
+            "512M",
+        ])
+        .expect("--max-memory should be accepted by zipper");
+        assert!(
+            zipper.queue_memory.max_memory.is_some(),
+            "--max-memory should populate queue_memory.max_memory so it flows to the chain spec"
+        );
+    }
+
     /// Convert a `RawRecord` built with [`RawSamBuilder`] into a noodles `RecordBuf`.
     ///
     /// Used in tests to push raw-built records into `FgSamBuilder::push_record`.
@@ -1444,6 +1477,7 @@ mod tests {
             output: output_path.clone(),
             threads: 1,
             compression: CompressionOptions { compression_level: 1 },
+            queue_memory: QueueMemoryOptions::default(),
             options: ZipperOptions {
                 tags_to_remove,
                 tags_to_reverse,
@@ -2190,6 +2224,7 @@ mod tests {
             output: output_path.clone(),
             threads: 4,
             compression: CompressionOptions { compression_level: 1 },
+            queue_memory: QueueMemoryOptions::default(),
             options: ZipperOptions { buffer: 5000, ..ZipperOptions::default() },
         };
 
@@ -2391,6 +2426,7 @@ mod tests {
             output: output_path.clone(),
             threads: 1,
             compression: CompressionOptions { compression_level: 1 },
+            queue_memory: QueueMemoryOptions::default(),
             options: ZipperOptions {
                 buffer: 5000,
                 exclude_missing_reads,
@@ -2475,6 +2511,7 @@ mod tests {
             output: output_path,
             threads: 1,
             compression: CompressionOptions { compression_level: 1 },
+            queue_memory: QueueMemoryOptions::default(),
             options: ZipperOptions { buffer: 5000, ..ZipperOptions::default() },
         };
 
