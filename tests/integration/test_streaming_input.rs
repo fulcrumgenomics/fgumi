@@ -6,6 +6,7 @@
 
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
+use rstest::rstest;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
@@ -850,4 +851,322 @@ fn create_grouped_test_bam(path: &PathBuf) {
     }
 
     writer.try_finish().expect("Failed to finish BAM");
+}
+
+// ===========================================================================
+// Comprehensive stdin-input coverage (issue #330 follow-up).
+//
+// Every command that accepts a BAM input must read stdin exactly once and
+// produce output byte-identical to reading the same BAM from a file. These
+// tests assert file-vs-stdin parity for both `-` and `/dev/stdin`, exercising
+// the single-threaded and multi-threaded reader paths where a command has both
+// (codec/duplex/clip have a single-threaded fast path; the rest route through
+// the chain builder regardless). Parity (not correctness) is the contract: the
+// command need only run to completion and emit the same records either way.
+// ===========================================================================
+
+/// Run `fgumi` with `args`; if `stdin_bam` is `Some`, pipe that BAM to its
+/// stdin via `cat`. Asserts the process exits successfully.
+fn run_fgumi_checked(args: &[String], stdin_bam: Option<&std::path::Path>) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fgumi"));
+    command.args(args);
+    let status = if let Some(bam) = stdin_bam {
+        let cat = Command::new("cat")
+            .arg(bam.to_str().unwrap())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn cat");
+        command.stdin(cat.stdout.unwrap()).status()
+    } else {
+        command.status()
+    };
+    let status = status.unwrap_or_else(|e| panic!("Failed to run fgumi {args:?}: {e}"));
+    assert!(status.success(), "fgumi {args:?} failed (stdin_piped={})", stdin_bam.is_some());
+}
+
+/// Assert a command emits byte-identical records reading `input_bam` from a
+/// file vs piped stdin (`-`) vs `/dev/stdin`. `build_args(input, output)`
+/// returns the full argv for one invocation; `label` namespaces temp outputs.
+fn assert_stdin_input_parity(
+    input_bam: &std::path::Path,
+    temp: &std::path::Path,
+    label: &str,
+    build_args: impl Fn(&str, &str) -> Vec<String>,
+) {
+    let out_file = temp.join(format!("{label}_file.bam"));
+    let out_dash = temp.join(format!("{label}_dash.bam"));
+    let out_dev = temp.join(format!("{label}_dev.bam"));
+
+    run_fgumi_checked(&build_args(input_bam.to_str().unwrap(), out_file.to_str().unwrap()), None);
+    run_fgumi_checked(&build_args("-", out_dash.to_str().unwrap()), Some(input_bam));
+    run_fgumi_checked(&build_args("/dev/stdin", out_dev.to_str().unwrap()), Some(input_bam));
+
+    // Guard against a vacuous pass: if the command emitted no records, a
+    // file-vs-stdin parity check would be trivially true even if stdin were
+    // dropped entirely. Require the file baseline to produce real output.
+    assert!(
+        count_bam_records(&out_file) > 0,
+        "{label}: file baseline produced no records — parity check would be vacuous"
+    );
+
+    compare_bam_records(&out_file, &out_dash);
+    compare_bam_records(&out_file, &out_dev);
+}
+
+/// Count records in a BAM (eager decode). Used to reject vacuous parity tests.
+fn count_bam_records(path: &std::path::Path) -> usize {
+    let mut reader = bam::io::reader::Builder.build_from_path(path).expect("open BAM for count");
+    let header = reader.read_header().expect("read header for count");
+    let mut count = 0;
+    for record in reader.record_bufs(&header) {
+        record.expect("read record for count");
+        count += 1;
+    }
+    count
+}
+
+fn s(v: &str) -> String {
+    v.to_string()
+}
+
+// NOTE: `sort` is intentionally NOT covered here — it does not currently
+// support stdin input. Its terminal-sort path uses a file-to-file
+// `RawExternalSorter` (`SortBamFile`) that reads the input path directly and
+// double-reads the header, so a stdin stream is drained/empty by the second
+// read; input validation also rejects `-`/`/dev/stdin` outright. Supporting
+// stdin requires refactoring the external sorter to consume the stream once
+// (tracked separately).
+
+/// Push `--threads <n>` only when `threads` is `Some`; `None` exercises a
+/// command's single-threaded fast path (where it has one).
+fn push_threads(args: &mut Vec<String>, threads: Option<&str>) {
+    if let Some(t) = threads {
+        args.push(s("--threads"));
+        args.push(s(t));
+    }
+}
+
+#[rstest]
+#[case("1")]
+#[case("2")]
+fn test_group_reads_stdin_once(#[case] threads: &str) {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("input.bam");
+    create_test_input_bam(&input);
+    assert_stdin_input_parity(&input, dir.path(), "group", |i, o| {
+        vec![
+            s("group"),
+            s("--input"),
+            s(i),
+            s("--output"),
+            s(o),
+            s("--strategy"),
+            s("identity"),
+            s("--edits"),
+            s("0"),
+            s("--threads"),
+            s(threads),
+            s("--compression-level"),
+            s("1"),
+        ]
+    });
+}
+
+#[rstest]
+#[case("1")]
+#[case("2")]
+fn test_dedup_reads_stdin_once(#[case] threads: &str) {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("input.bam");
+    create_test_input_bam(&input);
+    assert_stdin_input_parity(&input, dir.path(), "dedup", |i, o| {
+        vec![
+            s("dedup"),
+            s("--input"),
+            s(i),
+            s("--output"),
+            s(o),
+            s("--strategy"),
+            s("identity"),
+            s("--edits"),
+            s("0"),
+            s("--threads"),
+            s(threads),
+            s("--compression-level"),
+            s("1"),
+        ]
+    });
+}
+
+#[rstest]
+#[case("1")]
+#[case("2")]
+fn test_correct_reads_stdin_once(#[case] threads: &str) {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("input.bam");
+    create_test_input_bam(&input);
+    // create_test_input_bam tags reads with RX = AAAAAAAA / CCCCCCCC.
+    assert_stdin_input_parity(&input, dir.path(), "correct", |i, o| {
+        vec![
+            s("correct"),
+            s("--input"),
+            s(i),
+            s("--output"),
+            s(o),
+            s("--umis"),
+            s("AAAAAAAA"),
+            s("--umis"),
+            s("CCCCCCCC"),
+            s("--min-distance"),
+            s("1"),
+            s("--threads"),
+            s(threads),
+            s("--compression-level"),
+            s("1"),
+        ]
+    });
+}
+
+/// codec has a single-threaded fast path (no `--threads`) plus the
+/// multi-threaded chain path; cover both.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::multi_threaded(Some("2"))]
+fn test_codec_reads_stdin_once(#[case] threads: Option<&str>) {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("codec.bam");
+    // CODEC needs paired duplex reads (R1/R2 same molecule) to emit consensus;
+    // reuse the proven builder so the parity check is non-vacuous.
+    let pairs: Vec<_> = (0..3)
+        .map(|i| {
+            crate::test_codec_command::create_codec_read_pair(
+                &format!("read{i}"),
+                b"ACGTACGT",
+                b"ACGTACGT",
+                &[30; 8],
+                &[30; 8],
+                100,
+                "UMI001",
+                None,
+            )
+        })
+        .collect();
+    crate::test_codec_command::create_codec_test_bam(&input, pairs);
+    assert_stdin_input_parity(&input, dir.path(), "codec", move |i, o| {
+        let mut args = vec![
+            s("codec"),
+            s("--input"),
+            s(i),
+            s("--output"),
+            s(o),
+            s("--min-reads"),
+            s("1"),
+            s("--min-duplex-length"),
+            s("1"),
+            s("--compression-level"),
+            s("1"),
+        ];
+        push_threads(&mut args, threads);
+        args
+    });
+}
+
+/// duplex has a single-threaded fast path (no `--threads`) plus the
+/// multi-threaded chain path; cover both.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::multi_threaded(Some("2"))]
+fn test_duplex_reads_stdin_once(#[case] threads: Option<&str>) {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("duplex.bam");
+    // Duplex needs A/B-strand grouped molecules to emit consensus; reuse the
+    // proven builder so the parity check is non-vacuous.
+    let molecule =
+        crate::test_duplex_command::create_duplex_molecule("MI001", "ACGTACGT", 30, 100, 3);
+    crate::test_duplex_command::create_duplex_bam(&input, vec![molecule]);
+    assert_stdin_input_parity(&input, dir.path(), "duplex", move |i, o| {
+        let mut args = vec![
+            s("duplex"),
+            s("--input"),
+            s(i),
+            s("--output"),
+            s(o),
+            s("--min-reads"),
+            s("1"),
+            s("--compression-level"),
+            s("1"),
+        ];
+        push_threads(&mut args, threads);
+        args
+    });
+}
+
+#[rstest]
+#[case("1")]
+#[case("2")]
+fn test_filter_reads_stdin_once(#[case] threads: &str) {
+    use crate::helpers::bam_generator::create_test_reference;
+    let dir = TempDir::new().unwrap();
+    let reference = create_test_reference(dir.path()).to_str().unwrap().to_string();
+    let input = dir.path().join("consensus.bam");
+    // Mapped consensus reads with CD/CE per-base tags that pass the filter;
+    // reuse the proven builder so the parity check is non-vacuous.
+    crate::test_filter_command::write_filter_consensus_bam(&input);
+
+    assert_stdin_input_parity(&input, dir.path(), "filter", move |i, o| {
+        // --ref is required when filtering mapped reads (NM/UQ/MD).
+        vec![
+            s("filter"),
+            s("--input"),
+            s(i),
+            s("--output"),
+            s(o),
+            s("--ref"),
+            reference.clone(),
+            s("--min-reads"),
+            s("1"),
+            s("--max-no-call-fraction"),
+            s("1.0"),
+            s("--threads"),
+            s(threads),
+            s("--compression-level"),
+            s("1"),
+        ]
+    });
+}
+
+/// clip has a single-threaded fast path (no `--threads`) plus the
+/// multi-threaded chain path; cover both.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::multi_threaded(Some("2"))]
+fn test_clip_reads_stdin_once(#[case] threads: Option<&str>) {
+    use crate::helpers::bam_generator::{create_paired_umi_family, create_test_reference};
+    let dir = TempDir::new().unwrap();
+    let reference = create_test_reference(dir.path()).to_str().unwrap().to_string();
+    let input = dir.path().join("paired.bam");
+    let header = create_minimal_header("chr1", 10000);
+    let mut writer = bam::io::Writer::new(fs::File::create(&input).expect("create paired BAM"));
+    writer.write_header(&header).expect("write header");
+    for raw in &create_paired_umi_family("ACGTACGT", 3, "clip", "ACGTACGTAC", "TGCATGCATG", 30) {
+        writer.write_alignment_record(&header, &to_record_buf(raw)).expect("write paired record");
+    }
+    writer.try_finish().expect("finish BAM");
+
+    assert_stdin_input_parity(&input, dir.path(), "clip", move |i, o| {
+        let mut args = vec![
+            s("clip"),
+            s("--input"),
+            s(i),
+            s("--output"),
+            s(o),
+            s("--reference"),
+            reference.clone(),
+            s("--clip-overlapping-reads"),
+            s("--compression-level"),
+            s("1"),
+        ];
+        push_threads(&mut args, threads);
+        args
+    });
 }
