@@ -212,7 +212,12 @@ fn read_qname_mi(path: &Path) -> Vec<(String, u16, String)> {
 /// (`src/lib/commands/group.rs`'s `if self.threading.threads.is_none()` at
 /// the top of `execute`); `Some("1")` runs the parallel pipeline with one
 /// worker, which is a different code path. Both must be deterministic.
-fn assert_mi_deterministic(subcommand: &str, threads: Option<&str>, n_runs: usize) {
+fn assert_mi_deterministic(
+    subcommand: &str,
+    threads: Option<&str>,
+    extra_args: &[&str],
+    n_runs: usize,
+) {
     let temp_dir = TempDir::new().unwrap();
     let input_bam = temp_dir.path().join("input.bam");
     build_mixed_orientation_bam(&input_bam);
@@ -234,6 +239,7 @@ fn assert_mi_deterministic(subcommand: &str, threads: Option<&str>, n_runs: usiz
         if let Some(t) = threads {
             args.extend(["--threads", t]);
         }
+        args.extend_from_slice(extra_args);
         let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
             .args(&args)
             .status()
@@ -310,5 +316,20 @@ fn assert_mi_deterministic(subcommand: &str, threads: Option<&str>, n_runs: usiz
 #[case::dedup_threads_1("dedup", Some("1"))]
 #[case::dedup_threads_4("dedup", Some("4"))]
 fn test_paired_mi_deterministic(#[case] subcommand: &str, #[case] threads: Option<&str>) {
-    assert_mi_deterministic(subcommand, threads, 6);
+    assert_mi_deterministic(subcommand, threads, &[], 6);
+}
+
+/// `--parallel-group-min-templates` must route the chain `GroupProcess` step
+/// through its per-group assigner-selection branch: when the threshold is set
+/// there is no batch-wide assigner, so every group decides parallel-vs-sequential
+/// by its own template count and builds its own assigner. At `--threads 1` the
+/// `num_threads == 1` gate in `create_umi_assigner` takes the sequential
+/// fallback, so this exercises that branch without paying per-group rayon-pool
+/// construction (which the auto thresholds of 128–3072 exist to avoid; forcing
+/// the threshold to 1 at high thread counts would spin up a pool per tiny group).
+/// The assignment must stay deterministic across runs — the same lockstep
+/// guarantee the non-threshold path provides.
+#[test]
+fn test_parallel_group_min_templates_chain_is_deterministic() {
+    assert_mi_deterministic("group", Some("1"), &["--parallel-group-min-templates", "1"], 4);
 }

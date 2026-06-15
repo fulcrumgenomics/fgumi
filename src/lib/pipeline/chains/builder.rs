@@ -2231,6 +2231,7 @@ impl<'a> ChainBuilder<'a> {
             raw_tag,
             group.no_umi,
             group.allow_unmapped,
+            group.parallel_group_min_templates.clone(),
             num_threads,
             filter_config,
             accumulators_for_process,
