@@ -2181,7 +2181,8 @@ impl<'a> ChainBuilder<'a> {
                 );
             }
             bail!(
-                "Input BAM must be template-coordinate sorted.\n\n\
+                "Input BAM must be template-coordinate sorted (header must advertise \
+                SO:unsorted, GO:query, and SS:template-coordinate).\n\n\
                 To sort your BAM file, run:\n  \
                 fgumi sort -i input.bam -o sorted.bam --order template-coordinate"
             );
