@@ -1384,11 +1384,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions {
-                queue_memory: Some("768".to_string()),
-                queue_memory_per_thread: true,
-                queue_memory_limit_mb: None,
-            },
+            queue_memory: QueueMemoryOptions::default(),
         }
     }
 
