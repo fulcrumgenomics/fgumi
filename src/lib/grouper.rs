@@ -649,7 +649,10 @@ fn group_by_name_and_build<T>(
 ///
 /// Returns an error if template construction from records fails.
 pub fn build_templates_from_records(records: Vec<DecodedRecord>) -> io::Result<Vec<Template>> {
-    group_by_name_and_build(records, |d| Ok(d.into_raw_bytes()), Template::from_records)
+    // Pass the `DecodedRecord`s through (not just their raw bytes) so the UMI
+    // value position cached during decode (#334) is propagated onto each
+    // `Template` via `from_decoded_records`.
+    group_by_name_and_build(records, Ok, Template::from_decoded_records)
 }
 
 use crate::fastq_parse::{FastqRecord, parse_fastq_records, strip_read_suffix};
