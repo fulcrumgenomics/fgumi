@@ -1956,6 +1956,8 @@ impl<'a> ChainBuilder<'a> {
                 .ok_or_else(|| anyhow!("--sort::max-memory × --threads overflowed"))?;
 
             let sort_order = SortOrder::TemplateCoordinate;
+            // NB: the spill codec is pinned to BGZF inside `build_stream`
+            // (`SortSpillDecompress` is BGZF-block-only); see the comment there.
             let mut sorter = RawExternalSorter::new(sort_order)
                 .memory_limit(total_memory)
                 .threads(num_threads.max(1))

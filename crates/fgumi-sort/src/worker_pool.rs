@@ -726,11 +726,19 @@ pub(crate) struct SharedPipelineState {
     /// (Phase 1) or into a per-file `Phase2FileState.decompressed` reorder
     /// buffer (Phase 2) so the main thread wakes immediately instead of
     /// spin-yielding.
-    main_thread_handle: std::thread::Thread,
+    ///
+    /// Wrapped in a `parking_lot::Mutex` so the streaming-sort path can
+    /// re-target it via [`SortWorkerPool::set_main_thread`]: the typed-step
+    /// `Sort` adapter builds the pool on one thread but drives ingest/drain on
+    /// a framework worker, and pool workers must `unpark` whichever thread is
+    /// actually blocked. The lock is uncontended and fires per-block (not
+    /// per-record), so the cost is negligible.
+    main_thread_handle: parking_lot::Mutex<std::thread::Thread>,
 }
 
 impl SharedPipelineState {
     fn new(num_workers: usize, main_thread_handle: std::thread::Thread) -> Self {
+        let main_thread_handle = parking_lot::Mutex::new(main_thread_handle);
         let data_queue_cap = num_workers * 8;
         let compress_queue_cap = num_workers * 4;
 
@@ -1305,7 +1313,7 @@ impl SortWorkerPool {
             let pushed =
                 try_advance_held(&shared.decompressed_input, &mut worker.held_decompressed_input);
             if pushed {
-                shared.main_thread_handle.unpark();
+                shared.main_thread_handle.lock().unpark();
                 advanced = true;
                 // This may have been the last block. Increment `input_blocks_queued` now
                 // that the block is actually in the queue (not held), then re-check the
@@ -1320,7 +1328,7 @@ impl SortWorkerPool {
                     && !shared.decompressed_input_done.load(Ordering::Acquire)
                 {
                     shared.decompressed_input_done.store(true, Ordering::Release);
-                    shared.main_thread_handle.unpark();
+                    shared.main_thread_handle.lock().unpark();
                 }
             }
         }
@@ -1360,7 +1368,7 @@ impl SortWorkerPool {
                 log::error!("I/O error reading input BAM: {e}");
                 shared.input_read_error.store(true, Ordering::Release);
                 shared.input_eof.store(true, Ordering::Release);
-                shared.main_thread_handle.unpark();
+                shared.main_thread_handle.lock().unpark();
                 return StepResult::InputEmpty;
             }
         };
@@ -1418,7 +1426,7 @@ impl SortWorkerPool {
                 let total = shared.input_read_serial.load(Ordering::Acquire);
                 if queued >= total {
                     shared.decompressed_input_done.store(true, Ordering::Release);
-                    shared.main_thread_handle.unpark();
+                    shared.main_thread_handle.lock().unpark();
                 }
             }
             return StepResult::InputEmpty;
@@ -1429,7 +1437,7 @@ impl SortWorkerPool {
             Err(e) => {
                 log::error!("BGZF decompression error (input block serial {serial}): {e}");
                 shared.decompression_error.store(true, Ordering::Release);
-                shared.main_thread_handle.unpark();
+                shared.main_thread_handle.lock().unpark();
                 return StepResult::InputEmpty;
             }
         };
@@ -1440,13 +1448,13 @@ impl SortWorkerPool {
         // Try to push to decompressed_input ArrayQueue
         let pushed = match shared.decompressed_input.push((serial, data)) {
             Ok(()) => {
-                shared.main_thread_handle.unpark();
+                shared.main_thread_handle.lock().unpark();
                 true
             }
             Err(item) => {
                 worker.held_decompressed_input = Some(item);
                 // Queue full — wake main thread to drain so we can push next time
-                shared.main_thread_handle.unpark();
+                shared.main_thread_handle.lock().unpark();
                 false
             }
         };
@@ -1461,7 +1469,7 @@ impl SortWorkerPool {
             let total = shared.input_read_serial.load(Ordering::Acquire);
             if input_eof && raw_empty && queued >= total {
                 shared.decompressed_input_done.store(true, Ordering::Release);
-                shared.main_thread_handle.unpark();
+                shared.main_thread_handle.lock().unpark();
             }
         }
 
@@ -1533,7 +1541,7 @@ impl SortWorkerPool {
                                 );
                                 shared.decompression_error.store(true, Ordering::Release);
                                 file.decomp_in_flight.fetch_sub(1, Ordering::AcqRel);
-                                shared.main_thread_handle.unpark();
+                                shared.main_thread_handle.lock().unpark();
                                 worker.phase2_file_cursor = (i + 1) % n;
                                 return StepResult::Success;
                             }
@@ -1564,7 +1572,7 @@ impl SortWorkerPool {
                                 );
                                 shared.decompression_error.store(true, Ordering::Release);
                                 file.decomp_in_flight.fetch_sub(1, Ordering::AcqRel);
-                                shared.main_thread_handle.unpark();
+                                shared.main_thread_handle.lock().unpark();
                                 worker.phase2_file_cursor = (i + 1) % n;
                                 return StepResult::Success;
                             }
@@ -1586,7 +1594,7 @@ impl SortWorkerPool {
                     // Wake the consumer either because new data is available
                     // or because the last in-flight decompression for this
                     // file just completed and the file is now fully drained.
-                    shared.main_thread_handle.unpark();
+                    shared.main_thread_handle.lock().unpark();
                 }
                 worker.phase2_file_cursor = (i + 1) % n;
                 return StepResult::Success;
@@ -1621,7 +1629,7 @@ impl SortWorkerPool {
                             shared.chunk_read_error.store(true, Ordering::Release);
                             file.mark_reader_eof(&mut reader_guard);
                             drop(reader_guard);
-                            shared.main_thread_handle.unpark();
+                            shared.main_thread_handle.lock().unpark();
                             Self::maybe_mark_all_eof(shared);
                             worker.phase2_file_cursor = (i + 1) % n;
                             return StepResult::Success;
@@ -1636,7 +1644,7 @@ impl SortWorkerPool {
                             shared.chunk_read_error.store(true, Ordering::Release);
                             file.mark_reader_eof(&mut reader_guard);
                             drop(reader_guard);
-                            shared.main_thread_handle.unpark();
+                            shared.main_thread_handle.lock().unpark();
                             Self::maybe_mark_all_eof(shared);
                             worker.phase2_file_cursor = (i + 1) % n;
                             return StepResult::Success;
@@ -1648,7 +1656,7 @@ impl SortWorkerPool {
             if raw_bytes.is_empty() {
                 file.mark_reader_eof(&mut reader_guard);
                 drop(reader_guard);
-                shared.main_thread_handle.unpark();
+                shared.main_thread_handle.lock().unpark();
                 Self::maybe_mark_all_eof(shared);
                 worker.phase2_file_cursor = (i + 1) % n;
                 return StepResult::Success;
@@ -1749,7 +1757,7 @@ impl SortWorkerPool {
         let total = shared.total_sources.load(Ordering::Acquire);
         if total > 0 && eof_count >= total {
             shared.all_chunks_eof.store(true, Ordering::Release);
-            shared.main_thread_handle.unpark();
+            shared.main_thread_handle.lock().unpark();
         }
     }
 
@@ -1760,6 +1768,18 @@ impl SortWorkerPool {
     /// Number of worker threads in the pool.
     pub fn num_workers(&self) -> usize {
         self.num_workers
+    }
+
+    /// Re-target the thread that pool workers `unpark` when they publish work.
+    ///
+    /// Needed by the streaming-sort path: the pool is constructed on the thread
+    /// that builds the `*SortStream` (e.g. the chain-build thread), but ingest
+    /// and drain run on a framework worker. Without re-targeting, pool workers
+    /// would `unpark` the build thread while the worker actually driving the
+    /// sort blocks forever. Call this from whatever thread drives the sort,
+    /// before pushing records or draining spills.
+    pub fn set_main_thread(&self, handle: std::thread::Thread) {
+        *self.shared.main_thread_handle.lock() = handle;
     }
 
     /// Codec used to compress Phase 1 spill chunks.
@@ -1960,7 +1980,7 @@ impl SortWorkerPool {
                     // Worker panicked — set flag and wake main thread so it doesn't
                     // park forever waiting for work that will never arrive.
                     self.shared.worker_panicked.store(true, Ordering::Release);
-                    self.shared.main_thread_handle.unpark();
+                    self.shared.main_thread_handle.lock().unpark();
                 }
             }
         }
