@@ -46,8 +46,10 @@ fn create_consensus_bam(path: &Path, records: Vec<RawRecord>) {
     writer.try_finish().expect("Failed to finish BAM");
 }
 
-/// Write a small mapped-consensus BAM (two reads with CD/CE per-base tags that
-/// pass `filter`). Shared by `test_filter_command` and the stdin parity test.
+/// Write a minimal BAM of two mapped consensus reads (with `CD`/`CE` per-base
+/// tags) that pass `fgumi filter --min-reads 1 --max-no-call-fraction 1.0`.
+/// Shared with the stdin-coverage tests so they exercise filter non-vacuously.
+/// Mirrors the input built inline by `test_filter_command_basic`.
 pub(crate) fn write_filter_consensus_bam(path: &Path) {
     let r1 = {
         let mut b = RawSamBuilder::new();
@@ -84,7 +86,34 @@ fn test_filter_command_basic() {
     let output_bam = temp_dir.path().join("output.bam");
     let ref_path = create_test_reference(temp_dir.path());
 
-    write_filter_consensus_bam(&input_bam);
+    // Create consensus reads with good quality and per-base tags (cd/ce).
+    let r1 = {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"cons1")
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .sequence(b"ACGTACGT")
+            .qualities(&[35; 8]);
+        b.add_array_u16(SamTag::CD_BASES, &[10; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
+        b.build()
+    };
+
+    let r2 = {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"cons2")
+            .ref_id(0)
+            .pos(199)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .sequence(b"ACGTACGT")
+            .qualities(&[35; 8]);
+        b.add_array_u16(SamTag::CD_BASES, &[5; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
+        b.build()
+    };
+
+    create_consensus_bam(&input_bam, vec![r1, r2]);
 
     let cmd = Filter::try_parse_from([
         "filter",
