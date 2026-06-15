@@ -268,7 +268,7 @@ fn correct_emits_new_pipeline_log() {
     create_umi_bam(&input_bam, vec![reads]);
     create_whitelist(&whitelist, &["ACGTACGT"]);
 
-    let r = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+    let r = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
         .env("RUST_LOG", "info")
         .args([
             "correct",

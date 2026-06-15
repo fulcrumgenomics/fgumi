@@ -34,6 +34,18 @@ fn fgumi(args: &[OsString]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_fgumi")).args(args).output().expect("failed to execute fgumi")
 }
 
+/// Run a fgumi subcommand and assert it exited successfully, returning its
+/// output. Panics with the captured stderr if the process reports failure.
+fn fgumi_ok(args: &[OsString]) -> Output {
+    let out = fgumi(args);
+    assert!(
+        out.status.success(),
+        "fgumi {args:?} exited with failure: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
 /// Build a command argument list from mixed string and path arguments.
 macro_rules! args {
     ($($arg:expr),+ $(,)?) => {

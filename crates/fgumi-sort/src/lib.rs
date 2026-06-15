@@ -48,6 +48,7 @@ pub(crate) mod inline;
 pub(crate) mod keys;
 pub(crate) mod loser_tree;
 pub(crate) mod memory_probe;
+pub(crate) mod merge_slots;
 pub(crate) mod pipeline;
 pub(crate) mod pooled_bam_writer;
 pub(crate) mod pooled_chunk_writer;
@@ -87,7 +88,13 @@ pub struct SortStats {
 /// Preserves all existing header content (reference sequences, read groups, programs,
 /// comments, and `@HD` fields like `VN`), then overwrites only the sort-related tags
 /// (`SO`, `GO`, `SS`) based on the requested sort order.
-pub(crate) fn create_output_header(sort_order: keys::SortOrder, header: &Header) -> Header {
+///
+/// # Panics
+///
+/// Panics only if constructing a default `@HD` map fails for an input header that
+/// has no `@HD` line — this cannot happen for the empty-map default used here.
+#[must_use]
+pub fn create_output_header(sort_order: keys::SortOrder, header: &Header) -> Header {
     let mut builder = Header::builder();
 
     // Copy reference sequences
@@ -159,13 +166,16 @@ fn create_temp_dir(base: Option<&Path>) -> Result<TempDir> {
 
 pub use codec::SpillCodec;
 pub use external::{
-    KeyTypesSpec, LibraryLookup, RawExternalSorter, cb_hasher, extract_template_key_inline,
+    CoordinateSortStream, KeyTypesSpec, LibraryLookup, MergeDriver, MergeDriverDyn, MergeStep,
+    QuerynameSortStream, QuerynameSortStreamGeneric, RawExternalSorter, SlotSetup,
+    TemplateCoordinateSortStream, cb_hasher, extract_template_key_inline,
 };
 pub use inline::{TemplateKey, extract_coordinate_key_inline};
 pub use keys::{
     QuerynameComparator, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
     SortContext, SortOrder, natural_compare, natural_compare_nul, normalize_natural_key,
 };
+pub use merge_slots::{PHASE2_DECOMP_CAP, SortMergeSlot};
 pub use reader::RawBamRecordReader;
 pub use verify::{VerifySummary, verify_sort_order};
 
