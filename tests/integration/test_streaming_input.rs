@@ -11,6 +11,10 @@ use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+// `rstest` is imported here for the file-vs-stdin parity tests added in a later
+// task; no test in this file references it yet.
+#[allow(unused_imports)]
+use rstest::rstest;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, create_umi_family, to_record_buf};
@@ -199,29 +203,31 @@ fn read_file_contents(path: &PathBuf) -> Vec<u8> {
 }
 
 /// Helper to compare BAM records (ignoring header differences like @PG command line).
+///
+/// Decodes to eager `RecordBuf`s and compares them for full equality — every
+/// field including bases, qualities, flags, CIGAR, positions, and aux tags — so
+/// a record-level corruption from mishandled input (dropped or garbled bytes)
+/// fails here, not just a count/name mismatch.
 fn compare_bam_records(path1: &PathBuf, path2: &PathBuf) {
+    use noodles::sam::alignment::RecordBuf;
+
     let mut reader1 =
         bam::io::reader::Builder.build_from_path(path1).expect("Failed to open BAM 1");
-    let _header1 = reader1.read_header().expect("Failed to read header 1");
+    let header1 = reader1.read_header().expect("Failed to read header 1");
 
     let mut reader2 =
         bam::io::reader::Builder.build_from_path(path2).expect("Failed to open BAM 2");
-    let _header2 = reader2.read_header().expect("Failed to read header 2");
+    let header2 = reader2.read_header().expect("Failed to read header 2");
 
-    // Compare record counts and content
-    let records1: Vec<_> = reader1.records().map(|r| r.expect("Failed to read record")).collect();
-    let records2: Vec<_> = reader2.records().map(|r| r.expect("Failed to read record")).collect();
+    let records1: Vec<RecordBuf> =
+        reader1.record_bufs(&header1).map(|r| r.expect("Failed to read record 1")).collect();
+    let records2: Vec<RecordBuf> =
+        reader2.record_bufs(&header2).map(|r| r.expect("Failed to read record 2")).collect();
 
     assert_eq!(records1.len(), records2.len(), "BAM files have different record counts");
 
     for (i, (r1, r2)) in records1.iter().zip(records2.iter()).enumerate() {
-        // Compare key fields
-        assert_eq!(r1.name(), r2.name(), "Record {i} has different name");
-        assert_eq!(
-            r1.sequence().len(),
-            r2.sequence().len(),
-            "Record {i} has different sequence length"
-        );
+        assert_eq!(r1, r2, "Record {i} differs (full record identity)");
     }
 }
 
@@ -279,4 +285,72 @@ fn create_grouped_test_bam(path: &PathBuf) {
     }
 
     writer.try_finish().expect("Failed to finish BAM");
+}
+
+/// Run `fgumi` with `args`; if `stdin_bam` is `Some`, pipe that BAM to its
+/// stdin via `cat`. Asserts the process exits successfully.
+#[allow(dead_code)] // used by the sort stdin parity tests added in a later task
+fn run_fgumi_checked(args: &[String], stdin_bam: Option<&std::path::Path>) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fgumi"));
+    command.args(args);
+    let status = if let Some(bam) = stdin_bam {
+        let cat = Command::new("cat")
+            .arg(bam.to_str().unwrap())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn cat");
+        command.stdin(cat.stdout.unwrap()).status()
+    } else {
+        command.status()
+    };
+    let status = status.unwrap_or_else(|e| panic!("Failed to run fgumi {args:?}: {e}"));
+    assert!(status.success(), "fgumi {args:?} failed (stdin_piped={})", stdin_bam.is_some());
+}
+
+/// Assert a command emits byte-identical records reading `input_bam` from a
+/// file vs piped stdin (`-`) vs `/dev/stdin`. `build_args(input, output)`
+/// returns the full argv for one invocation; `label` namespaces temp outputs.
+#[allow(dead_code)] // used by the sort stdin parity tests added in a later task
+fn assert_stdin_input_parity(
+    input_bam: &std::path::Path,
+    temp: &std::path::Path,
+    label: &str,
+    build_args: impl Fn(&str, &str) -> Vec<String>,
+) {
+    let out_file = temp.join(format!("{label}_file.bam"));
+    let out_dash = temp.join(format!("{label}_dash.bam"));
+    let out_dev = temp.join(format!("{label}_dev.bam"));
+
+    run_fgumi_checked(&build_args(input_bam.to_str().unwrap(), out_file.to_str().unwrap()), None);
+    run_fgumi_checked(&build_args("-", out_dash.to_str().unwrap()), Some(input_bam));
+    run_fgumi_checked(&build_args("/dev/stdin", out_dev.to_str().unwrap()), Some(input_bam));
+
+    // Guard against a vacuous pass: if the command emitted no records, a
+    // file-vs-stdin parity check would be trivially true even if stdin were
+    // dropped entirely. Require the file baseline to produce real output.
+    assert!(
+        count_bam_records(&out_file) > 0,
+        "{label}: file baseline produced no records — parity check would be vacuous"
+    );
+
+    compare_bam_records(&out_file, &out_dash);
+    compare_bam_records(&out_file, &out_dev);
+}
+
+/// Count records in a BAM (eager decode). Used to reject vacuous parity tests.
+#[allow(dead_code)] // used by the sort stdin parity tests added in a later task
+fn count_bam_records(path: &std::path::Path) -> usize {
+    let mut reader = bam::io::reader::Builder.build_from_path(path).expect("open BAM for count");
+    let header = reader.read_header().expect("read header for count");
+    let mut count = 0;
+    for record in reader.record_bufs(&header) {
+        record.expect("read record for count");
+        count += 1;
+    }
+    count
+}
+
+#[allow(dead_code)] // used by the sort stdin parity tests added in a later task
+fn s(v: &str) -> String {
+    v.to_string()
 }
