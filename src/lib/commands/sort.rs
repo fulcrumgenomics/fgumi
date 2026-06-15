@@ -369,8 +369,23 @@ impl Command for Sort {
             bail!("--write-index cannot be used with --verify");
         }
 
-        // Validate inputs
-        validate_file_exists(&self.input, "Input BAM")?;
+        // Validate inputs. Exempt stdin paths (`-` / `/dev/stdin`): the
+        // streaming sort path reads stdin once (the sort engine's reader
+        // handles stdin directly), so a file-existence check would spuriously
+        // reject it — matching the stdin exemption in group/dedup/correct.
+        // `--verify` is the exception: it re-scans the input (header probe +
+        // a fresh record pass), which a non-seekable stdin can't satisfy, so
+        // reject stdin there up front with a clear message.
+        if fgumi_bam_io::is_stdin_path(&self.input) {
+            if self.verify {
+                bail!(
+                    "fgumi sort --verify cannot read from stdin (it re-scans the input); \
+                     provide a file path instead"
+                );
+            }
+        } else {
+            validate_file_exists(&self.input, "Input BAM")?;
+        }
 
         // Either --output or --verify must be specified
         if !self.verify && self.output.is_none() {
