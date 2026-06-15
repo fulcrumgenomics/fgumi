@@ -382,25 +382,18 @@ impl Command for Simplex {
             return crate::pipeline::chains::build_for(spec)?.run();
         }
 
-        // Single-threaded fast path is BAM-only: it goes straight through
-        // create_raw_bam_reader_with_opts (BgzfReader-backed). Reject SAM
-        // up front with a clear error rather than the cryptic
-        // "invalid BGZF magic" that would come out of BgzfReader.
-        if let crate::pipeline::steps::source::InputSource::Sam { .. } =
-            crate::pipeline::steps::source::InputSource::open_with_opts(
-                &self.io.input,
-                self.io.pipeline_reader_opts(),
-            )?
-        {
-            bail!(
-                "SAM input requires --threads N (single-threaded simplex path is BAM-only; \
-                 the multi-threaded path handles SAM via ReadSamChunks + ParseSamChunk)"
-            );
-        }
-
-        // Single-threaded fast path: open the raw reader once and derive the header from it.
+        // Single-threaded fast path is BAM-only. Open the raw reader ONCE and
+        // derive the header from it — this is the sole open of the input. Do NOT
+        // pre-open to sniff SAM-vs-BAM: a second open double-consumes stdin and
+        // loses the leading bytes (stdin can't be rewound or re-opened). SAM
+        // input (not BGZF) fails the header read here; surface the --threads hint.
         let (mut raw_reader, header) =
-            create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())?;
+            create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())
+                .with_context(|| {
+                    "Failed to open input as BAM. The single-threaded simplex path is BAM-only; \
+                     if this is SAM input, pass --threads N to use the SAM-capable \
+                     multi-threaded path (ReadSamChunks + ParseSamChunk)."
+                })?;
         let output_header = create_unmapped_consensus_header(
             &header,
             &self.read_group.read_group_id,

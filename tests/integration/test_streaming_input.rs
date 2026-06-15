@@ -197,6 +197,180 @@ fn test_simplex_command_with_piped_input() {
     compare_bam_records(&output_from_file, &output_from_pipe);
 }
 
+/// Single-threaded `simplex` (no `--threads`) must read stdin exactly once.
+/// The single-threaded path previously pre-sniffed SAM-vs-BAM via `InputSource`
+/// (consuming stdin) and then re-opened the input, so `-i -` failed outright and
+/// `-i /dev/stdin` silently dropped the leading bytes. The multi-threaded test
+/// above does not exercise this path — which is why the double-open shipped.
+/// Reading the same grouped BAM from a file vs piped stdin must yield
+/// byte-identical consensus records.
+#[test]
+fn test_simplex_single_threaded_reads_stdin_once() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_from_file = temp_dir.path().join("output_file.bam");
+    let output_from_pipe = temp_dir.path().join("output_pipe.bam");
+
+    create_grouped_test_bam(&input_bam);
+
+    // Baseline: single-threaded (no `--threads`) from a file.
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "simplex",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_from_file.to_str().unwrap(),
+            "--min-reads",
+            "1",
+            "--min-consensus-base-quality",
+            "0",
+            "--compression-level",
+            "1",
+        ])
+        .status()
+        .expect("Failed to run single-threaded simplex with file input");
+    assert!(status.success(), "single-threaded simplex with file input failed");
+
+    // Piped: `cat grouped.bam | fgumi simplex -i -` (single-threaded).
+    let cat_child = Command::new("cat")
+        .arg(input_bam.to_str().unwrap())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn cat");
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "simplex",
+            "--input",
+            "-",
+            "--output",
+            output_from_pipe.to_str().unwrap(),
+            "--min-reads",
+            "1",
+            "--min-consensus-base-quality",
+            "0",
+            "--compression-level",
+            "1",
+        ])
+        .stdin(cat_child.stdout.unwrap())
+        .status()
+        .expect("Failed to run single-threaded simplex with piped input");
+    assert!(
+        status.success(),
+        "single-threaded simplex with piped input failed (stdin double-open regression?)"
+    );
+
+    compare_bam_records(&output_from_file, &output_from_pipe);
+}
+
+/// SAM (non-BGZF) input to the single-threaded codec/simplex/duplex paths must
+/// fail at the header read with a `--threads` hint — those paths are BAM-only,
+/// and the multi-threaded path is the SAM-capable one. Guards the `with_context`
+/// message that replaced the removed SAM pre-sniff (codec/simplex) and the
+/// matching hint added to duplex.
+#[test]
+fn test_single_threaded_consensus_rejects_sam_with_threads_hint() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let bam = temp_dir.path().join("grouped.bam");
+    let sam = temp_dir.path().join("grouped.sam");
+    create_grouped_test_bam(&bam);
+    convert_bam_to_sam(&bam, &sam);
+    let input = sam.to_str().unwrap();
+
+    // Per-command minimal args; each runs single-threaded (no `--threads`).
+    let extra_args: [(&str, &[&str]); 3] = [
+        ("codec", &["--min-reads", "1", "--min-duplex-length", "1"]),
+        ("simplex", &["--min-reads", "1"]),
+        ("duplex", &["--min-reads", "1"]),
+    ];
+    for (cmd, extra) in extra_args {
+        let out = temp_dir.path().join(format!("{cmd}_out.bam"));
+        let mut args: Vec<&str> = vec![
+            cmd,
+            "--input",
+            input,
+            "--output",
+            out.to_str().unwrap(),
+            "--compression-level",
+            "1",
+        ];
+        args.extend_from_slice(extra);
+        let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+            .args(&args)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn {cmd}: {e}"));
+        assert!(!output.status.success(), "single-threaded {cmd} must reject SAM input");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--threads"),
+            "single-threaded {cmd} SAM error should hint at --threads; stderr: {stderr}"
+        );
+    }
+}
+
+/// `--async-reader` over stdin must spawn the prefetch thread (the stdin branch
+/// of `open_bgzf_reader` honors async like the file path) and still read the
+/// input correctly — file vs piped output must match.
+#[test]
+fn test_simplex_single_threaded_async_reader_over_stdin() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_from_file = temp_dir.path().join("output_file.bam");
+    let output_from_pipe = temp_dir.path().join("output_pipe.bam");
+    create_grouped_test_bam(&input_bam);
+
+    // Baseline: single-threaded + --async-reader from a file.
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "simplex",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_from_file.to_str().unwrap(),
+            "--min-reads",
+            "1",
+            "--min-consensus-base-quality",
+            "0",
+            "--compression-level",
+            "1",
+            "--async-reader",
+        ])
+        .status()
+        .expect("Failed to run async-reader simplex with file input");
+    assert!(status.success(), "async-reader simplex from file failed");
+
+    // Piped: `cat grouped.bam | fgumi simplex -i - --async-reader` (single-threaded).
+    let cat_child = Command::new("cat")
+        .arg(input_bam.to_str().unwrap())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn cat");
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "simplex",
+            "--input",
+            "-",
+            "--output",
+            output_from_pipe.to_str().unwrap(),
+            "--min-reads",
+            "1",
+            "--min-consensus-base-quality",
+            "0",
+            "--compression-level",
+            "1",
+            "--async-reader",
+        ])
+        .stdin(cat_child.stdout.unwrap())
+        .status()
+        .expect("Failed to run async-reader simplex with piped input");
+    assert!(
+        status.success(),
+        "async-reader simplex from stdin failed (prefetch-on-stdin regression?)"
+    );
+
+    compare_bam_records(&output_from_file, &output_from_pipe);
+}
+
 /// Convert a BAM file to a parallel SAM text file containing the same
 /// records. Lets `fgumi group --input foo.sam` reuse the same record
 /// set as the BAM-input baseline for parity tests.
