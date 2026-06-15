@@ -46,6 +46,38 @@ fn create_consensus_bam(path: &Path, records: Vec<RawRecord>) {
     writer.try_finish().expect("Failed to finish BAM");
 }
 
+/// Write a minimal BAM of two mapped consensus reads (with `CD`/`CE` per-base
+/// tags) that pass `fgumi filter --min-reads 1 --max-no-call-fraction 1.0`.
+/// Shared with the stdin-coverage tests so they exercise filter non-vacuously.
+/// Mirrors the input built inline by `test_filter_command_basic`.
+pub(crate) fn write_filter_consensus_bam(path: &Path) {
+    let r1 = {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"cons1")
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .sequence(b"ACGTACGT")
+            .qualities(&[35; 8]);
+        b.add_array_u16(SamTag::CD_BASES, &[10; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
+        b.build()
+    };
+    let r2 = {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"cons2")
+            .ref_id(0)
+            .pos(199)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .sequence(b"ACGTACGT")
+            .qualities(&[35; 8]);
+        b.add_array_u16(SamTag::CD_BASES, &[5; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
+        b.build()
+    };
+    create_consensus_bam(path, vec![r1, r2]);
+}
+
 /// Test basic filter command with passing reads.
 #[test]
 fn test_filter_command_basic() {
