@@ -1393,16 +1393,18 @@ impl RawExternalSorter {
              queryname / template-coordinate streaming entry points are forthcoming",
             self.sort_order,
         );
+        self.ensure_spill_codec_compat()?;
 
-        // Force BGZF: the streaming merge's `SortSpillDecompress` reads spill
-        // chunks as raw BGZF blocks, so the spill codec must be BGZF regardless
-        // of `self.spill_codec` (which defaults to zstd). Enforced here so this
-        // public constructor can't hand the decoder slots it can't read.
+        // Spill codec from config (zstd by default, the same fast codec
+        // standalone sort uses). `SortSpillDecompress` is codec-aware — it
+        // detects each spill chunk's codec from its file magic (see
+        // `slots_for_chunk_files`) and dispatches accordingly — so the streaming
+        // path no longer has to pin BGZF.
         let pool = Arc::new(SortWorkerPool::new(
             self.threads.max(1),
             self.temp_compression,
             self.output_compression,
-            crate::codec::SpillCodec::Bgzf,
+            self.spill_codec,
         ));
         // Phase 1 is the steady-state ingest mode for incoming records.
         pool.set_phase(crate::worker_pool::phase::PHASE1);
@@ -1465,14 +1467,15 @@ impl RawExternalSorter {
             "into_template_coordinate_stream requires SortOrder::TemplateCoordinate (got {:?})",
             self.sort_order,
         );
+        self.ensure_spill_codec_compat()?;
 
-        // Force BGZF (see `into_coordinate_stream`): the streaming decoder only
-        // reads raw BGZF spill blocks, so override `self.spill_codec`.
+        // Spill codec from config (see `into_coordinate_stream`): the streaming
+        // decoder is codec-aware, so honor `self.spill_codec` (zstd default).
         let pool = Arc::new(SortWorkerPool::new(
             self.threads.max(1),
             self.temp_compression,
             self.output_compression,
-            crate::codec::SpillCodec::Bgzf,
+            self.spill_codec,
         ));
         pool.set_phase(crate::worker_pool::phase::PHASE1);
 
@@ -1853,16 +1856,17 @@ impl RawExternalSorter {
         Ok(())
     }
 
-    /// Sort a BAM file using raw-bytes approach.
+    /// Reject `temp_compression == 0` combined with `SpillCodec::Zstd`: zstd has
+    /// no level-0 "stored" mode, so silently remapping to 1 would surprise
+    /// callers who set `temp_compression(0)` expecting an uncompressed spill
+    /// (which works for BGZF). Called by `sort()` and by every streaming entry
+    /// point (`into_*_stream`) so neither the standalone nor the fused path can
+    /// reach a misconfigured pool.
     ///
     /// # Errors
     ///
-    /// Returns an error if reading, sorting, or writing the BAM file fails.
-    pub fn sort(&self, input: &Path, output: &Path) -> Result<RawSortStats> {
-        // zstd has no level-0 "stored" mode; silently remapping to 1 would
-        // surprise API callers who set temp_compression(0) expecting an
-        // uncompressed spill (which works for BGZF). Mirror the CLI guard so
-        // direct RawExternalSorter callers cannot reach a misconfigured pool.
+    /// Returns an error if `temp_compression == 0` and the spill codec is zstd.
+    fn ensure_spill_codec_compat(&self) -> Result<()> {
         anyhow::ensure!(
             !(self.temp_compression == 0
                 && matches!(self.spill_codec, crate::codec::SpillCodec::Zstd)),
@@ -1871,6 +1875,18 @@ impl RawExternalSorter {
              spill_codec(SpillCodec::Bgzf) to keep level-0 spill, or pick a \
              zstd level >= 1."
         );
+        Ok(())
+    }
+
+    /// Sort a BAM file using raw-bytes approach.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading, sorting, or writing the BAM file fails.
+    pub fn sort(&self, input: &Path, output: &Path) -> Result<RawSortStats> {
+        // Mirror the CLI guard so direct RawExternalSorter callers cannot reach
+        // a misconfigured pool.
+        self.ensure_spill_codec_compat()?;
 
         debug!("Starting raw-bytes sort with order: {:?}", self.sort_order);
         debug!("Memory limit: {} MB", self.memory_limit / (1024 * 1024));
@@ -3497,12 +3513,31 @@ fn slots_for_chunk_files(chunk_files: &[std::path::PathBuf]) -> Result<Vec<Arc<S
         .iter()
         .enumerate()
         .map(|(idx, path)| {
-            let file = std::fs::File::open(path)
+            let mut file = std::fs::File::open(path)
                 .with_context(|| format!("failed to open spill chunk {}", path.display()))?;
+            // Detect the spill codec from the file magic. For zstd ("ZSP1") the
+            // 4-byte magic is consumed here, leaving the reader at the first
+            // `[len][frame]` record; for BGZF the `1f 8b` is part of the first
+            // block, so rewind to byte 0. `SortSpillDecompress` reads
+            // `slot.codec` to decompress accordingly.
+            let mut magic = [0u8; 4];
+            let filled = read_exact_or_eof(&mut file, &mut magic)
+                .with_context(|| format!("failed to read spill chunk magic {}", path.display()))?;
+            let codec = if filled {
+                crate::codec::SpillCodec::from_magic(&magic)
+                    .unwrap_or(crate::codec::SpillCodec::Bgzf)
+            } else {
+                crate::codec::SpillCodec::Bgzf
+            };
+            if matches!(codec, crate::codec::SpillCodec::Bgzf) {
+                use std::io::Seek;
+                file.seek(std::io::SeekFrom::Start(0))
+                    .with_context(|| format!("failed to rewind spill chunk {}", path.display()))?;
+            }
             let reader = std::io::BufReader::new(file);
             let file_id = u32::try_from(idx)
                 .with_context(|| format!("spill file_id {idx} exceeds u32::MAX"))?;
-            Ok(Arc::new(SortMergeSlot::new(file_id, reader)))
+            Ok(Arc::new(SortMergeSlot::new(file_id, reader, codec)))
         })
         .collect()
 }
@@ -3904,13 +3939,15 @@ impl<K: RawSortKey + Default + 'static> QuerynameSortStreamGeneric<K> {
     fn new_from_sorter(sorter: RawExternalSorter, header: &Header) -> Result<Self> {
         use crate::keys::SortContext;
 
-        // Force BGZF (see `into_coordinate_stream`): the streaming decoder only
-        // reads raw BGZF spill blocks, so override `sorter.spill_codec`.
+        sorter.ensure_spill_codec_compat()?;
+
+        // Spill codec from config (see `into_coordinate_stream`): the streaming
+        // decoder is codec-aware, so honor `sorter.spill_codec` (zstd default).
         let pool = Arc::new(SortWorkerPool::new(
             sorter.threads.max(1),
             sorter.temp_compression,
             sorter.output_compression,
-            crate::codec::SpillCodec::Bgzf,
+            sorter.spill_codec,
         ));
         pool.set_phase(crate::worker_pool::phase::PHASE1);
 
@@ -5168,6 +5205,43 @@ mod tests {
             "unexpected error: {msg}"
         );
         assert!(!output.exists(), "no output should be produced on validation failure");
+    }
+
+    /// The streaming entry points must reject `temp_compression=0` + zstd too,
+    /// not just `sort()` — otherwise the fused pipeline path (which builds the
+    /// sorter then calls `into_*_stream`) could reach a misconfigured pool that
+    /// `sort()` would have refused. Header is irrelevant: the guard fires before
+    /// any pool/temp-dir work.
+    #[test]
+    fn test_streaming_entry_points_reject_temp_compression_zero_with_zstd() {
+        use noodles::sam::Header;
+
+        let header = Header::default();
+
+        for sort_order in [
+            SortOrder::Coordinate,
+            SortOrder::TemplateCoordinate,
+            SortOrder::Queryname(crate::keys::QuerynameComparator::Lexicographic),
+        ] {
+            let sorter = RawExternalSorter::new(sort_order)
+                .spill_codec(crate::codec::SpillCodec::Zstd)
+                .temp_compression(0);
+            let err = match sort_order {
+                SortOrder::Coordinate => sorter.into_coordinate_stream(&header).err(),
+                SortOrder::TemplateCoordinate => {
+                    sorter.into_template_coordinate_stream(&header).err()
+                }
+                SortOrder::Queryname(_) => sorter.into_queryname_stream(&header).err(),
+            }
+            .unwrap_or_else(|| {
+                panic!("{sort_order:?} stream should reject temp_compression=0 + zstd")
+            });
+            assert!(
+                err.to_string()
+                    .contains("temp_compression=0 is only supported with SpillCodec::Bgzf"),
+                "unexpected error for {sort_order:?}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -7215,6 +7289,7 @@ mod from_slots_merge_tests {
         let slot = StdArc::new(SortMergeSlot::new(
             file_id,
             BufReader::new(tempfile::tempfile().expect("tempfile")),
+            crate::codec::SpillCodec::Bgzf,
         ));
         {
             let mut dec = slot.decompressed.lock().unwrap();
@@ -7312,6 +7387,7 @@ mod from_slots_merge_tests {
         let empty_slot = StdArc::new(SortMergeSlot::new(
             0,
             BufReader::new(tempfile::tempfile().expect("tempfile")),
+            crate::codec::SpillCodec::Bgzf,
         ));
         // Mark drained without inserting any blocks.
         empty_slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
@@ -7332,6 +7408,7 @@ mod from_slots_merge_tests {
         let slot = StdArc::new(SortMergeSlot::new(
             0,
             BufReader::new(tempfile::tempfile().expect("tempfile")),
+            crate::codec::SpillCodec::Bgzf,
         ));
         // Empty queue, NOT eof — the producer is "still feeding".
         let mut driver =
@@ -7370,6 +7447,7 @@ mod from_slots_merge_tests {
         let slot = StdArc::new(SortMergeSlot::new(
             0,
             BufReader::new(tempfile::tempfile().expect("tempfile")),
+            crate::codec::SpillCodec::Bgzf,
         ));
         // One record present, NOT eof (more "coming").
         {
@@ -7420,6 +7498,7 @@ mod from_slots_merge_tests {
         let slot = StdArc::new(SortMergeSlot::new(
             0,
             BufReader::new(tempfile::tempfile().expect("tempfile")),
+            crate::codec::SpillCodec::Bgzf,
         ));
         slot.decompressed.lock().unwrap().push_back(vec![serialized[0]]);
 
@@ -7464,6 +7543,7 @@ mod from_slots_merge_tests {
         let slot = StdArc::new(SortMergeSlot::new(
             0,
             BufReader::new(tempfile::tempfile().expect("tempfile")),
+            crate::codec::SpillCodec::Bgzf,
         ));
         slot.decompressed.lock().unwrap().push_back(head.to_vec());
 
@@ -7589,6 +7669,7 @@ mod from_slots_merge_tests {
         let slot = StdArc::new(SortMergeSlot::new(
             file_id,
             BufReader::new(tempfile::tempfile().expect("tempfile")),
+            crate::codec::SpillCodec::Bgzf,
         ));
         {
             let mut dec = slot.decompressed.lock().unwrap();
@@ -7651,6 +7732,7 @@ mod from_slots_merge_tests {
         let empty_slot = StdArc::new(SortMergeSlot::new(
             99,
             BufReader::new(tempfile::tempfile().expect("tempfile")),
+            crate::codec::SpillCodec::Bgzf,
         ));
         empty_slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
         // Insert empty-slot first, then a populated slot. The driver should
