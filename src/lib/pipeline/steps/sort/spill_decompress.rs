@@ -1,6 +1,7 @@
-//! `SortSpillDecompress` — Parallel typed step that reads raw BGZF
-//! blocks from spill files, decompresses them inline, and pushes the
-//! decompressed bytes into per-slot bounded queues on
+//! `SortSpillDecompress` — Parallel typed step that reads spill chunk
+//! files, decompresses them inline (codec-aware: BGZF blocks or zstd
+//! frames per `slot.codec`, detected from the file magic at slot-open),
+//! and pushes the decompressed bytes into per-slot bounded queues on
 //! `SortMergeSlot`. Replaces the legacy +N `SortWorkerPool::Phase2`
 //! OS threads with framework workers from the unified pipeline's
 //! work-stealing pool.
@@ -47,8 +48,7 @@
 use std::io;
 use std::sync::Arc;
 
-use fgumi_sort::{PHASE2_DECOMP_CAP, SortMergeSlot};
-use libdeflater::Decompressor;
+use fgumi_sort::{PHASE2_DECOMP_CAP, SortMergeSlot, SpillBlockDecompressor};
 use parking_lot::Mutex;
 
 use crate::pipeline::core::Unpushed;
@@ -58,10 +58,6 @@ use crate::pipeline::core::queues::QueueSpec;
 use crate::pipeline::core::reorder::BranchOrdering;
 use crate::pipeline::core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
 use crate::pipeline::steps::sort::protocol::{SortPhase1Event, SortPhase2Event};
-
-/// Per-worker decompression scratch capacity. Matches `BgzfDecompress`'s
-/// constant for the same mimalloc-size-class reuse pattern.
-const DECOMPRESS_SCRATCH_CAPACITY: usize = 256 * 1024;
 
 /// Max raw blocks read+decompressed by a single `try_fill_some_slot`
 /// call. Bounds the per-call work so the framework's round-robin
@@ -89,20 +85,18 @@ struct RegisteredSpill {
 ///
 /// Per-worker:
 ///
-/// * `decompressor: libdeflater::Decompressor` — fresh per worker
-///   copy (constructed in `new_worker_copy`).
-/// * `decompress_scratch: Vec<u8>` — fixed-capacity output buffer
-///   that `decompress_block_slice_into` fills; we `mem::replace` the
-///   filled `Vec` into the per-slot queue then re-allocate fresh.
-///   Mimalloc size-class reuse trick (same as `BgzfDecompress`).
+/// * `block_dec: SpillBlockDecompressor` — fresh per worker copy; the
+///   codec-aware (BGZF block / zstd frame) decompressor that reads +
+///   inflates a batch of blocks and returns owned `Vec<u8>`s for the
+///   per-slot queue (mimalloc size-class buffer reuse inside).
 /// * `held: HeldSlot<Unpushed<SortPhase2Event>>` — backpressure retry
 ///   slot for the forwarded events (`SpillReady`/`MemoryChunk`/
 ///   `AllAnnounced`). The per-slot decompressed queue handles its
 ///   own backpressure separately (producer SKIPs when at cap).
 pub struct SortSpillDecompress {
     registry: Arc<Mutex<Vec<RegisteredSpill>>>,
-    decompressor: Decompressor,
-    decompress_scratch: Vec<u8>,
+    /// Per-worker codec-aware decompressor (BGZF blocks or zstd frames).
+    block_dec: SpillBlockDecompressor,
     held: HeldSlot<Unpushed<SortPhase2Event>>,
     /// Max in-flight forwarded events. `SortSpillDecompress` emits at
     /// most one event per `try_run` (forward from input pop). 64
@@ -116,8 +110,7 @@ impl SortSpillDecompress {
     pub fn new(output_capacity: usize) -> Self {
         Self {
             registry: Arc::new(Mutex::new(Vec::new())),
-            decompressor: Decompressor::new(),
-            decompress_scratch: Vec::with_capacity(DECOMPRESS_SCRATCH_CAPACITY),
+            block_dec: SpillBlockDecompressor::new(),
             held: HeldSlot::new(),
             output_capacity,
         }
@@ -195,75 +188,37 @@ impl SortSpillDecompress {
             }
             let m = m.min(MAX_BATCH_PER_CALL);
 
-            // Read up to m raw BGZF blocks from disk. `read_raw_blocks`
-            // returns fewer than requested at EOF.
+            // Read + decompress up to m blocks from disk, codec-aware: BGZF
+            // self-framed blocks or zstd `[len][frame]` records, per `slot.codec`
+            // (detected from the file magic at slot-open). `read_blocks` returns
+            // fewer than `m` (incl. 0) at EOF.
             //
-            // **We hold `reader_guard` through decompression + push**
+            // **We hold `reader_guard` through the whole read+decompress + push**
             // for this batch — NOT just through the read. This is the
-            // "I'm the producer for this slot" lock: while held, no
-            // sibling worker can claim this slot, read another batch,
-            // and prematurely set `queue_eof` while our batch is
-            // still in flight. Releasing the reader before
-            // decompression would let a sibling worker see an empty
-            // read on a slot we'd already exhausted and set
-            // `queue_eof` before our batch lands — silently dropping
-            // our decompressed records.
+            // "I'm the producer for this slot" lock: while held, no sibling
+            // worker can claim this slot, read another batch, and prematurely set
+            // `queue_eof` while our batch is still in flight. Releasing the reader
+            // before decompression would let a sibling worker see an empty read on
+            // a slot we'd already exhausted and set `queue_eof` before our batch
+            // lands — silently dropping our decompressed records.
             //
-            // Cost: less per-slot parallelism (one worker
-            // decompresses per slot at a time). Cross-slot
-            // parallelism preserved — different workers handle
-            // different slots.
-            let raw_blocks = match fgumi_bgzf::reader::read_raw_blocks(&mut reader_guard.inner, m) {
-                Ok(v) => v,
-                Err(e) => {
-                    // Mark the slot as errored + EOF so the consumer
-                    // exits cleanly with Err. Release the reader
-                    // first to avoid lock-order issues.
-                    drop(reader_guard);
-                    {
-                        let _g = slot.decompressed.lock().expect("decompressed mutex poisoned");
-                        slot.decomp_error.store(true, std::sync::atomic::Ordering::Release);
-                        slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
-                    }
-                    return Err(e);
-                }
-            };
-            let got = raw_blocks.len();
-            let hit_eof = got < m;
-
-            if got == 0 {
-                // Empty read at EOF. Set queue_eof under the
-                // decompressed lock (still holding reader so no
-                // sibling can race).
-                {
-                    let _g = slot.decompressed.lock().expect("decompressed mutex poisoned");
-                    slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
-                }
-                drop(reader_guard);
-                return Ok(true);
-            }
-
-            // Decompress all `got` blocks on this worker.
-            let mut decompressed_batch: Vec<Vec<u8>> = Vec::with_capacity(got);
-            for raw in raw_blocks {
-                let decompress_result = fgumi_bgzf::reader::decompress_block_slice_into(
-                    &raw.data,
-                    &mut self.decompressor,
-                    &mut self.decompress_scratch,
-                );
-                match decompress_result {
-                    Ok(()) => {
-                        let bytes = std::mem::replace(
-                            &mut self.decompress_scratch,
-                            Vec::with_capacity(DECOMPRESS_SCRATCH_CAPACITY),
-                        );
-                        decompressed_batch.push(bytes);
-                    }
+            // Cost: less per-slot parallelism (one worker decompresses per slot
+            // at a time). Cross-slot parallelism preserved — different workers
+            // handle different slots.
+            let decompressed_batch =
+                match self.block_dec.read_blocks(&mut reader_guard.inner, slot.codec, m) {
+                    Ok(b) => b,
                     Err(e) => {
-                        // Atomic-ordering: hold decompressed lock while
-                        // setting both atomics so consumer sees a
-                        // consistent view via the lock release-acquire
-                        // chain.
+                        // Mark the slot as errored + EOF so the consumer exits
+                        // cleanly with Err. Hold `reader_guard` through the flag
+                        // block (lock order: reader → decompressed, same as the
+                        // success paths below) and drop it AFTER. Dropping the
+                        // reader first would let a sibling worker claim the slot,
+                        // read a clean EOF, and set `queue_eof` WITHOUT
+                        // `decomp_error` in the window — which the consumer (checks
+                        // `decomp_error` then `queue_eof`) would see as a clean
+                        // drain, silently dropping this error and the records after
+                        // it.
                         {
                             let _g = slot.decompressed.lock().expect("decompressed mutex poisoned");
                             slot.decomp_error.store(true, std::sync::atomic::Ordering::Release);
@@ -272,7 +227,19 @@ impl SortSpillDecompress {
                         drop(reader_guard);
                         return Err(e);
                     }
+                };
+            let got = decompressed_batch.len();
+            let hit_eof = got < m;
+
+            if got == 0 {
+                // Empty read at EOF. Set queue_eof under the decompressed lock
+                // (still holding reader so no sibling can race).
+                {
+                    let _g = slot.decompressed.lock().expect("decompressed mutex poisoned");
+                    slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
                 }
+                drop(reader_guard);
+                return Ok(true);
             }
 
             // Push all decompressed blocks under one decompressed-lock
@@ -302,8 +269,7 @@ impl Clone for SortSpillDecompress {
             // the registry so SpillReady popped by any worker is
             // immediately visible to all others.
             registry: Arc::clone(&self.registry),
-            decompressor: Decompressor::new(),
-            decompress_scratch: Vec::with_capacity(DECOMPRESS_SCRATCH_CAPACITY),
+            block_dec: SpillBlockDecompressor::new(),
             held: HeldSlot::new(),
             output_capacity: self.output_capacity,
         }
