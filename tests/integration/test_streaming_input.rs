@@ -929,13 +929,56 @@ fn s(v: &str) -> String {
     v.to_string()
 }
 
-// NOTE: `sort` is intentionally NOT covered here — it does not currently
-// support stdin input. Its terminal-sort path uses a file-to-file
-// `RawExternalSorter` (`SortBamFile`) that reads the input path directly and
-// double-reads the header, so a stdin stream is drained/empty by the second
-// read; input validation also rejects `-`/`/dev/stdin` outright. Supporting
-// stdin requires refactoring the external sorter to consume the stream once
-// (tracked separately).
+#[rstest]
+#[case("1")]
+#[case("2")]
+fn test_sort_reads_stdin_once(#[case] threads: &str) {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("input.bam");
+    create_test_input_bam(&input);
+    assert_stdin_input_parity(&input, dir.path(), "sort", |i, o| {
+        vec![
+            s("sort"),
+            s("--input"),
+            s(i),
+            s("--output"),
+            s(o),
+            s("--order"),
+            s("coordinate"),
+            s("--threads"),
+            s(threads),
+            s("--compression-level"),
+            s("1"),
+        ]
+    });
+}
+
+/// `sort --verify` reads its input twice (header probe + a fresh record
+/// re-scan), which a non-seekable stdin stream can't satisfy, so it must be
+/// rejected up front with a clear message rather than failing deep in a
+/// re-open. (Plain `sort` streams stdin once and IS supported — above.)
+#[test]
+fn test_sort_verify_rejects_stdin_with_clear_message() {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("input.bam");
+    create_test_input_bam(&input);
+    let cat = Command::new("cat")
+        .arg(input.to_str().unwrap())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn cat");
+    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args(["sort", "--verify", "--input", "-", "--order", "coordinate"])
+        .stdin(cat.stdout.unwrap())
+        .output()
+        .expect("run sort --verify -i -");
+    assert!(!output.status.success(), "sort --verify from stdin must be rejected");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("stdin"),
+        "sort --verify stdin rejection should mention stdin; stderr: {stderr}"
+    );
+}
 
 /// Push `--threads <n>` only when `threads` is `Some`; `None` exercises a
 /// command's single-threaded fast path (where it has one).

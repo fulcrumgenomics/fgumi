@@ -328,8 +328,23 @@ impl<'a> ChainBuilder<'a> {
         let tuning = BamPipelineTuning::auto_tuned(num_threads)
             .with_compression_level(spec.compression.compression_level);
 
-        let (raw_header, pending_source) = Self::open_source(spec)?;
-        let header = crate::commands::common::add_pg_record(raw_header, &spec.command_line)?;
+        // Standalone sort (`[Stage::Sort]`) is special: `build_for` skips
+        // `add_source`/`add_sink`, and the terminal `SortBamFile` step opens
+        // and reads the input (header included) itself via the sort engine.
+        // Opening the source here would be wasted work — and for a stdin input
+        // it would drain the pipe before `SortBamFile` reads it, leaving the
+        // engine to fail on an empty stdin. The header resolved here is unused
+        // by the sort-terminal branch, so skip the open entirely.
+        let sort_terminal = matches!(spec.stages.as_slice(), [Stage::Sort]);
+        let (header, pending_source) = if sort_terminal {
+            (Header::default(), None)
+        } else {
+            let (raw_header, pending_source) = Self::open_source(spec)?;
+            (
+                crate::commands::common::add_pg_record(raw_header, &spec.command_line)?,
+                pending_source,
+            )
+        };
 
         Ok(Self {
             spec,
