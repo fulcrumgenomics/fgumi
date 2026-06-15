@@ -1819,7 +1819,7 @@ impl<'a> ChainBuilder<'a> {
     /// [`SortBamFile`]: crate::pipeline::steps::sort::SortBamFile
     #[allow(clippy::too_many_lines)]
     fn add_sort(&mut self, position: StagePosition) -> Result<()> {
-        use crate::commands::sort::{MemoryLimit, resolve_memory_limit};
+        use crate::commands::common::{MemoryLimit, resolve_memory_budget};
         use crate::pipeline::chains::commands::sort::{
             IndexBamFinalizeHook, SortFinalizeHook, SortStepCaptures, build_sort_step,
             log_sort_start, sort_sink_path, sort_source_path,
@@ -1846,7 +1846,7 @@ impl<'a> ChainBuilder<'a> {
 
             let num_sorter_threads = self.spec.threading.num_threads();
 
-            let effective_memory = resolve_memory_limit(
+            let effective_memory = resolve_memory_budget(
                 sort.max_memory,
                 sort.memory_reserve,
                 num_sorter_threads,
@@ -1945,18 +1945,23 @@ impl<'a> ChainBuilder<'a> {
             use fgumi_sort::{RawExternalSorter, SortOrder};
             use noodles::sam::alignment::record::data::field::Tag;
 
-            let memory_per_thread = match sort.max_memory {
-                MemoryLimit::Fixed(b) => b,
-                MemoryLimit::Auto => bail!(
+            // Auto isn't supported in a fused chain (sort shares the budget with
+            // the other stages); require a fixed value.
+            if matches!(sort.max_memory, MemoryLimit::Auto) {
+                bail!(
                     "--sort::max-memory=auto is not supported in a fused multi-stage pipeline \
                      (sort is not standalone); pass a fixed value (e.g. --sort::max-memory 768M)"
-                ),
-            };
-
+                );
+            }
             let num_threads = self.spec.threading.num_threads();
-            let total_memory = memory_per_thread
-                .checked_mul(num_threads.max(1))
-                .ok_or_else(|| anyhow!("--sort::max-memory × --threads overflowed"))?;
+            // Reuse the same helper as the standalone path so `--sort::memory-per-thread`
+            // is honored (the previous inline `× num_threads` ignored it).
+            let total_memory = resolve_memory_budget(
+                sort.max_memory,
+                sort.memory_reserve,
+                num_threads,
+                sort.memory_per_thread,
+            )?;
 
             let sort_order = SortOrder::TemplateCoordinate;
             // NB: the spill codec is pinned to BGZF inside `build_stream`

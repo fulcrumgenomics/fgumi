@@ -546,36 +546,289 @@ impl ThreadingOptions {
     }
 }
 
+//////////////////////////////////////////////////////////////////////////////
+// Shared memory-budget types
+//
+// `--max-memory` / `--memory-reserve` are used both by `fgumi sort` (to bound
+// the in-memory sort buffer before spilling to disk) and by every pipeline
+// command via [`QueueMemoryOptions`] (to bound the inter-stage pipeline queue).
+// The types, parsers, and resolution logic live here so the two surfaces stay
+// in lockstep.
+//////////////////////////////////////////////////////////////////////////////
+
+/// A memory limit, either auto-detected from the host or a fixed byte count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryLimit {
+    /// Detect the (cgroup-aware) host memory and subtract the reserve.
+    Auto,
+    /// Use a fixed memory limit in bytes.
+    Fixed(usize),
+}
+
+impl Default for MemoryLimit {
+    /// Matches the clap `default_value = "768MiB"` on `SortOptions::max_memory`.
+    fn default() -> Self {
+        Self::Fixed(768 * 1024 * 1024)
+    }
+}
+
+impl std::fmt::Display for MemoryLimit {
+    /// Round-trips through [`parse_memory`]. `Fixed(N)` is rendered in the
+    /// largest binary unit that divides cleanly (`GiB` → `MiB` → `KiB` → `B`)
+    /// so `--help` shows e.g. `"768MiB"` rather than `"805306368B"`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Fixed(bytes) => format_binary_bytes(*bytes, f),
+        }
+    }
+}
+
+/// How much memory to reserve for other processes (OS, aligners, etc.) when a
+/// memory limit is set to [`MemoryLimit::Auto`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryReserve {
+    /// Automatic: `min(10 GiB, 50% of host memory)`.
+    Auto,
+    /// Reserve a fixed number of bytes.
+    Fixed(usize),
+}
+
+impl Default for MemoryReserve {
+    /// Matches the clap `default_value = "auto"` on `SortOptions::memory_reserve`.
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl std::fmt::Display for MemoryReserve {
+    /// Round-trips through [`parse_memory_reserve`]. See [`MemoryLimit`]'s
+    /// `Display` for the formatting rule.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Fixed(bytes) => format_binary_bytes(*bytes, f),
+        }
+    }
+}
+
+/// Format a byte count in the largest binary unit that divides cleanly
+/// (`G` → `M` → `K` → `B`). Used by [`MemoryLimit`]'s and [`MemoryReserve`]'s
+/// `Display` so that [`parse_memory`] / [`parse_memory_reserve`] round-trip the
+/// result.
+fn format_binary_bytes(bytes: usize, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    const K: usize = 1024;
+    const M: usize = K * 1024;
+    const G: usize = M * 1024;
+    // Emit binary (Mi/Gi) suffixes: `parse_memory` reads bare `M`/`G` as
+    // *decimal* (1000ⁿ) and only `MiB`/`GiB` as binary (1024ⁿ), so a bare
+    // suffix here would not round-trip a binary value.
+    if bytes >= G && bytes.is_multiple_of(G) {
+        write!(f, "{}GiB", bytes / G)
+    } else if bytes >= M && bytes.is_multiple_of(M) {
+        write!(f, "{}MiB", bytes / M)
+    } else if bytes >= K && bytes.is_multiple_of(K) {
+        write!(f, "{}KiB", bytes / K)
+    } else {
+        write!(f, "{bytes}B")
+    }
+}
+
+/// The minimum per-thread memory budget (256 MiB).
+pub(crate) const MIN_MEMORY_PER_THREAD: usize = 256 * 1024 * 1024;
+
+/// Default auto-reserve cap: 10 GiB.
+pub(crate) const AUTO_RESERVE_CAP: usize = 10 * 1024 * 1024 * 1024;
+
+/// Parse a memory size string into `usize` bytes, suitable for use in clap
+/// value parsers.
+///
+/// Delegates to [`parse_memory_size`] for numeric parsing. Plain numbers are
+/// interpreted as MiB (e.g. "768" = 768 MiB). Supports human-readable formats
+/// like "2GB", "1GiB", "512MiB". See [`parse_memory_size`] for full details.
+fn parse_memory_bytes(s: &str, label: &str) -> Result<usize, String> {
+    let bytes = parse_memory_size(s).map_err(|e| e.to_string())?;
+    usize::try_from(bytes).map_err(|_| format!("{label} too large: {bytes}"))
+}
+
+/// Parse a memory-limit string (e.g. "512M", "1G", "768", "auto").
+pub(crate) fn parse_memory(s: &str) -> Result<MemoryLimit, String> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("auto") {
+        return Ok(MemoryLimit::Auto);
+    }
+    Ok(MemoryLimit::Fixed(parse_memory_bytes(s, "Memory size")?))
+}
+
+/// Parse a memory-reserve string (e.g. "10G", "auto").
+pub(crate) fn parse_memory_reserve(s: &str) -> Result<MemoryReserve, String> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("auto") {
+        return Ok(MemoryReserve::Auto);
+    }
+    Ok(MemoryReserve::Fixed(parse_memory_bytes(s, "Memory reserve")?))
+}
+
+/// Resolve a [`MemoryReserve`] to a concrete byte count given total host memory.
+pub(crate) fn resolve_reserve(reserve: MemoryReserve, total_memory: usize) -> usize {
+    match reserve {
+        MemoryReserve::Fixed(bytes) => bytes,
+        // min(10 GiB, 50% of host memory)
+        MemoryReserve::Auto => AUTO_RESERVE_CAP.min(total_memory / 2),
+    }
+}
+
+/// Resolve a memory budget to a concrete byte count.
+///
+/// For [`MemoryLimit::Auto`]: detects total host memory (cgroup-aware via
+/// [`detect_total_memory`]), subtracts the reserve, and—when `per_thread` is
+/// set—targets each thread's share with a 256 MiB floor. The result is then
+/// **capped to the available (post-reserve) memory**, so the floor can never
+/// push the total past what the host has. The reserve makes the budget shrink
+/// to fit the host, which is what lets pipeline commands self-throttle instead
+/// of OOM-ing.
+///
+/// For [`MemoryLimit::Fixed`]: multiplies by `threads` when `per_thread` is set;
+/// the reserve and host size are ignored.
+///
+/// Calls [`detect_total_memory`] exactly once (it invokes `sysinfo`, which is
+/// not free).
+pub(crate) fn resolve_memory_budget(
+    limit: MemoryLimit,
+    reserve: MemoryReserve,
+    threads: usize,
+    per_thread: bool,
+) -> anyhow::Result<usize> {
+    // Call once — detect_total_memory() invokes sysinfo, which is not free.
+    resolve_memory_budget_with_total(limit, reserve, threads, per_thread, detect_total_memory())
+}
+
+/// Pure resolver behind [`resolve_memory_budget`], with `total` (host memory)
+/// injected so the `Auto` math is unit-testable on simulated small hosts.
+fn resolve_memory_budget_with_total(
+    limit: MemoryLimit,
+    reserve: MemoryReserve,
+    threads: usize,
+    per_thread: bool,
+    total: usize,
+) -> anyhow::Result<usize> {
+    if threads == 0 {
+        anyhow::bail!("--threads must be at least 1");
+    }
+
+    let budget = match limit {
+        MemoryLimit::Fixed(bytes) => {
+            if per_thread {
+                bytes
+                    .checked_mul(threads)
+                    .ok_or_else(|| anyhow::anyhow!("memory limit × {threads} threads overflowed"))?
+            } else {
+                bytes
+            }
+        }
+        MemoryLimit::Auto => {
+            let margin = resolve_reserve(reserve, total);
+            let available = total.saturating_sub(margin);
+            // The per-thread floor is a *target*, not a guarantee. On a small
+            // host (or high thread count) the floor-based budget can exceed what
+            // is actually available; cap it to `available` so `auto` truly
+            // self-throttles instead of multiplying the floor past physical
+            // memory — the exact OOM this feature exists to prevent (#380).
+            let target = if per_thread {
+                (available / threads)
+                    .max(MIN_MEMORY_PER_THREAD)
+                    .checked_mul(threads)
+                    .ok_or_else(|| anyhow::anyhow!("auto memory budget overflowed"))?
+            } else {
+                available.max(MIN_MEMORY_PER_THREAD)
+            };
+            let budget = target.min(available);
+            if budget < target {
+                log::warn!(
+                    "Auto memory: capping budget to host-available {} (minimum viable target {} \
+                     exceeds it after reserve {}); throughput may drop but the run stays within memory",
+                    ByteSize(budget as u64),
+                    ByteSize(target as u64),
+                    ByteSize(margin as u64),
+                );
+            }
+            log::debug!(
+                "Auto memory: {} of {} ({}/thread × {} threads, reserve {})",
+                ByteSize(budget as u64),
+                ByteSize(total as u64),
+                ByteSize((budget / threads) as u64),
+                threads,
+                ByteSize(margin as u64),
+            );
+            budget
+        }
+    };
+
+    if budget > total {
+        log::warn!(
+            "Memory budget {} exceeds total host memory {}; this may cause OOM (or, for sort, earlier spill-to-disk)",
+            ByteSize(budget as u64),
+            ByteSize(total as u64),
+        );
+    }
+
+    Ok(budget)
+}
+
 /// Options for pipeline queue memory limits.
 ///
-/// Controls memory usage in pipeline queues to prevent out-of-memory conditions.
-/// Supports human-readable formats for better UX.
+/// Bounds the memory held in the pipeline's inter-stage queues so a command
+/// self-throttles instead of OOM-ing. Shared (via `#[command(flatten)]`) by
+/// every multi-threaded command, so the `--max-memory` surface matches
+/// `fgumi sort`.
+///
+/// `--max-memory` is the dominant *controllable* consumer; it is a budget, not
+/// a hard RSS cap — a single pathological position group is still processed
+/// whole, and each worker has transient working-set memory on top of the queue.
 #[derive(Debug, Clone, Args)]
 pub struct QueueMemoryOptions {
-    /// Pipeline queue memory limit per thread (default) or total.
+    /// Maximum memory for the pipeline queues.
     ///
-    /// Plain numbers are interpreted as MB. Also supports human-readable
-    /// formats like "2GB", "1.5GB", or "1024MiB".
-    /// When set, this value is per-thread by default, so with --threads 8 the
-    /// total is 8x it; pass --queue-memory-per-thread false for a fixed total.
+    /// When unset (the common case) the default is 768 MiB per thread — EXCEPT
+    /// a single-threaded run (`--threads 1` / `--threads` omitted), which uses
+    /// a small fixed total (a streaming footprint), since a lone worker doesn't
+    /// need per-thread parallel buffering. Pass "auto" to detect host memory
+    /// (cgroup-aware) and subtract --memory-reserve, so the budget shrinks to
+    /// fit the host and the command self-throttles instead of OOM-ing. Explicit
+    /// values like "512MiB", "1GiB", "4GiB" are per-thread when --memory-per-thread
+    /// is enabled (default); plain numbers are MiB. Note bare "M"/"G" are decimal
+    /// (1000ⁿ); "MiB"/"GiB" are binary (1024ⁿ). Mirrors `fgumi sort`'s --max-memory.
+    #[arg(long = "max-memory", value_parser = parse_memory)]
+    pub max_memory: Option<MemoryLimit>,
+
+    /// Memory to reserve for other processes when --max-memory=auto.
     ///
-    /// When unset (the common case), the default is 768 MB per thread —
-    /// EXCEPT a single-threaded run (`--threads 1` / `--threads` omitted),
-    /// which defaults to a small fixed total (a streaming footprint), since a
-    /// lone worker doesn't need per-thread parallel buffering. Pass an explicit
-    /// value to override this single-thread default.
-    #[arg(long = "queue-memory")]
+    /// "auto" (default) reserves min(10 GiB, 50% of host memory). Explicit
+    /// values like "10G", "8GiB" set a fixed reservation. Ignored when
+    /// --max-memory is an explicit value.
+    #[arg(long = "memory-reserve", default_value = "auto", value_parser = parse_memory_reserve)]
+    pub memory_reserve: MemoryReserve,
+
+    /// Scale the memory limit by thread count.
+    ///
+    /// When enabled (default), --max-memory is per thread, so total memory =
+    /// `max_memory` × threads. Disable for a fixed total budget regardless of
+    /// thread count (recommended on fixed-RAM hosts).
+    #[arg(long = "memory-per-thread", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    pub memory_per_thread: bool,
+
+    /// DEPRECATED: use --max-memory instead. Kept as a hidden alias; when set it
+    /// overrides --max-memory.
+    #[arg(long = "queue-memory", hide = true)]
     pub queue_memory: Option<String>,
 
-    /// Interpret --queue-memory as per-thread (true, default) or total (false).
-    ///
-    /// When true, total memory = queue-memory * threads. For example,
-    /// --queue-memory 768 with --threads 16 allocates 12 GB total.
-    /// Set to false for a fixed total memory budget regardless of thread count.
-    #[arg(long = "queue-memory-per-thread", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
-    pub queue_memory_per_thread: bool,
+    /// DEPRECATED: use --memory-per-thread instead. Hidden alias that overrides
+    /// --memory-per-thread when set.
+    #[arg(long = "queue-memory-per-thread", hide = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    pub queue_memory_per_thread: Option<bool>,
 
-    /// DEPRECATED: Use --queue-memory instead. Memory limit for pipeline queues in megabytes.
+    /// DEPRECATED: use --max-memory instead. Hidden alias for a fixed total
+    /// limit in megabytes.
     #[arg(long = "queue-memory-limit-mb", hide = true)]
     pub queue_memory_limit_mb: Option<u64>,
 }
@@ -583,192 +836,127 @@ pub struct QueueMemoryOptions {
 impl Default for QueueMemoryOptions {
     fn default() -> Self {
         Self {
-            // `None` = unset → the computed default applies (768 MB/thread, or
-            // the lean single-thread total). Matches the CLI's no-flag case.
+            // `None` = unset → the computed default applies (lean 64 MiB total
+            // when single-threaded, else 768 MiB/thread). Matches the CLI's
+            // no-flag case.
+            max_memory: None,
+            memory_reserve: MemoryReserve::Auto,
+            memory_per_thread: true,
             queue_memory: None,
-            queue_memory_per_thread: true,
+            queue_memory_per_thread: None,
             queue_memory_limit_mb: None,
         }
     }
 }
 
 impl QueueMemoryOptions {
-    /// Maximum reasonable memory per thread (1TB)
-    const MAX_MEMORY_PER_THREAD: u64 = 1024 * 1024 * 1024 * 1024;
+    /// Default per-thread queue-memory budget when `--max-memory` is unset
+    /// (multi-threaded runs): 768 MiB × threads. Byte-identical to the
+    /// historical `--queue-memory 768` default.
+    const DEFAULT_PER_THREAD_BYTES: usize = 768 * 1024 * 1024;
 
-    /// Minimum reasonable memory (1MB)
-    const MIN_MEMORY_TOTAL: u64 = 1024 * 1024;
-
-    /// Default per-thread queue-memory budget when `--queue-memory` is unset
-    /// (multi-threaded runs): 768 MB × threads.
-    const DEFAULT_PER_THREAD_BYTES: u64 = 768 * 1024 * 1024;
-
-    /// Default TOTAL queue-memory budget when `--queue-memory` is unset AND the
+    /// Default TOTAL queue-memory budget when `--max-memory` is unset AND the
     /// run is single-threaded. A lone worker streams one batch per stage, so a
     /// per-thread parallel budget is wasteful; this small total keeps the
     /// (off-budget) reorder stash and transport queues at a streaming
-    /// footprint. Overridden by any explicit `--queue-memory`.
+    /// footprint. Overridden by any explicit `--max-memory` / `--queue-memory`.
     const LEAN_SINGLE_THREAD_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
-    /// Calculates the total queue memory limit in bytes with comprehensive validation.
+    /// Resolve the effective `(limit, reserve, per_thread)` triple, honoring the
+    /// deprecated `--queue-memory*` aliases over the modern `--max-memory*`
+    /// flags. Pure: no warnings, no system queries.
     ///
-    /// This includes system memory checks via `sysinfo` (warns if >90% of system memory).
-    /// Use [`compute_memory_limit`](Self::compute_memory_limit) for the pure arithmetic
-    /// without system queries (e.g. in tests).
+    /// `limit` is `None` only when neither `--max-memory` nor a deprecated
+    /// `--queue-memory*` alias was given, signalling the caller to apply the
+    /// thread-count-aware default (lean total at `threads == 1`, else
+    /// 768 MiB/thread).
     ///
     /// # Errors
-    /// Returns an error if the memory size string cannot be parsed, `num_threads` is 0,
-    /// or the memory calculation would overflow.
+    /// Returns an error if a deprecated `--queue-memory` string fails to parse.
+    fn resolve_spec(&self) -> anyhow::Result<(Option<MemoryLimit>, MemoryReserve, bool)> {
+        // The deprecated `--queue-memory-per-thread` alias overrides
+        // `--memory-per-thread` when set, even on its own (i.e. without
+        // `--queue-memory`); otherwise passing it alone would be a silent no-op.
+        let per_thread = self.queue_memory_per_thread.unwrap_or(self.memory_per_thread);
+
+        // Legacy fixed-total flag wins if present (matches prior behavior).
+        if let Some(legacy_mb) = self.queue_memory_limit_mb {
+            let bytes = usize::try_from(legacy_mb)
+                .ok()
+                .and_then(|mb| mb.checked_mul(1024 * 1024))
+                .ok_or_else(|| anyhow::anyhow!("--queue-memory-limit-mb too large: {legacy_mb}"))?;
+            return Ok((Some(MemoryLimit::Fixed(bytes)), MemoryReserve::Auto, false));
+        }
+
+        // Deprecated --queue-memory overrides --max-memory when set.
+        if let Some(queue_memory) = &self.queue_memory {
+            let limit = parse_memory(queue_memory).map_err(|e| {
+                anyhow::anyhow!("Failed to parse --queue-memory {queue_memory}: {e}")
+            })?;
+            return Ok((Some(limit), self.memory_reserve, per_thread));
+        }
+
+        Ok((self.max_memory, self.memory_reserve, per_thread))
+    }
+
+    /// Emit a one-time deprecation warning for any legacy flag in use.
+    fn warn_deprecations(&self) {
+        if self.queue_memory_limit_mb.is_some() {
+            log::warn!("DEPRECATED: --queue-memory-limit-mb; use --max-memory <N> instead.");
+        } else if self.queue_memory.is_some() {
+            log::warn!(
+                "DEPRECATED: --queue-memory / --queue-memory-per-thread; use --max-memory / --memory-per-thread instead."
+            );
+        } else if self.queue_memory_per_thread.is_some() {
+            log::warn!("DEPRECATED: --queue-memory-per-thread; use --memory-per-thread instead.");
+        }
+    }
+
+    /// Resolve the total queue memory budget in bytes for `num_threads`.
+    ///
+    /// When neither `--max-memory` nor a deprecated `--queue-memory*` alias is
+    /// set, the budget is the lean fixed total at `num_threads == 1` (a lone
+    /// worker streams) and 768 MiB/thread otherwise. Under `--max-memory auto`
+    /// the budget is detected from (cgroup-aware) host memory minus
+    /// `--memory-reserve`, so it shrinks to fit the host. Under an explicit
+    /// value it is `max_memory` (× threads when per-thread).
+    ///
+    /// # Errors
+    /// Returns an error if `num_threads` is 0, a deprecated `--queue-memory`
+    /// string fails to parse, or the multiplication overflows.
     pub fn calculate_memory_limit(&self, num_threads: usize) -> anyhow::Result<u64> {
-        let total_memory = self.compute_memory_limit(num_threads)?;
-        Self::validate_against_system_memory(total_memory);
-        Ok(total_memory)
-    }
-
-    /// Computes the total queue memory limit in bytes (pure arithmetic, no system queries).
-    ///
-    /// # Errors
-    /// Returns an error if:
-    /// - The memory size string cannot be parsed
-    /// - `num_threads` is 0
-    /// - Memory calculation would overflow
-    /// - Memory values are unreasonable
-    pub fn compute_memory_limit(&self, num_threads: usize) -> anyhow::Result<u64> {
-        // Validate thread count
-        if num_threads == 0 {
-            anyhow::bail!("Number of threads must be greater than 0, got: {num_threads}");
-        }
-
-        // Handle migration from old parameter
-        let (base_memory_bytes, is_legacy) = if let Some(legacy_mb) = self.queue_memory_limit_mb {
-            log::warn!(
-                "DEPRECATED: --queue-memory-limit-mb is deprecated. Use --queue-memory instead."
-            );
-            log::warn!(
-                "Migration: --queue-memory-limit-mb {legacy_mb} → --queue-memory {legacy_mb} --queue-memory-per-thread false"
-            );
-            (
-                legacy_mb.checked_mul(1024 * 1024).ok_or_else(|| {
-                    anyhow::anyhow!("Legacy memory size overflow: {legacy_mb} MB")
-                })?,
-                true,
-            )
-        } else if let Some(qm) = &self.queue_memory {
-            // User explicitly set --queue-memory: parse + apply as today.
-            (
-                parse_memory_size(qm)
-                    .map_err(|e| anyhow::anyhow!("Failed to parse queue memory size: {qm}: {e}"))?,
-                false,
-            )
-        } else if num_threads == 1 {
-            // Unset + single-threaded: a lean fixed TOTAL (streaming footprint).
-            // Returned directly so the per-thread multiply below leaves it as a
-            // total (× 1 would anyway, but be explicit and skip the per-thread
-            // path entirely).
-            return Ok(Self::LEAN_SINGLE_THREAD_TOTAL_BYTES);
+        self.warn_deprecations();
+        let (limit, reserve, per_thread) = self.resolve_spec()?;
+        let limit = if let Some(limit) = limit {
+            limit
         } else {
-            // Unset + multi-threaded: 768 MB per thread (the historical default).
-            (Self::DEFAULT_PER_THREAD_BYTES, false)
-        };
-
-        // Validate base memory range
-        if base_memory_bytes < Self::MIN_MEMORY_TOTAL {
-            anyhow::bail!(
-                "Memory limit too small: {} (minimum: {})",
-                ByteSize(base_memory_bytes),
-                ByteSize(Self::MIN_MEMORY_TOTAL)
-            );
-        }
-
-        // Calculate total memory with overflow checking
-        let total_memory = if self.queue_memory_per_thread && !is_legacy {
-            // Validate per-thread memory limit
-            if base_memory_bytes > Self::MAX_MEMORY_PER_THREAD {
-                anyhow::bail!(
-                    "Memory per thread too large: {} (maximum: {})",
-                    ByteSize(base_memory_bytes),
-                    ByteSize(Self::MAX_MEMORY_PER_THREAD)
-                );
+            // Unset: a lone worker streams, so use the lean fixed total at
+            // threads == 1; otherwise the historical 768 MiB/thread default.
+            if num_threads == 1 {
+                return Ok(Self::LEAN_SINGLE_THREAD_TOTAL_BYTES);
             }
-
-            // Check for overflow before multiplication
-            base_memory_bytes
-                .checked_mul(num_threads as u64)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Memory calculation overflow: {} × {} threads exceeds maximum addressable memory",
-                        ByteSize(base_memory_bytes),
-                        num_threads
-                    )
-                })?
-        } else {
-            // Fixed total memory (legacy mode or explicit setting)
-            base_memory_bytes
+            MemoryLimit::Fixed(Self::DEFAULT_PER_THREAD_BYTES)
         };
-
-        Ok(total_memory)
+        let bytes = resolve_memory_budget(limit, reserve, num_threads, per_thread)?;
+        Ok(bytes as u64)
     }
 
-    /// Warns if the requested memory exceeds reasonable system limits.
-    fn validate_against_system_memory(requested_bytes: u64) {
-        let mut system = sysinfo::System::new();
-        system.refresh_memory();
-
-        // Use cgroup-aware total clamped to physical RAM, matching detect_total_memory().
-        // A misconfigured container may report a cgroup limit exceeding physical RAM;
-        // clamping keeps warnings consistent with the value used by resolve_memory_limit.
-        let physical = system.total_memory();
-        let total_memory_bytes =
-            system.cgroup_limits().map_or(physical, |c| c.total_memory.min(physical));
-
-        // available_memory reflects free physical pages; no cgroup equivalent.
-        let available_memory_bytes = system.available_memory();
-
-        // Calculate 90% limit using integer arithmetic to avoid precision loss
-        let memory_limit = total_memory_bytes - (total_memory_bytes / 10); // 90% = total - 10%
-        if requested_bytes > memory_limit {
-            log::warn!(
-                "Requested memory {} exceeds 90% of system memory ({}). System has {} total, {} available. This may cause OOM conditions.",
-                ByteSize(requested_bytes),
-                ByteSize(memory_limit),
-                ByteSize(total_memory_bytes),
-                ByteSize(available_memory_bytes)
-            );
-        }
-
-        // Warn if requesting more than currently available memory
-        if requested_bytes > available_memory_bytes {
-            log::warn!(
-                "Requested memory {} exceeds currently available memory {}. This may cause swapping.",
-                ByteSize(requested_bytes),
-                ByteSize(available_memory_bytes)
-            );
-        }
-    }
-
-    /// Logs the memory configuration.
+    /// Logs the resolved memory configuration.
     ///
     /// # Arguments
-    /// * `num_threads` - Number of threads for the calculation
-    /// * `total_memory` - Pre-computed total memory limit in bytes from `calculate_memory_limit`
+    /// * `num_threads` - Number of threads used for the calculation.
+    /// * `total_memory` - The resolved total budget from `calculate_memory_limit`.
     pub fn log_memory_config(&self, num_threads: usize, total_memory: u64) {
-        if let Some(legacy_mb) = self.queue_memory_limit_mb {
+        let per_thread = self.resolve_spec().map(|(_, _, pt)| pt).unwrap_or(true);
+        if per_thread && num_threads > 1 {
             log::info!(
-                "Queue memory limit: {} (LEGACY: {legacy_mb} MB total, per-thread scaling disabled)",
-                ByteSize(total_memory)
-            );
-        } else if self.queue_memory_per_thread && num_threads > 1 {
-            // Derive the per-thread share from the computed total so this
-            // reports the effective value whether `--queue-memory` was set or
-            // defaulted (the raw flag is now `Option<String>`, possibly unset).
-            log::info!(
-                "Queue memory limit: {} total ({} per thread × {} threads)",
+                "Queue memory budget: {} total ({}/thread × {} threads)",
                 ByteSize(total_memory),
                 ByteSize(total_memory / num_threads as u64),
                 num_threads
             );
         } else {
-            log::info!("Queue memory limit: {} total (fixed)", ByteSize(total_memory));
+            log::info!("Queue memory budget: {} total", ByteSize(total_memory));
         }
     }
 }
@@ -887,6 +1075,16 @@ pub fn run_new_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Enable an at-Trace logger so `log::warn!`/`debug!` macros evaluate their
+    /// arguments — without an enabled logger the `log` crate skips argument
+    /// evaluation, leaving the formatting expressions inside the memory-budget
+    /// warn/debug branches unexecuted under test. nextest runs each test in its
+    /// own process, so `try_init` is local and idempotent.
+    fn enable_logging() {
+        let _ =
+            env_logger::builder().is_test(true).filter_level(log::LevelFilter::Trace).try_init();
+    }
 
     #[test]
     fn test_none_is_single_threaded() {
@@ -1042,154 +1240,297 @@ mod tests {
     // ========== Tests for QueueMemoryOptions ==========
 
     #[test]
-    fn test_queue_memory_options_compute_basic() {
+    fn test_queue_memory_default_is_768_mib_per_thread() {
+        // The multi-threaded default must stay byte-identical to the historical
+        // `--queue-memory 768` (768 MiB per thread).
+        let opts = QueueMemoryOptions::default();
+        let result = opts
+            .calculate_memory_limit(4)
+            .expect("calculate_memory_limit should succeed for the default");
+        assert_eq!(result, 768 * 1024 * 1024 * 4);
+    }
+
+    #[test]
+    fn test_queue_memory_max_memory_per_thread_scaling() {
+        // 100 MiB × 4 threads = 400 MiB
+        let opts = QueueMemoryOptions {
+            max_memory: Some(MemoryLimit::Fixed(100 * 1024 * 1024)),
+            ..QueueMemoryOptions::default()
+        };
+        let result = opts.calculate_memory_limit(4).expect("should succeed");
+        assert_eq!(result, 100 * 1024 * 1024 * 4);
+    }
+
+    #[test]
+    fn test_queue_memory_fixed_total_does_not_scale() {
+        let opts = QueueMemoryOptions {
+            max_memory: Some(MemoryLimit::Fixed(200 * 1024 * 1024)),
+            memory_per_thread: false,
+            ..QueueMemoryOptions::default()
+        };
+        let result = opts.calculate_memory_limit(8).expect("should succeed");
+        assert_eq!(result, 200 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_queue_memory_zero_threads_is_error() {
+        // Even with an explicit limit, 0 threads must error (not the lean
+        // single-thread path, which only triggers for the unset default).
+        let opts = QueueMemoryOptions {
+            max_memory: Some(MemoryLimit::Fixed(100 * 1024 * 1024)),
+            ..QueueMemoryOptions::default()
+        };
+        assert!(opts.calculate_memory_limit(0).is_err());
+    }
+
+    #[test]
+    fn test_queue_memory_human_readable_via_parse() {
+        // "2GB" parses as decimal gigabytes (matching `fgumi sort` / ByteSize).
+        let opts = QueueMemoryOptions {
+            max_memory: Some(parse_memory("2GB").expect("parse 2GB")),
+            memory_per_thread: false,
+            ..QueueMemoryOptions::default()
+        };
+        let result = opts.calculate_memory_limit(4).expect("should succeed");
+        assert_eq!(result, 2 * 1000 * 1000 * 1000);
+    }
+
+    #[test]
+    fn test_queue_memory_auto_is_bounded_by_host() {
+        // `auto` self-throttles: the budget must never exceed (cgroup-aware)
+        // host memory, regardless of thread count.
+        let total = detect_total_memory() as u64;
+        let opts = QueueMemoryOptions {
+            max_memory: Some(MemoryLimit::Auto),
+            ..QueueMemoryOptions::default()
+        };
+        let result = opts.calculate_memory_limit(4).expect("auto should resolve");
+        assert!(result > 0, "auto resolved to a zero budget");
+        assert!(result <= total, "auto budget {result} exceeded host total {total}");
+    }
+
+    #[test]
+    fn test_auto_never_oversubscribes_small_host() {
+        enable_logging(); // exercise the cap-warning and auto-debug log branches
+        // Simulated 4 GiB host, 16 threads: the 256 MiB/thread floor would want
+        // 4 GiB before reserve, which cannot fit after the auto reserve. The
+        // budget must be capped to `available`, never `floor × threads`.
+        let total = 4 * 1024 * 1024 * 1024; // 4 GiB
+        let margin = resolve_reserve(MemoryReserve::Auto, total); // min(10 GiB, 2 GiB) = 2 GiB
+        let available = total - margin;
+        let budget = resolve_memory_budget_with_total(
+            MemoryLimit::Auto,
+            MemoryReserve::Auto,
+            16,
+            true,
+            total,
+        )
+        .expect("should resolve");
+        assert!(budget <= available, "budget {budget} oversubscribed available {available}");
+        assert!(budget <= total, "budget {budget} oversubscribed host {total}");
+    }
+
+    #[test]
+    fn test_auto_uses_floor_when_host_is_ample() {
+        // Simulated 256 GiB host, 4 threads: plenty of room, so the budget is
+        // the per-thread share and stays under available.
+        let total = 256 * 1024 * 1024 * 1024;
+        let margin = resolve_reserve(MemoryReserve::Auto, total); // 10 GiB cap
+        let available = total - margin;
+        let budget = resolve_memory_budget_with_total(
+            MemoryLimit::Auto,
+            MemoryReserve::Auto,
+            4,
+            true,
+            total,
+        )
+        .expect("should resolve");
+        assert!(budget >= MIN_MEMORY_PER_THREAD * 4, "budget {budget} fell below the floor");
+        assert!(budget <= available, "budget {budget} exceeded available {available}");
+    }
+
+    #[test]
+    fn test_fixed_budget_independent_of_host() {
+        enable_logging(); // exercise the "budget exceeds host total" warn branch
+        // Fixed limits ignore host size entirely (reserve is irrelevant).
+        let tiny_host = 512 * 1024 * 1024;
+        let budget = resolve_memory_budget_with_total(
+            MemoryLimit::Fixed(2 * 1024 * 1024 * 1024),
+            MemoryReserve::Auto,
+            4,
+            false,
+            tiny_host,
+        )
+        .expect("should resolve");
+        assert_eq!(budget, 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_queue_memory_auto_reserve_shrinks_budget() {
+        let large_reserve = QueueMemoryOptions {
+            max_memory: Some(MemoryLimit::Auto),
+            memory_reserve: MemoryReserve::Fixed(512 * 1024 * 1024),
+            ..QueueMemoryOptions::default()
+        }
+        .calculate_memory_limit(4)
+        .expect("should succeed");
+        let small_reserve = QueueMemoryOptions {
+            max_memory: Some(MemoryLimit::Auto),
+            memory_reserve: MemoryReserve::Fixed(128 * 1024 * 1024),
+            ..QueueMemoryOptions::default()
+        }
+        .calculate_memory_limit(4)
+        .expect("should succeed");
+        assert!(large_reserve <= small_reserve);
+    }
+
+    #[test]
+    fn test_queue_memory_deprecated_queue_memory_alias() {
+        // The hidden `--queue-memory` alias overrides `--max-memory`, honoring
+        // its companion `--queue-memory-per-thread`.
+        let opts = QueueMemoryOptions {
+            queue_memory: Some("200".to_string()),
+            queue_memory_per_thread: Some(false),
+            ..QueueMemoryOptions::default()
+        };
+        let result = opts.calculate_memory_limit(8).expect("should succeed");
+        assert_eq!(result, 200 * 1024 * 1024); // fixed total, no scaling
+    }
+
+    #[test]
+    fn test_queue_memory_per_thread_alias_alone_takes_effect() {
+        // `--queue-memory-per-thread false` on its own must override
+        // `--memory-per-thread` (default true), not be a silent no-op.
+        let opts = QueueMemoryOptions {
+            max_memory: Some(MemoryLimit::Fixed(200 * 1024 * 1024)),
+            queue_memory_per_thread: Some(false),
+            ..QueueMemoryOptions::default()
+        };
+        let result = opts.calculate_memory_limit(8).expect("should succeed");
+        assert_eq!(result, 200 * 1024 * 1024); // fixed total, no per-thread scaling
+    }
+
+    #[test]
+    fn test_queue_memory_deprecated_alias_defaults_to_per_thread() {
+        // When `--queue-memory-per-thread` is unset, the alias falls back to
+        // `--memory-per-thread` (default true).
         let opts = QueueMemoryOptions {
             queue_memory: Some("100".to_string()),
-            queue_memory_per_thread: true,
-            queue_memory_limit_mb: None,
+            ..QueueMemoryOptions::default()
         };
-
-        // 100MB × 4 threads = 400MB
-        let result = opts
-            .compute_memory_limit(4)
-            .expect("compute_memory_limit should succeed for 100MB x 4 threads");
+        let result = opts.calculate_memory_limit(4).expect("should succeed");
         assert_eq!(result, 100 * 1024 * 1024 * 4);
-
-        // Fixed memory (no scaling)
-        let opts_fixed = QueueMemoryOptions {
-            queue_memory: Some("200".to_string()),
-            queue_memory_per_thread: false,
-            queue_memory_limit_mb: None,
-        };
-        let result_fixed = opts_fixed
-            .compute_memory_limit(8)
-            .expect("compute_memory_limit should succeed for fixed 200MB");
-        assert_eq!(result_fixed, 200 * 1024 * 1024); // Should not scale
     }
 
     #[test]
-    fn test_queue_memory_options_validation_errors() {
-        let opts = QueueMemoryOptions::default();
-
-        // Zero threads should fail
-        assert!(opts.compute_memory_limit(0).is_err());
-
-        // Very large memory per thread should fail
-        let large_opts = QueueMemoryOptions {
-            queue_memory: Some("2TB".to_string()),
-            queue_memory_per_thread: true,
-            queue_memory_limit_mb: None,
-        };
-        assert!(large_opts.compute_memory_limit(1).is_err());
-
-        // Very small memory should fail
-        let tiny_opts = QueueMemoryOptions {
-            queue_memory: Some("1KB".to_string()),
-            queue_memory_per_thread: false,
-            queue_memory_limit_mb: None,
-        };
-        assert!(tiny_opts.compute_memory_limit(1).is_err());
-    }
-
-    #[test]
-    fn test_queue_memory_options_overflow() {
+    fn test_queue_memory_legacy_limit_mb_fixed_total() {
         let opts = QueueMemoryOptions {
-            queue_memory: Some("2TB".to_string()), // 2TB > 1TB limit
-            queue_memory_per_thread: true,
-            queue_memory_limit_mb: None,
-        };
-
-        // Should fail due to per-thread limit
-        assert!(opts.compute_memory_limit(1).is_err());
-
-        // Large total (100TB) succeeds at the math level (system check is separate)
-        let opts2 = QueueMemoryOptions {
-            queue_memory: Some("100GB".to_string()),
-            queue_memory_per_thread: true,
-            queue_memory_limit_mb: None,
-        };
-        assert!(opts2.compute_memory_limit(1000).is_ok());
-    }
-
-    #[test]
-    fn test_queue_memory_options_legacy_migration() {
-        let legacy_opts = QueueMemoryOptions {
-            queue_memory: Some("768".to_string()), // Should be ignored
-            queue_memory_per_thread: true,         // Should be ignored
             queue_memory_limit_mb: Some(2048),
+            // These must be ignored in favor of the legacy fixed total.
+            max_memory: Some(MemoryLimit::Fixed(1)),
+            memory_per_thread: true,
+            ..QueueMemoryOptions::default()
         };
-
-        let result = legacy_opts
-            .compute_memory_limit(4)
-            .expect("compute_memory_limit should succeed for legacy migration");
-        assert_eq!(result, 2048 * 1024 * 1024); // Should use legacy value, no scaling
+        let result = opts.calculate_memory_limit(4).expect("should succeed");
+        assert_eq!(result, 2048 * 1024 * 1024); // fixed total, no scaling
     }
 
     #[test]
-    fn test_queue_memory_options_human_readable() {
+    fn test_legacy_limit_mb_overflow_is_error() {
+        // u64::MAX MiB overflows when multiplied by 1 MiB.
         let opts = QueueMemoryOptions {
-            queue_memory: Some("2GB".to_string()),
-            queue_memory_per_thread: false,
-            queue_memory_limit_mb: None,
+            queue_memory_limit_mb: Some(u64::MAX),
+            ..QueueMemoryOptions::default()
         };
-
-        let result = opts
-            .compute_memory_limit(4)
-            .expect("compute_memory_limit should succeed for 2GB fixed");
-        assert_eq!(result, 2 * 1000 * 1000 * 1000); // 2GB in bytes
+        assert!(opts.calculate_memory_limit(1).is_err());
     }
 
     #[test]
-    fn test_queue_memory_options_small_value() {
+    fn test_deprecated_queue_memory_parse_error_is_error() {
         let opts = QueueMemoryOptions {
-            queue_memory: Some("1".to_string()), // 1MB
-            queue_memory_per_thread: false,
-            queue_memory_limit_mb: None,
+            queue_memory: Some("not-a-size".to_string()),
+            ..QueueMemoryOptions::default()
         };
-
-        assert!(opts.compute_memory_limit(1).is_ok());
+        assert!(opts.calculate_memory_limit(4).is_err());
     }
 
     #[test]
-    fn unset_queue_memory_lean_at_single_thread_default_at_multi() {
-        // `--queue-memory` unset (`None`): lean 64 MiB TOTAL at threads==1 (a
-        // lone worker streams), but the historical 768 MiB/thread at t>1.
-        let opts = QueueMemoryOptions::default(); // queue_memory: None
+    fn test_fixed_per_thread_overflow_is_error() {
+        let opts = QueueMemoryOptions {
+            max_memory: Some(MemoryLimit::Fixed(usize::MAX)),
+            ..QueueMemoryOptions::default()
+        };
+        assert!(opts.calculate_memory_limit(4).is_err());
+    }
+
+    #[test]
+    fn test_auto_per_thread_overflow_is_error() {
+        // A pathological thread count makes the per-thread floor × threads
+        // overflow; this must surface as an error, not wrap.
+        let result = resolve_memory_budget_with_total(
+            MemoryLimit::Auto,
+            MemoryReserve::Auto,
+            usize::MAX,
+            true,
+            1024 * 1024 * 1024,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_log_memory_config_exercises_both_branches() {
+        // Logging only (no return value); call both paths to keep them covered
+        // and to guard against a panic in the formatting/division.
+        let per_thread = QueueMemoryOptions::default();
+        per_thread.log_memory_config(8, 8 * 768 * 1024 * 1024); // per-thread, threads > 1
+        per_thread.log_memory_config(1, 768 * 1024 * 1024); // threads == 1 → total branch
+
+        let fixed_total =
+            QueueMemoryOptions { memory_per_thread: false, ..QueueMemoryOptions::default() };
+        fixed_total.log_memory_config(8, 1024 * 1024 * 1024); // fixed total branch
+    }
+
+    #[test]
+    fn unset_max_memory_lean_at_single_thread_default_at_multi() {
+        // `--max-memory` unset (`None`): lean 64 MiB TOTAL at threads==1 (a lone
+        // worker streams), but the historical 768 MiB/thread at t>1. This is the
+        // #330 lean single-thread default, preserved through the #381 host-aware
+        // resolution.
+        let opts = QueueMemoryOptions::default(); // max_memory: None
         assert_eq!(
-            opts.compute_memory_limit(1).expect("t=1 default"),
+            opts.calculate_memory_limit(1).expect("t=1 default"),
             64 * 1024 * 1024,
             "single-threaded default is the lean 64 MiB total"
         );
         assert_eq!(
-            opts.compute_memory_limit(4).expect("t=4 default"),
+            opts.calculate_memory_limit(4).expect("t=4 default"),
             768 * 1024 * 1024 * 4,
             "multi-threaded default is unchanged at 768 MiB per thread"
         );
     }
 
     #[test]
-    fn explicit_queue_memory_not_clobbered_at_single_thread() {
-        // The override-detection guard: an explicit `--queue-memory` at
-        // threads==1 must be honored, NOT silently rewritten to the 64 MiB
-        // lean default. (`String` default_value would make "user typed 768"
-        // indistinguishable from the default — hence the `Option<String>`.)
+    fn explicit_max_memory_not_clobbered_at_single_thread() {
+        // The override-detection guard: an explicit `--max-memory` at threads==1
+        // must be honored, NOT silently rewritten to the 64 MiB lean default.
+        // (`Option<MemoryLimit>` makes "user typed 768" — `Some` — distinct from
+        // the unset default — `None`.)
         let explicit = QueueMemoryOptions {
-            queue_memory: Some("768".to_string()),
-            queue_memory_per_thread: true,
-            queue_memory_limit_mb: None,
+            max_memory: Some(MemoryLimit::Fixed(768 * 1024 * 1024)),
+            ..QueueMemoryOptions::default()
         };
         assert_eq!(
-            explicit.compute_memory_limit(1).expect("explicit t=1"),
+            explicit.calculate_memory_limit(1).expect("explicit t=1"),
             768 * 1024 * 1024,
-            "explicit --queue-memory at t=1 is honored (per-thread × 1), not the lean default"
+            "explicit --max-memory at t=1 is honored (per-thread × 1), not the lean default"
         );
         let explicit_total = QueueMemoryOptions {
-            queue_memory: Some("512".to_string()),
-            queue_memory_per_thread: false,
-            queue_memory_limit_mb: None,
+            max_memory: Some(MemoryLimit::Fixed(512 * 1024 * 1024)),
+            memory_per_thread: false,
+            ..QueueMemoryOptions::default()
         };
         assert_eq!(
-            explicit_total.compute_memory_limit(1).expect("explicit total t=1"),
+            explicit_total.calculate_memory_limit(1).expect("explicit total t=1"),
             512 * 1024 * 1024,
             "explicit total at t=1 is honored, not the lean default"
         );
@@ -1266,16 +1607,43 @@ mod tests {
     }
 
     #[rstest]
-    // --queue-memory-per-thread (default true)
+    // --memory-per-thread (default true)
     #[case(&["test"], true)]
-    #[case(&["test", "--queue-memory-per-thread"], true)]
-    #[case(&["test", "--queue-memory-per-thread", "true"], true)]
-    #[case(&["test", "--queue-memory-per-thread", "false"], false)]
-    #[case(&["test", "--queue-memory-per-thread=true"], true)]
-    #[case(&["test", "--queue-memory-per-thread=false"], false)]
-    fn test_queue_memory_per_thread_parsing(#[case] args: &[&str], #[case] expected: bool) {
+    #[case(&["test", "--memory-per-thread"], true)]
+    #[case(&["test", "--memory-per-thread", "true"], true)]
+    #[case(&["test", "--memory-per-thread", "false"], false)]
+    #[case(&["test", "--memory-per-thread=true"], true)]
+    #[case(&["test", "--memory-per-thread=false"], false)]
+    fn test_memory_per_thread_parsing(#[case] args: &[&str], #[case] expected: bool) {
         let cmd = TestBoolFlags::try_parse_from(args).expect("valid CLI args should parse");
-        assert_eq!(cmd.queue_memory.queue_memory_per_thread, expected);
+        assert_eq!(cmd.queue_memory.memory_per_thread, expected);
+    }
+
+    #[rstest]
+    // --max-memory parses to a MemoryLimit; "auto" and explicit values both work.
+    // Unset stays `None` (the thread-count-aware default applies at resolve time).
+    #[case(&["test"], None)]
+    #[case(&["test", "--max-memory", "auto"], Some(MemoryLimit::Auto))]
+    #[case(&["test", "--max-memory", "2GiB"], Some(MemoryLimit::Fixed(2 * 1024 * 1024 * 1024)))]
+    #[case(&["test", "--max-memory=512M"], Some(MemoryLimit::Fixed(512 * 1000 * 1000)))]
+    fn test_max_memory_parsing(#[case] args: &[&str], #[case] expected: Option<MemoryLimit>) {
+        let cmd = TestBoolFlags::try_parse_from(args).expect("valid CLI args should parse");
+        assert_eq!(cmd.queue_memory.max_memory, expected);
+    }
+
+    #[test]
+    fn test_deprecated_queue_memory_flag_still_parses() {
+        // The hidden aliases remain accepted for backward compatibility.
+        let cmd = TestBoolFlags::try_parse_from([
+            "test",
+            "--queue-memory",
+            "512",
+            "--queue-memory-per-thread",
+            "false",
+        ])
+        .expect("deprecated flags should still parse");
+        assert_eq!(cmd.queue_memory.queue_memory.as_deref(), Some("512"));
+        assert_eq!(cmd.queue_memory.queue_memory_per_thread, Some(false));
     }
 
     #[rstest]

@@ -31,9 +31,8 @@ use bytesize::ByteSize;
 use fgumi_sort::{RawExternalSorter, SortOrder};
 use log::info;
 
-use crate::commands::sort::{
-    MemoryLimit, SortOptions, TMP_DIRS_ENV, parse_cell_tag, resolve_memory_limit, resolve_tmp_dirs,
-};
+use crate::commands::common::{MemoryLimit, resolve_memory_budget};
+use crate::commands::sort::{SortOptions, TMP_DIRS_ENV, parse_cell_tag, resolve_tmp_dirs};
 use crate::logging::OperationTimer;
 use crate::pipeline::chains::builder::ChainBuilder;
 use crate::pipeline::chains::{BuiltPipeline, ChainSpec, FinalizeHook, SinkSpec, SourceSpec};
@@ -185,7 +184,7 @@ pub(crate) fn build_sort_step(cap: SortStepCaptures) -> Result<SortBamFile> {
     let sort_order: SortOrder = cap.sort.order.into();
     let cell_tag = parse_cell_tag(cap.sort.order)?;
 
-    let effective_memory = resolve_memory_limit(
+    let effective_memory = resolve_memory_budget(
         cap.sort.max_memory,
         cap.sort.memory_reserve,
         cap.num_sorter_threads,

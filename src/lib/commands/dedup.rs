@@ -867,6 +867,27 @@ genomic position are partitioned by cell barcode before deduplication. This ensu
 different cells are never marked as duplicates of each other, even if they share a UMI sequence and
 mapping position. The cell barcode is read from the standard `CB` tag. No
 correction or error-handling is performed on cell barcodes; they must be corrected upstream.
+
+# Memory
+
+dedup streams the input and processes one genomic position group at a time, so memory scales with
+parallelism, not input size. The two contributors are:
+
+  - Pipeline queue: bounded by --max-memory, which is per thread by default. With the default
+    (768 MiB/thread), --threads 16 budgets ~12 GiB of queue alone and --threads 8 budgets ~6 GiB.
+  - Per-worker working set: each worker transiently holds the templates of the group it is
+    processing (building, scoring, sorting). This is on top of the queue budget, so peak RSS is
+    higher than --max-memory; empirically ~1-2 GiB/thread on WGS-scale input.
+
+A practical rule of thumb for WGS-scale input is to budget ~2 GiB per thread of total RSS. On a
+fixed-RAM host, prefer one of:
+
+  fgumi dedup ... --threads 16 --max-memory auto              # detect host RAM, self-throttle
+  fgumi dedup ... --threads 16 --max-memory 16GiB --memory-per-thread false   # fixed total budget
+
+--max-memory is a budget for the controllable consumer (the queue), not a hard RSS cap: a single
+pathological high-coverage position group is still processed whole. The legacy --queue-memory /
+--queue-memory-per-thread flags remain accepted as hidden aliases.
 "#
 )]
 pub struct MarkDuplicates {
