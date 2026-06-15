@@ -99,11 +99,17 @@ pub fn build_serialize_processed_groups_step(
               item: BatchedProcessedPositionGroups|
               -> io::Result<DecompressedBlock> {
             let BatchedProcessedPositionGroups { batch_serial, groups } = item;
-            let total_records: usize = groups.iter().map(|g| g.templates.len()).sum();
-            let mut output = Vec::with_capacity(total_records * 800);
-            let mut total_input_records: u64 = 0;
+            // Size by record count, not template count: a paired-end template
+            // holds ~2 records, so `templates.len()` under-sized the buffer ~2×
+            // and forced reallocs. `input_record_count` is the per-group record
+            // tally; summed once here for both the capacity hint and the
+            // progress counter below.
+            let total_input_records: u64 =
+                groups.iter().fold(0u64, |acc, g| acc.saturating_add(g.input_record_count));
+            let mut output = Vec::with_capacity(
+                usize::try_from(total_input_records.saturating_mul(800)).unwrap_or(usize::MAX),
+            );
             for processed in &groups {
-                total_input_records += processed.input_record_count;
                 emit_templates_raw_with_mi(
                     &processed.templates,
                     0, // already mi_assign'd upstream — base offset is 0
