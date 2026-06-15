@@ -1209,9 +1209,11 @@ impl<'a> ChainBuilder<'a> {
     /// presence + numeric ranges). Loads UMI sequences and encodes them into
     /// [`EncodedUmiSet`] up front.
     ///
-    /// The `rejects_header` is the primary output header stamped as `SO:unsorted`
-    /// via [`header_as_unsorted`] — matching the Phase 2 behaviour in
-    /// `build_correct_chain`.
+    /// The `rejects_header` is the **input header verbatim** (PR #332 contract:
+    /// rejects are raw-input records, so they carry the input's `@HD` sort
+    /// fields + RG/PG — not the consensus/output header). For `correct`,
+    /// `self.header` is the input header (correct preserves input order and does
+    /// not replace `self.header` with a consensus header), so it is used as-is.
     ///
     /// Registers a [`CorrectFinalizeHook`] for: per-thread accumulator reduce →
     /// `finalize_metrics` → summary + warn banners → `--min-corrected` ratio
@@ -1226,7 +1228,6 @@ impl<'a> ChainBuilder<'a> {
     /// implemented).
     ///
     /// [`EncodedUmiSet`]: crate::commands::correct::EncodedUmiSet
-    /// [`header_as_unsorted`]: crate::sam::header_as_unsorted
     /// [`DecompressedBlock`]: crate::pipeline::steps::types::DecompressedBlock
     /// [`CorrectFinalizeHook`]: crate::pipeline::chains::commands::correct::CorrectFinalizeHook
     #[allow(clippy::too_many_lines)]
@@ -1241,7 +1242,7 @@ impl<'a> ChainBuilder<'a> {
         };
         use crate::pipeline::steps::group::queryname::GroupByQueryname;
         use crate::pipeline::steps::serialize::SerializeBamRecords;
-        use crate::sam::{SamTag, header_as_unsorted};
+        use crate::sam::SamTag;
         use log::info;
 
         // `Intermediate` is used when correct feeds into align-and-merge
@@ -1335,7 +1336,9 @@ impl<'a> ChainBuilder<'a> {
             let rejects_path = correct_opts.rejects_path.as_ref().ok_or_else(|| {
                 anyhow!("rejects_path unexpectedly None (build_for dispatch bug)")
             })?;
-            let rejects_header = header_as_unsorted(&self.header);
+            // PR #332 contract: rejects carry the INPUT header verbatim (raw-input
+            // records, input order). For correct, `self.header` IS the input header.
+            let rejects_header = self.header.clone();
             let rejects_write =
                 WriteBgzfFile::new(rejects_path, &rejects_header, self.tuning.compression_level)
                     .map_err(|e| anyhow!("WriteBgzfFile (rejects): {e}"))?;
