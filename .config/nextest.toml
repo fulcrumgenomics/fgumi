@@ -1,2 +1,10 @@
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 2 }
+
+# The trybuild compile-fail suite (`tests/compile_fail.rs`) invokes `rustc` once
+# per fail-case; on a cold build cache the whole run can exceed the default 120s
+# terminate cap (2 × 60s), causing intermittent CI timeouts that have nothing to
+# do with the code under test. Give just that binary headroom.
+[[profile.default.overrides]]
+filter = 'binary(compile_fail)'
+slow-timeout = { period = "120s", terminate-after = 5 }
