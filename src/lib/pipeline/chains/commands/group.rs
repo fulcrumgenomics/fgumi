@@ -21,8 +21,9 @@ use log::warn;
 
 use crate::assigner::Strategy;
 use crate::commands::group::{
-    GroupFilterConfig, GroupMetricsAccumulator, assign_umi_groups_impl, build_grouping_metrics,
-    filter_template_raw, write_metrics_for_chain,
+    GroupFilterConfig, GroupMetricsAccumulator, ParallelMinTemplates, assign_umi_groups_impl,
+    build_grouping_metrics, create_umi_assigner, filter_template_raw, should_use_parallel,
+    write_metrics_for_chain,
 };
 use crate::grouper::{FilterMetrics, ProcessedPositionGroup, build_templates_from_records};
 use crate::logging::OperationTimer;
@@ -40,10 +41,6 @@ use crate::pipeline::steps::serialize_processed::{
 };
 use crate::pipeline::steps::types::DecompressedBlock;
 use crate::template::Template;
-use crate::umi::parallel_assigner::{
-    ParallelAdjacencyAssigner, ParallelEditAssigner, ParallelIdentityAssigner,
-    ParallelPairedAssigner,
-};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GroupFinalizeHook
@@ -148,6 +145,7 @@ pub(crate) fn build_group_process_step(
     raw_tag: [u8; 2],
     no_umi: bool,
     allow_unmapped: bool,
+    parallel_group_min_templates: Option<ParallelMinTemplates>,
     num_threads: usize,
     filter_config: GroupFilterConfig,
     accumulators: Arc<PerThreadAccumulator<GroupMetricsAccumulator>>,
@@ -166,22 +164,25 @@ pub(crate) fn build_group_process_step(
             let BatchedRawPositionGroups { batch_serial, groups } = item;
             let mut processed_batch: Vec<ProcessedPositionGroup> = Vec::with_capacity(groups.len());
 
-            let assigner: Box<dyn crate::assigner::UmiAssigner> = if allow_unmapped {
-                match strategy {
-                    Strategy::Identity => Box::new(ParallelIdentityAssigner::new(num_threads)),
-                    Strategy::Edit => {
-                        Box::new(ParallelEditAssigner::new(effective_edits, num_threads))
-                    }
-                    Strategy::Adjacency => {
-                        Box::new(ParallelAdjacencyAssigner::new(effective_edits, num_threads))
-                    }
-                    Strategy::Paired => {
-                        Box::new(ParallelPairedAssigner::new(effective_edits, num_threads))
-                    }
-                }
-            } else {
-                strategy.new_assigner_full(effective_edits, 1, index_threshold)
-            };
+            // Uniform cases build one assigner for the whole batch and reuse it
+            // across every group (preserving the per-batch reuse):
+            // `--allow-unmapped` always goes parallel, and the no-threshold
+            // default always stays sequential. The per-group
+            // `--parallel-group-min-templates` threshold must decide per group
+            // (template counts vary), so it builds inside the loop below. See
+            // `should_use_parallel` / `create_umi_assigner` in `commands::group`.
+            let batch_assigner: Option<Box<dyn crate::assigner::UmiAssigner>> =
+                if allow_unmapped || parallel_group_min_templates.is_none() {
+                    Some(create_umi_assigner(
+                        strategy,
+                        effective_edits,
+                        index_threshold,
+                        num_threads,
+                        allow_unmapped,
+                    ))
+                } else {
+                    None
+                };
 
             for group in groups {
                 let mut filter_metrics = FilterMetrics::new();
@@ -209,12 +210,36 @@ pub(crate) fn build_group_process_step(
                     continue;
                 }
 
+                // Pick the assigner for this group: reuse the batch-wide one for
+                // the uniform cases, or build a per-group one when the threshold
+                // flag is set (the decision depends on this group's size).
+                let per_group_assigner;
+                let assigner: &dyn crate::assigner::UmiAssigner =
+                    if let Some(batch) = &batch_assigner {
+                        batch.as_ref()
+                    } else {
+                        let use_parallel = should_use_parallel(
+                            allow_unmapped,
+                            filtered_templates.len(),
+                            strategy,
+                            parallel_group_min_templates.as_ref(),
+                        );
+                        per_group_assigner = create_umi_assigner(
+                            strategy,
+                            effective_edits,
+                            index_threshold,
+                            num_threads,
+                            use_parallel,
+                        );
+                        per_group_assigner.as_ref()
+                    };
+
                 assigner.reset();
 
                 let mut templates = filtered_templates;
                 if let Err(e) = assign_umi_groups_impl(
                     &mut templates,
-                    assigner.as_ref(),
+                    assigner,
                     raw_tag,
                     filter_config.min_umi_length,
                     no_umi,
