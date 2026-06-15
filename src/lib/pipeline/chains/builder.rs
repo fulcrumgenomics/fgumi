@@ -2326,14 +2326,13 @@ impl<'a> ChainBuilder<'a> {
         use crate::per_thread_accumulator::PerThreadAccumulator;
         use crate::pipeline::chains::commands::simplex::{
             CollectedSimplexMetrics, SimplexConsensusCaptures, SimplexFinalizeHook,
-            build_simplex_consensus_step,
+            build_simplex_consensus_step_kept_only, build_simplex_consensus_step_with_rejects,
         };
         use crate::pipeline::steps::group::mi::GroupByMi;
-        use crate::sam::{SamTag, header_as_unsorted};
+        use crate::sam::SamTag;
         use crate::vanilla_consensus_caller::VanillaUmiConsensusOptions;
         use log::info;
         use noodles::sam::alignment::record::data::field::Tag;
-        use parking_lot::Mutex;
 
         let simplex = self
             .spec
@@ -2409,36 +2408,17 @@ impl<'a> ChainBuilder<'a> {
         // make_prefix_from_header returns "" which is the correct empty prefix.
         let read_name_prefix = simplex.read_group.prefix_or_from_header(&self.header);
 
+        // Capture the input header (raw-input RG/PG + @HD sort fields) BEFORE
+        // replacing self.header with the consensus output header. Per the PR
+        // #332 rejects contract, the rejects branch is written with this input
+        // header verbatim (rejects are raw-input records in input order).
+        let input_header = self.header.clone();
+
         // Replace self.header with the consensus output header so add_sink()
         // uses the correct header for WriteBgzfFile.
         self.replace_header(output_header);
 
         let track_rejects = simplex.rejects_opts.is_enabled();
-
-        // Open rejects writer up front. Rejected records are streamed straight
-        // to disk per-MI-group from the process closure, so no batch-level
-        // buffering. Workers flush under a mutex rather than through the
-        // ordered serialize stage, so reject records are emitted in
-        // mutex-acquisition order, not input order; the rejects header is
-        // marked `SO:unsorted`.
-        let rejects_writer: Option<Arc<Mutex<Option<fgumi_bam_io::RawBamWriter>>>> =
-            if track_rejects {
-                if let Some(path) = simplex.rejects_opts.rejects.as_ref() {
-                    let rejects_header = header_as_unsorted(&self.header);
-                    let w = fgumi_bam_io::create_raw_bam_writer(
-                        path,
-                        &rejects_header,
-                        num_threads,
-                        self.spec.compression.compression_level,
-                    )?;
-                    Some(Arc::new(Mutex::new(Some(w))))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-        let rejects_writer_for_step = rejects_writer.as_ref().map(Arc::clone);
 
         // Per-thread metrics accumulator.
         let accumulators = PerThreadAccumulator::<CollectedSimplexMetrics>::new(num_threads);
@@ -2467,21 +2447,17 @@ impl<'a> ChainBuilder<'a> {
 
         // ── Step factories (see chains::commands::simplex) ────────────────
 
-        let consensus_step = build_simplex_consensus_step(
-            self.tuning.per_step_byte_limit,
-            SimplexConsensusCaptures {
-                track_rejects,
-                rejects_writer: rejects_writer_for_step,
-                overlapping_enabled,
-                consensus_options,
-                read_name_prefix,
-                read_group_id,
-                methylation_ref,
-                accumulators: accumulators_for_step,
-                min_reads: simplex.min_reads,
-                progress: progress_records,
-            },
-        );
+        let consensus_cap = SimplexConsensusCaptures {
+            track_rejects,
+            overlapping_enabled,
+            consensus_options,
+            read_name_prefix,
+            read_group_id,
+            methylation_ref,
+            accumulators: accumulators_for_step,
+            min_reads: simplex.min_reads,
+            progress: progress_records,
+        };
 
         // ── Group-MI preamble: two paths depending on the incoming tail type ──
         //
@@ -2579,12 +2555,44 @@ impl<'a> ChainBuilder<'a> {
             self.pipeline.append_step(group_mi_step, tail)
         };
 
-        // Wire the simplex consensus step. For an Intermediate consensus stage
-        // (e.g. fused consensus → filter) this appends DecodeRecords so the
-        // downstream stage receives DecodedRecordBatch; Terminal leaves the
-        // DecompressedBlock for add_sink. See finish_consensus_tail.
-        let tail = self.pipeline.append_step(consensus_step, tail);
-        let tail = self.finish_consensus_tail(tail, position);
+        // Wire the simplex consensus step. With `--rejects` it is a 2-output
+        // step (branch 0 = consensus DecompressedBlock, branch 1 = rejects
+        // DecompressedBlock → BgzfCompress → WriteBgzfFile with the INPUT
+        // header, in input order — the PR #332 fan-out contract); without
+        // rejects it is the 1-output kept-only variant (the framework has no
+        // public discard sink). Mirrors add_correct.
+        let limit = self.tuning.per_step_byte_limit;
+        let consensus_branch0 = if track_rejects {
+            use crate::pipeline::core::topology::BranchIdx;
+            use crate::pipeline::steps::bgzf::compress::BgzfCompress;
+            use crate::pipeline::steps::sink::write_bgzf::WriteBgzfFile;
+
+            let rejects_path = simplex.rejects_opts.rejects.as_ref().ok_or_else(|| {
+                anyhow!("rejects path unexpectedly None when track_rejects is set")
+            })?;
+            let rejects_write =
+                WriteBgzfFile::new(rejects_path, &input_header, self.tuning.compression_level)
+                    .map_err(|e| anyhow!("WriteBgzfFile (simplex rejects): {e}"))?;
+
+            let step = build_simplex_consensus_step_with_rejects(limit, consensus_cap);
+            let pt = self.pipeline.append_step(step, tail);
+
+            let rejects_branch = (pt.0, BranchIdx(1));
+            let rejects_compress_tail = self.pipeline.append_step(
+                BgzfCompress::new(self.tuning.compression_level, limit),
+                rejects_branch,
+            );
+            self.pipeline.append_step(rejects_write, rejects_compress_tail);
+
+            pt
+        } else {
+            let step = build_simplex_consensus_step_kept_only(limit, consensus_cap);
+            self.pipeline.append_step(step, tail)
+        };
+        // Branch 0 = consensus DecompressedBlock. For an Intermediate consensus
+        // stage finish_consensus_tail appends DecodeRecords; Terminal leaves the
+        // DecompressedBlock for add_sink.
+        let tail = self.finish_consensus_tail(consensus_branch0, position);
         self.current_tail = Some(tail);
 
         // Register the simplex finalize hook.
@@ -2595,7 +2603,6 @@ impl<'a> ChainBuilder<'a> {
             accumulators,
             stats_path: simplex.stats_opts.stats.clone(),
             overlapping_enabled,
-            rejects_writer,
             timer,
         }));
 
@@ -2651,15 +2658,14 @@ impl<'a> ChainBuilder<'a> {
         use crate::per_thread_accumulator::PerThreadAccumulator;
         use crate::pipeline::chains::commands::duplex::{
             CollectedDuplexMetrics, DuplexConsensusCaptures, DuplexFinalizeHook,
-            build_duplex_consensus_step,
+            build_duplex_consensus_step_kept_only, build_duplex_consensus_step_with_rejects,
         };
         use crate::pipeline::steps::group::mi::GroupByMi;
-        use crate::sam::{SamTag, header_as_unsorted};
+        use crate::sam::SamTag;
         use crate::umi::extract_mi_base;
         use fgumi_raw_bam::RawRecordView;
         use log::info;
         use noodles::sam::alignment::record::data::field::Tag;
-        use parking_lot::Mutex;
 
         let duplex = self
             .spec
@@ -2737,36 +2743,16 @@ impl<'a> ChainBuilder<'a> {
         // make_prefix_from_header returns "" which is the correct empty prefix.
         let read_name_prefix = duplex.read_group.prefix_or_from_header(&self.header);
 
+        // Capture the input header BEFORE replacing self.header with the
+        // consensus output header — the rejects branch is written with the
+        // input header verbatim (PR #332 contract).
+        let input_header = self.header.clone();
+
         // Replace self.header with the consensus output header so add_sink()
         // uses the correct header for WriteBgzfFile.
         self.replace_header(output_header);
 
         let track_rejects = duplex.rejects_opts.is_enabled();
-
-        // Open rejects writer up front. Rejected records are streamed straight to
-        // disk per-MI-group from the process closure, so no batch-level buffering.
-        // Workers flush under a mutex rather than through the ordered serialize
-        // stage, so reject records are emitted in mutex-acquisition order, not
-        // input order; the rejects header is marked `SO:unsorted` so downstream
-        // tools don't assume the input's sort order carried over.
-        let rejects_writer: Option<Arc<Mutex<Option<fgumi_bam_io::RawBamWriter>>>> =
-            if track_rejects {
-                if let Some(path) = duplex.rejects_opts.rejects.as_ref() {
-                    let rejects_header = header_as_unsorted(&self.header);
-                    let w = fgumi_bam_io::create_raw_bam_writer(
-                        path,
-                        &rejects_header,
-                        num_threads,
-                        self.spec.compression.compression_level,
-                    )?;
-                    Some(Arc::new(Mutex::new(Some(w))))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-        let rejects_writer_for_step = rejects_writer.as_ref().map(Arc::clone);
 
         // Per-thread metrics accumulator.
         let accumulators = PerThreadAccumulator::<CollectedDuplexMetrics>::new(num_threads);
@@ -2788,28 +2774,24 @@ impl<'a> ChainBuilder<'a> {
 
         // ── Step factories (see chains::commands::duplex) ────────────────────
 
-        let consensus_step = build_duplex_consensus_step(
-            self.tuning.per_step_byte_limit,
-            DuplexConsensusCaptures {
-                track_rejects,
-                rejects_writer: rejects_writer_for_step,
-                overlapping_enabled,
-                methylation_ref,
-                methylation_mode,
-                read_name_prefix,
-                read_group_id,
-                min_reads,
-                min_input_base_quality,
-                output_per_base_tags,
-                trim,
-                max_reads_per_strand,
-                error_rate_pre_umi,
-                error_rate_post_umi,
-                cell_tag,
-                accumulators: accumulators_for_step,
-                progress: progress_records,
-            },
-        );
+        let consensus_cap = DuplexConsensusCaptures {
+            track_rejects,
+            overlapping_enabled,
+            methylation_ref,
+            methylation_mode,
+            read_name_prefix,
+            read_group_id,
+            min_reads,
+            min_input_base_quality,
+            output_per_base_tags,
+            trim,
+            max_reads_per_strand,
+            error_rate_pre_umi,
+            error_rate_post_umi,
+            cell_tag,
+            accumulators: accumulators_for_step,
+            progress: progress_records,
+        };
 
         // ── Group-MI preamble: two paths depending on the incoming tail type ──
         //
@@ -2924,12 +2906,41 @@ impl<'a> ChainBuilder<'a> {
             self.pipeline.append_step(group_mi_step, tail)
         };
 
-        // Wire the duplex consensus step. For an Intermediate consensus stage
-        // (e.g. fused consensus → filter) this appends DecodeRecords so the
-        // downstream stage receives DecodedRecordBatch; Terminal leaves the
-        // DecompressedBlock for add_sink. See finish_consensus_tail.
-        let tail = self.pipeline.append_step(consensus_step, tail);
-        let tail = self.finish_consensus_tail(tail, position);
+        // Wire the duplex consensus step. With `--rejects` it is a 2-output step
+        // (branch 0 = consensus, branch 1 = rejects → BgzfCompress → WriteBgzfFile
+        // with the INPUT header, in input order — the PR #332 fan-out contract);
+        // without rejects it is the 1-output kept-only variant. Mirrors add_correct.
+        let limit = self.tuning.per_step_byte_limit;
+        let consensus_branch0 = if track_rejects {
+            use crate::pipeline::core::topology::BranchIdx;
+            use crate::pipeline::steps::bgzf::compress::BgzfCompress;
+            use crate::pipeline::steps::sink::write_bgzf::WriteBgzfFile;
+
+            let rejects_path = duplex.rejects_opts.rejects.as_ref().ok_or_else(|| {
+                anyhow!("rejects path unexpectedly None when track_rejects is set")
+            })?;
+            let rejects_write =
+                WriteBgzfFile::new(rejects_path, &input_header, self.tuning.compression_level)
+                    .map_err(|e| anyhow!("WriteBgzfFile (duplex rejects): {e}"))?;
+
+            let step = build_duplex_consensus_step_with_rejects(limit, consensus_cap);
+            let pt = self.pipeline.append_step(step, tail);
+
+            let rejects_branch = (pt.0, BranchIdx(1));
+            let rejects_compress_tail = self.pipeline.append_step(
+                BgzfCompress::new(self.tuning.compression_level, limit),
+                rejects_branch,
+            );
+            self.pipeline.append_step(rejects_write, rejects_compress_tail);
+
+            pt
+        } else {
+            let step = build_duplex_consensus_step_kept_only(limit, consensus_cap);
+            self.pipeline.append_step(step, tail)
+        };
+        // Branch 0 = consensus DecompressedBlock. Intermediate appends
+        // DecodeRecords; Terminal leaves the DecompressedBlock for add_sink.
+        let tail = self.finish_consensus_tail(consensus_branch0, position);
         self.current_tail = Some(tail);
 
         // Register the duplex finalize hook.
@@ -2940,7 +2951,6 @@ impl<'a> ChainBuilder<'a> {
             accumulators,
             stats_path: duplex.stats_opts.stats.clone(),
             overlapping_enabled,
-            rejects_writer,
             timer,
         }));
 
@@ -2989,13 +2999,12 @@ impl<'a> ChainBuilder<'a> {
         use crate::per_thread_accumulator::PerThreadAccumulator;
         use crate::pipeline::chains::commands::codec::{
             CodecConsensusCaptures, CodecFinalizeHook, CollectedCodecMetrics,
-            build_codec_consensus_step,
+            build_codec_consensus_step_kept_only, build_codec_consensus_step_with_rejects,
         };
         use crate::pipeline::steps::group::mi::GroupByMi;
-        use crate::sam::{SamTag, header_as_unsorted};
+        use crate::sam::SamTag;
         use log::info;
         use noodles::sam::alignment::record::data::field::Tag;
-        use parking_lot::Mutex;
 
         let codec = self
             .spec
@@ -3059,37 +3068,16 @@ impl<'a> ChainBuilder<'a> {
         // make_prefix_from_header returns "" which is the correct empty prefix.
         let read_name_prefix = codec.read_group.prefix_or_from_header(&self.header);
 
+        // Capture the input header BEFORE replacing self.header with the
+        // consensus output header — the rejects branch is written with the
+        // input header verbatim (PR #332 contract).
+        let input_header = self.header.clone();
+
         // Replace self.header with the consensus output header so add_sink()
         // uses the correct header for WriteBgzfFile.
         self.replace_header(output_header);
 
         let track_rejects = codec.rejects_opts.is_enabled();
-
-        // Open rejects writer up front. Rejected records are streamed straight to
-        // disk per-MI-group from the process closure, so no batch-level buffering.
-        // Workers flush under a mutex rather than through the ordered serialize
-        // stage, so reject records are emitted in mutex-acquisition order, not
-        // input order; the rejects header is marked `SO:unsorted` so downstream
-        // tools don't assume the input's sort order carried over.
-        let rejects_writer: Option<Arc<Mutex<Option<fgumi_bam_io::RawBamWriter>>>> =
-            if track_rejects {
-                if let Some(path) = codec.rejects_opts.rejects.as_ref() {
-                    let writer_threads = self.spec.threading.num_threads();
-                    let rejects_header = header_as_unsorted(&self.header);
-                    let w = fgumi_bam_io::create_raw_bam_writer(
-                        path,
-                        &rejects_header,
-                        writer_threads,
-                        self.spec.compression.compression_level,
-                    )?;
-                    Some(Arc::new(Mutex::new(Some(w))))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-        let rejects_writer_for_step = rejects_writer.as_ref().map(Arc::clone);
 
         // Per-thread metrics accumulator.
         let accumulators = PerThreadAccumulator::<CollectedCodecMetrics>::new(num_threads);
@@ -3121,18 +3109,14 @@ impl<'a> ChainBuilder<'a> {
 
         // ── Step factories (see chains::commands::codec) ─────────────────────
 
-        let consensus_step = build_codec_consensus_step(
-            self.tuning.per_step_byte_limit,
-            CodecConsensusCaptures {
-                track_rejects,
-                rejects_writer: rejects_writer_for_step,
-                read_name_prefix,
-                read_group_id,
-                consensus_options,
-                accumulators: accumulators_for_step,
-                progress: progress_records,
-            },
-        );
+        let consensus_cap = CodecConsensusCaptures {
+            track_rejects,
+            read_name_prefix,
+            read_group_id,
+            consensus_options,
+            accumulators: accumulators_for_step,
+            progress: progress_records,
+        };
 
         // ── Group-MI preamble: two paths depending on the incoming tail type ──
         //
@@ -3228,12 +3212,41 @@ impl<'a> ChainBuilder<'a> {
             self.pipeline.append_step(group_mi_step, tail)
         };
 
-        // Wire the codec consensus step. For an Intermediate consensus stage
-        // (e.g. fused consensus → filter) this appends DecodeRecords so the
-        // downstream stage receives DecodedRecordBatch; Terminal leaves the
-        // DecompressedBlock for add_sink. See finish_consensus_tail.
-        let tail = self.pipeline.append_step(consensus_step, tail);
-        let tail = self.finish_consensus_tail(tail, position);
+        // Wire the codec consensus step. With `--rejects` it is a 2-output step
+        // (branch 0 = consensus, branch 1 = rejects → BgzfCompress → WriteBgzfFile
+        // with the INPUT header, in input order — the PR #332 fan-out contract);
+        // without rejects it is the 1-output kept-only variant. Mirrors add_correct.
+        let limit = self.tuning.per_step_byte_limit;
+        let consensus_branch0 = if track_rejects {
+            use crate::pipeline::core::topology::BranchIdx;
+            use crate::pipeline::steps::bgzf::compress::BgzfCompress;
+            use crate::pipeline::steps::sink::write_bgzf::WriteBgzfFile;
+
+            let rejects_path = codec.rejects_opts.rejects.as_ref().ok_or_else(|| {
+                anyhow!("rejects path unexpectedly None when track_rejects is set")
+            })?;
+            let rejects_write =
+                WriteBgzfFile::new(rejects_path, &input_header, self.tuning.compression_level)
+                    .map_err(|e| anyhow!("WriteBgzfFile (codec rejects): {e}"))?;
+
+            let step = build_codec_consensus_step_with_rejects(limit, consensus_cap);
+            let pt = self.pipeline.append_step(step, tail);
+
+            let rejects_branch = (pt.0, BranchIdx(1));
+            let rejects_compress_tail = self.pipeline.append_step(
+                BgzfCompress::new(self.tuning.compression_level, limit),
+                rejects_branch,
+            );
+            self.pipeline.append_step(rejects_write, rejects_compress_tail);
+
+            pt
+        } else {
+            let step = build_codec_consensus_step_kept_only(limit, consensus_cap);
+            self.pipeline.append_step(step, tail)
+        };
+        // Branch 0 = consensus DecompressedBlock. Intermediate appends
+        // DecodeRecords; Terminal leaves the DecompressedBlock for add_sink.
+        let tail = self.finish_consensus_tail(consensus_branch0, position);
         self.current_tail = Some(tail);
 
         // Register the codec finalize hook.
@@ -3243,7 +3256,6 @@ impl<'a> ChainBuilder<'a> {
         self.finalize.push(Box::new(CodecFinalizeHook {
             accumulators,
             stats_path: codec.stats_opts.stats.clone(),
-            rejects_writer,
             timer,
         }));
 

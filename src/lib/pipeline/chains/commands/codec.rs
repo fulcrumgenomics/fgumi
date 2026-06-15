@@ -4,7 +4,7 @@
 //! Phase 3 (T3a.10) lifts that logic into
 //! [`crate::pipeline::chains::builder::ChainBuilder`]; this module
 //! now holds the codec-specific types and step factory that the builder
-//! imports: [`CodecFinalizeHook`] and [`build_codec_consensus_step`] used
+//! imports: [`CodecFinalizeHook`] and the `build_codec_consensus_step_with_rejects` / `build_codec_consensus_step_kept_only` factories, used
 //! by `ChainBuilder::add_codec`.
 //!
 //! [`build_codec_chain`] shrinks to a ~10-line delegate.
@@ -22,7 +22,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use log::info;
-use parking_lot::Mutex;
 
 use crate::commands::consensus_runner::ConsensusStatsOps;
 use crate::consensus::codec_caller::{
@@ -34,10 +33,13 @@ use crate::mi_group::MiGroup;
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::pipeline::chains::builder::ChainBuilder;
 use crate::pipeline::chains::{BuiltPipeline, ChainSpec, FinalizeHook};
+use crate::pipeline::core::outputs::OrderedBytesTuple2;
+use crate::pipeline::core::step::Step;
 use crate::pipeline::steps::group::mi::BatchedMiGroups;
-use crate::pipeline::steps::process::{ProcessWithWorkerState, process_with_worker_state};
+use crate::pipeline::steps::process::{
+    Process2Output, ProcessWithWorkerState, process_with_worker_state, process2_with_worker_state,
+};
 use crate::pipeline::steps::types::DecompressedBlock;
-use fgumi_bam_io::RawBamWriter;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CollectedCodecMetrics
@@ -86,13 +88,12 @@ impl crate::pipeline::core::item::HeapSize for CodecState {}
 pub(crate) struct CodecFinalizeHook {
     pub(crate) accumulators: Arc<PerThreadAccumulator<CollectedCodecMetrics>>,
     pub(crate) stats_path: Option<std::path::PathBuf>,
-    pub(crate) rejects_writer: Option<Arc<Mutex<Option<RawBamWriter>>>>,
     pub(crate) timer: OperationTimer,
 }
 
 impl FinalizeHook for CodecFinalizeHook {
     fn finalize(self: Box<Self>) -> Result<()> {
-        let CodecFinalizeHook { accumulators, stats_path, rejects_writer, timer } = *self;
+        let CodecFinalizeHook { accumulators, stats_path, timer } = *self;
 
         // Reduce per-thread accumulators.
         let mut total_groups = 0u64;
@@ -121,16 +122,8 @@ impl FinalizeHook for CodecFinalizeHook {
 
         info!("Wrote {consensus_count} CODEC consensus reads");
 
-        // Finalize the rejects writer (always finalize even on success to flush BGZF EOF).
-        if let Some(rw_arc) = rejects_writer {
-            let maybe_writer = rw_arc.lock().take();
-            if let Some(writer) = maybe_writer {
-                writer
-                    .finish()
-                    .map_err(|e| anyhow::anyhow!("Failed to finish rejects file: {e}"))?;
-                info!("Rejected reads streamed to rejects file during processing");
-            }
-        }
+        // Rejects are emitted on the consensus step's second output branch
+        // (fan-out) and finalized by the rejects branch's WriteBgzfFile sink.
 
         timer.log_completion(consensus_count);
 
@@ -147,16 +140,15 @@ impl FinalizeHook for CodecFinalizeHook {
 // opaque-return position and cannot name themselves.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Captures passed into [`build_codec_consensus_step`] from `add_codec`.
+/// Captures passed into [`build_codec_consensus_step_with_rejects`] / [`build_codec_consensus_step_kept_only`] from `add_codec`.
 ///
 /// Bundles all the cloned scalars and Arcs the closure needs so `add_codec`
 /// can prepare them once and hand them off cleanly.
 ///
 /// `pub(crate)` — consumed only by [`ChainBuilder::add_codec`] and
-/// [`build_codec_consensus_step`].
+/// [`build_codec_consensus_step_with_rejects`] / [`build_codec_consensus_step_kept_only`].
 pub(crate) struct CodecConsensusCaptures {
     pub(crate) track_rejects: bool,
-    pub(crate) rejects_writer: Option<Arc<Mutex<Option<RawBamWriter>>>>,
     pub(crate) read_name_prefix: String,
     pub(crate) read_group_id: String,
     pub(crate) consensus_options: CodecConsensusOptions,
@@ -164,26 +156,164 @@ pub(crate) struct CodecConsensusCaptures {
     pub(crate) progress: Arc<AtomicU64>,
 }
 
-/// Build the `CodecConsensus` step: parallel, `ByItemOrdinal`. Builds a
-/// per-worker [`CodecConsensusCaller`] once, reuses across batches. Streams
-/// rejects inline through `cap.rejects_writer`.
+/// Append `[len:4 LE][record]` framing for a byte-slice record — the format
+/// `BgzfCompress` expects in a `DecompressedBlock`.
+fn append_framed_bytes(dst: &mut Vec<u8>, rec: &[u8]) {
+    #[allow(clippy::cast_possible_truncation)]
+    let block_size = rec.len() as u32;
+    dst.extend_from_slice(&block_size.to_le_bytes());
+    dst.extend_from_slice(rec);
+}
+
+/// Per-worker init: build the `CodecConsensusCaller` once, reused across
+/// batches. Shared by both step variants.
+fn make_codec_consensus_init(
+    read_name_prefix: String,
+    read_group_id: String,
+    consensus_options: CodecConsensusOptions,
+    track_rejects: bool,
+) -> impl Fn() -> CodecState + Send + Sync + 'static {
+    move || {
+        let caller = CodecConsensusCaller::new_with_rejects_tracking(
+            read_name_prefix.clone(),
+            read_group_id.clone(),
+            consensus_options.clone(),
+            track_rejects,
+        );
+        CodecState { caller }
+    }
+}
+
+/// Per-batch CODEC consensus body, shared by both step variants.
 ///
-/// Output: [`DecompressedBlock`] containing concatenated pre-serialized
-/// consensus records, ready for `BgzfCompress`.
-///
-/// Unlike duplex, codec does not apply a record filter, MI-tag transform,
-/// overlapping consensus, or methylation mode — matching fgbio's
-/// `CallCodecConsensusReads` behaviour.
+/// Returns the consensus `DecompressedBlock` (branch 0) and, when
+/// `track_rejects` is set and any record was rejected, a rejects
+/// `DecompressedBlock` (branch 1) of `[len][record]`-framed raw-input records
+/// in input order — the PR #332 fan-out contract (rejects flow through the
+/// ordered serialize/compress stages, not a mutex side-channel; the rejects
+/// writer is configured with the input header by `add_codec`).
+fn run_codec_consensus_batch(
+    state: &mut CodecState,
+    item: BatchedMiGroups,
+    track_rejects: bool,
+    accumulators: &Arc<PerThreadAccumulator<CollectedCodecMetrics>>,
+    progress: &Arc<AtomicU64>,
+) -> io::Result<(DecompressedBlock, Option<DecompressedBlock>)> {
+    let BatchedMiGroups { batch_serial, groups } = item;
+    let groups_count = groups.len() as u64;
+
+    let mut all_output = ConsensusOutput::default();
+    let mut batch_stats = CodecConsensusStats::default();
+    let mut rejects_bytes: Vec<u8> = Vec::new();
+
+    let mut total_input_records: u64 = 0;
+    for MiGroup { mi, records } in groups {
+        state.caller.clear();
+        total_input_records += records.len() as u64;
+
+        let result: anyhow::Result<ConsensusOutput> = state.caller.consensus_reads(records);
+        match result {
+            Ok(group_output) => {
+                all_output.merge(group_output);
+                batch_stats.merge(state.caller.statistics());
+                if track_rejects {
+                    for raw in &state.caller.take_rejected_reads() {
+                        append_framed_bytes(&mut rejects_bytes, raw);
+                    }
+                }
+            }
+            Err(e) => {
+                // Mirrors legacy: a "duplex disagreement" error isn't fatal —
+                // preserve stats + rejects and move on. Anything else is hard.
+                if e.to_string().contains("duplex disagreement") {
+                    batch_stats.merge(state.caller.statistics());
+                    if track_rejects {
+                        for raw in &state.caller.take_rejected_reads() {
+                            append_framed_bytes(&mut rejects_bytes, raw);
+                        }
+                    }
+                } else {
+                    return Err(io::Error::other(format!(
+                        "CODEC consensus error for MI {mi}: {e}"
+                    )));
+                }
+            }
+        }
+    }
+
+    // Merge per-batch metrics into this worker's slot.
+    accumulators.with_slot(|m| {
+        m.stats.merge(&batch_stats);
+        m.groups_processed += groups_count;
+    });
+
+    // Progress logging at million-record boundaries.
+    let prev = progress.fetch_add(total_input_records, Ordering::Relaxed);
+    if (prev + total_input_records) / 1_000_000 > prev / 1_000_000 {
+        info!("Processed {} records", prev + total_input_records);
+    }
+
+    let consensus = DecompressedBlock { batch_serial, bytes: all_output.data };
+    let rejects = if rejects_bytes.is_empty() {
+        None
+    } else {
+        Some(DecompressedBlock { batch_serial, bytes: rejects_bytes })
+    };
+    Ok((consensus, rejects))
+}
+
+/// Build the 2-output `CodecConsensus` step (used when `--rejects` is set):
+/// branch 0 = consensus, branch 1 = rejects.
 ///
 /// `pub(crate)` — consumed only by [`ChainBuilder::add_codec`].
+pub(crate) fn build_codec_consensus_step_with_rejects(
+    limit_bytes: u64,
+    cap: CodecConsensusCaptures,
+) -> impl Step<Input = BatchedMiGroups, Outputs = OrderedBytesTuple2<DecompressedBlock, DecompressedBlock>>
+{
+    let CodecConsensusCaptures {
+        track_rejects,
+        read_name_prefix,
+        read_group_id,
+        consensus_options,
+        accumulators,
+        progress,
+    } = cap;
+
+    let init = make_codec_consensus_init(
+        read_name_prefix,
+        read_group_id,
+        consensus_options,
+        track_rejects,
+    );
+    let body = move |state: &mut CodecState,
+                     item: BatchedMiGroups|
+          -> io::Result<Process2Output<DecompressedBlock, DecompressedBlock>> {
+        let (consensus, rejects) =
+            run_codec_consensus_batch(state, item, track_rejects, &accumulators, &progress)?;
+        match rejects {
+            Some(r) => Ok(Process2Output::both(consensus, r)),
+            None => Ok(Process2Output::only_a(consensus)),
+        }
+    };
+
+    process2_with_worker_state::<
+        BatchedMiGroups,
+        DecompressedBlock,
+        DecompressedBlock,
+        CodecState,
+        _,
+        _,
+    >("CodecConsensus", limit_bytes, limit_bytes, init, body)
+}
+
+/// Build the 1-output kept-only `CodecConsensus` step (used when `--rejects`
+/// is unset). The framework has no public discard sink, so omitting the rejects
+/// branch requires this single-output variant.
 ///
-/// # Panics
-///
-/// Does not panic during construction. Per-worker init failures are
-/// surfaced immediately because `CodecConsensusCaller::new_with_rejects_tracking`
-/// is infallible.
-#[allow(clippy::type_complexity, clippy::too_many_lines)]
-pub(crate) fn build_codec_consensus_step(
+/// `pub(crate)` — consumed only by [`ChainBuilder::add_codec`].
+#[allow(clippy::type_complexity)]
+pub(crate) fn build_codec_consensus_step_kept_only(
     limit_bytes: u64,
     cap: CodecConsensusCaptures,
 ) -> ProcessWithWorkerState<
@@ -195,7 +325,6 @@ pub(crate) fn build_codec_consensus_step(
 > {
     let CodecConsensusCaptures {
         track_rejects,
-        rejects_writer,
         read_name_prefix,
         read_group_id,
         consensus_options,
@@ -203,86 +332,24 @@ pub(crate) fn build_codec_consensus_step(
         progress,
     } = cap;
 
+    let init = make_codec_consensus_init(
+        read_name_prefix,
+        read_group_id,
+        consensus_options,
+        track_rejects,
+    );
+    let body =
+        move |state: &mut CodecState, item: BatchedMiGroups| -> io::Result<DecompressedBlock> {
+            let (consensus, _rejects) =
+                run_codec_consensus_batch(state, item, track_rejects, &accumulators, &progress)?;
+            Ok(consensus)
+        };
+
     process_with_worker_state::<BatchedMiGroups, DecompressedBlock, _, CodecState, _>(
         "CodecConsensus",
         limit_bytes,
-        move || {
-            let caller = CodecConsensusCaller::new_with_rejects_tracking(
-                read_name_prefix.clone(),
-                read_group_id.clone(),
-                consensus_options.clone(),
-                track_rejects,
-            );
-            CodecState { caller }
-        },
-        move |state: &mut CodecState, item: BatchedMiGroups| -> io::Result<DecompressedBlock> {
-            let BatchedMiGroups { batch_serial, groups } = item;
-            let groups_count = groups.len() as u64;
-
-            let mut all_output = ConsensusOutput::default();
-            let mut batch_stats = CodecConsensusStats::default();
-
-            let flush_byte_records = |recs: &[Vec<u8>]| -> io::Result<()> {
-                if let Some(ref rw_arc) = rejects_writer {
-                    if !recs.is_empty() {
-                        let mut guard = rw_arc.lock();
-                        if let Some(w) = guard.as_mut() {
-                            for raw in recs {
-                                w.write_raw_record(raw)?;
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            };
-
-            let mut total_input_records: u64 = 0;
-            for MiGroup { mi, records } in groups {
-                state.caller.clear();
-                total_input_records += records.len() as u64;
-
-                let result: anyhow::Result<ConsensusOutput> = state.caller.consensus_reads(records);
-                match result {
-                    Ok(group_output) => {
-                        all_output.merge(group_output);
-                        batch_stats.merge(state.caller.statistics());
-                        if track_rejects {
-                            flush_byte_records(&state.caller.take_rejected_reads())?;
-                        }
-                    }
-                    Err(e) => {
-                        // Mirrors legacy: a "duplex disagreement" error
-                        // isn't fatal — preserve stats + rejects and move
-                        // on. Anything else is a hard error.
-                        if e.to_string().contains("duplex disagreement") {
-                            batch_stats.merge(state.caller.statistics());
-                            if track_rejects {
-                                flush_byte_records(&state.caller.take_rejected_reads())?;
-                            }
-                        } else {
-                            return Err(io::Error::other(format!(
-                                "CODEC consensus error for MI {mi}: {e}"
-                            )));
-                        }
-                    }
-                }
-            }
-
-            // Merge per-batch metrics into this worker's slot.
-            accumulators.with_slot(|m| {
-                m.stats.merge(&batch_stats);
-                m.groups_processed += groups_count;
-            });
-
-            // Progress logging at million-record boundaries (mirrors
-            // legacy's `ProgressTracker::log_if_needed`).
-            let prev = progress.fetch_add(total_input_records, Ordering::Relaxed);
-            if (prev + total_input_records) / 1_000_000 > prev / 1_000_000 {
-                info!("Processed {} records", prev + total_input_records);
-            }
-
-            Ok(DecompressedBlock { batch_serial, bytes: all_output.data })
-        },
+        init,
+        body,
     )
 }
 
