@@ -219,6 +219,13 @@ impl MemoryDebugStats {
     }
 }
 
+#[cfg(feature = "memory-debug")]
+impl Default for MemoryDebugStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ============================================================================
 // Thread-Local Memory Tracking
 // ============================================================================
@@ -229,7 +236,7 @@ const THREAD_ID_UNSET: usize = usize::MAX;
 
 #[cfg(feature = "memory-debug")]
 thread_local! {
-    static THREAD_ID: std::cell::Cell<usize> = std::cell::Cell::new(THREAD_ID_UNSET);
+    static THREAD_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(THREAD_ID_UNSET) };
 }
 
 #[cfg(feature = "memory-debug")]

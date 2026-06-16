@@ -979,7 +979,7 @@ mod stress_tests {
                     move |record: RecordBuf| {
                         let n = count_clone.fetch_add(1, Ordering::Relaxed);
                         if n == fail_at {
-                            return Err(io::Error::new(io::ErrorKind::Other, "random fail"));
+                            return Err(io::Error::other("random fail"));
                         }
                         Ok(record)
                     },
@@ -1030,8 +1030,8 @@ mod stress_tests {
                                 })
                             })
                             .unwrap_or(0);
-                        if hash % 10 == 0 {
-                            return Err(io::Error::new(io::ErrorKind::Other, "intermittent fail"));
+                        if hash.is_multiple_of(10) {
+                            return Err(io::Error::other("intermittent fail"));
                         }
                         Ok(record)
                     },
