@@ -31,12 +31,11 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fgoxide::io::DelimFile;
 use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::{create_bam_reader_for_pipeline, create_bam_writer, is_stdin_path};
+use fgumi_bam_io::{create_bam_reader_for_pipeline, create_bam_writer};
 // MemoryEstimate is gated because it's only used in memory-debug blocks below
 use crate::sam::SamTag;
 #[cfg(feature = "memory-debug")]
 use crate::unified_pipeline::MemoryEstimate;
-use crate::validation::validate_file_exists;
 use fgumi_raw_bam::{RawBamReader, RawRecord};
 use log::{info, warn};
 use noodles::sam::Header;
@@ -917,10 +916,8 @@ impl Command for GroupReadsByUmi {
             (self.strategy, false)
         };
 
-        // Validate input file exists (skip for stdin)
-        if !is_stdin_path(&self.io.input) {
-            validate_file_exists(&self.io.input, "input BAM file")?;
-        }
+        // Validate the input exists (stdin paths are exempt).
+        self.io.validate()?;
 
         // Set minimum mapping quality
         let min_mapq: u8 = self.min_map_q.unwrap_or(1);
