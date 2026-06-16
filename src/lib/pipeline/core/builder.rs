@@ -751,7 +751,6 @@ impl Pipeline {
             build_chain_contexts, build_worker_storage, is_fusible_chain, run_fused_single_thread,
             run_worker_loop,
         };
-        use super::signal::PipelineError;
         use super::step::StepKind;
         use super::topology::StepIdx;
 
@@ -1022,17 +1021,7 @@ impl Pipeline {
         // (io::Error isn't Clone); reconstruct from the recorded outcome.
         let _ = graph;
         match signal.outcome() {
-            Some(PipelineError::Cancelled) => Err(PipelineError::Cancelled),
-            Some(PipelineError::Io { step, source }) => Err(PipelineError::Io {
-                step,
-                source: std::io::Error::new(source.kind(), format!("{source}")),
-            }),
-            Some(PipelineError::NotEnoughThreads { required, available }) => {
-                Err(PipelineError::NotEnoughThreads { required: *required, available: *available })
-            }
-            Some(PipelineError::TimedOut { stalled_secs }) => {
-                Err(PipelineError::TimedOut { stalled_secs: *stalled_secs })
-            }
+            Some(err) => Err(err.reconstruct()),
             None => Ok(()),
         }
     }
