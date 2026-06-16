@@ -11,9 +11,6 @@ use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-// `rstest` is imported here for the file-vs-stdin parity tests added in a later
-// task; no test in this file references it yet.
-#[allow(unused_imports)]
 use rstest::rstest;
 use tempfile::TempDir;
 
@@ -289,7 +286,6 @@ fn create_grouped_test_bam(path: &PathBuf) {
 
 /// Run `fgumi` with `args`; if `stdin_bam` is `Some`, pipe that BAM to its
 /// stdin via `cat`. Asserts the process exits successfully.
-#[allow(dead_code)] // used by the sort stdin parity tests added in a later task
 fn run_fgumi_checked(args: &[String], stdin_bam: Option<&std::path::Path>) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_fgumi"));
     command.args(args);
@@ -310,7 +306,6 @@ fn run_fgumi_checked(args: &[String], stdin_bam: Option<&std::path::Path>) {
 /// Assert a command emits byte-identical records reading `input_bam` from a
 /// file vs piped stdin (`-`) vs `/dev/stdin`. `build_args(input, output)`
 /// returns the full argv for one invocation; `label` namespaces temp outputs.
-#[allow(dead_code)] // used by the sort stdin parity tests added in a later task
 fn assert_stdin_input_parity(
     input_bam: &std::path::Path,
     temp: &std::path::Path,
@@ -338,7 +333,6 @@ fn assert_stdin_input_parity(
 }
 
 /// Count records in a BAM (eager decode). Used to reject vacuous parity tests.
-#[allow(dead_code)] // used by the sort stdin parity tests added in a later task
 fn count_bam_records(path: &std::path::Path) -> usize {
     let mut reader = bam::io::reader::Builder.build_from_path(path).expect("open BAM for count");
     let header = reader.read_header().expect("read header for count");
@@ -350,7 +344,63 @@ fn count_bam_records(path: &std::path::Path) -> usize {
     count
 }
 
-#[allow(dead_code)] // used by the sort stdin parity tests added in a later task
 fn s(v: &str) -> String {
     v.to_string()
+}
+
+#[rstest]
+#[case("1")]
+#[case("2")]
+fn test_sort_reads_stdin_once(#[case] threads: &str) {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("input.bam");
+    create_test_input_bam(&input);
+    assert_stdin_input_parity(&input, dir.path(), "sort", |i, o| {
+        vec![
+            s("sort"),
+            s("--input"),
+            s(i),
+            s("--output"),
+            s(o),
+            s("--order"),
+            s("coordinate"),
+            s("--threads"),
+            s(threads),
+            s("--compression-level"),
+            s("1"),
+        ]
+    });
+}
+
+/// `sort --verify` reads its input twice (header probe + a fresh record
+/// re-scan via `File::open`), which a non-seekable stdin stream can't satisfy,
+/// so it must be rejected up front with a clear message rather than failing
+/// deep in a re-open. (Plain `sort` streams stdin once and IS supported.)
+///
+/// The rejection keys off `is_stdin_path`, so both `-` and `/dev/stdin` must be
+/// rejected — `/dev/stdin` is a real path (`Path::exists` is `true`), so a gate
+/// keyed on the literal `-` would let it slip into the double-read path.
+#[rstest]
+#[case("-")]
+#[case("/dev/stdin")]
+fn test_sort_verify_rejects_stdin_with_clear_message(#[case] input_arg: &str) {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("input.bam");
+    create_test_input_bam(&input);
+    let cat = Command::new("cat")
+        .arg(input.to_str().unwrap())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn cat");
+    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args(["sort", "--verify", "--input", input_arg, "--order", "coordinate"])
+        .stdin(cat.stdout.unwrap())
+        .output()
+        .unwrap_or_else(|e| panic!("run sort --verify -i {input_arg}: {e}"));
+    assert!(!output.status.success(), "sort --verify from stdin ({input_arg}) must be rejected");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("stdin"),
+        "sort --verify stdin ({input_arg}) rejection should mention stdin; stderr: {stderr}"
+    );
 }
