@@ -844,11 +844,9 @@ allocated based on the command's workload profile to optimize performance.
 Example: --threads 8 spawns 8 pipeline threads (2 reader, 4 workers, 2 writer)
 
 Note: when --parallel-group-min-templates (or --allow-unmapped) engages the parallel UMI
-assigner, each parallel assigner constructs its own rayon thread pool of size --threads,
-independent of the pipeline threads above. As an example, one pipeline worker overlapping a
-single parallel assigner briefly runs ~2 * --threads OS threads; this is not an upper bound,
-because multiple pipeline workers can each spawn a --threads-sized pool concurrently and push
-the live thread count higher still. See --parallel-group-min-templates for details.
+assigner, each parallel assigner spawns its own rayon thread pool of size --threads, on top
+of the pipeline threads above, so the peak OS-thread count can exceed --threads. See
+--parallel-group-min-templates for the full caveat.
 "#
 )]
 #[allow(clippy::struct_excessive_bools)]
