@@ -450,3 +450,229 @@ fn test_simplex_single_threaded_reads_stdin_once(#[case] async_reader: bool) {
         args
     });
 }
+
+fn push_threads(args: &mut Vec<String>, threads: Option<&str>) {
+    if let Some(t) = threads {
+        args.push(s("--threads"));
+        args.push(s(t));
+    }
+}
+
+#[rstest]
+#[case("1")]
+#[case("2")]
+fn test_group_reads_stdin_once(#[case] threads: &str) {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("input.bam");
+    create_test_input_bam(&input);
+    assert_stdin_input_parity(&input, dir.path(), "group", |i, o| {
+        vec![
+            s("group"),
+            s("--input"),
+            s(i),
+            s("--output"),
+            s(o),
+            s("--strategy"),
+            s("identity"),
+            s("--edits"),
+            s("0"),
+            s("--threads"),
+            s(threads),
+            s("--compression-level"),
+            s("1"),
+        ]
+    });
+}
+
+#[rstest]
+#[case("1")]
+#[case("2")]
+fn test_dedup_reads_stdin_once(#[case] threads: &str) {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("input.bam");
+    create_test_input_bam(&input);
+    assert_stdin_input_parity(&input, dir.path(), "dedup", |i, o| {
+        vec![
+            s("dedup"),
+            s("--input"),
+            s(i),
+            s("--output"),
+            s(o),
+            s("--strategy"),
+            s("identity"),
+            s("--edits"),
+            s("0"),
+            s("--threads"),
+            s(threads),
+            s("--compression-level"),
+            s("1"),
+        ]
+    });
+}
+
+/// correct has a single-threaded fast path (no `--threads`) plus the
+/// multi-threaded path; cover both (single-threaded exercises the reader reuse).
+#[rstest]
+#[case::single_threaded(None)]
+#[case::multi_threaded(Some("2"))]
+fn test_correct_reads_stdin_once(#[case] threads: Option<&str>) {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("input.bam");
+    create_test_input_bam(&input);
+    // create_test_input_bam tags reads with RX = AAAAAAAA / CCCCCCCC.
+    assert_stdin_input_parity(&input, dir.path(), "correct", move |i, o| {
+        let mut args = vec![
+            s("correct"),
+            s("--input"),
+            s(i),
+            s("--output"),
+            s(o),
+            s("--umis"),
+            s("AAAAAAAA"),
+            s("--umis"),
+            s("CCCCCCCC"),
+            s("--min-distance"),
+            s("1"),
+            s("--compression-level"),
+            s("1"),
+        ];
+        push_threads(&mut args, threads);
+        args
+    });
+}
+
+/// codec has a single-threaded fast path (no `--threads`) plus the
+/// multi-threaded path; cover both.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::multi_threaded(Some("2"))]
+fn test_codec_reads_stdin_once(#[case] threads: Option<&str>) {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("codec.bam");
+    let pairs: Vec<_> = (0..3)
+        .map(|i| {
+            crate::test_codec_command::create_codec_read_pair(
+                &format!("read{i}"),
+                b"ACGTACGT",
+                b"ACGTACGT",
+                &[30; 8],
+                &[30; 8],
+                100,
+                "UMI001",
+                None,
+            )
+        })
+        .collect();
+    crate::test_codec_command::create_codec_test_bam(&input, pairs);
+    assert_stdin_input_parity(&input, dir.path(), "codec", move |i, o| {
+        let mut args = vec![
+            s("codec"),
+            s("--input"),
+            s(i),
+            s("--output"),
+            s(o),
+            s("--min-reads"),
+            s("1"),
+            s("--min-duplex-length"),
+            s("1"),
+            s("--compression-level"),
+            s("1"),
+        ];
+        push_threads(&mut args, threads);
+        args
+    });
+}
+
+/// duplex has a single-threaded fast path (no `--threads`) plus the
+/// multi-threaded path; cover both.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::multi_threaded(Some("2"))]
+fn test_duplex_reads_stdin_once(#[case] threads: Option<&str>) {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("duplex.bam");
+    let molecule =
+        crate::test_duplex_command::create_duplex_molecule("MI001", "ACGTACGT", 30, 100, 3);
+    crate::test_duplex_command::create_duplex_bam(&input, vec![molecule]);
+    assert_stdin_input_parity(&input, dir.path(), "duplex", move |i, o| {
+        let mut args = vec![
+            s("duplex"),
+            s("--input"),
+            s(i),
+            s("--output"),
+            s(o),
+            s("--min-reads"),
+            s("1"),
+            s("--compression-level"),
+            s("1"),
+        ];
+        push_threads(&mut args, threads);
+        args
+    });
+}
+
+#[rstest]
+#[case("1")]
+#[case("2")]
+fn test_filter_reads_stdin_once(#[case] threads: &str) {
+    use crate::helpers::bam_generator::create_test_reference;
+    let dir = TempDir::new().unwrap();
+    let reference = create_test_reference(dir.path()).to_str().unwrap().to_string();
+    let input = dir.path().join("consensus.bam");
+    crate::test_filter_command::write_filter_consensus_bam(&input);
+    assert_stdin_input_parity(&input, dir.path(), "filter", move |i, o| {
+        // --ref is required when filtering mapped reads (NM/UQ/MD).
+        vec![
+            s("filter"),
+            s("--input"),
+            s(i),
+            s("--output"),
+            s(o),
+            s("--ref"),
+            reference.clone(),
+            s("--min-reads"),
+            s("1"),
+            s("--max-no-call-fraction"),
+            s("1.0"),
+            s("--threads"),
+            s(threads),
+            s("--compression-level"),
+            s("1"),
+        ]
+    });
+}
+
+/// clip has a single-threaded fast path (no `--threads`) plus the
+/// multi-threaded path; cover both.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::multi_threaded(Some("2"))]
+fn test_clip_reads_stdin_once(#[case] threads: Option<&str>) {
+    use crate::helpers::bam_generator::{create_paired_umi_family, create_test_reference};
+    let dir = TempDir::new().unwrap();
+    let reference = create_test_reference(dir.path()).to_str().unwrap().to_string();
+    let input = dir.path().join("paired.bam");
+    let header = create_minimal_header("chr1", 10000);
+    let mut writer = bam::io::Writer::new(fs::File::create(&input).expect("create paired BAM"));
+    writer.write_header(&header).expect("write header");
+    for raw in &create_paired_umi_family("ACGTACGT", 3, "clip", "ACGTACGTAC", "TGCATGCATG", 30) {
+        writer.write_alignment_record(&header, &to_record_buf(raw)).expect("write paired record");
+    }
+    writer.try_finish().expect("finish BAM");
+    assert_stdin_input_parity(&input, dir.path(), "clip", move |i, o| {
+        let mut args = vec![
+            s("clip"),
+            s("--input"),
+            s(i),
+            s("--output"),
+            s(o),
+            s("--reference"),
+            reference.clone(),
+            s("--clip-overlapping-reads"),
+            s("--compression-level"),
+            s("1"),
+        ];
+        push_threads(&mut args, threads);
+        args
+    });
+}

@@ -59,17 +59,16 @@ use crate::unified_pipeline::{
     Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
     run_bam_pipeline_from_reader_with_secondary,
 };
-use crate::validation::validate_file_exists;
 use ahash::AHashMap;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::{
     BamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
-    create_optional_bam_writer, create_raw_bam_reader_with_opts,
+    create_optional_bam_writer,
 };
 use fgumi_raw_bam;
-use fgumi_raw_bam::RawRecord;
+use fgumi_raw_bam::{RawBamReader, RawRecord};
 use log::{info, warn};
 use lru::LruCache;
 use noodles::sam::Header;
@@ -439,10 +438,10 @@ impl Command for CorrectUmis {
                 self.rejects_opts.rejects.is_some(),
             )?
         } else {
-            // Drop reader for single-threaded mode - uses its own iterator
-            drop(reader);
-            // Single-threaded: main thread only, template-level optimization
+            // Single-threaded: reuse the already-opened reader (required for stdin —
+            // re-opening would double-consume a pipe). Mirrors group::execute_single_threaded.
             self.execute_single_thread_mode(
+                reader,
                 header,
                 encoded_umi_set,
                 umi_length,
@@ -470,7 +469,9 @@ impl CorrectUmis {
         if self.umis.is_empty() && self.umi_files.is_empty() {
             bail!("At least one UMI or UMI file must be provided.");
         }
-        validate_file_exists(&self.io.input, "input BAM file")?;
+        // Validate the input exists (stdin paths are exempt — the reader
+        // streams them in a single pass).
+        self.io.validate()?;
         if let Some(min) = self.min_corrected {
             if !(0.0..=1.0).contains(&min) {
                 bail!("--min-corrected must be between 0 and 1.");
@@ -1134,6 +1135,7 @@ impl CorrectUmis {
     #[allow(clippy::too_many_lines)]
     fn execute_single_thread_mode(
         &self,
+        reader: Box<dyn std::io::Read + Send>,
         header: Header,
         encoded_umi_set: EncodedUmiSet,
         umi_length: usize,
@@ -1141,9 +1143,13 @@ impl CorrectUmis {
     ) -> Result<u64> {
         info!("Using single-threaded mode with template-level UMI correction");
 
-        // Open input BAM reader (raw-byte reader for zero-copy processing)
-        let (mut bam_reader, _) =
-            create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())?;
+        // Reuse the already-opened reader (required for stdin: re-opening a pipe
+        // double-consumes it). Skip past the BAM header to reach records, then
+        // wrap in RawBamReader for zero-copy processing.
+        let buf_reader = std::io::BufReader::new(reader);
+        let mut noodles_reader = noodles::bam::io::Reader::new(buf_reader);
+        let _ = noodles_reader.read_header().context("Failed to skip BAM header")?;
+        let mut bam_reader = RawBamReader::new(noodles_reader.into_inner());
 
         // Open output writer (single-threaded)
         let mut writer =

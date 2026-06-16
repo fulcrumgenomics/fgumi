@@ -46,15 +46,9 @@ fn create_consensus_bam(path: &Path, records: Vec<RawRecord>) {
     writer.try_finish().expect("Failed to finish BAM");
 }
 
-/// Test basic filter command with passing reads.
-#[test]
-fn test_filter_command_basic() {
-    let temp_dir = TempDir::new().unwrap();
-    let input_bam = temp_dir.path().join("input.bam");
-    let output_bam = temp_dir.path().join("output.bam");
-    let ref_path = create_test_reference(temp_dir.path());
-
-    // Create consensus reads with good quality and per-base tags (cd/ce).
+/// Write a small mapped-consensus BAM (two reads with CD/CE per-base tags that
+/// pass `filter`). Shared by `test_filter_command` and the stdin parity test.
+pub(crate) fn write_filter_consensus_bam(path: &Path) {
     let r1 = {
         let mut b = RawSamBuilder::new();
         b.read_name(b"cons1")
@@ -67,7 +61,6 @@ fn test_filter_command_basic() {
         b.add_array_u16(SamTag::CD_BASES, &[10; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
         b.build()
     };
-
     let r2 = {
         let mut b = RawSamBuilder::new();
         b.read_name(b"cons2")
@@ -80,8 +73,18 @@ fn test_filter_command_basic() {
         b.add_array_u16(SamTag::CD_BASES, &[5; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
         b.build()
     };
+    create_consensus_bam(path, vec![r1, r2]);
+}
 
-    create_consensus_bam(&input_bam, vec![r1, r2]);
+/// Test basic filter command with passing reads.
+#[test]
+fn test_filter_command_basic() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+
+    write_filter_consensus_bam(&input_bam);
 
     let cmd = Filter::try_parse_from([
         "filter",
