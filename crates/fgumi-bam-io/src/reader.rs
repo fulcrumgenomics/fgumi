@@ -163,6 +163,22 @@ fn open_bgzf_reader(
     threads: usize,
     label: &str,
 ) -> Result<BgzfReaderEnum> {
+    // stdin can't be re-opened: `File::open("-")` fails outright, and
+    // `File::open("/dev/stdin")` re-reads fd 0 — losing any bytes a caller
+    // already consumed. Read the process stdin directly so this BGZF reader is
+    // the sole consumer (fixes the single-threaded double-open data loss).
+    if is_stdin_path(path) {
+        // Honor --async-reader for stdin too (parity with the file path below):
+        // a pipe benefits from prefetch overlapping upstream production with us.
+        let reader: Box<dyn Read + Send> = if opts.async_reader {
+            log::info!("async {label} enabled: spawning fgumi-prefetch thread for stdin");
+            Box::new(crate::prefetch_reader::PrefetchReader::new(io::stdin()))
+        } else {
+            Box::new(io::stdin())
+        };
+        return Ok(make_bgzf_reader(reader, threads));
+    }
+
     let file = File::open(path)
         .with_context(|| format!("Failed to open input BAM: {}", path.display()))?;
     crate::os_hints::advise_sequential(&file);

@@ -185,6 +185,14 @@ fn test_simplex_command_with_piped_input() {
     assert!(status.success(), "Simplex command with piped input failed");
     assert!(output_from_pipe.exists(), "Output BAM from pipe not created");
 
+    // Guard against a vacuous pass: simplex must actually emit consensus records,
+    // otherwise the file-vs-pipe comparison below is trivially true (0 == 0) even
+    // if stdin were dropped entirely.
+    assert!(
+        count_bam_records(&output_from_file) > 0,
+        "simplex produced no consensus records — parity check would be vacuous"
+    );
+
     // Compare outputs - records should be identical (headers may differ due to @PG command line)
     compare_bam_records(&output_from_file, &output_from_pipe);
 }
@@ -260,24 +268,27 @@ fn create_grouped_test_bam(path: &PathBuf) {
         bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
     writer.write_header(&header).expect("Failed to write header");
 
-    // Create grouped reads with MI tag
+    // Create grouped reads with MI tag.
+    //
+    // MI MUST be a STRING tag: `fgumi group` writes the MoleculeId as a string,
+    // and the consensus callers group reads by reading MI as a string (see
+    // `MiGrouper::get_mi_tag` via `find_string_tag_in_record`). An integer MI is
+    // invisible to the grouper — every read is dropped, so simplex/duplex emit
+    // zero consensus records (which would silently make the parity tests vacuous).
     let mi_tag = Tag::from(fgumi_lib::sam::SamTag::MI);
-    let records = create_umi_family("AAAAAAAA", 5, "mol1", "ACGTACGT", 30);
 
-    // Add MI tag to each record (convert to RecordBuf first to enable tag mutation)
-    let mi_value = 1;
+    let records = create_umi_family("AAAAAAAA", 5, "mol1", "ACGTACGT", 30);
     for raw in &records {
         let mut rec = to_record_buf(raw);
-        rec.data_mut().insert(mi_tag, Value::from(mi_value));
+        rec.data_mut().insert(mi_tag, Value::String("1".into()));
         writer.write_alignment_record(&header, &rec).expect("Failed to write record");
     }
 
     // Second family with different MI
-    let mi_value2 = 2;
     let records2 = create_umi_family("CCCCCCCC", 3, "mol2", "TGCATGCA", 30);
     for raw in &records2 {
         let mut rec = to_record_buf(raw);
-        rec.data_mut().insert(mi_tag, Value::from(mi_value2));
+        rec.data_mut().insert(mi_tag, Value::String("2".into()));
         writer.write_alignment_record(&header, &rec).expect("Failed to write record");
     }
 
@@ -403,4 +414,39 @@ fn test_sort_verify_rejects_stdin_with_clear_message(#[case] input_arg: &str) {
         stderr.contains("stdin"),
         "sort --verify stdin ({input_arg}) rejection should mention stdin; stderr: {stderr}"
     );
+}
+
+/// Single-threaded `simplex -i -` exercises the shared `open_bgzf_reader` stdin
+/// path (the multi-threaded path does not — which is how the single-threaded
+/// `File::open("-")` double-open regression shipped). With `--async-reader`, the
+/// stdin branch must also spawn the prefetch thread and still read correctly.
+/// `assert_stdin_input_parity` covers both `-` and `/dev/stdin` and guards
+/// against a vacuous pass (it requires the file baseline to emit records).
+#[rstest]
+#[case::sync(false)]
+#[case::async_reader(true)]
+fn test_simplex_single_threaded_reads_stdin_once(#[case] async_reader: bool) {
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let input = dir.path().join("input.bam");
+    create_grouped_test_bam(&input);
+    // No `--threads` → single-threaded fast path.
+    assert_stdin_input_parity(&input, dir.path(), "simplex", move |i, o| {
+        let mut args = vec![
+            s("simplex"),
+            s("--input"),
+            s(i),
+            s("--output"),
+            s(o),
+            s("--min-reads"),
+            s("1"),
+            s("--min-consensus-base-quality"),
+            s("0"),
+            s("--compression-level"),
+            s("1"),
+        ];
+        if async_reader {
+            args.push(s("--async-reader"));
+        }
+        args
+    });
 }
