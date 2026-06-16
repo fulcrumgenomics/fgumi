@@ -185,6 +185,15 @@ fn test_simplex_command_with_piped_input() {
     assert!(status.success(), "Simplex command with piped input failed");
     assert!(output_from_pipe.exists(), "Output BAM from pipe not created");
 
+    // Guard against a vacuous pass: simplex must actually emit consensus records,
+    // otherwise the file-vs-pipe comparison below is trivially true (0 == 0) even
+    // if stdin were dropped entirely. (A non-string MI tag in the input silently
+    // produces zero consensus reads — see create_grouped_test_bam.)
+    assert!(
+        count_bam_records(&output_from_file) > 0,
+        "simplex produced no consensus records — parity check would be vacuous"
+    );
+
     // Compare outputs - records should be identical (headers may differ due to @PG command line)
     compare_bam_records(&output_from_file, &output_from_pipe);
 }
@@ -260,24 +269,28 @@ fn create_grouped_test_bam(path: &PathBuf) {
         bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
     writer.write_header(&header).expect("Failed to write header");
 
-    // Create grouped reads with MI tag
+    // Create grouped reads with MI tag.
+    //
+    // MI MUST be a STRING tag: `fgumi group` writes the MoleculeId as a string,
+    // and the consensus callers group reads by reading MI via
+    // `find_string_tag_in_record` (see `MiGrouper::get_mi_tag`). An integer MI is
+    // invisible to the grouper — every read is dropped, so simplex/duplex emit
+    // zero consensus records. Writing it as an integer here silently made the
+    // simplex stdin parity tests vacuous (comparing 0 records vs 0 records).
     let mi_tag = Tag::from(fgumi_lib::sam::SamTag::MI);
-    let records = create_umi_family("AAAAAAAA", 5, "mol1", "ACGTACGT", 30);
 
-    // Add MI tag to each record (convert to RecordBuf first to enable tag mutation)
-    let mi_value = 1;
+    let records = create_umi_family("AAAAAAAA", 5, "mol1", "ACGTACGT", 30);
     for raw in &records {
         let mut rec = to_record_buf(raw);
-        rec.data_mut().insert(mi_tag, Value::from(mi_value));
+        rec.data_mut().insert(mi_tag, Value::String("1".into()));
         writer.write_alignment_record(&header, &rec).expect("Failed to write record");
     }
 
     // Second family with different MI
-    let mi_value2 = 2;
     let records2 = create_umi_family("CCCCCCCC", 3, "mol2", "TGCATGCA", 30);
     for raw in &records2 {
         let mut rec = to_record_buf(raw);
-        rec.data_mut().insert(mi_tag, Value::from(mi_value2));
+        rec.data_mut().insert(mi_tag, Value::String("2".into()));
         writer.write_alignment_record(&header, &rec).expect("Failed to write record");
     }
 
