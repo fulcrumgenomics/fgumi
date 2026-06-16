@@ -760,8 +760,6 @@ impl Template {
 /// return `None` even when found, so the downstream consumer falls back to
 /// scanning aux data.
 fn primary_read_cached_umi(records: &[fgumi_bam_io::DecodedRecord]) -> Option<(u32, u16)> {
-    use fgumi_raw_bam;
-
     let mut primary_r2: Option<&fgumi_bam_io::DecodedRecord> = None;
 
     for decoded in records {
@@ -776,24 +774,15 @@ fn primary_read_cached_umi(records: &[fgumi_bam_io::DecodedRecord]) -> Option<(u
         let is_r1 = !is_paired || is_first;
 
         if is_r1 {
-            let (offset, len) = decoded.cached_umi_position();
-            if offset == fgumi_bam_io::DecodedRecord::UMI_OFFSET_UNCACHED {
-                return None;
-            }
-            return Some((offset, len));
+            // First non-secondary/supplementary R1 wins, cached or not.
+            return decoded.cached_umi_position_opt();
         }
         if primary_r2.is_none() {
             primary_r2 = Some(decoded);
         }
     }
 
-    let r2 = primary_r2?;
-    let (offset, len) = r2.cached_umi_position();
-    if offset == fgumi_bam_io::DecodedRecord::UMI_OFFSET_UNCACHED {
-        None
-    } else {
-        Some((offset, len))
-    }
+    primary_r2?.cached_umi_position_opt()
 }
 
 /// Sets mate flags (`MATE_REVERSE`, `MATE_UNMAPPED`) on a raw BAM record.
