@@ -1374,8 +1374,6 @@ impl VanillaUmiConsensusCaller {
         errors: &[u16],
         methylation: Option<&crate::methylation::MethylationAnnotation>,
     ) {
-        let read_name = format!("{}:{}", self.read_name_prefix, umi);
-
         let mut flag = flags::UNMAPPED;
         match read_type {
             ReadType::R1 => {
@@ -1387,7 +1385,15 @@ impl VanillaUmiConsensusCaller {
             ReadType::Fragment => {}
         }
 
-        self.bam_builder.build_record(read_name.as_bytes(), flag, bases, quals);
+        // Read name is `<prefix>:<umi>`; compose it straight into the record
+        // buffer rather than allocating a fresh `String` per output read.
+        self.bam_builder.build_record_joined_name(
+            self.read_name_prefix.as_bytes(),
+            umi.as_bytes(),
+            flag,
+            bases,
+            quals,
+        );
 
         // RG tag
         self.bam_builder.append_string_tag(SamTag::RG, self.read_group_id.as_bytes());
