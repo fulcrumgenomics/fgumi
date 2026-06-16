@@ -189,19 +189,9 @@ pub fn run_fused_single_thread(
     }
 
     // Map the recorded outcome to the run result (same shape as `Pipeline::run`;
-    // `PipelineError` is not `Clone`, so reconstruct the `Io` variant).
+    // `PipelineError` is not `Clone`, so reconstruct via `PipelineError::reconstruct`).
     match signal.outcome() {
-        Some(PipelineError::Cancelled) => Err(PipelineError::Cancelled),
-        Some(PipelineError::Io { step, source }) => Err(PipelineError::Io {
-            step,
-            source: std::io::Error::new(source.kind(), format!("{source}")),
-        }),
-        Some(PipelineError::NotEnoughThreads { required, available }) => {
-            Err(PipelineError::NotEnoughThreads { required: *required, available: *available })
-        }
-        Some(PipelineError::TimedOut { stalled_secs }) => {
-            Err(PipelineError::TimedOut { stalled_secs: *stalled_secs })
-        }
+        Some(err) => Err(err.reconstruct()),
         None => Ok(()),
     }
 }

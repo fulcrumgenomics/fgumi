@@ -26,6 +26,29 @@ pub enum PipelineError {
     TimedOut { stalled_secs: u64 },
 }
 
+impl PipelineError {
+    /// Reconstruct an owned copy of this error.
+    ///
+    /// `PipelineError` is not `Clone` because its `Io` variant holds an
+    /// [`io::Error`], which is not `Clone`; this rebuilds that source from its
+    /// `kind()` + display string. Used to turn the borrowed `signal.outcome()`
+    /// into the owned error returned from the run drivers (`Pipeline::run` and
+    /// the fused single-thread driver), which previously open-coded the same
+    /// per-variant rematch in two places.
+    pub(crate) fn reconstruct(&self) -> PipelineError {
+        match self {
+            Self::Cancelled => Self::Cancelled,
+            Self::Io { step, source } => {
+                Self::Io { step, source: io::Error::new(source.kind(), format!("{source}")) }
+            }
+            Self::NotEnoughThreads { required, available } => {
+                Self::NotEnoughThreads { required: *required, available: *available }
+            }
+            Self::TimedOut { stalled_secs } => Self::TimedOut { stalled_secs: *stalled_secs },
+        }
+    }
+}
+
 impl std::fmt::Display for PipelineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -209,5 +232,29 @@ mod tests {
         handle.cancel();
         assert!(handle.is_cancelled());
         assert!(signal.is_cancelled());
+    }
+
+    #[test]
+    fn reconstruct_preserves_every_variant() {
+        // `reconstruct` rebuilds an owned error from a borrow (PipelineError
+        // isn't Clone). Each variant must round-trip; the `Io` source is
+        // rebuilt from kind + display, the rest are copied verbatim.
+        let io = PipelineError::Io { step: "s", source: io::Error::other("boom") }.reconstruct();
+        match io {
+            PipelineError::Io { step, source } => {
+                assert_eq!(step, "s");
+                assert_eq!(source.kind(), io::ErrorKind::Other);
+                assert_eq!(source.to_string(), "boom");
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
+
+        assert!(matches!(PipelineError::Cancelled.reconstruct(), PipelineError::Cancelled));
+
+        let net = PipelineError::NotEnoughThreads { required: 4, available: 2 }.reconstruct();
+        assert!(matches!(net, PipelineError::NotEnoughThreads { required: 4, available: 2 }));
+
+        let to = PipelineError::TimedOut { stalled_secs: 60 }.reconstruct();
+        assert!(matches!(to, PipelineError::TimedOut { stalled_secs: 60 }));
     }
 }
