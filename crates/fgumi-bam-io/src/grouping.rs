@@ -242,6 +242,19 @@ impl DecodedRecord {
         (self.umi_value_offset, self.umi_value_len)
     }
 
+    /// Returns the cached UMI `(offset, len)` position, or `None` when no
+    /// position was recorded during decode (the [`Self::UMI_OFFSET_UNCACHED`]
+    /// sentinel). Keeps the sentinel check at the owning layer so callers can
+    /// branch on a plain `Option` instead of comparing against the sentinel.
+    #[must_use]
+    pub fn cached_umi_position_opt(&self) -> Option<(u32, u16)> {
+        if self.umi_value_offset == Self::UMI_OFFSET_UNCACHED {
+            None
+        } else {
+            Some((self.umi_value_offset, self.umi_value_len))
+        }
+    }
+
     /// Returns a reference to the raw bytes.
     #[must_use]
     pub fn raw_bytes(&self) -> &[u8] {
