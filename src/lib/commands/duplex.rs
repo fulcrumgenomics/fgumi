@@ -8,9 +8,7 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fgoxide::io::DelimFile;
-use fgumi_bam_io::{
-    create_bam_writer, create_optional_bam_writer, create_raw_bam_reader_with_opts,
-};
+use fgumi_bam_io::{create_bam_writer, create_optional_bam_writer};
 
 use super::common::{
     BamIoOptions, CompressionOptions, ConsensusCallingOptions, OverlappingConsensusOptions,
@@ -437,16 +435,15 @@ impl Command for Duplex {
         }
 
         // Single-threaded fast path is BAM-only: open the raw reader once and
-        // derive the header from it. SAM input (not BGZF) fails the header read
-        // here; surface the --threads hint instead of a cryptic BGZF-magic error
-        // (mirrors the codec/simplex single-threaded paths).
+        // derive the header from it (shared with codec/simplex). SAM input (not
+        // BGZF) fails the header read with a --threads hint instead of a cryptic
+        // BGZF-magic error.
         let (mut raw_reader, header) =
-            create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())
-                .with_context(|| {
-                    "Failed to open input as BAM. The single-threaded duplex path is BAM-only; \
-                     if this is SAM input, pass --threads N to use the SAM-capable \
-                     multi-threaded path (ReadSamChunks + ParseSamChunk)."
-                })?;
+            crate::commands::consensus_runner::open_single_threaded_consensus_input(
+                &self.io.input,
+                self.io.pipeline_reader_opts(),
+                "duplex",
+            )?;
         let header = crate::commands::common::add_pg_record(header, command_line)?;
         let read_name_prefix = self.read_group.prefix_or_from_header(&header);
         let methylation_ref: MethylationRef =

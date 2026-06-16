@@ -885,6 +885,41 @@ impl<'a> ChainBuilder<'a> {
         }
     }
 
+    /// Wire the rejects fan-out branch (branch 1) of a 2-output consensus step:
+    /// `BgzfCompress` → `WriteBgzfFile` with the **input** header, in input
+    /// order — the PR #332 fan-out contract (rejects flow through the ordered
+    /// serialize/compress stages, not a mutex side-channel).
+    ///
+    /// `consensus_pt` is the just-appended consensus step (branch 0 is its kept
+    /// output, consumed by the caller); `label` names the command for error
+    /// context. Shared by `add_simplex`/`add_duplex`/`add_codec`, whose
+    /// rejects wiring is otherwise identical — only the consensus step's type
+    /// (built inline by the caller) differs.
+    fn wire_consensus_rejects_branch(
+        &self,
+        consensus_pt: (StepIdx, BranchIdx),
+        rejects_path: Option<&std::path::Path>,
+        input_header: &Header,
+        label: &str,
+    ) -> Result<()> {
+        use crate::pipeline::steps::bgzf::compress::BgzfCompress;
+        use crate::pipeline::steps::sink::write_bgzf::WriteBgzfFile;
+
+        let rejects_path = rejects_path
+            .ok_or_else(|| anyhow!("rejects path unexpectedly None when track_rejects is set"))?;
+        let rejects_write =
+            WriteBgzfFile::new(rejects_path, input_header, self.tuning.compression_level)
+                .map_err(|e| anyhow!("WriteBgzfFile ({label} rejects): {e}"))?;
+
+        let rejects_branch = (consensus_pt.0, BranchIdx(1));
+        let rejects_compress_tail = self.pipeline.append_step(
+            BgzfCompress::new(self.tuning.compression_level, self.tuning.per_step_byte_limit),
+            rejects_branch,
+        );
+        self.pipeline.append_step(rejects_write, rejects_compress_tail);
+        Ok(())
+    }
+
     /// Append the 4-step BAM decode preamble:
     /// `ReadBgzfBlocks → BgzfDecompress → FindBamBoundaries → DecodeRecords`.
     fn build_bam_decode_preamble(
@@ -2594,27 +2629,14 @@ impl<'a> ChainBuilder<'a> {
         // public discard sink). Mirrors add_correct.
         let limit = self.tuning.per_step_byte_limit;
         let consensus_branch0 = if track_rejects {
-            use crate::pipeline::core::topology::BranchIdx;
-            use crate::pipeline::steps::bgzf::compress::BgzfCompress;
-            use crate::pipeline::steps::sink::write_bgzf::WriteBgzfFile;
-
-            let rejects_path = simplex.rejects_opts.rejects.as_ref().ok_or_else(|| {
-                anyhow!("rejects path unexpectedly None when track_rejects is set")
-            })?;
-            let rejects_write =
-                WriteBgzfFile::new(rejects_path, &input_header, self.tuning.compression_level)
-                    .map_err(|e| anyhow!("WriteBgzfFile (simplex rejects): {e}"))?;
-
             let step = build_simplex_consensus_step_with_rejects(limit, consensus_cap);
             let pt = self.pipeline.append_step(step, tail);
-
-            let rejects_branch = (pt.0, BranchIdx(1));
-            let rejects_compress_tail = self.pipeline.append_step(
-                BgzfCompress::new(self.tuning.compression_level, limit),
-                rejects_branch,
-            );
-            self.pipeline.append_step(rejects_write, rejects_compress_tail);
-
+            self.wire_consensus_rejects_branch(
+                pt,
+                simplex.rejects_opts.rejects.as_deref(),
+                &input_header,
+                "simplex",
+            )?;
             pt
         } else {
             let step = build_simplex_consensus_step_kept_only(limit, consensus_cap);
@@ -2943,27 +2965,14 @@ impl<'a> ChainBuilder<'a> {
         // without rejects it is the 1-output kept-only variant. Mirrors add_correct.
         let limit = self.tuning.per_step_byte_limit;
         let consensus_branch0 = if track_rejects {
-            use crate::pipeline::core::topology::BranchIdx;
-            use crate::pipeline::steps::bgzf::compress::BgzfCompress;
-            use crate::pipeline::steps::sink::write_bgzf::WriteBgzfFile;
-
-            let rejects_path = duplex.rejects_opts.rejects.as_ref().ok_or_else(|| {
-                anyhow!("rejects path unexpectedly None when track_rejects is set")
-            })?;
-            let rejects_write =
-                WriteBgzfFile::new(rejects_path, &input_header, self.tuning.compression_level)
-                    .map_err(|e| anyhow!("WriteBgzfFile (duplex rejects): {e}"))?;
-
             let step = build_duplex_consensus_step_with_rejects(limit, consensus_cap);
             let pt = self.pipeline.append_step(step, tail);
-
-            let rejects_branch = (pt.0, BranchIdx(1));
-            let rejects_compress_tail = self.pipeline.append_step(
-                BgzfCompress::new(self.tuning.compression_level, limit),
-                rejects_branch,
-            );
-            self.pipeline.append_step(rejects_write, rejects_compress_tail);
-
+            self.wire_consensus_rejects_branch(
+                pt,
+                duplex.rejects_opts.rejects.as_deref(),
+                &input_header,
+                "duplex",
+            )?;
             pt
         } else {
             let step = build_duplex_consensus_step_kept_only(limit, consensus_cap);
@@ -3249,27 +3258,14 @@ impl<'a> ChainBuilder<'a> {
         // without rejects it is the 1-output kept-only variant. Mirrors add_correct.
         let limit = self.tuning.per_step_byte_limit;
         let consensus_branch0 = if track_rejects {
-            use crate::pipeline::core::topology::BranchIdx;
-            use crate::pipeline::steps::bgzf::compress::BgzfCompress;
-            use crate::pipeline::steps::sink::write_bgzf::WriteBgzfFile;
-
-            let rejects_path = codec.rejects_opts.rejects.as_ref().ok_or_else(|| {
-                anyhow!("rejects path unexpectedly None when track_rejects is set")
-            })?;
-            let rejects_write =
-                WriteBgzfFile::new(rejects_path, &input_header, self.tuning.compression_level)
-                    .map_err(|e| anyhow!("WriteBgzfFile (codec rejects): {e}"))?;
-
             let step = build_codec_consensus_step_with_rejects(limit, consensus_cap);
             let pt = self.pipeline.append_step(step, tail);
-
-            let rejects_branch = (pt.0, BranchIdx(1));
-            let rejects_compress_tail = self.pipeline.append_step(
-                BgzfCompress::new(self.tuning.compression_level, limit),
-                rejects_branch,
-            );
-            self.pipeline.append_step(rejects_write, rejects_compress_tail);
-
+            self.wire_consensus_rejects_branch(
+                pt,
+                codec.rejects_opts.rejects.as_deref(),
+                &input_header,
+                "codec",
+            )?;
             pt
         } else {
             let step = build_codec_consensus_step_kept_only(limit, consensus_cap);

@@ -178,18 +178,6 @@ pub(crate) struct SimplexConsensusCaptures {
     pub(crate) progress: Arc<AtomicU64>,
 }
 
-/// Append `[len:4 LE][record]` framing for each byte-slice record — the format
-/// `BgzfCompress` expects in a `DecompressedBlock`. Mirrors correct's
-/// `append_framed_raw_record`.
-fn append_framed_bytes(dst: &mut Vec<u8>, rec: &[u8]) {
-    // BAM record body size is u32-bounded per the spec; a single record's
-    // buffer cannot exceed u32::MAX in practice.
-    #[allow(clippy::cast_possible_truncation)]
-    let block_size = rec.len() as u32;
-    dst.extend_from_slice(&block_size.to_le_bytes());
-    dst.extend_from_slice(rec);
-}
-
 /// Per-worker init: build the `VanillaUmiConsensusCaller` (+ optional
 /// overlapping caller) once, reused across batches. Shared by both step
 /// variants.
@@ -259,7 +247,7 @@ fn run_simplex_consensus_batch(
             batch_stats.record_rejection(RejectionReason::InsufficientReads, raw_records.len());
             if track_rejects {
                 for raw in &raw_records {
-                    append_framed_bytes(&mut rejects_bytes, raw.as_ref());
+                    super::append_framed_bytes(&mut rejects_bytes, raw.as_ref());
                 }
             }
             continue;
@@ -286,7 +274,7 @@ fn run_simplex_consensus_batch(
         batch_stats.merge(&state.caller.statistics());
         if track_rejects {
             for raw in &state.caller.take_rejected_reads() {
-                append_framed_bytes(&mut rejects_bytes, raw);
+                super::append_framed_bytes(&mut rejects_bytes, raw);
             }
         }
     }

@@ -184,15 +184,6 @@ pub(crate) struct DuplexConsensusCaptures {
     pub(crate) progress: Arc<AtomicU64>,
 }
 
-/// Append `[len:4 LE][record]` framing for a byte-slice record — the format
-/// `BgzfCompress` expects in a `DecompressedBlock`.
-fn append_framed_bytes(dst: &mut Vec<u8>, rec: &[u8]) {
-    #[allow(clippy::cast_possible_truncation)]
-    let block_size = rec.len() as u32;
-    dst.extend_from_slice(&block_size.to_le_bytes());
-    dst.extend_from_slice(rec);
-}
-
 /// Per-worker init: build the `DuplexConsensusCaller` (+ optional overlapping
 /// caller) once, reused across batches. Shared by both step variants.
 ///
@@ -295,7 +286,7 @@ fn run_duplex_consensus_batch(
         batch_stats.merge(&state.caller.statistics());
         if track_rejects {
             for raw in &state.caller.take_rejected_reads() {
-                append_framed_bytes(&mut rejects_bytes, raw);
+                super::append_framed_bytes(&mut rejects_bytes, raw);
             }
         }
     }
