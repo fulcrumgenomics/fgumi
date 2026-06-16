@@ -17,9 +17,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fgoxide::io::DelimFile;
 use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::{
-    create_bam_writer, create_optional_bam_writer, create_raw_bam_reader_with_opts,
-};
+use fgumi_bam_io::{create_bam_writer, create_optional_bam_writer};
 use fgumi_raw_bam::RawRecord;
 
 use log::info;
@@ -388,12 +386,11 @@ impl Command for Simplex {
         // loses the leading bytes (stdin can't be rewound or re-opened). SAM
         // input (not BGZF) fails the header read here; surface the --threads hint.
         let (mut raw_reader, header) =
-            create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())
-                .with_context(|| {
-                    "Failed to open input as BAM. The single-threaded simplex path is BAM-only; \
-                     if this is SAM input, pass --threads N to use the SAM-capable \
-                     multi-threaded path (ReadSamChunks + ParseSamChunk)."
-                })?;
+            crate::commands::consensus_runner::open_single_threaded_consensus_input(
+                &self.io.input,
+                self.io.pipeline_reader_opts(),
+                "simplex",
+            )?;
         let output_header = create_unmapped_consensus_header(
             &header,
             &self.read_group.read_group_id,
