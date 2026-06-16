@@ -19,3 +19,17 @@ pub mod group;
 pub mod simplex;
 pub mod sort;
 pub mod zipper;
+
+/// Append `rec` to `dst` framed as a BAM record block: a 4-byte little-endian
+/// length prefix followed by the record bytes. Shared by the consensus
+/// command builders' rejects-serialization paths (codec/simplex/duplex), which
+/// emit raw record bytes into a `DecompressedBlock` buffer.
+///
+/// BAM record body size is u32-bounded per the spec; a single record's buffer
+/// cannot exceed `u32::MAX` in practice, so the length cast cannot truncate.
+pub(crate) fn append_framed_bytes(dst: &mut Vec<u8>, rec: &[u8]) {
+    #[allow(clippy::cast_possible_truncation)]
+    let block_size = rec.len() as u32;
+    dst.extend_from_slice(&block_size.to_le_bytes());
+    dst.extend_from_slice(rec);
+}
