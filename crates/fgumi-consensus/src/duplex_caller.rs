@@ -1881,15 +1881,14 @@ impl DuplexConsensusCaller {
 
         // Split filtered results back by firstOfPair flag (matching fgbio lines 347-350)
         // X = AB-R1 + BA-R2, Y = AB-R2 + BA-R1 (combined for alignment filtering)
-        // Now split them back into the four groups using sr.flags:
-        let filtered_ab_r1s: Vec<SourceRead> =
-            filtered_xs.iter().filter(|sr| sr.flags & flags::FIRST_SEGMENT != 0).cloned().collect();
-        let filtered_ba_r2s: Vec<SourceRead> =
-            filtered_xs.iter().filter(|sr| sr.flags & flags::FIRST_SEGMENT == 0).cloned().collect();
-        let filtered_ab_r2s: Vec<SourceRead> =
-            filtered_ys.iter().filter(|sr| sr.flags & flags::FIRST_SEGMENT == 0).cloned().collect();
-        let filtered_ba_r1s: Vec<SourceRead> =
-            filtered_ys.iter().filter(|sr| sr.flags & flags::FIRST_SEGMENT != 0).cloned().collect();
+        // Now split them back into the four groups using sr.flags. The two splits of
+        // each vec are disjoint partitions (`FIRST_SEGMENT` set vs clear), so move the
+        // reads into their groups with `partition` instead of cloning every surviving
+        // `SourceRead` (bases, quals, and two cigar vecs) out of a borrow.
+        let (filtered_ab_r1s, filtered_ba_r2s): (Vec<SourceRead>, Vec<SourceRead>) =
+            filtered_xs.into_iter().partition(|sr| sr.flags & flags::FIRST_SEGMENT != 0);
+        let (filtered_ba_r1s, filtered_ab_r2s): (Vec<SourceRead>, Vec<SourceRead>) =
+            filtered_ys.into_iter().partition(|sr| sr.flags & flags::FIRST_SEGMENT != 0);
 
         debug!(
             "MI {}: After split (filtered_AB-R1={}, filtered_AB-R2={}, filtered_BA-R1={}, filtered_BA-R2={})",
