@@ -695,17 +695,62 @@ fn build_consensus_record(
         .sequence(seq)
         .qualities(quals);
 
-    // Add consensus tags (note: cE is error count in this file, not error rate).
-    b.add_int_tag(SamTag::CD, cd).add_int_tag(SamTag::CM, cm).add_int_tag(SamTag::CE, ce);
+    // `fgumi filter` masks bases using the PER-BASE depth/error arrays and reads
+    // the read-level error tags (cE / aE / bE) as FLOAT rates — exactly what
+    // `fgumi simplex`/`duplex` emit (see `vanilla_caller`). Without the per-base
+    // arrays every base reads as zero depth and the read is rejected outright;
+    // with the error tags written as integer counts, filter's `find_float_tag`
+    // skips them. Emit both faithfully so the output honors its documented
+    // "suitable for input to `fgumi filter`" contract.
+    //
+    // Build per-base arrays consistent with the read-level summary tags: depth
+    // spans [min, max] (min == cM/aM/bM, max == cD/aD/bD) and the total error
+    // count is spread one-per-base. The read-level error tag is the resulting
+    // rate (sum of per-base errors / sum of per-base depths).
+    let read_len = seq.len();
+    let per_base_arrays =
+        |max_depth: i32, min_depth: i32, error_count: i32| -> (Vec<i16>, Vec<i16>) {
+            let clamp = |v: i32| i16::try_from(v).unwrap_or(i16::MAX);
+            let mut depths = vec![clamp(max_depth); read_len];
+            if read_len >= 2 {
+                // Anchor the per-base minimum at the summary min (max stays the fill).
+                depths[read_len - 1] = clamp(min_depth);
+            }
+            let mut errors = vec![0i16; read_len];
+            let n = usize::try_from(error_count).unwrap_or(0).min(read_len);
+            for slot in errors.iter_mut().take(n) {
+                *slot = 1;
+            }
+            (depths, errors)
+        };
+    let error_rate = |errors: &[i16], depths: &[i16]| -> f32 {
+        let total_errors: i64 = errors.iter().map(|&e| i64::from(e)).sum();
+        let total_depth: i64 = depths.iter().map(|&d| i64::from(d)).sum();
+        if total_depth > 0 { (total_errors as f64 / total_depth as f64) as f32 } else { 0.0 }
+    };
 
-    // Add duplex-specific tags if present.
+    // Single-strand consensus summary + per-base arrays.
+    let (cd_bases, ce_bases) = per_base_arrays(cd, cm, ce);
+    b.add_int_tag(SamTag::CD, cd)
+        .add_int_tag(SamTag::CM, cm)
+        .add_float_tag(SamTag::CE, error_rate(&ce_bases, &cd_bases));
+    b.add_array_i16(SamTag::CD_BASES, &cd_bases).add_array_i16(SamTag::CE_BASES, &ce_bases);
+
+    // Add duplex-specific tags if present: per-strand summary (aD/bD/aM/bM int,
+    // aE/bE float rate) plus the per-base strand depth/error arrays filter needs.
     if let Some((ad, bd, am, bm, ae, be)) = duplex_tags {
+        let (ad_bases, ae_bases) = per_base_arrays(ad, am, ae);
+        let (bd_bases, be_bases) = per_base_arrays(bd, bm, be);
         b.add_int_tag(SamTag::AD, ad)
             .add_int_tag(SamTag::BD, bd)
             .add_int_tag(SamTag::AM, am)
             .add_int_tag(SamTag::BM, bm)
-            .add_int_tag(SamTag::AE, ae)
-            .add_int_tag(SamTag::BE, be);
+            .add_float_tag(SamTag::AE, error_rate(&ae_bases, &ad_bases))
+            .add_float_tag(SamTag::BE, error_rate(&be_bases, &bd_bases));
+        b.add_array_i16(SamTag::AD_BASES, &ad_bases)
+            .add_array_i16(SamTag::AE_BASES, &ae_bases)
+            .add_array_i16(SamTag::BD_BASES, &bd_bases)
+            .add_array_i16(SamTag::BE_BASES, &be_bases);
     }
 
     // Add methylation tags if enabled.
@@ -856,6 +901,138 @@ mod tests {
         assert!(!flags.is_unmapped());
         assert!(flags.is_first_segment());
         assert_eq!(record.reference_sequence_id(), Some(0));
+    }
+
+    /// Consensus reads must carry the per-base `cd`/`ce` arrays (`CD_BASES` /
+    /// `CE_BASES`) in addition to the read-level `cD`/`cM`/`cE` — `fgumi filter`
+    /// masks bases using them, and without them it rejects every read. Regression
+    /// for the simulator omitting these arrays (its output was unusable by filter).
+    #[test]
+    fn test_build_consensus_record_emits_per_base_cd_ce_arrays() {
+        let seq = b"ACGTACGTAC"; // length 10
+        let quals = vec![40u8; seq.len()];
+        let (cd, cm, ce) = (9_i32, 4_i32, 2_i32);
+
+        let raw = build_consensus_record(
+            "per_base/1",
+            seq,
+            &quals,
+            true,
+            false,
+            0,
+            100,
+            cd,
+            cm,
+            ce,
+            None,
+            None,
+            MethylationMode::Disabled,
+        );
+
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::Value as BufValue;
+        use noodles::sam::alignment::record_buf::data::field::value::Array;
+        let record = to_record_buf(&raw);
+        let read_i16_array = |tag: SamTag| -> Vec<i16> {
+            match record.data().get(&Tag::from(tag)) {
+                Some(BufValue::Array(Array::Int16(vals))) => vals.clone(),
+                other => panic!("expected an i16 array tag, got {other:?}"),
+            }
+        };
+        let cd_bases = read_i16_array(SamTag::CD_BASES);
+        let ce_bases = read_i16_array(SamTag::CE_BASES);
+
+        // One entry per base.
+        assert_eq!(cd_bases.len(), seq.len(), "per-base depth length == read length");
+        assert_eq!(ce_bases.len(), seq.len(), "per-base error length == read length");
+
+        // Per-base depth is consistent with the read-level summary tags.
+        assert_eq!(i32::from(*cd_bases.iter().max().unwrap()), cd, "max per-base depth == cD");
+        assert_eq!(i32::from(*cd_bases.iter().min().unwrap()), cm, "min per-base depth == cM");
+
+        // Per-base errors sum to the read-level error count cE.
+        let total_errors: i32 = ce_bases.iter().map(|&e| i32::from(e)).sum();
+        let total_depth: i32 = cd_bases.iter().map(|&d| i32::from(d)).sum();
+        assert_eq!(total_errors, ce, "per-base errors sum to cE");
+
+        // The read-level cE tag is a FLOAT error rate (what `fgumi filter` reads
+        // via `find_float_tag`), not an integer count, and equals sum(ce)/sum(cd).
+        match record.data().get(&Tag::from(SamTag::CE)) {
+            Some(BufValue::Float(rate)) => {
+                let expected = total_errors as f64 / total_depth as f64;
+                assert!(
+                    (f64::from(*rate) - expected).abs() < 1e-6,
+                    "cE should equal sum(ce)/sum(cd): got {rate}, expected {expected}"
+                );
+            }
+            other => panic!("cE should be a float error rate, got {other:?}"),
+        }
+    }
+
+    /// Duplex consensus reads must also carry the per-base strand depth/error
+    /// arrays (aD/aE/bD/bE) and float aE/bE rates — `fgumi filter`'s duplex path
+    /// masks bases from these arrays, so their absence makes it reject everything.
+    #[test]
+    fn test_build_consensus_record_duplex_emits_per_base_strand_arrays() {
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::Value as BufValue;
+        use noodles::sam::alignment::record_buf::data::field::value::Array;
+
+        let seq = b"ACGTACGTAC"; // length 10
+        let quals = vec![40u8; seq.len()];
+        // cD/cM/cE then duplex (aD, bD, aM, bM, aE, bE).
+        let raw = build_consensus_record(
+            "dx/1",
+            seq,
+            &quals,
+            true,
+            false,
+            0,
+            100,
+            10,
+            6,
+            3,
+            Some((6, 4, 3, 2, 2, 1)),
+            None,
+            MethylationMode::Disabled,
+        );
+        let record = to_record_buf(&raw);
+        let read_i16 = |tag: SamTag| -> Vec<i16> {
+            match record.data().get(&Tag::from(tag)) {
+                Some(BufValue::Array(Array::Int16(vals))) => vals.clone(),
+                other => panic!("expected an i16 array tag, got {other:?}"),
+            }
+        };
+
+        for tag in [SamTag::AD_BASES, SamTag::AE_BASES, SamTag::BD_BASES, SamTag::BE_BASES] {
+            assert_eq!(read_i16(tag).len(), seq.len(), "per-base strand array spans the read");
+        }
+        // Strand depth arrays honor the per-strand max/min summary tags.
+        let ad_bases = read_i16(SamTag::AD_BASES);
+        assert_eq!(i32::from(*ad_bases.iter().max().unwrap()), 6, "max per-base aD == aD");
+        assert_eq!(i32::from(*ad_bases.iter().min().unwrap()), 3, "min per-base aD == aM");
+        let bd_bases = read_i16(SamTag::BD_BASES);
+        assert_eq!(i32::from(*bd_bases.iter().max().unwrap()), 4, "max per-base bD == bD");
+        assert_eq!(i32::from(*bd_bases.iter().min().unwrap()), 2, "min per-base bD == bM");
+        // Per-strand errors sum to the strand error counts.
+        assert_eq!(read_i16(SamTag::AE_BASES).iter().map(|&e| i32::from(e)).sum::<i32>(), 2);
+        assert_eq!(read_i16(SamTag::BE_BASES).iter().map(|&e| i32::from(e)).sum::<i32>(), 1);
+        // aE/bE are float rates derived from their per-strand arrays.
+        for (rate_tag, error_tag, depth_tag) in [
+            (SamTag::AE, SamTag::AE_BASES, SamTag::AD_BASES),
+            (SamTag::BE, SamTag::BE_BASES, SamTag::BD_BASES),
+        ] {
+            let errors: i32 = read_i16(error_tag).iter().map(|&e| i32::from(e)).sum();
+            let depths: i32 = read_i16(depth_tag).iter().map(|&d| i32::from(d)).sum();
+            let expected = errors as f64 / depths as f64;
+            match record.data().get(&Tag::from(rate_tag)) {
+                Some(BufValue::Float(rate)) => assert!(
+                    (f64::from(*rate) - expected).abs() < 1e-6,
+                    "{rate_tag:?} should equal sum(errors)/sum(depths): got {rate}, expected {expected}"
+                ),
+                other => panic!("{rate_tag:?} should be a float error rate, got {other:?}"),
+            }
+        }
     }
 
     #[test]
