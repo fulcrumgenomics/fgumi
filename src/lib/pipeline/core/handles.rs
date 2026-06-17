@@ -730,6 +730,7 @@ impl<T: Send + HeapSize + 'static> OutputHandles<Single<T>> {
     ///
     /// Panics if the type-erased outputs view doesn't downcast to
     /// `SingleOutputsView<T>` (a framework invariant violation).
+    #[inline]
     pub fn push(&self, item: T) -> Result<(), Unpushed<T>> {
         let view = self
             .inner
@@ -749,6 +750,7 @@ impl<T: Send + HeapSize + 'static> OutputHandles<Single<T>> {
     ///
     /// Panics if the type-erased outputs view doesn't downcast to
     /// `SingleOutputsView<T>`.
+    #[inline]
     pub fn retry(&self, unpushed: Unpushed<T>) -> Result<(), Unpushed<T>> {
         let view = self
             .inner
@@ -774,6 +776,7 @@ impl<T: Send + HeapSize + Ordered + 'static>
     ///
     /// Panics if the type-erased outputs view doesn't downcast to
     /// `OrderedBytesSingleOutputsView<T>` (a framework invariant violation).
+    #[inline]
     pub fn push(&self, item: T) -> Result<(), Unpushed<T>> {
         let view = self
             .inner
@@ -793,6 +796,7 @@ impl<T: Send + HeapSize + Ordered + 'static>
     ///
     /// Panics if the type-erased outputs view doesn't downcast to
     /// `OrderedBytesSingleOutputsView<T>`.
+    #[inline]
     pub fn retry(&self, unpushed: Unpushed<T>) -> Result<(), Unpushed<T>> {
         let view = self
             .inner
@@ -812,6 +816,7 @@ impl<T: Send + HeapSize + Ordered + 'static>
     /// forgot the put-back would silently drop a final batch). **Never spins** —
     /// the caller maps `StillHeld` to a yield (`NoProgress`/`Contention`) and
     /// retries on the next dispatch.
+    #[inline]
     pub fn retry_held(
         &self,
         held: &mut crate::pipeline::core::held::HeldSlot<Unpushed<T>>,
@@ -837,6 +842,7 @@ impl<A: Send + HeapSize + 'static, B: Send + HeapSize + 'static> OutputHandles<(
     /// Panics if the type-erased outputs view doesn't downcast to
     /// `Tuple2OutputsView<A, B>` (a framework invariant violation).
     #[must_use]
+    #[inline]
     pub fn view(&self) -> Tuple2View<'_, A, B> {
         let v = self
             .inner
@@ -862,6 +868,7 @@ where
     /// Panics if the type-erased outputs view doesn't downcast to
     /// `Tuple2OutputsView<A, B>` (a framework invariant violation).
     #[must_use]
+    #[inline]
     pub fn view(&self) -> Tuple2View<'_, A, B> {
         let v = self
             .inner
@@ -890,6 +897,7 @@ where
     /// Panics if the type-erased outputs view doesn't downcast to
     /// `Tuple3OutputsView<A, B, C>` (a framework invariant violation).
     #[must_use]
+    #[inline]
     pub fn view(&self) -> Tuple3View<'_, A, B, C> {
         let v = self
             .inner
@@ -925,6 +933,7 @@ where
     /// Panics if the type-erased outputs view doesn't downcast to
     /// `Tuple4OutputsView<A, B, C, D>` (a framework invariant violation).
     #[must_use]
+    #[inline]
     pub fn view(&self) -> Tuple4View<'_, A, B, C, D> {
         let v = self
             .inner
