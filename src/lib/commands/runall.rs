@@ -39,10 +39,9 @@
 //!     `--grouping-metrics`) are not emitted by runall under any
 //!     `--start-from`/`--stop-after` combination. The new pipeline
 //!     framework does not yet wire histogram state back through a
-//!     side channel; the group-only delegation path
-//!     (`execute_group_only`) constructs `GroupReadsByUmi` with all
-//!     three histogram fields set to `None`. Users who need these
-//!     files should invoke standalone `fgumi group` directly.
+//!     side channel; runall's group stage construction sets all three
+//!     histogram fields to `None`. Users who need these files should
+//!     invoke standalone `fgumi group` directly.
 
 use std::path::PathBuf;
 
@@ -1492,7 +1491,8 @@ impl RunAll {
                     let mut group_opts = self.group_opts.clone().validate()?;
                     // Mirror GroupReadsByUmi::execute: compute
                     // effective_strategy / effective_edits, then populate
-                    // the #[arg(skip)] slots. Matches execute_group_only.
+                    // the #[arg(skip)] slots before handing GroupOptions
+                    // to the ChainSpec.
                     let (effective_strategy, no_umi_edits_override) = if group_opts.no_umi {
                         (Strategy::Identity, true)
                     } else {
@@ -1632,112 +1632,6 @@ impl RunAll {
     }
 
     // ── end T3b.2 spec-construction helpers ────────────────────────────────
-
-    /// Run the truncated `--stop-after sort` pipeline. Only reachable
-    /// when `--start-from sort` is also set (per
-    /// [`RunAllStage::validate_with`]'s ordering rule).
-    ///
-    /// Routes through `chains::build_for` with `Stage::Sort` so the
-    /// standalone sort chain builder is reused directly. The
-    /// `--sort::*` flags validate to a `SortOptions`; the sort order
-    /// is fixed to `TemplateCoordinate` (the only order compatible
-    /// with the downstream `fgumi group` step). The chain uses
-    /// `SinkSpec::Bam` — runall never asks the chain-builder for
-    /// `BamWithIndex` because template-coordinate BAMs cannot be
-    /// BAI-indexed.
-    #[allow(dead_code)]
-    fn execute_sort_only(&self, command_line: &str) -> Result<()> {
-        use crate::commands::sort::SortOrderArg;
-        use crate::pipeline::chains::{ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag};
-
-        let mut sort_opts = self.sort_opts.clone().validate()?;
-        // Runall's sort step always produces template-coordinate output
-        // for the downstream group stage.
-        sort_opts.order = SortOrderArg::TemplateCoordinate;
-        // BAI indexing is not supported on this path (sort output is
-        // an intermediate or final non-coordinate BAM). Post-T4.4 the
-        // sink variant carries this contract — using `SinkSpec::Bam`
-        // means no BAI is requested.
-
-        let spec = ChainSpec {
-            async_reader: self.async_reader,
-            stages: vec![Stage::Sort],
-            source: SourceSpec::Bam(self.require_input()?),
-            sink: SinkSpec::Bam(self.output.clone()),
-            stage_opts: StageOptionsBag { sort: Some(sort_opts), ..Default::default() },
-            threading: self.threading.clone(),
-            compression: self.compression.clone(),
-            scheduler: self.scheduler_opts.clone(),
-            queue_memory: self.queue_memory.clone(),
-            command_line: command_line.to_string(),
-        };
-        crate::pipeline::chains::build_for(spec)?.run()
-    }
-
-    /// Run the truncated `--stop-after group` pipeline.
-    ///
-    /// Routes through `chains::build_for` with `Stage::Group`, reusing
-    /// the standalone group chain builder. Two sub-cases land here
-    /// identically:
-    ///
-    ///   * `--start-from group --stop-after group`: input is already
-    ///     template-coordinate sorted; the chain runs group + write.
-    ///   * `--start-from sort --stop-after group`: input is unsorted;
-    ///     the fused sort-before-group path is a Phase 3 optimisation
-    ///     (tracked). For now the `--start-from sort --stop-after
-    ///     group` case is structurally unreachable because the
-    ///     top-level dispatch always routes `--start-from sort` through
-    ///     `execute_sort_only` first and returns; `--start-from group`
-    ///     is the only caller of this function.
-    ///
-    /// The `effective_strategy` / `effective_edits` slots on
-    /// `GroupOptions` are populated here using the same logic
-    /// `GroupReadsByUmi::execute` applies before its `ChainSpec`
-    /// construction.
-    #[allow(dead_code)]
-    fn execute_group_only(&self, command_line: &str) -> Result<()> {
-        use crate::assigner::Strategy;
-        use crate::pipeline::chains::{ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag};
-
-        let mut group_opts = self.group_opts.clone().validate()?;
-
-        // Mirror GroupReadsByUmi::execute: compute effective_strategy /
-        // effective_edits, then populate the #[arg(skip)] slots before
-        // handing GroupOptions to the ChainSpec.
-        let (effective_strategy, no_umi_edits_override) = if group_opts.no_umi {
-            (Strategy::Identity, true)
-        } else {
-            (group_opts.strategy, false)
-        };
-        let effective_edits =
-            if no_umi_edits_override || matches!(effective_strategy, Strategy::Identity) {
-                0
-            } else {
-                group_opts.edits
-            };
-
-        group_opts.effective_strategy = effective_strategy;
-        group_opts.effective_edits = effective_edits;
-        // runall's group-only path never writes per-position metrics
-        // (anti-goal documented in the module-level doc comment).
-        group_opts.family_size_histogram = None;
-        group_opts.grouping_metrics = None;
-        group_opts.metrics_prefix = None;
-
-        let spec = ChainSpec {
-            async_reader: self.async_reader,
-            stages: vec![Stage::Group],
-            source: SourceSpec::Bam(self.require_input()?),
-            sink: SinkSpec::Bam(self.output.clone()),
-            stage_opts: StageOptionsBag { group: Some(group_opts), ..Default::default() },
-            threading: self.threading.clone(),
-            compression: self.compression.clone(),
-            scheduler: self.scheduler_opts.clone(),
-            queue_memory: self.queue_memory.clone(),
-            command_line: command_line.to_string(),
-        };
-        crate::pipeline::chains::build_for(spec)?.run()
-    }
 }
 
 #[cfg(test)]
