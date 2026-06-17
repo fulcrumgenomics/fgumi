@@ -105,8 +105,90 @@ impl MemoryEstimate for MiGroupBatch {
 /// Type alias for raw-byte MI tag transformation function.
 type MiTransformFn = Box<dyn Fn(&[u8]) -> String + Send + Sync>;
 
+/// Borrowed MI tag transformation, shared by `MiGrouper` and `MiGroupIterator`
+/// (whose stored transforms differ only in `Send + Sync` bounds).
+type MiTransform<'a> = Option<&'a dyn Fn(&[u8]) -> String>;
+
 /// Type alias for raw-byte record filter function.
 type RecordFilterFn = Box<dyn Fn(&[u8]) -> bool + Send + Sync>;
+
+/// The grouping key for a run of consecutive records, stored as the raw
+/// comparison bytes so that boundary detection stays allocation-free on the
+/// common (no-transform) path: a record is compared against the current
+/// group by byte-equality of its tag value(s) rather than by building an
+/// owned `String` per record. The display label handed to `MiGroup` / the
+/// iterator output is materialized from these bytes only once per group.
+struct MiKey {
+    /// MI tag bytes, already transformed if a transform is configured.
+    mi: Vec<u8>,
+    /// Cell tag bytes, present (`Some`) only when cell-barcode grouping is
+    /// enabled. `Some(empty)` when the tag is configured but absent on the
+    /// record, mirroring the legacy `"MI\t"` composite key.
+    cell: Option<Vec<u8>>,
+}
+
+impl MiKey {
+    /// Extract the grouping key from raw BAM bytes, allocating the owned key
+    /// bytes. Used when a new group begins. Returns `None` when the record has
+    /// no MI tag (the record is then skipped).
+    fn from_record(
+        bam: &[u8],
+        tag: [u8; 2],
+        cell_tag: Option<[u8; 2]>,
+        transform: MiTransform,
+    ) -> Option<Self> {
+        let value = fgumi_raw_bam::find_string_tag_in_record(bam, tag)?;
+        let mi = match transform {
+            Some(transform) => transform(value).into_bytes(),
+            None => value.to_vec(),
+        };
+        let cell = cell_tag.map(|ct| {
+            fgumi_raw_bam::find_string_tag_in_record(bam, ct)
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default()
+        });
+        Some(Self { mi, cell })
+    }
+
+    /// Test whether `bam` belongs to the same MI group as this key. Returns
+    /// `None` when the record has no MI tag (the record is then skipped).
+    /// Allocation-free on the no-transform path: the record's tag bytes are
+    /// compared against the stored key directly instead of building an owned key.
+    fn matches_record(
+        &self,
+        bam: &[u8],
+        tag: [u8; 2],
+        cell_tag: Option<[u8; 2]>,
+        transform: MiTransform,
+    ) -> Option<bool> {
+        let value = fgumi_raw_bam::find_string_tag_in_record(bam, tag)?;
+        let mi_eq = match transform {
+            Some(transform) => transform(value).as_bytes() == self.mi.as_slice(),
+            None => value == self.mi.as_slice(),
+        };
+        let cell_eq = match (cell_tag, &self.cell) {
+            (Some(ct), Some(want)) => {
+                fgumi_raw_bam::find_string_tag_in_record(bam, ct).unwrap_or(b"") == want.as_slice()
+            }
+            // `cell_tag` is fixed for a grouper's lifetime, so the stored key's
+            // cell presence always matches the configuration; the mixed arms are
+            // unreachable.
+            (None, None) => true,
+            _ => false,
+        };
+        Some(mi_eq && cell_eq)
+    }
+
+    /// Build the display label. With a cell tag this is `"MI\tCELL"`,
+    /// matching the legacy composite key; otherwise it is just the MI value.
+    fn label(&self) -> String {
+        let mi = String::from_utf8_lossy(&self.mi);
+        match &self.cell {
+            Some(cell) => format!("{mi}\t{}", String::from_utf8_lossy(cell)),
+            None => mi.into_owned(),
+        }
+    }
+}
 
 /// A Grouper that groups raw-byte BAM records by MI tag.
 ///
@@ -118,8 +200,8 @@ pub struct MiGrouper {
     tag: [u8; 2],
     /// Number of MI groups per batch
     batch_size: usize,
-    /// Current MI value being accumulated
-    current_mi: Option<String>,
+    /// Grouping key of the run currently being accumulated
+    current_key: Option<MiKey>,
     /// Records in current MI group (raw bytes)
     current_records: Vec<RawRecord>,
     /// Completed groups waiting to be batched
@@ -148,7 +230,7 @@ impl MiGrouper {
         Self {
             tag: [tag_bytes[0], tag_bytes[1]],
             batch_size: batch_size.max(1),
-            current_mi: None,
+            current_key: None,
             current_records: Vec::new(),
             pending_groups: VecDeque::new(),
             finished: false,
@@ -179,7 +261,7 @@ impl MiGrouper {
         Self {
             tag: [tag_bytes[0], tag_bytes[1]],
             batch_size: batch_size.max(1),
-            current_mi: None,
+            current_key: None,
             current_records: Vec::new(),
             pending_groups: VecDeque::new(),
             finished: false,
@@ -199,24 +281,12 @@ impl MiGrouper {
         self
     }
 
-    /// Get MI tag from raw BAM bytes, optionally applying transformation.
-    ///
-    /// When `cell_tag` is set, returns a composite key of `"MI\tCELL"`.
-    fn get_mi_tag(&self, bam: &[u8]) -> Option<String> {
-        use fgumi_raw_bam;
-        let value = fgumi_raw_bam::find_string_tag_in_record(bam, self.tag)?;
-        let mut key = if let Some(ref transform) = self.mi_transform {
-            transform(value)
-        } else {
-            String::from_utf8_lossy(value).into_owned()
-        };
-        if let Some(ct) = &self.cell_tag {
-            key.push('\t');
-            if let Some(cell_value) = fgumi_raw_bam::find_string_tag_in_record(bam, ct) {
-                key.push_str(&String::from_utf8_lossy(cell_value));
-            }
-        }
-        Some(key)
+    /// The configured MI transform, borrowed for [`MiKey`] helpers.
+    fn transform(&self) -> MiTransform<'_> {
+        self.mi_transform.as_ref().map(|t| {
+            let f: &dyn Fn(&[u8]) -> String = &**t;
+            f
+        })
     }
 
     /// Check if a raw record passes the filter.
@@ -229,10 +299,10 @@ impl MiGrouper {
 
     /// Flush current MI group to pending.
     fn flush_current_group(&mut self) {
-        if let Some(mi) = self.current_mi.take() {
+        if let Some(key) = self.current_key.take() {
             if !self.current_records.is_empty() {
                 let records = std::mem::take(&mut self.current_records);
-                self.pending_groups.push_back(MiGroup::new(mi, records));
+                self.pending_groups.push_back(MiGroup::new(key.label(), records));
             }
         }
     }
@@ -260,27 +330,31 @@ impl Grouper for MiGrouper {
                 continue;
             }
 
-            // Skip records without an MI tag: the consensus caller requires the
-            // MI tag and would fail when processing them. `MiGroupIterator`
-            // applies the same skip policy for parity across paths.
-            let Some(mi) = self.get_mi_tag(&raw) else {
-                continue;
-            };
-
-            // Check if this starts a new MI group
-            match &self.current_mi {
-                Some(current) if current == &mi => {
-                    self.current_records.push(raw);
+            // Check whether this record continues the current MI group. The
+            // match is allocation-free on the no-transform path; the owned
+            // key is only built when a new group begins. Records without an
+            // MI tag are skipped: the consensus caller requires the MI tag
+            // and would fail when processing them. `MiGroupIterator` applies
+            // the same skip policy for parity across paths.
+            if let Some(current) = &self.current_key {
+                match current.matches_record(&raw, self.tag, self.cell_tag, self.transform()) {
+                    None => {}                                    // no MI tag: skip
+                    Some(true) => self.current_records.push(raw), // same group
+                    Some(false) => {
+                        // New MI value: flush the old group and start a new one.
+                        self.flush_current_group();
+                        // `matches_record` returned `Some`, so the MI tag is present
+                        // and `from_record` is guaranteed to succeed.
+                        self.current_key =
+                            MiKey::from_record(&raw, self.tag, self.cell_tag, self.transform());
+                        self.current_records.push(raw);
+                    }
                 }
-                Some(_) => {
-                    self.flush_current_group();
-                    self.current_mi = Some(mi);
-                    self.current_records.push(raw);
-                }
-                None => {
-                    self.current_mi = Some(mi);
-                    self.current_records.push(raw);
-                }
+            } else if let Some(key) =
+                MiKey::from_record(&raw, self.tag, self.cell_tag, self.transform())
+            {
+                self.current_key = Some(key);
+                self.current_records.push(raw);
             }
         }
 
@@ -304,7 +378,7 @@ impl Grouper for MiGrouper {
     }
 
     fn has_pending(&self) -> bool {
-        !self.pending_groups.is_empty() || self.current_mi.is_some()
+        !self.pending_groups.is_empty() || self.current_key.is_some()
     }
 }
 
@@ -319,7 +393,7 @@ where
     tag: [u8; 2],
     /// Optional cell barcode tag for composite grouping (MI + cell barcode)
     cell_tag: Option<[u8; 2]>,
-    current_mi: Option<String>,
+    current_key: Option<MiKey>,
     current_group: Vec<RawRecord>,
     done: bool,
     /// Pending error to return after flushing a group
@@ -344,7 +418,7 @@ where
             record_iter,
             tag: [tag_bytes[0], tag_bytes[1]],
             cell_tag: None,
-            current_mi: None,
+            current_key: None,
             current_group: Vec::new(),
             done: false,
             pending_error: None,
@@ -367,7 +441,7 @@ where
             record_iter,
             tag: [tag_bytes[0], tag_bytes[1]],
             cell_tag: None,
-            current_mi: None,
+            current_key: None,
             current_group: Vec::new(),
             done: false,
             pending_error: None,
@@ -385,25 +459,19 @@ where
         self
     }
 
-    /// Extracts the group key from raw BAM bytes.
-    ///
-    /// When `cell_tag` is set, returns a composite key of `"MI\tCELL"`.
-    /// Otherwise returns just the MI tag value.
+    /// The configured MI transform, borrowed for [`MiKey`] helpers.
+    fn transform(&self) -> MiTransform<'_> {
+        self.mi_transform.as_ref().map(|t| {
+            let f: &dyn Fn(&[u8]) -> String = &**t;
+            f
+        })
+    }
+
+    /// Build the display label for a record's grouping key, if any. Retained
+    /// for unit tests that assert the key-extraction behavior directly.
+    #[cfg(test)]
     fn get_mi(&self, bam: &[u8]) -> Option<String> {
-        use fgumi_raw_bam;
-        let value = fgumi_raw_bam::find_string_tag_in_record(bam, self.tag)?;
-        let mut key = if let Some(ref transform) = self.mi_transform {
-            transform(value)
-        } else {
-            String::from_utf8_lossy(value).into_owned()
-        };
-        if let Some(ct) = &self.cell_tag {
-            key.push('\t');
-            if let Some(cell_value) = fgumi_raw_bam::find_string_tag_in_record(bam, ct) {
-                key.push_str(&String::from_utf8_lossy(cell_value));
-            }
-        }
-        Some(key)
+        MiKey::from_record(bam, self.tag, self.cell_tag, self.transform()).map(|key| key.label())
     }
 }
 
@@ -431,14 +499,14 @@ where
                     if self.current_group.is_empty() {
                         return None;
                     }
-                    let mi = self.current_mi.take().unwrap_or_default();
+                    let mi = self.current_key.take().map(|k| k.label()).unwrap_or_default();
                     let group = std::mem::take(&mut self.current_group);
                     return Some(Ok((mi, group)));
                 }
                 Some(Err(e)) => {
                     if !self.current_group.is_empty() {
                         self.pending_error = Some(e);
-                        let mi = self.current_mi.take().unwrap_or_default();
+                        let mi = self.current_key.take().map(|k| k.label()).unwrap_or_default();
                         let group = std::mem::take(&mut self.current_group);
                         return Some(Ok((mi, group)));
                     }
@@ -446,24 +514,43 @@ where
                     return Some(Err(e));
                 }
                 Some(Ok(raw)) => {
-                    // Skip records without an MI tag; the consensus caller requires
-                    // an MI tag and would fail when processing them. `MiGrouper`
-                    // applies the same skip policy for parity across paths.
-                    let Some(mi) = self.get_mi(&raw) else {
-                        continue;
-                    };
-
-                    if self.current_group.is_empty() {
-                        self.current_mi = Some(mi);
+                    // Check whether this record continues the current group. The
+                    // match is allocation-free on the no-transform path; the owned
+                    // key is only built when a new group begins. Records without an
+                    // MI tag are skipped; the consensus caller requires an MI tag
+                    // and would fail when processing them. `MiGrouper` applies the
+                    // same skip policy for parity across paths.
+                    if let Some(current) = &self.current_key {
+                        match current.matches_record(
+                            &raw,
+                            self.tag,
+                            self.cell_tag,
+                            self.transform(),
+                        ) {
+                            None => {}                                  // no MI tag: skip
+                            Some(true) => self.current_group.push(raw), // same group
+                            Some(false) => {
+                                // New MI value: emit the completed group and start a
+                                // new one. `matches_record` returned `Some`, so the MI
+                                // tag is present and `from_record` succeeds.
+                                let old_mi =
+                                    self.current_key.take().map(|k| k.label()).unwrap_or_default();
+                                let group = std::mem::take(&mut self.current_group);
+                                self.current_key = MiKey::from_record(
+                                    &raw,
+                                    self.tag,
+                                    self.cell_tag,
+                                    self.transform(),
+                                );
+                                self.current_group.push(raw);
+                                return Some(Ok((old_mi, group)));
+                            }
+                        }
+                    } else if let Some(key) =
+                        MiKey::from_record(&raw, self.tag, self.cell_tag, self.transform())
+                    {
+                        self.current_key = Some(key);
                         self.current_group.push(raw);
-                    } else if self.current_mi.as_ref() == Some(&mi) {
-                        self.current_group.push(raw);
-                    } else {
-                        let old_mi = self.current_mi.take().unwrap_or_default();
-                        let group = std::mem::take(&mut self.current_group);
-                        self.current_mi = Some(mi);
-                        self.current_group.push(raw);
-                        return Some(Ok((old_mi, group)));
                     }
                 }
             }
