@@ -454,6 +454,17 @@ fn extract_raw_name_and_flags(bam: &[u8]) -> (&[u8], u16) {
     (name, queryname_flag_order(raw_flags))
 }
 
+/// Read-name bytes *including* the trailing NUL that BAM stores: `l_read_name`
+/// (offset 8) counts the terminator, so `bam[32..32 + l_read_name]` is already
+/// a NUL-terminated name ready for `natural_compare_nul`. Returns `None` for a
+/// truncated record (the declared name + NUL does not fit), so the caller can
+/// fall back to the stripped-name path and keep byte-for-byte parity.
+#[inline]
+fn raw_name_with_nul(bam: &[u8]) -> Option<&[u8]> {
+    let l_read_name = bam[8] as usize;
+    (l_read_name > 0 && 32 + l_read_name <= bam.len()).then(|| &bam[32..32 + l_read_name])
+}
+
 /// Serialize a queryname key as `[name_len: u16][name: bytes][flags: u16]`.
 #[inline]
 fn write_queryname_key<W: Write>(name: &[u8], flags: u16, writer: &mut W) -> std::io::Result<()> {
@@ -529,11 +540,15 @@ impl RawQuerynameKey {
     #[inline]
     #[must_use]
     fn extract_queryname_key(bam: &[u8]) -> Self {
-        let (raw_name, flags) = extract_raw_name_and_flags(bam);
-        let mut name = Vec::with_capacity(raw_name.len() + 1);
-        name.extend_from_slice(raw_name);
-        name.push(0);
-        Self { name, flags }
+        let flags = queryname_flag_order(u16::from_le_bytes([bam[14], bam[15]]));
+        match raw_name_with_nul(bam) {
+            // BAM stores the name NUL-terminated, so copy those bytes directly
+            // instead of stripping the NUL and re-appending it.
+            Some(name) => Self { name: name.to_vec(), flags },
+            // Truncated record: fall back to the stripped-name path (`new`
+            // re-adds the terminator), preserving the prior bytes exactly.
+            None => Self::new(extract_raw_name_and_flags(bam).0.to_vec(), flags),
+        }
     }
 }
 
