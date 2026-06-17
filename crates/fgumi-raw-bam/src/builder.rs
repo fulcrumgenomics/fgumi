@@ -86,8 +86,60 @@ impl UnmappedSamBuilder {
     ///
     /// # Panics
     ///
-    /// Panics if `quals` is non-empty and `bases.len() != quals.len()`.
+    /// Panics if `name` is 255 bytes or longer, or if `quals` is non-empty and
+    /// `bases.len() != quals.len()`.
     pub fn build_record(&mut self, name: &[u8], flag: u16, bases: &[u8], quals: &[u8]) {
+        self.build_record_with_name(
+            name.len(),
+            |buf| buf.extend_from_slice(name),
+            flag,
+            bases,
+            quals,
+        );
+    }
+
+    /// Like [`Self::build_record`] but composes the read name as
+    /// `prefix:suffix` directly into the record buffer, avoiding a temporary
+    /// `String` allocation per record on the consensus hot path. Equivalent to
+    /// `build_record(format!("{prefix}:{suffix}").as_bytes(), flag, bases, quals)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the joined name (`prefix` + `:` + `suffix`) is 255 bytes or
+    /// longer, or if `quals` is non-empty and `bases.len() != quals.len()`.
+    pub fn build_record_joined_name(
+        &mut self,
+        prefix: &[u8],
+        suffix: &[u8],
+        flag: u16,
+        bases: &[u8],
+        quals: &[u8],
+    ) {
+        let name_len = prefix.len() + 1 + suffix.len(); // +1 for the ':' separator
+        self.build_record_with_name(
+            name_len,
+            |buf| {
+                buf.extend_from_slice(prefix);
+                buf.push(b':');
+                buf.extend_from_slice(suffix);
+            },
+            flag,
+            bases,
+            quals,
+        );
+    }
+
+    /// Shared record builder: writes the fixed header, the read name (via
+    /// `write_name`, which must append exactly `name_len` bytes), the packed
+    /// sequence, and the quality scores.
+    fn build_record_with_name(
+        &mut self,
+        name_len: usize,
+        write_name: impl FnOnce(&mut Vec<u8>),
+        flag: u16,
+        bases: &[u8],
+        quals: &[u8],
+    ) {
         assert!(
             bases.len() == quals.len() || quals.is_empty(),
             "bases.len() ({}) != quals.len() ({})",
@@ -98,12 +150,12 @@ impl UnmappedSamBuilder {
         self.buf.clear();
         self.sealed = false;
 
-        assert!(name.len() < 255, "read name too long ({} bytes, max 254)", name.len());
+        assert!(name_len < 255, "read name too long ({name_len} bytes, max 254)");
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "assert above guarantees name.len() < 255"
+            reason = "assert above guarantees name_len < 255"
         )]
-        let l_read_name = (name.len() + 1) as u8; // +1 for NUL
+        let l_read_name = (name_len + 1) as u8; // +1 for NUL
         let l_seq = u32::try_from(bases.len()).expect("sequence length overflow");
         let packed_seq_len = bases.len().div_ceil(2);
 
@@ -124,7 +176,14 @@ impl UnmappedSamBuilder {
         self.buf.extend_from_slice(&0i32.to_le_bytes()); // tlen = 0
 
         // === Read name + NUL ===
-        self.buf.extend_from_slice(name);
+        let name_start = self.buf.len();
+        write_name(&mut self.buf);
+        debug_assert_eq!(
+            self.buf.len() - name_start,
+            name_len,
+            "write_name appended {} bytes, expected name_len = {name_len}",
+            self.buf.len() - name_start,
+        );
         self.buf.push(0);
 
         // === Packed sequence ===
@@ -594,6 +653,55 @@ mod tests {
     use crate::tags::*;
     use crate::testutil::*;
     use fgumi_tag::SamTag;
+
+    #[test]
+    fn test_build_record_joined_name_matches_format() {
+        // The joined-name fast path must produce byte-for-byte the same record
+        // as concatenating the name with `format!` and calling `build_record`.
+        let bases = b"ACGTACGT";
+        let quals: [u8; 8] = [30, 25, 35, 40, 20, 22, 33, 31];
+
+        let mut joined = UnmappedSamBuilder::new();
+        joined.build_record_joined_name(b"consensus", b"1/A", flags::UNMAPPED, bases, &quals);
+
+        let mut formatted = UnmappedSamBuilder::new();
+        let name = format!("{}:{}", "consensus", "1/A");
+        formatted.build_record(name.as_bytes(), flags::UNMAPPED, bases, &quals);
+
+        assert_eq!(joined.as_bytes(), formatted.as_bytes());
+        assert_eq!(read_name(joined.as_bytes()), b"consensus:1/A");
+        assert_eq!(l_read_name(joined.as_bytes()), 14); // "consensus:1/A" (13) + NUL
+    }
+
+    proptest::proptest! {
+        /// The joined-name fast path must be byte-for-byte identical to
+        /// concatenating `prefix:suffix` and calling `build_record`, across
+        /// varied prefix/suffix/bases/quals. `prefix` and `suffix` lengths are
+        /// bounded so the joined name brushes the 254-byte maximum
+        /// (`127 + 1 + 126 = 254`) without exceeding it.
+        #[test]
+        fn test_build_record_joined_name_matches_format_prop(
+            prefix in proptest::collection::vec(0x21..=0x7eu8, 0..=127),
+            suffix in proptest::collection::vec(0x21..=0x7eu8, 0..=126),
+            bases in proptest::collection::vec(proptest::sample::select(&b"ACGTN"[..]), 0..40),
+        ) {
+            // Raw Phred qualities (0..=93) matching the sequence length; the
+            // same values feed both builders, so the qual branch is identical.
+            let quals: Vec<u8> = bases.iter().map(|&b| b % 60).collect();
+
+            let mut joined = UnmappedSamBuilder::new();
+            joined.build_record_joined_name(&prefix, &suffix, flags::UNMAPPED, &bases, &quals);
+
+            // Reference path: build the joined name explicitly, then build_record.
+            let mut name = prefix.clone();
+            name.push(b':');
+            name.extend_from_slice(&suffix);
+            let mut formatted = UnmappedSamBuilder::new();
+            formatted.build_record(&name, flags::UNMAPPED, &bases, &quals);
+
+            proptest::prop_assert_eq!(joined.as_bytes(), formatted.as_bytes());
+        }
+    }
 
     #[test]
     fn test_builder_basic_unmapped_record() {

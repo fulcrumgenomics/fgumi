@@ -1291,21 +1291,31 @@ impl CodecConsensusCaller {
     ) -> Result<()> {
         // Generate read name - use ':' delimiter to match fgbio format
         self.consensus_counter += 1;
-        let read_name = if let Some(umi_str) = umi {
-            format!("{}:{}", self.read_name_prefix, umi_str)
-        } else {
-            format!("{}:{}", self.read_name_prefix, self.consensus_counter)
-        };
 
         // Codec always outputs unmapped fragments
         let flag = flags::UNMAPPED;
 
-        self.bam_builder.build_record(
-            read_name.as_bytes(),
-            flag,
-            &consensus.bases,
-            &consensus.quals,
-        );
+        // Read name is `<prefix>:<umi>` (or `<prefix>:<counter>` when there is
+        // no UMI). Compose the common UMI case straight into the record buffer
+        // rather than allocating a `String` per read; the counter fallback
+        // still formats the integer suffix.
+        if let Some(umi_str) = umi {
+            self.bam_builder.build_record_joined_name(
+                self.read_name_prefix.as_bytes(),
+                umi_str.as_bytes(),
+                flag,
+                &consensus.bases,
+                &consensus.quals,
+            );
+        } else {
+            let read_name = format!("{}:{}", self.read_name_prefix, self.consensus_counter);
+            self.bam_builder.build_record(
+                read_name.as_bytes(),
+                flag,
+                &consensus.bases,
+                &consensus.quals,
+            );
+        }
 
         // RG tag
         self.bam_builder.append_string_tag(SamTag::RG, self.read_group_id.as_bytes());

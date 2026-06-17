@@ -1075,9 +1075,16 @@ impl DuplexConsensusCaller {
             }
         }
 
-        // Build the record (name, flags, bases, quals)
-        let read_name = format!("{read_name_prefix}:{umi}");
-        builder.build_record(read_name.as_bytes(), flag, &consensus.bases, &consensus.quals);
+        // Build the record (name, flags, bases, quals). The read name is
+        // `<prefix>:<umi>`; compose it straight into the record buffer rather
+        // than allocating a fresh `String` per output read.
+        builder.build_record_joined_name(
+            read_name_prefix.as_bytes(),
+            umi.as_bytes(),
+            flag,
+            &consensus.bases,
+            &consensus.quals,
+        );
 
         // 1. MI tag (string)
         builder.append_string_tag(SamTag::MI, umi.as_bytes());
