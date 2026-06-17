@@ -21,9 +21,7 @@ use crate::validation::validate_file_exists;
 use anyhow::Result;
 use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::{
-    create_bam_reader_for_pipeline, create_raw_bam_reader, create_raw_bam_writer, is_stdin_path,
-};
+use fgumi_bam_io::{create_bam_reader_for_pipeline, create_raw_bam_reader, create_raw_bam_writer};
 use fgumi_raw_bam::RawRecord;
 use log::info;
 use noodles::sam::Header;
@@ -195,10 +193,8 @@ struct CollectedClipMetrics {
 impl Command for Clip {
     #[allow(clippy::too_many_lines)]
     fn execute(&self, command_line: &str) -> Result<()> {
-        // Validate input files exist (skip for stdin)
-        if !is_stdin_path(&self.io.input) {
-            validate_file_exists(&self.io.input, "Input BAM")?;
-        }
+        // Validate the input exists (stdin paths are exempt).
+        self.io.validate()?;
         validate_file_exists(&self.reference, "Reference FASTA")?;
 
         info!("Clip");

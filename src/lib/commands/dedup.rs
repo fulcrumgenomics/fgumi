@@ -37,12 +37,11 @@ use crate::unified_pipeline::{
     BatchWeight, GroupKeyConfig, Grouper, MemoryEstimate,
     run_bam_pipeline_from_reader_with_mi_assign,
 };
-use crate::validation::validate_file_exists;
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fgoxide::io::DelimFile;
-use fgumi_bam_io::{create_bam_reader_for_pipeline_with_opts, is_stdin_path};
+use fgumi_bam_io::create_bam_reader_for_pipeline_with_opts;
 
 use log::info;
 use noodles::sam::Header;
@@ -968,10 +967,8 @@ impl Command for MarkDuplicates {
             (self.strategy, false)
         };
 
-        // Validate input file exists
-        if !is_stdin_path(&self.io.input) {
-            validate_file_exists(&self.io.input, "input BAM file")?;
-        }
+        // Validate the input exists (stdin paths are exempt).
+        self.io.validate()?;
 
         let min_mapq: u8 = self.min_map_q.unwrap_or(0);
 
