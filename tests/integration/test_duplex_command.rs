@@ -98,7 +98,7 @@ fn create_duplex_read_pair(
 }
 
 /// Create a BAM with duplex-grouped reads (MI tags with /A and /B strand suffixes).
-fn create_duplex_bam(path: &Path, molecules: Vec<Vec<(RawRecord, RawRecord)>>) {
+pub(crate) fn create_duplex_bam(path: &Path, molecules: Vec<Vec<(RawRecord, RawRecord)>>) {
     let header = create_minimal_header("chr1", 10000);
     let mut writer =
         bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
@@ -118,7 +118,7 @@ fn create_duplex_bam(path: &Path, molecules: Vec<Vec<(RawRecord, RawRecord)>>) {
 }
 
 /// Create a single duplex molecule with `depth` read pairs on each strand.
-fn create_duplex_molecule(
+pub(crate) fn create_duplex_molecule(
     mi_id: &str,
     sequence: &str,
     quality: u8,

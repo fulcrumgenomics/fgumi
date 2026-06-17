@@ -46,7 +46,6 @@ use fgumi_bam_io::ProgressTracker;
 use fgumi_raw_bam::RawRecord;
 // RejectionTracker now used via ConsensusStatsOps trait in consensus_runner
 use crate::sam::SamTag;
-use crate::validation::validate_file_exists;
 use log::info;
 use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
@@ -264,7 +263,9 @@ impl Command for Codec {
     fn execute(&self, command_line: &str) -> Result<()> {
         // Validate inputs
         self.validate()?;
-        validate_file_exists(&self.io.input, "input BAM file")?;
+        // Validate the input exists (stdin paths are exempt — the reader
+        // streams them in a single pass).
+        self.io.validate()?;
 
         let timer = OperationTimer::new("Calling CODEC consensus");
 

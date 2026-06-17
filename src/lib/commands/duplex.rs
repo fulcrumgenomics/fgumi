@@ -45,7 +45,6 @@ use crate::unified_pipeline::{
     GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
     run_bam_pipeline_from_reader_with_secondary,
 };
-use crate::validation::validate_file_exists;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_raw_bam;
 use fgumi_raw_bam::{RawRecord, RawRecordView};
@@ -288,8 +287,9 @@ impl Command for Duplex {
         // Start timing
         let timer = OperationTimer::new("Calling duplex consensus");
 
-        // Validate input file exists
-        validate_file_exists(&self.io.input, "Input BAM")?;
+        // Validate the input exists (stdin paths are exempt — the reader
+        // streams them in a single pass).
+        self.io.validate()?;
 
         // Get threading configuration (duplex is worker-heavy with consensus calling)
         let reader_threads = self.threading.num_threads();

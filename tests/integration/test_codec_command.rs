@@ -25,7 +25,7 @@ use crate::helpers::bam_generator::create_minimal_header;
 /// In CODEC sequencing, R1 and R2 come from opposite strands of the same molecule,
 /// so a single read pair can produce duplex consensus.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::too_many_arguments)]
-fn create_codec_read_pair(
+pub(crate) fn create_codec_read_pair(
     name: &str,
     r1_seq: &[u8],
     r2_seq: &[u8],
@@ -85,7 +85,7 @@ fn create_codec_read_pair(
 }
 
 /// Helper to create a test BAM file with CODEC read pairs.
-fn create_codec_test_bam(path: &PathBuf, pairs: Vec<(RawRecord, RawRecord)>) {
+pub(crate) fn create_codec_test_bam(path: &PathBuf, pairs: Vec<(RawRecord, RawRecord)>) {
     let header = create_minimal_header("chr1", 10000);
     let mut writer =
         create_raw_bam_writer(path, &header, 1, 6).expect("Failed to create raw BAM writer");

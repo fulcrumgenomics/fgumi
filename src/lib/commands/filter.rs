@@ -287,8 +287,9 @@ struct FilterProcessCaptures {
 
 impl Command for Filter {
     fn execute(&self, command_line: &str) -> Result<()> {
-        // Validate inputs
-        validate_file_exists(&self.io.input, "Input BAM")?;
+        // Validate the input exists (stdin paths are exempt — the reader
+        // streams them in a single pass).
+        self.io.validate()?;
 
         if let Some(ref reference) = self.reference {
             validate_file_exists(reference, "Reference FASTA")?;
