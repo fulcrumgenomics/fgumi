@@ -1467,6 +1467,12 @@ impl UmiAssigner for AdjacencyUmiAssigner {
         // Count UMIs using compact BitEnc representation (saves ~60-70% memory)
         // We store index into raw_umis to avoid cloning strings
         // Also build a map from BitEnc -> unique_index for result lookup
+        //
+        // Cache each read's encoding here so the final result map can reuse it
+        // instead of re-running `BitEnc::from_umi_str` over every raw UMI a
+        // second time. `encoded_per_read[i]` is the encoding of `raw_umis[i]`
+        // (`None` for an invalid UMI), so it stays aligned with `raw_umis`.
+        let mut encoded_per_read: Vec<Option<BitEnc>> = Vec::with_capacity(raw_umis.len());
         let mut umi_counts: Vec<(BitEnc, usize, usize)> = {
             // Map from BitEnc -> (count, first_raw_index)
             let mut counts: AHashMap<BitEnc, (usize, usize)> =
@@ -1476,8 +1482,10 @@ impl UmiAssigner for AdjacencyUmiAssigner {
                 // Convert to compact representation (skips dashes in paired UMIs)
                 let Some(encoded) = BitEnc::from_umi_str(umi) else {
                     // UMI contains invalid characters - skip it
+                    encoded_per_read.push(None);
                     continue;
                 };
+                encoded_per_read.push(Some(encoded));
 
                 if let Some((count, _idx)) = counts.get_mut(&encoded) {
                     *count += 1;
@@ -1533,12 +1541,13 @@ impl UmiAssigner for AdjacencyUmiAssigner {
         // Assign IDs to nodes and build result Vec
         let unique_assignments = self.assign_ids_to_nodes_bitenc(&nodes, &roots, &umi_counts);
 
-        // Map each input UMI to its MoleculeId using BitEnc lookup
-        let result: Vec<MoleculeId> = raw_umis
+        // Map each input UMI to its MoleculeId using the encoding cached during
+        // the count pass (no second `BitEnc::from_umi_str` over every read).
+        let result: Vec<MoleculeId> = encoded_per_read
             .iter()
-            .map(|umi| {
-                if let Some(enc) = BitEnc::from_umi_str(umi) {
-                    if let Some(&unique_idx) = bitenc_to_unique_idx.get(&enc) {
+            .map(|enc| {
+                if let Some(enc) = enc {
+                    if let Some(&unique_idx) = bitenc_to_unique_idx.get(enc) {
                         return unique_assignments[unique_idx];
                     }
                 }
