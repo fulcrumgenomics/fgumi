@@ -248,6 +248,10 @@ pub struct PooledInputStream {
     current_buf: Vec<u8>,
     /// Read position within `current_buf`.
     current_pos: usize,
+    /// Reusable scratch buffer for records (or their length prefixes) that
+    /// straddle a decompressed-block boundary and therefore cannot be borrowed
+    /// directly out of `current_buf`. See [`PooledInputStream::next_record_borrowed`].
+    scratch: RawRecord,
 }
 
 impl PooledInputStream {
@@ -267,6 +271,7 @@ impl PooledInputStream {
             reorder: fgumi_bam_io::ReorderBuffer::new(),
             current_buf: Vec::new(),
             current_pos: 0,
+            scratch: RawRecord::new(),
         }
     }
 
@@ -347,6 +352,75 @@ impl PooledInputStream {
             }
         }
     }
+
+    /// Read the next raw BAM record, borrowing its bytes from the current
+    /// decompressed block when possible.
+    ///
+    /// This is the borrow-in-place counterpart to [`read_raw_record`]: it removes
+    /// the per-record `read_exact` copy into a `RawRecord` on the common path
+    /// where the record body lies wholly within the current decompressed block.
+    ///
+    /// - **Fast path:** when the 4-byte `block_size` prefix and the full record
+    ///   body are both contained in `current_buf`, returns a slice borrowed
+    ///   directly out of `current_buf` (one copy: block → caller's arena).
+    /// - **Slow path (block straddle):** when the prefix *or* the body spans a
+    ///   decompressed-block boundary, the bytes are gathered into a reusable
+    ///   internal scratch buffer via the byte-stream [`IoRead`] impl and a slice
+    ///   into that scratch is returned.
+    ///
+    /// The returned slice borrows `self`; it is invalidated by the next call to
+    /// any method on this stream. Returns `Ok(None)` at clean EOF.
+    ///
+    /// A `block_size` of 0 is treated as EOF, mirroring [`read_raw_record`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying block stream errors (I/O or
+    /// decompression), the prefix/body is truncated, or `block_size` overflows
+    /// `usize`.
+    pub fn next_record_borrowed(&mut self) -> std::io::Result<Option<&[u8]>> {
+        // --- read the 4-byte block_size prefix ---
+        let block_size = if self.current_buf.len() - self.current_pos >= 4 {
+            // Fast path: the prefix is fully buffered — decode it in place.
+            let p = self.current_pos;
+            let n = u32::from_le_bytes([
+                self.current_buf[p],
+                self.current_buf[p + 1],
+                self.current_buf[p + 2],
+                self.current_buf[p + 3],
+            ]);
+            self.current_pos += 4;
+            usize::try_from(n)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+        } else {
+            // Slow path: the prefix straddles a block boundary (or the buffer is
+            // exhausted / at EOF). `read_block_size` reads across blocks via the
+            // `IoRead` impl and returns 0 at clean EOF.
+            fgumi_raw_bam::read_block_size(self)?
+        };
+        if block_size == 0 {
+            return Ok(None); // EOF (or a zero-length prefix, treated as EOF)
+        }
+
+        // --- read the record body ---
+        if self.current_buf.len() - self.current_pos >= block_size {
+            // Fast path: the body lies wholly within the current block — borrow it.
+            let start = self.current_pos;
+            self.current_pos += block_size;
+            Ok(Some(&self.current_buf[start..start + block_size]))
+        } else {
+            // Slow path: the body straddles a block boundary — gather it into the
+            // reusable scratch buffer. Take the scratch out so `read_exact` can
+            // borrow `self` mutably, then restore it (preserving its capacity).
+            let mut scratch = std::mem::take(&mut self.scratch);
+            let buf = scratch.as_mut_vec();
+            buf.resize(block_size, 0);
+            let res = self.read_exact(buf);
+            self.scratch = scratch;
+            res?;
+            Ok(Some(self.scratch.as_ref()))
+        }
+    }
 }
 
 impl IoRead for PooledInputStream {
@@ -411,8 +485,13 @@ impl IoRead for PooledInputStream {
 /// or a direct `RawBamReader<PooledInputStream>` (pool path, no extra threads).
 pub enum RecordSource {
     /// Legacy path: background thread prefetches records.
+    ///
+    /// The second field holds the most-recently-yielded owned record so that
+    /// [`RecordSource::next_record_borrowed`] can lend a slice into it: this path
+    /// delivers owned `RawRecord`s over a channel, so there is nothing in a
+    /// shared block to borrow — the owned record is the thing we lend.
     #[allow(dead_code)] // retained for potential future use / benchmarking
-    ReadAhead(RawReadAheadReader),
+    ReadAhead(RawReadAheadReader, Option<RawRecord>),
     /// Pool path: main thread reads directly from pool's decompressed stream.
     ///
     /// The second field stores the first I/O error encountered during iteration,
@@ -432,10 +511,41 @@ impl RecordSource {
     ///
     /// Returns `Some(err)` if the iterator stopped due to a read error rather than
     /// clean EOF. Call this after exhausting the iterator to detect truncated input.
+    ///
+    /// Note: [`RecordSource::next_record_borrowed`] on the `Direct` path
+    /// propagates errors directly via its `Result` rather than stashing them
+    /// here, so for that path `take_error()` returns `None`. The `ReadAhead`
+    /// path still surfaces background-thread errors here.
     pub fn take_error(&mut self) -> Option<std::io::Error> {
         match self {
             Self::Direct(_, err) => err.take(),
-            Self::ReadAhead(r) => r.take_error(),
+            Self::ReadAhead(r, _) => r.take_error(),
+        }
+    }
+
+    /// Read the next record, borrowing its bytes in place where possible.
+    ///
+    /// On the `Direct` (pool) path this borrows straight out of the current
+    /// decompressed block via [`PooledInputStream::next_record_borrowed`],
+    /// avoiding the per-record copy into a `RawRecord`. On the `ReadAhead` path
+    /// the background thread already owns the record, so we store it and lend a
+    /// slice into it.
+    ///
+    /// The returned slice borrows `self` and is invalidated by the next call.
+    /// Returns `Ok(None)` at clean EOF.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying `Direct` block stream errors or the
+    /// input is truncated. The `ReadAhead` path defers errors to
+    /// [`RecordSource::take_error`].
+    pub fn next_record_borrowed(&mut self) -> std::io::Result<Option<&[u8]>> {
+        match self {
+            Self::Direct(reader, _error_slot) => reader.get_mut().next_record_borrowed(),
+            Self::ReadAhead(r, held) => {
+                *held = r.next_record();
+                Ok(held.as_ref().map(RawRecord::as_ref))
+            }
         }
     }
 }
@@ -445,7 +555,7 @@ impl Iterator for RecordSource {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            Self::ReadAhead(r) => r.next(),
+            Self::ReadAhead(r, _) => r.next(),
             Self::Direct(reader, error_slot) => {
                 let mut record = RawRecord::default();
                 match reader.read_record(&mut record) {
@@ -545,5 +655,187 @@ mod tests {
         let ra = RawReadAheadReader::new(reader);
         let records: Vec<RawRecord> = ra.collect();
         assert_eq!(records.len(), num, "Raw read-ahead should yield exactly {num} records");
+    }
+
+    // ── PooledInputStream::next_record_borrowed — block-straddle tests ───────
+    //
+    // These build a PooledInputStream whose decompressed blocks are a fixed
+    // (often tiny) size, so records and their 4-byte length prefixes straddle
+    // block boundaries. The borrow-in-place reader must reassemble straddling
+    // records via its scratch buffer and produce byte-identical output to the
+    // owned read_record path.
+
+    use crossbeam_queue::ArrayQueue;
+    use proptest::{prop_assert_eq, proptest};
+    use rstest::rstest;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    /// Frame a record body with its 4-byte little-endian `block_size` prefix.
+    fn frame_record(body: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(4 + body.len());
+        v.extend_from_slice(&u32::try_from(body.len()).expect("body fits u32").to_le_bytes());
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// Build a `PooledInputStream` whose decompressed blocks are exactly
+    /// `block_len` bytes each (the last may be shorter). Small `block_len`
+    /// values force prefixes and bodies to straddle block boundaries.
+    fn pooled_stream_from(records: &[Vec<u8>], block_len: usize) -> PooledInputStream {
+        assert!(block_len >= 1, "block_len must be positive");
+        let mut stream = Vec::new();
+        for body in records {
+            stream.extend_from_slice(&frame_record(body));
+        }
+        let chunks: Vec<Vec<u8>> = if stream.is_empty() {
+            Vec::new()
+        } else {
+            stream.chunks(block_len).map(<[u8]>::to_vec).collect()
+        };
+        let queue = Arc::new(ArrayQueue::new(chunks.len().max(1)));
+        for (serial, chunk) in chunks.into_iter().enumerate() {
+            let serial = u64::try_from(serial).expect("serial fits u64");
+            queue.push((serial, chunk)).expect("queue has capacity for all chunks");
+        }
+        PooledInputStream::new(
+            queue,
+            Arc::new(AtomicBool::new(true)), // decompressed_input_done
+            Arc::new(AtomicBool::new(false)), // input_read_error
+            Arc::new(AtomicBool::new(false)), // decompression_error
+        )
+    }
+
+    /// Drain all records via the borrowing API, copying each borrowed slice into
+    /// an owned `Vec` for comparison.
+    fn collect_borrowed(stream: &mut PooledInputStream) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Some(rec) = stream.next_record_borrowed().expect("borrow read should succeed") {
+            out.push(rec.to_vec());
+        }
+        out
+    }
+
+    /// Record bodies of assorted lengths with position-dependent content, so a
+    /// misaligned read produces detectably wrong bytes.
+    fn sample_record_bodies() -> Vec<Vec<u8>> {
+        let lens = [1usize, 2, 3, 4, 5, 8, 13, 32, 33, 100, 255, 256, 257];
+        lens.iter()
+            .enumerate()
+            .map(|(k, &len)| {
+                let base = u8::try_from(k % 256).expect("k%256 fits u8");
+                (0..len)
+                    .map(|j| base.wrapping_add(u8::try_from(j % 256).expect("j%256 fits u8")))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[rstest]
+    fn test_next_record_borrowed_matches_input_across_block_sizes(
+        // Tiny sizes force straddles; large sizes (> whole stream) take the
+        // all-in-one-block fast path.
+        #[values(1usize, 2, 3, 4, 5, 6, 7, 8, 16, 64, 1024, 65_535)] block_len: usize,
+    ) {
+        let records = sample_record_bodies();
+        let mut stream = pooled_stream_from(&records, block_len);
+        let got = collect_borrowed(&mut stream);
+        assert_eq!(got, records, "record mismatch at block_len={block_len}");
+    }
+
+    #[test]
+    fn test_next_record_borrowed_empty_stream() {
+        let mut stream = pooled_stream_from(&[], 4);
+        assert!(
+            stream.next_record_borrowed().expect("empty stream read should succeed").is_none(),
+            "empty stream should yield no records"
+        );
+    }
+
+    #[test]
+    fn test_next_record_borrowed_prefix_straddle() {
+        // block_len = 2 guarantees every record's 4-byte prefix spans at least
+        // two blocks, exercising the slow prefix path (fgumi_raw_bam::read_block_size).
+        let records = vec![vec![0xAB; 10], vec![0xCD; 7], vec![0xEF; 1]];
+        let mut stream = pooled_stream_from(&records, 2);
+        assert_eq!(collect_borrowed(&mut stream), records);
+    }
+
+    #[test]
+    fn test_next_record_borrowed_body_exact_boundary_and_straddle() {
+        // With block_len = 10 the first framed record ([prefix(4)|body(6)] = 10
+        // bytes) ends exactly on a block boundary; the next records straddle.
+        let records = vec![vec![1u8; 6], vec![2u8; 9], vec![3u8; 3]];
+        let mut stream = pooled_stream_from(&records, 10);
+        assert_eq!(collect_borrowed(&mut stream), records);
+    }
+
+    #[rstest]
+    fn test_next_record_borrowed_parity_with_read_record(
+        #[values(1usize, 3, 7, 64)] block_len: usize,
+    ) {
+        // The borrow-in-place reader must produce byte-identical records to the
+        // owned read_raw_record path over the same chunked stream.
+        let records = sample_record_bodies();
+        let mut borrowed_stream = pooled_stream_from(&records, block_len);
+        let borrowed = collect_borrowed(&mut borrowed_stream);
+
+        let owned_stream = pooled_stream_from(&records, block_len);
+        let mut reader = fgumi_raw_bam::RawBamReader::new(owned_stream);
+        let mut owned = Vec::new();
+        let mut rec = fgumi_raw_bam::RawRecord::new();
+        loop {
+            let n = reader.read_record(&mut rec).expect("read_record should succeed");
+            if n == 0 {
+                break;
+            }
+            owned.push(rec.as_ref().to_vec());
+        }
+
+        assert_eq!(borrowed, owned, "borrowed vs owned mismatch at block_len={block_len}");
+        assert_eq!(borrowed, records, "borrowed records must match input");
+    }
+
+    #[test]
+    fn test_next_record_borrowed_truncated_body_errors() {
+        // A framed record claiming a 20-byte body but only 5 bytes present must
+        // surface an error (not silently return a short or wrong record).
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&20u32.to_le_bytes());
+        stream.extend_from_slice(&[7u8; 5]);
+        let queue = Arc::new(ArrayQueue::new(1));
+        queue.push((0u64, stream)).expect("push");
+        let mut pooled = PooledInputStream::new(
+            queue,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let err = pooled.next_record_borrowed().expect_err("truncated body should error");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    proptest! {
+        /// Property: over randomized record bodies and decompressed-block sizes,
+        /// the borrow-in-place reader yields records byte-identical to the input
+        /// (and, transitively, to the owned `read_record` path). This widens the
+        /// boundary coverage of the fixed straddle examples — any combination of
+        /// record length and block length where a prefix or body crosses a block
+        /// edge must still reassemble correctly via the scratch buffer.
+        #[test]
+        fn prop_next_record_borrowed_matches_input(
+            // Up to 24 records, each 1..=300 bytes of arbitrary content.
+            records in proptest::collection::vec(
+                proptest::collection::vec(proptest::num::u8::ANY, 1..=300),
+                0..=24,
+            ),
+            // Block sizes from 1 (every prefix straddles) up past the largest
+            // record (whole-record fast path).
+            block_len in 1usize..=512,
+        ) {
+            let mut stream = pooled_stream_from(&records, block_len);
+            let got = collect_borrowed(&mut stream);
+            prop_assert_eq!(got, records);
+        }
     }
 }

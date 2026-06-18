@@ -171,10 +171,22 @@ where
     Ok(block_size)
 }
 
-/// Reads the 4-byte block size prefix.
+/// Reads the 4-byte BAM record `block_size` prefix (little-endian u32).
 ///
-/// Returns 0 at EOF (no bytes available).
-fn read_block_size<R>(reader: &mut R) -> io::Result<usize>
+/// Returns 0 at EOF (no bytes available before the prefix starts). Handles a
+/// prefix split across reader boundaries by issuing a 1-byte read first (to
+/// detect clean EOF) followed by a `read_exact` of the remaining 3 bytes.
+///
+/// Exposed for the sort ingest borrow-in-place path
+/// (`PooledInputStream::next_record_borrowed`), which reads the prefix itself so
+/// it can decide whether the record body can be borrowed from the current
+/// decompressed block or must be gathered into a scratch buffer.
+///
+/// # Errors
+///
+/// Returns an error if the reader errors, the prefix is truncated, or the value
+/// does not fit in `usize`.
+pub fn read_block_size<R>(reader: &mut R) -> io::Result<usize>
 where
     R: Read,
 {

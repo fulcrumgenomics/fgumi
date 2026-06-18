@@ -90,7 +90,8 @@ pub use overlap::{is_fr_pair_raw, num_bases_extending_past_mate_raw};
 
 // -- raw_bam_record --
 pub use raw_bam_record::{
-    RawBamReader, RawBamWriter, RawRecord, read_raw_record, write_raw_record, write_raw_records,
+    RawBamReader, RawBamWriter, RawRecord, read_block_size, read_raw_record, write_raw_record,
+    write_raw_records,
 };
 
 // -- sequence --

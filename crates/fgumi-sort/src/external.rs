@@ -2116,12 +2116,16 @@ impl RawExternalSorter {
         debug!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
         let mut probe = SpillProbe::new("phase1");
 
-        for record in record_source.by_ref() {
+        // Borrow each record's bytes straight out of the decompressed block and
+        // push them into the arena, skipping the intermediate `RawRecord` copy
+        // (the borrowed slice is invalidated by the next `next_record_borrowed`
+        // call, which is fine — `push_coordinate` copies the bytes into the buffer).
+        while let Some(record) = record_source.next_record_borrowed()? {
             stats.total_records += 1;
             progress.log_if_needed(1);
 
             // Push directly to buffer - key extracted inline from raw bytes
-            buffer.push_coordinate(record.as_ref())?;
+            buffer.push_coordinate(record)?;
 
             if probe.should_sample_read(stats.total_records) {
                 probe.log_mid_read(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
@@ -2676,14 +2680,16 @@ impl RawExternalSorter {
             buffer.push(bam_bytes, K::from_full(&full))?;
         }
 
-        for record in record_source.by_ref() {
+        // Borrow each record's bytes in place (see the coordinate ingest loop);
+        // the key is extracted and the bytes copied into the buffer before the
+        // borrow ends, so no owned `RawRecord` is needed here.
+        while let Some(bam_bytes) = record_source.next_record_borrowed()? {
             stats.total_records += 1;
             progress.log_if_needed(1);
 
             // Extract the full template key, verify the lanes the chosen variant
             // dropped are constant relative to the first record, then push the
             // narrowed key.
-            let bam_bytes = record.as_ref();
             let full = extract_template_key_inline(bam_bytes, lib_lookup, self.cell_tag, cb_hasher);
             if let Some(violation) = verify_dropped_lanes(&first, &full, variant) {
                 let name = String::from_utf8_lossy(
