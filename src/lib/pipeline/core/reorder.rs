@@ -26,7 +26,8 @@
 //!     transport (`CountBounded` / `Unbounded` — see PR 1 caveat below).
 //!   - "Stashed" items (must-accept overflow when transport rejected, or
 //!     items pulled but not yet at their turn) live in `state.buffer:
-//!     HashMap<u64, T>`.
+//!     AHashMap<u64, T>` (ahash — the ordinals are trivial monotonic `u64`
+//!     keys, so the default `SipHash` buys nothing on this per-item path).
 //!   - The transport's backpressure budget covers only in-flight items.
 //!     The overflow stash has its own byte cap (`max_overflow_bytes`). The
 //!     framework sizes that cap thread-awarely from the per-edge transport
@@ -41,8 +42,8 @@
 //! / `ByItemOrdinal` compose with `QueueSpec::ByteBounded` — the canonical BAM
 //! step output shape (`build_branch_ordered_bytes`).
 
+use ahash::AHashMap;
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -213,7 +214,7 @@ struct ReorderState<T> {
     /// The size is consumed by `buffer_bytes` accounting; for items
     /// whose `heap_size()` is O(records) (e.g. position groups) this
     /// caching avoids 3× the `heap_size` cost per item flowing through.
-    buffer: HashMap<u64, (T, u64)>,
+    buffer: AHashMap<u64, (T, u64)>,
     /// Tracked heap bytes of items currently in `buffer`. Updated on
     /// insert + on `try_pop_in_order` drain. Used to enforce
     /// `max_overflow_bytes`. Mirrors legacy
@@ -229,7 +230,7 @@ impl<T: Send + HeapSize + 'static> ReorderStage<T> {
         Self {
             transport,
             state: Mutex::new(ReorderState {
-                buffer: HashMap::new(),
+                buffer: AHashMap::new(),
                 buffer_bytes: 0,
                 next_serial: 0,
             }),
@@ -269,7 +270,7 @@ impl<T: Send + HeapSize + 'static> ReorderStage<T> {
         Self {
             transport,
             state: Mutex::new(ReorderState {
-                buffer: HashMap::new(),
+                buffer: AHashMap::new(),
                 buffer_bytes: 0,
                 next_serial: 0,
             }),
