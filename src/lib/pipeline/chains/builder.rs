@@ -217,6 +217,102 @@ pub(crate) struct FuseState {
 
 impl HeapSize for FuseState {}
 
+/// Build the `TemplatesToMiGroups` bridge step that fuses an intermediate
+/// `add_group` (which emits `BatchedProcessedPositionGroups`) into a consensus
+/// stage (which consumes `BatchedMiGroups`). For each template it splices the
+/// assigned molecular identifier into the `MI` tag and runs the records into
+/// per-MI groups in a single pass, replicating `runall.rs`'s
+/// `templates_to_mi_step`.
+///
+/// `duplex_strip_strand` controls whether the `/A` `/B` strand suffix is
+/// stripped from the MI key so both strands of a duplex molecule group
+/// together (`true` for duplex; `false` for simplex and codec).
+fn templates_to_mi_step(
+    limit_bytes: u64,
+    duplex_strip_strand: bool,
+) -> impl crate::pipeline::core::step::Step<
+    Input = crate::pipeline::steps::group::position::BatchedProcessedPositionGroups,
+    Outputs = crate::pipeline::core::outputs::OrderedBytesSingle<
+        crate::pipeline::steps::group::mi::BatchedMiGroups,
+    >,
+> {
+    use crate::mi_group::MiGroup;
+    use crate::pipeline::steps::group::mi::BatchedMiGroups;
+    use crate::pipeline::steps::group::position::BatchedProcessedPositionGroups;
+    use crate::pipeline::steps::process::process_with_worker_state;
+    use crate::sam::SamTag;
+    use fgumi_raw_bam::RawRecord;
+    use std::io;
+
+    // The assign tag is always `MI` (== [b'M', b'I']), matching `add_group`.
+    let assign_tag_bytes: [u8; 2] = *SamTag::MI;
+
+    process_with_worker_state::<BatchedProcessedPositionGroups, BatchedMiGroups, _, FuseState, _>(
+        "TemplatesToMiGroups",
+        limit_bytes,
+        || FuseState { scratch: Vec::with_capacity(512), mi_buf: String::with_capacity(16) },
+        move |state: &mut FuseState,
+              item: BatchedProcessedPositionGroups|
+              -> io::Result<BatchedMiGroups> {
+            let BatchedProcessedPositionGroups { batch_serial, groups } = item;
+            let mut mi_groups: Vec<MiGroup> = Vec::new();
+            for processed in &groups {
+                let mut current_mi: Option<String> = None;
+                let mut current_records: Vec<RawRecord> = Vec::new();
+                for template in &processed.templates {
+                    if !template.mi.is_assigned() {
+                        continue;
+                    }
+                    let mi_key = if duplex_strip_strand {
+                        template.mi.id().unwrap().to_string()
+                    } else {
+                        template.mi.write_with_offset(0, &mut state.mi_buf);
+                        state.mi_buf.clone()
+                    };
+                    template.mi.write_with_offset(0, &mut state.mi_buf);
+                    match &current_mi {
+                        Some(curr) if curr != &mi_key => {
+                            if !current_records.is_empty() {
+                                mi_groups.push(MiGroup::new(
+                                    std::mem::take(&mut current_mi).unwrap(),
+                                    std::mem::take(&mut current_records),
+                                ));
+                            }
+                            current_mi = Some(mi_key);
+                        }
+                        None => {
+                            current_mi = Some(mi_key);
+                        }
+                        Some(_) => {}
+                    }
+                    for raw in [template.r1(), template.r2()].into_iter().flatten() {
+                        state.scratch.clear();
+                        state.scratch.extend_from_slice(raw);
+                        fgumi_raw_bam::update_string_tag(
+                            &mut state.scratch,
+                            assign_tag_bytes,
+                            state.mi_buf.as_bytes(),
+                        );
+                        // Move the tagged bytes into the record instead of cloning
+                        // them; reinstall a fresh scratch buffer pre-sized to the
+                        // same capacity so the next record reuses it without a
+                        // realloc (the per-record `clear()` above keeps it warm).
+                        let cap = state.scratch.capacity();
+                        let record = std::mem::replace(&mut state.scratch, Vec::with_capacity(cap));
+                        current_records.push(RawRecord::from(record));
+                    }
+                }
+                if !current_records.is_empty() {
+                    if let Some(mi) = current_mi.take() {
+                        mi_groups.push(MiGroup::new(mi, current_records));
+                    }
+                }
+            }
+            Ok(BatchedMiGroups::new(batch_serial, mi_groups))
+        },
+    )
+}
+
 pub struct ChainBuilder<'a> {
     spec: &'a ChainSpec,
     tuning: BamPipelineTuning,
@@ -2529,91 +2625,13 @@ impl<'a> ChainBuilder<'a> {
         //
         // Path 1 (normal): tail is DecodedRecordBatch → prepend GroupByMi.
         // Path 2 (fused group→simplex): tail is BatchedProcessedPositionGroups
-        //   (from add_group(Intermediate)) → prepend TemplatesToMiGroups bridge.
-        //
-        // TemplatesToMiGroups replicates build_group_and_fuse_steps's
-        // `templates_to_mi_step` from runall.rs.  The assign_tag_bytes is always
-        // *SamTag::MI (== [b'M', b'I']) — the same constant used in add_group.
-        // duplex_strip_strand = false for simplex (simplex does not use /A /B suffixes).
+        //   (from add_group(Intermediate)) → prepend the `templates_to_mi_step`
+        //   bridge. Simplex passes `duplex_strip_strand = false` (no /A /B
+        //   suffixes).
         let tail = if self.chain_tail_kind == ChainTailKind::BatchedProcessedPositionGroups {
-            use crate::mi_group::MiGroup;
-            use crate::pipeline::steps::group::mi::BatchedMiGroups;
-            use crate::pipeline::steps::group::position::BatchedProcessedPositionGroups;
-            use crate::pipeline::steps::process::process_with_worker_state;
-            use fgumi_raw_bam::RawRecord;
-            use std::io;
-
-            let assign_tag_bytes: [u8; 2] = *SamTag::MI;
-            let duplex_strip_strand = false;
-
-            let templates_to_mi_step = process_with_worker_state::<
-                BatchedProcessedPositionGroups,
-                BatchedMiGroups,
-                _,
-                FuseState,
-                _,
-            >(
-                "TemplatesToMiGroups",
-                self.tuning.per_step_byte_limit,
-                || FuseState {
-                    scratch: Vec::with_capacity(512),
-                    mi_buf: String::with_capacity(16),
-                },
-                move |state: &mut FuseState,
-                      item: BatchedProcessedPositionGroups|
-                      -> io::Result<BatchedMiGroups> {
-                    let BatchedProcessedPositionGroups { batch_serial, groups } = item;
-                    let mut mi_groups: Vec<MiGroup> = Vec::new();
-                    for processed in &groups {
-                        let mut current_mi: Option<String> = None;
-                        let mut current_records: Vec<RawRecord> = Vec::new();
-                        for template in &processed.templates {
-                            if !template.mi.is_assigned() {
-                                continue;
-                            }
-                            let mi_key = if duplex_strip_strand {
-                                template.mi.id().unwrap().to_string()
-                            } else {
-                                template.mi.write_with_offset(0, &mut state.mi_buf);
-                                state.mi_buf.clone()
-                            };
-                            template.mi.write_with_offset(0, &mut state.mi_buf);
-                            match &current_mi {
-                                Some(curr) if curr != &mi_key => {
-                                    if !current_records.is_empty() {
-                                        mi_groups.push(MiGroup::new(
-                                            std::mem::take(&mut current_mi).unwrap(),
-                                            std::mem::take(&mut current_records),
-                                        ));
-                                    }
-                                    current_mi = Some(mi_key);
-                                }
-                                None => {
-                                    current_mi = Some(mi_key);
-                                }
-                                Some(_) => {}
-                            }
-                            for raw in [template.r1(), template.r2()].into_iter().flatten() {
-                                state.scratch.clear();
-                                state.scratch.extend_from_slice(raw);
-                                fgumi_raw_bam::update_string_tag(
-                                    &mut state.scratch,
-                                    assign_tag_bytes,
-                                    state.mi_buf.as_bytes(),
-                                );
-                                current_records.push(RawRecord::from(state.scratch.clone()));
-                            }
-                        }
-                        if !current_records.is_empty() {
-                            if let Some(mi) = current_mi.take() {
-                                mi_groups.push(MiGroup::new(mi, current_records));
-                            }
-                        }
-                    }
-                    Ok(BatchedMiGroups::new(batch_serial, mi_groups))
-                },
-            );
-            self.pipeline.append_step(templates_to_mi_step, tail)
+            // simplex: no `/A` `/B` strand stripping.
+            self.pipeline
+                .append_step(templates_to_mi_step(self.tuning.per_step_byte_limit, false), tail)
         } else {
             // Normal path: DecodedRecordBatch → GroupByMi → BatchedMiGroups.
             let group_mi_step = GroupByMi::new(*SamTag::MI, self.tuning.per_step_byte_limit)
@@ -2854,84 +2872,9 @@ impl<'a> ChainBuilder<'a> {
         //   (from add_group(Intermediate)) → prepend TemplatesToMiGroups bridge
         //   with duplex_strip_strand = true.
         let tail = if self.chain_tail_kind == ChainTailKind::BatchedProcessedPositionGroups {
-            use crate::mi_group::MiGroup;
-            use crate::pipeline::steps::group::mi::BatchedMiGroups;
-            use crate::pipeline::steps::group::position::BatchedProcessedPositionGroups;
-            use crate::pipeline::steps::process::process_with_worker_state;
-            use fgumi_raw_bam::RawRecord;
-            use std::io;
-
-            let assign_tag_bytes: [u8; 2] = *SamTag::MI;
-            let duplex_strip_strand = true; // duplex: strip /A /B so both strands group together
-
-            let templates_to_mi_step = process_with_worker_state::<
-                BatchedProcessedPositionGroups,
-                BatchedMiGroups,
-                _,
-                FuseState,
-                _,
-            >(
-                "TemplatesToMiGroups",
-                self.tuning.per_step_byte_limit,
-                || FuseState {
-                    scratch: Vec::with_capacity(512),
-                    mi_buf: String::with_capacity(16),
-                },
-                move |state: &mut FuseState,
-                      item: BatchedProcessedPositionGroups|
-                      -> io::Result<BatchedMiGroups> {
-                    let BatchedProcessedPositionGroups { batch_serial, groups } = item;
-                    let mut mi_groups: Vec<MiGroup> = Vec::new();
-                    for processed in &groups {
-                        let mut current_mi: Option<String> = None;
-                        let mut current_records: Vec<RawRecord> = Vec::new();
-                        for template in &processed.templates {
-                            if !template.mi.is_assigned() {
-                                continue;
-                            }
-                            let mi_key = if duplex_strip_strand {
-                                template.mi.id().unwrap().to_string()
-                            } else {
-                                template.mi.write_with_offset(0, &mut state.mi_buf);
-                                state.mi_buf.clone()
-                            };
-                            template.mi.write_with_offset(0, &mut state.mi_buf);
-                            match &current_mi {
-                                Some(curr) if curr != &mi_key => {
-                                    if !current_records.is_empty() {
-                                        mi_groups.push(MiGroup::new(
-                                            std::mem::take(&mut current_mi).unwrap(),
-                                            std::mem::take(&mut current_records),
-                                        ));
-                                    }
-                                    current_mi = Some(mi_key);
-                                }
-                                None => {
-                                    current_mi = Some(mi_key);
-                                }
-                                Some(_) => {}
-                            }
-                            for raw in [template.r1(), template.r2()].into_iter().flatten() {
-                                state.scratch.clear();
-                                state.scratch.extend_from_slice(raw);
-                                fgumi_raw_bam::update_string_tag(
-                                    &mut state.scratch,
-                                    assign_tag_bytes,
-                                    state.mi_buf.as_bytes(),
-                                );
-                                current_records.push(RawRecord::from(state.scratch.clone()));
-                            }
-                        }
-                        if !current_records.is_empty() {
-                            if let Some(mi) = current_mi.take() {
-                                mi_groups.push(MiGroup::new(mi, current_records));
-                            }
-                        }
-                    }
-                    Ok(BatchedMiGroups::new(batch_serial, mi_groups))
-                },
-            );
-            self.pipeline.append_step(templates_to_mi_step, tail)
+            // duplex: strip `/A` `/B` so both strands group together.
+            self.pipeline
+                .append_step(templates_to_mi_step(self.tuning.per_step_byte_limit, true), tail)
         } else {
             // Normal path: DecodedRecordBatch → GroupByMi → BatchedMiGroups.
             // Record filter: skip secondary/supplementary; require mapped or mapped-mate.
@@ -3166,84 +3109,9 @@ impl<'a> ChainBuilder<'a> {
         //   (from add_group(Intermediate)) → prepend TemplatesToMiGroups bridge.
         //   duplex_strip_strand = false (codec does not use /A /B suffixes).
         let tail = if self.chain_tail_kind == ChainTailKind::BatchedProcessedPositionGroups {
-            use crate::mi_group::MiGroup;
-            use crate::pipeline::steps::group::mi::BatchedMiGroups;
-            use crate::pipeline::steps::group::position::BatchedProcessedPositionGroups;
-            use crate::pipeline::steps::process::process_with_worker_state;
-            use fgumi_raw_bam::RawRecord;
-            use std::io;
-
-            let assign_tag_bytes: [u8; 2] = *SamTag::MI;
-            let duplex_strip_strand = false;
-
-            let templates_to_mi_step = process_with_worker_state::<
-                BatchedProcessedPositionGroups,
-                BatchedMiGroups,
-                _,
-                FuseState,
-                _,
-            >(
-                "TemplatesToMiGroups",
-                self.tuning.per_step_byte_limit,
-                || FuseState {
-                    scratch: Vec::with_capacity(512),
-                    mi_buf: String::with_capacity(16),
-                },
-                move |state: &mut FuseState,
-                      item: BatchedProcessedPositionGroups|
-                      -> io::Result<BatchedMiGroups> {
-                    let BatchedProcessedPositionGroups { batch_serial, groups } = item;
-                    let mut mi_groups: Vec<MiGroup> = Vec::new();
-                    for processed in &groups {
-                        let mut current_mi: Option<String> = None;
-                        let mut current_records: Vec<RawRecord> = Vec::new();
-                        for template in &processed.templates {
-                            if !template.mi.is_assigned() {
-                                continue;
-                            }
-                            let mi_key = if duplex_strip_strand {
-                                template.mi.id().unwrap().to_string()
-                            } else {
-                                template.mi.write_with_offset(0, &mut state.mi_buf);
-                                state.mi_buf.clone()
-                            };
-                            template.mi.write_with_offset(0, &mut state.mi_buf);
-                            match &current_mi {
-                                Some(curr) if curr != &mi_key => {
-                                    if !current_records.is_empty() {
-                                        mi_groups.push(MiGroup::new(
-                                            std::mem::take(&mut current_mi).unwrap(),
-                                            std::mem::take(&mut current_records),
-                                        ));
-                                    }
-                                    current_mi = Some(mi_key);
-                                }
-                                None => {
-                                    current_mi = Some(mi_key);
-                                }
-                                Some(_) => {}
-                            }
-                            for raw in [template.r1(), template.r2()].into_iter().flatten() {
-                                state.scratch.clear();
-                                state.scratch.extend_from_slice(raw);
-                                fgumi_raw_bam::update_string_tag(
-                                    &mut state.scratch,
-                                    assign_tag_bytes,
-                                    state.mi_buf.as_bytes(),
-                                );
-                                current_records.push(RawRecord::from(state.scratch.clone()));
-                            }
-                        }
-                        if !current_records.is_empty() {
-                            if let Some(mi) = current_mi.take() {
-                                mi_groups.push(MiGroup::new(mi, current_records));
-                            }
-                        }
-                    }
-                    Ok(BatchedMiGroups::new(batch_serial, mi_groups))
-                },
-            );
-            self.pipeline.append_step(templates_to_mi_step, tail)
+            // codec: no `/A` `/B` strand stripping.
+            self.pipeline
+                .append_step(templates_to_mi_step(self.tuning.per_step_byte_limit, false), tail)
         } else {
             // Normal path: DecodedRecordBatch → GroupByMi → BatchedMiGroups.
             // Codec: no record filter (processes all mapped reads), no MI transform.
