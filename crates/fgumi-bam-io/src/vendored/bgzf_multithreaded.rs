@@ -482,7 +482,13 @@ fn compress_block(
         buffer[buffer.len() - 5],
     ]);
 
-    Ok((buffer.clone(), crc32, input.len()))
+    // Move the compressed block out instead of cloning it (a full per-block
+    // memcpy). Reinstall a fresh buffer pre-sized to the same capacity so the
+    // next block compresses into it without regrowing from empty — `mem::take`
+    // would leave a zero-capacity buffer and force that regrowth.
+    let cap = buffer.capacity();
+    let frame = std::mem::replace(buffer, Vec::with_capacity(cap));
+    Ok((frame, crc32, input.len()))
 }
 
 fn spawn_writer<W>(
