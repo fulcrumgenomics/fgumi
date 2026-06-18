@@ -206,12 +206,22 @@ fn read_raw_block<R: Read + ?Sized>(reader: &mut R) -> io::Result<Option<RawBgzf
         ));
     }
 
-    // Allocate buffer and copy header
-    let mut data = vec![0u8; block_size];
-    data[..BGZF_HEADER_SIZE].copy_from_slice(&header);
-
-    // Read remaining block data
-    reader.read_exact(&mut data[BGZF_HEADER_SIZE..])?;
+    // Reserve the exact block size and append the header, then read the
+    // remaining bytes via `read_to_end` into the uninitialized spare capacity.
+    // This avoids the `vec![0u8; block_size]` zero-fill that `read_exact` would
+    // immediately overwrite (std fills the spare capacity without a memset). The
+    // length check below restores `read_exact`'s "error on a short block"
+    // semantics, since `read_to_end` itself returns `Ok` on early EOF.
+    let mut data = Vec::with_capacity(block_size);
+    data.extend_from_slice(&header);
+    let remaining = block_size - BGZF_HEADER_SIZE;
+    let read = reader.take(remaining as u64).read_to_end(&mut data)?;
+    if read != remaining {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("truncated BGZF block: expected {remaining} more bytes, got {read}"),
+        ));
+    }
 
     Ok(Some(RawBgzfBlock { data }))
 }
