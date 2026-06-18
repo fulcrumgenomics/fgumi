@@ -150,7 +150,8 @@ because the hot path runs once per record (BAM workloads are millions to billion
 of records) and a safe rewrite measurably regresses sort throughput.
 
 - **`crates/fgumi-sort/src/inline.rs`** — three `#[allow(unsafe_code)]` regions:
-  the `radix_sort_record_refs` (coordinate) and `radix_sort_template_refs` /
+  the `radix_sort_record_refs_with_max` (coordinate; `radix_sort_record_refs`
+  delegates to it after scanning for the max) and `radix_sort_template_refs` /
   `radix_sort_template_field` (template) LSD radix sorts use `Vec::set_len` to
   skip per-element initialization on the auxiliary scratch buffer, plus
   raw-pointer slice swaps to avoid double-borrow restrictions across the

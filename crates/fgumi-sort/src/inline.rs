@@ -212,6 +212,15 @@ pub struct RecordRef {
     padding: u32,
 }
 
+impl RecordRef {
+    /// Construct a `RecordRef` from its public fields (padding is internal).
+    /// Primarily for tests and benchmarks that build sort indices directly.
+    #[must_use]
+    pub fn new(sort_key: u64, offset: u64, len: u32) -> Self {
+        Self { sort_key, offset, len, padding: 0 }
+    }
+}
+
 impl PartialEq for RecordRef {
     fn eq(&self, other: &Self) -> bool {
         self.sort_key == other.sort_key
@@ -279,6 +288,21 @@ pub struct RecordBuffer {
     refs: Vec<RecordRef>,
     /// Number of reference sequences (for unmapped handling).
     nref: u32,
+    /// Running maximum *mapped* `sort_key` over the records currently in
+    /// `refs`, maintained as records are pushed. Serves two purposes for the
+    /// radix sort: it skips the standalone max-finding scan, and — crucially —
+    /// it **excludes the unmapped sentinel** (`u64::MAX`, the key of `tid < 0`
+    /// reads). Mapped coordinate keys span only ~5 bytes (tid ≤ 24) to ~6
+    /// (with ALT/decoy contigs), but a single unmapped read would otherwise
+    /// drag the max to `u64::MAX`, forcing the radix to its full 8-byte width.
+    /// Since unmapped keys are `u64::MAX`, they truncate to all-`0xFF` under
+    /// any `bytes_needed` and always sort to the tail, so sizing `bytes_needed`
+    /// from the mapped max alone still produces a fully-ordered result.
+    /// Invariant: equals the max over non-sentinel keys
+    /// (`refs.iter().map(|r| r.sort_key).filter(|&k| k != u64::MAX).max().unwrap_or(0)`)
+    /// at every sort entry point (0 when empty or all-unmapped); debug builds
+    /// assert this.
+    max_sort_key: u64,
 }
 
 /// Segment size for in-memory sort buffers: 256 MiB.
@@ -300,7 +324,7 @@ const SORT_SEGMENT_SIZE: usize = 256 * 1024 * 1024;
 /// (`HEADER_SIZE` for `RecordBuffer`, `TEMPLATE_HEADER_SIZE` for
 /// `TemplateRecordBuffer`).
 macro_rules! par_sort_into_chunks_impl {
-    ($self:expr, $threads:expr, $sort_fn:ident, $header_size:expr, $key_fn:expr) => {{
+    ($self:expr, $threads:expr, $sort_fn:expr, $header_size:expr, $key_fn:expr) => {{
         use rayon::prelude::*;
         use std::sync::Arc;
 
@@ -361,6 +385,7 @@ impl RecordBuffer {
             ),
             refs: Vec::with_capacity(estimated_records),
             nref,
+            max_sort_key: 0,
         }
     }
 
@@ -411,9 +436,30 @@ impl RecordBuffer {
         // Write raw BAM data
         self.data.extend_in_place(record);
 
-        // Add to index
+        // Add to index, and keep the running max in sync so the radix sort can
+        // skip its standalone max-finding scan. Exclude the unmapped sentinel
+        // (`u64::MAX`) so a single unmapped read doesn't widen `bytes_needed`
+        // to the full 8 bytes; unmapped reads still sort to the tail because
+        // their key truncates to all-`0xFF` under any width.
         self.refs.push(RecordRef { sort_key, offset, len, padding: 0 });
+        if sort_key != u64::MAX {
+            self.max_sort_key = self.max_sort_key.max(sort_key);
+        }
         Ok(())
+    }
+
+    /// Debug-only check that the tracked running max matches a fresh in-place
+    /// scan over the non-sentinel keys. This is the streaming-vs-materialized
+    /// equivalence that guards every push/clear path; it compiles out entirely
+    /// in release.
+    #[inline]
+    fn debug_assert_max_sort_key(&self) {
+        debug_assert_eq!(
+            self.max_sort_key,
+            self.refs.iter().map(|r| r.sort_key).filter(|&k| k != u64::MAX).max().unwrap_or(0),
+            "tracked max_sort_key disagrees with an in-place scan (over non-sentinel keys); \
+             a push or clear path failed to maintain the running max",
+        );
     }
 
     /// Sort the index by key (records stay in place).
@@ -421,7 +467,8 @@ impl RecordBuffer {
     /// Uses radix sort for O(n×k) performance instead of O(n log n) comparison sort.
     /// Falls back to insertion sort for small arrays.
     pub fn sort(&mut self) {
-        radix_sort_record_refs(&mut self.refs);
+        self.debug_assert_max_sort_key();
+        radix_sort_record_refs_with_max(&mut self.refs, self.max_sort_key);
     }
 
     /// Sort using parallel radix sort (for large arrays).
@@ -432,7 +479,8 @@ impl RecordBuffer {
         // For parallel sort, we use chunked radix sort
         // Radix sort is already O(n×k), so parallelizing chunks provides
         // linear speedup without the merge overhead of comparison-based parallel sorts
-        parallel_radix_sort_record_refs(&mut self.refs);
+        self.debug_assert_max_sort_key();
+        parallel_radix_sort_record_refs_with_max(&mut self.refs, self.max_sort_key);
     }
 
     /// Sort in parallel and return each sub-array as a separate sorted chunk.
@@ -453,13 +501,21 @@ impl RecordBuffer {
         &mut self,
         threads: usize,
     ) -> Vec<InMemoryChunk<RawCoordinateKey>> {
-        par_sort_into_chunks_impl!(
-            self,
-            threads,
-            radix_sort_record_refs,
-            HEADER_SIZE,
-            |r: &RecordRef| RawCoordinateKey { sort_key: r.sort_key }
-        )
+        self.debug_assert_max_sort_key();
+        // Hand the tracked whole-buffer max to every chunk's sort so no chunk
+        // re-scans for its own maximum.
+        let max_key = self.max_sort_key;
+        // The macro drains `refs` on both paths, so reset the tracked max now to
+        // keep the invariant after this returns. It must happen *before* the
+        // macro: the single-thread path `return`s from inside the macro, so code
+        // placed after the invocation would never run on that path. `sort_chunk`
+        // captures the `max_key` local rather than `self.max_sort_key`, so the
+        // reset does not affect the sort.
+        self.max_sort_key = 0;
+        let sort_chunk = |refs: &mut [RecordRef]| radix_sort_record_refs_with_max(refs, max_key);
+        par_sort_into_chunks_impl!(self, threads, sort_chunk, HEADER_SIZE, |r: &RecordRef| {
+            RawCoordinateKey { sort_key: r.sort_key }
+        })
     }
 
     /// Drain the (already-sorted) buffer into a single in-memory chunk
@@ -484,6 +540,7 @@ impl RecordBuffer {
             })
             .collect();
         self.refs.clear();
+        self.max_sort_key = 0;
         InMemoryChunk::from_parts(data, records)
     }
 
@@ -540,6 +597,7 @@ impl RecordBuffer {
     pub fn clear(&mut self) {
         self.data.clear();
         self.refs.clear();
+        self.max_sort_key = 0;
     }
 
     /// Get the number of reference sequences.
@@ -1612,11 +1670,33 @@ const RADIX_THRESHOLD: usize = 256;
 /// Sorts by the `sort_key` field using 8-bit radix (256 buckets).
 /// This is O(n×k) where k is the number of bytes to sort (typically 5-8).
 ///
+/// Scans `refs` for the maximum key, then defers to
+/// [`radix_sort_record_refs_with_max`]. Callers that already know the maximum
+/// key (e.g. [`RecordBuffer`], which tracks it as records are pushed) should
+/// call that directly to skip the scan.
+///
 /// # Stability
 /// Radix sort is inherently stable - records with equal keys maintain their
 /// relative input order, matching samtools behavior.
-#[allow(clippy::uninit_vec, unsafe_code)]
 pub fn radix_sort_record_refs(refs: &mut [RecordRef]) {
+    let max_key = refs.iter().map(|r| r.sort_key).max().unwrap_or(0);
+    radix_sort_record_refs_with_max(refs, max_key);
+}
+
+/// Radix sort for `RecordRef` arrays using a precomputed maximum key, skipping
+/// the standalone max-finding scan that [`radix_sort_record_refs`] performs.
+///
+/// `max_key` sizes the number of radix byte-passes (`bytes_needed`). Each key
+/// must be **either `<= max_key` or exactly `u64::MAX`** (the unmapped
+/// coordinate sentinel). Keys `<= max_key` fit within `bytes_needed` bytes and
+/// are ordered correctly; `u64::MAX` keys truncate to all-`0xFF` under any
+/// width, so they sort *after* every other key and remain stable among
+/// themselves. This lets a coordinate sort size the passes from the maximum
+/// *mapped* key (~5–6 bytes) instead of the full 8 even when unmapped reads are
+/// present. A key strictly between `max_key` and `u64::MAX` would under-size the
+/// byte count and mis-order records — debug builds assert against this.
+#[allow(clippy::uninit_vec, unsafe_code)]
+pub fn radix_sort_record_refs_with_max(refs: &mut [RecordRef], max_key: u64) {
     let n = refs.len();
     if n < RADIX_THRESHOLD {
         // Use insertion sort for small arrays
@@ -1624,21 +1704,36 @@ pub fn radix_sort_record_refs(refs: &mut [RecordRef]) {
         return;
     }
 
-    // Find max key to determine how many bytes we need to sort
-    let max_key = refs.iter().map(|r| r.sort_key).max().unwrap_or(0);
+    debug_assert!(
+        refs.iter().all(|r| r.sort_key <= max_key || r.sort_key == u64::MAX),
+        "radix_sort_record_refs_with_max: a key exceeds max_key ({max_key}) without being the \
+         unmapped sentinel (u64::MAX); bytes_needed would be too small and records would mis-sort",
+    );
+
     let bytes_needed =
         if max_key == 0 { 0 } else { ((64 - max_key.leading_zeros()) as usize).div_ceil(8) };
 
     if bytes_needed == 0 {
-        return; // All keys are 0, already sorted
+        // No mapped keys (max_key == 0): every key is either 0 or the unmapped
+        // sentinel, all of which compare equal under a zero-width sort, so the
+        // records are already in a valid (stable) order.
+        return;
     }
 
     // Allocate auxiliary buffer
     let mut aux: Vec<RecordRef> = Vec::with_capacity(n);
+    // SAFETY: `aux` is written exactly once per radix pass (the scatter loop
+    // below) before any element is read; `RecordRef` is `Copy`/`Pod`, so leaving
+    // it uninitialized until the first scatter is sound. See CLAUDE.md
+    // "Approved hot-path unsafe".
     unsafe {
         aux.set_len(n);
     }
 
+    // SAFETY: `src`/`dst` always point at the disjoint, properly-aligned
+    // `[RecordRef]` storage of `refs`/`aux` (same length `n`); each pass writes
+    // every `dst` slot exactly once (the scatter loop) before that buffer is read
+    // as `src` on the next pass. See CLAUDE.md "Approved hot-path unsafe".
     let mut src = refs as *mut [RecordRef];
     let mut dst = aux.as_mut_slice() as *mut [RecordRef];
 
@@ -1686,12 +1781,21 @@ pub fn radix_sort_record_refs(refs: &mut [RecordRef]) {
 /// Divides the array into chunks, sorts each chunk with radix sort,
 /// then performs k-way merge. This provides near-linear speedup.
 pub fn parallel_radix_sort_record_refs(refs: &mut [RecordRef]) {
+    let max_key = refs.iter().map(|r| r.sort_key).max().unwrap_or(0);
+    parallel_radix_sort_record_refs_with_max(refs, max_key);
+}
+
+/// Parallel radix sort using a precomputed maximum key (see
+/// [`radix_sort_record_refs_with_max`] for the `max_key` contract). The same
+/// upper bound is handed to every chunk's sort, so no chunk re-scans for its
+/// own maximum.
+pub fn parallel_radix_sort_record_refs_with_max(refs: &mut [RecordRef], max_key: u64) {
     use rayon::prelude::*;
 
     let n = refs.len();
     if n < RADIX_THRESHOLD * 2 {
         // Small array - just use single-threaded radix sort
-        radix_sort_record_refs(refs);
+        radix_sort_record_refs_with_max(refs, max_key);
         return;
     }
 
@@ -1702,9 +1806,10 @@ pub fn parallel_radix_sort_record_refs(refs: &mut [RecordRef]) {
     if n_threads > 1 && n > 10_000 {
         let chunk_size = n.div_ceil(n_threads);
 
-        // Sort each chunk in parallel using radix sort
+        // Sort each chunk in parallel using radix sort. Every chunk's max key is
+        // bounded by the whole-slice `max_key`, so the shared bound is safe.
         refs.par_chunks_mut(chunk_size).for_each(|chunk| {
-            radix_sort_record_refs(chunk);
+            radix_sort_record_refs_with_max(chunk, max_key);
         });
 
         // K-way merge the sorted chunks
@@ -1721,7 +1826,7 @@ pub fn parallel_radix_sort_record_refs(refs: &mut [RecordRef]) {
         merge_sorted_chunks(refs, &chunk_boundaries);
     } else {
         // Single-threaded radix sort
-        radix_sort_record_refs(refs);
+        radix_sort_record_refs_with_max(refs, max_key);
     }
 }
 
@@ -2655,6 +2760,88 @@ mod tests {
         record
     }
 
+    #[test]
+    fn test_streaming_max_sort_key_matches_scan() {
+        // The running `max_sort_key` maintained during `push_coordinate` must
+        // equal an in-place scan over the materialized keys — the equivalence the
+        // radix sort relies on to skip its own max-finding pass. Cover several
+        // key distributions plus the empty and post-`clear` states.
+        let nref = 5;
+        // The invariant is over non-sentinel keys (unmapped reads carry u64::MAX
+        // and are intentionally excluded from the tracked max).
+        let scan_max = |b: &RecordBuffer| {
+            b.refs().iter().map(|r| r.sort_key).filter(|&k| k != u64::MAX).max().unwrap_or(0)
+        };
+
+        // Empty buffer: max is 0.
+        let mut buffer = RecordBuffer::with_capacity(16, 16 * 64, nref);
+        assert_eq!(buffer.max_sort_key, scan_max(&buffer));
+        assert_eq!(buffer.max_sort_key, 0);
+
+        // Multi-contig, out-of-order positions: tid 0 and the last contig,
+        // position 0 and large positions.
+        let records =
+            [(0, 0), (3, 1_000_000), (1, 42), (4, 7), (0, 999_999), (2, 500), (4, 250_000)];
+        for (tid, pos) in records {
+            buffer.push_coordinate(&make_coordinate_bam_record(tid, pos)).expect("push");
+            assert_eq!(
+                buffer.max_sort_key,
+                scan_max(&buffer),
+                "tracked max diverged after pushing tid={tid} pos={pos}",
+            );
+        }
+
+        // After clear, the tracked max resets to 0 and stays consistent on reuse.
+        buffer.clear();
+        assert_eq!(buffer.max_sort_key, 0);
+        assert_eq!(buffer.max_sort_key, scan_max(&buffer));
+        buffer.push_coordinate(&make_coordinate_bam_record(2, 12345)).expect("push");
+        assert_eq!(buffer.max_sort_key, scan_max(&buffer));
+    }
+
+    #[test]
+    fn test_max_sort_key_excludes_unmapped_sentinel_and_sorts_correctly() {
+        // Unmapped reads (tid < 0) carry the u64::MAX sentinel key. They must NOT
+        // inflate `max_sort_key` (which would force the radix to its full 8-byte
+        // width), yet must still sort to the tail. Exercise a mix above the radix
+        // threshold so the real radix path (not insertion sort) runs.
+        let nref = 5;
+        let mut buffer = RecordBuffer::with_capacity(2048, 2048 * 64, nref);
+
+        // 1500 mapped records with small keys (tid 0-3), interleaved with 500
+        // unmapped (tid = -1 -> u64::MAX). Push order is intentionally scrambled.
+        let mut expected_mapped_max = 0u64;
+        for i in 0..2000u32 {
+            if i % 4 == 3 {
+                buffer.push_coordinate(&make_coordinate_bam_record(-1, -1)).expect("push unmapped");
+            } else {
+                let tid = i32::try_from(i % 3).unwrap();
+                let pos = i32::try_from((i * 7) % 100_000).unwrap();
+                buffer.push_coordinate(&make_coordinate_bam_record(tid, pos)).expect("push mapped");
+                expected_mapped_max =
+                    expected_mapped_max.max(PackedCoordinateKey::new(tid, pos, false, nref).0);
+            }
+        }
+
+        // Tracked max excludes the sentinel: it equals the max mapped key, far
+        // below u64::MAX (so bytes_needed stays ~3-4, not 8).
+        assert_eq!(buffer.max_sort_key, expected_mapped_max);
+        assert_ne!(buffer.max_sort_key, u64::MAX);
+        assert!(buffer.max_sort_key < (1u64 << 48), "mapped max should be well under 8 bytes");
+
+        // Sorting with the mapped-only max must still produce a fully ordered
+        // result: mapped keys ascending, all unmapped (u64::MAX) at the tail.
+        buffer.sort();
+        let keys: Vec<u64> = buffer.refs().iter().map(|r| r.sort_key).collect();
+        assert!(keys.windows(2).all(|w| w[0] <= w[1]), "result is not sorted by sort_key");
+        let unmapped = keys.iter().filter(|&&k| k == u64::MAX).count();
+        assert_eq!(unmapped, 500, "all unmapped reads should be present");
+        assert!(
+            keys[keys.len() - unmapped..].iter().all(|&k| k == u64::MAX),
+            "unmapped reads must sort to the tail",
+        );
+    }
+
     /// Assert that `chunks` are each individually sorted and that the total
     /// record count across all chunks equals `expected_total`.
     fn assert_chunks_sorted_and_complete<K: RawSortKey + Default + Ord + 'static>(
@@ -2760,6 +2947,45 @@ mod tests {
             );
         }
         assert_chunks_sorted_and_complete(&chunks, n);
+    }
+
+    /// After `par_sort_into_chunks` drains the buffer, the tracked `max_sort_key`
+    /// must be reset to 0 so the streaming-vs-scan invariant still holds (an
+    /// empty buffer scans to 0). Covers both the single-threaded early-return
+    /// path and the multi-threaded path, which drain `refs` through different
+    /// branches of `par_sort_into_chunks_impl!`.
+    #[rstest::rstest]
+    #[case::single_threaded(100, 1)]
+    #[case::parallel(10_500, 4)]
+    fn test_par_sort_into_chunks_resets_max_sort_key(#[case] n: usize, #[case] threads: usize) {
+        let nref = 10u32;
+        let mut buffer = RecordBuffer::with_capacity(n, n * 50, nref);
+        for i in 0..n {
+            let pos = i32::try_from(n - i).expect("test n fits in i32");
+            buffer
+                .push_coordinate(&make_coordinate_bam_record(0, pos))
+                .expect("push_coordinate should succeed in tests");
+        }
+        assert!(buffer.max_sort_key > 0, "precondition: max should be tracked before the sort");
+
+        if threads > 1 {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("failed to build rayon thread pool");
+            pool.install(|| {
+                let _ = buffer.par_sort_into_chunks(threads);
+            });
+        } else {
+            let _ = buffer.par_sort_into_chunks(threads);
+        }
+
+        assert_eq!(buffer.max_sort_key, 0, "max_sort_key must reset after the buffer is drained");
+        let scan_max = buffer.refs().iter().map(|r| r.sort_key).max().unwrap_or(0);
+        assert_eq!(
+            buffer.max_sort_key, scan_max,
+            "tracked max must match a scan of the drained buffer"
+        );
     }
 
     /// Helper: build a `SegmentedBuf` containing the given byte chunks
