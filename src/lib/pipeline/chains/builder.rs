@@ -293,7 +293,13 @@ fn templates_to_mi_step(
                             assign_tag_bytes,
                             state.mi_buf.as_bytes(),
                         );
-                        current_records.push(RawRecord::from(state.scratch.clone()));
+                        // Move the tagged bytes into the record instead of cloning
+                        // them; reinstall a fresh scratch buffer pre-sized to the
+                        // same capacity so the next record reuses it without a
+                        // realloc (the per-record `clear()` above keeps it warm).
+                        let cap = state.scratch.capacity();
+                        let record = std::mem::replace(&mut state.scratch, Vec::with_capacity(cap));
+                        current_records.push(RawRecord::from(record));
                     }
                 }
                 if !current_records.is_empty() {
