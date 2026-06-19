@@ -29,10 +29,14 @@ impl<T> HeldSlot<T> {
     ///
     /// # Panics
     ///
-    /// Panics in debug builds if the slot is already occupied (a contract
-    /// violation: callers must drain via `take` before calling `put` again).
+    /// Panics if the slot is already occupied (a contract violation: callers
+    /// must drain via `take` before calling `put` again). This is a hard
+    /// `assert!` rather than `debug_assert!` because silently overwriting would
+    /// **drop the previously held item** — a record lost from the pipeline —
+    /// which must not pass unnoticed in release builds. The check is a single
+    /// predictable branch on the back-pressure path, so the cost is negligible.
     pub fn put(&mut self, item: T) {
-        debug_assert!(self.inner.is_none(), "HeldSlot already occupied");
+        assert!(self.inner.is_none(), "HeldSlot already occupied");
         self.inner = Some(item);
     }
 
@@ -67,12 +71,15 @@ mod tests {
     }
 
     #[test]
-    fn double_put_panics_in_debug() {
+    fn double_put_panics() {
         let mut s = HeldSlot::new();
         s.put(1_u32);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             s.put(2_u32);
         }));
-        assert!(result.is_err(), "double put should panic in debug builds");
+        assert!(
+            result.is_err(),
+            "double put must panic (in debug AND release) to avoid silent record loss"
+        );
     }
 }

@@ -16,7 +16,7 @@ pub struct ChainGraph {
     /// which input branch of the consumer this edge feeds.
     /// Defaults to `0` for single-input consumers; multi-input
     /// consumers (`Step2` / future `StepN`) record their per-input
-    /// slot explicitly so [`crate::pipeline::core::runtime::contexts`]
+    /// slot explicitly so [`crate::runtime::contexts`]
     /// can build the right [`TwoInputHandles`] wrapper.
     consumer_input_slots: Vec<Option<usize>>,
     /// `branch_count[step]` — number of output branches for that step.
@@ -77,7 +77,7 @@ impl ChainGraph {
     /// Wire a (producer, branch) → (consumer, consumer's input slot)
     /// link. Multi-input consumers (`Step2` / future `StepN`) record
     /// the consumer's input-slot index so
-    /// [`crate::pipeline::core::runtime::contexts`] can
+    /// [`crate::runtime::contexts`] can
     /// route each edge to the right per-branch input handle.
     ///
     /// # Panics

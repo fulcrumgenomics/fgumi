@@ -1,10 +1,16 @@
-//! Core types and traits for the new step-DSL pipeline framework.
+//! Core types and traits for the typed-step pipeline framework.
 //!
-//! This module is added by issue #330 PR 1 alongside the existing per-format
-//! `bam.rs` / `fastq.rs` machinery. Subsequent PRs incrementally migrate
-//! commands from the old framework to this one; PR 6 deletes the old framework.
+//! Extracted from the `fgumi` crate's `pipeline::core` module into its own
+//! crate so its lightweight dependency graph (no `noodles`-bam, sort, or
+//! consensus crates — just `ahash` / `crossbeam-queue` / `parking_lot` / `log`
+//! and one `noodles::sam` type) compiles fast in isolation. The `fgumi` crate
+//! re-exports this as `pipeline::core`, so existing `crate::pipeline::core::…`
+//! paths are unchanged; the `chains` and `steps` layers that drive these
+//! primitives still live in `fgumi`.
 //!
 //! Reference design: `docs/design/unified-pipeline-step-dsl.md`.
+
+#![deny(unsafe_code)]
 
 pub mod builder;
 pub mod erased;

@@ -91,13 +91,16 @@ impl PipelineSignal {
 
     /// Hot-path: workers call this once per loop iteration.
     ///
-    /// Uses `Relaxed` because the only thing the worker does on `true` is
-    /// stop polling — it doesn't read the payload synchronously. Code that
-    /// needs to read the payload (`outcome()`) goes through `OnceLock`,
-    /// which provides its own Acquire/Release synchronization on the cell.
-    /// So `Relaxed` here is sufficient: any worker that observes `true`
-    /// and *then* calls `outcome()` will see the payload via the
-    /// `OnceLock` acquire fence on `OnceLock::get`.
+    /// Uses `Relaxed` because the only thing a worker does on `true` is stop
+    /// polling — workers never read the payload. The payload is read only by
+    /// the run drivers via [`Self::to_result`], after every internal writer
+    /// (workers, deadlock monitor) has been joined, so the join supplies the
+    /// happens-before that makes a recorded error's payload visible.
+    ///
+    /// The one writer not covered by a join is an external
+    /// [`CancelHandle::cancel`], which races the driver's terminal read with no
+    /// synchronizing edge; [`Self::to_result`] derives `Cancelled` from the
+    /// (coherence-visible) state rather than the payload to close that window.
     #[inline]
     #[must_use]
     pub fn is_done(&self) -> bool {
@@ -136,22 +139,69 @@ impl PipelineSignal {
     /// First writer wins; later writers (including a `record_error` after
     /// `cancel`) are silently dropped.
     pub fn cancel(&self) {
-        let _ = self.state.compare_exchange(
-            STATE_OK,
-            STATE_CANCELLED,
-            AtomicOrdering::Release,
-            AtomicOrdering::Relaxed,
-        );
-        let _ = self.payload.set(PipelineError::Cancelled);
+        // Only publish the payload if THIS call won the state transition.
+        // Setting it unconditionally races a concurrent `record_error`: if
+        // that call wins the CAS (state → ERROR) but has not yet set its
+        // payload, an unconditional `payload.set(Cancelled)` here can win the
+        // `OnceLock` and leave `state == ERROR` while `outcome()` reports
+        // `Cancelled` — an inconsistent state/payload pair. Guarding on the CAS
+        // (as `record_error` does) keeps the two consistent: whoever wins the
+        // state transition is the one that sets the payload.
+        if self
+            .state
+            .compare_exchange(
+                STATE_OK,
+                STATE_CANCELLED,
+                AtomicOrdering::Release,
+                AtomicOrdering::Relaxed,
+            )
+            .is_ok()
+        {
+            let _ = self.payload.set(PipelineError::Cancelled);
+        }
     }
 
-    /// Read the recorded outcome. The `OnceLock::get` acquire fence pairs
-    /// with the `OnceLock::set` release on the writer side, so any worker
-    /// that observes `is_done() == true` and then calls `outcome()` sees
-    /// the payload.
+    /// Read the recorded error payload, if any.
+    ///
+    /// The `OnceLock::get` acquire fence pairs with the `OnceLock::set` release
+    /// on the writer side, so a reader synchronized with the writer (via the
+    /// worker/monitor join in the run drivers) sees a recorded error's payload.
+    ///
+    /// Beware the gap this does NOT cover: `is_done() == true` does not imply
+    /// `outcome().is_some()`. `cancel()`/`record_error()` publish the terminal
+    /// `state` (CAS) before `payload.set()`, so a reader can observe the
+    /// terminal state while the payload `OnceLock` is still empty — most
+    /// reachably for an external `CancelHandle::cancel`, whose writer is never
+    /// joined against the driver's read. Map an outcome to a run result through
+    /// [`Self::to_result`], which handles that window, not by branching on
+    /// `outcome()` directly.
     #[must_use]
     pub fn outcome(&self) -> Option<&PipelineError> {
         self.payload.get()
+    }
+
+    /// Map the recorded outcome to a run `Result`, as returned by the run
+    /// drivers ([`crate::builder::Pipeline::run`] and the fused single-thread
+    /// driver).
+    ///
+    /// A recorded error's payload is always visible here: every `record_error`
+    /// writer (workers, the deadlock monitor, the fused driver itself) is
+    /// joined before this read, so the join orders its `payload.set()` ahead of
+    /// the read.
+    ///
+    /// An external [`CancelHandle::cancel`] is the exception — its writer is
+    /// never joined against this read, so there is no happens-before edge to
+    /// make its `OnceLock` payload visible, and it can leave `state ==
+    /// CANCELLED` with `outcome() == None`. A naive `match outcome()` would then
+    /// map a genuinely cancelled run (workers observed `is_done()` and stopped
+    /// early) to `Ok(())`. `Cancelled` carries no payload data, so synthesize it
+    /// from the coherence-visible `state` via [`Self::is_cancelled`] instead.
+    pub(crate) fn to_result(&self) -> Result<(), PipelineError> {
+        match self.outcome() {
+            Some(err) => Err(err.reconstruct()),
+            None if self.is_cancelled() => Err(PipelineError::Cancelled),
+            None => Ok(()),
+        }
     }
 }
 
@@ -257,4 +307,48 @@ mod tests {
         let to = PipelineError::TimedOut { stalled_secs: 60 }.reconstruct();
         assert!(matches!(to, PipelineError::TimedOut { stalled_secs: 60 }));
     }
+
+    #[test]
+    fn to_result_maps_clean_error_and_cancel() {
+        let clean = PipelineSignal::new();
+        assert!(clean.to_result().is_ok());
+
+        let errored = PipelineSignal::new();
+        errored.record_error(PipelineError::Io { step: "s", source: io::Error::other("boom") });
+        assert!(matches!(errored.to_result(), Err(PipelineError::Io { step: "s", .. })));
+
+        let cancelled = PipelineSignal::new();
+        cancelled.cancel();
+        assert!(matches!(cancelled.to_result(), Err(PipelineError::Cancelled)));
+    }
+
+    #[test]
+    fn to_result_reports_cancel_when_payload_not_yet_published() {
+        // Reproduce the external-cancel window: a `CancelHandle::cancel` on an
+        // un-joined thread has published the terminal `state` (the CAS) but has
+        // not yet run `payload.set(Cancelled)`. A driver reading the outcome in
+        // that window sees `is_done() == true` but `outcome() == None`. Branching
+        // on `outcome()` alone would map this genuinely cancelled run to `Ok(())`;
+        // `to_result` must instead synthesize `Cancelled` from the state.
+        let signal = PipelineSignal::new();
+        signal.state.store(STATE_CANCELLED, AtomicOrdering::Release);
+        assert!(signal.is_done(), "terminal state must read as done");
+        assert!(signal.is_cancelled());
+        assert!(signal.outcome().is_none(), "payload not set in this window");
+        assert!(
+            matches!(signal.to_result(), Err(PipelineError::Cancelled)),
+            "a cancel observed before its payload is published must not map to Ok"
+        );
+    }
+
+    // NOTE: the `cancel` vs `record_error` state/payload-consistency fix (guarding
+    // `payload.set` behind the CAS) is deliberately NOT covered by a unit test.
+    // The bug is a true concurrent interleaving — `cancel` losing the CAS in the
+    // window between `record_error`'s CAS-win and its own `payload.set` — and
+    // `OnceLock` masks the inconsistency in every *sequential* ordering, so no
+    // single-threaded test can distinguish fixed from buggy. A spawned-thread
+    // stress loop does not reliably hit the two-instruction window either (a
+    // 2000-trial loop passed against the buggy code). Deterministically forcing
+    // the interleaving would require `loom`; until that dependency is justified,
+    // the fix rests on the inline argument at the `cancel` call site.
 }

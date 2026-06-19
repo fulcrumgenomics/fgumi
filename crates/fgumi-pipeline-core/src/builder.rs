@@ -145,9 +145,9 @@ impl PipelineBuilder {
     }
 
     /// Add a source step (first link) without requiring the typed `Chain`
-    /// return value. Used by [`crate::pipeline::chains::ChainBuilder`]
-    /// to accumulate steps across `add_source` / `add_<stage>` / `add_sink`
-    /// method calls.
+    /// return value. Used by the `ChainBuilder` in the parent `fgumi` crate's
+    /// `pipeline::chains` to accumulate steps across `add_source` /
+    /// `add_<stage>` / `add_sink` method calls.
     ///
     /// Returns `(StepIdx, BranchIdx(0))` for the newly registered step.
     /// The caller tracks this tail and passes it to
@@ -161,9 +161,10 @@ impl PipelineBuilder {
     /// `TypedStep::resolve_input` with "input handle downcast failed —
     /// chain topology invariant". That panic is loud and immediate but it
     /// is a runtime check, not a compile-time or build-time one. Callers
-    /// are responsible for maintaining type correctness; the `pub(crate)`
-    /// scope limits exposure to within `chains::builder`.
-    pub(crate) fn append_source<S>(&self, step: S) -> (StepIdx, BranchIdx)
+    /// are responsible for maintaining type correctness. `pub` so the
+    /// `chains` layer in the parent `fgumi` crate can drive incremental
+    /// assembly across the crate boundary.
+    pub fn append_source<S>(&self, step: S) -> (StepIdx, BranchIdx)
     where
         S: Step<Input = ()>,
     {
@@ -174,13 +175,12 @@ impl PipelineBuilder {
     }
 
     /// Append a step to the chain by wiring it to the current tail
-    /// `(prev_producer, prev_branch)`. Used by
-    /// [`crate::pipeline::chains::ChainBuilder`] for the same
-    /// reason as [`Self::append_source`] — type-erased incremental chain
-    /// assembly across method-boundary calls.
+    /// `(prev_producer, prev_branch)`. Used by the parent crate's
+    /// `ChainBuilder` for the same reason as [`Self::append_source`] —
+    /// type-erased incremental chain assembly across method-boundary calls.
     ///
     /// Returns `(StepIdx, BranchIdx(0))` for the newly registered step.
-    pub(crate) fn append_step<S: Step>(
+    pub fn append_step<S: Step>(
         &self,
         step: S,
         prev: (StepIdx, BranchIdx),
@@ -194,15 +194,12 @@ impl PipelineBuilder {
 
     /// Append a two-input [`Step2`] step, wiring `prev_a` into input slot 0
     /// and `prev_b` into input slot 1. The type-erased counterpart of
-    /// [`MultiChain2Ordered::join`] — used by
-    /// [`crate::pipeline::chains::ChainBuilder::add_zipper`] to wire
-    /// the unmapped and mapped source chains into [`ZipperMergeStep`] across
-    /// method-boundary calls.
+    /// [`MultiChain2Ordered::join`] — used by the parent crate's
+    /// `ChainBuilder::add_zipper` to wire the unmapped and mapped source
+    /// chains into the zipper-merge step across method-boundary calls.
     ///
     /// Returns `(StepIdx, BranchIdx(0))` for the newly registered step.
-    ///
-    /// [`ZipperMergeStep`]: crate::commands::zipper::merge_step::ZipperMergeStep
-    pub(crate) fn append_step2<S: Step2>(
+    pub fn append_step2<S: Step2>(
         &self,
         step: S,
         prev_a: (StepIdx, BranchIdx),
@@ -470,7 +467,7 @@ impl<'b, A: Send + HeapSize + 'static, B: Send + HeapSize + 'static> MultiChain2
     /// 2 in the chain graph. Each branch's typed producer-side
     /// [`OutputQueueSet`] is later (at chain-run time) drained into
     /// the consumer's
-    /// [`crate::pipeline::core::handles::TwoInputHandles<A, B>`]
+    /// [`crate::handles::TwoInputHandles<A, B>`]
     /// via [`TypedStep2::build_two_input_handles`].
     ///
     /// Returns a single-branch downstream [`Chain`] typed by the
@@ -1018,12 +1015,11 @@ impl Pipeline {
         }
 
         // 7. Surface error or cancellation. PipelineError isn't Clone
-        // (io::Error isn't Clone); reconstruct from the recorded outcome.
+        // (io::Error isn't Clone); `to_result` reconstructs the recorded
+        // outcome and, for an external cancel whose payload isn't yet visible
+        // to this thread, synthesizes `Cancelled` from the terminal state.
         let _ = graph;
-        match signal.outcome() {
-            Some(err) => Err(err.reconstruct()),
-            None => Ok(()),
-        }
+        signal.to_result()
     }
 }
 
@@ -1050,7 +1046,7 @@ const DEADLOCK_FATAL_MULTIPLE: u64 = 6;
 /// stays quiet during a slow merge (where in-flight on byte-bounded edges is 0).
 /// Extending the probe to count-based queues for defense-in-depth is tracked
 /// separately.
-fn in_flight_bytes(contexts: &crate::pipeline::core::runtime::contexts::ChainContexts) -> u64 {
+fn in_flight_bytes(contexts: &crate::runtime::contexts::ChainContexts) -> u64 {
     contexts
         .bounded_queues
         .iter()
@@ -1076,7 +1072,7 @@ fn in_flight_bytes(contexts: &crate::pipeline::core::runtime::contexts::ChainCon
 fn run_deadlock_monitor(
     stop: &Arc<std::sync::atomic::AtomicBool>,
     stats: &Arc<PipelineStats>,
-    contexts: &Arc<crate::pipeline::core::runtime::contexts::ChainContexts>,
+    contexts: &Arc<crate::runtime::contexts::ChainContexts>,
     signal: &Arc<PipelineSignal>,
     warn_timeout: std::time::Duration,
     fatal_timeout: std::time::Duration,
@@ -1304,10 +1300,7 @@ const MIN_REORDER_OVERFLOW_BYTES: u64 = 4 * 1024 * 1024;
 /// prior fixed value, so high thread counts (large `per_queue`) keep today's
 /// reorder headroom — no `--threads N` regression — while low thread counts
 /// (small `per_queue`) get a streaming-sized stash.
-fn apply_initial_queue_budget(
-    queues: &[crate::pipeline::core::runtime::contexts::RegisteredQueue],
-    total: u64,
-) {
+fn apply_initial_queue_budget(queues: &[crate::runtime::contexts::RegisteredQueue], total: u64) {
     if queues.is_empty() {
         return;
     }
@@ -1328,10 +1321,7 @@ fn apply_initial_queue_budget(
 /// counts) keeps today's reorder headroom; a small `per_queue` (low thread
 /// counts / lean budget) shrinks the off-budget stash to a streaming size.
 fn reorder_cap_for(per_queue: u64) -> u64 {
-    per_queue.clamp(
-        MIN_REORDER_OVERFLOW_BYTES,
-        crate::pipeline::core::reorder::DEFAULT_REORDER_OVERFLOW_BYTES,
-    )
+    per_queue.clamp(MIN_REORDER_OVERFLOW_BYTES, crate::reorder::DEFAULT_REORDER_OVERFLOW_BYTES)
 }
 
 /// Background queue-memory rebalancer body. Polls each queue's
@@ -1434,22 +1424,22 @@ mod tests {
     use super::*;
     use std::io;
 
-    use crate::pipeline::core::outputs::Single;
-    use crate::pipeline::core::queues::QueueSpec;
-    use crate::pipeline::core::reorder::BranchOrdering;
-    use crate::pipeline::core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
+    use crate::outputs::Single;
+    use crate::queues::QueueSpec;
+    use crate::reorder::BranchOrdering;
+    use crate::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
 
     #[test]
     fn apply_initial_queue_budget_sets_registered_reorder_cap() {
         // End-to-end wiring: a registered ordered byte-bounded branch's reorder
         // cap is re-sized by the budget pass (not left at its construction
         // default). Guards the Pass-1.5 registration + the `set` call together.
-        use crate::pipeline::core::queues::{BoundedQueueHandle, ByteBoundedQueue, ItemQueue};
-        use crate::pipeline::core::reorder::{
+        use crate::queues::{BoundedQueueHandle, ByteBoundedQueue, ItemQueue};
+        use crate::reorder::{
             DEFAULT_REORDER_OVERFLOW_BYTES, ReorderCapHandle, ReorderStage, Sequenced,
         };
-        use crate::pipeline::core::runtime::contexts::RegisteredQueue;
-        use crate::pipeline::core::topology::{BranchIdx, StepIdx};
+        use crate::runtime::contexts::RegisteredQueue;
+        use crate::topology::{BranchIdx, StepIdx};
 
         // A reorder stage constructed at the 256 MiB fallback; keep a concrete
         // handle so we can read the cap back after the budget pass.
@@ -1493,7 +1483,7 @@ mod tests {
 
     #[test]
     fn reorder_cap_tracks_per_queue_clamped_to_floor_and_ceiling() {
-        let ceiling = crate::pipeline::core::reorder::DEFAULT_REORDER_OVERFLOW_BYTES;
+        let ceiling = crate::reorder::DEFAULT_REORDER_OVERFLOW_BYTES;
         // Mid-range per_queue passes through unchanged.
         assert_eq!(reorder_cap_for(32 * 1024 * 1024), 32 * 1024 * 1024);
         // Tiny per_queue (lean / low-thread) is floored — but stays small.
@@ -1700,7 +1690,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicU32, Ordering as AtomicOrd};
 
-    use crate::pipeline::core::signal::PipelineError;
+    use crate::signal::PipelineError;
 
     /// Source emitting `remaining` items via a shared atomic counter; safe
     /// for both single-worker and multi-worker `Parallel` execution.
@@ -1861,86 +1851,6 @@ mod tests {
         assert_eq!(snap.steps[1].1.error_count, 0);
         // The source returned Finished at least once across the workers.
         assert!(snap.steps[0].1.finished_count >= 1);
-    }
-
-    #[test]
-    fn pipeline_run_process2_fans_out_to_two_sinks() {
-        use crate::pipeline::steps::process::{Process2Output, process2};
-
-        let remaining = Arc::new(AtomicU32::new(20));
-        let evens_received = Arc::new(AtomicU32::new(0));
-        let odds_received = Arc::new(AtomicU32::new(0));
-
-        // Process2 routes even items to branch A, odd items to branch B.
-        let split = process2::<u32, u32, u32, _>("EvenOddSplit", 32, 32, |x: u32| {
-            if x.is_multiple_of(2) {
-                Ok(Process2Output::only_a(x))
-            } else {
-                Ok(Process2Output::only_b(x))
-            }
-        });
-
-        let builder = PipelineBuilder::new();
-        let after_split =
-            builder.chain(SharedCountingSource { remaining: Arc::clone(&remaining) }).chain(split);
-        let multi = after_split.into_multi();
-        multi
-            .b0
-            .chain(ParallelCountingSink { received: Arc::clone(&evens_received) })
-            .into_sink_marker();
-        multi
-            .b1
-            .chain(ParallelCountingSink { received: Arc::clone(&odds_received) })
-            .into_sink_marker();
-
-        let pipeline = builder.build().unwrap();
-        let result = pipeline.run(PipelineConfig { threads: 4, ..Default::default() });
-        assert!(result.is_ok(), "run failed: {:?}", result.err());
-
-        // Source emits values [20, 19, ..., 1] (20 items total). Of these:
-        //   evens: 20, 18, ..., 2  -> 10 items
-        //   odds : 19, 17, ..., 1  -> 10 items
-        assert_eq!(evens_received.load(AtomicOrd::Relaxed), 10, "evens count");
-        assert_eq!(odds_received.load(AtomicOrd::Relaxed), 10, "odds count");
-    }
-
-    #[test]
-    fn pipeline_run_process2_drops_branches_emit_none() {
-        use crate::pipeline::steps::process::{Process2Output, process2};
-
-        let remaining = Arc::new(AtomicU32::new(15));
-        let kept = Arc::new(AtomicU32::new(0));
-        let dropped = Arc::new(AtomicU32::new(0));
-
-        // Filter: keep multiples of 3 on branch A, route the rest to branch B,
-        // and drop entirely if the value is 1 (Process2Output::none).
-        let filter = process2::<u32, u32, u32, _>("FilterStep", 16, 16, |x: u32| {
-            if x == 1 {
-                Ok(Process2Output::none())
-            } else if x.is_multiple_of(3) {
-                Ok(Process2Output::only_a(x))
-            } else {
-                Ok(Process2Output::only_b(x))
-            }
-        });
-
-        let builder = PipelineBuilder::new();
-        let after =
-            builder.chain(SharedCountingSource { remaining: Arc::clone(&remaining) }).chain(filter);
-        let multi = after.into_multi();
-        multi.b0.chain(ParallelCountingSink { received: Arc::clone(&kept) }).into_sink_marker();
-        multi.b1.chain(ParallelCountingSink { received: Arc::clone(&dropped) }).into_sink_marker();
-
-        let pipeline = builder.build().unwrap();
-        let result = pipeline.run(PipelineConfig { threads: 4, ..Default::default() });
-        assert!(result.is_ok(), "run failed: {:?}", result.err());
-
-        // Source emits [15, 14, ..., 1]. Of these:
-        //   multiples of 3 (kept):  15, 12, 9, 6, 3 -> 5 items
-        //   value == 1   (dropped): 1               -> 0 items emitted
-        //   the rest     (other):   14,13,11,10,8,7,5,4,2 -> 9 items
-        assert_eq!(kept.load(AtomicOrd::Relaxed), 5, "kept count");
-        assert_eq!(dropped.load(AtomicOrd::Relaxed), 9, "other-branch count");
     }
 
     #[test]
@@ -2172,7 +2082,7 @@ mod tests {
 
     #[test]
     fn apply_stall_verdict_wedged_records_timeout_and_cancels() {
-        use crate::pipeline::core::signal::PipelineError;
+        use crate::signal::PipelineError;
         let stats = PipelineStats::new(vec![]);
         let signal = PipelineSignal::new();
         let now = std::time::Instant::now();
@@ -2294,13 +2204,11 @@ mod tests {
         // The wedge-vs-starvation signal must include the reorder overflow
         // stash, not just transport queues — items can sit in a reorder buffer
         // (waiting for a missing serial) while every transport reads empty.
-        use crate::pipeline::core::item::HeapSize;
-        use crate::pipeline::core::queues::{
-            BoundedQueueHandle, ByteBoundedQueue, CountBoundedQueue, ItemQueue,
-        };
-        use crate::pipeline::core::reorder::{ReorderCapHandle, ReorderStage, Sequenced};
-        use crate::pipeline::core::runtime::contexts::{ChainContexts, RegisteredQueue};
-        use crate::pipeline::core::topology::{BranchIdx, StepIdx};
+        use crate::item::HeapSize;
+        use crate::queues::{BoundedQueueHandle, ByteBoundedQueue, CountBoundedQueue, ItemQueue};
+        use crate::reorder::{ReorderCapHandle, ReorderStage, Sequenced};
+        use crate::runtime::contexts::{ChainContexts, RegisteredQueue};
+        use crate::topology::{BranchIdx, StepIdx};
 
         #[derive(Debug)]
         struct Heavy(Vec<u8>);

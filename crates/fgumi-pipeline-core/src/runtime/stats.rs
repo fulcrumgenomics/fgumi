@@ -35,8 +35,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use crate::pipeline::core::step::StepOutcome;
-use crate::pipeline::core::topology::StepIdx;
+use crate::step::StepOutcome;
+use crate::topology::StepIdx;
 
 /// Atomic counters for a single step.
 #[derive(Debug)]

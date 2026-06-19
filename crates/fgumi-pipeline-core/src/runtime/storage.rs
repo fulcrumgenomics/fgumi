@@ -4,8 +4,8 @@
 use parking_lot::Mutex;
 use std::sync::{Arc, OnceLock};
 
-use crate::pipeline::core::erased::ErasedStep;
-use crate::pipeline::core::step::{Affinity, StepKind};
+use crate::erased::ErasedStep;
+use crate::step::{Affinity, StepKind};
 
 /// Shared "this step has finished" latch for a `Serial` step.
 ///
@@ -167,11 +167,11 @@ mod tests {
     use super::*;
     use std::io;
 
-    use crate::pipeline::core::erased::TypedStep;
-    use crate::pipeline::core::outputs::Single;
-    use crate::pipeline::core::queues::QueueSpec;
-    use crate::pipeline::core::reorder::BranchOrdering;
-    use crate::pipeline::core::step::{Step, StepCtx, StepOutcome, StepProfile};
+    use crate::erased::TypedStep;
+    use crate::outputs::Single;
+    use crate::queues::QueueSpec;
+    use crate::reorder::BranchOrdering;
+    use crate::step::{Step, StepCtx, StepOutcome, StepProfile};
 
     fn profile_for(name: &'static str, kind: StepKind, sticky: bool) -> StepProfile {
         StepProfile {

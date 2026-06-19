@@ -1,8 +1,8 @@
 //! `OrderedBytesSingle<T>` requires `T: HeapSize + Ordered`. A type that
 //! impls `HeapSize` but NOT `Ordered` must fail to compile.
 
-use fgumi_lib::pipeline::core::item::HeapSize;
-use fgumi_lib::pipeline::core::outputs::OrderedBytesSingle;
+use fgumi_pipeline_core::item::HeapSize;
+use fgumi_pipeline_core::outputs::OrderedBytesSingle;
 
 struct HeapNoOrdered {
     bytes: Vec<u8>,

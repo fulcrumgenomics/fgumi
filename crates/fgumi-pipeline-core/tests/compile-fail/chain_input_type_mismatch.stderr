@@ -11,8 +11,8 @@ note: expected this to be `u32`
    |
 34 |     type Input = u64; // mismatch with U32Source's Single<u32> output
    |                  ^^^
-note: required by a bound in `fgumi_lib::pipeline::core::Chain::<'b, fgumi_lib::pipeline::core::Single<T>>::chain`
-  --> src/lib/pipeline/core/builder.rs
+note: required by a bound in `fgumi_pipeline_core::Chain::<'b, Single<T>>::chain`
+  --> src/builder.rs
    |
    |     pub fn chain<S>(self, step: S) -> Chain<'b, S::Outputs>
    |            ----- required by a bound in this associated function

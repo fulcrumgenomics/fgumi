@@ -1073,6 +1073,180 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::core::{PipelineBuilder, PipelineConfig};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrd};
+
+    /// Source emitting `remaining` items via a shared atomic counter; safe for
+    /// single- and multi-worker `Parallel` execution. (Relocated here with the
+    /// `process2` pipeline-run tests below: the `fgumi-pipeline-core` crate that
+    /// owns the builder can't depend on this `pipeline::steps` layer, so these
+    /// end-to-end `process2` tests live next to `process2` itself.)
+    #[derive(Clone)]
+    struct SharedCountingSource {
+        remaining: Arc<AtomicU32>,
+    }
+    impl Step for SharedCountingSource {
+        type Input = ();
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "SharedSource",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![QueueSpec::Unbounded],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            let n = self.remaining.load(AtomicOrd::Acquire);
+            if n == 0 {
+                return Ok(StepOutcome::Finished);
+            }
+            if self
+                .remaining
+                .compare_exchange(n, n - 1, AtomicOrd::AcqRel, AtomicOrd::Acquire)
+                .is_ok()
+            {
+                ctx.outputs.push(n).map_err(|_| {
+                    std::io::Error::other("Unbounded queue rejected push (impossible)")
+                })?;
+                Ok(StepOutcome::Progress)
+            } else {
+                Ok(StepOutcome::NoProgress)
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// Sink that pops and collects the values it receives. Collecting the
+    /// actual values (rather than only a count) lets the fan-out tests assert
+    /// the exact multiset routed to each branch: a bug that drops, duplicates,
+    /// swaps, or misroutes values while preserving the per-branch count would
+    /// slip past a count-only assertion.
+    #[derive(Clone)]
+    struct ParallelCollectingSink {
+        received: Arc<Mutex<Vec<u32>>>,
+    }
+    impl Step for ParallelCollectingSink {
+        type Input = u32;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "ParallelSink",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            match ctx.input.pop() {
+                Some(v) => {
+                    self.received.lock().expect("sink mutex poisoned").push(v);
+                    Ok(StepOutcome::Progress)
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// Sorted copy of a collecting sink's values, for multiset assertions
+    /// (workers pop concurrently, so arrival order is non-deterministic).
+    fn sorted_received(received: &Arc<Mutex<Vec<u32>>>) -> Vec<u32> {
+        let mut values = received.lock().expect("sink mutex poisoned").clone();
+        values.sort_unstable();
+        values
+    }
+
+    #[test]
+    fn pipeline_run_process2_fans_out_to_two_sinks() {
+        let remaining = Arc::new(AtomicU32::new(20));
+        let evens_received = Arc::new(Mutex::new(Vec::new()));
+        let odds_received = Arc::new(Mutex::new(Vec::new()));
+
+        // Process2 routes even items to branch A, odd items to branch B.
+        let split = process2::<u32, u32, u32, _>("EvenOddSplit", 32, 32, |x: u32| {
+            if x.is_multiple_of(2) {
+                Ok(Process2Output::only_a(x))
+            } else {
+                Ok(Process2Output::only_b(x))
+            }
+        });
+
+        let builder = PipelineBuilder::new();
+        let after_split =
+            builder.chain(SharedCountingSource { remaining: Arc::clone(&remaining) }).chain(split);
+        let multi = after_split.into_multi();
+        multi
+            .b0
+            .chain(ParallelCollectingSink { received: Arc::clone(&evens_received) })
+            .into_sink_marker();
+        multi
+            .b1
+            .chain(ParallelCollectingSink { received: Arc::clone(&odds_received) })
+            .into_sink_marker();
+
+        let pipeline = builder.build().unwrap();
+        let result = pipeline.run(PipelineConfig { threads: 4, ..Default::default() });
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+
+        // Source emits values [20, 19, ..., 1]. Assert the exact multiset each
+        // branch received, not just the count: evens = {2, 4, ..., 20}, odds =
+        // {1, 3, ..., 19}.
+        let expected_evens: Vec<u32> = (1..=10).map(|k| k * 2).collect();
+        let expected_odds: Vec<u32> = (0..10).map(|k| k * 2 + 1).collect();
+        assert_eq!(sorted_received(&evens_received), expected_evens, "evens values");
+        assert_eq!(sorted_received(&odds_received), expected_odds, "odds values");
+    }
+
+    #[test]
+    fn pipeline_run_process2_drops_branches_emit_none() {
+        let remaining = Arc::new(AtomicU32::new(15));
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+
+        // Keep multiples of 3 on branch A, route the rest to branch B, drop 1.
+        let filter = process2::<u32, u32, u32, _>("FilterStep", 16, 16, |x: u32| {
+            if x == 1 {
+                Ok(Process2Output::none())
+            } else if x.is_multiple_of(3) {
+                Ok(Process2Output::only_a(x))
+            } else {
+                Ok(Process2Output::only_b(x))
+            }
+        });
+
+        let builder = PipelineBuilder::new();
+        let after =
+            builder.chain(SharedCountingSource { remaining: Arc::clone(&remaining) }).chain(filter);
+        let multi = after.into_multi();
+        multi.b0.chain(ParallelCollectingSink { received: Arc::clone(&kept) }).into_sink_marker();
+        multi
+            .b1
+            .chain(ParallelCollectingSink { received: Arc::clone(&dropped) })
+            .into_sink_marker();
+
+        let pipeline = builder.build().unwrap();
+        let result = pipeline.run(PipelineConfig { threads: 4, ..Default::default() });
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+
+        // [15..1]: multiples of 3 kept = {3, 6, 9, 12, 15}; value 1 dropped; the
+        // other 9 on branch B. Assert the exact multiset per branch, not just
+        // the count, so a misroute that preserves counts can't slip through.
+        assert_eq!(sorted_received(&kept), vec![3, 6, 9, 12, 15], "kept values");
+        assert_eq!(
+            sorted_received(&dropped),
+            vec![2, 4, 5, 7, 8, 10, 11, 13, 14],
+            "other-branch values"
+        );
+    }
 
     #[derive(Debug, PartialEq, Eq)]
     struct Item {

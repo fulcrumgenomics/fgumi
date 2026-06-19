@@ -24,8 +24,8 @@
 //! the handful of steps in a chain the linear `remove`/`position` cost is
 //! irrelevant.
 
-use crate::pipeline::core::runtime::storage::WorkerStepEntry;
-use crate::pipeline::core::topology::StepIdx;
+use crate::runtime::storage::WorkerStepEntry;
+use crate::topology::StepIdx;
 
 /// One per worker: the steps this worker can still dispatch, in chain order.
 pub struct LiveSteps {
@@ -88,12 +88,12 @@ mod tests {
 
     use parking_lot::Mutex;
 
-    use crate::pipeline::core::erased::{ErasedStep, TypedStep};
-    use crate::pipeline::core::outputs::Single;
-    use crate::pipeline::core::queues::QueueSpec;
-    use crate::pipeline::core::reorder::BranchOrdering;
-    use crate::pipeline::core::runtime::storage::DrainGate;
-    use crate::pipeline::core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
+    use crate::erased::{ErasedStep, TypedStep};
+    use crate::outputs::Single;
+    use crate::queues::QueueSpec;
+    use crate::reorder::BranchOrdering;
+    use crate::runtime::storage::DrainGate;
+    use crate::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
 
     #[derive(Clone)]
     struct Nop;

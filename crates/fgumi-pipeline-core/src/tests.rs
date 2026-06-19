@@ -313,16 +313,20 @@ fn step2_end_to_end_pipeline_pairs_two_sources_through_runtime() {
     // branch. Assert set equality on counts + sum.
     let collected = received.lock().clone();
     assert_eq!(collected.len(), 5, "expected 5 paired emits, got {collected:?}");
-    let sum: u64 = collected.iter().copied().sum();
-    // Pairs match A's i with B's i (since both emit 5..=1 in step), so the
-    // multiset of sums is exactly {11, 22, 33, 44, 55} = sum 165.
-    assert_eq!(sum, 11 + 22 + 33 + 44 + 55, "pair sums must total to 165");
+    // Pairs match A's i with B's i (both emit 5..=1 in step), so the multiset of
+    // sums is exactly {11, 22, 33, 44, 55}. Assert the multiset, not just the
+    // total: a sum check passes for any multiset summing to 165 (e.g. wrong
+    // individual pairings), so it can't catch mis-paired values.
+    let mut sorted = collected.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, vec![11, 22, 33, 44, 55], "pair sums multiset must match");
 }
 
-/// Sink: counts what it receives.
+/// Sink: records every value it receives so tests can assert no records were
+/// dropped, duplicated, or corrupted — not just that the count matched.
 #[derive(Clone)]
 struct DrainReproSink {
-    count: Arc<parking_lot::Mutex<usize>>,
+    received: Arc<parking_lot::Mutex<Vec<u32>>>,
 }
 impl Step for DrainReproSink {
     type Input = u32;
@@ -338,8 +342,8 @@ impl Step for DrainReproSink {
     }
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
         match ctx.input.pop() {
-            Some(_) => {
-                *self.count.lock() += 1;
+            Some(n) => {
+                self.received.lock().push(n);
                 Ok(StepOutcome::Progress)
             }
             None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
@@ -446,17 +450,17 @@ impl Step for ReportsFinishedBuffer {
 }
 
 fn run_reports_finished_pipeline(threads: usize, n_items: u32) {
-    let count: Arc<parking_lot::Mutex<usize>> = Arc::new(parking_lot::Mutex::new(0));
-    let count_for_run = Arc::clone(&count);
+    let received: Arc<parking_lot::Mutex<Vec<u32>>> = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let received_for_run = Arc::clone(&received);
 
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let handle = std::thread::spawn(move || {
-        use crate::pipeline::core::{Pipeline, PipelineConfig};
+        use crate::{Pipeline, PipelineConfig};
         let builder = Pipeline::builder();
         builder
             .chain(WideQueueSource { remaining: n_items })
             .chain(ReportsFinishedBuffer { buffered: Vec::new() })
-            .chain(DrainReproSink { count: count_for_run })
+            .chain(DrainReproSink { received: received_for_run })
             .into_sink_marker();
         let pipeline = builder.build().expect("pipeline build");
         pipeline.run(PipelineConfig { threads, ..Default::default() }).expect("pipeline run");
@@ -468,10 +472,17 @@ fn run_reports_finished_pipeline(threads: usize, n_items: u32) {
         "reports_finished mid-step pipeline DEADLOCKED or stalled at --threads {threads}"
     );
     handle.join().expect("worker thread panicked");
+    // WideQueueSource emits exactly 0..n_items. Assert the multiset (not just the
+    // count) so a dropped, duplicated, or value-corrupted record is caught, not
+    // only an off-by-N total. Order isn't asserted: at >1 thread the Serial
+    // step's re-dispatch interleaving is a valid scheduling detail.
+    let mut got = received.lock().clone();
+    got.sort_unstable();
+    let expected: Vec<u32> = (0..n_items).collect();
     assert_eq!(
-        *count.lock(),
-        n_items as usize,
-        "sink must receive all {n_items} items (no premature drain) at --threads {threads}"
+        got, expected,
+        "sink must receive every item 0..{n_items} exactly once (no drop/dup/corruption) \
+         at --threads {threads}"
     );
 }
 
@@ -668,7 +679,11 @@ fn multi_chain2_ordered_pairs_two_byte_bounded_sources() {
 
     let collected = received.lock().clone();
     assert_eq!(collected.len(), 5, "expected 5 paired emits, got {collected:?}");
-    let sum: u64 = collected.iter().copied().sum();
     // Both sources emit values 5,4,3,2,1 in step → pair sums are 10,8,6,4,2.
-    assert_eq!(sum, 10 + 8 + 6 + 4 + 2);
+    // Pairing is interleave-based (not order-deterministic), so assert the
+    // multiset rather than the sum: a sum check passes for any multiset
+    // totaling 30, missing mis-paired individual values.
+    let mut sorted = collected.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, vec![2, 4, 6, 8, 10], "pair sums multiset must match");
 }

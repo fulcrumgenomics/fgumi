@@ -673,6 +673,7 @@ dependencies = [
  "fgumi-consensus",
  "fgumi-dna",
  "fgumi-metrics",
+ "fgumi-pipeline-core",
  "fgumi-raw-bam",
  "fgumi-sam",
  "fgumi-simd-fastq",
@@ -789,6 +790,18 @@ dependencies = [
  "noodles",
  "serde",
  "tempfile",
+]
+
+[[package]]
+name = "fgumi-pipeline-core"
+version = "0.3.0"
+dependencies = [
+ "ahash",
+ "crossbeam-queue",
+ "log",
+ "noodles",
+ "parking_lot",
+ "trybuild",
 ]
 
 [[package]]

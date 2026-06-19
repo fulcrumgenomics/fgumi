@@ -37,5 +37,10 @@
 //! full checklist.
 
 pub mod chains;
-pub mod core;
+/// The typed-step execution engine, extracted into the `fgumi-pipeline-core`
+/// crate so its lightweight dependency graph (no `noodles`-bam / sort /
+/// consensus) compiles fast in isolation — notably for the `trybuild`
+/// compile-fail tests, which now build against just this crate. Re-exported
+/// here so every existing `crate::pipeline::core::…` path keeps resolving.
+pub use fgumi_pipeline_core as core;
 pub mod steps;

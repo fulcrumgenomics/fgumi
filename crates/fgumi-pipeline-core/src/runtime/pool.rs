@@ -1,9 +1,9 @@
 //! Exclusive owner assignment.
 
-use crate::pipeline::core::erased::ErasedStep;
-use crate::pipeline::core::signal::PipelineError;
-use crate::pipeline::core::step::StepKind;
-use crate::pipeline::core::topology::StepIdx;
+use crate::erased::ErasedStep;
+use crate::signal::PipelineError;
+use crate::step::StepKind;
+use crate::topology::StepIdx;
 
 /// Assign Exclusive steps to specific worker threads in chain declaration
 /// order. Returns `Ok(owners)` where `owners[step_idx] == Some(worker_id)`
@@ -81,10 +81,10 @@ pub fn assign_sticky_owners(
         let profile = step.profile();
         if profile.kind == StepKind::Serial && profile.sticky {
             let target = match step.affinity() {
-                crate::pipeline::core::step::Affinity::None => continue,
-                crate::pipeline::core::step::Affinity::Reader => 0,
-                crate::pipeline::core::step::Affinity::Writer => n_workers.saturating_sub(1),
-                crate::pipeline::core::step::Affinity::Worker(idx) => idx,
+                crate::step::Affinity::None => continue,
+                crate::step::Affinity::Reader => 0,
+                crate::step::Affinity::Writer => n_workers.saturating_sub(1),
+                crate::step::Affinity::Worker(idx) => idx,
             };
             if target < n_workers && sticky[target].is_none() {
                 sticky[target] = Some(StepIdx(step_usize));
@@ -100,11 +100,11 @@ mod tests {
     use super::*;
     use std::io;
 
-    use crate::pipeline::core::erased::TypedStep;
-    use crate::pipeline::core::outputs::Single;
-    use crate::pipeline::core::queues::QueueSpec;
-    use crate::pipeline::core::reorder::BranchOrdering;
-    use crate::pipeline::core::step::{Step, StepCtx, StepOutcome, StepProfile};
+    use crate::erased::TypedStep;
+    use crate::outputs::Single;
+    use crate::queues::QueueSpec;
+    use crate::reorder::BranchOrdering;
+    use crate::step::{Step, StepCtx, StepOutcome, StepProfile};
 
     fn stub_step(kind: StepKind) -> Box<dyn ErasedStep> {
         #[derive(Clone)]
