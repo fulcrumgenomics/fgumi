@@ -878,8 +878,7 @@ fixed-RAM host, prefer one of:
   fgumi dedup ... --threads 16 --max-memory 16G --memory-per-thread false   # fixed total budget
 
 --max-memory is a budget for the controllable consumer (the queue), not a hard RSS cap: a single
-pathological high-coverage position group is still processed whole. The legacy --queue-memory /
---queue-memory-per-thread flags remain accepted as hidden aliases.
+pathological high-coverage position group is still processed whole.
 "#
 )]
 pub struct MarkDuplicates {

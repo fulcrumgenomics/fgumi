@@ -78,12 +78,6 @@ total budget to avoid OOM.
 With `--max-memory auto`, the total budget is instead `host RAM − reserve`
 (divided across threads when per-thread), so it never scales past the host.
 
-### Deprecated flags
-
-`--queue-memory`, `--queue-memory-per-thread`, and `--queue-memory-limit-mb`
-remain accepted as hidden aliases of `--max-memory` / `--memory-per-thread` for
-backward compatibility, but new scripts should use the `--max-memory` flags.
-
 ## Compression Options
 
 ### Compression Level
@@ -393,23 +387,3 @@ Requested memory 16GB exceeds 90% of system memory (14.4GB)
 ### Filter
 - Streaming operation benefits from pipeline memory
 - Compression affects final output size
-
-## Migration from Legacy Parameters
-
-The `--queue-memory`, `--queue-memory-per-thread`, and `--queue-memory-limit-mb`
-flags are deprecated (but still accepted as hidden aliases). Migrate to the
-`--max-memory` family, which matches `fgumi sort`:
-
-```bash
-# Old (deprecated)
-fgumi group --queue-memory-limit-mb 4096
-fgumi group --queue-memory 4096 --queue-memory-per-thread false
-
-# New (recommended)
-fgumi group --max-memory 4096 --memory-per-thread false
-
-# Or let fgumi size the budget to the host:
-fgumi group --max-memory auto
-```
-
-The new parameters provide host-aware (`auto`) sizing and human-readable formats while maintaining backward compatibility.
