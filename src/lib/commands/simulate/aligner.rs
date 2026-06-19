@@ -14,7 +14,8 @@
 //! cannot supply.
 //!
 //! The fix is to read and write **concurrently** — exactly what a real streaming
-//! aligner does. Two independent workers that never wait on each other:
+//! aligner does. Two workers that run concurrently and never block each other
+//! while streaming:
 //!
 //!   - a *drainer* that reads stdin to EOF and discards it, and
 //!   - an *emitter* that copies the replay BAM verbatim to stdout.
@@ -61,9 +62,11 @@ pub struct Aligner {
     #[arg(long = "replay-bam")]
     pub replay_bam: PathBuf,
 
-    /// Reference path (accepted and ignored; for `{ref}`-template compatibility).
-    #[arg(value_name = "REF")]
-    pub reference: Option<PathBuf>,
+    /// Positional tokens substituted into the aligner command template
+    /// (`{ref}`, `{threads}`, …) — accepted and ignored, so the command is a
+    /// drop-in for real-aligner templates regardless of which tokens they fill.
+    #[arg(value_name = "IGNORED", trailing_var_arg = true, allow_hyphen_values = true)]
+    pub ignored: Vec<String>,
 }
 
 impl Command for Aligner {
@@ -82,17 +85,34 @@ impl Command for Aligner {
 
 /// Concurrently drain `stdin` (discarding it) and copy `replay` to `stdout`.
 ///
-/// The drainer and emitter run on separate threads and never wait on each other,
-/// so the function cannot deadlock a caller that backpressures one direction
-/// while feeding the other. A closed stdout read end (the caller went away) is
-/// treated as a clean shutdown — the same way a real aligner exits on SIGPIPE —
-/// rather than an error.
+/// The drainer and emitter run concurrently and never wait on each other, so the
+/// function cannot deadlock a caller that backpressures one direction while
+/// feeding the other.
 ///
-/// Both arguments are consumed (moved into the worker that owns them) so the
-/// underlying handles close when the function returns.
+/// The drainer runs on a *detached* thread, joined only on the full-emit success
+/// path. On the happy path the full replay BAM (with its in-band BGZF EOF marker)
+/// reaches the caller, whose BAM reader stops on its own; we then join the drainer
+/// so the caller finishes feeding FASTQ before we exit and we never SIGPIPE its
+/// writer.
+///
+/// The other two outcomes return *immediately without joining the drainer*,
+/// because joining it could block forever on stdin that never reaches EOF:
+///
+///   - A `BrokenPipe` on stdout means the caller closed its read end (it went
+///     away) — a clean shutdown, the same way a real aligner exits on SIGPIPE. We
+///     return `Ok(())`: there is no reader left to finish feeding FASTQ for, so
+///     there is nothing to wait on.
+///   - On an emit error the replay stream is truncated (no EOF marker), so the
+///     caller's reader would block waiting for bytes that never come — and if it
+///     is coupled to its FASTQ writer by an in-flight gate (as `AlignAndMerge`
+///     is), the writer wedges too and never closes our stdin. We return the error;
+///     process teardown then closes our fd 1, the caller's reader sees EOF and the
+///     whole pipeline winds down. We cannot rely on dropping `stdout` to deliver
+///     that EOF — dropping `io::Stdout` does not close fd 1 (it is intentionally
+///     kept open for the process lifetime).
 fn simulate_aligner<I, B, O>(mut stdin: I, mut replay: B, mut stdout: O) -> io::Result<()>
 where
-    I: Read + Send,
+    I: Read + Send + 'static,
     B: Read,
     O: Write,
 {
@@ -105,28 +125,103 @@ where
         }
     }
 
-    thread::scope(|scope| {
-        // Drainer: read all of stdin and discard. Runs concurrently with the
-        // emitter so the caller's FASTQ writer is never blocked by our output.
-        let drainer = scope.spawn(move || io::copy(&mut stdin, &mut io::sink()).map(|_| ()));
+    // Drainer: read all of stdin and discard, on a detached thread that runs
+    // concurrently with the emitter so the caller's FASTQ writer is never blocked
+    // by our output. Detached (not scoped) so an emit error can return without
+    // waiting on a caller that may never close stdin (see the function doc).
+    let drainer = thread::spawn(move || io::copy(&mut stdin, &mut io::sink()).map(|_| ()));
 
-        // Emitter (this thread): stream the replay BAM verbatim to stdout.
-        let emit =
-            allow_broken_pipe(io::copy(&mut replay, &mut stdout).and_then(|_| stdout.flush()));
+    // Emitter (this thread): stream the replay BAM verbatim to stdout.
+    //
+    // A `BrokenPipe` means the caller closed its stdout read end (it went away):
+    // there is no reader left to finish feeding FASTQ for, so we return a clean
+    // shutdown *immediately* without joining the drainer — joining it could block
+    // forever if the (departed) caller never closes our stdin. Only a full,
+    // successful emit falls through to join the drainer below.
+    match io::copy(&mut replay, &mut stdout).and_then(|_| stdout.flush()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(()),
+        Err(e) => return Err(e),
+    }
 
-        // Wait for the caller to finish feeding FASTQ before we exit, so we never
-        // SIGPIPE its writer by closing stdin early.
-        let drain = allow_broken_pipe(drainer.join().expect("simulate aligner drainer panicked"));
-
-        emit.and(drain)
-    })
+    // Emit succeeded: the caller has the complete BAM and its reader will stop on
+    // the in-band EOF marker. Wait for the caller to finish feeding FASTQ before
+    // we exit, so we never SIGPIPE its writer by dropping our stdin read end.
+    allow_broken_pipe(drainer.join().expect("simulate aligner drainer panicked"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use std::io::{Cursor, Read, Write};
     use std::time::{Duration, Instant};
+
+    /// A reader that yields `remaining` bytes then fails — models a corrupt or
+    /// truncated replay BAM whose read errors partway through.
+    struct ErrAfter {
+        remaining: usize,
+    }
+    impl Read for ErrAfter {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::other("simulated replay read error"));
+            }
+            let n = buf.len().min(self.remaining);
+            buf[..n].fill(0xEE);
+            self.remaining -= n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn accepts_and_ignores_extra_positional_tokens() {
+        // A `--aligner::command` template may substitute `{ref}` and `{threads}`,
+        // producing extra positionals; they must be accepted and ignored.
+        let a = Aligner::try_parse_from(["aligner", "--replay-bam", "x.bam", "/ref.fa", "8"])
+            .expect("parse with ref + threads tokens");
+        assert_eq!(a.replay_bam, PathBuf::from("x.bam"));
+        assert_eq!(a.ignored, vec!["/ref.fa".to_string(), "8".to_string()]);
+    }
+
+    #[test]
+    fn emit_error_returns_without_joining_a_caller_that_never_closes_stdin() {
+        // Models the production deadlock: the emitter errors partway (corrupt
+        // replay) while the caller is wedged — its BAM reader blocks on the
+        // truncated stream and its in-flight gate keeps its FASTQ writer from ever
+        // closing our stdin. The function MUST surface the error promptly without
+        // joining the (detached) drainer, which would otherwise block forever on
+        // stdin that never reaches EOF. We deliberately keep `stdin_w` open for the
+        // whole test, so the drainer can never complete; a join-the-drainer
+        // implementation hangs here.
+        //
+        // This is the case the old `drop(stdout)` could not cover with a real
+        // `io::Stdout`: dropping it does not close fd 1, so a join-based version
+        // never unblocked. A `PipeWriter` (which does close on drop) would mask
+        // that, so this test instead asserts the no-join behavior directly.
+        let (stdin_r, stdin_w) = io::pipe().expect("stdin pipe");
+        // Hold the stdout read end open so the partial emit does not BrokenPipe;
+        // the error must come from the replay read, not a closed reader.
+        let (stdout_r, stdout_w) = io::pipe().expect("stdout pipe");
+        let replay = ErrAfter { remaining: 1024 };
+
+        let sim = thread::spawn(move || simulate_aligner(stdin_r, replay, stdout_w));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !sim.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "simulate aligner hung on the drainer join after an emit error"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let res = sim.join().expect("sim thread");
+        assert!(res.is_err(), "emit error must surface as Err, got {res:?}");
+
+        // Cleanup: closing stdin_w lets the detached drainer finish.
+        drop(stdin_w);
+        drop(stdout_r);
+    }
 
     #[test]
     fn streams_replay_verbatim_and_drains_stdin() {
@@ -201,5 +296,35 @@ mod tests {
 
         let res = simulate_aligner(stdin, replay, stdout_w);
         assert!(res.is_ok(), "BrokenPipe on stdout must be a clean exit: {res:?}");
+    }
+
+    #[test]
+    fn broken_stdout_pipe_returns_without_joining_a_caller_that_never_closes_stdin() {
+        // The caller's reader is gone (stdout read end dropped) so the emit hits
+        // `BrokenPipe`, but the caller never closes our stdin. A correct aligner
+        // must NOT wait on the drainer here — there is no reader left to finish
+        // feeding FASTQ for, so joining the (detached) drainer would block forever
+        // on stdin that never reaches EOF. We hold `stdin_w` open for the whole
+        // test, so a join-on-BrokenPipe implementation hangs here.
+        let (stdin_r, stdin_w) = io::pipe().expect("stdin pipe");
+        let (stdout_r, stdout_w) = io::pipe().expect("stdout pipe");
+        drop(stdout_r); // reader gone: the emit will BrokenPipe
+
+        let replay = Cursor::new(vec![0xCDu8; 1024 * 1024]);
+        let sim = thread::spawn(move || simulate_aligner(stdin_r, replay, stdout_w));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !sim.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "simulate aligner hung on the drainer join after a BrokenPipe stdout"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let res = sim.join().expect("sim thread");
+        assert!(res.is_ok(), "BrokenPipe on stdout must be a clean exit: {res:?}");
+
+        // Cleanup: closing stdin_w lets the detached drainer finish.
+        drop(stdin_w);
     }
 }
