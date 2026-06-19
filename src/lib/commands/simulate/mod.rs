@@ -3,6 +3,7 @@
 //! This module provides commands to generate synthetic sequencing data
 //! for benchmarking and testing the fgumi pipeline.
 
+pub mod aligner;
 pub mod common;
 pub mod consensus_reads;
 pub mod correct_reads;
@@ -15,6 +16,7 @@ use crate::commands::command::Command;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+pub use aligner::Aligner;
 pub use consensus_reads::ConsensusReads;
 pub use correct_reads::CorrectReads;
 pub use fastq_reads::FastqReads;
@@ -45,6 +47,7 @@ pub enum SimulateCommand {
     GroupedReads(GroupedReads),
     ConsensusReads(ConsensusReads),
     CorrectReads(CorrectReads),
+    Aligner(Aligner),
 }
 
 impl SimulateCommand {
@@ -55,6 +58,7 @@ impl SimulateCommand {
             Self::GroupedReads(cmd) => cmd.execute(command_line),
             Self::ConsensusReads(cmd) => cmd.execute(command_line),
             Self::CorrectReads(cmd) => cmd.execute(command_line),
+            Self::Aligner(cmd) => cmd.execute(command_line),
         }
     }
 }
