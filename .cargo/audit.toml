@@ -1,0 +1,18 @@
+# cargo-audit configuration.
+#
+# See: https://github.com/rustsec/rustsec/tree/main/cargo-audit#configuration
+
+[advisories]
+# RUSTSEC-2024-0436: `paste` is unmaintained (archived upstream). This is an
+# "unmaintained" advisory, not a security vulnerability. `paste` is not a direct
+# dependency; it is pulled in transitively via statrs -> nalgebra -> simba.
+#
+# The fix (simba switching paste -> pastey) shipped in simba 0.10.0, which is
+# only reachable through nalgebra 0.35. Our chain is pinned to nalgebra ^0.33 by
+# statrs 0.18, and adopting nalgebra 0.35 upstream also drags in rand 0.10 and an
+# MSRV bump to 1.89, so this is a multi-hop, breaking upstream change.
+#
+# Tracking: https://github.com/fulcrumgenomics/fgumi/issues/26
+# Remove this ignore (and bump statrs) once a statrs release on nalgebra 0.35 is
+# available.
+ignore = ["RUSTSEC-2024-0436"]
