@@ -451,7 +451,7 @@ fn run_reports_finished_pipeline(threads: usize, n_items: u32) {
 
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let handle = std::thread::spawn(move || {
-        use crate::pipeline::core::{Pipeline, PipelineConfig};
+        use crate::{Pipeline, PipelineConfig};
         let builder = Pipeline::builder();
         builder
             .chain(WideQueueSource { remaining: n_items })

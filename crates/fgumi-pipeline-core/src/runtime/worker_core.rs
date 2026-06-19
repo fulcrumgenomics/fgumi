@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::pipeline::core::topology::StepIdx;
+use crate::topology::StepIdx;
 
 const BACKOFF_INITIAL_US: u64 = 1;
 const BACKOFF_MAX_US: u64 = 1_000_000; // 1 second

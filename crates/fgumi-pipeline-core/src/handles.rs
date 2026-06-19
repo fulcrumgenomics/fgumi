@@ -255,7 +255,7 @@ impl<T: Send + HeapSize + 'static> InputHandle<T> for BranchInputHandle<T> {
 /// reorder cap — from the same per-edge budget, so they stay in lockstep
 /// (single source of truth for `per_queue`).
 pub(crate) struct BranchBudgetHandles {
-    pub(crate) transport: Arc<dyn crate::pipeline::core::queues::BoundedQueueHandle>,
+    pub(crate) transport: Arc<dyn crate::queues::BoundedQueueHandle>,
     /// `Some` for an ordered (`ByOrdinal` / `ByItemOrdinal`) byte-bounded
     /// branch — its reorder overflow stash is sized from the same budget.
     /// `None` for a direct (unordered) byte-bounded branch (no reorder stage).
@@ -388,7 +388,7 @@ pub(crate) fn build_branch_ordered_bytes<T: Send + HeapSize + Ordered + 'static>
     spec: QueueSpec,
     ordering: BranchOrdering,
 ) -> Branch<T> {
-    use crate::pipeline::core::queues::BoundedQueueHandle;
+    use crate::queues::BoundedQueueHandle;
 
     match (spec, ordering) {
         (QueueSpec::ByteBounded { limit_bytes }, BranchOrdering::None) => {
@@ -446,7 +446,7 @@ pub(crate) fn build_branch_byte_aware<T: Send + HeapSize + 'static>(
     spec: QueueSpec,
     ordering: BranchOrdering,
 ) -> Branch<T> {
-    use crate::pipeline::core::queues::BoundedQueueHandle;
+    use crate::queues::BoundedQueueHandle;
 
     match (spec, ordering) {
         (QueueSpec::ByteBounded { limit_bytes }, BranchOrdering::None) => {
@@ -479,7 +479,7 @@ pub(crate) fn build_branch_byte_aware<T: Send + HeapSize + 'static>(
 
 fn direct_branch<T: Send + HeapSize + 'static>(
     q: Arc<dyn ItemQueue<T>>,
-    transport_handle: Option<Arc<dyn crate::pipeline::core::queues::BoundedQueueHandle>>,
+    transport_handle: Option<Arc<dyn crate::queues::BoundedQueueHandle>>,
 ) -> Branch<T> {
     // A direct (unordered) branch has no reorder stage, so no reorder cap.
     let bounded_queue_handle =
@@ -495,7 +495,7 @@ fn ordered_branch<T: Send + HeapSize + 'static>(
     transport: Arc<dyn ItemQueue<Sequenced<T>>>,
     ordinal_source: OrdinalSource<T>,
     max_overflow_bytes: Option<u64>,
-    transport_handle: Option<Arc<dyn crate::pipeline::core::queues::BoundedQueueHandle>>,
+    transport_handle: Option<Arc<dyn crate::queues::BoundedQueueHandle>>,
 ) -> Branch<T> {
     let stage = Arc::new(match max_overflow_bytes {
         Some(cap) => ReorderStage::<T>::with_max_overflow_bytes(transport, cap),
@@ -585,12 +585,12 @@ impl OutputQueueSet {
 // of the matching upstream's `OutputQueueSet`.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Two per-branch input handles for a [`crate::pipeline::core::step::Step2`]
+/// Two per-branch input handles for a [`crate::step::Step2`]
 /// consumer, paired by branch slot (`a` = consumer's input slot 0,
 /// `b` = slot 1). Boxed type-erased into `ChainContexts.inputs[step_idx]`
 /// at chain-build time; the
-/// [`crate::pipeline::core::erased::TypedStep2`] adapter
-/// downcasts and lends per-branch references into [`crate::pipeline::core::step::StepCtx2`].
+/// [`crate::erased::TypedStep2`] adapter
+/// downcasts and lends per-branch references into [`crate::step::StepCtx2`].
 pub struct TwoInputHandles<A, B>
 where
     A: Send + HeapSize + 'static,
@@ -761,9 +761,7 @@ impl<T: Send + HeapSize + 'static> OutputHandles<Single<T>> {
     }
 }
 
-impl<T: Send + HeapSize + Ordered + 'static>
-    OutputHandles<crate::pipeline::core::outputs::OrderedBytesSingle<T>>
-{
+impl<T: Send + HeapSize + Ordered + 'static> OutputHandles<crate::outputs::OrderedBytesSingle<T>> {
     /// Push a fresh item to the heap-aware ordered output.
     ///
     /// # Errors
@@ -817,10 +815,7 @@ impl<T: Send + HeapSize + Ordered + 'static>
     /// the caller maps `StillHeld` to a yield (`NoProgress`/`Contention`) and
     /// retries on the next dispatch.
     #[inline]
-    pub fn retry_held(
-        &self,
-        held: &mut crate::pipeline::core::held::HeldSlot<Unpushed<T>>,
-    ) -> HeldRetry {
+    pub fn retry_held(&self, held: &mut crate::held::HeldSlot<Unpushed<T>>) -> HeldRetry {
         match held.take() {
             None => HeldRetry::WasEmpty,
             Some(unpushed) => match self.retry(unpushed) {
@@ -853,7 +848,7 @@ impl<A: Send + HeapSize + 'static, B: Send + HeapSize + 'static> OutputHandles<(
     }
 }
 
-impl<A, B> OutputHandles<crate::pipeline::core::outputs::OrderedBytesTuple2<A, B>>
+impl<A, B> OutputHandles<crate::outputs::OrderedBytesTuple2<A, B>>
 where
     A: Send + HeapSize + Ordered + 'static,
     B: Send + HeapSize + Ordered + 'static,
@@ -988,9 +983,7 @@ impl<T: Send + HeapSize + 'static> OutputHandles<Single<T>> {
     }
 }
 
-impl<T: Send + HeapSize + Ordered + 'static>
-    OutputHandles<crate::pipeline::core::outputs::OrderedBytesSingle<T>>
-{
+impl<T: Send + HeapSize + Ordered + 'static> OutputHandles<crate::outputs::OrderedBytesSingle<T>> {
     /// Mark all output branches drained.
     ///
     /// # Panics
@@ -1024,7 +1017,7 @@ impl<A: Send + HeapSize + 'static, B: Send + HeapSize + 'static> OutputHandles<(
     }
 }
 
-impl<A, B> OutputHandles<crate::pipeline::core::outputs::OrderedBytesTuple2<A, B>>
+impl<A, B> OutputHandles<crate::outputs::OrderedBytesTuple2<A, B>>
 where
     A: Send + HeapSize + Ordered + 'static,
     B: Send + HeapSize + Ordered + 'static,
@@ -1371,7 +1364,7 @@ mod handle_tests {
         // `StepOutputs::build_queues` → `build_single_queues` →
         // `build_branch::<T>`. The panic message must clearly direct the
         // step author to PR 2's byte-aware path.
-        use crate::pipeline::core::outputs::{Single, StepOutputs};
+        use crate::outputs::{Single, StepOutputs};
         let _ = <Single<u32> as StepOutputs>::build_queues(
             &[QueueSpec::ByteBounded { limit_bytes: 1000 }],
             &[BranchOrdering::None],
@@ -1408,7 +1401,7 @@ mod handle_tests {
         ord: u64,
         v: u32,
     }
-    impl crate::pipeline::core::item::Ordered for OrdItem {
+    impl crate::item::Ordered for OrdItem {
         fn ordinal(&self) -> u64 {
             self.ord
         }
@@ -1515,8 +1508,8 @@ mod handle_tests {
 #[cfg(test)]
 mod build_queues_tests {
     use super::*;
-    use crate::pipeline::core::outputs::{Single, StepOutputs};
-    use crate::pipeline::core::step::OutputHandles;
+    use crate::outputs::{Single, StepOutputs};
+    use crate::step::OutputHandles;
 
     fn count_specs(arity: usize, capacity: usize) -> (Vec<QueueSpec>, Vec<BranchOrdering>) {
         (vec![QueueSpec::CountBounded { capacity }; arity], vec![BranchOrdering::None; arity])

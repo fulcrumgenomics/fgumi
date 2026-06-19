@@ -25,10 +25,10 @@ use std::time::Instant;
 
 use super::contexts::build_chain_contexts_fused;
 use super::stats::PipelineStats;
-use crate::pipeline::core::erased::{ErasedStep, ErasedStepCtx};
-use crate::pipeline::core::signal::{PipelineError, PipelineSignal};
-use crate::pipeline::core::step::StepOutcome;
-use crate::pipeline::core::topology::{BranchIdx, ChainGraph, StepIdx};
+use crate::erased::{ErasedStep, ErasedStepCtx};
+use crate::signal::{PipelineError, PipelineSignal};
+use crate::step::StepOutcome;
+use crate::topology::{BranchIdx, ChainGraph, StepIdx};
 
 /// Returns `true` iff `steps` (in chain-construction order) form a chain the
 /// fused driver can run on one worker: at least two steps, exactly one source
@@ -99,8 +99,8 @@ pub fn is_fusible_chain(steps: &[Box<dyn ErasedStep>], graph: &ChainGraph) -> bo
 /// Returns [`PipelineError::Io`] if any step's `try_run` returned `Err` (the
 /// first such error wins, carrying the originating step's name), or
 /// [`PipelineError::Cancelled`] if the run was cancelled via the pipeline's
-/// [`CancelHandle`](crate::pipeline::core::signal::CancelHandle) — matching
-/// [`crate::pipeline::core::builder::Pipeline::run`]'s contract.
+/// [`CancelHandle`](crate::signal::CancelHandle) — matching
+/// [`crate::builder::Pipeline::run`]'s contract.
 pub fn run_fused_single_thread(
     mut steps: Vec<Box<dyn ErasedStep>>,
     graph: &ChainGraph,
@@ -202,11 +202,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::pipeline::core::erased::TypedStep;
-    use crate::pipeline::core::outputs::Single;
-    use crate::pipeline::core::queues::QueueSpec;
-    use crate::pipeline::core::reorder::BranchOrdering;
-    use crate::pipeline::core::step::{Step, StepCtx, StepKind, StepProfile};
+    use crate::erased::TypedStep;
+    use crate::outputs::Single;
+    use crate::queues::QueueSpec;
+    use crate::reorder::BranchOrdering;
+    use crate::step::{Step, StepCtx, StepKind, StepProfile};
 
     // ── Stub steps: source → +100 mid → collecting sink ──────────────────
 

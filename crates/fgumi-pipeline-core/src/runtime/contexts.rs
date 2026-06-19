@@ -20,12 +20,12 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::pipeline::core::erased::ErasedStep;
-use crate::pipeline::core::handles::{BranchInputHandle, OutputQueueSet, build_branch};
-use crate::pipeline::core::item::HeapSize;
-use crate::pipeline::core::queues::QueueSpec;
-use crate::pipeline::core::reorder::BranchOrdering;
-use crate::pipeline::core::topology::{BranchIdx, ChainGraph, StepIdx};
+use crate::erased::ErasedStep;
+use crate::handles::{BranchInputHandle, OutputQueueSet, build_branch};
+use crate::item::HeapSize;
+use crate::queues::QueueSpec;
+use crate::reorder::BranchOrdering;
+use crate::topology::{BranchIdx, ChainGraph, StepIdx};
 
 /// Per-step input + outputs handles. The worker loop hands these to
 /// `ErasedStepCtx` for each `try_run_erased` dispatch and to
@@ -55,11 +55,11 @@ pub struct RegisteredQueue {
     pub producer_step_name: &'static str,
     pub producer_step: StepIdx,
     pub branch: BranchIdx,
-    pub handle: std::sync::Arc<dyn crate::pipeline::core::queues::BoundedQueueHandle>,
+    pub handle: std::sync::Arc<dyn crate::queues::BoundedQueueHandle>,
     /// `Some` for an ordered byte-bounded branch — its reorder overflow stash
     /// is sized from the same per-edge budget as `handle`. `None` for a direct
     /// (unordered) byte-bounded branch (no reorder stage).
-    pub reorder_cap: Option<std::sync::Arc<dyn crate::pipeline::core::reorder::ReorderCapHandle>>,
+    pub reorder_cap: Option<std::sync::Arc<dyn crate::reorder::ReorderCapHandle>>,
 }
 
 /// Build the chain's per-step contexts.
@@ -289,9 +289,9 @@ mod tests {
     use super::*;
     use std::io;
 
-    use crate::pipeline::core::erased::TypedStep;
-    use crate::pipeline::core::outputs::Single;
-    use crate::pipeline::core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
+    use crate::erased::TypedStep;
+    use crate::outputs::Single;
+    use crate::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
 
     #[derive(Clone)]
     struct StubSource;

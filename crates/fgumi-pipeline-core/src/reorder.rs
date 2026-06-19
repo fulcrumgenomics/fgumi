@@ -449,7 +449,7 @@ impl<T: Send + HeapSize + 'static> ReorderStage<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::core::queues::CountBoundedQueue;
+    use crate::queues::CountBoundedQueue;
 
     fn make_stage(transport_capacity: usize) -> ReorderStage<u32> {
         let q: Arc<dyn ItemQueue<Sequenced<u32>>> =

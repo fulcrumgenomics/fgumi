@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-tag", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/fgumi-bam-io", "crates/fgumi-sort", "crates/fgumi-cli-macros", "crates/xtask"]
+members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-tag", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/fgumi-bam-io", "crates/fgumi-sort", "crates/fgumi-pipeline-core", "crates/fgumi-cli-macros", "crates/xtask"]
 resolver = "2"
 
 [workspace.package]
@@ -20,6 +20,7 @@ fgumi-raw-bam = { version = "0.3.0", path = "crates/fgumi-raw-bam" }
 fgumi-sam = { version = "0.3.0", path = "crates/fgumi-sam" }
 fgumi-simd-fastq = { version = "0.3.0", path = "crates/fgumi-simd-fastq" }
 fgumi-sort = { version = "0.3.0", path = "crates/fgumi-sort" }
+fgumi-pipeline-core = { version = "0.3.0", path = "crates/fgumi-pipeline-core" }
 fgumi-tag = { version = "0.3.0", path = "crates/fgumi-tag" }
 fgumi-umi = { version = "0.3.0", path = "crates/fgumi-umi" }
 bytemuck = { version = "1.14", features = ["derive"] }
@@ -99,6 +100,7 @@ fgumi-umi = { workspace = true }
 fgumi-consensus = { workspace = true }
 fgumi-bam-io = { workspace = true }
 fgumi-sort = { workspace = true }
+fgumi-pipeline-core = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.6"

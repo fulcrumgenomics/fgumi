@@ -291,7 +291,7 @@ pub struct StepCtx<'a, S: Step> {
 ///
 /// Sits **alongside** [`Step`]; existing single-input steps are
 /// unaffected. The framework's [`TypedStep2`] adapter
-/// (`crate::pipeline::core::erased::TypedStep2`) is the
+/// (`crate::erased::TypedStep2`) is the
 /// dual of [`TypedStep`], implementing the same [`ErasedStep`]
 /// contract so the runtime sees no difference between single- and
 /// two-input steps at dispatch time.
@@ -355,8 +355,8 @@ pub struct StepCtx2<'a, S: Step2> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::core::queues::QueueSpec;
-    use crate::pipeline::core::reorder::BranchOrdering;
+    use crate::queues::QueueSpec;
+    use crate::reorder::BranchOrdering;
 
     #[test]
     fn step_profile_constructs() {
@@ -395,9 +395,9 @@ mod tests {
 #[cfg(test)]
 mod step_trait_compile_tests {
     use super::*;
-    use crate::pipeline::core::outputs::Single;
-    use crate::pipeline::core::queues::QueueSpec;
-    use crate::pipeline::core::reorder::BranchOrdering;
+    use crate::outputs::Single;
+    use crate::queues::QueueSpec;
+    use crate::reorder::BranchOrdering;
 
     /// Stub step that does nothing — exercises the trait declaration.
     #[derive(Clone)]

@@ -74,9 +74,9 @@ pub trait ErasedStep: Send + 'static {
     ) -> Box<dyn Any + Send + Sync>;
 
     /// Input arity. Default `1` for single-input
-    /// [`crate::pipeline::core::step::Step`] impls; multi-input
+    /// [`crate::step::Step`] impls; multi-input
     /// adapters (`TypedStep2`, future `StepN`) override to return their
-    /// arity. Used by [`crate::pipeline::core::runtime::contexts`]
+    /// arity. Used by [`crate::runtime::contexts`]
     /// to decide which input-construction path to take.
     fn input_arity(&self) -> usize {
         1
@@ -84,8 +84,8 @@ pub trait ErasedStep: Send + 'static {
 
     /// Take ownership of TWO consumer input handles from two
     /// upstream output queue sets, paired into a typed
-    /// [`crate::pipeline::core::handles::TwoInputHandles<A, B>`]
-    /// per the consumer's [`crate::pipeline::core::step::Step2`]
+    /// [`crate::handles::TwoInputHandles<A, B>`]
+    /// per the consumer's [`crate::step::Step2`]
     /// associated types.
     ///
     /// Default impl panics — single-input steps never have arity 2.
@@ -122,7 +122,7 @@ pub trait ErasedStep: Send + 'static {
     /// **direct, unbounded** transport (no byte bound, no reorder stage).
     ///
     /// Used only by the single-thread *fused* driver
-    /// ([`crate::pipeline::core::runtime::run_fused_single_thread`]). At one
+    /// ([`crate::runtime::run_fused_single_thread`]). At one
     /// worker, FIFO push order is already the correct order, so the reorder
     /// stage is dead weight, and the unbounded buffer never needs backpressure
     /// because the consumer is driven in the same pass over the chain. Each
@@ -594,11 +594,11 @@ impl<S: Step2> ErasedStep for TypedStep2<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::core::handles::BranchInputHandle;
-    use crate::pipeline::core::outputs::Single;
-    use crate::pipeline::core::queues::QueueSpec;
-    use crate::pipeline::core::reorder::BranchOrdering;
-    use crate::pipeline::core::step::{
+    use crate::handles::BranchInputHandle;
+    use crate::outputs::Single;
+    use crate::queues::QueueSpec;
+    use crate::reorder::BranchOrdering;
+    use crate::step::{
         InputHandle, OutputHandles, Step, StepCtx, StepKind, StepOutcome, StepProfile,
     };
 

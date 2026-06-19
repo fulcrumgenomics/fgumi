@@ -24,16 +24,16 @@ use std::any::Any;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::pipeline::core::erased::ErasedStepCtx;
-use crate::pipeline::core::runtime::contexts::ChainContexts;
-use crate::pipeline::core::runtime::drain::StepDrainCounter;
-use crate::pipeline::core::runtime::live::LiveSteps;
-use crate::pipeline::core::runtime::stats::PipelineStats;
-use crate::pipeline::core::runtime::storage::WorkerStepEntry;
-use crate::pipeline::core::runtime::worker_core::WorkerCore;
-use crate::pipeline::core::signal::{PipelineError, PipelineSignal};
-use crate::pipeline::core::step::StepOutcome;
-use crate::pipeline::core::topology::StepIdx;
+use crate::erased::ErasedStepCtx;
+use crate::runtime::contexts::ChainContexts;
+use crate::runtime::drain::StepDrainCounter;
+use crate::runtime::live::LiveSteps;
+use crate::runtime::stats::PipelineStats;
+use crate::runtime::storage::WorkerStepEntry;
+use crate::runtime::worker_core::WorkerCore;
+use crate::signal::{PipelineError, PipelineSignal};
+use crate::step::StepOutcome;
+use crate::topology::StepIdx;
 
 /// Run the worker loop for one worker thread.
 ///
@@ -337,7 +337,7 @@ fn dispatch_one_step(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::core::topology::ChainGraph;
+    use crate::topology::ChainGraph;
 
     #[test]
     fn run_worker_loop_exits_on_signal_done() {

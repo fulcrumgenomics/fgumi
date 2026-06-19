@@ -3,11 +3,11 @@
 
 use std::io;
 
-use fgumi_lib::pipeline::core::PipelineBuilder;
-use fgumi_lib::pipeline::core::outputs::Single;
-use fgumi_lib::pipeline::core::queues::QueueSpec;
-use fgumi_lib::pipeline::core::reorder::BranchOrdering;
-use fgumi_lib::pipeline::core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
+use fgumi_pipeline_core::PipelineBuilder;
+use fgumi_pipeline_core::outputs::Single;
+use fgumi_pipeline_core::queues::QueueSpec;
+use fgumi_pipeline_core::reorder::BranchOrdering;
+use fgumi_pipeline_core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
 
 #[derive(Clone)]
 struct U32Source;

@@ -1073,6 +1073,154 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::core::{PipelineBuilder, PipelineConfig};
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrd};
+
+    /// Source emitting `remaining` items via a shared atomic counter; safe for
+    /// single- and multi-worker `Parallel` execution. (Relocated here with the
+    /// `process2` pipeline-run tests below: the `fgumi-pipeline-core` crate that
+    /// owns the builder can't depend on this `pipeline::steps` layer, so these
+    /// end-to-end `process2` tests live next to `process2` itself.)
+    #[derive(Clone)]
+    struct SharedCountingSource {
+        remaining: Arc<AtomicU32>,
+    }
+    impl Step for SharedCountingSource {
+        type Input = ();
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "SharedSource",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![QueueSpec::Unbounded],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            let n = self.remaining.load(AtomicOrd::Acquire);
+            if n == 0 {
+                return Ok(StepOutcome::Finished);
+            }
+            if self
+                .remaining
+                .compare_exchange(n, n - 1, AtomicOrd::AcqRel, AtomicOrd::Acquire)
+                .is_ok()
+            {
+                ctx.outputs.push(n).map_err(|_| {
+                    std::io::Error::other("Unbounded queue rejected push (impossible)")
+                })?;
+                Ok(StepOutcome::Progress)
+            } else {
+                Ok(StepOutcome::NoProgress)
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// Sink that pops and counts.
+    #[derive(Clone)]
+    struct ParallelCountingSink {
+        received: Arc<AtomicU32>,
+    }
+    impl Step for ParallelCountingSink {
+        type Input = u32;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "ParallelSink",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            match ctx.input.pop() {
+                Some(_) => {
+                    self.received.fetch_add(1, AtomicOrd::Relaxed);
+                    Ok(StepOutcome::Progress)
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn pipeline_run_process2_fans_out_to_two_sinks() {
+        let remaining = Arc::new(AtomicU32::new(20));
+        let evens_received = Arc::new(AtomicU32::new(0));
+        let odds_received = Arc::new(AtomicU32::new(0));
+
+        // Process2 routes even items to branch A, odd items to branch B.
+        let split = process2::<u32, u32, u32, _>("EvenOddSplit", 32, 32, |x: u32| {
+            if x.is_multiple_of(2) {
+                Ok(Process2Output::only_a(x))
+            } else {
+                Ok(Process2Output::only_b(x))
+            }
+        });
+
+        let builder = PipelineBuilder::new();
+        let after_split =
+            builder.chain(SharedCountingSource { remaining: Arc::clone(&remaining) }).chain(split);
+        let multi = after_split.into_multi();
+        multi
+            .b0
+            .chain(ParallelCountingSink { received: Arc::clone(&evens_received) })
+            .into_sink_marker();
+        multi
+            .b1
+            .chain(ParallelCountingSink { received: Arc::clone(&odds_received) })
+            .into_sink_marker();
+
+        let pipeline = builder.build().unwrap();
+        let result = pipeline.run(PipelineConfig { threads: 4, ..Default::default() });
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+
+        // Source emits values [20, 19, ..., 1]. evens: 10 items, odds: 10 items.
+        assert_eq!(evens_received.load(AtomicOrd::Relaxed), 10, "evens count");
+        assert_eq!(odds_received.load(AtomicOrd::Relaxed), 10, "odds count");
+    }
+
+    #[test]
+    fn pipeline_run_process2_drops_branches_emit_none() {
+        let remaining = Arc::new(AtomicU32::new(15));
+        let kept = Arc::new(AtomicU32::new(0));
+        let dropped = Arc::new(AtomicU32::new(0));
+
+        // Keep multiples of 3 on branch A, route the rest to branch B, drop 1.
+        let filter = process2::<u32, u32, u32, _>("FilterStep", 16, 16, |x: u32| {
+            if x == 1 {
+                Ok(Process2Output::none())
+            } else if x.is_multiple_of(3) {
+                Ok(Process2Output::only_a(x))
+            } else {
+                Ok(Process2Output::only_b(x))
+            }
+        });
+
+        let builder = PipelineBuilder::new();
+        let after =
+            builder.chain(SharedCountingSource { remaining: Arc::clone(&remaining) }).chain(filter);
+        let multi = after.into_multi();
+        multi.b0.chain(ParallelCountingSink { received: Arc::clone(&kept) }).into_sink_marker();
+        multi.b1.chain(ParallelCountingSink { received: Arc::clone(&dropped) }).into_sink_marker();
+
+        let pipeline = builder.build().unwrap();
+        let result = pipeline.run(PipelineConfig { threads: 4, ..Default::default() });
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+
+        // [15..1]: multiples of 3 kept = 5; value 1 dropped; the other 9 on branch B.
+        assert_eq!(kept.load(AtomicOrd::Relaxed), 5, "kept count");
+        assert_eq!(dropped.load(AtomicOrd::Relaxed), 9, "other-branch count");
+    }
 
     #[derive(Debug, PartialEq, Eq)]
     struct Item {
