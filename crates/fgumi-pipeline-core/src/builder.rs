@@ -1015,12 +1015,11 @@ impl Pipeline {
         }
 
         // 7. Surface error or cancellation. PipelineError isn't Clone
-        // (io::Error isn't Clone); reconstruct from the recorded outcome.
+        // (io::Error isn't Clone); `to_result` reconstructs the recorded
+        // outcome and, for an external cancel whose payload isn't yet visible
+        // to this thread, synthesizes `Cancelled` from the terminal state.
         let _ = graph;
-        match signal.outcome() {
-            Some(err) => Err(err.reconstruct()),
-            None => Ok(()),
-        }
+        signal.to_result()
     }
 }
 

@@ -1074,6 +1074,7 @@ where
 mod tests {
     use super::*;
     use crate::pipeline::core::{PipelineBuilder, PipelineConfig};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering as AtomicOrd};
 
     /// Source emitting `remaining` items via a shared atomic counter; safe for
@@ -1120,12 +1121,16 @@ mod tests {
         }
     }
 
-    /// Sink that pops and counts.
+    /// Sink that pops and collects the values it receives. Collecting the
+    /// actual values (rather than only a count) lets the fan-out tests assert
+    /// the exact multiset routed to each branch: a bug that drops, duplicates,
+    /// swaps, or misroutes values while preserving the per-branch count would
+    /// slip past a count-only assertion.
     #[derive(Clone)]
-    struct ParallelCountingSink {
-        received: Arc<AtomicU32>,
+    struct ParallelCollectingSink {
+        received: Arc<Mutex<Vec<u32>>>,
     }
-    impl Step for ParallelCountingSink {
+    impl Step for ParallelCollectingSink {
         type Input = u32;
         type Outputs = ();
         fn profile(&self) -> StepProfile {
@@ -1139,8 +1144,8 @@ mod tests {
         }
         fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
             match ctx.input.pop() {
-                Some(_) => {
-                    self.received.fetch_add(1, AtomicOrd::Relaxed);
+                Some(v) => {
+                    self.received.lock().expect("sink mutex poisoned").push(v);
                     Ok(StepOutcome::Progress)
                 }
                 None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
@@ -1152,11 +1157,19 @@ mod tests {
         }
     }
 
+    /// Sorted copy of a collecting sink's values, for multiset assertions
+    /// (workers pop concurrently, so arrival order is non-deterministic).
+    fn sorted_received(received: &Arc<Mutex<Vec<u32>>>) -> Vec<u32> {
+        let mut values = received.lock().expect("sink mutex poisoned").clone();
+        values.sort_unstable();
+        values
+    }
+
     #[test]
     fn pipeline_run_process2_fans_out_to_two_sinks() {
         let remaining = Arc::new(AtomicU32::new(20));
-        let evens_received = Arc::new(AtomicU32::new(0));
-        let odds_received = Arc::new(AtomicU32::new(0));
+        let evens_received = Arc::new(Mutex::new(Vec::new()));
+        let odds_received = Arc::new(Mutex::new(Vec::new()));
 
         // Process2 routes even items to branch A, odd items to branch B.
         let split = process2::<u32, u32, u32, _>("EvenOddSplit", 32, 32, |x: u32| {
@@ -1173,27 +1186,31 @@ mod tests {
         let multi = after_split.into_multi();
         multi
             .b0
-            .chain(ParallelCountingSink { received: Arc::clone(&evens_received) })
+            .chain(ParallelCollectingSink { received: Arc::clone(&evens_received) })
             .into_sink_marker();
         multi
             .b1
-            .chain(ParallelCountingSink { received: Arc::clone(&odds_received) })
+            .chain(ParallelCollectingSink { received: Arc::clone(&odds_received) })
             .into_sink_marker();
 
         let pipeline = builder.build().unwrap();
         let result = pipeline.run(PipelineConfig { threads: 4, ..Default::default() });
         assert!(result.is_ok(), "run failed: {:?}", result.err());
 
-        // Source emits values [20, 19, ..., 1]. evens: 10 items, odds: 10 items.
-        assert_eq!(evens_received.load(AtomicOrd::Relaxed), 10, "evens count");
-        assert_eq!(odds_received.load(AtomicOrd::Relaxed), 10, "odds count");
+        // Source emits values [20, 19, ..., 1]. Assert the exact multiset each
+        // branch received, not just the count: evens = {2, 4, ..., 20}, odds =
+        // {1, 3, ..., 19}.
+        let expected_evens: Vec<u32> = (1..=10).map(|k| k * 2).collect();
+        let expected_odds: Vec<u32> = (0..10).map(|k| k * 2 + 1).collect();
+        assert_eq!(sorted_received(&evens_received), expected_evens, "evens values");
+        assert_eq!(sorted_received(&odds_received), expected_odds, "odds values");
     }
 
     #[test]
     fn pipeline_run_process2_drops_branches_emit_none() {
         let remaining = Arc::new(AtomicU32::new(15));
-        let kept = Arc::new(AtomicU32::new(0));
-        let dropped = Arc::new(AtomicU32::new(0));
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let dropped = Arc::new(Mutex::new(Vec::new()));
 
         // Keep multiples of 3 on branch A, route the rest to branch B, drop 1.
         let filter = process2::<u32, u32, u32, _>("FilterStep", 16, 16, |x: u32| {
@@ -1210,16 +1227,25 @@ mod tests {
         let after =
             builder.chain(SharedCountingSource { remaining: Arc::clone(&remaining) }).chain(filter);
         let multi = after.into_multi();
-        multi.b0.chain(ParallelCountingSink { received: Arc::clone(&kept) }).into_sink_marker();
-        multi.b1.chain(ParallelCountingSink { received: Arc::clone(&dropped) }).into_sink_marker();
+        multi.b0.chain(ParallelCollectingSink { received: Arc::clone(&kept) }).into_sink_marker();
+        multi
+            .b1
+            .chain(ParallelCollectingSink { received: Arc::clone(&dropped) })
+            .into_sink_marker();
 
         let pipeline = builder.build().unwrap();
         let result = pipeline.run(PipelineConfig { threads: 4, ..Default::default() });
         assert!(result.is_ok(), "run failed: {:?}", result.err());
 
-        // [15..1]: multiples of 3 kept = 5; value 1 dropped; the other 9 on branch B.
-        assert_eq!(kept.load(AtomicOrd::Relaxed), 5, "kept count");
-        assert_eq!(dropped.load(AtomicOrd::Relaxed), 9, "other-branch count");
+        // [15..1]: multiples of 3 kept = {3, 6, 9, 12, 15}; value 1 dropped; the
+        // other 9 on branch B. Assert the exact multiset per branch, not just
+        // the count, so a misroute that preserves counts can't slip through.
+        assert_eq!(sorted_received(&kept), vec![3, 6, 9, 12, 15], "kept values");
+        assert_eq!(
+            sorted_received(&dropped),
+            vec![2, 4, 5, 7, 8, 10, 11, 13, 14],
+            "other-branch values"
+        );
     }
 
     #[derive(Debug, PartialEq, Eq)]

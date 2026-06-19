@@ -188,12 +188,11 @@ pub fn run_fused_single_thread(
         }
     }
 
-    // Map the recorded outcome to the run result (same shape as `Pipeline::run`;
-    // `PipelineError` is not `Clone`, so reconstruct via `PipelineError::reconstruct`).
-    match signal.outcome() {
-        Some(err) => Err(err.reconstruct()),
-        None => Ok(()),
-    }
+    // Map the recorded outcome to the run result (same shape as `Pipeline::run`).
+    // `to_result` reconstructs the non-`Clone` `PipelineError` and synthesizes
+    // `Cancelled` from the state when an external cancel published the terminal
+    // state but its `OnceLock` payload is not yet visible to this thread.
+    signal.to_result()
 }
 
 #[cfg(test)]
