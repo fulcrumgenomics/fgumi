@@ -14,7 +14,8 @@
 //! cannot supply.
 //!
 //! The fix is to read and write **concurrently** — exactly what a real streaming
-//! aligner does. Two independent workers that never wait on each other:
+//! aligner does. Two workers that run concurrently and never block each other
+//! while streaming:
 //!
 //!   - a *drainer* that reads stdin to EOF and discards it, and
 //!   - an *emitter* that copies the replay BAM verbatim to stdout.
@@ -61,9 +62,11 @@ pub struct Aligner {
     #[arg(long = "replay-bam")]
     pub replay_bam: PathBuf,
 
-    /// Reference path (accepted and ignored; for `{ref}`-template compatibility).
-    #[arg(value_name = "REF")]
-    pub reference: Option<PathBuf>,
+    /// Positional tokens substituted into the aligner command template
+    /// (`{ref}`, `{threads}`, …) — accepted and ignored, so the command is a
+    /// drop-in for real-aligner templates regardless of which tokens they fill.
+    #[arg(value_name = "IGNORED", trailing_var_arg = true, allow_hyphen_values = true)]
+    pub ignored: Vec<String>,
 }
 
 impl Command for Aligner {
@@ -114,6 +117,12 @@ where
         let emit =
             allow_broken_pipe(io::copy(&mut replay, &mut stdout).and_then(|_| stdout.flush()));
 
+        // Close stdout so the caller's reader sees EOF and can wind down — even
+        // when the emitter errored partway (e.g. a corrupt replay BAM). Without
+        // this, the drainer join below would block forever on a caller that is
+        // still feeding FASTQ and waiting on output we will never produce.
+        drop(stdout);
+
         // Wait for the caller to finish feeding FASTQ before we exit, so we never
         // SIGPIPE its writer by closing stdin early.
         let drain = allow_broken_pipe(drainer.join().expect("simulate aligner drainer panicked"));
@@ -125,8 +134,66 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use std::io::{Cursor, Read, Write};
     use std::time::{Duration, Instant};
+
+    /// A reader that yields `remaining` bytes then fails — models a corrupt or
+    /// truncated replay BAM whose read errors partway through.
+    struct ErrAfter {
+        remaining: usize,
+    }
+    impl Read for ErrAfter {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::other("simulated replay read error"));
+            }
+            let n = buf.len().min(self.remaining);
+            buf[..n].fill(0xEE);
+            self.remaining -= n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn accepts_and_ignores_extra_positional_tokens() {
+        // A `--aligner::command` template may substitute `{ref}` and `{threads}`,
+        // producing extra positionals; they must be accepted and ignored.
+        let a = Aligner::try_parse_from(["aligner", "--replay-bam", "x.bam", "/ref.fa", "8"])
+            .expect("parse with ref + threads tokens");
+        assert_eq!(a.replay_bam, PathBuf::from("x.bam"));
+        assert_eq!(a.ignored, vec!["/ref.fa".to_string(), "8".to_string()]);
+    }
+
+    #[test]
+    fn emit_error_surfaces_as_err_without_hanging() {
+        // When the emitter errors partway (corrupt replay) against a live caller
+        // that is still feeding stdin, the function must close stdout (so the
+        // caller winds down) and return the error — not hang on the drainer join.
+        let (stdin_r, mut stdin_w) = io::pipe().expect("stdin pipe");
+        let (mut stdout_r, stdout_w) = io::pipe().expect("stdout pipe");
+        let replay = ErrAfter { remaining: 1024 };
+
+        let sim = thread::spawn(move || simulate_aligner(stdin_r, replay, stdout_w));
+
+        // Caller mimics AlignAndMerge: feed some FASTQ, then read stdout to EOF
+        // (released by the emitter's drop(stdout) on error), then close stdin.
+        let caller = thread::spawn(move || {
+            let _ = stdin_w.write_all(&[0x40u8; 4096]);
+            let mut got = Vec::new();
+            let _ = stdout_r.read_to_end(&mut got);
+            drop(stdin_w);
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !(sim.is_finished() && caller.is_finished()) {
+            assert!(Instant::now() < deadline, "simulate aligner hung on emit error");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let res = sim.join().expect("sim thread");
+        caller.join().expect("caller thread");
+        assert!(res.is_err(), "emit error must surface as Err, got {res:?}");
+    }
 
     #[test]
     fn streams_replay_verbatim_and_drains_stdin() {
