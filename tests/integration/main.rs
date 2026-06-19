@@ -39,6 +39,8 @@ mod test_simplex_command;
 mod test_simplex_metrics_command;
 #[cfg(feature = "simplex")]
 mod test_simplex_pipeline;
+#[cfg(feature = "simulate")]
+mod test_simulate_aligner;
 mod test_simulate_sort;
 mod test_sort_correctness;
 mod test_sort_write_index;
