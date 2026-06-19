@@ -13,8 +13,9 @@ Generate synthetic sequencing data for testing and benchmarking the fgumi pipeli
 | `fgumi simulate grouped-reads` | Template-coord sorted BAM with MI tags | Input for `simplex`/`duplex`/`codec` | Required |
 | `fgumi simulate consensus-reads` | Mapped BAM with consensus tags | Input for `filter` | Required |
 | `fgumi simulate correct-reads` | Unmapped BAM + includelist | Input for `correct` | Not used |
+| `fgumi simulate aligner` | Replays a pre-captured aligned BAM to stdout | Fake aligner for `runall --aligner::command` | Not used |
 
-**Note:** All simulate subcommands (except `correct-reads`) require `--reference` / `-r` pointing to a reference FASTA file. Positions are sampled from real chromosomes, template sequences are extracted from the reference, and BAM headers contain actual contig names and lengths. Read orientations are a 50/50 mix of F1R2 and R1F2 (strand coin flip per molecule).
+**Note:** The data-generating simulate subcommands (all except `correct-reads` and `aligner`) require `--reference` / `-r` pointing to a reference FASTA file. Positions are sampled from real chromosomes, template sequences are extracted from the reference, and BAM headers contain actual contig names and lengths. Read orientations are a 50/50 mix of F1R2 and R1F2 (strand coin flip per molecule).
 
 ---
 
@@ -608,3 +609,32 @@ fgumi simulate mapped-reads \
 ```
 
 This creates the kind of position-clustered data that stresses the UMI assignment algorithm and tests the MIH optimization path in `group`.
+
+## fgumi simulate aligner
+
+A fake streaming aligner for benchmarking `fgumi runall`'s align stage. It is
+invoked as the aligner subprocess via `--aligner::command`: it drains the
+interleaved FASTQ on stdin (discarding it) while concurrently streaming a
+pre-captured aligned BAM (`--replay-bam`) verbatim to stdout. Reading and
+writing run on independent threads, so it never deadlocks the caller's align
+stage the way a single-threaded lockstep replay does. It does no real
+alignment — it replays alignments captured earlier (e.g. by `bwa mem`).
+
+### Usage
+
+```bash
+fgumi runall --start-from extract --stop-after filter \
+    ... \
+    --aligner::command "fgumi simulate aligner --replay-bam sample.aligned.bam {ref}"
+```
+
+### Arguments
+
+- `--replay-bam <BAM>` (required): pre-captured aligned BAM to stream back. Must
+  be in input / queryname-grouped order (as `bwa mem` emits it), since
+  `AlignAndMerge` regroups records into templates by queryname. Streamed
+  verbatim — header first, every record (including secondary/supplementary) in
+  stored order.
+- Trailing positional tokens (e.g. the `{ref}` / `{threads}` a command template
+  substitutes) are accepted and ignored, so the command is a drop-in for
+  real-aligner templates.
