@@ -154,6 +154,31 @@ impl PairRawFastq {
     }
 }
 
+/// Decide which input branches to pull this dispatch, given backpressure state.
+///
+/// Returns `(pull_a, pull_b)`. The pending-pair buffer must be byte-bounded, but
+/// bounding it by globally refusing to pull deadlocks: when one FASTQ stream
+/// races ahead, the buffer fills with its unmatched chunks, and the chunk needed
+/// to complete the lowest pending pair sits unpulled in the *behind* stream's
+/// queue. So under backpressure we still pull whichever stream is missing from
+/// the front (lowest pending) pair — the pull that lets the front pair emit and
+/// the buffer drain — and throttle only the stream that is already ahead.
+///
+/// - Not over the limit → pull both (normal streaming).
+/// - Over the limit, front pair missing a slot → pull only that (behind) stream.
+/// - Over the limit, front pair already complete (or no pending) → pull neither;
+///   the caller drains via `try_emit_complete` instead of accumulating more.
+fn pull_decision(
+    over_backpressure: bool,
+    front_missing_a: bool,
+    front_missing_b: bool,
+) -> (bool, bool) {
+    if !over_backpressure {
+        return (true, true);
+    }
+    (front_missing_a, front_missing_b)
+}
+
 impl Step2 for PairRawFastq {
     type InputA = FastqRawChunk;
     type InputB = FastqRawChunk;
@@ -201,7 +226,9 @@ impl Step2 for PairRawFastq {
         }
 
         // 2. Catastrophic-desync guard: one stream producing far more data
-        //    than its counterpart balloons the partial-pair buffer.
+        //    than its counterpart balloons the partial-pair buffer. With the
+        //    per-stream backpressure below this should never trip (the ahead
+        //    stream is throttled at 1x), but keep it as a safety net.
         if self.pending_total_bytes > 2 * self.pending_backpressure_bytes {
             return Err(io::Error::other(format!(
                 "PairRawFastq: catastrophic stream desync — pending buffer ({} bytes) \
@@ -210,39 +237,43 @@ impl Step2 for PairRawFastq {
                 self.pending_total_bytes, self.pending_backpressure_bytes
             )));
         }
-        // Soft backpressure: stop pulling new chunks until the buffer drains.
-        if self.pending_total_bytes > self.pending_backpressure_bytes {
-            log::warn!(
-                "PairRawFastq: pending buffer exceeds backpressure limit ({} > {})",
-                self.pending_total_bytes,
-                self.pending_backpressure_bytes
-            );
-            if let Some(pair) = self.try_emit_complete() {
-                if let Err(unpushed) = ctx.outputs.push(pair) {
-                    self.held.put(unpushed);
-                }
-                return Ok(StepOutcome::Progress);
-            }
-            return Ok(StepOutcome::NoProgress);
-        }
 
-        // 3. Drain available chunks from both branches and emit every pair we
-        //    can in this dispatch. Doing this in a loop (rather than one chunk
-        //    per call) amortizes the Serial mutex / dispatch overhead and keeps
-        //    the downstream Parallel `ParseAndZipFastq` workers fed — a single
-        //    pair per call throttles the whole FASTQ front-end at low
-        //    `--threads` where few workers are free to drive this step.
+        // 3. Drain available chunks and emit every pair we can in this dispatch.
+        //    Doing this in a loop (rather than one chunk per call) amortizes the
+        //    Serial mutex / dispatch overhead and keeps the downstream Parallel
+        //    `ParseAndZipFastq` workers fed.
+        //
+        //    Backpressure is PER-STREAM, not global: once the pending buffer is
+        //    over the limit we keep pulling whichever stream is missing from the
+        //    lowest pending pair (the pull that completes it and drains the
+        //    buffer) and throttle only the stream that is ahead. Globally
+        //    refusing to pull here deadlocks — the completing chunk sits unpulled
+        //    in the behind stream's full queue while the buffer never drains
+        //    (a fast aligner makes the front-end run fast enough to desync the
+        //    R1/R2 readers past the limit and trip this).
         let mut pulled = false;
         let mut emitted = false;
         loop {
+            let over_backpressure = self.pending_total_bytes > self.pending_backpressure_bytes;
+            let (front_missing_a, front_missing_b) = match self.pending.values().next() {
+                Some((a, b)) => (a.is_none(), b.is_none()),
+                None => (false, false),
+            };
+            let (pull_a, pull_b) =
+                pull_decision(over_backpressure, front_missing_a, front_missing_b);
+
             let mut pulled_this_iter = false;
-            if let Some(chunk) = ctx.a.pop() {
-                self.buffer_chunk(chunk, /* is_a */ true);
-                pulled_this_iter = true;
+            if pull_a {
+                if let Some(chunk) = ctx.a.pop() {
+                    self.buffer_chunk(chunk, /* is_a */ true);
+                    pulled_this_iter = true;
+                }
             }
-            if let Some(chunk) = ctx.b.pop() {
-                self.buffer_chunk(chunk, /* is_a */ false);
-                pulled_this_iter = true;
+            if pull_b {
+                if let Some(chunk) = ctx.b.pop() {
+                    self.buffer_chunk(chunk, /* is_a */ false);
+                    pulled_this_iter = true;
+                }
             }
             pulled |= pulled_this_iter;
 
@@ -313,6 +344,28 @@ mod tests {
         // deterministic ordinal for clarity.
         let ordinal = chunk_serial * 2 + stream_idx as u64;
         FastqRawChunk { ordinal, stream_idx, chunk_serial, data: data.to_vec() }
+    }
+
+    #[test]
+    fn pull_decision_pulls_both_when_not_backpressured() {
+        assert_eq!(pull_decision(false, true, true), (true, true));
+        assert_eq!(pull_decision(false, false, false), (true, true));
+    }
+
+    #[test]
+    fn pull_decision_under_backpressure_pulls_only_the_behind_stream() {
+        // The deadlock fix: when over the limit and the front pair is missing
+        // B, we MUST still pull B (the behind stream) so the pair can complete
+        // and the buffer drain — never refuse the completing pull.
+        assert_eq!(pull_decision(true, false, true), (false, true), "missing B → pull B only");
+        assert_eq!(pull_decision(true, true, false), (true, false), "missing A → pull A only");
+    }
+
+    #[test]
+    fn pull_decision_under_backpressure_with_complete_front_pulls_neither() {
+        // Front pair is complete; draining (emit) is the way forward, not pulling
+        // more — so throttle both streams.
+        assert_eq!(pull_decision(true, false, false), (false, false));
     }
 
     #[test]
