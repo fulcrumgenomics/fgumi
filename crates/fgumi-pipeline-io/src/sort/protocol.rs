@@ -1,31 +1,5 @@
 //! Typed-event protocol between the three sort steps in the runall-sort
 //! fused chain.
-//!
-//! ```text
-//! [RecordBatch] → SortAndSpill ──SortPhase1Event──> SortSpillDecompress ──SortPhase2Event──> SortMerge → [RecordBatch]
-//!                   (Serial)        (Parallel)                                                    (Serial)
-//! ```
-//!
-//! v4 design: Decompressed BGZF block bytes do NOT flow on the typed
-//! event chain. They live exclusively in `slot.decompressed` (per-slot
-//! bounded queue on `SortMergeSlot`); `SortSpillDecompress` pushes,
-//! `SortMerge` pops. The events on the chain carry only:
-//!
-//! * `SpillReady` — registers a slot (with `Arc<SortMergeSlot>`) for
-//!   `SortSpillDecompress` to operate on AND for `SortMerge` to install
-//!   in its slot table.
-//! * `MemoryChunk` — residual in-memory chunk emitted by `SortAndSpill`'s
-//!   drained-completion path; nothing for `SortSpillDecompress` to do
-//!   (forwarded verbatim).
-//! * `AllAnnounced` — sentinel emitted LAST by `SortAndSpill`. Carries
-//!   the final counts so `SortMerge` can transition to `Merging` as
-//!   soon as it has received the announced slot/chunk count, without
-//!   waiting for `ctx.input.is_drained()` (which would require upstream
-//!   workers to Skip themselves first — see
-//!   `docs/design/sort-step-split-parity-fix.md`).
-//!
-//! See `docs/design/sort-step-split-parity-fix.md` for the full
-//! locked design and rationale.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,25 +9,13 @@ use fgumi_sort::{
     RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, SortMergeSlot, TemplateKey,
 };
 
-use crate::pipeline::core::item::HeapSize;
+use fgumi_pipeline_core::item::HeapSize;
 
-/// Approximate fixed overhead of a `Vec<(K, RawRecord)>` entry (key + record
-/// header). Used by `MemoryChunkErased::heap_size` to estimate buffer-bounded
-/// queue pressure when a memory chunk flows through the typed chain.
-///
-/// Conservatively chosen to match the per-record memory budget used by
-/// `RawExternalSorter` for spill triggering (`bytes_per_record = 354` in the
-/// sort engine). Slightly over-counting is harmless — under-counting risks
-/// queue overshoot.
+/// Approximate fixed overhead of a `Vec<(K, RawRecord)>` entry.
 const PER_MEMORY_RECORD_OVERHEAD: usize = 354;
 
 /// In-memory sorted residual chunk produced by `SortAndSpill`, type-erased
-/// over the sort-key variant `K` so it can flow through the typed-event
-/// chain without `K` leaking into step signatures.
-///
-/// `SortMerge` is constructed with `sort_order` known statically; it
-/// `match`es on the variant to recover the typed `Vec<(K, RawRecord)>` for
-/// `MergeDriver::from_slots`'s `memory_chunks` argument.
+/// over the sort-key variant `K`.
 pub enum MemoryChunkErased {
     /// Coordinate-sort residual. `K = RawCoordinateKey`.
     Coordinate(Vec<(RawCoordinateKey, RawRecord)>),
@@ -83,10 +45,7 @@ impl MemoryChunkErased {
         self.len() == 0
     }
 
-    /// Approximate heap footprint in bytes. Sum of each record's payload
-    /// length plus a fixed per-entry overhead approximating `K + RawRecord`
-    /// inline-struct cost. Used by `HeapSize` for byte-bounded queue
-    /// accounting.
+    /// Approximate heap footprint in bytes.
     #[must_use]
     pub fn approx_heap_bytes(&self) -> usize {
         let (count, payload): (usize, usize) = match self {
@@ -109,67 +68,55 @@ impl MemoryChunkErased {
 
 /// Events from `SortAndSpill` → `SortSpillDecompress`.
 pub enum SortPhase1Event {
-    /// A spill chunk file has been closed and is ready for Phase 2
-    /// decompression. Carries the per-file shared state, the on-disk
-    /// path (informational), and a snapshot of
-    /// `records_ingested_so_far` at spill-close.
+    /// A spill chunk file has been closed and is ready for Phase 2 decompression.
     SpillReady { slot: Arc<SortMergeSlot>, path: PathBuf, records_ingested_so_far: u64 },
     /// A par-sorted residual in-memory chunk produced by `SortAndSpill`'s
-    /// drained-completion path. Forwarded by `SortSpillDecompress` to
-    /// `SortMerge` (no decompression needed).
+    /// drained-completion path.
     MemoryChunk { chunk: Arc<MemoryChunkErased>, records_ingested_so_far: u64 },
-    /// Sentinel emitted as the LAST event by `SortAndSpill`'s drained-completion
-    /// path (after all `SpillReady` and `MemoryChunk` events). Carries the final
-    /// counts so `SortMerge`
-    /// can transition to `Merging` early — without waiting for
-    /// `ctx.input.is_drained()`. See
-    /// `docs/design/sort-step-split-parity-fix.md` Change 1.
+    /// Sentinel emitted as the LAST event by `SortAndSpill`'s drained-completion path.
     AllAnnounced { slot_count: u32, memory_chunk_count: u32, total_records: u64 },
 }
 
 impl HeapSize for SortPhase1Event {
     fn heap_size(&self) -> usize {
+        // Charge a fixed per-event base so the byte-bounded transport queues
+        // cannot accept an unbounded count of near-zero-cost control events
+        // (`SpillReady` with an empty path, `AllAnnounced`). Memory stays a
+        // function of configuration rather than event count.
+        let base = std::mem::size_of::<Self>();
         match self {
-            Self::SpillReady { path, .. } => path.as_os_str().len(),
-            Self::MemoryChunk { chunk, .. } => chunk.approx_heap_bytes(),
-            // Three small numeric fields plus the discriminant.
-            Self::AllAnnounced { .. } => 0,
+            Self::SpillReady { path, .. } => base + path.as_os_str().len(),
+            Self::MemoryChunk { chunk, .. } => base + chunk.approx_heap_bytes(),
+            Self::AllAnnounced { .. } => base,
         }
     }
 }
 
 /// Events from `SortSpillDecompress` → `SortMerge`.
-///
-/// Same shape as `SortPhase1Event`; `SortSpillDecompress` forwards all
-/// three variants verbatim. (Decompressed Block bytes do NOT flow on
-/// this chain — they live in `slot.decompressed`.)
 pub enum SortPhase2Event {
-    /// Forwarded `SortPhase1Event::SpillReady` — registers the slot in
-    /// `SortMerge`'s slot table.
+    /// Forwarded `SortPhase1Event::SpillReady`.
     SpillReady { slot: Arc<SortMergeSlot>, path: PathBuf, records_ingested_so_far: u64 },
-    /// Forwarded `SortPhase1Event::MemoryChunk`. `SortMerge` consumes
-    /// these directly as `ChunkSource::Memory` sources in
-    /// `MergeDriver::from_slots`.
+    /// Forwarded `SortPhase1Event::MemoryChunk`.
     MemoryChunk { chunk: Arc<MemoryChunkErased>, records_ingested_so_far: u64 },
-    /// Forwarded `SortPhase1Event::AllAnnounced`. Gates `SortMerge`'s
-    /// early transition from `WaitingForSetup` to `Merging`.
+    /// Forwarded `SortPhase1Event::AllAnnounced`.
     AllAnnounced { slot_count: u32, memory_chunk_count: u32, total_records: u64 },
 }
 
 impl HeapSize for SortPhase2Event {
     fn heap_size(&self) -> usize {
+        // See `SortPhase1Event::heap_size`: a fixed per-event base keeps the
+        // byte-bounded queues from absorbing unbounded control-event counts.
+        let base = std::mem::size_of::<Self>();
         match self {
-            Self::SpillReady { path, .. } => path.as_os_str().len(),
-            Self::MemoryChunk { chunk, .. } => chunk.approx_heap_bytes(),
-            Self::AllAnnounced { .. } => 0,
+            Self::SpillReady { path, .. } => base + path.as_os_str().len(),
+            Self::MemoryChunk { chunk, .. } => base + chunk.approx_heap_bytes(),
+            Self::AllAnnounced { .. } => base,
         }
     }
 }
 
 impl SortPhase1Event {
-    /// Running snapshot of records ingested at the moment this event was
-    /// emitted. `SortMerge` takes `max()` over all popped events to recover
-    /// the final `total_records` count.
+    /// Running snapshot of records ingested at the moment this event was emitted.
     #[must_use]
     pub fn records_ingested_so_far(&self) -> u64 {
         match self {
@@ -263,18 +210,21 @@ mod tests {
     }
 
     #[test]
-    fn all_announced_heap_size_is_zero() {
+    fn all_announced_heap_size_charges_base_cost() {
+        // Control events carry no heap payload but must still cost a fixed,
+        // non-zero amount so the byte-bounded queues cannot accept an unbounded
+        // count of them.
         let ev1 = SortPhase1Event::AllAnnounced {
             slot_count: 16,
             memory_chunk_count: 4,
             total_records: 1_000_000,
         };
-        assert_eq!(ev1.heap_size(), 0);
+        assert_eq!(ev1.heap_size(), std::mem::size_of::<SortPhase1Event>());
         let ev2 = SortPhase2Event::AllAnnounced {
             slot_count: 16,
             memory_chunk_count: 4,
             total_records: 1_000_000,
         };
-        assert_eq!(ev2.heap_size(), 0);
+        assert_eq!(ev2.heap_size(), std::mem::size_of::<SortPhase2Event>());
     }
 }

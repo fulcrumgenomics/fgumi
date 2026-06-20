@@ -412,19 +412,6 @@ pub struct ThreadingOptions {
     pub threads: Option<usize>,
 }
 
-/// Options for output compression.
-///
-/// Controls BGZF compression level for BAM output files.
-#[derive(Debug, Clone, Default, Args)]
-pub struct CompressionOptions {
-    /// Compression level for output BAM (1-12).
-    ///
-    /// Level 1 is fastest with larger files.
-    /// Level 12 produces smallest files but is slowest.
-    #[arg(long, default_value_t = 1)]
-    pub compression_level: u32,
-}
-
 /// Pipeline debugging/diagnostics options: statistics output, deadlock
 /// timeout, and deadlock recovery. Flattened into every pipeline command.
 ///
@@ -560,224 +547,14 @@ impl ThreadingOptions {
 // in lockstep.
 //////////////////////////////////////////////////////////////////////////////
 
-/// A memory limit, either auto-detected from the host or a fixed byte count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemoryLimit {
-    /// Detect the (cgroup-aware) host memory and subtract the reserve.
-    Auto,
-    /// Use a fixed memory limit in bytes.
-    Fixed(usize),
-}
-
-impl Default for MemoryLimit {
-    /// Matches the clap `default_value = "768MiB"` on `SortOptions::max_memory`.
-    fn default() -> Self {
-        Self::Fixed(768 * 1024 * 1024)
-    }
-}
-
-impl std::fmt::Display for MemoryLimit {
-    /// Round-trips through [`parse_memory`]. `Fixed(N)` is rendered in the
-    /// largest binary unit that divides cleanly (`GiB` → `MiB` → `KiB` → `B`)
-    /// so `--help` shows e.g. `"768MiB"` rather than `"805306368B"`.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Auto => f.write_str("auto"),
-            Self::Fixed(bytes) => format_binary_bytes(*bytes, f),
-        }
-    }
-}
-
-/// How much memory to reserve for other processes (OS, aligners, etc.) when a
-/// memory limit is set to [`MemoryLimit::Auto`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemoryReserve {
-    /// Automatic: `min(10 GiB, 50% of host memory)`.
-    Auto,
-    /// Reserve a fixed number of bytes.
-    Fixed(usize),
-}
-
-impl Default for MemoryReserve {
-    /// Matches the clap `default_value = "auto"` on `SortOptions::memory_reserve`.
-    fn default() -> Self {
-        Self::Auto
-    }
-}
-
-impl std::fmt::Display for MemoryReserve {
-    /// Round-trips through [`parse_memory_reserve`]. See [`MemoryLimit`]'s
-    /// `Display` for the formatting rule.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Auto => f.write_str("auto"),
-            Self::Fixed(bytes) => format_binary_bytes(*bytes, f),
-        }
-    }
-}
-
-/// Format a byte count in the largest binary unit that divides cleanly
-/// (`G` → `M` → `K` → `B`). Used by [`MemoryLimit`]'s and [`MemoryReserve`]'s
-/// `Display` so that [`parse_memory`] / [`parse_memory_reserve`] round-trip the
-/// result.
-fn format_binary_bytes(bytes: usize, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    const K: usize = 1024;
-    const M: usize = K * 1024;
-    const G: usize = M * 1024;
-    // Emit binary (Mi/Gi) suffixes: `parse_memory` reads bare `M`/`G` as
-    // *decimal* (1000ⁿ) and only `MiB`/`GiB` as binary (1024ⁿ), so a bare
-    // suffix here would not round-trip a binary value.
-    if bytes >= G && bytes.is_multiple_of(G) {
-        write!(f, "{}GiB", bytes / G)
-    } else if bytes >= M && bytes.is_multiple_of(M) {
-        write!(f, "{}MiB", bytes / M)
-    } else if bytes >= K && bytes.is_multiple_of(K) {
-        write!(f, "{}KiB", bytes / K)
-    } else {
-        write!(f, "{bytes}B")
-    }
-}
-
-/// The minimum per-thread memory budget (256 MiB).
-pub(crate) const MIN_MEMORY_PER_THREAD: usize = 256 * 1024 * 1024;
-
-/// Default auto-reserve cap: 10 GiB.
-pub(crate) const AUTO_RESERVE_CAP: usize = 10 * 1024 * 1024 * 1024;
-
-/// Parse a memory size string into `usize` bytes, suitable for use in clap
-/// value parsers.
-///
-/// Delegates to [`parse_memory_size`] for numeric parsing. Plain numbers are
-/// interpreted as MiB (e.g. "768" = 768 MiB). Supports human-readable formats
-/// like "2GB", "1GiB", "512MiB". See [`parse_memory_size`] for full details.
-fn parse_memory_bytes(s: &str, label: &str) -> Result<usize, String> {
-    let bytes = parse_memory_size(s).map_err(|e| e.to_string())?;
-    usize::try_from(bytes).map_err(|_| format!("{label} too large: {bytes}"))
-}
-
-/// Parse a memory-limit string (e.g. "512M", "1G", "768", "auto").
-pub(crate) fn parse_memory(s: &str) -> Result<MemoryLimit, String> {
-    let s = s.trim();
-    if s.eq_ignore_ascii_case("auto") {
-        return Ok(MemoryLimit::Auto);
-    }
-    Ok(MemoryLimit::Fixed(parse_memory_bytes(s, "Memory size")?))
-}
-
-/// Parse a memory-reserve string (e.g. "10G", "auto").
-pub(crate) fn parse_memory_reserve(s: &str) -> Result<MemoryReserve, String> {
-    let s = s.trim();
-    if s.eq_ignore_ascii_case("auto") {
-        return Ok(MemoryReserve::Auto);
-    }
-    Ok(MemoryReserve::Fixed(parse_memory_bytes(s, "Memory reserve")?))
-}
-
-/// Resolve a [`MemoryReserve`] to a concrete byte count given total host memory.
-pub(crate) fn resolve_reserve(reserve: MemoryReserve, total_memory: usize) -> usize {
-    match reserve {
-        MemoryReserve::Fixed(bytes) => bytes,
-        // min(10 GiB, 50% of host memory)
-        MemoryReserve::Auto => AUTO_RESERVE_CAP.min(total_memory / 2),
-    }
-}
-
-/// Resolve a memory budget to a concrete byte count.
-///
-/// For [`MemoryLimit::Auto`]: detects total host memory (cgroup-aware via
-/// [`detect_total_memory`]), subtracts the reserve, and—when `per_thread` is
-/// set—targets each thread's share with a 256 MiB floor. The result is then
-/// **capped to the available (post-reserve) memory**, so the floor can never
-/// push the total past what the host has. The reserve makes the budget shrink
-/// to fit the host, which is what lets pipeline commands self-throttle instead
-/// of OOM-ing.
-///
-/// For [`MemoryLimit::Fixed`]: multiplies by `threads` when `per_thread` is set;
-/// the reserve and host size are ignored.
-///
-/// Calls [`detect_total_memory`] exactly once (it invokes `sysinfo`, which is
-/// not free).
-pub(crate) fn resolve_memory_budget(
-    limit: MemoryLimit,
-    reserve: MemoryReserve,
-    threads: usize,
-    per_thread: bool,
-) -> anyhow::Result<usize> {
-    // Call once — detect_total_memory() invokes sysinfo, which is not free.
-    resolve_memory_budget_with_total(limit, reserve, threads, per_thread, detect_total_memory())
-}
-
-/// Pure resolver behind [`resolve_memory_budget`], with `total` (host memory)
-/// injected so the `Auto` math is unit-testable on simulated small hosts.
-fn resolve_memory_budget_with_total(
-    limit: MemoryLimit,
-    reserve: MemoryReserve,
-    threads: usize,
-    per_thread: bool,
-    total: usize,
-) -> anyhow::Result<usize> {
-    if threads == 0 {
-        anyhow::bail!("--threads must be at least 1");
-    }
-
-    let budget = match limit {
-        MemoryLimit::Fixed(bytes) => {
-            if per_thread {
-                bytes
-                    .checked_mul(threads)
-                    .ok_or_else(|| anyhow::anyhow!("memory limit × {threads} threads overflowed"))?
-            } else {
-                bytes
-            }
-        }
-        MemoryLimit::Auto => {
-            let margin = resolve_reserve(reserve, total);
-            let available = total.saturating_sub(margin);
-            // The per-thread floor is a *target*, not a guarantee. On a small
-            // host (or high thread count) the floor-based budget can exceed what
-            // is actually available; cap it to `available` so `auto` truly
-            // self-throttles instead of multiplying the floor past physical
-            // memory — the exact OOM this feature exists to prevent (#380).
-            let target = if per_thread {
-                (available / threads)
-                    .max(MIN_MEMORY_PER_THREAD)
-                    .checked_mul(threads)
-                    .ok_or_else(|| anyhow::anyhow!("auto memory budget overflowed"))?
-            } else {
-                available.max(MIN_MEMORY_PER_THREAD)
-            };
-            let budget = target.min(available);
-            if budget < target {
-                log::warn!(
-                    "Auto memory: capping budget to host-available {} (minimum viable target {} \
-                     exceeds it after reserve {}); throughput may drop but the run stays within memory",
-                    ByteSize(budget as u64),
-                    ByteSize(target as u64),
-                    ByteSize(margin as u64),
-                );
-            }
-            log::debug!(
-                "Auto memory: {} of {} ({}/thread × {} threads, reserve {})",
-                ByteSize(budget as u64),
-                ByteSize(total as u64),
-                ByteSize((budget / threads) as u64),
-                threads,
-                ByteSize(margin as u64),
-            );
-            budget
-        }
-    };
-
-    if budget > total {
-        log::warn!(
-            "Memory budget {} exceeds total host memory {}; this may cause OOM (or, for sort, earlier spill-to-disk)",
-            ByteSize(budget as u64),
-            ByteSize(total as u64),
-        );
-    }
-
-    Ok(budget)
-}
+// The memory-limit types, parsers, and resolution logic now live in the
+// `fgumi-cli-common` crate. Re-export them so `crate::commands::common::*`
+// paths keep resolving AND so there is ONE `MemoryLimit`/`MemoryReserve`
+// type shared with `fgumi-sort-cli`'s `SortOptions` (type unification).
+pub use fgumi_cli_common::{
+    MIN_MEMORY_PER_THREAD, MemoryLimit, MemoryReserve, parse_bool, parse_memory,
+    parse_memory_reserve, resolve_memory_budget, resolve_reserve,
+};
 
 /// Options for pipeline queue memory limits.
 ///
@@ -965,17 +742,18 @@ impl QueueMemoryOptions {
     }
 }
 
-/// Parses a boolean value from a string, accepting: true/false, yes/no, y/n, t/f
-/// (case-insensitive). Matches sopt/fgbio behavior.
-pub(crate) fn parse_bool(s: &str) -> Result<bool, String> {
-    match s.to_ascii_lowercase().as_str() {
-        "true" | "t" | "yes" | "y" => Ok(true),
-        "false" | "f" | "no" | "n" => Ok(false),
-        _ => Err(format!("Invalid boolean value '{s}'. Expected: true|false|yes|no|y|n|t|f")),
-    }
-}
+// `parse_bool` is re-exported from `fgumi_cli_common` above.
+
+// Output compression options now live in `fgumi-cli-common`; re-export so
+// `crate::commands::common::CompressionOptions` keeps resolving and is the
+// same type as `fgumi-sort-cli`'s `Sort::compression`.
+pub use fgumi_cli_common::CompressionOptions;
 
 // Re-export from the library crate for backward compatibility.
+// Now only the module's own tests reference `detect_total_memory` (the memory
+// resolvers that used it moved to `fgumi-cli-common`), so gate the import to
+// test builds to avoid an unused-import warning in the library build.
+#[cfg(test)]
 pub(crate) use crate::system::detect_total_memory;
 pub use crate::validation::parse_memory_size;
 
@@ -1079,16 +857,6 @@ pub fn run_new_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Enable an at-Trace logger so `log::warn!`/`debug!` macros evaluate their
-    /// arguments — without an enabled logger the `log` crate skips argument
-    /// evaluation, leaving the formatting expressions inside the memory-budget
-    /// warn/debug branches unexecuted under test. nextest runs each test in its
-    /// own process, so `try_init` is local and idempotent.
-    fn enable_logging() {
-        let _ =
-            env_logger::builder().is_test(true).filter_level(log::LevelFilter::Trace).try_init();
-    }
 
     #[test]
     fn test_none_is_single_threaded() {
@@ -1313,61 +1081,12 @@ mod tests {
         assert!(result <= total, "auto budget {result} exceeded host total {total}");
     }
 
-    #[test]
-    fn test_auto_never_oversubscribes_small_host() {
-        enable_logging(); // exercise the cap-warning and auto-debug log branches
-        // Simulated 4 GiB host, 16 threads: the 256 MiB/thread floor would want
-        // 4 GiB before reserve, which cannot fit after the auto reserve. The
-        // budget must be capped to `available`, never `floor × threads`.
-        let total = 4 * 1024 * 1024 * 1024; // 4 GiB
-        let margin = resolve_reserve(MemoryReserve::Auto, total); // min(10 GiB, 2 GiB) = 2 GiB
-        let available = total - margin;
-        let budget = resolve_memory_budget_with_total(
-            MemoryLimit::Auto,
-            MemoryReserve::Auto,
-            16,
-            true,
-            total,
-        )
-        .expect("should resolve");
-        assert!(budget <= available, "budget {budget} oversubscribed available {available}");
-        assert!(budget <= total, "budget {budget} oversubscribed host {total}");
-    }
-
-    #[test]
-    fn test_auto_uses_floor_when_host_is_ample() {
-        // Simulated 256 GiB host, 4 threads: plenty of room, so the budget is
-        // the per-thread share and stays under available.
-        let total = 256 * 1024 * 1024 * 1024;
-        let margin = resolve_reserve(MemoryReserve::Auto, total); // 10 GiB cap
-        let available = total - margin;
-        let budget = resolve_memory_budget_with_total(
-            MemoryLimit::Auto,
-            MemoryReserve::Auto,
-            4,
-            true,
-            total,
-        )
-        .expect("should resolve");
-        assert!(budget >= MIN_MEMORY_PER_THREAD * 4, "budget {budget} fell below the floor");
-        assert!(budget <= available, "budget {budget} exceeded available {available}");
-    }
-
-    #[test]
-    fn test_fixed_budget_independent_of_host() {
-        enable_logging(); // exercise the "budget exceeds host total" warn branch
-        // Fixed limits ignore host size entirely (reserve is irrelevant).
-        let tiny_host = 512 * 1024 * 1024;
-        let budget = resolve_memory_budget_with_total(
-            MemoryLimit::Fixed(2 * 1024 * 1024 * 1024),
-            MemoryReserve::Auto,
-            4,
-            false,
-            tiny_host,
-        )
-        .expect("should resolve");
-        assert_eq!(budget, 2 * 1024 * 1024 * 1024);
-    }
+    // NOTE: `test_auto_never_oversubscribes_small_host`,
+    // `test_auto_uses_floor_when_host_is_ample`, and
+    // `test_fixed_budget_independent_of_host` exercised the (now-private)
+    // `resolve_memory_budget_with_total` helper, which moved to
+    // `fgumi-cli-common` along with the resolver itself. Their coverage lives
+    // in that crate's unit tests now.
 
     #[test]
     fn test_queue_memory_auto_reserve_shrinks_budget() {
@@ -1467,19 +1186,8 @@ mod tests {
         assert!(opts.calculate_memory_limit(4).is_err());
     }
 
-    #[test]
-    fn test_auto_per_thread_overflow_is_error() {
-        // A pathological thread count makes the per-thread floor × threads
-        // overflow; this must surface as an error, not wrap.
-        let result = resolve_memory_budget_with_total(
-            MemoryLimit::Auto,
-            MemoryReserve::Auto,
-            usize::MAX,
-            true,
-            1024 * 1024 * 1024,
-        );
-        assert!(result.is_err());
-    }
+    // `test_auto_per_thread_overflow_is_error` moved to `fgumi-cli-common`
+    // with the `resolve_memory_budget_with_total` helper it exercised.
 
     #[test]
     fn test_log_memory_config_exercises_both_branches() {

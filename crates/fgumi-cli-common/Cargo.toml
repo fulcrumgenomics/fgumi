@@ -1,0 +1,21 @@
+[package]
+name = "fgumi-cli-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Shared CLI types and helpers for fgumi commands"
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.102"
+bytesize = "2.3"
+clap = { version = "4", features = ["derive", "string"] }
+enum_dispatch = "0.3.13"
+log = "0"
+num_cpus = "1.16"
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+thiserror = "2"
+
+[dev-dependencies]
+rstest = "0"

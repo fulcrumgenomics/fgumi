@@ -1,0 +1,31 @@
+[package]
+name = "fgumi-sort-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Standalone fgumi sort CLI command (framework-light)"
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+fgumi-bam-io = { workspace = true }
+fgumi-cli-common = { workspace = true }
+fgumi-cli-macros = { workspace = true }
+fgumi-pipeline-core = { workspace = true }
+fgumi-pipeline-io = { workspace = true }
+fgumi-sam = { workspace = true }
+fgumi-sort = { workspace = true }
+anyhow = "1.0.102"
+bytesize = "2.3"
+clap = { version = "4", features = ["derive", "string"] }
+log = "0"
+noodles = { version = "0.111.0", features = ["bam", "sam"] }
+parking_lot = "0.12"
+
+[dev-dependencies]
+noodles = { version = "0.111.0", features = ["bam", "sam"] }
+rstest = "0"
+tempfile = "3.4"
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }

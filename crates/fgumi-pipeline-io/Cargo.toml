@@ -1,0 +1,28 @@
+[package]
+name = "fgumi-pipeline-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "BAM pipeline I/O types and steps for fgumi"
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+fgumi-bam-io = { workspace = true }
+fgumi-bgzf = { workspace = true }
+fgumi-pipeline-core = { workspace = true }
+fgumi-raw-bam = { workspace = true, features = ["noodles"] }
+fgumi-sort = { workspace = true }
+anyhow = "1.0.102"
+log = "0"
+noodles = { version = "0.111.0", features = ["bam", "sam", "bgzf"] }
+parking_lot = "0.12"
+tempfile = "3.4"
+
+[dev-dependencies]
+fgumi-bam-io = { workspace = true }
+fgumi-raw-bam = { workspace = true, features = ["noodles", "test-utils"] }
+tempfile = "3.4"
+noodles = { version = "0.111.0", features = ["bam", "sam"] }
+fgumi-bgzf = { workspace = true }
+rstest = "0"
