@@ -167,11 +167,13 @@ mod tests {
     use super::*;
     use std::io;
 
+    use rstest::rstest;
+
     use crate::erased::TypedStep;
     use crate::outputs::Single;
     use crate::queues::QueueSpec;
     use crate::reorder::BranchOrdering;
-    use crate::step::{Step, StepCtx, StepOutcome, StepProfile};
+    use crate::step::{Affinity, Step, StepCtx, StepOutcome, StepProfile};
 
     fn profile_for(name: &'static str, kind: StepKind, sticky: bool) -> StepProfile {
         StepProfile {
@@ -272,6 +274,60 @@ mod tests {
         assert!(matches!(entries[1][0], WorkerStepEntry::Skip));
         assert!(matches!(entries[2][0], WorkerStepEntry::Exclusive { .. }));
         assert!(matches!(entries[3][0], WorkerStepEntry::Skip));
+    }
+
+    struct AffinitySerialStep(crate::step::Affinity);
+    impl Step for AffinitySerialStep {
+        type Input = u32;
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            profile_for("AffinitySer", StepKind::Serial, false)
+        }
+        fn affinity(&self) -> crate::step::Affinity {
+            self.0
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::NoProgress)
+        }
+    }
+
+    #[rstest]
+    #[case::reader(Affinity::Reader, 0)]
+    #[case::writer(Affinity::Writer, 2)] // last of 3 workers
+    #[case::worker_idx(Affinity::Worker(1), 1)]
+    fn serial_affinity_eligible_only_for_target_worker(
+        #[case] affinity: Affinity,
+        #[case] eligible: usize,
+    ) {
+        // A Serial step's affinity makes exactly one worker eligible (`Shared`);
+        // every other worker `Skip`s it. Reader→0, Writer→last, Worker(i)→i.
+        let steps: Vec<Box<dyn ErasedStep>> =
+            vec![Box::new(TypedStep::new(AffinitySerialStep(affinity)))];
+        let owners = vec![None];
+        let entries = build_worker_storage(steps, &owners, 3);
+        for (worker, entry) in entries.iter().enumerate() {
+            if worker == eligible {
+                assert!(
+                    matches!(entry[0], WorkerStepEntry::Shared { .. }),
+                    "worker {worker} should be eligible (Shared) for {affinity:?}"
+                );
+            } else {
+                assert!(
+                    matches!(entry[0], WorkerStepEntry::Skip),
+                    "worker {worker} should Skip for {affinity:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Serial step affinity")]
+    fn serial_out_of_range_worker_panics_in_storage() {
+        let steps: Vec<Box<dyn ErasedStep>> =
+            vec![Box::new(TypedStep::new(AffinitySerialStep(Affinity::Worker(99))))];
+        let owners = vec![None];
+        // build_worker_storage checks affinity in range via assert!; should panic.
+        let _ = build_worker_storage(steps, &owners, 3);
     }
 
     #[test]

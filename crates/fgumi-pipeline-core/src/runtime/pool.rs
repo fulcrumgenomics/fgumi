@@ -100,11 +100,13 @@ mod tests {
     use super::*;
     use std::io;
 
+    use rstest::rstest;
+
     use crate::erased::TypedStep;
     use crate::outputs::Single;
     use crate::queues::QueueSpec;
     use crate::reorder::BranchOrdering;
-    use crate::step::{Step, StepCtx, StepOutcome, StepProfile};
+    use crate::step::{Affinity, Step, StepCtx, StepOutcome, StepProfile};
 
     fn stub_step(kind: StepKind) -> Box<dyn ErasedStep> {
         #[derive(Clone)]
@@ -168,5 +170,124 @@ mod tests {
             result,
             Err(PipelineError::NotEnoughThreads { required: 3, available: 2 })
         ));
+    }
+
+    fn sticky_exclusive_step(owner_idx: usize) -> Box<dyn ErasedStep> {
+        #[derive(Clone)]
+        struct StickyExclusive;
+        impl Step for StickyExclusive {
+            type Input = u32;
+            type Outputs = Single<u32>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "StickyExclusive",
+                    kind: StepKind::Exclusive,
+                    sticky: true,
+                    output_queues: vec![QueueSpec::CountBounded { capacity: 4 }],
+                    branch_ordering: vec![BranchOrdering::None],
+                }
+            }
+            fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+                Ok(StepOutcome::NoProgress)
+            }
+            fn new_worker_copy(&self) -> Self {
+                self.clone()
+            }
+        }
+        let _ = owner_idx; // owner_idx used by caller, not embedded in step
+        Box::new(TypedStep::new(StickyExclusive))
+    }
+
+    fn sticky_serial_step(affinity: crate::step::Affinity) -> Box<dyn ErasedStep> {
+        struct StickySerial(crate::step::Affinity);
+        impl Step for StickySerial {
+            type Input = u32;
+            type Outputs = Single<u32>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "StickySerial",
+                    kind: StepKind::Serial,
+                    sticky: true,
+                    output_queues: vec![QueueSpec::CountBounded { capacity: 4 }],
+                    branch_ordering: vec![BranchOrdering::None],
+                }
+            }
+            fn affinity(&self) -> crate::step::Affinity {
+                self.0
+            }
+            fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+                Ok(StepOutcome::NoProgress)
+            }
+        }
+        Box::new(TypedStep::new(StickySerial(affinity)))
+    }
+
+    /// Assert that `sticky` holds `Some(StepIdx(0))` in exactly `expected_slot`
+    /// (when `Some`) and `None` everywhere else across `n_workers` slots.
+    fn assert_only_slot(
+        sticky: &[Option<StepIdx>],
+        n_workers: usize,
+        expected_slot: Option<usize>,
+    ) {
+        for (slot, &got) in sticky.iter().enumerate().take(n_workers) {
+            let want = if Some(slot) == expected_slot { Some(StepIdx(0)) } else { None };
+            assert_eq!(got, want, "slot {slot}; expected owner slot {expected_slot:?}");
+        }
+    }
+
+    #[rstest]
+    #[case::in_range(2, Some(2))]
+    #[case::out_of_range(10, None)]
+    fn sticky_exclusive_owner_maps_to_slot(
+        #[case] owner: usize,
+        #[case] expected_slot: Option<usize>,
+    ) {
+        // A sticky-exclusive step's slot is its (in-range) owner worker; an
+        // out-of-range owner is skipped, leaving every slot empty.
+        let steps = vec![sticky_exclusive_step(0), stub_step(StepKind::Parallel)];
+        let exclusive_owners = vec![Some(owner), None];
+        let sticky = assign_sticky_owners(&steps, &exclusive_owners, 4);
+        assert_only_slot(&sticky, 4, expected_slot);
+    }
+
+    #[test]
+    fn sticky_exclusive_occupied_slot_not_overwritten() {
+        // Two sticky-exclusive steps competing for the same worker slot.
+        let steps = vec![sticky_exclusive_step(0), sticky_exclusive_step(0)];
+        let exclusive_owners = vec![Some(0_usize), Some(0_usize)];
+        let sticky = assign_sticky_owners(&steps, &exclusive_owners, 4);
+        // First step wins; second is skipped because slot[0] is already occupied.
+        assert_eq!(sticky[0], Some(StepIdx(0)));
+    }
+
+    #[rstest]
+    #[case::reader(Affinity::Reader, Some(0))]
+    #[case::writer(Affinity::Writer, Some(3))]
+    #[case::worker_in_range(Affinity::Worker(2), Some(2))]
+    #[case::worker_out_of_range(Affinity::Worker(10), None)]
+    #[case::none(Affinity::None, None)]
+    fn sticky_serial_affinity_maps_to_slot(
+        #[case] affinity: Affinity,
+        #[case] expected_slot: Option<usize>,
+    ) {
+        // Serial affinity resolves to a single worker slot: Reader→0,
+        // Writer→last, Worker(i)→i; an out-of-range Worker index and None are
+        // skipped, leaving every slot empty.
+        let steps = vec![sticky_serial_step(affinity)];
+        let exclusive_owners = vec![None];
+        let sticky = assign_sticky_owners(&steps, &exclusive_owners, 4);
+        assert_only_slot(&sticky, 4, expected_slot);
+    }
+
+    #[test]
+    fn sticky_exclusive_beats_sticky_serial_on_same_slot() {
+        // Exclusive pass runs first; serial pass only fills empty slots.
+        let exc = sticky_exclusive_step(0);
+        let ser = sticky_serial_step(crate::step::Affinity::Reader); // also targets slot 0
+        let steps: Vec<Box<dyn ErasedStep>> = vec![exc, ser];
+        let exclusive_owners = vec![Some(0_usize), None];
+        let sticky = assign_sticky_owners(&steps, &exclusive_owners, 4);
+        // Exclusive (step 0) wins slot 0; Serial (step 1) is blocked.
+        assert_eq!(sticky[0], Some(StepIdx(0)));
     }
 }

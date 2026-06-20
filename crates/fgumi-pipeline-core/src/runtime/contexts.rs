@@ -289,6 +289,9 @@ mod tests {
     use super::*;
     use std::io;
 
+    use proptest::prelude::*;
+    use rstest::rstest;
+
     use crate::erased::TypedStep;
     use crate::outputs::Single;
     use crate::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
@@ -331,18 +334,99 @@ mod tests {
         }
     }
 
-    #[test]
-    fn build_chain_contexts_for_two_step_chain() {
+    /// A `u32 → u32` pass-through step used to grow a linear chain to an
+    /// arbitrary length between the source and sink.
+    #[derive(Clone)]
+    struct MiddleStep;
+    impl Step for MiddleStep {
+        type Input = u32;
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "Middle",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![QueueSpec::CountBounded { capacity: 4 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::NoProgress)
+        }
+    }
+
+    /// Build an `n`-step linear chain `Source → Middle×(n - 2) → Sink`,
+    /// returning the erased step boxes alongside the fully wired graph.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n < 2` (a linear chain needs at least a source and a sink).
+    fn linear_chain(n: usize) -> (Vec<Box<dyn ErasedStep>>, ChainGraph) {
+        assert!(n >= 2, "linear chain needs at least a source and a sink");
+
         let mut graph = ChainGraph::new();
-        let src = graph.register_step("Source", 1);
-        let sink = graph.register_step("Sink", 0);
-        graph.wire(src, BranchIdx(0), sink);
+        let mut steps: Vec<Box<dyn ErasedStep>> = Vec::with_capacity(n);
+        let mut indices: Vec<StepIdx> = Vec::with_capacity(n);
 
-        let steps: Vec<Box<dyn ErasedStep>> =
-            vec![Box::new(TypedStep::new(StubSource)), Box::new(TypedStep::new(StubSink))];
+        indices.push(graph.register_step("Source", 1));
+        steps.push(Box::new(TypedStep::new(StubSource)));
+        for _ in 1..n - 1 {
+            indices.push(graph.register_step("Middle", 1));
+            steps.push(Box::new(TypedStep::new(MiddleStep)));
+        }
+        indices.push(graph.register_step("Sink", 0));
+        steps.push(Box::new(TypedStep::new(StubSink)));
 
+        for pair in indices.windows(2) {
+            graph.wire(pair[0], BranchIdx(0), pair[1]);
+        }
+
+        (steps, graph)
+    }
+
+    /// Assert the invariants `build_chain_contexts` must uphold for an
+    /// `n`-step linear chain: one input/output slot per step, no byte-bounded
+    /// queues (the stubs only use `CountBounded` transport), the source's
+    /// input is a dummy pre-drained `BranchInputHandle<()>`, and every
+    /// downstream step receives a real `BranchInputHandle<u32>` wired from its
+    /// producer.
+    fn assert_linear_chain_invariants(ctx: &ChainContexts, n: usize) {
+        assert_eq!(ctx.inputs.len(), n);
+        assert_eq!(ctx.outputs.len(), n);
+        assert!(ctx.bounded_queues.is_empty());
+
+        assert!(
+            ctx.inputs[0].downcast_ref::<BranchInputHandle<()>>().is_some(),
+            "source must have a dummy unit input handle"
+        );
+        for i in 1..n {
+            assert!(
+                ctx.inputs[i].downcast_ref::<BranchInputHandle<u32>>().is_some(),
+                "downstream step {i} must have a BranchInputHandle<u32> wired from its producer"
+            );
+        }
+    }
+
+    /// `build_chain_contexts` wires linear chains of varying length: the
+    /// three-step case also exercises `find_all_producers` for a middle step.
+    #[rstest]
+    #[case(2)]
+    #[case(3)]
+    #[case(4)]
+    fn build_chain_contexts_linear(#[case] n: usize) {
+        let (steps, graph) = linear_chain(n);
         let ctx = build_chain_contexts(&steps, &graph);
-        assert_eq!(ctx.inputs.len(), 2);
-        assert_eq!(ctx.outputs.len(), 2);
+        assert_linear_chain_invariants(&ctx, n);
+    }
+
+    proptest! {
+        /// The typed-handle and bounded-queue invariants hold for linear
+        /// chains of any length, not just the hand-picked rstest cases.
+        #[test]
+        fn build_chain_contexts_linear_invariants(n in 2usize..=8) {
+            let (steps, graph) = linear_chain(n);
+            let ctx = build_chain_contexts(&steps, &graph);
+            assert_linear_chain_invariants(&ctx, n);
+        }
     }
 }
