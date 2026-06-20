@@ -167,7 +167,8 @@ impl SortAndSpill {
 
     /// # Panics
     ///
-    /// Panics if the number of spill slots exceeds `u32::MAX`.
+    /// Panics if the number of spill slots exceeds `u32::MAX`, or if the number
+    /// of in-memory chunks exceeds `u32::MAX`.
     fn finalize_into_pending(
         stream: SortStream,
         caller_label: &str,
@@ -190,7 +191,8 @@ impl SortAndSpill {
             if chunk.is_empty() {
                 continue;
             }
-            memory_chunk_count += 1;
+            memory_chunk_count =
+                memory_chunk_count.checked_add(1).expect("memory chunk count fits in u32");
             pending_events.push_back(SortPhase1Event::MemoryChunk {
                 chunk: Arc::new(chunk),
                 records_ingested_so_far: total_records,
