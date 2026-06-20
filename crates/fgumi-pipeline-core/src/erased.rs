@@ -556,6 +556,31 @@ impl<S: Step2> ErasedStep for TypedStep2<S> {
     }
 
     fn build_output_set(&self) -> (OutputQueueSet, OutputsViewAny) {
+        // Unlike `TypedStep::build_output_set`, a `Step2` does NOT collapse a
+        // `ByOrdinal` / `ByItemOrdinal` output to `None` for `Serial` /
+        // `Exclusive` kinds — the ordering is passed through verbatim and the
+        // reorder stage is kept.
+        //
+        // The single-input collapse rests on a universal property: a Serial
+        // single-input step consumes one already-ordered stream, so any input
+        // ordinal it propagates onto an output is emitted in push order, making
+        // the reorder stage redundant. A two-input MERGE has no such guarantee.
+        // It interleaves two branches, so a `ByItemOrdinal` output that
+        // propagates an *input's* ordinal can be pushed out of ordinal order
+        // even under serial (mutex-serialized, single-dispatcher) execution —
+        // e.g. when branch B's next-needed ordinal hasn't arrived yet but
+        // branch A's later one has. For such a step the reorder stage is
+        // load-bearing: dropping it would deliver records out of order.
+        //
+        // Today's production `Step2`s happen not to need it (`PairRawFastq`
+        // declares `BranchOrdering::None`; `ZipperMergeStep` assigns fresh
+        // *sequential* output ordinals, so its push order already equals its
+        // ordinal order). But the framework cannot assume that for an arbitrary
+        // merge, so it conservatively keeps the reorder for every ordered Step2
+        // output. Do not add the single-input collapse here: a `Step2` that
+        // propagates an input ordinal can emit out of ordinal order even under
+        // serial execution, so dropping the reorder would deliver records out of
+        // order.
         <S::Outputs as StepOutputs>::build_queues(
             &self.inner.profile().output_queues,
             &self.inner.profile().branch_ordering,
@@ -871,5 +896,73 @@ mod tests {
         let mid: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
         assert!(source.is_source());
         assert!(!mid.is_source());
+    }
+
+    /// Pins the deliberate asymmetry between `TypedStep::build_output_set`
+    /// (collapses ordered output → `None` for Serial/Exclusive) and
+    /// `TypedStep2::build_output_set` (keeps the reorder stage). A two-input
+    /// merge can push a `ByItemOrdinal` output out of ordinal order even under
+    /// serial execution, so the reorder stage is load-bearing. This test fails
+    /// if a future change adds the single-input collapse to the Step2 path.
+    #[test]
+    fn step2_serial_byitemordinal_output_is_reordered_not_collapsed() {
+        use crate::item::{HeapSize, Ordered};
+        use crate::outputs::OrderedBytesSingle;
+        use crate::step::{Step2, StepCtx2};
+
+        #[derive(Debug)]
+        struct Ord32 {
+            ordinal: u64,
+        }
+        impl HeapSize for Ord32 {
+            fn heap_size(&self) -> usize {
+                0
+            }
+        }
+        impl Ordered for Ord32 {
+            fn ordinal(&self) -> u64 {
+                self.ordinal
+            }
+        }
+
+        // A Serial two-input merge with a `ByItemOrdinal` output. We only need
+        // its output edge (via `build_output_set`), never run it, so `try_run`
+        // is trivial.
+        struct OutOfOrderMerge;
+        impl Step2 for OutOfOrderMerge {
+            type InputA = u32;
+            type InputB = u32;
+            type Outputs = OrderedBytesSingle<Ord32>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "OutOfOrderMerge",
+                    kind: StepKind::Serial,
+                    sticky: false,
+                    output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 64 * 1024 }],
+                    branch_ordering: vec![BranchOrdering::ByItemOrdinal],
+                }
+            }
+            fn try_run(&mut self, _ctx: &mut StepCtx2<'_, Self>) -> io::Result<StepOutcome> {
+                Ok(StepOutcome::NoProgress)
+            }
+        }
+
+        let step: Box<dyn ErasedStep> = Box::new(TypedStep2::new(OutOfOrderMerge));
+        let (mut queue_set, view) = step.build_output_set();
+        let outputs_any = step.wrap_outputs_view(view);
+        let outputs = outputs_any
+            .downcast_ref::<OutputHandles<OrderedBytesSingle<Ord32>>>()
+            .expect("OutputHandles downcast");
+
+        // Push OUT of ordinal order: 2, then 0, then 1.
+        outputs.push(Ord32 { ordinal: 2 }).unwrap();
+        outputs.push(Ord32 { ordinal: 0 }).unwrap();
+        outputs.push(Ord32 { ordinal: 1 }).unwrap();
+
+        // The reorder stage must deliver them in ORDINAL order (0, 1, 2). With
+        // the single-input collapse the consumer would see push order (2, 0, 1).
+        let input = queue_set.take_typed_input::<Ord32>(0);
+        let got: Vec<u64> = std::iter::from_fn(|| input.pop().map(|o| o.ordinal)).collect();
+        assert_eq!(got, vec![0, 1, 2], "ordered Step2 output must be reordered by ordinal");
     }
 }
