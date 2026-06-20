@@ -229,8 +229,13 @@ pub struct ConsensusBaseBuilder {
     /// Kahan summation compensation terms for each base - SIMD vectorized
     compensations: f64x4,
 
-    /// Count of observations for each base
-    observations: [u16; DNA_BASE_COUNT],
+    /// Count of observations for each base.
+    ///
+    /// `u32` (not `u16`) so very deep UMI families — a single position can exceed
+    /// `65_535` reads in high-duplication libraries — accumulate without wrapping.
+    /// The per-base depth is later clamped to `i16::MAX` only at tag emission, to
+    /// match fgbio's `Short` consensus-depth representation.
+    observations: [u32; DNA_BASE_COUNT],
 
     /// Pre-computed correct probabilities adjusted for post-UMI errors
     adjusted_correct_table: Vec<LogProbability>,
@@ -461,7 +466,7 @@ impl ConsensusBaseBuilder {
     ///
     /// This is the sum of observations across all four bases
     #[must_use]
-    pub fn contributions(&self) -> u16 {
+    pub fn contributions(&self) -> u32 {
         self.observations.iter().sum()
     }
 
@@ -472,14 +477,14 @@ impl ConsensusBaseBuilder {
     ///
     /// Returns 0 for invalid bases
     #[must_use]
-    pub fn observations_for_base(&self, base: u8) -> u16 {
+    pub fn observations_for_base(&self, base: u8) -> u32 {
         let idx = BASE_TO_INDEX[base as usize];
         if idx == 255 { 0 } else { self.observations[idx as usize] }
     }
 
     /// Returns the observations for all bases as [A, C, G, T]
     #[must_use]
-    pub fn all_observations(&self) -> [u16; DNA_BASE_COUNT] {
+    pub fn all_observations(&self) -> [u32; DNA_BASE_COUNT] {
         self.observations
     }
 }
@@ -501,6 +506,25 @@ mod tests {
         assert_eq!(base, b'A');
         assert!(qual >= 40); // Should have high quality
         assert_eq!(builder.contributions(), 10);
+    }
+
+    #[test]
+    fn test_contributions_do_not_overflow_at_u16_boundary() {
+        // A UMI family deeper than u16::MAX (e.g. high-duplication cfDNA) must not
+        // wrap the per-base observation counter. With a u16 counter, 70_000 single-base
+        // observations wrapped to 70_000 % 65_536 = 4_464; the depth must stay 70_000.
+        let mut builder = ConsensusBaseBuilder::new(45, 40);
+        let n: u32 = 70_000;
+        for _ in 0..n {
+            builder.add(b'A', 40);
+        }
+
+        assert_eq!(builder.contributions(), n, "consensus depth must not wrap at the u16 boundary");
+        assert_eq!(
+            builder.observations_for_base(b'A'),
+            n,
+            "per-base observation count must not wrap at the u16 boundary"
+        );
     }
 
     #[test]
