@@ -5,40 +5,15 @@
 //!
 //! All validation functions now use structured error types from [`crate::errors`] to provide
 //! rich contextual information when validation fails.
+//!
+//! `validate_file_exists` and `parse_memory_size` are re-exported from `fgumi-cli-common`
+//! (single source of truth); umbrella-only validators are defined here.
+
+pub use fgumi_cli_common::{parse_memory_size, validate_file_exists};
 
 use crate::errors::{FgumiError, Result};
-use bytesize::ByteSize;
 use std::fmt::Display;
 use std::path::Path;
-
-/// Validate that a file exists
-///
-/// # Arguments
-/// * `path` - Path to validate
-/// * `description` - Human-readable description of the file (e.g., "Input file", "Reference")
-///
-/// # Errors
-/// Returns an error if the file does not exist
-///
-/// # Example
-/// ```
-/// use fgumi_lib::validation::validate_file_exists;
-/// use std::path::Path;
-///
-/// let result = validate_file_exists("/nonexistent/file.bam", "Input file");
-/// assert!(result.is_err());
-/// ```
-pub fn validate_file_exists<P: AsRef<Path>>(path: P, description: &str) -> Result<()> {
-    let path_ref = path.as_ref();
-    if !path_ref.exists() {
-        return Err(FgumiError::InvalidFileFormat {
-            file_type: description.to_string(),
-            path: path_ref.display().to_string(),
-            reason: "File does not exist".to_string(),
-        });
-    }
-    Ok(())
-}
 
 /// Validate that multiple files exist
 ///
@@ -187,105 +162,6 @@ pub fn validate_positive<T: Ord + Display + Default>(value: T, name: &str) -> Re
         });
     }
     Ok(())
-}
-
-/// Parses a memory size string into bytes.
-///
-/// Accepts both plain numbers (interpreted as MiB) and human-readable formats like:
-/// - "2GB", "2G" -> 2 gigabytes (decimal: 2,000,000,000)
-/// - "1.5GB" -> 1.5 gigabytes
-/// - "1024MB", "1024M" -> 1024 megabytes (decimal)
-/// - "512MiB" -> 512 mebibytes (binary: 536,870,912)
-/// - "768" -> 768 MiB (plain numbers are interpreted as mebibytes, i.e. `n * 1024 * 1024`)
-///
-/// # Examples
-///
-/// ```
-/// # use fgumi_lib::validation::parse_memory_size;
-/// assert_eq!(parse_memory_size("768").unwrap(), 768 * 1024 * 1024);
-/// assert_eq!(parse_memory_size("2GB").unwrap(), 2 * 1000 * 1000 * 1000);
-/// assert_eq!(parse_memory_size("1024MiB").unwrap(), 1024 * 1024 * 1024);
-/// ```
-///
-/// # Errors
-///
-/// Returns [`FgumiError::InvalidMemorySize`] if the string cannot be parsed as a valid size.
-pub fn parse_memory_size(size_str: &str) -> Result<u64> {
-    let trimmed = size_str.trim();
-    if trimmed.is_empty() {
-        return Err(FgumiError::InvalidMemorySize {
-            reason: "Memory size cannot be empty".to_string(),
-        });
-    }
-
-    // Handle negative values early
-    if trimmed.starts_with('-') {
-        return Err(FgumiError::InvalidMemorySize {
-            reason: format!("Memory size cannot be negative: '{trimmed}'"),
-        });
-    }
-
-    // First try parsing as a plain integer in MiB (backward compatibility)
-    // Only accept simple integers, not floats or scientific notation
-    if let Ok(mb_value) = trimmed.parse::<u64>() {
-        if mb_value == 0 {
-            return Err(FgumiError::InvalidMemorySize {
-                reason: "Memory size cannot be zero".to_string(),
-            });
-        }
-        if mb_value > 1_000_000 {
-            // Sanity guard: >1TB as a plain number likely means the user forgot a unit suffix.
-            return Err(FgumiError::InvalidMemorySize {
-                reason: format!(
-                    "Plain number memory size too large: {} MiB. Use human-readable format like '{}GB' instead.",
-                    mb_value,
-                    mb_value / 1000
-                ),
-            });
-        }
-
-        return mb_value.checked_mul(1024 * 1024).ok_or_else(|| FgumiError::InvalidMemorySize {
-            reason: format!("Memory size calculation overflow for {mb_value} MiB"),
-        });
-    }
-
-    // Reject scientific notation (e.g. "1e3") but allow decimals in human-readable sizes (e.g. "1.5GB")
-    if trimmed.contains('e') || trimmed.contains('E') {
-        return Err(FgumiError::InvalidMemorySize {
-            reason: format!(
-                "Scientific notation not supported: '{trimmed}'. Use integer values or human-readable formats like '2GB'."
-            ),
-        });
-    }
-
-    // Reject bare decimal numbers without a unit suffix (e.g. "1.5") since plain numbers are MiB
-    if trimmed.contains('.') && trimmed.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        return Err(FgumiError::InvalidMemorySize {
-            reason: format!(
-                "Plain decimal numbers not supported: '{trimmed}'. Use an integer for MiB (e.g. '768') or a human-readable format (e.g. '1.5GB')."
-            ),
-        });
-    }
-
-    // Fall back to parsing as a human-readable size (like "2GB", "1024MiB")
-    match trimmed.parse::<ByteSize>() {
-        Ok(size) => {
-            if size.0 == 0 {
-                return Err(FgumiError::InvalidMemorySize {
-                    reason: format!("Memory size cannot be zero: '{trimmed}'"),
-                });
-            }
-            Ok(size.0)
-        }
-        Err(_) => Err(FgumiError::InvalidMemorySize {
-            reason: format!(
-                "Invalid memory size '{trimmed}'. Valid formats:\n\
-                 - Plain numbers (interpreted as MiB): '768', '4096'\n\
-                 - Human-readable (decimal): '2GB', '1024MB'\n\
-                 - Human-readable (binary): '1GiB', '512MiB'"
-            ),
-        }),
-    }
 }
 
 #[cfg(test)]
