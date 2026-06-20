@@ -903,6 +903,10 @@ impl Pipeline {
                 (None, None)
             };
 
+        // Holds the first worker panic payload; re-raised after helper threads
+        // are cleaned up so monitor/rebalancer shutdown always executes.
+        let mut worker_panic: Option<Box<dyn std::any::Any + Send>> = None;
+
         if n_threads == 1 {
             // Single-threaded fast path: run the worker loop directly on
             // the caller's thread instead of spawning + joining a fresh
@@ -929,14 +933,26 @@ impl Pipeline {
             let sticky_owner = sticky_owners[0];
             let mut worker = WorkerCore::new(0, exclusive_owner, sticky_owner);
             let mut entries_local = entries;
-            run_worker_loop(
-                &mut worker,
-                &mut entries_local,
-                &contexts,
-                &drain_counters,
-                &signal_arc,
-                stats_arc.as_ref(),
-            );
+            // Defer a panic on the single-threaded fast path the same way the
+            // multi-worker join loop does: capture the payload, signal
+            // cancellation, and let the common monitor/rebalancer shutdown run
+            // before re-raising at step 7. Without this, a worker-loop panic
+            // unwinds straight through the caller and leaks the helper threads.
+            // `AssertUnwindSafe` is sound: after a panic we never touch `worker`
+            // or `entries_local` again — the run is shutting down.
+            if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_worker_loop(
+                    &mut worker,
+                    &mut entries_local,
+                    &contexts,
+                    &drain_counters,
+                    &signal_arc,
+                    stats_arc.as_ref(),
+                );
+            })) {
+                signal_arc.cancel();
+                worker_panic = Some(panic);
+            }
         } else {
             // 5. Spawn worker threads.
             let mut handles = Vec::with_capacity(n_threads);
@@ -957,26 +973,43 @@ impl Pipeline {
                     .spawn(move || {
                         let mut worker = WorkerCore::new(worker_id, exclusive_owner, sticky_owner);
                         let mut entries_local = entries;
-                        run_worker_loop(
-                            &mut worker,
-                            &mut entries_local,
-                            &contexts_clone,
-                            &drain_counters_clone,
-                            &signal_clone,
-                            stats_clone.as_ref(),
-                        );
+                        // Catch a worker-loop panic so we can signal cancellation
+                        // *before* unwinding. A peer parked in its retry loop on a
+                        // full/empty queue only exits when it observes
+                        // `signal.is_done()`; without an early `cancel()` here, the
+                        // join loop below could block forever on an earlier,
+                        // now-wedged worker and never reach this thread's panic.
+                        // We re-raise after signalling so the join still collects
+                        // the payload (preserving the deferred re-raise at step 7).
+                        // `AssertUnwindSafe` is sound: on panic the run is tearing
+                        // down and neither local is used again.
+                        if let Err(panic) =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                run_worker_loop(
+                                    &mut worker,
+                                    &mut entries_local,
+                                    &contexts_clone,
+                                    &drain_counters_clone,
+                                    &signal_clone,
+                                    stats_clone.as_ref(),
+                                );
+                            }))
+                        {
+                            signal_clone.cancel();
+                            std::panic::resume_unwind(panic);
+                        }
                     })
                     .expect("failed to spawn worker thread");
                 handles.push(handle);
             }
 
-            // 6. Join workers. If a worker panicked, re-raise its original
-            // payload via `resume_unwind` so the main thread aborts with the
-            // worker's actual panic message and location — not the opaque
-            // `Any { .. }` that `join().expect(...)` would print.
+            // 6. Join workers. Capture the first worker panic payload so cleanup
+            // can proceed; re-raise after monitor/rebalancer threads are stopped.
             for h in handles {
                 if let Err(panic) = h.join() {
-                    std::panic::resume_unwind(panic);
+                    if worker_panic.is_none() {
+                        worker_panic = Some(panic);
+                    }
                 }
             }
         }
@@ -1014,7 +1047,13 @@ impl Pipeline {
             }
         }
 
-        // 7. Surface error or cancellation. PipelineError isn't Clone
+        // 7. Re-raise worker panics after helper threads are cleaned up so
+        // monitor/rebalancer shutdown code always executes.
+        if let Some(panic) = worker_panic {
+            std::panic::resume_unwind(panic);
+        }
+
+        // 8. Surface error or cancellation. PipelineError isn't Clone
         // (io::Error isn't Clone); `to_result` reconstructs the recorded
         // outcome and, for an external cancel whose payload isn't yet visible
         // to this thread, synthesizes `Cancelled` from the terminal state.
@@ -1802,6 +1841,95 @@ mod tests {
         let result = pipeline.run(PipelineConfig { threads: 4, ..Default::default() });
         assert!(result.is_ok(), "run failed: {:?}", result.err());
         assert_eq!(received.load(AtomicOrd::Relaxed), 50);
+    }
+
+    /// Sink whose worker loop panics the moment it pops an item — used to drive
+    /// the worker-panic deferral paths in `Pipeline::run`.
+    #[derive(Clone)]
+    struct PanickingSink;
+    impl Step for PanickingSink {
+        type Input = u32;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "PanickingSink",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            match ctx.input.pop() {
+                Some(_) => panic!("intentional worker panic for test"),
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// Run `f` with the panic hook silenced so an *expected* worker panic does
+    /// not spew a backtrace into the test log. Safe under `nextest`, which runs
+    /// each test in its own process.
+    fn with_silenced_panic_hook<R>(f: impl FnOnce() -> R) -> R {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = f();
+        std::panic::set_hook(prev);
+        result
+    }
+
+    #[test]
+    fn pipeline_run_reraises_worker_panic_single_threaded() {
+        // A worker-loop panic on the single-threaded fast path must propagate
+        // out of `run` (after the common monitor/rebalancer shutdown), not be
+        // swallowed. The test completing at all proves the run did not hang.
+        let remaining = Arc::new(AtomicU32::new(10));
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(SharedCountingSource { remaining: Arc::clone(&remaining) })
+            .chain(PanickingSink)
+            .into_sink_marker();
+        let pipeline = builder.build().unwrap();
+
+        let result = with_silenced_panic_hook(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pipeline.run(PipelineConfig { threads: 1, ..Default::default() })
+            }))
+        });
+        assert!(result.is_err(), "single-threaded worker panic must propagate out of run()");
+    }
+
+    #[test]
+    fn pipeline_run_reraises_worker_panic_with_monitor_enabled() {
+        // With the deadlock monitor enabled (stats + non-zero timeout), a
+        // multi-worker panic must still re-raise — after the monitor is stopped
+        // and joined — rather than deadlocking the join loop or leaking the
+        // helper thread. The panicking worker signals cancellation so any wedged
+        // peer observes `is_done()` and exits, letting every join complete.
+        let remaining = Arc::new(AtomicU32::new(1_000));
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(SharedCountingSource { remaining: Arc::clone(&remaining) })
+            .chain(PanickingSink)
+            .into_sink_marker();
+        let pipeline = builder.build().unwrap();
+        let stats = pipeline.stats();
+
+        let result = with_silenced_panic_hook(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pipeline.run(PipelineConfig {
+                    threads: 4,
+                    stats: Some(Arc::clone(&stats)),
+                    deadlock_timeout_secs: 5,
+                    ..Default::default()
+                })
+            }))
+        });
+        assert!(result.is_err(), "multi-worker panic must propagate out of run()");
     }
 
     #[test]

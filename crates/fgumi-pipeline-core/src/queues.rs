@@ -285,16 +285,19 @@ impl<T: Send + HeapSize + 'static> ItemQueue<T> for ByteBoundedQueue<T> {
             return Err(item);
         }
         let size = item.heap_size() as u64;
-        // ArrayQueue::push returns Err((item, size)) on full; map back to
-        // the raw item for the producer to retry. (In practice this slot
-        // capacity should never be hit before the byte budget triggers a
+        // Reserve bytes before pushing so a concurrent consumer cannot pop and
+        // decrement the counter before we add our share, which would cause the
+        // counter to underflow and create permanent false backpressure.
+        self.current_bytes.fetch_add(size, Ordering::Relaxed);
+        // ArrayQueue::push returns Err((item, size)) on full; roll back the
+        // reservation and return the item to the caller for retry. (In practice
+        // the slot cap should never be hit before the byte budget triggers a
         // reject above, but defend against it anyway.)
         match self.inner.push((item, size)) {
-            Ok(()) => {
-                self.current_bytes.fetch_add(size, Ordering::Relaxed);
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err((item, _size)) => {
+                // Roll back the byte reservation — the item never entered the queue.
+                self.current_bytes.fetch_sub(size, Ordering::Relaxed);
                 // The fixed 1024-slot backing was hit before the byte budget.
                 // This degrades byte-backpressure into a hard count cap for
                 // small items (heap_size ≲ limit/1024) — correctness is

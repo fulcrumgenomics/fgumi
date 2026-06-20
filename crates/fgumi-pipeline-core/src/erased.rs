@@ -530,13 +530,19 @@ impl<S: Step2> ErasedStep for TypedStep2<S> {
         p1_idx: usize,
         p1_branch: usize,
     ) -> Box<dyn Any + Send + Sync> {
-        assert_ne!(
-            p0_idx,
-            p1_idx,
-            "Step2 producers must be distinct steps (each upstream is its \
-             own subchain). Got p0_idx == p1_idx == {p0_idx} for step '{}'.",
-            self.profile().name
-        );
+        if p0_idx == p1_idx {
+            assert_ne!(
+                p0_branch,
+                p1_branch,
+                "Step2 inputs must consume distinct branches when they share \
+                 producer step {p0_idx} for step '{}'.",
+                self.profile().name
+            );
+            let set = &mut producer_sets[p0_idx];
+            let a: BranchInputHandle<S::InputA> = set.take_typed_input::<S::InputA>(p0_branch);
+            let b: BranchInputHandle<S::InputB> = set.take_typed_input::<S::InputB>(p1_branch);
+            return Box::new(TwoInputHandles::<S::InputA, S::InputB>::new(a, b));
+        }
         // Borrow two disjoint elements of `producer_sets` simultaneously.
         // `split_at_mut(lo+1)` puts producer_sets[lo] in the first half;
         // we index into the second half for the hi side.
