@@ -773,84 +773,20 @@ pub struct QueueMemoryOptions {
     /// thread count (recommended on fixed-RAM hosts).
     #[arg(long = "memory-per-thread", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub memory_per_thread: bool,
-
-    /// DEPRECATED: use --max-memory instead. Kept as a hidden alias; when set it
-    /// overrides --max-memory.
-    #[arg(long = "queue-memory", hide = true)]
-    pub queue_memory: Option<String>,
-
-    /// DEPRECATED: use --memory-per-thread instead. Hidden alias that overrides
-    /// --memory-per-thread when --queue-memory is set.
-    #[arg(long = "queue-memory-per-thread", hide = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
-    pub queue_memory_per_thread: Option<bool>,
-
-    /// DEPRECATED: use --max-memory instead. Hidden alias for a fixed total
-    /// limit in megabytes.
-    #[arg(long = "queue-memory-limit-mb", hide = true)]
-    pub queue_memory_limit_mb: Option<u64>,
 }
 
 impl Default for QueueMemoryOptions {
     fn default() -> Self {
         Self {
-            // 768 MiB per thread — byte-identical to the historical
-            // --queue-memory 768 default.
+            // 768 MiB per thread — byte-identical to the historical default.
             max_memory: MemoryLimit::Fixed(768 * 1024 * 1024),
             memory_reserve: MemoryReserve::Auto,
             memory_per_thread: true,
-            queue_memory: None,
-            queue_memory_per_thread: None,
-            queue_memory_limit_mb: None,
         }
     }
 }
 
 impl QueueMemoryOptions {
-    /// Resolve the effective `(limit, reserve, per_thread)` triple, honoring the
-    /// deprecated `--queue-memory*` aliases over the modern `--max-memory*`
-    /// flags. Pure: no warnings, no system queries.
-    ///
-    /// # Errors
-    /// Returns an error if a deprecated `--queue-memory` string fails to parse.
-    fn resolve_spec(&self) -> anyhow::Result<(MemoryLimit, MemoryReserve, bool)> {
-        // The deprecated `--queue-memory-per-thread` alias overrides
-        // `--memory-per-thread` when set, even on its own (i.e. without
-        // `--queue-memory`); otherwise passing it alone would be a silent no-op.
-        let per_thread = self.queue_memory_per_thread.unwrap_or(self.memory_per_thread);
-
-        // Legacy fixed-total flag wins if present (matches prior behavior).
-        if let Some(legacy_mb) = self.queue_memory_limit_mb {
-            let bytes = usize::try_from(legacy_mb)
-                .ok()
-                .and_then(|mb| mb.checked_mul(1024 * 1024))
-                .ok_or_else(|| anyhow::anyhow!("--queue-memory-limit-mb too large: {legacy_mb}"))?;
-            return Ok((MemoryLimit::Fixed(bytes), MemoryReserve::Auto, false));
-        }
-
-        // Deprecated --queue-memory overrides --max-memory when set.
-        if let Some(queue_memory) = &self.queue_memory {
-            let limit = parse_memory(queue_memory).map_err(|e| {
-                anyhow::anyhow!("Failed to parse --queue-memory {queue_memory}: {e}")
-            })?;
-            return Ok((limit, self.memory_reserve, per_thread));
-        }
-
-        Ok((self.max_memory, self.memory_reserve, per_thread))
-    }
-
-    /// Emit a one-time deprecation warning for any legacy flag in use.
-    fn warn_deprecations(&self) {
-        if self.queue_memory_limit_mb.is_some() {
-            log::warn!("DEPRECATED: --queue-memory-limit-mb; use --max-memory <N> instead.");
-        } else if self.queue_memory.is_some() {
-            log::warn!(
-                "DEPRECATED: --queue-memory / --queue-memory-per-thread; use --max-memory / --memory-per-thread instead."
-            );
-        } else if self.queue_memory_per_thread.is_some() {
-            log::warn!("DEPRECATED: --queue-memory-per-thread; use --memory-per-thread instead.");
-        }
-    }
-
     /// Resolve the total queue memory budget in bytes for `num_threads`.
     ///
     /// Under `--max-memory auto` the budget is detected from (cgroup-aware) host
@@ -858,12 +794,14 @@ impl QueueMemoryOptions {
     /// explicit value it is `max_memory` (× threads when per-thread).
     ///
     /// # Errors
-    /// Returns an error if `num_threads` is 0, a deprecated `--queue-memory`
-    /// string fails to parse, or the multiplication overflows.
+    /// Returns an error if `num_threads` is 0 or the multiplication overflows.
     pub fn calculate_memory_limit(&self, num_threads: usize) -> anyhow::Result<u64> {
-        self.warn_deprecations();
-        let (limit, reserve, per_thread) = self.resolve_spec()?;
-        let bytes = resolve_memory_budget(limit, reserve, num_threads, per_thread)?;
+        let bytes = resolve_memory_budget(
+            self.max_memory,
+            self.memory_reserve,
+            num_threads,
+            self.memory_per_thread,
+        )?;
         Ok(bytes as u64)
     }
 
@@ -873,7 +811,7 @@ impl QueueMemoryOptions {
     /// * `num_threads` - Number of threads used for the calculation.
     /// * `total_memory` - The resolved total budget from `calculate_memory_limit`.
     pub fn log_memory_config(&self, num_threads: usize, total_memory: u64) {
-        let per_thread = self.resolve_spec().map(|(_, _, pt)| pt).unwrap_or(true);
+        let per_thread = self.memory_per_thread;
         if per_thread && num_threads > 1 {
             log::info!(
                 "Queue memory budget: {} total ({}/thread × {} threads)",
@@ -1176,8 +1114,8 @@ mod tests {
 
     #[test]
     fn test_queue_memory_default_is_768_mib_per_thread() {
-        // The default must stay byte-identical to the historical
-        // `--queue-memory 768` (768 MiB per thread).
+        // The default must stay byte-identical to the historical default
+        // (768 MiB per thread).
         let opts = QueueMemoryOptions::default();
         let result = opts
             .calculate_memory_limit(4)
@@ -1312,76 +1250,6 @@ mod tests {
     }
 
     #[test]
-    fn test_queue_memory_deprecated_queue_memory_alias() {
-        // The hidden `--queue-memory` alias overrides `--max-memory`, honoring
-        // its companion `--queue-memory-per-thread`.
-        let opts = QueueMemoryOptions {
-            queue_memory: Some("200".to_string()),
-            queue_memory_per_thread: Some(false),
-            ..QueueMemoryOptions::default()
-        };
-        let result = opts.calculate_memory_limit(8).expect("should succeed");
-        assert_eq!(result, 200 * 1024 * 1024); // fixed total, no scaling
-    }
-
-    #[test]
-    fn test_queue_memory_per_thread_alias_alone_takes_effect() {
-        // `--queue-memory-per-thread false` on its own must override
-        // `--memory-per-thread` (default true), not be a silent no-op.
-        let opts = QueueMemoryOptions {
-            max_memory: MemoryLimit::Fixed(200 * 1024 * 1024),
-            queue_memory_per_thread: Some(false),
-            ..QueueMemoryOptions::default()
-        };
-        let result = opts.calculate_memory_limit(8).expect("should succeed");
-        assert_eq!(result, 200 * 1024 * 1024); // fixed total, no per-thread scaling
-    }
-
-    #[test]
-    fn test_queue_memory_deprecated_alias_defaults_to_per_thread() {
-        // When `--queue-memory-per-thread` is unset, the alias falls back to
-        // `--memory-per-thread` (default true).
-        let opts = QueueMemoryOptions {
-            queue_memory: Some("100".to_string()),
-            ..QueueMemoryOptions::default()
-        };
-        let result = opts.calculate_memory_limit(4).expect("should succeed");
-        assert_eq!(result, 100 * 1024 * 1024 * 4);
-    }
-
-    #[test]
-    fn test_queue_memory_legacy_limit_mb_fixed_total() {
-        let opts = QueueMemoryOptions {
-            queue_memory_limit_mb: Some(2048),
-            // These must be ignored in favor of the legacy fixed total.
-            max_memory: MemoryLimit::Fixed(1),
-            memory_per_thread: true,
-            ..QueueMemoryOptions::default()
-        };
-        let result = opts.calculate_memory_limit(4).expect("should succeed");
-        assert_eq!(result, 2048 * 1024 * 1024); // fixed total, no scaling
-    }
-
-    #[test]
-    fn test_legacy_limit_mb_overflow_is_error() {
-        // u64::MAX MiB overflows when multiplied by 1 MiB.
-        let opts = QueueMemoryOptions {
-            queue_memory_limit_mb: Some(u64::MAX),
-            ..QueueMemoryOptions::default()
-        };
-        assert!(opts.calculate_memory_limit(1).is_err());
-    }
-
-    #[test]
-    fn test_deprecated_queue_memory_parse_error_is_error() {
-        let opts = QueueMemoryOptions {
-            queue_memory: Some("not-a-size".to_string()),
-            ..QueueMemoryOptions::default()
-        };
-        assert!(opts.calculate_memory_limit(4).is_err());
-    }
-
-    #[test]
     fn test_fixed_per_thread_overflow_is_error() {
         let opts = QueueMemoryOptions {
             max_memory: MemoryLimit::Fixed(usize::MAX),
@@ -1509,21 +1377,6 @@ mod tests {
     fn test_max_memory_parsing(#[case] args: &[&str], #[case] expected: MemoryLimit) {
         let cmd = TestBoolFlags::try_parse_from(args).expect("valid CLI args should parse");
         assert_eq!(cmd.queue_memory.max_memory, expected);
-    }
-
-    #[test]
-    fn test_deprecated_queue_memory_flag_still_parses() {
-        // The hidden alias remains accepted for backward compatibility.
-        let cmd = TestBoolFlags::try_parse_from([
-            "test",
-            "--queue-memory",
-            "512",
-            "--queue-memory-per-thread",
-            "false",
-        ])
-        .expect("deprecated flags should still parse");
-        assert_eq!(cmd.queue_memory.queue_memory.as_deref(), Some("512"));
-        assert_eq!(cmd.queue_memory.queue_memory_per_thread, Some(false));
     }
 
     #[rstest]
