@@ -30,10 +30,15 @@ reviews:
   high_level_summary: true
   poem: false
   collapse_walkthrough: false
-  # Review automatically on push; don't review draft PRs.
+  # Review automatically on push; don't review draft PRs. `base_branches: .*`
+  # also auto-reviews PRs whose base is not the default branch (stacked PRs);
+  # without it CodeRabbit posts "auto reviews are disabled on base/target
+  # branches other than the default branch" and skips them.
   auto_review:
     enabled: true
     drafts: false
+    base_branches:
+      - ".*"
   # Never auto-block merges on a review verdict; findings are advisory.
   request_changes_workflow: false
 
