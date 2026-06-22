@@ -1,57 +1,4 @@
 //! `SortMerge` — third step of the runall-sort three-step chain.
-//!
-//! ```text
-//! [RecordBatch] → SortAndSpill ──SortPhase1Event──> SortSpillDecompress ──SortPhase2Event──> SortMerge → [RecordBatch]
-//!                   (Serial)        (Parallel)                                                    (Serial)
-//! ```
-//!
-//! Consumes `SortPhase2Event`s from the parallel decompress stage, drives
-//! a non-blocking `MergeDriverDyn` over the slot table + memory chunks, and
-//! emits sorted `RecordBatch`es downstream. The decompressed BGZF block
-//! bytes flow out-of-band on each `SortMergeSlot`'s bounded queue (pushed by
-//! `SortSpillDecompress`, popped by the merge driver) — only the slot
-//! handles and counts ride the typed `SortPhase2Event` chain.
-//!
-//! See `docs/design/sort-step-split.md` for the locked design and
-//! `docs/design/sort-merge-nonblocking.md` for the cooperative, resumable
-//! merge consumer (issue #330 BUG #3).
-//!
-//! ## State machine
-//!
-//! 1. **`WaitingForSetup`** — collect upstream events. `SpillReady` events
-//!    contribute their `slot` to the slot table (deduplicated by
-//!    `file_id`); `MemoryChunk` events accumulate as typed memory chunks;
-//!    `AllAnnounced` carries the final counts. We `max()`
-//!    `records_ingested_so_far` from every event so `total_records` is
-//!    order-independent. Transitions to `Merging` once the announced
-//!    slot/chunk counts have all arrived (or, as a fallback, on input
-//!    drain).
-//!
-//! 2. **`Merging`** — build a typed `MergeDriver<K>` via
-//!    [`fgumi_sort::MergeDriver::from_slots`], type-erase to
-//!    [`fgumi_sort::MergeDriverDyn`], and pump
-//!    [`MergeDriverDyn::try_step`]. `try_step` is **non-blocking**: when a
-//!    slot's decompressed queue is momentarily empty (and not at EOF) it
-//!    returns [`fgumi_sort::MergeStep::Stalled`], and this step flushes any
-//!    ready batch and returns `Contention` — yielding the worker so it can
-//!    round-robin to `SortSpillDecompress` to refill the slot, then resume
-//!    the merge on a later dispatch. Each produced record is appended to a
-//!    [`RecordBatchBuilder`]; batches flush downstream when full
-//!    (`target_batch_count` or `output_byte_limit`).
-//!
-//! 3. **`Done`** — terminal.
-//!
-//! ## Why the merge must never block
-//!
-//! `MergeDriver` runs on whichever framework worker holds `SortMerge`'s
-//! Serial-step lock. A blocking wait there would park that worker (and hold
-//! the lock) until a sibling worker refilled the slot — which a single-worker
-//! configuration can never do, deadlocking the chain (issue #330 BUG #3,
-//! review finding M1). The non-blocking `try_step` keeps the merge
-//! cooperative: the same worker that stalls can refill the slot itself. Lazy
-//! priming inside `from_slots` extends the same property to driver
-//! construction, so building the `LoserTree` over not-yet-decompressed slots
-//! never blocks either.
 
 use std::collections::HashMap;
 use std::io;
@@ -63,36 +10,23 @@ use fgumi_sort::{
     RawQuerynameLexKey, SortMergeSlot, SortOrder, TemplateKey,
 };
 
-use crate::pipeline::core::Unpushed;
-use crate::pipeline::core::held::HeldSlot;
-use crate::pipeline::core::outputs::OrderedBytesSingle;
-use crate::pipeline::core::queues::QueueSpec;
-use crate::pipeline::core::reorder::BranchOrdering;
-use crate::pipeline::core::step::{Affinity, Step, StepCtx, StepKind, StepOutcome, StepProfile};
-use crate::pipeline::steps::sort::protocol::{MemoryChunkErased, SortPhase2Event};
-use crate::pipeline::steps::types::{RecordBatch, RecordBatchBuilder};
+use crate::sort::protocol::{MemoryChunkErased, SortPhase2Event};
+use crate::types::{RecordBatch, RecordBatchBuilder};
+use fgumi_pipeline_core::{
+    Unpushed,
+    held::HeldSlot,
+    outputs::OrderedBytesSingle,
+    queues::QueueSpec,
+    reorder::BranchOrdering,
+    step::{Affinity, Step, StepCtx, StepKind, StepOutcome, StepProfile},
+};
 
 /// Default output batch size: 1024 records per emitted `RecordBatch`.
-/// Matches the legacy `Sort::DEFAULT_TARGET_BATCH_COUNT`.
 pub const DEFAULT_TARGET_BATCH_COUNT: usize = 1024;
 
-/// Max input events drained per `try_run` invocation in the
-/// `WaitingForSetup` state. Bounds the per-call work so other Serial
-/// steps in the chain make progress.
-const MAX_EVENTS_PER_LOCK: usize = 16;
-
-/// Max output batches emitted per `try_run` invocation in the `Merging`
-/// state. Same intent as `MAX_EVENTS_PER_LOCK`.
+/// Max output batches emitted per `try_run` invocation in `Merging`.
 const MAX_DRAIN_BATCHES_PER_LOCK: usize = 8;
 
-/// Type-erased memory-chunk accumulator. Per-variant `Vec`s grow as
-/// `MemoryChunk` events arrive in `WaitingForSetup`; on transition to
-/// `Merging` exactly one variant is non-empty (matching `sort_order`)
-/// and we hand its contents to the typed `MergeDriver::from_slots`.
-///
-/// We don't gate which variant fills purely by `sort_order` — the
-/// upstream `SortAndSpill` step is single-typed too — but the four
-/// fields exist so the dispatch is statically typed.
 #[derive(Default)]
 struct MemoryChunksByKind {
     coordinate: Vec<Vec<(RawCoordinateKey, RawRecord)>>,
@@ -111,7 +45,6 @@ impl MemoryChunksByKind {
         }
     }
 
-    /// Total non-empty memory chunks across all four variants.
     fn total_len(&self) -> usize {
         self.coordinate.len()
             + self.queryname_lex.len()
@@ -120,10 +53,6 @@ impl MemoryChunksByKind {
     }
 }
 
-/// Build a typed merge driver from the collected slots + memory chunks
-/// for the configured sort order. Construction is infallible and always
-/// yields a driver; an all-empty input is reported by the driver's first
-/// `try_step` returning [`MergeStep::Done`].
 fn build_driver(
     sort_order: SortOrder,
     slots: Vec<Arc<SortMergeSlot>>,
@@ -158,46 +87,21 @@ fn build_driver(
     }
 }
 
-/// Result of one [`SortMerge::next_batch`] pump.
 enum NextBatch {
-    /// A full output batch is ready to push; more may follow immediately.
     Batch(RecordBatch),
-    /// The merge driver stalled on a not-yet-ready slot. Carries any
-    /// partially-filled batch to flush before yielding.
     Stalled(Option<RecordBatch>),
-    /// The merge is exhausted. Carries any final partial batch to flush, plus
-    /// the driver's total `records_merged()` — read in `next_batch` while the
-    /// driver is still in scope — for the completion log.
     Done(Option<RecordBatch>, u64),
 }
 
-/// Three-phase state machine for [`SortMerge`].
 enum SortMergeState {
     WaitingForSetup {
-        /// Slots received via `SpillReady` events. Sorted by `file_id`
-        /// before passing to `MergeDriver::from_slots` so the
-        /// `LoserTree` tie-break for equal sort keys is deterministic
-        /// and matches the legacy chunk-files order.
         slots: Vec<Arc<SortMergeSlot>>,
-        /// `slot.file_id -> index into slots` so deduplication is
-        /// O(1) per `SpillReady`.
         slot_index: HashMap<u32, usize>,
-        /// Typed accumulators for the four sort-key variants.
         memory_chunks: MemoryChunksByKind,
-        /// Running `max(records_ingested_so_far)` across events.
         total_records: u64,
-        /// Expected slot count from `AllAnnounced`. Set once when
-        /// the sentinel arrives. The transition gate compares this
-        /// against `slots.len()`; when both match (and
-        /// `expected_memory_chunk_count` matches), we can transition
-        /// to `Merging` without waiting for `ctx.input.is_drained()`.
         expected_slot_count: Option<u32>,
-        /// Expected non-empty memory-chunk count from
-        /// `AllAnnounced`. Compared against `memory_chunks.total_len()`.
         expected_memory_chunk_count: Option<u32>,
     },
-    /// Active merge state. Boxed because `dyn MergeDriverDyn` is a wide
-    /// pointer; `RecordBatchBuilder` carries a `Vec<u8>` allocation.
     Merging {
         driver: Box<dyn MergeDriverDyn + Send>,
         builder: RecordBatchBuilder,
@@ -206,9 +110,6 @@ enum SortMergeState {
     Done,
 }
 
-/// Pop one `SortPhase2Event` and route it into the in-flight setup
-/// accumulators. Factored out of `try_run`'s `WaitingForSetup` arm so
-/// the latter stays under clippy's `too_many_lines` threshold.
 fn absorb_phase2_event(
     event: SortPhase2Event,
     slots: &mut Vec<Arc<SortMergeSlot>>,
@@ -227,20 +128,14 @@ fn absorb_phase2_event(
             *total_records = (*total_records).max(records_ingested_so_far);
         }
         SortPhase2Event::MemoryChunk { chunk, records_ingested_so_far } => {
-            let inner = Arc::try_unwrap(chunk).unwrap_or_else(|arc| {
-                // Fallback: clone. Only hit if a future change adds a
-                // second `Arc` holder.
-                match arc.as_ref() {
-                    MemoryChunkErased::Coordinate(v) => MemoryChunkErased::Coordinate(v.clone()),
-                    MemoryChunkErased::QuerynameLex(v) => {
-                        MemoryChunkErased::QuerynameLex(v.clone())
-                    }
-                    MemoryChunkErased::QuerynameNatural(v) => {
-                        MemoryChunkErased::QuerynameNatural(v.clone())
-                    }
-                    MemoryChunkErased::TemplateCoordinate(v) => {
-                        MemoryChunkErased::TemplateCoordinate(v.clone())
-                    }
+            let inner = Arc::try_unwrap(chunk).unwrap_or_else(|arc| match arc.as_ref() {
+                MemoryChunkErased::Coordinate(v) => MemoryChunkErased::Coordinate(v.clone()),
+                MemoryChunkErased::QuerynameLex(v) => MemoryChunkErased::QuerynameLex(v.clone()),
+                MemoryChunkErased::QuerynameNatural(v) => {
+                    MemoryChunkErased::QuerynameNatural(v.clone())
+                }
+                MemoryChunkErased::TemplateCoordinate(v) => {
+                    MemoryChunkErased::TemplateCoordinate(v.clone())
                 }
             });
             memory_chunks.push(inner);
@@ -265,10 +160,6 @@ fn absorb_phase2_event(
     }
 }
 
-/// Returns `true` if the slot set is complete: `AllAnnounced` has
-/// arrived and the actual slot + memory-chunk counts match the
-/// expected counts. Used to gate the early `WaitingForSetup → Merging`
-/// transition without waiting for `ctx.input.is_drained()`.
 fn slot_set_complete(
     slots_len: usize,
     memory_chunks_total_len: usize,
@@ -283,11 +174,7 @@ fn slot_set_complete(
     )
 }
 
-/// `Serial + ByItemOrdinal` middle-of-chain merge. Input =
-/// `SortPhase2Event`, Output = sorted `RecordBatch`. Drives
-/// [`fgumi_sort::MergeDriver`] via pausable `peek` / `advance` so the
-/// merge phase runs interleaved with the framework's round-robin
-/// dispatch — no dedicated OS thread.
+/// `Serial + ByItemOrdinal` middle-of-chain merge.
 pub struct SortMerge {
     state: SortMergeState,
     held: HeldSlot<Unpushed<RecordBatch>>,
@@ -328,17 +215,13 @@ impl SortMerge {
         }
     }
 
-    /// Override the affinity hint. Not load-bearing for correctness — the
-    /// pausable driver releases the Serial lock between bounded batches.
+    /// Override the affinity hint.
     #[must_use]
     pub fn with_affinity(mut self, affinity: Affinity) -> Self {
         self.affinity = affinity;
         self
     }
 
-    /// Try to deliver a previously-held batch. Returns `true` if the held
-    /// slot is now empty, `false` if it's still held (caller signals
-    /// `Contention`).
     fn flush_held(&mut self, ctx: &mut StepCtx<'_, Self>) -> bool {
         let Some(unpushed) = self.held.take() else {
             return true;
@@ -352,31 +235,14 @@ impl SortMerge {
         }
     }
 
-    /// If currently in `WaitingForSetup`, sort the accumulated slots,
-    /// build the merge driver, and transition to `Merging` (or
-    /// directly to `Done` for empty input — `build_driver` returns
-    /// `Ok(None)` when there's nothing to merge). No-op when already
-    /// in `Merging` or `Done`. Called from `try_run` once the setup
-    /// predicate is satisfied or the input is drained.
-    ///
-    /// `caller_label` is interpolated into the error message on
-    /// `build_driver` failure so post-mortems can attribute the
-    /// failure to the correct call site.
-    /// `WaitingForSetup` Phase 1: pop events from upstream and absorb
-    /// each into the setup accumulators. `cap` bounds the per-call
-    /// absorb count; `try_run` passes `Some(MAX_EVENTS_PER_LOCK)` to keep
-    /// each dispatch bounded. Returns the count of events absorbed so
-    /// `try_run` can short-circuit on `did_work`.
+    /// Drains every currently-available input event into the setup state and
+    /// returns the number absorbed. The drain is intentionally unbounded — the
+    /// upstream queue is byte-bounded, so memory is gated on the producer side.
     ///
     /// # Panics
     ///
-    /// Panics if `self.state` is not `WaitingForSetup`. Callers must
-    /// check the state before invoking.
-    fn absorb_events_into_setup(
-        &mut self,
-        ctx: &mut StepCtx<'_, Self>,
-        cap: Option<usize>,
-    ) -> usize {
+    /// Panics if `self.state` is not `WaitingForSetup`.
+    fn absorb_events_into_setup(&mut self, ctx: &mut StepCtx<'_, Self>) -> usize {
         let SortMergeState::WaitingForSetup {
             slots,
             slot_index,
@@ -389,8 +255,7 @@ impl SortMerge {
             unreachable!("absorb_events_into_setup called outside WaitingForSetup state");
         };
         let mut absorbed = 0usize;
-        while cap.is_none_or(|c| absorbed < c) {
-            let Some(event) = ctx.input.pop() else { break };
+        while let Some(event) = ctx.input.pop() {
             absorb_phase2_event(
                 event,
                 slots,
@@ -405,10 +270,6 @@ impl SortMerge {
         absorbed
     }
 
-    /// True when `self.state` is `WaitingForSetup` AND the
-    /// `AllAnnounced` predicates match. False in any other state.
-    /// Used by `try_run` to early-transition `WaitingForSetup ->
-    /// Merging` without waiting for upstream's drained flag.
     fn is_ready_to_merge(&self) -> bool {
         let SortMergeState::WaitingForSetup {
             slots,
@@ -428,17 +289,9 @@ impl SortMerge {
         )
     }
 
-    /// Pump the merge driver into the current batch builder via the
-    /// non-blocking [`MergeDriverDyn::try_step`] until the builder is
-    /// full (a `Batch` is ready), the driver stalls on a not-yet-ready
-    /// slot (`Stalled`), or the merge is exhausted (`Done`). For the
-    /// latter two, any partially-filled builder is flushed alongside so
-    /// the caller can push it before yielding / finishing.
-    ///
     /// # Panics
     ///
-    /// Panics if `self.state` is not `Merging`. Callers must check
-    /// the state before invoking.
+    /// Panics if `self.state` is not `Merging`.
     fn next_batch(&mut self) -> io::Result<NextBatch> {
         let target = self.target_batch_count;
         let byte_limit = self.output_byte_limit;
@@ -447,14 +300,11 @@ impl SortMerge {
             unreachable!("next_batch called outside Merging state");
         };
 
-        // Flush the current builder into a `RecordBatch`, advancing the
-        // ordinal and installing a fresh builder.
         let flush = |builder: &mut RecordBatchBuilder, next_ordinal: &mut u64| {
             *next_ordinal += 1;
             let next_builder = RecordBatchBuilder::with_capacity(*next_ordinal, bytes_cap, target);
             std::mem::replace(builder, next_builder).build()
         };
-        // Flush only if the builder holds at least one record.
         let flush_partial = |builder: &mut RecordBatchBuilder, next_ordinal: &mut u64| {
             if builder.is_empty() { None } else { Some(flush(builder, next_ordinal)) }
         };
@@ -485,21 +335,11 @@ impl SortMerge {
         }
     }
 
-    /// Cooperative merge emit. Produce up to `MAX_DRAIN_BATCHES_PER_LOCK`
-    /// batches via `next_batch`, push each downstream, stash the first
-    /// rejection in `held` and return `Progress`. Transitions state to
-    /// `Done` when the driver is exhausted.
-    ///
-    /// Called from `try_run` only.
-    ///
     /// # Panics
     ///
     /// Panics if `self.state` is not `Merging`.
     fn emit_batches_cooperative(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
         let mut delivered = 0usize;
-        // Push a batch downstream; on backpressure stash it in `held` and
-        // signal the caller to return `Progress` (so `flush_held` retries it
-        // next dispatch). Returns `false` if the push was held.
         loop {
             match self.next_batch()? {
                 NextBatch::Batch(batch) => {
@@ -520,14 +360,6 @@ impl SortMerge {
                         }
                         delivered += 1;
                     }
-                    // A slot's queue is momentarily empty. Yield so this
-                    // worker round-robins to `SortSpillDecompress` to refill
-                    // it, then resume the merge on a later dispatch. Either
-                    // outcome yields: `Progress` (we delivered batches this
-                    // call) triggers the framework's priority-restart at step
-                    // 0, which subsumes the `Contention` retry — so reporting
-                    // `Progress` when `delivered > 0` is the honest, stronger
-                    // signal, and `Contention` covers the made-no-progress case.
                     return Ok(if delivered > 0 {
                         StepOutcome::Progress
                     } else {
@@ -538,15 +370,10 @@ impl SortMerge {
                     if let Some(batch) = partial {
                         if let Err(unpushed) = ctx.outputs.push(batch) {
                             self.held.put(unpushed);
-                            // Stay in `Merging`; next dispatch flushes `held`,
-                            // then `next_batch` returns `Done(None)` → `Done`.
                             return Ok(StepOutcome::Progress);
                         }
                         delivered += 1;
                     }
-                    // Surface the merged-record count carried up from `next_batch`
-                    // (where the driver was in scope). The streaming sort's
-                    // analogue of standalone sort's Records-written summary.
                     log::info!("Sort merge complete: {merged} records merged");
                     self.state = SortMergeState::Done;
                     return Ok(if delivered > 0 {
@@ -559,11 +386,6 @@ impl SortMerge {
         }
     }
 
-    /// If currently `WaitingForSetup`, build the merge driver and move to
-    /// `Merging`. No-op in any other state. Infallible: `build_driver` always
-    /// yields a driver, and empty input is reported by the driver's first
-    /// `try_step` returning `Done` (handled by the `Merging` emit paths), so
-    /// there is no separate empty-input or error branch.
     fn transition_to_merging(&mut self) {
         if !matches!(&self.state, SortMergeState::WaitingForSetup { .. }) {
             return;
@@ -579,11 +401,6 @@ impl SortMerge {
         else {
             unreachable!("just matched WaitingForSetup")
         };
-        // Sort slots by `file_id` so `MergeDriver::from_slots` source
-        // order is deterministic and matches the legacy chunk-files
-        // order. `SpillReady` events arrive in `SortAndSpill`'s
-        // emission order (which IS `file_id` order today), but
-        // defensively sort to avoid relying on that.
         slots.sort_by_key(|s| s.file_id);
         let driver = build_driver(self.sort_order, slots, memory_chunks, total_records);
         let bytes_cap = usize::try_from(self.output_byte_limit).unwrap_or(usize::MAX);
@@ -615,15 +432,13 @@ impl Step for SortMerge {
             return Ok(StepOutcome::Contention);
         }
 
-        // Phase 1: absorb events while in WaitingForSetup. Transition
-        // to Merging when AllAnnounced predicates match (early-
-        // transition gate — avoids waiting for upstream's drained flag
-        // which would require SortSpillDecompress workers to Skip
-        // themselves first, blocking further decompress work) OR
-        // when upstream is drained with zero slots/chunks (empty-
-        // input fall-back).
         if matches!(&self.state, SortMergeState::WaitingForSetup { .. }) {
-            let absorbed = self.absorb_events_into_setup(ctx, Some(MAX_EVENTS_PER_LOCK));
+            // Drain the input queue unbounded: the setup absorb is cheap (it just
+            // moves `Arc`s/`Vec`s into the setup state) and the upstream queue is
+            // already byte-bounded, so backpressure belongs on the producer, not
+            // on a consumer-side drain cap. A cap here would cycle a full upstream
+            // queue through repeated partial drains and add producer contention.
+            let absorbed = self.absorb_events_into_setup(ctx);
             if !self.is_ready_to_merge() {
                 if absorbed > 0 {
                     return Ok(StepOutcome::Progress);
@@ -631,20 +446,38 @@ impl Step for SortMerge {
                 if !ctx.input.is_drained() {
                     return Ok(StepOutcome::NoProgress);
                 }
+                // Input is drained but setup never completed. Fail closed for any
+                // setup that saw payload or a (mismatched) `AllAnnounced`, so an
+                // incomplete setup can never silently merge a partial result. The
+                // only legitimate drained-but-not-ready case is a wholly empty
+                // input (no slots, no chunks, no announcement), which merges to an
+                // empty output.
+                let SortMergeState::WaitingForSetup {
+                    slots,
+                    memory_chunks,
+                    expected_slot_count,
+                    expected_memory_chunk_count,
+                    ..
+                } = &self.state
+                else {
+                    unreachable!("state matched WaitingForSetup above");
+                };
+                let saw_payload = !slots.is_empty() || memory_chunks.total_len() > 0;
+                let saw_expectations =
+                    expected_slot_count.is_some() || expected_memory_chunk_count.is_some();
+                if saw_payload || saw_expectations {
+                    return Err(io::Error::other(format!(
+                        "SortMerge: setup incomplete at input drain \
+                         (slots={}, chunks={}, expected_slots={expected_slot_count:?}, \
+                         expected_chunks={expected_memory_chunk_count:?})",
+                        slots.len(),
+                        memory_chunks.total_len(),
+                    )));
+                }
             }
             self.transition_to_merging();
         }
 
-        // Phase 2: cooperative emit if Merging; Done reports `Finished`.
-        // `Done` means the merge driver is exhausted and every batch has
-        // landed — completion is keyed on the merge state, NOT on
-        // `ctx.input.is_drained()` (the input edge drains early, before the
-        // merge finishes, because the records come from spilled chunks /
-        // sibling decompress workers; finishing on `is_drained` would
-        // truncate the sorted output). Empty input reaches `Merging`, then
-        // `emit_batches_cooperative`'s first `next_batch` returns `Done(None)`
-        // → state `Done` → `Finished` on the next pass. WaitingForSetup is
-        // unreachable — Phase 1 either returned early or transitioned us out.
         match &self.state {
             SortMergeState::Merging { .. } => self.emit_batches_cooperative(ctx),
             SortMergeState::Done => Ok(StepOutcome::Finished),

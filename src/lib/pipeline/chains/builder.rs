@@ -2020,6 +2020,7 @@ impl<'a> ChainBuilder<'a> {
                 input_path: input_path.clone(),
                 output_path: output_path.clone(),
                 num_sorter_threads,
+                effective_memory,
                 output_compression: self.spec.compression.compression_level,
                 command_line: self.spec.command_line.clone(),
                 stats_slot: Arc::clone(&stats_slot),
@@ -2133,10 +2134,11 @@ impl<'a> ChainBuilder<'a> {
             let affinity =
                 if num_threads.max(2) >= 3 { Affinity::Worker(1) } else { Affinity::Reader };
 
-            let and_spill = SortAndSpill::from_sorter(sorter, &self.header, 64)
-                .map_err(|e| anyhow!("SortAndSpill::from_sorter: {e}"))?
-                .with_affinity(affinity);
-            let decompress = SortSpillDecompress::new(64);
+            let and_spill =
+                SortAndSpill::from_sorter(sorter, &self.header, self.tuning.per_step_byte_limit)
+                    .map_err(|e| anyhow!("SortAndSpill::from_sorter: {e}"))?
+                    .with_affinity(affinity);
+            let decompress = SortSpillDecompress::new(self.tuning.per_step_byte_limit);
             let merge =
                 SortMerge::new(sort_order, self.tuning.per_step_byte_limit).with_affinity(affinity);
 

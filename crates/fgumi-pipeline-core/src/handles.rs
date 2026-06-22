@@ -1102,7 +1102,12 @@ pub(crate) fn build_single_queues<T: Send + HeapSize + 'static>(
     assert_eq!(specs.len(), 1, "Single<T>::build_queues requires 1 spec");
     assert_eq!(ordering.len(), 1, "Single<T>::build_queues requires 1 ordering");
 
-    let branch = build_branch::<T>(specs[0], ordering[0]);
+    // `Single<T>` bounds `T: HeapSize`, so use the byte-aware build path: it
+    // honors `QueueSpec::ByteBounded` (documented as supported for `Single<T>`
+    // outputs without item-carried serials) and delegates every non-byte spec
+    // straight back to `build_branch::<T>`, so count/unbounded paths are
+    // unchanged.
+    let branch = build_branch_byte_aware::<T>(specs[0], ordering[0]);
     let view = SingleOutputsView { primary: branch.output };
     let outputs_view = OutputsViewAny { inner: Box::new(view) };
     let queue_set = OutputQueueSet::new(vec![BranchEntry {
@@ -1357,18 +1362,23 @@ mod handle_tests {
     }
 
     #[test]
-    #[should_panic(expected = "ByteBounded requires `T: HeapSize`")]
-    fn byte_bounded_panics_via_user_facing_build_queues() {
-        // Regression: user step declaring `QueueSpec::ByteBounded` in its
-        // `StepProfile::output_queues` reaches the panic via
-        // `StepOutputs::build_queues` → `build_single_queues` →
-        // `build_branch::<T>`. The panic message must clearly direct the
-        // step author to PR 2's byte-aware path.
+    fn byte_bounded_single_builds_via_user_facing_build_queues() {
+        // Regression: a user step declaring `QueueSpec::ByteBounded` in its
+        // `StepProfile::output_queues` with a `Single<T>` output reaches
+        // `StepOutputs::build_queues` → `build_single_queues`. `Single<T>`
+        // bounds `T: HeapSize`, so this builds a byte-bounded queue (the
+        // documented "byte-bounded without item-carried serials" shape)
+        // rather than panicking.
         use crate::outputs::{Single, StepOutputs};
-        let _ = <Single<u32> as StepOutputs>::build_queues(
+        use crate::step::OutputHandles;
+        let (mut queue_set, outputs_view) = <Single<u32> as StepOutputs>::build_queues(
             &[QueueSpec::ByteBounded { limit_bytes: 1000 }],
             &[BranchOrdering::None],
         );
+        let outputs: OutputHandles<Single<u32>> = OutputHandles::new(outputs_view);
+        outputs.push(7).unwrap();
+        let input = queue_set.take_typed_input::<u32>(0);
+        assert_eq!(input.pop(), Some(7));
     }
 
     #[test]

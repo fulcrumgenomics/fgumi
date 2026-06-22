@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-tag", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/fgumi-bam-io", "crates/fgumi-sort", "crates/fgumi-pipeline-core", "crates/fgumi-cli-macros", "crates/xtask"]
+members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-tag", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/fgumi-bam-io", "crates/fgumi-sort", "crates/fgumi-pipeline-core", "crates/fgumi-cli-macros", "crates/fgumi-cli-common", "crates/fgumi-pipeline-io", "crates/fgumi-sort-cli", "crates/xtask"]
 resolver = "2"
 
 [workspace.package]
@@ -21,6 +21,9 @@ fgumi-sam = { version = "0.3.0", path = "crates/fgumi-sam" }
 fgumi-simd-fastq = { version = "0.3.0", path = "crates/fgumi-simd-fastq" }
 fgumi-sort = { version = "0.3.0", path = "crates/fgumi-sort" }
 fgumi-pipeline-core = { version = "0.3.0", path = "crates/fgumi-pipeline-core" }
+fgumi-cli-common = { version = "0.3.0", path = "crates/fgumi-cli-common" }
+fgumi-pipeline-io = { version = "0.3.0", path = "crates/fgumi-pipeline-io" }
+fgumi-sort-cli = { version = "0.3.0", path = "crates/fgumi-sort-cli" }
 fgumi-tag = { version = "0.3.0", path = "crates/fgumi-tag" }
 fgumi-umi = { version = "0.3.0", path = "crates/fgumi-umi" }
 bytemuck = { version = "1.14", features = ["derive"] }
@@ -101,6 +104,9 @@ fgumi-consensus = { workspace = true }
 fgumi-bam-io = { workspace = true }
 fgumi-sort = { workspace = true }
 fgumi-pipeline-core = { workspace = true }
+fgumi-cli-common = { workspace = true }
+fgumi-pipeline-io = { workspace = true }
+fgumi-sort-cli = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.6"

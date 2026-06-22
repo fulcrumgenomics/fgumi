@@ -1,16 +1,6 @@
 //! Tests for the runall-sort three-step chain
 //! (`SortAndSpill` → `SortSpillDecompress` → `SortMerge`) and for the
 //! single-step `SortBamFile` wrapper.
-//!
-//! Strategy: build a 5-step pipeline
-//! `VecSource → SortAndSpill → SortSpillDecompress → SortMerge → VecSink`
-//! and compare emitted record bytes against `RawExternalSorter::sort()`
-//! byte-for-byte. The sort engine itself is covered by 360+ tests in
-//! `fgumi-sort`; these tests pin the typed-step adapter (push, drain,
-//! batch, retry, ordinal-restamp, inter-step event flow).
-//!
-//! We exercise both the in-memory fast path (`memory_limit` > total) and
-//! the multi-spill / k-way merge path (`memory_limit` << total).
 
 use std::io;
 use std::sync::Arc;
@@ -24,21 +14,20 @@ use parking_lot::Mutex;
 use rstest::rstest;
 
 use super::*;
-use crate::pipeline::core::Unpushed;
-use crate::pipeline::core::builder::{Pipeline, PipelineConfig};
-use crate::pipeline::core::held::HeldSlot;
-use crate::pipeline::core::outputs::OrderedBytesSingle;
-use crate::pipeline::core::queues::QueueSpec;
-use crate::pipeline::core::reorder::BranchOrdering;
-use crate::pipeline::core::step::{Step, StepCtx, StepProfile};
-use crate::pipeline::steps::types::RecordBatch;
+use crate::types::RecordBatch;
+use fgumi_pipeline_core::{
+    Unpushed,
+    builder::{Pipeline, PipelineConfig},
+    held::HeldSlot,
+    outputs::OrderedBytesSingle,
+    queues::QueueSpec,
+    reorder::BranchOrdering,
+    step::{Step, StepCtx, StepProfile},
+};
 
 // ── In-memory source / sink test steps ──────────────────────────────────────
 
-/// `Exclusive` source that drains a `Vec<RecordBatch>` one batch per
-/// `try_run` call. Returns `Finished` when empty. Output ordering is
-/// `ByOrdinal` so the framework's reorder stage exercises the same path
-/// real producers go through.
+/// `Exclusive` source that drains a `Vec<RecordBatch>` one batch per `try_run` call.
 struct VecSource {
     batches: Vec<RecordBatch>,
     held: HeldSlot<Unpushed<RecordBatch>>,
@@ -47,7 +36,6 @@ struct VecSource {
 
 impl VecSource {
     fn new(mut batches: Vec<RecordBatch>, output_byte_limit: u64) -> Self {
-        // Pop from the end, so reverse to preserve user-supplied order.
         batches.reverse();
         Self { batches, held: HeldSlot::new(), output_byte_limit }
     }
@@ -90,11 +78,7 @@ impl Step for VecSource {
     }
 }
 
-/// Sink that appends every received batch into a shared `Vec<RecordBatch>`,
-/// for byte-level equivalence checks. `kind` selects the step kind: most tests
-/// use `Exclusive`; the `threads == 1` deadlock repro uses `Serial` so the
-/// chain has only ONE `Exclusive` step (`VecSource`) and is allowed to run at
-/// a single worker.
+/// Sink that appends every received batch into a shared `Vec<RecordBatch>`.
 struct VecSink {
     received: Arc<Mutex<Vec<RecordBatch>>>,
     kind: StepKind,
@@ -128,17 +112,12 @@ impl Step for VecSink {
 
 // ── Synthetic-record helpers ────────────────────────────────────────────────
 
-/// Build `n` synthetic unmapped records with deterministic, sort-relevant
-/// variation (read names, tid/pos, paired flags). Thin wrapper over
-/// [`synthesize_sized_records`] with a zero-length sequence — each record is
-/// the minimal ~50-byte header, so spills are ≤ 1 BGZF block.
 fn synthesize_records(n: usize, seed: u64) -> (Header, Vec<RawRecord>) {
     synthesize_sized_records(n, seed, 0)
 }
 
-/// Pack records into batches of `batch_size` records each.
 fn pack_batches(records: &[RawRecord], batch_size: usize) -> Vec<RecordBatch> {
-    use crate::pipeline::steps::types::RecordBatchBuilder;
+    use crate::types::RecordBatchBuilder;
     records
         .chunks(batch_size)
         .enumerate()
@@ -153,12 +132,6 @@ fn pack_batches(records: &[RawRecord], batch_size: usize) -> Vec<RecordBatch> {
         .collect()
 }
 
-/// Drive the pipeline:
-/// `VecSource(batches)` → `SortAndSpill` → `SortSpillDecompress` →
-/// `SortMerge` → `VecSink(sink_kind)` → collected.
-/// Returns the per-record bytes in emitted order. `sink_kind` is
-/// `Exclusive` for the parity tests and `Serial` for the `threads == 1`
-/// repro (so the chain has a single `Exclusive` step and one worker is legal).
 fn drive_sort_pipeline(
     sorter: RawExternalSorter,
     header: &Header,
@@ -171,9 +144,8 @@ fn drive_sort_pipeline(
 
     let sort_order = sorter.sort_order();
     let source = VecSource::new(batches, output_byte_limit);
-    let and_spill = SortAndSpill::from_sorter(sorter, header, 32)?;
-    // 64 events × ~256 KiB/block ≈ 16 MiB queue ceiling for spill blocks.
-    let decompress = SortSpillDecompress::new(64);
+    let and_spill = SortAndSpill::from_sorter(sorter, header, output_byte_limit)?;
+    let decompress = SortSpillDecompress::new(output_byte_limit);
     let merge = SortMerge::with_target_batch_count(sort_order, output_byte_limit, 256);
     let sink = VecSink { received: Arc::clone(&received), kind: sink_kind };
 
@@ -200,8 +172,6 @@ fn drive_sort_pipeline(
 
 // ── Reference: RawExternalSorter::sort to bytes ─────────────────────────────
 
-/// Run `RawExternalSorter::sort()` on `records` and return per-record
-/// bytes in the resulting BAM.
 fn sort_via_legacy(
     sort_order: SortOrder,
     header: &Header,
@@ -254,9 +224,6 @@ fn three_step_chain_in_memory_path_matches_legacy(
     #[case] sort_order: SortOrder,
     #[case] threads: usize,
 ) {
-    // 5K small records, memory_limit large enough to keep everything
-    // in memory — exercises the in-memory residual chunk (no spill files)
-    // path of the new chain.
     let (header, records) = synthesize_records(5_000, 0x00C0_FFEE);
     let memory_limit = 256 * 1024 * 1024;
 
@@ -293,9 +260,6 @@ fn three_step_chain_multi_spill_path_matches_legacy(
     #[case] sort_order: SortOrder,
     #[case] threads: usize,
 ) {
-    // 20K records under a tight 256 KB memory_limit → many spills,
-    // exercising the spill + decompress + k-way merge path of the new
-    // chain. This is the hot path that motivated the split.
     let (header, records) = synthesize_records(20_000, 0xFEED_FACE);
     let memory_limit = 256 * 1024;
 
@@ -323,13 +287,6 @@ fn three_step_chain_multi_spill_path_matches_legacy(
     }
 }
 
-/// Like [`synthesize_records`] but each record carries a `seq_len`-base
-/// sequence payload so the record byte size is tunable. Large records make
-/// each spill chunk span MANY BGZF blocks (more than `PHASE2_DECOMP_CAP`),
-/// which is the production condition the small-record tests above miss: a
-/// slot does not reach `queue_eof` on its first cap-fill, so the merge
-/// consumer drains it to empty and re-parks on `block_ready` while the
-/// producer is still feeding the same slot.
 fn synthesize_sized_records(n: usize, seed: u64, seq_len: usize) -> (Header, Vec<RawRecord>) {
     let header = Header::default();
     let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
@@ -354,36 +311,6 @@ fn synthesize_sized_records(n: usize, seed: u64, seq_len: usize) -> (Header, Vec
     (header, records)
 }
 
-/// Regression test for issue #330 BUG #3 — the fused-sort-chain deadlock.
-///
-/// Production symptom (fgumi-benchmarks, c7g.4xlarge, `--threads 8`, real
-/// CODEC BAM): `runall --start-from sort` reads/sorts/spills then wedges
-/// forever at the sort→group handoff. Root cause: the merge consumer
-/// blocked on `slot.block_ready.wait()` whenever a slot's decompressed queue
-/// was momentarily empty and not yet at EOF, parking a framework worker (and,
-/// being `Serial`, holding the step lock) with no guarantee a sibling worker
-/// would refill the slot.
-///
-/// The condition the small-record `*_multi_spill_*` tests miss is **large
-/// spill files** — each spill chunk spans far more than `PHASE2_DECOMP_CAP`
-/// (8) BGZF blocks, so a slot stays `!queue_eof` while the merge consumer
-/// drains it to empty mid-merge. The fix makes the merge non-blocking and
-/// resumable (`MergeDriver::try_step` → `SortMerge` returns `Contention`
-/// instead of parking); this test asserts the chain completes at every worker
-/// count, deterministically (a hang ⇒ the bug is back).
-///
-/// `threads == 1` is the M1 case the fix targets (a sole worker that parks in
-/// the merge can never round-robin to refill). It runs here with a large
-/// output-queue limit on purpose: at `threads == 1` the round-robin's
-/// priority-restart separately starves the single worker's downstream drain
-/// under output backpressure — a pre-existing, `threads == 1`-only artifact of
-/// this minimal harness. It does not affect production: the real fused chain
-/// has two `Exclusive` steps (BAM reader + writer) and so always runs at
-/// `threads >= 2`, where a separate worker drains the output. Sizing the queue
-/// above the total output isolates the merge-liveness property this test
-/// guards (the old blocking merge hangs at `threads == 1` regardless of queue
-/// size). The non-blocking-merge unit coverage is in `fgumi-sort`
-/// (`from_slots_try_step_*`).
 #[rstest]
 #[case::t1(1)]
 #[case::t2(2)]
@@ -393,17 +320,9 @@ fn three_step_chain_large_spill_completes(#[case] pipeline_threads: usize) {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    // ~320-byte records (seq_len=200 → 200 + 100 seq/qual bytes + header)
-    // under a 1 MiB memory_limit ⇒ ~3K records/spill ⇒ ~1 MiB ⇒ ~15 BGZF
-    // blocks/spill (> CAP 8). 60K records ⇒ ~20 spill files. The
-    // many-blocks-per-spill shape is what makes the merge consumer drain a
-    // slot to empty while that slot is still `!queue_eof` — the production
-    // condition that triggered the original `block_ready` park.
     let total_records = 60_000usize;
     let memory_limit = 1024 * 1024;
     let sort_order = SortOrder::Coordinate;
-    // Sort-engine internal threads are independent of the pipeline worker
-    // count; keep them low so the spill shape is stable across cases.
     let sorter_threads = 2;
 
     let (header, records) = synthesize_sized_records(total_records, 0xBADD_CAFE, 200);
@@ -414,24 +333,14 @@ fn three_step_chain_large_spill_completes(#[case] pipeline_threads: usize) {
         .output_compression(1)
         .temp_compression(1);
 
-    // Reference output (byte-for-byte) so a hang ISN'T the only thing this
-    // test catches — a merge/refill ordering regression must also fail.
     let legacy_out = sort_via_legacy(sort_order, &header, &records, memory_limit, sorter_threads)
         .expect("legacy sort");
 
-    // Output-queue ceiling sized above the ~19 MiB total output so the
-    // `threads == 1` case isn't confounded by the unrelated single-worker
-    // output-backpressure starvation (see the test doc). The old blocking
-    // merge hangs at `threads == 1` regardless of this size.
     let output_queue_limit = 256 * 1024 * 1024;
     let (tx, rx) = mpsc::channel();
     let worker = std::thread::Builder::new()
         .name(format!("bug3-repro-t{pipeline_threads}"))
         .spawn(move || {
-            // Drive the chain directly at the requested pipeline worker count
-            // — NOT `threads.max(3)` — with a `Serial` sink so the chain has a
-            // single `Exclusive` step and `threads == 1` is legal, exercising
-            // single-worker merge liveness rather than hiding it.
             let result = drive_sort_pipeline(
                 sorter,
                 &header,
@@ -480,13 +389,6 @@ fn three_step_chain_empty_input_drains_cleanly() {
 
 // ── SortBamFile (Exclusive single-step) tests ──────────────────────────────
 
-/// Smoke test for the `SortBamFile` step. Constructs a synthetic input
-/// BAM, sorts it via `[SortBamFile]` through the pipeline, then sorts
-/// the same input via `RawExternalSorter::sort()` directly, and
-/// verifies byte-identical output. Since `SortBamFile`'s body is just
-/// `sorter.sort(input, output)`, this test mostly verifies the
-/// framework wrapping doesn't corrupt anything — the heavy testing is
-/// in `fgumi-sort`'s own 360+ tests.
 #[test]
 fn sort_bam_file_matches_legacy_sort() {
     let (header, records) = synthesize_records(2_000, 0xCAFE_F00D);
@@ -518,17 +420,20 @@ fn sort_bam_file_matches_legacy_sort() {
         .threads(1)
         .output_compression(1)
         .temp_compression(1);
-    let step = SortBamFile::new(
-        sorter,
-        input.clone(),
-        pipeline_out.clone(),
-        Arc::new(parking_lot::Mutex::new(None)),
-    );
+    let stats_slot = Arc::new(parking_lot::Mutex::new(None));
+    let step =
+        SortBamFile::new(sorter, input.clone(), pipeline_out.clone(), Arc::clone(&stats_slot));
 
     let builder = Pipeline::builder();
     builder.chain(step).into_sink_marker();
     let pipeline = builder.build().expect("Pipeline::build");
     pipeline.run(PipelineConfig { threads: 1, ..Default::default() }).expect("Pipeline::run");
+
+    // `SortBamFile::try_run` must publish its stats into the shared slot; the
+    // `SortFinalizeHook` reads this slot after `Pipeline::run` to log the summary.
+    let stats = stats_slot.lock().take().expect("SortBamFile should publish SortStats");
+    assert_eq!(stats.total_records, records.len() as u64);
+    assert_eq!(stats.output_records, records.len() as u64);
 
     let legacy_records = read_all_records(&legacy_out);
     let pipeline_records = read_all_records(&pipeline_out);
@@ -556,7 +461,111 @@ fn sort_bam_file_profile_is_exclusive() {
     assert!(p.branch_ordering.is_empty());
 }
 
-/// Read every record's bytes from a BAM file.
+// ── SortMerge fail-closed regression tests ──────────────────────────────────
+
+/// `Exclusive` source that drains a `Vec<SortPhase2Event>` one event per
+/// `try_run`, feeding `SortMerge` directly. Used to drive the merge into a
+/// drained-but-incomplete-setup state without standing up the spill machinery.
+struct Phase2EventSource {
+    events: Vec<crate::sort::protocol::SortPhase2Event>,
+    held: HeldSlot<Unpushed<crate::sort::protocol::SortPhase2Event>>,
+    output_byte_limit: u64,
+}
+
+impl Phase2EventSource {
+    fn new(
+        mut events: Vec<crate::sort::protocol::SortPhase2Event>,
+        output_byte_limit: u64,
+    ) -> Self {
+        events.reverse();
+        Self { events, held: HeldSlot::new(), output_byte_limit }
+    }
+}
+
+impl Step for Phase2EventSource {
+    type Input = ();
+    type Outputs = fgumi_pipeline_core::outputs::Single<crate::sort::protocol::SortPhase2Event>;
+
+    fn profile(&self) -> StepProfile {
+        StepProfile {
+            name: "Phase2EventSource",
+            kind: StepKind::Exclusive,
+            sticky: true,
+            output_queues: vec![QueueSpec::ByteBounded { limit_bytes: self.output_byte_limit }],
+            branch_ordering: vec![BranchOrdering::None],
+        }
+    }
+
+    fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+        if let Some(unpushed) = self.held.take() {
+            match ctx.outputs.retry(unpushed) {
+                Ok(()) => {}
+                Err(again) => {
+                    self.held.put(again);
+                    return Ok(StepOutcome::Progress);
+                }
+            }
+        }
+        let Some(event) = self.events.pop() else {
+            return Ok(StepOutcome::Finished);
+        };
+        match ctx.outputs.push(event) {
+            Ok(()) => Ok(StepOutcome::Progress),
+            Err(unpushed) => {
+                self.held.put(unpushed);
+                Ok(StepOutcome::Progress)
+            }
+        }
+    }
+}
+
+fn run_merge_over_events(
+    events: Vec<crate::sort::protocol::SortPhase2Event>,
+) -> Result<Vec<Vec<u8>>> {
+    let output_byte_limit = 1 << 20;
+    let received: Arc<Mutex<Vec<RecordBatch>>> = Arc::new(Mutex::new(Vec::new()));
+    let source = Phase2EventSource::new(events, output_byte_limit);
+    let merge = SortMerge::with_target_batch_count(SortOrder::Coordinate, output_byte_limit, 256);
+    let sink = VecSink { received: Arc::clone(&received), kind: StepKind::Serial };
+
+    let builder = Pipeline::builder();
+    builder.chain(source).chain(merge).chain(sink).into_sink_marker();
+    let pipeline = builder.build()?;
+    pipeline.run(PipelineConfig { threads: 1, ..Default::default() })?;
+
+    let collected = std::mem::take(&mut *received.lock());
+    let mut out = Vec::new();
+    for batch in collected {
+        for bytes in batch.iter_record_bytes() {
+            out.push(bytes.to_vec());
+        }
+    }
+    Ok(out)
+}
+
+/// A wholly empty event stream (no payload, no `AllAnnounced`) is the one
+/// legitimate drained-but-not-ready case: it merges to an empty output.
+#[test]
+fn test_sort_merge_empty_input_merges_to_empty() {
+    let out = run_merge_over_events(Vec::new()).expect("empty merge should succeed");
+    assert!(out.is_empty(), "expected no records, got {}", out.len());
+}
+
+/// An `AllAnnounced` that promises a slot which never arrives leaves the setup
+/// incomplete when the input drains; `SortMerge` must fail closed rather than
+/// silently merge a partial result.
+#[test]
+fn test_sort_merge_fails_closed_on_incomplete_setup() {
+    let events = vec![crate::sort::protocol::SortPhase2Event::AllAnnounced {
+        slot_count: 1,
+        memory_chunk_count: 0,
+        total_records: 0,
+    }];
+    let err = run_merge_over_events(events).expect_err("incomplete setup must error");
+    let msg = err.to_string();
+    assert!(msg.contains("setup incomplete at input drain"), "unexpected error message: {msg}");
+}
+
 fn read_all_records(path: &std::path::Path) -> Vec<Vec<u8>> {
     let (mut reader, _hdr) = fgumi_bam_io::create_raw_bam_reader_with_opts(
         path,

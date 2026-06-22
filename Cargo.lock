@@ -669,15 +669,18 @@ dependencies = [
  "fgoxide",
  "fgumi-bam-io",
  "fgumi-bgzf",
+ "fgumi-cli-common",
  "fgumi-cli-macros",
  "fgumi-consensus",
  "fgumi-dna",
  "fgumi-metrics",
  "fgumi-pipeline-core",
+ "fgumi-pipeline-io",
  "fgumi-raw-bam",
  "fgumi-sam",
  "fgumi-simd-fastq",
  "fgumi-sort",
+ "fgumi-sort-cli",
  "fgumi-umi",
  "flate2",
  "fs4",
@@ -743,6 +746,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fgumi-cli-common"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "bytesize",
+ "clap",
+ "enum_dispatch",
+ "log",
+ "num_cpus",
+ "rstest",
+ "sysinfo",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "fgumi-cli-macros"
 version = "0.3.0"
 dependencies = [
@@ -802,6 +820,23 @@ dependencies = [
  "noodles",
  "parking_lot",
  "trybuild",
+]
+
+[[package]]
+name = "fgumi-pipeline-io"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "fgumi-bam-io",
+ "fgumi-bgzf",
+ "fgumi-pipeline-core",
+ "fgumi-raw-bam",
+ "fgumi-sort",
+ "log",
+ "noodles",
+ "parking_lot",
+ "rstest",
+ "tempfile",
 ]
 
 [[package]]
@@ -878,6 +913,27 @@ dependencies = [
  "rstest",
  "tempfile",
  "zstd",
+]
+
+[[package]]
+name = "fgumi-sort-cli"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "bytesize",
+ "clap",
+ "fgumi-bam-io",
+ "fgumi-cli-common",
+ "fgumi-cli-macros",
+ "fgumi-pipeline-core",
+ "fgumi-pipeline-io",
+ "fgumi-sam",
+ "fgumi-sort",
+ "log",
+ "noodles",
+ "parking_lot",
+ "rstest",
+ "tempfile",
 ]
 
 [[package]]

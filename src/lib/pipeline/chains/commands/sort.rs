@@ -27,16 +27,20 @@
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use bytesize::ByteSize;
-use fgumi_sort::{RawExternalSorter, SortOrder};
 use log::info;
 
-use crate::commands::common::{MemoryLimit, resolve_memory_budget};
-use crate::commands::sort::{SortOptions, TMP_DIRS_ENV, parse_cell_tag, resolve_tmp_dirs};
 use crate::logging::OperationTimer;
 use crate::pipeline::chains::builder::ChainBuilder;
 use crate::pipeline::chains::{BuiltPipeline, ChainSpec, FinalizeHook, SinkSpec, SourceSpec};
-use crate::pipeline::steps::sort::SortBamFile;
+
+// The sort step factory, its captures bundle, and the startup-banner logger now
+// live in the `fgumi-sort-cli` crate. Re-export them so the umbrella's
+// `ChainBuilder::add_sort` keeps importing them from this module. Their
+// signatures are independent of the umbrella's `FinalizeHook` trait, so they
+// can be shared verbatim. The two finalize hooks below, by contrast, implement
+// the umbrella's `FinalizeHook` trait (which `fgumi-sort-cli`'s plain-method
+// versions do not), so they stay umbrella-local.
+pub(crate) use fgumi_sort_cli::chains::{SortStepCaptures, build_sort_step, log_sort_start};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SortFinalizeHook
@@ -141,83 +145,10 @@ impl FinalizeHook for IndexBamFinalizeHook {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Step factory
+//
+// `SortStepCaptures`, `build_sort_step`, and `log_sort_start` are re-exported
+// from `fgumi-sort-cli` at the top of this module.
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Parameters for [`build_sort_step`]. Bundles all captures that the
-/// factory needs so the call site in [`ChainBuilder::add_sort`] stays
-/// readable.
-///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_sort`].
-pub(crate) struct SortStepCaptures {
-    pub(crate) sort: SortOptions,
-    pub(crate) input_path: std::path::PathBuf,
-    pub(crate) output_path: std::path::PathBuf,
-    pub(crate) num_sorter_threads: usize,
-    pub(crate) output_compression: u32,
-    pub(crate) command_line: String,
-    /// Shared slot for post-run stats retrieval. The caller (finalize hook)
-    /// holds the other end; the step fills it when `RawExternalSorter::sort`
-    /// returns.
-    pub(crate) stats_slot: Arc<parking_lot::Mutex<Option<fgumi_sort::SortStats>>>,
-}
-
-/// Build the `SortBamFile` step.
-///
-/// Constructs and fully configures the [`RawExternalSorter`] then wraps
-/// it in a [`SortBamFile`]. The step's `Outputs = ()` means it has no
-/// pipeline output branches; `PipelineBuilder::build()` will not flag it
-/// as unwired. The step also has `Input = ()`, so the caller uses
-/// `PipelineBuilder::append_source` to register it.
-///
-/// Returns `(SortBamFile, effective_memory)` — the effective memory value
-/// is not used by the step itself but is logged by `add_sort` before this
-/// function is called (the logging is done in `add_sort` to keep it all in
-/// one place).
-///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_sort`].
-///
-/// # Errors
-///
-/// Returns an error if the `MemoryLimit::Auto` initial-capacity calculation
-/// overflows.
-pub(crate) fn build_sort_step(cap: SortStepCaptures) -> Result<SortBamFile> {
-    let sort_order: SortOrder = cap.sort.order.into();
-    let cell_tag = parse_cell_tag(cap.sort.order)?;
-
-    let effective_memory = resolve_memory_budget(
-        cap.sort.max_memory,
-        cap.sort.memory_reserve,
-        cap.num_sorter_threads,
-        cap.sort.memory_per_thread,
-    )?;
-
-    let mut sorter = RawExternalSorter::new(sort_order)
-        .memory_limit(effective_memory)
-        .threads(cap.num_sorter_threads)
-        .output_compression(cap.output_compression)
-        .temp_compression(cap.sort.temp_compression)
-        .pg_info(crate::version::VERSION.to_string(), cap.command_line);
-
-    if matches!(cap.sort.max_memory, MemoryLimit::Auto) {
-        let init = 768_usize
-            .checked_mul(1024 * 1024)
-            .and_then(|b| b.checked_mul(cap.num_sorter_threads))
-            .ok_or_else(|| anyhow::anyhow!("initial auto buffer size overflowed"))?;
-        sorter = sorter.initial_capacity(effective_memory.min(init));
-    }
-
-    if let Some(ct) = cell_tag {
-        sorter = sorter.cell_tag(ct);
-    }
-
-    let env_value = std::env::var(TMP_DIRS_ENV).ok();
-    let resolved_tmp_dirs = resolve_tmp_dirs(&cap.sort.tmp_dirs, env_value.as_deref());
-    if !resolved_tmp_dirs.is_empty() {
-        sorter = sorter.temp_dirs(resolved_tmp_dirs);
-    }
-
-    Ok(SortBamFile::new(sorter, cap.input_path, cap.output_path, cap.stats_slot))
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // build_sort_chain — 10-line delegate
@@ -243,61 +174,6 @@ pub fn build_sort_chain(spec: ChainSpec) -> Result<BuiltPipeline> {
     let mut chain = ChainBuilder::new(&spec)?;
     chain.add_stage(Stage::Sort, StagePosition::Terminal)?;
     chain.build()
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Logging helpers re-used by add_sort
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Log the sort startup banner. Called from [`ChainBuilder::add_sort`].
-///
-/// `pub(crate)` — not part of the public API.
-pub(crate) fn log_sort_start(
-    sort: &SortOptions,
-    input_path: &std::path::Path,
-    output_path: &std::path::Path,
-    num_sorter_threads: usize,
-    effective_memory: usize,
-) {
-    let cell_tag = parse_cell_tag(sort.order).unwrap_or(None);
-    info!("Starting Sort");
-    info!("Input: {}", input_path.display());
-    info!("Output: {}", output_path.display());
-    info!("Sort order: {:?}", sort.order);
-    if let Some(ct) = cell_tag {
-        let ct_bytes = *ct;
-        info!("Cell tag: {}{}", ct_bytes[0] as char, ct_bytes[1] as char);
-    }
-    if let MemoryLimit::Fixed(per_thread) = sort.max_memory {
-        if sort.memory_per_thread {
-            info!(
-                "Max memory: {} ({}/thread x {} threads)",
-                ByteSize(effective_memory as u64),
-                ByteSize(per_thread as u64),
-                num_sorter_threads
-            );
-        } else {
-            info!("Max memory: {} (fixed)", ByteSize(effective_memory as u64));
-        }
-    }
-    info!("Threads: {num_sorter_threads}");
-    info!("Temp compression level: {}", sort.temp_compression);
-    // The "Write index: enabled" banner that the pre-Phase-4 path
-    // emitted here is no longer surfaced from sort's startup block —
-    // `IndexBamFinalizeHook` (registered by `add_sort` when
-    // `SinkSpec::BamWithIndex` is set) emits its own "Indexing BAM: …"
-    // line when the hook actually runs, which carries the same
-    // information at the more accurate moment.
-    let env_value = std::env::var(TMP_DIRS_ENV).ok();
-    let resolved_tmp_dirs = resolve_tmp_dirs(&sort.tmp_dirs, env_value.as_deref());
-    if !resolved_tmp_dirs.is_empty() {
-        let joined = resolved_tmp_dirs
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        info!("Temp directories: {joined}");
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

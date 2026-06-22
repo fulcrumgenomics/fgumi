@@ -190,6 +190,12 @@ fn main() -> Result<()> {
     // Capture full command line BEFORE clap parsing for @PG records
     let command_line = std::env::args().collect::<Vec<_>>().join(" ");
 
+    // Install the git-augmented version string so `fgumi sort`'s @PG record
+    // (built in the framework-light `fgumi-sort-cli` crate, which cannot see
+    // the umbrella's `built.rs`) matches the rest of the toolchain. Set once
+    // at startup; idempotent — the boolean return is intentionally ignored.
+    let _ = fgumi_sort_cli::version::set_version_override(fgumi_lib::version::VERSION.clone());
+
     let args = match Args::try_parse() {
         Ok(args) => args,
         Err(e) => {
