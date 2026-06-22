@@ -300,7 +300,7 @@ pub(crate) fn build_branch<T: Send + HeapSize + 'static>(
             ordered_branch(
                 transport,
                 OrdinalSource::Allocated(Arc::new(AtomicU64::new(0))),
-                None,
+                Some(DEFAULT_REORDER_OVERFLOW_BYTES),
                 None,
             )
         }
@@ -314,7 +314,7 @@ pub(crate) fn build_branch<T: Send + HeapSize + 'static>(
             ordered_branch(
                 transport,
                 OrdinalSource::Allocated(Arc::new(AtomicU64::new(0))),
-                None,
+                Some(DEFAULT_REORDER_OVERFLOW_BYTES),
                 None,
             )
         }
@@ -356,7 +356,7 @@ pub(crate) fn build_branch_ordered<T: Send + HeapSize + Ordered + 'static>(
             ordered_branch(
                 transport,
                 OrdinalSource::ItemSerial(|item: &T| item.ordinal()),
-                None,
+                Some(DEFAULT_REORDER_OVERFLOW_BYTES),
                 None,
             )
         }
@@ -366,7 +366,7 @@ pub(crate) fn build_branch_ordered<T: Send + HeapSize + Ordered + 'static>(
             ordered_branch(
                 transport,
                 OrdinalSource::ItemSerial(|item: &T| item.ordinal()),
-                None,
+                Some(DEFAULT_REORDER_OVERFLOW_BYTES),
                 None,
             )
         }

@@ -5,7 +5,6 @@
 // Command trait
 // ─────────────────────────────────────────────────────────────────────────────
 
-use anyhow::Result;
 use enum_dispatch::enum_dispatch;
 
 /// Trait implemented by all fgumi CLI commands.
@@ -15,7 +14,7 @@ use enum_dispatch::enum_dispatch;
 #[enum_dispatch]
 pub trait Command {
     #[allow(clippy::missing_errors_doc)]
-    fn execute(&self, command_line: &str) -> Result<()>;
+    fn execute(&self, command_line: &str) -> anyhow::Result<()>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -24,8 +23,15 @@ pub trait Command {
 
 use thiserror::Error;
 
-/// Result type alias for fgumi operations
+/// Result type alias for fgumi operations (preferred in standalone crates).
 pub type FgumiResult<T> = std::result::Result<T, FgumiError>;
+
+/// Unqualified result alias used by the umbrella crate's error/validation modules.
+///
+/// Both `FgumiResult<T>` and `Result<T>` are the same type; the two names exist
+/// so callers that shadow `std::result::Result` with `use crate::errors::Result`
+/// (umbrella convention) resolve to the same `FgumiError`-based alias.
+pub type Result<T> = std::result::Result<T, FgumiError>;
 
 /// Error type for fgumi operations
 #[derive(Error, Debug)]
@@ -99,7 +105,11 @@ pub fn detect_total_memory() -> usize {
     system.refresh_memory();
     let physical = system.total_memory();
     let bytes = system.cgroup_limits().map_or(physical, |c| c.total_memory.min(physical));
-    usize::try_from(bytes).unwrap_or(usize::MAX)
+    // Saturate at usize::MAX / 2 rather than usize::MAX on 32-bit platforms so
+    // the downstream `budget > total` overflow check in `resolve_memory_budget`
+    // can fire correctly (no value can exceed usize::MAX, so using it as the
+    // fallback renders the check dead).
+    usize::try_from(bytes).unwrap_or(usize::MAX / 2)
 }
 
 /// Returns the number of logical CPUs available to this process.
@@ -119,7 +129,8 @@ pub fn detect_cpu_count() -> usize {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Format an integer with comma separators (e.g. 1234567 → "1,234,567").
-fn format_count(n: u64) -> String {
+#[must_use]
+pub fn format_count(n: u64) -> String {
     let s = n.to_string();
     let mut result = String::with_capacity(s.len() + s.len() / 3);
     let offset = s.len() % 3;
@@ -406,7 +417,7 @@ const AUTO_RESERVE_CAP: usize = 10 * 1024 * 1024 * 1024;
 /// # Errors
 ///
 /// Returns an error string if parsing fails.
-pub fn parse_memory(s: &str) -> Result<MemoryLimit, String> {
+pub fn parse_memory(s: &str) -> std::result::Result<MemoryLimit, String> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("auto") {
         return Ok(MemoryLimit::Auto);
@@ -419,7 +430,7 @@ pub fn parse_memory(s: &str) -> Result<MemoryLimit, String> {
 /// # Errors
 ///
 /// Returns an error string if parsing fails.
-pub fn parse_memory_reserve(s: &str) -> Result<MemoryReserve, String> {
+pub fn parse_memory_reserve(s: &str) -> std::result::Result<MemoryReserve, String> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("auto") {
         return Ok(MemoryReserve::Auto);
@@ -517,7 +528,7 @@ fn resolve_memory_budget_with_total(
 }
 
 /// Parse a memory size string into `usize` bytes (private helper).
-fn parse_memory_bytes(s: &str, label: &str) -> Result<usize, String> {
+fn parse_memory_bytes(s: &str, label: &str) -> std::result::Result<usize, String> {
     let bytes = parse_memory_size(s).map_err(|e| e.to_string())?;
     usize::try_from(bytes).map_err(|_| format!("{label} too large: {bytes}"))
 }
@@ -528,7 +539,7 @@ fn parse_memory_bytes(s: &str, label: &str) -> Result<usize, String> {
 /// # Errors
 ///
 /// Returns an error string if the input is not a recognized boolean.
-pub fn parse_bool(s: &str) -> Result<bool, String> {
+pub fn parse_bool(s: &str) -> std::result::Result<bool, String> {
     match s.to_ascii_lowercase().as_str() {
         "true" | "t" | "yes" | "y" => Ok(true),
         "false" | "f" | "no" | "n" => Ok(false),
@@ -695,5 +706,45 @@ mod tests {
         // Out-of-range values are rejected at parse time rather than silently accepted.
         assert!(CompressionHarness::try_parse_from(["prog", "--compression-level", "13"]).is_err());
         assert!(CompressionHarness::try_parse_from(["prog", "--compression-level", "99"]).is_err());
+    }
+
+    #[test]
+    fn test_resolve_memory_budget_auto_low_available() {
+        // When available memory per thread is below MIN_MEMORY_PER_THREAD, the
+        // budget is floored to MIN_MEMORY_PER_THREAD × threads, then capped at
+        // available (which is less), so the result equals available.
+        let total = 2 * MIN_MEMORY_PER_THREAD; // very tight: only 2 × floor per 4 threads
+        let reserve = 0;
+        let budget = resolve_memory_budget_with_total(
+            MemoryLimit::Auto,
+            MemoryReserve::Fixed(reserve),
+            4,
+            true,
+            total,
+        )
+        .unwrap();
+        // available = total - 0 = 2×MIN; per-thread = 2×MIN/4 < MIN → floored to MIN;
+        // target = MIN × 4 = 4×MIN > available → capped at available.
+        assert_eq!(budget, total);
+    }
+
+    #[test]
+    fn test_resolve_memory_budget_auto_margin_exceeds_total() {
+        // When the reserve margin >= total, saturating_sub → 0 available.
+        // Budget is then floored to MIN_MEMORY_PER_THREAD, capped at 0
+        // (available), so result == 0 (the cap wins).
+        let total = 512 * 1024 * 1024_usize; // 512 MiB
+        let margin = total + 1; // margin exceeds total
+        let budget = resolve_memory_budget_with_total(
+            MemoryLimit::Auto,
+            MemoryReserve::Fixed(margin),
+            1,
+            false,
+            total,
+        )
+        .unwrap();
+        // available = total.saturating_sub(margin) = 0; target = max(0, MIN) = MIN;
+        // budget = MIN.min(0) = 0.
+        assert_eq!(budget, 0);
     }
 }

@@ -82,7 +82,9 @@ impl ChainGraph {
     ///
     /// # Panics
     ///
-    /// Panics if the (producer, branch) is already wired (defensive).
+    /// Panics if the (producer, branch) is already wired (defensive), or if
+    /// `producer`, `branch`, `consumer`, or `consumer_input_slot` are out of
+    /// range.
     pub fn wire_to_slot(
         &mut self,
         producer: StepIdx,
@@ -90,6 +92,19 @@ impl ChainGraph {
         consumer: StepIdx,
         consumer_input_slot: usize,
     ) {
+        assert!(
+            consumer.0 < self.input_arities.len(),
+            "consumer StepIdx({}) out of range (graph has {} steps)",
+            consumer.0,
+            self.input_arities.len()
+        );
+        let consumer_arity = self.input_arities[consumer.0];
+        assert!(
+            consumer_input_slot < consumer_arity,
+            "consumer_input_slot {consumer_input_slot} out of range for step '{}' \
+             with input_arity {consumer_arity}",
+            self.step_names[consumer.0]
+        );
         let slot = self.consumer_slot_index(producer, branch);
         assert!(
             self.consumers[slot].is_none(),
@@ -164,6 +179,20 @@ impl ChainGraph {
     }
 
     fn consumer_slot_index(&self, producer: StepIdx, branch: BranchIdx) -> usize {
+        assert!(
+            producer.0 < self.branch_counts.len(),
+            "producer StepIdx({}) out of range (graph has {} steps)",
+            producer.0,
+            self.branch_counts.len()
+        );
+        let branch_count = self.branch_counts[producer.0];
+        assert!(
+            branch.0 < branch_count,
+            "branch BranchIdx({}) out of range for producer '{}' with {} branches",
+            branch.0,
+            self.step_names[producer.0],
+            branch_count
+        );
         let mut offset = 0;
         for &count in &self.branch_counts[..producer.0] {
             offset += count;
@@ -232,5 +261,26 @@ mod tests {
         let sink2 = g.register_step("Sink2", 0);
         g.wire(src, BranchIdx(0), sink1);
         g.wire(src, BranchIdx(0), sink2); // panics
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn wire_into_zero_arity_source_panics() {
+        // Sources register with `input_arity = 0` (their input is implicit), so
+        // even slot 0 must be rejected — there is no valid input branch to wire.
+        let mut g = ChainGraph::new();
+        let producer = g.register_step("Producer", 1);
+        let source = g.register_step_with_input_arity("Source", 1, 0);
+        g.wire(producer, BranchIdx(0), source); // slot 0, but arity 0 → panics
+    }
+
+    #[test]
+    #[should_panic(expected = "consumer StepIdx(5) out of range")]
+    fn wire_to_out_of_range_consumer_panics() {
+        // A consumer index past the registered steps must produce a
+        // deterministic range error rather than an opaque out-of-bounds panic.
+        let mut g = ChainGraph::new();
+        let producer = g.register_step("Producer", 1);
+        g.wire(producer, BranchIdx(0), StepIdx(5)); // no step 5 registered
     }
 }

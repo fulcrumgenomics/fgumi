@@ -15,6 +15,8 @@ log = "0"
 noodles = { version = "0.111.0", features = ["sam"] }
 
 [dev-dependencies]
+proptest = "1.10"
+rstest = "0"
 trybuild = "1.0"
 
 [lints.clippy]

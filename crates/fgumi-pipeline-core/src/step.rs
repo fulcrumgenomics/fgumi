@@ -64,8 +64,8 @@ pub enum Affinity {
     /// benefits from thread locality.
     Writer,
     /// Restrict attempts to a specific worker index. Out-of-range values
-    /// (`>= n_threads`) are debug-asserted at run start and result in
-    /// a deadlock at runtime (no worker is eligible).
+    /// (`>= n_threads`) trigger an assertion failure (panic) at run start
+    /// via an always-on `assert!` in `build_worker_storage`.
     Worker(usize),
 }
 
@@ -245,7 +245,7 @@ pub trait Step: Send + Sized + 'static {
     }
 
     /// Step body. Pop from `ctx.input`, push to `ctx.outputs`. Returns
-    /// `Progress` / `NoProgress` / `Contention`. Errors propagate via `Err`.
+    /// `Progress` / `NoProgress` / `Contention` / `Finished`. Errors propagate via `Err`.
     ///
     /// # Errors
     ///

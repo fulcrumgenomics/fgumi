@@ -819,6 +819,8 @@ dependencies = [
  "log",
  "noodles",
  "parking_lot",
+ "proptest",
+ "rstest",
  "trybuild",
 ]
 

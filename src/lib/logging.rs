@@ -2,22 +2,16 @@
 //!
 //! This module provides consistent, user-friendly logging utilities for metrics,
 //! progress tracking, and operation summaries.
+//!
+//! `format_count`, `format_duration`, `format_rate`, and `OperationTimer` are
+//! re-exported from `fgumi-cli-common` (single source of truth).  `format_percent`
+//! and the consensus/UMI summary helpers are umbrella-only and defined here.
 
-use std::time::{Duration, Instant};
+pub use fgumi_cli_common::{OperationTimer, format_count, format_duration, format_rate};
 
 use crate::metrics::{ConsensusMetrics, UmiGroupingMetrics};
-use crate::rejection::format_count;
 
 /// Formats a percentage with specified decimal places.
-///
-/// # Arguments
-///
-/// * `value` - The fraction (0.0-1.0) to format as percentage
-/// * `decimals` - Number of decimal places to include
-///
-/// # Returns
-///
-/// A string formatted as "XX.XX%" (e.g., "95.43%")
 ///
 /// # Examples
 ///
@@ -33,87 +27,10 @@ pub fn format_percent(value: f64, decimals: usize) -> String {
     format!("{:.decimals$}%", value * 100.0, decimals = decimals)
 }
 
-/// Formats a duration in human-readable form.
-///
-/// # Arguments
-///
-/// * `duration` - The duration to format
-///
-/// # Returns
-///
-/// A human-readable string (e.g., "2m 15s", "1h 30m", "45s")
-///
-/// # Examples
-///
-/// ```
-/// use fgumi_lib::logging::format_duration;
-/// use std::time::Duration;
-///
-/// assert_eq!(format_duration(Duration::from_secs(45)), "45s");
-/// assert_eq!(format_duration(Duration::from_secs(135)), "2m 15s");
-/// assert_eq!(format_duration(Duration::from_secs(5400)), "1h 30m");
-/// ```
-#[must_use]
-pub fn format_duration(duration: Duration) -> String {
-    let secs = duration.as_secs();
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        let mins = secs / 60;
-        let remaining_secs = secs % 60;
-        if remaining_secs == 0 { format!("{mins}m") } else { format!("{mins}m {remaining_secs}s") }
-    } else {
-        let hours = secs / 3600;
-        let mins = (secs % 3600) / 60;
-        if mins == 0 { format!("{hours}h") } else { format!("{hours}h {mins}m") }
-    }
-}
-
-/// Formats a rate (items per second) with appropriate units.
-///
-/// # Arguments
-///
-/// * `count` - Number of items processed
-/// * `duration` - Time taken to process items
-///
-/// # Returns
-///
-/// A formatted rate string (e.g., "1,234 reads/s", "50 reads/min")
-///
-/// # Examples
-///
-/// ```
-/// use fgumi_lib::logging::format_rate;
-/// use std::time::Duration;
-///
-/// assert_eq!(format_rate(1000, Duration::from_secs(1)), "1,000 items/s");
-/// assert_eq!(format_rate(600, Duration::from_secs(60)), "10 items/s");
-/// ```
-#[must_use]
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub fn format_rate(count: u64, duration: Duration) -> String {
-    let secs = duration.as_secs_f64();
-    if secs < 0.001 {
-        return format!("{} items/s", format_count(count));
-    }
-
-    let rate = count as f64 / secs;
-    if rate >= 1.0 {
-        format!("{} items/s", format_count(rate as u64))
-    } else {
-        let items_per_min = count as f64 / (secs / 60.0);
-        format!("{items_per_min:.1} items/min")
-    }
-}
-
 /// Logs a formatted summary of consensus metrics.
 ///
 /// Outputs key metrics including input/output counts, rejection breakdown,
 /// and quality statistics.
-///
-/// # Arguments
-///
-/// * `metrics` - The consensus metrics to summarize
 ///
 /// # Examples
 ///
@@ -161,10 +78,6 @@ pub fn log_consensus_summary(metrics: &ConsensusMetrics) {
 ///
 /// Outputs grouping statistics including molecule counts and family sizes.
 ///
-/// # Arguments
-///
-/// * `metrics` - The UMI grouping metrics to summarize
-///
 /// # Examples
 ///
 /// ```no_run
@@ -200,21 +113,17 @@ pub fn log_umi_grouping_summary(metrics: &UmiGroupingMetrics) {
     }
 
     // Log filter counts (matching fgbio's logging style)
-    // Non-PF only logged if > 0
     if metrics.discarded_non_pf > 0 {
         log::info!("Filtered out {} non-PF records.", format_count(metrics.discarded_non_pf));
     }
-    // Poor alignment always logged (like fgbio)
     log::info!(
         "Filtered out {} records due to mapping issues.",
         format_count(metrics.discarded_poor_alignment)
     );
-    // Ns in UMI always logged (like fgbio)
     log::info!(
         "Filtered out {} records that contained one or more Ns in their UMIs.",
         format_count(metrics.discarded_ns_in_umi)
     );
-    // UMI too short only logged if > 0
     if metrics.discarded_umi_too_short > 0 {
         log::info!(
             "Filtered out {} records that contained UMIs that were too short.",
@@ -223,51 +132,11 @@ pub fn log_umi_grouping_summary(metrics: &UmiGroupingMetrics) {
     }
 }
 
-/// Operation timing and summary helper.
-///
-/// Tracks operation timing and provides formatted summary output.
-///
-/// # Examples
-///
-/// ```no_run
-/// use fgumi_lib::logging::OperationTimer;
-///
-/// let timer = OperationTimer::new("Processing reads");
-///
-/// // ... do work ...
-///
-/// timer.log_completion(10_000); // Log with item count
-/// ```
-pub struct OperationTimer {
-    operation: String,
-    start_time: Instant,
-}
-
-impl OperationTimer {
-    /// Creates a new operation timer and logs the start.
-    #[must_use]
-    pub fn new(operation: &str) -> Self {
-        log::info!("{operation} ...");
-        Self { operation: operation.to_string(), start_time: Instant::now() }
-    }
-
-    /// Logs the completion with item count and rate.
-    pub fn log_completion(&self, count: u64) {
-        let duration = self.start_time.elapsed();
-        log::info!(
-            "{} completed: {} in {} ({})",
-            self.operation,
-            format_count(count),
-            format_duration(duration),
-            format_rate(count, duration)
-        );
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::cast_precision_loss)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn test_format_percent() {
