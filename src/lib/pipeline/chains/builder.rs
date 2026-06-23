@@ -42,6 +42,8 @@ use crate::pipeline::chains::{
     StageTimingFinalizeHook, build_pipeline_config_for_chain,
 };
 use crate::pipeline::core::builder::PipelineBuilder;
+// Only the `consensus`-gated `FuseState` implements `HeapSize` in this module.
+#[cfg(feature = "consensus")]
 use crate::pipeline::core::item::HeapSize;
 use crate::pipeline::core::topology::{BranchIdx, StepIdx};
 use crate::pipeline::steps::tuning::BamPipelineTuning;
@@ -210,11 +212,13 @@ pub(crate) enum ChainTailKind {
 /// `PipelineBuilder::append_source` / `append_step`, which bypass the
 /// typed-chain API. See the module-level type-erasure note for the runtime
 /// behaviour when a type mismatch is introduced.
+#[cfg(feature = "consensus")]
 pub(crate) struct FuseState {
     scratch: Vec<u8>,
     mi_buf: String,
 }
 
+#[cfg(feature = "consensus")]
 impl HeapSize for FuseState {}
 
 /// Build the `TemplatesToMiGroups` bridge step that fuses an intermediate
@@ -227,6 +231,7 @@ impl HeapSize for FuseState {}
 /// `duplex_strip_strand` controls whether the `/A` `/B` strand suffix is
 /// stripped from the MI key so both strands of a duplex molecule group
 /// together (`true` for duplex; `false` for simplex and codec).
+#[cfg(feature = "consensus")]
 fn templates_to_mi_step(
     limit_bytes: u64,
     duplex_strip_strand: bool,
@@ -956,6 +961,7 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// [`DecompressedBlock`]: crate::pipeline::steps::types::DecompressedBlock
     /// [`DecodedRecordBatch`]: crate::pipeline::steps::types::DecodedRecordBatch
+    #[cfg(feature = "consensus")]
     fn finish_consensus_tail(
         &mut self,
         tail: (
@@ -991,6 +997,7 @@ impl<'a> ChainBuilder<'a> {
     /// context. Shared by `add_simplex`/`add_duplex`/`add_codec`, whose
     /// rejects wiring is otherwise identical — only the consensus step's type
     /// (built inline by the caller) differs.
+    #[cfg(feature = "consensus")]
     fn wire_consensus_rejects_branch(
         &self,
         consensus_pt: (StepIdx, BranchIdx),
@@ -2449,6 +2456,32 @@ impl<'a> ChainBuilder<'a> {
         Ok(())
     }
 
+    // ----------------------------------------------------------------------
+    // Consensus stages (simplex / duplex / codec).
+    //
+    // The full method bodies below are compiled only with the `consensus`
+    // feature, which gates the consensus command modules and their option
+    // types. When the crate is built without `consensus`, the consensus CLI
+    // commands and option-bag slots are compiled out, so these stages are
+    // unreachable — but `add_stage`'s match must still resolve all three
+    // `Stage` variants. These stubs provide that resolution and fail loudly
+    // if ever reached.
+    // ----------------------------------------------------------------------
+    #[cfg(not(feature = "consensus"))]
+    fn add_simplex(&mut self, _position: StagePosition) -> Result<()> {
+        bail!("fgumi was built without consensus support; rebuild with `--features consensus`")
+    }
+
+    #[cfg(not(feature = "consensus"))]
+    fn add_duplex(&mut self, _position: StagePosition) -> Result<()> {
+        bail!("fgumi was built without consensus support; rebuild with `--features consensus`")
+    }
+
+    #[cfg(not(feature = "consensus"))]
+    fn add_codec(&mut self, _position: StagePosition) -> Result<()> {
+        bail!("fgumi was built without consensus support; rebuild with `--features consensus`")
+    }
+
     /// Simplex-specific step sequence:
     ///
     /// `GroupByMi` →
@@ -2479,6 +2512,7 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// [`BatchedMiGroups`]: crate::pipeline::steps::group::mi::BatchedMiGroups
     /// [`DecompressedBlock`]: crate::pipeline::steps::types::DecompressedBlock
+    #[cfg(feature = "consensus")]
     #[allow(clippy::too_many_lines)]
     fn add_simplex(&mut self, position: StagePosition) -> Result<()> {
         use crate::commands::common::{
@@ -2721,6 +2755,7 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// [`BatchedMiGroups`]: crate::pipeline::steps::group::mi::BatchedMiGroups
     /// [`DecompressedBlock`]: crate::pipeline::steps::types::DecompressedBlock
+    #[cfg(feature = "consensus")]
     #[allow(clippy::too_many_lines)]
     fn add_duplex(&mut self, position: StagePosition) -> Result<()> {
         use crate::commands::common::{
@@ -2975,6 +3010,7 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// [`BatchedMiGroups`]: crate::pipeline::steps::group::mi::BatchedMiGroups
     /// [`DecompressedBlock`]: crate::pipeline::steps::types::DecompressedBlock
+    #[cfg(feature = "consensus")]
     #[allow(clippy::too_many_lines)]
     fn add_codec(&mut self, position: StagePosition) -> Result<()> {
         use crate::commands::common::warn_unwired_pipeline_flags;

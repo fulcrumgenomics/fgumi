@@ -9,13 +9,16 @@
 
 pub mod align;
 pub mod clip;
+#[cfg(feature = "consensus")]
 pub mod codec;
 pub mod correct;
 pub mod dedup;
+#[cfg(feature = "consensus")]
 pub mod duplex;
 pub mod extract;
 pub mod filter;
 pub mod group;
+#[cfg(feature = "consensus")]
 pub mod simplex;
 pub mod sort;
 pub mod zipper;
@@ -27,6 +30,10 @@ pub mod zipper;
 ///
 /// BAM record body size is u32-bounded per the spec; a single record's buffer
 /// cannot exceed `u32::MAX` in practice, so the length cast cannot truncate.
+//
+// Only the consensus command builders (codec/simplex/duplex) call this, so it
+// is gated under `consensus` to avoid a dead-code warning when consensus is off.
+#[cfg(feature = "consensus")]
 pub(crate) fn append_framed_bytes(dst: &mut Vec<u8>, rec: &[u8]) {
     #[allow(clippy::cast_possible_truncation)]
     let block_size = rec.len() as u32;

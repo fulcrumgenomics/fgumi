@@ -66,9 +66,13 @@ fn collect_commands() -> Vec<CommandInfo> {
     #[cfg(feature = "simulate")]
     use fgumi_lib::commands::simulate;
     use fgumi_lib::commands::{
-        clip, codec, correct, dedup, downsample, duplex, duplex_metrics, extract, fastq, filter,
-        group, merge, review, simplex, simplex_metrics, sort, zipper,
+        clip, correct, dedup, downsample, extract, fastq, filter, group, merge, review, sort,
+        zipper,
     };
+    // The consensus command modules are gated behind `fgumi`'s `consensus`
+    // feature; xtask mirrors it as `consensus` (default-on for doc builds).
+    #[cfg(feature = "consensus")]
+    use fgumi_lib::commands::{codec, duplex, duplex_metrics, runall, simplex, simplex_metrics};
 
     // Each command type with its CLI name. The name override is needed because
     // clap derives names from struct names, which may not match the subcommand
@@ -82,15 +86,22 @@ fn collect_commands() -> Vec<CommandInfo> {
         ("sort", <sort::Sort as CommandFactory>::command),
         ("group", <group::GroupReadsByUmi as CommandFactory>::command),
         ("dedup", <dedup::MarkDuplicates as CommandFactory>::command),
+        #[cfg(feature = "consensus")]
         ("simplex", <simplex::Simplex as CommandFactory>::command),
+        #[cfg(feature = "consensus")]
         ("duplex", <duplex::Duplex as CommandFactory>::command),
+        #[cfg(feature = "consensus")]
         ("codec", <codec::Codec as CommandFactory>::command),
+        #[cfg(feature = "consensus")]
+        ("runall", <runall::RunAll as CommandFactory>::command),
         ("filter", <filter::Filter as CommandFactory>::command),
         ("clip", <clip::Clip as CommandFactory>::command),
+        #[cfg(feature = "consensus")]
         ("duplex-metrics", <duplex_metrics::DuplexMetrics as CommandFactory>::command),
         ("review", <review::Review as CommandFactory>::command),
         ("downsample", <downsample::Downsample as CommandFactory>::command),
         ("merge", <merge::Merge as CommandFactory>::command),
+        #[cfg(feature = "consensus")]
         ("simplex-metrics", <simplex_metrics::SimplexMetrics as CommandFactory>::command),
         #[cfg(feature = "compare")]
         ("compare", <compare::Compare as CommandFactory>::command),
@@ -346,14 +357,34 @@ mod tests {
     fn test_collect_commands_finds_all() {
         let commands = collect_commands();
         let names: Vec<_> = commands.iter().map(|(n, ..)| n.as_str()).collect();
+        // Always present (feature-independent commands).
         assert!(names.contains(&"extract"));
         assert!(names.contains(&"group"));
-        assert!(names.contains(&"simplex"));
-        assert!(names.contains(&"duplex"));
         assert!(names.contains(&"filter"));
         assert!(names.contains(&"merge"));
-        assert!(names.contains(&"simplex-metrics"));
-        assert!(names.len() >= 17);
+        // The consensus commands are only collected with the `consensus` feature
+        // (their parser entries are `#[cfg(feature = "consensus")]`-gated).
+        #[cfg(feature = "consensus")]
+        {
+            // Assert every consensus command is discovered explicitly — `runall`
+            // in particular is exposed by `main.rs` under `consensus` but was
+            // previously omitted from `collect_commands()`, leaving its doc page
+            // ungenerated. A bare `names.len()` check is too weak to catch a
+            // single missing entry, so pin each name.
+            assert!(names.contains(&"simplex"));
+            assert!(names.contains(&"duplex"));
+            assert!(names.contains(&"codec"));
+            assert!(names.contains(&"runall"));
+            assert!(names.contains(&"duplex-metrics"));
+            assert!(names.contains(&"simplex-metrics"));
+            // 12 always-present + 6 consensus (simplex, duplex, codec, runall,
+            // duplex-metrics, simplex-metrics). `>=` rather than `==` because the
+            // `compare` / `simulate` features (which Cargo can feature-unify into
+            // a `--workspace` build) add further commands.
+            assert!(names.len() >= 18);
+        }
+        #[cfg(not(feature = "consensus"))]
+        assert!(names.len() >= 12);
     }
 
     #[test]

@@ -1072,6 +1072,8 @@ fn test_correct_reads_stdin_once(#[case] threads: &str) {
 
 /// codec has a single-threaded fast path (no `--threads`) plus the
 /// multi-threaded chain path; cover both.
+// Uses helpers from the consensus-gated `test_codec_command` module.
+#[cfg(feature = "consensus")]
 #[rstest]
 #[case::single_threaded(None)]
 #[case::multi_threaded(Some("2"))]
@@ -1116,6 +1118,8 @@ fn test_codec_reads_stdin_once(#[case] threads: Option<&str>) {
 
 /// duplex has a single-threaded fast path (no `--threads`) plus the
 /// multi-threaded chain path; cover both.
+// Uses helpers from the consensus-gated `test_duplex_command` module.
+#[cfg(feature = "consensus")]
 #[rstest]
 #[case::single_threaded(None)]
 #[case::multi_threaded(Some("2"))]
