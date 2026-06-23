@@ -478,8 +478,11 @@ impl UmiAssigner for ParallelAdjacencyAssigner {
             return (0..raw_umis.len()).map(|i| MoleculeId::Single(i as u64)).collect();
         }
 
-        // Sort by count descending, then by UMI string for determinism
-        // This matches the sequential assigner's behavior exactly
+        // Sort by count descending, then by the case-folded UMI string for determinism.
+        // `a.0` is the uppercased UMI (the count-map key), so this tie-break is
+        // case-insensitive and matches the sequential assigner, which folds case in its
+        // own tie-break. Keeping both case-folded is what makes the two implementations
+        // group mixed-case inputs identically.
         sorted_umis.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         // Build indexed structures (avoid cloning strings by using indices)
@@ -1220,6 +1223,152 @@ mod tests {
 
         // AAAAAA and AAAAAC should be grouped (AAAAAA is lexicographically first)
         assert_eq!(assignments1[0], assignments1[4]);
+    }
+
+    /// Returns true iff two assignment vectors induce the same partition of input
+    /// indices (i.e. identical grouping structure), ignoring the concrete
+    /// `MoleculeId` labels.
+    fn same_partition(a: &[MoleculeId], b: &[MoleculeId]) -> bool {
+        a.len() == b.len()
+            && (0..a.len()).all(|i| (0..a.len()).all(|j| (a[i] == a[j]) == (b[i] == b[j])))
+    }
+
+    // ==================== Mixed-case parity (sequential vs parallel) ====================
+    //
+    // fgbio baseline for the three parity tests below. fgbio's `GroupReadsByUmi` CLI
+    // uppercases every UMI before assignment (`canonicalize(rawTag.toUpperCase)`), so at the
+    // user-facing level fgbio groups mixed-case input case-insensitively. fgumi folds case
+    // inside the assigner instead, producing the SAME grouping as fgbio's CLI — these tests
+    // pin the concrete grouping that fgbio's CLI emits, so they are a real fgbio-derived
+    // expected output, not just a sequential-vs-parallel cross-check.
+    //
+    // The expected groupings below were captured by driving fgbio's actual assigner classes
+    // (fgbio @ src/main/scala/com/fulcrumgenomics/umi/GroupReadsByUmi.scala) on these exact
+    // inputs, uppercased as the CLI does:
+    //   * edit  [ACGT, acgt]                        -> 1 molecule {ACGT, acgt}
+    //   * adjacency [AAAaAA x2, AAAGAC x2, AAAAAC]  -> {AAAAAA(<-AAAaAA), AAAAAC}, {AAAGAC}
+    //   * paired [ACGT-TGCA, acgt-tgca, TGCA-ACGT]  -> one molecule, fwd spellings on strand
+    //                                                  A, reverse spelling on strand B
+    // On UPPERCASE input case folding is a no-op, so fgumi == fgbio there trivially too. The
+    // only place fgumi differs from fgbio is fgbio's raw assigner *classes* (case-sensitive
+    // counting/tie-break), which fgbio never reaches with mixed case because its CLI
+    // pre-uppercases; fgumi moving the fold into the assigner is the safer, equivalent choice.
+
+    #[test]
+    fn test_sequential_and_parallel_adjacency_agree_on_mixed_case() {
+        // The sequential and parallel adjacency assigners are documented to produce
+        // identical groupings. Counting is case-insensitive in both (BitEnc folds case),
+        // so their equal-count tie-break must also be case-insensitive to agree.
+        //
+        // This is the same topology as `test_parallel_adjacency_deterministic_tiebreak`
+        // (AAAAAA & AAAGAC both count=2, AAAAAC count=1 within 1 edit of both), but the
+        // first node's reads are spelled "AAAaAA". Raw-string ordering sorts "AAAaAA"
+        // AFTER "AAAGAC" ('a' > 'G'), while case-folded ordering sorts "AAAAAA" BEFORE
+        // "AAAGAC". A raw tie-break would make AAAGAC the root (capturing AAAAAC); a
+        // case-folded tie-break makes AAAAAA the root. The two assigners must agree.
+        let umis: Vec<String> = vec!["AAAaAA", "AAAaAA", "AAAGAC", "AAAGAC", "AAAAAC"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        let sequential = crate::umi::AdjacencyUmiAssigner::new(1, 1, 100).assign(&umis);
+        let parallel = ParallelAdjacencyAssigner::new(1, 2).assign(&umis);
+
+        assert!(
+            same_partition(&sequential, &parallel),
+            "sequential and parallel adjacency must group mixed-case UMIs identically;\n  \
+             sequential: {sequential:?}\n  parallel:   {parallel:?}"
+        );
+
+        // Pin the full fgbio-CLI grouping: {AAAAAA(<-AAAaAA), AAAAAC} and {AAAGAC} separate.
+        // The case-folded root (AAAAAA, from "AAAaAA") captures AAAAAC, and AAAGAC stays in
+        // its own molecule, in both implementations.
+        assert_eq!(sequential[0], sequential[4], "sequential: AAAaAA should capture AAAAAC");
+        assert_eq!(parallel[0], parallel[4], "parallel: AAAaAA should capture AAAAAC");
+        assert_ne!(sequential[0], sequential[2], "sequential: AAAGAC is a separate molecule");
+        assert_ne!(parallel[0], parallel[2], "parallel: AAAGAC is a separate molecule");
+    }
+
+    #[test]
+    fn test_sequential_and_parallel_edit_agree_on_mixed_case() {
+        // The parallel edit assigner uppercases before matching, so "ACGT" and "acgt"
+        // are the same molecule. The sequential edit assigner must agree: matching is
+        // case-insensitive. Without case folding, "ACGT" and "acgt" differ at all four
+        // positions (case-sensitive), so the sequential assigner would split them.
+        let umis: Vec<String> = vec!["ACGT", "acgt"].into_iter().map(String::from).collect();
+
+        let sequential = crate::umi::SimpleErrorUmiAssigner::new(1).assign(&umis);
+        let parallel = ParallelEditAssigner::new(1, 2).assign(&umis);
+
+        assert!(
+            same_partition(&sequential, &parallel),
+            "sequential and parallel edit must group mixed-case UMIs identically;\n  \
+             sequential: {sequential:?}\n  parallel:   {parallel:?}"
+        );
+        assert_eq!(sequential[0], sequential[1], "ACGT and acgt are the same molecule");
+    }
+
+    #[test]
+    fn test_sequential_and_parallel_paired_agree_on_mixed_case() {
+        // The parallel paired assigner canonicalizes to uppercase, so forward,
+        // reversed, and lowercase spellings of the same molecule group together with
+        // consistent strand (A/B) assignment. The sequential paired assigner must agree.
+        // Without case folding it counts/matches on the raw string, splitting "acgt-tgca"
+        // from "ACGT-TGCA".
+        //
+        // All three spell the same molecule: "ACGT-TGCA" (fwd), "acgt-tgca" (fwd, lower),
+        // "TGCA-ACGT" (reverse strand). Expected: indices 0,1 share a strand, index 2 the
+        // opposite strand.
+        let umis: Vec<String> =
+            vec!["ACGT-TGCA", "acgt-tgca", "TGCA-ACGT"].into_iter().map(String::from).collect();
+
+        let sequential = crate::umi::PairedUmiAssigner::new(1).assign(&umis);
+        let parallel = ParallelPairedAssigner::new(1, 2).assign(&umis);
+
+        assert!(
+            same_partition(&sequential, &parallel),
+            "sequential and parallel paired must group mixed-case UMIs identically \
+             (including strand);\n  sequential: {sequential:?}\n  parallel:   {parallel:?}"
+        );
+        // 0 and 1 (both forward) share a strand; 2 (reverse) is the opposite strand of the
+        // SAME molecule. Assert the full expected grouping (not just sequential/parallel
+        // parity): all three indices must share one base molecule ID, with index 2 on the
+        // opposite A/B strand. `same_partition` alone would still pass if index 2 were
+        // assigned to an unrelated molecule, so pin the base-molecule and strand
+        // relationships explicitly for both implementations.
+        //
+        // Pin the ABSOLUTE A/B orientation, not just "same"/"opposite": the canonical form of
+        // this molecule is "ACGT-TGCA" (the lexicographically smaller of ACGT-TGCA / TGCA-ACGT,
+        // uppercased), so the forward spellings (0, 1) match the canonical and land on strand A
+        // while the reverse spelling (2) lands on strand B. A global A/B inversion would still
+        // satisfy the same/opposite checks below but would diverge from this fgbio-derived
+        // expectation, so assert the concrete PairedA/PairedB variants.
+        assert!(
+            matches!(sequential[0], MoleculeId::PairedA(_))
+                && matches!(sequential[1], MoleculeId::PairedA(_))
+                && matches!(sequential[2], MoleculeId::PairedB(_)),
+            "sequential: expected fwd,fwd,rev => A,A,B; got {sequential:?}"
+        );
+        assert!(
+            matches!(parallel[0], MoleculeId::PairedA(_))
+                && matches!(parallel[1], MoleculeId::PairedA(_))
+                && matches!(parallel[2], MoleculeId::PairedB(_)),
+            "parallel: expected fwd,fwd,rev => A,A,B; got {parallel:?}"
+        );
+        assert_eq!(sequential[0], sequential[1], "forward spellings share a strand");
+        assert_eq!(parallel[0], parallel[1], "parallel: forward spellings share a strand");
+        assert_eq!(
+            sequential[0].base_id_string(),
+            sequential[2].base_id_string(),
+            "sequential: reverse spelling should share the base molecule"
+        );
+        assert_eq!(
+            parallel[0].base_id_string(),
+            parallel[2].base_id_string(),
+            "parallel: reverse spelling should share the base molecule"
+        );
+        assert_ne!(sequential[0], sequential[2], "reverse spelling is the opposite strand");
+        assert_ne!(parallel[0], parallel[2], "parallel: reverse spelling is the opposite strand");
     }
 
     #[test]

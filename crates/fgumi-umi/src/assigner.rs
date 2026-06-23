@@ -897,6 +897,11 @@ impl UmiAssigner for IdentityUmiAssigner {
 /// 3. If one match, add to that group
 /// 4. If multiple matches, merge all matching groups
 ///
+/// # Case sensitivity
+///
+/// UMI matching is case-insensitive: bases are folded to uppercase before comparison, so
+/// this agrees with the parallel edit assigner on mixed-case input.
+///
 /// # Thread Safety
 ///
 /// Uses atomic counter for ID generation, making it safe to use across threads.
@@ -938,12 +943,17 @@ impl UmiAssigner for SimpleErrorUmiAssigner {
             return Vec::new();
         }
 
+        // Match case-insensitively, consistent with the parallel edit assigner (which
+        // uppercases before encoding). Folding case here keeps the two implementations in
+        // agreement on mixed-case input; it is a no-op for the uppercase UMIs the CLI emits.
+        let upper_umis: Vec<Umi> = raw_umis.iter().map(|umi| umi.to_uppercase()).collect();
+
         let mut umi_sets: Vec<BTreeSet<Umi>> = Vec::new();
         // Track seen UMIs to skip duplicate processing
         let mut seen: std::collections::HashSet<&str> =
-            std::collections::HashSet::with_capacity(raw_umis.len());
+            std::collections::HashSet::with_capacity(upper_umis.len());
 
-        for umi in raw_umis {
+        for umi in &upper_umis {
             // Skip duplicate UMIs - they're already in a set
             if !seen.insert(umi.as_str()) {
                 continue;
@@ -1004,7 +1014,7 @@ impl UmiAssigner for SimpleErrorUmiAssigner {
         }
 
         // Build result Vec indexed by input position
-        raw_umis.iter().map(|umi| umi_to_id[umi]).collect()
+        upper_umis.iter().map(|umi| umi_to_id[umi]).collect()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -1047,6 +1057,21 @@ struct Node {
 ///    - Search for unassigned UMIs with `count < root_count / 2 + 1`
 ///    - If within edit distance, add as child and continue recursively
 /// 4. Assign same molecule ID to root and all its descendants
+///
+/// # Case sensitivity
+///
+/// UMI matching, counting, and the equal-count tie-break are all case-insensitive: bases
+/// are compared after folding to uppercase. This mirrors the parallel implementation so the
+/// two agree on mixed-case input.
+///
+/// This matches fgbio's user-facing output: fgbio's `GroupReadsByUmi` uppercases every UMI
+/// before assignment (`canonicalize(rawTag.toUpperCase)`), so its assigner only ever sees
+/// uppercase UMIs. fgumi folds case inside the assigner instead of relying on the caller,
+/// which is a no-op on the uppercase data both tools group in practice and keeps the library
+/// API from being misused case-sensitively. (fgbio's raw `AdjacencyUmiAssigner` *class*
+/// counts and tie-breaks on the case-sensitive string — its `countMismatches` folds case but
+/// its counting and ordering do not — but that path is never reached with mixed case because
+/// the CLI pre-uppercases.)
 ///
 /// # Multi-threading
 ///
@@ -1475,8 +1500,20 @@ impl UmiAssigner for AdjacencyUmiAssigner {
         #[cfg(feature = "profile-adjacency")]
         let t_after_count = std::time::Instant::now();
 
-        // Sort by descending count, then by original string for determinism
-        umi_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| raw_umis[a.2].cmp(&raw_umis[b.2])));
+        // Sort by descending count, then by the case-folded UMI string for determinism.
+        // Counting is case-insensitive (BitEnc folds case), so the tie-break must be too;
+        // otherwise mixed-case inputs would order differently here than in the parallel
+        // assigner (which keys on the uppercased UMI), producing divergent groupings.
+        // Comparing the raw bytes uppercased on the fly avoids allocating per comparison
+        // and is a no-op for the already-uppercase input the CLI provides.
+        umi_counts.sort_by(|a, b| {
+            b.1.cmp(&a.1).then_with(|| {
+                raw_umis[a.2]
+                    .bytes()
+                    .map(|c| c.to_ascii_uppercase())
+                    .cmp(raw_umis[b.2].bytes().map(|c| c.to_ascii_uppercase()))
+            })
+        });
 
         // Build lookup from BitEnc to sorted index (after sorting)
         let bitenc_to_unique_idx: AHashMap<BitEnc, usize> =
@@ -1581,6 +1618,12 @@ impl UmiAssigner for AdjacencyUmiAssigner {
 ///    - Compare to root to determine strand (closer to root or its reverse)
 ///    - Assign /A suffix if closer to root, /B if closer to reverse
 /// 4. Map both A-B and B-A forms to appropriate strand IDs
+///
+/// # Case sensitivity
+///
+/// UMI counting, matching, and strand assignment are all case-insensitive: bases are folded
+/// to uppercase before processing, so this agrees with the parallel paired assigner on
+/// mixed-case input.
 ///
 /// # Thread Safety
 ///
@@ -1794,8 +1837,14 @@ impl UmiAssigner for PairedUmiAssigner {
             assert!((umi.split('-').count() == 2), "UMI {umi} is not a paired UMI");
         }
 
+        // Work on uppercased UMIs so counting, matching, and strand assignment are all
+        // case-insensitive, matching the parallel paired assigner (which canonicalizes to
+        // uppercase). This keeps the two implementations in agreement on mixed-case input
+        // and is a no-op for the uppercase UMIs the CLI emits.
+        let upper_umis: Vec<Umi> = raw_umis.iter().map(|umi| umi.to_uppercase()).collect();
+
         // Count with A-B and B-A combined
-        let mut umi_counts = Self::count_paired(raw_umis);
+        let mut umi_counts = Self::count_paired(&upper_umis);
         umi_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         if umi_counts.len() == 1 {
@@ -1803,7 +1852,7 @@ impl UmiAssigner for PairedUmiAssigner {
             let ab = MoleculeId::PairedA(id);
             let ba = MoleculeId::PairedB(id);
 
-            return raw_umis
+            return upper_umis
                 .iter()
                 .map(|umi| {
                     let reversed = Self::reverse(umi)
@@ -1857,15 +1906,22 @@ impl UmiAssigner for PairedUmiAssigner {
         }
 
         // Build result Vec indexed by input position
-        raw_umis.iter().map(|umi| umi_to_id.get(umi).copied().unwrap_or(MoleculeId::None)).collect()
+        upper_umis
+            .iter()
+            .map(|umi| umi_to_id.get(umi).copied().unwrap_or(MoleculeId::None))
+            .collect()
     }
 
     fn is_same_umi(&self, a: &str, b: &str) -> bool {
+        // Fold case so this helper matches `assign()` (which works on `upper_umis`) and the
+        // parallel paired canonicalizer; mixed-case callers must not disagree.
+        let a = a.to_uppercase();
+        let b = b.to_uppercase();
         if a == b {
             return true;
         }
         // Check if A-B equals B-A
-        if let (Ok((a1, a2)), Ok((b1, b2))) = (Self::split(a), Self::split(b)) {
+        if let (Ok((a1, a2)), Ok((b1, b2))) = (Self::split(&a), Self::split(&b)) {
             a1 == b2 && a2 == b1
         } else {
             false
@@ -1873,7 +1929,10 @@ impl UmiAssigner for PairedUmiAssigner {
     }
 
     fn canonicalize(&self, umi: &str) -> String {
-        Self::canonicalize_paired(umi).unwrap_or_else(|_| umi.to_string())
+        // Fold case before canonicalizing so mixed-case spellings collapse to the same
+        // uppercase canonical form, matching `assign()` and the parallel paired assigner.
+        let upper = umi.to_uppercase();
+        Self::canonicalize_paired(&upper).unwrap_or(upper)
     }
 
     fn split_templates_by_pair_orientation(&self) -> bool {
@@ -2385,6 +2444,34 @@ mod tests {
     }
 
     #[test]
+    fn test_paired_helpers_are_case_insensitive() {
+        // `assign()` folds case (see `upper_umis`); the trait helpers that make up the
+        // rest of the paired assigner's public, case-insensitive contract must agree, so
+        // that mixed-case callers reaching these helpers directly cannot disagree with the
+        // parallel paired canonicalizer (which uppercases).
+        //
+        // fgbio baseline: case-insensitive matching/canonicalization is what fgbio's
+        // user-facing paired path does, since its `GroupReadsByUmi` CLI uppercases every UMI
+        // before assignment, so lower/upper and forward/reversed spellings of one molecule
+        // collapse to the same canonical form. Folding case in these helpers converges with
+        // that fgbio behavior rather than diverging from it. (Confirmed by driving fgbio's
+        // actual `PairedUmiAssigner` on the uppercased mixed-case inputs used below.)
+        let assigner = PairedUmiAssigner::new(1);
+
+        // is_same_umi: lower vs upper spelling of the same orientation.
+        assert!(assigner.is_same_umi("acgt-tgca", "ACGT-TGCA"));
+        // is_same_umi: lower vs upper spelling of the reversed orientation.
+        assert!(assigner.is_same_umi("acgt-tgca", "TGCA-ACGT"));
+        // is_same_umi: still distinguishes genuinely different UMIs regardless of case.
+        assert!(!assigner.is_same_umi("acgt-tgca", "aaaa-tttt"));
+
+        // canonicalize: case spelling does not change the canonical form, and reversed
+        // spellings canonicalize to the same uppercase string.
+        assert_eq!(assigner.canonicalize("acgt-tgca"), "ACGT-TGCA");
+        assert_eq!(assigner.canonicalize("tgca-ACGT"), assigner.canonicalize("ACGT-TGCA"));
+    }
+
+    #[test]
     fn test_paired_matches() {
         let assigner = PairedUmiAssigner::new(1);
 
@@ -2864,6 +2951,41 @@ mod tests {
             assignments_structurally_equal(&umis, &assignments, &umis2, &assignments2),
             "Equal-count adjacency grouping should be deterministic across runs"
         );
+    }
+
+    #[test]
+    fn test_adjacency_equal_count_tiebreak_is_case_insensitive() {
+        // Same topology as `test_adjacency_equal_count_deterministic`, but the count-2 root
+        // is spelled "AAAaAA". The equal-count tie-break must fold case: raw-byte ordering
+        // sorts "AAAaAA" AFTER "AAAGAC" ('a' > 'G'), which would make AAAGAC the root and
+        // capture AAAAAC; case-folded ordering sorts "AAAAAA" first, so it captures AAAAAC.
+        //
+        // fgbio baseline: this is an output-changing assignment path, so the grouping pinned
+        // below is the one fgbio's `GroupReadsByUmi` CLI produces, not just a local choice.
+        // fgbio uppercases every UMI before assignment (`canonicalize(rawTag.toUpperCase)`),
+        // so it sees "AAAAAA" (not "AAAaAA") and its `sortBy((-count, umi))` tie-break makes
+        // AAAAAA the root that captures AAAAAC, with AAAGAC in a separate molecule — exactly
+        // the grouping asserted here. Folding case in the assigner converges with fgbio's
+        // user-facing output; it does not diverge from it. (Captured by driving fgbio's actual
+        // `AdjacencyUmiAssigner` on the uppercased input.)
+        let assigner = AdjacencyUmiAssigner::new(1, 1, DEFAULT_INDEX_THRESHOLD);
+        let umis = vec![
+            "AAAaAA".to_string(),
+            "AAAaAA".to_string(),
+            "AAAGAC".to_string(),
+            "AAAGAC".to_string(),
+            "AAAAAC".to_string(),
+        ];
+
+        let assignments = assigner.assign(&umis);
+        let map = build_assignment_map(&umis, &assignments);
+
+        assert_eq!(
+            map.get("AAAaAA"),
+            map.get("AAAAAC"),
+            "case-folded tie-break: AAAaAA (== AAAAAA) should capture AAAAAC"
+        );
+        assert_ne!(map.get("AAAaAA"), map.get("AAAGAC"), "AAAGAC should be in a separate group");
     }
 
     // ==================== Index Threshold Tests ====================
