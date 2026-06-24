@@ -21,10 +21,8 @@ use std::any::Any;
 use std::sync::Arc;
 
 use crate::erased::ErasedStep;
-use crate::handles::{BranchInputHandle, OutputQueueSet, build_branch};
+use crate::handles::{BranchInputHandle, OutputQueueSet};
 use crate::item::HeapSize;
-use crate::queues::QueueSpec;
-use crate::reorder::BranchOrdering;
 use crate::topology::{BranchIdx, ChainGraph, StepIdx};
 
 /// Per-step input + outputs handles. The worker loop hands these to
@@ -194,11 +192,12 @@ fn build_chain_contexts_inner(
 }
 
 /// Construct a `BranchInputHandle<()>` that's already drained — for source
-/// steps whose input is implicitly empty + drained from t=0.
+/// steps whose input is implicitly empty + drained from t=0. Uses the zero-state
+/// `always_drained` handle (no backing queue), so building a source costs no
+/// `SegQueue` allocation for a handle whose only job is to report
+/// `is_drained() == true` (the worker loop never pops from a source's input).
 fn dummy_unit_input_handle() -> Box<dyn Any + Send + Sync> {
-    let branch = build_branch::<()>(QueueSpec::Unbounded, BranchOrdering::None);
-    branch.output.mark_drained();
-    Box::new(branch.input)
+    Box::new(BranchInputHandle::<()>::always_drained())
 }
 
 /// Find the (producer, branch) that produces the given consumer step.
@@ -294,7 +293,9 @@ mod tests {
 
     use crate::erased::TypedStep;
     use crate::outputs::Single;
-    use crate::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
+    use crate::queues::QueueSpec;
+    use crate::reorder::BranchOrdering;
+    use crate::step::{InputHandle, Step, StepCtx, StepKind, StepOutcome, StepProfile};
 
     #[derive(Clone)]
     struct StubSource;
@@ -395,9 +396,15 @@ mod tests {
         assert_eq!(ctx.outputs.len(), n);
         assert!(ctx.bounded_queues.is_empty());
 
+        let source = ctx.inputs[0]
+            .downcast_ref::<BranchInputHandle<()>>()
+            .expect("source must have a dummy unit input handle");
+        // Pin the `always_drained()` invariant: a source's input is implicitly
+        // drained from t=0, so a regression that swapped it back to a real
+        // (never-draining) queue would be caught here, not just the downcast.
         assert!(
-            ctx.inputs[0].downcast_ref::<BranchInputHandle<()>>().is_some(),
-            "source must have a dummy unit input handle"
+            source.is_drained(),
+            "source's dummy unit input handle must report drained (always_drained invariant)"
         );
         for i in 1..n {
             assert!(

@@ -176,13 +176,22 @@ pub fn run_fused_single_thread(
             // In release builds the `debug_assert!` is compiled out, so record
             // the stall as an error before breaking. Otherwise the loop would
             // exit and map to `Ok`, silently truncating the output instead of
-            // surfacing the broken invariant.
+            // surfacing the broken invariant. Name the still-unfinished steps so
+            // the error points at the wedged step(s) rather than just the
+            // synthetic "fused-driver" name.
+            let stalled_steps: Vec<&'static str> = finished
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| !**f)
+                .map(|(i, _)| steps[i].name())
+                .collect();
             signal.record_error(PipelineError::Io {
                 step: "fused-driver",
-                source: std::io::Error::other(
-                    "fused single-thread driver stalled: no step progressed and \
-                     not all steps have finished",
-                ),
+                source: std::io::Error::other(format!(
+                    "fused single-thread driver stalled: no step progressed and not all \
+                     steps have finished; unfinished step(s): {}",
+                    stalled_steps.join(", "),
+                )),
             });
             break 'drive;
         }

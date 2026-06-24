@@ -679,6 +679,18 @@ impl Pipeline {
         for (idx, step) in self.steps.iter().enumerate() {
             let profile = step.profile();
             let n_branches = self.graph.branch_count(super::topology::StepIdx(idx));
+            // Render the *effective* (post-collapse) ordering so the diagnostic
+            // matches the transport actually built. Single-input Serial /
+            // Exclusive producers collapse declared `ByOrdinal` / `ByItemOrdinal`
+            // to `None` (no reorder stage); `Step2` producers (input_arity == 2)
+            // and `Parallel` producers keep their declared ordering verbatim.
+            // Using the shared `effective_branch_orderings` helper keeps `dag()`
+            // and `build_output_set` from drifting.
+            let effective_orderings = if step.input_arity() == 2 {
+                profile.branch_ordering.clone()
+            } else {
+                super::erased::effective_branch_orderings(profile.kind, &profile.branch_ordering)
+            };
             let _ = write!(
                 s,
                 "  [{idx}] {name:<24} {kind:?} sticky={sticky} branches={n_branches}",
@@ -704,8 +716,7 @@ impl Pipeline {
                         .get(branch_usize)
                         .copied()
                         .unwrap_or(super::queues::QueueSpec::Unbounded);
-                    let ordering = profile
-                        .branch_ordering
+                    let ordering = effective_orderings
                         .get(branch_usize)
                         .copied()
                         .unwrap_or(super::reorder::BranchOrdering::None);
@@ -810,6 +821,17 @@ impl Pipeline {
 
         // 2. Build per-step contexts (input + output handles).
         let contexts = Arc::new(build_chain_contexts(&steps, &graph));
+
+        // 2-pre-monitor invariant: if the deadlock monitor will be armed, every
+        // output transport must be ByteBounded so `in_flight_bytes` can see a
+        // wedge on it. A CountBounded/Unbounded edge is invisible to the probe
+        // and would silently disable fail-fast on that edge. Checked here (debug
+        // builds only) while `steps` is still alive — it is consumed by
+        // `build_worker_storage` below. Test chains use CountBounded/Unbounded
+        // but do not arm the monitor, so this only fires for a fail-fast run.
+        if deadlock_timeout_secs > 0 && stats_arc.is_some() {
+            assert_monitor_visible_transports(&steps, &graph);
+        }
 
         // 2a. If a total queue-memory budget was supplied, evenly
         // redistribute it across all byte-bounded queues now (before
@@ -1077,14 +1099,20 @@ const DEADLOCK_FATAL_MULTIPLE: u64 = 6;
 /// on byte-bounded edges.
 ///
 /// LIMITATION: only `ByteBounded` branches register a queue handle (see
-/// `build_chain_contexts_inner`), so `CountBounded`/`Unbounded` transports — and
-/// any reorder stash on such a branch — do not contribute here. The only current
-/// `CountBounded` user is the sort spill→merge path, whose `SortMerge` is
-/// deadlock-free by construction (the cooperative slot-refill that fixed issue
-/// #330 BUG #3), so a wedge there is not reachable and the monitor correctly
-/// stays quiet during a slow merge (where in-flight on byte-bounded edges is 0).
-/// Extending the probe to count-based queues for defense-in-depth is tracked
-/// separately.
+/// `build_chain_contexts_inner`), so a `CountBounded`/`Unbounded` transport — and
+/// any reorder stash on such a branch — would not contribute here, making the
+/// monitor blind to a wedge living entirely on such an edge.
+///
+/// This is safe because **no production pipeline edge uses
+/// `CountBounded`/`Unbounded`**: every production step profile declares
+/// `QueueSpec::ByteBounded`, so the probe covers every production transport.
+/// (The sort spill→merge path is fully byte-bounded too — its deadlock-free
+/// backpressure is the internal `SortMergeSlot` slot table, not a pipeline
+/// `CountBounded` edge.) `assert_monitor_visible_transports` enforces this
+/// invariant in debug builds whenever the monitor is armed, so a future step
+/// that declares a monitor-blind transport on a fail-fast pipeline trips loudly
+/// rather than silently losing the wedge verdict. Extending the probe to
+/// count-based queues for full defense-in-depth is tracked separately.
 fn in_flight_bytes(contexts: &crate::runtime::contexts::ChainContexts) -> u64 {
     contexts
         .bounded_queues
@@ -1094,6 +1122,60 @@ fn in_flight_bytes(contexts: &crate::runtime::contexts::ChainContexts) -> u64 {
                 + rq.reorder_cap.as_ref().map_or(0, |r| r.current_buffer_bytes())
         })
         .sum()
+}
+
+/// Return the first `(step_name, QueueSpec)` whose output transport is invisible
+/// to the deadlock monitor's [`in_flight_bytes`] probe — i.e. a `CountBounded`
+/// or `Unbounded` branch, which registers no byte-probe handle. `None` means
+/// every output transport is monitor-visible (`ByteBounded`).
+///
+/// Used by [`assert_monitor_visible_transports`] to pin the "no production edge
+/// is monitor-blind" invariant the [`in_flight_bytes`] doc relies on. Iterates
+/// every branch the graph declares for each step (`0..branch_count`) rather than
+/// just the explicit `output_queues` entries: a step may declare fewer specs than
+/// it has branches, and `dag()`/context-building resolve those missing branches
+/// to `QueueSpec::Unbounded`. Using the same `unwrap_or(Unbounded)` fallback here
+/// keeps the guard from overlooking an implicit (and therefore monitor-blind)
+/// Unbounded branch.
+fn first_monitor_blind_transport(
+    steps: &[Box<dyn super::erased::ErasedStep>],
+    graph: &super::topology::ChainGraph,
+) -> Option<(&'static str, super::queues::QueueSpec)> {
+    use super::queues::QueueSpec;
+    for (step_idx, step) in steps.iter().enumerate() {
+        let profile = step.profile();
+        for branch in 0..graph.branch_count(super::topology::StepIdx(step_idx)) {
+            let spec = profile.output_queues.get(branch).copied().unwrap_or(QueueSpec::Unbounded);
+            match spec {
+                QueueSpec::ByteBounded { .. } => {}
+                QueueSpec::CountBounded { .. } | QueueSpec::Unbounded => {
+                    return Some((profile.name, spec));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Debug-build invariant check (run only when the deadlock monitor is armed):
+/// every production output transport must be `ByteBounded` so the
+/// [`in_flight_bytes`] probe can see a wedge on it. A `CountBounded`/`Unbounded`
+/// edge would be invisible to the monitor, silently disabling fail-fast on that
+/// edge — exactly the blind spot this guard exists to catch. The framework still
+/// permits `CountBounded`/`Unbounded` for `#[cfg(test)]` chains (which do not arm
+/// the monitor), so this only fires for a real fail-fast pipeline.
+fn assert_monitor_visible_transports(
+    steps: &[Box<dyn super::erased::ErasedStep>],
+    graph: &super::topology::ChainGraph,
+) {
+    debug_assert!(
+        first_monitor_blind_transport(steps, graph).is_none(),
+        "deadlock monitor is armed but step '{}' declares a {:?} output transport, \
+         which is invisible to the in_flight_bytes probe — a wedge on that edge would \
+         silently disable fail-fast. Production transports must be QueueSpec::ByteBounded.",
+        first_monitor_blind_transport(steps, graph).map_or("?", |(name, _)| name),
+        first_monitor_blind_transport(steps, graph).map(|(_, spec)| spec),
+    );
 }
 
 /// Background deadlock monitor body. Polls `stats` every `poll_interval`,
@@ -1521,6 +1603,45 @@ mod tests {
     }
 
     #[test]
+    fn apply_initial_queue_budget_floors_each_queue_at_min_when_budget_tiny() {
+        // When `total / n_queues < MIN_PER_QUEUE_BYTES`, the budget pass floors
+        // each transport at `MIN_PER_QUEUE_BYTES` even though the effective total
+        // then exceeds the user's budget — starvation (a zero/tiny-budget queue
+        // that always rejects pushes, wedging the producer) is the worse failure
+        // mode. A regression dropping the `.max(MIN_PER_QUEUE_BYTES)` would not be
+        // caught by the lean/huge cases the sibling test covers.
+        use crate::queues::{BoundedQueueHandle, ByteBoundedQueue};
+        use crate::runtime::contexts::RegisteredQueue;
+        use crate::topology::{BranchIdx, StepIdx};
+
+        // Four registered queues, each constructed at the 1 MiB floor.
+        let handles: Vec<Arc<ByteBoundedQueue<u32>>> =
+            (0..4).map(|_| Arc::new(ByteBoundedQueue::<u32>::new(MIN_PER_QUEUE_BYTES))).collect();
+        let registered: Vec<RegisteredQueue> = handles
+            .iter()
+            .enumerate()
+            .map(|(i, h)| RegisteredQueue {
+                producer_step_name: "TestStep",
+                producer_step: StepIdx(i),
+                branch: BranchIdx(0),
+                handle: Arc::clone(h) as Arc<dyn BoundedQueueHandle>,
+                reorder_cap: None,
+            })
+            .collect();
+
+        // total = 1 byte over 4 queues → per_queue would be 0, floored to 1 MiB.
+        apply_initial_queue_budget(&registered, 1);
+        for h in &handles {
+            assert_eq!(
+                h.limit_bytes(),
+                MIN_PER_QUEUE_BYTES,
+                "each queue's transport limit must be floored to MIN_PER_QUEUE_BYTES \
+                 when the per-queue share underflows the floor"
+            );
+        }
+    }
+
+    #[test]
     fn reorder_cap_tracks_per_queue_clamped_to_floor_and_ceiling() {
         let ceiling = crate::reorder::DEFAULT_REORDER_OVERFLOW_BYTES;
         // Mid-range per_queue passes through unchanged.
@@ -1723,6 +1844,32 @@ mod tests {
         assert!(dag.contains("→ SinkU32"), "DAG missing source→sink wiring: {dag}");
     }
 
+    #[test]
+    fn dag_renders_effective_collapsed_ordering_for_serial_exclusive() {
+        // `StubSource` is `Exclusive` and declares `BranchOrdering::ByOrdinal`,
+        // but `build_output_set` collapses that to `None` (no reorder stage) for
+        // single-input Serial/Exclusive producers. `dag()` must render the
+        // *effective* ordering so the diagnostic matches the transport actually
+        // built — it must not print the un-collapsed declared `ByOrdinal`.
+        let builder = PipelineBuilder::new();
+        builder.chain(StubSource).chain(StubSinkU32).into_sink_marker();
+        let pipeline = builder.build().unwrap();
+        let dag = pipeline.dag();
+        // The source's output branch line is `.0: <queue> <ordering> → SinkU32`.
+        let source_branch_line = dag
+            .lines()
+            .find(|l| l.contains("→ SinkU32"))
+            .expect("DAG must have the source→sink branch line");
+        assert!(
+            source_branch_line.contains("None"),
+            "DAG must render the collapsed (effective) ordering `None`: {source_branch_line}"
+        );
+        assert!(
+            !source_branch_line.contains("ByOrdinal"),
+            "DAG must NOT render the un-collapsed declared `ByOrdinal`: {source_branch_line}"
+        );
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // Pipeline::run smoke tests
     // ─────────────────────────────────────────────────────────────────────
@@ -1767,6 +1914,59 @@ mod tests {
                 ctx.outputs.push(n).map_err(|_| {
                     std::io::Error::other("Unbounded queue rejected push (impossible)")
                 })?;
+                Ok(StepOutcome::Progress)
+            } else {
+                Ok(StepOutcome::NoProgress)
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// Byte-bounded twin of [`SharedCountingSource`] for the monitor-armed
+    /// fail-fast test. The deadlock monitor's `in_flight_bytes` probe only sees
+    /// `ByteBounded` transports, and `assert_monitor_visible_transports` (a
+    /// debug-build invariant) rejects an `Unbounded`/`CountBounded` source on a
+    /// monitor-armed run. Using this source lets
+    /// `pipeline_run_reraises_worker_panic_with_monitor_enabled` actually reach
+    /// the monitor startup/shutdown path instead of tripping that assertion
+    /// first (and passing for the wrong reason).
+    #[derive(Clone)]
+    struct SharedCountingByteBoundedSource {
+        remaining: Arc<AtomicU32>,
+    }
+    impl Step for SharedCountingByteBoundedSource {
+        type Input = ();
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "SharedSourceByteBounded",
+                kind: StepKind::Parallel,
+                sticky: false,
+                // ByteBounded so the monitor probe can see this edge; sized large
+                // enough that the handful of items pushed before the sink panics
+                // never hit backpressure.
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 20 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            let n = self.remaining.load(AtomicOrd::Acquire);
+            if n == 0 {
+                return Ok(StepOutcome::Finished);
+            }
+            if self
+                .remaining
+                .compare_exchange(n, n - 1, AtomicOrd::AcqRel, AtomicOrd::Acquire)
+                .is_ok()
+            {
+                // ByteBounded can reject under backpressure: hand the claimed
+                // item's budget back and retry next dispatch rather than erroring.
+                if ctx.outputs.push(n).is_err() {
+                    self.remaining.fetch_add(1, AtomicOrd::AcqRel);
+                    return Ok(StepOutcome::NoProgress);
+                }
                 Ok(StepOutcome::Progress)
             } else {
                 Ok(StepOutcome::NoProgress)
@@ -1912,8 +2112,12 @@ mod tests {
         // peer observes `is_done()` and exits, letting every join complete.
         let remaining = Arc::new(AtomicU32::new(1_000));
         let builder = PipelineBuilder::new();
+        // ByteBounded source so the monitor-visible-transports invariant holds and
+        // the test reaches the real monitor startup/shutdown path (a plain
+        // `SharedCountingSource` declares an `Unbounded` edge, which the debug
+        // `assert_monitor_visible_transports` would reject before the monitor runs).
         builder
-            .chain(SharedCountingSource { remaining: Arc::clone(&remaining) })
+            .chain(SharedCountingByteBoundedSource { remaining: Arc::clone(&remaining) })
             .chain(PanickingSink)
             .into_sink_marker();
         let pipeline = builder.build().unwrap();
@@ -2206,6 +2410,113 @@ mod tests {
         // No progress with work stuck for >= the fatal threshold: a genuine
         // wedge — fail fast instead of hanging forever.
         assert_eq!(classify_stall(false, 60, 10, 60, 4096), StallVerdict::Wedged);
+    }
+
+    /// A step with a single output branch of the given `QueueSpec`, used to
+    /// exercise the monitor-visibility transport check.
+    fn step_with_output_spec(
+        name: &'static str,
+        spec: QueueSpec,
+    ) -> Box<dyn crate::erased::ErasedStep> {
+        #[derive(Clone)]
+        struct SpecStep {
+            name: &'static str,
+            spec: QueueSpec,
+        }
+        impl Step for SpecStep {
+            type Input = u32;
+            type Outputs = Single<u32>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: self.name,
+                    kind: StepKind::Serial,
+                    sticky: false,
+                    output_queues: vec![self.spec],
+                    branch_ordering: vec![BranchOrdering::None],
+                }
+            }
+            fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+                Ok(StepOutcome::NoProgress)
+            }
+        }
+        Box::new(crate::erased::TypedStep::new(SpecStep { name, spec }))
+    }
+
+    /// A `ChainGraph` whose per-step branch count matches each step's declared
+    /// `output_queues` length — the common shape where every branch has a spec.
+    fn graph_matching_specs(
+        steps: &[Box<dyn crate::erased::ErasedStep>],
+    ) -> crate::topology::ChainGraph {
+        let mut g = crate::topology::ChainGraph::new();
+        for step in steps {
+            g.register_step(step.profile().name, step.profile().output_queues.len());
+        }
+        g
+    }
+
+    #[test]
+    fn first_monitor_blind_transport_finds_count_and_unbounded() {
+        // All-ByteBounded: every transport is monitor-visible.
+        let visible = vec![
+            step_with_output_spec("A", QueueSpec::ByteBounded { limit_bytes: 1 << 20 }),
+            step_with_output_spec("B", QueueSpec::ByteBounded { limit_bytes: 1 << 20 }),
+        ];
+        assert!(first_monitor_blind_transport(&visible, &graph_matching_specs(&visible)).is_none());
+
+        // A CountBounded branch is flagged (it registers no byte probe).
+        let with_count = vec![
+            step_with_output_spec("A", QueueSpec::ByteBounded { limit_bytes: 1 << 20 }),
+            step_with_output_spec("Blind", QueueSpec::CountBounded { capacity: 8 }),
+        ];
+        let (name, spec) =
+            first_monitor_blind_transport(&with_count, &graph_matching_specs(&with_count)).unwrap();
+        assert_eq!(name, "Blind");
+        assert!(matches!(spec, QueueSpec::CountBounded { .. }));
+
+        // Unbounded is flagged too.
+        let with_unbounded = vec![step_with_output_spec("U", QueueSpec::Unbounded)];
+        assert!(
+            first_monitor_blind_transport(&with_unbounded, &graph_matching_specs(&with_unbounded))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn first_monitor_blind_transport_flags_implicit_unbounded_branch() {
+        // A step whose graph branch count exceeds its declared `output_queues`:
+        // the extra branch resolves to `QueueSpec::Unbounded` (matching `dag()`
+        // and context-building), which is monitor-blind and must be flagged even
+        // though the step declared only one explicit, ByteBounded spec.
+        let steps = vec![step_with_output_spec(
+            "HasImplicitBranch",
+            QueueSpec::ByteBounded { limit_bytes: 1 << 20 },
+        )];
+        let mut graph = crate::topology::ChainGraph::new();
+        graph.register_step("HasImplicitBranch", 2); // 2 branches, 1 explicit spec
+        let (name, spec) = first_monitor_blind_transport(&steps, &graph).unwrap();
+        assert_eq!(name, "HasImplicitBranch");
+        assert!(matches!(spec, QueueSpec::Unbounded), "implicit 2nd branch is Unbounded");
+    }
+
+    #[test]
+    fn assert_monitor_visible_transports_passes_for_all_byte_bounded() {
+        // The armed-monitor invariant holds (does not panic) when every output
+        // transport is ByteBounded.
+        let steps = vec![
+            step_with_output_spec("A", QueueSpec::ByteBounded { limit_bytes: 1 << 20 }),
+            step_with_output_spec("B", QueueSpec::ByteBounded { limit_bytes: 1 << 20 }),
+        ];
+        assert_monitor_visible_transports(&steps, &graph_matching_specs(&steps));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "invisible to the in_flight_bytes probe")]
+    fn assert_monitor_visible_transports_panics_on_count_bounded_in_debug() {
+        // In debug builds, a monitor-blind transport on an armed pipeline trips
+        // the invariant instead of silently losing the wedge verdict.
+        let steps = vec![step_with_output_spec("Blind", QueueSpec::CountBounded { capacity: 8 })];
+        assert_monitor_visible_transports(&steps, &graph_matching_specs(&steps));
     }
 
     #[test]

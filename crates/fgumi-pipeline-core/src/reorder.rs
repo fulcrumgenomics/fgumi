@@ -362,6 +362,8 @@ impl<T: Send + HeapSize + 'static> ReorderStage<T> {
                     // Transport full: overflow into the stash. The cap was
                     // already checked above; `next_serial` is exempt either
                     // way, so the must-accept liveness guarantee holds.
+                    // `usize → u64` is a lossless widen on every supported
+                    // (≤64-bit) target, so this cast never truncates.
                     let item_bytes = seq.item.heap_size() as u64;
                     state.buffer.insert(seq.ordinal, (seq.item, item_bytes));
                     state.buffer_bytes = state.buffer_bytes.saturating_add(item_bytes);
@@ -385,6 +387,14 @@ impl<T: Send + HeapSize + 'static> ReorderStage<T> {
 
     /// Consumer-side pop. Returns `Some(T)` if `next_serial` is available,
     /// `None` if still waiting for it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the in-order ordinal counter would overflow `u64` (i.e.
+    /// `next_serial == u64::MAX`). Branch ordinals start at 0 and increment, so
+    /// this is unreachable on any real workload (~1.8e19 items on one edge); the
+    /// guard exists only to fail loudly rather than silently wrap and wait
+    /// forever for ordinal 0.
     pub fn try_pop_in_order(&self) -> Option<T> {
         let mut state = self.state.lock();
         let next = state.next_serial;
@@ -397,6 +407,8 @@ impl<T: Send + HeapSize + 'static> ReorderStage<T> {
         // doesn't pay it again.
         if !state.buffer.contains_key(&next) {
             while let Some(seq) = self.transport.try_pop() {
+                // `usize → u64` is a lossless widen on every supported
+                // (≤64-bit) target, so this cast never truncates.
                 let bytes = seq.item.heap_size() as u64;
                 state.buffer.insert(seq.ordinal, (seq.item, bytes));
                 state.buffer_bytes = state.buffer_bytes.saturating_add(bytes);
@@ -408,7 +420,13 @@ impl<T: Send + HeapSize + 'static> ReorderStage<T> {
 
         if let Some((item, item_bytes)) = state.buffer.remove(&next) {
             state.buffer_bytes = state.buffer_bytes.saturating_sub(item_bytes);
-            let new_next = next + 1;
+            // Advance the in-order cursor. `ByOrdinal` ordinals come from an
+            // `AtomicU64` allocator and `ByItemOrdinal` from upstream item
+            // ordinals; both start at 0 and increment, so `u64::MAX` is
+            // unreachable on any real workload (~1.8e19 items on one edge).
+            // `checked_add` makes that invariant explicit: a wrap here would
+            // silently wait forever for ordinal 0, so we fail loudly instead.
+            let new_next = next.checked_add(1).expect("reorder ordinal overflow (next_serial)");
             state.next_serial = new_next;
             // Update the cache: is the NEW next_serial in the buffer?
             // Producers reading post-update see the right state.
@@ -693,14 +711,41 @@ mod tests {
             })
             .collect();
 
+        // Deadline guard: this test proves deadlock-freedom, so a liveness
+        // regression must *fail fast* rather than hang the whole `nextest` run
+        // until a global harness timeout (if any) fires. 30s is generous —
+        // 256 tiny items drain in milliseconds when healthy — so it only trips
+        // on a genuine wedge, not on a slow CI host. Mirrors the
+        // bounded-convergence guard the single-threaded sibling uses.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut out: Vec<usize> = Vec::with_capacity(total);
         while out.len() < total {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "concurrent reorder drain did not complete within 30s ({} of {total} drained) — \
+                 likely a deadlock/livelock regression",
+                out.len(),
+            );
             match stage.try_pop_in_order() {
                 Some(Heavy(v)) => out.push(v),
                 None => thread::yield_now(),
             }
         }
+        // Bound producer completion with the same deadline. The drain loop above
+        // only proves the *consumer* made progress; if a regression let
+        // `out.len()` reach `total` (e.g. a double-emit) while a producer is
+        // still stuck in its `try_push` retry loop, an unbounded `join()` would
+        // hang the run forever. Poll `is_finished()` against the deadline so a
+        // stuck producer fails fast instead.
         for p in producers {
+            while !p.is_finished() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "a producer thread did not finish within 30s — likely a stuck try_push \
+                     retry loop (liveness regression)",
+                );
+                thread::yield_now();
+            }
             p.join().unwrap();
         }
         assert_eq!(out, (0..total).collect::<Vec<_>>(), "all drain in serial order, none lost");

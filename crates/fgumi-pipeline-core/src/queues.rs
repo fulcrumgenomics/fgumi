@@ -143,11 +143,6 @@ impl<T: Send + 'static> ItemQueue<T> for CountBoundedQueue<T> {
 /// profiles (≈260 samples vs legacy on CODEC 8M).
 const BYTE_BOUNDED_QUEUE_SLOT_CAPACITY: usize = 1024;
 
-/// One-shot guard so the "slot cap hit before byte budget" warning
-/// (see `ByteBoundedQueue::try_push`) is emitted at most once per process,
-/// keeping the hot-path cost to a single relaxed swap after the first hit.
-static SLOT_CAP_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// Memory-bounded transport. Backed by
 /// `crossbeam_queue::ArrayQueue<(T, u64)>` plus an atomic byte counter.
 /// `try_push` rejects when the running byte counter has already reached
@@ -189,6 +184,13 @@ pub struct ByteBoundedQueue<T: Send + HeapSize + 'static> {
     /// best-effort backpressure heuristic, not a correctness gate).
     limit_bytes: AtomicU64,
     drained: AtomicBool,
+    /// Per-instance one-shot guard so the "slot cap hit before byte budget"
+    /// warning (see `try_push`) is emitted at most once *per queue*, not once
+    /// per process. A process-global flag would silence the warning for every
+    /// later queue (e.g. a second `runall` stage, or many pipelines in one
+    /// long-lived host / test harness) after the first occurrence. The hot-path
+    /// cost is a single relaxed swap after the first hit.
+    slot_cap_warned: AtomicBool,
 }
 
 impl<T: Send + HeapSize + 'static> ByteBoundedQueue<T> {
@@ -205,6 +207,7 @@ impl<T: Send + HeapSize + 'static> ByteBoundedQueue<T> {
             current_bytes: AtomicU64::new(0),
             limit_bytes: AtomicU64::new(limit_bytes),
             drained: AtomicBool::new(false),
+            slot_cap_warned: AtomicBool::new(false),
         }
     }
 
@@ -304,7 +307,7 @@ impl<T: Send + HeapSize + 'static> ItemQueue<T> for ByteBoundedQueue<T> {
                 // preserved (the producer retries) but throughput silently
                 // suffers. Surface it once so it is observable rather than a
                 // silent foot-gun; near-zero cost after the first hit.
-                if !SLOT_CAP_WARNED.swap(true, Ordering::Relaxed) {
+                if !self.slot_cap_warned.swap(true, Ordering::Relaxed) {
                     log::warn!(
                         "ByteBoundedQueue hit its {BYTE_BOUNDED_QUEUE_SLOT_CAPACITY}-slot count \
                          cap before the byte budget; small items are degrading byte-backpressure \
@@ -434,6 +437,39 @@ mod tests {
             q.try_push(Heavy(Vec::new())).is_err(),
             "push #{} must reject on the slot cap, not the byte budget",
             BYTE_BOUNDED_QUEUE_SLOT_CAPACITY + 1
+        );
+    }
+
+    #[test]
+    fn slot_cap_warn_flag_is_per_instance_not_process_global() {
+        // The "slot cap hit before byte budget" warn-once guard lives on the
+        // queue instance, so a second queue (e.g. a later runall stage, or a new
+        // pipeline in a long-lived host) still warns on its own first hit — the
+        // signal is not silenced process-wide by an earlier queue.
+        let fill_to_slot_cap = |q: &ByteBoundedQueue<Heavy>| {
+            for _ in 0..BYTE_BOUNDED_QUEUE_SLOT_CAPACITY {
+                q.try_push(Heavy(Vec::new())).expect("push within slot cap");
+            }
+            // This push trips the slot cap and (first time) sets the flag.
+            assert!(q.try_push(Heavy(Vec::new())).is_err(), "push must reject on slot cap");
+        };
+
+        let q1 = ByteBoundedQueue::<Heavy>::new(1_000_000);
+        assert!(!q1.slot_cap_warned.load(Ordering::Relaxed));
+        fill_to_slot_cap(&q1);
+        assert!(q1.slot_cap_warned.load(Ordering::Relaxed), "first queue must warn on its hit");
+
+        // A fresh queue starts un-warned even though q1 already warned, so it
+        // will warn on its own first hit (per-queue, not process-global).
+        let q2 = ByteBoundedQueue::<Heavy>::new(1_000_000);
+        assert!(
+            !q2.slot_cap_warned.load(Ordering::Relaxed),
+            "a second queue must NOT inherit the first queue's warned state"
+        );
+        fill_to_slot_cap(&q2);
+        assert!(
+            q2.slot_cap_warned.load(Ordering::Relaxed),
+            "second queue must warn on its own hit"
         );
     }
 

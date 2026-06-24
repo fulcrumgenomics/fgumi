@@ -38,6 +38,7 @@
 //! points are deferred.
 
 use std::any::Any;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -226,6 +227,21 @@ pub struct BranchInputHandle<T: Send + HeapSize + 'static> {
 enum BranchInputInner<T: Send + HeapSize + 'static> {
     Direct(Arc<dyn ItemQueue<T>>),
     Ordered(Arc<ReorderStage<T>>),
+    /// A permanently-empty, permanently-drained handle that owns no transport.
+    /// Used for source steps' dummy input (their input is implicitly drained
+    /// from t=0; the worker loop never pops from it), avoiding a per-source
+    /// `SegQueue` allocation just to report `is_drained() == true`.
+    AlwaysDrained(PhantomData<fn() -> T>),
+}
+
+impl<T: Send + HeapSize + 'static> BranchInputHandle<T> {
+    /// Construct a zero-state input handle that is always empty and always
+    /// drained, owning no backing queue. Used for source steps, whose input is
+    /// implicitly drained from the start and never popped.
+    #[must_use]
+    pub fn always_drained() -> Self {
+        Self { inner: BranchInputInner::AlwaysDrained(PhantomData) }
+    }
 }
 
 impl<T: Send + HeapSize + 'static> InputHandle<T> for BranchInputHandle<T> {
@@ -233,6 +249,7 @@ impl<T: Send + HeapSize + 'static> InputHandle<T> for BranchInputHandle<T> {
         match &self.inner {
             BranchInputInner::Direct(q) => q.try_pop(),
             BranchInputInner::Ordered(stage) => stage.try_pop_in_order(),
+            BranchInputInner::AlwaysDrained(_) => None,
         }
     }
 
@@ -240,6 +257,7 @@ impl<T: Send + HeapSize + 'static> InputHandle<T> for BranchInputHandle<T> {
         match &self.inner {
             BranchInputInner::Direct(q) => q.is_drained() && q.is_empty(),
             BranchInputInner::Ordered(stage) => stage.is_drained(),
+            BranchInputInner::AlwaysDrained(_) => true,
         }
     }
 }
@@ -1289,6 +1307,19 @@ pub(crate) fn build_unit_queues(
 #[cfg(test)]
 mod handle_tests {
     use super::*;
+
+    #[test]
+    fn always_drained_handle_is_empty_and_drained() {
+        // The zero-state source input handle owns no transport: it pops nothing
+        // and reports drained from the start, so a source step sees its
+        // (implicit) input as immediately end-of-stream.
+        let h = BranchInputHandle::<()>::always_drained();
+        assert_eq!(h.pop(), None, "always-drained handle yields no items");
+        assert!(h.is_drained(), "always-drained handle reports drained");
+        // Idempotent: still drained, still empty after repeated reads.
+        assert_eq!(h.pop(), None);
+        assert!(h.is_drained());
+    }
 
     #[test]
     fn count_bounded_fifo_round_trip() {
