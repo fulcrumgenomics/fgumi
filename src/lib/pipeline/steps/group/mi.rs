@@ -13,9 +13,7 @@
 
 use std::io;
 
-use fgumi_raw_bam::find_string_tag_in_record;
-
-use crate::mi_group::MiGroup;
+use crate::mi_group::{MiGroup, MiKey, MiTransform};
 use crate::pipeline::core::Unpushed;
 use crate::pipeline::core::held::HeldSlot;
 use crate::pipeline::core::item::{HeapSize, Ordered};
@@ -98,9 +96,12 @@ pub struct GroupByMi {
     /// (and stored on the emitted `MiGroup`). When unset, the raw MI
     /// bytes are used as a UTF-8 lossy string.
     mi_transform: Option<MiTransformFn>,
-    /// Run-length state: the MI value currently being accumulated.
-    current_mi: Option<String>,
-    /// Run-length state: records accumulated for `current_mi`.
+    /// Run-length state: the grouping key currently being accumulated, stored as
+    /// raw comparison bytes so run-boundary detection stays allocation-free on
+    /// the common (no-transform) path. The owned display label is materialized
+    /// only once per group (at the group boundary) via [`MiKey::label`].
+    current_key: Option<MiKey>,
+    /// Run-length state: records accumulated for `current_key`.
     current_records: Vec<fgumi_raw_bam::RawRecord>,
     /// Self-managed monotonic ordinal — each emitted *batch* gets the
     /// next value. Required for `BranchOrdering::ByItemOrdinal`'s
@@ -135,7 +136,7 @@ impl GroupByMi {
             cell_tag: None,
             record_filter: None,
             mi_transform: None,
-            current_mi: None,
+            current_key: None,
             current_records: Vec::new(),
             next_ordinal: 0,
             accumulator: Vec::with_capacity(target_batch_count),
@@ -178,25 +179,11 @@ impl GroupByMi {
         self
     }
 
-    /// Compute the composite group key for a record's bytes:
-    /// `MI` alone, or `MI\tCELL` when `cell_tag` is set. When
-    /// `mi_transform` is installed, the raw MI bytes are piped through
-    /// it before forming the key.
-    /// Returns `None` if the record lacks an MI tag.
-    fn group_key(&self, bam: &[u8]) -> Option<String> {
-        let mi_value = find_string_tag_in_record(bam, self.tag)?;
-        let mut key = if let Some(ref transform) = self.mi_transform {
-            transform(mi_value)
-        } else {
-            String::from_utf8_lossy(mi_value).into_owned()
-        };
-        if let Some(ct) = self.cell_tag {
-            key.push('\t');
-            if let Some(cell_value) = find_string_tag_in_record(bam, ct) {
-                key.push_str(&String::from_utf8_lossy(cell_value));
-            }
-        }
-        Some(key)
+    /// Borrow the installed MI-transform closure (if any) as the
+    /// `Option<&dyn Fn>` shape [`MiKey`] expects.
+    #[inline]
+    fn transform(&self) -> MiTransform<'_> {
+        self.mi_transform.as_ref().map(|t| t.as_ref() as &dyn Fn(&[u8]) -> String)
     }
 
     /// Run the optional filter against a record's bytes; returns `true`
@@ -209,12 +196,51 @@ impl GroupByMi {
         }
     }
 
-    /// Flush the run-in-progress into the accumulator (if non-empty).
+    /// Accumulate one raw record into the current MI run, opening a new run (and
+    /// flushing the previous one) at a group boundary. Run-boundary detection is
+    /// an allocation-free byte comparison against the stored key on the common
+    /// (no-transform) path; the owned key is built only when a new run begins.
+    /// Records that fail the optional filter, or that carry no MI tag, are
+    /// dropped (matching `MiGrouper`).
+    fn process_record(&mut self, raw: fgumi_raw_bam::RawRecord) {
+        // Optional filter (mirrors `MiGrouper::should_keep`).
+        if !self.passes_filter(raw.as_ref()) {
+            return;
+        }
+        let same_group = match &self.current_key {
+            Some(key) => {
+                match key.matches_record(raw.as_ref(), self.tag, self.cell_tag, self.transform()) {
+                    Some(matches) => matches,
+                    // No MI tag on this record: skip it.
+                    None => return,
+                }
+            }
+            None => false,
+        };
+        if same_group {
+            self.current_records.push(raw);
+        } else {
+            // New run (or first record). Build the owned key once at the
+            // boundary; `from_record` returns `None` (skip) without an MI tag.
+            let Some(key) =
+                MiKey::from_record(raw.as_ref(), self.tag, self.cell_tag, self.transform())
+            else {
+                return;
+            };
+            self.flush_current_group();
+            self.current_key = Some(key);
+            self.current_records.push(raw);
+        }
+    }
+
+    /// Flush the run-in-progress into the accumulator (if non-empty). The owned
+    /// display label is materialized here — once per group — from the stored key
+    /// bytes, rather than per record.
     fn flush_current_group(&mut self) {
-        if let Some(mi) = self.current_mi.take() {
+        if let Some(key) = self.current_key.take() {
             if !self.current_records.is_empty() {
                 let records = std::mem::take(&mut self.current_records);
-                self.accumulator.push(MiGroup::new(mi, records));
+                self.accumulator.push(MiGroup::new(key.label(), records));
             }
         }
     }
@@ -276,29 +302,7 @@ impl Step for GroupByMi {
             did_work = true;
             let DecodedRecordBatch { records, .. } = batch;
             for decoded in records {
-                let raw = decoded.into_raw_bytes();
-                // Optional filter (mirrors `MiGrouper::should_keep`).
-                if !self.passes_filter(raw.as_ref()) {
-                    continue;
-                }
-                // Records without MI are skipped (matches `MiGrouper`).
-                let Some(mi) = self.group_key(raw.as_ref()) else {
-                    continue;
-                };
-                match &self.current_mi {
-                    Some(current) if current == &mi => {
-                        self.current_records.push(raw);
-                    }
-                    Some(_) => {
-                        self.flush_current_group();
-                        self.current_mi = Some(mi);
-                        self.current_records.push(raw);
-                    }
-                    None => {
-                        self.current_mi = Some(mi);
-                        self.current_records.push(raw);
-                    }
-                }
+                self.process_record(decoded.into_raw_bytes());
             }
             if self.accumulator.len() >= self.target_batch_count {
                 break;
@@ -331,6 +335,164 @@ impl Step for GroupByMi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fgumi_raw_bam::RawRecord;
+
+    /// Build a minimal unmapped raw BAM record carrying a single Z-type tag.
+    #[allow(clippy::cast_possible_truncation)]
+    fn raw_with_tag(tag: &str, value: &str) -> RawRecord {
+        raw_with_tags(&[(tag, value)])
+    }
+
+    /// Build a minimal unmapped raw BAM record carrying the given Z-type tags
+    /// in the supplied aux-block order.
+    #[allow(clippy::cast_possible_truncation)]
+    fn raw_with_tags(tags: &[(&str, &str)]) -> RawRecord {
+        let name = b"read";
+        let l_read_name: u8 = (name.len() + 1) as u8;
+        let seq_len: u32 = 4;
+        let seq_bytes = seq_len.div_ceil(2) as usize;
+
+        let mut aux: Vec<u8> = Vec::new();
+        for (tag, value) in tags {
+            let t = tag.as_bytes();
+            aux.extend_from_slice(&[t[0], t[1], b'Z']);
+            aux.extend_from_slice(value.as_bytes());
+            aux.push(0);
+        }
+
+        let total = 32 + l_read_name as usize + seq_bytes + seq_len as usize + aux.len();
+        let mut buf = vec![0u8; total];
+        buf[0..4].copy_from_slice(&(-1i32).to_le_bytes());
+        buf[4..8].copy_from_slice(&(-1i32).to_le_bytes());
+        buf[8] = l_read_name;
+        buf[12..14].copy_from_slice(&0u16.to_le_bytes());
+        buf[16..20].copy_from_slice(&seq_len.to_le_bytes());
+        buf[20..24].copy_from_slice(&(-1i32).to_le_bytes());
+        buf[24..28].copy_from_slice(&(-1i32).to_le_bytes());
+        let name_start = 32;
+        buf[name_start..name_start + name.len()].copy_from_slice(name);
+        buf[name_start + name.len()] = 0;
+        let aux_start = 32 + l_read_name as usize + seq_bytes + seq_len as usize;
+        buf[aux_start..aux_start + aux.len()].copy_from_slice(&aux);
+        RawRecord::from(buf)
+    }
+
+    /// Build a minimal unmapped raw BAM record carrying no aux tags.
+    #[allow(clippy::cast_possible_truncation)]
+    fn raw_without_tag() -> RawRecord {
+        raw_with_tags(&[])
+    }
+
+    /// Drive a sequence of records through [`GroupByMi::process_record`], close
+    /// the final run, and return `(label, record_count)` per completed group.
+    fn run_grouping(step: &mut GroupByMi, records: Vec<RawRecord>) -> Vec<(String, usize)> {
+        for raw in records {
+            step.process_record(raw);
+        }
+        step.flush_current_group();
+        step.accumulator.iter().map(|g| (g.mi.clone(), g.records.len())).collect()
+    }
+
+    #[test]
+    fn single_mi_run_forms_one_group() {
+        use crate::sam::SamTag;
+        let mut step = GroupByMi::new(*SamTag::MI, 1 << 20);
+        let records: Vec<RawRecord> = (0..1000).map(|_| raw_with_tag("MI", "7")).collect();
+        let groups = run_grouping(&mut step, records);
+        assert_eq!(groups, vec![("7".to_string(), 1000)]);
+    }
+
+    #[test]
+    fn distinct_mi_values_split_runs_and_label_once() {
+        use crate::sam::SamTag;
+        let mut step = GroupByMi::new(*SamTag::MI, 1 << 20);
+        let records = vec![
+            raw_with_tag("MI", "1"),
+            raw_with_tag("MI", "1"),
+            raw_with_tag("MI", "2"),
+            raw_with_tag("MI", "1"), // non-adjacent: a fresh run, not merged
+        ];
+        let groups = run_grouping(&mut step, records);
+        assert_eq!(groups, vec![("1".to_string(), 2), ("2".to_string(), 1), ("1".to_string(), 1)]);
+    }
+
+    #[test]
+    fn records_without_mi_are_skipped() {
+        use crate::sam::SamTag;
+        let mut step = GroupByMi::new(*SamTag::MI, 1 << 20);
+        let records = vec![
+            raw_without_tag(), // skipped, no current run yet
+            raw_with_tag("MI", "5"),
+            raw_without_tag(), // skipped, current run preserved
+            raw_with_tag("MI", "5"),
+        ];
+        let groups = run_grouping(&mut step, records);
+        assert_eq!(groups, vec![("5".to_string(), 2)]);
+    }
+
+    #[test]
+    fn cell_tag_composite_key_splits_and_labels() {
+        use crate::sam::SamTag;
+        let mut step = GroupByMi::new(*SamTag::MI, 1 << 20).with_cell_tag(Some(*SamTag::CB));
+        // Same MI, different CB → distinct groups; aux order varies to exercise
+        // the single-pass dual-tag lookup regardless of tag ordering.
+        let records = vec![
+            raw_with_tags(&[("MI", "1"), ("CB", "ACGT")]),
+            raw_with_tags(&[("CB", "ACGT"), ("MI", "1")]),
+            raw_with_tags(&[("MI", "1"), ("CB", "TGCA")]),
+            raw_with_tags(&[("MI", "1"), ("CB", "TGCA")]),
+        ];
+        let groups = run_grouping(&mut step, records);
+        assert_eq!(groups, vec![("1\tACGT".to_string(), 2), ("1\tTGCA".to_string(), 2)]);
+    }
+
+    #[test]
+    fn missing_cell_tag_uses_empty_suffix() {
+        use crate::sam::SamTag;
+        // With a cell tag configured, a record that lacks `CB` keys on an empty
+        // cell suffix (`MI\t`), distinct from a record that carries `CB`. Guards
+        // against a future aux-lookup change silently merging or splitting MI
+        // groups when the configured cell tag is absent.
+        let mut step = GroupByMi::new(*SamTag::MI, 1 << 20).with_cell_tag(Some(*SamTag::CB));
+        let records = vec![
+            raw_with_tag("MI", "1"),                       // no CB → "1\t"
+            raw_with_tag("MI", "1"),                       // no CB → "1\t"
+            raw_with_tags(&[("MI", "1"), ("CB", "ACGT")]), // → "1\tACGT"
+        ];
+        let groups = run_grouping(&mut step, records);
+        assert_eq!(groups, vec![("1\t".to_string(), 2), ("1\tACGT".to_string(), 1)]);
+    }
+
+    #[test]
+    fn mi_transform_groups_strands_together() {
+        use crate::sam::SamTag;
+        // Strip a trailing "/A" or "/B" so both strands of a molecule group.
+        let mut step = GroupByMi::new(*SamTag::MI, 1 << 20).with_mi_transform(|mi: &[u8]| {
+            let s = String::from_utf8_lossy(mi);
+            s.split('/').next().unwrap_or("").to_string()
+        });
+        let records =
+            vec![raw_with_tag("MI", "1/A"), raw_with_tag("MI", "1/B"), raw_with_tag("MI", "2/A")];
+        let groups = run_grouping(&mut step, records);
+        // Label is the transformed key, materialized once per group.
+        assert_eq!(groups, vec![("1".to_string(), 2), ("2".to_string(), 1)]);
+    }
+
+    #[test]
+    fn record_filter_drops_records() {
+        use crate::sam::SamTag;
+        // Filter out any record whose MI tag value is "skip".
+        let mut step = GroupByMi::new(*SamTag::MI, 1 << 20).with_record_filter(|bam: &[u8]| {
+            fgumi_raw_bam::find_string_tag_in_record(bam, *SamTag::MI) != Some(b"skip")
+        });
+        let records = vec![
+            raw_with_tag("MI", "1"),
+            raw_with_tag("MI", "skip"), // dropped, run "1" preserved
+            raw_with_tag("MI", "1"),
+        ];
+        let groups = run_grouping(&mut step, records);
+        assert_eq!(groups, vec![("1".to_string(), 2)]);
+    }
 
     #[test]
     fn profile_advertises_serial_byordinal() {

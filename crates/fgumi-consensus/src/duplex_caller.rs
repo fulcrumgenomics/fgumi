@@ -1041,10 +1041,6 @@ impl DuplexConsensusCaller {
         clippy::too_many_lines,
         reason = "BAM record construction has many sequential tag-writing steps"
     )]
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "Result return type kept for API consistency with other consensus record builders"
-    )]
     pub(crate) fn duplex_read_into(
         builder: &mut UnmappedSamBuilder,
         output: &mut ConsensusOutput,
@@ -1077,14 +1073,16 @@ impl DuplexConsensusCaller {
 
         // Build the record (name, flags, bases, quals). The read name is
         // `<prefix>:<umi>`; compose it straight into the record buffer rather
-        // than allocating a fresh `String` per output read.
-        builder.build_record_joined_name(
+        // than allocating a fresh `String` per output read. The UMI is
+        // data-controlled, so reject an over-long joined name with a typed
+        // error rather than panicking.
+        builder.try_build_record_joined_name(
             read_name_prefix.as_bytes(),
             umi.as_bytes(),
             flag,
             &consensus.bases,
             &consensus.quals,
-        );
+        )?;
 
         // 1. MI tag (string)
         builder.append_string_tag(SamTag::MI, umi.as_bytes());

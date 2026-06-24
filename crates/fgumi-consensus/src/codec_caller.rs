@@ -1272,10 +1272,6 @@ impl CodecConsensusCaller {
 
     /// Builds the output record from the consensus and writes raw bytes into `output`.
     #[expect(
-        clippy::unnecessary_wraps,
-        reason = "Result return type kept for API consistency with other callers"
-    )]
-    #[expect(
         clippy::too_many_arguments,
         reason = "all_records needed separately from source_raws for UMI consensus"
     )]
@@ -1300,13 +1296,15 @@ impl CodecConsensusCaller {
         // rather than allocating a `String` per read; the counter fallback
         // still formats the integer suffix.
         if let Some(umi_str) = umi {
-            self.bam_builder.build_record_joined_name(
+            // UMI is data-controlled; reject an over-long joined name with a
+            // typed error rather than panicking.
+            self.bam_builder.try_build_record_joined_name(
                 self.read_name_prefix.as_bytes(),
                 umi_str.as_bytes(),
                 flag,
                 &consensus.bases,
                 &consensus.quals,
-            );
+            )?;
         } else {
             let read_name = format!("{}:{}", self.read_name_prefix, self.consensus_counter);
             self.bam_builder.build_record(

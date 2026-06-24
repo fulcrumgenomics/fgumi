@@ -184,6 +184,29 @@ impl InlineBgzfCompressor {
         std::mem::take(&mut self.completed_blocks)
     }
 
+    /// Return a drained block buffer to the internal pool for reuse by a later
+    /// [`compress_current_buffer`](Self::compress_current_buffer).
+    ///
+    /// Consumers that drive the compressor with [`write_all`](Self::write_all) +
+    /// [`flush`](Self::flush) + [`take_blocks`](Self::take_blocks) (rather than
+    /// [`write_blocks_to`](Self::write_blocks_to), which recycles automatically)
+    /// otherwise leave `buffer_pool` empty, so every block compression allocates
+    /// a fresh output `Vec`. Such a consumer can hand back any block `Vec` it is
+    /// done with via this method to restore the recycling.
+    ///
+    /// The buffer is cleared before being pooled. The pool is bounded to a small
+    /// number of buffers so a bursty consumer cannot grow it without limit; once
+    /// full, the handed-back buffer is simply dropped.
+    pub fn recycle_buffer(&mut self, mut buffer: Vec<u8>) {
+        /// Cap on pooled buffers. A single compressor processes one block at a
+        /// time, so a handful of recycled buffers fully covers steady state.
+        const MAX_POOLED_BUFFERS: usize = 4;
+        if self.buffer_pool.len() < MAX_POOLED_BUFFERS {
+            buffer.clear();
+            self.buffer_pool.push(buffer);
+        }
+    }
+
     /// Write all completed compressed blocks directly to output and recycle buffers.
     ///
     /// This is efficient for single-threaded use as it writes blocks directly
@@ -361,6 +384,40 @@ mod tests {
 
         // Both should produce identical output
         assert_eq!(output1, output2);
+    }
+
+    #[test]
+    fn test_recycle_buffer_reuses_pool_without_corrupting_output() {
+        let data = b"recycle pool roundtrip data";
+
+        // Reference output from a fresh compressor.
+        let mut reference = InlineBgzfCompressor::new(6);
+        reference.write_all(data).expect("write");
+        reference.flush().expect("flush");
+        let expected: Vec<u8> = reference.take_blocks().into_iter().flat_map(|b| b.data).collect();
+
+        // Compressor that hands its drained block buffer back to the pool, then
+        // compresses again — the recycled buffer must not corrupt the output.
+        let mut compressor = InlineBgzfCompressor::new(6);
+        compressor.write_all(data).expect("write");
+        compressor.flush().expect("flush");
+        for block in compressor.take_blocks() {
+            compressor.recycle_buffer(block.data);
+        }
+        compressor.write_all(data).expect("write");
+        compressor.flush().expect("flush");
+        let second: Vec<u8> = compressor.take_blocks().into_iter().flat_map(|b| b.data).collect();
+        assert_eq!(second, expected);
+    }
+
+    #[test]
+    fn test_recycle_buffer_is_bounded() {
+        let mut compressor = InlineBgzfCompressor::new(6);
+        // Hand back far more buffers than the cap; the pool must stay bounded.
+        for _ in 0..100 {
+            compressor.recycle_buffer(vec![0u8; 64]);
+        }
+        assert!(compressor.buffer_pool.len() <= 4, "pool must be capped");
     }
 
     #[test]
