@@ -11,6 +11,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use bytesize::ByteSize;
 use fgumi_cli_common::{MemoryLimit, OperationTimer, format_duration};
+use fgumi_pipeline_core::FinalizeHook;
 use fgumi_pipeline_io::SortBamFile;
 use fgumi_sort::{RawExternalSorter, SortOrder};
 use log::info;
@@ -26,6 +27,11 @@ use crate::version;
 /// Post-pipeline finalize action for sort. Reads `SortStats` out of the
 /// shared slot, logs the Summary block, and calls
 /// [`OperationTimer::log_completion`].
+///
+/// This is the single definition of the sort summary hook, implementing the
+/// shared [`FinalizeHook`] contract. The umbrella `fgumi` crate re-exports it
+/// (rather than redefining a parallel copy) so its `ChainBuilder::add_sort` can
+/// register it alongside the other stages' hooks (X1-005).
 pub struct SortFinalizeHook {
     /// Shared slot the `SortBamFile` step fills after `sort()` returns.
     pub stats_slot: Arc<Mutex<Option<fgumi_sort::SortStats>>>,
@@ -35,10 +41,13 @@ pub struct SortFinalizeHook {
     pub timer: OperationTimer,
 }
 
-impl SortFinalizeHook {
-    /// Run the post-pipeline summary logging.
-    pub fn finalize(self) {
-        let SortFinalizeHook { stats_slot, output_path, timer } = self;
+impl FinalizeHook for SortFinalizeHook {
+    /// Run the post-pipeline summary logging. Infallible — always returns
+    /// `Ok(())` — but typed as `Result` to satisfy the [`FinalizeHook`]
+    /// contract so it can share a `Vec<Box<dyn FinalizeHook>>` with the
+    /// fallible hooks.
+    fn finalize(self: Box<Self>) -> Result<()> {
+        let SortFinalizeHook { stats_slot, output_path, timer } = *self;
 
         let stats = stats_slot.lock().take().unwrap_or_default();
         info!("=== Summary ===");
@@ -50,6 +59,8 @@ impl SortFinalizeHook {
         info!("Output: {}", output_path.display());
 
         timer.log_completion(stats.total_records);
+
+        Ok(())
     }
 }
 
@@ -60,26 +71,42 @@ impl SortFinalizeHook {
 /// Post-pipeline action that builds a BAI index for a finished
 /// coordinate-sorted BAM, writing `<output>.bam.bai` next to the BAM.
 ///
+/// Reads the BAM via `noodles::bam::fs::index` (which walks BGZF block offsets
+/// and computes virtual positions from the on-disk layout) and writes
+/// `<output>.bam.bai` next to the BAM via `fgumi_bam_io::write_bai_index`. This
+/// decouples indexing from the sort step itself: the sorter no longer needs
+/// single-threaded BGZF compression to track virtual offsets during write, and
+/// BAI generation lifts cleanly to a hook that any future BAM-with-index chain
+/// can register.
+///
+/// This is the single definition of the BAI indexer hook, implementing the
+/// shared [`FinalizeHook`] contract; the umbrella `fgumi` crate re-exports it
+/// rather than redefining a parallel copy (X1-005).
+///
 /// **Invariant:** the BAM at `output_path` must be writer-closed before
-/// `finalize` runs — guaranteed by `Pipeline::run` returning (which only
-/// happens after every step's writer has dropped).
+/// `finalize` runs. This is guaranteed by `Pipeline::run` returning (which only
+/// happens after every step's writer has dropped); the hook does not call
+/// `fsync` because the same process re-reading via the OS page cache will see
+/// all flushed bytes on every supported local filesystem. A remote/NFS
+/// deployment would need its own close-to-open coherency story; that is out of
+/// scope for this hook.
 pub struct IndexBamFinalizeHook {
     /// Path of the finished coordinate-sorted BAM to index.
     pub output_path: PathBuf,
 }
 
-impl IndexBamFinalizeHook {
+impl FinalizeHook for IndexBamFinalizeHook {
     /// Build and write the BAI index alongside the BAM.
     ///
     /// # Errors
     ///
     /// Returns an error if indexing or writing the BAI sidecar fails.
-    pub fn finalize(self) -> Result<()> {
+    fn finalize(self: Box<Self>) -> Result<()> {
         use fgumi_bam_io::write_bai_index;
         use noodles::bam;
         use std::time::Instant;
 
-        let IndexBamFinalizeHook { output_path } = self;
+        let IndexBamFinalizeHook { output_path } = *self;
 
         info!("Indexing BAM: {}", output_path.display());
         let start = Instant::now();
@@ -88,7 +115,11 @@ impl IndexBamFinalizeHook {
             .map_err(|e| anyhow::anyhow!("Failed to index {}: {e}", output_path.display()))?;
 
         // BAI convention: sit next to the BAM with `.bam.bai`, e.g.
-        // `foo.bam` → `foo.bam.bai`.
+        // `foo.bam` → `foo.bam.bai`. The contract is "append `.bai` to the BAM
+        // path"; `with_extension` happens to produce the right result because
+        // the input always carries a single `.bam` extension. (Phase 4 moves
+        // this body into `fgumi_bam_io::write_bai_sidecar` and fixes the
+        // extensionless-path edge case once.)
         let index_path = output_path.with_extension("bam.bai");
         write_bai_index(&index_path, &index)
             .map_err(|e| anyhow::anyhow!("Failed to write BAI to {}: {e}", index_path.display()))?;
@@ -284,7 +315,7 @@ mod tests {
         }
         writer.finish().expect("finish");
 
-        let hook = IndexBamFinalizeHook { output_path: bam_path.clone() };
+        let hook = Box::new(IndexBamFinalizeHook { output_path: bam_path.clone() });
         hook.finalize().expect("hook finalize");
 
         let bai_path = bam_path.with_extension("bam.bai");

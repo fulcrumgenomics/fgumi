@@ -337,7 +337,17 @@ pub struct ChainBuilder<'a> {
     pipeline: PipelineBuilder,
 
     /// Post-pipeline cleanup hooks. Populated by `add_<stage>` methods.
+    /// Always drained, even when the run fails (see [`BuiltPipeline::run`]).
     finalize: Vec<Box<dyn FinalizeHook>>,
+
+    /// Post-pipeline hooks that run **only on a fully successful run**.
+    /// Populated by `add_<stage>` methods for actions that publish a derived
+    /// artifact from the run's output (currently only `add_sort`'s
+    /// `IndexBamFinalizeHook`, which writes the `.bai` sidecar by re-reading
+    /// the finished BAM). Gating these mirrors the standalone `fgumi sort`
+    /// flow, where the index write is behind `run_result?`: a failed run
+    /// leaves a partial BAM, so publishing its index would be stale.
+    finalize_on_success: Vec<Box<dyn FinalizeHook>>,
 
     /// Shared progress counter threaded through source + stage steps for
     /// progress logging. `Arc` so the stage step and the finalize hook can
@@ -454,6 +464,7 @@ impl<'a> ChainBuilder<'a> {
             current_tail: None,
             pipeline: PipelineBuilder::new(),
             finalize: Vec::new(),
+            finalize_on_success: Vec::new(),
             progress_records: Arc::new(AtomicU64::new(0)),
             pending_source,
             paired_tail: None,
@@ -1252,7 +1263,12 @@ impl<'a> ChainBuilder<'a> {
         // The timing hook fires first (before per-stage hooks like DedupFinalize).
         self.finalize.insert(0, Box::new(StageTimingFinalizeHook::new_with_label(chain_label)));
 
-        Ok(BuiltPipeline { pipeline, config, finalize: self.finalize })
+        Ok(BuiltPipeline {
+            pipeline,
+            config,
+            finalize: self.finalize,
+            finalize_on_success: self.finalize_on_success,
+        })
     }
 
     // -- private per-stage methods, one per Stage variant --
@@ -2054,20 +2070,24 @@ impl<'a> ChainBuilder<'a> {
             }));
 
             // When the spec asks for a sidecar BAI, queue the
-            // `IndexBamFinalizeHook` *after* `SortFinalizeHook` so the
+            // `IndexBamFinalizeHook` on the *success-gated* finalize list so
+            // it runs after a successful run only — a failed sort leaves a
+            // partial BAM, and publishing (or overwriting) `<output>.bam.bai`
+            // for it would be a stale index (mirrors the standalone
+            // `fgumi sort` flow, which gates the index write behind
+            // `run_result?`). It runs after `SortFinalizeHook` so the
             // "Records written / X records/s" summary lands before the
-            // indexer's "Indexing BAM:" / "Wrote BAM index:" pair. The
-            // hook re-reads the finished BAM and emits
-            // `<output>.bam.bai` next to it (see `IndexBamFinalizeHook`
-            // for the I/O contract). Rule 3 in `chains::validate`
-            // guarantees `BamWithIndex` only appears when the terminal
-            // chain stage is `Stage::Sort`, so a sole-stage
+            // indexer's "Indexing BAM:" / "Wrote BAM index:" pair. The hook
+            // re-reads the finished BAM and emits `<output>.bam.bai` next to
+            // it (see `IndexBamFinalizeHook` for the I/O contract). Rule 3 in
+            // `chains::validate` guarantees `BamWithIndex` only appears when
+            // the terminal chain stage is `Stage::Sort`, so a sole-stage
             // `[Stage::Sort]` chain is the only path that reaches the
-            // Standalone branch with that sink — multi-stage
-            // sort-terminal chains land in the streaming branch below,
-            // where the hook is mirrored.
+            // Standalone branch with that sink — multi-stage sort-terminal
+            // chains land in the streaming branch below, where the hook is
+            // mirrored.
             if matches!(self.spec.sink, SinkSpec::BamWithIndex(_)) {
-                self.finalize.push(Box::new(IndexBamFinalizeHook { output_path }));
+                self.finalize_on_success.push(Box::new(IndexBamFinalizeHook { output_path }));
             }
         } else {
             // ── Streaming sort (Intermediate OR Terminal-after-upstream-stages) ──
@@ -2182,8 +2202,10 @@ impl<'a> ChainBuilder<'a> {
 
                 // Mirror the Standalone-branch BAI hook registration: when
                 // the spec asks for a sidecar BAI, queue the
-                // `IndexBamFinalizeHook` so the indexer runs after the chain
-                // has flushed the final BAM. Multi-stage Sort-terminal
+                // `IndexBamFinalizeHook` on the *success-gated* finalize list
+                // so the indexer runs after the chain has flushed the final
+                // BAM on a successful run only (a failed run leaves a partial
+                // BAM whose index would be stale). Multi-stage Sort-terminal
                 // chains (e.g. `[Stage::Correct, Stage::Sort]`) land here
                 // instead of the Standalone branch (which requires
                 // `current_tail.is_none()`), so without this wire a
@@ -2196,7 +2218,7 @@ impl<'a> ChainBuilder<'a> {
                 // "BamWithIndex triggers the hook in every terminal-sort
                 // path" — is enforced here for future producers.
                 if let SinkSpec::BamWithIndex(p) = &self.spec.sink {
-                    self.finalize.push(Box::new(
+                    self.finalize_on_success.push(Box::new(
                         crate::pipeline::chains::commands::sort::IndexBamFinalizeHook {
                             output_path: p.clone(),
                         },

@@ -7,25 +7,12 @@ use anyhow::Result;
 use crate::pipeline::core::builder::{Pipeline, PipelineConfig};
 use crate::pipeline::core::runtime::stats::PipelineStats;
 
-/// Post-pipeline cleanup. Each stage with metrics, summary logging,
-/// `--min-corrected`-style gates, or rejects-file finalization
-/// registers one or more hooks during chain build. The caller iterates
-/// `built.finalize.into_iter().try_for_each(FinalizeHook::finalize)`
-/// after `pipeline.run()` returns.
-///
-/// Trait object so heterogeneous hooks (correct's metrics drain,
-/// consensus's summary log, AAM's records-aligned counter, etc.) can
-/// share a `Vec<Box<dyn FinalizeHook>>`.
-pub trait FinalizeHook: Send {
-    /// Run the post-pipeline action. Called exactly once, after
-    /// `Pipeline::run` returns and before the caller exits.
-    ///
-    /// # Errors
-    ///
-    /// Returns the underlying I/O / aggregation / gate-check error.
-    /// Callers typically chain via `try_for_each`.
-    fn finalize(self: Box<Self>) -> Result<()>;
-}
+// The bare `FinalizeHook` trait lives in `fgumi-pipeline-core` so CLI crates
+// built directly on the pipeline core (e.g. `fgumi-sort-cli`) can implement it
+// without redefining a parallel trait (X1-005). It is re-exported here so the
+// canonical `crate::pipeline::chains::FinalizeHook` path — used by every
+// in-crate `impl FinalizeHook` and by `BuiltPipeline` below — is unchanged.
+pub use crate::pipeline::core::FinalizeHook;
 
 /// Logs [`PipelineStats`] after the pipeline finishes, when
 /// `--pipeline-stats` was requested. Builders construct this and push
@@ -91,12 +78,22 @@ pub struct BuiltPipeline {
     pub pipeline: Pipeline,
     pub config: PipelineConfig,
     pub finalize: Vec<Box<dyn FinalizeHook>>,
+    /// Hooks that run **only after a fully successful run** — the pipeline
+    /// completed and every always-drain `finalize` hook succeeded.
+    ///
+    /// Use this for actions that publish a derived artifact from the output
+    /// the run produced (e.g. writing a `.bai` sidecar by re-reading the
+    /// finished BAM). On the error path the output is incomplete, so running
+    /// these would publish a stale/partial artifact — exactly the
+    /// `IndexBamFinalizeHook` footgun the standalone `fgumi sort` flow guards
+    /// against by gating the index write behind `run_result?`.
+    pub finalize_on_success: Vec<Box<dyn FinalizeHook>>,
 }
 
 impl BuiltPipeline {
     /// Convenience: run the pipeline and drain finalize hooks in order.
     ///
-    /// Finalize hooks are *always* drained in a finally-style path, even
+    /// `finalize` hooks are *always* drained in a finally-style path, even
     /// when `Pipeline::run` fails: the hooks own the metrics drains,
     /// summary logging, `--min-corrected`-style gates, and rejects-file
     /// finalization that must happen regardless of how the run ended.
@@ -105,29 +102,39 @@ impl BuiltPipeline {
     /// (pipeline run first, then hooks in registration order) is
     /// returned.
     ///
+    /// `finalize_on_success` hooks run only once the run and every
+    /// always-drain hook have succeeded — see the field docs.
+    ///
     /// # Errors
     ///
     /// Returns the first pipeline-run error or, if the pipeline
     /// succeeded, the first finalize-hook error.
     pub fn run(self) -> Result<()> {
-        let BuiltPipeline { pipeline, config, finalize } = self;
+        let BuiltPipeline { pipeline, config, finalize, finalize_on_success } = self;
 
         // Capture the run result but do not short-circuit: the finalize
         // hooks must still drain on the error path.
         let run_result = pipeline.run(config).map_err(|e| anyhow::anyhow!("Pipeline::run: {e:?}"));
 
-        drain_finalize(run_result, finalize)
+        drain_finalize(run_result, finalize, finalize_on_success)
     }
 }
 
-/// Drains every finalize hook in registration order, then combines the
-/// pipeline-run result with the first hook error.
+/// Drains every always-run finalize hook in registration order, then — only
+/// if the run and all of those hooks succeeded — runs the success-gated hooks.
 ///
-/// Hooks are always drained — including on the `run_result == Err` path —
-/// and a failing hook does not prevent later hooks from running. The
-/// pipeline-run error takes precedence over any hook error.
-fn drain_finalize(run_result: Result<()>, finalize: Vec<Box<dyn FinalizeHook>>) -> Result<()> {
-    // Drain every hook, keeping the first hook error.
+/// Always-run hooks are drained even on the `run_result == Err` path, and a
+/// failing hook does not prevent later always-run hooks from running. The
+/// pipeline-run error takes precedence over any hook error. Success-gated
+/// hooks are skipped entirely unless everything above succeeded; once running,
+/// the first of them to error short-circuits the rest (they publish derived
+/// artifacts, so there is no "drain everything" obligation on their path).
+fn drain_finalize(
+    run_result: Result<()>,
+    finalize: Vec<Box<dyn FinalizeHook>>,
+    finalize_on_success: Vec<Box<dyn FinalizeHook>>,
+) -> Result<()> {
+    // Drain every always-run hook, keeping the first hook error.
     let mut first_hook_error: Option<anyhow::Error> = None;
     for hook in finalize {
         if let Err(e) = hook.finalize() {
@@ -137,8 +144,15 @@ fn drain_finalize(run_result: Result<()>, finalize: Vec<Box<dyn FinalizeHook>>) 
         }
     }
 
-    // The pipeline-run error takes precedence over hook errors.
-    run_result.and_then(|()| first_hook_error.map_or(Ok(()), Err))
+    // The pipeline-run error takes precedence over hook errors. Resolve the
+    // combined result of the run plus the always-run hooks first.
+    run_result.and_then(|()| first_hook_error.map_or(Ok(()), Err))?;
+
+    // Reached only on full success: now safe to publish derived artifacts.
+    for hook in finalize_on_success {
+        hook.finalize()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -171,7 +185,7 @@ mod tests {
         // metrics drains / rejects finalization are not skipped.
         let ran = Arc::new(AtomicUsize::new(0));
         let hooks = vec![counting_hook(&ran, false), counting_hook(&ran, false)];
-        let result = drain_finalize(Err(anyhow::anyhow!("pipeline boom")), hooks);
+        let result = drain_finalize(Err(anyhow::anyhow!("pipeline boom")), hooks, vec![]);
         assert_eq!(ran.load(Ordering::SeqCst), 2, "all hooks should run on the error path");
         // The pipeline error takes precedence and is propagated.
         assert!(result.is_err());
@@ -184,7 +198,7 @@ mod tests {
         let ran = Arc::new(AtomicUsize::new(0));
         let hooks =
             vec![counting_hook(&ran, true), counting_hook(&ran, false), counting_hook(&ran, false)];
-        let result = drain_finalize(Ok(()), hooks);
+        let result = drain_finalize(Ok(()), hooks, vec![]);
         assert_eq!(ran.load(Ordering::SeqCst), 3, "all hooks should run despite an early failure");
         // With a successful run, the first hook error is surfaced.
         assert!(result.is_err());
@@ -195,9 +209,63 @@ mod tests {
     fn drain_finalize_ok_when_run_and_hooks_succeed() {
         let ran = Arc::new(AtomicUsize::new(0));
         let hooks = vec![counting_hook(&ran, false)];
-        let result = drain_finalize(Ok(()), hooks);
+        let result = drain_finalize(Ok(()), hooks, vec![]);
         assert_eq!(ran.load(Ordering::SeqCst), 1);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn drain_finalize_runs_success_hooks_only_on_full_success() {
+        // Success-gated hooks run once the pipeline and all always-run hooks
+        // succeed.
+        let always = Arc::new(AtomicUsize::new(0));
+        let on_success = Arc::new(AtomicUsize::new(0));
+        let result = drain_finalize(
+            Ok(()),
+            vec![counting_hook(&always, false)],
+            vec![counting_hook(&on_success, false)],
+        );
+        assert!(result.is_ok());
+        assert_eq!(always.load(Ordering::SeqCst), 1);
+        assert_eq!(on_success.load(Ordering::SeqCst), 1, "success hook should run on full success");
+    }
+
+    #[test]
+    fn drain_finalize_skips_success_hooks_when_pipeline_fails() {
+        // A failed run must not run success-gated hooks — the output is
+        // incomplete, so e.g. a `.bai` sidecar would be stale. The always-run
+        // hooks still drain.
+        let always = Arc::new(AtomicUsize::new(0));
+        let on_success = Arc::new(AtomicUsize::new(0));
+        let result = drain_finalize(
+            Err(anyhow::anyhow!("pipeline boom")),
+            vec![counting_hook(&always, false)],
+            vec![counting_hook(&on_success, false)],
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("pipeline boom"));
+        assert_eq!(always.load(Ordering::SeqCst), 1, "always-run hook still drains on failure");
+        assert_eq!(on_success.load(Ordering::SeqCst), 0, "success hook must not run on failure");
+    }
+
+    #[test]
+    fn drain_finalize_skips_success_hooks_when_an_always_hook_fails() {
+        // If an always-run hook fails (even with a successful pipeline run),
+        // the output is not trustworthy, so success-gated hooks are skipped.
+        let always = Arc::new(AtomicUsize::new(0));
+        let on_success = Arc::new(AtomicUsize::new(0));
+        let result = drain_finalize(
+            Ok(()),
+            vec![counting_hook(&always, true)],
+            vec![counting_hook(&on_success, false)],
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("hook failed"));
+        assert_eq!(
+            on_success.load(Ordering::SeqCst),
+            0,
+            "success hook must not run after a failure"
+        );
     }
 
     #[test]

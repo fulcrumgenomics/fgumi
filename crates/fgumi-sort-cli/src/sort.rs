@@ -30,7 +30,7 @@ use fgumi_cli_common::{
     Command, CompressionOptions, MemoryLimit, MemoryReserve, OperationTimer, parse_bool,
     parse_memory, parse_memory_reserve, resolve_memory_budget, validate_file_exists,
 };
-use fgumi_pipeline_core::{Pipeline, PipelineConfig};
+use fgumi_pipeline_core::{FinalizeHook, Pipeline, PipelineConfig};
 use fgumi_sam::SamTag;
 use fgumi_sort::{QuerynameComparator, SortOrder, verify_sort_order};
 use log::info;
@@ -469,14 +469,19 @@ impl Sort {
         // the summary logs. The pipeline-run error takes precedence.
         let run_result = pipeline.run(config).map_err(|e| anyhow::anyhow!("Pipeline::run: {e:?}"));
 
-        SortFinalizeHook { stats_slot, output_path: output_path.clone(), timer }.finalize();
+        // Drain the summary hook even on the error path (it is infallible —
+        // always `Ok(())`), then let the pipeline-run error take precedence.
+        let summary_result =
+            Box::new(SortFinalizeHook { stats_slot, output_path: output_path.clone(), timer })
+                .finalize();
 
         // Only write the BAM index after a successful sort: a failed run leaves
         // the output BAM incomplete, so emitting (or overwriting) `.bam.bai`
         // would publish a stale index for a partial file.
         run_result?;
+        summary_result?;
         if self.write_index {
-            IndexBamFinalizeHook { output_path }.finalize()?;
+            Box::new(IndexBamFinalizeHook { output_path }).finalize()?;
         }
         Ok(())
     }
