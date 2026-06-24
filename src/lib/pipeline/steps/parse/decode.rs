@@ -40,6 +40,66 @@ use crate::pipeline::steps::parse::bam::parse_records;
 use crate::pipeline::steps::types::{DecodedRecordBatch, DecompressedBlock, RecordBatch};
 use fgumi_bam_io::{DecodedRecord, GroupKeyConfig, compute_group_key_from_raw, name_hash_key};
 
+/// Fail closed on a raw BAM record body too short for the unchecked field
+/// accessors used during group-key extraction.
+///
+/// The parse steps that feed this one ([`parse_records`] and the
+/// `RecordBatch` walked by [`DecodeFromRecords`]) accept any record whose
+/// `block_size` prefix is internally consistent — they do **not** enforce a
+/// per-record minimum body size (see `parse_records`' contract). Both
+/// [`name_hash_key`] and [`compute_group_key_from_raw`] then call
+/// `fgumi_raw_bam::read_name`, which reads `raw[8]` (`l_read_name`, including
+/// the trailing NUL) and slices `raw[32..32 + l_read_name - 1]` with **no**
+/// bounds check; the full-key path additionally reads the 32-byte fixed header
+/// (`flags`, `ref_id`, mate fields, …). A truncated or malformed record would
+/// therefore panic on out-of-bounds indexing. We reject it here with
+/// `InvalidData` before any key is computed so the pipeline surfaces a clean
+/// error instead of unwinding a worker thread.
+///
+/// ## Minimum-length reasoning
+///
+/// - `raw.len() >= MIN_BAM_RECORD_LEN` (32) covers every fixed-offset field,
+///   including the `raw[8]` read of `l_read_name` itself.
+/// - A `>= MIN_BAM_RECORD_LEN` check alone is **not** sufficient: with
+///   `l_read_name` as large as 255 the name slice
+///   `raw[32..32 + l_read_name - 1]` ends well past a 32-byte record. So when
+///   `l_read_name > 1` we additionally require
+///   `raw.len() >= 32 + l_read_name - 1` (the exclusive end of that slice).
+///   When `l_read_name <= 1`, `read_name` returns `&[]` without slicing, so the
+///   32-byte header is enough.
+fn validate_record_for_decode(raw: &[u8]) -> io::Result<()> {
+    if raw.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "DecodeRecords: BAM record too short for group-key extraction \
+                 ({} byte(s) < {}-byte fixed header)",
+                raw.len(),
+                fgumi_raw_bam::MIN_BAM_RECORD_LEN,
+            ),
+        ));
+    }
+    // `raw[8]` is in bounds because `raw.len() >= MIN_BAM_RECORD_LEN` (>= 9).
+    // `read_name` only slices the name region when `l_read_name > 1`; that
+    // slice's exclusive end index is `32 + l_read_name - 1`, which must not run
+    // past the record end.
+    let l_read_name = raw[8] as usize;
+    if l_read_name > 1 {
+        let name_end = 32 + l_read_name - 1;
+        if name_end > raw.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "DecodeRecords: BAM record read-name region runs past record end \
+                     (l_read_name={l_read_name} needs {name_end} byte(s), record is {} byte(s))",
+                    raw.len(),
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Cache the UMI tag's value position on a `DecodedRecord` during decode.
 ///
 /// Looks up `umi_tag` in the record's aux data and, when present and Z-typed,
@@ -144,7 +204,11 @@ impl Step for DecodeRecords {
         let umi_tag = self.key_config.umi_tag;
         let decoded: Vec<DecodedRecord> = records
             .into_iter()
-            .map(|raw| {
+            .map(|raw| -> io::Result<DecodedRecord> {
+                // Fail closed before the unchecked raw-field accessors run: a
+                // truncated/malformed body would otherwise panic in
+                // `read_name` (see `validate_record_for_decode`).
+                validate_record_for_decode(raw.as_ref())?;
                 // Queryname-grouping stages (e.g. correct) read only
                 // `key.name_hash`; skip the CIGAR position walk + aux-tag pass.
                 let key = if name_hash_only {
@@ -158,9 +222,9 @@ impl Step for DecodeRecords {
                 if let Some(umi_tag) = umi_tag {
                     cache_umi_position(&mut decoded, umi_tag);
                 }
-                decoded
+                Ok(decoded)
             })
-            .collect();
+            .collect::<io::Result<Vec<_>>>()?;
 
         let out = DecodedRecordBatch::new(batch_serial, decoded);
         match ctx.outputs.push(out) {
@@ -250,14 +314,26 @@ impl Step for DecodeFromRecords {
 
         let library_index: &Arc<_> = &self.key_config.library_index;
         let cell_tag = self.key_config.cell_tag;
+        let name_hash_only = self.key_config.name_hash_only;
         let umi_tag = self.key_config.umi_tag;
         // `DecodedRecord` owns its bytes (via `RawRecord`), so we materialize
         // a heap-allocated copy here. The `RecordBatch`'s shared backing
         // buffer is dropped once this batch is consumed.
         let decoded: Vec<DecodedRecord> = batch
             .iter_record_bytes()
-            .map(|bytes| {
-                let key = compute_group_key_from_raw(bytes, library_index, cell_tag);
+            .map(|bytes| -> io::Result<DecodedRecord> {
+                // Fail closed before the unchecked raw-field accessors run: a
+                // truncated/malformed body would otherwise panic in
+                // `read_name` (see `validate_record_for_decode`).
+                validate_record_for_decode(bytes)?;
+                // Mirror `DecodeRecords::try_run`: queryname-grouping stages
+                // (e.g. correct) read only `key.name_hash`, so skip the CIGAR
+                // position walk + aux-tag pass when `name_hash_only` is set.
+                let key = if name_hash_only {
+                    name_hash_key(bytes)
+                } else {
+                    compute_group_key_from_raw(bytes, library_index, cell_tag)
+                };
                 let mut decoded = DecodedRecord::from_raw_bytes(
                     fgumi_raw_bam::RawRecord::from(bytes.to_vec()),
                     key,
@@ -267,9 +343,9 @@ impl Step for DecodeFromRecords {
                 if let Some(umi_tag) = umi_tag {
                     cache_umi_position(&mut decoded, umi_tag);
                 }
-                decoded
+                Ok(decoded)
             })
-            .collect();
+            .collect::<io::Result<Vec<_>>>()?;
 
         let out = DecodedRecordBatch::new(batch_serial, decoded);
         match ctx.outputs.push(out) {
@@ -351,6 +427,88 @@ mod tests {
                 GroupKey { name_hash: full.name_hash, ..GroupKey::default() },
                 "name_hash_only must leave all non-name fields at default"
             );
+        }
+    }
+
+    // ========================================================================
+    // Fail-closed validation of undersized / malformed records
+    // ========================================================================
+
+    /// A record body shorter than the 32-byte BAM fixed header must be rejected
+    /// with `InvalidData` rather than panicking in the unchecked field
+    /// accessors. Mirrors the 8-byte records built by
+    /// `parse_records_decodes_block_size_prefix` in `bam.rs` — exactly the
+    /// shape `parse_records` accepts but the key extractors cannot decode.
+    #[test]
+    fn validate_record_for_decode_rejects_record_shorter_than_fixed_header() {
+        let too_short = [0u8; 8];
+        let err = validate_record_for_decode(&too_short).expect_err("must fail closed");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A record long enough for the fixed header but whose declared
+    /// `l_read_name` runs past the record end must also be rejected. This is
+    /// the case a bare `len >= MIN_BAM_RECORD_LEN` check would miss: without
+    /// the read-name bound, `read_name` would slice `raw[32..32 + 50 - 1]` on a
+    /// 32-byte record and panic.
+    #[test]
+    fn validate_record_for_decode_rejects_truncated_read_name() {
+        let mut rec = [0u8; fgumi_raw_bam::MIN_BAM_RECORD_LEN];
+        rec[8] = 50; // l_read_name claims 49 name bytes + NUL, none of which exist
+        let err = validate_record_for_decode(&rec).expect_err("must fail closed");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// The boundary cases that must be accepted: a 32-byte record with an empty
+    /// name (`l_read_name <= 1`, where `read_name` never slices) and a real
+    /// well-formed record built by `SamBuilder`. Proves the guard does not
+    /// reject valid input.
+    #[test]
+    fn validate_record_for_decode_accepts_minimal_and_valid_records() {
+        use fgumi_raw_bam::SamBuilder;
+
+        // 32-byte record, l_read_name = 1 (just the NUL): read_name short-circuits.
+        let mut minimal = [0u8; fgumi_raw_bam::MIN_BAM_RECORD_LEN];
+        minimal[8] = 1;
+        validate_record_for_decode(&minimal).expect("minimal empty-name record is valid");
+
+        // A real record exercising read_name's slice path.
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1").sequence(b"ACGT").qualities(&[30u8; 4]);
+        let raw = b.build();
+        validate_record_for_decode(raw.as_ref()).expect("well-formed record is valid");
+    }
+
+    /// End-to-end fail-closed proof: the same undersized record fed through the
+    /// `DecodeRecords` map logic (the production `name_hash_only` and full-key
+    /// branches) yields an `io::Error`, not a panic. Reproduces the map +
+    /// `collect::<io::Result<Vec<_>>>()` shape used by `try_run`.
+    #[test]
+    fn decode_map_fails_closed_on_undersized_record_for_both_key_branches() {
+        use fgumi_bam_io::{GroupKey, LibraryIndex};
+        use noodles::sam::alignment::record::data::field::Tag;
+
+        let lib = LibraryIndex::default();
+        let cell_tag = Some(Tag::from([b'C', b'B']));
+        // Below the fixed-header minimum — would panic in `read_name` if it
+        // reached the key extractors.
+        let undersized: &[u8] = &[0u8; 8];
+
+        for name_hash_only in [true, false] {
+            let result: io::Result<Vec<GroupKey>> = [undersized]
+                .into_iter()
+                .map(|raw| -> io::Result<GroupKey> {
+                    validate_record_for_decode(raw)?;
+                    let key = if name_hash_only {
+                        name_hash_key(raw)
+                    } else {
+                        compute_group_key_from_raw(raw, &lib, cell_tag)
+                    };
+                    Ok(key)
+                })
+                .collect();
+            let err = result.expect_err("undersized record must fail closed");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         }
     }
 

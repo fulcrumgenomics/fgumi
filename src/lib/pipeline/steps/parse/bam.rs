@@ -176,8 +176,11 @@ pub(crate) fn parse_record_ranges(bytes: &[u8]) -> io::Result<Vec<(u32, u32)>> {
 ///
 /// # Errors
 ///
-/// Returns `Err` if a record runs past the buffer end or
-/// `block_size` is too small for a valid BAM record.
+/// Returns `Err` if a record runs past the buffer end, or if the buffer ends
+/// with a trailing partial record (the final `block_size` does not consume the
+/// remaining bytes exactly). It does NOT enforce a per-record minimum body
+/// size, so a `block_size` below the BAM fixed-field minimum is accepted here
+/// and rejected (if at all) by later decode of the record body.
 pub(crate) fn parse_records(bytes: &[u8]) -> io::Result<Vec<RawRecord>> {
     let mut records = Vec::new();
     let mut cursor = 0;

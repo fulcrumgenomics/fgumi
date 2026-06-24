@@ -149,13 +149,20 @@ fn read_fastq_raw_bytes_from_bufread(
             break;
         }
         if data[line_start] != b'@' {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            // A lone newline (blank line between records) is a common
+            // hand-edit/corruption artifact; give it a clearer message than
+            // the raw "got '\n'" the generic branch would produce.
+            let message = if data[line_start] == b'\n' {
+                "Unexpected blank line in FASTQ stream (expected a record \
+                 starting with '@')"
+                    .to_string()
+            } else {
                 format!(
                     "Expected FASTQ record to start with '@', got '{}'",
                     data[line_start] as char
-                ),
-            ));
+                )
+            };
+            return Err(io::Error::new(io::ErrorKind::InvalidData, message));
         }
         if data.last() != Some(&b'\n') {
             data.push(b'\n');
@@ -239,7 +246,6 @@ pub struct ReadFastqInputs {
     sticky: bool,
     batch_record_count: usize,
     next_chunk_serial: u64,
-    current_stream: usize,
     pending: VecDeque<FastqRawChunk>,
     held: HeldSlot<Unpushed<FastqRawChunk>>,
     output_byte_limit: u64,
@@ -327,7 +333,6 @@ impl ReadFastqInputs {
             sticky,
             batch_record_count: batch_record_count.max(1),
             next_chunk_serial: 0,
-            current_stream: 0,
             pending: VecDeque::new(),
             held: HeldSlot::new(),
             output_byte_limit,
@@ -389,18 +394,21 @@ impl Step for ReadFastqInputs {
         {
             let mut guard = self.readers.lock();
             let readers = guard.as_mut().expect("ReadFastqInputs: readers missing");
+            debug_assert_eq!(
+                readers.len(),
+                self.n_streams,
+                "reader count must match the declared stream count"
+            );
 
-            // Read from each stream starting at current_stream, wrapping around.
-            for offset in 0..self.n_streams {
-                let idx = (self.current_stream + offset) % self.n_streams;
+            // Read one chunk from every non-exhausted stream this cycle. Each
+            // cycle reads all streams, so there is no rotation offset.
+            for (idx, reader) in readers.iter_mut().enumerate() {
                 if self.exhausted[idx] {
                     continue;
                 }
 
-                let (data, records_read) = read_fastq_raw_bytes_from_bufread(
-                    readers[idx].as_mut(),
-                    self.batch_record_count,
-                )?;
+                let (data, records_read) =
+                    read_fastq_raw_bytes_from_bufread(reader.as_mut(), self.batch_record_count)?;
 
                 if records_read == 0 {
                     self.exhausted[idx] = true;
@@ -420,8 +428,7 @@ impl Step for ReadFastqInputs {
             }
         }
 
-        // Advance round-robin and serial.
-        self.current_stream = 0;
+        // Advance to the next round-robin cycle.
         self.next_chunk_serial += 1;
 
         if !any_read {

@@ -147,6 +147,22 @@ impl BoundaryState {
     /// # Errors
     ///
     /// Returns an I/O error if the BAM header is malformed.
+    ///
+    /// # Record-level validation
+    ///
+    /// This function does NOT validate individual record `block_size` values
+    /// against a malformed (but self-consistent) BAM stream. The per-record
+    /// cross-check below (offset delta vs. the stored prefix) is a
+    /// `debug_assertions`-only regression tripwire for this scanner's own
+    /// arithmetic — it re-reads the same `block_size` bytes the scan already
+    /// trusted, so it can only catch an internal bookkeeping bug, never input
+    /// corruption. Authoritative release-build validation of record structure
+    /// (out-of-bounds record end, trailing partial record) is performed
+    /// downstream by `parse_records` / `parse_record_ranges` on the same bytes,
+    /// which hard-error in all build modes. The `offsets` vector this returns
+    /// is not consumed in release builds (`FindBamBoundaries` forwards only
+    /// `buffer`), so promoting the cross-check to release would re-validate a
+    /// tautology at a per-record cost for no correctness benefit.
     pub fn find_boundaries(&mut self, decompressed: &[u8]) -> io::Result<BoundaryBatch> {
         // Step 1: Combine leftover with new data into reusable work_buffer
         // This avoids allocating a new Vec on every call
@@ -208,7 +224,14 @@ impl BoundaryState {
         // Extract the records buffer - this allocation is unavoidable as we return ownership
         let buffer = self.work_buffer[start_cursor..cursor].to_vec();
 
-        // Validate: verify each record's block_size matches the offset difference
+        // Debug-only regression tripwire (NOT input validation): cross-check
+        // each record's stored block_size prefix against the offset delta this
+        // scan just computed. Both derive from the same bytes with no
+        // intervening mutation, so this only catches an internal arithmetic /
+        // indexing bug in the scan above — a corrupt-but-self-consistent
+        // block_size passes trivially. Authoritative release validation lives
+        // in parse_records / parse_record_ranges downstream (see the
+        // `find_boundaries` doc comment).
         #[cfg(debug_assertions)]
         for i in 0..offsets.len().saturating_sub(1) {
             let start = offsets[i];

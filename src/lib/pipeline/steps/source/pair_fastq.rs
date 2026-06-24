@@ -117,6 +117,17 @@ impl PairRawFastq {
         }
     }
 
+    /// Override the soft pending-backpressure limit (test-only).
+    ///
+    /// Production wires the default 256 MiB limit; tests shrink it to a few
+    /// bytes so a skewed-completion scenario can cross it with a handful of
+    /// small chunks rather than hundreds of megabytes of data.
+    #[cfg(test)]
+    fn with_backpressure_bytes(mut self, bytes: usize) -> Self {
+        self.pending_backpressure_bytes = bytes;
+        self
+    }
+
     /// Buffer a chunk from stream A (slot 0) or stream B (slot 1).
     fn buffer_chunk(&mut self, chunk: FastqRawChunk, is_a: bool) {
         self.pending_total_bytes += chunk.data.len();
@@ -425,5 +436,314 @@ mod tests {
         assert_eq!(p1.data_b, b"raw_b1");
 
         assert_eq!(step.pending_total_bytes, 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // X3-003: drive the paired-FASTQ source through a REAL fused chain under
+    // back-pressure with skewed stream completion, on a watchdog thread.
+    //
+    // The in-module `pull_decision` tests above only check the decision
+    // predicate in isolation. This test exercises the actual `PairRawFastq`
+    // step inside a `Pipeline` with a tiny byte limit and one stream (R1)
+    // racing far ahead of the other (R2): R1 emits ALL its chunks before R2
+    // emits any. The partial-pair buffer crosses the limit while the front
+    // pair is missing R2; the deadlock fix must keep pulling R2 (the behind
+    // stream) so the front pair completes and the buffer drains. A regression
+    // that globally refuses to pull under back-pressure wedges the step, and
+    // the watchdog fires.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrd};
+
+    use crate::pipeline::core::{PipelineBuilder, PipelineConfig, Step, StepCtx};
+
+    /// Bytes per emitted raw chunk. Sized so that buffering a SINGLE unmatched
+    /// leader chunk already crosses the pairing step's soft byte limit — that
+    /// way the partial-pair buffer is over-limit with the front pair missing
+    /// its R2 slot, which is exactly the state where a "refuse all pulls under
+    /// back-pressure" regression deadlocks (it will not pull the available R2
+    /// chunk that would complete the front pair and drain the buffer).
+    const X3_CHUNK_BYTES: usize = 1024;
+    /// Number of chunk serials each stream emits.
+    const X3_N_SERIALS: u64 = 16;
+    /// Soft backpressure limit for the pairing step under test. Sized so a
+    /// single buffered unmatched chunk crosses the SOFT limit (1x) but stays
+    /// under the HARD desync limit (2x): `768 < 1024 (one chunk) < 1536`. This
+    /// puts the step in the over-soft-limit / front-pair-incomplete regime that
+    /// the deadlock fix targets, WITHOUT tripping the catastrophic-desync abort.
+    const X3_SOFT_LIMIT_BYTES: usize = 768;
+    /// Per-source output-queue byte limit. Small (a few chunks) so a
+    /// back-pressured pairing step leaves a source's output queue full and that
+    /// source cannot drain — the precondition for the deadlock to manifest (if
+    /// the streams always drained, `finalize_pairs` would flush everything even
+    /// under a refuse-to-pull regression, masking the bug).
+    const X3_SOURCE_QUEUE_BYTES: u64 = 4 * 1024;
+    /// R2 holds back until R1 has emitted this many chunks, so the front pair
+    /// (serial 0) is reliably buffered R1-first and over the limit with its R2
+    /// slot still missing. Kept minimal (just enough to order the front pair) so
+    /// it does not also stall the FIXED path, which over the limit pulls ONLY
+    /// the behind stream.
+    const X3_LAG_UNTIL: usize = 1;
+
+    /// Serial source emitting `FastqRawChunk`s for ONE stream, serials `0..N`,
+    /// at the given `stream_idx`. Mirrors the per-stream `ReadFastqInputs`
+    /// reader: one chunk per dispatch, each carrying a globally-unique ordinal.
+    ///
+    /// To force the skewed-completion regime the deadlock fix targets, the
+    /// stream is optionally gated on a shared "leader progress" counter: the
+    /// leader (R1) increments it on every emit, and the laggard (R2) refuses to
+    /// emit (`NoProgress`) until the leader has raced `lag_until` chunks ahead.
+    /// This piles the leader's unmatched chunks in `PairRawFastq`'s partial-pair
+    /// buffer past the byte limit while the front pair is still missing R2 —
+    /// exactly the state where a "refuse all pulls under back-pressure"
+    /// regression deadlocks (the completing R2 chunk is available but never
+    /// pulled).
+    struct OneStreamSource {
+        stream_idx: usize,
+        next_serial: u64,
+        n_serials: u64,
+        held: HeldSlot<Unpushed<FastqRawChunk>>,
+        output_byte_limit: u64,
+        /// Shared leader-progress counter (chunks the leader has emitted).
+        leader_progress: Arc<AtomicUsize>,
+        /// If `Some(n)`, this is the laggard: do not emit until the leader has
+        /// emitted at least `n` chunks. If `None`, this is the leader.
+        lag_until: Option<usize>,
+    }
+
+    impl OneStreamSource {
+        fn leader(
+            stream_idx: usize,
+            n_serials: u64,
+            output_byte_limit: u64,
+            leader_progress: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                stream_idx,
+                next_serial: 0,
+                n_serials,
+                held: HeldSlot::new(),
+                output_byte_limit,
+                leader_progress,
+                lag_until: None,
+            }
+        }
+
+        fn laggard(
+            stream_idx: usize,
+            n_serials: u64,
+            output_byte_limit: u64,
+            leader_progress: Arc<AtomicUsize>,
+            lag_until: usize,
+        ) -> Self {
+            Self {
+                stream_idx,
+                next_serial: 0,
+                n_serials,
+                held: HeldSlot::new(),
+                output_byte_limit,
+                leader_progress,
+                lag_until: Some(lag_until),
+            }
+        }
+    }
+
+    impl Step for OneStreamSource {
+        type Input = ();
+        type Outputs = OrderedBytesSingle<FastqRawChunk>;
+
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "OneStreamSource",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: self.output_byte_limit }],
+                branch_ordering: vec![BranchOrdering::ByItemOrdinal],
+            }
+        }
+
+        fn affinity(&self) -> Affinity {
+            // Distinct workers so R1 and R2 can race independently (mirrors the
+            // production per-stream reader affinities).
+            Affinity::Worker(self.stream_idx)
+        }
+
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            if let Some(unpushed) = self.held.take() {
+                match ctx.outputs.retry(unpushed) {
+                    Ok(()) => {}
+                    Err(again) => {
+                        self.held.put(again);
+                        return Ok(StepOutcome::Contention);
+                    }
+                }
+            }
+
+            if self.next_serial >= self.n_serials {
+                return Ok(StepOutcome::Finished);
+            }
+
+            // Laggard: stall until the leader has raced far enough ahead to
+            // pile its chunks past the byte limit with the front pair missing.
+            if let Some(lag_until) = self.lag_until {
+                if self.leader_progress.load(AtomicOrd::Acquire) < lag_until {
+                    return Ok(StepOutcome::NoProgress);
+                }
+            }
+
+            let chunk_serial = self.next_serial;
+            self.next_serial += 1;
+
+            // Globally-unique ordinal across both streams (N == 2):
+            // serial*2 + stream_idx.
+            let ordinal = chunk_serial * 2 + self.stream_idx as u64;
+            let chunk = FastqRawChunk {
+                ordinal,
+                stream_idx: self.stream_idx,
+                chunk_serial,
+                data: vec![b'A'; X3_CHUNK_BYTES],
+            };
+            match ctx.outputs.push(chunk) {
+                Ok(()) => {
+                    if self.lag_until.is_none() {
+                        self.leader_progress.fetch_add(1, AtomicOrd::Release);
+                    }
+                    Ok(StepOutcome::Progress)
+                }
+                Err(unpushed) => {
+                    self.held.put(unpushed);
+                    if self.lag_until.is_none() {
+                        self.leader_progress.fetch_add(1, AtomicOrd::Release);
+                    }
+                    Ok(StepOutcome::Progress)
+                }
+            }
+        }
+    }
+
+    /// Serial (single-consumer) sink that records each paired batch's
+    /// `chunk_serial` in the exact order it is emitted. A `Serial` sink — not
+    /// `Parallel` — is what lets the test assert true emission order: a single
+    /// worker drains the queue in FIFO order, so the recorded sequence is the
+    /// real downstream order rather than a multi-consumer interleaving.
+    #[derive(Clone)]
+    struct PairSink {
+        seen_serials: Arc<Mutex<Vec<u64>>>,
+        count: Arc<AtomicUsize>,
+    }
+
+    impl Step for PairSink {
+        type Input = PairedRawFastqBatch;
+        type Outputs = ();
+
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "PairSink",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            match ctx.input.pop() {
+                Some(batch) => {
+                    // Each emitted pair must carry equal-length R1/R2 data.
+                    assert_eq!(batch.data_a.len(), X3_CHUNK_BYTES);
+                    assert_eq!(batch.data_b.len(), X3_CHUNK_BYTES);
+                    self.seen_serials.lock().unwrap().push(batch.chunk_serial);
+                    self.count.fetch_add(1, AtomicOrd::Relaxed);
+                    Ok(StepOutcome::Progress)
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// End-to-end: two per-stream sources (R1 races ahead, R2 lags) feed
+    /// `PairRawFastq` (tiny byte limit) which feeds a collecting sink. Driven on
+    /// a watchdog thread so the deadlock regression surfaces as a timeout. The
+    /// run must complete and emit every pair in `chunk_serial` order.
+    #[test]
+    fn pair_fastq_does_not_deadlock_under_backpressure_with_skewed_streams() {
+        use std::time::{Duration, Instant};
+
+        let seen = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let count = Arc::new(AtomicUsize::new(0));
+
+        // R1 (leader) races ahead; R2 (laggard) stalls until R1 has emitted
+        // `X3_LAG_UNTIL` chunks, forcing the partial-pair buffer over the limit
+        // with the front pair missing R2.
+        let leader_progress = Arc::new(AtomicUsize::new(0));
+
+        let seen_for_thread = Arc::clone(&seen);
+        let count_for_thread = Arc::clone(&count);
+        let leader_for_thread = Arc::clone(&leader_progress);
+        let worker = std::thread::Builder::new()
+            .name("pair-fastq-x3-003".into())
+            .spawn(move || -> io::Result<()> {
+                let r1 = OneStreamSource::leader(
+                    0,
+                    X3_N_SERIALS,
+                    X3_SOURCE_QUEUE_BYTES,
+                    Arc::clone(&leader_for_thread),
+                );
+                let r2 = OneStreamSource::laggard(
+                    1,
+                    X3_N_SERIALS,
+                    X3_SOURCE_QUEUE_BYTES,
+                    leader_for_thread,
+                    X3_LAG_UNTIL,
+                );
+                let pair =
+                    PairRawFastq::new(64 * 1024).with_backpressure_bytes(X3_SOFT_LIMIT_BYTES);
+                let sink = PairSink { seen_serials: seen_for_thread, count: count_for_thread };
+
+                let builder = PipelineBuilder::new();
+                let r1_tail = builder.append_source(r1);
+                let r2_tail = builder.append_source(r2);
+                let pair_tail = builder.append_step2(pair, r1_tail, r2_tail);
+                builder.append_step(sink, pair_tail);
+
+                let pipeline = builder.build().map_err(io::Error::other)?;
+                // 3 workers: R1, R2, and a free worker for pairing/sink.
+                pipeline
+                    .run(PipelineConfig { threads: 3, ..Default::default() })
+                    .map_err(io::Error::other)
+            })
+            .expect("spawn pipeline worker");
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !worker.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "PairRawFastq pipeline did not finish within 30s — likely the X3-003 \
+                 refuse-to-pull-under-backpressure deadlock regression"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        worker.join().expect("pipeline thread panicked").expect("pipeline run returned Err");
+
+        // Full output: one pair per serial, every serial present AND in order.
+        // The single-consumer `PairSink` records the true emission order, so we
+        // assert the sequence directly (no sort) to prove `PairRawFastq` emits
+        // pairs in contiguous `chunk_serial` order, not merely as a set.
+        let serials = seen.lock().unwrap().clone();
+        assert_eq!(
+            serials.len(),
+            usize::try_from(X3_N_SERIALS).unwrap(),
+            "expected one emitted pair per serial, got {}",
+            serials.len()
+        );
+        let expected: Vec<u64> = (0..X3_N_SERIALS).collect();
+        assert_eq!(serials, expected, "every chunk_serial must be paired exactly once, in order");
     }
 }
