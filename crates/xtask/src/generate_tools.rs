@@ -52,7 +52,7 @@ pub fn generate(docs_src: &Path) -> Result<Vec<ToolPage>> {
     }
 
     let index = render_tools_index(&by_category);
-    fs::write(tools_dir.join("README.md"), index)?;
+    fs::write(tools_dir.join("index.md"), index)?;
 
     Ok(pages)
 }
