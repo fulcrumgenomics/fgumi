@@ -458,19 +458,29 @@ impl UmiAssigner for ParallelAdjacencyAssigner {
             return Vec::new();
         }
 
-        // Count unique UMIs
-        let mut umi_counts: AHashMap<String, usize> = AHashMap::new();
+        // Count unique UMIs by their uppercased form (node identity is the
+        // case-insensitive `BitEnc`), while remembering the RAW first-seen UMI
+        // string for each — that is the case-sensitive, fgbio-compatible tie-break
+        // key the sequential `AdjacencyUmiAssigner` uses (S7-002/FU-004). Iterating
+        // `raw_umis` in input order makes the recorded raw string the first-seen
+        // one, matching the sequential path's `raw_umis[first_index]`.
+        let mut umi_counts: AHashMap<String, (usize, String)> = AHashMap::new();
         for umi in raw_umis {
-            *umi_counts.entry(umi.to_uppercase()).or_insert(0) += 1;
+            umi_counts
+                .entry(umi.to_uppercase())
+                .and_modify(|(count, _)| *count += 1)
+                .or_insert_with(|| (1, umi.clone()));
         }
 
         // Build sorted list with BitEnc encoding
         // Filter out invalid UMIs during encoding
         // Use from_umi_str to handle paired UMIs with dashes (e.g., "ACGT-TGCA")
-        let mut sorted_umis: Vec<(String, usize, BitEnc)> = umi_counts
+        // Tuple: (uppercased key, count, BitEnc, raw first-seen UMI).
+        let mut sorted_umis: Vec<(String, usize, BitEnc, String)> = umi_counts
             .iter()
-            .filter_map(|(umi, &count)| {
-                BitEnc::from_umi_str(umi).map(|enc| (umi.clone(), count, enc))
+            .filter_map(|(umi_upper, (count, raw_first_seen))| {
+                BitEnc::from_umi_str(umi_upper)
+                    .map(|enc| (umi_upper.clone(), *count, enc, raw_first_seen.clone()))
             })
             .collect();
 
@@ -480,13 +490,14 @@ impl UmiAssigner for ParallelAdjacencyAssigner {
             return (0..raw_umis.len()).map(|i| MoleculeId::Single(i as u64)).collect();
         }
 
-        // Sort by count descending, then by UMI string for determinism
-        // This matches the sequential assigner's behavior exactly
-        sorted_umis.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        // Sort by count descending, then by the RAW first-seen UMI string — exactly
+        // the sequential assigner's case-sensitive tie-break (fgbio parity). A
+        // mixed-case parity proptest pins the equivalence.
+        sorted_umis.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.3.cmp(&b.3)));
 
         // Build indexed structures (avoid cloning strings by using indices)
         let unique_umis: Vec<(BitEnc, usize)> =
-            sorted_umis.iter().map(|(_, count, enc)| (*enc, *count)).collect();
+            sorted_umis.iter().map(|(_, count, enc, _)| (*enc, *count)).collect();
 
         // Phase 1: Parallel edge discovery (using configured thread pool)
         let max_mismatches = self.max_mismatches;
@@ -545,7 +556,7 @@ impl UmiAssigner for ParallelAdjacencyAssigner {
         let str_to_mol: AHashMap<&str, MoleculeId> = sorted_umis
             .iter()
             .enumerate()
-            .map(|(i, (umi, _, _))| (umi.as_str(), mol_ids[i]))
+            .map(|(i, (umi, _, _, _))| (umi.as_str(), mol_ids[i]))
             .collect();
 
         // Map back to original UMI order
@@ -754,6 +765,9 @@ impl UmiAssigner for ParallelPairedAssigner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::umi::AdjacencyUmiAssigner;
+    use fgumi_umi::assigner::DEFAULT_INDEX_THRESHOLD;
+    use proptest::prelude::*;
 
     // ==================== UnionFind Tests ====================
 
@@ -1415,4 +1429,102 @@ mod tests {
 
         assert_same_groupings(&result1, &result2);
     }
+
+    // ==================== Sequential-vs-parallel parity (S7-002 / FU-004) ====================
+
+    /// Compare two assignment vectors by the *partition* of input indices they induce, keyed on
+    /// the underlying molecule id (`MoleculeId::id()`). Unlike `assert_same_groupings`, this
+    /// collapses `PairedA`/`PairedB` of the same molecule into one group, so it is valid for both
+    /// the single (`AdjacencyUmiAssigner`) and paired (`PairedUmiAssigner`) strategies. Concrete
+    /// id *values* are irrelevant — only which inputs share a molecule.
+    fn assert_same_partition_by_molecule(a: &[MoleculeId], b: &[MoleculeId]) {
+        assert_eq!(a.len(), b.len());
+
+        let partition = |ids: &[MoleculeId]| -> Vec<Vec<usize>> {
+            let mut groups: AHashMap<Option<u64>, Vec<usize>> = AHashMap::new();
+            for (i, id) in ids.iter().enumerate() {
+                groups.entry(id.id()).or_default().push(i);
+            }
+            let mut sorted: Vec<Vec<usize>> = groups.into_values().collect();
+            for group in &mut sorted {
+                group.sort_unstable();
+            }
+            sorted.sort();
+            sorted
+        };
+
+        assert_eq!(partition(a), partition(b), "Partitions diverge between assigners");
+    }
+
+    proptest! {
+        /// `ParallelAdjacencyAssigner` and the sequential `AdjacencyUmiAssigner` must induce the
+        /// same partition for any UMI multiset, including mixed-case input. This is the parity
+        /// guard for S7-002 / FU-004: before converging the parallel tie-break key onto the RAW
+        /// first-seen UMI string, mixed-case equal-count roots could sort in opposite order
+        /// between the two paths (parallel keyed on the uppercased string, sequential on raw
+        /// bytes) and capture a shared neighbor into different groups. UMIs are drawn from a small
+        /// alphabet (mixed case) over a short fixed length to maximize ties and 1-edit adjacency.
+        #[test]
+        fn proptest_adjacency_parallel_matches_sequential(
+            indices in prop::collection::vec(0usize..16, 1..40),
+        ) {
+            // A small pool of length-4 UMIs over {A,C,G,T} in mixed case, so distinct-by-case
+            // strings collide to the same case-insensitive `BitEnc` node and exercise the
+            // tie-break ordering.
+            const POOL: [&str; 16] = [
+                "aAAA", "AAAA", "CAAA", "cAAA", "GAAA", "gAAA", "TAAA", "tAAA",
+                "AACA", "aaca", "AAGA", "aaga", "ACGT", "acgt", "TGCA", "tgca",
+            ];
+            let umis: Vec<Umi> = indices.iter().map(|&i| POOL[i].to_string()).collect();
+
+            let parallel = ParallelAdjacencyAssigner::new(1, 4).assign(&umis);
+            let sequential =
+                AdjacencyUmiAssigner::new(1, 1, DEFAULT_INDEX_THRESHOLD).assign(&umis);
+
+            assert_same_partition_by_molecule(&parallel, &sequential);
+        }
+    }
+
+    /// Non-vacuous DIRECTION guard for S7-002 / FU-004: pins that the tie-break is
+    /// the case-SENSITIVE RAW first-seen string (fgbio parity), not the uppercased
+    /// one. With raw bytes, `"CAAA"` (C=0x43) sorts before `"aAAA"` (a=0x61), so the
+    /// equal-count `CAAA` root is processed first and captures the 1-edit `GAAA`
+    /// child — `GAAA` groups with `CAAA`, NOT with `aAAA`. An uppercased tie-break
+    /// (`"AAAA" < "CAAA"`) would reverse this and group `GAAA` with `aAAA`, so this
+    /// test fails under the wrong direction. Both assigners must agree on the raw
+    /// outcome.
+    #[test]
+    fn adjacency_tie_break_is_case_sensitive_raw_not_uppercased() {
+        // 4×aAAA, 4×CAAA, 1×GAAA. aAAA/CAAA are equal-count (4); neither captures
+        // the other (4 > 4/2+1=3); both are 1 edit from GAAA (capturable at 1).
+        let umis: Vec<Umi> =
+            ["aAAA", "aAAA", "aAAA", "aAAA", "CAAA", "CAAA", "CAAA", "CAAA", "GAAA"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+
+        for label_and_result in [
+            ("sequential", AdjacencyUmiAssigner::new(1, 1, DEFAULT_INDEX_THRESHOLD).assign(&umis)),
+            ("parallel", ParallelAdjacencyAssigner::new(1, 4).assign(&umis)),
+        ] {
+            let (label, mol) = label_and_result;
+            // GAAA (index 8) must share CAAA's molecule (indices 4..=7), not aAAA's (0..=3).
+            assert_eq!(mol[8], mol[4], "{label}: GAAA must group with CAAA under a raw tie-break");
+            assert_ne!(mol[8], mol[0], "{label}: GAAA must NOT group with aAAA (that is the bug)");
+            assert_eq!(mol[0], mol[3], "{label}: the four aAAA reads share one molecule");
+            assert_eq!(mol[4], mol[7], "{label}: the four CAAA reads share one molecule");
+        }
+    }
+
+    // NOTE on the paired strategy (S7-002 / FU-004 scope): the sequential `PairedUmiAssigner`
+    // tie-break is the case-SENSITIVE canonical string (`canonicalize_paired` normalizes
+    // orientation only, not case) — raw/fgbio-compatible, matching the single-UMI raw tie-break.
+    // The parallel `ParallelPairedAssigner` is NOT converged onto raw here, and a *full* paired
+    // parity proptest is intentionally NOT added: the two paired paths diverge on inputs
+    // unrelated to the tie-break key — `ParallelPairedAssigner::canonicalize` uppercases (so its
+    // node identity itself is case-insensitive, unlike the sequential), and the two paths
+    // implement reverse-orientation adjacency matching differently (e.g. `GAAA-CCCC` vs
+    // `AAAA-CCCC`, 1 edit apart, group in the parallel path but not the sequential one).
+    // Converging the paired paths means reconciling those deeper divergences, which is a
+    // pre-existing, out-of-scope follow-up distinct from the FU-004 tie-break-key fix.
 }

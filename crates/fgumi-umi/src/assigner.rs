@@ -1515,7 +1515,12 @@ impl UmiAssigner for AdjacencyUmiAssigner {
         #[cfg(feature = "profile-adjacency")]
         let t_after_count = std::time::Instant::now();
 
-        // Sort by descending count, then by original string for determinism
+        // Sort by descending count, then by the RAW first-seen UMI string for a stable,
+        // fgbio-compatible tie-break (S7-002/FU-004). Node identity and counting are
+        // case-insensitive (`BitEnc`), but the equal-count root-order tie-break is
+        // case-SENSITIVE raw bytes — matching fgbio's `strnum`-style ordering. The
+        // parallel assigner is converged onto this same raw-first-seen key (see
+        // `ParallelAdjacencyAssigner::assign`); a mixed-case parity proptest pins it.
         umi_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| raw_umis[a.2].cmp(&raw_umis[b.2])));
 
         // Build the pre-sort -> sorted permutation as a dense `Vec` (indices are
@@ -1862,6 +1867,10 @@ impl UmiAssigner for PairedUmiAssigner {
 
         // Count with A-B and B-A combined
         let mut umi_counts = Self::count_paired(raw_umis);
+        // Tie-break equal-count canonical UMIs by the case-SENSITIVE canonical string
+        // (`canonicalize_paired` normalizes orientation only, not case), matching fgbio's
+        // raw ordering — consistent with the single-UMI raw tie-break in
+        // `AdjacencyUmiAssigner::assign` (S7-002/FU-004).
         umi_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         if umi_counts.len() == 1 {
