@@ -63,6 +63,10 @@ pub fn generate(docs_src: &Path) -> Result<Vec<MetricPage>> {
     }
 
     let index = render_metrics_index(&all_metrics);
+    // Name the index `index.md`, never `README.md`: mdBook renders both to
+    // `index.html`, but it does NOT rewrite links that target `README.md` — it
+    // only swaps the extension, producing a dead link to `metrics/README.html`.
+    // Using `index.md` keeps the link and the rendered filename in agreement.
     fs::write(metrics_dir.join("index.md"), index)?;
 
     Ok(pages)

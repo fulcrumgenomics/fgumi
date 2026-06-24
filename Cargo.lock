@@ -2739,6 +2739,7 @@ dependencies = [
  "fgumi",
  "quote",
  "syn 2.0.118",
+ "tempfile",
 ]
 
 [[package]]
