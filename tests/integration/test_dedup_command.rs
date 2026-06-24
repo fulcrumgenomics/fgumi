@@ -175,12 +175,14 @@ fn test_dedup_command_remove_duplicates() {
     cmd.execute("fgumi dedup").expect("Dedup command with --remove-duplicates failed");
     assert!(output_bam.exists(), "Output BAM not created");
 
-    // With remove-duplicates, only the best pair should remain
+    // With --remove-duplicates, exactly one pair (2 records) survives: the 3
+    // duplicate pairs (6 records) collapse to the single best representative
+    // pair, so the other 2 pairs (4 records) are dropped. Assert the exact
+    // expected count rather than loose bounds (S9b-008).
     let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
     let _header = reader.read_header().unwrap();
     let count = reader.records().count();
-    assert!(count < 6, "Remove-duplicates should produce fewer reads than input");
-    assert!(count >= 2, "Should keep at least one pair");
+    assert_eq!(count, 2, "remove-duplicates over 3 duplicate pairs must keep exactly one pair");
 }
 
 /// SAM-input parity: dedup's typed-step path accepts both BAM and SAM via

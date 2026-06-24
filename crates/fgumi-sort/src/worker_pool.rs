@@ -3033,4 +3033,139 @@ mod tests {
         assert_eq!(phase2_file_position(&files[0]), 0);
         pool.shutdown();
     }
+
+    // ========================================================================
+    // End-to-end Phase 2 over REAL zstd spill files (S3-009)
+    //
+    // The codec-detection tests above stop at `set_phase2_files`; the
+    // `read_raw_zstd_frames` tests feed opaque non-zstd bytes. Neither drives
+    // the real `decompress_to_buffer` arm. This test writes genuine zstd spill
+    // chunks (`ZSPILL_MAGIC` + `[u32 LE frame-len][zstd frame]` records),
+    // including a frame whose DECOMPRESSED size approaches `ZSTD_FRAME_DECOMP_CAP`,
+    // drives the pool through Phase 2, drains each file's reorder buffer in
+    // order, and asserts the reconstructed bytes are byte-identical to the
+    // original uncompressed payload — exercising the 256 KiB scratch-buffer
+    // boundary and the real zstd decode path the integration tests cover only
+    // indirectly.
+    // ========================================================================
+
+    /// Write a zstd spill file: `ZSPILL_MAGIC` followed by one
+    /// `[u32 LE compressed-len][zstd frame]` record per element of `frames`.
+    /// Returns the byte-concatenation of the original (uncompressed) frames,
+    /// which is what draining Phase 2 must reconstruct.
+    fn write_zstd_spill_file(path: &std::path::Path, frames: &[Vec<u8>]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut file = std::fs::File::create(path).expect("create zstd spill file");
+        file.write_all(&ZSPILL_MAGIC).expect("write magic");
+
+        let mut compressor = ZstdCompressor::new(3).expect("zstd compressor");
+        let mut expected = Vec::new();
+        for frame in frames {
+            let compressed = compressor.compress(frame).expect("zstd compress frame");
+            let len = u32::try_from(compressed.len()).expect("frame fits u32");
+            file.write_all(&len.to_le_bytes()).expect("write frame length prefix");
+            file.write_all(&compressed).expect("write compressed frame");
+            expected.extend_from_slice(frame);
+        }
+        file.flush().expect("flush spill file");
+        expected
+    }
+
+    /// Drain every Phase 2 file's reorder buffer in serial order, concatenating
+    /// the decompressed blocks. Mirrors `external.rs::advance_to_next_block`'s
+    /// pop / error-check / drained / park protocol.
+    fn drain_phase2_to_bytes(pool: &SortWorkerPool) -> Vec<u8> {
+        let files = pool.phase2_files();
+        let decompress_error = pool.decompress_error_flag();
+        let chunk_read_error = pool.chunk_read_error_flag();
+        let worker_panicked = pool.worker_panicked_flag();
+
+        let mut out = Vec::new();
+        for file in files.iter() {
+            // Hard deadline so a Phase-2 liveness regression that stalls without
+            // setting an error flag fails fast instead of parking the suite forever.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let popped = {
+                    let mut guard = file.decompressed.lock().expect("decompressed mutex");
+                    guard.try_pop_next()
+                };
+                if let Some(data) = popped {
+                    out.extend_from_slice(&data);
+                    if matches!(file.codec, SpillCodec::Zstd) {
+                        file.buffer_pool.checkin(data);
+                    }
+                    continue;
+                }
+                assert!(!decompress_error.load(Ordering::Acquire), "decompression error flagged");
+                assert!(!chunk_read_error.load(Ordering::Acquire), "chunk read error flagged");
+                assert!(!worker_panicked.load(Ordering::Acquire), "worker panicked");
+                if file.is_drained() {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for Phase 2 drain"
+                );
+                std::thread::park_timeout(std::time::Duration::from_millis(50));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn phase2_end_to_end_decodes_real_zstd_frames_including_near_cap_frame() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spill_a = dir.path().join("chunk_a.zsp");
+        let spill_b = dir.path().join("chunk_b.zsp");
+
+        // Build frames with structured (compressible) content so decompression
+        // is a real transform, not a memcpy. One frame is sized to approach
+        // ZSTD_FRAME_DECOMP_CAP (256 KiB) so the worker's scratch buffer is used
+        // at its capacity boundary; the buffer must hold the full decompressed
+        // frame, so stay just under the cap.
+        let near_cap_len = ZSTD_FRAME_DECOMP_CAP - 4096;
+        let frames_a: Vec<Vec<u8>> = vec![
+            (0..1024u32).flat_map(u32::to_le_bytes).collect(),
+            (0..near_cap_len).map(|i| u8::try_from(i % 251).expect("< 256")).collect(),
+            b"a short trailing frame".to_vec(),
+        ];
+        let frames_b: Vec<Vec<u8>> = vec![
+            (0..8192u32).map(|i| u8::try_from(i.wrapping_mul(7) % 256).expect("< 256")).collect(),
+            vec![0xCDu8; 4096],
+        ];
+
+        let expected_a = write_zstd_spill_file(&spill_a, &frames_a);
+        let expected_b = write_zstd_spill_file(&spill_b, &frames_b);
+
+        // Single worker keeps the drained-detection deterministic for the test.
+        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Zstd);
+        pool.set_main_thread(std::thread::current());
+        pool.set_phase2_files(&[spill_a.clone(), spill_b.clone()]).expect("set_phase2_files");
+
+        // Both files must have been routed through the zstd decoder.
+        let files = pool.phase2_files();
+        assert!(
+            files.iter().all(|f| matches!(f.codec, SpillCodec::Zstd)),
+            "both spill files must be detected as zstd"
+        );
+
+        pool.set_phase(phase::PHASE2);
+        let got = drain_phase2_to_bytes(&pool);
+
+        let mut expected = expected_a;
+        expected.extend_from_slice(&expected_b);
+        assert_eq!(
+            got.len(),
+            expected.len(),
+            "reconstructed byte length differs after Phase 2 zstd decode"
+        );
+        assert_eq!(
+            got, expected,
+            "Phase 2 zstd decode did not reconstruct the original payload byte-for-byte"
+        );
+
+        pool.shutdown();
+    }
 }

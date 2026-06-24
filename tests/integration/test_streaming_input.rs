@@ -7,8 +7,7 @@
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use rstest::rstest;
-use std::fs::{self, File};
-use std::io::{BufReader, Read};
+use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -635,6 +634,13 @@ fn test_correct_command_with_sam_input_new_pipeline_with_rejects_matches_bam_bas
             .unwrap_or_else(|_| panic!("Failed to run correct {label}"));
         assert!(status.success(), "correct {label} failed");
     }
+    // Non-vacuous guard (S9b-007): this is a SAM-vs-BAM parity check between two
+    // fgumi outputs, so a both-empty pass is possible if correct silently dropped
+    // every record on BOTH paths. Assert the BAM baseline kept output is
+    // non-empty before the parity comparison so the test cannot pass vacuously.
+    // (The rejects output is legitimately empty here — this fixture corrects all
+    // UMIs, rejecting none — so only the kept output is guarded.)
+    assert!(count_bam_records(&out_bam_baseline) > 0, "BAM baseline kept output is empty");
     compare_bam_records(&out_bam_baseline, &out_sam);
     compare_bam_records(&out_bam_rejects_baseline, &out_sam_rejects);
 }
@@ -649,8 +655,7 @@ fn create_unmapped_consensus_bam(path: &PathBuf) {
     let header = create_minimal_header("chr1", 10000);
     let records: Vec<_> = ["good1", "good2", "low_depth"]
         .iter()
-        .enumerate()
-        .map(|(i, name)| {
+        .map(|name| {
             let depth = if *name == "low_depth" { 1u16 } else { 10u16 };
             let mut b = RawSamBuilder::new();
             b.read_name(name.as_bytes())
@@ -658,7 +663,6 @@ fn create_unmapped_consensus_bam(path: &PathBuf) {
                 .sequence(b"ACGTACGT")
                 .qualities(&[35; 8]);
             b.add_array_u16(SamTag::CD_BASES, &[depth; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
-            let _ = i; // silence unused
             b.build()
         })
         .collect();
@@ -716,6 +720,15 @@ fn test_filter_command_with_rejects_sam_input_matches_bam_baseline() {
             .unwrap_or_else(|_| panic!("Failed to run filter {label}"));
         assert!(status.success(), "filter {label} failed");
     }
+    // Non-vacuous guard (S9b-007): this compares two fgumi outputs, so a
+    // both-empty pass is possible if filter silently dropped every record on
+    // BOTH paths. The fixture has two depth-10 reads (kept) and one depth-1 read
+    // (rejected at --min-reads 3), so both baseline outputs must be non-empty.
+    assert!(count_bam_records(&out_bam_baseline) > 0, "BAM baseline kept output is empty");
+    assert!(
+        count_bam_records(&out_bam_rejects_baseline) > 0,
+        "BAM baseline rejects output is empty"
+    );
     compare_bam_records(&out_bam_baseline, &out_sam);
     compare_bam_records(&out_bam_rejects_baseline, &out_sam_rejects);
 }
@@ -850,16 +863,6 @@ fn test_group_command_with_piped_input_new_pipeline() {
     assert!(output_from_pipe.exists(), "stdin output not created");
 
     compare_bam_records(&output_from_file, &output_from_pipe);
-}
-
-/// Helper to read file contents for comparison.
-#[allow(dead_code)]
-fn read_file_contents(path: &PathBuf) -> Vec<u8> {
-    let file = File::open(path).expect("Failed to open file");
-    let mut reader = BufReader::new(file);
-    let mut contents = Vec::new();
-    reader.read_to_end(&mut contents).expect("Failed to read file");
-    contents
 }
 
 /// Helper to compare BAM records (ignoring header differences like @PG command line).
@@ -1242,6 +1245,11 @@ fn test_duplex_reads_stdin_once(#[case] threads: Option<&str>) {
     });
 }
 
+/// Unlike codec/duplex/clip, filter has NO single-threaded fast path: `Filter::execute`
+/// always routes through `chains::build_for(spec).run()` regardless of `--threads`
+/// (see `src/lib/commands/filter.rs`). So there is no no-`--threads` code path to cover —
+/// only the explicit `--threads 1` / `--threads 2` cases exist (no
+/// `#[case::single_threaded(None)]`).
 #[rstest]
 #[case("1")]
 #[case("2")]

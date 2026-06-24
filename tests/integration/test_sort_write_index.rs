@@ -3,49 +3,97 @@
 //! Verifies that BAM index generation produces a valid `.bai` that
 //! samtools can query, across the coordinate sort code path.
 //!
-//! fgumi sort is invoked in-process via `Sort::execute()`; samtools
-//! is invoked as a subprocess (external tool).
+//! The input fixture is built in-process with `SamBuilder` + the noodles BAM
+//! writer (no samtools), so the fgumi-only tests run by default. The samtools
+//! cross-check tests are NO LONGER `#[ignore]`'d: they run by default and are
+//! gated only by a runtime `samtools_available()` check, so they execute in CI
+//! (samtools is installed in the workflow) and skip gracefully on a local dev
+//! box without samtools.
 
 use clap::Parser;
 use fgumi_lib::commands::command::Command as FgumiCommand;
 use fgumi_lib::commands::sort::Sort;
+use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
+use noodles::bam;
+use noodles::sam::Header;
+use noodles::sam::alignment::io::Write as AlignmentWrite;
 use rstest::rstest;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
 
+use crate::helpers::bam_generator::to_record_buf;
+
 /// Check if samtools is available in PATH.
 fn samtools_available() -> bool {
-    Command::new("samtools").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    which::which("samtools").is_ok()
 }
 
-/// Create a small test BAM file using samtools.
+/// Create a small unsorted multi-chromosome test BAM in-process (no samtools).
+///
+/// Six single-end records: five mapped across chr1/chr2 plus one unmapped, in a
+/// deliberately unsorted emission order so the coordinate sort has work to do.
 fn create_test_bam(dir: &Path) -> std::path::PathBuf {
+    use bstr::BString;
+    use noodles::sam::header::record::value::map::header::tag::Tag as HeaderTag;
+    use noodles::sam::header::record::value::map::{Map, ReferenceSequence};
+    use std::num::NonZeroUsize;
+
     let bam_path = dir.join("test_input.bam");
 
-    // Create a simple SAM file and convert to BAM
-    let sam_content = r"@HD	VN:1.6	SO:unsorted
-@SQ	SN:chr1	LN:10000
-@SQ	SN:chr2	LN:10000
-read1	0	chr1	100	60	10M	*	0	0	ACGTACGTAC	IIIIIIIIII
-read2	0	chr1	200	60	10M	*	0	0	ACGTACGTAC	IIIIIIIIII
-read3	0	chr1	300	60	10M	*	0	0	ACGTACGTAC	IIIIIIIIII
-read4	0	chr2	100	60	10M	*	0	0	ACGTACGTAC	IIIIIIIIII
-read5	0	chr2	200	60	10M	*	0	0	ACGTACGTAC	IIIIIIIIII
-read6	4	*	0	0	*	*	0	0	ACGTACGTAC	IIIIIIIIII
-";
+    let HeaderTag::Other(so_tag) = HeaderTag::from(*b"SO") else { unreachable!() };
+    let header_map = Map::<noodles::sam::header::record::value::map::Header>::builder()
+        .insert(so_tag, "unsorted")
+        .build()
+        .expect("valid header map");
+    let mut hb = Header::builder().set_header(header_map);
+    for chrom in ["chr1", "chr2"] {
+        hb = hb.add_reference_sequence(
+            BString::from(chrom),
+            Map::<ReferenceSequence>::new(NonZeroUsize::new(10_000).expect("non-zero")),
+        );
+    }
+    let header = hb.build();
 
-    let sam_path = dir.join("test_input.sam");
-    std::fs::write(&sam_path, sam_content).expect("Failed to write SAM file");
+    let seq = b"ACGTACGTAC";
+    let qual = vec![40u8; seq.len()];
+    let cigar = u32::try_from(seq.len()).expect("seq len fits u32") << 4; // 10M
 
-    // Convert SAM to BAM using samtools
-    let status = Command::new("samtools")
-        .args(["view", "-b", "-o", bam_path.to_str().unwrap(), sam_path.to_str().unwrap()])
-        .status()
-        .expect("Failed to run samtools view");
+    let mapped = |name: &str, ref_id: i32, pos: i32| -> RawRecord {
+        let mut b = SamBuilder::new();
+        b.read_name(name.as_bytes())
+            .ref_id(ref_id)
+            .pos(pos)
+            .mapq(60)
+            .flags(0)
+            .cigar_ops(&[cigar])
+            .sequence(seq)
+            .qualities(&qual);
+        b.build()
+    };
 
-    assert!(status.success(), "samtools view failed");
+    // Emit out of coordinate order on purpose.
+    let mut records = vec![
+        mapped("read4", 1, 99),  // chr2:100
+        mapped("read2", 0, 199), // chr1:200
+        mapped("read5", 1, 199), // chr2:200
+        mapped("read1", 0, 99),  // chr1:100
+        mapped("read3", 0, 299), // chr1:300
+    ];
+    // One unmapped read.
+    let mut un = SamBuilder::new();
+    un.read_name(b"read6").flags(flags::UNMAPPED).sequence(seq).qualities(&qual);
+    records.push(un.build());
+
+    let mut writer =
+        bam::io::Writer::new(std::fs::File::create(&bam_path).expect("create input BAM"));
+    writer.write_header(&header).expect("write header");
+    for r in &records {
+        writer.write_alignment_record(&header, &to_record_buf(r)).expect("write record");
+    }
+    writer.try_finish().expect("finish BAM");
+
     bam_path
 }
 
@@ -80,7 +128,9 @@ fn run_coordinate_sort(input: &Path, output: &Path, write_index: bool, threads: 
 /// (BAI-indexed) coordinate-sorted BAM.
 fn region_query_names(bam_path: &Path, region: &str) -> Vec<String> {
     let output = Command::new("samtools")
-        .args(["view", bam_path.to_str().unwrap(), region])
+        .arg("view")
+        .arg(bam_path)
+        .arg(region)
         .output()
         .expect("Failed to run samtools view");
     assert!(
@@ -96,27 +146,18 @@ fn region_query_names(bam_path: &Path, region: &str) -> Vec<String> {
     names
 }
 
-/// Verify that a BAM index allows region queries.
+/// Verify that a BAM index allows region queries AND returns the correct slice.
+/// Asserting record identities (not just a non-zero count) catches a BAI that
+/// returns the wrong reads for the interval, which `samtools view -c > 0` would
+/// miss. The `chr1:100-300` interval covers read1/read2/read3 in
+/// `create_test_bam` (read4/read5 are on chr2).
 fn verify_index_works(bam_path: &Path) -> bool {
-    // Try to query a region - this will fail if index is invalid
-    let output = Command::new("samtools")
-        .args(["view", "-c", bam_path.to_str().unwrap(), "chr1:100-300"])
-        .output()
-        .expect("Failed to run samtools view");
-
-    if !output.status.success() {
-        eprintln!("samtools view failed: {}", String::from_utf8_lossy(&output.stderr));
-        return false;
-    }
-
-    // Should find at least one read
-    let count: i32 = String::from_utf8_lossy(&output.stdout).trim().parse().unwrap_or(0);
-    count > 0
+    region_query_names(bam_path, "chr1:100-300")
+        == vec!["read1".to_string(), "read2".to_string(), "read3".to_string()]
 }
 
 /// Test sort --write-index creates a valid index.
 #[test]
-#[ignore = "requires samtools"]
 fn test_sort_write_index() {
     if !samtools_available() {
         eprintln!("Skipping: samtools not available");
@@ -155,7 +196,6 @@ fn test_sort_write_index() {
 
 /// Test that --write-index with multi-threading still produces valid index.
 #[test]
-#[ignore = "requires samtools"]
 fn test_sort_write_index_multithreaded() {
     if !samtools_available() {
         eprintln!("Skipping: samtools not available");
@@ -205,13 +245,10 @@ fn test_sort_write_index_multithreaded() {
 #[rstest]
 #[case::threads_1(1)]
 #[case::threads_4(4)]
-#[ignore = "requires samtools"]
 fn test_sort_write_index_byte_identical_to_off(#[case] threads: usize) {
-    if !samtools_available() {
-        eprintln!("Skipping: samtools not available");
-        return;
-    }
-
+    // No `samtools_available()` gate: this is a pure-fgumi regression (both runs
+    // go through `run_coordinate_sort`), so it must always run — including on
+    // minimal CI jobs without samtools.
     let temp_dir = TempDir::new().unwrap();
     let input_bam = create_test_bam(temp_dir.path());
 
@@ -248,7 +285,6 @@ fn test_sort_write_index_byte_identical_to_off(#[case] threads: usize) {
 #[case::t4_chr1_1_10000(4, "chr1:1-10000")]
 #[case::t4_chr2(4, "chr2")]
 #[case::t4_chr2_200_200(4, "chr2:200-200")]
-#[ignore = "requires samtools"]
 fn test_sort_write_index_matches_samtools_bai(#[case] threads: usize, #[case] region: &str) {
     if !samtools_available() {
         eprintln!("Skipping: samtools not available");
@@ -265,12 +301,16 @@ fn test_sort_write_index_matches_samtools_bai(#[case] threads: usize, #[case] re
     // samtools reference: sort the same input, then index it.
     let sam_bam = temp_dir.path().join("samtools_sorted.bam");
     let status = Command::new("samtools")
-        .args(["sort", "-o", sam_bam.to_str().unwrap(), input_bam.to_str().unwrap()])
+        .arg("sort")
+        .arg("-o")
+        .arg(&sam_bam)
+        .arg(&input_bam)
         .status()
         .expect("Failed to run samtools sort");
     assert!(status.success(), "samtools sort failed");
     let status = Command::new("samtools")
-        .args(["index", sam_bam.to_str().unwrap()])
+        .arg("index")
+        .arg(&sam_bam)
         .status()
         .expect("Failed to run samtools index");
     assert!(status.success(), "samtools index failed");

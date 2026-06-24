@@ -423,4 +423,244 @@ mod tests {
         b[8] = 0;
         assert_eq!(compare_names_raw(&a, &b), Ordering::Equal);
     }
+
+    // ========================================================================
+    // Candidate-comparator equivalence with the production oracle (S3-024)
+    // ========================================================================
+    //
+    // `benches/core_functions.rs` holds candidate queryname comparators
+    // (`compare_illumina_structured`, the samtools `strnum_cmp` port, and the
+    // `natural_compare_nul` wrapper) used to benchmark sort strategies. A
+    // "fast" candidate must not be promoted on speed alone without agreeing
+    // with the production ordering, so this module ports the candidate
+    // comparators as test-only helpers and asserts every pairwise comparison
+    // over `generate_name_pairs`-style data matches `natural_compare`. (The
+    // bench is `harness = false`, so a `#[cfg(test)]` module *inside* the bench
+    // never runs — the equivalence oracle belongs in this crate's test module.)
+    //
+    // `compare_u64_hash` is intentionally excluded: it is documented as a
+    // degenerate O(1) upper bound that byte-reverses ordering and collapses
+    // shared-prefix names to `Equal`, so it is deliberately NOT equivalent.
+
+    /// Faithful port of samtools' `strnum_cmp` over NUL-terminated byte slices,
+    /// mirroring the bench candidate. Used here only as an equivalence reference
+    /// for `natural_compare`.
+    ///
+    /// This is a *safe*, index-based port (no raw-pointer walk): the equivalence
+    /// oracle runs only in tests, which have no hot-path perf budget, so there is
+    /// no reason to introduce `unsafe` here. The caller NUL-terminates both
+    /// slices, so the `!= 0` guards stop the walk at the terminator and every
+    /// index stays in bounds.
+    fn strnum_cmp_samtools(a: &[u8], b: &[u8]) -> i32 {
+        let (mut pa, mut pb) = (0usize, 0usize);
+        while a[pa] != 0 && b[pb] != 0 {
+            if !a[pa].is_ascii_digit() || !b[pb].is_ascii_digit() {
+                if a[pa] != b[pb] {
+                    return i32::from(a[pa]) - i32::from(b[pb]);
+                }
+                pa += 1;
+                pb += 1;
+            } else {
+                while a[pa] == b'0' {
+                    pa += 1;
+                }
+                while b[pb] == b'0' {
+                    pb += 1;
+                }
+                while a[pa].is_ascii_digit() && a[pa] == b[pb] {
+                    pa += 1;
+                    pb += 1;
+                }
+                let diff = i32::from(a[pa]) - i32::from(b[pb]);
+                while a[pa].is_ascii_digit() && b[pb].is_ascii_digit() {
+                    pa += 1;
+                    pb += 1;
+                }
+                if a[pa].is_ascii_digit() {
+                    return 1;
+                } else if b[pb].is_ascii_digit() {
+                    return -1;
+                } else if diff != 0 {
+                    return diff;
+                }
+            }
+        }
+        if a[pa] != 0 {
+            1
+        } else if b[pb] != 0 {
+            -1
+        } else {
+            0
+        }
+    }
+
+    fn compare_strnum_samtools(a: &[u8], b: &[u8]) -> Ordering {
+        let mut a_nul = a.to_vec();
+        a_nul.push(0);
+        let mut b_nul = b.to_vec();
+        b_nul.push(0);
+        strnum_cmp_samtools(&a_nul, &b_nul).cmp(&0)
+    }
+
+    fn parse_int_fast(bytes: &[u8]) -> u64 {
+        let mut val: u64 = 0;
+        for &b in bytes {
+            if b.is_ascii_digit() {
+                val = val * 10 + u64::from(b - b'0');
+            } else {
+                break;
+            }
+        }
+        val
+    }
+
+    /// Port of the bench's Illumina-structured comparator: compare the first
+    /// four colon-delimited fields as bytes, then tile/x/y as integers.
+    fn compare_illumina_structured(a: &[u8], b: &[u8]) -> Ordering {
+        let mut a_fields = a.splitn(7, |&c| c == b':');
+        let mut b_fields = b.splitn(7, |&c| c == b':');
+        for _ in 0..4 {
+            let af = a_fields.next().unwrap_or(b"");
+            let bf = b_fields.next().unwrap_or(b"");
+            match af.cmp(bf) {
+                Ordering::Equal => {}
+                ord => return ord,
+            }
+        }
+        for _ in 0..3 {
+            let af = a_fields.next().unwrap_or(b"");
+            let bf = b_fields.next().unwrap_or(b"");
+            match parse_int_fast(af).cmp(&parse_int_fast(bf)) {
+                Ordering::Equal => {}
+                ord => return ord,
+            }
+        }
+        Ordering::Equal
+    }
+
+    /// Generate realistic sorted name pairs, mirroring the bench's
+    /// `generate_name_pairs`. Numbers are non-zero-padded so the samtools-strnum
+    /// and natural comparators agree (no leading-zero ambiguity).
+    fn generate_name_pairs(style: &str, count: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut pairs = Vec::with_capacity(count);
+        match style {
+            "illumina" => {
+                let prefixes =
+                    ["A00132:53:HFHJKDSXX", "A00132:54:HFH2JDSXX", "A00132:55:HFHKKDSXX"];
+                for i in 0..count {
+                    let p1 = prefixes[i % 3];
+                    let p2 = prefixes[(i + 1) % 3];
+                    let a = format!(
+                        "{p1}:{}:{}:{}:{}",
+                        (i % 4) + 1,
+                        1100 + (i % 500),
+                        1000 + (i * 17 % 30000),
+                        1000 + (i * 31 % 50000)
+                    );
+                    let b = format!(
+                        "{p2}:{}:{}:{}:{}",
+                        ((i + 1) % 4) + 1,
+                        1100 + ((i + 7) % 500),
+                        1000 + ((i + 3) * 17 % 30000),
+                        1000 + ((i + 5) * 31 % 50000)
+                    );
+                    pairs.push((a.into_bytes(), b.into_bytes()));
+                }
+            }
+            "illumina_same_prefix" => {
+                for i in 0..count {
+                    let a = format!(
+                        "A00132:53:HFHJKDSXX:{}:{}:{}:{}",
+                        (i % 4) + 1,
+                        1100 + (i % 500),
+                        1000 + (i * 17 % 30000),
+                        1000 + (i * 31 % 50000)
+                    );
+                    let b = format!(
+                        "A00132:53:HFHJKDSXX:{}:{}:{}:{}",
+                        ((i + 1) % 4) + 1,
+                        1100 + ((i + 7) % 500),
+                        1000 + ((i + 3) * 17 % 30000),
+                        1000 + ((i + 5) * 31 % 50000)
+                    );
+                    pairs.push((a.into_bytes(), b.into_bytes()));
+                }
+            }
+            "srr" => {
+                for i in 0..count {
+                    let a = format!("SRR6109273.{}", 100_000 + i * 7);
+                    let b = format!("SRR6109273.{}", 100_000 + (i + 1) * 7);
+                    pairs.push((a.into_bytes(), b.into_bytes()));
+                }
+            }
+            other => panic!("unknown name style: {other}"),
+        }
+        pairs
+    }
+
+    fn assert_candidate_matches_oracle(style: &str, candidate: impl Fn(&[u8], &[u8]) -> Ordering) {
+        for (a, b) in generate_name_pairs(style, 5_000) {
+            // Forward agreement with the oracle.
+            assert_eq!(
+                candidate(&a, &b),
+                natural_compare(&a, &b),
+                "candidate disagrees with natural_compare (style={style}): {:?} vs {:?}",
+                String::from_utf8_lossy(&a),
+                String::from_utf8_lossy(&b),
+            );
+            // Reverse agreement — pins antisymmetry, so a candidate cannot match
+            // the oracle on `(a, b)` while disagreeing on `(b, a)`.
+            assert_eq!(
+                candidate(&b, &a),
+                natural_compare(&b, &a),
+                "candidate disagrees with natural_compare on reversed pair (style={style}): \
+                 {:?} vs {:?}",
+                String::from_utf8_lossy(&b),
+                String::from_utf8_lossy(&a),
+            );
+            // Reflexivity — every name must compare equal to itself.
+            assert_eq!(
+                candidate(&a, &a),
+                Ordering::Equal,
+                "candidate is not reflexive (style={style}): {:?}",
+                String::from_utf8_lossy(&a),
+            );
+            assert_eq!(
+                candidate(&b, &b),
+                Ordering::Equal,
+                "candidate is not reflexive (style={style}): {:?}",
+                String::from_utf8_lossy(&b),
+            );
+        }
+    }
+
+    #[test]
+    fn strnum_samtools_candidate_matches_natural_compare() {
+        // samtools strnum_cmp agrees with natural_compare on non-zero-padded
+        // numeric runs, which every generated style produces.
+        for style in ["illumina", "illumina_same_prefix", "srr"] {
+            assert_candidate_matches_oracle(style, compare_strnum_samtools);
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn natural_nul_candidate_matches_natural_compare() {
+        // The production `natural_compare_nul` (via the `compare_nul` wrapper)
+        // agrees with the slice-based `natural_compare` when names carry no
+        // leading-zero ambiguity (none of the styles do).
+        for style in ["illumina", "illumina_same_prefix", "srr"] {
+            assert_candidate_matches_oracle(style, compare_nul);
+        }
+    }
+
+    #[test]
+    fn illumina_structured_candidate_matches_natural_compare() {
+        // The field-parsing Illumina comparator is only a faithful model for
+        // Illumina-format names, so it is checked against the oracle on the
+        // Illumina styles only.
+        for style in ["illumina", "illumina_same_prefix"] {
+            assert_candidate_matches_oracle(style, compare_illumina_structured);
+        }
+    }
 }

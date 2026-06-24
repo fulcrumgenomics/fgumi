@@ -99,15 +99,26 @@ fn errors_when_replay_bam_is_missing() {
     let tmp = TempDir::new().unwrap();
     let missing = tmp.path().join("does-not-exist.bam");
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
         .args(["simulate", "aligner", "--replay-bam"])
         .arg(&missing)
         .arg("/fake/reference.fa")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .output()
         .expect("spawn fgumi simulate aligner");
 
-    assert!(!status.success(), "missing replay BAM must be a non-zero exit");
+    assert!(!output.status.success(), "missing replay BAM must be a non-zero exit");
+
+    // The error must name the failing operation AND the offending path so the
+    // user can act on it — not just exit non-zero (S9b-005).
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("opening replay BAM"),
+        "stderr must explain the failing operation; got: {stderr}"
+    );
+    assert!(
+        stderr.contains(&*missing.to_string_lossy()),
+        "stderr must name the missing replay BAM path; got: {stderr}"
+    );
 }
