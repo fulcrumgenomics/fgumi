@@ -42,8 +42,8 @@ use crate::template::Template;
 /// * `read_structures` — one per FASTQ input file, shared across workers.
 /// * `extract_opts` — tag-output and name-annotation options, shared across
 ///   workers.
-/// * `records_emitted` — running counter incremented with the number of
-///   *templates* (not records) produced per batch.
+/// * `records_emitted` — running counter incremented with the number of BAM
+///   records (reads) emitted per batch.
 /// * `output_byte_limit` — byte-bounded queue limit for the output branch.
 pub fn build_extract_step(
     read_structures: Arc<Vec<ReadStructure>>,
@@ -69,7 +69,8 @@ pub fn build_extract_step(
 /// the [`build_extract_step`] closure, factored out so it can be unit-tested
 /// directly (the closure inside `ProcessOrdered` is otherwise unreachable).
 ///
-/// `records_emitted` is incremented by the number of templates produced.
+/// `records_emitted` is incremented by the number of BAM records (reads)
+/// emitted — summed across templates, not the template count.
 ///
 /// # Errors
 ///
@@ -128,21 +129,24 @@ pub(crate) fn extract_batch(
                 rs,
                 &[], // No skip reasons
             )
-            .map_err(io::Error::other)?;
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             fastq_sets.push(fastq_set);
         }
 
         let combined = FastqSet::combine_readsets(fastq_sets);
 
         let raw_records = make_raw_records_from_fastq_set(&combined, extract_opts)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         let template = Template::from_records(raw_records)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         templates.push(template);
     }
 
-    let count = templates.len() as u64;
+    // Count emitted BAM records, not templates: each template carries one
+    // record per read (R1, R2, …), and the finalize hook reports "records
+    // emitted". Summing `templates.len()` would undercount on paired-end input.
+    let count: u64 = templates.iter().map(|t| t.read_count() as u64).sum();
     records_emitted.fetch_add(count, Ordering::Relaxed);
     Ok(BamTemplateBatch::new(serial, templates))
 }
@@ -308,9 +312,10 @@ mod tests {
     }
 
     /// `extract_batch` propagates the input `batch_serial` to the output and
-    /// bumps `records_emitted` by the number of templates converted.
+    /// bumps `records_emitted` by the number of BAM records (reads) emitted,
+    /// not the number of templates: 3 paired templates × 2 reads each = 6.
     #[test]
-    fn extract_batch_propagates_serial_and_counts_templates() {
+    fn extract_batch_propagates_serial_and_counts_records() {
         let read_structures = vec!["5T".parse::<ReadStructure>().unwrap(); 2];
         let opts = default_extract_opts();
         let emitted = AtomicU64::new(0);
@@ -320,7 +325,13 @@ mod tests {
 
         assert_eq!(out.ordinal(), 7, "output batch_serial must equal the input batch_serial");
         assert_eq!(out.templates.len(), 3, "all templates converted");
-        assert_eq!(emitted.load(Ordering::Relaxed), 3, "records_emitted bumped by template count");
+        let total_records: usize = out.templates.iter().map(Template::read_count).sum();
+        assert_eq!(total_records, 6, "3 paired templates yield 6 records");
+        assert_eq!(
+            emitted.load(Ordering::Relaxed),
+            6,
+            "records_emitted bumped by emitted record count, not template count"
+        );
     }
 
     /// A template whose record count differs from `read_structures.len()` is a

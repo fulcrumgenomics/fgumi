@@ -1924,19 +1924,24 @@ mod tests {
         }
     }
 
-    /// Byte-bounded twin of [`SharedCountingSource`] for the monitor-armed
-    /// fail-fast test. The deadlock monitor's `in_flight_bytes` probe only sees
-    /// `ByteBounded` transports, and `assert_monitor_visible_transports` (a
-    /// debug-build invariant) rejects an `Unbounded`/`CountBounded` source on a
-    /// monitor-armed run. Using this source lets
-    /// `pipeline_run_reraises_worker_panic_with_monitor_enabled` actually reach
-    /// the monitor startup/shutdown path instead of tripping that assertion
-    /// first (and passing for the wrong reason).
+    /// Byte-bounded variant of [`SharedCountingSource`]. Identical claim/push
+    /// logic but declares a `ByteBounded` output transport so it is
+    /// monitor-visible — required by any test that arms the deadlock monitor
+    /// (`deadlock_timeout_secs > 0` + stats), which asserts every output edge is
+    /// `ByteBounded` (see `assert_monitor_visible_transports`) before workers
+    /// spawn. Using the `Unbounded` source there would trip that debug-assert
+    /// before the worker-panic path is ever reached.
     #[derive(Clone)]
-    struct SharedCountingByteBoundedSource {
+    struct SharedCountingSourceByteBounded {
         remaining: Arc<AtomicU32>,
+        /// A value claimed from `remaining` but not yet accepted by the output
+        /// (the byte-bounded push hit backpressure). Held per-worker and retried
+        /// on a later tick so the exact ordinal survives — rolling `remaining`
+        /// back instead would let a peer re-claim the count and drop/duplicate an
+        /// ordinal under contention.
+        pending: Option<u32>,
     }
-    impl Step for SharedCountingByteBoundedSource {
+    impl Step for SharedCountingSourceByteBounded {
         type Input = ();
         type Outputs = Single<u32>;
         fn profile(&self) -> StepProfile {
@@ -1944,14 +1949,23 @@ mod tests {
                 name: "SharedSourceByteBounded",
                 kind: StepKind::Parallel,
                 sticky: false,
-                // ByteBounded so the monitor probe can see this edge; sized large
-                // enough that the handful of items pushed before the sink panics
-                // never hit backpressure.
                 output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 20 }],
                 branch_ordering: vec![BranchOrdering::None],
             }
         }
         fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            // First flush any value claimed on a prior tick whose push was
+            // rejected by backpressure. Retrying the exact held ordinal (rather
+            // than rolling `remaining` back) keeps the emitted set a clean
+            // permutation of `1..=N` even under contention.
+            if let Some(n) = self.pending {
+                return if ctx.outputs.push(n).is_ok() {
+                    self.pending = None;
+                    Ok(StepOutcome::Progress)
+                } else {
+                    Ok(StepOutcome::NoProgress)
+                };
+            }
             let n = self.remaining.load(AtomicOrd::Acquire);
             if n == 0 {
                 return Ok(StepOutcome::Finished);
@@ -1961,13 +1975,19 @@ mod tests {
                 .compare_exchange(n, n - 1, AtomicOrd::AcqRel, AtomicOrd::Acquire)
                 .is_ok()
             {
-                // ByteBounded can reject under backpressure: hand the claimed
-                // item's budget back and retry next dispatch rather than erroring.
-                if ctx.outputs.push(n).is_err() {
-                    self.remaining.fetch_add(1, AtomicOrd::AcqRel);
-                    return Ok(StepOutcome::NoProgress);
+                // Byte-bounded push can hit backpressure; hold the claimed
+                // ordinal and retry it on a later tick. Holding a claimed item
+                // counts as progress per the `StepOutcome` contract ("pushed or
+                // held an item" — see `step.rs`) and matches the production
+                // held-slot sources (`sort::merge` / `sort::and_spill`), so the
+                // scheduler's deadlock accounting sees the claim as forward
+                // motion rather than a stall.
+                if ctx.outputs.push(n).is_ok() {
+                    Ok(StepOutcome::Progress)
+                } else {
+                    self.pending = Some(n);
+                    Ok(StepOutcome::Progress)
                 }
-                Ok(StepOutcome::Progress)
             } else {
                 Ok(StepOutcome::NoProgress)
             }
@@ -2110,14 +2130,20 @@ mod tests {
         // and joined — rather than deadlocking the join loop or leaking the
         // helper thread. The panicking worker signals cancellation so any wedged
         // peer observes `is_done()` and exits, letting every join complete.
+        //
+        // The source MUST be byte-bounded: arming the monitor (stats +
+        // non-zero timeout) runs `assert_monitor_visible_transports`, which
+        // debug-asserts every output edge is `ByteBounded`. An `Unbounded`
+        // source would trip that assert before any worker is spawned, so the
+        // test would "pass" on the wrong panic and never exercise the
+        // worker-panic deferral path it is meant to cover.
         let remaining = Arc::new(AtomicU32::new(1_000));
         let builder = PipelineBuilder::new();
-        // ByteBounded source so the monitor-visible-transports invariant holds and
-        // the test reaches the real monitor startup/shutdown path (a plain
-        // `SharedCountingSource` declares an `Unbounded` edge, which the debug
-        // `assert_monitor_visible_transports` would reject before the monitor runs).
         builder
-            .chain(SharedCountingByteBoundedSource { remaining: Arc::clone(&remaining) })
+            .chain(SharedCountingSourceByteBounded {
+                remaining: Arc::clone(&remaining),
+                pending: None,
+            })
             .chain(PanickingSink)
             .into_sink_marker();
         let pipeline = builder.build().unwrap();

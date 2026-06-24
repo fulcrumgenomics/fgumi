@@ -15,7 +15,6 @@ use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, create_umi_family, to_record_buf};
-use crate::helpers::parity::assert_bams_record_equivalent;
 
 /// Test that the group command works correctly with piped input.
 #[test]
@@ -188,12 +187,34 @@ fn test_downsample_command_with_piped_input() {
     assert!(output.status.success(), "downsample with piped input failed; stderr: {stderr}");
     assert!(output_bam.exists(), "Output BAM from pipe not created");
 
-    // `--fraction 1.0` is an identity transform, so the piped output must hold
-    // the same records, in the same order, as the input sorted BAM. A header-
-    // only or truncated BAM (which the success + existence checks above would
-    // still accept) fails here — this validates stdin *correctness*, not just
-    // that the upfront existence check was skipped for `-`.
-    assert_bams_record_equivalent(&sorted_bam, &output_bam);
+    // Oracle: run the SAME downsample directly against the sorted file (no
+    // stdin). With `--fraction 1.0` and a fixed seed, the stdin path must
+    // produce a byte-equivalent record stream to the direct-file path —
+    // `output_bam.exists()` alone would pass even if the stdin path silently
+    // dropped or reordered records.
+    let direct_out = temp_dir.path().join("direct_out.bam");
+    let direct = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "downsample",
+            "--input",
+            sorted_bam.to_str().unwrap(),
+            "--output",
+            direct_out.to_str().unwrap(),
+            "--fraction",
+            "1.0",
+            "--seed",
+            "42",
+            "--compression-level",
+            "1",
+        ])
+        .output()
+        .expect("Failed to run downsample with direct file input");
+    assert!(
+        direct.status.success(),
+        "downsample with direct input failed; stderr: {}",
+        String::from_utf8_lossy(&direct.stderr)
+    );
+    crate::helpers::parity::assert_bams_record_equivalent(&output_bam, &direct_out);
 }
 
 /// Test simplex command with piped input.

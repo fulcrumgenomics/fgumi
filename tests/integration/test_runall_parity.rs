@@ -52,7 +52,7 @@ use crate::helpers::cli_runner::{
     ParityArgs, Stage, fgumi, fgumi_binary, run_runall, run_runall_consensus_to_filter,
     run_staged_chain, run_standalone, run_standalone_filter,
 };
-use crate::helpers::parity::assert_bams_record_equivalent;
+use crate::helpers::parity::{assert_bams_record_equivalent, read_bam_records};
 
 // ────────────────────────── Fixtures ──────────────────────────
 //
@@ -628,6 +628,27 @@ fn new_002_group_to_duplex_allow_unmapped_parity() {
     let r = fgumi(&group_args);
     assert!(r.status.success(), "staged group: {}", String::from_utf8_lossy(&r.stderr));
 
+    // Independent intermediate check: the group stage with --allow-unmapped must
+    // retain the both-unmapped template (MI-tagged) BEFORE duplex runs. This
+    // pins the bridge/filter contract directly — without it, a regression that
+    // drops the unmapped template at the group stage could still pass the final
+    // fused-vs-staged comparison if both paths dropped it identically.
+    {
+        use noodles::sam::alignment::record::data::field::Tag;
+        let mi_tag = Tag::from(fgumi_lib::sam::SamTag::MI);
+        let group_records = read_bam_records(&group_bam);
+        let unmapped_mi_count = group_records
+            .iter()
+            .filter(|rec| rec.flags().is_unmapped() && rec.data().get(&mi_tag).is_some())
+            .count();
+        assert!(
+            unmapped_mi_count > 0,
+            "group --allow-unmapped output must retain the MI-tagged unmapped template; \
+             found {unmapped_mi_count} such records in {}",
+            group_bam.display()
+        );
+    }
+
     let duplex_args: Vec<OsString> = vec![
         "duplex".into(),
         "--input".into(),
@@ -939,12 +960,48 @@ fn rejects_backwards_group_to_sort() {
 }
 
 /// S5c2-003: runall `--group::*` flag combos that standalone `fgumi group`
-/// rejects must also be rejected on the fused path. Runs `runall
-/// --start-from group --stop-after group` with the bad combo and asserts the
-/// same error message standalone produces.
+/// rejects must also be rejected on the fused path. This uses standalone
+/// `fgumi group` (with the same flags, `--group::` prefix stripped) as the
+/// independent ORACLE: it asserts standalone rejects the combo with
+/// `expected_fragment`, then asserts runall rejects it the same way. Comparing
+/// against the live standalone failure (not just a hard-coded substring) keeps
+/// the two code paths aligned if the standalone error text ever changes.
 fn assert_runall_group_combo_rejects(extra_group_flags: &[&str], expected_fragment: &str) {
     let tmp = TempDir::new().unwrap();
     let fixture = sorted_duplex_fixture(tmp.path());
+
+    // ── Oracle: standalone `fgumi group` with the un-prefixed flags. ──
+    let standalone_out = tmp.path().join("standalone_out.bam");
+    let mut standalone_args: Vec<OsString> = vec![
+        "group".into(),
+        "--input".into(),
+        fixture.as_os_str().to_owned(),
+        "--output".into(),
+        standalone_out.as_os_str().to_owned(),
+        "--threads".into(),
+        "1".into(),
+    ];
+    for f in extra_group_flags {
+        // Translate the runall-prefixed `--group::<flag>` into the standalone
+        // `--<flag>`; non-prefixed tokens (values) pass through unchanged.
+        let translated = f
+            .strip_prefix("--group::")
+            .map_or_else(|| (*f).to_string(), |bare| format!("--{bare}"));
+        standalone_args.push(translated.into());
+    }
+    let standalone = fgumi(&standalone_args);
+    let standalone_stderr = String::from_utf8_lossy(&standalone.stderr);
+    assert!(
+        !standalone.status.success(),
+        "oracle: expected standalone group combo {extra_group_flags:?} to FAIL but it \
+         succeeded; stderr={standalone_stderr}"
+    );
+    assert!(
+        standalone_stderr.contains(expected_fragment),
+        "oracle: standalone stderr did not contain {expected_fragment:?}; got: {standalone_stderr}"
+    );
+
+    // ── Runall must reject the same combo with the same error fragment. ──
     let out = tmp.path().join("out.bam");
     let mut args: Vec<OsString> = vec![
         "runall".into(),
@@ -971,40 +1028,8 @@ fn assert_runall_group_combo_rejects(extra_group_flags: &[&str], expected_fragme
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains(expected_fragment),
-        "runall stderr did not contain {expected_fragment:?}; got: {stderr}"
-    );
-
-    // Independent oracle: run standalone `fgumi group` with the same flags
-    // (de-prefixed from `--group::*`). Standalone must reject the combo with the
-    // same message, so this pins runall↔standalone validation parity rather than
-    // trusting a hard-coded fragment that would silently drift if standalone's
-    // wording or behavior changed.
-    let standalone_out = tmp.path().join("standalone.bam");
-    let mut group_args: Vec<OsString> = vec![
-        "group".into(),
-        "--input".into(),
-        fixture.as_os_str().to_owned(),
-        "--output".into(),
-        standalone_out.as_os_str().to_owned(),
-        "--threads".into(),
-        "1".into(),
-    ];
-    for f in extra_group_flags {
-        group_args.push(
-            f.strip_prefix("--group::")
-                .map_or_else(|| (*f).into(), |bare| format!("--{bare}").into()),
-        );
-    }
-    let standalone = fgumi(&group_args);
-    assert!(
-        !standalone.status.success(),
-        "expected standalone group {extra_group_flags:?} to FAIL but it succeeded; stderr={}",
-        String::from_utf8_lossy(&standalone.stderr)
-    );
-    let standalone_stderr = String::from_utf8_lossy(&standalone.stderr);
-    assert!(
-        standalone_stderr.contains(expected_fragment),
-        "standalone group stderr did not contain {expected_fragment:?}; got: {standalone_stderr}"
+        "runall stderr did not contain {expected_fragment:?} (the standalone oracle rejected \
+         with it); got: {stderr}"
     );
 }
 

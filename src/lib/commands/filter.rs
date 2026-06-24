@@ -623,10 +623,10 @@ impl FilterOptions {
     /// Validates that parameter vectors have 1-3 values and are in valid ranges
     ///
     /// Also validates the duplex stringency-ordering invariant: when a vector
-    /// supplies separate AB/BA/CC values, the more-stringent value must come
-    /// first.
+    /// supplies separate CC/AB/BA values (indexed as `[0]` = CC/duplex,
+    /// `[1]` = AB, `[2]` = BA), the more-stringent value must come first.
     /// - For min-reads: ba <= ab <= cc (more reads required = more stringent)
-    /// - For error rates: ab <= ba (lower error allowed = more stringent)
+    /// - For error rates: cc <= ab <= ba (lower error allowed = more stringent)
     pub(crate) fn validate_parameters(&self) -> Result<()> {
         // Validate min-reads
         if self.min_reads.is_empty() || self.min_reads.len() > 3 {
@@ -696,7 +696,19 @@ impl FilterOptions {
             }
         }
 
-        // Validate error rate ordering (AB must be more stringent or equal to BA)
+        // Validate error rate ordering: CC (duplex) <= AB <= BA, where the lower
+        // allowed error is the more-stringent floor and must come first. The
+        // two-value case ([0]=CC, [1]=AB) is checked here; the three-value case
+        // adds the AB <= BA edge below.
+        if self.max_read_error_rate.len() >= 2 {
+            let cc_error = self.max_read_error_rate[0];
+            let ab_error = self.max_read_error_rate[1];
+            if cc_error > ab_error {
+                bail!(
+                    "max-read-error-rate for duplex (CC) must be <= AB (more stringent), got CC={cc_error} > AB={ab_error}"
+                );
+            }
+        }
         if self.max_read_error_rate.len() >= 3 {
             let ab_error = self.max_read_error_rate[1];
             let ba_error = self.max_read_error_rate[2];
@@ -707,6 +719,15 @@ impl FilterOptions {
             }
         }
 
+        if self.max_base_error_rate.len() >= 2 {
+            let cc_error = self.max_base_error_rate[0];
+            let ab_error = self.max_base_error_rate[1];
+            if cc_error > ab_error {
+                bail!(
+                    "max-base-error-rate for duplex (CC) must be <= AB (more stringent), got CC={cc_error} > AB={ab_error}"
+                );
+            }
+        }
         if self.max_base_error_rate.len() >= 3 {
             let ab_error = self.max_base_error_rate[1];
             let ba_error = self.max_base_error_rate[2];
@@ -1041,6 +1062,45 @@ mod tests {
         );
         cmd.options.min_methylation_depth = vec![2, 5]; // AB > CC
         assert!(cmd.options.validate_parameters().is_err());
+    }
+
+    #[test]
+    fn test_validate_read_error_rate_cc_gt_ab_rejected() {
+        // [0]=CC, [1]=AB: CC must be the more-stringent (lower) floor, so
+        // CC > AB violates the documented duplex-to-AB ordering even with only
+        // two values supplied (the prior code only checked the 3-value AB/BA edge).
+        let mut cmd = create_filter_with_paths(
+            PathBuf::from("input.bam"),
+            PathBuf::from("output.bam"),
+            PathBuf::from("ref.fa"),
+        );
+        cmd.options.max_read_error_rate = vec![0.20, 0.10]; // CC=0.20 > AB=0.10
+        assert!(cmd.options.validate_parameters().is_err());
+    }
+
+    #[test]
+    fn test_validate_base_error_rate_cc_gt_ab_rejected() {
+        let mut cmd = create_filter_with_paths(
+            PathBuf::from("input.bam"),
+            PathBuf::from("output.bam"),
+            PathBuf::from("ref.fa"),
+        );
+        cmd.options.max_base_error_rate = vec![0.20, 0.10]; // CC=0.20 > AB=0.10
+        assert!(cmd.options.validate_parameters().is_err());
+    }
+
+    #[test]
+    fn test_validate_error_rate_cc_le_ab_le_ba_accepted() {
+        // A correctly ordered CC <= AB <= BA triple (and its 2-value prefix)
+        // must pass for both read- and base-error-rate vectors.
+        let mut cmd = create_filter_with_paths(
+            PathBuf::from("input.bam"),
+            PathBuf::from("output.bam"),
+            PathBuf::from("ref.fa"),
+        );
+        cmd.options.max_read_error_rate = vec![0.05, 0.10, 0.20];
+        cmd.options.max_base_error_rate = vec![0.05, 0.10];
+        assert!(cmd.options.validate_parameters().is_ok());
     }
 
     #[test]

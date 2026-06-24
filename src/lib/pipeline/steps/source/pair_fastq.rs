@@ -648,11 +648,11 @@ mod tests {
         }
     }
 
-    /// Serial (single-consumer) sink that records each paired batch's
-    /// `chunk_serial` in the exact order it is emitted. A `Serial` sink — not
-    /// `Parallel` — is what lets the test assert true emission order: a single
-    /// worker drains the queue in FIFO order, so the recorded sequence is the
-    /// real downstream order rather than a multi-consumer interleaving.
+    /// Serial sink that records each paired batch's `chunk_serial` in the order
+    /// it is popped. Declared `Serial` (not `Parallel`) so the recorded order is
+    /// exactly the emission order of the upstream `Serial` `PairRawFastq` step —
+    /// a `Parallel` sink would let multiple workers race on `pop()` and reorder
+    /// the observations, masking any ordering regression in the pairing step.
     #[derive(Clone)]
     struct PairSink {
         seen_serials: Arc<Mutex<Vec<u64>>>,
@@ -757,10 +757,10 @@ mod tests {
         }
         worker.join().expect("pipeline thread panicked").expect("pipeline run returned Err");
 
-        // Full output: one pair per serial, every serial present AND in order.
-        // The single-consumer `PairSink` records the true emission order, so we
-        // assert the sequence directly (no sort) to prove `PairRawFastq` emits
-        // pairs in contiguous `chunk_serial` order, not merely as a set.
+        // Full output: one pair per serial, every serial present AND observed in
+        // ascending `chunk_serial` order. The Serial `PairSink` records in pop
+        // order, so we assert the observed vector directly (no sorting) — an
+        // out-of-order emission from `PairRawFastq` would now fail the test.
         let serials = seen.lock().unwrap().clone();
         assert_eq!(
             serials.len(),
@@ -769,6 +769,9 @@ mod tests {
             serials.len()
         );
         let expected: Vec<u64> = (0..X3_N_SERIALS).collect();
-        assert_eq!(serials, expected, "every chunk_serial must be paired exactly once, in order");
+        assert_eq!(
+            serials, expected,
+            "every chunk_serial must be paired exactly once and emitted in order"
+        );
     }
 }

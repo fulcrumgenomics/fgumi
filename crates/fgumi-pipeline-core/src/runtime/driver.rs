@@ -427,6 +427,32 @@ mod tests {
         }
     }
 
+    /// `() → u32` source that returns `NoProgress` on its first `try_run` (so
+    /// the sticky fast-path yields back to round-robin without removing it) and
+    /// `Finished` on every later call (so it is removed during the round-robin
+    /// pass, exercising `RoundRobinOutcome::removed_sticky_owner`).
+    #[derive(Clone)]
+    struct SrcIdleThenFinish {
+        calls: Arc<AtomicUsize>,
+    }
+    impl Step for SrcIdleThenFinish {
+        type Input = ();
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "SrcIdleThenFinish",
+                kind: StepKind::Exclusive,
+                sticky: true,
+                output_queues: vec![QueueSpec::CountBounded { capacity: 4 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            let n = self.calls.fetch_add(1, Ordering::Relaxed);
+            if n == 0 { Ok(StepOutcome::NoProgress) } else { Ok(StepOutcome::Finished) }
+        }
+    }
+
     /// `u32 → u32` step that always returns `Finished`. Used both as a
     /// `Parallel` body (counter-gated output close) and a `Serial` body
     /// (`DrainGate` short-circuit). The `runs` counter records every `try_run`
@@ -608,5 +634,48 @@ mod tests {
         // The source finishes immediately; the sink then sees its input drained
         // and finishes too. `run_worker_loop` must return (no hang).
         run_worker_loop(&mut worker, &mut entries, &contexts, &drain_counters, &signal, None);
+    }
+
+    /// A sticky owner that returns `NoProgress` on its first call (yielding out
+    /// of the sticky fast-path back to round-robin) and `Finished` later must be
+    /// removed via the round-robin path (`RoundRobinOutcome::removed_sticky_owner`),
+    /// after which the next outer iteration skips the sticky re-entry. This pins
+    /// the round-robin removal branch (lines around `outcome.removed_sticky_owner`),
+    /// not just the sticky fast-path removal exercised by
+    /// `sticky_owner_completes_and_loop_exits`.
+    #[test]
+    fn sticky_owner_removed_via_round_robin_and_loop_exits() {
+        let mut graph = ChainGraph::new();
+        let src = graph.register_step("SrcIdleThenFinish", 1);
+        let sink = graph.register_step("Sink", 0);
+        graph.wire(src, BranchIdx(0), sink);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let steps: Vec<Box<dyn ErasedStep>> = vec![
+            Box::new(TypedStep::new(SrcIdleThenFinish { calls: Arc::clone(&calls) })),
+            Box::new(TypedStep::new(SinkStep)),
+        ];
+        let contexts = Arc::new(build_chain_contexts(&steps, &graph));
+
+        let mut entries: Vec<WorkerStepEntry> = vec![
+            WorkerStepEntry::Exclusive { step: steps.into_iter().next().unwrap() },
+            WorkerStepEntry::Exclusive { step: Box::new(TypedStep::new(SinkStep)) },
+        ];
+        let drain_counters = vec![StepDrainCounter::new(1), StepDrainCounter::new(1)];
+        let signal = PipelineSignal::new();
+        let mut worker = WorkerCore::new(0, Some(src), Some(src));
+
+        // First sticky call → NoProgress (yield to round-robin); the source then
+        // returns Finished during a round-robin pass, which must remove it and
+        // disable the sticky fast-path so the loop terminates rather than hangs.
+        run_worker_loop(&mut worker, &mut entries, &contexts, &drain_counters, &signal, None);
+
+        // The source must have been called at least twice: once idle (sticky),
+        // then again to Finished (round-robin).
+        assert!(
+            calls.load(Ordering::Relaxed) >= 2,
+            "source should idle once then finish via round-robin, got {} call(s)",
+            calls.load(Ordering::Relaxed)
+        );
     }
 }

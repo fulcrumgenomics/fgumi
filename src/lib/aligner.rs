@@ -210,26 +210,22 @@ impl AlignerProcess {
 
         // Wait for the process to actually exit so its resources are cleaned up.
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        let mut reaped = false;
-        loop {
-            match self.child.try_wait() {
-                // Child exited (we reaped it), or `try_wait` errored (e.g. ECHILD
-                // because the child was already reaped elsewhere). Either way the
-                // child is gone, not leaked — mark reaped so the warning below
-                // doesn't fire spuriously, then stop polling.
-                Ok(Some(_)) | Err(_) => {
-                    reaped = true;
-                    break;
-                }
-                Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(50));
-                }
+        // Tracks whether the loop gave up because the 1s deadline elapsed while
+        // the process was still alive. Only that case warrants a warning; a
+        // successful reap or a non-leak `try_wait` error (e.g. ECHILD) does not.
+        let mut deadline_exceeded = false;
+        // `Ok(None)` means still alive — keep polling. Any other result
+        // (`Ok(Some)` = reaped, or `Err` such as ECHILD = already reaped) is a
+        // non-leak: exit without warning. Only hitting the deadline while still
+        // alive sets `deadline_exceeded`.
+        while let Ok(None) = self.child.try_wait() {
+            if std::time::Instant::now() >= deadline {
+                deadline_exceeded = true;
+                break;
             }
+            thread::sleep(Duration::from_millis(50));
         }
-        if !reaped {
+        if deadline_exceeded {
             log::warn!(
                 "aligner process (pid {pid}) did not exit within 1s of SIGKILL; it may be \
                  stuck (e.g. uninterruptible I/O) and left unreaped"
