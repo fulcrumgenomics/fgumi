@@ -213,7 +213,10 @@ fn test_downsample_command_with_piped_input() {
         "downsample with direct input failed; stderr: {}",
         String::from_utf8_lossy(&direct.stderr)
     );
-    crate::helpers::parity::assert_bams_record_equivalent(&output_bam, &direct_out);
+    // Use the non-empty variant so a both-empty pass (e.g. `downsample` silently
+    // dropping every record on both paths) cannot satisfy the equivalence
+    // vacuously — `--fraction 1.0` must retain the full record stream.
+    crate::helpers::parity::assert_bams_record_equivalent_nonempty(&output_bam, &direct_out);
 }
 
 /// Test simplex command with piped input.
@@ -833,6 +836,13 @@ fn test_group_command_with_piped_input_new_pipeline() {
         .expect("Failed to run group with file input");
     assert!(status.success(), "group (file) failed");
     assert!(output_from_file.exists(), "file-input output not created");
+    // Non-empty baseline: the file-vs-stdin parity check below (`compare_bam_records`)
+    // would pass vacuously if `group` emitted zero records on BOTH paths. Assert the
+    // file-path baseline actually produced records so the parity comparison is meaningful.
+    assert!(
+        count_bam_records(&output_from_file) > 0,
+        "file-input baseline produced no records; the stdin parity check would be vacuous"
+    );
 
     let cat_child = Command::new("cat")
         .arg(input_bam.to_str().unwrap())

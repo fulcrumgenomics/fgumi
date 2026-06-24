@@ -511,6 +511,42 @@ mod tests {
         }
     }
 
+    /// A non-sticky `Exclusive` sink that deliberately stays live for one extra
+    /// round-robin pass: it ignores its input-drain status and finishes purely
+    /// on an internal tick counter — `NoProgress` on the first `try_run`,
+    /// `Finished` after. Keeping a second step alive for one more outer
+    /// iteration *after* the sticky source is removed is what makes
+    /// `sticky_owner_removed_via_round_robin_and_loop_exits` branch-specific: a
+    /// plain `SinkStep` finishes in the same round-robin pass as the source
+    /// (its input is already drained), emptying `live` so the loop exits via
+    /// `live.is_empty()` even if the `removed_sticky_owner` branch had failed to
+    /// clear `sticky_live`. Lingering forces the extra iteration on which a
+    /// stale `sticky_live` would re-enter the sticky fast-path and re-invoke the
+    /// already-removed source.
+    struct LingerThenFinish {
+        ticks: usize,
+    }
+    impl Step for LingerThenFinish {
+        type Input = u32;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "Linger",
+                kind: StepKind::Exclusive,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            while ctx.input.pop().is_some() {}
+            self.ticks += 1;
+            // Stay live for exactly one extra round-robin pass before finishing,
+            // regardless of input-drain status.
+            if self.ticks >= 2 { Ok(StepOutcome::Finished) } else { Ok(StepOutcome::NoProgress) }
+        }
+    }
+
     /// Build `Src → Finish → Sink` (Finish having the given kind) and return the
     /// erased steps + the wired graph. The `Finish` step's `try_run` counter is
     /// returned so tests can assert how many times it actually ran.
@@ -643,23 +679,35 @@ mod tests {
     /// the round-robin removal branch (lines around `outcome.removed_sticky_owner`),
     /// not just the sticky fast-path removal exercised by
     /// `sticky_owner_completes_and_loop_exits`.
+    ///
+    /// A second `LingerThenFinish` step is kept alive for one extra round-robin
+    /// pass *after* the source is removed, so the worker loop must run one more
+    /// outer iteration. That iteration is where a stale `sticky_live` would
+    /// wrongly re-enter the sticky fast-path and re-invoke the
+    /// already-removed-from-`live` source — making the `== 2` source-call
+    /// assertion below uniquely diagnostic of the `removed_sticky_owner` branch.
+    /// (Without the linger, a plain sink would finish in the same pass as the
+    /// source, emptying `live` so the loop exits via `live.is_empty()` whether
+    /// or not `sticky_live` was cleared — and `== 2` would not be branch-specific.)
     #[test]
     fn sticky_owner_removed_via_round_robin_and_loop_exits() {
         let mut graph = ChainGraph::new();
         let src = graph.register_step("SrcIdleThenFinish", 1);
-        let sink = graph.register_step("Sink", 0);
-        graph.wire(src, BranchIdx(0), sink);
+        let linger = graph.register_step("Linger", 0);
+        graph.wire(src, BranchIdx(0), linger);
 
         let calls = Arc::new(AtomicUsize::new(0));
         let steps: Vec<Box<dyn ErasedStep>> = vec![
             Box::new(TypedStep::new(SrcIdleThenFinish { calls: Arc::clone(&calls) })),
-            Box::new(TypedStep::new(SinkStep)),
+            Box::new(TypedStep::new(LingerThenFinish { ticks: 0 })),
         ];
         let contexts = Arc::new(build_chain_contexts(&steps, &graph));
 
         let mut entries: Vec<WorkerStepEntry> = vec![
             WorkerStepEntry::Exclusive { step: steps.into_iter().next().unwrap() },
-            WorkerStepEntry::Exclusive { step: Box::new(TypedStep::new(SinkStep)) },
+            WorkerStepEntry::Exclusive {
+                step: Box::new(TypedStep::new(LingerThenFinish { ticks: 0 })),
+            },
         ];
         let drain_counters = vec![StepDrainCounter::new(1), StepDrainCounter::new(1)];
         let signal = PipelineSignal::new();
@@ -668,14 +716,26 @@ mod tests {
         // First sticky call → NoProgress (yield to round-robin); the source then
         // returns Finished during a round-robin pass, which must remove it and
         // disable the sticky fast-path so the loop terminates rather than hangs.
+        // The `Linger` step stays alive for one more iteration, forcing the
+        // post-removal outer iteration that exercises the cleared fast path.
         run_worker_loop(&mut worker, &mut entries, &contexts, &drain_counters, &signal, None);
 
-        // The source must have been called at least twice: once idle (sticky),
-        // then again to Finished (round-robin).
-        assert!(
-            calls.load(Ordering::Relaxed) >= 2,
-            "source should idle once then finish via round-robin, got {} call(s)",
-            calls.load(Ordering::Relaxed)
+        // The source must have been called EXACTLY twice: call 1 = idle in the
+        // sticky fast-path (`NoProgress`, which does NOT remove it there — that
+        // block only reaps a `Finished`), call 2 = `Finished` during the
+        // round-robin pass. The lingering second step guarantees one more outer
+        // iteration after that removal, so `== 2` is the branch-specific signal
+        // for the `removed_sticky_owner` path: if that branch had failed to clear
+        // `sticky_live`, the extra iteration's sticky fast-path would re-invoke
+        // the (already-removed-from-`live`) source — the sticky block dispatches
+        // `entries[owned_idx]` directly, not gated on `live` membership —
+        // producing a third call. `== 2` therefore proves removal happened via
+        // round-robin AND that it correctly disabled the fast path.
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "source must be called exactly twice (sticky idle, then round-robin finish); \
+             a different count means the removed_sticky_owner branch did not gate the fast path",
         );
     }
 }

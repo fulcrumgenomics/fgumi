@@ -343,10 +343,12 @@ fn bench_vanilla_consensus_caller(c: &mut Criterion) {
             .map(|i| {
                 let mut read_seq = seq.clone();
                 // Introduce a single-base error on every 10th read. NOTE: this
-                // only fires for `i` a positive multiple of 10, so the smaller
-                // molecule sizes here (num_reads in {2, 3, 5}) get NO injected
-                // error and exercise the unanimous fast path; only num_reads
-                // 10 and 20 actually introduce a mismatch.
+                // only fires for `i` a positive multiple of 10. Because the loop
+                // is `0..num_reads`, `i` only reaches 10 when `num_reads == 20`;
+                // for `num_reads` in {2, 3, 5, 10} the index never hits 10, so
+                // those sizes get NO injected error and exercise the unanimous
+                // fast path. Only the `num_reads == 20` case introduces a
+                // mismatch (at i = 10).
                 if i > 0 && i % 10 == 0 {
                     read_seq[i % read_len] = b"TGCA"[(read_seq[i % read_len] as usize) % 4];
                 }

@@ -176,13 +176,66 @@ fn test_dedup_command_remove_duplicates() {
     assert!(output_bam.exists(), "Output BAM not created");
 
     // With --remove-duplicates, exactly one pair (2 records) survives: the 3
-    // duplicate pairs (6 records) collapse to the single best representative
-    // pair, so the other 2 pairs (4 records) are dropped. Assert the exact
-    // expected count rather than loose bounds (S9b-008).
+    // duplicate pairs (6 records) collapse to a single representative pair, so
+    // the other 2 pairs (4 records) are dropped. The 3 input templates are
+    // byte-identical except for their qname suffix (`dup1_0/1/2`; see
+    // `create_duplicate_group`), so which one is retained is an implementation-
+    // defined tie-break, NOT an independently oracle-able contract — this test
+    // therefore does not pin the exact surviving qname. What it DOES enforce,
+    // beyond the count, is that the survivor is a well-formed representative
+    // *pair*: one R1 + one R2 sharing a single input qname, at the original
+    // mapped positions, and not duplicate-flagged. That catches a dropped-mate,
+    // split-pair, or malformed-survivor regression (S9b-008).
     let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
     let _header = reader.read_header().unwrap();
-    let count = reader.records().count();
-    assert_eq!(count, 2, "remove-duplicates over 3 duplicate pairs must keep exactly one pair");
+    let surviving: Vec<bam::Record> =
+        reader.records().map(|r| r.expect("read surviving record")).collect();
+    assert_eq!(
+        surviving.len(),
+        2,
+        "remove-duplicates over 3 duplicate pairs must keep exactly one pair"
+    );
+
+    // Project each surviving record onto stable, order-independent fields and
+    // assert the exact set: one R1 + one R2 with a shared qname (one of the
+    // input names `dup1_0/1/2`), the original mapped positions, and NOT flagged
+    // as a duplicate (representatives are kept, duplicates are removed).
+    let name0 = String::from_utf8(surviving[0].name().expect("R1 has a name").to_vec()).unwrap();
+    let name1 = String::from_utf8(surviving[1].name().expect("R2 has a name").to_vec()).unwrap();
+    assert_eq!(name0, name1, "the surviving pair's two mates must share one qname");
+    assert!(
+        ["dup1_0", "dup1_1", "dup1_2"].contains(&name0.as_str()),
+        "surviving qname must be one of the input templates, got {name0}"
+    );
+
+    // Project (is_first, is_last, is_reverse, pos) for each mate; the set must be
+    // exactly the forward R1 (first, not last) at pos 100 and the reverse R2 (last,
+    // not first) at pos 200 (1-based). Asserting both the first- and last-segment
+    // flags pins the exact "one R1 + one R2" contract — a malformed record that is
+    // merely "not first" at pos 200 would otherwise slip through.
+    let mut projected: Vec<(bool, bool, bool, i32)> = surviving
+        .iter()
+        .map(|rec| {
+            let flags = rec.flags();
+            let pos = i32::try_from(rec.alignment_start().unwrap().unwrap().get()).unwrap();
+            (
+                flags.is_first_segment(),
+                flags.is_last_segment(),
+                flags.is_reverse_complemented(),
+                pos,
+            )
+        })
+        .collect();
+    projected.sort_unstable();
+    assert_eq!(
+        projected,
+        vec![(false, true, true, 200), (true, false, false, 100)],
+        "surviving pair must be the forward R1 (first, pos 100) + reverse R2 (last, pos 200), 1-based"
+    );
+    assert!(
+        surviving.iter().all(|rec| !rec.flags().is_duplicate()),
+        "surviving representatives must not be flagged as duplicates"
+    );
 }
 
 /// SAM-input parity: dedup's typed-step path accepts both BAM and SAM via

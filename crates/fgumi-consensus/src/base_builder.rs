@@ -866,6 +866,15 @@ mod tests {
     }
 
     // ==================== Observation-count saturation (S7-001 / FU-002) ====================
+    //
+    // NOTE on fgbio parity: clamping `observations_for_base` / `contributions` at
+    // `u16::MAX` is an INTENTIONAL divergence from fgbio once a family's counts
+    // exceed the `u16` ceiling — `ConsensusBaseBuilder` uses `u16` counters, so it
+    // saturates where fgbio (wider counters) keeps counting. This only matters for
+    // pathologically large families (>65535 observations of a single base, or a
+    // cross-base contribution sum past the ceiling), well beyond any realistic UMI
+    // family. The tests below pin the clamp (no wrap toward zero); they are NOT a
+    // parity bug, so do not "fix" the saturation to match fgbio.
 
     #[test]
     fn test_observations_saturate_at_u16_max() {

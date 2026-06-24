@@ -45,7 +45,7 @@ use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{
     create_both_unmapped_pair, create_minimal_header, create_paired_umi_family,
-    create_paired_umi_family_at, create_umi_family, to_record_buf,
+    create_paired_umi_family_at, create_umi_family, create_umi_family_at, to_record_buf,
 };
 use crate::helpers::cli_runner::{
     ParityArgs, Stage, fgumi, fgumi_binary, run_runall, run_runall_consensus_to_filter,
@@ -396,6 +396,7 @@ fn parity_a_duplex_to_duplex() {
 
     // S9a-001: the duplex chain emits duplex consensus records — non-empty.
     assert_bams_record_equivalent_nonempty(&runall_out, &standalone_out);
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &standalone_out);
 }
 
 /// `Codec → Codec` parity vs standalone `fgumi codec`. Runs through the
@@ -427,6 +428,9 @@ fn parity_a_codec_to_codec() {
     assert!(r.status.success(), "standalone: {}", String::from_utf8_lossy(&r.stderr));
 
     assert_bams_record_equivalent(&runall_out, &standalone_out);
+    // Header parity matters most in this empty-stream case: a wrong fused
+    // @HD/@SQ/@RG would otherwise stay green behind the zero-record assertion.
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &standalone_out);
     assert_eq!(
         read_bam_records(&runall_out).len(),
         0,
@@ -620,6 +624,75 @@ fn parity_b_group_to_duplex() {
 /// `group` but must be dropped by the duplex `record_filter` on BOTH the fused
 /// `runall group→duplex` path and the staged `fgumi group | fgumi duplex` path.
 ///
+/// Assert that a `group --allow-unmapped` output BAM retains the fixture's sole
+/// both-unmapped template (`fam_unmapped`, UMI `TTAA-GGCC`; see
+/// `sorted_duplex_with_unmapped_fixture`) by IDENTITY, not just by count. A
+/// count-only check would still pass if the group stage retained two of some
+/// *other* record while dropping a `fam_unmapped` mate.
+fn assert_group_retains_both_unmapped_pair(group_bam: &Path) {
+    use noodles::sam::alignment::record::data::field::Tag;
+    use noodles::sam::alignment::record_buf::data::field::Value;
+    let mi_tag = Tag::from(fgumi_lib::sam::SamTag::MI);
+    let rx_tag = Tag::from(fgumi_lib::sam::SamTag::RX);
+    let group_records = read_bam_records(group_bam);
+    let retained: Vec<_> = group_records
+        .iter()
+        .filter(|rec| rec.flags().is_unmapped() && rec.data().get(&mi_tag).is_some())
+        .collect();
+    assert_eq!(
+        retained.len(),
+        2,
+        "group --allow-unmapped output must retain BOTH mates of the one both-unmapped \
+         template (= 2 MI-tagged unmapped records); a count other than 2 means a mate was \
+         dropped or duplicated. Found {} such records in {}",
+        retained.len(),
+        group_bam.display()
+    );
+    // Both retained records must be the `fam_unmapped` pair, carrying its UMI.
+    for rec in &retained {
+        let qname: &[u8] = rec.name().expect("retained record has a read name").as_ref();
+        assert_eq!(
+            qname, b"fam_unmapped",
+            "retained MI-tagged unmapped record has an unexpected qname (not fam_unmapped)"
+        );
+        let Some(Value::String(rx)) = rec.data().get(&rx_tag) else {
+            panic!("retained unmapped record is missing its RX (UMI) tag");
+        };
+        let rx_bytes: &[u8] = rx.as_ref();
+        assert_eq!(
+            rx_bytes, b"TTAA-GGCC",
+            "retained unmapped record carries the wrong UMI (not the fam_unmapped UMI)"
+        );
+    }
+    // Both retained mates must share ONE molecule id: presence alone (the filter
+    // above) would still pass if a regression split `fam_unmapped` into two
+    // different MI values, changing the grouped-template identity.
+    let mi_values: std::collections::BTreeSet<Vec<u8>> = retained
+        .iter()
+        .map(|rec| {
+            let Some(Value::String(mi)) = rec.data().get(&mi_tag) else {
+                panic!("retained unmapped record is missing its MI tag");
+            };
+            let mi_bytes: &[u8] = mi.as_ref();
+            mi_bytes.to_vec()
+        })
+        .collect();
+    assert_eq!(
+        mi_values.len(),
+        1,
+        "the retained both-unmapped pair must share one MI value; got {mi_values:?}"
+    );
+    // ...and they are exactly one R1 + one R2 (no mate dropped or duplicated).
+    let first = retained.iter().filter(|r| r.flags().is_first_segment()).count();
+    let last = retained.iter().filter(|r| r.flags().is_last_segment()).count();
+    assert_eq!(
+        (first, last),
+        (1, 1),
+        "the retained both-unmapped pair must be exactly one R1 + one R2, got \
+         ({first} first, {last} last) segments"
+    );
+}
+
 /// Before the fix the fused `templates_to_mi_step` bridge did not apply the
 /// duplex filter, so the both-unmapped pair leaked into the consensus caller on
 /// the fused path only — diverging from the staged path. This test fails on the
@@ -679,25 +752,12 @@ fn new_002_group_to_duplex_allow_unmapped_parity() {
     assert!(r.status.success(), "staged group: {}", String::from_utf8_lossy(&r.stderr));
 
     // Independent intermediate check: the group stage with --allow-unmapped must
-    // retain the both-unmapped template (MI-tagged) BEFORE duplex runs. This
-    // pins the bridge/filter contract directly — without it, a regression that
-    // drops the unmapped template at the group stage could still pass the final
-    // fused-vs-staged comparison if both paths dropped it identically.
-    {
-        use noodles::sam::alignment::record::data::field::Tag;
-        let mi_tag = Tag::from(fgumi_lib::sam::SamTag::MI);
-        let group_records = read_bam_records(&group_bam);
-        let unmapped_mi_count = group_records
-            .iter()
-            .filter(|rec| rec.flags().is_unmapped() && rec.data().get(&mi_tag).is_some())
-            .count();
-        assert!(
-            unmapped_mi_count > 0,
-            "group --allow-unmapped output must retain the MI-tagged unmapped template; \
-             found {unmapped_mi_count} such records in {}",
-            group_bam.display()
-        );
-    }
+    // retain the both-unmapped template (MI-tagged, by identity) BEFORE duplex
+    // runs. This pins the bridge/filter contract directly — without it, a
+    // regression that drops the unmapped template at the group stage could still
+    // pass the final fused-vs-staged comparison if both paths dropped it
+    // identically.
+    assert_group_retains_both_unmapped_pair(&group_bam);
 
     let duplex_args: Vec<OsString> = vec![
         "duplex".into(),
@@ -984,13 +1044,15 @@ fn deterministic_simplex_fixture(dir: &Path, positions: usize) -> PathBuf {
     let mut all = Vec::new();
     // A small set of valid-DNA UMIs (non-ACGT chars would be rejected by the
     // UMI grouping stage); cycle through them so distinct families form across
-    // positions. `create_umi_family` maps every read at a fixed position, so
-    // all 200 families share one coordinate but distinct UMIs → distinct MI
-    // groups → one fragment consensus each.
+    // positions. Each family is mapped to its own template-coordinate position
+    // (100 bp apart) via `create_umi_family_at`, so the families genuinely span
+    // many coordinates — exercising the sort/group/consensus path across
+    // multiple parallel workers rather than collapsing onto one position.
     let umis = ["ACGTACGT", "TGCATGCA", "CCAATTGG", "GGTTAACC", "AACCGGTT", "TTGGCCAA"];
     for p in 0..positions {
         let umi = umis[p % umis.len()];
-        for r in create_umi_family(umi, 3, &format!("ds{p}_{umi}"), "ACGTACGTACGT", 30) {
+        let pos = i32::try_from(100 + p * 100).expect("family position fits in i32");
+        for r in create_umi_family_at(pos, umi, 3, &format!("ds{p}_{umi}"), "ACGTACGTACGT", 30) {
             all.push(r);
         }
     }
@@ -1835,6 +1897,7 @@ fn parity_a_zipper_to_zipper() {
 
     // S9a-001: zipper merges the mapped + unmapped reads → a non-empty stream.
     assert_bams_record_equivalent_nonempty(&runall_out, &standalone_out);
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &standalone_out);
 }
 
 /// Smoke check — `fgumi runall --start-from zipper --stop-after zipper`
@@ -3673,11 +3736,43 @@ fn correct_to_sort_with_rejects_emits_warning() {
         "standalone correct --rejects failed: {}",
         String::from_utf8_lossy(&r.stderr)
     );
-    let standalone_reject_count = read_bam_records(&standalone_rejects).len();
-    assert!(
-        standalone_reject_count > 0,
-        "standalone correct --rejects must capture the off-whitelist family that the \
-         fused chain discarded — got {standalone_reject_count} rejects (expected the 4 \
-         GGTTAACC reads). If this is 0, the partial whitelist is not actually rejecting."
+    let standalone_reject_records = read_bam_records(&standalone_rejects);
+    assert_eq!(
+        standalone_reject_records.len(),
+        4,
+        "standalone correct --rejects must capture the ENTIRE off-whitelist family that the \
+         fused chain discarded — expected exactly the 4 GGTTAACC reads, got {}. A non-4 count \
+         means only part of the family was rejected (or the wrong reads were captured).",
+        standalone_reject_records.len()
     );
+    // Pin the captured family by IDENTITY, not just count: every rejected read
+    // must be a `fam_d` read carrying the off-whitelist UMI `GGTTAACC`, and the
+    // four must be exactly fam_d_0..fam_d_3 — proving the discarded data was the
+    // specific off-whitelist family, not some unrelated four reads.
+    {
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::Value;
+        let rx_tag = Tag::from(fgumi_lib::sam::SamTag::RX);
+        let mut reject_qnames: Vec<Vec<u8>> = Vec::new();
+        for rec in &standalone_reject_records {
+            let Some(Value::String(rx)) = rec.data().get(&rx_tag) else {
+                panic!("rejected record is missing its RX (UMI) tag");
+            };
+            let rx_bytes: &[u8] = rx.as_ref();
+            assert_eq!(
+                rx_bytes, b"GGTTAACC",
+                "rejected record carries the wrong UMI — only the off-whitelist GGTTAACC \
+                 family should be rejected"
+            );
+            let qname: &[u8] = rec.name().expect("rejected record has a read name").as_ref();
+            reject_qnames.push(qname.to_vec());
+        }
+        reject_qnames.sort();
+        let expected_qnames: Vec<Vec<u8>> =
+            (0..4).map(|i| format!("fam_d_{i}").into_bytes()).collect();
+        assert_eq!(
+            reject_qnames, expected_qnames,
+            "rejected reads must be exactly the four GGTTAACC family members fam_d_0..fam_d_3"
+        );
+    }
 }

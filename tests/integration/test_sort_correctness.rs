@@ -352,6 +352,19 @@ fn assert_records_preserved(input: &Path, output: &Path) {
 /// then `pos` ascending. This is computed independently of the sort crate from
 /// the records actually present in the output.
 fn assert_coordinate_ordered(records: &[RecordBuf]) {
+    // fgumi's coordinate sort key is `(tid << 34) | ((pos+1) << 1) | reverse`
+    // (see `RawCoordinateKey`), so the REVERSE strand flag (0x10) is a real,
+    // reliably-ordered tertiary component of the key — forward-strand records
+    // precede reverse-strand at the same (tid, pos). Including it here catches a
+    // comparator/merge regression that reshuffles equal-coordinate records by
+    // strand, which a `(tid, pos)`-only projection would miss. The remaining
+    // within-(tid, pos, strand) order is the stable input-order tie-break (no
+    // name tie-break, matching samtools); it is not asserted here because the
+    // parallel/spill merge does not independently guarantee global input order
+    // for fully-equal keys, and record integrity is proven separately by
+    // `assert_records_preserved`.
+    const REVERSE_FLAG: u16 = 0x10;
+    let strand = |k: &RecordKey| (k.flags & REVERSE_FLAG) != 0;
     let keys: Vec<RecordKey> = records.iter().map(record_key).collect();
     let mut expected = keys.clone();
     expected.sort_by(|a, b| {
@@ -361,25 +374,44 @@ fn assert_coordinate_ordered(records: &[RecordBuf]) {
             .cmp(&b_noref) // false (has ref) sorts before true (no ref)
             .then(a.tid.cmp(&b.tid))
             .then(a.pos.cmp(&b.pos))
+            .then(strand(a).cmp(&strand(b))) // forward (false) before reverse (true)
     });
-    // Compare only the order-determining prefix (tid, pos); names within an
-    // equal (tid, pos) are an unspecified tie so are not asserted here.
-    let proj = |k: &RecordKey| (k.tid < 0, k.tid, k.pos);
+    let proj = |k: &RecordKey| (k.tid < 0, k.tid, k.pos, strand(k));
     let got: Vec<_> = keys.iter().map(proj).collect();
     let want: Vec<_> = expected.iter().map(proj).collect();
-    assert_eq!(got, want, "output is not coordinate-ordered (independent oracle)");
+    assert_eq!(
+        got, want,
+        "output is not coordinate-ordered by (tid, pos, strand) (independent oracle)"
+    );
 }
 
-/// Queryname-lexicographic order oracle: read names compared as raw bytes,
-/// non-decreasing down the file. Computed independently of the sort crate.
+/// Queryname-lexicographic order oracle. The lex sort key is the read name
+/// compared as raw bytes; the sort is documented stable, so within an
+/// equal-name run the records keep their input order — and the fixture emits
+/// every template's R1 (`FIRST_SEGMENT`) before its R2 (`LAST_SEGMENT`). The order
+/// is therefore FULLY determined, so this oracle uses an order-preserving
+/// per-record projection `(name, is_last_segment)` rather than collapsing
+/// duplicates by name: a name-only `<=` would pass even if R1/R2 were swapped
+/// within a name, but the full projection catches per-record reordering within
+/// an equal-name run. Computed independently of the sort crate.
 fn assert_queryname_lex_ordered(records: &[RecordBuf]) {
-    let names: Vec<Vec<u8>> = records.iter().map(|r| record_key(r).name).collect();
-    for pair in names.windows(2) {
+    let proj = |r: &RecordBuf| -> (Vec<u8>, bool) {
+        let name = record_key(r).name;
+        // FIRST_SEGMENT (0x40) precedes LAST_SEGMENT (0x80) under the stable
+        // sort; `is_last_segment` (false < true) encodes that secondary order.
+        let is_last = r.flags().is_last_segment();
+        (name, is_last)
+    };
+    let keys: Vec<(Vec<u8>, bool)> = records.iter().map(proj).collect();
+    for pair in keys.windows(2) {
         assert!(
             pair[0] <= pair[1],
-            "output is not queryname-lexicographic ordered (independent oracle): {:?} > {:?}",
-            String::from_utf8_lossy(&pair[0]),
-            String::from_utf8_lossy(&pair[1]),
+            "output is not queryname-lexicographic ordered (independent oracle): \
+             ({:?}, last={}) > ({:?}, last={})",
+            String::from_utf8_lossy(&pair[0].0),
+            pair[0].1,
+            String::from_utf8_lossy(&pair[1].0),
+            pair[1].1,
         );
     }
 }
@@ -399,7 +431,9 @@ fn samtools_sort(input: &Path, output: &Path, samtools_args: &[&str]) {
     let mut cmd = Command::new("samtools");
     cmd.arg("sort");
     cmd.args(samtools_args);
-    cmd.args(["-o", output.to_str().unwrap(), input.to_str().unwrap()]);
+    cmd.arg("-o");
+    cmd.arg(output);
+    cmd.arg(input);
     let status = cmd.status().expect("run samtools sort");
     assert!(status.success(), "samtools sort failed");
 }
@@ -544,12 +578,33 @@ fn template_coordinate_sort_matrix(#[case] spill: Spill) {
     );
     assert_records_preserved(&input, &output);
 
+    // Run-to-run determinism: fgumi's template-coordinate tie-break folds the
+    // CB cell tag + a read-name hash into its key and legitimately DIVERGES from
+    // samtools' per-record tie order, so we do NOT cross-check the full record
+    // stream against samtools (that would assert a false equivalence — see
+    // `assert_template_position_order_matches`). But fgumi's OWN tie-break is
+    // deterministic, so sorting the same input twice must yield the identical
+    // full ordered record sequence. This pins the complete record order
+    // (including ties) internally, which the position-key samtools cross-check
+    // below cannot.
+    let output2 = dir.path().join("sorted2.bam");
+    run_sort(&input, &output2, "template-coordinate", spill);
+    let recs1 = read_records(&output);
+    let recs2 = read_records(&output2);
+    assert_eq!(
+        recs1, recs2,
+        "template-coordinate sort is not run-to-run deterministic ({spill:?}): \
+         the full ordered record sequence (including tie order) differs between two runs"
+    );
+
     if !samtools_available() {
         eprintln!("skipping template-coordinate samtools oracle: samtools not on PATH");
         return;
     }
     let samtools_out = dir.path().join("samtools_template.bam");
     samtools_sort(&input, &samtools_out, &["--template-coordinate"]);
+    // Cross-check only the (tid, pos) position-key stream against samtools — the
+    // per-record tie order is intentionally divergent (documented above).
     assert_template_position_order_matches(&output, &samtools_out);
 }
 
@@ -815,28 +870,60 @@ fn template_coordinate_cb_and_name_hash_tiebreak() {
     assert_records_preserved(&input, &output);
 
     let out = read_records(&output);
-    // Output index of the FIRST record carrying read name `qname` (the lower-end
-    // mate of that template, `is_upper = 0`).
-    let first_index = |qname: &[u8]| -> usize {
+    // The ordered `(name, is_first_segment)` slice of just the records whose
+    // name is in `names`, in output order. Each colliding template emits two
+    // records sharing a name: the FIRST_SEGMENT end is the lower 5' mate
+    // (`is_upper = 0`), the LAST_SEGMENT end the upper (`is_upper = 1`). Because
+    // the `cb_hash` / `name_hash` lane is MORE significant than the trailing
+    // `is_upper` lane, BOTH records of the earlier-hashing template must precede
+    // BOTH of the later one — never interleaved. Asserting only which template's
+    // first record appears earlier (a bare `first_index` check) would miss an
+    // interleaving that still violates the frozen lane order, so pin the full
+    // four-record slice.
+    let pair_slice = |names: &[&[u8]]| -> Vec<(Vec<u8>, bool)> {
         out.iter()
-            .position(|r| r.name().is_some_and(|n| AsRef::<[u8]>::as_ref(n) == qname))
-            .unwrap_or_else(|| panic!("qname {} not in output", String::from_utf8_lossy(qname)))
+            .filter(|r| {
+                r.name().is_some_and(|n| {
+                    let nb = AsRef::<[u8]>::as_ref(n);
+                    names.contains(&nb)
+                })
+            })
+            .map(|r| {
+                let name = AsRef::<[u8]>::as_ref(&r.name().expect("named record")).to_vec();
+                (name, r.flags().is_first_segment())
+            })
+            .collect()
     };
 
     // FROZEN expected order (see the header comment for why it is not recomputed
     // from the production hashers). For the fixed-seed `cb_hasher`, `cellA`'s
     // hash sorts before `cellB`'s, so the CB pair comes out cb_a then cb_b. For
     // `LibraryLookup`'s fixed-seed name hasher, `name_zzz`'s hash sorts before
-    // `name_aaa`'s, so the name pair comes out name_zzz then name_aaa.
-    assert!(
-        first_index(b"cb_a") < first_index(b"cb_b"),
-        "CB tie-break regressed: expected the cellA template (cb_a) to sort before the \
-         cellB template (cb_b) under the frozen cb_hash order",
+    // `name_aaa`'s, so the name pair comes out name_zzz then name_aaa. Within
+    // each template the lower-end (FIRST_SEGMENT) record precedes the upper-end
+    // (LAST_SEGMENT) one.
+    assert_eq!(
+        pair_slice(&[b"cb_a", b"cb_b"]),
+        vec![
+            (b"cb_a".to_vec(), true),
+            (b"cb_a".to_vec(), false),
+            (b"cb_b".to_vec(), true),
+            (b"cb_b".to_vec(), false),
+        ],
+        "CB tie-break regressed: expected both records of the cellA template (cb_a) to \
+         sort before both of the cellB template (cb_b), lower end first, under the frozen \
+         cb_hash order",
     );
-    assert!(
-        first_index(b"name_zzz") < first_index(b"name_aaa"),
-        "read-name tie-break regressed: expected name_zzz to sort before name_aaa under \
-         the frozen name_hash order",
+    assert_eq!(
+        pair_slice(&[b"name_zzz", b"name_aaa"]),
+        vec![
+            (b"name_zzz".to_vec(), true),
+            (b"name_zzz".to_vec(), false),
+            (b"name_aaa".to_vec(), true),
+            (b"name_aaa".to_vec(), false),
+        ],
+        "read-name tie-break regressed: expected both records of name_zzz to sort before \
+         both of name_aaa, lower end first, under the frozen name_hash order",
     );
 
     // The tie-break order must also be run-to-run deterministic (the fixed seeds

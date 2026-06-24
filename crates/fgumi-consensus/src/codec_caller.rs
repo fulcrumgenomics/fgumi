@@ -4299,6 +4299,13 @@ mod tests {
         }
     }
 
+    // NOTE (no fgbio oracle here, by design): the cD/cM/cE and ad/ae/bd/be
+    // saturation behavior is pinned by the helper-clamp tests below plus the
+    // public BAM-tag surface exercised elsewhere; we do NOT add an fgbio
+    // dependency to cross-check serialized tags. fgbio's codec consensus
+    // operates on raw bytes (established in S7-002-bitenc-perf-analysis.md), and
+    // the saturation at u16::MAX is an intentional u16-counter divergence for
+    // pathological families — not a parity bug to validate against fgbio.
     #[test]
     fn test_duplex_depth_error_saturate_to_u16_at_high_counts() {
         let options = CodecConsensusOptions::default();

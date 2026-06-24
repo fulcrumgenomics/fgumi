@@ -1423,7 +1423,11 @@ impl<'a> ChainBuilder<'a> {
                 .pipeline
                 .append_step(SerializeBamRecords::new(self.tuning.per_step_byte_limit), tail);
             self.current_tail = Some(tail);
-            self.chain_tail_kind = ChainTailKind::DecodedRecordBatch;
+            // SerializeBamRecords emits DecompressedBlock (serialized bytes), not
+            // DecodedRecordBatch. Mark the tail honestly as SerializedBytes, matching
+            // every other terminal serialize path (e.g. add_dedup); nothing downstream
+            // of a Terminal stage reads this, but the kind must never lie.
+            self.chain_tail_kind = ChainTailKind::SerializedBytes;
         } else {
             self.current_tail = Some(tail);
             self.chain_tail_kind = ChainTailKind::BamTemplateBatch;
@@ -1447,9 +1451,9 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// For [`StagePosition::Intermediate`], `SerializeBamRecords` is **not**
     /// appended: the chain tail is left as `BamTemplateBatch` so the next stage
-    /// (`add_align` → `GroupByQueryname → AlignAndMergeStep`) can consume the
-    /// correct step's kept output (branch 0) directly. This is the correct→align
-    /// fused path.
+    /// (`add_align` → `AlignAndMergeStep`) can consume the correct step's kept
+    /// output (branch 0) directly; `add_align` skips `GroupByQueryname` on an
+    /// incoming `BamTemplateBatch`. This is the correct→align fused path.
     ///
     /// When `--rejects` is set, branch 1 of the correct step carries pre-framed
     /// `DecompressedBlock` bytes and is wired here directly to its own
