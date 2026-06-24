@@ -188,9 +188,12 @@ UMIs should be single, non-hyphenated UMIs (e.g. if a record has `RX:Z:ACGT-GGCA
 
 ## Original UMI Storage
 
-Records which have their UMIs corrected (i.e. the UMI is not identical to one of the expected
-UMIs but is close enough to be corrected) will by default have their original UMI stored in the
-`OX` tag. This can be disabled with the `--dont-store-original-umis` option.
+Records whose UMI is corrected by one or more base mismatches (i.e. the observed UMI is not
+identical to an expected UMI but is close enough to be corrected) will by default have their
+original UMI stored in the `OX` tag. The `OX` tag is NOT written for a pure reverse-complement
+normalization that introduces no mismatches (the `RX` tag is still rewritten, but the original
+and corrected UMIs are the same sequence). `OX` storage can be disabled with the
+`--dont-store-original-umis` option.
 "#
 )]
 pub struct CorrectUmis {
@@ -293,15 +296,12 @@ impl Default for CorrectOptions {
             metrics: None,
             max_mismatches: 2,
             // Placeholder: `min_distance_diff` is required (no clap
-            // `default_value`) so the macro wraps it in
-            // `Option<usize>` on the Multi side and never reads this
-            // Default value at clap-init time. We use `1` rather than
-            // `0` because `check_umi_distances` computes
-            // `min_distance_diff - 1` — if a future caller ever picks
-            // up `CorrectOptions::default()` via struct-update syntax
-            // and forgets to override, `0` would underflow (wrap on
-            // release, panic on debug). `1` saturates to `0` there,
-            // which is harmless.
+            // `default_value`) so the macro wraps it in `Option<usize>` on
+            // the Multi side and never reads this Default value at clap-init
+            // time. `check_umi_distances` computes `min_distance_diff - 1`
+            // via `saturating_sub(1)`, so `0` no longer underflows; `1` is
+            // merely a conservative placeholder (the CLI `validate` also
+            // rejects an explicit `0`).
             min_distance_diff: 1,
             umis: Vec::new(),
             umi_files: Vec::new(),

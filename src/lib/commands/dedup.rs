@@ -18,7 +18,7 @@
 //! - Remove: Exclude duplicate reads from output
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
 use crate::batch_weight::BatchWeight;
@@ -985,7 +985,7 @@ impl Command for MarkDuplicates {
 // Metrics writing
 //////////////////////////////////////////////////////////////////////////////
 
-pub(crate) fn write_dedup_metrics(metrics: &DedupMetrics, path: &PathBuf) -> Result<()> {
+pub(crate) fn write_dedup_metrics(metrics: &DedupMetrics, path: &Path) -> Result<()> {
     let output: DedupMetricsOutput = metrics.into();
     DelimFile::default()
         .write_tsv(path, [output])
@@ -995,7 +995,7 @@ pub(crate) fn write_dedup_metrics(metrics: &DedupMetrics, path: &PathBuf) -> Res
 
 pub(crate) fn write_family_size_histogram(
     family_sizes: &AHashMap<usize, u64>,
-    path: &PathBuf,
+    path: &Path,
 ) -> Result<()> {
     let metrics = FamilySizeMetrics::from_size_counts(family_sizes.iter().map(|(&s, &c)| (s, c)));
     DelimFile::default()

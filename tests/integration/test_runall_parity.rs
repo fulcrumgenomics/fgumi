@@ -41,11 +41,12 @@ use std::path::{Path, PathBuf};
 
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
+use rstest::rstest;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{
-    create_minimal_header, create_paired_umi_family, create_paired_umi_family_at,
-    create_umi_family, to_record_buf,
+    create_both_unmapped_pair, create_minimal_header, create_paired_umi_family,
+    create_paired_umi_family_at, create_umi_family, to_record_buf,
 };
 use crate::helpers::cli_runner::{
     ParityArgs, Stage, fgumi, fgumi_binary, run_runall, run_runall_consensus_to_filter,
@@ -184,6 +185,53 @@ fn grouped_duplex_fixture(dir: &Path) -> PathBuf {
         String::from_utf8_lossy(&output.stderr)
     );
     grouped
+}
+
+/// Template-coordinate-sorted duplex fixture that ALSO contains one
+/// both-unmapped read pair (a valid paired UMI, both mates `UNMAPPED`).
+///
+/// Built so the both-unmapped pair survives `group --allow-unmapped` but is
+/// then dropped by the duplex `record_filter` on the non-fused path. Used by
+/// [`new_002_group_to_duplex_allow_unmapped_parity`] to pin that the fused
+/// group→duplex bridge applies the same filter (NEW-002).
+fn sorted_duplex_with_unmapped_fixture(dir: &Path) -> PathBuf {
+    let unsorted = dir.join("unsorted_duplex_with_unmapped.bam");
+    let header = create_minimal_header("chr1", 10000);
+    let mut writer = bam::io::Writer::new(fs::File::create(&unsorted).expect("create fixture BAM"));
+    writer.write_header(&header).expect("write fixture header");
+
+    // The standard 4 fully-mapped paired-UMI families.
+    let families = [
+        ("AAAA-CCCC", "fam_a", "ACGTACGT", "TTTTAAAA"),
+        ("GGGG-TTTT", "fam_b", "TGCATGCA", "CCCCGGGG"),
+        ("CCAA-TTGG", "fam_c", "CCAATTGG", "GGTTAACC"),
+        ("ATCG-GCTA", "fam_d", "GGTTAACC", "CCAATTGG"),
+    ];
+    let mut all_records = Vec::new();
+    for (umi, name, r1_seq, r2_seq) in families {
+        for r in create_paired_umi_family(umi, 4, name, r1_seq, r2_seq, 30) {
+            all_records.push(r);
+        }
+    }
+    // One both-unmapped pair with its own paired UMI.
+    for r in create_both_unmapped_pair("TTAA-GGCC", "fam_unmapped", "ACGTACGT", "TTTTAAAA", 30) {
+        all_records.push(r);
+    }
+    all_records.reverse();
+    for raw in &all_records {
+        writer.write_alignment_record(&header, &to_record_buf(raw)).expect("write fixture record");
+    }
+    writer.try_finish().expect("finish fixture BAM");
+
+    let sorted = dir.join("sorted_duplex_with_unmapped.bam");
+    let args = ParityArgs::for_duplex();
+    let output = run_standalone(Stage::Sort, &unsorted, &sorted, &args);
+    assert!(
+        output.status.success(),
+        "sorted_duplex_with_unmapped_fixture: sort failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    sorted
 }
 
 fn unsorted_codec_fixture(dir: &Path) -> PathBuf {
@@ -518,6 +566,111 @@ fn parity_b_group_to_duplex() {
     assert_bams_record_equivalent(&runall_out, &staged_out);
 }
 
+/// NEW-002: under `--group::allow-unmapped`, a both-unmapped read pair survives
+/// `group` but must be dropped by the duplex `record_filter` on BOTH the fused
+/// `runall group→duplex` path and the staged `fgumi group | fgumi duplex` path.
+///
+/// Before the fix the fused `templates_to_mi_step` bridge did not apply the
+/// duplex filter, so the both-unmapped pair leaked into the consensus caller on
+/// the fused path only — diverging from the staged path. This test fails on the
+/// unfixed bridge and passes once the bridge re-applies `duplex_record_filter`.
+#[test]
+fn new_002_group_to_duplex_allow_unmapped_parity() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = sorted_duplex_with_unmapped_fixture(tmp.path());
+    let runall_out = tmp.path().join("runall.bam");
+    let group_bam = tmp.path().join("staged_group.bam");
+    let staged_out = tmp.path().join("staged.bam");
+    let args = ParityArgs::for_duplex();
+
+    // Fused: runall group→duplex with allow-unmapped on the group stage.
+    let fused_args: Vec<OsString> = vec![
+        "runall".into(),
+        "--start-from".into(),
+        Stage::Group.runall_stage_value().into(),
+        "--stop-after".into(),
+        Stage::Duplex.runall_stage_value().into(),
+        "--consensus".into(),
+        "duplex".into(),
+        "--input".into(),
+        fixture.as_os_str().to_owned(),
+        "--output".into(),
+        runall_out.as_os_str().to_owned(),
+        "--group::strategy".into(),
+        args.strategy.into(),
+        "--group::edits".into(),
+        args.edits.to_string().into(),
+        "--group::allow-unmapped".into(),
+        "true".into(),
+        "--duplex::min-reads".into(),
+        args.min_reads.into(),
+        "--threads".into(),
+        args.threads.to_string().into(),
+    ];
+    let r = fgumi(&fused_args);
+    assert!(r.status.success(), "fused runall: {}", String::from_utf8_lossy(&r.stderr));
+
+    // Staged: standalone group --allow-unmapped, then standalone duplex.
+    let group_args: Vec<OsString> = vec![
+        "group".into(),
+        "--input".into(),
+        fixture.as_os_str().to_owned(),
+        "--output".into(),
+        group_bam.as_os_str().to_owned(),
+        "--strategy".into(),
+        args.strategy.into(),
+        "--edits".into(),
+        args.edits.to_string().into(),
+        "--allow-unmapped".into(),
+        "--threads".into(),
+        args.threads.to_string().into(),
+    ];
+    let r = fgumi(&group_args);
+    assert!(r.status.success(), "staged group: {}", String::from_utf8_lossy(&r.stderr));
+
+    let duplex_args: Vec<OsString> = vec![
+        "duplex".into(),
+        "--input".into(),
+        group_bam.as_os_str().to_owned(),
+        "--output".into(),
+        staged_out.as_os_str().to_owned(),
+        "--min-reads".into(),
+        args.min_reads.into(),
+        "--threads".into(),
+        args.threads.to_string().into(),
+    ];
+    let r = fgumi(&duplex_args);
+    assert!(r.status.success(), "staged duplex: {}", String::from_utf8_lossy(&r.stderr));
+
+    assert_bams_record_equivalent(&runall_out, &staged_out);
+
+    // Negative oracle: path-equivalence alone would still pass if BOTH paths
+    // wrongly emitted output derived from the both-unmapped family. The contract
+    // is that the duplex filter DROPS `fam_unmapped` before consensus, so no
+    // output consensus read may carry its UMI. The four mapped families use
+    // distinct UMIs (AAAA-CCCC / GGGG-TTTT / CCAA-TTGG / ATCG-GCTA), so the
+    // `fam_unmapped` UMI (TTAA-GGCC) appearing in any output `RX` would mean it
+    // leaked into consensus. Assert it is absent from both paths' output.
+    let rx_tag = noodles::sam::alignment::record::data::field::Tag::from(SamTag::RX);
+    for (label, path) in [("runall", &runall_out), ("staged", &staged_out)] {
+        let mut reader = noodles::bam::io::Reader::new(std::fs::File::open(path).unwrap());
+        let header = reader.read_header().unwrap();
+        for result in reader.record_bufs(&header) {
+            let rec = result.expect("read output record");
+            if let Some(noodles::sam::alignment::record_buf::data::field::Value::String(rx)) =
+                rec.data().get(&rx_tag)
+            {
+                let rx_bytes: &[u8] = rx.as_ref();
+                assert_ne!(
+                    rx_bytes, b"TTAA-GGCC",
+                    "{label} output has a consensus read with the both-unmapped family's UMI — \
+                     fam_unmapped was not dropped by the duplex filter",
+                );
+            }
+        }
+    }
+}
+
 /// `Group → Codec` parity vs staged `fgumi group | fgumi codec`.
 /// Uses the codec fixture family; see [`parity_b_sort_to_codec`] for
 /// the rationale.
@@ -783,6 +936,92 @@ fn rejects_reverse_order_consensus_to_consensus() {
 #[test]
 fn rejects_backwards_group_to_sort() {
     assert_runall_rejects(Stage::Group, Stage::Sort, "--start-from");
+}
+
+/// S5c2-003: runall `--group::*` flag combos that standalone `fgumi group`
+/// rejects must also be rejected on the fused path. Runs `runall
+/// --start-from group --stop-after group` with the bad combo and asserts the
+/// same error message standalone produces.
+fn assert_runall_group_combo_rejects(extra_group_flags: &[&str], expected_fragment: &str) {
+    let tmp = TempDir::new().unwrap();
+    let fixture = sorted_duplex_fixture(tmp.path());
+    let out = tmp.path().join("out.bam");
+    let mut args: Vec<OsString> = vec![
+        "runall".into(),
+        "--start-from".into(),
+        Stage::Group.runall_stage_value().into(),
+        "--stop-after".into(),
+        Stage::Group.runall_stage_value().into(),
+        "--input".into(),
+        fixture.as_os_str().to_owned(),
+        "--output".into(),
+        out.as_os_str().to_owned(),
+        "--threads".into(),
+        "1".into(),
+    ];
+    for f in extra_group_flags {
+        args.push((*f).into());
+    }
+    let output = fgumi(&args);
+    assert!(
+        !output.status.success(),
+        "expected runall group combo {extra_group_flags:?} to FAIL but it succeeded; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(expected_fragment),
+        "runall stderr did not contain {expected_fragment:?}; got: {stderr}"
+    );
+
+    // Independent oracle: run standalone `fgumi group` with the same flags
+    // (de-prefixed from `--group::*`). Standalone must reject the combo with the
+    // same message, so this pins runall↔standalone validation parity rather than
+    // trusting a hard-coded fragment that would silently drift if standalone's
+    // wording or behavior changed.
+    let standalone_out = tmp.path().join("standalone.bam");
+    let mut group_args: Vec<OsString> = vec![
+        "group".into(),
+        "--input".into(),
+        fixture.as_os_str().to_owned(),
+        "--output".into(),
+        standalone_out.as_os_str().to_owned(),
+        "--threads".into(),
+        "1".into(),
+    ];
+    for f in extra_group_flags {
+        group_args.push(
+            f.strip_prefix("--group::")
+                .map_or_else(|| (*f).into(), |bare| format!("--{bare}").into()),
+        );
+    }
+    let standalone = fgumi(&group_args);
+    assert!(
+        !standalone.status.success(),
+        "expected standalone group {extra_group_flags:?} to FAIL but it succeeded; stderr={}",
+        String::from_utf8_lossy(&standalone.stderr)
+    );
+    let standalone_stderr = String::from_utf8_lossy(&standalone.stderr);
+    assert!(
+        standalone_stderr.contains(expected_fragment),
+        "standalone group stderr did not contain {expected_fragment:?}; got: {standalone_stderr}"
+    );
+}
+
+#[rstest]
+#[case(
+    &["--group::strategy", "paired", "--group::min-umi-length", "4"],
+    "Paired strategy cannot be used with --min-umi-length"
+)]
+#[case(
+    &["--group::strategy", "paired", "--group::no-umi", "true"],
+    "--no-umi cannot be used with --strategy paired"
+)]
+fn rejects_invalid_group_combo(
+    #[case] extra_group_flags: &[&str],
+    #[case] expected_fragment: &str,
+) {
+    assert_runall_group_combo_rejects(extra_group_flags, expected_fragment);
 }
 
 // ────────────────────────── Zipper fixture + tests ──────────────────────────

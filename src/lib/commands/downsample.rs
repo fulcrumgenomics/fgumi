@@ -21,7 +21,7 @@ use rand::rngs::StdRng;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::commands::command::Command;
 use crate::commands::common::{BamIoOptions, CompressionOptions, parse_bool};
@@ -91,8 +91,14 @@ pub struct Downsample {
 
 impl Command for Downsample {
     fn execute(&self, command_line: &str) -> Result<()> {
-        // Validate inputs
-        validate_file_exists(&self.io.input, "Input BAM")?;
+        // Validate inputs. Skip the existence check for stdin (`-` /
+        // `/dev/stdin`), mirroring the sibling streaming commands
+        // (correct/group/duplex/codec); otherwise a `... | fgumi downsample
+        // -i -` invocation would fail with a spurious "file not found"
+        // (S5c2-002).
+        if !fgumi_bam_io::is_stdin_path(&self.io.input) {
+            validate_file_exists(&self.io.input, "Input BAM")?;
+        }
 
         // Validate fraction
         if self.fraction <= 0.0 || self.fraction > 1.0 {
@@ -252,7 +258,7 @@ impl Command for Downsample {
 }
 
 /// Write family size histogram in fgbio-compatible TSV format.
-fn write_histogram(histogram: &BTreeMap<usize, u64>, path: &PathBuf) -> Result<()> {
+fn write_histogram(histogram: &BTreeMap<usize, u64>, path: &Path) -> Result<()> {
     let mut file = File::create(path)?;
     writeln!(file, "family_size\tcount")?;
     for (size, count) in histogram {
@@ -545,8 +551,7 @@ mod tests {
         hist.insert(5, 5);
 
         let temp_file = NamedTempFile::new().expect("failed to create temp file");
-        write_histogram(&hist, &temp_file.path().to_path_buf())
-            .expect("write_histogram should succeed");
+        write_histogram(&hist, temp_file.path()).expect("write_histogram should succeed");
 
         let contents =
             std::fs::read_to_string(temp_file.path()).expect("failed to read histogram file");

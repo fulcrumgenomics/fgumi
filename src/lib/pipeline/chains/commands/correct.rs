@@ -21,7 +21,6 @@
 //! in [`ChainBuilder`]; `add_correct` always receives a
 //! `BamTemplateBatch`-typed tail (after `GroupByQueryname`).
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -52,8 +51,6 @@ pub(crate) struct CorrectFinalizeHook {
     pub(crate) records_emitted: Arc<AtomicU64>,
     pub(crate) encoded_umi_set: Arc<EncodedUmiSet>,
     pub(crate) unmatched_umi: String,
-    /// Path for the optional UMI-metrics TSV output.
-    pub(crate) metrics_path: Option<PathBuf>,
     /// `--min-corrected` gate value (if set).
     pub(crate) min_corrected: Option<f64>,
     /// Used by `finalize_metrics` to compute and write the metrics TSV.
@@ -68,7 +65,6 @@ impl FinalizeHook for CorrectFinalizeHook {
             records_emitted,
             encoded_umi_set,
             unmatched_umi,
-            metrics_path: _metrics_path,
             min_corrected,
             correct,
             timer,

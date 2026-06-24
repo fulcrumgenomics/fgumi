@@ -622,7 +622,9 @@ impl Filter {
 impl FilterOptions {
     /// Validates that parameter vectors have 1-3 values and are in valid ranges
     ///
-    /// Also validates stringency ordering requirements from Scala (lines 161-167):
+    /// Also validates the duplex stringency-ordering invariant: when a vector
+    /// supplies separate AB/BA/CC values, the more-stringent value must come
+    /// first.
     /// - For min-reads: ba <= ab <= cc (more reads required = more stringent)
     /// - For error rates: ab <= ba (lower error allowed = more stringent)
     pub(crate) fn validate_parameters(&self) -> Result<()> {
@@ -670,7 +672,8 @@ impl FilterOptions {
             );
         }
 
-        // Validate stringency ordering for duplex parameters (following Scala lines 161-167)
+        // Validate stringency ordering for duplex parameters: the more-stringent
+        // value must come first in each AB/BA/CC vector.
         if self.min_reads.len() >= 2 {
             // ab_min_reads <= cc_min_reads (more reads = more stringent)
             let cc_min = self.min_reads[0];

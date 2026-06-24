@@ -124,31 +124,31 @@ enum Subcommand {
     #[command(display_order = 11)]
     Codec(Codec),
     #[cfg(feature = "consensus")]
-    #[command(display_order = 11)]
+    #[command(display_order = 12)]
     Runall(RunAll),
 
     // Post-consensus
-    #[command(display_order = 12)]
-    Filter(Filter),
     #[command(display_order = 13)]
+    Filter(Filter),
+    #[command(display_order = 14)]
     Clip(Clip),
     #[cfg(feature = "consensus")]
-    #[command(display_order = 14)]
+    #[command(display_order = 15)]
     DuplexMetrics(DuplexMetrics),
     #[cfg(feature = "consensus")]
-    #[command(display_order = 15)]
-    SimplexMetrics(SimplexMetrics),
     #[command(display_order = 16)]
+    SimplexMetrics(SimplexMetrics),
+    #[command(display_order = 17)]
     Review(Review),
 
     // Utilities
-    #[command(display_order = 17)]
+    #[command(display_order = 18)]
     Downsample(Downsample),
     #[cfg(feature = "compare")]
-    #[command(display_order = 18)]
+    #[command(display_order = 19)]
     Compare(Compare),
     #[cfg(feature = "simulate")]
-    #[command(display_order = 19)]
+    #[command(display_order = 20)]
     Simulate(Simulate),
 }
 

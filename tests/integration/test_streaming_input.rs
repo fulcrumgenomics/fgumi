@@ -15,6 +15,7 @@ use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, create_umi_family, to_record_buf};
+use crate::helpers::parity::assert_bams_record_equivalent;
 
 /// Test that the group command works correctly with piped input.
 #[test]
@@ -121,6 +122,78 @@ fn test_group_command_with_dev_stdin_path() {
 
     assert!(status.success(), "Group command with /dev/stdin failed");
     assert!(output_bam.exists(), "Output BAM not created");
+}
+
+/// S5c2-002: the downsample command must accept stdin input (`-`) instead of
+/// failing the up-front existence check with a spurious "file not found".
+/// Downsample requires template-coordinate-sorted input, so we first sort the
+/// fixture, then pipe the sorted BAM into `fgumi downsample -i -`.
+#[test]
+fn test_downsample_command_with_piped_input() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let sorted_bam = temp_dir.path().join("sorted.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    // Downsample requires grouped (MI-tagged) reads sorted by template
+    // coordinate.
+    create_grouped_test_bam(&input_bam);
+
+    // Produce a template-coordinate-sorted BAM (downsample's required input).
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "sort",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            sorted_bam.to_str().unwrap(),
+            "--order",
+            "template-coordinate",
+            "--threads",
+            "1",
+        ])
+        .status()
+        .expect("Failed to run sort");
+    assert!(status.success(), "sort failed");
+
+    // Pipe the sorted BAM into downsample via stdin.
+    let cat_child = Command::new("cat")
+        .arg(sorted_bam.to_str().unwrap())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn cat");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "downsample",
+            "--input",
+            "-", // stdin
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--fraction",
+            "1.0",
+            "--seed",
+            "42",
+            "--compression-level",
+            "1",
+        ])
+        .stdin(cat_child.stdout.unwrap())
+        .output()
+        .expect("Failed to run downsample with piped input");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("not found") && !stderr.contains("Input BAM"),
+        "downsample stdin failed the existence check; stderr: {stderr}"
+    );
+    assert!(output.status.success(), "downsample with piped input failed; stderr: {stderr}");
+    assert!(output_bam.exists(), "Output BAM from pipe not created");
+
+    // `--fraction 1.0` is an identity transform, so the piped output must hold
+    // the same records, in the same order, as the input sorted BAM. A header-
+    // only or truncated BAM (which the success + existence checks above would
+    // still accept) fails here — this validates stdin *correctness*, not just
+    // that the upfront existence check was skipped for `-`.
+    assert_bams_record_equivalent(&sorted_bam, &output_bam);
 }
 
 /// Test simplex command with piped input.

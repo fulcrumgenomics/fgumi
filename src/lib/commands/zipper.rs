@@ -52,7 +52,7 @@ use crate::reference::ReferenceReader;
 use crate::sam::{SamTag, TemplateCoordinateInfo};
 use crate::template::Template;
 use crate::umi::TagInfo;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bstr::ByteSlice;
 use clap::{Args, Parser};
 use fgumi_cli_macros::multi_options;
@@ -143,11 +143,11 @@ pub struct ZipperOptions {
     #[arg(long = "exclude-missing-reads", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub exclude_missing_reads: bool,
 
-    /// Skip adding `pa` (primary alignment) tags to secondary/supplementary reads.
-    /// By default, zipper adds a `pa` tag containing the primary alignment's template
+    /// Skip adding `TC` (template-coordinate) tags to secondary/supplementary reads.
+    /// By default, zipper adds a `TC` tag containing the primary alignment's template
     /// sort key coordinates, which enables correct template-coordinate sorting and
     /// deduplication of these reads. Use this flag if you don't need this functionality.
-    #[arg(long = "skip-pa-tags", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "skip-tc-tags", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub skip_tc_tags: bool,
 
     /// Restore unconverted bases in EM-seq consensus reads after bwameth re-alignment.
@@ -883,6 +883,26 @@ impl Command for Zipper {
         // (see the field doc). Nudge users who explicitly set a non-default
         // value so they know it has no effect.
         warn_if_bwa_chunk_size_overridden(self.options.bwa_chunk_size);
+
+        // Existence-check the required real inputs up front so a missing file
+        // surfaces as a clear "not found" message rather than a lower-level
+        // open error from inside the chain builder (S5c2-004). `--input`
+        // (mapped) defaults to stdin, so exempt it; `--unmapped` and `--ref`
+        // are always real files, and the reference additionally needs a
+        // `.dict` sidecar.
+        use crate::validation::validate_file_exists;
+        if !fgumi_bam_io::is_stdin_path(&self.input) {
+            validate_file_exists(&self.input, "Mapped BAM (--input)")?;
+        }
+        validate_file_exists(&self.unmapped, "Unmapped BAM (--unmapped)")?;
+        validate_file_exists(&self.reference, "Reference FASTA (--ref)")?;
+        if crate::reference::find_dict_path(&self.reference).is_none() {
+            bail!(
+                "Reference FASTA {:?} has no sequence dictionary (`.dict`); \
+                 zipper needs it to build the output BAM header",
+                self.reference.display().to_string()
+            );
+        }
 
         let spec = ChainSpec {
             async_reader: false,
@@ -3751,13 +3771,13 @@ mod tests {
     }
 
     #[rstest]
-    // --skip-pa-tags (default false)
+    // --skip-tc-tags (default false)
     #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam"], false)]
-    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags"], true)]
-    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags", "true"], true)]
-    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags", "false"], false)]
-    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags=true"], true)]
-    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags=false"], false)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-tc-tags"], true)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-tc-tags", "true"], true)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-tc-tags", "false"], false)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-tc-tags=true"], true)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-tc-tags=false"], false)]
     fn test_skip_tc_tags_parsing(#[case] args: &[&str], #[case] expected: bool) {
         let cmd = Zipper::try_parse_from(args).expect("failed to parse Zipper arguments");
         assert_eq!(cmd.options.skip_tc_tags, expected);
