@@ -12,6 +12,7 @@ use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
+use noodles::sam::alignment::record_buf::RecordBuf;
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
@@ -244,6 +245,117 @@ fn test_duplex_command_with_rejects() {
     assert_eq!(
         reject_count, 2,
         "Singleton paired-end /A template should be streamed to rejects BAM (R1 + R2)"
+    );
+}
+
+/// Regression test for X5-001 at the duplex `--rejects` fan-out site (see the
+/// simplex/correct siblings for the full rationale): a fully-clean batch must
+/// emit an empty rejects block so the rejects branch's `ByItemOrdinal` serial
+/// sequence stays dense, instead of leaving a gap that wedges `try_pop_in_order`
+/// forever.
+///
+/// Many clean duplex molecules — each its own MI group (2 /A + 2 /B pairs,
+/// passing `--min-reads 2`) — together exceed the 4 MiB `per_step_byte_limit`
+/// (1000 molecules × 8 reads × 600 bp), so the batcher flushes all-clean
+/// leading batches before the reject's batch; a singleton /A pair that fails
+/// `--min-reads 2` provides the later reject. A *single* giant molecule would
+/// be one MI group the batcher co-locates with the reject, so no reject-free
+/// batch would ever form — see the construction comment in the body.
+#[test]
+fn test_duplex_command_rejects_all_clean_batch_does_not_wedge() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+
+    let long_seq: String = "ACGT".repeat(150); // 600 bp
+    // MANY clean molecules — each its own MI group (2 /A + 2 /B pairs, passing
+    // --min-reads 2). A single giant molecule is ONE MI group the byte-budget
+    // batcher co-locates with the reject, so no reject-free batch ever forms
+    // (the all-clean-batch X5-001 trigger). Many molecules let the batcher flush
+    // all-clean leading batches before the reject's batch. 1000 molecules × 8
+    // reads × 600 bp clears the 4 MiB `per_step_byte_limit` several times over.
+    let molecule_count = 1000;
+    let mut molecules: Vec<Vec<(RawRecord, RawRecord)>> = Vec::with_capacity(molecule_count + 1);
+    for m in 0..molecule_count {
+        let mut mol = Vec::with_capacity(4);
+        for i in 0..2 {
+            mol.push(create_duplex_read_pair(
+                &format!("ab_{m}_{i}"),
+                &format!("mi{m:04}/A"),
+                &long_seq,
+                30,
+                100,
+                false,
+            ));
+        }
+        for i in 0..2 {
+            mol.push(create_duplex_read_pair(
+                &format!("ba_{m}_{i}"),
+                &format!("mi{m:04}/B"),
+                &long_seq,
+                30,
+                100,
+                true,
+            ));
+        }
+        molecules.push(mol);
+    }
+    // Singleton /A pair rejected by --min-reads 2, written last so it lands in
+    // the final batch — after at least one all-clean leading batch.
+    molecules.push(vec![create_duplex_read_pair(
+        "solo",
+        "zzz_reject/A",
+        &long_seq,
+        30,
+        500,
+        false,
+    )]);
+    create_duplex_bam(&input_bam, molecules);
+
+    let cmd = Duplex::try_parse_from([
+        "duplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--min-reads",
+        "2",
+        "--threads",
+        "4",
+        // Short deadlock window so a regression is failed in ~18s (3s × the 6×
+        // fatal multiplier) instead of the ~60s default; the fixed path
+        // finishes well under a second.
+        "--deadlock-timeout",
+        "3",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse duplex args");
+    // Pre-fix this wedges on the rejects sink; post-fix it returns.
+    cmd.execute("fgumi duplex")
+        .expect("duplex --rejects must complete even with an all-clean leading batch");
+
+    assert!(rejects_bam.exists(), "Rejects BAM not created");
+    crate::helpers::assertions::assert_has_bgzf_eof(&rejects_bam);
+
+    // The singleton /A template's two source reads (R1 + R2) must reach
+    // --rejects byte-identical to their input records (passed through
+    // unchanged). Comparing full `RecordBuf` identity against the input BAM
+    // catches sequence/quality/tag mutation AND distinguishes R1 from R2 via
+    // the segment flags — strictly stronger than a (name, flags) check.
+    let expected: Vec<RecordBuf> = crate::helpers::assertions::read_record_bufs(&input_bam)
+        .into_iter()
+        .filter(|r| r.name().is_some_and(|n| n == "solo"))
+        .collect();
+    assert_eq!(expected.len(), 2, "fixture sanity: the singleton /A pair is two records");
+
+    let observed = crate::helpers::assertions::read_record_bufs(&rejects_bam);
+    assert_eq!(
+        observed, expected,
+        "the singleton /A pair must reach --rejects byte-identical to its input records"
     );
 }
 

@@ -1454,8 +1454,26 @@ impl CodecConsensusCaller {
         &mut self,
         records: Vec<RawRecord>,
     ) -> std::result::Result<ConsensusOutput, CodecConsensusError> {
-        let result = self.consensus_reads_raw(&records)?;
-        // When a group fails to produce consensus, all its records are rejected
+        let result = match self.consensus_reads_raw(&records) {
+            Ok(r) => r,
+            // A recoverable high-duplex-disagreement reject. fgbio routes the
+            // source records to `--rejects` (RejectionReason.HighDuplexDisagreement)
+            // and bumps `consensusReadsFilteredHighDisagreement`. Mirror both here
+            // before propagating the typed Err: previously the `?` unwound before
+            // the reject-capture block below, so disagreeing reads were silently
+            // dropped from BOTH --output and --rejects, and the HDD counter never
+            // incremented (S9b-006).
+            Err(e) if e.is_duplex_disagreement() => {
+                self.stats.consensus_reads_rejected_hdd += 1;
+                if self.track_rejects {
+                    self.rejected_reads.extend(records.into_iter().map(RawRecord::into_inner));
+                }
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
+        // When a group fails to produce consensus (without erroring), all its
+        // records are rejected.
         if self.track_rejects && result.count == 0 && !records.is_empty() {
             self.rejected_reads.extend(records.into_iter().map(RawRecord::into_inner));
         }
@@ -2718,6 +2736,14 @@ mod tests {
             "expected DuplexDisagreementCount, got: {err:?}"
         );
         assert!(err.is_duplex_disagreement());
+        // The disagreement arm bumps the high-duplex-disagreement counter
+        // (fgbio's `consensusReadsFilteredHighDisagreement`) exactly once for
+        // the single disagreeing molecule (S9b-006).
+        assert_eq!(
+            caller.statistics().consensus_reads_rejected_hdd,
+            1,
+            "one HDD rejection should be counted for the disagreeing molecule"
+        );
     }
 
     /// Verifies that `consensus_reads_typed` returns the typed

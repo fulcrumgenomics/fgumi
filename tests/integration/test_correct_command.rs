@@ -11,6 +11,7 @@ use fgumi_lib::commands::correct::CorrectUmis;
 use fgumi_raw_bam::RawRecord;
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
+use noodles::sam::alignment::record_buf::RecordBuf;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -245,6 +246,111 @@ fn test_correct_command_rejects_streaming_threaded_integrity() {
     let observed_names: std::collections::HashSet<String> =
         observed_order.iter().cloned().collect();
     assert_eq!(observed_names, expected_names, "unexpected reject-name set");
+}
+
+/// Regression test for X5-001: a fully-clean batch must not wedge the rejects
+/// branch. The rejects fan-out's branch B uses a `ByItemOrdinal` reorder stage,
+/// so every batch serial must produce a branch-B item. A batch with zero
+/// rejects previously pushed nothing (`Process2Output::only_a`), leaving a
+/// permanent gap in the serial sequence that stalls `try_pop_in_order` forever
+/// — any `--rejects` run with at least one all-clean batch hangs (the deadlock
+/// monitor eventually fails it). The fix emits an empty (zero-byte) rejects
+/// block for clean batches so serials stay dense.
+///
+/// Construction: the correct step's input is batched by a byte budget
+/// (`per_step_byte_limit`, 4 MiB), not a fixed template count, so the clean
+/// prefix must exceed that budget to guarantee the first emitted batch(es) are
+/// entirely correctable (zero rejects → the gap-triggering batches). 8000
+/// correctable records with 600 bp sequences clear 4 MiB several times over,
+/// followed by uncorrectable records whose rejects land in a later batch. The
+/// existing streaming-integrity test above fits all its records in a single
+/// byte-bounded batch, so it never exercises the all-clean-batch gap.
+#[test]
+fn test_correct_command_rejects_all_clean_batch_does_not_wedge() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+    let whitelist = temp_dir.path().join("whitelist.txt");
+
+    // The pipeline batches the correct step's input by a byte budget
+    // (`per_step_byte_limit`, 4 MiB), not a fixed template count, so the clean
+    // prefix must exceed that budget to guarantee the first emitted batch is
+    // entirely correctable (zero rejects). Use long sequences so a few thousand
+    // records clear 4 MiB. Each record is its own template (unique QNAME via
+    // create_umi_family's "{base}_{i}").
+    let long_seq: String = "ACGT".repeat(150); // 600 bp
+    let clean_prefix_size: usize = 8000;
+    let reject_size: u32 = 200;
+    let clean = create_umi_family("ACGTACGT", clean_prefix_size, "clean", &long_seq, 30);
+    // UMI far from the whitelist → uncorrectable → rejected, landing in a batch
+    // after the all-clean leading batch.
+    let rej = create_umi_family("TTTTTTTT", reject_size as usize, "rej", &long_seq, 30);
+
+    let expected_order: Vec<String> = (0..reject_size).map(|i| format!("rej_{i}")).collect();
+    // Keep the generated reject inputs (converted the same way `create_umi_bam`
+    // writes them) so we can assert the rejects BAM preserves each record's full
+    // identity — sequence, flags, tags — not just its QNAME. A names-only check
+    // would miss mutation of a rejected record.
+    let expected_records: Vec<RecordBuf> = rej.iter().map(to_record_buf).collect();
+
+    create_umi_bam(&input_bam, vec![clean, rej]);
+    create_whitelist(&whitelist, &["ACGTACGT"]);
+
+    let cmd = CorrectUmis::try_parse_from([
+        "correct",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--umi-files",
+        whitelist.to_str().unwrap(),
+        "--max-mismatches",
+        "1",
+        "--min-distance",
+        "1",
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--threads",
+        "4",
+        // Shorten the deadlock-monitor window so that, if the fix regresses,
+        // the wedge is reported as a failure in ~18s (3s × the 6× fatal
+        // multiplier) rather than the ~60s default. The fixed path completes in
+        // well under a second, so this never fires in the passing case.
+        "--deadlock-timeout",
+        "3",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse correct args");
+    // Pre-fix this call wedges on the rejects sink (the run never completes;
+    // the deadlock monitor fails it after its timeout). Post-fix it returns.
+    cmd.execute("fgumi correct")
+        .expect("correct --rejects must complete even with an all-clean leading batch");
+
+    assert!(rejects_bam.exists(), "Rejects BAM not created");
+    crate::helpers::assertions::assert_has_bgzf_eof(&rejects_bam);
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&rejects_bam).unwrap());
+    let header = reader.read_header().unwrap();
+    let observed_records: Vec<RecordBuf> =
+        reader.record_bufs(&header).map(|r| r.expect("read reject record")).collect();
+
+    // Names in input order — a clear message on drop/dupe/reorder.
+    let observed_order: Vec<String> = observed_records
+        .iter()
+        .map(|r| r.name().expect("reject record missing read name").to_string())
+        .collect();
+    assert_eq!(
+        observed_order, expected_order,
+        "exactly the uncorrectable records, in input order, must reach --rejects"
+    );
+    // Full record identity — catches mutation of a rejected read's sequence,
+    // flags, or tags that a names-only check would let through.
+    assert_eq!(
+        observed_records, expected_records,
+        "rejected records must be byte-identical to the uncorrectable inputs"
+    );
 }
 
 /// Smoke check — `fgumi correct` runs to completion via the typed-step

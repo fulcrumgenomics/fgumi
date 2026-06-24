@@ -106,9 +106,16 @@ pub(crate) fn correct_step_with_rejects(
                      batch: BamTemplateBatch|
           -> io::Result<Process2Output<BamTemplateBatch, DecompressedBlock>> {
         let (kept, rejects_opt) = run_batch_with_rejects(state, &cfg_run, batch)?;
-        match rejects_opt {
-            Some(rejects) => Ok(Process2Output::both(kept, rejects)),
-            None => Ok(Process2Output::only_a(kept)),
+        if let Some(rejects) = rejects_opt {
+            Ok(Process2Output::both(kept, rejects))
+        } else {
+            // X5-001: an all-clean batch must still emit a (zero-byte) rejects
+            // block so the rejects branch's `ByItemOrdinal` reorder stage sees a
+            // dense serial sequence; pushing nothing (`only_a`) leaves a gap at
+            // this serial that wedges the rejects sink. The empty `Vec` does not
+            // allocate and produces no physical BGZF block.
+            let batch_serial = kept.batch_serial;
+            Ok(Process2Output::both(kept, DecompressedBlock { batch_serial, bytes: Vec::new() }))
         }
     };
 
