@@ -87,8 +87,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::codec::SpillCodec;
 
 /// Per-slot decompressed-block queue cap. Bounds in-flight
-/// decompressed memory: `num_slots × PHASE2_DECOMP_CAP × ~256 KB`.
-/// Matches `worker_pool::PHASE2_DECOMP_CAP` numerically.
+/// decompressed memory: `num_slots × PHASE2_DECOMP_CAP ×` per-entry size,
+/// where each entry is a decompressed BGZF block or zstd frame ranging from
+/// ~64 KB (BGZF) up to 256 KB (zstd worst case). Matches
+/// `worker_pool::PHASE2_DECOMP_CAP` numerically.
 ///
 /// Hard cap — there is no admission escape. Producers skip a slot
 /// when its queue is at this cap, returning to it on a later
@@ -125,11 +127,11 @@ pub struct SortMergeSlot {
     /// Disk reader. Held only while reading raw bytes from disk.
     /// One worker at a time per slot via `try_lock`.
     pub reader: Mutex<SortMergeReader>,
-    /// Bounded queue of decompressed BGZF blocks, FIFO. Pushed by
-    /// the producer (`SortSpillDecompress`) after read + inline
-    /// decompress; popped by the consumer (`SortMerge` via
-    /// `slot_try_load_block`). Bounded at `PHASE2_DECOMP_CAP`;
-    /// producer skips when at cap.
+    /// Bounded queue of decompressed blocks (each a BGZF block or a zstd
+    /// frame, per this slot's `codec`), FIFO. Pushed by the producer
+    /// (`SortSpillDecompress`) after read + inline decompress; popped by the
+    /// consumer (`SortMerge` via `slot_try_load_block`). Bounded at
+    /// `PHASE2_DECOMP_CAP`; producer skips when at cap.
     pub decompressed: Mutex<VecDeque<Vec<u8>>>,
     /// Set true once the producer detects EOF on the disk reader
     /// AND has pushed any final batch of decompressed blocks to

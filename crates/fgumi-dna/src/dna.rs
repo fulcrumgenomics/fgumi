@@ -77,6 +77,13 @@ pub fn reverse_complement(seq: &[u8]) -> Vec<u8> {
 /// let mut s = b"acgt".to_vec();
 /// reverse_complement_in_place(&mut s);
 /// assert_eq!(s, b"ACGT"); // normalized to uppercase, same as reverse_complement
+///
+/// // The cases above are self-reverse-complementary, so they hide the
+/// // complement step. This one makes complementation visible: reverse(AAGG)
+/// // is GGAA, then complementing each base gives CCTT.
+/// let mut s = b"AAGG".to_vec();
+/// reverse_complement_in_place(&mut s);
+/// assert_eq!(s, b"CCTT");
 /// ```
 pub fn reverse_complement_in_place(seq: &mut [u8]) {
     seq.reverse();

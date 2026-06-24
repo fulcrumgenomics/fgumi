@@ -534,10 +534,12 @@ fn decompress_and_verify(
 /// * `LEN == uncompressed_size` — the deflate frame's LEN agrees with the
 ///   BGZF footer's ISIZE field.
 ///
-/// NLEN (one's complement of LEN) is not checked. NLEN doesn't cover the
-/// payload bytes, so a corrupt NLEN with an intact payload would pass the
-/// framing check anyway; the BGZF footer's CRC32 is the authoritative
-/// integrity check on the data itself.
+/// NLEN (one's complement of LEN) is intentionally skipped: the BGZF footer
+/// CRC32 (verified below on the copied bytes) is authoritative over the
+/// payload, so a mismatched NLEN with a CRC-correct payload is accepted, and a
+/// corrupt payload is caught by CRC regardless of NLEN. (This is a deliberate
+/// "trust CRC over deflate framing" choice — NLEN doesn't cover the payload
+/// bytes, so it adds nothing the CRC doesn't already guarantee.)
 ///
 /// CRC32 verification against the BGZF footer is still performed on the
 /// copied bytes (the BGZF spec mandates it, and the bypass is intended to
@@ -668,6 +670,42 @@ mod tests {
         let mut reader = Cursor::new(Vec::<u8>::new());
         let result = read_raw_block(&mut reader).expect("reading raw BGZF block should succeed");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_read_truncated_block_errors() {
+        // Regression guard for the `read_to_end`-based ingest path: a header that
+        // advertises a `block_size` larger than the bytes actually supplied must
+        // surface as a "truncated BGZF block" `UnexpectedEof`, NOT silently
+        // succeed. `read_to_end` returns `Ok` on early EOF, so the manual length
+        // check (and the `.take()` that bounds it) is the sole guard restoring
+        // `read_exact`'s short-block error semantics. Dropping or mis-bounding
+        // that check would regress here.
+
+        // Build a valid 18-byte header that passes magic/method/FEXTRA/BC checks.
+        let mut data = vec![0u8; BGZF_HEADER_SIZE];
+        data[0] = 0x1f; // magic
+        data[1] = 0x8b; // magic
+        data[2] = 0x08; // CM = DEFLATE
+        data[3] = 0x04; // FLG = FEXTRA
+        data[12] = b'B'; // BC subfield id
+        data[13] = b'C';
+        // BSIZE = block_size - 1. Advertise a block of 100 bytes total, i.e. it
+        // claims `100 - 18 = 82` body bytes follow the header.
+        let block_size: usize = 100;
+        let bsize = u16::try_from(block_size - 1).expect("bsize fits u16");
+        data[16..18].copy_from_slice(&bsize.to_le_bytes());
+
+        // Append only a partial body: far fewer than the advertised 82 bytes.
+        data.extend_from_slice(&[0u8; 10]);
+
+        let mut reader = Cursor::new(data);
+        let err = read_raw_block(&mut reader).expect_err("truncated block must error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            err.to_string().contains("truncated BGZF block"),
+            "expected a truncated-block error, got: {err}"
+        );
     }
 
     #[test]

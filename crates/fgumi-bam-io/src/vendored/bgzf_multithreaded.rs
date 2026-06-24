@@ -1,22 +1,32 @@
-//! Multithreaded BGZF writer with position tracking.
+//! Multithreaded BGZF writer with coarse progress counters.
 //!
 //! This module provides [`MultithreadedWriter`], a parallel BGZF compression writer
-//! that maintains block ordering and supports position tracking for building indexes
-//! during concurrent writes.
+//! that maintains block ordering and exposes a few coarse progress counters.
 //!
 //! Some accessors and constructors are only exercised by tests; the
 //! `dead_code` allow at module scope keeps them available for the test harness.
 
 #![allow(dead_code)]
 //!
-//! # Position Tracking
+//! # Progress Counters (not an exact block→offset index)
 //!
-//! The writer provides APIs to track compressed file positions, enabling construction
-//! of BAM indexes (BAI/CSI) without a second pass through the file:
+//! The writer exposes a few coarse counters describing how far compression and
+//! output have progressed:
 //!
-//! - [`current_block_number`](MultithreadedWriter::current_block_number): Block number being filled
-//! - [`buffer_offset`](MultithreadedWriter::buffer_offset): Bytes in current block's staging buffer
-//! - [`block_info_receiver`](MultithreadedWriter::block_info_receiver): Channel for block completion notifications
+//! - [`current_block_number`](MultithreadedWriter::current_block_number): the block index
+//!   currently being filled (incremented when a block is *enqueued* for compression)
+//! - [`buffer_offset`](MultithreadedWriter::buffer_offset): bytes in the current block's staging buffer
+//! - [`position`](MultithreadedWriter::position): total compressed bytes flushed by the writer thread
+//! - [`blocks_written`](MultithreadedWriter::blocks_written): count of blocks flushed by the writer thread
+//!
+//! **These counters are NOT an exact block→compressed-offset map and must not be used
+//! to build BAI/CSI virtual offsets.** `current_block_number` advances at enqueue time
+//! while `position`/`blocks_written` reflect only what the writer thread has already
+//! flushed, so with multiple blocks in flight there is no way to recover the unique
+//! compressed start offset of a given block from these globals. Index construction
+//! that needs exact offsets must obtain them another way (e.g. a real per-block
+//! position API, or a second pass that re-reads the finished BGZF stream — the latter
+//! is what fgumi's BAI generation does).
 
 use std::io::{self, Write};
 use std::mem;
@@ -26,7 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 
 use bytes::{Bytes, BytesMut};
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded};
 
 use bgzf::{BgzfError, CompressionLevel, Compressor};
 
@@ -57,28 +67,6 @@ type BgzfResult<T> = Result<T, BgzfError>;
 // Types
 // ============================================================================
 
-/// Information about a completed BGZF block.
-///
-/// Sent through [`BlockInfoRx`] when a block is written to the output.
-/// Use this to resolve virtual file positions for BAM index construction.
-#[derive(Debug, Clone, Copy)]
-pub struct BlockInfo {
-    /// The block number (0-indexed, assigned when block is sent for compression).
-    pub block_number: u64,
-    /// The compressed file position where this block starts.
-    pub compressed_start: u64,
-    /// The size of the compressed block (including header and footer).
-    pub compressed_size: usize,
-    /// The size of the uncompressed data in this block.
-    pub uncompressed_size: usize,
-}
-
-/// Receiver for [`BlockInfo`] notifications.
-///
-/// Clone this receiver and use `try_recv()` or `recv()` to receive
-/// block completion notifications as they occur.
-pub type BlockInfoRx = Receiver<BlockInfo>;
-
 // Internal channel types
 type FrameParts = (Vec<u8>, u32, usize); // (compressed_data, crc32, uncompressed_size)
 type BufferedTx = Sender<BgzfResult<FrameParts>>;
@@ -87,7 +75,6 @@ type DeflateTx = Sender<(Bytes, BufferedTx)>;
 type DeflateRx = Receiver<(Bytes, BufferedTx)>;
 type WriteTx = Sender<(BufferedRx, u64)>;
 type WriteRx = Receiver<(BufferedRx, u64)>;
-type BlockInfoTx = Sender<BlockInfo>;
 
 // ============================================================================
 // State
@@ -99,7 +86,6 @@ enum State<W> {
         deflater_handles: Vec<JoinHandle<()>>,
         write_tx: WriteTx,
         deflate_tx: DeflateTx,
-        block_info_rx: BlockInfoRx,
     },
     Done,
 }
@@ -116,8 +102,7 @@ enum State<W> {
 ///
 /// # Thread Safety
 ///
-/// The writer itself is not `Send` or `Sync`, but the [`BlockInfoRx`] receiver
-/// can be cloned and used from other threads.
+/// The writer itself is not `Send` or `Sync`.
 pub struct MultithreadedWriter<W>
 where
     W: Write + Send + 'static,
@@ -170,28 +155,16 @@ where
         // Create channels
         let (deflate_tx, deflate_rx) = bounded(worker_count.get());
         let (write_tx, write_rx) = bounded(worker_count.get());
-        let (block_info_tx, block_info_rx) = unbounded();
 
         // Spawn deflater workers
         let deflater_handles = spawn_deflaters(compression_level, worker_count, deflate_rx);
 
         // Spawn writer thread
-        let writer_handle = spawn_writer(
-            inner,
-            write_rx,
-            Arc::clone(&position),
-            Arc::clone(&blocks_written),
-            block_info_tx,
-        );
+        let writer_handle =
+            spawn_writer(inner, write_rx, Arc::clone(&position), Arc::clone(&blocks_written));
 
         Self {
-            state: State::Running {
-                writer_handle,
-                deflater_handles,
-                write_tx,
-                deflate_tx,
-                block_info_rx,
-            },
+            state: State::Running { writer_handle, deflater_handles, write_tx, deflate_tx },
             buf: BytesMut::with_capacity(blocksize),
             blocksize,
             current_block_number: 0,
@@ -200,24 +173,14 @@ where
         }
     }
 
-    // === Position Tracking APIs ===
+    // === Progress Counters (coarse; not an exact block→offset index) ===
 
-    /// Returns the receiver for block completion notifications.
+    /// Returns the index of the block currently being filled.
     ///
-    /// Returns `None` if the writer has already been finished.
-    #[must_use]
-    pub fn block_info_receiver(&self) -> Option<&BlockInfoRx> {
-        match &self.state {
-            State::Running { block_info_rx, .. } => Some(block_info_rx),
-            State::Done => None,
-        }
-    }
-
-    /// Returns the next block number to be assigned.
-    ///
-    /// This is incremented each time a block is sent for compression.
-    /// Use this value when caching index entries to correlate with
-    /// [`BlockInfo::block_number`] in completion notifications.
+    /// This is incremented each time a block is *enqueued* for compression, so it
+    /// runs ahead of the writer thread. It is a block *identifier*, not a position:
+    /// it cannot be combined with [`position`](Self::position) to recover a block's
+    /// exact compressed offset (see the module-level "Progress Counters" note).
     #[inline]
     #[must_use]
     pub fn current_block_number(&self) -> u64 {
@@ -273,13 +236,7 @@ where
         let state = mem::replace(&mut self.state, State::Done);
 
         match state {
-            State::Running {
-                writer_handle,
-                mut deflater_handles,
-                write_tx,
-                deflate_tx,
-                block_info_rx: _,
-            } => {
+            State::Running { writer_handle, mut deflater_handles, write_tx, deflate_tx } => {
                 // Drop channels to signal shutdown
                 drop(deflate_tx);
 
@@ -496,19 +453,17 @@ fn spawn_writer<W>(
     write_rx: WriteRx,
     position: Arc<AtomicU64>,
     blocks_written: Arc<AtomicU64>,
-    block_info_tx: BlockInfoTx,
 ) -> JoinHandle<BgzfResult<W>>
 where
     W: Write + Send + 'static,
 {
     thread::spawn(move || {
-        while let Ok((buffered_rx, block_number)) = write_rx.recv() {
+        while let Ok((buffered_rx, _block_number)) = write_rx.recv() {
             // Wait for compression result
-            let (compressed_data, _crc32, uncompressed_size) = buffered_rx
+            let (compressed_data, _crc32, _uncompressed_size) = buffered_rx
                 .recv()
                 .map_err(|_| BgzfError::Io(io::Error::other("Compression channel closed")))??;
 
-            let compressed_start = position.load(Ordering::Acquire);
             let compressed_size = compressed_data.len();
 
             // Write compressed block
@@ -517,14 +472,6 @@ where
             // Update position
             position.fetch_add(compressed_size as u64, Ordering::Release);
             blocks_written.fetch_add(1, Ordering::Release);
-
-            // Send block info notification
-            let _ = block_info_tx.send(BlockInfo {
-                block_number,
-                compressed_start,
-                compressed_size,
-                uncompressed_size,
-            });
         }
 
         // Write EOF marker
@@ -596,30 +543,26 @@ mod tests {
     }
 
     #[test]
-    fn test_block_info_notifications() {
+    fn test_block_counters_track_flushed_blocks() {
         let mut writer = MultithreadedWriter::with_worker_count(
             NonZero::new(2).expect("non-zero value 2"),
             Vec::new(),
             CompressionLevel::new(6).expect("valid compression level 6"),
         );
 
-        let rx = writer
-            .block_info_receiver()
-            .expect("block_info_receiver should return a receiver")
-            .clone();
-
         writer.write_all(b"block1").expect("write_all should succeed");
         writer.flush().expect("flush should succeed");
         writer.write_all(b"block2").expect("write_all should succeed");
         writer.flush().expect("flush should succeed");
 
+        // Two blocks were sent for compression.
+        assert_eq!(writer.current_block_number(), 2);
+
         writer.finish().expect("finish should succeed");
 
-        let infos: Vec<_> = rx.try_iter().collect();
-        assert_eq!(infos.len(), 2);
-        assert_eq!(infos[0].block_number, 0);
-        assert_eq!(infos[1].block_number, 1);
-        assert!(infos[1].compressed_start > 0);
+        // Both blocks reached the writer thread (position advanced past 0).
+        assert_eq!(writer.blocks_written(), 2);
+        assert!(writer.position() > 0);
     }
 
     #[test]
@@ -682,12 +625,18 @@ mod tests {
 
     #[test]
     fn test_builder() {
-        let writer = Builder::default()
+        let mut writer = Builder::default()
             .set_compression_level(CompressionLevel::new(9).expect("valid compression level 9"))
             .set_worker_count(NonZero::new(4).expect("non-zero value 4"))
             .set_blocksize(32768)
             .build_from_writer(Vec::new());
 
-        assert!(writer.block_info_receiver().is_some());
+        writer.write_all(b"builder roundtrip").expect("write_all should succeed");
+        let data = writer.finish().expect("finish should succeed");
+
+        let mut reader = Reader::new(&data[..]);
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).expect("read_to_end should succeed");
+        assert_eq!(buf, b"builder roundtrip");
     }
 }

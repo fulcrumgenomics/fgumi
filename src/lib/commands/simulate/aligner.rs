@@ -65,6 +65,14 @@ pub struct Aligner {
     /// Positional tokens substituted into the aligner command template
     /// (`{ref}`, `{threads}`, …) — accepted and ignored, so the command is a
     /// drop-in for real-aligner templates regardless of which tokens they fill.
+    ///
+    /// Because this field is `trailing_var_arg` + `allow_hyphen_values`, once the
+    /// first positional token is seen *every* remaining token — including
+    /// flag-like ones such as `-t 8` or even `--replay-bam` itself — is swallowed
+    /// into `ignored` rather than parsed. Therefore `--replay-bam` MUST be
+    /// supplied before any positional token; placing it after a positional makes
+    /// it disappear into `ignored` and the command fails with a missing
+    /// `--replay-bam` error.
     #[arg(value_name = "IGNORED", trailing_var_arg = true, allow_hyphen_values = true)]
     pub ignored: Vec<String>,
 }
@@ -326,5 +334,94 @@ mod tests {
 
         // Cleanup: closing stdin_w lets the detached drainer finish.
         drop(stdin_w);
+    }
+
+    #[test]
+    fn replayed_bytes_are_a_valid_bam_the_readers_accept() {
+        // End-to-end: the module's whole purpose is to feed a *BAM stream*
+        // (header + records + in-band BGZF EOF) to a real BAM reader. Write a
+        // small valid BAM to a temp file, replay it through `simulate_aligner`
+        // capturing stdout, then decode the captured bytes with the project's
+        // BAM reader and assert the header and record count round-trip. A
+        // regression that dropped a flush or truncated the tail would pass the
+        // opaque-byte tests above but fail here.
+        use fgumi_bam_io::PipelineReaderOpts;
+        use fgumi_raw_bam::RawRecord;
+        use fgumi_raw_bam::testutil::make_bam_bytes;
+        use noodles::sam::Header;
+
+        const N_RECORDS: usize = 5;
+        const HEADER_MARKER: &str = "simulate-aligner-e2e-marker";
+
+        // A header with an identifiable comment so we can assert it survives.
+        let header = Header::builder().add_comment(HEADER_MARKER).build();
+
+        let replay_path = tempfile::NamedTempFile::new().expect("replay temp").into_temp_path();
+        let mut writer =
+            fgumi_bam_io::create_raw_bam_writer(&replay_path, &header, 1, 1).expect("writer");
+        for i in 0..N_RECORDS {
+            let name = format!("read_{i}");
+            let record_bytes = make_bam_bytes(
+                -1,  // tid (unmapped)
+                -1,  // pos
+                0x4, // flag (unmapped)
+                name.as_bytes(),
+                &[], // cigar_ops
+                0,   // seq_len
+                -1,  // mate_tid
+                -1,  // mate_pos
+                &[], // aux_data
+            );
+            writer.write_raw_record(&record_bytes).expect("write record");
+        }
+        writer.finish().expect("finish writer");
+
+        // Replay the BAM through the aligner, capturing the verbatim stdout.
+        let replay = File::open(&replay_path).expect("open replay");
+        let stdin = Cursor::new(b"@r1\nACGT\n+\nIIII\n".to_vec());
+        let mut captured: Vec<u8> = Vec::new();
+        simulate_aligner(stdin, replay, &mut captured).expect("simulate aligner");
+
+        // Decode the captured bytes with the project's BAM reader by routing
+        // them back through a temp file (the reader factory takes a path).
+        let out_path = tempfile::NamedTempFile::new().expect("out temp").into_temp_path();
+        std::fs::write(&out_path, &captured).expect("write captured bytes");
+
+        let (mut reader, got_header) = fgumi_bam_io::create_raw_bam_reader_with_opts(
+            &out_path,
+            1,
+            PipelineReaderOpts::default(),
+        )
+        .expect("reader accepts replayed bytes");
+
+        // Header round-trips: the marker comment survives the verbatim copy.
+        let comments: Vec<String> = got_header.comments().iter().map(|c| c.to_string()).collect();
+        assert!(
+            comments.iter().any(|c| c == HEADER_MARKER),
+            "header comment must round-trip, got comments: {comments:?}"
+        );
+
+        // Record count round-trips, and the reader stops cleanly on the in-band
+        // BGZF EOF marker (read_record returns 0 rather than erroring).
+        let mut record = RawRecord::default();
+        let mut n = 0;
+        while reader.read_record(&mut record).expect("read replayed record") > 0 {
+            n += 1;
+        }
+        assert_eq!(n, N_RECORDS, "record count must round-trip through the replay");
+    }
+
+    #[test]
+    fn replay_bam_flag_after_a_positional_is_swallowed_into_ignored() {
+        // `ignored` is trailing_var_arg + allow_hyphen_values, so once the first
+        // positional is seen every later token — including `--replay-bam` — is
+        // captured into `ignored` rather than parsed. Placing `--replay-bam`
+        // after a positional therefore makes it disappear and parsing fails with
+        // the required-arg error. This pins the ordering constraint documented on
+        // the `ignored` field.
+        let err = Aligner::try_parse_from(["aligner", "/ref.fa", "--replay-bam", "x.bam"])
+            .expect_err("--replay-bam after a positional must fail to parse");
+        // clap reports the missing required `--replay-bam`.
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 }

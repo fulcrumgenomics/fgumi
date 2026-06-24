@@ -708,50 +708,75 @@ fn build_consensus_record(
     // count is spread one-per-base. The read-level error tag is the resulting
     // rate (sum of per-base errors / sum of per-base depths).
     let read_len = seq.len();
-    let per_base_arrays =
-        |max_depth: i32, min_depth: i32, error_count: i32| -> (Vec<i16>, Vec<i16>) {
-            let clamp = |v: i32| i16::try_from(v).unwrap_or(i16::MAX);
-            let mut depths = vec![clamp(max_depth); read_len];
-            if read_len >= 2 {
-                // Anchor the per-base minimum at the summary min (max stays the fill).
-                depths[read_len - 1] = clamp(min_depth);
-            }
-            let mut errors = vec![0i16; read_len];
-            let n = usize::try_from(error_count).unwrap_or(0).min(read_len);
-            for slot in errors.iter_mut().take(n) {
-                *slot = 1;
-            }
-            (depths, errors)
-        };
+
+    // Per-base depth/error arrays are written into reusable thread-local scratch
+    // buffers rather than freshly-allocated `Vec`s. `build_consensus_record` runs
+    // once per read (millions for a benchmark fixture) under `into_par_iter`, and
+    // each record previously allocated two `Vec<i16>` for simplex plus four more
+    // for duplex. Since `add_array_i16` copies the slice into the record's aux
+    // bytes, the arrays are transient and the same two buffers can be refilled
+    // for each strand in sequence (cd, then ad, then bd) without changing any
+    // emitted value. The thread-local keeps the reuse safe across the parallel
+    // generation loop (each rayon worker gets its own buffers).
+    thread_local! {
+        static PER_BASE_SCRATCH: std::cell::RefCell<(Vec<i16>, Vec<i16>)> =
+            const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    }
+    // Fills `depths`/`errors` (cleared first) with the per-base arrays for one
+    // strand: depth is `max_depth` everywhere, with the summary `min_depth`
+    // anchored at the last base; error is one-per-base from the front for
+    // `error_count` bases.
+    let fill_per_base = |depths: &mut Vec<i16>,
+                         errors: &mut Vec<i16>,
+                         max_depth: i32,
+                         min_depth: i32,
+                         error_count: i32| {
+        let clamp = |v: i32| i16::try_from(v).unwrap_or(i16::MAX);
+        depths.clear();
+        depths.resize(read_len, clamp(max_depth));
+        if read_len >= 2 {
+            // Anchor the per-base minimum at the summary min (max stays the fill).
+            depths[read_len - 1] = clamp(min_depth);
+        }
+        errors.clear();
+        errors.resize(read_len, 0i16);
+        let n = usize::try_from(error_count).unwrap_or(0).min(read_len);
+        for slot in errors.iter_mut().take(n) {
+            *slot = 1;
+        }
+    };
     let error_rate = |errors: &[i16], depths: &[i16]| -> f32 {
         let total_errors: i64 = errors.iter().map(|&e| i64::from(e)).sum();
         let total_depth: i64 = depths.iter().map(|&d| i64::from(d)).sum();
         if total_depth > 0 { (total_errors as f64 / total_depth as f64) as f32 } else { 0.0 }
     };
 
-    // Single-strand consensus summary + per-base arrays.
-    let (cd_bases, ce_bases) = per_base_arrays(cd, cm, ce);
-    b.add_int_tag(SamTag::CD, cd)
-        .add_int_tag(SamTag::CM, cm)
-        .add_float_tag(SamTag::CE, error_rate(&ce_bases, &cd_bases));
-    b.add_array_i16(SamTag::CD_BASES, &cd_bases).add_array_i16(SamTag::CE_BASES, &ce_bases);
+    PER_BASE_SCRATCH.with_borrow_mut(|(depths, errors)| {
+        // Single-strand consensus summary + per-base arrays.
+        fill_per_base(depths, errors, cd, cm, ce);
+        b.add_int_tag(SamTag::CD, cd)
+            .add_int_tag(SamTag::CM, cm)
+            .add_float_tag(SamTag::CE, error_rate(errors, depths));
+        b.add_array_i16(SamTag::CD_BASES, depths).add_array_i16(SamTag::CE_BASES, errors);
 
-    // Add duplex-specific tags if present: per-strand summary (aD/bD/aM/bM int,
-    // aE/bE float rate) plus the per-base strand depth/error arrays filter needs.
-    if let Some((ad, bd, am, bm, ae, be)) = duplex_tags {
-        let (ad_bases, ae_bases) = per_base_arrays(ad, am, ae);
-        let (bd_bases, be_bases) = per_base_arrays(bd, bm, be);
-        b.add_int_tag(SamTag::AD, ad)
-            .add_int_tag(SamTag::BD, bd)
-            .add_int_tag(SamTag::AM, am)
-            .add_int_tag(SamTag::BM, bm)
-            .add_float_tag(SamTag::AE, error_rate(&ae_bases, &ad_bases))
-            .add_float_tag(SamTag::BE, error_rate(&be_bases, &bd_bases));
-        b.add_array_i16(SamTag::AD_BASES, &ad_bases)
-            .add_array_i16(SamTag::AE_BASES, &ae_bases)
-            .add_array_i16(SamTag::BD_BASES, &bd_bases)
-            .add_array_i16(SamTag::BE_BASES, &be_bases);
-    }
+        // Add duplex-specific tags if present: per-strand summary (aD/bD/aM/bM
+        // int, aE/bE float rate) plus the per-base strand depth/error arrays
+        // filter needs. The same scratch buffers are refilled per strand.
+        if let Some((ad, bd, am, bm, ae, be)) = duplex_tags {
+            b.add_int_tag(SamTag::AD, ad)
+                .add_int_tag(SamTag::BD, bd)
+                .add_int_tag(SamTag::AM, am)
+                .add_int_tag(SamTag::BM, bm);
+
+            fill_per_base(depths, errors, ad, am, ae);
+            b.add_float_tag(SamTag::AE, error_rate(errors, depths));
+            b.add_array_i16(SamTag::AD_BASES, depths).add_array_i16(SamTag::AE_BASES, errors);
+
+            fill_per_base(depths, errors, bd, bm, be);
+            b.add_float_tag(SamTag::BE, error_rate(errors, depths));
+            b.add_array_i16(SamTag::BD_BASES, depths).add_array_i16(SamTag::BE_BASES, errors);
+        }
+    });
 
     // Add methylation tags if enabled.
     if let Some(meth) = methylation {
@@ -1927,6 +1952,112 @@ mod tests {
             r2_ct, r1_ct_rev,
             "R2 ct tag should be reversed relative to R1: R1={r1_ct:?}, R2={r2_ct:?}"
         );
+    }
+
+    #[test]
+    fn test_r2_per_base_depth_error_arrays_are_read_oriented_not_reversed() {
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::Value;
+        use noodles::sam::alignment::record_buf::data::field::value::Array;
+
+        // Unlike the methylation cu/ct arrays (which ARE reversed for R2 because
+        // they annotate reference-oriented evidence), the per-base depth/error
+        // arrays cd/ce (and the duplex ad/ae/bd/be) are built fresh from the
+        // scalar summaries and are *read-oriented*: each read's "low-depth tail"
+        // is anchored at its own last base. `fgumi simplex`/`duplex` emit cd/ce
+        // in read order, so the simulator deliberately does NOT reverse them for
+        // R2. This test pins that intended orientation so a future change that
+        // started reversing them (or stopped anchoring the min at the last
+        // index) is caught.
+        let seq = b"ACGTA";
+        let quals = vec![40; seq.len()];
+
+        // Distinct max/min so the anchored min is identifiable, and a non-zero
+        // error count so the per-base error array is non-trivial. Duplex tags are
+        // present so ad/ae/bd/be are emitted too.
+        let cd = 8; // max depth (array fill)
+        let cm = 3; // min depth (anchored at last base)
+        let ce = 2; // error count (spread one-per-base from the front)
+        let duplex = Some((7, 6, 2, 1, 1, 1)); // (ad, bd, am, bm, ae, be)
+
+        let r1_raw = build_consensus_record(
+            "test/1",
+            seq,
+            &quals,
+            true,
+            false,
+            0,
+            100,
+            cd,
+            cm,
+            ce,
+            duplex,
+            None,
+            MethylationMode::Disabled,
+        );
+        let r1 = to_record_buf(&r1_raw);
+
+        // R2 is the reverse complement, matching generate_consensus_pair.
+        let r2_seq = reverse_complement(seq);
+        let r2_raw = build_consensus_record(
+            "test/2",
+            &r2_seq,
+            &quals,
+            false,
+            true,
+            0,
+            100,
+            cd,
+            cm,
+            ce,
+            duplex,
+            None,
+            MethylationMode::Disabled,
+        );
+        let r2 = to_record_buf(&r2_raw);
+
+        let array_tag = |rec: &noodles::sam::alignment::RecordBuf, tag: SamTag| -> Vec<i16> {
+            match rec.data().get(&Tag::from(*tag)) {
+                Some(Value::Array(Array::Int16(arr))) => arr.clone(),
+                other => panic!("expected Int16 array for tag {:?}, got {other:?}", *tag),
+            }
+        };
+
+        // Every per-base array must be IDENTICAL between R1 and R2 (read-oriented,
+        // not reversed), and the depth array's min must sit at the LAST index on
+        // both reads.
+        for tag in [
+            SamTag::CD_BASES,
+            SamTag::CE_BASES,
+            SamTag::AD_BASES,
+            SamTag::AE_BASES,
+            SamTag::BD_BASES,
+            SamTag::BE_BASES,
+        ] {
+            let r1_arr = array_tag(&r1, tag);
+            let r2_arr = array_tag(&r2, tag);
+            assert_eq!(
+                r1_arr, r2_arr,
+                "per-base array {:?} must be read-oriented (same for R1 and R2), \
+                 not reversed: R1={r1_arr:?}, R2={r2_arr:?}",
+                *tag
+            );
+            let mut reversed = r1_arr.clone();
+            reversed.reverse();
+            // Sanity: with our asymmetric inputs the array is not palindromic, so
+            // "same as R1" is a strictly stronger claim than "reverse of R1".
+            assert_ne!(
+                r1_arr, reversed,
+                "test input for {:?} must be non-palindromic to be meaningful",
+                *tag
+            );
+        }
+
+        // The depth arrays anchor their min at the last base on BOTH reads.
+        let r1_cd = array_tag(&r1, SamTag::CD_BASES);
+        let r2_cd = array_tag(&r2, SamTag::CD_BASES);
+        assert_eq!(*r1_cd.last().unwrap(), cm as i16, "R1 cd min anchored at last base");
+        assert_eq!(*r2_cd.last().unwrap(), cm as i16, "R2 cd min anchored at last base");
     }
 
     #[test]
