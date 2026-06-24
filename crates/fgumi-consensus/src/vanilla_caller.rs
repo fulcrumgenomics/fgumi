@@ -1337,8 +1337,12 @@ impl VanillaUmiConsensusCaller {
             // Record depth
             depths.push(depth);
 
-            // Errors = total contributing bases minus those matching consensus
-            let error_count = depth - self.consensus_builder.observations_for_base(base);
+            // Errors = contributing bases that disagree with the consensus call. Derived by summing
+            // the non-consensus base counters at full width (see `non_consensus_contributions`)
+            // rather than `depth - observations_for_base(base)`: the latter subtracts two
+            // *saturated* `u16` operands and collapses to 0 in deep mixed pileups (e.g.
+            // A = u16::MAX, C = 1). In the non-saturated case the two are identical, matching fgbio.
+            let error_count = self.consensus_builder.non_consensus_contributions(base);
             errors.push(error_count);
 
             // Apply minimum depth and quality thresholds

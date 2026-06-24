@@ -193,7 +193,27 @@ use crate::phred::{
 };
 use approx::abs_diff_eq;
 use std::cmp::Ordering;
+use std::sync::Once;
 use wide::f64x4;
+
+/// One-shot guard so the per-base observation-count saturation warning is logged at most
+/// once per process (avoids log spam on adversarial/corrupt input).
+static OBSERVATIONS_SATURATION_WARNED: Once = Once::new();
+
+/// Emit the (once-per-process) observation-count saturation diagnostic.
+fn warn_observations_saturation_once() {
+    OBSERVATIONS_SATURATION_WARNED.call_once(|| {
+        log::warn!(
+            "Consensus per-base observation count saturated at u16::MAX ({}): a single \
+             position accumulated more than {} reads of one base, indicating a \
+             pathologically deep molecule family. The observation count and derived depth \
+             are clamped; the consensus at that position is not meaningful. Further \
+             saturation events are not reported.",
+            u16::MAX,
+            u16::MAX
+        );
+    });
+}
 
 /// The four DNA bases in the order used throughout consensus calling
 const DNA_BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
@@ -323,7 +343,16 @@ impl ConsensusBaseBuilder {
         // Update the sum
         self.likelihoods = t;
 
-        self.observations[matching_idx] += 1;
+        // Saturate rather than wrap/panic: a single (likely pathological) molecule family
+        // with more than u16::MAX non-N reads of the same base at one position would otherwise
+        // overflow this counter (debug panic / release wraparound). The depth derived from
+        // this is itself clamped to the SAM i16 tag ceiling downstream, so saturating here is
+        // the well-defined behavior. See `warn_observations_saturation_once`.
+        if self.observations[matching_idx] == u16::MAX {
+            warn_observations_saturation_once();
+        } else {
+            self.observations[matching_idx] += 1;
+        }
     }
 
     /// Fast path for unanimous consensus when only one base is observed.
@@ -462,7 +491,11 @@ impl ConsensusBaseBuilder {
     /// This is the sum of observations across all four bases
     #[must_use]
     pub fn contributions(&self) -> u16 {
-        self.observations.iter().sum()
+        // Saturating fold: the per-base counters each saturate at u16::MAX (see `add`), but
+        // their *sum* can exceed u16::MAX even when no single counter has saturated (e.g.
+        // 40000 + 30000). Saturate here so the derived per-position depth never wraps; the
+        // depth is clamped to the SAM i16 ceiling downstream regardless.
+        self.observations.iter().fold(0u16, |acc, &count| acc.saturating_add(count))
     }
 
     /// Returns the number of observations for a specific base
@@ -481,6 +514,51 @@ impl ConsensusBaseBuilder {
     #[must_use]
     pub fn all_observations(&self) -> [u16; DNA_BASE_COUNT] {
         self.observations
+    }
+
+    /// Returns the number of observations that do NOT match `consensus_base` — i.e. the per-position
+    /// raw-read error count against the consensus call.
+    ///
+    /// # Why this exists (and is not just `contributions() - observations_for_base(base)`)
+    ///
+    /// Both `contributions()` and the per-base counters in `observations` *saturate* at `u16::MAX`
+    /// (see `add` and `contributions`). Deriving the error count as
+    /// `contributions() - observations_for_base(base)` runs the subtraction on already-saturated
+    /// operands, which collapses to zero in pathological mixed pileups (e.g. `A = u16::MAX`,
+    /// `C = 1`: `contributions()` saturates to `u16::MAX`, so `u16::MAX - u16::MAX == 0`, hiding the
+    /// real single error). This mirrors fgbio, which derives the error count at full integer width
+    /// (`depth - observations(rawBase)` in `Int`) and only clamps the *final* per-position value to
+    /// `Short`. Here we sum the three non-consensus base counters in `u32` (so the sum itself never
+    /// wraps) and saturate to `u16` exactly once, since the per-position value is clamped to the SAM
+    /// `i16` tag ceiling downstream regardless.
+    ///
+    /// # Identity in the non-saturated case
+    ///
+    /// When no counter has saturated, every counter holds its exact value, so
+    /// `sum_{i != base} observations[i] == contributions() - observations_for_base(base)`. The two
+    /// formulas therefore agree exactly whenever there is no saturation; they diverge (this method
+    /// being the correct one) only once a counter has hit `u16::MAX`.
+    ///
+    /// # `NoCall` consensus base
+    ///
+    /// If `consensus_base` is not one of A/C/G/T (e.g. `N`), no counter matches it, so this returns
+    /// the saturated total of all four counters — equivalent to `depth`. This preserves fgbio's
+    /// `if (rawBase == NoCall) depth` branch, where a no-call consensus counts every contributing
+    /// read as an error.
+    #[must_use]
+    pub fn non_consensus_contributions(&self, consensus_base: u8) -> u16 {
+        // Widen the consensus index to usize; a non-base (e.g. N) maps to 255, which never matches
+        // a real base index (0..4), so all four counters are then summed (== depth).
+        let consensus_idx = BASE_TO_INDEX[consensus_base as usize] as usize;
+        let sum: u32 = self
+            .observations
+            .iter()
+            .enumerate()
+            .filter(|&(idx, _)| idx != consensus_idx)
+            .map(|(_, &count)| u32::from(count))
+            .sum();
+        // Saturate (not truncate) the full-width sum back to the u16 storage ceiling.
+        u16::try_from(sum).unwrap_or(u16::MAX)
     }
 }
 
@@ -785,5 +863,109 @@ mod tests {
                 "Q{input_q} should become ~Q{expected_q}, got Q{qual}"
             );
         }
+    }
+
+    // ==================== Observation-count saturation (S7-001 / FU-002) ====================
+
+    #[test]
+    fn test_observations_saturate_at_u16_max() {
+        let mut builder = ConsensusBaseBuilder::new(45, 40);
+
+        // Drive one base's counter right up to the ceiling, then a few past it. Pre-seed via the
+        // private field (test module has access) to avoid materializing 65535 `add` calls.
+        builder.observations[0] = u16::MAX - 2;
+        for _ in 0..5 {
+            builder.add(b'A', 40); // would overflow at the 3rd of these without saturation
+        }
+
+        // Counter must clamp at u16::MAX, never wrap back toward zero.
+        assert_eq!(builder.observations_for_base(b'A'), u16::MAX);
+    }
+
+    #[test]
+    fn test_contributions_saturates_across_bases() {
+        let mut builder = ConsensusBaseBuilder::new(45, 40);
+
+        // No single base has saturated, but the cross-base sum exceeds u16::MAX. `contributions`
+        // must saturate rather than wrap. (40000 + 30000 = 70000 > 65535.)
+        builder.observations[0] = 40_000; // A
+        builder.observations[1] = 30_000; // C
+
+        assert_eq!(builder.contributions(), u16::MAX);
+    }
+
+    #[test]
+    fn test_contributions_exact_when_in_range() {
+        let mut builder = ConsensusBaseBuilder::new(45, 40);
+        // Below the ceiling, contributions must be the exact sum (no spurious saturation).
+        for _ in 0..7 {
+            builder.add(b'A', 40);
+        }
+        for _ in 0..3 {
+            builder.add(b'C', 40);
+        }
+        assert_eq!(builder.contributions(), 10);
+    }
+
+    // ==================== non_consensus_contributions (FU-001 error-count saturation) ===========
+
+    #[test]
+    fn test_non_consensus_contributions_saturated_pileup_keeps_minority_error() {
+        // The regression: A's counter saturates at u16::MAX, plus one C. The old
+        // `depth - observations_for_base(A)` formula collapses to 0 (both operands saturate to
+        // u16::MAX), hiding the real single error. `non_consensus_contributions` derives at full
+        // width and must report exactly 1.
+        let mut builder = ConsensusBaseBuilder::new(45, 40);
+        builder.observations[0] = u16::MAX; // A, already at the ceiling
+        builder.observations[1] = 1; // C, a single minority observation
+
+        // Sanity: the saturated operands the buggy formula would have used.
+        assert_eq!(builder.contributions(), u16::MAX, "depth saturates as before");
+        assert_eq!(builder.observations_for_base(b'A'), u16::MAX, "A counter saturates as before");
+
+        // The fix: the lone C is correctly counted as one error against an A consensus.
+        assert_eq!(builder.non_consensus_contributions(b'A'), 1);
+    }
+
+    #[test]
+    fn test_non_consensus_contributions_identity_when_in_range() {
+        // CRITICAL INVARIANT: with no saturation, non_consensus_contributions(base) must equal
+        // contributions() - observations_for_base(base) for every candidate base.
+        let mut builder = ConsensusBaseBuilder::new(45, 40);
+        for _ in 0..8 {
+            builder.add(b'A', 40);
+        }
+        for _ in 0..3 {
+            builder.add(b'C', 40);
+        }
+        for _ in 0..2 {
+            builder.add(b'G', 40);
+        }
+
+        let depth = builder.contributions();
+        for base in [b'A', b'C', b'G', b'T'] {
+            let expected = depth - builder.observations_for_base(base);
+            assert_eq!(
+                builder.non_consensus_contributions(base),
+                expected,
+                "identity must hold for base {}",
+                base as char
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_consensus_contributions_nocall_counts_all_as_errors() {
+        // A no-call consensus base matches none of A/C/G/T, so every contributing read is an error.
+        // This preserves fgbio's `if (rawBase == NoCall) depth` branch.
+        let mut builder = ConsensusBaseBuilder::new(45, 40);
+        for _ in 0..4 {
+            builder.add(b'A', 40);
+        }
+        for _ in 0..6 {
+            builder.add(b'C', 40);
+        }
+        assert_eq!(builder.non_consensus_contributions(b'N'), builder.contributions());
+        assert_eq!(builder.non_consensus_contributions(b'N'), 10);
     }
 }
