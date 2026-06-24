@@ -346,14 +346,16 @@ mod tests {
 
     #[test]
     fn test_parse_fastq_eof_no_newline_seq_qual_mismatch() {
-        // Quality shorter than sequence at EOF — should error.
+        // Quality shorter than sequence at EOF — must error (must not silently
+        // swallow the malformed record).
         let data = b"@read1\nACGT\n+\nIII";
         let result = parse_fastq_records(data);
+        assert!(result.is_err(), "expected an error for seq/qual length mismatch at EOF");
+        let err = result.unwrap_err();
+        let msg = err.to_string();
         assert!(
-            result.is_err() || {
-                let (recs, leftover) = result.unwrap();
-                recs.is_empty() && !leftover.is_empty()
-            }
+            msg.contains("Sequence length") && msg.contains("quality length"),
+            "unexpected error: {msg}"
         );
     }
 

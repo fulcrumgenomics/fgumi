@@ -2283,4 +2283,65 @@ mod tests {
         let result = handle.try_get().expect("set");
         assert!(result.is_ok(), "SAM-text header should resolve handle to Ok: {:?}", result.err(),);
     }
+
+    /// `merge_aligner_header` must keep the *partial* header's `@PG` on a
+    /// duplicate ID (the aligner's PG with that ID is dropped, not merged)
+    /// while still appending aligner PGs whose IDs are unique to the
+    /// aligner. This pins the dedup behavior documented on the function.
+    #[test]
+    fn merge_aligner_header_keeps_partial_pg_on_duplicate_id() {
+        use bstr::BString;
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::Program;
+        use noodles::sam::header::record::value::map::program::tag as pg_tag;
+
+        // Helper: build a @PG map carrying a distinguishing PN field so we
+        // can tell the partial's PG apart from the aligner's.
+        let program_with_name = |name: &str| -> Map<Program> {
+            Map::<Program>::builder().insert(pg_tag::NAME, name).build().expect("valid @PG")
+        };
+
+        // Partial header: a "dup" PG (PN=partial) plus a partial-only PG.
+        let partial = Header::builder()
+            .add_program(BString::from("dup"), program_with_name("partial"))
+            .add_program(BString::from("onlypartial"), program_with_name("partial"))
+            .build();
+
+        // Aligner header: a "dup" PG (PN=aligner, must be dropped) plus a
+        // unique "bwa" PG (must be appended).
+        let aligner = Header::builder()
+            .add_program(BString::from("dup"), program_with_name("aligner"))
+            .add_program(BString::from("bwa"), program_with_name("aligner"))
+            .build();
+
+        let merged = merge_aligner_header(&partial, &aligner);
+        let programs = merged.programs();
+        let programs = programs.as_ref();
+
+        // Exactly three PGs survive: dup (partial's), onlypartial, bwa.
+        assert_eq!(programs.len(), 3, "expected dup + onlypartial + bwa");
+
+        // Read back the PN field for a given @PG ID.
+        let pn_of = |id: &str| -> Option<String> {
+            programs
+                .get(&BString::from(id))
+                .and_then(|pg| pg.other_fields().get(&pg_tag::NAME).map(ToString::to_string))
+        };
+
+        // The duplicate-ID PG is the PARTIAL's (PN=partial), not the
+        // aligner's — the aligner's same-ID PG was dropped.
+        assert_eq!(
+            pn_of("dup").as_deref(),
+            Some("partial"),
+            "duplicate @PG ID must retain the partial's PG, not the aligner's"
+        );
+        // The partial-only PG is preserved.
+        assert_eq!(pn_of("onlypartial").as_deref(), Some("partial"));
+        // The aligner-unique PG is appended.
+        assert_eq!(
+            pn_of("bwa").as_deref(),
+            Some("aligner"),
+            "aligner @PG with a non-duplicate ID must be appended"
+        );
+    }
 }

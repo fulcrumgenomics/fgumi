@@ -1851,6 +1851,130 @@ mod tests {
         );
     }
 
+    /// Codec consensus does not support methylation calling. The
+    /// `Stage::Codec` arm of `build_stage_options_bag` rejects a
+    /// `--methylation-mode` that survived parsing — fail loud rather than
+    /// silently drop the flag. The guard fires before any `--codec::*`
+    /// validation, so no codec tuning flags are needed to reach it.
+    #[test]
+    fn codec_with_methylation_is_rejected() {
+        use clap::Parser;
+        let r = RunAll::try_parse_from([
+            "runall",
+            "--start-from",
+            "group",
+            "--stop-after",
+            "consensus",
+            "--consensus",
+            "codec",
+            "--methylation-mode",
+            "em-seq",
+            "--ref",
+            "/tmp/fgumi-nonexistent-ref.fa",
+            "--input",
+            "x.bam",
+            "--output",
+            "o.bam",
+            "--group::strategy",
+            "paired",
+            "--threads",
+            "1",
+        ])
+        .expect("parse");
+        let stages = r.derive_stages().expect("derive stages");
+        assert!(
+            stages.contains(&crate::pipeline::chains::Stage::Codec),
+            "group → consensus with --consensus codec must include the Codec stage: {stages:?}"
+        );
+        let err = match r.build_stage_options_bag(&stages) {
+            Ok(_) => panic!("--consensus codec + --methylation-mode must be rejected"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("methylation-mode") && msg.contains("codec"),
+            "error must mention methylation-mode and codec, got: {msg}"
+        );
+    }
+
+    /// `--start-from align` (align-and-merge) does not yet support
+    /// methylation-aware aligning. `validate_align_and_merge` rejects a
+    /// `--methylation-mode` after confirming `--ref` is present but before
+    /// the `.dict` existence check, so a nonexistent reference path still
+    /// reaches the methylation guard.
+    #[test]
+    fn align_start_with_methylation_is_rejected() {
+        use clap::Parser;
+        let r = RunAll::try_parse_from([
+            "runall",
+            "--start-from",
+            "align",
+            "--stop-after",
+            "consensus",
+            "--consensus",
+            "duplex",
+            "--methylation-mode",
+            "em-seq",
+            "--ref",
+            "/tmp/fgumi-nonexistent-ref.fa",
+            "--input",
+            "x.bam",
+            "--output",
+            "o.bam",
+            "--group::strategy",
+            "paired",
+            "--threads",
+            "1",
+        ])
+        .expect("parse");
+        let err = r
+            .validate_align_and_merge()
+            .expect_err("--start-from align + --methylation-mode must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("methylation-mode") && msg.contains("align"),
+            "error must mention methylation-mode and align, got: {msg}"
+        );
+    }
+
+    /// On a non-aligner start stage (e.g. `--start-from group`), passing
+    /// `--ref` without `--methylation-mode` is rejected by `execute` before
+    /// any stage runs: the ref would otherwise be silently ignored. The
+    /// guard is checked early — after the (skipped-for-stdin) input
+    /// existence check but before the pipeline opens — so `--input -`
+    /// reaches the guard without a real input BAM and without consuming
+    /// stdin.
+    #[test]
+    fn ref_without_methylation_on_group_start_is_rejected() {
+        use clap::Parser;
+        let r = RunAll::try_parse_from([
+            "runall",
+            "--start-from",
+            "group",
+            "--stop-after",
+            "group",
+            "--ref",
+            "/tmp/fgumi-nonexistent-ref.fa",
+            "--input",
+            "-",
+            "--output",
+            "o.bam",
+            "--group::strategy",
+            "paired",
+            "--threads",
+            "1",
+        ])
+        .expect("parse");
+        let err = r
+            .execute("test")
+            .expect_err("--ref without --methylation-mode on a non-aligner start must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--ref requires --methylation-mode"),
+            "error must mention `--ref requires --methylation-mode`, got: {msg}"
+        );
+    }
+
     /// `--filter::max-read-error-rate` / `--filter::max-base-error-rate` are
     /// `Vec` fields with standalone defaults (`[0.025]` / `[0.1]`) that the
     /// `#[multi_options]`-generated `validate()` backfills from

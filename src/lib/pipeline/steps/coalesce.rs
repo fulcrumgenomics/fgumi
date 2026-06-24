@@ -211,6 +211,14 @@ impl Step for CoalesceBytes {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrd};
+
+    use crate::pipeline::core::item::HeapSize;
+    use crate::pipeline::core::outputs::Single;
+    use crate::pipeline::core::{PipelineBuilder, PipelineConfig};
+
     use super::*;
 
     #[test]
@@ -226,5 +234,173 @@ mod tests {
     #[test]
     fn default_threshold_is_256_kib() {
         assert_eq!(DEFAULT_COALESCE_THRESHOLD_BYTES, 256 * 1024);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // X3-007: drive `CoalesceBytes::try_run`'s flush loop through a real
+    // pipeline. The two pre-existing tests only assert the profile and the
+    // default threshold constant — neither exercises the byte-budget flush
+    // logic (accumulate until `pending` crosses `threshold_bytes`, then emit;
+    // bound `pending` at ~threshold regardless of input count). These tests
+    // pin that contract: all input bytes are preserved AND each emitted block
+    // is bounded (the step flushes at the threshold, never buffering the whole
+    // stream into one giant block).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Size of each `DecompressedBlock` the source emits.
+    const COALESCE_INPUT_BLOCK_BYTES: usize = 1000;
+    /// Coalesce flush threshold under test. Chosen so several input blocks
+    /// accumulate per emit (`THRESHOLD / INPUT = 8` blocks per flush) and the
+    /// flush loop runs many times over the full stream.
+    const COALESCE_THRESHOLD_BYTES: usize = 8 * COALESCE_INPUT_BLOCK_BYTES;
+    /// Number of fixed-size input blocks. Sums to `64 * THRESHOLD`, so a
+    /// regression that buffered everything into one block would emit a single
+    /// ~512 KB block (caught by the per-block size bound below).
+    const COALESCE_INPUT_BLOCKS: usize = 64 * 8;
+
+    /// Source emitting `remaining` fixed-size `DecompressedBlock`s via a shared
+    /// atomic counter (safe for Serial single-worker execution). Each block's
+    /// `bytes` is `COALESCE_INPUT_BLOCK_BYTES` of a deterministic fill so the
+    /// sink can verify byte preservation without an ordering assumption.
+    #[derive(Clone)]
+    struct BlockSource {
+        remaining: Arc<AtomicU64>,
+    }
+    impl Step for BlockSource {
+        type Input = ();
+        type Outputs = Single<DecompressedBlock>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "BlockSource",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 4 * 1024 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            let n = self.remaining.load(AtomicOrd::Acquire);
+            if n == 0 {
+                return Ok(StepOutcome::Finished);
+            }
+            let block = DecompressedBlock {
+                batch_serial: n,
+                bytes: vec![0xCD; COALESCE_INPUT_BLOCK_BYTES],
+            };
+            match ctx.outputs.push(block) {
+                Ok(()) => {
+                    self.remaining.fetch_sub(1, AtomicOrd::AcqRel);
+                    Ok(StepOutcome::Progress)
+                }
+                // Backpressure: keep the count and retry next dispatch.
+                Err(_) => Ok(StepOutcome::NoProgress),
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// Sink recording the byte length of every emitted block (so the test can
+    /// bound the per-block size) plus the running total.
+    #[derive(Clone)]
+    struct SizeRecordingSink {
+        sizes: Arc<Mutex<Vec<usize>>>,
+    }
+    impl Step for SizeRecordingSink {
+        type Input = DecompressedBlock;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "SizeSink",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            match ctx.input.pop() {
+                Some(block) => {
+                    // Every byte must be the source's fill — proving the
+                    // concatenation neither drops nor corrupts bytes.
+                    assert!(
+                        block.bytes.iter().all(|&b| b == 0xCD),
+                        "coalesced block carries unexpected bytes"
+                    );
+                    self.sizes.lock().expect("sink mutex").push(block.bytes.len());
+                    Ok(StepOutcome::Progress)
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn coalesce_flushes_at_threshold_and_preserves_bytes() {
+        let remaining = Arc::new(AtomicU64::new(u64::try_from(COALESCE_INPUT_BLOCKS).unwrap()));
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+
+        let coalesce = CoalesceBytes::new(COALESCE_THRESHOLD_BYTES, 4 * 1024);
+
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(BlockSource { remaining: Arc::clone(&remaining) })
+            .chain(coalesce)
+            .chain(SizeRecordingSink { sizes: Arc::clone(&sizes) })
+            .into_sink_marker();
+
+        let pipeline = builder.build().unwrap();
+        let result = pipeline.run(PipelineConfig { threads: 4, ..Default::default() });
+        assert!(result.is_ok(), "coalesce run failed: {:?}", result.err());
+
+        let emitted = sizes.lock().expect("sink mutex").clone();
+        let total_in = COALESCE_INPUT_BLOCKS * COALESCE_INPUT_BLOCK_BYTES;
+        let total_out: usize = emitted.iter().sum();
+
+        // Byte conservation: every input byte reaches the sink exactly once.
+        assert_eq!(total_out, total_in, "coalesce dropped or duplicated bytes");
+
+        // Memory bound: the step flushes once `pending` reaches the threshold,
+        // then resets. Each emitted block therefore carries between
+        // `threshold` and `threshold + (MAX_BATCHES_PER_LOCK - 1) * input` —
+        // the threshold check fires mid-pull, but the loop may absorb up to one
+        // lock's worth of inputs before re-checking. A "buffer everything into
+        // one block" regression emits a single `total_in`-sized block, which
+        // blows this bound spectacularly.
+        let per_block_ceiling =
+            COALESCE_THRESHOLD_BYTES + MAX_BATCHES_PER_LOCK * COALESCE_INPUT_BLOCK_BYTES;
+        for (i, &sz) in emitted.iter().enumerate() {
+            let is_last = i + 1 == emitted.len();
+            assert!(
+                sz <= per_block_ceiling,
+                "emitted block {i} of {sz} bytes exceeds the bound {per_block_ceiling} \
+                 — pending was not flushed at the threshold"
+            );
+            if !is_last {
+                // Non-final blocks must have crossed the threshold before
+                // flushing (only the final drain may emit a sub-threshold
+                // partial).
+                assert!(
+                    sz >= COALESCE_THRESHOLD_BYTES,
+                    "non-final block {i} of {sz} bytes is below the threshold \
+                     {COALESCE_THRESHOLD_BYTES} — premature flush"
+                );
+            }
+        }
+
+        // The stream is large enough that a correctly-flushing step emits many
+        // blocks (~64), never one.
+        assert!(
+            emitted.len() > 1,
+            "expected many threshold-sized flushes, got {} block(s)",
+            emitted.len()
+        );
+        // Sanity-check the helper trait is exercised on the flowing type.
+        assert!(DecompressedBlock { batch_serial: 0, bytes: vec![0u8; 3] }.heap_size() >= 3);
     }
 }

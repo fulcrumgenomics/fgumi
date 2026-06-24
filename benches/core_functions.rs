@@ -290,10 +290,14 @@ fn bench_adjacency_assigner(c: &mut Criterion) {
             &umis,
             |b, umis| {
                 let assigner = Strategy::Adjacency.new_assigner(1);
-                b.iter(|| {
-                    let result = assigner.assign(black_box(&umis.clone()));
-                    black_box(result)
-                });
+                b.iter_batched(
+                    || umis.clone(),
+                    |umis| {
+                        let result = assigner.assign(black_box(&umis));
+                        black_box(result)
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
             },
         );
     }
@@ -364,10 +368,14 @@ fn bench_vanilla_consensus_caller(c: &mut Criterion) {
                 let options = VanillaUmiConsensusOptions::default();
                 let mut caller =
                     VanillaUmiConsensusCaller::new("bench".to_string(), "RG1".to_string(), options);
-                b.iter(|| {
-                    let result = caller.consensus_reads(black_box(raw_reads.clone()));
-                    black_box(result)
-                });
+                b.iter_batched(
+                    || raw_reads.clone(),
+                    |raw_reads| {
+                        let result = caller.consensus_reads(black_box(raw_reads));
+                        black_box(result)
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
             },
         );
     }
@@ -391,10 +399,14 @@ fn bench_vanilla_consensus_caller(c: &mut Criterion) {
                 let options = VanillaUmiConsensusOptions::default();
                 let mut caller =
                     VanillaUmiConsensusCaller::new("bench".to_string(), "RG1".to_string(), options);
-                b.iter(|| {
-                    let result = caller.consensus_reads(black_box(raw_reads.clone()));
-                    black_box(result)
-                });
+                b.iter_batched(
+                    || raw_reads.clone(),
+                    |raw_reads| {
+                        let result = caller.consensus_reads(black_box(raw_reads));
+                        black_box(result)
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
             },
         );
     }

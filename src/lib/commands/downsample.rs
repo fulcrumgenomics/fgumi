@@ -89,6 +89,20 @@ pub struct Downsample {
     pub compression: CompressionOptions,
 }
 
+/// Validate the `--fraction` argument.
+///
+/// The fraction must be greater than 0.0 (exclusive) and at most 1.0 (inclusive).
+///
+/// # Errors
+///
+/// Returns an error if `fraction` is `<= 0.0` or `> 1.0`.
+fn validate_fraction(fraction: f64) -> Result<()> {
+    if fraction <= 0.0 || fraction > 1.0 {
+        bail!("--fraction must be between 0.0 (exclusive) and 1.0 (inclusive), got {}", fraction);
+    }
+    Ok(())
+}
+
 impl Command for Downsample {
     fn execute(&self, command_line: &str) -> Result<()> {
         // Validate inputs. Skip the existence check for stdin (`-` /
@@ -101,12 +115,7 @@ impl Command for Downsample {
         }
 
         // Validate fraction
-        if self.fraction <= 0.0 || self.fraction > 1.0 {
-            bail!(
-                "--fraction must be between 0.0 (exclusive) and 1.0 (inclusive), got {}",
-                self.fraction
-            );
-        }
+        validate_fraction(self.fraction)?;
 
         let timer = OperationTimer::new("Downsampling reads");
 
@@ -494,51 +503,23 @@ mod tests {
 
     #[test]
     fn test_validate_fraction_too_low() {
-        let cmd = Downsample {
-            io: test_bam_io_options(),
-            fraction: 0.0,
-            rejects: None,
-            seed: None,
-            validate_mi_order: false,
-            histogram_kept: None,
-            histogram_rejected: None,
-            compression: CompressionOptions { compression_level: 1 },
-        };
-
-        // We can't call execute() without a real BAM file, but we can test the validation
-        assert!(cmd.fraction <= 0.0);
+        // 0.0 is the exclusive lower bound, so it must be rejected; values below it likewise.
+        assert!(validate_fraction(0.0).is_err());
+        assert!(validate_fraction(-0.1).is_err());
     }
 
     #[test]
     fn test_validate_fraction_too_high() {
-        let cmd = Downsample {
-            io: test_bam_io_options(),
-            fraction: 1.5,
-            rejects: None,
-            seed: None,
-            validate_mi_order: false,
-            histogram_kept: None,
-            histogram_rejected: None,
-            compression: CompressionOptions { compression_level: 1 },
-        };
-
-        assert!(cmd.fraction > 1.0);
+        // Anything strictly greater than the inclusive upper bound of 1.0 must be rejected.
+        assert!(validate_fraction(1.1).is_err());
+        assert!(validate_fraction(1.5).is_err());
     }
 
     #[test]
     fn test_validate_fraction_valid() {
-        let cmd = Downsample {
-            io: test_bam_io_options(),
-            fraction: 0.5,
-            rejects: None,
-            seed: None,
-            validate_mi_order: false,
-            histogram_kept: None,
-            histogram_rejected: None,
-            compression: CompressionOptions { compression_level: 1 },
-        };
-
-        assert!(cmd.fraction > 0.0 && cmd.fraction <= 1.0);
+        // A mid-range value and the inclusive upper bound 1.0 must both be accepted.
+        assert!(validate_fraction(0.5).is_ok());
+        assert!(validate_fraction(1.0).is_ok());
     }
 
     #[test]
