@@ -145,7 +145,6 @@ pub fn build_serialize_processed_groups_step(
 /// [`build_serialize_processed_groups_step`]) and the single-threaded writer
 /// in [`crate::commands::group`] so they can't drift in MI-injection
 /// semantics.
-#[allow(clippy::cast_possible_truncation)]
 pub(crate) fn emit_templates_raw_with_mi(
     templates: &[Template],
     base_mi: u64,
@@ -166,11 +165,21 @@ pub(crate) fn emit_templates_raw_with_mi(
                 scratch.clear();
                 scratch.extend_from_slice(raw);
                 fgumi_raw_bam::update_string_tag(scratch, assign_tag_bytes, mi_buf.as_bytes());
-                let block_size = scratch.len() as u32;
+                let block_size = u32::try_from(scratch.len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("BAM record too large ({} bytes)", scratch.len()),
+                    )
+                })?;
                 emit(&block_size.to_le_bytes())?;
                 emit(scratch)?;
             } else {
-                let block_size = raw.len() as u32;
+                let block_size = u32::try_from(raw.len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("BAM record too large ({} bytes)", raw.len()),
+                    )
+                })?;
                 emit(&block_size.to_le_bytes())?;
                 emit(raw)?;
             }

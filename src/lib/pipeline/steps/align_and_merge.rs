@@ -1150,11 +1150,15 @@ impl BamTemplateStream {
             }
             // `scratch.clone()` here (and below) is intentional: the
             // same `scratch` buffer is reused for the *next*
-            // `read_record` call, so we can't `mem::take` it
-            // without leaving the next read with an uninitialized
-            // record. A `RawRecord` pool would be the next
-            // optimisation if a profile points here, but at 10k–100k
-            // records/sec the clones are cheap.
+            // `read_record` call (this call's loop and the following
+            // `next_template` call's first read), so we can't
+            // `mem::take` it without surrendering the capacity reuse
+            // that the scratch buffer exists to provide — each taken
+            // record would start a fresh allocation. The accepted
+            // follow-up (deferred, no profile points here today) is a
+            // small `RawRecord` free-list so `next_template` can swap a
+            // recycled buffer in rather than clone; at 10k–100k
+            // records/sec the clones are cheap. See S5a1-007.
             records.push(self.scratch.clone());
         }
 

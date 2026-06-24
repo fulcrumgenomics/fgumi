@@ -247,7 +247,7 @@ fn run_simplex_consensus_batch(
             batch_stats.record_rejection(RejectionReason::InsufficientReads, raw_records.len());
             if track_rejects {
                 for raw in &raw_records {
-                    super::append_framed_bytes(&mut rejects_bytes, raw.as_ref());
+                    super::append_framed_bytes(&mut rejects_bytes, raw.as_ref())?;
                 }
             }
             continue;
@@ -274,7 +274,7 @@ fn run_simplex_consensus_batch(
         batch_stats.merge(&state.caller.statistics());
         if track_rejects {
             for raw in &state.caller.take_rejected_reads() {
-                super::append_framed_bytes(&mut rejects_bytes, raw);
+                super::append_framed_bytes(&mut rejects_bytes, raw)?;
             }
         }
     }

@@ -308,13 +308,21 @@ pub(crate) fn build_serialize_step(
                             // and applies the MI tag — encapsulates the
                             // split-borrow needed for scratch + mi_buf.
                             let tagged = state.apply_mi_tag(raw, assign_tag_bytes);
-                            #[allow(clippy::cast_possible_truncation)]
-                            let block_size = tagged.len() as u32;
+                            let block_size = u32::try_from(tagged.len()).map_err(|_| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("BAM record too large ({} bytes)", tagged.len()),
+                                )
+                            })?;
                             output.extend_from_slice(&block_size.to_le_bytes());
                             output.extend_from_slice(tagged);
                         } else {
-                            #[allow(clippy::cast_possible_truncation)]
-                            let block_size = raw.len() as u32;
+                            let block_size = u32::try_from(raw.len()).map_err(|_| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("BAM record too large ({} bytes)", raw.len()),
+                                )
+                            })?;
                             output.extend_from_slice(&block_size.to_le_bytes());
                             output.extend_from_slice(raw);
                         }

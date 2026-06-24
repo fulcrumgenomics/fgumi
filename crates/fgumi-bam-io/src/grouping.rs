@@ -174,6 +174,16 @@ impl Default for GroupKey {
 /// This is the output of the Decode step and input to the Group step.
 /// The key is computed during the parallel Decode step so that the
 /// serial Group step only needs to do fast integer comparisons.
+///
+/// # Cached-UMI invariant
+///
+/// `umi_value_offset` / `umi_value_len` cache the position of the UMI value
+/// *within* `data`. The invariant is: **the cache is only valid while `data` is
+/// unmodified.** Any mutation of `data` that could shift or overwrite the UMI
+/// value bytes invalidates the cache. To enforce this cheaply, the sole
+/// mutable-bytes accessor ([`Self::raw_bytes_mut`]) resets the cache to
+/// [`Self::UMI_OFFSET_UNCACHED`] on hand-out, so a `cached_umi()` read after a
+/// mutation falls back to a re-scan instead of slicing stale bytes.
 #[derive(Debug)]
 pub struct DecodedRecord {
     /// Pre-computed grouping key.
@@ -232,7 +242,18 @@ impl DecodedRecord {
         }
         let start = self.umi_value_offset as usize;
         let end = start.checked_add(self.umi_value_len as usize)?;
-        self.data.as_ref().get(start..end)
+        let value = self.data.as_ref().get(start..end)?;
+        // The cache only ever holds a Z-typed UMI value (NUL-free by the BAM
+        // spec; the trailing NUL is excluded by `set_cached_umi`). If a mutation
+        // shifted the record bytes such that this offset now lands on a different
+        // region, the slice would typically contain an interior NUL — a cheap,
+        // zero-release-cost canary for a stale cache that survived bounds checks.
+        debug_assert!(
+            !value.contains(&0),
+            "stale cached UMI: offset {start} sliced bytes containing an interior NUL \
+             (the record was likely mutated without invalidating the UMI cache)"
+        );
+        Some(value)
     }
 
     /// Returns the cached UMI offset ([`Self::UMI_OFFSET_UNCACHED`] when absent)
@@ -267,7 +288,16 @@ impl DecodedRecord {
     /// or invalidating its pre-computed `GroupKey`. Caller must not
     /// change the record's identity (qname, library bytes, cell barcode)
     /// — those feed `key`, which we don't recompute here.
+    ///
+    /// Handing out mutable bytes resets the cached UMI position to
+    /// [`Self::UMI_OFFSET_UNCACHED`] (see the type-level cached-UMI invariant):
+    /// a length-changing edit before the UMI tag could shift the value while
+    /// leaving the old offset in-bounds, so a later `cached_umi()` would slice
+    /// stale-but-valid bytes. Clearing forces a re-scan instead. This is a
+    /// single field store and the cache is only repopulated by the decode step.
     pub fn raw_bytes_mut(&mut self) -> &mut RawRecord {
+        self.umi_value_offset = Self::UMI_OFFSET_UNCACHED;
+        self.umi_value_len = 0;
         &mut self.data
     }
 
@@ -694,5 +724,48 @@ mod tests {
                 "name_hash parity mismatch",
             );
         }
+    }
+
+    // ========================================================================
+    // DecodedRecord cached-UMI invalidation (S6-002)
+    // ========================================================================
+
+    /// Build a `DecodedRecord` carrying an RX UMI tag with its value position
+    /// cached, exactly as the Decode step's `cache_umi_position` would.
+    fn decoded_with_cached_umi(umi: &[u8]) -> DecodedRecord {
+        use fgumi_raw_bam::SamTag;
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1").sequence(b"ACGT").qualities(&[30; 4]);
+        b.add_string_tag(SamTag::RX, umi);
+        let rec = b.build();
+        let bytes = rec.as_ref();
+        let aux_offset =
+            fgumi_raw_bam::aux_data_offset_from_record(bytes).expect("aux offset present");
+        let aux = &bytes[aux_offset..];
+        let (off_in_aux, len) =
+            fgumi_raw_bam::find_string_tag_position(aux, *SamTag::RX).expect("RX tag present");
+        let offset = u32::try_from(aux_offset).expect("aux offset fits u32") + off_in_aux;
+        let mut d = DecodedRecord::from_raw_bytes(rec, GroupKey::default());
+        d.set_cached_umi(offset, len);
+        d
+    }
+
+    #[test]
+    fn cached_umi_returns_value_then_raw_bytes_mut_invalidates() {
+        // The cache resolves to the UMI value up front; handing out mutable bytes
+        // must reset the cache to the sentinel so a later read re-scans rather
+        // than slicing stale-but-in-range bytes (see the cached-UMI invariant).
+        let mut decoded = decoded_with_cached_umi(b"ACGTACGT");
+        assert_eq!(decoded.cached_umi(), Some(b"ACGTACGT".as_ref()), "cache populated up front");
+        assert_ne!(decoded.cached_umi_position().0, DecodedRecord::UMI_OFFSET_UNCACHED);
+
+        let _ = decoded.raw_bytes_mut();
+
+        assert_eq!(
+            decoded.cached_umi_position().0,
+            DecodedRecord::UMI_OFFSET_UNCACHED,
+            "raw_bytes_mut resets the cache to the uncached sentinel",
+        );
+        assert!(decoded.cached_umi().is_none(), "cached_umi returns None after mutation");
     }
 }
