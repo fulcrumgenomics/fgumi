@@ -441,6 +441,12 @@ impl RecordBuffer {
         // (`u64::MAX`) so a single unmapped read doesn't widen `bytes_needed`
         // to the full 8 bytes; unmapped reads still sort to the tail because
         // their key truncates to all-`0xFF` under any width.
+        //
+        // CORRECTNESS-CRITICAL: this running max is what makes the radix pass
+        // sizing in `radix_sort_record_refs_with_max` correct. Any new
+        // `sort_key` producer feeding this buffer MUST keep `max_sort_key` in
+        // sync here (or pass a true max to the radix sort) — a key in
+        // `(max_sort_key, u64::MAX)` would silently mis-sort in release builds.
         self.refs.push(RecordRef { sort_key, offset, len, padding: 0 });
         if sort_key != u64::MAX {
             self.max_sort_key = self.max_sort_key.max(sort_key);
@@ -1693,8 +1699,18 @@ pub fn radix_sort_record_refs(refs: &mut [RecordRef]) {
 /// width, so they sort *after* every other key and remain stable among
 /// themselves. This lets a coordinate sort size the passes from the maximum
 /// *mapped* key (~5–6 bytes) instead of the full 8 even when unmapped reads are
-/// present. A key strictly between `max_key` and `u64::MAX` would under-size the
-/// byte count and mis-order records — debug builds assert against this.
+/// present.
+///
+/// CORRECTNESS-CRITICAL precondition: a key strictly between `max_key` and
+/// `u64::MAX` under-sizes `bytes_needed`, so its high bytes are never examined
+/// and the record is **silently mis-ordered in release builds** (a wrong
+/// permutation — never a panic or memory-unsafety, since the scatter indexes
+/// only correctly-sized `counts`/`dst`). The invariant holds today because the
+/// sole key source (`extract_coordinate_key_inline`) emits only a mapped key
+/// `<= max` or `u64::MAX`, and `RecordBuffer::push_coordinate` tracks the
+/// running max on every push. The debug assert below cross-checks the per-key
+/// bound, but there is deliberately **no release guard** (this is a per-record
+/// hot path); any future `sort_key` producer must uphold this contract.
 #[allow(clippy::uninit_vec, unsafe_code)]
 pub fn radix_sort_record_refs_with_max(refs: &mut [RecordRef], max_key: u64) {
     let n = refs.len();

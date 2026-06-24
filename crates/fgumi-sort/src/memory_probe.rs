@@ -88,8 +88,10 @@ mod platform_ffi {
 
     /// Read the current process resident-set size in bytes.
     ///
-    /// Returns `None` if the platform sampler is unavailable (e.g. `/proc` is not
-    /// mounted on a non-Linux host and the `sysinfo` fallback fails).
+    /// Returns `None` on platforms without a sampler (anything other than Linux
+    /// or macOS), or if the platform sampler fails (e.g. `/proc/self/status` is
+    /// unreadable). There is no `sysinfo` fallback — the samplers below are the
+    /// only sources.
     ///
     /// # Implementation
     ///
@@ -97,11 +99,11 @@ mod platform_ffi {
     ///   no allocations on the hot path beyond the status string itself.
     /// - **macOS**: reads `phys_footprint` from `task_info(TASK_VM_INFO)`. This is
     ///   what Activity Monitor reports as "Memory" and excludes purgeable
-    ///   `MADV_FREE` pages, unlike `task_basic_info::resident_size` (which sysinfo
-    ///   uses). For sort memory diagnosis we need this metric — Darwin keeps
-    ///   freed pages in `resident_size` until kernel pressure forces eviction,
-    ///   which produces a misleading ~30 GiB peak when mimalloc has actually
-    ///   already purged them.
+    ///   `MADV_FREE` pages, unlike the older `task_basic_info::resident_size`
+    ///   metric. For sort memory diagnosis we need `phys_footprint` — Darwin
+    ///   keeps freed pages in `resident_size` until kernel pressure forces
+    ///   eviction, which produces a misleading ~30 GiB peak when mimalloc has
+    ///   actually already purged them.
     #[cfg(target_os = "macos")]
     #[must_use]
     pub fn process_rss_bytes() -> Option<u64> {
@@ -435,7 +437,7 @@ pub struct MergeProbe {
 impl MergeProbe {
     /// Sample the RSS every this-many merged records when probe logging is on.
     /// Chosen to give ~20 samples on a 200M-record merge — fine-grained enough
-    /// to see the growth-curve shape, sparse enough that the sysinfo/proc
+    /// to see the growth-curve shape, sparse enough that the RSS
     /// sampling overhead is negligible.
     pub const SAMPLE_INTERVAL_RECORDS: u64 = 1_000_000;
 
@@ -542,8 +544,8 @@ mod tests {
 
     #[test]
     fn test_process_rss_bytes_returns_plausible_value() {
-        // Every host we target has either /proc/self/status or a working
-        // sysinfo fallback, so this should not return None in CI.
+        // Every host we target is Linux (/proc/self/status) or macOS
+        // (task_info), so this should not return None in CI.
         let rss = process_rss_bytes().expect("RSS sampling should work on supported platforms");
         // 1 MiB is a safe lower bound for any running Rust process.
         assert!(rss >= 1024 * 1024, "RSS {rss} is implausibly small");

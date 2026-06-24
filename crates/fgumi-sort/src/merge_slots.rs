@@ -7,8 +7,8 @@
 //! queue, parses records, drives the k-way merge) via
 //! `Arc<SortMergeSlot>` clones.
 //!
-//! # Per-slot bounded queue design (v4 — see
-//! `docs/design/sort-step-split-parity-fix.md`)
+//! # Per-slot bounded queue design (v4 — see commit `9c39dea` / PR #389 and
+//! `docs/design/sort-phase2-unification-deferral.md`)
 //!
 //! Each slot carries a bounded queue of decompressed BGZF blocks
 //! (`PHASE2_DECOMP_CAP` entries). Backpressure lives here — the
@@ -61,6 +61,22 @@
 //! eliminating the `raw_blocks` queue, the in-flight counter, the
 //! reorder buffer (FIFO suffices because one worker reads per slot
 //! at a time via the reader lock), and the gap-filler escape.
+//!
+//! ## The OTHER Phase-2 implementation (`worker_pool.rs`) still has all of
+//! this — by design.
+//!
+//! Standalone file-to-file `fgumi sort` uses `worker_pool::Phase2FileState`
+//! plus the gap-filler this module dropped. That path is NOT broken: its merge
+//! consumer is a parked OS thread (no framework Skip), so the v4 deadlock
+//! cannot occur there, and its single-reader/**multi-decompressor** topology
+//! genuinely needs the reorder buffer + in-flight counter (a plain FIFO
+//! suffices HERE only because read-and-decompress is one inline op, so blocks
+//! decompress strictly in read order). Unifying the two drivers is a deferred
+//! goal — see commit `9d6d7e9` / PR #395 and
+//! `docs/design/sort-phase2-unification-deferral.md` — gated on this streaming
+//! path gaining file-to-file drive + `--write-index` + `--verify` + a
+//! deadlock-safe consumer.
+// TODO(#395): unify the two Phase-2 sort drivers — see docs/design/sort-phase2-unification-deferral.md
 
 use std::collections::VecDeque;
 use std::fs::File;

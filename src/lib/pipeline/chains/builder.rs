@@ -445,8 +445,9 @@ impl<'a> ChainBuilder<'a> {
         // Opening the source here would be wasted work — and for a stdin input
         // it would drain the pipe before `SortBamFile` reads it, leaving the
         // engine to fail on an empty stdin. The header resolved here is unused
-        // by the sort-terminal branch, so skip the open entirely.
-        let sort_terminal = matches!(spec.stages.as_slice(), [Stage::Sort]);
+        // by the sort-terminal branch, so skip the open entirely. Single-sourced
+        // with `build_for`'s source/sink skip via `ChainSpec::is_sort_terminal`.
+        let sort_terminal = spec.is_sort_terminal();
         let (header, pending_source) = if sort_terminal {
             (Header::default(), None)
         } else {
@@ -2047,6 +2048,7 @@ impl<'a> ChainBuilder<'a> {
                 output_compression: self.spec.compression.compression_level,
                 command_line: self.spec.command_line.clone(),
                 stats_slot: Arc::clone(&stats_slot),
+                async_reader: self.spec.async_reader,
             })?;
 
             // Register SortBamFile as a source (Input = (), Outputs = ()).

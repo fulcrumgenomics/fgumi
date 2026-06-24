@@ -31,7 +31,7 @@
 use anyhow::{Result, bail};
 
 use crate::pipeline::chains::{
-    BuiltPipeline, ChainSpec, Stage,
+    BuiltPipeline, ChainSpec,
     builder::{ChainBuilder, StagePosition},
     validate::{
         validate_cross_stage_constraints, validate_stage_opts_present, validate_stage_progression,
@@ -81,8 +81,9 @@ pub fn build_for(spec: ChainSpec) -> Result<BuiltPipeline> {
     }
 
     // Sort-terminal special case: SortBamFile is self-contained (reads/writes
-    // files directly). Skip add_source and add_sink.
-    let sort_terminal = matches!(spec.stages.as_slice(), [Stage::Sort]);
+    // files directly). Skip add_source and add_sink. Single-sourced with
+    // `ChainBuilder::new`'s header-open skip via `ChainSpec::is_sort_terminal`.
+    let sort_terminal = spec.is_sort_terminal();
 
     let mut chain = ChainBuilder::new(&spec)?;
 

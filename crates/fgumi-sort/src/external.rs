@@ -833,12 +833,6 @@ impl<K: RawSortKey + Default + 'static> MemorySources<K> {
 /// recently read record's bytes; `Memory`/`MemoryOwned` borrow directly from
 /// their backing store, eliminating the per-record memcpy on the in-memory path.
 enum ChunkSource<K: RawSortKey + Default + 'static> {
-    /// Disk-based chunk with prefetching reader (legacy path with per-source threads).
-    Disk {
-        reader: GenericKeyedChunkReader<K>,
-        /// Bytes for the current record (filled by the most recent `advance`).
-        scratch: Vec<u8>,
-    },
     /// In-memory chunk from an inline-buffer sort (coordinate / template).
     /// All records borrow their bytes from a shared `Arc<SegmentedBuf>`;
     /// `current_bytes` borrows them directly (zero-copy).
@@ -867,7 +861,6 @@ impl<K: RawSortKey + Default + 'static> ChunkSource<K> {
     /// record's bytes without copying.
     fn advance(&mut self, consumer: Option<&mut MainThreadChunkConsumer<K>>) -> Result<Option<K>> {
         match self {
-            ChunkSource::Disk { reader, scratch } => reader.next_record(scratch),
             ChunkSource::PoolDisk { source_id, scratch } => {
                 let c = consumer.ok_or_else(|| {
                     anyhow::anyhow!(
@@ -907,11 +900,11 @@ impl<K: RawSortKey + Default + 'static> ChunkSource<K> {
     /// Caller MUST have received `Some(_)` from a prior `advance`. The merge
     /// loops uphold this: the init loop only retains a source whose first
     /// `advance` returned `Some`, and the main loop only calls this on the
-    /// active tree winner — so the `Disk`/`PoolDisk` empty-scratch case is
+    /// active tree winner — so the `PoolDisk` empty-scratch case is
     /// unreachable.
     fn current_bytes(&self) -> &[u8] {
         match self {
-            ChunkSource::Disk { scratch, .. } | ChunkSource::PoolDisk { scratch, .. } => scratch,
+            ChunkSource::PoolDisk { scratch, .. } => scratch,
             ChunkSource::Memory { chunk, idx } => {
                 debug_assert!(*idx != usize::MAX, "current_bytes called before advance");
                 chunk.record_bytes(*idx)
@@ -1044,8 +1037,19 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
                 if let Some(data) = guard.try_pop_next() {
                     drop(guard);
                     let st = &mut self.parser_state[source_id];
-                    st.current_buf = data;
+                    let exhausted = std::mem::replace(&mut st.current_buf, data);
                     st.current_pos = 0;
+                    // Recycle the just-exhausted block back to the shared
+                    // decompression buffer pool so zstd workers can reuse the
+                    // allocation for the next frame (BGZF decompress returns its
+                    // own buffers and does not check out, so skip it there). The
+                    // initial `current_buf` is a zero-capacity `Vec` that was
+                    // never checked out, so don't return it to the pool.
+                    if matches!(file.codec, crate::codec::SpillCodec::Zstd)
+                        && exhausted.capacity() != 0
+                    {
+                        file.buffer_pool.checkin(exhausted);
+                    }
                     return Ok(true);
                 }
             }
@@ -1069,6 +1073,19 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
 
             // Source produced everything it ever will?
             if file.is_drained() {
+                // Recycle the terminal zstd block: nothing replaces `current_buf`
+                // after a source drains, so without this the last decompression
+                // allocation for each source lingers in `parser_state` until the
+                // whole merge ends — one retained buffer per spill file. (BGZF
+                // returns its own buffers and never checks out; the initial
+                // zero-capacity `Vec` was never checked out either.)
+                let st = &mut self.parser_state[source_id];
+                if matches!(file.codec, crate::codec::SpillCodec::Zstd)
+                    && st.current_buf.capacity() != 0
+                {
+                    file.buffer_pool.checkin(std::mem::take(&mut st.current_buf));
+                    st.current_pos = 0;
+                }
                 return Ok(false);
             }
 
@@ -2434,10 +2451,12 @@ impl RawExternalSorter {
             // Sort remaining records into separate sub-array chunks (avoids
             // intermediate merge back into a single sorted buffer). The
             // queryname path accumulates records as individual `RawRecord`
-            // allocations upstream (per-record alloc already paid), so we
-            // sort the keyed `Vec`s in place and pack the owned `RawRecord`s
-            // into `MemorySources::Owned` for the merge interface — unlike
-            // the inline-buffer paths (coordinate, template), which produce
+            // allocations upstream (per-record alloc already paid; this is the
+            // documented S3-015 tradeoff — see
+            // docs/design/sort-queryname-arena-deferral.md), so we sort the
+            // keyed `Vec`s in place and pack the owned `RawRecord`s into
+            // `MemorySources::Owned` for the merge interface — unlike the
+            // inline-buffer paths (coordinate, template), which produce
             // `InMemoryChunk`s sharing an `Arc<SegmentedBuf>`.
             let keyed_chunks: Vec<Vec<(K, fgumi_raw_bam::RawRecord)>> = if entries.is_empty() {
                 Vec::new()
@@ -2829,41 +2848,32 @@ impl RawExternalSorter {
 
     /// Build chunk sources from disk files and in-memory chunks.
     ///
-    /// When `pool_decompress` is true, disk sources become `PoolDisk` variants —
-    /// workers read and decompress in the background, main thread parses records.
-    /// No per-source threads are spawned.
-    ///
-    /// When `pool_decompress` is false, disk sources use `GenericKeyedChunkReader`
-    /// with its own per-source background thread. Used by the indexing path, which
-    /// does not yet support pool-integrated decompression.
+    /// Disk files become `PoolDisk` sources: pool workers read and decompress
+    /// them via work-stealing while the main thread parses records, so no
+    /// per-source threads are spawned. In-memory chunks are appended as-is.
+    /// (The index/verify path does not call this — it builds
+    /// `GenericKeyedChunkReader` directly via `run_merge_loop`.)
     fn build_chunk_sources<K: RawSortKey + Default + 'static>(
         chunk_files: &[PathBuf],
         memory_chunks: MemorySources<K>,
-        reader_concurrency: usize,
-        pool_decompress: bool,
         pool: &Arc<SortWorkerPool>,
     ) -> Result<Vec<ChunkSource<K>>> {
         let num_disk = chunk_files.len();
         let num_memory = memory_chunks.num_non_empty();
         let mut sources: Vec<ChunkSource<K>> = Vec::with_capacity(num_disk + num_memory);
 
-        if pool_decompress && !chunk_files.is_empty() {
-            // Pool-integrated path: install per-file Phase 2 state on the
-            // pool, then create one PoolDisk source per file. Workers
-            // cooperatively read+decompress all files via work-stealing.
+        if !chunk_files.is_empty() {
+            // Install per-file Phase 2 state on the pool, then create one
+            // PoolDisk source per file. Workers cooperatively read+decompress
+            // all files via work-stealing. (The legacy per-source-reader-thread
+            // `ChunkSource::Disk` branch was removed in S3-003 slimming: it was
+            // never reachable — `merge_chunks_generic` is the only caller and
+            // always used the pool path; the index/verify path builds
+            // `GenericKeyedChunkReader` directly via `run_merge_loop`.)
             pool.set_phase2_files(chunk_files)?;
 
             for source_id in 0..num_disk {
                 sources.push(ChunkSource::PoolDisk { source_id, scratch: Vec::new() });
-            }
-        } else {
-            // Legacy path: per-source reader threads (used by indexing path)
-            let sem = make_reader_semaphore(reader_concurrency);
-            for path in chunk_files {
-                sources.push(ChunkSource::Disk {
-                    reader: GenericKeyedChunkReader::<K>::open(path, Some(Arc::clone(&sem)))?,
-                    scratch: Vec::new(),
-                });
             }
         }
 
@@ -2891,7 +2901,6 @@ impl RawExternalSorter {
         use crate::pooled_bam_writer::PooledBamWriter;
         use crate::worker_pool::phase;
 
-        let reader_concurrency: usize = 1;
         let num_disk = chunk_files.len();
 
         if num_disk > 0 {
@@ -2902,13 +2911,7 @@ impl RawExternalSorter {
             );
         }
 
-        let mut sources = Self::build_chunk_sources::<K>(
-            chunk_files,
-            memory_chunks,
-            reader_concurrency,
-            true,
-            pool,
-        )?;
+        let mut sources = Self::build_chunk_sources::<K>(chunk_files, memory_chunks, pool)?;
 
         let num_sources = sources.len();
         debug!("Merging from {num_sources} sources...");
@@ -5539,6 +5542,14 @@ mod tests {
         RawReadAheadReader::new(reader).count() as u64
     }
 
+    /// Read every record body of a BAM file into a `Vec<Vec<u8>>` for exact
+    /// output comparison.
+    fn read_all_bam_records(path: &std::path::Path) -> Vec<Vec<u8>> {
+        use crate::read_ahead::RawReadAheadReader;
+        let (reader, _) = create_raw_bam_reader(path, 1).expect("failed to create raw BAM reader");
+        RawReadAheadReader::new(reader).map(|r| r.as_ref().to_vec()).collect()
+    }
+
     /// Verifies that sort with consolidation preserves all records.
     ///
     /// Uses a tiny memory limit and low `max_temp_files` to force many chunks and
@@ -5678,6 +5689,67 @@ mod tests {
         let expected = (num_pairs * 2) as u64;
         let observed = count_bam_records(&output);
         assert_eq!(observed, expected, "semaphore-capped merge lost data");
+    }
+
+    /// S3-008: the zstd Phase-2 decompress path recycles block buffers through
+    /// the shared pool (worker checks out, merge consumer checks back in).
+    /// Force many zstd spill chunks so the pool is cycled well past its
+    /// capacity, and assert the recycled-buffer merge output is byte-identical
+    /// to an in-memory sort of the same input (recycling must not corrupt,
+    /// reorder, drop, or duplicate records).
+    #[rstest::rstest]
+    #[case::coordinate(SortOrder::Coordinate)]
+    #[case::queryname_natural(SortOrder::Queryname(QuerynameComparator::Natural))]
+    #[case::template_coordinate(SortOrder::TemplateCoordinate)]
+    fn test_zstd_phase2_buffer_recycling_preserves_output(#[case] sort_order: SortOrder) {
+        use fgumi_sam::SamBuilder;
+
+        let num_pairs = 300;
+        let mut builder = SamBuilder::new();
+        for i in 0..num_pairs {
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i}"))
+                .start1((i * 7 % 4000) + 1)
+                .start2((i * 7 % 4000) + 101)
+                .build();
+        }
+
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
+        let input = dir.path().join("input.bam");
+        builder.write_bam(&input).expect("failed to write BAM");
+
+        // Spilled zstd sort: a tiny memory limit forces many chunks → many
+        // Phase-2 zstd decompress blocks cycled through the recycling pool.
+        let spilled = dir.path().join("spilled.bam");
+        let stats = RawExternalSorter::new(sort_order)
+            .memory_limit(16 * 1024)
+            .threads(2)
+            .spill_codec(crate::codec::SpillCodec::Zstd)
+            .temp_compression(3)
+            .output_compression(0)
+            .sort(&input, &spilled)
+            .expect("spilled zstd sort should succeed");
+        assert!(
+            stats.chunks_written >= 3,
+            "expected several zstd spill chunks to cycle the buffer pool, got {}",
+            stats.chunks_written
+        );
+
+        // In-memory reference sort (no spill, no Phase-2 decompression).
+        let in_memory = dir.path().join("in_memory.bam");
+        RawExternalSorter::new(sort_order)
+            .memory_limit(256 * 1024 * 1024)
+            .threads(2)
+            .output_compression(0)
+            .sort(&input, &in_memory)
+            .expect("in-memory sort should succeed");
+
+        assert_eq!(
+            read_all_bam_records(&spilled),
+            read_all_bam_records(&in_memory),
+            "zstd-spilled recycled-buffer merge must match the in-memory sort exactly",
+        );
     }
 
     // ========================================================================

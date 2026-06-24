@@ -32,7 +32,7 @@ use fgumi_cli_common::{
 };
 use fgumi_pipeline_core::{FinalizeHook, Pipeline, PipelineConfig};
 use fgumi_sam::SamTag;
-use fgumi_sort::{QuerynameComparator, SortOrder, verify_sort_order};
+use fgumi_sort::{KeyTypesSpec, QuerynameComparator, SortOrder, SpillCodec, verify_sort_order};
 use log::info;
 use parking_lot::Mutex;
 
@@ -306,6 +306,25 @@ pub struct SortOptions {
     #[arg(long = "temp-compression", default_value = "1", value_parser = clap::value_parser!(u32).range(0..=9))]
     pub temp_compression: u32,
 
+    /// Codec for temporary spill files: `zstd` (default) or `bgzf`.
+    ///
+    /// Spill files are internal to the sort and never read by other tools, so
+    /// `zstd` is the default — it is faster than `bgzf` on every axis. Pass
+    /// `bgzf` for the legacy on-disk format, or to use `--temp-compression 0`
+    /// (uncompressed spill), which zstd does not support.
+    #[arg(long = "temp-codec", default_value = "zstd")]
+    pub temp_codec: SpillCodec,
+
+    /// Expert override for which sort-key lanes to provision (template-coordinate
+    /// order only).
+    ///
+    /// Omitted (default) auto-detects the narrowest key from the first record.
+    /// Accepts `full`, `none` (or empty), or a comma/space list of `cb`,
+    /// `library`, `mi` (`library`/`mi` both map to the shared tertiary lane).
+    /// Ignored for non-template-coordinate orders.
+    #[arg(long = "key-types", value_parser = parse_key_types)]
+    pub key_types: Option<KeyTypesSpec>,
+
     /// Sort order (chain-builder slot).
     ///
     /// Carried here so the chain builder can read it from the bag without
@@ -323,9 +342,41 @@ impl Default for SortOptions {
             memory_per_thread: true,
             tmp_dirs: Vec::new(),
             temp_compression: 1,
+            temp_codec: SpillCodec::default(),
+            key_types: None,
             order: SortOrderArg::TemplateCoordinate,
         }
     }
+}
+
+/// Parse `--key-types` into a [`KeyTypesSpec`].
+///
+/// `full` | `none`/`""` | comma/space list of `cb`,`library`,`mi`. Unknown
+/// tokens are rejected. `library`, `mi`, and `library,mi` all map to the shared
+/// `tertiary` lane.
+pub(crate) fn parse_key_types(s: &str) -> Result<KeyTypesSpec, String> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("full") {
+        return Ok(KeyTypesSpec::Full);
+    }
+    if s.is_empty() || s.eq_ignore_ascii_case("none") {
+        return Ok(KeyTypesSpec::None);
+    }
+    let mut cb = false;
+    let mut tertiary = false;
+    for tok in s.split([',', ' ']).filter(|t| !t.is_empty()) {
+        match tok.to_ascii_lowercase().as_str() {
+            "cb" => cb = true,
+            "library" | "mi" => tertiary = true,
+            other => {
+                return Err(format!(
+                    "unknown --key-types token '{other}', expected 'full', 'none', \
+                     or a list of 'cb','library','mi'"
+                ));
+            }
+        }
+    }
+    Ok(KeyTypesSpec::Explicit { cb, tertiary })
 }
 
 /// Environment variable name for the fallback temp-dir list, parsed as a
@@ -409,6 +460,28 @@ impl Command for Sort {
             bail!("--write-index is only valid for coordinate sort");
         }
 
+        // Up-front guard (S3-002): zstd has no uncompressed mode, so reject the
+        // `--temp-compression 0` + `--temp-codec zstd` combination before the run
+        // starts rather than failing late. (The engine also enforces this via
+        // `ensure_spill_codec_compat`, but catching it here gives a CLI-level
+        // message and avoids any setup work.)
+        if self.options.temp_compression == 0 && matches!(self.options.temp_codec, SpillCodec::Zstd)
+        {
+            bail!(
+                "--temp-compression 0 is only supported with --temp-codec bgzf; \
+                 zstd does not have an uncompressed mode. Pass --temp-codec bgzf \
+                 to keep uncompressed spill, or use a zstd level >= 1."
+            );
+        }
+
+        // `--key-types` only applies to template-coordinate sort; warn if set for
+        // any other order so the override is not silently ignored.
+        if self.options.key_types.is_some()
+            && !matches!(self.order, SortOrderArg::TemplateCoordinate)
+        {
+            info!("--key-types is ignored for --order {:?}", self.order);
+        }
+
         // Copy order into SortOptions so the step factory can read it.
         let mut sort_opts = self.options.clone();
         sort_opts.order = self.order;
@@ -454,6 +527,7 @@ impl Sort {
             output_compression: self.compression.compression_level,
             command_line: command_line.to_string(),
             stats_slot: Arc::clone(&stats_slot),
+            async_reader: self.async_reader,
         })?;
 
         // SortBamFile has `Input = ()` and `Outputs = ()`, so it registers via
@@ -667,6 +741,112 @@ mod tests {
         assert_eq!(sort.options.memory_reserve, defaults.memory_reserve);
         assert_eq!(sort.options.memory_per_thread, defaults.memory_per_thread);
         assert_eq!(sort.options.temp_compression, defaults.temp_compression);
+        assert_eq!(sort.options.temp_codec, defaults.temp_codec);
+        assert_eq!(sort.options.temp_codec, SpillCodec::Zstd, "default spill codec is zstd");
+        assert_eq!(sort.options.key_types, defaults.key_types);
+        assert_eq!(sort.options.key_types, None, "--key-types defaults to Auto (None)");
+    }
+
+    #[rstest]
+    #[case::default_omitted(&["sort", "-i", "in.bam", "-o", "out.bam"], SpillCodec::Zstd)]
+    #[case::explicit_zstd(
+        &["sort", "-i", "in.bam", "-o", "out.bam", "--temp-codec", "zstd"],
+        SpillCodec::Zstd
+    )]
+    #[case::explicit_bgzf(
+        &["sort", "-i", "in.bam", "-o", "out.bam", "--temp-codec", "bgzf"],
+        SpillCodec::Bgzf
+    )]
+    fn test_temp_codec_parses(#[case] args: &[&str], #[case] expected: SpillCodec) {
+        let sort = Sort::try_parse_from(args).expect("parse");
+        assert_eq!(sort.options.temp_codec, expected);
+    }
+
+    #[test]
+    fn test_parse_key_types() {
+        assert_eq!(parse_key_types("full").unwrap(), KeyTypesSpec::Full);
+        assert_eq!(parse_key_types("none").unwrap(), KeyTypesSpec::None);
+        assert_eq!(parse_key_types("").unwrap(), KeyTypesSpec::None);
+        assert_eq!(
+            parse_key_types("cb").unwrap(),
+            KeyTypesSpec::Explicit { cb: true, tertiary: false }
+        );
+        // `library` and `mi` both map to the shared tertiary lane.
+        assert_eq!(
+            parse_key_types("library").unwrap(),
+            KeyTypesSpec::Explicit { cb: false, tertiary: true }
+        );
+        assert_eq!(
+            parse_key_types("mi").unwrap(),
+            KeyTypesSpec::Explicit { cb: false, tertiary: true }
+        );
+        assert_eq!(
+            parse_key_types("cb, mi").unwrap(),
+            KeyTypesSpec::Explicit { cb: true, tertiary: true }
+        );
+        assert!(parse_key_types("bogus").is_err(), "unknown token must be rejected");
+    }
+
+    #[test]
+    fn test_temp_compression_zero_with_zstd_rejected_up_front() {
+        // zstd has no uncompressed mode — the combination must be rejected
+        // before the sort runs (S3-002). Use a valid input so the up-front
+        // config guard, not input validation, is what fires.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("in.bam");
+        let output = dir.path().join("out.bam");
+        write_coordinate_bam(&input);
+
+        let sort = Sort::try_parse_from([
+            "sort",
+            "-i",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--temp-compression",
+            "0",
+            "--temp-codec",
+            "zstd",
+        ])
+        .expect("parse");
+        let err = sort.execute("fgumi sort").expect_err("zstd + level 0 must be rejected");
+        assert!(
+            err.to_string().contains("only supported with --temp-codec bgzf"),
+            "unexpected error: {err}"
+        );
+        assert!(!output.exists(), "no output should be written when the config is rejected");
+    }
+
+    #[test]
+    fn test_temp_compression_zero_with_bgzf_runs() {
+        // bgzf supports uncompressed (level-0) spill, so the combination is
+        // accepted and the sort completes.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("in.bam");
+        let output = dir.path().join("out.bam");
+        write_coordinate_bam(&input);
+
+        let sort = Sort::try_parse_from([
+            "sort",
+            "-i",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--order",
+            "coordinate",
+            // Bound the memory reservation: the default is 768 MiB per thread,
+            // which a single-record test should not reserve (especially under
+            // nextest's concurrent execution).
+            "--max-memory",
+            "16MiB",
+            "--temp-compression",
+            "0",
+            "--temp-codec",
+            "bgzf",
+        ])
+        .expect("parse");
+        sort.execute("fgumi sort").expect("bgzf level-0 spill must sort successfully");
+        assert!(output.exists(), "sorted output not written");
     }
 
     /// Write a minimal valid coordinate-sorted BAM (one mapped record) to

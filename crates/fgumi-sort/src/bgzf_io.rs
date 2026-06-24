@@ -16,6 +16,16 @@ use std::sync::Arc;
 /// Padding beyond `BGZF_MAX_BLOCK_SIZE` for the staging buffer capacity.
 const STAGING_PADDING: usize = 4096;
 
+/// Nominal upper bound on the uncompressed size of a single staging frame (one
+/// `CompressJob`'s `data`). The staging buffer flushes at `BGZF_MAX_BLOCK_SIZE`
+/// and is sized with `STAGING_PADDING` of headroom, so a flushed frame is
+/// bounded by this for normal record sizes. Consumers that size a decompression
+/// buffer for these frames (the zstd Phase-2 path in `worker_pool`) link their
+/// capacity to this constant via a compile-time assertion so the two cannot
+/// silently drift apart.
+pub(crate) const STAGING_FRAME_MAX_UNCOMPRESSED_BYTES: usize =
+    BGZF_MAX_BLOCK_SIZE + STAGING_PADDING;
+
 /// Staging buffer that accumulates data and submits full blocks to the pool.
 pub(crate) struct StagingBuffer {
     pool: Arc<SortWorkerPool>,

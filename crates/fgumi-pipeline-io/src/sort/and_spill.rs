@@ -185,19 +185,23 @@ impl SortAndSpill {
                 records_ingested_so_far: total_records,
             });
         }
-        let slot_count = u32::try_from(pending_events.len()).expect("spill count fits in u32");
-        let mut memory_chunk_count: u32 = 0;
+        // Derive both announced counts the same way — `u32::try_from` on the
+        // number of pushed events — so the two overflow guards are symmetric and
+        // can't drift (a `slot_count` cast that panics differently from a
+        // `memory_chunk_count` accumulator would mask a protocol bug).
+        let slot_count = u32::try_from(pending_events.len()).expect("spill slot count fits in u32");
+        let memory_events_start = pending_events.len();
         for chunk in memory_chunks {
             if chunk.is_empty() {
                 continue;
             }
-            memory_chunk_count =
-                memory_chunk_count.checked_add(1).expect("memory chunk count fits in u32");
             pending_events.push_back(SortPhase1Event::MemoryChunk {
                 chunk: Arc::new(chunk),
                 records_ingested_so_far: total_records,
             });
         }
+        let memory_chunk_count = u32::try_from(pending_events.len() - memory_events_start)
+            .expect("memory chunk count fits in u32");
         if pending_events.is_empty() {
             return Ok(None);
         }
