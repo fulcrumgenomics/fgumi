@@ -185,6 +185,8 @@ pub fn format_duration(duration: std::time::Duration) -> String {
 ///
 /// assert_eq!(format_rate(1000, Duration::from_secs(1)), "1,000 items/s");
 /// assert_eq!(format_rate(600, Duration::from_secs(60)), "10 items/s");
+/// // Below one item per second the units switch to items/min.
+/// assert_eq!(format_rate(30, Duration::from_secs(60)), "30.0 items/min");
 /// ```
 #[must_use]
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -295,9 +297,9 @@ pub fn parse_memory_size(size_str: &str) -> FgumiResult<u64> {
         if mb_value > 1_000_000 {
             return Err(FgumiError::InvalidMemorySize {
                 reason: format!(
-                    "Plain number memory size too large: {} MiB. Use human-readable format like '{}GB' instead.",
+                    "Plain number memory size too large: {} MiB. Use human-readable format like '{}GiB' instead.",
                     mb_value,
-                    mb_value / 1000
+                    mb_value / 1024
                 ),
             });
         }
@@ -746,5 +748,54 @@ mod tests {
         // available = total.saturating_sub(margin) = 0; target = max(0, MIN) = MIN;
         // budget = MIN.min(0) = 0.
         assert_eq!(budget, 0);
+    }
+
+    #[test]
+    fn test_resolve_memory_budget_threads_zero_bails() {
+        // `threads == 0` is an invalid input and must bail before any
+        // per-thread arithmetic.
+        let err = resolve_memory_budget_with_total(
+            MemoryLimit::Fixed(512 * 1024 * 1024),
+            MemoryReserve::Auto,
+            0,
+            true,
+            32 * 1024 * 1024 * 1024,
+        )
+        .expect_err("threads == 0 must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--threads must be at least 1"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_resolve_memory_budget_fixed_per_thread_overflow() {
+        // Fixed(usize::MAX) × 2 threads overflows the `checked_mul`, which must
+        // surface an error rather than wrap.
+        let err = resolve_memory_budget_with_total(
+            MemoryLimit::Fixed(usize::MAX),
+            MemoryReserve::Auto,
+            2,
+            true,
+            32 * 1024 * 1024 * 1024,
+        )
+        .expect_err("Fixed per-thread multiplication must overflow");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("overflowed"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_resolve_memory_budget_auto_per_thread_overflow() {
+        // Construct an Auto config whose per-thread floor × threads overflows:
+        // with `total == usize::MAX` and a tiny reserve, `available` is enormous,
+        // so `(available / threads).max(MIN) * threads` overflows `usize`.
+        let err = resolve_memory_budget_with_total(
+            MemoryLimit::Auto,
+            MemoryReserve::Fixed(0),
+            usize::MAX,
+            true,
+            usize::MAX,
+        )
+        .expect_err("Auto per-thread multiplication must overflow");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("auto memory budget overflowed"), "got: {msg}");
     }
 }

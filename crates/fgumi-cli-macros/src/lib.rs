@@ -106,7 +106,7 @@ pub fn multi_options(attr: TokenStream, item: TokenStream) -> TokenStream {
         /// the runall command. Carries the same fields as the original
         /// options struct but exposes each via `--<prefix>::<flag>` and
         /// groups them under a help heading.
-        #[derive(clap::Args, Debug, Clone)]
+        #[derive(::clap::Args, Debug, Clone)]
         #[command(next_help_heading = #heading)]
         pub struct #multi_struct_name {
             #(#multi_field_tokens)*
@@ -117,7 +117,7 @@ pub fn multi_options(attr: TokenStream, item: TokenStream) -> TokenStream {
             /// options struct. Returns `Err` if any field that was
             /// required (no default + non-`Option`) was not supplied
             /// on the command line.
-            pub fn validate(self) -> anyhow::Result<#struct_name> {
+            pub fn validate(self) -> ::anyhow::Result<#struct_name> {
                 let opts = self;
                 Ok(#struct_name {
                     #(#validate_field_tokens)*
@@ -250,7 +250,13 @@ fn generate_field_tokens(
     let is_required = !is_option && !is_vec && !has_default;
 
     if is_required {
-        let required_doc = format!("{doc_comment} Required when {prefix} is selected.");
+        // Avoid a leading space when the source field has no doc comment
+        // (`doc_comment` is then the empty string).
+        let required_doc = if doc_comment.is_empty() {
+            format!("Required when {prefix} is selected.")
+        } else {
+            format!("{doc_comment} Required when {prefix} is selected.")
+        };
         let error_msg = format!("--{long_name} is required when {prefix} is selected");
 
         multi_field_tokens.push(quote! {
@@ -260,7 +266,7 @@ fn generate_field_tokens(
         });
         validate_field_tokens.push(quote! {
             #field_ident: opts.#prefixed_ident
-                .ok_or_else(|| anyhow::anyhow!(#error_msg))?,
+                .ok_or_else(|| ::anyhow::anyhow!(#error_msg))?,
         });
         from_original_field_tokens.push(quote! {
             #prefixed_ident: Some(opts.#field_ident),
@@ -271,8 +277,9 @@ fn generate_field_tokens(
         // and no `default_value_t` rewrite is possible (clap rejects
         // `default_value_t` on `Vec<T>`, and the macro strips any string
         // `default_value`).
+        let doc_attr = doc_attr_tokens(&doc_comment);
         multi_field_tokens.push(quote! {
-            #[doc = #doc_comment]
+            #doc_attr
             #[arg(long = #long_name #(#preserved)*)]
             pub #prefixed_ident: #field_type,
         });
@@ -307,8 +314,9 @@ fn generate_field_tokens(
         // generated code to compile and match the original's CLI
         // default.
         let default_attr = quote! { , default_value_t = #struct_name::default().#field_ident };
+        let doc_attr = doc_attr_tokens(&doc_comment);
         multi_field_tokens.push(quote! {
-            #[doc = #doc_comment]
+            #doc_attr
             #[arg(long = #long_name #default_attr #(#preserved)*)]
             pub #prefixed_ident: #field_type,
         });
@@ -476,6 +484,21 @@ fn extract_long_override(field: &syn::Field) -> Option<String> {
         }
     }
     None
+}
+
+/// Build a `#[doc = "..."]` attribute token for a Multi-struct field, or an
+/// empty token stream when the source field had no doc comment.
+///
+/// Emitting `#[doc = ""]` for an undocumented field is harmless but produces a
+/// stray empty doc attribute in the generated code; returning nothing keeps the
+/// generated output clean and avoids a leading-space artifact in concatenated
+/// doc strings.
+fn doc_attr_tokens(doc_comment: &str) -> proc_macro2::TokenStream {
+    if doc_comment.is_empty() {
+        quote! {}
+    } else {
+        quote! { #[doc = #doc_comment] }
+    }
 }
 
 /// Join all `#[doc = "..."]` attributes into a single trimmed string.

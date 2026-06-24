@@ -175,15 +175,22 @@ fn macro_treats_vec_t_as_repeating_pass_through() {
     assert_eq!(opts.repeated_paths, vec![1, 2, 3]);
 }
 
-/// Coverage for two attribute-handling fixes:
+/// Coverage for four attribute-handling fixes:
 ///
 ///   * `skip_with_expr` uses `#[arg(skip = expr)]`. The macro must use
 ///     the provided expression verbatim in `validate()` rather than
 ///     hard-wiring `BazOptions::default().skip_with_expr`.
+///   * `bare_skipped` uses a bare `#[arg(skip)]` (no `= expr`). The
+///     macro must fall back to `BazOptions::default().bare_skipped`
+///     (the struct default), NOT `u32::default()`.
 ///   * `conditionally_required` carries `#[arg(required = true)]`. The
 ///     macro must strip the `required = ...` name-value form so the
 ///     generated Multi field (an `Option<T>`) is not forced by clap
 ///     during parsing — required-ness is handled by `validate()`.
+///   * `tmp_dirs` carries `#[arg(long = "tmp-dir")]`, a `long` override
+///     that differs from the kebab of the field name. The macro must
+///     honor the override so the Multi flag is `--baz::tmp-dir`, NOT
+///     `--baz::tmp-dirs`.
 #[multi_options("baz", "Baz Options")]
 #[derive(Args, Debug, Clone, PartialEq)]
 pub struct BazOptions {
@@ -192,19 +199,37 @@ pub struct BazOptions {
     #[arg(skip = 99u32)]
     pub skip_with_expr: u32,
 
+    /// Bare-skipped field. Not exposed on the CLI; `validate()` must
+    /// pull its value from `BazOptions::default()`, not `u32::default()`.
+    #[arg(skip)]
+    pub bare_skipped: u32,
+
     /// Required (non-default) field that also carries `required = true`.
     /// The Multi side must wrap this as `Option<T>` and not propagate
     /// `required = true` to clap.
     #[arg(long, required = true)]
     pub conditionally_required: u32,
+
+    /// Repeatable field with a `long` override (`--tmp-dir`, not
+    /// `--tmp-dirs`). The Multi side must derive `--baz::tmp-dir`.
+    #[arg(long = "tmp-dir", action = clap::ArgAction::Append)]
+    pub tmp_dirs: Vec<u32>,
 }
 
 impl Default for BazOptions {
     fn default() -> Self {
         // `skip_with_expr`'s Default is deliberately non-zero (and different
         // from the `skip = 99u32` expression) so the test proves the macro
-        // emits the skip expression, not this Default value.
-        Self { skip_with_expr: 1, conditionally_required: 0 }
+        // emits the skip expression, not this Default value. `bare_skipped`'s
+        // Default is deliberately non-zero (and different from `u32::default()`
+        // == 0) so the bare-skip test proves the macro pulls from this struct
+        // Default rather than the field type's Default.
+        Self {
+            skip_with_expr: 1,
+            bare_skipped: 77,
+            conditionally_required: 0,
+            tmp_dirs: Vec::new(),
+        }
     }
 }
 
@@ -212,10 +237,64 @@ impl Default for BazOptions {
 fn skip_with_expr_uses_provided_expression_not_default() {
     // The skip expression is `99`, while `BazOptions::default().skip_with_expr`
     // is `0`. validate() must yield `99`, proving the expression is honored.
-    let multi = MultiBazOptions { baz_conditionally_required: Some(5) };
+    let multi = MultiBazOptions { baz_conditionally_required: Some(5), baz_tmp_dirs: Vec::new() };
     let opts = multi.validate().expect("validate should succeed");
     assert_eq!(opts.skip_with_expr, 99, "skip = 99 expression must be used verbatim");
     assert_eq!(opts.conditionally_required, 5);
+}
+
+#[test]
+fn bare_skip_falls_back_to_struct_default_not_type_default() {
+    // `bare_skipped` is `#[arg(skip)]` (no `= expr`), so the macro must
+    // populate it from `BazOptions::default().bare_skipped` (== 77), NOT
+    // `u32::default()` (== 0). It is not a CLI flag, so MultiBazOptions does
+    // not carry it.
+    let multi = MultiBazOptions { baz_conditionally_required: Some(1), baz_tmp_dirs: Vec::new() };
+    let opts = multi.validate().expect("validate should succeed");
+    assert_eq!(
+        opts.bare_skipped, 77,
+        "bare #[arg(skip)] must use the struct Default (77), not u32::default() (0)"
+    );
+}
+
+#[test]
+fn long_override_renames_multi_flag() {
+    // `tmp_dirs` carries `#[arg(long = "tmp-dir")]`, so the Multi flag must be
+    // `--baz::tmp-dir` (honoring the override), and `--baz::tmp-dirs` (the
+    // kebab of the field name) must be rejected.
+    #[derive(Parser, Debug)]
+    struct Wrapper {
+        #[command(flatten)]
+        baz_opts: MultiBazOptions,
+    }
+
+    // The overridden flag name parses.
+    let wrapper = Wrapper::try_parse_from([
+        "test-prog",
+        "--baz::conditionally-required",
+        "1",
+        "--baz::tmp-dir",
+        "3",
+        "--baz::tmp-dir",
+        "4",
+    ])
+    .expect("--baz::tmp-dir should parse");
+    let opts = wrapper.baz_opts.validate().expect("validate after parse");
+    assert_eq!(opts.tmp_dirs, vec![3, 4]);
+
+    // The field-name kebab (`--baz::tmp-dirs`) must NOT be a valid flag,
+    // proving the macro honored the `long = "tmp-dir"` override.
+    let err = Wrapper::try_parse_from([
+        "test-prog",
+        "--baz::conditionally-required",
+        "1",
+        "--baz::tmp-dirs",
+        "3",
+    ]);
+    assert!(
+        err.is_err(),
+        "--baz::tmp-dirs must be rejected (override renamed it to --baz::tmp-dir)"
+    );
 }
 
 #[test]
