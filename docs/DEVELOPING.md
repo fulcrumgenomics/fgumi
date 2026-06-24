@@ -108,6 +108,32 @@ At a minimum, all of the functions and data structures that are a part of the pr
 
 You are encouraged to include [examples](https://doc.rust-lang.org/rust-by-example/testing/doc_testing.html) in the function documentation, as these are also run as test cases.
 
+##### Building the documentation site
+
+The user-facing documentation site (published via [Read the Docs](https://fgumi.readthedocs.io/)) is built with [mdBook](https://rust-lang.github.io/mdBook/) from the sources under `docs/src/`. The per-tool and per-metric reference pages are generated from the CLI definitions by the `xtask` crate.
+
+Two tools must be installed locally to build the site:
+
+```bash
+cargo install mdbook --version 0.5.2
+# Broken-link checker backend. We use the mdbook-linkcheck2 fork because the
+# original mdbook-linkcheck is pinned to the mdBook 0.4 backend API and cannot
+# parse mdBook 0.5's RenderContext.
+cargo install mdbook-linkcheck2 --version 0.12.2
+```
+
+Then, from the repository root:
+
+```bash
+# Generate the markdown and build the site (output under docs/book/html/)
+cargo run --package xtask --release -- docs-build
+
+# Or serve it locally with live reload
+cargo run --package xtask --release -- docs
+```
+
+The `linkcheck2` backend fails the build on dead *internal* links (a link to a page that does not exist). This guards against regressions such as a reference page link that resolves to a file mdBook never renders. External (web) links are not followed, and bracketed literal text in the generated reference pages (e.g. `[ACGT]`) is reported only as a non-fatal warning. Because a second output backend is configured, mdBook writes the HTML site to `docs/book/html/` rather than `docs/book/`.
+
 
 #### Feature Flags for Development
 

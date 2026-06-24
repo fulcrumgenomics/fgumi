@@ -27,3 +27,20 @@ level = 1
 [output.html.playground]
 editable = false
 runnable = false
+
+# Broken-link checker (mdbook-linkcheck2 fork; see .readthedocs.yaml for why the
+# fork rather than mdbook-linkcheck). Configuring this as an output backend makes
+# `mdbook build` fail when an internal link points at a page that does not exist
+# -- e.g. the tools/README.html regression, where mdBook renders README.md to
+# index.html but does not rewrite links *targeting* README.md. mdBook on its own
+# only warns on such dead links, so the RTD build went green despite the bug.
+#
+# `follow-web-links = false`: do not hit the network. External links are out of
+# scope here and following them makes the build slow and flaky (and offline-broken).
+#
+# The default warning-policy is intentional: bracketed literal text in the
+# generated CLI/metrics docs (e.g. `[ACGT]`, `[cD]`, `[duplex, AB consensus, ...]`)
+# is reported as a non-fatal "incomplete link" *warning* and does not fail the
+# build, while genuine dead links remain hard errors.
+[output.linkcheck2]
+follow-web-links = false
