@@ -8,9 +8,19 @@ build:
     # Install mdbook
     - cargo install mdbook --version 0.5.2
 
+    # Install the broken-link checker backend. We use the `mdbook-linkcheck2`
+    # fork because the original `mdbook-linkcheck` is pinned to the mdBook 0.4
+    # backend API and cannot parse mdBook 0.5's RenderContext; the fork tracks
+    # mdBook 0.5. With `[output.linkcheck2]` in docs/book.toml this fails the
+    # build on dead internal links (the defense-in-depth that would have caught
+    # the tools/README.html regression -- mdBook itself only *warns*).
+    - cargo install mdbook-linkcheck2 --version 0.12.2
+
     # Generate documentation markdown and build the mdbook site
     - cargo run --package xtask --release -- docs-build
 
-    # Move output to where Read the Docs expects it
+    # Move output to where Read the Docs expects it. With a second output
+    # backend configured, mdBook writes the HTML site to book/html/ (rather
+    # than book/), so copy from there.
     - mkdir -p _readthedocs/html
-    - cp -r docs/book/. _readthedocs/html/
+    - cp -r docs/book/html/. _readthedocs/html/
