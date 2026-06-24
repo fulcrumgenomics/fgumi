@@ -1,9 +1,11 @@
 //! BAM writer factories and related types.
 //!
 //! This module provides writer factories for BAM output, including standard BAM writers,
-//! raw-bytes BAM writers, and a sidecar BAI writer (`write_bai_index`). Incremental
-//! indexing during write was removed in Phase 4 of issue #330; BAI generation now lives
-//! in the typed-step `IndexBamFinalizeHook` as a post-pipeline pass.
+//! raw-bytes BAM writers, and BAI sidecar helpers (`write_bai_index` for a prebuilt index,
+//! `write_bai_sidecar` to index a finished BAM and write `<bam>.bai` in one call, and
+//! `bai_sidecar_path` for the path convention). Incremental indexing during write was
+//! removed in Phase 4 of issue #330; BAI generation now lives in the typed-step
+//! `IndexBamFinalizeHook` as a post-pipeline pass that delegates to `write_bai_sidecar`.
 
 use anyhow::{Context, Result};
 use bgzf::CompressionLevel;
@@ -13,7 +15,7 @@ use noodles_bgzf::io::Writer as BgzfWriter;
 use std::fs::File;
 use std::io::{self, Write};
 use std::num::NonZero;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::paths::is_stdout_path;
 use crate::vendored::{MultithreadedWriter, MultithreadedWriterBuilder};
@@ -268,6 +270,52 @@ pub fn write_bai_index<P: AsRef<Path>>(path: P, index: &bai::Index) -> Result<()
     Ok(())
 }
 
+/// Append `.bai` to a BAM path to form its conventional sidecar index path.
+///
+/// This appends to the **full** path (samtools convention) rather than
+/// replacing the final extension:
+///
+/// - `foo.bam` → `foo.bam.bai`
+/// - `foo` (no extension) → `foo.bai`
+/// - `foo.sorted` → `foo.sorted.bai`
+///
+/// Using `Path::with_extension("bam.bai")` instead would replace whatever
+/// follows the last `.`, producing the correct result only for paths that end
+/// in exactly `.bam` and mis-naming every other path (`foo` → `foo.bam.bai`,
+/// `foo.sorted` → `foo.bam.bai`).
+#[must_use]
+pub fn bai_sidecar_path<P: AsRef<Path>>(bam_path: P) -> PathBuf {
+    let mut index_os = bam_path.as_ref().as_os_str().to_owned();
+    index_os.push(".bai");
+    PathBuf::from(index_os)
+}
+
+/// Build a BAI index for a finished coordinate-sorted BAM and write it to the
+/// conventional `<bam_path>.bai` sidecar, returning the path written.
+///
+/// The sidecar path is derived by [`bai_sidecar_path`] (append `.bai` to the
+/// full path), so BAMs whose path does not end in `.bam` still get a correctly
+/// named sidecar.
+///
+/// **Invariant:** the BAM at `bam_path` must be writer-closed before this is
+/// called — [`noodles::bam::fs::index`] re-reads the file from disk to compute
+/// virtual offsets, so any buffered writes must already be flushed.
+///
+/// # Errors
+/// Returns an error if indexing the BAM or writing the BAI sidecar fails.
+pub fn write_bai_sidecar<P: AsRef<Path>>(bam_path: P) -> Result<PathBuf> {
+    let bam_path = bam_path.as_ref();
+
+    let index = noodles::bam::fs::index(bam_path)
+        .with_context(|| format!("Failed to index {}", bam_path.display()))?;
+
+    let index_path = bai_sidecar_path(bam_path);
+    write_bai_index(&index_path, &index)
+        .with_context(|| format!("Failed to write BAI to {}", index_path.display()))?;
+
+    Ok(index_path)
+}
+
 /// Create a BAM writer and write the header in one operation.
 ///
 /// # Arguments
@@ -379,6 +427,21 @@ mod tests {
         );
         builder = builder.add_reference_sequence(b"chr1", ref_seq);
         builder.build()
+    }
+
+    #[test]
+    fn bai_sidecar_path_appends_dot_bai_to_full_path() {
+        // The samtools convention is to append `.bai` to the whole BAM path,
+        // not to replace the final extension. The previous
+        // `with_extension("bam.bai")` only produced the right answer for paths
+        // ending in exactly `.bam`; these cases pin the fix (S3-006 / S5b2-008).
+        assert_eq!(bai_sidecar_path("foo.bam"), PathBuf::from("foo.bam.bai"));
+        // Extensionless path: must become `foo.bai`, not `foo.bam.bai`.
+        assert_eq!(bai_sidecar_path("foo"), PathBuf::from("foo.bai"));
+        // Non-`.bam` extension: must keep the original name and append `.bai`.
+        assert_eq!(bai_sidecar_path("foo.sorted"), PathBuf::from("foo.sorted.bai"));
+        // Path with directory components is preserved.
+        assert_eq!(bai_sidecar_path("/tmp/run1/out.bam"), PathBuf::from("/tmp/run1/out.bam.bai"));
     }
 
     #[test]

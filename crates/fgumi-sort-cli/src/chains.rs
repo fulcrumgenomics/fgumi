@@ -69,11 +69,14 @@ impl FinalizeHook for SortFinalizeHook {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Post-pipeline action that builds a BAI index for a finished
-/// coordinate-sorted BAM, writing `<output>.bam.bai` next to the BAM.
+/// coordinate-sorted BAM, writing the `.bai` sidecar next to the BAM.
 ///
 /// Reads the BAM via `noodles::bam::fs::index` (which walks BGZF block offsets
-/// and computes virtual positions from the on-disk layout) and writes
-/// `<output>.bam.bai` next to the BAM via `fgumi_bam_io::write_bai_index`. This
+/// and computes virtual positions from the on-disk layout) and writes the
+/// sidecar via `fgumi_bam_io::write_bai_sidecar`, which derives the path by
+/// appending `.bai` to the full output path (samtools convention) — so
+/// `foo.bam` → `foo.bam.bai` and a non-`.bam` output like `foo.sorted` →
+/// `foo.sorted.bai`. This
 /// decouples indexing from the sort step itself: the sorter no longer needs
 /// single-threaded BGZF compression to track virtual offsets during write, and
 /// BAI generation lifts cleanly to a hook that any future BAM-with-index chain
@@ -102,8 +105,6 @@ impl FinalizeHook for IndexBamFinalizeHook {
     ///
     /// Returns an error if indexing or writing the BAI sidecar fails.
     fn finalize(self: Box<Self>) -> Result<()> {
-        use fgumi_bam_io::write_bai_index;
-        use noodles::bam;
         use std::time::Instant;
 
         let IndexBamFinalizeHook { output_path } = *self;
@@ -111,18 +112,10 @@ impl FinalizeHook for IndexBamFinalizeHook {
         info!("Indexing BAM: {}", output_path.display());
         let start = Instant::now();
 
-        let index = bam::fs::index(&output_path)
-            .map_err(|e| anyhow::anyhow!("Failed to index {}: {e}", output_path.display()))?;
-
-        // BAI convention: sit next to the BAM with `.bam.bai`, e.g.
-        // `foo.bam` → `foo.bam.bai`. The contract is "append `.bai` to the BAM
-        // path"; `with_extension` happens to produce the right result because
-        // the input always carries a single `.bam` extension. (Phase 4 moves
-        // this body into `fgumi_bam_io::write_bai_sidecar` and fixes the
-        // extensionless-path edge case once.)
-        let index_path = output_path.with_extension("bam.bai");
-        write_bai_index(&index_path, &index)
-            .map_err(|e| anyhow::anyhow!("Failed to write BAI to {}: {e}", index_path.display()))?;
+        // Index + write the `<output>.bai` sidecar in one call; the path is
+        // derived by appending `.bai` to the full BAM path (samtools
+        // convention), correct for any path — not just `*.bam`.
+        let index_path = fgumi_bam_io::write_bai_sidecar(&output_path)?;
         info!("Wrote BAM index: {} ({})", index_path.display(), format_duration(start.elapsed()));
 
         Ok(())
@@ -318,7 +311,7 @@ mod tests {
         let hook = Box::new(IndexBamFinalizeHook { output_path: bam_path.clone() });
         hook.finalize().expect("hook finalize");
 
-        let bai_path = bam_path.with_extension("bam.bai");
+        let bai_path = fgumi_bam_io::bai_sidecar_path(&bam_path);
         assert!(bai_path.exists(), "BAI not created at {}", bai_path.display());
         let index = noodles::bam::bai::fs::read(&bai_path).expect("read bai");
         assert!(!index.reference_sequences().is_empty(), "BAI has no reference sequences");

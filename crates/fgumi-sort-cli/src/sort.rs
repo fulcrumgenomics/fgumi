@@ -726,7 +726,7 @@ mod tests {
         // (missing) input before touching the output, so this file survives —
         // making the BAI's presence a clean signal of whether the index hook ran.
         write_coordinate_bam(&output);
-        let bai = output.with_extension("bam.bai");
+        let bai = fgumi_bam_io::bai_sidecar_path(&output);
         assert!(!bai.exists(), "precondition: no index before the failed sort");
 
         // A Sort configured to write the index on success.
