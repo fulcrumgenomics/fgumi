@@ -52,7 +52,11 @@ pub fn generate(docs_src: &Path) -> Result<Vec<ToolPage>> {
     }
 
     let index = render_tools_index(&by_category);
-    fs::write(tools_dir.join("README.md"), index)?;
+    // Name the index `index.md`, never `README.md`: mdBook renders both to
+    // `index.html`, but it does NOT rewrite links that target `README.md` — it
+    // only swaps the extension, producing a dead link to `tools/README.html`.
+    // Using `index.md` keeps the link and the rendered filename in agreement.
+    fs::write(tools_dir.join("index.md"), index)?;
 
     Ok(pages)
 }
@@ -354,6 +358,17 @@ mod tests {
         assert!(names.contains(&"merge"));
         assert!(names.contains(&"simplex-metrics"));
         assert!(names.len() >= 17);
+    }
+
+    #[test]
+    fn test_generate_writes_index_not_readme() {
+        // Regression guard for the broken `tools/README.html` link: the index
+        // page must be `index.md`, never `README.md` (see the write site for
+        // why mdBook mishandles links to `README.md`).
+        let tmp = tempfile::tempdir().unwrap();
+        generate(tmp.path()).unwrap();
+        assert!(tmp.path().join("tools/index.md").exists());
+        assert!(!tmp.path().join("tools/README.md").exists());
     }
 
     #[test]

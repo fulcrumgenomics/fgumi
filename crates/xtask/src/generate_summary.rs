@@ -92,7 +92,7 @@ pub fn generate(
 
     // ── Tool Reference ────────────────────────────────────────────────────────
     md.push_str("# Tool Reference\n\n");
-    md.push_str("- [Index](tools/README.md)\n");
+    md.push_str("- [Index](tools/index.md)\n");
 
     let mut by_category: BTreeMap<String, Vec<&ToolPage>> = BTreeMap::new();
     for page in tool_pages {
@@ -139,7 +139,7 @@ pub fn generate(
 
     // ── Metrics Reference ─────────────────────────────────────────────────────
     md.push_str("# Metrics Reference\n\n");
-    md.push_str("- [Index](metrics/README.md)\n");
+    md.push_str("- [Index](metrics/index.md)\n");
 
     // Group metrics by prefix into logical sections
     let metric_groups: &[(&str, &[&str])] = &[

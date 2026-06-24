@@ -72,4 +72,4 @@ cargo build --release
 | `simplex-metrics` | Collect simplex metrics |
 | `merge` | Merge sorted BAM files |
 
-See the [Tool Reference](tools/README.md) for detailed documentation of each command.
+See the [Tool Reference](tools/index.md) for detailed documentation of each command.

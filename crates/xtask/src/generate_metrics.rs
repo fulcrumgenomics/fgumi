@@ -63,7 +63,11 @@ pub fn generate(docs_src: &Path) -> Result<Vec<MetricPage>> {
     }
 
     let index = render_metrics_index(&all_metrics);
-    fs::write(metrics_dir.join("README.md"), index)?;
+    // Name the index `index.md`, never `README.md`: mdBook renders both to
+    // `index.html`, but it does NOT rewrite links that target `README.md` — it
+    // only swaps the extension, producing a dead link to `metrics/README.html`.
+    // Using `index.md` keeps the link and the rendered filename in agreement.
+    fs::write(metrics_dir.join("index.md"), index)?;
 
     Ok(pages)
 }
@@ -340,7 +344,7 @@ mod tests {
             fields: vec![],
         }];
         let index = render_metrics_index(&metrics);
-        // Link should be relative (no "metrics/" prefix), since README.md lives in metrics/
+        // Link should be relative (no "metrics/" prefix), since index.md lives in metrics/
         assert!(index.contains("(umi-grouping-metrics.md)"));
         assert!(!index.contains("(metrics/umi-grouping-metrics.md)"));
     }

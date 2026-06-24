@@ -15,7 +15,7 @@ fgumi commands produce structured metrics files for quality control and analysis
 | `simplex-metrics` | Comprehensive simplex QC metrics | `--output` (prefix) |
 | `group` | Family sizes, grouping metrics, position group sizes | `--metrics` (prefix), `--family-size-histogram`, `--grouping-metrics` |
 
-See the [Metrics Reference](../metrics/README.md) for field-level documentation of each metric type.
+See the [Metrics Reference](../metrics/index.md) for field-level documentation of each metric type.
 
 ## File Formats
 
