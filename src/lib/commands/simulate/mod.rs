@@ -77,7 +77,7 @@ impl SimulateCommand {
 #[allow(clippy::eq_op, clippy::cast_possible_truncation)]
 #[must_use]
 pub fn region_to_bin(start_1based: Option<u32>, end_1based: Option<u32>) -> u16 {
-    /// SAM spec §4.2.1: `reg2bin(-1, 0)` = 4680.
+    /// SAM spec §5.3 (indexing): `reg2bin(-1, 0)` = 4680.
     const UNMAPPED_BIN: u16 = 4680;
 
     let (Some(start_1), Some(end_1)) = (start_1based, end_1based) else {

@@ -338,7 +338,11 @@ fn bench_vanilla_consensus_caller(c: &mut Criterion) {
         let reads: Vec<RecordBuf> = (0..num_reads)
             .map(|i| {
                 let mut read_seq = seq.clone();
-                // Introduce small errors (~1% error rate)
+                // Introduce a single-base error on every 10th read. NOTE: this
+                // only fires for `i` a positive multiple of 10, so the smaller
+                // molecule sizes here (num_reads in {2, 3, 5}) get NO injected
+                // error and exercise the unanimous fast path; only num_reads
+                // 10 and 20 actually introduce a mismatch.
                 if i > 0 && i % 10 == 0 {
                     read_seq[i % read_len] = b"TGCA"[(read_seq[i % read_len] as usize) % 4];
                 }
@@ -403,6 +407,15 @@ fn bench_vanilla_consensus_caller(c: &mut Criterion) {
 // ============================================================================
 
 /// Compare using only the first 8 bytes as a u64 (O(1), wrong results, upper-bound test).
+///
+/// DEGENERATE for shared-prefix name styles: names whose first 8 bytes are
+/// identical (e.g. a common `read_`/`SRR…` prefix) all hash to the same `u64`
+/// and compare `Equal`, so this becomes a no-op (always-`Equal`) on such inputs
+/// rather than a representative comparator. It is only a meaningful O(1)
+/// lower-bound for name styles that diverge within their first 8 bytes. The
+/// `from_le_bytes` packing also makes the `u64` ordering byte-reversed relative
+/// to lexicographic order, so it does not model real name ordering even when it
+/// does discriminate.
 #[inline]
 fn compare_u64_hash(a: &[u8], b: &[u8]) -> Ordering {
     let a_val = if a.len() >= 8 {
@@ -713,7 +726,12 @@ fn bench_queryname_comparators(c: &mut Criterion) {
             },
         );
 
-        // Benchmark normalize_natural_key encoding throughput
+        // Benchmark normalize_natural_key encoding throughput.
+        //
+        // NOTE: this measures the buffer-REUSE path — `buf` is allocated once
+        // and cleared per call, so the per-call allocation cost is excluded.
+        // Production call sites that allocate a fresh buffer per call will be
+        // slower than this number; treat it as a lower bound on encode cost.
         group.bench_with_input(
             BenchmarkId::new("normalize_key_encode", style),
             &pairs,
@@ -1225,7 +1243,16 @@ fn bench_queryname_sort_strategies(c: &mut Criterion) {
             );
         });
 
-        // (h) Natural sort with allocation-free inline prefix
+        // (h) Natural sort with allocation-free inline prefix.
+        //
+        // NOTE: prefixes are pre-computed *outside* the timed loop (above), and
+        // the timed body is `sort_natural_with_norm_prefix` — identical to (f).
+        // So (h) and (f) measure the *same sort* and report the same timing by
+        // construction; the inline-prefix benefit is in prefix COMPUTATION
+        // (`normalize_prefix_inline` vs `precompute_norm_prefixes_for_sort`),
+        // which this bench does not time. Treat (h) as a sanity check that the
+        // inline-computed prefixes sort identically, not as a measurement of the
+        // inline-prefix speedup.
         group.bench_with_input(
             BenchmarkId::new("natural_inline_prefix", count),
             &(&names, &inline_prefixes),
@@ -1309,8 +1336,9 @@ fn bench_queryname_sort_strategies(c: &mut Criterion) {
 /// `bytes_needed` widens to the full 8 bytes whenever an unmapped read is
 /// present, since the unmapped sentinel is `u64::MAX`) against the
 /// mapped-max path (`bytes_needed` sized from the largest *mapped* key, ~4–5
-/// bytes), plus a `sort_unstable_by_key` baseline. The input mixes ~24 tids
-/// with a 5% unmapped tail to exercise the sentinel handling.
+/// bytes), plus a `sort_unstable_by_key` baseline. The input mixes 25 tids
+/// (`nref` only bounds the tid range `r % nref`; it does not affect key
+/// byte-packing) with a 5% unmapped tail to exercise the sentinel handling.
 fn bench_coordinate_radix_sort(c: &mut Criterion) {
     use fgumi_sort::{
         PackedCoordinateKey, RecordRef, radix_sort_record_refs, radix_sort_record_refs_with_max,

@@ -38,15 +38,30 @@ pub fn create_umi_family(
     sequence: &str,
     quality: u8,
 ) -> Vec<RawRecord> {
+    create_umi_family_at(99, umi, depth, base_name, sequence, quality)
+}
+
+/// Like [`create_umi_family`], but maps every read in the family to the explicit
+/// reference position `pos` instead of the fixed default. Lets callers spread
+/// families across distinct template-coordinate positions so the sort/group
+/// path is exercised across multiple positions (and parallel workers).
+pub fn create_umi_family_at(
+    pos: i32,
+    umi: &str,
+    depth: usize,
+    base_name: &str,
+    sequence: &str,
+    quality: u8,
+) -> Vec<RawRecord> {
     let seq = sequence.as_bytes();
-    let cigar_op = u32::try_from(seq.len()).expect("seq.len() fits u32") << 4; // NM
+    let cigar_op = u32::try_from(seq.len()).expect("seq.len() fits u32") << 4; // <len>M (op 0)
     (0..depth)
         .map(|i| {
             let name = format!("{base_name}_{i}");
             let mut b = SamBuilder::new();
             b.read_name(name.as_bytes())
                 .ref_id(0)
-                .pos(99)
+                .pos(pos)
                 .mapq(60)
                 .flags(0)
                 .cigar_ops(&[cigar_op])
@@ -471,6 +486,33 @@ mod tests {
                 Some(format!("test_{i}").as_bytes())
             );
             assert_eq!(buf.sequence().as_ref(), b"AAAA");
+        }
+    }
+
+    #[test]
+    fn create_umi_family_at_round_trips_pos() {
+        // `create_umi_family_at` is what spreads the determinism fixtures across
+        // multiple coordinates, but nothing else in this file asserts that the
+        // passed `pos` actually survives into the generated records — so a
+        // regression in `.pos(pos)` would silently collapse those fixtures to a
+        // single coordinate and make the multi-worker sort/group oracles
+        // vacuous. Pin the round-trip directly here. A non-default 0-based POS
+        // (distinct from `create_umi_family`'s 99) is checked both on the raw
+        // record (BAM stores POS 0-based) and via the noodles `RecordBuf`
+        // (1-based `Position`).
+        const POS: i32 = 4242;
+        let family = create_umi_family_at(POS, "ACGTACGT", 3, "atpos", "AAAA", 30);
+        assert_eq!(family.len(), 3);
+        for record in &family {
+            assert_eq!(record.pos(), POS, "raw 0-based POS must round-trip through the builder");
+            let buf = to_record_buf(record);
+            let start =
+                usize::from(buf.alignment_start().expect("mapped record has an alignment start"));
+            assert_eq!(
+                start,
+                usize::try_from(POS).expect("POS fits usize") + 1,
+                "1-based alignment_start must be the 0-based POS + 1",
+            );
         }
     }
 

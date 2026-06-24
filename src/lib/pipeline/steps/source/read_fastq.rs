@@ -61,6 +61,9 @@ pub struct FastqRawChunk {
     /// Per-stream round-robin cycle serial, for the `ZipFastqRecords` join.
     pub chunk_serial: u64,
     /// Decompressed raw FASTQ bytes, aligned to whole records (4 lines each).
+    ///
+    /// Rebuild this chunk rather than mutating it in place: an in-place edit
+    /// that breaks whole-record (4-line) alignment desyncs downstream parsing.
     pub data: Vec<u8>,
 }
 

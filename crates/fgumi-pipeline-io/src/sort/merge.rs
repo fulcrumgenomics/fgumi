@@ -189,7 +189,8 @@ fn slot_set_complete(
     )
 }
 
-/// `Serial + ByItemOrdinal` middle-of-chain merge.
+/// `Serial + ByItemOrdinal` terminal merge: the final of the three sort steps,
+/// producing the sorted `RecordBatch` stream consumed by the sink.
 pub struct SortMerge {
     state: SortMergeState,
     held: HeldSlot<Unpushed<RecordBatch>>,

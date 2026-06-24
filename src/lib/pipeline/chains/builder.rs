@@ -194,24 +194,8 @@ pub(crate) enum ChainTailKind {
 // ChainBuilder
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// In-progress chain builder. Constructed by
-/// [`crate::pipeline::chains::build_for`] (or by a per-command
-/// builder during Phase 3a).
-///
-/// Owns the resolved output header, an accumulating `PipelineBuilder`, and a
-/// growing `Vec<Box<dyn FinalizeHook>>` populated by `add_<stage>`
-/// methods. Per-stage methods are private — callers drive the chain
-/// via the public `add_source` / `add_stage(Stage, StagePosition)` /
-/// `add_sink` / `build()` flow.
-///
-/// ## Type erasure
-///
-/// The framework's `Chain<'b, O>` provides compile-time step-compatibility
-/// enforcement but cannot span method boundaries on `&mut self`. Instead,
-/// `ChainBuilder` tracks the chain tail as `(StepIdx, BranchIdx)` and uses
-/// `PipelineBuilder::append_source` / `append_step`, which bypass the
-/// typed-chain API. See the module-level type-erasure note for the runtime
-/// behaviour when a type mismatch is introduced.
+/// Per-worker scratch state for the `templates_to_mi_step` bridge: a reusable
+/// byte buffer and an MI-key string buffer, reset per template.
 #[cfg(feature = "consensus")]
 pub(crate) struct FuseState {
     scratch: Vec<u8>,
@@ -245,8 +229,8 @@ fn duplex_record_filter(raw: &[u8]) -> bool {
 /// `add_group` (which emits `BatchedProcessedPositionGroups`) into a consensus
 /// stage (which consumes `BatchedMiGroups`). For each template it splices the
 /// assigned molecular identifier into the `MI` tag and runs the records into
-/// per-MI groups in a single pass, replicating `runall.rs`'s
-/// `templates_to_mi_step`.
+/// per-MI groups in a single pass. This is the in-builder successor of the
+/// former `runall.rs` `templates_to_mi_step` (folded into the chain builder).
 ///
 /// Grouping on the MI alone (without a cell-barcode partition) is exactly
 /// equivalent to the non-fused `GroupByMi::with_cell_tag(Some(CB))` path
@@ -371,6 +355,24 @@ where
     )
 }
 
+/// In-progress chain builder. Constructed by
+/// [`crate::pipeline::chains::build_for`] (or by a per-command
+/// builder during Phase 3a).
+///
+/// Owns the resolved output header, an accumulating `PipelineBuilder`, and a
+/// growing `Vec<Box<dyn FinalizeHook>>` populated by `add_<stage>`
+/// methods. Per-stage methods are private — callers drive the chain
+/// via the public `add_source` / `add_stage(Stage, StagePosition)` /
+/// `add_sink` / `build()` flow.
+///
+/// ## Type erasure
+///
+/// The framework's `Chain<'b, O>` provides compile-time step-compatibility
+/// enforcement but cannot span method boundaries on `&mut self`. Instead,
+/// `ChainBuilder` tracks the chain tail as `(StepIdx, BranchIdx)` and uses
+/// `PipelineBuilder::append_source` / `append_step`, which bypass the
+/// typed-chain API. See the module-level type-erasure note for the runtime
+/// behaviour when a type mismatch is introduced.
 pub struct ChainBuilder<'a> {
     spec: &'a ChainSpec,
     tuning: BamPipelineTuning,
@@ -1428,8 +1430,11 @@ impl<'a> ChainBuilder<'a> {
     /// For [`StagePosition::Terminal`], `SerializeBamRecords` is appended and
     /// the chain tail is [`DecompressedBlock`] (bytes ready for `BgzfCompress`).
     ///
-    /// For [`StagePosition::Intermediate`], correct returns `Err` as a guard —
-    /// no Phase 3 runall combination requires intermediate correct.
+    /// For [`StagePosition::Intermediate`], `SerializeBamRecords` is **not**
+    /// appended: the chain tail is left as `BamTemplateBatch` so the next stage
+    /// (`add_align` → `GroupByQueryname → AlignAndMergeStep`) can consume the
+    /// correct step's kept output (branch 0) directly. This is the correct→align
+    /// fused path.
     ///
     /// When `--rejects` is set, branch 1 of the correct step carries pre-framed
     /// `DecompressedBlock` bytes and is wired here directly to its own
@@ -1456,9 +1461,8 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// # Errors
     ///
-    /// Returns errors if correct options are missing from the spec bag, if UMI
-    /// sequence loading fails, or if `position` is `Intermediate` (not yet
-    /// implemented).
+    /// Returns errors if correct options are missing from the spec bag or if UMI
+    /// sequence loading fails.
     ///
     /// [`EncodedUmiSet`]: crate::commands::correct::EncodedUmiSet
     /// [`DecompressedBlock`]: crate::pipeline::steps::types::DecompressedBlock
@@ -2360,11 +2364,10 @@ impl<'a> ChainBuilder<'a> {
     /// chain tail is [`DecompressedBlock`] (bytes ready for `BgzfCompress`).
     ///
     /// For [`StagePosition::Intermediate`], only the first three steps are
-    /// appended; the chain tail stays as [`BatchedProcessedPositionGroups`] for
-    /// the next stage to consume. Intermediate group is not yet needed by any
-    /// Phase 3a runall combination; calling `add_group` with `Intermediate`
-    /// returns `Err` as a guard until Phase 3b's fused group→consensus chains
-    /// require it.
+    /// appended; the chain tail stays as [`BatchedProcessedPositionGroups`] so
+    /// the consensus stages (`add_simplex`/`add_duplex`/`add_codec`) can prepend
+    /// `templates_to_mi_step` and consume it. This is the fused group→consensus
+    /// path.
     ///
     /// Accepts both template-coordinate-sorted and (with `--allow-unmapped`)
     /// queryname-sorted inputs, matching `GroupReadsByUmi::execute`'s validation.
@@ -2376,8 +2379,8 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// # Errors
     ///
-    /// Returns errors if the sort order is wrong, if the group options are missing
-    /// from the spec bag, or if `position` is `Intermediate` (not yet implemented).
+    /// Returns errors if the sort order is wrong or if the group options are
+    /// missing from the spec bag.
     ///
     /// [`BatchedProcessedPositionGroups`]: crate::pipeline::steps::group::position::BatchedProcessedPositionGroups
     #[allow(clippy::too_many_lines)]

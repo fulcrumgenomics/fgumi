@@ -16,11 +16,10 @@
 //!   [`substitute_template`] helper fills the `{ref}` / `{threads}`
 //!   placeholders.
 //!
-//! Used by Step 2 of the `AlignAndMerge` chain in
-//! `src/lib/commands/runall/align_and_merge.rs` (lands in a follow-up
-//! commit). This module is the framework-agnostic subprocess primitive;
-//! the typed `Step` impl that owns the I/O threads lives in the runall
-//! module.
+//! Used by the `AlignAndMergeStep` in
+//! `src/lib/pipeline/steps/align_and_merge.rs`. This module is the
+//! framework-agnostic subprocess primitive; the typed `Step` impl that owns the
+//! I/O threads lives in that step module.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
@@ -578,9 +577,10 @@ impl Default for AlignerOptions {
 /// `pub(crate)` because only the runall AAM dispatch consumes it;
 /// promote to `pub` if a cross-crate caller materializes.
 ///
-/// Fields are flagged `#[allow(dead_code)]` because C3 only
-/// validates them (via `_resolved` in `validate_align_and_merge`);
-/// C4 will consume them when wiring the 3-step chain.
+/// Fields are flagged `#[allow(dead_code)]` because the AAM validation path
+/// currently only validates them (via `_resolved` in
+/// `validate_align_and_merge`); the wired chain sources its parameters
+/// independently.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedAligner {
@@ -599,7 +599,7 @@ pub(crate) struct ResolvedAligner {
 }
 
 /// How a [`ResolvedAligner`] was produced. Same dead-code rationale
-/// as [`ResolvedAligner`] — C4 wiring consumes this.
+/// as [`ResolvedAligner`].
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ResolvedAlignerMode {

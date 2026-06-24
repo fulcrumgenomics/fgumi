@@ -19,8 +19,7 @@ pub struct WorkerCore {
     /// step whose `Affinity` targets this worker), the step's index.
     /// The driver drives this step in a tight inner loop until it returns
     /// `NoProgress` / `Contention` / `Finished`, then yields to round-
-    /// robin. Mirrors legacy `pipeline/base.rs:4360-4392` sticky
-    /// read.
+    /// robin. Mirrors the legacy pipeline's sticky read.
     pub sticky_owner: Option<StepIdx>,
     /// Backoff duration in microseconds. Doubled on no-progress; reset on progress.
     backoff_us: u64,

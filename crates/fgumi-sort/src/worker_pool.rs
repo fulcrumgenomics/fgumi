@@ -958,13 +958,15 @@ struct SortBackpressureState {
 /// Backpressure-driven priority selection — the sort pipeline's equivalent
 /// of `BalancedChaseDrain.build_priorities()`.
 ///
-/// Returns a static slice of steps ordered by priority. The scheduler naturally
-/// adapts to all 7 sub-phases without explicit phase tracking because:
-/// - During 1A (reading): compress queue empty, decompressed low → read/decompress
-/// - During 1C (sort): decompressed full → skip decompress, do compress if available
-/// - During 1D (spill): compress queue fills → prioritize compress
-/// - During 1E (overlap): both compress and decompress needed → split by queue depths
-/// - During Phase 2: both compress (output) and decompress (chunks) → split
+/// Returns a static slice of steps ordered by priority. The scheduler adapts to
+/// the workload purely from the current backpressure state (no explicit phase
+/// tracking) via two decision points:
+/// - Phase 1 (read/decompress/sort/spill): when spill compression is the
+///   bottleneck (compress queue has items and decompressed blocks are not low),
+///   prioritize draining compression; otherwise feed the main thread first
+///   (decompress, read) and compress only when work is available.
+/// - Phase 2 (merge): when output compression has items (the writer-side
+///   bottleneck), drain it before file work; otherwise do file work first.
 fn get_sort_priorities(bp: &SortBackpressureState) -> &'static [SortStep] {
     match bp.phase {
         phase::PHASE1 => {

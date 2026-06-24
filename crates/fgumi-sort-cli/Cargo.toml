@@ -23,7 +23,6 @@ noodles = { version = "0.111.0", features = ["bam", "sam"] }
 parking_lot = "0.12"
 
 [dev-dependencies]
-noodles = { version = "0.111.0", features = ["bam", "sam"] }
 rstest = "0"
 tempfile = "3.4"
 

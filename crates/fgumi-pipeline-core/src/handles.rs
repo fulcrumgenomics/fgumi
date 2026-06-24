@@ -29,13 +29,14 @@
 //! those are framework-managed. Step authors see `outputs.push(item)` and
 //! `input.pop() -> Option<T>`.
 //!
-//! PR 1 caveat: `QueueSpec::ByteBounded` requires `T: HeapSize`. The
-//! `build_*_queues` entry points used by `outputs.rs` don't have a
-//! `HeapSize` bound on `T`, so they panic with a clear message if a caller
-//! declares `ByteBounded`. Steps that need byte-bounded outputs use the
-//! `build_*_queues_byte_bounded` overloads (lands alongside the first such
-//! step in PR 2). The trait machinery is fully in place; only the entry
-//! points are deferred.
+//! `QueueSpec::ByteBounded` requires `T: HeapSize`. `Single<T>` (and the
+//! ordered-bytes paths) support `ByteBounded` directly: `build_single_queues`
+//! bounds `T: HeapSize` and routes `ByteBounded` through
+//! `build_branch_byte_aware`. The only remaining panics are for tuple branches
+//! built via `build_branch` — which has the `HeapSize` bound but is the
+//! non-byte-aware path, so it never constructs a byte-bounded queue and panics
+//! on `ByteBounded` (the byte-aware `build_branch_byte_aware` must be used
+//! instead) — and for `ByItemOrdinal` declared without `Ordered`.
 
 use std::any::Any;
 use std::marker::PhantomData;
@@ -1542,7 +1543,6 @@ mod handle_tests {
             &[BranchOrdering::None],
         );
         let _input: BranchInputHandle<u32> = set.take_typed_input::<u32>(0);
-        // Subsequent take_typed_input on the same branch panics (slot is empty).
     }
 }
 

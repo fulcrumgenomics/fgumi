@@ -1,7 +1,6 @@
 //! [`build_for`] — the single chain-construction entry point.
 //!
-//! T3b.3 converts this from a match-based dispatch (10 single-stage arms +
-//! catch-all bail) to a stage-by-stage loop. `build_for` now:
+//! `build_for` constructs the chain as a stage-by-stage loop:
 //!
 //!   1. Validates the spec (progression, options presence, cross-stage constraints).
 //!   2. Constructs a [`ChainBuilder`] from the spec.

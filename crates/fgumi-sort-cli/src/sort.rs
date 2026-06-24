@@ -140,8 +140,8 @@ PERFORMANCE:
   - Handles BAM files larger than available RAM via spill-to-disk
   - Uses parallel sorting (--threads) for in-memory chunks
   - Configurable temp file compression (--temp-compression)
-  - Default 768M per-thread memory limit (samtools-compatible); pass
-    `--max-memory auto` to detect system memory (opt-in)
+  - Default 768MiB per-thread memory limit (samtools-compatible); pass
+    `--max-memory auto` to detect host memory (opt-in)
 
 EXAMPLES:
 
@@ -154,13 +154,13 @@ EXAMPLES:
   # Sort by queryname for zipper
   fgumi sort -i input.bam -o sorted.bam --order queryname
 
-  # Multi-threaded sort (default 768M per thread)
+  # Multi-threaded sort (default 768MiB per thread)
   fgumi sort -i input.bam -o sorted.bam --order template-coordinate --threads 8
 
   # Override the per-thread memory limit
   fgumi sort -i input.bam -o sorted.bam -m 2GiB --threads 8
 
-  # Opt in to auto-detected system memory (subtracts --memory-reserve)
+  # Opt in to auto-detected host memory (subtracts --memory-reserve)
   fgumi sort -i input.bam -o sorted.bam -m auto --threads 8
 
   # Reserve extra memory for bwa mem running in a pipeline
@@ -255,7 +255,7 @@ pub struct SortOptions {
     /// Maximum memory for in-memory sorting.
     ///
     /// Default is "768MiB" per thread (matching samtools' 768 MiB). Pass "auto"
-    /// to detect system memory and subtract --memory-reserve, leaving room
+    /// to detect host memory and subtract --memory-reserve, leaving room
     /// for the OS and co-running processes (e.g. an aligner). Explicit values
     /// like "512MiB", "1GiB", "4GiB" are per-thread when --memory-per-thread is
     /// enabled (default). Note bare "M"/"G" are decimal (1000ⁿ); "MiB"/"GiB" are
@@ -267,7 +267,7 @@ pub struct SortOptions {
 
     /// Memory to reserve for other processes when --max-memory=auto.
     ///
-    /// "auto" (default) reserves min(10 GiB, 50% of system memory). Explicit
+    /// "auto" (default) reserves min(10 GiB, 50% of host memory). Explicit
     /// values like "10G", "8GiB" set a fixed reservation. Set higher when
     /// running alongside a memory-intensive aligner (e.g. `bwa mem` with a
     /// human genome index uses ~8 GiB).

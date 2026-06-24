@@ -106,6 +106,13 @@ pub fn build_serialize_processed_groups_step(
             // progress counter below.
             let total_input_records: u64 =
                 groups.iter().fold(0u64, |acc, g| acc.saturating_add(g.input_record_count));
+            // The `saturating_mul`/`unwrap_or(usize::MAX)` is purely overflow-
+            // defensive and unreachable for realistic record counts (a count
+            // approaching `usize::MAX / 800` is impossible for any BAM). It is a
+            // theoretical guard only: if it ever did saturate to `usize::MAX`,
+            // the `with_capacity(usize::MAX)` would itself abort — so the guard
+            // protects against the multiply wrapping, not against a real
+            // allocation of that size.
             let mut output = Vec::with_capacity(
                 usize::try_from(total_input_records.saturating_mul(800)).unwrap_or(usize::MAX),
             );

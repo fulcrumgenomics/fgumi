@@ -155,7 +155,8 @@ impl PipelineBuilder {
     ///
     /// This deliberately bypasses the typed `Chain<'_, S::Outputs>` API.
     /// Type correctness is NOT validated at [`Self::build`] time — `build()`
-    /// only checks that every output branch is wired. A mis-typed step
+    /// only checks that the chain is non-empty (rejecting a zero-step chain with
+    /// `BuildError::Empty`) and that every output branch is wired. A mis-typed step
     /// sequence (e.g. a step whose `Input=A` consumes an output of type `B`)
     /// builds successfully and panics at the first dispatch in
     /// `TypedStep::resolve_input` with "input handle downcast failed —
@@ -462,8 +463,8 @@ impl<'b, A: Send + HeapSize + 'static, B: Send + HeapSize + 'static> MultiChain2
     /// Join two parallel sub-chains into a single [`Step2`] consumer.
     ///
     /// Wires `b0` into the consumer's input slot 0
-    /// ([`StepCtx2::a`]) and `b1` into input slot 1
-    /// ([`StepCtx2::b`]), registering the consumer with input arity
+    /// ([`StepCtx2`]'s `a`) and `b1` into input slot 1
+    /// ([`StepCtx2`]'s `b`), registering the consumer with input arity
     /// 2 in the chain graph. Each branch's typed producer-side
     /// [`OutputQueueSet`] is later (at chain-run time) drained into
     /// the consumer's
@@ -555,8 +556,8 @@ where
     /// Join two parallel ordered/byte-bounded sub-chains into a single
     /// [`Step2`] consumer. Ordered counterpart of
     /// [`MultiChain2::join`]: wires `b0` into the consumer's input
-    /// slot 0 ([`StepCtx2::a`]) and `b1` into input slot 1
-    /// ([`StepCtx2::b`]), registering the consumer with input arity 2.
+    /// slot 0 ([`StepCtx2`]'s `a`) and `b1` into input slot 1
+    /// ([`StepCtx2`]'s `b`), registering the consumer with input arity 2.
     ///
     /// Returns a single-branch downstream [`Chain`] typed by the
     /// joined step's `S::Outputs`.
@@ -825,12 +826,13 @@ impl Pipeline {
         // 2-pre-monitor invariant: if the deadlock monitor will be armed, every
         // output transport must be ByteBounded so `in_flight_bytes` can see a
         // wedge on it. A CountBounded/Unbounded edge is invisible to the probe
-        // and would silently disable fail-fast on that edge. Checked here (debug
-        // builds only) while `steps` is still alive — it is consumed by
+        // and would silently disable fail-fast on that edge. Checked here (in
+        // every build, release included — the blind spot only matters in a real
+        // fail-fast run) while `steps` is still alive — it is consumed by
         // `build_worker_storage` below. Test chains use CountBounded/Unbounded
         // but do not arm the monitor, so this only fires for a fail-fast run.
         if deadlock_timeout_secs > 0 && stats_arc.is_some() {
-            assert_monitor_visible_transports(&steps, &graph);
+            ensure_monitor_visible_transports(&steps, &graph)?;
         }
 
         // 2a. If a total queue-memory budget was supplied, evenly
@@ -1157,25 +1159,30 @@ fn first_monitor_blind_transport(
     None
 }
 
-/// Debug-build invariant check (run only when the deadlock monitor is armed):
-/// every production output transport must be `ByteBounded` so the
-/// [`in_flight_bytes`] probe can see a wedge on it. A `CountBounded`/`Unbounded`
-/// edge would be invisible to the monitor, silently disabling fail-fast on that
-/// edge — exactly the blind spot this guard exists to catch. The framework still
-/// permits `CountBounded`/`Unbounded` for `#[cfg(test)]` chains (which do not arm
-/// the monitor), so this only fires for a real fail-fast pipeline.
-fn assert_monitor_visible_transports(
+/// Invariant check (run only when the deadlock monitor is armed): every
+/// production output transport must be `ByteBounded` so the [`in_flight_bytes`]
+/// probe can see a wedge on it. A `CountBounded`/`Unbounded` edge would be
+/// invisible to the monitor, silently disabling fail-fast on that edge — exactly
+/// the blind spot this guard exists to catch. The framework still permits
+/// `CountBounded`/`Unbounded` for `#[cfg(test)]` chains (which do not arm the
+/// monitor), so this only fires for a real fail-fast pipeline.
+///
+/// Returns a [`PipelineError::MonitorBlindTransport`] (rather than panicking or
+/// being a debug-only check) so the guard runs in release builds — where the
+/// blind spot actually matters — yet a misconfigured chain fails gracefully at
+/// startup, consistent with the other build/run-time validations (e.g.
+/// [`PipelineError::NotEnoughThreads`]) rather than crashing the process.
+fn ensure_monitor_visible_transports(
     steps: &[Box<dyn super::erased::ErasedStep>],
     graph: &super::topology::ChainGraph,
-) {
-    debug_assert!(
-        first_monitor_blind_transport(steps, graph).is_none(),
-        "deadlock monitor is armed but step '{}' declares a {:?} output transport, \
-         which is invisible to the in_flight_bytes probe — a wedge on that edge would \
-         silently disable fail-fast. Production transports must be QueueSpec::ByteBounded.",
-        first_monitor_blind_transport(steps, graph).map_or("?", |(name, _)| name),
-        first_monitor_blind_transport(steps, graph).map(|(_, spec)| spec),
-    );
+) -> Result<(), super::signal::PipelineError> {
+    if let Some((name, spec)) = first_monitor_blind_transport(steps, graph) {
+        return Err(super::signal::PipelineError::MonitorBlindTransport {
+            step: name,
+            spec: format!("{spec:?}"),
+        });
+    }
+    Ok(())
 }
 
 /// Background deadlock monitor body. Polls `stats` every `poll_interval`,
@@ -2525,24 +2532,28 @@ mod tests {
     }
 
     #[test]
-    fn assert_monitor_visible_transports_passes_for_all_byte_bounded() {
-        // The armed-monitor invariant holds (does not panic) when every output
+    fn ensure_monitor_visible_transports_ok_for_all_byte_bounded() {
+        // The armed-monitor invariant holds (returns Ok) when every output
         // transport is ByteBounded.
         let steps = vec![
             step_with_output_spec("A", QueueSpec::ByteBounded { limit_bytes: 1 << 20 }),
             step_with_output_spec("B", QueueSpec::ByteBounded { limit_bytes: 1 << 20 }),
         ];
-        assert_monitor_visible_transports(&steps, &graph_matching_specs(&steps));
+        assert!(ensure_monitor_visible_transports(&steps, &graph_matching_specs(&steps)).is_ok());
     }
 
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "invisible to the in_flight_bytes probe")]
-    fn assert_monitor_visible_transports_panics_on_count_bounded_in_debug() {
-        // In debug builds, a monitor-blind transport on an armed pipeline trips
-        // the invariant instead of silently losing the wedge verdict.
+    fn ensure_monitor_visible_transports_errs_on_count_bounded() {
+        // A monitor-blind transport on an armed pipeline is rejected with a
+        // graceful error (in every build, release included) instead of silently
+        // losing the wedge verdict or crashing the process.
         let steps = vec![step_with_output_spec("Blind", QueueSpec::CountBounded { capacity: 8 })];
-        assert_monitor_visible_transports(&steps, &graph_matching_specs(&steps));
+        let err = ensure_monitor_visible_transports(&steps, &graph_matching_specs(&steps))
+            .expect_err("a CountBounded transport on an armed pipeline must be rejected");
+        assert!(
+            matches!(err, PipelineError::MonitorBlindTransport { step: "Blind", .. }),
+            "expected MonitorBlindTransport for the blind step, got {err:?}"
+        );
     }
 
     #[test]

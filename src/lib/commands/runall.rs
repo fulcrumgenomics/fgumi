@@ -929,9 +929,6 @@ fn validate_stages_for(start_from: RunAllStage, stop_after: RunAllStage) -> Resu
 /// reject (should not be reached if `validate_stages` was called first), or
 /// if the Stage derivation reaches a branch that is a programming error (e.g.
 /// a non-consensus `stop` that makes it through all prior early-returns).
-// T3b.3 will call this from `RunAll::execute`; until then it is
-// only called from `RunAll::derive_stages` and from the unit tests.
-#[allow(dead_code)]
 fn derive_stages_for(
     start_from: RunAllStage,
     stop_after: RunAllStage,

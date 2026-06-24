@@ -300,7 +300,7 @@ fgumi simulate grouped-reads \
 | Tag | Type | Description |
 |-----|------|-------------|
 | `RX` | String | Raw UMI sequence |
-| `MI` | String | Molecule ID (integer for simplex, "N/A" or "N/B" for duplex) |
+| `MI` | String | Molecule ID (integer for simplex, `<id>/A` or `<id>/B` for duplex) |
 | `RG` | String | Read group (default: "A") |
 
 ### Truth File Format
@@ -595,9 +595,14 @@ R2 reads have an additional offset (`r2-quality-offset`, typically -2) applied.
 
 ### Template-Coordinate Sorting
 
-For `mapped-reads` and `grouped-reads`, output is sorted by template coordinate:
-- Primary sort: 5' position of the leftmost read in the pair
-- Secondary sort: Read name (for determinism)
+For `mapped-reads` and `grouped-reads`, output is sorted by template coordinate,
+matching `samtools sort --template-coordinate` (the order `fgumi group` expects):
+- Position/strand: ref IDs and unclipped 5' positions of both reads, then strand
+  (reverse before forward), for both ends of the pair
+- MI tag: molecular identifier (suffix-stripped, length-then-lexicographic)
+- Read name, then upper/lower-of-pair: final tie-breaks for determinism
+
+(Library is omitted because simulated data is single-library.)
 
 BAM header includes: `SO:unsorted`, `GO:query`, `SS:template-coordinate`
 

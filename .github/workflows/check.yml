@@ -33,10 +33,11 @@ jobs:
         with:
           tool: nextest
       # Install bwa + bwa-mem3 from bioconda for the AAM
-      # (--start-from align-and-merge) integration tests. Local dev
-      # without these binaries gets gracefully-skipped tests via
-      # `which::which` checks in the test code; CI installs them so
-      # the real-aligner parity tests actually exercise the chain.
+      # (--start-from align-and-merge) integration tests. The real-aligner
+      # parity tests are `#[ignore]`'d (they need bwa / bwa-mem3 on PATH), so
+      # local dev without these binaries simply does not run them; CI installs
+      # them here and runs the ignored set explicitly below so the chain is
+      # actually exercised.
       - name: Install aligners (bwa-mem3, bwa) from bioconda
         uses: mamba-org/setup-micromamba@06375d89d211a1232ef63355742e9e2e564bc7f7 # v2.0.7
         with:

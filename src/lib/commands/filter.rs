@@ -248,7 +248,7 @@ impl Default for FilterOptions {
 }
 
 // ============================================================================
-// 7-Step Pipeline Types
+// Typed-Step Pipeline Types
 // ============================================================================
 
 /// Per-thread accumulator merged into final counts after pipeline completion.

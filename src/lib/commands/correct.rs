@@ -393,7 +393,7 @@ pub(crate) struct TemplateCorrection {
 }
 
 // ============================================================================
-// 7-Step Pipeline Types
+// Typed-Step Pipeline Types
 // ============================================================================
 
 /// Metrics collected from UMI correction processing, aggregated post-pipeline.

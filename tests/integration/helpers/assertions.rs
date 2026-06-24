@@ -220,7 +220,6 @@ pub fn assert_rx_tag(record: &RecordBuf, expected: &str) {
 /// Asserts that consensus quality improved compared to input reads.
 ///
 /// Checks that the consensus read has:
-/// - Higher minimum quality score than any input read
 /// - Mean quality >= mean of input reads
 ///
 /// # Panics

@@ -88,7 +88,9 @@ pub fn validate_min_max<T: Ord + Display>(
 ///
 /// # Arguments
 /// * `rate` - Error rate to validate
-/// * `name` - Name of the parameter for error messages
+/// * `_name` - Parameter name, accepted for call-site symmetry with
+///   `validate_min_max`/`validate_positive` but currently unused: the returned
+///   `FgumiError::InvalidFrequency` does not interpolate it.
 ///
 /// # Errors
 /// Returns an error if the rate is not in [0.0, 1.0]
@@ -114,7 +116,9 @@ pub fn validate_error_rate(rate: f64, _name: &str) -> Result<()> {
 ///
 /// # Arguments
 /// * `quality` - Quality score to validate
-/// * `name` - Name of the parameter for error messages
+/// * `_name` - Parameter name, accepted for call-site symmetry with
+///   `validate_min_max`/`validate_positive` but currently unused: the returned
+///   `FgumiError::InvalidQuality` does not interpolate it.
 ///
 /// # Errors
 /// Returns an error if the quality is not in [0, 93]

@@ -74,7 +74,8 @@
 //!
 //! **Two values** `[D, M]`:
 //! - Single-strand consensus requires M reads per strand (both AB and BA)
-//! - Final duplex must have D reads supporting it (typically D ≤ M since we need both strands)
+//! - Final duplex must have D reads supporting it (D ≥ M: the total threshold
+//!   must be at least the per-strand threshold, as validated by the constructor)
 //!
 //! **Three values** `[D, M_AB, M_BA]`:
 //! - AB single-strand requires `M_AB` reads

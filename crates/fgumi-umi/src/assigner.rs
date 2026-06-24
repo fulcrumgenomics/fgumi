@@ -1093,7 +1093,8 @@ impl AdjacencyUmiAssigner {
     ///
     /// * `max_mismatches` - Maximum number of mismatches allowed for UMIs to be adjacent
     /// * `threads` - Number of threads to use for matching (default: 1)
-    /// * `index_threshold` - Minimum UMIs per position to use N-gram/BK-tree index (default: 1000)
+    /// * `index_threshold` - Minimum UMIs per position to use N-gram/BK-tree index
+    ///   (default: 100, see [`DEFAULT_INDEX_THRESHOLD`])
     ///
     /// # Returns
     ///

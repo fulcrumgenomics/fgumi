@@ -14,8 +14,10 @@
 //!   - `progress_count` — `StepOutcome::Progress`.
 //!   - `no_progress_count` — `StepOutcome::NoProgress`.
 //!   - `contention_count` — `StepOutcome::Contention` (Serial step mutex
-//!     held by another worker; or skipped via `try_lock`).
-//!   - `finished_count` — `StepOutcome::Finished` (sources only).
+//!     held by another worker; or skipped via `try_lock`). Always 0 under the
+//!     fused single-thread driver, which holds no mutex and never contends.
+//!   - `finished_count` — `StepOutcome::Finished` (any step on end-of-stream:
+//!     source, mid, or sink all record `Finished` once their inputs drain).
 //!   - `error_count` — `try_run_erased` returned `Err`.
 //!   - `total_run_ns` — cumulative wall time across all dispatches.
 //!

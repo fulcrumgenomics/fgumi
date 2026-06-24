@@ -2,7 +2,8 @@
 //!
 //! 1. [`validate_stage_progression`] — ordering rules and mutual exclusions.
 //! 2. [`validate_stage_opts_present`] — each stage has its options in the bag.
-//! 3. [`validate_cross_stage_constraints`] — placeholder for Phase 3 cross-stage rules.
+//! 3. [`validate_cross_stage_constraints`] — Zipper source, Duplex/Group
+//!    strategy, `BamWithIndex` terminal-sort, and Extract source rules.
 
 use anyhow::{Result, bail};
 
@@ -138,9 +139,9 @@ pub fn validate_stage_progression(spec: &ChainSpec) -> Result<()> {
 
 /// Reject specs where a referenced stage has no options in the bag.
 ///
-/// As of Phase 5 T5.3, eleven stages have their options in the bag:
+/// As of Phase 5 T5.3, twelve stages have their options in the bag:
 /// Correct, Sort, Group, Zipper, Duplex, Codec, Dedup, Filter, Clip, Simplex,
-/// and Extract. The remaining stage (Downsample) adds its slot incrementally
+/// Align, and Extract. The remaining stage (Downsample) adds its slot incrementally
 /// during its migration task (T2.19–T2.22). For now that stage skips the
 /// options-presence check — once its slot lands in the bag, add the check here.
 ///

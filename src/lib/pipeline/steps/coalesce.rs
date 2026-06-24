@@ -188,8 +188,9 @@ impl Step for CoalesceBytes {
         }
 
         // 4. No input this call. If upstream is drained, flush the final
-        // partial block (held is empty here — step 1 returned `Contention`
-        // otherwise) and report `Finished` once nothing remains. A bounced
+        // partial block (held is empty here because step 1 early-returns
+        // `Contention` on a failed retry, so control only reaches here with
+        // `held` empty) and report `Finished` once nothing remains. A bounced
         // final push is parked in `held` and retried by step 1 next pass.
         if ctx.input.is_drained() {
             if !self.pending.is_empty() {

@@ -473,9 +473,9 @@ fn convert_bam_to_sam(bam_path: &PathBuf, sam_path: &PathBuf) {
     }
 }
 
-/// SAM-input parity for the new typed-step pipeline. Generates a SAM file
+/// SAM-input parity for the typed-step pipeline. Generates a SAM file
 /// from the same record set as the BAM baseline, runs `fgumi group
-/// --use-new-pipeline --input foo.sam`, and compares the output BAMs.
+/// --input foo.sam`, and compares the output BAMs.
 /// Exercises the `ReadSamChunks` + `ParseSamChunk` parallel-parse path.
 #[test]
 fn test_group_command_with_sam_input_new_pipeline_matches_bam_baseline() {
@@ -505,7 +505,7 @@ fn test_group_command_with_sam_input_new_pipeline_matches_bam_baseline() {
             "2",
         ])
         .status()
-        .expect("Failed to run group --use-new-pipeline with BAM input");
+        .expect("Failed to run group with BAM input");
     assert!(status.success(), "BAM-input baseline failed");
 
     let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
@@ -525,7 +525,7 @@ fn test_group_command_with_sam_input_new_pipeline_matches_bam_baseline() {
             "2",
         ])
         .status()
-        .expect("Failed to run group --use-new-pipeline with SAM input");
+        .expect("Failed to run group with SAM input");
     assert!(status.success(), "SAM-input run failed");
 
     compare_bam_records(&out_bam_baseline, &out_sam);
@@ -786,7 +786,7 @@ fn test_group_command_with_sam_stdin_new_pipeline_matches_bam_baseline() {
 }
 
 /// Same shape as `test_group_command_with_piped_input` but routed through
-/// the typed-step pipeline (`--use-new-pipeline`). Exercises the
+/// the typed-step pipeline. Exercises the
 /// `read_bam_auto` dispatcher introduced for issue #330 Phase 1 T1.3.4:
 /// when the input path is `-`, the source step is `read_bam_stdin`
 /// (which buffers the BAM header via `TeeReader` and replays it ahead
@@ -817,8 +817,8 @@ fn test_group_command_with_piped_input_new_pipeline() {
             "2",
         ])
         .status()
-        .expect("Failed to run group --use-new-pipeline with file input");
-    assert!(status.success(), "group --use-new-pipeline (file) failed");
+        .expect("Failed to run group with file input");
+    assert!(status.success(), "group (file) failed");
     assert!(output_from_file.exists(), "file-input output not created");
 
     let cat_child = Command::new("cat")
@@ -845,8 +845,8 @@ fn test_group_command_with_piped_input_new_pipeline() {
         ])
         .stdin(cat_child.stdout.unwrap())
         .status()
-        .expect("Failed to run group --use-new-pipeline with piped input");
-    assert!(status.success(), "group --use-new-pipeline (stdin) failed");
+        .expect("Failed to run group with piped input");
+    assert!(status.success(), "group (stdin) failed");
     assert!(output_from_pipe.exists(), "stdin output not created");
 
     compare_bam_records(&output_from_file, &output_from_pipe);

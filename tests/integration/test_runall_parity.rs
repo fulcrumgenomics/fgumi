@@ -8,17 +8,16 @@
 //!     `fgumi runall --start-from X --stop-after X` and `fgumi X` on
 //!     the same input, asserts the output BAMs contain the same
 //!     record stream. Pins that runall's per-stage execution path
-//!     matches the standalone command's execution path. Activated by
-//!     #33 tasks 5-9 as each diagonal combo is wired through the
-//!     validator.
+//!     matches the standalone command's execution path. All five run
+//!     by default.
 //!
 //!   * **Class B — composition / multi-stage parity (7 tests).** Runs
 //!     `fgumi runall --start-from S --stop-after T` and the equivalent
 //!     staged chain (`fgumi S → tmp.bam → fgumi ... → fgumi T`),
 //!     asserts the output BAMs contain the same record stream. Pins
 //!     that runall's FUSED chain matches the standalone STAGED chain.
-//!     Six of these (`{Sort,Group}→{Simplex,Duplex,Codec}`) are
-//!     unblocked today; one (`Sort→Group`) waits on task 9.
+//!     All seven (`{Sort,Group}→{Simplex,Duplex,Codec}` plus
+//!     `Sort→Group`) run by default.
 //!
 //! Total: 12 parity tests covering every valid `(start, stop)` pair
 //! the validator accepts (5 diagonal + 7 off-diagonal = 12; the
@@ -292,12 +291,12 @@ fn grouped_codec_fixture(dir: &Path) -> PathBuf {
 // ────────────────────────── Class A — single-stage parity ──────────────────────────
 //
 // Each Class A test runs `fgumi runall --start-from X --stop-after X`
-// against `fgumi X` on the same input. Activated as #33 tasks 5-9 lift
-// the corresponding `--start-from`/`--stop-after` gate.
+// against `fgumi X` on the same input.
 
-/// `Sort → Sort` parity vs standalone `fgumi sort`. Unblocked by
-/// task 8 of #33 — runall delegates to `Sort::execute` for
-/// byte-identical output by construction.
+/// `Sort → Sort` parity vs standalone `fgumi sort`. Runall delegates to
+/// `Sort::execute`, so the two are record- and header-equivalent — identical
+/// records and `@HD`/`@SQ`/`@RG`, ignoring only the `@PG` command-line
+/// provenance (which legitimately differs between runall and standalone).
 #[test]
 fn parity_a_sort_to_sort() {
     let tmp = TempDir::new().unwrap();
@@ -315,9 +314,10 @@ fn parity_a_sort_to_sort() {
     assert_bams_record_equivalent(&runall_out, &standalone_out);
 }
 
-/// `Group → Group` parity vs standalone `fgumi group`. Unblocked by
-/// task 9 of #33 — runall delegates to `GroupReadsByUmi::execute`
-/// for byte-identical output by construction.
+/// `Group → Group` parity vs standalone `fgumi group`. Runall delegates to
+/// `GroupReadsByUmi::execute`, so the two are record- and header-equivalent —
+/// identical records and `@HD`/`@SQ`/`@RG`, ignoring only the `@PG`
+/// command-line provenance (which legitimately differs).
 #[test]
 fn parity_a_group_to_group() {
     let tmp = TempDir::new().unwrap();
@@ -336,8 +336,8 @@ fn parity_a_group_to_group() {
 }
 
 /// `Simplex → Simplex` parity vs standalone `fgumi simplex`.
-/// Unblocked by task 5 of #33; uses the consensus-only delegation
-/// fast path (`execute_consensus_only`) added in a later commit —
+/// Uses the consensus-only delegation fast path
+/// (`execute_consensus_only`) —
 /// runall constructs a `Simplex` struct from its own flags and calls
 /// `Simplex::execute` directly, skipping the group step entirely.
 /// Parity therefore holds by construction (same standalone command,
@@ -361,10 +361,9 @@ fn parity_a_simplex_to_simplex() {
     assert_bams_record_equivalent(&runall_out, &standalone_out);
 }
 
-/// `Duplex → Duplex` parity vs standalone `fgumi duplex`. Unblocked
-/// by task 6 of #33; runs through the consensus-only delegation fast
-/// path. See `parity_a_simplex_to_simplex` for the delegation
-/// contract this pins.
+/// `Duplex → Duplex` parity vs standalone `fgumi duplex`. Runs through
+/// the consensus-only delegation fast path. See
+/// `parity_a_simplex_to_simplex` for the delegation contract this pins.
 #[cfg(feature = "consensus")]
 #[test]
 fn parity_a_duplex_to_duplex() {
@@ -383,8 +382,8 @@ fn parity_a_duplex_to_duplex() {
     assert_bams_record_equivalent(&runall_out, &standalone_out);
 }
 
-/// `Codec → Codec` parity vs standalone `fgumi codec`. Unblocked by
-/// task 7 of #33; runs through the consensus-only delegation fast
+/// `Codec → Codec` parity vs standalone `fgumi codec`. Runs through
+/// the consensus-only delegation fast
 /// path. Uses `grouped_codec_fixture` (paired-end, single-strand
 /// UMI, grouped with `--strategy adjacency`) — the documented CODEC
 /// input — so this actually exercises the duplex consensus logic
@@ -410,20 +409,13 @@ fn parity_a_codec_to_codec() {
 // ────────────────────────── Class B — multi-stage parity ──────────────────────────
 //
 // Each Class B test runs `fgumi runall --start-from S --stop-after T`
-// against the equivalent staged chain. Today (post-task-4 of #33), 6
-// of the 7 Class B combos are accepted by the validator; only
-// `Sort → Group` waits on task 9.
-//
-// All six already-unblocked tests are also `#[ignore]`'d in this
-// scaffold commit — they will be activated one-by-one as each test
-// is verified end-to-end (the helper modules and fixtures still need
-// to be exercised together at least once; see the activation TODO
-// note in each).
+// against the equivalent staged chain. All seven Class B combos are
+// accepted by the validator and run by default.
 
 /// `Sort → Group` parity vs staged `fgumi sort | fgumi group`.
-/// Unblocked by task 9 of #33 — runall delegates to `Sort::execute`
-/// then `GroupReadsByUmi::execute` (via a tempfile) for
-/// byte-identical output by construction.
+/// Runall delegates to `Sort::execute` then `GroupReadsByUmi::execute`
+/// (via a tempfile), so the output is record- and header-equivalent
+/// (ignoring `@PG` command-line provenance) by construction.
 #[test]
 fn parity_b_sort_to_group() {
     let tmp = TempDir::new().unwrap();
@@ -443,8 +435,6 @@ fn parity_b_sort_to_group() {
 }
 
 /// `Sort → Simplex` parity vs staged `fgumi sort | fgumi group | fgumi simplex`.
-/// Unblocked by validator (today); test activation pending end-to-end
-/// verification of the parity scaffold.
 #[cfg(feature = "consensus")]
 #[test]
 fn parity_b_sort_to_simplex() {
@@ -2554,7 +2544,8 @@ fn correct_parity_fixture(dir: &Path) -> PathBuf {
 
     // (umi, family_name, sequence) — same length as ACGTACGT (8) for
     // all variants. ACGTACGT exact match; ACGTACGC = 1 mismatch;
-    // ACGTACCC = 2 mismatches; ACGTCCCC = 4 mismatches (rejected).
+    // ACGTACCC = 2 mismatches; ACGTCCCC = 3 mismatches (exceeds
+    // --max-mismatches 2, rejected).
     let families = [
         ("ACGTACGT", "fam_exact", "ACGTACGTACGTACGT"),
         ("ACGTACGC", "fam_1mm", "TTTTAAAACCCCGGGG"),
@@ -2578,8 +2569,9 @@ fn correct_parity_fixture(dir: &Path) -> PathBuf {
 
 /// Class A — `correct → correct` parity vs standalone `fgumi correct`.
 /// Pins the runall delegation: runall constructs a `CorrectUmis`
-/// struct from its own flags and calls `CorrectUmis::execute`, so
-/// the output is byte-identical by construction. The fixture
+/// struct from its own flags and calls `CorrectUmis::execute`, so the
+/// output is record- and header-equivalent (ignoring `@PG` command-line
+/// provenance) by construction. The fixture
 /// (`correct_parity_fixture`) is built specifically to exercise
 /// every branch of the correction code path — no-op, single-
 /// mismatch rewrite (RX overwritten + OX stashed), and rejection
