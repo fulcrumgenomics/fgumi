@@ -135,8 +135,14 @@ pub struct SortStepCaptures {
     pub input_path: PathBuf,
     /// Output BAM path.
     pub output_path: PathBuf,
-    /// Number of threads for the sort engine's worker pool.
+    /// Number of threads for the sort engine's worker pool (the overall /
+    /// Phase-2 "writing" count).
     pub num_sorter_threads: usize,
+    /// Worker count for Phase 1 (accumulate/sort/spill); defaults to
+    /// `num_sorter_threads`. Lower to cede CPU to an upstream producer.
+    pub num_phase1_threads: usize,
+    /// Worker count for Phase 2 (merge/write); defaults to `num_sorter_threads`.
+    pub num_phase2_threads: usize,
     /// Resolved memory budget, already computed by the caller via
     /// [`resolve_memory_budget`](fgumi_cli_common::resolve_memory_budget).
     /// Passed in (rather than recomputed here) so
@@ -172,6 +178,8 @@ pub fn build_sort_step(cap: SortStepCaptures) -> Result<SortBamFile> {
     let mut sorter = RawExternalSorter::new(sort_order)
         .memory_limit(effective_memory)
         .threads(cap.num_sorter_threads)
+        .sort_threads(cap.num_phase1_threads)
+        .merge_threads(cap.num_phase2_threads)
         .output_compression(cap.output_compression)
         .temp_compression(cap.sort.temp_compression)
         .spill_codec(cap.sort.temp_codec)
@@ -210,6 +218,8 @@ pub fn log_sort_start(
     input_path: &std::path::Path,
     output_path: &std::path::Path,
     num_sorter_threads: usize,
+    num_phase1_threads: usize,
+    num_phase2_threads: usize,
     effective_memory: usize,
 ) {
     let cell_tag = parse_cell_tag(sort.order).unwrap_or(None);
@@ -233,7 +243,13 @@ pub fn log_sort_start(
             info!("Max memory: {} (fixed)", ByteSize(effective_memory as u64));
         }
     }
-    info!("Threads: {num_sorter_threads}");
+    if num_phase1_threads == num_sorter_threads && num_phase2_threads == num_sorter_threads {
+        info!("Threads: {num_sorter_threads}");
+    } else {
+        info!(
+            "Threads: {num_sorter_threads} (sort phase {num_phase1_threads}, merge phase {num_phase2_threads})"
+        );
+    }
     info!("Temp compression level: {}", sort.temp_compression);
     let env_value = std::env::var(TMP_DIRS_ENV).ok();
     let resolved_tmp_dirs = resolve_tmp_dirs(&sort.tmp_dirs, env_value.as_deref());
