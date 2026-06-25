@@ -1458,8 +1458,10 @@ impl RawExternalSorter {
     /// Enable writing BAM index alongside output.
     ///
     /// Only valid for coordinate sort. When enabled, writes `<output>.bai`
-    /// alongside the output BAM file. Uses single-threaded compression
-    /// for accurate virtual position tracking.
+    /// alongside the output BAM file. Output BGZF compression stays
+    /// multi-threaded (scales with the configured thread count); BAI virtual
+    /// offsets are recovered from each BGZF block as it finalizes, so indexing
+    /// does not serialize compression.
     #[must_use]
     pub fn write_index(mut self, enabled: bool) -> Self {
         self.write_index = enabled;
@@ -2091,8 +2093,10 @@ impl RawExternalSorter {
     /// Coordinate sort with BAM index generation.
     ///
     /// Similar to `sort_coordinate_optimized` but uses `IndexingBamWriter` to
-    /// build the BAI index incrementally during write. Uses single-threaded
-    /// compression for accurate virtual position tracking.
+    /// build the BAI index incrementally during write. Output BGZF compression
+    /// stays multi-threaded (scales with the configured thread count); BAI
+    /// virtual offsets are recovered from each BGZF block as it finalizes, so
+    /// indexing does not serialize compression.
     #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     fn sort_coordinate_with_index(
         &self,
