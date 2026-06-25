@@ -36,11 +36,21 @@ cargo bench
 
 ## Features
 
+- `consensus` *(default-on)* - All consensus calling: the `simplex`, `duplex`,
+  `codec`, `runall`, `simplex-metrics`, and `duplex-metrics` subcommands. This is
+  a single umbrella toggle; the granular `simplex`/`duplex`/`codec` features live
+  one level down in the `fgumi-consensus` crate for embedders that want a reduced
+  library build. Building with `--no-default-features` cleanly drops all consensus
+  code (the root crate still compiles); pass `--features consensus` to add it back.
+- `simulate` - Enable the simulate command for test data generation (implies `consensus`)
 - `compare` - Enable compare subcommand (developer tools)
-- `simulate` - Enable simulate command for test data generation
 - `profile-adjacency` - Enable profiling output for adjacency UMI assigner
 
 Build with features: `cargo build --release --features compare,simulate`
+
+The reduced-feature build (`cargo check -p fgumi --no-default-features`) is
+exercised in CI by the `fgumi-feature-check` job so always-compiled chain/runall
+code can never silently reference a feature-gated consensus module again.
 
 ## Code Architecture
 

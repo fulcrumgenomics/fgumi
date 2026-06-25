@@ -27,6 +27,13 @@
 //! the bottom of this file).
 
 #![allow(clippy::needless_pass_by_value)]
+// The non-consensus parity oracles (sort/group/zipper/correct/align) run in
+// every build; the consensus-targeting cases (`*_simplex/duplex/codec*`) are
+// gated per-test with `#[cfg(feature = "consensus")]` below. In a reduced
+// (`--no-default-features`) build those gated tests compile out, leaving the
+// consensus-only fixtures and helper imports they used unused — silence the
+// resulting warnings in that build only (they are all live under `consensus`).
+#![cfg_attr(not(feature = "consensus"), allow(dead_code, unused_imports))]
 
 use std::ffi::OsString;
 use std::fs;
@@ -288,6 +295,7 @@ fn parity_a_group_to_group() {
 /// Parity therefore holds by construction (same standalone command,
 /// same input); this test pins the delegation glue (input forwarding,
 /// option-struct construction).
+#[cfg(feature = "consensus")]
 #[test]
 fn parity_a_simplex_to_simplex() {
     let tmp = TempDir::new().unwrap();
@@ -309,6 +317,7 @@ fn parity_a_simplex_to_simplex() {
 /// by task 6 of #33; runs through the consensus-only delegation fast
 /// path. See `parity_a_simplex_to_simplex` for the delegation
 /// contract this pins.
+#[cfg(feature = "consensus")]
 #[test]
 fn parity_a_duplex_to_duplex() {
     let tmp = TempDir::new().unwrap();
@@ -332,6 +341,7 @@ fn parity_a_duplex_to_duplex() {
 /// UMI, grouped with `--strategy adjacency`) — the documented CODEC
 /// input — so this actually exercises the duplex consensus logic
 /// instead of degenerating to a no-op on simplex single-end data.
+#[cfg(feature = "consensus")]
 #[test]
 fn parity_a_codec_to_codec() {
     let tmp = TempDir::new().unwrap();
@@ -387,6 +397,7 @@ fn parity_b_sort_to_group() {
 /// `Sort → Simplex` parity vs staged `fgumi sort | fgumi group | fgumi simplex`.
 /// Unblocked by validator (today); test activation pending end-to-end
 /// verification of the parity scaffold.
+#[cfg(feature = "consensus")]
 #[test]
 fn parity_b_sort_to_simplex() {
     let tmp = TempDir::new().unwrap();
@@ -414,6 +425,7 @@ fn parity_b_sort_to_simplex() {
 /// `create_paired_umi_family` sets MC tags programmatically so the
 /// fixture flows through `GroupByPosition` (which requires MC on
 /// paired-end inputs).
+#[cfg(feature = "consensus")]
 #[test]
 fn parity_b_sort_to_duplex() {
     let tmp = TempDir::new().unwrap();
@@ -441,6 +453,7 @@ fn parity_b_sort_to_duplex() {
 /// Uses the codec fixture family (paired-end, single-strand UMI,
 /// `--strategy adjacency`) so the consensus stage actually exercises
 /// CODEC's duplex logic.
+#[cfg(feature = "consensus")]
 #[test]
 fn parity_b_sort_to_codec() {
     let tmp = TempDir::new().unwrap();
@@ -465,6 +478,7 @@ fn parity_b_sort_to_codec() {
 }
 
 /// `Group → Simplex` parity vs staged `fgumi group | fgumi simplex`.
+#[cfg(feature = "consensus")]
 #[test]
 fn parity_b_group_to_simplex() {
     let tmp = TempDir::new().unwrap();
@@ -485,6 +499,7 @@ fn parity_b_group_to_simplex() {
 
 /// `Group → Duplex` parity vs staged `fgumi group | fgumi duplex`.
 /// See [`parity_b_sort_to_duplex`] for the MC-tag fixture note.
+#[cfg(feature = "consensus")]
 #[test]
 fn parity_b_group_to_duplex() {
     let tmp = TempDir::new().unwrap();
@@ -506,6 +521,7 @@ fn parity_b_group_to_duplex() {
 /// `Group → Codec` parity vs staged `fgumi group | fgumi codec`.
 /// Uses the codec fixture family; see [`parity_b_sort_to_codec`] for
 /// the rationale.
+#[cfg(feature = "consensus")]
 #[test]
 fn parity_b_group_to_codec() {
     let tmp = TempDir::new().unwrap();
@@ -534,6 +550,7 @@ fn parity_b_group_to_codec() {
 // same default filter parameters, so the filtered records must match.
 
 /// `Group → Simplex → Filter` (fused) vs staged consensus BAM + `fgumi filter`.
+#[cfg(feature = "consensus")]
 #[test]
 fn parity_group_to_simplex_to_filter() {
     let tmp = TempDir::new().unwrap();
@@ -558,6 +575,7 @@ fn parity_group_to_simplex_to_filter() {
 }
 
 /// `Group → Duplex → Filter` (fused) vs staged consensus BAM + `fgumi filter`.
+#[cfg(feature = "consensus")]
 #[test]
 fn parity_group_to_duplex_to_filter() {
     let tmp = TempDir::new().unwrap();
@@ -580,6 +598,7 @@ fn parity_group_to_duplex_to_filter() {
 }
 
 /// `Group → Codec → Filter` (fused) vs staged consensus BAM + `fgumi filter`.
+#[cfg(feature = "consensus")]
 #[test]
 fn parity_group_to_codec_to_filter() {
     let tmp = TempDir::new().unwrap();
@@ -664,6 +683,7 @@ fn deterministic_duplex_fixture(dir: &Path, positions: usize) -> PathBuf {
 /// The fused `group → duplex` pipeline must produce a byte-identical record
 /// stream run-to-run at `--threads 8`, and the same record stream at
 /// `--threads 1` as at `--threads 8` (thread-count-invariant output).
+#[cfg(feature = "consensus")]
 #[test]
 fn runall_duplex_record_stream_is_deterministic() {
     let tmp = TempDir::new().unwrap();
@@ -745,6 +765,7 @@ fn assert_runall_rejects(start: Stage, stop: Stage, expected_stderr_fragment: &s
 /// Cross-flavor terminal: `simplex → duplex` is structurally invalid
 /// (both are terminal consensus stages, so the pipeline cannot
 /// progress past simplex). Rejected by `RunAllStage::validate_with`.
+#[cfg(feature = "consensus")]
 #[test]
 fn rejects_cross_flavor_consensus_pair() {
     assert_runall_rejects(Stage::Simplex, Stage::Duplex, "--start-from");
@@ -752,6 +773,7 @@ fn rejects_cross_flavor_consensus_pair() {
 
 /// Reverse order: `duplex → simplex` violates the linear-stage
 /// ordering rule.
+#[cfg(feature = "consensus")]
 #[test]
 fn rejects_reverse_order_consensus_to_consensus() {
     assert_runall_rejects(Stage::Duplex, Stage::Simplex, "--start-from");
@@ -1535,6 +1557,7 @@ fn aam_to_sort_fused_pipeline_with_mock_aligner() {
 /// tempfile-bridge path because the merged BAM's record order
 /// depends on the in-pipeline vs across-tempfile sort cadence —
 /// instead we assert the consensus BAM is non-empty.
+#[cfg(feature = "consensus")]
 #[test]
 fn aam_to_simplex_fused_pipeline_with_mock_aligner() {
     let tmp = TempDir::new().unwrap();
@@ -1596,6 +1619,7 @@ fn aam_to_simplex_fused_pipeline_with_mock_aligner() {
     }
 }
 
+#[cfg(feature = "consensus")]
 #[test]
 fn aam_to_duplex_fused_pipeline_with_mock_aligner() {
     let tmp = TempDir::new().unwrap();
@@ -1650,6 +1674,7 @@ fn aam_to_duplex_fused_pipeline_with_mock_aligner() {
     assert!(n_records >= 1, "expected >= 1 record in duplex BAM, got {n_records}");
 }
 
+#[cfg(feature = "consensus")]
 #[test]
 fn aam_to_codec_fused_pipeline_with_mock_aligner() {
     let tmp = TempDir::new().unwrap();
@@ -1714,6 +1739,7 @@ fn aam_to_codec_fused_pipeline_with_mock_aligner() {
 /// turns out to produce 0 simplex consensus reads on a correctly-
 /// wired chain — so a record-count assertion on it can't tell the
 /// wire-up bug shape apart from the "fixture too thin" shape.
+#[cfg(feature = "consensus")]
 #[test]
 fn zipper_to_simplex_fused_pipeline() {
     let tmp = TempDir::new().unwrap();
@@ -1769,6 +1795,7 @@ fn zipper_to_simplex_fused_pipeline() {
 /// everything filtered → header-only BAM, which still satisfies
 /// `meta.len() > 0`). The record-count assertion below makes that
 /// regression visible as a test failure rather than a silent zero.
+#[cfg(feature = "consensus")]
 #[test]
 fn zipper_to_duplex_fused_pipeline() {
     let tmp = TempDir::new().unwrap();
@@ -1808,6 +1835,7 @@ fn zipper_to_duplex_fused_pipeline() {
 /// Same wire-up bug as `zipper_to_duplex_fused_pipeline` guards —
 /// `execute_codec_pipeline` was previously missing its
 /// `else if let Some(zipper) = zipper` arm.
+#[cfg(feature = "consensus")]
 #[test]
 fn zipper_to_codec_fused_pipeline() {
     let tmp = TempDir::new().unwrap();
@@ -2659,6 +2687,7 @@ fn correct_to_group_fused_pipeline() {
 /// requires both R1 + R2 of a pair to emit consensus, so this
 /// produces a header-only BAM by construction. Smoke-test asserts
 /// the chain succeeds + the output BAM opens cleanly.
+#[cfg(feature = "consensus")]
 #[test]
 fn correct_to_simplex_fused_pipeline() {
     let tmp = TempDir::new().unwrap();
@@ -2692,6 +2721,7 @@ fn correct_to_simplex_fused_pipeline() {
 /// well-formed input (proper-pair flags, both R1 and R2 with
 /// matching qnames). Asserts ≥ 1 consensus record — same shape as
 /// `aam_to_duplex_fused_pipeline_with_mock_aligner`.
+#[cfg(feature = "consensus")]
 #[test]
 fn correct_to_duplex_fused_pipeline() {
     let tmp = TempDir::new().unwrap();
@@ -2726,6 +2756,7 @@ fn correct_to_duplex_fused_pipeline() {
 /// paired-end UMI fixture + paired mock aligner (which emits the
 /// FR-overlap shape codec requires). Asserts ≥ 1 consensus record —
 /// same shape as `aam_to_codec_fused_pipeline_with_mock_aligner`.
+#[cfg(feature = "consensus")]
 #[test]
 fn correct_to_codec_fused_pipeline() {
     let tmp = TempDir::new().unwrap();

@@ -115,24 +115,33 @@ mach2 = "0.6"
 nix = { version = "0.31", default-features = false, features = ["fs"] }
 
 [features]
-default = ["simplex", "duplex", "codec"]
-simplex = ["fgumi-consensus/simplex"]
-# duplex and codec depend on simplex (mirrors fgumi-consensus: `duplex = ["simplex"]`
-# and `codec = ["simplex"]`), and their commands share methylation/filter paths
-# that live behind the `simplex` feature in this crate.
-duplex = ["simplex", "fgumi-consensus/duplex"]
-codec = ["simplex", "fgumi-consensus/codec"]
+default = ["consensus"]
+# All consensus calling (simplex, duplex, CODEC) is gated behind a single
+# `consensus` feature in this umbrella crate. The shipped binary always bundles
+# all three callers, so a per-codec split of the *umbrella* crate bought nothing
+# while letting the always-compiled chain/runall layer reference a half-present
+# consensus surface — the X1-001 regression where every reduced-feature build
+# failed to compile. The granular `simplex`/`duplex`/`codec` features are kept
+# one level down in `fgumi-consensus` for embedders that want a reduced library
+# build. `--no-default-features` now cleanly drops all consensus code, restoring
+# the #314 "root crate builds with --no-default-features" guarantee.
+#
+# `fgumi-consensus`'s `duplex` and `codec` features are siblings (each depends on
+# `simplex`, not on each other), so all three must be enabled explicitly.
+consensus = [
+    "fgumi-consensus/simplex",
+    "fgumi-consensus/duplex",
+    "fgumi-consensus/codec",
+]
 dhat-heap = ["dep:dhat"]
 # Enable comprehensive memory debugging infrastructure (monitor thread, hot-path atomics, CLI args)
 memory-debug = ["fgumi-sort/memory-debug"]
 # Enable compare subcommand with bams and metrics (developer tools)
 compare = []
-# Enable simulate commands for generating synthetic test data
-simulate = ["simplex"]
+# Enable simulate commands for generating synthetic test data (needs the consensus surface)
+simulate = ["consensus"]
 # Enable profiling output for adjacency UMI assigner
 profile-adjacency = []
-# Enable slow stress tests for concurrency testing
-stress-tests = []
 
 [dev-dependencies]
 rstest = "0"
@@ -145,8 +154,8 @@ trybuild = "1.0"
 [[bench]]
 name = "core_functions"
 harness = false
-# Exercises vanilla consensus / overlap helpers that live behind `simplex`.
-required-features = ["simplex"]
+# Exercises vanilla consensus / overlap helpers that live behind `consensus`.
+required-features = ["consensus"]
 
 [[bench]]
 name = "raw_bam_accessors"

@@ -51,7 +51,7 @@
 )]
 
 pub mod clip;
-#[cfg(feature = "codec")]
+#[cfg(feature = "consensus")]
 pub mod codec;
 pub mod command;
 pub mod common;
@@ -61,9 +61,9 @@ pub mod consensus_runner;
 pub mod correct;
 pub mod dedup;
 pub mod downsample;
-#[cfg(feature = "duplex")]
+#[cfg(feature = "consensus")]
 pub mod duplex;
-#[cfg(feature = "duplex")]
+#[cfg(feature = "consensus")]
 pub mod duplex_metrics;
 pub mod extract;
 pub mod fastq;
@@ -71,12 +71,12 @@ pub mod filter;
 pub mod group;
 pub mod merge;
 pub mod review;
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 pub mod runall;
 pub mod shared_metrics;
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 pub mod simplex;
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 pub mod simplex_metrics;
 #[cfg(feature = "simulate")]
 pub mod simulate;

@@ -92,6 +92,68 @@ pub fn assert_rejects_header_matches_input(
     );
 }
 
+/// Reads a BAM file and returns the multiset of record (read) names it holds.
+///
+/// Used to assert *family routing* — e.g. that a `--min-reads`-rejected family
+/// lands in the rejects BAM and is absent from the kept consensus output —
+/// rather than a weaker count/EOF side effect.
+///
+/// # Panics
+///
+/// Panics if the file cannot be opened, the header cannot be read, or any
+/// record cannot be decoded.
+pub fn read_record_names(path: &std::path::Path) -> Vec<String> {
+    let mut reader = noodles::bam::io::Reader::new(
+        std::fs::File::open(path).expect("Failed to open BAM for record-name read"),
+    );
+    let _header = reader.read_header().expect("Failed to read BAM header");
+    reader
+        .records()
+        .map(|result| {
+            result
+                .expect("Failed to read BAM record")
+                .name()
+                .expect("record missing read name")
+                .to_string()
+        })
+        .collect()
+}
+
+/// Asserts that a `--min-reads`-rejected family was routed correctly: every
+/// record name in `reject_names` is present in `rejects_path` and absent from
+/// the kept output at `kept_path`.
+///
+/// This proves the contract the rejects tests care about — the rejected family
+/// went to the rejects file and did *not* slip into the kept consensus output
+/// (which a miscount of the family size, e.g. counting one paired template as
+/// two reads, would cause). Kept output holds renamed consensus reads, so the
+/// raw rejected read names only ever survive in the rejects file.
+///
+/// # Panics
+///
+/// Panics if any expected reject name is missing from `rejects_path` or present
+/// in `kept_path`.
+pub fn assert_family_rejected_not_kept(
+    rejects_path: &std::path::Path,
+    kept_path: &std::path::Path,
+    reject_names: &[&str],
+) {
+    let in_rejects = read_record_names(rejects_path);
+    let in_kept = read_record_names(kept_path);
+    for &name in reject_names {
+        assert!(
+            in_rejects.iter().any(|n| n == name),
+            "rejected read '{name}' should be present in rejects BAM {} (found {in_rejects:?})",
+            rejects_path.display(),
+        );
+        assert!(
+            !in_kept.iter().any(|n| n == name),
+            "rejected read '{name}' must be absent from kept output {} (found {in_kept:?})",
+            kept_path.display(),
+        );
+    }
+}
+
 /// Asserts that a record has a specific MI (molecule ID) tag value.
 ///
 /// # Panics

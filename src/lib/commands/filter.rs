@@ -9,7 +9,7 @@
 //!    (min reads, max read error rate, max no-calls, min mean quality)
 
 use crate::alignment_tags::regenerate_alignment_tags_raw;
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 use crate::consensus_filter::resolve_ref_bases_for_record;
 use crate::consensus_filter::{
     FilterConfig, FilterResult, MethylationDepthThresholds, MethylationTags,
@@ -402,8 +402,8 @@ impl Filter {
         methylation_mode: fgumi_consensus::MethylationMode,
         ref_names: &[String],
     ) -> Result<(u64, bool)> {
-        // `ref_names` is only consumed by the `simplex`-gated ref-base resolver below.
-        #[cfg(not(feature = "simplex"))]
+        // `ref_names` is only consumed by the `consensus`-gated ref-base resolver below.
+        #[cfg(not(feature = "consensus"))]
         let _ = ref_names;
 
         // Fail fast if we encounter a mapped read without a reference, since masking
@@ -465,10 +465,10 @@ impl Filter {
         }
 
         // Resolve reference bases once for all reference-dependent filters.
-        // The resolver lives in the `simplex`-gated `methylation` module, so the
+        // The resolver lives in the `consensus`-gated `methylation` module, so the
         // reference-dependent methylation filters below are only available when
-        // `simplex` is enabled. Without `simplex` we skip the lookup entirely.
-        #[cfg(feature = "simplex")]
+        // `consensus` is enabled. Without `consensus` we skip the lookup entirely.
+        #[cfg(feature = "consensus")]
         let ref_base_map = {
             let needs_ref_bases = (require_strand_methylation_agreement && is_duplex)
                 || min_conversion_fraction.is_some();
@@ -478,13 +478,13 @@ impl Filter {
                 None
             }
         };
-        #[cfg(not(feature = "simplex"))]
+        #[cfg(not(feature = "consensus"))]
         let ref_base_map: Option<Vec<Option<u8>>> = {
             if (require_strand_methylation_agreement && is_duplex)
                 || min_conversion_fraction.is_some()
             {
                 bail!(
-                    "reference-dependent methylation filters require building fgumi with the `simplex` feature"
+                    "reference-dependent methylation filters require building fgumi with the `consensus` feature"
                 );
             }
             None

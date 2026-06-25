@@ -11,13 +11,16 @@
 
 use clap::Parser;
 use fgumi_lib::commands::clip::Clip;
+#[cfg(feature = "consensus")]
 use fgumi_lib::commands::codec::Codec;
 use fgumi_lib::commands::command::Command as FgumiCommand;
 use fgumi_lib::commands::correct::CorrectUmis;
 use fgumi_lib::commands::dedup::MarkDuplicates;
+#[cfg(feature = "consensus")]
 use fgumi_lib::commands::duplex::Duplex;
 use fgumi_lib::commands::filter::Filter;
 use fgumi_lib::commands::group::GroupReadsByUmi;
+#[cfg(feature = "consensus")]
 use fgumi_lib::commands::simplex::Simplex;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
@@ -31,6 +34,9 @@ use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 use crate::helpers::assertions::{assert_has_bgzf_eof, assert_rejects_header_matches_input};
+// Only the `#[cfg(feature = "consensus")]` rejects tests use this helper.
+#[cfg(feature = "consensus")]
+use crate::helpers::assertions::assert_family_rejected_not_kept;
 use crate::helpers::bam_generator::{
     create_minimal_header, create_test_reference, create_umi_family, to_record_buf,
 };
@@ -109,6 +115,7 @@ fn create_dedup_reads(name: &[u8], umi: &str, start: i32) -> Vec<RawRecord> {
 }
 
 /// Create a duplex read pair with /A or /B strand MI suffix.
+#[cfg(feature = "consensus")]
 fn create_duplex_pair(
     name: &[u8],
     mi_tag: &str,
@@ -179,6 +186,7 @@ fn create_duplex_pair(
 }
 
 /// Create a single-template family (will be rejected by --min-reads > 1).
+#[cfg(feature = "consensus")]
 fn create_rejected_family(name: &[u8], umi: &str, start: i32) -> Vec<RawRecord> {
     let r1 = {
         let mut b = SamBuilder::new();
@@ -220,6 +228,7 @@ fn create_rejected_family(name: &[u8], umi: &str, start: i32) -> Vec<RawRecord> 
 }
 
 /// Create a CODEC read pair (FR orientation, same position).
+#[cfg(feature = "consensus")]
 fn create_codec_pair(name: &[u8], umi: &str, ref_start: i32) -> (RawRecord, RawRecord) {
     let r1 = {
         let mut b = SamBuilder::new();
@@ -319,6 +328,7 @@ fn test_dedup_output_has_bgzf_eof() {
     assert_has_bgzf_eof(&output_bam);
 }
 
+#[cfg(feature = "consensus")]
 #[test]
 fn test_simplex_output_has_bgzf_eof() {
     let temp_dir = TempDir::new().unwrap();
@@ -346,6 +356,7 @@ fn test_simplex_output_has_bgzf_eof() {
     assert_has_bgzf_eof(&output_bam);
 }
 
+#[cfg(feature = "consensus")]
 #[test]
 fn test_duplex_output_has_bgzf_eof() {
     let temp_dir = TempDir::new().unwrap();
@@ -386,6 +397,7 @@ fn test_duplex_output_has_bgzf_eof() {
     assert_has_bgzf_eof(&output_bam);
 }
 
+#[cfg(feature = "consensus")]
 #[test]
 fn test_codec_output_has_bgzf_eof() {
     let temp_dir = TempDir::new().unwrap();
@@ -626,6 +638,7 @@ fn test_piped_simplex_to_filter_has_bgzf_eof() {
 // Rejects writer BGZF EOF tests
 // ============================================================================
 
+#[cfg(feature = "consensus")]
 #[test]
 fn test_simplex_rejects_has_bgzf_eof() {
     let temp_dir = TempDir::new().unwrap();
@@ -658,8 +671,12 @@ fn test_simplex_rejects_has_bgzf_eof() {
     assert_has_bgzf_eof(&output_bam);
     assert_has_bgzf_eof(&rejects_bam);
     assert_rejects_header_matches_input(&rejects_bam, &input_bam);
+    // The singleton "reject" family must be routed to the rejects BAM and not
+    // slip into the kept consensus output (a miscount of family size would).
+    assert_family_rejected_not_kept(&rejects_bam, &output_bam, &["reject"]);
 }
 
+#[cfg(feature = "consensus")]
 #[test]
 fn test_duplex_rejects_has_bgzf_eof() {
     let temp_dir = TempDir::new().unwrap();
@@ -707,8 +724,12 @@ fn test_duplex_rejects_has_bgzf_eof() {
     assert_has_bgzf_eof(&output_bam);
     assert_has_bgzf_eof(&rejects_bam);
     assert_rejects_header_matches_input(&rejects_bam, &input_bam);
+    // The singleton "reject_a" family must land in the rejects BAM and not in
+    // the kept consensus output.
+    assert_family_rejected_not_kept(&rejects_bam, &output_bam, &["reject_a"]);
 }
 
+#[cfg(feature = "consensus")]
 #[test]
 fn test_codec_rejects_has_bgzf_eof() {
     let temp_dir = TempDir::new().unwrap();
@@ -748,6 +769,9 @@ fn test_codec_rejects_has_bgzf_eof() {
     assert_has_bgzf_eof(&output_bam);
     assert_has_bgzf_eof(&rejects_bam);
     assert_rejects_header_matches_input(&rejects_bam, &input_bam);
+    // The singleton "reject" pair must land in the rejects BAM and not in the
+    // kept consensus output.
+    assert_family_rejected_not_kept(&rejects_bam, &output_bam, &["reject"]);
 }
 
 #[test]

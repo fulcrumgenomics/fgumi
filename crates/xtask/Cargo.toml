@@ -9,6 +9,15 @@ license.workspace = true
 publish = false
 
 [features]
+# `consensus` is default-on so doc builds (`cargo run -p xtask -- docs-build`,
+# which uses default features) generate the simplex/duplex/codec command docs.
+# It is its own feature — rather than relying on `fgumi`'s default — so that the
+# workspace `--no-default-features` CI check disables it here too, letting that
+# check exercise a genuinely reduced `fgumi` and catch always-compiled code that
+# references the consensus surface (X1-002). The consensus command imports in
+# `generate_tools.rs` are gated on this feature.
+default = ["consensus"]
+consensus = ["fgumi/consensus"]
 # Mirror the compare feature from the fgumi crate to include the compare tool in docs
 compare = ["fgumi/compare"]
 # Mirror the simulate feature from the fgumi crate to include simulate tools in docs
@@ -19,7 +28,13 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
-fgumi = { path = "../.." }
+# `default-features = false` so the workspace `--no-default-features` CI check
+# actually exercises a reduced `fgumi`. Without it, Cargo feature-unification
+# pulls in `fgumi`'s default (consensus) features under `--workspace`, masking
+# any always-compiled code that references the consensus surface (see X1-002).
+# xtask re-enables consensus (default-on, above) / compare / simulate explicitly
+# for doc generation via its own mirrored features.
+fgumi = { path = "../..", default-features = false }
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }

@@ -4,11 +4,11 @@
 
 pub use fgumi_consensus::{base_builder, caller, filter, overlapping, sequence, simple_umi, tags};
 
-#[cfg(feature = "codec")]
+#[cfg(feature = "consensus")]
 pub use fgumi_consensus::codec_caller;
-#[cfg(feature = "duplex")]
+#[cfg(feature = "consensus")]
 pub use fgumi_consensus::duplex_caller;
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 pub use fgumi_consensus::vanilla_caller;
 
 // Re-export commonly used items
@@ -20,15 +20,15 @@ pub use fgumi_consensus::{
     log_consensus_statistics, mask_bases, mask_duplex_bases, mean_base_quality, template_passes,
 };
 
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 pub use fgumi_consensus::{
     VanillaConsensusRead, VanillaUmiConsensusCaller, VanillaUmiConsensusOptions,
 };
 
-#[cfg(feature = "duplex")]
+#[cfg(feature = "consensus")]
 pub use fgumi_consensus::{DuplexConsensusCaller, DuplexConsensusRead};
 
-#[cfg(feature = "codec")]
+#[cfg(feature = "consensus")]
 pub use fgumi_consensus::{
     CodecConsensusCaller, CodecConsensusError, CodecConsensusOptions, CodecConsensusStats,
 };

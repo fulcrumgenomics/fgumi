@@ -9,18 +9,18 @@ mod helpers;
 mod test_async_reader;
 mod test_bgzf_eof;
 mod test_clip_command;
-#[cfg(feature = "codec")]
+#[cfg(feature = "consensus")]
 mod test_codec_command;
-#[cfg(feature = "codec")]
+#[cfg(feature = "consensus")]
 mod test_codec_pipeline;
 #[cfg(feature = "compare")]
 mod test_compare_bams;
 mod test_correct_command;
 mod test_dedup_command;
 mod test_downsample_command;
-#[cfg(feature = "duplex")]
+#[cfg(feature = "consensus")]
 mod test_duplex_command;
-#[cfg(feature = "duplex")]
+#[cfg(feature = "consensus")]
 mod test_duplex_metrics_command;
 #[cfg(all(feature = "compare", feature = "simulate"))]
 mod test_e2e_regression;
@@ -31,13 +31,15 @@ mod test_filter_command;
 mod test_group_command;
 mod test_group_determinism;
 mod test_review_command;
-#[cfg(all(feature = "simplex", feature = "duplex", feature = "codec"))]
+// Always compiled: the non-consensus parity oracles (sort/group/zipper/correct/
+// align) must keep their reduced-feature coverage. The consensus-targeting
+// cases inside are individually `#[cfg(feature = "consensus")]`-gated.
 mod test_runall_parity;
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 mod test_simplex_command;
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 mod test_simplex_metrics_command;
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 mod test_simplex_pipeline;
 #[cfg(feature = "simulate")]
 mod test_simulate_aligner;

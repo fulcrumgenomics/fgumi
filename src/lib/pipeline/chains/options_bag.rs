@@ -7,13 +7,16 @@ use std::path::PathBuf;
 // home, not redefined.
 pub use crate::aligner::AlignerOptions;
 pub use crate::commands::clip::Clip;
+#[cfg(feature = "consensus")]
 pub use crate::commands::codec::CodecOptions;
 pub use crate::commands::correct::CorrectOptions;
 pub use crate::commands::dedup::MarkDuplicates;
+#[cfg(feature = "consensus")]
 pub use crate::commands::duplex::DuplexOptions;
 pub use crate::commands::extract::ExtractOptions;
 pub use crate::commands::filter::FilterOptions;
 pub use crate::commands::group::GroupOptions;
+#[cfg(feature = "consensus")]
 pub use crate::commands::simplex::SimplexOptions;
 pub use crate::commands::sort::SortOptions;
 pub use crate::commands::zipper::ZipperOptions;
@@ -65,7 +68,9 @@ pub struct StageOptionsBag {
     pub zipper: Option<ZipperOptions>,
     pub sort: Option<SortOptions>,
     pub group: Option<GroupOptions>,
+    #[cfg(feature = "consensus")]
     pub duplex: Option<DuplexOptions>,
+    #[cfg(feature = "consensus")]
     pub codec: Option<CodecOptions>,
     /// Dedup options. Holds `MarkDuplicates` directly (approach 2 from
     /// the T2.12 design note) to keep the test surface stable.
@@ -79,6 +84,7 @@ pub struct StageOptionsBag {
     /// Simplex options. Holds the free-standing `SimplexOptions` struct
     /// (same approach as Duplex/Codec), so runall can re-expose the tuning
     /// knobs via `--simplex::*` through `MultiSimplexOptions`.
+    #[cfg(feature = "consensus")]
     pub simplex: Option<SimplexOptions>,
     /// Align (`AlignAndMerge`) options. Carries [`AlignerOptions`] +
     /// reference path + optional aligner-binary override.

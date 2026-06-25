@@ -391,7 +391,7 @@ impl fgumi_sam::ReferenceProvider for ReferenceReader {
     }
 }
 
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 impl fgumi_consensus::methylation::RefBaseProvider for ReferenceReader {
     fn base_at_0based(&self, chrom: &str, pos: u64) -> Option<u8> {
         let sequence = self.sequences.get(chrom)?;

@@ -164,12 +164,26 @@ pub fn validate_stage_opts_present(spec: &ChainSpec) -> Result<()> {
             Stage::Zipper => bag.zipper.is_some(),
             Stage::Sort => bag.sort.is_some(),
             Stage::Group => bag.group.is_some(),
+            #[cfg(feature = "consensus")]
             Stage::Duplex => bag.duplex.is_some(),
+            #[cfg(feature = "consensus")]
             Stage::Codec => bag.codec.is_some(),
             Stage::Dedup => bag.dedup.is_some(),
             Stage::Filter => bag.filter.is_some(),
             Stage::Clip => bag.clip.is_some(),
+            #[cfg(feature = "consensus")]
             Stage::Simplex => bag.simplex.is_some(),
+            // Without the `consensus` feature the consensus option-bag slots do
+            // not exist, so this stage can never be satisfied. Bail with an
+            // explicit feature-disabled error rather than returning `false`,
+            // which would surface the generic "options not provided" message
+            // below and tell reduced-feature callers to populate bag slots that
+            // do not exist. Unreachable in practice — the consensus CLI commands
+            // are compiled out too — but the message is correct if reached.
+            #[cfg(not(feature = "consensus"))]
+            Stage::Duplex | Stage::Codec | Stage::Simplex => {
+                bail!("Stage {stage:?} requires building fgumi with the `consensus` feature");
+            }
             Stage::Align => bag.aligner.is_some(),
             Stage::Extract => bag.extract.is_some(),
             Stage::Downsample => unreachable!(),
@@ -516,6 +530,9 @@ mod tests {
         );
     }
 
+    // These three exercise the consensus option-bag slots, which only exist
+    // with the `consensus` feature.
+    #[cfg(feature = "consensus")]
     #[test]
     fn duplex_after_group_requires_paired_strategy() {
         use crate::assigner::Strategy;
@@ -531,6 +548,7 @@ mod tests {
         assert!(err.to_string().contains("Paired"), "got: {err}");
     }
 
+    #[cfg(feature = "consensus")]
     #[test]
     fn duplex_after_group_with_paired_strategy_accepted() {
         use crate::assigner::Strategy;
@@ -545,6 +563,7 @@ mod tests {
         validate_cross_stage_constraints(&spec).expect("paired strategy should pass");
     }
 
+    #[cfg(feature = "consensus")]
     #[test]
     fn standalone_duplex_skips_paired_check() {
         // Chain has only Stage::Duplex (no Stage::Group). Rule 2 does not fire

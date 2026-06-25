@@ -3,7 +3,7 @@
 //! This module provides shared traits and utilities used by simplex, duplex, and codec
 //! consensus calling commands to reduce code duplication.
 
-#[cfg(feature = "codec")]
+#[cfg(feature = "consensus")]
 use crate::consensus::codec_caller::CodecConsensusStats;
 use crate::consensus_caller::ConsensusCallingStats;
 use crate::metrics::consensus::ConsensusMetrics;
@@ -24,6 +24,7 @@ use noodles::sam::header::record::value::map::tag::Other;
 /// `--threads` hint pointing at the SAM-capable multi-threaded path. Shared by
 /// `codec`/`simplex`/`duplex`'s `execute` (their open logic and error message
 /// are identical bar the command name).
+#[cfg(feature = "consensus")]
 pub(crate) fn open_single_threaded_consensus_input(
     input: &std::path::Path,
     reader_opts: fgumi_bam_io::PipelineReaderOpts,
@@ -68,7 +69,7 @@ impl ConsensusStatsOps for ConsensusCallingStats {
     }
 }
 
-#[cfg(feature = "codec")]
+#[cfg(feature = "consensus")]
 impl ConsensusStatsOps for CodecConsensusStats {
     fn merge(&mut self, other: &Self) {
         self.total_input_reads += other.total_input_reads;

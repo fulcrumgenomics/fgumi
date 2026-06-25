@@ -815,6 +815,7 @@ name = "fgumi-pipeline-core"
 version = "0.3.0"
 dependencies = [
  "ahash",
+ "anyhow",
  "crossbeam-queue",
  "log",
  "noodles",

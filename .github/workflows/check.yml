@@ -190,3 +190,32 @@ jobs:
         # (lib + tests + benches) with no default features to surface
         # regressions at PR time.
         run: cargo check --workspace --no-default-features --all-targets
+
+  fgumi-feature-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # This job runs `cargo check` on PR code, which executes build
+          # scripts and proc macros. Don't leave GITHUB_TOKEN in git config
+          # where that untrusted code could read it (zizmor: artipacked).
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Set up compilation cache (sccache)
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: fgumi reduced-feature compile coverage
+        # All consensus calling (simplex, duplex, codec) in the umbrella `fgumi`
+        # crate is gated behind one `consensus` feature (default-on). `--workspace`
+        # jobs feature-unify across members, so they cannot prove the *reduced*
+        # `fgumi` compiles in isolation. This job checks `fgumi` alone across its
+        # meaningful feature combos so a regression where always-compiled
+        # chain/runall code references the consensus surface (the X1-001 break,
+        # where every reduced-feature build failed to compile) is caught at PR
+        # time. The consensus-off combo is lib + bin only: the test/bench suite
+        # intentionally requires consensus to exercise the consensus callers.
+        run: |
+          cargo check -p fgumi --no-default-features
+          cargo check -p fgumi --no-default-features --features consensus --all-targets
+          cargo check -p fgumi --all-targets

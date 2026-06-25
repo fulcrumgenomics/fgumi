@@ -4,18 +4,18 @@
 //! command structs using `#[command(flatten)]`.
 
 use std::path::PathBuf;
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 use std::sync::Arc;
 
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 use crate::logging::OperationTimer;
 use crate::validation::validate_file_exists;
 use bytesize::ByteSize;
 use clap::Args;
 use fgumi_bam_io::is_stdin_path;
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 use fgumi_consensus::methylation::RefBaseProvider;
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 use log::info;
 use noodles::sam::Header;
 
@@ -56,7 +56,7 @@ pub fn resolve_methylation_mode(
 }
 
 /// Methylation reference pair: reference base provider + contig name mapping.
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 pub type MethylationRef = Option<(
     Arc<dyn fgumi_consensus::methylation::RefBaseProvider + Send + Sync>,
     Arc<Vec<String>>,
@@ -65,7 +65,7 @@ pub type MethylationRef = Option<(
 /// Loads the reference FASTA and builds contig name mapping for methylation-aware modes.
 ///
 /// Returns `None` if methylation mode is disabled. Errors if enabled but `reference` is `None`.
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 pub fn load_methylation_reference(
     methylation_mode: fgumi_consensus::MethylationMode,
     reference: &Option<PathBuf>,
@@ -417,9 +417,19 @@ pub struct ThreadingOptions {
 ///
 /// (Named `SchedulerOptions` for historical reasons — the `--scheduler`
 /// strategy flag it once carried was removed in the issue #330 migration,
-/// since the typed-step dispatch model has no pluggable strategy.)
+/// since the typed-step dispatch model has no pluggable strategy. It survives
+/// only as a hidden, deprecated no-op alias so legacy invocations degrade to a
+/// warning rather than a hard clap error — see the `scheduler` field.)
 #[derive(Debug, Clone, Default, Args)]
 pub struct SchedulerOptions {
+    /// DEPRECATED: no-op. The pluggable scheduler strategy was removed in the
+    /// issue #330 typed-step dispatch migration; the typed-step model has no
+    /// strategy to select. Kept as a hidden alias that accepts (and ignores)
+    /// any value so scripts passing the old `--scheduler <strategy>` warn
+    /// instead of hard-failing on an unknown argument (AUDIT-002).
+    #[arg(long = "scheduler", hide = true)]
+    pub scheduler: Option<String>,
+
     /// Print detailed pipeline statistics at completion.
     ///
     /// Shows per-step timing, throughput, contention metrics, and
@@ -766,6 +776,16 @@ pub fn warn_unwired_pipeline_flags(
     scheduler_opts: &SchedulerOptions,
     queue_memory: &QueueMemoryOptions,
 ) {
+    // --scheduler: removed in the issue #330 typed-step dispatch migration
+    // (no pluggable strategy to select). Accepted as a hidden no-op alias so
+    // legacy scripts warn rather than hard-failing on an unknown argument.
+    if scheduler_opts.scheduler.is_some() {
+        log::warn!(
+            "DEPRECATED: --scheduler is a no-op and is ignored; the pluggable \
+             scheduler strategy was removed in the typed-step pipeline migration \
+             (#330). Remove it from your invocation."
+        );
+    }
     // --deadlock-recover: the legacy progressive-doubling recovery
     // addressed a failure mode (a worker pinned on a stuck step under
     // legacy's static scheduler) that doesn't exist in the typed-step
@@ -985,6 +1005,7 @@ mod tests {
             pipeline_stats: true,
             deadlock_timeout: 10,
             deadlock_recover: false,
+            scheduler: None,
         };
         assert!(opts.collect_stats());
     }
@@ -995,6 +1016,7 @@ mod tests {
             pipeline_stats: false,
             deadlock_timeout: 30,
             deadlock_recover: false,
+            scheduler: None,
         };
         assert_eq!(opts.deadlock_timeout_secs(), 30);
     }
@@ -1005,8 +1027,32 @@ mod tests {
             pipeline_stats: false,
             deadlock_timeout: 10,
             deadlock_recover: true,
+            scheduler: None,
         };
         assert!(opts.deadlock_recover_enabled());
+    }
+
+    #[test]
+    fn test_deprecated_scheduler_flag_is_accepted_as_noop() {
+        use clap::Parser;
+
+        // A minimal parser that flattens SchedulerOptions, mirroring how every
+        // pipeline command embeds it. The deprecated `--scheduler <value>` must
+        // parse (not hard-error like an unknown argument) and be captured so the
+        // dispatch path can emit the deprecation warning.
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            scheduler: SchedulerOptions,
+        }
+
+        let cli = TestCli::try_parse_from(["test", "--scheduler", "work-stealing"])
+            .expect("--scheduler must be accepted as a deprecated no-op, not rejected");
+        assert_eq!(cli.scheduler.scheduler.as_deref(), Some("work-stealing"));
+
+        // Absent by default.
+        let cli = TestCli::try_parse_from(["test"]).expect("parses with no args");
+        assert_eq!(cli.scheduler.scheduler, None);
     }
 
     // ========== Tests for QueueMemoryOptions ==========

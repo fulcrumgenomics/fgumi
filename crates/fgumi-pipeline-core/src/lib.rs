@@ -14,6 +14,7 @@
 
 pub mod builder;
 pub mod erased;
+pub mod finalize;
 pub mod handles;
 pub mod header;
 pub mod held;
@@ -34,6 +35,7 @@ pub use builder::{
     PipelineConfig,
 };
 pub use erased::{ErasedStep, ErasedStepCtx, TypedStep, TypedStep2};
+pub use finalize::FinalizeHook;
 pub use handles::{HeldRetry, TwoInputHandles, Unpushed};
 pub use header::{AlreadySetError, HeaderHandle};
 pub use held::HeldSlot;

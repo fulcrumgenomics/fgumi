@@ -42,6 +42,8 @@ use crate::pipeline::chains::{
     StageTimingFinalizeHook, build_pipeline_config_for_chain,
 };
 use crate::pipeline::core::builder::PipelineBuilder;
+// Only the `consensus`-gated `FuseState` implements `HeapSize` in this module.
+#[cfg(feature = "consensus")]
 use crate::pipeline::core::item::HeapSize;
 use crate::pipeline::core::topology::{BranchIdx, StepIdx};
 use crate::pipeline::steps::tuning::BamPipelineTuning;
@@ -210,11 +212,13 @@ pub(crate) enum ChainTailKind {
 /// `PipelineBuilder::append_source` / `append_step`, which bypass the
 /// typed-chain API. See the module-level type-erasure note for the runtime
 /// behaviour when a type mismatch is introduced.
+#[cfg(feature = "consensus")]
 pub(crate) struct FuseState {
     scratch: Vec<u8>,
     mi_buf: String,
 }
 
+#[cfg(feature = "consensus")]
 impl HeapSize for FuseState {}
 
 /// Build the `TemplatesToMiGroups` bridge step that fuses an intermediate
@@ -227,6 +231,7 @@ impl HeapSize for FuseState {}
 /// `duplex_strip_strand` controls whether the `/A` `/B` strand suffix is
 /// stripped from the MI key so both strands of a duplex molecule group
 /// together (`true` for duplex; `false` for simplex and codec).
+#[cfg(feature = "consensus")]
 fn templates_to_mi_step(
     limit_bytes: u64,
     duplex_strip_strand: bool,
@@ -332,7 +337,17 @@ pub struct ChainBuilder<'a> {
     pipeline: PipelineBuilder,
 
     /// Post-pipeline cleanup hooks. Populated by `add_<stage>` methods.
+    /// Always drained, even when the run fails (see [`BuiltPipeline::run`]).
     finalize: Vec<Box<dyn FinalizeHook>>,
+
+    /// Post-pipeline hooks that run **only on a fully successful run**.
+    /// Populated by `add_<stage>` methods for actions that publish a derived
+    /// artifact from the run's output (currently only `add_sort`'s
+    /// `IndexBamFinalizeHook`, which writes the `.bai` sidecar by re-reading
+    /// the finished BAM). Gating these mirrors the standalone `fgumi sort`
+    /// flow, where the index write is behind `run_result?`: a failed run
+    /// leaves a partial BAM, so publishing its index would be stale.
+    finalize_on_success: Vec<Box<dyn FinalizeHook>>,
 
     /// Shared progress counter threaded through source + stage steps for
     /// progress logging. `Arc` so the stage step and the finalize hook can
@@ -449,6 +464,7 @@ impl<'a> ChainBuilder<'a> {
             current_tail: None,
             pipeline: PipelineBuilder::new(),
             finalize: Vec::new(),
+            finalize_on_success: Vec::new(),
             progress_records: Arc::new(AtomicU64::new(0)),
             pending_source,
             paired_tail: None,
@@ -956,6 +972,7 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// [`DecompressedBlock`]: crate::pipeline::steps::types::DecompressedBlock
     /// [`DecodedRecordBatch`]: crate::pipeline::steps::types::DecodedRecordBatch
+    #[cfg(feature = "consensus")]
     fn finish_consensus_tail(
         &mut self,
         tail: (
@@ -991,6 +1008,7 @@ impl<'a> ChainBuilder<'a> {
     /// context. Shared by `add_simplex`/`add_duplex`/`add_codec`, whose
     /// rejects wiring is otherwise identical — only the consensus step's type
     /// (built inline by the caller) differs.
+    #[cfg(feature = "consensus")]
     fn wire_consensus_rejects_branch(
         &self,
         consensus_pt: (StepIdx, BranchIdx),
@@ -1245,7 +1263,12 @@ impl<'a> ChainBuilder<'a> {
         // The timing hook fires first (before per-stage hooks like DedupFinalize).
         self.finalize.insert(0, Box::new(StageTimingFinalizeHook::new_with_label(chain_label)));
 
-        Ok(BuiltPipeline { pipeline, config, finalize: self.finalize })
+        Ok(BuiltPipeline {
+            pipeline,
+            config,
+            finalize: self.finalize,
+            finalize_on_success: self.finalize_on_success,
+        })
     }
 
     // -- private per-stage methods, one per Stage variant --
@@ -2047,20 +2070,24 @@ impl<'a> ChainBuilder<'a> {
             }));
 
             // When the spec asks for a sidecar BAI, queue the
-            // `IndexBamFinalizeHook` *after* `SortFinalizeHook` so the
+            // `IndexBamFinalizeHook` on the *success-gated* finalize list so
+            // it runs after a successful run only — a failed sort leaves a
+            // partial BAM, and publishing (or overwriting) `<output>.bam.bai`
+            // for it would be a stale index (mirrors the standalone
+            // `fgumi sort` flow, which gates the index write behind
+            // `run_result?`). It runs after `SortFinalizeHook` so the
             // "Records written / X records/s" summary lands before the
-            // indexer's "Indexing BAM:" / "Wrote BAM index:" pair. The
-            // hook re-reads the finished BAM and emits
-            // `<output>.bam.bai` next to it (see `IndexBamFinalizeHook`
-            // for the I/O contract). Rule 3 in `chains::validate`
-            // guarantees `BamWithIndex` only appears when the terminal
-            // chain stage is `Stage::Sort`, so a sole-stage
+            // indexer's "Indexing BAM:" / "Wrote BAM index:" pair. The hook
+            // re-reads the finished BAM and emits `<output>.bam.bai` next to
+            // it (see `IndexBamFinalizeHook` for the I/O contract). Rule 3 in
+            // `chains::validate` guarantees `BamWithIndex` only appears when
+            // the terminal chain stage is `Stage::Sort`, so a sole-stage
             // `[Stage::Sort]` chain is the only path that reaches the
-            // Standalone branch with that sink — multi-stage
-            // sort-terminal chains land in the streaming branch below,
-            // where the hook is mirrored.
+            // Standalone branch with that sink — multi-stage sort-terminal
+            // chains land in the streaming branch below, where the hook is
+            // mirrored.
             if matches!(self.spec.sink, SinkSpec::BamWithIndex(_)) {
-                self.finalize.push(Box::new(IndexBamFinalizeHook { output_path }));
+                self.finalize_on_success.push(Box::new(IndexBamFinalizeHook { output_path }));
             }
         } else {
             // ── Streaming sort (Intermediate OR Terminal-after-upstream-stages) ──
@@ -2175,8 +2202,10 @@ impl<'a> ChainBuilder<'a> {
 
                 // Mirror the Standalone-branch BAI hook registration: when
                 // the spec asks for a sidecar BAI, queue the
-                // `IndexBamFinalizeHook` so the indexer runs after the chain
-                // has flushed the final BAM. Multi-stage Sort-terminal
+                // `IndexBamFinalizeHook` on the *success-gated* finalize list
+                // so the indexer runs after the chain has flushed the final
+                // BAM on a successful run only (a failed run leaves a partial
+                // BAM whose index would be stale). Multi-stage Sort-terminal
                 // chains (e.g. `[Stage::Correct, Stage::Sort]`) land here
                 // instead of the Standalone branch (which requires
                 // `current_tail.is_none()`), so without this wire a
@@ -2189,7 +2218,7 @@ impl<'a> ChainBuilder<'a> {
                 // "BamWithIndex triggers the hook in every terminal-sort
                 // path" — is enforced here for future producers.
                 if let SinkSpec::BamWithIndex(p) = &self.spec.sink {
-                    self.finalize.push(Box::new(
+                    self.finalize_on_success.push(Box::new(
                         crate::pipeline::chains::commands::sort::IndexBamFinalizeHook {
                             output_path: p.clone(),
                         },
@@ -2449,6 +2478,32 @@ impl<'a> ChainBuilder<'a> {
         Ok(())
     }
 
+    // ----------------------------------------------------------------------
+    // Consensus stages (simplex / duplex / codec).
+    //
+    // The full method bodies below are compiled only with the `consensus`
+    // feature, which gates the consensus command modules and their option
+    // types. When the crate is built without `consensus`, the consensus CLI
+    // commands and option-bag slots are compiled out, so these stages are
+    // unreachable — but `add_stage`'s match must still resolve all three
+    // `Stage` variants. These stubs provide that resolution and fail loudly
+    // if ever reached.
+    // ----------------------------------------------------------------------
+    #[cfg(not(feature = "consensus"))]
+    fn add_simplex(&mut self, _position: StagePosition) -> Result<()> {
+        bail!("fgumi was built without consensus support; rebuild with `--features consensus`")
+    }
+
+    #[cfg(not(feature = "consensus"))]
+    fn add_duplex(&mut self, _position: StagePosition) -> Result<()> {
+        bail!("fgumi was built without consensus support; rebuild with `--features consensus`")
+    }
+
+    #[cfg(not(feature = "consensus"))]
+    fn add_codec(&mut self, _position: StagePosition) -> Result<()> {
+        bail!("fgumi was built without consensus support; rebuild with `--features consensus`")
+    }
+
     /// Simplex-specific step sequence:
     ///
     /// `GroupByMi` →
@@ -2479,6 +2534,7 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// [`BatchedMiGroups`]: crate::pipeline::steps::group::mi::BatchedMiGroups
     /// [`DecompressedBlock`]: crate::pipeline::steps::types::DecompressedBlock
+    #[cfg(feature = "consensus")]
     #[allow(clippy::too_many_lines)]
     fn add_simplex(&mut self, position: StagePosition) -> Result<()> {
         use crate::commands::common::{
@@ -2721,6 +2777,7 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// [`BatchedMiGroups`]: crate::pipeline::steps::group::mi::BatchedMiGroups
     /// [`DecompressedBlock`]: crate::pipeline::steps::types::DecompressedBlock
+    #[cfg(feature = "consensus")]
     #[allow(clippy::too_many_lines)]
     fn add_duplex(&mut self, position: StagePosition) -> Result<()> {
         use crate::commands::common::{
@@ -2975,6 +3032,7 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// [`BatchedMiGroups`]: crate::pipeline::steps::group::mi::BatchedMiGroups
     /// [`DecompressedBlock`]: crate::pipeline::steps::types::DecompressedBlock
+    #[cfg(feature = "consensus")]
     #[allow(clippy::too_many_lines)]
     fn add_codec(&mut self, position: StagePosition) -> Result<()> {
         use crate::commands::common::warn_unwired_pipeline_flags;
