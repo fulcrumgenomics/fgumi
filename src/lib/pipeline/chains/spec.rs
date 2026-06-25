@@ -32,3 +32,19 @@ pub struct ChainSpec {
     /// For `@PG` line injection into the output header.
     pub command_line: String,
 }
+
+impl ChainSpec {
+    /// Whether this is the standalone sort-terminal chain (`[Stage::Sort]`).
+    ///
+    /// This layout is special: `build_for` skips `add_source`/`add_sink` and the
+    /// terminal `SortBamFile` step opens and reads the input itself. Both the
+    /// source/sink skip in `build_for` and the header-open skip in
+    /// `ChainBuilder::new` MUST agree on this predicate — if they drift, a
+    /// sort-terminal chain could open its source twice (draining a stdin pipe
+    /// before the sort engine reads it). Single-source the test here so the two
+    /// call sites cannot disagree.
+    #[must_use]
+    pub fn is_sort_terminal(&self) -> bool {
+        matches!(self.stages.as_slice(), [Stage::Sort])
+    }
+}

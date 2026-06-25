@@ -151,6 +151,9 @@ pub struct SortStepCaptures {
     /// holds the other end; the step fills it when `RawExternalSorter::sort`
     /// returns.
     pub stats_slot: Arc<Mutex<Option<fgumi_sort::SortStats>>>,
+    /// Wrap the sorter's input in a userspace async prefetch reader (the
+    /// standalone `--async-reader` flag). Off for the fused runall sort.
+    pub async_reader: bool,
 }
 
 /// Build the `SortBamFile` step, constructing and fully configuring the
@@ -171,6 +174,9 @@ pub fn build_sort_step(cap: SortStepCaptures) -> Result<SortBamFile> {
         .threads(cap.num_sorter_threads)
         .output_compression(cap.output_compression)
         .temp_compression(cap.sort.temp_compression)
+        .spill_codec(cap.sort.temp_codec)
+        .key_types(cap.sort.key_types.unwrap_or_default())
+        .async_reader(cap.async_reader)
         .pg_info(version::version_string(), cap.command_line);
 
     if matches!(cap.sort.max_memory, MemoryLimit::Auto) {

@@ -566,6 +566,112 @@ fn test_sort_merge_fails_closed_on_incomplete_setup() {
     assert!(msg.contains("setup incomplete at input drain"), "unexpected error message: {msg}");
 }
 
+// ── SortMerge output-buffer sizing + duplicate-AllAnnounced regression ───────
+
+/// Drive `SortMerge` over `events` and return the *batches* it emits (not the
+/// flattened records), so tests can inspect per-batch buffer capacity.
+fn collect_merge_batches(
+    events: Vec<crate::sort::protocol::SortPhase2Event>,
+    output_byte_limit: u64,
+    target_batch_count: usize,
+) -> Result<Vec<RecordBatch>> {
+    let received: Arc<Mutex<Vec<RecordBatch>>> = Arc::new(Mutex::new(Vec::new()));
+    let source = Phase2EventSource::new(events, output_byte_limit);
+    let merge = SortMerge::with_target_batch_count(
+        SortOrder::Coordinate,
+        output_byte_limit,
+        target_batch_count,
+    );
+    let sink = VecSink { received: Arc::clone(&received), kind: StepKind::Serial };
+
+    let builder = Pipeline::builder();
+    builder.chain(source).chain(merge).chain(sink).into_sink_marker();
+    let pipeline = builder.build()?;
+    pipeline.run(PipelineConfig { threads: 1, ..Default::default() })?;
+
+    Ok(std::mem::take(&mut *received.lock()))
+}
+
+/// Wrap `records` as a single coordinate-sorted in-memory chunk event. All keys
+/// are `default()` (equal) — order does not matter for the buffer-sizing and
+/// duplicate-announcement assertions, only that the chunk merges cleanly.
+fn coordinate_memory_chunk_event(
+    records: Vec<RawRecord>,
+) -> crate::sort::protocol::SortPhase2Event {
+    use crate::sort::protocol::MemoryChunkErased;
+    let total = records.len() as u64;
+    let pairs = records.into_iter().map(|r| (fgumi_sort::RawCoordinateKey::default(), r)).collect();
+    crate::sort::protocol::SortPhase2Event::MemoryChunk {
+        chunk: Arc::new(MemoryChunkErased::Coordinate(pairs)),
+        records_ingested_so_far: total,
+    }
+}
+
+/// Count-bound output batches must not each reserve the full output-queue byte
+/// budget. Drive a many-small-record merge that emits several count-capped
+/// batches and assert their total resident capacity stays well under one byte
+/// budget — it would be ~`num_batches * byte_limit` if every buffer reserved
+/// the full budget (the pre-fix behavior).
+#[test]
+fn test_sort_merge_does_not_over_reserve_output_buffers() {
+    use fgumi_pipeline_core::item::HeapSize;
+
+    let (_header, records) = synthesize_records(600, 7);
+    let byte_limit: u64 = 1 << 20; // 1 MiB
+    let target = 256;
+    let events = vec![
+        coordinate_memory_chunk_event(records),
+        crate::sort::protocol::SortPhase2Event::AllAnnounced {
+            slot_count: 0,
+            memory_chunk_count: 1,
+            total_records: 600,
+        },
+    ];
+    let batches = collect_merge_batches(events, byte_limit, target).expect("merge should succeed");
+
+    let emitted: usize = batches.iter().map(|b| b.iter_record_bytes().count()).sum();
+    assert_eq!(emitted, 600, "all records must be emitted");
+    assert!(
+        batches.len() >= 2,
+        "workload must span multiple count-bound batches, got {}",
+        batches.len()
+    );
+    let total_heap: usize = batches.iter().map(HeapSize::heap_size).sum();
+    assert!(
+        (total_heap as u64) < byte_limit,
+        "output buffers over-reserved: {total_heap} bytes across {} batches \
+         (would exceed one byte budget if each reserved the full {byte_limit})",
+        batches.len(),
+    );
+}
+
+/// The Phase-2 protocol emits exactly one `AllAnnounced`. A second one is a
+/// protocol violation; `SortMerge` must fail closed rather than overwrite its
+/// completion expectations. The first announcement over-promises (2 chunks) so
+/// setup never completes and the duplicate is still absorbed in setup.
+#[test]
+fn test_sort_merge_fails_closed_on_duplicate_all_announced() {
+    let (_header, records) = synthesize_records(1, 1);
+    let byte_limit: u64 = 1 << 20;
+    let events = vec![
+        coordinate_memory_chunk_event(records),
+        crate::sort::protocol::SortPhase2Event::AllAnnounced {
+            slot_count: 0,
+            memory_chunk_count: 2,
+            total_records: 1,
+        },
+        crate::sort::protocol::SortPhase2Event::AllAnnounced {
+            slot_count: 0,
+            memory_chunk_count: 2,
+            total_records: 1,
+        },
+    ];
+    let err = collect_merge_batches(events, byte_limit, 256)
+        .expect_err("duplicate AllAnnounced must error");
+    let msg = err.to_string();
+    assert!(msg.contains("duplicate AllAnnounced"), "unexpected error: {msg}");
+}
+
 fn read_all_records(path: &std::path::Path) -> Vec<Vec<u8>> {
     let (mut reader, _hdr) = fgumi_bam_io::create_raw_bam_reader_with_opts(
         path,

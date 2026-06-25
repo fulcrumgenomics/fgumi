@@ -27,6 +27,15 @@ pub const DEFAULT_TARGET_BATCH_COUNT: usize = 1024;
 /// Max output batches emitted per `try_run` invocation in `Merging`.
 const MAX_DRAIN_BATCHES_PER_LOCK: usize = 8;
 
+/// Initial reservation for an output-batch byte buffer, before any batch has
+/// been emitted to size the next one from. Kept modest on purpose: most batches
+/// fill on the record-count cap well below the output-queue byte budget, so
+/// reserving the full budget for every buffer chronically over-allocates (and
+/// inflates the byte-bounded queue's capacity-based accounting). Buffers grow
+/// on demand via `extend_from_slice`, so under-reserving only costs a few
+/// startup reallocations.
+const INITIAL_OUTPUT_BUFFER_BYTES: usize = 64 * 1024;
+
 #[derive(Default)]
 struct MemoryChunksByKind {
     coordinate: Vec<Vec<(RawCoordinateKey, RawRecord)>>,
@@ -118,7 +127,7 @@ fn absorb_phase2_event(
     total_records: &mut u64,
     expected_slot_count: &mut Option<u32>,
     expected_memory_chunk_count: &mut Option<u32>,
-) {
+) -> io::Result<()> {
     match event {
         SortPhase2Event::SpillReady { slot, path: _, records_ingested_so_far } => {
             if let std::collections::hash_map::Entry::Vacant(e) = slot_index.entry(slot.file_id) {
@@ -128,16 +137,17 @@ fn absorb_phase2_event(
             *total_records = (*total_records).max(records_ingested_so_far);
         }
         SortPhase2Event::MemoryChunk { chunk, records_ingested_so_far } => {
-            let inner = Arc::try_unwrap(chunk).unwrap_or_else(|arc| match arc.as_ref() {
-                MemoryChunkErased::Coordinate(v) => MemoryChunkErased::Coordinate(v.clone()),
-                MemoryChunkErased::QuerynameLex(v) => MemoryChunkErased::QuerynameLex(v.clone()),
-                MemoryChunkErased::QuerynameNatural(v) => {
-                    MemoryChunkErased::QuerynameNatural(v.clone())
-                }
-                MemoryChunkErased::TemplateCoordinate(v) => {
-                    MemoryChunkErased::TemplateCoordinate(v.clone())
-                }
-            });
+            // The MemoryChunk `Arc` is created uniquely in `SortAndSpill` and only
+            // ever *moved* (never cloned) through `SortSpillDecompress` to here, so
+            // it must be uniquely owned at this single consumer. Fail closed on a
+            // shared `Arc` rather than silently deep-cloning a potentially large
+            // record vector on the merge setup path.
+            let inner = Arc::try_unwrap(chunk).map_err(|_| {
+                io::Error::other(
+                    "SortMerge: MemoryChunk Arc unexpectedly shared at the merge consumer \
+                     (protocol invariant: memory chunks are moved, never cloned)",
+                )
+            })?;
             memory_chunks.push(inner);
             *total_records = (*total_records).max(records_ingested_so_far);
         }
@@ -146,18 +156,23 @@ fn absorb_phase2_event(
             memory_chunk_count,
             total_records: ar_total,
         } => {
-            if expected_slot_count.is_some() {
-                log::warn!(
+            // The Phase-2 protocol emits exactly one `AllAnnounced` (the last event
+            // from `SortAndSpill`). A second one is a protocol violation; fail
+            // closed rather than overwrite the prior expectations and risk masking
+            // the bug behind a silently-different completion target.
+            if expected_slot_count.is_some() || expected_memory_chunk_count.is_some() {
+                return Err(io::Error::other(format!(
                     "SortMerge: duplicate AllAnnounced — prior {expected_slot_count:?}/\
                      {expected_memory_chunk_count:?}, new {slot_count}/{memory_chunk_count}; \
-                     using the new values",
-                );
+                     the Phase-2 protocol emits exactly one AllAnnounced",
+                )));
             }
             *expected_slot_count = Some(slot_count);
             *expected_memory_chunk_count = Some(memory_chunk_count);
             *total_records = (*total_records).max(ar_total);
         }
     }
+    Ok(())
 }
 
 fn slot_set_complete(
@@ -242,7 +257,12 @@ impl SortMerge {
     /// # Panics
     ///
     /// Panics if `self.state` is not `WaitingForSetup`.
-    fn absorb_events_into_setup(&mut self, ctx: &mut StepCtx<'_, Self>) -> usize {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on a Phase-2 protocol violation (a duplicate
+    /// `AllAnnounced`, or a `MemoryChunk` whose `Arc` is unexpectedly shared).
+    fn absorb_events_into_setup(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<usize> {
         let SortMergeState::WaitingForSetup {
             slots,
             slot_index,
@@ -264,10 +284,10 @@ impl SortMerge {
                 total_records,
                 expected_slot_count,
                 expected_memory_chunk_count,
-            );
+            )?;
             absorbed += 1;
         }
-        absorbed
+        Ok(absorbed)
     }
 
     fn is_ready_to_merge(&self) -> bool {
@@ -300,9 +320,16 @@ impl SortMerge {
             unreachable!("next_batch called outside Merging state");
         };
 
+        let buffer_floor = INITIAL_OUTPUT_BUFFER_BYTES.min(bytes_cap);
         let flush = |builder: &mut RecordBatchBuilder, next_ordinal: &mut u64| {
             *next_ordinal += 1;
-            let next_builder = RecordBatchBuilder::with_capacity(*next_ordinal, bytes_cap, target);
+            // Size the next buffer to the batch we just filled, clamped to
+            // `[buffer_floor, bytes_cap]`. Count-bound batches stay small; a
+            // byte-bound batch carries ~`bytes_cap` forward. This avoids
+            // reserving the full byte budget for every (typically count-bound)
+            // batch — see `INITIAL_OUTPUT_BUFFER_BYTES`.
+            let hint = builder.total_bytes().clamp(buffer_floor, bytes_cap);
+            let next_builder = RecordBatchBuilder::with_capacity(*next_ordinal, hint, target);
             std::mem::replace(builder, next_builder).build()
         };
         let flush_partial = |builder: &mut RecordBatchBuilder, next_ordinal: &mut u64| {
@@ -404,7 +431,10 @@ impl SortMerge {
         slots.sort_by_key(|s| s.file_id);
         let driver = build_driver(self.sort_order, slots, memory_chunks, total_records);
         let bytes_cap = usize::try_from(self.output_byte_limit).unwrap_or(usize::MAX);
-        let builder = RecordBatchBuilder::with_capacity(0, bytes_cap, self.target_batch_count);
+        // Seed the first buffer modestly; subsequent buffers are sized from the
+        // prior batch's actual byte length (see `next_batch`).
+        let initial_bytes = INITIAL_OUTPUT_BUFFER_BYTES.min(bytes_cap);
+        let builder = RecordBatchBuilder::with_capacity(0, initial_bytes, self.target_batch_count);
         self.state = SortMergeState::Merging { driver, builder, next_ordinal: 0 };
     }
 }
@@ -438,7 +468,7 @@ impl Step for SortMerge {
             // already byte-bounded, so backpressure belongs on the producer, not
             // on a consumer-side drain cap. A cap here would cycle a full upstream
             // queue through repeated partial drains and add producer contention.
-            let absorbed = self.absorb_events_into_setup(ctx);
+            let absorbed = self.absorb_events_into_setup(ctx)?;
             if !self.is_ready_to_merge() {
                 if absorbed > 0 {
                     return Ok(StepOutcome::Progress);

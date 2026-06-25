@@ -553,6 +553,18 @@ impl RecordSource {
 impl Iterator for RecordSource {
     type Item = RawRecord;
 
+    // PERF NOTE (S3-015): the `Direct` arm below allocates a fresh `RawRecord`
+    // per `next()`. This is INHERENT to owned iteration, not a missed reuse: the
+    // sole hot consumer (`sort_queryname_keyed`) *stores* every yielded record
+    // in its in-memory `entries` buffer until spill, so each live record needs
+    // its own buffer — a scratch + `mem::take` would just hand out the scratch's
+    // buffer and leave an empty one behind, reallocating on the very next read
+    // (identical to `RawRecord::default()`). The principled fix is to put the
+    // queryname path on the same byte arena the coordinate/template paths
+    // already use (copy bytes once into a `SegmentedBuf`, store `(key, range)`
+    // refs, pool the keys), which makes this owned `Iterator::next` dead. That
+    // is a design + sort-bench effort tracked in
+    // `docs/design/sort-queryname-arena-deferral.md`.
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::ReadAhead(r, _) => r.next(),

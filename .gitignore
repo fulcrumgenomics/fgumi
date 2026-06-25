@@ -52,6 +52,12 @@ dhat-heap.json
 docs/bench/
 docs/design/*
 !docs/design/deterministic-mi-numbering.md
+# Tracked: cited from worker_pool.rs / merge_slots.rs, so it must be committed
+# (a dangling design-doc citation is exactly what S3-003 / NEW-003 fixed).
+!docs/design/sort-phase2-unification-deferral.md
+# Tracked: cited from read_ahead.rs (S3-015 deferral); must be committed so the
+# code's PERF NOTE citation does not dangle.
+!docs/design/sort-queryname-arena-deferral.md
 scripts/bench-*.sh
 scripts/parity-*.sh
 /TRACKER.md

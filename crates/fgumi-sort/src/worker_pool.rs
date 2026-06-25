@@ -115,10 +115,21 @@ pub(crate) fn read_length_prefix<R: std::io::Read + ?Sized>(
 }
 
 /// Cap on uncompressed size of a zstd spill frame. Production frames are
-/// bounded by the staging buffer (`BGZF_MAX_BLOCK_SIZE` + padding ~= 68 KB);
-/// this leaves slack but stays small enough that per-frame allocations don't
-/// dominate the merge phase when there are many tens of thousands of frames.
+/// bounded by the staging buffer (`STAGING_FRAME_MAX_UNCOMPRESSED_BYTES` ~= 68
+/// KB); this leaves slack (which absorbs atypically large records, e.g. long
+/// reads) but stays small enough that per-frame allocations don't dominate the
+/// merge phase when there are many tens of thousands of frames. The
+/// compile-time assertion below links it to the producer's frame bound so a
+/// future bump to `BGZF_MAX_BLOCK_SIZE`/`STAGING_PADDING` cannot silently leave
+/// this cap too small (which would turn into runtime `decompress_to_buffer`
+/// failures instead of a build error).
 const ZSTD_FRAME_DECOMP_CAP: usize = 256 * 1024;
+
+const _: () = assert!(
+    ZSTD_FRAME_DECOMP_CAP >= crate::bgzf_io::STAGING_FRAME_MAX_UNCOMPRESSED_BYTES,
+    "ZSTD_FRAME_DECOMP_CAP must cover the producer's max uncompressed staging frame; \
+     bump ZSTD_FRAME_DECOMP_CAP if BGZF_MAX_BLOCK_SIZE or STAGING_PADDING grow",
+);
 
 /// Hard cap on the `u32 LE` length prefix of any zstd spill frame. Frames are
 /// produced one per ~64 KiB of input by `handle_compress_job`; even
@@ -434,9 +445,35 @@ impl Clone for BufferPool {
 /// releases a permit after each `write_all`. At most `capacity` compressed
 /// blocks exist anywhere in the pipeline simultaneously, bounding the reorder
 /// buffer to `capacity × BGZF_MAX_BLOCK_SIZE` bytes.
+///
+/// The sender is held in an `ArcSwapOption` rather than a `Mutex<Option<_>>` so
+/// `release()` — called after every block write on the I/O-writer hot path —
+/// is lock-free. `close()` swaps the sender out (dropping it) to disconnect the
+/// channel and wake any producers parked in `acquire()`.
+///
+/// # Closure liveness
+///
+/// `release()` and `close()` are both called by the **single I/O-writer thread**
+/// (`io_writer_loop`): `release()` from within `io_writer_loop_inner`, and
+/// `close()` only *after* that inner loop returns. They are therefore never
+/// concurrent, so a `release()` cannot be mid-`try_send` when `close()` runs.
+/// Even if a future caller invoked `close()` from another thread, liveness still
+/// holds: `release()`'s `load_full()` yields a short-lived local `Arc<Sender>`
+/// that is dropped at the end of the call, so `store(None)` disconnects the
+/// channel as soon as that in-flight clone (if any) drops — a parked `acquire()`
+/// wakes with `Err` within that window, never permanently. The disconnect alone
+/// handles a producer *already parked* in `rx.recv()`; the `closed` flag below
+/// additionally makes `acquire()` **fail closed** for *new* calls, so they don't
+/// keep draining the channel's still-buffered permits after a write error.
 pub(crate) struct PermitPool {
-    tx: std::sync::Mutex<Option<Sender<()>>>,
+    tx: arc_swap::ArcSwapOption<Sender<()>>,
     rx: Receiver<()>,
+    /// Set by `close()` before the sender is dropped. `acquire()` checks it
+    /// around `recv()` so a pool closed on writer error rejects new acquirers
+    /// immediately rather than handing out the permits still buffered in the
+    /// channel (the initial unacquired permits plus any released ones) until
+    /// the channel disconnects.
+    closed: AtomicBool,
 }
 
 impl PermitPool {
@@ -446,34 +483,49 @@ impl PermitPool {
         for _ in 0..capacity {
             tx.try_send(()).expect("fresh channel has capacity for initial permits");
         }
-        Self { tx: std::sync::Mutex::new(Some(tx)), rx }
+        Self { tx: arc_swap::ArcSwapOption::from_pointee(tx), rx, closed: AtomicBool::new(false) }
     }
 
     /// Acquire a permit, blocking until one is available.
     ///
-    /// Returns an error if the pool has been closed (I/O writer exited with an error).
+    /// Returns an error if the pool has been closed (I/O writer exited with an
+    /// error). Fails closed: the `closed` flag is checked both before blocking
+    /// (so a post-close caller never starts draining buffered permits) and after
+    /// `recv()` returns (so a permit handed out concurrently with `close()` is
+    /// rejected rather than used), in addition to the channel-disconnect `Err`.
     pub(crate) fn acquire(&self) -> anyhow::Result<()> {
-        self.rx.recv().map_err(|_| anyhow::anyhow!("permit pool closed: I/O writer thread exited"))
+        if self.closed.load(Ordering::Acquire) {
+            anyhow::bail!("permit pool closed: I/O writer thread exited");
+        }
+        let recv_result = self.rx.recv();
+        if self.closed.load(Ordering::Acquire) {
+            anyhow::bail!("permit pool closed: I/O writer thread exited");
+        }
+        recv_result.map_err(|_| anyhow::anyhow!("permit pool closed: I/O writer thread exited"))
     }
 
     /// Release a permit back to the pool after a block has been written to disk.
+    ///
+    /// Lock-free: loads the sender via `arc-swap` (no mutex on this per-block
+    /// hot path) and `try_send`s a permit. A no-op once the pool is closed (the
+    /// sender has been swapped out, or the channel has disconnected).
     pub(crate) fn release(&self) {
-        if let Ok(guard) = self.tx.lock() {
-            if let Some(tx) = guard.as_ref() {
-                let _ = tx.try_send(());
-            }
+        if let Some(tx) = self.tx.load_full() {
+            let _ = tx.try_send(());
         }
     }
 
     /// Close the pool, unblocking any threads waiting on `acquire()`.
     ///
-    /// Drops the sending half of the channel so that `rx.recv()` in `acquire()`
-    /// returns `Err`, which is mapped to an `anyhow` error. Called by
-    /// `io_writer_loop` on write error to prevent producers from parking forever.
+    /// Sets the `closed` flag (so new/just-woken `acquire()` calls fail closed
+    /// instead of consuming still-buffered permits), then swaps out (drops) the
+    /// sending half so that `rx.recv()` in `acquire()` returns `Err` once the
+    /// channel disconnects. Called by `io_writer_loop` on write error to prevent
+    /// producers from parking forever. The channel disconnects once any
+    /// `release()` clone in flight is dropped.
     pub(crate) fn close(&self) {
-        if let Ok(mut guard) = self.tx.lock() {
-            guard.take(); // drops the Sender, closing the channel
-        }
+        self.closed.store(true, Ordering::Release);
+        self.tx.store(None);
     }
 }
 
@@ -515,6 +567,28 @@ pub(crate) struct Phase2Reader {
 /// file. The locks here are deliberately fine-grained so different workers can
 /// be reading, decompressing, and the main thread can be popping records all
 /// concurrently as long as they touch different sub-states.
+///
+/// # Two Phase-2 merge implementations (deliberate split — see commit `9d6d7e9` / PR #395)
+///
+/// This pool path drives standalone file-to-file `fgumi sort` (it keeps the
+/// engine, zstd spill, `--write-index`, and `--verify`). A SECOND, slimmer
+/// Phase-2 lives in `merge_slots.rs` (`SortMergeSlot`) for the fused in-pipeline
+/// `runall` sort. That path REMOVED the `raw_blocks` FIFO, `decomp_in_flight`,
+/// the reorder buffer, and the gap-filler because its cooperative-step consumer
+/// deadlocked at production scale (see its module header).
+///
+/// This pool path is IMMUNE to that v4 deadlock: its merge consumer is a parked
+/// OS thread (`external.rs::advance_to_next_block`), not a framework step the
+/// engine can Skip; and its single-reader gapless-FIFO serials guarantee the
+/// stuck serial is always either at the `raw_blocks` head (so the gap-filler
+/// fires) or in-flight in a worker's decompressor. Do NOT delete the gap-filler
+/// or the reorder buffer to "match" `merge_slots` — single-*reader* is not
+/// single-*decompressor* here (workers decompress in parallel, so completion
+/// order ≠ pop order), and removing them reintroduces a real deadlock and/or
+/// out-of-order merge output. The split is intentional and deferred-for-now
+/// (see commit `9c39dea` / PR #389 and
+/// `docs/design/sort-phase2-unification-deferral.md`).
+// TODO(#395): unify the two Phase-2 sort drivers — see docs/design/sort-phase2-unification-deferral.md
 pub(crate) struct Phase2FileState {
     /// Disk reader. Held only while popping bytes from disk.
     pub(crate) reader: Mutex<Phase2Reader>,
@@ -537,10 +611,21 @@ pub(crate) struct Phase2FileState {
     /// `is_drained` to avoid a race where the consumer exits while a worker
     /// is mid-decompress.
     pub(crate) decomp_in_flight: AtomicUsize,
+    /// Recycling pool for decompressed-block buffers, shared with the worker
+    /// pool's Phase-1 staging pool (idle once Phase 1 finishes). The zstd
+    /// Phase-2 decompress path checks out a buffer here instead of allocating a
+    /// fresh `Vec` per frame, and the merge consumer checks exhausted blocks
+    /// back in (see `MainThreadChunkConsumer::advance_to_next_block`). BGZF
+    /// decompression returns its own buffer, so it does not participate.
+    pub(crate) buffer_pool: BufferPool,
 }
 
 impl Phase2FileState {
-    pub(crate) fn new(reader: BufReader<std::fs::File>, codec: SpillCodec) -> Self {
+    pub(crate) fn new(
+        reader: BufReader<std::fs::File>,
+        codec: SpillCodec,
+        buffer_pool: BufferPool,
+    ) -> Self {
         Self {
             reader: Mutex::new(Phase2Reader { inner: reader, next_serial: 0, eof: false }),
             reader_eof: AtomicBool::new(false),
@@ -548,6 +633,7 @@ impl Phase2FileState {
             raw_blocks: Mutex::new(VecDeque::with_capacity(PHASE2_RAW_CAP)),
             decompressed: Mutex::new(ReorderBuffer::new()),
             decomp_in_flight: AtomicUsize::new(0),
+            buffer_pool,
         }
     }
 
@@ -1561,11 +1647,17 @@ impl SortWorkerPool {
                             Ok(n) => {
                                 // Copy the `n` decompressed bytes (≤ one
                                 // staging-buffer's worth, typically ~65 KB)
-                                // into a fresh Vec for the consumer. The
-                                // scratch buffer keeps its 256 KiB capacity
-                                // so the next frame on this worker reuses it
+                                // into a buffer checked out from the shared
+                                // recycling pool (rather than a fresh `Vec` per
+                                // frame). The merge consumer checks the buffer
+                                // back in once it has drained the block. The
+                                // scratch buffer keeps its 256 KiB capacity so
+                                // the next frame on this worker reuses it
                                 // without reallocating.
-                                worker.zstd_decompress_buf[..n].to_vec()
+                                let mut out = file.buffer_pool.checkout();
+                                out.clear();
+                                out.extend_from_slice(&worker.zstd_decompress_buf[..n]);
+                                out
                             }
                             Err(e) => {
                                 log::error!(
@@ -1924,7 +2016,7 @@ impl SortWorkerPool {
                 anyhow::anyhow!("Failed to seek chunk file {}: {e}", path.display())
             })?;
             let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
-            states.push(Phase2FileState::new(reader, codec));
+            states.push(Phase2FileState::new(reader, codec, self.buffer_pool.clone()));
         }
 
         let mut guard = self.shared.phase2_files.write().expect("phase2_files rwlock poisoned");
@@ -2136,6 +2228,66 @@ mod tests {
         let pool = BufferPool::new(4);
         let buf = pool.checkout();
         assert!(buf.is_empty());
+    }
+
+    /// `PermitPool` must behave as a bounded semaphore: `capacity` initial
+    /// permits, `release()` (lock-free) returns permits, and `close()` makes a
+    /// subsequent blocking `acquire()` error instead of parking forever.
+    #[test]
+    fn test_permit_pool_acquire_release_close() {
+        let pool = PermitPool::new(2);
+        // Drain the two initial permits.
+        pool.acquire().expect("permit 1");
+        pool.acquire().expect("permit 2");
+
+        // Release one and re-acquire it.
+        pool.release();
+        pool.acquire().expect("re-acquire released permit");
+
+        // Closing unblocks/erros a subsequent acquire rather than parking.
+        pool.close();
+        assert!(pool.acquire().is_err(), "acquire after close must error");
+        // release() after close is a harmless no-op.
+        pool.release();
+    }
+
+    /// A producer parked in `acquire()` (pool fully drained) must be woken with
+    /// `Err` when `close()` runs from another thread — it must not hang. This
+    /// pins the closure-liveness property of the lock-free `ArcSwapOption`
+    /// sender even in the (currently unused) cross-thread close case.
+    #[test]
+    fn test_permit_pool_close_wakes_parked_acquire() {
+        use std::sync::Arc as StdArc;
+        let pool = StdArc::new(PermitPool::new(1));
+        pool.acquire().expect("drain the lone permit");
+
+        let waiter = {
+            let pool = StdArc::clone(&pool);
+            std::thread::spawn(move || pool.acquire())
+        };
+        // Give the waiter time to park in `rx.recv()`, then close from here.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        pool.close();
+
+        let result = waiter.join().expect("waiter thread joins");
+        assert!(result.is_err(), "close() must wake the parked acquire() with Err, not hang");
+    }
+
+    /// Fail closed: a pool closed before any `acquire()` must reject acquirers
+    /// immediately, even though the channel still holds its `capacity` initial
+    /// permits. Without the `closed` flag, `recv()` would hand those buffered
+    /// permits out (`Ok`) until the channel drained, so a writer-error `close()`
+    /// would not stop producers promptly.
+    #[test]
+    fn test_permit_pool_close_fails_closed_with_buffered_permits() {
+        let pool = PermitPool::new(4); // 4 initial permits still buffered in the channel
+        pool.close();
+        for i in 0..4 {
+            assert!(
+                pool.acquire().is_err(),
+                "acquire() #{i} after close must fail closed despite buffered permits",
+            );
+        }
     }
 
     #[test]
@@ -2404,7 +2556,7 @@ mod tests {
     fn empty_phase2_file() -> Phase2FileState {
         let tmp = tempfile::tempfile().expect("failed to create tempfile");
         let reader = BufReader::with_capacity(1024, tmp);
-        Phase2FileState::new(reader, SpillCodec::Bgzf)
+        Phase2FileState::new(reader, SpillCodec::Bgzf, BufferPool::new(4))
     }
 
     /// Build a tiny placeholder raw block whose contents we never decode.
@@ -2469,8 +2621,56 @@ mod tests {
         assert_eq!(file.decomp_in_flight.load(Ordering::Acquire), 1);
     }
 
+    /// FORWARD-PROGRESS GUARD (S3-025) — the exact scenario the cooperative
+    /// `merge_slots` Phase-2 path deadlocked on: EVERY file's reorder buffer at
+    /// `PHASE2_DECOMP_CAP` simultaneously, each stuck on its `next_seq` gap. The
+    /// pool path must stay live: the gap-filler exception admits each file's
+    /// next-expected serial regardless of the global cap pressure, so the
+    /// consumer can pop and drain rather than stalling globally. This pins the
+    /// liveness property the by-construction immunity (and the deferred
+    /// two-driver split) rests on, without standing up a real BAM merge.
     #[test]
-    fn test_admission_at_cap_stuck_wrong_head_rejects() {
+    fn test_phase2_gap_filler_admits_for_every_file_at_cap_simultaneously() {
+        const K: usize = 4;
+        let files: Vec<Phase2FileState> = (0..K).map(|_| empty_phase2_file()).collect();
+        // Put every file simultaneously at cap with a gap at serial 0 and its
+        // gap-filler waiting at the raw-blocks head.
+        for file in &files {
+            {
+                let mut dec = file.decompressed.lock().expect("dec lock");
+                for s in 1..=PHASE2_DECOMP_CAP as u64 {
+                    dec.insert(s, vec![0u8; 4]);
+                }
+                assert!(!dec.can_pop(), "each file should be stuck waiting for serial 0");
+            }
+            file.raw_blocks.lock().expect("raw lock").push_back((0, dummy_raw_block(0)));
+        }
+        // No file may be starved: each admits its own gap-filler at next_seq.
+        for (i, file) in files.iter().enumerate() {
+            let popped = SortWorkerPool::try_pop_raw_for_decompress(file);
+            assert!(
+                popped.is_some(),
+                "file {i}: gap-filler must admit despite all files at cap (no global stall)"
+            );
+            assert_eq!(popped.expect("admitted").0, 0, "admitted block must be next_seq 0");
+            assert_eq!(file.decomp_in_flight.load(Ordering::Acquire), 1);
+        }
+    }
+
+    /// INVARIANT GUARD — pins the cap predicate's rejection branch, not a
+    /// reachable production state.
+    ///
+    /// Premise (reorder buffer stuck on `next_seq = 0` while `raw_blocks` head
+    /// is `CAP + 1`) is unreachable on the live path: serial 0 cannot leave
+    /// `raw_blocks` without being inserted into the reorder buffer (the
+    /// `Phase2FileState` single-reader gapless-FIFO invariant). The test exists
+    /// so that a future "simplification" of `try_pop_raw_for_decompress` which
+    /// drops the `head_serial == next_seq` conjunct — which would defeat the
+    /// `PHASE2_DECOMP_CAP` soft memory bound by admitting non-gap-filler blocks
+    /// over the cap — fails loudly here. Its sibling
+    /// `test_admission_at_cap_stuck_admits_gap_filler` covers the reachable case.
+    #[test]
+    fn test_admission_at_cap_stuck_wrong_head_rejects_invariant_guard() {
         let file = empty_phase2_file();
         // Same setup as gap-filler test, but the head raw is NOT the
         // gap-filler — admission must reject and the merge must rely on

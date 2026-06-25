@@ -337,6 +337,17 @@ mod tests {
     }
 
     #[test]
+    fn is_sort_terminal_only_for_lone_sort() {
+        // The single-sourced predicate that both `build_for` (source/sink skip)
+        // and `ChainBuilder::new` (header-open skip) rely on.
+        assert!(empty_spec(vec![Stage::Sort]).is_sort_terminal());
+        assert!(!empty_spec(vec![]).is_sort_terminal());
+        assert!(!empty_spec(vec![Stage::Group, Stage::Sort]).is_sort_terminal());
+        assert!(!empty_spec(vec![Stage::Sort, Stage::Group]).is_sort_terminal());
+        assert!(!empty_spec(vec![Stage::Correct, Stage::Sort]).is_sort_terminal());
+    }
+
+    #[test]
     fn good_chain_accepted() {
         let spec = empty_spec(vec![Stage::Sort, Stage::Group, Stage::Simplex]);
         validate_stage_progression(&spec).expect("good chain should validate");
