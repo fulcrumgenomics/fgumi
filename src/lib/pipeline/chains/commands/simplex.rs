@@ -346,9 +346,21 @@ pub(crate) fn build_simplex_consensus_step_with_rejects(
             &accumulators,
             &progress,
         )?;
-        match rejects {
-            Some(r) => Ok(Process2Output::both(consensus, r)),
-            None => Ok(Process2Output::only_a(consensus)),
+        if let Some(r) = rejects {
+            Ok(Process2Output::both(consensus, r))
+        } else {
+            // X5-001: an all-clean batch must still emit a (zero-byte) rejects
+            // block so the rejects branch's `ByItemOrdinal` reorder stage sees a
+            // dense serial sequence. Pushing nothing here (`only_a`) leaves a
+            // permanent gap at this serial that wedges `try_pop_in_order`, so
+            // the rejects sink never drains. The empty `Vec` does not allocate
+            // and produces no physical BGZF block (compress/write of `&[]` are
+            // no-ops; the single EOF is appended once at drain).
+            let batch_serial = consensus.batch_serial;
+            Ok(Process2Output::both(
+                consensus,
+                DecompressedBlock { batch_serial, bytes: Vec::new() },
+            ))
         }
     };
 

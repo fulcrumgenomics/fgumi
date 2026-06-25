@@ -13,6 +13,7 @@ use fgumi_lib::sam::SamTag;
 use noodles::bam;
 use noodles::sam::Header;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
+use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::header::record::value::Map;
 use noodles::sam::header::record::value::map::ReadGroup;
 use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
@@ -143,6 +144,99 @@ fn test_simplex_command_with_rejects() {
     .expect("failed to parse simplex args");
     cmd.execute("fgumi simplex").expect("Simplex command with rejects failed");
     assert!(rejects_bam.exists(), "Rejects BAM not created");
+}
+
+/// Regression test for X5-001 at the simplex `--rejects` fan-out site: a
+/// fully-clean batch must not wedge the rejects branch. The rejects fan-out's
+/// branch B uses a `ByItemOrdinal` reorder stage, so every batch serial must
+/// produce a branch-B item; a batch with zero rejects previously pushed nothing
+/// (`Process2Output::only_a`), leaving a permanent serial gap that stalls
+/// `try_pop_in_order` forever. The fix emits an empty (zero-byte) rejects block
+/// for clean batches so serials stay dense.
+///
+/// Construction: the consensus step batches its input by a byte budget
+/// (`per_step_byte_limit`, 4 MiB), so the clean prefix must exceed that budget
+/// to guarantee the leading emitted batch(es) carry no rejects. Many clean
+/// families — each its own MI group (depth 2, passing `--min-reads 2`) —
+/// together clear 4 MiB (4000 families × 2 reads × 600 bp), so the batcher
+/// flushes all-clean leading batches before a singleton family that
+/// `--min-reads 2` rejects in a later batch. A *single* giant family would be
+/// one MI group the batcher co-locates with the reject, so no reject-free batch
+/// would form — see the construction comment in the body.
+#[test]
+fn test_simplex_command_rejects_all_clean_batch_does_not_wedge() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+
+    let long_seq: String = "ACGT".repeat(150); // 600 bp
+    // MANY clean families — each its own MI group, depth 2 (passes --min-reads
+    // 2). A single giant family is ONE MI group that the byte-budget batcher
+    // co-locates with the reject, so no reject-free batch ever forms (the
+    // all-clean-batch X5-001 trigger). Many families let the batcher flush
+    // all-clean leading batches before the reject's batch. 4000 families × 2
+    // reads × 600 bp clears the 4 MiB `per_step_byte_limit` several times over.
+    let family_count = 4000;
+    let mi_tags: Vec<String> = (0..family_count).map(|i| format!("mi{i:04}")).collect();
+    let mut families: Vec<(&str, Vec<fgumi_raw_bam::RawRecord>)> =
+        Vec::with_capacity(family_count + 1);
+    for (i, mi) in mi_tags.iter().enumerate() {
+        families.push((
+            mi.as_str(),
+            create_umi_family("ACGTACGT", 2, &format!("clean{i}"), &long_seq, 30),
+        ));
+    }
+    // Singleton family rejected by --min-reads 2, written last so it lands in
+    // the final batch — after at least one all-clean leading batch.
+    families.push(("zzz_reject", create_umi_family("TTTTTTTT", 1, "rej", &long_seq, 30)));
+    create_grouped_bam(&input_bam, families);
+
+    let cmd = Simplex::try_parse_from([
+        "simplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--min-reads",
+        "2",
+        "--threads",
+        "4",
+        // Short deadlock window: a regression wedges and is failed in ~18s
+        // (3s × the 6× fatal multiplier) instead of the ~60s default; the fixed
+        // path finishes in well under a second.
+        "--deadlock-timeout",
+        "3",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse simplex args");
+    // Pre-fix this wedges on the rejects sink; post-fix it returns.
+    cmd.execute("fgumi simplex")
+        .expect("simplex --rejects must complete even with an all-clean leading batch");
+
+    assert!(rejects_bam.exists(), "Rejects BAM not created");
+    crate::helpers::assertions::assert_has_bgzf_eof(&rejects_bam);
+
+    // The singleton "rej_0" read must reach --rejects byte-identical to its
+    // input record (the reject path passes source reads through unchanged).
+    // Compare full `RecordBuf`s against the record as written to the input BAM
+    // — that captures every field/tag (incl. the MI added at grouping time),
+    // so a mutated sequence/quality/tag on the passed-through reject is caught,
+    // not just a wrong QNAME.
+    let expected: Vec<RecordBuf> = crate::helpers::assertions::read_record_bufs(&input_bam)
+        .into_iter()
+        .filter(|r| r.name().is_some_and(|n| n == "rej_0"))
+        .collect();
+    assert_eq!(expected.len(), 1, "fixture sanity: exactly one reject input record");
+
+    let observed = crate::helpers::assertions::read_record_bufs(&rejects_bam);
+    assert_eq!(
+        observed, expected,
+        "the singleton reject must reach --rejects byte-identical to its input record"
+    );
 }
 
 /// Creates a header with multiple read groups, each with SM, LB, PL tags.

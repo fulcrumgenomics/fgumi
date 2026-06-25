@@ -14,6 +14,7 @@ use fgumi_lib::commands::command::Command;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
 use noodles::bam;
+use noodles::sam::alignment::record_buf::RecordBuf;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -535,6 +536,7 @@ fn test_codec_command_recovers_from_duplex_disagreement() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let input_bam = temp_dir.path().join("input.bam");
     let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
 
     // Single offset pair → 20 single-strand positions = 20 disagreements,
     // which trips the count threshold below.
@@ -547,6 +549,8 @@ fn test_codec_command_recovers_from_duplex_disagreement() {
         input_bam.to_str().unwrap(),
         "--output",
         output_bam.to_str().unwrap(),
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
         "--min-reads",
         "1",
         "--min-duplex-length",
@@ -567,6 +571,25 @@ fn test_codec_command_recovers_from_duplex_disagreement() {
     let _header = reader.read_header().unwrap();
     let consensus_count = reader.records().count();
     assert_eq!(consensus_count, 0, "Disagreeing molecule should produce no consensus");
+
+    // The disagreement-failed pair (R1 + R2) is routed to --rejects, matching
+    // fgbio (`RejectionReason.HighDuplexDisagreement`) and the threaded sibling
+    // test (S9b-006). Asserts the single-threaded path populates rejects too.
+    assert!(rejects_bam.exists(), "Rejects BAM file should be created");
+    // The disagreement-failed pair (R1 + R2) must reach --rejects byte-identical
+    // to its input records (passed through unchanged). Comparing full
+    // `RecordBuf`s catches sequence/quality/CIGAR/tag mutation AND distinguishes
+    // R1 from R2 via the segment flags — stronger than a (name, flags) check.
+    let expected: Vec<RecordBuf> = crate::helpers::assertions::read_record_bufs(&input_bam)
+        .into_iter()
+        .filter(|r| r.name().is_some_and(|n| n == "disagree_read"))
+        .collect();
+    assert_eq!(expected.len(), 2, "fixture sanity: the disagreeing pair is two records");
+    let observed = crate::helpers::assertions::read_record_bufs(&rejects_bam);
+    assert_eq!(
+        observed, expected,
+        "the disagreeing pair (R1+R2) must reach --rejects byte-identical to its input records"
+    );
 }
 
 /// Verifies that the parallel `Codec::execute_threads_mode` path recovers
@@ -611,20 +634,22 @@ fn test_codec_command_recovers_from_duplex_disagreement_threaded() {
     let consensus_count = reader.records().count();
     assert_eq!(consensus_count, 0, "Disagreeing molecule should produce no consensus");
 
-    // Exercising --rejects forces the parallel-mode `flush_byte_records`
-    // call inside the typed-disagreement arm (`is_duplex_disagreement()`
-    // branch in `execute_threads_mode`). The current behavior is that the
-    // disagreement short-circuit in `consensus_reads_typed` returns the
-    // typed error before populating `rejected_reads`, so the file is
-    // created but stays empty — match that here without baking the
-    // open question (whether disagreement-failed reads *should* land in
-    // --rejects) into the test.
+    // High-duplex-disagreement molecules are routed to --rejects, matching
+    // fgbio's `RejectionReason.HighDuplexDisagreement` (S9b-006). The single
+    // offset pair contributes its two source reads (R1 + R2), so the rejects
+    // BAM holds exactly 2 records.
     assert!(rejects_bam.exists(), "Rejects BAM file should be created");
-    let mut rejects_reader = bam::io::Reader::new(fs::File::open(&rejects_bam).unwrap());
-    let _ = rejects_reader.read_header().unwrap();
-    let reject_count = rejects_reader.records().count();
+    // Full `RecordBuf` identity against the input records (passed through
+    // unchanged) — catches sequence/quality/CIGAR/tag mutation and distinguishes
+    // R1 from R2 via the segment flags, like the single-threaded sibling.
+    let expected: Vec<RecordBuf> = crate::helpers::assertions::read_record_bufs(&input_bam)
+        .into_iter()
+        .filter(|r| r.name().is_some_and(|n| n == "disagree_read_mt"))
+        .collect();
+    assert_eq!(expected.len(), 2, "fixture sanity: the disagreeing pair is two records");
+    let observed = crate::helpers::assertions::read_record_bufs(&rejects_bam);
     assert_eq!(
-        reject_count, 0,
-        "Disagreement short-circuits before reject tracking; rejects file is empty"
+        observed, expected,
+        "the disagreeing pair (R1+R2) must reach --rejects byte-identical to its input records"
     );
 }

@@ -282,9 +282,19 @@ pub(crate) fn build_codec_consensus_step_with_rejects(
           -> io::Result<Process2Output<DecompressedBlock, DecompressedBlock>> {
         let (consensus, rejects) =
             run_codec_consensus_batch(state, item, track_rejects, &accumulators, &progress)?;
-        match rejects {
-            Some(r) => Ok(Process2Output::both(consensus, r)),
-            None => Ok(Process2Output::only_a(consensus)),
+        if let Some(r) = rejects {
+            Ok(Process2Output::both(consensus, r))
+        } else {
+            // X5-001: an all-clean batch must still emit a (zero-byte) rejects
+            // block so the rejects branch's `ByItemOrdinal` reorder stage sees a
+            // dense serial sequence; pushing nothing (`only_a`) leaves a gap at
+            // this serial that wedges the rejects sink. The empty `Vec` does not
+            // allocate and produces no physical BGZF block.
+            let batch_serial = consensus.batch_serial;
+            Ok(Process2Output::both(
+                consensus,
+                DecompressedBlock { batch_serial, bytes: Vec::new() },
+            ))
         }
     };
 

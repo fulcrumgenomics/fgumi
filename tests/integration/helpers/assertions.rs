@@ -92,6 +92,23 @@ pub fn assert_rejects_header_matches_input(
     );
 }
 
+/// Reads every record from a BAM file into owned `RecordBuf`s.
+///
+/// Useful for asserting full record identity (sequence, flags, tags) — e.g.
+/// that a `--rejects` stream passed its source reads through byte-identically.
+///
+/// # Panics
+///
+/// Panics if the file cannot be opened, the header cannot be read, or any
+/// record cannot be decoded.
+pub fn read_record_bufs(path: &std::path::Path) -> Vec<RecordBuf> {
+    let mut reader = noodles::bam::io::Reader::new(
+        std::fs::File::open(path).expect("Failed to open BAM for record-buf read"),
+    );
+    let header = reader.read_header().expect("Failed to read BAM header");
+    reader.record_bufs(&header).map(|r| r.expect("Failed to read BAM record")).collect()
+}
+
 /// Reads a BAM file and returns the multiset of record (read) names it holds.
 ///
 /// Used to assert *family routing* — e.g. that a `--min-reads`-rejected family
