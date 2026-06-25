@@ -6,7 +6,7 @@
 //!
 //! Relocated here from the main crate's `read_info` module so the grouping
 //! domain types (which depend on `LibraryIndex`) can live in this crate
-//! alongside [`crate::RawRecord`]-adjacent helpers and `MemoryEstimate`.
+//! alongside [`fgumi_raw_bam::RawRecord`]-adjacent helpers and `MemoryEstimate`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
