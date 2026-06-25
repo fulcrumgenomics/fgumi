@@ -301,8 +301,9 @@ pub struct Sort {
     /// Write BAM index (.bai) alongside output.
     ///
     /// Only valid for coordinate sort. The index file will be written to
-    /// `<output>.bai`. Uses single-threaded compression for accurate virtual
-    /// position tracking.
+    /// `<output>.bai`. Output BGZF compression stays multi-threaded (scales
+    /// with `--threads`); the BAI virtual offsets are recovered from each BGZF
+    /// block as it finalizes, so indexing does not serialize compression.
     #[arg(long = "write-index", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub write_index: bool,
 
