@@ -1,4 +1,4 @@
-<!-- Please make sure you click the link below to view the contribution guidelines, then fill out the requested information below. **IMPORTANT: Please do not create a Pull Request without creating an issue first.** -->
+<!-- Please review the contribution guidelines in CONTRIBUTING.md (https://github.com/fulcrumgenomics/fgumi/blob/main/CONTRIBUTING.md) before filling out the information below. **IMPORTANT: Please open an issue before creating a Pull Request.** -->
 
 ## Summary of changes
 
@@ -21,7 +21,7 @@ If you know who should review your PR, please tag them here. -->
 - [ ] Yes
 - [ ] No
 
-<!-- If this introduces a breaking change, please describe the impact and migration path for the existing applications below. Remember to add a `BREAKING CHANGE:` footer to your commit message when you merge this PR. -->
+<!-- If this introduces a breaking change, describe the impact and the migration path for existing users below, and add a `BREAKING CHANGE:` footer to the relevant commit message. -->
 
 ### :heavy_check_mark: Checklist
 

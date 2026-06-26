@@ -1,11 +1,15 @@
 # Contributing to fgumi
 
+For a full developer guide — project layout, the development lifecycle, and the release process — see [docs/DEVELOPING.md](docs/DEVELOPING.md). [CLAUDE.md](CLAUDE.md) documents the code architecture and key design patterns.
+
 ## Development Setup
 
 ### Prerequisites
 
-- Rust (stable toolchain)
-- cargo-nextest (for running tests)
+- Rust 1.87.0 or newer (the project uses edition 2024)
+- [cargo-nextest](https://nexte.st/) for running tests (`cargo install cargo-nextest --locked`)
+
+The `cargo ci-*` commands below are project-specific aliases defined in [`.cargo/config.toml`](.cargo/config.toml); they wrap the formatting, lint, and test invocations CI runs.
 
 ### Install Git Hooks
 
@@ -49,6 +53,19 @@ git commit --no-verify -m "message"
 - Run `cargo fmt` before committing
 - Fix all clippy warnings
 - Add backticks around identifiers in doc comments (e.g., `` `read_name` ``)
+
+## Commit Messages
+
+Use the [Conventional Commits](https://www.conventionalcommits.org/) format: `<type>[(scope)][!]: <description>`. Common types are `feat`, `fix`, `docs`, `refactor`, `perf`, `test`, `build`, `ci`, and `chore`.
+
+```text
+feat(group): add paired adjacency strategy
+fix(codec): handle empty consensus families
+```
+
+## Branch Naming
+
+Name branches `<issue-number>/<user>/<type>-<description>`, e.g. `42/jdidion/fix-fibonacci-calculation`. Never commit directly to `main` or `dev`; use a feature branch.
 
 ## Testing
 

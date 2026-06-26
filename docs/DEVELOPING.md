@@ -99,6 +99,8 @@ For example, the following command will run all CI checks:
 cargo ci-test && cargo ci-fmt && cargo ci-lint
 ```
 
+To run `cargo ci-fmt` and `cargo ci-lint` automatically before each commit, install the pre-commit hooks with `./scripts/install-hooks.sh`. Set `FGUMI_PRECOMMIT_TEST=1` to also run the tests in the hook.
+
 When a particular topic is not covered by Fulcrum best practices, you can [start a Discussion](https://github.com/fulcrumgenomics/fgumi/discussions) or search online (e.g., [Idiomatic Rust](https://github.com/mre/idiomatic-rust)).
 
 #### Documentation
@@ -118,19 +120,19 @@ Several Cargo features exist for development and debugging purposes. These are *
 | `memory-debug` | Enables comprehensive memory debugging infrastructure: a monitor thread, hot-path atomic counters, and additional CLI arguments for memory tracking. Requires `libmimalloc-sys` and `sysinfo` dependencies. | `cargo build --features memory-debug` |
 | `dhat-heap` | Enables heap profiling via the `dhat` crate. Replaces the default `mimalloc` allocator with `dhat::Alloc`. | `cargo build --features dhat-heap` |
 | `profile-adjacency` | Enables profiling output for the adjacency UMI assigner. | `cargo build --features profile-adjacency` |
-| `compare` | Enables the `compare` subcommand for BAM and metrics developer tools. | `cargo build --features compare` |
-| `simulate` | Enables the `simulate` command for generating synthetic test data. | `cargo build --features simulate` |
+| `compare` | Enables the `compare` subcommand for BAM and metrics developer tools (see [compare-cli.md](compare-cli.md)). | `cargo build --features compare` |
+| `simulate` | Enables the `simulate` command for generating synthetic test data (see [simulate-cli.md](simulate-cli.md)). | `cargo build --features simulate` |
 
 None of these features are included in release builds or `cargo dist` artifacts.
 
 #### Testing
 
 In general, every addition of (non-trivial) code to the project must be accompanied by unit tests that, at a minimum, exercise all the "happy paths" (i.e., non-error cases) through the code.
-It is strongly recommended to also test at least the most commonly expected error cases to make sure they are handled correctly.
+Also test at least the most commonly expected error cases to make sure they are handled correctly.
 Most importantly, every bugfix *must* be accompanied by at least one regression test.
 
 Please read the [documentation](https://doc.rust-lang.org/rust-by-example/testing/unit_testing.html) on unit testing in Rust if you haven't already done so.
-We use [`rstest`](https://docs.rs/rstest/latest/rstest/) for writing tests, and we use [`nextest`](https://nexte.st/) for running tests in CI and recommend you use it locally.
+We use [`rstest`](https://docs.rs/rstest/latest/rstest/) for parameterized tests and [`proptest`](https://docs.rs/proptest/latest/proptest/) for property-based tests, and we use [`nextest`](https://nexte.st/) for running tests in CI and recommend you use it locally.
 The Cargo `ci-test` alias will run the project tests in the same way they are run in CI.
 
 
