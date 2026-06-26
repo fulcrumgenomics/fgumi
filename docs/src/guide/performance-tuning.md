@@ -39,6 +39,10 @@ For memory-constrained environments, pass `--max-memory auto` to detect (cgroup-
 - **Behavior**: Uses unified 7-step pipeline with work-stealing scheduler
 - **Best for**: Large files, high-performance systems, production workloads
 
+> **`fgumi runall`:** all fused stages share a single `--threads` thread pool, so set `--threads`
+> once at the top level rather than per stage. Memory tuning applies to the whole chain — see the
+> [Memory Management](#memory-management) section below.
+
 ## Memory Management
 
 fgumi's unified memory management controls pipeline queue memory to prevent out-of-memory conditions while maintaining throughput.
@@ -101,7 +105,10 @@ backward compatibility, but new scripts should use the `--max-memory` flags.
 For sequential workloads like BAM and FASTQ processing, I/O throughput is often the
 bottleneck — not CPU. Two areas to check: OS readahead and volume throughput.
 
-### OS Readahead
+### OS Readahead (Linux)
+
+> The `blockdev` commands below are Linux-specific. On macOS and other platforms, use
+> `--async-reader` (below) instead.
 
 The Linux kernel prefetches file data into the page cache ahead of the application.
 The default readahead window is typically 128 KB, which fgumi's decompression threads
@@ -397,3 +404,9 @@ fgumi group --max-memory auto
 ```
 
 The new parameters provide host-aware (`auto`) sizing and human-readable formats while maintaining backward compatibility.
+
+## See Also
+
+- [Best Practices](best-practices.md) — recommended pipelines these settings apply to
+- [Running Pipelines](running-pipelines.md) — how threading and memory apply to a fused `runall` run
+- [Troubleshooting](troubleshooting.md) — diagnosing out-of-memory and slow-I/O symptoms

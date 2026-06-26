@@ -1,6 +1,8 @@
-# fgumi Best Practice FASTQ -> Consensus Pipeline
+# Best Practices: FASTQ → Consensus Pipeline
 
-This document describes the recommended best practice pipeline for processing FASTQ files through to consensus sequences using fgumi.
+This guide describes the recommended pipeline for processing FASTQ files through to consensus sequences with fgumi.
+
+> **Tip:** Use [`fgumi runall`](running-pipelines.md) to fuse supported runs of these stages into one command — same output, no intermediate BAMs. This guide shows the stages separately so you can see and tune each one.
 
 ## Tools Required
 
@@ -9,7 +11,7 @@ This pipeline uses only fgumi and a read aligner:
 - **fgumi** (version 0.1 or higher)
 - **bwa mem** (version 0.7.17 or higher recommended)
 
-Unlike fgbio-based pipelines, **no samtools is required** - fgumi provides native `fastq`, `sort`, and `merge` commands.
+Unlike fgbio-based pipelines, **no samtools `sort`/`merge` is required for the pipeline itself** — fgumi provides native `fastq`, `sort`, and `merge` commands. (You do still need a reference sequence dictionary (`.dict`) alongside the FASTA for `fgumi zipper`; create it once with `samtools dict` or Picard `CreateSequenceDictionary`.) In fact, you should **not** substitute `samtools sort` for `fgumi sort` ahead of `group`, `dedup`, or `downsample`: samtools ignores the `tc` tag and orders secondary/supplementary reads incorrectly for those commands (see [Troubleshooting](troubleshooting.md)).
 
 ## Common Configuration Options
 
@@ -37,7 +39,7 @@ fgumi group --input in.bam --output out.bam --strategy adjacency
 fgumi group --input in.bam --output out.bam --strategy adjacency --threads 8
 ```
 
-Thread allocation is automatically optimized per-command based on workload profiling.
+Without `--threads`, commands run on a single-threaded fast path. Pass `--threads N` to parallelize; each command splits the N threads across reading, its workers, and writing.
 
 ### Memory
 
@@ -95,6 +97,15 @@ A["fgumi simplex/duplex"]-->B["fgumi fastq | bwa mem | fgumi zipper | fgumi filt
 
 ---
 
+## Choosing your path
+
+**Phase 1 (FASTQ → grouped BAM) is universal** — every workflow runs it. The difference is in Phase 2, where you turn grouped reads into filtered consensus reads:
+
+- **Phase 2a (R&D)** writes an intermediate consensus BAM, so you can re-run filtering with different thresholds without re-calling consensus. Choose it while you are tuning parameters.
+- **Phase 2b (high-throughput)** fuses consensus calling and filtering into pipes for speed. Choose it once your parameters are locked in.
+
+Both phases produce the same result for the same parameters. Within either phase, you can replace a run of stages with a single [`fgumi runall`](running-pipelines.md) command — the callouts below show where.
+
 ## Phase 1: FASTQ to Grouped BAM
 
 ### Step 1.1: UMI Extraction
@@ -151,7 +162,7 @@ Key points:
 - `fgumi fastq` converts BAM to interleaved FASTQ for the aligner
 - `-p` tells bwa mem to expect interleaved paired-end reads
 - `-K 150000000` sets batch size (improves reproducibility)
-- **`-Y` is critical**: Use soft-clipping for supplementary alignments to preserve bases
+- **`-Y` is critical**: soft-clip (rather than hard-clip) supplementary alignments so their bases are preserved — `fgumi zipper` and the consensus callers need the full read sequence to transfer UMI tags and call consensus correctly
 - `fgumi zipper` transfers tags from unmapped BAM to aligned reads
 - `fgumi zipper` accepts SAM or BAM on stdin or `--input`. For best performance, pipe
   uncompressed BAM from the aligner (e.g. `bwa-mem3 mem --bam=0`); SAM is fine for aligners
@@ -399,7 +410,21 @@ fgumi sort \
 
 For production use where filtering parameters are established, combine steps for better throughput.
 
-**Stage 1: Group and call consensus in a single pipe:**
+> **Recommended:** run Step 2b.1 as a single `fgumi runall` command instead of a pipe — it fuses
+> sort, group, and consensus in memory with no intermediate BAM:
+>
+> ```bash
+> fgumi runall \
+>   --start-from sort --stop-after consensus --consensus simplex \
+>   --input aligned.bam --output consensus.bam \
+>   --group::strategy adjacency --simplex::min-reads 1 \
+>   --simplex::output-per-base-tags true \
+>   --threads 8
+> ```
+>
+> See [Running Pipelines](running-pipelines.md).
+
+### Step 2b.1: Group and Call Consensus (manual pipe)
 
 ```bash
 fgumi group --input aligned.bam --strategy adjacency --threads 4 --compression-level 1 \
@@ -407,7 +432,7 @@ fgumi group --input aligned.bam --strategy adjacency --threads 4 --compression-l
     --output consensus.bam --threads 4 --compression-level 1
 ```
 
-**Stage 2: Align, filter, and sort in a single pipe:**
+### Step 2b.2: Re-align, Filter, and Sort
 
 ```bash
 fgumi fastq --input consensus.bam \
@@ -417,7 +442,7 @@ fgumi fastq --input consensus.bam \
   | fgumi sort --input /dev/stdin --output filtered.bam --order coordinate --threads 4
 ```
 
-Note: The two stages cannot be combined into a single pipeline because `fgumi zipper --unmapped` needs random access to the consensus BAM. For most use cases, the R&D pipeline with intermediate files provides better debuggability and flexibility.
+Note: Steps 2b.1 and 2b.2 cannot be fused into one pipe because re-aligning the consensus reads in Step 2b.2 requires the consensus BAM to be materialized first (via `fgumi zipper --unmapped`). `fgumi runall` fuses the in-memory stages *within* Step 2b.1; the consensus re-alignment in Step 2b.2 remains a separate pass. For most use cases, the R&D pipeline with intermediate files (Phase 2a) provides better debuggability and flexibility.
 
 ---
 
@@ -479,7 +504,11 @@ fgumi dedup --input sorted.bam --output deduped.bam \
 
 ## Recommended Parameters by Application
 
+Pick a starting point by how you trade sensitivity against specificity for your assay, then tune from there.
+
 ### Variant Calling (High Sensitivity)
+
+Maximize the number of consensus reads (keep singletons, tolerate more error) when you would rather not miss a true variant — e.g. germline or high-depth somatic calling.
 
 ```bash
 fgumi simplex --min-reads 1 --min-input-base-quality 10
@@ -488,6 +517,8 @@ fgumi filter --min-reads 2 --max-base-error-rate 0.2 --max-no-call-fraction 0.3
 
 ### Variant Calling (High Specificity)
 
+Suppress false positives with duplex consensus and stringent thresholds, at the cost of yield — e.g. low-frequency somatic calling where a wrong call is costly.
+
 ```bash
 fgumi duplex --min-reads 1 --min-input-base-quality 20
 fgumi filter --min-reads 10,5,3 --max-base-error-rate 0.1 --max-no-call-fraction 0.1 \
@@ -495,6 +526,8 @@ fgumi filter --min-reads 10,5,3 --max-base-error-rate 0.1 --max-no-call-fraction
 ```
 
 ### Liquid Biopsy / ctDNA
+
+Detect very-low-frequency variants in cell-free DNA, where input is limited so duplex thresholds are relaxed slightly relative to high-specificity calling while still requiring strand agreement.
 
 ```bash
 fgumi duplex --min-reads 1 --min-input-base-quality 20

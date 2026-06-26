@@ -53,7 +53,7 @@ Grouping is performed by one of four strategies:
 
 ### identity
 
-Only reads with identical UMI sequences are grouped together. This is simpler and faster than other strategies, but should usually be avoided because sequencing errors in the UMI will split reads from the same molecule into separate groups. Useful for data exploration.
+Groups only reads with identical UMI sequences. It is the simplest and fastest strategy, but a single sequencing error in a UMI splits one molecule into separate groups — so use it only for data exploration, not production grouping.
 
 ### edit
 
@@ -61,7 +61,7 @@ Reads are clustered into groups such that each read within a group has at least 
 
 ### adjacency
 
-A version of the directed adjacency method described in [umi_tools](http://dx.doi.org/10.1101/051755) that allows for errors between UMIs but only when there is a count gradient. **Recommended for most simplex and CODEC workflows.**
+A version of the directed adjacency method described in [umi_tools](http://dx.doi.org/10.1101/051755). It merges UMIs that differ by a few bases, but only when the read counts form a *count gradient* — a high-count UMI absorbs a near-identical low-count one (the low-count UMI is treated as a sequencing error of the abundant parent), while two similarly abundant UMIs are kept separate (they are likely distinct molecules). **Recommended for most simplex and CODEC workflows.**
 
 ### paired
 
@@ -124,9 +124,9 @@ Note: `position_group_sizes.txt` is only available via `--metrics`. The individu
 
 ### Family sizes
 
-The `family_sizes.txt` file is a histogram of how many reads belong to each UMI family. A large
-fraction of singleton families may indicate UMI collisions, over-sequencing, or UMI extraction
-errors.
+The `family_sizes.txt` file is a histogram of how many templates belong to each UMI family (on paired-end data a read pair counts as one template). A large
+fraction of singleton families usually indicates insufficient sequencing depth relative to library
+complexity, or a UMI extraction error (the wrong bases ending up in `RX`).
 
 ### Grouping metrics
 
@@ -178,4 +178,9 @@ Because 5' coordinates are strand-aware, reads from opposite strands with the sa
 position will not be grouped together (they belong to different strands of the same duplex
 molecule).
 
-See also: [Consensus Calling](consensus-calling.md), [Duplex Consensus Calling](duplex-consensus-calling.md), [Best Practices](best-practices.md)
+## See Also
+
+- [Consensus Calling](consensus-calling.md) and [Duplex Consensus Calling](duplex-consensus-calling.md) — the next stage after grouping
+- [Tracking Reads](tracking-reads.md) — the `MI` tag and `/A`·`/B` strand labels grouping assigns
+- [Working with Metrics](working-with-metrics.md) — interpreting the grouping metrics
+- [Best Practices](best-practices.md) — grouping in the recommended workflow

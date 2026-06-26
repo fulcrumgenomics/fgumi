@@ -10,14 +10,16 @@ This guide walks through a basic fgumi workflow from FASTQ files to filtered con
 
 ## Basic Workflow
 
+This guide runs each stage as its own command so you can see the whole pipeline. Once you are comfortable with the stages, you can collapse supported runs of them into a single [`fgumi runall`](running-pipelines.md) command — same output, no intermediate files. We point out where along the way.
+
 ### 1. Extract UMIs from FASTQ
 
-Extract UMIs from FASTQ reads and create an unmapped BAM. The `--read-structures` argument tells fgumi where UMI bases are located in each read. See [Read Structures](read-structures.md) for details.
+Extract UMIs from the FASTQ reads and create an unmapped BAM. The `--read-structures` argument tells fgumi where the UMI bases sit in each read; here `8M+T` means the first 8 bases of R1 are the UMI followed by template, and `+T` means R2 is all template. Adjust these to match your library — see [Read Structures](read-structures.md).
 
 ```bash
 fgumi extract \
   --inputs R1.fastq.gz R2.fastq.gz \
-  --read-structures +T +M \
+  --read-structures 8M+T +T \
   --output unaligned.bam \
   --sample MySample \
   --library MyLibrary
@@ -37,19 +39,20 @@ fgumi correct \
 
 ### 3. Align and Sort
 
-Use fgumi's streaming pipeline to align with BWA and sort into template-coordinate order in a single pass:
+Aligners read and write plain reads, so they drop the UMI tags carried on the unmapped BAM. The workflow therefore aligns the reads, then uses `fgumi zipper` to copy the UMI (and other) tags from the original unmapped BAM back onto the aligned reads — you cannot pipe the aligner straight into `sort` without losing the UMIs. fgumi runs all of this as one streaming pass:
 
 ```bash
 fgumi fastq --input unaligned.bam \
   | bwa mem -p ref.fa - \
-  | fgumi zipper --unmapped unaligned.bam \
+  | fgumi zipper --unmapped unaligned.bam --reference ref.fa \
   | fgumi sort --output sorted.bam --order template-coordinate
 ```
 
-This pipes reads through:
-1. `fastq` — converts unmapped BAM to interleaved FASTQ
+This pipes reads through four stages:
+
+1. `fastq` — converts the unmapped BAM to interleaved FASTQ
 2. `bwa mem` — aligns reads to the reference
-3. `zipper` — merges aligned reads with original unmapped BAM to restore UMI tags
+3. `zipper` — merges aligned reads with the original unmapped BAM to restore UMI tags
 4. `sort` — sorts into template-coordinate order for grouping
 
 > **Note:** `fgumi zipper` accepts SAM or BAM input, on stdin or via `--input`. For best
@@ -58,15 +61,9 @@ This pipes reads through:
 > side. SAM is fine for aligners that can't emit BAM; compressed BAM on a pipe is not
 > recommended (wasted CPU on both ends).
 
-For single-cell data, the `CB` cell barcode tag is automatically included in the
-template-coordinate sort key, keeping templates from different cells at the same locus separate:
-
-```bash
-fgumi fastq --input unaligned.bam \
-  | bwa mem -p ref.fa - \
-  | fgumi zipper --unmapped unaligned.bam \
-  | fgumi sort --output sorted.bam --order template-coordinate
-```
+For single-cell data, `fgumi sort` automatically adds the `CB` cell barcode tag to the
+template-coordinate sort key, so reads from different cells at the same genomic position stay
+separate. No extra flags are needed.
 
 ### 3b. (Optional) Merge Multiple BAMs
 
@@ -129,7 +126,9 @@ See [UMI Grouping](umi-grouping.md) for details on grouping strategies.
 
 ### 5. Call Consensus Reads
 
-Choose the consensus calling method based on your library preparation:
+Choose the consensus method based on your library preparation: `simplex` for single-strand UMI
+libraries, `duplex` for double-stranded duplex libraries, and `codec` for CODEC. If you are
+unsure, see [Choosing a Consensus Method](consensus-calling.md#choosing-a-consensus-method).
 
 **Simplex consensus** (single-strand):
 ```bash
@@ -153,6 +152,24 @@ fgumi codec \
 ```
 
 See [Consensus Calling](consensus-calling.md) and [Duplex Consensus Calling](duplex-consensus-calling.md) for details.
+
+> **Do it in one command.** Steps 3–5 — align, sort, group, and call consensus — can run as a
+> single streaming `fgumi runall` invocation that starts from the unmapped BAM produced in step 1,
+> with no intermediate BAMs and byte-for-byte identical output:
+>
+> ```bash
+> fgumi runall \
+>   --start-from align --stop-after consensus --consensus simplex \
+>   --input unaligned.bam --ref ref.fa --output consensus.bam \
+>   --aligner::preset bwa \
+>   --group::strategy adjacency --simplex::min-reads 1 \
+>   --threads 8
+> ```
+>
+> (`runall` runs the aligner for you via `--aligner::preset` and inserts the sort step
+> automatically.) See
+> [Running Pipelines](running-pipelines.md) for the full stage model and more examples. The
+> step-by-step commands remain useful for inspecting intermediates or collecting per-stage metrics.
 
 ### 6. (Optional) Collect QC Metrics
 
@@ -213,6 +230,8 @@ fgumi clip \
 
 ## What's Next
 
+- [Running Pipelines](running-pipelines.md) — fuse these steps with `fgumi runall`, and when to prefer it over individual commands
 - [Best Practices](best-practices.md) — recommended parameter settings and pipeline configuration
 - [Performance Tuning](performance-tuning.md) — threading, memory, and compression optimization
 - [Working with Metrics](working-with-metrics.md) — understanding fgumi's output metrics
+- [Glossary](glossary.md) and [Troubleshooting](troubleshooting.md) — terminology reference and fixes for common errors

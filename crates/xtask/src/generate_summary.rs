@@ -28,6 +28,12 @@ pub fn generate(
         let _ = writeln!(md, "- [{}]({})", entry.0, entry.1);
     }
 
+    // Running Pipelines — fgumi runall vs individual commands
+    let running = ("Running Pipelines", "guide/running-pipelines.md");
+    if docs_src.join(running.1).exists() {
+        let _ = writeln!(md, "- [{}]({})", running.0, running.1);
+    }
+
     // Core Concepts sub-group
     let core_concepts = [
         ("Read Structures", "guide/read-structures.md"),
@@ -82,6 +88,19 @@ pub fn generate(
     if advanced_exists {
         md.push_str("- [Advanced Topics]()\n");
         for (title, path) in &advanced {
+            if docs_src.join(path).exists() {
+                let _ = writeln!(md, "  - [{title}]({path})");
+            }
+        }
+    }
+
+    // Reference sub-group
+    let reference =
+        [("Glossary", "guide/glossary.md"), ("Troubleshooting", "guide/troubleshooting.md")];
+    let reference_exists = reference.iter().any(|(_, p)| docs_src.join(p).exists());
+    if reference_exists {
+        md.push_str("- [Reference]()\n");
+        for (title, path) in &reference {
             if docs_src.join(path).exists() {
                 let _ = writeln!(md, "  - [{title}]({path})");
             }
