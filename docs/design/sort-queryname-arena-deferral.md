@@ -12,7 +12,8 @@ only `RecordRef { sort_key, offset, len }` entries, which are radix/comparison
 `Direct` arm (`read_ahead.rs`) — and its per-record `RawRecord` allocation — is
 used **only** by the queryname path.
 
-This is the substance of finding **S3-015**. The reviewer's suggested fix
+This is the substance of code-review finding **S3-015** (the per-record key + record-byte
+allocation in the queryname Phase-1 buffer). The reviewer's suggested fix
 (hold a scratch `RawRecord` in the `Direct` variant and `mem::take` it out per
 `next()`) is a **no-op**: `mem::take` hands the caller the scratch's buffer and
 leaves an empty (capacity-0) `Vec` behind, so the next `read_raw_record`

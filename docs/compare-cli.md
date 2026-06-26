@@ -50,6 +50,8 @@ fgumi compare bams <BAM1> <BAM2> [OPTIONS]
 | `-t, --threads` | INT | 1 | Threads for BGZF decompression and comparison |
 | `--batch-size` | INT | 10000 | Records per batch for parallel processing |
 
+`--max-diffs` caps how many differences are *printed*, not how much is compared: the full files are still scanned, and the exit code reflects whether any difference exists regardless of the cap.
+
 ### Comparison Fields
 
 The tool compares:
