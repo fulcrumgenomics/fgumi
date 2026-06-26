@@ -97,9 +97,9 @@ impl std::fmt::Display for RunAllMode {
 }
 
 /// Pipeline stage marker for the `--start-from` / `--stop-after`
-/// runall stage flags. Stages are linearly ordered for the sort and
-/// group phases, with three parallel terminal consensus modes
-/// (`Simplex`, `Duplex`, `Codec`).
+/// runall stage flags. Stages are linearly ordered:
+/// `Extract < Correct < AlignAndMerge < Zipper < Sort < Group <
+/// Consensus < Filter` (see [`RunAllStage::ord`]).
 ///
 /// **Stage semantics — "the input is positioned AT this stage's
 /// entry":**
@@ -112,22 +112,20 @@ impl std::fmt::Display for RunAllMode {
 ///   `fgumi sort`). `--start-from group` skips the sort step.
 ///   `--stop-after group` writes the grouped BAM (output of
 ///   `fgumi group`) and stops.
-/// * `Simplex` / `Duplex` / `Codec` — BAM is sorted and grouped
-///   (MI tags assigned). `--start-from <consensus>` skips sort
-///   and group. `--stop-after <consensus>` runs the corresponding
-///   consensus caller and writes the consensus BAM (output of
-///   `fgumi simplex`/`duplex`/`codec`).
+/// * `Consensus` — BAM is sorted and grouped (MI tags assigned,
+///   output of `fgumi group`). `--start-from consensus` skips sort
+///   and group. `--stop-after consensus` runs the consensus caller
+///   chosen by `--consensus {simplex,duplex,codec}` and writes the
+///   consensus BAM (output of `fgumi simplex`/`duplex`/`codec`). The
+///   algorithm is selected by `--consensus`, not by a stage variant.
 ///
-/// **Linear order**: `AlignAndMerge < Zipper < Sort < Group <
-/// {Simplex, Duplex, Codec}`. The three consensus stages are terminal
-/// and mutually exclusive — `--stop-after` may name at most one
-/// consensus stage per run.
+/// `AlignAndMerge` is a valid `--start-from` but not a valid
+/// `--stop-after` (see [`StopAfter`]): raw aligner output before the
+/// zipper-merge has lost every original tag.
 ///
 /// **Case-insensitive parsing**: `sort`, `Sort`, `SORT` all match
-/// when the CLI argument uses `#[arg(value_enum, ignore_case = true)]`.
-/// (clap 4's default is case-SENSITIVE; the `ignore_case = true`
-/// attribute opts in to case-insensitive matching. Task 2 wires this
-/// up on the `--start-from` / `--stop-after` flags.)
+/// because the `--start-from` / `--stop-after` flags use
+/// `#[arg(value_enum, ignore_case = true)]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, clap::ValueEnum)]
 #[clap(rename_all = "kebab-case")]
 pub enum RunAllStage {
@@ -335,38 +333,43 @@ impl std::fmt::Display for RunAllStage {
     name = "runall",
     about = "\x1b[38;5;166m[UTILITIES]\x1b[0m      \x1b[36mFused multi-stage pipeline (correct + align + zipper + sort + group + consensus, no intermediate BAM)\x1b[0m",
     long_about = "\
-Fuses UMI correction, alignment+merge, sort, group, and consensus calling into a \
-single in-memory pipeline, selected by `--start-from` and `--stop-after` (both \
-required).
+Fuses extract, UMI correction, alignment + zipper-merge, sort, group, and \
+consensus calling (optionally followed by filter) into a single in-memory \
+pipeline. Select the slice to run with `--start-from` and `--stop-after` (both \
+required); the stages run in the fixed order extract < correct < align < zipper \
+< sort < group < consensus < filter. Records flow directly between stages in \
+memory, so every intermediate BAM a sequential run would write is elided, and \
+the output is byte-for-byte identical to running the equivalent standalone \
+commands in turn.
 
-* `--start-from correct` accepts an extracted unmapped BAM and runs UMI \
-  correction against a fixed whitelist (`--correct::umi-files` / \
-  `--correct::umis`). Currently only supports `--stop-after correct` (writes the \
-  corrected unmapped BAM); cross-stage chaining to align is a follow-up.
-* `--start-from align` accepts an unmapped BAM with UMI tags and a reference \
-  FASTA; spawns the aligner subprocess (bwa-mem3 / bwa / user-supplied command \
-  via `--aligner::*`), zipper-merges the result, then chains downstream.
-* `--start-from zipper` accepts a queryname-sorted mapped BAM (`--input`) plus \
-  the matching unmapped BAM (`--unmapped`) and the reference FASTA (`--ref`); \
-  runs the zipper merge, then chains downstream.
-* `--start-from sort` accepts raw unsorted aligned BAM and runs the in-pipeline \
-  sort step before group + consensus.
-* `--start-from group` accepts a BAM already sorted by template-coordinate \
-  (output of `fgumi sort`) and skips the sort step.
-* `--start-from consensus` accepts a grouped (MI-tagged) BAM and runs only \
-  the consensus caller chosen by `--consensus {simplex,duplex,codec}`.
+`--start-from` declares the state of the input and selects the upstream work:
 
-`--stop-after consensus` runs the consensus caller chosen by `--consensus \
-{simplex,duplex,codec}`; output is the same consensus BAM that `fgumi \
-{simplex,duplex,codec}` produces. `--stop-after filter` additionally fuses a \
-post-consensus `fgumi filter` pass into the same pipeline (tunable via \
-`--filter::*`); the consensus output is decoded in memory and streamed \
-straight into filter, so no intermediate consensus BAM is written. Every \
-intermediate BAM that a multi-stage sequential run would write is elided — \
-records flow directly between stages in memory.
+* `extract` reads FASTQ via `--extract::inputs` / `--extract::read-structures` \
+  (no `--input`).
+* `correct` reads an unmapped BAM via `--input` and corrects UMIs against \
+  `--correct::umis` / `--correct::umi-files`.
+* `align` reads an unmapped BAM via `--input`, runs the aligner subprocess \
+  (`--aligner::preset` or `--aligner::command`) against `--ref`, and \
+  zipper-merges the result.
+* `zipper` reads a queryname-sorted mapped BAM via `--input` plus the matching \
+  unmapped BAM via `--unmapped` and the reference (`--ref` + `.dict`).
+* `sort` reads a raw unsorted aligned BAM via `--input`.
+* `group` reads a template-coordinate-sorted BAM via `--input`.
+* `consensus` reads a grouped (MI-tagged) BAM via `--input`.
+* `filter` reads a consensus BAM via `--input`.
 
-This command always uses the new typed-step pipeline framework; there is \
-no legacy fallback."
+The consensus algorithm is chosen by `--consensus {simplex,duplex,codec}`, not \
+by a stage name; `--stop-after consensus` produces the same BAM as the matching \
+`fgumi {simplex,duplex,codec}` command. `--stop-after filter` fuses a \
+post-consensus `fgumi filter` pass (tunable via `--filter::*`) into the same \
+pipeline, so no intermediate consensus BAM is written. Tune any stage with its \
+prefixed flags: `--sort::max-memory`, `--group::strategy`, `--duplex::min-reads`, \
+and so on.
+
+`--stop-after align` is not allowed: raw aligner output before the zipper-merge \
+has lost every original tag, so the earliest stop after `--start-from align` is \
+`zipper`. The validator checks the requested stage range but cannot verify that \
+the on-disk input actually matches `--start-from` — make sure it does."
 )]
 #[allow(clippy::struct_excessive_bools)]
 pub struct RunAll {
@@ -539,65 +542,39 @@ pub struct RunAll {
     pub duplex_opts: crate::commands::duplex::MultiDuplexOptions,
 
     // ───────── pipeline stage control (#33) ─────────
-    /// Pipeline stage to START FROM. Required.
+    /// Pipeline stage to start from: extract, correct, align, zipper, sort, group, consensus, or filter (required, case-insensitive).
     ///
-    /// Declares the state of the input BAM and selects which work
-    /// runall does upstream of the terminal `--stop-after` stage:
+    /// Declares the state of the input and selects the upstream work
+    /// runall performs before the terminal `--stop-after` stage. See the
+    /// command description for what each start stage reads (FASTQ for
+    /// `extract`; `--input` plus, for `zipper`, `--unmapped`; a
+    /// template-coordinate-sorted BAM for `group`; a grouped MI-tagged
+    /// BAM for `consensus`; and so on).
     ///
-    /// * `sort` — input is raw unsorted BAM; the chain includes
-    ///   the in-pipeline sort step before group + consensus.
-    /// * `group` — input is sorted by template-coordinate (output
-    ///   of `fgumi sort`); the chain skips sort and runs
-    ///   group + consensus.
-    /// * `simplex` / `duplex` / `codec` — input is sorted and
-    ///   grouped (MI-tagged, output of `fgumi group`); the chain
-    ///   runs through the named consensus caller. Mutually exclusive
-    ///   with each other and terminal (`--stop-after` must equal
-    ///   `--start-from`).
+    /// **Input-state hazard:** the validator checks that
+    /// `start_from.ord() <= stop_after.ord()` but cannot verify that the
+    /// on-disk input actually matches the declared stage. Passing, say, a
+    /// raw-unsorted BAM to `--start-from group` will not raise a clear
+    /// error; the chain runs on whatever it finds. Make sure the input
+    /// matches the declared start stage.
     ///
-    /// **Executor honesty note (task 5 of #33):** The consensus-start
-    /// row (`--start-from consensus` with `--consensus {simplex,duplex,codec}`)
-    /// accepts input that is already MI-tagged but the executor does not yet specialize
-    /// — it runs the same chain as `--start-from group`
-    /// (`GroupByPosition` + `ProcessGroups` + `MiAssign` + consensus). On
-    /// a properly pre-grouped input the output is byte-identical to
-    /// the standalone consensus command (`fgumi simplex` /
-    /// `fgumi duplex` / `fgumi codec`) because the grouping
-    /// algorithm is deterministic; a true consensus-only optimized
-    /// branch is queued as follow-up work and gated by the parity
-    /// tests.
-    ///
-    /// **Input-state hazard:** the validator cannot check whether
-    /// the on-disk BAM actually matches the declared `start_from`.
-    /// Passing a raw-unsorted BAM to `--start-from simplex`, or a
-    /// sorted-but-not-grouped BAM to `--start-from simplex`, will
-    /// not produce a clear error today; the chain will run on
-    /// whatever it finds. Make sure the input matches the declared
-    /// start stage.
-    ///
-    /// Case-insensitive. Must satisfy `start_from.ord() <=
-    /// stop_after.ord()` and the consensus-terminal rules
-    /// (see [`RunAllStage::validate_with`]).
+    /// Must satisfy `start_from.ord() <= stop_after.ord()` (see
+    /// [`RunAllStage::validate_with`]).
     #[arg(long = "start-from", value_enum, ignore_case = true)]
     pub start_from: RunAllStage,
 
-    /// Pipeline stage to STOP AFTER. Required.
+    /// Pipeline stage to stop after: extract, correct, zipper, sort, group, consensus, or filter (required, case-insensitive).
     ///
-    /// Determines the terminal stage of the chain:
+    /// Determines the terminal stage of the chain. `--stop-after
+    /// consensus` writes the consensus BAM produced by the caller chosen
+    /// with `--consensus`; `--stop-after filter` fuses a post-consensus
+    /// filter pass into the same pipeline.
     ///
-    /// * `sort` — write the sorted BAM and stop (equivalent to
-    ///   `fgumi sort` output).
-    /// * `group` — write the grouped BAM (with MI tags) and stop
-    ///   (equivalent to `fgumi group` output).
-    /// * `simplex` / `duplex` / `codec` — run the named consensus
-    ///   caller and write the consensus BAM (equivalent to
-    ///   `fgumi simplex` / `duplex` / `codec` output).
-    ///
-    /// Case-insensitive. Must satisfy `start_from.ord() <=
-    /// stop_after.ord()` and the consensus-terminal rules
-    /// (`RunAllStage::validate_with`). `align` is intentionally absent
-    /// (see [`StopAfter`]); use [`RunAll::stop_after_stage`] to read this
-    /// as a [`RunAllStage`].
+    /// `align` is intentionally not a valid stop: raw aligner output
+    /// before the zipper-merge has lost every original tag, so the
+    /// earliest stop after `--start-from align` is `zipper`. Must satisfy
+    /// `start_from.ord() <= stop_after.ord()` (`RunAllStage::validate_with`);
+    /// use [`RunAll::stop_after_stage`] to read this as a [`RunAllStage`].
     #[arg(long = "stop-after", value_enum, ignore_case = true)]
     pub stop_after: StopAfter,
 

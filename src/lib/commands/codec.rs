@@ -27,81 +27,6 @@ use log::info;
 use noodles::sam::alignment::record::data::field::Tag;
 use std::io::Write as IoWrite;
 
-/// Call CODEC consensus reads from template-coordinate sorted BAM
-///
-/// CODEC is a sequencing protocol where a single read-pair sequences both strands of the
-/// original duplex molecule. R1 sequences one strand, R2 sequences the opposite strand,
-/// enabling duplex consensus calling from individual read-pairs.
-///
-/// The algorithm:
-/// 1. Groups reads by molecule ID (MI tag)
-/// 2. For each molecule:
-///    - Clips read pairs where they extend past mate ends
-///    - Filters R1s and R2s for compatible alignments
-///    - Checks for sufficient overlap
-///    - Calls single-strand consensus from R1s and R2s separately
-///    - Combines into duplex consensus
-///    - Applies quality masking
-/// 3. Outputs unmapped consensus fragments (not paired-end)
-///
-/// ## Input Requirements
-///
-/// - BAM must be template-coordinate sorted (or queryname sorted)
-/// - Reads must be aligned (mapped)
-/// - Required tags:
-///   - `RX`: Raw UMI bases
-///   - `MI`: Molecule ID (from `group`)
-///   - `CB`: Cell barcode (optional, for single-cell data)
-///
-/// ## Grouping Strategy
-///
-/// Must use `adjacency` or `identity` grouping (NOT `paired`).
-/// MI tags should not have /A or /B suffixes.
-///
-/// ## Output
-///
-/// - Output BAM contains unmapped consensus fragments (not paired-end)
-/// - Each consensus represents a full duplex molecule
-/// - Includes rich per-base and per-read tags
-///
-/// Consensus reads have a number of additional optional tags set in the resulting BAM file.
-/// The tag names follow a pattern where the first letter (a, b or c) denotes that the tag
-/// applies to the first single strand consensus (a), second single-strand consensus (b) or
-/// the final duplex consensus (c). The second letter captures the meaning of the tag
-/// (e.g. d=depth, m=min depth, e=errors/error-rate) and is upper case for values that are
-/// one per read and lower case for values that are one per base.
-///
-/// The tags break down into those that are single-valued per read:
-///
-///   consensus depth      \[aD,bD,cD\] (int)  : the maximum depth of raw reads
-///   consensus min depth  \[aM,bM,cM\] (int)  : the minimum depth of raw reads
-///   consensus error rate \[aE,bE,cE\] (float): the fraction of bases disagreeing with consensus
-///
-/// And those that have a value per base:
-///
-///   consensus depth  \[ad,bd\] (short[]): the count of bases contributing to consensus
-///   consensus errors \[ae,be\] (short[]): the count of disagreeing bases
-///   consensus bases  \[ac,bc\] (string) : the single-strand consensus bases
-///   consensus quals  \[aq,bq\] (string) : the single-strand consensus qualities
-///
-/// ## Examples
-///
-/// Basic usage:
-/// ```bash
-/// fgumi codec -i grouped.bam -o codec_consensus.bam
-/// ```
-///
-/// With quality thresholds and statistics:
-/// ```bash
-/// fgumi codec \
-///   -i grouped.bam \
-///   -o codec_consensus.bam \
-///   -r rejects.bam \
-///   -s stats.txt \
-///   -m 15 \
-///   -M 3 \
-///   -d 10
-/// ```
 /// Codec-specific tuning, flattened into both the standalone `Codec`
 /// command (as bare `--min-duplex-length`, `--outer-bases-qual`, …) and
 /// the `RunAll` command (as `--codec::min-duplex-length`, etc. via the
@@ -126,7 +51,7 @@ pub struct CodecOptions {
     #[arg(short = 'm', long = "min-input-base-quality", default_value = "10")]
     pub min_input_base_quality: u8,
 
-    /// Produce per-base tags (cd, ce) in addition to per-read tags
+    /// Produce per-base tags (ad/bd, ae/be, ac/bc, aq/bq) in addition to per-read tags
     #[arg(short = 'B', long = "output-per-base-tags", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = super::common::parse_bool)]
     pub output_per_base_tags: bool,
 
@@ -293,27 +218,57 @@ impl CodecOptions {
 #[command(
     name = "codec",
     about = "\x1b[38;5;180m[CONSENSUS]\x1b[0m      \x1b[36mCall CODEC consensus reads from grouped BAM\x1b[0m",
-    long_about = "\
-Calls CODEC duplex consensus reads from a grouped, MI-tagged BAM.
+    long_about = r#"
+Calls duplex consensus reads from CODEC sequencing data.
 
-CODEC libraries read both strands of a duplex molecule within a single read pair \
-(R1 covers one strand, R2 the other), so the two strands are paired by position \
-within each MI group rather than by the `/A` `/B` strand suffix used by the \
-standard duplex caller. The two single-strand consensuses are then reconciled \
-into one duplex consensus per molecule.
+CODEC (Bae et al. 2023) is a protocol in which a single read pair sequences both strands of the
+original duplex molecule: R1 comes from one strand and R2 from the opposite strand, so even a
+single read pair can yield a duplex consensus. Prior to running this tool, group reads with
+`group` using the `adjacency` (or `identity`/`edit`) strategy — NOT `paired`; MI tags must not
+carry `/A` or `/B` suffixes (CODEC pairs the two strands by position within each MI group).
+
+For each molecule the tool clips read pairs that extend past their mate, filters R1s and R2s for
+compatible alignments, requires sufficient duplex overlap, calls a single-strand consensus from
+the R1s and from the R2s separately, then combines the two into a duplex consensus and applies
+quality masking. The consensus reads produced are unmapped single fragments (not paired-end) and
+should be aligned afterwards.
+
+Input must be template-coordinate sorted (or queryname sorted) and carry `RX` (raw UMI) and `MI`
+(molecule ID, from `group`) tags; `CB` (cell barcode) is used when present.
+
+Methylation-aware consensus calling (`--methylation-mode`) is not supported for CODEC; use
+`simplex` or `duplex` for EM-seq / TAPs workflows.
 
 Quality-reduction and duplex-disagreement knobs:
 
-* `--single-strand-qual` caps the reported quality of bases supported by only one \
-  strand (single-strand regions), since those bases lack duplex confirmation.
-* `--outer-bases-qual` / `--outer-bases-length` cap the quality of the outermost \
-  N bases of each read, which are more error-prone (adapter/ligation artifacts).
-* `--min-duplex-length` sets the minimum overlap (in bases) required for a region \
-  to be called as duplex.
-* `--max-duplex-disagreements` / `--max-duplex-disagreement-rate` bound how much \
-  the two strands may disagree before the molecule is rejected.
+* `--single-strand-qual` caps the reported quality of bases supported by only one strand
+  (single-strand regions), since those bases lack duplex confirmation.
+* `--outer-bases-qual` / `--outer-bases-length` cap the quality of the outermost N bases of each
+  read, which are more error-prone (adapter/ligation artifacts).
+* `--min-duplex-length` sets the minimum overlap (in bases) required for a region to be called as
+  duplex.
+* `--max-duplex-disagreements` / `--max-duplex-disagreement-rate` bound how much the two strands
+  may disagree before the molecule is rejected.
 
-Reads that fail these thresholds can be captured with `--rejects`."
+Reads that fail these thresholds can be captured with `--rejects`.
+
+Consensus reads carry optional per-read and per-base tags. The first letter (a, b, c) marks the
+first single-strand consensus (a), the second single-strand consensus (b), or the final duplex
+consensus (c); the second letter is the quantity, upper case for per-read values and lower case
+for per-base values:
+
+  consensus depth      [aD,bD,cD] (int)  : maximum depth of raw reads
+  consensus min depth  [aM,bM,cM] (int)  : minimum depth of raw reads
+  consensus error rate [aE,bE,cE] (float): fraction of raw bases disagreeing with the consensus
+  consensus depth      [ad,bd] (short[]) : per-base count of contributing reads
+  consensus errors     [ae,be] (short[]) : per-base count of disagreeing reads
+  consensus bases      [ac,bc] (string)  : single-strand consensus bases
+  consensus quals      [aq,bq] (string)  : single-strand consensus qualities
+
+Example:
+
+  fgumi codec -i grouped.bam -o codec_consensus.bam --min-reads 1
+"#
 )]
 pub struct Codec {
     /// Input/output BAM options

@@ -927,7 +927,7 @@ impl Command for Zipper {
     }
 }
 
-/// Typed-step pipeline merger for the `--use-new-pipeline` path.
+/// Typed-step pipeline merger for the zipper merge stage.
 ///
 /// Implements [`Step2`] over two `BamTemplateBatch` streams (unmapped
 /// `InputA` and mapped `InputB`) and emits merged
