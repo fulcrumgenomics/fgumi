@@ -52,7 +52,7 @@ pub fn generate(
 
     // Consensus sub-group
     let consensus = [
-        ("Consensus Calling", "guide/consensus-calling.md"),
+        ("Simplex Consensus Calling", "guide/consensus-calling.md"),
         ("Duplex Consensus Calling", "guide/duplex-consensus-calling.md"),
     ];
     let consensus_exists = consensus.iter().any(|(_, p)| docs_src.join(p).exists());
@@ -65,16 +65,11 @@ pub fn generate(
         }
     }
 
-    // Methylation sub-group
-    let methylation = [("Pipeline Guide", "guide/methylation.md")];
-    let methylation_exists = methylation.iter().any(|(_, p)| docs_src.join(p).exists());
-    if methylation_exists {
-        md.push_str("- [Methylation]()\n");
-        for (title, path) in &methylation {
-            if docs_src.join(path).exists() {
-                let _ = writeln!(md, "  - [{title}]({path})");
-            }
-        }
+    // Methylation — single page, so render as a top-level leaf rather than a
+    // collapsible section wrapping one child.
+    let methylation = ("Methylation", "guide/methylation.md");
+    if docs_src.join(methylation.1).exists() {
+        let _ = writeln!(md, "- [{}]({})", methylation.0, methylation.1);
     }
 
     // Advanced Topics sub-group
@@ -177,11 +172,21 @@ pub fn generate(
             .iter()
             .filter(|p| prefixes.iter().any(|pfx| p.name.starts_with(pfx)))
             .collect();
-        if !matches.is_empty() {
-            let _ = writeln!(md, "- [{group_name}]()");
-            for page in &matches {
-                let _ = writeln!(md, "  - [{}]({})", page.name, page.path);
-                assigned.insert(page.name.as_str());
+        match matches.as_slice() {
+            [] => {}
+            // A group with a single page collapses to a top-level leaf so the
+            // sidebar doesn't hide one entry behind a fold toggle; the label is
+            // humanized (`ConsensusMetrics` -> `Consensus Metrics`).
+            [single] => {
+                let _ = writeln!(md, "- [{}]({})", humanize_metric_name(&single.name), single.path);
+                assigned.insert(single.name.as_str());
+            }
+            _ => {
+                let _ = writeln!(md, "- [{group_name}]()");
+                for page in &matches {
+                    let _ = writeln!(md, "  - [{}]({})", page.name, page.path);
+                    assigned.insert(page.name.as_str());
+                }
             }
         }
     }
@@ -200,4 +205,18 @@ pub fn generate(
 
     fs::write(docs_src.join("SUMMARY.md"), md)?;
     Ok(())
+}
+
+/// Insert a space before each interior capital letter so a CamelCase metric name
+/// reads as a normal label when its section collapses to a single leaf entry
+/// (e.g. `ConsensusMetrics` -> `Consensus Metrics`).
+fn humanize_metric_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for (i, ch) in name.char_indices() {
+        if i > 0 && ch.is_ascii_uppercase() {
+            out.push(' ');
+        }
+        out.push(ch);
+    }
+    out
 }

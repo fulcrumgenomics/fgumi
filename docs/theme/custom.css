@@ -182,11 +182,16 @@ h1, h2, h3, h4, h5, h6 {
     text-decoration: none;
 }
 
-/* Section header spans (no-link items like "Core Concepts") */
+/* Section header spans (no-link items like "Core Concepts"). These are not
+   navigable — they only expand/collapse — so use a dimmed version of the link
+   color rather than link-blue, which would read as clickable. The fold chevron
+   plus the lower emphasis signals "expandable group". */
 .sidebar .chapter-link-wrapper > span {
-    color: var(--fg-blue) !important;
+    color: rgba(226, 232, 240, 0.55) !important;
     font-size: 0.8rem;
-    font-weight: 500;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
 }
 
 /* Active page — green left-bar accent */
