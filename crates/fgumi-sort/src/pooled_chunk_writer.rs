@@ -97,8 +97,12 @@ impl<K: RawSortKey> PooledChunkWriter<K> {
     /// # Panics
     ///
     /// Panics if called after [`start_finish`](Self::start_finish) has been called.
-    #[allow(clippy::cast_possible_truncation)]
     pub fn write_record(&mut self, key: &K, record: &[u8]) -> Result<()> {
+        // The on-disk spill frame prefixes each record with a 4-byte little-endian
+        // length that the merge reader (`external.rs`) reads back; a checked cast
+        // fails loud before a truncated prefix could desync the spill stream.
+        let record_len = u32::try_from(record.len())
+            .map_err(|_| anyhow::anyhow!("BAM record too large ({} bytes)", record.len()))?;
         let staging = self.staging.as_mut().expect("write_record called after start_finish");
         if K::EMBEDDED_IN_RECORD {
             // Fast path: key is part of the record bytes, no extra serialization.
@@ -107,7 +111,7 @@ impl<K: RawSortKey> PooledChunkWriter<K> {
             if staging.buf().len() + needed > BGZF_MAX_BLOCK_SIZE {
                 staging.flush()?;
             }
-            staging.buf().extend_from_slice(&(record.len() as u32).to_le_bytes());
+            staging.buf().extend_from_slice(&record_len.to_le_bytes());
             if record.len() > BGZF_MAX_BLOCK_SIZE.saturating_sub(4) {
                 staging.write_chunked(record)?;
             } else {
@@ -127,7 +131,7 @@ impl<K: RawSortKey> PooledChunkWriter<K> {
                 staging.flush()?;
             }
             staging.buf().extend_from_slice(&self.key_buf);
-            staging.buf().extend_from_slice(&(record.len() as u32).to_le_bytes());
+            staging.buf().extend_from_slice(&record_len.to_le_bytes());
             staging.write_chunked(record)?;
         }
         Ok(())

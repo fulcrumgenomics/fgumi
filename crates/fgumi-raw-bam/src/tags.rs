@@ -95,6 +95,73 @@ pub fn find_string_tag_in_record(bam: &[u8], tag: impl AsTagBytes) -> Option<&[u
     find_string_tag(aux, tag)
 }
 
+/// Find two string (Z-type) tags in a complete BAM record in a **single** aux-data
+/// walk, returning each value's bytes (without the NUL terminator) or `None` if that
+/// tag is absent or not Z-type.
+///
+/// Equivalent to calling [`find_string_tag_in_record`] twice, but it walks the aux
+/// block only once — relevant on hot paths that need both an MI tag and a cell-barcode
+/// tag per record. The returned slices borrow the record's aux data.
+#[inline]
+#[must_use]
+pub fn find_two_string_tags_in_record(
+    bam: &[u8],
+    first: impl AsTagBytes,
+    second: impl AsTagBytes,
+) -> (Option<&[u8]>, Option<&[u8]>) {
+    let first = u16::from_le_bytes(*first.as_tag_bytes());
+    let second = u16::from_le_bytes(*second.as_tag_bytes());
+    let aux = aux_data_slice(bam);
+
+    let mut first_done = false;
+    let mut second_done = false;
+    let mut first_val: Option<&[u8]> = None;
+    let mut second_val: Option<&[u8]> = None;
+    let mut p = 0;
+    while p + 3 <= aux.len() {
+        let entry_u16 = u16::from_le_bytes([aux[p], aux[p + 1]]);
+        let val_type = aux[p + 2];
+
+        // Each tag resolves on its FIRST matching entry, exactly as
+        // `find_string_tag_in_record` does (it returns the first tag match and
+        // yields a value only if that match is a NUL-terminated `Z` entry). A
+        // non-`Z` (or unterminated) first match resolves the tag to `None`; we
+        // must NOT skip it and pick up a later `Z` duplicate, or the two-tag
+        // walk would disagree with two single-tag lookups on malformed aux.
+        let matches_first = entry_u16 == first && !first_done;
+        let matches_second = entry_u16 == second && !second_done;
+        if matches_first || matches_second {
+            let value = if val_type == b'Z' {
+                let start = p + 3;
+                aux[start..].iter().position(|&b| b == 0).map(|len| &aux[start..start + len])
+            } else {
+                None
+            };
+            // Independent (not `else`) so a single entry resolves both slots
+            // when `first == second`, preserving the "call twice" contract.
+            if matches_first {
+                first_done = true;
+                first_val = value;
+            }
+            if matches_second {
+                second_done = true;
+                second_val = value;
+            }
+        }
+
+        // Stop once both tags have been resolved (each to a value or `None`).
+        if first_done && second_done {
+            break;
+        }
+
+        match tag_value_size(val_type, &aux[p + 3..]) {
+            Some(size) => p += 3 + size,
+            None => break,
+        }
+    }
+    (first_val, second_val)
+}
+
 /// Find the byte range `[start, end)` of an entire tag entry (tag+type+value) in aux data.
 ///
 /// Returns offsets relative to the start of `aux_data`.
@@ -2081,6 +2148,88 @@ mod tests {
         let aux = b"RXZhello\x00";
         let rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
         assert_eq!(find_string_tag_in_record(&rec, SamTag::RX), Some(b"hello".as_ref()));
+    }
+
+    #[test]
+    fn test_find_two_string_tags_both_present_either_order() {
+        // MI before CB.
+        let aux = b"MIZ7\x00CBZACGT\x00";
+        let rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
+        let (mi, cb) = find_two_string_tags_in_record(&rec, SamTag::MI, SamTag::CB);
+        assert_eq!(mi, Some(b"7".as_ref()));
+        assert_eq!(cb, Some(b"ACGT".as_ref()));
+
+        // CB before MI: result is independent of aux ordering and of arg order.
+        let aux = b"CBZACGT\x00MIZ7\x00";
+        let rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
+        let (mi, cb) = find_two_string_tags_in_record(&rec, SamTag::MI, SamTag::CB);
+        assert_eq!(mi, Some(b"7".as_ref()));
+        assert_eq!(cb, Some(b"ACGT".as_ref()));
+    }
+
+    #[test]
+    fn test_find_two_string_tags_agrees_with_single_lookups() {
+        // Interleave a non-Z tag to make the walk non-trivial.
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"NMC");
+        aux.push(3);
+        aux.extend_from_slice(b"MIZ42\x00");
+        aux.extend_from_slice(b"CBZTGCA\x00");
+        let rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &aux);
+        let (mi, cb) = find_two_string_tags_in_record(&rec, SamTag::MI, SamTag::CB);
+        assert_eq!(mi, find_string_tag_in_record(&rec, SamTag::MI));
+        assert_eq!(cb, find_string_tag_in_record(&rec, SamTag::CB));
+    }
+
+    #[test]
+    fn test_find_two_string_tags_first_match_wins_on_malformed_dup() {
+        // A non-Z MI entry precedes a Z MI duplicate. `find_string_tag_in_record`
+        // resolves the FIRST MI match (non-Z → None) and never reaches the later
+        // Z duplicate; the two-tag walk must match that rather than skipping the
+        // non-Z entry and returning the later Z value.
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"MIC"); // MI, type 'C' (uint8) ...
+        aux.push(9); //                ... 1-byte value (non-Z → MI resolves None)
+        aux.extend_from_slice(b"MIZ77\x00"); // later Z duplicate — must be ignored
+        aux.extend_from_slice(b"CBZACGT\x00");
+        let rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &aux);
+
+        let (mi, cb) = find_two_string_tags_in_record(&rec, SamTag::MI, SamTag::CB);
+        assert_eq!(mi, None, "first (non-Z) MI match resolves the tag to None");
+        assert_eq!(cb, Some(b"ACGT".as_ref()));
+        // Must agree with two independent single-tag lookups.
+        assert_eq!(mi, find_string_tag_in_record(&rec, SamTag::MI));
+        assert_eq!(cb, find_string_tag_in_record(&rec, SamTag::CB));
+    }
+
+    #[test]
+    fn test_find_two_string_tags_missing_second_returns_none() {
+        let aux = b"MIZ7\x00";
+        let rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
+        let (mi, cb) = find_two_string_tags_in_record(&rec, SamTag::MI, SamTag::CB);
+        assert_eq!(mi, Some(b"7".as_ref()));
+        assert_eq!(cb, None);
+    }
+
+    #[test]
+    fn test_find_two_string_tags_identical_tags_fills_both() {
+        // When both arguments name the same tag, the helper must stay equivalent
+        // to calling `find_string_tag_in_record` twice — i.e. both slots filled,
+        // not `(Some, None)`.
+        let aux = b"MIZ7\x00CBZACGT\x00";
+        let rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
+        let (a, b) = find_two_string_tags_in_record(&rec, SamTag::MI, SamTag::MI);
+        assert_eq!(a, Some(b"7".as_ref()));
+        assert_eq!(b, Some(b"7".as_ref()));
+        assert_eq!(a, find_string_tag_in_record(&rec, SamTag::MI));
+        assert_eq!(b, find_string_tag_in_record(&rec, SamTag::MI));
+
+        // Identical tags, both absent → both None.
+        let aux = b"CBZACGT\x00";
+        let rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
+        let (a, b) = find_two_string_tags_in_record(&rec, SamTag::MI, SamTag::MI);
+        assert_eq!(a, None);
+        assert_eq!(b, None);
     }
 
     #[test]

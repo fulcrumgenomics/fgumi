@@ -167,6 +167,13 @@ impl RawReadAheadReader {
     ///
     /// Returns `Some(err)` if the background thread stopped due to a read error
     /// rather than clean EOF. Call this after exhausting the iterator.
+    ///
+    /// This only reliably reflects background errors when iteration ran to its
+    /// natural EOF (`next_record` returned `None`). If the consumer stops early
+    /// and drops the reader before EOF, `Drop` drops the channel receiver, which
+    /// can make the background thread's `tx.send` fail so it breaks out of its
+    /// loop *before* recording any subsequent read error — that error is then
+    /// lost. Do not rely on `take_error()` after an early `break`.
     #[must_use]
     pub fn take_error(&self) -> Option<std::io::Error> {
         self.error_slot.lock().ok()?.take()

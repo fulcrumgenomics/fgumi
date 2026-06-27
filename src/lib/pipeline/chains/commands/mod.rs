@@ -28,15 +28,24 @@ pub mod zipper;
 /// command builders' rejects-serialization paths (codec/simplex/duplex), which
 /// emit raw record bytes into a `DecompressedBlock` buffer.
 ///
-/// BAM record body size is u32-bounded per the spec; a single record's buffer
-/// cannot exceed `u32::MAX` in practice, so the length cast cannot truncate.
+/// BAM record body size is u32-bounded per the spec and the canonical builder
+/// (`fgumi-raw-bam`) already panics on overflow, so a single record's buffer
+/// cannot exceed `u32::MAX` in practice. The length prefix is nonetheless
+/// written through a checked `u32::try_from` (mirroring `filter.rs` and the
+/// builder) so the length cannot silently truncate if that invariant is ever
+/// broken — a loud `InvalidData` error is strictly safer than a corrupt frame.
 //
 // Only the consensus command builders (codec/simplex/duplex) call this, so it
 // is gated under `consensus` to avoid a dead-code warning when consensus is off.
 #[cfg(feature = "consensus")]
-pub(crate) fn append_framed_bytes(dst: &mut Vec<u8>, rec: &[u8]) {
-    #[allow(clippy::cast_possible_truncation)]
-    let block_size = rec.len() as u32;
+pub(crate) fn append_framed_bytes(dst: &mut Vec<u8>, rec: &[u8]) -> std::io::Result<()> {
+    let block_size = u32::try_from(rec.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("BAM record too large ({} bytes)", rec.len()),
+        )
+    })?;
     dst.extend_from_slice(&block_size.to_le_bytes());
     dst.extend_from_slice(rec);
+    Ok(())
 }

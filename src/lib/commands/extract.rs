@@ -720,12 +720,9 @@ impl Extract {
     /// Names with fewer than 8 fields are treated as not containing a UMI and
     /// produce `None`. Any `+` characters in the extracted UMI (used by some
     /// demultiplexers to delimit dual UMIs) are normalized to `-`.
-    fn extract_read_name_and_umi(
-        header: &Vec<u8>,
-        extract_umis: bool,
-    ) -> (Vec<u8>, Option<Vec<u8>>) {
+    fn extract_read_name_and_umi(header: &[u8], extract_umis: bool) -> (Vec<u8>, Option<Vec<u8>>) {
         // Remove @ prefix if present
-        let name_bytes = if header.starts_with(b"@") { &header[1..] } else { header.as_slice() };
+        let name_bytes = if header.starts_with(b"@") { &header[1..] } else { header };
 
         // Split on space to get just the name part
         let name_part = name_bytes.find_byte(b' ').map_or(name_bytes, |pos| &name_bytes[..pos]);

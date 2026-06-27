@@ -173,9 +173,11 @@ where
 
 /// Reads the 4-byte BAM record `block_size` prefix (little-endian u32).
 ///
-/// Returns 0 at EOF (no bytes available before the prefix starts). Handles a
-/// prefix split across reader boundaries by issuing a 1-byte read first (to
-/// detect clean EOF) followed by a `read_exact` of the remaining 3 bytes.
+/// Returns 0 only at a clean EOF before any prefix byte is read (no bytes
+/// available before the prefix starts); a prefix truncated after 1-3 bytes
+/// returns an error rather than 0. Handles a prefix split across reader
+/// boundaries by issuing a 1-byte read first (to detect clean EOF) followed by
+/// a `read_exact` of the remaining 3 bytes.
 ///
 /// Exposed for the sort ingest borrow-in-place path
 /// (`PooledInputStream::next_record_borrowed`), which reads the prefix itself so

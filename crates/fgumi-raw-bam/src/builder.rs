@@ -129,6 +129,41 @@ impl UnmappedSamBuilder {
         );
     }
 
+    /// Fallible variant of [`Self::build_record_joined_name`] for callers whose
+    /// name parts are **data-controlled** (e.g. a consensus read name composed
+    /// from an `RX`/`MI` tag of arbitrary, attacker-controllable length).
+    ///
+    /// Returns an [`io::Error`] of kind [`io::ErrorKind::InvalidData`] when the
+    /// joined name (`prefix` + `:` + `suffix`) would be 255 bytes or longer
+    /// (BAM's `l_read_name` is a single byte including the NUL terminator),
+    /// instead of panicking. On success the record is built exactly as
+    /// [`Self::build_record_joined_name`] would.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the joined name is 255 bytes or longer.
+    pub fn try_build_record_joined_name(
+        &mut self,
+        prefix: &[u8],
+        suffix: &[u8],
+        flag: u16,
+        bases: &[u8],
+        quals: &[u8],
+    ) -> std::io::Result<()> {
+        let name_len = prefix.len() + 1 + suffix.len(); // +1 for the ':' separator
+        if name_len >= 255 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "consensus read name too long ({name_len} bytes, max 254); \
+                     the composing UMI/MI tag value is over-long"
+                ),
+            ));
+        }
+        self.build_record_joined_name(prefix, suffix, flag, bases, quals);
+        Ok(())
+    }
+
     /// Shared record builder: writes the fixed header, the read name (via
     /// `write_name`, which must append exactly `name_len` bytes), the packed
     /// sequence, and the quality scores.
@@ -671,6 +706,44 @@ mod tests {
         assert_eq!(joined.as_bytes(), formatted.as_bytes());
         assert_eq!(read_name(joined.as_bytes()), b"consensus:1/A");
         assert_eq!(l_read_name(joined.as_bytes()), 14); // "consensus:1/A" (13) + NUL
+    }
+
+    #[test]
+    fn test_try_build_record_joined_name_ok_matches_infallible() {
+        let bases = b"ACGT";
+        let quals: [u8; 4] = [30, 30, 30, 30];
+
+        let mut fallible = UnmappedSamBuilder::new();
+        fallible
+            .try_build_record_joined_name(b"cons", b"1/A", flags::UNMAPPED, bases, &quals)
+            .expect("name fits");
+
+        let mut infallible = UnmappedSamBuilder::new();
+        infallible.build_record_joined_name(b"cons", b"1/A", flags::UNMAPPED, bases, &quals);
+
+        assert_eq!(fallible.as_bytes(), infallible.as_bytes());
+    }
+
+    #[test]
+    fn test_try_build_record_joined_name_boundary_254_ok_255_err() {
+        let bases = b"AC";
+        let quals: [u8; 2] = [30, 30];
+
+        // prefix(127) + ':' + suffix(126) = 254 → OK.
+        let prefix = vec![b'A'; 127];
+        let suffix_ok = vec![b'B'; 126];
+        let mut ok = UnmappedSamBuilder::new();
+        ok.try_build_record_joined_name(&prefix, &suffix_ok, flags::UNMAPPED, bases, &quals)
+            .expect("254-byte name must be accepted");
+        assert_eq!(l_read_name(ok.as_bytes()), 255); // 254 name bytes + NUL
+
+        // One more byte → 255 → typed InvalidData error, no panic.
+        let suffix_err = vec![b'B'; 127];
+        let mut err_builder = UnmappedSamBuilder::new();
+        let err = err_builder
+            .try_build_record_joined_name(&prefix, &suffix_err, flags::UNMAPPED, bases, &quals)
+            .expect_err("255-byte name must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     proptest::proptest! {

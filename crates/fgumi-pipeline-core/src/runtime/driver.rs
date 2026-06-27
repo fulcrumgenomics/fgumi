@@ -58,6 +58,16 @@ pub fn run_worker_loop(
     // worklist.
     let mut live = LiveSteps::from_entries(entries);
 
+    // Cache whether this worker's sticky owner (if any) is still dispatchable,
+    // so the hot sticky fast-path does not run a linear `live.contains` scan on
+    // every outer-loop iteration (the sticky path exists precisely to shave
+    // per-iteration overhead). `sticky_owner` is fixed for the worker's
+    // lifetime; the step leaves `live` exactly when it returns `Finished`,
+    // either via the sticky block below or via round-robin dispatch — both
+    // sites flip this flag false. A `None` sticky owner is permanently "not
+    // live" so the fast path is skipped entirely.
+    let mut sticky_live = worker.sticky_owner.is_some_and(|idx| live.contains(idx));
+
     loop {
         if signal.is_done() {
             break;
@@ -78,7 +88,7 @@ pub fn run_worker_loop(
         // / Err. Remove from the worklist on Finished (source drain) or
         // observed input drain (mid-step drain). Gated on the step still
         // being live — once removed, the sticky fast-path is disabled.
-        if let Some(owned_idx) = worker.sticky_owner.filter(|idx| live.contains(*idx)) {
+        if let Some(owned_idx) = worker.sticky_owner.filter(|_| sticky_live) {
             let mut mark_skip = false;
             loop {
                 if signal.is_done() {
@@ -118,13 +128,28 @@ pub fn run_worker_loop(
             }
             if mark_skip {
                 live.remove(owned_idx);
+                // The sticky owner finished here; disable the fast path.
+                sticky_live = false;
             }
         }
 
         // 2. Round-robin priority dispatch over all live steps.
         if !signal.is_done() {
-            did_work |=
-                round_robin_dispatch(entries, &mut live, contexts, drain_counters, signal, stats);
+            let outcome = round_robin_dispatch(
+                entries,
+                &mut live,
+                worker.sticky_owner,
+                contexts,
+                drain_counters,
+                signal,
+                stats,
+            );
+            did_work |= outcome.did_work;
+            if outcome.removed_sticky_owner {
+                // The sticky owner finished during round-robin; disable the
+                // fast path so subsequent iterations skip the sticky block.
+                sticky_live = false;
+            }
         }
 
         // 3. Exponential-backoff sleep on no-progress; reset on progress.
@@ -139,18 +164,31 @@ pub fn run_worker_loop(
     }
 }
 
+/// Result of one round-robin pass: whether any step did useful work (caller
+/// resets backoff), and whether the worker's sticky owner finished during the
+/// pass (caller clears its `sticky_live` cache so the sticky fast-path is not
+/// re-attempted on a removed step).
+struct RoundRobinOutcome {
+    did_work: bool,
+    removed_sticky_owner: bool,
+}
+
 /// One pass of the round-robin dispatch over this worker's live steps, in
-/// chain order. Returns `true` if any step did useful work (caller resets
-/// backoff). Finished steps are removed from `live` at end-of-pass (deferred
+/// chain order. Finished steps are removed from `live` at end-of-pass (deferred
 /// so the in-progress walk over `live.order()` is not mutated underneath it).
+/// `sticky_owner` (if any) is reported back via
+/// [`RoundRobinOutcome::removed_sticky_owner`] when it finishes here, so the
+/// caller can disable the per-iteration sticky fast-path without a linear
+/// `live.contains` scan.
 fn round_robin_dispatch(
     entries: &mut [WorkerStepEntry],
     live: &mut LiveSteps,
+    sticky_owner: Option<StepIdx>,
     contexts: &Arc<ChainContexts>,
     drain_counters: &[Arc<StepDrainCounter>],
     signal: &Arc<PipelineSignal>,
     stats: Option<&Arc<PipelineStats>>,
-) -> bool {
+) -> RoundRobinOutcome {
     let mut did_work = false;
     // Steps that finished this pass, removed from `live` after the walk. A
     // step is visited at most once per pass (the cursor only advances; we
@@ -205,10 +243,11 @@ fn round_robin_dispatch(
             break;
         }
     }
+    let removed_sticky_owner = sticky_owner.is_some_and(|owner| finished.contains(&owner));
     for step_idx in finished {
         live.remove(step_idx);
     }
-    did_work
+    RoundRobinOutcome { did_work, removed_sticky_owner }
 }
 
 /// Outcome of dispatching one step, plus the `name` captured *during* the
@@ -336,8 +375,20 @@ fn dispatch_one_step(
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
-    use crate::topology::ChainGraph;
+    use crate::erased::{ErasedStep, TypedStep};
+    use crate::handles::BranchInputHandle;
+    use crate::outputs::Single;
+    use crate::queues::QueueSpec;
+    use crate::reorder::BranchOrdering;
+    use crate::runtime::contexts::build_chain_contexts;
+    use crate::runtime::storage::DrainGate;
+    use crate::step::{InputHandle, Step, StepCtx, StepKind, StepOutcome, StepProfile};
+    use crate::topology::{BranchIdx, ChainGraph};
+    use parking_lot::Mutex;
 
     #[test]
     fn run_worker_loop_exits_on_signal_done() {
@@ -352,5 +403,210 @@ mod tests {
         signal.cancel();
         run_worker_loop(&mut worker, &mut entries, &contexts, &drain_counters, &signal, None);
         // If we reach this line, the loop exited cleanly.
+    }
+
+    // ── Test steps for dispatch-level coverage ──────────────────────────────
+
+    /// `() → u32` source that returns `Finished` immediately.
+    #[derive(Clone)]
+    struct SrcFinished;
+    impl Step for SrcFinished {
+        type Input = ();
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "Src",
+                kind: StepKind::Exclusive,
+                sticky: false,
+                output_queues: vec![QueueSpec::CountBounded { capacity: 4 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::Finished)
+        }
+    }
+
+    /// `u32 → u32` step that always returns `Finished`. Used both as a
+    /// `Parallel` body (counter-gated output close) and a `Serial` body
+    /// (`DrainGate` short-circuit). The `runs` counter records every `try_run`
+    /// so the short-circuit test can prove a worker did NOT re-run the step.
+    #[derive(Clone)]
+    struct FinishStep {
+        kind: StepKind,
+        runs: Arc<AtomicUsize>,
+    }
+    impl Step for FinishStep {
+        type Input = u32;
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "Finish",
+                kind: self.kind,
+                sticky: false,
+                output_queues: vec![QueueSpec::CountBounded { capacity: 4 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            self.runs.fetch_add(1, Ordering::Relaxed);
+            Ok(StepOutcome::Finished)
+        }
+        fn new_worker_copy(&self) -> Self {
+            // Clones share the `runs` counter so the test can total runs across
+            // every Parallel clone.
+            self.clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct SinkStep;
+    impl Step for SinkStep {
+        type Input = u32;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "Sink",
+                kind: StepKind::Exclusive,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            // Drain any inputs, then finish once the upstream edge is drained so
+            // the worker loop can terminate (a real sink finishes on drain).
+            while ctx.input.pop().is_some() {}
+            if ctx.input.is_drained() {
+                Ok(StepOutcome::Finished)
+            } else {
+                Ok(StepOutcome::NoProgress)
+            }
+        }
+    }
+
+    /// Build `Src → Finish → Sink` (Finish having the given kind) and return the
+    /// erased steps + the wired graph. The `Finish` step's `try_run` counter is
+    /// returned so tests can assert how many times it actually ran.
+    fn three_step_chain(
+        finish_kind: StepKind,
+    ) -> (Vec<Box<dyn ErasedStep>>, ChainGraph, Arc<AtomicUsize>) {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let mut graph = ChainGraph::new();
+        let src = graph.register_step("Src", 1);
+        let mid = graph.register_step("Finish", 1);
+        let sink = graph.register_step("Sink", 0);
+        graph.wire(src, BranchIdx(0), mid);
+        graph.wire(mid, BranchIdx(0), sink);
+        let steps: Vec<Box<dyn ErasedStep>> = vec![
+            Box::new(TypedStep::new(SrcFinished)),
+            Box::new(TypedStep::new(FinishStep { kind: finish_kind, runs: Arc::clone(&runs) })),
+            Box::new(TypedStep::new(SinkStep)),
+        ];
+        (steps, graph, runs)
+    }
+
+    /// A `Parallel` step's shared output queue must be closed exactly once — by
+    /// the LAST clone to finish (the one that takes the `StepDrainCounter` to
+    /// 0). Earlier finishers must leave the downstream input un-drained so a
+    /// sibling could still push.
+    #[test]
+    fn parallel_last_finisher_closes_shared_output_exactly_once() {
+        const N: usize = 4;
+        let (steps, graph, _runs) = three_step_chain(StepKind::Parallel);
+        let contexts = Arc::new(build_chain_contexts(&steps, &graph));
+        let mid = StepIdx(1);
+        let counter = StepDrainCounter::new(N);
+        let signal = PipelineSignal::new();
+
+        // One `Owned` clone per worker, each sharing `contexts.outputs[mid]`.
+        let mut clones: Vec<WorkerStepEntry> =
+            (0..N).map(|_| WorkerStepEntry::Owned { step: steps[mid.0].clone_boxed() }).collect();
+
+        let sink_input = contexts.inputs[2].downcast_ref::<BranchInputHandle<u32>>().unwrap();
+
+        for (i, clone) in clones.iter_mut().enumerate() {
+            assert!(
+                !InputHandle::is_drained(sink_input),
+                "downstream input drained before the last clone finished (after {i} of {N})"
+            );
+            let info = dispatch_one_step(clone, mid, &contexts, &counter, &signal, None).unwrap();
+            assert!(matches!(info.result, Ok(StepOutcome::Finished)));
+        }
+        assert!(
+            InputHandle::is_drained(sink_input),
+            "downstream input must be drained once the last Parallel clone finished"
+        );
+    }
+
+    /// Once one worker finishes a `Serial` step (setting the shared `DrainGate`),
+    /// a second `dispatch_one_step` short-circuits to a synthetic `Finished`
+    /// WITHOUT re-acquiring the mutex or re-running the step.
+    #[test]
+    fn serial_drain_gate_short_circuits_second_worker() {
+        let (steps, graph, runs) = three_step_chain(StepKind::Serial);
+        let contexts = Arc::new(build_chain_contexts(&steps, &graph));
+        let mid = StepIdx(1);
+        let counter = StepDrainCounter::new(1);
+        let signal = PipelineSignal::new();
+
+        let shared = Arc::new(Mutex::new(steps.into_iter().nth(1).unwrap()));
+        let drain = Arc::new(DrainGate::default());
+
+        // Worker 1 finishes the step: runs once, sets the latch.
+        let mut entry1 =
+            WorkerStepEntry::Shared { step: Arc::clone(&shared), drain: Arc::clone(&drain) };
+        let info1 =
+            dispatch_one_step(&mut entry1, mid, &contexts, &counter, &signal, None).unwrap();
+        assert!(matches!(info1.result, Ok(StepOutcome::Finished)));
+        assert_eq!(runs.load(Ordering::Relaxed), 1, "step ran exactly once on the first worker");
+        assert!(drain.is_finished(), "first finisher must set the DrainGate latch");
+
+        // Worker 2 dispatches the same step: short-circuit, no re-run.
+        let mut entry2 =
+            WorkerStepEntry::Shared { step: Arc::clone(&shared), drain: Arc::clone(&drain) };
+        let info2 =
+            dispatch_one_step(&mut entry2, mid, &contexts, &counter, &signal, None).unwrap();
+        assert!(matches!(info2.result, Ok(StepOutcome::Finished)));
+        assert_eq!(
+            info2.name, "<finished-serial-step>",
+            "second worker takes the latch short-circuit"
+        );
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            1,
+            "the Serial step must NOT be re-run after the DrainGate latch is set"
+        );
+    }
+
+    /// A sticky-owned source driven through `run_worker_loop` completes and the
+    /// loop exits even though the cached `sticky_live` flag (not a per-iteration
+    /// `live.contains` scan) gates the fast path. Exercises the S1b-006 cache:
+    /// the sticky step is removed once it returns `Finished`, after which the
+    /// fast path must be disabled and the loop must terminate.
+    #[test]
+    fn sticky_owner_completes_and_loop_exits() {
+        let mut graph = ChainGraph::new();
+        let src = graph.register_step("Src", 1);
+        let sink = graph.register_step("Sink", 0);
+        graph.wire(src, BranchIdx(0), sink);
+        let steps: Vec<Box<dyn ErasedStep>> =
+            vec![Box::new(TypedStep::new(SrcFinished)), Box::new(TypedStep::new(SinkStep))];
+        let contexts = Arc::new(build_chain_contexts(&steps, &graph));
+
+        // Single worker; the source (idx 0) is its Exclusive sticky owner, the
+        // sink (idx 1) is Exclusive owned by the same worker for this 1-worker
+        // run.
+        let mut entries: Vec<WorkerStepEntry> = vec![
+            WorkerStepEntry::Exclusive { step: steps.into_iter().next().unwrap() },
+            WorkerStepEntry::Exclusive { step: Box::new(TypedStep::new(SinkStep)) },
+        ];
+        let drain_counters = vec![StepDrainCounter::new(1), StepDrainCounter::new(1)];
+        let signal = PipelineSignal::new();
+        let mut worker = WorkerCore::new(0, Some(src), Some(src));
+
+        // The source finishes immediately; the sink then sees its input drained
+        // and finishes too. `run_worker_loop` must return (no hang).
+        run_worker_loop(&mut worker, &mut entries, &contexts, &drain_counters, &signal, None);
     }
 }

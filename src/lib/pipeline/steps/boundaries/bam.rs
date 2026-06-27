@@ -99,9 +99,11 @@ impl Step for FindBamBoundaries {
 
         // Process up to `MAX_BATCHES_PER_LOCK` inputs per `try_run` to
         // amortize the Serial mutex acquisition. Each iteration pops one
-        // input, runs find_boundaries, and (if records were produced)
-        // pushes one output. We stop early on push rejection (held the
-        // unpushed; subsequent iterations would contend on backpressure)
+        // input, runs find_boundaries, and pushes at most one output —
+        // header-only or carryover-only inputs are fully absorbed and produce
+        // no output (the loop `continue`s, and `did_work` still records the
+        // consumed input as Progress). We stop early on push rejection (held
+        // the unpushed; subsequent iterations would contend on backpressure)
         // or on input exhaustion.
         let mut did_work = false;
         for _ in 0..MAX_BATCHES_PER_LOCK {

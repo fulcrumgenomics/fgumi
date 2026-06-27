@@ -17,7 +17,7 @@ pub fn assign_exclusive_owners(
     steps: &[Box<dyn ErasedStep>],
     n_threads: usize,
 ) -> Result<Vec<Option<usize>>, PipelineError> {
-    let total_exclusive = steps.iter().filter(|s| s.profile().kind == StepKind::Exclusive).count();
+    let total_exclusive = steps.iter().filter(|s| s.kind() == StepKind::Exclusive).count();
     if total_exclusive > n_threads {
         return Err(PipelineError::NotEnoughThreads {
             required: total_exclusive,
@@ -28,7 +28,7 @@ pub fn assign_exclusive_owners(
     let mut owners: Vec<Option<usize>> = vec![None; steps.len()];
     let mut next_owner = 0usize;
     for (idx, step) in steps.iter().enumerate() {
-        if step.profile().kind == StepKind::Exclusive {
+        if step.kind() == StepKind::Exclusive {
             owners[idx] = Some(next_owner);
             next_owner += 1;
         }
@@ -66,8 +66,7 @@ pub fn assign_sticky_owners(
 
     // First pass: Exclusive-sticky owners (highest priority).
     for (step_usize, step) in steps.iter().enumerate() {
-        let profile = step.profile();
-        if profile.kind == StepKind::Exclusive && profile.sticky {
+        if step.kind() == StepKind::Exclusive && step.sticky() {
             if let Some(owner) = exclusive_owners[step_usize] {
                 if owner < n_workers && sticky[owner].is_none() {
                     sticky[owner] = Some(StepIdx(step_usize));
@@ -78,8 +77,7 @@ pub fn assign_sticky_owners(
 
     // Second pass: Serial-sticky-Affinity owners (only fill empty slots).
     for (step_usize, step) in steps.iter().enumerate() {
-        let profile = step.profile();
-        if profile.kind == StepKind::Serial && profile.sticky {
+        if step.kind() == StepKind::Serial && step.sticky() {
             let target = match step.affinity() {
                 crate::step::Affinity::None => continue,
                 crate::step::Affinity::Reader => 0,

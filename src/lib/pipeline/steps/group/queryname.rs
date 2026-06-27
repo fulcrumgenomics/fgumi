@@ -42,9 +42,14 @@ pub const DEFAULT_TARGET_BATCH_COUNT: usize = 1000;
 /// when an emit is rejected by downstream backpressure, the partial
 /// state stays buffered until the held slot drains.
 pub struct GroupByQueryname {
-    /// Run-length state: queryname currently being accumulated.
-    current_name: Option<Vec<u8>>,
-    /// Run-length state: cached `name_hash` for fast pre-check.
+    /// Run-length state: queryname currently being accumulated, kept in a
+    /// reusable buffer so each template boundary refills (`clear` +
+    /// `extend_from_slice`) rather than re-allocating a fresh `Vec`. Only
+    /// meaningful while a run is active (`current_name_hash.is_some()`).
+    current_name: Vec<u8>,
+    /// Run-length state: cached `name_hash` for fast pre-check. `Some` iff a
+    /// run is currently active; doubles as the run-active flag so the
+    /// `current_name` allocation survives across template boundaries.
     current_name_hash: Option<u64>,
     /// Run-length state: records accumulated for `current_name`.
     current_records: Vec<fgumi_raw_bam::RawRecord>,
@@ -71,7 +76,7 @@ impl GroupByQueryname {
     #[must_use]
     pub fn with_target_batch_count(output_byte_limit: u64, target_batch_count: usize) -> Self {
         Self {
-            current_name: None,
+            current_name: Vec::new(),
             current_name_hash: None,
             current_records: Vec::new(),
             next_ordinal: 0,
@@ -83,15 +88,40 @@ impl GroupByQueryname {
         }
     }
 
-    /// Flush the run-in-progress into the accumulator (if non-empty).
+    /// Flush the run-in-progress into the accumulator (if non-empty). The
+    /// `current_name` buffer is retained (only the run-active flag is cleared)
+    /// so its allocation is reused by the next template boundary.
     fn flush_current_template(&mut self) -> io::Result<()> {
         if !self.current_records.is_empty() {
             let records = std::mem::take(&mut self.current_records);
             let template = Template::from_records(records)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             self.accumulator.push(template);
-            self.current_name = None;
             self.current_name_hash = None;
+        }
+        Ok(())
+    }
+
+    /// Accumulate one raw record into the current template run, opening a new
+    /// run (and flushing the previous one) at a queryname boundary. The cached
+    /// `name_hash` pre-check short-circuits most inequality before the byte
+    /// compare; the `current_name` buffer is reused across boundaries.
+    fn process_record(&mut self, raw: fgumi_raw_bam::RawRecord, name_hash: u64) -> io::Result<()> {
+        let read_name = fgumi_raw_bam::read_name(raw.as_ref());
+        // A run is active iff `current_name_hash` is `Some`.
+        let same_template = match self.current_name_hash {
+            Some(h) => h == name_hash && self.current_name == read_name,
+            None => false,
+        };
+        if same_template {
+            self.current_records.push(raw);
+        } else {
+            self.flush_current_template()?;
+            // Reuse the buffer: clear + refill rather than allocate.
+            self.current_name.clear();
+            self.current_name.extend_from_slice(read_name);
+            self.current_name_hash = Some(name_hash);
+            self.current_records.push(raw);
         }
         Ok(())
     }
@@ -151,19 +181,7 @@ impl Step for GroupByQueryname {
             for decoded in records {
                 let name_hash = decoded.key.name_hash;
                 let raw = decoded.into_raw_bytes();
-                let read_name = fgumi_raw_bam::read_name(raw.as_ref());
-                let same_template = match (self.current_name_hash, self.current_name.as_deref()) {
-                    (Some(h), Some(name)) => h == name_hash && name == read_name,
-                    _ => false,
-                };
-                if same_template {
-                    self.current_records.push(raw);
-                } else {
-                    self.flush_current_template()?;
-                    self.current_name = Some(read_name.to_vec());
-                    self.current_name_hash = Some(name_hash);
-                    self.current_records.push(raw);
-                }
+                self.process_record(raw, name_hash)?;
             }
             if self.accumulator.len() >= self.target_batch_count {
                 break;
@@ -197,6 +215,83 @@ impl Step for GroupByQueryname {
 mod tests {
     use super::*;
     use crate::pipeline::core::item::Ordered;
+    use fgumi_bam_io::library::LibraryIndex;
+    use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder};
+
+    use fgumi_raw_bam::flags;
+
+    /// Build a minimal mapped raw record with the given read name and flags.
+    fn raw_named(name: &[u8], flag: u16) -> RawRecord {
+        let mut b = RawSamBuilder::new();
+        b.read_name(name).sequence(b"ACGT").qualities(&[30; 4]).flags(flag);
+        b.build()
+    }
+
+    /// Drive each `(name, flag)` record through [`GroupByQueryname::process_record`],
+    /// close the final run, and return `(name, record_count)` per template in order.
+    fn run_grouping(
+        step: &mut GroupByQueryname,
+        records: &[(&[u8], u16)],
+    ) -> Vec<(Vec<u8>, usize)> {
+        for (name, flag) in records {
+            let raw = raw_named(name, *flag);
+            let name_hash = LibraryIndex::hash_name(Some(name));
+            step.process_record(raw, name_hash).expect("process_record");
+        }
+        step.flush_current_template().expect("flush");
+        step.accumulator.iter().map(|t| (t.name.clone(), t.records().len())).collect()
+    }
+
+    const R1: u16 = flags::PAIRED | flags::FIRST_SEGMENT;
+    const R2: u16 = flags::PAIRED | flags::LAST_SEGMENT;
+
+    #[test]
+    fn consecutive_same_name_forms_one_template() {
+        let mut step = GroupByQueryname::new(1 << 20);
+        let records: Vec<(&[u8], u16)> = vec![(b"read1", R1), (b"read1", R2)];
+        let groups = run_grouping(&mut step, &records);
+        assert_eq!(groups, vec![(b"read1".to_vec(), 2)]);
+    }
+
+    #[test]
+    fn distinct_and_nonadjacent_names_split_runs() {
+        let mut step = GroupByQueryname::new(1 << 20);
+        // read1 appears again non-adjacently → a fresh template, not merged.
+        let records: Vec<(&[u8], u16)> =
+            vec![(b"read1", R1), (b"read1", R2), (b"read2", R1), (b"read1", R1)];
+        let groups = run_grouping(&mut step, &records);
+        assert_eq!(
+            groups,
+            vec![(b"read1".to_vec(), 2), (b"read2".to_vec(), 1), (b"read1".to_vec(), 1)]
+        );
+    }
+
+    #[test]
+    fn buffer_reuse_across_boundaries_preserves_grouping() {
+        // Short-then-long-then-short name transitions exercise the reused
+        // `current_name` buffer (clear + refill); grouping must stay exact.
+        let mut step = GroupByQueryname::new(1 << 20);
+        let records: Vec<(&[u8], u16)> = vec![
+            (b"a", R1),
+            (b"a", R2),
+            (b"longer_name", R1),
+            (b"b", R1),
+            (b"b", R2),
+            (b"another_longer_name", R1),
+            (b"c", R1),
+        ];
+        let groups = run_grouping(&mut step, &records);
+        assert_eq!(
+            groups,
+            vec![
+                (b"a".to_vec(), 2),
+                (b"longer_name".to_vec(), 1),
+                (b"b".to_vec(), 2),
+                (b"another_longer_name".to_vec(), 1),
+                (b"c".to_vec(), 1),
+            ]
+        );
+    }
 
     #[test]
     fn profile_advertises_serial_byordinal() {

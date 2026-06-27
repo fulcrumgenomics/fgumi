@@ -12,10 +12,13 @@ anyhow = "1.0.102"
 bytesize = "2.3"
 clap = { version = "4", features = ["derive", "string"] }
 enum_dispatch = "0.3.13"
-log = "0"
+log = "0.4"
 num_cpus = "1.16"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 thiserror = "2"
 
 [dev-dependencies]
-rstest = "0"
+rstest = "0.26"
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }

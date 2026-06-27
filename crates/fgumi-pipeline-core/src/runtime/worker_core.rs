@@ -67,6 +67,23 @@ mod tests {
     #[test]
     fn backoff_doubles_then_caps() {
         let mut w = WorkerCore::new(0, None, None);
+        // Pin the doubling sequence before the cap: 1 → 2 → 4 → 8 → … . The
+        // initial value is 1, and each `increase_backoff` doubles it. Asserting
+        // only the final cap would pass a buggy `increase_backoff` that jumped
+        // straight to the cap or incremented by a constant, so check the
+        // sequence too.
+        assert_eq!(w.current_backoff_us(), BACKOFF_INITIAL_US);
+        let mut expected = BACKOFF_INITIAL_US;
+        for _ in 0..10 {
+            w.increase_backoff();
+            expected = (expected * 2).min(BACKOFF_MAX_US);
+            assert_eq!(
+                w.current_backoff_us(),
+                expected,
+                "backoff must double each step until it saturates"
+            );
+        }
+        // Many more doublings saturate at the cap and stay there.
         for _ in 0..50 {
             w.increase_backoff();
         }

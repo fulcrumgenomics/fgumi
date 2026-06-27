@@ -1248,7 +1248,7 @@ impl VanillaUmiConsensusCaller {
             &depths,
             &errors,
             methylation.as_ref(),
-        );
+        )?;
 
         Ok((true, surviving_count, surviving_reads))
     }
@@ -1373,7 +1373,7 @@ impl VanillaUmiConsensusCaller {
         depths: &[u16],
         errors: &[u16],
         methylation: Option<&crate::methylation::MethylationAnnotation>,
-    ) {
+    ) -> Result<()> {
         let mut flag = flags::UNMAPPED;
         match read_type {
             ReadType::R1 => {
@@ -1386,14 +1386,16 @@ impl VanillaUmiConsensusCaller {
         }
 
         // Read name is `<prefix>:<umi>`; compose it straight into the record
-        // buffer rather than allocating a fresh `String` per output read.
-        self.bam_builder.build_record_joined_name(
+        // buffer rather than allocating a fresh `String` per output read. The
+        // UMI is data-controlled, so reject an over-long joined name with a
+        // typed error rather than panicking.
+        self.bam_builder.try_build_record_joined_name(
             self.read_name_prefix.as_bytes(),
             umi.as_bytes(),
             flag,
             bases,
             quals,
-        );
+        )?;
 
         // RG tag
         self.bam_builder.append_string_tag(SamTag::RG, self.read_group_id.as_bytes());
@@ -1476,6 +1478,7 @@ impl VanillaUmiConsensusCaller {
         // Write record with block_size prefix
         self.bam_builder.write_with_block_size(&mut output.data);
         output.count += 1;
+        Ok(())
     }
 }
 

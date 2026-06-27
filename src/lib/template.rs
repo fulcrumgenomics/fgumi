@@ -137,13 +137,32 @@ impl Template {
     ///
     /// Returns `None` when no UMI cache is set, when neither R1 nor R2 is
     /// present, or when the cached position would slice outside the record.
+    ///
+    /// # Cached-UMI invariant
+    ///
+    /// `cached_umi_position` is only valid while the primary record's bytes are
+    /// unmodified. Mutating accessors ([`Template::records_mut`],
+    /// [`Template::fix_mate_info`]) rewrite aux bytes (MS/MC/MQ via
+    /// remove/append tag) that can shift the cached UMI offset, so they clear
+    /// `cached_umi_position` to `None`; a `cached_umi()` read after a mutation
+    /// then falls back to scanning aux data instead of slicing stale bytes.
     #[must_use]
     pub fn cached_umi(&self) -> Option<&[u8]> {
         let (offset, len) = self.cached_umi_position?;
         let raw = self.r1().or_else(|| self.r2())?;
         let start = offset as usize;
         let end = start.checked_add(len as usize)?;
-        raw.as_ref().get(start..end)
+        let value = raw.as_ref().get(start..end)?;
+        // The cache only ever holds a Z-typed UMI value (NUL-free by the BAM
+        // spec; the trailing NUL is excluded when caching). An interior NUL
+        // means the offset drifted onto a different region — a cheap,
+        // zero-release-cost canary for a stale cache that survived bounds checks.
+        debug_assert!(
+            !value.contains(&0),
+            "stale cached UMI: offset {start} sliced bytes containing an interior NUL \
+             (the template was likely mutated without invalidating the UMI cache)"
+        );
+        Some(value)
     }
 
     /// Approximate heap footprint in bytes — the sum of all member records'
@@ -175,7 +194,13 @@ impl Template {
     }
 
     /// Returns mutable access to all records.
+    ///
+    /// Clears `cached_umi_position` (see the cached-UMI invariant on
+    /// [`Template::cached_umi`]): a caller may rewrite aux bytes that shift the
+    /// cached UMI offset, so the cache is invalidated and the next
+    /// [`Template::cached_umi`] read falls back to scanning aux data.
     pub fn records_mut(&mut self) -> &mut [RawRecord] {
+        self.cached_umi_position = None;
         &mut self.records
     }
 
@@ -464,6 +489,11 @@ impl Template {
     #[allow(clippy::too_many_lines)]
     pub fn fix_mate_info(&mut self) -> Result<()> {
         use fgumi_raw_bam;
+
+        // Rewrites aux bytes (mate score/cigar/quality tags) that can shift the
+        // cached UMI offset; invalidate the cache so a later `cached_umi()` read
+        // re-scans rather than slicing stale bytes (see `Template::cached_umi`).
+        self.cached_umi_position = None;
 
         let rr = &mut self.records;
 
@@ -2694,5 +2724,40 @@ mod tests {
         let aux = fgumi_raw_bam::aux_data_slice(primary);
         let expected = fgumi_raw_bam::find_string_tag(aux, *SamTag::RX).expect("RX present");
         assert_eq!(template.cached_umi(), Some(expected));
+    }
+
+    #[test]
+    fn records_mut_invalidates_umi_cache() {
+        // A populated cache must be cleared when records_mut hands out mutable
+        // access, since the caller may rewrite aux bytes and shift the UMI offset
+        // (see the cached-UMI invariant on Template::cached_umi).
+        let r1 = raw_with_umi(b"read1", FLAG_PAIRED | FLAG_READ1, b"ACGTACGT");
+        let mut template =
+            Template::from_decoded_records(vec![decoded_with_cached_umi(r1)]).expect("builds");
+        assert_eq!(template.cached_umi(), Some(b"ACGTACGT".as_ref()), "cache populated up front");
+
+        let _ = template.records_mut();
+
+        assert!(template.cached_umi_position.is_none(), "records_mut clears the cache");
+        assert!(template.cached_umi().is_none(), "cached_umi falls back after mutation");
+    }
+
+    #[test]
+    fn fix_mate_info_invalidates_umi_cache() {
+        // fix_mate_info rewrites mate aux tags, which can shift the UMI offset, so
+        // the cache must be cleared to force a re-scan on the next read.
+        let r1 = raw_with_umi(b"read1", FLAG_PAIRED | FLAG_READ1, b"ACGTACGT");
+        let r2 = raw_with_umi(b"read1", FLAG_PAIRED | FLAG_READ2, b"OTHERUMI");
+        let mut template = Template::from_decoded_records(vec![
+            decoded_with_cached_umi(r1),
+            decoded_with_cached_umi(r2),
+        ])
+        .expect("builds");
+        assert_eq!(template.cached_umi(), Some(b"ACGTACGT".as_ref()), "cache populated up front");
+
+        template.fix_mate_info().expect("fix_mate_info succeeds");
+
+        assert!(template.cached_umi_position.is_none(), "fix_mate_info clears the cache");
+        assert!(template.cached_umi().is_none(), "cached_umi falls back after mutation");
     }
 }

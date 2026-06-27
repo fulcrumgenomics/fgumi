@@ -31,3 +31,32 @@ pub fn set_version_override(version: String) -> bool {
 pub fn version_string() -> String {
     VERSION_OVERRIDE.get().cloned().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The override is a process-global `OnceLock`, so its first-write-wins
+    /// contract and the `version_string` fallback must be exercised in ONE test
+    /// (a second test could observe state left by the first). This test must be
+    /// the only thing in the crate's test binary that sets the override.
+    #[test]
+    fn set_version_override_is_first_write_wins_and_drives_version_string() {
+        // Before any override is installed, `version_string` falls back to the
+        // Cargo package version. This test is the only thing in the crate's test
+        // binary that touches the override, so the fallback is still observable
+        // here — assert it so a broken fallback is caught in the same one-shot test.
+        assert_eq!(version_string(), env!("CARGO_PKG_VERSION"));
+
+        // First write installs the value and reports success.
+        assert!(set_version_override("X".to_string()), "first set must install the value");
+        // A second write is ignored (first-write-wins) and reports failure.
+        assert!(
+            !set_version_override("Y".to_string()),
+            "second set must be ignored, leaving the first value"
+        );
+        // `version_string` reflects the first-installed override, not the Cargo
+        // fallback nor the second (ignored) value.
+        assert_eq!(version_string(), "X");
+    }
+}

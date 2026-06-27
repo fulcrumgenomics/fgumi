@@ -246,6 +246,15 @@ use fgumi_raw_bam::{self, RawRecordView, RawTagsEditor};
 ///
 /// Returns `Ok(true)` if tags were regenerated, `Ok(false)` for unmapped reads.
 ///
+/// A record that is *mapped*-flagged but carries a negative reference sequence
+/// ID (`ref_id < 0`) is degenerate/contradictory: there is no reference to
+/// compute tags against. Rather than leaving whatever stale NM/UQ/MD were on
+/// the record, this strips them and returns `Ok(false)` — the same fail-closed
+/// behavior as the unmapped branch, and consistent with fgbio's
+/// `regenerateNmUqMdTags`, which nulls NM/UQ/MD whenever a read has no usable
+/// alignment. This guarantees the raw path never emits stale alignment tags on
+/// malformed input.
+///
 /// # Errors
 ///
 /// Returns an error if the record is too short, the reference sequence ID is not found
@@ -281,6 +290,16 @@ pub fn regenerate_alignment_tags_raw(
     // Get reference sequence ID and look up name in header
     let ref_seq_id = RawRecordView::new(record).ref_id();
     if ref_seq_id < 0 {
+        // Degenerate: a mapped-flagged record with no reference sequence ID has
+        // nothing to recompute tags against. Fail closed by stripping any stale
+        // NM/UQ/MD (matching the unmapped branch above and fgbio's
+        // `regenerateNmUqMdTags`, which nulls these tags when a read has no
+        // usable alignment) so the malformed record never carries stale
+        // alignment tags downstream.
+        let mut editor = RawTagsEditor::from_vec(record);
+        editor.remove(SamTag::NM);
+        editor.remove(SamTag::UQ);
+        editor.remove(SamTag::MD);
         return Ok(false);
     }
     let ref_seqs = header.reference_sequences();
@@ -982,6 +1001,45 @@ mod tests {
             Some("1C2"),
             "MD should be 1C2"
         );
+
+        Ok(())
+    }
+
+    /// A mapped-flagged record with a negative reference ID is degenerate: there
+    /// is no reference to compute tags against. The raw path must fail closed by
+    /// stripping any stale NM/UQ/MD (matching the unmapped branch and fgbio's
+    /// `regenerateNmUqMdTags`), not leave them in place.
+    #[test]
+    fn test_regenerate_alignment_tags_raw_strips_tags_on_negative_ref_id() -> Result<()> {
+        let (_fasta, reference) = create_test_reference()?;
+        let header = create_test_header();
+
+        // Start from a valid mapped record and regenerate real NM/UQ/MD onto it.
+        let mut record_buf = create_mapped_record("ATGT", &[30, 30, 25, 30], "4M", 1);
+        regenerate_alignment_tags(&mut record_buf, &header, &reference)?;
+        let mut raw = encode_record_buf_to_raw(&header, &record_buf)?;
+
+        // Sanity: the stale tags are present before we corrupt the ref ID.
+        let aux_off = fgumi_raw_bam::aux_data_offset_from_record(&raw).unwrap_or(raw.len());
+        assert!(
+            fgumi_raw_bam::find_int_tag(&raw[aux_off..], SamTag::NM).is_some(),
+            "precondition: NM present before forcing a negative ref ID"
+        );
+
+        // Force a negative reference sequence ID (BAM refID = first 4 bytes, i32 LE)
+        // while leaving the record mapped-flagged: the degenerate edge case.
+        raw[0..4].copy_from_slice(&(-1i32).to_le_bytes());
+        assert!(!RawRecordView::new(&raw).is_unmapped(), "record must stay mapped-flagged");
+
+        let regenerated = regenerate_alignment_tags_raw(&mut raw, &header, &reference)?;
+        assert!(!regenerated, "degenerate negative-ref-id record reports no regeneration");
+
+        // The stale alignment tags must have been stripped, not left behind.
+        let aux_off = fgumi_raw_bam::aux_data_offset_from_record(&raw).unwrap_or(raw.len());
+        let aux = &raw[aux_off..];
+        assert_eq!(fgumi_raw_bam::find_int_tag(aux, SamTag::NM), None, "NM must be stripped");
+        assert_eq!(fgumi_raw_bam::find_int_tag(aux, SamTag::UQ), None, "UQ must be stripped");
+        assert_eq!(fgumi_raw_bam::find_string_tag(aux, SamTag::MD), None, "MD must be stripped");
 
         Ok(())
     }

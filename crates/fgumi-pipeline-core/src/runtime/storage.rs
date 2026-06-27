@@ -92,7 +92,7 @@ pub fn build_worker_storage(
         (0..n_workers).map(|_| Vec::with_capacity(steps.len())).collect();
 
     for (step_idx, step) in steps.into_iter().enumerate() {
-        let kind = step.profile().kind;
+        let kind = step.kind();
         match kind {
             StepKind::Parallel => {
                 // Each worker gets its own clone; the original goes to worker N-1.

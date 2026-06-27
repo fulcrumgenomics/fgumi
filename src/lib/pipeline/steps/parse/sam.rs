@@ -25,8 +25,7 @@ use crate::pipeline::core::queues::QueueSpec;
 use crate::pipeline::core::reorder::BranchOrdering;
 use crate::pipeline::core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
 use crate::pipeline::steps::types::{DecodedRecordBatch, SamChunk};
-use fgumi_bam_io::compute_group_key_from_raw;
-use fgumi_bam_io::{DecodedRecord, GroupKeyConfig};
+use fgumi_bam_io::{DecodedRecord, GroupKeyConfig, compute_group_key_from_raw, name_hash_key};
 
 /// Parse every line in `chunk` and produce a `DecodedRecordBatch` carrying
 /// the chunk's batch serial. SAM lines are encoded into BAM record body
@@ -49,6 +48,7 @@ pub fn parse_sam_chunk_into_decoded(
 
     let library_index = &key_config.library_index;
     let cell_tag = key_config.cell_tag;
+    let name_hash_only = key_config.name_hash_only;
 
     let mut sam_record = sam::Record::default();
     let mut encoder = bam::io::Writer::from(Vec::<u8>::with_capacity(4096));
@@ -76,11 +76,27 @@ pub fn parse_sam_chunk_into_decoded(
         }
         encoder.get_mut().clear();
         encoder.write_alignment_record(header, &sam_record)?;
-        // Strip the 4-byte little-endian `block_size` prefix that
-        // `bam::io::Writer` prepends; what remains is the raw BAM
-        // record body, the same shape `DecodedRecord` expects.
-        let body_bytes: Vec<u8> = encoder.get_ref()[4..].to_vec();
-        let key = compute_group_key_from_raw(&body_bytes, library_index, cell_tag);
+        // `DecodedRecord` takes ownership of the body bytes, so swap the
+        // encoder's inner buffer out (replacing it with a pre-sized fresh one
+        // for the next record) and strip the 4-byte little-endian `block_size`
+        // prefix that `bam::io::Writer` prepends in place. This avoids the extra
+        // full-body memcpy that `get_ref()[4..].to_vec()` performed per record
+        // (this is the hot SAM parse loop). The replacement is sized to the
+        // outgoing buffer's capacity so the encoder keeps room for the next
+        // record instead of re-growing a zero-capacity `Vec` from scratch (which
+        // `std::mem::take` would leave behind).
+        let next_capacity = encoder.get_mut().capacity().max(4096);
+        let mut body_bytes =
+            std::mem::replace(encoder.get_mut(), Vec::with_capacity(next_capacity));
+        body_bytes.drain(..4);
+        // Match the BAM decode path (`DecodeFromRecords`): under
+        // `name_hash_only` the key is the name hash alone, so SAM- and
+        // BAM-ingested records group identically.
+        let key = if name_hash_only {
+            name_hash_key(&body_bytes)
+        } else {
+            compute_group_key_from_raw(&body_bytes, library_index, cell_tag)
+        };
         decoded.push(DecodedRecord::from_raw_bytes(body_bytes, key));
     }
 
@@ -357,6 +373,43 @@ read2\t16\tchr1\t20\t60\t5M\t*\t0\t0\tTGCAT\t!!!!!\n";
             bam_decoded.raw_bytes(),
             "SAM and BAM paths must produce byte-identical DecodedRecord.raw_bytes()",
         );
+    }
+
+    /// Under `name_hash_only`, the SAM parse path must key records by the read
+    /// name hash alone — identical to the BAM `DecodeFromRecords` path — so
+    /// SAM- and BAM-ingested reads group together. Regression for the SAM path
+    /// previously ignoring `name_hash_only` and always computing the full
+    /// position/library key.
+    #[test]
+    fn parse_sam_chunk_honors_name_hash_only() {
+        let header = parse_header(SAM_TEXT);
+        let library_index = fgumi_bam_io::LibraryIndex::from_header(&header);
+        let key_config = GroupKeyConfig::name_hash_only(library_index);
+
+        let chunk = sam_chunk_from_records(0);
+        let batch = parse_sam_chunk_into_decoded(chunk, &header, &key_config).expect("parses");
+        assert_eq!(batch.records.len(), 2);
+
+        for rec in &batch.records {
+            let raw = rec.raw_bytes();
+            assert_eq!(
+                rec.key,
+                fgumi_bam_io::name_hash_key(raw),
+                "name_hash_only SAM key must be the name-hash key, not the full group key",
+            );
+            // The fixture reads are mapped (chr1:10 / chr1:20), so the full
+            // position/library key differs from the name-hash key — confirming
+            // the branch actually changed paths.
+            assert_ne!(
+                rec.key,
+                fgumi_bam_io::compute_group_key_from_raw(
+                    raw,
+                    &key_config.library_index,
+                    key_config.cell_tag,
+                ),
+                "name_hash_only key must differ from the full position/library key for a mapped read",
+            );
+        }
     }
 
     #[test]

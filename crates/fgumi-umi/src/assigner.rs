@@ -1465,37 +1465,46 @@ impl UmiAssigner for AdjacencyUmiAssigner {
         let t_start = std::time::Instant::now();
 
         // Count UMIs using compact BitEnc representation (saves ~60-70% memory)
-        // We store index into raw_umis to avoid cloning strings
-        // Also build a map from BitEnc -> unique_index for result lookup
+        // We store index into raw_umis to avoid cloning strings.
         //
-        // Cache each read's encoding here so the final result map can reuse it
-        // instead of re-running `BitEnc::from_umi_str` over every raw UMI a
-        // second time. `encoded_per_read[i]` is the encoding of `raw_umis[i]`
-        // (`None` for an invalid UMI), so it stays aligned with `raw_umis`.
-        let mut encoded_per_read: Vec<Option<BitEnc>> = Vec::with_capacity(raw_umis.len());
-        let mut umi_counts: Vec<(BitEnc, usize, usize)> = {
-            // Map from BitEnc -> (count, first_raw_index)
-            let mut counts: AHashMap<BitEnc, (usize, usize)> =
+        // To map each read to its final assignment without a per-read hash
+        // lookup, assign every distinct UMI a dense *pre-sort* index at first
+        // sight, and cache that index per read in `presort_idx_per_read[i]`
+        // (`None` for an invalid UMI; stays aligned with `raw_umis`). After the
+        // sort we build a plain `Vec` permutation `presort_to_sorted` so the
+        // final result loop is pure array indexing — no `BitEnc::from_umi_str`
+        // re-run and no `AHashMap` probe per read.
+        let mut presort_idx_per_read: Vec<Option<usize>> = Vec::with_capacity(raw_umis.len());
+        // (BitEnc, count, first_raw_index, presort_idx)
+        let mut umi_counts: Vec<(BitEnc, usize, usize, usize)> = {
+            // Map from BitEnc -> (count, first_raw_index, presort_idx)
+            let mut counts: AHashMap<BitEnc, (usize, usize, usize)> =
                 AHashMap::with_capacity(raw_umis.len() / 4); // Estimate ~4 reads per UMI
 
             for (i, umi) in raw_umis.iter().enumerate() {
                 // Convert to compact representation (skips dashes in paired UMIs)
                 let Some(encoded) = BitEnc::from_umi_str(umi) else {
                     // UMI contains invalid characters - skip it
-                    encoded_per_read.push(None);
+                    presort_idx_per_read.push(None);
                     continue;
                 };
-                encoded_per_read.push(Some(encoded));
 
-                if let Some((count, _idx)) = counts.get_mut(&encoded) {
+                if let Some((count, _idx, presort_idx)) = counts.get_mut(&encoded) {
                     *count += 1;
+                    presort_idx_per_read.push(Some(*presort_idx));
                 } else {
-                    // Store index into raw_umis instead of cloning
-                    counts.insert(encoded, (1, i));
+                    // First sighting: assign the next dense pre-sort index.
+                    let presort_idx = counts.len();
+                    presort_idx_per_read.push(Some(presort_idx));
+                    // Store index into raw_umis instead of cloning.
+                    counts.insert(encoded, (1, i, presort_idx));
                 }
             }
-            // Convert to Vec<(BitEnc, count, first_raw_index)>
-            counts.into_iter().map(|(enc, (count, idx))| (enc, count, idx)).collect()
+            // Convert to Vec<(BitEnc, count, first_raw_index, presort_idx)>
+            counts
+                .into_iter()
+                .map(|(enc, (count, idx, presort_idx))| (enc, count, idx, presort_idx))
+                .collect()
         };
 
         // Handle case where all UMIs had invalid characters
@@ -1509,16 +1518,30 @@ impl UmiAssigner for AdjacencyUmiAssigner {
         // Sort by descending count, then by original string for determinism
         umi_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| raw_umis[a.2].cmp(&raw_umis[b.2])));
 
-        // Build lookup from BitEnc to sorted index (after sorting)
-        let bitenc_to_unique_idx: AHashMap<BitEnc, usize> =
-            umi_counts.iter().enumerate().map(|(idx, (enc, _, _))| (*enc, idx)).collect();
+        // Build the pre-sort -> sorted permutation as a dense `Vec` (indices are
+        // `0..umi_counts.len()`), then drop the pre-sort field so the graph
+        // helpers keep their `(BitEnc, count, first_raw_index)` tuple shape.
+        let mut presort_to_sorted = vec![0usize; umi_counts.len()];
+        for (sorted_idx, &(_, _, _, presort_idx)) in umi_counts.iter().enumerate() {
+            presort_to_sorted[presort_idx] = sorted_idx;
+        }
+        let umi_counts: Vec<(BitEnc, usize, usize)> =
+            umi_counts.into_iter().map(|(enc, count, idx, _)| (enc, count, idx)).collect();
 
         #[cfg(feature = "profile-adjacency")]
         let t_after_sort = std::time::Instant::now();
 
         if umi_counts.len() == 1 {
+            // Exactly one *encodable* UMI, but the batch may still contain reads
+            // with invalid (non-encodable) UMIs. Those must stay `MoleculeId::None`
+            // — exactly as the general path below maps them — rather than being
+            // folded into the single molecule. A `vec![id; raw_umis.len()]` here
+            // would mis-assign e.g. the middle read of `["AAAAAA","XXXXXX","AAAAAA"]`.
             let id = MoleculeId::Single(self.next_id());
-            return vec![id; raw_umis.len()];
+            return presort_idx_per_read
+                .iter()
+                .map(|presort_idx| if presort_idx.is_some() { id } else { MoleculeId::None })
+                .collect();
         }
 
         // Check all UMIs have same length (in bases, not string length)
@@ -1541,17 +1564,14 @@ impl UmiAssigner for AdjacencyUmiAssigner {
         // Assign IDs to nodes and build result Vec
         let unique_assignments = self.assign_ids_to_nodes_bitenc(&nodes, &roots, &umi_counts);
 
-        // Map each input UMI to its MoleculeId using the encoding cached during
-        // the count pass (no second `BitEnc::from_umi_str` over every read).
-        let result: Vec<MoleculeId> = encoded_per_read
+        // Map each input UMI to its MoleculeId by pure array indexing: the
+        // cached pre-sort index → sorted unique index (`presort_to_sorted`) →
+        // assignment. No `BitEnc::from_umi_str` re-run and no per-read hash probe.
+        let result: Vec<MoleculeId> = presort_idx_per_read
             .iter()
-            .map(|enc| {
-                if let Some(enc) = enc {
-                    if let Some(&unique_idx) = bitenc_to_unique_idx.get(enc) {
-                        return unique_assignments[unique_idx];
-                    }
-                }
-                MoleculeId::None // Invalid UMI
+            .map(|presort_idx| match presort_idx {
+                Some(presort_idx) => unique_assignments[presort_to_sorted[*presort_idx]],
+                None => MoleculeId::None, // Invalid UMI
             })
             .collect();
 
@@ -1697,19 +1717,29 @@ impl PairedUmiAssigner {
     ///
     /// Returns error if UMI doesn't contain exactly one '-'
     fn split(umi: &str) -> Result<(&str, &str)> {
-        // Use byte operations for faster lookup since UMIs are ASCII
+        // Use byte operations for faster lookup since UMIs are ASCII. A single
+        // pass finds the first '-' and detects any second '-' (rejecting it),
+        // rather than a `position()` scan followed by a second `contains()` scan
+        // of the remainder.
         let bytes = umi.as_bytes();
-        if let Some(pos) = bytes.iter().position(|&b| b == b'-') {
-            // Check for additional dashes after first
-            if bytes[pos + 1..].contains(&b'-') {
-                return Err(anyhow::anyhow!(
-                    "UMI '{umi}' is not a valid paired UMI (expected format: 'A-B', found multiple '-')"
-                ));
+        let mut first_dash: Option<usize> = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'-' {
+                if first_dash.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "UMI '{umi}' is not a valid paired UMI (expected format: 'A-B', found multiple '-')"
+                    ));
+                }
+                first_dash = Some(i);
             }
-            // SAFETY: '-' is a single byte ASCII, so splitting at its position is valid UTF-8
-            Ok((&umi[..pos], &umi[pos + 1..]))
-        } else {
-            Err(anyhow::anyhow!("UMI '{umi}' is not a valid paired UMI (expected format: 'A-B')"))
+        }
+        match first_dash {
+            // SAFETY: '-' is a single ASCII byte, so splitting at its position
+            // yields valid UTF-8 boundaries.
+            Some(pos) => Ok((&umi[..pos], &umi[pos + 1..])),
+            None => Err(anyhow::anyhow!(
+                "UMI '{umi}' is not a valid paired UMI (expected format: 'A-B')"
+            )),
         }
     }
 
@@ -2196,6 +2226,72 @@ mod tests {
         assert_ne!(map.get("AAAA"), map.get("GGGG"), "GGGG should be separate");
     }
 
+    /// Per-read result mapping must stay correct when reads are interleaved so
+    /// that the pre-sort unique index and the post-sort unique index differ.
+    /// Exercises the `presort_to_sorted` permutation that replaced the per-read
+    /// `bitenc_to_unique_idx` hash lookup.
+    #[test]
+    fn test_adjacency_per_read_mapping_with_interleaved_counts() {
+        let assigner = AdjacencyUmiAssigner::new(0, 1, DEFAULT_INDEX_THRESHOLD);
+
+        // First-seen order: AAAAAA, CCCCCC, GGGGGG. Final counts: GGGGGG(5) >
+        // AAAAAA(3) > CCCCCC(1), so the descending-count sort permutes the order,
+        // forcing presort_idx != sorted_idx for every UMI.
+        let umis: Vec<String> = vec![
+            "AAAAAA", "CCCCCC", "GGGGGG", // first sightings, in this order
+            "AAAAAA", "GGGGGG", "AAAAAA", "GGGGGG", "GGGGGG", "GGGGGG",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+        let assignments = assigner.assign(&umis);
+        assert_eq!(assignments.len(), umis.len());
+
+        // With 0 edits each distinct UMI is its own group; every read must carry
+        // exactly its own UMI's id, and identical UMIs must share an id.
+        let map = build_assignment_map(&umis, &assignments);
+        for (umi, id) in umis.iter().zip(assignments.iter()) {
+            assert_eq!(map.get(umi), Some(id), "read {umi} mis-mapped after sort permutation");
+        }
+        let distinct: HashSet<_> = assignments.iter().map(MoleculeId::base_id_string).collect();
+        assert_eq!(distinct.len(), 3, "three distinct UMIs → three groups");
+    }
+
+    /// A read whose UMI has invalid characters must map to `MoleculeId::None`
+    /// while the valid reads around it still map correctly (the cached pre-sort
+    /// index is `None` for invalid reads). Uses two distinct valid UMIs so the
+    /// single-unique-UMI fast path (which assigns one id to every read) is not
+    /// taken and the per-read `presort_to_sorted` mapping is exercised.
+    #[test]
+    fn test_adjacency_invalid_umi_maps_to_none() {
+        let assigner = AdjacencyUmiAssigner::new(0, 1, DEFAULT_INDEX_THRESHOLD);
+        let umis: Vec<String> = ["AAAAAA", "XXXXXX", "AAAAAA", "CCCCCC", "CCCCCC"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let assignments = assigner.assign(&umis);
+        assert_eq!(assignments[1], MoleculeId::None, "invalid UMI → None");
+        assert_ne!(assignments[0], MoleculeId::None);
+        assert_eq!(assignments[0], assignments[2], "valid AAAAAA reads share an id");
+        assert_eq!(assignments[3], assignments[4], "valid CCCCCC reads share an id");
+        assert_ne!(assignments[0], assignments[3], "distinct UMIs → distinct ids");
+    }
+
+    /// Regression: with exactly ONE unique encodable UMI the assigner takes the
+    /// single-unique-UMI fast path. An invalid UMI in that same batch must still
+    /// map to `MoleculeId::None`, not inherit the lone molecule's id.
+    #[test]
+    fn test_adjacency_invalid_umi_maps_to_none_single_unique_fast_path() {
+        let assigner = AdjacencyUmiAssigner::new(0, 1, DEFAULT_INDEX_THRESHOLD);
+        let umis: Vec<String> =
+            ["AAAAAA", "XXXXXX", "AAAAAA"].into_iter().map(str::to_string).collect();
+        let assignments = assigner.assign(&umis);
+        assert_eq!(assignments[1], MoleculeId::None, "invalid UMI → None even on the fast path");
+        assert_ne!(assignments[0], MoleculeId::None, "valid AAAAAA read keeps a molecule id");
+        assert_eq!(assignments[0], assignments[2], "both valid AAAAAA reads share the same id");
+    }
+
     // ========================================================================
     // PairedUmiAssigner Tests
     // ========================================================================
@@ -2332,6 +2428,9 @@ mod tests {
     #[case("-ACT", true, Some(("", "ACT")), "empty first part")]
     #[case("ACTACT", false, None, "no delimiter")]
     #[case("A-B-C", false, None, "multiple delimiters")]
+    #[case("AB-CD-", false, None, "trailing second dash")]
+    #[case("--", false, None, "two adjacent dashes")]
+    #[case("", false, None, "empty string has no delimiter")]
     fn test_paired_split(
         #[case] umi: &str,
         #[case] should_succeed: bool,

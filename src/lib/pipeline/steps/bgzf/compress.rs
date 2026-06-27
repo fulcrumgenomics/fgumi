@@ -73,6 +73,51 @@ impl Clone for BgzfCompress {
     }
 }
 
+impl BgzfCompress {
+    /// Drain the compressor's physical BGZF blocks and assemble the single
+    /// output `BgzfBlock` byte buffer.
+    ///
+    /// INVARIANT: each block's `serial` is `InlineBgzfCompressor`'s monotonic
+    /// per-worker counter; it has no relation to the pipeline-wide
+    /// `batch_serial`. We deliberately drop it (read only `child.data`) and
+    /// inherit the parent's `batch_serial` for the emitted `BgzfBlock`. Future
+    /// code must NOT propagate `child.serial` into the framework's ordinal stream.
+    ///
+    /// The output is the concatenation of the physical block bytes (a valid BGZF
+    /// stream is just independent blocks back to back). When there is exactly one
+    /// physical block — the common case, since a batch usually fits in one 64 KiB
+    /// block — its buffer is moved out directly (no scratch allocation and no
+    /// concatenating memcpy); this is byte-identical to concatenating a single
+    /// block. For the multi-block case the bytes are concatenated into the
+    /// per-worker scratch (then `mem::replace`d out so the replacement stays in a
+    /// fixed mimalloc size class), and each drained child buffer is handed back to
+    /// the compressor's pool so the next compression reuses it.
+    fn assemble_output_bytes(&mut self) -> Vec<u8> {
+        let mut children = self.compressor.take_blocks();
+        match children.len() {
+            // No physical blocks — reachable from the all-clean rejects path,
+            // where an empty `DecompressedBlock` produces no BGZF output. Return
+            // an empty `Vec` rather than `mem::replace`-ing out the scratch:
+            // after a prior multi-block batch the scratch retains a
+            // `COMPRESS_SCRATCH_CAPACITY` allocation, and handing that out as an
+            // "empty" output would inflate queue memory/backpressure on the
+            // ordinal-preserving fast path.
+            0 => Vec::new(),
+            1 => children.pop().expect("len == 1").data,
+            _ => {
+                for child in children {
+                    self.output_scratch.extend_from_slice(&child.data);
+                    self.compressor.recycle_buffer(child.data);
+                }
+                std::mem::replace(
+                    &mut self.output_scratch,
+                    Vec::with_capacity(COMPRESS_SCRATCH_CAPACITY),
+                )
+            }
+        }
+    }
+}
+
 impl Step for BgzfCompress {
     type Input = DecompressedBlock;
     type Outputs = OrderedBytesSingle<BgzfBlock>;
@@ -115,24 +160,7 @@ impl Step for BgzfCompress {
         // Compress and harvest physical BGZF blocks.
         self.compressor.write_all(&bytes)?;
         self.compressor.flush()?;
-        let children = self.compressor.take_blocks();
-        // INVARIANT: `child.serial` here is `InlineBgzfCompressor`'s
-        // monotonic per-worker counter; it has no relation to the
-        // pipeline-wide `batch_serial`. We deliberately drop it (read
-        // only `child.data`) and inherit the parent's `batch_serial` for
-        // the emitted `BgzfBlock`. Future code must NOT propagate
-        // `child.serial` into the framework's ordinal stream.
-
-        // Concatenate the physical block bytes into the per-worker
-        // scratch, then mem::replace it out — single mimalloc size class
-        // every call.
-        for child in children {
-            self.output_scratch.extend_from_slice(&child.data);
-        }
-        let bytes = std::mem::replace(
-            &mut self.output_scratch,
-            Vec::with_capacity(COMPRESS_SCRATCH_CAPACITY),
-        );
+        let bytes = self.assemble_output_bytes();
 
         let out = BgzfBlock { batch_serial, bytes, uncompressed_size };
         match ctx.outputs.push(out) {
@@ -179,5 +207,107 @@ mod tests {
         for b in &blocks {
             assert_eq!(&b.data[..2], &[0x1f, 0x8b], "BGZF magic");
         }
+    }
+
+    /// Reference assembly: the straightforward concatenation the move/recycle
+    /// fast path must reproduce byte-for-byte.
+    fn reference_concat(level: u32, input: &[u8]) -> Vec<u8> {
+        let mut c = InlineBgzfCompressor::new(level);
+        c.write_all(input).unwrap();
+        c.flush().unwrap();
+        let mut out = Vec::new();
+        for block in c.take_blocks() {
+            out.extend_from_slice(&block.data);
+        }
+        out
+    }
+
+    /// Drive `assemble_output_bytes` on a fresh step over `input`.
+    fn assemble(level: u32, input: &[u8]) -> Vec<u8> {
+        let mut s = BgzfCompress::new(level, 1024);
+        s.compressor.write_all(input).unwrap();
+        s.compressor.flush().unwrap();
+        s.assemble_output_bytes()
+    }
+
+    #[test]
+    fn single_block_fast_path_is_byte_identical() {
+        // Small input → one physical block → move fast path.
+        let input = b"the quick brown fox jumps over the lazy dog";
+        let mut s = BgzfCompress::new(1, 1024);
+        s.compressor.write_all(input).unwrap();
+        s.compressor.flush().unwrap();
+        assert_eq!(s.compressor.take_blocks().len(), 1, "input should fit one block");
+
+        let assembled = assemble(1, input);
+        assert_eq!(assembled, reference_concat(1, input));
+        assert_eq!(&assembled[..2], &[0x1f, 0x8b], "valid BGZF magic");
+    }
+
+    #[test]
+    fn multi_block_concat_path_is_byte_identical() {
+        // Input larger than one 64 KiB block forces the multi-block concat +
+        // recycle path; output must still match the plain concatenation.
+        let mut input = Vec::with_capacity(200 * 1024);
+        for i in 0..(200 * 1024u32) {
+            input.push((i % 251) as u8);
+        }
+        let mut s = BgzfCompress::new(1, 1024);
+        s.compressor.write_all(&input).unwrap();
+        s.compressor.flush().unwrap();
+        assert!(s.compressor.take_blocks().len() > 1, "input should span >1 block");
+
+        let assembled = assemble(1, &input);
+        assert_eq!(assembled, reference_concat(1, &input));
+    }
+
+    #[test]
+    fn recycle_buffer_repopulates_pool_for_reuse() {
+        // After the multi-block path recycles buffers, a subsequent compression
+        // reuses them, and output remains byte-identical to a fresh compressor.
+        let big: Vec<u8> = (0..(200 * 1024u32)).map(|i| (i % 251) as u8).collect();
+        let mut s = BgzfCompress::new(1, 1024);
+
+        s.compressor.write_all(&big).unwrap();
+        s.compressor.flush().unwrap();
+        let first = s.assemble_output_bytes();
+        assert_eq!(first, reference_concat(1, &big));
+
+        // Second block through the same (now pool-primed) compressor.
+        s.compressor.write_all(&big).unwrap();
+        s.compressor.flush().unwrap();
+        let second = s.assemble_output_bytes();
+        assert_eq!(second, reference_concat(1, &big), "recycled buffers must not corrupt output");
+    }
+
+    #[test]
+    fn empty_batch_returns_unallocated_vec() {
+        // An all-clean rejects batch produces no physical BGZF blocks. The
+        // assembled output must be a truly empty `Vec`, not the per-worker
+        // scratch — otherwise an "empty" output carries a retained
+        // `COMPRESS_SCRATCH_CAPACITY` allocation and inflates queue memory.
+        let mut s = BgzfCompress::new(1, 1024);
+
+        // Fresh compressor, nothing written → no blocks.
+        let fresh = s.assemble_output_bytes();
+        assert!(fresh.is_empty());
+        assert_eq!(fresh.capacity(), 0, "empty output must not carry a scratch allocation");
+
+        // After a real multi-block batch (which routes through the scratch and
+        // replaces it with a `COMPRESS_SCRATCH_CAPACITY` Vec), a following empty
+        // batch must still return an unallocated Vec.
+        let big: Vec<u8> = (0..(200 * 1024u32)).map(|i| (i % 251) as u8).collect();
+        s.compressor.write_all(&big).unwrap();
+        s.compressor.flush().unwrap();
+        let multi = s.assemble_output_bytes();
+        assert!(!multi.is_empty(), "multi-block batch should produce output");
+
+        let after = s.assemble_output_bytes(); // no new input → empty batch
+        assert!(after.is_empty());
+        assert_eq!(
+            after.capacity(),
+            0,
+            "empty batch after a multi-block batch must not retain scratch"
+        );
     }
 }

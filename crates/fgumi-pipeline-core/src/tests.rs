@@ -6,6 +6,7 @@
 //! lives in Phase 2. These tests confirm the Phase 1 pieces support the
 //! unified report-`Finished` completion contract end-to-end.
 
+use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
 
@@ -399,7 +400,11 @@ impl Step for WideQueueSource {
 /// completion contract.
 #[derive(Clone)]
 struct ReportsFinishedBuffer {
-    buffered: Vec<u32>,
+    // A `VecDeque` so the flush-first drain pops the FIFO front in O(1). Real
+    // steps process millions of records: a `Vec` with `remove(0)` would be O(n)
+    // per flushed item (quadratic drain). Step authors copying this worked
+    // example must keep the front-drain O(1) — never `Vec::remove(0)`.
+    buffered: VecDeque<u32>,
 }
 impl Step for ReportsFinishedBuffer {
     type Input = u32;
@@ -416,10 +421,10 @@ impl Step for ReportsFinishedBuffer {
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
         // 1. Flush-first: push held items until the queue rejects one.
         let mut pushed = false;
-        while let Some(&item) = self.buffered.first() {
+        while let Some(&item) = self.buffered.front() {
             match ctx.outputs.push(item) {
                 Ok(()) => {
-                    self.buffered.remove(0);
+                    self.buffered.pop_front();
                     pushed = true;
                 }
                 Err(_unpushed) => break, // queue full — yield, retry next pass
@@ -430,7 +435,7 @@ impl Step for ReportsFinishedBuffer {
         }
         // 2. Consume input.
         if let Some(n) = ctx.input.pop() {
-            self.buffered.push(n);
+            self.buffered.push_back(n);
             return Ok(StepOutcome::Progress);
         }
         // 3. Completion: input drained AND nothing held — never push again.
@@ -459,7 +464,7 @@ fn run_reports_finished_pipeline(threads: usize, n_items: u32) {
         let builder = Pipeline::builder();
         builder
             .chain(WideQueueSource { remaining: n_items })
-            .chain(ReportsFinishedBuffer { buffered: Vec::new() })
+            .chain(ReportsFinishedBuffer { buffered: VecDeque::new() })
             .chain(DrainReproSink { received: received_for_run })
             .into_sink_marker();
         let pipeline = builder.build().expect("pipeline build");

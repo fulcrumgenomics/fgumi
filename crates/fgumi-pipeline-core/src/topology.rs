@@ -2,6 +2,16 @@
 //! `PipelineBuilder::build()` to assert all-outputs-wired and by the
 //! runtime to construct queue topology.
 
+/// Static branch-index display names covering every branch up to [`MAX_ARITY`].
+/// Output branch counts are bounded by `MAX_ARITY` at registration, so a valid
+/// branch index always maps to a name and the build-error message never prints a
+/// placeholder. Out-of-range indices fall back to `"?"` (never hit in practice,
+/// but keeps the function total).
+fn branch_name(branch: usize) -> &'static str {
+    const BRANCH_NAMES: [&str; crate::outputs::MAX_ARITY] = ["0", "1", "2", "3"];
+    BRANCH_NAMES.get(branch).copied().unwrap_or("?")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StepIdx(pub usize);
 
@@ -21,6 +31,13 @@ pub struct ChainGraph {
     consumer_input_slots: Vec<Option<usize>>,
     /// `branch_count[step]` — number of output branches for that step.
     branch_counts: Vec<usize>,
+    /// `branch_offsets[step]` — running prefix sum of `branch_counts` *before*
+    /// `step` (i.e. `sum(branch_counts[..step])`). This is the base index into
+    /// the flat `consumers` / `consumer_input_slots` arrays for `step`'s first
+    /// output branch, so `consumer_slot_index` is O(1) instead of re-summing the
+    /// prefix on every call. Pushed once per step in
+    /// [`Self::register_step_with_input_arity`]; static thereafter.
+    branch_offsets: Vec<usize>,
     /// `input_arities[step]` — number of input branches for that
     /// step (1 for single-input [`Step`] impls, 2 for [`Step2`],
     /// N for future `StepN`). Defaults to 1 via [`Self::register_step`];
@@ -53,6 +70,9 @@ impl ChainGraph {
         input_arity: usize,
     ) -> StepIdx {
         let idx = StepIdx(self.branch_counts.len());
+        // The offset for this step is the total branch count of all prior steps,
+        // i.e. the current length of the flat `consumers` array before we grow it.
+        self.branch_offsets.push(self.consumers.len());
         self.branch_counts.push(branch_count);
         self.input_arities.push(input_arity);
         self.step_names.push(name);
@@ -143,14 +163,7 @@ impl ChainGraph {
                 let producer = StepIdx(producer_usize);
                 let slot = self.consumer_slot_index(producer, BranchIdx(branch));
                 if self.consumers[slot].is_none() {
-                    let name = match branch {
-                        0 => "0",
-                        1 => "1",
-                        2 => "2",
-                        3 => "3",
-                        _ => "?",
-                    };
-                    return Some((producer, BranchIdx(branch), name));
+                    return Some((producer, BranchIdx(branch), branch_name(branch)));
                 }
             }
         }
@@ -193,11 +206,10 @@ impl ChainGraph {
             self.step_names[producer.0],
             branch_count
         );
-        let mut offset = 0;
-        for &count in &self.branch_counts[..producer.0] {
-            offset += count;
-        }
-        offset + branch.0
+        // `branch_offsets[producer]` is the precomputed prefix sum of all prior
+        // steps' branch counts (maintained in `register_step_with_input_arity`),
+        // so this is O(1) rather than re-summing `branch_counts[..producer.0]`.
+        self.branch_offsets[producer.0] + branch.0
     }
 }
 
@@ -250,6 +262,36 @@ mod tests {
         let (producer, branch, _) = g.first_unwired().unwrap();
         assert_eq!(producer, StepIdx(1));
         assert_eq!(branch, BranchIdx(1));
+    }
+
+    #[test]
+    fn branch_offsets_route_multi_branch_consumers_correctly() {
+        // Several multi-branch producers in a row: the precomputed branch
+        // offsets must keep each (producer, branch) edge mapped to a distinct
+        // flat slot so `consumer`/`consumer_input_slot` return the right links.
+        let mut g = ChainGraph::new();
+        let src = g.register_step("Source", 1); // offset 0, slot 0
+        let fan3 = g.register_step("Fan3", 3); // offset 1, slots 1..4
+        let fan2 = g.register_step("Fan2", 2); // offset 4, slots 4..6
+        let s0 = g.register_step("S0", 0);
+        let s1 = g.register_step("S1", 0);
+        let s2 = g.register_step("S2", 0);
+        let s3 = g.register_step("S3", 0);
+
+        g.wire(src, BranchIdx(0), fan3);
+        g.wire(fan3, BranchIdx(0), s0);
+        g.wire(fan3, BranchIdx(1), fan2);
+        g.wire(fan3, BranchIdx(2), s1);
+        g.wire(fan2, BranchIdx(0), s2);
+        g.wire(fan2, BranchIdx(1), s3);
+
+        assert!(g.first_unwired().is_none());
+        assert_eq!(g.consumer(src, BranchIdx(0)), Some(fan3));
+        assert_eq!(g.consumer(fan3, BranchIdx(0)), Some(s0));
+        assert_eq!(g.consumer(fan3, BranchIdx(1)), Some(fan2));
+        assert_eq!(g.consumer(fan3, BranchIdx(2)), Some(s1));
+        assert_eq!(g.consumer(fan2, BranchIdx(0)), Some(s2));
+        assert_eq!(g.consumer(fan2, BranchIdx(1)), Some(s3));
     }
 
     #[test]

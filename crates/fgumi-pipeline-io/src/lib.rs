@@ -1,5 +1,19 @@
 #![deny(unsafe_code)]
 
+//! BAM-pipeline I/O layer for the fgumi typed-step pipeline.
+//!
+//! Provides the source, sink, and sort typed-step building blocks plus the
+//! record-batch and BGZF-block buffer types shared across the fgumi pipeline:
+//!
+//!   * [`source`] — BAM ingest steps ([`ReadBgzfBlocks`] and the
+//!     `read_bam*` helpers) that turn a reader into decompressed blocks.
+//!   * [`sink`] — BAM output steps ([`WriteBgzfFile`]).
+//!   * [`sort`] — in-pipeline sort steps ([`SortAndSpill`], [`SortMerge`],
+//!     [`SortBamFile`], [`SortSpillDecompress`]).
+//!   * [`types`] — the record-batch / decompressed-block buffers
+//!     ([`RecordBatch`], [`DecompressedBlock`], [`BgzfBlock`], …) exchanged
+//!     between steps.
+
 pub mod sink;
 pub mod sort;
 pub mod source;

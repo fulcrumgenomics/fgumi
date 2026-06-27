@@ -169,15 +169,29 @@ pub(crate) fn parse_record_ranges(bytes: &[u8]) -> io::Result<Vec<(u32, u32)>> {
 }
 
 /// Walk record-aligned bytes and produce `Vec<RawRecord>` (one heap
-/// allocation per record). Convenience wrapper for test paths and the
-/// `SerializeBamRecords` round-trip; the production
-/// `ParseBamRecords` step uses [`parse_record_ranges`] for the
-/// zero-alloc path.
+/// allocation per record, via `to_vec()`).
+///
+/// Used by:
+/// - the `SerializeBamRecords` round-trip and test paths;
+/// - the production [`DecodeRecords`](super::decode::DecodeRecords) step, whose
+///   downstream `DecodedRecord::from_raw_bytes` takes an **owned** `RawRecord`
+///   (it stores the bytes, unlike `ParseBamRecords` which only emits ranges into
+///   the shared block) — so the production decode path does allocate one `Vec`
+///   per record here. This is inherent to the owned-per-record `DecodedRecord`
+///   representation; sharing the block buffer across a batch's records (e.g.
+///   `Arc<[u8]>` + per-record range) is a `DecodedRecord` representation change
+///   deferred behind a benchmark.
+///
+/// The other production parser, the `ParseBamRecords` step, instead uses
+/// [`parse_record_ranges`] for its zero-alloc path.
 ///
 /// # Errors
 ///
-/// Returns `Err` if a record runs past the buffer end or
-/// `block_size` is too small for a valid BAM record.
+/// Returns `Err` if a record runs past the buffer end, or if the buffer ends
+/// with a trailing partial record (the final `block_size` does not consume the
+/// remaining bytes exactly). It does NOT enforce a per-record minimum body
+/// size, so a `block_size` below the BAM fixed-field minimum is accepted here
+/// and rejected (if at all) by later decode of the record body.
 pub(crate) fn parse_records(bytes: &[u8]) -> io::Result<Vec<RawRecord>> {
     let mut records = Vec::new();
     let mut cursor = 0;

@@ -286,7 +286,7 @@ fn run_duplex_consensus_batch(
         batch_stats.merge(&state.caller.statistics());
         if track_rejects {
             for raw in &state.caller.take_rejected_reads() {
-                super::append_framed_bytes(&mut rejects_bytes, raw);
+                super::append_framed_bytes(&mut rejects_bytes, raw)?;
             }
         }
     }

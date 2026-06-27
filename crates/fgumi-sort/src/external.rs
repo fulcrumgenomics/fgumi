@@ -482,12 +482,15 @@ impl<K: RawSortKey> GenericKeyedChunkWriter<K> {
     ///
     /// Returns an error if writing to the underlying writer fails.
     #[inline]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn write_record(&mut self, key: &K, record: &[u8]) -> Result<()> {
         if !K::EMBEDDED_IN_RECORD {
             key.write_to(&mut self.writer)?;
         }
-        self.writer.write_all(&(record.len() as u32).to_le_bytes())?;
+        // The merge reader reads this 4-byte length prefix back; a checked cast
+        // fails loud before a truncated prefix could desync the spill stream.
+        let record_len = u32::try_from(record.len())
+            .map_err(|_| anyhow::anyhow!("BAM record too large ({} bytes)", record.len()))?;
+        self.writer.write_all(&record_len.to_le_bytes())?;
         self.writer.write_all(record)?;
         Ok(())
     }

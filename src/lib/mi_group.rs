@@ -107,7 +107,7 @@ type MiTransformFn = Box<dyn Fn(&[u8]) -> String + Send + Sync>;
 
 /// Borrowed MI tag transformation, shared by `MiGrouper` and `MiGroupIterator`
 /// (whose stored transforms differ only in `Send + Sync` bounds).
-type MiTransform<'a> = Option<&'a dyn Fn(&[u8]) -> String>;
+pub(crate) type MiTransform<'a> = Option<&'a dyn Fn(&[u8]) -> String>;
 
 /// Type alias for raw-byte record filter function.
 type RecordFilterFn = Box<dyn Fn(&[u8]) -> bool + Send + Sync>;
@@ -118,7 +118,7 @@ type RecordFilterFn = Box<dyn Fn(&[u8]) -> bool + Send + Sync>;
 /// group by byte-equality of its tag value(s) rather than by building an
 /// owned `String` per record. The display label handed to `MiGroup` / the
 /// iterator output is materialized from these bytes only once per group.
-struct MiKey {
+pub(crate) struct MiKey {
     /// MI tag bytes, already transformed if a transform is configured.
     mi: Vec<u8>,
     /// Cell tag bytes, present (`Some`) only when cell-barcode grouping is
@@ -128,25 +128,43 @@ struct MiKey {
 }
 
 impl MiKey {
+    /// Locate the MI (and, when cell grouping is enabled, the cell) tag value(s)
+    /// for a record. When a cell tag is configured both are found in a **single**
+    /// aux-data walk; otherwise only the MI tag is looked up. Returns `None` when
+    /// the record has no MI tag (the record is then skipped). The boolean tracks
+    /// whether cell grouping is enabled so callers can distinguish a configured
+    /// cell tag that is absent on the record (`Some(b"")`) from no cell tag at all.
+    #[inline]
+    fn locate_values(
+        bam: &[u8],
+        tag: [u8; 2],
+        cell_tag: Option<[u8; 2]>,
+    ) -> Option<(&[u8], Option<&[u8]>)> {
+        match cell_tag {
+            Some(ct) => {
+                // Single aux-block walk for both the MI and the cell tag.
+                let (mi, cell) = fgumi_raw_bam::find_two_string_tags_in_record(bam, tag, ct);
+                Some((mi?, Some(cell.unwrap_or(b""))))
+            }
+            None => Some((fgumi_raw_bam::find_string_tag_in_record(bam, tag)?, None)),
+        }
+    }
+
     /// Extract the grouping key from raw BAM bytes, allocating the owned key
     /// bytes. Used when a new group begins. Returns `None` when the record has
     /// no MI tag (the record is then skipped).
-    fn from_record(
+    pub(crate) fn from_record(
         bam: &[u8],
         tag: [u8; 2],
         cell_tag: Option<[u8; 2]>,
         transform: MiTransform,
     ) -> Option<Self> {
-        let value = fgumi_raw_bam::find_string_tag_in_record(bam, tag)?;
+        let (value, cell_value) = Self::locate_values(bam, tag, cell_tag)?;
         let mi = match transform {
             Some(transform) => transform(value).into_bytes(),
             None => value.to_vec(),
         };
-        let cell = cell_tag.map(|ct| {
-            fgumi_raw_bam::find_string_tag_in_record(bam, ct)
-                .map(<[u8]>::to_vec)
-                .unwrap_or_default()
-        });
+        let cell = cell_value.map(<[u8]>::to_vec);
         Some(Self { mi, cell })
     }
 
@@ -154,22 +172,20 @@ impl MiKey {
     /// `None` when the record has no MI tag (the record is then skipped).
     /// Allocation-free on the no-transform path: the record's tag bytes are
     /// compared against the stored key directly instead of building an owned key.
-    fn matches_record(
+    pub(crate) fn matches_record(
         &self,
         bam: &[u8],
         tag: [u8; 2],
         cell_tag: Option<[u8; 2]>,
         transform: MiTransform,
     ) -> Option<bool> {
-        let value = fgumi_raw_bam::find_string_tag_in_record(bam, tag)?;
+        let (value, cell_value) = Self::locate_values(bam, tag, cell_tag)?;
         let mi_eq = match transform {
             Some(transform) => transform(value).as_bytes() == self.mi.as_slice(),
             None => value == self.mi.as_slice(),
         };
-        let cell_eq = match (cell_tag, &self.cell) {
-            (Some(ct), Some(want)) => {
-                fgumi_raw_bam::find_string_tag_in_record(bam, ct).unwrap_or(b"") == want.as_slice()
-            }
+        let cell_eq = match (cell_value, &self.cell) {
+            (Some(have), Some(want)) => have == want.as_slice(),
             // `cell_tag` is fixed for a grouper's lifetime, so the stored key's
             // cell presence always matches the configuration; the mixed arms are
             // unreachable.
@@ -181,7 +197,7 @@ impl MiKey {
 
     /// Build the display label. With a cell tag this is `"MI\tCELL"`,
     /// matching the legacy composite key; otherwise it is just the MI value.
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         let mi = String::from_utf8_lossy(&self.mi);
         match &self.cell {
             Some(cell) => format!("{mi}\t{}", String::from_utf8_lossy(cell)),

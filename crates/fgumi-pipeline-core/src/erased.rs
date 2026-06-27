@@ -33,6 +33,36 @@ use super::step::{
     Affinity, OutputHandles, OutputsViewAny, Step, StepCtx, StepKind, StepOutcome, StepProfile,
 };
 
+/// The branch orderings the framework actually *builds* for a single-input
+/// producer of the given [`StepKind`], given its declared profile orderings.
+///
+/// `Serial` / `Exclusive` producers emit items in arrival order by construction
+/// (the framework's mutex serializes pushes; an Exclusive-owned step has a
+/// single dispatcher), so inserting a `ReorderStage` on their output edges is
+/// pure overhead. The framework collapses any declared
+/// `ByOrdinal` / `ByItemOrdinal` to [`BranchOrdering::None`] for those kinds —
+/// `build_queues` then constructs the direct transport with no reorder stage.
+/// `Parallel` producers keep their declared orderings verbatim.
+///
+/// This is the single source of truth for the collapse rule, shared by
+/// [`TypedStep::build_output_set`] (which constructs the transport) and
+/// `Pipeline::dag` (which must render the *effective* — post-collapse —
+/// ordering so the diagnostic matches the transport actually built). Note
+/// `Step2` producers (`TypedStep2`) do **not** collapse, so this helper is only
+/// for single-input steps.
+#[must_use]
+pub(crate) fn effective_branch_orderings(
+    kind: StepKind,
+    declared: &[BranchOrdering],
+) -> Vec<BranchOrdering> {
+    match kind {
+        StepKind::Parallel => declared.to_vec(),
+        StepKind::Serial | StepKind::Exclusive => {
+            declared.iter().map(|_| BranchOrdering::None).collect()
+        }
+    }
+}
+
 /// Type-erased step interface used by the worker loop.
 pub trait ErasedStep: Send + 'static {
     fn profile(&self) -> StepProfile;
@@ -45,6 +75,20 @@ pub trait ErasedStep: Send + 'static {
     /// the optimizer cannot elide them). Adapters cache the name at
     /// construction and return it here for free.
     fn name(&self) -> &'static str;
+
+    /// The step's [`StepKind`], returned WITHOUT building a `StepProfile`.
+    ///
+    /// The setup passes (`pool::assign_exclusive_owners`,
+    /// `pool::assign_sticky_owners`, `storage::build_worker_storage`) read the
+    /// kind per step; going through `profile()` there heap-allocates the
+    /// profile's two `Vec`s per read (a virtual call, so the optimizer cannot
+    /// elide them). Adapters cache the kind at construction and return it free.
+    fn kind(&self) -> StepKind;
+
+    /// Whether the step is `sticky`, returned WITHOUT building a `StepProfile`.
+    /// Same rationale as [`Self::kind`]: the sticky-owner assignment passes read
+    /// it per step. Adapters cache it at construction.
+    fn sticky(&self) -> bool;
 
     /// Forward `Step::affinity` for worker-eligibility gating. Only
     /// consulted for `Serial` steps; the runtime calls this once during
@@ -193,6 +237,11 @@ pub struct TypedStep<S: Step> {
     /// construction so `ErasedStep::name()` (read per dispatch) never
     /// rebuilds the profile's `Vec`s. See the `ErasedStep::name` doc.
     name: &'static str,
+    /// `StepKind`, cached at construction so the setup passes read it without
+    /// rebuilding the profile's `Vec`s. See the `ErasedStep::kind` doc.
+    kind: StepKind,
+    /// `sticky` flag, cached at construction for the same reason as `kind`.
+    sticky: bool,
     /// Cached downcast of `ctx.input` after the first dispatch.
     /// `'static` is a lie — the actual lifetime is bounded by
     /// `ChainContexts` — enforced via the `// SAFETY:` comment below.
@@ -204,8 +253,19 @@ pub struct TypedStep<S: Step> {
 
 impl<S: Step> TypedStep<S> {
     pub fn new(step: S) -> Self {
-        let name = step.profile().name;
-        Self { inner: step, name, cached_input: None, cached_outputs: None, _phantom: PhantomData }
+        let profile = step.profile();
+        let name = profile.name;
+        let kind = profile.kind;
+        let sticky = profile.sticky;
+        Self {
+            inner: step,
+            name,
+            kind,
+            sticky,
+            cached_input: None,
+            cached_outputs: None,
+            _phantom: PhantomData,
+        }
     }
 
     /// Resolve the typed input handle from the dispatch context, caching
@@ -292,6 +352,14 @@ where
         self.name
     }
 
+    fn kind(&self) -> StepKind {
+        self.kind
+    }
+
+    fn sticky(&self) -> bool {
+        self.sticky
+    }
+
     fn affinity(&self) -> Affinity {
         self.inner.affinity()
     }
@@ -339,12 +407,8 @@ where
         // documents what the consumer needs); the framework is just
         // smart enough to skip the wrap when the producer can already
         // satisfy that need.
-        let effective_orderings: Vec<BranchOrdering> = match profile.kind {
-            StepKind::Parallel => profile.branch_ordering.clone(),
-            StepKind::Serial | StepKind::Exclusive => {
-                profile.branch_ordering.iter().map(|_| BranchOrdering::None).collect()
-            }
-        };
+        let effective_orderings =
+            effective_branch_orderings(profile.kind, &profile.branch_ordering);
         <S::Outputs as StepOutputs>::build_queues(&profile.output_queues, &effective_orderings)
     }
 
@@ -407,6 +471,10 @@ pub struct TypedStep2<S: Step2> {
     inner: S,
     /// Static step name, cached at construction. See `ErasedStep::name`.
     name: &'static str,
+    /// `StepKind`, cached at construction. See `ErasedStep::kind`.
+    kind: StepKind,
+    /// `sticky` flag, cached at construction. See `ErasedStep::sticky`.
+    sticky: bool,
     cached_inputs: Option<&'static TwoInputHandles<S::InputA, S::InputB>>,
     cached_outputs: Option<&'static OutputHandles<S::Outputs>>,
     _phantom: PhantomData<fn() -> S>,
@@ -414,8 +482,19 @@ pub struct TypedStep2<S: Step2> {
 
 impl<S: Step2> TypedStep2<S> {
     pub fn new(step: S) -> Self {
-        let name = step.profile().name;
-        Self { inner: step, name, cached_inputs: None, cached_outputs: None, _phantom: PhantomData }
+        let profile = step.profile();
+        let name = profile.name;
+        let kind = profile.kind;
+        let sticky = profile.sticky;
+        Self {
+            inner: step,
+            name,
+            kind,
+            sticky,
+            cached_inputs: None,
+            cached_outputs: None,
+            _phantom: PhantomData,
+        }
     }
 
     #[allow(unsafe_code)]
@@ -486,6 +565,14 @@ impl<S: Step2> ErasedStep for TypedStep2<S> {
 
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    fn kind(&self) -> StepKind {
+        self.kind
+    }
+
+    fn sticky(&self) -> bool {
+        self.sticky
     }
 
     fn affinity(&self) -> Affinity {
@@ -624,13 +711,15 @@ impl<S: Step2> ErasedStep for TypedStep2<S> {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use crate::handles::BranchInputHandle;
     use crate::outputs::Single;
     use crate::queues::QueueSpec;
     use crate::reorder::BranchOrdering;
     use crate::step::{
-        InputHandle, OutputHandles, Step, StepCtx, StepKind, StepOutcome, StepProfile,
+        InputHandle, OutputHandles, Step, StepCtx, StepCtx2, StepKind, StepOutcome, StepProfile,
     };
 
     /// Trivial step: u32 → u32+1 (single output).
@@ -673,6 +762,98 @@ mod tests {
         let (queue_set, outputs_view) = producer.build_output_set();
         let outputs: OutputHandles<Single<u32>> = OutputHandles::new(outputs_view);
         (queue_set, outputs)
+    }
+
+    #[rstest]
+    #[case(StepKind::Serial, false)]
+    #[case(StepKind::Serial, true)]
+    #[case(StepKind::Parallel, false)]
+    #[case(StepKind::Parallel, true)]
+    #[case(StepKind::Exclusive, false)]
+    #[case(StepKind::Exclusive, true)]
+    fn cached_kind_and_sticky_match_profile(#[case] kind: StepKind, #[case] sticky: bool) {
+        // The `kind()` / `sticky()` accessors return values cached at
+        // construction (so the setup passes don't rebuild the profile's `Vec`s).
+        // They must agree with `profile()` for every kind/sticky combination,
+        // or a stale cache could mis-route worker assignment. Each combination is
+        // an independent `#[case]` so a failure isolates the offending pair.
+        #[derive(Clone)]
+        struct Tagged(StepKind, bool);
+        impl Step for Tagged {
+            type Input = u32;
+            type Outputs = Single<u32>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "Tagged",
+                    kind: self.0,
+                    sticky: self.1,
+                    output_queues: vec![QueueSpec::CountBounded { capacity: 4 }],
+                    branch_ordering: vec![BranchOrdering::None],
+                }
+            }
+            fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+                Ok(StepOutcome::NoProgress)
+            }
+            fn new_worker_copy(&self) -> Self {
+                self.clone()
+            }
+        }
+
+        let erased: Box<dyn ErasedStep> = Box::new(TypedStep::new(Tagged(kind, sticky)));
+        let profile = erased.profile();
+        assert_eq!(erased.kind(), profile.kind, "kind() must match profile for {kind:?}");
+        assert_eq!(
+            erased.sticky(),
+            profile.sticky,
+            "sticky() must match profile for {kind:?}/{sticky}"
+        );
+    }
+
+    #[rstest]
+    #[case(StepKind::Serial, false)]
+    #[case(StepKind::Serial, true)]
+    #[case(StepKind::Parallel, false)]
+    #[case(StepKind::Parallel, true)]
+    #[case(StepKind::Exclusive, false)]
+    #[case(StepKind::Exclusive, true)]
+    fn cached_kind_and_sticky_match_profile_step2(#[case] kind: StepKind, #[case] sticky: bool) {
+        // Mirror `cached_kind_and_sticky_match_profile` for the `Step2` adapter.
+        // `TypedStep2::{new, kind, sticky}` caches the same metadata at
+        // construction, and runtime setup reads `ErasedStep::kind()`/`sticky()`
+        // for ALL erased steps — `Step` and `Step2` alike (e.g. zipper's merge
+        // step). A stale `TypedStep2` cache could mis-route owner assignment for
+        // a merge step just as a `TypedStep` cache could, so pin both paths.
+        #[derive(Clone)]
+        struct Tagged2(StepKind, bool);
+        impl Step2 for Tagged2 {
+            type InputA = u32;
+            type InputB = u32;
+            type Outputs = Single<u32>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "Tagged2",
+                    kind: self.0,
+                    sticky: self.1,
+                    output_queues: vec![QueueSpec::CountBounded { capacity: 4 }],
+                    branch_ordering: vec![BranchOrdering::None],
+                }
+            }
+            fn try_run(&mut self, _ctx: &mut StepCtx2<'_, Self>) -> io::Result<StepOutcome> {
+                Ok(StepOutcome::NoProgress)
+            }
+            fn new_worker_copy(&self) -> Self {
+                self.clone()
+            }
+        }
+
+        let erased: Box<dyn ErasedStep> = Box::new(TypedStep2::new(Tagged2(kind, sticky)));
+        let profile = erased.profile();
+        assert_eq!(erased.kind(), profile.kind, "kind() must match profile for {kind:?}");
+        assert_eq!(
+            erased.sticky(),
+            profile.sticky,
+            "sticky() must match profile for {kind:?}/{sticky}"
+        );
     }
 
     #[test]
