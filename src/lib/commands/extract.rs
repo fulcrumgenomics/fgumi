@@ -380,8 +380,8 @@ impl QualityEncoding {
 /// [Read Structure Wiki Page](https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures)
 ///
 /// UMIs may be extracted from the read sequences, the read names, or both.  If `--extract-umis-from-read-names` is
-/// specified, any UMIs present in the read names are extracted; read names are expected to be `:`-separated with
-/// any UMIs present in the 8th field.  If this option is specified, `--store-umi-quals` may not be used as
+/// specified, any UMIs present in the read names are extracted; read names are expected to be `:`-separated and
+/// the UMI is taken from the **last** field, when the name has at least 8 fields.  If this option is specified, `--store-umi-quals` may not be used as
 /// qualities are not available for UMIs in the read name. If UMI segments are present in the read structures those
 /// will also be extracted.  If UMIs are present in both, the final UMIs are constructed by first taking the UMIs
 /// from the read names, then adding a hyphen, then the UMIs extracted from the reads.

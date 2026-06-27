@@ -1691,8 +1691,14 @@ impl Drop for AlignAndMergeStep {
         drop(self.out_rx.take());
 
         if let Some(mut aligner) = self.aligner.take() {
-            aligner.kill();
-            let _ = aligner.wait();
+            // Bounded teardown: only issue the unbounded `wait()` once the child
+            // has actually been reaped. If `kill()` timed out (stuck child, e.g.
+            // uninterruptible I/O), calling `wait()` would block teardown
+            // forever — defeating the 1s kill deadline. In that case we skip
+            // `wait()` and let `AlignerProcess::Drop` (itself bounded) clean up.
+            if aligner.kill() {
+                let _ = aligner.wait();
+            }
         }
 
         if let Some(h) = self.writer_thread.take() {

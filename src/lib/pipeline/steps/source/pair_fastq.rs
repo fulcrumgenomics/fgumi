@@ -129,14 +129,26 @@ impl PairRawFastq {
     }
 
     /// Buffer a chunk from stream A (slot 0) or stream B (slot 1).
+    ///
+    /// Each reader mints exactly one chunk per `(chunk_serial, stream)`, so a
+    /// target slot is always `None` here. The byte accounting (X5-004) depends
+    /// on that invariant: it adds `chunk.data.len()` to `pending_total_bytes`,
+    /// which feeds the catastrophic-desync guard and the backpressure decision.
+    /// A *hard* `assert!` enforces single-chunk-per-serial in release builds
+    /// too: overwriting an already-filled slot would silently change emitted
+    /// read identity (and drift the byte total), so a retry/replay/re-chunk
+    /// regression must fail fast rather than corrupt output.
     fn buffer_chunk(&mut self, chunk: FastqRawChunk, is_a: bool) {
         self.pending_total_bytes += chunk.data.len();
         let entry = self.pending.entry(chunk.chunk_serial).or_insert((None, None));
-        if is_a {
-            entry.0 = Some(chunk);
-        } else {
-            entry.1 = Some(chunk);
-        }
+        let slot = if is_a { &mut entry.0 } else { &mut entry.1 };
+        assert!(
+            slot.is_none(),
+            "duplicate chunk for serial {} stream {}: single-chunk-per-serial invariant violated",
+            chunk.chunk_serial,
+            if is_a { "A" } else { "B" },
+        );
+        *slot = Some(chunk);
     }
 
     /// If the lowest pending `chunk_serial` has both stream slots filled, remove
@@ -404,6 +416,19 @@ mod tests {
         // serialize the consumer.
         assert_eq!(p.branch_ordering, vec![BranchOrdering::None]);
         assert!(matches!(p.output_queues[0], QueueSpec::ByteBounded { .. }));
+    }
+
+    /// X5-004: a duplicate chunk for an already-filled `(chunk_serial, stream)`
+    /// slot violates the single-chunk-per-serial invariant the byte accounting
+    /// depends on. The hard `assert!` in `buffer_chunk` must catch it in all
+    /// builds rather than letting `pending_total_bytes` silently drift.
+    #[test]
+    #[should_panic(expected = "single-chunk-per-serial invariant violated")]
+    fn buffer_chunk_rejects_duplicate_slot() {
+        let mut step = PairRawFastq::new(64 * 1024);
+        step.buffer_chunk(chunk(0, 0, b"raw_a0"), true);
+        // Second chunk for the same (serial 0, stream A) slot — must trip the guard.
+        step.buffer_chunk(chunk(0, 0, b"raw_a0_again"), true);
     }
 
     /// Buffering a-then-b for a serial completes the pair; out-of-order serial

@@ -152,7 +152,6 @@ pub struct CodecOptions {
     pub min_duplex_length: usize,
 
     /// Reduce single-strand region quality to this value (0-93).
-    /// Note: This uses a different short flag than duplex's -q for min-base-quality.
     #[arg(long = "single-strand-qual")]
     pub single_strand_qual: Option<u8>,
 
@@ -233,13 +232,88 @@ impl CodecOptions {
             min_consensus_base_quality: self.min_consensus_base_quality,
         }
     }
+
+    /// Validate the numeric/semantic codec parameters (everything except I/O
+    /// path existence). Shared by the standalone `Codec::validate` and the
+    /// `runall` `Stage::Codec` arm so both reject degenerate configs
+    /// identically (S5c2-001).
+    pub(crate) fn validate(&self) -> Result<()> {
+        // Validate error rates.
+        if self.error_rate_pre_umi == 0 {
+            bail!("error-rate-pre-umi must be > 0");
+        }
+        if self.error_rate_post_umi == 0 {
+            bail!("error-rate-post-umi must be > 0");
+        }
+
+        // Validate optional quality ceilings (0-93 Phred range).
+        const MAX_PHRED: u8 = 93;
+        if let Some(qual) = self.single_strand_qual {
+            if qual > MAX_PHRED {
+                bail!("single-strand-qual ({qual}) exceeds maximum Phred score ({MAX_PHRED})");
+            }
+        }
+        if let Some(qual) = self.outer_bases_qual {
+            if qual > MAX_PHRED {
+                bail!("outer-bases-qual ({qual}) exceeds maximum Phred score ({MAX_PHRED})");
+            }
+        }
+
+        // Validate min/max reads.
+        if self.min_reads == 0 {
+            bail!("min-reads must be >= 1");
+        }
+        if let Some(max) = self.max_reads {
+            if max < self.min_reads {
+                bail!("max-reads ({}) must be >= min-reads ({})", max, self.min_reads);
+            }
+        }
+
+        // Validate duplex length.
+        if self.min_duplex_length == 0 {
+            bail!("min-duplex-length must be >= 1");
+        }
+
+        // Validate disagreement rate. Use a range `contains` check rather than
+        // two `<`/`>` comparisons so `NaN` is rejected too: `NaN < 0.0` and
+        // `NaN > 1.0` are both false (a comparison pair would let `NaN`
+        // through), but `NaN` is in no range so `!contains` rejects it.
+        if !(0.0..=1.0).contains(&self.max_duplex_disagreement_rate) {
+            bail!(
+                "max-duplex-disagreement-rate must be between 0.0 and 1.0 (got {})",
+                self.max_duplex_disagreement_rate
+            );
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Parser, Debug)]
 #[command(
     name = "codec",
     about = "\x1b[38;5;180m[CONSENSUS]\x1b[0m      \x1b[36mCall CODEC consensus reads from grouped BAM\x1b[0m",
-    long_about = None
+    long_about = "\
+Calls CODEC duplex consensus reads from a grouped, MI-tagged BAM.
+
+CODEC libraries read both strands of a duplex molecule within a single read pair \
+(R1 covers one strand, R2 the other), so the two strands are paired by position \
+within each MI group rather than by the `/A` `/B` strand suffix used by the \
+standard duplex caller. The two single-strand consensuses are then reconciled \
+into one duplex consensus per molecule.
+
+Quality-reduction and duplex-disagreement knobs:
+
+* `--single-strand-qual` caps the reported quality of bases supported by only one \
+  strand (single-strand regions), since those bases lack duplex confirmation.
+* `--outer-bases-qual` / `--outer-bases-length` cap the quality of the outermost \
+  N bases of each read, which are more error-prone (adapter/ligation artifacts).
+* `--min-duplex-length` sets the minimum overlap (in bases) required for a region \
+  to be called as duplex.
+* `--max-duplex-disagreements` / `--max-duplex-disagreement-rate` bound how much \
+  the two strands may disagree before the molecule is rejected.
+
+Reads that fail these thresholds can be captured with `--rejects`."
 )]
 pub struct Codec {
     /// Input/output BAM options
@@ -500,48 +574,8 @@ impl Codec {
         // matching the sibling consensus commands (e.g. `Simplex`).
         self.io.validate()?;
 
-        // Validate error rates
-        if self.options.error_rate_pre_umi == 0 {
-            bail!("error-rate-pre-umi must be > 0");
-        }
-        if self.options.error_rate_post_umi == 0 {
-            bail!("error-rate-post-umi must be > 0");
-        }
-
-        // Validate optional quality ceilings (0-93 Phred range).
-        const MAX_PHRED: u8 = 93;
-        if let Some(qual) = self.options.single_strand_qual {
-            if qual > MAX_PHRED {
-                bail!("single-strand-qual ({qual}) exceeds maximum Phred score ({MAX_PHRED})");
-            }
-        }
-        if let Some(qual) = self.options.outer_bases_qual {
-            if qual > MAX_PHRED {
-                bail!("outer-bases-qual ({qual}) exceeds maximum Phred score ({MAX_PHRED})");
-            }
-        }
-
-        // Validate min/max reads
-        if self.options.min_reads == 0 {
-            bail!("min-reads must be >= 1");
-        }
-        if let Some(max) = self.options.max_reads {
-            if max < self.options.min_reads {
-                bail!("max-reads ({}) must be >= min-reads ({})", max, self.options.min_reads);
-            }
-        }
-
-        // Validate duplex length
-        if self.options.min_duplex_length == 0 {
-            bail!("min-duplex-length must be >= 1");
-        }
-
-        // Validate disagreement rate
-        if self.options.max_duplex_disagreement_rate < 0.0
-            || self.options.max_duplex_disagreement_rate > 1.0
-        {
-            bail!("max-duplex-disagreement-rate must be between 0.0 and 1.0");
-        }
+        // Numeric/semantic checks shared with the runall Stage::Codec arm.
+        self.options.validate()?;
 
         Ok(())
     }
@@ -1100,5 +1134,39 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    // ── S5c2-001: numeric validation shared by standalone codec and runall ──
+
+    #[test]
+    fn codec_options_validate_accepts_defaults() {
+        // The Default config (min_reads = 1, valid error rates, etc.) is valid.
+        CodecOptions::default().validate().expect("default CodecOptions should validate");
+    }
+
+    #[rstest]
+    #[case::min_reads_zero(CodecOptions { min_reads: 0, ..Default::default() })]
+    #[case::max_lt_min(CodecOptions { min_reads: 3, max_reads: Some(2), ..Default::default() })]
+    #[case::error_pre_zero(CodecOptions { error_rate_pre_umi: 0, ..Default::default() })]
+    #[case::error_post_zero(CodecOptions { error_rate_post_umi: 0, ..Default::default() })]
+    #[case::ss_qual_too_high(CodecOptions { single_strand_qual: Some(94), ..Default::default() })]
+    #[case::outer_qual_too_high(CodecOptions { outer_bases_qual: Some(94), ..Default::default() })]
+    #[case::min_duplex_zero(CodecOptions { min_duplex_length: 0, ..Default::default() })]
+    #[case::disagreement_rate_high(
+        CodecOptions { max_duplex_disagreement_rate: 1.5, ..Default::default() }
+    )]
+    #[case::disagreement_rate_negative(
+        CodecOptions { max_duplex_disagreement_rate: -0.1, ..Default::default() }
+    )]
+    // Regression: `NaN < 0.0` and `NaN > 1.0` are both false, so a comparison
+    // pair would let `NaN` through; the range `contains` check rejects it.
+    #[case::disagreement_rate_nan(
+        CodecOptions { max_duplex_disagreement_rate: f64::NAN, ..Default::default() }
+    )]
+    fn codec_options_validate_rejects_degenerate(#[case] options: CodecOptions) {
+        assert!(
+            options.validate().is_err(),
+            "expected degenerate CodecOptions to be rejected: {options:?}"
+        );
     }
 }

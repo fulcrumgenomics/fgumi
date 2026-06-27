@@ -232,7 +232,7 @@ fn test_zipper_missing_input() {
     let missing_mapped = temp_dir.path().join("missing.mapped.sam");
     let missing_unmapped = temp_dir.path().join("missing.unmapped.bam");
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
         .args([
             "zipper",
             "--input",
@@ -244,10 +244,65 @@ fn test_zipper_missing_input() {
             "--output",
             output_bam.to_str().unwrap(),
         ])
-        .status()
+        .output()
         .expect("Failed to run zipper command");
 
-    assert!(!status.success(), "Zipper should fail for nonexistent input");
+    assert!(!output.status.success(), "Zipper should fail for nonexistent input");
+    // S5c2-004: the failure should be a clear up-front existence error, not a
+    // lower-level open error from inside the chain builder.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Mapped BAM (--input)") || stderr.contains("Unmapped BAM (--unmapped)"),
+        "expected a clear file-not-found error; got: {stderr}"
+    );
+}
+
+/// S5c2-004: a missing `--unmapped` (with a valid mapped input and reference)
+/// is rejected up front with a clear message.
+#[test]
+fn test_zipper_missing_unmapped_only() {
+    let temp_dir = TempDir::new().unwrap();
+    let output_bam = temp_dir.path().join("output.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+
+    // Valid mapped SAM, but the unmapped BAM does not exist.
+    let mapped_sam = temp_dir.path().join("mapped.sam");
+    let mapped_header = create_minimal_header("chr1", 10000);
+    let mapped_records = vec![{
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]);
+        b.build()
+    }];
+    create_mapped_sam(&mapped_sam, &mapped_header, &mapped_records);
+    let missing_unmapped = temp_dir.path().join("missing.unmapped.bam");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "zipper",
+            "--input",
+            mapped_sam.to_str().unwrap(),
+            "--unmapped",
+            missing_unmapped.to_str().unwrap(),
+            "--reference",
+            ref_path.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run zipper command");
+
+    assert!(!output.status.success(), "Zipper should fail for a missing --unmapped");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Unmapped BAM (--unmapped)"),
+        "expected a clear unmapped-not-found error; got: {stderr}"
+    );
 }
 
 /// Test zipper accepts BAM as mapped input (--input).

@@ -197,17 +197,45 @@ impl AlignerProcess {
     ///
     /// Sends SIGKILL immediately (`Child::kill()` always sends SIGKILL
     /// on Unix). Waits up to 1 second for the process to exit.
-    pub fn kill(&mut self) {
+    ///
+    /// Returns `true` if the child was reaped within the 1s deadline (or was
+    /// already gone), and `false` if it was still running when the deadline
+    /// expired (i.e. stuck, e.g. in uninterruptible I/O). Callers MUST honor a
+    /// `false` return by NOT issuing a subsequent unbounded [`wait`](Self::wait)
+    /// on the child, which would re-introduce the very teardown hang this
+    /// bounded kill exists to prevent.
+    pub fn kill(&mut self) -> bool {
+        let pid = self.child.id();
         let _ = self.child.kill();
 
         // Wait for the process to actually exit so its resources are cleaned up.
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while let Ok(None) = self.child.try_wait() {
-            if std::time::Instant::now() >= deadline {
-                break;
+        let mut reaped = false;
+        loop {
+            match self.child.try_wait() {
+                // Child exited (we reaped it), or `try_wait` errored (e.g. ECHILD
+                // because the child was already reaped elsewhere). Either way the
+                // child is gone, not leaked — mark reaped so the warning below
+                // doesn't fire spuriously, then stop polling.
+                Ok(Some(_)) | Err(_) => {
+                    reaped = true;
+                    break;
+                }
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
             }
-            thread::sleep(Duration::from_millis(50));
         }
+        if !reaped {
+            log::warn!(
+                "aligner process (pid {pid}) did not exit within 1s of SIGKILL; it may be \
+                 stuck (e.g. uninterruptible I/O) and left unreaped"
+            );
+        }
+        reaped
     }
 
     /// Return the process ID of the aligner child process.
@@ -684,10 +712,13 @@ fn append_extension(path: &Path, suffix: &str) -> PathBuf {
 /// — the argv it builds is interpolated into `/bin/bash -c "..."` so
 /// any whitespace, quote, or metacharacter would break word-splitting.
 ///
-/// The check is conservative: we allow only `[A-Za-z0-9_./-]` plus
-/// non-ASCII (UTF-8 bytes that aren't whitespace or metas). Users with
-/// paths outside this set can switch to `--aligner::command "..."`
-/// (free-form mode), where they own the quoting.
+/// The check is conservative: we allow only `[A-Za-z0-9_./:-]` plus
+/// non-ASCII (UTF-8 bytes that aren't whitespace or metas). `:` is
+/// permitted because it is not a shell metacharacter in argument position
+/// (it only matters to bash inside parameter expansions / as the `PATH`
+/// separator, neither of which applies to an interpolated argv word).
+/// Users with paths outside this set can switch to `--aligner::command
+/// "..."` (free-form mode), where they own the quoting.
 ///
 /// `flag_label` is interpolated into the error message so the user
 /// sees which flag they need to clean up.
@@ -775,6 +806,20 @@ mod tests {
         assert_eq!(output.trim(), "hello pipe");
 
         proc.wait().expect("process should exit successfully");
+    }
+
+    /// `kill()` reports `true` when the child is reaped within the deadline.
+    /// A plain `sleep` responds to SIGKILL immediately, so the bounded kill
+    /// reaps it well inside the 1s window — and a `true` return is what lets
+    /// `AlignAndMergeStep::Drop` safely issue its follow-up `wait()` without
+    /// risking a teardown hang.
+    #[test]
+    fn test_kill_reports_reaped_for_killable_child() {
+        let mut proc = AlignerProcess::spawn("sleep 30", 10).expect("spawn should succeed");
+        assert!(proc.kill(), "a killable child must be reaped within the deadline");
+        // A second kill on an already-gone child still reports reaped, never
+        // a spurious timeout.
+        assert!(proc.kill(), "killing an already-reaped child must still report reaped");
     }
 
     /// `bwa mem` command string with default-PATH binary.

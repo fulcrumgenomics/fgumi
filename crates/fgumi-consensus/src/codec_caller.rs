@@ -93,7 +93,50 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use std::cmp::{max, min};
 use std::collections::HashMap;
+use std::sync::Once;
 use thiserror::Error;
+
+/// One-shot guard so a depth/error saturation warning is logged at most once per
+/// process, regardless of how many positions or molecules trigger it (avoids log
+/// spam on adversarial/corrupt input that could collapse a huge read set into one
+/// MI group).
+static DEPTH_SATURATION_WARNED: Once = Once::new();
+
+/// Emit the (once-per-process) depth/error saturation diagnostic.
+fn warn_depth_saturation_once(kind: &str, value: u32, ceiling: u32) {
+    DEPTH_SATURATION_WARNED.call_once(|| {
+        log::warn!(
+            "CODEC duplex {kind} saturated: a per-position value of {value} exceeded the \
+             representable ceiling of {ceiling} and was clamped. This indicates an \
+             extremely (and likely pathologically) deep single-molecule family; the \
+             affected depth/error tags are clamped and the consensus at those positions is \
+             not meaningful. Further saturation events are not reported."
+        );
+    });
+}
+
+/// Saturate a `u32` per-position depth/error to the `u16` storage ceiling, logging a
+/// diagnostic on the first clamp. Intermediate duplex-merge arithmetic is performed in
+/// `u32` so it cannot overflow; the only lossy step is this single clamp at the storage
+/// boundary, which is reached only at >65535 reads/strand/position.
+fn saturate_u32_to_u16(value: u32) -> u16 {
+    u16::try_from(value).unwrap_or_else(|_| {
+        warn_depth_saturation_once("depth/error", value, u32::from(u16::MAX));
+        u16::MAX
+    })
+}
+
+/// Saturate a `u16` per-base depth/error to the `i16` SAM short-array ceiling, logging a
+/// diagnostic on the first clamp. The per-base `aD`/`bD`/`ae`/`be` arrays serialize as SAM
+/// `s` (signed 16-bit) arrays (matching fgbio's `Short`), so `i16::MAX` is the genuine
+/// representable ceiling. This replaces the previous truncating `d as i16` cast, which
+/// produced silently-negative depths for values in `32768..=65535`.
+fn saturate_u16_to_i16(value: u16) -> i16 {
+    i16::try_from(value).unwrap_or_else(|_| {
+        warn_depth_saturation_once("per-base tag", u32::from(value), i16::MAX as u32);
+        i16::MAX
+    })
+}
 
 /// Typed errors returned by [`CodecConsensusCaller::consensus_reads_typed`].
 ///
@@ -1097,13 +1140,16 @@ impl CodecConsensusCaller {
         for pos_idx in 0..len {
             let ba = ss_a.bases[pos_idx];
             let qa = ss_a.quals[pos_idx];
-            let da = ss_a.depths[pos_idx];
-            let ea = ss_a.errors[pos_idx];
+            // Depth/error sums are computed in u32 so they cannot overflow even when both
+            // strands carry near-`u16::MAX` per-position depths; the result is saturated back
+            // to the `u16` storage ceiling once, at the `depths`/`errors` store below.
+            let da = u32::from(ss_a.depths[pos_idx]);
+            let ea = u32::from(ss_a.errors[pos_idx]);
 
             let bb = ss_b.bases[pos_idx];
             let qb = ss_b.quals[pos_idx];
-            let db = ss_b.depths[pos_idx];
-            let eb = ss_b.errors[pos_idx];
+            let db = u32::from(ss_b.depths[pos_idx]);
+            let eb = u32::from(ss_b.errors[pos_idx]);
 
             // Check if this is a duplex position (both strands have data)
             // Match fgbio's logic: only check if base is N/n (padding), not quality
@@ -1199,8 +1245,9 @@ impl CodecConsensusCaller {
 
             bases[pos_idx] = duplex_base;
             quals[pos_idx] = duplex_qual;
-            depths[pos_idx] = depth;
-            errors[pos_idx] = error;
+            // `depth`/`error` are exact u32 sums; saturate once to the u16 storage ceiling.
+            depths[pos_idx] = saturate_u32_to_u16(depth);
+            errors[pos_idx] = saturate_u32_to_u16(error);
         }
 
         // Check duplex disagreement rate
@@ -1369,15 +1416,18 @@ impl CodecConsensusCaller {
 
         // Per-base tags if enabled
         if self.options.produce_per_base_tags {
-            // Per-base depth arrays - convert to signed integers to match fgbio/simplex/duplex
-            let ad_array: Vec<i16> = ss_a.depths.iter().map(|&d| d as i16).collect();
-            let bd_array: Vec<i16> = ss_b.depths.iter().map(|&d| d as i16).collect();
+            // Per-base depth arrays - convert to signed integers to match fgbio/simplex/duplex.
+            // Saturate to i16::MAX (the SAM `s`-array ceiling) rather than truncating: a raw
+            // `d as i16` produces a silently-negative depth for values in 32768..=65535.
+            let ad_array: Vec<i16> = ss_a.depths.iter().map(|&d| saturate_u16_to_i16(d)).collect();
+            let bd_array: Vec<i16> = ss_b.depths.iter().map(|&d| saturate_u16_to_i16(d)).collect();
             self.bam_builder.append_i16_array_tag(SamTag::AD_BASES, &ad_array);
             self.bam_builder.append_i16_array_tag(SamTag::BD_BASES, &bd_array);
 
-            // Per-base error arrays - convert to signed integers to match fgbio/simplex/duplex
-            let ae_array: Vec<i16> = ss_a.errors.iter().map(|&e| e as i16).collect();
-            let be_array: Vec<i16> = ss_b.errors.iter().map(|&e| e as i16).collect();
+            // Per-base error arrays - convert to signed integers to match fgbio/simplex/duplex.
+            // Same i16 saturation as the depth arrays above.
+            let ae_array: Vec<i16> = ss_a.errors.iter().map(|&e| saturate_u16_to_i16(e)).collect();
+            let be_array: Vec<i16> = ss_b.errors.iter().map(|&e| saturate_u16_to_i16(e)).collect();
             self.bam_builder.append_i16_array_tag(SamTag::AE_BASES, &ae_array);
             self.bam_builder.append_i16_array_tag(SamTag::BE_BASES, &be_array);
 
@@ -4225,5 +4275,80 @@ mod tests {
             "TLEN must match between M and =/X CIGARs with identical reference consumption"
         );
         assert_eq!(match_r1_tlen, 100, "Expected TLEN=100 for start1=1, start2=71, ref_len=30");
+    }
+
+    // ==================== Depth/error saturation (S7-001 / S7-005 / FU-002) ====================
+
+    /// Build a minimal `SingleStrandConsensus` from explicit per-position bases/depths/errors,
+    /// with full-quality (Q40) calls so duplex positions agree. Used to exercise the depth/error
+    /// merge at depths near and beyond `u16::MAX` without materializing tens of thousands of
+    /// reads.
+    fn ss_from(bases: &[u8], depths: &[u16], errors: &[u16]) -> SingleStrandConsensus {
+        let len = bases.len();
+        assert_eq!(depths.len(), len);
+        assert_eq!(errors.len(), len);
+        SingleStrandConsensus {
+            bases: bases.to_vec(),
+            quals: vec![40; len],
+            depths: depths.to_vec(),
+            errors: errors.to_vec(),
+            raw_read_count: 0,
+            ref_start: 1,
+            ref_end: len,
+            is_negative_strand: false,
+        }
+    }
+
+    #[test]
+    fn test_duplex_depth_error_saturate_to_u16_at_high_counts() {
+        let options = CodecConsensusOptions::default();
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        // Three positions, both strands agreeing on 'A':
+        // - pos 0: small counts, must pass through exactly (depth = da+db).
+        // - pos 1: each strand near u16::MAX so the sum overflows u16 -> saturates to u16::MAX.
+        // - pos 2: each strand exactly u16::MAX (sum and errors both overflow) -> saturates.
+        let ss_a = ss_from(b"AAA", &[3, 40_000, u16::MAX], &[1, 5, u16::MAX]);
+        let ss_b = ss_from(b"AAA", &[5, 40_000, u16::MAX], &[2, 7, u16::MAX]);
+
+        let merged = caller
+            .build_duplex_consensus_from_padded(&ss_a, &ss_b)
+            .expect("merge must not panic at high depth");
+
+        // In-range position is exact (no saturation): depth = 3 + 5, error = 1 + 2.
+        assert_eq!(merged.depths[0], 8, "small in-range depth must be the exact sum");
+        assert_eq!(merged.errors[0], 3, "small in-range error must be the exact sum");
+
+        // Overflowing positions saturate to the u16 ceiling, never wrap to a small value.
+        assert_eq!(merged.depths[1], u16::MAX, "40000+40000 must saturate to u16::MAX");
+        assert_eq!(merged.depths[2], u16::MAX, "MAX+MAX must saturate to u16::MAX");
+        assert_eq!(merged.errors[2], u16::MAX, "MAX+MAX errors must saturate to u16::MAX");
+    }
+
+    #[test]
+    fn test_saturate_u16_to_i16_clamps_without_truncation() {
+        // In-range values pass through unchanged.
+        assert_eq!(saturate_u16_to_i16(0), 0);
+        assert_eq!(saturate_u16_to_i16(1), 1);
+        assert_eq!(saturate_u16_to_i16(32_767), i16::MAX);
+
+        // The previously-truncating range (32768..=65535) must clamp to i16::MAX, NOT become
+        // negative as a raw `d as i16` cast would (e.g. 32768 as i16 == i16::MIN).
+        assert_eq!(saturate_u16_to_i16(32_768), i16::MAX);
+        assert_eq!(saturate_u16_to_i16(40_000), i16::MAX);
+        assert_eq!(saturate_u16_to_i16(u16::MAX), i16::MAX);
+        // Sanity: a raw truncating cast WOULD have gone negative here.
+        assert!(32_768u16.cast_signed() < 0, "raw cast is the negative-truncation bug we avoid");
+    }
+
+    #[test]
+    fn test_saturate_u32_to_u16_clamps_without_wrapping() {
+        // In-range u32 values pass through unchanged.
+        assert_eq!(saturate_u32_to_u16(0), 0);
+        assert_eq!(saturate_u32_to_u16(8), 8);
+        assert_eq!(saturate_u32_to_u16(u32::from(u16::MAX)), u16::MAX);
+        // Values above u16::MAX saturate rather than wrap.
+        assert_eq!(saturate_u32_to_u16(u32::from(u16::MAX) + 1), u16::MAX);
+        assert_eq!(saturate_u32_to_u16(131_070), u16::MAX); // u16::MAX + u16::MAX
     }
 }

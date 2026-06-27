@@ -186,7 +186,12 @@ pub fn validate_stage_opts_present(spec: &ChainSpec) -> Result<()> {
             }
             Stage::Align => bag.aligner.is_some(),
             Stage::Extract => bag.extract.is_some(),
-            Stage::Downsample => unreachable!(),
+            // Downsample is rejected by the early `bail!` above (no bag slot
+            // yet). Report "not provided" rather than `unreachable!()` so that
+            // if the early guard is ever removed without adding a slot here, the
+            // validator returns the clean "options not provided" error instead
+            // of panicking on a valid `[Downsample]` spec (S5b2-003).
+            Stage::Downsample => false,
         };
         if !present {
             bail!(

@@ -214,6 +214,41 @@ pub fn create_paired_umi_family_at(
     records
 }
 
+/// Creates a both-unmapped paired-end read pair carrying a paired UMI in `RX`.
+///
+/// Both R1 and R2 are `UNMAPPED | MATE_UNMAPPED` (no reference, no position),
+/// so the group stage retains the pair ONLY under `--allow-unmapped`. Used to
+/// exercise the duplex `record_filter` divergence between the fused
+/// group→duplex bridge and the non-fused `fgumi group | fgumi duplex` path
+/// (NEW-002): the duplex filter drops unmapped-without-mapped-mate records on
+/// both paths, so a both-unmapped pair must never reach the duplex caller.
+pub fn create_both_unmapped_pair(
+    umi: &str,
+    base_name: &str,
+    r1_sequence: &str,
+    r2_sequence: &str,
+    quality: u8,
+) -> Vec<RawRecord> {
+    let r1_seq = r1_sequence.as_bytes();
+    let r2_seq = r2_sequence.as_bytes();
+
+    let mut b1 = SamBuilder::new();
+    b1.read_name(base_name.as_bytes())
+        .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::UNMAPPED | flags::MATE_UNMAPPED)
+        .sequence(r1_seq)
+        .qualities(&vec![quality; r1_seq.len()])
+        .add_string_tag(SamTag::RX, umi.as_bytes());
+
+    let mut b2 = SamBuilder::new();
+    b2.read_name(base_name.as_bytes())
+        .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::UNMAPPED | flags::MATE_UNMAPPED)
+        .sequence(r2_seq)
+        .qualities(&vec![quality; r2_seq.len()])
+        .add_string_tag(SamTag::RX, umi.as_bytes());
+
+    vec![b1.build(), b2.build()]
+}
+
 /// Creates a consensus read with specified metrics.
 ///
 /// # Arguments

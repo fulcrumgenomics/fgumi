@@ -221,6 +221,26 @@ pub(crate) struct FuseState {
 #[cfg(feature = "consensus")]
 impl HeapSize for FuseState {}
 
+/// The per-record filter applied by the duplex consensus stage before
+/// MI-grouping: reject secondary/supplementary alignments and any record that
+/// is unmapped without a mapped mate (the duplex caller works on primary,
+/// alignment-anchored reads). Shared by both the non-fused
+/// `GroupByMi::with_record_filter` path and the fused `templates_to_mi_step`
+/// bridge so the two paths cannot drift (NEW-002).
+#[cfg(feature = "consensus")]
+fn duplex_record_filter(raw: &[u8]) -> bool {
+    use fgumi_raw_bam::RawRecordView;
+    let flg = RawRecordView::new(raw).flags();
+    if flg & fgumi_raw_bam::flags::SECONDARY != 0 || flg & fgumi_raw_bam::flags::SUPPLEMENTARY != 0
+    {
+        return false;
+    }
+    let is_mapped = flg & fgumi_raw_bam::flags::UNMAPPED == 0;
+    let has_mapped_mate =
+        flg & fgumi_raw_bam::flags::PAIRED != 0 && flg & fgumi_raw_bam::flags::MATE_UNMAPPED == 0;
+    is_mapped || has_mapped_mate
+}
+
 /// Build the `TemplatesToMiGroups` bridge step that fuses an intermediate
 /// `add_group` (which emits `BatchedProcessedPositionGroups`) into a consensus
 /// stage (which consumes `BatchedMiGroups`). For each template it splices the
@@ -228,19 +248,40 @@ impl HeapSize for FuseState {}
 /// per-MI groups in a single pass, replicating `runall.rs`'s
 /// `templates_to_mi_step`.
 ///
+/// Grouping on the MI alone (without a cell-barcode partition) is exactly
+/// equivalent to the non-fused `GroupByMi::with_cell_tag(Some(CB))` path
+/// (S5b1-003): MI values are globally unique across cell barcodes. The cell
+/// barcode is part of the upstream `GroupByPosition` key (so reads from
+/// different cells land in different position groups), and `assign_mi_offsets`
+/// shifts every group's local MI ids by a single global monotonic counter, so
+/// every distinct molecule receives a unique integer MI regardless of cell.
+/// Two templates with the same MI but different CB therefore cannot exist, so
+/// the bridge needs no cell-tag partition.
+///
 /// `duplex_strip_strand` controls whether the `/A` `/B` strand suffix is
 /// stripped from the MI key so both strands of a duplex molecule group
 /// together (`true` for duplex; `false` for simplex and codec).
+///
+/// `record_filter` is an optional per-record predicate applied to each emitted
+/// `r1()`/`r2()` raw record; records for which it returns `false` are dropped.
+/// Duplex passes [`duplex_record_filter`] here so the fused
+/// group→duplex path applies the **same** record filter that the non-fused
+/// `GroupByMi::with_record_filter` applies (NEW-002); simplex and codec pass
+/// `None` (they install no record filter on either path).
 #[cfg(feature = "consensus")]
-fn templates_to_mi_step(
+fn templates_to_mi_step<F>(
     limit_bytes: u64,
     duplex_strip_strand: bool,
+    record_filter: Option<F>,
 ) -> impl crate::pipeline::core::step::Step<
     Input = crate::pipeline::steps::group::position::BatchedProcessedPositionGroups,
     Outputs = crate::pipeline::core::outputs::OrderedBytesSingle<
         crate::pipeline::steps::group::mi::BatchedMiGroups,
     >,
-> {
+>
+where
+    F: Fn(&[u8]) -> bool + Send + Sync + 'static,
+{
     use crate::mi_group::MiGroup;
     use crate::pipeline::steps::group::mi::BatchedMiGroups;
     use crate::pipeline::steps::group::position::BatchedProcessedPositionGroups;
@@ -268,13 +309,17 @@ fn templates_to_mi_step(
                     if !template.mi.is_assigned() {
                         continue;
                     }
+                    // Write the full strand-suffixed MI into `mi_buf` for the
+                    // per-record `MI` tag exactly once. On the strip path the
+                    // grouping key is the strand-stripped base id (so both
+                    // strands group together); on the non-strip path the full
+                    // MI is also the grouping key (reuse `mi_buf`).
+                    template.mi.write_with_offset(0, &mut state.mi_buf);
                     let mi_key = if duplex_strip_strand {
                         template.mi.id().unwrap().to_string()
                     } else {
-                        template.mi.write_with_offset(0, &mut state.mi_buf);
                         state.mi_buf.clone()
                     };
-                    template.mi.write_with_offset(0, &mut state.mi_buf);
                     match &current_mi {
                         Some(curr) if curr != &mi_key => {
                             if !current_records.is_empty() {
@@ -291,6 +336,14 @@ fn templates_to_mi_step(
                         Some(_) => {}
                     }
                     for raw in [template.r1(), template.r2()].into_iter().flatten() {
+                        // Apply the optional per-record filter (duplex) so the
+                        // fused bridge drops the same records the non-fused
+                        // `GroupByMi::with_record_filter` would (NEW-002).
+                        if let Some(filter) = &record_filter {
+                            if !filter(raw) {
+                                continue;
+                            }
+                        }
                         state.scratch.clear();
                         state.scratch.extend_from_slice(raw);
                         fgumi_raw_bam::update_string_tag(
@@ -1569,7 +1622,6 @@ impl<'a> ChainBuilder<'a> {
             records_emitted,
             encoded_umi_set,
             unmatched_umi,
-            metrics_path: correct_opts.metrics.clone(),
             min_corrected: correct_opts.min_corrected,
             correct: correct_wrapper,
             timer,
@@ -1930,8 +1982,14 @@ impl<'a> ChainBuilder<'a> {
         }
 
         // Set the thread override to the floored count so build() forwards it
-        // to PipelineConfig::threads.
-        self.override_pipeline_threads = Some(num_threads);
+        // to PipelineConfig::threads. Take the max with any prior override (e.g.
+        // a preceding align stage) so we never lower an earlier stage's floor
+        // (S5b1-004).
+        if let Some(prev) = self.override_pipeline_threads {
+            self.override_pipeline_threads = Some(prev.max(num_threads));
+        } else {
+            self.override_pipeline_threads = Some(num_threads);
+        }
 
         // Register ZipperFinalizeHook.
         // The chain-level StageTimingFinalizeHook is inserted at index 0 by
@@ -2309,6 +2367,20 @@ impl<'a> ChainBuilder<'a> {
             .as_ref()
             .ok_or_else(|| anyhow!("Stage::Group options missing from StageOptionsBag"))?;
 
+        // Reject the same incompatible flag combinations that standalone
+        // `fgumi group` rejects up front, so the runall path enforces them too
+        // (S5c2-003). These read the user-supplied `strategy`/`no_umi`/
+        // `min_umi_length` (not the derived `effective_*`), matching
+        // `GroupReadsByUmi::execute`.
+        if group.min_umi_length.is_some()
+            && matches!(group.strategy, crate::assigner::Strategy::Paired)
+        {
+            bail!("Paired strategy cannot be used with --min-umi-length");
+        }
+        if group.no_umi && matches!(group.strategy, crate::assigner::Strategy::Paired) {
+            bail!("--no-umi cannot be used with --strategy paired");
+        }
+
         let tail = self.current_tail.expect("add_group called before add_source");
 
         // Resolve source path for log messages only.
@@ -2491,17 +2563,22 @@ impl<'a> ChainBuilder<'a> {
     // `Stage` variants. These stubs provide that resolution and fail loudly
     // if ever reached.
     // ----------------------------------------------------------------------
+    // `&mut self` matches the consensus-enabled signatures so the call sites are
+    // identical; the stub bails before touching any field, hence `unused_self`.
     #[cfg(not(feature = "consensus"))]
+    #[allow(clippy::unused_self)]
     fn add_simplex(&mut self, _position: StagePosition) -> Result<()> {
         bail!("fgumi was built without consensus support; rebuild with `--features consensus`")
     }
 
     #[cfg(not(feature = "consensus"))]
+    #[allow(clippy::unused_self)]
     fn add_duplex(&mut self, _position: StagePosition) -> Result<()> {
         bail!("fgumi was built without consensus support; rebuild with `--features consensus`")
     }
 
     #[cfg(not(feature = "consensus"))]
+    #[allow(clippy::unused_self)]
     fn add_codec(&mut self, _position: StagePosition) -> Result<()> {
         bail!("fgumi was built without consensus support; rebuild with `--features consensus`")
     }
@@ -2689,11 +2766,20 @@ impl<'a> ChainBuilder<'a> {
         //   bridge. Simplex passes `duplex_strip_strand = false` (no /A /B
         //   suffixes).
         let tail = if self.chain_tail_kind == ChainTailKind::BatchedProcessedPositionGroups {
-            // simplex: no `/A` `/B` strand stripping.
-            self.pipeline
-                .append_step(templates_to_mi_step(self.tuning.per_step_byte_limit, false), tail)
+            // simplex: no `/A` `/B` strand stripping, no record filter.
+            self.pipeline.append_step(
+                templates_to_mi_step(
+                    self.tuning.per_step_byte_limit,
+                    false,
+                    None::<fn(&[u8]) -> bool>,
+                ),
+                tail,
+            )
         } else {
             // Normal path: DecodedRecordBatch → GroupByMi → BatchedMiGroups.
+            // The cell-tag partition is defensive/redundant given MI uniqueness
+            // (see `templates_to_mi_step` doc, S5b1-003): MI is globally unique
+            // across cell barcodes, so MI-only grouping is already cell-correct.
             let group_mi_step = GroupByMi::new(*SamTag::MI, self.tuning.per_step_byte_limit)
                 .with_cell_tag(Some(*SamTag::CB));
             self.pipeline.append_step(group_mi_step, tail)
@@ -2795,7 +2881,6 @@ impl<'a> ChainBuilder<'a> {
         use crate::pipeline::steps::group::mi::GroupByMi;
         use crate::sam::SamTag;
         use crate::umi::extract_mi_base;
-        use fgumi_raw_bam::RawRecordView;
         use log::info;
         use noodles::sam::alignment::record::data::field::Tag;
 
@@ -2933,32 +3018,30 @@ impl<'a> ChainBuilder<'a> {
         //   (from add_group(Intermediate)) → prepend TemplatesToMiGroups bridge
         //   with duplex_strip_strand = true.
         let tail = if self.chain_tail_kind == ChainTailKind::BatchedProcessedPositionGroups {
-            // duplex: strip `/A` `/B` so both strands group together.
-            self.pipeline
-                .append_step(templates_to_mi_step(self.tuning.per_step_byte_limit, true), tail)
+            // duplex: strip `/A` `/B` so both strands group together, and apply
+            // the same per-record filter the non-fused path applies (NEW-002).
+            self.pipeline.append_step(
+                templates_to_mi_step(
+                    self.tuning.per_step_byte_limit,
+                    true,
+                    Some(duplex_record_filter),
+                ),
+                tail,
+            )
         } else {
             // Normal path: DecodedRecordBatch → GroupByMi → BatchedMiGroups.
-            // Record filter: skip secondary/supplementary; require mapped or mapped-mate.
-            let record_filter = |raw: &[u8]| -> bool {
-                let flg = RawRecordView::new(raw).flags();
-                if flg & fgumi_raw_bam::flags::SECONDARY != 0
-                    || flg & fgumi_raw_bam::flags::SUPPLEMENTARY != 0
-                {
-                    return false;
-                }
-                let is_mapped = flg & fgumi_raw_bam::flags::UNMAPPED == 0;
-                let has_mapped_mate = flg & fgumi_raw_bam::flags::PAIRED != 0
-                    && flg & fgumi_raw_bam::flags::MATE_UNMAPPED == 0;
-                is_mapped || has_mapped_mate
-            };
+            // Record filter: skip secondary/supplementary; require mapped or
+            // mapped-mate (shared with the fused bridge above).
             // MI transform: strip /A and /B so both strands group together.
             let mi_transform = |mi_bytes: &[u8]| -> String {
                 let mi_str = std::borrow::Cow::from(std::str::from_utf8(mi_bytes).unwrap_or(""));
                 extract_mi_base(&mi_str).to_string()
             };
+            // `with_cell_tag` is defensive/redundant given MI uniqueness
+            // (S5b1-003); `with_record_filter` is the load-bearing duplex filter.
             let group_mi_step = GroupByMi::new(*SamTag::MI, self.tuning.per_step_byte_limit)
                 .with_cell_tag(Some(*SamTag::CB))
-                .with_record_filter(record_filter)
+                .with_record_filter(duplex_record_filter)
                 .with_mi_transform(mi_transform);
             self.pipeline.append_step(group_mi_step, tail)
         };
@@ -3171,12 +3254,20 @@ impl<'a> ChainBuilder<'a> {
         //   (from add_group(Intermediate)) → prepend TemplatesToMiGroups bridge.
         //   duplex_strip_strand = false (codec does not use /A /B suffixes).
         let tail = if self.chain_tail_kind == ChainTailKind::BatchedProcessedPositionGroups {
-            // codec: no `/A` `/B` strand stripping.
-            self.pipeline
-                .append_step(templates_to_mi_step(self.tuning.per_step_byte_limit, false), tail)
+            // codec: no `/A` `/B` strand stripping, no record filter.
+            self.pipeline.append_step(
+                templates_to_mi_step(
+                    self.tuning.per_step_byte_limit,
+                    false,
+                    None::<fn(&[u8]) -> bool>,
+                ),
+                tail,
+            )
         } else {
             // Normal path: DecodedRecordBatch → GroupByMi → BatchedMiGroups.
-            // Codec: no record filter (processes all mapped reads), no MI transform.
+            // Codec: no record filter (processes all mapped reads), no MI
+            // transform. The cell-tag partition is defensive/redundant given
+            // MI uniqueness (S5b1-003).
             let group_mi_step = GroupByMi::new(*SamTag::MI, self.tuning.per_step_byte_limit)
                 .with_cell_tag(Some(*SamTag::CB));
             self.pipeline.append_step(group_mi_step, tail)
