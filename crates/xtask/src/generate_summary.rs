@@ -34,6 +34,15 @@ pub fn generate(
         let _ = writeln!(md, "- [{}]({})", running.0, running.1);
     }
 
+    // Methylation — a single standalone guide, so it renders as a top-level leaf
+    // rather than a collapsible section wrapping one child. Standalone pages are
+    // listed before the collapsible groups so the sidebar's plain links and
+    // expandable section headers form two visually distinct zones.
+    let methylation = ("Methylation", "guide/methylation.md");
+    if docs_src.join(methylation.1).exists() {
+        let _ = writeln!(md, "- [{}]({})", methylation.0, methylation.1);
+    }
+
     // Core Concepts sub-group
     let core_concepts = [
         ("Read Structures", "guide/read-structures.md"),
@@ -63,13 +72,6 @@ pub fn generate(
                 let _ = writeln!(md, "  - [{title}]({path})");
             }
         }
-    }
-
-    // Methylation — single page, so render as a top-level leaf rather than a
-    // collapsible section wrapping one child.
-    let methylation = ("Methylation", "guide/methylation.md");
-    if docs_src.join(methylation.1).exists() {
-        let _ = writeln!(md, "- [{}]({})", methylation.0, methylation.1);
     }
 
     // Advanced Topics sub-group
@@ -167,6 +169,12 @@ pub fn generate(
 
     let mut assigned: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
+    // Partition categories into single-page ones (rendered as flat leaves) and
+    // multi-page ones (collapsible groups). Leaves are emitted before groups so
+    // the part's plain links and expandable section headers form two visually
+    // distinct zones, matching the User Guide layout.
+    let mut single_page_metrics: Vec<&MetricPage> = Vec::new();
+    let mut grouped_metrics: Vec<(&str, Vec<&MetricPage>)> = Vec::new();
     for (group_name, prefixes) in metric_groups {
         let matches: Vec<&MetricPage> = metric_pages
             .iter()
@@ -174,20 +182,25 @@ pub fn generate(
             .collect();
         match matches.as_slice() {
             [] => {}
-            // A group with a single page collapses to a top-level leaf so the
-            // sidebar doesn't hide one entry behind a fold toggle; the label is
-            // humanized (`ConsensusMetrics` -> `Consensus Metrics`).
-            [single] => {
-                let _ = writeln!(md, "- [{}]({})", humanize_metric_name(&single.name), single.path);
-                assigned.insert(single.name.as_str());
-            }
-            _ => {
-                let _ = writeln!(md, "- [{group_name}]()");
-                for page in &matches {
-                    let _ = writeln!(md, "  - [{}]({})", page.name, page.path);
-                    assigned.insert(page.name.as_str());
-                }
-            }
+            [single] => single_page_metrics.push(single),
+            _ => grouped_metrics.push((group_name, matches)),
+        }
+    }
+
+    // Single-page categories first, as top-level leaves with a humanized label
+    // (`ConsensusMetrics` -> `Consensus Metrics`) so they aren't hidden behind a
+    // fold toggle that wraps a single entry.
+    for single in &single_page_metrics {
+        let _ = writeln!(md, "- [{}]({})", humanize_metric_name(&single.name), single.path);
+        assigned.insert(single.name.as_str());
+    }
+
+    // Then the collapsible multi-page groups.
+    for (group_name, matches) in &grouped_metrics {
+        let _ = writeln!(md, "- [{group_name}]()");
+        for page in matches {
+            let _ = writeln!(md, "  - [{}]({})", page.name, page.path);
+            assigned.insert(page.name.as_str());
         }
     }
 
