@@ -1322,8 +1322,17 @@ pub struct RawExternalSorter {
     /// distributed across them in free-space-aware round-robin order via
     /// [`TmpDirAllocator`].
     temp_dirs: Vec<PathBuf>,
-    /// Number of threads for parallel operations.
+    /// Number of threads for parallel operations — the base/fallback count used
+    /// by both phases unless overridden by `sort_threads` / `merge_threads`.
     threads: usize,
+    /// Optional override for the Phase-1 (accumulate/sort/spill) worker count.
+    /// `None` ⇒ Phase 1 uses `threads`. Lower it to cede cores to an upstream
+    /// producer (e.g. `bwa mem` in a pipeline) during accumulation.
+    sort_threads: Option<usize>,
+    /// Optional override for the Phase-2 (merge/write) worker count.
+    /// `None` ⇒ Phase 2 uses `threads`. The merge/write phase scales with cores,
+    /// so this is typically left at (or raised toward) the full core count.
+    merge_threads: Option<usize>,
     /// Compression level for output.
     output_compression: u32,
     /// Compression level for temporary chunk files (0 = uncompressed).
@@ -1420,8 +1429,9 @@ impl RawExternalSorter {
         // detects each spill chunk's codec from its file magic (see
         // `slots_for_chunk_files`) and dispatches accordingly — so the streaming
         // path no longer has to pin BGZF.
+        // Phase 1 (streaming) is capped by --sort-threads; this pool is Phase-1-only (dropped at finalize).
         let pool = Arc::new(SortWorkerPool::new(
-            self.threads.max(1),
+            self.phase1_threads(),
             self.temp_compression,
             self.output_compression,
             self.spill_codec,
@@ -1491,8 +1501,9 @@ impl RawExternalSorter {
 
         // Spill codec from config (see `into_coordinate_stream`): the streaming
         // decoder is codec-aware, so honor `self.spill_codec` (zstd default).
+        // Phase 1 (streaming) is capped by --sort-threads; this pool is Phase-1-only (dropped at finalize).
         let pool = Arc::new(SortWorkerPool::new(
-            self.threads.max(1),
+            self.phase1_threads(),
             self.temp_compression,
             self.output_compression,
             self.spill_codec,
@@ -1580,6 +1591,8 @@ impl RawExternalSorter {
             memory_limit: 512 * 1024 * 1024, // 512 MB default
             temp_dirs: Vec::new(),
             threads: 1,
+            sort_threads: None,
+            merge_threads: None,
             output_compression: 6,
             temp_compression: 1, // Default: fast compression
             spill_codec: crate::codec::SpillCodec::default(),
@@ -1624,6 +1637,43 @@ impl RawExternalSorter {
     pub fn threads(mut self, threads: usize) -> Self {
         self.threads = threads;
         self
+    }
+
+    /// Set the Phase-1 (accumulate/sort/spill) worker count. Defaults to
+    /// [`threads`](Self::threads) when unset. Lower it to cede cores to an
+    /// upstream producer in a pipeline.
+    ///
+    /// Honored by [`sort`](Self::sort) (via the worker-pool active cap) and by
+    /// the streaming `into_*_stream` entry points (which size their Phase-1-only
+    /// pool via `phase1_threads()`).
+    #[must_use]
+    pub fn sort_threads(mut self, n: usize) -> Self {
+        self.sort_threads = Some(n);
+        self
+    }
+
+    /// Set the Phase-2 (merge/write) worker count. Defaults to
+    /// [`threads`](Self::threads) when unset.
+    ///
+    /// Honored by [`sort`](Self::sort) (via the worker-pool active cap). The
+    /// streaming `into_*_stream` entry points do not read this value — their
+    /// Phase 2 (decompress/merge) runs on the framework scheduler, so the chain
+    /// builder caps streaming Phase-2 concurrency at the pipeline layer
+    /// (`SortSpillDecompress::with_max_concurrency`) instead.
+    #[must_use]
+    pub fn merge_threads(mut self, n: usize) -> Self {
+        self.merge_threads = Some(n);
+        self
+    }
+
+    /// Effective Phase-1 worker count: `sort_threads` if set, else `threads`.
+    fn phase1_threads(&self) -> usize {
+        self.sort_threads.unwrap_or(self.threads).max(1)
+    }
+
+    /// Effective Phase-2 worker count: `merge_threads` if set, else `threads`.
+    fn phase2_threads(&self) -> usize {
+        self.merge_threads.unwrap_or(self.threads).max(1)
     }
 
     /// Set the output compression level.
@@ -1742,7 +1792,7 @@ impl RawExternalSorter {
     /// idle at the moment rayon fans out.
     fn build_sort_rayon_pool(&self) -> Result<rayon::ThreadPool> {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(self.threads.max(1))
+            .num_threads(self.phase1_threads())
             .thread_name(|i| format!("fgumi-sort-rayon-{i}"))
             .build()
             .map_err(|e| anyhow::anyhow!("failed to build rayon sort pool: {e}"))
@@ -1808,8 +1858,11 @@ impl RawExternalSorter {
         // Create merged output file
         let merged_path = namer.next_merged_path()?;
 
-        // Open readers with semaphore to cap concurrent I/O.
-        let sem = make_reader_semaphore(self.threads);
+        // Open readers with semaphore to cap concurrent I/O. Consolidation runs
+        // during Phase 1 (from `drain_pending_spill`, before the Phase-2 worker
+        // switch), so bound the readers by the Phase-1 thread count to match the
+        // rest of the Phase-1 sizing rather than the base thread count.
+        let sem = make_reader_semaphore(self.phase1_threads());
         let mut readers: Vec<GenericKeyedChunkReader<K>> = files_to_merge
             .iter()
             .map(|p| GenericKeyedChunkReader::<K>::open(p, Some(Arc::clone(&sem))))
@@ -1912,13 +1965,20 @@ impl RawExternalSorter {
         debug!("Memory limit: {} MB", self.memory_limit / (1024 * 1024));
         debug!("Threads: {}", self.threads);
 
-        // Shared worker pool for parallel BGZF compress/decompress across all phases
+        // Shared worker pool for parallel BGZF compress/decompress across all
+        // phases. Sized to the larger of the two phase counts; the active-worker
+        // cap (set below, then switched to the Phase-2 count at the merge/write
+        // boundary — which may raise or lower it) governs how many run in each
+        // phase.
         let pool = Arc::new(SortWorkerPool::new(
-            self.threads.max(1),
+            self.phase1_threads().max(self.phase2_threads()),
             self.temp_compression,
             self.output_compression,
             self.spill_codec,
         ));
+        // Phase 1 (accumulate/sort/spill) runs on the Phase-1 count; the
+        // merge/write phase switches the cap to the Phase-2 count.
+        pool.set_active_workers(self.phase1_threads());
 
         // Open input BAM and create record source
         // N+2 model: workers do ReadInputBlocks + DecompressInput,
@@ -2218,6 +2278,11 @@ impl RawExternalSorter {
         )?;
         probe.phase1_end(buffer.memory_usage() as u64);
 
+        // Ingest (accumulate/sort/spill) is done. Switch the worker cap to the
+        // Phase-2 count for the writing phase (merge or in-memory write), which
+        // is the part that scales and runs after any upstream producer.
+        pool.set_active_workers(self.phase2_threads());
+
         if chunk_files.is_empty() {
             // All records fit in memory - no merge needed
             debug!("All records fit in memory, performing in-memory sort");
@@ -2243,8 +2308,10 @@ impl RawExternalSorter {
             // chunk becomes its own in-memory merge source.
             let memory_chunks: Vec<InMemoryChunk<RawCoordinateKey>> = if buffer.is_empty() {
                 Vec::new()
-            } else if self.threads > 1 {
-                timer.time_sort(|| rayon_pool.install(|| buffer.par_sort_into_chunks(self.threads)))
+            } else if self.phase1_threads() > 1 {
+                timer.time_sort(|| {
+                    rayon_pool.install(|| buffer.par_sort_into_chunks(self.phase1_threads()))
+                })
             } else {
                 timer.time_sort(|| {
                     rayon_pool.install(|| buffer.par_sort());
@@ -2430,6 +2497,9 @@ impl RawExternalSorter {
         )?;
         probe.phase1_end(memory_used as u64);
 
+        // Ingest done; switch the worker cap to the Phase-2 count for the write phase.
+        pool.set_active_workers(self.phase2_threads());
+
         if chunk_files.is_empty() {
             // All records fit in memory
             debug!("All records fit in memory, performing in-memory sort");
@@ -2463,10 +2533,10 @@ impl RawExternalSorter {
             // `InMemoryChunk`s sharing an `Arc<SegmentedBuf>`.
             let keyed_chunks: Vec<Vec<(K, fgumi_raw_bam::RawRecord)>> = if entries.is_empty() {
                 Vec::new()
-            } else if self.threads > 1 {
+            } else if self.phase1_threads() > 1 {
                 timer.time_sort(|| {
                     use rayon::prelude::*;
-                    let chunk_size = entries.len().div_ceil(self.threads.max(1));
+                    let chunk_size = entries.len().div_ceil(self.phase1_threads());
                     rayon_pool.install(|| {
                         entries.par_chunks_mut(chunk_size).for_each(|chunk| {
                             chunk.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -2789,6 +2859,9 @@ impl RawExternalSorter {
         )?;
         probe.phase1_end(buffer.memory_usage() as u64);
 
+        // Ingest done; switch the worker cap to the Phase-2 count for the write phase.
+        pool.set_active_workers(self.phase2_threads());
+
         if chunk_files.is_empty() {
             // All records fit in memory
             debug!("All records fit in memory, performing in-memory sort");
@@ -2813,8 +2886,10 @@ impl RawExternalSorter {
             // intermediate merge back into a single sorted buffer)
             let memory_chunks: Vec<InMemoryChunk<K>> = if buffer.is_empty() {
                 Vec::new()
-            } else if self.threads > 1 {
-                timer.time_sort(|| rayon_pool.install(|| buffer.par_sort_into_chunks(self.threads)))
+            } else if self.phase1_threads() > 1 {
+                timer.time_sort(|| {
+                    rayon_pool.install(|| buffer.par_sort_into_chunks(self.phase1_threads()))
+                })
             } else {
                 timer.time_sort(|| {
                     rayon_pool.install(|| buffer.par_sort());
@@ -3825,10 +3900,10 @@ impl CoordinateSortStream {
                         .collect::<Vec<_>>()
                 });
                 vec![chunk]
-            } else if self.sorter.threads > 1 {
+            } else if self.sorter.phase1_threads() > 1 {
                 let buffer = &mut self.buffer;
                 let rayon_pool = &self.rayon_pool;
-                let threads = self.sorter.threads;
+                let threads = self.sorter.phase1_threads();
                 inmem_chunks_to_keyed(
                     self.timer
                         .time_sort(|| rayon_pool.install(|| buffer.par_sort_into_chunks(threads))),
@@ -3955,8 +4030,9 @@ impl<K: RawSortKey + Default + 'static> QuerynameSortStreamGeneric<K> {
 
         // Spill codec from config (see `into_coordinate_stream`): the streaming
         // decoder is codec-aware, so honor `sorter.spill_codec` (zstd default).
+        // Phase 1 (streaming) is capped by --sort-threads; this pool is Phase-1-only (dropped at finalize).
         let pool = Arc::new(SortWorkerPool::new(
-            sorter.threads.max(1),
+            sorter.phase1_threads(),
             sorter.temp_compression,
             sorter.output_compression,
             sorter.spill_codec,
@@ -4146,7 +4222,7 @@ impl<K: RawSortKey + Default + 'static> QuerynameSortStreamGeneric<K> {
         } else if self.chunk_files.is_empty() {
             let entries = &mut self.entries;
             let rayon_pool = &self.rayon_pool;
-            if self.sorter.threads > 1 {
+            if self.sorter.phase1_threads() > 1 {
                 self.timer.time_sort(|| {
                     use rayon::prelude::*;
                     rayon_pool.install(|| entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0)));
@@ -4157,10 +4233,10 @@ impl<K: RawSortKey + Default + 'static> QuerynameSortStreamGeneric<K> {
                 });
             }
             vec![std::mem::take(&mut self.entries)]
-        } else if self.sorter.threads > 1 {
+        } else if self.sorter.phase1_threads() > 1 {
             let entries = &mut self.entries;
             let rayon_pool = &self.rayon_pool;
-            let threads = self.sorter.threads;
+            let threads = self.sorter.phase1_threads();
             self.timer.time_sort(|| {
                 use rayon::prelude::*;
                 let chunk_size = entries.len().div_ceil(threads.max(1));
@@ -4414,10 +4490,10 @@ impl TemplateCoordinateSortStream {
                         .collect::<Vec<_>>()
                 });
                 vec![chunk]
-            } else if self.sorter.threads > 1 {
+            } else if self.sorter.phase1_threads() > 1 {
                 let buffer = &mut self.buffer;
                 let rayon_pool = &self.rayon_pool;
-                let threads = self.sorter.threads;
+                let threads = self.sorter.phase1_threads();
                 inmem_chunks_to_keyed(
                     self.timer
                         .time_sort(|| rayon_pool.install(|| buffer.par_sort_into_chunks(threads))),
@@ -5176,6 +5252,220 @@ mod tests {
         assert_eq!(sorter.temp_compression, 3);
         assert_eq!(sorter.pg_info, Some(("1.0".to_string(), "fgumi sort".to_string())));
         assert_eq!(sorter.max_temp_files, 128);
+    }
+
+    #[test]
+    fn test_raw_sorter_phase_threads_builders() {
+        let new = || RawExternalSorter::new(SortOrder::Coordinate).threads(8);
+        // Default: both phases fall back to threads.
+        let base = new();
+        assert_eq!((base.sort_threads, base.merge_threads), (None, None));
+        assert_eq!((base.phase1_threads(), base.phase2_threads()), (8, 8));
+        // sort_threads overrides only Phase 1.
+        let sort_only = new().sort_threads(2);
+        assert_eq!((sort_only.phase1_threads(), sort_only.phase2_threads()), (2, 8));
+        // merge_threads overrides only Phase 2.
+        let merge_only = new().merge_threads(3);
+        assert_eq!((merge_only.phase1_threads(), merge_only.phase2_threads()), (8, 3));
+        // Both override independently.
+        let both = new().sort_threads(2).merge_threads(16);
+        assert_eq!((both.phase1_threads(), both.phase2_threads()), (2, 16));
+        // Clamp to >= 1.
+        let zero = new().sort_threads(0).merge_threads(0);
+        assert_eq!((zero.phase1_threads(), zero.phase2_threads()), (1, 1));
+    }
+
+    /// Read every record's raw bytes from a BAM, in file order.
+    fn records_bytes(path: &Path) -> Vec<Vec<u8>> {
+        let (mut reader, _h) = create_raw_bam_reader(path, 1).expect("open bam");
+        let mut out = Vec::new();
+        let mut rec = fgumi_raw_bam::RawRecord::new();
+        while reader.read_record(&mut rec).expect("read record") != 0 {
+            out.push(rec.view().as_bytes().to_vec());
+        }
+        out
+    }
+
+    /// Splitting Phase-1 (`sort_threads`) and Phase-2 (`merge_threads`) from the
+    /// base `threads` is a pure scheduling knob: output must be byte-identical to
+    /// the unsplit sort, with spills forced. Matrixed over every order (`#[values]`)
+    /// and every thread-split variant (`#[case]`) so a failure names the exact order
+    /// and split. The cases mirror the prior inline matrix: `sort_low` (Phase-1 on
+    /// 1), `merge_low` (Phase-2 on 1), `both` (Phase-1 on 1 / Phase-2 on 2), and
+    /// `sort_high` (Phase-1 above base).
+    #[rstest::rstest]
+    #[case::sort_low(Some(1), None)]
+    #[case::merge_low(None, Some(1))]
+    #[case::both(Some(1), Some(2))]
+    #[case::sort_high(Some(8), Some(2))]
+    fn phase_thread_split_is_byte_identical(
+        #[values(
+            SortOrder::Coordinate,
+            SortOrder::Queryname(QuerynameComparator::Natural),
+            SortOrder::Queryname(QuerynameComparator::Lexicographic),
+            SortOrder::TemplateCoordinate
+        )]
+        order: SortOrder,
+        #[case] sort_t: Option<usize>,
+        #[case] merge_t: Option<usize>,
+    ) {
+        use fgumi_sam::SamBuilder;
+        let mut builder = SamBuilder::new();
+        for i in 0..2000 {
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i}"))
+                .start1(i * 50 + 1)
+                .start2(i * 50 + 101)
+                .build();
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("in.bam");
+        builder.write_bam(&input).expect("write bam");
+
+        let mk = |out: &Path, sort_t: Option<usize>, merge_t: Option<usize>| {
+            let mut s = RawExternalSorter::new(order)
+                .threads(4)
+                .memory_limit(32 * 1024) // force spills
+                .spill_codec(crate::codec::SpillCodec::Bgzf)
+                .temp_compression(0)
+                .output_compression(0);
+            if let Some(j) = sort_t {
+                s = s.sort_threads(j);
+            }
+            if let Some(k) = merge_t {
+                s = s.merge_threads(k);
+            }
+            s.sort(&input, out).expect("sort");
+        };
+        // Base: both phases on the unsplit `threads(4)`.
+        let base = dir.path().join("base.bam");
+        mk(&base, None, None);
+        let golden = records_bytes(&base);
+        // The split variant must reproduce the base output exactly.
+        let out = dir.path().join("variant.bam");
+        mk(&out, sort_t, merge_t);
+        assert_eq!(
+            records_bytes(&out),
+            golden,
+            "order {order:?} split sort_t={sort_t:?} merge_t={merge_t:?}: \
+             thread split must not change output"
+        );
+    }
+
+    /// Regression guard for the residual Phase-1 sort honoring `sort_threads`
+    /// rather than the base `threads`. With `threads(1).sort_threads(4)` the
+    /// residual sort/chunk decision must take the *parallel* `phase1_threads()`
+    /// branch (previously it gated on `threads`, so it ran serially and ignored
+    /// `sort_threads`). Spills are forced so the keyed-chunk residual path
+    /// (`chunk_files` non-empty) is exercised; output must be byte-identical to
+    /// the serial `threads(1)` sort for every order.
+    #[rstest::rstest]
+    #[case::coordinate(SortOrder::Coordinate)]
+    #[case::queryname_natural(SortOrder::Queryname(QuerynameComparator::Natural))]
+    #[case::queryname_lex(SortOrder::Queryname(QuerynameComparator::Lexicographic))]
+    #[case::template_coordinate(SortOrder::TemplateCoordinate)]
+    fn residual_phase1_honors_sort_threads_with_single_base_thread(#[case] order: SortOrder) {
+        use fgumi_sam::SamBuilder;
+        let mut builder = SamBuilder::new();
+        for i in 0..2000 {
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i}"))
+                .start1(i * 50 + 1)
+                .start2(i * 50 + 101)
+                .build();
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("in.bam");
+        builder.write_bam(&input).expect("write bam");
+
+        let mk = |out: &Path, sort_t: Option<usize>| {
+            let mut s = RawExternalSorter::new(order)
+                .threads(1)
+                .memory_limit(32 * 1024) // force spills -> exercise residual chunk path
+                .spill_codec(crate::codec::SpillCodec::Bgzf)
+                .temp_compression(0)
+                .output_compression(0);
+            if let Some(j) = sort_t {
+                s = s.sort_threads(j);
+            }
+            s.sort(&input, out).expect("sort");
+        };
+        let serial = dir.path().join("serial.bam");
+        mk(&serial, None); // threads(1): residual sort runs serially
+        let golden = records_bytes(&serial);
+
+        let parallel = dir.path().join("parallel.bam");
+        mk(&parallel, Some(4)); // sort_threads(4): residual sort now parallel
+        assert_eq!(
+            records_bytes(&parallel),
+            golden,
+            "order {order:?}: threads(1).sort_threads(4) must match the serial sort output"
+        );
+    }
+
+    /// Build a streaming sorter for `order` with `threads(4)` and the optional
+    /// `sort_threads` cap, returning its Phase-1 `SortWorkerPool` worker count.
+    /// Centralizes the per-order stream-constructor dispatch so the pool-sizing
+    /// assertion can be parameterized.
+    fn streaming_phase1_pool_workers(order: SortOrder, sort_threads: Option<usize>) -> usize {
+        use noodles::sam::Header;
+
+        let header = Header::default();
+        let mut sorter = RawExternalSorter::new(order).threads(4);
+        if let Some(j) = sort_threads {
+            sorter = sorter.sort_threads(j);
+        }
+        match order {
+            SortOrder::Coordinate => sorter
+                .into_coordinate_stream(&header)
+                .expect("coordinate stream")
+                .pool
+                .num_workers(),
+            SortOrder::TemplateCoordinate => sorter
+                .into_template_coordinate_stream(&header)
+                .expect("template-coordinate stream")
+                .pool
+                .num_workers(),
+            SortOrder::Queryname(_) => {
+                match sorter.into_queryname_stream(&header).expect("queryname stream") {
+                    QuerynameSortStream::Lex(s) => s.pool.num_workers(),
+                    QuerynameSortStream::Natural(s) => s.pool.num_workers(),
+                }
+            }
+        }
+    }
+
+    /// The streaming Phase-1 `SortWorkerPool` must be sized to `phase1_threads()`,
+    /// not `threads`. When `sort_threads` is set, the pool must reflect the cap;
+    /// when it is unset, the pool has the full `threads` count. One case per
+    /// (order, split-state) so a failure names the exact combination.
+    #[rstest::rstest]
+    #[case::coordinate_split(SortOrder::Coordinate, Some(1), 1)]
+    #[case::coordinate_nosplit(SortOrder::Coordinate, None, 4)]
+    #[case::template_coordinate_split(SortOrder::TemplateCoordinate, Some(1), 1)]
+    #[case::template_coordinate_nosplit(SortOrder::TemplateCoordinate, None, 4)]
+    #[case::queryname_split(
+        SortOrder::Queryname(crate::keys::QuerynameComparator::Lexicographic),
+        Some(1),
+        1
+    )]
+    #[case::queryname_nosplit(
+        SortOrder::Queryname(crate::keys::QuerynameComparator::Lexicographic),
+        None,
+        4
+    )]
+    fn streaming_pool_is_capped_to_phase1_threads(
+        #[case] order: SortOrder,
+        #[case] sort_threads: Option<usize>,
+        #[case] expected_workers: usize,
+    ) {
+        assert_eq!(
+            streaming_phase1_pool_workers(order, sort_threads),
+            expected_workers,
+            "order {order:?} sort_threads {sort_threads:?}: stream pool must size to phase1_threads"
+        );
     }
 
     #[test]

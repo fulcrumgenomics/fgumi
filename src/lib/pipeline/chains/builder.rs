@@ -2084,6 +2084,11 @@ impl<'a> ChainBuilder<'a> {
 
             let num_sorter_threads = self.spec.threading.num_threads();
 
+            // Per-phase worker counts default to --threads; runall forwards
+            // --sort::sort-threads / --sort::merge-threads via SortOptions.
+            let num_phase1_threads = resolve_phase_threads(sort.sort_threads, num_sorter_threads);
+            let num_phase2_threads = resolve_phase_threads(sort.merge_threads, num_sorter_threads);
+
             let effective_memory = resolve_memory_budget(
                 sort.max_memory,
                 sort.memory_reserve,
@@ -2093,7 +2098,15 @@ impl<'a> ChainBuilder<'a> {
 
             let timer = crate::logging::OperationTimer::new("Sorting BAM");
 
-            log_sort_start(&sort, &input_path, &output_path, num_sorter_threads, effective_memory);
+            log_sort_start(
+                &sort,
+                &input_path,
+                &output_path,
+                num_sorter_threads,
+                num_phase1_threads,
+                num_phase2_threads,
+                effective_memory,
+            );
 
             let stats_slot = Arc::new(parking_lot::Mutex::new(None::<fgumi_sort::SortStats>));
 
@@ -2102,6 +2115,8 @@ impl<'a> ChainBuilder<'a> {
                 input_path: input_path.clone(),
                 output_path: output_path.clone(),
                 num_sorter_threads,
+                num_phase1_threads,
+                num_phase2_threads,
                 effective_memory,
                 output_compression: self.spec.compression.compression_level,
                 command_line: self.spec.command_line.clone(),
@@ -2195,6 +2210,18 @@ impl<'a> ChainBuilder<'a> {
                 );
             }
             let num_threads = self.spec.threading.num_threads();
+            // Per-phase worker counts default to --threads; runall forwards
+            // --sort::sort-threads / --sort::merge-threads via SortOptions.
+            // Phase 1 caps the streaming sort/spill worker pool; Phase 2 caps
+            // concurrent spill-decompression (the merge step itself is serial).
+            let num_phase1_threads = resolve_phase_threads(sort.sort_threads, num_threads);
+            let num_phase2_threads = resolve_phase_threads(sort.merge_threads, num_threads);
+            if sort.sort_threads.is_some() || sort.merge_threads.is_some() {
+                log::debug!(
+                    "streaming sort: per-phase thread split (phase1={num_phase1_threads}, \
+                     phase2={num_phase2_threads}); phase2 caps decompress concurrency, merge is serial"
+                );
+            }
             // Reuse the same helper as the standalone path so `--sort::memory-per-thread`
             // is honored (the previous inline `× num_threads` ignored it).
             let total_memory = resolve_memory_budget(
@@ -2207,9 +2234,16 @@ impl<'a> ChainBuilder<'a> {
             let sort_order = SortOrder::TemplateCoordinate;
             // NB: the spill codec is pinned to BGZF inside `build_stream`
             // (`SortSpillDecompress` is BGZF-block-only); see the comment there.
+            // NB: `sort_threads` sizes the streaming Phase-1 pool; `merge_threads`
+            // is inert on the streaming sorter (its Phase 2 runs on the framework
+            // scheduler, not this pool) — streaming Phase-2 concurrency is capped
+            // on `SortSpillDecompress` below. It is set here only for config
+            // symmetry with the standalone `sort()` path.
             let mut sorter = RawExternalSorter::new(sort_order)
                 .memory_limit(total_memory)
                 .threads(num_threads.max(1))
+                .sort_threads(num_phase1_threads)
+                .merge_threads(num_phase2_threads)
                 .output_compression(1)
                 .temp_compression(sort.temp_compression)
                 .cell_tag(SamTag::CB);
@@ -2225,7 +2259,8 @@ impl<'a> ChainBuilder<'a> {
                 SortAndSpill::from_sorter(sorter, &self.header, self.tuning.per_step_byte_limit)
                     .map_err(|e| anyhow!("SortAndSpill::from_sorter: {e}"))?
                     .with_affinity(affinity);
-            let decompress = SortSpillDecompress::new(self.tuning.per_step_byte_limit);
+            let decompress = SortSpillDecompress::new(self.tuning.per_step_byte_limit)
+                .with_max_concurrency(Some(num_phase2_threads));
             let merge =
                 SortMerge::new(sort_order, self.tuning.per_step_byte_limit).with_affinity(affinity);
 
@@ -3833,5 +3868,41 @@ impl<'a> ChainBuilder<'a> {
         }));
 
         Ok(())
+    }
+}
+
+/// Resolve a sort phase's worker-thread count.
+///
+/// A per-phase override (`--sort::sort-threads` / `--sort::merge-threads`, or
+/// the standalone `--sort-threads` / `--merge-threads`) is used as-is when
+/// present; otherwise the phase falls back to the chain's base sorter-thread
+/// count (`--threads`). The result is clamped to at least 1 so a `0` override
+/// never disables a phase. This is the single source of truth for both the
+/// sole-stage (`SortStepCaptures`) and streaming (`RawExternalSorter`) sort
+/// paths in `add_sort`.
+fn resolve_phase_threads(override_threads: Option<usize>, num_sorter_threads: usize) -> usize {
+    override_threads.unwrap_or(num_sorter_threads).max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_phase_threads;
+
+    /// Pin the per-phase thread resolution contract shared by the standalone and
+    /// streaming sort branches in `add_sort`: each phase falls back to the base
+    /// sorter-thread count when no explicit override is supplied, and is clamped
+    /// to at least 1. Exercises the production `resolve_phase_threads` helper
+    /// directly so it cannot drift from the code `add_sort` actually runs.
+    #[test]
+    fn sole_stage_sort_resolves_per_phase_threads() {
+        let num_sorter_threads = 8usize;
+
+        // Explicit overrides are used as-is (clamped ≥ 1).
+        assert_eq!(resolve_phase_threads(Some(1), num_sorter_threads), 1);
+        assert_eq!(resolve_phase_threads(Some(2), num_sorter_threads), 2);
+        // Zero is clamped to 1.
+        assert_eq!(resolve_phase_threads(Some(0), num_sorter_threads), 1);
+        // None falls back to num_sorter_threads.
+        assert_eq!(resolve_phase_threads(None, num_sorter_threads), 8);
     }
 }

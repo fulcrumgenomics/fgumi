@@ -325,6 +325,25 @@ pub struct SortOptions {
     #[arg(long = "key-types", value_parser = parse_key_types)]
     pub key_types: Option<KeyTypesSpec>,
 
+    /// Worker threads for the accumulation/sort/spill phase (Phase 1).
+    ///
+    /// Defaults to `--threads`. Lower this to cede CPU to an upstream producer
+    /// (e.g. `bwa mem | fgumi sort`, or runall's align→sort chain); use
+    /// `--merge-threads` for the merge/write phase. Output is byte-identical
+    /// regardless of this value.
+    #[arg(long = "sort-threads")]
+    pub sort_threads: Option<usize>,
+
+    /// Worker threads for the merge/write phase (Phase 2).
+    ///
+    /// Defaults to `--threads`. In standalone `fgumi sort` (and runall's
+    /// sole-stage sort) this caps the merge/write workers of the sort engine's
+    /// pool. In a multi-stage runall chain it caps the number of concurrent
+    /// spill-decompression workers (the merge step itself is serial). Output is
+    /// byte-identical regardless of this value.
+    #[arg(long = "merge-threads")]
+    pub merge_threads: Option<usize>,
+
     /// Sort order (chain-builder slot).
     ///
     /// Carried here so the chain builder can read it from the bag without
@@ -344,6 +363,8 @@ impl Default for SortOptions {
             temp_compression: 1,
             temp_codec: SpillCodec::default(),
             key_types: None,
+            sort_threads: None,
+            merge_threads: None,
             order: SortOrderArg::TemplateCoordinate,
         }
     }
@@ -505,6 +526,12 @@ impl Sort {
         let input_path = self.input.clone();
         let output_path = output.to_path_buf();
         let num_sorter_threads = self.threads.max(1);
+        // Per-phase worker counts; each defaults to --threads. Memory budget
+        // intentionally stays tied to --threads (these knobs are CPU-only). Read
+        // from `sort_opts` (the resolved options used by the rest of the method)
+        // so the phase counts cannot diverge from the logged / built config.
+        let num_phase1_threads = sort_opts.sort_threads.unwrap_or(num_sorter_threads).max(1);
+        let num_phase2_threads = sort_opts.merge_threads.unwrap_or(num_sorter_threads).max(1);
 
         let effective_memory = resolve_memory_budget(
             sort_opts.max_memory,
@@ -514,7 +541,15 @@ impl Sort {
         )?;
 
         let timer = OperationTimer::new("Sorting BAM");
-        log_sort_start(&sort_opts, &input_path, &output_path, num_sorter_threads, effective_memory);
+        log_sort_start(
+            &sort_opts,
+            &input_path,
+            &output_path,
+            num_sorter_threads,
+            num_phase1_threads,
+            num_phase2_threads,
+            effective_memory,
+        );
 
         let stats_slot = Arc::new(Mutex::new(None::<fgumi_sort::SortStats>));
 
@@ -523,6 +558,8 @@ impl Sort {
             input_path,
             output_path: output_path.clone(),
             num_sorter_threads,
+            num_phase1_threads,
+            num_phase2_threads,
             effective_memory,
             output_compression: self.compression.compression_level,
             command_line: command_line.to_string(),
@@ -847,6 +884,44 @@ mod tests {
         .expect("parse");
         sort.execute("fgumi sort").expect("bgzf level-0 spill must sort successfully");
         assert!(output.exists(), "sorted output not written");
+    }
+
+    #[test]
+    fn test_phase_thread_flags_parse() {
+        use clap::Parser;
+        // Standalone: flags now live on SortOptions, still spelled --sort-threads / --merge-threads.
+        let cmd = Sort::parse_from([
+            "sort",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--sort-threads",
+            "2",
+            "--merge-threads",
+            "5",
+        ]);
+        assert_eq!(cmd.options.sort_threads, Some(2));
+        assert_eq!(cmd.options.merge_threads, Some(5));
+
+        // Defaults: unset => None (engine falls back to --threads).
+        let cmd = Sort::parse_from(["sort", "-i", "in.bam", "-o", "out.bam"]);
+        assert_eq!(cmd.options.sort_threads, None);
+        assert_eq!(cmd.options.merge_threads, None);
+    }
+
+    #[test]
+    fn test_runall_prefixed_phase_thread_flags_parse() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Probe {
+            #[command(flatten)]
+            sort: MultiSortOptions,
+        }
+        let p = Probe::parse_from(["x", "--sort::sort-threads", "3", "--sort::merge-threads", "7"]);
+        let opts = p.sort.validate().expect("validate");
+        assert_eq!(opts.sort_threads, Some(3));
+        assert_eq!(opts.merge_threads, Some(7));
     }
 
     /// Write a minimal valid coordinate-sorted BAM (one mapped record) to

@@ -4,6 +4,7 @@
 
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fgumi_sort::{PHASE2_DECOMP_CAP, SortMergeSlot, SpillBlockDecompressor};
 use parking_lot::Mutex;
@@ -21,6 +22,42 @@ use fgumi_pipeline_core::{
 /// Max raw blocks read+decompressed by a single `try_fill_some_slot` call.
 const MAX_BATCH_PER_CALL: usize = 4;
 
+/// CAS-acquire one decompress permit. `max == None` ⇒ unbounded (always succeeds).
+///
+/// Returns the [`DecompressPermit`] on success so ownership of the slot is
+/// encoded in the type: the count is released exactly once, when the returned
+/// permit drops, and acquisition cannot be separated from release. `None` ⇒ the
+/// cap is full and no slot was taken.
+#[must_use]
+fn try_acquire(active: &Arc<AtomicUsize>, max: Option<usize>) -> Option<DecompressPermit> {
+    let Some(max) = max else {
+        active.fetch_add(1, Ordering::AcqRel);
+        return Some(DecompressPermit { active: Arc::clone(active) });
+    };
+    let max = max.max(1);
+    let mut cur = active.load(Ordering::Acquire);
+    loop {
+        if cur >= max {
+            return None;
+        }
+        match active.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(DecompressPermit { active: Arc::clone(active) }),
+            Err(observed) => cur = observed,
+        }
+    }
+}
+
+/// RAII release of one decompress permit. Holds an OWNED `Arc` clone so it does
+/// not borrow `self` while `try_fill_some_slot(&mut self)` runs.
+struct DecompressPermit {
+    active: Arc<AtomicUsize>,
+}
+impl Drop for DecompressPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct RegisteredSpill {
     slot: Arc<SortMergeSlot>,
 }
@@ -33,6 +70,11 @@ pub struct SortSpillDecompress {
     block_dec: SpillBlockDecompressor,
     held: HeldSlot<Unpushed<SortPhase2Event>>,
     output_byte_limit: u64,
+    /// Shared admission counter: how many worker clones are currently inside the
+    /// decompress branch. Shared across all clones so the cap is global.
+    active: Arc<AtomicUsize>,
+    /// Maximum concurrent decompress workers. `None` ⇒ unbounded.
+    max_decompress: Option<usize>,
 }
 
 impl SortSpillDecompress {
@@ -49,7 +91,17 @@ impl SortSpillDecompress {
             block_dec: SpillBlockDecompressor::new(),
             held: HeldSlot::new(),
             output_byte_limit,
+            active: Arc::new(AtomicUsize::new(0)),
+            max_decompress: None,
         }
+    }
+
+    /// Cap the number of concurrent spill-decompression workers (Phase-2 CPU
+    /// control via `--merge-threads`). `None` (default) leaves it unbounded.
+    #[must_use]
+    pub fn with_max_concurrency(mut self, max: Option<usize>) -> Self {
+        self.max_decompress = max;
+        self
     }
 
     fn flush_held(&mut self, ctx: &mut StepCtx<'_, Self>) -> bool {
@@ -147,6 +199,9 @@ impl Clone for SortSpillDecompress {
             block_dec: SpillBlockDecompressor::new(),
             held: HeldSlot::new(),
             output_byte_limit: self.output_byte_limit,
+            // Share the SAME counter so the cap is global across all worker clones.
+            active: Arc::clone(&self.active),
+            max_decompress: self.max_decompress,
         }
     }
 }
@@ -189,9 +244,12 @@ impl Step for SortSpillDecompress {
             return Ok(StepOutcome::Progress);
         }
 
-        // 3. Greedy slot-fill step.
-        if self.try_fill_some_slot()? {
-            return Ok(StepOutcome::Progress);
+        // 3. Greedy slot-fill, admission-controlled by --merge-threads.
+        if let Some(_permit) = try_acquire(&self.active, self.max_decompress) {
+            if self.try_fill_some_slot()? {
+                return Ok(StepOutcome::Progress);
+            }
+            // permit drops here (also on the `?` early return), releasing the count
         }
 
         // 4. No fill work.
