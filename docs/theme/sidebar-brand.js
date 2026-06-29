@@ -5,7 +5,7 @@
 (function () {
     // Selectively clear only sidebar visibility state (not theme preference).
     // Bumping this version resets fold/sidebar state for all returning visitors.
-    var SIDEBAR_VERSION = '3';
+    var SIDEBAR_VERSION = '4';
     if (localStorage.getItem('fg-sidebar-version') !== SIDEBAR_VERSION) {
         localStorage.removeItem('sidebar');
         localStorage.setItem('fg-sidebar-version', SIDEBAR_VERSION);
@@ -164,12 +164,39 @@
         }
     }
 
+    // ── Whole-row fold for draft-chapter section headers ──────────────────────
+    // Section headers (Core Concepts, Consensus Calling, ...) are mdBook "draft
+    // chapters": non-link <span>s that fold their children. mdBook only wires
+    // its fold handler to the small ❱ arrow (a.chapter-fold-toggle), so by
+    // default clicking the header *text* does nothing. Delegate clicks at the
+    // document level (the TOC is injected asynchronously by mdBook's toc.js, so
+    // a stable ancestor is the reliable place to listen) and forward a click on
+    // anywhere in a draft header row to that existing toggle — reusing mdBook's
+    // own fold logic and persistence rather than reimplementing it.
+    function enableDraftHeaderFold() {
+        document.addEventListener('click', function (e) {
+            // Clicks can land on a Text node (e.g. directly on header text), and
+            // closest() is an Element-only method — normalize to an element first
+            // so the handler never throws and silently skips the fold.
+            var target = e.target instanceof Element ? e.target : e.target.parentElement;
+            if (!target) return;
+            // Real anchors (child page links, the ❱ arrow itself, brand links)
+            // handle their own clicks — don't hijack or double-toggle them.
+            if (target.closest('a')) return;
+            var wrapper = target.closest('.chapter-link-wrapper');
+            if (!wrapper) return;
+            var toggle = wrapper.querySelector('a.chapter-fold-toggle');
+            if (toggle) toggle.click();
+        });
+    }
+
     // ── Init ──────────────────────────────────────────────────────────────────
     function init() {
         injectBrand();
         injectFooter();
         injectBreadcrumb();
         colorMenuTitle();
+        enableDraftHeaderFold();
     }
 
     if (document.readyState === 'loading') {

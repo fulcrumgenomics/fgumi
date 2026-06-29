@@ -573,6 +573,16 @@ Three distribution types are supported:
 3. **Empirical**: Load from `fgumi group -f` histogram output
    - Parameter: `--family-size-dist /path/to/histogram.tsv`
 
+Use **log-normal** as the default model of PCR amplification, **negative binomial** when you want an alternative over-dispersed model, and **empirical** to reproduce the family-size profile of a specific real dataset.
+
+### Reproducibility
+
+Pass `--seed <INT>` to make a run reproducible: the same seed, the same fgumi version, and the same inputs produce the same reads in the same order, which is what makes simulated data usable as regression-test fixtures. Omit `--seed` for a fresh random draw each run. The simulated reads are independent of the thread count for a given seed; note that the thread count can change the gzip block framing of a `.gz` output, so compare decompressed records rather than raw compressed bytes.
+
+### Methylation Simulation
+
+The `--methylation-*` options apply only when simulating EM-Seq / TAPs data; leave them unset for standard (non-bisulfite) libraries. They let you generate reads with realistic C→T conversion and `MM`/`ML` methylation tags so you can exercise the methylation-aware consensus and filter paths. See the [Methylation Pipeline Guide](src/guide/methylation.md).
+
 ### Quality Score Model
 
 Quality scores follow a three-phase model:

@@ -8,6 +8,20 @@ Reads with the same molecular identifier (MI tag) are examined base-by-base to d
 2. Computing the maximum posterior probability base
 3. Adjusting the output consensus base quality
 
+> **Output is unmapped.** `simplex`, `duplex`, and `codec` all emit an **unmapped** BAM — inferring the consensus alignment directly is error-prone, so the consensus reads must be re-aligned before filtering or variant calling. The usual next step is `fgumi fastq | <aligner> | fgumi zipper | fgumi sort` (see [Getting Started](getting-started.md) and [Best Practices](best-practices.md)). The consensus callers can also write per-read and per-base evidence tags (`cD`, `cM`, `cE`, and the duplex `a*`/`b*` variants); per-base tags are enabled by default — set `--output-per-base-tags false` to disable them — and see [Tracking Reads](tracking-reads.md) for their meaning.
+
+## Choosing a Consensus Method
+
+fgumi has three consensus callers. Pick the one that matches your library preparation:
+
+| Method | Command | Use when | Grouping strategy |
+|--------|---------|----------|-------------------|
+| **Simplex** (single-strand) | `fgumi simplex` | Reads carry a single UMI per molecule and you want to collapse PCR/sequencing duplicates. The most common choice. | `adjacency` |
+| **Duplex** (double-strand) | `fgumi duplex` | The library tags both strands of each molecule (duplex UMIs), and you want the lowest error rate by requiring both strands to agree. | `paired` (required) |
+| **CODEC** | `fgumi codec` | The library was prepared with the CODEC protocol, where a single read pair sequences both strands. | `adjacency` |
+
+Duplex is the most error-suppressing but needs both strands observed, so it yields fewer consensus reads; simplex retains the most reads. When unsure, your library prep kit determines the answer — duplex UMIs require `fgumi duplex`, and only CODEC libraries should use `fgumi codec`. See [Duplex Consensus Calling](duplex-consensus-calling.md) for the duplex model.
+
 ## Glossary
 
 | Symbol | Description |
@@ -78,11 +92,17 @@ Q_call = -10 * log10(Pr_err')
 
 The final consensus base quality represents the probability of error across the entire process: from sample extraction through library preparation, UMI integration, amplification, and sequencing.
 
-Any consensus base with quality below the minimum threshold is masked to `N`.
+Any consensus base whose quality falls below `--min-consensus-base-quality` (default 2) is masked to `N`.
 
 ## Caveats
 
-- Each end of a pair is treated independently; overlapping bases within a pair are jointly called by default (disable with `--consensus-call-overlapping-bases false`)
-- Indel errors in the reads are not considered in the consensus model
-- `simplex` and `codec` do not accept a `--sort-order` flag; consensus reads are emitted as
-  unmapped and should be sorted by the downstream pipeline (`fgumi zipper` + `fgumi sort`)
+- Overlapping bases within a read pair are jointly called by default; pass `--consensus-call-overlapping-bases false` to treat each end of the pair independently
+- Indel errors in the reads are not modeled. The caller compares reads base-by-base at each position, so it assumes the reads of a family are already in phase (as aligned reads of the same molecule generally are). An indel in a raw read would shift its bases out of phase and is not corrected here — it instead shows up as elevated disagreement (and thus lower consensus quality) at the affected positions.
+- `simplex` and `codec` do not accept a `--sort-order` flag; the unmapped consensus reads are
+  re-aligned and sorted by the downstream pipeline (`fgumi fastq | <aligner> | fgumi zipper | fgumi sort`)
+
+## See Also
+
+- [Duplex Consensus Calling](duplex-consensus-calling.md) — the two-strand model and its parameters
+- [Tracking Reads](tracking-reads.md) — the per-read and per-base consensus tags
+- [Best Practices](best-practices.md) — recommended consensus and filter parameters by application

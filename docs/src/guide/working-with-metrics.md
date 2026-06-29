@@ -68,9 +68,17 @@ pass_rate	0.8542
 The `position_group_sizes.txt` file is only written when using `--metrics`; it is not available
 through the individual `--family-size-histogram`/`--grouping-metrics` flags.
 
-A large fraction of singleton families in `family_sizes.txt` may indicate UMI collisions,
-over-sequencing, or incorrect read structures. A distribution skewed toward large values in
-`position_group_sizes.txt` may indicate UMI exhaustion or very high on-target duplication.
+`family_sizes.txt` is a histogram — one row per family size, with counts and cumulative fractions:
+
+```text
+family_size	count	fraction	fraction_gt_or_eq_size
+1	8200	0.41	1.000
+2	5100	0.255	0.590
+3	3400	0.17	0.335
+4	1800	0.09	0.165
+```
+
+**Rules of thumb.** A healthy library shows most families at size 2 or greater, with a tail of larger families. A *large* fraction of singletons (size 1) usually points to insufficient depth relative to library complexity, or an incorrect read structure putting the wrong bases in `RX`. A `position_group_sizes.txt` distribution skewed toward large values points to UMI exhaustion or very high on-target duplication. See [Troubleshooting](troubleshooting.md) if singletons dominate.
 
 ## Duplex Metrics
 
@@ -165,3 +173,9 @@ fgumi compare metrics file1.txt file2.txt --precision 6 --rel-tol 1e-6
 This is useful for validating that pipeline changes produce equivalent results. See the [compare documentation](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/compare-cli.md) for details.
 
 > **Note:** `fgumi compare` is a developer tool not included in standard builds. Build with `--features compare` to enable it: `cargo build --release --features compare`.
+
+## See Also
+
+- [UMI Grouping](umi-grouping.md) — the grouping metrics and what they reveal about library quality
+- [Consensus Calling](consensus-calling.md) — the consensus statistics reported via `--stats`
+- [Best Practices](best-practices.md) — where metrics fit in the recommended workflow

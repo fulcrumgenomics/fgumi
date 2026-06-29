@@ -838,8 +838,8 @@ different cells are never grouped together, even if they share a UMI sequence an
 The cell barcode is read from the standard `CB` tag. No correction or
 error-handling is performed on cell barcodes; they must be corrected upstream.
 
-Multi-threaded operation is supported via --threads N, which spawns N pipeline threads
-allocated based on the command's workload profile to optimize performance.
+Pass --threads N to run the pipeline on N threads, split across reading, the UMI-assignment
+workers, and writing.
 
 Example: --threads 8 spawns 8 pipeline threads (2 reader, 4 workers, 2 writer)
 

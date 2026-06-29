@@ -20,6 +20,7 @@ fgumi is the Rust successor to [fgbio](https://github.com/fulcrumgenomics/fgbio)
 | *(no equivalent)* | `simplex-metrics` | New: simplex QC metrics (yield, family sizes, UMI counts) |
 | *(samtools merge)* | `merge` | k-way merge of pre-sorted BAMs; supports all sort orders |
 | `ReviewConsensusVariants` | `review` | |
+| *(no equivalent)* | `runall` | New: fuse a whole multi-stage pipeline into one streaming command |
 
 ## Key Differences
 
@@ -34,11 +35,15 @@ fgumi supports Unix pipe-based streaming for the alignment workflow:
 ```bash
 fgumi fastq --input unaligned.bam \
   | bwa mem -p -K 150000000 -Y ref.fa - \
-  | fgumi zipper --unmapped unaligned.bam \
+  | fgumi zipper --unmapped unaligned.bam --reference ref.fa \
   | fgumi sort --output sorted.bam --order template-coordinate
 ```
 
 This replaces multiple separate fgbio/picard steps (SortBam, ZipperBams/MergeBamAlignment) with a single streaming pass. `fgumi zipper` accepts SAM or BAM on stdin or via `--input`; for best performance, pipe uncompressed BAM from the aligner (e.g. `bwa-mem3 mem --bam=0`).
+
+### Fused Pipeline (`runall`)
+
+fgbio has no equivalent to `fgumi runall`, which fuses an entire pipeline — extract, correct, align, zipper, sort, group, consensus, and filter — into one in-memory command. Where an fgbio workflow chains many tools and writes a BAM between each, `runall` streams records directly between stages and writes none. Choose the slice with `--start-from` and `--stop-after`; the output is identical to running the individual commands. See [Running Pipelines](running-pipelines.md).
 
 ### Merging Multiple BAMs
 
@@ -144,3 +149,9 @@ fgumi focuses on UMI-based tools. The following fgbio tools do **not** have fgum
 - FASTQ/FASTA utilities (e.g., `FastqToBam`, `HardMaskFasta`)
 
 Continue using fgbio for these tools.
+
+## See Also
+
+- [Getting Started](getting-started.md) — the fgumi workflow end to end
+- [Running Pipelines](running-pipelines.md) — `fgumi runall`, which has no fgbio equivalent
+- [Best Practices](best-practices.md) — recommended parameters by application

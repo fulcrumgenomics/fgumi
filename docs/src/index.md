@@ -1,6 +1,6 @@
 <h1><span style="color:#26a8e0">fg</span><span style="color:#38b44a">umi</span></h1>
 
-High-performance tools for UMI-tagged sequencing data: extraction, grouping, and consensus calling.
+High-performance tools for UMI-tagged sequencing data: UMI extraction and correction, alignment support, grouping, deduplication, simplex/duplex/CODEC consensus calling, filtering, and QC metrics.
 
 ![fgumi Pipeline](images/fgumi_subway.png)
 
@@ -52,24 +52,29 @@ cargo build --release
 
 ## Available Commands
 
-| Command | Description |
-|---------|-------------|
-| `extract` | Extract UMIs from FASTQ files |
-| `correct` | Correct UMIs based on sequence similarity |
-| `fastq` | Convert BAM to FASTQ format |
-| `zipper` | Restore original FASTQ from unaligned BAM |
-| `sort` | Sort BAM by coordinate/queryname/template |
-| `group` | Group reads by UMI |
-| `dedup` | Mark/remove UMI-aware duplicates |
-| `simplex` | Call single-strand consensus reads |
-| `duplex` | Call duplex consensus reads |
-| `codec` | Call CODEC consensus |
-| `filter` | Filter consensus reads |
-| `clip` | Clip overlapping read pairs |
-| `duplex-metrics` | Collect duplex metrics |
-| `review` | Review consensus variants |
-| `downsample` | Downsample BAM by UMI family |
-| `simplex-metrics` | Collect simplex metrics |
-| `merge` | Merge sorted BAM files |
+> **Running more than one stage?** Use [`fgumi runall`](guide/running-pipelines.md) to fuse the whole pipeline into a single streaming command — no intermediate BAMs, identical output. Use the individual commands below for a single stage, to inspect an intermediate, or to collect per-stage metrics.
 
-See the [Tool Reference](tools/README.md) for detailed documentation of each command.
+The commands below are grouped by pipeline stage.
+
+| Stage | Command | Description |
+|-------|---------|-------------|
+| UMI extraction | `extract` | Extract UMIs from FASTQ and create an unmapped BAM |
+| UMI extraction | `correct` | Correct UMIs in a BAM to a fixed set of UMIs |
+| Alignment support | `fastq` | Convert BAM to interleaved FASTQ for an aligner |
+| Alignment support | `zipper` | Merge an aligned BAM with its unmapped BAM, restoring tags |
+| Alignment support | `sort` | Sort by coordinate, queryname, or template-coordinate |
+| Alignment support | `merge` | Merge pre-sorted BAM files into one sorted BAM |
+| Grouping & dedup | `group` | Group reads by UMI to identify reads from the same molecule |
+| Grouping & dedup | `dedup` | Mark or remove PCR duplicates using UMI information |
+| Consensus | `simplex` | Call single-strand consensus reads |
+| Consensus | `duplex` | Call duplex (double-strand) consensus reads |
+| Consensus | `codec` | Call CODEC duplex consensus reads |
+| Post-consensus | `filter` | Filter and mask consensus reads by quality |
+| Post-consensus | `clip` | Clip overlapping bases in read pairs |
+| QC metrics | `simplex-metrics` | Collect QC metrics for simplex data |
+| QC metrics | `duplex-metrics` | Collect QC metrics for duplex data |
+| QC metrics | `review` | Extract data to review consensus variant calls |
+| Utilities | `downsample` | Downsample a BAM by UMI family |
+| Utilities | `runall` | Fused multi-stage pipeline (extract → … → filter, no intermediate BAMs) |
+
+See the [Tool Reference](tools/README.md) for detailed documentation of each command, and [Running Pipelines](guide/running-pipelines.md) for `runall`.

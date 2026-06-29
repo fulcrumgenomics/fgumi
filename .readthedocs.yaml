@@ -8,8 +8,11 @@ build:
     # Install mdbook
     - cargo install mdbook --version 0.5.2
 
-    # Generate documentation markdown and build the mdbook site
-    - cargo run --package xtask --release -- docs-build
+    # Generate documentation markdown and build the mdbook site. A debug build
+    # is used deliberately: xtask only emits Markdown and shells out to the
+    # mdbook binary, so an optimized build adds compile time (and peak memory)
+    # with byte-identical output.
+    - cargo run --package xtask -- docs-build
 
     # Move output to where Read the Docs expects it
     - mkdir -p _readthedocs/html

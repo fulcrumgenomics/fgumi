@@ -13,9 +13,16 @@ their own BAM sort tools without taking on the rest of fgumi.
 
 ## Performance
 
-External merge-sort with parallel radix sort over packed sort keys, K-way merge via a
-loser tree, async I/O prefetch, libdeflate-backed BGZF, and free-space-aware temp-dir
-round-robin. Faster than `samtools sort` on the workloads it targets.
+External merge-sort built from:
+
+- parallel radix sort over packed sort keys for in-memory chunks
+- K-way merge via a loser tree to combine spill files
+- async I/O prefetch and spill compression (BGZF legacy / Zstd default)
+- free-space-aware, round-robin spill across multiple temp directories
+
+Designed to outperform `samtools sort` on the large-BAM sort workloads it
+targets; actual speedup depends on the data, sort order, thread count, and
+hardware.
 
 ## Usage
 

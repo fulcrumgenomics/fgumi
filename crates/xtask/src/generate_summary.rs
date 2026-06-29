@@ -28,6 +28,21 @@ pub fn generate(
         let _ = writeln!(md, "- [{}]({})", entry.0, entry.1);
     }
 
+    // Running Pipelines — fgumi runall vs individual commands
+    let running = ("Running Pipelines", "guide/running-pipelines.md");
+    if docs_src.join(running.1).exists() {
+        let _ = writeln!(md, "- [{}]({})", running.0, running.1);
+    }
+
+    // Methylation — a single standalone guide, so it renders as a top-level leaf
+    // rather than a collapsible section wrapping one child. Standalone pages are
+    // listed before the collapsible groups so the sidebar's plain links and
+    // expandable section headers form two visually distinct zones.
+    let methylation = ("Methylation", "guide/methylation.md");
+    if docs_src.join(methylation.1).exists() {
+        let _ = writeln!(md, "- [{}]({})", methylation.0, methylation.1);
+    }
+
     // Core Concepts sub-group
     let core_concepts = [
         ("Read Structures", "guide/read-structures.md"),
@@ -46,25 +61,13 @@ pub fn generate(
 
     // Consensus sub-group
     let consensus = [
-        ("Consensus Calling", "guide/consensus-calling.md"),
+        ("Simplex Consensus Calling", "guide/consensus-calling.md"),
         ("Duplex Consensus Calling", "guide/duplex-consensus-calling.md"),
     ];
     let consensus_exists = consensus.iter().any(|(_, p)| docs_src.join(p).exists());
     if consensus_exists {
         md.push_str("- [Consensus Calling]()\n");
         for (title, path) in &consensus {
-            if docs_src.join(path).exists() {
-                let _ = writeln!(md, "  - [{title}]({path})");
-            }
-        }
-    }
-
-    // Methylation sub-group
-    let methylation = [("Pipeline Guide", "guide/methylation.md")];
-    let methylation_exists = methylation.iter().any(|(_, p)| docs_src.join(p).exists());
-    if methylation_exists {
-        md.push_str("- [Methylation]()\n");
-        for (title, path) in &methylation {
             if docs_src.join(path).exists() {
                 let _ = writeln!(md, "  - [{title}]({path})");
             }
@@ -82,6 +85,19 @@ pub fn generate(
     if advanced_exists {
         md.push_str("- [Advanced Topics]()\n");
         for (title, path) in &advanced {
+            if docs_src.join(path).exists() {
+                let _ = writeln!(md, "  - [{title}]({path})");
+            }
+        }
+    }
+
+    // Reference sub-group
+    let reference =
+        [("Glossary", "guide/glossary.md"), ("Troubleshooting", "guide/troubleshooting.md")];
+    let reference_exists = reference.iter().any(|(_, p)| docs_src.join(p).exists());
+    if reference_exists {
+        md.push_str("- [Reference]()\n");
+        for (title, path) in &reference {
             if docs_src.join(path).exists() {
                 let _ = writeln!(md, "  - [{title}]({path})");
             }
@@ -153,17 +169,38 @@ pub fn generate(
 
     let mut assigned: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
+    // Partition categories into single-page ones (rendered as flat leaves) and
+    // multi-page ones (collapsible groups). Leaves are emitted before groups so
+    // the part's plain links and expandable section headers form two visually
+    // distinct zones, matching the User Guide layout.
+    let mut single_page_metrics: Vec<&MetricPage> = Vec::new();
+    let mut grouped_metrics: Vec<(&str, Vec<&MetricPage>)> = Vec::new();
     for (group_name, prefixes) in metric_groups {
         let matches: Vec<&MetricPage> = metric_pages
             .iter()
             .filter(|p| prefixes.iter().any(|pfx| p.name.starts_with(pfx)))
             .collect();
-        if !matches.is_empty() {
-            let _ = writeln!(md, "- [{group_name}]()");
-            for page in &matches {
-                let _ = writeln!(md, "  - [{}]({})", page.name, page.path);
-                assigned.insert(page.name.as_str());
-            }
+        match matches.as_slice() {
+            [] => {}
+            [single] => single_page_metrics.push(single),
+            _ => grouped_metrics.push((group_name, matches)),
+        }
+    }
+
+    // Single-page categories first, as top-level leaves with a humanized label
+    // (`ConsensusMetrics` -> `Consensus Metrics`) so they aren't hidden behind a
+    // fold toggle that wraps a single entry.
+    for single in &single_page_metrics {
+        let _ = writeln!(md, "- [{}]({})", humanize_metric_name(&single.name), single.path);
+        assigned.insert(single.name.as_str());
+    }
+
+    // Then the collapsible multi-page groups.
+    for (group_name, matches) in &grouped_metrics {
+        let _ = writeln!(md, "- [{group_name}]()");
+        for page in matches {
+            let _ = writeln!(md, "  - [{}]({})", page.name, page.path);
+            assigned.insert(page.name.as_str());
         }
     }
 
@@ -181,4 +218,18 @@ pub fn generate(
 
     fs::write(docs_src.join("SUMMARY.md"), md)?;
     Ok(())
+}
+
+/// Insert a space before each interior capital letter so a CamelCase metric name
+/// reads as a normal label when its section collapses to a single leaf entry
+/// (e.g. `ConsensusMetrics` -> `Consensus Metrics`).
+fn humanize_metric_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for (i, ch) in name.char_indices() {
+        if i > 0 && ch.is_ascii_uppercase() {
+            out.push(' ');
+        }
+        out.push(ch);
+    }
+    out
 }

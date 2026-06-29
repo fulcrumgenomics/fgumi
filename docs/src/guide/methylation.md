@@ -18,7 +18,7 @@ Both EM-Seq and TAPs detect cytosine methylation by converting one class of cyto
 C→T conversion affects consensus calling: at a reference C position, reads showing T are not errors — they represent conversion events. Standard consensus calling would treat C/T disagreements as sequencing errors and penalize quality. Methylation mode recognizes these as conversion events and tracks per-base evidence through consensus calling.
 
 **UMI sequences:**
-- **EM-Seq**: UMIs should be synthesized with methylated cytosines (5mC) to protect them from enzymatic conversion. Unmethylated C in UMIs is a library prep issue.
+- **EM-Seq**: UMIs should be synthesized with methylated cytosines (5mC) so the enzymatic conversion leaves them intact. If a fixed-UMI design instead used ordinary (unmethylated) C, those bases convert to T on the top strand (or to A on the bottom strand), and each converted base must be absorbed by `--max-mismatches` during correction (see [Workflow B](#step-2-umi-correction)).
 - **TAPs**: UMIs are unaffected — synthetic oligonucleotides contain unmethylated cytosines, which TAPs does not convert.
 
 ---
@@ -260,7 +260,7 @@ fgumi correct \
   --threads 8
 ```
 
-If your UMI design includes unmethylated cytosines, add `--allow-c-to-t`. This flag applies uniformly across all UMI segments regardless of read-pair index, since both R1 and R2 UMI segments are in forward orientation. Only C-to-T tolerance is needed; G-to-A tolerance is not required.
+In EM-Seq, the ideal is to synthesize fixed UMIs with methylated cytosines (5mC) so the conversion leaves them unchanged — this is strongly preferred. If instead your UMIs contain ordinary cytosines, the conversion turns each into a T on the top strand (or an A on the bottom strand), and `fgumi correct` simply sees that as a mismatch against the whitelist: it will correct only if `--max-mismatches` is high enough to absorb the converted bases, which also lowers specificity. There is no dedicated conversion-aware correction mode; raise `--max-mismatches` to suit your UMI length and expected conversion count, or (better) protect the UMIs with 5mC. (`--revcomp` only reverse-complements the whole hyphenated UMI before matching; it is unrelated to conversion.)
 
 ### Steps 3-8: Alignment through Final Sort
 
@@ -283,7 +283,7 @@ When methylation mode is enabled, consensus reads carry additional BAM tags for 
 
 ### Duplex Output Tags
 
-All simplex tags above (combined from both strands), plus per-strand tags:
+All simplex tags above (combined from both strands), plus per-strand tags. The `AB` and `BA` labels denote the two strand orientations of the duplex molecule (see the [Glossary](glossary.md#strand-labels)):
 
 | Tag | Type | Description |
 |-----|------|-------------|
@@ -416,3 +416,9 @@ If many reads fail `--min-conversion-fraction`:
 ### Using the Wrong Methylation Mode
 
 If you use `--methylation-mode em-seq` for TAPs data (or vice versa), the methylation probabilities will be inverted — methylated positions will show low probability and vice versa. If downstream analysis shows unexpected methylation patterns, verify you used the correct mode for your chemistry.
+
+## See Also
+
+- [Consensus Calling](consensus-calling.md) and [Duplex Consensus Calling](duplex-consensus-calling.md) — the consensus models methylation mode builds on
+- [Best Practices](best-practices.md) — the standard (non-methylation) pipeline this guide extends
+- [Working with Metrics](working-with-metrics.md) — QC for methylation runs

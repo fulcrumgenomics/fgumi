@@ -182,11 +182,38 @@ h1, h2, h3, h4, h5, h6 {
     text-decoration: none;
 }
 
-/* Section header spans (no-link items like "Core Concepts") */
+/* Section header spans (no-link draft chapters like "Core Concepts").
+   sidebar-brand.js makes the whole row fold its section on click, so render
+   the header as interactive (blue, pointer cursor) — blue now consistently
+   means "clickable" across both navigable links and foldable headers. */
 .sidebar .chapter-link-wrapper > span {
     color: var(--fg-blue) !important;
     font-size: 0.8rem;
     font-weight: 500;
+    cursor: pointer;
+}
+
+/* Top-level standalone pages (Home, Getting Started, Running Pipelines,
+   Methylation, the section Indexes, single-page metrics) are real links, not
+   draft-chapter spans, so they would otherwise pick up the light link color and
+   look out of place among the blue section headers. Color them blue to match
+   when not the current page; the active rule below keeps the current page white
+   with the green accent bar. Nested child pages keep the default link color. */
+.sidebar .chapter > li.chapter-item > .chapter-link-wrapper > a:not(.active) {
+    color: var(--fg-blue) !important;
+}
+.sidebar .chapter > li.chapter-item > .chapter-link-wrapper > a:not(.active):hover {
+    color: var(--fg-sky) !important;
+}
+
+/* mdBook 0.5 injects the *current* page's in-page headings into the left
+   sidebar as an always-expanded ".on-this-page" outline under the active entry.
+   That makes the active item (e.g. Home, or a guide page's "Workflow" steps)
+   the one thing in the sidebar that cannot be collapsed, clashing with the
+   uniform collapsible sections. Hide it; the page's headings remain visible in
+   the page body itself. */
+.sidebar .on-this-page {
+    display: none !important;
 }
 
 /* Active page — green left-bar accent */
@@ -199,9 +226,11 @@ h1, h2, h3, h4, h5, h6 {
 .sidebar a.active::before {
     content: '';
     position: absolute;
-    left: 0;
-    top: 0;
-    bottom: 0;
+    /* Sit in the left gutter rather than flush against the text, so there is a
+       clear gap between the accent bar and the active label. */
+    left: -0.6rem;
+    top: 0.1rem;
+    bottom: 0.1rem;
     width: 3px;
     background: var(--fg-green);
     border-radius: 0 2px 2px 0;

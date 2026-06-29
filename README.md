@@ -4,7 +4,7 @@
 [![Documentation at docs.rs](https://img.shields.io/docsrs/fgumi)](https://docs.rs/fgumi)
 [![codecov](https://codecov.io/gh/fulcrumgenomics/fgumi/graph/badge.svg)](https://codecov.io/gh/fulcrumgenomics/fgumi)
 [![Bioconda](https://img.shields.io/conda/vn/bioconda/fgumi.svg?label=bioconda)](https://bioconda.github.io/recipes/fgumi/README.html)
-[![License](http://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/fulcrumgenomics/fgumi/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18702470.svg)](https://doi.org/10.5281/zenodo.18702470)
 
 # fgumi
@@ -12,13 +12,10 @@
 **⚠️ RESEARCH PREVIEW - USE AT YOUR OWN RISK**
 
 This software is currently a **research preview**. While we have extensively
-tested these tools across a wide variety of vendor-provided data, **no
-guarantees are made** regarding correctness or stability.
+tested these tools across a wide variety of vendor-provided data, we make **no
+guarantees** regarding correctness or stability.
 
-We are targeting **June 1, 2026** to recommend fgumi over
-[fgbio](https://github.com/fulcrumgenomics/fgbio) for production use.
-
-Fulcrum Genomics Unique Molecular Indexing (UMI) Tools - a suite of high-performance tools for working with UMI-tagged sequencing data.
+High-performance tools for UMI-tagged sequencing data, from Fulcrum Genomics.
 
 <p>
 <a href="https://fulcrumgenomics.com">
@@ -58,22 +55,30 @@ The diagram shows the workflow from FASTQ files to filtered consensus reads:
 - **Green**: CODEC consensus
 - **Orange**: Optional UMI correction for fixed UMI sets
 
+## Where to Use fgumi
+
+- **Command line** — install and run fgumi directly on your data; see the [Getting Started guide](docs/src/guide/getting-started.md).
+- **Nextflow** — [fastquorum](https://github.com/fulcrumgenomics/fastquorum) provides an end-to-end FASTQ-to-consensus workflow built on fgumi.
+- **Latch.bio** — run fgumi in the cloud through a point-and-click interface via [Latch.bio](https://latch.bio), no installation required.
+
 ## Resources
 
 * [Documentation](https://docs.rs/fgumi)
-* [Best Practice Pipeline](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/src/guide/best-practices.md): Recommended workflow from FASTQ to consensus
-* [Performance Tuning Guide](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/src/guide/performance-tuning.md): Threading, memory, and compression optimization
-* [Snakemake Pipeline](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/FastqToConsensus-RnD.smk): Reference implementation
-* [Metrics](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/src/guide/working-with-metrics.md): Output metrics documentation
-* [Developing](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/DEVELOPING.md): Developer guide
-* [Compare CLI](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/compare-cli.md): Compare command documentation (feature-gated)
-* [Simulate CLI](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/simulate-cli.md): Simulate command documentation (feature-gated)
+* [Getting Started](docs/src/guide/getting-started.md): Tutorial workflow from FASTQ to consensus
+* [Running Pipelines](docs/src/guide/running-pipelines.md): `fgumi runall` and when to use it
+* [Best Practice Pipeline](docs/src/guide/best-practices.md): Recommended workflow from FASTQ to consensus
+* [Performance Tuning Guide](docs/src/guide/performance-tuning.md): Threading, memory, and compression optimization
+* [Snakemake Pipeline](docs/FastqToConsensus-RnD.smk): Reference implementation
+* [Metrics](docs/src/guide/working-with-metrics.md): Output metrics documentation
+* [Developing](docs/DEVELOPING.md): Developer guide
+* [Compare CLI](docs/compare-cli.md): Compare command documentation (feature-gated)
+* [Simulate CLI](docs/simulate-cli.md): Simulate command documentation (feature-gated)
 * [Releases](https://github.com/fulcrumgenomics/fgumi/releases)
 * [Issues](https://github.com/fulcrumgenomics/fgumi/issues): Report a bug or request a feature
 * [Pull requests](https://github.com/fulcrumgenomics/fgumi/pulls): Submit a patch or new feature
 * [Discussions](https://github.com/fulcrumgenomics/fgumi/discussions): Ask a question
-* [Contributors guide](https://github.com/fulcrumgenomics/fgumi/blob/main/CONTRIBUTING.md)
-* [License](https://github.com/fulcrumgenomics/fgumi/blob/main/LICENSE): Released under the MIT license
+* [Contributors guide](CONTRIBUTING.md)
+* [License](LICENSE): Released under the MIT license
 
 ## Installation
 
@@ -115,11 +120,12 @@ Enable with: `cargo build --release --features <feature>`
 
 | Command | Description | Equivalent Tool(s) |
 |---------|-------------|------------------|
-| `extract` | Extract UMIs from FASTQ files | `fgbio ExtractUmisFromBam` |
-| `correct` | Correct UMIs based on sequence similarity | `fgbio CorrectUmis` |
-| `zipper` | Restore original FASTQ from unaligned BAM | `fgbio ZipperBams`, `picard MergeBamAlignment` |
-| `fastq` | Convert BAM to FASTQ format | `samtools fastq` |
-| `sort` | Sort BAM by coordinate/queryname/template | — |
+| `extract` | Extract UMIs from FASTQ and create an unmapped BAM | `fgbio FastqToBam` + `fgbio ExtractUmisFromBam` |
+| `correct` | Correct UMIs in a BAM to a fixed set of UMIs | `fgbio CorrectUmis` |
+| `fastq` | Convert BAM to interleaved FASTQ for an aligner | `samtools fastq` |
+| `zipper` | Merge an aligned BAM with its unmapped BAM, restoring tags | `fgbio ZipperBams`, `picard MergeBamAlignment` |
+| `sort` | Sort by coordinate, queryname, or template-coordinate | `samtools sort` |
+| `merge` | Merge pre-sorted BAM files into one sorted BAM | `samtools merge` |
 | `group` | Group reads by UMI | `fgbio GroupReadsByUmi` |
 | `dedup` | Mark/remove UMI-aware duplicates | `gatk UmiAwareMarkDuplicatesWithMateCigar`, `umi-tools dedup` |
 | `simplex` | Call single-strand consensus reads | `fgbio CallMolecularConsensusReads` |
@@ -127,9 +133,11 @@ Enable with: `cargo build --release --features <feature>`
 | `codec` | Call CODEC consensus | `fgbio CallCodecConsensusReads` |
 | `filter` | Filter consensus reads | `fgbio FilterConsensusReads` |
 | `clip` | Clip overlapping read pairs | `fgbio ClipBam` |
-| `duplex-metrics` | Collect duplex metrics | `fgbio CollectDuplexSeqMetrics` |
+| `simplex-metrics` | Collect simplex QC metrics | — |
+| `duplex-metrics` | Collect duplex QC metrics | `fgbio CollectDuplexSeqMetrics` |
 | `review` | Review consensus variants | `fgbio ReviewConsensusVariants` |
 | `downsample` | Downsample BAM by UMI family | N/A |
+| `runall` | Fused multi-stage pipeline (extract → … → filter, no intermediate BAMs) | N/A |
 | `compare <cmd>` | Compare files (feature-gated) | N/A |
 | `simulate <cmd>` | Generate test data (feature-gated) | N/A |
 
@@ -141,6 +149,8 @@ fgumi <command> --help
 ```
 
 ### Basic Workflow
+
+> **Tip:** the multi-stage steps below can run as a single `fgumi runall` command — same output, no intermediate BAMs. See [Running Pipelines](docs/src/guide/running-pipelines.md). The individual commands are shown here so each stage is visible and tunable.
 
 1. **Extract UMIs** from FASTQ:
 ```bash
@@ -165,7 +175,7 @@ fgumi correct \
 ```bash
 fgumi fastq --input unaligned.bam \
   | bwa mem -p ref.fa - \
-  | fgumi zipper --unmapped unaligned.bam \
+  | fgumi zipper --unmapped unaligned.bam --reference ref.fa \
   | fgumi sort --output sorted.bam --order template-coordinate
 ```
 
@@ -232,12 +242,12 @@ fgumi supports multi-threading and memory management for optimal performance:
 > 2. **Queue memory < total process memory:** Actual RSS will be higher due to
 >    UMI data structures, decompressors, thread stacks, and working buffers.
 >
-> See the [Performance Tuning Guide](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/src/guide/performance-tuning.md)
+> See the [Performance Tuning Guide](docs/src/guide/performance-tuning.md)
 > for detailed guidance, including scenario-based configurations and troubleshooting.
 
 ## Performance
 
-fgumi is written in Rust for maximum performance.
+fgumi is written in Rust and tuned for high-throughput BAM processing.
 
 ### Command-Level Optimizations
 
@@ -283,6 +293,6 @@ Development of fgumi is supported by [Fulcrum Genomics](https://www.fulcrumgenom
 ## Disclaimer
 
 This software is under active development.
-While we make a best effort to test this software and to fix issues as they are reported, this software is provided as-is without any warranty (see the [license](https://github.com/fulcrumgenomics/fgumi/blob/main/LICENSE) for details).
+While we make a best effort to test this software and to fix issues as they are reported, this software is provided as-is without any warranty (see the [license](LICENSE) for details).
 Please submit an [issue](https://github.com/fulcrumgenomics/fgumi/issues), and better yet a [pull request](https://github.com/fulcrumgenomics/fgumi/pulls) as well, if you discover a bug or identify a missing feature.
 Please contact [Fulcrum Genomics](https://www.fulcrumgenomics.com) if you are considering using this software or are interested in sponsoring its development.

@@ -23,11 +23,11 @@ Starting from a group of reads identified as originating from the same double-st
 
 ### Splitting Reads into Groups
 
-Reads are split by strand of origin (A or B) and whether they are sequencing read 1 or 2. R1s from strand A correspond to R2s from strand B, and vice versa.
+Reads are split by their strand sub-family (`A` or `B`, assigned by `fgumi group --strategy paired` from sequencing order — see [Tracking Reads](tracking-reads.md)) and by whether they are sequencing read 1 or 2. R1s from the `A` sub-family correspond to R2s from the `B` sub-family, and vice versa, which is why the duplex consensuses are formed from A1+B2 and A2+B1.
 
 ### Quality Trimming
 
-Reads can be end-trimmed to remove low-quality bases. This is highly recommended as it reduces disagreements in the consensus and fewer no-calls (`N`s). Trimming uses the same running-sum algorithm as BWA.
+Pass `--trim` to end-trim low-quality bases before consensus calling. This is highly recommended: it reduces consensus disagreements and no-calls (`N`s). Trimming uses the same running-sum algorithm as BWA.
 
 ### Masking Low-Quality Bases
 
@@ -35,7 +35,7 @@ Bases below the minimum quality threshold are converted to `N`s so they are not 
 
 ### Trimming to Insert Length
 
-Reads longer than the insert length read into adapter sequence. For duplex data, A1 and B2 reads may read into *different* adapter sequences. Calling consensus across different adapters produces many disagreements and no-calls, potentially causing consensus reads to be erroneously filtered. Reads are therefore trimmed to insert length before consensus calling.
+Reads longer than the insert length read into adapter sequence. For duplex data, A1 and B2 reads may read into *different* adapter sequences. Calling consensus across different adapters produces many disagreements and no-calls, potentially causing consensus reads to be erroneously filtered. fgumi therefore trims reads to the insert length before consensus calling.
 
 ### CIGAR Filtering
 
@@ -67,20 +67,25 @@ The final duplex R1 and R2 are produced by merging the appropriate A and B reads
 
 ### For Simplex Consensus
 
-`fgumi simplex` and `fgumi filter` accept a single `--min-reads` value.
+`fgumi simplex` accepts a single `--min-reads` value.
 
 ### For Duplex Consensus
 
-`fgumi duplex` and `fgumi filter` accept one, two, or three `--min-reads` values. If fewer than three values are supplied, the last is repeated (e.g. `80 40` becomes `80 40 40`, `10` becomes `10 10 10`).
+`fgumi duplex` and `fgumi filter` accept one, two, or three `--min-reads` values. When you supply fewer than three, the last is repeated — `80 40` becomes `80 40 40`, and `10` becomes `10 10 10`.
 
-The values control:
-1. **First value**: minimum total raw reads across both single-strand consensuses for the final duplex read
-2. **Second value**: minimum reads for the single-strand consensus with *more* support
-3. **Third value**: minimum reads for the single-strand consensus with *less* support
+| Position | Applies to | Meaning |
+|----------|-----------|---------|
+| 1st | the final **duplex** read | minimum total raw reads across both strands |
+| 2nd | the **better-supported** single-strand consensus | minimum reads for the strand with *more* support |
+| 3rd | the **less-supported** single-strand consensus | minimum reads for the strand with *less* support |
 
-If values two and three differ, the more stringent value must come first.
+The 2nd value must be at least the 3rd: it applies to the strand that has *more* reads, so it makes no sense to demand more reads from the weaker strand than the stronger one.
 
-**Example:** `--min-reads 7 3 1` requires:
-- At least 7 total raw reads supporting the duplex consensus
-- At least 3 raw reads for the better-supported single-strand consensus
-- At least 1 raw read for the other single-strand consensus
+**Example:** `--min-reads 7 3 1` requires at least 7 total raw reads supporting the duplex consensus, at least 3 raw reads for the better-supported single-strand consensus, and at least 1 raw read for the other.
+
+## See Also
+
+- [Consensus Calling](consensus-calling.md) — the underlying single-strand model
+- [Tracking Reads](tracking-reads.md) — how `/A`·`/B` strand labels and the per-strand tags are assigned
+- [UMI Grouping](umi-grouping.md) — the `paired` strategy that duplex requires
+- [Working with Metrics](working-with-metrics.md) — duplex QC metrics
