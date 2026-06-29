@@ -334,9 +334,14 @@ impl AlignerPreset {
         match self {
             // BWA classic: amb / ann / bwt / pac / sa
             Self::Bwa => &[".amb", ".ann", ".bwt", ".pac", ".sa"],
-            // BWA-MEM3 (compatible with bwa-mem2 index format):
-            // 0123 / amb / ann / bwt.2bit.64 / pac
-            Self::BwaMem3 => &[".0123", ".amb", ".ann", ".bwt.2bit.64", ".pac"],
+            // BWA-MEM3: amb / ann / bwt.2bit.64 / pac. `bwa-mem3 0.4.0+` pac-fetches
+            // the reference from `.pac` on demand and no longer writes `.0123` by
+            // default (fg-labs/bwa-mem3#177); `.0123` is now opt-in via `index
+            // --emit-unpacked-ref` and `mem` ignores any present, so requiring it
+            // here rejects a valid 0.4.0 index. `.bwt.2bit.64` is the canonical
+            // index sentinel. Indexes built by older bwa-mem3 still carry these
+            // four files, so dropping `.0123` is backward-compatible.
+            Self::BwaMem3 => &[".amb", ".ann", ".bwt.2bit.64", ".pac"],
         }
     }
 
@@ -853,9 +858,11 @@ mod tests {
     #[test]
     fn test_index_extensions() {
         assert_eq!(AlignerPreset::Bwa.index_extensions(), &[".amb", ".ann", ".bwt", ".pac", ".sa"]);
+        // `bwa-mem3 0.4.0+` no longer writes `.0123` (fg-labs/bwa-mem3#177), so it
+        // is not a required index file.
         assert_eq!(
             AlignerPreset::BwaMem3.index_extensions(),
-            &[".0123", ".amb", ".ann", ".bwt.2bit.64", ".pac"]
+            &[".amb", ".ann", ".bwt.2bit.64", ".pac"]
         );
     }
 
