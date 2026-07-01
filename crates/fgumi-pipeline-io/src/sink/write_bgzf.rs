@@ -16,7 +16,7 @@ use fgumi_pipeline_core::{
     step::{Affinity, Step, StepCtx, StepKind, StepOutcome, StepProfile},
 };
 
-/// `Exclusive + sticky` BAM sink that consumes pre-compressed `BgzfBlock`s.
+/// `Serial + sticky` BAM sink that consumes pre-compressed `BgzfBlock`s.
 pub struct WriteBgzfFile {
     state: Mutex<Option<WriterState>>,
     name: &'static str,

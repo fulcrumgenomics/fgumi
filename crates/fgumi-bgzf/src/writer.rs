@@ -216,12 +216,22 @@ impl InlineBgzfCompressor {
     ///
     /// Returns an error if writing to the output fails.
     pub fn write_blocks_to<W: io::Write + ?Sized>(&mut self, output: &mut W) -> io::Result<()> {
-        for block in self.completed_blocks.drain(..) {
-            output.write_all(&block.data)?;
-            // Recycle the buffer for reuse
-            let mut buf = block.data;
-            buf.clear();
-            self.buffer_pool.push(buf);
+        // Drain into a temporary so we can call `recycle_buffer` (which borrows
+        // `self` mutably) for each block without holding a borrow on
+        // `self.completed_blocks`. On a write error, restore the unwritten block
+        // and the remaining tail to `completed_blocks` so the queue is never
+        // silently emptied — a caller can retry or surface the partial state.
+        let mut remaining = std::mem::take(&mut self.completed_blocks).into_iter();
+        while let Some(block) = remaining.next() {
+            if let Err(e) = output.write_all(&block.data) {
+                self.completed_blocks.push(block);
+                self.completed_blocks.extend(remaining);
+                return Err(e);
+            }
+            // Route the drained buffer through the capped recycle path so the
+            // pool stays bounded by MAX_POOLED_BUFFERS, just like the
+            // steady-state recycle path.
+            self.recycle_buffer(block.data);
         }
         Ok(())
     }
@@ -358,6 +368,77 @@ mod tests {
         // Count BGZF block headers (0x1f 0x8b magic)
         let block_count = output.windows(2).filter(|w| w == &[0x1f, 0x8b]).count();
         assert_eq!(block_count, 2);
+    }
+
+    #[test]
+    fn test_write_blocks_to_respects_pool_cap() {
+        // Draining many blocks through write_blocks_to must not grow buffer_pool
+        // beyond the cap enforced by recycle_buffer (MAX_POOLED_BUFFERS).
+        let mut compressor = InlineBgzfCompressor::new(6);
+
+        // Produce many full blocks so there are far more drained buffers than
+        // the pool cap. Each full block's worth of data yields one block.
+        let data = vec![b'Z'; BGZF_MAX_BLOCK_SIZE * 20];
+        compressor.write_all(&data).expect("writing data should succeed");
+        compressor.flush().expect("flushing compressor should succeed");
+
+        let mut output = Vec::new();
+        compressor.write_blocks_to(&mut output).expect("writing blocks to output should succeed");
+
+        // With 20 drained blocks against a cap of 4, the pool must end *exactly*
+        // at the cap. A `<= 4` check alone would also pass if `write_blocks_to`
+        // stopped recycling and just dropped the drained buffers (the pool would
+        // stay at 0), so the equality assertion pins both postconditions at once:
+        // bounded growth (not > 4) AND actual reuse (not < 4 / lost recycling).
+        assert_eq!(
+            compressor.buffer_pool.len(),
+            4,
+            "buffer_pool should be filled to the cap by recycling, got {}",
+            compressor.buffer_pool.len()
+        );
+    }
+
+    #[test]
+    fn test_write_blocks_to_preserves_unwritten_blocks_on_error() {
+        // A writer that accepts the first `write` and then fails. Each block is
+        // emitted with a single `write_all` (the writer returns the full length
+        // each time), so the failure lands partway through the block queue.
+        struct FailAfterFirst {
+            writes: usize,
+        }
+        impl io::Write for FailAfterFirst {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                if self.writes > 1 {
+                    return Err(io::Error::other("simulated write failure"));
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut compressor = InlineBgzfCompressor::new(6);
+        // Produce several full blocks so the failure has unwritten blocks to drop.
+        let data = vec![b'Q'; BGZF_MAX_BLOCK_SIZE * 3];
+        compressor.write_all(&data).expect("writing data should succeed");
+        compressor.flush().expect("flushing compressor should succeed");
+        let serials: Vec<u64> =
+            compressor.completed_blocks.iter().map(|block| block.serial).collect();
+        assert!(serials.len() >= 3, "expected multiple blocks, got {}", serials.len());
+
+        let mut output = FailAfterFirst { writes: 0 };
+        let err =
+            compressor.write_blocks_to(&mut output).expect_err("write must surface the error");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+
+        // Only the first block (successfully written) was consumed; the block
+        // that failed plus every block after it must survive in the queue, in
+        // their original order, so a retry/recovery path can re-emit them.
+        let remaining: Vec<u64> =
+            compressor.completed_blocks.iter().map(|block| block.serial).collect();
+        assert_eq!(remaining, serials[1..].to_vec());
     }
 
     #[test]

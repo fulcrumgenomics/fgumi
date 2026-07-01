@@ -1,13 +1,14 @@
 //! Single-thread *fused* execution mode (issue #330).
 //!
-//! At `--threads 1` a linear `source → … → sink` chain gains nothing from the
-//! scheduled worker pool: there is one worker, so the inter-step bounded
+//! At `--threads 1` a forward-wired `source → … → sink` chain gains nothing from
+//! the scheduled worker pool: there is one worker, so the inter-step bounded
 //! queues, round-robin polling, held-slot retries, and reorder bookkeeping are
 //! pure overhead (profiling showed ~2/3 of `try_run` calls do no useful work).
 //!
 //! This module is the structural fix. Fusion is **not** a per-command rewrite
-//! — it is an execution mode of the existing pipeline. [`is_linear_chain`]
-//! detects a linear chain; [`run_fused_single_thread`] then drives the chain's
+//! — it is an execution mode of the existing pipeline. [`is_fusible_chain`]
+//! detects a fusible chain (forward-wired, fan-out allowed);
+//! [`run_fused_single_thread`] then drives the chain's
 //! own type-erased steps inline, in topological order, over **direct,
 //! unbounded** buffers (built by [`build_chain_contexts_fused`]). FIFO push
 //! order is already the correct order at one worker, so the reorder stage is

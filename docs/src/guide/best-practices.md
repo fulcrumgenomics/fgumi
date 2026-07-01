@@ -70,6 +70,22 @@ The diagram shows the workflow from FASTQ files to filtered consensus reads:
 - **Green**: CODEC consensus
 - **Orange**: Optional UMI correction for fixed UMI sets
 
+> **Tip — fused `runall`.** The per-step commands below give you full control and
+> are easiest to reason about, but you can also fuse the stages into a single
+> invocation with `fgumi runall` — covering
+> `extract`/`correct`/`align`/`zipper`/`sort`/`group`/`consensus`/`filter`. It
+> supports multiple entry points (selected with `--start-from`), each with its own
+> input contract: start at `extract` (`--start-from extract`) to feed raw FASTQ
+> straight through, resume from an already-extracted unmapped UMI BAM with
+> `--start-from correct`, or resume a later stage from its own stage-appropriate
+> BAM (`--start-from sort` from an unsorted BAM, `--start-from group` from a
+> template-coordinate–sorted BAM, `--start-from consensus` from a grouped MI-tagged
+> BAM). It
+> streams the stages together (no intermediate BAMs on disk) and
+> exposes per-stage tuning as prefixed flags (`--sort::max-memory`,
+> `--group::strategy`, …). Use `--start-from`/`--stop-after` to run a sub-range of
+> stages. See `fgumi runall --help` for the full surface.
+
 ### Phase 1: FASTQ → Grouped BAM
 
 ```mermaid
@@ -426,8 +442,15 @@ For production use where filtering parameters are established, combine steps for
 
 ### Step 2b.1: Group and Call Consensus (manual pipe)
 
+`fgumi group` requires template-coordinate-sorted input, so sort once up front (the
+`runall --start-from sort` example above folds this same `sort` step into the fused chain).
+`fgumi sort` writes a file, so it is a separate command rather than a pipe stage; the
+group → consensus fusion then runs as a single pipe with no intermediate consensus BAM:
+
 ```bash
-fgumi group --input aligned.bam --strategy adjacency --threads 4 --compression-level 1 \
+fgumi sort --input aligned.bam --output sorted.bam --order template-coordinate --threads 4
+
+fgumi group --input sorted.bam --strategy adjacency --threads 4 --compression-level 1 \
   | fgumi simplex --input /dev/stdin --min-reads 1 --output-per-base-tags true \
     --output consensus.bam --threads 4 --compression-level 1
 ```

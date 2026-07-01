@@ -648,11 +648,11 @@ mod tests {
         }
     }
 
-    /// Serial (single-consumer) sink that records each paired batch's
-    /// `chunk_serial` in the exact order it is emitted. A `Serial` sink — not
-    /// `Parallel` — is what lets the test assert true emission order: a single
-    /// worker drains the queue in FIFO order, so the recorded sequence is the
-    /// real downstream order rather than a multi-consumer interleaving.
+    /// Serial sink that records each paired batch's `chunk_serial` in the order
+    /// it is popped. Declared `Serial` (not `Parallel`) so the recorded order is
+    /// exactly the emission order of the upstream `Serial` `PairRawFastq` step —
+    /// a `Parallel` sink would let multiple workers race on `pop()` and reorder
+    /// the observations, masking any ordering regression in the pairing step.
     #[derive(Clone)]
     struct PairSink {
         seen_serials: Arc<Mutex<Vec<u64>>>,
@@ -757,10 +757,10 @@ mod tests {
         }
         worker.join().expect("pipeline thread panicked").expect("pipeline run returned Err");
 
-        // Full output: one pair per serial, every serial present AND in order.
-        // The single-consumer `PairSink` records the true emission order, so we
-        // assert the sequence directly (no sort) to prove `PairRawFastq` emits
-        // pairs in contiguous `chunk_serial` order, not merely as a set.
+        // Full output: one pair per serial, every serial present AND observed in
+        // ascending `chunk_serial` order. The Serial `PairSink` records in pop
+        // order, so we assert the observed vector directly (no sorting) — an
+        // out-of-order emission from `PairRawFastq` would now fail the test.
         let serials = seen.lock().unwrap().clone();
         assert_eq!(
             serials.len(),
@@ -769,6 +769,133 @@ mod tests {
             serials.len()
         );
         let expected: Vec<u64> = (0..X3_N_SERIALS).collect();
-        assert_eq!(serials, expected, "every chunk_serial must be paired exactly once, in order");
+        assert_eq!(
+            serials, expected,
+            "every chunk_serial must be paired exactly once and emitted in order"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // S5a2-011: when the two FASTQ streams have UNEQUAL record counts, one
+    // stream's reader drains while the other still has a chunk for the lowest
+    // pending serial. `finalize_pairs` must abort with an "out of sync" error
+    // that names the stream index that ENDED EARLY (the missing one) — and it
+    // must do so symmetrically, whichever of the two streams is short. The
+    // `run_desync_harness` helper below drives both directions; the two tests
+    // assert the stream-1-short and stream-0-short cases respectively.
+    //
+    // Wiring mirrors the X3-003 harness above: two `OneStreamSource` leaders
+    // (no lag — we want clean end-of-stream desync at drain, not mid-stream
+    // backpressure), one feeding 3 serials and one feeding 2. Serial 2 buffers
+    // only the long stream's chunk; both readers then drain, `finalize_pairs`
+    // finds serial 2 holding one side present and the other missing, computes
+    // `short` from which side is absent, and reports "stream <short> ended
+    // before chunk_serial 2". The backpressure limit is kept generous so the
+    // catastrophic-desync hard-abort (2x) never fires first — the one-serial
+    // skew keeps the partial-pair buffer tiny.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// The long stream emits this many serials.
+    const DESYNC_LONG_SERIALS: u64 = 3;
+    /// The short stream emits this many serials (it ends one serial early).
+    const DESYNC_SHORT_SERIALS: u64 = 2;
+
+    /// Run the two-leader desync harness with `serials0` chunks on stream 0 and
+    /// `serials1` on stream 1, returning the pipeline run result. Whichever
+    /// stream is short drains first, leaving the lowest pending serial holding
+    /// only the long stream's chunk, so `finalize_pairs` must abort with an
+    /// "out of sync" error naming the SHORT (missing) stream index. Shared by
+    /// both desync tests so the stream-0-short and stream-1-short cases exercise
+    /// byte-for-byte the same wiring (only the lengths swap).
+    fn run_desync_harness(serials0: u64, serials1: u64) -> Result<(), String> {
+        use std::time::{Duration, Instant};
+
+        // Both sources are leaders with no lag gate; the shared counter is
+        // unused for ordering here but required by the constructor signature.
+        let unused_progress = Arc::new(AtomicUsize::new(0));
+
+        let progress_for_thread = Arc::clone(&unused_progress);
+        let worker = std::thread::Builder::new()
+            .name("pair-fastq-s5a2-011".into())
+            .spawn(move || -> Result<(), String> {
+                let stream0 = OneStreamSource::leader(
+                    0,
+                    serials0,
+                    X3_SOURCE_QUEUE_BYTES,
+                    Arc::clone(&progress_for_thread),
+                );
+                let stream1 = OneStreamSource::leader(
+                    1,
+                    serials1,
+                    X3_SOURCE_QUEUE_BYTES,
+                    progress_for_thread,
+                );
+                // Generous backpressure so the catastrophic-desync 2x abort never
+                // trips before the end-of-stream `finalize_pairs` desync path.
+                let pair = PairRawFastq::new(64 * 1024);
+                let sink = PairSink {
+                    seen_serials: Arc::new(Mutex::new(Vec::new())),
+                    count: Arc::new(AtomicUsize::new(0)),
+                };
+
+                let builder = PipelineBuilder::new();
+                let tail0 = builder.append_source(stream0);
+                let tail1 = builder.append_source(stream1);
+                let pair_tail = builder.append_step2(pair, tail0, tail1);
+                builder.append_step(sink, pair_tail);
+
+                let pipeline = builder.build().map_err(|e| e.to_string())?;
+                pipeline
+                    .run(PipelineConfig { threads: 3, ..Default::default() })
+                    .map_err(|e| e.to_string())
+            })
+            .expect("spawn pipeline worker");
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !worker.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "PairRawFastq desync pipeline did not finish within 30s — likely a deadlock"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        worker.join().expect("pipeline thread panicked")
+    }
+
+    #[test]
+    fn finalize_pairs_reports_desync_with_short_stream_index() {
+        // Stream 0 long (3 serials), stream 1 short (2): serial 2 buffers only
+        // stream 0's chunk, so `short = usize::from(entry.0.is_some()) = 1` and
+        // the error must name the MISSING (short) stream, index 1.
+        let result = run_desync_harness(DESYNC_LONG_SERIALS, DESYNC_SHORT_SERIALS);
+        let err = result.expect_err("unequal stream lengths must abort the pipeline run");
+        assert!(
+            err.contains("out of sync"),
+            "desync abort must report an out-of-sync error, got: {err}"
+        );
+        assert!(
+            err.contains("stream 1 ended before chunk_serial 2"),
+            "desync error must name the short stream (index 1) and the orphaned \
+             serial (2), got: {err}"
+        );
+    }
+
+    #[test]
+    fn finalize_pairs_reports_desync_when_stream_zero_is_short() {
+        // Mirror of the above with the lengths swapped: stream 0 short (2
+        // serials), stream 1 long (3). Serial 2 now buffers only stream 1's
+        // chunk, so the missing-stream index is 0 — guards the symmetric branch
+        // that a stream-1-only test would leave unexercised.
+        let result = run_desync_harness(DESYNC_SHORT_SERIALS, DESYNC_LONG_SERIALS);
+        let err = result.expect_err("unequal stream lengths must abort the pipeline run");
+        assert!(
+            err.contains("out of sync"),
+            "desync abort must report an out-of-sync error, got: {err}"
+        );
+        assert!(
+            err.contains("stream 0 ended before chunk_serial 2"),
+            "desync error must name the short stream (index 0) and the orphaned \
+             serial (2), got: {err}"
+        );
     }
 }

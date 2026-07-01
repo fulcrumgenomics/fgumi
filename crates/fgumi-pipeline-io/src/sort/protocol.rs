@@ -11,7 +11,17 @@ use fgumi_sort::{
 
 use fgumi_pipeline_core::item::HeapSize;
 
-/// Approximate fixed overhead of a `Vec<(K, RawRecord)>` entry.
+/// Approximate fixed per-entry overhead of a `Vec<(K, RawRecord)>`, in bytes,
+/// added once per record in [`MemoryChunkErased::approx_heap_bytes`] on top of
+/// the variable record payload (`RawRecord::as_ref().len()`).
+///
+/// This is the size of one `(K, RawRecord)` tuple slot — the sort key `K`
+/// (largest variant: `TemplateKey`) inline plus the `RawRecord` handle — together
+/// with the per-`RawRecord` heap-allocation and allocator-bucket slack that the
+/// payload byte count does not capture. It is an intentionally conservative
+/// constant, not a `size_of` expression, so the queue accounting over-counts
+/// rather than under-counts memory. If the key or record types grow materially,
+/// re-derive it from `size_of::<(TemplateKey, RawRecord)>()` plus allocator slack.
 const PER_MEMORY_RECORD_OVERHEAD: usize = 354;
 
 /// In-memory sorted residual chunk produced by `SortAndSpill`, type-erased

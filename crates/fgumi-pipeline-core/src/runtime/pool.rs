@@ -50,11 +50,13 @@ pub fn assign_exclusive_owners(
 ///   - `Parallel` steps are never sticky-driven (each worker has its own
 ///     clone — sticky drive on one would not gate others).
 ///
-/// If two steps' sticky-ownership rules collide on the same worker (e.g.,
-/// the worker is both an Exclusive-sticky owner AND a Serial-sticky-Affinity
-/// target), the exclusive ownership wins — the framework only models one
-/// sticky-owned step per worker today. Returns `None` for workers without
-/// any sticky-owned step.
+/// If two steps' sticky-ownership rules collide on the same worker, the first
+/// writer to that worker's slot wins — the framework only models one
+/// sticky-owned step per worker today. The Exclusive pass runs before the Serial
+/// pass and each pass only fills empty slots, so an Exclusive owner beats a
+/// later Serial-sticky-Affinity target on the same worker; the same first-wins
+/// rule resolves Exclusive-vs-Exclusive and Serial-vs-Serial collisions too.
+/// Returns `None` for workers without any sticky-owned step.
 #[must_use]
 pub fn assign_sticky_owners(
     steps: &[Box<dyn ErasedStep>],

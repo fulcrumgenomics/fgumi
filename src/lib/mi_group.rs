@@ -190,7 +190,14 @@ impl MiKey {
             // cell presence always matches the configuration; the mixed arms are
             // unreachable.
             (None, None) => true,
-            _ => false,
+            (Some(_), None) | (None, Some(_)) => {
+                debug_assert!(
+                    false,
+                    "cell-tag presence is fixed for the grouper's lifetime, so the stored key's \
+                     cell presence always matches the record's; this mixed arm is unreachable"
+                );
+                false
+            }
         };
         Some(mi_eq && cell_eq)
     }

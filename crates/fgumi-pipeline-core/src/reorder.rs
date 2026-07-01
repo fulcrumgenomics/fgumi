@@ -97,9 +97,14 @@ pub enum BranchOrdering {
 }
 
 /// Framework-internal wrapper carrying a producer-assigned ordinal.
-/// Step authors never see this type.
+///
+/// Step authors never see this type; it is `pub` only because it appears in the
+/// public `ItemQueue<Sequenced<T>>` trait bounds that ordered queues (and their
+/// tests) instantiate, so callers may construct it directly when wiring queues.
 pub struct Sequenced<T> {
+    /// Producer-assigned monotonic ordinal used to restore emission order.
     pub ordinal: u64,
+    /// The wrapped payload carried alongside its `ordinal`.
     pub item: T,
 }
 

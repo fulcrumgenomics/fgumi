@@ -16,11 +16,10 @@
 //!   [`substitute_template`] helper fills the `{ref}` / `{threads}`
 //!   placeholders.
 //!
-//! Used by Step 2 of the `AlignAndMerge` chain in
-//! `src/lib/commands/runall/align_and_merge.rs` (lands in a follow-up
-//! commit). This module is the framework-agnostic subprocess primitive;
-//! the typed `Step` impl that owns the I/O threads lives in the runall
-//! module.
+//! Used by the `AlignAndMergeStep` in
+//! `src/lib/pipeline/steps/align_and_merge.rs`. This module is the
+//! framework-agnostic subprocess primitive; the typed `Step` impl that owns the
+//! I/O threads lives in that step module.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
@@ -210,31 +209,62 @@ impl AlignerProcess {
 
         // Wait for the process to actually exit so its resources are cleaned up.
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        // Tracks whether the loop gave up because the 1s deadline elapsed while
+        // the process was still alive. Only that case warrants the leak warning.
+        let mut deadline_exceeded = false;
+        // Set only when exit is *positively confirmed*: a clean reap
+        // (`Ok(Some)`) or an `ECHILD` error (already reaped by a SIGCHLD
+        // handler). A deadline timeout or an unclassified `try_wait` errno
+        // leaves this `false`, so the caller must NOT follow up with an
+        // unbounded `wait()`.
         let mut reaped = false;
         loop {
             match self.child.try_wait() {
-                // Child exited (we reaped it), or `try_wait` errored (e.g. ECHILD
-                // because the child was already reaped elsewhere). Either way the
-                // child is gone, not leaked — mark reaped so the warning below
-                // doesn't fire spuriously, then stop polling.
-                Ok(Some(_)) | Err(_) => {
+                // Reaped cleanly: resources cleaned up, no warning.
+                Ok(Some(_)) => {
                     reaped = true;
                     break;
                 }
+                // Still alive: keep polling until the deadline.
                 Ok(None) => {
                     if std::time::Instant::now() >= deadline {
+                        deadline_exceeded = true;
                         break;
                     }
                     thread::sleep(Duration::from_millis(50));
                 }
+                // `try_wait` failed. `ECHILD` (the child was already reaped,
+                // e.g. by a SIGCHLD handler) is a benign non-leak that confirms
+                // exit. Any *other* errno is unexpected — the process may still
+                // be around — so we do NOT report it as reaped; we cannot make
+                // progress on a `try_wait` error either way, so stop polling.
+                Err(err) => {
+                    if is_already_reaped(&err) {
+                        log::debug!(
+                            "aligner process (pid {pid}) try_wait returned ECHILD after \
+                             SIGKILL; already reaped"
+                        );
+                        reaped = true;
+                    } else {
+                        log::warn!(
+                            "aligner process (pid {pid}) try_wait failed after SIGKILL: {err}; \
+                             unable to confirm exit, treating as not reaped"
+                        );
+                    }
+                    break;
+                }
             }
         }
-        if !reaped {
+        if deadline_exceeded {
             log::warn!(
                 "aligner process (pid {pid}) did not exit within 1s of SIGKILL; it may be \
                  stuck (e.g. uninterruptible I/O) and left unreaped"
             );
         }
+        // Report reaped only when exit was positively confirmed (clean reap or
+        // `ECHILD`). A timeout on a still-running child or an unclassified
+        // `try_wait` errno reports `false` so the caller avoids a follow-up
+        // unbounded `wait()`.
         reaped
     }
 
@@ -245,17 +275,61 @@ impl AlignerProcess {
     }
 }
 
+/// `ECHILD` errno. POSIX assigns it the value 10 on every Unix fgumi runs an
+/// external aligner on (Linux, macOS, the BSDs); `std::io` exposes no
+/// `ErrorKind` for it, and `nix`/`libc` are not available on all targets here,
+/// so we match the raw errno directly. On non-Unix targets nothing returns this
+/// value, so [`is_already_reaped`] simply never matches — the conservative
+/// "not confirmed reaped" default.
+const ECHILD: i32 = 10;
+
+/// Whether a `try_wait` error means the child was *already reaped* (and so its
+/// exit is confirmed). Only `ECHILD` qualifies — it is what the OS returns once
+/// a SIGCHLD handler (or a prior wait) has already collected the child. Any
+/// other errno is unexpected and must NOT be treated as a confirmed exit.
+fn is_already_reaped(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(ECHILD)
+}
+
 impl Drop for AlignerProcess {
     fn drop(&mut self) {
-        // If the child process is still running when the struct is
-        // dropped (e.g. due to a panic or early return), kill it to
-        // prevent orphaned processes.
-        if let Ok(None) = self.child.try_wait() {
-            self.kill();
-        }
-        // Always join the stderr relay thread to avoid resource leaks.
+        // Determine whether the child's exit is *confirmed*. Only then is it
+        // safe to join the stderr relay thread: that thread blocks reading the
+        // child's stderr fd, which stays open while the child lives, so joining
+        // a still-alive child would hang teardown forever — the very hang the
+        // bounded `kill()` exists to prevent.
+        let exit_confirmed = match self.child.try_wait() {
+            // Already exited: stderr fd is closed, relay will finish.
+            Ok(Some(_)) => true,
+            // Still running: kill() reports `true` only on a confirmed reap
+            // (clean exit or ECHILD); `false` means it may still be alive.
+            Ok(None) => self.kill(),
+            // `try_wait` errored. ECHILD (already reaped) confirms exit. For any
+            // other errno the child may still be alive, so fall back to the
+            // bounded `kill()` — returning `is_already_reaped` alone here would
+            // drop the handle without ever attempting SIGKILL and leak the
+            // subprocess. `kill()` re-classifies ECHILD as a confirmed reap.
+            Err(err) => {
+                if is_already_reaped(&err) {
+                    true
+                } else {
+                    log::warn!(
+                        "aligner process (pid {}) try_wait failed in Drop: {err}; \
+                         attempting bounded kill",
+                        self.child.id()
+                    );
+                    self.kill()
+                }
+            }
+        };
+        // Join the stderr relay only when exit is confirmed. If the child could
+        // not be confirmed dead (kill timed out / unclassified errno), skip the
+        // join: leaking a detached relay thread is the lesser evil versus
+        // hanging Drop indefinitely on a still-open stderr fd.
         if let Some(handle) = self.stderr_thread.take() {
-            let _ = handle.join();
+            if exit_confirmed {
+                let _ = handle.join();
+            }
         }
     }
 }
@@ -582,9 +656,10 @@ impl Default for AlignerOptions {
 /// `pub(crate)` because only the runall AAM dispatch consumes it;
 /// promote to `pub` if a cross-crate caller materializes.
 ///
-/// Fields are flagged `#[allow(dead_code)]` because C3 only
-/// validates them (via `_resolved` in `validate_align_and_merge`);
-/// C4 will consume them when wiring the 3-step chain.
+/// Fields are flagged `#[allow(dead_code)]` because the AAM validation path
+/// currently only validates them (via `_resolved` in
+/// `validate_align_and_merge`); the wired chain sources its parameters
+/// independently.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedAligner {
@@ -603,7 +678,7 @@ pub(crate) struct ResolvedAligner {
 }
 
 /// How a [`ResolvedAligner`] was produced. Same dead-code rationale
-/// as [`ResolvedAligner`] — C4 wiring consumes this.
+/// as [`ResolvedAligner`].
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ResolvedAlignerMode {
@@ -825,6 +900,23 @@ mod tests {
         // A second kill on an already-gone child still reports reaped, never
         // a spurious timeout.
         assert!(proc.kill(), "killing an already-reaped child must still report reaped");
+    }
+
+    /// `is_already_reaped` confirms exit only for `ECHILD`. An unrelated errno
+    /// (e.g. `EINVAL`) must NOT be treated as a confirmed reap, so `kill()`
+    /// reports `false` and the caller avoids a follow-up unbounded `wait()`.
+    #[test]
+    fn test_is_already_reaped_only_for_echild() {
+        let echild = std::io::Error::from_raw_os_error(ECHILD);
+        assert!(is_already_reaped(&echild), "ECHILD must count as already reaped");
+
+        // EINVAL (22) stands in for any unrelated errno: it must NOT count.
+        let einval = std::io::Error::from_raw_os_error(22);
+        assert!(!is_already_reaped(&einval), "an unrelated errno must not count as reaped");
+
+        // A non-OS error (no errno at all) is likewise not a confirmed reap.
+        let not_os = std::io::Error::other("synthetic non-os error");
+        assert!(!is_already_reaped(&not_os), "a non-OS error must not count as reaped");
     }
 
     /// `bwa mem` command string with default-PATH binary.

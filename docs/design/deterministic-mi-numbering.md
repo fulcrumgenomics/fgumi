@@ -159,7 +159,8 @@ its own intermediate `ArrayQueue`. This keeps the change isolated to
 `try_step_serialize`'s input path and avoids touching the scheduler /
 deadlock detector with a new `PipelineStep` variant.
 
-In `src/lib/unified_pipeline/bam.rs`:
+In the BAM pipeline (the logic since moved into the typed-step `MiAssign` step
+under `src/lib/pipeline/steps/`):
 
 ```rust
 enum MiAssignPopOutcome<P> {

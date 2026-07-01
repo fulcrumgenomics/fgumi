@@ -77,6 +77,10 @@ pub fn run_bam_roundtrip(input: &Path, output: &Path, cfg: RoundtripConfig) -> i
         // (CIGAR walk + tag scan + library/cell-barcode hashing) in one
         // parallel pass. Matches the legacy pipeline's combined Decode
         // step; drops the intermediate Parse → Decode queue.
+        // `GroupKeyConfig::default()` (empty library index, no cell tag) is used
+        // deliberately: this round-trip validates byte-equivalence only and does
+        // not exercise UMI/library/cell grouping (`GroupBam` batches by qname
+        // regardless), so the computed group key does not affect output bytes.
         .chain(DecodeRecords::new(GroupKeyConfig::default(), t.per_step_byte_limit))
         .chain(GroupBam::new(t.template_batch_size, t.per_step_byte_limit))
         .chain(SerializeBamRecords::new(t.per_step_byte_limit))

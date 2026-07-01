@@ -32,12 +32,20 @@ jobs:
         uses: taiki-e/install-action@0631aa6515c7d545823c67cfae7ef4fc7f490154 # v2.81.8
         with:
           tool: nextest
-      # Install bwa + bwa-mem3 from bioconda for the AAM
-      # (--start-from align-and-merge) integration tests. Local dev
-      # without these binaries gets gracefully-skipped tests via
-      # `which::which` checks in the test code; CI installs them so
-      # the real-aligner parity tests actually exercise the chain.
-      - name: Install aligners (bwa-mem3, bwa) from bioconda
+      # Install bwa + bwa-mem3 + samtools from bioconda. bwa / bwa-mem3 back the
+      # AAM (--start-from align-and-merge) parity tests (still `#[ignore]`'d, run
+      # explicitly below). samtools backs the sort-correctness oracle: the
+      # queryname-natural / template-coordinate order checks cross-reference
+      # `samtools sort -n` / `samtools sort --template-coordinate`, and the
+      # sort --write-index region-query tests. Those are NOT `#[ignore]`'d — they
+      # run in the default `cargo ci-test` step below and are gated only by a
+      # runtime `which samtools` check, so installing samtools here makes them
+      # actually exercise the independent order oracle in CI (X3-005).
+      #
+      # samtools is pinned because it is the oracle: an unpinned bioconda solve
+      # could silently change sort-order semantics with no repo change. Bump the
+      # pin deliberately (and re-validate the parity expectations) when updating.
+      - name: Install bioconda tools (bwa-mem3, bwa, samtools)
         uses: mamba-org/setup-micromamba@06375d89d211a1232ef63355742e9e2e564bc7f7 # v2.0.7
         with:
           micromamba-version: '2.0.5-0'
@@ -46,16 +54,19 @@ jobs:
             -c bioconda -c conda-forge
             bwa
             bwa-mem3
+            samtools=1.23.1
           init-shell: bash
           cache-environment: true
           cache-downloads: true
-      - name: Verify aligner binaries on PATH
+      - name: Verify bioconda binaries on PATH
         shell: bash -el {0}
         run: |
           which bwa
           which bwa-mem3
+          which samtools
           bwa 2>&1 | head -3 || true
           bwa-mem3 2>&1 | head -3 || true
+          samtools --version 2>&1 | head -2 || true
       - name: Unit tests
         shell: bash -el {0}
         run: cargo ci-test

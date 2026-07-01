@@ -135,9 +135,9 @@ impl<T: Send + 'static> ItemQueue<T> for CountBoundedQueue<T> {
 /// items the byte cap (default 4 MiB) imposes a tighter bound.
 ///
 /// Sized in pages of `crossbeam_queue::ArrayQueue` storage (one
-/// pre-allocated slot array, no per-push allocation). Mirrors legacy
-/// `ArrayQueue::new(queue_capacity)` (`base.rs:1638`+) — the legacy
-/// pipeline uses a fixed-capacity `ArrayQueue` everywhere for the same
+/// pre-allocated slot array, no per-push allocation). Mirrors the
+/// `ArrayQueue::new(queue_capacity)` strategy the legacy pipeline used — it
+/// also used a fixed-capacity `ArrayQueue` everywhere for the same
 /// reason: `SegQueue` allocates segments on demand under load, and
 /// the resulting allocator churn shows up as `mi_*` overhead in
 /// profiles (≈260 samples vs legacy on CODEC 8M).
@@ -171,8 +171,9 @@ const BYTE_BOUNDED_QUEUE_SLOT_CAPACITY: usize = 1024;
 /// `T::heap_size()` for the budget update. For types whose
 /// `heap_size()` is O(items inside) (e.g. `BatchedRawPositionGroups`,
 /// `OrderedRawPositionGroup`) this avoids recomputing a O(group)
-/// walk on every pop. Mirrors legacy `ReorderBuffer<T>`'s
-/// `(T, usize)` storage (`fgumi-bam-io/src/reorder.rs:50`).
+/// walk on every pop. Mirrors the legacy `ReorderBuffer<T>`'s
+/// cached-size storage strategy (`(T, usize)` there; `(T, u64)` here,
+/// matching `inner`'s `ArrayQueue<(T, u64)>` above).
 pub struct ByteBoundedQueue<T: Send + HeapSize + 'static> {
     inner: ArrayQueue<(T, u64)>,
     current_bytes: AtomicU64,
@@ -272,7 +273,7 @@ impl<T: Send + HeapSize + 'static> ItemQueue<T> for ByteBoundedQueue<T> {
             !self.drained.load(Ordering::Acquire),
             "try_push after mark_drained — producer contract violation"
         );
-        // Legacy `ReorderBufferState::can_proceed` (`base.rs:766-781`)
+        // Like the legacy `ReorderBufferState::can_proceed`, this
         // gates on `heap_bytes < limit` — accept if currently *under*
         // budget, regardless of incoming item size. Per-item-larger-than
         // -limit is a real case (busy-locus position-group batches can

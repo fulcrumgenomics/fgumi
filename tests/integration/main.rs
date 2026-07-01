@@ -8,6 +8,7 @@
 mod helpers;
 mod test_async_reader;
 mod test_bgzf_eof;
+mod test_chain_build;
 mod test_clip_command;
 #[cfg(feature = "consensus")]
 mod test_codec_command;

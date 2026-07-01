@@ -162,6 +162,17 @@ pub(crate) enum ChainTailKind {
     /// [`DecodedRecordBatch`]: crate::pipeline::steps::types::DecodedRecordBatch
     DecodedRecordBatch,
 
+    /// The chain tail produces serialized BGZF-ready bytes
+    /// ([`DecompressedBlock`]) after a Terminal serialize step
+    /// (`SerializeBamRecords` / `SerializeRecordBatch` / `SerializeGroups`, or
+    /// the record-aligned block emitted by a terminal consensus stage). No
+    /// stage downstream of a Terminal stage reads `chain_tail_kind`, so this is
+    /// a terminal-only marker; it exists so the kind is never a lie. `add_sink`
+    /// wires `BgzfCompress → WriteBgzfFile` regardless of this value.
+    ///
+    /// [`DecompressedBlock`]: crate::pipeline::steps::types::DecompressedBlock
+    SerializedBytes,
+
     /// The chain tail produces [`RecordBatch`]. Set when Sort is the first
     /// stage: `add_source` uses `ParseBamRecords` (not `DecodeRecords`).
     ///
@@ -194,24 +205,8 @@ pub(crate) enum ChainTailKind {
 // ChainBuilder
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// In-progress chain builder. Constructed by
-/// [`crate::pipeline::chains::build_for`] (or by a per-command
-/// builder during Phase 3a).
-///
-/// Owns the resolved output header, an accumulating `PipelineBuilder`, and a
-/// growing `Vec<Box<dyn FinalizeHook>>` populated by `add_<stage>`
-/// methods. Per-stage methods are private — callers drive the chain
-/// via the public `add_source` / `add_stage(Stage, StagePosition)` /
-/// `add_sink` / `build()` flow.
-///
-/// ## Type erasure
-///
-/// The framework's `Chain<'b, O>` provides compile-time step-compatibility
-/// enforcement but cannot span method boundaries on `&mut self`. Instead,
-/// `ChainBuilder` tracks the chain tail as `(StepIdx, BranchIdx)` and uses
-/// `PipelineBuilder::append_source` / `append_step`, which bypass the
-/// typed-chain API. See the module-level type-erasure note for the runtime
-/// behaviour when a type mismatch is introduced.
+/// Per-worker scratch state for the `templates_to_mi_step` bridge: a reusable
+/// byte buffer and an MI-key string buffer, reset per template.
 #[cfg(feature = "consensus")]
 pub(crate) struct FuseState {
     scratch: Vec<u8>,
@@ -245,8 +240,8 @@ fn duplex_record_filter(raw: &[u8]) -> bool {
 /// `add_group` (which emits `BatchedProcessedPositionGroups`) into a consensus
 /// stage (which consumes `BatchedMiGroups`). For each template it splices the
 /// assigned molecular identifier into the `MI` tag and runs the records into
-/// per-MI groups in a single pass, replicating `runall.rs`'s
-/// `templates_to_mi_step`.
+/// per-MI groups in a single pass. This is the in-builder successor of the
+/// former `runall.rs` `templates_to_mi_step` (folded into the chain builder).
 ///
 /// Grouping on the MI alone (without a cell-barcode partition) is exactly
 /// equivalent to the non-fused `GroupByMi::with_cell_tag(Some(CB))` path
@@ -371,6 +366,24 @@ where
     )
 }
 
+/// In-progress chain builder. Constructed by
+/// [`crate::pipeline::chains::build_for`] (or by a per-command
+/// builder during Phase 3a).
+///
+/// Owns the resolved output header, an accumulating `PipelineBuilder`, and a
+/// growing `Vec<Box<dyn FinalizeHook>>` populated by `add_<stage>`
+/// methods. Per-stage methods are private — callers drive the chain
+/// via the public `add_source` / `add_stage(Stage, StagePosition)` /
+/// `add_sink` / `build()` flow.
+///
+/// ## Type erasure
+///
+/// The framework's `Chain<'b, O>` provides compile-time step-compatibility
+/// enforcement but cannot span method boundaries on `&mut self`. Instead,
+/// `ChainBuilder` tracks the chain tail as `(StepIdx, BranchIdx)` and uses
+/// `PipelineBuilder::append_source` / `append_step`, which bypass the
+/// typed-chain API. See the module-level type-erasure note for the runtime
+/// behaviour when a type mismatch is introduced.
 pub struct ChainBuilder<'a> {
     spec: &'a ChainSpec,
     tuning: BamPipelineTuning,
@@ -1015,9 +1028,10 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// The consensus step emits a record-aligned [`DecompressedBlock`]. For a
     /// [`StagePosition::Terminal`] consensus stage, that block IS the chain tail
-    /// (`add_sink` wires `BgzfCompress → Write`); `chain_tail_kind` is left at
-    /// its sentinel (the enum has no `DecompressedBlock` variant and nothing
-    /// downstream of a terminal consensus reads it). For a
+    /// (`add_sink` wires `BgzfCompress → Write`); `chain_tail_kind` is set to
+    /// [`ChainTailKind::SerializedBytes`] (the honest marker for "serialized
+    /// bytes ready for sink"; nothing downstream of a terminal consensus reads
+    /// it). For a
     /// [`StagePosition::Intermediate`] consensus stage, a downstream stage
     /// (e.g. filter) consumes records, so append the existing [`DecodeRecords`]
     /// step — consensus output is already record-aligned, so no
@@ -1037,8 +1051,11 @@ impl<'a> ChainBuilder<'a> {
     ) -> (crate::pipeline::core::topology::StepIdx, crate::pipeline::core::topology::BranchIdx)
     {
         match position {
-            // terminal: tail is DecompressedBlock; chain_tail_kind left as sentinel.
-            StagePosition::Terminal => tail,
+            // terminal: tail is DecompressedBlock (serialized bytes) → SerializedBytes.
+            StagePosition::Terminal => {
+                self.chain_tail_kind = ChainTailKind::SerializedBytes;
+                tail
+            }
             StagePosition::Intermediate => {
                 use crate::pipeline::steps::parse::decode::DecodeRecords;
                 let group_key_config = self.bam_group_key_config();
@@ -1406,7 +1423,11 @@ impl<'a> ChainBuilder<'a> {
                 .pipeline
                 .append_step(SerializeBamRecords::new(self.tuning.per_step_byte_limit), tail);
             self.current_tail = Some(tail);
-            self.chain_tail_kind = ChainTailKind::DecodedRecordBatch;
+            // SerializeBamRecords emits DecompressedBlock (serialized bytes), not
+            // DecodedRecordBatch. Mark the tail honestly as SerializedBytes, matching
+            // every other terminal serialize path (e.g. add_dedup); nothing downstream
+            // of a Terminal stage reads this, but the kind must never lie.
+            self.chain_tail_kind = ChainTailKind::SerializedBytes;
         } else {
             self.current_tail = Some(tail);
             self.chain_tail_kind = ChainTailKind::BamTemplateBatch;
@@ -1428,8 +1449,11 @@ impl<'a> ChainBuilder<'a> {
     /// For [`StagePosition::Terminal`], `SerializeBamRecords` is appended and
     /// the chain tail is [`DecompressedBlock`] (bytes ready for `BgzfCompress`).
     ///
-    /// For [`StagePosition::Intermediate`], correct returns `Err` as a guard —
-    /// no Phase 3 runall combination requires intermediate correct.
+    /// For [`StagePosition::Intermediate`], `SerializeBamRecords` is **not**
+    /// appended: the chain tail is left as `BamTemplateBatch` so the next stage
+    /// (`add_align` → `AlignAndMergeStep`) can consume the correct step's kept
+    /// output (branch 0) directly; `add_align` skips `GroupByQueryname` on an
+    /// incoming `BamTemplateBatch`. This is the correct→align fused path.
     ///
     /// When `--rejects` is set, branch 1 of the correct step carries pre-framed
     /// `DecompressedBlock` bytes and is wired here directly to its own
@@ -1456,9 +1480,8 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// # Errors
     ///
-    /// Returns errors if correct options are missing from the spec bag, if UMI
-    /// sequence loading fails, or if `position` is `Intermediate` (not yet
-    /// implemented).
+    /// Returns errors if correct options are missing from the spec bag or if UMI
+    /// sequence loading fails.
     ///
     /// [`EncodedUmiSet`]: crate::commands::correct::EncodedUmiSet
     /// [`DecompressedBlock`]: crate::pipeline::steps::types::DecompressedBlock
@@ -1604,7 +1627,8 @@ impl<'a> ChainBuilder<'a> {
                 process_tail,
             );
             self.current_tail = Some(tail);
-            self.chain_tail_kind = ChainTailKind::DecodedRecordBatch; // actually DecompressedBlock
+            // tail is DecompressedBlock (serialized bytes) → SerializedBytes.
+            self.chain_tail_kind = ChainTailKind::SerializedBytes;
         } else {
             // Intermediate: leave the tail as BamTemplateBatch so the next
             // stage (add_align → GroupByQueryname → AlignAndMergeStep) can
@@ -1830,10 +1854,9 @@ impl<'a> ChainBuilder<'a> {
                 .pipeline
                 .append_step(SerializeBamRecords::new(self.tuning.per_step_byte_limit), aam_tail);
             self.current_tail = Some(tail);
-            // chain_tail_kind is DecompressedBlock after SerializeBamRecords, but
-            // we reuse DecodedRecordBatch as the sentinel for "bytes ready for sink"
-            // (consistent with other Terminal paths).
-            self.chain_tail_kind = ChainTailKind::DecodedRecordBatch;
+            // tail is DecompressedBlock (serialized bytes) after SerializeBamRecords
+            // → SerializedBytes.
+            self.chain_tail_kind = ChainTailKind::SerializedBytes;
         } else {
             self.current_tail = Some(aam_tail);
             // AAM output is BamTemplateBatch; downstream stages (Sort, Group,
@@ -1969,11 +1992,9 @@ impl<'a> ChainBuilder<'a> {
                 merge_tail,
             );
             self.current_tail = Some(tail);
-            // Tail is now DecompressedBlock (bytes). The chain_tail_kind
-            // sentinel after SerializeBamRecords is DecodedRecordBatch
-            // (same convention used by other Terminal paths — see the
-            // comment on `ChainTailKind` for the "ready for sink" sentinel).
-            self.chain_tail_kind = ChainTailKind::DecodedRecordBatch;
+            // tail is DecompressedBlock (serialized bytes) after SerializeBamRecords
+            // → SerializedBytes.
+            self.chain_tail_kind = ChainTailKind::SerializedBytes;
         } else {
             self.current_tail = Some(merge_tail);
             // Intermediate: ZipperMergeStep emits BamTemplateBatch so the
@@ -2188,8 +2209,8 @@ impl<'a> ChainBuilder<'a> {
             // For Intermediate: chain_tail_kind = DecodedRecordBatch;
             // add_group / add_simplex / etc. can proceed normally.
             //
-            // For Terminal: chain_tail_kind = DecodedRecordBatch (sentinel for
-            // "bytes ready for sink") — add_sink appends BgzfCompress → WriteBgzfFile.
+            // For Terminal: chain_tail_kind = SerializedBytes (DecompressedBlock
+            // bytes ready for sink) — add_sink appends BgzfCompress → WriteBgzfFile.
             //
             // Memory must be `Fixed` — `Auto` cannot be honoured in a
             // multi-stage pipeline where the memory budget is shared across
@@ -2291,9 +2312,9 @@ impl<'a> ChainBuilder<'a> {
                     merge_tail,
                 );
                 self.current_tail = Some(tail);
-                // Use DecodedRecordBatch as the sentinel for "bytes ready for sink"
-                // (consistent with other Terminal paths).
-                self.chain_tail_kind = ChainTailKind::DecodedRecordBatch;
+                // tail is DecompressedBlock (serialized bytes) after
+                // SerializeRecordBatch → SerializedBytes.
+                self.chain_tail_kind = ChainTailKind::SerializedBytes;
 
                 // Mirror the Standalone-branch BAI hook registration: when
                 // the spec asks for a sidecar BAI, queue the
@@ -2360,11 +2381,10 @@ impl<'a> ChainBuilder<'a> {
     /// chain tail is [`DecompressedBlock`] (bytes ready for `BgzfCompress`).
     ///
     /// For [`StagePosition::Intermediate`], only the first three steps are
-    /// appended; the chain tail stays as [`BatchedProcessedPositionGroups`] for
-    /// the next stage to consume. Intermediate group is not yet needed by any
-    /// Phase 3a runall combination; calling `add_group` with `Intermediate`
-    /// returns `Err` as a guard until Phase 3b's fused group→consensus chains
-    /// require it.
+    /// appended; the chain tail stays as [`BatchedProcessedPositionGroups`] so
+    /// the consensus stages (`add_simplex`/`add_duplex`/`add_codec`) can prepend
+    /// `templates_to_mi_step` and consume it. This is the fused group→consensus
+    /// path.
     ///
     /// Accepts both template-coordinate-sorted and (with `--allow-unmapped`)
     /// queryname-sorted inputs, matching `GroupReadsByUmi::execute`'s validation.
@@ -2376,8 +2396,8 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// # Errors
     ///
-    /// Returns errors if the sort order is wrong, if the group options are missing
-    /// from the spec bag, or if `position` is `Intermediate` (not yet implemented).
+    /// Returns errors if the sort order is wrong or if the group options are
+    /// missing from the spec bag.
     ///
     /// [`BatchedProcessedPositionGroups`]: crate::pipeline::steps::group::position::BatchedProcessedPositionGroups
     #[allow(clippy::too_many_lines)]
@@ -2549,8 +2569,9 @@ impl<'a> ChainBuilder<'a> {
             );
             let tail = self.pipeline.append_step(serialize_step, tail);
             self.current_tail = Some(tail);
-            // chain_tail_kind remains DecodedRecordBatch (actually DecompressedBlock,
-            // but that's used only for add_sink detection, not for stage routing).
+            // tail is DecompressedBlock (serialized bytes) after SerializeGroups
+            // → SerializedBytes.
+            self.chain_tail_kind = ChainTailKind::SerializedBytes;
         } else {
             // Intermediate: leave tail as BatchedProcessedPositionGroups so the
             // next stage (add_simplex / add_duplex / add_codec) can wire

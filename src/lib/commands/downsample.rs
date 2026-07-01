@@ -89,6 +89,22 @@ pub struct Downsample {
     pub compression: CompressionOptions,
 }
 
+/// Validate the `--fraction` argument.
+///
+/// The fraction must be greater than 0.0 (exclusive) and at most 1.0 (inclusive).
+///
+/// # Errors
+///
+/// Returns an error if `fraction` is non-finite (NaN/±inf), `<= 0.0`, or `> 1.0`.
+fn validate_fraction(fraction: f64) -> Result<()> {
+    // Reject non-finite values (NaN/±inf) first, since NaN comparisons are always
+    // false and would otherwise slip past the range test below.
+    if !fraction.is_finite() || fraction <= 0.0 || fraction > 1.0 {
+        bail!("--fraction must be between 0.0 (exclusive) and 1.0 (inclusive), got {}", fraction);
+    }
+    Ok(())
+}
+
 impl Command for Downsample {
     fn execute(&self, command_line: &str) -> Result<()> {
         // Validate inputs. Skip the existence check for stdin (`-` /
@@ -101,12 +117,7 @@ impl Command for Downsample {
         }
 
         // Validate fraction
-        if self.fraction <= 0.0 || self.fraction > 1.0 {
-            bail!(
-                "--fraction must be between 0.0 (exclusive) and 1.0 (inclusive), got {}",
-                self.fraction
-            );
-        }
+        validate_fraction(self.fraction)?;
 
         let timer = OperationTimer::new("Downsampling reads");
 
@@ -377,6 +388,7 @@ fn get_mi_tag(record: &RawRecord) -> Result<String> {
 mod tests {
     use super::*;
     use fgumi_raw_bam::SamBuilder as RawSamBuilder;
+    use rstest::rstest;
 
     /// Create a test record with a string MI tag.
     fn create_test_record(name: &str, mi: &str) -> RawRecord {
@@ -492,53 +504,28 @@ mod tests {
         assert!(family.is_none());
     }
 
-    #[test]
-    fn test_validate_fraction_too_low() {
-        let cmd = Downsample {
-            io: test_bam_io_options(),
-            fraction: 0.0,
-            rejects: None,
-            seed: None,
-            validate_mi_order: false,
-            histogram_kept: None,
-            histogram_rejected: None,
-            compression: CompressionOptions { compression_level: 1 },
-        };
-
-        // We can't call execute() without a real BAM file, but we can test the validation
-        assert!(cmd.fraction <= 0.0);
-    }
-
-    #[test]
-    fn test_validate_fraction_too_high() {
-        let cmd = Downsample {
-            io: test_bam_io_options(),
-            fraction: 1.5,
-            rejects: None,
-            seed: None,
-            validate_mi_order: false,
-            histogram_kept: None,
-            histogram_rejected: None,
-            compression: CompressionOptions { compression_level: 1 },
-        };
-
-        assert!(cmd.fraction > 1.0);
-    }
-
-    #[test]
-    fn test_validate_fraction_valid() {
-        let cmd = Downsample {
-            io: test_bam_io_options(),
-            fraction: 0.5,
-            rejects: None,
-            seed: None,
-            validate_mi_order: false,
-            histogram_kept: None,
-            histogram_rejected: None,
-            compression: CompressionOptions { compression_level: 1 },
-        };
-
-        assert!(cmd.fraction > 0.0 && cmd.fraction <= 1.0);
+    /// `validate_fraction` accepts `(0.0, 1.0]` and rejects everything else.
+    ///
+    /// The boundary matrix is kept in one table so new edge values land in a
+    /// single place:
+    /// - too low: `0.0` is the exclusive lower bound, and negatives are below it;
+    /// - too high: anything strictly above the inclusive upper bound of `1.0`;
+    /// - valid: a mid-range value and the inclusive upper bound `1.0`;
+    /// - non-finite: NaN/±inf, which must be rejected first since NaN
+    ///   comparisons are always false and would otherwise slip past the
+    ///   `<= 0.0 || > 1.0` range test.
+    #[rstest]
+    #[case::too_low_zero(0.0, false)]
+    #[case::too_low_negative(-0.1, false)]
+    #[case::too_high_just_over(1.1, false)]
+    #[case::too_high(1.5, false)]
+    #[case::valid_mid(0.5, true)]
+    #[case::valid_upper_bound(1.0, true)]
+    #[case::non_finite_nan(f64::NAN, false)]
+    #[case::non_finite_inf(f64::INFINITY, false)]
+    #[case::non_finite_neg_inf(f64::NEG_INFINITY, false)]
+    fn test_validate_fraction(#[case] fraction: f64, #[case] expect_ok: bool) {
+        assert_eq!(validate_fraction(fraction).is_ok(), expect_ok);
     }
 
     #[test]

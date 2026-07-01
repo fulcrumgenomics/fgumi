@@ -3,6 +3,11 @@
 //! When a step can't push to a downstream queue (it's full), it stashes the
 //! item in a `HeldSlot` and returns `StepOutcome::Progress`. The next
 //! `try_run` call drains the held item before doing new work.
+//!
+//! Draining the held item before new work is a *step-author convention*, not
+//! something `HeldSlot` enforces: the type only provides single-slot put/take
+//! (with a double-put panic). The step is responsible for checking and draining
+//! the slot first on each `try_run`.
 
 pub struct HeldSlot<T> {
     inner: Option<T>,

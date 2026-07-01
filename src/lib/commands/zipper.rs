@@ -898,9 +898,9 @@ impl Command for Zipper {
         validate_file_exists(&self.reference, "Reference FASTA (--ref)")?;
         if crate::reference::find_dict_path(&self.reference).is_none() {
             bail!(
-                "Reference FASTA {:?} has no sequence dictionary (`.dict`); \
+                "Reference FASTA {} has no sequence dictionary (`.dict`); \
                  zipper needs it to build the output BAM header",
-                self.reference.display().to_string()
+                self.reference.display()
             );
         }
 
@@ -927,7 +927,7 @@ impl Command for Zipper {
     }
 }
 
-/// Typed-step pipeline merger for the zipper merge stage.
+/// Typed-step pipeline merger for the zipper merge path.
 ///
 /// Implements [`Step2`] over two `BamTemplateBatch` streams (unmapped
 /// `InputA` and mapped `InputB`) and emits merged

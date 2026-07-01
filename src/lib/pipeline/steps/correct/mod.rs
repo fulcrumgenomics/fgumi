@@ -51,7 +51,7 @@ mod tests;
 /// can't impl `HeapSize` (orphan rule). Reports `heap_size = 0` because
 /// the cache size is bounded by the user-set `cache_size` option, not
 /// dynamically grown — same convention as `ConsensusState` /
-/// `CodecState` / `DuplexState` at `commands/runall.rs:3517,3665,3772`.
+/// `CodecState` / `DuplexState` in `commands::runall`.
 pub(crate) struct CorrectWorkerState {
     cache: Option<LruCache<Vec<u8>, UmiMatch>>,
 }
@@ -327,14 +327,12 @@ fn run_batch_kept_only(
 
 /// Append one raw BAM record to `dst` using the standard BAM framing:
 /// 4-byte LE `block_size` followed by the record body. Matches the
-/// legacy rejects writer's framing at `correct.rs:~1184-1186` (the
-/// `serialize_fn` body that frames kept records) and what
-/// `BgzfCompress` expects in a `DecompressedBlock`.
+/// legacy rejects writer's framing (the `serialize_fn` body that frames
+/// kept records) and what `BgzfCompress` expects in a `DecompressedBlock`.
 fn append_framed_raw_record(dst: &mut Vec<u8>, rec: &RawRecord) {
     // BAM record body size is u32-bounded per the spec; the underlying
     // RawRecord buffer was sized to fit a single record, so the cast
-    // cannot truncate in practice. Matches the legacy serialize_fn cast
-    // at `correct.rs:~1201`.
+    // cannot truncate in practice. Matches the legacy serialize_fn cast.
     #[allow(clippy::cast_possible_truncation)]
     let block_size = rec.len() as u32;
     dst.extend_from_slice(&block_size.to_le_bytes());

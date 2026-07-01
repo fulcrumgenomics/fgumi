@@ -199,15 +199,14 @@ impl CodecOptions {
             bail!("min-duplex-length must be >= 1");
         }
 
-        // Validate disagreement rate. Use a range `contains` check rather than
-        // two `<`/`>` comparisons so `NaN` is rejected too: `NaN < 0.0` and
-        // `NaN > 1.0` are both false (a comparison pair would let `NaN`
-        // through), but `NaN` is in no range so `!contains` rejects it.
-        if !(0.0..=1.0).contains(&self.max_duplex_disagreement_rate) {
-            bail!(
-                "max-duplex-disagreement-rate must be between 0.0 and 1.0 (got {})",
-                self.max_duplex_disagreement_rate
-            );
+        // Validate disagreement rate. Reject non-finite values (NaN/inf) first,
+        // since NaN comparisons are always false and would otherwise slip past
+        // the `0.0..=1.0` range test below.
+        if !self.max_duplex_disagreement_rate.is_finite()
+            || self.max_duplex_disagreement_rate < 0.0
+            || self.max_duplex_disagreement_rate > 1.0
+        {
+            bail!("max-duplex-disagreement-rate must be between 0.0 and 1.0");
         }
 
         Ok(())
@@ -1110,13 +1109,14 @@ mod tests {
     #[case::disagreement_rate_high(
         CodecOptions { max_duplex_disagreement_rate: 1.5, ..Default::default() }
     )]
+    #[case::disagreement_rate_nan(
+        CodecOptions { max_duplex_disagreement_rate: f64::NAN, ..Default::default() }
+    )]
     #[case::disagreement_rate_negative(
         CodecOptions { max_duplex_disagreement_rate: -0.1, ..Default::default() }
     )]
-    // Regression: `NaN < 0.0` and `NaN > 1.0` are both false, so a comparison
-    // pair would let `NaN` through; the range `contains` check rejects it.
-    #[case::disagreement_rate_nan(
-        CodecOptions { max_duplex_disagreement_rate: f64::NAN, ..Default::default() }
+    #[case::disagreement_rate_inf(
+        CodecOptions { max_duplex_disagreement_rate: f64::INFINITY, ..Default::default() }
     )]
     fn codec_options_validate_rejects_degenerate(#[case] options: CodecOptions) {
         assert!(

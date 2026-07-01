@@ -12,12 +12,9 @@
 //!     intermediate BAMs (`fgumi runall --start-from S --stop-after T`
 //!     vs `fgumi S → tmp.bam → ... → fgumi T`).
 //!
-//! Today's runall only accepts `{Sort, Group} → {Simplex, Duplex, Codec}`
-//! (6 combos). The remaining 6 combos (5 Class A diagonal + Sort→Group)
-//! are gated behind #33 tasks 5-9 and the corresponding tests are
-//! `#[ignore = "TDD: blocked on task N of #33"]` — they compile, build
-//! the right CLI invocation via this module, and turn green
-//! automatically when the gate is lifted.
+//! The parity matrix covers the valid `(--start-from, --stop-after)` pairs;
+//! consult `RunAllStage`/the validator (`RunAllStage::validate_with`) for the
+//! authoritative supported set, since the surface grows as new stages are wired.
 
 #![allow(dead_code)]
 

@@ -399,7 +399,7 @@ impl ThreadingMode {
 ///
 /// ```bash
 /// fgumi group --threads 8 ...
-/// # Uses up to 8 threads with work-stealing scheduler
+/// # Uses up to 8 threads with the round-robin pipeline scheduler
 /// ```
 #[derive(Debug, Clone, Args)]
 pub struct ThreadingOptions {
@@ -407,7 +407,7 @@ pub struct ThreadingOptions {
     ///
     /// If not specified, uses a single-threaded fast path optimized for
     /// simple streaming. When specified (even with --threads 1), uses the
-    /// 7-step parallel pipeline with work-stealing scheduler.
+    /// typed-step round-robin pipeline.
     #[arg(long = "threads")]
     pub threads: Option<usize>,
 }

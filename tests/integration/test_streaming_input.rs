@@ -7,15 +7,13 @@
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use rstest::rstest;
-use std::fs::{self, File};
-use std::io::{BufReader, Read};
+use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, create_umi_family, to_record_buf};
-use crate::helpers::parity::assert_bams_record_equivalent;
 
 /// Test that the group command works correctly with piped input.
 #[test]
@@ -188,12 +186,37 @@ fn test_downsample_command_with_piped_input() {
     assert!(output.status.success(), "downsample with piped input failed; stderr: {stderr}");
     assert!(output_bam.exists(), "Output BAM from pipe not created");
 
-    // `--fraction 1.0` is an identity transform, so the piped output must hold
-    // the same records, in the same order, as the input sorted BAM. A header-
-    // only or truncated BAM (which the success + existence checks above would
-    // still accept) fails here — this validates stdin *correctness*, not just
-    // that the upfront existence check was skipped for `-`.
-    assert_bams_record_equivalent(&sorted_bam, &output_bam);
+    // Oracle: run the SAME downsample directly against the sorted file (no
+    // stdin). With `--fraction 1.0` and a fixed seed, the stdin path must
+    // produce a byte-equivalent record stream to the direct-file path —
+    // `output_bam.exists()` alone would pass even if the stdin path silently
+    // dropped or reordered records.
+    let direct_out = temp_dir.path().join("direct_out.bam");
+    let direct = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "downsample",
+            "--input",
+            sorted_bam.to_str().unwrap(),
+            "--output",
+            direct_out.to_str().unwrap(),
+            "--fraction",
+            "1.0",
+            "--seed",
+            "42",
+            "--compression-level",
+            "1",
+        ])
+        .output()
+        .expect("Failed to run downsample with direct file input");
+    assert!(
+        direct.status.success(),
+        "downsample with direct input failed; stderr: {}",
+        String::from_utf8_lossy(&direct.stderr)
+    );
+    // Use the non-empty variant so a both-empty pass (e.g. `downsample` silently
+    // dropping every record on both paths) cannot satisfy the equivalence
+    // vacuously — `--fraction 1.0` must retain the full record stream.
+    crate::helpers::parity::assert_bams_record_equivalent_nonempty(&output_bam, &direct_out);
 }
 
 /// Test simplex command with piped input.
@@ -452,9 +475,9 @@ fn convert_bam_to_sam(bam_path: &PathBuf, sam_path: &PathBuf) {
     }
 }
 
-/// SAM-input parity for the new typed-step pipeline. Generates a SAM file
+/// SAM-input parity for the typed-step pipeline. Generates a SAM file
 /// from the same record set as the BAM baseline, runs `fgumi group
-/// --use-new-pipeline --input foo.sam`, and compares the output BAMs.
+/// --input foo.sam`, and compares the output BAMs.
 /// Exercises the `ReadSamChunks` + `ParseSamChunk` parallel-parse path.
 #[test]
 fn test_group_command_with_sam_input_new_pipeline_matches_bam_baseline() {
@@ -484,7 +507,7 @@ fn test_group_command_with_sam_input_new_pipeline_matches_bam_baseline() {
             "2",
         ])
         .status()
-        .expect("Failed to run group --use-new-pipeline with BAM input");
+        .expect("Failed to run group with BAM input");
     assert!(status.success(), "BAM-input baseline failed");
 
     let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
@@ -504,7 +527,7 @@ fn test_group_command_with_sam_input_new_pipeline_matches_bam_baseline() {
             "2",
         ])
         .status()
-        .expect("Failed to run group --use-new-pipeline with SAM input");
+        .expect("Failed to run group with SAM input");
     assert!(status.success(), "SAM-input run failed");
 
     compare_bam_records(&out_bam_baseline, &out_sam);
@@ -614,6 +637,13 @@ fn test_correct_command_with_sam_input_new_pipeline_with_rejects_matches_bam_bas
             .unwrap_or_else(|_| panic!("Failed to run correct {label}"));
         assert!(status.success(), "correct {label} failed");
     }
+    // Non-vacuous guard (S9b-007): this is a SAM-vs-BAM parity check between two
+    // fgumi outputs, so a both-empty pass is possible if correct silently dropped
+    // every record on BOTH paths. Assert the BAM baseline kept output is
+    // non-empty before the parity comparison so the test cannot pass vacuously.
+    // (The rejects output is legitimately empty here — this fixture corrects all
+    // UMIs, rejecting none — so only the kept output is guarded.)
+    assert!(count_bam_records(&out_bam_baseline) > 0, "BAM baseline kept output is empty");
     compare_bam_records(&out_bam_baseline, &out_sam);
     compare_bam_records(&out_bam_rejects_baseline, &out_sam_rejects);
 }
@@ -628,8 +658,7 @@ fn create_unmapped_consensus_bam(path: &PathBuf) {
     let header = create_minimal_header("chr1", 10000);
     let records: Vec<_> = ["good1", "good2", "low_depth"]
         .iter()
-        .enumerate()
-        .map(|(i, name)| {
+        .map(|name| {
             let depth = if *name == "low_depth" { 1u16 } else { 10u16 };
             let mut b = RawSamBuilder::new();
             b.read_name(name.as_bytes())
@@ -637,7 +666,6 @@ fn create_unmapped_consensus_bam(path: &PathBuf) {
                 .sequence(b"ACGTACGT")
                 .qualities(&[35; 8]);
             b.add_array_u16(SamTag::CD_BASES, &[depth; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
-            let _ = i; // silence unused
             b.build()
         })
         .collect();
@@ -695,6 +723,15 @@ fn test_filter_command_with_rejects_sam_input_matches_bam_baseline() {
             .unwrap_or_else(|_| panic!("Failed to run filter {label}"));
         assert!(status.success(), "filter {label} failed");
     }
+    // Non-vacuous guard (S9b-007): this compares two fgumi outputs, so a
+    // both-empty pass is possible if filter silently dropped every record on
+    // BOTH paths. The fixture has two depth-10 reads (kept) and one depth-1 read
+    // (rejected at --min-reads 3), so both baseline outputs must be non-empty.
+    assert!(count_bam_records(&out_bam_baseline) > 0, "BAM baseline kept output is empty");
+    assert!(
+        count_bam_records(&out_bam_rejects_baseline) > 0,
+        "BAM baseline rejects output is empty"
+    );
     compare_bam_records(&out_bam_baseline, &out_sam);
     compare_bam_records(&out_bam_rejects_baseline, &out_sam_rejects);
 }
@@ -765,7 +802,7 @@ fn test_group_command_with_sam_stdin_new_pipeline_matches_bam_baseline() {
 }
 
 /// Same shape as `test_group_command_with_piped_input` but routed through
-/// the typed-step pipeline (`--use-new-pipeline`). Exercises the
+/// the typed-step pipeline. Exercises the
 /// `read_bam_auto` dispatcher introduced for issue #330 Phase 1 T1.3.4:
 /// when the input path is `-`, the source step is `read_bam_stdin`
 /// (which buffers the BAM header via `TeeReader` and replays it ahead
@@ -796,9 +833,16 @@ fn test_group_command_with_piped_input_new_pipeline() {
             "2",
         ])
         .status()
-        .expect("Failed to run group --use-new-pipeline with file input");
-    assert!(status.success(), "group --use-new-pipeline (file) failed");
+        .expect("Failed to run group with file input");
+    assert!(status.success(), "group (file) failed");
     assert!(output_from_file.exists(), "file-input output not created");
+    // Non-empty baseline: the file-vs-stdin parity check below (`compare_bam_records`)
+    // would pass vacuously if `group` emitted zero records on BOTH paths. Assert the
+    // file-path baseline actually produced records so the parity comparison is meaningful.
+    assert!(
+        count_bam_records(&output_from_file) > 0,
+        "file-input baseline produced no records; the stdin parity check would be vacuous"
+    );
 
     let cat_child = Command::new("cat")
         .arg(input_bam.to_str().unwrap())
@@ -824,21 +868,11 @@ fn test_group_command_with_piped_input_new_pipeline() {
         ])
         .stdin(cat_child.stdout.unwrap())
         .status()
-        .expect("Failed to run group --use-new-pipeline with piped input");
-    assert!(status.success(), "group --use-new-pipeline (stdin) failed");
+        .expect("Failed to run group with piped input");
+    assert!(status.success(), "group (stdin) failed");
     assert!(output_from_pipe.exists(), "stdin output not created");
 
     compare_bam_records(&output_from_file, &output_from_pipe);
-}
-
-/// Helper to read file contents for comparison.
-#[allow(dead_code)]
-fn read_file_contents(path: &PathBuf) -> Vec<u8> {
-    let file = File::open(path).expect("Failed to open file");
-    let mut reader = BufReader::new(file);
-    let mut contents = Vec::new();
-    reader.read_to_end(&mut contents).expect("Failed to read file");
-    contents
 }
 
 /// Helper to compare BAM records (ignoring header differences like @PG command line).
@@ -1221,6 +1255,11 @@ fn test_duplex_reads_stdin_once(#[case] threads: Option<&str>) {
     });
 }
 
+/// Unlike codec/duplex/clip, filter has NO single-threaded fast path: `Filter::execute`
+/// always routes through `chains::build_for(spec).run()` regardless of `--threads`
+/// (see `src/lib/commands/filter.rs`). So there is no no-`--threads` code path to cover —
+/// only the explicit `--threads 1` / `--threads 2` cases exist (no
+/// `#[case::single_threaded(None)]`).
 #[rstest]
 #[case("1")]
 #[case("2")]

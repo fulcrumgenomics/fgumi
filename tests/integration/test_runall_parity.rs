@@ -8,17 +8,16 @@
 //!     `fgumi runall --start-from X --stop-after X` and `fgumi X` on
 //!     the same input, asserts the output BAMs contain the same
 //!     record stream. Pins that runall's per-stage execution path
-//!     matches the standalone command's execution path. Activated by
-//!     #33 tasks 5-9 as each diagonal combo is wired through the
-//!     validator.
+//!     matches the standalone command's execution path. All five run
+//!     by default.
 //!
 //!   * **Class B — composition / multi-stage parity (7 tests).** Runs
 //!     `fgumi runall --start-from S --stop-after T` and the equivalent
 //!     staged chain (`fgumi S → tmp.bam → fgumi ... → fgumi T`),
 //!     asserts the output BAMs contain the same record stream. Pins
 //!     that runall's FUSED chain matches the standalone STAGED chain.
-//!     Six of these (`{Sort,Group}→{Simplex,Duplex,Codec}`) are
-//!     unblocked today; one (`Sort→Group`) waits on task 9.
+//!     All seven (`{Sort,Group}→{Simplex,Duplex,Codec}` plus
+//!     `Sort→Group`) run by default.
 //!
 //! Total: 12 parity tests covering every valid `(start, stop)` pair
 //! the validator accepts (5 diagonal + 7 off-diagonal = 12; the
@@ -46,13 +45,16 @@ use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{
     create_both_unmapped_pair, create_minimal_header, create_paired_umi_family,
-    create_paired_umi_family_at, create_umi_family, to_record_buf,
+    create_paired_umi_family_at, create_umi_family, create_umi_family_at, to_record_buf,
 };
 use crate::helpers::cli_runner::{
     ParityArgs, Stage, fgumi, fgumi_binary, run_runall, run_runall_consensus_to_filter,
     run_staged_chain, run_standalone, run_standalone_filter,
 };
-use crate::helpers::parity::assert_bams_record_equivalent;
+use crate::helpers::parity::{
+    assert_bam_headers_equivalent_ignoring_pg, assert_bams_record_equivalent,
+    assert_bams_record_equivalent_nonempty, read_bam_records,
+};
 
 // ────────────────────────── Fixtures ──────────────────────────
 //
@@ -292,12 +294,12 @@ fn grouped_codec_fixture(dir: &Path) -> PathBuf {
 // ────────────────────────── Class A — single-stage parity ──────────────────────────
 //
 // Each Class A test runs `fgumi runall --start-from X --stop-after X`
-// against `fgumi X` on the same input. Activated as #33 tasks 5-9 lift
-// the corresponding `--start-from`/`--stop-after` gate.
+// against `fgumi X` on the same input.
 
-/// `Sort → Sort` parity vs standalone `fgumi sort`. Unblocked by
-/// task 8 of #33 — runall delegates to `Sort::execute` for
-/// byte-identical output by construction.
+/// `Sort → Sort` parity vs standalone `fgumi sort`. Runall delegates to
+/// `Sort::execute`, so the two are record- and header-equivalent — identical
+/// records and `@HD`/`@SQ`/`@RG`, ignoring only the `@PG` command-line
+/// provenance (which legitimately differs between runall and standalone).
 #[test]
 fn parity_a_sort_to_sort() {
     let tmp = TempDir::new().unwrap();
@@ -312,12 +314,17 @@ fn parity_a_sort_to_sort() {
     let r = run_standalone(Stage::Sort, &fixture, &standalone_out, &args);
     assert!(r.status.success(), "standalone: {}", String::from_utf8_lossy(&r.stderr));
 
-    assert_bams_record_equivalent(&runall_out, &standalone_out);
+    assert_bams_record_equivalent_nonempty(&runall_out, &standalone_out);
+    // S9a-005: the sort-order metadata (`@HD SO/GO/SS`), `@SQ` dictionary, and
+    // `@RG` set must match too — a fused runall that emitted the wrong sort
+    // order would be invisible to the record-only equivalence check.
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &standalone_out);
 }
 
-/// `Group → Group` parity vs standalone `fgumi group`. Unblocked by
-/// task 9 of #33 — runall delegates to `GroupReadsByUmi::execute`
-/// for byte-identical output by construction.
+/// `Group → Group` parity vs standalone `fgumi group`. Runall delegates to
+/// `GroupReadsByUmi::execute`, so the two are record- and header-equivalent —
+/// identical records and `@HD`/`@SQ`/`@RG`, ignoring only the `@PG`
+/// command-line provenance (which legitimately differs).
 #[test]
 fn parity_a_group_to_group() {
     let tmp = TempDir::new().unwrap();
@@ -332,12 +339,14 @@ fn parity_a_group_to_group() {
     let r = run_standalone(Stage::Group, &fixture, &standalone_out, &args);
     assert!(r.status.success(), "standalone: {}", String::from_utf8_lossy(&r.stderr));
 
-    assert_bams_record_equivalent(&runall_out, &standalone_out);
+    assert_bams_record_equivalent_nonempty(&runall_out, &standalone_out);
+    // S9a-005: group preserves the sort metadata + dictionary + read groups.
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &standalone_out);
 }
 
 /// `Simplex → Simplex` parity vs standalone `fgumi simplex`.
-/// Unblocked by task 5 of #33; uses the consensus-only delegation
-/// fast path (`execute_consensus_only`) added in a later commit —
+/// Uses the consensus-only delegation fast path
+/// (`execute_consensus_only`) —
 /// runall constructs a `Simplex` struct from its own flags and calls
 /// `Simplex::execute` directly, skipping the group step entirely.
 /// Parity therefore holds by construction (same standalone command,
@@ -358,13 +367,18 @@ fn parity_a_simplex_to_simplex() {
     let r = run_standalone(Stage::Simplex, &fixture, &standalone_out, &args);
     assert!(r.status.success(), "standalone: {}", String::from_utf8_lossy(&r.stderr));
 
-    assert_bams_record_equivalent(&runall_out, &standalone_out);
+    // S9a-001: simplex on the grouped fixture emits one fragment consensus per
+    // MI group, so the stream is non-empty — pin that floor so a regression
+    // that dropped all consensus records can't pass vacuously.
+    assert_bams_record_equivalent_nonempty(&runall_out, &standalone_out);
+    // S9a-005: the consensus header collapses read groups; pin that the fused
+    // and standalone paths agree on the @HD/@SQ/@RG metadata.
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &standalone_out);
 }
 
-/// `Duplex → Duplex` parity vs standalone `fgumi duplex`. Unblocked
-/// by task 6 of #33; runs through the consensus-only delegation fast
-/// path. See `parity_a_simplex_to_simplex` for the delegation
-/// contract this pins.
+/// `Duplex → Duplex` parity vs standalone `fgumi duplex`. Runs through
+/// the consensus-only delegation fast path. See
+/// `parity_a_simplex_to_simplex` for the delegation contract this pins.
 #[cfg(feature = "consensus")]
 #[test]
 fn parity_a_duplex_to_duplex() {
@@ -380,15 +394,24 @@ fn parity_a_duplex_to_duplex() {
     let r = run_standalone(Stage::Duplex, &fixture, &standalone_out, &args);
     assert!(r.status.success(), "standalone: {}", String::from_utf8_lossy(&r.stderr));
 
-    assert_bams_record_equivalent(&runall_out, &standalone_out);
+    // S9a-001: the duplex chain emits duplex consensus records — non-empty.
+    assert_bams_record_equivalent_nonempty(&runall_out, &standalone_out);
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &standalone_out);
 }
 
-/// `Codec → Codec` parity vs standalone `fgumi codec`. Unblocked by
-/// task 7 of #33; runs through the consensus-only delegation fast
-/// path. Uses `grouped_codec_fixture` (paired-end, single-strand
-/// UMI, grouped with `--strategy adjacency`) — the documented CODEC
-/// input — so this actually exercises the duplex consensus logic
-/// instead of degenerating to a no-op on simplex single-end data.
+/// `Codec → Codec` parity vs standalone `fgumi codec`. Runs through the
+/// consensus-only delegation fast path. Uses `grouped_codec_fixture`
+/// (paired-end, single-UMI, grouped with `--strategy adjacency`).
+///
+/// NOTE (S9a-001): this fixture lacks the FR-overlap flag shape CODEC
+/// consensus requires (R1 `PAIRED|FIRST|MATE_REVERSE` / R2 `PAIRED|LAST|REVERSE`
+/// at the same position), so every pair is rejected and BOTH the fused and
+/// standalone paths emit **0 consensus records**. The parity therefore holds
+/// only because both sides are empty. The explicit `== 0` assertion below makes
+/// that deliberate zero VISIBLE: if a future change gives the codec fixture
+/// FR-overlap flags (making it non-empty), this test fails loudly and forces an
+/// upgrade to a real non-empty parity check (the `zipper_*_codec` smoke tests
+/// already cover the non-empty FR-overlap shape via `zipper_codec_fixture`).
 #[cfg(feature = "consensus")]
 #[test]
 fn parity_a_codec_to_codec() {
@@ -405,25 +428,26 @@ fn parity_a_codec_to_codec() {
     assert!(r.status.success(), "standalone: {}", String::from_utf8_lossy(&r.stderr));
 
     assert_bams_record_equivalent(&runall_out, &standalone_out);
+    // Header parity matters most in this empty-stream case: a wrong fused
+    // @HD/@SQ/@RG would otherwise stay green behind the zero-record assertion.
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &standalone_out);
+    assert_eq!(
+        read_bam_records(&runall_out).len(),
+        0,
+        "codec fixture lacks the FR-overlap shape → 0 consensus by design (S9a-001)"
+    );
 }
 
 // ────────────────────────── Class B — multi-stage parity ──────────────────────────
 //
 // Each Class B test runs `fgumi runall --start-from S --stop-after T`
-// against the equivalent staged chain. Today (post-task-4 of #33), 6
-// of the 7 Class B combos are accepted by the validator; only
-// `Sort → Group` waits on task 9.
-//
-// All six already-unblocked tests are also `#[ignore]`'d in this
-// scaffold commit — they will be activated one-by-one as each test
-// is verified end-to-end (the helper modules and fixtures still need
-// to be exercised together at least once; see the activation TODO
-// note in each).
+// against the equivalent staged chain. All seven Class B combos are
+// accepted by the validator and run by default.
 
 /// `Sort → Group` parity vs staged `fgumi sort | fgumi group`.
-/// Unblocked by task 9 of #33 — runall delegates to `Sort::execute`
-/// then `GroupReadsByUmi::execute` (via a tempfile) for
-/// byte-identical output by construction.
+/// Runall delegates to `Sort::execute` then `GroupReadsByUmi::execute`
+/// (via a tempfile), so the output is record- and header-equivalent
+/// (ignoring `@PG` command-line provenance) by construction.
 #[test]
 fn parity_b_sort_to_group() {
     let tmp = TempDir::new().unwrap();
@@ -439,12 +463,15 @@ fn parity_b_sort_to_group() {
         run_staged_chain(&[Stage::Sort, Stage::Group], &fixture, &staged_out, tmp.path(), &args);
     assert!(r.status.success(), "staged: {}", String::from_utf8_lossy(&r.stderr));
 
-    assert_bams_record_equivalent(&runall_out, &staged_out);
+    assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
+    // S9a-005: the stack changes header propagation/update paths, so also pin
+    // @HD/@SQ/@RG parity — a fused-chain header regression (e.g. SO:unsorted
+    // after sort, a dropped @SQ, uncollapsed @RG) is invisible to the
+    // record-only comparison above.
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
 }
 
 /// `Sort → Simplex` parity vs staged `fgumi sort | fgumi group | fgumi simplex`.
-/// Unblocked by validator (today); test activation pending end-to-end
-/// verification of the parity scaffold.
 #[cfg(feature = "consensus")]
 #[test]
 fn parity_b_sort_to_simplex() {
@@ -466,7 +493,12 @@ fn parity_b_sort_to_simplex() {
     );
     assert!(r.status.success(), "staged: {}", String::from_utf8_lossy(&r.stderr));
 
-    assert_bams_record_equivalent(&runall_out, &staged_out);
+    assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
+    // S9a-005: the stack changes header propagation/update paths, so also pin
+    // @HD/@SQ/@RG parity — a fused-chain header regression (e.g. SO:unsorted
+    // after sort, a dropped @SQ, uncollapsed @RG) is invisible to the
+    // record-only comparison above.
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
 }
 
 /// `Sort → Duplex` parity vs staged `fgumi sort | fgumi group | fgumi duplex`.
@@ -494,7 +526,12 @@ fn parity_b_sort_to_duplex() {
     );
     assert!(r.status.success(), "staged: {}", String::from_utf8_lossy(&r.stderr));
 
-    assert_bams_record_equivalent(&runall_out, &staged_out);
+    assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
+    // S9a-005: the stack changes header propagation/update paths, so also pin
+    // @HD/@SQ/@RG parity — a fused-chain header regression (e.g. SO:unsorted
+    // after sort, a dropped @SQ, uncollapsed @RG) is invisible to the
+    // record-only comparison above.
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
 }
 
 /// `Sort → Codec` parity vs staged `fgumi sort | fgumi group | fgumi codec`.
@@ -523,6 +560,13 @@ fn parity_b_sort_to_codec() {
     assert!(r.status.success(), "staged: {}", String::from_utf8_lossy(&r.stderr));
 
     assert_bams_record_equivalent(&runall_out, &staged_out);
+    // S9a-005: header parity holds even for the zero-record codec branch (both
+    // sides still emit @HD/@SQ/@RG) — assert it before the zero-count pin below.
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
+    // S9a-001: the codec fixture lacks the FR-overlap shape → 0 consensus by
+    // design; pin the deliberate zero so a future non-empty fixture forces a
+    // real parity check.
+    assert_eq!(read_bam_records(&runall_out).len(), 0, "codec fixture → 0 consensus by design");
 }
 
 /// `Group → Simplex` parity vs staged `fgumi group | fgumi simplex`.
@@ -542,7 +586,12 @@ fn parity_b_group_to_simplex() {
         run_staged_chain(&[Stage::Group, Stage::Simplex], &fixture, &staged_out, tmp.path(), &args);
     assert!(r.status.success(), "staged: {}", String::from_utf8_lossy(&r.stderr));
 
-    assert_bams_record_equivalent(&runall_out, &staged_out);
+    assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
+    // S9a-005: the stack changes header propagation/update paths, so also pin
+    // @HD/@SQ/@RG parity — a fused-chain header regression (e.g. SO:unsorted
+    // after sort, a dropped @SQ, uncollapsed @RG) is invisible to the
+    // record-only comparison above.
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
 }
 
 /// `Group → Duplex` parity vs staged `fgumi group | fgumi duplex`.
@@ -563,13 +612,87 @@ fn parity_b_group_to_duplex() {
         run_staged_chain(&[Stage::Group, Stage::Duplex], &fixture, &staged_out, tmp.path(), &args);
     assert!(r.status.success(), "staged: {}", String::from_utf8_lossy(&r.stderr));
 
-    assert_bams_record_equivalent(&runall_out, &staged_out);
+    assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
+    // S9a-005: the stack changes header propagation/update paths, so also pin
+    // @HD/@SQ/@RG parity — a fused-chain header regression (e.g. SO:unsorted
+    // after sort, a dropped @SQ, uncollapsed @RG) is invisible to the
+    // record-only comparison above.
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
 }
 
 /// NEW-002: under `--group::allow-unmapped`, a both-unmapped read pair survives
 /// `group` but must be dropped by the duplex `record_filter` on BOTH the fused
 /// `runall group→duplex` path and the staged `fgumi group | fgumi duplex` path.
 ///
+/// Assert that a `group --allow-unmapped` output BAM retains the fixture's sole
+/// both-unmapped template (`fam_unmapped`, UMI `TTAA-GGCC`; see
+/// `sorted_duplex_with_unmapped_fixture`) by IDENTITY, not just by count. A
+/// count-only check would still pass if the group stage retained two of some
+/// *other* record while dropping a `fam_unmapped` mate.
+fn assert_group_retains_both_unmapped_pair(group_bam: &Path) {
+    use noodles::sam::alignment::record::data::field::Tag;
+    use noodles::sam::alignment::record_buf::data::field::Value;
+    let mi_tag = Tag::from(fgumi_lib::sam::SamTag::MI);
+    let rx_tag = Tag::from(fgumi_lib::sam::SamTag::RX);
+    let group_records = read_bam_records(group_bam);
+    let retained: Vec<_> = group_records
+        .iter()
+        .filter(|rec| rec.flags().is_unmapped() && rec.data().get(&mi_tag).is_some())
+        .collect();
+    assert_eq!(
+        retained.len(),
+        2,
+        "group --allow-unmapped output must retain BOTH mates of the one both-unmapped \
+         template (= 2 MI-tagged unmapped records); a count other than 2 means a mate was \
+         dropped or duplicated. Found {} such records in {}",
+        retained.len(),
+        group_bam.display()
+    );
+    // Both retained records must be the `fam_unmapped` pair, carrying its UMI.
+    for rec in &retained {
+        let qname: &[u8] = rec.name().expect("retained record has a read name").as_ref();
+        assert_eq!(
+            qname, b"fam_unmapped",
+            "retained MI-tagged unmapped record has an unexpected qname (not fam_unmapped)"
+        );
+        let Some(Value::String(rx)) = rec.data().get(&rx_tag) else {
+            panic!("retained unmapped record is missing its RX (UMI) tag");
+        };
+        let rx_bytes: &[u8] = rx.as_ref();
+        assert_eq!(
+            rx_bytes, b"TTAA-GGCC",
+            "retained unmapped record carries the wrong UMI (not the fam_unmapped UMI)"
+        );
+    }
+    // Both retained mates must share ONE molecule id: presence alone (the filter
+    // above) would still pass if a regression split `fam_unmapped` into two
+    // different MI values, changing the grouped-template identity.
+    let mi_values: std::collections::BTreeSet<Vec<u8>> = retained
+        .iter()
+        .map(|rec| {
+            let Some(Value::String(mi)) = rec.data().get(&mi_tag) else {
+                panic!("retained unmapped record is missing its MI tag");
+            };
+            let mi_bytes: &[u8] = mi.as_ref();
+            mi_bytes.to_vec()
+        })
+        .collect();
+    assert_eq!(
+        mi_values.len(),
+        1,
+        "the retained both-unmapped pair must share one MI value; got {mi_values:?}"
+    );
+    // ...and they are exactly one R1 + one R2 (no mate dropped or duplicated).
+    let first = retained.iter().filter(|r| r.flags().is_first_segment()).count();
+    let last = retained.iter().filter(|r| r.flags().is_last_segment()).count();
+    assert_eq!(
+        (first, last),
+        (1, 1),
+        "the retained both-unmapped pair must be exactly one R1 + one R2, got \
+         ({first} first, {last} last) segments"
+    );
+}
+
 /// Before the fix the fused `templates_to_mi_step` bridge did not apply the
 /// duplex filter, so the both-unmapped pair leaked into the consensus caller on
 /// the fused path only — diverging from the staged path. This test fails on the
@@ -628,6 +751,14 @@ fn new_002_group_to_duplex_allow_unmapped_parity() {
     let r = fgumi(&group_args);
     assert!(r.status.success(), "staged group: {}", String::from_utf8_lossy(&r.stderr));
 
+    // Independent intermediate check: the group stage with --allow-unmapped must
+    // retain the both-unmapped template (MI-tagged, by identity) BEFORE duplex
+    // runs. This pins the bridge/filter contract directly — without it, a
+    // regression that drops the unmapped template at the group stage could still
+    // pass the final fused-vs-staged comparison if both paths dropped it
+    // identically.
+    assert_group_retains_both_unmapped_pair(&group_bam);
+
     let duplex_args: Vec<OsString> = vec![
         "duplex".into(),
         "--input".into(),
@@ -642,7 +773,12 @@ fn new_002_group_to_duplex_allow_unmapped_parity() {
     let r = fgumi(&duplex_args);
     assert!(r.status.success(), "staged duplex: {}", String::from_utf8_lossy(&r.stderr));
 
-    assert_bams_record_equivalent(&runall_out, &staged_out);
+    assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
+    // S9a-005: the stack changes header propagation/update paths, so also pin
+    // @HD/@SQ/@RG parity — a fused-chain header regression (e.g. SO:unsorted
+    // after sort, a dropped @SQ, uncollapsed @RG) is invisible to the
+    // record-only comparison above.
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
 
     // Negative oracle: path-equivalence alone would still pass if BOTH paths
     // wrongly emitted output derived from the both-unmapped family. The contract
@@ -691,6 +827,10 @@ fn parity_b_group_to_codec() {
     assert!(r.status.success(), "staged: {}", String::from_utf8_lossy(&r.stderr));
 
     assert_bams_record_equivalent(&runall_out, &staged_out);
+    // S9a-005: header parity holds even for the zero-record codec branch.
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
+    // S9a-001: codec fixture lacks FR-overlap → 0 consensus by design.
+    assert_eq!(read_bam_records(&runall_out).len(), 0, "codec fixture → 0 consensus by design");
 }
 
 // ──────────────── Fused consensus → filter parity (issue #330 option a) ────────────────
@@ -724,7 +864,12 @@ fn parity_group_to_simplex_to_filter() {
     let r = run_standalone_filter(&consensus_bam, &staged_out, &args);
     assert!(r.status.success(), "staged filter: {}", String::from_utf8_lossy(&r.stderr));
 
-    assert_bams_record_equivalent(&fused_out, &staged_out);
+    // S9a-001 / S5b2-004: simplex consensus at --min-reads 1 survives the
+    // filter, so the fused consensus→filter stream is non-empty.
+    assert_bams_record_equivalent_nonempty(&fused_out, &staged_out);
+    // S9a-005: the fused consensus→filter path also updates the header; pin
+    // @HD/@SQ/@RG parity against the staged consensus + standalone-filter chain.
+    assert_bam_headers_equivalent_ignoring_pg(&fused_out, &staged_out);
 }
 
 /// `Group → Duplex → Filter` (fused) vs staged consensus BAM + `fgumi filter`.
@@ -747,7 +892,22 @@ fn parity_group_to_duplex_to_filter() {
     let r = run_standalone_filter(&consensus_bam, &staged_out, &args);
     assert!(r.status.success(), "staged filter: {}", String::from_utf8_lossy(&r.stderr));
 
+    // S9a-001 / S5b2-004: this pins the fused consensus→filter topology (the
+    // duplex strand-strip bridge) — fused MUST equal staged. The duplex fixture
+    // is single-strand (all reads of each family carry the same paired UMI →
+    // AB depth 4, BA depth 0), so `fgumi filter --min-reads 1` drops every
+    // duplex consensus read for failing the per-strand depth floor (BA = 0 < 1).
+    // Both paths therefore yield 0 — assert that deliberate zero explicitly
+    // (rather than letting the equivalence pass vacuously). `parity_b_group_to_
+    // duplex` already pins the NON-empty duplex consensus stream before filtering.
     assert_bams_record_equivalent(&fused_out, &staged_out);
+    // S9a-005: header parity holds even for the zero-record duplex→filter branch.
+    assert_bam_headers_equivalent_ignoring_pg(&fused_out, &staged_out);
+    assert_eq!(
+        read_bam_records(&fused_out).len(),
+        0,
+        "single-strand duplex fixture → 0 reads survive `filter --min-reads 1` (BA depth 0)"
+    );
 }
 
 /// `Group → Codec → Filter` (fused) vs staged consensus BAM + `fgumi filter`.
@@ -770,6 +930,10 @@ fn parity_group_to_codec_to_filter() {
     assert!(r.status.success(), "staged filter: {}", String::from_utf8_lossy(&r.stderr));
 
     assert_bams_record_equivalent(&fused_out, &staged_out);
+    // S9a-005: header parity holds even for the zero-record codec→filter branch.
+    assert_bam_headers_equivalent_ignoring_pg(&fused_out, &staged_out);
+    // S9a-001: codec fixture → 0 consensus → 0 after filter, by design.
+    assert_eq!(read_bam_records(&fused_out).len(), 0, "codec fixture → 0 consensus by design");
 }
 
 // ───────────────────── Run-to-run / thread-count determinism ─────────────────────
@@ -866,6 +1030,378 @@ fn runall_duplex_record_stream_is_deterministic() {
     assert_bams_record_equivalent(&out_a, &out_t1);
 }
 
+/// Build a many-position single-end simplex fixture spanning enough distinct
+/// template-coordinate positions that the sort/group/consensus stages run
+/// across multiple parallel workers — the regime where a broken
+/// `ByItemOrdinal` contract would let output diverge by thread-completion
+/// order. Returns a SORTED BAM (so `group` / `simplex` can consume it).
+fn deterministic_simplex_fixture(dir: &Path, positions: usize) -> PathBuf {
+    let unsorted = dir.join("det_simplex_unsorted.bam");
+    let header = create_minimal_header("chr1", positions * 200 + 1000);
+    let mut writer =
+        bam::io::Writer::new(fs::File::create(&unsorted).expect("create det simplex fixture"));
+    writer.write_header(&header).expect("write det simplex header");
+    let mut all = Vec::new();
+    // A small set of valid-DNA UMIs (non-ACGT chars would be rejected by the
+    // UMI grouping stage); cycle through them so distinct families form across
+    // positions. Each family is mapped to its own template-coordinate position
+    // (100 bp apart) via `create_umi_family_at`, so the families genuinely span
+    // many coordinates — exercising the sort/group/consensus path across
+    // multiple parallel workers rather than collapsing onto one position.
+    let umis = ["ACGTACGT", "TGCATGCA", "CCAATTGG", "GGTTAACC", "AACCGGTT", "TTGGCCAA"];
+    for p in 0..positions {
+        let umi = umis[p % umis.len()];
+        let pos = i32::try_from(100 + p * 100).expect("family position fits in i32");
+        for r in create_umi_family_at(pos, umi, 3, &format!("ds{p}_{umi}"), "ACGTACGTACGT", 30) {
+            all.push(r);
+        }
+    }
+    all.reverse();
+    for raw in &all {
+        writer
+            .write_alignment_record(&header, &to_record_buf(raw))
+            .expect("write det simplex record");
+    }
+    writer.try_finish().expect("finish det simplex fixture");
+
+    let sorted = dir.join("det_simplex_sorted.bam");
+    let args = ParityArgs::for_simplex_like();
+    let out = run_standalone(Stage::Sort, &unsorted, &sorted, &args);
+    assert!(out.status.success(), "det simplex sort: {}", String::from_utf8_lossy(&out.stderr));
+    sorted
+}
+
+/// S9a-008: extend the determinism guard beyond `group → duplex` to the
+/// streaming `sort` and the `group → simplex` parallel paths — the other
+/// stages whose output most plausibly emits in thread-completion order if the
+/// `ByItemOrdinal` contract regressed. Each asserts run-to-run equivalence at
+/// `--threads 8` AND thread-count invariance (`t8 == t1`).
+#[test]
+fn runall_sort_record_stream_is_deterministic() {
+    let tmp = TempDir::new().unwrap();
+    // The sort engine itself is the parallel stage under test — feed it the
+    // UNSORTED, many-position duplex fixture and sort it via runall.
+    let unsorted = tmp.path().join("sort_det_unsorted.bam");
+    {
+        let positions = 200usize;
+        let header = create_minimal_header("chr1", positions * 200 + 1000);
+        let mut writer =
+            bam::io::Writer::new(fs::File::create(&unsorted).expect("create sort det fixture"));
+        writer.write_header(&header).expect("write sort det header");
+        let mut all = Vec::new();
+        for p in 0..positions {
+            for r in create_paired_umi_family_at(
+                "AAAA-CCCC",
+                3,
+                &format!("sd{p}"),
+                "ACGTACGT",
+                "TTTTAAAA",
+                30,
+                99 + p * 200,
+            ) {
+                all.push(r);
+            }
+        }
+        all.reverse();
+        for raw in &all {
+            writer
+                .write_alignment_record(&header, &to_record_buf(raw))
+                .expect("write sort det record");
+        }
+        writer.try_finish().expect("finish sort det fixture");
+    }
+
+    let run = |out: &Path, threads: u32| {
+        let mut args = ParityArgs::for_simplex_like();
+        args.threads = threads;
+        let r = run_runall(Stage::Sort, Stage::Sort, &unsorted, out, &args);
+        assert!(
+            r.status.success(),
+            "runall sort (threads={threads}): {}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+    };
+    let out_a = tmp.path().join("sort_t8_a.bam");
+    let out_b = tmp.path().join("sort_t8_b.bam");
+    let out_t1 = tmp.path().join("sort_t1.bam");
+    run(&out_a, 8);
+    run(&out_b, 8);
+    run(&out_t1, 1);
+    assert_bams_record_equivalent_nonempty(&out_a, &out_b);
+    assert_bams_record_equivalent_nonempty(&out_a, &out_t1);
+}
+
+/// S9a-008: `group → simplex` determinism (run-to-run + thread-count invariant).
+#[test]
+fn runall_simplex_record_stream_is_deterministic() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = deterministic_simplex_fixture(tmp.path(), 200);
+
+    let run = |out: &Path, threads: u32| {
+        let mut args = ParityArgs::for_simplex_like();
+        args.threads = threads;
+        let r = run_runall(Stage::Group, Stage::Simplex, &fixture, out, &args);
+        assert!(
+            r.status.success(),
+            "runall simplex (threads={threads}): {}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+    };
+    let out_a = tmp.path().join("simplex_t8_a.bam");
+    let out_b = tmp.path().join("simplex_t8_b.bam");
+    let out_t1 = tmp.path().join("simplex_t1.bam");
+    run(&out_a, 8);
+    run(&out_b, 8);
+    run(&out_t1, 1);
+    assert_bams_record_equivalent_nonempty(&out_a, &out_b);
+    assert_bams_record_equivalent_nonempty(&out_a, &out_t1);
+}
+
+// ───────────────────────── stdin + FASTQ-source coverage ─────────────────────────
+//
+// X3-001/X3-002: runall is the one command that FUSES the stdin-aware sources,
+// yet it had no stdin test and no FASTQ-entry-point (`--start-from extract`)
+// end-to-end test. These close both gaps: the "reads the source exactly once"
+// invariant (which fusion is most likely to break by re-opening / double-pulling
+// a non-seekable `-`) and the FASTQ→consensus fusion path.
+
+/// X3-001: `fgumi runall --start-from group --stop-after simplex --input -`
+/// reading a BAM piped to stdin must produce the SAME (non-empty) record stream
+/// as the identical runall reading the BAM from a file path. A regression that
+/// made the fused chain pull stdin twice (or seek it) would read an empty stream
+/// the second time and diverge; every BAM-source-from-file test would still pass.
+#[test]
+fn runall_reads_bam_from_stdin_once() {
+    use std::process::{Command, Stdio};
+
+    let tmp = TempDir::new().unwrap();
+    let fixture = sorted_simplex_fixture(tmp.path());
+    let from_file = tmp.path().join("from_file.bam");
+    let from_stdin = tmp.path().join("from_stdin.bam");
+    let args = ParityArgs::for_simplex_like();
+
+    // Baseline: file input.
+    let r = run_runall(Stage::Group, Stage::Simplex, &fixture, &from_file, &args);
+    assert!(r.status.success(), "runall (file input): {}", String::from_utf8_lossy(&r.stderr));
+
+    // Piped: `cat fixture.bam | fgumi runall ... --input -`.
+    let mut cat = Command::new("cat")
+        .arg(&fixture)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn cat for stdin pipe");
+    let cat_stdout = cat.stdout.take().expect("cat stdout");
+    let stdin_out = Command::new(fgumi_binary())
+        .args([
+            "runall",
+            "--start-from",
+            "group",
+            "--stop-after",
+            "consensus",
+            "--consensus",
+            "simplex",
+            "--input",
+            "-",
+            "--output",
+            from_stdin.to_str().unwrap(),
+            "--group::strategy",
+            args.strategy,
+            "--group::edits",
+            "1",
+            "--simplex::min-reads",
+            args.min_reads,
+            "--threads",
+            "1",
+        ])
+        .stdin(cat_stdout)
+        .output()
+        .expect("run runall with stdin");
+    // Reap the `cat` producer so it isn't left unwaited.
+    let _ = cat.wait().expect("wait on cat");
+    assert!(
+        stdin_out.status.success(),
+        "runall (stdin input): {}",
+        String::from_utf8_lossy(&stdin_out.stderr)
+    );
+
+    // Same record stream both ways, and non-empty (so the stdin source was read
+    // exactly once — a double-pull would yield 0 records on the second read).
+    assert_bams_record_equivalent_nonempty(&from_file, &from_stdin);
+}
+
+/// Write a gzip-compressed FASTQ from `(name, seq, qual)` records.
+fn write_gzip_fastq(path: &Path, records: &[(&str, &str, &str)]) {
+    use std::io::Write as _;
+    let file = fs::File::create(path).expect("create gzip fastq");
+    let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    for (name, seq, qual) in records {
+        writeln!(encoder, "@{name}\n{seq}\n+\n{qual}").expect("write fastq record");
+    }
+    encoder.finish().expect("finish gzip fastq");
+}
+
+/// Build a small paired gzip FASTQ (`r1.fq.gz`, `r2.fq.gz`) for the X3-002
+/// fusion test: 3 families × 3 read-pairs, BOTH mates carrying a 6 bp UMI
+/// prefix (read structure `6M16T` each) so extract builds a paired UMI
+/// (`<r1umi>-<r2umi>`) — the shape `--group::strategy paired` + duplex
+/// consensus consume. Within a family all pairs share the same UMI + template
+/// bases so they collapse into one MI group. Returns `(r1, r2)`.
+fn write_paired_umi_fastq(dir: &Path) -> (PathBuf, PathBuf) {
+    let r1 = dir.join("r1.fq.gz");
+    let r2 = dir.join("r2.fq.gz");
+    // (r1 umi, r2 umi, r1 template (16bp), r2 template (16bp)).
+    let families = [
+        ("AAAAAA", "CCCCCC", "ACGTACGTACGTACGT", "GGTTAACCGGTTAACC"),
+        ("GGGGGG", "TTTTTT", "TGCATGCATGCATGCA", "AACCGGTTAACCGGTT"),
+        ("ACACAC", "TGTGTG", "TTGGCCAATTGGCCAA", "CCAATTGGCCAATTGG"),
+    ];
+    let qual = "I".repeat(22); // 6 (UMI) + 16 (template), both mates
+    let mut r1_owned: Vec<(String, String)> = Vec::new();
+    let mut r2_owned: Vec<(String, String)> = Vec::new();
+    for (fi, (r1_umi, r2_umi, r1_tmpl, r2_tmpl)) in families.iter().enumerate() {
+        for i in 0..3 {
+            let name = format!("fam{fi}_{i}");
+            r1_owned.push((name.clone(), format!("{r1_umi}{r1_tmpl}"))); // 6 + 16 = 22
+            r2_owned.push((name, format!("{r2_umi}{r2_tmpl}"))); // 6 + 16 = 22
+        }
+    }
+    let r1_slices: Vec<(&str, &str, &str)> =
+        r1_owned.iter().map(|(n, s)| (n.as_str(), s.as_str(), qual.as_str())).collect();
+    let r2_slices: Vec<(&str, &str, &str)> =
+        r2_owned.iter().map(|(n, s)| (n.as_str(), s.as_str(), qual.as_str())).collect();
+    write_gzip_fastq(&r1, &r1_slices);
+    write_gzip_fastq(&r2, &r2_slices);
+    (r1, r2)
+}
+
+/// X3-002: the headline FASTQ→consensus fusion. `fgumi runall --start-from
+/// extract` over a paired gzip FASTQ must produce the SAME (non-empty) record
+/// stream as the equivalent chain where extract is run STANDALONE and its BAM
+/// is fed to `runall --start-from align`. Every other runall fixture is a
+/// synthesized BAM; this gives the fused extract source (`SourceSpec::Fastqs`)
+/// and the paired-FASTQ pull machinery its only end-to-end coverage.
+///
+/// NB: runall AUTO-INSERTS `Stage::Align` after extract (a FASTQ source must be
+/// aligned before sort/group), so `--start-from extract` requires `--ref` + an
+/// aligner. We use the deterministic mock-aligner shell script (as the AAM
+/// tests do) so the test needs no real bwa. The staged side feeds the SAME
+/// extracted BAM into `--start-from align` with the SAME mock aligner, isolating
+/// the one difference under test: whether extract is fused into the chain.
+#[test]
+fn runall_extract_to_duplex_fastq_fusion_matches_staged() {
+    let tmp = TempDir::new().unwrap();
+    let reference = crate::helpers::bam_generator::create_test_reference(tmp.path());
+    // PAIRED mock aligner: extract emits paired R1/R2 sharing a queryname, so a
+    // single-end mock (flag 0 on both) would collide on the queryname. The
+    // paired mock alternates R1(99)/R2(147) as proper pairs with MC tags, the
+    // shape `GroupByPosition` + duplex consensus need.
+    let mock = write_paired_mock_aligner_script(tmp.path());
+    let aligner_cmd = format!("{} {{ref}}", mock.display());
+
+    let (r1, r2) = write_paired_umi_fastq(tmp.path());
+
+    // ── Fused: runall --start-from extract (auto-inserts align) → simplex. ──
+    let fused_out = tmp.path().join("fused_extract_simplex.bam");
+    let fused = fgumi(&[
+        "runall".into(),
+        "--start-from".into(),
+        "extract".into(),
+        "--stop-after".into(),
+        "consensus".into(),
+        "--consensus".into(),
+        "duplex".into(),
+        "--ref".into(),
+        reference.as_os_str().to_owned(),
+        "--aligner::command".into(),
+        aligner_cmd.clone().into(),
+        "--extract::inputs".into(),
+        r1.as_os_str().to_owned(),
+        r2.as_os_str().to_owned(),
+        "--extract::read-structures".into(),
+        "6M16T".into(),
+        "6M16T".into(),
+        "--extract::sample".into(),
+        "s".into(),
+        "--extract::library".into(),
+        "l".into(),
+        "--group::strategy".into(),
+        "paired".into(),
+        "--group::edits".into(),
+        "0".into(),
+        "--duplex::min-reads".into(),
+        "1,1,0".into(),
+        "--output".into(),
+        fused_out.as_os_str().to_owned(),
+        "--threads".into(),
+        "1".into(),
+    ]);
+    assert!(
+        fused.status.success(),
+        "fused extract→duplex: {}",
+        String::from_utf8_lossy(&fused.stderr)
+    );
+
+    // ── Staged: standalone extract, then runall --start-from align on the
+    // extracted BAM with the SAME mock aligner. ──
+    let extracted = tmp.path().join("extracted.bam");
+    let e = fgumi(&[
+        "extract".into(),
+        "--inputs".into(),
+        r1.as_os_str().to_owned(),
+        r2.as_os_str().to_owned(),
+        "--read-structures".into(),
+        "6M16T".into(),
+        "6M16T".into(),
+        "--sample".into(),
+        "s".into(),
+        "--library".into(),
+        "l".into(),
+        "--output".into(),
+        extracted.as_os_str().to_owned(),
+    ]);
+    assert!(e.status.success(), "staged extract: {}", String::from_utf8_lossy(&e.stderr));
+
+    let staged_out = tmp.path().join("staged_align_duplex.bam");
+    let staged = fgumi(&[
+        "runall".into(),
+        "--start-from".into(),
+        "align".into(),
+        "--stop-after".into(),
+        "consensus".into(),
+        "--consensus".into(),
+        "duplex".into(),
+        "--input".into(),
+        extracted.as_os_str().to_owned(),
+        "--ref".into(),
+        reference.as_os_str().to_owned(),
+        "--aligner::command".into(),
+        aligner_cmd.into(),
+        "--group::strategy".into(),
+        "paired".into(),
+        "--group::edits".into(),
+        "0".into(),
+        "--duplex::min-reads".into(),
+        "1,1,0".into(),
+        "--output".into(),
+        staged_out.as_os_str().to_owned(),
+        "--threads".into(),
+        "1".into(),
+    ]);
+    assert!(
+        staged.status.success(),
+        "staged align→duplex: {}",
+        String::from_utf8_lossy(&staged.stderr)
+    );
+
+    // The fused FASTQ→consensus chain must match the standalone-extract +
+    // align-onward chain, and be non-empty (the FASTQ entry path actually
+    // produced consensus records through the full extract→align→…→simplex path).
+    assert_bams_record_equivalent_nonempty(&fused_out, &staged_out);
+    // S9a-005: the FASTQ-entrypoint chain also builds the output header from
+    // scratch (extract→align→…), so pin @HD/@SQ/@RG parity against the staged chain.
+    assert_bam_headers_equivalent_ignoring_pg(&fused_out, &staged_out);
+}
+
 // ────────────────────────── CLI-level rejection tests ──────────────────────────
 //
 // These pin the validator's structural rules at the binary entry
@@ -874,11 +1410,16 @@ fn runall_duplex_record_stream_is_deterministic() {
 // `commands::runall::tests` wouldn't surface (e.g. a clap-level flag
 // rename that silently drops `--start-from`).
 //
-// We test three categories:
-//   * Cross-flavor terminal (`simplex → duplex`) — rejected by
-//     `RunAllStage::validate_with` rule 2.
-//   * Reverse order (`duplex → simplex`) — rejected by rule 1.
-//   * Backwards (`group → sort`) — rejected by rule 1.
+// We test three STRUCTURALLY DISTINCT rejection causes, each pinned by its
+// OWN stderr fragment (S9a-010 — the shared `"--start-from"` substring did not
+// distinguish them; that flag name appears in essentially any error that
+// echoes it, so it could not tell a correct rejection from an unrelated one):
+//   * Invalid start value (`--start-from simplex` / `duplex`) — the
+//     per-algorithm names are NOT valid stage values (the algorithm moved to
+//     `--consensus`), so CLAP rejects them with `invalid value '<name>'`
+//     BEFORE the validator runs.
+//   * Backwards order (`group → sort`) — `group.ord() > sort.ord()`, rejected
+//     by `RunAllStage::validate_with` with the `comes after` ordinal message.
 
 fn assert_runall_rejects(start: Stage, stop: Stage, expected_stderr_fragment: &str) {
     let tmp = TempDir::new().unwrap();
@@ -915,36 +1456,79 @@ fn assert_runall_rejects(start: Stage, stop: Stage, expected_stderr_fragment: &s
     );
 }
 
-/// Cross-flavor terminal: `simplex → duplex` is structurally invalid
-/// (both are terminal consensus stages, so the pipeline cannot
-/// progress past simplex). Rejected by `RunAllStage::validate_with`.
+/// `--start-from simplex` is not a valid stage value — the per-algorithm
+/// names moved to `--consensus`. Clap rejects it with `invalid value
+/// 'simplex'` before any validator rule runs. (S9a-010: pin the clap
+/// value-rejection message, not the bare `--start-from` flag name.)
 #[cfg(feature = "consensus")]
 #[test]
 fn rejects_cross_flavor_consensus_pair() {
-    assert_runall_rejects(Stage::Simplex, Stage::Duplex, "--start-from");
+    assert_runall_rejects(Stage::Simplex, Stage::Duplex, "invalid value 'simplex'");
 }
 
-/// Reverse order: `duplex → simplex` violates the linear-stage
-/// ordering rule.
+/// `--start-from duplex` is likewise an invalid stage value → clap
+/// `invalid value 'duplex'`.
 #[cfg(feature = "consensus")]
 #[test]
 fn rejects_reverse_order_consensus_to_consensus() {
-    assert_runall_rejects(Stage::Duplex, Stage::Simplex, "--start-from");
+    assert_runall_rejects(Stage::Duplex, Stage::Simplex, "invalid value 'duplex'");
 }
 
-/// Backwards: `group → sort` violates the linear-stage ordering rule.
+/// Backwards order: `group → sort` has `group.ord() > sort.ord()`, rejected
+/// by the validator's ordinal rule. Pin the `comes after` message so this
+/// test verifies the ORDER rule fired, not merely that the flag was echoed.
 #[test]
 fn rejects_backwards_group_to_sort() {
-    assert_runall_rejects(Stage::Group, Stage::Sort, "--start-from");
+    assert_runall_rejects(
+        Stage::Group,
+        Stage::Sort,
+        "--start-from group comes after --stop-after sort",
+    );
 }
 
 /// S5c2-003: runall `--group::*` flag combos that standalone `fgumi group`
-/// rejects must also be rejected on the fused path. Runs `runall
-/// --start-from group --stop-after group` with the bad combo and asserts the
-/// same error message standalone produces.
+/// rejects must also be rejected on the fused path. This uses standalone
+/// `fgumi group` (with the same flags, `--group::` prefix stripped) as the
+/// independent ORACLE: it asserts standalone rejects the combo with
+/// `expected_fragment`, then asserts runall rejects it the same way. Comparing
+/// against the live standalone failure (not just a hard-coded substring) keeps
+/// the two code paths aligned if the standalone error text ever changes.
 fn assert_runall_group_combo_rejects(extra_group_flags: &[&str], expected_fragment: &str) {
     let tmp = TempDir::new().unwrap();
     let fixture = sorted_duplex_fixture(tmp.path());
+
+    // ── Oracle: standalone `fgumi group` with the un-prefixed flags. ──
+    let standalone_out = tmp.path().join("standalone_out.bam");
+    let mut standalone_args: Vec<OsString> = vec![
+        "group".into(),
+        "--input".into(),
+        fixture.as_os_str().to_owned(),
+        "--output".into(),
+        standalone_out.as_os_str().to_owned(),
+        "--threads".into(),
+        "1".into(),
+    ];
+    for f in extra_group_flags {
+        // Translate the runall-prefixed `--group::<flag>` into the standalone
+        // `--<flag>`; non-prefixed tokens (values) pass through unchanged.
+        let translated = f
+            .strip_prefix("--group::")
+            .map_or_else(|| (*f).to_string(), |bare| format!("--{bare}"));
+        standalone_args.push(translated.into());
+    }
+    let standalone = fgumi(&standalone_args);
+    let standalone_stderr = String::from_utf8_lossy(&standalone.stderr);
+    assert!(
+        !standalone.status.success(),
+        "oracle: expected standalone group combo {extra_group_flags:?} to FAIL but it \
+         succeeded; stderr={standalone_stderr}"
+    );
+    assert!(
+        standalone_stderr.contains(expected_fragment),
+        "oracle: standalone stderr did not contain {expected_fragment:?}; got: {standalone_stderr}"
+    );
+
+    // ── Runall must reject the same combo with the same error fragment. ──
     let out = tmp.path().join("out.bam");
     let mut args: Vec<OsString> = vec![
         "runall".into(),
@@ -971,40 +1555,8 @@ fn assert_runall_group_combo_rejects(extra_group_flags: &[&str], expected_fragme
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains(expected_fragment),
-        "runall stderr did not contain {expected_fragment:?}; got: {stderr}"
-    );
-
-    // Independent oracle: run standalone `fgumi group` with the same flags
-    // (de-prefixed from `--group::*`). Standalone must reject the combo with the
-    // same message, so this pins runall↔standalone validation parity rather than
-    // trusting a hard-coded fragment that would silently drift if standalone's
-    // wording or behavior changed.
-    let standalone_out = tmp.path().join("standalone.bam");
-    let mut group_args: Vec<OsString> = vec![
-        "group".into(),
-        "--input".into(),
-        fixture.as_os_str().to_owned(),
-        "--output".into(),
-        standalone_out.as_os_str().to_owned(),
-        "--threads".into(),
-        "1".into(),
-    ];
-    for f in extra_group_flags {
-        group_args.push(
-            f.strip_prefix("--group::")
-                .map_or_else(|| (*f).into(), |bare| format!("--{bare}").into()),
-        );
-    }
-    let standalone = fgumi(&group_args);
-    assert!(
-        !standalone.status.success(),
-        "expected standalone group {extra_group_flags:?} to FAIL but it succeeded; stderr={}",
-        String::from_utf8_lossy(&standalone.stderr)
-    );
-    let standalone_stderr = String::from_utf8_lossy(&standalone.stderr);
-    assert!(
-        standalone_stderr.contains(expected_fragment),
-        "standalone group stderr did not contain {expected_fragment:?}; got: {standalone_stderr}"
+        "runall stderr did not contain {expected_fragment:?} (the standalone oracle rejected \
+         with it); got: {stderr}"
     );
 }
 
@@ -1343,7 +1895,9 @@ fn parity_a_zipper_to_zipper() {
     let r = run_standalone_zipper(&inputs, &standalone_out, &args);
     assert!(r.status.success(), "standalone: {}", String::from_utf8_lossy(&r.stderr));
 
-    assert_bams_record_equivalent(&runall_out, &standalone_out);
+    // S9a-001: zipper merges the mapped + unmapped reads → a non-empty stream.
+    assert_bams_record_equivalent_nonempty(&runall_out, &standalone_out);
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &standalone_out);
 }
 
 /// Smoke check — `fgumi runall --start-from zipper --stop-after zipper`
@@ -1764,24 +2318,35 @@ fn aam_to_sort_fused_pipeline_with_mock_aligner() {
     let n_records = reader.record_bufs(&noodles::sam::Header::default()).count();
     assert!(n_records >= 1, "expected at least 1 record in sorted BAM, got {n_records}");
 
-    // The fused path's promise: no `aam-merged.bam` tempfile is
-    // left behind anywhere in the tempdir. (The tempdir itself
-    // contains the input fixture + reference + mock-aligner; we
-    // assert no extra BAM file beyond the user's --output.)
-    let leftover_bams: Vec<_> = fs::read_dir(tmp.path())
+    // The fused path's promise: no AAM/sort tempfile bridge BAM is left
+    // behind. S9a-004: assert the EXACT set of top-level `.bam` files —
+    // the two `zipper_fixture` inputs plus the user's `--output` — and
+    // that NO tempfile-bridge name appears. The old `len() <= 3` bound was
+    // self-defeating: 3 legitimate BAMs + 1 leaked `aam-merged.bam` = 4,
+    // but a leak of a name already counted (or any off-by-one) could slip
+    // past a loose count. The exact allow-set + per-name leak check (the
+    // pattern the simplex companion already uses) catches a single leak.
+    let bam_names: std::collections::BTreeSet<String> = fs::read_dir(tmp.path())
         .unwrap()
         .filter_map(Result::ok)
         .filter(|e| e.path().extension().is_some_and(|x| x == "bam"))
-        .map(|e| e.path())
+        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
         .collect();
-    // Two BAMs expected at the top-level tempdir: the input mapped
-    // BAM and the output sorted BAM. Anything more means the v1
-    // `aam-merged.bam` tempfile leaked into the user-visible
-    // working dir.
-    assert!(
-        leftover_bams.len() <= 3,
-        "unexpected BAM artifacts left behind (tempfile leak?): {leftover_bams:?}"
+    let expected: std::collections::BTreeSet<String> =
+        ["zipper_mapped.bam", "zipper_unmapped.bam", "aam-sorted.bam"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+    assert_eq!(
+        bam_names, expected,
+        "unexpected top-level BAM set (tempfile leak?): got {bam_names:?}, expected {expected:?}"
     );
+    for tempfile_name in ["aam-merged.bam", "sorted.bam", "after_sort.bam", "after_group.bam"] {
+        assert!(
+            !bam_names.contains(tempfile_name),
+            "fused-pipeline tempfile {tempfile_name} leaked into the user-visible dir: {bam_names:?}"
+        );
+    }
 }
 
 /// Companion to `aam_to_sort_fused_pipeline_with_mock_aligner`:
@@ -2296,13 +2861,32 @@ fn aam_fails_cleanly_on_bogus_aligner_output() {
     let inputs = zipper_fixture(tmp.path());
     let out = tmp.path().join("out.bam");
     let mut args = aam_base_args(&inputs.unmapped, &inputs.reference, &out);
+    // `cat > /dev/null` drains the writer's stdin to EOF *before* the bogus
+    // line is emitted (same guard the sibling `aam_rejects_empty_aligner_output`
+    // uses). A bare `echo dummy {ref}` exits immediately and closes its stdin,
+    // which races the AAM writer's flush: under slower runs (e.g. llvm-cov
+    // coverage) the flush loses the race and surfaces a "Broken pipe" I/O error
+    // instead of the deterministic `@SQ count` mismatch this test pins. Draining
+    // stdin first removes the race while leaving stdout (the bogus, non-SAM
+    // `dummy {ref}` line ⇒ 0 `@SQ` records) unchanged.
     args.push("--aligner::command".into());
-    args.push("echo dummy {ref}".into());
+    args.push("cat > /dev/null; echo dummy {ref}".into());
     let r = fgumi_with_args(&args);
     assert!(!r.status.success(), "AAM should fail on bogus aligner output");
     let stderr = String::from_utf8_lossy(&r.stderr);
     assert!(!stderr.contains("panicked"), "unexpected panic: {stderr}");
     assert!(!stderr.contains("unreachable"), "unexpected unreachable: {stderr}");
+    // S9a-006: a clean non-zero exit is necessary but not sufficient — pin
+    // that the failure is the EXPECTED AAM-step error, not an incidental clap
+    // / I/O failure before the aligner is reached. `echo dummy {ref}` emits a
+    // non-SAM line, so the aligner's parsed header carries 0 `@SQ` records,
+    // which the AAM `@SQ`-consistency check rejects against the reference
+    // dict's 1 `@SQ`. The `"AAM"` step marker plus the stable `"@SQ count"`
+    // fragment confirm the failure happens at the aligner-merge step.
+    assert!(
+        stderr.contains("AAM") && stderr.contains("@SQ count"),
+        "expected the stable AAM @SQ-mismatch error at the merge step, got: {stderr}"
+    );
 }
 
 /// `--methylation-mode em-seq` paired with `--start-from align-and-merge`
@@ -2378,16 +2962,27 @@ fn aam_rejects_stop_after_align_and_merge() {
 
 use crate::helpers::bam_generator::build_aligner_index;
 
-/// Build a small reference + run the supplied aligner's `index`
-/// command on it. Returns `Ok((ref_path, _temp_dir))` so the caller
-/// can use the path; `_temp_dir` extends the lifetime of the
-/// indexed files. Returns `Err(reason)` to signal "skip this test"
-/// when the aligner isn't installed locally.
-fn build_aam_reference_for(binary_name: &str) -> Result<(PathBuf, TempDir), String> {
-    let tmp = TempDir::new().map_err(|e| format!("tempdir: {e}"))?;
+/// Build a small reference + run the supplied aligner's `index` command on it.
+/// Returns `(ref_path, _temp_dir)`; `_temp_dir` extends the lifetime of the
+/// indexed files.
+///
+/// S9a-002: this is called ONLY after the caller has confirmed the binary is
+/// on `PATH`, so EVERY failure here (tempdir creation, `<binary> index`
+/// non-zero exit) is a real setup regression and `panic!`s loudly rather than
+/// being laundered into a silent skip. A skip that is indistinguishable from a
+/// pass would mask an index-build regression; the only legitimate skip
+/// condition — a missing binary — is handled by the caller's `which` gate
+/// before this runs.
+fn build_aam_reference_for(binary_name: &str) -> (PathBuf, TempDir) {
+    let tmp = TempDir::new().expect("AAM parity: create reference tempdir");
     let ref_path = crate::helpers::bam_generator::create_test_reference(tmp.path());
-    build_aligner_index(&ref_path, binary_name)?;
-    Ok((ref_path, tmp))
+    build_aligner_index(&ref_path, binary_name).unwrap_or_else(|e| {
+        panic!(
+            "AAM parity: `{binary_name} index` failed with the binary present (real setup \
+             regression, not a skip): {e}"
+        )
+    });
+    (ref_path, tmp)
 }
 
 /// Run an AAM parity test: invoke runall with the supplied
@@ -2408,13 +3003,21 @@ fn build_aam_reference_for(binary_name: &str) -> Result<(PathBuf, TempDir), Stri
 ///   * `-t 1` — pin single-threaded aligner output for stable
 ///     record ordering.
 fn run_aam_parity_test(aligner_binary: &str, aligner_args: &[(&str, &str)]) {
-    let (ref_path, _ref_temp) = match build_aam_reference_for(aligner_binary) {
-        Ok(r) => r,
-        Err(reason) => {
-            eprintln!("skipping AAM parity test: setup failed: {reason}");
-            return;
-        }
-    };
+    // S9a-002: a MISSING aligner binary is the ONLY condition that skips —
+    // legitimate for a binary-less dev laptop running with `--include-ignored`.
+    // Any OTHER setup failure (tempdir, index build with the binary present) is
+    // a real regression and panics in `build_aam_reference_for` rather than
+    // green-passing with zero assertions. (CI installs both binaries and
+    // verifies them on PATH before these `#[ignore]`'d tests run, so this skip
+    // is unreachable in CI.)
+    if which::which(aligner_binary).is_err() {
+        eprintln!(
+            "skipping AAM parity test: `{aligner_binary}` not found on PATH \
+             (install via bioconda for CI)"
+        );
+        return;
+    }
+    let (ref_path, _ref_temp) = build_aam_reference_for(aligner_binary);
 
     let tmp = TempDir::new().unwrap();
     // The fixture uses single-end UNMAPPED reads with RX tags
@@ -2529,7 +3132,8 @@ fn correct_parity_fixture(dir: &Path) -> PathBuf {
 
     // (umi, family_name, sequence) — same length as ACGTACGT (8) for
     // all variants. ACGTACGT exact match; ACGTACGC = 1 mismatch;
-    // ACGTACCC = 2 mismatches; ACGTCCCC = 4 mismatches (rejected).
+    // ACGTACCC = 2 mismatches; ACGTCCCC = 3 mismatches (exceeds
+    // --max-mismatches 2, rejected).
     let families = [
         ("ACGTACGT", "fam_exact", "ACGTACGTACGTACGT"),
         ("ACGTACGC", "fam_1mm", "TTTTAAAACCCCGGGG"),
@@ -2553,8 +3157,9 @@ fn correct_parity_fixture(dir: &Path) -> PathBuf {
 
 /// Class A — `correct → correct` parity vs standalone `fgumi correct`.
 /// Pins the runall delegation: runall constructs a `CorrectUmis`
-/// struct from its own flags and calls `CorrectUmis::execute`, so
-/// the output is byte-identical by construction. The fixture
+/// struct from its own flags and calls `CorrectUmis::execute`, so the
+/// output is record- and header-equivalent (ignoring `@PG` command-line
+/// provenance) by construction. The fixture
 /// (`correct_parity_fixture`) is built specifically to exercise
 /// every branch of the correction code path — no-op, single-
 /// mismatch rewrite (RX overwritten + OX stashed), and rejection
@@ -2628,8 +3233,15 @@ fn parity_a_correct_to_correct() {
     let r = fgumi(&standalone_args);
     assert!(r.status.success(), "standalone: {}", String::from_utf8_lossy(&r.stderr));
 
-    assert_bams_record_equivalent(&runall_out, &standalone_out);
-    assert_bams_record_equivalent(&runall_rejects, &standalone_rejects);
+    // The fixture is designed to emit both kept reads and rejects, so pin both
+    // streams non-empty — otherwise a shared-empty regression would silently
+    // satisfy the record/header equivalence checks on both paths.
+    assert_bams_record_equivalent_nonempty(&runall_out, &standalone_out);
+    assert_bams_record_equivalent_nonempty(&runall_rejects, &standalone_rejects);
+    // S9a-005: both the accepted-output and rejects BAMs must carry equivalent
+    // @HD/@SQ/@RG headers between the fused runall correct stage and standalone.
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &standalone_out);
+    assert_bam_headers_equivalent_ignoring_pg(&runall_rejects, &standalone_rejects);
     // Metrics TSVs are plain text; compare exactly (both are produced
     // by the same `UmiCorrectionMetrics::write_metrics` writer, so any
     // forwarding bug would surface as different counts on one side).
@@ -3026,17 +3638,34 @@ fn correct_to_codec_fused_pipeline() {
     assert!(n_records >= 1, "expected ≥ 1 record in codec BAM, got {n_records}");
 }
 
-/// Warning: combining `--rejects` with `--start-from correct
-/// --stop-after sort` (or any cross-stage stop past `correct`) does
-/// NOT capture correct's UMI rejects — the fused chain uses
-/// `correct_step_kept_only`, which has no UMI-rejects branch. The
-/// dispatcher emits a warn log explaining this and proceeds; the
-/// rejects file collects only downstream rejects (here, none, since
-/// sort doesn't filter).
+/// X3-006: combining `--rejects` with a cross-stage `--start-from correct
+/// --stop-after sort` chain does NOT capture correct's UMI rejects — the fused
+/// chain uses `correct_step_kept_only`, which has no UMI-rejects branch, so the
+/// rejected reads are silently DROPPED (a near-data-loss the dispatcher guards
+/// only with a warn log).
+///
+/// The old version of this test used a whitelist containing EVERY family's UMI,
+/// so 0 reads were rejected — it could not distinguish "rejects correctly
+/// discarded" from "no rejects existed at all" (the vacuous-pass pattern
+/// S9a-001 calls out). This version uses a PARTIAL whitelist that genuinely
+/// rejects one family, then PROVES the discard is real and bounded:
+///   (a) the warn log fires,
+///   (b) the fused `--rejects` BAM is EMPTY (correct's rejects were discarded,
+///       not routed here), and
+///   (c) a standalone `fgumi correct --rejects` on the SAME input produces a
+///       NON-empty rejects BAM — i.e. real reads ARE lost, justifying the warning.
 #[test]
 fn correct_to_sort_with_rejects_emits_warning() {
     let tmp = TempDir::new().unwrap();
-    let (input, reference, whitelist) = correct_to_aam_fixture(tmp.path());
+    // `unsorted_simplex_fixture` carries families ACGTACGT/TGCATGCA/CCAATTGG/
+    // GGTTAACC. Drop GGTTAACC from the whitelist so its 4 reads are rejected by
+    // correct (the remaining whitelist UMIs are all far from GGTTAACC, so it
+    // cannot be corrected to any of them within `--correct::min-distance 1`).
+    let input = unsorted_simplex_fixture(tmp.path());
+    let reference = crate::helpers::bam_generator::create_test_reference(tmp.path());
+    let whitelist = tmp.path().join("partial_whitelist.txt");
+    fs::write(&whitelist, "ACGTACGT\nTGCATGCA\nCCAATTGG\n").expect("write partial whitelist");
+
     let out = tmp.path().join("correct-to-sort-rejects.bam");
     let rejects = tmp.path().join("rejects.bam");
     let mock = write_mock_aligner_script(tmp.path());
@@ -3063,9 +3692,87 @@ fn correct_to_sort_with_rejects_emits_warning() {
         String::from_utf8_lossy(&r.stderr)
     );
 
+    // (a) The warning fires.
     let stderr = String::from_utf8_lossy(&r.stderr);
     assert!(
         stderr.contains("discards correct's UMI rejects"),
         "expected UMI-rejects-discarded warning, got stderr:\n{stderr}"
     );
+
+    // (b) The fused `--rejects` capture is EMPTY — correct's rejects were
+    // discarded by `correct_step_kept_only`, and sort produces no rejects of its
+    // own. The file is either absent (sort emitted nothing to it) or a
+    // header-only BAM; either way, ZERO reject reads were captured.
+    let fused_reject_count = if rejects.exists() { read_bam_records(&rejects).len() } else { 0 };
+    assert_eq!(
+        fused_reject_count, 0,
+        "fused correct→sort --rejects must capture 0 reads (correct's rejects are discarded), got {fused_reject_count}"
+    );
+
+    // (c) Standalone `fgumi correct --rejects` on the SAME input + whitelist
+    // captures the rejected family — proving the discard above lost REAL data,
+    // exactly what the warning claims. The standalone correct path uses the
+    // 2-output `correct_step_with_rejects` branch.
+    let standalone_kept = tmp.path().join("standalone-correct.bam");
+    let standalone_rejects = tmp.path().join("standalone-correct-rejects.bam");
+    let correct_args: Vec<OsString> = vec![
+        "correct".into(),
+        "--input".into(),
+        input.as_os_str().to_owned(),
+        "--output".into(),
+        standalone_kept.as_os_str().to_owned(),
+        "--umi-files".into(),
+        whitelist.as_os_str().to_owned(),
+        "--min-distance".into(),
+        "1".into(),
+        "--rejects".into(),
+        standalone_rejects.as_os_str().to_owned(),
+        "--threads".into(),
+        "1".into(),
+    ];
+    let r = fgumi(&correct_args);
+    assert!(
+        r.status.success(),
+        "standalone correct --rejects failed: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let standalone_reject_records = read_bam_records(&standalone_rejects);
+    assert_eq!(
+        standalone_reject_records.len(),
+        4,
+        "standalone correct --rejects must capture the ENTIRE off-whitelist family that the \
+         fused chain discarded — expected exactly the 4 GGTTAACC reads, got {}. A non-4 count \
+         means only part of the family was rejected (or the wrong reads were captured).",
+        standalone_reject_records.len()
+    );
+    // Pin the captured family by IDENTITY, not just count: every rejected read
+    // must be a `fam_d` read carrying the off-whitelist UMI `GGTTAACC`, and the
+    // four must be exactly fam_d_0..fam_d_3 — proving the discarded data was the
+    // specific off-whitelist family, not some unrelated four reads.
+    {
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::Value;
+        let rx_tag = Tag::from(fgumi_lib::sam::SamTag::RX);
+        let mut reject_qnames: Vec<Vec<u8>> = Vec::new();
+        for rec in &standalone_reject_records {
+            let Some(Value::String(rx)) = rec.data().get(&rx_tag) else {
+                panic!("rejected record is missing its RX (UMI) tag");
+            };
+            let rx_bytes: &[u8] = rx.as_ref();
+            assert_eq!(
+                rx_bytes, b"GGTTAACC",
+                "rejected record carries the wrong UMI — only the off-whitelist GGTTAACC \
+                 family should be rejected"
+            );
+            let qname: &[u8] = rec.name().expect("rejected record has a read name").as_ref();
+            reject_qnames.push(qname.to_vec());
+        }
+        reject_qnames.sort();
+        let expected_qnames: Vec<Vec<u8>> =
+            (0..4).map(|i| format!("fam_d_{i}").into_bytes()).collect();
+        assert_eq!(
+            reject_qnames, expected_qnames,
+            "rejected reads must be exactly the four GGTTAACC family members fam_d_0..fam_d_3"
+        );
+    }
 }

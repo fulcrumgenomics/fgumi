@@ -2203,33 +2203,39 @@ mod tests {
     }
 
     #[test]
+    fn test_find_two_string_tags_same_tag_fills_both() {
+        // When the same tag is requested for both first and second, a single
+        // matching aux entry must populate both outputs (not just one).
+        let aux = b"MIZ7\x00CBZACGT\x00";
+        let rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
+        let (a, b) = find_two_string_tags_in_record(&rec, SamTag::MI, SamTag::MI);
+        assert_eq!(a, Some(b"7".as_ref()));
+        assert_eq!(b, Some(b"7".as_ref()));
+        // Both outputs must agree with an independent single-tag lookup, proving
+        // the same-tag case behaves like two separate `find_string_tag_in_record`
+        // calls (the contract the `mi_group.rs` production path relies on).
+        let mi = find_string_tag_in_record(&rec, SamTag::MI);
+        assert_eq!(a, mi, "first output must match an independent MI lookup");
+        assert_eq!(b, mi, "second output must match an independent MI lookup");
+
+        // Same-tag MISS path: when the (identical) requested tag is absent, both
+        // outputs must be None — the zero-match branch of the same-tag case,
+        // matching two independent single-tag lookups that each miss.
+        let rec_without_mi = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, b"CBZACGT\x00");
+        let (a_missing, b_missing) =
+            find_two_string_tags_in_record(&rec_without_mi, SamTag::MI, SamTag::MI);
+        assert_eq!(a_missing, None);
+        assert_eq!(b_missing, None);
+        assert_eq!(a_missing, find_string_tag_in_record(&rec_without_mi, SamTag::MI));
+    }
+
+    #[test]
     fn test_find_two_string_tags_missing_second_returns_none() {
         let aux = b"MIZ7\x00";
         let rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
         let (mi, cb) = find_two_string_tags_in_record(&rec, SamTag::MI, SamTag::CB);
         assert_eq!(mi, Some(b"7".as_ref()));
         assert_eq!(cb, None);
-    }
-
-    #[test]
-    fn test_find_two_string_tags_identical_tags_fills_both() {
-        // When both arguments name the same tag, the helper must stay equivalent
-        // to calling `find_string_tag_in_record` twice — i.e. both slots filled,
-        // not `(Some, None)`.
-        let aux = b"MIZ7\x00CBZACGT\x00";
-        let rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
-        let (a, b) = find_two_string_tags_in_record(&rec, SamTag::MI, SamTag::MI);
-        assert_eq!(a, Some(b"7".as_ref()));
-        assert_eq!(b, Some(b"7".as_ref()));
-        assert_eq!(a, find_string_tag_in_record(&rec, SamTag::MI));
-        assert_eq!(b, find_string_tag_in_record(&rec, SamTag::MI));
-
-        // Identical tags, both absent → both None.
-        let aux = b"CBZACGT\x00";
-        let rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
-        let (a, b) = find_two_string_tags_in_record(&rec, SamTag::MI, SamTag::MI);
-        assert_eq!(a, None);
-        assert_eq!(b, None);
     }
 
     #[test]

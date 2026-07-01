@@ -164,6 +164,14 @@ pub fn read_bam_from_reader(
 /// Convenience helper: open a BAM file, parse its header, return the
 /// `(step, header)` pair.
 ///
+/// The file is deliberately opened twice: first via
+/// `create_raw_bam_reader_with_opts` to parse and return the `Header`, then
+/// re-opened with `File::open` and a fresh `BufReader` at offset 0 so the raw
+/// BGZF stream — including the header blocks — is emitted in full. Those header
+/// blocks are stripped downstream by `FindBamBoundaries`. Do not "optimize" this
+/// by reusing the first reader's position: skipping the header blocks corrupts
+/// the raw-block stream.
+///
 /// # Errors
 ///
 /// Returns I/O errors from file open or BAM-header parse.

@@ -4,8 +4,10 @@
 //! The four are colocated per Phase 0 design line 371:
 //! `process.rs # process(fn), process_with_worker_state(init, fn), mi_assign(fn)`.
 //!
-//! Phase 3 ships single-output Process only. Multi-output (e.g.,
-//! `correct`'s `CorrectOutputs`) is Phase 4 work.
+//! In addition to the single-output `Process*` family, this module also
+//! provides the 2-output fan-out variants `Process2`, `Process2Ordered`, and
+//! `Process2WithWorkerState` for the kept/rejects shape (e.g. `correct`'s
+//! `CorrectOutputs`).
 
 use std::io;
 use std::marker::PhantomData;
@@ -709,8 +711,12 @@ where
 // fail, the rejected item is parked in `held_a` and the next `try_run`
 // drains it before popping new input. Branch B is independent. This means
 // a stuck consumer on one side won't drop items — but it also means a
-// permanently slow consumer will eventually block the step (held slot full,
-// dispatch returns `Contention`).
+// permanently slow consumer will eventually block the step. The dispatch that
+// first parks an item still returns `Progress` (with the produced item(s)
+// buffered — up to one per branch, since a single dispatch can fill both
+// `held_a` and `held_b`); `Contention` is reported only on a *subsequent*
+// dispatch, by the held-drain preamble, when a still-held item cannot be
+// pushed. Each branch holds at most one item (one input is popped per call).
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Output of a [`Process2`] closure: one optional value per output branch.

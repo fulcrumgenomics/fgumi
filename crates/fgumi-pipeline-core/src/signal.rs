@@ -24,6 +24,14 @@ pub enum PipelineError {
     /// while work was still stuck in queues/reorder buffers — a wedge. The
     /// pipeline is failed fast rather than left to hang forever.
     TimedOut { stalled_secs: u64 },
+    /// The pipeline was built with the deadlock monitor armed
+    /// (`deadlock_timeout_secs > 0`), but `step` declares a non-`ByteBounded`
+    /// output transport (`spec`, e.g. `CountBounded`/`Unbounded`). The
+    /// `in_flight_bytes` probe cannot see a wedge on such an edge, so fail-fast
+    /// would be silently disabled there. The pipeline is rejected at startup
+    /// rather than allowed to hang. This is a chain-construction error, not a
+    /// runtime condition: production chains wire only `ByteBounded` transports.
+    MonitorBlindTransport { step: &'static str, spec: String },
 }
 
 impl PipelineError {
@@ -45,6 +53,9 @@ impl PipelineError {
                 Self::NotEnoughThreads { required: *required, available: *available }
             }
             Self::TimedOut { stalled_secs } => Self::TimedOut { stalled_secs: *stalled_secs },
+            Self::MonitorBlindTransport { step, spec } => {
+                Self::MonitorBlindTransport { step, spec: spec.clone() }
+            }
         }
     }
 }
@@ -61,6 +72,12 @@ impl std::fmt::Display for PipelineError {
             Self::TimedOut { stalled_secs } => write!(
                 f,
                 "pipeline deadlock detected: no progress for {stalled_secs}s with work still in flight"
+            ),
+            Self::MonitorBlindTransport { step, spec } => write!(
+                f,
+                "deadlock monitor is armed but step {step:?} declares a {spec} output transport, \
+                 which is invisible to the in_flight_bytes probe — a wedge on that edge would \
+                 silently disable fail-fast. Production transports must be QueueSpec::ByteBounded."
             ),
         }
     }
@@ -147,6 +164,8 @@ impl PipelineSignal {
         // `Cancelled` — an inconsistent state/payload pair. Guarding on the CAS
         // (as `record_error` does) keeps the two consistent: whoever wins the
         // state transition is the one that sets the payload.
+        // (See the loom NOTE at the end of the tests module for why this
+        // race-guard is not exercised by a unit test.)
         if self
             .state
             .compare_exchange(
@@ -306,6 +325,15 @@ mod tests {
 
         let to = PipelineError::TimedOut { stalled_secs: 60 }.reconstruct();
         assert!(matches!(to, PipelineError::TimedOut { stalled_secs: 60 }));
+
+        let blind = PipelineError::MonitorBlindTransport {
+            step: "s",
+            spec: "QueueSpec::Unbounded".to_string(),
+        }
+        .reconstruct();
+        assert!(
+            matches!(blind, PipelineError::MonitorBlindTransport { step: "s", spec } if spec == "QueueSpec::Unbounded")
+        );
     }
 
     #[test]

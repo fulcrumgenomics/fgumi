@@ -155,7 +155,8 @@ impl PipelineBuilder {
     ///
     /// This deliberately bypasses the typed `Chain<'_, S::Outputs>` API.
     /// Type correctness is NOT validated at [`Self::build`] time — `build()`
-    /// only checks that every output branch is wired. A mis-typed step
+    /// only checks that the chain is non-empty (rejecting a zero-step chain with
+    /// `BuildError::Empty`) and that every output branch is wired. A mis-typed step
     /// sequence (e.g. a step whose `Input=A` consumes an output of type `B`)
     /// builds successfully and panics at the first dispatch in
     /// `TypedStep::resolve_input` with "input handle downcast failed —
@@ -462,8 +463,8 @@ impl<'b, A: Send + HeapSize + 'static, B: Send + HeapSize + 'static> MultiChain2
     /// Join two parallel sub-chains into a single [`Step2`] consumer.
     ///
     /// Wires `b0` into the consumer's input slot 0
-    /// ([`StepCtx2::a`]) and `b1` into input slot 1
-    /// ([`StepCtx2::b`]), registering the consumer with input arity
+    /// ([`StepCtx2`]'s `a`) and `b1` into input slot 1
+    /// ([`StepCtx2`]'s `b`), registering the consumer with input arity
     /// 2 in the chain graph. Each branch's typed producer-side
     /// [`OutputQueueSet`] is later (at chain-run time) drained into
     /// the consumer's
@@ -555,8 +556,8 @@ where
     /// Join two parallel ordered/byte-bounded sub-chains into a single
     /// [`Step2`] consumer. Ordered counterpart of
     /// [`MultiChain2::join`]: wires `b0` into the consumer's input
-    /// slot 0 ([`StepCtx2::a`]) and `b1` into input slot 1
-    /// ([`StepCtx2::b`]), registering the consumer with input arity 2.
+    /// slot 0 ([`StepCtx2`]'s `a`) and `b1` into input slot 1
+    /// ([`StepCtx2`]'s `b`), registering the consumer with input arity 2.
     ///
     /// Returns a single-branch downstream [`Chain`] typed by the
     /// joined step's `S::Outputs`.
@@ -825,12 +826,13 @@ impl Pipeline {
         // 2-pre-monitor invariant: if the deadlock monitor will be armed, every
         // output transport must be ByteBounded so `in_flight_bytes` can see a
         // wedge on it. A CountBounded/Unbounded edge is invisible to the probe
-        // and would silently disable fail-fast on that edge. Checked here (debug
-        // builds only) while `steps` is still alive — it is consumed by
+        // and would silently disable fail-fast on that edge. Checked here (in
+        // every build, release included — the blind spot only matters in a real
+        // fail-fast run) while `steps` is still alive — it is consumed by
         // `build_worker_storage` below. Test chains use CountBounded/Unbounded
         // but do not arm the monitor, so this only fires for a fail-fast run.
         if deadlock_timeout_secs > 0 && stats_arc.is_some() {
-            assert_monitor_visible_transports(&steps, &graph);
+            ensure_monitor_visible_transports(&steps, &graph)?;
         }
 
         // 2a. If a total queue-memory budget was supplied, evenly
@@ -1157,25 +1159,30 @@ fn first_monitor_blind_transport(
     None
 }
 
-/// Debug-build invariant check (run only when the deadlock monitor is armed):
-/// every production output transport must be `ByteBounded` so the
-/// [`in_flight_bytes`] probe can see a wedge on it. A `CountBounded`/`Unbounded`
-/// edge would be invisible to the monitor, silently disabling fail-fast on that
-/// edge — exactly the blind spot this guard exists to catch. The framework still
-/// permits `CountBounded`/`Unbounded` for `#[cfg(test)]` chains (which do not arm
-/// the monitor), so this only fires for a real fail-fast pipeline.
-fn assert_monitor_visible_transports(
+/// Invariant check (run only when the deadlock monitor is armed): every
+/// production output transport must be `ByteBounded` so the [`in_flight_bytes`]
+/// probe can see a wedge on it. A `CountBounded`/`Unbounded` edge would be
+/// invisible to the monitor, silently disabling fail-fast on that edge — exactly
+/// the blind spot this guard exists to catch. The framework still permits
+/// `CountBounded`/`Unbounded` for `#[cfg(test)]` chains (which do not arm the
+/// monitor), so this only fires for a real fail-fast pipeline.
+///
+/// Returns a [`PipelineError::MonitorBlindTransport`] (rather than panicking or
+/// being a debug-only check) so the guard runs in release builds — where the
+/// blind spot actually matters — yet a misconfigured chain fails gracefully at
+/// startup, consistent with the other build/run-time validations (e.g.
+/// [`PipelineError::NotEnoughThreads`]) rather than crashing the process.
+fn ensure_monitor_visible_transports(
     steps: &[Box<dyn super::erased::ErasedStep>],
     graph: &super::topology::ChainGraph,
-) {
-    debug_assert!(
-        first_monitor_blind_transport(steps, graph).is_none(),
-        "deadlock monitor is armed but step '{}' declares a {:?} output transport, \
-         which is invisible to the in_flight_bytes probe — a wedge on that edge would \
-         silently disable fail-fast. Production transports must be QueueSpec::ByteBounded.",
-        first_monitor_blind_transport(steps, graph).map_or("?", |(name, _)| name),
-        first_monitor_blind_transport(steps, graph).map(|(_, spec)| spec),
-    );
+) -> Result<(), super::signal::PipelineError> {
+    if let Some((name, spec)) = first_monitor_blind_transport(steps, graph) {
+        return Err(super::signal::PipelineError::MonitorBlindTransport {
+            step: name,
+            spec: format!("{spec:?}"),
+        });
+    }
+    Ok(())
 }
 
 /// Background deadlock monitor body. Polls `stats` every `poll_interval`,
@@ -1924,19 +1931,24 @@ mod tests {
         }
     }
 
-    /// Byte-bounded twin of [`SharedCountingSource`] for the monitor-armed
-    /// fail-fast test. The deadlock monitor's `in_flight_bytes` probe only sees
-    /// `ByteBounded` transports, and `assert_monitor_visible_transports` (a
-    /// debug-build invariant) rejects an `Unbounded`/`CountBounded` source on a
-    /// monitor-armed run. Using this source lets
-    /// `pipeline_run_reraises_worker_panic_with_monitor_enabled` actually reach
-    /// the monitor startup/shutdown path instead of tripping that assertion
-    /// first (and passing for the wrong reason).
+    /// Byte-bounded variant of [`SharedCountingSource`]. Identical claim/push
+    /// logic but declares a `ByteBounded` output transport so it is
+    /// monitor-visible — required by any test that arms the deadlock monitor
+    /// (`deadlock_timeout_secs > 0` + stats), which asserts every output edge is
+    /// `ByteBounded` (see `assert_monitor_visible_transports`) before workers
+    /// spawn. Using the `Unbounded` source there would trip that debug-assert
+    /// before the worker-panic path is ever reached.
     #[derive(Clone)]
-    struct SharedCountingByteBoundedSource {
+    struct SharedCountingSourceByteBounded {
         remaining: Arc<AtomicU32>,
+        /// A value claimed from `remaining` but not yet accepted by the output
+        /// (the byte-bounded push hit backpressure). Held per-worker and retried
+        /// on a later tick so the exact ordinal survives — rolling `remaining`
+        /// back instead would let a peer re-claim the count and drop/duplicate an
+        /// ordinal under contention.
+        pending: Option<u32>,
     }
-    impl Step for SharedCountingByteBoundedSource {
+    impl Step for SharedCountingSourceByteBounded {
         type Input = ();
         type Outputs = Single<u32>;
         fn profile(&self) -> StepProfile {
@@ -1944,14 +1956,23 @@ mod tests {
                 name: "SharedSourceByteBounded",
                 kind: StepKind::Parallel,
                 sticky: false,
-                // ByteBounded so the monitor probe can see this edge; sized large
-                // enough that the handful of items pushed before the sink panics
-                // never hit backpressure.
                 output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 20 }],
                 branch_ordering: vec![BranchOrdering::None],
             }
         }
         fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            // First flush any value claimed on a prior tick whose push was
+            // rejected by backpressure. Retrying the exact held ordinal (rather
+            // than rolling `remaining` back) keeps the emitted set a clean
+            // permutation of `1..=N` even under contention.
+            if let Some(n) = self.pending {
+                return if ctx.outputs.push(n).is_ok() {
+                    self.pending = None;
+                    Ok(StepOutcome::Progress)
+                } else {
+                    Ok(StepOutcome::NoProgress)
+                };
+            }
             let n = self.remaining.load(AtomicOrd::Acquire);
             if n == 0 {
                 return Ok(StepOutcome::Finished);
@@ -1961,13 +1982,19 @@ mod tests {
                 .compare_exchange(n, n - 1, AtomicOrd::AcqRel, AtomicOrd::Acquire)
                 .is_ok()
             {
-                // ByteBounded can reject under backpressure: hand the claimed
-                // item's budget back and retry next dispatch rather than erroring.
-                if ctx.outputs.push(n).is_err() {
-                    self.remaining.fetch_add(1, AtomicOrd::AcqRel);
-                    return Ok(StepOutcome::NoProgress);
+                // Byte-bounded push can hit backpressure; hold the claimed
+                // ordinal and retry it on a later tick. Holding a claimed item
+                // counts as progress per the `StepOutcome` contract ("pushed or
+                // held an item" — see `step.rs`) and matches the production
+                // held-slot sources (`sort::merge` / `sort::and_spill`), so the
+                // scheduler's deadlock accounting sees the claim as forward
+                // motion rather than a stall.
+                if ctx.outputs.push(n).is_ok() {
+                    Ok(StepOutcome::Progress)
+                } else {
+                    self.pending = Some(n);
+                    Ok(StepOutcome::Progress)
                 }
-                Ok(StepOutcome::Progress)
             } else {
                 Ok(StepOutcome::NoProgress)
             }
@@ -2110,14 +2137,20 @@ mod tests {
         // and joined — rather than deadlocking the join loop or leaking the
         // helper thread. The panicking worker signals cancellation so any wedged
         // peer observes `is_done()` and exits, letting every join complete.
+        //
+        // The source MUST be byte-bounded: arming the monitor (stats +
+        // non-zero timeout) runs `assert_monitor_visible_transports`, which
+        // debug-asserts every output edge is `ByteBounded`. An `Unbounded`
+        // source would trip that assert before any worker is spawned, so the
+        // test would "pass" on the wrong panic and never exercise the
+        // worker-panic deferral path it is meant to cover.
         let remaining = Arc::new(AtomicU32::new(1_000));
         let builder = PipelineBuilder::new();
-        // ByteBounded source so the monitor-visible-transports invariant holds and
-        // the test reaches the real monitor startup/shutdown path (a plain
-        // `SharedCountingSource` declares an `Unbounded` edge, which the debug
-        // `assert_monitor_visible_transports` would reject before the monitor runs).
         builder
-            .chain(SharedCountingByteBoundedSource { remaining: Arc::clone(&remaining) })
+            .chain(SharedCountingSourceByteBounded {
+                remaining: Arc::clone(&remaining),
+                pending: None,
+            })
             .chain(PanickingSink)
             .into_sink_marker();
         let pipeline = builder.build().unwrap();
@@ -2499,24 +2532,28 @@ mod tests {
     }
 
     #[test]
-    fn assert_monitor_visible_transports_passes_for_all_byte_bounded() {
-        // The armed-monitor invariant holds (does not panic) when every output
+    fn ensure_monitor_visible_transports_ok_for_all_byte_bounded() {
+        // The armed-monitor invariant holds (returns Ok) when every output
         // transport is ByteBounded.
         let steps = vec![
             step_with_output_spec("A", QueueSpec::ByteBounded { limit_bytes: 1 << 20 }),
             step_with_output_spec("B", QueueSpec::ByteBounded { limit_bytes: 1 << 20 }),
         ];
-        assert_monitor_visible_transports(&steps, &graph_matching_specs(&steps));
+        assert!(ensure_monitor_visible_transports(&steps, &graph_matching_specs(&steps)).is_ok());
     }
 
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "invisible to the in_flight_bytes probe")]
-    fn assert_monitor_visible_transports_panics_on_count_bounded_in_debug() {
-        // In debug builds, a monitor-blind transport on an armed pipeline trips
-        // the invariant instead of silently losing the wedge verdict.
+    fn ensure_monitor_visible_transports_errs_on_count_bounded() {
+        // A monitor-blind transport on an armed pipeline is rejected with a
+        // graceful error (in every build, release included) instead of silently
+        // losing the wedge verdict or crashing the process.
         let steps = vec![step_with_output_spec("Blind", QueueSpec::CountBounded { capacity: 8 })];
-        assert_monitor_visible_transports(&steps, &graph_matching_specs(&steps));
+        let err = ensure_monitor_visible_transports(&steps, &graph_matching_specs(&steps))
+            .expect_err("a CountBounded transport on an armed pipeline must be rejected");
+        assert!(
+            matches!(err, PipelineError::MonitorBlindTransport { step: "Blind", .. }),
+            "expected MonitorBlindTransport for the blind step, got {err:?}"
+        );
     }
 
     #[test]

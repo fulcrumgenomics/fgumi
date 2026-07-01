@@ -484,10 +484,12 @@ impl UmiAssigner for ParallelAdjacencyAssigner {
             })
             .collect();
 
-        // Handle edge case: no valid UMIs
+        // Handle edge case: no valid UMIs. Reads whose UMI failed to encode keep
+        // `MoleculeId::None`, matching the sequential `AdjacencyUmiAssigner` (which
+        // returns `vec![MoleculeId::None; len]` when every UMI is invalid). Assigning
+        // a fresh `Single` here would diverge from the sequential path (parity bug).
         if sorted_umis.is_empty() {
-            // All UMIs were invalid - each gets its own molecule ID
-            return (0..raw_umis.len()).map(|i| MoleculeId::Single(i as u64)).collect();
+            return vec![MoleculeId::None; raw_umis.len()];
         }
 
         // Sort by count descending, then by the RAW first-seen UMI string — exactly
@@ -559,17 +561,15 @@ impl UmiAssigner for ParallelAdjacencyAssigner {
             .map(|(i, (umi, _, _, _))| (umi.as_str(), mol_ids[i]))
             .collect();
 
-        // Map back to original UMI order
+        // Map back to original UMI order. Reads whose UMI failed to encode are not
+        // present in `str_to_mol` and keep `MoleculeId::None`, mirroring the
+        // sequential `AdjacencyUmiAssigner` (which maps invalid reads to `None`).
+        // Assigning a fresh `Single` here would be a sequential/parallel parity bug.
         raw_umis
             .iter()
             .map(|umi| {
                 let upper = umi.to_uppercase();
-                str_to_mol.get(upper.as_str()).copied().unwrap_or_else(|| {
-                    // Invalid UMI gets its own molecule ID (consistent with Edit assigner)
-                    let id = MoleculeId::Single(next_mol_id);
-                    next_mol_id += 1;
-                    id
-                })
+                str_to_mol.get(upper.as_str()).copied().unwrap_or(MoleculeId::None)
             })
             .collect()
     }
@@ -1464,6 +1464,12 @@ mod tests {
         /// between the two paths (parallel keyed on the uppercased string, sequential on raw
         /// bytes) and capture a shared neighbor into different groups. UMIs are drawn from a small
         /// alphabet (mixed case) over a short fixed length to maximize ties and 1-edit adjacency.
+        ///
+        /// No fgbio oracle (by design): the case-SENSITIVE raw-bytes tie-break IS fgbio's
+        /// `strnum`-style order, established in S7-002-bitenc-perf-analysis.md (fgbio = raw bytes).
+        /// The DIRECTION test below (`adjacency_tie_break_is_case_sensitive_raw_not_uppercased`,
+        /// aAAA/CAAA/GAAA) non-vacuously pins that direction, so we cross-check the two fgumi paths
+        /// against each other rather than adding an fgbio dependency.
         #[test]
         fn proptest_adjacency_parallel_matches_sequential(
             indices in prop::collection::vec(0usize..16, 1..40),
@@ -1513,6 +1519,55 @@ mod tests {
             assert_ne!(mol[8], mol[0], "{label}: GAAA must NOT group with aAAA (that is the bug)");
             assert_eq!(mol[0], mol[3], "{label}: the four aAAA reads share one molecule");
             assert_eq!(mol[4], mol[7], "{label}: the four CAAA reads share one molecule");
+        }
+    }
+
+    /// Invalid-UMI parity: a read whose UMI fails to encode (e.g. contains an `N`)
+    /// must map to `MoleculeId::None` in BOTH the sequential `AdjacencyUmiAssigner`
+    /// and the parallel `ParallelAdjacencyAssigner`, never to a fresh
+    /// `MoleculeId::Single`. The sequential path has long preserved `None`; the
+    /// parallel path previously minted a `Single` per invalid read, which broke
+    /// sequential/parallel parity and would silently fold invalid reads into their
+    /// own consensus families. This pins the fix for both the mixed case and the
+    /// all-invalid case.
+    ///
+    /// The `None` expectations below ARE the fgbio oracle, not a mere
+    /// sequential-vs-parallel cross-check: fgbio's `GroupReadsByUmi` drops reads
+    /// whose UMI contains an `N` (`.filter(r => !umi.contains('N'))`), assigning
+    /// them no molecule — exactly `MoleculeId::None` here. (That fgbio-compatible
+    /// UMI validation is documented on `fgumi_umi`'s UMI validator, which mirrors
+    /// the same Scala filter.) Because these are absolute expected values, a
+    /// shared drift from fgbio — e.g. both paths minting a fresh `Single` for an
+    /// invalid UMI — FAILS the asserts rather than slipping through. No fgbio
+    /// dependency is added, consistent with the no-oracle-by-design rationale on
+    /// `proptest_adjacency_parallel_matches_sequential` above.
+    #[test]
+    fn adjacency_invalid_umi_maps_to_none_in_both_paths() {
+        // One valid UMI (twice) + one invalid UMI (contains `N`).
+        let mixed: Vec<Umi> = ["ACGT", "ACGT", "ACGN"].iter().map(|s| (*s).to_string()).collect();
+        for (label, mol) in [
+            ("sequential", AdjacencyUmiAssigner::new(1, 1, DEFAULT_INDEX_THRESHOLD).assign(&mixed)),
+            ("parallel", ParallelAdjacencyAssigner::new(1, 4).assign(&mixed)),
+        ] {
+            assert_eq!(mol[0], mol[1], "{label}: the two valid reads share one molecule");
+            assert!(matches!(mol[0], MoleculeId::Single(_)), "{label}: valid reads get a Single");
+            assert_eq!(mol[2], MoleculeId::None, "{label}: invalid read must be None, not Single");
+        }
+
+        // All-invalid input: every read must be `None` (no fresh `Single` ids).
+        let all_invalid: Vec<Umi> =
+            ["ACGN", "NNNN", "TTNT"].iter().map(|s| (*s).to_string()).collect();
+        for (label, mol) in [
+            (
+                "sequential",
+                AdjacencyUmiAssigner::new(1, 1, DEFAULT_INDEX_THRESHOLD).assign(&all_invalid),
+            ),
+            ("parallel", ParallelAdjacencyAssigner::new(1, 4).assign(&all_invalid)),
+        ] {
+            assert!(
+                mol.iter().all(|id| *id == MoleculeId::None),
+                "{label}: all-invalid input must map every read to None, got {mol:?}",
+            );
         }
     }
 

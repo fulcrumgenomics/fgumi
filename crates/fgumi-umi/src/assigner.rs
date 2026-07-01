@@ -1093,7 +1093,8 @@ impl AdjacencyUmiAssigner {
     ///
     /// * `max_mismatches` - Maximum number of mismatches allowed for UMIs to be adjacent
     /// * `threads` - Number of threads to use for matching (default: 1)
-    /// * `index_threshold` - Minimum UMIs per position to use N-gram/BK-tree index (default: 1000)
+    /// * `index_threshold` - Minimum UMIs per position to use N-gram/BK-tree index
+    ///   (default: 100, see [`DEFAULT_INDEX_THRESHOLD`])
     ///
     /// # Returns
     ///
@@ -1537,15 +1538,17 @@ impl UmiAssigner for AdjacencyUmiAssigner {
         let t_after_sort = std::time::Instant::now();
 
         if umi_counts.len() == 1 {
-            // Exactly one *encodable* UMI, but the batch may still contain reads
-            // with invalid (non-encodable) UMIs. Those must stay `MoleculeId::None`
-            // — exactly as the general path below maps them — rather than being
-            // folded into the single molecule. A `vec![id; raw_umis.len()]` here
-            // would mis-assign e.g. the middle read of `["AAAAAA","XXXXXX","AAAAAA"]`.
+            // Exactly one valid unique UMI. Every *valid* read maps to the same
+            // single molecule ID, but reads whose UMI was invalid (recorded as
+            // `None` in `presort_idx_per_read`) must keep their own
+            // `MoleculeId::None` rather than inheriting the shared ID.
             let id = MoleculeId::Single(self.next_id());
             return presort_idx_per_read
                 .iter()
-                .map(|presort_idx| if presort_idx.is_some() { id } else { MoleculeId::None })
+                .map(|presort_idx| match presort_idx {
+                    Some(_) => id,
+                    None => MoleculeId::None,
+                })
                 .collect();
         }
 
@@ -2287,18 +2290,19 @@ mod tests {
         assert_ne!(assignments[0], assignments[3], "distinct UMIs → distinct ids");
     }
 
-    /// Regression: with exactly ONE unique encodable UMI the assigner takes the
-    /// single-unique-UMI fast path. An invalid UMI in that same batch must still
-    /// map to `MoleculeId::None`, not inherit the lone molecule's id.
+    /// Regression: when there is exactly one valid unique UMI (so the
+    /// `umi_counts.len() == 1` fast path is taken), reads with invalid UMIs must
+    /// still map to `MoleculeId::None` instead of inheriting the single shared
+    /// molecule id.
     #[test]
-    fn test_adjacency_invalid_umi_maps_to_none_single_unique_fast_path() {
+    fn test_adjacency_single_unique_umi_with_invalid_maps_invalid_to_none() {
         let assigner = AdjacencyUmiAssigner::new(0, 1, DEFAULT_INDEX_THRESHOLD);
         let umis: Vec<String> =
             ["AAAAAA", "XXXXXX", "AAAAAA"].into_iter().map(str::to_string).collect();
         let assignments = assigner.assign(&umis);
-        assert_eq!(assignments[1], MoleculeId::None, "invalid UMI → None even on the fast path");
-        assert_ne!(assignments[0], MoleculeId::None, "valid AAAAAA read keeps a molecule id");
-        assert_eq!(assignments[0], assignments[2], "both valid AAAAAA reads share the same id");
+        assert_ne!(assignments[0], MoleculeId::None, "valid UMI → assigned id");
+        assert_eq!(assignments[1], MoleculeId::None, "invalid UMI → None (fast path)");
+        assert_eq!(assignments[0], assignments[2], "both valid reads share the single id");
     }
 
     // ========================================================================

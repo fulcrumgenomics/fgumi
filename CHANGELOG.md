@@ -8,6 +8,7 @@ All notable changes to this project will be documented in this file.
 
 - [**breaking**] `fgumi runall` no longer accepts the `--raw-tag`/`-t` and `--assign-tag`/`-T` flags. They were validated but never propagated into any stage — group reads the UMI from `RX` and emits `MI`, and the consensus callers read `MI`, all via shared constants — so the flags were silent no-ops that misleadingly implied configurability. Removing them frees the `-t`/`-T` short flags. There is no replacement: the UMI/assign tags are fixed (`RX`/`MI`) across the fused chain.
 - [**breaking**] `fgumi zipper`'s `--skip-pa-tags` flag (and `runall`'s `--zipper::skip-pa-tags`) is renamed to `--skip-tc-tags`. The flag never controlled a `pa` tag — it gates the `TC` (template-coordinate) tag added to secondary/supplementary reads — so the old name and help were misleading. Behavior is unchanged; update any scripts passing `--skip-pa-tags`.
+- [**breaking**] The separate `simplex`, `duplex`, and `codec` Cargo features on the root `fgumi` crate are collapsed into a single default-on `consensus` umbrella feature, which gates all consensus calling (the `simplex`, `duplex`, `codec`, `runall`, `simplex-metrics`, and `duplex-metrics` subcommands). Default builds are unaffected. Embedders that built with a subset of the old features should use `--features consensus` (or `--no-default-features` to drop all consensus code); the granular `simplex`/`duplex`/`codec` features still exist one level down in the `fgumi-consensus` crate for reduced library builds.
 
 - `fgumi sort --write-index --order coordinate` BAM output bytes now match the corresponding `--write-index`-off run for the same input — both paths now share the same writer backend. Pre-`#330` Phase 4 the `--write-index` path used a *different* writer backend (the in-sort indexer wrote through noodles' `MultithreadedWriter` so it could track per-record virtual offsets during write) than the off path (`PooledBamWriter`); the two backends emit different BGZF block boundaries, so the BAMs diverged byte-for-byte even though both were multi-threaded. The indexer now runs as a post-write pass via `IndexBamFinalizeHook`, so the `--write-index`-on and -off runs go through the identical `PooledBamWriter` path. BAI content (record-set returned by samtools region queries) is unchanged; only the BAM's BGZF block layout differs from prior releases.
 - `fgumi extract` output BAM block layout may differ from prior releases. When `--threads` is unset, the typed-step framework's BGZF compression schedule produces different block boundaries than the legacy `process_singlethreaded` path. Record content (queryname + sequence + quality + tags) is unchanged.
@@ -21,7 +22,9 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
-- `fgumi runall` now supports `--start-from extract` so users can run FASTQ-to-consensus in a single fused invocation without intermediate BAM files.
+- New `fgumi runall` command: runs the full FASTQ/BAM-to-consensus pipeline as a single fused invocation, streaming the stages together (no intermediate stage BAMs on disk — the in-pipeline sort may still spill temporary chunks under memory pressure). Use `--start-from`/`--stop-after` to run a sub-range of stages; per-stage tuning is exposed as prefixed flags (`--sort::max-memory`, `--group::strategy`, …). With `--start-from extract` it runs FASTQ-to-consensus end to end without intermediate stage BAM files.
+- New `fgumi simulate aligner` subcommand (gated behind the `simulate` feature): a fake streaming replay aligner that replays a pre-recorded BAM, for benchmarking the `runall` align-and-merge chain without a real aligner.
+- The intermediate `fgumi sort` stage now runs as an in-pipeline streaming sort within `runall` (streaming, not file-to-file), and the standalone `fgumi sort` command is re-homed into the new `fgumi-sort-cli` crate (`fgumi sort`'s CLI surface is unchanged).
 
 ### Bug Fixes
 
@@ -30,7 +33,7 @@ All notable changes to this project will be documented in this file.
 
 ### Refactor
 
-- Extracted the sort engine into the new `fgumi-sort` crate and the BAM-pipeline I/O layer into the new `fgumi-bam-io` crate. The main `fgumi` binary now consumes both as workspace dependencies; behavior is unchanged.
+- Extracted the typed-step pipeline engine into the new `fgumi-pipeline-core` crate, the BAM-pipeline I/O layer into `fgumi-pipeline-io`, shared CLI plumbing into `fgumi-cli-common`, the multi-options proc-macro into `fgumi-cli-macros`, and the standalone sort CLI into `fgumi-sort-cli`. The main `fgumi` binary consumes these as workspace dependencies; behavior is unchanged.
 - Unified chain-builder refactor (`#330`): the typed-step pipeline framework is the single execution path for all multi-stage commands. `fgumi runall`'s 15 fused dispatchers collapse into a declarative `ChainSpec` consumed by `chains::build_for`; `fgumi sort --write-index` lifts to a post-pipeline `IndexBamFinalizeHook` keyed off `SinkSpec::BamWithIndex` (see Behavioural changes above for the user-visible BAM-layout consequence). Internal-only otherwise.
 - `fgumi extract` migrated onto the typed-step `chains::build_for` framework. The 5462-LOC custom FASTQ-pipeline framework (`unified_pipeline/fastq.rs`) is deleted; `Extract::execute` collapses to a ~25-line `ChainSpec` construction. Net: −3879 LOC.
 

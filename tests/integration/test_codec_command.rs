@@ -38,8 +38,8 @@ pub(crate) fn create_codec_read_pair(
 ) -> (RawRecord, RawRecord) {
     let r1_len = r1_seq.len();
     let r2_len = r2_seq.len();
-    let r1_cigar_op = u32::try_from(r1_len).expect("r1_len fits u32") << 4; // nM
-    let r2_cigar_op = u32::try_from(r2_len).expect("r2_len fits u32") << 4; // nM
+    let r1_cigar_op = u32::try_from(r1_len).expect("r1_len fits u32") << 4; // <len>M (op 0)
+    let r2_cigar_op = u32::try_from(r2_len).expect("r2_len fits u32") << 4; // <len>M (op 0)
     // SamBuilder pos is 0-based; ref_start is 1-based
     let pos = i32::try_from(ref_start).expect("ref_start fits i32") - 1;
     // MC is the mate's CIGAR, so b1 carries R2's tag and vice versa.

@@ -140,8 +140,8 @@ PERFORMANCE:
   - Handles BAM files larger than available RAM via spill-to-disk
   - Uses parallel sorting (--threads) for in-memory chunks
   - Configurable temp file compression (--temp-compression)
-  - Default 768M per-thread memory limit (samtools-compatible); pass
-    `--max-memory auto` to detect system memory (opt-in)
+  - Default 768MiB per-thread memory limit (samtools-compatible); pass
+    `--max-memory auto` to detect host memory (opt-in)
 
 EXAMPLES:
 
@@ -154,13 +154,13 @@ EXAMPLES:
   # Sort by queryname for zipper
   fgumi sort -i input.bam -o sorted.bam --order queryname
 
-  # Multi-threaded sort (default 768M per thread)
+  # Multi-threaded sort (default 768MiB per thread)
   fgumi sort -i input.bam -o sorted.bam --order template-coordinate --threads 8
 
   # Override the per-thread memory limit
   fgumi sort -i input.bam -o sorted.bam -m 2GiB --threads 8
 
-  # Opt in to auto-detected system memory (subtracts --memory-reserve)
+  # Opt in to auto-detected host memory (subtracts --memory-reserve)
   fgumi sort -i input.bam -o sorted.bam -m auto --threads 8
 
   # Reserve extra memory for bwa mem running in a pipeline
@@ -255,7 +255,7 @@ pub struct SortOptions {
     /// Maximum memory for in-memory sorting.
     ///
     /// Default is "768MiB" per thread (matching samtools' 768 MiB). Pass "auto"
-    /// to detect system memory and subtract --memory-reserve, leaving room
+    /// to detect host memory and subtract --memory-reserve, leaving room
     /// for the OS and co-running processes (e.g. an aligner). Explicit values
     /// like "512MiB", "1GiB", "4GiB" are per-thread when --memory-per-thread is
     /// enabled (default). Note bare "M"/"G" are decimal (1000ⁿ); "MiB"/"GiB" are
@@ -267,7 +267,7 @@ pub struct SortOptions {
 
     /// Memory to reserve for other processes when --max-memory=auto.
     ///
-    /// "auto" (default) reserves min(10 GiB, 50% of system memory). Explicit
+    /// "auto" (default) reserves min(10 GiB, 50% of host memory). Explicit
     /// values like "10G", "8GiB" set a fixed reservation. Set higher when
     /// running alongside a memory-intensive aligner (e.g. `bwa mem` with a
     /// human genome index uses ~8 GiB).
@@ -967,6 +967,201 @@ mod tests {
             .expect("create_raw_bam_writer");
         writer.write_raw_record(&record).expect("write record");
         writer.finish().expect("finish");
+    }
+
+    /// Compute the spec-valid BAM bin for a 0-based half-open alignment range
+    /// `[beg, end)` using the SAM spec §5.3 `reg2bin` reference algorithm. The
+    /// fixtures here emit 10M alignments, so on-wire records must carry a real
+    /// bin rather than `0` (which is only valid for the largest-window layer).
+    #[allow(clippy::eq_op, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn reg2bin(beg: i32, end: i32) -> u16 {
+        let beg = beg as usize;
+        let end = (end - 1) as usize; // spec works on the inclusive last base
+        let bin = if beg >> 14 == end >> 14 {
+            ((1 << 15) - 1) / 7 + (beg >> 14)
+        } else if beg >> 17 == end >> 17 {
+            ((1 << 12) - 1) / 7 + (beg >> 17)
+        } else if beg >> 20 == end >> 20 {
+            ((1 << 9) - 1) / 7 + (beg >> 20)
+        } else if beg >> 23 == end >> 23 {
+            ((1 << 6) - 1) / 7 + (beg >> 23)
+        } else if beg >> 26 == end >> 26 {
+            ((1 << 3) - 1) / 7 + (beg >> 26)
+        } else {
+            0
+        };
+        bin as u16
+    }
+
+    /// Build a single 10-base mapped BAM record body at `(ref_id, pos)` with the
+    /// given read `name`. Mirrors the layout in `write_coordinate_bam`.
+    #[allow(clippy::cast_possible_truncation)]
+    fn mapped_record_body(name: &[u8], ref_id: i32, pos: i32) -> Vec<u8> {
+        let name_with_null = name.len() + 1;
+        let padding = (4 - (name_with_null % 4)) % 4;
+        // 10M alignment spanning [pos, pos + 10); emit the spec-valid bin so the
+        // success-path fixture mirrors the production on-wire BAM encoding.
+        let bin = reg2bin(pos, pos + 10);
+        let mut record = Vec::with_capacity(64);
+        record.extend_from_slice(&ref_id.to_le_bytes());
+        record.extend_from_slice(&pos.to_le_bytes());
+        record.push((name_with_null + padding) as u8); // l_read_name
+        record.push(60_u8); // mapq
+        record.extend_from_slice(&bin.to_le_bytes()); // bin (SAM spec §5.3 reg2bin)
+        record.extend_from_slice(&1_u16.to_le_bytes()); // n_cigar_op
+        record.extend_from_slice(&0_u16.to_le_bytes()); // flag
+        record.extend_from_slice(&10_u32.to_le_bytes()); // l_seq
+        record.extend_from_slice(&(-1_i32).to_le_bytes()); // next_ref_id
+        record.extend_from_slice(&(-1_i32).to_le_bytes()); // next_pos
+        record.extend_from_slice(&0_i32.to_le_bytes()); // tlen
+        record.extend_from_slice(name);
+        record.push(0);
+        record.extend(std::iter::repeat_n(0_u8, padding));
+        record.extend_from_slice(&(10_u32 << 4).to_le_bytes()); // 10M cigar
+        record.extend_from_slice(&[0x11_u8; 5]); // packed seq
+        record.extend_from_slice(&[30_u8; 10]); // qualities
+        record
+    }
+
+    /// Write a small UNSORTED two-reference coordinate BAM to `path`. Returns the
+    /// number of records written. The records are emitted out of coordinate
+    /// order so a real sort has work to do.
+    fn write_unsorted_coordinate_bam(path: &std::path::Path) -> usize {
+        use noodles::sam::Header;
+        use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
+        use std::num::NonZeroUsize;
+
+        let mut builder = Header::builder();
+        for chrom in [b"chr1".as_slice(), b"chr2".as_slice()] {
+            builder = builder.add_reference_sequence(
+                chrom,
+                Map::<ReferenceSequence>::new(NonZeroUsize::new(10_000).expect("non-zero")),
+            );
+        }
+        // Header SO is `unsorted` for input; the writer is told nothing about order.
+        let header = builder.build();
+
+        // (ref_id, pos) emitted deliberately out of coordinate order.
+        let layout: &[(&[u8], i32, i32)] = &[
+            (b"r_chr2_300", 1, 300),
+            (b"r_chr1_500", 0, 500),
+            (b"r_chr1_100", 0, 100),
+            (b"r_chr2_50", 1, 50),
+            (b"r_chr1_900", 0, 900),
+            (b"r_chr2_700", 1, 700),
+            (b"r_chr1_300", 0, 300),
+        ];
+
+        let mut writer = fgumi_bam_io::create_raw_bam_writer(path, &header, 1, 1)
+            .expect("create_raw_bam_writer");
+        for &(name, ref_id, pos) in layout {
+            writer.write_raw_record(&mapped_record_body(name, ref_id, pos)).expect("write record");
+        }
+        writer.finish().expect("finish");
+        layout.len()
+    }
+
+    /// Canonical per-record identity: the full logical record.
+    ///
+    /// We key on the `Debug` rendering of the entire [`noodles` `RecordBuf`], which
+    /// covers the complete alignment payload — read name, flags, reference id /
+    /// position, mapping quality, CIGAR, mate fields, template length, SEQ, QUAL,
+    /// and AUX tags. A weaker `(name, tid, pos, flags)` projection would still
+    /// pass if a sort mutated CIGAR, mate fields, SEQ/QUAL, or a tag. `RecordBuf`
+    /// is the parsed *logical* record, so this is robust to encoding-only
+    /// differences (e.g. the recomputed `bin`) that a raw-byte compare would
+    /// spuriously flag. `RecordBuf` is not `Ord`, so we sort the string forms.
+    type RecordIdentity = String;
+
+    /// Read a canonical per-record identity for every record of a BAM, sorted
+    /// into a multiset. Comparing the input and output multisets proves the sort
+    /// preserved every record exactly — not just its coordinate.
+    fn read_record_identities(path: &std::path::Path) -> Vec<RecordIdentity> {
+        let mut reader =
+            noodles::bam::io::Reader::new(std::fs::File::open(path).expect("open bam"));
+        let header = reader.read_header().expect("read header");
+        let mut ids: Vec<RecordIdentity> =
+            reader.record_bufs(&header).map(|r| format!("{:?}", r.expect("read record"))).collect();
+        ids.sort();
+        ids
+    }
+
+    /// Read back `(reference_sequence_id, alignment_start)` for every record of a
+    /// BAM, in file order, via noodles.
+    fn read_coordinate_keys(path: &std::path::Path) -> Vec<(Option<usize>, Option<usize>)> {
+        let mut reader =
+            noodles::bam::io::Reader::new(std::fs::File::open(path).expect("open sorted output"));
+        let header = reader.read_header().expect("read header");
+        reader
+            .record_bufs(&header)
+            .map(|r| {
+                let rec = r.expect("read record");
+                (rec.reference_sequence_id(), rec.alignment_start().map(usize::from))
+            })
+            .collect()
+    }
+
+    /// Success-path coverage for the streaming sort engine wiring
+    /// (`execute_sort` / `build_sort_step` / write-index) — S3-010. A small
+    /// unsorted coordinate BAM is sorted end-to-end with `--write-index`; the
+    /// output must be coordinate-ordered, preserve every record, and produce a
+    /// readable `.bam.bai` sidecar.
+    #[test]
+    fn execute_sort_success_path_sorts_and_writes_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("in.bam");
+        let output = dir.path().join("out.bam");
+        let expected_count = write_unsorted_coordinate_bam(&input);
+
+        let sort = Sort::try_parse_from([
+            "sort",
+            "-i",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--order",
+            "coordinate",
+            "--write-index",
+            "true",
+            // Bound the per-thread reservation well below the 768 MiB default so
+            // nextest's concurrent execution stays light.
+            "--max-memory",
+            "16MiB",
+        ])
+        .expect("parse Sort");
+
+        sort.execute("fgumi sort").expect("end-to-end coordinate sort must succeed");
+
+        // Output BAM and a readable BAI sidecar must both exist.
+        assert!(output.exists(), "sorted output BAM not written");
+        let bai = fgumi_bam_io::bai_sidecar_path(&output);
+        assert!(bai.exists(), "BAI sidecar not written on the success path");
+        noodles::bam::bai::fs::read(&bai).expect("BAI sidecar must parse");
+
+        // Exact record count preserved (no loss / duplication).
+        let keys = read_coordinate_keys(&output);
+        assert_eq!(keys.len(), expected_count, "record count changed across sort");
+
+        // Record identity preserved: the input and output multisets must match
+        // exactly, so a sort cannot silently mutate, drop, or duplicate a record
+        // while still satisfying the count and coordinate-order checks below.
+        assert_eq!(
+            read_record_identities(&input),
+            read_record_identities(&output),
+            "record identity changed across sort (mutation / loss / duplication)"
+        );
+
+        // Independent coordinate-order check: (tid, pos) non-decreasing, with
+        // no-reference records (None) sorting last.
+        let rank = |k: &(Option<usize>, Option<usize>)| (k.0.is_none(), k.0, k.1);
+        for pair in keys.windows(2) {
+            assert!(
+                rank(&pair[0]) <= rank(&pair[1]),
+                "output is not coordinate-ordered: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 
     /// A failed sort must not write (or overwrite) the `.bam.bai`: the index

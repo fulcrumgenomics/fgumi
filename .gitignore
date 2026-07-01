@@ -58,6 +58,9 @@ docs/design/*
 # Tracked: cited from read_ahead.rs (S3-015 deferral); must be committed so the
 # code's PERF NOTE citation does not dangle.
 !docs/design/sort-queryname-arena-deferral.md
+# Tracked: the simulate-aligner replay design doc (committed alongside the
+# `simulate aligner` subcommand).
+!docs/design/2026-06-18-simulate-aligner.md
 scripts/bench-*.sh
 scripts/parity-*.sh
 /TRACKER.md

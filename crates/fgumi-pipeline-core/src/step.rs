@@ -45,9 +45,8 @@ pub enum StepKind {
 /// affinity only the hinted worker(s) ever acquire it.
 ///
 /// Mirrors the legacy framework's per-thread `exclusive_step_owned`
-/// mapping (`pipeline/scheduler/mod.rs:263-308`) where T0 is the
-/// reader, T(N-1) is the writer, and interior exclusive steps fan out
-/// from both ends.
+/// mapping, where T0 is the reader, T(N-1) is the writer, and interior
+/// exclusive steps fan out from both ends.
 ///
 /// Default `None` keeps the existing pure-mutex-shared `Serial` behavior.
 /// Ignored for `Parallel` and `Exclusive` kinds.

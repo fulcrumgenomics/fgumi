@@ -25,18 +25,21 @@ For memory-constrained environments, pass `--max-memory auto` to detect (cgroup-
 ## Threading Options
 
 ### No-flag Fast Path (default)
+
 - **Usage**: Omit `--threads` entirely
 - **Behavior**: Uses optimized single-threaded fast path with minimal overhead
 - **Best for**: Small files, memory-constrained systems, debugging
 
 ### Explicit Single-threaded Mode
+
 - **Usage**: `--threads 1`
-- **Behavior**: Uses the unified pipeline with a single worker thread — same pipeline as `--threads N` but with N=1; does **not** use the no-flag fast path
+- **Behavior**: Uses the typed-step work-stealing pipeline with a single worker thread — same pipeline as `--threads N` but with N=1; does **not** use the no-flag fast path
 - **Best for**: Isolating pipeline behavior in a single-threaded context
 
 ### Multi-threaded Mode
+
 - **Usage**: `--threads N` where N > 1
-- **Behavior**: Uses unified 7-step pipeline with work-stealing scheduler
+- **Behavior**: Uses the typed-step work-stealing pipeline
 - **Best for**: Large files, high-performance systems, production workloads
 
 > **`fgumi runall`:** all fused stages share a single `--threads` thread pool, so set `--threads`
@@ -65,10 +68,16 @@ fgumi filter --max-memory auto
 fgumi filter --max-memory auto --memory-reserve 12GiB
 ```
 
-This is the same `--max-memory` surface as `fgumi sort`. The default is opt-in:
-the budget stays 768 MiB/thread unless you pass `auto`, so on a fixed-RAM host
-(e.g. a 30 GiB container at `--threads 16`) prefer `--max-memory auto` or a fixed
-total budget to avoid OOM.
+This is the same `--max-memory` surface as `fgumi sort`. Out of the box the
+budget is **768 MiB per thread with per-thread scaling ON**, so the total grows
+with `--threads` (4 threads → 3 GiB, 8 → 6 GiB, …). This per-thread default is
+deliberately conservative; opt into host-aware sizing with `--max-memory auto`
+(detects RAM and divides across threads) or cap the total with
+`--memory-per-thread false`. On a fixed-RAM host (e.g. a 30 GiB container at
+`--threads 16`, where the per-thread default would want a 12 GiB *queue* budget —
+and total RSS, which also includes UMI structures, decompressors/compressors, and
+thread stacks, is often 2–3× that) prefer `--max-memory auto` or a fixed total
+budget to avoid OOM.
 
 ### Memory Scaling Behavior
 
