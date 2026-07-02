@@ -233,6 +233,7 @@ pub fn cb_hasher() -> ahash::RandomState {
 ///
 /// Pre-computes ordinals by sorting library names alphabetically.
 /// Empty/unknown library sorts first (ordinal 0).
+#[derive(Clone)]
 pub struct LibraryLookup {
     /// RG ID -> library ordinal
     rg_to_ordinal: HashMap<Vec<u8>, u32>,
@@ -795,8 +796,11 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
 /// individual `RawRecord`s and produces `Owned` chunks — the
 /// per-record allocation is sunk cost, so we preserve the original
 /// zero-copy `mem::swap` merge bridge.
-pub(crate) enum MemorySources<K: RawSortKey + Default + 'static> {
+pub enum MemorySources<K: RawSortKey + Default + 'static> {
+    /// Inline-buffer (coordinate / template) residual chunks sharing an
+    /// `Arc<SegmentedBuf>` — zero per-record allocation.
     Shared(Vec<InMemoryChunk<K>>),
+    /// Queryname-style residual chunks (each record an owned `RawRecord`).
     Owned(Vec<Vec<(K, fgumi_raw_bam::RawRecord)>>),
 }
 
@@ -1402,185 +1406,117 @@ impl RawExternalSorter {
         self.sort_order
     }
 
-    /// Convert this configured sorter into a streaming coordinate-sort handle.
+    /// The configured cell-barcode tag (template-coordinate CB hashing), if any.
+    /// Read when building a record-input arena strategy so it matches the
+    /// block-input template strategy exactly.
+    #[must_use]
+    pub fn cell_tag_value(&self) -> Option<SamTag> {
+        self.cell_tag
+    }
+
+    /// The configured `--key-types` narrowing spec (template-coordinate only).
+    #[must_use]
+    pub fn key_types_spec(&self) -> KeyTypesSpec {
+        self.key_types
+    }
+
+    /// The configured in-memory sort budget in bytes (per-run seal threshold).
+    #[must_use]
+    pub fn memory_limit_bytes(&self) -> usize {
+        self.memory_limit
+    }
+
+    /// The configured sort thread count (per-chunk parallel sort width).
+    #[must_use]
+    pub fn num_threads(&self) -> usize {
+        self.threads
+    }
+
+    /// Convert this configured sorter into a lean coordinate buffering sorter
+    /// for the P6 `SortBuffer` step.
     ///
-    /// The returned [`CoordinateSortStream`] ingests records via `push_record`
-    /// / `push_records`, spilling internally as the buffer crosses
-    /// `memory_limit`, and is finalized by the typed-step pipeline via
-    /// `into_slot_setup`. Gated on `SortOrder::Coordinate`; see
-    /// [`Self::into_queryname_stream`] / [`Self::into_template_coordinate_stream`]
-    /// for the other orders.
+    /// Same buffer sizing / rayon pool as the retired `into_coordinate_stream`,
+    /// but with **no** `SortWorkerPool`, temp dirs, or spill files — the
+    /// `SortBuffer` step only ingests + par-sorts + materializes chunks; the
+    /// `CompressSpill` step owns compression and disk I/O.
     ///
     /// # Errors
     ///
-    /// Returns an error if `self.sort_order` is not `Coordinate`, if the temp
-    /// directories cannot be created, or if the rayon sort pool cannot be built.
-    pub fn into_coordinate_stream(self, header: &Header) -> Result<CoordinateSortStream> {
+    /// Returns an error if `self.sort_order` is not `Coordinate`, the reference
+    /// count exceeds `u32::MAX`, or the rayon sort pool cannot be built.
+    pub fn into_coordinate_chunk_sorter(
+        self,
+        header: &Header,
+    ) -> Result<crate::chunk_sorter::CoordinateChunkSorter> {
         anyhow::ensure!(
             matches!(self.sort_order, SortOrder::Coordinate),
-            "into_coordinate_stream requires SortOrder::Coordinate (got {:?}); \
-             queryname / template-coordinate streaming entry points are forthcoming",
+            "into_coordinate_chunk_sorter requires SortOrder::Coordinate (got {:?})",
             self.sort_order,
         );
-        self.ensure_spill_codec_compat()?;
-
-        // Spill codec from config (zstd by default, the same fast codec
-        // standalone sort uses). `SortSpillDecompress` is codec-aware — it
-        // detects each spill chunk's codec from its file magic (see
-        // `slots_for_chunk_files`) and dispatches accordingly — so the streaming
-        // path no longer has to pin BGZF.
-        // Phase 1 (streaming) is capped by --sort-threads; this pool is Phase-1-only (dropped at finalize).
-        let pool = Arc::new(SortWorkerPool::new(
-            self.phase1_threads(),
-            self.temp_compression,
-            self.output_compression,
-            self.spill_codec,
-        ));
-        // Phase 1 is the steady-state ingest mode for incoming records.
-        pool.set_phase(crate::worker_pool::phase::PHASE1);
-
-        let (temp_dirs, alloc) = self.create_temp_dirs()?;
         let rayon_pool = self.build_sort_rayon_pool()?;
-
-        // The output header is owned by the chain builder (it injects @PG and the
-        // sort order onto the sink header); this stream's copy is used only to size
-        // the record buffer (nref), so it is not @PG-augmented here.
-        let header = header.clone();
-
-        // Estimate buffer capacity from initial_capacity (matching sort_coordinate_optimized).
         let nref = u32::try_from(header.reference_sequences().len())
             .context("reference sequence count exceeds u32::MAX")?;
         let init_cap = self.effective_initial_capacity();
-        // Per-record footprint: ~200 bytes BAM + 16 header + 24 ref = ~240 bytes
+        // Per-record footprint estimate matches `into_coordinate_stream`.
         let estimated_records = init_cap / 240;
-        let estimated_data_bytes = init_cap.saturating_sub(estimated_records * 24);
-        let buffer = RecordBuffer::with_capacity(estimated_records, estimated_data_bytes, nref);
-
-        Ok(CoordinateSortStream {
-            sorter: self,
-            pool,
-            _temp_dirs: temp_dirs,
-            alloc,
-            namer_chunk_count: 0,
-            namer_merge_count: 0,
-            chunk_files: Vec::new(),
+        // The data arena comes from the `ArenaPool` (acquired on the first
+        // `ensure_arena`), so the buffer starts with NO pre-allocated data
+        // segment (0 bytes) — only the refs Vec is pre-sized.
+        let buffer = RecordBuffer::with_capacity(estimated_records, 0, nref);
+        // Bounded reusable-arena pool (lever-1 RSS fix). Capacity 1 = legacy's
+        // one-arena-at-a-time footprint: the next chunk cannot fill until the
+        // prior chunk is spilled and its arena returns, bounding peak RSS to
+        // ~one arena ≈ base. (Tunable via `--sort-arenas` in a later increment.)
+        let arena_pool = crate::arena_pool::ArenaPool::new(1, crate::inline::SORT_SEGMENT_SIZE);
+        Ok(crate::chunk_sorter::CoordinateChunkSorter::new(
             buffer,
-            pending_spill: None,
             rayon_pool,
-            header,
-            stats: RawSortStats::default(),
-            timer: SortPhaseTimer::new(),
-            progress: ProgressTracker::new("Read records").with_interval(1_000_000),
-            probe: SpillProbe::new("phase1"),
-            finalized: false,
-        })
+            self.memory_limit,
+            arena_pool,
+        ))
     }
 
-    /// Convert this configured sorter into a streaming
-    /// template-coordinate-sort handle.
-    ///
-    /// Same shape as [`Self::into_coordinate_stream`] but uses
-    /// `TemplateRecordBuffer` and the template key (which incorporates
-    /// library, cell barcode, and MI in addition to coordinates).
+    /// Convert this configured sorter into a lean template-coordinate buffering
+    /// sorter for the P6 `SortBuffer` step (the template analogue of
+    /// [`Self::into_coordinate_chunk_sorter`] — same sizing as the retired
+    /// `into_template_coordinate_stream`, minus the pool/temp-dirs).
     ///
     /// # Errors
     ///
-    /// Returns an error if `self.sort_order` is not `TemplateCoordinate`,
-    /// if the temp directories cannot be created, or if the rayon sort
-    /// pool cannot be built.
-    pub fn into_template_coordinate_stream(
+    /// Returns an error if `self.sort_order` is not `TemplateCoordinate` or the
+    /// rayon sort pool cannot be built.
+    pub fn into_template_chunk_sorter(
         self,
         header: &Header,
-    ) -> Result<TemplateCoordinateSortStream> {
+    ) -> Result<crate::chunk_sorter::TemplateChunkSorter> {
         anyhow::ensure!(
             matches!(self.sort_order, SortOrder::TemplateCoordinate),
-            "into_template_coordinate_stream requires SortOrder::TemplateCoordinate (got {:?})",
+            "into_template_chunk_sorter requires SortOrder::TemplateCoordinate (got {:?})",
             self.sort_order,
         );
-        self.ensure_spill_codec_compat()?;
-
-        // Spill codec from config (see `into_coordinate_stream`): the streaming
-        // decoder is codec-aware, so honor `self.spill_codec` (zstd default).
-        // Phase 1 (streaming) is capped by --sort-threads; this pool is Phase-1-only (dropped at finalize).
-        let pool = Arc::new(SortWorkerPool::new(
-            self.phase1_threads(),
-            self.temp_compression,
-            self.output_compression,
-            self.spill_codec,
-        ));
-        pool.set_phase(crate::worker_pool::phase::PHASE1);
-
-        let (temp_dirs, alloc) = self.create_temp_dirs()?;
         let rayon_pool = self.build_sort_rayon_pool()?;
-
-        // Output header owned by the chain builder; stream copy used only for nref.
-        let header = header.clone();
-
-        let lib_lookup = LibraryLookup::from_header(&header);
+        let lib_lookup = LibraryLookup::from_header(header);
+        let header_library_varies = lib_lookup.distinct_header_ordinals() > 1;
         let cb_hasher = cb_hasher();
-
+        // Capacity hints for the lazily-built narrowed-key buffer. The variant
+        // (and thus the exact key width) is not known until the first record, so
+        // a key-width-agnostic estimate is used (the per-K ref-size difference is
+        // immaterial for a capacity hint).
         let init_cap = self.effective_initial_capacity();
         let bytes_per_record = 354;
         let estimated_records = init_cap / bytes_per_record;
         let estimated_data_bytes = init_cap * 86 / 100;
-        let buffer = TemplateRecordBuffer::with_capacity(estimated_records, estimated_data_bytes);
-
-        Ok(TemplateCoordinateSortStream {
-            sorter: self,
-            pool,
-            _temp_dirs: temp_dirs,
-            alloc,
-            namer_chunk_count: 0,
-            namer_merge_count: 0,
-            chunk_files: Vec::new(),
-            buffer,
-            pending_spill: None,
+        Ok(crate::chunk_sorter::TemplateChunkSorter::new(
             rayon_pool,
-            header,
+            self.memory_limit,
+            estimated_records,
+            estimated_data_bytes,
             lib_lookup,
             cb_hasher,
-            stats: RawSortStats::default(),
-            timer: SortPhaseTimer::new(),
-            progress: ProgressTracker::new("Read records").with_interval(1_000_000),
-            probe: SpillProbe::new("phase1"),
-            finalized: false,
-        })
-    }
-
-    /// Convert this configured sorter into a streaming queryname-sort handle.
-    ///
-    /// Same shape as [`Self::into_coordinate_stream`] but for queryname-order
-    /// sorts. The returned [`QuerynameSortStream`] is an enum dispatching to
-    /// the lex / natural variants based on `self.sort_order`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `self.sort_order` is not `Queryname(_)`, if the
-    /// temp directories cannot be created, or if the rayon sort pool cannot
-    /// be built.
-    pub fn into_queryname_stream(self, header: &Header) -> Result<QuerynameSortStream> {
-        use crate::keys::{QuerynameComparator, RawQuerynameKey, RawQuerynameLexKey};
-
-        let comparator = match self.sort_order {
-            SortOrder::Queryname(c) => c,
-            other => {
-                anyhow::bail!("into_queryname_stream requires SortOrder::Queryname (got {other:?})")
-            }
-        };
-
-        match comparator {
-            QuerynameComparator::Lexicographic => {
-                let inner = QuerynameSortStreamGeneric::<RawQuerynameLexKey>::new_from_sorter(
-                    self, header,
-                )?;
-                Ok(QuerynameSortStream::Lex(inner))
-            }
-            QuerynameComparator::Natural => {
-                let inner =
-                    QuerynameSortStreamGeneric::<RawQuerynameKey>::new_from_sorter(self, header)?;
-                Ok(QuerynameSortStream::Natural(inner))
-            }
-        }
+            self.cell_tag,
+            self.key_types,
+            header_library_varies,
+        ))
     }
 
     /// Create a new raw external sorter with the given sort order.
@@ -1667,7 +1603,12 @@ impl RawExternalSorter {
     }
 
     /// Effective Phase-1 worker count: `sort_threads` if set, else `threads`.
-    fn phase1_threads(&self) -> usize {
+    ///
+    /// Public so the streaming arena front (`SortBuffer::from_sorter`) sizes its
+    /// per-chunk sort with the resolved `--sort-threads` override rather than the
+    /// raw base `--threads` (`num_threads`), which silently ignores the override.
+    #[must_use]
+    pub fn phase1_threads(&self) -> usize {
         self.sort_threads.unwrap_or(self.threads).max(1)
     }
 
@@ -1701,8 +1642,8 @@ impl RawExternalSorter {
 
     /// Set the codec used for temporary chunk files.
     ///
-    /// Defaults to [`SpillCodec::Zstd`] which is significantly faster than
-    /// BGZF at comparable ratios for BAM-record data.
+    /// Defaults to [`SpillCodec::Zstd`](crate::codec::SpillCodec::Zstd) which is
+    /// significantly faster than BGZF at comparable ratios for BAM-record data.
     #[must_use]
     pub fn spill_codec(mut self, codec: crate::codec::SpillCodec) -> Self {
         self.spill_codec = codec;
@@ -3131,6 +3072,22 @@ impl RawExternalSorter {
         super::create_output_header(self.sort_order, header)
     }
 
+    /// Create the spill temp dirs + allocator for the P6 `CompressSpill` step.
+    ///
+    /// Public wrapper over [`Self::create_temp_dirs`]: honors `--temp-dir` /
+    /// `FGUMI_TMP_DIRS` (the configured `temp_dirs`) exactly as the legacy
+    /// streaming path does. The caller hands the [`Vec<TempDir>`] RAII handles to
+    /// `CompressSpill` (held for the step's lifetime) and the [`TmpDirAllocator`]
+    /// behind a shared mutex for per-file base-dir allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a temp directory cannot be created or has insufficient
+    /// free space.
+    pub fn create_spill_dirs(&self) -> Result<(Vec<TempDir>, TmpDirAllocator)> {
+        self.create_temp_dirs()
+    }
+
     /// Create per-base temp directories and an allocator over their subdirs.
     ///
     /// For each user-supplied base directory, a fresh sort-run subdirectory is
@@ -3554,7 +3511,7 @@ pub fn verify_dropped_lanes(
 }
 
 /// Build the actionable error message for a dropped-lane violation.
-fn dropped_lane_error(name: &str, v: DroppedLaneViolation) -> anyhow::Error {
+pub(crate) fn dropped_lane_error(name: &str, v: DroppedLaneViolation) -> anyhow::Error {
     let field = match v {
         DroppedLaneViolation::Cb => "CB",
         DroppedLaneViolation::Mi => "MI",
@@ -3567,963 +3524,55 @@ fn dropped_lane_error(name: &str, v: DroppedLaneViolation) -> anyhow::Error {
     )
 }
 
-/// Output of `*SortStream::into_slot_setup` — the raw materials a typed
-/// pipeline `SortMerge` step needs to build a slot-backed `MergeDriver`.
+/// Open `path` as a single [`SortMergeSlot`] with the given `file_id`.
 ///
-/// Produced by [`CoordinateSortStream::into_slot_setup`],
-/// [`TemplateCoordinateSortStream::into_slot_setup`], and
-/// [`QuerynameSortStreamGeneric::into_slot_setup`]. The caller (the
-/// unified-pipeline `SortAndSpill` step) decomposes this into
-/// `SortPhase1Event::SpillReady` events (one per slot) and
-/// `SortPhase1Event::MemoryChunk` events (one per memory chunk).
-pub struct SlotSetup<K: RawSortKey + Default + Send + 'static> {
-    /// One per spill file. Each slot owns a fresh `BufReader<File>`
-    /// positioned at byte 0 of the spill chunk.
-    pub slots: Vec<Arc<SortMergeSlot>>,
-    /// Already-sorted in-memory residual chunks (the par-sorted residual
-    /// buffer; one chunk for the in-memory fast path, multiple sub-chunks
-    /// for `par_sort_into_chunks` at multi-thread external-merge).
-    pub memory_chunks: Vec<Vec<(K, fgumi_raw_bam::RawRecord)>>,
-    /// RAII tempdir handles. Must outlive the slots' readers (the spill
-    /// files live inside these directories). The caller stashes them
-    /// somewhere with a lifetime that exceeds the merge phase.
-    pub temp_dirs: Vec<TempDir>,
-    /// `RawSortStats::total_records` at the moment ingestion completed.
-    /// Carried so the `SortAndSpill` step can stamp it on emitted events.
-    pub total_records: u64,
-}
-
-/// Helper: open the spill `chunk_files` as `Arc<SortMergeSlot>`s with
-/// sequential `file_id`s. Returns an error if any file fails to open.
-fn slots_for_chunk_files(chunk_files: &[std::path::PathBuf]) -> Result<Vec<Arc<SortMergeSlot>>> {
-    chunk_files
-        .iter()
-        .enumerate()
-        .map(|(idx, path)| {
-            let mut file = std::fs::File::open(path)
-                .with_context(|| format!("failed to open spill chunk {}", path.display()))?;
-            // Detect the spill codec from the file magic. For zstd ("ZSP1") the
-            // 4-byte magic is consumed here, leaving the reader at the first
-            // `[len][frame]` record; for BGZF the `1f 8b` is part of the first
-            // block, so rewind to byte 0. `SortSpillDecompress` reads
-            // `slot.codec` to decompress accordingly.
-            let mut magic = [0u8; 4];
-            let filled = read_exact_or_eof(&mut file, &mut magic)
-                .with_context(|| format!("failed to read spill chunk magic {}", path.display()))?;
-            let codec = if filled {
-                crate::codec::SpillCodec::from_magic(&magic)
-                    .unwrap_or(crate::codec::SpillCodec::Bgzf)
-            } else {
-                crate::codec::SpillCodec::Bgzf
-            };
-            if matches!(codec, crate::codec::SpillCodec::Bgzf) {
-                use std::io::Seek;
-                file.seek(std::io::SeekFrom::Start(0))
-                    .with_context(|| format!("failed to rewind spill chunk {}", path.display()))?;
-            }
-            let reader = std::io::BufReader::new(file);
-            let file_id = u32::try_from(idx)
-                .with_context(|| format!("spill file_id {idx} exceeds u32::MAX"))?;
-            Ok(Arc::new(SortMergeSlot::new(file_id, reader, codec)))
-        })
-        .collect()
-}
-
-/// Materialize main's `Vec<InMemoryChunk<K>>` (the `par_sort_into_chunks`
-/// output, whose records borrow a shared `SegmentedBuf`) into the
-/// `Vec<Vec<(K, RawRecord)>>` shape the typed-step merge protocol carries.
+/// The spill codec is auto-detected from the file magic: for zstd (`ZSP1`) the
+/// 4-byte magic is consumed here, leaving the reader at the first `[len][frame]`
+/// record; for BGZF the `1f 8b` is part of the first block, so the reader is
+/// rewound to byte 0. `SortSpillDecompress` reads `slot.codec` to decompress
+/// accordingly.
 ///
-/// The streaming pipeline path needs owned per-record `RawRecord`s because the
-/// memory chunks flow across `SortPhase1Event`/`SortPhase2Event` to a separate
-/// `SortMerge` step (the `SegmentedBuf` Arc would otherwise pin the whole sort
-/// buffer in the merge step). This matches the #330 representation; the
-/// `InMemoryChunk` sharing optimization stays on main's standalone-sort path.
-fn inmem_chunks_to_keyed<K: Default>(
-    chunks: Vec<crate::inline::InMemoryChunk<K>>,
-) -> Vec<Vec<(K, fgumi_raw_bam::RawRecord)>> {
-    chunks
-        .into_iter()
-        .map(|mut chunk| {
-            (0..chunk.len())
-                .map(|i| {
-                    let bytes = chunk.record_bytes(i).to_vec();
-                    let key = chunk.take_key(i);
-                    (key, fgumi_raw_bam::RawRecord::from(bytes))
-                })
-                .collect()
-        })
-        .collect()
+/// `file_id` is the slot's stable merge-order identifier — `SortMerge` orders
+/// sources by it so the `LoserTree` tie-break for equal sort keys matches the
+/// legacy chunk-files order. The P6 `CompressSpill` step passes a chunk's
+/// **logical spill index** here so the tie-break is independent of which worker
+/// happened to write the file.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened, its magic cannot be read, or
+/// (for BGZF) the rewind fails.
+pub fn open_spill_slot(path: &std::path::Path, file_id: u32) -> Result<Arc<SortMergeSlot>> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open spill chunk {}", path.display()))?;
+    let mut magic = [0u8; 4];
+    let filled = read_exact_or_eof(&mut file, &mut magic)
+        .with_context(|| format!("failed to read spill chunk magic {}", path.display()))?;
+    let codec = if filled {
+        crate::codec::SpillCodec::from_magic(&magic).unwrap_or(crate::codec::SpillCodec::Bgzf)
+    } else {
+        crate::codec::SpillCodec::Bgzf
+    };
+    if matches!(codec, crate::codec::SpillCodec::Bgzf) {
+        use std::io::Seek;
+        file.seek(std::io::SeekFrom::Start(0))
+            .with_context(|| format!("failed to rewind spill chunk {}", path.display()))?;
+    }
+    let reader = std::io::BufReader::new(file);
+    Ok(Arc::new(SortMergeSlot::new(file_id, reader, codec)))
 }
 
 // ============================================================================
 // CoordinateSortStream — streaming coordinate-sort handle
 // ============================================================================
 
-/// Streaming coordinate-sort handle. Constructed via
-/// [`RawExternalSorter::into_coordinate_stream`].
-///
-/// Push raw BAM records via [`Self::push_record`] one at a time; each push
-/// may opportunistically trigger an internal spill if the in-memory buffer
-/// crosses `memory_limit`. When input is drained, finalize via
-/// [`Self::into_slot_setup`], which returns the `SortMergeSlot`s + residual
-/// memory chunks for the typed-step `SortMerge` to drive.
-///
-/// Owns the per-sort `SortWorkerPool`, the temp-dir RAII handles (so spill
-/// files are cleaned up on drop), and all the per-sort buffer / progress
-/// state previously local to `sort_coordinate_optimized`. The
-/// `RawExternalSorter` itself is moved in for read-only access to its
-/// configuration.
-pub struct CoordinateSortStream {
-    /// Configuration source (`memory_limit`, `threads`, `max_temp_files`, etc.).
-    sorter: RawExternalSorter,
-    /// Shared worker pool for parallel spill compress/decompress.
-    pool: Arc<SortWorkerPool>,
-    /// RAII tempdir handles; kept alive until the stream is dropped so spill
-    /// files are cleaned up automatically.
-    _temp_dirs: Vec<TempDir>,
-    /// Allocates spill-file paths across one-or-more temp dirs.
-    alloc: TmpDirAllocator,
-    /// Persisted `ChunkNamer.chunk_count`. Re-attached to a fresh
-    /// `ChunkNamer` whenever we need to call `drain_pending_spill`.
-    namer_chunk_count: usize,
-    /// Persisted `ChunkNamer.merge_count`. Same role for consolidation paths.
-    namer_merge_count: usize,
-    chunk_files: Vec<PathBuf>,
-    buffer: RecordBuffer,
-    pending_spill: Option<PendingSpill>,
-    rayon_pool: rayon::ThreadPool,
-    /// Output BAM header (already augmented with `@PG` if `pg_info` was set).
-    header: Header,
-    stats: RawSortStats,
-    timer: SortPhaseTimer,
-    progress: ProgressTracker,
-    probe: SpillProbe,
-    /// Set after `into_slot_setup` runs; subsequent calls panic.
-    finalized: bool,
-}
-
-impl CoordinateSortStream {
-    /// Push one raw BAM record into the sort buffer. May trigger an
-    /// internal spill (buffer sort + write-to-disk) if the buffer crosses
-    /// `memory_limit`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the record cannot be parsed for the coordinate
-    /// key, if a spill write fails, or if a previous pending-spill drain
-    /// reports an error.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called after [`Self::into_slot_setup`] has consumed `self`.
-    pub fn push_record(&mut self, bam_bytes: &[u8]) -> Result<()> {
-        use crate::keys::RawCoordinateKey;
-
-        assert!(!self.finalized, "push_record called after into_slot_setup");
-
-        self.stats.total_records += 1;
-        self.progress.log_if_needed(1);
-
-        self.buffer.push_coordinate(bam_bytes)?;
-
-        if self.probe.should_sample_read(self.stats.total_records) {
-            self.probe
-                .log_mid_read(probe_stats(&self.buffer), Some(self.pool.phase1_queue_depths()));
-        }
-
-        if self.buffer.memory_usage() < self.sorter.memory_limit {
-            return Ok(());
-        }
-
-        // Spill threshold reached: drain previous pending spill, sort the
-        // current buffer, write a new spill chunk, and start a fresh buffer.
-        // This mirrors `sort_coordinate_optimized` line-for-line so the
-        // spill-pipeline behavior (start_finish + pending_spill overlap)
-        // is identical.
-        self.timer.end_read_span();
-        let bstats = probe_stats(&self.buffer);
-        let depths = Some(self.pool.phase1_queue_depths());
-        self.probe.pre_spill(bstats, depths);
-
-        // Borrow alloc + counters into a fresh ChunkNamer for the
-        // drain_pending_spill call (which may consolidate temp files).
-        let mut namer = ChunkNamer {
-            alloc: &mut self.alloc,
-            chunk_count: self.namer_chunk_count,
-            merge_count: self.namer_merge_count,
-        };
-        self.sorter.drain_pending_spill::<RawCoordinateKey>(
-            &mut self.pending_spill,
-            &mut self.chunk_files,
-            &mut self.stats,
-            &mut self.timer,
-            &mut namer,
-            &self.pool,
-        )?;
-        let chunk_path = namer.next_chunk_path()?;
-        self.namer_chunk_count = namer.chunk_count;
-        self.namer_merge_count = namer.merge_count;
-        // namer (which holds `&mut self.alloc`) goes out of scope at end of
-        // block, releasing the borrow before we touch self.buffer below.
-
-        self.probe.post_drain(probe_stats(&self.buffer), Some(self.pool.phase1_queue_depths()));
-
-        let buffer = &mut self.buffer;
-        let rayon_pool = &self.rayon_pool;
-        self.timer.time_sort(|| {
-            rayon_pool.install(|| buffer.par_sort());
-        });
-
-        let pool = &self.pool;
-        let buffer_ref = &self.buffer;
-        let chunk_path_clone = chunk_path.clone();
-        let handle = self.timer.time_spill_write(|| {
-            let mut writer = PooledChunkWriter::<RawCoordinateKey>::new(
-                Arc::clone(pool),
-                &chunk_path_clone,
-                pool.spill_codec(),
-            )?;
-            for r in buffer_ref.refs() {
-                let key = RawCoordinateKey { sort_key: r.sort_key };
-                let record_bytes = buffer_ref.get_record(r);
-                writer.write_record(&key, record_bytes)?;
-            }
-            writer.start_finish()
-        })?;
-
-        self.pending_spill = Some(PendingSpill { handle, chunk_path });
-
-        self.buffer.clear();
-        force_mi_collect();
-        self.probe.post_spill(Some(self.pool.phase1_queue_depths()));
-        self.timer.begin_read_span();
-
-        Ok(())
-    }
-
-    /// Push a batch of records via [`Self::push_record`] in one call.
-    ///
-    /// Identical semantics to invoking `push_record` per record — the
-    /// per-record work (sort-key extraction + buffer copy + memory-limit
-    /// check + opportunistic spill) still runs per record. The win is
-    /// the call-boundary savings at the typed-step caller (one
-    /// `SortInner` enum dispatch per batch instead of per record).
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::push_record`].
-    ///
-    /// # Panics
-    ///
-    /// Same as [`Self::push_record`].
-    pub fn push_records<'a, I: IntoIterator<Item = &'a [u8]>>(&mut self, iter: I) -> Result<()> {
-        for bytes in iter {
-            self.push_record(bytes)?;
-        }
-        Ok(())
-    }
-
-    /// Finalize the stream for the typed-step pipeline: return raw
-    /// `SortMergeSlot`s and memory chunks for a typed-step `SortMerge` to
-    /// drive. See [`SlotSetup`] for the output shape.
-    ///
-    /// Performs the same prologue (drain pending spill, par-sort residual
-    /// buffer matching legacy tie-break), but opens fresh `BufReader`s
-    /// for each spill chunk file inside the returned slots and skips
-    /// pool Phase 2 activation (slots are independent of the pool —
-    /// `SortSpillDecompress` will drive disk I/O via the slots' own
-    /// readers).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a pending-spill drain fails, the residual-buffer
-    /// sort fails, or a spill chunk file cannot be opened for its slot reader.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called twice on the same stream.
-    pub fn into_slot_setup(mut self) -> Result<SlotSetup<crate::keys::RawCoordinateKey>> {
-        use crate::keys::RawCoordinateKey;
-
-        assert!(!self.finalized, "into_slot_setup called twice");
-        self.finalized = true;
-
-        self.pool.set_main_thread(std::thread::current());
-        self.timer.end_read_span();
-
-        let mut namer = ChunkNamer {
-            alloc: &mut self.alloc,
-            chunk_count: self.namer_chunk_count,
-            merge_count: self.namer_merge_count,
-        };
-        self.sorter.drain_pending_spill::<RawCoordinateKey>(
-            &mut self.pending_spill,
-            &mut self.chunk_files,
-            &mut self.stats,
-            &mut self.timer,
-            &mut namer,
-            &self.pool,
-        )?;
-        self.namer_chunk_count = namer.chunk_count;
-        self.namer_merge_count = namer.merge_count;
-
-        self.probe.phase1_end(self.buffer.memory_usage() as u64);
-
-        // No-spill path uses `par_sort` (global sort) + parallel
-        // `par_iter` collect, producing ONE memory chunk. This keeps
-        // the downstream `MergeDriver::from_slots` LoserTree at a
-        // single source (no per-record heap comparisons in the merge
-        // hot path) while still parallelizing the per-record
-        // `RawRecord::from(...to_vec())` allocations across rayon
-        // threads (the dominant cost at 5M+ records). With-spill
-        // path keeps `par_sort_into_chunks` since merge is unavoidable
-        // there anyway (one source per spill file + memory chunks).
-        let memory_chunks: Vec<Vec<(RawCoordinateKey, fgumi_raw_bam::RawRecord)>> =
-            if self.buffer.is_empty() {
-                Vec::new()
-            } else if self.chunk_files.is_empty() {
-                let buffer = &mut self.buffer;
-                let rayon_pool = &self.rayon_pool;
-                self.timer.time_sort(|| {
-                    rayon_pool.install(|| buffer.par_sort());
-                });
-                let chunk = rayon_pool.install(|| {
-                    use rayon::prelude::*;
-                    self.buffer
-                        .refs()
-                        .par_iter()
-                        .map(|r| {
-                            let key = RawCoordinateKey { sort_key: r.sort_key };
-                            let bytes = self.buffer.get_record(r);
-                            (key, fgumi_raw_bam::RawRecord::from(bytes.to_vec()))
-                        })
-                        .collect::<Vec<_>>()
-                });
-                vec![chunk]
-            } else if self.sorter.phase1_threads() > 1 {
-                let buffer = &mut self.buffer;
-                let rayon_pool = &self.rayon_pool;
-                let threads = self.sorter.phase1_threads();
-                inmem_chunks_to_keyed(
-                    self.timer
-                        .time_sort(|| rayon_pool.install(|| buffer.par_sort_into_chunks(threads))),
-                )
-            } else {
-                let buffer = &mut self.buffer;
-                let rayon_pool = &self.rayon_pool;
-                self.timer.time_sort(|| {
-                    rayon_pool.install(|| buffer.par_sort());
-                });
-                let chunk = self
-                    .buffer
-                    .refs()
-                    .iter()
-                    .map(|r| {
-                        let key = RawCoordinateKey { sort_key: r.sort_key };
-                        (key, fgumi_raw_bam::RawRecord::from(self.buffer.get_record(r).to_vec()))
-                    })
-                    .collect();
-                vec![chunk]
-            };
-
-        let chunk_files = std::mem::take(&mut self.chunk_files);
-        #[allow(
-            clippy::used_underscore_binding,
-            reason = "_temp_dirs is RAII-only on the *SortStream; into_slot_setup hands ownership to the caller for the lifetime of the merge"
-        )]
-        let temp_dirs = std::mem::take(&mut self._temp_dirs);
-        let total_records = self.stats.total_records;
-        let slots = slots_for_chunk_files(&chunk_files)?;
-
-        Ok(SlotSetup { slots, memory_chunks, temp_dirs, total_records })
-    }
-}
-
 // ============================================================================
 // QuerynameSortStream — streaming queryname-sort handle (lex or natural)
 // ============================================================================
 
-/// Streaming queryname-sort handle. Constructed via
-/// [`RawExternalSorter::into_queryname_stream`].
-///
-/// Wraps the per-comparator generic [`QuerynameSortStreamGeneric`] so callers
-/// can hold a single concrete type regardless of the sub-order
-/// (lexicographic vs natural). Operations on the stream dispatch to the
-/// underlying generic via the inner enum variant.
-pub enum QuerynameSortStream {
-    /// Lexicographic comparator (default for `--order queryname`).
-    Lex(QuerynameSortStreamGeneric<crate::keys::RawQuerynameLexKey>),
-    /// Natural comparator (samtools-compatible).
-    Natural(QuerynameSortStreamGeneric<crate::keys::RawQuerynameKey>),
-}
-
-impl QuerynameSortStream {
-    /// Push one raw BAM record into the sort buffer. May trigger an
-    /// internal spill if the in-memory buffer crosses `memory_limit`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a spill write fails or a previous pending-spill
-    /// drain reports an error.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called after [`Self::into_slot_setup`] has consumed `self`.
-    pub fn push_record(&mut self, bam_bytes: &[u8]) -> Result<()> {
-        match self {
-            Self::Lex(s) => s.push_record(bam_bytes),
-            Self::Natural(s) => s.push_record(bam_bytes),
-        }
-    }
-
-    /// Push a batch of records via [`Self::push_record`] in one call.
-    /// See [`CoordinateSortStream::push_records`] for the rationale.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::push_record`].
-    ///
-    /// # Panics
-    ///
-    /// Same as [`Self::push_record`].
-    pub fn push_records<'a, I: IntoIterator<Item = &'a [u8]>>(&mut self, iter: I) -> Result<()> {
-        match self {
-            Self::Lex(s) => s.push_records(iter),
-            Self::Natural(s) => s.push_records(iter),
-        }
-    }
-}
-
-/// Generic queryname-sort stream over the comparator key type
-/// (`RawQuerynameLexKey` or `RawQuerynameKey`). Mirrors
-/// [`CoordinateSortStream`] but stores entries as `Vec<(K, RawRecord)>`
-/// instead of an inline arena, matching today's `sort_queryname_keyed`.
-pub struct QuerynameSortStreamGeneric<K: RawSortKey + Default + 'static> {
-    sorter: RawExternalSorter,
-    pool: Arc<SortWorkerPool>,
-    _temp_dirs: Vec<TempDir>,
-    alloc: TmpDirAllocator,
-    namer_chunk_count: usize,
-    namer_merge_count: usize,
-    chunk_files: Vec<PathBuf>,
-    entries: Vec<(K, fgumi_raw_bam::RawRecord)>,
-    memory_used: usize,
-    pending_spill: Option<PendingSpill>,
-    rayon_pool: rayon::ThreadPool,
-    header: Header,
-    ctx: crate::keys::SortContext,
-    stats: RawSortStats,
-    timer: SortPhaseTimer,
-    progress: ProgressTracker,
-    probe: SpillProbe,
-    finalized: bool,
-}
-
-impl<K: RawSortKey + Default + 'static> QuerynameSortStreamGeneric<K> {
-    /// Construct from a `RawExternalSorter` config. Caller (via
-    /// [`RawExternalSorter::into_queryname_stream`]) is responsible for
-    /// matching the `sort_order` to `K`.
-    fn new_from_sorter(sorter: RawExternalSorter, header: &Header) -> Result<Self> {
-        use crate::keys::SortContext;
-
-        sorter.ensure_spill_codec_compat()?;
-
-        // Spill codec from config (see `into_coordinate_stream`): the streaming
-        // decoder is codec-aware, so honor `sorter.spill_codec` (zstd default).
-        // Phase 1 (streaming) is capped by --sort-threads; this pool is Phase-1-only (dropped at finalize).
-        let pool = Arc::new(SortWorkerPool::new(
-            sorter.phase1_threads(),
-            sorter.temp_compression,
-            sorter.output_compression,
-            sorter.spill_codec,
-        ));
-        pool.set_phase(crate::worker_pool::phase::PHASE1);
-
-        let (temp_dirs, alloc) = sorter.create_temp_dirs()?;
-        let rayon_pool = sorter.build_sort_rayon_pool()?;
-
-        // Output header owned by the chain builder; stream copy used only for nref/ctx.
-        let header = header.clone();
-
-        let ctx = SortContext::from_header(&header);
-        let init_cap = sorter.effective_initial_capacity();
-        let estimated_records = init_cap / 300;
-
-        Ok(Self {
-            sorter,
-            pool,
-            _temp_dirs: temp_dirs,
-            alloc,
-            namer_chunk_count: 0,
-            namer_merge_count: 0,
-            chunk_files: Vec::new(),
-            entries: Vec::with_capacity(estimated_records),
-            memory_used: 0,
-            pending_spill: None,
-            rayon_pool,
-            header,
-            ctx,
-            stats: RawSortStats::default(),
-            timer: SortPhaseTimer::new(),
-            progress: ProgressTracker::new("Read records").with_interval(1_000_000),
-            probe: SpillProbe::new("phase1"),
-            finalized: false,
-        })
-    }
-
-    /// Push one raw BAM record. See [`QuerynameSortStream::push_record`].
-    ///
-    /// # Errors
-    ///
-    /// Propagates any spill-compression or I/O error that fires when the
-    /// in-memory buffer hits `memory_limit` and the chunk must be flushed.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called after [`Self::into_slot_setup`] has finalized
-    /// the stream.
-    pub fn push_record(&mut self, bam_bytes: &[u8]) -> Result<()> {
-        assert!(!self.finalized, "push_record called after into_slot_setup");
-
-        self.stats.total_records += 1;
-        self.progress.log_if_needed(1);
-
-        let key = K::extract(bam_bytes, &self.ctx);
-        let record_size = bam_bytes.len() + 50; // approximate key overhead
-        self.memory_used += record_size;
-        self.entries.push((key, fgumi_raw_bam::RawRecord::from(bam_bytes.to_vec())));
-
-        if self.probe.should_sample_read(self.stats.total_records) {
-            let bstats =
-                BufferProbeStats::simple(self.memory_used as u64, self.entries.len() as u64);
-            self.probe.log_mid_read(bstats, Some(self.pool.phase1_queue_depths()));
-        }
-
-        if self.memory_used < self.sorter.memory_limit {
-            return Ok(());
-        }
-
-        // Spill threshold reached — same shape as sort_queryname_keyed.
-        self.timer.end_read_span();
-        let bstats = BufferProbeStats::simple(self.memory_used as u64, self.entries.len() as u64);
-        let depths = Some(self.pool.phase1_queue_depths());
-        self.probe.pre_spill(bstats, depths);
-
-        let mut namer = ChunkNamer {
-            alloc: &mut self.alloc,
-            chunk_count: self.namer_chunk_count,
-            merge_count: self.namer_merge_count,
-        };
-        self.sorter.drain_pending_spill::<K>(
-            &mut self.pending_spill,
-            &mut self.chunk_files,
-            &mut self.stats,
-            &mut self.timer,
-            &mut namer,
-            &self.pool,
-        )?;
-        let chunk_path = namer.next_chunk_path()?;
-        self.namer_chunk_count = namer.chunk_count;
-        self.namer_merge_count = namer.merge_count;
-
-        self.probe.post_drain(bstats, Some(self.pool.phase1_queue_depths()));
-
-        let entries = &mut self.entries;
-        let rayon_pool = &self.rayon_pool;
-        self.timer.time_sort(|| {
-            use rayon::prelude::*;
-            rayon_pool.install(|| entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0)));
-        });
-
-        let pool = &self.pool;
-        let entries_drain = &mut self.entries;
-        let chunk_path_clone = chunk_path.clone();
-        let handle = self.timer.time_spill_write(|| {
-            let mut writer = PooledChunkWriter::<K>::new(
-                Arc::clone(pool),
-                &chunk_path_clone,
-                pool.spill_codec(),
-            )?;
-            for (key, record) in entries_drain.drain(..) {
-                writer.write_record(&key, record.as_ref())?;
-            }
-            writer.start_finish()
-        })?;
-
-        self.pending_spill = Some(PendingSpill { handle, chunk_path });
-
-        self.memory_used = 0;
-        force_mi_collect();
-        self.probe.post_spill(Some(self.pool.phase1_queue_depths()));
-        self.timer.begin_read_span();
-
-        Ok(())
-    }
-
-    /// Push a batch of records via [`Self::push_record`] in one call.
-    /// See [`CoordinateSortStream::push_records`] for the rationale.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::push_record`].
-    ///
-    /// # Panics
-    ///
-    /// Same as [`Self::push_record`].
-    pub fn push_records<'a, I: IntoIterator<Item = &'a [u8]>>(&mut self, iter: I) -> Result<()> {
-        for bytes in iter {
-            self.push_record(bytes)?;
-        }
-        Ok(())
-    }
-
-    /// Finalize the stream for the typed-step pipeline: drain pending spill,
-    /// par-sort the residual buffer, and return `SortMergeSlot`s + memory
-    /// chunks. See [`CoordinateSortStream::into_slot_setup`] for the contract.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a pending-spill drain fails, the residual-buffer
-    /// sort fails, or a spill chunk file cannot be opened for its slot reader.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called twice on the same stream.
-    pub fn into_slot_setup(mut self) -> Result<SlotSetup<K>>
-    where
-        K: Send,
-    {
-        assert!(!self.finalized, "into_slot_setup called twice");
-        self.finalized = true;
-
-        self.pool.set_main_thread(std::thread::current());
-        self.timer.end_read_span();
-
-        let mut namer = ChunkNamer {
-            alloc: &mut self.alloc,
-            chunk_count: self.namer_chunk_count,
-            merge_count: self.namer_merge_count,
-        };
-        self.sorter.drain_pending_spill::<K>(
-            &mut self.pending_spill,
-            &mut self.chunk_files,
-            &mut self.stats,
-            &mut self.timer,
-            &mut namer,
-            &self.pool,
-        )?;
-        self.namer_chunk_count = namer.chunk_count;
-        self.namer_merge_count = namer.merge_count;
-
-        self.probe.phase1_end(self.memory_used as u64);
-
-        let memory_chunks: Vec<Vec<(K, fgumi_raw_bam::RawRecord)>> = if self.entries.is_empty() {
-            Vec::new()
-        } else if self.chunk_files.is_empty() {
-            let entries = &mut self.entries;
-            let rayon_pool = &self.rayon_pool;
-            if self.sorter.phase1_threads() > 1 {
-                self.timer.time_sort(|| {
-                    use rayon::prelude::*;
-                    rayon_pool.install(|| entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0)));
-                });
-            } else {
-                self.timer.time_sort(|| {
-                    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                });
-            }
-            vec![std::mem::take(&mut self.entries)]
-        } else if self.sorter.phase1_threads() > 1 {
-            let entries = &mut self.entries;
-            let rayon_pool = &self.rayon_pool;
-            let threads = self.sorter.phase1_threads();
-            self.timer.time_sort(|| {
-                use rayon::prelude::*;
-                let chunk_size = entries.len().div_ceil(threads.max(1));
-                rayon_pool.install(|| {
-                    entries.par_chunks_mut(chunk_size).for_each(|chunk| {
-                        chunk.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                    });
-                });
-                let mut remaining = std::mem::take(entries);
-                let num_chunks = remaining.len().div_ceil(chunk_size);
-                let mut chunks: Vec<Vec<(K, fgumi_raw_bam::RawRecord)>> =
-                    Vec::with_capacity(num_chunks);
-                let tail_len = remaining.len() % chunk_size;
-                if tail_len != 0 {
-                    let split_at = remaining.len() - tail_len;
-                    chunks.push(remaining.split_off(split_at));
-                }
-                while !remaining.is_empty() {
-                    let split_at = remaining.len().saturating_sub(chunk_size);
-                    chunks.push(remaining.split_off(split_at));
-                }
-                chunks.reverse();
-                chunks
-            })
-        } else {
-            let entries = &mut self.entries;
-            self.timer.time_sort(|| {
-                entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            });
-            vec![std::mem::take(&mut self.entries)]
-        };
-
-        let chunk_files = std::mem::take(&mut self.chunk_files);
-        #[allow(
-            clippy::used_underscore_binding,
-            reason = "_temp_dirs is RAII-only on the *SortStream; into_slot_setup hands ownership to the caller"
-        )]
-        let temp_dirs = std::mem::take(&mut self._temp_dirs);
-        let total_records = self.stats.total_records;
-        let slots = slots_for_chunk_files(&chunk_files)?;
-
-        Ok(SlotSetup { slots, memory_chunks, temp_dirs, total_records })
-    }
-}
-
 // ============================================================================
 // TemplateCoordinateSortStream — streaming template-coordinate-sort handle
 // ============================================================================
-
-/// Streaming template-coordinate-sort handle. Constructed via
-/// [`RawExternalSorter::into_template_coordinate_stream`].
-///
-/// Same shape as [`CoordinateSortStream`] but uses [`TemplateRecordBuffer`]
-/// and the packed [`TemplateKey`] (which incorporates library, cell
-/// barcode, and MI in addition to coordinates). Mirrors
-/// `sort_template_coordinate` line-for-line so spill / merge / fast-path
-/// semantics match.
-pub struct TemplateCoordinateSortStream {
-    sorter: RawExternalSorter,
-    pool: Arc<SortWorkerPool>,
-    _temp_dirs: Vec<TempDir>,
-    alloc: TmpDirAllocator,
-    namer_chunk_count: usize,
-    namer_merge_count: usize,
-    chunk_files: Vec<PathBuf>,
-    buffer: TemplateRecordBuffer<TemplateKey>,
-    pending_spill: Option<PendingSpill>,
-    rayon_pool: rayon::ThreadPool,
-    header: Header,
-    lib_lookup: LibraryLookup,
-    cb_hasher: ahash::RandomState,
-    stats: RawSortStats,
-    timer: SortPhaseTimer,
-    progress: ProgressTracker,
-    probe: SpillProbe,
-    finalized: bool,
-}
-
-impl TemplateCoordinateSortStream {
-    /// Push one raw BAM record. May trigger an internal spill.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a spill write fails, the buffer push fails, or
-    /// a previous pending-spill drain reports an error.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called after [`Self::into_slot_setup`] has consumed `self`.
-    pub fn push_record(&mut self, bam_bytes: &[u8]) -> Result<()> {
-        assert!(!self.finalized, "push_record called after into_slot_setup");
-
-        self.stats.total_records += 1;
-        self.progress.log_if_needed(1);
-
-        let key = extract_template_key_inline(
-            bam_bytes,
-            &self.lib_lookup,
-            self.sorter.cell_tag,
-            &self.cb_hasher,
-        );
-        self.buffer.push(bam_bytes, key)?;
-
-        if self.probe.should_sample_read(self.stats.total_records) {
-            self.probe
-                .log_mid_read(probe_stats(&self.buffer), Some(self.pool.phase1_queue_depths()));
-        }
-
-        if self.buffer.memory_usage() < self.sorter.memory_limit {
-            return Ok(());
-        }
-
-        // Spill threshold reached.
-        self.timer.end_read_span();
-        let bstats = probe_stats(&self.buffer);
-        let depths = Some(self.pool.phase1_queue_depths());
-        self.probe.pre_spill(bstats, depths);
-
-        let mut namer = ChunkNamer {
-            alloc: &mut self.alloc,
-            chunk_count: self.namer_chunk_count,
-            merge_count: self.namer_merge_count,
-        };
-        self.sorter.drain_pending_spill::<TemplateKey>(
-            &mut self.pending_spill,
-            &mut self.chunk_files,
-            &mut self.stats,
-            &mut self.timer,
-            &mut namer,
-            &self.pool,
-        )?;
-        let chunk_path = namer.next_chunk_path()?;
-        self.namer_chunk_count = namer.chunk_count;
-        self.namer_merge_count = namer.merge_count;
-
-        self.probe.post_drain(probe_stats(&self.buffer), Some(self.pool.phase1_queue_depths()));
-
-        let buffer = &mut self.buffer;
-        let rayon_pool = &self.rayon_pool;
-        self.timer.time_sort(|| {
-            rayon_pool.install(|| buffer.par_sort());
-        });
-
-        let pool = &self.pool;
-        let buffer_ref = &self.buffer;
-        let chunk_path_clone = chunk_path.clone();
-        let handle = self.timer.time_spill_write(|| {
-            let mut writer = PooledChunkWriter::<TemplateKey>::new(
-                Arc::clone(pool),
-                &chunk_path_clone,
-                pool.spill_codec(),
-            )?;
-            for (key, record) in buffer_ref.iter_sorted_keyed() {
-                writer.write_record(&key, record)?;
-            }
-            writer.start_finish()
-        })?;
-
-        self.pending_spill = Some(PendingSpill { handle, chunk_path });
-
-        self.buffer.clear();
-        force_mi_collect();
-        self.probe.post_spill(Some(self.pool.phase1_queue_depths()));
-        self.timer.begin_read_span();
-
-        Ok(())
-    }
-
-    /// Push a batch of records via [`Self::push_record`] in one call.
-    /// See [`CoordinateSortStream::push_records`] for the rationale.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::push_record`].
-    ///
-    /// # Panics
-    ///
-    /// Same as [`Self::push_record`].
-    pub fn push_records<'a, I: IntoIterator<Item = &'a [u8]>>(&mut self, iter: I) -> Result<()> {
-        for bytes in iter {
-            self.push_record(bytes)?;
-        }
-        Ok(())
-    }
-
-    /// Finalize the stream for the typed-step pipeline: drain pending spill,
-    /// par-sort the residual buffer, and return `SortMergeSlot`s + memory
-    /// chunks. See [`CoordinateSortStream::into_slot_setup`] for the contract.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a pending-spill drain fails, the residual-buffer
-    /// sort fails, or a spill chunk file cannot be opened for its slot reader.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called twice on the same stream.
-    pub fn into_slot_setup(mut self) -> Result<SlotSetup<TemplateKey>> {
-        assert!(!self.finalized, "into_slot_setup called twice");
-        self.finalized = true;
-
-        self.pool.set_main_thread(std::thread::current());
-        self.timer.end_read_span();
-
-        let mut namer = ChunkNamer {
-            alloc: &mut self.alloc,
-            chunk_count: self.namer_chunk_count,
-            merge_count: self.namer_merge_count,
-        };
-        self.sorter.drain_pending_spill::<TemplateKey>(
-            &mut self.pending_spill,
-            &mut self.chunk_files,
-            &mut self.stats,
-            &mut self.timer,
-            &mut namer,
-            &self.pool,
-        )?;
-        self.namer_chunk_count = namer.chunk_count;
-        self.namer_merge_count = namer.merge_count;
-
-        self.probe.phase1_end(self.buffer.memory_usage() as u64);
-
-        // No-spill path uses `par_sort` (global sort) + parallel
-        // `par_iter` collect, producing ONE memory chunk. This keeps
-        // the downstream `MergeDriver::from_slots` LoserTree at a
-        // single source (no per-record heap comparisons in the merge
-        // hot path) while still parallelizing the per-record
-        // `RawRecord::from(...to_vec())` allocations across rayon
-        // threads (the dominant cost at 5M+ records). With-spill
-        // path keeps `par_sort_into_chunks` since merge is unavoidable
-        // there anyway (one source per spill file + memory chunks).
-        let memory_chunks: Vec<Vec<(TemplateKey, fgumi_raw_bam::RawRecord)>> =
-            if self.buffer.is_empty() {
-                Vec::new()
-            } else if self.chunk_files.is_empty() {
-                let buffer = &mut self.buffer;
-                let rayon_pool = &self.rayon_pool;
-                self.timer.time_sort(|| {
-                    rayon_pool.install(|| buffer.par_sort());
-                });
-                let chunk = rayon_pool.install(|| {
-                    use rayon::prelude::*;
-                    self.buffer
-                        .refs()
-                        .par_iter()
-                        .map(|r| {
-                            let key = self.buffer.get_key(r);
-                            let bytes = self.buffer.get_record(r);
-                            (key, fgumi_raw_bam::RawRecord::from(bytes.to_vec()))
-                        })
-                        .collect::<Vec<_>>()
-                });
-                vec![chunk]
-            } else if self.sorter.phase1_threads() > 1 {
-                let buffer = &mut self.buffer;
-                let rayon_pool = &self.rayon_pool;
-                let threads = self.sorter.phase1_threads();
-                inmem_chunks_to_keyed(
-                    self.timer
-                        .time_sort(|| rayon_pool.install(|| buffer.par_sort_into_chunks(threads))),
-                )
-            } else {
-                let buffer = &mut self.buffer;
-                let rayon_pool = &self.rayon_pool;
-                self.timer.time_sort(|| {
-                    rayon_pool.install(|| buffer.par_sort());
-                });
-                let chunk = self
-                    .buffer
-                    .iter_sorted_keyed()
-                    .map(|(k, r)| (k, fgumi_raw_bam::RawRecord::from(r.to_vec())))
-                    .collect();
-                vec![chunk]
-            };
-
-        let chunk_files = std::mem::take(&mut self.chunk_files);
-        #[allow(
-            clippy::used_underscore_binding,
-            reason = "_temp_dirs is RAII-only on the *SortStream; into_slot_setup hands ownership to the caller"
-        )]
-        let temp_dirs = std::mem::take(&mut self._temp_dirs);
-        let total_records = self.stats.total_records;
-        let slots = slots_for_chunk_files(&chunk_files)?;
-
-        Ok(SlotSetup { slots, memory_chunks, temp_dirs, total_records })
-    }
-}
 
 // ============================================================================
 // Streaming-sort merge path (unified pipeline `SortMerge` step)
@@ -4825,8 +3874,13 @@ enum SlotMergeSource<K: RawSortKey + Default + 'static> {
     /// `slot.decompressed` with decompressed blocks; this driver reads them
     /// in-order via the per-source [`SlotParserState`].
     Slot { slot: Arc<crate::merge_slots::SortMergeSlot>, parser: SlotParserState },
-    /// In-memory sorted residual records from the inline buffer.
+    /// In-memory sorted residual records from a queryname-style sort (each
+    /// record an owned `RawRecord`). Read via a zero-copy `mem::swap` bridge.
     Memory { records: Vec<(K, fgumi_raw_bam::RawRecord)>, idx: usize },
+    /// In-memory sorted residual from an inline-buffer (coordinate / template)
+    /// sort, sharing an `Arc<SegmentedBuf>` — zero per-record allocation. Read
+    /// copies each record's bytes into the caller's reused `buf`.
+    MemoryShared { chunk: InMemoryChunk<K>, idx: usize },
 }
 
 impl<K: RawSortKey + Default + 'static> SlotMergeSource<K> {
@@ -4842,6 +3896,20 @@ impl<K: RawSortKey + Default + 'static> SlotMergeSource<K> {
                     // avoid re-allocating. The caller's buf is a plain Vec<u8>.
                     std::mem::swap(buf, data.as_mut_vec());
                     let key = std::mem::take(key);
+                    *idx += 1;
+                    Ok(TryRead::Ready(Some(key)))
+                } else {
+                    Ok(TryRead::Ready(None))
+                }
+            }
+            SlotMergeSource::MemoryShared { chunk, idx } => {
+                if *idx < chunk.len() {
+                    // Bytes are borrowed from the shared `Arc<SegmentedBuf>`, so
+                    // copy them into the caller's reused `buf` (one memcpy, no
+                    // per-record allocation — the materialise-time copy is gone).
+                    buf.clear();
+                    buf.extend_from_slice(chunk.record_bytes(*idx));
+                    let key = chunk.take_key(*idx);
                     *idx += 1;
                     Ok(TryRead::Ready(Some(key)))
                 } else {
@@ -4939,11 +4007,11 @@ impl<K: RawSortKey + Default + Send + 'static> MergeDriver<K> {
     #[must_use]
     pub fn from_slots(
         slots: Vec<Arc<crate::merge_slots::SortMergeSlot>>,
-        memory_chunks: Vec<Vec<(K, fgumi_raw_bam::RawRecord)>>,
+        memory: MemorySources<K>,
         total_records: u64,
     ) -> Self {
         let num_slots = slots.len();
-        let num_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
+        let num_memory = memory.num_non_empty();
         let num_sources = num_slots + num_memory;
 
         if num_slots > 0 {
@@ -4956,9 +4024,20 @@ impl<K: RawSortKey + Default + Send + 'static> MergeDriver<K> {
         for slot in slots {
             sources.push(SlotMergeSource::Slot { slot, parser: SlotParserState::new() });
         }
-        for chunk in memory_chunks {
-            if !chunk.is_empty() {
-                sources.push(SlotMergeSource::Memory { records: chunk, idx: 0 });
+        match memory {
+            MemorySources::Owned(chunks) => {
+                for chunk in chunks {
+                    if !chunk.is_empty() {
+                        sources.push(SlotMergeSource::Memory { records: chunk, idx: 0 });
+                    }
+                }
+            }
+            MemorySources::Shared(chunks) => {
+                for chunk in chunks {
+                    if !chunk.is_empty() {
+                        sources.push(SlotMergeSource::MemoryShared { chunk, idx: 0 });
+                    }
+                }
             }
         }
 
@@ -5264,6 +4343,12 @@ mod tests {
         // sort_threads overrides only Phase 1.
         let sort_only = new().sort_threads(2);
         assert_eq!((sort_only.phase1_threads(), sort_only.phase2_threads()), (2, 8));
+        // The public `num_threads()` accessor returns the BASE count, unaffected
+        // by the Phase-1 override — so the streaming front must read
+        // `phase1_threads()`, not `num_threads()`, to honor `--sort-threads`
+        // (the D1.1 regression was reading the base here). Pin the distinction.
+        assert_eq!(sort_only.num_threads(), 8);
+        assert_eq!(sort_only.phase1_threads(), 2);
         // merge_threads overrides only Phase 2.
         let merge_only = new().merge_threads(3);
         assert_eq!((merge_only.phase1_threads(), merge_only.phase2_threads()), (8, 3));
@@ -5405,69 +4490,6 @@ mod tests {
         );
     }
 
-    /// Build a streaming sorter for `order` with `threads(4)` and the optional
-    /// `sort_threads` cap, returning its Phase-1 `SortWorkerPool` worker count.
-    /// Centralizes the per-order stream-constructor dispatch so the pool-sizing
-    /// assertion can be parameterized.
-    fn streaming_phase1_pool_workers(order: SortOrder, sort_threads: Option<usize>) -> usize {
-        use noodles::sam::Header;
-
-        let header = Header::default();
-        let mut sorter = RawExternalSorter::new(order).threads(4);
-        if let Some(j) = sort_threads {
-            sorter = sorter.sort_threads(j);
-        }
-        match order {
-            SortOrder::Coordinate => sorter
-                .into_coordinate_stream(&header)
-                .expect("coordinate stream")
-                .pool
-                .num_workers(),
-            SortOrder::TemplateCoordinate => sorter
-                .into_template_coordinate_stream(&header)
-                .expect("template-coordinate stream")
-                .pool
-                .num_workers(),
-            SortOrder::Queryname(_) => {
-                match sorter.into_queryname_stream(&header).expect("queryname stream") {
-                    QuerynameSortStream::Lex(s) => s.pool.num_workers(),
-                    QuerynameSortStream::Natural(s) => s.pool.num_workers(),
-                }
-            }
-        }
-    }
-
-    /// The streaming Phase-1 `SortWorkerPool` must be sized to `phase1_threads()`,
-    /// not `threads`. When `sort_threads` is set, the pool must reflect the cap;
-    /// when it is unset, the pool has the full `threads` count. One case per
-    /// (order, split-state) so a failure names the exact combination.
-    #[rstest::rstest]
-    #[case::coordinate_split(SortOrder::Coordinate, Some(1), 1)]
-    #[case::coordinate_nosplit(SortOrder::Coordinate, None, 4)]
-    #[case::template_coordinate_split(SortOrder::TemplateCoordinate, Some(1), 1)]
-    #[case::template_coordinate_nosplit(SortOrder::TemplateCoordinate, None, 4)]
-    #[case::queryname_split(
-        SortOrder::Queryname(crate::keys::QuerynameComparator::Lexicographic),
-        Some(1),
-        1
-    )]
-    #[case::queryname_nosplit(
-        SortOrder::Queryname(crate::keys::QuerynameComparator::Lexicographic),
-        None,
-        4
-    )]
-    fn streaming_pool_is_capped_to_phase1_threads(
-        #[case] order: SortOrder,
-        #[case] sort_threads: Option<usize>,
-        #[case] expected_workers: usize,
-    ) {
-        assert_eq!(
-            streaming_phase1_pool_workers(order, sort_threads),
-            expected_workers,
-            "order {order:?} sort_threads {sort_threads:?}: stream pool must size to phase1_threads"
-        );
-    }
-
     #[test]
     fn test_raw_sorter_memory_limit() {
         let sorter = RawExternalSorter::new(SortOrder::Coordinate).memory_limit(256 * 1024 * 1024);
@@ -5507,43 +4529,6 @@ mod tests {
             "unexpected error: {msg}"
         );
         assert!(!output.exists(), "no output should be produced on validation failure");
-    }
-
-    /// The streaming entry points must reject `temp_compression=0` + zstd too,
-    /// not just `sort()` — otherwise the fused pipeline path (which builds the
-    /// sorter then calls `into_*_stream`) could reach a misconfigured pool that
-    /// `sort()` would have refused. Header is irrelevant: the guard fires before
-    /// any pool/temp-dir work.
-    #[test]
-    fn test_streaming_entry_points_reject_temp_compression_zero_with_zstd() {
-        use noodles::sam::Header;
-
-        let header = Header::default();
-
-        for sort_order in [
-            SortOrder::Coordinate,
-            SortOrder::TemplateCoordinate,
-            SortOrder::Queryname(crate::keys::QuerynameComparator::Lexicographic),
-        ] {
-            let sorter = RawExternalSorter::new(sort_order)
-                .spill_codec(crate::codec::SpillCodec::Zstd)
-                .temp_compression(0);
-            let err = match sort_order {
-                SortOrder::Coordinate => sorter.into_coordinate_stream(&header).err(),
-                SortOrder::TemplateCoordinate => {
-                    sorter.into_template_coordinate_stream(&header).err()
-                }
-                SortOrder::Queryname(_) => sorter.into_queryname_stream(&header).err(),
-            }
-            .unwrap_or_else(|| {
-                panic!("{sort_order:?} stream should reject temp_compression=0 + zstd")
-            });
-            assert!(
-                err.to_string()
-                    .contains("temp_compression=0 is only supported with SpillCodec::Bgzf"),
-                "unexpected error for {sort_order:?}: {err}"
-            );
-        }
     }
 
     #[test]
@@ -6253,6 +5238,31 @@ mod tests {
 
         assert_eq!(count, 40);
         assert_eq!(count_bam_records(&merged), 40);
+
+        // Verify template-coordinate order/identity via an independent oracle
+        // (mirrors `narrow_sort_output_passes_full_width_verify`): re-extract the
+        // template key from every merged record and assert non-decreasing core
+        // order. A count-only check would pass even if the merge reordered or
+        // duplicated records.
+        let (_, hdr) = create_raw_bam_reader(&merged, 1).expect("header");
+        let lib = LibraryLookup::from_header(&hdr);
+        let hasher = cb_hasher();
+        let file = std::fs::File::open(&merged).expect("open merged");
+        let mut raw_reader = crate::reader::RawBamRecordReader::new(file).expect("reader");
+        raw_reader.skip_header().expect("skip header");
+        let (total, violations, first) = crate::verify::verify_sort_order(
+            raw_reader,
+            |bam| extract_template_key_inline(bam, &lib, None, &hasher),
+            |cur: &TemplateKey40, prev: &TemplateKey40| {
+                cur.core_cmp(prev) == std::cmp::Ordering::Less
+            },
+        )
+        .expect("verify runs");
+        assert_eq!(total, 40, "verify must see every merged record");
+        assert_eq!(
+            violations, 0,
+            "template-coordinate order violated after merge (first={first:?}, total={total})"
+        );
     }
 
     #[test]
@@ -7720,7 +6730,7 @@ mod from_slots_merge_tests {
             populated_slot(2, &file2, 1),
         ];
 
-        let driver = MergeDriver::<TestKey>::from_slots(slots, Vec::new(), 9);
+        let driver = MergeDriver::<TestKey>::from_slots(slots, MemorySources::Owned(Vec::new()), 9);
         let emitted_bytes = drain_merge_driver_bytes(driver);
         let expected: Vec<Vec<u8>> = vec![
             b"AAA-1".to_vec(),
@@ -7747,7 +6757,8 @@ mod from_slots_merge_tests {
             .collect();
 
         let slots = vec![populated_slot(0, &records, 4)];
-        let driver = MergeDriver::<TestKey>::from_slots(slots, Vec::new(), 20);
+        let driver =
+            MergeDriver::<TestKey>::from_slots(slots, MemorySources::Owned(Vec::new()), 20);
         let emitted_bytes = drain_merge_driver_bytes(driver);
         let expected: Vec<Vec<u8>> = records.into_iter().map(|(_, b)| b).collect();
         assert_eq!(emitted_bytes, expected, "cross-block parse corrupted record sequence");
@@ -7764,7 +6775,11 @@ mod from_slots_merge_tests {
         empty_slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
         // Lazy priming: `from_slots` always yields a driver; the empty
         // determination happens on the first `try_step`, which returns `Done`.
-        let driver = MergeDriver::<TestKey>::from_slots(vec![empty_slot], Vec::new(), 0);
+        let driver = MergeDriver::<TestKey>::from_slots(
+            vec![empty_slot],
+            MemorySources::Owned(Vec::new()),
+            0,
+        );
         let emitted = drain_merge_driver_bytes(driver);
         assert!(emitted.is_empty(), "all-empty merge must emit zero records");
     }
@@ -7782,8 +6797,11 @@ mod from_slots_merge_tests {
             crate::codec::SpillCodec::Bgzf,
         ));
         // Empty queue, NOT eof — the producer is "still feeding".
-        let mut driver =
-            MergeDriver::<TestKey>::from_slots(vec![StdArc::clone(&slot)], Vec::new(), 0);
+        let mut driver = MergeDriver::<TestKey>::from_slots(
+            vec![StdArc::clone(&slot)],
+            MemorySources::Owned(Vec::new()),
+            0,
+        );
 
         // Priming cannot read the slot's first record → Stalled, not a hang.
         assert!(
@@ -7825,8 +6843,11 @@ mod from_slots_merge_tests {
             let bytes = serialize_records(&[(TestKey(1), b"rec-A".to_vec())]);
             slot.decompressed.lock().unwrap().push_back(bytes);
         }
-        let mut driver =
-            MergeDriver::<TestKey>::from_slots(vec![StdArc::clone(&slot)], Vec::new(), 0);
+        let mut driver = MergeDriver::<TestKey>::from_slots(
+            vec![StdArc::clone(&slot)],
+            MemorySources::Owned(Vec::new()),
+            0,
+        );
 
         // Prime + emit the first record.
         match driver.try_step().expect("try_step") {
@@ -7873,8 +6894,11 @@ mod from_slots_merge_tests {
         ));
         slot.decompressed.lock().unwrap().push_back(vec![serialized[0]]);
 
-        let mut driver =
-            MergeDriver::<TestKey>::from_slots(vec![StdArc::clone(&slot)], Vec::new(), 1);
+        let mut driver = MergeDriver::<TestKey>::from_slots(
+            vec![StdArc::clone(&slot)],
+            MemorySources::Owned(Vec::new()),
+            1,
+        );
 
         // Each step before the last byte consumes one byte into the pending
         // record and stalls (queue empty, not EOF).
@@ -7918,8 +6942,11 @@ mod from_slots_merge_tests {
         ));
         slot.decompressed.lock().unwrap().push_back(head.to_vec());
 
-        let mut driver =
-            MergeDriver::<TestEmbeddedKey>::from_slots(vec![StdArc::clone(&slot)], Vec::new(), 1);
+        let mut driver = MergeDriver::<TestEmbeddedKey>::from_slots(
+            vec![StdArc::clone(&slot)],
+            MemorySources::Owned(Vec::new()),
+            1,
+        );
 
         // Body incomplete in the first block → Stalled mid-record.
         assert!(matches!(driver.try_step().expect("try_step"), MergeStep::Stalled));
@@ -7951,7 +6978,11 @@ mod from_slots_merge_tests {
         ];
 
         let slots = vec![populated_slot(0, &slot_records, 2)];
-        let driver = MergeDriver::<TestKey>::from_slots(slots, vec![memory_records], 6);
+        let driver = MergeDriver::<TestKey>::from_slots(
+            slots,
+            MemorySources::Owned(vec![memory_records]),
+            6,
+        );
         let emitted_bytes = drain_merge_driver_bytes(driver);
         let expected: Vec<Vec<u8>> = vec![
             b"slot-1".to_vec(),
@@ -8070,7 +7101,8 @@ mod from_slots_merge_tests {
             embedded_populated_slot(2, &file2, 1),
         ];
 
-        let driver = MergeDriver::<TestEmbeddedKey>::from_slots(slots, Vec::new(), 9);
+        let driver =
+            MergeDriver::<TestEmbeddedKey>::from_slots(slots, MemorySources::Owned(Vec::new()), 9);
         let emitted = drain_merge_driver_bytes(driver);
 
         // Verify keys are emitted in sorted order. Tail bytes prove the
@@ -8111,7 +7143,7 @@ mod from_slots_merge_tests {
         // populated slot.
         let slots = vec![empty_slot, populated_slot(0, &populated, 1)];
 
-        let driver = MergeDriver::<TestKey>::from_slots(slots, Vec::new(), 3);
+        let driver = MergeDriver::<TestKey>::from_slots(slots, MemorySources::Owned(Vec::new()), 3);
         let emitted = drain_merge_driver_bytes(driver);
         assert_eq!(emitted, vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
     }
@@ -8127,7 +7159,8 @@ mod from_slots_merge_tests {
         let total = (f0.len() + f1.len()) as u64;
 
         let slots = vec![populated_slot(0, &f0, 3), populated_slot(1, &f1, 2)];
-        let mut driver = MergeDriver::<TestKey>::from_slots(slots, Vec::new(), total);
+        let mut driver =
+            MergeDriver::<TestKey>::from_slots(slots, MemorySources::Owned(Vec::new()), total);
 
         let mut emitted = 0u64;
         loop {

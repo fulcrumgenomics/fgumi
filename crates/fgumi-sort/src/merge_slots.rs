@@ -65,37 +65,55 @@
 //! ## The OTHER Phase-2 implementation (`worker_pool.rs`) still has all of
 //! this — by design.
 //!
-//! Standalone file-to-file `fgumi sort` uses `worker_pool::Phase2FileState`
-//! plus the gap-filler this module dropped. That path is NOT broken: its merge
-//! consumer is a parked OS thread (no framework Skip), so the v4 deadlock
-//! cannot occur there, and its single-reader/**multi-decompressor** topology
-//! genuinely needs the reorder buffer + in-flight counter (a plain FIFO
-//! suffices HERE only because read-and-decompress is one inline op, so blocks
-//! decompress strictly in read order). Unifying the two drivers is a deferred
-//! goal — see commit `9d6d7e9` / PR #395 and
-//! `docs/design/sort-phase2-unification-deferral.md` — gated on this streaming
-//! path gaining file-to-file drive + `--write-index` + `--verify` + a
-//! deadlock-safe consumer.
-// TODO(#395): unify the two Phase-2 sort drivers — see docs/design/sort-phase2-unification-deferral.md
+//! Since the P6/P7 unification (#395) THIS module is the production Phase-2 for
+//! both standalone `fgumi sort` and the fused `runall` sort. `worker_pool::
+//! Phase2FileState` (plus the gap-filler this module dropped) no longer drives
+//! a production sort; it is retained as the `RawExternalSorter::sort` library
+//! path and the `#[cfg(test)]` parity oracle. It keeps the reorder buffer +
+//! in-flight counter because its single-reader/**multi-decompressor** topology
+//! genuinely needs them (a plain FIFO suffices HERE only because read-and-
+//! decompress is one inline op, so blocks decompress strictly in read order).
+//! (History: commit `9d6d7e9` / PR #395 and
+//! `docs/design/sort-phase2-unification-deferral.md`.)
 
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::BufReader;
+
+// Concurrency primitives are sourced from `loom` under `--cfg loom` so the
+// model-checking test (`tests/loom_merge_slots.rs`) exercises the REAL
+// `SortMergeSlot` atomics/mutexes — every interleaving and memory reordering of
+// the block-parallel EOF/in-flight/finalize protocol — instead of a hand-copied
+// re-implementation. Under a normal build these are the `std` types verbatim.
+#[cfg(loom)]
+use loom::sync::Mutex;
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(not(loom))]
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(loom))]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use fgumi_bam_io::reorder::ReorderBuffer;
 
 use crate::codec::SpillCodec;
 
 /// Per-slot decompressed-block queue cap. Bounds in-flight
 /// decompressed memory: `num_slots × PHASE2_DECOMP_CAP ×` per-entry size,
 /// where each entry is a decompressed BGZF block or zstd frame ranging from
-/// ~64 KB (BGZF) up to 256 KB (zstd worst case). Matches
-/// `worker_pool::PHASE2_DECOMP_CAP` numerically.
+/// ~64 KB (BGZF) up to 256 KB (zstd worst case).
+///
+/// Raised from 8 to 32 (increment 1a) to give the work-stealing decompressor
+/// more runway ahead of the `Detached` merge, which was input-starved
+/// (`MergeDiag stalls`) at the spill-heavy operating point. The `worker_pool.rs`
+/// copy (the `cfg(test)`/library oracle path) is intentionally left at 8 — these
+/// two are no longer equal.
 ///
 /// Hard cap — there is no admission escape. Producers skip a slot
 /// when its queue is at this cap, returning to it on a later
-/// `try_run` after the consumer has drained.
-pub const PHASE2_DECOMP_CAP: usize = 8;
+/// `try_run` after the consumer has drained. It stays a per-slot, independent
+/// bound (deadlock-safety is unchanged — see the module header).
+pub const PHASE2_DECOMP_CAP: usize = 32;
 
 /// Disk reader state for a single spill file. Mutex'd separately
 /// from `decompressed` so the producer can hold the reader during
@@ -103,6 +121,15 @@ pub const PHASE2_DECOMP_CAP: usize = 8;
 pub struct SortMergeReader {
     /// Buffered file handle.
     pub inner: BufReader<File>,
+    /// Next per-slot sequence number to assign to a raw block read from this
+    /// file. Used ONLY by the block-parallel `SortSpillDecompress` path: each
+    /// raw block read under the reader lock is stamped with a monotonically
+    /// increasing sequence number so the out-of-order decompression results can
+    /// be reassembled in read order by the slot's [`SortMergeSlot::reorder`]
+    /// buffer. Because every read is serialized under the reader lock, the
+    /// sequence numbers are dense and assigned in strict read order. Unused by
+    /// the inline (file-granularity) path, which never reorders.
+    pub next_seq: u64,
 }
 
 /// Per-spill-file shared state.
@@ -151,6 +178,36 @@ pub struct SortMergeSlot {
     /// stores while holding `decompressed`; consumer reads under
     /// the same lock.
     pub decomp_error: AtomicBool,
+
+    // ── Block-parallel decompression state (file_granularity == false) ───────
+    //
+    // These three fields are inert in the inline (file-granularity) path. In
+    // the block-parallel path multiple workers decompress one file's blocks
+    // concurrently: the READ is serialized under `reader` (sequence-tagged via
+    // `SortMergeReader::next_seq`), but the decompression happens outside the
+    // lock, so results complete out of order and are reassembled here.
+    /// Number of raw blocks that have been READ (under the reader lock) but not
+    /// yet inserted into `reorder`. Incremented under the reader lock when a
+    /// batch is read; decremented after the worker inserts that batch into
+    /// `reorder`. The slot may declare EOF only once this reaches zero — a
+    /// worker that observes reader-EOF must not truncate the merge while another
+    /// worker still holds an in-flight (read-but-undelivered) block.
+    pub in_flight: AtomicUsize,
+    /// Set true once a read returns fewer raw blocks than requested, i.e. the
+    /// disk reader reached a clean EOF. Distinct from `queue_eof`: `reader_eof`
+    /// means "no more blocks will be read", whereas `queue_eof` means "every
+    /// block has been read, decompressed, reassembled, and delivered to the
+    /// FIFO". `queue_eof` is set only when `reader_eof && in_flight == 0 &&
+    /// reorder.is_empty()`. Stored under the reader lock (Release), read in the
+    /// finalize path (Acquire); being an atomic it does not participate in lock
+    /// ordering.
+    pub reader_eof: AtomicBool,
+    /// Per-slot reorder buffer that reassembles out-of-order decompression
+    /// results back into read (sequence) order before they are drained into the
+    /// FIFO. Lock order: acquire `reorder` BEFORE `decompressed` (never the
+    /// reverse); the reader lock, when held, is outermost. The consumer never
+    /// touches this — it only pops the in-order FIFO.
+    pub reorder: Mutex<ReorderBuffer<Vec<u8>>>,
 }
 
 impl SortMergeSlot {
@@ -161,10 +218,13 @@ impl SortMergeSlot {
         Self {
             file_id,
             codec,
-            reader: Mutex::new(SortMergeReader { inner: reader }),
+            reader: Mutex::new(SortMergeReader { inner: reader, next_seq: 0 }),
             decompressed: Mutex::new(VecDeque::with_capacity(PHASE2_DECOMP_CAP)),
             queue_eof: AtomicBool::new(false),
             decomp_error: AtomicBool::new(false),
+            in_flight: AtomicUsize::new(0),
+            reader_eof: AtomicBool::new(false),
+            reorder: Mutex::new(ReorderBuffer::new()),
         }
     }
 
@@ -242,9 +302,203 @@ impl SortMergeSlot {
         let active = !self.queue_eof.load(Ordering::Acquire);
         (pending_blocks, pending_bytes, active)
     }
+
+    /// Current number of decompressed blocks resident in the FIFO. Locks
+    /// `decompressed` for an O(1) `len()` read — used by the decompressor's
+    /// emptiest-first refill order (most-starved slot first). Cheaper than
+    /// [`Self::probe_stats`], which also sums per-block byte lengths.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `decompressed` mutex is poisoned.
+    #[must_use]
+    pub fn fifo_len(&self) -> usize {
+        self.decompressed.lock().expect("SortMergeSlot decompressed mutex poisoned").len()
+    }
+
+    // ── Block-parallel decompression helpers (file_granularity == false) ─────
+
+    /// Block-parallel admission control: may a worker read another batch of raw
+    /// blocks (whose first block would be tagged `next_seq`) into this slot's
+    /// reorder window?
+    ///
+    /// Combines [`ReorderBuffer::would_accept`] (the deadlock-free predicate the
+    /// pipeline uses elsewhere) with a hard `heap_bytes < window_budget`
+    /// backstop. The backstop is what actually bounds memory: `would_accept`
+    /// alone returns `true` (accept-all) while the buffer is *stuck* (the front
+    /// sequence not yet decompressed), which would let a slow straggler balloon
+    /// the window. The backstop is deadlock-safe **in this topology** because
+    /// reads are serialized and densely sequenced, so the front gap is ALWAYS an
+    /// already-read in-flight block (some worker is decompressing it) — never an
+    /// unread block that a new read would be required to fetch. Refusing new
+    /// reads therefore cannot wedge progress.
+    ///
+    /// `window_budget == 0` means unlimited.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `reorder` mutex is poisoned.
+    #[must_use]
+    pub fn bp_reorder_admits(&self, next_seq: u64, window_budget: u64) -> bool {
+        let rb = self.reorder.lock().expect("reorder mutex poisoned");
+        if !rb.would_accept(next_seq, window_budget) {
+            return false;
+        }
+        window_budget == 0 || rb.heap_bytes() < window_budget
+    }
+
+    /// Reserve `count` in-flight blocks just read under the reader lock.
+    ///
+    /// **Ordering requirement:** the caller MUST call this BEFORE
+    /// [`Self::bp_set_reader_eof`] for the EOF-carrying batch. Both stores are
+    /// `Release`; the lock-free finalizer in [`Self::drain_locked_and_finalize`]
+    /// reads `reader_eof` (Acquire) then `in_flight` (Acquire) WITHOUT the
+    /// reader lock, so only this publish order guarantees that observing
+    /// `reader_eof == true` also makes this batch's `in_flight` increment
+    /// visible — otherwise the finalizer can declare a clean EOF that truncates
+    /// the EOF read's own still-in-flight block (loom-verified; see
+    /// `tests/loom_merge_slots.rs`).
+    pub fn bp_add_in_flight(&self, count: usize) {
+        self.in_flight.fetch_add(count, Ordering::Release);
+    }
+
+    /// Mark the disk reader as having reached a clean EOF (called under the
+    /// reader lock when a read returns fewer blocks than requested).
+    ///
+    /// **Ordering requirement:** call this AFTER [`Self::bp_add_in_flight`] has
+    /// reserved the current batch — see that method's note. Publishing
+    /// `reader_eof` before the in-flight reservation reopens a truncation race.
+    pub fn bp_set_reader_eof(&self) {
+        self.reader_eof.store(true, Ordering::Release);
+    }
+
+    /// Publish the accounting for a batch of `count` raw blocks just read under
+    /// the reader lock, in the one order that is correct: reserve the in-flight
+    /// blocks FIRST, then (on a short read) set `reader_eof`.
+    ///
+    /// This is the single source of truth for the publish order — both the
+    /// production worker (`SortSpillDecompress::try_fill_block_parallel_slot`)
+    /// and the loom model (`tests/loom_merge_slots.rs`) call it, so the ordering
+    /// is model-checked against the real code and the two cannot drift.
+    ///
+    /// **Why this order (loom-verified).** The lock-free finalizer in
+    /// [`Self::drain_locked_and_finalize`] reads `reader_eof` (Acquire) then
+    /// `in_flight` (Acquire) WITHOUT the reader lock, so the reader lock does not
+    /// order this batch's accounting against it. Both stores are `Release`; a
+    /// finalizer that observes `reader_eof == true` therefore also observes this
+    /// (possibly EOF-carrying) batch's `in_flight` increment, and so cannot
+    /// finalize `queue_eof` while the batch is still in flight. Setting
+    /// `reader_eof` first would let a finalizer see `reader_eof == true` with
+    /// `in_flight == 0` after earlier blocks drained, finalizing a clean EOF that
+    /// silently truncates this batch's own block. Swapping the two lines makes
+    /// `tests/loom_merge_slots.rs` fail (as it did before the fix in `ac0a2ad`).
+    pub fn bp_commit_read(&self, count: usize, hit_eof: bool) {
+        self.bp_add_in_flight(count);
+        if hit_eof {
+            self.bp_set_reader_eof();
+        }
+    }
+
+    /// Number of additional decompressed blocks the FIFO can accept before it
+    /// hits [`PHASE2_DECOMP_CAP`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `decompressed` mutex is poisoned.
+    #[must_use]
+    pub fn bp_fifo_room(&self) -> usize {
+        let dec = self.decompressed.lock().expect("decompressed mutex poisoned");
+        PHASE2_DECOMP_CAP.saturating_sub(dec.len())
+    }
+
+    /// Tracked reorder-window heap bytes (for tests / diagnostics).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `reorder` mutex is poisoned.
+    #[must_use]
+    pub fn bp_reorder_heap_bytes(&self) -> u64 {
+        self.reorder.lock().expect("reorder mutex poisoned").heap_bytes()
+    }
+
+    /// Insert a freshly-decompressed batch `[start_seq, start_seq + count)` into
+    /// the reorder buffer, release the in-flight reservation, drain any now-ready
+    /// (in-order) blocks into the FIFO (bounded by [`PHASE2_DECOMP_CAP`]), and
+    /// finalize `queue_eof` if the slot is fully delivered.
+    ///
+    /// `blocks.len()` need not equal `count`: an empty final read (`count == 0`)
+    /// still calls through here so the EOF can be finalized once the last
+    /// in-flight block drains. Returns `true` if it made progress (drained at
+    /// least one block or finalized EOF).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `reorder` or `decompressed` mutex is poisoned.
+    pub fn bp_insert_drain_finalize(
+        &self,
+        start_seq: u64,
+        blocks: Vec<Vec<u8>>,
+        count: usize,
+    ) -> bool {
+        let mut rb = self.reorder.lock().expect("reorder mutex poisoned");
+        for (i, block) in blocks.into_iter().enumerate() {
+            let size = block.len();
+            // `start_seq + i` cannot exceed the number of blocks read from one
+            // spill file, which is far below u64::MAX.
+            rb.insert_with_size(start_seq + i as u64, block, size);
+        }
+        // The reservation now lives in `reorder`, so release it. AcqRel so the
+        // finalize load below sees a consistent count.
+        self.in_flight.fetch_sub(count, Ordering::AcqRel);
+        self.drain_locked_and_finalize(&mut rb)
+    }
+
+    /// Drain-only block-parallel pass: move any in-order ready blocks from the
+    /// reorder buffer into the FIFO (used when the FIFO had no room earlier, or
+    /// post-reader-EOF to flush stragglers other workers inserted) and finalize
+    /// `queue_eof`. Returns `true` if it made progress.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `reorder` or `decompressed` mutex is poisoned.
+    pub fn bp_drain_and_finalize(&self) -> bool {
+        let mut rb = self.reorder.lock().expect("reorder mutex poisoned");
+        self.drain_locked_and_finalize(&mut rb)
+    }
+
+    /// Shared drain + finalize, called with the `reorder` lock held. Acquires
+    /// `decompressed` (lock order: reorder → decompressed) so `queue_eof` is
+    /// stored under the same mutex the consumer reads it under.
+    fn drain_locked_and_finalize(&self, rb: &mut ReorderBuffer<Vec<u8>>) -> bool {
+        let mut dec = self.decompressed.lock().expect("decompressed mutex poisoned");
+        let mut room = PHASE2_DECOMP_CAP.saturating_sub(dec.len());
+        let mut drained = 0usize;
+        while room > 0 {
+            let Some(block) = rb.try_pop_next() else { break };
+            dec.push_back(block);
+            room -= 1;
+            drained += 1;
+        }
+        // Finalize EOF: reader is exhausted, every read block has been inserted
+        // (in_flight == 0), and the reorder buffer is fully drained. Stored
+        // under `decompressed` so the consumer's release-acquire chain sees it.
+        let mut finalized = false;
+        if !self.queue_eof.load(Ordering::Acquire)
+            && self.reader_eof.load(Ordering::Acquire)
+            && self.in_flight.load(Ordering::Acquire) == 0
+            && rb.is_empty()
+        {
+            self.queue_eof.store(true, Ordering::Release);
+            finalized = true;
+        }
+        drained > 0 || finalized
+    }
 }
 
-#[cfg(test)]
+// These exercise `SortMergeSlot` outside `loom::model`, which is illegal once
+// the primitives are loom's, so they compile only in a normal (non-loom) build.
+// The `--cfg loom` invocation runs `tests/loom_merge_slots.rs` exclusively.
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
 
@@ -276,6 +530,15 @@ mod tests {
         let popped = slot.decompressed.lock().unwrap().pop_front();
         assert_eq!(popped, Some(vec![0xAB, 0xCD]));
         assert!(slot.is_drained(), "drained once queue empty AND queue_eof");
+    }
+
+    #[test]
+    fn fifo_len_reports_block_count() {
+        let slot = SortMergeSlot::new(0, empty_reader(), SpillCodec::Bgzf);
+        assert_eq!(slot.fifo_len(), 0);
+        slot.decompressed.lock().unwrap().push_back(vec![0u8; 10]);
+        slot.decompressed.lock().unwrap().push_back(vec![0u8; 20]);
+        assert_eq!(slot.fifo_len(), 2, "counts blocks, not bytes");
     }
 
     #[test]
@@ -334,5 +597,94 @@ mod tests {
         slot.queue_eof.store(true, Ordering::Release);
         assert!(slot.is_drained(), "clean empty + queue_eof is drained");
         assert!(!slot.has_error(), "clean drain has no error");
+    }
+
+    // ── Block-parallel helper tests ─────────────────────────────────────────
+
+    /// A single in-order batch drains straight into the FIFO and (because the
+    /// reader is at EOF with no other in-flight blocks) finalizes `queue_eof`.
+    #[test]
+    fn bp_single_batch_drains_and_finalizes() {
+        let slot = SortMergeSlot::new(0, empty_reader(), SpillCodec::Bgzf);
+        slot.bp_add_in_flight(2);
+        slot.bp_set_reader_eof();
+        let progressed = slot.bp_insert_drain_finalize(0, vec![vec![1u8], vec![2u8]], 2);
+        assert!(progressed);
+        assert!(slot.queue_eof.load(Ordering::Acquire), "reader_eof + drained ⇒ queue_eof");
+        let mut dec = slot.decompressed.lock().unwrap();
+        assert_eq!(dec.pop_front(), Some(vec![1u8]));
+        assert_eq!(dec.pop_front(), Some(vec![2u8]));
+    }
+
+    /// EOF-with-stragglers: a worker reads the FINAL (short) batch and hits
+    /// reader-EOF while another worker still holds an earlier in-flight batch.
+    /// The EOF-observing worker must NOT finalize `queue_eof` (which would
+    /// truncate the merge); only after the straggler is delivered, in order,
+    /// does the slot finalize. No block is dropped or reordered.
+    #[test]
+    fn bp_eof_with_straggler_does_not_truncate() {
+        let slot = SortMergeSlot::new(0, empty_reader(), SpillCodec::Bgzf);
+
+        // Worker A reserved seqs 0,1; worker B reserved seqs 2,3 on the final
+        // (short) read and set reader_eof.
+        slot.bp_add_in_flight(2); // A: seq 0,1
+        slot.bp_add_in_flight(2); // B: seq 2,3 (final batch)
+        slot.bp_set_reader_eof();
+
+        // Worker B finishes decompressing FIRST and delivers seqs 2,3. Gap at
+        // 0,1 ⇒ nothing drains, and in_flight (A's 2) is non-zero ⇒ no EOF.
+        let b_progress = slot.bp_insert_drain_finalize(2, vec![vec![2u8], vec![3u8]], 2);
+        assert!(!b_progress, "straggler ahead-of-gap insert drains nothing and can't finalize");
+        assert!(!slot.queue_eof.load(Ordering::Acquire), "must NOT declare EOF with A in flight");
+        assert!(slot.decompressed.lock().unwrap().is_empty(), "nothing delivered yet");
+
+        // Worker A finishes and delivers seqs 0,1 ⇒ all four drain in order and
+        // EOF finalizes.
+        let a_progress = slot.bp_insert_drain_finalize(0, vec![vec![0u8], vec![1u8]], 2);
+        assert!(a_progress);
+        assert!(slot.queue_eof.load(Ordering::Acquire), "EOF finalizes once straggler delivered");
+
+        let mut dec = slot.decompressed.lock().unwrap();
+        let order: Vec<u8> = std::iter::from_fn(|| dec.pop_front()).map(|b| b[0]).collect();
+        assert_eq!(order, vec![0, 1, 2, 3], "blocks delivered in read order, none truncated");
+    }
+
+    /// The reorder window stays bounded when the front sequence straggles: a
+    /// worker keeps decompressing ahead-of-gap blocks, but `bp_reorder_admits`
+    /// refuses new reads once `heap_bytes` reaches the window budget, so the
+    /// buffer never balloons past `budget + one batch`.
+    #[test]
+    fn bp_reorder_window_is_bounded_under_straggler() {
+        const BLOCK: usize = 1024;
+        const BUDGET: u64 = 4 * BLOCK as u64; // 4 blocks
+        let slot = SortMergeSlot::new(0, empty_reader(), SpillCodec::Bgzf);
+
+        // Seq 0 is the straggler — it is reserved but never decompressed/inserted,
+        // so the buffer can never pop and keeps a permanent front gap.
+        slot.bp_add_in_flight(1); // seq 0 in flight forever (the straggler)
+
+        // Workers race ahead delivering seqs 1,2,3,… as long as admission allows.
+        let mut next = 1u64;
+        let mut admitted = 0;
+        while slot.bp_reorder_admits(next, BUDGET) {
+            slot.bp_add_in_flight(1);
+            slot.bp_insert_drain_finalize(next, vec![vec![0u8; BLOCK]], 1);
+            // Front gap at seq 0 ⇒ nothing drains.
+            assert!(slot.decompressed.lock().unwrap().is_empty());
+            assert!(!slot.queue_eof.load(Ordering::Acquire), "never EOF while seq 0 in flight");
+            assert!(
+                slot.bp_reorder_heap_bytes() <= BUDGET,
+                "reorder window must stay within budget, got {} > {BUDGET}",
+                slot.bp_reorder_heap_bytes(),
+            );
+            next += 1;
+            admitted += 1;
+            assert!(admitted < 1000, "admission must eventually backpressure, not loop forever");
+        }
+        assert!(admitted > 0, "should admit at least some ahead-of-gap blocks");
+        assert!(
+            slot.bp_reorder_heap_bytes() >= BUDGET.saturating_sub(BLOCK as u64),
+            "should have filled the window before backpressuring",
+        );
     }
 }

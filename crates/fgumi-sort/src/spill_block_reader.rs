@@ -132,6 +132,89 @@ impl SpillBlockDecompressor {
         }
         Ok(out)
     }
+
+    /// Read up to `max` *raw* (still-compressed) blocks from `reader` using
+    /// `codec`, returning the compressed payloads **without** decompressing them.
+    ///
+    /// This is the read half of the block-parallel `SortSpillDecompress` path:
+    /// the caller acquires the per-slot reader lock, calls `read_raw` to pull a
+    /// batch of compressed blocks (which it sequence-tags), releases the lock,
+    /// and then decompresses each block via [`Self::decompress_one`] *outside*
+    /// the lock so multiple workers decompress one file's blocks concurrently.
+    /// The read and the decompression of a given block still happen within a
+    /// single `try_run` of a single worker — only the lock is released between
+    /// them — which preserves the read-and-decompress-together invariant that
+    /// the FIFO inline path also upholds.
+    ///
+    /// For BGZF each returned `Vec<u8>` is one complete raw block (header +
+    /// compressed data + footer), exactly what [`Self::decompress_one`] expects;
+    /// EOF-marker blocks are skipped. For zstd each is one raw frame body (the
+    /// `[u32 LE len]` prefix is consumed here). A result shorter than `max`
+    /// (including empty) signals a clean EOF, matching [`Self::read_blocks`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates I/O errors and truncation (a partial BGZF block, or a partial
+    /// zstd length prefix / frame body at EOF).
+    pub fn read_raw<R: Read + ?Sized>(
+        &mut self,
+        reader: &mut R,
+        codec: SpillCodec,
+        max: usize,
+    ) -> io::Result<Vec<Vec<u8>>> {
+        match codec {
+            SpillCodec::Bgzf => {
+                let raw_blocks = fgumi_bgzf::reader::read_raw_blocks(reader, max)?;
+                Ok(raw_blocks.into_iter().map(|b| b.data).collect())
+            }
+            SpillCodec::Zstd => {
+                let mut out = Vec::with_capacity(max);
+                for _ in 0..max {
+                    let Some(frame_len) = read_length_prefix(reader)? else {
+                        break;
+                    };
+                    let mut frame = vec![0u8; frame_len];
+                    reader.read_exact(&mut frame)?;
+                    out.push(frame);
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Decompress a single raw block/frame previously read by [`Self::read_raw`].
+    ///
+    /// `raw` is one BGZF raw block (header + compressed data + footer) or one
+    /// zstd frame body, per `codec`. Returns the decompressed bytes. Uses the
+    /// worker's reusable scratch buffers, so this is cheap to call in a loop over
+    /// a freshly-read batch.
+    ///
+    /// # Errors
+    ///
+    /// Propagates BGZF/zstd decompression failures (bad CRC, size mismatch, or a
+    /// malformed frame).
+    pub fn decompress_one(&mut self, codec: SpillCodec, raw: &[u8]) -> io::Result<Vec<u8>> {
+        match codec {
+            SpillCodec::Bgzf => {
+                fgumi_bgzf::reader::decompress_block_slice_into(
+                    raw,
+                    &mut self.bgzf,
+                    &mut self.bgzf_scratch,
+                )?;
+                Ok(std::mem::replace(&mut self.bgzf_scratch, Vec::with_capacity(SCRATCH_CAP)))
+            }
+            SpillCodec::Zstd => {
+                if self.zstd_buf.len() < SCRATCH_CAP {
+                    self.zstd_buf.resize(SCRATCH_CAP, 0);
+                }
+                let n = self
+                    .zstd
+                    .decompress_to_buffer(raw, &mut self.zstd_buf)
+                    .map_err(|e| io::Error::other(format!("zstd spill frame decompress: {e}")))?;
+                Ok(self.zstd_buf[..n].to_vec())
+            }
+        }
+    }
 }
 
 impl Default for SpillBlockDecompressor {
@@ -237,5 +320,97 @@ mod tests {
     #[test]
     fn roundtrip_zstd() {
         roundtrip(SpillCodec::Zstd);
+    }
+
+    /// The split `read_raw` + `decompress_one` path (used by the block-parallel
+    /// `SortSpillDecompress`) must yield the exact same per-block bytes as the
+    /// inline `read_blocks` path. We read the same chunk twice and compare.
+    fn read_raw_matches_read_blocks(codec: SpillCodec) {
+        use crate::keys::{RawCoordinateKey, RawSortKey};
+
+        let records: Vec<Vec<u8>> = (0usize..80)
+            .map(|i| {
+                let size = 3000 + (i % 13) * 500;
+                let mut r = vec![0u8; size];
+                let stamp = u8::try_from(i % 251).expect("i % 251 fits u8");
+                r[0] = stamp;
+                let last = r.len() - 1;
+                r[last] = stamp;
+                r
+            })
+            .collect();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("chunk.spill");
+        let pool = Arc::new(SortWorkerPool::new(1, 1, 6, codec));
+        {
+            let mut w = PooledChunkWriter::<RawCoordinateKey>::new(Arc::clone(&pool), &path, codec)
+                .expect("writer");
+            for rec in &records {
+                let key = RawCoordinateKey::extract_from_record(rec);
+                w.write_record(&key, rec).expect("write");
+            }
+            w.start_finish().expect("start_finish").wait().expect("finish");
+        }
+
+        // Helper: open the chunk positioned past any codec magic.
+        let open = || {
+            let mut file = std::fs::File::open(&path).expect("open");
+            let mut magic = [0u8; 4];
+            let filled = crate::external::read_exact_or_eof(&mut file, &mut magic).expect("magic");
+            let detected = if filled {
+                SpillCodec::from_magic(&magic).unwrap_or(SpillCodec::Bgzf)
+            } else {
+                SpillCodec::Bgzf
+            };
+            if matches!(detected, SpillCodec::Bgzf) {
+                use std::io::Seek;
+                file.seek(std::io::SeekFrom::Start(0)).expect("seek");
+            }
+            (std::io::BufReader::new(file), detected)
+        };
+
+        // Path A: inline read_blocks.
+        let (mut reader_a, detected) = open();
+        let mut dec_a = SpillBlockDecompressor::new();
+        let mut blocks_a: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let blocks = dec_a.read_blocks(&mut reader_a, detected, 4).expect("read_blocks");
+            let got = blocks.len();
+            blocks_a.extend(blocks);
+            if got < 4 {
+                break;
+            }
+        }
+
+        // Path B: read_raw + decompress_one.
+        let (mut reader_b, _) = open();
+        let mut dec_b = SpillBlockDecompressor::new();
+        let mut blocks_b: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let raws = dec_b.read_raw(&mut reader_b, detected, 4).expect("read_raw");
+            let got = raws.len();
+            for raw in &raws {
+                blocks_b.push(dec_b.decompress_one(detected, raw).expect("decompress_one"));
+            }
+            if got < 4 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            blocks_a, blocks_b,
+            "split read_raw path must match inline read_blocks ({codec:?})"
+        );
+    }
+
+    #[test]
+    fn read_raw_matches_read_blocks_bgzf() {
+        read_raw_matches_read_blocks(SpillCodec::Bgzf);
+    }
+
+    #[test]
+    fn read_raw_matches_read_blocks_zstd() {
+        read_raw_matches_read_blocks(SpillCodec::Zstd);
     }
 }

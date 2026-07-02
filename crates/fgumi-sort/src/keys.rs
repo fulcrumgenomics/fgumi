@@ -23,10 +23,20 @@
 //! - samtools' `bam1_tag` union (C)
 
 use noodles::sam::Header;
+use smallvec::SmallVec;
 use std::cmp::Ordering;
 
 use fgumi_raw_bam::RawRecordView;
 use std::io::{Read, Write};
+
+/// Inline-capacity buffer for queryname key name bytes. Illumina/SRA read names
+/// are short (typically ≤ ~24 bytes incl. the NUL), so an inline `SmallVec`
+/// keeps the name **contiguous inside the sort ref array** instead of a
+/// per-record heap allocation. During the comparison sort this eliminates the
+/// pointer-chase to scattered heap that dominates on memory-latency-bound cores
+/// (e.g. Graviton), where the queryname sort regressed vs the owned-`Vec` key.
+/// Names longer than the inline capacity spill to the heap transparently.
+type NameBuf = SmallVec<[u8; 24]>;
 
 // ============================================================================
 // Generic Sorting Abstraction (Trait-based, inspired by fgbio/samtools)
@@ -477,13 +487,18 @@ fn write_queryname_key<W: Write>(name: &[u8], flags: u16, writer: &mut W) -> std
 }
 
 /// Deserialize a queryname key from `[name_len: u16][name: bytes][flags: u16]`.
+///
+/// Reads the name straight into an inline [`NameBuf`] so the spill-merge read
+/// path allocates no per-record heap for short names — the merge-side analogue
+/// of the SSO key change on the ingest path.
 #[inline]
-fn read_queryname_key<R: Read>(reader: &mut R) -> std::io::Result<(Vec<u8>, u16)> {
+fn read_queryname_key<R: Read>(reader: &mut R) -> std::io::Result<(NameBuf, u16)> {
     let mut len_buf = [0u8; 2];
     reader.read_exact(&mut len_buf)?;
     let name_len = u16::from_le_bytes(len_buf) as usize;
 
-    let mut name = vec![0u8; name_len];
+    let mut name: NameBuf = SmallVec::new();
+    name.resize(name_len, 0);
     reader.read_exact(&mut name)?;
 
     let mut flags_buf = [0u8; 2];
@@ -501,12 +516,27 @@ fn read_queryname_key<R: Read>(reader: &mut R) -> std::io::Result<(Vec<u8>, u16)
 /// Unlike fixed-size keys, serialization size depends on name length.
 ///
 /// Serialization format: `[name_len: u16][name: bytes][flags: u16]`
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct RawQuerynameKey {
-    /// Read name bytes, null-terminated for `natural_compare_nul`.
-    name: Vec<u8>,
+    /// Read name bytes, null-terminated for `natural_compare_nul`. Inline for
+    /// short names (see [`NameBuf`]) so the comparison sort stays cache-local.
+    name: NameBuf,
     /// Flags for segment ordering (R1 before R2).
     flags: u16,
+}
+
+impl Default for RawQuerynameKey {
+    /// A default key must still satisfy the null-terminated invariant that
+    /// `cmp`'s `natural_compare_nul` relies on — a derived `Default` would leave
+    /// `name` empty (no terminator), so a default-constructed key would feed a
+    /// non-terminated pointer into the comparator (out-of-bounds read). This is
+    /// required because generic merge code bounds `K: RawSortKey + Default`
+    /// (e.g. `MergeDriver<K>`, `MemorySources<K>`). The default is the empty
+    /// name `"\0"` — it orders before any non-empty name and terminates
+    /// immediately.
+    fn default() -> Self {
+        Self { name: SmallVec::from_slice(&[0]), flags: 0 }
+    }
 }
 
 impl PartialEq for RawQuerynameKey {
@@ -526,7 +556,7 @@ impl RawQuerynameKey {
         if name.last() != Some(&0) {
             name.push(0);
         }
-        Self { name, flags }
+        Self { name: SmallVec::from_vec(name), flags }
     }
 
     /// Returns the read name bytes (including the null terminator).
@@ -543,8 +573,8 @@ impl RawQuerynameKey {
         let flags = queryname_flag_order(u16::from_le_bytes([bam[14], bam[15]]));
         match raw_name_with_nul(bam) {
             // BAM stores the name NUL-terminated, so copy those bytes directly
-            // instead of stripping the NUL and re-appending it.
-            Some(name) => Self { name: name.to_vec(), flags },
+            // (inline when short) instead of stripping the NUL and re-appending.
+            Some(name) => Self { name: SmallVec::from_slice(name), flags },
             // Truncated record: fall back to the stripped-name path (`new`
             // re-adds the terminator), preserving the prior bytes exactly.
             None => Self::new(extract_raw_name_and_flags(bam).0.to_vec(), flags),
@@ -556,7 +586,8 @@ impl Ord for RawQuerynameKey {
     #[inline]
     #[allow(unsafe_code)]
     fn cmp(&self, other: &Self) -> Ordering {
-        // SAFETY: `name` is always null-terminated (see `extract_queryname_key` and `new`).
+        // SAFETY: `name` is always null-terminated by every constructor
+        // (`extract_queryname_key`, `new`, and `read_from`).
         unsafe { natural_compare_nul(self.name.as_ptr(), other.name.as_ptr()) }
             .then_with(|| self.flags.cmp(&other.flags))
     }
@@ -590,8 +621,18 @@ impl RawSortKey for RawQuerynameKey {
 
     #[inline]
     fn read_from<R: Read>(reader: &mut R) -> std::io::Result<Self> {
-        let (name, flags) = read_queryname_key(reader)?;
-        Ok(Self::new(name, flags))
+        // A well-formed frame (written by `write_to`) already carries the
+        // trailing NUL that `cmp`'s `natural_compare_nul` unsafe relies on, so
+        // the common path constructs directly rather than via `new`. But
+        // `read_from` is a public entry point that could be handed a truncated
+        // or malformed frame; re-append the terminator if it is missing so the
+        // NUL-termination invariant holds unconditionally and the comparator can
+        // never walk off the end.
+        let (mut name, flags) = read_queryname_key(reader)?;
+        if name.last() != Some(&0) {
+            name.push(0);
+        }
+        Ok(Self { name, flags })
     }
 }
 
@@ -607,8 +648,9 @@ impl RawSortKey for RawQuerynameKey {
 /// Serialization format: `[name_len: u16][name: bytes][flags: u16]`
 #[derive(Clone, Eq, PartialEq, Debug, Default)]
 pub struct RawQuerynameLexKey {
-    /// Read name bytes.
-    name: Vec<u8>,
+    /// Read name bytes. Inline for short names (see [`NameBuf`]) so the
+    /// comparison sort stays cache-local.
+    name: NameBuf,
     /// Flags for segment ordering (R1 before R2).
     flags: u16,
 }
@@ -617,7 +659,7 @@ impl RawQuerynameLexKey {
     /// Create a new lexicographic queryname key.
     #[must_use]
     pub fn new(name: Vec<u8>, flags: u16) -> Self {
-        Self { name, flags }
+        Self { name: SmallVec::from_vec(name), flags }
     }
 
     /// Returns the read name bytes.
@@ -631,7 +673,7 @@ impl RawQuerynameLexKey {
     #[must_use]
     fn extract_queryname_key(bam: &[u8]) -> Self {
         let (raw_name, flags) = extract_raw_name_and_flags(bam);
-        Self { name: raw_name.to_vec(), flags }
+        Self { name: SmallVec::from_slice(raw_name), flags }
     }
 }
 
@@ -682,6 +724,21 @@ impl RawSortKey for RawQuerynameLexKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `RawQuerynameKey::default()` must produce a null-terminated `name` so the
+    /// `unsafe` `natural_compare_nul` in `cmp` never walks off the end of an
+    /// unterminated buffer (a derived `Default` would leave `name` empty). The
+    /// default orders before any non-empty name.
+    #[test]
+    fn default_queryname_key_is_null_terminated() {
+        let def = RawQuerynameKey::default();
+        assert_eq!(def.name(), &[0u8], "default name must be a single NUL terminator");
+        // cmp against a real key must not read out of bounds and must order the
+        // empty default first.
+        let real = RawQuerynameKey::new(b"read1".to_vec(), 0);
+        assert_eq!(def.cmp(&real), Ordering::Less);
+        assert_eq!(def.cmp(&RawQuerynameKey::default()), Ordering::Equal);
+    }
 
     // ========================================================================
     // queryname_flag_order tests
@@ -1630,5 +1687,96 @@ mod tests {
         const { assert!(RawQuerynameLexKey::EMBEDDED_IN_RECORD) };
         const { assert!(RawQuerynameKey::EMBEDDED_IN_RECORD) };
         const { assert!(RawCoordinateKey::EMBEDDED_IN_RECORD) };
+    }
+
+    // ========================================================================
+    // NameBuf heap-fallback (SSO spill) tests
+    //
+    // `NameBuf` inlines names up to 24 bytes and spills longer ones to the
+    // heap. Read names in real data are almost always short, so the common
+    // unit tests above only exercise the inline path. These tests explicitly
+    // drive names past the inline capacity for BOTH key kinds (lexicographic
+    // and natural) across every surface that touches a `NameBuf`: `new`,
+    // `extract_from_record`, the `write_to`/`read_from` serialization
+    // roundtrip, and ordering — so the heap-backed path can never silently
+    // regress.
+    // ========================================================================
+
+    /// A read name comfortably longer than `NameBuf`'s 24-byte inline capacity,
+    /// so the backing `SmallVec` is forced onto the heap. The trailing `9` /
+    /// `10` lets a paired name below expose the lex-vs-natural ordering split.
+    const HEAP_NAME_PREFIX: &[u8] = b"A00123:45:HGVWXDSXY:1:1101:12345:";
+
+    #[test]
+    fn test_natural_key_heap_name_serialization_roundtrip() {
+        let name = [HEAP_NAME_PREFIX, b"67890"].concat();
+        assert!(name.len() > 24, "test name must exceed NameBuf inline capacity");
+
+        let key = RawQuerynameKey::new(name.clone(), 42);
+        // `new` appends the NUL terminator that `natural_compare_nul` relies on.
+        assert_eq!(key.name(), [name.as_slice(), b"\0"].concat().as_slice());
+
+        let mut buf = Vec::new();
+        key.write_to(&mut buf).expect("write_to should succeed");
+        let mut cursor = std::io::Cursor::new(&buf);
+        let restored = RawQuerynameKey::read_from(&mut cursor).expect("read_from should succeed");
+
+        assert_eq!(key, restored);
+        assert_eq!(restored.name(), key.name(), "heap name (incl. NUL) must survive roundtrip");
+    }
+
+    #[test]
+    fn test_lex_key_heap_name_serialization_roundtrip() {
+        let name = [HEAP_NAME_PREFIX, b"67890"].concat();
+        assert!(name.len() > 24, "test name must exceed NameBuf inline capacity");
+
+        let key = RawQuerynameLexKey::new(name.clone(), 42);
+        assert_eq!(key.name(), name.as_slice());
+
+        let mut buf = Vec::new();
+        key.write_to(&mut buf).expect("write_to should succeed");
+        let mut cursor = std::io::Cursor::new(&buf);
+        let restored =
+            RawQuerynameLexKey::read_from(&mut cursor).expect("read_from should succeed");
+
+        assert_eq!(key, restored);
+        assert_eq!(restored.name(), key.name(), "heap name must survive roundtrip");
+    }
+
+    #[test]
+    fn test_queryname_keys_extract_from_record_heap_name() {
+        use fgumi_raw_bam::testutil::make_bam_bytes;
+
+        let name = [HEAP_NAME_PREFIX, b"67890"].concat();
+        assert!(name.len() > 24, "test name must exceed NameBuf inline capacity");
+        let bam = make_bam_bytes(0, 0, 0, &name, &[], 100, -1, -1, &[]);
+
+        // Lexicographic: the extracted name is the raw name, no NUL.
+        let lex = RawQuerynameLexKey::extract_from_record(&bam);
+        assert_eq!(lex.name(), name.as_slice());
+
+        // Natural: the extracted name is NUL-terminated for `natural_compare_nul`.
+        let nat = RawQuerynameKey::extract_from_record(&bam);
+        assert_eq!(nat.name(), [name.as_slice(), b"\0"].concat().as_slice());
+    }
+
+    #[test]
+    fn test_heap_name_lex_vs_natural_ordering_difference() {
+        // Both names spill to the heap; they differ only in the numeric suffix
+        // `9` vs `10`, so the two comparators disagree exactly as they do for
+        // short names — proving the split is preserved on the heap-backed path.
+        let name_9 = [HEAP_NAME_PREFIX, b"9"].concat();
+        let name_10 = [HEAP_NAME_PREFIX, b"10"].concat();
+        assert!(name_9.len() > 24 && name_10.len() > 24, "names must exceed inline capacity");
+
+        // Lexicographic: '1' < '9', so `...:10` sorts before `...:9`.
+        let lex_9 = RawQuerynameLexKey::new(name_9.clone(), 0);
+        let lex_10 = RawQuerynameLexKey::new(name_10.clone(), 0);
+        assert!(lex_10 < lex_9, "lexicographic: '...:10' should be < '...:9'");
+
+        // Natural: 9 < 10 numerically, so `...:9` sorts before `...:10`.
+        let nat_9 = RawQuerynameKey::new(name_9, 0);
+        let nat_10 = RawQuerynameKey::new(name_10, 0);
+        assert!(nat_9 < nat_10, "natural: '...:9' should be < '...:10'");
     }
 }
