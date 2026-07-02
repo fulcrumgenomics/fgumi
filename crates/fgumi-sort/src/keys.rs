@@ -23,10 +23,20 @@
 //! - samtools' `bam1_tag` union (C)
 
 use noodles::sam::Header;
+use smallvec::SmallVec;
 use std::cmp::Ordering;
 
 use fgumi_raw_bam::RawRecordView;
 use std::io::{Read, Write};
+
+/// Inline-capacity buffer for queryname key name bytes. Illumina/SRA read names
+/// are short (typically ≤ ~24 bytes incl. the NUL), so an inline `SmallVec`
+/// keeps the name **contiguous inside the sort ref array** instead of a
+/// per-record heap allocation. During the comparison sort this eliminates the
+/// pointer-chase to scattered heap that dominates on memory-latency-bound cores
+/// (e.g. Graviton), where the queryname sort regressed vs the owned-`Vec` key.
+/// Names longer than the inline capacity spill to the heap transparently.
+type NameBuf = SmallVec<[u8; 24]>;
 
 // ============================================================================
 // Generic Sorting Abstraction (Trait-based, inspired by fgbio/samtools)
@@ -477,13 +487,18 @@ fn write_queryname_key<W: Write>(name: &[u8], flags: u16, writer: &mut W) -> std
 }
 
 /// Deserialize a queryname key from `[name_len: u16][name: bytes][flags: u16]`.
+///
+/// Reads the name straight into an inline [`NameBuf`] so the spill-merge read
+/// path allocates no per-record heap for short names — the merge-side analogue
+/// of the SSO key change on the ingest path.
 #[inline]
-fn read_queryname_key<R: Read>(reader: &mut R) -> std::io::Result<(Vec<u8>, u16)> {
+fn read_queryname_key<R: Read>(reader: &mut R) -> std::io::Result<(NameBuf, u16)> {
     let mut len_buf = [0u8; 2];
     reader.read_exact(&mut len_buf)?;
     let name_len = u16::from_le_bytes(len_buf) as usize;
 
-    let mut name = vec![0u8; name_len];
+    let mut name: NameBuf = SmallVec::new();
+    name.resize(name_len, 0);
     reader.read_exact(&mut name)?;
 
     let mut flags_buf = [0u8; 2];
@@ -503,8 +518,9 @@ fn read_queryname_key<R: Read>(reader: &mut R) -> std::io::Result<(Vec<u8>, u16)
 /// Serialization format: `[name_len: u16][name: bytes][flags: u16]`
 #[derive(Clone, Debug, Default)]
 pub struct RawQuerynameKey {
-    /// Read name bytes, null-terminated for `natural_compare_nul`.
-    name: Vec<u8>,
+    /// Read name bytes, null-terminated for `natural_compare_nul`. Inline for
+    /// short names (see [`NameBuf`]) so the comparison sort stays cache-local.
+    name: NameBuf,
     /// Flags for segment ordering (R1 before R2).
     flags: u16,
 }
@@ -526,7 +542,7 @@ impl RawQuerynameKey {
         if name.last() != Some(&0) {
             name.push(0);
         }
-        Self { name, flags }
+        Self { name: SmallVec::from_vec(name), flags }
     }
 
     /// Returns the read name bytes (including the null terminator).
@@ -543,8 +559,8 @@ impl RawQuerynameKey {
         let flags = queryname_flag_order(u16::from_le_bytes([bam[14], bam[15]]));
         match raw_name_with_nul(bam) {
             // BAM stores the name NUL-terminated, so copy those bytes directly
-            // instead of stripping the NUL and re-appending it.
-            Some(name) => Self { name: name.to_vec(), flags },
+            // (inline when short) instead of stripping the NUL and re-appending.
+            Some(name) => Self { name: SmallVec::from_slice(name), flags },
             // Truncated record: fall back to the stripped-name path (`new`
             // re-adds the terminator), preserving the prior bytes exactly.
             None => Self::new(extract_raw_name_and_flags(bam).0.to_vec(), flags),
@@ -590,8 +606,10 @@ impl RawSortKey for RawQuerynameKey {
 
     #[inline]
     fn read_from<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+        // `name` already carries its trailing NUL (written by `write_to`), so
+        // construct directly rather than via `new`, which would re-check/append.
         let (name, flags) = read_queryname_key(reader)?;
-        Ok(Self::new(name, flags))
+        Ok(Self { name, flags })
     }
 }
 
@@ -607,8 +625,9 @@ impl RawSortKey for RawQuerynameKey {
 /// Serialization format: `[name_len: u16][name: bytes][flags: u16]`
 #[derive(Clone, Eq, PartialEq, Debug, Default)]
 pub struct RawQuerynameLexKey {
-    /// Read name bytes.
-    name: Vec<u8>,
+    /// Read name bytes. Inline for short names (see [`NameBuf`]) so the
+    /// comparison sort stays cache-local.
+    name: NameBuf,
     /// Flags for segment ordering (R1 before R2).
     flags: u16,
 }
@@ -617,7 +636,7 @@ impl RawQuerynameLexKey {
     /// Create a new lexicographic queryname key.
     #[must_use]
     pub fn new(name: Vec<u8>, flags: u16) -> Self {
-        Self { name, flags }
+        Self { name: SmallVec::from_vec(name), flags }
     }
 
     /// Returns the read name bytes.
@@ -631,7 +650,7 @@ impl RawQuerynameLexKey {
     #[must_use]
     fn extract_queryname_key(bam: &[u8]) -> Self {
         let (raw_name, flags) = extract_raw_name_and_flags(bam);
-        Self { name: raw_name.to_vec(), flags }
+        Self { name: SmallVec::from_slice(raw_name), flags }
     }
 }
 

@@ -28,6 +28,7 @@ use crate::erased::ErasedStepCtx;
 use crate::runtime::contexts::ChainContexts;
 use crate::runtime::drain::StepDrainCounter;
 use crate::runtime::live::LiveSteps;
+use crate::runtime::scheduler::{Scheduler, WalkDirection};
 use crate::runtime::stats::PipelineStats;
 use crate::runtime::storage::WorkerStepEntry;
 use crate::runtime::worker_core::WorkerCore;
@@ -50,6 +51,7 @@ pub fn run_worker_loop(
     drain_counters: &[Arc<StepDrainCounter>],
     signal: &Arc<PipelineSignal>,
     stats: Option<&Arc<PipelineStats>>,
+    scheduler: &dyn Scheduler,
 ) {
     // Per-worker worklist of still-dispatchable steps, in chain order. A step
     // is removed when it returns `StepOutcome::Finished`; the worker exits once
@@ -78,6 +80,11 @@ pub fn run_worker_loop(
         }
 
         let mut did_work = false;
+
+        // Time the dispatch (busy) section vs the backoff sleep (idle) below,
+        // per worker, only when stats are on (`Instant::now()` is otherwise not
+        // called — the no-stats loop stays zero-cost).
+        let work_start = stats.map(|_| Instant::now());
 
         // 1. Sticky re-entry for sticky-owned steps (either an Exclusive
         // sticky step this worker owns, or a Serial+sticky step whose
@@ -143,6 +150,7 @@ pub fn run_worker_loop(
                 drain_counters,
                 signal,
                 stats,
+                scheduler.walk(),
             );
             did_work |= outcome.did_work;
             if outcome.removed_sticky_owner {
@@ -152,14 +160,32 @@ pub fn run_worker_loop(
             }
         }
 
-        // 3. Exponential-backoff sleep on no-progress; reset on progress.
+        // Attribute the dispatch section's wall time to this worker's busy total.
+        if let (Some(stats), Some(ws)) = (stats, work_start) {
+            stats.record_worker_busy(
+                worker.thread_id,
+                u64::try_from(ws.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            );
+        }
+
+        // 3. Exponential-backoff sleep on no-progress; reset on progress. The
+        // sleep is the worker's idle/blocked time — attribute it per worker so
+        // pool under-utilisation (cores parked while one worker drives a Serial
+        // step) is visible in `--pipeline-stats`.
         if did_work {
             worker.reset_backoff();
         } else if signal.is_done() {
             break;
         } else {
+            let sleep_start = stats.map(|_| Instant::now());
             worker.sleep_backoff();
             worker.increase_backoff();
+            if let (Some(stats), Some(ss)) = (stats, sleep_start) {
+                stats.record_worker_idle(
+                    worker.thread_id,
+                    u64::try_from(ss.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                );
+            }
         }
     }
 }
@@ -180,6 +206,7 @@ struct RoundRobinOutcome {
 /// [`RoundRobinOutcome::removed_sticky_owner`] when it finishes here, so the
 /// caller can disable the per-iteration sticky fast-path without a linear
 /// `live.contains` scan.
+#[allow(clippy::too_many_arguments)] // shared per-step state + the walk policy; a struct would not clarify
 fn round_robin_dispatch(
     entries: &mut [WorkerStepEntry],
     live: &mut LiveSteps,
@@ -188,6 +215,7 @@ fn round_robin_dispatch(
     drain_counters: &[Arc<StepDrainCounter>],
     signal: &Arc<PipelineSignal>,
     stats: Option<&Arc<PipelineStats>>,
+    walk: WalkDirection,
 ) -> RoundRobinOutcome {
     let mut did_work = false;
     // Steps that finished this pass, removed from `live` after the walk. A
@@ -195,10 +223,20 @@ fn round_robin_dispatch(
     // `break` on `Progress`/error, never revisit), so deferring removal is
     // safe and avoids reorder-under-iteration.
     let mut finished: Vec<StepIdx> = Vec::new();
-    for pos in 0..live.len() {
+    let n = live.len();
+    for i in 0..n {
         if signal.is_done() {
             break;
         }
+        // The Scheduler selects the walk DIRECTION over this worker's live
+        // steps: `Forward` = chain order (upstream-first, favour production);
+        // `Reverse` = downstream-first (favour draining buffered work before
+        // producing more). Everything else — skip-on-contention, the sticky
+        // source/sink fast-path, Finished handling — is direction-agnostic.
+        let pos = match walk {
+            WalkDirection::Forward => i,
+            WalkDirection::Reverse => n - 1 - i,
+        };
         let step_idx = live.order()[pos];
         let entry = &mut entries[step_idx.0];
         let mut mark_skip = false;
@@ -394,14 +432,26 @@ mod tests {
     fn run_worker_loop_exits_on_signal_done() {
         let signal = PipelineSignal::new();
         let mut entries: Vec<WorkerStepEntry> = vec![];
-        let contexts =
-            Arc::new(ChainContexts { inputs: vec![], outputs: vec![], bounded_queues: vec![] });
+        let contexts = Arc::new(ChainContexts {
+            inputs: vec![],
+            outputs: vec![],
+            bounded_queues: vec![],
+            edges: vec![],
+        });
         let drain_counters: Vec<Arc<StepDrainCounter>> = vec![];
         let _ = ChainGraph::new();
         let mut worker = WorkerCore::new(0, None, None);
 
         signal.cancel();
-        run_worker_loop(&mut worker, &mut entries, &contexts, &drain_counters, &signal, None);
+        run_worker_loop(
+            &mut worker,
+            &mut entries,
+            &contexts,
+            &drain_counters,
+            &signal,
+            None,
+            &crate::runtime::scheduler::ChainOrderScheduler,
+        );
         // If we reach this line, the loop exited cleanly.
     }
 
@@ -576,7 +626,11 @@ mod tests {
     fn parallel_last_finisher_closes_shared_output_exactly_once() {
         const N: usize = 4;
         let (steps, graph, _runs) = three_step_chain(StepKind::Parallel);
-        let contexts = Arc::new(build_chain_contexts(&steps, &graph));
+        let contexts = Arc::new(build_chain_contexts(
+            &steps,
+            &graph,
+            crate::builder::InstrumentationLevel::Off,
+        ));
         let mid = StepIdx(1);
         let counter = StepDrainCounter::new(N);
         let signal = PipelineSignal::new();
@@ -607,7 +661,11 @@ mod tests {
     #[test]
     fn serial_drain_gate_short_circuits_second_worker() {
         let (steps, graph, runs) = three_step_chain(StepKind::Serial);
-        let contexts = Arc::new(build_chain_contexts(&steps, &graph));
+        let contexts = Arc::new(build_chain_contexts(
+            &steps,
+            &graph,
+            crate::builder::InstrumentationLevel::Off,
+        ));
         let mid = StepIdx(1);
         let counter = StepDrainCounter::new(1);
         let signal = PipelineSignal::new();
@@ -654,7 +712,11 @@ mod tests {
         graph.wire(src, BranchIdx(0), sink);
         let steps: Vec<Box<dyn ErasedStep>> =
             vec![Box::new(TypedStep::new(SrcFinished)), Box::new(TypedStep::new(SinkStep))];
-        let contexts = Arc::new(build_chain_contexts(&steps, &graph));
+        let contexts = Arc::new(build_chain_contexts(
+            &steps,
+            &graph,
+            crate::builder::InstrumentationLevel::Off,
+        ));
 
         // Single worker; the source (idx 0) is its Exclusive sticky owner, the
         // sink (idx 1) is Exclusive owned by the same worker for this 1-worker
@@ -669,7 +731,15 @@ mod tests {
 
         // The source finishes immediately; the sink then sees its input drained
         // and finishes too. `run_worker_loop` must return (no hang).
-        run_worker_loop(&mut worker, &mut entries, &contexts, &drain_counters, &signal, None);
+        run_worker_loop(
+            &mut worker,
+            &mut entries,
+            &contexts,
+            &drain_counters,
+            &signal,
+            None,
+            &crate::runtime::scheduler::ChainOrderScheduler,
+        );
     }
 
     /// A sticky owner that returns `NoProgress` on its first call (yielding out
@@ -701,7 +771,11 @@ mod tests {
             Box::new(TypedStep::new(SrcIdleThenFinish { calls: Arc::clone(&calls) })),
             Box::new(TypedStep::new(LingerThenFinish { ticks: 0 })),
         ];
-        let contexts = Arc::new(build_chain_contexts(&steps, &graph));
+        let contexts = Arc::new(build_chain_contexts(
+            &steps,
+            &graph,
+            crate::builder::InstrumentationLevel::Off,
+        ));
 
         let mut entries: Vec<WorkerStepEntry> = vec![
             WorkerStepEntry::Exclusive { step: steps.into_iter().next().unwrap() },
@@ -718,7 +792,15 @@ mod tests {
         // disable the sticky fast-path so the loop terminates rather than hangs.
         // The `Linger` step stays alive for one more iteration, forcing the
         // post-removal outer iteration that exercises the cleared fast path.
-        run_worker_loop(&mut worker, &mut entries, &contexts, &drain_counters, &signal, None);
+        run_worker_loop(
+            &mut worker,
+            &mut entries,
+            &contexts,
+            &drain_counters,
+            &signal,
+            None,
+            &crate::runtime::scheduler::ChainOrderScheduler,
+        );
 
         // The source must have been called EXACTLY twice: call 1 = idle in the
         // sticky fast-path (`NoProgress`, which does NOT remove it there — that

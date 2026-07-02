@@ -33,6 +33,22 @@ pub enum StepKind {
     /// assigns owners at run start in chain declaration order. Other
     /// workers skip the step entirely.
     Exclusive,
+    /// Runs on its own **dedicated OS thread**, spawned at run start
+    /// alongside the deadlock-monitor / queue-rebalancer — never dispatched
+    /// by the work-stealing pool. The dedicated thread drives the step with
+    /// a *blocking* loop (park on empty input / full output via the
+    /// `BlockingQueue` facet) instead of the pool's cooperative
+    /// `try_run`-and-reschedule, so the step consumes no pool worker slot.
+    ///
+    /// This mirrors the legacy sort's "N + 2" threading: N pool workers do
+    /// the parallel (compression-bound) work while the merge and the output
+    /// writer each occupy a dedicated thread, keeping the pool saturated.
+    ///
+    /// **Opt-in.** No existing step declares `Detached`; it is wired only on
+    /// the standalone sort chain's merge + writer. A single shared instance
+    /// (like `Serial`/`Exclusive`, never `new_worker_copy`'d) runs on the
+    /// dedicated thread; every pool worker gets a `Skip` entry for it.
+    Detached,
 }
 
 /// Optional scheduling hint for `Serial` steps. Restricts which worker(s)

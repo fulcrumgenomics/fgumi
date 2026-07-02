@@ -392,7 +392,7 @@ fn test_full_pipeline_extract_to_filter() {
         // Extract emits SO:unsorted GO:query (no SS); `fgumi group` requires
         // template-coordinate sorted input, so put the sort step between them.
         let sorted = tmp.path().join(format!("sorted_{suffix}.bam"));
-        Sort::try_parse_from([
+        let sort_cmd = Sort::try_parse_from([
             OsStr::new("sort"),
             OsStr::new("--input"),
             extracted.as_os_str(),
@@ -401,9 +401,9 @@ fn test_full_pipeline_extract_to_filter() {
             OsStr::new("--order"),
             OsStr::new("template-coordinate"),
         ])
-        .expect("failed to parse sort args")
-        .execute("fgumi sort")
-        .expect("sort failed");
+        .expect("failed to parse sort args");
+        fgumi_lib::commands::sort::execute_sort_command(&sort_cmd, "fgumi sort")
+            .expect("sort failed");
 
         let grouped = tmp.path().join(format!("grouped_{suffix}.bam"));
         GroupReadsByUmi::try_parse_from([
