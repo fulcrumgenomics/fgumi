@@ -269,6 +269,46 @@ the same box reference for a given `step_idx` (see
     safety argument applied to the typed `OutputHandles<S::Outputs>`
     view.
 
+### Approved hot-path unsafe (parallel-inflate sort ingest, fgumi-pipeline-io)
+
+The parallel-inflate sort ingest front (`ReadBlocks` → `InflateToArena` →
+`FindBoundariesAndSort`) decompresses BGZF blocks directly into pre-reserved,
+non-overlapping arena slots so the ingest hot path performs no per-record copy
+or allocation. `fgumi-pipeline-io` is `#![deny(unsafe_code)]`; the five
+production sites below are each `#[allow(unsafe_code)]` with a `// SAFETY:`
+comment, approved because ingest runs once per BGZF block for millions-to-
+billions of records and a safe rewrite (re-bounds-checking every slot write, or
+copying through an owned `Vec`) measurably regresses sort throughput. All sites
+are in `crates/fgumi-pipeline-io/src/sort/arena_ingest.rs`.
+
+- **`prefetch_read_l1`** — two `#[allow(unsafe_code)]` regions (`aarch64` `prfm
+  pldl1keep` and `x86_64` `_mm_prefetch`) in `FindBoundariesAndSort`'s
+  latency-bound serial boundary scan. SAFETY: both are *non-faulting prefetch
+  hints* — they never read/write observable memory and never trap, even on an
+  unmapped address; the pointer is taken from a live `&u8` the caller
+  bounds-checks. No-op on other architectures.
+- **`ReadBlocks::ensure_arena` `grow_uninit`** — grows the whole arena segment
+  to its full `segment_size` in one call on the serial admit path, BEFORE the
+  arena is wrapped in an `Arc` or any slice is handed out. SAFETY: sole writer,
+  no live borrow at grow time; `reserve_full_capacity` guarantees the capacity
+  so no realloc moves the storage; `u8` has no validity invariant and every live
+  byte is written exactly once (block slots by their inflate worker, the
+  `[0, FRONT_REGION)` carry region by `FindBoundariesAndSort`) before any read.
+- **`InflateToArena::inflate_one` `slice_mut`** — synthesizes the `&mut [u8]`
+  slot a worker decompresses into. SAFETY: `(offset, len)` was reserved by
+  `grow_uninit` on the serial `ReadBlocks` admit path; the ISIZE prefix-sum
+  partitions the arena into non-overlapping slots, so the slice aliases no other
+  concurrent inflate worker's slice; every byte is written by
+  `decompress_into_slice` before any read.
+- **`FindBoundariesAndSort` straddler-carry `slice_mut`** — writes a run's
+  leading straddler bytes into the arena's front region `[FRONT_REGION - l,
+  FRONT_REGION)`. SAFETY: soundness rests on DISJOINTNESS, not ordering — this
+  range lies strictly below `FRONT_REGION` while every inflate block slot lies at
+  or above it, so the slice aliases no slot a worker may concurrently be writing
+  (later blocks of the next run may still be inflating); the segment was frozen
+  with `reserve_full_capacity` before sharing, so no realloc moves these bytes
+  under a live slice; written exactly once per straddler per run.
+
 Any new `unsafe` site must extend this list and explain why the safe
 alternative is unacceptable. Do not introduce `unsafe` outside the crates
 listed in this section.

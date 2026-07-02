@@ -1,6 +1,8 @@
-//! `WriteBgzfFile` sink step. `Serial` + `Affinity::Writer`. Receives
-//! pre-compressed `BgzfBlock`s from `BgzfCompress` and writes them
-//! directly to disk.
+//! `WriteBgzfFile` sink step. `Serial + Affinity::Writer` by default, or
+//! `StepKind::Detached` (its own dedicated thread, off the pool) when built
+//! via [`WriteBgzfFile::with_detached`] — used only on the standalone-sort
+//! terminal (lever 2, legacy "N + 2"). Receives pre-compressed `BgzfBlock`s
+//! from `BgzfCompress` and writes them directly to disk.
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -13,13 +15,21 @@ use parking_lot::Mutex;
 use crate::types::BgzfBlock;
 use fgumi_pipeline_core::{
     header::HeaderHandle,
-    step::{Affinity, Step, StepCtx, StepKind, StepOutcome, StepProfile},
+    step::{Affinity, DetachedGroup, Step, StepCtx, StepKind, StepOutcome, StepProfile},
 };
 
-/// `Serial + sticky` BAM sink that consumes pre-compressed `BgzfBlock`s.
+/// `Serial + sticky` BAM sink (or `Detached` — see [`Self::with_detached`])
+/// that consumes pre-compressed `BgzfBlock`s.
 pub struct WriteBgzfFile {
     state: Mutex<Option<WriterState>>,
     name: &'static str,
+    /// When `Some`, advertise `StepKind::Detached` so the framework drives this
+    /// sink on its own dedicated driver thread (off the work-stealing pool) in the
+    /// given [`DetachedGroup`], instead of `Serial + Affinity::Writer`. The caller
+    /// (e.g. the sort chain) supplies the group via [`Self::with_detached`], so
+    /// this generic sink carries no chain-specific grouping. `None` (the default)
+    /// keeps the pool-scheduled writer that every other chain uses.
+    detached_group: Option<DetachedGroup>,
 }
 
 struct WriterState {
@@ -59,7 +69,23 @@ impl WriteBgzfFile {
         Ok(Self {
             state: Mutex::new(Some(WriterState { out, pending_header: None })),
             name: "WriteBgzfFile",
+            detached_group: None,
         })
+    }
+
+    /// Run this sink on a dedicated `StepKind::Detached` driver thread (in the
+    /// given [`DetachedGroup`]) instead of as a pool-scheduled `Serial +
+    /// Affinity::Writer` step. Used ONLY on the standalone-sort terminal (lever 2):
+    /// it frees a pool worker for the compression-bound work, matching the legacy
+    /// sort's dedicated writer thread. The caller chooses the group so this generic
+    /// sink stays chain-agnostic. The `try_run` body and the bytes it writes are
+    /// unchanged — the driver pops blocks in the same (reorder-stage-ordered)
+    /// sequence — so the output BAM is byte-identical to the pool-scheduled writer.
+    /// Affinity is ignored for `Detached`.
+    #[must_use]
+    pub fn with_detached(mut self, group: DetachedGroup) -> Self {
+        self.detached_group = Some(group);
+        self
     }
 
     /// Open `path` and return the sink with the BAM header write
@@ -82,6 +108,7 @@ impl WriteBgzfFile {
                 pending_header: Some(PendingHeader { handle, compression_level }),
             })),
             name: "WriteBgzfFile",
+            detached_group: None,
         })
     }
 
@@ -116,14 +143,27 @@ impl Step for WriteBgzfFile {
     fn profile(&self) -> StepProfile {
         StepProfile {
             name: self.name,
-            kind: StepKind::Serial,
+            // Detached (own driver thread) when a group was set via
+            // `with_detached`; otherwise the default pool-scheduled Serial + sticky
+            // writer. `sticky` is irrelevant for Detached (it never enters a
+            // worker's worklist).
+            kind: if self.detached_group.is_some() { StepKind::Detached } else { StepKind::Serial },
             sticky: true,
             output_queues: vec![],
             branch_ordering: vec![],
         }
     }
 
+    fn detached_group(&self) -> DetachedGroup {
+        // The caller-supplied group (the sort chain passes `SORT_IO_GROUP`);
+        // `PerStep` fallback is unreachable for a Serial (non-detached) writer
+        // since `detached_group()` is only consulted for `Detached` steps.
+        self.detached_group.unwrap_or(DetachedGroup::PerStep)
+    }
+
     fn affinity(&self) -> Affinity {
+        // Ignored for `Detached` (no pool worker drives it); kept for the
+        // default Serial path where it pins the writer to the last worker.
         Affinity::Writer
     }
 
@@ -198,6 +238,25 @@ mod tests {
         assert_eq!(step.affinity(), Affinity::Writer);
         assert_eq!(profile.output_queues.len(), 0);
         assert_eq!(profile.branch_ordering.len(), 0);
+    }
+
+    /// L2.6: `with_detached()` flips the profile kind to `Detached` (its own
+    /// thread, off the pool) while leaving everything else — name, the
+    /// (now-irrelevant) sticky flag, the empty output edges — unchanged. The
+    /// default constructors stay `Serial`, so only the standalone-sort terminal
+    /// that opts in is affected.
+    #[test]
+    fn with_detached_advertises_detached_kind() {
+        let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let header = empty_header();
+        let step = WriteBgzfFile::new(&path, &header, 1)
+            .unwrap()
+            .with_detached(DetachedGroup::Shared("test-io"));
+        let profile = step.profile();
+        assert_eq!(profile.name, "WriteBgzfFile");
+        assert_eq!(profile.kind, StepKind::Detached);
+        assert_eq!(step.detached_group(), DetachedGroup::Shared("test-io"));
+        assert_eq!(profile.output_queues.len(), 0);
     }
 
     #[test]
