@@ -11,7 +11,6 @@
 //! box without samtools.
 
 use clap::Parser;
-use fgumi_lib::commands::command::Command as FgumiCommand;
 use fgumi_lib::commands::sort::Sort;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
@@ -97,7 +96,8 @@ fn create_test_bam(dir: &Path) -> std::path::PathBuf {
     bam_path
 }
 
-/// Sort `input` into `output` (coordinate order) in-process via `Sort::execute`.
+/// Sort `input` into `output` (coordinate order) in-process via
+/// `execute_sort_command` (the production standalone-sort entry point).
 ///
 /// `write_index` toggles `--write-index`; `threads` sets `-@`. Paths are passed
 /// as `&OsStr` so `try_parse_from` does not UTF-8 round-trip non-UTF-8 temp dirs.
@@ -121,7 +121,7 @@ fn run_coordinate_sort(input: &Path, output: &Path, write_index: bool, threads: 
     }
 
     let cmd = Sort::try_parse_from(args).expect("failed to parse sort args");
-    cmd.execute("fgumi sort").expect("fgumi sort failed");
+    fgumi_lib::commands::sort::execute_sort_command(&cmd, "fgumi sort").expect("fgumi sort failed");
 }
 
 /// Return the sorted read names returned by a samtools region query against a
@@ -186,7 +186,8 @@ fn test_sort_write_index() {
     ])
     .expect("failed to parse sort args");
 
-    cmd.execute("fgumi sort").expect("fgumi sort --write-index failed");
+    fgumi_lib::commands::sort::execute_sort_command(&cmd, "fgumi sort")
+        .expect("fgumi sort --write-index failed");
     assert!(sorted_bam_path.exists(), "Output BAM not created");
     assert!(index_path.exists(), "Output BAI not created");
 
@@ -224,7 +225,8 @@ fn test_sort_write_index_multithreaded() {
     ])
     .expect("failed to parse sort args");
 
-    cmd.execute("fgumi sort").expect("fgumi sort --write-index -@ 4 failed");
+    fgumi_lib::commands::sort::execute_sort_command(&cmd, "fgumi sort")
+        .expect("fgumi sort --write-index -@ 4 failed");
     assert!(sorted_bam_path.exists(), "Output BAM not created");
     assert!(index_path.exists(), "Output BAI not created");
 
@@ -342,7 +344,7 @@ fn test_write_index_requires_coordinate_sort() {
     ])
     .expect("failed to parse sort args");
 
-    let result = cmd.execute("fgumi sort");
+    let result = fgumi_lib::commands::sort::execute_sort_command(&cmd, "fgumi sort");
     assert!(result.is_err(), "fgumi sort --order queryname --write-index should fail");
 
     let err_msg = format!("{:#}", result.unwrap_err());

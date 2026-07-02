@@ -144,6 +144,22 @@ pub fn build_worker_storage(
                 }
                 entries[owner][step_idx] = WorkerStepEntry::Exclusive { step };
             }
+            StepKind::Detached => {
+                // A Detached step never runs on the pool: every worker gets a
+                // `Skip` placeholder. The step instance is driven on its own
+                // dedicated thread, extracted by `extract_detached_steps`
+                // (L2.3) BEFORE this function is called — so by the time we
+                // reach here a Detached step should not exist. Until the
+                // detached runtime is wired, `Pipeline::run` rejects a chain
+                // that still contains one (see the not-yet-wired guard), so
+                // this arm is unreachable in a real run; we keep it (Skip for
+                // all + drop the orphan instance) so the type system stays
+                // exhaustive and unit tests can introspect the dispatch lists.
+                for entries_for_worker in &mut entries {
+                    entries_for_worker.push(WorkerStepEntry::Skip);
+                }
+                drop(step);
+            }
         }
     }
 
@@ -227,9 +243,40 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct DetachedStep;
+    impl Step for DetachedStep {
+        type Input = u32;
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            profile_for("Det", StepKind::Detached, false)
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::NoProgress)
+        }
+    }
+
     #[test]
     fn skip_is_not_dispatchable() {
         assert!(!WorkerStepEntry::Skip.is_dispatchable());
+    }
+
+    /// L2.1: a `Detached` step is excluded from every pool worker's dispatch
+    /// list (all workers get `Skip`). The dedicated-thread extraction is L2.3;
+    /// here we only prove the pool never sees it.
+    #[test]
+    fn detached_step_is_skipped_on_all_workers() {
+        let steps: Vec<Box<dyn ErasedStep>> = vec![Box::new(TypedStep::new(DetachedStep))];
+        let owners = vec![None];
+        let entries = build_worker_storage(steps, &owners, 4);
+        assert_eq!(entries.len(), 4);
+        for w in &entries {
+            assert_eq!(w.len(), 1);
+            assert!(
+                matches!(w[0], WorkerStepEntry::Skip),
+                "Detached step must be Skip on every pool worker"
+            );
+        }
     }
 
     #[test]

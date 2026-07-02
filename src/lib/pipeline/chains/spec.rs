@@ -34,15 +34,13 @@ pub struct ChainSpec {
 }
 
 impl ChainSpec {
-    /// Whether this is the standalone sort-terminal chain (`[Stage::Sort]`).
+    /// Whether this is the standalone sort chain (`[Stage::Sort]` only).
     ///
-    /// This layout is special: `build_for` skips `add_source`/`add_sink` and the
-    /// terminal `SortBamFile` step opens and reads the input itself. Both the
-    /// source/sink skip in `build_for` and the header-open skip in
-    /// `ChainBuilder::new` MUST agree on this predicate — if they drift, a
-    /// sort-terminal chain could open its source twice (draining a stdin pipe
-    /// before the sort engine reads it). Single-source the test here so the two
-    /// call sites cannot disagree.
+    /// Standalone sort no longer has a special build path — like every other
+    /// chain it runs through `add_source` → sort stage → `add_sink`. This
+    /// predicate is the spec classifier for the sole-`[Sort]` layout: `add_sort`
+    /// calls it (as `is_standalone_sort`) to honour `--sort::max-memory=auto`
+    /// only when sort owns the whole memory budget, and `validate` uses it.
     #[must_use]
     pub fn is_sort_terminal(&self) -> bool {
         matches!(self.stages.as_slice(), [Stage::Sort])

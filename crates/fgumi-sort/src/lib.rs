@@ -41,7 +41,10 @@ use tempfile::TempDir;
 
 // All sub-modules are crate-private. Items intended for external consumers are
 // re-exported at the crate root below.
+pub mod arena_pool;
 pub(crate) mod bgzf_io;
+pub(crate) mod block_offsets;
+pub(crate) mod chunk_sorter;
 pub mod codec;
 pub(crate) mod external;
 pub(crate) mod inline;
@@ -55,8 +58,17 @@ pub(crate) mod pooled_chunk_writer;
 pub(crate) mod radix;
 pub(crate) mod read_ahead;
 pub(crate) mod reader;
-pub(crate) mod segmented_buf;
+pub mod ref_sort;
+pub mod segmented_buf;
+pub mod template_arena;
+// Block-granular spill compression kernel for the block-parallel spill steps
+// (`SpillGather`/`SpillCompress`/`SpillWrite`). Surfaced via the re-exports
+// below.
+pub(crate) mod spill_block;
 pub(crate) mod spill_block_reader;
+// Synchronous inline spill compress for the P6 `CompressSpill` step (retires the
+// `SortWorkerPool` compress path). Surfaced via `write_sorted_chunk` below.
+pub(crate) mod sync_spill_writer;
 pub(crate) mod tmp_dir_alloc;
 pub(crate) mod verify;
 pub(crate) mod worker_pool;
@@ -165,15 +177,18 @@ fn create_temp_dir(base: Option<&Path>) -> Result<TempDir> {
     }
 }
 
+pub use arena_pool::{ArenaPool, PooledSegmentedBuf};
+pub use chunk_sorter::{CoordinateChunkSorter, TemplateChunkSorter};
 pub use codec::SpillCodec;
+pub use external::MemorySources;
 pub use external::{
-    CoordinateSortStream, KeyTypesSpec, LibraryLookup, MergeDriver, MergeDriverDyn, MergeStep,
-    QuerynameSortStream, QuerynameSortStreamGeneric, RawExternalSorter, SlotSetup,
-    TemplateCoordinateSortStream, cb_hasher, extract_template_key_inline,
+    KeyTypesSpec, LibraryLookup, MergeDriver, MergeDriverDyn, MergeStep, RawExternalSorter,
+    cb_hasher, extract_template_key_inline, open_spill_slot,
 };
 pub use inline::{
-    PackedCoordinateKey, RecordRef, TemplateKey, extract_coordinate_key_inline,
-    radix_sort_record_refs, radix_sort_record_refs_with_max,
+    CbKey32, InMemoryChunk, PackedCoordinateKey, RecordBuffer, RecordRef, SORT_SEGMENT_SIZE,
+    TemplateKey, TemplateKey24, TertKey32, extract_coordinate_key_inline, radix_sort_record_refs,
+    radix_sort_record_refs_with_max,
 };
 pub use keys::{
     QuerynameComparator, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
@@ -181,7 +196,17 @@ pub use keys::{
 };
 pub use merge_slots::{PHASE2_DECOMP_CAP, SortMergeSlot};
 pub use reader::RawBamRecordReader;
+pub use ref_sort::{
+    coordinate_chunk_from_arena_refs, coordinate_chunk_from_refs, queryname_chunk_from_arena_refs,
+};
+pub use segmented_buf::SegmentedBuf;
+pub use spill_block::{SpillBlockCompressor, frame_keyed_record_into, spill_magic, spill_trailer};
 pub use spill_block_reader::SpillBlockDecompressor;
+pub use sync_spill_writer::{write_sorted_chunk, write_sorted_chunk_inmem};
+pub use template_arena::{
+    TemplateArenaAccumulator, TemplateMemChunk, template_chunk_from_arena_refs,
+};
+pub use tmp_dir_alloc::TmpDirAllocator;
 pub use verify::{VerifySummary, verify_sort_order};
 
 #[cfg(test)]

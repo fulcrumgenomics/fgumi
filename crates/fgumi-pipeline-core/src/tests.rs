@@ -74,6 +74,7 @@ fn step2_typed_dispatch_pairs_both_branches() {
     let (a_set, a_view) = <Single<u32> as super::outputs::StepOutputs>::build_queues(
         &[QueueSpec::CountBounded { capacity: 4 }],
         &[BranchOrdering::None],
+        crate::builder::InstrumentationLevel::Off,
     );
     let a_outputs: super::step::OutputHandles<Single<u32>> =
         super::step::OutputHandles::new(a_view);
@@ -82,6 +83,7 @@ fn step2_typed_dispatch_pairs_both_branches() {
     let (b_set, b_view) = <Single<u32> as super::outputs::StepOutputs>::build_queues(
         &[QueueSpec::CountBounded { capacity: 4 }],
         &[BranchOrdering::None],
+        crate::builder::InstrumentationLevel::Off,
     );
     let b_outputs: super::step::OutputHandles<Single<u32>> =
         super::step::OutputHandles::new(b_view);
@@ -96,7 +98,8 @@ fn step2_typed_dispatch_pairs_both_branches() {
     assert_eq!(sum_step.input_arity(), 2);
 
     // Merge step's output set.
-    let (mut merge_outset, merge_view) = sum_step.build_output_set();
+    let (mut merge_outset, merge_view) =
+        sum_step.build_output_set(crate::builder::InstrumentationLevel::Off);
     let merge_outputs_any = sum_step.wrap_outputs_view(merge_view);
     let merge_consumer_input = merge_outset.take_typed_input::<u64>(0);
 
@@ -144,6 +147,7 @@ fn step2_build_two_input_handles_rejects_duplicate_producer() {
     let (a_set, _a_view) = <Single<u32> as super::outputs::StepOutputs>::build_queues(
         &[QueueSpec::CountBounded { capacity: 4 }],
         &[BranchOrdering::None],
+        crate::builder::InstrumentationLevel::Off,
     );
     let mut producer_sets = vec![a_set];
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

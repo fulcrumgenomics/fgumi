@@ -407,7 +407,7 @@ pub struct ThreadingOptions {
     ///
     /// If not specified, uses a single-threaded fast path optimized for
     /// simple streaming. When specified (even with --threads 1), uses the
-    /// typed-step round-robin pipeline.
+    /// typed-step work-stealing pipeline.
     #[arg(long = "threads")]
     pub threads: Option<usize>,
 }
@@ -437,6 +437,21 @@ pub struct SchedulerOptions {
     #[arg(long = "pipeline-stats", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool, hide = true)]
     pub pipeline_stats: bool,
 
+    /// Per-edge instrumentation level: off | summary | timeline | deep.
+    ///
+    /// `summary` adds per-edge throughput/occupancy/latency + a bottleneck
+    /// verdict to the end-of-run report; `timeline` also writes a per-tick TSV
+    /// (see `--pipeline-trace-out`); `deep` adds direct dwell/park-time latency.
+    /// Diagnostic only — throughput is slightly depressed under tracing; confirm
+    /// final wall/RSS with the flag off. Overridable via `FGUMI_PIPELINE_TRACE`.
+    #[arg(long = "pipeline-trace", default_value = "off", value_parser = ["off", "summary", "timeline", "deep"], hide = true)]
+    pub pipeline_trace: String,
+
+    /// Path for the `--pipeline-trace timeline` per-tick TSV
+    /// (default `pipeline-trace.tsv` in the working directory).
+    #[arg(long = "pipeline-trace-out", hide = true)]
+    pub pipeline_trace_out: Option<std::path::PathBuf>,
+
     /// Timeout in seconds for deadlock detection (default: 10, 0 = disabled).
     ///
     /// When no progress is made for this duration, a warning is logged with
@@ -461,6 +476,22 @@ impl SchedulerOptions {
     #[must_use]
     pub fn collect_stats(&self) -> bool {
         self.pipeline_stats
+    }
+
+    /// Resolve the instrumentation level from `--pipeline-trace`, with the
+    /// `FGUMI_PIPELINE_TRACE` env var taking precedence (so standalone commands
+    /// can enable it without flattening the flag). Unknown values → `Off`.
+    #[must_use]
+    pub fn instrumentation_level(&self) -> crate::pipeline::core::builder::InstrumentationLevel {
+        use crate::pipeline::core::builder::InstrumentationLevel as L;
+        let raw =
+            std::env::var("FGUMI_PIPELINE_TRACE").unwrap_or_else(|_| self.pipeline_trace.clone());
+        match raw.as_str() {
+            "summary" => L::Summary,
+            "timeline" => L::Timeline,
+            "deep" => L::Deep,
+            _ => L::Off,
+        }
     }
 
     /// Returns the deadlock detection timeout in seconds (0 = disabled).
@@ -879,6 +910,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn instrumentation_level_maps_from_pipeline_trace_flag() {
+        use crate::pipeline::core::builder::InstrumentationLevel as L;
+        // Only valid when the env override is unset (diagnostic var, not set in CI).
+        if std::env::var_os("FGUMI_PIPELINE_TRACE").is_some() {
+            return;
+        }
+        let mut s = SchedulerOptions::default();
+        assert_eq!(s.instrumentation_level(), L::Off, "default off");
+        s.pipeline_trace = "summary".to_string();
+        assert_eq!(s.instrumentation_level(), L::Summary);
+        s.pipeline_trace = "timeline".to_string();
+        assert_eq!(s.instrumentation_level(), L::Timeline);
+        s.pipeline_trace = "deep".to_string();
+        assert_eq!(s.instrumentation_level(), L::Deep);
+    }
+
+    #[test]
     fn test_none_is_single_threaded() {
         let opts = ThreadingOptions::none();
         assert!(opts.is_single_threaded());
@@ -1006,6 +1054,7 @@ mod tests {
             deadlock_timeout: 10,
             deadlock_recover: false,
             scheduler: None,
+            ..Default::default()
         };
         assert!(opts.collect_stats());
     }
@@ -1017,6 +1066,7 @@ mod tests {
             deadlock_timeout: 30,
             deadlock_recover: false,
             scheduler: None,
+            ..Default::default()
         };
         assert_eq!(opts.deadlock_timeout_secs(), 30);
     }
@@ -1028,6 +1078,7 @@ mod tests {
             deadlock_timeout: 10,
             deadlock_recover: true,
             scheduler: None,
+            ..Default::default()
         };
         assert!(opts.deadlock_recover_enabled());
     }

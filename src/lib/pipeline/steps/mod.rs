@@ -26,7 +26,6 @@ pub mod process;
 pub mod roundtrip;
 pub mod serialize;
 pub mod serialize_processed;
-pub mod serialize_record_batch;
 pub mod sink;
 pub mod sort;
 pub mod source;

@@ -15,7 +15,6 @@ use crate::pipeline::core::outputs::OrderedBytesSingle;
 use crate::pipeline::core::queues::QueueSpec;
 use crate::pipeline::core::reorder::BranchOrdering;
 use crate::pipeline::core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
-use crate::pipeline::steps::serialize_record_batch::frame_record_into;
 use crate::pipeline::steps::types::{BamTemplateBatch, DecompressedBlock};
 
 /// Per-worker serialization scratch capacity. Sized to the typical
@@ -23,6 +22,29 @@ use crate::pipeline::steps::types::{BamTemplateBatch, DecompressedBlock};
 /// Mirrors legacy `bam.rs:1561` `SERIALIZATION_BUFFER_CAPACITY` (64 KiB)
 /// scaled up to match the new framework's larger batch sizes.
 const SERIALIZE_SCRATCH_CAPACITY: usize = 1024 * 1024;
+
+/// Append one BAM-framed record (4-byte little-endian `block_size` + body)
+/// into `scratch`. This is the canonical on-disk BAM record framing used by
+/// the output path; the terminal standalone-sort path inlines the identical
+/// layout in `SortMerge`'s `BlockBuilder` (`fgumi-pipeline-io`), which must
+/// stay byte-for-byte in sync with this helper.
+///
+/// # Errors
+///
+/// Returns `io::ErrorKind::InvalidData` if `body.len()` exceeds `u32::MAX` —
+/// unreachable in practice (BAM body size is u32-bounded and
+/// `tuning.per_step_byte_limit` is 4 MiB by default).
+fn frame_record_into(scratch: &mut Vec<u8>, body: &[u8]) -> io::Result<()> {
+    let block_size = u32::try_from(body.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("record exceeds u32 BAM block_size: {}", body.len()),
+        )
+    })?;
+    scratch.extend_from_slice(&block_size.to_le_bytes());
+    scratch.extend_from_slice(body);
+    Ok(())
+}
 
 /// `Parallel + ByItemOrdinal` serializer. Templates → record-aligned bytes.
 pub struct SerializeBamRecords {
@@ -171,5 +193,26 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].as_ref(), r1.as_ref());
         assert_eq!(parsed[1].as_ref(), r2.as_ref());
+    }
+
+    /// `frame_record_into` writes `[u32 LE block_size][body]` and is the
+    /// canonical layout the terminal-sort `BlockBuilder` must reproduce
+    /// byte-for-byte; verify the exact prefix + body layout here.
+    #[test]
+    fn frame_record_into_writes_le_prefix_then_body() {
+        let mut scratch = Vec::new();
+        frame_record_into(&mut scratch, &[0xAA; 8]).unwrap();
+        frame_record_into(&mut scratch, &[0xBB; 12]).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&8u32.to_le_bytes());
+        expected.extend_from_slice(&[0xAA; 8]);
+        expected.extend_from_slice(&12u32.to_le_bytes());
+        expected.extend_from_slice(&[0xBB; 12]);
+        assert_eq!(scratch, expected);
+        // Round-trips through the BAM record parser.
+        let parsed = parse_records(&scratch).expect("parse");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].as_ref(), &[0xAA; 8]);
+        assert_eq!(parsed[1].as_ref(), &[0xBB; 12]);
     }
 }

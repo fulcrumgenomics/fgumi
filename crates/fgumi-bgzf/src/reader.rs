@@ -433,6 +433,33 @@ pub fn decompress_block_slice_into(
     )
 }
 
+/// Decompress a full BGZF block's DEFLATE payload into a caller-provided,
+/// pre-sized slice. `out.len()` must equal the block's ISIZE (uncompressed size).
+/// Returns the number of bytes written (== ISIZE on success). This is the
+/// fixed-slice analogue of [`decompress_block_slice_into`] (which appends to a
+/// `Vec`); it lets a caller decompress straight into an arena slot.
+///
+/// # Errors
+///
+/// Returns an `io::Error` if `block` is too short to contain a valid BGZF
+/// header + footer, if the DEFLATE stream is invalid, or if it does not fill `out`.
+pub fn decompress_into_slice(
+    block: &[u8],
+    decompressor: &mut Decompressor,
+    out: &mut [u8],
+) -> io::Result<usize> {
+    if block.len() < BGZF_HEADER_SIZE + BGZF_FOOTER_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "BGZF block too short to contain header + footer",
+        ));
+    }
+    let compressed = &block[BGZF_HEADER_SIZE..block.len() - BGZF_FOOTER_SIZE];
+    decompressor.deflate_decompress(compressed, out).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("BGZF decompression failed: {e:?}"))
+    })
+}
+
 /// Decompress (or copy, for deflate stored blocks) BGZF block data into the
 /// output buffer and verify the result.
 ///
@@ -956,6 +983,46 @@ mod tests {
             "error should mention ISIZE mismatch: {err}"
         );
         assert!(out.is_empty(), "output should be rolled back on failure");
+    }
+
+    /// Decompress a full BGZF block into a pre-sized `&mut [u8]` slot and
+    /// confirm the bytes and returned length match the original payload.
+    #[test]
+    fn decompress_into_slice_fills_presized_slot() {
+        use crate::writer::InlineBgzfCompressor;
+
+        // Build one BGZF block from known bytes, then decompress it into a pre-sized
+        // &mut [u8] and confirm the bytes + returned length match the round trip.
+        let payload = b"the quick brown fox jumps over the lazy dog".repeat(100);
+        let mut compressor = InlineBgzfCompressor::new(6);
+        compressor.write_all(&payload).expect("write payload");
+        compressor.flush().expect("flush");
+        let blocks = compressor.take_blocks();
+        // Use the first block for the test (payload fits in one BGZF block at < 64 KiB).
+        let block = &blocks[0].data;
+        let isize = uncompressed_size_from_slice(block);
+        let mut out = vec![0u8; isize];
+        let mut d = Decompressor::new();
+        let n = decompress_into_slice(block, &mut d, &mut out).expect("decompress");
+        assert_eq!(n, payload.len());
+        assert_eq!(&out[..n], &payload[..]);
+    }
+
+    /// A block shorter than `BGZF_HEADER_SIZE + BGZF_FOOTER_SIZE` (26 bytes)
+    /// must return `InvalidData` rather than panicking with an index-out-of-bounds
+    /// or subtract-overflow.
+    #[test]
+    fn decompress_into_slice_rejects_too_short_block() {
+        let mut d = Decompressor::new();
+        let mut out = vec![0u8; 16];
+        let short_block = vec![0u8; 10];
+        let err =
+            decompress_into_slice(&short_block, &mut d, &mut out).expect_err("expected an error");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::InvalidData,
+            "expected InvalidData for a too-short block, got {err:?}"
+        );
     }
 
     /// A BGZF block whose compressed payload is fewer than 5 bytes can't

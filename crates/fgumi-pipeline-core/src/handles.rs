@@ -223,6 +223,12 @@ impl<T: Send + HeapSize + 'static> BranchOutputHandle<T> {
 /// Consumer-side input handle for one branch. Implements `InputHandle<T>`.
 pub struct BranchInputHandle<T: Send + HeapSize + 'static> {
     inner: BranchInputInner<T>,
+    /// `Some` only on an instrumented edge. The **consumer-pop** side of the
+    /// edge's `EdgeMetrics` is recorded here (not at the transport queue),
+    /// because an ordered edge pops through a `ReorderStage` that drains the
+    /// transport in bulk — `pop` here is the real consumer pop. Shares the same
+    /// `Arc<EdgeMetrics>` as the producer transport (push side).
+    metrics: Option<Arc<crate::runtime::metrics::EdgeMetrics>>,
 }
 
 enum BranchInputInner<T: Send + HeapSize + 'static> {
@@ -241,17 +247,26 @@ impl<T: Send + HeapSize + 'static> BranchInputHandle<T> {
     /// implicitly drained from the start and never popped.
     #[must_use]
     pub fn always_drained() -> Self {
-        Self { inner: BranchInputInner::AlwaysDrained(PhantomData) }
+        Self { inner: BranchInputInner::AlwaysDrained(PhantomData), metrics: None }
     }
 }
 
 impl<T: Send + HeapSize + 'static> InputHandle<T> for BranchInputHandle<T> {
     fn pop(&self) -> Option<T> {
-        match &self.inner {
+        let item = match &self.inner {
             BranchInputInner::Direct(q) => q.try_pop(),
             BranchInputInner::Ordered(stage) => stage.try_pop_in_order(),
             BranchInputInner::AlwaysDrained(_) => None,
+        };
+        if let Some(m) = &self.metrics {
+            match &item {
+                // usize→u64 is lossless on every target we build for.
+                #[allow(clippy::cast_possible_truncation)]
+                Some(it) => m.record_pop(it.heap_size() as u64),
+                None => m.record_empty(),
+            }
         }
+        item
     }
 
     fn is_drained(&self) -> bool {
@@ -294,6 +309,10 @@ pub(crate) struct Branch<T: Send + HeapSize + 'static> {
     pub(crate) output: BranchOutputHandle<T>,
     pub(crate) input: BranchInputHandle<T>,
     pub(crate) bounded_queue_handle: Option<BranchBudgetHandles>,
+    /// `Some` on an instrumented edge — the shared `EdgeMetrics` (also held by
+    /// the transport queue for push counts and the input handle for pop counts).
+    /// Collected into the edge registry by `contexts.rs` Pass 1.5.
+    pub(crate) metrics: Option<Arc<crate::runtime::metrics::EdgeMetrics>>,
 }
 
 /// Build one branch from a queue spec + ordering directive, where `T` does
@@ -304,37 +323,58 @@ pub(crate) struct Branch<T: Send + HeapSize + 'static> {
 /// Panics on `QueueSpec::ByteBounded` (requires `T: HeapSize`; use the
 /// byte-aware build path) or on `BranchOrdering::ByItemOrdinal` (requires
 /// `T: Ordered`; use `build_branch_ordered`).
+/// Mint a per-edge [`EdgeMetrics`] when instrumentation is on, else `None`.
+/// Called once per branch in the `build_branch*` constructors; the same handle
+/// is shared by the transport (push counts) and the input handle (pop counts).
+fn edge_metrics(
+    level: crate::builder::InstrumentationLevel,
+) -> Option<Arc<crate::runtime::metrics::EdgeMetrics>> {
+    level.is_on().then(crate::runtime::metrics::EdgeMetrics::new)
+}
+
 pub(crate) fn build_branch<T: Send + HeapSize + 'static>(
     spec: QueueSpec,
     ordering: BranchOrdering,
+    level: crate::builder::InstrumentationLevel,
 ) -> Branch<T> {
     match (spec, ordering) {
         (QueueSpec::CountBounded { capacity }, BranchOrdering::None) => {
-            let q: Arc<dyn ItemQueue<T>> = Arc::new(CountBoundedQueue::<T>::new(capacity));
-            direct_branch(q, None)
+            let m = edge_metrics(level);
+            let q: Arc<dyn ItemQueue<T>> =
+                Arc::new(CountBoundedQueue::<T>::maybe_instrumented(capacity, m.clone()));
+            direct_branch(q, None, m)
         }
         (QueueSpec::CountBounded { capacity }, BranchOrdering::ByOrdinal) => {
-            let transport: Arc<dyn ItemQueue<Sequenced<T>>> =
-                Arc::new(CountBoundedQueue::<Sequenced<T>>::new(capacity));
+            let m = edge_metrics(level);
+            let transport: Arc<dyn ItemQueue<Sequenced<T>>> = Arc::new(CountBoundedQueue::<
+                Sequenced<T>,
+            >::maybe_instrumented(
+                capacity, m.clone()
+            ));
             ordered_branch(
                 transport,
                 OrdinalSource::Allocated(Arc::new(AtomicU64::new(0))),
                 Some(DEFAULT_REORDER_OVERFLOW_BYTES),
                 None,
+                m,
             )
         }
         (QueueSpec::Unbounded, BranchOrdering::None) => {
-            let q: Arc<dyn ItemQueue<T>> = Arc::new(UnboundedQueue::<T>::new());
-            direct_branch(q, None)
+            let m = edge_metrics(level);
+            let q: Arc<dyn ItemQueue<T>> =
+                Arc::new(UnboundedQueue::<T>::maybe_instrumented(m.clone()));
+            direct_branch(q, None, m)
         }
         (QueueSpec::Unbounded, BranchOrdering::ByOrdinal) => {
+            let m = edge_metrics(level);
             let transport: Arc<dyn ItemQueue<Sequenced<T>>> =
-                Arc::new(UnboundedQueue::<Sequenced<T>>::new());
+                Arc::new(UnboundedQueue::<Sequenced<T>>::maybe_instrumented(m.clone()));
             ordered_branch(
                 transport,
                 OrdinalSource::Allocated(Arc::new(AtomicU64::new(0))),
                 Some(DEFAULT_REORDER_OVERFLOW_BYTES),
                 None,
+                m,
             )
         }
         (_, BranchOrdering::ByItemOrdinal) => {
@@ -367,26 +407,34 @@ pub(crate) fn build_branch<T: Send + HeapSize + 'static>(
 pub(crate) fn build_branch_ordered<T: Send + HeapSize + Ordered + 'static>(
     spec: QueueSpec,
     ordering: BranchOrdering,
+    level: crate::builder::InstrumentationLevel,
 ) -> Branch<T> {
     match (spec, ordering) {
         (QueueSpec::CountBounded { capacity }, BranchOrdering::ByItemOrdinal) => {
-            let transport: Arc<dyn ItemQueue<Sequenced<T>>> =
-                Arc::new(CountBoundedQueue::<Sequenced<T>>::new(capacity));
+            let m = edge_metrics(level);
+            let transport: Arc<dyn ItemQueue<Sequenced<T>>> = Arc::new(CountBoundedQueue::<
+                Sequenced<T>,
+            >::maybe_instrumented(
+                capacity, m.clone()
+            ));
             ordered_branch(
                 transport,
                 OrdinalSource::ItemSerial(|item: &T| item.ordinal()),
                 Some(DEFAULT_REORDER_OVERFLOW_BYTES),
                 None,
+                m,
             )
         }
         (QueueSpec::Unbounded, BranchOrdering::ByItemOrdinal) => {
+            let m = edge_metrics(level);
             let transport: Arc<dyn ItemQueue<Sequenced<T>>> =
-                Arc::new(UnboundedQueue::<Sequenced<T>>::new());
+                Arc::new(UnboundedQueue::<Sequenced<T>>::maybe_instrumented(m.clone()));
             ordered_branch(
                 transport,
                 OrdinalSource::ItemSerial(|item: &T| item.ordinal()),
                 Some(DEFAULT_REORDER_OVERFLOW_BYTES),
                 None,
+                m,
             )
         }
         (QueueSpec::ByteBounded { .. }, _) => {
@@ -397,7 +445,7 @@ pub(crate) fn build_branch_ordered<T: Send + HeapSize + Ordered + 'static>(
                  combined case."
             );
         }
-        (other, ord) => build_branch::<T>(other, ord),
+        (other, ord) => build_branch::<T>(other, ord, level),
     }
 }
 
@@ -406,18 +454,23 @@ pub(crate) fn build_branch_ordered<T: Send + HeapSize + Ordered + 'static>(
 pub(crate) fn build_branch_ordered_bytes<T: Send + HeapSize + Ordered + 'static>(
     spec: QueueSpec,
     ordering: BranchOrdering,
+    level: crate::builder::InstrumentationLevel,
 ) -> Branch<T> {
     use crate::queues::BoundedQueueHandle;
 
     match (spec, ordering) {
         (QueueSpec::ByteBounded { limit_bytes }, BranchOrdering::None) => {
-            let q = Arc::new(ByteBoundedQueue::<T>::new(limit_bytes));
+            let m = edge_metrics(level);
+            let q = Arc::new(ByteBoundedQueue::<T>::maybe_instrumented(limit_bytes, m.clone()));
             let handle: Arc<dyn BoundedQueueHandle> = Arc::clone(&q) as Arc<dyn BoundedQueueHandle>;
             let q_dyn: Arc<dyn ItemQueue<T>> = q;
-            direct_branch(q_dyn, Some(handle))
+            direct_branch(q_dyn, Some(handle), m)
         }
         (QueueSpec::ByteBounded { limit_bytes }, BranchOrdering::ByOrdinal) => {
-            let transport_concrete = Arc::new(ByteBoundedQueue::<Sequenced<T>>::new(limit_bytes));
+            let m = edge_metrics(level);
+            let transport_concrete = Arc::new(
+                ByteBoundedQueue::<Sequenced<T>>::maybe_instrumented(limit_bytes, m.clone()),
+            );
             let handle: Arc<dyn BoundedQueueHandle> =
                 Arc::clone(&transport_concrete) as Arc<dyn BoundedQueueHandle>;
             let transport: Arc<dyn ItemQueue<Sequenced<T>>> = transport_concrete;
@@ -434,10 +487,14 @@ pub(crate) fn build_branch_ordered_bytes<T: Send + HeapSize + Ordered + 'static>
                 OrdinalSource::Allocated(Arc::new(AtomicU64::new(0))),
                 Some(DEFAULT_REORDER_OVERFLOW_BYTES),
                 Some(handle),
+                m,
             )
         }
         (QueueSpec::ByteBounded { limit_bytes }, BranchOrdering::ByItemOrdinal) => {
-            let transport_concrete = Arc::new(ByteBoundedQueue::<Sequenced<T>>::new(limit_bytes));
+            let m = edge_metrics(level);
+            let transport_concrete = Arc::new(
+                ByteBoundedQueue::<Sequenced<T>>::maybe_instrumented(limit_bytes, m.clone()),
+            );
             let handle: Arc<dyn BoundedQueueHandle> =
                 Arc::clone(&transport_concrete) as Arc<dyn BoundedQueueHandle>;
             let transport: Arc<dyn ItemQueue<Sequenced<T>>> = transport_concrete;
@@ -446,9 +503,10 @@ pub(crate) fn build_branch_ordered_bytes<T: Send + HeapSize + Ordered + 'static>
                 OrdinalSource::ItemSerial(|item: &T| item.ordinal()),
                 Some(DEFAULT_REORDER_OVERFLOW_BYTES),
                 Some(handle),
+                m,
             )
         }
-        (other, ord) => build_branch_ordered::<T>(other, ord),
+        (other, ord) => build_branch_ordered::<T>(other, ord, level),
     }
 }
 
@@ -464,18 +522,23 @@ pub(crate) fn build_branch_ordered_bytes<T: Send + HeapSize + Ordered + 'static>
 pub(crate) fn build_branch_byte_aware<T: Send + HeapSize + 'static>(
     spec: QueueSpec,
     ordering: BranchOrdering,
+    level: crate::builder::InstrumentationLevel,
 ) -> Branch<T> {
     use crate::queues::BoundedQueueHandle;
 
     match (spec, ordering) {
         (QueueSpec::ByteBounded { limit_bytes }, BranchOrdering::None) => {
-            let q = Arc::new(ByteBoundedQueue::<T>::new(limit_bytes));
+            let m = edge_metrics(level);
+            let q = Arc::new(ByteBoundedQueue::<T>::maybe_instrumented(limit_bytes, m.clone()));
             let handle: Arc<dyn BoundedQueueHandle> = Arc::clone(&q) as Arc<dyn BoundedQueueHandle>;
             let q_dyn: Arc<dyn ItemQueue<T>> = q;
-            direct_branch(q_dyn, Some(handle))
+            direct_branch(q_dyn, Some(handle), m)
         }
         (QueueSpec::ByteBounded { limit_bytes }, BranchOrdering::ByOrdinal) => {
-            let transport_concrete = Arc::new(ByteBoundedQueue::<Sequenced<T>>::new(limit_bytes));
+            let m = edge_metrics(level);
+            let transport_concrete = Arc::new(
+                ByteBoundedQueue::<Sequenced<T>>::maybe_instrumented(limit_bytes, m.clone()),
+            );
             let handle: Arc<dyn BoundedQueueHandle> =
                 Arc::clone(&transport_concrete) as Arc<dyn BoundedQueueHandle>;
             let transport: Arc<dyn ItemQueue<Sequenced<T>>> = transport_concrete;
@@ -484,6 +547,7 @@ pub(crate) fn build_branch_byte_aware<T: Send + HeapSize + 'static>(
                 OrdinalSource::Allocated(Arc::new(AtomicU64::new(0))),
                 Some(DEFAULT_REORDER_OVERFLOW_BYTES),
                 Some(handle),
+                m,
             )
         }
         (QueueSpec::ByteBounded { .. }, BranchOrdering::ByItemOrdinal) => {
@@ -492,21 +556,23 @@ pub(crate) fn build_branch_byte_aware<T: Send + HeapSize + 'static>(
                  use `build_branch_ordered_bytes` instead."
             );
         }
-        (other, ord) => build_branch::<T>(other, ord),
+        (other, ord) => build_branch::<T>(other, ord, level),
     }
 }
 
 fn direct_branch<T: Send + HeapSize + 'static>(
     q: Arc<dyn ItemQueue<T>>,
     transport_handle: Option<Arc<dyn crate::queues::BoundedQueueHandle>>,
+    metrics: Option<Arc<crate::runtime::metrics::EdgeMetrics>>,
 ) -> Branch<T> {
     // A direct (unordered) branch has no reorder stage, so no reorder cap.
     let bounded_queue_handle =
         transport_handle.map(|transport| BranchBudgetHandles { transport, reorder_cap: None });
     Branch {
         output: BranchOutputHandle { inner: BranchOutputInner::Direct(Arc::clone(&q)) },
-        input: BranchInputHandle { inner: BranchInputInner::Direct(q) },
+        input: BranchInputHandle { inner: BranchInputInner::Direct(q), metrics: metrics.clone() },
         bounded_queue_handle,
+        metrics,
     }
 }
 
@@ -515,6 +581,7 @@ fn ordered_branch<T: Send + HeapSize + 'static>(
     ordinal_source: OrdinalSource<T>,
     max_overflow_bytes: Option<u64>,
     transport_handle: Option<Arc<dyn crate::queues::BoundedQueueHandle>>,
+    metrics: Option<Arc<crate::runtime::metrics::EdgeMetrics>>,
 ) -> Branch<T> {
     let stage = Arc::new(match max_overflow_bytes {
         Some(cap) => ReorderStage::<T>::with_max_overflow_bytes(transport, cap),
@@ -530,8 +597,12 @@ fn ordered_branch<T: Send + HeapSize + 'static>(
         output: BranchOutputHandle {
             inner: BranchOutputInner::Ordered { stage: Arc::clone(&stage), ordinal_source },
         },
-        input: BranchInputHandle { inner: BranchInputInner::Ordered(stage) },
+        input: BranchInputHandle {
+            inner: BranchInputInner::Ordered(stage),
+            metrics: metrics.clone(),
+        },
         bounded_queue_handle,
+        metrics,
     }
 }
 
@@ -557,6 +628,11 @@ pub(crate) struct BranchEntry {
     /// builder collects these into a registry so the budget pass +
     /// optional queue-memory rebalancer can set/reallocate budget.
     pub(crate) bounded_queue_handle: Option<BranchBudgetHandles>,
+    /// `Some` iff this edge is instrumented (`--pipeline-trace`); the shared
+    /// `EdgeMetrics` (also held by the transport for push counts and the input
+    /// handle for pop counts). Collected into the edge registry by `contexts.rs`
+    /// Pass 1.5. Cleared (`None`) by `take_typed_input`'s placeholder.
+    pub(crate) metrics: Option<Arc<crate::runtime::metrics::EdgeMetrics>>,
 }
 
 impl OutputQueueSet {
@@ -583,7 +659,7 @@ impl OutputQueueSet {
     ) -> BranchInputHandle<T> {
         let entry = std::mem::replace(
             &mut self.branches[branch_idx],
-            BranchEntry { input_handle: Box::new(()), bounded_queue_handle: None },
+            BranchEntry { input_handle: Box::new(()), bounded_queue_handle: None, metrics: None },
         );
         let handle: Box<BranchInputHandle<T>> =
             entry.input_handle.downcast::<BranchInputHandle<T>>().unwrap_or_else(|_| {
@@ -777,6 +853,31 @@ impl<T: Send + HeapSize + 'static> OutputHandles<Single<T>> {
             .downcast_ref::<SingleOutputsView<T>>()
             .expect("Single<T> outputs view downcast failed");
         view.primary.retry(unpushed)
+    }
+
+    /// Retry a step's held output slot, re-holding on backpressure.
+    ///
+    /// The single canonical definition of the held-slot re-hold invariant for
+    /// the `Single<T>` output shape — mirror of the `OrderedBytesSingle<T>`
+    /// variant. If the slot holds an
+    /// item, [`retry`](Self::retry) it; on rejection put it **back** in the slot
+    /// (so it is never dropped) and report [`HeldRetry::StillHeld`]. Used by step
+    /// flush-first preambles so each step doesn't re-implement the
+    /// take/retry/put-back dance (a copy that forgot the put-back would silently
+    /// drop a final batch). **Never spins** — the caller maps `StillHeld` to a
+    /// yield (`NoProgress`/`Contention`) and retries on the next dispatch.
+    #[inline]
+    pub fn retry_held(&self, held: &mut crate::held::HeldSlot<Unpushed<T>>) -> HeldRetry {
+        match held.take() {
+            None => HeldRetry::WasEmpty,
+            Some(unpushed) => match self.retry(unpushed) {
+                Ok(()) => HeldRetry::Flushed,
+                Err(again) => {
+                    held.put(again);
+                    HeldRetry::StillHeld
+                }
+            },
+        }
     }
 }
 
@@ -1117,6 +1218,7 @@ impl OutputHandles<()> {
 pub(crate) fn build_single_queues<T: Send + HeapSize + 'static>(
     specs: &[QueueSpec],
     ordering: &[BranchOrdering],
+    level: crate::builder::InstrumentationLevel,
 ) -> (OutputQueueSet, OutputsViewAny) {
     assert_eq!(specs.len(), 1, "Single<T>::build_queues requires 1 spec");
     assert_eq!(ordering.len(), 1, "Single<T>::build_queues requires 1 ordering");
@@ -1126,12 +1228,13 @@ pub(crate) fn build_single_queues<T: Send + HeapSize + 'static>(
     // outputs without item-carried serials) and delegates every non-byte spec
     // straight back to `build_branch::<T>`, so count/unbounded paths are
     // unchanged.
-    let branch = build_branch_byte_aware::<T>(specs[0], ordering[0]);
+    let branch = build_branch_byte_aware::<T>(specs[0], ordering[0], level);
     let view = SingleOutputsView { primary: branch.output };
     let outputs_view = OutputsViewAny { inner: Box::new(view) };
     let queue_set = OutputQueueSet::new(vec![BranchEntry {
         input_handle: Box::new(branch.input),
         bounded_queue_handle: branch.bounded_queue_handle,
+        metrics: branch.metrics,
     }]);
     (queue_set, outputs_view)
 }
@@ -1141,16 +1244,18 @@ pub(crate) fn build_single_queues<T: Send + HeapSize + 'static>(
 pub(crate) fn build_single_queues_ordered_bytes<T: Send + HeapSize + Ordered + 'static>(
     specs: &[QueueSpec],
     ordering: &[BranchOrdering],
+    level: crate::builder::InstrumentationLevel,
 ) -> (OutputQueueSet, OutputsViewAny) {
     assert_eq!(specs.len(), 1, "OrderedBytesSingle<T>::build_queues requires 1 spec");
     assert_eq!(ordering.len(), 1, "OrderedBytesSingle<T>::build_queues requires 1 ordering");
 
-    let branch = build_branch_ordered_bytes::<T>(specs[0], ordering[0]);
+    let branch = build_branch_ordered_bytes::<T>(specs[0], ordering[0], level);
     let view = OrderedBytesSingleOutputsView { primary: branch.output };
     let outputs_view = OutputsViewAny { inner: Box::new(view) };
     let queue_set = OutputQueueSet::new(vec![BranchEntry {
         input_handle: Box::new(branch.input),
         bounded_queue_handle: branch.bounded_queue_handle,
+        metrics: branch.metrics,
     }]);
     (queue_set, outputs_view)
 }
@@ -1158,6 +1263,7 @@ pub(crate) fn build_single_queues_ordered_bytes<T: Send + HeapSize + Ordered + '
 pub(crate) fn build_tuple2_queues<A, B>(
     specs: &[QueueSpec],
     ordering: &[BranchOrdering],
+    level: crate::builder::InstrumentationLevel,
 ) -> (OutputQueueSet, OutputsViewAny)
 where
     A: Send + HeapSize + 'static,
@@ -1166,18 +1272,20 @@ where
     assert_eq!(specs.len(), 2, "(A, B)::build_queues requires 2 specs");
     assert_eq!(ordering.len(), 2, "(A, B)::build_queues requires 2 orderings");
 
-    let ba = build_branch::<A>(specs[0], ordering[0]);
-    let bb = build_branch::<B>(specs[1], ordering[1]);
+    let ba = build_branch::<A>(specs[0], ordering[0], level);
+    let bb = build_branch::<B>(specs[1], ordering[1], level);
     let view = Tuple2OutputsView { a: ba.output, b: bb.output };
     let outputs_view = OutputsViewAny { inner: Box::new(view) };
     let queue_set = OutputQueueSet::new(vec![
         BranchEntry {
             input_handle: Box::new(ba.input),
             bounded_queue_handle: ba.bounded_queue_handle,
+            metrics: ba.metrics,
         },
         BranchEntry {
             input_handle: Box::new(bb.input),
             bounded_queue_handle: bb.bounded_queue_handle,
+            metrics: bb.metrics,
         },
     ]);
     (queue_set, outputs_view)
@@ -1191,6 +1299,7 @@ where
 pub(crate) fn build_tuple2_queues_ordered_bytes<A, B>(
     specs: &[QueueSpec],
     ordering: &[BranchOrdering],
+    level: crate::builder::InstrumentationLevel,
 ) -> (OutputQueueSet, OutputsViewAny)
 where
     A: Send + HeapSize + Ordered + 'static,
@@ -1199,18 +1308,20 @@ where
     assert_eq!(specs.len(), 2, "OrderedBytesTuple2<A, B>::build_queues requires 2 specs");
     assert_eq!(ordering.len(), 2, "OrderedBytesTuple2<A, B>::build_queues requires 2 orderings");
 
-    let ba = build_branch_ordered_bytes::<A>(specs[0], ordering[0]);
-    let bb = build_branch_ordered_bytes::<B>(specs[1], ordering[1]);
+    let ba = build_branch_ordered_bytes::<A>(specs[0], ordering[0], level);
+    let bb = build_branch_ordered_bytes::<B>(specs[1], ordering[1], level);
     let view = Tuple2OutputsView { a: ba.output, b: bb.output };
     let outputs_view = OutputsViewAny { inner: Box::new(view) };
     let queue_set = OutputQueueSet::new(vec![
         BranchEntry {
             input_handle: Box::new(ba.input),
             bounded_queue_handle: ba.bounded_queue_handle,
+            metrics: ba.metrics,
         },
         BranchEntry {
             input_handle: Box::new(bb.input),
             bounded_queue_handle: bb.bounded_queue_handle,
+            metrics: bb.metrics,
         },
     ]);
     (queue_set, outputs_view)
@@ -1219,6 +1330,7 @@ where
 pub(crate) fn build_tuple3_queues<A, B, C>(
     specs: &[QueueSpec],
     ordering: &[BranchOrdering],
+    level: crate::builder::InstrumentationLevel,
 ) -> (OutputQueueSet, OutputsViewAny)
 where
     A: Send + HeapSize + 'static,
@@ -1228,23 +1340,26 @@ where
     assert_eq!(specs.len(), 3, "(A, B, C)::build_queues requires 3 specs");
     assert_eq!(ordering.len(), 3, "(A, B, C)::build_queues requires 3 orderings");
 
-    let ba = build_branch::<A>(specs[0], ordering[0]);
-    let bb = build_branch::<B>(specs[1], ordering[1]);
-    let bc = build_branch::<C>(specs[2], ordering[2]);
+    let ba = build_branch::<A>(specs[0], ordering[0], level);
+    let bb = build_branch::<B>(specs[1], ordering[1], level);
+    let bc = build_branch::<C>(specs[2], ordering[2], level);
     let view = Tuple3OutputsView { a: ba.output, b: bb.output, c: bc.output };
     let outputs_view = OutputsViewAny { inner: Box::new(view) };
     let queue_set = OutputQueueSet::new(vec![
         BranchEntry {
             input_handle: Box::new(ba.input),
             bounded_queue_handle: ba.bounded_queue_handle,
+            metrics: ba.metrics,
         },
         BranchEntry {
             input_handle: Box::new(bb.input),
             bounded_queue_handle: bb.bounded_queue_handle,
+            metrics: bb.metrics,
         },
         BranchEntry {
             input_handle: Box::new(bc.input),
             bounded_queue_handle: bc.bounded_queue_handle,
+            metrics: bc.metrics,
         },
     ]);
     (queue_set, outputs_view)
@@ -1253,6 +1368,7 @@ where
 pub(crate) fn build_tuple4_queues<A, B, C, D>(
     specs: &[QueueSpec],
     ordering: &[BranchOrdering],
+    level: crate::builder::InstrumentationLevel,
 ) -> (OutputQueueSet, OutputsViewAny)
 where
     A: Send + HeapSize + 'static,
@@ -1263,28 +1379,32 @@ where
     assert_eq!(specs.len(), 4, "(A, B, C, D)::build_queues requires 4 specs");
     assert_eq!(ordering.len(), 4, "(A, B, C, D)::build_queues requires 4 orderings");
 
-    let ba = build_branch::<A>(specs[0], ordering[0]);
-    let bb = build_branch::<B>(specs[1], ordering[1]);
-    let bc = build_branch::<C>(specs[2], ordering[2]);
-    let bd = build_branch::<D>(specs[3], ordering[3]);
+    let ba = build_branch::<A>(specs[0], ordering[0], level);
+    let bb = build_branch::<B>(specs[1], ordering[1], level);
+    let bc = build_branch::<C>(specs[2], ordering[2], level);
+    let bd = build_branch::<D>(specs[3], ordering[3], level);
     let view = Tuple4OutputsView { a: ba.output, b: bb.output, c: bc.output, d: bd.output };
     let outputs_view = OutputsViewAny { inner: Box::new(view) };
     let queue_set = OutputQueueSet::new(vec![
         BranchEntry {
             input_handle: Box::new(ba.input),
             bounded_queue_handle: ba.bounded_queue_handle,
+            metrics: ba.metrics,
         },
         BranchEntry {
             input_handle: Box::new(bb.input),
             bounded_queue_handle: bb.bounded_queue_handle,
+            metrics: bb.metrics,
         },
         BranchEntry {
             input_handle: Box::new(bc.input),
             bounded_queue_handle: bc.bounded_queue_handle,
+            metrics: bc.metrics,
         },
         BranchEntry {
             input_handle: Box::new(bd.input),
             bounded_queue_handle: bd.bounded_queue_handle,
+            metrics: bd.metrics,
         },
     ]);
     (queue_set, outputs_view)
@@ -1293,6 +1413,7 @@ where
 pub(crate) fn build_unit_queues(
     specs: &[QueueSpec],
     ordering: &[BranchOrdering],
+    _level: crate::builder::InstrumentationLevel,
 ) -> (OutputQueueSet, OutputsViewAny) {
     assert_eq!(specs.len(), 0, "()::build_queues requires 0 specs");
     assert_eq!(ordering.len(), 0, "()::build_queues requires 0 orderings");
@@ -1323,8 +1444,49 @@ mod handle_tests {
     }
 
     #[test]
+    fn build_branch_mints_metrics_iff_on() {
+        use crate::builder::InstrumentationLevel as L;
+        let on = build_branch::<u32>(
+            QueueSpec::CountBounded { capacity: 4 },
+            BranchOrdering::None,
+            L::Summary,
+        );
+        assert!(on.metrics.is_some(), "level on → edge metrics minted");
+        let off = build_branch::<u32>(
+            QueueSpec::CountBounded { capacity: 4 },
+            BranchOrdering::None,
+            L::Off,
+        );
+        assert!(off.metrics.is_none(), "level off → no metrics (hot path metric-free)");
+    }
+
+    #[test]
+    fn metrics_shared_between_transport_push_and_input_handle_pop() {
+        // Producer-push (transport) and consumer-pop (input handle) share one
+        // EdgeMetrics: push lands via the queue, pop/empty via the input handle.
+        use crate::builder::InstrumentationLevel as L;
+        let b = build_branch::<u32>(
+            QueueSpec::CountBounded { capacity: 4 },
+            BranchOrdering::None,
+            L::Summary,
+        );
+        let m = b.metrics.clone().expect("metrics present");
+        b.output.push(7).unwrap();
+        assert_eq!(b.input.pop(), Some(7));
+        assert_eq!(b.input.pop(), None); // empty
+        let s = m.snapshot();
+        assert_eq!(s.pushed_items, 1, "producer push counted at the transport");
+        assert_eq!(s.popped_items, 1, "consumer pop counted at the input handle");
+        assert_eq!(s.pop_empties, 1, "empty pop counted at the input handle");
+    }
+
+    #[test]
     fn count_bounded_fifo_round_trip() {
-        let b = build_branch::<u32>(QueueSpec::CountBounded { capacity: 4 }, BranchOrdering::None);
+        let b = build_branch::<u32>(
+            QueueSpec::CountBounded { capacity: 4 },
+            BranchOrdering::None,
+            crate::builder::InstrumentationLevel::Off,
+        );
         b.output.push(1).unwrap();
         b.output.push(2).unwrap();
         assert_eq!(b.input.pop(), Some(1));
@@ -1334,8 +1496,11 @@ mod handle_tests {
 
     #[test]
     fn count_bounded_ordered_emits_in_order() {
-        let b =
-            build_branch::<u32>(QueueSpec::CountBounded { capacity: 8 }, BranchOrdering::ByOrdinal);
+        let b = build_branch::<u32>(
+            QueueSpec::CountBounded { capacity: 8 },
+            BranchOrdering::ByOrdinal,
+            crate::builder::InstrumentationLevel::Off,
+        );
         // Single producer pushes ordinals 0,1,2 in arrival order.
         b.output.push(100).unwrap();
         b.output.push(200).unwrap();
@@ -1347,7 +1512,11 @@ mod handle_tests {
 
     #[test]
     fn drained_signal_propagates() {
-        let b = build_branch::<u32>(QueueSpec::CountBounded { capacity: 4 }, BranchOrdering::None);
+        let b = build_branch::<u32>(
+            QueueSpec::CountBounded { capacity: 4 },
+            BranchOrdering::None,
+            crate::builder::InstrumentationLevel::Off,
+        );
         b.output.push(1).unwrap();
         b.output.mark_drained();
         // Marker set but item still buffered: not drained.
@@ -1358,7 +1527,11 @@ mod handle_tests {
 
     #[test]
     fn unbounded_branch_works() {
-        let b = build_branch::<u32>(QueueSpec::Unbounded, BranchOrdering::None);
+        let b = build_branch::<u32>(
+            QueueSpec::Unbounded,
+            BranchOrdering::None,
+            crate::builder::InstrumentationLevel::Off,
+        );
         for i in 0..1024 {
             b.output.push(i).unwrap();
         }
@@ -1380,6 +1553,7 @@ mod handle_tests {
         let b = build_branch_byte_aware::<Bytes>(
             QueueSpec::ByteBounded { limit_bytes: 1000 },
             BranchOrdering::None,
+            crate::builder::InstrumentationLevel::Off,
         );
         b.output.push(Bytes(vec![0; 500])).unwrap();
         let popped = b.input.pop().unwrap();
@@ -1389,8 +1563,11 @@ mod handle_tests {
     #[test]
     #[should_panic(expected = "ByteBounded requires `T: HeapSize`")]
     fn byte_bounded_panics_in_non_heap_aware_builder() {
-        let _ =
-            build_branch::<u32>(QueueSpec::ByteBounded { limit_bytes: 1000 }, BranchOrdering::None);
+        let _ = build_branch::<u32>(
+            QueueSpec::ByteBounded { limit_bytes: 1000 },
+            BranchOrdering::None,
+            crate::builder::InstrumentationLevel::Off,
+        );
     }
 
     #[test]
@@ -1406,11 +1583,48 @@ mod handle_tests {
         let (mut queue_set, outputs_view) = <Single<u32> as StepOutputs>::build_queues(
             &[QueueSpec::ByteBounded { limit_bytes: 1000 }],
             &[BranchOrdering::None],
+            crate::builder::InstrumentationLevel::Off,
         );
         let outputs: OutputHandles<Single<u32>> = OutputHandles::new(outputs_view);
         outputs.push(7).unwrap();
         let input = queue_set.take_typed_input::<u32>(0);
         assert_eq!(input.pop(), Some(7));
+    }
+
+    #[test]
+    fn single_retry_held_drains_then_reholds() {
+        // Exercises `OutputHandles<Single<T>>::retry_held`: empty → WasEmpty,
+        // a rejected push re-held → StillHeld while the queue is full → Flushed
+        // once a slot frees, with the held item never dropped.
+        use crate::held::HeldSlot;
+        use crate::outputs::{Single, StepOutputs};
+        use crate::step::OutputHandles;
+        let (mut queue_set, outputs_view) = <Single<u32> as StepOutputs>::build_queues(
+            &[QueueSpec::CountBounded { capacity: 1 }],
+            &[BranchOrdering::None],
+            crate::builder::InstrumentationLevel::Off,
+        );
+        let outputs: OutputHandles<Single<u32>> = OutputHandles::new(outputs_view);
+        let mut held: HeldSlot<Unpushed<u32>> = HeldSlot::new();
+
+        // Empty slot → WasEmpty (queue untouched).
+        assert!(matches!(outputs.retry_held(&mut held), HeldRetry::WasEmpty));
+
+        // Fill the capacity-1 queue; the next push is rejected and re-held.
+        outputs.push(1).unwrap();
+        let rejected = outputs.push(2).expect_err("capacity-1 queue must reject the 2nd push");
+        held.put(rejected);
+
+        // Queue still full → StillHeld; the item is put back, not dropped.
+        assert!(matches!(outputs.retry_held(&mut held), HeldRetry::StillHeld));
+        assert!(held.is_held());
+
+        // Drain one item; the held push now flushes.
+        let input = queue_set.take_typed_input::<u32>(0);
+        assert_eq!(input.pop(), Some(1));
+        assert!(matches!(outputs.retry_held(&mut held), HeldRetry::Flushed));
+        assert!(!held.is_held());
+        assert_eq!(input.pop(), Some(2));
     }
 
     #[test]
@@ -1422,6 +1636,7 @@ mod handle_tests {
         let b = build_branch_byte_aware::<Bytes>(
             QueueSpec::ByteBounded { limit_bytes: 1000 },
             BranchOrdering::ByOrdinal,
+            crate::builder::InstrumentationLevel::Off,
         );
         b.output.push(Bytes(vec![0; 100])).unwrap();
         let popped = b.input.pop().unwrap();
@@ -1434,6 +1649,7 @@ mod handle_tests {
         let _ = build_branch::<u32>(
             QueueSpec::CountBounded { capacity: 4 },
             BranchOrdering::ByItemOrdinal,
+            crate::builder::InstrumentationLevel::Off,
         );
     }
 
@@ -1454,6 +1670,7 @@ mod handle_tests {
         let b = build_branch_ordered::<OrdItem>(
             QueueSpec::CountBounded { capacity: 8 },
             BranchOrdering::ByItemOrdinal,
+            crate::builder::InstrumentationLevel::Off,
         );
         // Push out of order: ordinals 2, 0, 1.
         b.output.push(OrdItem { ord: 2, v: 200 }).unwrap();
@@ -1476,6 +1693,7 @@ mod handle_tests {
         let b = build_branch_ordered_bytes::<OrdItem>(
             QueueSpec::ByteBounded { limit_bytes: 4096 },
             BranchOrdering::ByItemOrdinal,
+            crate::builder::InstrumentationLevel::Off,
         );
         b.output.push(OrdItem { ord: 1, v: 1 }).unwrap();
         b.output.push(OrdItem { ord: 0, v: 0 }).unwrap();
@@ -1489,8 +1707,11 @@ mod handle_tests {
         // through an ordered branch, draining one at a time. Without the
         // Unpushed<T> retry, the third push would burn an ordinal on
         // backpressure and stall the reorder stage.
-        let b =
-            build_branch::<u32>(QueueSpec::CountBounded { capacity: 2 }, BranchOrdering::ByOrdinal);
+        let b = build_branch::<u32>(
+            QueueSpec::CountBounded { capacity: 2 },
+            BranchOrdering::ByOrdinal,
+            crate::builder::InstrumentationLevel::Off,
+        );
 
         // Pump 5 items through the branch, draining sequentially. Capacity 2
         // means every push after the second hits backpressure once.
@@ -1541,6 +1762,7 @@ mod handle_tests {
         let (mut set, _view) = build_single_queues::<u32>(
             &[QueueSpec::CountBounded { capacity: 4 }],
             &[BranchOrdering::None],
+            crate::builder::InstrumentationLevel::Off,
         );
         let _input: BranchInputHandle<u32> = set.take_typed_input::<u32>(0);
     }
@@ -1559,8 +1781,11 @@ mod build_queues_tests {
     #[test]
     fn single_round_trip() {
         let (specs, ordering) = count_specs(1, 4);
-        let (mut queue_set, outputs_view) =
-            <Single<u32> as StepOutputs>::build_queues(&specs, &ordering);
+        let (mut queue_set, outputs_view) = <Single<u32> as StepOutputs>::build_queues(
+            &specs,
+            &ordering,
+            crate::builder::InstrumentationLevel::Off,
+        );
         let outputs: OutputHandles<Single<u32>> = OutputHandles::new(outputs_view);
         outputs.push(7).unwrap();
 
@@ -1571,8 +1796,11 @@ mod build_queues_tests {
     #[test]
     fn tuple_2_round_trip() {
         let (specs, ordering) = count_specs(2, 2);
-        let (mut queue_set, outputs_view) =
-            <(u32, String) as StepOutputs>::build_queues(&specs, &ordering);
+        let (mut queue_set, outputs_view) = <(u32, String) as StepOutputs>::build_queues(
+            &specs,
+            &ordering,
+            crate::builder::InstrumentationLevel::Off,
+        );
         let outputs: OutputHandles<(u32, String)> = OutputHandles::new(outputs_view);
 
         let v = outputs.view();
@@ -1588,8 +1816,11 @@ mod build_queues_tests {
     #[test]
     fn tuple_3_round_trip() {
         let (specs, ordering) = count_specs(3, 2);
-        let (mut queue_set, outputs_view) =
-            <(u32, u64, String) as StepOutputs>::build_queues(&specs, &ordering);
+        let (mut queue_set, outputs_view) = <(u32, u64, String) as StepOutputs>::build_queues(
+            &specs,
+            &ordering,
+            crate::builder::InstrumentationLevel::Off,
+        );
         let outputs: OutputHandles<(u32, u64, String)> = OutputHandles::new(outputs_view);
 
         let v = outputs.view();
@@ -1606,7 +1837,11 @@ mod build_queues_tests {
     fn tuple_4_round_trip() {
         let (specs, ordering) = count_specs(4, 2);
         let (mut queue_set, outputs_view) =
-            <(u32, u64, String, Vec<u8>) as StepOutputs>::build_queues(&specs, &ordering);
+            <(u32, u64, String, Vec<u8>) as StepOutputs>::build_queues(
+                &specs,
+                &ordering,
+                crate::builder::InstrumentationLevel::Off,
+            );
         let outputs: OutputHandles<(u32, u64, String, Vec<u8>)> = OutputHandles::new(outputs_view);
 
         let v = outputs.view();
@@ -1623,7 +1858,8 @@ mod build_queues_tests {
 
     #[test]
     fn unit_build_queues_yields_empty_set() {
-        let (queue_set, outputs_view) = <() as StepOutputs>::build_queues(&[], &[]);
+        let (queue_set, outputs_view) =
+            <() as StepOutputs>::build_queues(&[], &[], crate::builder::InstrumentationLevel::Off);
         let outputs: OutputHandles<()> = OutputHandles::new(outputs_view);
         outputs.noop();
         assert_eq!(queue_set.n_branches(), 0);
@@ -1632,8 +1868,11 @@ mod build_queues_tests {
     #[test]
     fn mark_all_drained_propagates_to_input_handle() {
         let (specs, ordering) = count_specs(1, 4);
-        let (mut queue_set, outputs_view) =
-            <Single<u32> as StepOutputs>::build_queues(&specs, &ordering);
+        let (mut queue_set, outputs_view) = <Single<u32> as StepOutputs>::build_queues(
+            &specs,
+            &ordering,
+            crate::builder::InstrumentationLevel::Off,
+        );
         let outputs: OutputHandles<Single<u32>> = OutputHandles::new(outputs_view);
 
         let input = queue_set.take_typed_input::<u32>(0);
@@ -1646,8 +1885,11 @@ mod build_queues_tests {
     fn ordered_branch_preserves_emission_order_through_typed_path() {
         let specs = vec![QueueSpec::CountBounded { capacity: 8 }];
         let ordering = vec![BranchOrdering::ByOrdinal];
-        let (mut queue_set, outputs_view) =
-            <Single<u32> as StepOutputs>::build_queues(&specs, &ordering);
+        let (mut queue_set, outputs_view) = <Single<u32> as StepOutputs>::build_queues(
+            &specs,
+            &ordering,
+            crate::builder::InstrumentationLevel::Off,
+        );
         let outputs: OutputHandles<Single<u32>> = OutputHandles::new(outputs_view);
 
         outputs.push(10).unwrap();

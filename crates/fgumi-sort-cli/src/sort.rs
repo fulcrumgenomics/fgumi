@@ -21,24 +21,17 @@
 //! Use `--verify` to check if a BAM file is correctly sorted without writing output.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use clap::Parser;
 use fgumi_bam_io::create_raw_bam_reader;
 use fgumi_cli_common::{
-    Command, CompressionOptions, MemoryLimit, MemoryReserve, OperationTimer, parse_bool,
-    parse_memory, parse_memory_reserve, resolve_memory_budget, validate_file_exists,
+    CompressionOptions, MemoryLimit, MemoryReserve, OperationTimer, parse_bool, parse_memory,
+    parse_memory_reserve,
 };
-use fgumi_pipeline_core::{FinalizeHook, Pipeline, PipelineConfig};
 use fgumi_sam::SamTag;
 use fgumi_sort::{KeyTypesSpec, QuerynameComparator, SortOrder, SpillCodec, verify_sort_order};
 use log::info;
-use parking_lot::Mutex;
-
-use crate::chains::{
-    IndexBamFinalizeHook, SortFinalizeHook, SortStepCaptures, build_sort_step, log_sort_start,
-};
 
 /// Sort order for BAM files.
 ///
@@ -344,6 +337,28 @@ pub struct SortOptions {
     #[arg(long = "merge-threads")]
     pub merge_threads: Option<usize>,
 
+    /// Phase-2 spill decompression granularity (expert tuning).
+    ///
+    /// `false` (default) — block-level parallel: workers hold the per-file reader
+    /// lock only for the READ (sequence-tagged), release it, then decompress
+    /// OUTSIDE the lock, so multiple workers decompress one file's blocks
+    /// concurrently, reassembled by a per-slot reorder buffer. Hardened by the
+    /// loom model (`fgumi-sort` `tests/loom_merge_slots.rs`, driving the real
+    /// `SortMergeSlot`) and the external-watchdog soak matrix.
+    ///
+    /// `true` — one worker owns a spill file's decompression at a time: it reads
+    /// AND decompresses blocks inline under the reader lock, in order, into a
+    /// plain FIFO. The older, single-worker-per-file path; pass `true` to fall
+    /// back to it.
+    #[arg(long = "file-granularity", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool, hide = true)]
+    pub file_granularity: bool,
+
+    /// Raw blocks claimed per reader-lock acquisition during Phase-2
+    /// decompression (expert tuning). Default `4` (the original
+    /// `MAX_BATCH_PER_CALL`; a fleet bench will tune it). Must be >= 1.
+    #[arg(long = "block-batch", default_value = "4", value_parser = clap::value_parser!(usize), hide = true)]
+    pub block_batch: usize,
+
     /// Sort order (chain-builder slot).
     ///
     /// Carried here so the chain builder can read it from the bag without
@@ -365,8 +380,52 @@ impl Default for SortOptions {
             key_types: None,
             sort_threads: None,
             merge_threads: None,
+            file_granularity: false,
+            block_batch: 4,
             order: SortOrderArg::TemplateCoordinate,
         }
+    }
+}
+
+impl SortOptions {
+    /// Validate the order-independent semantic constraints on sort options that
+    /// clap's per-field value parser cannot express. This is the **single**
+    /// validator for sort options — both the standalone `fgumi sort` path
+    /// (`execute_sort_command`) and the `fgumi runall` path (after
+    /// `MultiSortOptions::validate`) call it, so the two CLI surfaces share one
+    /// set of rules and cannot drift (order-*dependent* rules like
+    /// `--write-index` requires coordinate order stay with the standalone
+    /// command, which owns the sink/order surface).
+    ///
+    /// Rules:
+    /// - `--block-batch` must be `>= 1`. A value of `0` would read zero raw
+    ///   blocks per reader-lock acquisition — the inline (file-granularity)
+    ///   decompress path would declare a phantom EOF after reading nothing
+    ///   (silent record loss), and the block-parallel path would livelock
+    ///   (`queue_eof` never finalizes). `SortSpillDecompress::new` clamps to
+    ///   `>= 1` as defense-in-depth, but the CLI rejects `0` up front rather
+    ///   than letting a silent clamp be the *only* guard.
+    /// - `--temp-compression 0` requires `--temp-codec bgzf`: zstd has no
+    ///   uncompressed mode, so level 0 + zstd is rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any option is out of range or mutually inconsistent.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        // Name both surfaces in messages: `fgumi sort` exposes the bare flags,
+        // `fgumi runall` the prefixed `--sort::*` flags (this struct is shared).
+        anyhow::ensure!(
+            self.block_batch >= 1,
+            "--block-batch (--sort::block-batch under runall) must be >= 1 (got {})",
+            self.block_batch
+        );
+        anyhow::ensure!(
+            !(self.temp_compression == 0 && matches!(self.temp_codec, SpillCodec::Zstd)),
+            "--temp-compression 0 (--sort::temp-compression 0 under runall) is only supported \
+             with --temp-codec bgzf; zstd has no uncompressed mode. Pass --temp-codec bgzf to \
+             keep uncompressed spill, or use a zstd level >= 1."
+        );
+        Ok(())
     }
 }
 
@@ -438,165 +497,7 @@ pub fn parse_cell_tag(order: SortOrderArg) -> Result<Option<SamTag>> {
     if matches!(order, SortOrderArg::TemplateCoordinate) { Ok(Some(SamTag::CB)) } else { Ok(None) }
 }
 
-impl Command for Sort {
-    fn execute(&self, command_line: &str) -> Result<()> {
-        if self.verify && self.output.is_some() {
-            bail!("--verify cannot be used with --output");
-        }
-        if self.verify && self.write_index {
-            bail!("--write-index cannot be used with --verify");
-        }
-
-        // Validate inputs. Exempt stdin paths (`-` / `/dev/stdin`): the
-        // streaming sort path reads stdin once (the sort engine's reader
-        // handles stdin directly), so a file-existence check would spuriously
-        // reject it. `--verify` is the exception: it re-scans the input, which
-        // a non-seekable stdin can't satisfy, so reject stdin there up front.
-        if fgumi_bam_io::is_stdin_path(&self.input) {
-            if self.verify {
-                bail!(
-                    "fgumi sort --verify cannot read from stdin (it re-scans the input); \
-                     provide a file path instead"
-                );
-            }
-        } else {
-            validate_file_exists(&self.input, "Input BAM")?;
-        }
-
-        // Either --output or --verify must be specified
-        if !self.verify && self.output.is_none() {
-            bail!("Either --output or --verify must be specified");
-        }
-
-        if self.verify {
-            // --verify is a standalone read-and-check path: no pipeline, just a
-            // raw record-stream walk that compares each key to the previous.
-            return self.execute_verify();
-        }
-
-        let output = self.output.as_ref().expect("output required for sort mode");
-
-        // BAI is only defined for coordinate sort.
-        if self.write_index && !matches!(self.order, SortOrderArg::Coordinate) {
-            bail!("--write-index is only valid for coordinate sort");
-        }
-
-        // Up-front guard (S3-002): zstd has no uncompressed mode, so reject the
-        // `--temp-compression 0` + `--temp-codec zstd` combination before the run
-        // starts rather than failing late. (The engine also enforces this via
-        // `ensure_spill_codec_compat`, but catching it here gives a CLI-level
-        // message and avoids any setup work.)
-        if self.options.temp_compression == 0 && matches!(self.options.temp_codec, SpillCodec::Zstd)
-        {
-            bail!(
-                "--temp-compression 0 is only supported with --temp-codec bgzf; \
-                 zstd does not have an uncompressed mode. Pass --temp-codec bgzf \
-                 to keep uncompressed spill, or use a zstd level >= 1."
-            );
-        }
-
-        // `--key-types` only applies to template-coordinate sort; warn if set for
-        // any other order so the override is not silently ignored.
-        if self.options.key_types.is_some()
-            && !matches!(self.order, SortOrderArg::TemplateCoordinate)
-        {
-            info!("--key-types is ignored for --order {:?}", self.order);
-        }
-
-        // Copy order into SortOptions so the step factory can read it.
-        let mut sort_opts = self.options.clone();
-        sort_opts.order = self.order;
-
-        self.execute_sort(sort_opts, output, command_line)
-    }
-}
-
 impl Sort {
-    /// Execute the non-verify sort path by building the typed-step pipeline
-    /// directly (no chains monolith): a single `Exclusive` `SortBamFile` step
-    /// registered as a source, run on one framework driver thread while the
-    /// sort engine's own worker pool provides internal concurrency. Finalize
-    /// actions (summary log, optional BAI index) run after `Pipeline::run`.
-    fn execute_sort(
-        &self,
-        sort_opts: SortOptions,
-        output: &std::path::Path,
-        command_line: &str,
-    ) -> Result<()> {
-        let input_path = self.input.clone();
-        let output_path = output.to_path_buf();
-        let num_sorter_threads = self.threads.max(1);
-        // Per-phase worker counts; each defaults to --threads. Memory budget
-        // intentionally stays tied to --threads (these knobs are CPU-only). Read
-        // from `sort_opts` (the resolved options used by the rest of the method)
-        // so the phase counts cannot diverge from the logged / built config.
-        let num_phase1_threads = sort_opts.sort_threads.unwrap_or(num_sorter_threads).max(1);
-        let num_phase2_threads = sort_opts.merge_threads.unwrap_or(num_sorter_threads).max(1);
-
-        let effective_memory = resolve_memory_budget(
-            sort_opts.max_memory,
-            sort_opts.memory_reserve,
-            num_sorter_threads,
-            sort_opts.memory_per_thread,
-        )?;
-
-        let timer = OperationTimer::new("Sorting BAM");
-        log_sort_start(
-            &sort_opts,
-            &input_path,
-            &output_path,
-            num_sorter_threads,
-            num_phase1_threads,
-            num_phase2_threads,
-            effective_memory,
-        );
-
-        let stats_slot = Arc::new(Mutex::new(None::<fgumi_sort::SortStats>));
-
-        let sort_step = build_sort_step(SortStepCaptures {
-            sort: sort_opts,
-            input_path,
-            output_path: output_path.clone(),
-            num_sorter_threads,
-            num_phase1_threads,
-            num_phase2_threads,
-            effective_memory,
-            output_compression: self.compression.compression_level,
-            command_line: command_line.to_string(),
-            stats_slot: Arc::clone(&stats_slot),
-            async_reader: self.async_reader,
-        })?;
-
-        // SortBamFile has `Input = ()` and `Outputs = ()`, so it registers via
-        // `append_source` and the builder won't flag unwired branches. A single
-        // Exclusive step needs only one framework driver thread.
-        let builder = Pipeline::builder();
-        let _ = builder.append_source(sort_step);
-        let pipeline =
-            builder.build().map_err(|e| anyhow::anyhow!("Pipeline build failed: {e}"))?;
-        let config = PipelineConfig { threads: 1, ..Default::default() };
-
-        // Always drain the summary finalize action, even on the error path, so
-        // the summary logs. The pipeline-run error takes precedence.
-        let run_result = pipeline.run(config).map_err(|e| anyhow::anyhow!("Pipeline::run: {e:?}"));
-
-        // Drain the summary hook even on the error path (it is infallible —
-        // always `Ok(())`), then let the pipeline-run error take precedence.
-        let summary_result =
-            Box::new(SortFinalizeHook { stats_slot, output_path: output_path.clone(), timer })
-                .finalize();
-
-        // Only write the BAM index after a successful sort: a failed run leaves
-        // the output BAM incomplete, so emitting (or overwriting) `.bam.bai`
-        // would publish a stale index for a partial file.
-        run_result?;
-        summary_result?;
-        if self.write_index {
-            Box::new(IndexBamFinalizeHook { output_path }).finalize()?;
-        }
-        Ok(())
-    }
-
     /// Parse the cell tag for template-coordinate sort/verify, returning `None`
     /// for other sort orders.
     fn parse_cell_tag(&self) -> Result<Option<SamTag>> {
@@ -604,7 +505,12 @@ impl Sort {
     }
 
     /// Execute verify mode: read records and check sort order.
-    fn execute_verify(&self) -> Result<()> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input cannot be opened or read, or if any
+    /// record is found out of order relative to the requested sort order.
+    pub fn execute_verify(&self) -> Result<()> {
         use fgumi_sort::RawBamRecordReader;
         use fgumi_sort::{
             LibraryLookup, RawQuerynameKey, RawQuerynameLexKey, RawSortKey, SortContext, cb_hasher,
@@ -724,6 +630,83 @@ mod tests {
     }
 
     #[test]
+    fn default_decompress_tuning_is_block_parallel_batch_of_four() {
+        // block_batch default is 4 (the original `MAX_BATCH_PER_CALL`, pending a
+        // fleet bench); file_granularity default is false (block-parallel is the
+        // hardened production default, P5c). Both clap `default_value`s must
+        // round-trip through `SortOptions::default`.
+        let defaults = SortOptions::default();
+        assert_eq!(defaults.block_batch, 4);
+        assert!(
+            !defaults.file_granularity,
+            "block-parallel is the default (file_granularity=false)"
+        );
+
+        let sort = Sort::try_parse_from(["fgumi-sort", "-i", "in.bam", "-o", "out.bam"])
+            .expect("parse with defaults");
+        assert_eq!(sort.options.block_batch, 4, "CLI default block_batch must be 4");
+        assert!(
+            !sort.options.file_granularity,
+            "CLI default must be block-parallel (file_granularity=false)",
+        );
+    }
+
+    #[rstest]
+    #[case(1)]
+    #[case(2)]
+    #[case(4)]
+    fn validate_accepts_positive_block_batch(#[case] block_batch: usize) {
+        let opts = SortOptions { block_batch, ..SortOptions::default() };
+        assert!(opts.validate().is_ok(), "block_batch={block_batch} must be accepted");
+    }
+
+    #[test]
+    fn validate_rejects_zero_block_batch() {
+        let opts = SortOptions { block_batch: 0, ..SortOptions::default() };
+        let err = opts.validate().expect_err("block_batch 0 must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("--block-batch"), "error should name the standalone flag: {msg}");
+        assert!(
+            msg.contains("--sort::block-batch"),
+            "error should also name the runall flag: {msg}"
+        );
+        assert!(msg.contains(">= 1"), "error should state the constraint: {msg}");
+    }
+
+    #[test]
+    fn validate_rejects_uncompressed_zstd_spill() {
+        // temp-compression 0 + zstd has no uncompressed mode. This rule is now in
+        // the shared validator, so BOTH `fgumi sort` and `fgumi runall` reject it
+        // (previously runall slipped it through — the guard-parity gap this closes).
+        let opts = SortOptions {
+            temp_compression: 0,
+            temp_codec: SpillCodec::Zstd,
+            ..SortOptions::default()
+        };
+        let err = opts.validate().expect_err("temp-compression 0 + zstd must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("temp-compression 0"), "error should name the flag: {msg}");
+        assert!(msg.contains("bgzf"), "error should point at the bgzf fix: {msg}");
+    }
+
+    #[test]
+    fn validate_accepts_uncompressed_bgzf_and_compressed_zstd() {
+        // The two valid temp-spill configs: uncompressed bgzf, and zstd >= 1.
+        let bgzf0 = SortOptions {
+            temp_compression: 0,
+            temp_codec: SpillCodec::Bgzf,
+            ..SortOptions::default()
+        };
+        assert!(bgzf0.validate().is_ok(), "temp-compression 0 + bgzf is valid");
+        let zstd1 = SortOptions {
+            temp_compression: 1,
+            temp_codec: SpillCodec::Zstd,
+            ..SortOptions::default()
+        };
+        assert!(zstd1.validate().is_ok(), "zstd level 1 is valid");
+    }
+
+    #[test]
     fn test_resolve_tmp_dirs_cli_overrides_env() {
         let cli = vec![PathBuf::from("/tmp/cli")];
         #[cfg(unix)]
@@ -825,68 +808,6 @@ mod tests {
     }
 
     #[test]
-    fn test_temp_compression_zero_with_zstd_rejected_up_front() {
-        // zstd has no uncompressed mode — the combination must be rejected
-        // before the sort runs (S3-002). Use a valid input so the up-front
-        // config guard, not input validation, is what fires.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let input = dir.path().join("in.bam");
-        let output = dir.path().join("out.bam");
-        write_coordinate_bam(&input);
-
-        let sort = Sort::try_parse_from([
-            "sort",
-            "-i",
-            input.to_str().unwrap(),
-            "-o",
-            output.to_str().unwrap(),
-            "--temp-compression",
-            "0",
-            "--temp-codec",
-            "zstd",
-        ])
-        .expect("parse");
-        let err = sort.execute("fgumi sort").expect_err("zstd + level 0 must be rejected");
-        assert!(
-            err.to_string().contains("only supported with --temp-codec bgzf"),
-            "unexpected error: {err}"
-        );
-        assert!(!output.exists(), "no output should be written when the config is rejected");
-    }
-
-    #[test]
-    fn test_temp_compression_zero_with_bgzf_runs() {
-        // bgzf supports uncompressed (level-0) spill, so the combination is
-        // accepted and the sort completes.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let input = dir.path().join("in.bam");
-        let output = dir.path().join("out.bam");
-        write_coordinate_bam(&input);
-
-        let sort = Sort::try_parse_from([
-            "sort",
-            "-i",
-            input.to_str().unwrap(),
-            "-o",
-            output.to_str().unwrap(),
-            "--order",
-            "coordinate",
-            // Bound the memory reservation: the default is 768 MiB per thread,
-            // which a single-record test should not reserve (especially under
-            // nextest's concurrent execution).
-            "--max-memory",
-            "16MiB",
-            "--temp-compression",
-            "0",
-            "--temp-codec",
-            "bgzf",
-        ])
-        .expect("parse");
-        sort.execute("fgumi sort").expect("bgzf level-0 spill must sort successfully");
-        assert!(output.exists(), "sorted output not written");
-    }
-
-    #[test]
     fn test_phase_thread_flags_parse() {
         use clap::Parser;
         // Standalone: flags now live on SortOptions, still spelled --sort-threads / --merge-threads.
@@ -922,282 +843,5 @@ mod tests {
         let opts = p.sort.validate().expect("validate");
         assert_eq!(opts.sort_threads, Some(3));
         assert_eq!(opts.merge_threads, Some(7));
-    }
-
-    /// Write a minimal valid coordinate-sorted BAM (one mapped record) to
-    /// `path`, so a pre-placed output file looks indexable to the BAI hook.
-    #[allow(clippy::cast_possible_truncation)]
-    fn write_coordinate_bam(path: &std::path::Path) {
-        use noodles::sam::Header;
-        use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
-        use std::num::NonZeroUsize;
-
-        let mut builder = Header::builder();
-        builder = builder.add_reference_sequence(
-            b"chr1",
-            Map::<ReferenceSequence>::new(NonZeroUsize::new(1000).expect("non-zero")),
-        );
-        let header =
-            fgumi_sort::create_output_header(fgumi_sort::SortOrder::Coordinate, &builder.build());
-
-        // One 10-base mapped record on chr1:100 (BAM record body bytes).
-        let name = b"r1";
-        let name_with_null = name.len() + 1;
-        let padding = (4 - (name_with_null % 4)) % 4;
-        let mut record = Vec::with_capacity(64);
-        record.extend_from_slice(&0_i32.to_le_bytes()); // ref_id
-        record.extend_from_slice(&100_i32.to_le_bytes()); // pos
-        record.push((name_with_null + padding) as u8); // l_read_name
-        record.push(60_u8); // mapq
-        record.extend_from_slice(&4681_u16.to_le_bytes()); // bin
-        record.extend_from_slice(&1_u16.to_le_bytes()); // n_cigar_op
-        record.extend_from_slice(&0_u16.to_le_bytes()); // flag
-        record.extend_from_slice(&10_u32.to_le_bytes()); // l_seq
-        record.extend_from_slice(&(-1_i32).to_le_bytes()); // next_ref_id
-        record.extend_from_slice(&(-1_i32).to_le_bytes()); // next_pos
-        record.extend_from_slice(&0_i32.to_le_bytes()); // tlen
-        record.extend_from_slice(name);
-        record.push(0);
-        record.extend(std::iter::repeat_n(0_u8, padding));
-        record.extend_from_slice(&(10_u32 << 4).to_le_bytes()); // 10M cigar
-        record.extend_from_slice(&[0x11_u8; 5]); // packed seq
-        record.extend_from_slice(&[30_u8; 10]); // qualities
-
-        let mut writer = fgumi_bam_io::create_raw_bam_writer(path, &header, 1, 1)
-            .expect("create_raw_bam_writer");
-        writer.write_raw_record(&record).expect("write record");
-        writer.finish().expect("finish");
-    }
-
-    /// Compute the spec-valid BAM bin for a 0-based half-open alignment range
-    /// `[beg, end)` using the SAM spec §5.3 `reg2bin` reference algorithm. The
-    /// fixtures here emit 10M alignments, so on-wire records must carry a real
-    /// bin rather than `0` (which is only valid for the largest-window layer).
-    #[allow(clippy::eq_op, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    fn reg2bin(beg: i32, end: i32) -> u16 {
-        let beg = beg as usize;
-        let end = (end - 1) as usize; // spec works on the inclusive last base
-        let bin = if beg >> 14 == end >> 14 {
-            ((1 << 15) - 1) / 7 + (beg >> 14)
-        } else if beg >> 17 == end >> 17 {
-            ((1 << 12) - 1) / 7 + (beg >> 17)
-        } else if beg >> 20 == end >> 20 {
-            ((1 << 9) - 1) / 7 + (beg >> 20)
-        } else if beg >> 23 == end >> 23 {
-            ((1 << 6) - 1) / 7 + (beg >> 23)
-        } else if beg >> 26 == end >> 26 {
-            ((1 << 3) - 1) / 7 + (beg >> 26)
-        } else {
-            0
-        };
-        bin as u16
-    }
-
-    /// Build a single 10-base mapped BAM record body at `(ref_id, pos)` with the
-    /// given read `name`. Mirrors the layout in `write_coordinate_bam`.
-    #[allow(clippy::cast_possible_truncation)]
-    fn mapped_record_body(name: &[u8], ref_id: i32, pos: i32) -> Vec<u8> {
-        let name_with_null = name.len() + 1;
-        let padding = (4 - (name_with_null % 4)) % 4;
-        // 10M alignment spanning [pos, pos + 10); emit the spec-valid bin so the
-        // success-path fixture mirrors the production on-wire BAM encoding.
-        let bin = reg2bin(pos, pos + 10);
-        let mut record = Vec::with_capacity(64);
-        record.extend_from_slice(&ref_id.to_le_bytes());
-        record.extend_from_slice(&pos.to_le_bytes());
-        record.push((name_with_null + padding) as u8); // l_read_name
-        record.push(60_u8); // mapq
-        record.extend_from_slice(&bin.to_le_bytes()); // bin (SAM spec §5.3 reg2bin)
-        record.extend_from_slice(&1_u16.to_le_bytes()); // n_cigar_op
-        record.extend_from_slice(&0_u16.to_le_bytes()); // flag
-        record.extend_from_slice(&10_u32.to_le_bytes()); // l_seq
-        record.extend_from_slice(&(-1_i32).to_le_bytes()); // next_ref_id
-        record.extend_from_slice(&(-1_i32).to_le_bytes()); // next_pos
-        record.extend_from_slice(&0_i32.to_le_bytes()); // tlen
-        record.extend_from_slice(name);
-        record.push(0);
-        record.extend(std::iter::repeat_n(0_u8, padding));
-        record.extend_from_slice(&(10_u32 << 4).to_le_bytes()); // 10M cigar
-        record.extend_from_slice(&[0x11_u8; 5]); // packed seq
-        record.extend_from_slice(&[30_u8; 10]); // qualities
-        record
-    }
-
-    /// Write a small UNSORTED two-reference coordinate BAM to `path`. Returns the
-    /// number of records written. The records are emitted out of coordinate
-    /// order so a real sort has work to do.
-    fn write_unsorted_coordinate_bam(path: &std::path::Path) -> usize {
-        use noodles::sam::Header;
-        use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
-        use std::num::NonZeroUsize;
-
-        let mut builder = Header::builder();
-        for chrom in [b"chr1".as_slice(), b"chr2".as_slice()] {
-            builder = builder.add_reference_sequence(
-                chrom,
-                Map::<ReferenceSequence>::new(NonZeroUsize::new(10_000).expect("non-zero")),
-            );
-        }
-        // Header SO is `unsorted` for input; the writer is told nothing about order.
-        let header = builder.build();
-
-        // (ref_id, pos) emitted deliberately out of coordinate order.
-        let layout: &[(&[u8], i32, i32)] = &[
-            (b"r_chr2_300", 1, 300),
-            (b"r_chr1_500", 0, 500),
-            (b"r_chr1_100", 0, 100),
-            (b"r_chr2_50", 1, 50),
-            (b"r_chr1_900", 0, 900),
-            (b"r_chr2_700", 1, 700),
-            (b"r_chr1_300", 0, 300),
-        ];
-
-        let mut writer = fgumi_bam_io::create_raw_bam_writer(path, &header, 1, 1)
-            .expect("create_raw_bam_writer");
-        for &(name, ref_id, pos) in layout {
-            writer.write_raw_record(&mapped_record_body(name, ref_id, pos)).expect("write record");
-        }
-        writer.finish().expect("finish");
-        layout.len()
-    }
-
-    /// Canonical per-record identity: the full logical record.
-    ///
-    /// We key on the `Debug` rendering of the entire [`noodles` `RecordBuf`], which
-    /// covers the complete alignment payload — read name, flags, reference id /
-    /// position, mapping quality, CIGAR, mate fields, template length, SEQ, QUAL,
-    /// and AUX tags. A weaker `(name, tid, pos, flags)` projection would still
-    /// pass if a sort mutated CIGAR, mate fields, SEQ/QUAL, or a tag. `RecordBuf`
-    /// is the parsed *logical* record, so this is robust to encoding-only
-    /// differences (e.g. the recomputed `bin`) that a raw-byte compare would
-    /// spuriously flag. `RecordBuf` is not `Ord`, so we sort the string forms.
-    type RecordIdentity = String;
-
-    /// Read a canonical per-record identity for every record of a BAM, sorted
-    /// into a multiset. Comparing the input and output multisets proves the sort
-    /// preserved every record exactly — not just its coordinate.
-    fn read_record_identities(path: &std::path::Path) -> Vec<RecordIdentity> {
-        let mut reader =
-            noodles::bam::io::Reader::new(std::fs::File::open(path).expect("open bam"));
-        let header = reader.read_header().expect("read header");
-        let mut ids: Vec<RecordIdentity> =
-            reader.record_bufs(&header).map(|r| format!("{:?}", r.expect("read record"))).collect();
-        ids.sort();
-        ids
-    }
-
-    /// Read back `(reference_sequence_id, alignment_start)` for every record of a
-    /// BAM, in file order, via noodles.
-    fn read_coordinate_keys(path: &std::path::Path) -> Vec<(Option<usize>, Option<usize>)> {
-        let mut reader =
-            noodles::bam::io::Reader::new(std::fs::File::open(path).expect("open sorted output"));
-        let header = reader.read_header().expect("read header");
-        reader
-            .record_bufs(&header)
-            .map(|r| {
-                let rec = r.expect("read record");
-                (rec.reference_sequence_id(), rec.alignment_start().map(usize::from))
-            })
-            .collect()
-    }
-
-    /// Success-path coverage for the streaming sort engine wiring
-    /// (`execute_sort` / `build_sort_step` / write-index) — S3-010. A small
-    /// unsorted coordinate BAM is sorted end-to-end with `--write-index`; the
-    /// output must be coordinate-ordered, preserve every record, and produce a
-    /// readable `.bam.bai` sidecar.
-    #[test]
-    fn execute_sort_success_path_sorts_and_writes_index() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let input = dir.path().join("in.bam");
-        let output = dir.path().join("out.bam");
-        let expected_count = write_unsorted_coordinate_bam(&input);
-
-        let sort = Sort::try_parse_from([
-            "sort",
-            "-i",
-            input.to_str().unwrap(),
-            "-o",
-            output.to_str().unwrap(),
-            "--order",
-            "coordinate",
-            "--write-index",
-            "true",
-            // Bound the per-thread reservation well below the 768 MiB default so
-            // nextest's concurrent execution stays light.
-            "--max-memory",
-            "16MiB",
-        ])
-        .expect("parse Sort");
-
-        sort.execute("fgumi sort").expect("end-to-end coordinate sort must succeed");
-
-        // Output BAM and a readable BAI sidecar must both exist.
-        assert!(output.exists(), "sorted output BAM not written");
-        let bai = fgumi_bam_io::bai_sidecar_path(&output);
-        assert!(bai.exists(), "BAI sidecar not written on the success path");
-        noodles::bam::bai::fs::read(&bai).expect("BAI sidecar must parse");
-
-        // Exact record count preserved (no loss / duplication).
-        let keys = read_coordinate_keys(&output);
-        assert_eq!(keys.len(), expected_count, "record count changed across sort");
-
-        // Record identity preserved: the input and output multisets must match
-        // exactly, so a sort cannot silently mutate, drop, or duplicate a record
-        // while still satisfying the count and coordinate-order checks below.
-        assert_eq!(
-            read_record_identities(&input),
-            read_record_identities(&output),
-            "record identity changed across sort (mutation / loss / duplication)"
-        );
-
-        // Independent coordinate-order check: (tid, pos) non-decreasing, with
-        // no-reference records (None) sorting last.
-        let rank = |k: &(Option<usize>, Option<usize>)| (k.0.is_none(), k.0, k.1);
-        for pair in keys.windows(2) {
-            assert!(
-                rank(&pair[0]) <= rank(&pair[1]),
-                "output is not coordinate-ordered: {:?} then {:?}",
-                pair[0],
-                pair[1]
-            );
-        }
-    }
-
-    /// A failed sort must not write (or overwrite) the `.bam.bai`: the index
-    /// finalize hook only runs once the pipeline run succeeds.
-    #[test]
-    fn execute_sort_skips_index_when_sort_fails() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let missing_input = dir.path().join("does-not-exist.bam");
-        let output = dir.path().join("out.bam");
-
-        // Pre-place a valid coordinate BAM at the output path. The sort opens its
-        // (missing) input before touching the output, so this file survives —
-        // making the BAI's presence a clean signal of whether the index hook ran.
-        write_coordinate_bam(&output);
-        let bai = fgumi_bam_io::bai_sidecar_path(&output);
-        assert!(!bai.exists(), "precondition: no index before the failed sort");
-
-        // A Sort configured to write the index on success.
-        let sort = Sort::try_parse_from([
-            "sort",
-            "--input",
-            missing_input.to_str().expect("utf8"),
-            "--output",
-            output.to_str().expect("utf8"),
-            "--order",
-            "coordinate",
-            "--write-index",
-            "true",
-        ])
-        .expect("parse Sort");
-
-        let mut sort_opts = sort.options.clone();
-        sort_opts.order = sort.order;
-        let result = sort.execute_sort(sort_opts, &output, "fgumi sort test");
-
-        assert!(result.is_err(), "sort should fail when the input is missing");
-        assert!(!bai.exists(), "index hook must not run after a failed sort");
     }
 }

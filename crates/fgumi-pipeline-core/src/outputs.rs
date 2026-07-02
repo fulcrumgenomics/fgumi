@@ -13,7 +13,7 @@
 //!
 //! Each `StepOutputs` impl provides:
 //!   - `arity()` — number of independent output channels.
-//!   - `build_queues(specs, ordering) -> (OutputQueueSet, OutputsViewAny)` —
+//!   - `build_queues(specs, ordering, level) -> (OutputQueueSet, OutputsViewAny)` —
 //!     constructs the typed queues + reorder operators (where applicable)
 //!     and the type-erased view the framework stores. Implemented in
 //!     `handles.rs` (one impl per arity).
@@ -46,6 +46,7 @@ pub trait StepOutputs: Send + 'static {
     fn build_queues(
         specs: &[QueueSpec],
         ordering: &[BranchOrdering],
+        level: crate::builder::InstrumentationLevel,
     ) -> (OutputQueueSet, OutputsViewAny);
 
     /// Mark all output branches drained, dispatching through the typed
@@ -69,8 +70,9 @@ impl<T: Send + HeapSize + 'static> StepOutputs for Single<T> {
     fn build_queues(
         specs: &[QueueSpec],
         ordering: &[BranchOrdering],
+        level: crate::builder::InstrumentationLevel,
     ) -> (OutputQueueSet, OutputsViewAny) {
-        super::handles::build_single_queues::<T>(specs, ordering)
+        super::handles::build_single_queues::<T>(specs, ordering, level)
     }
 
     fn mark_all_drained(handles: &super::step::OutputHandles<Self>) {
@@ -101,8 +103,9 @@ impl<T: Send + HeapSize + Ordered + 'static> StepOutputs for OrderedBytesSingle<
     fn build_queues(
         specs: &[QueueSpec],
         ordering: &[BranchOrdering],
+        level: crate::builder::InstrumentationLevel,
     ) -> (OutputQueueSet, OutputsViewAny) {
-        super::handles::build_single_queues_ordered_bytes::<T>(specs, ordering)
+        super::handles::build_single_queues_ordered_bytes::<T>(specs, ordering, level)
     }
 
     fn mark_all_drained(handles: &super::step::OutputHandles<Self>) {
@@ -119,8 +122,9 @@ impl<A: Send + HeapSize + 'static, B: Send + HeapSize + 'static> StepOutputs for
     fn build_queues(
         specs: &[QueueSpec],
         ordering: &[BranchOrdering],
+        level: crate::builder::InstrumentationLevel,
     ) -> (OutputQueueSet, OutputsViewAny) {
-        super::handles::build_tuple2_queues::<A, B>(specs, ordering)
+        super::handles::build_tuple2_queues::<A, B>(specs, ordering, level)
     }
 
     fn mark_all_drained(handles: &super::step::OutputHandles<Self>) {
@@ -157,8 +161,9 @@ where
     fn build_queues(
         specs: &[QueueSpec],
         ordering: &[BranchOrdering],
+        level: crate::builder::InstrumentationLevel,
     ) -> (OutputQueueSet, OutputsViewAny) {
-        super::handles::build_tuple2_queues_ordered_bytes::<A, B>(specs, ordering)
+        super::handles::build_tuple2_queues_ordered_bytes::<A, B>(specs, ordering, level)
     }
 
     fn mark_all_drained(handles: &super::step::OutputHandles<Self>) {
@@ -180,8 +185,9 @@ where
     fn build_queues(
         specs: &[QueueSpec],
         ordering: &[BranchOrdering],
+        level: crate::builder::InstrumentationLevel,
     ) -> (OutputQueueSet, OutputsViewAny) {
-        super::handles::build_tuple3_queues::<A, B, C>(specs, ordering)
+        super::handles::build_tuple3_queues::<A, B, C>(specs, ordering, level)
     }
 
     fn mark_all_drained(handles: &super::step::OutputHandles<Self>) {
@@ -204,8 +210,9 @@ where
     fn build_queues(
         specs: &[QueueSpec],
         ordering: &[BranchOrdering],
+        level: crate::builder::InstrumentationLevel,
     ) -> (OutputQueueSet, OutputsViewAny) {
-        super::handles::build_tuple4_queues::<A, B, C, D>(specs, ordering)
+        super::handles::build_tuple4_queues::<A, B, C, D>(specs, ordering, level)
     }
 
     fn mark_all_drained(handles: &super::step::OutputHandles<Self>) {
@@ -222,8 +229,9 @@ impl StepOutputs for () {
     fn build_queues(
         specs: &[QueueSpec],
         ordering: &[BranchOrdering],
+        level: crate::builder::InstrumentationLevel,
     ) -> (OutputQueueSet, OutputsViewAny) {
-        super::handles::build_unit_queues(specs, ordering)
+        super::handles::build_unit_queues(specs, ordering, level)
     }
 
     fn mark_all_drained(handles: &super::step::OutputHandles<Self>) {

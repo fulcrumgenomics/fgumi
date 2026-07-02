@@ -1,75 +1,26 @@
 //! Sort typed-steps for the unified pipeline.
 
-pub mod and_spill;
+pub mod arena_ingest;
+pub mod compress_spill;
 pub mod merge;
 pub mod protocol;
+pub mod sort_buffer;
+pub mod spill_compress;
 pub mod spill_decompress;
+pub mod spill_gather;
+pub mod spill_write;
 
-pub use and_spill::SortAndSpill;
-pub use merge::SortMerge;
-pub use spill_decompress::SortSpillDecompress;
-
-use std::io;
-use std::path::PathBuf;
-use std::sync::Arc;
-
-use fgumi_sort::RawExternalSorter;
-use parking_lot::Mutex;
-
-use fgumi_pipeline_core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SortBamFile — Exclusive single-step wrapping legacy sort end-to-end.
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// `Exclusive` step that drives a complete legacy
-/// `RawExternalSorter::sort(input, output)` call to completion in a
-/// single `try_run`.
-pub struct SortBamFile {
-    sorter: Option<RawExternalSorter>,
-    input: PathBuf,
-    output: PathBuf,
-    stats_out: Arc<Mutex<Option<fgumi_sort::SortStats>>>,
-}
-
-impl SortBamFile {
-    /// Build a `SortBamFile` step.
-    #[must_use]
-    pub fn new(
-        sorter: RawExternalSorter,
-        input: PathBuf,
-        output: PathBuf,
-        stats_out: Arc<Mutex<Option<fgumi_sort::SortStats>>>,
-    ) -> Self {
-        Self { sorter: Some(sorter), input, output, stats_out }
-    }
-}
-
-impl Step for SortBamFile {
-    type Input = ();
-    type Outputs = ();
-
-    fn profile(&self) -> StepProfile {
-        StepProfile {
-            name: "SortBamFile",
-            kind: StepKind::Exclusive,
-            sticky: false,
-            output_queues: vec![],
-            branch_ordering: vec![],
-        }
-    }
-
-    fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
-        let Some(sorter) = self.sorter.take() else {
-            return Ok(StepOutcome::Finished);
-        };
-        let stats = sorter
-            .sort(&self.input, &self.output)
-            .map_err(|e| io::Error::other(format!("SortBamFile: sort failed: {e:#}")))?;
-        *self.stats_out.lock() = Some(stats);
-        Ok(StepOutcome::Finished)
-    }
-}
+pub use arena_ingest::{
+    ArenaBlock, ArenaSortStrategy, CoordinateStrategy, FindBoundariesAndSort, InflateToArena,
+    InflatedBlock, QuerynameStrategy, ReadBlocks, TemplateStrategy,
+};
+pub use compress_spill::CompressSpill;
+pub use merge::{BlockOutput, MergeBatchBuilder, MergeOutput, RecordBatchOutput, SortMerge};
+pub use sort_buffer::SortBuffer;
+pub use spill_compress::SpillCompress;
+pub use spill_decompress::{SortDecompressTuning, SortSpillDecompress};
+pub use spill_gather::SpillGather;
+pub use spill_write::SpillWrite;
 
 #[cfg(test)]
 pub mod tests;
