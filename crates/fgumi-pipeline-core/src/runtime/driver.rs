@@ -28,9 +28,10 @@ use crate::erased::ErasedStepCtx;
 use crate::runtime::contexts::ChainContexts;
 use crate::runtime::drain::StepDrainCounter;
 use crate::runtime::live::LiveSteps;
+use crate::runtime::scheduler::{Scheduler, WalkDirection};
 use crate::runtime::stats::PipelineStats;
 use crate::runtime::storage::WorkerStepEntry;
-use crate::runtime::worker_core::WorkerCore;
+use crate::runtime::worker_core::{WorkerCore, WorkerRole};
 use crate::signal::{PipelineError, PipelineSignal};
 use crate::step::StepOutcome;
 use crate::topology::StepIdx;
@@ -50,6 +51,7 @@ pub fn run_worker_loop(
     drain_counters: &[Arc<StepDrainCounter>],
     signal: &Arc<PipelineSignal>,
     stats: Option<&Arc<PipelineStats>>,
+    scheduler: &dyn Scheduler,
 ) {
     // Per-worker worklist of still-dispatchable steps, in chain order. A step
     // is removed when it returns `StepOutcome::Finished`; the worker exits once
@@ -68,6 +70,13 @@ pub fn run_worker_loop(
     // live" so the fast path is skipped entirely.
     let mut sticky_live = worker.sticky_owner.is_some_and(|idx| live.contains(idx));
 
+    // A driver thread attributes busy time PER grouped step on the off-pool
+    // detached line (so a multi-step `Shared` group shows each step's real
+    // busy, not the whole thread's time under one name), recorded inside
+    // `dispatch_one_step`; a pool worker records aggregate busy by `thread_id`
+    // below. Idle/park stay thread-level (keyed to the group's primary step).
+    let is_driver = matches!(worker.role(), WorkerRole::Driver { .. });
+
     loop {
         if signal.is_done() {
             break;
@@ -78,6 +87,11 @@ pub fn run_worker_loop(
         }
 
         let mut did_work = false;
+
+        // Time the dispatch (busy) section vs the backoff sleep (idle) below,
+        // per worker, only when stats are on (`Instant::now()` is otherwise not
+        // called — the no-stats loop stays zero-cost).
+        let work_start = stats.map(|_| Instant::now());
 
         // 1. Sticky re-entry for sticky-owned steps (either an Exclusive
         // sticky step this worker owns, or a Serial+sticky step whose
@@ -102,6 +116,7 @@ pub fn run_worker_loop(
                     &drain_counters[owned_idx.0],
                     signal,
                     stats,
+                    is_driver,
                 ) else {
                     break; // Skip
                 };
@@ -143,6 +158,8 @@ pub fn run_worker_loop(
                 drain_counters,
                 signal,
                 stats,
+                scheduler.walk(),
+                is_driver,
             );
             did_work |= outcome.did_work;
             if outcome.removed_sticky_owner {
@@ -152,14 +169,41 @@ pub fn run_worker_loop(
             }
         }
 
-        // 3. Exponential-backoff sleep on no-progress; reset on progress.
+        // Attribute the dispatch section's wall time to this thread's busy total.
+        // Pool workers sum the whole pass into the N-worker utilisation line (by
+        // thread_id). Driver threads instead record each grouped step's own busy
+        // inside `dispatch_one_step` (on the off-pool detached line, by step) so a
+        // multi-step `Shared` group isn't collapsed onto one name — so nothing to
+        // record here for a driver.
+        if let (Some(stats), Some(ws)) = (stats, work_start) {
+            if let WorkerRole::Pool = worker.role() {
+                let ns = u64::try_from(ws.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                stats.record_worker_busy(worker.thread_id, ns);
+            }
+        }
+
+        // 3. Exponential-backoff sleep on no-progress; reset on progress. The
+        // sleep is the worker's idle/blocked time — attribute it per worker so
+        // pool under-utilisation (cores parked while one worker drives a Serial
+        // step) is visible in `--pipeline-stats`.
         if did_work {
             worker.reset_backoff();
         } else if signal.is_done() {
             break;
         } else {
+            let sleep_start = stats.map(|_| Instant::now());
             worker.sleep_backoff();
             worker.increase_backoff();
+            if let (Some(stats), Some(ss)) = (stats, sleep_start) {
+                let ns = u64::try_from(ss.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                match worker.role() {
+                    WorkerRole::Pool => stats.record_worker_idle(worker.thread_id, ns),
+                    WorkerRole::Driver { primary_step } => {
+                        stats.record_detached_idle(primary_step, ns);
+                        stats.record_detached_park(primary_step);
+                    }
+                }
+            }
         }
     }
 }
@@ -180,6 +224,7 @@ struct RoundRobinOutcome {
 /// [`RoundRobinOutcome::removed_sticky_owner`] when it finishes here, so the
 /// caller can disable the per-iteration sticky fast-path without a linear
 /// `live.contains` scan.
+#[allow(clippy::too_many_arguments)] // shared per-step state + the walk policy; a struct would not clarify
 fn round_robin_dispatch(
     entries: &mut [WorkerStepEntry],
     live: &mut LiveSteps,
@@ -188,6 +233,8 @@ fn round_robin_dispatch(
     drain_counters: &[Arc<StepDrainCounter>],
     signal: &Arc<PipelineSignal>,
     stats: Option<&Arc<PipelineStats>>,
+    walk: WalkDirection,
+    is_driver: bool,
 ) -> RoundRobinOutcome {
     let mut did_work = false;
     // Steps that finished this pass, removed from `live` after the walk. A
@@ -195,10 +242,20 @@ fn round_robin_dispatch(
     // `break` on `Progress`/error, never revisit), so deferring removal is
     // safe and avoids reorder-under-iteration.
     let mut finished: Vec<StepIdx> = Vec::new();
-    for pos in 0..live.len() {
+    let n = live.len();
+    for i in 0..n {
         if signal.is_done() {
             break;
         }
+        // The Scheduler selects the walk DIRECTION over this worker's live
+        // steps: `Forward` = chain order (upstream-first, favour production);
+        // `Reverse` = downstream-first (favour draining buffered work before
+        // producing more). Everything else — skip-on-contention, the sticky
+        // source/sink fast-path, Finished handling — is direction-agnostic.
+        let pos = match walk {
+            WalkDirection::Forward => i,
+            WalkDirection::Reverse => n - 1 - i,
+        };
         let step_idx = live.order()[pos];
         let entry = &mut entries[step_idx.0];
         let mut mark_skip = false;
@@ -210,6 +267,7 @@ fn round_robin_dispatch(
             &drain_counters[step_idx.0],
             signal,
             stats,
+            is_driver,
         ) else {
             continue; // Skip (build-time placeholder; should not appear in `live`)
         };
@@ -277,6 +335,11 @@ fn dispatch_one_step(
     counter: &StepDrainCounter,
     signal: &Arc<PipelineSignal>,
     stats: Option<&Arc<PipelineStats>>,
+    // When true (a dedicated driver thread), attribute this dispatch's wall time
+    // to the off-pool detached line keyed by `step_idx` — so each grouped step
+    // reports its own busy. Pool workers pass `false` and record aggregate busy
+    // by `thread_id` in the loop instead.
+    is_driver: bool,
 ) -> Option<DispatchInfo> {
     let outputs_any: &(dyn Any + Send + Sync) = contexts.outputs[step_idx.0].as_ref();
     let mut ctx =
@@ -367,6 +430,11 @@ fn dispatch_one_step(
                 Ok(outcome) => stats.record(step_idx, *outcome, start_ns, elapsed_ns),
                 Err(_) => stats.record_error(step_idx, start_ns, elapsed_ns),
             }
+            // On a driver thread, this step's try_run wall is its own off-pool
+            // busy (excluded from the pool%); each grouped step accrues its own.
+            if is_driver {
+                stats.record_detached_busy(step_idx, elapsed_ns);
+            }
         }
     }
 
@@ -376,7 +444,7 @@ fn dispatch_one_step(
 #[cfg(test)]
 mod tests {
     use std::io;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
     use crate::erased::{ErasedStep, TypedStep};
@@ -394,14 +462,26 @@ mod tests {
     fn run_worker_loop_exits_on_signal_done() {
         let signal = PipelineSignal::new();
         let mut entries: Vec<WorkerStepEntry> = vec![];
-        let contexts =
-            Arc::new(ChainContexts { inputs: vec![], outputs: vec![], bounded_queues: vec![] });
+        let contexts = Arc::new(ChainContexts {
+            inputs: vec![],
+            outputs: vec![],
+            bounded_queues: vec![],
+            edges: vec![],
+        });
         let drain_counters: Vec<Arc<StepDrainCounter>> = vec![];
         let _ = ChainGraph::new();
         let mut worker = WorkerCore::new(0, None, None);
 
         signal.cancel();
-        run_worker_loop(&mut worker, &mut entries, &contexts, &drain_counters, &signal, None);
+        run_worker_loop(
+            &mut worker,
+            &mut entries,
+            &contexts,
+            &drain_counters,
+            &signal,
+            None,
+            &crate::runtime::scheduler::ChainOrderScheduler,
+        );
         // If we reach this line, the loop exited cleanly.
     }
 
@@ -576,7 +656,11 @@ mod tests {
     fn parallel_last_finisher_closes_shared_output_exactly_once() {
         const N: usize = 4;
         let (steps, graph, _runs) = three_step_chain(StepKind::Parallel);
-        let contexts = Arc::new(build_chain_contexts(&steps, &graph));
+        let contexts = Arc::new(build_chain_contexts(
+            &steps,
+            &graph,
+            crate::builder::InstrumentationLevel::Off,
+        ));
         let mid = StepIdx(1);
         let counter = StepDrainCounter::new(N);
         let signal = PipelineSignal::new();
@@ -592,7 +676,8 @@ mod tests {
                 !InputHandle::is_drained(sink_input),
                 "downstream input drained before the last clone finished (after {i} of {N})"
             );
-            let info = dispatch_one_step(clone, mid, &contexts, &counter, &signal, None).unwrap();
+            let info =
+                dispatch_one_step(clone, mid, &contexts, &counter, &signal, None, false).unwrap();
             assert!(matches!(info.result, Ok(StepOutcome::Finished)));
         }
         assert!(
@@ -607,7 +692,11 @@ mod tests {
     #[test]
     fn serial_drain_gate_short_circuits_second_worker() {
         let (steps, graph, runs) = three_step_chain(StepKind::Serial);
-        let contexts = Arc::new(build_chain_contexts(&steps, &graph));
+        let contexts = Arc::new(build_chain_contexts(
+            &steps,
+            &graph,
+            crate::builder::InstrumentationLevel::Off,
+        ));
         let mid = StepIdx(1);
         let counter = StepDrainCounter::new(1);
         let signal = PipelineSignal::new();
@@ -619,7 +708,7 @@ mod tests {
         let mut entry1 =
             WorkerStepEntry::Shared { step: Arc::clone(&shared), drain: Arc::clone(&drain) };
         let info1 =
-            dispatch_one_step(&mut entry1, mid, &contexts, &counter, &signal, None).unwrap();
+            dispatch_one_step(&mut entry1, mid, &contexts, &counter, &signal, None, false).unwrap();
         assert!(matches!(info1.result, Ok(StepOutcome::Finished)));
         assert_eq!(runs.load(Ordering::Relaxed), 1, "step ran exactly once on the first worker");
         assert!(drain.is_finished(), "first finisher must set the DrainGate latch");
@@ -628,7 +717,7 @@ mod tests {
         let mut entry2 =
             WorkerStepEntry::Shared { step: Arc::clone(&shared), drain: Arc::clone(&drain) };
         let info2 =
-            dispatch_one_step(&mut entry2, mid, &contexts, &counter, &signal, None).unwrap();
+            dispatch_one_step(&mut entry2, mid, &contexts, &counter, &signal, None, false).unwrap();
         assert!(matches!(info2.result, Ok(StepOutcome::Finished)));
         assert_eq!(
             info2.name, "<finished-serial-step>",
@@ -654,7 +743,11 @@ mod tests {
         graph.wire(src, BranchIdx(0), sink);
         let steps: Vec<Box<dyn ErasedStep>> =
             vec![Box::new(TypedStep::new(SrcFinished)), Box::new(TypedStep::new(SinkStep))];
-        let contexts = Arc::new(build_chain_contexts(&steps, &graph));
+        let contexts = Arc::new(build_chain_contexts(
+            &steps,
+            &graph,
+            crate::builder::InstrumentationLevel::Off,
+        ));
 
         // Single worker; the source (idx 0) is its Exclusive sticky owner, the
         // sink (idx 1) is Exclusive owned by the same worker for this 1-worker
@@ -669,7 +762,15 @@ mod tests {
 
         // The source finishes immediately; the sink then sees its input drained
         // and finishes too. `run_worker_loop` must return (no hang).
-        run_worker_loop(&mut worker, &mut entries, &contexts, &drain_counters, &signal, None);
+        run_worker_loop(
+            &mut worker,
+            &mut entries,
+            &contexts,
+            &drain_counters,
+            &signal,
+            None,
+            &crate::runtime::scheduler::ChainOrderScheduler,
+        );
     }
 
     /// A sticky owner that returns `NoProgress` on its first call (yielding out
@@ -701,7 +802,11 @@ mod tests {
             Box::new(TypedStep::new(SrcIdleThenFinish { calls: Arc::clone(&calls) })),
             Box::new(TypedStep::new(LingerThenFinish { ticks: 0 })),
         ];
-        let contexts = Arc::new(build_chain_contexts(&steps, &graph));
+        let contexts = Arc::new(build_chain_contexts(
+            &steps,
+            &graph,
+            crate::builder::InstrumentationLevel::Off,
+        ));
 
         let mut entries: Vec<WorkerStepEntry> = vec![
             WorkerStepEntry::Exclusive { step: steps.into_iter().next().unwrap() },
@@ -718,7 +823,15 @@ mod tests {
         // disable the sticky fast-path so the loop terminates rather than hangs.
         // The `Linger` step stays alive for one more iteration, forcing the
         // post-removal outer iteration that exercises the cleared fast path.
-        run_worker_loop(&mut worker, &mut entries, &contexts, &drain_counters, &signal, None);
+        run_worker_loop(
+            &mut worker,
+            &mut entries,
+            &contexts,
+            &drain_counters,
+            &signal,
+            None,
+            &crate::runtime::scheduler::ChainOrderScheduler,
+        );
 
         // The source must have been called EXACTLY twice: call 1 = idle in the
         // sticky fast-path (`NoProgress`, which does NOT remove it there — that
@@ -736,6 +849,206 @@ mod tests {
             2,
             "source must be called exactly twice (sticky idle, then round-robin finish); \
              a different count means the removed_sticky_owner branch did not gate the fast path",
+        );
+    }
+
+    // ── G1: the load-bearing driver invariant ───────────────────────────────
+    //
+    // A driver thread (`WorkerCore::driver`) is just `run_worker_loop` over a
+    // few `Owned` steps. Its no-deadlock property rests ENTIRELY on the loop
+    // trying EVERY live step in a pass before it parks. A naive "drive the first
+    // live step until it yields, then park" loop would wedge the coordination
+    // driver: it parks on a step whose input isn't ready yet while a *sibling*
+    // step on the same driver holds the work that would unblock it (e.g. park on
+    // `FindBoundariesAndSort` while `SpillGather` holds the chunk that frees the
+    // capacity-1 arena). These two steps pin that the whole-pass discipline holds.
+
+    /// `Owned` step wedged on `NoProgress` until `gate` is flipped by a sibling,
+    /// then `Finished`. Placed FIRST in the walk so a park-on-first-NoProgress
+    /// loop would never let the sibling run — the gate never flips — and hang.
+    #[derive(Clone)]
+    struct WedgedUntilGate {
+        gate: Arc<AtomicBool>,
+    }
+    impl Step for WedgedUntilGate {
+        type Input = ();
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "WedgedUntilGate",
+                kind: StepKind::Exclusive,
+                sticky: false,
+                output_queues: vec![QueueSpec::CountBounded { capacity: 4 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            if self.gate.load(Ordering::Acquire) {
+                Ok(StepOutcome::Finished)
+            } else {
+                Ok(StepOutcome::NoProgress)
+            }
+        }
+    }
+
+    /// `Owned` sibling that flips `gate` and finishes on its first dispatch —
+    /// reached only if the loop tries all live steps in a pass rather than
+    /// parking on the wedged step's `NoProgress`.
+    #[derive(Clone)]
+    struct GateOpener {
+        gate: Arc<AtomicBool>,
+    }
+    impl Step for GateOpener {
+        type Input = u32;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "GateOpener",
+                kind: StepKind::Exclusive,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            self.gate.store(true, Ordering::Release);
+            Ok(StepOutcome::Finished)
+        }
+    }
+
+    /// A driver (`WorkerCore::driver`, Park backoff) driving `[Wedged, Opener]`
+    /// as two `Owned` steps must drive the sibling that unblocks the wedged step
+    /// and terminate. A watchdog aborts the process on a wedge so the failure is
+    /// loud rather than a silent hang.
+    #[test]
+    fn driver_round_robins_all_live_before_parking() {
+        let mut graph = ChainGraph::new();
+        let wedged = graph.register_step("WedgedUntilGate", 1);
+        let opener = graph.register_step("GateOpener", 0);
+        graph.wire(wedged, BranchIdx(0), opener);
+
+        let gate = Arc::new(AtomicBool::new(false));
+        let steps: Vec<Box<dyn ErasedStep>> = vec![
+            Box::new(TypedStep::new(WedgedUntilGate { gate: Arc::clone(&gate) })),
+            Box::new(TypedStep::new(GateOpener { gate: Arc::clone(&gate) })),
+        ];
+        let contexts = Arc::new(build_chain_contexts(
+            &steps,
+            &graph,
+            crate::builder::InstrumentationLevel::Off,
+        ));
+
+        // Hand-built driver row: both steps Owned on the one driver thread.
+        let mut entries: Vec<WorkerStepEntry> =
+            steps.into_iter().map(|step| WorkerStepEntry::Owned { step }).collect();
+        let drain_counters = vec![StepDrainCounter::new(1), StepDrainCounter::new(1)];
+        let signal = PipelineSignal::new();
+
+        // Watchdog: a wedge parks forever; abort so the test FAILS loudly.
+        let done = Arc::new(AtomicBool::new(false));
+        {
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                for _ in 0..200 {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    if done.load(Ordering::SeqCst) {
+                        return;
+                    }
+                }
+                eprintln!("driver_round_robins_all_live_before_parking: WEDGED");
+                std::process::abort();
+            });
+        }
+
+        // Forward walk (ChainOrderScheduler) tries `wedged` (idx 0) first: it
+        // yields NoProgress, and the loop MUST proceed to `opener` in the same
+        // pass, flip the gate, then finish `wedged` on the next pass.
+        let mut worker = WorkerCore::driver(wedged);
+        run_worker_loop(
+            &mut worker,
+            &mut entries,
+            &contexts,
+            &drain_counters,
+            &signal,
+            None,
+            &crate::runtime::scheduler::ChainOrderScheduler,
+        );
+        done.store(true, Ordering::SeqCst);
+
+        assert!(gate.load(Ordering::Acquire), "the sibling opener must have run");
+        assert!(!signal.is_done(), "clean completion, no error");
+    }
+
+    /// A step that spends a measurable, nonzero span inside `try_run` so its
+    /// dispatch busy-time rounds above 0 ns.
+    #[derive(Clone)]
+    struct SlowFinish;
+    impl Step for SlowFinish {
+        type Input = ();
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "SlowFinish",
+                kind: StepKind::Exclusive,
+                sticky: false,
+                output_queues: vec![QueueSpec::CountBounded { capacity: 4 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+            Ok(StepOutcome::Finished)
+        }
+    }
+
+    /// A driver dispatch (`is_driver = true`) records the step's busy on the
+    /// off-pool detached line keyed by THAT step's own index — so a multi-step
+    /// `Shared` group attributes each member's real time, not the whole thread's
+    /// under one name. A pool dispatch (`is_driver = false`) records nothing there.
+    #[test]
+    fn driver_dispatch_records_detached_busy_by_own_step() {
+        let mut graph = ChainGraph::new();
+        let a = graph.register_step("SlowFinish", 1);
+        let sink = graph.register_step("Sink", 0);
+        graph.wire(a, BranchIdx(0), sink);
+        let steps: Vec<Box<dyn ErasedStep>> =
+            vec![Box::new(TypedStep::new(SlowFinish)), Box::new(TypedStep::new(SinkStep))];
+        let contexts = Arc::new(build_chain_contexts(
+            &steps,
+            &graph,
+            crate::builder::InstrumentationLevel::Off,
+        ));
+        let mid = StepIdx(0);
+        let counter = StepDrainCounter::new(1);
+        let signal = PipelineSignal::new();
+
+        // Driver dispatch of step 0 → its busy lands on the detached line keyed
+        // to step 0 (not some group primary).
+        let stats = Arc::new(PipelineStats::new(vec!["SlowFinish", "Sink"]));
+        let mut entry = WorkerStepEntry::Owned { step: Box::new(TypedStep::new(SlowFinish)) };
+        let _ =
+            dispatch_one_step(&mut entry, mid, &contexts, &counter, &signal, Some(&stats), true);
+        let snap = stats.snapshot();
+        assert!(
+            snap.detached.iter().any(|(name, busy, ..)| *name == "SlowFinish" && *busy > 0),
+            "driver dispatch must record detached busy for the dispatched step itself"
+        );
+
+        // Pool dispatch (is_driver=false) records nothing on the detached line.
+        let stats_pool = Arc::new(PipelineStats::new(vec!["SlowFinish", "Sink"]));
+        let mut entry_pool = WorkerStepEntry::Owned { step: Box::new(TypedStep::new(SlowFinish)) };
+        let _ = dispatch_one_step(
+            &mut entry_pool,
+            mid,
+            &contexts,
+            &counter,
+            &signal,
+            Some(&stats_pool),
+            false,
+        );
+        assert!(
+            stats_pool.snapshot().detached.is_empty(),
+            "pool dispatch must not record on the off-pool detached line"
         );
     }
 }

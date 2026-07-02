@@ -33,6 +33,27 @@ pub enum StepKind {
     /// assigns owners at run start in chain declaration order. Other
     /// workers skip the step entirely.
     Exclusive,
+    /// Runs on a **dedicated OS thread**, spawned at run start alongside the
+    /// deadlock-monitor / queue-rebalancer — never dispatched by the
+    /// work-stealing pool. The dedicated thread drives the step with the
+    /// *same* `run_worker_loop` the pool uses (via
+    /// `runtime::detached::run_detached_driver`): a `WorkerCore::driver` (Park
+    /// backoff) over an `Owned`-for-its-group row. The step body still uses
+    /// non-blocking `try_pop`/`try_push` and never blocks inside `try_run`, so
+    /// it consumes no pool worker slot. A driver is literally a 1-thread pool.
+    ///
+    /// This mirrors the legacy sort's "N + 2" threading: N pool workers do
+    /// the parallel (compression-bound) work while off-pool driver threads do
+    /// the serial coordination + I/O, keeping the pool saturated. Several
+    /// detached steps sharing a [`DetachedGroup::Shared`] label are driven by
+    /// ONE thread; [`DetachedGroup::PerStep`] (the default) keeps one thread
+    /// per step.
+    ///
+    /// **Opt-in.** No existing step declares `Detached` unless the sort chain
+    /// wires it. A single shared instance (like `Serial`/`Exclusive`, never
+    /// `new_worker_copy`'d) runs on the driver thread; every pool worker gets a
+    /// `Skip` entry for it.
+    Detached,
 }
 
 /// Optional scheduling hint for `Serial` steps. Restricts which worker(s)
@@ -80,6 +101,27 @@ impl Affinity {
             Self::Worker(idx) => worker_id == idx,
         }
     }
+}
+
+/// Which dedicated driver thread a [`StepKind::Detached`] step runs on.
+///
+/// Detached steps run off the work-stealing pool on dedicated OS threads. By
+/// default each detached step gets its own thread ([`PerStep`](Self::PerStep))
+/// — the legacy "one dedicated thread per detached step" behavior. Steps that
+/// declare the same [`Shared`](Self::Shared) label instead share ONE dedicated
+/// driver thread that round-robins them through the same `run_worker_loop` the
+/// pool uses (the unified "1-thread pool"). This realizes the true N+2 model:
+/// the sort chain groups its serial coordination steps onto one driver and its
+/// writers onto another, keeping the N pool workers on pure (de)compression.
+///
+/// Ignored for non-`Detached` kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetachedGroup {
+    /// One dedicated thread for this step alone (default; legacy behavior).
+    PerStep,
+    /// Share one dedicated driver thread with every other detached step that
+    /// declares the same label.
+    Shared(&'static str),
 }
 
 /// Static description of how a step is scheduled, plus per-output queue
@@ -243,6 +285,15 @@ pub trait Step: Send + Sized + 'static {
         Affinity::None
     }
 
+    /// Which dedicated driver thread this step runs on, for [`StepKind::Detached`]
+    /// steps. Defaults to [`DetachedGroup::PerStep`] (its own thread — legacy
+    /// behavior). Override to [`DetachedGroup::Shared`] to co-locate several
+    /// detached steps on one driver thread (the true N+2 model). Ignored for
+    /// non-`Detached` kinds.
+    fn detached_group(&self) -> DetachedGroup {
+        DetachedGroup::PerStep
+    }
+
     /// Step body. Pop from `ctx.input`, push to `ctx.outputs`. Returns
     /// `Progress` / `NoProgress` / `Contention` / `Finished`. Errors propagate via `Err`.
     ///
@@ -313,6 +364,12 @@ pub trait Step2: Send + Sized + 'static {
     /// `Affinity::None`.
     fn affinity(&self) -> Affinity {
         Affinity::None
+    }
+
+    /// Same semantics as [`Step::detached_group`]. Defaults to
+    /// [`DetachedGroup::PerStep`].
+    fn detached_group(&self) -> DetachedGroup {
+        DetachedGroup::PerStep
     }
 
     /// Step body. Pop from `ctx.a` (input branch 0) and `ctx.b`

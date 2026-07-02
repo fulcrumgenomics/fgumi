@@ -30,7 +30,8 @@ use super::queues::QueueSpec;
 use super::reorder::BranchOrdering;
 use super::signal::PipelineSignal;
 use super::step::{
-    Affinity, OutputHandles, OutputsViewAny, Step, StepCtx, StepKind, StepOutcome, StepProfile,
+    Affinity, DetachedGroup, OutputHandles, OutputsViewAny, Step, StepCtx, StepKind, StepOutcome,
+    StepProfile,
 };
 
 /// The branch orderings the framework actually *builds* for a single-input
@@ -57,7 +58,10 @@ pub(crate) fn effective_branch_orderings(
 ) -> Vec<BranchOrdering> {
     match kind {
         StepKind::Parallel => declared.to_vec(),
-        StepKind::Serial | StepKind::Exclusive => {
+        // Single-producer kinds emit in-order from one thread, so a downstream
+        // reorder stage is redundant. `Detached` is single-producer too (one
+        // dedicated thread), so it collapses like `Serial`/`Exclusive`.
+        StepKind::Serial | StepKind::Exclusive | StepKind::Detached => {
             declared.iter().map(|_| BranchOrdering::None).collect()
         }
     }
@@ -95,6 +99,12 @@ pub trait ErasedStep: Send + 'static {
     /// `build_worker_storage` to decide which workers get a `Shared`
     /// entry vs a `Skip` placeholder.
     fn affinity(&self) -> Affinity;
+
+    /// Forward `Step::detached_group` — which dedicated driver thread a
+    /// `Detached` step runs on. Read once by `extract_detached_steps` to group
+    /// detached steps onto shared driver threads (the N+2 model). Only
+    /// meaningful for `Detached` kinds.
+    fn detached_group(&self) -> DetachedGroup;
 
     /// Dispatch `S::try_run` after downcasting queue handles.
     ///
@@ -160,7 +170,10 @@ pub trait ErasedStep: Send + 'static {
 
     /// Build this step's output queue set + outputs view from the profile's
     /// per-branch queue specs and ordering directives.
-    fn build_output_set(&self) -> (OutputQueueSet, OutputsViewAny);
+    fn build_output_set(
+        &self,
+        level: crate::builder::InstrumentationLevel,
+    ) -> (OutputQueueSet, OutputsViewAny);
 
     /// Like [`Self::build_output_set`] but forces every output branch to a
     /// **direct, unbounded** transport (no byte bound, no reorder stage).
@@ -172,7 +185,10 @@ pub trait ErasedStep: Send + 'static {
     /// because the consumer is driven in the same pass over the chain. Each
     /// sub-step emits a bounded number of items per `try_run`, so the buffer
     /// stays shallow (the fused-chain bounded-fan-out invariant).
-    fn build_fused_output_set(&self) -> (OutputQueueSet, OutputsViewAny);
+    fn build_fused_output_set(
+        &self,
+        level: crate::builder::InstrumentationLevel,
+    ) -> (OutputQueueSet, OutputsViewAny);
 
     /// Wrap a typed `OutputsViewAny` into `Box<OutputHandles<S::Outputs>>`
     /// (type-erased as `Any`). The runtime stores this box per step so the
@@ -364,6 +380,10 @@ where
         self.inner.affinity()
     }
 
+    fn detached_group(&self) -> DetachedGroup {
+        self.inner.detached_group()
+    }
+
     fn try_run_erased(&mut self, ctx: &mut ErasedStepCtx<'_>) -> io::Result<StepOutcome> {
         let input = self.resolve_input(ctx);
         let outputs = self.resolve_outputs(ctx);
@@ -391,7 +411,10 @@ where
         Box::new(handle)
     }
 
-    fn build_output_set(&self) -> (OutputQueueSet, OutputsViewAny) {
+    fn build_output_set(
+        &self,
+        level: crate::builder::InstrumentationLevel,
+    ) -> (OutputQueueSet, OutputsViewAny) {
         let profile = self.inner.profile();
         // Producers with `StepKind::Serial` or `StepKind::Exclusive` emit
         // items in arrival order by construction (the framework's mutex
@@ -409,17 +432,24 @@ where
         // satisfy that need.
         let effective_orderings =
             effective_branch_orderings(profile.kind, &profile.branch_ordering);
-        <S::Outputs as StepOutputs>::build_queues(&profile.output_queues, &effective_orderings)
+        <S::Outputs as StepOutputs>::build_queues(
+            &profile.output_queues,
+            &effective_orderings,
+            level,
+        )
     }
 
-    fn build_fused_output_set(&self) -> (OutputQueueSet, OutputsViewAny) {
+    fn build_fused_output_set(
+        &self,
+        level: crate::builder::InstrumentationLevel,
+    ) -> (OutputQueueSet, OutputsViewAny) {
         // Force a direct, unbounded transport on every branch: at one worker
         // FIFO is already correct (no reorder), and the consumer is driven in
         // the same pass (no backpressure). Arity comes from the profile.
         let n = self.inner.profile().output_queues.len();
         let specs = vec![QueueSpec::Unbounded; n];
         let orderings = vec![BranchOrdering::None; n];
-        <S::Outputs as StepOutputs>::build_queues(&specs, &orderings)
+        <S::Outputs as StepOutputs>::build_queues(&specs, &orderings, level)
     }
 
     fn wrap_outputs_view(&self, view: OutputsViewAny) -> Box<dyn Any + Send + Sync> {
@@ -579,6 +609,10 @@ impl<S: Step2> ErasedStep for TypedStep2<S> {
         self.inner.affinity()
     }
 
+    fn detached_group(&self) -> DetachedGroup {
+        self.inner.detached_group()
+    }
+
     fn try_run_erased(&mut self, ctx: &mut ErasedStepCtx<'_>) -> io::Result<StepOutcome> {
         let inputs = self.resolve_inputs(ctx);
         let outputs = self.resolve_outputs(ctx);
@@ -648,7 +682,10 @@ impl<S: Step2> ErasedStep for TypedStep2<S> {
         Box::new(TwoInputHandles::<S::InputA, S::InputB>::new(a, b))
     }
 
-    fn build_output_set(&self) -> (OutputQueueSet, OutputsViewAny) {
+    fn build_output_set(
+        &self,
+        level: crate::builder::InstrumentationLevel,
+    ) -> (OutputQueueSet, OutputsViewAny) {
         // Unlike `TypedStep::build_output_set`, a `Step2` does NOT collapse a
         // `ByOrdinal` / `ByItemOrdinal` output to `None` for `Serial` /
         // `Exclusive` kinds — the ordering is passed through verbatim and the
@@ -677,17 +714,21 @@ impl<S: Step2> ErasedStep for TypedStep2<S> {
         <S::Outputs as StepOutputs>::build_queues(
             &self.inner.profile().output_queues,
             &self.inner.profile().branch_ordering,
+            level,
         )
     }
 
-    fn build_fused_output_set(&self) -> (OutputQueueSet, OutputsViewAny) {
+    fn build_fused_output_set(
+        &self,
+        level: crate::builder::InstrumentationLevel,
+    ) -> (OutputQueueSet, OutputsViewAny) {
         // `Step2` never appears in a linear (single-input) fused chain, so this
         // is unreachable in practice; provided for trait completeness with the
         // same direct+unbounded semantics as the single-input adapter.
         let n = self.inner.profile().output_queues.len();
         let specs = vec![QueueSpec::Unbounded; n];
         let orderings = vec![BranchOrdering::None; n];
-        <S::Outputs as StepOutputs>::build_queues(&specs, &orderings)
+        <S::Outputs as StepOutputs>::build_queues(&specs, &orderings, level)
     }
 
     fn wrap_outputs_view(&self, view: OutputsViewAny) -> Box<dyn Any + Send + Sync> {
@@ -759,7 +800,8 @@ mod tests {
     /// chain link by manually constructing the upstream side.
     fn build_addone_outputs() -> (OutputQueueSet, OutputHandles<Single<u32>>) {
         let producer: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
-        let (queue_set, outputs_view) = producer.build_output_set();
+        let (queue_set, outputs_view) =
+            producer.build_output_set(crate::builder::InstrumentationLevel::Off);
         let outputs: OutputHandles<Single<u32>> = OutputHandles::new(outputs_view);
         (queue_set, outputs)
     }
@@ -871,7 +913,8 @@ mod tests {
         let input_any = consumer.build_input_handle(&mut producer_set, 0);
 
         // Consumer needs its own output set + view to run.
-        let (consumer_set, consumer_view) = consumer.build_output_set();
+        let (consumer_set, consumer_view) =
+            consumer.build_output_set(crate::builder::InstrumentationLevel::Off);
         let consumer_outputs: OutputHandles<Single<u32>> = OutputHandles::new(consumer_view);
 
         let signal = PipelineSignal::new();
@@ -895,7 +938,8 @@ mod tests {
         let mut consumer: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
         let input_any = consumer.build_input_handle(&mut producer_set, 0);
 
-        let (_consumer_set, consumer_view) = consumer.build_output_set();
+        let (_consumer_set, consumer_view) =
+            consumer.build_output_set(crate::builder::InstrumentationLevel::Off);
         let consumer_outputs: OutputHandles<Single<u32>> = OutputHandles::new(consumer_view);
 
         let signal = PipelineSignal::new();
@@ -932,7 +976,8 @@ mod tests {
     #[test]
     fn build_output_set_uses_profile_queues_and_ordering() {
         let typed: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
-        let (mut queue_set, _outputs_view) = typed.build_output_set();
+        let (mut queue_set, _outputs_view) =
+            typed.build_output_set(crate::builder::InstrumentationLevel::Off);
         assert_eq!(queue_set.n_branches(), 1);
         // Verify the queue is u32-typed by taking the input handle.
         let input = queue_set.take_typed_input::<u32>(0);
@@ -957,7 +1002,8 @@ mod tests {
     #[test]
     fn wrap_outputs_view_yields_typed_outputs_handles() {
         let typed: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
-        let (mut queue_set, view) = typed.build_output_set();
+        let (mut queue_set, view) =
+            typed.build_output_set(crate::builder::InstrumentationLevel::Off);
         let outputs_any = typed.wrap_outputs_view(view);
 
         // Downcast back to OutputHandles<Single<u32>> and push.
@@ -974,7 +1020,8 @@ mod tests {
     fn mark_outputs_drained_propagates_to_consumer_input() {
         // Producer is an AddOne; its outputs feed a consumer's input.
         let producer: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
-        let (mut producer_set, producer_view) = producer.build_output_set();
+        let (mut producer_set, producer_view) =
+            producer.build_output_set(crate::builder::InstrumentationLevel::Off);
         let producer_outputs_any = producer.wrap_outputs_view(producer_view);
 
         let consumer: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
@@ -1039,7 +1086,8 @@ mod tests {
         let input_any = splitter.build_input_handle(&mut producer_set, 0);
 
         // Splitter's own output set has two branches.
-        let (mut splitter_set, splitter_view) = splitter.build_output_set();
+        let (mut splitter_set, splitter_view) =
+            splitter.build_output_set(crate::builder::InstrumentationLevel::Off);
         let splitter_outputs: OutputHandles<(u32, u32)> = OutputHandles::new(splitter_view);
 
         let signal = PipelineSignal::new();
@@ -1135,7 +1183,8 @@ mod tests {
         }
 
         let step: Box<dyn ErasedStep> = Box::new(TypedStep2::new(OutOfOrderMerge));
-        let (mut queue_set, view) = step.build_output_set();
+        let (mut queue_set, view) =
+            step.build_output_set(crate::builder::InstrumentationLevel::Off);
         let outputs_any = step.wrap_outputs_view(view);
         let outputs = outputs_any
             .downcast_ref::<OutputHandles<OrderedBytesSingle<Ord32>>>()
