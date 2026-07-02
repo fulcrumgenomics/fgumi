@@ -164,8 +164,9 @@ pub(crate) enum ChainTailKind {
 
     /// The chain tail produces serialized BGZF-ready bytes
     /// ([`DecompressedBlock`]) after a Terminal serialize step
-    /// (`SerializeBamRecords` / `SerializeRecordBatch` / `SerializeGroups`, or
-    /// the record-aligned block emitted by a terminal consensus stage). No
+    /// (`SerializeBamRecords` / `SerializeGroups`, the terminal
+    /// `SortMerge<BlockOutput>` for sort, or the record-aligned block emitted by
+    /// a terminal consensus stage). No
     /// stage downstream of a Terminal stage reads `chain_tail_kind`, so this is
     /// a terminal-only marker; it exists so the kind is never a lie. `add_sink`
     /// wires `BgzfCompress → WriteBgzfFile` regardless of this value.
@@ -173,17 +174,22 @@ pub(crate) enum ChainTailKind {
     /// [`DecompressedBlock`]: crate::pipeline::steps::types::DecompressedBlock
     SerializedBytes,
 
-    /// The chain tail produces [`RecordBatch`]. Set when Sort is the first
-    /// stage: `add_source` uses `ParseBamRecords` (not `DecodeRecords`).
-    ///
-    /// [`RecordBatch`]: crate::pipeline::steps::types::RecordBatch
-    RecordBatch,
-
     /// The chain tail produces [`BamTemplateBatch`]. Set by `add_align`
     /// (Intermediate) and `add_correct` (Intermediate).
     ///
     /// [`BamTemplateBatch`]: crate::pipeline::steps::types::BamTemplateBatch
     BamTemplateBatch,
+
+    /// The chain tail produces `BgzfBlock` (raw compressed BGZF blocks, NOT yet
+    /// decompressed), with an arena-backed front waiting for the parallel-inflate
+    /// sort ingest steps. Set by `add_source` when the first stage is a sort over
+    /// a BAM source (all four orders): `ReadBgzfBlocks` is emitted but
+    /// `BgzfDecompress` is NOT — the new front (`ReadBlocks` → `InflateToArena`
+    /// → `FindBoundariesAndSort`) handles decompression + boundary-find + sort
+    /// inline.
+    ///
+    /// `add_sort` consumes this tail for every BAM sort order.
+    BgzfBlockArena,
 
     /// The chain tail produces [`BatchedProcessedPositionGroups`]. Set by
     /// `add_group` (Intermediate) — after `GroupByPosition → ProcessOrdered
@@ -443,16 +449,22 @@ pub struct ChainBuilder<'a> {
     /// `None` (the default) leaves `config.threads` set to
     /// `spec.threading.num_threads()`. `Some(n)` forces it to `n`.
     ///
-    /// Currently only [`Self::add_sort`] sets this: sort wraps a single
-    /// `Exclusive` [`SortBamFile`] step that drives the sort engine's own
-    /// internal thread pool. The framework must run **one** driver thread
-    /// (`threads = 1`) regardless of how many sorter threads were requested
-    /// via `--threads`. Without this override the pipeline would spin up
-    /// `num_sorter_threads` framework workers for a chain that has only one
-    /// step, wasting OS threads.
-    ///
-    /// [`SortBamFile`]: crate::pipeline::steps::sort::SortBamFile
+    /// Set by stages whose framework thread count differs from the requested
+    /// `--threads` (e.g. [`Self::add_zipper`] / [`Self::add_align`], which
+    /// reserve a driver thread for an external aligner process). Sort no longer
+    /// sets it: standalone sort streams through the normal multi-step pipeline
+    /// and uses the requested thread count like every other stage.
     override_pipeline_threads: Option<usize>,
+
+    /// Set when a BAM sort source is wired through the parallel-inflate arena
+    /// front (`ReadBlocks → InflateToArena → FindBoundariesAndSort`), for any
+    /// sort order. [`Self::build`] then opts the ENTIRE sort-first pipeline —
+    /// including fused `Sort → Group/Simplex/Duplex/Codec` chains — into the
+    /// downstream-first [`DrainFirstScheduler`], so the sort's serial
+    /// boundary/key scan overlaps the parallel inflate (drained ahead of
+    /// production) instead of starving behind it on the shared pool. Chains
+    /// without a sort source keep the default upstream-first scheduler.
+    use_drain_first_scheduler: bool,
 
     /// `HeaderHandle` stashed by [`Self::add_align`] for consumption by
     /// [`Self::add_sink`].
@@ -477,8 +489,9 @@ pub struct ChainBuilder<'a> {
     /// Default is [`ChainTailKind::DecodedRecordBatch`], set by `add_source`
     /// on the normal BAM/SAM source path. Changes:
     ///
-    /// - `add_source` sets `RecordBatch` when Sort is the first stage (uses
-    ///   `ParseBamRecords` instead of `DecodeRecords`).
+    /// - `add_source` sets `BgzfBlockArena` when Sort is the first stage over a
+    ///   BAM source (leaves raw BGZF blocks for the parallel-inflate arena front
+    ///   instead of `DecodeRecords`; SAM sort-first input is rejected).
     /// - `add_correct(Intermediate)` sets `BamTemplateBatch`.
     /// - `add_align(Intermediate)` sets `BamTemplateBatch`.
     /// - `add_sort(Intermediate)` reads the kind to decide its preamble,
@@ -488,6 +501,15 @@ pub struct ChainBuilder<'a> {
     ///   (`GroupByMi` for `DecodedRecordBatch`, `TemplatesToMiGroups` for
     ///   `BatchedProcessedPositionGroups`).
     chain_tail_kind: ChainTailKind,
+
+    /// Lever 2: run the terminal `WriteBgzfFile` on its own dedicated
+    /// `StepKind::Detached` thread instead of as a pool-scheduled
+    /// `Serial + Affinity::Writer` step. Set ONLY by `add_sort` on the
+    /// standalone-sort terminal (`spec.is_sort_terminal()`), so every other
+    /// chain (runall / group / consensus / zipper / correct / dedup / filter /
+    /// clip) keeps the pool-scheduled writer. `add_sink` reads this flag.
+    /// Default `false`.
+    detached_writer: bool,
 }
 
 impl<'a> ChainBuilder<'a> {
@@ -505,24 +527,14 @@ impl<'a> ChainBuilder<'a> {
         let tuning = BamPipelineTuning::auto_tuned(num_threads)
             .with_compression_level(spec.compression.compression_level);
 
-        // Standalone sort (`[Stage::Sort]`) is special: `build_for` skips
-        // `add_source`/`add_sink`, and the terminal `SortBamFile` step opens
-        // and reads the input (header included) itself via the sort engine.
-        // Opening the source here would be wasted work — and for a stdin input
-        // it would drain the pipe before `SortBamFile` reads it, leaving the
-        // engine to fail on an empty stdin. The header resolved here is unused
-        // by the sort-terminal branch, so skip the open entirely. Single-sourced
-        // with `build_for`'s source/sink skip via `ChainSpec::is_sort_terminal`.
-        let sort_terminal = spec.is_sort_terminal();
-        let (header, pending_source) = if sort_terminal {
-            (Header::default(), None)
-        } else {
-            let (raw_header, pending_source) = Self::open_source(spec)?;
-            (
-                crate::commands::common::add_pg_record(raw_header, &spec.command_line)?,
-                pending_source,
-            )
-        };
+        // Every chain — including the sole-`[Stage::Sort]` chain — opens its
+        // source exactly once here (header read; the reader continues in
+        // `add_source` for the body, which is the single-open contract stdin
+        // relies on). The former sort-terminal skip (where `SortBamFile` opened
+        // the input itself) is gone: standalone sort now streams through the
+        // normal source path, so `@PG` injection applies to it too.
+        let (raw_header, pending_source) = Self::open_source(spec)?;
+        let header = crate::commands::common::add_pg_record(raw_header, &spec.command_line)?;
 
         Ok(Self {
             spec,
@@ -536,10 +548,14 @@ impl<'a> ChainBuilder<'a> {
             pending_source,
             paired_tail: None,
             override_pipeline_threads: None,
+            use_drain_first_scheduler: false,
             pending_header_handle: None,
             // Initialise to the default; add_source will set the correct kind
             // based on whether sort is the first intermediate stage.
             chain_tail_kind: ChainTailKind::DecodedRecordBatch,
+            // Pool-scheduled writer by default; add_sort opts the standalone
+            // sort terminal into a Detached writer (lever 2).
+            detached_writer: false,
         })
     }
 
@@ -666,30 +682,27 @@ impl<'a> ChainBuilder<'a> {
     /// Panics if called twice (after `pending_source` is already consumed).
     #[allow(clippy::too_many_lines)]
     pub fn add_source(&mut self) -> Result<()> {
-        use crate::pipeline::steps::bgzf::decompress::BgzfDecompress;
-        use crate::pipeline::steps::boundaries::bam::FindBamBoundaries;
-        use crate::pipeline::steps::parse::bam::ParseBamRecords;
         use crate::pipeline::steps::source::InputSource;
         use crate::pipeline::steps::source::read_bam::read_bam_from_reader;
         use crate::sam::check_sort;
 
         let source = self.pending_source.take().expect("add_source called twice");
 
-        // Detect whether Sort is the first intermediate stage. When it is,
-        // the source preamble must end at `ParseBamRecords → RecordBatch`
-        // (rather than `DecodeRecords → DecodedRecordBatch`) so that
-        // `SortAndSpill` (which consumes `RecordBatch`) can be wired
-        // directly to the source output without an extra round-trip.
-        //
-        // This replaces the fused dispatcher's use of `ParseBamRecords`
-        // before `SortAndSpill` in `execute_group_pipeline`'s
-        // `is_sort_enabled()` branch, where `--start-from sort --stop-after
-        // {group,consensus}` fed the source through `ParseBamRecords`
-        // instead of `DecodeRecords`.
-        let sort_is_first_intermediate = matches!(
-            self.spec.stages.as_slice(),
-            [Stage::Sort, ..] if self.spec.stages.len() > 1
-        );
+        // Detect whether Sort is the FIRST stage (whether or not it is the
+        // only one). When it is over a BAM source, the preamble stops at the
+        // raw `ReadBgzfBlocks` step (tail = `ChainTailKind::BgzfBlockArena`)
+        // instead of `DecodeRecords → DecodedRecordBatch`, so `add_sort`'s
+        // parallel-inflate arena front (`ReadBlocks → InflateToArena →
+        // FindBoundariesAndSort`) can consume it directly without an extra
+        // round-trip. SAM sort-first is rejected outright (see the `Sam` arm
+        // below); `SortBuffer` is only reached by the non-arena path in
+        // `add_sort`, where sort is *not* first (a fused earlier stage feeds it
+        // `DecodedRecordBatch` / `BamTemplateBatch`). This covers both the
+        // sole-`[Sort]` chain (standalone `fgumi sort`) and
+        // sort-as-first-intermediate (`--start-from sort --stop-after
+        // {group,consensus}`); the former used to be special-cased out of
+        // `add_source` entirely.
+        let sort_is_first_intermediate = matches!(self.spec.stages.as_slice(), [Stage::Sort, ..]);
 
         match source {
             PendingSource::Single(boxed_input) => {
@@ -702,8 +715,12 @@ impl<'a> ChainBuilder<'a> {
                 match input {
                     InputSource::Bam { reader, .. } => {
                         if sort_is_first_intermediate {
-                            // Sort-as-intermediate needs `RecordBatch` input.
-                            // Use ParseBamRecords instead of DecodeRecords.
+                            // All four sort orders use the arena-backed
+                            // parallel-inflate front (ReadBgzfBlocks only — no
+                            // BgzfDecompress); ReadBlocks → InflateToArena →
+                            // FindBoundariesAndSort (with the per-order strategy)
+                            // are wired in add_sort. Leave the BgzfBlock tail for
+                            // that front. SAM / fused inputs still use SortBuffer.
                             let (read_step, _) = read_bam_from_reader(
                                 reader,
                                 self.header.clone(),
@@ -711,20 +728,8 @@ impl<'a> ChainBuilder<'a> {
                                 self.tuning.per_step_byte_limit,
                             );
                             let tail = self.pipeline.append_source(read_step);
-                            let tail = self.pipeline.append_step(
-                                BgzfDecompress::new(self.tuning.per_step_byte_limit),
-                                tail,
-                            );
-                            let tail = self.pipeline.append_step(
-                                FindBamBoundaries::new(self.tuning.per_step_byte_limit),
-                                tail,
-                            );
-                            let tail = self.pipeline.append_step(
-                                ParseBamRecords::new(self.tuning.per_step_byte_limit),
-                                tail,
-                            );
                             self.current_tail = Some(tail);
-                            self.chain_tail_kind = ChainTailKind::RecordBatch;
+                            self.chain_tail_kind = ChainTailKind::BgzfBlockArena;
                         } else {
                             let tail = self.build_bam_decode_preamble(
                                 reader,
@@ -736,6 +741,19 @@ impl<'a> ChainBuilder<'a> {
                         }
                     }
                     InputSource::Sam { reader: sam_reader, .. } => {
+                        // Sort-as-first-stage needs a `RecordBatch` source, but the
+                        // SAM preamble only produces `DecodedRecordBatch`; feeding
+                        // that into the sort ingest (`SortBuffer`) is a handle-type
+                        // mismatch (see `add_sort`). SAM input to a sort-first chain was never
+                        // supported (the legacy file→file sorter read BAM only), so
+                        // reject it with a clear message instead of a downstream
+                        // typed-step panic.
+                        if sort_is_first_intermediate {
+                            anyhow::bail!(
+                                "sort requires BAM input; SAM input is not supported \
+                                 (convert with `samtools view -b` first)"
+                            );
+                        }
                         let buf = sam_reader.into_inner();
                         let tail = self.build_sam_parse_preamble(
                             buf,
@@ -1253,6 +1271,17 @@ impl<'a> ChainBuilder<'a> {
             WriteBgzfFile::new(output_path, &self.header, self.tuning.compression_level)
                 .map_err(|e| anyhow!("WriteBgzfFile::new: {e}"))?
         };
+        // Lever 2: on the standalone-sort terminal only, run the writer on the
+        // sort's I/O driver thread (legacy "N + 2"), sharing it with the phase-1
+        // `SpillWrite`. Every other chain keeps the pool-scheduled Serial +
+        // Affinity::Writer writer.
+        let write_step = if self.detached_writer {
+            use crate::pipeline::core::step::DetachedGroup;
+            use crate::pipeline::steps::sort::SORT_IO_GROUP;
+            write_step.with_detached(DetachedGroup::Shared(SORT_IO_GROUP))
+        } else {
+            write_step
+        };
         let tail = self.pipeline.append_step(write_step, tail);
 
         self.current_tail = Some(tail);
@@ -1310,7 +1339,26 @@ impl<'a> ChainBuilder<'a> {
         if let Some(t) = self.override_pipeline_threads {
             config.threads = t;
         }
-        let user_wants_stats = self.spec.scheduler.collect_stats();
+        // Opt the whole sort-first pipeline into downstream-first dispatch so the
+        // arena front's serial scan overlaps the parallel inflate (flag set in
+        // add_sort for any sort order). Chains without a sort source keep the
+        // default upstream-first scheduler.
+        if self.use_drain_first_scheduler {
+            config = config.with_scheduler(std::sync::Arc::new(
+                crate::pipeline::core::runtime::DrainFirstScheduler,
+            ));
+        }
+        // DIAGNOSTIC: the stats `Arc` already exists whenever the deadlock
+        // monitor is on (default), so allow `FGUMI_PIPELINE_STATS=1` to dump the
+        // per-step timing report even on paths (e.g. standalone `fgumi sort`)
+        // that do not flatten `--pipeline-stats`.
+        // `--pipeline-trace` (any instrumentation level above Off) also produces a
+        // stats `Arc` in `build_pipeline_config_for_chain`; without this clause a
+        // trace-only run would collect edge metrics but never emit the end-of-run
+        // report, since neither `collect_stats()` nor the env var is set.
+        let user_wants_stats = self.spec.scheduler.collect_stats()
+            || super::build_helpers::env_flag_enabled("FGUMI_PIPELINE_STATS")
+            || self.spec.scheduler.instrumentation_level().is_on();
         if user_wants_stats {
             if let Some(s) = pipeline_stats {
                 self.finalize.push(Box::new(PipelineStatsFinalizeHook { stats: s }));
@@ -2026,63 +2074,47 @@ impl<'a> ChainBuilder<'a> {
         Ok(())
     }
 
-    /// Sort-specific step sequence — two execution modes:
+    /// Sort-specific step sequence — a single streaming pipeline used for
+    /// every sort, whether standalone (`[Stage::Sort]`), intermediate, or
+    /// terminal-after-upstream-stages.
     ///
-    /// ## Standalone mode (Sort is the sole stage)
-    ///
-    /// When [`StagePosition::Terminal`] and `current_tail` is `None`
-    /// (`build_sort_chain` skips `add_source` / `add_sink`), sort emits
-    /// a single `Exclusive` [`SortBamFile`] step that reads from and
-    /// writes to files directly. `SortBamFile` has `Input = ()` and
-    /// `Outputs = ()` — it is a self-contained black-box. The method:
-    ///
-    /// - Does **not** read from `current_tail`.
-    /// - Registers the step via `PipelineBuilder::append_source`.
-    /// - Leaves `current_tail = None` (`add_sink` must not be called afterwards).
-    /// - Sets `override_pipeline_threads = Some(1)` so `build()` runs a single
-    ///   framework worker; the sorter's internal `SortWorkerPool` / rayon pools
-    ///   provide the real concurrency.
-    /// - Registers a `SortFinalizeHook` for stats logging + timer.
-    ///
-    /// ## Streaming mode (sort composes with other stages)
-    ///
-    /// When `current_tail` is `Some` (the source preamble or an
-    /// upstream stage has run), sort emits the in-pipeline step
-    /// sequence the legacy fused dispatchers used:
+    /// `add_source` always runs before this method (even for a sole-`[Sort]`
+    /// chain), so `current_tail` is always `Some`. Sort emits the in-pipeline
+    /// step sequence:
     ///
     /// ```text
     /// [BamTemplateBatch or RecordBatch at current_tail]
     ///     ↓ (TemplatesToRecordBatch if BamTemplateBatch)
-    /// RecordBatch
-    ///     ↓ SortAndSpill (Serial)
+    /// RecordBatch (SAM) │ BgzfBlockArena (BAM)
+    ///     ↓ arena sort ingest:
+    ///        SAM → SortBuffer (Serial)
+    ///        BAM → ReadBlocks → InflateToArena → FindBoundariesAndSort
+    ///     ↓ SpillGather (Serial) → SpillCompress (Parallel) → SpillWrite (Serial)
     /// SortPhase1Event
     ///     ↓ SortSpillDecompress (Parallel)
     /// SortPhase2Event
-    ///     ↓ SortMerge (Serial)
-    /// RecordBatch
-    ///     ↓ [Terminal]     SerializeRecordBatch → DecompressedBlock
-    ///     ↓ [Intermediate] DecodeFromRecords    → DecodedRecordBatch
+    ///     ↓ [Terminal]     SortMerge<BlockOutput> (Serial) → DecompressedBlock
+    ///     ↓ [Intermediate] SortMerge (Serial) → RecordBatch → DecodeFromRecords
     /// ```
     ///
-    /// Streaming mode does NOT register a `SortFinalizeHook`; the
-    /// chain-level [`StageTimingFinalizeHook`] covers the wall time.
-    /// Memory must be `Fixed` — `Auto` cannot be honoured when sort
-    /// shares its budget with other in-pipeline stages.
+    /// For a `SinkSpec::BamWithIndex` (terminal sort only), an
+    /// [`IndexBamFinalizeHook`] is registered on the success-gated finalize
+    /// list. `--sort::max-memory=auto` is only honoured for a sole-`[Sort]`
+    /// chain (it owns the whole budget); a fused chain must pass a fixed value.
+    ///
+    /// The chain-level [`StageTimingFinalizeHook`] (registered by [`Self::build`])
+    /// covers the wall time; sort does not register a per-stage summary hook.
     ///
     /// # Errors
     ///
-    /// Returns errors if sort options are missing from the spec bag, if the
-    /// source is not a BAM/SAM path, or if `--sort::max-memory=auto` is
-    /// requested in streaming mode.
+    /// Returns errors if sort options are missing from the spec bag, or if
+    /// `--sort::max-memory=auto` is requested in a fused multi-stage pipeline.
     ///
-    /// [`SortBamFile`]: crate::pipeline::steps::sort::SortBamFile
+    /// [`IndexBamFinalizeHook`]: crate::pipeline::chains::commands::sort::IndexBamFinalizeHook
     #[allow(clippy::too_many_lines)]
     fn add_sort(&mut self, position: StagePosition) -> Result<()> {
         use crate::commands::common::{MemoryLimit, resolve_memory_budget};
-        use crate::pipeline::chains::commands::sort::{
-            IndexBamFinalizeHook, SortFinalizeHook, SortStepCaptures, build_sort_step,
-            log_sort_start, sort_sink_path, sort_source_path,
-        };
+        use crate::pipeline::chains::commands::sort::IndexBamFinalizeHook;
 
         let sort = self
             .spec
@@ -2092,119 +2124,33 @@ impl<'a> ChainBuilder<'a> {
             .ok_or_else(|| anyhow!("Stage::Sort options missing from StageOptionsBag"))?
             .clone();
 
-        if position == StagePosition::Terminal && self.current_tail.is_none() {
-            // ── Standalone sort (Stage::Sort is the only stage) ─────────────
+        {
+            // ── Streaming sort (standalone, Intermediate, OR Terminal-after-upstream) ──
             //
-            // SortBamFile is a self-contained Exclusive step that reads from
-            // and writes to files directly. Used only when Sort is the sole
-            // stage in the chain (current_tail is None because add_source was
-            // skipped by build_for for the sort-terminal special case).
-
-            let input_path = sort_source_path(self.spec)?;
-            let output_path = sort_sink_path(self.spec);
-
-            let num_sorter_threads = self.spec.threading.num_threads();
-
-            // Per-phase worker counts default to --threads; runall forwards
-            // --sort::sort-threads / --sort::merge-threads via SortOptions.
-            let num_phase1_threads = resolve_phase_threads(sort.sort_threads, num_sorter_threads);
-            let num_phase2_threads = resolve_phase_threads(sort.merge_threads, num_sorter_threads);
-
-            let effective_memory = resolve_memory_budget(
-                sort.max_memory,
-                sort.memory_reserve,
-                num_sorter_threads,
-                sort.memory_per_thread,
-            )?;
-
-            let timer = crate::logging::OperationTimer::new("Sorting BAM");
-
-            log_sort_start(
-                &sort,
-                &input_path,
-                &output_path,
-                num_sorter_threads,
-                num_phase1_threads,
-                num_phase2_threads,
-                effective_memory,
-            );
-
-            let stats_slot = Arc::new(parking_lot::Mutex::new(None::<fgumi_sort::SortStats>));
-
-            let sort_step = build_sort_step(SortStepCaptures {
-                sort,
-                input_path: input_path.clone(),
-                output_path: output_path.clone(),
-                num_sorter_threads,
-                num_phase1_threads,
-                num_phase2_threads,
-                effective_memory,
-                output_compression: self.spec.compression.compression_level,
-                command_line: self.spec.command_line.clone(),
-                stats_slot: Arc::clone(&stats_slot),
-                async_reader: self.spec.async_reader,
-            })?;
-
-            // Register SortBamFile as a source (Input = (), Outputs = ()).
-            // PipelineBuilder::build() will not flag unwired branches since
-            // Outputs::arity() == 0.
-            let tail = self.pipeline.append_source(sort_step);
-            // current_tail must remain None / unchanged — add_sink must NOT be
-            // called after add_sort (Terminal).  We don't update current_tail
-            // here so that any mistaken add_sink() call will panic on
-            // "add_sink called before add_source" rather than silently adding
-            // orphaned steps.
-            let _ = tail; // tail is unused intentionally
-
-            // Single Exclusive step → pipeline needs only 1 framework thread.
-            self.override_pipeline_threads = Some(1);
-
-            self.finalize.push(Box::new(SortFinalizeHook {
-                stats_slot,
-                output_path: output_path.clone(),
-                timer,
-            }));
-
-            // When the spec asks for a sidecar BAI, queue the
-            // `IndexBamFinalizeHook` on the *success-gated* finalize list so
-            // it runs after a successful run only — a failed sort leaves a
-            // partial BAM, and publishing (or overwriting) `<output>.bam.bai`
-            // for it would be a stale index (mirrors the standalone
-            // `fgumi sort` flow, which gates the index write behind
-            // `run_result?`). It runs after `SortFinalizeHook` so the
-            // "Records written / X records/s" summary lands before the
-            // indexer's "Indexing BAM:" / "Wrote BAM index:" pair. The hook
-            // re-reads the finished BAM and emits `<output>.bam.bai` next to
-            // it (see `IndexBamFinalizeHook` for the I/O contract). Rule 3 in
-            // `chains::validate` guarantees `BamWithIndex` only appears when
-            // the terminal chain stage is `Stage::Sort`, so a sole-stage
-            // `[Stage::Sort]` chain is the only path that reaches the
-            // Standalone branch with that sink — multi-stage sort-terminal
-            // chains land in the streaming branch below, where the hook is
-            // mirrored.
-            if matches!(self.spec.sink, SinkSpec::BamWithIndex(_)) {
-                self.finalize_on_success.push(Box::new(IndexBamFinalizeHook { output_path }));
-            }
-        } else {
-            // ── Streaming sort (Intermediate OR Terminal-after-upstream-stages) ──
-            //
-            // Used when Sort has upstream pipeline stages (current_tail is Some),
-            // regardless of whether Sort is Intermediate or Terminal.
+            // Every sort — including a sole-`[Stage::Sort]` standalone sort —
+            // runs through the streaming source → arena sort ingest →
+            // SpillGather → SpillCompress → SpillWrite → SortSpillDecompress →
+            // SortMerge → sink pipeline. `add_source` always runs first (even
+            // for `[Sort]`), so `current_tail` is always `Some` here.
             //
             // Chain topology (continuing from current_tail):
             //
             //   [BamTemplateBatch or RecordBatch at current_tail]
             //       ↓ (TemplatesToRecordBatch if BamTemplateBatch)
-            //   RecordBatch
+            //   RecordBatch (SAM) │ BgzfBlockArena (BAM)
+            //       ↓ arena sort ingest (SortBuffer, or ReadBlocks →
+            //         InflateToArena → FindBoundariesAndSort for BAM)
             //       ↓
-            //   SortAndSpill  (Serial) → SortPhase1Event
+            //   SpillGather (Serial) → SpillCompress (Parallel) → SpillWrite
+            //       (Serial) → SortPhase1Event
             //       ↓
             //   SortSpillDecompress (Parallel)
             //       ↓ SortPhase2Event
-            //   SortMerge (Serial) → RecordBatch
+            //   SortMerge<RecordBatchOutput> (Serial) → RecordBatch      [Intermediate]
+            //   SortMerge<BlockOutput>       (Serial) → DecompressedBlock [Terminal]
             //       ↓
             //   [Intermediate] DecodeFromRecords (Parallel) → DecodedRecordBatch
-            //   [Terminal]     SerializeRecordBatch (Parallel) → DecompressedBlock
+            //   [Terminal]     (none — SortMerge<BlockOutput> emits DecompressedBlock directly)
             //
             // For Intermediate: chain_tail_kind = DecodedRecordBatch;
             // add_group / add_simplex / etc. can proceed normally.
@@ -2212,19 +2158,34 @@ impl<'a> ChainBuilder<'a> {
             // For Terminal: chain_tail_kind = SerializedBytes (DecompressedBlock
             // bytes ready for sink) — add_sink appends BgzfCompress → WriteBgzfFile.
             //
-            // Memory must be `Fixed` — `Auto` cannot be honoured in a
-            // multi-stage pipeline where the memory budget is shared across
-            // stages. This matches `build_sort_steps`' behaviour.
+            // `Auto` memory is honored only for a sole-`[Sort]` chain (see
+            // `is_standalone_sort` below), where sort owns the whole budget. In a
+            // multi-stage pipeline the budget is shared across stages, so `Auto`
+            // cannot be resolved here and a fixed value is required.
             use crate::pipeline::core::step::Affinity;
             use crate::pipeline::steps::parse::decode::DecodeFromRecords;
-            use crate::pipeline::steps::serialize_record_batch::SerializeRecordBatch;
-            use crate::pipeline::steps::sort::{SortAndSpill, SortMerge, SortSpillDecompress};
-            use crate::sam::SamTag;
+            use crate::pipeline::steps::sort::{
+                BlockOutput, RecordBatchOutput, SortBuffer, SortDecompressTuning, SortMerge,
+                SortSpillDecompress, SpillCompress, SpillGather, SpillWrite,
+            };
             use fgumi_sort::{RawExternalSorter, SortOrder};
 
-            // Auto isn't supported in a fused chain (sort shares the budget with
-            // the other stages); require a fixed value.
-            if matches!(sort.max_memory, MemoryLimit::Auto) {
+            // `auto` is honorable only for a sole-`[Sort]` chain (standalone
+            // sort): it owns the whole budget. In a fused chain sort shares the
+            // budget with the other stages, so `auto` can't be split — require
+            // a fixed value there.
+            // Single-sourced from the spec classifier (sole-`[Sort]` layout).
+            let is_standalone_sort = self.spec.is_sort_terminal();
+
+            // Lever 2: on the standalone-sort terminal, run the output writer on
+            // its own dedicated thread (legacy "N + 2"). Gated to the standalone
+            // sort terminal ONLY — any intermediate sort, or a sort inside a
+            // fused runall chain, keeps the pool-scheduled writer so no streaming
+            // command's terminal is affected. `add_sink` reads this flag.
+            if is_standalone_sort && matches!(position, StagePosition::Terminal) {
+                self.detached_writer = true;
+            }
+            if matches!(sort.max_memory, MemoryLimit::Auto) && !is_standalone_sort {
                 bail!(
                     "--sort::max-memory=auto is not supported in a fused multi-stage pipeline \
                      (sort is not standalone); pass a fixed value (e.g. --sort::max-memory 768M)"
@@ -2252,14 +2213,18 @@ impl<'a> ChainBuilder<'a> {
                 sort.memory_per_thread,
             )?;
 
-            let sort_order = SortOrder::TemplateCoordinate;
-            // NB: the spill codec is pinned to BGZF inside `build_stream`
-            // (`SortSpillDecompress` is BGZF-block-only); see the comment there.
-            // NB: `sort_threads` sizes the streaming Phase-1 pool; `merge_threads`
-            // is inert on the streaming sorter (its Phase 2 runs on the framework
-            // scheduler, not this pool) — streaming Phase-2 concurrency is capped
-            // on `SortSpillDecompress` below. It is set here only for config
-            // symmetry with the standalone `sort()` path.
+            // Honor the requested order (standalone sort can request any of the
+            // four; runall always passes `TemplateCoordinate`). The cell tag is
+            // only meaningful for cell-grouped orders — `parse_cell_tag` returns
+            // `Some(CB)` for template-coordinate and `None` otherwise — so it is
+            // applied conditionally rather than hardcoded.
+            let sort_order: SortOrder = sort.order.into();
+            let cell_tag = crate::commands::sort::parse_cell_tag(sort.order)?;
+            // Honor the requested spill codec (`SortSpillDecompress` handles both
+            // BGZF and zstd). Standalone sort may request `bgzf` to pair with
+            // `--temp-compression 0` (uncompressed spill); runall leaves it at
+            // the zstd default. Omitting this previously forced the sorter's
+            // default codec, breaking the uncompressed-bgzf spill path.
             let mut sorter = RawExternalSorter::new(sort_order)
                 .memory_limit(total_memory)
                 .threads(num_threads.max(1))
@@ -2267,28 +2232,75 @@ impl<'a> ChainBuilder<'a> {
                 .merge_threads(num_phase2_threads)
                 .output_compression(1)
                 .temp_compression(sort.temp_compression)
-                .cell_tag(SamTag::CB);
+                .spill_codec(sort.temp_codec);
+            if let Some(ct) = cell_tag {
+                sorter = sorter.cell_tag(ct);
+            }
+            // Honor `--key-types` (template-coordinate only): the arena template
+            // accumulator (`TemplateArenaAccumulator`) provisions the dropped-lane
+            // variant from this and validates that dropped lanes are constant.
+            // Previously the streaming production path ignored it entirely.
+            if let Some(kt) = sort.key_types {
+                sorter = sorter.key_types(kt);
+            }
 
             if !sort.tmp_dirs.is_empty() {
                 sorter = sorter.temp_dirs(sort.tmp_dirs.clone());
             }
 
+            // NOTE: the legacy `build_sort_step` clamped the sorter's *initial*
+            // in-memory capacity (768 MiB/thread) for standalone `--max-memory
+            // auto`, relying on the old `RawExternalSorter`'s lazy buffer growth.
+            // That knob does not carry over to the arena front used below
+            // (`ReadBlocks`): it sizes its arena segment to the FULL budget
+            // (`run_cap = memory_limit`) so a run that fits `--max-memory` sorts
+            // in memory with zero spills (see `ReadBlocks::new`). Capping the
+            // segment would cap `run_cap` and force premature spills — the exact
+            // wall-clock regression that doc warns against — so there is no
+            // separate initial-capacity clamp here.
+
             let affinity =
                 if num_threads.max(2) >= 3 { Affinity::Worker(1) } else { Affinity::Reader };
 
-            let and_spill =
-                SortAndSpill::from_sorter(sorter, &self.header, self.tuning.per_step_byte_limit)
-                    .map_err(|e| anyhow!("SortAndSpill::from_sorter: {e}"))?
-                    .with_affinity(affinity);
-            let decompress = SortSpillDecompress::new(self.tuning.per_step_byte_limit)
-                .with_max_concurrency(Some(num_phase2_threads));
-            let merge =
-                SortMerge::new(sort_order, self.tuning.per_step_byte_limit).with_affinity(affinity);
+            // Phase-2 decompression granularity knobs (`--sort::file-granularity`,
+            // `--sort::block-batch`). The default is the block-parallel path
+            // (P5c, hardened by loom/TSan + the soak matrix); its reorder window
+            // is bounded by the per-step byte limit (see SortSpillDecompress).
+            // `block_batch` defaults to 4 (the original MAX_BATCH_PER_CALL),
+            // pending a fleet decompress-throughput bench.
+            let decompress_tuning = SortDecompressTuning {
+                file_granularity: sort.file_granularity,
+                block_batch: sort.block_batch,
+            };
+            // `--merge-threads` (Phase-2) caps how many decompress workers run
+            // concurrently; the block-parallel path still does the work, but the
+            // admission counter bounds concurrency to `num_phase2_threads`.
+            let decompress =
+                SortSpillDecompress::new(self.tuning.per_step_byte_limit, decompress_tuning)
+                    .with_max_concurrency(Some(num_phase2_threads));
+            // Standalone sort gets an end-of-run summary (records processed /
+            // written / temporary chunks); the fused runall path does not (the
+            // chain-level timing hook covers it). The slot is filled by
+            // `SortMerge` on completion and read by `SortSummaryFinalizeHook`.
+            let sort_stats_slot = is_standalone_sort
+                .then(|| Arc::new(parking_lot::Mutex::new(None::<fgumi_sort::SortStats>)));
+            // `SortMerge` is constructed inside the Terminal/Intermediate branch
+            // below, because its output-framing strategy differs by position:
+            //
+            // - Terminal: `SortMerge<BlockOutput>` frames each merged record as
+            //   `[u32 LE block_size][body]` directly into a `DecompressedBlock`,
+            //   wired straight to `BgzfCompress` — the former
+            //   `SortMerge → SerializeRecordBatch → BgzfCompress` triple folded to
+            //   `SortMerge → BgzfCompress` (lever 1: one fewer pool step, one
+            //   fewer reorder stage, one fewer memcpy per record). The framing is
+            //   byte-for-byte identical to the removed `SerializeRecordBatch`.
+            // - Intermediate: `SortMerge<RecordBatchOutput>` (the default) emits
+            //   `RecordBatch` for the downstream `DecodeFromRecords`.
 
             let tail = self.current_tail.expect("streaming sort called before add_source");
 
             // If the upstream stage produced BamTemplateBatch (from Align or
-            // Correct), flatten it to RecordBatch before feeding SortAndSpill.
+            // Correct), flatten it to RecordBatch before feeding the sort ingest.
             let tail = if self.chain_tail_kind == ChainTailKind::BamTemplateBatch {
                 use crate::pipeline::steps::templates_to_records::TemplatesToRecordBatch;
                 self.pipeline
@@ -2299,53 +2311,225 @@ impl<'a> ChainBuilder<'a> {
                 tail
             };
 
-            let tail = self.pipeline.append_step(and_spill, tail);
-            let tail = self.pipeline.append_step(decompress, tail);
-            let merge_tail = self.pipeline.append_step(merge, tail);
+            // Phase-1 head — the block-parallel spill-write split for ALL sort
+            // orders: `SortBuffer` (Serial: ingest + par-sort + emit sorted
+            // chunks) → `SpillGather` (Serial: fan each chunk into raw blocks,
+            // mint a dense ordinal) → `SpillCompress` (Parallel + ByItemOrdinal:
+            // compress blocks across the work-stealing pool) → `SpillWrite`
+            // (Serial + Writer: demux blocks to per-file spill files, emit
+            // `SortPhase1Event`). This mirrors the output BAM tail
+            // (Serialize → BgzfCompress → WriteBgzfFile) so a single spill's
+            // compression saturates cores instead of pinning one worker, while
+            // keeping `SortBuffer` Serial (no N² rayon oversubscription). The head
+            // emits `SortPhase1Event`, so `SortSpillDecompress`/`SortMerge` are
+            // identical downstream regardless of order.
+            let phase1_tail = {
+                let (temp_dirs, alloc) = sorter
+                    .create_spill_dirs()
+                    .map_err(|e| anyhow!("create spill temp dirs: {e}"))?;
+                let temp_codec = sort.temp_codec;
+                let temp_compression = sort.temp_compression;
+                let temp_dirs = Arc::new(temp_dirs);
+                let alloc = Arc::new(parking_lot::Mutex::new(alloc));
+                let byte_limit = self.tuning.per_step_byte_limit;
+                // Sort head: two cases depending on the source tail kind.
+                // BgzfBlockArena (BAM): use the parallel-inflate front
+                // (ReadBlocks → InflateToArena → FindBoundariesAndSort).
+                // Else (RecordBatch from SAM or upstream stage): use SortBuffer.
+                let head_tail = if self.chain_tail_kind == ChainTailKind::BgzfBlockArena {
+                    // BAM sort through the parallel-inflate arena front
+                    // (ReadBlocks → InflateToArena → FindBoundariesAndSort).
+                    // Each order selects its per-order strategy.
+                    use fgumi_pipeline_io::sort::protocol::MemoryChunkErased;
+                    use fgumi_pipeline_io::sort::{
+                        CoordinateStrategy, FindBoundariesAndSort, InflateToArena,
+                        QuerynameStrategy, ReadBlocks, TemplateStrategy,
+                    };
+                    use fgumi_sort::{QuerynameComparator, RawQuerynameKey, RawQuerynameLexKey};
+                    let n_ref = u32::try_from(self.header.reference_sequences().len())
+                        .map_err(|_| anyhow!("reference sequence count overflows u32"))?;
+                    // sorter is not consumed by this branch; the spill dirs/alloc it
+                    // owns were already taken above (create_spill_dirs). Drop it to
+                    // silence the unused-variable warning.
+                    drop(sorter);
+                    // `total_memory` is the full in-memory budget (--max-memory ×
+                    // threads). ReadBlocks sizes its arena segment to hold one
+                    // full-budget run, so data that fits the budget sorts entirely
+                    // in memory with zero spills — matching legacy.
+                    let read_blocks = ReadBlocks::new(total_memory, byte_limit);
+                    let inflate = InflateToArena::new(byte_limit);
+                    // Hand the resolved Phase-1 count (honoring `--sort-threads`,
+                    // else `--threads`) to the per-chunk sort so large chunks use
+                    // the parallel radix. Using the raw global `num_threads()` here
+                    // silently dropped the `--sort-threads` override.
+                    let sort_threads = num_phase1_threads;
+                    let t = self.pipeline.append_step(read_blocks, tail);
+                    let t = self.pipeline.append_step(inflate, t);
+                    let out = match sort_order {
+                        SortOrder::TemplateCoordinate => {
+                            // Template-coordinate: the accumulator carries the
+                            // library / cell-barcode / MI and `--key-types`
+                            // narrowed-lane machinery the template key needs, built
+                            // from the header exactly as the legacy
+                            // TemplateChunkSorter.
+                            let key_types = sort.key_types.unwrap_or_default();
+                            let acc = fgumi_sort::TemplateArenaAccumulator::from_header(
+                                &self.header,
+                                cell_tag,
+                                key_types,
+                            );
+                            self.pipeline.append_step(
+                                FindBoundariesAndSort::new(
+                                    TemplateStrategy::new(acc),
+                                    sort_threads,
+                                    byte_limit,
+                                ),
+                                t,
+                            )
+                        }
+                        SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
+                            // Queryname (lexicographic): the read name IS the key,
+                            // embedded in the record; the strategy comparator-sorts
+                            // arena refs into an InMemoryChunk<RawQuerynameLexKey>.
+                            self.pipeline.append_step(
+                                FindBoundariesAndSort::new(
+                                    QuerynameStrategy::<RawQuerynameLexKey>::new(
+                                        MemoryChunkErased::QuerynameLex,
+                                    ),
+                                    sort_threads,
+                                    byte_limit,
+                                ),
+                                t,
+                            )
+                        }
+                        SortOrder::Queryname(QuerynameComparator::Natural) => {
+                            self.pipeline.append_step(
+                                FindBoundariesAndSort::new(
+                                    QuerynameStrategy::<RawQuerynameKey>::new(
+                                        MemoryChunkErased::QuerynameNatural,
+                                    ),
+                                    sort_threads,
+                                    byte_limit,
+                                ),
+                                t,
+                            )
+                        }
+                        SortOrder::Coordinate => self.pipeline.append_step(
+                            FindBoundariesAndSort::new(
+                                CoordinateStrategy::new(n_ref),
+                                sort_threads,
+                                byte_limit,
+                            ),
+                            t,
+                        ),
+                    };
+                    // Opt this chain into downstream-first dispatch: the serial
+                    // FindBoundariesAndSort scan then overlaps the 8-way parallel
+                    // InflateToArena instead of starving behind it on the pool.
+                    self.use_drain_first_scheduler = true;
+                    out
+                } else {
+                    let sort_buffer = SortBuffer::from_sorter(sorter, &self.header, byte_limit)
+                        .map_err(|e| anyhow!("SortBuffer::from_sorter: {e}"))?
+                        .with_affinity(affinity);
+                    self.pipeline.append_step(sort_buffer, tail)
+                };
+                // `SpillGather` runs on the off-pool coordination driver
+                // (`StepKind::Detached`, group `sort-coord`) alongside the sort
+                // head, so it never contends a pool worker — the driver frames the
+                // just-sorted chunk into blocks while the pool inflates/compresses.
+                let serialize = SpillGather::new(byte_limit);
+                let compress = SpillCompress::new(temp_codec, temp_compression, byte_limit);
+                let write = SpillWrite::new(alloc, temp_codec, byte_limit, temp_dirs);
+                // Lever 2, Phase-1 analogue: on the standalone-sort terminal,
+                // detach the spill writer onto its own dedicated thread as well,
+                // so the single serial spill-write stream stops occupying a pool
+                // worker that could be running the compression-bound
+                // `SpillCompress`. One persistent writer thread for the whole run
+                // (not one per spill chunk). Same gate as the terminal output
+                // writer set above; every other chain keeps the pool-scheduled
+                // `Serial + Affinity::Writer` spill writer.
+                let write = if self.detached_writer { write.with_detached() } else { write };
+                let tail = self.pipeline.append_step(serialize, head_tail);
+                let tail = self.pipeline.append_step(compress, tail);
+                self.pipeline.append_step(write, tail)
+            };
+            let decompress_tail = self.pipeline.append_step(decompress, phase1_tail);
 
             if position == StagePosition::Terminal {
-                // Terminal-after-upstream: sort then write to output file.
-                // SerializeRecordBatch converts RecordBatch → DecompressedBlock
-                // ready for BgzfCompress → WriteBgzfFile in add_sink.
-                let tail = self.pipeline.append_step(
-                    SerializeRecordBatch::new(self.tuning.per_step_byte_limit),
-                    merge_tail,
-                );
-                self.current_tail = Some(tail);
-                // tail is DecompressedBlock (serialized bytes) after
-                // SerializeRecordBatch → SerializedBytes.
+                // Terminal sort: `SortMerge<BlockOutput>` frames merged records
+                // directly into `DecompressedBlock`s (lever 1), wired straight to
+                // `BgzfCompress → WriteBgzfFile` in add_sink. No
+                // `SerializeRecordBatch` step (and so no extra reorder stage) —
+                // the framing is byte-for-byte identical to what that step
+                // produced, but emitted on the already-in-order `Detached` merge
+                // thread, dropping one pool step and one memcpy per record.
+                let mut merge =
+                    SortMerge::<BlockOutput>::new(sort_order, self.tuning.per_step_byte_limit);
+                if let Some(slot) = &sort_stats_slot {
+                    merge = merge.with_stats_slot(Arc::clone(slot));
+                }
+                let merge_tail = self.pipeline.append_step(merge, decompress_tail);
+                self.current_tail = Some(merge_tail);
+                // tail is DecompressedBlock (serialized bytes) directly from
+                // SortMerge → SerializedBytes.
                 self.chain_tail_kind = ChainTailKind::SerializedBytes;
 
-                // Mirror the Standalone-branch BAI hook registration: when
-                // the spec asks for a sidecar BAI, queue the
-                // `IndexBamFinalizeHook` on the *success-gated* finalize list
-                // so the indexer runs after the chain has flushed the final
-                // BAM on a successful run only (a failed run leaves a partial
-                // BAM whose index would be stale). Multi-stage Sort-terminal
-                // chains (e.g. `[Stage::Correct, Stage::Sort]`) land here
-                // instead of the Standalone branch (which requires
-                // `current_tail.is_none()`), so without this wire a
-                // `BamWithIndex` request would pass Rule 3 and silently
-                // skip indexing. Today only standalone `fgumi sort` builds
-                // such specs (runall never constructs `SinkSpec::BamWithIndex`
-                // because its sort output is template-coordinate, where BAI
-                // is undefined), so the Streaming-Terminal path is unreachable
-                // in production, but the architectural invariant —
-                // "BamWithIndex triggers the hook in every terminal-sort
-                // path" — is enforced here for future producers.
-                if let SinkSpec::BamWithIndex(p) = &self.spec.sink {
+                // Standalone sort: log the `=== Summary ===` block from the
+                // SortMerge stats slot. Success-gated (`finalize_on_success`), NOT
+                // always-run: the always-run `finalize` hooks drain even on the
+                // error path, and the stats slot is unset (default zeros) whenever
+                // SortMerge never reached `Done`, so an always-run summary would
+                // report a bogus "Records processed: 0 ... completed" line on a
+                // failed run. Registered before the index hook so on success the
+                // summary still lands before any "Indexing BAM:" line, mirroring
+                // the legacy SortFinalizeHook ordering.
+                if let Some(slot) = sort_stats_slot {
+                    let output_path = match &self.spec.sink {
+                        SinkSpec::Bam(p) | SinkSpec::BamWithIndex(p) => p.clone(),
+                    };
                     self.finalize_on_success.push(Box::new(
-                        crate::pipeline::chains::commands::sort::IndexBamFinalizeHook {
-                            output_path: p.clone(),
+                        crate::pipeline::chains::commands::sort::SortSummaryFinalizeHook {
+                            stats_slot: slot,
+                            output_path,
+                            timer: fgumi_cli_common::OperationTimer::new("Sorting BAM"),
                         },
                     ));
                 }
+
+                // When the spec asks for a sidecar BAI, queue the
+                // `IndexBamFinalizeHook` on the *success-gated* finalize list
+                // so the indexer runs after the chain has flushed the final
+                // BAM on a successful run only (a failed run leaves a partial
+                // BAM whose index would be stale). Every Sort-terminal chain —
+                // standalone `[Stage::Sort]` or fused (e.g.
+                // `[Stage::Correct, Stage::Sort]`) — lands here in the unified
+                // `add_sort` flow, so without this wire a `BamWithIndex` request
+                // would pass Rule 3 and silently skip indexing. Today only
+                // standalone `fgumi sort` builds such specs (runall never
+                // constructs `SinkSpec::BamWithIndex` because its sort output is
+                // template-coordinate, where BAI is undefined), but the
+                // architectural invariant — "BamWithIndex triggers the hook in
+                // every terminal-sort path" — is enforced here for future
+                // producers.
+                if let SinkSpec::BamWithIndex(p) = &self.spec.sink {
+                    self.finalize_on_success
+                        .push(Box::new(IndexBamFinalizeHook { output_path: p.clone() }));
+                }
             } else {
-                // Intermediate: decode to DecodedRecordBatch for downstream stages.
-                // Route through `bam_group_key_config` so a `[Sort, Group]` chain
-                // still caches the UMI (RX) value position during this decode —
-                // otherwise group would re-scan aux per template and lose the
-                // #334/#343 optimization on the sort→group path.
+                // Intermediate: `SortMerge<RecordBatchOutput>` (the default)
+                // emits `RecordBatch`, decoded to `DecodedRecordBatch` for the
+                // downstream stages. Route through `bam_group_key_config` so a
+                // `[Sort, Group]` chain still caches the UMI (RX) value position
+                // during this decode — otherwise group would re-scan aux per
+                // template and lose the #334/#343 optimization on the sort→group
+                // path. The intermediate sort is never standalone, so the stats
+                // slot is `None`; no `with_stats_slot` call is needed.
+                let merge = SortMerge::<RecordBatchOutput>::new(
+                    sort_order,
+                    self.tuning.per_step_byte_limit,
+                );
+                let merge_tail = self.pipeline.append_step(merge, decompress_tail);
                 let group_key_config = self.bam_group_key_config();
                 let tail = self.pipeline.append_step(
                     DecodeFromRecords::new(group_key_config, self.tuning.per_step_byte_limit),

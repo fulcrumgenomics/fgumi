@@ -2,8 +2,8 @@
 //!
 //! Bridges the queryname-template view (`BamTemplateBatch`,
 //! emitted by `AlignAndMergeStep` and `ZipperMergeStep`) to the
-//! flat-record view (`RecordBatch`, consumed by `SortAndSpill`,
-//! `DecodeRecords`, etc.). Flattens each `Template`'s records into
+//! flat-record view (`RecordBatch`, consumed by the sort ingest
+//! (`SortBuffer`), `DecodeRecords`, etc.). Flattens each `Template`'s records into
 //! a single `RecordBatch` carrying the input batch's serial
 //! ordinal, so `BranchOrdering::ByItemOrdinal` consumers downstream
 //! see a monotonic sequence.
