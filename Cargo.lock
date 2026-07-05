@@ -743,6 +743,7 @@ dependencies = [
  "crc32fast",
  "criterion",
  "libdeflater",
+ "rstest",
 ]
 
 [[package]]
