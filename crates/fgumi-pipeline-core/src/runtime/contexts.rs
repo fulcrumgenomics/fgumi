@@ -42,6 +42,44 @@ pub struct ChainContexts {
     /// exist (e.g. a chain composed entirely of `CountBounded` /
     /// `Unbounded` steps).
     pub bounded_queues: Vec<RegisteredQueue>,
+    /// Registry of every instrumented edge (`--pipeline-trace`), with its
+    /// `EdgeMetrics` + producer/consumer + (for byte-bounded edges) a depth
+    /// source. Empty when instrumentation is `Off`. Read by the occupancy
+    /// sampler and the end-of-run edge report.
+    pub edges: Vec<RegisteredEdge>,
+}
+
+/// One instrumented edge: its shared [`EdgeMetrics`](crate::runtime::metrics::EdgeMetrics)
+/// (push counts from the transport, pop counts from the input handle), its
+/// producer + consumer steps, and a depth source for occupancy sampling.
+pub struct RegisteredEdge {
+    pub producer_step: StepIdx,
+    pub producer_name: &'static str,
+    /// `None` for a terminal branch with no consumer (e.g. a `--rejects` tail).
+    pub consumer_step: Option<StepIdx>,
+    pub consumer_name: Option<&'static str>,
+    pub branch: BranchIdx,
+    /// On an **ordered** edge, the push-side counters (`pushed_items` /
+    /// `pushed_bytes` / `push_rejections`) are recorded at the `ReorderStage`
+    /// boundary, not on the transport queue: the reorder stage's must-accept path
+    /// turns a full-transport reject into an accepted (stashed) push, so recording
+    /// on the transport would miscount stashed items as backpressure. Recorded at
+    /// the boundary, `pushed_bytes` counts the bare `T` (`heap_size`) and so
+    /// matches `popped_bytes` (the ordinal tag adds no heap).
+    pub metrics: std::sync::Arc<crate::runtime::metrics::EdgeMetrics>,
+    /// `Some` for byte-bounded edges — the transport queue's `current_bytes`
+    /// (plus, for an ordered edge, the `reorder_depth` stash bytes) over
+    /// `limit_bytes` gives the occupancy fraction the sampler records. `None`
+    /// for count/unbounded edges (counters still apply; occupancy histogram is
+    /// skipped).
+    pub depth_source: Option<std::sync::Arc<dyn crate::queues::BoundedQueueHandle>>,
+    /// `Some` for an **ordered** byte-bounded edge — the `ReorderStage`'s
+    /// overflow-stash handle. Its buffered bytes are added to the transport's
+    /// `current_bytes` when sampling depth, so an ordered edge reflects total
+    /// buffered bytes (transport + reorder stash) rather than the transport
+    /// queue alone (which under-reports occupancy when items pile in the reorder
+    /// buffer under producer skew). `None` for direct/count/unbounded edges.
+    pub reorder_depth: Option<std::sync::Arc<dyn crate::reorder::ReorderCapHandle>>,
 }
 
 /// One byte-bounded queue's location in the chain plus the handles for
@@ -72,8 +110,12 @@ pub struct RegisteredQueue {
 /// Panics if `graph.n_steps() != steps.len()` or if any non-source step
 /// has no producer (the builder's all-wired check should prevent this).
 #[must_use]
-pub fn build_chain_contexts(steps: &[Box<dyn ErasedStep>], graph: &ChainGraph) -> ChainContexts {
-    build_chain_contexts_inner(steps, graph, false)
+pub fn build_chain_contexts(
+    steps: &[Box<dyn ErasedStep>],
+    graph: &ChainGraph,
+    level: crate::builder::InstrumentationLevel,
+) -> ChainContexts {
+    build_chain_contexts_inner(steps, graph, false, level)
 }
 
 /// Build the chain's per-step contexts with **direct, unbounded** inter-step
@@ -92,13 +134,48 @@ pub fn build_chain_contexts_fused(
     steps: &[Box<dyn ErasedStep>],
     graph: &ChainGraph,
 ) -> ChainContexts {
-    build_chain_contexts_inner(steps, graph, true)
+    // The fused path uses direct, unbounded transports (no bounded edges), so
+    // there is nothing to instrument — force `Off` regardless of the run's level.
+    build_chain_contexts_inner(steps, graph, true, crate::builder::InstrumentationLevel::Off)
+}
+
+/// Build the producer→consumer edge map (keyed by `(producer_step, branch)`)
+/// used to label registered edges with their consumer. Empty when
+/// instrumentation is off (no edges are registered, so the map is unused).
+fn build_consumer_map(
+    steps: &[Box<dyn ErasedStep>],
+    graph: &ChainGraph,
+    level: crate::builder::InstrumentationLevel,
+) -> std::collections::HashMap<(usize, usize), usize> {
+    let mut m = std::collections::HashMap::new();
+    if !level.is_on() {
+        return m;
+    }
+    for (consumer_idx, step) in steps.iter().enumerate() {
+        if step.is_source() {
+            continue;
+        }
+        match step.input_arity() {
+            1 => {
+                let (p, b) = find_producer(graph, StepIdx(consumer_idx));
+                m.insert((p.0, b.0), consumer_idx);
+            }
+            2 => {
+                for (p, b) in find_all_producers(graph, StepIdx(consumer_idx)) {
+                    m.insert((p.0, b.0), consumer_idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    m
 }
 
 fn build_chain_contexts_inner(
     steps: &[Box<dyn ErasedStep>],
     graph: &ChainGraph,
     direct: bool,
+    level: crate::builder::InstrumentationLevel,
 ) -> ChainContexts {
     assert_eq!(steps.len(), graph.n_steps(), "chain length mismatch");
 
@@ -112,11 +189,15 @@ fn build_chain_contexts_inner(
     // the scheduled path honours each step's profiled queue spec + ordering.
     for step in steps {
         let (set, view) =
-            if direct { step.build_fused_output_set() } else { step.build_output_set() };
+            if direct { step.build_fused_output_set(level) } else { step.build_output_set(level) };
         let outputs_box = step.wrap_outputs_view(view);
         output_sets.push(set);
         outputs.push(outputs_box);
     }
+
+    // Producer→consumer map for edge registration (inverse of `find_producer`,
+    // which Pass 2 uses consumer→producer). Empty when instrumentation is off.
+    let consumer_of = build_consumer_map(steps, graph, level);
 
     // Pass 1.5: collect byte-bounded queue handles into the registry.
     // Must run before Pass 2 because `take_typed_input` (called via
@@ -124,6 +205,7 @@ fn build_chain_contexts_inner(
     // one whose `bounded_queue_handle` is `None` — by then the
     // handles have been moved out of the chain.
     let mut bounded_queues: Vec<RegisteredQueue> = Vec::new();
+    let mut edges: Vec<RegisteredEdge> = Vec::new();
     for (step_idx_usize, set) in output_sets.iter().enumerate() {
         for (branch_idx_usize, entry) in set.branches.iter().enumerate() {
             if let Some(handles) = entry.bounded_queue_handle.as_ref() {
@@ -133,6 +215,28 @@ fn build_chain_contexts_inner(
                     branch: BranchIdx(branch_idx_usize),
                     handle: std::sync::Arc::clone(&handles.transport),
                     reorder_cap: handles.reorder_cap.clone(),
+                });
+            }
+            // Instrumented edge: register its shared metrics + producer/consumer
+            // + (for byte-bounded edges) a depth source for occupancy sampling.
+            if let Some(metrics) = entry.metrics.as_ref() {
+                let consumer_step =
+                    consumer_of.get(&(step_idx_usize, branch_idx_usize)).map(|c| StepIdx(*c));
+                edges.push(RegisteredEdge {
+                    producer_step: StepIdx(step_idx_usize),
+                    producer_name: steps[step_idx_usize].profile().name,
+                    consumer_step,
+                    consumer_name: consumer_step.map(|c| steps[c.0].profile().name),
+                    branch: BranchIdx(branch_idx_usize),
+                    metrics: std::sync::Arc::clone(metrics),
+                    depth_source: entry
+                        .bounded_queue_handle
+                        .as_ref()
+                        .map(|h| std::sync::Arc::clone(&h.transport)),
+                    reorder_depth: entry
+                        .bounded_queue_handle
+                        .as_ref()
+                        .and_then(|h| h.reorder_cap.clone()),
                 });
             }
         }
@@ -188,7 +292,7 @@ fn build_chain_contexts_inner(
     // exactly once via `build_input_handle`, leaving placeholder slots.
     drop(output_sets);
 
-    ChainContexts { inputs, outputs, bounded_queues }
+    ChainContexts { inputs, outputs, bounded_queues, edges }
 }
 
 /// Construct a `BranchInputHandle<()>` that's already drained — for source
@@ -422,8 +526,31 @@ mod tests {
     #[case(4)]
     fn build_chain_contexts_linear(#[case] n: usize) {
         let (steps, graph) = linear_chain(n);
-        let ctx = build_chain_contexts(&steps, &graph);
+        let ctx = build_chain_contexts(&steps, &graph, crate::builder::InstrumentationLevel::Off);
         assert_linear_chain_invariants(&ctx, n);
+    }
+
+    #[test]
+    fn registry_covers_edges_with_producer_and_consumer() {
+        use crate::builder::InstrumentationLevel as L;
+        // Source → Middle → Sink: two producing edges, each with a consumer.
+        let (steps, graph) = linear_chain(3);
+        let ctx = build_chain_contexts(&steps, &graph, L::Summary);
+        assert_eq!(ctx.edges.len(), 2, "every bounded producing edge is registered");
+        for e in &ctx.edges {
+            assert!(
+                e.consumer_step.is_some(),
+                "edge from {} has a resolved consumer",
+                e.producer_name
+            );
+            assert!(e.consumer_name.is_some());
+            // CountBounded edges expose no byte depth source (occupancy via len only).
+            assert!(e.depth_source.is_none(), "count-bounded edge has no byte depth source");
+        }
+        // Off → no edges registered (zero-overhead path).
+        let (steps, graph) = linear_chain(3);
+        let off = build_chain_contexts(&steps, &graph, L::Off);
+        assert!(off.edges.is_empty(), "level Off registers no edges");
     }
 
     proptest! {
@@ -432,7 +559,7 @@ mod tests {
         #[test]
         fn build_chain_contexts_linear_invariants(n in 2usize..=8) {
             let (steps, graph) = linear_chain(n);
-            let ctx = build_chain_contexts(&steps, &graph);
+            let ctx = build_chain_contexts(&steps, &graph, crate::builder::InstrumentationLevel::Off);
             assert_linear_chain_invariants(&ctx, n);
         }
     }

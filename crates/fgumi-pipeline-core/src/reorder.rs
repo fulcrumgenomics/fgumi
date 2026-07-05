@@ -166,6 +166,19 @@ pub struct ReorderStage<T: Send + HeapSize + 'static> {
     /// nothing on the lock-free fast path. Mirrors legacy
     /// `ReorderBufferState::can_proceed` (`base.rs:766-781`).
     max_overflow_bytes: AtomicU64,
+    /// Producer-side push metrics for an **ordered** edge, recorded at THIS
+    /// boundary rather than on the transport queue. `try_push` can turn a
+    /// full-transport `Err` into a must-accept stash `Ok`, so recording on the
+    /// transport would miscount a stashed (accepted) item as a rejection. Here we
+    /// record `record_push` on every accepted push (transport OR stash) and
+    /// `record_reject` only on a true `Err`, keeping `pushed_items` /
+    /// `push_rejections` accurate under producer skew. `None` when the edge is
+    /// not instrumented; the pop side is recorded separately by the input handle.
+    push_metrics: Option<Arc<crate::runtime::metrics::EdgeMetrics>>,
+    /// Whether `push_metrics` records each push's `heap_size` (byte-bounded edge)
+    /// or `0` (count/unbounded edge) — mirroring the underlying queue's own byte
+    /// accounting. Set from the branch's queue kind at construction.
+    record_item_bytes: bool,
 }
 
 /// Unbounded sentinel for [`ReorderStage::max_overflow_bytes`].
@@ -242,6 +255,8 @@ impl<T: Send + HeapSize + 'static> ReorderStage<T> {
             next_serial_buffered: AtomicBool::new(false),
             drained_observed: AtomicBool::new(false),
             max_overflow_bytes: AtomicU64::new(REORDER_OVERFLOW_UNBOUNDED),
+            push_metrics: None,
+            record_item_bytes: false,
         }
     }
 
@@ -282,7 +297,25 @@ impl<T: Send + HeapSize + 'static> ReorderStage<T> {
             next_serial_buffered: AtomicBool::new(false),
             drained_observed: AtomicBool::new(false),
             max_overflow_bytes: AtomicU64::new(max_bytes),
+            push_metrics: None,
+            record_item_bytes: false,
         }
+    }
+
+    /// Attach producer-side push metrics recorded at the `ReorderStage` boundary
+    /// (see [`push_metrics`](Self::push_metrics)). `record_item_bytes` is `true`
+    /// for a byte-bounded edge (record each push's `heap_size`) and `false` for a
+    /// count/unbounded edge (record `0`), matching the underlying queue's byte
+    /// accounting. Called once by the ordered-branch builder.
+    #[must_use]
+    pub fn with_push_metrics(
+        mut self,
+        push_metrics: Option<Arc<crate::runtime::metrics::EdgeMetrics>>,
+        record_item_bytes: bool,
+    ) -> Self {
+        self.push_metrics = push_metrics;
+        self.record_item_bytes = record_item_bytes;
+        self
     }
 
     /// Producer-side push. The framework allocates `ordinal` from a
@@ -307,6 +340,35 @@ impl<T: Send + HeapSize + 'static> ReorderStage<T> {
     /// were not in must-accept mode (i.e., `next_serial` is already
     /// observable, so the consumer can drain).
     pub fn try_push(&self, ordinal: u64, item: T) -> Result<(), (u64, T)> {
+        // Record push-side metrics at THIS boundary (see `push_metrics`). The
+        // must-accept path turns a full-transport `Err` into a stash `Ok`, so the
+        // transport queue can't tell a stashed (accepted) push from a reject —
+        // only the final `Result` here can. `heap_size()` is read before `item`
+        // moves into the inner push. Every `Ok` (transport OR stash) is a push;
+        // every `Err` (backpressure or stash-cap held) is a reject.
+        //
+        // Gate the `heap_size()` call on metrics being present: on the default
+        // instrumentation-off path (`push_metrics == None`) the byte figure is
+        // never recorded, so computing it would be pure hot-path overhead.
+        let bytes = if self.push_metrics.is_some() && self.record_item_bytes {
+            item.heap_size() as u64
+        } else {
+            0
+        };
+        let result = self.try_push_inner(ordinal, item);
+        if let Some(m) = &self.push_metrics {
+            match &result {
+                Ok(()) => m.record_push(bytes),
+                Err(_) => m.record_reject(),
+            }
+        }
+        result
+    }
+
+    /// Inner push: the transport / must-accept-stash decision, without metrics.
+    /// See [`try_push`](Self::try_push) for the public contract; metrics are
+    /// recorded there so a stashed push is not miscounted as a rejection.
+    fn try_push_inner(&self, ordinal: u64, item: T) -> Result<(), (u64, T)> {
         // Lock-free fast path. If next_serial is in the buffer (consumer
         // can drain), the producer is in pure-backpressure mode: a
         // transport push that succeeds returns Ok; a rejection returns
@@ -401,6 +463,25 @@ impl<T: Send + HeapSize + 'static> ReorderStage<T> {
     /// guard exists only to fail loudly rather than silently wrap and wait
     /// forever for ordinal 0.
     pub fn try_pop_in_order(&self) -> Option<T> {
+        self.try_pop_in_order_reporting_blocked().0
+    }
+
+    /// Like [`try_pop_in_order`](Self::try_pop_in_order), but also reports whether
+    /// a `None` result was *reorder-blocked* — later ordinals are buffered while
+    /// the stage waits for an earlier one — rather than genuinely drained. The
+    /// pop and the reorder-blocked check are computed under the SAME state lock,
+    /// so a shared (`Parallel`) consumer cannot observe a torn `(item, blocked)`
+    /// pair that would skew the `pop_empties` starvation metric. The flag is
+    /// always `false` when an item is returned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the in-order ordinal counter would overflow `u64` (i.e.
+    /// `next_serial == u64::MAX`). Branch ordinals start at 0 and increment, so
+    /// this is unreachable on any real workload (~1.8e19 items on one edge); the
+    /// guard exists only to fail loudly rather than silently wrap and wait
+    /// forever for ordinal 0.
+    pub fn try_pop_in_order_reporting_blocked(&self) -> (Option<T>, bool) {
         let mut state = self.state.lock();
         let next = state.next_serial;
 
@@ -437,9 +518,14 @@ impl<T: Send + HeapSize + 'static> ReorderStage<T> {
             // Producers reading post-update see the right state.
             let new_buffered = state.buffer.contains_key(&new_next);
             self.next_serial_buffered.store(new_buffered, Ordering::Release);
-            Some(item)
+            (Some(item), false)
         } else {
-            None
+            // No in-order item. Reorder-blocked (backlog, not starvation) iff the
+            // buffer still holds out-of-order items awaiting an earlier ordinal —
+            // `next` was just confirmed absent, so any remaining entry is a later
+            // ordinal. Computed here under the same lock as the pop above.
+            let reorder_blocked = !state.buffer.is_empty();
+            (None, reorder_blocked)
         }
     }
 
@@ -518,6 +604,93 @@ mod tests {
         assert_eq!(s.try_pop_in_order(), Some(10));
         assert_eq!(s.try_pop_in_order(), Some(20));
         assert_eq!(s.try_pop_in_order(), Some(30));
+    }
+
+    #[test]
+    fn reporting_pop_flags_reorder_blocked_vs_drained() {
+        // The reporting pop returns the reorder-blocked flag from the same locked
+        // path as the pop itself, so a shared consumer sees a consistent pair.
+        let s = make_stage(8);
+        // Buffer a later ordinal while ordinal 0 is absent → reorder-blocked.
+        s.try_push(1, 100).unwrap();
+        assert_eq!(s.try_pop_in_order_reporting_blocked(), (None, true), "blocked, not drained");
+        // Ordinal 0 arrives; the pop yields it and is not blocked.
+        s.try_push(0, 0).unwrap();
+        assert_eq!(s.try_pop_in_order_reporting_blocked(), (Some(0), false));
+        assert_eq!(s.try_pop_in_order_reporting_blocked(), (Some(100), false));
+        // Genuinely drained now → None and NOT reorder-blocked (a true empty pop).
+        assert_eq!(s.try_pop_in_order_reporting_blocked(), (None, false), "drained, not blocked");
+    }
+
+    #[test]
+    fn push_metrics_count_stashed_item_as_push_not_reject() {
+        use crate::runtime::metrics::EdgeMetrics;
+        // Transport capacity 1, next_serial (0) absent → must-accept. The first
+        // push fills the transport; the second must-accept-overflows into the
+        // stash, returning Ok. Recording at the ReorderStage boundary must count
+        // BOTH as pushes and NEITHER as a rejection — the transport's internal
+        // `Err` on the stashed push is not a real backpressure event. (Recording
+        // on the transport, as before, miscounted the stashed item as a reject.)
+        let m = EdgeMetrics::new();
+        let q: Arc<dyn ItemQueue<Sequenced<u32>>> = Arc::new(CountBoundedQueue::new(1));
+        let stage = ReorderStage::new(q).with_push_metrics(Some(Arc::clone(&m)), false);
+        assert!(stage.try_push(1, 10).is_ok(), "ordinal 1 into transport");
+        assert!(stage.try_push(2, 20).is_ok(), "ordinal 2 stashed (transport full)");
+        let s = m.snapshot();
+        assert_eq!(s.pushed_items, 2, "both accepted pushes counted");
+        assert_eq!(s.push_rejections, 0, "a stashed push is not a rejection");
+        assert_eq!(s.pushed_bytes, 0, "count-bounded edge records 0 push bytes");
+    }
+
+    #[test]
+    fn push_metrics_record_item_bytes_when_byte_bounded() {
+        use crate::runtime::metrics::EdgeMetrics;
+        #[derive(Debug)]
+        struct Heavy;
+        impl HeapSize for Heavy {
+            fn heap_size(&self) -> usize {
+                100
+            }
+        }
+        // With `record_item_bytes = true` (byte-bounded edge), each accepted push
+        // records its `heap_size` — so `pushed_bytes` tracks the bare `T`, the
+        // same size the pop side records.
+        let m = EdgeMetrics::new();
+        let q: Arc<dyn ItemQueue<Sequenced<Heavy>>> = Arc::new(CountBoundedQueue::new(8));
+        let stage = ReorderStage::new(q).with_push_metrics(Some(Arc::clone(&m)), true);
+        assert!(stage.try_push(0, Heavy).is_ok());
+        assert!(stage.try_push(1, Heavy).is_ok());
+        let s = m.snapshot();
+        assert_eq!(s.pushed_items, 2);
+        assert_eq!(s.pushed_bytes, 200, "byte-bounded edge records heap_size per push");
+    }
+
+    #[test]
+    fn push_without_metrics_skips_heap_size() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        // On the default instrumentation-off path (`push_metrics == None`) the
+        // push wrapper must NOT compute `heap_size` — that byte figure is only
+        // needed to record a push, so computing it would be pure hot-path cost.
+        #[derive(Debug)]
+        struct Counted(Arc<AtomicUsize>);
+        impl HeapSize for Counted {
+            fn heap_size(&self) -> usize {
+                self.0.fetch_add(1, AtomicOrdering::Relaxed);
+                0
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let q: Arc<dyn ItemQueue<Sequenced<Counted>>> = Arc::new(CountBoundedQueue::new(8));
+        // Byte-bounded edge (`record_item_bytes = true`) but no push metrics.
+        let stage = ReorderStage::new(q).with_push_metrics(None, true);
+        // ordinal 0 == next_serial → transport accepts (no stash), so the only
+        // `heap_size` call would be the wrapper's — which the gate must skip.
+        stage.try_push(0, Counted(Arc::clone(&calls))).unwrap();
+        assert_eq!(
+            calls.load(AtomicOrdering::Relaxed),
+            0,
+            "heap_size must not be computed when push metrics are disabled"
+        );
     }
 
     #[test]

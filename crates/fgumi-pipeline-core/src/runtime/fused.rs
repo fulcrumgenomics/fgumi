@@ -26,6 +26,7 @@ use std::time::Instant;
 
 use super::contexts::build_chain_contexts_fused;
 use super::stats::PipelineStats;
+use crate::builder::InstrumentationLevel;
 use crate::erased::{ErasedStep, ErasedStepCtx};
 use crate::signal::{PipelineError, PipelineSignal};
 use crate::step::StepOutcome;
@@ -79,6 +80,28 @@ pub fn is_fusible_chain(steps: &[Box<dyn ErasedStep>], graph: &ChainGraph) -> bo
         }
     }
     true
+}
+
+/// Whether `build_chain`'s fused single-thread fast path may be taken for this
+/// chain.
+///
+/// The fast path drives a fusible chain inline over direct buffers, skipping the
+/// scheduler — and with it the per-edge instrumentation the scheduled path sets
+/// up (edge [`EdgeMetrics`](super::metrics::EdgeMetrics), the occupancy sampler,
+/// and the `snapshot_with_edges` bottleneck verdict). An instrumented run
+/// (`InstrumentationLevel != Off`) must therefore NOT fuse, or its
+/// `--pipeline-stats` / `--pipeline-trace` output would silently omit all edge /
+/// occupancy data. When instrumentation is `Off` (the default), fusion is taken
+/// whenever the chain is single-thread and fusible (zero-overhead fast path
+/// preserved).
+#[must_use]
+pub fn should_fuse_single_thread(
+    n_threads: usize,
+    instrumentation: InstrumentationLevel,
+    steps: &[Box<dyn ErasedStep>],
+    graph: &ChainGraph,
+) -> bool {
+    n_threads == 1 && !instrumentation.is_on() && is_fusible_chain(steps, graph)
 }
 
 /// Drive a fusible chain to completion on the calling thread, fused.
@@ -209,6 +232,8 @@ pub fn run_fused_single_thread(
 mod tests {
     use std::io;
     use std::sync::{Arc, Mutex};
+
+    use rstest::rstest;
 
     use super::*;
     use crate::erased::TypedStep;
@@ -409,6 +434,27 @@ mod tests {
         let odd = Arc::new(Mutex::new(Vec::new()));
         let (steps, graph) = fan_out_chain(0, &even, &odd);
         assert!(is_fusible_chain(&steps, &graph));
+    }
+
+    // A fusible chain fuses ONLY when it is single-thread AND uninstrumented: the
+    // fused fast path skips the scheduled path's edge metrics / occupancy sampler
+    // / bottleneck verdict, so any instrumentation level (or ≥2 threads) must fall
+    // through to the scheduled path instead of silently dropping that output.
+    #[rstest]
+    #[case::off_single_thread(1, InstrumentationLevel::Off, true)]
+    #[case::summary_single_thread(1, InstrumentationLevel::Summary, false)]
+    #[case::timeline_single_thread(1, InstrumentationLevel::Timeline, false)]
+    #[case::deep_single_thread(1, InstrumentationLevel::Deep, false)]
+    #[case::off_multi_thread(2, InstrumentationLevel::Off, false)]
+    fn should_fuse_only_when_uninstrumented_single_thread(
+        #[case] n_threads: usize,
+        #[case] level: InstrumentationLevel,
+        #[case] expected: bool,
+    ) {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let (steps, graph) = linear_chain(4, &out);
+        assert!(is_fusible_chain(&steps, &graph), "linear chain is fusible");
+        assert_eq!(should_fuse_single_thread(n_threads, level, &steps, &graph), expected);
     }
 
     #[test]

@@ -37,6 +37,50 @@ impl std::fmt::Display for BuildError {
 
 impl std::error::Error for BuildError {}
 
+/// How much pipeline instrumentation to collect. Off by default (zero overhead:
+/// queues stay non-instrumented and no sampler thread spawns). Each higher level
+/// is a superset of the one below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InstrumentationLevel {
+    /// No edge instrumentation. The pool hot path takes its existing zero-cost
+    /// route; this is the production default.
+    #[default]
+    Off,
+    /// Per-edge throughput/occupancy/latency counters + the occupancy sampler +
+    /// the end-of-run edge table and bottleneck verdict.
+    Summary,
+    /// `Summary` plus a per-tick occupancy/throughput timeline TSV.
+    Timeline,
+    /// `Timeline` plus direct dwell/park-time latency (Detached edges).
+    Deep,
+}
+
+impl InstrumentationLevel {
+    /// `true` for any level above `Off` (edge metrics are collected).
+    #[must_use]
+    pub fn is_on(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// `true` if the background occupancy sampler should run.
+    #[must_use]
+    pub fn samples(self) -> bool {
+        self.is_on()
+    }
+
+    /// `true` if the per-tick timeline TSV should be written.
+    #[must_use]
+    pub fn timeline(self) -> bool {
+        matches!(self, Self::Timeline | Self::Deep)
+    }
+
+    /// `true` if direct dwell/park-time latency should be recorded.
+    #[must_use]
+    pub fn deep(self) -> bool {
+        matches!(self, Self::Deep)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
     pub threads: usize,
@@ -70,6 +114,21 @@ pub struct PipelineConfig {
     /// Floor of 1 MiB per queue is enforced regardless of the
     /// rebalancer's decisions to prevent pathological starvation.
     pub queue_memory_total: Option<u64>,
+    /// How much per-edge instrumentation to collect (default `Off` = zero
+    /// overhead). Threaded into queue construction (instrumented transports) and
+    /// the occupancy sampler. See [`InstrumentationLevel`].
+    pub instrumentation: InstrumentationLevel,
+    /// Where to write the per-tick timeline TSV when
+    /// `instrumentation.timeline()`. `None` → a default `pipeline-trace.tsv`.
+    pub trace_path: Option<std::path::PathBuf>,
+    /// Per-worker dispatch-order policy. The default
+    /// [`ChainOrderScheduler`](crate::runtime::ChainOrderScheduler) walks live
+    /// steps upstream-first (historical behaviour). A chain may opt into
+    /// [`DrainFirstScheduler`](crate::runtime::DrainFirstScheduler) to walk
+    /// downstream-first (drain buffered work before producing more) — e.g. the
+    /// sort chain, to overlap its serial boundary/key scan with the parallel
+    /// inflate instead of starving it behind inflate on the shared pool.
+    pub scheduler: Arc<dyn super::runtime::Scheduler>,
 }
 
 impl Default for PipelineConfig {
@@ -79,6 +138,9 @@ impl Default for PipelineConfig {
             stats: None,
             deadlock_timeout_secs: 0,
             queue_memory_total: None,
+            instrumentation: InstrumentationLevel::Off,
+            trace_path: None,
+            scheduler: Arc::new(super::runtime::ChainOrderScheduler),
         }
     }
 }
@@ -100,12 +162,30 @@ impl PipelineConfig {
         self
     }
 
+    /// Builder-style helper to set the per-worker dispatch-order policy.
+    /// Defaults to [`ChainOrderScheduler`](crate::runtime::ChainOrderScheduler)
+    /// (upstream-first); pass
+    /// [`DrainFirstScheduler`](crate::runtime::DrainFirstScheduler) to walk
+    /// downstream-first.
+    #[must_use]
+    pub fn with_scheduler(mut self, scheduler: Arc<dyn super::runtime::Scheduler>) -> Self {
+        self.scheduler = scheduler;
+        self
+    }
+
     /// Builder-style helper to set the total queue-memory budget.
     /// `None` keeps per-step `ByteBounded` limits at their static
     /// values; `Some(total)` enables the rebalancer.
     #[must_use]
     pub fn with_queue_memory_total(mut self, total: Option<u64>) -> Self {
         self.queue_memory_total = total;
+        self
+    }
+
+    /// Builder-style helper to set the instrumentation level (default `Off`).
+    #[must_use]
+    pub fn with_instrumentation(mut self, level: InstrumentationLevel) -> Self {
+        self.instrumentation = level;
         self
     }
 }
@@ -757,16 +837,18 @@ impl Pipeline {
 
         use super::runtime::{
             StepDrainCounter, WorkerCore, assign_exclusive_owners, assign_sticky_owners,
-            build_chain_contexts, build_worker_storage, is_fusible_chain, run_fused_single_thread,
-            run_worker_loop,
+            build_chain_contexts, build_worker_storage, extract_detached_steps,
+            run_detached_driver, run_fused_single_thread, run_worker_loop,
+            should_fuse_single_thread,
         };
-        use super::step::StepKind;
+        use super::step::{DetachedGroup, StepKind};
         use super::topology::StepIdx;
 
-        let Self { steps, graph, signal } = self;
+        let Self { mut steps, graph, signal } = self;
         let n_threads = config.threads;
         let stats_arc = config.stats;
         let deadlock_timeout_secs = config.deadlock_timeout_secs;
+        let scheduler = Arc::clone(&config.scheduler);
         assert!(n_threads > 0, "PipelineConfig::threads must be > 0");
         if let Some(stats) = stats_arc.as_ref() {
             assert_eq!(
@@ -795,7 +877,9 @@ impl Pipeline {
         // `--threads ≥ 2` fall through to the scheduled worker pool below. The
         // deadlock monitor / queue rebalancer are not spawned: a single-worker
         // inline drive cannot deadlock and has no bounded queues to rebalance.
-        if n_threads == 1 && is_fusible_chain(&steps, &graph) {
+        // Instrumentation forces the scheduled path (see `should_fuse_single_thread`):
+        // the fused path has no per-edge metrics / occupancy sampler / verdict.
+        if should_fuse_single_thread(n_threads, config.instrumentation, &steps, &graph) {
             log::debug!(
                 "Using fused single-thread pipeline ({} steps, direct buffers)",
                 steps.len()
@@ -821,14 +905,14 @@ impl Pipeline {
         let sticky_owners = assign_sticky_owners(&steps, &owners, n_threads);
 
         // 2. Build per-step contexts (input + output handles).
-        let contexts = Arc::new(build_chain_contexts(&steps, &graph));
+        let contexts = Arc::new(build_chain_contexts(&steps, &graph, config.instrumentation));
 
         // 2-pre-monitor invariant: if the deadlock monitor will be armed, every
         // output transport must be ByteBounded so `in_flight_bytes` can see a
         // wedge on it. A CountBounded/Unbounded edge is invisible to the probe
-        // and would silently disable fail-fast on that edge. Checked here (in
-        // every build, release included — the blind spot only matters in a real
-        // fail-fast run) while `steps` is still alive — it is consumed by
+        // and would silently disable fail-fast on that edge. Checked here in
+        // every build (not debug-only — it returns a real `PipelineError`) while
+        // `steps` is still alive, before it is consumed by
         // `build_worker_storage` below. Test chains use CountBounded/Unbounded
         // but do not arm the monitor, so this only fires for a fail-fast run.
         if deadlock_timeout_secs > 0 && stats_arc.is_some() {
@@ -852,11 +936,23 @@ impl Pipeline {
             .map(|step| {
                 let initial = match step.profile().kind {
                     StepKind::Parallel => n_threads,
-                    StepKind::Serial | StepKind::Exclusive => 1,
+                    // `Detached` runs on a single dedicated thread, so (like
+                    // `Serial`/`Exclusive`) exactly one finisher closes its
+                    // output edge.
+                    StepKind::Serial | StepKind::Exclusive | StepKind::Detached => 1,
                 };
                 StepDrainCounter::new(initial)
             })
             .collect();
+
+        // 3a. Extract `Detached` steps' real instances for their dedicated
+        // threads, leaving same-position placeholders so `build_worker_storage`
+        // (which Skips Detached on every worker) and the `step_idx`-aligned
+        // `ChainContexts` stay correct. The contexts were already built from
+        // `&steps` above, so each extracted step's input/output handles live in
+        // `contexts[step_idx]`. Done before `build_worker_storage` consumes
+        // `steps`. Empty for every non-sort chain (nothing declares Detached).
+        let detached_steps = extract_detached_steps(&mut steps);
 
         // 4. Build per-worker step storage (consumes `steps`).
         let mut worker_entries = build_worker_storage(steps, &owners, n_threads);
@@ -927,6 +1023,95 @@ impl Pipeline {
                 (None, None)
             };
 
+        // 4c. Optional occupancy sampler (`--pipeline-trace`). Polls each
+        // byte-bounded edge's depth into its `EdgeMetrics` histogram on a fixed
+        // cadence. Runs whenever instrumentation samples AND there are edges to
+        // sample (`contexts.edges` is empty at level `Off` and on the fused
+        // single-thread fast path, so this stays inert there). Read-only over
+        // the live queues — never perturbs the worker hot path.
+        let (sampler_stop, sampler_handle) =
+            if config.instrumentation.samples() && !contexts.edges.is_empty() {
+                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let stop_clone = Arc::clone(&stop);
+                let contexts_clone = Arc::clone(&contexts);
+                // Timeline TSV path only when the level requests it.
+                let trace_path = if config.instrumentation.timeline() {
+                    Some(
+                        config
+                            .trace_path
+                            .clone()
+                            .unwrap_or_else(|| std::path::PathBuf::from("pipeline-trace.tsv")),
+                    )
+                } else {
+                    None
+                };
+                let handle = thread::Builder::new()
+                    .name("fgumi-occupancy-sampler".to_string())
+                    .spawn(move || {
+                        crate::runtime::sampler::run_occupancy_sampler(
+                            &stop_clone,
+                            &contexts_clone.edges,
+                            crate::runtime::sampler::DEFAULT_SAMPLE_INTERVAL,
+                            trace_path,
+                        );
+                    })
+                    .expect("failed to spawn occupancy sampler thread");
+                (Some(stop), Some(handle))
+            } else {
+                (None, None)
+            };
+
+        // 4d. Spawn one dedicated OS thread per `Detached` driver GROUP, in chain
+        // order, BEFORE the workers — same lifecycle slot as the monitor /
+        // rebalancer / sampler. Each thread drives its group with the SAME
+        // `run_worker_loop` the pool uses (via `run_detached_driver`), off the
+        // work-stealing pool, so a Detached step never consumes a pool worker
+        // slot (the "N + 2" threading). A group with one step is the legacy
+        // one-thread-per-detached-step case (`DetachedGroup::PerStep`); a
+        // `Shared` group co-locates several steps on one driver thread. Joined
+        // after the workers (step 6d). Empty for every non-sort chain, so this
+        // is a no-op there.
+        let detached_handles: Vec<thread::JoinHandle<()>> = detached_steps
+            .into_iter()
+            .map(|group| {
+                let contexts_clone = Arc::clone(&contexts);
+                let signal_clone = Arc::clone(&signal_arc);
+                let drain_counters_clone: Vec<Arc<StepDrainCounter>> =
+                    drain_counters.iter().map(Arc::clone).collect();
+                let stats_clone = stats_arc.as_ref().map(Arc::clone);
+                let thread_name = match group.label() {
+                    DetachedGroup::Shared(label) => format!("fgumi-driver-{label}"),
+                    DetachedGroup::PerStep => {
+                        format!("fgumi-detached-{}", group.primary_name())
+                    }
+                };
+                thread::Builder::new()
+                    .name(thread_name)
+                    .spawn(move || {
+                        // Catch a driver-thread panic so we can signal
+                        // cancellation before unwinding — a wedged pool worker
+                        // parked on this group's (now-dead) edge only exits on
+                        // `is_done()`. Re-raise after signalling so the join in
+                        // step 6d still collects the payload.
+                        if let Err(panic) =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                run_detached_driver(
+                                    group,
+                                    &contexts_clone,
+                                    &drain_counters_clone,
+                                    &signal_clone,
+                                    stats_clone.as_ref(),
+                                );
+                            }))
+                        {
+                            signal_clone.cancel();
+                            std::panic::resume_unwind(panic);
+                        }
+                    })
+                    .expect("failed to spawn detached driver thread")
+            })
+            .collect();
+
         // Holds the first worker panic payload; re-raised after helper threads
         // are cleaned up so monitor/rebalancer shutdown always executes.
         let mut worker_panic: Option<Box<dyn std::any::Any + Send>> = None;
@@ -972,6 +1157,7 @@ impl Pipeline {
                     &drain_counters,
                     &signal_arc,
                     stats_arc.as_ref(),
+                    scheduler.as_ref(),
                 );
             })) {
                 signal_arc.cancel();
@@ -991,6 +1177,7 @@ impl Pipeline {
                 let drain_counters_clone: Vec<Arc<StepDrainCounter>> =
                     drain_counters.iter().map(Arc::clone).collect();
                 let stats_clone = stats_arc.as_ref().map(Arc::clone);
+                let scheduler_clone = Arc::clone(&scheduler);
 
                 let handle = thread::Builder::new()
                     .name(format!("fgumi-worker-{worker_id}"))
@@ -1016,6 +1203,7 @@ impl Pipeline {
                                     &drain_counters_clone,
                                     &signal_clone,
                                     stats_clone.as_ref(),
+                                    scheduler_clone.as_ref(),
                                 );
                             }))
                         {
@@ -1034,6 +1222,21 @@ impl Pipeline {
                     if worker_panic.is_none() {
                         worker_panic = Some(panic);
                     }
+                }
+            }
+        }
+
+        // 6d. Join the Detached step threads (after the workers). The sort
+        // writer (Detached, consuming the pool's Compress output) and merge
+        // (Detached, producing to the pool's Serialize input) finish their final
+        // flush only after their pool peers have drained, so joining them here —
+        // after the worker join, before the monitor stop — captures the full
+        // chain completion (and any Detached-thread panic) in the same deferred
+        // re-raise path the workers use. A no-op when no step is Detached.
+        for h in detached_handles {
+            if let Err(panic) = h.join() {
+                if worker_panic.is_none() {
+                    worker_panic = Some(panic);
                 }
             }
         }
@@ -1058,13 +1261,27 @@ impl Pipeline {
             let _ = handle.join();
         }
 
+        if let Some(stop) = sampler_stop {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(handle) = sampler_handle {
+            let _ = handle.join();
+        }
+
         // 6c. End-of-run stats snapshot — emitted at info-level so
         // bench profiling can see which step accumulated the most
         // wall-clock time inside `try_run`. Only logged when stats
         // were enabled (`with_stats(...)` on the config); cheap
         // either way.
         if let Some(stats) = stats_arc.as_ref() {
-            let snapshot = stats.snapshot();
+            // When instrumentation is on, fold the per-edge table + bottleneck
+            // verdict into the snapshot (the edges live in `contexts`, only
+            // reachable here inside `run`); otherwise the edge-less snapshot.
+            let snapshot = if config.instrumentation.is_on() {
+                stats.snapshot_with_edges(&contexts.edges, stats.elapsed_ns())
+            } else {
+                stats.snapshot()
+            };
             log::info!("Pipeline end-of-run stats:");
             for line in format!("{snapshot}").lines() {
                 log::info!("{line}");
@@ -1552,10 +1769,39 @@ mod tests {
     use super::*;
     use std::io;
 
+    use rstest::rstest;
+
     use crate::outputs::Single;
     use crate::queues::QueueSpec;
     use crate::reorder::BranchOrdering;
     use crate::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
+
+    // Each case pins one level's (is_on/samples, timeline, deep) predicates, so a
+    // failure identifies the specific level that regressed. `samples()` tracks
+    // `is_on()`, so the two share the `is_on` column.
+    #[rstest]
+    #[case(InstrumentationLevel::Off, false, false, false)]
+    #[case(InstrumentationLevel::Summary, true, false, false)]
+    #[case(InstrumentationLevel::Timeline, true, true, false)]
+    #[case(InstrumentationLevel::Deep, true, true, true)]
+    fn instrumentation_level_predicates(
+        #[case] level: InstrumentationLevel,
+        #[case] is_on: bool,
+        #[case] timeline: bool,
+        #[case] deep: bool,
+    ) {
+        assert_eq!(level.is_on(), is_on);
+        assert_eq!(level.samples(), is_on);
+        assert_eq!(level.timeline(), timeline);
+        assert_eq!(level.deep(), deep);
+    }
+
+    #[test]
+    fn instrumentation_defaults_are_off() {
+        assert_eq!(InstrumentationLevel::default(), InstrumentationLevel::Off);
+        assert_eq!(PipelineConfig::default().instrumentation, InstrumentationLevel::Off);
+        assert!(PipelineConfig::default().trace_path.is_none());
+    }
 
     #[test]
     fn apply_initial_queue_budget_sets_registered_reorder_cap() {
@@ -1986,9 +2232,8 @@ mod tests {
                 // ordinal and retry it on a later tick. Holding a claimed item
                 // counts as progress per the `StepOutcome` contract ("pushed or
                 // held an item" — see `step.rs`) and matches the production
-                // held-slot sources (`sort::merge` / `sort::and_spill`), so the
-                // scheduler's deadlock accounting sees the claim as forward
-                // motion rather than a stall.
+                // held-slot source (`sort::merge`), so the scheduler's deadlock
+                // accounting sees the claim as forward motion rather than a stall.
                 if ctx.outputs.push(n).is_ok() {
                     Ok(StepOutcome::Progress)
                 } else {
@@ -2068,6 +2313,114 @@ mod tests {
         let result = pipeline.run(PipelineConfig { threads: 4, ..Default::default() });
         assert!(result.is_ok(), "run failed: {:?}", result.err());
         assert_eq!(received.load(AtomicOrd::Relaxed), 50);
+    }
+
+    /// A `u32 -> u32` pass-through step that runs on a dedicated Detached
+    /// thread. Pops one item per `try_run`, pushes it on (holding on
+    /// output-full backpressure), finishes once its input drains.
+    #[derive(Clone)]
+    struct DetachedPassThrough {
+        held: Option<u32>,
+    }
+    impl Step for DetachedPassThrough {
+        type Input = u32;
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "DetachedPassThrough",
+                kind: StepKind::Detached,
+                sticky: false,
+                output_queues: vec![QueueSpec::CountBounded { capacity: 8 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            if let Some(v) = self.held.take() {
+                if ctx.outputs.push(v).is_err() {
+                    self.held = Some(v);
+                    return Ok(StepOutcome::Contention);
+                }
+                return Ok(StepOutcome::Progress);
+            }
+            match ctx.input.pop() {
+                Some(v) => match ctx.outputs.push(v) {
+                    Ok(()) => Ok(StepOutcome::Progress),
+                    Err(unpushed) => {
+                        self.held = Some(unpushed.into_item());
+                        Ok(StepOutcome::Contention)
+                    }
+                },
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+    }
+
+    /// L2.3: a `source(Parallel) -> passthrough(Detached) -> sink(Parallel)`
+    /// chain runs to completion at `--threads 4` with the Detached step on its
+    /// own dedicated thread (off the pool). All N items flow through.
+    #[test]
+    fn detached_step_runs_and_drains_multithreaded() {
+        let remaining = Arc::new(AtomicU32::new(200));
+        let received = Arc::new(AtomicU32::new(0));
+
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(SharedCountingSource { remaining: Arc::clone(&remaining) })
+            .chain(DetachedPassThrough { held: None })
+            .chain(ParallelCountingSink { received: Arc::clone(&received) })
+            .into_sink_marker();
+        let pipeline = builder.build().unwrap();
+
+        let result = pipeline.run(PipelineConfig { threads: 4, ..Default::default() });
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+        assert_eq!(
+            received.load(AtomicOrd::Relaxed),
+            200,
+            "all items flowed through Detached step"
+        );
+    }
+
+    /// L2.3: a chain with a Detached step and ZERO items (source finishes
+    /// immediately) cleanly drains the Detached thread and the run completes.
+    #[test]
+    fn detached_step_zero_items_run_completes() {
+        let remaining = Arc::new(AtomicU32::new(0));
+        let received = Arc::new(AtomicU32::new(0));
+
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(SharedCountingSource { remaining: Arc::clone(&remaining) })
+            .chain(DetachedPassThrough { held: None })
+            .chain(ParallelCountingSink { received: Arc::clone(&received) })
+            .into_sink_marker();
+        let pipeline = builder.build().unwrap();
+
+        let result = pipeline.run(PipelineConfig { threads: 4, ..Default::default() });
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+        assert_eq!(received.load(AtomicOrd::Relaxed), 0);
+    }
+
+    /// L2.3 step 7: at `--threads 1` the fusible linear chain runs the Detached
+    /// step **inline** in the fused single-thread driver — no dedicated thread
+    /// is spawned (the fused path returns before `extract_detached_steps`), yet
+    /// the Detached step still drives to completion.
+    #[test]
+    fn detached_collapses_inline_at_t1() {
+        let remaining = Arc::new(AtomicU32::new(30));
+        let received = Arc::new(AtomicU32::new(0));
+
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(SharedCountingSource { remaining: Arc::clone(&remaining) })
+            .chain(DetachedPassThrough { held: None })
+            .chain(ParallelCountingSink { received: Arc::clone(&received) })
+            .into_sink_marker();
+        let pipeline = builder.build().unwrap();
+
+        let result = pipeline.run(PipelineConfig { threads: 1, ..Default::default() });
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+        assert_eq!(received.load(AtomicOrd::Relaxed), 30);
     }
 
     /// Sink whose worker loop panics the moment it pops an item — used to drive
@@ -2445,6 +2798,35 @@ mod tests {
         assert_eq!(classify_stall(false, 60, 10, 60, 4096), StallVerdict::Wedged);
     }
 
+    /// L2.4: a Detached step legitimately blocked on EMPTY input (slow upstream)
+    /// must NOT trip the monitor. The Detached merge's data flows through the
+    /// internal `SortMergeSlot` table — invisible to `in_flight_bytes` — and its
+    /// framework input edge (setup events) is drained early, so while it waits
+    /// for decompress the byte-bounded edges feeding it are EMPTY:
+    /// `in_flight_bytes == 0` → `Starving` (progress-shaped), never `Wedged`,
+    /// no matter how long the wait. The starvation guard already encodes this;
+    /// this test pins the Detached interpretation against a regression.
+    #[test]
+    fn monitor_no_false_positive_on_idle_detached() {
+        // Long stall, well past the fatal threshold, but nothing is stuck on a
+        // visible byte-bounded edge (the Detached step is parked on its empty
+        // input). Must be Starving, not Wedged.
+        assert_eq!(classify_stall(false, 600, 10, 60, 0), StallVerdict::Starving);
+        // And the instant the slow producer feeds it, global progress advances.
+        assert_eq!(classify_stall(true, 600, 10, 60, 0), StallVerdict::Progressing);
+    }
+
+    /// L2.4 (revision item 10): a *genuine* wedge of the Detached merge still
+    /// trips fatal. If the merge is truly stuck, its pool upstream (decompress)
+    /// can't push to the full slots either, so the byte-bounded spill→decompress
+    /// edge stays FULL with no progress — `in_flight_bytes > 0` past the fatal
+    /// window → `Wedged`. The slot-table blindness does not hide a real wedge,
+    /// because the upstream byte edge always reflects it.
+    #[test]
+    fn monitor_still_trips_on_genuine_detached_wedge() {
+        assert_eq!(classify_stall(false, 60, 10, 60, 1_048_576), StallVerdict::Wedged);
+    }
+
     /// A step with a single output branch of the given `QueueSpec`, used to
     /// exercise the monitor-visibility transport check.
     fn step_with_output_spec(
@@ -2718,12 +3100,22 @@ mod tests {
             handle,
             reorder_cap: Some(cap),
         };
-        let contexts = ChainContexts { inputs: vec![], outputs: vec![], bounded_queues: vec![rq] };
+        let contexts = ChainContexts {
+            inputs: vec![],
+            outputs: vec![],
+            bounded_queues: vec![rq],
+            edges: vec![],
+        };
         // 200 (transport) + 300 (reorder stash).
         assert_eq!(in_flight_bytes(&contexts), 500);
 
         // An empty registry reads zero — the starvation (idle) signal.
-        let empty = ChainContexts { inputs: vec![], outputs: vec![], bounded_queues: vec![] };
+        let empty = ChainContexts {
+            inputs: vec![],
+            outputs: vec![],
+            bounded_queues: vec![],
+            edges: vec![],
+        };
         assert_eq!(in_flight_bytes(&empty), 0);
     }
 }

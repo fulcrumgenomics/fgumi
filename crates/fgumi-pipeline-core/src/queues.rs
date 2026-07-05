@@ -22,9 +22,11 @@
 //!     end-of-stream. Once both are true, no further items will arrive.
 
 use crossbeam_queue::{ArrayQueue, SegQueue};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::item::HeapSize;
+use super::runtime::metrics::EdgeMetrics;
 
 /// Transport-layer queue trait. Type-uniform across queue impls: the
 /// `try_push` surface accepts any `T` regardless of whether the impl uses
@@ -83,6 +85,10 @@ pub enum QueueSpec {
 pub struct CountBoundedQueue<T: Send + 'static> {
     inner: ArrayQueue<T>,
     drained: AtomicBool,
+    /// `Some` only on an instrumented edge (`--pipeline-trace`); `None` keeps the
+    /// hot path metric-free. Producer-push counts are recorded here; consumer-pop
+    /// counts are recorded at the `BranchInputHandle` (see `handles.rs`).
+    metrics: Option<Arc<EdgeMetrics>>,
 }
 
 impl<T: Send + 'static> CountBoundedQueue<T> {
@@ -93,8 +99,34 @@ impl<T: Send + 'static> CountBoundedQueue<T> {
     /// Panics if `capacity == 0` (a zero-capacity queue would always reject).
     #[must_use]
     pub fn new(capacity: usize) -> Self {
+        Self::build(capacity, None)
+    }
+
+    /// Like [`new`](Self::new) but recording producer-push metrics into `metrics`
+    /// (an instrumented edge). The non-blocking `try_*` surface is unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity == 0`.
+    #[must_use]
+    pub fn new_instrumented(capacity: usize, metrics: Arc<EdgeMetrics>) -> Self {
+        Self::build(capacity, Some(metrics))
+    }
+
+    /// [`new`](Self::new) when `metrics` is `None`, [`new_instrumented`](Self::new_instrumented)
+    /// when `Some`. Lets branch builders thread an optional metrics handle uniformly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity == 0`.
+    #[must_use]
+    pub fn maybe_instrumented(capacity: usize, metrics: Option<Arc<EdgeMetrics>>) -> Self {
+        Self::build(capacity, metrics)
+    }
+
+    fn build(capacity: usize, metrics: Option<Arc<EdgeMetrics>>) -> Self {
         assert!(capacity > 0, "CountBoundedQueue capacity must be > 0");
-        Self { inner: ArrayQueue::new(capacity), drained: AtomicBool::new(false) }
+        Self { inner: ArrayQueue::new(capacity), drained: AtomicBool::new(false), metrics }
     }
 }
 
@@ -104,11 +136,21 @@ impl<T: Send + 'static> ItemQueue<T> for CountBoundedQueue<T> {
             !self.drained.load(Ordering::Acquire),
             "try_push after mark_drained — producer contract violation"
         );
-        self.inner.push(item)
+        if let Err(item) = self.inner.push(item) {
+            if let Some(m) = &self.metrics {
+                m.record_reject();
+            }
+            return Err(item);
+        }
+        if let Some(m) = &self.metrics {
+            m.record_push(0); // count-bounded: items only, no byte size
+        }
+        Ok(())
     }
 
     fn try_pop(&self) -> Option<T> {
-        self.inner.pop()
+        let item = self.inner.pop()?;
+        Some(item)
     }
 
     fn is_empty(&self) -> bool {
@@ -192,6 +234,10 @@ pub struct ByteBoundedQueue<T: Send + HeapSize + 'static> {
     /// long-lived host / test harness) after the first occurrence. The hot-path
     /// cost is a single relaxed swap after the first hit.
     slot_cap_warned: AtomicBool,
+    /// `Some` only on an instrumented edge; producer-push (items + bytes) and
+    /// rejections are recorded here. Consumer-pop is recorded at the
+    /// `BranchInputHandle` (see `handles.rs`).
+    metrics: Option<Arc<EdgeMetrics>>,
 }
 
 impl<T: Send + HeapSize + 'static> ByteBoundedQueue<T> {
@@ -202,6 +248,32 @@ impl<T: Send + HeapSize + 'static> ByteBoundedQueue<T> {
     /// Panics if `limit_bytes == 0` (a zero-budget queue would always reject).
     #[must_use]
     pub fn new(limit_bytes: u64) -> Self {
+        Self::build(limit_bytes, None)
+    }
+
+    /// Like [`new`](Self::new) but recording producer-push metrics (items + bytes
+    /// + rejections) into `metrics`. Byte-budget semantics unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limit_bytes == 0`.
+    #[must_use]
+    pub fn new_instrumented(limit_bytes: u64, metrics: Arc<EdgeMetrics>) -> Self {
+        Self::build(limit_bytes, Some(metrics))
+    }
+
+    /// [`new`](Self::new) when `metrics` is `None`, [`new_instrumented`](Self::new_instrumented)
+    /// when `Some`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limit_bytes == 0`.
+    #[must_use]
+    pub fn maybe_instrumented(limit_bytes: u64, metrics: Option<Arc<EdgeMetrics>>) -> Self {
+        Self::build(limit_bytes, metrics)
+    }
+
+    fn build(limit_bytes: u64, metrics: Option<Arc<EdgeMetrics>>) -> Self {
         assert!(limit_bytes > 0, "ByteBoundedQueue limit_bytes must be > 0");
         Self {
             inner: ArrayQueue::new(BYTE_BOUNDED_QUEUE_SLOT_CAPACITY),
@@ -209,6 +281,7 @@ impl<T: Send + HeapSize + 'static> ByteBoundedQueue<T> {
             limit_bytes: AtomicU64::new(limit_bytes),
             drained: AtomicBool::new(false),
             slot_cap_warned: AtomicBool::new(false),
+            metrics,
         }
     }
 
@@ -286,6 +359,9 @@ impl<T: Send + HeapSize + 'static> ItemQueue<T> for ByteBoundedQueue<T> {
         let cur = self.current_bytes.load(Ordering::Relaxed);
         let limit = self.limit_bytes.load(Ordering::Relaxed);
         if cur >= limit {
+            if let Some(m) = &self.metrics {
+                m.record_reject();
+            }
             return Err(item);
         }
         let size = item.heap_size() as u64;
@@ -298,10 +374,18 @@ impl<T: Send + HeapSize + 'static> ItemQueue<T> for ByteBoundedQueue<T> {
         // the slot cap should never be hit before the byte budget triggers a
         // reject above, but defend against it anyway.)
         match self.inner.push((item, size)) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if let Some(m) = &self.metrics {
+                    m.record_push(size);
+                }
+                Ok(())
+            }
             Err((item, _size)) => {
                 // Roll back the byte reservation — the item never entered the queue.
                 self.current_bytes.fetch_sub(size, Ordering::Relaxed);
+                if let Some(m) = &self.metrics {
+                    m.record_reject();
+                }
                 // The fixed 1024-slot backing was hit before the byte budget.
                 // This degrades byte-backpressure into a hard count cap for
                 // small items (heap_size ≲ limit/1024) — correctness is
@@ -347,12 +431,31 @@ impl<T: Send + HeapSize + 'static> ItemQueue<T> for ByteBoundedQueue<T> {
 pub struct UnboundedQueue<T: Send + 'static> {
     inner: SegQueue<T>,
     drained: AtomicBool,
+    /// `Some` only on an instrumented edge; producer-push items are recorded
+    /// here (unbounded → never rejects, no byte tracking). Consumer-pop is at the
+    /// `BranchInputHandle`.
+    metrics: Option<Arc<EdgeMetrics>>,
 }
 
 impl<T: Send + 'static> UnboundedQueue<T> {
     #[must_use]
     pub fn new() -> Self {
-        Self { inner: SegQueue::new(), drained: AtomicBool::new(false) }
+        Self { inner: SegQueue::new(), drained: AtomicBool::new(false), metrics: None }
+    }
+
+    /// Like [`new`](Self::new) but recording producer-push item counts into
+    /// `metrics`. Unbounded edges have no byte budget and never reject; depth is
+    /// reported as raw length only.
+    #[must_use]
+    pub fn new_instrumented(metrics: Arc<EdgeMetrics>) -> Self {
+        Self { inner: SegQueue::new(), drained: AtomicBool::new(false), metrics: Some(metrics) }
+    }
+
+    /// [`new`](Self::new) when `metrics` is `None`, [`new_instrumented`](Self::new_instrumented)
+    /// when `Some`.
+    #[must_use]
+    pub fn maybe_instrumented(metrics: Option<Arc<EdgeMetrics>>) -> Self {
+        Self { inner: SegQueue::new(), drained: AtomicBool::new(false), metrics }
     }
 }
 
@@ -369,6 +472,9 @@ impl<T: Send + 'static> ItemQueue<T> for UnboundedQueue<T> {
             "try_push after mark_drained — producer contract violation"
         );
         self.inner.push(item);
+        if let Some(m) = &self.metrics {
+            m.record_push(0);
+        }
         Ok(())
     }
 
@@ -520,5 +626,57 @@ mod tests {
         for i in 0..1024 {
             assert!(q.try_push(i).is_ok());
         }
+    }
+
+    // ── Per-edge metrics (L2-instrumentation Task 2) ─────────────────────────
+
+    #[test]
+    fn instrumented_queue_counts_push_and_reject() {
+        let m = EdgeMetrics::new();
+        let q = CountBoundedQueue::<u32>::new_instrumented(1, Arc::clone(&m));
+        assert!(q.try_push(1).is_ok());
+        assert_eq!(q.try_push(2), Err(2)); // full (cap 1) → reject
+        let s = m.snapshot();
+        assert_eq!(s.pushed_items, 1, "one successful push");
+        assert_eq!(s.push_rejections, 1, "one rejection");
+        // Producer-push only at this layer; pop is counted at the input handle.
+        assert_eq!(s.popped_items, 0);
+    }
+
+    #[test]
+    fn byte_bounded_instrumented_push_bytes_and_depth() {
+        let m = EdgeMetrics::new();
+        let q = ByteBoundedQueue::<Heavy>::new_instrumented(1000, Arc::clone(&m));
+        q.try_push(Heavy(vec![0; 200])).unwrap();
+        let s = m.snapshot();
+        assert_eq!(s.pushed_items, 1);
+        assert_eq!(s.pushed_bytes, 200);
+    }
+
+    #[test]
+    fn byte_bounded_instrumented_counts_reject() {
+        // The byte-budget reject path increments push_rejections (distinct from
+        // the CountBounded slot reject above). Fill to budget, then a push rejects.
+        let m = EdgeMetrics::new();
+        let q = ByteBoundedQueue::<Heavy>::new_instrumented(100, Arc::clone(&m));
+        q.try_push(Heavy(vec![0; 200])).unwrap(); // accepted (cur<limit on empty), now over budget
+        assert!(q.try_push(Heavy(vec![0; 1])).is_err(), "at/over budget rejects");
+        let s = m.snapshot();
+        assert_eq!(s.pushed_items, 1);
+        assert_eq!(s.push_rejections, 1, "byte-budget reject counted");
+    }
+
+    #[test]
+    fn non_instrumented_queue_has_no_metrics() {
+        // Hot-path guard: a plain `new` queue is metric-free (one nullable
+        // branch, no atomics).
+        assert!(CountBoundedQueue::<u32>::new(4).metrics.is_none());
+        assert!(ByteBoundedQueue::<Heavy>::new(100).metrics.is_none());
+        assert!(UnboundedQueue::<u32>::new().metrics.is_none());
+        // And instrumented constructors do attach metrics.
+        assert!(
+            CountBoundedQueue::<u32>::new_instrumented(4, EdgeMetrics::new()).metrics.is_some()
+        );
+        assert!(UnboundedQueue::<u32>::new_instrumented(EdgeMetrics::new()).metrics.is_some());
     }
 }
