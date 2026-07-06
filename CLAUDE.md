@@ -181,6 +181,44 @@ of records) and a safe rewrite measurably regresses sort throughput.
   `RawQuerynameKey::new`).
 - **`crates/fgumi-sort/src/radix.rs`** — internal radix-sort helpers; see file
   comments for the `SAFETY:` invariants.
+- **`crates/fgumi-sort/src/ref_sort.rs`** — one `#[allow(unsafe_code)]` site in
+  `sort_coordinate_refs`: a pointer cast reinterpreting `&mut [RecordRef]` as
+  `&mut [CoordSortRef]` to feed the parallel `voracious_mt_sort` radix on the
+  large-input / multi-thread coordinate path. SAFETY: `CoordSortRef` is
+  `#[repr(transparent)]` over `RecordRef`, so the two have identical size,
+  alignment, and layout; the pointer cast (clippy rejects a ref-to-ref
+  `transmute`) is sound. This is approved for the same reason as the other sort
+  hot paths — it runs once per coordinate sort over millions of record refs, and
+  the parallel radix is measurably (~4×) faster than the safe single-threaded
+  fallback; both produce byte-identical output (verified by the ref-sort oracle
+  proptests).
+- **`crates/fgumi-sort/src/segmented_buf.rs`** — two `#[allow(unsafe_code)]`
+  sites backing the arena record buffer (a segmented, append-only `Vec<u8>` the
+  sort engine decompresses/frames records into without per-record allocation):
+  - `grow_uninit` (≈line 207) — grows a segment's live `len` over
+    reserved-but-uninitialized bytes via `Vec::set_len` (after `reserve`), to skip
+    zero-filling the slot on the ingest hot path. SAFETY: after `reserve(additional)`,
+    `capacity() >= new_len`, so `set_len(new_len)` only extends `len` over
+    already-allocated bytes; `u8` has no drop glue and no validity invariant, so
+    growing `len` over uninitialized bytes is not itself UB — the documented contract
+    requires the caller to fully write the grown `[old_len, new_len)` region (via
+    `slice_mut`) before any read, and a read-before-write is the only UB, which the
+    contract forbids. Pointer stability is a *separate* invariant: this `reserve`
+    MAY reallocate and move the segment, so no `slice_mut` borrow may be live across
+    a `grow_uninit` — the borrow checker enforces this in the single-threaded case
+    (`&mut self`), and the concurrent-inflate path first calls
+    `reserve_full_capacity` once per fresh segment so the per-slot `reserve` is a
+    no-op (it does NOT rely on `reserve` alone for stability).
+  - `slice_mut` (≈line 267) — synthesizes a `&mut [u8]` slot from a shared `&self`
+    (so disjoint slots can be written concurrently by different workers). SAFETY:
+    the asserted `seg_offset + len <= seg.len()` keeps the range inside the
+    segment's live region (in-bounds pointer + length); the `&mut` is sound only
+    under the caller's disjointness contract — each call's range must not overlap
+    any other concurrently-borrowed range — so the produced `&mut` aliases no
+    other `&`/`&mut`. Approved for the same reason as the other sort hot paths:
+    ingest runs once per record over millions-to-billions of records, and a safe
+    rewrite (zero-fill on grow, or an owning `Vec` per slot) measurably regresses
+    sort throughput.
 
 ### Approved natural-order comparator (fgumi-raw-bam)
 

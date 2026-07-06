@@ -568,27 +568,28 @@ pub(crate) struct Phase2Reader {
 /// be reading, decompressing, and the main thread can be popping records all
 /// concurrently as long as they touch different sub-states.
 ///
-/// # Two Phase-2 merge implementations (deliberate split — see commit `9d6d7e9` / PR #395)
+/// # Two Phase-2 merge implementations (production vs. the retained oracle)
 ///
-/// This pool path drives standalone file-to-file `fgumi sort` (it keeps the
-/// engine, zstd spill, `--write-index`, and `--verify`). A SECOND, slimmer
-/// Phase-2 lives in `merge_slots.rs` (`SortMergeSlot`) for the fused in-pipeline
-/// `runall` sort. That path REMOVED the `raw_blocks` FIFO, `decomp_in_flight`,
-/// the reorder buffer, and the gap-filler because its cooperative-step consumer
-/// deadlocked at production scale (see its module header).
+/// Since the P6/P7 sort unification (#395), the `fgumi` production sort — both
+/// standalone `fgumi sort` and the fused `runall` sort — runs entirely on the
+/// buffer chain, whose Phase-2 is `merge_slots.rs` (`SortMergeSlot`). THIS pool
+/// path no longer drives any production sort; it is retained as the
+/// `RawExternalSorter::sort` library entry point and the `#[cfg(test)]` parity
+/// oracle (the byte-for-byte cross-check the buffer chain is verified against),
+/// keeping the engine, zstd spill, `--write-index`, and `--verify`.
 ///
-/// This pool path is IMMUNE to that v4 deadlock: its merge consumer is a parked
-/// OS thread (`external.rs::advance_to_next_block`), not a framework step the
-/// engine can Skip; and its single-reader gapless-FIFO serials guarantee the
-/// stuck serial is always either at the `raw_blocks` head (so the gap-filler
-/// fires) or in-flight in a worker's decompressor. Do NOT delete the gap-filler
-/// or the reorder buffer to "match" `merge_slots` — single-*reader* is not
-/// single-*decompressor* here (workers decompress in parallel, so completion
-/// order ≠ pop order), and removing them reintroduces a real deadlock and/or
-/// out-of-order merge output. The split is intentional and deferred-for-now
-/// (see commit `9c39dea` / PR #389 and
-/// `docs/design/sort-phase2-unification-deferral.md`).
-// TODO(#395): unify the two Phase-2 sort drivers — see docs/design/sort-phase2-unification-deferral.md
+/// The two implementations differ deliberately, and that difference is
+/// load-bearing for the oracle. This path keeps the `raw_blocks` FIFO,
+/// `decomp_in_flight`, the reorder buffer, and the gap-filler because its merge
+/// consumer is a parked OS thread (`external.rs::advance_to_next_block`, immune
+/// to the v4 framework-Skip deadlock) and its single-*reader* /
+/// multi-*decompressor* topology means completion order ≠ pop order. The
+/// slimmer `merge_slots.rs` dropped all four because its consumer reads AND
+/// decompresses in one inline op (blocks decompress strictly in read order, so
+/// a plain FIFO suffices). Do NOT delete the gap-filler or the reorder buffer
+/// here to "match" `merge_slots` — it would reintroduce a real deadlock and/or
+/// out-of-order merge output. (History: commits `9d6d7e9` / `9c39dea`, PRs
+/// #389 / #395, `docs/design/sort-phase2-unification-deferral.md`.)
 pub(crate) struct Phase2FileState {
     /// Disk reader. Held only while popping bytes from disk.
     pub(crate) reader: Mutex<Phase2Reader>,
@@ -1919,6 +1920,11 @@ impl SortWorkerPool {
     /// early misdirected wake is
     /// harmless as long as a later `unpark` arrives — which it always does
     /// (every subsequent block publish + the terminal drain/EOF unpark).
+    ///
+    /// Now exercised only by this module's unit tests: its production caller was
+    /// the streaming `*SortStream::into_slot_setup`, retired in P7. Retained as a
+    /// tested pool primitive (the `.sort()` oracle never needed to re-target).
+    #[allow(dead_code)]
     pub fn set_main_thread(&self, handle: std::thread::Thread) {
         self.shared.main_thread_handle.store(std::sync::Arc::new(handle));
     }
