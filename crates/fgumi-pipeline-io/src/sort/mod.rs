@@ -1,75 +1,41 @@
 //! Sort typed-steps for the unified pipeline.
 
-pub mod and_spill;
+/// `DetachedGroup::Shared` label for the sort's **coordination** driver thread:
+/// the serial phase-1 coordination steps (`ReadBlocks` admit, `FindBoundariesAndSort`
+/// sort/seal, `SpillGather` framing) plus the phase-2 `SortMerge`. One dedicated
+/// thread runs all of them off the pool — the true N+2 model (mirrors main's
+/// single main thread). Phase 1 and phase 2 are temporally disjoint, so the
+/// coordination steps finish and leave the driver's live set before the merge
+/// runs, giving the merge a dedicated thread in phase 2.
+pub const SORT_COORD_GROUP: &str = "sort-coord";
+
+/// `DetachedGroup::Shared` label for the sort's **I/O writer** driver thread:
+/// `SpillWrite` (phase 1) and `WriteBgzfFile` (phase 2). Isolated from the
+/// coordination driver so a write flush never stalls coordination (main's reason
+/// for the second dedicated thread).
+pub const SORT_IO_GROUP: &str = "sort-io";
+
+pub mod arena_ingest;
+pub mod compress_spill;
 pub mod merge;
 pub mod protocol;
+pub mod sort_buffer;
+pub mod spill_compress;
 pub mod spill_decompress;
+pub mod spill_gather;
+pub mod spill_write;
 
-pub use and_spill::SortAndSpill;
-pub use merge::SortMerge;
-pub use spill_decompress::SortSpillDecompress;
-
-use std::io;
-use std::path::PathBuf;
-use std::sync::Arc;
-
-use fgumi_sort::RawExternalSorter;
-use parking_lot::Mutex;
-
-use fgumi_pipeline_core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SortBamFile — Exclusive single-step wrapping legacy sort end-to-end.
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// `Exclusive` step that drives a complete legacy
-/// `RawExternalSorter::sort(input, output)` call to completion in a
-/// single `try_run`.
-pub struct SortBamFile {
-    sorter: Option<RawExternalSorter>,
-    input: PathBuf,
-    output: PathBuf,
-    stats_out: Arc<Mutex<Option<fgumi_sort::SortStats>>>,
-}
-
-impl SortBamFile {
-    /// Build a `SortBamFile` step.
-    #[must_use]
-    pub fn new(
-        sorter: RawExternalSorter,
-        input: PathBuf,
-        output: PathBuf,
-        stats_out: Arc<Mutex<Option<fgumi_sort::SortStats>>>,
-    ) -> Self {
-        Self { sorter: Some(sorter), input, output, stats_out }
-    }
-}
-
-impl Step for SortBamFile {
-    type Input = ();
-    type Outputs = ();
-
-    fn profile(&self) -> StepProfile {
-        StepProfile {
-            name: "SortBamFile",
-            kind: StepKind::Exclusive,
-            sticky: false,
-            output_queues: vec![],
-            branch_ordering: vec![],
-        }
-    }
-
-    fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
-        let Some(sorter) = self.sorter.take() else {
-            return Ok(StepOutcome::Finished);
-        };
-        let stats = sorter
-            .sort(&self.input, &self.output)
-            .map_err(|e| io::Error::other(format!("SortBamFile: sort failed: {e:#}")))?;
-        *self.stats_out.lock() = Some(stats);
-        Ok(StepOutcome::Finished)
-    }
-}
+pub use arena_ingest::{
+    ArenaBlock, ArenaSortStrategy, CoordinateStrategy, FindBoundariesAndSort, InflateToArena,
+    InflatedBlock, QuerynameStrategy, ReadBlocks, TemplateStrategy,
+};
+pub use compress_spill::CompressSpill;
+pub use merge::{BlockOutput, MergeBatchBuilder, MergeOutput, RecordBatchOutput, SortMerge};
+pub use sort_buffer::SortBuffer;
+pub use spill_compress::SpillCompress;
+pub use spill_decompress::{SortDecompressTuning, SortSpillDecompress};
+pub use spill_gather::SpillGather;
+pub use spill_write::SpillWrite;
 
 #[cfg(test)]
 pub mod tests;
