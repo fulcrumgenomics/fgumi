@@ -666,6 +666,7 @@ fn writer_loop(
                     record,
                     flags,
                     /* no_suffix */ true,
+                    /* umi_header */ None,
                     &mut seq_buf,
                     &mut qual_buf,
                 ) {

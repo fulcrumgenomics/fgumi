@@ -60,7 +60,7 @@ The commands below are grouped by pipeline stage.
 |-------|---------|-------------|
 | UMI extraction | `extract` | Extract UMIs from FASTQ and create an unmapped BAM |
 | UMI extraction | `correct` | Correct UMIs in a BAM to a fixed set of UMIs |
-| Alignment support | `fastq` | Convert BAM to interleaved FASTQ for an aligner |
+| Alignment support | `fastq` | Convert BAM to FASTQ (interleaved or paired), optionally embedding the UMI in the read name |
 | Alignment support | `zipper` | Merge an aligned BAM with its unmapped BAM, restoring tags |
 | Alignment support | `sort` | Sort by coordinate, queryname, or template-coordinate |
 | Alignment support | `merge` | Merge pre-sorted BAM files into one sorted BAM |

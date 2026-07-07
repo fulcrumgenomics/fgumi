@@ -148,6 +148,8 @@ rstest = "0"
 proptest = "1.10"
 criterion = { version = "0.8", features = ["html_reports"] }
 fgumi-raw-bam = { workspace = true, features = ["test-utils", "noodles"] }
+fgumi-tag = { workspace = true }
+flate2 = { version = "1.1", features = ["zlib-rs"] }
 noodles = { version = "0.111.0", features = ["bam", "sam"] }
 trybuild = "1.0"
 

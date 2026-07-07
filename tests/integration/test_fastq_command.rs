@@ -6,14 +6,57 @@ use clap::Parser;
 use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::fastq::Fastq;
 use fgumi_raw_bam::{SamBuilder, flags};
+use fgumi_tag::SamTag;
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
+
+/// Create a BAM with a single read pair carrying a UMI in the given tag.
+///
+/// `umi_tag` is `None` to write no UMI tag at all (passthrough test).
+fn create_pair_with_umi_tag(path: &Path, name: &str, umi_tag: Option<(SamTag, &str)>) {
+    let header = create_minimal_header("chr1", 10000);
+    let mut writer =
+        bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
+    writer.write_header(&header).expect("Failed to write header");
+
+    for (seq, segment_flag) in
+        [("ACGTACGT", flags::FIRST_SEGMENT), ("TGCATGCA", flags::LAST_SEGMENT)]
+    {
+        let mut b = SamBuilder::new();
+        b.read_name(name.as_bytes())
+            .sequence(seq.as_bytes())
+            .qualities(&[40, 40, 40, 40, 40, 40, 40, 40])
+            .flags(flags::PAIRED | segment_flag)
+            .ref_id(0)
+            .pos(99)
+            .mapq(60);
+        if let Some((tag, value)) = umi_tag {
+            b.add_string_tag(tag, value.as_bytes());
+        }
+        writer
+            .write_alignment_record(&header, &to_record_buf(&b.build()))
+            .expect("Failed to write record");
+    }
+    writer.try_finish().expect("Failed to finish BAM");
+}
+
+/// Run `fgumi fastq` with the given extra args and return parsed FASTQ records.
+fn run_fastq_with_args(input_bam: &Path, extra: &[&str]) -> Vec<(String, String, String)> {
+    let temp = input_bam.parent().expect("parent");
+    let output_fq = temp.join("umi_out.fq");
+    let mut args =
+        vec!["fastq", "-i", input_bam.to_str().unwrap(), "-o", output_fq.to_str().unwrap()];
+    args.extend_from_slice(extra);
+    let cmd = Fastq::try_parse_from(args).expect("failed to parse fastq args");
+    cmd.execute("fgumi fastq").expect("fastq command failed");
+    parse_fastq_records(&output_fq)
+}
 
 /// Create a BAM file with paired-end reads for testing.
 fn create_paired_bam(path: &PathBuf, read_pairs: Vec<(&str, &str, &str, &str, &str, bool)>) {
@@ -368,6 +411,387 @@ fn test_fastq_hex_flags() {
 
     let records = parse_fastq_records(&output_fq);
     assert_eq!(records.len(), 2);
+}
+
+/// `--umi-in-header` with defaults reproduces `samtools fastq -U`: the duplex
+/// UMI stored as `AAAAAAAA-CCCCCCCC` in `RX` becomes `:AAAAAAAA+CCCCCCCC`
+/// appended before the /1 /2 suffix.
+#[test]
+fn test_fastq_umi_in_header_dragen_format() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    create_pair_with_umi_tag(&input_bam, "read1", Some((SamTag::RX, "AAAAAAAA-CCCCCCCC")));
+
+    let records = run_fastq_with_args(&input_bam, &["--annotate-read-names"]);
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].0, "read1:AAAAAAAA+CCCCCCCC/1");
+    assert_eq!(records[1].0, "read1:AAAAAAAA+CCCCCCCC/2");
+}
+
+/// `-n` drops the /1 /2 suffix but keeps the UMI annotation.
+#[test]
+fn test_fastq_umi_in_header_no_suffix() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    create_pair_with_umi_tag(&input_bam, "read1", Some((SamTag::RX, "AAAAAAAA-CCCCCCCC")));
+
+    let records = run_fastq_with_args(&input_bam, &["--annotate-read-names", "-n"]);
+    assert_eq!(records[0].0, "read1:AAAAAAAA+CCCCCCCC");
+    assert_eq!(records[1].0, "read1:AAAAAAAA+CCCCCCCC");
+}
+
+/// Custom delimiters: underscore name separator, empty UMI separator.
+#[test]
+fn test_fastq_umi_in_header_custom_delims() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    create_pair_with_umi_tag(&input_bam, "read1", Some((SamTag::RX, "AAAA-GGGG")));
+
+    let records = run_fastq_with_args(
+        &input_bam,
+        &["--annotate-read-names", "-n", "--umi-name-delim", "_", "--umi-sep", ""],
+    );
+    assert_eq!(records[0].0, "read1_AAAAGGGG");
+}
+
+/// When `RX` is absent the fallback `OX` tag is used (default tag list `RX,OX`).
+#[test]
+fn test_fastq_umi_in_header_ox_fallback() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    create_pair_with_umi_tag(&input_bam, "read1", Some((SamTag::OX, "TTTT-GGGG")));
+
+    let records = run_fastq_with_args(&input_bam, &["--annotate-read-names", "-n"]);
+    assert_eq!(records[0].0, "read1:TTTT+GGGG");
+}
+
+/// With the default tag list `RX,OX`, `RX` takes priority when both are present.
+#[test]
+fn test_fastq_umi_in_header_rx_preferred_over_ox() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    // Write both RX and OX; RX must win.
+    let header = create_minimal_header("chr1", 10000);
+    let mut writer = bam::io::Writer::new(fs::File::create(&input_bam).expect("create BAM"));
+    writer.write_header(&header).expect("write header");
+    let mut b = SamBuilder::new();
+    b.read_name(b"read1")
+        .sequence(b"ACGT")
+        .qualities(&[40, 40, 40, 40])
+        .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+        .ref_id(0)
+        .pos(99)
+        .mapq(60);
+    b.add_string_tag(SamTag::RX, b"RRRR");
+    b.add_string_tag(SamTag::OX, b"OOOO");
+    writer.write_alignment_record(&header, &to_record_buf(&b.build())).expect("write");
+    writer.try_finish().expect("finish");
+
+    let records = run_fastq_with_args(&input_bam, &["--annotate-read-names", "-n"]);
+    assert_eq!(records[0].0, "read1:RRRR");
+}
+
+/// A record with no UMI tag passes through with the name unchanged.
+#[test]
+fn test_fastq_umi_in_header_missing_tag_passthrough() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    create_pair_with_umi_tag(&input_bam, "read1", None);
+
+    let records = run_fastq_with_args(&input_bam, &["--annotate-read-names", "-n"]);
+    assert_eq!(records[0].0, "read1");
+}
+
+/// Without `--umi-in-header`, the tag is ignored and the name is unchanged.
+#[test]
+fn test_fastq_umi_not_in_header_by_default() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    create_pair_with_umi_tag(&input_bam, "read1", Some((SamTag::RX, "AAAA-GGGG")));
+
+    let records = run_fastq_with_args(&input_bam, &["-n"]);
+    assert_eq!(records[0].0, "read1");
+}
+
+/// Read a FASTQ file, transparently decompressing BGZF/gzip (`.gz`/`.bgz`) via
+/// multi-member gzip decoding (BGZF is a series of gzip blocks). Both extensions
+/// trigger BGZF writing on the output side, so the reader honors both.
+fn read_fastq_maybe_gz(path: &Path) -> Vec<(String, String, String)> {
+    let file = fs::File::open(path).expect("open fastq");
+    let is_gz = matches!(path.extension().and_then(|e| e.to_str()), Some("gz" | "bgz"));
+    let reader: Box<dyn BufRead> = if is_gz {
+        Box::new(BufReader::new(flate2::read::MultiGzDecoder::new(file)))
+    } else {
+        Box::new(BufReader::new(file))
+    };
+    let lines: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
+    let mut records = Vec::new();
+    for chunk in lines.chunks(4) {
+        if chunk.len() == 4 {
+            records.push((
+                chunk[0].trim_start_matches('@').to_string(),
+                chunk[1].clone(),
+                chunk[3].clone(),
+            ));
+        }
+    }
+    records
+}
+
+/// Paired `-1`/`-2` output routes R1 to out1 and R2 to out2, with the UMI
+/// annotation applied to both.
+#[test]
+fn test_fastq_paired_split_output() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    create_pair_with_umi_tag(&input_bam, "read1", Some((SamTag::RX, "AAAA-GGGG")));
+    let r1 = temp_dir.path().join("R1.fq");
+    let r2 = temp_dir.path().join("R2.fq");
+
+    let cmd = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "--annotate-read-names",
+        "-1",
+        r1.to_str().unwrap(),
+        "-2",
+        r2.to_str().unwrap(),
+    ])
+    .expect("parse");
+    cmd.execute("fgumi fastq").expect("run");
+
+    let recs1 = read_fastq_maybe_gz(&r1);
+    let recs2 = read_fastq_maybe_gz(&r2);
+    assert_eq!(recs1.len(), 1, "one R1 read");
+    assert_eq!(recs2.len(), 1, "one R2 read");
+    // Split mode omits the /1 /2 suffix (like samtools -1/-2); R1 and R2 names match.
+    assert_eq!(recs1[0].0, "read1:AAAA+GGGG");
+    assert_eq!(recs2[0].0, "read1:AAAA+GGGG");
+    // R1 sequence is the FIRST_SEGMENT read; R2 the LAST_SEGMENT read.
+    assert_eq!(recs1[0].1, "ACGTACGT");
+    assert_eq!(recs2[0].1, "TGCATGCA");
+}
+
+/// A `.gz` output path is written as BGZF (gzip magic bytes + BGZF `BC` subfield)
+/// and round-trips to the expected records.
+#[test]
+fn test_fastq_paired_output_is_bgzf() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    create_pair_with_umi_tag(&input_bam, "read1", None);
+    let r1 = temp_dir.path().join("R1.fq.gz");
+    let r2 = temp_dir.path().join("R2.fq.gz");
+
+    let cmd = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-1",
+        r1.to_str().unwrap(),
+        "-2",
+        r2.to_str().unwrap(),
+    ])
+    .expect("parse");
+    cmd.execute("fgumi fastq").expect("run");
+
+    // Verify BGZF framing: gzip magic 1f 8b, and the BGZF `BC` extra subfield.
+    let raw = fs::read(&r1).expect("read gz");
+    assert!(raw.len() > 18, "non-empty bgzf");
+    assert_eq!(&raw[0..2], &[0x1f, 0x8b], "gzip magic");
+    assert_eq!(raw[3] & 0x04, 0x04, "FEXTRA flag set (BGZF has an extra field)");
+    assert_eq!([raw[12], raw[13]], [b'B', b'C'], "BGZF BC subfield identifier");
+
+    // And it decodes to the expected read (split mode omits the /1 suffix).
+    let recs1 = read_fastq_maybe_gz(&r1);
+    assert_eq!(recs1.len(), 1);
+    assert_eq!(recs1[0].0, "read1");
+}
+
+/// The `.bgz` extension triggers BGZF writing on the same footing as `.gz`,
+/// so a `.bgz`-suffixed paired output is BGZF-framed and round-trips. Guards
+/// against a writer bug specific to `.bgz` extension detection.
+#[test]
+fn test_fastq_paired_output_bgz_extension_is_bgzf() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    create_pair_with_umi_tag(&input_bam, "read1", None);
+    let r1 = temp_dir.path().join("R1.fq.bgz");
+    let r2 = temp_dir.path().join("R2.fq.bgz");
+
+    let cmd = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-1",
+        r1.to_str().unwrap(),
+        "-2",
+        r2.to_str().unwrap(),
+    ])
+    .expect("parse");
+    cmd.execute("fgumi fastq").expect("run");
+
+    // Verify BGZF framing on the `.bgz` output: gzip magic + BGZF `BC` subfield.
+    let raw = fs::read(&r1).expect("read bgz");
+    assert!(raw.len() > 18, "non-empty bgzf");
+    assert_eq!(&raw[0..2], &[0x1f, 0x8b], "gzip magic");
+    assert_eq!(raw[3] & 0x04, 0x04, "FEXTRA flag set (BGZF has an extra field)");
+    assert_eq!([raw[12], raw[13]], [b'B', b'C'], "BGZF BC subfield identifier");
+
+    // And both `.bgz` mates decode to the expected read (split mode omits /1 /2).
+    let recs1 = read_fastq_maybe_gz(&r1);
+    let recs2 = read_fastq_maybe_gz(&r2);
+    assert_eq!(recs1.len(), 1);
+    assert_eq!(recs2.len(), 1);
+    assert_eq!(recs1[0].0, "read1");
+    assert_eq!(recs2[0].0, "read1");
+}
+
+/// An interleaved `--output` ending in `.gz` is also written as BGZF.
+#[test]
+fn test_fastq_interleaved_gz_is_bgzf() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    create_pair_with_umi_tag(&input_bam, "read1", None);
+    let out = temp_dir.path().join("out.fq.gz");
+
+    let cmd = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ])
+    .expect("parse");
+    cmd.execute("fgumi fastq").expect("run");
+
+    let raw = fs::read(&out).expect("read gz");
+    assert_eq!(&raw[0..2], &[0x1f, 0x8b], "gzip magic");
+    assert_eq!([raw[12], raw[13]], [b'B', b'C'], "BGZF BC subfield");
+    let recs = read_fastq_maybe_gz(&out);
+    assert_eq!(recs.len(), 2, "both mates interleaved");
+    // Assert record identity, not just count: R1 then R2, with the /1 /2 suffix.
+    assert_eq!(recs[0].0, "read1/1");
+    assert_eq!(recs[1].0, "read1/2");
+    assert_eq!(recs[0].1, "ACGTACGT");
+    assert_eq!(recs[1].1, "TGCATGCA");
+}
+
+/// `--out1` without `--out2` is rejected by clap (`requires`).
+#[test]
+fn test_fastq_out1_requires_out2() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let r1 = temp_dir.path().join("R1.fq");
+    let parsed = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-1",
+        r1.to_str().unwrap(),
+    ]);
+    assert!(parsed.is_err(), "--out1 without --out2 must be rejected");
+}
+
+/// `-U` remains a working alias for `--annotate-read-names`.
+#[test]
+fn test_fastq_annotate_u_alias() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    create_pair_with_umi_tag(&input_bam, "read1", Some((SamTag::RX, "AAAA-GGGG")));
+    let records = run_fastq_with_args(&input_bam, &["-U", "-n"]);
+    assert_eq!(records[0].0, "read1:AAAA+GGGG");
+}
+
+/// Two outputs pointing at the same file must be rejected before any writing,
+/// so two writer streams cannot silently truncate/corrupt one file.
+#[test]
+fn test_fastq_duplicate_output_paths_rejected() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    create_pair_with_umi_tag(&input_bam, "read1", None);
+    let same = temp_dir.path().join("both.fq");
+
+    let cmd = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-1",
+        same.to_str().unwrap(),
+        "-2",
+        same.to_str().unwrap(),
+    ])
+    .expect("parse");
+    let err = cmd.execute("fgumi fastq").expect_err("must reject --out1 == --out2");
+    assert!(err.to_string().contains("used more than once"), "unexpected error: {err}");
+    assert!(!same.exists(), "no output file should be created when paths collide");
+}
+
+/// Two lexically-different but equivalent output paths that don't exist yet —
+/// here the same file reached through a real directory and a symlink to it —
+/// must still be rejected. The dedup canonicalizes the (existing) parent
+/// directory, so the aliases collide before two sink threads can truncate the
+/// same not-yet-existing target. Without parent-canonicalization the raw
+/// lexical paths differ and the collision slips through.
+#[cfg(unix)]
+#[test]
+fn test_fastq_aliased_nonexistent_output_paths_rejected() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    create_pair_with_umi_tag(&input_bam, "read1", None);
+
+    // `real/` exists; `link/` is a symlink to it. Same not-yet-existing file
+    // `r.fq` reached two lexically-distinct ways that resolve to one inode.
+    let real_dir = temp_dir.path().join("real");
+    fs::create_dir(&real_dir).expect("mkdir real");
+    let link_dir = temp_dir.path().join("link");
+    std::os::unix::fs::symlink(&real_dir, &link_dir).expect("symlink");
+    let out1 = real_dir.join("r.fq");
+    let out2 = link_dir.join("r.fq");
+    assert!(!out1.exists(), "target must not exist yet for this to test the non-existent path");
+    assert_ne!(out1, out2, "the two paths must be lexically distinct");
+
+    let cmd = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-1",
+        out1.to_str().unwrap(),
+        "-2",
+        out2.to_str().unwrap(),
+    ])
+    .expect("parse");
+    let err = cmd.execute("fgumi fastq").expect_err("must reject aliased non-existent outputs");
+    assert!(err.to_string().contains("used more than once"), "unexpected error: {err}");
+    assert!(!out1.exists(), "no output file should be created when paths collide");
+}
+
+/// `/dev/null` is exempt from the duplicate-path check: routing several streams
+/// to it (e.g. `--out0 /dev/null`) is intentional, as with `samtools fastq`.
+#[cfg(unix)]
+#[test]
+fn test_fastq_dev_null_out0_allowed() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    create_pair_with_umi_tag(&input_bam, "read1", None);
+    let r1 = temp_dir.path().join("R1.fq");
+    let r2 = temp_dir.path().join("R2.fq");
+
+    let cmd = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-1",
+        r1.to_str().unwrap(),
+        "-2",
+        r2.to_str().unwrap(),
+        "-0",
+        "/dev/null",
+    ])
+    .expect("parse");
+    cmd.execute("fgumi fastq").expect("run with --out0 /dev/null");
+    assert_eq!(read_fastq_maybe_gz(&r1).len(), 1);
+    assert_eq!(read_fastq_maybe_gz(&r2).len(), 1);
 }
 
 /// `--output` pointing at the same file as `--input` must fail before any
