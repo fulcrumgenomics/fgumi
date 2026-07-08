@@ -889,6 +889,36 @@ pub(crate) fn serialize_raw_bam_records<R: AsRef<[u8]>>(
     Ok(records.len() as u64)
 }
 
+/// Checks whether R1 is genomically earlier than R2 from their raw BAM bytes.
+///
+/// Shared by `group` and `dedup` so their paired-UMI assignment can't drift.
+/// Uses zero-allocation CIGAR iteration; unmapped reads return position 0
+/// (matching noodles `unwrap_or(0)` behavior). Ordering is by reference id,
+/// then unclipped 5' coordinate, then strand.
+///
+/// The strand tie-break mirrors fgbio `GroupReadsByUmi.umiForRead`'s
+/// `pos1 == pos2 && r1.positiveStrand`: when both mates share an unclipped 5'
+/// coordinate (fully-overlapping / short-insert pairs), R1 is "earlier" iff it
+/// is on the forward strand. A bare `r1_pos <= r2_pos` returns `true`
+/// unconditionally on a tie, which assigns the lower/higher paired-UMI prefix
+/// inconsistently between the two duplex strands — so the strands fail to
+/// reverse-match and one duplex molecule is incorrectly split into two.
+pub(crate) fn is_r1_genomically_earlier_raw(r1: &[u8], r2: &[u8]) -> bool {
+    use fgumi_raw_bam::RawRecordView;
+
+    let ref1 = fgumi_raw_bam::ref_id(r1);
+    let ref2 = fgumi_raw_bam::ref_id(r2);
+    if ref1 != ref2 {
+        return ref1 < ref2;
+    }
+    let r1_pos = fgumi_raw_bam::unclipped_5prime_from_raw_bam(r1);
+    let r2_pos = fgumi_raw_bam::unclipped_5prime_from_raw_bam(r2);
+    if r1_pos != r2_pos {
+        return r1_pos < r2_pos;
+    }
+    (RawRecordView::new(r1).flags() & fgumi_raw_bam::flags::REVERSE) == 0
+}
+
 /// Parses a boolean value from a string, accepting: true/false, yes/no, y/n, t/f
 /// (case-insensitive). Matches sopt/fgbio behavior.
 pub(crate) fn parse_bool(s: &str) -> Result<bool, String> {
