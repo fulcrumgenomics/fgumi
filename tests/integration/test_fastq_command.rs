@@ -10,8 +10,11 @@ use fgumi_tag::SamTag;
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
@@ -856,4 +859,335 @@ fn test_fastq_output_symlink_to_input_rejected() {
         input_size_before, input_size_after,
         "input BAM was truncated/clobbered through symlinked --output"
     );
+}
+
+// ── Paired output through the typed-step chain (Task 6) ─────────────────
+//
+// `test_fastq_paired_split_output` and `test_fastq_paired_output_is_bgzf`
+// above already exercise the chain path (paired output no longer runs on the
+// standalone `run_paired` loop); the tests below extend paired coverage to
+// `--out0` routing, both `.gz` outputs, multi-pair UMI ordering, stdout
+// fallback, and the empty-R2-branch no-ordinal-gaps regression.
+
+/// Create a BAM with one R1/R2 pair plus one single-end ("other") read —
+/// exercises `--out0` routing (`samtools fastq -0` semantics).
+fn create_paired_bam_with_other(path: &Path) {
+    let header = create_minimal_header("chr1", 10000);
+    let mut writer =
+        bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
+    writer.write_header(&header).expect("Failed to write header");
+
+    for (name, seq, flag_bits) in [
+        ("pair1", "ACGTACGT", flags::PAIRED | flags::FIRST_SEGMENT),
+        ("pair1", "TGCATGCA", flags::PAIRED | flags::LAST_SEGMENT),
+        // No segment bits set: classify_segment routes this to "other".
+        ("single1", "GGGGCCCC", 0),
+    ] {
+        let mut b = SamBuilder::new();
+        b.read_name(name.as_bytes())
+            .sequence(seq.as_bytes())
+            .qualities(&[40; 8])
+            .flags(flag_bits)
+            .ref_id(0)
+            .pos(99)
+            .mapq(60);
+        writer
+            .write_alignment_record(&header, &to_record_buf(&b.build()))
+            .expect("Failed to write record");
+    }
+    writer.try_finish().expect("Failed to finish BAM");
+}
+
+/// Parse FASTQ records from an in-memory byte buffer (e.g. captured stdout).
+fn parse_fastq_bytes(bytes: &[u8]) -> Vec<(String, String, String)> {
+    let lines: Vec<String> =
+        BufReader::new(bytes).lines().map(|l| l.expect("read stdout line")).collect();
+    let mut records = Vec::new();
+    for chunk in lines.chunks(4) {
+        if chunk.len() == 4 {
+            records.push((
+                chunk[0].trim_start_matches('@').to_string(),
+                chunk[1].clone(),
+                chunk[3].clone(),
+            ));
+        }
+    }
+    records
+}
+
+/// Run `fgumi` as a real subprocess with the given args and a watchdog
+/// timeout, returning `(exited_successfully, stdout, stderr)`.
+///
+/// Needed for cases that a plain in-process `Command::execute()` call can't
+/// observe or guard: capturing real process stdout (the paired chain's
+/// `--out0`-omitted branch writes straight to `io::stdout()` for path `-`),
+/// and detecting a pipeline deadlock without hanging the test suite.
+///
+/// stdout/stderr are drained on worker threads while the main thread polls
+/// `try_wait`, mirroring `test_simulate_aligner.rs`'s pattern: a deadlocked
+/// child never closes its pipes, so a synchronous `read_to_end` on the main
+/// thread would block forever and the watchdog would never get to run.
+fn run_fastq_subprocess_with_timeout(args: &[&str], timeout: Duration) -> (bool, Vec<u8>, Vec<u8>) {
+    let mut cmd = ProcessCommand::new(env!("CARGO_BIN_EXE_fgumi"));
+    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn fgumi fastq");
+
+    let mut child_stdout = child.stdout.take().expect("child stdout");
+    let stdout_reader = thread::spawn(move || {
+        let mut out = Vec::new();
+        child_stdout.read_to_end(&mut out).expect("read child stdout");
+        out
+    });
+    let mut child_stderr = child.stderr.take().expect("child stderr");
+    let stderr_reader = thread::spawn(move || {
+        let mut out = Vec::new();
+        child_stderr.read_to_end(&mut out).expect("read child stderr");
+        out
+    });
+
+    let deadline = Instant::now() + timeout;
+    let success = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status.success();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("fgumi fastq did not exit within {timeout:?} (deadlock?)");
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let stdout = stdout_reader.join().expect("stdout reader thread");
+    let stderr = stderr_reader.join().expect("stderr reader thread");
+    (success, stdout, stderr)
+}
+
+/// `--out0` routes single-end / "other" reads to their own file, matching
+/// `samtools fastq -0`; R1/R2 files contain only the paired reads.
+#[test]
+fn test_fastq_paired_other_reads_route_to_out0() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    create_paired_bam_with_other(&input_bam);
+    let r1 = temp_dir.path().join("R1.fq");
+    let r2 = temp_dir.path().join("R2.fq");
+    let r0 = temp_dir.path().join("R0.fq");
+
+    let cmd = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-1",
+        r1.to_str().unwrap(),
+        "-2",
+        r2.to_str().unwrap(),
+        "-0",
+        r0.to_str().unwrap(),
+    ])
+    .expect("parse");
+    cmd.execute("fgumi fastq").expect("run");
+
+    let recs1 = read_fastq_maybe_gz(&r1);
+    let recs2 = read_fastq_maybe_gz(&r2);
+    let recs0 = read_fastq_maybe_gz(&r0);
+    assert_eq!(recs1.len(), 1, "R1 file has only the paired R1 read");
+    assert_eq!(recs2.len(), 1, "R2 file has only the paired R2 read");
+    assert_eq!(recs0.len(), 1, "out0 has the single-end read");
+    assert_eq!(recs1[0].0, "pair1");
+    assert_eq!(recs1[0].1, "ACGTACGT");
+    assert_eq!(recs2[0].0, "pair1");
+    assert_eq!(recs2[0].1, "TGCATGCA");
+    assert_eq!(recs0[0].0, "single1");
+    assert_eq!(recs0[0].1, "GGGGCCCC");
+}
+
+/// Both `-1`/`-2` outputs as `.fastq.gz` decompress to the expected R1/R2
+/// records and are each valid BGZF. Extends `test_fastq_paired_output_is_bgzf`
+/// (which only checks R1) to both files.
+#[test]
+fn test_fastq_paired_gz_output_round_trips_both_files() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    create_pair_with_umi_tag(&input_bam, "read1", None);
+    let r1 = temp_dir.path().join("R1.fastq.gz");
+    let r2 = temp_dir.path().join("R2.fastq.gz");
+
+    let cmd = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-1",
+        r1.to_str().unwrap(),
+        "-2",
+        r2.to_str().unwrap(),
+    ])
+    .expect("parse");
+    cmd.execute("fgumi fastq").expect("run");
+
+    for path in [&r1, &r2] {
+        let raw = fs::read(path).expect("read gz");
+        assert!(raw.len() > 18, "non-empty bgzf: {}", path.display());
+        assert_eq!(&raw[0..2], &[0x1f, 0x8b], "gzip magic: {}", path.display());
+        assert_eq!(raw[3] & 0x04, 0x04, "FEXTRA flag set: {}", path.display());
+        assert_eq!([raw[12], raw[13]], [b'B', b'C'], "BGZF BC subfield: {}", path.display());
+    }
+
+    let recs1 = read_fastq_maybe_gz(&r1);
+    let recs2 = read_fastq_maybe_gz(&r2);
+    assert_eq!(recs1.len(), 1);
+    assert_eq!(recs2.len(), 1);
+    assert_eq!(recs1[0].0, "read1");
+    assert_eq!(recs2[0].0, "read1");
+    assert_eq!(recs1[0].1, "ACGTACGT");
+    assert_eq!(recs2[0].1, "TGCATGCA");
+}
+
+/// Paired split output with `--annotate-read-names` across multiple pairs:
+/// each pair's DRAGEN-format UMI annotation lands on both R1 and R2, and the
+/// per-pair records line up positionally between the two files.
+#[test]
+fn test_fastq_paired_umi_header_multiple_pairs() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let header = create_minimal_header("chr1", 10000);
+    let mut writer = bam::io::Writer::new(fs::File::create(&input_bam).expect("create BAM"));
+    writer.write_header(&header).expect("write header");
+
+    for (name, umi) in [("readA", "AAAA-CCCC"), ("readB", "GGGG-TTTT")] {
+        for (seq, segment_flag) in
+            [("ACGTACGT", flags::FIRST_SEGMENT), ("TGCATGCA", flags::LAST_SEGMENT)]
+        {
+            let mut b = SamBuilder::new();
+            b.read_name(name.as_bytes())
+                .sequence(seq.as_bytes())
+                .qualities(&[40; 8])
+                .flags(flags::PAIRED | segment_flag)
+                .ref_id(0)
+                .pos(99)
+                .mapq(60);
+            b.add_string_tag(SamTag::RX, umi.as_bytes());
+            writer
+                .write_alignment_record(&header, &to_record_buf(&b.build()))
+                .expect("Failed to write record");
+        }
+    }
+    writer.try_finish().expect("Failed to finish BAM");
+
+    let r1 = temp_dir.path().join("R1.fq");
+    let r2 = temp_dir.path().join("R2.fq");
+    let cmd = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "--annotate-read-names",
+        "-1",
+        r1.to_str().unwrap(),
+        "-2",
+        r2.to_str().unwrap(),
+    ])
+    .expect("parse");
+    cmd.execute("fgumi fastq").expect("run");
+
+    let recs1 = read_fastq_maybe_gz(&r1);
+    let recs2 = read_fastq_maybe_gz(&r2);
+    assert_eq!(recs1.len(), 2);
+    assert_eq!(recs2.len(), 2);
+    assert_eq!(recs1[0].0, "readA:AAAA+CCCC");
+    assert_eq!(recs2[0].0, "readA:AAAA+CCCC");
+    assert_eq!(recs1[1].0, "readB:GGGG+TTTT");
+    assert_eq!(recs2[1].0, "readB:GGGG+TTTT");
+}
+
+/// Without `--out0`, single-end/"other" reads go to stdout, matching
+/// `samtools fastq` without `-0`; R1/R2 files contain only the paired reads.
+/// Runs the real binary as a subprocess: the paired chain writes the "other"
+/// branch straight to `io::stdout()` for path `-`, which an in-process
+/// `Command::execute()` call in this test binary cannot observe.
+#[test]
+fn test_fastq_paired_no_out0_sends_other_to_stdout() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    create_paired_bam_with_other(&input_bam);
+    let r1 = temp_dir.path().join("R1.fq");
+    let r2 = temp_dir.path().join("R2.fq");
+
+    let (success, stdout, stderr) = run_fastq_subprocess_with_timeout(
+        &[
+            "fastq",
+            "-i",
+            input_bam.to_str().unwrap(),
+            "-1",
+            r1.to_str().unwrap(),
+            "-2",
+            r2.to_str().unwrap(),
+        ],
+        Duration::from_secs(30),
+    );
+    assert!(success, "fgumi fastq failed: {}", String::from_utf8_lossy(&stderr));
+
+    let stdout_recs = parse_fastq_bytes(&stdout);
+    assert_eq!(stdout_recs.len(), 1, "single-end read on stdout");
+    assert_eq!(stdout_recs[0].0, "single1");
+    assert_eq!(stdout_recs[0].1, "GGGGCCCC");
+
+    let recs1 = read_fastq_maybe_gz(&r1);
+    let recs2 = read_fastq_maybe_gz(&r2);
+    assert_eq!(recs1.len(), 1, "R1 file has only the paired read");
+    assert_eq!(recs2.len(), 1, "R2 file has only the paired read");
+}
+
+/// A BAM whose reads are ALL R1 (no R2 at all) must not deadlock. The paired
+/// encode step always emits a block on every branch per batch — an empty
+/// `Vec<u8>` where a branch has no records — precisely so the R2 branch's
+/// `batch_serial` sequence has no gaps; a gap would wedge the R2 writer's
+/// reorder stage waiting on an ordinal that never arrives. This is the direct
+/// regression guard for that rule: it asserts the command actually completes
+/// (via the subprocess watchdog) rather than hanging, and that the R2 output
+/// is a valid empty file rather than missing or truncated.
+#[test]
+fn test_fastq_paired_empty_r2_batch_no_hang() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let header = create_minimal_header("chr1", 10000);
+    let mut writer = bam::io::Writer::new(fs::File::create(&input_bam).expect("create BAM"));
+    writer.write_header(&header).expect("write header");
+    for i in 0..8 {
+        let name = format!("read{i}");
+        let mut b = SamBuilder::new();
+        b.read_name(name.as_bytes())
+            .sequence(b"ACGTACGT")
+            .qualities(&[40; 8])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+            .ref_id(0)
+            .pos(99)
+            .mapq(60);
+        writer
+            .write_alignment_record(&header, &to_record_buf(&b.build()))
+            .expect("Failed to write record");
+    }
+    writer.try_finish().expect("Failed to finish BAM");
+
+    let r1 = temp_dir.path().join("R1.fq");
+    let r2 = temp_dir.path().join("R2.fq");
+    let r0 = temp_dir.path().join("R0.fq");
+
+    let (success, _stdout, stderr) = run_fastq_subprocess_with_timeout(
+        &[
+            "fastq",
+            "-i",
+            input_bam.to_str().unwrap(),
+            "-1",
+            r1.to_str().unwrap(),
+            "-2",
+            r2.to_str().unwrap(),
+            "-0",
+            r0.to_str().unwrap(),
+        ],
+        Duration::from_secs(30),
+    );
+    assert!(success, "fgumi fastq did not complete: {}", String::from_utf8_lossy(&stderr));
+
+    assert_eq!(read_fastq_maybe_gz(&r1).len(), 8, "all reads are R1");
+    let r2_len = fs::metadata(&r2).expect("stat R2").len();
+    assert_eq!(r2_len, 0, "R2 file must be empty (zero-length), not missing/corrupt");
+    assert_eq!(read_fastq_maybe_gz(&r0).len(), 0, "no other reads");
 }

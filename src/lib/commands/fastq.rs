@@ -3,23 +3,20 @@
 //! Reads a BAM and writes FASTQ: interleaved to stdout (for piping to an
 //! aligner) or a file, paired split files (`--out1`/`--out2`/`--out0`), and
 //! optionally BGZF-compressed (`.gz`/`.bgz`) with the UMI embedded in the read
-//! name (`--annotate-read-names`). Interleaved output runs on the typed-step
-//! pipeline; paired output currently runs on a standalone loop. Input should be
-//! queryname-sorted or template-coordinate sorted.
+//! name (`--annotate-read-names`). Both interleaved and paired-split output run
+//! on the typed-step pipeline. Input should be queryname-sorted or
+//! template-coordinate sorted.
 
 use crate::commands::common::{QueueMemoryOptions, SchedulerOptions, parse_bool};
-use crate::logging::OperationTimer;
 use crate::sam::SamTag;
 use crate::validation::validate_file_exists;
 use anyhow::Result;
 use clap::Parser;
-use fgumi_bam_io::{BgzfWriterEnum, create_bgzf_writer, create_raw_bam_reader};
 use fgumi_raw_bam::{
     RawRecord, extract_sequence_into, quality_scores_slice, read_name as raw_read_name,
 };
 use log::info;
-use std::fs::File;
-use std::io::{BufWriter, StdoutLock, Write, stdout};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::commands::command::Command;
@@ -113,7 +110,7 @@ impl UmiHeader {
 
 /// Which FASTQ stream a record belongs to, based on its segment flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Segment {
+pub(crate) enum Segment {
     /// First segment of a pair (`FIRST_SEGMENT` set, `LAST_SEGMENT` clear) → R1.
     Read1,
     /// Last segment of a pair (`LAST_SEGMENT` set, `FIRST_SEGMENT` clear) → R2.
@@ -124,7 +121,7 @@ enum Segment {
 
 /// Classify a record into R1 / R2 / other from its flags, matching how
 /// `samtools fastq` routes reads to `-1` / `-2` / `-0`.
-fn classify_segment(flags: u16) -> Segment {
+pub(crate) fn classify_segment(flags: u16) -> Segment {
     use fgumi_raw_bam::flags as flag_bits;
     let is_first = (flags & flag_bits::FIRST_SEGMENT) != 0;
     let is_last = (flags & flag_bits::LAST_SEGMENT) != 0;
@@ -171,71 +168,6 @@ const FASTQ_GZIP_LEVEL: u32 = 6;
 
 /// Default for the deprecated, now-ignored `--bwa-chunk-size` flag.
 const DEFAULT_BWA_CHUNK_SIZE: u64 = 150_000_000;
-
-/// A FASTQ output stream. Compressed file outputs use BGZF (block gzip) via the
-/// same multi-threaded backend fgumi uses for BAM — gzip-compatible for
-/// downstream tools yet block-indexable. Plain files and stdout are written
-/// uncompressed.
-enum FastqSink {
-    /// Uncompressed file.
-    Plain(BufWriter<File>),
-    /// BGZF-compressed file (chosen for `.gz`/`.bgz` paths).
-    Bgzf(BgzfWriterEnum),
-    /// Uncompressed stdout (for piping to an aligner).
-    Stdout(BufWriter<StdoutLock<'static>>),
-}
-
-impl FastqSink {
-    /// Output buffer capacity, sized for efficient pipe/file throughput.
-    const BUF_CAPACITY: usize = 64 * 1024 * 1024;
-
-    /// Open a file sink, writing BGZF when the path ends in `.gz`/`.bgz`. BGZF
-    /// compression is parallelized across `threads` worker threads.
-    fn open_file(path: &Path, threads: usize) -> Result<Self> {
-        let buf = BufWriter::with_capacity(Self::BUF_CAPACITY, File::create(path)?);
-        if path_is_gzip(path) {
-            let boxed: Box<dyn Write + Send> = Box::new(buf);
-            Ok(FastqSink::Bgzf(create_bgzf_writer(boxed, threads, FASTQ_GZIP_LEVEL)))
-        } else {
-            Ok(FastqSink::Plain(buf))
-        }
-    }
-
-    /// A sink writing uncompressed FASTQ to stdout.
-    fn stdout() -> Self {
-        FastqSink::Stdout(BufWriter::with_capacity(Self::BUF_CAPACITY, stdout().lock()))
-    }
-
-    /// Finish the stream: for BGZF this flushes all workers and writes the EOF
-    /// block; all variants flush their underlying writer.
-    fn finish(self) -> std::io::Result<()> {
-        match self {
-            FastqSink::Plain(mut w) => w.flush(),
-            FastqSink::Stdout(mut w) => w.flush(),
-            FastqSink::Bgzf(w) => w.finish(),
-        }
-    }
-}
-
-impl Write for FastqSink {
-    #[inline]
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            FastqSink::Plain(w) => w.write(buf),
-            FastqSink::Stdout(w) => w.write(buf),
-            FastqSink::Bgzf(w) => w.write(buf),
-        }
-    }
-
-    #[inline]
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            FastqSink::Plain(w) => w.flush(),
-            FastqSink::Stdout(w) => w.flush(),
-            FastqSink::Bgzf(w) => w.flush(),
-        }
-    }
-}
 
 /// Convert BAM to FASTQ format.
 #[derive(Debug, Parser)]
@@ -388,109 +320,9 @@ impl Fastq {
         info!("Read name suffix: {}", if self.no_suffix { "disabled" } else { "enabled" });
     }
 
-    /// Paired conversion: route R1/R2/other reads to the `--out1`/`--out2`/`--out0`
-    /// sinks by segment flag, mirroring `samtools fastq -1/-2/-0`. Assumes input
-    /// is name-grouped (the standard queryname / template-coordinate order);
-    /// a singleton mate follows its own segment flag, as `samtools fastq` does
-    /// without `-s`.
-    fn run_paired(&self) -> Result<()> {
-        let timer = OperationTimer::new("Converting BAM to paired FASTQ");
-        self.log_config();
-        let opts = self.to_fastq_options()?;
-
-        // clap `requires` guarantees out2 is present whenever out1 is.
-        let out1 = self.out1.as_ref().expect("out1 present in paired mode");
-        let out2 = self.out2.as_ref().expect("out2 present in paired mode");
-        info!("R1 -> {}", out1.display());
-        info!("R2 -> {}", out2.display());
-
-        // Each compressed (BGZF) output gets its own pool of `--threads`
-        // compression workers. Surface the effective total so a large `--threads`
-        // with several gzipped outputs doesn't silently oversubscribe the CPU
-        // (e.g. `--threads 16` with three `.gz` outputs = 48 compression workers,
-        // plus the reader's own decompression threads).
-        let threads = self.threads;
-        let gzip_output_count = [Some(out1), Some(out2), self.out0.as_ref()]
-            .into_iter()
-            .flatten()
-            .filter(|p| path_is_gzip(p))
-            .count();
-        if threads > 1 && gzip_output_count > 1 {
-            info!(
-                "Compressing {} BGZF outputs with {} workers each ({} compression workers total)",
-                gzip_output_count,
-                threads,
-                threads * gzip_output_count
-            );
-        }
-        let mut sink1 = FastqSink::open_file(out1, threads)?;
-        let mut sink2 = FastqSink::open_file(out2, threads)?;
-        // Reads that are neither cleanly R1 nor R2 go to --out0 if given, else to
-        // stdout (matching `samtools fastq` without -0).
-        let mut sink_other = match &self.out0 {
-            Some(path) => {
-                info!("other -> {}", path.display());
-                FastqSink::open_file(path, threads)?
-            }
-            None => FastqSink::stdout(),
-        };
-
-        let (mut reader, _header) = create_raw_bam_reader(&self.input, self.threads)?;
-
-        let mut total_records: u64 = 0;
-        let mut written_records: u64 = 0;
-        let mut seq_buf: Vec<u8> = Vec::with_capacity(512);
-        let mut qual_buf: Vec<u8> = Vec::with_capacity(512);
-        let mut record = RawRecord::new();
-
-        // In split mode the R1/R2 file already identifies the mate, so the
-        // `/1` `/2` suffix is always omitted — matching `samtools fastq -1/-2`,
-        // which keeps R1 and R2 read names identical for downstream pairing.
-        let no_suffix = true;
-
-        loop {
-            let n = reader.read_record(&mut record)?;
-            if n == 0 {
-                break; // EOF
-            }
-            total_records += 1;
-
-            let flags = record.flags();
-            if !opts.passes_filters(flags) {
-                continue;
-            }
-
-            let sink = match classify_segment(flags) {
-                Segment::Read1 => &mut sink1,
-                Segment::Read2 => &mut sink2,
-                Segment::Other => &mut sink_other,
-            };
-            write_fastq_record(
-                sink,
-                &record,
-                flags,
-                no_suffix,
-                opts.umi_header.as_ref(),
-                &mut seq_buf,
-                &mut qual_buf,
-            )?;
-            written_records += 1;
-        }
-
-        sink1.finish()?;
-        sink2.finish()?;
-        sink_other.finish()?;
-
-        info!("Read {total_records} records, wrote {written_records} FASTQ records");
-        timer.log_completion(written_records);
-        Ok(())
-    }
-}
-
-impl Fastq {
     /// Build the per-stage [`FastqOptions`] — the single source of truth for the
-    /// flag filters and UMI-header config, shared by the chain (interleaved) and
-    /// the standalone `run_paired` loop.
+    /// flag filters and UMI-header config, shared by the interleaved and
+    /// paired-split chain specs.
     fn to_fastq_options(&self) -> Result<FastqOptions> {
         Ok(FastqOptions {
             exclude_flags: self.exclude_flags,
@@ -526,6 +358,24 @@ impl Fastq {
             async_reader: false,
             command_line: command_line.to_string(),
         })
+    }
+
+    /// Assemble the [`ChainSpec`] for paired-split BAM → FASTQ:
+    /// `SourceSpec::Bam` → `Stage::Fastq` → `SinkSpec::FastqPaired`. The only
+    /// difference from [`Self::build_chain_spec`] is the sink; everything else
+    /// (stage options, threading, compression, scheduler, queue memory) is
+    /// shared.
+    fn build_paired_chain_spec(
+        &self,
+        command_line: &str,
+    ) -> Result<crate::pipeline::chains::ChainSpec> {
+        // clap `requires` guarantees out2 is present whenever out1 is (and
+        // execute() only calls this when out1.is_some()).
+        let out1 = self.out1.clone().expect("out1 present in paired mode");
+        let out2 = self.out2.clone().expect("out2 present in paired mode");
+        let sink =
+            crate::pipeline::chains::SinkSpec::FastqPaired { out1, out2, out0: self.out0.clone() };
+        self.build_chain_spec(sink, command_line)
     }
 
     /// The queue-memory options for the chain: the user's `--max-memory` /
@@ -616,13 +466,24 @@ impl Command for Fastq {
             }
         }
 
-        // Paired split output (`-1`/`-2`, optionally `-0`). clap guarantees
-        // `--out1`/`--out2` come together and conflict with `--output`.
-        // (Paired output is not yet wired on the typed-step chain path — the
-        // 3-way fan-out needs a 3-output process primitive — so it still runs
-        // on the standalone loop.)
-        if self.out1.is_some() {
-            return self.run_paired();
+        // Paired split output (`-1`/`-2`, optionally `-0`) runs through the
+        // typed-step chain: BAM source → Stage::Fastq 3-way encode → three
+        // per-file raw writers (BGZF for `.gz`), all sharing one work-stealing
+        // pool. clap guarantees `--out1`/`--out2` come together and conflict
+        // with `--output`.
+        if let Some(out1) = &self.out1 {
+            self.log_config();
+            // clap `requires` guarantees out2 is present whenever out1 is.
+            let out2 = self.out2.as_ref().expect("out2 present in paired mode");
+            info!("R1 -> {}", out1.display());
+            info!("R2 -> {}", out2.display());
+            if let Some(out0) = &self.out0 {
+                info!("other -> {}", out0.display());
+            }
+            return crate::pipeline::chains::build_for(
+                self.build_paired_chain_spec(command_line)?,
+            )?
+            .run();
         }
 
         // Interleaved output runs through the typed-step chain: BAM source →

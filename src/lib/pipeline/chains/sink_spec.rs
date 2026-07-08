@@ -34,10 +34,14 @@ pub enum SinkSpec {
     /// Interleaved FASTQ file write (or `-` for stdout). A `.gz`/`.bgz`
     /// path is written as BGZF. Only valid on a `Stage::Fastq`-terminal chain.
     ///
-    /// Paired split output (`--out1`/`--out2`) is not yet a chain sink — it
-    /// runs on the standalone `fgumi fastq` loop — so there is no `FastqPaired`
-    /// variant here until the 3-way fan-out encode step is wired.
+    /// Paired split output uses the [`SinkSpec::FastqPaired`] variant.
     Fastq(PathBuf),
+    /// Paired split FASTQ output: R1 → `out1`, R2 → `out2`, and "other"
+    /// (single-end / ambiguous) reads → `out0` if given, else stdout. Each
+    /// `.gz`/`.bgz` path is written as BGZF. Only valid on a `Stage::Fastq`-
+    /// terminal chain. The three streams are fanned out by the paired FASTQ
+    /// encode step (a 3-output `Process3WithWorkerState`).
+    FastqPaired { out1: PathBuf, out2: PathBuf, out0: Option<PathBuf> },
 }
 
 impl SinkSpec {
@@ -47,6 +51,7 @@ impl SinkSpec {
     pub fn path(&self) -> &PathBuf {
         match self {
             SinkSpec::Bam(p) | SinkSpec::BamWithIndex(p) | SinkSpec::Fastq(p) => p,
+            SinkSpec::FastqPaired { out1, .. } => out1,
         }
     }
 }

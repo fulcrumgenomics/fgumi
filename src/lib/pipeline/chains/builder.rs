@@ -1239,17 +1239,24 @@ impl<'a> ChainBuilder<'a> {
 
     /// Add the terminal BAM → FASTQ encode stage.
     ///
-    /// Consumes the `DecodedRecordBatch` tail from the BAM source preamble and
-    /// appends the `Parallel` FASTQ-encode step (pool-spread), leaving a
-    /// `DecompressedBlock` byte tail for `add_sink` to route to a raw writer
-    /// (optionally through `BgzfCompress` for `.gz`/`.bgz` output).
+    /// Consumes the `DecodedRecordBatch` tail from the BAM source preamble.
+    /// For a single-output sink, appends the `Parallel` FASTQ-encode step
+    /// (pool-spread), leaving a `DecompressedBlock` byte tail for `add_sink`
+    /// to route to a raw writer (optionally through `BgzfCompress` for
+    /// `.gz`/`.bgz` output). For a `SinkSpec::FastqPaired` sink, appends the
+    /// 3-output `Process3` encode step and wires branch b (R2) to `out2` and
+    /// branch c (other) to `out0`/stdout in-method (mirroring how
+    /// `add_filter`/`wire_consensus_rejects_branch` wire secondary branches),
+    /// leaving branch a (R1) as `current_tail` for `add_sink` to route to
+    /// `out1`.
     fn add_fastq(&mut self, position: StagePosition) -> Result<()> {
         use std::sync::atomic::AtomicU64;
 
         use crate::logging::OperationTimer;
         use crate::pipeline::chains::commands::fastq::{
-            FastqFinalizeHook, build_fastq_encode_step,
+            FastqFinalizeHook, build_fastq_encode_step, build_fastq_paired_encode_step,
         };
+        use crate::pipeline::core::topology::BranchIdx;
 
         debug_assert_eq!(position, StagePosition::Terminal, "Stage::Fastq is always terminal");
 
@@ -1264,15 +1271,29 @@ impl<'a> ChainBuilder<'a> {
         let timer = OperationTimer::new("Converting BAM to FASTQ");
         let records_written = Arc::new(AtomicU64::new(0));
 
-        let step = build_fastq_encode_step(
-            Arc::new(opts.clone()),
-            self.tuning.per_step_byte_limit,
-            Arc::clone(&records_written),
-        );
-        let tail = self.pipeline.append_step(step, tail);
-        self.current_tail = Some(tail);
-        // Byte tail (FASTQ text); nothing downstream of the terminal stage reads
-        // the typed kind, but mark it honestly like the other serialize paths.
+        if let SinkSpec::FastqPaired { out2, out0, .. } = &self.spec.sink {
+            let out2 = out2.clone();
+            let out0 = out0.clone();
+            let step = build_fastq_paired_encode_step(
+                Arc::new(opts.clone()),
+                self.tuning.per_step_byte_limit,
+                Arc::clone(&records_written),
+            );
+            let process_tail = self.pipeline.append_step(step, tail);
+            // Branch 1 = R2 → out2; branch 2 = "other" → out0 (or stdout via `-`).
+            self.wire_fastq_output((process_tail.0, BranchIdx(1)), &out2)?;
+            let out0_path = out0.unwrap_or_else(|| std::path::PathBuf::from("-"));
+            self.wire_fastq_output((process_tail.0, BranchIdx(2)), &out0_path)?;
+            // Branch 0 = R1 → current_tail for add_sink → out1.
+            self.current_tail = Some(process_tail);
+        } else {
+            let step = build_fastq_encode_step(
+                Arc::new(opts.clone()),
+                self.tuning.per_step_byte_limit,
+                Arc::clone(&records_written),
+            );
+            self.current_tail = Some(self.pipeline.append_step(step, tail));
+        }
         self.chain_tail_kind = ChainTailKind::SerializedBytes;
 
         self.finalize.push(Box::new(FastqFinalizeHook { records_written, timer }));
@@ -1300,6 +1321,13 @@ impl<'a> ChainBuilder<'a> {
         if let SinkSpec::Fastq(path) = &self.spec.sink {
             let path = path.clone();
             return self.add_fastq_sink(&path);
+        }
+        if let SinkSpec::FastqPaired { out1, .. } = &self.spec.sink {
+            let out1 = out1.clone();
+            // Branches b (R2) and c (other) were wired in add_fastq; branch a
+            // (R1) is current_tail here.
+            let tail = self.current_tail.expect("add_sink called before add_source");
+            return self.wire_fastq_output(tail, &out1);
         }
 
         let tail = self.current_tail.expect("add_sink called before add_source");
@@ -1338,29 +1366,39 @@ impl<'a> ChainBuilder<'a> {
         Ok(())
     }
 
-    /// Route the FASTQ byte tail to a single (interleaved) raw writer. A
-    /// `.gz`/`.bgz` path is compressed via the shared-pool `BgzfCompress` step
-    /// first; otherwise the bytes are written verbatim (file or stdout via `-`).
+    /// Route the FASTQ byte tail to a single (interleaved) raw writer.
     fn add_fastq_sink(&mut self, path: &std::path::Path) -> Result<()> {
+        let tail = self.current_tail.expect("add_sink called before add_source");
+        self.wire_fastq_output(tail, path)?;
+        // add_fastq_sink terminates the chain; no downstream tail.
+        Ok(())
+    }
+
+    /// Wire one FASTQ byte branch (`tail`) to its own writer: a `.gz`/`.bgz`
+    /// `path` is compressed via the shared-pool `BgzfCompress` step first
+    /// (appending the BGZF EOF marker so the stream is a complete BGZF file);
+    /// otherwise the bytes are written verbatim (file, or stdout via `-`).
+    fn wire_fastq_output(
+        &mut self,
+        tail: (StepIdx, BranchIdx),
+        path: &std::path::Path,
+    ) -> Result<()> {
         use crate::commands::fastq::path_is_gzip;
         use crate::pipeline::steps::bgzf::compress::BgzfCompress;
         use crate::pipeline::steps::sink::write_raw::WriteRawFile;
         use crate::pipeline::steps::types::{BgzfBlock, DecompressedBlock};
 
-        let tail = self.current_tail.expect("add_sink called before add_source");
         if path_is_gzip(path) {
             let compress =
                 BgzfCompress::new(self.tuning.compression_level, self.tuning.per_step_byte_limit);
-            let tail = self.pipeline.append_step(compress, tail);
-            // Append the BGZF EOF marker so the `.gz` stream is a complete,
-            // non-truncated BGZF file (BgzfCompress emits blocks but no EOF).
+            let compress_tail = self.pipeline.append_step(compress, tail);
             let writer = WriteRawFile::<BgzfBlock>::new(path, &fgumi_bgzf::BGZF_EOF)
                 .map_err(|e| anyhow!("WriteRawFile: {e}"))?;
-            self.current_tail = Some(self.pipeline.append_step(writer, tail));
+            self.pipeline.append_step(writer, compress_tail);
         } else {
             let writer = WriteRawFile::<DecompressedBlock>::new(path, b"")
                 .map_err(|e| anyhow!("WriteRawFile: {e}"))?;
-            self.current_tail = Some(self.pipeline.append_step(writer, tail));
+            self.pipeline.append_step(writer, tail);
         }
         Ok(())
     }

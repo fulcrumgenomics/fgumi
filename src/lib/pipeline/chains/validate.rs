@@ -318,7 +318,7 @@ pub fn validate_cross_stage_constraints(spec: &ChainSpec) -> Result<()> {
     // either with the other format's counterpart would silently write a
     // corrupt file (FASTQ text wrapped in a BAM header, or BAM bytes with no
     // header). Require the biconditional.
-    let sink_is_fastq = matches!(spec.sink, SinkSpec::Fastq(_));
+    let sink_is_fastq = matches!(spec.sink, SinkSpec::Fastq(_) | SinkSpec::FastqPaired { .. });
     let terminal_is_fastq = spec.stages.last() == Some(&Stage::Fastq);
     if sink_is_fastq != terminal_is_fastq {
         bail!(
@@ -688,5 +688,32 @@ mod tests {
         spec.stage_opts.extract = Some(minimal_extract_opts());
         validate_stage_opts_present(&spec)
             .expect("Stage::Extract with options populated should pass");
+    }
+
+    // ── Rule 5: SinkSpec::{Fastq,FastqPaired} <-> Stage::Fastq biconditional ─
+
+    #[test]
+    fn cross_stage_fastq_paired_accepted_on_terminal_fastq() {
+        let mut spec = empty_spec(vec![Stage::Fastq]);
+        spec.sink = SinkSpec::FastqPaired {
+            out1: std::path::PathBuf::from("r1.fq.gz"),
+            out2: std::path::PathBuf::from("r2.fq.gz"),
+            out0: Some(std::path::PathBuf::from("other.fq.gz")),
+        };
+        validate_cross_stage_constraints(&spec)
+            .expect("FastqPaired + terminal Stage::Fastq must be valid");
+    }
+
+    #[test]
+    fn cross_stage_fastq_paired_rejected_on_non_fastq_terminal() {
+        // Sort -> Group (Group is terminal, not Fastq).
+        let mut spec = empty_spec(vec![Stage::Sort, Stage::Group]);
+        spec.sink = SinkSpec::FastqPaired {
+            out1: std::path::PathBuf::from("r1.fq"),
+            out2: std::path::PathBuf::from("r2.fq"),
+            out0: None,
+        };
+        let err = validate_cross_stage_constraints(&spec).unwrap_err();
+        assert!(err.to_string().contains("Stage::Fastq"), "got: {err}");
     }
 }
