@@ -4,7 +4,7 @@ use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    build_pipeline_config, parse_bool,
+    build_pipeline_config, is_r1_genomically_earlier_raw, parse_bool,
 };
 use crate::grouper::{
     FilterMetrics, ProcessedPositionGroup, RawPositionGroup, RecordPositionGrouper,
@@ -271,23 +271,6 @@ fn filter_template_raw(
 
     metrics.accepted_templates += num_primary_reads;
     true
-}
-
-/// Check if R1 is genomically earlier than R2 using raw bytes.
-///
-/// Uses zero-allocation CIGAR iteration. Unmapped reads return position 0
-/// (matching noodles `unwrap_or(0)` behavior).
-fn is_r1_genomically_earlier_raw(r1: &[u8], r2: &[u8]) -> bool {
-    use fgumi_raw_bam;
-
-    let ref1 = fgumi_raw_bam::ref_id(r1);
-    let ref2 = fgumi_raw_bam::ref_id(r2);
-    if ref1 != ref2 {
-        return ref1 < ref2;
-    }
-    let r1_pos = fgumi_raw_bam::unclipped_5prime_from_raw_bam(r1);
-    let r2_pos = fgumi_raw_bam::unclipped_5prime_from_raw_bam(r2);
-    r1_pos <= r2_pos
 }
 
 /// Get pair orientation from raw-byte template.
@@ -4228,58 +4211,200 @@ mod tests {
         Ok(())
     }
 
+    /// Build a paired template for the duplex `paired` strategy with an
+    /// explicit R1 strand, so both strands of one duplex molecule can be
+    /// constructed (unlike `build_test_pair`, which is FR-only).
+    ///
+    /// * `r1_reverse = false` — top strand: R1 forward at `r1_pos`, R2 reverse
+    ///   at `r2_pos`.
+    /// * `r1_reverse = true` — bottom strand: R1 reverse at `r1_pos`, R2 forward
+    ///   at `r2_pos`.
+    ///
+    /// Both reads are 100M and carry `umi` in `RX` plus the mate's cigar in
+    /// `MC` (required for the paired `GroupKey`'s mate-position computation).
+    fn build_duplex_pair(
+        name: &str,
+        ref_id: usize,
+        r1_pos: i32,
+        r2_pos: i32,
+        umi: &str,
+        r1_reverse: bool,
+    ) -> (fgumi_raw_bam::RawRecord, fgumi_raw_bam::RawRecord) {
+        let seq = vec![b'A'; 100];
+        let quals = vec![30u8; 100];
+        let cigar = encode_op(0, 100); // 100M
+
+        // R1 strand is `r1_reverse`; R2 is always the opposite strand. Each
+        // read's MATE_REVERSE bit reflects the other read's strand.
+        let r1_flags = flags::PAIRED
+            | flags::FIRST_SEGMENT
+            | if r1_reverse { flags::REVERSE } else { flags::MATE_REVERSE };
+        let r2_flags = flags::PAIRED
+            | flags::LAST_SEGMENT
+            | if r1_reverse { flags::MATE_REVERSE } else { flags::REVERSE };
+
+        let mut b1 = RawSamBuilder::new();
+        b1.read_name(name.as_bytes())
+            .flags(r1_flags)
+            .ref_id(ref_id as i32)
+            .pos(r1_pos - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals)
+            .mate_ref_id(ref_id as i32)
+            .mate_pos(r2_pos - 1);
+        b1.add_string_tag(SamTag::RX, umi.as_bytes());
+        b1.add_string_tag(SamTag::MC, b"100M");
+        let r1 = b1.build();
+
+        let mut b2 = RawSamBuilder::new();
+        b2.read_name(name.as_bytes())
+            .flags(r2_flags)
+            .ref_id(ref_id as i32)
+            .pos(r2_pos - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals)
+            .mate_ref_id(ref_id as i32)
+            .mate_pos(r1_pos - 1);
+        b2.add_string_tag(SamTag::RX, umi.as_bytes());
+        b2.add_string_tag(SamTag::MC, b"100M");
+        let r2 = b2.build();
+
+        (r1, r2)
+    }
+
+    /// Distinct molecule bases (the `MI` value before the `/A`|`/B` suffix).
+    fn distinct_mi_bases(
+        records: &[sam::alignment::RecordBuf],
+    ) -> std::collections::HashSet<String> {
+        get_mi_tags(records)
+            .into_iter()
+            .map(|t| t.split('/').next().unwrap_or(&t).to_string())
+            .collect()
+    }
+
     #[test]
     fn test_paired_assigner_explicit_ab_ba_symmetry() -> Result<()> {
-        // Test that paired assigner correctly handles A-B and B-A pairs
-        // They should be grouped separately as different orientations
+        // Ported from fgbio GroupReadsByUmiTest "correctly group reads with the
+        // paired assigner when the two UMIs are the same". The two strands of
+        // ONE duplex molecule — the top strand (R1 forward) and the bottom
+        // strand (R1 reverse), whose paired UMIs are reverses of each other —
+        // must group into a SINGLE molecule with `/A` and `/B` suffixes, NOT
+        // two separate molecules.
+        //
+        // The prior version of this test used the FR-only `build_test_pair`
+        // helper (so it could not build the reverse-strand bottom read) and
+        // asserted 2 groups, inverting fgbio's contract.
         let mut records = Vec::new();
 
-        // Create pairs with A-B orientation
-        let (r1_ab, r2_ab) = build_test_pair("read_ab_1", 0, 100, 300, 60, 60, "AAAA-TTTT");
-        records.push(r1_ab);
-        records.push(r2_ab);
+        // Top strand: R1 forward @100, R2 reverse @300; UMI AAAA-TTTT.
+        let (r1, r2) = build_duplex_pair("read_ab_1", 0, 100, 300, "AAAA-TTTT", false);
+        records.push(r1);
+        records.push(r2);
+        let (r1, r2) = build_duplex_pair("read_ab_2", 0, 100, 300, "AAAA-TTTT", false);
+        records.push(r1);
+        records.push(r2);
 
-        // Create another pair with same A-B orientation
-        let (r1_ab2, r2_ab2) = build_test_pair("read_ab_2", 0, 100, 300, 60, 60, "AAAA-TTTT");
-        records.push(r1_ab2);
-        records.push(r2_ab2);
-
-        // Create pairs with B-A orientation (swapped UMIs)
-        let (r1_ba, r2_ba) = build_test_pair("read_ba_1", 0, 100, 300, 60, 60, "TTTT-AAAA");
-        records.push(r1_ba);
-        records.push(r2_ba);
+        // Bottom strand: R1 reverse @300, R2 forward @100; UMI reversed to
+        // TTTT-AAAA — the opposite strand of the SAME molecule.
+        let (r1, r2) = build_duplex_pair("read_ba_1", 0, 300, 100, "TTTT-AAAA", true);
+        records.push(r1);
+        records.push(r2);
 
         let input = create_test_bam(records)?;
         let paths = TestPaths::new()?;
-
         let cmd = GroupReadsByUmi {
             io: BamIoOptions {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
             },
-            ..test_group_cmd(Strategy::Paired, 0)
+            ..test_group_cmd(Strategy::Paired, 1)
         };
-
         cmd.execute("test")?;
 
         let output_records = read_bam_records(&paths.output)?;
-
-        // Should have 6 records (3 pairs)
         assert_eq!(output_records.len(), 6, "Should have all 6 records");
+        let mi_tags = get_mi_tags(&output_records);
+        assert!(
+            mi_tags.iter().all(|t| t.ends_with("/A") || t.ends_with("/B")),
+            "All MI tags should have /A or /B suffix. Tags: {mi_tags:?}"
+        );
 
-        // Get the MI tags
+        // Both strands are ONE molecule: exactly one base, and exactly two
+        // full MI values (`<base>/A` and `<base>/B`).
+        let bases = distinct_mi_bases(&output_records);
+        assert_eq!(
+            bases.len(),
+            1,
+            "top and bottom strands must share one molecule base; got MIs {mi_tags:?}"
+        );
+        assert_eq!(
+            count_unique_mi_tags(&output_records),
+            2,
+            "the one molecule must have exactly two strands /A and /B; got MIs {mi_tags:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_paired_assigner_pairs_overlapping_duplex_strands() -> Result<()> {
+        // Regression test for the paired-strategy strand-pairing bug on
+        // fully-overlapping / short-insert fragments.
+        //
+        // When a template's two mates share an unclipped 5' coordinate, the
+        // `is_r1_genomically_earlier_raw` tie-break decides which half of the
+        // paired UMI gets the lower-vs-higher-read prefix. A tie-break of
+        // `r1_pos <= r2_pos` returns `true` for BOTH strands (R1 forward and R1
+        // reverse), so the two strands' prefixed UMIs are no longer reverses of
+        // each other and fail to pair — splitting one duplex molecule into two.
+        // fgbio breaks the tie on `r1.positiveStrand`, keeping the strands
+        // paired; this test pins that behavior.
+        //
+        // Geometry (100M reads): top strand R1 forward @199 / R2 reverse @100
+        // and bottom strand R1 reverse @100 / R2 forward @199. Both mates'
+        // unclipped 5' ends land on 199 (100 + 100 - 1), so the tie-break fires.
+        let mut records = Vec::new();
+        let (r1, r2) = build_duplex_pair("top", 0, 199, 100, "AAAA-TTTT", false);
+        records.push(r1);
+        records.push(r2);
+        let (r1, r2) = build_duplex_pair("bottom", 0, 100, 199, "TTTT-AAAA", true);
+        records.push(r1);
+        records.push(r2);
+
+        let input = create_test_bam(records)?;
+        let paths = TestPaths::new()?;
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
+            ..test_group_cmd(Strategy::Paired, 1)
+        };
+        cmd.execute("test")?;
+
+        let output_records = read_bam_records(&paths.output)?;
+        assert_eq!(output_records.len(), 4, "Should have all 4 records");
         let mi_tags = get_mi_tags(&output_records);
 
-        // With paired strategy, A-B and B-A should form separate groups
-        // but both should get /A or /B suffixes
-        let unique_groups = count_unique_mi_tags(&output_records);
-        assert_eq!(unique_groups, 2, "Should have 2 groups (A-B vs B-A orientation)");
-
-        // All tags should have the /A or /B suffix
-        assert!(
-            mi_tags.iter().all(|t| t.contains("/A") || t.contains("/B")),
-            "All MI tags should have /A or /B suffix. Tags: {mi_tags:?}"
+        // The two strands must be ONE molecule: a single base, with both /A and
+        // /B present. Before the fix this produced two distinct bases (a split).
+        let bases = distinct_mi_bases(&output_records);
+        assert_eq!(
+            bases.len(),
+            1,
+            "overlapping-fragment duplex strands must share one molecule base, \
+             not be split; got MIs {mi_tags:?}"
+        );
+        assert_eq!(
+            count_unique_mi_tags(&output_records),
+            2,
+            "the one molecule must have exactly two strands /A and /B; got MIs {mi_tags:?}"
         );
 
         Ok(())

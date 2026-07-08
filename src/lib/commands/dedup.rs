@@ -52,7 +52,7 @@ use serde::{Deserialize, Serialize};
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    build_pipeline_config, parse_bool,
+    build_pipeline_config, is_r1_genomically_earlier_raw, parse_bool,
 };
 use crate::sam::TC_TAG;
 use fgumi_raw_bam;
@@ -463,18 +463,6 @@ fn get_pair_orientation(template: &Template) -> (bool, bool) {
         .r2()
         .is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::REVERSE) == 0);
     (r1_positive, r2_positive)
-}
-
-/// Check if R1 is genomically earlier than R2.
-fn is_r1_genomically_earlier_raw(r1: &[u8], r2: &[u8]) -> bool {
-    let ref1 = fgumi_raw_bam::ref_id(r1);
-    let ref2 = fgumi_raw_bam::ref_id(r2);
-    if ref1 != ref2 {
-        return ref1 < ref2;
-    }
-    let r1_pos = fgumi_raw_bam::unclipped_5prime_from_raw_bam(r1);
-    let r2_pos = fgumi_raw_bam::unclipped_5prime_from_raw_bam(r2);
-    r1_pos <= r2_pos
 }
 
 /// Truncate UMIs to minimum length if specified.
@@ -2111,30 +2099,34 @@ mod tests {
 
     #[test]
     fn test_is_r1_earlier_equal_position() {
-        // Both at position 100 -> true (<=)
-        let r1 = {
+        // Both mates share an unclipped 5' coordinate, so the tie breaks on
+        // strand (mirroring fgbio): R1 is "earlier" iff it is on the forward
+        // strand. A forward-strand R1 => true; a reverse-strand R1 => false.
+        // Assert both halves so the strand-dependent tie-break stays pinned.
+        let build_mate = |first_segment: bool, r1_reverse: bool| {
             let mut b = RawSamBuilder::new();
+            let strand = if r1_reverse { flags::REVERSE } else { 0 };
+            let segment = if first_segment { flags::FIRST_SEGMENT } else { flags::LAST_SEGMENT };
             b.read_name(b"q1")
                 .sequence(b"ACGT")
                 .qualities(&[30, 30, 30, 30])
                 .ref_id(0)
                 .pos(99)
                 .cigar_ops(&[encode_op(0, 4)])
-                .flags(flags::PAIRED | flags::FIRST_SEGMENT);
+                .flags(flags::PAIRED | segment | strand);
             b.build()
         };
-        let r2 = {
-            let mut b = RawSamBuilder::new();
-            b.read_name(b"q1")
-                .sequence(b"TGCA")
-                .qualities(&[30, 30, 30, 30])
-                .ref_id(0)
-                .pos(99)
-                .cigar_ops(&[encode_op(0, 4)])
-                .flags(flags::PAIRED | flags::LAST_SEGMENT);
-            b.build()
-        };
-        assert!(is_r1_genomically_earlier_raw(&r1, &r2));
+
+        // Forward-strand R1 at the tie => R1 is earlier.
+        let r1_fwd = build_mate(true, false);
+        let r2_fwd = build_mate(false, false);
+        assert!(is_r1_genomically_earlier_raw(&r1_fwd, &r2_fwd));
+
+        // Reverse-strand R1 at the same tie => R1 is NOT earlier. This is the
+        // half the old `r1_pos <= r2_pos` tie-break got wrong.
+        let r1_rev = build_mate(true, true);
+        let r2_rev = build_mate(false, false);
+        assert!(!is_r1_genomically_earlier_raw(&r1_rev, &r2_rev));
     }
 
     // ========================================================================

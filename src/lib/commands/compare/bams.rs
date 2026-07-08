@@ -516,6 +516,24 @@ enum MiKey {
     Strand { base: i64, strand: u8 },
 }
 
+impl MiKey {
+    /// The molecule-level id, ignoring any duplex strand suffix.
+    ///
+    /// For duplex output the two strands of one molecule share a `base` but
+    /// differ in `strand` (`/A` vs `/B`). Grouping-equivalence checks that key
+    /// on the full [`MiKey`] treat the strands as independent groups, so they
+    /// cannot detect a *strand-pairing* difference — one file bundling `X/A` +
+    /// `X/B` into a single molecule while another splits them into `X/A` +
+    /// `Y/A`. Comparing at the `base` level catches that: reads that share a
+    /// molecule in one file must share a molecule in the other.
+    fn base(&self) -> i64 {
+        match self {
+            MiKey::Int(v) => *v,
+            MiKey::Strand { base, .. } => *base,
+        }
+    }
+}
+
 impl std::fmt::Display for MiKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -523,6 +541,45 @@ impl std::fmt::Display for MiKey {
             MiKey::Strand { base, strand } => write!(f, "{base}/{}", *strand as char),
         }
     }
+}
+
+/// Count molecule-level (strand-suffix-stripped) grouping mismatches in both
+/// directions: the number of `base` groups in either file whose reads map to
+/// more than one `base` in the other file.
+///
+/// This complements the full-[`MiKey`] grouping check (which keeps `/A`/`/B`
+/// distinct to catch strand *disagreements*) by catching strand-*pairing*
+/// differences the full-key check is structurally blind to: if BAM1 pairs
+/// `X/A` + `X/B` into molecule `X` and BAM2 splits those same reads into
+/// `X/A` + `Y/A`, the full-key mapping is still a consistent bijection
+/// (`X/A↔X/A`, `X/B↔Y/A`) with zero mismatches, yet the duplex molecules
+/// genuinely differ. For single-strand (`Int`) MIs `base()` is the id itself,
+/// so this reduces to the same partition check and never adds false mismatches.
+fn count_base_pairing_mismatches(
+    mi_map1: &AHashMap<ReadKeyHash, MiKey>,
+    mi_map2: &AHashMap<ReadKeyHash, MiKey>,
+) -> u64 {
+    fn count_one_direction(
+        from: &AHashMap<ReadKeyHash, MiKey>,
+        to: &AHashMap<ReadKeyHash, MiKey>,
+    ) -> u64 {
+        let mut base_to_base: AHashMap<i64, (i64, bool)> = AHashMap::new();
+        for (key_hash, mi_from) in from {
+            if let Some(mi_to) = to.get(key_hash) {
+                base_to_base
+                    .entry(mi_from.base())
+                    .and_modify(|(first, has_mismatch)| {
+                        if *first != mi_to.base() {
+                            *has_mismatch = true;
+                        }
+                    })
+                    .or_insert((mi_to.base(), false));
+            }
+        }
+        base_to_base.values().filter(|(_, has_mismatch)| *has_mismatch).count() as u64
+    }
+
+    count_one_direction(mi_map1, mi_map2) + count_one_direction(mi_map2, mi_map1)
 }
 
 /// Build a map from MI value to set of read key hashes.
@@ -1832,6 +1889,21 @@ impl CompareBams {
             }
         }
 
+        // Verify molecule-level (duplex strand-pairing) equivalence — the
+        // per-MiKey checks above keep `/A`/`/B` distinct and so cannot detect a
+        // strand-pairing split (see `count_base_pairing_mismatches`). Fold any
+        // base-level mismatches into the total so a split makes groupings DIFFER.
+        let base_pairing_mismatches = count_base_pairing_mismatches(&mi_map1, &mi_map2);
+        if base_pairing_mismatches > 0 {
+            stats.grouping_mismatches += base_pairing_mismatches;
+            if grouping_errors.len() < self.max_diffs {
+                grouping_errors.push(format!(
+                    "{base_pairing_mismatches} molecule(s) differ in duplex strand pairing \
+                     (reads sharing a molecule in one BAM are split across molecules in the other)"
+                ));
+            }
+        }
+
         // Determine result
         let is_equivalent = !stats.count_mismatch
             && stats.order_mismatches == 0
@@ -2030,6 +2102,22 @@ impl CompareBams {
                 mismatches2.into_iter().take(max_diffs.saturating_sub(grouping_errors.len())),
             );
 
+            // Phase 5: Verify molecule-level (duplex strand-pairing) equivalence.
+            // Phase 4 keys on the full MiKey, so it cannot see a strand-pairing
+            // split (see `count_base_pairing_mismatches`). Fold any base-level
+            // mismatches into the grouping-mismatch total so such a split makes
+            // the groupings DIFFER instead of silently passing as EQUIVALENT.
+            let base_pairing_mismatches = count_base_pairing_mismatches(&mi_map1, &mi_map2);
+            if base_pairing_mismatches > 0 {
+                stats.grouping_mismatches += base_pairing_mismatches;
+                if grouping_errors.len() < max_diffs {
+                    grouping_errors.push(format!(
+                        "{base_pairing_mismatches} molecule(s) differ in duplex strand pairing \
+                         (reads sharing a molecule in one BAM are split across molecules in the other)"
+                    ));
+                }
+            }
+
             Ok(())
         });
 
@@ -2108,6 +2196,66 @@ mod tests {
         let h1 = hash_read_key_raw(b"read_one", true);
         let h2 = hash_read_key_raw(b"read_one", true);
         assert_eq!(h1, h2, "same input must yield same hash");
+    }
+
+    // ---- count_base_pairing_mismatches (duplex strand-pairing check) --------
+
+    /// A strand-pairing split must be flagged: BAM1 pairs both strands into
+    /// molecule `0` (`0/A` + `0/B`); BAM2 splits those same reads into two
+    /// molecules (`0/A` + `1/A`). The full-MiKey check sees a consistent
+    /// bijection (0 mismatches), so this base-level check is what catches it.
+    #[test]
+    fn count_base_pairing_mismatches_flags_strand_split() {
+        let mut m1: AHashMap<ReadKeyHash, MiKey> = AHashMap::new();
+        m1.insert(1, MiKey::Strand { base: 0, strand: b'A' });
+        m1.insert(2, MiKey::Strand { base: 0, strand: b'B' });
+        let mut m2: AHashMap<ReadKeyHash, MiKey> = AHashMap::new();
+        m2.insert(1, MiKey::Strand { base: 0, strand: b'A' });
+        m2.insert(2, MiKey::Strand { base: 1, strand: b'A' });
+        assert!(
+            count_base_pairing_mismatches(&m1, &m2) > 0,
+            "a duplex molecule split across two bases must be flagged"
+        );
+    }
+
+    /// Pure molecule renumbering (same pairing, different base id) is
+    /// equivalent and must not be flagged.
+    #[test]
+    fn count_base_pairing_mismatches_zero_for_molecule_relabel() {
+        let mut m1: AHashMap<ReadKeyHash, MiKey> = AHashMap::new();
+        m1.insert(1, MiKey::Strand { base: 0, strand: b'A' });
+        m1.insert(2, MiKey::Strand { base: 0, strand: b'B' });
+        let mut m2: AHashMap<ReadKeyHash, MiKey> = AHashMap::new();
+        m2.insert(1, MiKey::Strand { base: 9, strand: b'A' });
+        m2.insert(2, MiKey::Strand { base: 9, strand: b'B' });
+        assert_eq!(count_base_pairing_mismatches(&m1, &m2), 0);
+    }
+
+    /// Swapping the `/A` and `/B` labels of a molecule is a naming difference,
+    /// not a pairing difference — equivalent at the base level.
+    #[test]
+    fn count_base_pairing_mismatches_zero_for_ab_strand_swap() {
+        let mut m1: AHashMap<ReadKeyHash, MiKey> = AHashMap::new();
+        m1.insert(1, MiKey::Strand { base: 0, strand: b'A' });
+        m1.insert(2, MiKey::Strand { base: 0, strand: b'B' });
+        let mut m2: AHashMap<ReadKeyHash, MiKey> = AHashMap::new();
+        m2.insert(1, MiKey::Strand { base: 0, strand: b'B' });
+        m2.insert(2, MiKey::Strand { base: 0, strand: b'A' });
+        assert_eq!(count_base_pairing_mismatches(&m1, &m2), 0);
+    }
+
+    /// For single-strand (`Int`) MIs `base()` is the id itself, so a consistent
+    /// relabel reduces to the ordinary partition check and adds no false
+    /// mismatches.
+    #[test]
+    fn count_base_pairing_mismatches_zero_for_simplex_relabel() {
+        let mut m1: AHashMap<ReadKeyHash, MiKey> = AHashMap::new();
+        m1.insert(1, MiKey::Int(5));
+        m1.insert(2, MiKey::Int(5));
+        let mut m2: AHashMap<ReadKeyHash, MiKey> = AHashMap::new();
+        m2.insert(1, MiKey::Int(7));
+        m2.insert(2, MiKey::Int(7));
+        assert_eq!(count_base_pairing_mismatches(&m1, &m2), 0);
     }
 
     #[test]
