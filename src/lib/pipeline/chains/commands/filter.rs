@@ -168,7 +168,8 @@ pub(crate) fn build_filter_step_single_no_rejects(
         "FilterProcess",
         limit_bytes,
         move |item: DecodedRecordBatch| -> io::Result<DecompressedBlock> {
-            let DecodedRecordBatch { batch_serial, records, .. } = item;
+            let batch_serial = item.batch_serial();
+            let records = item.into_records();
             let records_count = records.len() as u64;
             let mut kept_bytes: Vec<u8> = Vec::new();
             let mut passed_count: u64 = 0;
@@ -246,7 +247,8 @@ pub(crate) fn build_filter_step_single_with_rejects(
         limit_bytes,
         move |item: DecodedRecordBatch|
               -> io::Result<Process2Output<DecompressedBlock, DecompressedBlock>> {
-            let DecodedRecordBatch { batch_serial, records, .. } = item;
+            let batch_serial = item.batch_serial();
+            let records = item.into_records();
             let records_count = records.len() as u64;
             let mut kept_bytes: Vec<u8> = Vec::new();
             let mut rejected_bytes: Vec<u8> = Vec::new();
@@ -316,7 +318,7 @@ pub(crate) fn build_filter_step_template_no_rejects(
         "FilterProcess",
         limit_bytes,
         move |item: BamTemplateBatch| -> io::Result<DecompressedBlock> {
-            let BamTemplateBatch { batch_serial, templates, .. } = item;
+            let (batch_serial, templates) = item.into_parts();
             let mut kept_bytes: Vec<u8> = Vec::new();
             let mut total_records: u64 = 0;
             let mut passed_count: u64 = 0;
@@ -407,7 +409,7 @@ pub(crate) fn build_filter_step_template_with_rejects(
         limit_bytes,
         move |item: BamTemplateBatch|
               -> io::Result<Process2Output<DecompressedBlock, DecompressedBlock>> {
-            let BamTemplateBatch { batch_serial, templates, .. } = item;
+            let (batch_serial, templates) = item.into_parts();
             let mut kept_bytes: Vec<u8> = Vec::new();
             let mut rejected_bytes: Vec<u8> = Vec::new();
             let mut total_records: u64 = 0;

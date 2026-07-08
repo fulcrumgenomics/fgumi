@@ -122,7 +122,7 @@ impl Step for SerializeBamRecords {
         // thread-local cache is the goal — see `BgzfDecompress` for the
         // rationale. Per-record framing shared with `SerializeRecordBatch`
         // via [`frame_record_into`].
-        for template in &batch.templates {
+        for template in batch.templates() {
             for record in &template.records {
                 frame_record_into(&mut self.output_scratch, record.as_ref())?;
             }
@@ -132,7 +132,7 @@ impl Step for SerializeBamRecords {
             Vec::with_capacity(SERIALIZE_SCRATCH_CAPACITY),
         );
 
-        let out = DecompressedBlock { batch_serial: batch.batch_serial, bytes };
+        let out = DecompressedBlock { batch_serial: batch.batch_serial(), bytes };
         match ctx.outputs.push(out) {
             Ok(()) => Ok(StepOutcome::Progress),
             Err(unpushed) => {
@@ -222,9 +222,9 @@ mod tests {
 
         // Drive the serializer manually (mirrors the closure path; the
         // step trait integration is exercised by `tests.rs` via `run`).
-        let record_count: usize = input.templates.iter().map(|t| t.records.len()).sum();
-        let mut bytes = Vec::with_capacity(input.total_bytes + 4 * record_count);
-        for template in &input.templates {
+        let record_count: usize = input.templates().iter().map(|t| t.records.len()).sum();
+        let mut bytes = Vec::with_capacity(input.total_bytes() + 4 * record_count);
+        for template in input.templates() {
             for record in &template.records {
                 let block_size = u32::try_from(record.len()).unwrap();
                 bytes.extend_from_slice(&block_size.to_le_bytes());

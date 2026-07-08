@@ -127,9 +127,9 @@ fn run_batch_with_rejects_splits_kept_and_rejected() {
         run_batch_with_rejects(&mut state, &cfg, batch).expect("run_batch_with_rejects");
 
     // Kept branch keeps the on-whitelist + correctable templates only.
-    assert_eq!(kept.batch_serial, 7);
-    assert_eq!(kept.templates.len(), 2, "exact + correctable kept");
-    let mut kept_umis: Vec<String> = kept.templates.iter().map(template_rx).collect();
+    assert_eq!(kept.batch_serial(), 7);
+    assert_eq!(kept.templates().len(), 2, "exact + correctable kept");
+    let mut kept_umis: Vec<String> = kept.templates().iter().map(template_rx).collect();
     kept_umis.sort();
     // Both kept records carry the corrected/whitelisted UMI "AAAA".
     assert_eq!(kept_umis, vec!["AAAA".to_string(), "AAAA".to_string()]);
@@ -137,7 +137,7 @@ fn run_batch_with_rejects_splits_kept_and_rejected() {
     // templates normalize to "AAAA", so a regression that kept the wrong record
     // (e.g. dropped `correctable` and kept `offlist` rewritten to AAAA) would
     // still satisfy the RX check above.
-    let mut kept_qnames: Vec<String> = kept.templates.iter().map(template_qname).collect();
+    let mut kept_qnames: Vec<String> = kept.templates().iter().map(template_qname).collect();
     kept_qnames.sort();
     assert_eq!(kept_qnames, vec!["correctable".to_string(), "exact".to_string()]);
 
@@ -173,7 +173,7 @@ fn run_batch_with_rejects_no_rejects_when_all_kept() {
     let (kept, rejects) =
         run_batch_with_rejects(&mut state, &cfg, batch).expect("run_batch_with_rejects");
 
-    assert_eq!(kept.templates.len(), 1);
+    assert_eq!(kept.templates().len(), 1);
     assert!(rejects.is_none(), "no rejected records -> no rejects block");
     assert_eq!(cfg.records_emitted.load(Ordering::Relaxed), 1);
 }
@@ -196,14 +196,14 @@ fn run_batch_kept_only_drops_rejected() {
     let (kept, ()) = run_batch_kept_only(&mut state, &cfg, batch).expect("run_batch_kept_only");
 
     // Only the AAAA + correctable templates survive; TTTT is dropped silently.
-    assert_eq!(kept.batch_serial, 11);
-    assert_eq!(kept.templates.len(), 2, "TTTT dropped, no rejects branch");
-    let mut kept_umis: Vec<String> = kept.templates.iter().map(template_rx).collect();
+    assert_eq!(kept.batch_serial(), 11);
+    assert_eq!(kept.templates().len(), 2, "TTTT dropped, no rejects branch");
+    let mut kept_umis: Vec<String> = kept.templates().iter().map(template_rx).collect();
     kept_umis.sort();
     assert_eq!(kept_umis, vec!["AAAA".to_string(), "AAAA".to_string()]);
     // Pin kept identity by QNAME: the on-whitelist `exact` and the `correctable`
     // template survive; `offlist` (TTTT) is the one dropped.
-    let mut kept_qnames: Vec<String> = kept.templates.iter().map(template_qname).collect();
+    let mut kept_qnames: Vec<String> = kept.templates().iter().map(template_qname).collect();
     kept_qnames.sort();
     assert_eq!(kept_qnames, vec!["correctable".to_string(), "exact".to_string()]);
 

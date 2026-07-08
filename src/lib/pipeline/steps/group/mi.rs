@@ -300,7 +300,7 @@ impl Step for GroupByMi {
         for _ in 0..MAX_BATCHES_PER_LOCK {
             let Some(batch) = ctx.input.pop() else { break };
             did_work = true;
-            let DecodedRecordBatch { records, .. } = batch;
+            let records = batch.into_records();
             for decoded in records {
                 self.process_record(decoded.into_raw_bytes());
             }

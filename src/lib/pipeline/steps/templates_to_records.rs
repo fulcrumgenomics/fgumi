@@ -91,22 +91,23 @@ impl Step for TemplatesToRecordBatch {
             return Ok(StepOutcome::NoProgress);
         };
 
-        let serial = batch.batch_serial;
+        let serial = batch.batch_serial();
         // Pre-size the backing buffer from the exact sum of record
-        // body bytes. `batch.total_bytes` over-estimates because
+        // body bytes. `batch.total_bytes()` over-estimates because
         // `Template::heap_size` includes the queryname bytes, but
         // those don't appear in the `RecordBatch.backing` (only the
         // body bytes do). Computing the tight number once is cheap
         // and keeps the builder's allocation in a single mimalloc
         // size class.
         let bytes_cap: usize = batch
-            .templates
+            .templates()
             .iter()
             .flat_map(|t| t.records.iter().map(fgumi_raw_bam::RawRecord::len))
             .sum();
-        let records_cap: usize = batch.templates.iter().map(|t| t.records.len()).sum();
+        let records_cap: usize = batch.templates().iter().map(|t| t.records.len()).sum();
         let mut builder = RecordBatchBuilder::with_capacity(serial, bytes_cap, records_cap);
-        for template in batch.templates {
+        let (_, templates) = batch.into_parts();
+        for template in templates {
             for record in template.records {
                 builder.push_record_bytes(record.as_ref());
             }
@@ -178,11 +179,12 @@ mod tests {
             42,
             vec![make_paired_template(b"q1"), make_paired_template(b"q2")],
         );
-        let total_bytes = batch.total_bytes;
-        let serial = batch.batch_serial;
-        let records_cap: usize = batch.templates.iter().map(|t| t.records.len()).sum();
+        let total_bytes = batch.total_bytes();
+        let serial = batch.batch_serial();
+        let records_cap: usize = batch.templates().iter().map(|t| t.records.len()).sum();
         let mut builder = RecordBatchBuilder::with_capacity(serial, total_bytes, records_cap);
-        for template in batch.templates {
+        let (_, templates) = batch.into_parts();
+        for template in templates {
             for record in template.records {
                 builder.push_record_bytes(record.as_ref());
             }

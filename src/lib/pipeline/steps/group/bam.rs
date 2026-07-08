@@ -100,7 +100,7 @@ impl Step for GroupBam {
         for _ in 0..MAX_BATCHES_PER_LOCK {
             let Some(batch) = ctx.input.pop() else { break };
             did_work = true;
-            let DecodedRecordBatch { records, .. } = batch;
+            let records = batch.into_records();
 
             // Feed pre-decoded records into the wrapped grouper. The
             // grouper returns zero or more completed `TemplateBatch`es
