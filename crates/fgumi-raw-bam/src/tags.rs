@@ -858,7 +858,11 @@ pub fn reverse_string_tag_in_place(record: &mut [u8], aux_offset: usize, tag: im
     }
 }
 
-/// Reverse-complement a Z-type string tag value in place (A<->T, C<->G).
+/// Reverse-complement a Z-type string tag value in place.
+///
+/// Uses `fgumi_dna::COMPLEMENT`, the shared IUPAC-aware, case-preserving
+/// complement table (unknown bytes pass through), so tag reverse-complement
+/// matches the consensus base paths and fgbio/htsjdk (`R<->Y`, etc.).
 #[inline]
 pub fn reverse_complement_string_tag_in_place(
     record: &mut [u8],
@@ -869,13 +873,7 @@ pub fn reverse_complement_string_tag_in_place(
     if let Some((start, end)) = find_string_tag_range(record, aux_offset, *tag) {
         record[start..end].reverse();
         for b in &mut record[start..end] {
-            *b = match *b {
-                b'A' | b'a' => b'T',
-                b'T' | b't' => b'A',
-                b'C' | b'c' => b'G',
-                b'G' | b'g' => b'C',
-                other => other,
-            };
+            *b = fgumi_dna::COMPLEMENT[*b as usize];
         }
     }
 }
@@ -3369,8 +3367,20 @@ mod tests {
         let aux_offset = aux_data_offset_from_record(&rec)
             .expect("record should have valid header for aux offset");
         reverse_complement_string_tag_in_place(&mut rec, aux_offset, SamTag::RX);
-        // lowercase a->T, c->G, g->C, t->A, reversed: ACGT
-        assert_eq!(find_string_tag(&rec[aux_offset..], SamTag::RX), Some(b"ACGT".as_ref()));
+        // case-preserving: acgt -> reverse tgca -> complement acgt
+        assert_eq!(find_string_tag(&rec[aux_offset..], SamTag::RX), Some(b"acgt".as_ref()));
+    }
+
+    #[test]
+    fn test_reverse_complement_string_tag_in_place_iupac_and_case() {
+        // IUPAC-aware + case-preserving, sharing fgumi-dna's COMPLEMENT table (R2-SEQ-04).
+        // "NRG" -> reverse "GRN" -> complement "CYN"
+        let aux = b"RXZNRG\x00";
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
+        let aux_offset = aux_data_offset_from_record(&rec)
+            .expect("record should have valid header for aux offset");
+        reverse_complement_string_tag_in_place(&mut rec, aux_offset, SamTag::RX);
+        assert_eq!(find_string_tag(&rec[aux_offset..], SamTag::RX), Some(b"CYN".as_ref()));
     }
 
     #[test]
