@@ -1,9 +1,13 @@
 //! Convert BAM to FASTQ format.
 //!
-//! This tool reads a BAM file and outputs interleaved FASTQ to stdout for piping to aligners.
-//! Input should be queryname-sorted or template-coordinate sorted.
+//! Reads a BAM and writes FASTQ: interleaved to stdout (for piping to an
+//! aligner) or a file, paired split files (`--out1`/`--out2`/`--out0`), and
+//! optionally BGZF-compressed (`.gz`/`.bgz`) with the UMI embedded in the read
+//! name (`--annotate-read-names`). Interleaved output runs on the typed-step
+//! pipeline; paired output currently runs on a standalone loop. Input should be
+//! queryname-sorted or template-coordinate sorted.
 
-use crate::commands::common::parse_bool;
+use crate::commands::common::{QueueMemoryOptions, SchedulerOptions, parse_bool};
 use crate::logging::OperationTimer;
 use crate::sam::SamTag;
 use crate::validation::validate_file_exists;
@@ -64,7 +68,8 @@ fn parse_umi_tags(spec: &str) -> Result<Vec<SamTag>> {
 /// `OX`) and appended to the read name as `<name><name_delim><umi>`, with each
 /// `-` in the stored UMI (fgumi's duplex join) replaced by `umi_sep` (default
 /// `+`, the delimiter Illumina DRAGEN expects between duplex UMIs).
-pub(crate) struct UmiHeader {
+#[derive(Clone)]
+pub struct UmiHeader {
     /// Tags to search, in priority order; the first present wins.
     tags: Vec<SamTag>,
     /// Bytes inserted between the read name and the UMI.
@@ -131,13 +136,41 @@ fn classify_segment(flags: u16) -> Segment {
 }
 
 /// Returns `true` if `path` should be written compressed (ends in `.gz`/`.bgz`).
-fn path_is_gzip(path: &Path) -> bool {
+pub(crate) fn path_is_gzip(path: &Path) -> bool {
     matches!(path.extension().and_then(|e| e.to_str()), Some("gz" | "bgz" | "bgzf"))
+}
+
+/// Per-stage options for [`crate::pipeline::chains::Stage::Fastq`] — the
+/// BAM→FASTQ encode. Carries the flag filters, read-name suffix behavior, and
+/// the optional UMI-in-read-name config the encode step needs. The output
+/// destination(s) and compression are carried by the chain's `SinkSpec`, not
+/// here.
+#[derive(Clone)]
+pub struct FastqOptions {
+    /// Exclude reads with any of these flag bits set.
+    pub exclude_flags: u16,
+    /// Only include reads with all of these flag bits set.
+    pub require_flags: u16,
+    /// When `true`, omit the `/1` `/2` read-name suffix.
+    pub no_suffix: bool,
+    /// When `Some`, append the UMI (from the configured tag) to the read name.
+    pub umi_header: Option<UmiHeader>,
+}
+
+impl FastqOptions {
+    /// Returns `true` if a record with `flags` passes the include/exclude filters.
+    #[must_use]
+    pub(crate) fn passes_filters(&self, flags: u16) -> bool {
+        (flags & self.exclude_flags) == 0 && (flags & self.require_flags) == self.require_flags
+    }
 }
 
 /// Default BGZF/DEFLATE compression level for `.gz` FASTQ output (matches the
 /// samtools default).
 const FASTQ_GZIP_LEVEL: u32 = 6;
+
+/// Default for the deprecated, now-ignored `--bwa-chunk-size` flag.
+const DEFAULT_BWA_CHUNK_SIZE: u64 = 150_000_000;
 
 /// A FASTQ output stream. Compressed file outputs use BGZF (block gzip) via the
 /// same multi-threaded backend fgumi uses for BAM — gzip-compatible for
@@ -264,9 +297,11 @@ pub struct Fastq {
     #[arg(short = '@', short_alias = 't', long = "threads", default_value = "1")]
     pub threads: usize,
 
-    /// BWA -K parameter value (bases per batch). Sizes output buffer to match bwa's
-    /// batch size for optimal pipe throughput. Default matches common bwa mem usage.
-    #[arg(short = 'K', long = "bwa-chunk-size", default_value = "150000000")]
+    /// Deprecated and ignored. Previously sized the stdout flush batch to bwa's
+    /// `-K`; the typed-step pipeline now manages output batching via its queue
+    /// budget (`--max-memory`), so this flag has no effect. Kept for backward
+    /// compatibility; overriding it logs a warning.
+    #[arg(short = 'K', long = "bwa-chunk-size", default_value_t = DEFAULT_BWA_CHUNK_SIZE)]
     pub bwa_chunk_size: u64,
 
     /// Append the UMI (from a BAM tag) to the read name, matching
@@ -303,7 +338,26 @@ pub struct Fastq {
     /// `samtools fastq` without -0. A `.gz`/`.bgz` path is written as BGZF.
     #[arg(short = '0', long = "out0", requires = "out1")]
     pub out0: Option<PathBuf>,
+
+    /// Pipeline memory limits (`--max-memory`, …). The conversion runs on the
+    /// typed-step pipeline; these cap the in-flight queue memory. Defaults to a
+    /// lean fastq budget (see `FASTQ_DEFAULT_QUEUE_MEMORY_MB`); pass
+    /// `--max-memory` to override.
+    #[command(flatten)]
+    pub queue_memory: QueueMemoryOptions,
+
+    /// Pipeline scheduler diagnostics (`--pipeline-stats`, `--pipeline-trace`).
+    #[command(flatten)]
+    pub scheduler: SchedulerOptions,
 }
+
+/// Default total in-flight queue-memory budget for `fgumi fastq` when the user
+/// passes no `--max-memory`/`--queue-memory` flag. FASTQ blocks are small and
+/// the chain is a short linear source→encode→write pipeline, so the
+/// sort/consensus-sized default (768 MiB/thread) is wildly oversized; a modest
+/// fixed total keeps RSS flat as `--threads` scales while staying well above
+/// the pipeline's steady-state working set.
+const FASTQ_DEFAULT_QUEUE_MEMORY_MB: u64 = 256;
 
 /// Parse flag values supporting both decimal and hex (0x) notation.
 fn parse_flags(s: &str) -> Result<u16, String> {
@@ -334,79 +388,6 @@ impl Fastq {
         info!("Read name suffix: {}", if self.no_suffix { "disabled" } else { "enabled" });
     }
 
-    /// Returns `true` if the record passes the include/exclude flag filters.
-    #[inline]
-    fn passes_filters(&self, flags: u16) -> bool {
-        (flags & self.exclude_flags) == 0 && (flags & self.require_flags) == self.require_flags
-    }
-
-    /// Interleaved conversion: every record is written to a single sink (stdout
-    /// for piping, or one `--output` file).
-    fn run_interleaved(&self, mut sink: FastqSink) -> Result<()> {
-        let timer = OperationTimer::new("Converting BAM to FASTQ");
-        self.log_config();
-        info!("BWA chunk size: {} bases", self.bwa_chunk_size);
-        let umi_header = self.build_umi_header()?;
-
-        let (mut reader, _header) = create_raw_bam_reader(&self.input, self.threads)?;
-
-        let mut total_records: u64 = 0;
-        let mut written_records: u64 = 0;
-
-        // Batch tracking (mirrors bwa's logic)
-        let mut bases_this_batch: u64 = 0;
-        let mut records_this_batch: usize = 0;
-
-        // Reusable buffers to avoid per-record allocations
-        let mut seq_buf: Vec<u8> = Vec::with_capacity(512);
-        let mut qual_buf: Vec<u8> = Vec::with_capacity(512);
-        let mut record = RawRecord::new();
-
-        loop {
-            let n = reader.read_record(&mut record)?;
-            if n == 0 {
-                break; // EOF
-            }
-            total_records += 1;
-
-            let flags = record.flags();
-            if !self.passes_filters(flags) {
-                continue;
-            }
-
-            // Get sequence length for batch tracking
-            let seq_len = record.l_seq() as usize;
-
-            write_fastq_record(
-                &mut sink,
-                &record,
-                flags,
-                self.no_suffix,
-                umi_header.as_ref(),
-                &mut seq_buf,
-                &mut qual_buf,
-            )?;
-            written_records += 1;
-
-            // Track batch progress
-            bases_this_batch += seq_len as u64;
-            records_this_batch += 1;
-
-            // Flush at batch boundary (like bwa: bases >= K AND record count is even)
-            if bases_this_batch >= self.bwa_chunk_size && records_this_batch.is_multiple_of(2) {
-                sink.flush()?;
-                bases_this_batch = 0;
-                records_this_batch = 0;
-            }
-        }
-
-        sink.finish()?;
-
-        info!("Read {total_records} records, wrote {written_records} FASTQ records");
-        timer.log_completion(written_records);
-        Ok(())
-    }
-
     /// Paired conversion: route R1/R2/other reads to the `--out1`/`--out2`/`--out0`
     /// sinks by segment flag, mirroring `samtools fastq -1/-2/-0`. Assumes input
     /// is name-grouped (the standard queryname / template-coordinate order);
@@ -415,7 +396,7 @@ impl Fastq {
     fn run_paired(&self) -> Result<()> {
         let timer = OperationTimer::new("Converting BAM to paired FASTQ");
         self.log_config();
-        let umi_header = self.build_umi_header()?;
+        let opts = self.to_fastq_options()?;
 
         // clap `requires` guarantees out2 is present whenever out1 is.
         let out1 = self.out1.as_ref().expect("out1 present in paired mode");
@@ -475,7 +456,7 @@ impl Fastq {
             total_records += 1;
 
             let flags = record.flags();
-            if !self.passes_filters(flags) {
+            if !opts.passes_filters(flags) {
                 continue;
             }
 
@@ -489,7 +470,7 @@ impl Fastq {
                 &record,
                 flags,
                 no_suffix,
-                umi_header.as_ref(),
+                opts.umi_header.as_ref(),
                 &mut seq_buf,
                 &mut qual_buf,
             )?;
@@ -506,9 +487,82 @@ impl Fastq {
     }
 }
 
+impl Fastq {
+    /// Build the per-stage [`FastqOptions`] — the single source of truth for the
+    /// flag filters and UMI-header config, shared by the chain (interleaved) and
+    /// the standalone `run_paired` loop.
+    fn to_fastq_options(&self) -> Result<FastqOptions> {
+        Ok(FastqOptions {
+            exclude_flags: self.exclude_flags,
+            require_flags: self.require_flags,
+            no_suffix: self.no_suffix,
+            umi_header: self.build_umi_header()?,
+        })
+    }
+
+    /// Assemble the typed-step [`ChainSpec`] for a BAM → FASTQ conversion:
+    /// `SourceSpec::Bam` → `Stage::Fastq` → the given `sink`.
+    fn build_chain_spec(
+        &self,
+        sink: crate::pipeline::chains::SinkSpec,
+        command_line: &str,
+    ) -> Result<crate::pipeline::chains::ChainSpec> {
+        use crate::commands::common::ThreadingOptions;
+        use crate::pipeline::chains::{ChainSpec, SourceSpec, Stage, StageOptionsBag};
+        use fgumi_cli_common::CompressionOptions;
+
+        Ok(ChainSpec {
+            stages: vec![Stage::Fastq],
+            source: SourceSpec::Bam(self.input.clone()),
+            sink,
+            stage_opts: StageOptionsBag {
+                fastq: Some(self.to_fastq_options()?),
+                ..Default::default()
+            },
+            threading: ThreadingOptions::new(self.threads),
+            compression: CompressionOptions { compression_level: FASTQ_GZIP_LEVEL },
+            scheduler: self.scheduler.clone(),
+            queue_memory: self.resolve_queue_memory(),
+            async_reader: false,
+            command_line: command_line.to_string(),
+        })
+    }
+
+    /// The queue-memory options for the chain: the user's `--max-memory` /
+    /// `--queue-memory` flags if given, otherwise the lean fastq default
+    /// ([`FASTQ_DEFAULT_QUEUE_MEMORY_MB`]) so a large `--threads` doesn't
+    /// inflate RSS to the sort/consensus-sized 768 MiB/thread default.
+    ///
+    /// The default is applied through the modern `max_memory` field (a fixed
+    /// total, not per-thread) so it does not trip the deprecation warning the
+    /// legacy `queue_memory_limit_mb` field would.
+    fn resolve_queue_memory(&self) -> QueueMemoryOptions {
+        use crate::commands::common::MemoryLimit;
+
+        let mut qm = self.queue_memory.clone();
+        let user_set_limit = qm.max_memory.is_some()
+            || qm.queue_memory.is_some()
+            || qm.queue_memory_limit_mb.is_some();
+        if !user_set_limit {
+            let bytes = FASTQ_DEFAULT_QUEUE_MEMORY_MB as usize * 1024 * 1024;
+            qm.max_memory = Some(MemoryLimit::Fixed(bytes));
+            qm.memory_per_thread = false;
+        }
+        qm
+    }
+}
+
 impl Command for Fastq {
-    fn execute(&self, _command_line: &str) -> Result<()> {
+    fn execute(&self, command_line: &str) -> Result<()> {
         validate_file_exists(&self.input, "Input BAM")?;
+
+        if self.bwa_chunk_size != DEFAULT_BWA_CHUNK_SIZE {
+            info!(
+                "--bwa-chunk-size ({}) is deprecated and ignored; output batching is managed \
+                 by the pipeline (tune with --max-memory)",
+                self.bwa_chunk_size
+            );
+        }
 
         // Refuse to clobber the input BAM or write two streams to the same file.
         // `File::create(path)` truncates before the input is opened, so an output
@@ -564,15 +618,21 @@ impl Command for Fastq {
 
         // Paired split output (`-1`/`-2`, optionally `-0`). clap guarantees
         // `--out1`/`--out2` come together and conflict with `--output`.
+        // (Paired output is not yet wired on the typed-step chain path — the
+        // 3-way fan-out needs a 3-output process primitive — so it still runs
+        // on the standalone loop.)
         if self.out1.is_some() {
             return self.run_paired();
         }
 
-        let sink = match &self.output {
-            Some(path) => FastqSink::open_file(path, self.threads)?,
-            None => FastqSink::stdout(),
-        };
-        self.run_interleaved(sink)
+        // Interleaved output runs through the typed-step chain: BAM source →
+        // Stage::Fastq encode (pool-spread) → raw writer (BGZF for `.gz`). `-`
+        // (or omitted `--output`) writes to stdout.
+        self.log_config();
+        let sink = crate::pipeline::chains::SinkSpec::Fastq(
+            self.output.clone().unwrap_or_else(|| PathBuf::from("-")),
+        );
+        crate::pipeline::chains::build_for(self.build_chain_spec(sink, command_line)?)?.run()
     }
 }
 

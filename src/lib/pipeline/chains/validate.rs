@@ -40,6 +40,9 @@ fn stage_ord(stage: Stage) -> usize {
         Stage::Clip | Stage::Dedup | Stage::Downsample => 6,
         Stage::Simplex | Stage::Duplex | Stage::Codec => 7,
         Stage::Filter => 8,
+        // Terminal BAM→FASTQ export. Only ever appears as the sole stage of a
+        // `fgumi fastq` chain, so its rank is nominal; place it last.
+        Stage::Fastq => 9,
     }
 }
 
@@ -187,6 +190,7 @@ pub fn validate_stage_opts_present(spec: &ChainSpec) -> Result<()> {
             }
             Stage::Align => bag.aligner.is_some(),
             Stage::Extract => bag.extract.is_some(),
+            Stage::Fastq => bag.fastq.is_some(),
             // Downsample is rejected by the early `bail!` above (no bag slot
             // yet). Report "not provided" rather than `unreachable!()` so that
             // if the early guard is ever removed without adding a slot here, the
@@ -306,6 +310,23 @@ pub fn validate_cross_stage_constraints(spec: &ChainSpec) -> Result<()> {
     // spec-validation time gives a clearer error message.
     if spec.stages.contains(&Stage::Extract) && !matches!(spec.source, SourceSpec::Fastqs { .. }) {
         bail!("Stage::Extract requires SourceSpec::Fastqs; got {:?}", spec.source);
+    }
+
+    // Rule 5: the FASTQ sink and `Stage::Fastq` must go together. A `Fastq`
+    // sink pushes raw bytes through `add_fastq_sink` with no BAM header, and
+    // `Stage::Fastq` emits FASTQ text, not serialized BAM records — pairing
+    // either with the other format's counterpart would silently write a
+    // corrupt file (FASTQ text wrapped in a BAM header, or BAM bytes with no
+    // header). Require the biconditional.
+    let sink_is_fastq = matches!(spec.sink, SinkSpec::Fastq(_));
+    let terminal_is_fastq = spec.stages.last() == Some(&Stage::Fastq);
+    if sink_is_fastq != terminal_is_fastq {
+        bail!(
+            "SinkSpec::Fastq requires Stage::Fastq as the terminal chain stage and vice versa; \
+             got sink={:?}, terminal stage={:?}",
+            spec.sink,
+            spec.stages.last()
+        );
     }
 
     Ok(())

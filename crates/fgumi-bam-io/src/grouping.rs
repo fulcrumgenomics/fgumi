@@ -282,6 +282,14 @@ impl DecodedRecord {
         self.data.as_ref()
     }
 
+    /// Immutable access to the underlying [`RawRecord`], for read-only
+    /// consumers (e.g. the FASTQ-encode step) that need the typed accessors
+    /// (`flags()`, sequence, qualities, tags) rather than the raw byte slice.
+    #[must_use]
+    pub fn record(&self) -> &RawRecord {
+        &self.data
+    }
+
     /// Mutable access to the underlying [`RawRecord`]. Used by mid-chain
     /// `Parallel` Process steps that need to mutate record bytes (e.g.,
     /// MQ bumping, tag rewriting) without rebuilding the `DecodedRecord`

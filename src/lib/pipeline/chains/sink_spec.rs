@@ -31,14 +31,22 @@ pub enum SinkSpec {
     /// BAM file write + `.bai` index write after the BAM finishes.
     /// Only valid when the final stage emits coordinate-sorted output.
     BamWithIndex(PathBuf),
+    /// Interleaved FASTQ file write (or `-` for stdout). A `.gz`/`.bgz`
+    /// path is written as BGZF. Only valid on a `Stage::Fastq`-terminal chain.
+    ///
+    /// Paired split output (`--out1`/`--out2`) is not yet a chain sink — it
+    /// runs on the standalone `fgumi fastq` loop — so there is no `FastqPaired`
+    /// variant here until the 3-way fan-out encode step is wired.
+    Fastq(PathBuf),
 }
 
 impl SinkSpec {
-    /// The output path, regardless of variant.
+    /// A representative output path for the sink, used for logging and the
+    /// input-clobber guard.
     #[must_use]
     pub fn path(&self) -> &PathBuf {
         match self {
-            SinkSpec::Bam(p) | SinkSpec::BamWithIndex(p) => p,
+            SinkSpec::Bam(p) | SinkSpec::BamWithIndex(p) | SinkSpec::Fastq(p) => p,
         }
     }
 }

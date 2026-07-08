@@ -1230,10 +1230,53 @@ impl<'a> ChainBuilder<'a> {
             Stage::Zipper => self.add_zipper(position),
             Stage::Align => self.add_align(position),
             Stage::Extract => self.add_extract(position),
+            Stage::Fastq => self.add_fastq(position),
             Stage::Downsample => {
                 Err(anyhow!("Stage::Downsample is out of scope — not on the typed-step pipeline"))
             }
         }
+    }
+
+    /// Add the terminal BAM → FASTQ encode stage.
+    ///
+    /// Consumes the `DecodedRecordBatch` tail from the BAM source preamble and
+    /// appends the `Parallel` FASTQ-encode step (pool-spread), leaving a
+    /// `DecompressedBlock` byte tail for `add_sink` to route to a raw writer
+    /// (optionally through `BgzfCompress` for `.gz`/`.bgz` output).
+    fn add_fastq(&mut self, position: StagePosition) -> Result<()> {
+        use std::sync::atomic::AtomicU64;
+
+        use crate::logging::OperationTimer;
+        use crate::pipeline::chains::commands::fastq::{
+            FastqFinalizeHook, build_fastq_encode_step,
+        };
+
+        debug_assert_eq!(position, StagePosition::Terminal, "Stage::Fastq is always terminal");
+
+        let opts = self
+            .spec
+            .stage_opts
+            .fastq
+            .as_ref()
+            .ok_or_else(|| anyhow!("Stage::Fastq options missing from StageOptionsBag"))?;
+
+        let tail = self.current_tail.expect("add_fastq called before add_source");
+        let timer = OperationTimer::new("Converting BAM to FASTQ");
+        let records_written = Arc::new(AtomicU64::new(0));
+
+        let step = build_fastq_encode_step(
+            Arc::new(opts.clone()),
+            self.tuning.per_step_byte_limit,
+            Arc::clone(&records_written),
+        );
+        let tail = self.pipeline.append_step(step, tail);
+        self.current_tail = Some(tail);
+        // Byte tail (FASTQ text); nothing downstream of the terminal stage reads
+        // the typed kind, but mark it honestly like the other serialize paths.
+        self.chain_tail_kind = ChainTailKind::SerializedBytes;
+
+        self.finalize.push(Box::new(FastqFinalizeHook { records_written, timer }));
+        Ok(())
     }
 
     /// Add the output sink step(s) to the pipeline.
@@ -1251,6 +1294,13 @@ impl<'a> ChainBuilder<'a> {
     pub fn add_sink(&mut self) -> Result<()> {
         use crate::pipeline::steps::bgzf::compress::BgzfCompress;
         use crate::pipeline::steps::sink::write_bgzf::WriteBgzfFile;
+
+        // FASTQ sinks write raw bytes (no BAM header, no BGZF EOF) via a
+        // dedicated writer, optionally through `BgzfCompress` for `.gz`/`.bgz`.
+        if let SinkSpec::Fastq(path) = &self.spec.sink {
+            let path = path.clone();
+            return self.add_fastq_sink(&path);
+        }
 
         let tail = self.current_tail.expect("add_sink called before add_source");
         let output_path = self.spec.sink.path();
@@ -1285,6 +1335,33 @@ impl<'a> ChainBuilder<'a> {
         let tail = self.pipeline.append_step(write_step, tail);
 
         self.current_tail = Some(tail);
+        Ok(())
+    }
+
+    /// Route the FASTQ byte tail to a single (interleaved) raw writer. A
+    /// `.gz`/`.bgz` path is compressed via the shared-pool `BgzfCompress` step
+    /// first; otherwise the bytes are written verbatim (file or stdout via `-`).
+    fn add_fastq_sink(&mut self, path: &std::path::Path) -> Result<()> {
+        use crate::commands::fastq::path_is_gzip;
+        use crate::pipeline::steps::bgzf::compress::BgzfCompress;
+        use crate::pipeline::steps::sink::write_raw::WriteRawFile;
+        use crate::pipeline::steps::types::{BgzfBlock, DecompressedBlock};
+
+        let tail = self.current_tail.expect("add_sink called before add_source");
+        if path_is_gzip(path) {
+            let compress =
+                BgzfCompress::new(self.tuning.compression_level, self.tuning.per_step_byte_limit);
+            let tail = self.pipeline.append_step(compress, tail);
+            // Append the BGZF EOF marker so the `.gz` stream is a complete,
+            // non-truncated BGZF file (BgzfCompress emits blocks but no EOF).
+            let writer = WriteRawFile::<BgzfBlock>::new(path, &fgumi_bgzf::BGZF_EOF)
+                .map_err(|e| anyhow!("WriteRawFile: {e}"))?;
+            self.current_tail = Some(self.pipeline.append_step(writer, tail));
+        } else {
+            let writer = WriteRawFile::<DecompressedBlock>::new(path, b"")
+                .map_err(|e| anyhow!("WriteRawFile: {e}"))?;
+            self.current_tail = Some(self.pipeline.append_step(writer, tail));
+        }
         Ok(())
     }
 
@@ -1440,9 +1517,7 @@ impl<'a> ChainBuilder<'a> {
 
         let tail = self.current_tail.expect("add_extract called before add_source");
 
-        let output_path = match &self.spec.sink {
-            SinkSpec::Bam(p) | SinkSpec::BamWithIndex(p) => p.clone(),
-        };
+        let output_path = self.spec.sink.path().clone();
 
         let timer = OperationTimer::new("Extracting UMIs");
 
@@ -1569,9 +1644,7 @@ impl<'a> ChainBuilder<'a> {
 
         // Resolve source path for log messages only.
         let input_path = self.resolve_log_input_path();
-        let output_path = match &self.spec.sink {
-            SinkSpec::Bam(p) | SinkSpec::BamWithIndex(p) => p.clone(),
-        };
+        let output_path = self.spec.sink.path().clone();
 
         let timer = OperationTimer::new("Correcting UMIs (new pipeline)");
 
@@ -2485,9 +2558,7 @@ impl<'a> ChainBuilder<'a> {
                 // summary still lands before any "Indexing BAM:" line, mirroring
                 // the legacy SortFinalizeHook ordering.
                 if let Some(slot) = sort_stats_slot {
-                    let output_path = match &self.spec.sink {
-                        SinkSpec::Bam(p) | SinkSpec::BamWithIndex(p) => p.clone(),
-                    };
+                    let output_path = self.spec.sink.path().clone();
                     self.finalize_on_success.push(Box::new(
                         crate::pipeline::chains::commands::sort::SortSummaryFinalizeHook {
                             stats_slot: slot,
@@ -2624,9 +2695,7 @@ impl<'a> ChainBuilder<'a> {
 
         // Resolve source path for log messages only.
         let input_path = self.resolve_log_input_path();
-        let output_path = match &self.spec.sink {
-            SinkSpec::Bam(p) | SinkSpec::BamWithIndex(p) => p.clone(),
-        };
+        let output_path = self.spec.sink.path().clone();
 
         let timer = OperationTimer::new("Grouping reads by UMI");
 
@@ -2891,9 +2960,7 @@ impl<'a> ChainBuilder<'a> {
 
         // Resolve source path for log messages only.
         let input_path = self.resolve_log_input_path();
-        let output_path = match &self.spec.sink {
-            SinkSpec::Bam(p) | SinkSpec::BamWithIndex(p) => p.clone(),
-        };
+        let output_path = self.spec.sink.path().clone();
 
         let timer = OperationTimer::new("Calling simplex consensus");
 
@@ -3142,9 +3209,7 @@ impl<'a> ChainBuilder<'a> {
 
         // Resolve source path for log messages only.
         let input_path = self.resolve_log_input_path();
-        let output_path = match &self.spec.sink {
-            SinkSpec::Bam(p) | SinkSpec::BamWithIndex(p) => p.clone(),
-        };
+        let output_path = self.spec.sink.path().clone();
 
         let timer = OperationTimer::new("Calling duplex consensus");
 
@@ -3385,9 +3450,7 @@ impl<'a> ChainBuilder<'a> {
 
         // Resolve source path for log messages only.
         let input_path = self.resolve_log_input_path();
-        let output_path = match &self.spec.sink {
-            SinkSpec::Bam(p) | SinkSpec::BamWithIndex(p) => p.clone(),
-        };
+        let output_path = self.spec.sink.path().clone();
 
         let timer = OperationTimer::new("Calling CODEC consensus");
 
@@ -3608,9 +3671,7 @@ impl<'a> ChainBuilder<'a> {
 
         // Resolve source path for log messages only.
         let input_path = self.resolve_log_input_path();
-        let output_path = match &self.spec.sink {
-            SinkSpec::Bam(p) | SinkSpec::BamWithIndex(p) => p.clone(),
-        };
+        let output_path = self.spec.sink.path().clone();
 
         // Reference is always required for clip.
         crate::validation::validate_file_exists(&clip.reference, "Reference FASTA")?;
@@ -3773,9 +3834,7 @@ impl<'a> ChainBuilder<'a> {
         let timer = OperationTimer::new("Filtering consensus reads");
 
         // Resolve output path for log.
-        let output_path = match &self.spec.sink {
-            SinkSpec::Bam(p) | SinkSpec::BamWithIndex(p) => p.clone(),
-        };
+        let output_path = self.spec.sink.path().clone();
 
         info!("Starting Filter");
         info!("Input: {}", input_path.display());
@@ -3976,9 +4035,7 @@ impl<'a> ChainBuilder<'a> {
 
         let timer = OperationTimer::new("Marking duplicates");
 
-        let output_path = match &self.spec.sink {
-            SinkSpec::Bam(p) | SinkSpec::BamWithIndex(p) => p.clone(),
-        };
+        let output_path = self.spec.sink.path().clone();
 
         info!("Starting dedup");
         info!("Output: {}", output_path.display());

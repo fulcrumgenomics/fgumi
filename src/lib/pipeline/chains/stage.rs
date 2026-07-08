@@ -27,6 +27,8 @@ pub enum Stage {
     Filter,
     Dedup,
     Downsample,
+    /// Terminal BAM → FASTQ encode (interleaved or paired split output).
+    Fastq,
 }
 
 impl Stage {
