@@ -14,7 +14,7 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use read_structure::ReadStructure;
+//! use fgumi_lib::read_structure::ReadStructure;
 //! use fgumi_simd_fastq::SimdFastqReader;
 //! use std::fs::File;
 //! use std::io::BufReader;
@@ -31,10 +31,11 @@
 //! }
 //! ```
 
+use crate::read_structure::LengthCheck;
+use crate::read_structure::ReadStructure;
+use crate::read_structure::SegmentType;
 use anyhow::{Result, anyhow};
 use fgumi_simd_fastq::SimdFastqReader;
-use read_structure::ReadStructure;
-use read_structure::SegmentType;
 use std::fmt::Display;
 use std::io::BufRead;
 use std::iter::Filter;
@@ -222,8 +223,9 @@ impl FastqSet {
     ///
     /// # Errors
     ///
-    /// Returns an error if the read has too few bases and `TooFewBases` is not in
-    /// `skip_reasons`, or if base/quality extraction fails for any segment.
+    /// Returns an error if sequence and quality lengths differ, if a fully-fixed
+    /// structure does not exactly match the read length, or if the read has too
+    /// few bases and `TooFewBases` is not in `skip_reasons`.
     pub fn from_record_with_structure(
         header: &[u8],
         sequence: &[u8],
@@ -231,49 +233,55 @@ impl FastqSet {
         read_structure: &ReadStructure,
         skip_reasons: &[SkipReason],
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            sequence.len() == quality.len(),
+            "Bases (len {}) and qualities (len {}) differ in length for read {}",
+            sequence.len(),
+            quality.len(),
+            String::from_utf8_lossy(header)
+        );
+
         let mut segments = Vec::with_capacity(read_structure.number_of_segments());
 
-        // Check minimum length required by the read structure
-        let min_len: usize = read_structure.iter().map(|s| s.length().unwrap_or(0)).sum();
-        if sequence.len() < min_len {
-            if skip_reasons.contains(&SkipReason::TooFewBases) {
-                return Ok(Self {
-                    header: header.to_vec(),
-                    segments: vec![],
-                    skip_reason: Some(SkipReason::TooFewBases),
-                });
+        // Validate the read length against the structure (fgbio `validateReadLength`): a `+`
+        // structure needs at least the fixed bases (the `+` is zero-or-more); a fully-fixed
+        // structure must match exactly — an over-long read is an error, never a silent truncation.
+        match read_structure.check_read_length(sequence.len()) {
+            LengthCheck::Ok => {}
+            LengthCheck::TooFew { need } => {
+                if skip_reasons.contains(&SkipReason::TooFewBases) {
+                    return Ok(Self {
+                        header: header.to_vec(),
+                        segments: vec![],
+                        skip_reason: Some(SkipReason::TooFewBases),
+                    });
+                }
+                anyhow::bail!(
+                    "Read {} had too few bases to demux {} vs. {} needed in read structure {}.",
+                    String::from_utf8_lossy(header),
+                    sequence.len(),
+                    need,
+                    read_structure
+                );
             }
-            let read_name_str = String::from_utf8_lossy(header);
-            anyhow::bail!(
-                "Read {} had too few bases to demux {} vs. {} needed in read structure {}.",
-                read_name_str,
-                sequence.len(),
-                min_len,
-                read_structure
-            );
+            LengthCheck::OverLong { need } => {
+                anyhow::bail!(
+                    "Read {} length {} does not match fixed read structure length {} for {}.",
+                    String::from_utf8_lossy(header),
+                    sequence.len(),
+                    need,
+                    read_structure
+                );
+            }
         }
 
-        // Extract segments according to the read structure
+        // Extract segments according to the read structure. Spans are computed at the structure
+        // level so that a non-terminal `+` and the segments after it resolve against the read end.
         for (segment_index, read_segment) in read_structure.iter().enumerate() {
-            let (seq, quals) =
-                read_segment.extract_bases_and_quals(sequence, quality).map_err(|e| {
-                    let read_name_str = String::from_utf8_lossy(header);
-                    anyhow::anyhow!(
-                        "Error extracting bases (len: {}) or quals (len: {}) for the {}th \
-                         segment ({}) in read structure ({}) from record {}; {}",
-                        sequence.len(),
-                        quality.len(),
-                        segment_index,
-                        read_segment,
-                        read_structure,
-                        read_name_str,
-                        e
-                    )
-                })?;
-
+            let (start, end) = read_structure.span_of(segment_index, sequence.len());
             segments.push(FastqSegment {
-                seq: seq.to_vec(),
-                quals: quals.to_vec(),
+                seq: sequence[start..end].to_vec(),
+                quals: quality[start..end].to_vec(),
                 segment_type: read_segment.kind,
             });
         }
@@ -693,6 +701,51 @@ mod tests {
         // Variable template gets remaining 8 bases
         assert_eq!(result.segments[1].seq, b"TTTTTTTT");
         assert_eq!(result.segments[1].segment_type, SegmentType::Template);
+    }
+
+    #[test]
+    fn test_from_record_with_non_terminal_plus_walks_back_from_end() {
+        // 8B + variable M + 10T on a 30bp read: fgbio extracts M = bases[8..20], T = bases[20..30].
+        let read_structure = ReadStructure::from_str("8B+M10T").expect("valid read structure");
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTAC"; // 30 bp
+        let quals = b"IIIIIIIIIIIIIIIIIIIIIIIIIIIIII";
+        let result =
+            FastqSet::from_record_with_structure(b"rs01", seq, quals, &read_structure, &[])
+                .expect("extraction should succeed");
+        assert_eq!(result.segments.len(), 3);
+        assert_eq!(result.segments[0].segment_type, SegmentType::SampleBarcode);
+        assert_eq!(result.segments[0].seq, b"ACGTACGT"); // 8B
+        assert_eq!(result.segments[1].segment_type, SegmentType::MolecularBarcode);
+        assert_eq!(result.segments[1].seq, b"ACGTACGTACGT"); // +M absorbs 12 bases
+        assert_eq!(result.segments[2].segment_type, SegmentType::Template);
+        assert_eq!(result.segments[2].seq, b"ACGTACGTAC"); // 10T from the read end
+    }
+
+    #[test]
+    fn test_from_record_rejects_over_long_read_for_fixed_structure() {
+        // fgbio requires an exact length for a fully-fixed structure; an over-long read is an
+        // error, never a silent truncation of the trailing bases.
+        let read_structure = ReadStructure::from_str("8M2T").expect("valid read structure"); // fixed 10
+        let seq = b"ACGTACGTACGT"; // 12 bp -> 2 too many
+        let quals = b"IIIIIIIIIIII";
+        let err = FastqSet::from_record_with_structure(b"rs02", seq, quals, &read_structure, &[])
+            .expect_err("over-long read must be rejected");
+        assert!(
+            err.to_string().contains("does not match fixed read structure length"),
+            "unexpected error: {err}"
+        );
+        // The over-long guard is not silenced by the too-few skip reason.
+        assert!(
+            FastqSet::from_record_with_structure(
+                b"rs02",
+                seq,
+                quals,
+                &read_structure,
+                &[SkipReason::TooFewBases],
+            )
+            .is_err(),
+            "over-long read must error even when TooFewBases skipping is enabled"
+        );
     }
 
     #[test]

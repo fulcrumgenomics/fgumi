@@ -37,6 +37,7 @@ use fgumi_raw_bam::fields::flags;
 use log::{debug, info};
 use noodles_bgzf::io::MultithreadedReader;
 
+use crate::read_structure::{ReadStructure, SegmentType};
 #[cfg(test)]
 use fgumi_bam_io::create_bam_reader;
 use fgumi_simd_fastq::SimdFastqReader;
@@ -51,7 +52,6 @@ use noodles::sam::header::record::value::{
     Map as HeaderRecordMap,
     map::{Header as HeaderRecord, Tag as HeaderTag},
 };
-use read_structure::{ReadStructure, SegmentType};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -303,10 +303,11 @@ impl QualityEncoding {
 /// 4. `C` identifies a cell barcode read
 /// 5. `S` identifies a set of bases that should be skipped or ignored
 ///
-/// The last `<number><operator>` pair may be specified using a `+` sign instead of number to denote "all remaining
-/// bases". This is useful if, e.g., FASTQs have been trimmed and contain reads of varying length.  For example
-/// to convert a paired-end run with an index read and where the first 5 bases of R1 are a UMI and the second
-/// five bases are monotemplate you might specify:
+/// A single `<number><operator>` pair may be specified using a `+` sign instead of a number to denote "all
+/// remaining bases". The `+` may appear in any position (not only the last); segments after it are resolved by
+/// counting back from the end of the read. This is useful if, e.g., FASTQs have been trimmed and contain reads of
+/// varying length.  For example to convert a paired-end run with an index read and where the first 5 bases of R1
+/// are a UMI and the second five bases should be skipped, you might specify:
 ///
 /// ```text
 /// --input r1.fq r2.fq i1.fq --read-structures 5M5S+T +T +B
@@ -381,7 +382,7 @@ The last `<number><operator>` pair may be specified using a `+` sign instead of 
 varying length.
 
 For example, to convert a paired-end run with an index read and where the first 5 bases of R1 are
-a UMI and the second five bases are monotemplate:
+a UMI and the second five bases should be skipped:
 
   fgumi extract --input r1.fq r2.fq i1.fq --read-structures 5M5S+T +T +B
 
