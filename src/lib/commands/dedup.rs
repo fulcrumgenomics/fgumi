@@ -220,14 +220,41 @@ struct DedupFilterConfig {
 // Duplicate scoring
 //////////////////////////////////////////////////////////////////////////////
 
+/// Minimum base quality counted by Picard's `SUM_OF_BASE_QUALITIES` scoring.
+///
+/// HTSJDK `DuplicateScoringStrategy.getSumOfBaseQualities` sums only base
+/// qualities `>= 15`; anything below is excluded. This is a threshold, not a cap.
+const PICARD_MIN_BASE_QUALITY: u8 = 15;
+
+/// Per-read cap on the summed base-quality score, mirroring HTSJDK
+/// `DuplicateScoringStrategy.computeDuplicateScore`, which caps each read at
+/// `Short.MAX_VALUE / 2` (`Math.min(getSumOfBaseQualities(rec), Short.MAX_VALUE/2)`)
+/// so the two mates' scores can be summed without overflowing a `short`.
+const PICARD_MAX_SCORE_PER_READ: i64 = i16::MAX as i64 / 2; // 16383
+
+/// Score penalty for a read failing vendor quality checks (QC-fail), mirroring
+/// HTSJDK `computeDuplicateScore`'s `Short.MIN_VALUE / 2` discount so a QC-fail
+/// read is never preferred as the duplicate representative. Only reachable with
+/// `--include-non-pf` (QC-fail reads are otherwise filtered before scoring).
+const PICARD_QC_FAIL_DISCOUNT: i64 = i16::MIN as i64 / 2; // -16384
+
 /// Scores a template for duplicate selection.
 /// Higher score = more likely to be chosen as representative.
 ///
-/// Sums base qualities from primary reads (R1 and R2), capping each quality at 15
-/// per base to match Picard/HTSJDK's `SUM_OF_BASE_QUALITIES` strategy.
+/// Implements Picard/HTSJDK's `SUM_OF_BASE_QUALITIES`
+/// `DuplicateScoringStrategy.computeDuplicateScore`, summed over the primary reads
+/// (R1 and R2) exactly as Picard `MarkDuplicates` sums the two mates:
+/// 1. per read, sum every base quality `>= 15` at its **full value**
+///    (`getSumOfBaseQualities`; the 15 is a threshold, not a cap),
+/// 2. cap that per-read sum at `Short.MAX_VALUE / 2` (16383), and
+/// 3. subtract `Short.MIN_VALUE / 2` (16384) from any read flagged QC-fail.
+///
+/// No mapping-quality term is added: fgumi `dedup` is a Picard `MarkDuplicates`
+/// drop-in, whereas fgbio's `GroupReadsByUmi` additionally adds `mapq`. Omitting
+/// `mapq` is intentional (see tracker DEDUP-01).
 #[inline]
 fn score_template(template: &Template) -> i64 {
-    let mut score: u32 = 0;
+    let mut score: i64 = 0;
 
     for raw in [template.r1(), template.r2()].into_iter().flatten() {
         if raw.len() < 32 {
@@ -239,12 +266,23 @@ fn score_template(template: &Template) -> i64 {
             continue;
         }
         let max_len = std::cmp::min(seq_len, raw.len() - qo);
-        // Slice-iterate for auto-vectorization (compiler can use SIMD min+sum)
-        score +=
-            raw[qo..qo + max_len].iter().map(|&q| u32::from(std::cmp::min(q, 15))).sum::<u32>();
+        // Slice-iterate for auto-vectorization (compiler can vectorize the
+        // threshold filter + sum).
+        let read_sum: u32 = raw[qo..qo + max_len]
+            .iter()
+            .filter(|&&q| q >= PICARD_MIN_BASE_QUALITY)
+            .map(|&q| u32::from(q))
+            .sum();
+        // Cap per read (Short.MAX_VALUE/2), then discount QC-fail reads, matching
+        // HTSJDK computeDuplicateScore before the two mates' scores are summed.
+        let mut read_score = i64::from(read_sum).min(PICARD_MAX_SCORE_PER_READ);
+        if (RawRecordView::new(raw).flags() & fgumi_raw_bam::flags::QC_FAIL) != 0 {
+            read_score += PICARD_QC_FAIL_DISCOUNT;
+        }
+        score += read_score;
     }
 
-    i64::from(score)
+    score
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -1257,21 +1295,15 @@ mod tests {
         Template::from_records(vec![b.build()]).expect("test template construction should not fail")
     }
 
-    #[test]
-    fn test_score_template() {
-        // Each quality capped at 15
-        let template = create_test_template("q1", &[20, 20, 20, 20]);
-        let score = score_template(&template);
-        // 4 bases * 15 (capped) = 60
-        assert_eq!(score, 60);
-    }
-
-    #[test]
-    fn test_score_template_low_quality() {
-        let template = create_test_template("q1", &[10, 10, 10, 10]);
-        let score = score_template(&template);
-        // 4 bases * 10 = 40
-        assert_eq!(score, 40);
+    /// Picard/HTSJDK `SUM_OF_BASE_QUALITIES` (`DuplicateScoringStrategy.getSumOfBaseQualities`):
+    /// each base quality strictly below 15 is excluded; 15 and above are summed at full value.
+    #[rstest]
+    #[case::all_above_threshold(&[20, 20, 20, 20], 80)] // 4 * 20
+    #[case::all_below_threshold(&[10, 10, 10, 10], 0)] // every q < 15 excluded
+    #[case::threshold_boundary(&[14, 15, 16, 40], 71)] // 14 excluded; 15 + 16 + 40
+    fn test_score_template_single(#[case] qualities: &[u8], #[case] expected: i64) {
+        let template = create_test_template("q1", qualities);
+        assert_eq!(score_template(&template), expected);
     }
 
     /// Creates a paired-end test template with R1 and R2.
@@ -1299,42 +1331,20 @@ mod tests {
         Template::from_records(vec![r1, r2]).expect("test template construction should not fail")
     }
 
-    #[test]
-    fn test_score_template_paired_end() {
-        // Both R1 and R2 contribute to score
-        let template = create_paired_test_template("q1", &[10, 10, 10, 10], &[10, 10, 10, 10]);
-        let score = score_template(&template);
-        // R1: 4 * 10 = 40, R2: 4 * 10 = 40, total = 80
-        assert_eq!(score, 80);
-    }
-
-    #[test]
-    fn test_score_template_paired_end_capped() {
-        // High quality gets capped at 15 per base
-        let template = create_paired_test_template("q1", &[40, 40, 40, 40], &[40, 40, 40, 40]);
-        let score = score_template(&template);
-        // R1: 4 * 15 = 60, R2: 4 * 15 = 60, total = 120
-        assert_eq!(score, 120);
-    }
-
-    #[test]
-    fn test_score_template_paired_end_asymmetric() {
-        // R1 and R2 have different qualities
-        let template = create_paired_test_template("q1", &[5, 5, 5, 5], &[15, 15, 15, 15]);
-        let score = score_template(&template);
-        // R1: 4 * 5 = 20, R2: 4 * 15 = 60, total = 80
-        assert_eq!(score, 80);
-    }
-
-    #[test]
-    fn test_score_template_paired_end_mixed_capping() {
-        // Some qualities below cap, some above
-        let template = create_paired_test_template("q1", &[10, 20, 5, 30], &[8, 12, 25, 3]);
-        let score = score_template(&template);
-        // R1: 10 + 15 + 5 + 15 = 45 (20 and 30 capped to 15)
-        // R2: 8 + 12 + 15 + 3 = 38 (25 capped to 15)
-        // Total: 45 + 38 = 83
-        assert_eq!(score, 83);
+    /// Both R1 and R2 contribute to a paired template's score, applying the same
+    /// Picard `>= 15` per-base rule across both mates.
+    #[rstest]
+    #[case::both_below_threshold(&[10, 10, 10, 10], &[10, 10, 10, 10], 0)]
+    #[case::both_high_quality(&[40, 40, 40, 40], &[40, 40, 40, 40], 320)] // 160 + 160, no cap
+    #[case::asymmetric_r1_excluded(&[5, 5, 5, 5], &[15, 15, 15, 15], 60)] // R1 all < 15; R2 4*15
+    #[case::mixed_threshold(&[10, 20, 5, 30], &[8, 12, 25, 3], 75)] // R1 20+30; R2 25
+    fn test_score_template_paired(
+        #[case] r1_qualities: &[u8],
+        #[case] r2_qualities: &[u8],
+        #[case] expected: i64,
+    ) {
+        let template = create_paired_test_template("q1", r1_qualities, r2_qualities);
+        assert_eq!(score_template(&template), expected);
     }
 
     #[test]
@@ -1397,7 +1407,7 @@ mod tests {
         // Fast path for size 2: first template has higher score
         let mut metrics = DedupMetrics::default();
         let mut t1 = create_test_template("q1", &[15, 15, 15, 15]); // Score: 60
-        let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 40
+        let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 0 (all q < 15)
         let mut templates: Vec<&mut Template> = vec![&mut t1, &mut t2];
         mark_duplicates_in_family(&mut templates, &mut metrics);
 
@@ -1411,7 +1421,7 @@ mod tests {
     fn test_mark_duplicates_size_2_second_higher() {
         // Fast path for size 2: second template has higher score
         let mut metrics = DedupMetrics::default();
-        let mut t1 = create_test_template("q1", &[5, 5, 5, 5]); // Score: 20
+        let mut t1 = create_test_template("q1", &[5, 5, 5, 5]); // Score: 0 (all q < 15)
         let mut t2 = create_test_template("q2", &[15, 15, 15, 15]); // Score: 60
         let mut templates: Vec<&mut Template> = vec![&mut t1, &mut t2];
         mark_duplicates_in_family(&mut templates, &mut metrics);
@@ -1427,8 +1437,8 @@ mod tests {
         // Fast path for size 3: first template has highest score
         let mut metrics = DedupMetrics::default();
         let mut t1 = create_test_template("q1", &[15, 15, 15, 15]); // Score: 60
-        let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 40
-        let mut t3 = create_test_template("q3", &[5, 5, 5, 5]); // Score: 20
+        let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 0 (all q < 15)
+        let mut t3 = create_test_template("q3", &[5, 5, 5, 5]); // Score: 0 (all q < 15)
         let mut templates: Vec<&mut Template> = vec![&mut t1, &mut t2, &mut t3];
         mark_duplicates_in_family(&mut templates, &mut metrics);
 
@@ -1443,9 +1453,9 @@ mod tests {
     fn test_mark_duplicates_size_3_second_highest() {
         // Fast path for size 3: second template has highest score
         let mut metrics = DedupMetrics::default();
-        let mut t1 = create_test_template("q1", &[5, 5, 5, 5]); // Score: 20
+        let mut t1 = create_test_template("q1", &[5, 5, 5, 5]); // Score: 0 (all q < 15)
         let mut t2 = create_test_template("q2", &[15, 15, 15, 15]); // Score: 60
-        let mut t3 = create_test_template("q3", &[10, 10, 10, 10]); // Score: 40
+        let mut t3 = create_test_template("q3", &[10, 10, 10, 10]); // Score: 0 (all q < 15)
         let mut templates: Vec<&mut Template> = vec![&mut t1, &mut t2, &mut t3];
         mark_duplicates_in_family(&mut templates, &mut metrics);
 
@@ -1460,8 +1470,8 @@ mod tests {
     fn test_mark_duplicates_size_3_third_highest() {
         // Fast path for size 3: third template has highest score
         let mut metrics = DedupMetrics::default();
-        let mut t1 = create_test_template("q1", &[5, 5, 5, 5]); // Score: 20
-        let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 40
+        let mut t1 = create_test_template("q1", &[5, 5, 5, 5]); // Score: 0 (all q < 15)
+        let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 0 (all q < 15)
         let mut t3 = create_test_template("q3", &[15, 15, 15, 15]); // Score: 60
         let mut templates: Vec<&mut Template> = vec![&mut t1, &mut t2, &mut t3];
         mark_duplicates_in_family(&mut templates, &mut metrics);
@@ -1477,10 +1487,10 @@ mod tests {
     fn test_mark_duplicates_size_4_general_case() {
         // General case for size 4+: uses Vec and sort
         let mut metrics = DedupMetrics::default();
-        let mut t1 = create_test_template("q1", &[5, 5, 5, 5]); // Score: 20
+        let mut t1 = create_test_template("q1", &[5, 5, 5, 5]); // Score: 0 (all q < 15)
         let mut t2 = create_test_template("q2", &[15, 15, 15, 15]); // Score: 60 (highest)
-        let mut t3 = create_test_template("q3", &[10, 10, 10, 10]); // Score: 40
-        let mut t4 = create_test_template("q4", &[8, 8, 8, 8]); // Score: 32
+        let mut t3 = create_test_template("q3", &[10, 10, 10, 10]); // Score: 0 (all q < 15)
+        let mut t4 = create_test_template("q4", &[8, 8, 8, 8]); // Score: 0 (all q < 15)
         let mut templates: Vec<&mut Template> = vec![&mut t1, &mut t2, &mut t3, &mut t4];
         mark_duplicates_in_family(&mut templates, &mut metrics);
 
@@ -1497,7 +1507,7 @@ mod tests {
         // Verify duplicate_reads metric is incremented for each read in duplicate templates
         let mut metrics = DedupMetrics::default();
         let mut t1 = create_test_template("q1", &[15, 15, 15, 15]); // Score: 60 (1 read)
-        let mut t2 = create_test_template("q2", &[5, 5, 5, 5]); // Score: 20 (1 read)
+        let mut t2 = create_test_template("q2", &[5, 5, 5, 5]); // Score: 0 (all q < 15; 1 read)
         let mut templates: Vec<&mut Template> = vec![&mut t1, &mut t2];
         mark_duplicates_in_family(&mut templates, &mut metrics);
 
@@ -1512,8 +1522,8 @@ mod tests {
     fn test_mark_duplicates_tie_breaking_size_2() {
         // When scores are equal, first template should be kept (deterministic)
         let mut metrics = DedupMetrics::default();
-        let mut t1 = create_test_template("q1", &[10, 10, 10, 10]); // Score: 40
-        let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 40 (tie)
+        let mut t1 = create_test_template("q1", &[10, 10, 10, 10]); // Score: 0 (all < 15)
+        let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 0 (tie)
         let mut templates: Vec<&mut Template> = vec![&mut t1, &mut t2];
         mark_duplicates_in_family(&mut templates, &mut metrics);
 
@@ -1528,9 +1538,9 @@ mod tests {
     fn test_mark_duplicates_tie_breaking_size_3_all_equal() {
         // All three have equal scores - first template should be kept
         let mut metrics = DedupMetrics::default();
-        let mut t1 = create_test_template("q1", &[10, 10, 10, 10]); // Score: 40
-        let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 40
-        let mut t3 = create_test_template("q3", &[10, 10, 10, 10]); // Score: 40
+        let mut t1 = create_test_template("q1", &[10, 10, 10, 10]); // Score: 0 (all < 15)
+        let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 0
+        let mut t3 = create_test_template("q3", &[10, 10, 10, 10]); // Score: 0
         let mut templates: Vec<&mut Template> = vec![&mut t1, &mut t2, &mut t3];
         mark_duplicates_in_family(&mut templates, &mut metrics);
 
@@ -1546,9 +1556,9 @@ mod tests {
     fn test_mark_duplicates_tie_breaking_size_3_second_and_third_tie() {
         // First is lower, second and third tie - second should win
         let mut metrics = DedupMetrics::default();
-        let mut t1 = create_test_template("q1", &[5, 5, 5, 5]); // Score: 20
-        let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 40
-        let mut t3 = create_test_template("q3", &[10, 10, 10, 10]); // Score: 40 (tie with t2)
+        let mut t1 = create_test_template("q1", &[10, 10, 10, 10]); // Score: 0 (all < 15)
+        let mut t2 = create_test_template("q2", &[20, 20, 20, 20]); // Score: 80
+        let mut t3 = create_test_template("q3", &[20, 20, 20, 20]); // Score: 80 (tie with t2)
         let mut templates: Vec<&mut Template> = vec![&mut t1, &mut t2, &mut t3];
         mark_duplicates_in_family(&mut templates, &mut metrics);
 
@@ -1564,10 +1574,10 @@ mod tests {
     fn test_mark_duplicates_tie_breaking_size_4_all_equal() {
         // All four have equal scores - first template should be kept
         let mut metrics = DedupMetrics::default();
-        let mut t1 = create_test_template("q1", &[10, 10, 10, 10]); // Score: 40
-        let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 40
-        let mut t3 = create_test_template("q3", &[10, 10, 10, 10]); // Score: 40
-        let mut t4 = create_test_template("q4", &[10, 10, 10, 10]); // Score: 40
+        let mut t1 = create_test_template("q1", &[10, 10, 10, 10]); // Score: 0 (all < 15)
+        let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 0
+        let mut t3 = create_test_template("q3", &[10, 10, 10, 10]); // Score: 0
+        let mut t4 = create_test_template("q4", &[10, 10, 10, 10]); // Score: 0
         let mut templates: Vec<&mut Template> = vec![&mut t1, &mut t2, &mut t3, &mut t4];
         mark_duplicates_in_family(&mut templates, &mut metrics);
 
@@ -1584,10 +1594,10 @@ mod tests {
     fn test_mark_duplicates_tie_breaking_size_4_partial_tie() {
         // Third and fourth tie for highest - third should win
         let mut metrics = DedupMetrics::default();
-        let mut t1 = create_test_template("q1", &[5, 5, 5, 5]); // Score: 20
-        let mut t2 = create_test_template("q2", &[8, 8, 8, 8]); // Score: 32
-        let mut t3 = create_test_template("q3", &[10, 10, 10, 10]); // Score: 40
-        let mut t4 = create_test_template("q4", &[10, 10, 10, 10]); // Score: 40 (tie with t3)
+        let mut t1 = create_test_template("q1", &[10, 10, 10, 10]); // Score: 0 (all < 15)
+        let mut t2 = create_test_template("q2", &[16, 16, 16, 16]); // Score: 64
+        let mut t3 = create_test_template("q3", &[20, 20, 20, 20]); // Score: 80
+        let mut t4 = create_test_template("q4", &[20, 20, 20, 20]); // Score: 80 (tie with t3)
         let mut templates: Vec<&mut Template> = vec![&mut t1, &mut t2, &mut t3, &mut t4];
         mark_duplicates_in_family(&mut templates, &mut metrics);
 
@@ -2517,13 +2527,56 @@ mod tests {
         RawRecord::from(buf)
     }
 
+    /// Picard `computeDuplicateScore` caps each read's Q>=15 base-quality sum at
+    /// `Short.MAX_VALUE / 2` (16383) before the two mates are summed. A single read
+    /// whose sum exceeds the cap must contribute exactly the cap.
+    #[test]
+    fn test_score_template_picard_per_read_cap() {
+        // 500 bases at Q40 -> raw sum 20000, capped to 16383.
+        let raw = make_raw_bam_for_dedup(
+            b"cap",
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
+            60,
+            500,
+            &[40u8; 500],
+            b"ACGT",
+        );
+        let template =
+            Template::from_records(vec![raw]).expect("test template construction should not fail");
+        assert_eq!(score_template(&template), PICARD_MAX_SCORE_PER_READ);
+    }
+
+    /// Picard `computeDuplicateScore` subtracts `Short.MIN_VALUE / 2` (16384) from a
+    /// QC-fail read so it is never preferred as the duplicate representative
+    /// (reachable in fgumi only under `--include-non-pf`). An otherwise-identical
+    /// QC-fail read must score strictly below the passing read.
+    #[test]
+    fn test_score_template_qc_fail_discount() {
+        let base_flags = fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT;
+        let passing = make_raw_bam_for_dedup(b"pass", base_flags, 60, 4, &[40u8; 4], b"ACGT");
+        let qc_fail = make_raw_bam_for_dedup(
+            b"nonpf",
+            base_flags | fgumi_raw_bam::flags::QC_FAIL,
+            60,
+            4,
+            &[40u8; 4],
+            b"ACGT",
+        );
+        let pf_t = Template::from_records(vec![passing]).expect("template construction");
+        let qc_t = Template::from_records(vec![qc_fail]).expect("template construction");
+        // 4 * 40 = 160 for the passing read; QC-fail is discounted by 16384.
+        assert_eq!(score_template(&pf_t), 160);
+        assert_eq!(score_template(&qc_t), 160 + PICARD_QC_FAIL_DISCOUNT);
+        assert!(score_template(&qc_t) < score_template(&pf_t), "QC-fail must score lower");
+    }
+
     // ========================================================================
     // score_template_raw tests
     // ========================================================================
 
     #[test]
     fn test_score_template_raw_basic() {
-        // 4 bases with quality 20 each, capped at 15 → 4 * 15 = 60
+        // 4 bases at quality 20 (all >= 15) → 4 * 20 = 80
         let raw = make_raw_bam_for_dedup(
             b"rea",
             fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
@@ -2534,12 +2587,12 @@ mod tests {
         );
         let template =
             Template::from_records(vec![raw]).expect("test template construction should not fail");
-        assert_eq!(score_template(&template), 60);
+        assert_eq!(score_template(&template), 80);
     }
 
     #[test]
     fn test_score_template_raw_low_quality() {
-        // 4 bases with quality 10 each, no capping → 4 * 10 = 40
+        // 4 bases at quality 10 (all < 15) → excluded → 0
         let raw = make_raw_bam_for_dedup(
             b"rea",
             fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
@@ -2550,12 +2603,12 @@ mod tests {
         );
         let template =
             Template::from_records(vec![raw]).expect("test template construction should not fail");
-        assert_eq!(score_template(&template), 40);
+        assert_eq!(score_template(&template), 0);
     }
 
     #[test]
     fn test_score_template_raw_paired() {
-        // Paired: R1 (4 bases * 15) + R2 (4 bases * 10) = 60 + 40 = 100
+        // Paired: R1 (4 bases * 20, all >= 15) + R2 (4 bases * 10, all < 15) = 80 + 0 = 80
         let r1 = make_raw_bam_for_dedup(
             b"rea",
             fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
@@ -2574,7 +2627,7 @@ mod tests {
         );
         let template = Template::from_records(vec![r1, r2])
             .expect("test template construction should not fail");
-        assert_eq!(score_template(&template), 100);
+        assert_eq!(score_template(&template), 80);
     }
 
     #[test]
