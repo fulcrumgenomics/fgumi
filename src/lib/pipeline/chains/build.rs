@@ -4,28 +4,20 @@
 //!
 //!   1. Validates the spec (progression, options presence, cross-stage constraints).
 //!   2. Constructs a [`ChainBuilder`] from the spec.
-//!   3. Calls `add_source` (skipped for the Sort-terminal special case — `SortBamFile`
-//!      reads its own input file, so no pipeline source step is needed).
+//!   3. Calls `add_source`.
 //!   4. Walks `spec.stages`, calling `add_stage(stage, position)` for each,
 //!      where `position` is `Terminal` for the last stage and `Intermediate` for all
 //!      earlier ones.
-//!   5. Calls `add_sink` (skipped for Sort-terminal, same reason as step 3).
+//!   5. Calls `add_sink`.
 //!   6. Calls `build()` to produce the [`BuiltPipeline`].
 //!
-//! ## Sort-terminal special case
-//!
-//! When `spec.stages == [Stage::Sort]`, `SortBamFile` is a self-contained
-//! `Exclusive` step that reads from and writes to files directly — it bypasses
-//! both the normal source preamble and the `BgzfCompress → WriteBgzfFile` sink.
-//! `add_sort(Terminal)` registers `SortBamFile` via `PipelineBuilder::append_source`
-//! (legal for `Input = ()` steps) and does NOT call `add_source` / `add_sink`.
-//! The calling code in `build_for` detects this case (`stages == [Sort]`) and
-//! skips `add_source` + `add_sink` accordingly.
-//!
-//! For all other stage combinations (including Sort-intermediate, i.e. Sort followed
-//! by Group, Simplex, Duplex, or Codec), `add_source` and `add_sink` ARE called:
-//! the intermediate sort path uses `ParseBamRecords` (not `SortBamFile`) and feeds
-//! records through the normal source → sort → downstream → sink topology.
+//! Every chain — including the sole-`[Stage::Sort]` standalone sort — runs
+//! through this uniform `add_source` → stages → `add_sink` topology on the
+//! work-stealing pool. There is no longer a Sort-terminal special case: the
+//! former self-contained file→file `SortBamFile` step was removed, and
+//! standalone sort now streams (`ParseBamRecords` → arena sort ingest →
+//! `SpillGather` → `SpillCompress` → `SpillWrite` → `SortSpillDecompress` →
+//! `SortMerge` → sink) like every other command.
 
 use anyhow::{Result, bail};
 
@@ -51,12 +43,12 @@ use crate::pipeline::chains::{
 /// `build_for` constructs a [`ChainBuilder`] and drives it stage-by-stage:
 ///
 /// ```text
-/// chain.add_source()?                     // skipped for Sort-terminal
+/// chain.add_source()?
 /// for (i, stage) in stages.iter().enumerate() {
 ///     let pos = if i == last { Terminal } else { Intermediate };
 ///     chain.add_stage(*stage, pos)?;
 /// }
-/// chain.add_sink()?                       // skipped for Sort-terminal
+/// chain.add_sink()?
 /// chain.build()
 /// ```
 ///
@@ -79,11 +71,6 @@ pub fn build_for(spec: ChainSpec) -> Result<BuiltPipeline> {
         bail!("ChainSpec must specify at least one stage");
     }
 
-    // Sort-terminal special case: SortBamFile is self-contained (reads/writes
-    // files directly). Skip add_source and add_sink. Single-sourced with
-    // `ChainBuilder::new`'s header-open skip via `ChainSpec::is_sort_terminal`.
-    let sort_terminal = spec.is_sort_terminal();
-
     let mut chain = ChainBuilder::new(&spec)?;
 
     // NOTE: `--threads 1` whole-chain fusion is NOT wired here. It is applied
@@ -91,10 +78,13 @@ pub fn build_for(spec: ChainSpec) -> Result<BuiltPipeline> {
     // to ANY linear source→sink chain at one worker — see
     // `pipeline::core::runtime::fused`. `build_for` therefore constructs the
     // same staged chain regardless of thread count; the runtime fuses it.
-
-    if !sort_terminal {
-        chain.add_source()?;
-    }
+    //
+    // Every chain — including the sole-`[Stage::Sort]` chain — runs through the
+    // normal `add_source` → stages → `add_sink` topology on the work-stealing
+    // pool. The former Sort-terminal special case (which skipped source/sink so
+    // a self-contained `SortBamFile` could read/write files itself) was removed:
+    // standalone sort now streams like every other command.
+    chain.add_source()?;
 
     let last_idx = spec.stages.len() - 1;
     for (i, &stage) in spec.stages.iter().enumerate() {
@@ -103,9 +93,7 @@ pub fn build_for(spec: ChainSpec) -> Result<BuiltPipeline> {
         chain.add_stage(stage, position)?;
     }
 
-    if !sort_terminal {
-        chain.add_sink()?;
-    }
+    chain.add_sink()?;
 
     chain.build()
 }

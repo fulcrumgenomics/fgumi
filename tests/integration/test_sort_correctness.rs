@@ -43,7 +43,6 @@ use std::path::Path;
 use std::process::Command;
 
 use clap::Parser;
-use fgumi_lib::commands::command::Command as FgumiCommand;
 use fgumi_lib::commands::sort::Sort;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
@@ -207,7 +206,7 @@ fn build_unsorted_fixture(num_templates: usize) -> (TempDir, std::path::PathBuf)
 
 fn fgumi_sort_in_process(args: &[OsString]) -> anyhow::Result<()> {
     let cmd = Sort::try_parse_from(args.iter().cloned()).expect("failed to parse sort args");
-    cmd.execute("fgumi sort")
+    fgumi_lib::commands::sort::execute_sort_command(&cmd, "fgumi sort")
 }
 
 /// Spill regime applied to a sort run. Each variant maps to a concrete memory

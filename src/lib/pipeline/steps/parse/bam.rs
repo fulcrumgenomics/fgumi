@@ -6,7 +6,9 @@
 //! `(start, end)` ranges).
 
 use std::io;
+use std::sync::Arc;
 
+use fgumi_bam_io::ProgressTracker;
 use fgumi_raw_bam::RawRecord;
 
 use crate::pipeline::core::Unpushed;
@@ -25,18 +27,33 @@ use crate::pipeline::steps::types::{DecompressedBlock, RecordBatch};
 pub struct ParseBamRecords {
     held: HeldSlot<Unpushed<RecordBatch>>,
     output_byte_limit: u64,
+    /// Records parsed across all Parallel workers (shared `Arc`), logged every
+    /// 1M under `RUST_LOG=info`. Compared against `SortBuffer`'s ingest rate,
+    /// this splits the read-supply (decode chain) cost from `SortBuffer.push`.
+    parse_progress: Arc<ProgressTracker>,
 }
 
 impl ParseBamRecords {
     #[must_use]
     pub fn new(output_byte_limit: u64) -> Self {
-        Self { held: HeldSlot::new(), output_byte_limit }
+        Self {
+            held: HeldSlot::new(),
+            output_byte_limit,
+            parse_progress: Arc::new(
+                ProgressTracker::new("Parse records").with_interval(1_000_000),
+            ),
+        }
     }
 }
 
 impl Clone for ParseBamRecords {
     fn clone(&self) -> Self {
-        Self { held: HeldSlot::new(), output_byte_limit: self.output_byte_limit }
+        // Share the parse counter across workers so the count is global.
+        Self {
+            held: HeldSlot::new(),
+            output_byte_limit: self.output_byte_limit,
+            parse_progress: Arc::clone(&self.parse_progress),
+        }
     }
 }
 
@@ -89,6 +106,7 @@ impl Step for ParseBamRecords {
         // allocation per batch (plus the move of `bytes` into the
         // batch).
         let ranges = parse_record_ranges(&bytes)?;
+        self.parse_progress.log_if_needed(ranges.len() as u64);
         let batch = RecordBatch::from_parsed(batch_serial, bytes, ranges);
 
         match ctx.outputs.push(batch) {

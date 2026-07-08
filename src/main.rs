@@ -159,7 +159,7 @@ impl Subcommand {
             Self::Correct(cmd) => cmd.execute(command_line),
             Self::Fastq(cmd) => cmd.execute(command_line),
             Self::Zipper(cmd) => cmd.execute(command_line),
-            Self::Sort(cmd) => cmd.execute(command_line),
+            Self::Sort(cmd) => fgumi_lib::commands::sort::execute_sort_command(cmd, command_line),
             Self::Merge(cmd) => cmd.execute(command_line),
             Self::Group(cmd) => cmd.execute(command_line),
             Self::Dedup(cmd) => cmd.execute(command_line),
