@@ -20,6 +20,7 @@ tempfile = "3.3.0"
 
 [dev-dependencies]
 fgumi-raw-bam = { workspace = true, features = ["test-utils"] }
+rstest = "0.26"
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }

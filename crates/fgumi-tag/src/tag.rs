@@ -128,6 +128,23 @@ impl SamTag {
     pub const UQ: SamTag = SamTag::new(b'U', b'Q');
     /// Original base quality scores, before recalibration (SAM spec).
     pub const OQ: SamTag = SamTag::new(b'O', b'Q');
+    /// The 2nd-most-likely base calls, a base-oriented `Z` string (SAM spec).
+    ///
+    /// Reverse-complemented alongside `SEQ` when a read is reverse-complemented
+    /// (htsjdk `SAMRecord.TAGS_TO_REVERSE_COMPLEMENT`).
+    pub const E2: SamTag = SamTag::new(b'E', b'2');
+    /// Phred quality of the 2nd-most-likely base calls, a quality-oriented `Z`
+    /// string (SAM spec).
+    ///
+    /// Reversed alongside `QUAL` when a read is reverse-complemented (htsjdk
+    /// `SAMRecord.TAGS_TO_REVERSE`).
+    pub const U2: SamTag = SamTag::new(b'U', b'2');
+    /// Deprecated per-base substitution/quality string, a base-oriented tag
+    /// (SAM spec).
+    ///
+    /// Reverse-complemented alongside `SEQ` when a read is reverse-complemented
+    /// (htsjdk `SAMRecord.TAGS_TO_REVERSE_COMPLEMENT`).
+    pub const SQ: SamTag = SamTag::new(b'S', b'Q');
     /// Per-base offset to base alignment quality (BAQ), `B:C` array (SAM spec).
     ///
     /// Note: the Rust identifier uses a descriptive suffix to avoid a name
