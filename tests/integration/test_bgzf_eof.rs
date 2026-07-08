@@ -434,6 +434,8 @@ fn test_filter_output_has_bgzf_eof() {
             .pos(99)
             .mapq(60)
             .cigar_ops(&[8 << 4]) // 8M
+            .add_int_tag(SamTag::CD, 10)
+            .add_float_tag(SamTag::CE, 0.0_f32)
             .add_array_u16(SamTag::CD_BASES, &[10; 8])
             .add_array_u16(SamTag::CE_BASES, &[0; 8]);
         b.build()

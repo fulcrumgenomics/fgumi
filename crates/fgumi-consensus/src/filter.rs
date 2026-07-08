@@ -67,7 +67,7 @@ pub struct FilterConfig {
     /// Minimum base quality after masking (optional - None means no quality masking)
     pub min_base_quality: Option<u8>,
 
-    /// Minimum mean base quality after masking (optional)
+    /// Minimum mean base quality over the full read length, computed prior to masking (optional)
     pub min_mean_base_quality: Option<f64>,
 
     /// Maximum fraction of no-calls (N bases) allowed (0.0-1.0)
@@ -451,8 +451,19 @@ pub fn is_duplex_consensus(aux_data: &[u8]) -> bool {
 ///
 /// Returns an error if the aux data cannot be parsed.
 pub fn filter_read(aux_data: &[u8], thresholds: &FilterThresholds) -> Result<FilterResult> {
+    // The per-read consensus depth (cD) and error-rate (cE) tags must both be present:
+    // FilterConsensusReads only operates on consensus reads. fgbio fails hard when either
+    // is absent (FilterConsensusReads.scala:242) rather than silently keeping the read.
+    let depth = bam_fields::find_int_tag(aux_data, SamTag::CD);
+    let error_rate = bam_fields::find_float_tag(aux_data, SamTag::CE);
+    anyhow::ensure!(
+        depth.is_some() && error_rate.is_some(),
+        "read does not appear to have consensus calling tags (cD/cE) present; \
+         FilterConsensusReads requires reads produced by consensus calling"
+    );
+
     // Check minimum reads (cD tag — any integer type)
-    if let Some(depth) = bam_fields::find_int_tag(aux_data, SamTag::CD) {
+    if let Some(depth) = depth {
         let min_reads = i64::try_from(thresholds.min_reads).unwrap_or(i64::MAX);
         if depth < min_reads {
             return Ok(FilterResult::InsufficientReads);
@@ -460,7 +471,7 @@ pub fn filter_read(aux_data: &[u8], thresholds: &FilterThresholds) -> Result<Fil
     }
 
     // Check maximum error rate (cE tag — Float)
-    if let Some(error_rate) = bam_fields::find_float_tag(aux_data, SamTag::CE) {
+    if let Some(error_rate) = error_rate {
         if f64::from(error_rate) > thresholds.max_read_error_rate {
             return Ok(FilterResult::ExcessiveErrorRate);
         }
@@ -587,6 +598,40 @@ pub fn compute_read_stats(bam: &[u8]) -> (usize, f64) {
     )]
     let mean_qual = if non_n_count == 0 { 0.0 } else { qual_sum as f64 / non_n_count as f64 };
     (n_count, mean_qual)
+}
+
+/// Mean base quality over the **full** read length, i.e. the sum of all base qualities
+/// divided by the read length, **including** no-call (N) bases.
+///
+/// This mirrors fgbio's read-level mean-quality filter, which is computed *prior to any
+/// masking* over the whole read (`FilterConsensusReads.scala:247`:
+/// `rec.quals.foldLeft(0)(_ + _) / rec.length`). It differs from [`compute_read_stats`],
+/// whose mean is taken over non-N bases only — the correct denominator for this filter is
+/// the full read length, so a read whose low-quality bases are masked (and thus excluded
+/// from a non-N mean) is still judged on its original, unmasked quality.
+///
+/// Returns `0.0` for an empty read.
+///
+/// # Panics
+/// Panics if the record is shorter than `MIN_BAM_RECORD_LEN` (36 bytes).
+#[must_use]
+pub fn mean_base_quality_full_length(bam: &[u8]) -> f64 {
+    assert!(bam.len() >= bam_fields::MIN_BAM_RECORD_LEN, "BAM record too short");
+    let qual_off = bam_fields::qual_offset(bam);
+    let len = RawRecordView::new(bam).l_seq() as usize;
+    if len == 0 {
+        return 0.0;
+    }
+    let mut qual_sum = 0u64;
+    for i in 0..len {
+        qual_sum += u64::from(bam_fields::get_qual(bam, qual_off, i));
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "precision loss is acceptable for quality averaging"
+    )]
+    let mean = qual_sum as f64 / len as f64;
+    mean
 }
 
 /// Counts the number of N bases in a raw BAM record.
@@ -1221,6 +1266,7 @@ pub fn check_conversion_fraction_raw_with_ref_bases_and_tags(
 mod tests {
     use super::*;
     use fgumi_raw_bam::SamBuilder as RawSamBuilder;
+    use rstest::rstest;
 
     #[test]
     fn test_filter_result_to_rejection_reason() {
@@ -2049,5 +2095,63 @@ mod tests {
         };
         let bases = resolve_ref_bases_for_record(&raw, &reference, &ref_names).unwrap();
         assert_eq!(bases, vec![Some(b'A'), Some(b'C'), None, None, Some(b'G'), Some(b'T')]);
+    }
+
+    // -- FILT-02: hard-fail when per-read consensus tags (cD/cE) are absent --
+
+    /// Both `cD` and `cE` consensus tags are required: missing either one (or both) must
+    /// error (fgbio `FilterConsensusReads.scala:242`); only both-present yields a normal
+    /// filter result. `expected` is `None` when the record must be rejected.
+    #[rstest]
+    #[case::both_absent(false, false, None)]
+    #[case::only_cd_present(true, false, None)]
+    #[case::only_ce_present(false, true, None)]
+    #[case::both_present(true, true, Some(FilterResult::Pass))]
+    fn test_filter_read_requires_consensus_tags(
+        #[case] with_cd: bool,
+        #[case] with_ce: bool,
+        #[case] expected: Option<FilterResult>,
+    ) {
+        let thresholds =
+            FilterThresholds { min_reads: 1, max_read_error_rate: 0.05, max_base_error_rate: 0.1 };
+        let mut b = RawSamBuilder::new();
+        b.ref_id(0).pos(0).mapq(0).cigar_ops(&[4 << 4]).sequence(b"ACGT").qualities(&[30; 4]);
+        if with_cd {
+            b.add_int_tag(SamTag::CD, 20);
+        }
+        if with_ce {
+            b.add_float_tag(SamTag::CE, 0.0);
+        }
+        let rec = b.build();
+        let aux = fgumi_raw_bam::aux_data_slice(rec.as_ref());
+
+        match expected {
+            None => assert!(
+                filter_read(aux, &thresholds).is_err(),
+                "cD={with_cd} cE={with_ce}: absent consensus tag must be rejected, not passed"
+            ),
+            Some(result) => assert_eq!(filter_read(aux, &thresholds).unwrap(), result),
+        }
+    }
+
+    // -- FILT-01: mean base quality is over the FULL read (pre-masking), including N bases --
+
+    #[test]
+    fn test_mean_base_quality_full_length_includes_all_bases() {
+        // 5 bases at q40 and 5 no-call (N) bases at q2.
+        let rec = {
+            let mut b = RawSamBuilder::new();
+            b.ref_id(0)
+                .pos(0)
+                .mapq(0)
+                .cigar_ops(&[10 << 4])
+                .sequence(b"AAAAANNNNN")
+                .qualities(&[40, 40, 40, 40, 40, 2, 2, 2, 2, 2]);
+            b.build()
+        };
+        // fgbio: sum(all quals) / length = (5*40 + 5*2)/10 = 21.0 (FilterConsensusReads.scala:247).
+        assert!((mean_base_quality_full_length(rec.as_ref()) - 21.0).abs() < 1e-9);
+        // The non-N mean (what the read-level check must NOT use) is 40.0 — proving they differ.
+        assert!((compute_read_stats(rec.as_ref()).1 - 40.0).abs() < 1e-9);
     }
 }
