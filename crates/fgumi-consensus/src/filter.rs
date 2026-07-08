@@ -709,6 +709,12 @@ pub fn mask_bases(
     let ce_vals = bam_fields::find_array_tag(&record[aux_off..], SamTag::CE_BASES)
         .map(|r| bam_fields::array_tag_to_vec_u16(&r));
 
+    // Per-base depth/error masking only applies when BOTH per-base tags are present, matching
+    // fgbio's `pb = depths != null && errors != null` guard (FilterConsensusReads.scala:281,
+    // 287-289). When they are absent we must NOT treat depth as 0 and mask everything —
+    // only the base-quality mask applies.
+    let has_per_base = cd_vals.is_some() && ce_vals.is_some();
+
     let mut masked_count = 0;
     for i in 0..len {
         let depth = cd_vals.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
@@ -716,8 +722,9 @@ pub fn mask_bases(
         let qual = bam_fields::get_qual(record, qual_off, i);
 
         let should_mask = min_base_quality.is_some_and(|min_qual| qual < min_qual)
-            || (depth as usize) < thresholds.min_reads
-            || (depth > 0
+            || (has_per_base && (depth as usize) < thresholds.min_reads)
+            || (has_per_base
+                && depth > 0
                 && (f64::from(errors) / f64::from(depth)) > thresholds.max_base_error_rate);
 
         if should_mask {
@@ -2153,5 +2160,49 @@ mod tests {
         assert!((mean_base_quality_full_length(rec.as_ref()) - 21.0).abs() < 1e-9);
         // The non-N mean (what the read-level check must NOT use) is 40.0 — proving they differ.
         assert!((compute_read_stats(rec.as_ref()).1 - 40.0).abs() < 1e-9);
+    }
+
+    // -- FILT-04: when per-base cd/ce tags are absent, mask only by base quality --
+
+    /// Per-base depth/error masking engages only when BOTH the `cd` and `ce` per-base arrays
+    /// are present (`pb = depths != null && errors != null`, fgbio
+    /// FilterConsensusReads.scala:281,287-289). With neither — or only one — present, `pb` is
+    /// false: fgumi must NOT treat an absent array as depth 0 and mask everything; only the
+    /// base-quality mask applies, so exactly the 5 q10 bases (below `--min-base-quality` 30)
+    /// are masked. The one-present-one-absent cases guard the `&&` against a regression to
+    /// `||` / a single `is_some()`: the deliberately low `cd` depths (1 < `min_reads`=5) would
+    /// mask all 10 bases if `pb` were wrongly true.
+    #[rstest]
+    #[case::neither_tag(false, false)]
+    #[case::only_cd_present(true, false)]
+    #[case::only_ce_present(false, true)]
+    fn test_mask_bases_depth_mask_requires_both_per_base_tags(
+        #[case] with_cd: bool,
+        #[case] with_ce: bool,
+    ) {
+        let mut rec = {
+            let mut b = RawSamBuilder::new();
+            b.ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[10 << 4])
+                .sequence(b"AAAAAAAAAA")
+                .qualities(&[40, 40, 40, 40, 40, 10, 10, 10, 10, 10]);
+            if with_cd {
+                b.add_array_i16(SamTag::CD_BASES, &[1; 10]);
+            }
+            if with_ce {
+                b.add_array_i16(SamTag::CE_BASES, &[100; 10]);
+            }
+            b.build().into_inner()
+        };
+        let thresholds =
+            FilterThresholds { min_reads: 5, max_read_error_rate: 0.05, max_base_error_rate: 0.1 };
+        let masked = mask_bases(&mut rec, &thresholds, Some(30)).unwrap();
+        assert_eq!(
+            masked, 5,
+            "with_cd={with_cd} with_ce={with_ce}: pb=false, only the 5 low-quality bases masked \
+             (depth/error mask skipped unless BOTH per-base tags present)"
+        );
     }
 }
