@@ -677,6 +677,11 @@ impl Extract {
     /// `1:N:0:<index>` is not counted, as it is stripped before parsing). See
     /// <https://support.illumina.com/help/BaseSpace_OLH_009008/Content/Source/Informatics/BS/FileFormat_FASTQ-files_swBS.htm>.
     ///
+    /// An old-style Casava (<1.8) `/1` / `/2` read-number suffix is stripped from
+    /// the returned name (see [`strip_read_number_suffix`]) so both mates of a pair
+    /// share an identical QNAME, matching fgbio's `FastqSource`. Stripping happens
+    /// before UMI extraction so a read-number digit never leaks into the UMI.
+    ///
     /// Some demultiplexers fold additional information (e.g. the sample index) into
     /// the colon-separated portion of the read name, producing names with 9+ fields
     /// where the UMI is the **last** field rather than the 8th. To handle both
@@ -696,6 +701,13 @@ impl Extract {
 
         // Split on space to get just the name part
         let name_part = name_bytes.find_byte(b' ').map_or(name_bytes, |pos| &name_bytes[..pos]);
+
+        // Strip an old-style Casava (<1.8) `/1` / `/2` read-number suffix so both
+        // mates of a pair share an identical QNAME (required by the SAM spec).
+        // Matches fgbio's `FastqSource`: only `/` followed by a single digit is
+        // removed. Done before UMI extraction so the digit never leaks into the
+        // UMI's trailing `:` field.
+        let name_part = strip_read_number_suffix(name_part);
 
         if !extract_umis {
             return (name_part.to_vec(), None);
@@ -1328,30 +1340,49 @@ impl Command for Extract {
     }
 }
 
-/// Strip /1, /2, or other read pair suffixes from a read name.
+/// Strip an old-style Casava (<1.8) `/<digit>` read-number suffix from a read name.
 ///
-/// This is used to validate that reads at the same position in synchronized FASTQs
-/// have matching names. Returns a slice of the name without the suffix.
-fn strip_read_suffix_extract(name: &[u8]) -> &[u8] {
-    // First strip any space-separated comment suffix (e.g., "read/1 extra" -> "read/1")
-    let name = if let Some(space_pos) = name.iter().position(|&b| b == b' ') {
-        &name[..space_pos]
-    } else {
-        name
-    };
-
-    // Then strip common pair suffixes: /1, /2, .1, .2, _1, _2, :1, :2
+/// This is applied to the QNAME written to the unmapped BAM, mirroring fgbio's
+/// `FastqSource` header parsing: only a trailing `/` followed by a single digit is
+/// removed (e.g. `read/1` -> `read`). Stripping is intentionally conservative — `.`, `_`,
+/// and `:` are never treated as read-number separators because they can appear in
+/// legitimate read names (e.g. `sample_1`), so stripping them from the written QNAME could
+/// corrupt data. [`strip_read_suffix_extract`] applies this same suffix logic (after also
+/// stripping a trailing space comment) when validating that read names match across
+/// synchronized FASTQs, keeping validation and the written QNAME in lock-step.
+///
+/// Returns a slice of `name` without the suffix, or `name` unchanged if it has no
+/// `/<digit>` suffix.
+fn strip_read_number_suffix(name: &[u8]) -> &[u8] {
     if name.len() >= 2 {
         let last = name[name.len() - 1];
         let sep = name[name.len() - 2];
-        if (last == b'1' || last == b'2')
-            && (sep == b'/' || sep == b'.' || sep == b'_' || sep == b':')
-        {
+        if sep == b'/' && last.is_ascii_digit() {
             return &name[..name.len() - 2];
         }
     }
-
     name
+}
+
+/// Strip a trailing space comment and an old-style `/<digit>` read-number suffix from a
+/// read name, for validating that reads match across synchronized FASTQs.
+///
+/// This mirrors the QNAME write path (see [`strip_read_number_suffix`]) so that any pair
+/// of names accepted by validation is guaranteed to be written with an identical BAM
+/// QNAME. Only `/` followed by a single digit is treated as a read-number suffix; `.`,
+/// `_`, and `:` separators are preserved because they can appear in legitimate read names
+/// (e.g. `sample_1`), matching fgbio's `FastqSource`. Narrowing this to `/` alone keeps
+/// validation and the written QNAME in lock-step: a `read_1`/`read_2` pair is now
+/// correctly reported as out of sync rather than passing validation and being written
+/// with two different QNAMEs.
+///
+/// Returns a slice of `name` without the comment or read-number suffix.
+fn strip_read_suffix_extract(name: &[u8]) -> &[u8] {
+    // First strip any space-separated comment suffix (e.g., "read/1 extra" -> "read/1").
+    let name = name.iter().position(|&b| b == b' ').map_or(name, |pos| &name[..pos]);
+
+    // Then strip the same conservative `/<digit>` read-number suffix as the write path.
+    strip_read_number_suffix(name)
 }
 
 #[cfg(test)]
@@ -2383,6 +2414,217 @@ mod tests {
         let (name, umi) = Extract::extract_read_name_and_umi(&header, false);
         assert_eq!(name, b"q1:2:3:4:5:6:7:ACGT".to_vec());
         assert_eq!(umi, None);
+    }
+
+    // ── Old-style Casava (<1.8) `/1` and `/2` read-number suffix stripping ──
+    //
+    // The written BAM QNAME must have a trailing `/<digit>` removed, matching
+    // fgbio's `FastqSource` behavior. Both mates of a pair must share an
+    // identical QNAME per the SAM spec, so `read/1` and `read/2` must both
+    // become `read`. Stripping is conservative — only `/` followed by a single
+    // digit is removed, never `.`, `_`, or `:` separators, which could appear
+    // in legitimate read names.
+
+    #[rstest]
+    // fgbio strips `/` + any single digit, not just 1/2.
+    #[case::one(b"@SRR001.1/1".as_slice(), b"SRR001.1".as_slice())]
+    #[case::two(b"@SRR001.1/2".as_slice(), b"SRR001.1".as_slice())]
+    #[case::any_digit(b"@read/3".as_slice(), b"read".as_slice())]
+    fn test_extract_read_name_and_umi_strips_single_digit_suffix(
+        #[case] header: &[u8],
+        #[case] expected: &[u8],
+    ) {
+        let (name, umi) = Extract::extract_read_name_and_umi(&header.to_vec(), false);
+        assert_eq!(name, expected.to_vec());
+        assert_eq!(umi, None);
+    }
+
+    #[test]
+    fn test_extract_read_name_and_umi_does_not_strip_dot_or_underscore_suffix() {
+        // Only `/` is a read-number separator; `.`/`_`/`:` may be part of a real
+        // name and must be preserved (unlike the broader validation helper).
+        for header in [b"@sample_1".as_slice(), b"@foo.2".as_slice(), b"@bar:1".as_slice()] {
+            let (name, _umi) = Extract::extract_read_name_and_umi(&header.to_vec(), false);
+            assert_eq!(name, header[1..].to_vec(), "should not strip: {header:?}");
+        }
+    }
+
+    #[test]
+    fn test_extract_read_name_and_umi_does_not_strip_slash_non_digit() {
+        let header = b"@read/x".to_vec();
+        let (name, _umi) = Extract::extract_read_name_and_umi(&header, false);
+        assert_eq!(name, b"read/x".to_vec());
+    }
+
+    #[test]
+    fn test_extract_read_name_and_umi_does_not_strip_slash_multi_digit() {
+        // Only a single trailing digit is a read number; `/12` is left intact.
+        let header = b"@read/12".to_vec();
+        let (name, _umi) = Extract::extract_read_name_and_umi(&header, false);
+        assert_eq!(name, b"read/12".to_vec());
+    }
+
+    #[test]
+    fn test_extract_read_name_and_umi_strips_slash_digit_then_comment() {
+        // The space comment is stripped first, then the `/1` read-number suffix.
+        let header = b"@read/1 1:N:0:ACGT".to_vec();
+        let (name, umi) = Extract::extract_read_name_and_umi(&header, false);
+        assert_eq!(name, b"read".to_vec());
+        assert_eq!(umi, None);
+    }
+
+    #[test]
+    fn test_extract_read_name_and_umi_strips_slash_before_umi_extraction() {
+        // fgbio strips `/<digit>` from the whole name before extracting the UMI,
+        // so the read-number digit never leaks into the UMI's last `:` field.
+        let header = b"@a:b:c:d:e:f:g:ACGT/1".to_vec();
+        let (name, umi) = Extract::extract_read_name_and_umi(&header, true);
+        assert_eq!(name, b"a:b:c:d:e:f:g:ACGT".to_vec());
+        assert_eq!(umi, Some(b"ACGT".to_vec()));
+    }
+
+    #[rstest]
+    // Strips a trailing `/<digit>` read-number suffix, matching the write path.
+    #[case::slash_one(b"read/1".as_slice(), b"read".as_slice())]
+    #[case::slash_two(b"read/2".as_slice(), b"read".as_slice())]
+    #[case::slash_any_digit(b"read/3".as_slice(), b"read".as_slice())]
+    // Strips a trailing space comment (before the read-number suffix).
+    #[case::space_comment(b"read 1:N:0:ACGT".as_slice(), b"read".as_slice())]
+    #[case::space_comment_then_slash(b"read/1 1:N:0:ACGT".as_slice(), b"read".as_slice())]
+    // Preserves `.`/`_`/`:` separators — they are not read-number delimiters and can
+    // appear in legitimate names, so validation must keep them (in lock-step with the
+    // write path, which also preserves them).
+    #[case::underscore(b"sample_1".as_slice(), b"sample_1".as_slice())]
+    #[case::dot(b"foo.2".as_slice(), b"foo.2".as_slice())]
+    #[case::colon(b"bar:1".as_slice(), b"bar:1".as_slice())]
+    // Preserves a multi-digit or non-digit `/` suffix.
+    #[case::slash_multi_digit(b"read/12".as_slice(), b"read/12".as_slice())]
+    #[case::slash_non_digit(b"read/x".as_slice(), b"read/x".as_slice())]
+    fn test_strip_read_suffix_extract(#[case] name: &[u8], #[case] expected: &[u8]) {
+        assert_eq!(strip_read_suffix_extract(name), expected);
+    }
+
+    proptest::proptest! {
+        /// Validation and the written QNAME must agree on the read-number suffix so that
+        /// any pair accepted by validation is written with an identical QNAME.
+        /// `strip_read_suffix_extract` first strips a trailing space comment, then delegates
+        /// to `strip_read_number_suffix`, so for any input *without* a space the two helpers
+        /// must return the identical slice. Generating arbitrary byte strings (not just
+        /// UTF-8) exercises trailing slashes, embedded digits, `.`/`_`/`:` separators, empty
+        /// names, and multi-byte edge cases that a fixed table misses.
+        #[test]
+        fn test_strip_read_suffix_extract_matches_write_path(
+            name in proptest::collection::vec(0u8..=255, 0..20),
+        ) {
+            // The invariant only holds for space-free inputs: the space-comment strip is the
+            // one step the write path performs separately before this helper is reached.
+            proptest::prop_assume!(!name.contains(&b' '));
+            proptest::prop_assert_eq!(
+                strip_read_suffix_extract(&name),
+                strip_read_number_suffix(&name),
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Read names do not match")]
+    fn test_extract_fails_on_underscore_read_number_suffix() {
+        // A `read_1`/`read_2` pair previously passed validation (`_1`/`_2` were stripped)
+        // yet was written with two different QNAMEs, violating the SAM spec. Validation
+        // now only strips `/<digit>`, so the mismatch is reported instead.
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let r1 = create_fastq(&tmp, "r1.fq", &[("read_1", "AAAAAAAAAA", "==========")]);
+        let r2 = create_fastq(&tmp, "r2.fq", &[("read_2", "CCCCCCCCCC", "##########")]);
+        let output = tmp.path().join("output.bam");
+
+        let extract = Extract {
+            inputs: vec![r1, r2],
+            output,
+            read_structures: vec![],
+            store_umi_quals: false,
+            store_cell_quals: false,
+            store_sample_barcode_qualities: false,
+            extract_umis_from_read_names: false,
+            annotate_read_names: false,
+            single_tag: None,
+            clipping_attribute: None,
+            read_group_id: "A".to_string(),
+            sample: "s".to_string(),
+            library: "l".to_string(),
+            barcode: None,
+            platform: "illumina".to_string(),
+            platform_unit: None,
+            platform_model: None,
+            sequencing_center: None,
+            predicted_insert_size: None,
+            description: None,
+            comment: vec![],
+            run_date: None,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
+        };
+
+        extract.execute("test").expect("execute should succeed");
+    }
+
+    #[rstest]
+    #[case::fast_path(ThreadingOptions::none())]
+    #[case::threaded(ThreadingOptions::new(2))]
+    fn test_extract_strips_read_number_suffix_from_written_qname(
+        #[case] threading: ThreadingOptions,
+    ) {
+        // End-to-end: paired FASTQs with old-style `/1` and `/2` read-number
+        // suffixes must produce a single shared QNAME (no suffix) for both mates,
+        // as required by the SAM spec. Guards the wiring from
+        // `extract_read_name_and_umi` through to the written BAM QNAME in both the
+        // single-threaded (`make_raw_records`) and threaded
+        // (`make_raw_records_static` + `strip_read_suffix_extract`) record-building
+        // paths.
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let r1 = create_fastq(&tmp, "r1.fq", &[("SRR001.1/1", "AAAAAAAAAA", "==========")]);
+        let r2 = create_fastq(&tmp, "r2.fq", &[("SRR001.1/2", "CCCCCCCCCC", "##########")]);
+        let output = tmp.path().join("output.bam");
+
+        let extract = Extract {
+            inputs: vec![r1, r2],
+            output: output.clone(),
+            read_structures: vec![],
+            store_umi_quals: false,
+            store_cell_quals: false,
+            store_sample_barcode_qualities: false,
+            extract_umis_from_read_names: false,
+            annotate_read_names: false,
+            single_tag: None,
+            clipping_attribute: None,
+            read_group_id: "A".to_string(),
+            sample: "s".to_string(),
+            library: "l".to_string(),
+            barcode: None,
+            platform: "illumina".to_string(),
+            platform_unit: None,
+            platform_model: None,
+            sequencing_center: None,
+            predicted_insert_size: None,
+            description: None,
+            comment: vec![],
+            run_date: None,
+            threading,
+            compression: CompressionOptions { compression_level: 1 },
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
+        };
+
+        extract.execute("test").expect("execute should succeed");
+
+        let recs = read_bam_records(&output);
+        assert_eq!(recs.len(), 2);
+        // Both mates share the suffix-free QNAME.
+        assert_eq!(recs[0].name().map(|n| n.as_bytes()), Some(b"SRR001.1".as_slice()));
+        assert_eq!(recs[1].name().map(|n| n.as_bytes()), Some(b"SRR001.1".as_slice()));
     }
 
     #[test]
