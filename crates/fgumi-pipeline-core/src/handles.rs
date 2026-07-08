@@ -1031,6 +1031,32 @@ where
     }
 }
 
+impl<A, B, C> OutputHandles<crate::outputs::OrderedBytesTuple3<A, B, C>>
+where
+    A: Send + HeapSize + Ordered + 'static,
+    B: Send + HeapSize + Ordered + 'static,
+    C: Send + HeapSize + Ordered + 'static,
+{
+    /// Borrow the typed per-branch view for an ordered + byte-bounded 3-tuple
+    /// output. Same view type as plain `(A, B, C)` — the view carries only
+    /// `BranchOutputHandle`s; the ordering is encoded in the queue transport.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the type-erased outputs view doesn't downcast to
+    /// `Tuple3OutputsView<A, B, C>` (a framework invariant violation).
+    #[must_use]
+    #[inline]
+    pub fn view(&self) -> Tuple3View<'_, A, B, C> {
+        let v = self
+            .inner
+            .inner
+            .downcast_ref::<Tuple3OutputsView<A, B, C>>()
+            .expect("OrderedBytesTuple3 outputs view downcast failed");
+        Tuple3View { a: &v.a, b: &v.b, c: &v.c }
+    }
+}
+
 pub struct Tuple2View<'a, A: Send + HeapSize + 'static, B: Send + HeapSize + 'static> {
     pub a: &'a BranchOutputHandle<A>,
     pub b: &'a BranchOutputHandle<B>,
@@ -1192,6 +1218,29 @@ where
             .inner
             .downcast_ref::<Tuple2OutputsView<A, B>>()
             .expect("OrderedBytesTuple2 outputs view downcast failed");
+        view.mark_all_drained();
+    }
+}
+
+impl<A, B, C> OutputHandles<crate::outputs::OrderedBytesTuple3<A, B, C>>
+where
+    A: Send + HeapSize + Ordered + 'static,
+    B: Send + HeapSize + Ordered + 'static,
+    C: Send + HeapSize + Ordered + 'static,
+{
+    /// Mark all output branches drained.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the type-erased outputs view doesn't downcast to
+    /// `Tuple3OutputsView<A, B, C>` (the view shape is shared with plain
+    /// `(A, B, C)`).
+    pub fn mark_all_drained(&self) {
+        let view = self
+            .inner
+            .inner
+            .downcast_ref::<Tuple3OutputsView<A, B, C>>()
+            .expect("OrderedBytesTuple3 outputs view downcast failed");
         view.mark_all_drained();
     }
 }
@@ -1380,6 +1429,49 @@ where
     let ba = build_branch::<A>(specs[0], ordering[0], level);
     let bb = build_branch::<B>(specs[1], ordering[1], level);
     let bc = build_branch::<C>(specs[2], ordering[2], level);
+    let view = Tuple3OutputsView { a: ba.output, b: bb.output, c: bc.output };
+    let outputs_view = OutputsViewAny { inner: Box::new(view) };
+    let queue_set = OutputQueueSet::new(vec![
+        BranchEntry {
+            input_handle: Box::new(ba.input),
+            bounded_queue_handle: ba.bounded_queue_handle,
+            metrics: ba.metrics,
+        },
+        BranchEntry {
+            input_handle: Box::new(bb.input),
+            bounded_queue_handle: bb.bounded_queue_handle,
+            metrics: bb.metrics,
+        },
+        BranchEntry {
+            input_handle: Box::new(bc.input),
+            bounded_queue_handle: bc.bounded_queue_handle,
+            metrics: bc.metrics,
+        },
+    ]);
+    (queue_set, outputs_view)
+}
+
+/// Build queues for `OrderedBytesTuple3<A, B, C>` outputs. All three branches
+/// support the full `QueueSpec × BranchOrdering` cross-product because each is
+/// `Ordered + HeapSize`. The `Tuple3OutputsView` carries only
+/// `BranchOutputHandle`s (no ordering metadata), so the view type is the same
+/// as for plain `(A, B, C)`.
+pub(crate) fn build_tuple3_queues_ordered_bytes<A, B, C>(
+    specs: &[QueueSpec],
+    ordering: &[BranchOrdering],
+    level: crate::builder::InstrumentationLevel,
+) -> (OutputQueueSet, OutputsViewAny)
+where
+    A: Send + HeapSize + Ordered + 'static,
+    B: Send + HeapSize + Ordered + 'static,
+    C: Send + HeapSize + Ordered + 'static,
+{
+    assert_eq!(specs.len(), 3, "OrderedBytesTuple3<A, B, C>::build_queues requires 3 specs");
+    assert_eq!(ordering.len(), 3, "OrderedBytesTuple3<A, B, C>::build_queues requires 3 orderings");
+
+    let ba = build_branch_ordered_bytes::<A>(specs[0], ordering[0], level);
+    let bb = build_branch_ordered_bytes::<B>(specs[1], ordering[1], level);
+    let bc = build_branch_ordered_bytes::<C>(specs[2], ordering[2], level);
     let view = Tuple3OutputsView { a: ba.output, b: bb.output, c: bc.output };
     let outputs_view = OutputsViewAny { inner: Box::new(view) };
     let queue_set = OutputQueueSet::new(vec![

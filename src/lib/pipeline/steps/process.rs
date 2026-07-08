@@ -600,6 +600,238 @@ where
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Process3WithWorkerState<I, A, B, C, S, Init, F> — Parallel + lazy per-worker
+// state + 3-output fan-out. Mirror of `Process2WithWorkerState` widened to
+// three ordered + byte-bounded output branches. Used by the paired FASTQ
+// encode (R1 / R2 / other), where each worker reuses one scratch buffer set
+// across all batches. Each branch carries its own `HeldSlot` for independent
+// backpressure, exactly as the 2-output sibling.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Output of a [`Process3WithWorkerState`] closure: one optional value per
+/// output branch. For an *ordered* consumer every branch that participates in
+/// the run must receive an item for every input ordinal (an empty payload is
+/// fine); `None` leaves a gap that wedges that branch's reorder stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Process3Output<A, B, C> {
+    pub a: Option<A>,
+    pub b: Option<B>,
+    pub c: Option<C>,
+}
+
+impl<A, B, C> Process3Output<A, B, C> {
+    #[must_use]
+    pub fn both3(a: A, b: B, c: C) -> Self {
+        Self { a: Some(a), b: Some(b), c: Some(c) }
+    }
+}
+
+/// `Parallel` + lazy per-worker state + 3-output fan-out. `Clone` resets
+/// `state` to `None`; first `try_run` initializes via `init()`; subsequent
+/// calls reuse the stored `S` via `&mut`. Each worker owns its clone
+/// exclusively (Parallel kind), so no synchronization is needed. Mirror of
+/// [`Process2WithWorkerState`] with a third branch.
+pub struct Process3WithWorkerState<I, A, B, C, S, Init, F>
+where
+    I: Send + HeapSize + 'static,
+    A: Send + HeapSize + Ordered + 'static,
+    B: Send + HeapSize + Ordered + 'static,
+    C: Send + HeapSize + Ordered + 'static,
+    S: Send + HeapSize + 'static,
+    Init: Fn() -> S + Send + Sync + 'static,
+    F: Fn(&mut S, I) -> io::Result<Process3Output<A, B, C>> + Send + Sync + 'static,
+{
+    f: Arc<F>,
+    init: Arc<Init>,
+    state: Option<S>,
+    held_a: HeldSlot<Unpushed<A>>,
+    held_b: HeldSlot<Unpushed<B>>,
+    held_c: HeldSlot<Unpushed<C>>,
+    name: &'static str,
+    limit_bytes_a: u64,
+    limit_bytes_b: u64,
+    limit_bytes_c: u64,
+    _phantom: PhantomData<fn() -> I>,
+}
+
+impl<I, A, B, C, S, Init, F> Process3WithWorkerState<I, A, B, C, S, Init, F>
+where
+    I: Send + HeapSize + 'static,
+    A: Send + HeapSize + Ordered + 'static,
+    B: Send + HeapSize + Ordered + 'static,
+    C: Send + HeapSize + Ordered + 'static,
+    S: Send + HeapSize + 'static,
+    Init: Fn() -> S + Send + Sync + 'static,
+    F: Fn(&mut S, I) -> io::Result<Process3Output<A, B, C>> + Send + Sync + 'static,
+{
+    pub fn new(
+        name: &'static str,
+        limit_bytes_a: u64,
+        limit_bytes_b: u64,
+        limit_bytes_c: u64,
+        init: Init,
+        f: F,
+    ) -> Self {
+        Self {
+            f: Arc::new(f),
+            init: Arc::new(init),
+            state: None,
+            held_a: HeldSlot::new(),
+            held_b: HeldSlot::new(),
+            held_c: HeldSlot::new(),
+            name,
+            limit_bytes_a,
+            limit_bytes_b,
+            limit_bytes_c,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<I, A, B, C, S, Init, F> Clone for Process3WithWorkerState<I, A, B, C, S, Init, F>
+where
+    I: Send + HeapSize + 'static,
+    A: Send + HeapSize + Ordered + 'static,
+    B: Send + HeapSize + Ordered + 'static,
+    C: Send + HeapSize + Ordered + 'static,
+    S: Send + HeapSize + 'static,
+    Init: Fn() -> S + Send + Sync + 'static,
+    F: Fn(&mut S, I) -> io::Result<Process3Output<A, B, C>> + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            f: Arc::clone(&self.f),
+            init: Arc::clone(&self.init),
+            state: None, // per-worker fresh; lazy on first try_run
+            held_a: HeldSlot::new(),
+            held_b: HeldSlot::new(),
+            held_c: HeldSlot::new(),
+            name: self.name,
+            limit_bytes_a: self.limit_bytes_a,
+            limit_bytes_b: self.limit_bytes_b,
+            limit_bytes_c: self.limit_bytes_c,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<I, A, B, C, S, Init, F> Step for Process3WithWorkerState<I, A, B, C, S, Init, F>
+where
+    I: Send + HeapSize + 'static,
+    A: Send + HeapSize + Ordered + 'static,
+    B: Send + HeapSize + Ordered + 'static,
+    C: Send + HeapSize + Ordered + 'static,
+    S: Send + HeapSize + 'static,
+    Init: Fn() -> S + Send + Sync + 'static,
+    F: Fn(&mut S, I) -> io::Result<Process3Output<A, B, C>> + Send + Sync + 'static,
+{
+    type Input = I;
+    type Outputs = crate::pipeline::core::outputs::OrderedBytesTuple3<A, B, C>;
+
+    fn profile(&self) -> StepProfile {
+        StepProfile {
+            name: self.name,
+            kind: StepKind::Parallel,
+            sticky: false,
+            output_queues: vec![
+                QueueSpec::ByteBounded { limit_bytes: self.limit_bytes_a },
+                QueueSpec::ByteBounded { limit_bytes: self.limit_bytes_b },
+                QueueSpec::ByteBounded { limit_bytes: self.limit_bytes_c },
+            ],
+            branch_ordering: vec![
+                BranchOrdering::ByItemOrdinal,
+                BranchOrdering::ByItemOrdinal,
+                BranchOrdering::ByItemOrdinal,
+            ],
+        }
+    }
+
+    fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+        let view = ctx.outputs.view();
+
+        if let Some(unpushed) = self.held_a.take() {
+            match view.a.retry(unpushed) {
+                Ok(()) => {}
+                Err(again) => {
+                    self.held_a.put(again);
+                    return Ok(StepOutcome::Contention);
+                }
+            }
+        }
+        if let Some(unpushed) = self.held_b.take() {
+            match view.b.retry(unpushed) {
+                Ok(()) => {}
+                Err(again) => {
+                    self.held_b.put(again);
+                    return Ok(StepOutcome::Contention);
+                }
+            }
+        }
+        if let Some(unpushed) = self.held_c.take() {
+            match view.c.retry(unpushed) {
+                Ok(()) => {}
+                Err(again) => {
+                    self.held_c.put(again);
+                    return Ok(StepOutcome::Contention);
+                }
+            }
+        }
+
+        let Some(item) = ctx.input.pop() else {
+            if ctx.input.is_drained() {
+                return Ok(StepOutcome::Finished);
+            }
+            return Ok(StepOutcome::NoProgress);
+        };
+        let state = self.state.get_or_insert_with(|| (self.init)());
+        let Process3Output { a, b, c } = (self.f)(state, item)?;
+
+        if let Some(av) = a {
+            if let Err(unpushed) = view.a.push(av) {
+                self.held_a.put(unpushed);
+            }
+        }
+        if let Some(bv) = b {
+            if let Err(unpushed) = view.b.push(bv) {
+                self.held_b.put(unpushed);
+            }
+        }
+        if let Some(cv) = c {
+            if let Err(unpushed) = view.c.push(cv) {
+                self.held_c.put(unpushed);
+            }
+        }
+        Ok(StepOutcome::Progress)
+    }
+
+    fn new_worker_copy(&self) -> Self {
+        self.clone()
+    }
+}
+
+/// Convenience constructor for [`Process3WithWorkerState`].
+#[allow(clippy::too_many_arguments)]
+pub fn process3_with_worker_state<I, A, B, C, S, Init, F>(
+    name: &'static str,
+    limit_bytes_a: u64,
+    limit_bytes_b: u64,
+    limit_bytes_c: u64,
+    init: Init,
+    f: F,
+) -> Process3WithWorkerState<I, A, B, C, S, Init, F>
+where
+    I: Send + HeapSize + 'static,
+    A: Send + HeapSize + Ordered + 'static,
+    B: Send + HeapSize + Ordered + 'static,
+    C: Send + HeapSize + Ordered + 'static,
+    S: Send + HeapSize + 'static,
+    Init: Fn() -> S + Send + Sync + 'static,
+    F: Fn(&mut S, I) -> io::Result<Process3Output<A, B, C>> + Send + Sync + 'static,
+{
+    Process3WithWorkerState::new(name, limit_bytes_a, limit_bytes_b, limit_bytes_c, init, f)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // MiAssign<I, F> — Serial + monotonic MI counter. Used for deterministic
 // MoleculeId numbering across input batches.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1395,6 +1627,79 @@ mod tests {
         assert_eq!(
             profile.branch_ordering,
             vec![BranchOrdering::ByItemOrdinal, BranchOrdering::ByItemOrdinal]
+        );
+    }
+
+    #[test]
+    fn process3_with_worker_state_clone_resets_state() {
+        #[derive(Default)]
+        struct WS {
+            counter: u32,
+        }
+        impl HeapSize for WS {
+            fn heap_size(&self) -> usize {
+                0
+            }
+        }
+
+        let step = process3_with_worker_state::<Item, Item, Item, Item, WS, _, _>(
+            "stateful3",
+            1024,
+            1024,
+            1024,
+            WS::default,
+            |state, item| {
+                state.counter += 1;
+                Ok(Process3Output::both3(
+                    Item { ord: item.ord, v: state.counter },
+                    Item { ord: item.ord, v: state.counter },
+                    Item { ord: item.ord, v: state.counter },
+                ))
+            },
+        );
+        let cloned = step.clone();
+        assert!(step.state.is_none());
+        assert!(cloned.state.is_none());
+    }
+
+    #[test]
+    fn process3_with_worker_state_profile_is_parallel_byitem_three_branches() {
+        #[derive(Default)]
+        struct WS;
+        impl HeapSize for WS {
+            fn heap_size(&self) -> usize {
+                0
+            }
+        }
+
+        let step = process3_with_worker_state::<Item, Item, Item, Item, WS, _, _>(
+            "stateful3-profile",
+            256,
+            512,
+            1024,
+            WS::default,
+            |_state, item| {
+                Ok(Process3Output::both3(item, Item { ord: 0, v: 0 }, Item { ord: 0, v: 0 }))
+            },
+        );
+        let profile = step.profile();
+        assert_eq!(profile.kind, StepKind::Parallel);
+        assert_eq!(profile.output_queues.len(), 3);
+        assert_eq!(
+            profile.output_queues,
+            vec![
+                QueueSpec::ByteBounded { limit_bytes: 256 },
+                QueueSpec::ByteBounded { limit_bytes: 512 },
+                QueueSpec::ByteBounded { limit_bytes: 1024 },
+            ]
+        );
+        assert_eq!(
+            profile.branch_ordering,
+            vec![
+                BranchOrdering::ByItemOrdinal,
+                BranchOrdering::ByItemOrdinal,
+                BranchOrdering::ByItemOrdinal,
+            ]
         );
     }
 
