@@ -1,5 +1,7 @@
 //! FASTQ parser: uses SIMD-produced newline bitmasks to find record boundaries.
 
+use std::fmt;
+
 use crate::lexer;
 
 /// A borrowed FASTQ record with zero-copy slices into the input buffer.
@@ -12,6 +14,45 @@ pub struct FastqRecord<'a> {
     /// Quality scores (Phred-encoded ASCII).
     pub quality: &'a [u8],
 }
+
+/// A structural error encountered while parsing a single FASTQ record.
+///
+/// These mirror the malformed-input cases that fgbio's `FastqSource` rejects:
+/// a header not starting with `@`, a record without the expected four lines, a
+/// quality header not starting with `+`, and a sequence/quality length mismatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FastqParseError {
+    /// The header line did not start with `@`.
+    MissingAtPrefix,
+    /// The record did not contain the four expected newline-delimited lines.
+    TooFewLines,
+    /// The quality header line did not start with `+`.
+    MissingPlusPrefix,
+    /// The sequence and quality lines had different lengths.
+    LengthMismatch {
+        /// Number of sequence bases.
+        seq_len: usize,
+        /// Number of quality scores.
+        qual_len: usize,
+    },
+}
+
+impl fmt::Display for FastqParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingAtPrefix => write!(f, "FASTQ record must start with @"),
+            Self::TooFewLines => write!(f, "FASTQ record must have four newline-delimited lines"),
+            Self::MissingPlusPrefix => write!(f, "FASTQ quality header must start with +"),
+            Self::LengthMismatch { seq_len, qual_len } => write!(
+                f,
+                "FASTQ sequence and quality lengths differ ({seq_len} bases vs {qual_len} quals)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FastqParseError {}
 
 /// Find FASTQ record boundary offsets in a byte buffer.
 ///
@@ -143,16 +184,21 @@ impl<'a> Iterator for RecordIter<'a> {
     }
 }
 
-/// Parse a single FASTQ record from a byte slice.
+/// Parse a single FASTQ record from a byte slice, validating its structure.
 ///
-/// Expects format: `@name\nsequence\n+\nquality\n`
+/// Expects format: `@name\nsequence\n+\nquality\n`. Validates, in order, that
+/// the record starts with `@`, has the four expected lines, has a quality header
+/// starting with `+`, and has equal-length sequence and quality lines. These are
+/// the same structural checks fgbio's `FastqSource` enforces. All checks are
+/// `O(1)` beyond the newline scan already required for framing.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the record does not contain exactly 4 newline-delimited lines
-/// or does not start with `@`.
-pub(crate) fn parse_single_record(record: &[u8]) -> FastqRecord<'_> {
-    assert!(!record.is_empty() && record[0] == b'@', "FASTQ record must start with @");
+/// Returns a [`FastqParseError`] describing the first structural violation.
+pub(crate) fn try_parse_single_record(record: &[u8]) -> Result<FastqRecord<'_>, FastqParseError> {
+    if record.is_empty() || record[0] != b'@' {
+        return Err(FastqParseError::MissingAtPrefix);
+    }
 
     // Find the 3 internal newlines (the 4th newline is the last byte)
     let mut newline_positions = [0usize; 3];
@@ -170,11 +216,18 @@ pub(crate) fn parse_single_record(record: &[u8]) -> FastqRecord<'_> {
         }
     }
 
-    assert_eq!(count, 3, "FASTQ record must have at least 3 internal newlines");
+    if count != 3 {
+        return Err(FastqParseError::TooFewLines);
+    }
 
     let name_end = newline_positions[0];
     let seq_end = newline_positions[1];
     let plus_end = newline_positions[2];
+
+    // The quality header (third line, between seq_end and plus_end) must start with '+'.
+    if record.get(seq_end + 1) != Some(&b'+') {
+        return Err(FastqParseError::MissingPlusPrefix);
+    }
 
     // name: skip '@', up to first newline
     let name = &record[1..name_end];
@@ -183,14 +236,56 @@ pub(crate) fn parse_single_record(record: &[u8]) -> FastqRecord<'_> {
     // quality: after third newline, up to end (excluding trailing newline if present)
     let qual_start = plus_end + 1;
     let qual_end = if record.last() == Some(&b'\n') { record.len() - 1 } else { record.len() };
+    // When the record ends right after the '+' line (its third newline is the
+    // final byte) there is no quality line at all: qual_start would exceed
+    // qual_end and the slice below would panic. Treat this as a missing fourth
+    // line rather than indexing an inverted range.
+    if qual_start > qual_end {
+        return Err(FastqParseError::TooFewLines);
+    }
     let quality = &record[qual_start..qual_end];
 
-    FastqRecord { name, sequence, quality }
+    if sequence.len() != quality.len() {
+        return Err(FastqParseError::LengthMismatch {
+            seq_len: sequence.len(),
+            qual_len: quality.len(),
+        });
+    }
+
+    Ok(FastqRecord { name, sequence, quality })
+}
+
+/// Parse a single FASTQ record from a byte slice, panicking on malformed input.
+///
+/// Convenience wrapper over [`try_parse_single_record`] for the infallible
+/// zero-copy [`parse_records`] scan, which assumes well-formed input. The
+/// streaming [`SimdFastqReader`](crate::SimdFastqReader) uses the fallible form
+/// so real files surface a clean error instead of a panic.
+///
+/// # Panics
+///
+/// Panics if the record is structurally invalid; see [`FastqParseError`].
+pub(crate) fn parse_single_record(record: &[u8]) -> FastqRecord<'_> {
+    try_parse_single_record(record).unwrap_or_else(|e| panic!("{e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use rstest::rstest;
+
+    proptest! {
+        // `try_parse_single_record` is the fallible core the streaming reader
+        // routes real input through, so it must never panic on malformed bytes —
+        // it may only return `Ok` or a typed `FastqParseError`. Arbitrary byte
+        // slices exercise the record-slicing logic (e.g. a record ending right
+        // after the '+' line) and guard against slice-panic regressions.
+        #[test]
+        fn test_try_parse_single_record_never_panics(record in proptest::collection::vec(any::<u8>(), 0..64)) {
+            let _ = try_parse_single_record(&record);
+        }
+    }
 
     #[test]
     fn test_empty_input() {
@@ -236,6 +331,46 @@ mod tests {
         assert_eq!(records[0].name, b"read1");
         assert_eq!(records[0].sequence, b"ACGT");
         assert_eq!(records[0].quality, b"IIII");
+    }
+
+    #[test]
+    fn test_try_parse_single_record_ok() {
+        let rec = try_parse_single_record(b"@read1\nACGT\n+\nIIII\n")
+            .expect("well-formed record should parse");
+        assert_eq!(rec.name, b"read1");
+        assert_eq!(rec.sequence, b"ACGT");
+        assert_eq!(rec.quality, b"IIII");
+    }
+
+    #[test]
+    fn test_try_parse_single_record_ok_zero_length_read() {
+        // Empty sequence and quality lines are valid (0 == 0) and must be preserved;
+        // fgumi supports zero-length reads and this must not regress.
+        let rec =
+            try_parse_single_record(b"@read1\n\n+\n\n").expect("zero-length read should parse");
+        assert_eq!(rec.name, b"read1");
+        assert_eq!(rec.sequence, b"");
+        assert_eq!(rec.quality, b"");
+    }
+
+    #[rstest]
+    #[case::missing_at_prefix(b"read1\nACGT\n+\nIIII\n", FastqParseError::MissingAtPrefix)]
+    // Only two newline-delimited lines.
+    #[case::too_few_lines(b"@read1\nACGT\n", FastqParseError::TooFewLines)]
+    #[case::missing_plus_prefix(b"@read1\nACGT\n?\nIIII\n", FastqParseError::MissingPlusPrefix)]
+    #[case::length_mismatch(
+        b"@read1\nACGT\n+\nII\n",
+        FastqParseError::LengthMismatch { seq_len: 4, qual_len: 2 }
+    )]
+    // Record ends right after the '+' line (three newlines, no quality line):
+    // the quality range would be empty-but-inverted (qual_start > qual_end), so
+    // this must return TooFewLines rather than panic on the slice.
+    #[case::plus_line_but_no_quality(b"@r\nA\n+\n", FastqParseError::TooFewLines)]
+    fn test_try_parse_single_record_rejects_malformed(
+        #[case] input: &[u8],
+        #[case] expected: FastqParseError,
+    ) {
+        assert_eq!(try_parse_single_record(input), Err(expected));
     }
 
     #[test]

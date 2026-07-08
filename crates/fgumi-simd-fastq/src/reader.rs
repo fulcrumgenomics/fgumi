@@ -5,7 +5,7 @@
 
 use std::io::{self, BufRead};
 
-use crate::parser::{self, parse_single_record};
+use crate::parser::{self, try_parse_single_record};
 
 /// Default internal buffer size (1 MiB), matching `seq_io`'s default.
 const DEFAULT_BUFFER_SIZE: usize = 1 << 20;
@@ -139,7 +139,14 @@ impl<R: BufRead> Iterator for SimdFastqReader<R> {
                 let end = self.offsets[self.next_record_idx + 1];
                 self.next_record_idx += 1;
 
-                let borrowed = parse_single_record(&self.buffer[start..end]);
+                let borrowed = match try_parse_single_record(&self.buffer[start..end]) {
+                    Ok(rec) => rec,
+                    Err(e) => {
+                        // Preserve the typed `FastqParseError` as the io::Error's inner error
+                        // so downstream callers can inspect or downcast it via `get_ref()`.
+                        return Some(Err(io::Error::new(io::ErrorKind::InvalidData, e)));
+                    }
+                };
                 return Some(Ok(OwnedFastqRecord {
                     name: borrowed.name.to_vec(),
                     sequence: borrowed.sequence.to_vec(),
@@ -174,6 +181,7 @@ impl<R: BufRead> Iterator for SimdFastqReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::io::Cursor;
 
     #[test]
@@ -240,6 +248,50 @@ mod tests {
         let data = b"";
         let mut reader = SimdFastqReader::new(Cursor::new(&data[..]));
         assert!(reader.next().is_none());
+    }
+
+    // ── Malformed-record validation (mirrors fgbio's FastqSource throwing
+    // behavior in FastqIoTest, adapted to fgumi's fallible `io::Result` item
+    // contract: the streaming reader surfaces an `InvalidData` error rather than
+    // panicking or silently yielding a corrupt record). ──
+
+    fn assert_next_is_invalid_data<R: BufRead>(reader: &mut SimdFastqReader<R>) {
+        let err = reader
+            .next()
+            .expect("reader should yield an item")
+            .expect_err("malformed record should be an error, not Ok");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "unexpected error: {err}");
+    }
+
+    #[rstest]
+    // Header line does not start with '@'.
+    #[case::missing_at_prefix(b"r1\nACGT\n+\nIIII\n")]
+    // Third line (quality header) does not start with '+'.
+    #[case::missing_plus_line(b"@r1\nACGT\n?\nIIII\n")]
+    // Sequence has 4 bases but quality has 2 scores.
+    #[case::seq_qual_length_mismatch(b"@r1\nACGT\n+\nII\n")]
+    fn test_reader_rejects_malformed_record(#[case] data: &[u8]) {
+        let mut reader = SimdFastqReader::new(Cursor::new(data));
+        assert_next_is_invalid_data(&mut reader);
+    }
+
+    #[test]
+    fn test_reader_error_preserves_parse_error_source() {
+        // Sequence has 4 bases but quality has 2 scores.
+        let data = b"@r1\nACGT\n+\nII\n";
+        let mut reader = SimdFastqReader::new(Cursor::new(&data[..]));
+        let err = reader
+            .next()
+            .expect("reader should yield an item")
+            .expect_err("malformed record should be an error, not Ok");
+
+        // The typed FastqParseError must survive as the io::Error's inner error so callers
+        // can downcast it, rather than being flattened into a string.
+        let inner = err.get_ref().expect("io::Error should carry an inner error");
+        let parse_err = inner
+            .downcast_ref::<parser::FastqParseError>()
+            .expect("inner error should downcast to FastqParseError");
+        assert_eq!(*parse_err, parser::FastqParseError::LengthMismatch { seq_len: 4, qual_len: 2 });
     }
 
     #[test]

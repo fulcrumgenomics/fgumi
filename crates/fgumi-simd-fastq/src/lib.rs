@@ -33,5 +33,5 @@ mod reader;
 
 pub use bitmask::FastqBitmask;
 pub use lexer::lex_block_full;
-pub use parser::{FastqRecord, find_record_offsets, parse_records};
+pub use parser::{FastqParseError, FastqRecord, find_record_offsets, parse_records};
 pub use reader::SimdFastqReader;
