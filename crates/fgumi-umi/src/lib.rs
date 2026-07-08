@@ -193,17 +193,24 @@ impl std::fmt::Display for MoleculeId {
 pub struct TagSets;
 
 impl TagSets {
-    /// Consensus tags that should be reversed.
+    /// Consensus per-base tags that should be **reversed** on negative-strand reads.
     ///
-    /// These are per-base tags from fgbio consensus callers that need to be
-    /// reversed when the read is mapped to the negative strand.
-    pub const CONSENSUS_REVERSE: &[&str] = &["ad", "ae", "bd", "be", "cd"];
+    /// Mirrors fgbio `ConsensusTags.PerBase.TagsToReverse`: the per-base
+    /// depth/error/quality arrays — `cd`,`ce` (consensus), `ad`,`ae` (top strand),
+    /// `bd`,`be` (bottom strand), and `aq`,`bq` (per-strand quals). These are
+    /// position-indexed arrays, so they must be reversed (not reverse-complemented)
+    /// when the read maps to the negative strand.
+    pub const CONSENSUS_REVERSE: &[&str] = &["cd", "ce", "ad", "ae", "bd", "be", "aq", "bq"];
 
-    /// Consensus tags that should be reverse complemented.
+    /// Consensus per-base **base** tags that should be **reverse-complemented** on
+    /// negative-strand reads.
     ///
-    /// These are per-base sequence tags from fgbio consensus callers that need
-    /// to be reverse complemented when the read is mapped to the negative strand.
-    pub const CONSENSUS_REVCOMP: &[&str] = &["aD", "bD", "cD"];
+    /// Mirrors fgbio `ConsensusTags.PerBase.TagsToReverseComplement`: the per-base
+    /// consensus base arrays `ac` (top strand) and `bc` (bottom strand). Being
+    /// sequence bases, they are reverse-complemented (not merely reversed) on the
+    /// negative strand. (Note: `aD`/`bD`/`cD` are per-*read* scalar depths — never
+    /// reversed or revcomped.)
+    pub const CONSENSUS_REVCOMP: &[&str] = &["ac", "bc"];
 }
 
 /// Information about which tags to remove, reverse, or reverse complement
@@ -368,8 +375,62 @@ mod tests {
 
     #[test]
     fn test_consensus_reverse_returns_correct_tags() {
-        assert_eq!(TagSets::CONSENSUS_REVERSE.len(), 5);
-        assert_eq!(TagSets::CONSENSUS_REVERSE, &["ad", "ae", "bd", "be", "cd"]);
+        // fgbio ConsensusTags.PerBase.TagsToReverse = {cd, ce, ad, ae, bd, be, aq, bq}
+        assert_eq!(TagSets::CONSENSUS_REVERSE.len(), 8);
+        assert_eq!(TagSets::CONSENSUS_REVERSE, &["cd", "ce", "ad", "ae", "bd", "be", "aq", "bq"]);
+    }
+
+    /// Programmatic fgbio baseline for the per-base consensus tag sets, so the
+    /// `TagSets::CONSENSUS_*` pins are checked against fgbio's *definition* rather than a
+    /// second hand-copied literal.
+    ///
+    /// This reconstructs fgbio's `ConsensusTags.PerBase` sets from the individually named tag
+    /// symbols, in fgbio's exact `Seq(...)` order (fgbio
+    /// `src/main/scala/com/fulcrumgenomics/umi/ConsensusTags.scala`, `object PerBase`,
+    /// verified against fgbio main). If fgbio adds, removes, or reorders a per-base tag, update
+    /// the named symbols below and this test catches any resulting drift in the production
+    /// constants. The intentional divergence from fgumi's *superset* `per_base` lists — which
+    /// additionally cover the CODEC conversion tags — is asserted separately by
+    /// `test_zipper_consensus_tagset_is_subset_of_canonical_per_base` in `src/lib/tag_reversal.rs`.
+    #[test]
+    fn test_consensus_tag_sets_match_fgbio_perbase_baseline() {
+        // fgbio ConsensusTags.PerBase named symbol -> 2-char SAM tag.
+        let raw_read_count = "cd"; // RawReadCount    (consensus depth)
+        let raw_read_errors = "ce"; // RawReadErrors   (consensus errors)
+        let ab_raw_read_count = "ad"; // AbRawReadCount
+        let ba_raw_read_count = "bd"; // BaRawReadCount
+        let ab_raw_read_errors = "ae"; // AbRawReadErrors
+        let ba_raw_read_errors = "be"; // BaRawReadErrors
+        let ab_consensus_bases = "ac"; // AbConsensusBases
+        let ba_consensus_bases = "bc"; // BaConsensusBases
+        let ab_consensus_quals = "aq"; // AbConsensusQuals
+        let ba_consensus_quals = "bq"; // BaConsensusQuals
+
+        // fgbio: TagsToReverse = Seq(RawReadCount, RawReadErrors, AbRawReadCount, AbRawReadErrors,
+        //                            BaRawReadCount, BaRawReadErrors, AbConsensusQuals, BaConsensusQuals)
+        let fgbio_tags_to_reverse = [
+            raw_read_count,
+            raw_read_errors,
+            ab_raw_read_count,
+            ab_raw_read_errors,
+            ba_raw_read_count,
+            ba_raw_read_errors,
+            ab_consensus_quals,
+            ba_consensus_quals,
+        ];
+        // fgbio: TagsToReverseComplement = Seq(AbConsensusBases, BaConsensusBases)
+        let fgbio_tags_to_reverse_complement = [ab_consensus_bases, ba_consensus_bases];
+
+        assert_eq!(
+            TagSets::CONSENSUS_REVERSE,
+            &fgbio_tags_to_reverse,
+            "CONSENSUS_REVERSE drifted from fgbio ConsensusTags.PerBase.TagsToReverse",
+        );
+        assert_eq!(
+            TagSets::CONSENSUS_REVCOMP,
+            &fgbio_tags_to_reverse_complement,
+            "CONSENSUS_REVCOMP drifted from fgbio ConsensusTags.PerBase.TagsToReverseComplement",
+        );
     }
 
     // ========================================================================
@@ -458,8 +519,9 @@ mod tests {
 
     #[test]
     fn test_consensus_revcomp_returns_correct_tags() {
-        assert_eq!(TagSets::CONSENSUS_REVCOMP.len(), 3);
-        assert_eq!(TagSets::CONSENSUS_REVCOMP, &["aD", "bD", "cD"]);
+        // fgbio ConsensusTags.PerBase.TagsToReverseComplement = {ac, bc} (per-base base arrays)
+        assert_eq!(TagSets::CONSENSUS_REVCOMP.len(), 2);
+        assert_eq!(TagSets::CONSENSUS_REVCOMP, &["ac", "bc"]);
     }
 
     #[test]
@@ -490,21 +552,18 @@ mod tests {
     #[test]
     fn test_taginfo_new_with_consensus_reverse() {
         let tag_info = TagInfo::new(vec![], vec!["Consensus".to_string()], vec![]);
-        assert_eq!(tag_info.reverse.len(), 5);
-        assert!(tag_info.reverse.contains("ad"));
-        assert!(tag_info.reverse.contains("ae"));
-        assert!(tag_info.reverse.contains("bd"));
-        assert!(tag_info.reverse.contains("be"));
-        assert!(tag_info.reverse.contains("cd"));
+        assert_eq!(tag_info.reverse.len(), 8);
+        for t in ["cd", "ce", "ad", "ae", "bd", "be", "aq", "bq"] {
+            assert!(tag_info.reverse.contains(t), "missing reverse tag {t}");
+        }
     }
 
     #[test]
     fn test_taginfo_new_with_consensus_revcomp() {
         let tag_info = TagInfo::new(vec![], vec![], vec!["Consensus".to_string()]);
-        assert_eq!(tag_info.revcomp.len(), 3);
-        assert!(tag_info.revcomp.contains("aD"));
-        assert!(tag_info.revcomp.contains("bD"));
-        assert!(tag_info.revcomp.contains("cD"));
+        assert_eq!(tag_info.revcomp.len(), 2);
+        assert!(tag_info.revcomp.contains("ac"));
+        assert!(tag_info.revcomp.contains("bc"));
     }
 
     #[test]
@@ -517,20 +576,16 @@ mod tests {
         // Remove set
         assert_eq!(tag_info.remove.len(), 1);
         assert!(tag_info.remove.contains("AS"));
-        // Reverse set should have Consensus tags + BQ
-        assert_eq!(tag_info.reverse.len(), 6);
-        assert!(tag_info.reverse.contains("ad"));
-        assert!(tag_info.reverse.contains("ae"));
-        assert!(tag_info.reverse.contains("bd"));
-        assert!(tag_info.reverse.contains("be"));
-        assert!(tag_info.reverse.contains("cd"));
-        assert!(tag_info.reverse.contains("BQ"));
-        // Revcomp set should have Consensus tags + E2
-        assert_eq!(tag_info.revcomp.len(), 4);
-        assert!(tag_info.revcomp.contains("aD"));
-        assert!(tag_info.revcomp.contains("bD"));
-        assert!(tag_info.revcomp.contains("cD"));
-        assert!(tag_info.revcomp.contains("E2"));
+        // Reverse set should have the 8 Consensus tags + BQ
+        assert_eq!(tag_info.reverse.len(), 9);
+        for t in ["cd", "ce", "ad", "ae", "bd", "be", "aq", "bq", "BQ"] {
+            assert!(tag_info.reverse.contains(t), "missing reverse tag {t}");
+        }
+        // Revcomp set should have the 2 Consensus base tags + E2
+        assert_eq!(tag_info.revcomp.len(), 3);
+        for t in ["ac", "bc", "E2"] {
+            assert!(tag_info.revcomp.contains(t), "missing revcomp tag {t}");
+        }
     }
 
     #[test]
@@ -554,8 +609,8 @@ mod tests {
             vec!["Consensus".to_string(), "Consensus".to_string()],
         );
         // Should not duplicate consensus tags
-        assert_eq!(tag_info.reverse.len(), 5);
-        assert_eq!(tag_info.revcomp.len(), 3);
+        assert_eq!(tag_info.reverse.len(), 8);
+        assert_eq!(tag_info.revcomp.len(), 2);
     }
 
     #[test]

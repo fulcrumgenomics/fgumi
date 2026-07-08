@@ -97,8 +97,11 @@ You can specify which tags to manipulate for reads mapped to the negative strand
 - --tags-to-reverse: Reverses array and string tags (e.g., [1,2,3] becomes [3,2,1])
 - --tags-to-revcomp: Reverse complements sequence tags (e.g., AGAGG becomes CCTCT)
 
-Named tag sets like "Consensus" are automatically expanded to their constituent tags:
-- Consensus: aD bD cD aM bM cM aE bE cE ad bd cd ae be ce ac bc
+Named tag sets like "Consensus" are automatically expanded to their constituent per-base tags
+(matching fgbio's ConsensusTags):
+- --tags-to-reverse Consensus:  cd ce ad ae bd be aq bq  (per-base depth/error/quality arrays; reversed)
+- --tags-to-revcomp Consensus:  ac bc  (per-base consensus base arrays; reverse-complemented)
+Per-read scalar tags (aD bD cD, aM bM cM, aE bE cE) are never reversed or reverse-complemented.
 
 ## Default Behavior
 
@@ -1588,9 +1591,13 @@ mod tests {
         let mut mapped = FgSamBuilder::new_mapped();
 
         let mut attrs = HashMap::new();
-        attrs.insert("aD", BufValue::from("AAAGG".to_string()));
-        attrs.insert("bD", BufValue::from("AAAGC".to_string()));
+        // ac/bc are the per-base consensus BASE arrays -> reverse-complemented on neg strand.
+        attrs.insert("ac", BufValue::from("AAAGG".to_string()));
+        attrs.insert("bc", BufValue::from("AAAGC".to_string()));
+        // ad is a per-base depth array -> reversed on neg strand.
         attrs.insert("ad", BufValue::from(vec![3i16, 3, 4, 4, 2]));
+        // aD is a per-READ scalar depth -> in NO transform set, must be left unchanged.
+        attrs.insert("aD", BufValue::from(42i32));
         unmapped.add_frag_with_attrs("q1", None, true, &attrs);
 
         let mut mapped_attrs1 = HashMap::new();
@@ -1627,12 +1634,12 @@ mod tests {
 
         for rec in &records {
             if rec.flags().is_reverse_complemented() {
-                // Negative strand - should be reversed/revcomped
-                if let Some(BufValue::String(s)) = rec.data().get(&Tag::new(b'a', b'D')) {
+                // Negative strand: ac/bc reverse-complemented, ad reversed, per-read aD unchanged.
+                if let Some(BufValue::String(s)) = rec.data().get(&Tag::new(b'a', b'c')) {
                     assert_eq!(s.to_string(), "CCTTT");
                 }
 
-                if let Some(BufValue::String(s)) = rec.data().get(&Tag::new(b'b', b'D')) {
+                if let Some(BufValue::String(s)) = rec.data().get(&Tag::new(b'b', b'c')) {
                     assert_eq!(s.to_string(), "GCTTT");
                 }
 
@@ -1642,13 +1649,18 @@ mod tests {
                 {
                     assert_eq!(*vals, vec![2i16, 4, 4, 3, 3]);
                 }
+
+                // Per-read scalar aD is in no transform set -> unchanged even on neg strand.
+                if let Some(BufValue::Int32(v)) = rec.data().get(&Tag::new(b'a', b'D')) {
+                    assert_eq!(*v, 42);
+                }
             } else {
                 // Positive strand - no changes
-                if let Some(BufValue::String(s)) = rec.data().get(&Tag::new(b'a', b'D')) {
+                if let Some(BufValue::String(s)) = rec.data().get(&Tag::new(b'a', b'c')) {
                     assert_eq!(s.to_string(), "AAAGG");
                 }
 
-                if let Some(BufValue::String(s)) = rec.data().get(&Tag::new(b'b', b'D')) {
+                if let Some(BufValue::String(s)) = rec.data().get(&Tag::new(b'b', b'c')) {
                     assert_eq!(s.to_string(), "AAAGC");
                 }
 
@@ -1735,16 +1747,18 @@ mod tests {
         let tag_info =
             TagInfo::new(vec![], vec!["Consensus".to_string()], vec!["Consensus".to_string()]);
 
-        // Check that "Consensus" was expanded
-        assert!(tag_info.reverse.contains("ad"));
-        assert!(tag_info.reverse.contains("ae"));
-        assert!(tag_info.reverse.contains("bd"));
-        assert!(tag_info.reverse.contains("be"));
-        assert!(tag_info.reverse.contains("cd"));
-
-        assert!(tag_info.revcomp.contains("aD"));
-        assert!(tag_info.revcomp.contains("bD"));
-        assert!(tag_info.revcomp.contains("cD"));
+        // "Consensus" reverse set = fgbio TagsToReverse {cd, ce, ad, ae, bd, be, aq, bq}
+        for t in ["cd", "ce", "ad", "ae", "bd", "be", "aq", "bq"] {
+            assert!(tag_info.reverse.contains(t), "missing reverse tag {t}");
+        }
+        // "Consensus" revcomp set = fgbio TagsToReverseComplement {ac, bc} (per-base base arrays);
+        // per-read scalars aD/bD/cD must NOT be present.
+        for t in ["ac", "bc"] {
+            assert!(tag_info.revcomp.contains(t), "missing revcomp tag {t}");
+        }
+        for t in ["aD", "bD", "cD"] {
+            assert!(!tag_info.revcomp.contains(t), "per-read scalar {t} must not be revcomped");
+        }
     }
 
     #[test]
