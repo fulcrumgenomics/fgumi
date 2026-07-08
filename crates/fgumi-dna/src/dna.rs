@@ -6,8 +6,9 @@ use crate::{NO_CALL_BASE, NO_CALL_BASE_LOWER};
 
 /// Complements a single DNA base, normalizing to uppercase except for N/n.
 ///
-/// Returns the Watson-Crick complement: A<->T, C<->G.
-/// Both uppercase and lowercase A/T/C/G input are normalized to uppercase output.
+/// Returns the Watson-Crick complement: A<->T, C<->G. RNA uracil (`U`/`u`)
+/// complements to `A`, matching fgbio's `Sequences.complement`.
+/// Both uppercase and lowercase A/T/C/G/U input are normalized to uppercase output.
 ///
 /// # Case preservation for N/n
 ///
@@ -30,7 +31,8 @@ use crate::{NO_CALL_BASE, NO_CALL_BASE_LOWER};
 pub const fn complement_base(base: u8) -> u8 {
     match base {
         b'A' | b'a' => b'T',
-        b'T' | b't' => b'A',
+        // T and RNA uracil U both complement to A (fgbio Sequences.complement)
+        b'T' | b't' | b'U' | b'u' => b'A',
         b'C' | b'c' => b'G',
         b'G' | b'g' => b'C',
         NO_CALL_BASE => NO_CALL_BASE,             // 'N' stays 'N'
@@ -42,7 +44,7 @@ pub const fn complement_base(base: u8) -> u8 {
 /// Reverse complements a DNA sequence.
 ///
 /// Returns the reverse complement of the input sequence, normalizing to uppercase.
-/// A<->T, C<->G, N and other bases are unchanged.
+/// A<->T, C<->G, U->A; N and other bases are unchanged.
 ///
 /// # Examples
 ///
@@ -61,7 +63,8 @@ pub fn reverse_complement(seq: &[u8]) -> Vec<u8> {
 
 /// Complements a single DNA base, preserving case.
 ///
-/// Returns the Watson-Crick complement: A<->T, C<->G.
+/// Returns the Watson-Crick complement: A<->T, C<->G. RNA uracil (`U`/`u`)
+/// complements to `A`/`a`, matching fgbio's `Sequences.complement`.
 /// Unlike [`complement_base`], this preserves the case of the input:
 /// uppercase input produces uppercase output, lowercase produces lowercase.
 ///
@@ -78,11 +81,12 @@ pub fn reverse_complement(seq: &[u8]) -> Vec<u8> {
 pub const fn complement_base_preserve_case(base: u8) -> u8 {
     match base {
         b'A' => b'T',
-        b'T' => b'A',
+        // T and RNA uracil U both complement to A (fgbio Sequences.complement)
+        b'T' | b'U' => b'A',
         b'C' => b'G',
         b'G' => b'C',
         b'a' => b't',
-        b't' => b'a',
+        b't' | b'u' => b'a',
         b'c' => b'g',
         b'g' => b'c',
         other => other,
@@ -132,6 +136,10 @@ mod tests {
         assert_eq!(complement_base(b'c'), b'G');
         assert_eq!(complement_base(b'g'), b'C');
 
+        // RNA uracil complements to A (fgbio Sequences.complement: U/u -> A/a)
+        assert_eq!(complement_base(b'U'), b'A');
+        assert_eq!(complement_base(b'u'), b'A');
+
         // N bases preserve case (fgbio uses lowercase 'n' for padding)
         assert_eq!(complement_base(b'N'), b'N');
         assert_eq!(complement_base(b'n'), b'n');
@@ -158,6 +166,10 @@ mod tests {
         assert_eq!(reverse_complement(b"GGGG"), b"CCCC".to_vec());
         assert_eq!(reverse_complement(b"ACGTN"), b"NACGT".to_vec());
 
+        // RNA uracil complements to A (matches fgbio revcomp of 'r'-prefixed UMIs)
+        assert_eq!(reverse_complement(b"AAU"), b"ATT".to_vec());
+        assert_eq!(reverse_complement(b"U"), b"A".to_vec());
+
         // Lowercase normalized to uppercase
         assert_eq!(reverse_complement(b"acgt"), b"ACGT".to_vec());
         assert_eq!(reverse_complement(b"AcGt"), b"ACGT".to_vec());
@@ -180,6 +192,8 @@ mod tests {
     #[case(b't', b'a')]
     #[case(b'c', b'g')]
     #[case(b'g', b'c')]
+    #[case(b'U', b'A')]
+    #[case(b'u', b'a')]
     #[case(b'N', b'N')]
     #[case(b'n', b'n')]
     #[case(b'.', b'.')]
