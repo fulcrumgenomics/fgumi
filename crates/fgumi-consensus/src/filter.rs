@@ -438,11 +438,14 @@ impl MethylationTags {
 
 /// Detects if a raw BAM record is a duplex consensus.
 ///
-/// Checks for presence of `aD` or `bD` tags in the aux data.
+/// Matches fgbio `Umis.isFgbioDuplexConsensus` (`Umis.scala:144`), which requires **both**
+/// the AB and BA raw-read-count tags (`aD` **and** `bD`). A read carrying only one of the two
+/// is treated as a simplex consensus (fgbio routes it to `filterVanillaConsensusRead`); routing
+/// it through the duplex filter would spuriously reject it on the BA tier (worst-strand depth 0).
 #[must_use]
 pub fn is_duplex_consensus(aux_data: &[u8]) -> bool {
     bam_fields::find_tag_type(aux_data, SamTag::AD).is_some()
-        || bam_fields::find_tag_type(aux_data, SamTag::BD).is_some()
+        && bam_fields::find_tag_type(aux_data, SamTag::BD).is_some()
 }
 
 /// Filters a raw consensus read based on per-read tags (cD depth, cE error rate).
@@ -2203,6 +2206,35 @@ mod tests {
             masked, 5,
             "with_cd={with_cd} with_ce={with_ce}: pb=false, only the 5 low-quality bases masked \
              (depth/error mask skipped unless BOTH per-base tags present)"
+        );
+    }
+
+    // -- CONS-02: duplex detection requires BOTH aD and bD (fgbio Umis.isFgbioDuplexConsensus) --
+
+    // fgbio Umis.isFgbioDuplexConsensus = contains(aD) && contains(bD): only both -> duplex.
+    #[rstest]
+    #[case::neither(false, false, false)]
+    #[case::ad_only(true, false, false)]
+    #[case::bd_only(false, true, false)]
+    #[case::both(true, true, true)]
+    fn test_is_duplex_consensus_requires_both_ad_and_bd(
+        #[case] with_ad: bool,
+        #[case] with_bd: bool,
+        #[case] expected: bool,
+    ) {
+        let mut b = RawSamBuilder::new();
+        b.ref_id(0).pos(0).mapq(60).cigar_ops(&[4 << 4]).sequence(b"ACGT").qualities(&[30; 4]);
+        if with_ad {
+            b.add_int_tag(SamTag::AD, 10);
+        }
+        if with_bd {
+            b.add_int_tag(SamTag::BD, 8);
+        }
+        let rec = b.build();
+        assert_eq!(
+            is_duplex_consensus(fgumi_raw_bam::aux_data_slice(rec.as_ref())),
+            expected,
+            "aD={with_ad} bD={with_bd}: duplex iff both present"
         );
     }
 }
