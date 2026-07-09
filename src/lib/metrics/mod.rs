@@ -36,4 +36,4 @@ pub use duplex::{
 };
 pub use group::{FamilySizeMetrics, PositionGroupSizeMetrics, UmiGroupingMetrics};
 pub use shared::UmiMetric;
-pub use writer::{read_metrics, write_metrics};
+pub use writer::{read_metrics, write_metrics, write_metrics_auto};

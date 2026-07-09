@@ -13,11 +13,19 @@ use crate::Metric;
 /// Write metrics to a TSV file with consistent error handling.
 ///
 /// This is a convenience wrapper around `DelimFile::write_tsv` that provides
-/// consistent error messages across all commands.
+/// consistent error messages across all commands, and — unlike a bare
+/// `DelimFile::write_tsv` — **always writes the column header**, even for an empty
+/// slice.
+///
+/// The underlying csv writer emits headers lazily (on the first record), so writing
+/// a zero-row slice through it produces a 0-byte file. fgbio writes the header
+/// eagerly in its `Metric` writer, so fgbio's `Metric.read` rejects such a file with
+/// "No header found". Emitting a header-only file keeps an empty metrics output
+/// re-readable by both fgbio and fgumi (it parses back to zero rows).
 ///
 /// # Arguments
 /// * `path` - Path to the output TSV file
-/// * `metrics` - The metrics to write (must implement Serialize)
+/// * `metrics` - The metrics to write (must implement `Serialize` and `Default`)
 /// * `description` - Human-readable description of the metrics for error messages
 ///
 /// # Errors
@@ -29,7 +37,7 @@ use crate::Metric;
 /// use serde::Serialize;
 /// use std::path::Path;
 ///
-/// #[derive(Serialize)]
+/// #[derive(Serialize, Default)]
 /// struct MyMetrics {
 ///     count: usize,
 ///     value: f64,
@@ -42,15 +50,34 @@ use crate::Metric;
 ///
 /// write_metrics(Path::new("metrics.txt"), &metrics, "processing").unwrap();
 /// ```
-pub fn write_metrics<P: AsRef<Path>, T: Serialize>(
+pub fn write_metrics<P: AsRef<Path>, T: Serialize + Default>(
     path: P,
     metrics: &[T],
     description: &str,
 ) -> Result<()> {
     let path_ref = path.as_ref();
+    if metrics.is_empty() {
+        return write_header_only::<_, T>(path_ref).with_context(|| {
+            format!("Failed to write {} metrics header: {}", description, path_ref.display())
+        });
+    }
     DelimFile::default()
         .write_tsv(path_ref, metrics)
         .with_context(|| format!("Failed to write {} metrics: {}", description, path_ref.display()))
+}
+
+/// Writes a header-only metrics file for a metric type with no rows.
+///
+/// Serializes a single `T::default()` row through the normal `DelimFile` path so the
+/// header is formatted identically to a populated file, then truncates the file to
+/// just that header line. The result parses back to zero metrics.
+fn write_header_only<P: AsRef<Path>, T: Serialize + Default>(path: P) -> Result<()> {
+    let path_ref = path.as_ref();
+    DelimFile::default().write_tsv(path_ref, [T::default()])?;
+    let content = std::fs::read_to_string(path_ref)?;
+    let header = content.lines().next().unwrap_or_default();
+    std::fs::write(path_ref, format!("{header}\n"))?;
+    Ok(())
 }
 
 /// Write metrics implementing the Metric trait to a TSV file.
@@ -163,14 +190,22 @@ mod tests {
     }
 
     #[test]
-    fn test_write_metrics_empty() -> Result<()> {
+    fn test_write_metrics_empty_is_header_only_and_round_trips() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
         let metrics: Vec<TestMetrics> = vec![];
 
         write_metrics(temp_file.path(), &metrics, "empty")?;
 
-        // Verify the file was created (even if empty/header-only)
-        assert!(temp_file.path().exists());
+        // An empty metrics slice must still produce the column header (fgbio's
+        // Metric.read rejects a 0-byte file with "No header found"), and no data rows.
+        let content = fs::read_to_string(temp_file.path())?;
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1, "expected header-only file, got: {content:?}");
+        assert_eq!(lines[0], "name\tcount\tvalue");
+
+        // And it round-trips back to zero rows.
+        let read_back: Vec<TestMetrics> = read_metrics(temp_file.path(), "empty")?;
+        assert!(read_back.is_empty());
 
         Ok(())
     }

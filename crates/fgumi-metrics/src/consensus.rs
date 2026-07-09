@@ -57,9 +57,11 @@ pub struct ConsensusMetrics {
     pub umi_groups_failed: u64,
 
     /// Average input reads per consensus read
+    #[serde(with = "crate::float")]
     pub avg_input_reads_per_consensus: f64,
 
     /// Average raw read depth per consensus read
+    #[serde(with = "crate::float")]
     pub avg_raw_read_depth: f64,
 
     /// Minimum raw read depth

@@ -11,9 +11,8 @@ use crate::logging::OperationTimer;
 use crate::metrics::simplex::{SimplexMetricsCollector, SimplexYieldMetric};
 use crate::simple_umi_consensus::SimpleUmiConsensusCaller;
 use crate::validation::validate_file_exists;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
-use fgoxide::io::DelimFile;
 use log::info;
 use std::path::PathBuf;
 
@@ -157,27 +156,22 @@ impl Command for SimplexMetrics {
         // Generate and write metrics
         info!("Writing metrics...");
 
-        // Family size metrics
+        // Family size metrics. Use `write_metrics_auto` (not a bare `DelimFile::write_tsv`)
+        // so an empty distribution still produces a header-only, fgbio-readable file.
         let family_size_metrics = main_collector.family_size_metrics();
         let family_size_path = format!("{}.family_sizes.txt", self.output.display());
-        DelimFile::default()
-            .write_tsv(&family_size_path, family_size_metrics)
-            .with_context(|| format!("Failed to write family size metrics: {family_size_path}"))?;
+        crate::metrics::writer::write_metrics_auto(&family_size_path, &family_size_metrics)?;
         info!("Wrote family size metrics to {family_size_path}");
 
         // UMI metrics
         let umi_metrics = main_collector.umi_metrics();
         let umi_path = format!("{}.umi_counts.txt", self.output.display());
-        DelimFile::default()
-            .write_tsv(&umi_path, umi_metrics)
-            .with_context(|| format!("Failed to write UMI metrics: {umi_path}"))?;
+        crate::metrics::writer::write_metrics_auto(&umi_path, &umi_metrics)?;
         info!("Wrote UMI metrics to {umi_path}");
 
         // Yield metrics
         let yield_path = format!("{}.simplex_yield_metrics.txt", self.output.display());
-        DelimFile::default()
-            .write_tsv(&yield_path, yield_metrics)
-            .with_context(|| format!("Failed to write yield metrics: {yield_path}"))?;
+        crate::metrics::writer::write_metrics_auto(&yield_path, &yield_metrics)?;
         info!("Wrote yield metrics to {yield_path}");
 
         // Generate PDF plots using R script (optional)

@@ -23,20 +23,26 @@ pub struct FamilySizeMetric {
     /// Count of CS families with this size
     pub cs_count: usize,
     /// Fraction of all CS families with this size
+    #[serde(with = "crate::float")]
     pub cs_fraction: f64,
     /// Fraction of CS families with size >= `family_size`
+    #[serde(with = "crate::float")]
     pub cs_fraction_gt_or_eq_size: f64,
     /// Count of SS families with this size
     pub ss_count: usize,
     /// Fraction of all SS families with this size
+    #[serde(with = "crate::float")]
     pub ss_fraction: f64,
     /// Fraction of SS families with size >= `family_size`
+    #[serde(with = "crate::float")]
     pub ss_fraction_gt_or_eq_size: f64,
     /// Count of DS families with this size
     pub ds_count: usize,
     /// Fraction of all DS families with this size
+    #[serde(with = "crate::float")]
     pub ds_fraction: f64,
     /// Fraction of DS families with size >= `family_size`
+    #[serde(with = "crate::float")]
     pub ds_fraction_gt_or_eq_size: f64,
 }
 
@@ -83,8 +89,10 @@ pub struct DuplexFamilySizeMetric {
     /// Count of families with these AB/BA sizes
     pub count: usize,
     /// Fraction of all duplex families with these sizes
+    #[serde(with = "crate::float")]
     pub fraction: f64,
     /// Fraction of duplex families with AB >= `ab_size` and BA >= `ba_size`
+    #[serde(with = "crate::float")]
     pub fraction_gt_or_eq_size: f64,
 }
 
@@ -132,6 +140,7 @@ impl PartialEq for DuplexFamilySizeMetric {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DuplexYieldMetric {
     /// Approximate fraction of full dataset used
+    #[serde(with = "crate::float")]
     pub fraction: f64,
     /// Number of read pairs upon which metrics are based
     pub read_pairs: usize,
@@ -144,8 +153,10 @@ pub struct DuplexYieldMetric {
     /// Number of DS families that are duplexes (min reads on both strands)
     pub ds_duplexes: usize,
     /// Fraction of DS families that are duplexes
+    #[serde(with = "crate::float")]
     pub ds_fraction_duplexes: f64,
     /// Expected fraction of DS families that should be duplexes under ideal model
+    #[serde(with = "crate::float")]
     pub ds_fraction_duplexes_ideal: f64,
 }
 
@@ -192,10 +203,13 @@ pub struct DuplexUmiMetric {
     /// Number of double-stranded tag families observing this duplex UMI
     pub unique_observations: usize,
     /// Fraction of all raw observations
+    #[serde(with = "crate::float")]
     pub fraction_raw_observations: f64,
     /// Fraction of all unique observations
+    #[serde(with = "crate::float")]
     pub fraction_unique_observations: f64,
     /// Expected fraction based on individual UMI frequencies
+    #[serde(with = "crate::float")]
     pub fraction_unique_observations_expected: f64,
 }
 
@@ -313,30 +327,30 @@ impl DuplexMetricsCollector {
         self.duplex_umi_counts.record(umi, raw_count, error_count, is_unique);
     }
 
-    /// Generates family size metrics
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal array-of-three maximum computation fails, which cannot
-    /// happen since the array is always non-empty.
+    /// Generates family size metrics, one row per observed family size (sparse), sorted
+    /// ascending by `family_size`.
     #[must_use]
     pub fn family_size_metrics(&self) -> Vec<FamilySizeMetric> {
-        // Find max family size across all types
-        let max_size = *[
-            self.cs_family_sizes.keys().max().unwrap_or(&0),
-            self.ss_family_sizes.keys().max().unwrap_or(&0),
-            self.ds_family_sizes.keys().max().unwrap_or(&0),
-        ]
-        .iter()
-        .max()
-        .expect("array of three elements always has a maximum");
-
         let coord_strand_total: usize = self.cs_family_sizes.values().sum();
         let single_strand_total: usize = self.ss_family_sizes.values().sum();
         let double_strand_total: usize = self.ds_family_sizes.values().sum();
 
-        let mut metrics = Vec::new();
-        for size in 1..=*max_size {
+        // fgbio emits one row per *observed* family size (sparse), not a dense
+        // `1..=max` range: `CollectDuplexSeqMetrics.familySizeMetrics` builds a map
+        // keyed only by sizes that occur in the CS/SS/DS counters, then sorts
+        // ascending by `family_size`. Take the sorted union of observed sizes.
+        let mut sizes: Vec<usize> = self
+            .cs_family_sizes
+            .keys()
+            .chain(self.ss_family_sizes.keys())
+            .chain(self.ds_family_sizes.keys())
+            .copied()
+            .collect();
+        sizes.sort_unstable();
+        sizes.dedup();
+
+        let mut metrics = Vec::with_capacity(sizes.len());
+        for size in sizes {
             let mut metric = FamilySizeMetric::new(size);
 
             metric.cs_count = *self.cs_family_sizes.get(&size).unwrap_or(&0);
@@ -469,8 +483,13 @@ impl DuplexMetricsCollector {
             })
             .collect();
 
-        // Sort by unique observations descending (matching Scala's sort order)
-        metrics.sort_by(|a, b| b.unique_observations.cmp(&a.unique_observations));
+        // Sort by unique observations descending (matching fgbio's `sortBy(-unique_observations)`),
+        // with the UMI sequence as a deterministic secondary key. fgbio's own tie order comes from
+        // nondeterministic map iteration; keying ties on `umi` makes fgumi's output stable across
+        // runs and thread counts (an acceptance-criterion requirement) without changing the row set.
+        metrics.sort_by(|a, b| {
+            b.unique_observations.cmp(&a.unique_observations).then_with(|| a.umi.cmp(&b.umi))
+        });
         metrics
     }
 }
@@ -773,6 +792,41 @@ mod tests {
         assert_eq!(duplex_metrics.len(), 1);
         // Expected = 0.5 * 0.5 = 0.25
         assert!((duplex_metrics[0].fraction_unique_observations_expected - 0.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_family_size_metrics_are_sparse() {
+        let mut collector = DuplexMetricsCollector::new(false);
+        // Observe only sizes 1 and 5 (a gap at 2, 3, 4). fgbio's `familySizeMetrics`
+        // emits a row per *observed* size; the old dense `1..=max` range emitted
+        // phantom all-zero rows for the unobserved sizes.
+        collector.record_cs_family(1);
+        collector.record_cs_family(5);
+
+        let metrics = collector.family_size_metrics();
+        let sizes: Vec<usize> = metrics.iter().map(|m| m.family_size).collect();
+        assert_eq!(sizes, vec![1, 5], "only observed family sizes should be emitted");
+
+        // The reverse-cumulative `>= size` fraction stays correct across the gap:
+        // each size holds half the CS families, so size 1 → 1.0, size 5 → 0.5.
+        assert!((metrics[0].cs_fraction_gt_or_eq_size - 1.0).abs() < 1e-9);
+        assert!((metrics[1].cs_fraction_gt_or_eq_size - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_duplex_umi_metrics_deterministic_tie_order() {
+        // Three duplex UMIs each observed exactly once → equal `unique_observations`
+        // (a tie). Insertion order is reverse-sorted; the output must be ordered by
+        // `umi` ascending (the deterministic secondary sort key) rather than by the
+        // nondeterministic HashMap iteration order the primary key alone would leave.
+        let mut collector = DuplexMetricsCollector::new(true);
+        for umi in ["GGGG-CCCC", "AAAA-TTTT", "CCCC-GGGG"] {
+            collector.record_duplex_umi(umi, 1, 0, true);
+        }
+
+        let metrics = collector.duplex_umi_metrics(&[]);
+        let order: Vec<&str> = metrics.iter().map(|m| m.umi.as_str()).collect();
+        assert_eq!(order, vec!["AAAA-TTTT", "CCCC-GGGG", "GGGG-CCCC"]);
     }
 
     #[test]

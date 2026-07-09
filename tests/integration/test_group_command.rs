@@ -55,10 +55,11 @@ fn test_group_command_writes_new_metrics() {
 
     let metric = &metrics[0];
 
-    // Verify basic fields are populated
-    assert!(metric.total_records > 0, "total_records should be positive");
+    // Verify the serialized fgbio columns are populated. The `.grouping_metrics.txt`
+    // matches fgbio's 5-column `UmiGroupingMetric`; `total_records`/`unique_molecule_ids`
+    // are fgumi-internal (`#[serde(skip)]`) and read back as zero, so they are not asserted
+    // here.
     assert!(metric.accepted_records > 0, "accepted_records should be positive");
-    assert!(metric.unique_molecule_ids > 0, "unique_molecule_ids should be positive");
 
     // Rejection fields are validated by their presence in the struct (no runtime check needed
     // since they are unsigned integers that are always >= 0)

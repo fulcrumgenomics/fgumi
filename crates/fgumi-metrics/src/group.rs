@@ -39,14 +39,27 @@ fn build_size_distribution<T>(
 
 /// Metrics for UMI grouping operations.
 ///
-/// These metrics track how reads are grouped by UMI and provide insight into
-/// data quality and molecule representation.
+/// The **serialized** form matches fgbio's `UmiGroupingMetric` exactly — the same
+/// five columns, in the same order, with the same (fgbio-spelled) names:
+/// `accepted_sam_records`, `discarded_non_pf`, `discarded_poor_alignment`,
+/// `discarded_ns_in_umi`, `discarded_umis_to_short`. This keeps the
+/// `.grouping_metrics.txt` output readable by fgbio's `Metric.read`, which hard-fails
+/// on any unexpected column.
+///
+/// The remaining fields are `#[serde(skip)]` — they are computed and retained for
+/// fgumi's own summary logging ([`crate::ProcessingMetrics`] and
+/// `log_umi_grouping_summary`) but are **not** written to the metrics file. They are
+/// all derivable from the accepted count and the family-size distribution, which is
+/// emitted separately in `.family_sizes.txt`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UmiGroupingMetrics {
-    /// Total SAM records processed
+    /// Total SAM records processed (fgumi-internal; not part of fgbio's schema —
+    /// derivable as accepted + discarded).
+    #[serde(skip)]
     pub total_records: u64,
 
-    /// Records accepted for grouping
+    /// Records accepted for grouping (fgbio column `accepted_sam_records`).
+    #[serde(rename = "accepted_sam_records")]
     pub accepted_records: u64,
 
     /// Records discarded (not passing filter)
@@ -58,25 +71,33 @@ pub struct UmiGroupingMetrics {
     /// Records discarded (Ns in UMI)
     pub discarded_ns_in_umi: u64,
 
-    /// Records discarded (UMI too short)
+    /// Records discarded (UMI too short). fgbio spells this column
+    /// `discarded_umis_to_short` (sic); the serialized name matches it exactly.
+    #[serde(rename = "discarded_umis_to_short")]
     pub discarded_umi_too_short: u64,
 
-    /// Number of unique molecule IDs assigned
+    /// Number of unique molecule IDs assigned (fgumi-internal summary only).
+    #[serde(skip)]
     pub unique_molecule_ids: u64,
 
-    /// Total number of UMI families/groups
+    /// Total number of UMI families/groups (fgumi-internal summary only).
+    #[serde(skip)]
     pub total_families: u64,
 
-    /// Average reads per molecule
+    /// Average reads per molecule (fgumi-internal summary only).
+    #[serde(skip)]
     pub avg_reads_per_molecule: f64,
 
-    /// Median reads per molecule
+    /// Median reads per molecule (fgumi-internal summary only).
+    #[serde(skip)]
     pub median_reads_per_molecule: u64,
 
-    /// Minimum reads per molecule
+    /// Minimum reads per molecule (fgumi-internal summary only).
+    #[serde(skip)]
     pub min_reads_per_molecule: u64,
 
-    /// Maximum reads per molecule
+    /// Maximum reads per molecule (fgumi-internal summary only).
+    #[serde(skip)]
     pub max_reads_per_molecule: u64,
 }
 
@@ -123,9 +144,11 @@ pub struct FamilySizeMetrics {
     pub count: u64,
 
     /// Fraction of all families with this size
+    #[serde(with = "crate::float")]
     pub fraction: f64,
 
     /// Cumulative fraction (families with size >= this value)
+    #[serde(with = "crate::float")]
     pub fraction_gt_or_eq_family_size: f64,
 }
 
@@ -176,9 +199,11 @@ pub struct PositionGroupSizeMetrics {
     pub count: u64,
 
     /// Fraction of all position groups with this size
+    #[serde(with = "crate::float")]
     pub fraction: f64,
 
     /// Cumulative fraction (position groups with size >= this value)
+    #[serde(with = "crate::float")]
     pub fraction_gt_or_eq_position_group_size: f64,
 }
 
@@ -231,6 +256,52 @@ mod tests {
         assert_eq!(metrics.total_records, 0);
         assert_eq!(metrics.accepted_records, 0);
         assert_eq!(metrics.unique_molecule_ids, 0);
+    }
+
+    #[test]
+    fn test_umi_grouping_metrics_serializes_fgbio_five_columns() {
+        use fgoxide::io::DelimFile;
+        use tempfile::NamedTempFile;
+
+        let metrics = vec![UmiGroupingMetrics {
+            total_records: 100,
+            accepted_records: 90,
+            discarded_non_pf: 4,
+            discarded_poor_alignment: 3,
+            discarded_ns_in_umi: 2,
+            discarded_umi_too_short: 1,
+            // fgumi-internal fields that must NOT be serialized:
+            unique_molecule_ids: 42,
+            total_families: 42,
+            avg_reads_per_molecule: 2.5,
+            median_reads_per_molecule: 2,
+            min_reads_per_molecule: 1,
+            max_reads_per_molecule: 9,
+        }];
+
+        let file = NamedTempFile::new().expect("temp file");
+        DelimFile::default().write_tsv(file.path(), &metrics).expect("write");
+        let content = std::fs::read_to_string(file.path()).expect("read");
+        let mut lines = content.lines();
+
+        // Header and row must be exactly fgbio's 5-column `UmiGroupingMetric`, in order.
+        assert_eq!(
+            lines.next(),
+            Some(
+                "accepted_sam_records\tdiscarded_non_pf\tdiscarded_poor_alignment\t\
+                 discarded_ns_in_umi\tdiscarded_umis_to_short"
+            )
+        );
+        assert_eq!(lines.next(), Some("90\t4\t3\t2\t1"));
+        assert_eq!(lines.next(), None);
+
+        // And it reads back (fgumi-internal fields default to zero, fgbio columns intact).
+        let read_back: Vec<UmiGroupingMetrics> =
+            DelimFile::default().read_tsv(file.path()).expect("read back");
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(read_back[0].accepted_records, 90);
+        assert_eq!(read_back[0].discarded_umi_too_short, 1);
+        assert_eq!(read_back[0].total_records, 0);
     }
 
     #[test]

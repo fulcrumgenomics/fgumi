@@ -13,6 +13,7 @@ pub mod clip;
 pub mod consensus;
 pub mod correct;
 pub mod duplex;
+pub(crate) mod float;
 pub mod group;
 pub mod rejection;
 pub mod shared;
@@ -21,13 +22,20 @@ pub mod writer;
 
 use serde::{Deserialize, Serialize};
 
-/// Number of decimal places used for float metrics (matches fgbio).
+/// Number of decimal places used by [`format_float`] for fixed-precision float metrics.
 pub const FLOAT_PRECISION: usize = 6;
 
-/// Formats a float value with the standard precision for metrics.
+/// Formats a float with a fixed 6 decimal places (e.g. `0.9` → `"0.900000"`).
 ///
-/// This ensures consistent float formatting across all metrics output,
-/// matching fgbio's 6 decimal place precision.
+/// This does **not** reproduce fgbio's textual format. fgbio uses
+/// `DecimalFormat("0.######")`, which trims trailing zeros (`0.9` → `"0.9"`,
+/// `0.0` → `"0"`) and can switch to scientific notation for very small values. The
+/// metric contract between fgumi and fgbio is *numeric* equality — `fgumi compare
+/// metrics` parses both sides and compares with a tolerance — so this
+/// representation difference is accepted (see the issue's "Accepted (not a bug)"
+/// note). f64 fields that must be *read back* by fgbio use
+/// [`float::serialize_f64`] instead, which additionally renders non-finite values
+/// as fgbio-parseable `Infinity`/`-Infinity`/`NaN` tokens.
 ///
 /// # Example
 /// ```
