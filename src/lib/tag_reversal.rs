@@ -82,6 +82,50 @@ mod tests {
             .expect("raw_record_to_record_buf failed in test")
     }
 
+    /// Cross-path guard for the two per-base tag-transform lists (a drift between them was the
+    /// root cause of ZIP-01/02).
+    ///
+    /// - `fgumi_umi::TagSets::CONSENSUS_*` (used by `zipper`'s `--tags-to-reverse/revcomp
+    ///   Consensus` expansion) mirrors **fgbio's** `ConsensusTags.PerBase` sets exactly — 8
+    ///   reverse (`cd ce ad ae bd be aq bq`), 2 revcomp (`ac bc`) — for fgbio `ZipperBams` parity.
+    /// - `per_base::tags_to_reverse{,_complement}()` (used by this raw reversal path, e.g. from
+    ///   `filter`) is a fgumi **superset**: it additionally reverses the CODEC/bisulfite
+    ///   conversion tags (`cu ct au at bu bt`), which fgbio's `Consensus` set does not include.
+    ///
+    /// So the invariant is a **subset**, not equality: every tag in the zipper Consensus set must
+    /// be a recognized fgumi per-base tag (catches a bogus/typo'd addition), while `per_base` may
+    /// grow. The exact fgbio set is pinned separately by the `fgumi-umi` `TagSets` unit tests.
+    #[test]
+    fn test_zipper_consensus_tagset_is_subset_of_canonical_per_base() {
+        use std::collections::BTreeSet;
+        let canon_rev: BTreeSet<String> =
+            per_base::tags_to_reverse().iter().map(ToString::to_string).collect();
+        for t in fgumi_umi::TagSets::CONSENSUS_REVERSE {
+            assert!(
+                canon_rev.contains(*t),
+                "zipper Consensus reverse tag `{t}` unknown to per_base"
+            );
+        }
+        let canon_rc: BTreeSet<String> =
+            per_base::tags_to_reverse_complement().iter().map(ToString::to_string).collect();
+        for t in fgumi_umi::TagSets::CONSENSUS_REVCOMP {
+            assert!(
+                canon_rc.contains(*t),
+                "zipper Consensus revcomp tag `{t}` unknown to per_base"
+            );
+        }
+
+        // No tag may be in BOTH lists: a per-base tag is either reversed (depth/
+        // error/qual arrays) or reverse-complemented (base arrays), never both.
+        // Guards against a tag being copied into the wrong (or an extra) list.
+        let reverse: BTreeSet<&str> =
+            fgumi_umi::TagSets::CONSENSUS_REVERSE.iter().copied().collect();
+        let revcomp: BTreeSet<&str> =
+            fgumi_umi::TagSets::CONSENSUS_REVCOMP.iter().copied().collect();
+        let both: Vec<&str> = reverse.intersection(&revcomp).copied().collect();
+        assert!(both.is_empty(), "tags in both Consensus reverse and revcomp sets: {both:?}");
+    }
+
     #[rstest]
     #[case(Value::from(vec![1i8, 2, 3]), Value::from(vec![3i8, 2, 1]))]
     #[case(Value::from(vec![1u8, 2, 3]), Value::from(vec![3u8, 2, 1]))]
