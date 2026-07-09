@@ -58,8 +58,8 @@ done in streaming fashion with, for example:
 
   fgumi sort -i in.bam --order queryname | fgumi clip -i /dev/stdin ...
 
-The output sort order may be specified with --sort-order. If not given, then the output will be in the same
-order as input.
+The output is written in the same order as the input. To produce coordinate-sorted output, pipe the
+result through a separate `fgumi sort`.
 
 Any existing NM, UQ and MD tags are repaired, and mate-pair information is updated.
 
@@ -86,14 +86,6 @@ pub struct Clip {
     /// Clipping mode: soft, soft-with-mask, or hard
     #[arg(short = 'c', long = "clipping-mode", default_value_t = ClippingMode::Hard)]
     pub clipping_mode: ClippingMode,
-
-    /// Output sort order (if not specified, output is in same order as input)
-    #[arg(
-        short = 'S',
-        long = "sort-order",
-        value_parser = ["unknown", "unsorted", "queryname", "coordinate"]
-    )]
-    pub sort_order: Option<String>,
 
     /// Clip overlapping read pairs
     #[arg(long = "clip-overlapping-reads", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
@@ -248,9 +240,6 @@ impl Command for Clip {
             // Load reference (always required for clip)
             let reference = Arc::new(ReferenceReader::new(&self.reference)?);
 
-            // Update header sort order if specified
-            let header = self.update_header_sort_order(header)?;
-
             // Add @PG record with PP chaining to input's last program
             let header = crate::commands::common::add_pg_record(header, command_line)?;
 
@@ -286,9 +275,6 @@ impl Clip {
         let reader_threads = self.threading.num_threads();
         let (reader, header) = create_raw_bam_reader(&self.io.input, reader_threads)?;
 
-        // Update header sort order if specified
-        let header = self.update_header_sort_order(header)?;
-
         // Add @PG record with PP chaining to input's last program
         let header = crate::commands::common::add_pg_record(header, command_line)?;
 
@@ -316,31 +302,34 @@ impl Clip {
             let template = template?;
             let mut records: Vec<RawRecord> = template.into_records();
 
-            // Process based on template type
-            #[allow(clippy::len_zero)] // We specifically want len() == 1, not !is_empty()
-            if records.len() == 1 {
-                // Fragment
-                let record = &mut records[0];
-                self.clip_fragment(&clipper, record, metrics_collection.as_mut())?;
-            } else if records.len() == 2 {
-                // Paired reads
-                let (r1, r2) = records.split_at_mut(1);
-                let r1 = &mut r1[0];
-                let r2 = &mut r2[0];
+            // Clip the primary R1/R2 (or a lone fragment) — never positional records[0]/[1] —
+            // so templates with secondary/supplementary reads (len > 2) are clipped too, matching
+            // fgbio ClipBam's Template.r1/r2 handling.
+            match find_primary_pair_indices(&records)? {
+                (Some(i1), Some(i2)) => {
+                    let [r1, r2] =
+                        records.get_disjoint_mut([i1, i2]).expect("distinct primary indices");
 
-                let (overlap_clip, extend_clip) =
-                    self.clip_pair(&clipper, r1, r2, metrics_collection.as_mut())?;
+                    let (overlap_clip, extend_clip) =
+                        self.clip_pair(&clipper, r1, r2, metrics_collection.as_mut())?;
 
-                if overlap_clip {
-                    total_clipped_overlap += 1;
+                    if overlap_clip {
+                        total_clipped_overlap += 1;
+                    }
+                    if extend_clip {
+                        total_clipped_mate_extension += 1;
+                    }
+
+                    // Fix full mate-pair info (mate coords/strand, mate-unmapped flag, MQ/MC,
+                    // TLEN), matching fgbio ClipBam's SamPairUtil.setMateInfo call, then repair
+                    // mate info on any supplementary alignments in the template.
+                    set_mate_info_raw(r1, r2);
+                    fix_supplemental_mate_info(&mut records, i1, i2);
                 }
-                if extend_clip {
-                    total_clipped_mate_extension += 1;
+                (Some(i1), None) => {
+                    self.clip_fragment(&clipper, &mut records[i1], metrics_collection.as_mut())?;
                 }
-
-                // Fix full mate-pair info (mate coords/strand, mate-unmapped flag, MQ/MC,
-                // TLEN), matching fgbio ClipBam's SamPairUtil.setMateInfo call.
-                set_mate_info_raw(r1, r2);
+                _ => {}
             }
 
             // Regenerate alignment tags (always done to match Scala fgbio behavior)
@@ -575,49 +564,6 @@ impl Clip {
         Ok((overlap_clipped, extend_clipped))
     }
 
-    /// Updates the header sort order if specified via command line option.
-    fn update_header_sort_order(&self, header: Header) -> Result<Header> {
-        if let Some(ref sort_order) = self.sort_order {
-            use bstr::BString;
-            use noodles::sam::header::record::value::Map;
-            use noodles::sam::header::record::value::map::header::tag::SORT_ORDER;
-
-            // Get or create the header map
-            let mut header_map = if let Some(hd) = header.header() {
-                hd.clone()
-            } else {
-                Map::<noodles::sam::header::record::value::map::Header>::default()
-            };
-
-            // Update sort order
-            *header_map.other_fields_mut().entry(SORT_ORDER).or_insert(BString::from("")) =
-                BString::from(sort_order.as_str());
-
-            // Rebuild header with new header map
-            let mut builder = noodles::sam::Header::builder();
-
-            // Copy existing components
-            for (name, rg) in header.read_groups() {
-                builder = builder.add_read_group(name.clone(), rg.clone());
-            }
-            for (name, reference) in header.reference_sequences() {
-                builder = builder.add_reference_sequence(name.clone(), reference.clone());
-            }
-            for (id, pg) in header.programs().as_ref() {
-                builder = builder.add_program(id.clone(), pg.clone());
-            }
-            for comment in header.comments() {
-                builder = builder.add_comment(comment.clone());
-            }
-
-            // Set the modified header
-            builder = builder.set_header(header_map);
-            Ok(builder.build())
-        } else {
-            Ok(header)
-        }
-    }
-
     /// Execute using the 7-step unified pipeline with multi-threading.
     ///
     /// Uses `TemplateGrouper` to batch records by template (QNAME) for parallel processing.
@@ -686,77 +632,80 @@ impl Clip {
                 templates_count += 1;
                 let mut records: Vec<RawRecord> = template.into_records();
 
-                #[allow(clippy::len_zero)]
-                if records.len() == 1 {
-                    // Fragment - apply fixed-position clipping
-                    let record = &mut records[0];
-                    if upgrade_clipping {
-                        clipper.upgrade_all_clipping_raw(record).map_err(io::Error::other)?;
-                    }
-                    if read_one_five_prime > 0 {
-                        clipper.clip_5_prime_end_of_alignment(record, read_one_five_prime);
-                    }
-                    if read_one_three_prime > 0 {
-                        clipper.clip_3_prime_end_of_alignment(record, read_one_three_prime);
-                    }
-                } else if records.len() == 2 {
-                    // Paired reads
-                    let (r1_slice, r2_slice) = records.split_at_mut(1);
-                    let r1 = &mut r1_slice[0];
-                    let r2 = &mut r2_slice[0];
+                // Clip the primary R1/R2 (or a lone fragment) by flags, never positional
+                // records[0]/[1], so templates with secondary/supplementary reads are clipped
+                // too (matches fgbio ClipBam's Template.r1/r2 handling).
+                match find_primary_pair_indices(&records).map_err(io::Error::other)? {
+                    (Some(i1), Some(i2)) => {
+                        let [r1, r2] =
+                            records.get_disjoint_mut([i1, i2]).expect("distinct primary indices");
 
-                    if upgrade_clipping {
-                        clipper.upgrade_all_clipping_raw(r1).map_err(io::Error::other)?;
-                        clipper.upgrade_all_clipping_raw(r2).map_err(io::Error::other)?;
-                    }
+                        if upgrade_clipping {
+                            clipper.upgrade_all_clipping_raw(r1).map_err(io::Error::other)?;
+                            clipper.upgrade_all_clipping_raw(r2).map_err(io::Error::other)?;
+                        }
 
-                    // Determine read types (raw flags)
-                    let is_r1_first = r1.is_first_segment();
-                    let is_r2_last = r2.is_last_segment();
+                        // Determine read types (raw flags)
+                        let is_r1_first = r1.is_first_segment();
 
-                    // Apply fixed-position clipping for R1
-                    if is_r1_first && read_one_five_prime > 0 {
-                        clipper.clip_5_prime_end_of_alignment(r1, read_one_five_prime);
-                    } else if !is_r1_first && read_two_five_prime > 0 {
-                        clipper.clip_5_prime_end_of_alignment(r1, read_two_five_prime);
-                    }
-                    if is_r1_first && read_one_three_prime > 0 {
-                        clipper.clip_3_prime_end_of_alignment(r1, read_one_three_prime);
-                    } else if !is_r1_first && read_two_three_prime > 0 {
-                        clipper.clip_3_prime_end_of_alignment(r1, read_two_three_prime);
-                    }
+                        // Apply fixed-position clipping for R1
+                        if is_r1_first && read_one_five_prime > 0 {
+                            clipper.clip_5_prime_end_of_alignment(r1, read_one_five_prime);
+                        } else if !is_r1_first && read_two_five_prime > 0 {
+                            clipper.clip_5_prime_end_of_alignment(r1, read_two_five_prime);
+                        }
+                        if is_r1_first && read_one_three_prime > 0 {
+                            clipper.clip_3_prime_end_of_alignment(r1, read_one_three_prime);
+                        } else if !is_r1_first && read_two_three_prime > 0 {
+                            clipper.clip_3_prime_end_of_alignment(r1, read_two_three_prime);
+                        }
 
-                    // Apply fixed-position clipping for R2
-                    if is_r2_last && read_two_five_prime > 0 {
-                        clipper.clip_5_prime_end_of_alignment(r2, read_two_five_prime);
-                    } else if !is_r2_last && read_one_five_prime > 0 {
-                        clipper.clip_5_prime_end_of_alignment(r2, read_one_five_prime);
-                    }
-                    if is_r2_last && read_two_three_prime > 0 {
-                        clipper.clip_3_prime_end_of_alignment(r2, read_two_three_prime);
-                    } else if !is_r2_last && read_one_three_prime > 0 {
-                        clipper.clip_3_prime_end_of_alignment(r2, read_one_three_prime);
-                    }
+                        // Apply fixed-position clipping for R2. The primary R2 slot is always a
+                        // last-segment read (find_primary_pair_indices only fills it from an
+                        // is_last_segment read), so it always uses the read-two thresholds.
+                        if read_two_five_prime > 0 {
+                            clipper.clip_5_prime_end_of_alignment(r2, read_two_five_prime);
+                        }
+                        if read_two_three_prime > 0 {
+                            clipper.clip_3_prime_end_of_alignment(r2, read_two_three_prime);
+                        }
 
-                    // Clip overlapping reads
-                    if clip_overlapping_reads {
-                        let (num_r1, num_r2) = clipper.clip_overlapping_reads(r1, r2);
-                        if num_r1 > 0 || num_r2 > 0 {
-                            overlap_clipped_count += 1;
+                        // Clip overlapping reads
+                        if clip_overlapping_reads {
+                            let (num_r1, num_r2) = clipper.clip_overlapping_reads(r1, r2);
+                            if num_r1 > 0 || num_r2 > 0 {
+                                overlap_clipped_count += 1;
+                            }
+                        }
+
+                        // Clip reads extending past mate
+                        if clip_extending_past_mate {
+                            let (num_r1, num_r2) = clipper.clip_extending_past_mate_ends(r1, r2);
+                            if num_r1 > 0 || num_r2 > 0 {
+                                extend_clipped_count += 1;
+                            }
+                        }
+
+                        // Fix full mate-pair info (mate coords/strand, mate-unmapped flag,
+                        // MQ/MC, TLEN), matching fgbio ClipBam's SamPairUtil.setMateInfo call,
+                        // then repair mate info on any supplementary alignments.
+                        set_mate_info_raw(r1, r2);
+                        fix_supplemental_mate_info(&mut records, i1, i2);
+                    }
+                    (Some(i1), None) => {
+                        // Fragment - apply fixed-position clipping (R1 thresholds)
+                        let record = &mut records[i1];
+                        if upgrade_clipping {
+                            clipper.upgrade_all_clipping_raw(record).map_err(io::Error::other)?;
+                        }
+                        if read_one_five_prime > 0 {
+                            clipper.clip_5_prime_end_of_alignment(record, read_one_five_prime);
+                        }
+                        if read_one_three_prime > 0 {
+                            clipper.clip_3_prime_end_of_alignment(record, read_one_three_prime);
                         }
                     }
-
-                    // Clip reads extending past mate
-                    if clip_extending_past_mate {
-                        let (num_r1, num_r2) = clipper.clip_extending_past_mate_ends(r1, r2);
-                        if num_r1 > 0 || num_r2 > 0 {
-                            extend_clipped_count += 1;
-                        }
-                    }
-
-                    // Fix full mate-pair info (mate coords/strand, mate-unmapped flag,
-                    // MQ/MC, TLEN), matching fgbio ClipBam's SamPairUtil.setMateInfo call.
-                    set_mate_info_raw(r1, r2);
+                    _ => {}
                 }
 
                 // Regenerate alignment tags (always done to match fgbio behavior)
@@ -984,6 +933,89 @@ fn set_mate_info_raw(r1: &mut RawRecord, r2: &mut RawRecord) {
     }
 }
 
+/// Ports htsjdk 5.0.0 `SamPairUtil.setMateInformationOnSupplementalAlignment(supp, matePrimary,
+/// setMateCigar=true)`.
+///
+/// fgbio `ClipBam` calls this on every supplementary alignment after clipping the primary pair,
+/// so a supplemental's mate fields point at its mate *primary* read. It sets mate ref/pos/strand,
+/// the mate-unmapped flag, TLEN (the negation of the mate primary's already-updated TLEN), the
+/// mate CIGAR (MC, only when the mate is mapped) and — as of htsjdk 5.0.0 — the mate mapping
+/// quality (MQ, unconditionally). `mate` and `mate_tlen` are snapshotted from the post-clip
+/// primary so the caller can fix several supplementals without re-borrowing the primaries.
+fn set_supplemental_mate_info_raw(supp: &mut RawRecord, mate: &MateSnap, mate_tlen: i32) {
+    supp.set_mate_ref_id(mate.ref_id);
+    supp.set_mate_pos(mate.pos);
+    set_mate_flags_raw(supp, mate.neg, mate.unmapped);
+    supp.set_template_length(-mate_tlen);
+    let mut editor = supp.tags_editor();
+    if mate.unmapped {
+        editor.remove(SamTag::MC);
+    } else {
+        editor.update_string(SamTag::MC, mate.cigar.as_bytes());
+    }
+    // htsjdk 5.0.0 sets MQ unconditionally from the mate primary's mapping quality.
+    editor.update_int(SamTag::MQ, i32::from(mate.mapq));
+}
+
+/// Finds the primary R1 and R2 record indices in a template, following fgbio `Template.r1`/`r2`:
+/// the first non-secondary, non-supplementary read that is unpaired or first-of-pair, and the
+/// first that is paired and second-of-pair, respectively. Either may be `None`.
+///
+/// Like fgbio's `Bams.Template` (`Bams.scala:161,167`), a template carrying more than one primary
+/// (non-secondary, non-supplementary) R1 — or more than one primary R2 — is malformed and rejected
+/// with an error rather than silently keeping the first and passing the extra through unclipped and
+/// with unrepaired mate info. The error message mirrors fgbio verbatim.
+fn find_primary_pair_indices(records: &[RawRecord]) -> Result<(Option<usize>, Option<usize>)> {
+    let mut r1_idx = None;
+    let mut r2_idx = None;
+    for (i, rec) in records.iter().enumerate() {
+        if rec.is_secondary() || rec.is_supplementary() {
+            continue;
+        }
+        if !rec.is_paired() || rec.is_first_segment() {
+            if r1_idx.is_some() {
+                anyhow::bail!(
+                    "Multiple non-secondary, non-supplemental R1s for {}",
+                    String::from_utf8_lossy(rec.read_name()).trim_end_matches('\0')
+                );
+            }
+            r1_idx = Some(i);
+        } else if rec.is_last_segment() {
+            if r2_idx.is_some() {
+                anyhow::bail!(
+                    "Multiple non-secondary, non-supplemental R2s for {}",
+                    String::from_utf8_lossy(rec.read_name()).trim_end_matches('\0')
+                );
+            }
+            r2_idx = Some(i);
+        }
+    }
+    Ok((r1_idx, r2_idx))
+}
+
+/// Repairs mate information on the template's supplementary alignments after the primary pair
+/// (at `r1_idx`/`r2_idx`) has been clipped and had its own mate info set. Mirrors fgbio
+/// `ClipBam`: R1 supplementals point at the primary R2, R2 supplementals at the primary R1.
+fn fix_supplemental_mate_info(records: &mut [RawRecord], r1_idx: usize, r2_idx: usize) {
+    // Snapshot the post-clip primaries so the per-supplemental updates don't re-borrow them.
+    let r1_snap = MateSnap::of(&records[r1_idx]);
+    let r1_tlen = records[r1_idx].template_length();
+    let r2_snap = MateSnap::of(&records[r2_idx]);
+    let r2_tlen = records[r2_idx].template_length();
+
+    for rec in records.iter_mut() {
+        if !rec.is_supplementary() {
+            continue;
+        }
+        // R1 supplementals (unpaired or first-of-pair) take R2 as their mate; R2 supplementals R1.
+        if !rec.is_paired() || rec.is_first_segment() {
+            set_supplemental_mate_info_raw(rec, &r2_snap, r2_tlen);
+        } else if rec.is_last_segment() {
+            set_supplemental_mate_info_raw(rec, &r1_snap, r1_tlen);
+        }
+    }
+}
+
 /// Returns the number of clipped bases (soft + hard) in a raw record's CIGAR.
 fn clipped_bases_raw(record: &RawRecord) -> usize {
     record
@@ -1003,6 +1035,261 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use std::path::PathBuf;
+
+    // R2-CLIP-02: the primary R1/R2 are located by SAM flags, not by position, so templates
+    // that carry secondary/supplementary alignments (len > 2) still resolve their primary pair.
+    #[test]
+    fn test_find_primary_pair_indices_ignores_secondary_and_supplementary() {
+        use crate::sam::RecordBuilder;
+        use fgumi_raw_bam::encode_record_buf_to_raw;
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReferenceSequence;
+        use std::num::NonZeroUsize;
+
+        let ref_seq = Map::<ReferenceSequence>::new(
+            NonZeroUsize::new(100_000).expect("ref length must be nonzero"),
+        );
+        let header =
+            noodles::sam::Header::builder().add_reference_sequence(b"chr1", ref_seq).build();
+        let enc = |b: &noodles::sam::alignment::RecordBuf| {
+            encode_record_buf_to_raw(b, &header).expect("encode")
+        };
+        let mapped = |first: bool, secondary: bool, supplementary: bool, start: usize| {
+            RecordBuilder::mapped_read()
+                .name("q")
+                .paired(true)
+                .first_segment(first)
+                .secondary(secondary)
+                .supplementary(supplementary)
+                .reference_sequence_id(0)
+                .alignment_start(start)
+                .cigar("50M")
+                .sequence(&"A".repeat(50))
+                .build()
+        };
+
+        let r1 = mapped(true, false, false, 100);
+        let r2 = mapped(false, false, false, 300);
+        let supp_r1 = mapped(true, false, true, 700);
+        let sec_r2 = mapped(false, true, false, 900);
+
+        // Primaries at positions 0/1 with trailing secondary + supplementary reads.
+        let recs = vec![enc(&r1), enc(&r2), enc(&supp_r1), enc(&sec_r2)];
+        assert_eq!(find_primary_pair_indices(&recs).unwrap(), (Some(0), Some(1)));
+
+        // Order-independent: a supplementary read first must not be mistaken for a primary.
+        let recs2 = vec![enc(&supp_r1), enc(&r2), enc(&r1)];
+        assert_eq!(find_primary_pair_indices(&recs2).unwrap(), (Some(2), Some(1)));
+
+        // A lone fragment (unpaired primary) resolves R1 only.
+        let frag = RecordBuilder::mapped_read()
+            .name("f")
+            .paired(false)
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("50M")
+            .sequence(&"A".repeat(50))
+            .build();
+        assert_eq!(find_primary_pair_indices(&[enc(&frag)]).unwrap(), (Some(0), None));
+    }
+
+    // A malformed template with two primary (non-secondary, non-supplementary) R1s — or two
+    // primary R2s — is rejected loudly, matching fgbio `Bams.Template` (`Bams.scala:161,167`)
+    // rather than silently keeping the first and passing the extra through unclipped.
+    #[test]
+    fn test_find_primary_pair_indices_rejects_duplicate_primaries() {
+        use crate::sam::RecordBuilder;
+        use fgumi_raw_bam::encode_record_buf_to_raw;
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReferenceSequence;
+        use std::num::NonZeroUsize;
+
+        let ref_seq = Map::<ReferenceSequence>::new(
+            NonZeroUsize::new(100_000).expect("ref length must be nonzero"),
+        );
+        let header =
+            noodles::sam::Header::builder().add_reference_sequence(b"chr1", ref_seq).build();
+        let enc = |b: &noodles::sam::alignment::RecordBuf| {
+            encode_record_buf_to_raw(b, &header).expect("encode")
+        };
+        let mapped = |first: bool, start: usize| {
+            RecordBuilder::mapped_read()
+                .name("dup")
+                .paired(true)
+                .first_segment(first)
+                .reference_sequence_id(0)
+                .alignment_start(start)
+                .cigar("50M")
+                .sequence(&"A".repeat(50))
+                .build()
+        };
+
+        // Two primary R1s (both first-of-pair, neither secondary/supplementary).
+        let two_r1 =
+            vec![enc(&mapped(true, 100)), enc(&mapped(false, 300)), enc(&mapped(true, 500))];
+        let err = find_primary_pair_indices(&two_r1).unwrap_err().to_string();
+        assert_eq!(err, "Multiple non-secondary, non-supplemental R1s for dup");
+
+        // Two primary R2s (both last-of-pair).
+        let two_r2 =
+            vec![enc(&mapped(true, 100)), enc(&mapped(false, 300)), enc(&mapped(false, 500))];
+        let err = find_primary_pair_indices(&two_r2).unwrap_err().to_string();
+        assert_eq!(err, "Multiple non-secondary, non-supplemental R2s for dup");
+    }
+
+    /// Encodes a `RecordBuf` to a `RawRecord` with a shared single-contig header. Used by the
+    /// raw mate-info tests below.
+    fn encode_raw(rec: &noodles::sam::alignment::RecordBuf) -> RawRecord {
+        use fgumi_raw_bam::encode_record_buf_to_raw;
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReferenceSequence;
+        use std::num::NonZeroUsize;
+
+        let ref_seq = Map::<ReferenceSequence>::new(
+            NonZeroUsize::new(100_000).expect("ref length must be nonzero"),
+        );
+        let header =
+            noodles::sam::Header::builder().add_reference_sequence(b"chr1", ref_seq).build();
+        encode_record_buf_to_raw(rec, &header).expect("encode")
+    }
+
+    /// Builds a mapped raw record from the common fields the mate-info tests need.
+    fn raw_read(
+        first: bool,
+        supplementary: bool,
+        reverse: bool,
+        start: usize,
+        mapq: u8,
+    ) -> RawRecord {
+        use crate::sam::RecordBuilder;
+        encode_raw(
+            &RecordBuilder::mapped_read()
+                .name("q")
+                .paired(true)
+                .first_segment(first)
+                .supplementary(supplementary)
+                .reverse_complement(reverse)
+                .reference_sequence_id(0)
+                .alignment_start(start)
+                .mapping_quality(mapq)
+                .cigar("50M")
+                .sequence(&"A".repeat(50))
+                .build(),
+        )
+    }
+
+    // set_supplemental_mate_info_raw copies a mapped mate's coordinate/strand/MAPQ onto a
+    // supplementary read, writes MC from the mate CIGAR, sets MQ, and negates the mate TLEN.
+    #[test]
+    fn test_set_supplemental_mate_info_raw_mapped_mate() {
+        use fgumi_raw_bam::flags as rflags;
+
+        // A reverse-strand primary mate at 1-based 301 (0-based 300), MAPQ 40, CIGAR 50M.
+        let mate = raw_read(false, false, true, 301, 40);
+        let mut supp = raw_read(true, true, false, 700, 30);
+
+        set_supplemental_mate_info_raw(&mut supp, &MateSnap::of(&mate), 120);
+
+        assert_eq!(supp.mate_ref_id(), 0);
+        assert_eq!(supp.mate_pos(), 300);
+        assert_eq!(supp.template_length(), -120);
+        assert_ne!(supp.flags() & rflags::MATE_REVERSE, 0, "mate is reverse");
+        assert_eq!(supp.flags() & rflags::MATE_UNMAPPED, 0, "mate is mapped");
+        assert_eq!(supp.tags().find_mc(), Some("50M"));
+        assert_eq!(supp.tags().find_int(SamTag::MQ), Some(40));
+    }
+
+    // With an unmapped mate, set_supplemental_mate_info_raw flags the mate unmapped and drops MC.
+    #[test]
+    fn test_set_supplemental_mate_info_raw_unmapped_mate() {
+        use crate::sam::RecordBuilder;
+        use fgumi_raw_bam::flags as rflags;
+
+        let mate = encode_raw(
+            &RecordBuilder::mapped_read()
+                .name("q")
+                .paired(true)
+                .first_segment(false)
+                .unmapped(true)
+                .reference_sequence_id(0)
+                .alignment_start(301)
+                .cigar("50M")
+                .sequence(&"A".repeat(50))
+                .build(),
+        );
+        // Seed an MC tag so we can confirm it is removed when the mate is unmapped.
+        let mut supp = raw_read(true, true, false, 700, 30);
+        supp.tags_editor().update_string(SamTag::MC, b"10M");
+        assert!(supp.tags().contains(SamTag::MC), "MC present before");
+
+        set_supplemental_mate_info_raw(&mut supp, &MateSnap::of(&mate), 0);
+
+        assert_ne!(supp.flags() & rflags::MATE_UNMAPPED, 0, "mate is unmapped");
+        assert!(!supp.tags().contains(SamTag::MC), "MC dropped when mate unmapped");
+    }
+
+    // fix_supplemental_mate_info points R1 supplementals at the primary R2 and R2 supplementals
+    // at the primary R1, inheriting each primary's coordinate/strand/MAPQ and negated TLEN.
+    #[test]
+    fn test_fix_supplemental_mate_info() {
+        use fgumi_raw_bam::flags as rflags;
+
+        let mut recs = vec![
+            raw_read(true, false, false, 101, 60), // 0: primary R1 (forward, MAPQ 60)
+            raw_read(false, false, true, 301, 40), // 1: primary R2 (reverse, MAPQ 40)
+            raw_read(true, true, false, 701, 30),  // 2: supplementary R1
+            raw_read(false, true, false, 901, 20), // 3: supplementary R2
+        ];
+        recs[0].set_template_length(200);
+        recs[1].set_template_length(-200);
+
+        fix_supplemental_mate_info(&mut recs, 0, 1);
+
+        // Supp R1 (idx 2) takes primary R2 (idx 1) as its mate.
+        assert_eq!(recs[2].mate_ref_id(), 0);
+        assert_eq!(recs[2].mate_pos(), 300);
+        assert_ne!(recs[2].flags() & rflags::MATE_REVERSE, 0, "primary R2 is reverse");
+        assert_eq!(recs[2].tags().find_int(SamTag::MQ), Some(40));
+        assert_eq!(recs[2].template_length(), 200); // -(-200)
+
+        // Supp R2 (idx 3) takes primary R1 (idx 0) as its mate.
+        assert_eq!(recs[3].mate_ref_id(), 0);
+        assert_eq!(recs[3].mate_pos(), 100);
+        assert_eq!(recs[3].flags() & rflags::MATE_REVERSE, 0, "primary R1 is forward");
+        assert_eq!(recs[3].tags().find_int(SamTag::MQ), Some(60));
+        assert_eq!(recs[3].template_length(), -200);
+    }
+
+    // The RecordBuf unsoftclipped_start/end helpers (used by the RecordBuf clip path) subtract or
+    // add only *soft* clips, ignore hard clips, and return None for unmapped reads.
+    #[test]
+    fn test_unsoftclipped_recordbuf_helpers() {
+        use crate::sam::RecordBuilder;
+        use crate::sam::record_utils::{unsoftclipped_end, unsoftclipped_start};
+
+        // 5H10S30M10S at 1-based 100: start = 100 - 10 (leading soft) = 90; hard clips ignored.
+        // end = 100 + 30 (ref span) - 1 + 10 (trailing soft) = 139.
+        let mapped = RecordBuilder::mapped_read()
+            .name("q")
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("5H10S30M10S")
+            .sequence(&"A".repeat(50))
+            .build();
+        assert_eq!(unsoftclipped_start(&mapped), Some(90));
+        assert_eq!(unsoftclipped_end(&mapped), Some(139));
+
+        let unmapped = RecordBuilder::mapped_read()
+            .name("q")
+            .unmapped(true)
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("50M")
+            .sequence(&"A".repeat(50))
+            .build();
+        assert_eq!(unsoftclipped_start(&unmapped), None);
+        assert_eq!(unsoftclipped_end(&unmapped), None);
+    }
 
     #[test]
     fn test_default_clip_parameters() {
@@ -1024,7 +1311,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1056,7 +1342,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1089,7 +1374,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1121,7 +1405,6 @@ mod tests {
             upgrade_clipping: true,
             auto_clip_attributes: false,
             metrics: Some(PathBuf::from("metrics.txt")),
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1153,7 +1436,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: true,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1184,7 +1466,6 @@ mod tests {
             upgrade_clipping: true,
             auto_clip_attributes: true,
             metrics: Some(PathBuf::from("metrics.txt")),
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1220,7 +1501,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1228,36 +1508,6 @@ mod tests {
         };
 
         assert_eq!(soft.clipping_mode, ClippingMode::Soft);
-    }
-
-    #[test]
-    fn test_clip_with_sort_order_specification() {
-        let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-                async_reader: false,
-            },
-            reference: PathBuf::from("reference.fa"),
-            clipping_mode: ClippingMode::Hard,
-            clip_overlapping_reads: false,
-            clip_extending_past_mate: false,
-
-            read_one_five_prime: 0,
-            read_one_three_prime: 0,
-            read_two_five_prime: 0,
-            read_two_three_prime: 0,
-            upgrade_clipping: false,
-            auto_clip_attributes: false,
-            metrics: None,
-            sort_order: Some("coordinate".to_string()),
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
-        };
-
-        assert_eq!(clip.sort_order, Some("coordinate".to_string()));
     }
 
     #[test]
@@ -1280,7 +1530,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1314,7 +1563,6 @@ mod tests {
             upgrade_clipping: true,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1346,7 +1594,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1378,7 +1625,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1410,7 +1656,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: true,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1442,7 +1687,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1476,7 +1720,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1508,7 +1751,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1542,7 +1784,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1575,7 +1816,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1600,7 +1840,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1625,7 +1864,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1636,66 +1874,6 @@ mod tests {
         assert_eq!(soft.clipping_mode, ClippingMode::Soft);
         assert_eq!(soft_mask.clipping_mode, ClippingMode::SoftWithMask);
         assert_eq!(hard.clipping_mode, ClippingMode::Hard);
-    }
-
-    #[test]
-    fn test_clip_with_queryname_sort_order() {
-        let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-                async_reader: false,
-            },
-            reference: PathBuf::from("reference.fa"),
-            clipping_mode: ClippingMode::Hard,
-            clip_overlapping_reads: true,
-            clip_extending_past_mate: true,
-
-            read_one_five_prime: 0,
-            read_one_three_prime: 0,
-            read_two_five_prime: 0,
-            read_two_three_prime: 0,
-            upgrade_clipping: false,
-            auto_clip_attributes: false,
-            metrics: None,
-            sort_order: Some("queryname".to_string()),
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
-        };
-
-        assert_eq!(clip.sort_order, Some("queryname".to_string()));
-    }
-
-    #[test]
-    fn test_clip_with_unsorted_sort_order() {
-        let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-                async_reader: false,
-            },
-            reference: PathBuf::from("reference.fa"),
-            clipping_mode: ClippingMode::Hard,
-            clip_overlapping_reads: true,
-            clip_extending_past_mate: true,
-
-            read_one_five_prime: 0,
-            read_one_three_prime: 0,
-            read_two_five_prime: 0,
-            read_two_three_prime: 0,
-            upgrade_clipping: false,
-            auto_clip_attributes: false,
-            metrics: None,
-            sort_order: Some("unsorted".to_string()),
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
-        };
-
-        assert_eq!(clip.sort_order, Some("unsorted".to_string()));
     }
 
     #[test]
@@ -1718,7 +1896,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1752,7 +1929,6 @@ mod tests {
             upgrade_clipping: true,
             auto_clip_attributes: false,
             metrics: Some(PathBuf::from("metrics.txt")),
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1784,7 +1960,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1857,7 +2032,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1908,7 +2082,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1958,7 +2131,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2008,7 +2180,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2058,7 +2229,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2108,7 +2278,6 @@ mod tests {
             upgrade_clipping: true,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2159,7 +2328,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: Some(metrics_path.clone()),
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2169,56 +2337,6 @@ mod tests {
 
         assert!(output_path.exists());
         assert!(metrics_path.exists());
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_clip_execute_with_sort_order() -> Result<()> {
-        let dir = TempDir::new()?;
-        let ref_path = create_test_reference(&dir);
-        let input_path = dir.path().join("input.bam");
-        let output_path = dir.path().join("output.bam");
-
-        let mut builder = SamBuilder::with_single_ref("chr1", 200);
-        let _ = builder
-            .add_pair()
-            .name("read1")
-            .bases1("ACGTACGTACGTACGTACGT")
-            .contig(0)
-            .start1(10)
-            .start2(30)
-            .build();
-
-        builder.write(&input_path)?;
-
-        let clip = Clip {
-            io: BamIoOptions {
-                input: input_path,
-                output: output_path.clone(),
-                async_reader: false,
-            },
-            reference: ref_path,
-            clipping_mode: ClippingMode::Hard,
-            clip_overlapping_reads: true,
-            clip_extending_past_mate: false,
-
-            read_one_five_prime: 0,
-            read_one_three_prime: 0,
-            read_two_five_prime: 0,
-            read_two_three_prime: 0,
-            upgrade_clipping: false,
-            auto_clip_attributes: false,
-            metrics: None,
-            sort_order: Some("queryname".to_string()),
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
-        };
-        clip.execute("test")?;
-
-        assert!(output_path.exists());
 
         Ok(())
     }
@@ -2260,7 +2378,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2311,7 +2428,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: true,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2362,7 +2478,6 @@ mod tests {
             upgrade_clipping: true,
             auto_clip_attributes: true,
             metrics: Some(metrics_path.clone()),
-            sort_order: Some("queryname".to_string()),
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2409,7 +2524,6 @@ mod tests {
             upgrade_clipping: false, // No clipping option
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2466,7 +2580,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading,
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2529,7 +2642,6 @@ mod tests {
             upgrade_clipping: false,
             auto_clip_attributes: false,
             metrics: None,
-            sort_order: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
