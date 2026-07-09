@@ -822,7 +822,11 @@ impl Duplex {
 
         // Write statistics file if requested
         if let Some(stats_path) = &self.stats_opts.stats {
-            let kv_metrics = metrics.to_kv_metrics();
+            // Duplex always-emits the fgbio `usedByDuplex` rejection rows
+            // (non_paired_reads, single_strand_only, potential_umi_collision),
+            // seeded to zero, for metric parity (R2-MET-05).
+            let kv_metrics =
+                metrics.to_kv_metrics_seeded(&fgumi_metrics::consensus::DUPLEX_SEEDED_REJECTIONS);
             DelimFile::default()
                 .write_tsv(stats_path, kv_metrics)
                 .with_context(|| format!("Failed to write statistics: {}", stats_path.display()))?;

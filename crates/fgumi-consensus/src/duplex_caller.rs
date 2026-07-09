@@ -1771,7 +1771,11 @@ impl DuplexConsensusCaller {
             return Ok((ConsensusOutput::default(), stats, rejected_raw));
         }
 
-        // Extract cell barcode from source reads (matching fgbio: recs.head.get[String](cellTag))
+        // Extract the cell barcode from the source reads. fgumi's grouper keys
+        // on (MI, cell), so every record in this molecule already shares one
+        // cell barcode — taking the first is correct. (fgbio instead computes
+        // `distinct` + `require(<=1)`; fgumi's upstream per-cell partition is a
+        // deliberate lossless divergence, so the caller never sees >1 cell.)
         let cell_barcode: Option<String> = cell_tag.and_then(|tag| {
             let tag_bytes: [u8; 2] = <[u8; 2]>::from(tag);
             a_records.first().or_else(|| b_records.first()).and_then(|r| {
@@ -1781,6 +1785,20 @@ impl DuplexConsensusCaller {
                     .map(|v| String::from_utf8_lossy(v).into_owned())
             })
         });
+
+        // fgbio partitions out unpaired/fragment reads and rejects them as
+        // `non_paired_reads` (DuplexConsensusCaller.scala:204-205). fgumi drops
+        // them from the R1/R2 strand groups below; count them here as
+        // `FragmentRead` so they are accounted for in the rejection metrics
+        // rather than silently folded into the input total.
+        let fragment_count = a_records
+            .iter()
+            .chain(b_records.iter())
+            .filter(|r| RawRecordView::new(r.as_ref()).flags() & flags::PAIRED == 0)
+            .count();
+        if fragment_count > 0 {
+            stats.record_rejection(RejectionReason::FragmentRead, fragment_count);
+        }
 
         // Split reads into R1/R2 groups for AB and BA strands (done once, reused below).
         // Require PAIRED for both: otherwise unpaired/fragment reads (which have both

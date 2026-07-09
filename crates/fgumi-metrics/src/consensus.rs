@@ -166,6 +166,15 @@ fn all_rejections() -> impl Iterator<Item = RejectionReason> {
     CORE_REJECTIONS.into_iter().chain(OPTIONAL_REJECTIONS)
 }
 
+/// Rejection reasons the duplex caller always emits (seeds to zero even when the
+/// count is zero), mirroring fgbio's `usedByDuplex` reasons that are not already
+/// in [`CORE_REJECTIONS`] (fgbio `UmiConsensusCaller.initializeRejectCounts`).
+pub const DUPLEX_SEEDED_REJECTIONS: [RejectionReason; 3] = [
+    RejectionReason::NonPairedReads,
+    RejectionReason::SameStrandOnly,
+    RejectionReason::PotentialUmiCollision,
+];
+
 impl ConsensusMetrics {
     /// Creates a new consensus metrics struct with all counts initialized to zero.
     #[must_use]
@@ -290,6 +299,17 @@ impl ConsensusMetrics {
     /// metrics output format used by `CallMolecularConsensusReads`.
     #[must_use]
     pub fn to_kv_metrics(&self) -> Vec<ConsensusKvMetric> {
+        self.to_kv_metrics_seeded(&[])
+    }
+
+    /// Like [`Self::to_kv_metrics`], but additionally always-emits (seeds to
+    /// zero) the given rejection reasons, matching fgbio's per-caller
+    /// `initializeRejectCounts` seeding. The duplex caller passes
+    /// [`DUPLEX_SEEDED_REJECTIONS`] so that `non_paired_reads`,
+    /// `single_strand_only`, and `potential_umi_collision` rows are always
+    /// present even when their counts are zero.
+    #[must_use]
+    pub fn to_kv_metrics_seeded(&self, seeded: &[RejectionReason]) -> Vec<ConsensusKvMetric> {
         let mut metrics = Vec::new();
 
         let raw_reads_used = self.total_input_reads.saturating_sub(self.filtered_reads);
@@ -326,8 +346,22 @@ impl ConsensusMetrics {
             ));
         }
 
-        // Optional rejection reasons (only included when non-zero)
-        self.push_optional_rejections(&mut metrics);
+        // Caller-seeded rejection reasons (always included, even when zero),
+        // skipping any already covered by CORE_REJECTIONS.
+        for reason in seeded {
+            if CORE_REJECTIONS.contains(reason) {
+                continue;
+            }
+            metrics.push(ConsensusKvMetric::new(
+                reason.tsv_key(),
+                self.rejection_count(*reason).to_string(),
+                reason.kv_description(),
+            ));
+        }
+
+        // Optional rejection reasons (only included when non-zero, and not
+        // already emitted as a seeded reason above).
+        self.push_optional_rejections(&mut metrics, seeded);
 
         // Final output metric
         metrics.push(ConsensusKvMetric::new(
@@ -340,8 +374,15 @@ impl ConsensusMetrics {
     }
 
     /// Appends fgumi-specific rejection metrics with non-zero counts.
-    fn push_optional_rejections(&self, metrics: &mut Vec<ConsensusKvMetric>) {
+    fn push_optional_rejections(
+        &self,
+        metrics: &mut Vec<ConsensusKvMetric>,
+        seeded: &[RejectionReason],
+    ) {
         for reason in &OPTIONAL_REJECTIONS {
+            if seeded.contains(reason) {
+                continue;
+            }
             let count = self.rejection_count(*reason);
             if count > 0 {
                 metrics.push(ConsensusKvMetric::new(
@@ -581,6 +622,44 @@ mod tests {
         // Should NOT have excessive_n_bases since it's zero
         let en = kv_metrics.iter().find(|m| m.key == "raw_reads_rejected_for_excessive_n_bases");
         assert!(en.is_none());
+    }
+
+    #[test]
+    fn test_to_kv_metrics_seeded_always_emits_duplex_reasons() {
+        // With all counts zero, the plain KV output omits the duplex-seeded
+        // reasons (they are optional/non-zero), but the seeded output always
+        // emits exactly one row per seeded reason.
+        let metrics = ConsensusMetrics::new();
+
+        let plain = metrics.to_kv_metrics();
+        for reason in DUPLEX_SEEDED_REJECTIONS {
+            assert!(
+                plain.iter().all(|m| m.key != reason.tsv_key()),
+                "{} should be omitted from the un-seeded output at zero",
+                reason.tsv_key()
+            );
+        }
+
+        let seeded = metrics.to_kv_metrics_seeded(&DUPLEX_SEEDED_REJECTIONS);
+        for reason in DUPLEX_SEEDED_REJECTIONS {
+            let key = reason.tsv_key();
+            let rows: Vec<_> = seeded.iter().filter(|m| m.key == key).collect();
+            assert_eq!(rows.len(), 1, "{key} should be emitted exactly once even at zero");
+            assert_eq!(rows[0].value, "0", "{key} should be seeded to zero");
+        }
+    }
+
+    #[test]
+    fn test_to_kv_metrics_seeded_reports_nonzero_counts() {
+        // A non-zero seeded reason is emitted with its count and not duplicated.
+        let mut metrics = ConsensusMetrics::new();
+        metrics.rejected_non_paired_reads = 7;
+
+        let seeded = metrics.to_kv_metrics_seeded(&DUPLEX_SEEDED_REJECTIONS);
+        let rows: Vec<_> =
+            seeded.iter().filter(|m| m.key == "raw_reads_rejected_for_non_paired_reads").collect();
+        assert_eq!(rows.len(), 1, "non_paired_reads must not be duplicated");
+        assert_eq!(rows[0].value, "7");
     }
 
     #[test]
