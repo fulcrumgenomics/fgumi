@@ -275,10 +275,15 @@ impl SimplexMetrics {
                     let num_components = split_rx.first().map_or(0, Vec::len);
 
                     for pos in 0..num_components {
+                        // Do NOT drop empty molecule-end halves (e.g. the trailing half
+                        // of `CCC-` or the leading half of `-GGG`). fgbio counts them,
+                        // recording the empty half as an empty-string UMI, so single-index
+                        // designs are not undercounted (SIM-01, mirroring DXM-01). A read
+                        // that simply has fewer components than `pos` contributes nothing
+                        // (its `parts.get(pos)` is `None`).
                         let umis_at_pos: Vec<String> = split_rx
                             .iter()
                             .filter_map(|parts| parts.get(pos).map(|s| (*s).to_string()))
-                            .filter(|s| !s.is_empty())
                             .collect();
 
                         if umis_at_pos.is_empty() {
@@ -343,6 +348,7 @@ impl SimplexMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::shared::UmiMetric;
     use crate::metrics::simplex::{SimplexFamilySizeMetric, SimplexMetricsCollector};
     use crate::sam::SamTag;
     use anyhow::Result;
@@ -546,6 +552,66 @@ mod tests {
             .expect("expected family size 3 metric not found");
         assert_eq!(size_3.cs_count, 1);
         assert_eq!(size_3.ss_count, 0);
+
+        Ok(())
+    }
+
+    /// SIM-01: `simplex-metrics` must count UMIs even when one component of a
+    /// multi-part UMI is an empty molecule-end half (e.g. `CCC-`, `-GGG`), recording
+    /// the empty half as an empty-string (`""`) UMI. This mirrors the DXM-01 fix in
+    /// `duplex-metrics` and fgbio's single-strand UMI counting
+    /// (`CollectDuplexSeqMetrics` records both halves via `split("-", -1)`), keeping
+    /// the two metrics tools internally consistent. Previously the per-position
+    /// collection dropped empty components, undercounting single-index designs.
+    #[test]
+    fn test_count_umis_with_empty_molecule_end_half() -> Result<()> {
+        let mut records = Vec::new();
+
+        // Family 1: normal two-part UMI "AAA-TTT" → records "AAA" and "TTT".
+        let (r1, r2) = build_test_pair("q1", 0, 100, 200, "AAA-TTT", "1/A");
+        records.push(r1);
+        records.push(r2);
+        // Family 2: empty SECOND half "CCC-" → records "CCC" and "".
+        let (r1, r2) = build_test_pair("q2", 0, 1000, 1100, "CCC-", "2/A");
+        records.push(r1);
+        records.push(r2);
+        // Family 3: empty FIRST half "-GGG" → records "" and "GGG".
+        let (r1, r2) = build_test_pair("q3", 0, 2000, 2100, "-GGG", "3/A");
+        records.push(r1);
+        records.push(r2);
+
+        let input = create_test_bam(records)?;
+        let output_dir = TempDir::new()?;
+        let output = output_dir.path().join("output");
+
+        let cmd = SimplexMetrics {
+            input: input.path().to_path_buf(),
+            output: output.clone(),
+            min_reads: 1,
+            intervals: None,
+            description: None,
+        };
+        cmd.execute("test")?;
+
+        let umi_path = format!("{}.umi_counts.txt", output.display());
+        let umi_metrics: Vec<UmiMetric> = DelimFile::default().read_tsv(&umi_path)?;
+        let by_umi: std::collections::HashMap<&str, &UmiMetric> =
+            umi_metrics.iter().map(|m| (m.umi.as_str(), m)).collect();
+
+        // Present halves ("CCC", "GGG") are counted, and each empty molecule-end half
+        // is recorded as an empty-string UMI (CCC- second half + -GGG first half → 2).
+        assert_eq!(
+            umi_metrics.len(),
+            5,
+            "expected 5 UMIs (present halves + empty UMI): {:?}",
+            umi_metrics.iter().map(|m| m.umi.as_str()).collect::<Vec<_>>()
+        );
+        for umi in ["", "AAA", "TTT", "CCC", "GGG"] {
+            assert!(by_umi.contains_key(umi), "missing UMI {umi:?}");
+        }
+        assert_eq!(by_umi[""].unique_observations, 2, "empty halves counted as empty UMI");
+        assert_eq!(by_umi["CCC"].unique_observations, 1);
+        assert_eq!(by_umi["GGG"].unique_observations, 1);
 
         Ok(())
     }
