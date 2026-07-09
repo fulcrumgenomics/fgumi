@@ -989,24 +989,29 @@ pub(crate) mod merge_step {
         pub output_byte_limit: u64,
     }
 
-    /// One batch in flight on a branch + the cursor into it.
+    /// One batch's templates in flight on a branch + the cursor into them.
+    /// Owns the `Vec<Template>` moved out of the batch (via
+    /// [`BamTemplateBatch::into_parts`]) so the drain cursor can replace
+    /// slots in place — the cached `total_bytes` is dropped with the batch,
+    /// so there is no stale accounting to worry about.
     struct PendingBatch {
-        batch: BamTemplateBatch,
+        templates: Vec<Template>,
         cursor: usize,
     }
 
     impl PendingBatch {
         fn new(batch: BamTemplateBatch) -> Self {
-            Self { batch, cursor: 0 }
+            let (_, templates) = batch.into_parts();
+            Self { templates, cursor: 0 }
         }
 
         fn current(&self) -> Option<&Template> {
-            self.batch.templates.get(self.cursor)
+            self.templates.get(self.cursor)
         }
 
         fn take_current(&mut self) -> Option<Template> {
             let i = self.cursor;
-            if i >= self.batch.templates.len() {
+            if i >= self.templates.len() {
                 return None;
             }
             self.cursor += 1;
@@ -1014,11 +1019,11 @@ pub(crate) mod merge_step {
             // surrounding `Vec` can keep its length without the
             // `Template: Default` bound (Template carries a
             // `MoleculeId` enum that has no canonical default).
-            Some(std::mem::replace(&mut self.batch.templates[i], Template::new(Vec::new())))
+            Some(std::mem::replace(&mut self.templates[i], Template::new(Vec::new())))
         }
 
         fn is_exhausted(&self) -> bool {
-            self.cursor >= self.batch.templates.len()
+            self.cursor >= self.templates.len()
         }
     }
 
@@ -1207,7 +1212,7 @@ pub(crate) mod merge_step {
                                         .map(|t| t.name.clone())
                                         .or_else(|| {
                                             ctx.b.pop().and_then(|batch| {
-                                                batch.templates.first().map(|t| t.name.clone())
+                                                batch.templates().first().map(|t| t.name.clone())
                                             })
                                         });
                                     if let Some(name) = leftover_b {

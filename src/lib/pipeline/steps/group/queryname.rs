@@ -177,7 +177,7 @@ impl Step for GroupByQueryname {
         for _ in 0..MAX_BATCHES_PER_LOCK {
             let Some(batch) = ctx.input.pop() else { break };
             did_work = true;
-            let DecodedRecordBatch { records, .. } = batch;
+            let records = batch.into_records();
             for decoded in records {
                 let name_hash = decoded.key.name_hash;
                 let raw = decoded.into_raw_bytes();

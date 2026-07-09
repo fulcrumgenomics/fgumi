@@ -114,7 +114,7 @@ pub(crate) fn correct_step_with_rejects(
             // dense serial sequence; pushing nothing (`only_a`) leaves a gap at
             // this serial that wedges the rejects sink. The empty `Vec` does not
             // allocate and produces no physical BGZF block.
-            let batch_serial = kept.batch_serial;
+            let batch_serial = kept.batch_serial();
             Ok(Process2Output::both(kept, DecompressedBlock { batch_serial, bytes: Vec::new() }))
         }
     };
@@ -177,7 +177,7 @@ fn run_batch_with_rejects(
     cfg: &Arc<CorrectStepConfig>,
     batch: BamTemplateBatch,
 ) -> io::Result<(BamTemplateBatch, Option<DecompressedBlock>)> {
-    let BamTemplateBatch { batch_serial, templates, .. } = batch;
+    let (batch_serial, templates) = batch.into_parts();
 
     let mut kept_templates: Vec<Template> = Vec::with_capacity(templates.len());
     let mut rejects_bytes: Vec<u8> = Vec::new();
@@ -261,7 +261,7 @@ fn run_batch_kept_only(
     cfg: &Arc<CorrectStepConfig>,
     batch: BamTemplateBatch,
 ) -> io::Result<(BamTemplateBatch, ())> {
-    let BamTemplateBatch { batch_serial, templates, .. } = batch;
+    let (batch_serial, templates) = batch.into_parts();
 
     let mut kept_templates: Vec<Template> = Vec::with_capacity(templates.len());
     let mut local_metrics = CollectedCorrectMetrics::default();

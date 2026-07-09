@@ -244,18 +244,22 @@ fn full_chain_with_process_mutates_mq() {
     let bump_mq = process_ordered::<DecodedRecordBatch, DecodedRecordBatch, _>(
         "BumpMq",
         bytes_4mb,
-        |mut batch: DecodedRecordBatch| {
+        |batch: DecodedRecordBatch| {
             // BAM record body byte 9 is `mapq` (raw layout: refID(4) +
             // pos(4) + l_read_name(1) + mapq(1) + ...). Mutating mapq
             // doesn't change the record's identity (qname / library /
             // cell barcode), so the pre-computed GroupKey stays valid.
-            for record in &mut batch.records {
+            // Take ownership, edit in place, and rebuild via `new` so the
+            // cached `total_bytes` is recomputed for the edited records.
+            let serial = batch.batch_serial();
+            let mut records = batch.into_records();
+            for record in &mut records {
                 let buf = record.raw_bytes_mut().as_mut_vec();
                 if buf.len() > 9 {
                     buf[9] = 42;
                 }
             }
-            Ok(batch)
+            Ok(DecodedRecordBatch::new(serial, records))
         },
     );
 

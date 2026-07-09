@@ -654,7 +654,7 @@ fn writer_loop(
         // re-aligned BAM by mistake. Error out loudly with the
         // queryname so the misconfiguration is obvious.
         let mut n_templates = 0usize;
-        for template in &batch.templates {
+        for template in batch.templates() {
             let mut wrote_any = false;
             for record in &template.records {
                 let flags = record.flags();
@@ -915,12 +915,12 @@ fn reader_loop_inner(
             // both templates' `name` fields, which both halves
             // already carry.
             debug_assert_eq!(
-                token.unmapped.templates[i].name,
+                token.unmapped.templates()[i].name,
                 mapped.name,
                 "AAM reader: queryname mismatch — unmapped[{i}]='{u}' but mapped='{m}' \
                  (aligner reordered output?)",
                 i = i,
-                u = String::from_utf8_lossy(&token.unmapped.templates[i].name),
+                u = String::from_utf8_lossy(&token.unmapped.templates()[i].name),
                 m = String::from_utf8_lossy(&mapped.name),
             );
 
@@ -988,14 +988,14 @@ fn merge_zipper_batch(zb: ZipperBatch, cfg: &AlignAndMergeConfig) -> io::Result<
     let ZipperBatch { serial, mapped, unmapped } = zb;
     debug_assert_eq!(
         mapped.len(),
-        unmapped.templates.len(),
+        unmapped.templates().len(),
         "ZipperBatch invariant: mapped and unmapped must have equal length",
     );
 
     let mut merged: Vec<Template> = Vec::with_capacity(mapped.len());
     let mut total_records: u64 = 0;
     let mut total_bytes: usize = 0;
-    for (mut mapped_template, unmapped_template) in mapped.into_iter().zip(&unmapped.templates) {
+    for (mut mapped_template, unmapped_template) in mapped.into_iter().zip(unmapped.templates()) {
         merge_one_template(
             unmapped_template,
             &mut mapped_template,

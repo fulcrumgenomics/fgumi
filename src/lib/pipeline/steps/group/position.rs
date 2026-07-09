@@ -252,7 +252,7 @@ impl Step for GroupByPosition {
         for _ in 0..MAX_BATCHES_PER_LOCK {
             let Some(batch) = ctx.input.pop() else { break };
             did_work = true;
-            let DecodedRecordBatch { records, .. } = batch;
+            let records = batch.into_records();
             let groups = self.grouper.add_records(records)?;
             self.accumulator.extend(groups);
             if self.accumulator.len() >= self.target_batch_count {

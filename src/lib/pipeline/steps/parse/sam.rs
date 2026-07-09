@@ -76,19 +76,23 @@ pub fn parse_sam_chunk_into_decoded(
         }
         encoder.get_mut().clear();
         encoder.write_alignment_record(header, &sam_record)?;
-        // `DecodedRecord` takes ownership of the body bytes, so swap the
-        // encoder's inner buffer out (replacing it with a pre-sized fresh one
-        // for the next record) and strip the 4-byte little-endian `block_size`
-        // prefix that `bam::io::Writer` prepends in place. This avoids the extra
-        // full-body memcpy that `get_ref()[4..].to_vec()` performed per record
-        // (this is the hot SAM parse loop). The replacement is sized to the
-        // outgoing buffer's capacity so the encoder keeps room for the next
-        // record instead of re-growing a zero-capacity `Vec` from scratch (which
-        // `std::mem::take` would leave behind).
-        let next_capacity = encoder.get_mut().capacity().max(4096);
-        let mut body_bytes =
-            std::mem::replace(encoder.get_mut(), Vec::with_capacity(next_capacity));
-        body_bytes.drain(..4);
+        // Copy the encoded body into a *right-sized* buffer, stripping the
+        // 4-byte little-endian `block_size` prefix `bam::io::Writer` prepends.
+        // The encoder's scratch buffer is retained and reused (it is cleared at
+        // the top of the next iteration), so it grows once to the largest record
+        // and never reallocates; only this right-sized `to_vec()` allocates per
+        // record.
+        //
+        // A record must NOT inherit the encoder's scratch capacity. A previous
+        // `mem::replace(encoder.get_mut(), Vec::with_capacity(cap.max(4096)))`
+        // handed every `DecodedRecord` a >=4 KiB buffer to hold a ~60-byte body
+        // — a ~20x per-record over-allocation. Because records are held in
+        // flight through the pipeline, that blew `zipper` (and any SAM-input
+        // pipeline) to tens of GiB on large inputs, while the BAM-input path
+        // stayed bounded (its records are right-sized). The single memcpy per
+        // record here is far cheaper than that blowup and matches the BAM path's
+        // right-sized records.
+        let body_bytes = encoder.get_ref()[4..].to_vec();
         // Match the BAM decode path (`DecodeFromRecords`): under
         // `name_hash_only` the key is the name hash alone, so SAM- and
         // BAM-ingested records group identically.
@@ -243,8 +247,35 @@ read2\t16\tchr1\t20\t60\t5M\t*\t0\t0\tTGCAT\t!!!!!\n";
         let chunk = sam_chunk_from_records(7);
 
         let batch = parse_sam_chunk_into_decoded(chunk, &header, &key_config).expect("parses");
-        assert_eq!(batch.batch_serial, 7, "serial propagated from input chunk");
-        assert_eq!(batch.records.len(), 2);
+        assert_eq!(batch.batch_serial(), 7, "serial propagated from input chunk");
+        assert_eq!(batch.records().len(), 2);
+    }
+
+    #[test]
+    fn parse_sam_chunk_records_are_right_sized_not_encoder_buffer() {
+        // Regression: each SAM record must own a *right-sized* buffer, not the
+        // shared >=4 KiB encoder scratch buffer. Handing every record the
+        // encoder's `Vec::with_capacity(>=4096)` (via `mem::replace`) made a
+        // ~60-byte record carry a 4 KiB allocation — a ~20x per-record blowup
+        // that drove pipeline-mode `zipper` to tens of GiB on large inputs
+        // (fast-path/BAM-input stayed bounded because those records are
+        // right-sized). The BAM decode path is the reference: its records'
+        // capacity tracks their length.
+        use fgumi_bam_io::MemoryEstimate;
+        let header = parse_header(SAM_TEXT);
+        let key_config = key_config_for(&header);
+        let chunk = sam_chunk_from_records(0);
+
+        let batch = parse_sam_chunk_into_decoded(chunk, &header, &key_config).expect("parses");
+        for rec in batch.records() {
+            let len = rec.raw_bytes().len();
+            let cap = rec.estimate_heap_size(); // RawRecord::capacity()
+            assert!(
+                cap <= len * 2 + 64,
+                "SAM-parsed record over-allocated: len={len} cap={cap} — each record \
+                 must own a right-sized buffer, not the shared >=4096 B encoder scratch",
+            );
+        }
     }
 
     #[test]
@@ -259,7 +290,7 @@ read2\t16\tchr1\t20\t60\t5M\t*\t0\t0\tTGCAT\t!!!!!\n";
         let batch = parse_sam_chunk_into_decoded(chunk, &header, &key_config).expect("parses");
 
         let mut names: Vec<Vec<u8>> = Vec::new();
-        for rec in &batch.records {
+        for rec in batch.records() {
             let body = rec.raw_bytes();
             // BAM record body layout: bytes 0..32 are fixed fields;
             // byte 8 is l_read_name (including NUL); read_name starts at
@@ -291,7 +322,7 @@ read2\t16\tchr1\t20\t60\t5M\t*\t0\t0\tTGCAT\t!!!!!\n";
         let chunk = SamChunk { batch_serial: 0, bytes, line_offsets };
 
         let batch = parse_sam_chunk_into_decoded(chunk, &header, &key_config).expect("parses");
-        assert_eq!(batch.records.len(), 1, "empty line should be skipped, not parsed");
+        assert_eq!(batch.records().len(), 1, "empty line should be skipped, not parsed");
     }
 
     #[test]
@@ -301,8 +332,8 @@ read2\t16\tchr1\t20\t60\t5M\t*\t0\t0\tTGCAT\t!!!!!\n";
         let chunk = SamChunk { batch_serial: 11, bytes: Vec::new(), line_offsets: Vec::new() };
 
         let batch = parse_sam_chunk_into_decoded(chunk, &header, &key_config).expect("parses");
-        assert_eq!(batch.batch_serial, 11);
-        assert!(batch.records.is_empty());
+        assert_eq!(batch.batch_serial(), 11);
+        assert!(batch.records().is_empty());
     }
 
     /// Full-field parity: BAM-encode a record via noodles + `DecodeRecords`
@@ -363,8 +394,8 @@ read2\t16\tchr1\t20\t60\t5M\t*\t0\t0\tTGCAT\t!!!!!\n";
         }
         let chunk = SamChunk { batch_serial: 0, bytes, line_offsets };
         let batch = parse_sam_chunk_into_decoded(chunk, &header, &key_config).expect("parses");
-        assert_eq!(batch.records.len(), 1);
-        let sam_decoded = &batch.records[0];
+        assert_eq!(batch.records().len(), 1);
+        let sam_decoded = &batch.records()[0];
 
         // Byte-identical raw record bytes (the SAM and BAM encoder paths
         // both go through `bam::io::Writer::write_alignment_record`).
@@ -388,9 +419,9 @@ read2\t16\tchr1\t20\t60\t5M\t*\t0\t0\tTGCAT\t!!!!!\n";
 
         let chunk = sam_chunk_from_records(0);
         let batch = parse_sam_chunk_into_decoded(chunk, &header, &key_config).expect("parses");
-        assert_eq!(batch.records.len(), 2);
+        assert_eq!(batch.records().len(), 2);
 
-        for rec in &batch.records {
+        for rec in batch.records() {
             let raw = rec.raw_bytes();
             assert_eq!(
                 rec.key,

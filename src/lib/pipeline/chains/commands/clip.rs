@@ -155,7 +155,7 @@ pub(crate) fn build_clip_process_step(
                 RawRecordClipper::new(cap.clipping_mode)
             };
 
-            let BamTemplateBatch { batch_serial, mut templates, .. } = batch;
+            let (batch_serial, mut templates) = batch.into_parts();
             let mut local_templates: u64 = 0;
             let mut local_overlap_clipped: u64 = 0;
             let mut local_extend_clipped: u64 = 0;

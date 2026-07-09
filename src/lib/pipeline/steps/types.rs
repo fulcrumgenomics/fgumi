@@ -19,7 +19,7 @@
 
 use crate::pipeline::core::item::{HeapSize, Ordered};
 use crate::template::Template;
-use fgumi_bam_io::DecodedRecord;
+use fgumi_bam_io::{DecodedRecord, MemoryEstimate};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Light flowing types (BgzfBlock, DecompressedBlock, RecordBatch,
@@ -43,23 +43,57 @@ pub use fgumi_pipeline_io::types::{BgzfBlock, DecompressedBlock, RecordBatch, Re
 /// A batch of `DecodedRecord`s — raw record bytes paired with a
 /// pre-computed `GroupKey`. Carries `total_bytes` for O(1) `HeapSize`.
 ///
-/// `total_bytes` is cached at construction (`new`) and assumes the
-/// `records` vector is **not** mutated in a size-changing way afterwards.
-/// The fields are `pub` for ergonomics, but in-place edits that change a
-/// record's `raw_bytes().len()` would desync `heap_size()` from reality —
-/// rebuild via [`Self::new`] instead of mutating in place.
+/// `total_bytes` is cached at construction (`new`) and sums each record's
+/// **allocated capacity** ([`MemoryEstimate::estimate_heap_size`]), not its
+/// logical `raw_bytes().len()`. This feeds the pipeline's byte-backpressure
+/// budget, which must track the true heap footprint: accounting by `len`
+/// under-counts an over-allocated record and lets the pipeline buffer far past
+/// its budget.
+///
+/// The fields are **private** so the cached `total_bytes` can never drift out
+/// of sync with `records`: the only constructor is [`Self::new`] (which
+/// recomputes the cache), reads go through [`Self::records`] /
+/// [`Self::total_bytes`], and taking ownership of the records consumes the
+/// batch via [`Self::into_records`]. There is no way to mutate `records` in
+/// place, so byte-bounded admission control always sees the true footprint.
 #[derive(Debug)]
 pub struct DecodedRecordBatch {
-    pub batch_serial: u64,
-    pub records: Vec<DecodedRecord>,
-    pub total_bytes: usize,
+    batch_serial: u64,
+    records: Vec<DecodedRecord>,
+    total_bytes: usize,
 }
 
 impl DecodedRecordBatch {
     #[must_use]
     pub fn new(batch_serial: u64, records: Vec<DecodedRecord>) -> Self {
-        let total_bytes = records.iter().map(|d| d.raw_bytes().len()).sum();
+        let total_bytes = records.iter().map(MemoryEstimate::estimate_heap_size).sum();
         Self { batch_serial, records, total_bytes }
+    }
+
+    /// The batch's ordering serial.
+    #[must_use]
+    pub fn batch_serial(&self) -> u64 {
+        self.batch_serial
+    }
+
+    /// Immutable view of the batch's decoded records.
+    #[must_use]
+    pub fn records(&self) -> &[DecodedRecord] {
+        &self.records
+    }
+
+    /// Cached heap footprint (summed allocated capacity) of the records.
+    #[must_use]
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    /// Consume the batch and return ownership of its records. The cached
+    /// `total_bytes` is dropped with the batch, so callers move the records
+    /// out without any risk of leaving a stale byte count behind.
+    #[must_use]
+    pub fn into_records(self) -> Vec<DecodedRecord> {
+        self.records
     }
 }
 
@@ -82,11 +116,19 @@ impl Ordered for DecodedRecordBatch {
 
 /// A batch of templates (same-queryname record groups), with batch serial
 /// for ordering and `total_bytes` for memory accounting.
+///
+/// The fields are **private** so the cached `total_bytes` can never drift out
+/// of sync with `templates`: construct via [`Self::new`] (which recomputes the
+/// cache) or [`Self::from_parts`] (which trusts a caller that already summed
+/// `heap_size`), read through the accessors, and take ownership of the
+/// templates by consuming the batch via [`Self::into_parts`]. There is no way
+/// to mutate `templates` in place, so byte-bounded admission control always
+/// sees the true footprint.
 #[derive(Debug)]
 pub struct BamTemplateBatch {
-    pub batch_serial: u64,
-    pub templates: Vec<Template>,
-    pub total_bytes: usize,
+    batch_serial: u64,
+    templates: Vec<Template>,
+    total_bytes: usize,
 }
 
 impl BamTemplateBatch {
@@ -104,6 +146,32 @@ impl BamTemplateBatch {
     #[must_use]
     pub fn from_parts(batch_serial: u64, templates: Vec<Template>, total_bytes: usize) -> Self {
         Self { batch_serial, templates, total_bytes }
+    }
+
+    /// The batch's ordering serial.
+    #[must_use]
+    pub fn batch_serial(&self) -> u64 {
+        self.batch_serial
+    }
+
+    /// Immutable view of the batch's templates.
+    #[must_use]
+    pub fn templates(&self) -> &[Template] {
+        &self.templates
+    }
+
+    /// Cached heap footprint (summed `Template::heap_size`) of the templates.
+    #[must_use]
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    /// Consume the batch and return its serial and templates. The cached
+    /// `total_bytes` is dropped with the batch, so callers move the templates
+    /// out (and re-wrap via [`Self::new`]) without risking a stale byte count.
+    #[must_use]
+    pub fn into_parts(self) -> (u64, Vec<Template>) {
+        (self.batch_serial, self.templates)
     }
 }
 
@@ -173,6 +241,63 @@ mod tests {
         let batch = BamTemplateBatch::new(42, vec![]);
         assert_eq!(batch.heap_size(), 0);
         assert_eq!(batch.ordinal(), 42);
+    }
+
+    #[test]
+    fn decoded_record_batch_heap_size_counts_capacity_not_len() {
+        // `heap_size` feeds the pipeline's byte-backpressure budget, so it must
+        // report the records' true heap footprint (allocated capacity), not
+        // their logical length. Accounting by `len` under-counts an
+        // over-allocated record — exactly the failure mode where a SAM-parsed
+        // record with a 4 KiB buffer holding ~60 bytes fooled backpressure and
+        // let the pipeline buffer far past its memory budget.
+        use fgumi_bam_io::{GroupKey, MemoryEstimate};
+        let mut raw = Vec::with_capacity(4096);
+        raw.extend_from_slice(&[0u8; 64]); // len 64, capacity 4096
+        let rec = DecodedRecord::from_raw_bytes(raw, GroupKey::default());
+        let cap = rec.estimate_heap_size();
+        assert!(cap >= 4096, "sanity: over-allocated record capacity, got {cap}");
+        let batch = DecodedRecordBatch::new(0, vec![rec]);
+        assert_eq!(
+            batch.heap_size(),
+            cap,
+            "heap_size must reflect allocated capacity ({cap}), not logical len — \
+             else byte-backpressure under-counts real memory",
+        );
+    }
+
+    #[test]
+    fn decoded_record_batch_accessors_and_into_records_round_trip() {
+        // The fields are private; callers read via the accessors and take
+        // ownership by consuming the batch. `into_records` must hand back the
+        // exact records `new` was given, and `batch_serial` must round-trip.
+        use fgumi_bam_io::GroupKey;
+        let rec = DecodedRecord::from_raw_bytes(vec![7u8; 32], GroupKey::default());
+        let batch = DecodedRecordBatch::new(3, vec![rec]);
+        assert_eq!(batch.batch_serial(), 3);
+        assert_eq!(batch.records().len(), 1);
+        assert_eq!(batch.total_bytes(), batch.heap_size());
+        let records = batch.into_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].raw_bytes().len(), 32);
+    }
+
+    #[test]
+    fn bam_template_batch_accessors_and_into_parts_round_trip() {
+        // Mirror of the DecodedRecordBatch contract: private fields, read via
+        // accessors, consume via `into_parts` to move the templates out and
+        // re-wrap through `new` (which recomputes the byte cache).
+        let t1 = crate::template::Template::new(b"read1".to_vec());
+        let expected_bytes = t1.heap_size();
+        let batch = BamTemplateBatch::new(9, vec![t1]);
+        assert_eq!(batch.batch_serial(), 9);
+        assert_eq!(batch.templates().len(), 1);
+        assert_eq!(batch.total_bytes(), expected_bytes);
+        let (serial, templates) = batch.into_parts();
+        assert_eq!(serial, 9);
+        // Re-wrapping the moved-out templates recomputes an identical cache.
+        let rewrapped = BamTemplateBatch::new(serial, templates);
+        assert_eq!(rewrapped.total_bytes(), expected_bytes);
     }
 
     #[test]

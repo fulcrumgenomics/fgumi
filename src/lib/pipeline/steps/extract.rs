@@ -324,8 +324,8 @@ mod tests {
         let out = extract_batch(&read_structures, &opts, &emitted, &batch).unwrap();
 
         assert_eq!(out.ordinal(), 7, "output batch_serial must equal the input batch_serial");
-        assert_eq!(out.templates.len(), 3, "all templates converted");
-        let total_records: usize = out.templates.iter().map(Template::read_count).sum();
+        assert_eq!(out.templates().len(), 3, "all templates converted");
+        let total_records: usize = out.templates().iter().map(Template::read_count).sum();
         assert_eq!(total_records, 6, "3 paired templates yield 6 records");
         assert_eq!(
             emitted.load(Ordering::Relaxed),
