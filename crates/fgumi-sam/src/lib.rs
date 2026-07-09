@@ -251,6 +251,42 @@ pub fn is_query_grouped_unsorted(header: &Header) -> bool {
     }
 }
 
+/// Checks if a header is queryname sorted or query grouped, matching fgbio's
+/// `Bams.isQueryGrouped` (`header.getSortOrder == queryname || header.getGroupOrder == query`).
+///
+/// When this holds, all reads with the same query name are adjacent, so
+/// template-based commands (filter, clip) can group a template's mates by
+/// adjacency. This is *weaker* than [`is_template_coordinate_sorted`] /
+/// [`is_query_grouped_unsorted`]: a plain `SO:queryname` file (no `GO`) qualifies
+/// here but not there. Template-coordinate input (`SO:unsorted GO:query …`) also
+/// qualifies via its `GO:query`.
+///
+/// # Arguments
+///
+/// * `header` - SAM header to check
+///
+/// # Returns
+///
+/// `true` if the header advertises `SO:queryname` or `GO:query`, `false` otherwise.
+#[must_use]
+pub fn is_query_grouped(header: &Header) -> bool {
+    if let Some(hdr_map) = header.header() {
+        let other_fields = hdr_map.other_fields();
+
+        // SO:queryname (a full queryname sort is also query grouped).
+        let so_queryname =
+            other_fields.get(b"SO").is_some_and(|so| <_ as AsRef<[u8]>>::as_ref(so) == QUERY_NAME);
+
+        // GO:query (query grouped without a queryname sort — includes template-coordinate).
+        let go_query =
+            other_fields.get(b"GO").is_some_and(|go| <_ as AsRef<[u8]>>::as_ref(go) == b"query");
+
+        so_queryname || go_query
+    } else {
+        false
+    }
+}
+
 /// Checks if a BAM file is queryname sorted and logs a warning if not.
 ///
 /// This function validates that the input file has the correct sort order for
@@ -283,6 +319,33 @@ pub fn check_sort(header: &Header, path: &Path, name: &str) {
     }
 }
 
+/// Rebuilds `header` with a replaced `@HD` (header) map, preserving its read
+/// groups, reference sequences, programs, and comments.
+///
+/// Shared by the `header_as_*` sort-order stampers, which differ only in how
+/// they mutate the `@HD` map before rebuilding.
+fn rebuild_header_with_hd(
+    header: &Header,
+    header_map: noodles::sam::header::record::value::Map<
+        noodles::sam::header::record::value::map::Header,
+    >,
+) -> Header {
+    let mut builder = Header::builder();
+    for (name, rg) in header.read_groups() {
+        builder = builder.add_read_group(name.clone(), rg.clone());
+    }
+    for (name, reference) in header.reference_sequences() {
+        builder = builder.add_reference_sequence(name.clone(), reference.clone());
+    }
+    for (id, pg) in header.programs().as_ref() {
+        builder = builder.add_program(id.clone(), pg.clone());
+    }
+    for comment in header.comments() {
+        builder = builder.add_comment(comment.clone());
+    }
+    builder.set_header(header_map).build()
+}
+
 /// Returns a copy of `header` with its sort-order metadata cleared.
 ///
 /// The `SO` tag is set to `unsorted` and any `GO` (group order) or `SS`
@@ -305,20 +368,32 @@ pub fn header_as_unsorted(header: &Header) -> Header {
     other_fields.shift_remove(b"GO");
     other_fields.shift_remove(b"SS");
 
-    let mut builder = Header::builder();
-    for (name, rg) in header.read_groups() {
-        builder = builder.add_read_group(name.clone(), rg.clone());
-    }
-    for (name, reference) in header.reference_sequences() {
-        builder = builder.add_reference_sequence(name.clone(), reference.clone());
-    }
-    for (id, pg) in header.programs().as_ref() {
-        builder = builder.add_program(id.clone(), pg.clone());
-    }
-    for comment in header.comments() {
-        builder = builder.add_comment(comment.clone());
-    }
-    builder.set_header(header_map).build()
+    rebuild_header_with_hd(header, header_map)
+}
+
+/// Returns a copy of `header` advertising queryname sort order (`SO:queryname`),
+/// with any `GO`/`SS` tags removed.
+///
+/// This is the weakest order that satisfies [`is_query_grouped`], so it is the
+/// natural input order for template-based commands (filter, clip). Used by the
+/// test [`crate::builder::SamBuilder`] to stamp query-grouped fixtures.
+#[must_use]
+pub fn header_as_queryname(header: &Header) -> Header {
+    use bstr::BString;
+    use noodles::sam::header::record::value::Map;
+    use noodles::sam::header::record::value::map::header::tag::SORT_ORDER;
+
+    let mut header_map = header
+        .header()
+        .cloned()
+        .unwrap_or_else(Map::<noodles::sam::header::record::value::map::Header>::default);
+
+    let other_fields = header_map.other_fields_mut();
+    other_fields.insert(SORT_ORDER, BString::from(QUERY_NAME));
+    other_fields.shift_remove(b"GO");
+    other_fields.shift_remove(b"SS");
+
+    rebuild_header_with_hd(header, header_map)
 }
 
 /// Returns a copy of `header` advertising template-coordinate sort order.
@@ -344,20 +419,7 @@ pub fn header_as_template_coordinate(header: &Header) -> Header {
     other_fields.insert(GROUP_ORDER, BString::from("query"));
     other_fields.insert(SUBSORT_ORDER, BString::from("template-coordinate"));
 
-    let mut builder = Header::builder();
-    for (name, rg) in header.read_groups() {
-        builder = builder.add_read_group(name.clone(), rg.clone());
-    }
-    for (name, reference) in header.reference_sequences() {
-        builder = builder.add_reference_sequence(name.clone(), reference.clone());
-    }
-    for (id, pg) in header.programs().as_ref() {
-        builder = builder.add_program(id.clone(), pg.clone());
-    }
-    for comment in header.comments() {
-        builder = builder.add_comment(comment.clone());
-    }
-    builder.set_header(header_map).build()
+    rebuild_header_with_hd(header, header_map)
 }
 
 /// Reverses a `BufValue` (array or string).
@@ -531,6 +593,7 @@ pub fn buf_value_to_smallest_signed_int(value: &BufValue) -> Option<BufValue> {
 mod tests {
     use super::*;
     use noodles::sam::alignment::record_buf::data::field::value::Array;
+    use rstest::rstest;
 
     #[test]
     fn test_reverse_buf_value_int8_array() {
@@ -994,6 +1057,50 @@ mod tests {
         let header: Header =
             "@HD\tVN:1.6\tGO:query\n".parse().expect("failed to parse header with GO but no SO");
         assert!(is_query_grouped_unsorted(&header));
+    }
+
+    // =========================================================================
+    // Tests for is_query_grouped() — matches fgbio Bams.isQueryGrouped.
+    // The final column contrasts the weaker is_query_grouped_unsorted (which
+    // additionally requires SO:unsorted + GO:query) so the two are pinned
+    // side-by-side.
+    // =========================================================================
+
+    #[rstest]
+    // queryname sort qualifies for is_query_grouped but not the unsorted variant.
+    #[case::queryname("queryname", None, None, true, false)]
+    // GO:query alone (SO:unsorted) qualifies for both.
+    #[case::go_query("unsorted", Some("query"), None, true, true)]
+    // Template-coordinate qualifies for both via GO:query.
+    #[case::template_coordinate("unsorted", Some("query"), Some("template-coordinate"), true, true)]
+    // SO:coordinate GO:none — the FILT3-02/CLIP3-05 footgun input.
+    #[case::coordinate("coordinate", None, None, false, false)]
+    // Bare SO:unsorted with no GO is not query grouped (mates may scatter).
+    #[case::bare_unsorted("unsorted", None, None, false, false)]
+    fn test_is_query_grouped(
+        #[case] so: &str,
+        #[case] go: Option<&str>,
+        #[case] ss: Option<&str>,
+        #[case] expected_query_grouped: bool,
+        #[case] expected_query_grouped_unsorted: bool,
+    ) {
+        let header = create_template_coord_header(so, go, ss);
+        assert_eq!(is_query_grouped(&header), expected_query_grouped);
+        assert_eq!(is_query_grouped_unsorted(&header), expected_query_grouped_unsorted);
+    }
+
+    #[test]
+    fn test_header_as_queryname_stamps_so_and_strips_go_ss() {
+        // Start from a template-coordinate header (SO:unsorted GO:query SS:…) and
+        // confirm header_as_queryname rewrites SO:queryname and drops GO/SS.
+        let header =
+            create_template_coord_header("unsorted", Some("query"), Some("template-coordinate"));
+        let stamped = header_as_queryname(&header);
+        assert!(is_query_grouped(&stamped));
+        assert!(is_sorted(&stamped, QUERY_NAME));
+        let other = stamped.header().expect("has @HD").other_fields();
+        assert!(other.get(b"GO").is_none(), "GO must be stripped");
+        assert!(other.get(b"SS").is_none(), "SS must be stripped");
     }
 
     // =========================================================================

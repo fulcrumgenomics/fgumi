@@ -16,7 +16,9 @@ use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
-use crate::helpers::bam_generator::{create_minimal_header, create_test_reference};
+use crate::helpers::bam_generator::{
+    create_coordinate_sorted_header, create_minimal_header, create_test_reference,
+};
 
 /// Convert a raw BAM record to a `RecordBuf` using the given header.
 ///
@@ -31,24 +33,34 @@ fn to_record_buf(
         .expect("raw_record_to_record_buf should succeed in test")
 }
 
-/// Create a consensus BAM with records that have consensus tags.
-fn create_consensus_bam(path: &Path, records: Vec<RawRecord>) {
-    let header = create_minimal_header("chr1", 10000);
+/// Create a consensus BAM with the given header and consensus-tagged records.
+fn create_consensus_bam_with_header(
+    path: &Path,
+    header: &noodles::sam::Header,
+    records: Vec<RawRecord>,
+) {
     let mut writer =
         bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
-    writer.write_header(&header).expect("Failed to write header");
+    writer.write_header(header).expect("Failed to write header");
 
     for record in records {
         writer
-            .write_alignment_record(&header, &to_record_buf(&record, &header))
+            .write_alignment_record(header, &to_record_buf(&record, header))
             .expect("Failed to write record");
     }
     writer.try_finish().expect("Failed to finish BAM");
 }
 
-/// Write a small mapped-consensus BAM (two reads with CD/CE per-base tags that
-/// pass `filter`). Shared by `test_filter_command` and the stdin parity test.
-pub(crate) fn write_filter_consensus_bam(path: &Path) {
+/// Create a consensus BAM with a query-grouped (template-coordinate) header.
+fn create_consensus_bam(path: &Path, records: Vec<RawRecord>) {
+    let header = create_minimal_header("chr1", 10000);
+    create_consensus_bam_with_header(path, &header, records);
+}
+
+/// Two mapped-consensus records with CD/CE per-base tags that pass `filter`
+/// (`cons1` depth 10, `cons2` depth 5). Shared by the query-grouped writer and
+/// the coordinate-sorted guard test.
+fn filter_consensus_records() -> Vec<RawRecord> {
     let r1 = {
         let mut b = RawSamBuilder::new();
         b.read_name(b"cons1")
@@ -75,7 +87,13 @@ pub(crate) fn write_filter_consensus_bam(path: &Path) {
         b.add_array_u16(SamTag::CD_BASES, &[5; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
         b.build()
     };
-    create_consensus_bam(path, vec![r1, r2]);
+    vec![r1, r2]
+}
+
+/// Write a small mapped-consensus BAM (two reads with CD/CE per-base tags that
+/// pass `filter`). Shared by `test_filter_command` and the stdin parity test.
+pub(crate) fn write_filter_consensus_bam(path: &Path) {
+    create_consensus_bam(path, filter_consensus_records());
 }
 
 /// Test basic filter command with passing reads.
@@ -112,6 +130,43 @@ fn test_filter_command_basic() {
     let _header = reader.read_header().unwrap();
     let count = reader.records().count();
     assert_eq!(count, 2, "Both reads should be present in output");
+}
+
+/// FILT3-02: filter must reject coordinate-sorted (non-query-grouped) input,
+/// matching fgbio's `Bams.requireQueryGrouped`. On coordinate-sorted input a
+/// template's mates scatter, every read degrades to its own "template", and the
+/// both-primaries-pass logic silently corrupts the result — so we hard-fail.
+#[test]
+fn test_filter_rejects_coordinate_sorted_input() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+
+    // Same consensus records as write_filter_consensus_bam, but a coordinate header.
+    let header = create_coordinate_sorted_header("chr1", 10000);
+    create_consensus_bam_with_header(&input_bam, &header, filter_consensus_records());
+
+    let cmd = Filter::try_parse_from([
+        "filter",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--max-no-call-fraction",
+        "1.0",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse filter args");
+
+    let err = cmd.execute("fgumi filter").expect_err("must reject coordinate-sorted input");
+    let msg = err.to_string();
+    assert!(msg.contains("queryname sorted or query grouped"), "unexpected error message: {msg}");
 }
 
 /// Test filter command with reads that fail due to low per-base depth.
