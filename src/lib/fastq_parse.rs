@@ -266,11 +266,20 @@ fn find_newline(data: &[u8]) -> Option<usize> {
     data.iter().position(|&b| b == b'\n')
 }
 
-/// Strip mate-indicator suffix and CASAVA comment from a read name for comparison.
+/// Strip a mate-indicator suffix and CASAVA comment from a read name for comparison.
 ///
 /// First truncates at the first ASCII space (removing CASAVA-style comments like
-/// `read1 1:N:0:ATCACG`), then strips common pair suffixes: `/1`, `/2`, `.1`,
-/// `.2`, `_1`, `_2`, `:1`, `:2`.
+/// `read1 1:N:0:ATCACG`), then strips a trailing `/` followed by a single ASCII
+/// digit (`0`-`9`), e.g. `read/1` -> `read`.
+///
+/// This mirrors fgbio's `FastqSource` read-name canonicalization (see
+/// `com/fulcrumgenomics/fastq/FastqSource.scala`), which strips only a trailing
+/// `/` + single digit. It deliberately does **not** strip `.`/`_`/`:` separators
+/// or multi-digit runs (`read/12` is left intact): those separators are not a
+/// reliable mate indicator, and treating them as one makes genuinely mismatched
+/// pairs such as `read_1` (R1) vs `read_2` (R2) collapse to the same base name
+/// and be silently accepted as "in sync". Used to validate that reads at the same
+/// position across paired/interleaved FASTQ streams have matching names.
 #[must_use]
 pub fn strip_read_suffix(name: &[u8]) -> &[u8] {
     // Truncate at the first space (CASAVA comment separator).
@@ -279,14 +288,11 @@ pub fn strip_read_suffix(name: &[u8]) -> &[u8] {
         None => name,
     };
 
-    // Strip common pair suffixes: separator + digit where separator is
-    // one of '/', '.', '_', ':' and digit is '1' or '2'.
+    // Strip a trailing '/' + single ASCII digit (fgbio FastqSource parity).
     if name.len() >= 2 {
         let last = name[name.len() - 1];
         let sep = name[name.len() - 2];
-        if (last == b'1' || last == b'2')
-            && (sep == b'/' || sep == b'.' || sep == b'_' || sep == b':')
-        {
+        if sep == b'/' && last.is_ascii_digit() {
             return &name[..name.len() - 2];
         }
     }
@@ -295,6 +301,8 @@ pub fn strip_read_suffix(name: &[u8]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     #[test]
@@ -360,25 +368,50 @@ mod tests {
         assert_eq!(leftover, b"@read2\nTG");
     }
 
+    #[rstest]
+    // A trailing '/' + single digit is stripped (any digit, fgbio parity).
+    #[case::slash_one(b"read/1", b"read")]
+    #[case::slash_two(b"read/2", b"read")]
+    #[case::slash_three(b"read/3", b"read")]
+    #[case::slash_zero(b"read/0", b"read")]
+    // Non-'/' separators are preserved: they are not a reliable mate indicator,
+    // and stripping them collapses genuinely different reads (see the collision
+    // test below). This narrows the previous over-lenient behavior to match
+    // fgbio's FastqSource.
+    #[case::dot_one(b"read.1", b"read.1")]
+    #[case::dot_two(b"read.2", b"read.2")]
+    #[case::underscore_one(b"read_1", b"read_1")]
+    #[case::underscore_two(b"read_2", b"read_2")]
+    #[case::colon_one(b"read:1", b"read:1")]
+    #[case::colon_two(b"read:2", b"read:2")]
+    // Multi-digit runs are preserved (only a single trailing digit is stripped).
+    #[case::slash_multidigit(b"read/12", b"read/12")]
+    // Non-digit after '/' is preserved.
+    #[case::slash_nondigit(b"read/x", b"read/x")]
+    // A trailing space comment is stripped first, then the '/'+digit suffix.
+    #[case::comment_and_slash(b"read/1 1:N:0:ATCACG", b"read")]
+    // A comment is stripped even when there is no mate suffix.
+    #[case::comment_only(b"read 1:N:0:ATCACG", b"read")]
+    // No suffix at all.
+    #[case::no_suffix(b"read", b"read")]
+    #[case::single_char(b"a", b"a")]
+    #[case::empty(b"", b"")]
+    fn test_strip_read_suffix(#[case] input: &[u8], #[case] expected: &[u8]) {
+        assert_eq!(strip_read_suffix(input), expected);
+    }
+
     #[test]
-    fn test_strip_read_suffix() {
-        // Slash separators (original behavior).
-        assert_eq!(strip_read_suffix(b"read1/1"), b"read1");
-        assert_eq!(strip_read_suffix(b"read1/2"), b"read1");
-        // Dot, underscore, colon separators.
-        assert_eq!(strip_read_suffix(b"read1.1"), b"read1");
-        assert_eq!(strip_read_suffix(b"read1.2"), b"read1");
-        assert_eq!(strip_read_suffix(b"read1_1"), b"read1");
-        assert_eq!(strip_read_suffix(b"read1_2"), b"read1");
-        assert_eq!(strip_read_suffix(b"read1:1"), b"read1");
-        assert_eq!(strip_read_suffix(b"read1:2"), b"read1");
-        // CASAVA-style headers with space-separated comments.
-        assert_eq!(strip_read_suffix(b"read1/1 1:N:0:ATCACG"), b"read1");
-        // No pair suffix, but CASAVA comment is still stripped.
-        assert_eq!(strip_read_suffix(b"read1 1:N:0:ATCACG"), b"read1");
-        // No suffix.
-        assert_eq!(strip_read_suffix(b"read1"), b"read1");
-        assert_eq!(strip_read_suffix(b"a"), b"a");
-        assert_eq!(strip_read_suffix(b""), b"" as &[u8]);
+    fn test_strip_read_suffix_rejects_mismatched_underscore_pair() {
+        // Behavior tradeoff / regression guard: `read_1` (R1) and `read_2` (R2)
+        // are genuinely different reads. The previous over-lenient rule stripped
+        // the `_1`/`_2` suffix, collapsing both to `read` so a mismatched pair of
+        // streams was silently accepted as "in sync". The fgbio-parity rule now
+        // preserves them, so the two no longer collide and sync-validation
+        // correctly rejects the pair. This also means non-standard paired FASTQs
+        // that legitimately use `_1`/`_2` (or `.1`/`.2`/`:1`/`:2`) suffixes are
+        // now rejected — matching fgbio, which rejects them too.
+        assert_eq!(strip_read_suffix(b"read_1"), b"read_1");
+        assert_eq!(strip_read_suffix(b"read_2"), b"read_2");
+        assert_ne!(strip_read_suffix(b"read_1"), strip_read_suffix(b"read_2"));
     }
 }
