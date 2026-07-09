@@ -705,6 +705,40 @@ mod tests {
         assert!(qual <= 5, "Quality should be low due to conflicting evidence, got {qual}");
     }
 
+    /// SIMPLEX3-01: a Q0 observation of a *minority* base drives that base's
+    /// likelihood lane to `−∞`. The consensus base must stay the majority (`A`) and
+    /// the quality must NOT exceed the quality of the same pileup *without* the
+    /// contradicting read — a conflicting observation cannot increase confidence.
+    /// The pre-fix `ln_sum_exp_array` returned `−∞` for the normalizer whenever any
+    /// lane was `−∞`, driving the posterior to `+∞` and inflating the quality to the
+    /// pre-UMI cap (observed as fgumi Q45 vs fgbio Q44).
+    #[test]
+    fn test_neg_inf_lane_does_not_inflate_quality() {
+        let clean = {
+            let mut b = ConsensusBaseBuilder::new(45, 40);
+            b.add(b'A', 30);
+            b.add(b'A', 30);
+            b.call()
+        };
+        let with_q0_conflict = {
+            let mut b = ConsensusBaseBuilder::new(45, 40);
+            b.add(b'A', 30);
+            b.add(b'A', 30);
+            b.add(b'C', 0); // Q0 -> lane[C] = -inf
+            b.call()
+        };
+        assert_eq!(with_q0_conflict.0, b'A', "majority base must remain A");
+        // Pin the exact fgbio-compatible qualities: the clean 2×A pileup caps at Q44,
+        // and adding the Q0 (probability-0) `C` must leave it at Q44 — the pre-fix bug
+        // produced Q45 by driving the normalizer to +∞. Asserting the exact value (not
+        // just `conflict <= clean`) pins the fgbio baseline against future drift.
+        assert_eq!(clean.1, 44, "clean 2xA pileup must be fgbio's Q44");
+        assert_eq!(
+            with_q0_conflict.1, 44,
+            "a Q0 conflicting base must leave the quality at fgbio's Q44, not inflate it"
+        );
+    }
+
     // Port of fgbio test: "support calling multiple pileups from the same builder"
     #[test]
     fn test_reset_and_reuse_fgbio() {
