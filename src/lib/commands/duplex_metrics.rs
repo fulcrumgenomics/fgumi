@@ -178,7 +178,7 @@ impl Command for DuplexMetrics {
                     &mut umi_consensus_caller,
                     fraction_counts,
                     self,
-                );
+                )
             },
         )?;
 
@@ -295,11 +295,11 @@ impl DuplexMetrics {
         umi_consensus_caller: &mut SimpleUmiConsensusCaller,
         fraction_template_counts: &mut [usize],
         metrics: &DuplexMetrics,
-    ) {
+    ) -> Result<()> {
         use std::collections::HashMap;
 
         if group.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Pre-compute metadata once for the entire group
@@ -391,10 +391,11 @@ impl DuplexMetrics {
                         base_umi,
                         *a_count,
                         *b_count,
-                    );
+                    )?;
                 }
             }
         }
+        Ok(())
     }
 
     /// Generates a yield metric from a collector at a specific downsampling fraction.
@@ -563,7 +564,7 @@ impl DuplexMetrics {
         base_umi: &str,
         _a_count: usize,
         _b_count: usize,
-    ) {
+    ) -> Result<()> {
         // Collect the two UMI positions, each oriented to the F1R2 reading of the
         // top strand. umi1s holds the leading half, umi2s the trailing half.
         let mut umi1s = Vec::new();
@@ -579,13 +580,17 @@ impl DuplexMetrics {
 
             // Split the RX tag to get individual UMI parts. fgbio uses
             // `split("-", -1)`, which keeps a trailing empty field, and requires
-            // exactly two parts (`case Array(u1, u2)`); a UMI with a different number
-            // of `-`-separated parts is skipped here rather than panicking as fgbio
-            // does on a `MatchError`.
+            // exactly two parts (`case Array(u1, u2)`), throwing a `MatchError` on
+            // anything else. Reject a malformed duplex UMI here with a clear error
+            // rather than silently skipping it — matching fgbio's fail-fast and
+            // fgumi's own `group`/`dedup`, which bail on non-2-segment paired UMIs
+            // (DXM-03). Empty molecule-end halves (`-CCC`, `CCC-`) are still two
+            // parts and are kept (DXM-01).
             let parts: Vec<&str> = rx.split('-').collect();
             if parts.len() != 2 {
-                // Not a valid duplex UMI, skip
-                continue;
+                anyhow::bail!(
+                    "Duplex UMI did not contain 2 segments delimited by '-': '{rx}' (MI '{mi}')"
+                );
             }
 
             // Do NOT skip empty molecule-end halves (e.g. `-CCC` or `CCC-`). fgbio
@@ -651,6 +656,8 @@ impl DuplexMetrics {
 
             collector.record_duplex_umi(&duplex_umi, total_raw, error_count, true);
         }
+
+        Ok(())
     }
 }
 
@@ -900,6 +907,39 @@ mod tests {
         assert_eq!(duplex_metric.raw_observations, 6);
         // A and B strands are now in the same coordinate group (same DS family)
         assert_eq!(duplex_metric.unique_observations, 1);
+
+        Ok(())
+    }
+
+    /// DXM-03: a malformed duplex UMI whose `RX` is not exactly two `-`-delimited
+    /// segments (e.g. no dash) must be rejected with a clear error, matching fgbio
+    /// (`split("-", -1)` + `case Array(u1, u2)` throws a `MatchError`) and fgumi's own
+    /// `group`/`dedup`, which bail on non-2-segment paired UMIs — rather than being
+    /// silently skipped.
+    #[test]
+    fn test_malformed_duplex_umi_is_rejected() -> Result<()> {
+        let mut records = Vec::new();
+        // RX "AAATTT" has no '-' delimiter → not a valid duplex UMI.
+        let (r1, r2) = build_test_pair("q1", 0, 100, 200, "AAATTT", "1/A", true, false);
+        records.push(r1);
+        records.push(r2);
+
+        let input = create_test_bam(records)?;
+        let output_dir = TempDir::new()?;
+        let output = output_dir.path().join("output");
+
+        let cmd = DuplexMetrics {
+            input: input.path().to_path_buf(),
+            output,
+            min_ab_reads: 1,
+            min_ba_reads: 1,
+            duplex_umi_counts: false,
+            intervals: None,
+            description: None,
+        };
+
+        let err = cmd.execute("test").expect_err("malformed duplex UMI must be rejected");
+        assert!(err.to_string().contains("did not contain 2 segments"), "unexpected error: {err}");
 
         Ok(())
     }

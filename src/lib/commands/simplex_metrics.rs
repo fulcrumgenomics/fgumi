@@ -135,6 +135,9 @@ impl Command for SimplexMetrics {
                     &mut umi_consensus_caller,
                     fraction_counts,
                 );
+                // simplex UMIs are N-component by design, so there is no
+                // wrong-segment-count guard (cf. DXM-03 for duplex).
+                Ok(())
             },
         )?;
 
