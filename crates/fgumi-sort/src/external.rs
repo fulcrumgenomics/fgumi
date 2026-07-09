@@ -40,7 +40,7 @@ use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::create_raw_bam_reader;
-use fgumi_bam_io::{ChainedReader, TeeReader, is_stdin_path};
+use fgumi_bam_io::{ChainedReader, TeeReader, is_stdin_path, is_stdout_path};
 use fgumi_raw_bam::SamTag;
 use log::{debug, info};
 use noodles::sam::Header;
@@ -226,6 +226,199 @@ pub fn cb_hasher() -> ahash::RandomState {
         0xfede_dcba_0987_6543,
         0x0011_2233_4455_6677,
     )
+}
+
+/// Where a merge writes its output.
+///
+/// For a regular file, the merge writes to an exclusive, uniquely-named
+/// [`tempfile::NamedTempFile`] in the output's directory and atomically
+/// [`persist`](MergeOutputTarget::persist)s it into place on success. Because the
+/// temp is RAII-owned, *any* error path (a sort-order violation, a write failure,
+/// `finish` failing) drops it and removes the file — a rejected or failed merge
+/// never leaves a partial/corrupt output or a stray temp behind. The
+/// same-directory temp keeps the rename atomic (same filesystem), and exclusive
+/// creation avoids clobbering a concurrent run or a stale leftover.
+///
+/// Stdout can't be renamed, so it is written directly (a mid-merge failure there
+/// leaves whatever was already streamed, which is unavoidable for a pipe).
+///
+/// A `NamedTempFile` is created `0600`, so persisting it verbatim would silently
+/// make merged output owner-only. To preserve the semantics of the pre-atomic-temp
+/// direct write (`File::create`), the `Temp` variant carries the mode the final
+/// file must end up with (see [`target_file_mode`]) and applies it before the
+/// rename.
+enum MergeOutputTarget {
+    /// A regular-file output, staged in a same-directory temp. `dest` is the
+    /// resolved final path the temp is atomically renamed onto (a symlinked
+    /// output is followed to its real target, so the temp is staged next to —
+    /// and renamed onto — the linked file rather than the link itself). `mode`
+    /// is the Unix mode to stamp onto the temp before persisting (`None` on
+    /// non-Unix, where file modes are managed by the platform).
+    Temp {
+        temp: tempfile::NamedTempFile,
+        dest: PathBuf,
+        mode: Option<u32>,
+    },
+    Stdout(PathBuf),
+}
+
+impl MergeOutputTarget {
+    fn create(output: &Path) -> Result<Self> {
+        if is_stdout_path(output) {
+            return Ok(Self::Stdout(output.to_path_buf()));
+        }
+        // Follow a symlinked destination to the real file it points at, so the
+        // atomic rename updates the linked file in place (matching `File::create`,
+        // which follows symlinks) instead of replacing the symlink with a regular
+        // file. The temp is then staged next to — and renamed onto — that real
+        // target, keeping the rename same-directory (hence same-filesystem/atomic).
+        let dest = resolve_symlink_output(output)?;
+        // The temp+rename `persist` replaces `dest` with a regular file, so an
+        // existing FIFO, device, socket, or directory would be silently clobbered
+        // (a plain `File::create` would instead write *through* a FIFO/device).
+        // Only a missing path or an existing regular file can be staged this way;
+        // reject anything else with a clear error rather than corrupt it.
+        if let Ok(metadata) = std::fs::metadata(&dest) {
+            anyhow::ensure!(
+                metadata.file_type().is_file(),
+                "merge output must be a regular file or stdout: {}",
+                dest.display()
+            );
+        }
+        let dir = dest
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        let temp = tempfile::Builder::new()
+            .prefix(".fgumi-merge-")
+            .suffix(".tmp")
+            .tempfile_in(&dir)
+            .with_context(|| format!("failed to create a merge temp file in {}", dir.display()))?;
+        // Resolve the final mode now (before any BGZF writer threads spawn) so the
+        // umask read below is single-threaded and cannot race a concurrent create.
+        let mode = target_file_mode(&dest);
+        Ok(Self::Temp { temp, dest, mode })
+    }
+
+    /// The path the merged BAM is written to.
+    fn path(&self) -> &Path {
+        match self {
+            Self::Temp { temp, .. } => temp.path(),
+            Self::Stdout(path) => path,
+        }
+    }
+
+    /// Atomically moves the finished temp onto its resolved destination (a no-op
+    /// for stdout), first stamping the resolved mode so the output is not left
+    /// temp-private (`0600`). Consumes `self`, disarming the RAII auto-remove.
+    fn persist(self) -> Result<()> {
+        if let Self::Temp { temp, dest, mode } = self {
+            if let Some(mode) = mode {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    temp.as_file()
+                        .set_permissions(std::fs::Permissions::from_mode(mode))
+                        .with_context(|| {
+                            format!("failed to set mode on merge temp for {}", dest.display())
+                        })?;
+                }
+                #[cfg(not(unix))]
+                let _ = mode;
+            }
+            temp.persist(&dest).map_err(|e| e.error).with_context(|| {
+                format!("failed to finalize merged output at {}", dest.display())
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Resolves a symlinked output path to the real file the atomic rename must
+/// target, so a `latest.bam -> run.bam` symlink is followed and updated in
+/// place (matching `File::create`, which follows symlinks) instead of being
+/// replaced by a regular file. Non-symlink paths — including ones that do not
+/// exist yet — are returned unchanged. Bails on a symlink cycle (or an
+/// unreasonably long chain) rather than looping forever.
+fn resolve_symlink_output(output: &Path) -> Result<PathBuf> {
+    // POSIX ELOOP triggers around 40 levels; cap here at the same bound so a
+    // cyclic/pathological chain fails fast instead of spinning.
+    const MAX_LINKS: usize = 40;
+    let mut path = output.to_path_buf();
+    for _ in 0..MAX_LINKS {
+        // `is_symlink` returns false for a nonexistent path, so a brand-new
+        // output (or its final component) short-circuits here unchanged.
+        if !path.is_symlink() {
+            return Ok(path);
+        }
+        let target = std::fs::read_link(&path)
+            .with_context(|| format!("failed to read symlink output {}", path.display()))?;
+        // Relative link targets resolve against the link's own directory.
+        path = if target.is_absolute() {
+            target
+        } else {
+            path.parent().map_or_else(|| target.clone(), |parent| parent.join(&target))
+        };
+    }
+    anyhow::bail!("too many levels of symbolic links while resolving output {}", output.display())
+}
+
+/// The mode the merged output file must carry, matching the pre-atomic-temp write
+/// path (`File::create`): an existing destination keeps its current mode; a new
+/// file gets `0o666 & !umask`. Returns `None` on non-Unix, where the temp's
+/// platform-managed permissions are left as-is.
+#[cfg(unix)]
+// The `not(unix)` sibling returns `None`, so the `Option` is load-bearing there.
+#[allow(clippy::unnecessary_wraps, reason = "non-unix sibling returns None")]
+fn target_file_mode(output: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = match std::fs::metadata(output) {
+        // Overwriting: `File::create` never changes an existing file's mode, so keep it.
+        Ok(meta) => meta.permissions().mode() & 0o777,
+        // New file: `File::create` opens `0o666`, then the kernel masks it with umask.
+        Err(_) => 0o666 & !process_umask(),
+    };
+    Some(mode)
+}
+
+#[cfg(not(unix))]
+fn target_file_mode(_output: &Path) -> Option<u32> {
+    None
+}
+
+/// Reads the process file-creation mask (`umask`) without leaving it changed.
+///
+/// `umask(2)` can only *set* the mask (returning the previous value), so reading it
+/// means setting it to `0` and immediately restoring it. That read-modify-restore is
+/// not atomic: two concurrent probes can interleave so the second reads the first's
+/// transient `0` and restores `0`, permanently clearing the process mask (and mis-
+/// computing every subsequent new-file mode). A process-global lock serializes the
+/// probes so each is atomic with respect to every other — needed because
+/// `fgumi_lib` is a library and callers may run merges concurrently in one process.
+#[cfg(unix)]
+fn process_umask() -> u32 {
+    use std::sync::Mutex;
+
+    // Serializes the non-atomic umask read-restore against other concurrent probes.
+    static UMASK_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = UMASK_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // SAFETY: `umask` has no preconditions and cannot fail; it is `unsafe` only
+    // because it is a raw libc binding. We restore the original mask on the very
+    // next call under `UMASK_LOCK`, so the process-wide umask is unchanged on return.
+    #[allow(unsafe_code)]
+    let previous = unsafe {
+        let previous = libc::umask(0);
+        libc::umask(previous);
+        previous
+    };
+    // `libc::mode_t` is `u16` on macOS (the conversion widens) and `u32` on Linux
+    // (the conversion is a no-op), so `useless_conversion` fires only on Linux.
+    #[allow(
+        clippy::useless_conversion,
+        reason = "libc::mode_t is u16 on macOS and u32 on Linux; the From keeps this portable"
+    )]
+    u32::from(previous)
 }
 
 /// Maps read group ID -> library ordinal for O(1) comparison.
@@ -1778,29 +1971,39 @@ impl RawExternalSorter {
                 let lib_lookup = LibraryLookup::from_header(header);
                 let cell_tag = self.cell_tag;
                 let hasher = cb_hasher();
-                self.run_merge_loop(&mut readers, &output_header, output, |bam| {
+                self.run_merge_loop(&mut readers, inputs, &output_header, output, |bam| {
                     extract_template_key_inline(bam, &lib_lookup, cell_tag, &hasher)
                 })
             }
             SortOrder::Coordinate => {
                 #[allow(clippy::cast_possible_truncation)]
                 let nref = header.reference_sequences().len() as u32;
-                self.run_merge_loop(&mut readers, &output_header, output, |bam| RawCoordinateKey {
-                    sort_key: extract_coordinate_key_inline(bam, nref),
+                self.run_merge_loop(&mut readers, inputs, &output_header, output, |bam| {
+                    RawCoordinateKey { sort_key: extract_coordinate_key_inline(bam, nref) }
                 })
             }
             SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
                 let ctx = SortContext::from_header(header);
-                self.run_merge_loop(&mut readers, &output_header, output, |bam| {
+                self.run_merge_loop(&mut readers, inputs, &output_header, output, |bam| {
                     RawQuerynameLexKey::extract(bam, &ctx)
                 })
             }
             SortOrder::Queryname(QuerynameComparator::Natural) => {
                 let ctx = SortContext::from_header(header);
-                self.run_merge_loop(&mut readers, &output_header, output, |bam| {
+                self.run_merge_loop(&mut readers, inputs, &output_header, output, |bam| {
                     RawQuerynameKey::extract(bam, &ctx)
                 })
             }
+        }
+    }
+
+    /// The `fgumi sort --order` value for this sorter's order, for error hints.
+    fn sort_order_flag_value(&self) -> &'static str {
+        match self.sort_order {
+            SortOrder::Coordinate => "coordinate",
+            SortOrder::Queryname(QuerynameComparator::Lexicographic) => "queryname",
+            SortOrder::Queryname(QuerynameComparator::Natural) => "queryname::natural",
+            SortOrder::TemplateCoordinate => "template-coordinate",
         }
     }
 
@@ -1822,6 +2025,7 @@ impl RawExternalSorter {
     fn run_merge_loop<K: Ord>(
         &self,
         readers: &mut [RawReadAheadReader],
+        inputs: &[PathBuf],
         output_header: &Header,
         output: &Path,
         extract_key: impl Fn(&[u8]) -> K,
@@ -1844,22 +2048,30 @@ impl RawExternalSorter {
             }
         }
 
+        // Write to an exclusive temp and atomically persist on success, so a
+        // mid-merge sort-order violation (below) — or any other error — never
+        // leaves a partial/corrupt output or a stray temp behind. Chosen before
+        // the empty-input branch so header-only outputs are finalized through the
+        // same atomic path as non-empty merges.
+        let out_target = MergeOutputTarget::create(output)?;
+
         if initial_keys.is_empty() {
             debug!("Merge complete: 0 records merged");
             let writer = fgumi_bam_io::create_raw_bam_writer(
-                output,
+                out_target.path(),
                 output_header,
                 self.threads,
                 self.output_compression,
             )?;
             writer.finish()?;
+            out_target.persist()?;
             return Ok(0);
         }
 
         let mut tree = LoserTree::new(initial_keys);
 
         let mut writer = fgumi_bam_io::create_raw_bam_writer(
-            output,
+            out_target.path(),
             output_header,
             self.threads,
             self.output_compression,
@@ -1867,6 +2079,13 @@ impl RawExternalSorter {
 
         let mut records_merged = 0u64;
         let merge_progress = ProgressTracker::new("Merged records").with_interval(1_000_000);
+        // Set when an input is found not to be monotonic in the merge order:
+        // (source index into `inputs`, 1-based record number within that input).
+        let mut violation: Option<(usize, u64)> = None;
+        // Per-source count of records pulled so far (each source starts with its
+        // first record already loaded), used to report the offending record's
+        // 1-based position within its input.
+        let mut pulled_per_source = vec![1u64; records.len()];
 
         while tree.winner_is_active() {
             let winner = tree.winner();
@@ -1881,13 +2100,44 @@ impl RawExternalSorter {
                 buf.clear();
                 buf.extend_from_slice(raw_record.as_ref());
                 let new_key = extract_key(buf);
+                // MERGE3-01 streaming verify: the merge assumes each input is
+                // already sorted in the merge order. `tree.winner_key()` still
+                // holds the key of the record we just emitted from this source;
+                // if the next record sorts before it, the input isn't monotonic
+                // and the k-way merge would silently corrupt the output.
+                if new_key < *tree.winner_key() {
+                    violation = Some((reader_idx, pulled_per_source[winner] + 1));
+                    break;
+                }
+                pulled_per_source[winner] += 1;
                 tree.replace_winner(new_key);
             } else {
                 tree.remove_winner();
             }
         }
 
+        if let Some((reader_idx, record_no)) = violation {
+            // Close the writer's handle to the partial output. `out_target` is
+            // still owned here, so returning the error below drops it and removes
+            // the temp — nothing partial is left behind. Not finalizing a doomed
+            // output also avoids `finish` masking the real (sort-order) error.
+            drop(writer);
+            let source = inputs[reader_idx].display();
+            let order = self.sort_order_flag_value();
+            // The path is named for identification only; the remediation commands
+            // use a `<input>` placeholder so a path with shell metacharacters
+            // can't turn the copy-pasteable hint into something unexpected.
+            anyhow::bail!(
+                "Input '{source}' is not sorted in {order} order: record {record_no} sorts \
+                 before a preceding record from the same input, so the k-way merge would \
+                 corrupt the output. Sort that input in {order} order first \
+                 (`fgumi sort -i <input> -o sorted.bam --order {order}`), or locate the \
+                 violation with `fgumi sort -i <input> --verify --order {order}`."
+            );
+        }
+
         writer.finish()?;
+        out_target.persist()?;
         merge_progress.log_final();
 
         Ok(records_merged)
@@ -3601,6 +3851,110 @@ mod tests {
     use fgumi_sam::{PairBuilder, SamBuilder};
     use noodles::sam::header::record::value::Map;
     use noodles::sam::header::record::value::map::ReadGroup;
+
+    // ========================================================================
+    // process_umask concurrency
+    // ========================================================================
+
+    /// `process_umask` reads the mask via a non-atomic set-0-then-restore. Two
+    /// interleaved probes can leave the process mask permanently `0` (and every
+    /// probe observe the wrong value); `UMASK_LOCK` must serialize them. Read the
+    /// mask once, hammer it from many threads, and assert every probe — and the
+    /// final mask — matches the initial value. Without the lock this corrupts to
+    /// `0` reliably under contention. (Uses only `process_umask` so it introduces
+    /// no new `unsafe` site.)
+    #[cfg(unix)]
+    #[test]
+    fn test_process_umask_is_concurrency_safe() {
+        use std::thread;
+
+        let expected = process_umask();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                thread::spawn(move || {
+                    for _ in 0..2000 {
+                        assert_eq!(
+                            process_umask(),
+                            expected,
+                            "a concurrent probe observed a corrupted umask"
+                        );
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("umask probe thread panicked");
+        }
+        assert_eq!(
+            process_umask(),
+            expected,
+            "concurrent probes must leave the process umask unchanged"
+        );
+    }
+
+    // ========================================================================
+    // resolve_symlink_output / target_file_mode
+    // ========================================================================
+
+    /// A non-symlink path — even one that does not exist yet — is returned
+    /// unchanged, so a brand-new merge output is not perturbed by the resolver.
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_symlink_output_passthrough_for_nonexistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("merged.bam");
+        assert_eq!(resolve_symlink_output(&out).unwrap(), out);
+    }
+
+    /// A relative symlink target resolves against the link's own directory, so a
+    /// `latest.bam -> run.bam` link is followed to the sibling it points at.
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_symlink_output_follows_relative_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("run.bam");
+        std::fs::write(&target, b"x").unwrap();
+        let link = dir.path().join("latest.bam");
+        // Relative target ("run.bam") must resolve against the link's directory.
+        std::os::unix::fs::symlink("run.bam", &link).unwrap();
+        assert_eq!(resolve_symlink_output(&link).unwrap(), target);
+    }
+
+    /// A cyclic symlink chain bails at `MAX_LINKS` with an error instead of
+    /// looping forever.
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_symlink_output_detects_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        assert!(resolve_symlink_output(&a).is_err());
+    }
+
+    /// Overwriting an existing destination keeps its current mode (matching
+    /// `File::create`, which never re-chmods an existing file).
+    #[cfg(unix)]
+    #[test]
+    fn test_target_file_mode_keeps_existing_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.bam");
+        std::fs::write(&path, b"x").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert_eq!(target_file_mode(&path), Some(0o640));
+    }
+
+    /// A new destination gets `0o666 & !umask` — the mode `File::create` would
+    /// have produced — not the temp file's private `0600`.
+    #[cfg(unix)]
+    #[test]
+    fn test_target_file_mode_new_file_uses_umask() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.bam");
+        assert_eq!(target_file_mode(&path), Some(0o666 & !process_umask()));
+    }
 
     // ========================================================================
     // LibraryLookup tests

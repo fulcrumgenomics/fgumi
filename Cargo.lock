@@ -827,6 +827,7 @@ dependencies = [
  "fgumi-raw-bam",
  "fgumi-sam",
  "fs4",
+ "libc",
  "libdeflater",
  "libmimalloc-sys",
  "log",
