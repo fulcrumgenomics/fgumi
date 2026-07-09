@@ -196,14 +196,22 @@ impl SortOrder {
         }
     }
 
-    /// Get the SAM header sub-sort tag value.
+    /// Get the SAM header sub-sort (`SS`) tag value.
+    ///
+    /// The `SS` tag is written as `<sort-order>:<sub-sort>`, matching fgbio
+    /// (`SamOrder.applyTo`: `sortOrder.name() + ":" + ss`) and samtools. The
+    /// `<sort-order>` prefix is the value written to the `SO` tag for this
+    /// order (`queryname` for queryname sub-sorts; `unsorted` for
+    /// template-coordinate). Without the prefix, fgbio's `SamOrder.apply`
+    /// (which strips everything up to the first `:`) fails to re-recognize the
+    /// header.
     #[must_use]
     pub fn header_ss_tag(&self) -> Option<&'static str> {
         match self {
             Self::Coordinate => None,
-            Self::Queryname(QuerynameComparator::Lexicographic) => Some("lexicographic"),
-            Self::Queryname(QuerynameComparator::Natural) => Some("natural"),
-            Self::TemplateCoordinate => Some("template-coordinate"),
+            Self::Queryname(QuerynameComparator::Lexicographic) => Some("queryname:lexicographic"),
+            Self::Queryname(QuerynameComparator::Natural) => Some("queryname:natural"),
+            Self::TemplateCoordinate => Some("unsorted:template-coordinate"),
         }
     }
 }
@@ -1489,16 +1497,20 @@ mod tests {
 
     #[test]
     fn test_sort_order_header_ss_tag() {
+        // The SS tag carries the `<sort-order>:<sub-sort>` form (fgbio/samtools).
         assert_eq!(SortOrder::Coordinate.header_ss_tag(), None);
         assert_eq!(
             SortOrder::Queryname(QuerynameComparator::Lexicographic).header_ss_tag(),
-            Some("lexicographic")
+            Some("queryname:lexicographic")
         );
         assert_eq!(
             SortOrder::Queryname(QuerynameComparator::Natural).header_ss_tag(),
-            Some("natural")
+            Some("queryname:natural")
         );
-        assert_eq!(SortOrder::TemplateCoordinate.header_ss_tag(), Some("template-coordinate"));
+        assert_eq!(
+            SortOrder::TemplateCoordinate.header_ss_tag(),
+            Some("unsorted:template-coordinate")
+        );
     }
 
     #[test]

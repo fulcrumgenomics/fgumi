@@ -1004,14 +1004,14 @@ mod tests {
     fn test_queryname_lex_header_has_subsort() {
         let order = SortOrder::from(SortOrderArg::Queryname);
         assert_eq!(order.header_so_tag(), "queryname");
-        assert_eq!(order.header_ss_tag(), Some("lexicographic"));
+        assert_eq!(order.header_ss_tag(), Some("queryname:lexicographic"));
     }
 
     #[test]
     fn test_queryname_natural_header_has_subsort() {
         let order = SortOrder::from(SortOrderArg::QuerynameNatural);
         assert_eq!(order.header_so_tag(), "queryname");
-        assert_eq!(order.header_ss_tag(), Some("natural"));
+        assert_eq!(order.header_ss_tag(), Some("queryname:natural"));
     }
 
     #[test]
@@ -1025,7 +1025,7 @@ mod tests {
     fn test_template_coordinate_header_subsort() {
         let order = SortOrder::from(SortOrderArg::TemplateCoordinate);
         assert_eq!(order.header_so_tag(), "unsorted");
-        assert_eq!(order.header_ss_tag(), Some("template-coordinate"));
+        assert_eq!(order.header_ss_tag(), Some("unsorted:template-coordinate"));
     }
 
     #[test]
