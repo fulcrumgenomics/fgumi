@@ -1165,16 +1165,20 @@ mod tests {
 
         let paths = TestPaths::new()?;
         let output_multi_path = paths.dir.path().join("output_multi.bam");
+        let stats_single_path = paths.dir.path().join("stats_single.txt");
+        let stats_multi_path = paths.dir.path().join("stats_multi.txt");
         builder.write(&paths.input)?;
 
         // Run with single thread
-        let cmd_single = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
+        let mut cmd_single = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
+        cmd_single.stats_opts.stats = Some(stats_single_path.clone());
         cmd_single.execute("test")?;
 
         // Run with multiple threads
         let mut cmd_multi =
             create_simplex_with_paths(paths.input.clone(), output_multi_path.clone());
         cmd_multi.threading = ThreadingOptions::new(4);
+        cmd_multi.stats_opts.stats = Some(stats_multi_path.clone());
         cmd_multi.execute("test")?;
 
         // Verify both outputs have same number of records
@@ -1187,6 +1191,13 @@ mod tests {
             "Single and multi-threaded should produce same number of records"
         );
         assert_eq!(records_single.len(), 100, "Should have 100 consensus reads");
+
+        // The metrics output must not depend on thread count.
+        assert_eq!(
+            std::fs::read_to_string(&stats_single_path)?,
+            std::fs::read_to_string(&stats_multi_path)?,
+            "single-threaded and multi-threaded simplex must write identical stats"
+        );
 
         Ok(())
     }

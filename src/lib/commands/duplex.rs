@@ -530,11 +530,15 @@ impl Command for Duplex {
         metrics.consensus_reads = consensus_count as u64;
         log_consensus_summary(&metrics);
 
-        // Write statistics file if requested
+        // Write statistics file if requested. Emit the same fgbio KV format as
+        // the threaded path (execute_threads_mode), seeding the `usedByDuplex`
+        // rejection rows — the metrics output must not depend on thread count.
         if let Some(stats_path) = &self.stats_opts.stats {
-            DelimFile::default().write_tsv(stats_path, [metrics]).map_err(|e| {
-                anyhow::anyhow!("Failed to write statistics to {}: {}", stats_path.display(), e)
-            })?;
+            let kv_metrics =
+                metrics.to_kv_metrics_seeded(&fgumi_metrics::consensus::DUPLEX_SEEDED_REJECTIONS);
+            DelimFile::default()
+                .write_tsv(stats_path, kv_metrics)
+                .with_context(|| format!("Failed to write statistics: {}", stats_path.display()))?;
             info!("Statistics written to: {}", stats_path.display());
         }
 
@@ -816,7 +820,13 @@ impl Duplex {
         info!("Total MI groups processed: {total_groups}");
         info!("Total consensus reads written by pipeline: {consensus_reads_written}");
 
-        let metrics = merged_stats.to_metrics();
+        // Report the actual number of consensus reads written by the pipeline
+        // (R1+R2 per molecule), matching the single-threaded path which sets
+        // `metrics.consensus_reads` from its streaming write count. The caller
+        // stat counts consensus events, not emitted reads, so the metric must
+        // not depend on thread count.
+        let mut metrics = merged_stats.to_metrics();
+        metrics.consensus_reads = consensus_reads_written;
         let consensus_count = metrics.consensus_reads;
         log_consensus_summary(&metrics);
 
@@ -1574,8 +1584,10 @@ mod tests {
         // Test with 1 thread
         let input1 = create_test_bam(records.clone())?;
         let paths = TestPaths::new()?;
+        let stats1_path = paths.output.with_extension("stats.txt");
 
-        let cmd1 = create_duplex_with_paths(input1.path().to_path_buf(), paths.output.clone());
+        let mut cmd1 = create_duplex_with_paths(input1.path().to_path_buf(), paths.output.clone());
+        cmd1.stats_opts.stats = Some(stats1_path.clone());
 
         cmd1.execute("test")?;
         let output1_records = read_bam_records(&paths.output)?;
@@ -1583,12 +1595,28 @@ mod tests {
         // Test with 4 threads
         let input2 = create_test_bam(records)?;
         let output2_path = paths.output_n(2);
+        let stats2_path = output2_path.with_extension("stats.txt");
 
         let mut cmd2 = create_duplex_with_paths(input2.path().to_path_buf(), output2_path.clone());
         cmd2.threading = ThreadingOptions::new(4);
+        cmd2.stats_opts.stats = Some(stats2_path.clone());
 
         cmd2.execute("test")?;
         let output2_records = read_bam_records(&output2_path)?;
+
+        // The metrics output must not depend on thread count: the single- and
+        // multi-threaded paths must write byte-identical stats (same fgbio KV
+        // format, same seeded rejection rows, same counts).
+        let stats1 = std::fs::read_to_string(&stats1_path)?;
+        let stats2 = std::fs::read_to_string(&stats2_path)?;
+        assert_eq!(
+            stats1, stats2,
+            "single-threaded and multi-threaded duplex must write identical stats"
+        );
+        assert!(
+            stats1.contains("raw_reads_rejected_for_non_paired_reads"),
+            "duplex stats must always emit the seeded non_paired_reads row (KV format)"
+        );
 
         // Should produce the same number of consensus reads
         assert_eq!(

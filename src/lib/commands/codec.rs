@@ -1306,19 +1306,30 @@ mod tests {
 
         // Run single-threaded
         let out_st = dir.path().join("out_st.bam");
+        let stats_st = dir.path().join("stats_st.txt");
         let mut cmd_st = create_codec_with_paths(input_path.clone(), out_st.clone());
         cmd_st.outer_bases_length = 0;
         cmd_st.threading = ThreadingOptions::none();
+        cmd_st.stats_opts.stats = Some(stats_st.clone());
         cmd_st.execute("test")?;
         let records_st = read_bam_records(&out_st)?;
 
         // Run multi-threaded
         let out_mt = dir.path().join("out_mt.bam");
+        let stats_mt = dir.path().join("stats_mt.txt");
         let mut cmd_mt = create_codec_with_paths(input_path, out_mt.clone());
         cmd_mt.outer_bases_length = 0;
         cmd_mt.threading = ThreadingOptions::new(2);
+        cmd_mt.stats_opts.stats = Some(stats_mt.clone());
         cmd_mt.execute("test")?;
         let records_mt = read_bam_records(&out_mt)?;
+
+        // The metrics output must not depend on thread count.
+        assert_eq!(
+            std::fs::read_to_string(&stats_st)?,
+            std::fs::read_to_string(&stats_mt)?,
+            "single-threaded and multi-threaded codec must write identical stats"
+        );
 
         assert_eq!(
             records_st.len(),
