@@ -71,6 +71,12 @@ The molecular IDs produced have structure: `{base}/{A|B}`. For example, UMI pair
 
 The `edit`, `adjacency`, and `paired` strategies use the `--edits` parameter to control matching of non-identical UMIs.
 
+> **Note:** `fgumi group` and fgbio's `GroupReadsByUmi` produce identical groupings but generally
+> assign different integer `MI` values to the same molecules. This is a known, expected
+> divergence — the `MI` integer is only a label for an equivalence class. See
+> [Migration from fgbio → MI Tag Values](migration-from-fgbio.md#mi-tag-values) for why, and use
+> `fgumi compare bams --mode grouping` (not a raw `MI` diff) to check equivalence.
+
 ## Cell Barcode Support
 
 When processing data with cell barcodes (e.g. single-cell sequencing), reads at the same genomic

@@ -85,6 +85,39 @@ fgumi supports the same four UMI assignment strategies as fgbio:
 
 The algorithms are equivalent but fgumi's implementations are optimized for throughput.
 
+### MI Tag Values
+
+`fgumi group` and fgbio's `GroupReadsByUmi` produce **identical UMI groupings** — the same reads
+are assigned to the same molecule — but they generally write **different integer `MI` values** for
+those molecules. This is a known, expected divergence: the grouping is what is biologically
+meaningful, while the `MI` integer is only an arbitrary label for an equivalence class. Verify
+equivalence with `fgumi compare bams --mode grouping`, which compares the partition of reads into
+families rather than the raw integers; it reports 0 mismatches between the two tools' outputs (run
+on the same source reads) even though the integers differ.
+
+The two tools agree on the overall numbering scheme:
+
+- Both emit **consecutive** integer labels `0..N-1` for the `N` distinct molecules (fgumi since
+  [issue #269](https://github.com/fulcrumgenomics/fgumi/issues/269); earlier fgumi versions left
+  gaps).
+- Both number **position groups in template-coordinate order** — the molecule(s) at the earliest
+  coordinate cluster get the lowest integers.
+- For `--strategy paired` (duplex), both use the `{base}/A` · `{base}/B` form, sharing the numeric
+  `{base}` between a molecule's two strands and assigning `/A` to the top strand. See
+  [Tracking Reads](tracking-reads.md).
+
+They diverge only on *which* integer a molecule within a single coordinate cluster receives,
+because the within-cluster numbering order differs (fgumi uses deterministic sorted orders; fgbio
+uses Scala hash-bucket iteration order, which can also shift across Scala/JVM versions). Both are
+deterministic per tool version — fgumi even under `--threads N > 1`. See
+`docs/design/deterministic-mi-numbering.md` for the per-strategy specifics.
+
+Because downstream consensus callers derive read names from the input `MI` base (e.g.
+`<prefix>:<mi_base>`), comparing two pipelines' consensus BAMs by read name or raw `MI` will
+mismatch even when the molecules are identical — verify equivalence at the **grouped** stage with
+`fgumi compare bams --mode grouping`, which preserves the input read names, rather than at the
+consensus stage.
+
 ### Group Metrics
 
 fgumi's `group` command now produces a third metrics file beyond family sizes and grouping
