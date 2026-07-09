@@ -573,18 +573,20 @@ impl DuplexMetrics {
                 continue;
             }
 
-            // Split the RX tag to get individual UMI parts
+            // Split the RX tag to get individual UMI parts. fgbio uses
+            // `split("-", -1)`, which keeps a trailing empty field, and requires
+            // exactly two parts (`case Array(u1, u2)`); a UMI with a different number
+            // of `-`-separated parts is skipped here rather than panicking as fgbio
+            // does on a `MatchError`.
             let parts: Vec<&str> = rx.split('-').collect();
             if parts.len() != 2 {
                 // Not a valid duplex UMI, skip
                 continue;
             }
 
-            // Check that both components are non-empty
-            if parts[0].is_empty() || parts[1].is_empty() {
-                // Empty component, skip
-                continue;
-            }
+            // Do NOT skip empty molecule-end halves (e.g. `-CCC` or `CCC-`). fgbio
+            // counts them, recording the empty half as an empty-string UMI, so
+            // single-index / single-strand designs are not undercounted (DXM-01).
 
             // Add UMI parts based on strand. The String allocations here are
             // bounded by the consensus caller's `&[String]` signature; only the
@@ -2016,40 +2018,51 @@ mod tests {
         Ok(())
     }
 
+    /// DXM-01 / PIN-01: fgbio's `CollectDuplexSeqMetrics` counts UMIs even when one
+    /// half of a duplex UMI (a "molecule end") is an empty sequence — e.g. `CCC-` or
+    /// `-GGG`, as produced by single-index / single-strand designs. fgbio splits the
+    /// `RX` tag with `split("-", -1)` (which keeps the trailing empty field) and
+    /// records BOTH halves; the empty half is recorded as an empty-string (`""`) UMI
+    /// (`CollectDuplexSeqMetrics.scala:407-408`,
+    /// `CollectDuplexSeqMetricsTest.scala:362` — "count UMIs even if one of the UMIs
+    /// on a 'molecule end' is an empty sequence").
+    ///
+    /// fgumi previously skipped the *entire* read pair whenever either half was empty,
+    /// dropping even the present half and undercounting empty-half designs. This test
+    /// pins the corrected behavior: the present halves (`CCC`, `GGG`) are counted, and
+    /// the empty halves are recorded as an empty-string UMI.
+    ///
+    /// (A dash-less `RX` such as `GGG` is out of scope here: fgbio throws a
+    /// `MatchError` on it, so it is excluded rather than asserting fgumi's lenient skip
+    /// against fgbio's hard failure.)
     #[test]
     fn test_handle_empty_umi_components() -> Result<()> {
         let mut records = Vec::new();
 
-        // Family 1: Valid duplex UMI "AAA-TTT"
+        // Family 1: normal duplex UMI "AAA-TTT" (both halves present), /A and /B strands.
         let (r1, r2) = build_test_pair("q1", 0, 100, 200, "AAA-TTT", "1/A", true, false);
         records.push(r1);
         records.push(r2);
-        // Swap positions for /B
+        // Swap positions/strands for /B (same double-stranded molecule).
         let (r1, r2) = build_test_pair("q2", 0, 200, 100, "TTT-AAA", "1/B", false, true);
         records.push(r1);
         records.push(r2);
 
-        // Family 2: Empty first component "-CCC" (should be skipped gracefully)
+        // Family 2: empty FIRST half "-CCC" (single-strand). fgbio records "" and "CCC".
         let (r1, r2) = build_test_pair("q3", 0, 200, 300, "-CCC", "2/A", true, false);
         records.push(r1);
         records.push(r2);
 
-        // Family 3: Empty second component "AAA-" (should be skipped gracefully)
+        // Family 3: empty SECOND half "AAA-" (single-strand). fgbio records "AAA" and "".
         let (r1, r2) = build_test_pair("q4", 0, 300, 400, "AAA-", "3/A", true, false);
         records.push(r1);
         records.push(r2);
 
-        // Family 4: Single component "GGG" without dash (should be skipped)
-        let (r1, r2) = build_test_pair("q5", 0, 400, 500, "GGG", "4/A", true, false);
+        // Family 4: another normal duplex "CCC-GGG", /A and /B strands.
+        let (r1, r2) = build_test_pair("q6", 0, 500, 600, "CCC-GGG", "4/A", true, false);
         records.push(r1);
         records.push(r2);
-
-        // Family 5: Another valid duplex "CCC-GGG"
-        let (r1, r2) = build_test_pair("q6", 0, 500, 600, "CCC-GGG", "5/A", true, false);
-        records.push(r1);
-        records.push(r2);
-        // Swap positions for /B
-        let (r1, r2) = build_test_pair("q7", 0, 600, 500, "GGG-CCC", "5/B", false, true);
+        let (r1, r2) = build_test_pair("q7", 0, 600, 500, "GGG-CCC", "4/B", false, true);
         records.push(r1);
         records.push(r2);
 
@@ -2067,42 +2080,57 @@ mod tests {
             description: None,
         };
 
-        // Should complete without panicking or errors
         cmd.execute("test")?;
 
-        // Read UMI metrics
+        // Read UMI metrics.
         let umi_path = format!("{}.umi_counts.txt", output.display());
         let umi_metrics: Vec<UmiMetric> = DelimFile::default().read_tsv(&umi_path)?;
+        let by_umi: std::collections::HashMap<&str, &UmiMetric> =
+            umi_metrics.iter().map(|m| (m.umi.as_str(), m)).collect();
 
-        // Should only have UMIs from valid duplex families (1 and 5)
-        // Valid UMIs: AAA, TTT, CCC, GGG
-        assert_eq!(umi_metrics.len(), 4, "Should have 4 valid UMIs");
-
-        // Verify each UMI is from valid families
-        for metric in &umi_metrics {
-            assert!(
-                ["AAA", "TTT", "CCC", "GGG"].contains(&metric.umi.as_str()),
-                "Unexpected UMI: {}",
-                metric.umi
-            );
+        // fgbio records both halves of every family, so the empty-half families
+        // contribute their present halves ("CCC", "GGG") plus an empty-string UMI.
+        // Expected UMIs: "" (from -CCC and AAA-), AAA, TTT, CCC, GGG.
+        assert_eq!(
+            umi_metrics.len(),
+            5,
+            "expected 5 UMIs (present halves of empty-half families + the empty UMI): {:?}",
+            umi_metrics.iter().map(|m| m.umi.as_str()).collect::<Vec<_>>()
+        );
+        for umi in ["", "AAA", "TTT", "CCC", "GGG"] {
+            assert!(by_umi.contains_key(umi), "missing UMI {umi:?}");
         }
 
-        // Check that empty-component families were counted in family metrics but not in UMI metrics
+        // The present halves of the empty-half families must be counted (the DXM-01 fix).
+        // CCC appears in family 2 (-CCC) and family 4 (CCC-GGG); GGG only in family 4.
+        assert_eq!(
+            by_umi["CCC"].unique_observations, 2,
+            "CCC (present half of -CCC, plus CCC-GGG) must be counted"
+        );
+        assert_eq!(by_umi["GGG"].unique_observations, 1);
+
+        // The empty molecule-end halves are counted as an empty-string UMI, once per
+        // empty half (-CCC first half + AAA- second half = 2 unique observations).
+        assert_eq!(
+            by_umi[""].unique_observations, 2,
+            "empty molecule-end halves are counted as an empty UMI"
+        );
+
+        // The normal duplex families are unaffected. AAA appears in family 1 (AAA-TTT)
+        // and family 3 (AAA-); TTT only in family 1.
+        assert_eq!(by_umi["AAA"].unique_observations, 2);
+        assert_eq!(by_umi["TTT"].unique_observations, 1);
+
+        // Family accounting: 4 coordinate-start (CS) families, one per coordinate group.
         let family_path = format!("{}.family_sizes.txt", output.display());
         let family_metrics: Vec<FamilySizeMetric> = DelimFile::default().read_tsv(&family_path)?;
-
-        // Should have families for all coordinate groups including those with invalid UMIs
-        // Families at: 100-200 (valid), 200-300 (invalid), 300-400 (invalid), 400-500 (invalid), 500-600 (valid)
-        // Total CS families = 5 (one at each coordinate)
         let cs_families: usize = family_metrics.iter().map(|m| m.cs_count).sum();
-        assert_eq!(cs_families, 5, "Should have 5 CS families (including those with invalid UMIs)");
+        assert_eq!(cs_families, 4, "Should have 4 CS families (one per coordinate)");
 
-        // But only valid duplexes should be counted as having UMI observations
+        // Only families 1 and 4 are duplexes (each has both /A and /B single-strand families).
         let duplex_path = format!("{}.duplex_family_sizes.txt", output.display());
         let duplex_metrics: Vec<DuplexFamilySizeMetric> =
             DelimFile::default().read_tsv(&duplex_path)?;
-
-        // Should have 2 duplex families (1 and 5)
         let duplex_count: usize = duplex_metrics
             .iter()
             .filter(|m| m.ab_size >= 1 && m.ba_size >= 1)
