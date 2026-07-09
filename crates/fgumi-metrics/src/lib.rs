@@ -88,7 +88,7 @@ pub trait ProcessingMetrics {
 // Re-export commonly used types
 #[cfg(feature = "clip")]
 pub use clip::{ClipCounts, ClippingMetrics, ClippingMetricsCollection, ReadType};
-pub use consensus::{ConsensusKvMetric, ConsensusMetrics};
+pub use consensus::{ConsensusCallerKind, ConsensusKvMetric, ConsensusMetrics};
 pub use correct::UmiCorrectionMetrics;
 pub use duplex::{
     DuplexFamilySizeMetric, DuplexMetricsCollector, DuplexUmiMetric, DuplexYieldMetric,

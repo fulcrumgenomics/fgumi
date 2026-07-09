@@ -541,9 +541,13 @@ impl Command for Duplex {
         metrics.consensus_reads = consensus_count as u64;
         log_consensus_summary(&metrics);
 
-        // Write statistics file if requested
+        // Write statistics file if requested. Emit the same fgbio seeded key-value format as
+        // the multi-threaded path (`execute_threads_mode`) so duplex metrics output is
+        // thread-independent — the single-threaded path previously wrote the wide format,
+        // omitting the always-seeded `usedByDuplex` rejection rows (R2-MET-05).
         if let Some(stats_path) = &self.stats_opts.stats {
-            DelimFile::default().write_tsv(stats_path, [metrics]).map_err(|e| {
+            let kv_metrics = metrics.to_kv_metrics(fgumi_metrics::ConsensusCallerKind::Duplex);
+            DelimFile::default().write_tsv(stats_path, kv_metrics).map_err(|e| {
                 anyhow::anyhow!("Failed to write statistics to {}: {}", stats_path.display(), e)
             })?;
             info!("Statistics written to: {}", stats_path.display());
@@ -850,7 +854,7 @@ impl Duplex {
 
         // Write statistics file if requested
         if let Some(stats_path) = &self.stats_opts.stats {
-            let kv_metrics = metrics.to_kv_metrics();
+            let kv_metrics = metrics.to_kv_metrics(fgumi_metrics::ConsensusCallerKind::Duplex);
             DelimFile::default()
                 .write_tsv(stats_path, kv_metrics)
                 .with_context(|| format!("Failed to write statistics: {}", stats_path.display()))?;

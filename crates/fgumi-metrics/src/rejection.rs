@@ -42,7 +42,9 @@ pub enum RejectionReason {
     UmiTooShort,
     /// Template had reads on same strand only (no proper pair)
     SameStrandOnly,
-    /// Duplicate UMI at same genomic position
+    /// Unpaired/fragment reads supplied to the duplex/codec caller
+    NonPairedReads,
+    /// Potential collision between independent duplex molecules sharing an MI
     DuplicateUmi,
     /// Only one of R1 or R2 consensus was generated (orphan)
     OrphanConsensus,
@@ -72,7 +74,8 @@ impl RejectionReason {
             Self::ExcessiveErrorRate => "Consensus read had excessive error rate",
             Self::UmiTooShort => "UMI was too short",
             Self::SameStrandOnly => "Template had reads on same strand only",
-            Self::DuplicateUmi => "Duplicate UMI at same genomic position",
+            Self::NonPairedReads => "Unpaired/fragment reads not supported by Duplex caller",
+            Self::DuplicateUmi => "Potential collision between independent duplex molecules",
             Self::OrphanConsensus => "Only one of R1 or R2 consensus generated",
             Self::ZeroBasesPostTrimming => "Read or mate had zero bases post trimming",
             Self::NotPrimaryFrPair => "Template did not have a single primary FR pair of reads",
@@ -98,7 +101,8 @@ impl RejectionReason {
             Self::ExcessiveErrorRate => "raw_reads_rejected_for_excessive_error_rate",
             Self::UmiTooShort => "raw_reads_rejected_for_umi_too_short",
             Self::SameStrandOnly => "raw_reads_rejected_for_single_strand_only",
-            Self::DuplicateUmi => "raw_reads_rejected_for_duplicate_umi",
+            Self::NonPairedReads => "raw_reads_rejected_for_non_paired_reads",
+            Self::DuplicateUmi => "raw_reads_rejected_for_potential_umi_collision",
             Self::OrphanConsensus => "raw_reads_rejected_for_orphan_consensus",
             Self::ZeroBasesPostTrimming => "raw_reads_rejected_for_zero_bases_post_trimming",
             Self::NotPrimaryFrPair => "raw_reads_rejected_for_not_primary_fr_pair",
@@ -123,8 +127,9 @@ impl RejectionReason {
             Self::InsufficientMinDepth => "Insufficient minimum read depth",
             Self::ExcessiveErrorRate => "Excessive error rate",
             Self::UmiTooShort => "UMI sequence too short",
-            Self::SameStrandOnly => "Only generating one strand of duplex consensus",
-            Self::DuplicateUmi => "Duplicate UMI detected",
+            Self::SameStrandOnly => "Only Generating One Strand of Duplex Consensus",
+            Self::NonPairedReads => "Unpaired/fragment reads not supported by Duplex caller",
+            Self::DuplicateUmi => "Potential collision between independent duplex molecules",
             Self::OrphanConsensus => "Only one of R1 or R2 consensus generated",
             Self::ZeroBasesPostTrimming => "Read or mate had zero bases post trimming",
             Self::NotPrimaryFrPair => "Template did not have a single primary FR pair of reads",
@@ -178,29 +183,33 @@ mod tests {
         );
     }
 
+    /// Every rejection reason fgumi tracks, for coverage assertions.
+    const ALL_REASONS: [RejectionReason; 20] = [
+        RejectionReason::InsufficientSupport,
+        RejectionReason::MinorityAlignment,
+        RejectionReason::InsufficientStrandSupport,
+        RejectionReason::LowBaseQuality,
+        RejectionReason::ExcessiveNBases,
+        RejectionReason::NoValidAlignment,
+        RejectionReason::LowMappingQuality,
+        RejectionReason::NBasesInUmi,
+        RejectionReason::MissingUmi,
+        RejectionReason::NotPassingFilter,
+        RejectionReason::LowMeanQuality,
+        RejectionReason::InsufficientMinDepth,
+        RejectionReason::ExcessiveErrorRate,
+        RejectionReason::UmiTooShort,
+        RejectionReason::SameStrandOnly,
+        RejectionReason::NonPairedReads,
+        RejectionReason::DuplicateUmi,
+        RejectionReason::OrphanConsensus,
+        RejectionReason::ZeroBasesPostTrimming,
+        RejectionReason::NotPrimaryFrPair,
+    ];
+
     #[test]
     fn test_tsv_key_prefix() {
-        let all_reasons = [
-            RejectionReason::InsufficientSupport,
-            RejectionReason::MinorityAlignment,
-            RejectionReason::InsufficientStrandSupport,
-            RejectionReason::LowBaseQuality,
-            RejectionReason::ExcessiveNBases,
-            RejectionReason::NoValidAlignment,
-            RejectionReason::LowMappingQuality,
-            RejectionReason::NBasesInUmi,
-            RejectionReason::MissingUmi,
-            RejectionReason::NotPassingFilter,
-            RejectionReason::LowMeanQuality,
-            RejectionReason::InsufficientMinDepth,
-            RejectionReason::ExcessiveErrorRate,
-            RejectionReason::UmiTooShort,
-            RejectionReason::SameStrandOnly,
-            RejectionReason::DuplicateUmi,
-            RejectionReason::OrphanConsensus,
-            RejectionReason::ZeroBasesPostTrimming,
-        ];
-        for reason in &all_reasons {
+        for reason in &ALL_REASONS {
             assert!(
                 reason.tsv_key().starts_with("raw_reads_rejected_for_"),
                 "tsv_key for {:?} does not have expected prefix: {}",
@@ -211,28 +220,25 @@ mod tests {
     }
 
     #[test]
+    fn test_duplex_row_keys_match_fgbio() {
+        // R2-MET-05 / R2-UCC-01: the duplex/codec rejection rows carry fgbio's exact keys.
+        assert_eq!(
+            RejectionReason::NonPairedReads.tsv_key(),
+            "raw_reads_rejected_for_non_paired_reads"
+        );
+        assert_eq!(
+            RejectionReason::SameStrandOnly.tsv_key(),
+            "raw_reads_rejected_for_single_strand_only"
+        );
+        assert_eq!(
+            RejectionReason::DuplicateUmi.tsv_key(),
+            "raw_reads_rejected_for_potential_umi_collision"
+        );
+    }
+
+    #[test]
     fn test_kv_description_non_empty() {
-        let all_reasons = [
-            RejectionReason::InsufficientSupport,
-            RejectionReason::MinorityAlignment,
-            RejectionReason::InsufficientStrandSupport,
-            RejectionReason::LowBaseQuality,
-            RejectionReason::ExcessiveNBases,
-            RejectionReason::NoValidAlignment,
-            RejectionReason::LowMappingQuality,
-            RejectionReason::NBasesInUmi,
-            RejectionReason::MissingUmi,
-            RejectionReason::NotPassingFilter,
-            RejectionReason::LowMeanQuality,
-            RejectionReason::InsufficientMinDepth,
-            RejectionReason::ExcessiveErrorRate,
-            RejectionReason::UmiTooShort,
-            RejectionReason::SameStrandOnly,
-            RejectionReason::DuplicateUmi,
-            RejectionReason::OrphanConsensus,
-            RejectionReason::ZeroBasesPostTrimming,
-        ];
-        for reason in &all_reasons {
+        for reason in &ALL_REASONS {
             assert!(!reason.kv_description().is_empty(), "kv_description for {reason:?} is empty");
         }
     }

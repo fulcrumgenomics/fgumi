@@ -470,7 +470,7 @@ impl Command for Simplex {
 
         if let Some(stats_path) = &self.stats_opts.stats {
             // Convert to fgbio-compatible vertical key-value-description format
-            let kv_metrics = metrics.to_kv_metrics();
+            let kv_metrics = metrics.to_kv_metrics(fgumi_metrics::ConsensusCallerKind::Vanilla);
             DelimFile::default()
                 .write_tsv(stats_path, kv_metrics)
                 .with_context(|| format!("Failed to write statistics: {}", stats_path.display()))?;
@@ -746,7 +746,7 @@ impl Simplex {
 
         if let Some(stats_path) = &self.stats_opts.stats {
             // Convert to fgbio-compatible vertical key-value-description format
-            let kv_metrics = metrics.to_kv_metrics();
+            let kv_metrics = metrics.to_kv_metrics(fgumi_metrics::ConsensusCallerKind::Vanilla);
             DelimFile::default()
                 .write_tsv(stats_path, kv_metrics)
                 .with_context(|| format!("Failed to write statistics: {}", stats_path.display()))?;

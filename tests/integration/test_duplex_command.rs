@@ -360,4 +360,20 @@ fn test_duplex_command_with_stats() {
     .expect("failed to parse duplex args");
     cmd.execute("fgumi duplex").expect("Duplex command with stats failed");
     assert!(stats_path.exists(), "Stats file not created");
+
+    // Single-threaded duplex must emit the same fgbio seeded key-value format as the
+    // multi-threaded path (thread-independent metrics): the always-seeded `usedByDuplex`
+    // rejection rows must be present even at zero. The wide (per-field) format the
+    // single-threaded path previously wrote would not contain these KV keys.
+    let stats = std::fs::read_to_string(&stats_path).expect("read stats");
+    for key in [
+        "raw_reads_rejected_for_non_paired_reads",
+        "raw_reads_rejected_for_single_strand_only",
+        "raw_reads_rejected_for_potential_umi_collision",
+    ] {
+        assert!(
+            stats.contains(key),
+            "single-threaded duplex stats must emit the seeded KV row {key}:\n{stats}"
+        );
+    }
 }
