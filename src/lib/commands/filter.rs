@@ -13,10 +13,11 @@ use crate::alignment_tags::regenerate_alignment_tags_raw;
 use crate::consensus_filter::resolve_ref_bases_for_record;
 use crate::consensus_filter::{
     FilterConfig, FilterResult, MethylationDepthThresholds, MethylationTags,
-    check_conversion_fraction_raw_with_ref_bases_and_tags, compute_read_stats, filter_duplex_read,
+    check_conversion_fraction_raw_with_ref_bases_and_tags, count_no_calls, filter_duplex_read,
     filter_read, is_duplex_consensus, mask_bases, mask_duplex_bases,
     mask_methylation_depth_duplex_raw_with_tags, mask_methylation_depth_simplex_raw_with_tags,
-    mask_strand_methylation_agreement_raw_with_ref_bases_and_tags, template_passes,
+    mask_strand_methylation_agreement_raw_with_ref_bases_and_tags, mean_base_quality_full_length,
+    template_passes,
 };
 use crate::grouper::{SingleRawRecordGrouper, TemplateGrouper};
 use crate::logging::OperationTimer;
@@ -97,8 +98,7 @@ query grouped. If your BAM is not already in an appropriate order, this can be d
 
   fgumi sort -i in.bam --order queryname | fgumi filter -i /dev/stdin ...
 
-The output sort order may be specified with --sort-order. If not given, then the output will be in the same
-order as input.
+Output is written in the same order as the input. To emit coordinate-sorted output, pipe through fgumi sort.
 
 The --reverse-per-base-tags option controls whether per-base tags should be reversed before being used on reads
 marked as being mapped to the negative strand. This is necessary if the reads have been mapped and the
@@ -141,7 +141,8 @@ pub struct Filter {
     #[arg(short = 'N', long = "min-base-quality")]
     pub min_base_quality: Option<u8>,
 
-    /// Minimum mean base quality across the read (after masking)
+    /// Minimum mean base quality across the read, computed over the full read length prior
+    /// to any masking (matching fgbio `FilterConsensusReads`)
     #[arg(short = 'q', long = "min-mean-base-quality")]
     pub min_mean_base_quality: Option<f64>,
 
@@ -758,6 +759,17 @@ impl Filter {
             reverse_per_base_tags_raw(record)?;
         }
 
+        // Capture the mean base quality over the full read BEFORE any masking — fgbio's
+        // read-level mean-quality filter is evaluated on the unmasked read (FILT-01).
+        // Only scan when the mean-quality filter is actually configured; masking mutates
+        // the read below, so it must be taken here (pre-mask) rather than recomputed later.
+        // When unset the value is never read downstream, so a placeholder 0.0 is fine.
+        let pre_mask_mean_qual = if min_mean_base_quality.is_some() {
+            mean_base_quality_full_length(record.as_ref())
+        } else {
+            0.0
+        };
+
         let is_duplex = {
             let aux = fgumi_raw_bam::aux_data_slice(record);
             is_duplex_consensus(aux)
@@ -853,6 +865,7 @@ impl Filter {
                     cc_thresh,
                     ab_thresh,
                     ba_thresh,
+                    pre_mask_mean_qual,
                     min_mean_base_quality,
                     max_no_call_fraction,
                 )?
@@ -864,6 +877,7 @@ impl Filter {
                     record,
                     aux,
                     thresholds,
+                    pre_mask_mean_qual,
                     min_mean_base_quality,
                     max_no_call_fraction,
                 )?
@@ -892,18 +906,25 @@ impl Filter {
 
     /// Check mean quality and no-call fraction/count on a raw BAM record.
     ///
-    /// Returns `true` if the record passes the quality and no-call thresholds.
+    /// `mean_qual` is the read's mean base quality computed over the full read length
+    /// **prior to masking** (see [`mean_base_quality_full_length`]); it is passed in rather
+    /// than recomputed here because masking mutates the record before this check runs, and
+    /// fgbio evaluates the mean-quality filter on the unmasked read. The no-call count, in
+    /// contrast, is taken from the (already-masked) record — fgbio counts Ns *after* masking.
+    ///
+    /// Returns `true` if the record passes the mean-quality and no-call thresholds.
     fn check_no_call_and_quality(
         bam: &[u8],
+        mean_qual: f64,
         min_mean_qual: Option<f64>,
         max_no_call_frac: f64,
     ) -> bool {
-        let (no_calls, mean_qual) = compute_read_stats(bam);
         if let Some(min_qual) = min_mean_qual {
             if mean_qual < min_qual {
                 return false;
             }
         }
+        let no_calls = count_no_calls(bam);
         let seq_len = fgumi_raw_bam::l_seq(bam) as usize;
         if max_no_call_frac >= 1.0 {
             // Count mode: threshold is an absolute base count
@@ -923,6 +944,7 @@ impl Filter {
         bam: &[u8],
         aux_data: &[u8],
         thresholds: &crate::consensus_filter::FilterThresholds,
+        mean_qual: f64,
         min_mean_qual: Option<f64>,
         max_no_call_frac: f64,
     ) -> Result<bool> {
@@ -930,19 +952,21 @@ impl Filter {
         if filter_result != FilterResult::Pass {
             return Ok(false);
         }
-        Ok(Self::check_no_call_and_quality(bam, min_mean_qual, max_no_call_frac))
+        Ok(Self::check_no_call_and_quality(bam, mean_qual, min_mean_qual, max_no_call_frac))
     }
 
     /// Checks read-level filters on a raw duplex consensus record.
     ///
     /// Returns `true` if the record passes all filters (CC/AB/BA depth and error rate,
     /// mean quality, no-call fraction/count).
+    #[allow(clippy::too_many_arguments)]
     fn check_duplex_filters_raw(
         bam: &[u8],
         aux_data: &[u8],
         cc_thresholds: &crate::consensus_filter::FilterThresholds,
         ab_thresholds: &crate::consensus_filter::FilterThresholds,
         ba_thresholds: &crate::consensus_filter::FilterThresholds,
+        mean_qual: f64,
         min_mean_qual: Option<f64>,
         max_no_call_frac: f64,
     ) -> Result<bool> {
@@ -951,7 +975,7 @@ impl Filter {
         if filter_result != FilterResult::Pass {
             return Ok(false);
         }
-        Ok(Self::check_no_call_and_quality(bam, min_mean_qual, max_no_call_frac))
+        Ok(Self::check_no_call_and_quality(bam, mean_qual, min_mean_qual, max_no_call_frac))
     }
 
     /// Validates that parameter vectors have 1-3 values and are in valid ranges
@@ -1577,7 +1601,7 @@ mod tests {
             None,
             None,
             Some(vec![1, 10, 4, 10]), // First and third bases have low depth
-            None,
+            Some(vec![0, 0, 0, 0]),   // errors present so per-base masking is active (pb=true)
         );
 
         let thresholds =
@@ -1585,7 +1609,7 @@ mod tests {
 
         mask_bases(&mut record, &thresholds, Some(10)).expect("mask_bases should succeed");
 
-        // Bases with depth < 5 should be masked to N
+        // Bases with depth < 5 should be masked to N (per-base tags present, so depth mask applies)
         let seq = fgumi_raw_bam::RawRecordView::new(&record).sequence_vec();
         assert_eq!(&seq, b"NCNT");
     }
@@ -1686,18 +1710,21 @@ mod tests {
 
     #[test]
     fn test_filter_read_without_tags() {
-        use crate::consensus_filter::{FilterResult, FilterThresholds, filter_read};
+        use crate::consensus_filter::{FilterThresholds, filter_read};
 
-        // Record without depth/error tags should pass (tags are optional)
+        // A record lacking the per-read consensus tags (cD/cE) must be REJECTED, not
+        // silently kept: fgbio fails hard on non-consensus reads (FilterConsensusReads.scala:242,
+        // FILT-02).
         let record =
             create_filter_test_record("test", b"ACGT", &[30, 30, 30, 30], None, None, None, None);
 
         let thresholds =
             FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.2 };
 
-        let result =
-            filter_read(aux_data_slice(&record), &thresholds).expect("filter_read should succeed");
-        assert_eq!(result, FilterResult::Pass);
+        assert!(
+            filter_read(aux_data_slice(&record), &thresholds).is_err(),
+            "filter_read must reject a read lacking cD/cE consensus tags"
+        );
     }
 
     #[test]
@@ -2960,6 +2987,11 @@ mod tests {
             .cigar_ops(&[n << 4]) // nM
             .sequence(bases)
             .qualities(quals);
+        // Per-read final-consensus tags (cD/cE): present on every real consensus read.
+        // cD = total raw-read depth; cE kept at 0 so the read clears the CC-tier check and
+        // the test's intended pass/fail is decided by the AB/BA tiers below.
+        b.add_int_tag(SamTag::CD, i32::from(ab_depth) + i32::from(ba_depth));
+        b.add_float_tag(SamTag::CE, 0.0_f32);
         // Per-read duplex tags
         b.add_int_tag(SamTag::AD, i32::from(ab_depth));
         b.add_int_tag(SamTag::BD, i32::from(ba_depth));
@@ -4202,11 +4234,25 @@ mod tests {
             FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.1 };
 
         // Fraction mode: 2/10 = 0.2, threshold = 0.2 => should pass
-        let result = Filter::check_filters_raw(&raw, aux, &thresholds, None, 0.2)?;
+        let result = Filter::check_filters_raw(
+            &raw,
+            aux,
+            &thresholds,
+            crate::consensus_filter::mean_base_quality_full_length(&raw),
+            None,
+            0.2,
+        )?;
         assert!(result, "Should pass with 2/10 Ns and threshold 0.2");
 
         // Fraction mode: 2/10 = 0.2, threshold = 0.19 => should fail
-        let result = Filter::check_filters_raw(&raw, aux, &thresholds, None, 0.19)?;
+        let result = Filter::check_filters_raw(
+            &raw,
+            aux,
+            &thresholds,
+            crate::consensus_filter::mean_base_quality_full_length(&raw),
+            None,
+            0.19,
+        )?;
         assert!(!result, "Should fail with 2/10 Ns and threshold 0.19");
 
         Ok(())
@@ -4232,11 +4278,25 @@ mod tests {
             FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.1 };
 
         // Count mode: 3 Ns <= 5.0 threshold => should pass
-        let result = Filter::check_filters_raw(&raw, aux, &thresholds, None, 5.0)?;
+        let result = Filter::check_filters_raw(
+            &raw,
+            aux,
+            &thresholds,
+            crate::consensus_filter::mean_base_quality_full_length(&raw),
+            None,
+            5.0,
+        )?;
         assert!(result, "Should pass with 3 Ns and count threshold 5.0");
 
         // Count mode: 3 Ns <= 3.0 threshold => should pass (boundary)
-        let result = Filter::check_filters_raw(&raw, aux, &thresholds, None, 3.0)?;
+        let result = Filter::check_filters_raw(
+            &raw,
+            aux,
+            &thresholds,
+            crate::consensus_filter::mean_base_quality_full_length(&raw),
+            None,
+            3.0,
+        )?;
         assert!(result, "Should pass with 3 Ns and count threshold 3.0 (boundary)");
 
         Ok(())
@@ -4262,7 +4322,14 @@ mod tests {
             FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.1 };
 
         // Count mode: 3 Ns > 2.0 threshold => should fail
-        let result = Filter::check_filters_raw(&raw, aux, &thresholds, None, 2.0)?;
+        let result = Filter::check_filters_raw(
+            &raw,
+            aux,
+            &thresholds,
+            crate::consensus_filter::mean_base_quality_full_length(&raw),
+            None,
+            2.0,
+        )?;
         assert!(!result, "Should fail with 3 Ns and count threshold 2.0");
 
         Ok(())
@@ -4277,8 +4344,10 @@ mod tests {
             let mut b = RawSamBuilder::new();
             b.sequence(b"AANNNTTGGC") // 10 bases, 3 Ns
                 .qualities(&[30, 30, 30, 30, 30, 30, 30, 30, 30, 30]);
-            // Add required duplex tags: aD, bD, aE, bE, aM, bM
-            b.add_int_tag(SamTag::AD, 10)
+            // Per-read consensus tags (cD/cE) plus duplex tags aD, bD, aE, bE, aM, bM.
+            b.add_int_tag(SamTag::CD, 10)
+                .add_float_tag(SamTag::CE, 0.01_f32)
+                .add_int_tag(SamTag::AD, 10)
                 .add_int_tag(SamTag::BD, 8)
                 .add_float_tag(SamTag::AE, 0.01_f32)
                 .add_float_tag(SamTag::BE, 0.01_f32)
@@ -4289,6 +4358,7 @@ mod tests {
         let raw = raw_record.into_inner();
 
         let aux = fgumi_raw_bam::aux_data_slice(&raw);
+        let mean_qual = crate::consensus_filter::mean_base_quality_full_length(&raw);
         let thresholds =
             FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.1 };
 
@@ -4299,6 +4369,7 @@ mod tests {
             &thresholds,
             &thresholds,
             &thresholds,
+            mean_qual,
             None,
             5.0,
         )?;
@@ -4311,6 +4382,7 @@ mod tests {
             &thresholds,
             &thresholds,
             &thresholds,
+            mean_qual,
             None,
             2.0,
         )?;
@@ -4331,6 +4403,7 @@ mod tests {
                 .flags(flags::UNMAPPED)
                 .sequence(b"ACGTACGT")
                 .qualities(&[35, 35, 35, 35, 35, 35, 35, 35]);
+            b.add_int_tag(SamTag::CD, 10).add_float_tag(SamTag::CE, 0.0_f32);
             b.add_array_u16(SamTag::CD_BASES, &[10; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
             b.build()
         };

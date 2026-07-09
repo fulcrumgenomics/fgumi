@@ -743,6 +743,7 @@ dependencies = [
  "log",
  "noodles",
  "rand 0.10.1",
+ "rstest",
  "thiserror 2.0.18",
  "wide 1.5.0",
 ]
