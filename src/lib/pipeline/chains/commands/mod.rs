@@ -16,6 +16,7 @@ pub mod dedup;
 #[cfg(feature = "consensus")]
 pub mod duplex;
 pub mod extract;
+pub mod fastq;
 pub mod filter;
 pub mod group;
 #[cfg(feature = "consensus")]

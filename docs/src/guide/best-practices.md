@@ -525,6 +525,63 @@ fgumi dedup --input sorted.bam --output deduped.bam \
 
 ---
 
+## Alternative: UMI-Extracted FASTQ Output (for third-party tools)
+
+Some downstream tools expect the UMI in the **FASTQ read name** rather than in a BAM tag — for example Illumina DRAGEN, which reads the UMI from the read header and, for duplex UMIs, requires the two UMIs joined with a `+`. Because `fgumi extract` already parses the UMIs, trims them off the reads, and stores them in the standard `RX` tag, `fgumi fastq --annotate-read-names` can write them straight back into the read name. This replaces the slow `umi-tools` + `samtools fastq` combination with a single fast pipeline that yields both a UMI-tagged BAM and UMI-in-header FASTQs.
+
+```mermaid
+graph TD;
+A["fgumi extract"]-->B["extracted.bam (UMI in RX tag, reads trimmed)"];
+B-->C["fgumi fastq --annotate-read-names"];
+C-->D["R1.fastq.gz / R2.fastq.gz (UMI in read name)"];
+```
+
+```bash
+# Step 1: Extract UMIs from FASTQ (UMIs trimmed off, stored in the RX tag)
+fgumi extract \
+  --inputs r1.fq.gz r2.fq.gz \
+  --read-structures 8M+T 8M+T \
+  --sample "sample_name" \
+  --library "library_name" \
+  --output extracted.bam
+
+# Step 2: Write paired, gzipped FASTQs with the UMI in the read name
+fgumi fastq \
+  --input extracted.bam \
+  --annotate-read-names \
+  --threads 8 \
+  --out1 out_R1.fastq.gz \
+  --out2 out_R2.fastq.gz \
+  --out0 /dev/null
+```
+
+Key points:
+- Set `--read-structures` in Step 1 to match where your UMIs actually live (e.g. `8M+T +T` for a UMI on R1 only). See [Read Structures](read-structures.md).
+- **DRAGEN-ready by default**: a duplex UMI stored as `RX:Z:AAAAAAAA-CCCCCCCC` becomes the read name `@readname:AAAAAAAA+CCCCCCCC` — identical to `samtools fastq -U`, and the `+`-joined format DRAGEN expects.
+- In split (`--out1`/`--out2`) mode the `/1` `/2` suffixes are omitted so R1 and R2 read names match, as in `samtools fastq -1/-2`. Reads that are neither cleanly R1 nor R2 go to `--out0` (or stdout if `--out0` is omitted).
+- Any `.gz`/`.bgz` output path is written as **BGZF** (gzip-compatible for downstream tools, yet block-indexable). Pass `--threads` to parallelize BGZF compression on compressed output.
+
+### Optional: Interleaved output and custom delimiters
+
+```bash
+# Interleaved FASTQ to stdout (e.g. to pipe elsewhere), UMI in the read name.
+# `-U` is a short alias for `--annotate-read-names`, matching `samtools fastq -U`.
+fgumi fastq --input extracted.bam -U > umi_in_name.fastq
+
+# Custom delimiters for non-DRAGEN platforms (e.g. MGI, Element, ONT):
+# underscore between the read name and UMI, and no delimiter between duplex UMIs.
+fgumi fastq --input extracted.bam --annotate-read-names \
+  --umi-name-delim _ --umi-sep '' \
+  --out1 out_R1.fastq.gz --out2 out_R2.fastq.gz
+```
+
+Options:
+- `--umi-tag`: tag(s) to read the UMI from, first present wins (default `RX,OX`)
+- `--umi-name-delim`: delimiter between the read name and the UMI (default `:`)
+- `--umi-sep`: delimiter joining duplex UMIs, replacing the stored `-` (default `+`)
+
+---
+
 ## Recommended Parameters by Application
 
 Pick a starting point by how you trade sensitivity against specificity for your assay, then tune from there.

@@ -171,6 +171,46 @@ where
     }
 }
 
+/// Ordered + byte-bounded tuple-3 outputs. The 3-branch analog of
+/// [`OrderedBytesTuple2`]: use when a step fans out to three branches that all
+/// need `BranchOrdering::ByItemOrdinal` + byte-bounded queues — e.g. paired
+/// FASTQ output splitting one record batch into R1 / R2 / other byte streams,
+/// each feeding an ordered `WriteRawFile` sink.
+///
+/// The plain `(A, B, C)` `StepOutputs` impl only bounds each branch `HeapSize`.
+/// To use `ByItemOrdinal` on any branch, all three must satisfy
+/// `Ordered + HeapSize` — that's what this shape encodes at the type level.
+#[allow(clippy::type_complexity)]
+pub struct OrderedBytesTuple3<A, B, C>(PhantomData<fn() -> (A, B, C)>)
+where
+    A: Send + HeapSize + Ordered + 'static,
+    B: Send + HeapSize + Ordered + 'static,
+    C: Send + HeapSize + Ordered + 'static;
+
+impl<A, B, C> StepOutputs for OrderedBytesTuple3<A, B, C>
+where
+    A: Send + HeapSize + Ordered + 'static,
+    B: Send + HeapSize + Ordered + 'static,
+    C: Send + HeapSize + Ordered + 'static,
+{
+    #[inline]
+    fn arity() -> usize {
+        3
+    }
+
+    fn build_queues(
+        specs: &[QueueSpec],
+        ordering: &[BranchOrdering],
+        level: crate::builder::InstrumentationLevel,
+    ) -> (OutputQueueSet, OutputsViewAny) {
+        super::handles::build_tuple3_queues_ordered_bytes::<A, B, C>(specs, ordering, level)
+    }
+
+    fn mark_all_drained(handles: &super::step::OutputHandles<Self>) {
+        handles.mark_all_drained();
+    }
+}
+
 impl<A, B, C> StepOutputs for (A, B, C)
 where
     A: Send + HeapSize + 'static,
@@ -256,6 +296,26 @@ mod tests {
     #[test]
     fn tuple_3_arity_is_three() {
         assert_eq!(<(u32, u64, String) as StepOutputs>::arity(), 3);
+    }
+
+    #[derive(Clone, Copy)]
+    struct OrdU64(u64);
+    impl crate::item::HeapSize for OrdU64 {}
+    impl crate::item::Ordered for OrdU64 {
+        fn ordinal(&self) -> u64 {
+            self.0
+        }
+    }
+
+    #[test]
+    fn ordered_bytes_tuple_3_arity_is_three() {
+        // OrderedBytesTuple3 is the ordered + byte-bounded 3-way fan-out shape.
+        // Its three branches carry Ordered + HeapSize items (here the u64/u32
+        // stand-ins just need to satisfy the bounds at the type level).
+        fn assert_arity<O: StepOutputs>() -> usize {
+            O::arity()
+        }
+        assert_eq!(assert_arity::<OrderedBytesTuple3<OrdU64, OrdU64, OrdU64>>(), 3);
     }
 
     #[test]

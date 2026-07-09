@@ -1694,7 +1694,7 @@ impl RunAll {
                 // Stages that runall does not use. If any of these appear in
                 // the stages list it is a programming error (derive_stages
                 // never emits them for a runall chain).
-                Stage::Clip | Stage::Dedup | Stage::Downsample => {
+                Stage::Clip | Stage::Dedup | Stage::Downsample | Stage::Fastq => {
                     bail!(
                         "internal error: build_stage_options_bag encountered unexpected \
                          stage {stage:?} in a runall chain; this is a bug in derive_stages"

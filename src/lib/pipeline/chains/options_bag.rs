@@ -14,6 +14,7 @@ pub use crate::commands::dedup::MarkDuplicates;
 #[cfg(feature = "consensus")]
 pub use crate::commands::duplex::DuplexOptions;
 pub use crate::commands::extract::ExtractOptions;
+pub use crate::commands::fastq::FastqOptions;
 pub use crate::commands::filter::FilterOptions;
 pub use crate::commands::group::GroupOptions;
 #[cfg(feature = "consensus")]
@@ -92,6 +93,9 @@ pub struct StageOptionsBag {
     /// Extract options. Carries header-synthesis fields and behavior knobs
     /// for the FASTQ→unmapped-BAM extract stage (Phase 5 T5.3).
     pub extract: Option<ExtractOptions>,
+    /// Fastq options. Carries flag filters, read-name suffix, and UMI-in-name
+    /// config for the terminal BAM→FASTQ encode stage.
+    pub fastq: Option<FastqOptions>,
     // Additional fields added during command migrations:
     //   - downsample (T2.13).
     // Cross-stage fields (read_group, methylation_mode, reference, …)

@@ -681,6 +681,7 @@ dependencies = [
  "fgumi-simd-fastq",
  "fgumi-sort",
  "fgumi-sort-cli",
+ "fgumi-tag",
  "fgumi-umi",
  "flate2",
  "fs4",

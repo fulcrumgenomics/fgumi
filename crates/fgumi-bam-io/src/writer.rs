@@ -112,6 +112,25 @@ pub(crate) fn make_bgzf_writer(
     }
 }
 
+/// Create a BGZF-compressed writer over an arbitrary `output`, selecting a
+/// multi-threaded encoder when `threads > 1`.
+///
+/// This exposes the same BGZF backend fgumi uses for BAM output so other output
+/// formats (e.g. gzipped FASTQ) get identical, block-gzip (BGZF) framing and
+/// multi-threaded compression rather than a separate implementation.
+///
+/// `compression_level` is the BGZF/DEFLATE level (0–12, where 0 means
+/// uncompressed); values outside the valid range fall back to the backend
+/// default.
+#[must_use]
+pub fn create_bgzf_writer(
+    output: Box<dyn Write + Send>,
+    threads: usize,
+    compression_level: u32,
+) -> BgzfWriterEnum {
+    make_bgzf_writer(output, threads, compression_level)
+}
+
 /// Write a BAM header (magic, SAM text, reference sequences) to any writer.
 ///
 /// Shared implementation used by the BAM writer factories (e.g. [`RawBamWriter`]).
