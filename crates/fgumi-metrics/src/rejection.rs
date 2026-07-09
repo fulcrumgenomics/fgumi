@@ -14,7 +14,7 @@ use std::fmt;
 pub enum RejectionReason {
     /// Insufficient reads to generate a consensus
     InsufficientSupport,
-    /// Read has a different, and minority, set of indels
+    /// Reads has a different, and minority, set of indels
     MinorityAlignment,
     /// Too few reads agreed on the strand orientation
     InsufficientStrandSupport,
@@ -60,7 +60,8 @@ impl RejectionReason {
     pub fn description(&self) -> &'static str {
         match self {
             Self::InsufficientSupport => "Insufficient reads to generate a consensus",
-            Self::MinorityAlignment => "Read has a different, and minority, set of indels",
+            // fgbio spells this "Reads has …" (sic) — matched verbatim for metric parity.
+            Self::MinorityAlignment => "Reads has a different, and minority, set of indels",
             Self::InsufficientStrandSupport => "Too few reads agreed on the strand orientation",
             Self::LowBaseQuality => "Base quality scores were below threshold",
             Self::ExcessiveNBases => "Read group had too many N bases",
@@ -114,7 +115,7 @@ impl RejectionReason {
     pub fn kv_description(&self) -> &'static str {
         match self {
             Self::InsufficientSupport => "Insufficient reads to generate a consensus",
-            Self::MinorityAlignment => "Read has a different, and minority, set of indels",
+            Self::MinorityAlignment => "Reads has a different, and minority, set of indels",
             Self::InsufficientStrandSupport => "Insufficient strand support for consensus",
             Self::LowBaseQuality => "Low base quality",
             Self::ExcessiveNBases => "Excessive N bases in read",
@@ -127,6 +128,7 @@ impl RejectionReason {
             Self::InsufficientMinDepth => "Insufficient minimum read depth",
             Self::ExcessiveErrorRate => "Excessive error rate",
             Self::UmiTooShort => "UMI sequence too short",
+            // fgbio's exact title-cased string for `single_strand_only`, matched for parity.
             Self::SameStrandOnly => "Only Generating One Strand of Duplex Consensus",
             Self::NonPairedReads => "Unpaired/fragment reads not supported by Duplex caller",
             Self::DuplicateUmi => "Potential collision between independent duplex molecules",
@@ -177,9 +179,10 @@ mod tests {
     fn test_rejection_reason_description() {
         assert!(RejectionReason::LowBaseQuality.description().contains("quality"));
         assert!(RejectionReason::InsufficientSupport.description().contains("Insufficient"));
+        // Matches fgbio's exact (grammatically-odd) wording for metric parity.
         assert_eq!(
             RejectionReason::MinorityAlignment.to_string(),
-            "Read has a different, and minority, set of indels"
+            "Reads has a different, and minority, set of indels"
         );
     }
 
@@ -241,6 +244,30 @@ mod tests {
         for reason in &ALL_REASONS {
             assert!(!reason.kv_description().is_empty(), "kv_description for {reason:?} is empty");
         }
+    }
+
+    /// Pin the exact fgbio-parity `tsv_key` + `kv_description` for the two reasons whose strings
+    /// are deliberately matched to fgbio (see the `for parity` comments above). A non-empty check
+    /// would let these silently drift; exact equality is what keeps them aligned with fgbio.
+    #[test]
+    fn test_kv_description_matches_fgbio_verbatim() {
+        assert_eq!(
+            RejectionReason::MinorityAlignment.tsv_key(),
+            "raw_reads_rejected_for_minority_alignment"
+        );
+        assert_eq!(
+            RejectionReason::MinorityAlignment.kv_description(),
+            "Reads has a different, and minority, set of indels"
+        );
+
+        assert_eq!(
+            RejectionReason::SameStrandOnly.tsv_key(),
+            "raw_reads_rejected_for_single_strand_only"
+        );
+        assert_eq!(
+            RejectionReason::SameStrandOnly.kv_description(),
+            "Only Generating One Strand of Duplex Consensus"
+        );
     }
 
     #[test]

@@ -22,14 +22,18 @@ pub struct SimplexFamilySizeMetric {
     /// Count of CS families with this size
     pub cs_count: usize,
     /// Fraction of all CS families with this size
+    #[serde(with = "crate::float")]
     pub cs_fraction: f64,
     /// Fraction of CS families with size >= `family_size`
+    #[serde(with = "crate::float")]
     pub cs_fraction_gt_or_eq_size: f64,
     /// Count of SS families with this size
     pub ss_count: usize,
     /// Fraction of all SS families with this size
+    #[serde(with = "crate::float")]
     pub ss_fraction: f64,
     /// Fraction of SS families with size >= `family_size`
+    #[serde(with = "crate::float")]
     pub ss_fraction_gt_or_eq_size: f64,
 }
 
@@ -65,6 +69,7 @@ impl Metric for SimplexFamilySizeMetric {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimplexYieldMetric {
     /// Approximate fraction of full dataset used
+    #[serde(with = "crate::float")]
     pub fraction: f64,
     /// Number of read pairs upon which metrics are based
     pub read_pairs: usize,
@@ -73,10 +78,12 @@ pub struct SimplexYieldMetric {
     /// Number of SS (Single-Strand by UMI) families
     pub ss_families: usize,
     /// Mean SS family size
+    #[serde(with = "crate::float")]
     pub mean_ss_family_size: f64,
     /// Number of SS singleton families (size 1)
     pub ss_singletons: usize,
     /// Fraction of SS families that are singletons
+    #[serde(with = "crate::float")]
     pub ss_singleton_fraction: f64,
     /// Number of SS families with size >= consensus minimum
     pub ss_consensus_families: usize,

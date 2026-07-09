@@ -765,6 +765,8 @@ dependencies = [
  "fgumi-raw-bam",
  "fgumi-sam",
  "noodles",
+ "proptest",
+ "rstest",
  "serde",
  "tempfile",
 ]
