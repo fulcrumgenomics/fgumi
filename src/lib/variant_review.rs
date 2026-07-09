@@ -123,10 +123,16 @@ impl BaseCounts {
     }
 }
 
-/// Generates a /1 or /2 suffix based on read pair information
+/// Generates a `/1` or `/2` suffix from a read's pairing status, matching fgbio's
+/// `readNumberSuffix`: `/2` only when the read is **paired and second-of-pair**;
+/// unpaired reads and first-of-pair reads both get `/1`.
+///
+/// The caller must pass `record.is_paired() && record.is_last_segment()` for
+/// `is_second_of_pair` — a bare `!is_first_segment()` wrongly yields `/2` for
+/// unpaired reads (which never set the first-segment flag).
 #[must_use]
-pub fn read_number_suffix(is_first_of_pair: bool) -> &'static str {
-    if is_first_of_pair { "/1" } else { "/2" }
+pub fn read_number_suffix(is_second_of_pair: bool) -> &'static str {
+    if is_second_of_pair { "/2" } else { "/1" }
 }
 
 /// Generates an insert string for a consensus read
@@ -227,11 +233,14 @@ mod tests {
     use super::*;
     use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags as raw_flags};
     use noodles::sam::Header;
+    use rstest::rstest;
 
-    #[test]
-    fn test_read_number_suffix() {
-        assert_eq!(read_number_suffix(true), "/1");
-        assert_eq!(read_number_suffix(false), "/2");
+    #[rstest]
+    // `is_second_of_pair` is `paired && second-of-pair`; only that case is `/2`.
+    #[case::second_of_pair(true, "/2")]
+    #[case::first_of_pair_or_unpaired(false, "/1")]
+    fn test_read_number_suffix(#[case] is_second_of_pair: bool, #[case] expected: &str) {
+        assert_eq!(read_number_suffix(is_second_of_pair), expected);
     }
 
     #[test]
