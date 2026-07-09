@@ -129,6 +129,22 @@ pub struct ConsensusMetrics {
 
     /// Reads rejected because the template was not a single primary FR pair (codec)
     pub rejected_not_primary_fr_pair: u64,
+
+    /// Reads rejected because the R1/R2 overlap was too short for CODEC (fgbio
+    /// `r1_r2_overlap_too_short`; codec)
+    pub rejected_r1_r2_overlap_too_short: u64,
+
+    /// Reads rejected due to an indel error between the top/bottom strands (fgbio
+    /// `indel_error_between_strands`; codec)
+    pub rejected_indel_error_between_strands: u64,
+
+    /// Reads rejected due to too many errors between the top/bottom strands (fgbio
+    /// `high_duplex_disagreement`; codec)
+    pub rejected_high_duplex_disagreement: u64,
+
+    /// Reads rejected because overlap clipping failed (fgbio `clip_overlap_failed`;
+    /// codec)
+    pub rejected_clip_overlap_failed: u64,
 }
 
 /// The consensus caller whose statistics are being rendered.
@@ -163,8 +179,16 @@ const DUPLEX_EXTRA_SEEDED: [RejectionReason; 3] = [
     RejectionReason::DuplicateUmi,
 ];
 
-/// Additional reason the codec caller always emits (`usedByCodec`).
-const CODEC_EXTRA_SEEDED: [RejectionReason; 1] = [RejectionReason::NotPrimaryFrPair];
+/// Additional reasons the codec caller always emits (`usedByCodec`), in fgbio's
+/// `RejectionReason.values` order (`UmiConsensusCaller.scala:84-88`) — the four
+/// codec-specific reasons followed by `not_primary_fr_pair`.
+const CODEC_EXTRA_SEEDED: [RejectionReason; 5] = [
+    RejectionReason::R1R2OverlapTooShort,
+    RejectionReason::IndelErrorBetweenStrands,
+    RejectionReason::HighDuplexDisagreement,
+    RejectionReason::ClipOverlapFailed,
+    RejectionReason::NotPrimaryFrPair,
+];
 
 impl ConsensusCallerKind {
     /// The rejection reasons this caller seeds (always emits), in fgbio's order.
@@ -185,7 +209,7 @@ impl ConsensusCallerKind {
 /// fgumi's taxonomy is finer-grained than fgbio's; the reasons not in any caller's
 /// seeded set (e.g. `LowBaseQuality`) are fgumi-specific and are emitted only when
 /// non-zero.
-const ALL_REJECTIONS: [RejectionReason; 20] = [
+const ALL_REJECTIONS: [RejectionReason; 24] = [
     RejectionReason::InsufficientSupport,
     RejectionReason::MinorityAlignment,
     RejectionReason::OrphanConsensus,
@@ -193,6 +217,10 @@ const ALL_REJECTIONS: [RejectionReason; 20] = [
     RejectionReason::NonPairedReads,
     RejectionReason::SameStrandOnly,
     RejectionReason::DuplicateUmi,
+    RejectionReason::R1R2OverlapTooShort,
+    RejectionReason::IndelErrorBetweenStrands,
+    RejectionReason::HighDuplexDisagreement,
+    RejectionReason::ClipOverlapFailed,
     RejectionReason::NotPrimaryFrPair,
     RejectionReason::InsufficientStrandSupport,
     RejectionReason::LowBaseQuality,
@@ -248,6 +276,10 @@ impl ConsensusMetrics {
             rejected_orphan_consensus: 0,
             rejected_zero_bases_post_trimming: 0,
             rejected_not_primary_fr_pair: 0,
+            rejected_r1_r2_overlap_too_short: 0,
+            rejected_indel_error_between_strands: 0,
+            rejected_high_duplex_disagreement: 0,
+            rejected_clip_overlap_failed: 0,
         }
     }
 
@@ -275,6 +307,10 @@ impl ConsensusMetrics {
             RejectionReason::OrphanConsensus => self.rejected_orphan_consensus,
             RejectionReason::ZeroBasesPostTrimming => self.rejected_zero_bases_post_trimming,
             RejectionReason::NotPrimaryFrPair => self.rejected_not_primary_fr_pair,
+            RejectionReason::R1R2OverlapTooShort => self.rejected_r1_r2_overlap_too_short,
+            RejectionReason::IndelErrorBetweenStrands => self.rejected_indel_error_between_strands,
+            RejectionReason::HighDuplexDisagreement => self.rejected_high_duplex_disagreement,
+            RejectionReason::ClipOverlapFailed => self.rejected_clip_overlap_failed,
         }
     }
 
@@ -307,6 +343,14 @@ impl ConsensusMetrics {
                 self.rejected_zero_bases_post_trimming += count;
             }
             RejectionReason::NotPrimaryFrPair => self.rejected_not_primary_fr_pair += count,
+            RejectionReason::R1R2OverlapTooShort => self.rejected_r1_r2_overlap_too_short += count,
+            RejectionReason::IndelErrorBetweenStrands => {
+                self.rejected_indel_error_between_strands += count;
+            }
+            RejectionReason::HighDuplexDisagreement => {
+                self.rejected_high_duplex_disagreement += count;
+            }
+            RejectionReason::ClipOverlapFailed => self.rejected_clip_overlap_failed += count,
         }
     }
 
@@ -336,7 +380,10 @@ impl ConsensusMetrics {
     /// selects which rejection rows are seeded (always emitted, even at zero),
     /// matching fgbio's per-caller `initializeRejectCounts`: vanilla emits four
     /// rows, duplex additionally emits `non_paired_reads`, `single_strand_only`,
-    /// and `potential_umi_collision`, and codec additionally `not_primary_fr_pair`.
+    /// and `potential_umi_collision`, and codec additionally emits the four
+    /// codec-specific reasons (`r1_r2_overlap_too_short`,
+    /// `indel_error_between_strands`, `high_duplex_disagreement`,
+    /// `clip_overlap_failed`) plus `not_primary_fr_pair`.
     /// fgumi-specific finer-grained reasons are emitted only when non-zero.
     #[must_use]
     pub fn to_kv_metrics(&self, kind: ConsensusCallerKind) -> Vec<ConsensusKvMetric> {
@@ -541,6 +588,58 @@ mod tests {
     }
 
     #[test]
+    fn test_add_rejection_round_trips_every_reason() {
+        use strum::IntoEnumIterator;
+
+        // `add_rejection(reason, n)` must route to a counter that `rejection_count(reason)` reads
+        // back as `n`, and must not touch any other reason's counter. Iterating every variant
+        // (including the codec-specific reasons) keeps this exhaustive as new reasons are added.
+        for reason in RejectionReason::iter() {
+            let mut metrics = ConsensusMetrics::new();
+            metrics.add_rejection(reason, 7);
+            assert_eq!(
+                metrics.rejection_count(reason),
+                7,
+                "add_rejection/rejection_count disagree for {reason:?}"
+            );
+            for other in RejectionReason::iter() {
+                if other != reason {
+                    assert_eq!(
+                        metrics.rejection_count(other),
+                        0,
+                        "adding {reason:?} leaked into {other:?}'s counter"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_all_rejections_is_exhaustive() {
+        use std::collections::HashSet;
+        use strum::IntoEnumIterator;
+
+        // `ALL_REJECTIONS` is hand-maintained and drives `all_rejections()`, which
+        // `total_rejections()`, `rejection_summary()`, and the fgumi-specific seeding pass in
+        // `to_kv_metrics()` all iterate. Unlike the exhaustive `match` in
+        // `add_rejection`/`rejection_count`, nothing forces this list to stay in sync when a new
+        // `RejectionReason` variant is added — a forgotten entry would silently under-report that
+        // reason forever. Assert it covers exactly the variant set.
+        let listed: HashSet<_> = ALL_REJECTIONS.iter().copied().collect();
+        let all: HashSet<_> = RejectionReason::iter().collect();
+        assert_eq!(
+            listed, all,
+            "ALL_REJECTIONS is out of sync with RejectionReason variants; \
+             total_rejections()/rejection_summary()/to_kv_metrics() would silently miss the diff"
+        );
+        assert_eq!(
+            ALL_REJECTIONS.len(),
+            listed.len(),
+            "ALL_REJECTIONS contains a duplicate rejection reason"
+        );
+    }
+
+    #[test]
     fn test_metric_trait_impl() {
         assert_eq!(ConsensusMetrics::metric_name(), "consensus");
     }
@@ -683,25 +782,45 @@ mod tests {
         assert_eq!(duplex_keys.as_slice(), EXPECTED_DUPLEX, "duplex KV row order drifted");
     }
 
-    /// R2-MET-05: the codec caller additionally seeds `not_primary_fr_pair`
-    /// (`usedByCodec`) on top of the duplex rows.
+    /// R2-MET-05: the codec caller additionally seeds `not_primary_fr_pair` and
+    /// the four codec-specific `usedByCodec` reasons on top of the duplex rows,
+    /// matching fgbio's `CodecConsensusCaller.initializeRejectCounts`.
     #[test]
     fn test_to_kv_metrics_codec_seeds_codec_row() {
         let metrics = ConsensusMetrics::new();
         let codec = metrics.to_kv_metrics(ConsensusCallerKind::Codec);
-        let has_key = |key: &str| codec.iter().any(|m| m.key == key);
-        assert!(
-            has_key("raw_reads_rejected_for_not_primary_fr_pair"),
-            "codec KV metrics must always emit not_primary_fr_pair"
+        // All codec-only rows (`usedByCodec` && !`usedByDuplex`) are seeded, at zero.
+        let codec_only_keys = [
+            "raw_reads_rejected_for_r1_r2_overlap_too_short",
+            "raw_reads_rejected_for_indel_error_between_strands",
+            "raw_reads_rejected_for_high_duplex_disagreement",
+            "raw_reads_rejected_for_clip_overlap_failed",
+            "raw_reads_rejected_for_not_primary_fr_pair",
+        ];
+        for key in codec_only_keys {
+            let rows: Vec<_> = codec.iter().filter(|m| m.key == key).collect();
+            assert_eq!(rows.len(), 1, "codec KV metrics must emit {key} exactly once");
+            assert_eq!(rows[0].value, "0", "{key} must be seeded at zero");
+        }
+        // The codec-only rows must appear in fgbio's `RejectionReason.values` order
+        // (`UmiConsensusCaller.scala:84-88`: the four codec reasons then
+        // `not_primary_fr_pair`), not merely be present.
+        let emitted_codec_order: Vec<&str> =
+            codec.iter().map(|m| m.key.as_str()).filter(|k| codec_only_keys.contains(k)).collect();
+        assert_eq!(
+            emitted_codec_order, codec_only_keys,
+            "codec-only seeded rows must be emitted in fgbio order"
         );
         // ...and it still seeds the duplex rows.
-        assert!(has_key("raw_reads_rejected_for_non_paired_reads"));
-        // Duplex must NOT seed the codec-only row.
+        assert!(codec.iter().any(|m| m.key == "raw_reads_rejected_for_non_paired_reads"));
+        // Duplex must NOT seed the codec-only rows.
         let duplex = metrics.to_kv_metrics(ConsensusCallerKind::Duplex);
-        assert!(
-            !duplex.iter().any(|m| m.key == "raw_reads_rejected_for_not_primary_fr_pair"),
-            "duplex KV metrics must not seed the codec-only row at zero"
-        );
+        for key in codec_only_keys {
+            assert!(
+                !duplex.iter().any(|m| m.key == key),
+                "duplex KV metrics must not seed the codec-only row {key} at zero"
+            );
+        }
     }
 
     /// R2-MET-05: seeded duplex rows carry fgbio's exact keys and descriptions.
