@@ -21,13 +21,19 @@ pub mod writer;
 
 use serde::{Deserialize, Serialize};
 
-/// Number of decimal places used for float metrics (matches fgbio).
+/// Number of decimal places used for fixed-precision float metrics.
 pub const FLOAT_PRECISION: usize = 6;
 
-/// Formats a float value with the standard precision for metrics.
+/// Formats a float value with a fixed [`FLOAT_PRECISION`] decimal places.
 ///
-/// This ensures consistent float formatting across all metrics output,
-/// matching fgbio's 6 decimal place precision.
+/// This produces a stable, fixed-width representation for metrics output
+/// (`0.9` → `"0.900000"`). Note this is **not** byte-identical to fgbio, which
+/// formats floats with `DecimalFormat("0.######")` and therefore strips
+/// trailing zeros (`0.9` → `"0.9"`) and switches to scientific notation for
+/// very small magnitudes. The difference is intentional and harmless:
+/// `fgumi compare metrics` parses values numerically (with rounding tolerance),
+/// and `Double.parseDouble` reads either form, so no consumer depends on the
+/// exact string. See the round-2 parity notes (R2-MET-01).
 ///
 /// # Example
 /// ```
