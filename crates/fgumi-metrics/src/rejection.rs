@@ -10,6 +10,9 @@ use std::fmt;
 ///
 /// Each variant represents a specific reason for rejection, allowing for
 /// detailed tracking and reporting of why data was filtered out.
+// `EnumIter` (test-only) auto-generates `RejectionReason::iter()` so coverage assertions
+// enumerate every variant without a hand-maintained list that can silently drift.
+#[cfg_attr(test, derive(strum::EnumIter))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RejectionReason {
     /// Insufficient reads to generate a consensus
@@ -186,33 +189,13 @@ mod tests {
         );
     }
 
-    /// Every rejection reason fgumi tracks, for coverage assertions.
-    const ALL_REASONS: [RejectionReason; 20] = [
-        RejectionReason::InsufficientSupport,
-        RejectionReason::MinorityAlignment,
-        RejectionReason::InsufficientStrandSupport,
-        RejectionReason::LowBaseQuality,
-        RejectionReason::ExcessiveNBases,
-        RejectionReason::NoValidAlignment,
-        RejectionReason::LowMappingQuality,
-        RejectionReason::NBasesInUmi,
-        RejectionReason::MissingUmi,
-        RejectionReason::NotPassingFilter,
-        RejectionReason::LowMeanQuality,
-        RejectionReason::InsufficientMinDepth,
-        RejectionReason::ExcessiveErrorRate,
-        RejectionReason::UmiTooShort,
-        RejectionReason::SameStrandOnly,
-        RejectionReason::NonPairedReads,
-        RejectionReason::DuplicateUmi,
-        RejectionReason::OrphanConsensus,
-        RejectionReason::ZeroBasesPostTrimming,
-        RejectionReason::NotPrimaryFrPair,
-    ];
+    use strum::IntoEnumIterator;
 
     #[test]
     fn test_tsv_key_prefix() {
-        for reason in &ALL_REASONS {
+        // `RejectionReason::iter()` (via `EnumIter`) covers every variant automatically, so a
+        // newly added reason is exercised here without updating a hand-maintained list.
+        for reason in RejectionReason::iter() {
             assert!(
                 reason.tsv_key().starts_with("raw_reads_rejected_for_"),
                 "tsv_key for {:?} does not have expected prefix: {}",
@@ -241,7 +224,7 @@ mod tests {
 
     #[test]
     fn test_kv_description_non_empty() {
-        for reason in &ALL_REASONS {
+        for reason in RejectionReason::iter() {
             assert!(!reason.kv_description().is_empty(), "kv_description for {reason:?} is empty");
         }
     }
