@@ -291,6 +291,9 @@ impl Command for Duplex {
         // streams them in a single pass).
         self.io.validate()?;
 
+        // Validate consensus arguments (e.g. error rates must be > 0).
+        self.validate()?;
+
         // Get threading configuration (duplex is worker-heavy with consensus calling)
         let reader_threads = self.threading.num_threads();
         let worker_threads = self.threading.num_threads();
@@ -343,6 +346,10 @@ impl Command for Duplex {
                 &self.io.input,
                 self.io.pipeline_reader_opts(),
             )?;
+            crate::commands::common::check_consensus_sort_order(
+                &header,
+                &self.io.input.display().to_string(),
+            )?;
             let header = crate::commands::common::add_pg_record(header, command_line)?;
             let read_name_prefix = self.read_group.prefix_or_from_header(&header);
             let methylation_ref: MethylationRef =
@@ -365,6 +372,10 @@ impl Command for Duplex {
         // Single-threaded fast path: open the raw reader once and derive the header from it.
         let (mut raw_reader, header) =
             create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())?;
+        crate::commands::common::check_consensus_sort_order(
+            &header,
+            &self.io.input.display().to_string(),
+        )?;
         let header = crate::commands::common::add_pg_record(header, command_line)?;
         let read_name_prefix = self.read_group.prefix_or_from_header(&header);
         let methylation_ref: MethylationRef =
@@ -547,6 +558,23 @@ impl Command for Duplex {
 }
 
 impl Duplex {
+    /// Validates command-line arguments prior to execution.
+    ///
+    /// Mirrors fgbio's `CallDuplexConsensusReads` argument validation: both the
+    /// pre- and post-UMI Phred-scaled error rates must be strictly greater than
+    /// zero. A rate of Q0 corresponds to `P(error) = 1`, which is nonsensical as
+    /// a prior and would corrupt the duplex consensus quality model, so fgbio
+    /// rejects it (`CallDuplexConsensusReads.scala:131-132`).
+    fn validate(&self) -> Result<()> {
+        if self.consensus.error_rate_pre_umi == 0 {
+            bail!("error-rate-pre-umi must be > 0");
+        }
+        if self.consensus.error_rate_post_umi == 0 {
+            bail!("error-rate-post-umi must be > 0");
+        }
+        Ok(())
+    }
+
     /// Execute using 7-step unified pipeline with --threads.
     ///
     /// This method is called when `--threads N` is specified with N > 1.
@@ -963,7 +991,8 @@ mod tests {
                 ),
             );
 
-        builder.build()
+        // Consensus callers require template-coordinate-sorted input (CONS-01).
+        fgumi_sam::header_as_template_coordinate(&builder.build())
     }
 
     fn to_record_buf(raw: fgumi_raw_bam::RawRecord) -> sam::alignment::RecordBuf {
@@ -1128,6 +1157,24 @@ mod tests {
     // ========================================================================
     // Unit Tests for Duplex Configuration
     // ========================================================================
+
+    /// DUP-01: fgbio's `CallDuplexConsensusReads` requires both Phred error rates > 0
+    /// (`CallDuplexConsensusReads.scala:131-132`); Q0 => P(err)=1, which fgbio rejects.
+    #[rstest]
+    #[case::defaults_valid(45, 40, true)]
+    #[case::zero_pre_umi_rejected(0, 40, false)]
+    #[case::zero_post_umi_rejected(45, 0, false)]
+    fn test_error_rate_validation(
+        #[case] pre_umi: u8,
+        #[case] post_umi: u8,
+        #[case] expect_ok: bool,
+    ) {
+        let mut duplex =
+            create_duplex_with_paths(PathBuf::from("test.bam"), PathBuf::from("output.bam"));
+        duplex.consensus.error_rate_pre_umi = pre_umi;
+        duplex.consensus.error_rate_post_umi = post_umi;
+        assert_eq!(duplex.validate().is_ok(), expect_ok);
+    }
 
     #[test]
     fn test_default_parameters() {
