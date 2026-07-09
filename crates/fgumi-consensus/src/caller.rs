@@ -448,16 +448,18 @@ impl RejectionReason {
             Self::QualityTooLow | Self::QualityTrimmed => CentralReason::LowBaseQuality,
             Self::FailedQC => CentralReason::NotPassingFilter,
             Self::MissingUmi => CentralReason::MissingUmi,
-            // For reasons that don't have a direct centralized equivalent,
-            // we use the closest semantic match
-            Self::FragmentRead => CentralReason::SameStrandOnly,
+            // fgbio maps unpaired/fragment reads to `non_paired_reads` and MI
+            // collisions to `potential_umi_collision`
+            // (UmiConsensusCaller.scala:81,83), not to `single_strand_only` /
+            // `duplicate_umi` — match fgbio's rejection accounting.
+            Self::FragmentRead => CentralReason::NonPairedReads,
             Self::Unmapped
             | Self::Mapped
             | Self::SecondaryOrSupplementary
             | Self::IndelErrorBetweenStrands => CentralReason::NoValidAlignment,
             Self::ZeroLengthAfterTrimming => CentralReason::ZeroBasesPostTrimming,
             Self::OrphanConsensus => CentralReason::OrphanConsensus,
-            Self::PotentialCollision => CentralReason::DuplicateUmi,
+            Self::PotentialCollision => CentralReason::PotentialUmiCollision,
         }
     }
 }
@@ -1067,7 +1069,7 @@ mod tests {
 
         // Test every variant maps to a centralized reason
         let mappings = [
-            (RejectionReason::FragmentRead, CentralReason::SameStrandOnly),
+            (RejectionReason::FragmentRead, CentralReason::NonPairedReads),
             (RejectionReason::InsufficientReads, CentralReason::InsufficientSupport),
             (RejectionReason::QualityTooLow, CentralReason::LowBaseQuality),
             (RejectionReason::Unmapped, CentralReason::NoValidAlignment),
@@ -1082,7 +1084,7 @@ mod tests {
             (RejectionReason::InsufficientOverlap, CentralReason::InsufficientSupport),
             (RejectionReason::OrphanConsensus, CentralReason::OrphanConsensus),
             (RejectionReason::IndelErrorBetweenStrands, CentralReason::NoValidAlignment),
-            (RejectionReason::PotentialCollision, CentralReason::DuplicateUmi),
+            (RejectionReason::PotentialCollision, CentralReason::PotentialUmiCollision),
             (RejectionReason::Other, CentralReason::InsufficientSupport),
         ];
 

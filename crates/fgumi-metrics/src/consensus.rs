@@ -123,6 +123,14 @@ pub struct ConsensusMetrics {
 
     /// Reads rejected due to zero bases after trimming
     pub rejected_zero_bases_post_trimming: u64,
+
+    /// Reads rejected due to being unpaired/fragment reads (fgbio
+    /// `non_paired_reads`; duplex/codec)
+    pub rejected_non_paired_reads: u64,
+
+    /// Reads rejected due to a potential collision between independent duplex
+    /// molecules (fgbio `potential_umi_collision`; duplex/codec)
+    pub rejected_potential_umi_collision: u64,
 }
 
 /// Core rejection reasons always included in KV metrics output.
@@ -134,7 +142,7 @@ const CORE_REJECTIONS: [RejectionReason; 4] = [
 ];
 
 /// Optional rejection reasons included in KV metrics output only when non-zero.
-const OPTIONAL_REJECTIONS: [RejectionReason; 14] = [
+const OPTIONAL_REJECTIONS: [RejectionReason; 16] = [
     RejectionReason::InsufficientStrandSupport,
     RejectionReason::LowBaseQuality,
     RejectionReason::ExcessiveNBases,
@@ -149,6 +157,8 @@ const OPTIONAL_REJECTIONS: [RejectionReason; 14] = [
     RejectionReason::UmiTooShort,
     RejectionReason::SameStrandOnly,
     RejectionReason::DuplicateUmi,
+    RejectionReason::NonPairedReads,
+    RejectionReason::PotentialUmiCollision,
 ];
 
 /// Returns an iterator over all rejection reasons (core + optional).
@@ -189,6 +199,8 @@ impl ConsensusMetrics {
             rejected_duplicate_umi: 0,
             rejected_orphan_consensus: 0,
             rejected_zero_bases_post_trimming: 0,
+            rejected_non_paired_reads: 0,
+            rejected_potential_umi_collision: 0,
         }
     }
 
@@ -214,6 +226,8 @@ impl ConsensusMetrics {
             RejectionReason::DuplicateUmi => self.rejected_duplicate_umi,
             RejectionReason::OrphanConsensus => self.rejected_orphan_consensus,
             RejectionReason::ZeroBasesPostTrimming => self.rejected_zero_bases_post_trimming,
+            RejectionReason::NonPairedReads => self.rejected_non_paired_reads,
+            RejectionReason::PotentialUmiCollision => self.rejected_potential_umi_collision,
         }
     }
 
@@ -243,6 +257,10 @@ impl ConsensusMetrics {
             RejectionReason::OrphanConsensus => self.rejected_orphan_consensus += count,
             RejectionReason::ZeroBasesPostTrimming => {
                 self.rejected_zero_bases_post_trimming += count;
+            }
+            RejectionReason::NonPairedReads => self.rejected_non_paired_reads += count,
+            RejectionReason::PotentialUmiCollision => {
+                self.rejected_potential_umi_collision += count;
             }
         }
     }

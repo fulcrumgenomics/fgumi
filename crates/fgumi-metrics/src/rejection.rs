@@ -48,6 +48,12 @@ pub enum RejectionReason {
     OrphanConsensus,
     /// Read had zero bases after quality trimming
     ZeroBasesPostTrimming,
+    /// Unpaired/fragment reads given to the duplex/codec caller (fgbio
+    /// `non_paired_reads`; used by duplex and codec)
+    NonPairedReads,
+    /// Potential collision between independent duplex molecules (fgbio
+    /// `potential_umi_collision`; used by duplex and codec)
+    PotentialUmiCollision,
 }
 
 impl RejectionReason {
@@ -74,6 +80,10 @@ impl RejectionReason {
             Self::DuplicateUmi => "Duplicate UMI at same genomic position",
             Self::OrphanConsensus => "Only one of R1 or R2 consensus generated",
             Self::ZeroBasesPostTrimming => "Read or mate had zero bases post trimming",
+            Self::NonPairedReads => "Unpaired/fragment reads not supported by Duplex caller",
+            Self::PotentialUmiCollision => {
+                "Potential collision between independent duplex molecules"
+            }
         }
     }
 
@@ -99,6 +109,8 @@ impl RejectionReason {
             Self::DuplicateUmi => "raw_reads_rejected_for_duplicate_umi",
             Self::OrphanConsensus => "raw_reads_rejected_for_orphan_consensus",
             Self::ZeroBasesPostTrimming => "raw_reads_rejected_for_zero_bases_post_trimming",
+            Self::NonPairedReads => "raw_reads_rejected_for_non_paired_reads",
+            Self::PotentialUmiCollision => "raw_reads_rejected_for_potential_umi_collision",
         }
     }
 
@@ -125,7 +137,29 @@ impl RejectionReason {
             Self::DuplicateUmi => "Duplicate UMI detected",
             Self::OrphanConsensus => "Only one of R1 or R2 consensus generated",
             Self::ZeroBasesPostTrimming => "Read or mate had zero bases post trimming",
+            Self::NonPairedReads => "Unpaired/fragment reads not supported by Duplex caller",
+            Self::PotentialUmiCollision => {
+                "Potential collision between independent duplex molecules"
+            }
         }
+    }
+
+    /// Whether the fgbio duplex caller emits (seeds) this rejection reason.
+    /// Mirrors fgbio's `usedByDuplex` flags on `RejectionReason`
+    /// (`UmiConsensusCaller.scala:60-88`) for the reasons fgumi shares with
+    /// fgbio; used to always-emit (seed to zero) the corresponding KV rows.
+    #[must_use]
+    pub fn used_by_duplex(&self) -> bool {
+        matches!(
+            self,
+            Self::InsufficientSupport
+                | Self::MinorityAlignment
+                | Self::OrphanConsensus
+                | Self::ZeroBasesPostTrimming
+                | Self::NonPairedReads
+                | Self::SameStrandOnly
+                | Self::PotentialUmiCollision
+        )
     }
 }
 
