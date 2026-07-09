@@ -19,8 +19,15 @@ use serde::{Deserialize, Deserializer, Serializer};
 /// Non-finite values become `Infinity`/`-Infinity`/`NaN` (readable by fgbio's
 /// `Double.parseDouble`); finite whole numbers drop the fractional part; all other
 /// finite values keep full precision.
-#[expect(clippy::trivially_copy_pass_by_ref, reason = "serde requires &T signature")]
-pub(crate) fn serialize<S>(value: &f64, serializer: S) -> Result<S::Ok, S::Error>
+///
+/// Intended for use as `#[serde(with = "fgumi_metrics::float")]` on `f64` metric
+/// fields so every crate's metric TSVs format floats consistently.
+///
+/// # Errors
+///
+/// Propagates any error from the underlying `serializer`.
+#[allow(clippy::trivially_copy_pass_by_ref, reason = "serde requires &T signature")]
+pub fn serialize<S>(value: &f64, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -49,7 +56,12 @@ where
 
 /// Deserializes an `f64` written by [`serialize`], accepting the non-finite
 /// tokens `NaN`, `Infinity`, and `-Infinity` in addition to ordinary numbers.
-pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<f64, D::Error>
+///
+/// # Errors
+///
+/// Returns an error if the underlying `deserializer` fails or the value is
+/// neither a recognized non-finite token nor a parseable number.
+pub fn deserialize<'de, D>(deserializer: D) -> Result<f64, D::Error>
 where
     D: Deserializer<'de>,
 {

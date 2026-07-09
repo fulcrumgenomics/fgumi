@@ -126,7 +126,12 @@ impl Command for DuplexMetrics {
         // Validate inputs
         validate_file_exists(&self.input, "input BAM file")?;
 
-        // Validate parameters
+        // Validate parameters (fgbio CollectDuplexSeqMetrics requires minAb >= 1,
+        // minBa >= 0, minBa <= minAb; DXM3-06). min_ab == 0 would label every
+        // family a duplex, so reject it like fgbio rather than proceeding.
+        if self.min_ab_reads == 0 {
+            anyhow::bail!("--min-ab-reads must be >= 1 (got {})", self.min_ab_reads);
+        }
         if self.min_ab_reads < self.min_ba_reads {
             anyhow::bail!(
                 "--min-ab-reads ({}) must be >= --min-ba-reads ({})",
@@ -776,6 +781,27 @@ mod tests {
     }
 
     // ==================== Test Cases ====================
+
+    /// DXM3-06: `--min-ab-reads 0` is rejected (fgbio validates `minAbReads >= 1`);
+    /// otherwise every tag family would be labeled a duplex.
+    #[test]
+    fn test_duplex_metrics_rejects_min_ab_reads_zero() -> Result<()> {
+        let (r1, r2) = build_test_pair("q1", 0, 100, 200, "AAA-GGG", "1/A", true, false);
+        let input = create_test_bam(vec![r1, r2])?;
+        let output_dir = TempDir::new()?;
+        let cmd = DuplexMetrics {
+            input: input.path().to_path_buf(),
+            output: output_dir.path().join("output"),
+            min_ab_reads: 0,
+            min_ba_reads: 0,
+            duplex_umi_counts: false,
+            intervals: None,
+            description: None,
+        };
+        let err = cmd.execute("test").expect_err("must reject --min-ab-reads 0");
+        assert!(err.to_string().contains("min-ab-reads must be >= 1"), "unexpected: {err}");
+        Ok(())
+    }
 
     #[test]
     fn test_count_umis_once_per_read_pair() -> Result<()> {
