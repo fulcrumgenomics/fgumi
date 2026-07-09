@@ -69,7 +69,7 @@ use fgumi_bam_io::{
 };
 use fgumi_raw_bam;
 use fgumi_raw_bam::{RawBamReader, RawRecord};
-use log::{info, warn};
+use log::{error, info, warn};
 use lru::LruCache;
 use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
@@ -535,6 +535,14 @@ impl CorrectUmis {
     ///
     /// * `umi_sequences` - Slice of UMI sequences to check
     fn check_umi_distances(&self, umi_sequences: &[String]) {
+        // fgbio computes `findUmiPairsWithinDistance(umis, minDistanceDiff - 1)`
+        // with signed arithmetic, so `--min-distance 0` yields a threshold of -1
+        // and reports no pairs (CorrectUmis.scala:180, exercised by
+        // CorrectUmisTest.scala:187). Reproduce that — and avoid the `usize`
+        // underflow that would otherwise wrap to `usize::MAX` and flag every pair.
+        if self.min_distance_diff == 0 {
+            return;
+        }
         let pairs = find_umi_pairs_within_distance(umi_sequences, self.min_distance_diff - 1);
 
         if !pairs.is_empty() {
@@ -638,6 +646,46 @@ impl CorrectUmis {
                 has_mismatches: false,
                 matches,
                 rejection_reason: RejectionReason::Mismatched,
+            }
+        }
+    }
+
+    /// Credits per-UMI correction metrics for one template's segment matches.
+    ///
+    /// Mirrors fgbio `CorrectUmis` (CorrectUmis.scala:218-232): the metric loop
+    /// runs for every correct-length template *before* the accept/reject
+    /// decision, so each matched segment credits its fixed UMI (bucketed by
+    /// mismatch count) and each unmatched segment credits the all-`N` bucket —
+    /// even when the template as a whole is rejected because a *different*
+    /// segment failed to match. Wrong-length and missing-UMI templates never
+    /// reach this with a populated `matches` (fgbio rejects them before
+    /// matching), so they contribute nothing to the per-UMI metrics.
+    ///
+    /// `num_records` scales fgbio's per-record accounting to fgumi's
+    /// per-template batching (both R1 and R2 of a template share one UMI).
+    fn credit_umi_metrics(
+        matches: &[UmiMatch],
+        num_records: u64,
+        unmatched_umi: &str,
+        umi_metrics: &mut AHashMap<String, UmiCorrectionMetrics>,
+    ) {
+        for m in matches {
+            if m.matched {
+                let entry = umi_metrics
+                    .entry(m.umi.clone())
+                    .or_insert_with(|| UmiCorrectionMetrics::new(m.umi.clone()));
+                entry.total_matches += num_records;
+                match m.mismatches {
+                    0 => entry.perfect_matches += num_records,
+                    1 => entry.one_mismatch_matches += num_records,
+                    2 => entry.two_mismatch_matches += num_records,
+                    _ => entry.other_matches += num_records,
+                }
+            } else {
+                umi_metrics
+                    .entry(unmatched_umi.to_string())
+                    .or_insert_with(|| UmiCorrectionMetrics::new(unmatched_umi.to_string()))
+                    .total_matches += num_records;
             }
         }
     }
@@ -898,14 +946,11 @@ impl CorrectUmis {
 
                         match umi_opt {
                             None => {
+                                // fgbio counts a missing-UMI read only in
+                                // `missingUmisRecords` and never credits the all-`N`
+                                // metric bucket (CorrectUmis.scala:199-202).
                                 let num_records = raw_records.len() as u64;
                                 missing_umis += num_records;
-                                let entry = umi_matches_map
-                                    .entry(unmatched_umi_for_process.clone())
-                                    .or_insert_with(|| {
-                                        UmiCorrectionMetrics::new(unmatched_umi_for_process.clone())
-                                    });
-                                entry.total_matches += num_records;
                                 if track_rejects {
                                     // Move out of `raw_records` (consumed here) to
                                     // avoid a per-record clone+memcpy on the rejects
@@ -927,24 +972,19 @@ impl CorrectUmis {
                                 );
                                 let num_records = raw_records.len() as u64;
 
-                                if correction.matched {
-                                    for m in &correction.matches {
-                                        if m.matched {
-                                            let entry = umi_matches_map
-                                                .entry(m.umi.clone())
-                                                .or_insert_with(|| {
-                                                    UmiCorrectionMetrics::new(m.umi.clone())
-                                                });
-                                            entry.total_matches += num_records;
-                                            match m.mismatches {
-                                                0 => entry.perfect_matches += num_records,
-                                                1 => entry.one_mismatch_matches += num_records,
-                                                2 => entry.two_mismatch_matches += num_records,
-                                                _ => entry.other_matches += num_records,
-                                            }
-                                        }
-                                    }
+                                // Credit per-segment metrics for every correct-length
+                                // template before the keep/reject decision, matching
+                                // fgbio (CorrectUmis.scala:218-232): a mismatched
+                                // template still credits its matched segments and the
+                                // all-`N` bucket for its unmatched segments.
+                                Self::credit_umi_metrics(
+                                    &correction.matches,
+                                    num_records,
+                                    &unmatched_umi_for_process,
+                                    &mut umi_matches_map,
+                                );
 
+                                if correction.matched {
                                     for mut raw in raw_records {
                                         Self::apply_correction_to_raw(
                                             &mut raw,
@@ -964,14 +1004,6 @@ impl CorrectUmis {
                                         }
                                         RejectionReason::None => {}
                                     }
-                                    let entry = umi_matches_map
-                                        .entry(unmatched_umi_for_process.clone())
-                                        .or_insert_with(|| {
-                                            UmiCorrectionMetrics::new(
-                                                unmatched_umi_for_process.clone(),
-                                            )
-                                        });
-                                    entry.total_matches += num_records;
                                     if track_rejects {
                                         // Move out of `raw_records` (consumed
                                         // here) to avoid a per-record clone.
@@ -1100,16 +1132,17 @@ impl CorrectUmis {
         info!("Total templates processed: {total_templates}");
 
         if total_missing > 0 || total_wrong_length > 0 {
-            warn!("###################################################################");
+            // fgbio logs this summary at error level (CorrectUmis.scala:275-280).
+            error!("###################################################################");
             if total_missing > 0 {
-                warn!("# {total_missing} were missing UMI attributes in the BAM file!");
+                error!("# {total_missing} were missing UMI attributes in the BAM file!");
             }
             if total_wrong_length > 0 {
-                warn!(
+                error!(
                     "# {total_wrong_length} had unexpected UMIs of differing lengths in the BAM file!"
                 );
             }
-            warn!("###################################################################");
+            error!("###################################################################");
         }
 
         // Check minimum correction ratio
@@ -1236,12 +1269,10 @@ impl CorrectUmis {
 
                 match umi_opt {
                     None => {
-                        // No UMI in any record - reject all records
+                        // fgbio counts a missing-UMI read only in
+                        // `missingUmisRecords` and never credits the all-`N`
+                        // metric bucket (CorrectUmis.scala:199-202).
                         missing_umis += num_records;
-                        umi_metrics
-                            .get_mut(&unmatched_umi)
-                            .expect("unmatched_umi key initialized in metrics map")
-                            .total_matches += num_records;
 
                         if track_rejects {
                             if let Some(rw) = reject_writer.as_mut() {
@@ -1263,23 +1294,19 @@ impl CorrectUmis {
                             &mut cache,
                         );
 
-                        if correction.matched {
-                            // Update metrics for matched UMIs (count per-read, not per-template)
-                            for m in &correction.matches {
-                                if m.matched {
-                                    let entry = umi_metrics.get_mut(&m.umi).expect(
-                                        "UMI key initialized in metrics map from allowed UMIs",
-                                    );
-                                    entry.total_matches += num_records;
-                                    match m.mismatches {
-                                        0 => entry.perfect_matches += num_records,
-                                        1 => entry.one_mismatch_matches += num_records,
-                                        2 => entry.two_mismatch_matches += num_records,
-                                        _ => entry.other_matches += num_records,
-                                    }
-                                }
-                            }
+                        // Credit per-segment metrics for every correct-length
+                        // template before the keep/reject decision, matching fgbio
+                        // (CorrectUmis.scala:218-232): a mismatched template still
+                        // credits its matched segments and the all-`N` bucket for its
+                        // unmatched segments.
+                        CorrectUmis::credit_umi_metrics(
+                            &correction.matches,
+                            num_records,
+                            &unmatched_umi,
+                            &mut umi_metrics,
+                        );
 
+                        if correction.matched {
                             // Apply correction to all records in template and write
                             for mut raw in raw_records.drain(..) {
                                 CorrectUmis::apply_correction_to_raw(
@@ -1297,10 +1324,6 @@ impl CorrectUmis {
                                 RejectionReason::Mismatched => mismatched += num_records,
                                 RejectionReason::None => {}
                             }
-                            umi_metrics
-                                .get_mut(&unmatched_umi)
-                                .expect("unmatched_umi key initialized in metrics map")
-                                .total_matches += num_records;
 
                             if track_rejects {
                                 if let Some(rw) = reject_writer.as_mut() {
@@ -1344,14 +1367,17 @@ impl CorrectUmis {
         info!("Total templates processed: {total_templates}");
 
         if missing_umis > 0 || wrong_length > 0 {
-            warn!("###################################################################");
+            // fgbio logs this summary at error level (CorrectUmis.scala:275-280).
+            error!("###################################################################");
             if missing_umis > 0 {
-                warn!("# {missing_umis} were missing UMI attributes in the BAM file!");
+                error!("# {missing_umis} were missing UMI attributes in the BAM file!");
             }
             if wrong_length > 0 {
-                warn!("# {wrong_length} had unexpected UMIs of differing lengths in the BAM file!");
+                error!(
+                    "# {wrong_length} had unexpected UMIs of differing lengths in the BAM file!"
+                );
             }
-            warn!("###################################################################");
+            error!("###################################################################");
         }
 
         // Check minimum correction ratio
@@ -2888,10 +2914,10 @@ mod tests {
         // Test that uncorrectable reads are tracked in an "NNNNNN" row
         let input = create_test_bam(vec![
             ("q1", Some("AAAAAA")), // Perfect match
-            ("q2", Some("GGGTTT")), // No match (too far from all UMIs)
+            ("q2", Some("GGGTTT")), // No match (too far from all UMIs) -> NNNNNN
             ("q3", Some("CCCCCC")), // Perfect match
-            ("q4", Some("ACTGAC")), // No match
-            ("q5", None),           // Missing UMI - should also count as unmatched
+            ("q4", Some("ACTGAC")), // No match -> NNNNNN
+            ("q5", None),           // Missing UMI - counted in missing, NOT NNNNNN (fgbio)
         ])?;
 
         let paths = TestPaths::new()?;
@@ -2931,10 +2957,12 @@ mod tests {
         assert!(unmatched.is_some(), "Unmatched UMI row (NNNNNN) not found in metrics");
 
         let unmatched = unmatched.expect("unmatched UMI row (NNNNNN) should be present");
-        // 3 uncorrectable reads: q2, q4, q5
+        // Only the two correct-length uncorrectable reads (q2, q4) credit NNNNNN.
+        // The missing-UMI read (q5) is counted separately and does NOT credit
+        // NNNNNN, matching fgbio (CorrectUmis.scala:199-202).
         assert_eq!(
-            unmatched.total_matches, 3,
-            "Unmatched row should have 3 total_matches for uncorrectable reads"
+            unmatched.total_matches, 2,
+            "Unmatched row should have 2 total_matches (q2, q4; missing-UMI q5 excluded)"
         );
         // All mismatch categories should be 0 for unmatched row (matches fgbio)
         assert_eq!(unmatched.perfect_matches, 0);
@@ -2942,6 +2970,149 @@ mod tests {
         assert_eq!(unmatched.two_mismatch_matches, 0);
         assert_eq!(unmatched.other_matches, 0);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_rejected_dual_umi_template_credits_matched_segment() -> Result<()> {
+        // COR-01/02: a dual-UMI template that is rejected because one segment
+        // fails to match must still credit the *matched* segment's UMI and the
+        // all-N bucket for the unmatched segment (fgbio CorrectUmis.scala:218-232,
+        // CorrectUmisTest.scala:159).
+        let input = create_test_bam(vec![
+            ("q1", Some("AAAAAA-ACTACT")), // ok-ko: AAAAAA matches, ACTACT does not
+        ])?;
+        let paths = TestPaths::new()?;
+
+        let corrector = CorrectUmis {
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
+            rejects_opts: RejectsOptions::default(),
+            metrics: Some(paths.metrics.clone()),
+            max_mismatches: 3,
+            min_distance_diff: 2,
+            umis: vec![
+                "AAAAAA".to_string(),
+                "CCCCCC".to_string(),
+                "GGGGGG".to_string(),
+                "TTTTTT".to_string(),
+            ],
+            umi_files: vec![],
+            dont_store_original_umis: false,
+            cache_size: 100_000,
+            min_corrected: None,
+            revcomp: false,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+        };
+
+        corrector.execute("test")?;
+
+        // The template is rejected (not in the corrected output)...
+        assert!(
+            read_bam_record_names(&paths.output)?.is_empty(),
+            "rejected template must not be output"
+        );
+
+        // ...but AAAAAA is still credited as a perfect match, and the unmatched
+        // ACTACT segment credits the all-N bucket.
+        let metrics = UmiCorrectionMetrics::read_metrics(&paths.metrics)?;
+        let by_umi = |u: &str| metrics.iter().find(|m| m.umi == u).cloned();
+
+        let aaaaaa = by_umi("AAAAAA").expect("AAAAAA metric present");
+        assert_eq!(aaaaaa.total_matches, 1, "AAAAAA credited despite template rejection");
+        assert_eq!(aaaaaa.perfect_matches, 1);
+
+        let nnnnnn = by_umi("NNNNNN").expect("NNNNNN metric present");
+        assert_eq!(nnnnnn.total_matches, 1, "unmatched segment credits NNNNNN once");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_wrong_length_umi_not_credited_to_nnnnnn() -> Result<()> {
+        // COR-02: a wrong-length UMI read is rejected and counted separately; it
+        // must NOT credit the all-N bucket (fgbio rejects it before matching,
+        // CorrectUmis.scala:205-212).
+        let input = create_test_bam(vec![
+            ("q1", Some("AAAAAA")), // exact match
+            ("q2", Some("ACGT")),   // wrong length (4 != 6)
+        ])?;
+        let paths = TestPaths::new()?;
+
+        let corrector = CorrectUmis {
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
+            rejects_opts: RejectsOptions::default(),
+            metrics: Some(paths.metrics.clone()),
+            max_mismatches: 2,
+            min_distance_diff: 2,
+            umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
+            umi_files: vec![],
+            dont_store_original_umis: false,
+            cache_size: 100_000,
+            min_corrected: None,
+            revcomp: false,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+        };
+
+        corrector.execute("test")?;
+
+        let metrics = UmiCorrectionMetrics::read_metrics(&paths.metrics)?;
+        let nnnnnn = metrics.iter().find(|m| m.umi == "NNNNNN").expect("NNNNNN metric present");
+        assert_eq!(
+            nnnnnn.total_matches, 0,
+            "wrong-length read must not credit NNNNNN (got {})",
+            nnnnnn.total_matches
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_min_distance_zero_runs_without_panic_or_spurious_warning() -> Result<()> {
+        // COR-03: `--min-distance 0` is valid (fgbio CorrectUmisTest.scala:187).
+        // Before the fix, `check_umi_distances` computed `min_distance_diff - 1`
+        // as a `usize`, which underflowed on 0 — panicking in debug builds and
+        // wrapping to `usize::MAX` (flagging every pair) in release.
+        let input = create_test_bam(vec![("q1", Some("AAAAAAAAA"))])?;
+        let paths = TestPaths::new()?;
+
+        let corrector = CorrectUmis {
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
+            rejects_opts: RejectsOptions::default(),
+            metrics: Some(paths.metrics.clone()),
+            max_mismatches: 4,
+            min_distance_diff: 0,
+            umis: vec!["AAAAAAAAA".to_string(), "TTTTTTTTT".to_string()],
+            umi_files: vec![],
+            dont_store_original_umis: false,
+            cache_size: 100_000,
+            min_corrected: None,
+            revcomp: false,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+        };
+
+        // Must not panic; the read matches exactly and is kept.
+        corrector.execute("test")?;
+        assert_eq!(read_bam_record_names(&paths.output)?, vec!["q1".to_string()]);
         Ok(())
     }
 
