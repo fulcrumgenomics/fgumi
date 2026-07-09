@@ -52,6 +52,9 @@ pub struct TemplateInfo {
     pub position: Option<i32>,
     /// Alignment end position (1-based), if mapped.
     pub end_position: Option<i32>,
+    /// `true` if read 1 (the first segment) is on the positive strand. Used to
+    /// orient duplex UMIs to the F1R2 reading of the top strand (DXM-02).
+    pub r1_positive: bool,
     /// Hash fraction for deterministic downsampling (computed once per template).
     pub hash_fraction: f64,
 }
@@ -575,6 +578,7 @@ where
             ref_name,
             position: Some(position),
             end_position: Some(end_position),
+            r1_positive: !r1_strand,
             hash_fraction,
         };
 

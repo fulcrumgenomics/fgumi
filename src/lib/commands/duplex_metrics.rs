@@ -312,15 +312,16 @@ impl DuplexMetrics {
         // `simplex_metrics::process_coordinate_group` already uses for its
         // `ss_groups` map.
         //
-        // The inner `Vec<(&str, &str)>` stored as `ds_groups` entry.2 is
+        // The inner `Vec<(&str, &str, bool)>` stored as `ds_groups` entry.2 is
         // still freed per entry on `.clear()`. Combined with the
         // `is_full_fraction` gate below, that inner Vec now allocates exactly
         // once per coordinate group (at the 100% fraction) rather than once
-        // per fraction × per `or_default()` slot.
+        // per fraction × per `or_default()` slot. The `bool` is `r1_positive`
+        // (read 1 on the positive strand), used to orient the duplex UMI.
         let mut downsampled: Vec<&TemplateMetadata> = Vec::new();
         let mut ss_groups: HashMap<&str, usize> = HashMap::new();
         #[allow(clippy::type_complexity)]
-        let mut ds_groups: HashMap<&str, (usize, usize, Vec<(&str, &str)>)> = HashMap::new();
+        let mut ds_groups: HashMap<&str, (usize, usize, Vec<(&str, &str, bool)>)> = HashMap::new();
 
         // For each fraction: filter ONCE, then groupBy (like fgbio)
         for (idx, &fraction) in fractions.iter().enumerate() {
@@ -361,7 +362,11 @@ impl DuplexMetrics {
                     entry.1 += 1;
                 }
                 if is_full_fraction {
-                    entry.2.push((m.template.mi.as_str(), m.template.rx.as_str()));
+                    entry.2.push((
+                        m.template.mi.as_str(),
+                        m.template.rx.as_str(),
+                        m.template.r1_positive,
+                    ));
                 }
             }
 
@@ -554,18 +559,17 @@ impl DuplexMetrics {
         &self,
         collector: &mut DuplexMetricsCollector,
         umi_consensus_caller: &mut SimpleUmiConsensusCaller,
-        group_pairs: &[(&str, &str)],
+        group_pairs: &[(&str, &str, bool)],
         base_umi: &str,
         _a_count: usize,
         _b_count: usize,
     ) {
-        // Collect individual UMI parts from each strand's RX tag
-        // For /A strand: split RX "AAA-TTT" → umi1s += "AAA", umi2s += "TTT"
-        // For /B strand: split RX "TTT-AAA" → umi1s += "AAA", umi2s += "TTT" (swapped)
+        // Collect the two UMI positions, each oriented to the F1R2 reading of the
+        // top strand. umi1s holds the leading half, umi2s the trailing half.
         let mut umi1s = Vec::new();
         let mut umi2s = Vec::new();
 
-        for &(mi, rx) in group_pairs {
+        for &(mi, rx, r1_positive) in group_pairs {
             // Check if this MI tag belongs to the current base_umi family
             let mi_base = extract_mi_base(mi);
 
@@ -588,15 +592,19 @@ impl DuplexMetrics {
             // counts them, recording the empty half as an empty-string UMI, so
             // single-index / single-strand designs are not undercounted (DXM-01).
 
-            // Add UMI parts based on strand. The String allocations here are
-            // bounded by the consensus caller's `&[String]` signature; only the
-            // post-filter (base-matching, non-empty parts) subset is cloned.
-            if mi.ends_with("/A") {
-                // For /A strand: u1 goes to umi1s, u2 goes to umi2s
+            // Orient by the actual R1 strand, not the MI `/A`,`/B` suffix (which is
+            // not strand-reliable — e.g. an `/A` family can be on the negative
+            // strand). If R1 is on the positive strand the molecule was read
+            // top-strand-first, so the RX is already `u1-u2`; otherwise it was read
+            // bottom-strand-first, so swap the halves. Because metrics collection is
+            // R1-only, this reproduces fgbio's per-read F1R2 normalization
+            // (CollectDuplexSeqMetrics.scala:407-408) and its duplex-UMI orientation
+            // pick (:419-425), which then reduces to "lead with the positive-strand
+            // read's half" (DXM-02).
+            if r1_positive {
                 umi1s.push(parts[0].to_string());
                 umi2s.push(parts[1].to_string());
-            } else if mi.ends_with("/B") {
-                // For /B strand: u2 goes to umi1s, u1 goes to umi2s (swapped)
+            } else {
                 umi1s.push(parts[1].to_string());
                 umi2s.push(parts[0].to_string());
             }
@@ -633,7 +641,7 @@ impl DuplexMetrics {
             let expected_duplex2 = format!("{}-{}", consensus_umis[1], consensus_umis[0]);
             let error_count = group_pairs
                 .iter()
-                .filter(|&&(mi, rx)| {
+                .filter(|&&(mi, rx, _r1_positive)| {
                     let mi_base = extract_mi_base(mi);
                     mi_base == base_umi
                         && rx != expected_duplex1.as_str()
@@ -892,6 +900,63 @@ mod tests {
         assert_eq!(duplex_metric.raw_observations, 6);
         // A and B strands are now in the same coordinate group (same DS family)
         assert_eq!(duplex_metric.unique_observations, 1);
+
+        Ok(())
+    }
+
+    /// DXM-02: the `--duplex-umi-counts` duplex UMI must be oriented to the F1R2
+    /// reading of the top strand, by the actual R1 strand — not the MI `/A`,`/B`
+    /// suffix (which is not strand-reliable). fgbio reports a read pair with UMI
+    /// `u1-u2` as `u1-u2` when R1 is on the positive strand, and as `u2-u1` when R1 is
+    /// on the negative strand (`CollectDuplexSeqMetrics.scala:419-425`; docstring
+    /// example `AAAA-GGGG`, R1 negative → `GGGG-AAAA`). Previously fgumi always led
+    /// with the `/A` half, so a reverse-strand-first family was recorded in the wrong
+    /// orientation.
+    #[test]
+    fn test_duplex_umi_orientation_follows_r1_strand() -> Result<()> {
+        let mut records = Vec::new();
+
+        // Reverse-strand-first single-strand family: RX "ACC-TGG" with R1 on the
+        // negative strand → must be reported flipped as "TGG-ACC".
+        let (r1, r2) = build_test_pair("qR", 0, 300, 400, "ACC-TGG", "1/A", false, true);
+        records.push(r1);
+        records.push(r2);
+
+        // Forward-strand-first single-strand family: RX "GAT-CCA" with R1 on the
+        // positive strand → reported as-is, "GAT-CCA".
+        let (r1, r2) = build_test_pair("qF", 0, 1000, 1100, "GAT-CCA", "2/A", true, false);
+        records.push(r1);
+        records.push(r2);
+
+        let input = create_test_bam(records)?;
+        let output_dir = TempDir::new()?;
+        let output = output_dir.path().join("output");
+
+        let cmd = DuplexMetrics {
+            input: input.path().to_path_buf(),
+            output: output.clone(),
+            min_ab_reads: 1,
+            min_ba_reads: 1,
+            duplex_umi_counts: true,
+            intervals: None,
+            description: None,
+        };
+        cmd.execute("test")?;
+
+        let duplex_umi_path = format!("{}.duplex_umi_counts.txt", output.display());
+        let duplex_umi_metrics: Vec<DuplexUmiMetric> =
+            DelimFile::default().read_tsv(&duplex_umi_path)?;
+        let umis: std::collections::HashSet<&str> =
+            duplex_umi_metrics.iter().map(|m| m.umi.as_str()).collect();
+
+        assert!(
+            umis.contains("TGG-ACC"),
+            "reverse-strand-first family must be flipped to TGG-ACC, got {umis:?}"
+        );
+        assert!(
+            umis.contains("GAT-CCA"),
+            "forward-strand-first family must stay GAT-CCA, got {umis:?}"
+        );
 
         Ok(())
     }
@@ -1805,6 +1870,7 @@ mod tests {
             ref_name: Some("chr1".to_string()),
             position: Some(1000),
             end_position: Some(1100),
+            r1_positive: true,
             hash_fraction: 0.5,
         };
 
@@ -1825,6 +1891,7 @@ mod tests {
             ref_name: None,
             position: None,
             end_position: None,
+            r1_positive: true,
             hash_fraction: 0.5,
         };
         assert!(!overlaps_intervals(&unmapped, &intervals));
