@@ -2393,6 +2393,45 @@ mod tests {
         assert!(truncated.iter().all(|u| u.len() == 5));
     }
 
+    /// `--min-umi-length` truncates every UMI to a common length before assignment,
+    /// which is what lets variable-length UMIs pass the assigner's uniform-length
+    /// guard (`assert_uniform_umi_length`, tracker GRP-01). Exercise the full
+    /// truncate -> assign composition so a regression in truncation would trip the
+    /// guard here rather than in production.
+    #[test]
+    fn test_variable_length_umis_group_after_truncation() {
+        // Variable-length single-segment UMIs. After truncating to 6 bases the near-neighbor
+        // stays DISTINCT (AACCGA vs AACCGG — a single mismatch) rather than collapsing to the
+        // same bytes, so grouping it relies on real adjacency (edit-distance) clustering, not
+        // exact match. A 3:1 count gradient makes the low-count neighbor get absorbed.
+        let umis = vec![
+            "AACCGGT".to_string(),  // -> AACCGG (parent, x3)
+            "AACCGGA".to_string(),  // -> AACCGG
+            "AACCGG".to_string(),   // -> AACCGG
+            "AACCGATT".to_string(), // -> AACCGA (1 mismatch from AACCGG, x1 -> merges)
+            "TTGGAAC".to_string(),  // -> TTGGAA (distinct -> its own molecule)
+        ];
+        let truncated =
+            truncate_umis_impl(umis, Some(6)).expect("truncation to a present minimum succeeds");
+        assert!(truncated.iter().all(|u| u.len() == 6), "truncation must yield uniform lengths");
+        // The near-neighbor is distinct after truncation (not byte-identical) — so it can only
+        // group with the parent via adjacency, not exact match.
+        assert_eq!(truncated[3], "AACCGA");
+        assert_ne!(truncated[0], truncated[3], "truncated UMIs must stay distinct");
+
+        // Sequential adjacency assigner, max 1 mismatch (num_threads = 1, use_parallel = false).
+        let assigner = create_umi_assigner(Strategy::Adjacency, 1, 100, 1, false);
+        let assignments = assigner.assign(&truncated);
+
+        assert_eq!(assignments.len(), 5);
+        // All four AACCGG/AACCGA reads cluster into one molecule via 1-mismatch adjacency.
+        assert!(
+            assignments[..4].iter().all(|a| *a == assignments[0]),
+            "the 1-mismatch neighbor must be adjacency-clustered with the parent: {assignments:?}"
+        );
+        assert_ne!(assignments[0], assignments[4], "the distinct UMI forms its own molecule");
+    }
+
     #[test]
     fn test_truncate_umis_none_returns_unchanged() {
         let tool = test_group_cmd(Strategy::Identity, 0);

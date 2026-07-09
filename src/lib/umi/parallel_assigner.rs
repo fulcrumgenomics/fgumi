@@ -20,7 +20,28 @@ use rayon::prelude::*;
 use crate::bitenc::BitEnc;
 use crate::template::MoleculeId;
 
+use fgumi_umi::assigner::assert_uniform_umi_length;
+
 use super::{Umi, UmiAssigner};
+
+/// Assign each distinct invalid (non-encodable) UMI its own molecule, with identical uppercased
+/// strings sharing -- mirroring fgbio's `Map[Umi, MoleculeId]` (every UMI it sees is assigned a
+/// molecule) and the sequential assigners. Used for the "all UMIs invalid" edge case shared by
+/// every parallel assigner.
+fn all_invalid_molecule_ids(raw_umis: &[Umi]) -> Vec<MoleculeId> {
+    let mut invalid_to_id: AHashMap<String, MoleculeId> = AHashMap::new();
+    let mut next_mol_id: u64 = 0;
+    raw_umis
+        .iter()
+        .map(|umi| {
+            *invalid_to_id.entry(umi.to_uppercase()).or_insert_with(|| {
+                let id = MoleculeId::Single(next_mol_id);
+                next_mol_id += 1;
+                id
+            })
+        })
+        .collect()
+}
 
 /// Thread-safe union-find data structure for parallel connected component discovery.
 ///
@@ -370,14 +391,19 @@ impl UmiAssigner for ParallelEditAssigner {
             }
         }
 
-        // Handle edge case: no valid UMIs
+        // Handle edge case: no valid UMIs. Give each distinct invalid string its own molecule
+        // (identical strings share), mirroring fgbio's per-string assignment and the sequential
+        // edit assigner.
         if umi_counts.is_empty() {
-            // All UMIs were invalid - each gets its own molecule ID
-            return (0..raw_umis.len()).map(|i| MoleculeId::Single(i as u64)).collect();
+            return all_invalid_molecule_ids(raw_umis);
         }
 
         // Convert to indexed list (order doesn't matter for Edit strategy)
         let unique_umis: Vec<(BitEnc, usize)> = umi_counts.into_iter().collect();
+
+        // Reject differing-length UMIs the way fgbio (and the sequential assigner) does.
+        assert_uniform_umi_length(unique_umis.iter().map(|(enc, _)| enc.len()));
+
         let enc_to_idx: AHashMap<BitEnc, usize> =
             unique_umis.iter().enumerate().map(|(i, (enc, _))| (*enc, i)).collect();
 
@@ -393,10 +419,11 @@ impl UmiAssigner for ParallelEditAssigner {
 
         // Assign molecule IDs based on connected components
         let mut root_to_mol: AHashMap<usize, MoleculeId> = AHashMap::new();
+        let mut invalid_to_id: AHashMap<String, MoleculeId> = AHashMap::new();
         let mut next_mol_id: u64 = 0;
 
         let mut result = Vec::with_capacity(raw_umis.len());
-        for enc_opt in &umi_to_original {
+        for (raw, enc_opt) in raw_umis.iter().zip(&umi_to_original) {
             let mol_id = if let Some(enc) = enc_opt {
                 let idx = enc_to_idx[enc];
                 let root = uf.find(idx);
@@ -406,10 +433,15 @@ impl UmiAssigner for ParallelEditAssigner {
                     id
                 })
             } else {
-                // Invalid UMI gets its own molecule ID (consistent with sequential)
-                let id = MoleculeId::Single(next_mol_id);
-                next_mol_id += 1;
-                id
+                // Each distinct invalid (non-encodable) UMI gets its own molecule (identical
+                // strings share), mirroring fgbio's per-string assignment and the sequential
+                // edit assigner. Invalid UMIs never join a valid molecule. See the
+                // cross-assigner parity note in the tests module.
+                *invalid_to_id.entry(raw.to_uppercase()).or_insert_with(|| {
+                    let id = MoleculeId::Single(next_mol_id);
+                    next_mol_id += 1;
+                    id
+                })
             };
             result.push(mol_id);
         }
@@ -472,10 +504,11 @@ impl UmiAssigner for ParallelAdjacencyAssigner {
             })
             .collect();
 
-        // Handle edge case: no valid UMIs
+        // Handle edge case: no valid UMIs. Give each distinct invalid string its own molecule
+        // (identical strings share), mirroring fgbio's per-string assignment and the sequential
+        // adjacency assigner.
         if sorted_umis.is_empty() {
-            // All UMIs were invalid - each gets its own molecule ID
-            return (0..raw_umis.len()).map(|i| MoleculeId::Single(i as u64)).collect();
+            return all_invalid_molecule_ids(raw_umis);
         }
 
         // Sort by count descending, then by the case-folded UMI string for determinism.
@@ -488,6 +521,9 @@ impl UmiAssigner for ParallelAdjacencyAssigner {
         // Build indexed structures (avoid cloning strings by using indices)
         let unique_umis: Vec<(BitEnc, usize)> =
             sorted_umis.iter().map(|(_, count, enc)| (*enc, *count)).collect();
+
+        // Reject differing-length UMIs the way fgbio (and the sequential assigner) does.
+        assert_uniform_umi_length(unique_umis.iter().map(|(enc, _)| enc.len()));
 
         // Phase 1: Parallel edge discovery (using configured thread pool)
         let max_mismatches = self.max_mismatches;
@@ -549,16 +585,21 @@ impl UmiAssigner for ParallelAdjacencyAssigner {
             .map(|(i, (umi, _, _))| (umi.as_str(), mol_ids[i]))
             .collect();
 
-        // Map back to original UMI order
+        // Map back to original UMI order. Each distinct invalid (non-encodable) UMI gets its own
+        // molecule (identical strings share, continuing the `next_mol_id` sequence), mirroring
+        // fgbio's per-string assignment and the sequential adjacency assigner. Invalid UMIs never
+        // join a valid molecule. See the cross-assigner parity note in the tests module.
+        let mut invalid_to_id: AHashMap<String, MoleculeId> = AHashMap::new();
         raw_umis
             .iter()
             .map(|umi| {
                 let upper = umi.to_uppercase();
                 str_to_mol.get(upper.as_str()).copied().unwrap_or_else(|| {
-                    // Invalid UMI gets its own molecule ID (consistent with Edit assigner)
-                    let id = MoleculeId::Single(next_mol_id);
-                    next_mol_id += 1;
-                    id
+                    *invalid_to_id.entry(upper).or_insert_with(|| {
+                        let id = MoleculeId::Single(next_mol_id);
+                        next_mol_id += 1;
+                        id
+                    })
                 })
             })
             .collect()
@@ -651,9 +692,11 @@ impl UmiAssigner for ParallelPairedAssigner {
             })
             .collect();
 
-        // Handle edge case: no valid UMIs
+        // Handle edge case: no valid UMIs. Give each distinct invalid string its own molecule
+        // (identical strings share), mirroring fgbio's per-string assignment, the main path
+        // below, and the sequential paired assigner.
         if sorted_umis.is_empty() {
-            return (0..raw_umis.len()).map(|i| MoleculeId::Single(i as u64)).collect();
+            return all_invalid_molecule_ids(raw_umis);
         }
 
         // Sort by count descending, then by UMI string for determinism
@@ -662,6 +705,10 @@ impl UmiAssigner for ParallelPairedAssigner {
         // Build indexed structures
         let unique_umis: Vec<(BitEnc, usize)> =
             sorted_umis.iter().map(|(_, count, enc)| (*enc, *count)).collect();
+
+        // Reject differing-length paired UMIs the way fgbio (and the sequential assigner)
+        // does. `BitEnc::len` excludes the dash, so this compares base length.
+        assert_uniform_umi_length(unique_umis.iter().map(|(enc, _)| enc.len()));
 
         // Phase 1: Parallel edge discovery (using configured thread pool)
         // Use max_mismatches directly (not 2x) because canonicalization already handles
@@ -720,7 +767,12 @@ impl UmiAssigner for ParallelPairedAssigner {
             .map(|(i, (umi, _, _))| (umi.as_str(), mol_ids[i]))
             .collect();
 
-        // Map back to original UMI order with strand assignment
+        // Map back to original UMI order with strand assignment. Each distinct invalid
+        // (non-encodable) UMI gets its own molecule keyed by its canonical form (identical
+        // strings share), mirroring fgbio's per-string assignment and the sequential paired
+        // assigner. An unencodable UMI has no valid strand, so it is a plain `Single`, not a
+        // `PairedA`/`PairedB`. See the cross-assigner parity note in the tests module.
+        let mut invalid_to_id: AHashMap<String, MoleculeId> = AHashMap::new();
         raw_umis
             .iter()
             .map(|umi| {
@@ -733,8 +785,11 @@ impl UmiAssigner for ParallelPairedAssigner {
                         MoleculeId::PairedB(base_id)
                     }
                 } else {
-                    // Invalid UMI
-                    MoleculeId::None
+                    *invalid_to_id.entry(canonical).or_insert_with(|| {
+                        let id = MoleculeId::Single(next_mol_id);
+                        next_mol_id += 1;
+                        id
+                    })
                 }
             })
             .collect()
@@ -752,6 +807,8 @@ impl UmiAssigner for ParallelPairedAssigner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::umi::{AdjacencyUmiAssigner, PairedUmiAssigner, SimpleErrorUmiAssigner};
+    use rstest::rstest;
 
     // ==================== UnionFind Tests ====================
 
@@ -1051,6 +1108,77 @@ mod tests {
         assert_eq!(assignments.len(), 1);
     }
 
+    // fgbio's GroupReadsByUmi throws on UMIs of differing length; every parallel
+    // mismatch-based assigner must reject them the same way rather than silently
+    // under-group (tracker GRP-01), matching the sequential assigners.
+    #[rstest]
+    #[case::edit(|| Box::new(ParallelEditAssigner::new(1, 2)) as Box<dyn UmiAssigner>, &["AAAA", "AAA"])]
+    #[case::adjacency(
+        || Box::new(ParallelAdjacencyAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["AAAA", "AAA"]
+    )]
+    #[case::paired(
+        || Box::new(ParallelPairedAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["ACT-ACT", "ACT-AC"]
+    )]
+    #[should_panic(expected = "Multiple UMI lengths")]
+    fn test_parallel_assigner_rejects_differing_umi_lengths(
+        #[case] make: fn() -> Box<dyn UmiAssigner>,
+        #[case] umis: &[&str],
+    ) {
+        let assigner = make();
+        let umis: Vec<Umi> = umis.iter().map(|s| (*s).to_string()).collect();
+        let _ = assigner.assign(&umis);
+    }
+
+    // Complement to `test_parallel_assigner_rejects_differing_umi_lengths`: a non-encodable
+    // (invalid-base) UMI whose length differs from the valid UMIs must NOT trip the
+    // differing-length guard. The parallel assigners never feed non-encodable UMIs into the
+    // length check (they are dropped during graph construction), so the mixed valid/invalid
+    // GRP-01 parity scenario groups the valid UMIs together and gives the invalid one its own
+    // molecule instead of panicking. This mirrors the sequential
+    // `test_sequential_assigner_excludes_invalid_umis_from_length_guard` and guards against a
+    // future refactor moving the guard ahead of the encoding filter and silently reintroducing
+    // the parity break. Cross-assigner grouping parity for invalid UMIs is enforced separately
+    // by `test_sequential_and_parallel_assigners_induce_same_partition`.
+    //
+    // fgbio divergence here is *intentional*, so these assertions encode fgumi's chosen behavior
+    // rather than fgbio parity: fgbio never drops non-encodable UMIs, so on this exact mixed input
+    // its assigners reject the whole family instead of grouping the valid subset. The Edit strategy
+    // (SimpleErrorUmiAssigner) throws via Sequences.countMismatches's require(s1.length == s2.length)
+    // (fgbio Sequences.scala:99), and Paired (PairedUmiAssigner extends AdjacencyUmiAssigner) throws
+    // via the umiLength require (fgbio GroupReadsByUmi.scala:283) -- both see the length-3 NNN /
+    // length-5 NN-NN beside the length-4 AAAA / length-7 ACT-ACT. fgumi deliberately tolerates
+    // invalid-base UMIs of a differing length by excluding them from the guard (GRP-01) and grouping
+    // only the encodable UMIs. Differing-length *valid* UMIs still match fgbio by rejecting (see
+    // test_parallel_assigner_rejects_differing_umi_lengths).
+    #[rstest]
+    #[case::edit(
+        || Box::new(ParallelEditAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["AAAA", "AAAA", "NNN"]
+    )]
+    #[case::paired(
+        || Box::new(ParallelPairedAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["ACT-ACT", "ACT-ACT", "NN-NN"]
+    )]
+    fn test_parallel_assigner_excludes_invalid_umis_from_length_guard(
+        #[case] make: fn() -> Box<dyn UmiAssigner>,
+        #[case] umis: &[&str],
+    ) {
+        let assigner = make();
+        let umis: Vec<Umi> = umis.iter().map(|s| (*s).to_string()).collect();
+        // Must not panic despite the invalid UMI having a different length.
+        let ids = assigner.assign(&umis);
+        assert_eq!(ids.len(), umis.len());
+        assert_eq!(ids[0], ids[1], "identical valid UMIs must share a molecule");
+        assert_ne!(ids[0], ids[2], "invalid-base UMI must not join the valid molecule");
+        assert_ne!(
+            ids[2],
+            MoleculeId::None,
+            "invalid-base UMI gets its own molecule (fgbio assigns every UMI a molecule)"
+        );
+    }
+
     #[test]
     fn test_parallel_edit_identical_umis() {
         let assigner = ParallelEditAssigner::new(1, 2);
@@ -1118,20 +1246,35 @@ mod tests {
         assert_eq!(assignments[1], assignments[2]);
     }
 
-    #[test]
-    fn test_parallel_edit_invalid_umis() {
-        let assigner = ParallelEditAssigner::new(1, 2);
-        let umis: Vec<String> = vec!["ACGT", "ACGN", "ACGT"] // ACGN is invalid
+    // Run on BOTH the sequential and parallel edit assigners: an invalid (non-encodable) UMI must
+    // get its own molecule -- distinct from any valid molecule -- by each, while the surrounding
+    // valid UMIs still group. This mirrors fgbio's per-string molecule assignment (every UMI it
+    // sees gets a molecule). `ACGN` is a same-length 1-mismatch neighbour of `ACGT`; the
+    // sequential assigner used to string-match and *group* it (fgbio does group N-neighbours,
+    // but the parallel BitEnc path structurally cannot), so this pins the corrected,
+    // implementation-independent behavior: `ACGN` is isolated, not merged into `ACGT`.
+    #[rstest]
+    #[case::sequential(|| Box::new(SimpleErrorUmiAssigner::new(1)) as Box<dyn UmiAssigner>)]
+    #[case::parallel(|| Box::new(ParallelEditAssigner::new(1, 2)) as Box<dyn UmiAssigner>)]
+    fn test_edit_invalid_umis_get_own_molecule(#[case] make: fn() -> Box<dyn UmiAssigner>) {
+        let assigner = make();
+        let umis: Vec<String> = vec!["ACGT", "ACGN", "ACGT"] // ACGN is invalid (non-encodable)
             .into_iter()
             .map(String::from)
             .collect();
 
         let assignments = assigner.assign(&umis);
 
-        // Valid UMIs should be grouped
-        assert_eq!(assignments[0], assignments[2]);
-        // Invalid UMI gets its own ID
-        assert_ne!(assignments[0], assignments[1]);
+        // Valid UMIs group together.
+        assert_eq!(assignments[0], assignments[2], "identical valid UMIs must share a molecule");
+        // The invalid UMI gets its own molecule, distinct from the valid one (never merged into
+        // it), and it is a real assignment rather than left unassigned.
+        assert_ne!(assignments[1], assignments[0], "invalid UMI must not join the valid molecule");
+        assert_ne!(
+            assignments[1],
+            MoleculeId::None,
+            "invalid UMI gets its own molecule (fgbio assigns every UMI a molecule)"
+        );
     }
 
     // ==================== Adjacency Assigner Tests ====================
@@ -1369,6 +1512,125 @@ mod tests {
         );
         assert_ne!(sequential[0], sequential[2], "reverse spelling is the opposite strand");
         assert_ne!(parallel[0], parallel[2], "parallel: reverse spelling is the opposite strand");
+    }
+
+    // ==================== Cross-assigner parity (sequential vs parallel) ====================
+    //
+    // Production selects between the sequential and parallel assigners purely on the worker
+    // thread count (`create_umi_assigner` in `commands/group.rs`: `use_parallel && threads > 1`
+    // picks the parallel struct, otherwise the sequential one). The two MUST induce the same
+    // partition of the input UMIs for every strategy, or the same reads group differently
+    // depending only on `--threads` -- a silent, user-visible correctness bug.
+    //
+    // Invalid (non-ACGT-encodable, e.g. `N`-containing) UMIs are the sharp edge. fgbio's
+    // assigner returns a `Map[Umi, MoleculeId]` keyed by the UMI string, so *every* UMI it sees
+    // gets a molecule: identical strings always share, distinct strings never merge. fgumi
+    // mirrors that model: an invalid UMI forms its own molecule keyed by its uppercased string --
+    // distinct from every valid molecule and from every other distinct invalid string, with
+    // identical invalid strings sharing. The one thing fgumi cannot mirror is fgbio grouping a
+    // near (within-threshold) `N`-neighbour -- fgbio treats `N` as a mismatch character, but
+    // `BitEnc` cannot represent `N`, so fgumi isolates such a UMI instead. Both fgumi assigners
+    // agree on that isolation, which is what this harness pins.
+    //
+    // These inputs are rare but reachable: fgumi (like fgbio, GroupReadsByUmi.scala:673) filters
+    // only *uppercase* `N` UMIs upstream (`validate_umi` -> `discarded_ns_in_umi`), so a UMI with
+    // a lowercase `n` or a non-ACGT IUPAC base passes the filter (as it does in fgbio) and reaches
+    // `assign()` as non-encodable. The two implementations must therefore agree on it.
+    //
+    // `same_partition` compares grouping structure only, ignoring concrete `MoleculeId`
+    // labels, so it is robust to the two assigners numbering molecules in different orders.
+    #[rstest]
+    // --- Edit strategy ---
+    #[case::edit_valid_grouping(
+        || Box::new(SimpleErrorUmiAssigner::new(1)) as Box<dyn UmiAssigner>,
+        || Box::new(ParallelEditAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["ACGT", "ACGT", "ACGA", "TTTT"]
+    )]
+    #[case::edit_duplicate_invalid(
+        || Box::new(SimpleErrorUmiAssigner::new(1)) as Box<dyn UmiAssigner>,
+        || Box::new(ParallelEditAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["AAAA", "NNN", "NNN"]
+    )]
+    #[case::edit_distinct_invalid(
+        || Box::new(SimpleErrorUmiAssigner::new(1)) as Box<dyn UmiAssigner>,
+        || Box::new(ParallelEditAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["AAAA", "NNNN", "XXXX"]
+    )]
+    #[case::edit_invalid_within_threshold(
+        || Box::new(SimpleErrorUmiAssigner::new(1)) as Box<dyn UmiAssigner>,
+        || Box::new(ParallelEditAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["ACGT", "ACGN", "ACGT"]
+    )]
+    // --- Adjacency strategy ---
+    #[case::adjacency_valid_grouping(
+        || Box::new(AdjacencyUmiAssigner::new(1, 1, 100)) as Box<dyn UmiAssigner>,
+        || Box::new(ParallelAdjacencyAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["AAAA", "AAAA", "AAAT"]
+    )]
+    #[case::adjacency_single_invalid(
+        || Box::new(AdjacencyUmiAssigner::new(1, 1, 100)) as Box<dyn UmiAssigner>,
+        || Box::new(ParallelAdjacencyAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["AAAA", "NNN"]
+    )]
+    #[case::adjacency_duplicate_invalid_fast_path(
+        || Box::new(AdjacencyUmiAssigner::new(1, 1, 100)) as Box<dyn UmiAssigner>,
+        || Box::new(ParallelAdjacencyAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["AAAA", "AAAA", "NNN", "NNN"]
+    )]
+    #[case::adjacency_duplicate_invalid_normal_path(
+        || Box::new(AdjacencyUmiAssigner::new(1, 1, 100)) as Box<dyn UmiAssigner>,
+        || Box::new(ParallelAdjacencyAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["AAAA", "GGGG", "NNN", "NNN"]
+    )]
+    // --- Paired strategy ---
+    #[case::paired_valid_grouping(
+        || Box::new(PairedUmiAssigner::new(1)) as Box<dyn UmiAssigner>,
+        || Box::new(ParallelPairedAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["ACT-ACT", "ACT-ACT", "ACT-TGA"]
+    )]
+    #[case::paired_duplicate_invalid(
+        || Box::new(PairedUmiAssigner::new(1)) as Box<dyn UmiAssigner>,
+        || Box::new(ParallelPairedAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["ACT-ACT", "NN-NN", "NN-NN"]
+    )]
+    // Same-length invalid neighbour: `ACGN-TTTT` is a 1-mismatch neighbour of the valid
+    // `ACGT-TTTT` (and, unlike `NN-NN` vs `ACT-ACT` above, the SAME length, so it can string-
+    // match). The parallel paired assigner drops it before grouping (not BitEnc-encodable) and
+    // gives it its own `Single`; the sequential paired assigner must agree. Before the paired-path
+    // GRP-01 fix the sequential assigner counted invalid UMIs into `umi_counts`, so this invalid
+    // neighbour string-matched into the valid molecule (index 1 joined index 0) -- diverging from
+    // the parallel path depending only on `--threads`. With one valid UMI it exercises the
+    // `umi_counts.len() == 1` fast path.
+    #[case::paired_invalid_neighbor_fast_path(
+        || Box::new(PairedUmiAssigner::new(1)) as Box<dyn UmiAssigner>,
+        || Box::new(ParallelPairedAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["ACGT-TTTT", "ACGN-TTTT"]
+    )]
+    // As above but with two distinct valid molecules, exercising the adjacency-graph path
+    // (`umi_counts.len() > 1`) rather than the fast path. `ACGN-TTTT` is a 1-mismatch neighbour
+    // of `ACGT-TTTT`; it must still be isolated as its own `Single` in both assigners while the
+    // two valid UMIs (>1 mismatch apart) stay in separate molecules.
+    #[case::paired_invalid_neighbor_graph_path(
+        || Box::new(PairedUmiAssigner::new(1)) as Box<dyn UmiAssigner>,
+        || Box::new(ParallelPairedAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["ACGT-TTTT", "GGGG-TTTT", "ACGN-TTTT"]
+    )]
+    fn test_sequential_and_parallel_assigners_induce_same_partition(
+        #[case] make_sequential: fn() -> Box<dyn UmiAssigner>,
+        #[case] make_parallel: fn() -> Box<dyn UmiAssigner>,
+        #[case] umis: &[&str],
+    ) {
+        let umis: Vec<Umi> = umis.iter().map(|s| (*s).to_string()).collect();
+        let sequential = make_sequential().assign(&umis);
+        let parallel = make_parallel().assign(&umis);
+
+        assert_eq!(sequential.len(), umis.len());
+        assert_eq!(parallel.len(), umis.len());
+        assert!(
+            same_partition(&sequential, &parallel),
+            "sequential and parallel assigners must induce the same partition;\n  \
+             umis:       {umis:?}\n  sequential: {sequential:?}\n  parallel:   {parallel:?}"
+        );
     }
 
     #[test]
