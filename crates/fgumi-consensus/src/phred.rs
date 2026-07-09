@@ -198,7 +198,7 @@ fn ln_one_minus_exp(x: f64) -> f64 {
 /// `test_ln_a_minus_b_near_equal_within_epsilon_*` and `test_ln_a_minus_b_panics_*` tests pin
 /// this boundary.
 ///
-/// Uses: a + log1mexp(a - b) for numerical stability.
+/// Uses: a + log1mexp(b - a) for numerical stability.
 #[inline]
 fn ln_a_minus_b(a: f64, b: f64) -> f64 {
     if b.is_infinite() && b < 0.0 {
@@ -208,7 +208,7 @@ fn ln_a_minus_b(a: f64, b: f64) -> f64 {
     } else if a < b {
         panic!("Subtraction will be less than zero.");
     } else {
-        // a + log(1 - exp(-(a-b))) = a + log1mexp(a-b)
+        // a + log(1 - exp(-(a-b))) = a + log1mexp(b-a)
         // In our convention, ln_one_minus_exp takes negative values, but here b < a
         a + ln_one_minus_exp(b - a)
     }
