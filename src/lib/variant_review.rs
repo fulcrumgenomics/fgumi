@@ -17,7 +17,9 @@ pub struct ConsensusVariantReviewInfo {
     pub chrom: String,
     /// Position of the variant (1-based)
     pub pos: i32,
-    /// Reference allele
+    /// Reference allele. Serialized as `ref` to match fgbio's
+    /// `ConsensusVariantReviewInfo` column name (fgbio-format consumers key on it).
+    #[serde(rename = "ref")]
     pub ref_allele: String,
     /// Genotype string (if available from VCF)
     pub genotype: String,

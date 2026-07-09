@@ -339,13 +339,17 @@ pub fn validate_umi(umi: &[u8]) -> UmiValidation {
     UmiValidation::Valid(base_count)
 }
 
-/// Extracts the molecular identifier base, removing any trailing /A, /B suffix.
+/// Extracts the molecular identifier base by truncating at the last `/`.
 ///
-/// MI tags in duplex sequencing have suffixes `/A` or `/B` to indicate
-/// which strand the read came from. This function strips those specific suffixes
-/// to get the base molecular identifier for grouping purposes.
+/// MI tags for paired/duplex molecule ids carry a trailing strand (or other)
+/// suffix after a `/` — e.g. `1/A` and `1/B` are the two strands of molecule
+/// `1` (see the `Paired` assignment strategy in `group`). To correlate reads
+/// back to their source molecule, everything from the last `/` onwards is
+/// dropped. This mirrors fgbio `ReviewConsensusVariants.toMi`
+/// (`mi.substring(0, mi.lastIndexOf('/'))`), which truncates at the last `/`
+/// regardless of what the suffix is — not only `/A`/`/B`.
 ///
-/// Only `/A` and `/B` suffixes are stripped; other suffixes are preserved.
+/// A leading `/` (index 0) is preserved, matching fgbio's `slash > 0` guard.
 ///
 /// # Examples
 ///
@@ -355,17 +359,16 @@ pub fn validate_umi(umi: &[u8]) -> UmiValidation {
 /// assert_eq!(extract_mi_base("123"), "123");
 /// assert_eq!(extract_mi_base("123/A"), "123");
 /// assert_eq!(extract_mi_base("123/B"), "123");
-/// assert_eq!(extract_mi_base("abc/456/A"), "abc/456");
-/// assert_eq!(extract_mi_base("123/C"), "123/C");  // not stripped
+/// assert_eq!(extract_mi_base("abc/456/A"), "abc/456"); // truncates at last `/`
+/// assert_eq!(extract_mi_base("123/C"), "123");         // any suffix, not just /A,/B
+/// assert_eq!(extract_mi_base("123/456"), "123");
+/// assert_eq!(extract_mi_base("/A"), "/A");             // leading `/` preserved
 /// ```
 #[must_use]
 pub fn extract_mi_base(mi: &str) -> &str {
-    if let Some(stripped) = mi.strip_suffix("/A") {
-        stripped
-    } else if let Some(stripped) = mi.strip_suffix("/B") {
-        stripped
-    } else {
-        mi
+    match mi.rfind('/') {
+        Some(slash) if slash > 0 => &mi[..slash],
+        _ => mi,
     }
 }
 
@@ -661,13 +664,18 @@ mod tests {
 
     #[test]
     fn test_extract_mi_base_with_duplex_suffix() {
-        // Only /A and /B suffixes are stripped
+        // Truncates at the last `/`, matching fgbio `ReviewConsensusVariants.toMi`
+        // (ReviewConsensusVariantsTest.scala:157) — the suffix is stripped whatever
+        // it is, not only `/A` and `/B`.
         assert_eq!(extract_mi_base("123/A"), "123");
         assert_eq!(extract_mi_base("123/B"), "123");
         assert_eq!(extract_mi_base("123/456/A"), "123/456");
-        // Other suffixes are preserved
-        assert_eq!(extract_mi_base("123/C"), "123/C");
-        assert_eq!(extract_mi_base("123/ReallyLongSuffix"), "123/ReallyLongSuffix");
+        // Any suffix after the last `/` is stripped (previously left intact).
+        assert_eq!(extract_mi_base("123/C"), "123");
+        assert_eq!(extract_mi_base("123/ReallyLongSuffix"), "123");
+        assert_eq!(extract_mi_base("123/456"), "123");
+        // A leading `/` (index 0) is preserved (fgbio's `slash > 0` guard).
+        assert_eq!(extract_mi_base("/A"), "/A");
     }
 
     // =========================================================================
