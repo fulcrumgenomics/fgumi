@@ -742,6 +742,7 @@ dependencies = [
  "fgumi-sam",
  "log",
  "noodles",
+ "proptest",
  "rand 0.10.1",
  "rstest",
  "thiserror 2.0.18",

@@ -25,6 +25,7 @@ fgumi-raw-bam = { workspace = true, features = ["noodles"] }
 [dev-dependencies]
 fgumi-raw-bam = { workspace = true, features = ["test-utils"] }
 rstest = "0.26"
+proptest = "1.10"
 
 [features]
 default = ["simplex", "duplex", "codec"]
