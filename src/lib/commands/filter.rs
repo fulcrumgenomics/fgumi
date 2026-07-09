@@ -17,7 +17,7 @@ use crate::consensus_filter::{
     filter_read, is_duplex_consensus, mask_bases, mask_duplex_bases,
     mask_methylation_depth_duplex_raw_with_tags, mask_methylation_depth_simplex_raw_with_tags,
     mask_strand_methylation_agreement_raw_with_ref_bases_and_tags, mean_base_quality_full_length,
-    template_passes,
+    retained_primary_masked_bases, template_passes,
 };
 use crate::grouper::{SingleRawRecordGrouper, TemplateGrouper};
 use crate::logging::OperationTimer;
@@ -554,7 +554,7 @@ impl Filter {
             let mut rejected_records: Vec<RawRecord> = Vec::new();
             let mut passed_count = 0u64;
 
-            let (bases_masked, pass) = Self::process_record_raw(
+            let (masked, pass) = Self::process_record_raw(
                 &mut record,
                 &ctx.config,
                 ctx.reference.as_deref(),
@@ -571,6 +571,13 @@ impl Filter {
                 &ctx.ref_names,
             )
             .map_err(io::Error::other)?;
+
+            // Match fgbio's `maskedBases`: count a record's masked bases only when it is a
+            // retained primary read (FilterConsensusReads.scala:207-219). In this per-record
+            // streaming mode the record is its own single-read "template", so `pass` is the
+            // template result; secondary/supplementary reads still contribute nothing.
+            let bases_masked =
+                retained_primary_masked_bases(std::slice::from_ref(&record), &[masked], pass);
 
             if pass {
                 passed_count = 1;
@@ -629,6 +636,7 @@ impl Filter {
             for template in batch {
                 let mut template_records: Vec<RawRecord> = template.into_records();
                 let mut pass_map: AHashMap<usize, bool> = AHashMap::new();
+                let mut masked_by_record: Vec<u64> = Vec::with_capacity(template_records.len());
 
                 for (idx, record) in template_records.iter_mut().enumerate() {
                     total_records += 1;
@@ -650,11 +658,20 @@ impl Filter {
                         &ctx.ref_names,
                     )
                     .map_err(io::Error::other)?;
-                    bases_masked += masked;
+                    masked_by_record.push(masked);
                     pass_map.insert(idx, pass);
                 }
 
                 let template_pass = template_passes(&template_records, &pass_map);
+
+                // fgbio tallies masked bases only over the primary reads of retained
+                // templates (FilterConsensusReads.scala:207-219); a dropped template and
+                // any secondary/supplementary read contribute nothing.
+                bases_masked += retained_primary_masked_bases(
+                    &template_records,
+                    &masked_by_record,
+                    template_pass,
+                );
 
                 for (idx, record) in template_records.into_iter().enumerate() {
                     let flags = RawRecordView::new(&record).flags();
