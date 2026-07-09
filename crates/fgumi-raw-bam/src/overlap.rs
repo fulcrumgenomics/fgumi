@@ -61,6 +61,46 @@ pub fn is_fr_pair_raw(bam: &[u8]) -> bool {
     positive_five_prime < negative_five_prime
 }
 
+/// Symmetric per-pair FR classification for a template's two primary reads.
+///
+/// This is the raw-byte port of fgbio `CodecConsensusCaller.isPrimaryFrPair(a, b)`
+/// (`CodecConsensusCaller.scala:424-433`). Unlike [`is_fr_pair_raw`], which is a *per-record*
+/// test, this evaluates a *pair* and is order-independent: after confirming both reads are
+/// mapped with mapped mates, on the same reference, and on opposite strands, it derives the FR
+/// orientation from the **reverse-strand record only**. That branch of the orientation test is
+/// CIGAR-derived (`is_fr_pair_raw`'s reverse arm), so it is independent of TLEN and gives the
+/// same answer regardless of argument order — avoiding the htsjdk per-record asymmetry
+/// (samtools/htsjdk#1771) that mis-drops dovetail pairs whose aligned ends coincide.
+///
+/// Returns `true` iff `(a, b)` is a single primary FR pair.
+#[must_use]
+pub fn is_primary_fr_pair_raw(a: &[u8], b: &[u8]) -> bool {
+    let (va, vb) = (RawRecordView::new(a), RawRecordView::new(b));
+    let (fa, fb) = (va.flags(), vb.flags());
+
+    // Both reads mapped.
+    if fa & flags::UNMAPPED != 0 || fb & flags::UNMAPPED != 0 {
+        return false;
+    }
+    // Both mates mapped.
+    if fa & flags::MATE_UNMAPPED != 0 || fb & flags::MATE_UNMAPPED != 0 {
+        return false;
+    }
+    // Same reference.
+    if va.ref_id() != vb.ref_id() {
+        return false;
+    }
+    // Opposite strands.
+    let a_reverse = fa & flags::REVERSE != 0;
+    let b_reverse = fb & flags::REVERSE != 0;
+    if a_reverse == b_reverse {
+        return false;
+    }
+    // Evaluate FR orientation on the reverse-strand record only (the symmetric branch).
+    let reverse_record = if a_reverse { a } else { b };
+    is_fr_pair_raw(reverse_record)
+}
+
 #[must_use]
 pub fn num_bases_extending_past_mate_raw(bam: &[u8]) -> usize {
     // Only applies to FR pairs (matching the RecordBuf-based `num_bases_extending_past_mate`)
@@ -401,6 +441,138 @@ mod tests {
             &[],
         );
         assert!(!is_fr_pair_raw(&rec));
+    }
+
+    // ========================================================================
+    // is_primary_fr_pair_raw tests (symmetric per-pair FR classification)
+    // ========================================================================
+
+    #[test]
+    fn test_is_primary_fr_pair_raw_symmetric_on_dovetail() {
+        // A dovetail FR pair on which the *per-record* check disagrees:
+        //  - forward read has TLEN = -90, so is_fr_pair_raw(fwd) uses the TLEN branch
+        //    (0 < -90 => false) and wrongly reports NOT FR (CODEC-01);
+        //  - reverse read (100M @ 61..160, mate 5' at 101) uses the CIGAR branch
+        //    (101 < 160 => true) and reports FR.
+        // is_primary_fr_pair_raw evaluates the reverse record only, so it is symmetric
+        // and returns true regardless of argument order.
+        let fwd = make_bam_bytes_with_tlen(
+            0,
+            100,
+            flags::PAIRED | flags::MATE_REVERSE | flags::FIRST_SEGMENT,
+            b"dtl",
+            &[encode_op(0, 50)],
+            50,
+            0,
+            60,
+            -90,
+            &[],
+        );
+        let rev = make_bam_bytes_with_tlen(
+            0,
+            60,
+            flags::PAIRED | flags::REVERSE | flags::LAST_SEGMENT,
+            b"dtl",
+            &[encode_op(0, 100)],
+            100,
+            0,
+            100,
+            90,
+            &[],
+        );
+
+        // Per-record is asymmetric — this is the bug the per-pair check avoids.
+        assert!(!is_fr_pair_raw(&fwd), "forward per-record check mis-reports NOT FR");
+        assert!(is_fr_pair_raw(&rev), "reverse per-record check reports FR");
+
+        // Per-pair is symmetric and correct in both argument orders.
+        assert!(is_primary_fr_pair_raw(&fwd, &rev));
+        assert!(is_primary_fr_pair_raw(&rev, &fwd));
+    }
+
+    #[test]
+    fn test_is_primary_fr_pair_raw_negative_cases() {
+        let fr_fwd = make_bam_bytes_with_tlen(
+            0,
+            100,
+            flags::PAIRED | flags::MATE_REVERSE,
+            b"p",
+            &[encode_op(0, 50)],
+            50,
+            0,
+            150,
+            100,
+            &[],
+        );
+        // RF pair: reverse read upstream of its forward mate -> not FR.
+        let rf_rev = make_bam_bytes_with_tlen(
+            0,
+            100,
+            flags::PAIRED | flags::REVERSE,
+            b"p",
+            &[encode_op(0, 100)],
+            100,
+            0,
+            200,
+            100,
+            &[],
+        );
+        let rf_fwd = make_bam_bytes_with_tlen(
+            0,
+            200,
+            flags::PAIRED | flags::MATE_REVERSE,
+            b"p",
+            &[encode_op(0, 50)],
+            50,
+            0,
+            100,
+            -100,
+            &[],
+        );
+        assert!(!is_primary_fr_pair_raw(&rf_rev, &rf_fwd), "RF pair is not a primary FR pair");
+        assert!(!is_primary_fr_pair_raw(&rf_fwd, &rf_rev), "RF pair is not FR either order");
+
+        // Same strand (FF): opposite-strand precondition fails.
+        let ff_a = make_bam_bytes_with_tlen(
+            0,
+            10,
+            flags::PAIRED,
+            b"p",
+            &[encode_op(0, 30)],
+            30,
+            0,
+            50,
+            70,
+            &[],
+        );
+        let ff_b = make_bam_bytes_with_tlen(
+            0,
+            50,
+            flags::PAIRED,
+            b"p",
+            &[encode_op(0, 30)],
+            30,
+            0,
+            10,
+            -70,
+            &[],
+        );
+        assert!(!is_primary_fr_pair_raw(&ff_a, &ff_b), "same-strand pair is not FR");
+
+        // Different references.
+        let xchrom = make_bam_bytes_with_tlen(
+            1,
+            100,
+            flags::PAIRED | flags::REVERSE,
+            b"p",
+            &[encode_op(0, 50)],
+            50,
+            0,
+            100,
+            0,
+            &[],
+        );
+        assert!(!is_primary_fr_pair_raw(&fr_fwd, &xchrom), "cross-chromosomal is not FR");
     }
 
     // ========================================================================
