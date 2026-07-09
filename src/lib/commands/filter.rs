@@ -1601,7 +1601,7 @@ mod tests {
             None,
             None,
             Some(vec![1, 10, 4, 10]), // First and third bases have low depth
-            None,
+            Some(vec![0, 0, 0, 0]),   // errors present so per-base masking is active (pb=true)
         );
 
         let thresholds =
@@ -1609,7 +1609,7 @@ mod tests {
 
         mask_bases(&mut record, &thresholds, Some(10)).expect("mask_bases should succeed");
 
-        // Bases with depth < 5 should be masked to N
+        // Bases with depth < 5 should be masked to N (per-base tags present, so depth mask applies)
         let seq = fgumi_raw_bam::RawRecordView::new(&record).sequence_vec();
         assert_eq!(&seq, b"NCNT");
     }
