@@ -175,8 +175,12 @@ fgumi compare metrics <FILE1> <FILE2> [OPTIONS]
 - Within a matched key: **integers** are compared exactly, **floats** are
   optionally rounded then compared with tolerance, **strings** are compared
   exactly.
-- A key that appears more than once in a file (a duplicate key) is matched
-  against the other file's same-key rows as a multiset, not by on-disk order.
+- The key column(s) must **uniquely identify** each row. Every metric is emitted
+  from a map or histogram keyed by its dimensions, so a key that appears on more
+  than one row means the chosen key set is under-specified. This is a hard error
+  (not silently reconciled, which could mask a real difference): pass
+  `--key-columns` naming the row's full identity (e.g. `ab_size,ba_size` for
+  `duplex_family_sizes`).
 
 ### Float Comparison
 

@@ -35,7 +35,7 @@ use crate::commands::compare::engines::push_diff;
 use crate::logging::OperationTimer;
 use crate::validation::validate_file_exists;
 use ahash::AHashMap;
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::Parser;
 use log::info;
 use std::cmp::Ordering;
@@ -116,7 +116,9 @@ pub struct CompareMetrics {
     #[arg(short = 'm', long = "max-diffs", default_value = "20")]
     pub max_diffs: usize,
 
-    /// Quiet mode - only exit code indicates result (0=equal, 1=different)
+    /// Quiet mode - the exit code is the only result signal (0=equal, 1=different):
+    /// suppresses the stdout report and this command's own informational logging. Global
+    /// startup logging stays under `RUST_LOG` control (like fgbio's `--log-level`).
     #[arg(short = 'q', long = "quiet", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub quiet: bool,
 
@@ -366,43 +368,41 @@ fn canonicalize_key_field(raw: &str, precision: Option<u32>) -> String {
 }
 
 /// Group `tsv`'s data rows by the (numeric-normalized, see
-/// [`canonicalize_key_field`]) value of `key_idxs`, preserving each key's row indices in
-/// on-disk order (used to align a duplicate key's rows deterministically -- see
-/// [`align_duplicate_group`]).
+/// [`canonicalize_key_field`]) value of `key_idxs` -- exactly one row per key.
 ///
 /// A `BTreeMap` (rather than a hash map) so the outer join in [`compare_metrics`]
 /// can walk both files' groups as two sorted streams, merge-join style -- the same
 /// discipline `engines::keyjoin::keyjoin_compare` uses for BAM records.
+///
+/// # Errors
+///
+/// Returns an error if the key column(s) do not uniquely identify rows (a key value
+/// appears on more than one row). Every well-formed metric row is uniquely identified
+/// by its dimension column(s) -- each fgbio/fgumi metric is emitted from a map or
+/// histogram keyed by exactly those dimensions -- so a duplicate key means the chosen
+/// key set is under-specified, not that the rows legitimately collide. Silently
+/// reconciling such rows would let the oracle mask a real difference; instead we fail
+/// loud and direct the caller to name the row's full identity via `--key-columns`.
 fn group_by_key(
     tsv: &Tsv,
     key_idxs: &[usize],
     precision: Option<u32>,
-) -> BTreeMap<Vec<String>, Vec<usize>> {
-    let mut groups: BTreeMap<Vec<String>, Vec<usize>> = BTreeMap::new();
+    file: &Path,
+) -> Result<BTreeMap<Vec<String>, usize>> {
+    let mut groups: BTreeMap<Vec<String>, usize> = BTreeMap::new();
     for (row_idx, row) in tsv.rows.iter().enumerate() {
         let key: Vec<String> =
             key_idxs.iter().map(|&i| canonicalize_key_field(&row[i], precision)).collect();
-        groups.entry(key).or_default().push(row_idx);
+        if groups.insert(key.clone(), row_idx).is_some() {
+            bail!(
+                "{}: key {} appears on multiple rows -- the chosen key column(s) do not \
+                 uniquely identify rows; pass --key-columns to name the row's full identity",
+                file.display(),
+                format_key(&key),
+            );
+        }
     }
-    groups
-}
-
-/// Align a duplicate key's row-index groups from each file for pairwise
-/// comparison.
-///
-/// A key is expected to identify at most one row per file; when it identifies
-/// more (a duplicate key within a file), rows are matched as a **multiset**,
-/// not positionally by on-disk order: each group is sorted by its full raw-field
-/// signature (tab-joined, all columns) before pairing index-for-index. This is a
-/// deliberate, documented simplification (not a true minimum-cost bipartite
-/// match) -- see this module's doc comment; it is exact whenever the duplicate
-/// rows are themselves exact duplicates or differ enough that sorting still
-/// aligns like with like, which covers the expected use (e.g. fgumi#498's
-/// nondeterministic-tie rows).
-fn align_duplicate_group(tsv: &Tsv, idxs: &[usize]) -> Vec<usize> {
-    let mut sorted = idxs.to_vec();
-    sorted.sort_by_key(|&i| tsv.rows[i].join("\t"));
-    sorted
+    Ok(groups)
 }
 
 /// Compare one matched `(file1 row, file2 row)` pair's non-key columns.
@@ -472,9 +472,8 @@ pub struct MetricsCompareOutcome {
     pub only_in_file1: usize,
     /// Number of keys present only in file2.
     pub only_in_file2: usize,
-    /// Number of matched keys whose row(s) disagreed: either a differing
-    /// occurrence count for a duplicate key, or at least one non-key column
-    /// differing beyond tolerance.
+    /// Number of matched keys whose rows disagreed on at least one non-key
+    /// column beyond tolerance.
     pub value_diffs: usize,
     /// `true` if the two files declared different column *sets* (a hard
     /// `DIFFER`; row-level comparison is not attempted since column alignment
@@ -510,8 +509,39 @@ pub fn compare_metrics(
     file2: &Path,
     cfg: &MetricsCompareConfig,
 ) -> Result<MetricsCompareOutcome> {
+    // Reject nonsensical tolerances up front: a negative tolerance makes two identical finite
+    // floats "differ" (`diff <= negative` is never true), and a non-finite (NaN/±inf)
+    // tolerance makes arbitrary values "match" (`diff <= inf` is always true), either way
+    // silently corrupting the comparison. Fail loud instead.
+    ensure!(
+        cfg.rel_tol.is_finite() && cfg.rel_tol >= 0.0,
+        "relative tolerance must be finite and non-negative (got {})",
+        cfg.rel_tol
+    );
+    ensure!(
+        cfg.abs_tol.is_finite() && cfg.abs_tol >= 0.0,
+        "absolute tolerance must be finite and non-negative (got {})",
+        cfg.abs_tol
+    );
+
     let tsv1 = Tsv::parse(file1)?;
     let tsv2 = Tsv::parse(file2)?;
+
+    // Resolve any explicit `--key-columns` up front, *before* the column-set and
+    // empty-file early returns below. Otherwise `--key-columns <missing>` against
+    // two empty files (or files whose column sets differ) would bypass key
+    // resolution entirely and spuriously report MATCH — the user named a key that
+    // does not exist and must get the resolution error regardless of file
+    // content. An explicitly empty key list is itself rejected. The default
+    // (first-column) key only makes sense once both files are known to share a
+    // non-empty column set, so it stays deferred until after those checks.
+    let explicit_key_names = match &cfg.key_columns {
+        Some(tokens) => {
+            ensure!(!tokens.is_empty(), "at least one key column must be specified");
+            Some(resolve_key_names(&parse_key_column_specs(tokens), &tsv1.columns)?)
+        }
+        None => None,
+    };
 
     let mut outcome = MetricsCompareOutcome {
         rows1: tsv1.rows.len(),
@@ -548,18 +578,17 @@ pub fn compare_metrics(
         return Ok(outcome);
     }
 
-    let key_names = match &cfg.key_columns {
-        Some(tokens) => resolve_key_names(&parse_key_column_specs(tokens), &tsv1.columns)?,
-        None => vec![tsv1.columns[0].clone()],
-    };
+    // Reached only once both files share a non-empty column set (checks above),
+    // so `tsv1.columns[0]` is a valid default when no explicit key was given.
+    let key_names = explicit_key_names.unwrap_or_else(|| vec![tsv1.columns[0].clone()]);
     let key_idx1 = key_indices(&tsv1, &key_names)?;
     let key_idx2 = key_indices(&tsv2, &key_names)?;
 
     let non_key_columns: Vec<String> =
         tsv1.columns.iter().filter(|c| !key_names.contains(c)).cloned().collect();
 
-    let groups1 = group_by_key(&tsv1, &key_idx1, cfg.precision);
-    let groups2 = group_by_key(&tsv2, &key_idx2, cfg.precision);
+    let groups1 = group_by_key(&tsv1, &key_idx1, cfg.precision, file1)?;
+    let groups2 = group_by_key(&tsv2, &key_idx2, cfg.precision, file2)?;
 
     // Merge-join the two sorted key streams (mirrors
     // `engines::keyjoin::keyjoin_compare`'s no-resync discipline): always compare
@@ -574,61 +603,44 @@ pub fn compare_metrics(
     loop {
         match (cur1.take(), cur2.take()) {
             (None, None) => break,
-            (Some((key, idxs)), None) => {
+            (Some((key, _row)), None) => {
                 outcome.only_in_file1 += 1;
                 push_diff(&mut outcome.diff_details, cfg.max_diffs, || {
-                    format!("row {} only in file1 ({} row(s))", format_key(&key), idxs.len())
+                    format!("row {} only in file1", format_key(&key))
                 });
                 cur1 = iter1.next();
             }
-            (None, Some((key, idxs))) => {
+            (None, Some((key, _row))) => {
                 outcome.only_in_file2 += 1;
                 push_diff(&mut outcome.diff_details, cfg.max_diffs, || {
-                    format!("row {} only in file2 ({} row(s))", format_key(&key), idxs.len())
+                    format!("row {} only in file2", format_key(&key))
                 });
                 cur2 = iter2.next();
             }
-            (Some((k1, idxs1)), Some((k2, idxs2))) => match k1.cmp(&k2) {
+            (Some((k1, r1)), Some((k2, r2))) => match k1.cmp(&k2) {
                 Ordering::Less => {
                     outcome.only_in_file1 += 1;
                     push_diff(&mut outcome.diff_details, cfg.max_diffs, || {
-                        format!("row {} only in file1 ({} row(s))", format_key(&k1), idxs1.len())
+                        format!("row {} only in file1", format_key(&k1))
                     });
                     cur1 = iter1.next();
-                    cur2 = Some((k2, idxs2));
+                    cur2 = Some((k2, r2));
                 }
                 Ordering::Greater => {
                     outcome.only_in_file2 += 1;
                     push_diff(&mut outcome.diff_details, cfg.max_diffs, || {
-                        format!("row {} only in file2 ({} row(s))", format_key(&k2), idxs2.len())
+                        format!("row {} only in file2", format_key(&k2))
                     });
-                    cur1 = Some((k1, idxs1));
+                    cur1 = Some((k1, r1));
                     cur2 = iter2.next();
                 }
                 Ordering::Equal => {
                     outcome.matched_keys += 1;
-                    if idxs1.len() == idxs2.len() {
-                        let aligned1 = align_duplicate_group(&tsv1, &idxs1);
-                        let aligned2 = align_duplicate_group(&tsv2, &idxs2);
-                        for (&r1, &r2) in aligned1.iter().zip(aligned2.iter()) {
-                            let diffs =
-                                diff_row_values(&tsv1, r1, &tsv2, r2, &non_key_columns, cfg);
-                            if !diffs.is_empty() {
-                                outcome.value_diffs += 1;
-                                push_diff(&mut outcome.diff_details, cfg.max_diffs, || {
-                                    format!("row {}: {}", format_key(&k1), diffs.join("; "))
-                                });
-                            }
-                        }
-                    } else {
+                    let diffs = diff_row_values(&tsv1, r1, &tsv2, r2, &non_key_columns, cfg);
+                    if !diffs.is_empty() {
                         outcome.value_diffs += 1;
                         push_diff(&mut outcome.diff_details, cfg.max_diffs, || {
-                            format!(
-                                "row {}: {} occurrence(s) in file1 vs {} in file2",
-                                format_key(&k1),
-                                idxs1.len(),
-                                idxs2.len()
-                            )
+                            format!("row {}: {}", format_key(&k1), diffs.join("; "))
                         });
                     }
                     cur1 = iter1.next();
@@ -646,7 +658,12 @@ impl Command for CompareMetrics {
         validate_file_exists(&self.file1, "First file")?;
         validate_file_exists(&self.file2, "Second file")?;
 
-        let timer = OperationTimer::new("Comparing metrics");
+        // `--quiet` means "only the exit code communicates the comparison result": suppress
+        // not just the stdout report but also this command's own informational stderr logging
+        // (the timer line and the identical/differ `info!`s). The process-wide startup banner
+        // is emitted by `main` before dispatch and stays under `RUST_LOG` control — the same
+        // orthogonal-logging model as fgbio's global `--log-level`.
+        let timer = (!self.quiet).then(|| OperationTimer::new("Comparing metrics"));
 
         let precision = if self.precision >= 0 { Some(self.precision as u32) } else { None };
         let cfg = MetricsCompareConfig {
@@ -690,11 +707,15 @@ impl Command for CompareMetrics {
         }
 
         if is_equal {
-            info!("Metrics files are identical");
-            timer.log_completion(outcome.matched_keys as u64);
+            if let Some(timer) = timer {
+                info!("Metrics files are identical");
+                timer.log_completion(outcome.matched_keys as u64);
+            }
             Ok(())
         } else {
-            info!("Metrics files differ");
+            if !self.quiet {
+                info!("Metrics files differ");
+            }
             Err(super::CompareMismatch("metrics files differ".to_owned()).into())
         }
     }
@@ -723,6 +744,81 @@ mod tests {
             key_columns: None,
             max_diffs: 20,
         }
+    }
+
+    /// A negative or non-finite tolerance is rejected at the `compare_metrics` boundary
+    /// before any comparison runs — a negative tolerance would make identical finite floats
+    /// "differ", and a non-finite one would make arbitrary values "match".
+    #[rstest]
+    #[case::rel_negative(-1e-9, 1e-9, "relative tolerance")]
+    #[case::abs_negative(1e-9, -1e-9, "absolute tolerance")]
+    #[case::rel_nan(f64::NAN, 1e-9, "relative tolerance")]
+    #[case::abs_inf(1e-9, f64::INFINITY, "absolute tolerance")]
+    #[case::rel_neg_inf(f64::NEG_INFINITY, 1e-9, "relative tolerance")]
+    fn compare_metrics_rejects_invalid_tolerance(
+        #[case] rel_tol: f64,
+        #[case] abs_tol: f64,
+        #[case] expected_msg: &str,
+    ) {
+        let dir = tempdir().expect("tempdir");
+        let f1 = write_tsv(dir.path(), "a.txt", "key\tvalue\nA\t1\n");
+        let f2 = write_tsv(dir.path(), "b.txt", "key\tvalue\nA\t1\n");
+        let cfg = MetricsCompareConfig { rel_tol, abs_tol, ..default_cfg() };
+        let err = compare_metrics(&f1, &f2, &cfg)
+            .expect_err("an invalid tolerance must be a hard error, not a silent comparison");
+        assert!(
+            err.to_string().contains(expected_msg),
+            "error must name the offending tolerance, got: {err}"
+        );
+    }
+
+    /// An explicit `--key-columns` naming a column that does not exist must be rejected even
+    /// when both files are empty (no columns): the column-set and empty-file early returns
+    /// must not bypass key resolution and let `--key-columns missing` spuriously report MATCH.
+    #[test]
+    fn compare_metrics_rejects_missing_explicit_key_even_for_empty_files() {
+        let dir = tempdir().expect("tempdir");
+        let f1 = write_tsv(dir.path(), "a.txt", "");
+        let f2 = write_tsv(dir.path(), "b.txt", "");
+        let cfg = MetricsCompareConfig {
+            key_columns: Some(vec!["missing".to_string()]),
+            ..default_cfg()
+        };
+        let err = compare_metrics(&f1, &f2, &cfg).expect_err(
+            "an explicit key column that does not exist must error, even for empty files",
+        );
+        assert!(
+            err.to_string().contains("missing"),
+            "error must name the missing key column, got: {err}"
+        );
+    }
+
+    /// An explicitly empty `--key-columns` list is meaningless and must be rejected up front
+    /// rather than silently falling back to the default first-column key.
+    #[test]
+    fn compare_metrics_rejects_empty_key_column_list() {
+        let dir = tempdir().expect("tempdir");
+        let f1 = write_tsv(dir.path(), "a.txt", "key\tvalue\nA\t1\n");
+        let f2 = write_tsv(dir.path(), "b.txt", "key\tvalue\nA\t1\n");
+        let cfg = MetricsCompareConfig { key_columns: Some(vec![]), ..default_cfg() };
+        let err = compare_metrics(&f1, &f2, &cfg)
+            .expect_err("an explicitly empty key-column list must be rejected");
+        assert!(
+            err.to_string().contains("at least one key column"),
+            "error must explain the empty key list, got: {err}"
+        );
+    }
+
+    /// The preserved happy path: two empty files with *no* explicit key trivially match —
+    /// there are no rows to compare and no column to default the join key to.
+    #[test]
+    fn compare_metrics_empty_files_without_explicit_key_match() {
+        let dir = tempdir().expect("tempdir");
+        let f1 = write_tsv(dir.path(), "a.txt", "");
+        let f2 = write_tsv(dir.path(), "b.txt", "");
+        let outcome = compare_metrics(&f1, &f2, &default_cfg())
+            .expect("two empty files with no explicit key must compare cleanly");
+        assert!(outcome.is_match(), "two empty files trivially match: {outcome:?}");
     }
 
     #[test]
@@ -935,24 +1031,41 @@ mod tests {
         assert_eq!(outcome.matched_keys, 2);
     }
 
+    /// A key that does not uniquely identify rows (here `key=A` twice, differing only
+    /// in a non-key column) is an under-specified key, not a legitimate collision:
+    /// every fgbio/fgumi metric is emitted from a map/histogram keyed by its
+    /// dimensions, so a duplicate key can only mean the wrong key was chosen. The
+    /// oracle must fail loud (never silently reconcile, which could mask a real diff)
+    /// and point at `--key-columns`.
     #[test]
-    fn duplicate_key_within_file_uses_multiset_match() {
+    fn duplicate_key_under_current_key_set_is_rejected() {
         let dir = tempdir().expect("tempdir");
-        // Same key twice per file, in different orders; values line up once sorted.
         let f1 = write_tsv(dir.path(), "a.txt", "key\tvalue\nA\t1\nA\t2\n");
         let f2 = write_tsv(dir.path(), "b.txt", "key\tvalue\nA\t2\nA\t1\n");
-        let outcome = compare_metrics(&f1, &f2, &default_cfg()).expect("compare should succeed");
-        assert!(outcome.is_match(), "{:?}", outcome.diff_details);
+        let err = compare_metrics(&f1, &f2, &default_cfg())
+            .expect_err("a duplicate key must be rejected, not multiset-matched");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("appears on multiple rows") && msg.contains("--key-columns"),
+            "error must name the duplicate key and direct to --key-columns: {msg}"
+        );
     }
 
+    /// The remedy the error directs to: naming the row's full identity via
+    /// `--key-columns` makes the *same* data compare cleanly, because each row is now
+    /// uniquely keyed. (Order still differs between the files; the join handles it.)
     #[test]
-    fn duplicate_key_count_mismatch_differs() {
+    fn unique_key_columns_resolve_the_duplicate() {
         let dir = tempdir().expect("tempdir");
         let f1 = write_tsv(dir.path(), "a.txt", "key\tvalue\nA\t1\nA\t2\n");
-        let f2 = write_tsv(dir.path(), "b.txt", "key\tvalue\nA\t1\n");
-        let outcome = compare_metrics(&f1, &f2, &default_cfg()).expect("compare should succeed");
-        assert!(!outcome.is_match());
-        assert_eq!(outcome.value_diffs, 1);
+        let f2 = write_tsv(dir.path(), "b.txt", "key\tvalue\nA\t2\nA\t1\n");
+        let cfg = MetricsCompareConfig {
+            key_columns: Some(vec!["key".to_owned(), "value".to_owned()]),
+            ..default_cfg()
+        };
+        let outcome = compare_metrics(&f1, &f2, &cfg).expect("compare should succeed");
+        assert!(outcome.is_match(), "{:?}", outcome.diff_details);
+        assert_eq!(outcome.matched_keys, 2);
     }
 
     #[rstest]
