@@ -78,7 +78,6 @@ mod platform_ffi {
     /// `mi_stats_print_out(None, null_mut())` uses mimalloc's internal synchronization,
     /// making it safe to call concurrently with allocation/deallocation on other threads.
     #[cfg(feature = "memory-debug")]
-    #[allow(dead_code)] // consumed by main fgumi's pipeline via the crate-root re-export
     pub fn print_mi_stats() {
         // SAFETY: mimalloc synchronizes stats collection internally.
         unsafe {
