@@ -322,6 +322,57 @@ pub struct DuplexConsensusCaller {
     reason = "consensus calling uses numeric casts for quality/position math and has domain-specific variable names"
 )]
 impl DuplexConsensusCaller {
+    /// Validate a `min_reads` vector: 1–3 values specified high to low
+    /// (`total >= XY >= YX`), matching fgbio's `padTo(3, last)` semantics.
+    ///
+    /// Extracted from [`Self::new`] so callers that construct the caller inside
+    /// a worker-init closure (where a panic cannot propagate a `Result`) can
+    /// validate UP FRONT and surface a clean error, instead of the closure
+    /// `.expect()`-ing on `new` and panicking mid-pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `min_reads` is empty, has more than 3 values, or the
+    /// values are not in decreasing order (`total >= XY >= YX`).
+    pub fn validate_min_reads(min_reads: &[usize]) -> Result<()> {
+        Self::pad_and_validate_min_reads(min_reads).map(|_| ())
+    }
+
+    /// Pad a `min_reads` vector to `[total, XY, YX]` (fgbio's `padTo(3, last)`) and
+    /// validate it, returning the three padded values on success.
+    ///
+    /// Single source of truth for the padding + ordering logic shared by
+    /// [`Self::validate_min_reads`] (up-front, panic-free validation) and
+    /// [`Self::new`] (which needs the padded values), so the two cannot drift.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `min_reads` is empty, has more than 3 values, or the
+    /// values are not in decreasing order (`total >= XY >= YX`).
+    fn pad_and_validate_min_reads(min_reads: &[usize]) -> Result<(usize, usize, usize)> {
+        if min_reads.is_empty() {
+            anyhow::bail!("min_reads parameter must have at least 1 value");
+        }
+        if min_reads.len() > 3 {
+            anyhow::bail!(
+                "min_reads parameter must have 1-3 values (total, [XY, [YX]]), got {} values",
+                min_reads.len()
+            );
+        }
+        // Non-empty guaranteed above; `unwrap_or` fallbacks keep this panic-free.
+        let min_total_reads = min_reads.first().copied().unwrap_or(0);
+        let last = min_reads.last().copied().unwrap_or(min_total_reads);
+        let min_xy_reads = min_reads.get(1).copied().unwrap_or(last);
+        let min_yx_reads = min_reads.get(2).copied().unwrap_or(last);
+        if min_xy_reads > min_total_reads {
+            anyhow::bail!("min-reads values must be specified high to low (total >= XY)");
+        }
+        if min_yx_reads > min_xy_reads {
+            anyhow::bail!("min-reads values must be specified high to low (XY >= YX)");
+        }
+        Ok((min_total_reads, min_xy_reads, min_yx_reads))
+    }
+
     /// Creates a new duplex consensus caller
     ///
     /// # Arguments
@@ -344,10 +395,6 @@ impl DuplexConsensusCaller {
     ///
     /// Returns an error if `min_reads` is empty, has more than 3 values, or the values
     /// are not in decreasing order (total >= XY >= YX).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `min_reads` is empty (though this is checked and returns an error first).
     #[expect(
         clippy::too_many_arguments,
         reason = "constructor needs all configuration parameters from CLI options"
@@ -371,29 +418,8 @@ impl DuplexConsensusCaller {
     ) -> Result<Self> {
         // Parse min_reads vector like fgbio: padTo(3, last)
         // [total, XY, YX] where XY >= YX (larger strand, smaller strand)
-        if min_reads.is_empty() {
-            anyhow::bail!("min_reads parameter must have at least 1 value");
-        }
-        if min_reads.len() > 3 {
-            anyhow::bail!(
-                "min_reads parameter must have 1-3 values (total, [XY, [YX]]), got {} values",
-                min_reads.len()
-            );
-        }
-
-        let last = *min_reads.last().expect("expected a last item");
-        let min_total_reads = min_reads[0];
-        let min_xy_reads = min_reads.get(1).copied().unwrap_or(last);
-        let min_yx_reads = min_reads.get(2).copied().unwrap_or(last);
-
-        // Validate min_reads ordering: yx <= xy <= total (matching fgbio)
-        // For depth thresholds it's required that yx <= xy <= total
-        if min_xy_reads > min_total_reads {
-            anyhow::bail!("min-reads values must be specified high to low (total >= XY)");
-        }
-        if min_yx_reads > min_xy_reads {
-            anyhow::bail!("min-reads values must be specified high to low (XY >= YX)");
-        }
+        let (min_total_reads, min_xy_reads, min_yx_reads) =
+            Self::pad_and_validate_min_reads(&min_reads)?;
 
         // Create single-strand consensus caller with min_reads=1 (matching fgbio)
         // Filtering happens at duplex level based on input read counts, not at SS level
@@ -2298,6 +2324,7 @@ mod tests {
     use super::*;
     use fgumi_raw_bam::{ParsedBamRecord, SamBuilder, testutil::encode_op};
     use noodles::sam::alignment::record_buf::data::field::Value;
+    use rstest::rstest;
 
     #[test]
     fn test_parse_mi_tag() {
@@ -2313,6 +2340,64 @@ mod tests {
             DuplexConsensusCaller::parse_mi_tag("ACGT-TGCA"),
             ("ACGT-TGCA".to_string(), None)
         );
+    }
+
+    /// fgbio-parity matrix for `validate_min_reads`. The vector is `padTo(3, last)`
+    /// (a single value fills all three; two values fill the third from the second)
+    /// and then required non-increasing (`total >= XY >= YX`), matching fgbio's
+    /// `CallDuplexConsensusReads` `--min-reads` contract. The accepted cases cover
+    /// the padding fallbacks plus the zero and tie (equal-value) boundaries; each
+    /// rejected case pins the exact guard that trips (empty, >3 values, `total < XY`,
+    /// or `XY < YX`).
+    ///
+    /// The `expected` column is the exact `(total, XY, YX)` triple fgbio's
+    /// `padTo(3, last)` derives for each accepted input — asserting `is_ok()` alone
+    /// would let a wrong padding fallback (e.g. filling YX from `total` instead of
+    /// `last`) slip through, so each accepted case pins the derived thresholds the
+    /// caller actually uses via `pad_and_validate_min_reads`. `None` marks a rejected
+    /// input.
+    #[rstest]
+    // --- accepted: expected fgbio `padTo(3, last)` (total, XY, YX) ---
+    #[case::single_pads_to_all(&[1], Some((1, 1, 1)))]
+    #[case::single_zero_boundary(&[0], Some((0, 0, 0)))]
+    #[case::single_large(&[7], Some((7, 7, 7)))]
+    #[case::two_equal_tie(&[5, 5], Some((5, 5, 5)))]
+    #[case::two_decreasing(&[5, 2], Some((5, 2, 2)))] // YX padded from `last`, not `total`
+    #[case::three_decreasing(&[3, 2, 1], Some((3, 2, 1)))]
+    #[case::three_all_equal_tie(&[3, 3, 3], Some((3, 3, 3)))]
+    #[case::three_tie_at_top(&[5, 5, 1], Some((5, 5, 1)))]
+    #[case::three_tie_at_bottom(&[5, 1, 1], Some((5, 1, 1)))]
+    #[case::all_zero_boundary(&[0, 0, 0], Some((0, 0, 0)))]
+    // --- rejected ---
+    #[case::empty(&[], None)]
+    #[case::four_values(&[4, 3, 2, 1], None)]
+    #[case::two_total_below_xy(&[1, 5], None)] // the reported `--min-reads 1 5` panic case
+    #[case::three_total_below_xy(&[2, 5, 1], None)]
+    #[case::three_xy_below_yx(&[5, 2, 3], None)]
+    fn validate_min_reads_matches_fgbio_padding_and_ordering(
+        #[case] min_reads: &[usize],
+        #[case] expected: Option<(usize, usize, usize)>,
+    ) {
+        // The public entry point agrees on accept vs. reject...
+        assert_eq!(
+            DuplexConsensusCaller::validate_min_reads(min_reads).is_ok(),
+            expected.is_some(),
+            "validate_min_reads({min_reads:?}): expected accepted={}",
+            expected.is_some()
+        );
+        // ...and for accepted inputs the padded `(total, XY, YX)` the caller will
+        // actually apply matches fgbio's `padTo(3, last)` derivation exactly.
+        match expected {
+            Some(padded) => assert_eq!(
+                DuplexConsensusCaller::pad_and_validate_min_reads(min_reads).unwrap(),
+                padded,
+                "pad_and_validate_min_reads({min_reads:?}): wrong padded (total, XY, YX)"
+            ),
+            None => assert!(
+                DuplexConsensusCaller::pad_and_validate_min_reads(min_reads).is_err(),
+                "pad_and_validate_min_reads({min_reads:?}): expected rejection"
+            ),
+        }
     }
 
     /// Build a minimal raw record with the given MI tag value.
