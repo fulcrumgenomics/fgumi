@@ -287,8 +287,19 @@ impl SortSpillDecompress {
             return Ok(false);
         }
 
-        let Ok(mut reader_guard) = slot.reader.try_lock() else {
-            return Ok(false);
+        let mut reader_guard = match slot.reader.try_lock() {
+            Ok(guard) => guard,
+            // Contended (another worker owns the slot): a normal skip.
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            // Poisoned: a fill worker panicked mid-read. Fail the slot CLOSED so
+            // `SortMerge` surfaces the failure; swallowing it as a skip would
+            // leave `queue_eof` unset and spin `Contention` forever (deadlock).
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                Self::mark_slot_failed(slot);
+                return Err(io::Error::other(
+                    "spill reader mutex poisoned: a decompress fill worker panicked",
+                ));
+            }
         };
 
         let room = {
@@ -351,7 +362,20 @@ impl SortSpillDecompress {
         // Phase A: read a fresh batch if the reader is still live and the
         // FIFO / reorder window admit more.
         if !slot.reader_eof.load(Ordering::Acquire) {
-            if let Ok(mut reader_guard) = slot.reader.try_lock() {
+            let acquired = match slot.reader.try_lock() {
+                Ok(guard) => Some(guard),
+                // Contended: fall through to the drain-only phase below.
+                Err(std::sync::TryLockError::WouldBlock) => None,
+                // Poisoned: a fill worker panicked mid-read. Fail closed so
+                // `SortMerge` surfaces it instead of spinning forever.
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    Self::mark_slot_failed(slot);
+                    return Err(io::Error::other(
+                        "spill reader mutex poisoned: a decompress fill worker panicked",
+                    ));
+                }
+            };
+            if let Some(mut reader_guard) = acquired {
                 // Re-check under the lock: another worker may have hit EOF.
                 if !slot.reader_eof.load(Ordering::Acquire) {
                     let next_seq = reader_guard.next_seq;

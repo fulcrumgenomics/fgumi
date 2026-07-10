@@ -97,3 +97,46 @@ fn emptiest_first_order_sorts_by_fifo_len_ascending() {
     let slots = vec![mk(0, 5), mk(1, 1), mk(2, 3)];
     assert_eq!(SortSpillDecompress::emptiest_first_order(&slots), vec![1, 2, 0]);
 }
+
+/// A poisoned `reader` mutex (a fill worker panicked while holding the lock)
+/// must fail the slot CLOSED — `try_fill_*_slot` returns `Err` and sets
+/// `decomp_error`/`queue_eof` — rather than being swallowed as `WouldBlock` and
+/// skipped forever. If it were skipped, `queue_eof` would never be set and
+/// `SortMerge` would spin on `Contention` and deadlock instead of surfacing the
+/// panic. Regression test for the poisoned-vs-would-block conflation.
+#[test]
+fn poisoned_reader_lock_fails_closed_rather_than_hanging() {
+    let make_poisoned_slot = || {
+        let slot = Arc::new(SortMergeSlot::new(
+            0,
+            BufReader::new(tempfile::tempfile().expect("tempfile")),
+            SpillCodec::Bgzf,
+        ));
+        let holder = Arc::clone(&slot);
+        // Panic while holding the reader lock; joining the panicked thread leaves
+        // the mutex poisoned (mirrors a fill worker dying mid-read).
+        let _ = std::thread::spawn(move || {
+            let _guard = holder.reader.lock().expect("acquire reader lock");
+            panic!("simulated fill-worker panic under the reader lock");
+        })
+        .join();
+        assert!(slot.reader.is_poisoned(), "precondition: reader mutex is poisoned");
+        slot
+    };
+
+    let mut dec = SortSpillDecompress::new(4 * 1024 * 1024, SortDecompressTuning::default());
+
+    // Inline path.
+    let inline_slot = make_poisoned_slot();
+    let inline = dec.try_fill_inline_slot(&inline_slot);
+    assert!(inline.is_err(), "inline path: poisoned reader must return Err, not Ok(false)");
+    assert!(inline_slot.decomp_error.load(Ordering::Acquire), "inline: decomp_error set");
+    assert!(inline_slot.queue_eof.load(Ordering::Acquire), "inline: queue_eof set");
+
+    // Block-parallel path.
+    let bp_slot = make_poisoned_slot();
+    let bp = dec.try_fill_block_parallel_slot(&bp_slot);
+    assert!(bp.is_err(), "block-parallel path: poisoned reader must return Err, not skip");
+    assert!(bp_slot.decomp_error.load(Ordering::Acquire), "bp: decomp_error set");
+    assert!(bp_slot.queue_eof.load(Ordering::Acquire), "bp: queue_eof set");
+}
