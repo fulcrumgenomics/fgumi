@@ -852,6 +852,128 @@ mod tests {
         Ok(())
     }
 
+    /// DXM3-02: reads from different libraries (RG -> LB) at the same coordinate/strand
+    /// must form SEPARATE families, not merge into one. fgbio's `ReadInfo` carries the
+    /// library; fgumi's own group/dedup partition by it too.
+    #[test]
+    fn test_families_partitioned_by_library() -> Result<()> {
+        use bstr::BString;
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::Value as BufValue;
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReadGroup;
+        use noodles::sam::header::record::value::map::ReferenceSequence;
+        use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
+
+        // Header: chr1 + two read groups with distinct libraries.
+        let rg_a = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("libA"))
+            .build()
+            .expect("read group A");
+        let rg_b = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("libB"))
+            .build()
+            .expect("read group B");
+        let header = sam::Header::builder()
+            .add_reference_sequence(
+                BString::from("chr1"),
+                Map::<ReferenceSequence>::new(
+                    NonZeroUsize::new(248_956_422).expect("non-zero length"),
+                ),
+            )
+            .add_read_group(BString::from("rgA"), rg_a)
+            .add_read_group(BString::from("rgB"), rg_b)
+            .build();
+
+        // Two templates at the same coordinate/strand, tagged to different read groups.
+        let rg_tag_id = Tag::new(b'R', b'G');
+        let mk = |name: &str, rg: &str| {
+            let (mut r1, mut r2) =
+                build_test_pair(name, 0, 100, 200, "AAA-TTT", "AAA-TTT/A", true, false);
+            r1.data_mut().insert(rg_tag_id, BufValue::String(rg.into()));
+            r2.data_mut().insert(rg_tag_id, BufValue::String(rg.into()));
+            [r1, r2]
+        };
+        let mut records = Vec::new();
+        records.extend(mk("q1", "rgA"));
+        records.extend(mk("q2", "rgB"));
+
+        let temp_file = NamedTempFile::new()?;
+        let mut writer = bam::io::writer::Builder.build_from_path(temp_file.path())?;
+        writer.write_header(&header)?;
+        for record in &records {
+            writer.write_alignment_record(&header, record)?;
+        }
+        drop(writer);
+
+        let output_dir = TempDir::new()?;
+        let output = output_dir.path().join("output");
+        let cmd = DuplexMetrics {
+            input: temp_file.path().to_path_buf(),
+            output: output.clone(),
+            min_ab_reads: 1,
+            min_ba_reads: 0,
+            duplex_umi_counts: false,
+            intervals: None,
+            description: None,
+        };
+        cmd.execute("test")?;
+
+        let family_path = format!("{}.family_sizes.txt", output.display());
+        let family_metrics: Vec<FamilySizeMetric> = DelimFile::default().read_tsv(&family_path)?;
+        let cs_families: usize = family_metrics.iter().map(|m| m.cs_count).sum();
+        assert_eq!(cs_families, 2, "different libraries must not merge into one CS family");
+        let size1 = family_metrics.iter().find(|m| m.family_size == 1).expect("size-1 row present");
+        assert_eq!(size1.cs_count, 2, "two CS families, each a single template");
+        Ok(())
+    }
+
+    /// DXM3-02: reads with different cell barcodes (CB) at the same
+    /// coordinate/strand/library must form SEPARATE families, not merge into one.
+    /// Mirrors `test_families_partitioned_by_library` for the `cell_barcode` key field,
+    /// which is otherwise unexercised (a regression dropping CB from the key would pass).
+    #[test]
+    fn test_families_partitioned_by_cell_barcode() -> Result<()> {
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::Value as BufValue;
+
+        // Two templates at the same coordinate/strand and (absent) library, tagged with
+        // distinct cell barcodes — they must not collapse into one family.
+        let cb_tag_id = Tag::new(b'C', b'B');
+        let mk = |name: &str, cb: &str| {
+            let (mut r1, mut r2) =
+                build_test_pair(name, 0, 100, 200, "AAA-TTT", "AAA-TTT/A", true, false);
+            r1.data_mut().insert(cb_tag_id, BufValue::String(cb.into()));
+            r2.data_mut().insert(cb_tag_id, BufValue::String(cb.into()));
+            [r1, r2]
+        };
+        let mut records = Vec::new();
+        records.extend(mk("q1", "CELL_A"));
+        records.extend(mk("q2", "CELL_B"));
+
+        let input = create_test_bam(records)?;
+        let output_dir = TempDir::new()?;
+        let output = output_dir.path().join("output");
+        let cmd = DuplexMetrics {
+            input: input.path().to_path_buf(),
+            output: output.clone(),
+            min_ab_reads: 1,
+            min_ba_reads: 0,
+            duplex_umi_counts: false,
+            intervals: None,
+            description: None,
+        };
+        cmd.execute("test")?;
+
+        let family_path = format!("{}.family_sizes.txt", output.display());
+        let family_metrics: Vec<FamilySizeMetric> = DelimFile::default().read_tsv(&family_path)?;
+        let cs_families: usize = family_metrics.iter().map(|m| m.cs_count).sum();
+        assert_eq!(cs_families, 2, "different cell barcodes must not merge into one CS family");
+        let size1 = family_metrics.iter().find(|m| m.family_size == 1).expect("size-1 row present");
+        assert_eq!(size1.cs_count, 2, "two CS families, each a single template");
+        Ok(())
+    }
+
     /// DXM3-03: non-duplex (unsuffixed MI) input must still be counted as a
     /// single-strand DS family (`ab=n`, `ba=0`, `ds_size=n`), matching fgbio — not dropped
     /// via a size-0 family-size bucket.

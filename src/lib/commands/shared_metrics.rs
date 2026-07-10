@@ -5,6 +5,7 @@
 //! deterministic downsampling. Both `duplex_metrics` and `simplex_metrics` commands
 //! build on these shared primitives.
 
+use crate::read_info::LibraryIndex;
 use crate::sam::SamTag;
 use crate::template::TemplateIterator;
 use anyhow::{Context, Result};
@@ -61,7 +62,11 @@ pub struct TemplateInfo {
 
 /// Grouping key matching fgbio's `ReadInfo` structure.
 ///
-/// Fields are ordered so the earlier-mapping read comes first.
+/// The two mate positions are ordered so the earlier-mapping read comes first;
+/// `library` and `cell_barcode` are template-level (identical for both mates) and are
+/// part of the key so that reads from different libraries or cells at the same
+/// coordinate/strand form separate families, matching fgbio's `ReadInfo` (which carries
+/// `library` and `cellBarcode`) and fgumi's own `group`/`dedup` grouping.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ReadInfoKey {
     /// Reference sequence index for read 1.
@@ -76,6 +81,10 @@ pub struct ReadInfoKey {
     pub start2: i32,
     /// `true` if read 2 is reverse-complemented.
     pub strand2: bool,
+    /// Library index (from the read group's `LB`, via [`LibraryIndex`]); 0 = unknown.
+    pub library: u16,
+    /// Cell barcode (`CB` tag) value, or `None` when the tag is absent.
+    pub cell_barcode: Option<Box<[u8]>>,
 }
 
 /// Pre-computed metadata for a template within a coordinate group.
@@ -472,6 +481,10 @@ where
 {
     let (reader, header) = create_raw_bam_reader(input, 1)?;
 
+    // Library index (RG -> LB) for partitioning families by library, matching fgbio's
+    // ReadInfo.library and fgumi's own group/dedup grouping.
+    let library_index = LibraryIndex::from_header(&header);
+
     let template_iter = TemplateIterator::new(reader);
 
     // Streaming approach: process groups as they arrive (assumes consecutive ReadInfo grouping)
@@ -553,31 +566,37 @@ where
             (r1_start, r1_end.unwrap_or(r1_start))
         };
 
-        // ReadInfoKey fields are ordered so the earlier-mapping read comes first.
-        // The tie-break includes strand (positive sorts before negative, since Rust
+        // Template-level library (RG -> LB) and cell barcode (CB), taken from the primary
+        // R1, matching fgbio's ReadInfo(library, cellBarcode). Different libraries or cells
+        // at the same coordinate/strand form separate families (DXM3-02). The cell tag is
+        // hardcoded to CB, matching fgumi's opinionated group/dedup (no --cell-tag flag).
+        let library = find_string_tag_in_record(r1.as_ref(), SamTag::RG)
+            .map_or(0u16, |rg| library_index.get(LibraryIndex::hash_rg(rg)));
+        let cell_barcode: Option<Box<[u8]>> =
+            find_string_tag_in_record(r1.as_ref(), SamTag::CB).map(Box::from);
+
+        // Order the two mate positions so the earlier-mapping read comes first. The
+        // tie-break includes strand (positive sorts before negative, since Rust
         // `false < true` and `strand == is_reverse`), matching fgumi's own group/dedup
         // canonicalization (`unified_pipeline/base.rs`: `(ref, pos, strand) <= ...`) and
         // fgbio's ReadInfo `r1Earlier` (GroupReadsByUmi.scala:105-111). Without the strand
         // tie-break, the two strands of a duplex whose mates share an identical
         // (ref, unclipped-5') canonicalize to different keys and fail to co-group.
-        let read_info_key = if (r1_ref, s1, r1_strand) <= (r2_ref, s2, r2_strand) {
-            ReadInfoKey {
-                ref_index1: r1_ref,
-                start1: s1,
-                strand1: r1_strand,
-                ref_index2: r2_ref,
-                start2: s2,
-                strand2: r2_strand,
-            }
-        } else {
-            ReadInfoKey {
-                ref_index1: r2_ref,
-                start1: s2,
-                strand1: r2_strand,
-                ref_index2: r1_ref,
-                start2: s1,
-                strand2: r1_strand,
-            }
+        let (ref_index1, start1, strand1, ref_index2, start2, strand2) =
+            if (r1_ref, s1, r1_strand) <= (r2_ref, s2, r2_strand) {
+                (r1_ref, s1, r1_strand, r2_ref, s2, r2_strand)
+            } else {
+                (r2_ref, s2, r2_strand, r1_ref, s1, r1_strand)
+            };
+        let read_info_key = ReadInfoKey {
+            ref_index1,
+            start1,
+            strand1,
+            ref_index2,
+            start2,
+            strand2,
+            library,
+            cell_barcode,
         };
 
         let hash_fraction = compute_hash_fraction(&read_name);
