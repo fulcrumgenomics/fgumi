@@ -339,11 +339,31 @@ impl Drop for AlignerProcess {
 ///
 /// Returns the captured lines when the child closes its stderr fd.
 fn relay_stderr(stderr: impl std::io::Read, ring_size: usize) -> Vec<String> {
-    let reader = BufReader::new(stderr);
+    let mut reader = BufReader::new(stderr);
     let mut ring: VecDeque<String> = VecDeque::with_capacity(ring_size);
+    let mut buf: Vec<u8> = Vec::new();
 
-    for line in reader.lines() {
-        let Ok(line) = line else { break };
+    // Byte-oriented drain: `BufRead::lines()` yields `Err` on a non-UTF-8 line,
+    // and breaking on it would STOP draining the aligner's stderr — the aligner
+    // then blocks once its stderr pipe fills (~64 KiB) and the whole align
+    // pipeline deadlocks. Read raw lines and decode lossily so invalid UTF-8
+    // never halts the relay.
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            // EOF (child closed stderr) or an unrecoverable pipe read error:
+            // stop draining either way.
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        // Strip the line terminator to match `lines()` semantics.
+        if buf.last() == Some(&b'\n') {
+            buf.pop();
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+        }
+        let line = String::from_utf8_lossy(&buf).into_owned();
         eprintln!("{line}");
         if ring_size > 0 {
             if ring.len() == ring_size {
@@ -830,6 +850,34 @@ mod tests {
     use std::io::{Read, Write};
 
     use super::*;
+
+    /// A non-UTF-8 stderr line must NOT halt the relay: draining has to
+    /// continue to EOF, otherwise the aligner blocks once its stderr pipe fills
+    /// (~64 KiB) and the whole align pipeline deadlocks. Regression test for the
+    /// `lines()`-breaks-on-invalid-UTF-8 hang.
+    #[test]
+    fn relay_stderr_keeps_draining_past_non_utf8_line() {
+        let mut data: Vec<u8> = Vec::new();
+        data.extend_from_slice(b"first line\n");
+        data.extend_from_slice(&[0xff, 0xfe, b'\n']); // invalid UTF-8 line
+        data.extend_from_slice(b"third line\n");
+
+        let ring = relay_stderr(std::io::Cursor::new(data), 8);
+
+        // All three lines were read (the invalid one lossily decoded), proving
+        // the drain continued past the bad line to EOF.
+        assert_eq!(ring.len(), 3, "drain must not stop at the non-UTF-8 line");
+        assert_eq!(ring[0], "first line");
+        // Pin the "lossily decoded" claim itself: 0xff and 0xfe are each individually
+        // ill-formed in UTF-8 (never a valid lead or continuation byte), so
+        // `String::from_utf8_lossy` emits one U+FFFD per byte — the bad bytes are
+        // replaced, not dropped.
+        assert_eq!(
+            ring[1], "\u{FFFD}\u{FFFD}",
+            "invalid bytes must be lossily decoded, not dropped"
+        );
+        assert_eq!(ring[2], "third line");
+    }
 
     /// Spawn a simple `echo` command and verify that stdout can be read.
     #[test]
