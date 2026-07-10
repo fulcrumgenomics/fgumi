@@ -775,6 +775,7 @@ dependencies = [
  "anyhow",
  "bstr 1.12.1",
  "bytemuck",
+ "fgumi-dna",
  "fgumi-tag",
  "noodles",
  "proptest",

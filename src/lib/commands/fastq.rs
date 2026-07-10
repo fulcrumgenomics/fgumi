@@ -32,17 +32,18 @@ static QUAL_TO_ASCII: [u8; 256] = {
 
 /// Lookup table for base complement (A<->T, C<->G, others->N)
 static COMPLEMENT: [u8; 256] = {
+    // Values are shared from `fgumi_dna::COMPLEMENT` (IUPAC-aware, case-preserving),
+    // but this table keeps the FASTQ-validity policy: any byte outside the valid
+    // IUPAC alphabet folds to 'N', since an emitted FASTQ base must be a valid
+    // nucleotide code (unlike the consensus/tag paths, which pass unknowns through).
     let mut table = [b'N'; 256];
-    table[b'A' as usize] = b'T';
-    table[b'a' as usize] = b'T';
-    table[b'T' as usize] = b'A';
-    table[b't' as usize] = b'A';
-    table[b'C' as usize] = b'G';
-    table[b'c' as usize] = b'G';
-    table[b'G' as usize] = b'C';
-    table[b'g' as usize] = b'C';
-    table[b'N' as usize] = b'N';
-    table[b'n' as usize] = b'N';
+    const VALID: &[u8] = b"ACGTURYSWKMBVDHNacgturyswkmbvdhn";
+    let mut i = 0;
+    while i < VALID.len() {
+        let base = VALID[i];
+        table[base as usize] = fgumi_dna::COMPLEMENT[base as usize];
+        i += 1;
+    }
     table
 };
 
@@ -368,16 +369,29 @@ mod tests {
         assert_eq!(COMPLEMENT[b'G' as usize], b'C');
         assert_eq!(COMPLEMENT[b'N' as usize], b'N');
 
-        // Lowercase
-        assert_eq!(COMPLEMENT[b'a' as usize], b'T');
-        assert_eq!(COMPLEMENT[b't' as usize], b'A');
-        assert_eq!(COMPLEMENT[b'c' as usize], b'G');
-        assert_eq!(COMPLEMENT[b'g' as usize], b'C');
-        assert_eq!(COMPLEMENT[b'n' as usize], b'N');
+        // Lowercase (case preserved)
+        assert_eq!(COMPLEMENT[b'a' as usize], b't');
+        assert_eq!(COMPLEMENT[b't' as usize], b'a');
+        assert_eq!(COMPLEMENT[b'c' as usize], b'g');
+        assert_eq!(COMPLEMENT[b'g' as usize], b'c');
+        assert_eq!(COMPLEMENT[b'n' as usize], b'n'); // case preserved (shared table)
 
         // Unknown bases map to N
         assert_eq!(COMPLEMENT[b'X' as usize], b'N');
         assert_eq!(COMPLEMENT[0], b'N');
+    }
+
+    #[test]
+    fn test_complement_lookup_table_iupac_and_case() {
+        // IUPAC-aware (values shared from fgumi_dna::COMPLEMENT), case-preserving,
+        // but keeps the FASTQ-validity policy of folding invalid bytes to N.
+        assert_eq!(COMPLEMENT[b'R' as usize], b'Y');
+        assert_eq!(COMPLEMENT[b'Y' as usize], b'R');
+        assert_eq!(COMPLEMENT[b'K' as usize], b'M');
+        assert_eq!(COMPLEMENT[b'S' as usize], b'S');
+        assert_eq!(COMPLEMENT[b'a' as usize], b't'); // case preserved
+        assert_eq!(COMPLEMENT[b'r' as usize], b'y');
+        assert_eq!(COMPLEMENT[b'.' as usize], b'N'); // invalid -> N (FASTQ validity)
     }
 
     #[test]
