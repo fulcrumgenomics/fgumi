@@ -172,6 +172,24 @@ impl SimplexOptions {
             consensus_call_overlapping_bases: self.consensus_call_overlapping_bases,
         }
     }
+
+    /// Validate the `--min-reads` / `--max-reads` range.
+    ///
+    /// `min_reads` must be `>= 1` (a value of 0 admits empty groups) and, when
+    /// `max_reads` is set, it must be `>= min_reads`. Shared by the standalone
+    /// `Simplex::execute` and the chain builder's `add_simplex` so `runall`
+    /// rejects the same degenerate configurations the standalone command does.
+    pub(crate) fn validate_read_bounds(&self) -> Result<()> {
+        if self.min_reads == 0 {
+            bail!("--min-reads must be >= 1 (a value of 0 admits empty groups)");
+        }
+        if let Some(max) = self.max_reads {
+            if max < self.min_reads {
+                bail!("--max-reads ({}) must be >= --min-reads ({})", max, self.min_reads);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Calls simplex consensus sequences from reads with the same unique molecular tag.
@@ -300,14 +318,7 @@ impl Command for Simplex {
         // Validate inputs
         self.io.validate()?;
 
-        if self.options.min_reads == 0 {
-            bail!("--min-reads must be >= 1 (a value of 0 admits empty groups)");
-        }
-        if let Some(max) = self.options.max_reads {
-            if max < self.options.min_reads {
-                bail!("--max-reads ({}) must be >= --min-reads ({})", max, self.options.min_reads);
-            }
-        }
+        self.options.validate_read_bounds()?;
 
         info!("Starting Simplex");
         info!("Input: {}", self.io.input.display());
@@ -1050,6 +1061,31 @@ mod tests {
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("--max-reads"));
         assert!(error_msg.contains("--min-reads"));
+    }
+
+    #[rstest]
+    #[case::valid_min_only(1, None, None)]
+    #[case::valid_min_and_max(3, Some(10), None)]
+    #[case::valid_min_equals_max(5, Some(5), None)]
+    #[case::min_reads_zero(0, None, Some("--min-reads must be >= 1"))]
+    #[case::max_below_min(5, Some(2), Some("--max-reads (2) must be >= --min-reads (5)"))]
+    fn test_validate_read_bounds(
+        #[case] min_reads: usize,
+        #[case] max_reads: Option<usize>,
+        #[case] expected_err: Option<&str>,
+    ) {
+        let options = SimplexOptions { min_reads, max_reads, ..SimplexOptions::default() };
+        match (options.validate_read_bounds(), expected_err) {
+            (Ok(()), None) => {}
+            (Err(err), Some(needle)) => {
+                assert!(
+                    err.to_string().contains(needle),
+                    "expected error containing {needle:?}, got: {err}"
+                );
+            }
+            (Ok(()), Some(needle)) => panic!("expected error containing {needle:?}, got Ok"),
+            (Err(err), None) => panic!("expected Ok, got error: {err}"),
+        }
     }
 
     #[test]
