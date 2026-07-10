@@ -677,6 +677,15 @@ impl SamRecordClipper {
             return (0, 0);
         }
 
+        // Normalize by strand so the positive-strand read is treated as r1 and the
+        // negative-strand read as r2. The body below assumes r1 is the forward read
+        // (5' at its start) and r2 the reverse read (5' at its end); an FR pair whose
+        // first-of-pair read is the reverse strand would otherwise be clipped at the
+        // wrong (outer) ends. Mirrors fgbio `SamRecordClipper.clipOverlappingReads`
+        // (`if (rec.negativeStrand) clipOverlappingReads(rec=mate, mate=rec).swap`).
+        let swapped = r1.flags().is_reverse_complemented();
+        let (r1, r2) = if swapped { (r2, r1) } else { (r1, r2) };
+
         // Get alignment positions
         let r1_start = match r1.alignment_start() {
             Some(pos) => usize::from(pos),
@@ -751,7 +760,8 @@ impl SamRecordClipper {
             let _ = self.upgrade_all_clipping(r2);
         }
 
-        (clipped_r1, clipped_r2)
+        // Map clip counts back to the caller's original (r1, r2) argument order.
+        if swapped { (clipped_r2, clipped_r1) } else { (clipped_r1, clipped_r2) }
     }
 
     /// Calculates the number of bases in a read that extend past the mate's unclipped boundary
@@ -1962,6 +1972,12 @@ impl RawRecordClipper {
             return (0, 0);
         }
 
+        // Normalize by strand so the positive-strand read is treated as r1 and the
+        // negative-strand read as r2 (see the typed `clip_overlapping_reads` for the
+        // rationale; mirrors fgbio `SamRecordClipper.clipOverlappingReads:305`).
+        let swapped = r1.flags() & fgumi_raw_bam::flags::REVERSE != 0;
+        let (r1, r2) = if swapped { (r2, r1) } else { (r1, r2) };
+
         let Some(r1_start) = r1.alignment_start_1based() else {
             return (0, 0);
         };
@@ -2018,7 +2034,8 @@ impl RawRecordClipper {
             let _ = self.upgrade_all_clipping_raw(r2);
         }
 
-        (clipped_r1, clipped_r2)
+        // Map clip counts back to the caller's original (r1, r2) argument order.
+        if swapped { (clipped_r2, clipped_r1) } else { (clipped_r1, clipped_r2) }
     }
 
     /// Returns the number of bases extending past the mate's boundaries.
@@ -2636,6 +2653,7 @@ pub mod cigar_utils {
 mod tests {
     use super::*;
     use crate::builder::RecordBuilder;
+    use rstest::rstest;
 
     #[test]
     fn test_clipping_mode() {
@@ -4379,6 +4397,94 @@ mod tests {
         *r2.template_length_mut() = -tlen;
 
         (r1, r2)
+    }
+
+    /// CLIP3-01 (typed): `clip_overlapping_reads` must normalize by *strand*, not by
+    /// argument order. Passing the negative-strand read first must produce the same
+    /// per-record clipping as passing the positive-strand read first, with the
+    /// returned tuple swapped. Mirrors fgbio `SamRecordClipper.clipOverlappingReads`
+    /// (`if (rec.negativeStrand) clipOverlappingReads(rec=mate, mate=rec).swap`).
+    #[rstest]
+    #[case::one_base_overlap(1, 100)]
+    #[case::large_overlap(1, 50)]
+    #[case::most_overlap(1, 20)]
+    fn test_clip_overlapping_reads_normalizes_by_strand_typed(
+        #[case] fwd_start: usize,
+        #[case] rev_start: usize,
+        #[values(ClippingMode::Soft, ClippingMode::Hard)] mode: ClippingMode,
+    ) {
+        let clipper = SamRecordClipper::new(mode);
+        let seq = "A".repeat(100);
+
+        // Forward-first: positive-strand read passed first (canonical, already handled).
+        let mut fwd_a =
+            create_paired_record("100M", &seq, fwd_start, false, true, rev_start, "100M");
+        let mut rev_a =
+            create_paired_record("100M", &seq, rev_start, true, false, fwd_start, "100M");
+        let (clip_fwd_a, clip_rev_a) = clipper.clip_overlapping_reads(&mut fwd_a, &mut rev_a);
+
+        // Reverse-first: same biology, negative-strand read passed first.
+        let mut rev_b =
+            create_paired_record("100M", &seq, rev_start, true, false, fwd_start, "100M");
+        let mut fwd_b =
+            create_paired_record("100M", &seq, fwd_start, false, true, rev_start, "100M");
+        let (clip_rev_b, clip_fwd_b) = clipper.clip_overlapping_reads(&mut rev_b, &mut fwd_b);
+
+        // Same per-record clip counts regardless of argument order.
+        assert_eq!(clip_fwd_a, clip_fwd_b, "forward-read clip count differs by arg order");
+        assert_eq!(clip_rev_a, clip_rev_b, "reverse-read clip count differs by arg order");
+
+        // Same resulting record state (CIGAR + alignment start) for each read.
+        assert_eq!(format_cigar(&fwd_a.cigar()), format_cigar(&fwd_b.cigar()), "forward CIGAR");
+        assert_eq!(fwd_a.alignment_start(), fwd_b.alignment_start(), "forward start");
+        assert_eq!(format_cigar(&rev_a.cigar()), format_cigar(&rev_b.cigar()), "reverse CIGAR");
+        assert_eq!(rev_a.alignment_start(), rev_b.alignment_start(), "reverse start");
+    }
+
+    /// CLIP3-01 (raw): same strand-normalization requirement for the raw-byte
+    /// `clip_overlapping_reads` used by the `clip` command's hot path.
+    #[rstest]
+    #[case::one_base_overlap(1, 100)]
+    #[case::large_overlap(1, 50)]
+    #[case::most_overlap(1, 20)]
+    fn test_clip_overlapping_reads_normalizes_by_strand_raw(
+        #[case] fwd_start: usize,
+        #[case] rev_start: usize,
+        #[values(ClippingMode::Soft, ClippingMode::Hard)] mode: ClippingMode,
+    ) {
+        use fgumi_raw_bam::encode_record_buf_to_raw;
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReferenceSequence;
+        use std::num::NonZeroUsize;
+
+        let seq = "A".repeat(100);
+        let ref_seq =
+            Map::<ReferenceSequence>::new(NonZeroUsize::new(100_000).expect("ref length nonzero"));
+        let header =
+            noodles::sam::Header::builder().add_reference_sequence(b"chr1", ref_seq).build();
+        let clipper = RawRecordClipper::new(mode);
+        let enc = |buf: &RecordBuf| encode_record_buf_to_raw(buf, &header).expect("encode raw");
+
+        // Forward-first.
+        let mut fwd_a =
+            enc(&create_paired_record("100M", &seq, fwd_start, false, true, rev_start, "100M"));
+        let mut rev_a =
+            enc(&create_paired_record("100M", &seq, rev_start, true, false, fwd_start, "100M"));
+        let (clip_fwd_a, clip_rev_a) = clipper.clip_overlapping_reads(&mut fwd_a, &mut rev_a);
+
+        // Reverse-first.
+        let mut rev_b =
+            enc(&create_paired_record("100M", &seq, rev_start, true, false, fwd_start, "100M"));
+        let mut fwd_b =
+            enc(&create_paired_record("100M", &seq, fwd_start, false, true, rev_start, "100M"));
+        let (clip_rev_b, clip_fwd_b) = clipper.clip_overlapping_reads(&mut rev_b, &mut fwd_b);
+
+        assert_eq!(clip_fwd_a, clip_fwd_b, "forward-read clip count differs by arg order");
+        assert_eq!(clip_rev_a, clip_rev_b, "reverse-read clip count differs by arg order");
+        assert_eq!(fwd_a.cigar_ops_vec(), fwd_b.cigar_ops_vec(), "forward CIGAR");
+        assert_eq!(fwd_a.alignment_start_1based(), fwd_b.alignment_start_1based(), "forward start");
+        assert_eq!(rev_a.cigar_ops_vec(), rev_b.cigar_ops_vec(), "reverse CIGAR");
+        assert_eq!(rev_a.alignment_start_1based(), rev_b.alignment_start_1based(), "reverse start");
     }
 
     #[test]

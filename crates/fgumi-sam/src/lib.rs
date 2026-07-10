@@ -346,63 +346,15 @@ fn rebuild_header_with_hd(
     builder.set_header(header_map).build()
 }
 
-/// Returns a copy of `header` with its sort-order metadata cleared.
+/// Returns a copy of `header` with its `@HD` sort-order tags stamped.
 ///
-/// The `SO` tag is set to `unsorted` and any `GO` (group order) or `SS`
-/// (sub-sort) tags are removed. Use this when writing records whose emission
-/// order does not match the input's advertised sort order, so downstream tools
-/// don't mistakenly assume the output is sorted.
-#[must_use]
-pub fn header_as_unsorted(header: &Header) -> Header {
-    use bstr::BString;
-    use noodles::sam::header::record::value::Map;
-    use noodles::sam::header::record::value::map::header::tag::SORT_ORDER;
-
-    let mut header_map = header
-        .header()
-        .cloned()
-        .unwrap_or_else(Map::<noodles::sam::header::record::value::map::Header>::default);
-
-    let other_fields = header_map.other_fields_mut();
-    other_fields.insert(SORT_ORDER, BString::from(UNSORTED));
-    other_fields.shift_remove(b"GO");
-    other_fields.shift_remove(b"SS");
-
-    rebuild_header_with_hd(header, header_map)
-}
-
-/// Returns a copy of `header` advertising queryname sort order (`SO:queryname`),
-/// with any `GO`/`SS` tags removed.
-///
-/// This is the weakest order that satisfies [`is_query_grouped`], so it is the
-/// natural input order for template-based commands (filter, clip). Used by the
-/// test [`crate::builder::SamBuilder`] to stamp query-grouped fixtures.
-#[must_use]
-pub fn header_as_queryname(header: &Header) -> Header {
-    use bstr::BString;
-    use noodles::sam::header::record::value::Map;
-    use noodles::sam::header::record::value::map::header::tag::SORT_ORDER;
-
-    let mut header_map = header
-        .header()
-        .cloned()
-        .unwrap_or_else(Map::<noodles::sam::header::record::value::map::Header>::default);
-
-    let other_fields = header_map.other_fields_mut();
-    other_fields.insert(SORT_ORDER, BString::from(QUERY_NAME));
-    other_fields.shift_remove(b"GO");
-    other_fields.shift_remove(b"SS");
-
-    rebuild_header_with_hd(header, header_map)
-}
-
-/// Returns a copy of `header` advertising template-coordinate sort order.
-///
-/// Sets `SO:unsorted`, `GO:query`, and `SS:template-coordinate` — the order
-/// `is_template_coordinate_sorted` accepts and that `fgumi group`/`sort` emit.
-/// Primarily useful for constructing consensus-calling inputs (real or test).
-#[must_use]
-pub fn header_as_template_coordinate(header: &Header) -> Header {
+/// `so` is written to the `SO` (sort order) tag. `go` and `ss` control the `GO`
+/// (group order) and `SS` (sub-sort) tags: `Some(value)` inserts the tag with
+/// that value, `None` removes any existing tag. All other `@HD` fields and the
+/// header's read groups, reference sequences, programs, and comments are
+/// preserved. Shared by the `header_as_*` sort-order stampers, which differ only
+/// in the `(SO, GO, SS)` values they pass.
+fn stamp_hd_sort_order(header: &Header, so: &[u8], go: Option<&[u8]>, ss: Option<&[u8]>) -> Header {
     use bstr::BString;
     use noodles::sam::header::record::value::Map;
     use noodles::sam::header::record::value::map::header::tag::{
@@ -415,11 +367,71 @@ pub fn header_as_template_coordinate(header: &Header) -> Header {
         .unwrap_or_else(Map::<noodles::sam::header::record::value::map::Header>::default);
 
     let other_fields = header_map.other_fields_mut();
-    other_fields.insert(SORT_ORDER, BString::from(UNSORTED));
-    other_fields.insert(GROUP_ORDER, BString::from("query"));
-    other_fields.insert(SUBSORT_ORDER, BString::from("template-coordinate"));
+    other_fields.insert(SORT_ORDER, BString::from(so));
+    match go {
+        Some(value) => {
+            other_fields.insert(GROUP_ORDER, BString::from(value));
+        }
+        None => {
+            other_fields.shift_remove(b"GO");
+        }
+    }
+    match ss {
+        Some(value) => {
+            other_fields.insert(SUBSORT_ORDER, BString::from(value));
+        }
+        None => {
+            other_fields.shift_remove(b"SS");
+        }
+    }
 
     rebuild_header_with_hd(header, header_map)
+}
+
+/// Returns a copy of `header` with its sort-order metadata cleared.
+///
+/// The `SO` tag is set to `unsorted` and any `GO` (group order) or `SS`
+/// (sub-sort) tags are removed. Use this when writing records whose emission
+/// order does not match the input's advertised sort order, so downstream tools
+/// don't mistakenly assume the output is sorted.
+#[must_use]
+pub fn header_as_unsorted(header: &Header) -> Header {
+    stamp_hd_sort_order(header, UNSORTED, None, None)
+}
+
+/// Returns a copy of `header` advertising queryname sort order (`SO:queryname`),
+/// with any `GO`/`SS` tags removed.
+///
+/// This is the weakest order that satisfies [`is_query_grouped`], so it is the
+/// natural input order for template-based commands (filter, clip). Used by the
+/// test [`crate::builder::SamBuilder`] to stamp query-grouped fixtures.
+#[must_use]
+pub fn header_as_queryname(header: &Header) -> Header {
+    stamp_hd_sort_order(header, QUERY_NAME, None, None)
+}
+
+/// Returns a copy of `header` advertising template-coordinate sort order.
+///
+/// Sets `SO:unsorted`, `GO:query`, and `SS:template-coordinate` — the order
+/// `is_template_coordinate_sorted` accepts and that `fgumi group`/`sort` emit.
+/// Primarily useful for constructing consensus-calling inputs (real or test).
+#[must_use]
+pub fn header_as_template_coordinate(header: &Header) -> Header {
+    stamp_hd_sort_order(header, UNSORTED, Some(b"query"), Some(b"template-coordinate"))
+}
+
+/// Returns a copy of `header` advertising query grouping (`SO:unsorted`, `GO:query`).
+///
+/// The `SO` tag is set to `unsorted`, the `GO` (group order) tag to `query`, and any `SS`
+/// (sub-sort) tag is removed. Use this when the records being written are grouped by query
+/// name (a template's reads are adjacent) but not otherwise sorted — the order that
+/// `fgumi extract` and other FASTQ-order writers emit, and the minimum the template-oriented
+/// commands (`clip --clip-overlapping-reads`, `filter`, ...) require. It is the inverse of
+/// [`header_as_unsorted`]. Note this is *not* template-coordinate sorted: that additionally
+/// requires `SS:template-coordinate` (see [`is_template_coordinate_sorted`]).
+#[must_use]
+pub fn header_as_query_grouped(header: &Header) -> Header {
+    stamp_hd_sort_order(header, UNSORTED, Some(b"query"), None)
 }
 
 /// Reverses a `BufValue` (array or string).
@@ -922,6 +934,59 @@ mod tests {
         assert!(unsorted.read_groups().contains_key(b"rg1".as_slice()));
         assert_eq!(unsorted.programs().as_ref().len(), 1);
         assert!(is_sorted(&unsorted, UNSORTED));
+    }
+
+    // =========================================================================
+    // Tests for header_as_query_grouped()
+    // =========================================================================
+
+    #[test]
+    fn test_header_as_query_grouped_sets_so_unsorted_and_go_query() {
+        let header = create_header_with_so("coordinate");
+        let grouped = header_as_query_grouped(&header);
+        assert!(is_sorted(&grouped, UNSORTED), "SO must be unsorted");
+        let other_fields = grouped.header().expect("header map present").other_fields();
+        assert_eq!(other_fields.get(b"GO").map(AsRef::as_ref), Some(&b"query"[..]));
+    }
+
+    #[test]
+    fn test_header_as_query_grouped_sets_fields_when_hd_missing() {
+        let header = create_header_without_so();
+        let grouped = header_as_query_grouped(&header);
+        assert!(is_sorted(&grouped, UNSORTED));
+        let other_fields = grouped.header().expect("header map present").other_fields();
+        assert_eq!(other_fields.get(b"GO").map(AsRef::as_ref), Some(&b"query"[..]));
+    }
+
+    #[test]
+    fn test_header_as_query_grouped_drops_ss_and_is_not_template_coordinate() {
+        // Template-coordinate header has SO:unsorted, GO:query, SS:template-coordinate.
+        // Downgrading to query-grouped must drop SS so it no longer reads as
+        // template-coordinate sorted (which requires the SS sub-sort tag).
+        let header =
+            create_template_coord_header("unsorted", Some("query"), Some("template-coordinate"));
+        assert!(is_template_coordinate_sorted(&header));
+        let grouped = header_as_query_grouped(&header);
+        assert!(!is_template_coordinate_sorted(&grouped));
+        let other_fields = grouped.header().expect("header map present").other_fields();
+        assert!(other_fields.get(b"SS").is_none(), "SS should be cleared");
+        assert_eq!(other_fields.get(b"GO").map(AsRef::as_ref), Some(&b"query"[..]));
+        assert!(is_sorted(&grouped, UNSORTED));
+    }
+
+    #[test]
+    fn test_header_as_query_grouped_preserves_read_groups_and_refs() {
+        let header_str = "@HD\tVN:1.6\tSO:coordinate\n\
+                          @SQ\tSN:chr1\tLN:1000\n\
+                          @RG\tID:rg1\tSM:sample1\n\
+                          @PG\tID:prog1\tPN:tool\n";
+        let header: Header = header_str.parse().expect("parse header");
+        let grouped = header_as_query_grouped(&header);
+        assert_eq!(grouped.reference_sequences().len(), 1);
+        assert!(grouped.reference_sequences().contains_key(b"chr1".as_slice()));
+        assert_eq!(grouped.read_groups().len(), 1);
+        assert!(grouped.read_groups().contains_key(b"rg1".as_slice()));
+        assert_eq!(grouped.programs().as_ref().len(), 1);
     }
 
     // =========================================================================
