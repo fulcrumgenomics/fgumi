@@ -145,6 +145,7 @@ pub mod mi_group;
 pub mod per_thread_accumulator;
 pub use fgumi_consensus::phred;
 pub mod read_info;
+pub mod read_structure;
 pub mod reference;
 pub use fgumi_metrics::rejection;
 pub mod sam;
