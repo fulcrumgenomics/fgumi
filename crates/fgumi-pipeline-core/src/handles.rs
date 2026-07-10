@@ -542,7 +542,6 @@ pub(crate) fn build_branch_ordered_bytes<T: Send + HeapSize + Ordered + 'static>
 /// `build_branch_ordered_bytes` (BAM steps need both `HeapSize` and
 /// `Ordered`). Kept for the rare case where a step needs byte-bounded
 /// outputs without ordering.
-#[allow(dead_code)]
 pub(crate) fn build_branch_byte_aware<T: Send + HeapSize + 'static>(
     spec: QueueSpec,
     ordering: BranchOrdering,
