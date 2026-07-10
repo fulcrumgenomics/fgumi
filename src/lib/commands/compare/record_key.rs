@@ -33,13 +33,35 @@
 use fgumi_raw_bam::RawRecord;
 
 /// Which read of a template a record belongs to.
+///
+/// All four FIRST/LAST bit combinations map to a distinct variant so that
+/// same-QNAME records with different segment flags never collide into one key —
+/// including the malformed `FIRST | LAST` state, which must not be conflated with
+/// a plain `Fragment` (neither flag set).
+///
+/// **The variant declaration order is load-bearing** (it defines the derived
+/// `Ord` used by [`RecordKey`]). `FirstAndLast` is deliberately ordered *before*
+/// `First`/`Last`, i.e. it does **not** match `fgumi_sort`'s
+/// `queryname_flag_order` bit-packing, which sorts the `FIRST | LAST` flag word
+/// (`0xc0`) *last*. That intentional disagreement is what keeps the key-join F1
+/// soundness guard ([`keyjoin_compare`](super::engines::keyjoin::keyjoin_compare))
+/// able to detect — and hard-fail on — a canonicalized stream containing such a
+/// malformed record, rather than silently joining it. The
+/// `test_keyjoin_compare_hard_errors_on_record_key_order_violation` integration
+/// test locks this coupling: reordering `FirstAndLast` to match the flag packing
+/// would break it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub enum Segment {
     /// Neither FIRST nor LAST segment set (unpaired / fragment read).
     Fragment,
-    /// `FIRST_OF_PAIR` (flag 0x40).
+    /// Both `FIRST_OF_PAIR` and `LAST_OF_PAIR` set — a malformed/ambiguous flag
+    /// state that is kept distinct from `Fragment` so the two never share an
+    /// identity key. Ordered here (before `First`/`Last`) on purpose — see the
+    /// enum-level note above.
+    FirstAndLast,
+    /// `FIRST_OF_PAIR` (flag 0x40) only.
     First,
-    /// `LAST_OF_PAIR` (flag 0x80).
+    /// `LAST_OF_PAIR` (flag 0x80) only.
     Last,
 }
 
@@ -73,9 +95,10 @@ pub struct RecordKey {
 #[inline]
 fn segment_of(raw: &RawRecord) -> Segment {
     match (raw.is_first_segment(), raw.is_last_segment()) {
+        (false, false) => Segment::Fragment,
         (true, false) => Segment::First,
         (false, true) => Segment::Last,
-        _ => Segment::Fragment,
+        (true, true) => Segment::FirstAndLast,
     }
 }
 
@@ -137,6 +160,8 @@ pub fn record_keys_match(a: &RawRecord, b: &RawRecord) -> bool {
 mod tests {
     use super::*;
     use fgumi_raw_bam::SamBuilder;
+    use proptest::prelude::*;
+    use rstest::rstest;
     // Reuse `fgumi_raw_bam`'s own flag-bit constants (rather than redefining them here) for
     // building raw test records under the old short names these tests already use throughout.
     use fgumi_raw_bam::flags::{
@@ -207,45 +232,78 @@ mod tests {
         assert_eq!(record_key(&rec(b"frag", 0)).segment, Segment::Fragment);
     }
 
-    /// `record_keys_match` must agree with `record_key(a) == record_key(b)` on every
-    /// case exercised above — it is a non-allocating equivalent of that comparison,
-    /// not a different notion of identity.
     #[test]
-    fn record_keys_match_agrees_with_owned_record_key_equality() {
-        let cases: Vec<(RawRecord, RawRecord)> = vec![
-            // Identical records.
-            (rec(b"read", FLAG_FIRST), rec(b"read", FLAG_FIRST)),
-            // Different read names.
-            (rec(b"read_a", FLAG_FIRST), rec(b"read_b", FLAG_FIRST)),
-            // Same name, different segment (R1 vs R2).
-            (rec(b"read", FLAG_FIRST), rec(b"read", FLAG_LAST)),
-            // Same name/segment, primary vs secondary.
-            (rec(b"read", FLAG_FIRST), rec(b"read", FLAG_FIRST | FLAG_SECONDARY)),
-            // Same name/segment, primary vs supplementary.
-            (rec(b"read", FLAG_FIRST), rec(b"read", FLAG_FIRST | FLAG_SUPPLEMENTARY)),
-            // Two secondary alignments of the same segment at different loci.
-            (
-                rec_at(b"read", FLAG_FIRST | FLAG_SECONDARY, 1, 100),
-                rec_at(b"read", FLAG_FIRST | FLAG_SECONDARY, 1, 250),
-            ),
-            // Two secondary alignments of the same segment at the same locus.
-            (
-                rec_at(b"read", FLAG_FIRST | FLAG_SECONDARY, 1, 100),
-                rec_at(b"read", FLAG_FIRST | FLAG_SECONDARY, 1, 100),
-            ),
-            // Primaries at different loci must still pair (locus ignored for primaries).
-            (rec_at(b"read", FLAG_FIRST, 1, 100), rec_at(b"read", FLAG_FIRST, 2, 999)),
-            // Fragment reads (neither FIRST nor LAST).
-            (rec(b"frag", 0), rec(b"frag", 0)),
-        ];
+    fn first_and_last_set_does_not_collapse_into_fragment() {
+        // A record with both FIRST and LAST set is a distinct (malformed but real) flag
+        // state; it must not share a key with a plain fragment (neither flag set) of the
+        // same name, or the two would collide and pair arbitrarily.
+        let both = record_key(&rec(b"read", FLAG_FIRST | FLAG_LAST));
+        let fragment = record_key(&rec(b"read", 0));
+        assert_eq!(both.segment, Segment::FirstAndLast);
+        assert_ne!(
+            both, fragment,
+            "FIRST|LAST and a plain fragment of the same name must not collide"
+        );
+    }
 
-        for (a, b) in &cases {
-            let owned_equal = record_key(a) == record_key(b);
-            assert_eq!(
-                record_keys_match(a, b),
-                owned_equal,
-                "record_keys_match must agree with record_key(a) == record_key(b) for {a:?} vs {b:?}"
-            );
+    /// `record_keys_match` is a non-allocating equivalent of `record_key(a) == record_key(b)`,
+    /// not a different notion of identity — it must agree with the owned comparison on every
+    /// case. Each scenario is its own `#[case]` so a failure names the scenario, not an index.
+    #[rstest]
+    #[case::identical(rec(b"read", FLAG_FIRST), rec(b"read", FLAG_FIRST))]
+    #[case::different_names(rec(b"read_a", FLAG_FIRST), rec(b"read_b", FLAG_FIRST))]
+    #[case::r1_vs_r2(rec(b"read", FLAG_FIRST), rec(b"read", FLAG_LAST))]
+    #[case::primary_vs_secondary(rec(b"read", FLAG_FIRST), rec(b"read", FLAG_FIRST | FLAG_SECONDARY))]
+    #[case::primary_vs_supplementary(
+        rec(b"read", FLAG_FIRST),
+        rec(b"read", FLAG_FIRST | FLAG_SUPPLEMENTARY)
+    )]
+    #[case::two_secondaries_different_locus(
+        rec_at(b"read", FLAG_FIRST | FLAG_SECONDARY, 1, 100),
+        rec_at(b"read", FLAG_FIRST | FLAG_SECONDARY, 1, 250)
+    )]
+    #[case::two_secondaries_same_locus(
+        rec_at(b"read", FLAG_FIRST | FLAG_SECONDARY, 1, 100),
+        rec_at(b"read", FLAG_FIRST | FLAG_SECONDARY, 1, 100)
+    )]
+    #[case::primaries_different_locus_still_pair(
+        rec_at(b"read", FLAG_FIRST, 1, 100),
+        rec_at(b"read", FLAG_FIRST, 2, 999)
+    )]
+    #[case::fragments(rec(b"frag", 0), rec(b"frag", 0))]
+    fn record_keys_match_agrees_with_owned_record_key_equality(
+        #[case] a: RawRecord,
+        #[case] b: RawRecord,
+    ) {
+        assert_eq!(
+            record_keys_match(&a, &b),
+            record_key(&a) == record_key(&b),
+            "record_keys_match must agree with record_key(a) == record_key(b) for {a:?} vs {b:?}"
+        );
+    }
+
+    proptest! {
+        /// The fixed case table above can only spot-check the `record_keys_match` ==
+        /// `record_key(a) == record_key(b)` invariant; this proves it over arbitrary
+        /// records. Names are drawn from a tiny alphabet and full-random flags cover every
+        /// FIRST/LAST/SECONDARY/SUPPLEMENTARY combination, so equal names — and thus the
+        /// segment/secondary/supplementary/locus discriminators — are exercised frequently,
+        /// not just the trivially-unequal-name path. A single divergence here would be a
+        /// silent soundness hole in the positional engine's record pairing.
+        #[test]
+        fn record_keys_match_agrees_with_owned_equality_over_arbitrary_records(
+            name_a in "[a-c]{1,3}",
+            flags_a in any::<u16>(),
+            ref_a in -1i32..4,
+            pos_a in -1i32..500,
+            name_b in "[a-c]{1,3}",
+            flags_b in any::<u16>(),
+            ref_b in -1i32..4,
+            pos_b in -1i32..500,
+        ) {
+            let a = rec_at(name_a.as_bytes(), flags_a, ref_a, pos_a);
+            let b = rec_at(name_b.as_bytes(), flags_b, ref_b, pos_b);
+            prop_assert_eq!(record_keys_match(&a, &b), record_key(&a) == record_key(&b));
         }
     }
 }
