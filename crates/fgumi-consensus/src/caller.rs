@@ -414,6 +414,13 @@ pub enum RejectionReason {
     OrphanConsensus,
     /// Overlap boundary lands in an indel between strands
     IndelErrorBetweenStrands,
+    /// Overlap clipping failed: the computed consensus length is shorter than a
+    /// single-strand consensus, so the overlapping ends could not be clipped
+    /// (codec; fgbio `CodecConsensusCaller.scala:243` `ClipOverlapFailed`).
+    ClipOverlapFailed,
+    /// Too many disagreements between the top/bottom strands of a duplex
+    /// (codec; fgbio `CodecConsensusCaller.scala:255` `HighDuplexDisagreement`).
+    HighDuplexDisagreement,
     /// Potential collision
     PotentialCollision,
     /// Template did not have a single primary FR pair of reads (codec)
@@ -442,6 +449,8 @@ impl RejectionReason {
             Self::InsufficientOverlap => 'V',
             Self::OrphanConsensus => 'P',
             Self::IndelErrorBetweenStrands => 'D',
+            Self::ClipOverlapFailed => 'L',
+            Self::HighDuplexDisagreement => 'H',
             Self::PotentialCollision => 'C',
             Self::NotPrimaryFrPair => 'R',
             Self::Other => 'O',
@@ -467,6 +476,8 @@ impl RejectionReason {
             Self::InsufficientOverlap => "Insufficient overlap between reads",
             Self::OrphanConsensus => "Only one of R1 or R2 consensus generated",
             Self::IndelErrorBetweenStrands => "Overlap boundary lands in indel between strands",
+            Self::ClipOverlapFailed => "Overlap clipping failed (consensus shorter than a strand)",
+            Self::HighDuplexDisagreement => "Too many disagreements between top/bottom strands",
             Self::PotentialCollision => {
                 "Potential collisions (reads with the same MI but different strands)"
             }
@@ -500,6 +511,10 @@ impl RejectionReason {
             // not as generic insufficient-support / no-valid-alignment.
             Self::InsufficientOverlap => CentralReason::R1R2OverlapTooShort,
             Self::IndelErrorBetweenStrands => CentralReason::IndelErrorBetweenStrands,
+            // fgbio's codec caller counts these as `clip_overlap_failed` and
+            // `high_duplex_disagreement` (CodecConsensusCaller.scala:243,255).
+            Self::ClipOverlapFailed => CentralReason::ClipOverlapFailed,
+            Self::HighDuplexDisagreement => CentralReason::HighDuplexDisagreement,
             Self::ZeroLengthAfterTrimming => CentralReason::ZeroBasesPostTrimming,
             Self::OrphanConsensus => CentralReason::OrphanConsensus,
             Self::PotentialCollision => CentralReason::DuplicateUmi,
@@ -553,6 +568,7 @@ pub fn make_prefix_from_header(header: &Header) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fgumi_metrics::rejection::RejectionReason as CentralReason;
     use rstest::rstest;
 
     /// The scalar depth-tag clamp mirrors fgbio's `Short` per-base ceiling: values at or
@@ -593,8 +609,6 @@ mod tests {
 
     #[test]
     fn test_rejection_reason_to_centralized() {
-        use fgumi_metrics::rejection::RejectionReason as CentralReason;
-
         assert_eq!(
             RejectionReason::InsufficientReads.to_centralized(),
             CentralReason::InsufficientSupport
@@ -781,6 +795,9 @@ mod tests {
             RejectionReason::InsufficientOverlap,
             RejectionReason::OrphanConsensus,
             RejectionReason::IndelErrorBetweenStrands,
+            RejectionReason::ClipOverlapFailed,
+            RejectionReason::HighDuplexDisagreement,
+            RejectionReason::NotPrimaryFrPair,
             RejectionReason::PotentialCollision,
             RejectionReason::Other,
         ];
@@ -1094,68 +1111,87 @@ mod tests {
     // Comprehensive RejectionReason tests
     // =====================================================================
 
-    #[test]
-    fn test_all_rejection_reasons_have_descriptions() {
-        let reasons = [
-            RejectionReason::FragmentRead,
-            RejectionReason::InsufficientReads,
-            RejectionReason::QualityTooLow,
-            RejectionReason::Unmapped,
-            RejectionReason::Mapped,
-            RejectionReason::TooManyNs,
-            RejectionReason::MinorityAlignment,
-            RejectionReason::SecondaryOrSupplementary,
-            RejectionReason::FailedQC,
-            RejectionReason::MissingUmi,
-            RejectionReason::QualityTrimmed,
-            RejectionReason::ZeroLengthAfterTrimming,
-            RejectionReason::InsufficientOverlap,
-            RejectionReason::OrphanConsensus,
-            RejectionReason::IndelErrorBetweenStrands,
-            RejectionReason::PotentialCollision,
-            RejectionReason::NotPrimaryFrPair,
-            RejectionReason::Other,
-        ];
-
-        for reason in &reasons {
-            let desc = reason.description();
-            assert!(!desc.is_empty(), "Description should not be empty for {reason:?}");
-        }
+    #[rstest]
+    #[case::fragment_read(RejectionReason::FragmentRead)]
+    #[case::insufficient_reads(RejectionReason::InsufficientReads)]
+    #[case::quality_too_low(RejectionReason::QualityTooLow)]
+    #[case::unmapped(RejectionReason::Unmapped)]
+    #[case::mapped(RejectionReason::Mapped)]
+    #[case::too_many_ns(RejectionReason::TooManyNs)]
+    #[case::minority_alignment(RejectionReason::MinorityAlignment)]
+    #[case::secondary_or_supplementary(RejectionReason::SecondaryOrSupplementary)]
+    #[case::failed_qc(RejectionReason::FailedQC)]
+    #[case::missing_umi(RejectionReason::MissingUmi)]
+    #[case::quality_trimmed(RejectionReason::QualityTrimmed)]
+    #[case::zero_length_after_trimming(RejectionReason::ZeroLengthAfterTrimming)]
+    #[case::insufficient_overlap(RejectionReason::InsufficientOverlap)]
+    #[case::orphan_consensus(RejectionReason::OrphanConsensus)]
+    #[case::indel_error_between_strands(RejectionReason::IndelErrorBetweenStrands)]
+    #[case::clip_overlap_failed(RejectionReason::ClipOverlapFailed)]
+    #[case::high_duplex_disagreement(RejectionReason::HighDuplexDisagreement)]
+    #[case::potential_collision(RejectionReason::PotentialCollision)]
+    #[case::not_primary_fr_pair(RejectionReason::NotPrimaryFrPair)]
+    #[case::other(RejectionReason::Other)]
+    fn test_all_rejection_reasons_have_descriptions(#[case] reason: RejectionReason) {
+        assert!(!reason.description().is_empty(), "Description should not be empty for {reason:?}");
     }
 
-    #[test]
-    fn test_all_rejection_reasons_to_centralized() {
-        use fgumi_metrics::rejection::RejectionReason as CentralReason;
-
-        // Test every variant maps to a centralized reason
-        let mappings = [
-            (RejectionReason::FragmentRead, CentralReason::NonPairedReads),
-            (RejectionReason::InsufficientReads, CentralReason::InsufficientSupport),
-            (RejectionReason::QualityTooLow, CentralReason::LowBaseQuality),
-            (RejectionReason::Unmapped, CentralReason::NoValidAlignment),
-            (RejectionReason::Mapped, CentralReason::NoValidAlignment),
-            (RejectionReason::TooManyNs, CentralReason::ExcessiveNBases),
-            (RejectionReason::MinorityAlignment, CentralReason::MinorityAlignment),
-            (RejectionReason::SecondaryOrSupplementary, CentralReason::NoValidAlignment),
-            (RejectionReason::FailedQC, CentralReason::NotPassingFilter),
-            (RejectionReason::MissingUmi, CentralReason::MissingUmi),
-            (RejectionReason::QualityTrimmed, CentralReason::LowBaseQuality),
-            (RejectionReason::ZeroLengthAfterTrimming, CentralReason::ZeroBasesPostTrimming),
-            (RejectionReason::InsufficientOverlap, CentralReason::R1R2OverlapTooShort),
-            (RejectionReason::OrphanConsensus, CentralReason::OrphanConsensus),
-            (RejectionReason::IndelErrorBetweenStrands, CentralReason::IndelErrorBetweenStrands),
-            (RejectionReason::PotentialCollision, CentralReason::DuplicateUmi),
-            (RejectionReason::NotPrimaryFrPair, CentralReason::NotPrimaryFrPair),
-            (RejectionReason::Other, CentralReason::InsufficientSupport),
-        ];
-
-        for (caller_reason, expected_central) in &mappings {
-            assert_eq!(
-                caller_reason.to_centralized(),
-                *expected_central,
-                "Mismatch for {caller_reason:?}"
-            );
-        }
+    /// Every caller-specific rejection reason maps to the expected centralized reason.
+    /// One case per distinct mapping so a drifted mapping names the offending variant.
+    #[rstest]
+    #[case::fragment_read(RejectionReason::FragmentRead, CentralReason::NonPairedReads)]
+    #[case::insufficient_reads(
+        RejectionReason::InsufficientReads,
+        CentralReason::InsufficientSupport
+    )]
+    #[case::quality_too_low(RejectionReason::QualityTooLow, CentralReason::LowBaseQuality)]
+    #[case::unmapped(RejectionReason::Unmapped, CentralReason::NoValidAlignment)]
+    #[case::mapped(RejectionReason::Mapped, CentralReason::NoValidAlignment)]
+    #[case::too_many_ns(RejectionReason::TooManyNs, CentralReason::ExcessiveNBases)]
+    #[case::minority_alignment(
+        RejectionReason::MinorityAlignment,
+        CentralReason::MinorityAlignment
+    )]
+    #[case::secondary_or_supplementary(
+        RejectionReason::SecondaryOrSupplementary,
+        CentralReason::NoValidAlignment
+    )]
+    #[case::failed_qc(RejectionReason::FailedQC, CentralReason::NotPassingFilter)]
+    #[case::missing_umi(RejectionReason::MissingUmi, CentralReason::MissingUmi)]
+    #[case::quality_trimmed(RejectionReason::QualityTrimmed, CentralReason::LowBaseQuality)]
+    #[case::zero_length_after_trimming(
+        RejectionReason::ZeroLengthAfterTrimming,
+        CentralReason::ZeroBasesPostTrimming
+    )]
+    #[case::insufficient_overlap(
+        RejectionReason::InsufficientOverlap,
+        CentralReason::R1R2OverlapTooShort
+    )]
+    #[case::orphan_consensus(RejectionReason::OrphanConsensus, CentralReason::OrphanConsensus)]
+    #[case::indel_error_between_strands(
+        RejectionReason::IndelErrorBetweenStrands,
+        CentralReason::IndelErrorBetweenStrands
+    )]
+    #[case::clip_overlap_failed(
+        RejectionReason::ClipOverlapFailed,
+        CentralReason::ClipOverlapFailed
+    )]
+    #[case::high_duplex_disagreement(
+        RejectionReason::HighDuplexDisagreement,
+        CentralReason::HighDuplexDisagreement
+    )]
+    #[case::not_primary_fr_pair(RejectionReason::NotPrimaryFrPair, CentralReason::NotPrimaryFrPair)]
+    #[case::potential_collision(RejectionReason::PotentialCollision, CentralReason::DuplicateUmi)]
+    #[case::other(RejectionReason::Other, CentralReason::InsufficientSupport)]
+    fn test_all_rejection_reasons_to_centralized(
+        #[case] caller_reason: RejectionReason,
+        #[case] expected_central: CentralReason,
+    ) {
+        assert_eq!(
+            caller_reason.to_centralized(),
+            expected_central,
+            "Mismatch for {caller_reason:?}"
+        );
     }
 
     #[test]
@@ -1165,6 +1201,8 @@ mod tests {
         assert_eq!(RejectionReason::InsufficientOverlap.code(), 'V');
         assert_eq!(RejectionReason::OrphanConsensus.code(), 'P');
         assert_eq!(RejectionReason::IndelErrorBetweenStrands.code(), 'D');
+        assert_eq!(RejectionReason::ClipOverlapFailed.code(), 'L');
+        assert_eq!(RejectionReason::HighDuplexDisagreement.code(), 'H');
         assert_eq!(RejectionReason::PotentialCollision.code(), 'C');
 
         assert_eq!(
@@ -1182,6 +1220,14 @@ mod tests {
         assert_eq!(
             RejectionReason::IndelErrorBetweenStrands.description(),
             "Overlap boundary lands in indel between strands"
+        );
+        assert_eq!(
+            RejectionReason::ClipOverlapFailed.description(),
+            "Overlap clipping failed (consensus shorter than a strand)"
+        );
+        assert_eq!(
+            RejectionReason::HighDuplexDisagreement.description(),
+            "Too many disagreements between top/bottom strands"
         );
         assert_eq!(
             RejectionReason::PotentialCollision.description(),
