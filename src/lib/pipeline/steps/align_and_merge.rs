@@ -298,6 +298,19 @@ impl InFlightGate {
     }
 }
 
+/// RAII guard that latches consumer-gone on drop — on normal return, on an
+/// error return, AND on a panic unwinding out of `reader_loop`. Without the
+/// guard the panic path would skip `mark_consumer_gone`, leaving a writer
+/// parked in `gate.acquire` blocked forever and `Drop`'s `writer_thread.join()`
+/// hung with it.
+struct ConsumerGoneGuard<'a>(&'a InFlightGate);
+
+impl Drop for ConsumerGoneGuard<'_> {
+    fn drop(&mut self) {
+        self.0.mark_consumer_gone();
+    }
+}
+
 /// FASTQ-writer [`BufWriter`] capacity. 1 MiB matches the legacy
 /// orchestrator's choice (`align_and_merge.rs:259`): bigger than the
 /// OS pipe buffer (~64 KiB) so we amortize `write` syscalls, but not
@@ -572,12 +585,13 @@ impl AlignAndMergeStep {
             thread::Builder::new()
                 .name("aam-sam-reader".into())
                 .spawn(move || {
-                    let result = reader_loop(token_rx, out_tx, aligner_stdout, cfg, shared, &gate);
-                    // Latch consumer-gone on every reader exit (EOF or
-                    // error) so a writer blocked in `gate.acquire` wakes
-                    // and bails instead of hanging.
-                    gate.mark_consumer_gone();
-                    result
+                    // Latch consumer-gone on EVERY reader exit — normal return,
+                    // error, or a panic in `reader_loop` — via the RAII guard, so
+                    // a writer blocked in `gate.acquire` always wakes and bails
+                    // instead of hanging (and `Drop`'s `writer_thread.join()`
+                    // cannot deadlock on a panicked reader).
+                    let _consumer_gone = ConsumerGoneGuard(&gate);
+                    reader_loop(token_rx, out_tx, aligner_stdout, cfg, shared, &gate)
                 })
                 .map_err(|e| {
                     io::Error::other(format!(
@@ -1739,6 +1753,27 @@ mod tests {
         // Small / zero -K floors at IN_FLIGHT_MIN_BUDGET.
         assert_eq!(in_flight_budget_for_chunk_size(0), IN_FLIGHT_MIN_BUDGET);
         assert_eq!(in_flight_budget_for_chunk_size(1_000_000), IN_FLIGHT_MIN_BUDGET);
+    }
+
+    #[test]
+    fn consumer_gone_latched_even_when_reader_scope_panics() {
+        // A panic unwinding out of the reader scope must still latch
+        // consumer-gone via `ConsumerGoneGuard`, so a writer parked in
+        // `acquire` bails (returns false) instead of blocking forever. Without
+        // the guard the panic would skip `mark_consumer_gone`, deadlocking the
+        // writer and the `writer_thread.join()` in `Drop`.
+        let gate = InFlightGate::new(1024);
+        assert!(gate.acquire(10), "acquire succeeds before the consumer is gone");
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _consumer_gone = ConsumerGoneGuard(&gate);
+            panic!("simulated reader_loop panic");
+        }));
+        assert!(panicked.is_err(), "the panic must propagate out of the guarded scope");
+
+        // The guard's `Drop` latched consumer-gone during unwind, so a
+        // subsequent writer reservation bails instead of blocking.
+        assert!(!gate.acquire(10), "a writer must bail once the reader scope has panicked");
     }
 
     #[test]
