@@ -1498,14 +1498,29 @@ impl SortWorkerPool {
             return StepResult::InputEmpty;
         }
 
-        // Drop the lock before pushing to queue
+        // Reserve this batch's serial range WHILE STILL HOLDING the input lock,
+        // before releasing it. Otherwise a worker preempted between `drop(guard)`
+        // and the per-block `fetch_add` leaves its already-read blocks uncounted
+        // in `input_read_serial` while another worker acquires the lock, reads the
+        // empty EOF batch, and sets `input_eof`. The done-check
+        // (`input_blocks_queued == input_read_serial && input_eof`) then fires
+        // early, the merge finalizes, and this worker's trailing blocks are pushed
+        // after termination — silently truncating output. Reserving under the lock
+        // guarantees `input_read_serial` accounts for every read block before
+        // `input_eof` can be set (mirrors the Phase-2 reserve-under-lock protocol).
+        let batch_len = blocks.len() as u64;
+        let base_serial = shared.input_read_serial.fetch_add(batch_len, Ordering::Relaxed);
+
+        // Drop the lock before pushing to queue.
         drop(guard);
 
-        // Assign serial numbers and push to raw_input_blocks ArrayQueue.
-        // Once the queue is full, hold this block and all remaining blocks.
+        // Push blocks under their pre-reserved serials. Once the queue is full,
+        // hold this block and all remaining blocks.
+        let mut next_serial = base_serial;
         let mut blocks_iter = blocks.into_iter();
         for block in blocks_iter.by_ref() {
-            let serial = shared.input_read_serial.fetch_add(1, Ordering::Relaxed);
+            let serial = next_serial;
+            next_serial += 1;
             match shared.raw_input_blocks.push((serial, block)) {
                 Ok(()) => {}
                 Err((serial, block)) => {
@@ -1516,7 +1531,8 @@ impl SortWorkerPool {
         }
         // Hold any remaining blocks we didn't attempt to push
         for block in blocks_iter {
-            let serial = shared.input_read_serial.fetch_add(1, Ordering::Relaxed);
+            let serial = next_serial;
+            next_serial += 1;
             worker.held_raw_input_blocks.push((serial, block));
         }
 
