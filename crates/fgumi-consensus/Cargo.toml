@@ -13,7 +13,7 @@ anyhow = "1.0"
 approx = "0.5"
 bstr = "1.12.1"
 log = "0"
-noodles = { version = "0.111.0", features = ["bam", "sam", "core"] }
+noodles = { version = "0.112.0", features = ["bam", "sam", "core"] }
 rand = "0.10"
 thiserror = "2"
 wide = "1.5"
