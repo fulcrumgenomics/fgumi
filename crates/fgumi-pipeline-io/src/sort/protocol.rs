@@ -229,21 +229,6 @@ pub enum SortPhase1Event {
     AllAnnounced { slot_count: u32, memory_chunk_count: u32, total_records: u64 },
 }
 
-impl HeapSize for SortPhase1Event {
-    fn heap_size(&self) -> usize {
-        // Charge a fixed per-event base so the byte-bounded transport queues
-        // cannot accept an unbounded count of near-zero-cost control events
-        // (`SpillReady` with an empty path, `AllAnnounced`). Memory stays a
-        // function of configuration rather than event count.
-        let base = std::mem::size_of::<Self>();
-        match self {
-            Self::SpillReady { path, .. } => base + path.as_os_str().len(),
-            Self::MemoryChunk { chunk, .. } => base + chunk.approx_heap_bytes(),
-            Self::AllAnnounced { .. } => base,
-        }
-    }
-}
-
 /// Events from `SortSpillDecompress` → `SortMerge`.
 pub enum SortPhase2Event {
     /// Forwarded `SortPhase1Event::SpillReady`.
@@ -254,42 +239,47 @@ pub enum SortPhase2Event {
     AllAnnounced { slot_count: u32, memory_chunk_count: u32, total_records: u64 },
 }
 
-impl HeapSize for SortPhase2Event {
-    fn heap_size(&self) -> usize {
-        // See `SortPhase1Event::heap_size`: a fixed per-event base keeps the
-        // byte-bounded queues from absorbing unbounded control-event counts.
-        let base = std::mem::size_of::<Self>();
-        match self {
-            Self::SpillReady { path, .. } => base + path.as_os_str().len(),
-            Self::MemoryChunk { chunk, .. } => base + chunk.approx_heap_bytes(),
-            Self::AllAnnounced { .. } => base,
+/// Generates the identical `HeapSize` impl and `records_ingested_so_far` accessor for a
+/// spill-phase event enum.
+///
+/// [`SortPhase1Event`] and [`SortPhase2Event`] are structurally identical (the Phase-2
+/// event is a verbatim forward of the Phase-1 event) but are kept as distinct types so
+/// the typed-step pipeline cannot wire a Phase-1 producer output straight into a
+/// Phase-2 (`SortMerge`) input. This macro removes the duplicated impl bodies without
+/// collapsing the two types.
+macro_rules! impl_spill_phase_event {
+    ($ty:ty) => {
+        impl HeapSize for $ty {
+            fn heap_size(&self) -> usize {
+                // Charge a fixed per-event base so the byte-bounded transport queues
+                // cannot accept an unbounded count of near-zero-cost control events
+                // (`SpillReady` with an empty path, `AllAnnounced`). Memory stays a
+                // function of configuration rather than event count.
+                let base = std::mem::size_of::<Self>();
+                match self {
+                    Self::SpillReady { path, .. } => base + path.as_os_str().len(),
+                    Self::MemoryChunk { chunk, .. } => base + chunk.approx_heap_bytes(),
+                    Self::AllAnnounced { .. } => base,
+                }
+            }
         }
-    }
+
+        impl $ty {
+            /// Running snapshot of records ingested at the moment this event was emitted.
+            #[must_use]
+            pub fn records_ingested_so_far(&self) -> u64 {
+                match self {
+                    Self::SpillReady { records_ingested_so_far, .. }
+                    | Self::MemoryChunk { records_ingested_so_far, .. } => *records_ingested_so_far,
+                    Self::AllAnnounced { total_records, .. } => *total_records,
+                }
+            }
+        }
+    };
 }
 
-impl SortPhase1Event {
-    /// Running snapshot of records ingested at the moment this event was emitted.
-    #[must_use]
-    pub fn records_ingested_so_far(&self) -> u64 {
-        match self {
-            Self::SpillReady { records_ingested_so_far, .. }
-            | Self::MemoryChunk { records_ingested_so_far, .. } => *records_ingested_so_far,
-            Self::AllAnnounced { total_records, .. } => *total_records,
-        }
-    }
-}
-
-impl SortPhase2Event {
-    /// See [`SortPhase1Event::records_ingested_so_far`].
-    #[must_use]
-    pub fn records_ingested_so_far(&self) -> u64 {
-        match self {
-            Self::SpillReady { records_ingested_so_far, .. }
-            | Self::MemoryChunk { records_ingested_so_far, .. } => *records_ingested_so_far,
-            Self::AllAnnounced { total_records, .. } => *total_records,
-        }
-    }
-}
+impl_spill_phase_event!(SortPhase1Event);
+impl_spill_phase_event!(SortPhase2Event);
 
 #[cfg(test)]
 mod tests {
