@@ -262,6 +262,28 @@ pub fn validate_file_exists<P: AsRef<Path>>(path: P, description: &str) -> Fgumi
     Ok(())
 }
 
+/// Returns `true` if `s` contains a genuine decimal scientific-notation
+/// mantissa-exponent (e.g. `1e5`, `1.5e10`, `2E+3`).
+///
+/// Only an `e`/`E` that is preceded by a digit or `.` **and** followed by a
+/// digit or a sign counts. This deliberately does *not* match the exabyte units
+/// `EB`/`EiB` (where `E` is followed by `B`/`i`), which `bytesize` accepts — the
+/// earlier `contains('e') || contains('E')` heuristic wrongly rejected them.
+fn looks_like_scientific_notation(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| {
+        if b != b'e' && b != b'E' {
+            return false;
+        }
+        let prev_is_mantissa = i > 0 && (bytes[i - 1].is_ascii_digit() || bytes[i - 1] == b'.');
+        let next_is_exponent = matches!(
+            bytes.get(i + 1),
+            Some(&c) if c.is_ascii_digit() || c == b'+' || c == b'-'
+        );
+        prev_is_mantissa && next_is_exponent
+    })
+}
+
 /// Parses a memory size string into bytes.
 ///
 /// Accepts both plain numbers (interpreted as MiB) and human-readable formats like:
@@ -269,6 +291,8 @@ pub fn validate_file_exists<P: AsRef<Path>>(path: P, description: &str) -> Fgumi
 /// - "1.5GB" -> 1.5 gigabytes
 /// - "1024MB", "1024M" -> 1024 megabytes (decimal)
 /// - "512MiB" -> 512 mebibytes (binary: 536,870,912)
+/// - "1EB", "1EiB" -> 1 exabyte / exbibyte (decimal / binary; the largest units
+///   accepted — values above `u64::MAX` saturate rather than wrapping)
 /// - "768" -> 768 MiB (plain numbers are interpreted as mebibytes)
 ///
 /// # Errors
@@ -308,7 +332,7 @@ pub fn parse_memory_size(size_str: &str) -> FgumiResult<u64> {
         });
     }
 
-    if trimmed.contains('e') || trimmed.contains('E') {
+    if looks_like_scientific_notation(trimmed) {
         return Err(FgumiError::InvalidMemorySize {
             reason: format!(
                 "Scientific notation not supported: '{trimmed}'. Use integer values or human-readable formats like '2GB'."
@@ -412,7 +436,13 @@ fn format_binary_bytes(bytes: usize, f: &mut std::fmt::Formatter<'_>) -> std::fm
 pub const MIN_MEMORY_PER_THREAD: usize = 256 * 1024 * 1024;
 
 /// Default auto-reserve cap: 10 GiB.
-const AUTO_RESERVE_CAP: usize = 10 * 1024 * 1024 * 1024;
+///
+/// Computed with `saturating_mul` so it does not const-overflow `usize` on
+/// 32-bit targets (where `usize == u32` cannot hold 10 GiB). There it saturates
+/// to `usize::MAX`, so `resolve_reserve`'s `AUTO_RESERVE_CAP.min(total / 2)`
+/// simply yields `total / 2` — consistent with `detect_total_memory`, which also
+/// deliberately supports 32-bit by saturating.
+const AUTO_RESERVE_CAP: usize = 10usize.saturating_mul(1024 * 1024 * 1024);
 
 /// Parse a memory-limit string (e.g. "512M", "1G", "768", "auto").
 ///
@@ -632,6 +662,29 @@ mod tests {
         assert!(parse_memory_size("0").is_err());
     }
 
+    /// Audit C3: the scientific-notation guard rejected any `e`/`E`, which also
+    /// rejected the exabyte units `EB`/`EiB` that `bytesize` accepts. It must
+    /// only fire for a genuine mantissa-exponent (a digit/`.`, then `e`/`E`,
+    /// then a digit or sign).
+    #[rstest]
+    #[case::exabyte("1EB", true)]
+    #[case::exbibyte("1EiB", true)]
+    #[case::exabyte_multi("2EB", true)]
+    #[case::gibibyte("512MiB", true)]
+    #[case::scientific_lower("1e5", false)]
+    #[case::scientific_upper("1E5", false)]
+    #[case::scientific_decimal("1.5e10", false)]
+    #[case::scientific_signed("2E+3", false)]
+    #[case::scientific_neg("3e-2", false)]
+    fn test_parse_memory_size_scientific_notation_guard(#[case] input: &str, #[case] ok: bool) {
+        assert_eq!(
+            parse_memory_size(input).is_ok(),
+            ok,
+            "parse_memory_size({input:?}) expected ok={ok}, got {:?}",
+            parse_memory_size(input)
+        );
+    }
+
     #[test]
     fn test_memory_limit_display() {
         assert_eq!(MemoryLimit::Auto.to_string(), "auto");
@@ -641,9 +694,14 @@ mod tests {
 
     #[test]
     fn test_resolve_reserve_auto() {
-        let total = 32 * 1024 * 1024 * 1024_usize; // 32 GiB
+        // Target-aware: a fixed 32 GiB `usize` literal cannot compile on 32-bit (`usize == u32`).
+        // Derive `total` from the cap so the test builds on every target, and assert the exact
+        // `resolve_reserve` formula (`AUTO_RESERVE_CAP.min(total / 2)`): on 64-bit the 10 GiB cap
+        // strictly binds (total/2 = 15 GiB > cap); on 32-bit the cap saturates to `usize::MAX`, so
+        // the expected value is `total / 2` — matching the documented 32-bit saturation behavior.
+        let total = AUTO_RESERVE_CAP.saturating_mul(3);
         let r = resolve_reserve(MemoryReserve::Auto, total);
-        assert_eq!(r, AUTO_RESERVE_CAP); // capped at 10 GiB
+        assert_eq!(r, AUTO_RESERVE_CAP.min(total / 2));
     }
 
     #[test]
