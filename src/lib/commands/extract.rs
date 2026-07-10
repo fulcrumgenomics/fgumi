@@ -26,11 +26,12 @@ use crate::logging::OperationTimer;
 use crate::sam::SamTag;
 use crate::unified_pipeline::{FastqPipelineConfig, MemoryEstimate, run_fastq_pipeline};
 use crate::validation::validate_file_exists;
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use bstr::{BString, ByteSlice};
 use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::{RawBamWriter, create_raw_bam_writer};
+use fgumi_dna::dna::reverse_complement;
 use fgumi_raw_bam::UnmappedSamBuilder;
 use fgumi_raw_bam::fields::flags;
 use log::{debug, info};
@@ -58,6 +59,14 @@ use std::str::FromStr;
 
 const BUFFER_SIZE: usize = 1024 * 1024;
 const QUALITY_DETECTION_SAMPLE_SIZE: usize = 400;
+
+/// Prefix marking a read-name UMI segment that must be reverse-complemented,
+/// matching fgbio `Umis.RevcompPrefix` (`Umis.scala:33`).
+const REVCOMP_PREFIX: u8 = b'r';
+
+/// Delimiter separating dual UMIs in a read name, translated to `-` on extraction,
+/// matching fgbio's `umiDelimiter` default (`Umis.scala:88`).
+const UMI_DELIMITER: u8 = b'+';
 
 /// Pre-serialized batch of BAM records for the pipeline output type.
 ///
@@ -314,7 +323,9 @@ impl QualityEncoding {
 ///
 /// UMIs may be extracted from the read sequences, the read names, or both.  If `--extract-umis-from-read-names` is
 /// specified, any UMIs present in the read names are extracted; read names are expected to be `:`-separated with
-/// any UMIs present in the 8th field.  If this option is specified, `--store-umi-quals` may not be used as
+/// the UMI in the last field (of at least 8).  The extracted UMI is upper-cased, `r`-prefixed segments are
+/// reverse-complemented, `+` dual-UMI delimiters become `-`, and a UMI containing any character outside `ACGTN-`
+/// is rejected with an error.  If this option is specified, `--store-umi-quals` may not be used as
 /// qualities are not available for UMIs in the read name. If UMI segments are present in the read structures those
 /// will also be extracted.  If UMIs are present in both, the final UMIs are constructed by first taking the UMIs
 /// from the read names, then adding a hyphen, then the UMIs extracted from the reads.
@@ -690,14 +701,20 @@ impl Extract {
     /// `:`-separated field as the UMI when at least 8 fields are present.
     ///
     /// Names with fewer than 8 fields are treated as not containing a UMI and
-    /// produce `None`. Any `+` characters in the extracted UMI (used by some
-    /// demultiplexers to delimit dual UMIs) are normalized to `-`.
+    /// produce `None`. The extracted UMI is then normalized via
+    /// [`normalize_read_name_umi`](Self::normalize_read_name_umi) to match fgbio's
+    /// strict `Umis.extractUmisFromReadName` (reverse-complement `r`-prefixed
+    /// segments, `+`→`-`, upper-case).
+    ///
+    /// # Errors
+    /// Returns an error if the extracted UMI contains a character outside `ACGTN-`,
+    /// mirroring fgbio's strict-mode rejection (EXT-01).
     fn extract_read_name_and_umi(
-        header: &Vec<u8>,
+        header: &[u8],
         extract_umis: bool,
-    ) -> (Vec<u8>, Option<Vec<u8>>) {
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
         // Remove @ prefix if present
-        let name_bytes = if header.starts_with(b"@") { &header[1..] } else { header.as_slice() };
+        let name_bytes = if header.starts_with(b"@") { &header[1..] } else { header };
 
         // Split on space to get just the name part
         let name_part = name_bytes.find_byte(b' ').map_or(name_bytes, |pos| &name_bytes[..pos]);
@@ -710,7 +727,7 @@ impl Extract {
         let name_part = strip_read_number_suffix(name_part);
 
         if !extract_umis {
-            return (name_part.to_vec(), None);
+            return Ok((name_part.to_vec(), None));
         }
 
         // The UMI is the last `:`-separated field, but only if the name has at
@@ -723,19 +740,88 @@ impl Extract {
         if parts.len() >= 8 {
             if let Some(last) = parts.last() {
                 if !last.is_empty() {
-                    let mut umi = last.to_vec();
-                    // Normalize '+' to '-' in UMI
-                    for byte in &mut umi {
-                        if *byte == b'+' {
-                            *byte = b'-';
-                        }
-                    }
-                    return (name_part.to_vec(), Some(umi));
+                    let umi = Self::normalize_read_name_umi(last).with_context(|| {
+                        format!(
+                            "extracting UMI from read name '{}'",
+                            String::from_utf8_lossy(name_part)
+                        )
+                    })?;
+                    return Ok((name_part.to_vec(), Some(umi)));
                 }
             }
         }
 
-        (name_part.to_vec(), None)
+        Ok((name_part.to_vec(), None))
+    }
+
+    /// Normalizes a UMI extracted from the last field of a read name, matching
+    /// fgbio's `Umis.extractUmisFromReadName` (strict mode, as called by
+    /// `FastqToBam`; `Umis.scala:85-126`).
+    ///
+    /// With `reverseComplementPrefixedUmis` defaulting to true, fgbio:
+    /// 1. reverse-complements any `r`-prefixed segment (EXT-04); when the UMI is
+    ///    `+`-delimited, only the `r`-prefixed segments are reverse-complemented,
+    /// 2. translates the `+` dual-UMI delimiter to `-`,
+    /// 3. upper-cases the result (EXT-03), and
+    /// 4. throws if any character is outside `ACGTN-` (EXT-01, strict mode).
+    ///
+    /// Reverse-complementing reuses [`fgumi_dna::dna::reverse_complement`], which
+    /// complements `ACGT`, maps RNA `U`→`A`, and preserves `N` — matching fgbio's
+    /// `Sequences.complement` over the bases a read-name UMI may contain. Any other
+    /// character is passed through and then rejected by the `ACGTN-` validation
+    /// below, mirroring fgbio's strict-mode rejection.
+    ///
+    /// # Errors
+    /// Returns an error if the normalized UMI contains a character outside `ACGTN-`,
+    /// mirroring fgbio's strict-mode `IllegalArgumentException`.
+    fn normalize_read_name_umi(raw: &[u8]) -> Result<Vec<u8>> {
+        // fgbio keys the transform on whether an 'r' appears anywhere and whether a
+        // '+' delimiter appears at an index > 0 (a leading '+' is not a delimiter).
+        let has_revcomp_prefix = raw.contains(&REVCOMP_PREFIX);
+        let has_delimiter = raw.iter().position(|&b| b == UMI_DELIMITER).is_some_and(|idx| idx > 0);
+
+        let transformed: Vec<u8> = match (has_revcomp_prefix, has_delimiter) {
+            // Reverse-complement each `r`-prefixed segment, join with '-'.
+            (true, true) => {
+                let mut out = Vec::with_capacity(raw.len());
+                for (i, segment) in raw.split(|&b| b == UMI_DELIMITER).enumerate() {
+                    if i > 0 {
+                        out.push(b'-');
+                    }
+                    match segment.split_first() {
+                        Some((&REVCOMP_PREFIX, rest)) => out.extend(reverse_complement(rest)),
+                        // `stripPrefix('r')` is a no-op when the segment is not
+                        // prefixed with 'r'; the segment is copied verbatim.
+                        _ => out.extend_from_slice(segment),
+                    }
+                }
+                out
+            }
+            // Single UMI: reverse-complement after stripping a leading 'r'.
+            (true, false) => {
+                let stripped = raw.strip_prefix(&[REVCOMP_PREFIX][..]).unwrap_or(raw);
+                reverse_complement(stripped)
+            }
+            // No revcomp: just translate the '+' delimiter to '-'.
+            (false, true) => {
+                raw.iter().map(|&b| if b == UMI_DELIMITER { b'-' } else { b }).collect()
+            }
+            (false, false) => raw.to_vec(),
+        };
+
+        // fgbio upper-cases the UMI after any reverse-complementing.
+        let umi: Vec<u8> = transformed.iter().map(u8::to_ascii_uppercase).collect();
+
+        // Strict mode: reject any character outside the SAM UMI alphabet.
+        if let Some(&bad) = umi.iter().find(|&&b| !is_valid_umi_char(b)) {
+            bail!(
+                "Invalid UMI '{}' extracted from read name (illegal character '{}')",
+                String::from_utf8_lossy(&umi),
+                bad as char,
+            );
+        }
+
+        Ok(umi)
     }
 
     /// Validates that all read names match across the read sets
@@ -822,7 +908,7 @@ impl Extract {
 
         // Extract UMI from read name if requested
         let (read_name_bytes, umi_from_name) =
-            Self::extract_read_name_and_umi(&read_set.header, self.extract_umis_from_read_names);
+            Self::extract_read_name_and_umi(&read_set.header, self.extract_umis_from_read_names)?;
 
         // Prepare final UMI as BString - avoid format! and unnecessary allocations
         let final_umi_bs: BString = match (umi_bs.is_empty(), &umi_from_name) {
@@ -1159,7 +1245,7 @@ fn make_raw_records_static(
 
     // Extract UMI from read name if requested
     let (read_name_bytes, umi_from_name) =
-        Extract::extract_read_name_and_umi(&read_set.header, cfg.extract_umis_from_read_names);
+        Extract::extract_read_name_and_umi(&read_set.header, cfg.extract_umis_from_read_names)?;
 
     // Prepare final UMI
     let final_umi_bs: BString = match (umi_bs.is_empty(), &umi_from_name) {
@@ -1383,6 +1469,16 @@ fn strip_read_suffix_extract(name: &[u8]) -> &[u8] {
 
     // Then strip the same conservative `/<digit>` read-number suffix as the write path.
     strip_read_number_suffix(name)
+}
+
+/// Returns true if `b` is a valid SAM UMI character (`ACGTN-`), matching fgbio's
+/// `Umis.isValidUmiCharacter` (`Umis.scala:128-130`).
+///
+/// This is intentionally distinct from [`fgumi_umi::validate_umi`], which
+/// implements the more permissive `GroupReadsByUmi` counting rule (only rejects
+/// upper-case `N`); the read-name extraction path uses fgbio's strict alphabet.
+fn is_valid_umi_char(b: u8) -> bool {
+    matches!(b, b'A' | b'C' | b'G' | b'T' | b'N' | b'-')
 }
 
 #[cfg(test)]
@@ -2360,7 +2456,7 @@ mod tests {
         // in field 8 and the UMI in field 9 (here, "TCNGCG" is a 6 bp duplex UMI).
         let header =
             b"@LH00620:304:23LLHJLT4:7:1101:2578:1070:CAATCTATAA+rTTACATAGTT:TCNGCG".to_vec();
-        let (name, umi) = Extract::extract_read_name_and_umi(&header, true);
+        let (name, umi) = Extract::extract_read_name_and_umi(&header, true).unwrap();
         assert_eq!(
             name,
             b"LH00620:304:23LLHJLT4:7:1101:2578:1070:CAATCTATAA+rTTACATAGTT:TCNGCG".to_vec()
@@ -2371,7 +2467,7 @@ mod tests {
     #[test]
     fn test_extract_read_name_and_umi_eight_fields_takes_last() {
         let header = b"@q1:2:3:4:5:6:7:ACGT".to_vec();
-        let (name, umi) = Extract::extract_read_name_and_umi(&header, true);
+        let (name, umi) = Extract::extract_read_name_and_umi(&header, true).unwrap();
         assert_eq!(name, b"q1:2:3:4:5:6:7:ACGT".to_vec());
         assert_eq!(umi, Some(b"ACGT".to_vec()));
     }
@@ -2379,7 +2475,7 @@ mod tests {
     #[test]
     fn test_extract_read_name_and_umi_seven_fields_returns_none() {
         let header = b"@q1:2:3:4:5:6:7".to_vec();
-        let (name, umi) = Extract::extract_read_name_and_umi(&header, true);
+        let (name, umi) = Extract::extract_read_name_and_umi(&header, true).unwrap();
         assert_eq!(name, b"q1:2:3:4:5:6:7".to_vec());
         assert_eq!(umi, None);
     }
@@ -2387,7 +2483,7 @@ mod tests {
     #[test]
     fn test_extract_read_name_and_umi_normalizes_plus_to_hyphen() {
         let header = b"@q1:2:3:4:5:6:7:ACGT+CGTA".to_vec();
-        let (_name, umi) = Extract::extract_read_name_and_umi(&header, true);
+        let (_name, umi) = Extract::extract_read_name_and_umi(&header, true).unwrap();
         assert_eq!(umi, Some(b"ACGT-CGTA".to_vec()));
     }
 
@@ -2395,7 +2491,7 @@ mod tests {
     fn test_extract_read_name_and_umi_normalizes_plus_in_nine_fields() {
         // 9-field name with duplex-style UMI containing '+'.
         let header = b"@A:B:C:D:E:F:G:CAATCTATAA+TTACATAGTT:ACGT+CGTA".to_vec();
-        let (_name, umi) = Extract::extract_read_name_and_umi(&header, true);
+        let (_name, umi) = Extract::extract_read_name_and_umi(&header, true).unwrap();
         assert_eq!(umi, Some(b"ACGT-CGTA".to_vec()));
     }
 
@@ -2403,7 +2499,7 @@ mod tests {
     fn test_extract_read_name_and_umi_strips_space_comment() {
         // Standard Illumina header with space-separated comment after the name.
         let header = b"@q1:2:3:4:5:6:7:ACGT 1:N:0:NNNN".to_vec();
-        let (name, umi) = Extract::extract_read_name_and_umi(&header, true);
+        let (name, umi) = Extract::extract_read_name_and_umi(&header, true).unwrap();
         assert_eq!(name, b"q1:2:3:4:5:6:7:ACGT".to_vec());
         assert_eq!(umi, Some(b"ACGT".to_vec()));
     }
@@ -2411,7 +2507,7 @@ mod tests {
     #[test]
     fn test_extract_read_name_and_umi_extract_false_returns_none() {
         let header = b"@q1:2:3:4:5:6:7:ACGT".to_vec();
-        let (name, umi) = Extract::extract_read_name_and_umi(&header, false);
+        let (name, umi) = Extract::extract_read_name_and_umi(&header, false).unwrap();
         assert_eq!(name, b"q1:2:3:4:5:6:7:ACGT".to_vec());
         assert_eq!(umi, None);
     }
@@ -2434,25 +2530,28 @@ mod tests {
         #[case] header: &[u8],
         #[case] expected: &[u8],
     ) {
-        let (name, umi) = Extract::extract_read_name_and_umi(&header.to_vec(), false);
+        let (name, umi) = Extract::extract_read_name_and_umi(header, false).unwrap();
         assert_eq!(name, expected.to_vec());
         assert_eq!(umi, None);
     }
 
-    #[test]
-    fn test_extract_read_name_and_umi_does_not_strip_dot_or_underscore_suffix() {
-        // Only `/` is a read-number separator; `.`/`_`/`:` may be part of a real
-        // name and must be preserved (unlike the broader validation helper).
-        for header in [b"@sample_1".as_slice(), b"@foo.2".as_slice(), b"@bar:1".as_slice()] {
-            let (name, _umi) = Extract::extract_read_name_and_umi(&header.to_vec(), false);
-            assert_eq!(name, header[1..].to_vec(), "should not strip: {header:?}");
-        }
+    // Only `/` is a read-number separator; `.`/`_`/`:` may be part of a real
+    // name and must be preserved (unlike the broader validation helper).
+    #[rstest]
+    #[case::underscore(b"@sample_1".as_slice())]
+    #[case::dot(b"@foo.2".as_slice())]
+    #[case::colon(b"@bar:1".as_slice())]
+    fn test_extract_read_name_and_umi_does_not_strip_dot_or_underscore_suffix(
+        #[case] header: &[u8],
+    ) {
+        let (name, _umi) = Extract::extract_read_name_and_umi(header, false).unwrap();
+        assert_eq!(name, header[1..].to_vec(), "should not strip: {header:?}");
     }
 
     #[test]
     fn test_extract_read_name_and_umi_does_not_strip_slash_non_digit() {
         let header = b"@read/x".to_vec();
-        let (name, _umi) = Extract::extract_read_name_and_umi(&header, false);
+        let (name, _umi) = Extract::extract_read_name_and_umi(&header, false).unwrap();
         assert_eq!(name, b"read/x".to_vec());
     }
 
@@ -2460,7 +2559,7 @@ mod tests {
     fn test_extract_read_name_and_umi_does_not_strip_slash_multi_digit() {
         // Only a single trailing digit is a read number; `/12` is left intact.
         let header = b"@read/12".to_vec();
-        let (name, _umi) = Extract::extract_read_name_and_umi(&header, false);
+        let (name, _umi) = Extract::extract_read_name_and_umi(&header, false).unwrap();
         assert_eq!(name, b"read/12".to_vec());
     }
 
@@ -2468,7 +2567,7 @@ mod tests {
     fn test_extract_read_name_and_umi_strips_slash_digit_then_comment() {
         // The space comment is stripped first, then the `/1` read-number suffix.
         let header = b"@read/1 1:N:0:ACGT".to_vec();
-        let (name, umi) = Extract::extract_read_name_and_umi(&header, false);
+        let (name, umi) = Extract::extract_read_name_and_umi(&header, false).unwrap();
         assert_eq!(name, b"read".to_vec());
         assert_eq!(umi, None);
     }
@@ -2478,7 +2577,7 @@ mod tests {
         // fgbio strips `/<digit>` from the whole name before extracting the UMI,
         // so the read-number digit never leaks into the UMI's last `:` field.
         let header = b"@a:b:c:d:e:f:g:ACGT/1".to_vec();
-        let (name, umi) = Extract::extract_read_name_and_umi(&header, true);
+        let (name, umi) = Extract::extract_read_name_and_umi(&header, true).unwrap();
         assert_eq!(name, b"a:b:c:d:e:f:g:ACGT".to_vec());
         assert_eq!(umi, Some(b"ACGT".to_vec()));
     }
@@ -2625,6 +2724,79 @@ mod tests {
         // Both mates share the suffix-free QNAME.
         assert_eq!(recs[0].name().map(|n| n.as_bytes()), Some(b"SRR001.1".as_slice()));
         assert_eq!(recs[1].name().map(|n| n.as_bytes()), Some(b"SRR001.1".as_slice()));
+    }
+
+    /// EXT-03: fgbio `Umis.extractUmisFromReadName` upper-cases the extracted UMI
+    /// (`Umis.scala:111-117`); a lowercase read-name UMI must become upper-case so
+    /// that case-insensitive grouping matches fgbio.
+    #[test]
+    fn test_extract_read_name_and_umi_uppercases_umi() {
+        let header = b"@i:1:f:1:1:1:1:acgtn".to_vec();
+        let (_name, umi) = Extract::extract_read_name_and_umi(&header, true).unwrap();
+        assert_eq!(umi, Some(b"ACGTN".to_vec()));
+    }
+
+    /// EXT-04: an `r`-prefixed UMI is reverse-complemented (`Umis.scala:102-115`,
+    /// `reverseComplementPrefixedUmis` defaults to true, as `FastqToBam` uses it).
+    /// `rGGTTAA` → revcomp(`GGTTAA`) = `TTAACC`.
+    #[test]
+    fn test_extract_read_name_and_umi_revcomps_r_prefixed_umi() {
+        let header = b"@i:1:f:1:1:1:1:rGGTTAA".to_vec();
+        let (_name, umi) = Extract::extract_read_name_and_umi(&header, true).unwrap();
+        assert_eq!(umi, Some(b"TTAACC".to_vec()));
+    }
+
+    /// EXT-04: for a dual (`+`-delimited) UMI, only the `r`-prefixed segment is
+    /// reverse-complemented; the delimiter becomes `-` and the result is upper-cased.
+    /// `acgt+rGGTTAA` → `ACGT-TTAACC`.
+    #[test]
+    fn test_extract_read_name_and_umi_revcomps_only_r_prefixed_segment() {
+        let header = b"@i:1:f:1:1:1:1:acgt+rGGTTAA".to_vec();
+        let (_name, umi) = Extract::extract_read_name_and_umi(&header, true).unwrap();
+        assert_eq!(umi, Some(b"ACGT-TTAACC".to_vec()));
+    }
+
+    /// EXT-01: fgbio strict mode throws on a UMI containing characters outside
+    /// `ACGTN-` (`Umis.scala:121-123`, `UmisTest.scala:110-114`). fgumi must
+    /// error rather than silently writing the illegal UMI to `RX`.
+    #[rstest]
+    #[case::illegal_char_unpaired(&b"@i:1:f:1:1:1:1:ACGTXY"[..])]
+    #[case::illegal_char_in_second_segment(&b"@i:1:f:1:1:1:1:ACGT-CCKC"[..])]
+    #[case::illegal_char_in_first_segment(&b"@i:1:f:1:1:1:1:CCKC-ACGT"[..])]
+    fn test_extract_read_name_and_umi_rejects_illegal_chars(#[case] illegal: &[u8]) {
+        let result = Extract::extract_read_name_and_umi(illegal, true);
+        assert!(
+            result.is_err(),
+            "expected an error for illegal UMI in {:?}",
+            String::from_utf8_lossy(illegal)
+        );
+    }
+
+    /// EXT-01 boundary: a valid UMI (upper-case `ACGTN-` only) is accepted and returned.
+    #[test]
+    fn test_extract_read_name_and_umi_accepts_valid_umi() {
+        let header = b"@i:1:f:1:1:1:1:ACGTN-ACGT".to_vec();
+        let (_name, umi) = Extract::extract_read_name_and_umi(&header, true).unwrap();
+        assert_eq!(umi, Some(b"ACGTN-ACGT".to_vec()));
+    }
+
+    /// EXT-03/EXT-02 combined: a lowercase dual (`+`-delimited) UMI without an
+    /// `r` prefix is both upper-cased and hyphen-normalized. `acgt+cgta` → `ACGT-CGTA`.
+    #[test]
+    fn test_extract_read_name_and_umi_uppercases_plus_delimited_umi() {
+        let header = b"@i:1:f:1:1:1:1:acgt+cgta".to_vec();
+        let (_name, umi) = Extract::extract_read_name_and_umi(&header, true).unwrap();
+        assert_eq!(umi, Some(b"ACGT-CGTA".to_vec()));
+    }
+
+    /// EXT-04: reverse-complementing an `r`-prefixed UMI maps RNA `U`→`A`, matching
+    /// fgbio's `Sequences.complement`. `rAAU` → revcomp(`AAU`) = `ATT`. (A `U` in a
+    /// non-`r` UMI is not reverse-complemented and is rejected by both tools.)
+    #[test]
+    fn test_extract_read_name_and_umi_revcomps_uracil_to_a() {
+        let header = b"@i:1:f:1:1:1:1:rAAU".to_vec();
+        let (_name, umi) = Extract::extract_read_name_and_umi(&header, true).unwrap();
+        assert_eq!(umi, Some(b"ATT".to_vec()));
     }
 
     #[test]
