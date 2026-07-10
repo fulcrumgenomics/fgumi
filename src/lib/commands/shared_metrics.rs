@@ -90,10 +90,14 @@ pub struct TemplateMetadata<'a> {
     pub is_b_strand: bool,
 }
 
-/// Computes the unclipped 5' position for a read, matching fgbio's `positionOf`.
+/// Computes the unclipped 5' position for a read.
 ///
-/// Delegates to [`unclipped_5prime_from_raw_bam`]. Includes both soft- and hard-clip
-/// bases on the 5' side (matching htsjdk / fgbio semantics). Returns `None` for
+/// Delegates to [`unclipped_5prime_from_raw_bam`], which subtracts both soft- **and**
+/// hard-clip bases on the 5' side. This deliberately matches samtools
+/// (`unclipped_start` in `bam.c`, used by `markdup` and template-coordinate sort) and
+/// htsjdk `getUnclippedStart`, keeping this grouping key consistent with how fgumi's
+/// own `group`/`dedup` compute coordinates. It intentionally diverges from fgbio's
+/// `positionOf`/`unSoftClippedStart`, which counts soft clips only. Returns `None` for
 /// unmapped records or records missing CIGAR ops.
 fn unclipped_five_prime_position_raw(record: &RawRecord) -> Option<i32> {
     let flags = record.flags();
@@ -550,7 +554,13 @@ where
         };
 
         // ReadInfoKey fields are ordered so the earlier-mapping read comes first.
-        let read_info_key = if (r1_ref, s1) <= (r2_ref, s2) {
+        // The tie-break includes strand (positive sorts before negative, since Rust
+        // `false < true` and `strand == is_reverse`), matching fgumi's own group/dedup
+        // canonicalization (`unified_pipeline/base.rs`: `(ref, pos, strand) <= ...`) and
+        // fgbio's ReadInfo `r1Earlier` (GroupReadsByUmi.scala:105-111). Without the strand
+        // tie-break, the two strands of a duplex whose mates share an identical
+        // (ref, unclipped-5') canonicalize to different keys and fail to co-group.
+        let read_info_key = if (r1_ref, s1, r1_strand) <= (r2_ref, s2, r2_strand) {
             ReadInfoKey {
                 ref_index1: r1_ref,
                 start1: s1,

@@ -351,10 +351,15 @@ impl DuplexMetrics {
             ds_groups.clear();
             for m in &downsampled {
                 let entry = ds_groups.entry(m.base_umi).or_default();
-                if m.is_a_strand {
-                    entry.0 += 1;
-                } else if m.is_b_strand {
+                if m.is_b_strand {
                     entry.1 += 1;
+                } else {
+                    // /A or an unsuffixed MI counts toward the AB strand. fgbio treats a
+                    // single unsuffixed MI as Pair(ab=n, ba=0) — a valid single-strand DS
+                    // family (CollectDuplexSeqMetrics). Without this, unsuffixed families
+                    // get ds_size=0 and are silently dropped by the family-size histogram
+                    // (which iterates 1..=max), undercounting ds_families (DXM3-03).
+                    entry.0 += 1;
                 }
                 if is_full_fraction {
                     entry.2.push((
@@ -800,6 +805,90 @@ mod tests {
         };
         let err = cmd.execute("test").expect_err("must reject --min-ab-reads 0");
         assert!(err.to_string().contains("min-ab-reads must be >= 1"), "unexpected: {err}");
+        Ok(())
+    }
+
+    /// DXM3-07: the two strands of a duplex whose mates share an identical
+    /// (ref, unclipped-5') must co-group into ONE duplex family. Without a strand
+    /// tie-break in the canonical key they land in separate coordinate groups and are
+    /// reported as two single-strand (ab=1, ba=0) families instead of one (ab=1, ba=1).
+    #[test]
+    fn test_duplex_strands_cogroup_when_mates_share_five_prime() -> Result<()> {
+        // Palindromic fragment: both 5' ends map to reference position 100.
+        //   AB strand: R1 fwd @100 (5'=100), R2 rev @1 (5'=end=100), MI .../A
+        //   BA strand: R1 rev @1 (5'=100),  R2 fwd @100 (5'=100),    MI .../B
+        let mut records = Vec::new();
+        let (r1, r2) = build_test_pair("ab", 0, 100, 1, "AAA-TTT", "AAA-TTT/A", true, false);
+        records.push(r1);
+        records.push(r2);
+        let (r1, r2) = build_test_pair("ba", 0, 1, 100, "TTT-AAA", "AAA-TTT/B", false, true);
+        records.push(r1);
+        records.push(r2);
+
+        let input = create_test_bam(records)?;
+        let output_dir = TempDir::new()?;
+        let output = output_dir.path().join("output");
+
+        let cmd = DuplexMetrics {
+            input: input.path().to_path_buf(),
+            output: output.clone(),
+            min_ab_reads: 1,
+            min_ba_reads: 1,
+            duplex_umi_counts: false,
+            intervals: None,
+            description: None,
+        };
+        cmd.execute("test")?;
+
+        let duplex_family_path = format!("{}.duplex_family_sizes.txt", output.display());
+        let metrics: Vec<DuplexFamilySizeMetric> =
+            DelimFile::default().read_tsv(&duplex_family_path)?;
+
+        // Exactly one duplex family, with both strands observed (ab=1, ba=1).
+        let total: usize = metrics.iter().map(|m| m.count).sum();
+        assert_eq!(total, 1, "the two strands must form a single duplex family");
+        let family = metrics.iter().find(|m| m.count > 0).expect("one duplex family");
+        assert_eq!((family.ab_size, family.ba_size), (1, 1), "one read on each strand");
+        Ok(())
+    }
+
+    /// DXM3-03: non-duplex (unsuffixed MI) input must still be counted as a
+    /// single-strand DS family (`ab=n`, `ba=0`, `ds_size=n`), matching fgbio — not dropped
+    /// via a size-0 family-size bucket.
+    #[test]
+    fn test_unsuffixed_mi_counts_as_single_strand_ds_family() -> Result<()> {
+        // Two read pairs at the same coordinate with an unsuffixed MI ("1").
+        let mut records = Vec::new();
+        let (r1, r2) = build_test_pair("q1", 0, 100, 200, "AAA-TTT", "1", true, false);
+        records.push(r1);
+        records.push(r2);
+        let (r1, r2) = build_test_pair("q2", 0, 100, 200, "AAA-TTT", "1", true, false);
+        records.push(r1);
+        records.push(r2);
+
+        let input = create_test_bam(records)?;
+        let output_dir = TempDir::new()?;
+        let output = output_dir.path().join("output");
+
+        let cmd = DuplexMetrics {
+            input: input.path().to_path_buf(),
+            output: output.clone(),
+            min_ab_reads: 1,
+            min_ba_reads: 0,
+            duplex_umi_counts: false,
+            intervals: None,
+            description: None,
+        };
+        cmd.execute("test")?;
+
+        let family_path = format!("{}.family_sizes.txt", output.display());
+        let family_metrics: Vec<FamilySizeMetric> = DelimFile::default().read_tsv(&family_path)?;
+
+        // Exactly one DS family, of size 2 (both reads on the AB strand).
+        let ds_families: usize = family_metrics.iter().map(|m| m.ds_count).sum();
+        assert_eq!(ds_families, 1, "unsuffixed-MI family must be counted, not dropped");
+        let size2 = family_metrics.iter().find(|m| m.family_size == 2).expect("size-2 row present");
+        assert_eq!(size2.ds_count, 1, "one DS family of size 2");
         Ok(())
     }
 
