@@ -27,6 +27,49 @@ use crate::worker_pool::read_length_prefix;
 /// the mimalloc size-class reuse pattern matches.
 const SCRATCH_CAP: usize = 256 * 1024;
 
+/// Grow `buf` so it can hold the decompressed content of a zstd `frame`.
+///
+/// zstd frames written by the one-shot bulk `Compressor` embed the decompressed
+/// content size in their header; read it and size the reusable scratch to fit,
+/// clamped up to `SCRATCH_CAP` so the common (small-block) path keeps its
+/// mimalloc size-class reuse. Falls back to `SCRATCH_CAP` when the content size
+/// is not declared (no regression).
+///
+/// The declared content size is header-controlled and therefore untrusted: both
+/// spill producers frame at most
+/// [`STAGING_FRAME_MAX_UNCOMPRESSED_BYTES`](crate::bgzf_io::STAGING_FRAME_MAX_UNCOMPRESSED_BYTES)
+/// of uncompressed content per block (`pooled_chunk_writer` flushes at
+/// `BGZF_MAX_BLOCK_SIZE` and splits oversized records via `write_chunked`; the
+/// streaming `SpillGather` emits `≤ BGZF_MAX_BLOCK_SIZE` blocks), so a frame
+/// declaring more than that came from a truncated or corrupted spill file. Reject
+/// it up front rather than letting a bogus header drive `Vec::resize` into an
+/// unbounded allocation.
+///
+/// # Errors
+///
+/// Returns an error when the declared content size exceeds the producer's
+/// per-frame limit
+/// ([`STAGING_FRAME_MAX_UNCOMPRESSED_BYTES`](crate::bgzf_io::STAGING_FRAME_MAX_UNCOMPRESSED_BYTES)).
+fn ensure_zstd_capacity(buf: &mut Vec<u8>, frame: &[u8]) -> io::Result<()> {
+    let content_size = zstd::zstd_safe::get_frame_content_size(frame)
+        .ok()
+        .flatten()
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0);
+    if content_size > crate::bgzf_io::STAGING_FRAME_MAX_UNCOMPRESSED_BYTES {
+        return Err(io::Error::other(format!(
+            "zstd spill frame declares {content_size} uncompressed bytes, exceeding the \
+             {} byte producer limit (truncated or corrupted spill file?)",
+            crate::bgzf_io::STAGING_FRAME_MAX_UNCOMPRESSED_BYTES
+        )));
+    }
+    let needed = content_size.max(SCRATCH_CAP);
+    if buf.len() < needed {
+        buf.resize(needed, 0);
+    }
+    Ok(())
+}
+
 /// Per-worker codec-aware decompressor. Holds a libdeflate decompressor (BGZF)
 /// and a zstd decompressor plus reusable scratch buffers; one instance per
 /// `SortSpillDecompress` worker copy.
@@ -111,9 +154,6 @@ impl SpillBlockDecompressor {
         reader: &mut R,
         max: usize,
     ) -> io::Result<Vec<Vec<u8>>> {
-        if self.zstd_buf.len() < SCRATCH_CAP {
-            self.zstd_buf.resize(SCRATCH_CAP, 0);
-        }
         let mut out = Vec::with_capacity(max);
         for _ in 0..max {
             // `read_length_prefix` returns `Ok(None)` only at a clean frame
@@ -124,6 +164,7 @@ impl SpillBlockDecompressor {
             self.zstd_frame.clear();
             self.zstd_frame.resize(frame_len, 0);
             reader.read_exact(&mut self.zstd_frame)?;
+            ensure_zstd_capacity(&mut self.zstd_buf, &self.zstd_frame)?;
             let n = self
                 .zstd
                 .decompress_to_buffer(&self.zstd_frame, &mut self.zstd_buf)
@@ -204,9 +245,7 @@ impl SpillBlockDecompressor {
                 Ok(std::mem::replace(&mut self.bgzf_scratch, Vec::with_capacity(SCRATCH_CAP)))
             }
             SpillCodec::Zstd => {
-                if self.zstd_buf.len() < SCRATCH_CAP {
-                    self.zstd_buf.resize(SCRATCH_CAP, 0);
-                }
+                ensure_zstd_capacity(&mut self.zstd_buf, raw)?;
                 let n = self
                     .zstd
                     .decompress_to_buffer(raw, &mut self.zstd_buf)
@@ -228,6 +267,7 @@ mod tests {
     use super::*;
     use crate::pooled_chunk_writer::PooledChunkWriter;
     use crate::worker_pool::SortWorkerPool;
+    use rstest::rstest;
     use std::io::Cursor;
     use std::sync::Arc;
 
@@ -235,16 +275,14 @@ mod tests {
     /// `SpillBlockDecompressor`, must yield the exact `[len][record]` byte
     /// stream that was written — for BOTH codecs. This is the round-trip the
     /// streaming merge depends on.
-    fn roundtrip(codec: SpillCodec) {
-        use crate::keys::{RawCoordinateKey, RawSortKey};
-        // Build framed records whose total size (~440 KB) far exceeds the
-        // writer's ~64 KB block cap, so the chunk is written as MANY blocks /
-        // frames. That is what actually exercises the per-block decompress and
-        // the downstream record reassembly across block boundaries — the whole
-        // reason `read_blocks` returns per-block `Vec<u8>`s. Each record is
-        // stamped with its index at both ends so a misaligned reassembly is
-        // caught, not just a stream of zeros.
-        let records: Vec<Vec<u8>> = (0usize..80)
+    /// Build framed records whose total size (~440 KB) far exceeds the writer's
+    /// ~64 KB block cap, so the chunk is written as MANY blocks / frames. That is
+    /// what actually exercises the per-block decompress and the downstream record
+    /// reassembly across block boundaries. Each record is stamped with its index
+    /// at both ends so a misaligned reassembly is caught, not just a stream of
+    /// zeros.
+    fn default_roundtrip_records() -> Vec<Vec<u8>> {
+        (0usize..80)
             .map(|i| {
                 let size = 3000 + (i % 13) * 500; // 3000..9000 bytes
                 let mut r = vec![0u8; size];
@@ -254,7 +292,19 @@ mod tests {
                 r[last] = stamp;
                 r
             })
-            .collect();
+            .collect()
+    }
+
+    #[rstest]
+    #[case::bgzf(SpillCodec::Bgzf)]
+    #[case::zstd(SpillCodec::Zstd)]
+    fn roundtrip(#[case] codec: SpillCodec) {
+        roundtrip_records(codec, &default_roundtrip_records());
+    }
+
+    fn roundtrip_records(codec: SpillCodec, records: &[Vec<u8>]) {
+        use crate::keys::{RawCoordinateKey, RawSortKey};
+        // (records borrowed; callers keep ownership)
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("chunk.spill");
@@ -262,7 +312,7 @@ mod tests {
         {
             let mut w = PooledChunkWriter::<RawCoordinateKey>::new(Arc::clone(&pool), &path, codec)
                 .expect("writer");
-            for rec in &records {
+            for rec in records {
                 let key = RawCoordinateKey::extract_from_record(rec);
                 w.write_record(&key, rec).expect("write");
             }
@@ -309,23 +359,75 @@ mod tests {
             cursor.read_exact(&mut rec).expect("record body");
             read_back.push(rec);
         }
-        assert_eq!(read_back, records, "round-trip mismatch for {codec:?}");
+        assert_eq!(read_back.as_slice(), records, "round-trip mismatch for {codec:?}");
     }
 
+    /// A zstd frame whose header declares more uncompressed content than any
+    /// producer can emit (`> STAGING_FRAME_MAX_UNCOMPRESSED_BYTES`) is treated as
+    /// corruption: `ensure_zstd_capacity` must error instead of resizing the
+    /// scratch buffer to the attacker-/corruption-chosen size. Guards against a
+    /// truncated or malicious spill file driving an unbounded allocation.
     #[test]
-    fn roundtrip_bgzf() {
-        roundtrip(SpillCodec::Bgzf);
+    fn ensure_zstd_capacity_rejects_over_limit_declared_size() {
+        use crate::bgzf_io::STAGING_FRAME_MAX_UNCOMPRESSED_BYTES;
+        let oversized = vec![7u8; STAGING_FRAME_MAX_UNCOMPRESSED_BYTES + 1];
+        // One-shot bulk compression stamps the pledged content size into the
+        // frame header, so `get_frame_content_size` reads back the full size.
+        let frame = zstd::bulk::compress(&oversized, 3).expect("compress");
+        let mut buf = vec![0u8; SCRATCH_CAP];
+        let err = ensure_zstd_capacity(&mut buf, &frame)
+            .expect_err("over-limit declared content size must be rejected");
+        assert!(err.to_string().contains("exceeding the"), "unexpected error message: {err}");
+        // The scratch must not have been grown to the bogus declared size.
+        assert_eq!(buf.len(), SCRATCH_CAP, "scratch must not grow on a rejected frame");
     }
 
+    /// A frame at the producer's per-frame limit is accepted, and the scratch is
+    /// kept at (at least) the `SCRATCH_CAP` floor for mimalloc size-class reuse.
     #[test]
-    fn roundtrip_zstd() {
-        roundtrip(SpillCodec::Zstd);
+    fn ensure_zstd_capacity_accepts_frame_at_producer_limit() {
+        use crate::bgzf_io::STAGING_FRAME_MAX_UNCOMPRESSED_BYTES;
+        let at_limit = vec![3u8; STAGING_FRAME_MAX_UNCOMPRESSED_BYTES];
+        let frame = zstd::bulk::compress(&at_limit, 3).expect("compress");
+        let mut buf = Vec::new();
+        ensure_zstd_capacity(&mut buf, &frame).expect("frame at the limit must be accepted");
+        assert!(buf.len() >= SCRATCH_CAP, "scratch keeps the SCRATCH_CAP floor");
+    }
+
+    /// A single record larger than `SCRATCH_CAP` (256 KiB) is framed as its own
+    /// oversized spill block/frame. The decompressor must grow its scratch to the
+    /// frame's declared content size rather than failing `decompress_to_buffer` —
+    /// otherwise any BAM with a >256 KiB record (e.g. long reads) aborts the sort
+    /// on the default zstd codec. Regression test for both codecs.
+    #[rstest]
+    #[case::bgzf(SpillCodec::Bgzf)]
+    #[case::zstd(SpillCodec::Zstd)]
+    fn roundtrip_with_oversized_record(#[case] codec: SpillCodec) {
+        let mut records = default_roundtrip_records();
+        let big = {
+            let mut r = vec![0u8; 300 * 1024]; // > SCRATCH_CAP
+            r[0] = 42;
+            let last = r.len() - 1;
+            r[last] = 42;
+            // Vary the body so it isn't trivially compressible to a tiny frame.
+            for (i, b) in r.iter_mut().enumerate() {
+                if i % 7 == 0 {
+                    *b = u8::try_from(i % 251).expect("fits u8");
+                }
+            }
+            r
+        };
+        records.insert(40, big);
+        roundtrip_records(codec, &records);
     }
 
     /// The split `read_raw` + `decompress_one` path (used by the block-parallel
     /// `SortSpillDecompress`) must yield the exact same per-block bytes as the
     /// inline `read_blocks` path. We read the same chunk twice and compare.
-    fn read_raw_matches_read_blocks(codec: SpillCodec) {
+    #[rstest]
+    #[case::bgzf(SpillCodec::Bgzf)]
+    #[case::zstd(SpillCodec::Zstd)]
+    fn read_raw_matches_read_blocks(#[case] codec: SpillCodec) {
         use crate::keys::{RawCoordinateKey, RawSortKey};
 
         let records: Vec<Vec<u8>> = (0usize..80)
@@ -402,15 +504,5 @@ mod tests {
             blocks_a, blocks_b,
             "split read_raw path must match inline read_blocks ({codec:?})"
         );
-    }
-
-    #[test]
-    fn read_raw_matches_read_blocks_bgzf() {
-        read_raw_matches_read_blocks(SpillCodec::Bgzf);
-    }
-
-    #[test]
-    fn read_raw_matches_read_blocks_zstd() {
-        read_raw_matches_read_blocks(SpillCodec::Zstd);
     }
 }
