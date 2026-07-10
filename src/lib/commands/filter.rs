@@ -137,7 +137,8 @@ pub struct Filter {
     #[arg(short = 'e', long = "max-base-error-rate", value_delimiter = ',', default_value = "0.1")]
     pub max_base_error_rate: Vec<f64>,
 
-    /// Minimum base quality score (after masking)
+    /// Minimum base quality score (after masking). Optional in fgumi (unlike fgbio, which requires
+    /// it): when omitted, no per-base quality masking is performed.
     #[arg(short = 'N', long = "min-base-quality")]
     pub min_base_quality: Option<u8>,
 

@@ -77,11 +77,14 @@ pub struct SimplexMetrics {
     #[arg(long = "min-reads", default_value = "1")]
     pub min_reads: usize,
 
-    /// Optional intervals file to restrict analysis (BED or Picard interval list format).
+    /// Optional intervals file to restrict analysis. Both BED and Picard interval-list formats are
+    /// auto-detected (an fgumi superset; fgbio's duplex analog accepts only the Picard interval list).
     #[arg(short = 'l', long = "intervals")]
     pub intervals: Option<PathBuf>,
 
-    /// Optional sample name or description for PDF plot titles.
+    /// Optional sample name or description for PDF plot titles. When omitted, fgumi uses the
+    /// literal "Sample" (fgbio instead derives the sample/library name from the BAM `@RG` header,
+    /// so plot titles differ unless this is set).
     #[arg(long = "description")]
     pub description: Option<String>,
 }

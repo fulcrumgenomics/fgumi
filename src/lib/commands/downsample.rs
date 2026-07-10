@@ -49,6 +49,20 @@ The tool processes families in streaming fashion by grouping consecutive reads w
 MI tag value. For each family, a random decision is made based on the fraction parameter to
 either keep or reject all reads in that family.
 
+NOTE: this command is NOT a port of Picard `DownsampleSam`. It is a UMI-family sampler by
+design, and differs from `DownsampleSam` in several deliberate ways:
+  - Sampling unit: whole UMI families (MI tag), not individual read templates. Every record
+    must carry an MI tag and the input must be group-produced, template-coordinate-sorted BAM.
+    `DownsampleSam` downsamples any BAM in any order by read name.
+  - Decision function: one sequential random draw per family (order-dependent), rather than
+    `DownsampleSam`'s stateless, name+seed hash (order-independent, cross-tool reproducible).
+  - Determinism: without --seed, a run is non-deterministic (seeded from entropy), whereas
+    `DownsampleSam` defaults to a fixed seed of 1. Pass --seed for reproducible output.
+  - --fraction must be in (0.0, 1.0]; 0.0 is rejected (unlike `DownsampleSam`, which allows
+    PROBABILITY=0 for an empty pass). NaN and infinities are also rejected.
+Because the sampling unit, decision function, and RNG all differ, output is intentionally not
+bit-identical to `DownsampleSam`; only a statistically-equivalent fraction of families is kept.
+
 Example usage:
   fgumi downsample -i grouped.bam -o downsampled.bam -f 0.1 --seed 42
   fgumi downsample -i grouped.bam -o kept.bam -f 0.5 --rejects rejected.bam

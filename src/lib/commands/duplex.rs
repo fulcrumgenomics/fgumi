@@ -144,7 +144,8 @@ And those that have a value per base (duplex values are not generated, but can b
 The per base depths and errors are both capped at 32,767. In all cases no-calls (Ns) and bases below the
 min-input-base-quality are not counted in tag value calculations.
 
-The --min-reads option can take 1-3 values similar to `filter`. For example:
+The --min-reads option can take 1-3 values similar to `filter`. Values are comma-delimited in
+fgumi (whereas fgbio's `CallDuplexConsensusReads` takes them space-separated). For example:
 
   fgumi duplex ... --min-reads 10,5,3
 

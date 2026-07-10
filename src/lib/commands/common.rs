@@ -392,7 +392,9 @@ pub struct ConsensusCallingOptions {
     #[arg(short = 'm', long = "min-input-base-quality", default_value = "10")]
     pub min_input_base_quality: u8,
 
-    /// Produce per-base tags (cd, ce) in addition to per-read tags
+    /// Produce per-base tags (cd, ce) in addition to per-read tags. The default (true) matches
+    /// fgbio, which always writes per-base tags; setting this to false drops per-base tags that
+    /// fgbio emits unconditionally.
     #[arg(short = 'B', long = "output-per-base-tags", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub output_per_base_tags: bool,
 
@@ -400,7 +402,10 @@ pub struct ConsensusCallingOptions {
     #[arg(long = "trim", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub trim: bool,
 
-    /// Minimum consensus base quality (output consensus bases below this are masked to N)
+    /// Minimum consensus base quality (output consensus bases below this are masked to N). The
+    /// default (2) matches fgbio, which hardcodes the consensus base-quality minimum to `MIN_PHRED`
+    /// (2) and defers further masking to `fgumi filter` / fgbio `FilterConsensusReads`; exposing
+    /// this as a flag is an fgumi superset.
     #[arg(long = "min-consensus-base-quality", default_value = "2")]
     pub min_consensus_base_quality: u8,
 }
