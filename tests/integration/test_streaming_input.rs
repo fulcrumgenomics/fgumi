@@ -351,13 +351,13 @@ fn test_simplex_single_threaded_reads_stdin_once() {
     compare_bam_records(&output_from_file, &output_from_pipe);
 }
 
-/// SAM (non-BGZF) input to the single-threaded codec/simplex/duplex paths must
-/// fail at the header read with a `--threads` hint — those paths are BAM-only,
-/// and the multi-threaded path is the SAM-capable one. Guards the `with_context`
-/// message that replaced the removed SAM pre-sniff (codec/simplex) and the
-/// matching hint added to duplex.
+/// Consensus-unify behavior change: after folding the single-threaded
+/// codec/simplex/duplex paths onto the chain, all three ACCEPT SAM input with
+/// `--threads` unset. They previously bailed "SAM input requires --threads N",
+/// since the single-threaded path opened the input as raw BAM only; the chain's
+/// `ReadSamChunks` source handles SAM at any worker count.
 #[test]
-fn test_single_threaded_consensus_rejects_sam_with_threads_hint() {
+fn test_single_threaded_consensus_accepts_sam() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let bam = temp_dir.path().join("grouped.bam");
     let sam = temp_dir.path().join("grouped.sam");
@@ -365,7 +365,7 @@ fn test_single_threaded_consensus_rejects_sam_with_threads_hint() {
     convert_bam_to_sam(&bam, &sam);
     let input = sam.to_str().unwrap();
 
-    // Per-command minimal args; each runs single-threaded (no `--threads`).
+    // Per-command minimal args; each runs with `--threads` unset.
     let extra_args: [(&str, &[&str]); 3] = [
         ("codec", &["--min-reads", "1", "--min-duplex-length", "1"]),
         ("simplex", &["--min-reads", "1"]),
@@ -387,11 +387,14 @@ fn test_single_threaded_consensus_rejects_sam_with_threads_hint() {
             .args(&args)
             .output()
             .unwrap_or_else(|e| panic!("failed to spawn {cmd}: {e}"));
-        assert!(!output.status.success(), "single-threaded {cmd} must reject SAM input");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("--threads"),
-            "single-threaded {cmd} SAM error should hint at --threads; stderr: {stderr}"
+            output.status.success(),
+            "{cmd} with --threads unset must now accept SAM input; stderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("SAM input requires"),
+            "{cmd} must not emit the old SAM-rejection hint; stderr: {stderr}"
         );
     }
 }
@@ -588,6 +591,49 @@ fn test_simplex_command_with_sam_input_new_pipeline_matches_bam_baseline() {
     assert!(status.success(), "simplex SAM run failed");
 
     compare_bam_records(&out_bam_baseline, &out_sam);
+}
+
+/// Consensus-unify behavior change (representative of simplex/duplex/codec):
+/// folding the bespoke single-threaded consensus path onto the chain removed the
+/// BAM-only restriction, so a consensus command with `--threads` unset now
+/// accepts SAM input (it previously bailed "SAM input requires --threads N",
+/// since the single-threaded path opened the input as raw BAM only). The SAM run
+/// must match the BAM run, both with `--threads` omitted.
+#[test]
+fn test_simplex_sam_input_without_threads_now_accepted() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let bam_input = temp_dir.path().join("input.bam");
+    let sam_input = temp_dir.path().join("input.sam");
+    let out_from_bam = temp_dir.path().join("out_from_bam.bam");
+    let out_via_sam = temp_dir.path().join("out_via_sam.bam");
+
+    create_grouped_test_bam(&bam_input);
+    convert_bam_to_sam(&bam_input, &sam_input);
+
+    let run = |input: &std::path::Path, output: &std::path::Path, label: &str| {
+        let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+            .args([
+                "simplex",
+                "--input",
+                input.to_str().unwrap(),
+                "--output",
+                output.to_str().unwrap(),
+                "--min-reads",
+                "1",
+                "--min-consensus-base-quality",
+                "0",
+                "--compression-level",
+                "1",
+                // No --threads: the (now unified) unset path.
+            ])
+            .status()
+            .unwrap_or_else(|e| panic!("spawn simplex {label}: {e}"));
+        assert!(status.success(), "simplex {label} with --threads unset failed");
+    };
+
+    run(&bam_input, &out_from_bam, "BAM");
+    run(&sam_input, &out_via_sam, "SAM");
+    compare_bam_records(&out_from_bam, &out_via_sam);
 }
 
 /// SAM-input parity for `correct` — exercises the `(Sam, true)` arm of

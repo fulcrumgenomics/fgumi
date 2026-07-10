@@ -4,26 +4,10 @@
 //! consensus reads using a likelihood-based model that accounts for sequencing errors and
 //! errors introduced during sample preparation.
 
-use crate::consensus_caller::ConsensusCaller;
-use crate::logging::{OperationTimer, log_consensus_summary};
-use crate::mi_group::MiGroupIterator;
-use crate::overlapping_consensus::{
-    AgreementStrategy, CorrectionStats, DisagreementStrategy, OverlappingBasesConsensusCaller,
-    apply_overlapping_consensus,
-};
-use crate::sam::SamTag;
-use crate::vanilla_consensus_caller::{VanillaUmiConsensusCaller, VanillaUmiConsensusOptions};
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::Parser;
-use fgoxide::io::DelimFile;
-use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::{create_bam_writer, create_optional_bam_writer};
-use fgumi_raw_bam::RawRecord;
 
 use log::info;
-use noodles::sam::alignment::record::data::field::Tag;
-use std::io::Write as IoWrite;
-use std::sync::Arc;
 
 use crate::commands::command::Command;
 use crate::commands::common::{
@@ -31,11 +15,6 @@ use crate::commands::common::{
     QueueMemoryOptions, ReadGroupOptions, RejectsOptions, SchedulerOptions, StatsOptions,
     ThreadingOptions, parse_bool,
 };
-use crate::commands::consensus_runner::{
-    ConsensusStatsOps, create_unmapped_consensus_header, log_overlapping_stats,
-};
-
-use super::common::{MethylationRef, load_methylation_reference};
 
 /// Simplex-specific tuning, flattened into both the standalone `Simplex`
 /// command (as bare `--error-rate-pre-umi`, `--min-reads`, … flags) and
@@ -312,13 +291,15 @@ pub struct Simplex {
 
 impl Command for Simplex {
     fn execute(&self, command_line: &str) -> Result<()> {
-        // Start timing
-        let timer = OperationTimer::new("Calling simplex consensus");
-
         // Validate inputs
         self.io.validate()?;
 
         self.options.validate_read_bounds()?;
+        // Also enforced in build_simplex_chain (M5); checked up front here for a
+        // clear error before pipeline construction.
+        if self.reference.is_some() && self.methylation_mode.is_none() {
+            bail!("--ref requires --methylation-mode to be set");
+        }
 
         info!("Starting Simplex");
         info!("Input: {}", self.io.input.display());
@@ -330,242 +311,34 @@ impl Command for Simplex {
         info!("Error rate pre-UMI: Q{}", self.options.error_rate_pre_umi);
         info!("Error rate post-UMI: Q{}", self.options.error_rate_post_umi);
 
-        // Get threading configuration
-        let writer_threads = self.threading.num_threads();
+        // Route through the typed-step chain for every thread count. `--threads`
+        // unset resolves to a one-worker chain (`num_threads() == 1`) — output
+        // identical to `--threads 1`, with no separate single-threaded path. The
+        // chain opens the source once (BAM or SAM) and runs validation, consensus,
+        // and metrics in `add_simplex`. Populate the #[arg(skip)] chain-builder
+        // slots on a clone of SimplexOptions before handing it to the ChainSpec.
+        use crate::pipeline::chains::{ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag};
+        let mut options = self.options.clone();
+        options.io.clone_from(&self.io);
+        options.rejects_opts.clone_from(&self.rejects_opts);
+        options.stats_opts.clone_from(&self.stats_opts);
+        options.read_group.clone_from(&self.read_group);
+        options.methylation_mode = self.methylation_mode;
+        options.reference.clone_from(&self.reference);
 
-        let cell_tag = Tag::from(SamTag::CB);
-
-        // Enable rejects tracking if rejects file is specified
-        let track_rejects = self.rejects_opts.is_enabled();
-
-        // Same check also in build_simplex_chain (M5) so runall's
-        // execute_consensus_only path enforces the same constraint.
-        // This copy covers the standalone single-threaded fast path, which
-        // does not route through build_for.
-        if self.reference.is_some() && self.methylation_mode.is_none() {
-            bail!("--ref requires --methylation-mode to be set");
-        }
-        let methylation_mode =
-            crate::commands::common::resolve_methylation_mode(self.methylation_mode);
-
-        // Track overlapping consensus settings (callers created per-thread in threaded mode)
-        let overlapping_enabled = self.options.overlapping().is_enabled();
-        if overlapping_enabled {
-            info!("Overlapping consensus calling enabled");
-        }
-
-        // Process reads using streaming by MI groups
-        info!("Processing reads and calling consensus (streaming)...");
-
-        // ============================================================
-        // --threads N mode: route through chains::build_for.
-        // None: Use single-threaded fast path (below).
-        // ============================================================
-        // IMPORTANT: Do NOT open the source here — the chain builder opens
-        // it once. This avoids double-open (wastes I/O, breaks stdin).
-        if self.threading.threads.is_some() {
-            use crate::pipeline::chains::{
-                ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag,
-            };
-            // Populate the #[arg(skip)] chain-builder slots on a clone of
-            // SimplexOptions before handing it to the ChainSpec.
-            let mut options = self.options.clone();
-            options.io.clone_from(&self.io);
-            options.rejects_opts.clone_from(&self.rejects_opts);
-            options.stats_opts.clone_from(&self.stats_opts);
-            options.read_group.clone_from(&self.read_group);
-            options.methylation_mode = self.methylation_mode;
-            options.reference.clone_from(&self.reference);
-
-            let spec = ChainSpec {
-                async_reader: self.io.async_reader,
-                stages: vec![Stage::Simplex],
-                source: SourceSpec::Bam(self.io.input.clone()),
-                sink: SinkSpec::Bam(self.io.output.clone()),
-                stage_opts: StageOptionsBag { simplex: Some(options), ..Default::default() },
-                threading: self.threading.clone(),
-                compression: self.compression.clone(),
-                scheduler: self.scheduler_opts.clone(),
-                queue_memory: self.queue_memory.clone(),
-                command_line: command_line.to_string(),
-            };
-            return crate::pipeline::chains::build_for(spec)?.run();
-        }
-
-        // Single-threaded fast path is BAM-only. Open the raw reader ONCE and
-        // derive the header from it — this is the sole open of the input. Do NOT
-        // pre-open to sniff SAM-vs-BAM: a second open double-consumes stdin and
-        // loses the leading bytes (stdin can't be rewound or re-opened). SAM
-        // input (not BGZF) fails the header read here; surface the --threads hint.
-        let (mut raw_reader, header) =
-            crate::commands::consensus_runner::open_single_threaded_consensus_input(
-                &self.io.input,
-                self.io.pipeline_reader_opts(),
-                "simplex",
-            )?;
-        let output_header = create_unmapped_consensus_header(
-            &header,
-            &self.read_group.read_group_id,
-            "Read group",
-            command_line,
-        )?;
-        let read_name_prefix = self.read_group.prefix_or_from_header(&header);
-        let methylation_ref: MethylationRef =
-            load_methylation_reference(methylation_mode, &self.reference, &header)?;
-
-        // ============================================================
-        // For non-pipeline modes, create output writers here
-        // ============================================================
-
-        // Open output - use multi-threaded BGZF writer
-        let mut writer = create_bam_writer(
-            &self.io.output,
-            &output_header,
-            writer_threads,
-            self.compression.compression_level,
-        )?;
-
-        // Open rejects writer if rejects file is specified
-        let mut rejects_writer = create_optional_bam_writer(
-            self.rejects_opts.rejects.as_ref(),
-            &header,
-            writer_threads,
-            self.compression.compression_level,
-        )?;
-
-        let options = VanillaUmiConsensusOptions {
-            tag: "MI".to_string(),
-            error_rate_pre_umi: self.options.error_rate_pre_umi,
-            error_rate_post_umi: self.options.error_rate_post_umi,
-            min_input_base_quality: self.options.min_input_base_quality,
-            min_reads: self.options.min_reads,
-            max_reads: self.options.max_reads,
-            produce_per_base_tags: self.options.output_per_base_tags,
-            seed: Some(42), // Hard-coded seed for reproducible downsampling
-            trim: self.options.trim,
-            min_consensus_base_quality: self.options.min_consensus_base_quality,
-            cell_tag: Some(cell_tag),
-            methylation_mode,
+        let spec = ChainSpec {
+            async_reader: self.io.async_reader,
+            stages: vec![Stage::Simplex],
+            source: SourceSpec::Bam(self.io.input.clone()),
+            sink: SinkSpec::Bam(self.io.output.clone()),
+            stage_opts: StageOptionsBag { simplex: Some(options), ..Default::default() },
+            threading: self.threading.clone(),
+            compression: self.compression.clone(),
+            scheduler: self.scheduler_opts.clone(),
+            queue_memory: self.queue_memory.clone(),
+            command_line: command_line.to_string(),
         };
-
-        // Create a single-threaded caller for stats collection
-        let mut caller = VanillaUmiConsensusCaller::new_with_rejects_tracking(
-            read_name_prefix.clone(),
-            self.read_group.read_group_id.clone(),
-            options.clone(),
-            track_rejects,
-        );
-
-        // Set reference for methylation-aware consensus if enabled
-        if let Some((ref reference, ref ref_names)) = methylation_ref {
-            caller.set_reference(Arc::clone(reference), Arc::clone(ref_names));
-        }
-
-        // Accumulator for overlapping stats from parallel processing
-        let mut merged_overlapping_stats = CorrectionStats::new();
-
-        // Track progress (count records written, not UMI groups)
-        let mut record_count: usize = 0;
-        let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
-
-        // Use the raw_reader opened above (single input open).
-        let raw_record_iter = std::iter::from_fn(move || {
-            let mut record = RawRecord::new();
-            match raw_reader.read_record(&mut record) {
-                Ok(0) => None, // EOF
-                Ok(_) => Some(Ok(record)),
-                Err(e) => Some(Err(e.into())),
-            }
-        });
-        let mi_group_iter =
-            MiGroupIterator::new(raw_record_iter, "MI").with_cell_tag(Some(*SamTag::CB));
-        // Single-threaded streaming processing
-        // Create overlapping consensus caller for single-threaded mode
-        let mut overlapping_caller = if overlapping_enabled {
-            Some(OverlappingBasesConsensusCaller::new(
-                AgreementStrategy::Consensus,
-                DisagreementStrategy::Consensus,
-            ))
-        } else {
-            None
-        };
-
-        for result in mi_group_iter {
-            let (umi, mut records) = result.context("Failed to read MI group")?;
-
-            // Apply overlapping consensus if enabled (modifies raw bytes in-place)
-            if let Some(ref mut oc) = overlapping_caller {
-                apply_overlapping_consensus(&mut records, oc)?;
-            }
-
-            // Call consensus directly — records are already RawRecord values.
-            let output = caller
-                .consensus_reads(records)
-                .with_context(|| format!("Failed to call consensus for UMI: {umi}"))?;
-
-            let batch_size = output.count;
-            record_count += batch_size;
-
-            // Write pre-serialized consensus reads to output
-            writer.get_mut().write_all(&output.data).context("Failed to write consensus read")?;
-
-            // Write rejected reads if tracking is enabled
-            if let Some(ref mut rw) = rejects_writer {
-                for raw_record in caller.rejected_reads() {
-                    let block_size = raw_record.len() as u32;
-                    rw.get_mut()
-                        .write_all(&block_size.to_le_bytes())
-                        .context("Failed to write rejected read block size")?;
-                    rw.get_mut().write_all(raw_record).context("Failed to write rejected read")?;
-                }
-                caller.clear_rejected_reads();
-            }
-
-            progress.log_if_needed(batch_size as u64);
-        }
-
-        // For single-threaded, use the caller's stats and merge overlapping stats
-        let merged_stats = caller.statistics();
-        if let Some(ref oc) = overlapping_caller {
-            merged_overlapping_stats.merge(oc.stats());
-        }
-
-        progress.log_final();
-
-        // Finish the buffered writer (flush remaining records and wait for writer thread)
-        writer.into_inner().finish().context("Failed to finish output BAM")?;
-
-        // Log overlapping consensus statistics if enabled
-        if overlapping_enabled {
-            log_overlapping_stats(&merged_overlapping_stats);
-        }
-
-        // Log statistics and write to file
-        info!("Consensus calling complete");
-        info!("Total records processed: {record_count}");
-
-        let metrics = merged_stats.to_metrics();
-        let consensus_count = metrics.consensus_reads;
-        log_consensus_summary(&metrics);
-
-        if let Some(stats_path) = &self.stats_opts.stats {
-            // Convert to fgbio-compatible vertical key-value-description format
-            let kv_metrics = metrics.to_kv_metrics();
-            DelimFile::default()
-                .write_tsv(stats_path, kv_metrics)
-                .with_context(|| format!("Failed to write statistics: {}", stats_path.display()))?;
-            info!("Wrote statistics to: {}", stats_path.display());
-        }
-
-        timer.log_completion(consensus_count);
-
-        // Close rejects writer if it was opened
-        if let Some(rw) = rejects_writer {
-            rw.into_inner().finish().context("Failed to finish rejects file")?;
-            info!("Rejected reads written successfully");
-        }
-
-        Ok(())
+        crate::pipeline::chains::build_for(spec)?.run()
     }
 }
 
@@ -573,6 +346,7 @@ impl Command for Simplex {
 mod tests {
     use super::*;
     use crate::metrics::consensus::ConsensusKvMetric;
+    use fgoxide::io::DelimFile;
     use noodles::sam::alignment::record::data::field::Tag;
     use noodles::sam::alignment::record_buf::RecordBuf;
     use rstest::rstest;

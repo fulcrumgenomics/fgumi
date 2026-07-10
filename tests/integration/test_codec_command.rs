@@ -653,3 +653,117 @@ fn test_codec_command_recovers_from_duplex_disagreement_threaded() {
         "the disagreeing pair (R1+R2) must reach --rejects byte-identical to its input records"
     );
 }
+
+/// Consensus-unify regression: `codec` with `--threads` unset must produce
+/// output identical to `--threads 1` (both route through the chain now).
+#[test]
+fn codec_no_threads_matches_threads_1() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let mut pairs = Vec::new();
+    for i in 0..3 {
+        let (r1, r2) = create_codec_read_pair(
+            &format!("read{i}"),
+            b"ACGTACGT",
+            b"ACGTACGT",
+            &[30; 8],
+            &[30; 8],
+            100,
+            "UMI001",
+            None,
+        );
+        pairs.push((r1, r2));
+    }
+    create_codec_test_bam(&input_bam, pairs);
+
+    let run = |out: &std::path::Path, stats: &std::path::Path, threads: Option<&str>| {
+        let mut args: Vec<String> = vec![
+            "codec".into(),
+            "--input".into(),
+            input_bam.to_str().unwrap().into(),
+            "--output".into(),
+            out.to_str().unwrap().into(),
+            "--stats".into(),
+            stats.to_str().unwrap().into(),
+            "--min-reads".into(),
+            "1".into(),
+            "--min-duplex-length".into(),
+            "1".into(),
+            "--compression-level".into(),
+            "1".into(),
+        ];
+        if let Some(t) = threads {
+            args.push("--threads".into());
+            args.push(t.into());
+        }
+        Codec::try_parse_from(args).expect("parse").execute("fgumi codec").expect("codec");
+    };
+    let out_none = temp_dir.path().join("none.bam");
+    let out_t1 = temp_dir.path().join("t1.bam");
+    let stats_none = temp_dir.path().join("none.stats.txt");
+    let stats_t1 = temp_dir.path().join("t1.stats.txt");
+    run(&out_none, &stats_none, None);
+    run(&out_t1, &stats_t1, Some("1"));
+    let read = |p: &std::path::Path| {
+        let mut r = bam::io::Reader::new(fs::File::open(p).unwrap());
+        let h = r.read_header().unwrap();
+        let recs: Vec<RecordBuf> = r.record_bufs(&h).map(|x| x.unwrap()).collect();
+        (h, recs)
+    };
+    let (h_none, recs_none) = read(&out_none);
+    let (h_t1, recs_t1) = read(&out_t1);
+    assert_eq!(recs_none, recs_t1, "codec unset must match --threads 1 (records)");
+    assert_eq!(h_none, h_t1, "codec unset must match --threads 1 (output header)");
+    assert_eq!(
+        fs::read_to_string(&stats_none).unwrap(),
+        fs::read_to_string(&stats_t1).unwrap(),
+        "codec unset must match --threads 1 (--stats file)"
+    );
+
+    // --- Independent oracle (NOT a snapshot) -------------------------------
+    // The parity asserts above only prove the two --threads paths AGREE; a
+    // shared bug in the folded chain would corrupt BOTH identically and still
+    // pass. Derive the expected output from the input and pin it against
+    // `recs_none` (the --threads-unset path PR 549 folds onto the chain).
+    //
+    // Input: 3 identical clean CODEC read pairs of ONE molecule (R1 = R2 =
+    // `ACGTACGT`, all quals 30), `--min-reads 1 --min-duplex-length 1`. In
+    // CODEC, R1 and R2 are the two strands of the same fragment, so the three
+    // pairs collapse to a single duplex consensus read (single-end, not a
+    // pair) → exactly 1 consensus record. The consensus of identical
+    // error-free reads is the template, so its SEQ is `ACGTACGT`. The
+    // consensus read is emitted unmapped in read (forward) orientation, so it
+    // is not reverse-complemented; we still revcomp defensively for a
+    // reverse-strand record.
+    let expected_consensus_reads: usize = 1;
+    assert_eq!(
+        recs_none.len(),
+        expected_consensus_reads,
+        "3 CODEC pairs of one molecule → one duplex consensus read",
+    );
+    let rec = &recs_none[0];
+    let seq = rec.sequence().as_ref().to_vec();
+    let forward =
+        if rec.flags().is_reverse_complemented() { reverse_complement(&seq) } else { seq };
+    assert_eq!(
+        forward,
+        b"ACGTACGT".to_vec(),
+        "clean CODEC molecule → consensus SEQ equals the R1/R2 template (forward-oriented)",
+    );
+    // Second independent oracle: the codec --stats `consensus_reads` column
+    // (horizontal header row + values row) must equal the emitted count.
+    let stats_text = fs::read_to_string(&stats_none).unwrap();
+    let mut stats_lines = stats_text.lines();
+    let header = stats_lines.next().expect("codec stats header row");
+    let values = stats_lines.next().expect("codec stats values row");
+    let col = header
+        .split('\t')
+        .position(|c| c == "consensus_reads")
+        .expect("codec stats has a consensus_reads column");
+    let consensus_reads: usize =
+        values.split('\t').nth(col).expect("values row has the column").parse().unwrap();
+    assert_eq!(
+        consensus_reads, expected_consensus_reads,
+        "codec --stats consensus_reads must equal the emitted consensus count",
+    );
+}

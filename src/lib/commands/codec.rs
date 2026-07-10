@@ -7,25 +7,13 @@
 //! allowing even a single read-pair to generate duplex consensus.
 
 use crate::commands::command::Command;
-use crate::commands::consensus_runner::{ConsensusStatsOps, create_unmapped_consensus_header};
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::Parser;
-use fgoxide::io::DelimFile;
-use fgumi_bam_io::{create_bam_writer, create_optional_bam_writer};
 
 use super::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, ReadGroupOptions, RejectsOptions,
     SchedulerOptions, StatsOptions, ThreadingOptions,
 };
-use crate::consensus::codec_caller::{CodecConsensusCaller, CodecConsensusOptions};
-use crate::logging::{OperationTimer, log_consensus_summary};
-use crate::mi_group::MiGroupIterator;
-use crate::sam::SamTag;
-use fgumi_bam_io::ProgressTracker;
-use fgumi_raw_bam::RawRecord;
-use log::info;
-use noodles::sam::alignment::record::data::field::Tag;
-use std::io::Write as IoWrite;
 
 /// Codec-specific tuning, flattened into both the standalone `Codec`
 /// command (as bare `--min-duplex-length`, `--outer-bases-qual`, …) and
@@ -317,208 +305,32 @@ impl Command for Codec {
         // Validate inputs
         self.validate()?;
 
-        // ============================================================
-        // --threads N mode: route through chains::build_for.
-        // None: Use single-threaded fast path (below).
-        // ============================================================
-        // IMPORTANT: Do NOT open the source here — the chain builder opens
-        // it once. This avoids double-open (wastes I/O, breaks stdin).
-        if self.threading.threads.is_some() {
-            use crate::pipeline::chains::{
-                ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag,
-            };
-            // Populate the #[arg(skip)] chain-builder slots on a clone of
-            // CodecOptions before handing it to the ChainSpec.
-            let mut options = self.options.clone();
-            options.io.clone_from(&self.io);
-            options.rejects_opts.clone_from(&self.rejects_opts);
-            options.stats_opts.clone_from(&self.stats_opts);
-            options.read_group.clone_from(&self.read_group);
+        // Route through the typed-step chain for every thread count. `--threads`
+        // unset resolves to a one-worker chain (`num_threads() == 1`) — output
+        // identical to `--threads 1`, with no separate single-threaded path. The
+        // chain opens the source once (BAM or SAM) and runs CODEC consensus in
+        // `add_codec`. Populate the #[arg(skip)] chain-builder slots on a clone of
+        // CodecOptions before handing it to the ChainSpec.
+        use crate::pipeline::chains::{ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag};
+        let mut options = self.options.clone();
+        options.io.clone_from(&self.io);
+        options.rejects_opts.clone_from(&self.rejects_opts);
+        options.stats_opts.clone_from(&self.stats_opts);
+        options.read_group.clone_from(&self.read_group);
 
-            let spec = ChainSpec {
-                async_reader: self.io.async_reader,
-                stages: vec![Stage::Codec],
-                source: SourceSpec::Bam(self.io.input.clone()),
-                sink: SinkSpec::Bam(self.io.output.clone()),
-                stage_opts: StageOptionsBag { codec: Some(options), ..Default::default() },
-                threading: self.threading.clone(),
-                compression: self.compression.clone(),
-                scheduler: self.scheduler_opts.clone(),
-                queue_memory: self.queue_memory.clone(),
-                command_line: command_line.to_string(),
-            };
-            return crate::pipeline::chains::build_for(spec)?.run();
-        }
-
-        let timer = OperationTimer::new("Calling CODEC consensus");
-        let writer_threads = self.threading.num_threads();
-
-        // Parse cell tag
-        let cell_tag = Tag::from(SamTag::CB);
-
-        // Enable rejects tracking if rejects file is specified
-        let track_rejects = self.rejects_opts.is_enabled();
-
-        // Single-threaded fast path is BAM-only. Open the raw reader ONCE and
-        // derive the header from it — this is the sole open of the input. Do NOT
-        // pre-open to sniff SAM-vs-BAM: a second open double-consumes stdin and
-        // loses the leading bytes (stdin can't be rewound or re-opened). SAM
-        // input (not BGZF) fails the header read here; surface the --threads hint.
-        let (mut raw_reader, header) =
-            crate::commands::consensus_runner::open_single_threaded_consensus_input(
-                &self.io.input,
-                self.io.pipeline_reader_opts(),
-                "codec",
-            )?;
-        let output_header = create_unmapped_consensus_header(
-            &header,
-            &self.read_group.read_group_id,
-            "Read group",
-            command_line,
-        )?;
-        let read_name_prefix = self.read_group.prefix_or_from_header(&header);
-
-        // ============================================================
-        // For non-pipeline modes, create output writers here
-        // ============================================================
-
-        // Open output BAM writer with multi-threaded BGZF compression
-        let mut writer = create_bam_writer(
-            &self.io.output,
-            &output_header,
-            writer_threads,
-            self.compression.compression_level,
-        )?;
-
-        // Open rejects writer if rejects file is specified
-        let mut rejects_writer = create_optional_bam_writer(
-            self.rejects_opts.rejects.as_ref(),
-            &header,
-            writer_threads,
-            self.compression.compression_level,
-        )?;
-
-        // Reconstruct the shared ConsensusCallingOptions from the inlined
-        // CodecOptions flat fields.
-        let consensus = self.options.consensus();
-
-        // Create options
-        let options = CodecConsensusOptions {
-            min_input_base_quality: consensus.min_input_base_quality,
-            error_rate_pre_umi: consensus.error_rate_pre_umi,
-            error_rate_post_umi: consensus.error_rate_post_umi,
-            min_reads_per_strand: self.options.min_reads,
-            max_reads_per_strand: self.options.max_reads,
-            min_duplex_length: self.options.min_duplex_length,
-            single_strand_qual: self.options.single_strand_qual,
-            outer_bases_qual: self.options.outer_bases_qual,
-            outer_bases_length: self.options.outer_bases_length,
-            max_duplex_disagreements: self.options.max_duplex_disagreements.unwrap_or(usize::MAX),
-            max_duplex_disagreement_rate: self.options.max_duplex_disagreement_rate,
-            cell_tag: Some(cell_tag),
-            produce_per_base_tags: consensus.output_per_base_tags,
-            trim: consensus.trim,
-            min_consensus_base_quality: consensus.min_consensus_base_quality,
+        let spec = ChainSpec {
+            async_reader: self.io.async_reader,
+            stages: vec![Stage::Codec],
+            source: SourceSpec::Bam(self.io.input.clone()),
+            sink: SinkSpec::Bam(self.io.output.clone()),
+            stage_opts: StageOptionsBag { codec: Some(options), ..Default::default() },
+            threading: self.threading.clone(),
+            compression: self.compression.clone(),
+            scheduler: self.scheduler_opts.clone(),
+            queue_memory: self.queue_memory.clone(),
+            command_line: command_line.to_string(),
         };
-
-        // Note: CODEC does not support overlapping consensus (matching fgbio)
-        // We keep the infrastructure in place but it's always disabled.
-
-        // Track progress (count records written, not UMI groups)
-        let mut record_count: usize = 0;
-        let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
-
-        // Use the raw_reader opened above (single input open).
-        let raw_record_iter = std::iter::from_fn(move || {
-            let mut record = RawRecord::new();
-            match raw_reader.read_record(&mut record) {
-                Ok(0) => None, // EOF
-                Ok(_) => Some(Ok(record)),
-                Err(e) => Some(Err(e.into())),
-            }
-        });
-        let mi_group_iter =
-            MiGroupIterator::new(raw_record_iter, "MI").with_cell_tag(Some(*SamTag::CB));
-
-        let mut caller = CodecConsensusCaller::new_with_rejects_tracking(
-            read_name_prefix,
-            self.read_group.read_group_id.clone(),
-            options,
-            track_rejects,
-        );
-
-        for result in mi_group_iter {
-            let (umi, records) = result.context("Failed to read MI group")?;
-
-            // Call consensus directly — records are already RawRecord values.
-            // Use the typed-error entry point so recoverable duplex-disagreement
-            // rejects are distinguished from fatal failures by variant rather
-            // than by matching on the error message (see issue #338).
-            match caller.consensus_reads_typed(records) {
-                Ok(output) => {
-                    let batch_size = output.count;
-                    record_count += batch_size;
-                    writer
-                        .get_mut()
-                        .write_all(&output.data)
-                        .context("Failed to write consensus read")?;
-                    progress.log_if_needed(batch_size as u64);
-                }
-                Err(e) => {
-                    // Duplex disagreements are recoverable: drop the offending
-                    // MI group and keep processing. Anything else is fatal.
-                    if !e.is_duplex_disagreement() {
-                        return Err(anyhow::Error::from(e))
-                            .with_context(|| format!("Failed to call consensus for UMI: {umi}"));
-                    }
-                }
-            }
-
-            // Write rejected reads if tracking is enabled (already raw BAM bytes)
-            if let Some(ref mut rw) = rejects_writer {
-                for raw_record in caller.rejected_reads() {
-                    let block_size = raw_record.len() as u32;
-                    rw.get_mut()
-                        .write_all(&block_size.to_le_bytes())
-                        .context("Failed to write rejected read block size")?;
-                    rw.get_mut().write_all(raw_record).context("Failed to write rejected read")?;
-                }
-                caller.clear_rejected_reads();
-            }
-        }
-
-        // For single-threaded, use the caller's stats
-        let merged_stats = caller.statistics().clone();
-
-        progress.log_final();
-
-        // Finish the buffered writer (flush remaining records and wait for writer thread)
-        writer.into_inner().finish().context("Failed to finish output BAM")?;
-
-        // Log statistics and write to file
-        info!("Consensus calling complete");
-        info!("Total records processed: {record_count}");
-
-        let metrics = merged_stats.to_metrics();
-        let consensus_count = metrics.consensus_reads;
-        log_consensus_summary(&metrics);
-
-        if let Some(stats_path) = &self.stats_opts.stats {
-            DelimFile::default()
-                .write_tsv(stats_path, [metrics])
-                .with_context(|| format!("Failed to write statistics: {}", stats_path.display()))?;
-            info!("Wrote statistics to: {}", stats_path.display());
-        }
-
-        timer.log_completion(consensus_count);
-
-        // Close rejects writer if it was opened
-        if let Some(rw) = rejects_writer {
-            rw.into_inner().finish().context("Failed to finish rejects file")?;
-            info!("Rejected reads written successfully");
-        }
-
-        Ok(())
+        crate::pipeline::chains::build_for(spec)?.run()
     }
 }
 impl Codec {
@@ -540,7 +352,9 @@ impl Codec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::consensus_runner::ConsensusStatsOps;
     use crate::consensus::codec_caller::CodecConsensusStats;
+    use crate::sam::SamTag;
     use noodles::sam::alignment::io::Write as AlignmentWrite;
     use rstest::rstest;
     use std::path::PathBuf;

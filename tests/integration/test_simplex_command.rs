@@ -7,6 +7,7 @@
 
 use bstr::BString;
 use clap::Parser;
+use fgumi_dna::reverse_complement;
 use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::simplex::Simplex;
 use fgumi_lib::sam::SamTag;
@@ -84,6 +85,124 @@ fn test_simplex_command_basic_consensus() {
         count += 1;
     }
     assert!(count > 0, "Should have produced consensus reads");
+}
+
+/// Consensus-unify regression: `simplex` with `--threads` unset must produce
+/// output identical to `--threads 1`. Both now route through the chain (unset
+/// resolves to a one-worker chain), so this pins that the fold of the former
+/// single-threaded path onto the chain is output-preserving.
+#[test]
+fn simplex_no_threads_matches_threads_1() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let family1 = create_umi_family("ACGT", 5, "fam1", "ACGTACGT", 30);
+    let family2 = create_umi_family("TGCA", 5, "fam2", "TTTTAAAA", 30);
+    create_grouped_bam(&input_bam, vec![("1", family1), ("2", family2)]);
+
+    let run = |out: &Path, stats: &Path, threads: Option<&str>| {
+        let mut args: Vec<String> = vec![
+            "simplex".into(),
+            "--input".into(),
+            input_bam.to_str().unwrap().into(),
+            "--output".into(),
+            out.to_str().unwrap().into(),
+            "--stats".into(),
+            stats.to_str().unwrap().into(),
+            "--min-reads".into(),
+            "2".into(),
+            "--compression-level".into(),
+            "1".into(),
+        ];
+        if let Some(t) = threads {
+            args.push("--threads".into());
+            args.push(t.into());
+        }
+        Simplex::try_parse_from(args).expect("parse").execute("fgumi simplex").expect("simplex");
+    };
+    let out_none = temp_dir.path().join("none.bam");
+    let out_t1 = temp_dir.path().join("t1.bam");
+    let stats_none = temp_dir.path().join("none.stats.txt");
+    let stats_t1 = temp_dir.path().join("t1.stats.txt");
+    run(&out_none, &stats_none, None);
+    run(&out_t1, &stats_t1, Some("1"));
+
+    let read = |p: &Path| {
+        let mut r = bam::io::Reader::new(fs::File::open(p).unwrap());
+        let h = r.read_header().unwrap();
+        let recs: Vec<RecordBuf> = r.record_bufs(&h).map(|x| x.unwrap()).collect();
+        (h, recs)
+    };
+    let (h_none, recs_none) = read(&out_none);
+    let (h_t1, recs_t1) = read(&out_t1);
+    assert_eq!(
+        recs_none, recs_t1,
+        "simplex --threads unset must match --threads 1 (consensus records)"
+    );
+    assert_eq!(h_none, h_t1, "simplex --threads unset must match --threads 1 (output header)");
+    assert_eq!(
+        fs::read_to_string(&stats_none).unwrap(),
+        fs::read_to_string(&stats_t1).unwrap(),
+        "simplex --threads unset must match --threads 1 (--stats file)"
+    );
+
+    // --- Independent oracle (NOT a snapshot) -------------------------------
+    // The parity asserts above only prove the two --threads paths AGREE; a
+    // shared bug in the folded chain (wrong consensus math / wrong record
+    // count) would corrupt BOTH identically and still pass. Derive the
+    // expected output from the input and pin it against `recs_none` (the
+    // --threads-unset path that PR 549 folds onto the chain).
+    //
+    // Input: two clean, error-free single-end UMI families (5 identical reads
+    // each), `--min-reads 2`. The consensus of N identical error-free reads is
+    // the input template, and each family yields exactly one single-end
+    // consensus read → 2 consensus records, one per family. Templates are
+    // `ACGTACGT` (fam1) and `TTTTAAAA` (fam2). Consensus reads are emitted
+    // unmapped in read (forward) orientation, so no record is
+    // reverse-complemented; each stored SEQ equals its template forward. We
+    // still revcomp defensively for any reverse-strand record so the oracle
+    // stays correct if orientation ever changes.
+    let expected_consensus_reads: usize = 2;
+    assert_eq!(
+        recs_none.len(),
+        expected_consensus_reads,
+        "two clean families → two single-end consensus reads",
+    );
+    // Forward-oriented SEQ of each consensus record (revcomp iff reverse-strand).
+    let mut forward_seqs: Vec<Vec<u8>> = recs_none
+        .iter()
+        .map(|rec| {
+            let seq = rec.sequence().as_ref().to_vec();
+            if rec.flags().is_reverse_complemented() { reverse_complement(&seq) } else { seq }
+        })
+        .collect();
+    forward_seqs.sort();
+    // Non-vacuous: a single-base change to either expected template (e.g.
+    // `ACGTACGA`) fails this equality.
+    assert_eq!(
+        forward_seqs,
+        vec![b"ACGTACGT".to_vec(), b"TTTTAAAA".to_vec()],
+        "clean families → consensus SEQ equals the input templates (forward-oriented)",
+    );
+    // Second independent oracle: the --stats `consensus_reads_emitted` value
+    // (vertical `key<TAB>value<TAB>description` layout) must equal the count.
+    let emitted = parse_stats_kv_usize(&stats_none, "consensus_reads_emitted");
+    assert_eq!(
+        emitted, expected_consensus_reads,
+        "--stats consensus_reads_emitted must equal the emitted consensus count",
+    );
+}
+
+/// Parse a `usize` value from a vertical `key<TAB>value<TAB>description` stats
+/// file (the fgbio-style consensus stats layout), by key.
+fn parse_stats_kv_usize(path: &Path, key: &str) -> usize {
+    let text = fs::read_to_string(path).expect("read stats file");
+    let prefix = format!("{key}\t");
+    text.lines()
+        .find(|line| line.starts_with(&prefix))
+        .and_then(|line| line.split('\t').nth(1))
+        .unwrap_or_else(|| panic!("stats file missing key {key}"))
+        .parse()
+        .expect("stats value parses as usize")
 }
 
 /// Test simplex command with statistics output.

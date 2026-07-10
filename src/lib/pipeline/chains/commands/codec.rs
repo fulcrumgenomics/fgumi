@@ -13,8 +13,9 @@
 //! different consensus caller and no MI-tag transform, overlapping consensus,
 //! or methylation mode — matching fgbio's `CallCodecConsensusReads` behaviour.
 //!
-//! The single-threaded fast path (`--threads` unset, BAM-only) is **not**
-//! migrated here — it stays inline in `Codec::execute`.
+//! This is the sole standalone execution path — `Codec::execute` always routes
+//! here, and `--threads` unset resolves to a one-worker chain (no separate
+//! single-threaded path).
 
 use std::io;
 use std::sync::Arc;
@@ -364,8 +365,8 @@ pub(crate) fn build_codec_consensus_step_kept_only(
 /// [`ChainBuilder`]'s `add_codec` method in
 /// [`crate::pipeline::chains::builder`].
 ///
-/// The single-threaded fast path (`--threads` unset, BAM-only) is **not**
-/// migrated here — it stays inline in `Codec::execute`.
+/// This is the sole standalone execution path — `Codec::execute` always routes
+/// here, and `--threads` unset resolves to a one-worker chain.
 ///
 /// # Errors
 ///
