@@ -9,6 +9,8 @@
 use clap::Parser;
 use fgumi_lib::commands::command::Command as FgumiCommand;
 use fgumi_lib::commands::compare::{CompareMetrics, CompareMismatch};
+use fgumi_lib::variant_review::ConsensusVariantReviewInfo;
+use proptest::prelude::*;
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
@@ -173,4 +175,208 @@ fn localized_differ_names_the_offending_key() {
     let (code, stdout, _stderr) = run_compare_subprocess(&f1, &f2, &[]);
     assert_eq!(code, Some(1), "a clean DIFFER must exit exactly 1: {stdout}");
     assert!(stdout.contains("3 only in file1"), "stdout was: {stdout}");
+}
+
+// ---------------------------------------------------------------------------
+// CMP3-02 (BS2): `compare metrics` is the review-`.txt` comparator.
+//
+// The `review` command writes its `<output>.txt` as a headered TSV (serde/csv
+// serialize of `ConsensusVariantReviewInfo`), so the generic row key-join
+// comparator handles it directly — one `<variant-site> × <consensus-read>` row
+// per line, joined on `chrom,pos,consensus_read`. These two tests pin that the
+// review file's own failure modes are visible to the oracle: row order between
+// two `review` runs must be tolerated, and a per-read consensus base/quality
+// divergence (the class the whole `review` command's parity findings live in)
+// must DIFFER and be localized to the offending variant/read key.
+// ---------------------------------------------------------------------------
+
+/// A minimal `review`-`.txt` fixture: the real column header emitted by
+/// `ConsensusVariantReviewInfo` (derived from the struct itself via
+/// `tsv_header()`, so it can't drift if a field is added/renamed), followed by
+/// the given data rows (each a full tab-joined line without its trailing
+/// newline).
+fn review_txt(rows: &[&str]) -> String {
+    let mut out = ConsensusVariantReviewInfo::tsv_header();
+    for row in rows {
+        out.push('\n');
+        out.push_str(row);
+    }
+    out.push('\n');
+    out
+}
+
+/// A baseline `ConsensusVariantReviewInfo` for the review-`.txt` fixtures.
+///
+/// Each fixture starts from this and mutates only the fields it cares about via
+/// [`review_row`], so every value stays bound to a *named* struct field. A
+/// reorder of two same-typed fields (e.g. two `String`s) is then a compiler- and
+/// header-visible change — the row moves in lockstep with the struct-derived
+/// header — rather than a silent positional misassignment in a hand-typed
+/// tab-joined literal.
+fn baseline_review_info() -> ConsensusVariantReviewInfo {
+    ConsensusVariantReviewInfo {
+        chrom: "chr1".to_string(),
+        pos: 100,
+        ref_allele: "A".to_string(),
+        genotype: "0/1".to_string(),
+        filters: "PASS".to_string(),
+        consensus_a: 3,
+        consensus_c: 0,
+        consensus_g: 1,
+        consensus_t: 0,
+        consensus_n: 0,
+        consensus_read: "read".to_string(),
+        consensus_insert: "chr1:100-200 | F1R2".to_string(),
+        consensus_call: 'A',
+        consensus_qual: 40,
+        a: 5,
+        c: 0,
+        g: 2,
+        t: 0,
+        n: 0,
+    }
+}
+
+/// Build one review-`.txt` row from the baseline, applying `overrides`, and
+/// serialize it through `ConsensusVariantReviewInfo::to_tsv_row()` — the same
+/// serde/csv mechanism as the struct-derived header — so the row can never drift
+/// from the header's column order.
+fn review_row(overrides: impl FnOnce(&mut ConsensusVariantReviewInfo)) -> String {
+    let mut info = baseline_review_info();
+    overrides(&mut info);
+    info.to_tsv_row()
+}
+
+/// Build `n` review rows with pairwise-distinct join keys
+/// (`chrom,pos,consensus_read`), so any reordering of the set is unambiguously a
+/// pure permutation of identical content.
+fn distinct_review_rows(n: usize) -> Vec<String> {
+    (0..n)
+        .map(|i| {
+            review_row(|info| {
+                info.chrom = format!("chr{i}");
+                info.pos = 100 + i32::try_from(i).expect("row index fits i32");
+                info.consensus_read = format!("read{i}");
+                info.consensus_insert = format!("chr{i}:100-200 | F1R2");
+            })
+        })
+        .collect()
+}
+
+/// `readX` — the baseline row, distinguished only by its read name.
+fn review_row_x() -> String {
+    review_row(|info| info.consensus_read = "readX".to_string())
+}
+
+/// The `readY`-specific fields shared by both the reference and the diverged
+/// `readY` row *except* its consensus base call and quality. Both rows derive
+/// from this, so the `consensus_call`/`consensus_qual` transition is guaranteed
+/// to be their *only* difference — a later edit to readY's key/insert/raw counts
+/// can't silently turn the divergence test into a multi-column diff.
+fn apply_read_y_context(info: &mut ConsensusVariantReviewInfo) {
+    info.consensus_read = "readY".to_string();
+    info.consensus_insert = "chr1:100-200 | F2R1".to_string();
+    info.a = 0;
+    info.g = 0;
+    info.t = 4;
+}
+
+/// `readY` — same variant site as `readX`, a distinct read on the F2R1 insert
+/// calling `G@38`.
+fn review_row_y() -> String {
+    review_row(|info| {
+        apply_read_y_context(info);
+        info.consensus_call = 'G';
+        info.consensus_qual = 38;
+    })
+}
+
+/// `readZ` — a different variant site (`chr2:250`, ref `C`).
+fn review_row_z() -> String {
+    review_row(|info| {
+        info.chrom = "chr2".to_string();
+        info.pos = 250;
+        info.ref_allele = "C".to_string();
+        info.genotype = "1/1".to_string();
+        info.consensus_a = 0;
+        info.consensus_c = 2;
+        info.consensus_g = 0;
+        info.consensus_t = 1;
+        info.consensus_read = "readZ".to_string();
+        info.consensus_insert = "chr2:250-350 | F1R2".to_string();
+        info.consensus_call = 'C';
+        info.consensus_qual = 42;
+        info.a = 0;
+        info.c = 3;
+        info.g = 0;
+        info.t = 1;
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Row order between two `review` runs is tolerated for ANY permutation, not
+    /// just one hand-picked shuffle: two runs may legitimately emit identical
+    /// rows in different order, and `compare metrics`' key-join on
+    /// `chrom,pos,consensus_read` exists to tolerate exactly that. Generalizes
+    /// the former single fixed shuffle to a property over a generated N-row set
+    /// and an arbitrary permutation. (Coding guidelines: use proptest for
+    /// property-based testing.)
+    #[test]
+    fn review_txt_row_order_is_tolerated(
+        perm in (1usize..8).prop_flat_map(|n| Just((0..n).collect::<Vec<usize>>()).prop_shuffle())
+    ) {
+        let rows = distinct_review_rows(perm.len());
+        let canonical: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let shuffled: Vec<&str> = perm.iter().map(|&i| rows[i].as_str()).collect();
+
+        let dir = TempDir::new().expect("tempdir");
+        let f1 = write_tsv(dir.path(), "a.txt", &review_txt(&canonical));
+        let f2 = write_tsv(dir.path(), "b.txt", &review_txt(&shuffled));
+        prop_assert!(
+            run_compare_in_process(&f1, &f2, &["--key-columns", "chrom,pos,consensus_read"]),
+            "reordered review rows with identical content must MATCH (perm={perm:?})"
+        );
+    }
+}
+
+#[test]
+fn review_txt_consensus_call_and_qual_divergence_differs_and_is_localized() {
+    let dir = TempDir::new().expect("tempdir");
+    let (row_x, row_y, row_z) = (review_row_x(), review_row_y(), review_row_z());
+    let f1 = write_tsv(
+        dir.path(),
+        "a.txt",
+        &review_txt(&[row_x.as_str(), row_y.as_str(), row_z.as_str()]),
+    );
+    // readY's consensus base G→T and quality 38→20 — the per-read consensus
+    // divergence class the `review` command's parity findings live in. Shares
+    // `apply_read_y_context` with `review_row_y` so call+qual are the ONLY diff.
+    let row_y_diff = review_row(|info| {
+        apply_read_y_context(info);
+        info.consensus_call = 'T';
+        info.consensus_qual = 20;
+    });
+    let f2 = write_tsv(
+        dir.path(),
+        "b.txt",
+        &review_txt(&[row_x.as_str(), row_y_diff.as_str(), row_z.as_str()]),
+    );
+    let (code, stdout, _stderr) =
+        run_compare_subprocess(&f1, &f2, &["--key-columns", "chrom,pos,consensus_read"]);
+    assert_eq!(code, Some(1), "a consensus base/qual divergence must exit non-zero (DIFFER)");
+    assert!(stdout.contains("RESULT: metrics files DIFFER"), "stdout was: {stdout}");
+    // Localized to the offending variant-site × read key (chr1:100, readY)...
+    assert!(stdout.contains("chr1"), "diff must name the offending contig: {stdout}");
+    assert!(stdout.contains("100"), "diff must name the offending position: {stdout}");
+    assert!(stdout.contains("readY"), "diff must name the offending read: {stdout}");
+    // ...naming both changed columns and their exact value transitions.
+    assert!(stdout.contains("consensus_call"), "diff must name the call column: {stdout}");
+    assert!(stdout.contains(r#""G" != "T""#), "diff must show the base transition: {stdout}");
+    assert!(stdout.contains("consensus_qual"), "diff must name the qual column: {stdout}");
+    assert!(stdout.contains(r#""38" != "20""#), "diff must show the qual transition: {stdout}");
+    // The unchanged readX/readZ rows must NOT be reported (no cascade).
+    assert!(!stdout.contains("readX"), "unchanged rows must not appear: {stdout}");
+    assert!(!stdout.contains("readZ"), "unchanged rows must not appear: {stdout}");
 }

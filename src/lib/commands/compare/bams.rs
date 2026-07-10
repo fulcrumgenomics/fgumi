@@ -106,13 +106,25 @@ pub enum CommandPreset {
     /// CODEC consensus output: positional, exact content comparison
     /// (see [`ContentPredicate::Exact`]).
     Codec,
-    /// Filter output: consensus reads with reads dropped, but the same depth tags
-    /// (`cD`/`cM`/`cE`, and duplex `aD`/`aM`/`bD`/`bM`/`aE`/`bE`) as the consensus command
-    /// that produced them, passed through unchanged. Compares via the same predicate as
-    /// consensus output
+    /// Filter output: consensus reads with failing reads dropped and failing bases masked —
+    /// masking rewrites `SEQ` (base → `N`) and `QUAL` (→ the minimum Phred) in place, and
+    /// per-base tags may be reoriented under `--reverse-per-base-tags` (see
+    /// `commands::filter`) — but the depth tags (`cD`/`cM`/`cE`, and duplex
+    /// `aD`/`aM`/`bD`/`bM`/`aE`/`bE`) written by the consensus command are never recomputed.
+    /// Compares via the same predicate as consensus output
     /// ([`ContentPredicate::Exact`]);
     /// see `CommandPreset::resolve` for the full rationale.
     Filter,
+    /// Clip output: post-consensus reads with overlapping/read-end clipping applied. Clipping
+    /// rewrites CIGAR/SEQ/QUAL in the clipped span and, as a consequence, regenerates the
+    /// alignment tags (`NM`/`UQ`/`MD`) and repairs mate-pair metadata (see `commands::clip`);
+    /// the depth tags (`cD`/`cM`/`cE`, and duplex `aD`/`aM`/`bD`/`bM`/`aE`/`bE`) written by the
+    /// consensus command, and the `MI` tag, are passed through unchanged. Compares via the same
+    /// exact predicate as consensus and `filter` output
+    /// ([`ContentPredicate::Exact`]), which checks the regenerated alignment tags and repaired
+    /// mate fields as well as the passed-through `MI`/depth tags;
+    /// see `CommandPreset::resolve` for the full rationale.
+    Clip,
 }
 
 impl CommandPreset {
@@ -131,15 +143,24 @@ impl CommandPreset {
     ///   [`super::engines::sort_verify::sort_verify_compare`] instead, which has no notion of
     ///   `CompareMode`/`ContentPredicate` at all. This arm exists only so the match stays
     ///   exhaustive without a wildcard.)
-    /// - `Filter | Simplex | Duplex | Codec` → `(Content, false, Exact)`: all four
+    /// - `Filter | Clip | Simplex | Duplex | Codec` → `(Content, false, Exact)`: all five
     ///   deal in consensus reads carrying the depth tags (`cD`/`cM`/`cE`, and duplex
     ///   `aD`/`aM`/`bD`/`bM`/`aE`/`bE`). `Simplex`/`Duplex`/`Codec` are the commands that
-    ///   write those tags; `filter` only drops reads afterward, it never rewrites them. All
-    ///   four compare positionally under
+    ///   write those tags; `filter` both drops failing reads and rewrites the reads it keeps
+    ///   (base-level masking sets failing bases to `N` and their qualities to the minimum
+    ///   Phred, and per-base tags may be reoriented under `--reverse-per-base-tags`), and
+    ///   `clip` rewrites CIGAR/SEQ/QUAL in the clipped span and, as a consequence, regenerates
+    ///   the alignment tags (`NM`/`UQ`/`MD`) and repairs mate-pair metadata — but neither ever
+    ///   recomputes the depth-tag values. All five compare positionally under
     ///   [`ContentPredicate::Exact`](super::engines::content::ContentPredicate::Exact):
     ///   because fgumi clamps the depth tags to fgbio's `Short` ceiling at the source, the
     ///   tags are bit-identical and an exact comparison is both sound and complete — no
-    ///   consensus-specific predicate is needed.
+    ///   consensus-specific predicate is needed. Since `Exact` holds every core SAM field
+    ///   (SEQ/QUAL/CIGAR) plus the regenerated alignment tags and repaired mate fields exact,
+    ///   `clip`'s clipping-correctness cluster (CLIP3-01/02/03) is still caught — sound because
+    ///   fgumi and fgbio clip regenerate `NM`/`UQ`/`MD` and mate info identically — and so is
+    ///   any `filter` masking divergence, since a masked base/quality is itself a SEQ/QUAL
+    ///   difference.
     /// - `Group` → `(Grouping, true, ExactMinusMi)`: MI values and molecule order may
     ///   legitimately differ between tools or runs, so `Group` is the only preset that
     ///   verifies grouping equivalence instead of routing to `execute_content`. It compares
@@ -159,7 +180,7 @@ impl CommandPreset {
             Self::Extract | Self::Zipper | Self::Sort | Self::Correct | Self::Dedup => {
                 (CompareMode::Content, false, ContentPredicate::Exact)
             }
-            Self::Filter | Self::Simplex | Self::Duplex | Self::Codec => {
+            Self::Filter | Self::Clip | Self::Simplex | Self::Duplex | Self::Codec => {
                 (CompareMode::Content, false, ContentPredicate::Exact)
             }
             Self::Group => (CompareMode::Grouping, true, ContentPredicate::ExactMinusMi),
@@ -240,6 +261,7 @@ COMMAND PRESETS (--command):
   sort            (dedicated sort-verify engine; --mode/--ignore-order rejected)
   correct         content     false            Modifies RX tag only, not MI
   dedup           content     false            Deterministic
+  clip            content     false            Post-consensus; passes MI/depth tags through unchanged; exact (like filter)
   filter          content     false            Passes through MI/depth tags unchanged; exact (like consensus)
   group           grouping    true             Molecule-join: EXACT-MI content + membership/strand (cross-tool)
   simplex         content     false            Exact (cD/cM/cE compared exactly; clamped at source)
@@ -290,7 +312,7 @@ pub struct CompareBams {
     pub command: Option<CommandPreset>,
 
     /// Comparison mode: 'content' (all fields and tags, order-sound positional
-    /// pairing — for extract/zipper/correct/dedup/simplex/duplex/codec/filter
+    /// pairing — for extract/zipper/correct/dedup/clip/simplex/duplex/codec/filter
     /// output), or 'grouping' (MI equivalence via the streaming molecule-join
     /// engine — for group output; requires grouped, same-MI-consecutive input).
     /// Overrides `--command` preset if both given. Defaults to 'content' when
@@ -996,6 +1018,7 @@ mod tests {
     #[case(CommandPreset::Correct)]
     #[case(CommandPreset::Dedup)]
     #[case(CommandPreset::Filter)]
+    #[case(CommandPreset::Clip)]
     fn preset_defaults_content_stages_map_to_content_no_ignore_order(#[case] stage: CommandPreset) {
         let (mode, ignore) = stage.defaults();
         assert!(matches!(mode, CompareMode::Content), "{stage:?} → {mode:?}");
@@ -1034,12 +1057,28 @@ mod tests {
 
     /// `filter` output is consensus reads that still carry the depth tags (`cD`/`cM`/`cE`,
     /// and duplex `aD`/`aM`/`bD`/`bM`/`aE`/`bE`) as the consensus command that produced them
-    /// -- `filter` only drops reads, it never rewrites these tags. So `Filter` routes through
+    /// -- `filter` drops failing reads and masks failing bases (rewriting SEQ/QUAL on the reads
+    /// it keeps), but it never recomputes these tags. So `Filter` routes through
     /// the same `Exact` predicate as `Simplex`/`Duplex`/`Codec`, keeping the four consensus
     /// commands on one predicate.
     #[test]
     fn filter_preset_content_predicate_is_exact() {
         assert_eq!(CommandPreset::Filter.content_predicate(), ContentPredicate::Exact);
+    }
+
+    /// `clip` output is post-consensus reads that still carry the same depth tags
+    /// (`cD`/`cM`/`cE`, and duplex `aD`/`aM`/`bD`/`bM`/`aE`/`bE`) as the consensus command
+    /// that produced them -- clip rewrites CIGAR/SEQ/QUAL in the clipped span and, as a
+    /// consequence, regenerates the alignment tags (`NM`/`UQ`/`MD`) and repairs mate-pair
+    /// metadata, but never these depth tags. So `Clip`'s content predicate routes through the
+    /// same `Exact` predicate as `Filter`/`Simplex`/`Duplex`/`Codec`: because fgumi clamps the
+    /// depth tags to fgbio's `Short` ceiling at the source, they are bit-identical and an exact
+    /// comparison is both sound and complete. `Exact` holds SEQ/QUAL/CIGAR plus the regenerated
+    /// alignment tags and repaired mate fields exact, so the CLIP3-01/02/03
+    /// clipping-correctness cluster is caught.
+    #[test]
+    fn clip_preset_content_predicate_is_exact() {
+        assert_eq!(CommandPreset::Clip.content_predicate(), ContentPredicate::Exact);
     }
 
     #[test]
