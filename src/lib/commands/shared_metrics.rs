@@ -52,6 +52,9 @@ pub struct TemplateInfo {
     pub position: Option<i32>,
     /// Alignment end position (1-based), if mapped.
     pub end_position: Option<i32>,
+    /// `true` if read 1 (the first segment) is on the positive strand. Used to
+    /// orient duplex UMIs to the F1R2 reading of the top strand (DXM-02).
+    pub r1_positive: bool,
     /// Hash fraction for deterministic downsampling (computed once per template).
     pub hash_fraction: f64,
 }
@@ -461,7 +464,7 @@ pub fn process_templates_from_bam<F>(
     mut process_group: F,
 ) -> Result<(usize, Vec<usize>)>
 where
-    F: FnMut(&[TemplateInfo], &mut Vec<usize>),
+    F: FnMut(&[TemplateInfo], &mut Vec<usize>) -> Result<()>,
 {
     let (reader, header) = create_raw_bam_reader(input, 1)?;
 
@@ -575,6 +578,7 @@ where
             ref_name,
             position: Some(position),
             end_position: Some(end_position),
+            r1_positive: !r1_strand,
             hash_fraction,
         };
 
@@ -588,7 +592,7 @@ where
         // Flush the accumulated group when the ReadInfo key changes — input is
         // assumed to already be consecutively grouped by this key.
         if current_key.as_ref() != Some(&read_info_key) && !current_group.is_empty() {
-            process_group(&current_group, &mut fraction_template_counts);
+            process_group(&current_group, &mut fraction_template_counts)?;
             current_group.clear();
         }
 
@@ -597,7 +601,7 @@ where
     }
 
     if !current_group.is_empty() {
-        process_group(&current_group, &mut fraction_template_counts);
+        process_group(&current_group, &mut fraction_template_counts)?;
     }
 
     progress.log_final();
@@ -761,6 +765,7 @@ mod tests {
         let mut groups: Vec<Vec<String>> = Vec::new();
         let (total, _) = process_templates_from_bam(bam.path(), &[], 1, |group, _| {
             groups.push(group.iter().map(|t| t.mi.clone()).collect());
+            Ok(())
         })
         .expect("process_templates_from_bam");
 
