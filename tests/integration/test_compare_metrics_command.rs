@@ -74,12 +74,37 @@ fn reordered_rows_still_match_in_process() {
     assert!(run_compare_in_process(&f1, &f2, &[]), "row order must not affect the key-join");
 }
 
+/// The composite key must use *both* named columns. The two rows share `ab_size` and
+/// differ only in `ba_size`, so keying on `ab_size` alone would collide them into one
+/// duplicate key (which the engine rejects) — only a genuine two-column key gives the two
+/// rows distinct identities and lets the row-order-independent join succeed.
 #[test]
-fn multi_column_key_columns_flag_joins_correctly() {
+fn multi_column_key_joins_on_both_columns() {
     let dir = TempDir::new().expect("tempdir");
-    let f1 = write_tsv(dir.path(), "a.txt", "ab_size\tba_size\tcount\n1\t0\t100\n2\t0\t20\n");
-    let f2 = write_tsv(dir.path(), "b.txt", "ab_size\tba_size\tcount\n2\t0\t20\n1\t0\t100\n");
-    assert!(run_compare_in_process(&f1, &f2, &["--key-columns", "ab_size,ba_size"]));
+    let f1 = write_tsv(dir.path(), "a.txt", "ab_size\tba_size\tcount\n1\t0\t100\n1\t5\t20\n");
+    let f2 = write_tsv(dir.path(), "b.txt", "ab_size\tba_size\tcount\n1\t5\t20\n1\t0\t100\n");
+    assert!(
+        run_compare_in_process(&f1, &f2, &["--key-columns", "ab_size,ba_size"]),
+        "rows sharing ab_size but differing in ba_size must join by the full (ab_size, ba_size) key"
+    );
+}
+
+/// The negative direction of the above: with the same two-column key, a value change on
+/// exactly one composite-keyed row must DIFFER and name that row's full `(ab_size, ba_size)`
+/// identity — proving the join pairs rows by both columns, not just the first.
+#[test]
+fn multi_column_key_value_change_on_one_row_differs() {
+    let dir = TempDir::new().expect("tempdir");
+    let f1 = write_tsv(dir.path(), "a.txt", "ab_size\tba_size\tcount\n1\t0\t100\n1\t5\t20\n");
+    let f2 = write_tsv(dir.path(), "b.txt", "ab_size\tba_size\tcount\n1\t0\t100\n1\t5\t21\n");
+    let (code, stdout, _stderr) =
+        run_compare_subprocess(&f1, &f2, &["--key-columns", "ab_size,ba_size"]);
+    assert_eq!(code, Some(1), "a value change on one composite-keyed row must DIFFER: {stdout}");
+    assert!(stdout.contains("RESULT: metrics files DIFFER"), "stdout was: {stdout}");
+    assert!(
+        stdout.contains("(1, 5)"),
+        "the diff must name the offending composite key (ab_size, ba_size) = (1, 5): {stdout}"
+    );
 }
 
 /// Exercises the CLI's exit code and the `RESULT: metrics files DIFFER` report
@@ -122,9 +147,22 @@ fn subprocess_quiet_suppresses_output_on_differ() {
         "a quiet DIFFER must exit exactly 1, not crash/usage-error: {stderr}"
     );
     assert!(stdout.is_empty(), "quiet mode must suppress stdout: {stdout}");
-    // A generic runtime error also exits 1 but reports via `anyhow`'s `Error:` line on
-    // stderr; assert its absence so a real error can't masquerade as a clean quiet DIFFER.
+    // The `--quiet` contract is "the exit code is the only *result* signal". stderr is not
+    // asserted fully empty: `main` emits a process-wide startup banner (the fgumi version) at
+    // `info` before dispatch, under `RUST_LOG` control — the same orthogonal-logging model as
+    // fgbio's global `--log-level`. What quiet DOES guarantee is that nothing on stderr
+    // communicates the comparison *result* or a runtime error:
+    //   - no `anyhow` `Error:` report (a generic runtime error also exits 1, and would
+    //     otherwise masquerade as a clean quiet DIFFER),
+    //   - no result-determination text (the command's own "Metrics files differ"/"identical"
+    //     `info!`s and the "Comparing metrics" timer line are gated behind `!quiet`).
     assert!(!stderr.contains("Error:"), "quiet DIFFER must not emit a runtime error: {stderr}");
+    for banned in ["differ", "Differ", "DIFFER", "identical", "IDENTICAL", "Comparing metrics"] {
+        assert!(
+            !stderr.contains(banned),
+            "quiet mode must not leak the result token {banned:?} to stderr: {stderr}"
+        );
+    }
 }
 
 #[test]
