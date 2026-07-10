@@ -1772,19 +1772,29 @@ mod tests {
     fn test_is_duplex_consensus_with_tag() {
         use crate::consensus_filter::is_duplex_consensus;
 
-        // Build a record with the aD tag included directly
-        let mut b = RawSamBuilder::new();
-        b.ref_id(0)
-            .pos(0)
-            .mapq(60)
-            .flags(0)
-            .cigar_ops(&[4 << 4]) // 4M
-            .sequence(b"ACGT")
-            .qualities(&[30, 30, 30, 30]);
-        b.add_int_tag(SamTag::AD, 10);
-        let record = b.build();
+        // A duplex consensus requires BOTH aD and bD (fgbio Umis.isFgbioDuplexConsensus,
+        // CONS-02). A record with only aD is a simplex consensus, not duplex.
+        let build = |with_ad: bool, with_bd: bool| {
+            let mut b = RawSamBuilder::new();
+            b.ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .flags(0)
+                .cigar_ops(&[4 << 4]) // 4M
+                .sequence(b"ACGT")
+                .qualities(&[30, 30, 30, 30]);
+            if with_ad {
+                b.add_int_tag(SamTag::AD, 10);
+            }
+            if with_bd {
+                b.add_int_tag(SamTag::BD, 8);
+            }
+            b.build()
+        };
 
-        assert!(is_duplex_consensus(aux_data_slice(&record)));
+        assert!(!is_duplex_consensus(aux_data_slice(&build(true, false))), "aD only is not duplex");
+        assert!(!is_duplex_consensus(aux_data_slice(&build(false, true))), "bD only is not duplex");
+        assert!(is_duplex_consensus(aux_data_slice(&build(true, true))), "aD and bD is duplex");
     }
 
     #[test]
