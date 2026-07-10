@@ -337,6 +337,9 @@ impl Command for Filter {
             self.io.pipeline_reader_opts(),
         )?;
 
+        // Synthesize @HD VN:1.6 SO:unsorted when the input lacks one (match fgbio,
+        // which never passes a header-less BAM straight through).
+        let header = crate::commands::common::ensure_hd_record(header)?;
         // FILT3-02: fgbio's FilterConsensusReads calls Bams.requireQueryGrouped.
         // Filtering is template-based, so coordinate-sorted input silently scatters
         // mates and corrupts the both-primaries-pass logic. Reject it like fgbio.

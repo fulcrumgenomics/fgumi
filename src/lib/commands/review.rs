@@ -781,6 +781,9 @@ impl Review {
         let mut reader = IndexedRawBamReader::from_path(&self.consensus_bam, index)?;
         let header = reader.read_header()?;
 
+        // Synthesize @HD VN:1.6 SO:unsorted when the input lacks one (match fgbio).
+        let header = crate::commands::common::ensure_hd_record(header)?;
+
         // Add @PG record with PP chaining
         let header = crate::commands::common::add_pg_record(header, command_line)?;
 
@@ -894,6 +897,9 @@ impl Review {
         // the noodles decode/encode round-trip on every record.
         let mut bam_reader = bam::io::reader::Builder.build_from_path(&self.grouped_bam)?;
         let header = bam_reader.read_header()?;
+
+        // Synthesize @HD VN:1.6 SO:unsorted when the input lacks one (match fgbio).
+        let header = crate::commands::common::ensure_hd_record(header)?;
 
         // Add @PG record with PP chaining (must happen before we consume the reader below)
         let header = crate::commands::common::add_pg_record(header, command_line)?;

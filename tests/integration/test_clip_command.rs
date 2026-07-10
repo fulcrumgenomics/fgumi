@@ -22,8 +22,15 @@ use crate::helpers::bam_generator::{
     create_coordinate_sorted_header, create_minimal_header, create_test_reference, to_record_buf,
 };
 
-/// Create a BAM with paired reads using the given header.
-fn create_paired_bam_with_header(
+/// Create a BAM with paired reads using the shared minimal (query-grouped) header.
+fn create_paired_bam(path: &Path, pairs: Vec<(RawRecord, RawRecord)>) {
+    let header = create_minimal_header("chr1", 10000);
+    write_paired_bam_with_header(path, &header, pairs);
+}
+
+/// Write paired reads under a caller-supplied header (used to exercise
+/// header-less and coordinate-sorted input).
+fn write_paired_bam_with_header(
     path: &Path,
     header: &noodles::sam::Header,
     pairs: Vec<(RawRecord, RawRecord)>,
@@ -37,12 +44,6 @@ fn create_paired_bam_with_header(
         writer.write_alignment_record(header, &to_record_buf(&r2)).expect("Failed to write R2");
     }
     writer.try_finish().expect("Failed to finish BAM");
-}
-
-/// Create a BAM with paired reads and a query-grouped (template-coordinate) header.
-fn create_paired_bam(path: &Path, pairs: Vec<(RawRecord, RawRecord)>) {
-    let header = create_minimal_header("chr1", 10000);
-    create_paired_bam_with_header(path, &header, pairs);
 }
 
 /// CLIP3-05: clip must reject coordinate-sorted (non-query-grouped) input,
@@ -91,7 +92,7 @@ fn test_clip_rejects_coordinate_sorted_input(#[case] extra_args: &[&str]) {
         b.build()
     };
     let header = create_coordinate_sorted_header("chr1", 10000);
-    create_paired_bam_with_header(&input_bam, &header, vec![(r1, r2)]);
+    write_paired_bam_with_header(&input_bam, &header, vec![(r1, r2)]);
 
     let mut args = vec![
         "clip",
@@ -111,6 +112,23 @@ fn test_clip_rejects_coordinate_sorted_input(#[case] extra_args: &[&str]) {
         err.to_string().contains("queryname sorted or query grouped"),
         "unexpected error message: {err}"
     );
+}
+
+/// A header carrying only `@SQ` (no `@HD` line) -- mirrors header-less input.
+fn headerless_header(ref_name: &str, ref_len: usize) -> noodles::sam::Header {
+    use noodles::sam::header::record::value::Map;
+    use noodles::sam::header::record::value::map::ReferenceSequence;
+
+    let header = noodles::sam::Header::builder()
+        .add_reference_sequence(
+            ref_name,
+            Map::<ReferenceSequence>::new(
+                std::num::NonZero::new(ref_len).expect("non-zero reference length"),
+            ),
+        )
+        .build();
+    assert!(header.header().is_none(), "precondition: header must lack @HD");
+    header
 }
 
 /// Test basic clip command with fixed-end clipping.
@@ -180,6 +198,83 @@ fn test_clip_command_basic() {
     let _header = reader.read_header().unwrap();
     let count = reader.records().count();
     assert_eq!(count, 2, "Should have both reads in output");
+}
+
+/// CLIP3-05: clip must reject header-less input. A header-less BAM synthesizes
+/// `@HD VN:1.6 SO:unsorted` (via `ensure_hd_record`), which is neither queryname
+/// sorted nor query grouped, so `require_query_grouped` rejects it — matching
+/// fgbio's `Bams.requireQueryGrouped`. The `@HD` synthesis itself is still exercised
+/// end-to-end by `correct`/`review` (which have no query-grouped guard).
+///
+/// Exercised on both `Clip::execute` paths (the single-threaded fast path and the
+/// `--threads` pipeline): both run `ensure_hd_record` before `require_query_grouped`,
+/// so header-less input is rejected the same way regardless of execution mode.
+#[rstest]
+#[case::single_threaded(&[])]
+#[case::threaded(&["--threads", "2"])]
+fn test_clip_rejects_headerless_input(#[case] extra_args: &[&str]) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+
+    let r1 = {
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .mate_ref_id(0)
+            .mate_pos(103)
+            .template_length(12);
+        b.build()
+    };
+    let r2 = {
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+            .ref_id(0)
+            .pos(103)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .mate_ref_id(0)
+            .mate_pos(99)
+            .template_length(-12);
+        b.build()
+    };
+
+    let header = headerless_header("chr1", 10000);
+    write_paired_bam_with_header(&input_bam, &header, vec![(r1, r2)]);
+
+    let mut args = vec![
+        "clip",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--reference",
+        ref_path.to_str().unwrap(),
+        "--read-one-five-prime",
+        "1",
+        "--read-one-three-prime",
+        "1",
+        "--compression-level",
+        "1",
+    ];
+    args.extend_from_slice(extra_args);
+    let cmd = Clip::try_parse_from(args).expect("failed to parse clip args");
+
+    let err = cmd.execute("fgumi clip").expect_err("must reject header-less input");
+    assert!(
+        err.to_string().contains("queryname sorted or query grouped"),
+        "unexpected error message: {err}"
+    );
 }
 
 /// Test clip command with metrics output.

@@ -237,6 +237,11 @@ impl Command for Clip {
             // Read header for the 7-step pipeline (supports stdin)
             let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
 
+            // Synthesize @HD VN:1.6 SO:unsorted when the input lacks one (match fgbio).
+            // Run before require_query_grouped so both execution modes guard the same
+            // normalized header (matching execute_single_threaded's ordering).
+            let header = crate::commands::common::ensure_hd_record(header)?;
+
             // CLIP3-05: fgbio's ClipBam calls Bams.requireQueryGrouped. Clipping is
             // template-based (pair clip, overlap, past-mate, mate-fix), so coordinate-
             // sorted input silently mis-groups mates. Guard the *input* header.
@@ -283,6 +288,8 @@ impl Clip {
         let reader_threads = self.threading.num_threads();
         let (reader, header) = create_raw_bam_reader(&self.io.input, reader_threads)?;
 
+        // Synthesize @HD VN:1.6 SO:unsorted when the input lacks one (match fgbio).
+        let header = crate::commands::common::ensure_hd_record(header)?;
         // CLIP3-05: require query-grouped input (fgbio Bams.requireQueryGrouped).
         crate::commands::common::require_query_grouped(
             &header,

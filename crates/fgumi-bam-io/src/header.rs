@@ -143,6 +143,47 @@ pub fn add_pg_record(mut header: Header, version: &str, command_line: &str) -> R
     Ok(header)
 }
 
+/// Ensure the header carries an `@HD` line, synthesizing `@HD VN:1.6 SO:unsorted`
+/// when it is absent.
+///
+/// The SAM spec makes `@HD` optional, but fgbio (and essentially every tool)
+/// synthesizes `@HD VN:1.6 SO:unsorted` when reading input that lacks one, and
+/// downstream readers can choke on its absence. Commands that read an input
+/// header and pass it through (e.g. `correct`, `filter`) otherwise propagate a
+/// missing `@HD` — producing a BAM whose header starts at `@PG`, which diverges
+/// from fgbio. This normalizes that case.
+///
+/// An existing `@HD` (and its sort order) is left untouched.
+///
+/// # Arguments
+///
+/// * `header` - The header to normalize
+///
+/// # Returns
+///
+/// The header, guaranteed to carry an `@HD` line.
+///
+/// # Errors
+///
+/// Returns an error if the synthesized `@HD` map cannot be built.
+pub fn ensure_hd_record(mut header: Header) -> Result<Header> {
+    use noodles::sam::header::record::value::map::Header as HeaderMap;
+    use noodles::sam::header::record::value::map::header::{Version, tag as header_tag};
+
+    if header.header().is_none() {
+        // Set VN:1.6 explicitly (rather than relying on the map's default) so the
+        // synthesized `@HD VN:1.6 SO:unsorted` matches fgbio regardless of the
+        // noodles default version.
+        let hd = Map::<HeaderMap>::builder()
+            .set_version(Version::new(1, 6))
+            .insert(header_tag::SORT_ORDER, BString::from("unsorted"))
+            .build()?;
+        *header.header_mut() = Some(hd);
+    }
+
+    Ok(header)
+}
+
 /// Add a @PG record to a header builder (for commands creating new headers).
 ///
 /// Use this when building a header from scratch (no PP chaining needed).
@@ -403,5 +444,49 @@ mod tests {
         let output_path = dir.path().join("test.bam");
         let _writer = create_bam_writer(&output_path, &result, 1, 6)
             .expect("creating BAM writer should succeed");
+    }
+
+    #[test]
+    fn test_ensure_hd_record_synthesizes_when_absent() {
+        use noodles::sam::header::record::value::map::header::{Version, tag as header_tag};
+
+        // A header built without an explicit @HD (only @SQ etc.) reports None.
+        let header = Header::builder()
+            .add_reference_sequence(
+                "chr1",
+                Map::<noodles::sam::header::record::value::map::ReferenceSequence>::new(
+                    std::num::NonZero::new(1000).expect("non-zero reference length"),
+                ),
+            )
+            .build();
+        assert!(header.header().is_none(), "precondition: no @HD");
+
+        let header = ensure_hd_record(header).expect("ensure_hd_record should succeed");
+        let hd = header.header().expect("@HD must now be present");
+        assert_eq!(hd.version(), Version::new(1, 6), "@HD VN must be 1.6");
+        assert_eq!(
+            hd.other_fields().get(&header_tag::SORT_ORDER).map(|v| v.to_vec()),
+            Some(b"unsorted".to_vec()),
+            "@HD SO must be 'unsorted' to match fgbio"
+        );
+    }
+
+    #[test]
+    fn test_ensure_hd_record_preserves_existing() {
+        use noodles::sam::header::record::value::map::Header as HeaderMap;
+        use noodles::sam::header::record::value::map::header::{Version, tag as header_tag};
+
+        // Existing @HD with a NON-default version and SO:coordinate must be left
+        // entirely untouched (not just the SO tag).
+        let existing = Map::<HeaderMap>::builder()
+            .set_version(Version::new(1, 5))
+            .insert(header_tag::SORT_ORDER, BString::from("coordinate"))
+            .build()
+            .expect("building @HD map should succeed");
+        let header = Header::builder().set_header(existing.clone()).build();
+
+        let header = ensure_hd_record(header).expect("ensure_hd_record should succeed");
+        let hd = header.header().expect("@HD present");
+        assert_eq!(*hd, existing, "an existing @HD (version + all fields) must be left untouched");
     }
 }

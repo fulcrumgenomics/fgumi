@@ -96,6 +96,33 @@ pub(crate) fn write_filter_consensus_bam(path: &Path) {
     create_consensus_bam(path, filter_consensus_records());
 }
 
+/// Write the same passing consensus reads, but with a header carrying only `@SQ`
+/// (no `@HD` line) -- mirrors the header-less inputs `filter` must normalize.
+fn write_headerless_consensus_bam(path: &Path) {
+    use noodles::sam::header::record::value::Map;
+    use noodles::sam::header::record::value::map::ReferenceSequence;
+
+    let header = noodles::sam::Header::builder()
+        .add_reference_sequence(
+            "chr1",
+            Map::<ReferenceSequence>::new(
+                std::num::NonZero::new(10000).expect("non-zero reference length"),
+            ),
+        )
+        .build();
+    assert!(header.header().is_none(), "precondition: input must lack @HD");
+
+    let mut writer =
+        bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
+    writer.write_header(&header).expect("Failed to write header");
+    for record in filter_consensus_records() {
+        writer
+            .write_alignment_record(&header, &to_record_buf(&record, &header))
+            .expect("Failed to write record");
+    }
+    writer.try_finish().expect("Failed to finish BAM");
+}
+
 /// Test basic filter command with passing reads.
 #[test]
 fn test_filter_command_basic() {
@@ -165,6 +192,42 @@ fn test_filter_rejects_coordinate_sorted_input() {
     .expect("failed to parse filter args");
 
     let err = cmd.execute("fgumi filter").expect_err("must reject coordinate-sorted input");
+    let msg = err.to_string();
+    assert!(msg.contains("queryname sorted or query grouped"), "unexpected error message: {msg}");
+}
+
+/// FILT3-02: filter must reject header-less input. A header-less BAM synthesizes
+/// `@HD VN:1.6 SO:unsorted` (via `ensure_hd_record`), which is neither queryname
+/// sorted nor query grouped, so `require_query_grouped` rejects it — matching
+/// fgbio's `Bams.requireQueryGrouped`. The `@HD` synthesis itself is still exercised
+/// end-to-end by `correct`/`review` (which have no query-grouped guard).
+#[test]
+fn test_filter_rejects_headerless_input() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+
+    write_headerless_consensus_bam(&input_bam);
+
+    let cmd = Filter::try_parse_from([
+        "filter",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--max-no-call-fraction",
+        "1.0",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse filter args");
+
+    let err = cmd.execute("fgumi filter").expect_err("must reject header-less input");
     let msg = err.to_string();
     assert!(msg.contains("queryname sorted or query grouped"), "unexpected error message: {msg}");
 }
