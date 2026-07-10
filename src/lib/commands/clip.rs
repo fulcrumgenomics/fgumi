@@ -338,9 +338,9 @@ impl Clip {
                     total_clipped_mate_extension += 1;
                 }
 
-                // Update mate info (MC and MQ tags) using raw tag API
-                update_mate_info_raw(r1, r2);
-                update_mate_info_raw(r2, r1);
+                // Fix full mate-pair info (mate coords/strand, mate-unmapped flag, MQ/MC,
+                // TLEN), matching fgbio ClipBam's SamPairUtil.setMateInfo call.
+                set_mate_info_raw(r1, r2);
             }
 
             // Regenerate alignment tags (always done to match Scala fgbio behavior)
@@ -754,9 +754,9 @@ impl Clip {
                         }
                     }
 
-                    // Update mate info (MC and MQ tags) using raw tag API
-                    update_mate_info_raw(r1, r2);
-                    update_mate_info_raw(r2, r1);
+                    // Fix full mate-pair info (mate coords/strand, mate-unmapped flag,
+                    // MQ/MC, TLEN), matching fgbio ClipBam's SamPairUtil.setMateInfo call.
+                    set_mate_info_raw(r1, r2);
                 }
 
                 // Regenerate alignment tags (always done to match fgbio behavior)
@@ -841,29 +841,147 @@ impl Clip {
     }
 }
 
-/// Updates mate information tags (MC and MQ) for a read based on its mate.
-///
-/// After clipping operations, mate information tags need to be updated to reflect
-/// the new state of the mate read. This function updates:
-/// - MC tag: Mate CIGAR string
-/// - MQ tag: Mate mapping quality
-///
-/// These tags are standard SAM optional tags that store information about the mate
-/// to enable single-ended processing.
-///
-/// # Arguments
-///
-/// * `record` - The record to update (mutable)
-/// * `mate` - The mate record to read information from
-fn update_mate_info_raw(record: &mut RawRecord, mate: &RawRecord) {
-    // Update MC tag: build CIGAR string from raw bytes
-    let cigar_str = mate.cigar_to_string();
-    let mut editor = record.tags_editor();
-    editor.update_string(SamTag::MC, cigar_str.as_bytes());
+/// Snapshot of the mate-relevant fields of a read, taken before any mutation.
+struct MateSnap {
+    ref_id: i32,
+    pos: i32,
+    neg: bool,
+    unmapped: bool,
+    mapq: u8,
+    cigar: String,
+    aln_start: Option<usize>,
+    aln_end: Option<usize>,
+}
 
-    // Update MQ tag: mate mapping quality
-    let mapq = mate.mapq();
-    editor.update_int(SamTag::MQ, i32::from(mapq));
+impl MateSnap {
+    fn of(rec: &RawRecord) -> Self {
+        use fgumi_raw_bam::flags as rflags;
+        Self {
+            ref_id: rec.ref_id(),
+            pos: rec.pos(),
+            neg: rec.flags() & rflags::REVERSE != 0,
+            unmapped: rec.flags() & rflags::UNMAPPED != 0,
+            mapq: rec.mapq(),
+            cigar: rec.cigar_to_string(),
+            aln_start: rec.alignment_start_1based(),
+            aln_end: rec.alignment_end_1based(),
+        }
+    }
+}
+
+/// Sets or clears the `MATE_REVERSE` and `MATE_UNMAPPED` flags on a record.
+fn set_mate_flags_raw(rec: &mut RawRecord, mate_neg: bool, mate_unmapped: bool) {
+    use fgumi_raw_bam::flags as rflags;
+    let mut f = rec.flags();
+    if mate_neg {
+        f |= rflags::MATE_REVERSE;
+    } else {
+        f &= !rflags::MATE_REVERSE;
+    }
+    if mate_unmapped {
+        f |= rflags::MATE_UNMAPPED;
+    } else {
+        f &= !rflags::MATE_UNMAPPED;
+    }
+    rec.set_flags(f);
+}
+
+/// Writes the MQ (mate mapping quality) and MC (mate CIGAR) tags for a read.
+fn set_mate_mq_mc_raw(rec: &mut RawRecord, mate_mapq: u8, mate_cigar: &str) {
+    let mut editor = rec.tags_editor();
+    editor.update_int(SamTag::MQ, i32::from(mate_mapq));
+    editor.update_string(SamTag::MC, mate_cigar.as_bytes());
+}
+
+/// Removes the MQ and MC tags from a read (used when the mate is unmapped).
+fn clear_mate_mq_mc_raw(rec: &mut RawRecord) {
+    let mut editor = rec.tags_editor();
+    editor.remove(SamTag::MQ);
+    editor.remove(SamTag::MC);
+}
+
+/// Computes the TLEN (inferred insert size) for the first read of a pair, mirroring
+/// htsjdk `SamPairUtil.computeInsertSize`. Returns 0 unless both reads are mapped to
+/// the same reference; the second read's TLEN is the negation of this value.
+fn compute_insert_size_raw(s1: &MateSnap, s2: &MateSnap) -> i32 {
+    if s1.unmapped || s2.unmapped || s1.ref_id != s2.ref_id {
+        return 0;
+    }
+    let five_prime = |s: &MateSnap| if s.neg { s.aln_end } else { s.aln_start };
+    let (Some(p1), Some(p2)) = (five_prime(s1), five_prime(s2)) else {
+        return 0;
+    };
+    let (p1, p2) = (p1 as i64, p2 as i64);
+    let adjustment = if p2 >= p1 { 1 } else { -1 };
+    i32::try_from(p2 - p1 + adjustment).unwrap_or(0)
+}
+
+/// Sets full mate-pair information on a read pair, mirroring htsjdk
+/// `SamPairUtil.setMateInfo(rec1, rec2, setMateCigar=true)`.
+///
+/// fgbio `ClipBam` calls `SamPairUtil.setMateInfo` on every pair after clipping so that
+/// mate reference/position/strand, the mate-unmapped flag, the MQ/MC tags, and TLEN all
+/// reflect the post-clip state — including reads that clipping unmapped (see CLIP-01). The
+/// three branches (both mapped, both unmapped, one of each) match htsjdk exactly; an
+/// unmapped read is relocated to its mapped mate's coordinate.
+fn set_mate_info_raw(r1: &mut RawRecord, r2: &mut RawRecord) {
+    // Snapshot both reads up front so mutating one never reads stale/updated fields of the other.
+    let s1 = MateSnap::of(r1);
+    let s2 = MateSnap::of(r2);
+
+    if !s1.unmapped && !s2.unmapped {
+        // Both mapped: copy each read's coordinates into the other's mate fields.
+        r1.set_mate_ref_id(s2.ref_id);
+        r1.set_mate_pos(s2.pos);
+        set_mate_flags_raw(r1, s2.neg, false);
+        set_mate_mq_mc_raw(r1, s2.mapq, &s2.cigar);
+
+        r2.set_mate_ref_id(s1.ref_id);
+        r2.set_mate_pos(s1.pos);
+        set_mate_flags_raw(r2, s1.neg, false);
+        set_mate_mq_mc_raw(r2, s1.mapq, &s1.cigar);
+
+        let insert_size = compute_insert_size_raw(&s1, &s2);
+        r1.set_template_length(insert_size);
+        r2.set_template_length(-insert_size);
+    } else if s1.unmapped && s2.unmapped {
+        // Both unmapped: clear coordinates and mate coordinates, flag each mate unmapped.
+        for (rec, mate_neg) in [(&mut *r1, s2.neg), (&mut *r2, s1.neg)] {
+            rec.set_ref_id(-1);
+            rec.set_pos(-1);
+            rec.set_mate_ref_id(-1);
+            rec.set_mate_pos(-1);
+            set_mate_flags_raw(rec, mate_neg, true);
+            clear_mate_mq_mc_raw(rec);
+            rec.set_template_length(0);
+        }
+    } else {
+        // Exactly one is unmapped: relocate it to the mapped mate's coordinate.
+        let (mapped, unmapped, mapped_snap, unmapped_snap) = if s1.unmapped {
+            (&mut *r2, &mut *r1, &s2, &s1)
+        } else {
+            (&mut *r1, &mut *r2, &s1, &s2)
+        };
+
+        // The unmapped read is placed at the mapped read's coordinate.
+        unmapped.set_ref_id(mapped_snap.ref_id);
+        unmapped.set_pos(mapped_snap.pos);
+        unmapped.set_mate_ref_id(mapped_snap.ref_id);
+        unmapped.set_mate_pos(mapped_snap.pos);
+        set_mate_flags_raw(unmapped, mapped_snap.neg, false);
+        set_mate_mq_mc_raw(unmapped, mapped_snap.mapq, &mapped_snap.cigar);
+        unmapped.set_template_length(0);
+
+        // The mapped read points its mate fields at the (now co-located) unmapped read.
+        // Its mate-reverse flag reflects the unmapped read's *actual* strand (htsjdk
+        // `SamPairUtil.java:267`): the clipper's own unmap clears REVERSE, but a read that
+        // arrived unmapped-on-input may still carry it, and this runs on every pair.
+        mapped.set_mate_ref_id(mapped_snap.ref_id);
+        mapped.set_mate_pos(mapped_snap.pos);
+        set_mate_flags_raw(mapped, unmapped_snap.neg, true);
+        clear_mate_mq_mc_raw(mapped);
+        mapped.set_template_length(0);
+    }
 }
 
 /// Returns the number of clipped bases (soft + hard) in a raw record's CIGAR.
@@ -2593,5 +2711,156 @@ mod tests {
         assert_eq!(metrics.read_one.reads, 1);
         assert_eq!(metrics.read_one.bases_clipped_five_prime, 2);
         assert_eq!(metrics.read_one.bases_clipped_three_prime, 1);
+    }
+
+    /// `set_mate_info_raw` mirrors htsjdk `SamPairUtil.setMateInfo` across all three
+    /// branches (both mapped, one unmapped, both unmapped) so `fgumi clip` matches fgbio
+    /// `ClipBam` when clipping unmaps a read (CLIP-01).
+    #[test]
+    fn test_set_mate_info_raw_all_branches() {
+        use fgumi_raw_bam::flags as raw_flags;
+
+        let has_flag = |rec: &RawRecord, f: u16| rec.flags() & f != 0;
+        let has_tag = |rec: &RawRecord, tag: [u8; 2]| {
+            fgumi_raw_bam::find_tag_type(fgumi_raw_bam::aux_data_slice(rec.as_ref()), tag).is_some()
+        };
+        // Forward, mapped read: 20M at 0-based pos 99 (alignment start 100).
+        let mapped_fwd = || {
+            fgumi_raw_bam::SamBuilder::new()
+                .read_name(b"t")
+                .sequence(b"ACGTACGTACGTACGTACGT")
+                .qualities(&[30; 20])
+                .cigar_ops(&[20u32 << 4])
+                .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT)
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .build()
+        };
+        // Reverse, mapped read: 20M at 0-based pos 199 (alignment start 200).
+        let mapped_rev = || {
+            fgumi_raw_bam::SamBuilder::new()
+                .read_name(b"t")
+                .sequence(b"ACGTACGTACGTACGTACGT")
+                .qualities(&[30; 20])
+                .cigar_ops(&[20u32 << 4])
+                .flags(raw_flags::PAIRED | raw_flags::LAST_SEGMENT | raw_flags::REVERSE)
+                .ref_id(0)
+                .pos(199)
+                .mapq(40)
+                .build()
+        };
+        // Unmapped read as produced by makeReadUnmapped: no ref/pos, no strand, no CIGAR.
+        let unmapped = |last: bool| {
+            let seg = if last { raw_flags::LAST_SEGMENT } else { raw_flags::FIRST_SEGMENT };
+            fgumi_raw_bam::SamBuilder::new()
+                .read_name(b"t")
+                .sequence(b"ACGTACGTACGTACGTACGT")
+                .qualities(&[30; 20])
+                .cigar_ops(&[])
+                .flags(raw_flags::PAIRED | seg | raw_flags::UNMAPPED)
+                .ref_id(-1)
+                .pos(-1)
+                .mapq(0)
+                .build()
+        };
+
+        // --- Branch 1: both mapped ---
+        let (mut r1, mut r2) = (mapped_fwd(), mapped_rev());
+        set_mate_info_raw(&mut r1, &mut r2);
+        assert_eq!((r1.mate_ref_id(), r1.mate_pos()), (0, 199), "r1 mate coords <- r2");
+        assert!(has_flag(&r1, raw_flags::MATE_REVERSE), "r1 mate-reverse (r2 is reverse)");
+        assert!(!has_flag(&r1, raw_flags::MATE_UNMAPPED), "r1 mate mapped");
+        assert_eq!((r2.mate_ref_id(), r2.mate_pos()), (0, 99), "r2 mate coords <- r1");
+        assert!(!has_flag(&r2, raw_flags::MATE_REVERSE), "r2 mate not reverse (r1 forward)");
+        // TLEN: fwd 5' = 100, rev 5' = alignmentEnd 219 -> 219 - 100 + 1 = 120.
+        assert_eq!(r1.template_length(), 120, "r1 TLEN");
+        assert_eq!(r2.template_length(), -120, "r2 TLEN");
+        assert!(has_tag(&r1, *SamTag::MQ) && has_tag(&r1, *SamTag::MC), "r1 MQ/MC set");
+        assert!(has_tag(&r2, *SamTag::MQ) && has_tag(&r2, *SamTag::MC), "r2 MQ/MC set");
+
+        // --- Branch 2: one mapped (r1), one unmapped (r2) ---
+        let (mut r1, mut r2) = (mapped_fwd(), unmapped(true));
+        set_mate_info_raw(&mut r1, &mut r2);
+        // Unmapped r2 is relocated to r1's coordinate.
+        assert_eq!((r2.ref_id(), r2.pos()), (0, 99), "unmapped r2 placed at mate coord");
+        assert_eq!((r2.mate_ref_id(), r2.mate_pos()), (0, 99), "r2 mate coords <- r1");
+        assert!(!has_flag(&r2, raw_flags::MATE_UNMAPPED), "r2's mate (r1) is mapped");
+        assert!(
+            has_tag(&r2, *SamTag::MQ) && has_tag(&r2, *SamTag::MC),
+            "r2 MQ/MC from mapped mate"
+        );
+        // Mapped r1 points at the co-located unmapped mate.
+        assert_eq!((r1.mate_ref_id(), r1.mate_pos()), (0, 99), "r1 mate coords <- unmapped r2");
+        assert!(has_flag(&r1, raw_flags::MATE_UNMAPPED), "r1 mate unmapped");
+        assert!(!has_flag(&r1, raw_flags::MATE_REVERSE), "r1 mate-reverse cleared (unmapped)");
+        assert!(!has_tag(&r1, *SamTag::MQ) && !has_tag(&r1, *SamTag::MC), "r1 MQ/MC removed");
+        assert_eq!(
+            (r1.template_length(), r2.template_length()),
+            (0, 0),
+            "TLEN 0 when a mate unmapped"
+        );
+
+        // --- Branch 3: both unmapped ---
+        let (mut r1, mut r2) = (unmapped(false), unmapped(true));
+        set_mate_info_raw(&mut r1, &mut r2);
+        for rec in [&r1, &r2] {
+            assert_eq!((rec.ref_id(), rec.pos()), (-1, -1), "unmapped coords cleared");
+            assert_eq!(
+                (rec.mate_ref_id(), rec.mate_pos()),
+                (-1, -1),
+                "unmapped mate coords cleared"
+            );
+            assert!(has_flag(rec, raw_flags::MATE_UNMAPPED), "mate-unmapped set");
+            assert!(!has_flag(rec, raw_flags::MATE_REVERSE), "mate-reverse cleared");
+            assert!(!has_tag(rec, *SamTag::MQ) && !has_tag(rec, *SamTag::MC), "MQ/MC removed");
+            assert_eq!(rec.template_length(), 0, "TLEN 0");
+        }
+    }
+
+    /// htsjdk's one-mapped branch sets the mapped read's mate-reverse flag from the
+    /// unmapped read's *actual current* strand (`SamPairUtil.java:267`), not an assumed
+    /// `false`. This only diverges for a read that was already unmapped on input while
+    /// still carrying the REVERSE flag — the clipper's own unmap clears it, but
+    /// `set_mate_info_raw` runs on every pair, so such a read reaches this branch.
+    #[test]
+    fn test_set_mate_info_raw_one_mapped_uses_unmapped_reads_strand() {
+        use fgumi_raw_bam::flags as raw_flags;
+        let has_flag = |rec: &RawRecord, f: u16| rec.flags() & f != 0;
+
+        // Mapped forward r1.
+        let mut r1 = fgumi_raw_bam::SamBuilder::new()
+            .read_name(b"t")
+            .sequence(b"ACGTACGTACGTACGTACGT")
+            .qualities(&[30; 20])
+            .cigar_ops(&[20u32 << 4])
+            .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT)
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .build();
+        // Unmapped r2 that still carries the REVERSE flag (already unmapped on input).
+        let mut r2 = fgumi_raw_bam::SamBuilder::new()
+            .read_name(b"t")
+            .sequence(b"ACGTACGTACGTACGTACGT")
+            .qualities(&[30; 20])
+            .cigar_ops(&[])
+            .flags(
+                raw_flags::PAIRED
+                    | raw_flags::LAST_SEGMENT
+                    | raw_flags::UNMAPPED
+                    | raw_flags::REVERSE,
+            )
+            .ref_id(-1)
+            .pos(-1)
+            .mapq(0)
+            .build();
+
+        set_mate_info_raw(&mut r1, &mut r2);
+
+        assert!(
+            has_flag(&r1, raw_flags::MATE_REVERSE),
+            "mapped r1 mate-reverse must reflect unmapped r2's actual REVERSE flag"
+        );
     }
 }

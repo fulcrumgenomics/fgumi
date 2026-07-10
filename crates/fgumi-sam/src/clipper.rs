@@ -45,6 +45,45 @@ macro_rules! slice_array {
     };
 }
 
+/// Base-oriented aux tags that are reverse-complemented (with `SEQ`) when a read is
+/// reverse-complemented, mirroring htsjdk `SAMRecord.TAGS_TO_REVERSE_COMPLEMENT`.
+const TAGS_TO_REVERSE_COMPLEMENT: [fgumi_raw_bam::SamTag; 2] =
+    [fgumi_raw_bam::SamTag::E2, fgumi_raw_bam::SamTag::SQ];
+
+/// Quality-oriented aux tags that are reversed (with `QUAL`) when a read is
+/// reverse-complemented, mirroring htsjdk `SAMRecord.TAGS_TO_REVERSE`.
+const TAGS_TO_REVERSE: [fgumi_raw_bam::SamTag; 2] =
+    [fgumi_raw_bam::SamTag::OQ, fgumi_raw_bam::SamTag::U2];
+
+/// Reorients the strand-sensitive aux tags of a `RecordBuf` the way htsjdk
+/// `SAMRecord.reverseComplement` does when unmapping a reverse-strand read:
+/// reverse-complement the base-oriented tags ([`TAGS_TO_REVERSE_COMPLEMENT`]) and
+/// reverse the quality-oriented tags ([`TAGS_TO_REVERSE`]).
+///
+/// Only the `Z`-string encoding is handled — the sole form these tags take in practice.
+/// htsjdk additionally reverses array-encoded (`B:...`) values, but none of these tags
+/// is emitted as an array by real tooling, and skipping them keeps this in lockstep with
+/// the raw path (`RawTagsMut::reverse_string` / `reverse_complement_string`).
+fn reorient_strand_tags(record: &mut RecordBuf) {
+    for tag in TAGS_TO_REVERSE_COMPLEMENT {
+        if let Some(Value::String(s)) = record.data_mut().get_mut(&tag.to_noodles_tag()) {
+            let mut bytes = s.to_vec();
+            bytes.reverse();
+            for b in &mut bytes {
+                *b = fgumi_dna::complement_base(*b);
+            }
+            *s = bytes.into();
+        }
+    }
+    for tag in TAGS_TO_REVERSE {
+        if let Some(Value::String(s)) = record.data_mut().get_mut(&tag.to_noodles_tag()) {
+            let mut bytes = s.to_vec();
+            bytes.reverse();
+            *s = bytes.into();
+        }
+    }
+}
+
 /// Modes of clipping that can be applied to reads
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ClippingMode {
@@ -155,6 +194,69 @@ impl SamRecordClipper {
         }
     }
 
+    /// Number of bases available to be clipped from the alignment.
+    ///
+    /// The sum of the alignment (`M`/`=`/`X`) and insertion (`I`) CIGAR op lengths,
+    /// i.e. the read bases that are aligned. Mirrors fgbio `numberOfClippableBases`.
+    fn number_of_clippable_bases(record: &RecordBuf) -> usize {
+        record
+            .cigar()
+            .iter()
+            .filter_map(Result::ok)
+            .filter(|op| {
+                matches!(
+                    op.kind(),
+                    Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Insertion
+                )
+            })
+            .map(CigarOp::len)
+            .sum()
+    }
+
+    /// Unmaps a read the way htsjdk `SAMUtils.makeReadUnmapped` does.
+    ///
+    /// Clears the reference, position, mapping quality, CIGAR, and template length, and
+    /// clears the duplicate, secondary, supplementary, and proper-pair flags while setting
+    /// the unmapped flag. For reverse-strand reads the (reference-forward) bases are
+    /// reverse-complemented, the qualities reversed, and the strand-sensitive aux tags
+    /// reoriented (see [`reorient_strand_tags`]) — returning them to original read
+    /// orientation — before the reverse-strand flag is cleared. Bases and qualities are
+    /// otherwise preserved (they are *not* dropped).
+    fn make_read_unmapped(record: &mut RecordBuf) {
+        use noodles::sam::alignment::record::Flags;
+
+        if record.flags().is_reverse_complemented() {
+            let rc = fgumi_dna::reverse_complement(record.sequence().as_ref());
+            let mut quals: Vec<u8> = record.quality_scores().as_ref().to_vec();
+            quals.reverse();
+            *record.sequence_mut() = Sequence::from(rc);
+            *record.quality_scores_mut() = QualityScores::from(quals);
+            reorient_strand_tags(record);
+        }
+
+        let flags = record.flags_mut();
+        flags.remove(
+            Flags::REVERSE_COMPLEMENTED
+                | Flags::DUPLICATE
+                | Flags::SECONDARY
+                | Flags::SUPPLEMENTARY
+                | Flags::PROPERLY_SEGMENTED,
+        );
+        flags.insert(Flags::UNMAPPED);
+
+        *record.reference_sequence_id_mut() = None;
+        *record.alignment_start_mut() = None;
+        // htsjdk makeReadUnmapped sets NO_MAPPING_QUALITY (0), not the "unavailable"
+        // sentinel: a typed `None` here would serialize to BAM MAPQ 255, diverging from
+        // both htsjdk and the raw path (`make_read_unmapped_raw` sets 0).
+        *record.mapping_quality_mut() = Some(
+            noodles::sam::alignment::record::MappingQuality::try_from(0u8)
+                .expect("0 is a valid mapping quality"),
+        );
+        *record.template_length_mut() = 0;
+        *record.cigar_mut() = CigarBuf::default();
+    }
+
     /// Clips a specified number of bases from the start (left side) of the alignment
     ///
     /// Returns the number of bases actually clipped
@@ -181,6 +283,14 @@ impl SamRecordClipper {
         let sequence_len = record.sequence();
         if sequence_len.is_empty() {
             return 0;
+        }
+
+        // If the read has no more clippable (aligned/inserted) bases than requested, it
+        // cannot retain an alignment; unmap it (fgbio SamRecordClipper.scala:111-114).
+        let num_clippable = Self::number_of_clippable_bases(record);
+        if num_clippable <= bases_to_clip {
+            Self::make_read_unmapped(record);
+            return num_clippable;
         }
 
         // Collect existing CIGAR ops
@@ -357,6 +467,14 @@ impl SamRecordClipper {
         let sequence_len = record.sequence();
         if sequence_len.is_empty() {
             return 0;
+        }
+
+        // If the read has no more clippable (aligned/inserted) bases than requested, it
+        // cannot retain an alignment; unmap it (fgbio SamRecordClipper.scala:157-160).
+        let num_clippable = Self::number_of_clippable_bases(record);
+        if num_clippable <= bases_to_clip {
+            Self::make_read_unmapped(record);
+            return num_clippable;
         }
 
         // Collect existing CIGAR ops
@@ -1392,6 +1510,60 @@ impl RawRecordClipper {
         }
     }
 
+    /// Number of bases available to be clipped from the alignment.
+    ///
+    /// The sum of the alignment (`M`/`=`/`X`) and insertion (`I`) CIGAR op lengths.
+    /// Raw-byte equivalent of [`SamRecordClipper::number_of_clippable_bases`].
+    fn number_of_clippable_bases_raw(ops: &[u32]) -> usize {
+        ops.iter()
+            .filter(|&&op| matches!(op & 0xF, 0 | 1 | 7 | 8)) // M, I, =, X
+            .map(|&op| (op >> 4) as usize)
+            .sum()
+    }
+
+    /// Unmaps a read the way htsjdk `SAMUtils.makeReadUnmapped` does.
+    ///
+    /// Raw-byte equivalent of [`SamRecordClipper::make_read_unmapped`]: clears the
+    /// reference, position, mapping quality, CIGAR, and template length, clears the
+    /// duplicate/secondary/supplementary/proper-pair flags, and sets the unmapped flag.
+    /// Reverse-strand reads have their bases reverse-complemented, qualities reversed, and
+    /// strand-sensitive aux tags reoriented (see [`reorient_strand_tags`]) before the
+    /// reverse flag is cleared. Bases and qualities are otherwise preserved.
+    fn make_read_unmapped_raw(record: &mut fgumi_raw_bam::RawRecord) {
+        use fgumi_raw_bam::flags as rflags;
+
+        let flags = record.flags();
+        if flags & rflags::REVERSE != 0 {
+            let rc = fgumi_dna::reverse_complement(&record.sequence_vec());
+            let mut quals = record.quality_scores().to_vec();
+            quals.reverse();
+            record.set_sequence_and_qualities(&rc, &quals);
+            // Reorient the strand-sensitive aux tags alongside SEQ/QUAL, matching htsjdk
+            // `SAMRecord.reverseComplement` (see `reorient_strand_tags` for the Z-only note).
+            let mut tags = record.tags_mut();
+            for tag in TAGS_TO_REVERSE_COMPLEMENT {
+                tags.reverse_complement_string(tag);
+            }
+            for tag in TAGS_TO_REVERSE {
+                tags.reverse_string(tag);
+            }
+        }
+
+        let new_flags = (flags
+            & !(rflags::REVERSE
+                | rflags::DUPLICATE
+                | rflags::SECONDARY
+                | rflags::SUPPLEMENTARY
+                | rflags::PROPER_PAIR))
+            | rflags::UNMAPPED;
+        record.set_flags(new_flags);
+        record.set_ref_id(-1);
+        record.set_pos(-1);
+        record.set_mapq(0);
+        record.set_template_length(0);
+        record.set_cigar_ops(&[]);
+    }
+
     /// Clips a specified number of bases from the start (left side) of the alignment.
     ///
     /// Returns the number of bases actually clipped.
@@ -1429,6 +1601,14 @@ impl RawRecordClipper {
         }
 
         let old_ops: Vec<u32> = record.cigar_ops_vec();
+
+        // If the read has no more clippable (aligned/inserted) bases than requested, it
+        // cannot retain an alignment; unmap it (fgbio SamRecordClipper.scala:111-114).
+        let num_clippable = Self::number_of_clippable_bases_raw(&old_ops);
+        if num_clippable <= bases_to_clip {
+            Self::make_read_unmapped_raw(record);
+            return num_clippable;
+        }
 
         // Extract existing hard and soft clips from the start
         let existing_hard_clip: usize = old_ops
@@ -1568,6 +1748,10 @@ impl RawRecordClipper {
         clippy::cast_possible_truncation,
         reason = "CIGAR lengths are bounded by BAM read length which fits in u32"
     )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "mirrors clip_start_of_alignment with symmetric end-clipping logic"
+    )]
     pub fn clip_end_of_alignment(
         &self,
         record: &mut fgumi_raw_bam::RawRecord,
@@ -1586,6 +1770,14 @@ impl RawRecordClipper {
         }
 
         let old_ops: Vec<u32> = record.cigar_ops_vec();
+
+        // If the read has no more clippable (aligned/inserted) bases than requested, it
+        // cannot retain an alignment; unmap it (fgbio SamRecordClipper.scala:157-160).
+        let num_clippable = Self::number_of_clippable_bases_raw(&old_ops);
+        if num_clippable <= bases_to_clip {
+            Self::make_read_unmapped_raw(record);
+            return num_clippable;
+        }
 
         // Extract existing hard and soft clips from the end (reverse order)
         let existing_hard_clip: usize = old_ops
@@ -2725,17 +2917,20 @@ mod tests {
         let seq = "ACGTACGTACGTACGTACGT"; // 20 bases
         let mut record = create_test_record("10S10M", seq, 10);
 
+        // Only 10 clippable (aligned) bases; requesting 10 consumes the whole alignment,
+        // so fgbio unmaps the read (SamRecordClipper.scala:111-114) rather than masking.
         let clipped = clipper.clip_start_of_alignment(&mut record, 10);
         assert_eq!(clipped, 10);
 
-        let cigar_str = format_cigar(&record.cigar());
-        assert_eq!(cigar_str, "20S"); // All bases now soft-clipped (0M operations are removed)
+        assert!(record.flags().is_unmapped(), "read should be unmapped");
+        assert_eq!(record.cigar().iter().count(), 0, "CIGAR should be empty");
 
-        // Check all 20 bases are masked to N
-        let bases = record.sequence();
-        for i in 0..20 {
-            assert_eq!(bases.as_ref()[i], b'N');
-        }
+        // Bases are preserved (NOT masked) on unmap — makeReadUnmapped keeps seq/qual.
+        assert_eq!(
+            record.sequence().as_ref(),
+            seq.as_bytes(),
+            "bases should be preserved, not masked"
+        );
     }
 
     #[test]
@@ -4700,11 +4895,13 @@ mod tests {
         let clipper = SamRecordClipper::new(ClippingMode::Soft);
         let mut record = create_test_record("10M", &"A".repeat(10), 1000);
 
+        // Clipping all 10 aligned bases leaves no alignment, so fgbio unmaps the read
+        // (SamRecordClipper.scala:157-160) instead of emitting an all-soft-clip CIGAR.
         let clipped = clipper.clip_end_of_alignment(&mut record, 10);
         assert_eq!(clipped, 10);
 
-        let cigar = format_cigar(&record.cigar());
-        assert_eq!(cigar, "10S");
+        assert!(record.flags().is_unmapped(), "read should be unmapped");
+        assert_eq!(record.cigar().iter().count(), 0, "CIGAR should be empty");
     }
 
     #[test]
@@ -5285,6 +5482,7 @@ mod crosscheck_tests {
     use noodles::sam::alignment::RecordBuf;
     use noodles::sam::alignment::record::Sequence as SequenceTrait;
     use noodles::sam::alignment::record::cigar::op::Kind;
+    use rstest::rstest;
 
     /// Build a SAM header with a single reference sequence of length 100 000.
     fn test_header() -> noodles::sam::Header {
@@ -5757,6 +5955,274 @@ mod crosscheck_tests {
 
             assert_eq!(buf_c, raw_c, "3' positive mode={mode:?}");
             assert_raw_matches_buf(&raw, &buf, &format!("clip_3prime pos mode={mode:?}"));
+        }
+    }
+
+    // =========================================================================
+    // Unmap-when-fully-clipped cross-checks (CLIP-01)
+    //
+    // fgbio `SamRecordClipper.clip{Start,End}OfAlignment` unmaps the read (via
+    // htsjdk `SAMUtils.makeReadUnmapped`) when the requested clip is >= the number
+    // of clippable (alignment + insertion) bases, keeping bases/quals intact.
+    // Refs: SamRecordClipper.scala:106-128,152-173; SamRecordClipperTest.scala:168,311.
+    // =========================================================================
+
+    /// Assert both clippers put the record into the fgbio `makeReadUnmapped` state
+    /// and that the raw and typed records agree on sequence and qualities.
+    fn assert_both_unmapped(raw: &RawRecord, buf: &RecordBuf, context: &str) {
+        use fgumi_raw_bam::flags as rflags;
+
+        // --- RecordBuf (typed) ---
+        assert!(buf.flags().is_unmapped(), "{context}: buf not unmapped");
+        assert!(!buf.flags().is_reverse_complemented(), "{context}: buf reverse not cleared");
+        assert!(!buf.flags().is_duplicate(), "{context}: buf duplicate not cleared");
+        assert!(!buf.flags().is_secondary(), "{context}: buf secondary not cleared");
+        assert!(!buf.flags().is_supplementary(), "{context}: buf supplementary not cleared");
+        assert!(!buf.flags().is_properly_segmented(), "{context}: buf proper-pair not cleared");
+        assert_eq!(buf.reference_sequence_id(), None, "{context}: buf ref id");
+        assert_eq!(buf.alignment_start(), None, "{context}: buf alignment start");
+        // MAPQ must be 0 (htsjdk NO_MAPPING_QUALITY), NOT the "unavailable" sentinel
+        // that a typed `None` serializes to (255). This must equal the raw path's 0
+        // below — the two clippers agree on the same on-wire MAPQ.
+        assert_eq!(
+            buf.mapping_quality().map(u8::from),
+            Some(0u8),
+            "{context}: buf mapq should be 0 (htsjdk makeReadUnmapped), matching raw path"
+        );
+        assert_eq!(buf.template_length(), 0, "{context}: buf tlen");
+        assert_eq!(buf.cigar().iter().count(), 0, "{context}: buf cigar not empty");
+
+        // --- RawRecord ---
+        assert!(raw.flags() & rflags::UNMAPPED != 0, "{context}: raw not unmapped");
+        assert!(raw.flags() & rflags::REVERSE == 0, "{context}: raw reverse not cleared");
+        assert!(raw.flags() & rflags::DUPLICATE == 0, "{context}: raw duplicate not cleared");
+        assert!(raw.flags() & rflags::SECONDARY == 0, "{context}: raw secondary not cleared");
+        assert!(
+            raw.flags() & rflags::SUPPLEMENTARY == 0,
+            "{context}: raw supplementary not cleared"
+        );
+        assert!(raw.flags() & rflags::PROPER_PAIR == 0, "{context}: raw proper-pair not cleared");
+        assert_eq!(raw.ref_id(), -1, "{context}: raw ref id");
+        assert_eq!(raw.pos(), -1, "{context}: raw pos");
+        assert_eq!(raw.mapq(), 0, "{context}: raw mapq");
+        assert_eq!(raw.template_length(), 0, "{context}: raw tlen");
+        assert!(raw.cigar_ops_vec().is_empty(), "{context}: raw cigar not empty");
+
+        // --- Cross-check seq & qual (bases/quals are preserved on unmap) ---
+        let buf_seq: Vec<u8> = buf.sequence().iter().collect();
+        assert_eq!(raw.sequence_vec(), buf_seq, "{context}: seq mismatch");
+        assert_eq!(
+            raw.quality_scores().to_vec(),
+            buf.quality_scores().as_ref().to_vec(),
+            "{context}: qual mismatch"
+        );
+    }
+
+    #[rstest]
+    fn crosscheck_unmap_clip_start_exceeds_alignment(
+        #[values(ClippingMode::Soft, ClippingMode::SoftWithMask, ClippingMode::Hard)]
+        mode: ClippingMode,
+    ) {
+        // fgbio SamRecordClipperTest.scala:168 — 10S40M, clip 50 from the start.
+        // Only 40 clippable bases (the 40M); 40 <= 50 => unmap, return 40.
+        let mut buf = RecordBuilder::mapped_read()
+            .sequence(&"A".repeat(50))
+            .cigar("10S40M")
+            .alignment_start(100)
+            .mapping_quality(60)
+            .build();
+        let mut raw = to_raw(&buf);
+
+        let buf_c = SamRecordClipper::new(mode).clip_start_of_alignment(&mut buf, 50);
+        let raw_c = RawRecordClipper::new(mode).clip_start_of_alignment(&mut raw, 50);
+
+        assert_eq!(buf_c, 40, "buf return count mode={mode:?}");
+        assert_eq!(raw_c, 40, "raw return count mode={mode:?}");
+        assert_eq!(buf.sequence().iter().count(), 50, "buf seq len preserved mode={mode:?}");
+        assert_eq!(raw.l_seq(), 50, "raw seq len preserved mode={mode:?}");
+        assert_both_unmapped(&raw, &buf, &format!("clip_start 10S40M clip=50 mode={mode:?}"));
+    }
+
+    #[rstest]
+    fn crosscheck_unmap_clip_end_exceeds_alignment(
+        #[values(ClippingMode::Soft, ClippingMode::SoftWithMask, ClippingMode::Hard)]
+        mode: ClippingMode,
+    ) {
+        // fgbio SamRecordClipperTest.scala:311 — 40M10S, clip 50 from the end.
+        let mut buf = RecordBuilder::mapped_read()
+            .sequence(&"A".repeat(50))
+            .cigar("40M10S")
+            .alignment_start(100)
+            .mapping_quality(60)
+            .build();
+        let mut raw = to_raw(&buf);
+
+        let buf_c = SamRecordClipper::new(mode).clip_end_of_alignment(&mut buf, 50);
+        let raw_c = RawRecordClipper::new(mode).clip_end_of_alignment(&mut raw, 50);
+
+        assert_eq!(buf_c, 40, "buf return count mode={mode:?}");
+        assert_eq!(raw_c, 40, "raw return count mode={mode:?}");
+        assert_both_unmapped(&raw, &buf, &format!("clip_end 40M10S clip=50 mode={mode:?}"));
+    }
+
+    #[rstest]
+    fn crosscheck_unmap_boundary_clip_equals_clippable(
+        #[values(ClippingMode::Soft, ClippingMode::Hard)] mode: ClippingMode,
+    ) {
+        // Boundary: requesting exactly the clippable-base count also unmaps
+        // (fgbio uses `numClippable <= numberOfBasesToClip`).
+        let mut buf = RecordBuilder::mapped_read()
+            .sequence(&"A".repeat(50))
+            .cigar("50M")
+            .alignment_start(100)
+            .mapping_quality(60)
+            .build();
+        let mut raw = to_raw(&buf);
+
+        let buf_c = SamRecordClipper::new(mode).clip_start_of_alignment(&mut buf, 50);
+        let raw_c = RawRecordClipper::new(mode).clip_start_of_alignment(&mut raw, 50);
+
+        assert_eq!(buf_c, 50, "buf return count mode={mode:?}");
+        assert_eq!(raw_c, 50, "raw return count mode={mode:?}");
+        assert_both_unmapped(&raw, &buf, &format!("clip_start 50M clip=50 mode={mode:?}"));
+    }
+
+    #[rstest]
+    fn crosscheck_no_unmap_when_clip_below_clippable(
+        #[values(ClippingMode::Soft, ClippingMode::Hard)] mode: ClippingMode,
+    ) {
+        // Regression guard: clipping fewer than the clippable bases must NOT unmap.
+        let mut buf = RecordBuilder::mapped_read()
+            .sequence(&"A".repeat(50))
+            .cigar("50M")
+            .alignment_start(100)
+            .mapping_quality(60)
+            .build();
+        let mut raw = to_raw(&buf);
+
+        let buf_c = SamRecordClipper::new(mode).clip_start_of_alignment(&mut buf, 49);
+        let raw_c = RawRecordClipper::new(mode).clip_start_of_alignment(&mut raw, 49);
+
+        assert_eq!(buf_c, 49, "buf return count mode={mode:?}");
+        assert_eq!(raw_c, 49, "raw return count mode={mode:?}");
+        assert!(!buf.flags().is_unmapped(), "buf must stay mapped mode={mode:?}");
+        assert!(raw.flags() & fgumi_raw_bam::flags::UNMAPPED == 0, "raw must stay mapped");
+        assert_raw_matches_buf(&raw, &buf, &format!("clip_start 50M clip=49 mode={mode:?}"));
+    }
+
+    #[rstest]
+    fn crosscheck_unmap_negative_strand_revcomps_bases(
+        #[values(ClippingMode::Soft, ClippingMode::Hard)] mode: ClippingMode,
+    ) {
+        // A negative-strand read that gets fully clipped is unmapped with its stored
+        // (reference-forward) SEQ reverse-complemented and QUAL reversed, mirroring
+        // htsjdk `SAMUtils.makeReadUnmapped` (reverseComplement + clear reverse flag).
+        let seq = format!("{}{}", "A".repeat(25), "C".repeat(25));
+        let expected_rc = fgumi_dna::reverse_complement(seq.as_bytes());
+        let mut buf = RecordBuilder::mapped_read()
+            .sequence(&seq)
+            .cigar("50M")
+            .alignment_start(100)
+            .mapping_quality(60)
+            .reverse_complement(true)
+            .build();
+        let mut raw = to_raw(&buf);
+
+        SamRecordClipper::new(mode).clip_start_of_alignment(&mut buf, 60);
+        RawRecordClipper::new(mode).clip_start_of_alignment(&mut raw, 60);
+
+        assert_both_unmapped(&raw, &buf, &format!("neg-strand unmap mode={mode:?}"));
+        assert_eq!(raw.sequence_vec(), expected_rc, "neg-strand seq revcomp mode={mode:?}");
+    }
+
+    /// Reads a `Z`-type string tag back from a typed [`RecordBuf`].
+    fn typed_string_tag(buf: &RecordBuf, tag: [u8; 2]) -> Vec<u8> {
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::Value;
+        match buf.data().get(&Tag::new(tag[0], tag[1])) {
+            Some(Value::String(s)) => s.to_vec(),
+            other => {
+                panic!("expected string tag {:?}, got {other:?}", String::from_utf8_lossy(&tag))
+            }
+        }
+    }
+
+    /// Reads a `Z`-type string tag back from a [`RawRecord`].
+    fn raw_string_tag(raw: &RawRecord, tag: [u8; 2]) -> Vec<u8> {
+        fgumi_raw_bam::find_string_tag(fgumi_raw_bam::aux_data_slice(raw.as_ref()), tag)
+            .unwrap_or_else(|| panic!("expected string tag {:?}", String::from_utf8_lossy(&tag)))
+            .to_vec()
+    }
+
+    #[rstest]
+    fn crosscheck_unmap_negative_strand_reorients_tags(
+        #[values(ClippingMode::Soft, ClippingMode::Hard)] mode: ClippingMode,
+    ) {
+        use fgumi_raw_bam::SamTag;
+        // htsjdk `SAMUtils.makeReadUnmapped` calls `reverseComplement(true)`, which — for
+        // reverse-strand reads — also reverse-complements the base-oriented tags
+        // (E2, SQ) and reverses the quality-oriented tags (OQ, U2), matching
+        // `SAMRecord.TAGS_TO_REVERSE_COMPLEMENT` / `TAGS_TO_REVERSE`.
+        let oq = format!("{}{}", "5".repeat(25), "F".repeat(25)); // reversed -> F*25 5*25
+        let u2 = format!("{}{}", "#".repeat(25), "2".repeat(25)); // reversed -> 2*25 #*25
+        let e2 = format!("{}{}", "A".repeat(25), "C".repeat(25)); // revcomp  -> G*25 T*25
+        let expected_oq = format!("{}{}", "F".repeat(25), "5".repeat(25));
+        let expected_u2 = format!("{}{}", "2".repeat(25), "#".repeat(25));
+        let expected_e2 = format!("{}{}", "G".repeat(25), "T".repeat(25));
+
+        let mut buf = RecordBuilder::mapped_read()
+            .sequence(&"A".repeat(50))
+            .cigar("50M")
+            .alignment_start(100)
+            .mapping_quality(60)
+            .reverse_complement(true)
+            .tag("OQ", oq.as_str())
+            .tag("U2", u2.as_str())
+            .tag("E2", e2.as_str())
+            .build();
+        let mut raw = to_raw(&buf);
+
+        SamRecordClipper::new(mode).clip_start_of_alignment(&mut buf, 60);
+        RawRecordClipper::new(mode).clip_start_of_alignment(&mut raw, 60);
+
+        assert_both_unmapped(&raw, &buf, &format!("neg-strand tag reorient mode={mode:?}"));
+        for (tag, want) in
+            [(*SamTag::OQ, &expected_oq), (*SamTag::U2, &expected_u2), (*SamTag::E2, &expected_e2)]
+        {
+            let label = String::from_utf8_lossy(&tag).into_owned();
+            assert_eq!(typed_string_tag(&buf, tag), want.as_bytes(), "typed {label} mode={mode:?}");
+            assert_eq!(raw_string_tag(&raw, tag), want.as_bytes(), "raw {label} mode={mode:?}");
+        }
+    }
+
+    #[rstest]
+    fn crosscheck_unmap_positive_strand_leaves_tags_untouched(
+        #[values(ClippingMode::Soft, ClippingMode::Hard)] mode: ClippingMode,
+    ) {
+        use fgumi_raw_bam::SamTag;
+        // For forward-strand reads, htsjdk `makeReadUnmapped` does NOT call
+        // `reverseComplement`, so the base/quality-oriented tags are left as-is.
+        let oq = format!("{}{}", "5".repeat(25), "F".repeat(25));
+        let e2 = format!("{}{}", "A".repeat(25), "C".repeat(25));
+
+        let mut buf = RecordBuilder::mapped_read()
+            .sequence(&"A".repeat(50))
+            .cigar("50M")
+            .alignment_start(100)
+            .mapping_quality(60)
+            .tag("OQ", oq.as_str())
+            .tag("E2", e2.as_str())
+            .build();
+        let mut raw = to_raw(&buf);
+
+        SamRecordClipper::new(mode).clip_start_of_alignment(&mut buf, 60);
+        RawRecordClipper::new(mode).clip_start_of_alignment(&mut raw, 60);
+
+        assert_both_unmapped(&raw, &buf, &format!("fwd-strand unmap mode={mode:?}"));
+        for (tag, want) in [(*SamTag::OQ, &oq), (*SamTag::E2, &e2)] {
+            let label = String::from_utf8_lossy(&tag).into_owned();
+            assert_eq!(typed_string_tag(&buf, tag), want.as_bytes(), "typed {label} unchanged");
+            assert_eq!(raw_string_tag(&raw, tag), want.as_bytes(), "raw {label} unchanged");
         }
     }
 }
