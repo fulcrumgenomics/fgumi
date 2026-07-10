@@ -1229,6 +1229,93 @@ fn runall_reads_bam_from_stdin_once() {
     assert_bams_record_equivalent_nonempty(&from_file, &from_stdin);
 }
 
+/// CG-5 (audit E2): every runall failure test rejects *before* the pipeline runs
+/// (invalid stage pair, missing `--unmapped`/`--ref`/`--umis`, bad flag combo).
+/// None checks that the fused BAM-in pipeline fails *cleanly mid-run* when a
+/// downstream stage hits malformed input. Feed `runall --start-from group
+/// --stop-after consensus --consensus simplex` a BAM truncated mid-stream and
+/// assert a clean non-zero exit — no panic / `unreachable`, and (via a
+/// wall-clock watchdog) no hang.
+#[test]
+fn runall_group_simplex_fails_cleanly_on_truncated_bam() {
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let tmp = TempDir::new().unwrap();
+    let fixture = sorted_simplex_fixture(tmp.path());
+
+    // Truncate the valid grouped-input BAM: keep the header + some BGZF blocks,
+    // then cut, so the reader errors partway through a real record stream rather
+    // than failing an up-front header parse.
+    let bytes = fs::read(&fixture).expect("read fixture");
+    assert!(bytes.len() > 200, "fixture unexpectedly tiny ({} bytes)", bytes.len());
+    let truncated = tmp.path().join("truncated.bam");
+    let keep = bytes.len() * 3 / 5; // 60% — past the header, into the block stream
+    fs::write(&truncated, &bytes[..keep]).expect("write truncated bam");
+
+    let out_path = tmp.path().join("out.bam");
+    let args = ParityArgs::for_simplex_like();
+    let mut child = Command::new(fgumi_binary())
+        .args([
+            "runall",
+            "--start-from",
+            "group",
+            "--stop-after",
+            "consensus",
+            "--consensus",
+            "simplex",
+            "--input",
+            truncated.to_str().unwrap(),
+            "--output",
+            out_path.to_str().unwrap(),
+            "--group::strategy",
+            args.strategy,
+            "--group::edits",
+            "1",
+            "--simplex::min-reads",
+            args.min_reads,
+            "--threads",
+            "2",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn fgumi runall");
+
+    // Drain stderr on a worker so a hung child (which never closes the pipe)
+    // cannot block the watchdog loop below.
+    let mut stderr_pipe = child.stderr.take().expect("child stderr");
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr_pipe.read_to_string(&mut s);
+        s
+    });
+
+    // Wall-clock watchdog: a mid-run corruption must fail fast, never hang.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("runall did not exit within 60s on truncated input (hang?)");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let stderr = reader.join().expect("join stderr reader");
+
+    assert!(!status.success(), "runall must fail on a truncated BAM; stderr:\n{stderr}");
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("unreachable"),
+        "runall must fail cleanly (no panic/unreachable) on truncated input; stderr:\n{stderr}"
+    );
+    // A clean failure must not leave a half-written output masquerading as success.
+    // (Absent or present-but-the-command-failed is fine; we only forbid a
+    // success-looking exit, asserted above.)
+}
+
 /// Write a gzip-compressed FASTQ from `(name, seq, qual)` records.
 fn write_gzip_fastq(path: &Path, records: &[(&str, &str, &str)]) {
     use std::io::Write as _;

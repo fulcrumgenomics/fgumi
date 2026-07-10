@@ -505,6 +505,77 @@ fn coordinate_sort_matrix(#[case] spill: Spill) {
     assert_records_preserved(&input, &output);
 }
 
+/// CG-3 (audit E1): the spill matrix drives `-m` down to *force* spills but
+/// never asserts one actually happened. If memory accounting regressed so the
+/// engine ignored `-m` and held everything in RAM, every matrix case would still
+/// pass (output is still correct) — silently deleting all spill/merge coverage
+/// *and* the memory-bound guarantee. Pin the lever directly by observing the
+/// arena `SortMerge` step's INFO log: a tiny `-m` must take the disk-spill merge
+/// path ("Sort merge complete"), while a large `-m` must take the single-source
+/// in-memory fast path ("in-memory fast path complete"). Run as a subprocess so
+/// `RUST_LOG=info` is honored, with `--threads 1` so the in-memory case is a
+/// single source (deterministic fast path).
+#[rstest]
+#[case::in_memory("256M", false)]
+#[case::single_spill("200K", true)]
+#[case::many_spill("64K", true)]
+fn sort_spill_actually_occurs_under_small_memory(
+    #[case] max_memory: &str,
+    #[case] expect_spill: bool,
+) {
+    let (dir, input) = build_unsorted_fixture(1500);
+    let output = dir.path().join("sorted.bam");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .env("RUST_LOG", "info")
+        .args([
+            "sort",
+            "-i",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--order",
+            "coordinate",
+            "--threads",
+            "1",
+            "-m",
+            max_memory,
+            "--temp-compression",
+            "1",
+        ])
+        .output()
+        .expect("spawn fgumi sort");
+    assert!(
+        out.status.success(),
+        "fgumi sort failed (-m {max_memory}): {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    let merged = stderr.contains("Sort merge complete");
+    let in_memory = stderr.contains("in-memory fast path complete");
+    if expect_spill {
+        assert!(
+            merged && !in_memory,
+            "-m {max_memory} must force a disk-spill merge, not the in-memory fast path.\n\
+             stderr:\n{stderr}"
+        );
+    } else {
+        assert!(
+            in_memory && !merged,
+            "-m {max_memory} must sort entirely in memory (no spill/merge).\nstderr:\n{stderr}"
+        );
+    }
+
+    // The output must still be correct regardless of regime: the tool's own
+    // --verify guards against write corruption, and an INDEPENDENT in-test
+    // coordinate-order oracle (re-derived from the records via noodles, not the
+    // tool's --verify path) proves the order — mirroring `coordinate_sort_matrix`.
+    assert!(verify_sorted(&output, "coordinate"), "coordinate --verify guard failed");
+    assert_coordinate_ordered(&read_records(&output));
+    assert_records_preserved(&input, &output);
+}
+
 // ---------------------------------------------------------------------------
 // Queryname-lexicographic sort: full spill matrix, independent in-test oracle
 // ---------------------------------------------------------------------------
