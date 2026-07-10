@@ -4,8 +4,10 @@
 //! for testing and validation of fgumi output against other tools.
 
 pub mod bams;
+pub(crate) mod engines;
 pub mod metrics;
 pub(crate) mod raw_compare;
+pub(crate) mod record_key;
 
 use crate::commands::command::Command;
 use anyhow::Result;
@@ -13,6 +15,20 @@ use clap::{Parser, Subcommand};
 
 pub use bams::CompareBams;
 pub use metrics::CompareMetrics;
+
+// Narrow facade over the `engines` module tree: `engines` itself stays
+// `pub(crate)` (it is an internal implementation detail of `compare`), but the
+// separate-crate integration tests for the positional and key-join engines need a
+// public entry point. Re-export exactly the items those tests use rather than
+// widening `engines` to `pub`, so the rest of `engines`' internals stay out of
+// the public API surface.
+pub use engines::content::ContentPredicate;
+pub use engines::header::compare_headers;
+pub use engines::keyjoin::{
+    KeyJoinConfig, KeyJoinOutcome, canonicalize_to_queryname, keyjoin_compare,
+};
+pub use engines::positional::positional_compare;
+pub use engines::sort_verify::{SortVerifyOutcome, sort_verify_compare};
 
 /// Marker error returned when a compare subcommand detects a mismatch between
 /// the two inputs.

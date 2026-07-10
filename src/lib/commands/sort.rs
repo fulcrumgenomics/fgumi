@@ -330,7 +330,11 @@ pub struct Sort {
 
 /// Environment variable name for the fallback temp-dir list, parsed as a
 /// `PATH`-style list when no `-T/--tmp-dir` flags are passed.
-const TMP_DIRS_ENV: &str = "FGUMI_TMP_DIRS";
+///
+/// Widened from private to `pub(crate)` so `compare bams --command group`'s
+/// key-join canonicalization step (`compare::engines::keyjoin`) can reuse the same
+/// env var and precedence rules instead of re-inventing tmp-dir resolution.
+pub(crate) const TMP_DIRS_ENV: &str = "FGUMI_TMP_DIRS";
 
 /// Resolve the final list of temp directories for a sort run.
 ///
