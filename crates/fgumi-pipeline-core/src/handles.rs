@@ -538,11 +538,11 @@ pub(crate) fn build_branch_ordered_bytes<T: Send + HeapSize + Ordered + 'static>
 /// for non-`ByItemOrdinal` orderings. `ByItemOrdinal` requires `T: Ordered`
 /// — use `build_branch_ordered_bytes` for the combined case.
 ///
-/// Currently exercised only by tests; production code uses
-/// `build_branch_ordered_bytes` (BAM steps need both `HeapSize` and
-/// `Ordered`). Kept for the rare case where a step needs byte-bounded
-/// outputs without ordering.
-#[allow(dead_code)]
+/// The build path `build_single_queues` uses for every `Single<T>` output
+/// (`T: HeapSize`, no `Ordered` bound): it honors `ByteBounded` specs and
+/// delegates every other spec straight back to `build_branch::<T>`. Steps
+/// needing both `HeapSize` and `Ordered` go through
+/// `build_branch_ordered_bytes` instead.
 pub(crate) fn build_branch_byte_aware<T: Send + HeapSize + 'static>(
     spec: QueueSpec,
     ordering: BranchOrdering,

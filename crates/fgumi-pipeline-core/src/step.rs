@@ -221,9 +221,9 @@ pub struct OutputHandles<O: StepOutputs> {
 }
 
 impl<O: StepOutputs> OutputHandles<O> {
-    /// Wrap a type-erased outputs view. Constructed by `TypedStep<S>`
-    /// (Phase 1 Task 15) when assembling the step's `StepCtx`.
-    #[allow(dead_code)] // wired up by Phase 1 Task 15 (TypedStep::wrap_outputs_view).
+    /// Wrap a type-erased outputs view into a typed `OutputHandles<O>`.
+    /// Called from `TypedStep::wrap_outputs_view` (see `erased.rs`) when the
+    /// worker assembles a step's `StepCtx` outputs.
     pub(crate) fn new(inner: OutputsViewAny) -> Self {
         Self { inner, _phantom: std::marker::PhantomData }
     }
