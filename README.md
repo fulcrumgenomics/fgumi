@@ -15,7 +15,7 @@ This software is currently a **research preview**. While we have extensively
 tested these tools across a wide variety of vendor-provided data, **no
 guarantees are made** regarding correctness or stability.
 
-We are targeting **June 1, 2026** to recommend fgumi over
+We are targeting **July 31, 2026** to recommend fgumi over
 [fgbio](https://github.com/fulcrumgenomics/fgbio) for production use.
 
 Fulcrum Genomics Unique Molecular Indexing (UMI) Tools - a suite of high-performance tools for working with UMI-tagged sequencing data.
