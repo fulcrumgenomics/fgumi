@@ -74,7 +74,7 @@
 
 use crate::caller::{
     ConsensusCaller, ConsensusCallingStats, ConsensusOutput,
-    RejectionReason as CallerRejectionReason,
+    RejectionReason as CallerRejectionReason, clamp_per_base_to_fgbio_short,
 };
 use crate::phred::{MIN_PHRED, NO_CALL_BASE, NO_CALL_BASE_LOWER, PhredScore};
 use crate::simple_umi::consensus_umis;
@@ -280,6 +280,14 @@ struct SingleStrandConsensus {
     ref_end: usize,
     /// Whether the original reads were on the negative strand
     is_negative_strand: bool,
+}
+
+/// Convert a per-base depth/error array to the `i16` `Array[Short]` form fgbio
+/// emits, saturating any value above the `Short` ceiling at `i16::MAX` (32767)
+/// rather than letting a raw `as i16` cast wrap it to a negative value. Matches
+/// the duplex caller's per-base tag encoding.
+fn capped_short_array(values: &[u16]) -> Vec<i16> {
+    values.iter().map(|&v| i16::try_from(v).unwrap_or(i16::MAX)).collect()
 }
 
 /// Precomputed clip metadata for a single record in the raw-byte codec pipeline.
@@ -1168,7 +1176,16 @@ impl CodecConsensusCaller {
                         eb + da.saturating_sub(ea)
                     };
 
-                    (final_base, final_qual, da + db, duplex_error)
+                    // Per-base duplex depth = sum of each strand's per-base depth,
+                    // each CAPPED at fgbio's `Short` ceiling first (fgbio's
+                    // `min(da,32767) + min(db,32767)`). Capping before the sum both
+                    // matches fgbio and keeps the total within u16 for very deep
+                    // families (a raw `da + db` u16 sum can overflow past 65535).
+                    let duplex_depth = u16::try_from(
+                        clamp_per_base_to_fgbio_short(da) + clamp_per_base_to_fgbio_short(db),
+                    )
+                    .expect("two Short-capped depths sum to at most 65534, which fits u16");
+                    (final_base, final_qual, duplex_depth, duplex_error)
                 }
                 (true, false) => {
                     // Only A has data - single-strand from A
@@ -1327,16 +1344,25 @@ impl CodecConsensusCaller {
         // Duplex consensus tags (cD, cM, cE)
         // fgbio calculates these from totalDepths = ab.depths + ba.depths (sum of SS depths),
         // NOT from the duplex consensus depths
+        // fgbio caps each strand's per-base depth at the `Short` ceiling *before* summing
+        // (`totalDepths(i) = min(abD_i,32767) + min(baD_i,32767)`), then derives cD/cM
+        // (max/min) and the cE denominator (sum) from those capped values.
         let total_depths: Vec<i32> = ss_a
             .depths
             .iter()
             .zip(ss_b.depths.iter())
-            .map(|(&a, &b)| i32::from(a) + i32::from(b))
+            .map(|(&a, &b)| clamp_per_base_to_fgbio_short(a) + clamp_per_base_to_fgbio_short(b))
             .collect();
         let total_depth = total_depths.iter().copied().max().unwrap_or(0);
         let min_depth = total_depths.iter().copied().min().unwrap_or(0);
-        let total_errors: usize = consensus.errors.iter().map(|&e| e as usize).sum();
-        let total_bases: i32 = total_depths.iter().sum();
+        // Cap each per-base duplex error at the `Short` ceiling before summing, matching fgbio's
+        // capped `duplexConsensus.errors` `Array[Short]` (cE = errors.sum / totalDepths.sum).
+        let total_errors: usize =
+            consensus.errors.iter().map(|&e| clamp_per_base_to_fgbio_short(e) as usize).sum();
+        // Accumulate in `usize` (not `i32`), matching the aD/bD strand totals below and the
+        // vanilla (`u64`) / duplex (`i64`) callers: each per-base value is Short-capped (<=65534),
+        // so a very long consensus could otherwise overflow a 32-bit sum.
+        let total_bases: usize = total_depths.iter().map(|&d| d as usize).sum();
         let error_rate =
             if total_bases > 0 { total_errors as f32 / total_bases as f32 } else { 0.0 };
 
@@ -1344,11 +1370,16 @@ impl CodecConsensusCaller {
         self.bam_builder.append_int_tag(SamTag::CM, min_depth);
         self.bam_builder.append_float_tag(SamTag::CE, error_rate);
 
-        // AB strand tags (aD, aM, aE)
-        let a_max_depth = ss_a.depths.iter().map(|&d| i32::from(d)).max().unwrap_or(0);
-        let a_min_depth = ss_a.depths.iter().map(|&d| i32::from(d)).min().unwrap_or(0);
-        let a_total_errors: usize = ss_a.errors.iter().map(|&e| e as usize).sum();
-        let a_total_bases: usize = ss_a.depths.iter().map(|&d| d as usize).sum();
+        // AB strand tags (aD, aM, aE) -- per-base depth capped at the `Short` ceiling
+        // before max/min/sum, matching fgbio's `abConsensus.depths` (`Array[Short]`).
+        let a_depths_capped: Vec<i32> =
+            ss_a.depths.iter().map(|&d| clamp_per_base_to_fgbio_short(d)).collect();
+        let a_max_depth = a_depths_capped.iter().copied().max().unwrap_or(0);
+        let a_min_depth = a_depths_capped.iter().copied().min().unwrap_or(0);
+        // Per-base error also capped at the `Short` ceiling, matching fgbio's `abConsensus.errors`.
+        let a_total_errors: usize =
+            ss_a.errors.iter().map(|&e| clamp_per_base_to_fgbio_short(e) as usize).sum();
+        let a_total_bases: usize = a_depths_capped.iter().map(|&d| d as usize).sum();
         let a_error_rate =
             if a_total_bases > 0 { a_total_errors as f32 / a_total_bases as f32 } else { 0.0 };
 
@@ -1356,11 +1387,15 @@ impl CodecConsensusCaller {
         self.bam_builder.append_int_tag(SamTag::AM, a_min_depth);
         self.bam_builder.append_float_tag(SamTag::AE, a_error_rate);
 
-        // BA strand tags (bD, bM, bE)
-        let b_max_depth = ss_b.depths.iter().map(|&d| i32::from(d)).max().unwrap_or(0);
-        let b_min_depth = ss_b.depths.iter().map(|&d| i32::from(d)).min().unwrap_or(0);
-        let b_total_errors: usize = ss_b.errors.iter().map(|&e| e as usize).sum();
-        let b_total_bases: usize = ss_b.depths.iter().map(|&d| d as usize).sum();
+        // BA strand tags (bD, bM, bE) -- same per-base `Short`-ceiling cap as AB.
+        let b_depths_capped: Vec<i32> =
+            ss_b.depths.iter().map(|&d| clamp_per_base_to_fgbio_short(d)).collect();
+        let b_max_depth = b_depths_capped.iter().copied().max().unwrap_or(0);
+        let b_min_depth = b_depths_capped.iter().copied().min().unwrap_or(0);
+        // Same `Short`-ceiling cap on the bE numerator as the AB strand above.
+        let b_total_errors: usize =
+            ss_b.errors.iter().map(|&e| clamp_per_base_to_fgbio_short(e) as usize).sum();
+        let b_total_bases: usize = b_depths_capped.iter().map(|&d| d as usize).sum();
         let b_error_rate =
             if b_total_bases > 0 { b_total_errors as f32 / b_total_bases as f32 } else { 0.0 };
 
@@ -1370,15 +1405,17 @@ impl CodecConsensusCaller {
 
         // Per-base tags if enabled
         if self.options.produce_per_base_tags {
-            // Per-base depth arrays - convert to signed integers to match fgbio/simplex/duplex
-            let ad_array: Vec<i16> = ss_a.depths.iter().map(|&d| d as i16).collect();
-            let bd_array: Vec<i16> = ss_b.depths.iter().map(|&d| d as i16).collect();
+            // Per-base depth/error arrays - each value capped at fgbio's `Short`
+            // ceiling (`Array[Short]`, i16::MAX = 32767) so a value above 32767
+            // saturates rather than wrapping to a NEGATIVE i16 (see `capped_short_array`).
+            // Mirrors the duplex caller and the scalar cD/aD/bD tags.
+            let ad_array = capped_short_array(&ss_a.depths);
+            let bd_array = capped_short_array(&ss_b.depths);
             self.bam_builder.append_i16_array_tag(SamTag::AD_BASES, &ad_array);
             self.bam_builder.append_i16_array_tag(SamTag::BD_BASES, &bd_array);
 
-            // Per-base error arrays - convert to signed integers to match fgbio/simplex/duplex
-            let ae_array: Vec<i16> = ss_a.errors.iter().map(|&e| e as i16).collect();
-            let be_array: Vec<i16> = ss_b.errors.iter().map(|&e| e as i16).collect();
+            let ae_array = capped_short_array(&ss_a.errors);
+            let be_array = capped_short_array(&ss_b.errors);
             self.bam_builder.append_i16_array_tag(SamTag::AE_BASES, &ae_array);
             self.bam_builder.append_i16_array_tag(SamTag::BE_BASES, &be_array);
 
@@ -3187,6 +3224,157 @@ mod tests {
         );
     }
 
+    /// Regression (CLI CRITICAL): the per-base duplex depth must be the sum of each
+    /// strand's per-base depth CAPPED at fgbio's `Short` ceiling first
+    /// (`min(da,32767) + min(db,32767)`), not the raw `da + db`. A raw u16 sum both
+    /// diverges from fgbio and OVERFLOWS u16 for very deep families — here
+    /// `40000 + 40000 = 80000 > u16::MAX`, which panicked in debug before the fix.
+    #[test]
+    fn test_duplex_per_base_depth_caps_each_strand_before_summing() {
+        let options = CodecConsensusOptions::default();
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        // Both strands agree on both bases (drives the `da + db` agreement branch),
+        // with per-base depths at/above the `Short` ceiling.
+        let deep = SingleStrandConsensus {
+            bases: b"AC".to_vec(),
+            quals: vec![40, 40],
+            depths: vec![40_000, u16::MAX], // 40000 > 32767; u16::MAX = 65535
+            errors: vec![0, 0],
+            raw_read_count: 40_000,
+            ref_start: 0,
+            ref_end: 1,
+            is_negative_strand: false,
+        };
+        let ss_a = deep.clone();
+        let ss_b = SingleStrandConsensus { is_negative_strand: true, ..deep };
+
+        let duplex = caller
+            .build_duplex_consensus_from_padded(&ss_a, &ss_b)
+            .expect("Should build duplex consensus without overflowing");
+
+        // min(40000,32767)+min(40000,32767) = 32767+32767 = 65534, and
+        // min(65535,32767)+min(65535,32767) = 65534 too — both fit u16 (no overflow).
+        assert_eq!(
+            duplex.depths,
+            vec![65_534, 65_534],
+            "per-base duplex depth must be the sum of Short-capped strand depths, not the raw \
+             (overflowing) da + db"
+        );
+    }
+
+    /// The emitted error-rate NUMERATORS (aE/bE/cE) must sum per-base errors capped at fgbio's
+    /// `Short` ceiling, matching fgbio's capped `errors` `Array[Short]` — not just the depth
+    /// denominators that #552 already capped. A per-base error above 32767 left uncapped inflates
+    /// the rate past fgbio's value. Companion to the per-base depth-cap test above.
+    #[test]
+    fn test_codec_error_rate_numerator_caps_at_fgbio_short_ceiling() {
+        let options = CodecConsensusOptions::default();
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        // AB strand: first base's error count exceeds the Short ceiling; depths saturate too.
+        let ss_a = SingleStrandConsensus {
+            bases: b"ACGT".to_vec(),
+            quals: vec![30, 30, 30, 30],
+            depths: vec![40_000, 40_000, 40_000, 40_000], // capped denominator: 32767 each
+            errors: vec![40_000, 0, 0, 0],                // first base's errors exceed the ceiling
+            raw_read_count: 40_000,
+            ref_start: 0,
+            ref_end: 3,
+            is_negative_strand: false,
+        };
+        // BA strand: below the ceiling, no errors.
+        let ss_b = SingleStrandConsensus {
+            bases: b"ACGT".to_vec(),
+            quals: vec![30, 30, 30, 30],
+            depths: vec![30_000, 30_000, 30_000, 30_000],
+            errors: vec![0, 0, 0, 0],
+            raw_read_count: 30_000,
+            ref_start: 0,
+            ref_end: 3,
+            is_negative_strand: true,
+        };
+        // Duplex consensus: per-base error above the ceiling drives the cE numerator.
+        let consensus = SingleStrandConsensus {
+            bases: b"ACGT".to_vec(),
+            quals: vec![30, 30, 30, 30],
+            depths: vec![65_534, 65_534, 65_534, 65_534],
+            errors: vec![40_000, 0, 0, 0],
+            raw_read_count: 40_000,
+            ref_start: 0,
+            ref_end: 3,
+            is_negative_strand: false,
+        };
+
+        let mut output = ConsensusOutput::default();
+        caller
+            .build_output_record_into(&mut output, &consensus, &ss_a, &ss_b, None, &[], &[])
+            .expect("build_output_record_into should succeed");
+
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let rec = &records[0];
+
+        // aE = min(40000,32767) / (32767 * 4) = 32767 / 131068 = 0.25 (uncapped would be 0.3052).
+        let ae = rec.get_float_tag(SamTag::AE).expect("aE present");
+        let expected_ae = 32_767.0f32 / (32_767.0f32 * 4.0);
+        assert!(
+            (ae - expected_ae).abs() < 1e-6,
+            "aE numerator must cap at the Short ceiling: expected {expected_ae}, got {ae}"
+        );
+        // bE strand has no errors → 0.
+        assert_eq!(rec.get_float_tag(SamTag::BE), Some(0.0), "bE has no errors");
+        // cE = min(40000,32767) / totalDepths.sum, totalDepths = (32767 + 30000) * 4.
+        let ce = rec.get_float_tag(SamTag::CE).expect("cE present");
+        let expected_ce = 32_767.0f32 / ((32_767.0f32 + 30_000.0f32) * 4.0);
+        assert!(
+            (ce - expected_ce).abs() < 1e-6,
+            "cE numerator must cap at the Short ceiling: expected {expected_ce}, got {ce}"
+        );
+    }
+
+    /// Regression: the combined-depth denominator for `cE` must accumulate in a type wider than
+    /// `i32`. Each per-base `totalDepths` entry is Short-capped (`min(da,32767)+min(db,32767)` <=
+    /// 65534), so a long consensus overflows a 32-bit sum (here `40_000 * 65_534 > i32::MAX`),
+    /// which panicked in debug before the fix. Mirrors the vanilla (`u64`) / duplex (`i64`) callers.
+    #[test]
+    fn test_codec_ce_denominator_does_not_overflow_for_long_deep_consensus() {
+        let options = CodecConsensusOptions::default();
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        // A consensus long enough that summing the Short-capped per-base depths exceeds i32::MAX:
+        // 40_000 bases * 65_534 = 2_621_360_000 > 2_147_483_647.
+        let len = 40_000usize;
+        let deep = |is_negative_strand: bool| SingleStrandConsensus {
+            bases: vec![b'A'; len],
+            quals: vec![40; len],
+            depths: vec![u16::MAX; len], // clamps to 32_767 per strand
+            errors: vec![0; len],
+            raw_read_count: u16::MAX as usize,
+            ref_start: 0,
+            ref_end: len - 1,
+            is_negative_strand,
+        };
+        let ss_a = deep(false);
+        let ss_b = deep(true);
+        let consensus = deep(false);
+
+        let mut output = ConsensusOutput::default();
+        caller
+            .build_output_record_into(&mut output, &consensus, &ss_a, &ss_b, None, &[], &[])
+            .expect(
+                "build_output_record_into should succeed without overflowing the cE denominator",
+            );
+
+        let records = ParsedBamRecord::parse_all(&output.data);
+        // No errors -> cE is exactly 0.0; the point is that the denominator was computed without
+        // overflowing (an i32 sum would panic in debug before reaching this assertion).
+        assert_eq!(
+            records[0].get_float_tag(SamTag::CE),
+            Some(0.0),
+            "cE should be 0.0 for an error-free consensus"
+        );
+    }
+
     #[test]
     fn test_to_source_read_for_codec_positive_strand() {
         use noodles::sam::alignment::record::cigar::op::Kind;
@@ -4253,5 +4441,163 @@ mod tests {
             "TLEN must match between M and =/X CIGARs with identical reference consumption"
         );
         assert_eq!(match_r1_tlen, 100, "Expected TLEN=100 for start1=1, start2=71, ref_len=30");
+    }
+}
+
+// ============================================================================
+// fgbio-oracle saturation tests (offline-pinned)
+//
+// These tests drive fgumi's own CODEC caller on a DEEP fixture and assert the
+// emitted depth/error tags equal values CAPTURED FROM A REAL fgbio RUN on the
+// exact same input BAM, rather than re-derived from the implementation's own
+// formula. This closes the CodeRabbit finding that the hand-authored saturation
+// tests above "repeat the implementation's expected formulas, so a shared
+// misunderstanding of fgbio's cap-before-sum behavior would still pass".
+//
+// Equivalence: one `fgumi_sam::builder::SamBuilder` produces the fixture and
+// writes ONE BAM. That exact file is (1) what the offline fgbio run consumes and
+// (2) what the fgumi test reads back into `RawRecord`s. See the `#[ignore]`d
+// `regen_*` tests to re-emit the fixture BAM for a fresh fgbio capture.
+// ============================================================================
+#[cfg(test)]
+mod fgbio_oracle_saturation_tests {
+    use super::*;
+    use crate::oracle_test_support::{ExpectedOracleTags, records_from_builder, regen_write};
+    use fgumi_raw_bam::ParsedBamRecord;
+    use fgumi_sam::builder::{SamBuilder, Strand};
+    use rstest::rstest;
+
+    /// CODEC fixture: `n_pairs` FR read pairs on one molecule (single MI), each
+    /// carrying the RX (raw UMI) tag fgbio requires. R1 is on the plus strand and
+    /// R2 on the minus strand, both fully overlapping at position 100 with `bases`
+    /// (`ACGT` is its own reverse-complement, so both strands store the same
+    /// bytes). `r1_variant_bases`/`count` inject a disagreeing R1 sequence in the
+    /// first `count` pairs to exercise the per-strand error numerator.
+    fn build_codec_fixture(
+        n_pairs: usize,
+        bases: &str,
+        r1_variant_bases: Option<&str>,
+        variant_count: usize,
+    ) -> SamBuilder {
+        let mut b = SamBuilder::new();
+        b.set_template_coordinate_sort_order();
+        let quals = vec![40u8; bases.len()];
+        for i in 0..n_pairs {
+            let name = format!("p{i:07}");
+            let r1_bases = match r1_variant_bases {
+                Some(v) if i < variant_count => v,
+                _ => bases,
+            };
+            let _ = b
+                .add_pair()
+                .name(&name)
+                .bases1(r1_bases)
+                .bases2(bases)
+                .quals1(&quals)
+                .quals2(&quals)
+                .contig(0)
+                .start1(100)
+                .start2(100)
+                .strand1(Strand::Plus)
+                .strand2(Strand::Minus)
+                .attr("MI", "mol1")
+                .attr("RX", "ACC")
+                .build();
+        }
+        b
+    }
+
+    /// A CODEC caller configured to match fgbio's `CallCodecConsensusReads` CLI,
+    /// which always emits the per-base arrays (ad/bd/ae/be); the library default
+    /// leaves them off, so the oracle assertions on those arrays would otherwise
+    /// see absent tags.
+    fn codec_caller() -> CodecConsensusCaller {
+        let options = CodecConsensusOptions {
+            produce_per_base_tags: true,
+            ..CodecConsensusOptions::default()
+        };
+        CodecConsensusCaller::new("codec".to_string(), "A".to_string(), options)
+    }
+
+    // Note on the CODEC single-strand depths: every surviving primary FR pair
+    // contributes exactly one R1 and one R2 with the same (mutually clip-normalized)
+    // alignment, so aD (R1 depth) and bD (R2 depth) are structurally EQUAL. Hence the
+    // CODEC saturation shape is aD == bD == 32767 → cD = 65534 (the cap-before-sum
+    // boundary; an uncapped sum would overflow/wrap). The OPEN-interval mixed-strand
+    // case (aD != bD) is exercised by the duplex caller, whose /A and /B strand read
+    // sets are independent (see duplex_caller.rs fgbio_oracle_saturation_tests).
+
+    /// fgumi's CODEC caller, driven on a DEEP fixture, must emit depth/error tags
+    /// equal to values CAPTURED FROM A REAL fgbio RUN on the exact same input BAM.
+    ///
+    /// Oracle provenance — fgbio `4.0.1-de8e5d4-SNAPSHOT`, captured with (CLI
+    /// defaults: `--error-rate-pre-umi 45 --error-rate-post-umi 40
+    /// --min-input-base-quality 10 --min-read-pairs 1`, no `--max-read-pairs` so the
+    /// deep families are NOT downsampled):
+    ///
+    /// ```text
+    /// java -jar fgbio-4.0.1-de8e5d4-SNAPSHOT.jar CallCodecConsensusReads \
+    ///   -i <fixture>.bam -o out.bam
+    /// samtools view out.bam   # read aD/aM/aE/bD/bM/bE/cD/cM/cE and ad/bd/ae/be
+    /// ```
+    ///
+    /// Re-emit `<fixture>.bam` with the matching `#[ignore]`d `regen_codec_*` test
+    /// (`FGUMI_ORACLE_BAM_OUT=/path/to.bam cargo test ... -- --ignored`).
+    #[rstest]
+    // Depth saturation, equal strands: 33_000 identical FR pairs. Each strand's
+    // per-base depth (33_000) caps to 32_767, so cD = 32_767 + 32_767 = 65_534.
+    #[case::depth_saturation_equal_strands(
+        33_000, "ACGT", None, 0,
+        ExpectedOracleTags {
+            cd: 65_534, cm: 65_534, ce: 0.0,
+            ad: 32_767, am: 32_767, ae: 0.0,
+            bd: 32_767, bm: 32_767, be: 0.0,
+            ad_bases: vec![32_767; 4], bd_bases: vec![32_767; 4],
+            ae_bases: vec![0; 4], be_bases: vec![0; 4],
+        },
+    )]
+    // Error-numerator saturation: 73_000 R1 pairs, 33_000 disagreeing at base 0
+    // (C) vs 40_000 majority (A). The per-base error count at base 0 is
+    // 73_000 - 40_000 = 33_000, which caps to 32_767 (NOT wrapping to a negative
+    // i16). aE = 32_767 / (32_767 * 8) = 0.125.
+    #[case::error_numerator_saturation(
+        73_000, "ACGTACGT", Some("CCGTACGT"), 33_000,
+        ExpectedOracleTags {
+            cd: 65_534, cm: 65_534, ce: 0.062_5,
+            ad: 32_767, am: 32_767, ae: 0.125,
+            bd: 32_767, bm: 32_767, be: 0.0,
+            ad_bases: vec![32_767; 8], bd_bases: vec![32_767; 8],
+            ae_bases: vec![32_767, 0, 0, 0, 0, 0, 0, 0], be_bases: vec![0; 8],
+        },
+    )]
+    fn codec_saturation_matches_fgbio_oracle(
+        #[case] n_pairs: usize,
+        #[case] bases: &str,
+        #[case] variant: Option<&str>,
+        #[case] variant_count: usize,
+        #[case] expected: ExpectedOracleTags,
+    ) {
+        let builder = build_codec_fixture(n_pairs, bases, variant, variant_count);
+        let records = records_from_builder(&builder);
+        let mut caller = codec_caller();
+        let output =
+            caller.consensus_reads_from_sam_records(records).expect("codec consensus succeeds");
+        let parsed = ParsedBamRecord::parse_all(&output.data);
+        assert_eq!(parsed.len(), 1, "one CODEC consensus fragment expected");
+        expected.assert_matches(&parsed[0]);
+    }
+
+    /// Re-emit the CODEC depth-saturation fixture BAM for a fresh fgbio capture.
+    #[test]
+    #[ignore = "regen: writes the fixture BAM (set FGUMI_ORACLE_BAM_OUT), then run fgbio on it"]
+    fn regen_codec_depth_saturation_fixture() {
+        regen_write(&build_codec_fixture(33_000, "ACGT", None, 0));
+    }
+
+    /// Re-emit the CODEC error-saturation fixture BAM for a fresh fgbio capture.
+    #[test]
+    #[ignore = "regen: writes the fixture BAM (set FGUMI_ORACLE_BAM_OUT), then run fgbio on it"]
+    fn regen_codec_error_saturation_fixture() {
+        regen_write(&build_codec_fixture(73_000, "ACGTACGT", Some("CCGTACGT"), 33_000));
     }
 }

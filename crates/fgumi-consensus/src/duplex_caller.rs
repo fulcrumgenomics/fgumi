@@ -202,7 +202,9 @@ use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::RecordBuf;
 
 use crate::caller::ConsensusOutput;
-use crate::caller::{ConsensusCaller, ConsensusCallingStats, RejectionReason};
+use crate::caller::{
+    ConsensusCaller, ConsensusCallingStats, RejectionReason, clamp_per_base_to_fgbio_short,
+};
 use crate::phred::MAX_PHRED;
 use crate::phred::{MIN_PHRED, PhredScore};
 use crate::simple_umi::consensus_umis;
@@ -1100,10 +1102,18 @@ impl DuplexConsensusCaller {
         let ab = &consensus.ab_consensus;
         let ba_opt = consensus.ba_consensus.as_ref();
 
-        let ab_depth_max = i32::from(ab.depths.iter().copied().max().unwrap_or(0));
-        let ab_depth_min = i32::from(ab.depths.iter().copied().min().unwrap_or(0));
-        let ab_total_depth: i64 = ab.depths.iter().map(|&d| i64::from(d)).sum();
-        let ab_total_errors: i64 = ab.errors.iter().map(|&e| i64::from(e)).sum();
+        // Clamp each per-base depth to fgbio's `Short` ceiling before max/min, so the
+        // scalar aD/aM match fgbio (which derives them from its capped `Array[Short]`).
+        let ab_depth_max =
+            ab.depths.iter().map(|&d| clamp_per_base_to_fgbio_short(d)).max().unwrap_or(0);
+        let ab_depth_min =
+            ab.depths.iter().map(|&d| clamp_per_base_to_fgbio_short(d)).min().unwrap_or(0);
+        let ab_total_depth: i64 =
+            ab.depths.iter().map(|&d| i64::from(clamp_per_base_to_fgbio_short(d))).sum();
+        // Clamp each per-base error count to the same `Short` ceiling before summing, so the
+        // aE numerator matches fgbio (which stores `abConsensus.errors` as a capped `Array[Short]`).
+        let ab_total_errors: i64 =
+            ab.errors.iter().map(|&e| i64::from(clamp_per_base_to_fgbio_short(e))).sum();
         let ab_error_rate =
             if ab_total_depth > 0 { ab_total_errors as f32 / ab_total_depth as f32 } else { 0.0 };
 
@@ -1129,10 +1139,15 @@ impl DuplexConsensusCaller {
 
         // Calculate BA strand metrics
         let (ba_depth_max, ba_depth_min, ba_error_rate) = if let Some(ba) = ba_opt {
-            let ba_depth_max = i32::from(ba.depths.iter().copied().max().unwrap_or(0));
-            let ba_depth_min = i32::from(ba.depths.iter().copied().min().unwrap_or(0));
-            let ba_total_depth: i64 = ba.depths.iter().map(|&d| i64::from(d)).sum();
-            let ba_total_errors: i64 = ba.errors.iter().map(|&e| i64::from(e)).sum();
+            let ba_depth_max =
+                ba.depths.iter().map(|&d| clamp_per_base_to_fgbio_short(d)).max().unwrap_or(0);
+            let ba_depth_min =
+                ba.depths.iter().map(|&d| clamp_per_base_to_fgbio_short(d)).min().unwrap_or(0);
+            let ba_total_depth: i64 =
+                ba.depths.iter().map(|&d| i64::from(clamp_per_base_to_fgbio_short(d))).sum();
+            // Same `Short`-ceiling cap on the bE numerator as the aE strand above.
+            let ba_total_errors: i64 =
+                ba.errors.iter().map(|&e| i64::from(clamp_per_base_to_fgbio_short(e))).sum();
             let ba_error_rate = if ba_total_depth > 0 {
                 ba_total_errors as f32 / ba_total_depth as f32
             } else {
@@ -1166,10 +1181,15 @@ impl DuplexConsensusCaller {
         }
 
         // 8. Duplex consensus tags (cD, cM, cE)
+        // fgbio's combined depth caps EACH strand's per-base value at the `Short`
+        // ceiling *before* summing (`totalDepths(i) = min(abD_i,32767) + min(baD_i,32767)`),
+        // so clamp per strand per base, then max/min for cD/cM.
         let combined_depths: Vec<i32> = (0..consensus.len())
             .map(|i| {
-                let ab_d = i32::from(ab.depths.get(i).copied().unwrap_or(0));
-                let ba_d = i32::from(ba_opt.and_then(|b| b.depths.get(i).copied()).unwrap_or(0));
+                let ab_d = clamp_per_base_to_fgbio_short(ab.depths.get(i).copied().unwrap_or(0));
+                let ba_d = clamp_per_base_to_fgbio_short(
+                    ba_opt.and_then(|b| b.depths.get(i).copied()).unwrap_or(0),
+                );
                 ab_d + ba_d
             })
             .collect();
@@ -1178,7 +1198,10 @@ impl DuplexConsensusCaller {
         let duplex_depth_min = combined_depths.iter().copied().min().unwrap_or(0);
 
         let total_depth: i64 = combined_depths.iter().map(|&d| i64::from(d)).sum();
-        let total_errors: i64 = consensus.errors.iter().map(|&e| i64::from(e)).sum();
+        // Cap each per-base duplex error at the `Short` ceiling before summing, matching
+        // fgbio's capped `duplexConsensus.errors` `Array[Short]` (cE = errors.sum / totalDepths.sum).
+        let total_errors: i64 =
+            consensus.errors.iter().map(|&e| i64::from(clamp_per_base_to_fgbio_short(e))).sum();
         let duplex_error_rate =
             if total_depth > 0 { total_errors as f32 / total_depth as f32 } else { 0.0 };
 
@@ -5002,6 +5025,156 @@ mod tests {
         assert_eq!(rec.get_int_tag(SamTag::AM), Some(5)); // min depth from AB
     }
 
+    /// Deep families must report depth tags saturated at fgbio's `Short` ceiling, matching
+    /// fgbio (which stores per-base depth as `Array[Short]`). The per-strand `aD`/`bD` cap
+    /// at 32767; the combined `cD` caps EACH strand's per-base value *before* summing
+    /// (`cD = max_i(min(abD_i,32767) + min(baD_i,32767))`), so a mixed pair where only one
+    /// strand saturates lands in the open interval (32767, 65534) — the exact case an
+    /// "only at 32767/65534" tolerance would miss.
+    #[test]
+    fn test_duplex_depth_tags_saturate_at_fgbio_short_ceiling() {
+        let ab_consensus = VanillaConsensusRead {
+            id: "ab".to_string(),
+            bases: vec![b'A', b'C', b'G', b'T'],
+            quals: vec![30, 30, 30, 30],
+            depths: vec![40_000, 40_000, 40_000, 40_000], // > i16::MAX (32767)
+            errors: vec![0, 0, 0, 0],
+            source_reads: None,
+            methylation: None,
+        };
+        let ba_consensus = VanillaConsensusRead {
+            id: "ba".to_string(),
+            bases: vec![b'A', b'C', b'G', b'T'],
+            quals: vec![30, 30, 30, 30],
+            depths: vec![30_000, 30_000, 30_000, 30_000], // < i16::MAX, not saturated
+            errors: vec![0, 0, 0, 0],
+            source_reads: None,
+            methylation: None,
+        };
+        let duplex = DuplexConsensusRead {
+            id: "test".to_string(),
+            bases: vec![b'A', b'C', b'G', b'T'],
+            quals: vec![30, 30, 30, 30],
+            errors: vec![0, 0, 0, 0],
+            ab_consensus,
+            ba_consensus: Some(ba_consensus),
+            methylation: None,
+            is_ba_only: false,
+        };
+
+        let mut builder = UnmappedSamBuilder::new();
+        let mut output = ConsensusOutput::default();
+        DuplexConsensusCaller::duplex_read_into(
+            &mut builder,
+            &mut output,
+            &duplex,
+            ReadType::R1,
+            "UMI123",
+            &[],
+            &[],
+            false,
+            "consensus",
+            "RG1",
+            true,
+            crate::MethylationMode::Disabled,
+            None,
+            None,
+        )
+        .expect("duplex_read_into should succeed");
+
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let rec = &records[0];
+
+        // Per-strand tags saturate at the Short ceiling.
+        assert_eq!(rec.get_int_tag(SamTag::AD), Some(32_767), "aD caps at i16::MAX");
+        assert_eq!(rec.get_int_tag(SamTag::AM), Some(32_767), "aM caps at i16::MAX");
+        // BA strand is below the ceiling and is unchanged.
+        assert_eq!(rec.get_int_tag(SamTag::BD), Some(30_000), "bD unchanged below ceiling");
+        assert_eq!(rec.get_int_tag(SamTag::BM), Some(30_000), "bM unchanged below ceiling");
+        // Combined caps EACH strand per base before summing: 32767 + 30000 = 62767 — the
+        // intermediate value in (32767, 65534) that a boundary-only tolerance would miss.
+        assert_eq!(rec.get_int_tag(SamTag::CD), Some(62_767), "cD = min(ab,32767)+min(ba,32767)");
+        assert_eq!(rec.get_int_tag(SamTag::CM), Some(62_767), "cM = per-strand-capped sum");
+    }
+
+    /// The error-rate NUMERATORS (aE/bE/cE) must also be summed from per-base errors capped at
+    /// fgbio's `Short` ceiling, matching fgbio's capped `errors` `Array[Short]` — not just the
+    /// depth denominators. A per-base error above 32767 that is left uncapped inflates the rate
+    /// past fgbio's value (and can even exceed 1.0). Companion to the depth-saturation test above.
+    #[test]
+    fn test_duplex_error_rate_numerator_caps_at_fgbio_short_ceiling() {
+        let ab_consensus = VanillaConsensusRead {
+            id: "ab".to_string(),
+            bases: vec![b'A', b'C', b'G', b'T'],
+            quals: vec![30, 30, 30, 30],
+            depths: vec![40_000, 40_000, 40_000, 40_000], // capped denominator: 32767 each
+            errors: vec![40_000, 0, 0, 0], // first base's errors exceed the Short ceiling
+            source_reads: None,
+            methylation: None,
+        };
+        let ba_consensus = VanillaConsensusRead {
+            id: "ba".to_string(),
+            bases: vec![b'A', b'C', b'G', b'T'],
+            quals: vec![30, 30, 30, 30],
+            depths: vec![30_000, 30_000, 30_000, 30_000], // below the ceiling
+            errors: vec![0, 0, 0, 0],
+            source_reads: None,
+            methylation: None,
+        };
+        let duplex = DuplexConsensusRead {
+            id: "test".to_string(),
+            bases: vec![b'A', b'C', b'G', b'T'],
+            quals: vec![30, 30, 30, 30],
+            errors: vec![40_000, 0, 0, 0], // duplex per-base error above the ceiling
+            ab_consensus,
+            ba_consensus: Some(ba_consensus),
+            methylation: None,
+            is_ba_only: false,
+        };
+
+        let mut builder = UnmappedSamBuilder::new();
+        let mut output = ConsensusOutput::default();
+        DuplexConsensusCaller::duplex_read_into(
+            &mut builder,
+            &mut output,
+            &duplex,
+            ReadType::R1,
+            "UMI123",
+            &[],
+            &[],
+            false,
+            "consensus",
+            "RG1",
+            true,
+            crate::MethylationMode::Disabled,
+            None,
+            None,
+        )
+        .expect("duplex_read_into should succeed");
+
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let rec = &records[0];
+
+        // aE numerator caps at 32767: aE = min(40000,32767) / (32767 * 4) = 32767 / 131068 = 0.25.
+        // With an uncapped numerator it would be 40000 / 131068 = 0.3052, so assert it landed at
+        // the capped value (and did NOT exceed the uncapped inflation).
+        let ae = rec.get_float_tag(SamTag::AE).expect("aE present");
+        let expected_ae = 32_767.0f32 / (32_767.0f32 * 4.0);
+        assert!(
+            (ae - expected_ae).abs() < 1e-6,
+            "aE numerator must cap at the Short ceiling: expected {expected_ae}, got {ae}"
+        );
+        // bE strand has no errors → 0.
+        assert_eq!(rec.get_float_tag(SamTag::BE), Some(0.0), "bE has no errors");
+        // cE numerator caps at 32767 too: 32767 / totalDepths.sum, totalDepths = (32767+30000)*4.
+        let ce = rec.get_float_tag(SamTag::CE).expect("cE present");
+        let expected_ce = 32_767.0f32 / ((32_767.0f32 + 30_000.0f32) * 4.0);
+        assert!(
+            (ce - expected_ce).abs() < 1e-6,
+            "cE numerator must cap at the Short ceiling: expected {expected_ce}, got {ce}"
+        );
+    }
+
     #[test]
     fn test_are_all_same_strand_mixed() {
         // Test are_all_same_strand with mixed strands
@@ -6233,5 +6406,215 @@ mod tests {
         );
 
         Ok(())
+    }
+}
+
+// ============================================================================
+// fgbio-oracle saturation tests (offline-pinned)
+//
+// These tests drive fgumi's own duplex caller on a DEEP fixture and assert the
+// emitted depth/error tags equal values CAPTURED FROM A REAL fgbio RUN on the
+// exact same input BAM, rather than re-derived from the implementation's own
+// formula. This closes the CodeRabbit finding that the hand-authored saturation
+// tests "repeat the implementation's expected formulas, so a shared
+// misunderstanding of fgbio's cap-before-sum behavior would still pass".
+//
+// Equivalence: one `fgumi_sam::builder::SamBuilder` produces the fixture and
+// writes ONE BAM. That exact file is (1) what the offline fgbio run consumes and
+// (2) what the fgumi test reads back into `RawRecord`s. See the `#[ignore]`d
+// `regen_*` tests to re-emit the fixture BAM for a fresh fgbio capture.
+// ============================================================================
+#[cfg(test)]
+mod fgbio_oracle_saturation_tests {
+    use super::*;
+    use crate::oracle_test_support::{ExpectedOracleTags, records_from_builder, regen_write};
+    use fgumi_raw_bam::ParsedBamRecord;
+    use fgumi_sam::builder::{SamBuilder, Strand};
+    use rstest::rstest;
+
+    /// DUPLEX fixture: one source molecule sequenced on both strands. `n_ab` read
+    /// pairs carry `MI = mol/A`, `n_ba` pairs carry `MI = mol/B`. For the R1 duplex
+    /// consensus fgbio builds the AB single-strand consensus from the /A pairs' R1s
+    /// (so `aD = n_ab`) and the BA single-strand consensus from the /B pairs' R2s
+    /// (so `bD = n_ba`); because the two counts are independent, an unequal
+    /// `n_ab`/`n_ba` makes `cD = min(aD,32767) + min(bD,32767)` land in the OPEN
+    /// interval (32767, 65534) when one strand saturates.
+    ///
+    /// Strand layout (so fgbio's `areAllSameStrand` check holds):
+    ///   AB (mol/A): R1 = plus,  R2 = minus
+    ///   BA (mol/B): R1 = minus, R2 = plus
+    /// R1 starts at 100 and R2 at `start2`. `start2` is set NON-overlapping with R1
+    /// (e.g. 200) so that when a per-strand error variant is injected, fgbio's
+    /// FR-pair overlapping-base masking does NOT mask the disagreeing R1 base
+    /// against its own (agreeing) R2 mate — which would otherwise drop that base
+    /// from the AB single-strand depth and zero the error. `bases` uses `ACGT`-style
+    /// palindromic bytes so both strands store identical bytes. `variant_bases`/
+    /// `count` inject a disagreeing AB-R1 sequence in the first `count` /A pairs to
+    /// exercise the per-strand error numerator.
+    fn build_duplex_fixture(
+        n_ab: usize,
+        n_ba: usize,
+        bases: &str,
+        variant_bases: Option<&str>,
+        variant_count: usize,
+        start2: usize,
+    ) -> SamBuilder {
+        let mut b = SamBuilder::new();
+        b.set_template_coordinate_sort_order();
+        let quals = vec![40u8; bases.len()];
+        for i in 0..n_ab {
+            let name = format!("a{i:07}");
+            let r1_bases = match variant_bases {
+                Some(v) if i < variant_count => v,
+                _ => bases,
+            };
+            let _ = b
+                .add_pair()
+                .name(&name)
+                .bases1(r1_bases)
+                .bases2(bases)
+                .quals1(&quals)
+                .quals2(&quals)
+                .contig(0)
+                .start1(100)
+                .start2(start2)
+                .strand1(Strand::Plus)
+                .strand2(Strand::Minus)
+                .attr("MI", "mol/A")
+                .build();
+        }
+        for i in 0..n_ba {
+            let name = format!("b{i:07}");
+            let _ = b
+                .add_pair()
+                .name(&name)
+                .bases1(bases)
+                .bases2(bases)
+                .quals1(&quals)
+                .quals2(&quals)
+                .contig(0)
+                .start1(100)
+                .start2(start2)
+                .strand1(Strand::Minus)
+                .strand2(Strand::Plus)
+                .attr("MI", "mol/B")
+                .build();
+        }
+        b
+    }
+
+    fn duplex_caller() -> DuplexConsensusCaller {
+        DuplexConsensusCaller::new(
+            "duplex".to_string(),
+            "A".to_string(),
+            vec![1],
+            10,    // min_input_base_quality (fgbio default)
+            true,  // produce_per_base_tags (fgbio CLI always emits per-base arrays)
+            false, // trim
+            None,  // max_reads_per_strand
+            None,  // cell_tag
+            false, // track_rejects
+            45,    // error_rate_pre_umi
+            40,    // error_rate_post_umi
+        )
+        .expect("duplex caller")
+    }
+
+    /// Non-overlapping R2 start for the fixtures: keeps R1 (start 100, ≤8bp) and
+    /// R2 (start 200) apart so fgbio's FR overlapping-base masking never touches an
+    /// injected AB-R1 error base (see `build_duplex_fixture`).
+    const NON_OVERLAP_R2_START: usize = 200;
+
+    /// fgumi's duplex caller, driven on a DEEP fixture, must emit depth/error tags
+    /// equal to values CAPTURED FROM A REAL fgbio RUN on the exact same input BAM.
+    /// Assertions target the R1 duplex record (`FIRST_SEGMENT`), whose AB
+    /// single-strand consensus carries the injected error.
+    ///
+    /// Oracle provenance — fgbio `4.0.1-de8e5d4-SNAPSHOT`, captured with (CLI
+    /// defaults: `--error-rate-pre-umi 45 --error-rate-post-umi 40
+    /// --min-input-base-quality 10 --min-reads 1`, no `--max-reads-per-strand` so
+    /// the deep families are NOT downsampled):
+    ///
+    /// ```text
+    /// java -jar fgbio-4.0.1-de8e5d4-SNAPSHOT.jar CallDuplexConsensusReads \
+    ///   -i <fixture>.bam -o out.bam
+    /// samtools view out.bam   # first (R1) record: aD/aM/aE/bD/bM/bE/cD/cM/cE, ad/bd/ae/be
+    /// ```
+    ///
+    /// Re-emit `<fixture>.bam` with the matching `#[ignore]`d `regen_duplex_*` test
+    /// (`FGUMI_ORACLE_BAM_OUT=/path/to.bam cargo test ... -- --ignored`).
+    #[rstest]
+    // Open-interval depth saturation, mixed strands: 33_000 /A pairs (AB depth
+    // 33_000 → caps to 32_767) and 20_000 /B pairs (BA depth 20_000, below the
+    // cap). cD = min(33_000,32_767) + 20_000 = 52_767, landing strictly INSIDE the
+    // open interval (32_767, 65_534) — the case a "saturates only at 32_767/65_534"
+    // tolerance would miss.
+    #[case::open_interval_depth_saturation(
+        33_000, 20_000, "ACGT", None, 0,
+        ExpectedOracleTags {
+            cd: 52_767, cm: 52_767, ce: 0.0,
+            ad: 32_767, am: 32_767, ae: 0.0,
+            bd: 20_000, bm: 20_000, be: 0.0,
+            ad_bases: vec![32_767; 4], bd_bases: vec![20_000; 4],
+            ae_bases: vec![0; 4], be_bases: vec![0; 4],
+        },
+    )]
+    // Error-numerator saturation on the (saturated) AB strand: 73_000 /A pairs,
+    // 33_000 disagreeing at base 0, 40_000 majority. AB per-base error at base 0 is
+    // 73_000 - 40_000 = 33_000, which caps to 32_767 (NOT wrapping negative).
+    // aE = 32_767 / (32_767 * 8) = 0.125. The BA strand (20_000 /B pairs) is clean.
+    #[case::error_numerator_saturation(
+        73_000, 20_000, "ACGTACGT", Some("CCGTACGT"), 33_000,
+        ExpectedOracleTags {
+            cd: 52_767, cm: 52_767, ce: 0.077_621_91,
+            ad: 32_767, am: 32_767, ae: 0.125,
+            bd: 20_000, bm: 20_000, be: 0.0,
+            ad_bases: vec![32_767; 8], bd_bases: vec![20_000; 8],
+            ae_bases: vec![32_767, 0, 0, 0, 0, 0, 0, 0], be_bases: vec![0; 8],
+        },
+    )]
+    fn duplex_saturation_matches_fgbio_oracle(
+        #[case] n_ab: usize,
+        #[case] n_ba: usize,
+        #[case] bases: &str,
+        #[case] variant: Option<&str>,
+        #[case] variant_count: usize,
+        #[case] expected: ExpectedOracleTags,
+    ) {
+        let builder =
+            build_duplex_fixture(n_ab, n_ba, bases, variant, variant_count, NON_OVERLAP_R2_START);
+        let records = records_from_builder(&builder);
+        let mut caller = duplex_caller();
+        let output = caller.consensus_reads(records).expect("duplex consensus succeeds");
+        let parsed = ParsedBamRecord::parse_all(&output.data);
+        assert_eq!(parsed.len(), 2, "duplex emits R1 and R2 consensus records");
+        // The AB single-strand consensus (and any injected error) lands on the R1
+        // duplex record; assert against it.
+        let rec = parsed
+            .iter()
+            .find(|r| r.flag & flags::FIRST_SEGMENT != 0)
+            .expect("R1 (first-of-pair) consensus present");
+        expected.assert_matches(rec);
+    }
+
+    /// Re-emit the duplex open-interval depth-saturation fixture BAM for fgbio.
+    #[test]
+    #[ignore = "regen: writes the fixture BAM (set FGUMI_ORACLE_BAM_OUT), then run fgbio on it"]
+    fn regen_duplex_depth_saturation_fixture() {
+        regen_write(&build_duplex_fixture(33_000, 20_000, "ACGT", None, 0, NON_OVERLAP_R2_START));
+    }
+
+    /// Re-emit the duplex error-saturation fixture BAM for fgbio.
+    #[test]
+    #[ignore = "regen: writes the fixture BAM (set FGUMI_ORACLE_BAM_OUT), then run fgbio on it"]
+    fn regen_duplex_error_saturation_fixture() {
+        regen_write(&build_duplex_fixture(
+            73_000,
+            20_000,
+            "ACGTACGT",
+            Some("CCGTACGT"),
+            33_000,
+            NON_OVERLAP_R2_START,
+        ));
     }
 }

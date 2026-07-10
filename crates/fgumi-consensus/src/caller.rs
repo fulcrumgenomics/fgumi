@@ -342,6 +342,23 @@ pub fn calculate_error_rate(depths: &[u16], errors: &[u16]) -> f32 {
     total_errors as f32 / total_depth as f32
 }
 
+/// fgbio's `Short` per-base depth ceiling (`i16::MAX` = 32767).
+///
+/// fgumi stores per-base depths in `u16` (max 65535), but fgbio stores them in a
+/// `Short` `Array` capped at `Short.MaxValue`, and derives every scalar depth tag
+/// (`cD`/`aD`/`bD` and the `cM`/`aM`/`bM` minima) from those already-capped arrays.
+pub const FGBIO_SHORT_DEPTH_MAX: u16 = i16::MAX.unsigned_abs(); // 32_767
+
+/// Clamp one raw per-base depth to fgbio's `Short` ceiling before it contributes to a
+/// scalar consensus depth tag, so `min`/`max`/sum over per-base depths reproduce fgbio
+/// exactly (fgbio caps each per-base depth in its `Array[Short]`, then takes
+/// `.max`/`.min`; for the duplex combined depth it caps each strand's per-base value
+/// *before* summing). Returns `i32` so a summed duplex value cannot overflow.
+#[must_use]
+pub fn clamp_per_base_to_fgbio_short(depth: u16) -> i32 {
+    i32::from(depth.min(FGBIO_SHORT_DEPTH_MAX))
+}
+
 /// Reasons why reads might be rejected and not used in consensus calling
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RejectionReason {
@@ -514,6 +531,21 @@ pub fn make_prefix_from_header(header: &Header) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
+
+    /// The scalar depth-tag clamp mirrors fgbio's `Short` per-base ceiling: values at or
+    /// below 32767 pass through; anything above (up to `u16::MAX`) saturates at 32767,
+    /// never truncating to a negative or wrapped value.
+    #[rstest]
+    #[case::zero(0, 0)]
+    #[case::small(5, 5)]
+    #[case::at_ceiling(32_767, 32_767)]
+    #[case::just_above(32_768, 32_767)]
+    #[case::deep(40_000, 32_767)]
+    #[case::u16_max(65_535, 32_767)]
+    fn test_clamp_per_base_to_fgbio_short(#[case] input: u16, #[case] expected: i32) {
+        assert_eq!(clamp_per_base_to_fgbio_short(input), expected);
+    }
 
     #[test]
     fn test_consensus_output_estimate_heap_size_empty() {
