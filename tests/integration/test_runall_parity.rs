@@ -1229,6 +1229,143 @@ fn runall_reads_bam_from_stdin_once() {
     assert_bams_record_equivalent_nonempty(&from_file, &from_stdin);
 }
 
+/// The `(offset, len)` of every BGZF block in `bam`, in file order.
+///
+/// Only the block framing is read: `BSIZE` lives at offset 16 of each block
+/// header and holds the total block size minus one. That is enough to pick a
+/// truncation point by structure rather than by guessing at a byte fraction.
+fn bgzf_block_bounds(bam: &[u8]) -> Vec<(usize, usize)> {
+    const BGZF_HEADER_SIZE: usize = 18;
+    const BSIZE_OFFSET: usize = 16;
+
+    let mut bounds = Vec::new();
+    let mut offset = 0;
+    while offset + BGZF_HEADER_SIZE <= bam.len() {
+        let bsize =
+            u16::from_le_bytes([bam[offset + BSIZE_OFFSET], bam[offset + BSIZE_OFFSET + 1]]);
+        let block_len = usize::from(bsize) + 1;
+        // A malformed or truncated trailing block would otherwise loop forever or
+        // report a block running past the buffer.
+        if block_len < BGZF_HEADER_SIZE || offset + block_len > bam.len() {
+            break;
+        }
+        bounds.push((offset, block_len));
+        offset += block_len;
+    }
+    bounds
+}
+
+/// CG-5 (audit E2): every runall failure test rejects *before* the pipeline runs
+/// (invalid stage pair, missing `--unmapped`/`--ref`/`--umis`, bad flag combo).
+/// None checks that the fused BAM-in pipeline fails *cleanly mid-run* when a
+/// downstream stage hits malformed input. Feed `runall --start-from group
+/// --stop-after consensus --consensus simplex` a BAM truncated mid-stream and
+/// assert a clean non-zero exit — no panic / `unreachable`, and (via a
+/// wall-clock watchdog) no hang.
+#[test]
+fn runall_group_simplex_fails_cleanly_on_truncated_bam() {
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let tmp = TempDir::new().unwrap();
+    let fixture = sorted_simplex_fixture(tmp.path());
+
+    // Truncate the sorted input BAM so the reader errors partway through a real
+    // record stream rather than failing an up-front header parse.
+    //
+    // The cut point is derived from the file's actual BGZF block boundaries, not
+    // from a fraction of its length. A fraction cannot state the property this
+    // test needs — "past the header block, inside a record block" — and on this
+    // fixture it very nearly fails to hold it: the file is ~592 bytes with its
+    // header block ending at ~329, so a 60% cut landed only ~26 bytes inside the
+    // first record block. Any growth in the header (a longer `@PG CL` from a
+    // longer temp path, a longer version string) would push the cut back into the
+    // header block, silently turning this into the up-front-parse-failure case
+    // that other tests already cover — while still passing.
+    let bytes = fs::read(&fixture).expect("read fixture");
+    let blocks = bgzf_block_bounds(&bytes);
+    assert!(
+        blocks.len() >= 3,
+        "fixture must have a header block, at least one record block, and the EOF block to \
+         truncate meaningfully; got {} block(s) in {} bytes",
+        blocks.len(),
+        bytes.len()
+    );
+    // Halfway into the second block: past the header, inside real record data.
+    let (record_block_start, record_block_len) = blocks[1];
+    let keep = record_block_start + record_block_len / 2;
+    assert!(
+        keep > record_block_start && keep < record_block_start + record_block_len,
+        "cut point {keep} must fall strictly inside the first record block \
+         [{record_block_start}, {})",
+        record_block_start + record_block_len
+    );
+    let truncated = tmp.path().join("truncated.bam");
+    fs::write(&truncated, &bytes[..keep]).expect("write truncated bam");
+
+    let out_path = tmp.path().join("out.bam");
+    let args = ParityArgs::for_simplex_like();
+    let mut child = Command::new(fgumi_binary())
+        .args([
+            "runall",
+            "--start-from",
+            "group",
+            "--stop-after",
+            "consensus",
+            "--consensus",
+            "simplex",
+            "--input",
+            truncated.to_str().unwrap(),
+            "--output",
+            out_path.to_str().unwrap(),
+            "--group::strategy",
+            args.strategy,
+            "--group::edits",
+            &args.edits.to_string(),
+            "--simplex::min-reads",
+            args.min_reads,
+            // Deliberately more than `args.threads` (1): a mid-run failure has to
+            // stay clean when several workers are in flight, which is where a
+            // partial-shutdown panic or a hang would actually show up.
+            "--threads",
+            "2",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn fgumi runall");
+
+    // Drain stderr on a worker so a hung child (which never closes the pipe)
+    // cannot block the watchdog loop below.
+    let mut stderr_pipe = child.stderr.take().expect("child stderr");
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr_pipe.read_to_string(&mut s);
+        s
+    });
+
+    // Wall-clock watchdog: a mid-run corruption must fail fast, never hang.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("runall did not exit within 60s on truncated input (hang?)");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let stderr = reader.join().expect("join stderr reader");
+
+    assert!(!status.success(), "runall must fail on a truncated BAM; stderr:\n{stderr}");
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("unreachable"),
+        "runall must fail cleanly (no panic/unreachable) on truncated input; stderr:\n{stderr}"
+    );
+}
+
 /// Write a gzip-compressed FASTQ from `(name, seq, qual)` records.
 fn write_gzip_fastq(path: &Path, records: &[(&str, &str, &str)]) {
     use std::io::Write as _;

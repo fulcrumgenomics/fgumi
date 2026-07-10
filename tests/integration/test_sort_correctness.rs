@@ -505,6 +505,121 @@ fn coordinate_sort_matrix(#[case] spill: Spill) {
     assert_records_preserved(&input, &output);
 }
 
+/// CG-3 (audit E1): the spill matrix drives `-m` down to *force* spills but
+/// never asserts one actually happened. If memory accounting regressed so the
+/// engine ignored `-m` and held everything in RAM, every matrix case would still
+/// pass (output is still correct) — silently deleting all spill/merge coverage
+/// *and* the memory-bound guarantee. Pin the lever directly by observing the
+/// arena `SortMerge` step's INFO log: a tiny `-m` must take the disk-spill merge
+/// path ("Sort merge complete"), while a large `-m` must take the single-source
+/// in-memory fast path ("in-memory fast path complete"). Run as a subprocess so
+/// `RUST_LOG=info` is honored, with `--threads 1` so the in-memory case is a
+/// single source (deterministic fast path).
+/// `expect_multiple_sources` is what separates `single_spill` from `many_spill`:
+/// both take the merge path, so asserting only `expect_spill` would make the two
+/// cases byte-identical and their labels would claim a distinction nothing checks
+/// — `many_spill` would still pass if `-m 64K` regressed to a single chunk. The
+/// merge's own INFO line reports the chunk count (`… (N records, M sources)`), so
+/// the spill *count* is observable: measured here as 1 source at `-m 200K` and 4
+/// at `-m 64K`. Asserted as one-vs-many rather than an exact 4, which would break
+/// on any record-size or compression tuning without indicating a real regression.
+#[rstest]
+#[case::in_memory("256M", false, None)]
+#[case::single_spill("200K", true, Some(false))]
+#[case::many_spill("64K", true, Some(true))]
+fn sort_spill_actually_occurs_under_small_memory(
+    #[case] max_memory: &str,
+    #[case] expect_spill: bool,
+    #[case] expect_multiple_sources: Option<bool>,
+) {
+    let (dir, input) = build_unsorted_fixture(1500);
+    let output = dir.path().join("sorted.bam");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .env("RUST_LOG", "info")
+        .args([
+            "sort",
+            "-i",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--order",
+            "coordinate",
+            "--threads",
+            "1",
+            "-m",
+            max_memory,
+            "--temp-compression",
+            "1",
+        ])
+        .output()
+        .expect("spawn fgumi sort");
+    assert!(
+        out.status.success(),
+        "fgumi sort failed (-m {max_memory}): {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    let merged = stderr.contains("Sort merge complete");
+    let in_memory = stderr.contains("in-memory fast path complete");
+    if expect_spill {
+        assert!(
+            merged && !in_memory,
+            "-m {max_memory} must force a disk-spill merge, not the in-memory fast path.\n\
+             stderr:\n{stderr}"
+        );
+    } else {
+        assert!(
+            in_memory && !merged,
+            "-m {max_memory} must sort entirely in memory (no spill/merge).\nstderr:\n{stderr}"
+        );
+    }
+
+    // Pin how *many* chunks spilled, not just that spilling happened, so the
+    // `single_spill` / `many_spill` labels mean something. The merge logs
+    // `… (N records, M sources)`; `M` is its chunk count.
+    if let Some(expect_multiple) = expect_multiple_sources {
+        let sources = stderr
+            .lines()
+            .find_map(|line| {
+                // "… Sort merge diag: … (3020 records, 4 sources)"
+                let (_, tail) = line.split_once("Sort merge diag:")?;
+                let (_, after_records) = tail.split_once("records, ")?;
+                let (count, _) = after_records.split_once(" sources")?;
+                count.parse::<usize>().ok()
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "-m {max_memory} spilled, so the merge must log its source count.\n\
+                     stderr:\n{stderr}"
+                )
+            });
+        if expect_multiple {
+            assert!(
+                sources > 1,
+                "-m {max_memory} must spill more than one chunk (this is the `many_spill` case, \
+                 and a single chunk would make it a duplicate of `single_spill`); got {sources} \
+                 source(s).\nstderr:\n{stderr}"
+            );
+        } else {
+            assert_eq!(
+                sources, 1,
+                "-m {max_memory} must spill exactly one chunk (the `single_spill` case); got \
+                 {sources} source(s).\nstderr:\n{stderr}"
+            );
+        }
+    }
+
+    // The output must still be correct regardless of regime: the tool's own
+    // --verify guards against write corruption, and an INDEPENDENT in-test
+    // coordinate-order oracle (re-derived from the records via noodles, not the
+    // tool's --verify path) proves the order — mirroring `coordinate_sort_matrix`.
+    assert!(verify_sorted(&output, "coordinate"), "coordinate --verify guard failed");
+    assert_coordinate_ordered(&read_records(&output));
+    assert_records_preserved(&input, &output);
+}
+
 // ---------------------------------------------------------------------------
 // Queryname-lexicographic sort: full spill matrix, independent in-test oracle
 // ---------------------------------------------------------------------------
