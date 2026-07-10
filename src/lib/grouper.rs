@@ -727,8 +727,11 @@ impl FastqGrouper {
             combined
         };
 
-        // Parse FASTQ records
-        let (records, leftover) = parse_fastq_records(&combined)?;
+        // Parse FASTQ records. This is an incremental chunk (more bytes may follow
+        // for this stream), so `at_eof = false`: an unterminated final record must
+        // be held as leftover and completed by the next chunk, not mistaken for a
+        // complete shorter record. `finish` re-parses the final leftover at EOF.
+        let (records, leftover) = parse_fastq_records(&combined, false)?;
         self.leftovers[stream_idx] = leftover;
 
         // Add to pending
@@ -859,6 +862,21 @@ impl FastqGrouper {
     ///
     /// Returns an error if there is incomplete or unmatched data at EOF.
     pub fn finish(&mut self) -> io::Result<Option<FastqTemplate>> {
+        // At EOF, re-parse each stream's leftover with `at_eof = true` so a
+        // complete final record whose quality line lacks a terminating newline is
+        // accepted (matching the sibling `SimdFastqReader` and fgbio). During
+        // streaming these bytes were held back (`add_bytes_for_stream` parses with
+        // `at_eof = false`); a genuinely truncated leftover stays as leftover and
+        // is rejected by the "Incomplete FASTQ record at EOF" check below.
+        for stream_idx in 0..self.num_inputs {
+            if !self.leftovers[stream_idx].is_empty() {
+                let leftover = std::mem::take(&mut self.leftovers[stream_idx]);
+                let (records, remaining) = parse_fastq_records(&leftover, true)?;
+                self.pending_records[stream_idx].extend(records);
+                self.leftovers[stream_idx] = remaining;
+            }
+        }
+
         // Check for any remaining complete templates
         let templates = self.drain_complete_templates()?;
         if templates.len() == 1 {
@@ -1006,6 +1024,54 @@ mod tests {
         let mut grouper = FastqGrouper::new(2);
         let result = grouper.finish().expect("finish should succeed");
         assert!(result.is_none());
+    }
+
+    /// `add_bytes_for_stream` feeds *incremental* chunks: a chunk boundary can
+    /// fall in the middle of a record, and the tail must be held as leftover until
+    /// the next chunk completes it. If the parser treated a chunk's unterminated
+    /// final quality bytes as a complete record, a boundary landing mid-quality
+    /// would compute a short quality span and reject the (valid) record with a
+    /// spurious `Sequence length != quality length` error — or, at an exact
+    /// boundary, silently truncate it. The chunk here splits the valid record
+    /// `@r/1\nACGT\n+\nIIII\n` after two of its four quality bytes; the grouper
+    /// must hold the partial record and reassemble the full `qual=IIII` record.
+    #[test]
+    fn add_bytes_for_stream_holds_unterminated_record_across_chunks() {
+        let mut grouper = FastqGrouper::new(1);
+        grouper
+            .add_bytes_for_stream(0, b"@r/1\nACGT\n+\nII")
+            .expect("a mid-quality chunk boundary must be held as leftover, not rejected");
+        grouper.add_bytes_for_stream(0, b"II\n").expect("second chunk should complete the record");
+
+        let template = grouper
+            .finish()
+            .expect("finish should succeed")
+            .expect("one reassembled template expected");
+        assert_eq!(template.records[0].sequence(), b"ACGT");
+        assert_eq!(
+            template.records[0].quality(),
+            b"IIII",
+            "the quality split across the chunk boundary must be reassembled, not truncated"
+        );
+    }
+
+    /// A complete final record whose quality line lacks a terminating newline is
+    /// still valid FASTQ (fgbio's `lines.take(4)` accepts it, as does the sibling
+    /// `SimdFastqReader`). Fed as a single final chunk, the grouper must accept it
+    /// at `finish()` rather than rejecting it as "Incomplete FASTQ record at EOF".
+    #[test]
+    fn finish_accepts_unterminated_final_record() {
+        let mut grouper = FastqGrouper::new(1);
+        grouper
+            .add_bytes_for_stream(0, b"@r/1\nACGT\n+\nIIII")
+            .expect("add_bytes_for_stream should succeed");
+
+        let template = grouper
+            .finish()
+            .expect("finish should accept an unterminated final record")
+            .expect("one final template expected");
+        assert_eq!(template.records[0].sequence(), b"ACGT");
+        assert_eq!(template.records[0].quality(), b"IIII");
     }
 
     #[test]
