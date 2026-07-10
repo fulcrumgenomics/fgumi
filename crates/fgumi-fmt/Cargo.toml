@@ -1,0 +1,16 @@
+[package]
+name = "fgumi-fmt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Human-readable formatting helpers (counts, durations) shared across the fgumi workspace"
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+rstest = "0.26"
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }

@@ -15,6 +15,7 @@ pedantic = { level = "deny", priority = -1 }
 
 [dependencies]
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
+fgumi-fmt = { workspace = true }
 noodles = { version = "0.111.0", features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
 noodles-bgzf = { version = "0.47.0", features = ["libdeflate"] }
 noodles-csi = "0.56.0"

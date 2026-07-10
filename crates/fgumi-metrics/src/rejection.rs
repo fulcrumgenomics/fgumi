@@ -133,31 +133,11 @@ impl fmt::Display for RejectionReason {
     }
 }
 
-/// Formats a count with thousands separators.
-///
-/// # Examples
-///
-/// ```
-/// use fgumi_metrics::rejection::format_count;
-///
-/// assert_eq!(format_count(1234567), "1,234,567");
-/// assert_eq!(format_count(123), "123");
-/// ```
-#[must_use]
-pub fn format_count(n: u64) -> String {
-    let s = n.to_string();
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-    let num_commas = if len > 3 { (len - 1) / 3 } else { 0 };
-    let mut result = String::with_capacity(len + num_commas);
-    for (i, &byte) in bytes.iter().enumerate() {
-        if i > 0 && (len - i).is_multiple_of(3) {
-            result.push(',');
-        }
-        result.push(byte as char);
-    }
-    result
-}
+// `format_count` lives in the dependency-free `fgumi-fmt` leaf crate so it is shared with
+// `fgumi-cli-common` and `fgumi-bam-io` instead of copied. Re-exported here (and via
+// `fgumi_metrics::format_count`) so existing `fgumi_metrics::rejection::format_count`
+// callers keep resolving.
+pub use fgumi_fmt::format_count;
 
 #[cfg(test)]
 mod tests {

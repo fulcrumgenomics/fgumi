@@ -128,52 +128,10 @@ pub fn detect_cpu_count() -> usize {
 // Formatting helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Format an integer with comma separators (e.g. 1234567 → "1,234,567").
-#[must_use]
-pub fn format_count(n: u64) -> String {
-    let s = n.to_string();
-    let mut result = String::with_capacity(s.len() + s.len() / 3);
-    let offset = s.len() % 3;
-    for (i, c) in s.chars().enumerate() {
-        // Insert a comma before every group of three digits, but not before
-        // the first character. `offset` is the length of the leading partial
-        // group, so commas fall at indices `offset, offset+3, offset+6, …`
-        // (skipping index 0 when `offset == 0`).
-        if i >= offset && i > 0 && (i - offset).is_multiple_of(3) {
-            result.push(',');
-        }
-        result.push(c);
-    }
-    result
-}
-
-/// Formats a duration in human-readable form.
-///
-/// # Examples
-///
-/// ```
-/// use fgumi_cli_common::format_duration;
-/// use std::time::Duration;
-///
-/// assert_eq!(format_duration(Duration::from_secs(45)), "45s");
-/// assert_eq!(format_duration(Duration::from_secs(135)), "2m 15s");
-/// assert_eq!(format_duration(Duration::from_secs(5400)), "1h 30m");
-/// ```
-#[must_use]
-pub fn format_duration(duration: std::time::Duration) -> String {
-    let secs = duration.as_secs();
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        let mins = secs / 60;
-        let remaining_secs = secs % 60;
-        if remaining_secs == 0 { format!("{mins}m") } else { format!("{mins}m {remaining_secs}s") }
-    } else {
-        let hours = secs / 3600;
-        let mins = (secs % 3600) / 60;
-        if mins == 0 { format!("{hours}h") } else { format!("{hours}h {mins}m") }
-    }
-}
+// `format_count` and `format_duration` live in the dependency-free `fgumi-fmt` leaf crate
+// so `fgumi-cli-common`, `fgumi-metrics`, and `fgumi-bam-io` share one implementation.
+// Re-exported here so `fgumi_cli_common::{format_count, format_duration}` keep resolving.
+pub use fgumi_fmt::{format_count, format_duration};
 
 /// Formats a rate (items per second) with appropriate units.
 ///
