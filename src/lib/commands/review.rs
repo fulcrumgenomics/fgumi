@@ -26,6 +26,53 @@ use std::path::{Path, PathBuf};
 
 use super::command::Command;
 
+/// Extracts the source molecule id from a record's `MI` tag, truncated at the
+/// last `/` (see [`extract_mi_base`]).
+///
+/// Mirrors fgbio `ReviewConsensusVariants.toMi`: a record that reaches this
+/// point is expected to carry an `MI` tag, and it is an error if it does not
+/// (fgbio throws `IllegalStateException`; `ReviewConsensusVariantsTest.scala:166`).
+fn to_mi(record: &RawRecord) -> Result<String> {
+    match find_string_tag_in_record(record, SamTag::MI) {
+        Some(mi_bytes) => Ok(extract_mi_base(std::str::from_utf8(mi_bytes)?).to_string()),
+        None => {
+            bail!("{} did not have a value for tag MI", String::from_utf8_lossy(record.read_name()))
+        }
+    }
+}
+
+/// Formats a genotype the way htsjdk's `Genotype.getGenotypeString` does, so the
+/// `genotype` column matches fgbio's (`variant.genotype.getOrElse("NA")`).
+///
+/// Each allele position is mapped to its base string (`0` => reference,
+/// `i` => `i`-th alternate, missing => `.`) and the base strings are joined in
+/// genotype order. htsjdk preserves allele order (it does not sort, so `1/0`
+/// renders as `T/A`, not `A/T`); only the separator differs — `|` for a fully
+/// phased genotype, otherwise `/`.
+fn format_genotype_string(
+    alleles: &[noodles::vcf::variant::record_buf::samples::sample::value::genotype::Allele],
+    reference: &str,
+    alternates: &[String],
+) -> String {
+    use noodles::vcf::variant::record::samples::series::value::genotype::Phasing;
+
+    let strings: Vec<String> = alleles
+        .iter()
+        .map(|allele| match allele.position() {
+            None => ".".to_string(),
+            Some(0) => reference.to_string(),
+            Some(i) => alternates.get(i - 1).cloned().unwrap_or_else(|| ".".to_string()),
+        })
+        .collect();
+
+    // htsjdk treats a genotype as phased only when every separator is `|`, which
+    // noodles records as `Phased` on each allele after the first.
+    let phased = alleles.len() > 1 && alleles[1..].iter().all(|a| a.phasing() == Phasing::Phased);
+    let separator = if phased { "|" } else { "/" };
+
+    strings.join(separator)
+}
+
 /// Reviews consensus variant calls by extracting relevant reads.
 ///
 /// Creates filtered BAM files containing consensus reads with variants
@@ -454,40 +501,33 @@ impl Review {
         }
     }
 
-    /// Extract genotype for a specific sample
+    /// Extract genotype for a specific sample.
     ///
-    /// Returns the genotype string (e.g., "0/1", "1|1") for the specified sample.
-    /// Implementation note: This is simplified due to noodles API complexity.
-    /// For production use with complex VCF files, consider enhancing with proper genotype parsing.
+    /// Returns the genotype rendered like htsjdk's `Genotype.getGenotypeString`
+    /// (e.g. `A/T`, `A|T`) — the format fgbio writes to the `genotype` column —
+    /// or `None` if the sample has no `GT` value.
     fn extract_genotype_for_sample(
         record: &noodles::vcf::variant::RecordBuf,
         header: &noodles::vcf::Header,
         sample_name: &str,
     ) -> Option<String> {
-        use noodles::vcf::variant::record::samples::Sample;
+        use noodles::vcf::variant::record_buf::samples::sample::Value;
 
         // Find the sample index
         let sample_idx = header.sample_names().iter().position(|s| s == sample_name)?;
 
-        // Get the samples
         let samples = record.samples();
-        let keys = samples.keys();
+        let gt_idx = samples.keys().as_ref().iter().position(|k| k == "GT")?;
+        let sample = samples.get_index(sample_idx)?;
 
-        // Try to get the GT field for this sample
-        let gt_key = "GT";
-
-        // Iterate through sample keys to find GT
-        if let Some(gt_idx) = keys.as_ref().iter().position(|k| k == gt_key) {
-            // Access the sample value at this index
-            if let Some(sample_values) = samples.get_index(sample_idx) {
-                if let Some(Ok(Some(gt_value))) = sample_values.get_index(header, gt_idx) {
-                    // Convert to string representation
-                    return Some(format!("{gt_value:?}"));
-                }
-            }
+        match sample.values().get(gt_idx) {
+            Some(Some(Value::Genotype(genotype))) => Some(format_genotype_string(
+                genotype.as_ref(),
+                record.reference_bases(),
+                record.alternate_bases().as_ref(),
+            )),
+            _ => None,
         }
-
-        None
     }
 
     /// Extract filters from VCF record
@@ -642,15 +682,14 @@ impl Review {
 
                 // Check if this read has a non-reference base at the variant position
                 if self.has_non_reference_base(&record, variant)? {
-                    // Extract MI tag
-                    if let Some(mi_bytes) = find_string_tag_in_record(&record, SamTag::MI) {
-                        let mi = std::str::from_utf8(mi_bytes)?;
-                        let mi_base = extract_mi_base(mi).to_string();
-                        mi_set.insert(mi_base);
+                    // fgbio records `toMi(rec)` in its source set for every
+                    // non-reference consensus read, erroring if the MI tag is
+                    // absent (ReviewConsensusVariantsTest.scala:166).
+                    let mi_base = to_mi(&record)?;
+                    mi_set.insert(mi_base);
 
-                        // Write raw record to output BAM.
-                        write_raw_record(writer.get_mut(), &record)?;
-                    }
+                    // Write raw record to output BAM.
+                    write_raw_record(writer.get_mut(), &record)?;
                 }
             }
         }
@@ -706,6 +745,12 @@ impl Review {
             progress.log_if_needed(1);
 
             // Extract MI tag directly from raw bytes; no RecordBuf decode needed.
+            // Unlike fgbio's `query(variants)` (which only touches variant-overlapping
+            // reads and errors via `toMi` on a missing MI), this is a full sequential
+            // scan of the grouped BAM, so a missing MI is skipped rather than an error:
+            // an MI-less read cannot be in `mi_set` and erroring here would be stricter
+            // than fgbio for reads that don't overlap any variant. Variant-overlapping
+            // grouped reads are still MI-guarded in `generate_review_file` via `to_mi`.
             if let Some(mi_bytes) = find_string_tag_in_record(&raw_rec, SamTag::MI) {
                 let mi = std::str::from_utf8(mi_bytes)?;
                 let mi_base = extract_mi_base(mi);
@@ -783,14 +828,12 @@ impl Review {
                 // If None, check if it's a spanning deletion
                 let read_base = match self.get_base_at_position(&record, variant.pos)? {
                     Some(b) => Self::normalize_base_for_variant(b, variant.ref_base) as char,
-                    None => {
-                        // Check if this is a spanning deletion (position is within a deletion)
-                        if self.is_spanning_deletion(&record, variant.pos)? {
-                            '*' // Use '*' to represent spanning deletion
-                        } else {
-                            continue; // Position not covered by read
-                        }
-                    }
+                    // fgbio iterates `SamLocusIterator.getRecordAndOffsets`, which
+                    // excludes reads with a deletion (or no base) at the locus, so
+                    // spanning-deletion reads produce no detail row
+                    // (ReviewConsensusVariantsTest.scala:250-251). Such reads are
+                    // still extracted to the output BAMs by `has_non_reference_base`.
+                    None => continue,
                 };
 
                 // Skip if it's the reference base (unless we're not ignoring Ns)
@@ -806,12 +849,9 @@ impl Review {
                 // Get the quality at this position
                 let read_qual = self.get_quality_at_position(&record, variant.pos)?.unwrap_or(0);
 
-                // Extract MI tag from raw bytes
-                let mi_str = match find_string_tag_in_record(&record, SamTag::MI) {
-                    Some(mi_bytes) => std::str::from_utf8(mi_bytes)?.to_string(),
-                    None => continue,
-                };
-                let mi_base = extract_mi_base(&mi_str);
+                // Source molecule id for this consensus read (fgbio calls
+                // `toMi(rec)`, which errors when the MI tag is absent).
+                let mi_base = to_mi(&record)?;
 
                 // Format consensus read name with /1 or /2 suffix
                 let read_name = String::from_utf8_lossy(record.read_name()).to_string();
@@ -836,14 +876,10 @@ impl Review {
                     for result in grouped_reader.query(&grouped_header, &region)? {
                         let rec = result?;
 
-                        // Extract MI tag from raw bytes
-                        let grp_mi_str = match find_string_tag_in_record(&rec, SamTag::MI) {
-                            Some(mi_bytes) => std::str::from_utf8(mi_bytes)?.to_string(),
-                            None => continue,
-                        };
-
-                        // Check if MI matches
-                        let read_mi_base = extract_mi_base(&grp_mi_str);
+                        // Source molecule id for this grouped read. fgbio buckets
+                        // the locus's grouped reads with `toMi(rec)` (erroring on a
+                        // missing MI tag) before matching them to the consensus MI.
+                        let read_mi_base = to_mi(&rec)?;
                         if read_mi_base != mi_base {
                             continue;
                         }
@@ -1091,6 +1127,7 @@ impl Review {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -1540,6 +1577,71 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
         assert_eq!(review_path, PathBuf::from("/path/to/output.txt"));
     }
 
+    // ------------------------------------------------------------------
+    // Unit tests for the fgbio-parity helpers (REV-01 genotype, REV-05 MI guard)
+    // ------------------------------------------------------------------
+
+    /// Each case pairs a genotype — a list of `(allele position, is_phased)` tuples — with the
+    /// reference base, the ALT bases, and the htsjdk-formatted string `format_genotype_string`
+    /// must produce. Using an `#[rstest]` case table reports each parity scenario independently
+    /// on failure.
+    #[rstest]
+    // Unphased het 0/1 (REF=A, ALT=[T]) => base strings joined with `/`.
+    #[case::unphased_het(&[(Some(0), false), (Some(1), false)], "A", &["T"], "A/T")]
+    // htsjdk preserves genotype order (it does NOT sort), so 1/0 => "T/A".
+    // Verified against fgbio ReviewConsensusVariants on a `GT=1/0` record.
+    #[case::unphased_order_preserved(&[(Some(1), false), (Some(0), false)], "A", &["T"], "T/A")]
+    // Phased 0|1 preserves order and joins with `|`.
+    #[case::phased(&[(Some(0), true), (Some(1), true)], "A", &["T"], "A|T")]
+    // Multi-allelic phased using the second alternate (index 2 => ALT[1]).
+    #[case::phased_multiallelic(&[(Some(1), true), (Some(2), true)], "A", &["C", "G"], "C|G")]
+    // A missing allele renders as `.`.
+    #[case::missing_allele(&[(None, false), (Some(1), false)], "A", &["T"], "./T")]
+    fn test_format_genotype_string_matches_htsjdk(
+        #[case] alleles: &[(Option<usize>, bool)],
+        #[case] reference: &str,
+        #[case] alternates: &[&str],
+        #[case] expected: &str,
+    ) {
+        use noodles::vcf::variant::record::samples::series::value::genotype::Phasing;
+        use noodles::vcf::variant::record_buf::samples::sample::value::genotype::Allele;
+
+        let genotype: Vec<Allele> = alleles
+            .iter()
+            .map(|&(position, phased)| {
+                Allele::new(position, if phased { Phasing::Phased } else { Phasing::Unphased })
+            })
+            .collect();
+        let alternates: Vec<String> = alternates.iter().map(|s| (*s).to_string()).collect();
+
+        assert_eq!(format_genotype_string(&genotype, reference, &alternates), expected);
+    }
+
+    #[test]
+    fn test_to_mi_truncates_and_errors_when_absent() {
+        use fgumi_raw_bam::SamBuilder as RawSamBuilder;
+
+        // Present MI with a non-/A,/B suffix is truncated at the last `/` (REV-02).
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"withmi").sequence(b"A").qualities(&[30]);
+        b.add_string_tag(SamTag::MI, b"5/456");
+        assert_eq!(to_mi(&b.build()).expect("MI present"), "5");
+
+        // A leading `/` is preserved (fgbio's `slash > 0` guard): only the *last* `/`
+        // truncates, so `/abc/456` keeps the leading-slash prefix `/abc`.
+        let mut b_lead = RawSamBuilder::new();
+        b_lead.read_name(b"leadmi").sequence(b"A").qualities(&[30]);
+        b_lead.add_string_tag(SamTag::MI, b"/abc/456");
+        assert_eq!(to_mi(&b_lead.build()).expect("MI present"), "/abc");
+
+        // Absent MI is an error, mirroring fgbio `toMi`
+        // (ReviewConsensusVariantsTest.scala:166).
+        let mut b2 = RawSamBuilder::new();
+        b2.read_name(b"nomi").sequence(b"A").qualities(&[30]);
+        let err = to_mi(&b2.build()).expect_err("missing MI must error");
+        assert!(err.to_string().contains("nomi"), "error should name the read: {err}");
+    }
+
     // Integration tests based on Scala test suite
 
     #[test]
@@ -1767,13 +1869,17 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
         // Should have header plus data rows
         assert!(lines.len() > 1, "TSV should have header and data rows");
 
-        // Check header contains expected columns
+        // Check header contains expected columns. The reference-allele column is
+        // named `ref` to match fgbio's `ConsensusVariantReviewInfo` (REV-04), not
+        // `ref_allele`.
         let header = &lines[0];
-        assert!(header.contains("chrom"));
-        assert!(header.contains("pos"));
-        assert!(header.contains("ref_allele"));
-        assert!(header.contains("consensus_read"));
-        assert!(header.contains("consensus_call"));
+        let columns: Vec<&str> = header.split('\t').collect();
+        assert!(columns.contains(&"chrom"));
+        assert!(columns.contains(&"pos"));
+        assert!(columns.contains(&"ref"), "reference column must be `ref`, got: {header}");
+        assert!(!columns.contains(&"ref_allele"), "column must not be `ref_allele`: {header}");
+        assert!(columns.contains(&"consensus_read"));
+        assert!(columns.contains(&"consensus_call"));
     }
 
     #[test]
@@ -1822,6 +1928,48 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
 
         // D should be extracted (spanning deletion at chr1:30)
         assert!(consensus_reads.contains(&"D".to_string()));
+
+        // REV-03: but the spanning-deletion read must NOT get a row in the review
+        // .txt (fgbio's SamLocusIterator.getRecordAndOffsets excludes deletions;
+        // ReviewConsensusVariantsTest.scala:250-251).
+        let txt_out = output_path.with_extension("txt");
+        let content = std::fs::read_to_string(&txt_out).expect("failed to read review txt");
+        assert!(
+            !content.contains("\tD/1\t"),
+            "spanning-deletion read D should not have a review row:\n{content}"
+        );
+        assert!(
+            !content.contains("\t*\t"),
+            "no row should carry a spanning-deletion `*` call:\n{content}"
+        );
+
+        // REV-03: the grouped/raw spanning-deletion read (D1, MI=D) is still extracted to
+        // the grouped output BAM — only the review .txt row is suppressed, not the read
+        // itself (fgbio `readBamRecs(rawOut)` contains `D1/1`;
+        // ReviewConsensusVariantsTest.scala:249).
+        let grouped_out = output_path.with_extension("grouped.bam");
+        let mut grp_reader = bam::io::indexed_reader::Builder::default()
+            .build_from_path(&grouped_out)
+            .expect("failed to open grouped BAM");
+        let grp_header = grp_reader.read_header().expect("failed to read grouped BAM header");
+        let mut grouped_reads = Vec::new();
+        let mut grp_record = noodles::sam::alignment::RecordBuf::default();
+        while grp_reader
+            .read_record_buf(&grp_header, &mut grp_record)
+            .expect("failed to read grouped BAM record")
+            > 0
+        {
+            grouped_reads.push(
+                String::from_utf8_lossy(
+                    grp_record.name().expect("record should have name").as_ref(),
+                )
+                .to_string(),
+            );
+        }
+        assert!(
+            grouped_reads.contains(&"D1".to_string()),
+            "spanning-deletion grouped read D1 must still be extracted: {grouped_reads:?}"
+        );
     }
 
     #[test]
