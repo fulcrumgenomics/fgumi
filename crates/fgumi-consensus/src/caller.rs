@@ -377,6 +377,8 @@ pub enum RejectionReason {
     IndelErrorBetweenStrands,
     /// Potential collision
     PotentialCollision,
+    /// Template did not have a single primary FR pair of reads (codec)
+    NotPrimaryFrPair,
     /// Other unspecified reason
     Other,
 }
@@ -402,6 +404,7 @@ impl RejectionReason {
             Self::OrphanConsensus => 'P',
             Self::IndelErrorBetweenStrands => 'D',
             Self::PotentialCollision => 'C',
+            Self::NotPrimaryFrPair => 'R',
             Self::Other => 'O',
         }
     }
@@ -428,6 +431,7 @@ impl RejectionReason {
             Self::PotentialCollision => {
                 "Potential collisions (reads with the same MI but different strands)"
             }
+            Self::NotPrimaryFrPair => "Template did not have a single primary FR pair of reads",
             Self::Other => "Other reason",
         }
     }
@@ -458,6 +462,7 @@ impl RejectionReason {
             Self::ZeroLengthAfterTrimming => CentralReason::ZeroBasesPostTrimming,
             Self::OrphanConsensus => CentralReason::OrphanConsensus,
             Self::PotentialCollision => CentralReason::DuplicateUmi,
+            Self::NotPrimaryFrPair => CentralReason::NotPrimaryFrPair,
         }
     }
 }

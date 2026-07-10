@@ -48,6 +48,8 @@ pub enum RejectionReason {
     OrphanConsensus,
     /// Read had zero bases after quality trimming
     ZeroBasesPostTrimming,
+    /// Template did not have a single primary FR pair of reads (codec)
+    NotPrimaryFrPair,
 }
 
 impl RejectionReason {
@@ -73,6 +75,7 @@ impl RejectionReason {
             Self::DuplicateUmi => "Duplicate UMI at same genomic position",
             Self::OrphanConsensus => "Only one of R1 or R2 consensus generated",
             Self::ZeroBasesPostTrimming => "Read or mate had zero bases post trimming",
+            Self::NotPrimaryFrPair => "Template did not have a single primary FR pair of reads",
         }
     }
 
@@ -98,6 +101,7 @@ impl RejectionReason {
             Self::DuplicateUmi => "raw_reads_rejected_for_duplicate_umi",
             Self::OrphanConsensus => "raw_reads_rejected_for_orphan_consensus",
             Self::ZeroBasesPostTrimming => "raw_reads_rejected_for_zero_bases_post_trimming",
+            Self::NotPrimaryFrPair => "raw_reads_rejected_for_not_primary_fr_pair",
         }
     }
 
@@ -123,6 +127,7 @@ impl RejectionReason {
             Self::DuplicateUmi => "Duplicate UMI detected",
             Self::OrphanConsensus => "Only one of R1 or R2 consensus generated",
             Self::ZeroBasesPostTrimming => "Read or mate had zero bases post trimming",
+            Self::NotPrimaryFrPair => "Template did not have a single primary FR pair of reads",
         }
     }
 }

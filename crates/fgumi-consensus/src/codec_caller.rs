@@ -589,7 +589,10 @@ impl CodecConsensusCaller {
             .find_string(SamTag::MI)
             .map(|b| String::from_utf8_lossy(b).to_string());
 
-        // Phase 1: Filter on raw bytes — keep paired, primary, mapped, FR-pair reads
+        // Phase 1: Filter on raw bytes — keep paired, primary reads. FR classification is done
+        // per *pair* in Phase 2 (see is_primary_fr_pair_raw), NOT per record: the per-record
+        // is_fr_pair_raw check is asymmetric on dovetails whose aligned ends coincide and would
+        // silently drop legitimate FR pairs (CODEC-01).
         let mut paired_indices: Vec<usize> = Vec::new();
         let mut frag_count = 0usize;
         for (i, raw) in records.iter().enumerate() {
@@ -598,11 +601,9 @@ impl CodecConsensusCaller {
                 frag_count += 1;
                 continue;
             }
-            // Filter: primary, mapped, FR pair
-            if flg & (flags::SECONDARY | flags::SUPPLEMENTARY | flags::UNMAPPED) != 0 {
-                continue;
-            }
-            if !bam_fields::is_fr_pair_raw(raw) {
+            // Drop secondary/supplementary alignments (fgbio filters these out of the primary
+            // pairs; they are not consensus input and are not counted as rejections).
+            if flg & (flags::SECONDARY | flags::SUPPLEMENTARY) != 0 {
                 continue;
             }
             paired_indices.push(i);
@@ -632,7 +633,15 @@ impl CodecConsensusCaller {
 
         for name in name_order {
             let indices = by_name.get(name).expect("name from iteration");
-            if indices.len() != 2 {
+            // A template must be exactly one primary FR pair. Anything else — a singleton
+            // read-name bucket, or a pair that is not FR — is rejected and counted as
+            // NotPrimaryFrPair, matching fgbio's per-pair `partition` (which sweeps degenerate
+            // buckets in via its `case _ => false` arm). This is the counted reject that was
+            // previously a silent `continue` (R2-CODEC-01).
+            let is_primary_fr = indices.len() == 2
+                && bam_fields::is_primary_fr_pair_raw(&records[indices[0]], &records[indices[1]]);
+            if !is_primary_fr {
+                self.reject_records_count(indices.len(), CallerRejectionReason::NotPrimaryFrPair);
                 continue;
             }
 
@@ -2373,6 +2382,59 @@ mod tests {
             .expect("consensus_reads_from_sam_records should succeed");
 
         assert_eq!(output.count, 0, "Should not emit consensus for RF pair");
+        // R2-CODEC-01: both records of the non-FR template are counted as NotPrimaryFrPair
+        // (previously they were silently dropped with no rejection accounting).
+        assert_eq!(
+            caller.stats.rejection_reasons.get(&CallerRejectionReason::NotPrimaryFrPair),
+            Some(&2),
+            "RF pair records should be counted as NotPrimaryFrPair"
+        );
+    }
+
+    /// CODEC-01: a dovetail FR pair on which the per-record `is_fr_pair_raw` check is
+    /// asymmetric (the forward read is assigned a non-positive TLEN and mis-classified NOT-FR)
+    /// must pass FR classification and reach the consensus stage — it must NOT be dropped as a
+    /// non-primary-FR template. (Whether the synthetic overhang geometry then yields a consensus
+    /// depends on the unrelated overlap math; end-to-end consensus parity is covered by the
+    /// fgbio-oracle fixture. The behavioral change here is: kept, not silently dropped.)
+    #[test]
+    fn test_dovetail_fr_pair_is_not_rejected_as_non_fr() {
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            min_duplex_length: 1,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        // Dovetail: R1 forward @100 (100..149), R2 reverse @95 (95..144). The forward read's
+        // 5' (100) is left of the reverse read's 5' (144) => genuinely FR, but because
+        // start1 > start2 the helper gives R1 a negative TLEN, so the old per-record forward
+        // check reported NOT FR and dropped the pair (both reads vanished with no accounting).
+        let reads = create_fr_pair(
+            "dt",
+            100,
+            95,
+            50,
+            35,
+            &[(Kind::Match, 50)],
+            &[(Kind::Match, 50)],
+            "hi",
+            Some("ACC-TGA"),
+            false, // R1 forward
+            true,  // R2 reverse
+        );
+
+        caller
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
+
+        // The per-pair classification keeps the dovetail: it is NOT counted as NotPrimaryFrPair
+        // (the old per-record check would have dropped it here). This is the CODEC-01 fix.
+        assert_eq!(
+            caller.stats.rejection_reasons.get(&CallerRejectionReason::NotPrimaryFrPair),
+            None,
+            "a genuine (dovetail) FR pair must not be dropped/counted as NotPrimaryFrPair"
+        );
     }
 
     /// Port of fgbio test: "not emit a consensus when there are insufficient reads"

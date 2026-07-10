@@ -121,6 +121,9 @@ pub struct ConsensusMetrics {
 
     /// Reads rejected due to zero bases after trimming
     pub rejected_zero_bases_post_trimming: u64,
+
+    /// Reads rejected because the template was not a single primary FR pair (codec)
+    pub rejected_not_primary_fr_pair: u64,
 }
 
 /// Core rejection reasons always included in KV metrics output.
@@ -132,7 +135,14 @@ const CORE_REJECTIONS: [RejectionReason; 4] = [
 ];
 
 /// Optional rejection reasons included in KV metrics output only when non-zero.
-const OPTIONAL_REJECTIONS: [RejectionReason; 14] = [
+///
+/// `NotPrimaryFrPair` is codec-only in fgbio (`usedByCodec` only), so it is optional here rather
+/// than a core reason: emitting it only when non-zero fixes the R2-CODEC-01 "reads vanish from
+/// the rejection metrics" defect for codec without making simplex/duplex emit a spurious `=0`
+/// row that fgbio never writes for those callers. (fgbio additionally seeds it to 0 for codec so
+/// its row is always present in codec output even at zero; that always-emit-zero seeding is a
+/// separate metric-format concern tracked with the rejection-row seeding work.)
+const OPTIONAL_REJECTIONS: [RejectionReason; 15] = [
     RejectionReason::InsufficientStrandSupport,
     RejectionReason::LowBaseQuality,
     RejectionReason::ExcessiveNBases,
@@ -147,6 +157,7 @@ const OPTIONAL_REJECTIONS: [RejectionReason; 14] = [
     RejectionReason::UmiTooShort,
     RejectionReason::SameStrandOnly,
     RejectionReason::DuplicateUmi,
+    RejectionReason::NotPrimaryFrPair,
 ];
 
 /// Returns an iterator over all rejection reasons (core + optional).
@@ -187,6 +198,7 @@ impl ConsensusMetrics {
             rejected_duplicate_umi: 0,
             rejected_orphan_consensus: 0,
             rejected_zero_bases_post_trimming: 0,
+            rejected_not_primary_fr_pair: 0,
         }
     }
 
@@ -212,6 +224,7 @@ impl ConsensusMetrics {
             RejectionReason::DuplicateUmi => self.rejected_duplicate_umi,
             RejectionReason::OrphanConsensus => self.rejected_orphan_consensus,
             RejectionReason::ZeroBasesPostTrimming => self.rejected_zero_bases_post_trimming,
+            RejectionReason::NotPrimaryFrPair => self.rejected_not_primary_fr_pair,
         }
     }
 
@@ -242,6 +255,7 @@ impl ConsensusMetrics {
             RejectionReason::ZeroBasesPostTrimming => {
                 self.rejected_zero_bases_post_trimming += count;
             }
+            RejectionReason::NotPrimaryFrPair => self.rejected_not_primary_fr_pair += count,
         }
     }
 
