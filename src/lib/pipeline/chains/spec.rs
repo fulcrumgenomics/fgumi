@@ -1,7 +1,7 @@
 //! Declarative chain specification — input to [`super::build_for`].
 
 use crate::commands::common::{
-    CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
+    BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
 };
 use crate::pipeline::chains::{SinkSpec, SourceSpec, Stage, StageOptionsBag};
 
@@ -33,7 +33,49 @@ pub struct ChainSpec {
     pub command_line: String,
 }
 
+/// The CLI option blocks every BAM-in/BAM-out single-stage command carries.
+///
+/// Exists so [`ChainSpec::single_stage`] can take them as one argument instead of
+/// six positional ones; the fields are borrowed straight off the command struct.
+pub struct SingleStageContext<'a> {
+    pub io: &'a BamIoOptions,
+    pub threading: &'a ThreadingOptions,
+    pub compression: &'a CompressionOptions,
+    pub scheduler: &'a SchedulerOptions,
+    pub queue_memory: &'a QueueMemoryOptions,
+    /// For `@PG` line injection into the output header.
+    pub command_line: &'a str,
+}
+
 impl ChainSpec {
+    /// Build the spec for a command that runs exactly one stage, BAM in to BAM out.
+    ///
+    /// `simplex`, `duplex`, and `codec` are all this shape, differing only in their
+    /// [`Stage`] and which [`StageOptionsBag`] slot they fill. Constructing the
+    /// nine-field spec here rather than in each `execute` means a new `ChainSpec`
+    /// field is wired once: previously each command hand-built the struct, so a
+    /// field added to one and missed in the others left that command silently
+    /// running on a default its siblings did not use.
+    #[must_use]
+    pub fn single_stage(
+        stage: Stage,
+        stage_opts: StageOptionsBag,
+        ctx: &SingleStageContext<'_>,
+    ) -> Self {
+        Self {
+            stages: vec![stage],
+            source: SourceSpec::Bam(ctx.io.input.clone()),
+            sink: SinkSpec::Bam(ctx.io.output.clone()),
+            stage_opts,
+            threading: ctx.threading.clone(),
+            compression: ctx.compression.clone(),
+            scheduler: ctx.scheduler.clone(),
+            queue_memory: ctx.queue_memory.clone(),
+            async_reader: ctx.io.async_reader,
+            command_line: ctx.command_line.to_string(),
+        }
+    }
+
     /// Whether this is the standalone sort chain (`[Stage::Sort]` only).
     ///
     /// Standalone sort no longer has a special build path — like every other

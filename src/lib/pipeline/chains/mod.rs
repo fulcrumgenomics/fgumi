@@ -28,7 +28,7 @@ pub mod options_bag;
 pub use options_bag::StageOptionsBag;
 
 pub mod spec;
-pub use spec::ChainSpec;
+pub use spec::{ChainSpec, SingleStageContext};
 
 pub mod validate;
 
