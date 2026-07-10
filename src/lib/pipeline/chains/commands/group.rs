@@ -414,8 +414,9 @@ pub(crate) fn build_group_serialize_step(
 /// [`ChainBuilder`]'s `add_group` method in
 /// [`crate::pipeline::chains::builder`].
 ///
-/// The single-threaded fast path (`--threads` unset, BAM-only) is **not**
-/// migrated here — it stays inline in `GroupReadsByUmi::execute`.
+/// This is the sole group execution path for every thread count —
+/// `GroupReadsByUmi::execute` always routes here, and `--threads` unset resolves
+/// to a one-worker chain.
 ///
 /// # Errors
 ///

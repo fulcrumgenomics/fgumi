@@ -451,11 +451,11 @@ impl ThreadingMode {
 /// ```
 #[derive(Debug, Clone, Args)]
 pub struct ThreadingOptions {
-    /// Number of threads for the multi-threaded pipeline.
+    /// Number of worker threads for the pipeline.
     ///
-    /// If not specified, uses a single-threaded fast path optimized for
-    /// simple streaming. When specified (even with --threads 1), uses the
-    /// typed-step work-stealing pipeline.
+    /// If not specified, runs with a single worker (equivalent to `--threads 1`);
+    /// higher values enable the work-stealing parallel pipeline. Every command
+    /// routes through the same typed-step pipeline regardless of this value.
     #[arg(long = "threads")]
     pub threads: Option<usize>,
 }
@@ -571,7 +571,11 @@ impl ThreadingOptions {
         Self { threads: Some(threads) }
     }
 
-    /// Creates threading options with no threads specified (uses single-threaded fast path).
+    /// Creates threading options with no thread count specified. This yields a
+    /// single worker — the same `num_threads() == 1` worker count as `--threads
+    /// 1` — but a *distinct* `ThreadingMode::SingleThreaded` variant, not a
+    /// `Threads(1)`. It is therefore not fully equivalent to `--threads 1`:
+    /// `is_parallel()` is `false` here and `true` for `--threads 1`.
     #[must_use]
     pub fn none() -> Self {
         Self { threads: None }
@@ -579,8 +583,14 @@ impl ThreadingOptions {
 
     /// Returns the threading mode based on CLI options.
     ///
-    /// - `None` -> `SingleThreaded` (fast path, no pipeline)
-    /// - `Some(n)` -> `Threads(n)` (uses pipeline, even when n=1)
+    /// - `None` -> `SingleThreaded` (one worker; `num_threads() == 1`)
+    /// - `Some(n)` -> `Threads(n)`
+    ///
+    /// Both run through the typed-step pipeline and both report
+    /// `num_threads() == 1`, so they are equal in worker count. They are still
+    /// distinct variants: `SingleThreaded` is *not* parallel (`is_parallel()`
+    /// is `false`) whereas `Threads(1)` *is* (`is_parallel()` is `true`), and
+    /// the `log_message()` string differs.
     #[must_use]
     pub fn mode(&self) -> ThreadingMode {
         match self.threads {

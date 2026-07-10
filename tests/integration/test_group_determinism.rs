@@ -207,11 +207,10 @@ fn read_qname_mi(path: &Path) -> Vec<(String, u16, String)> {
 /// comparing pairwise raises the probability of catching the variance even
 /// when only a handful of subgroup keys are present.
 ///
-/// `threads = None` omits the `--threads` flag entirely. For `fgumi group`
-/// this triggers the dedicated `execute_single_threaded` fast path
-/// (`src/lib/commands/group.rs`'s `if self.threading.threads.is_none()` at
-/// the top of `execute`); `Some("1")` runs the parallel pipeline with one
-/// worker, which is a different code path. Both must be deterministic.
+/// `threads = None` omits the `--threads` flag entirely, which resolves to a
+/// one-worker chain (`num_threads() == 1`); `Some("1")` requests one worker
+/// explicitly. Both route through the same typed-step pipeline and must be
+/// deterministic (and, per `group_no_threads_matches_threads_1`, identical).
 fn assert_mi_deterministic(
     subcommand: &str,
     threads: Option<&str>,
@@ -301,11 +300,9 @@ fn assert_mi_deterministic(
 /// must assign identical `MI:Z` tags to every record across runs and across
 /// every supported threading mode.
 ///
-/// The three threads cases exercise three distinct code paths:
+/// The three threads cases exercise the pipeline at different worker counts:
 ///
-/// * `None` — `group` only: the dedicated `execute_single_threaded` fast
-///   path (taken when `--threads` is omitted), which assigns `MoleculeId`s
-///   inline without going through the unified pipeline scheduler.
+/// * `None` — `--threads` omitted, which resolves to a one-worker chain.
 /// * `Some("1")` — the unified pipeline with a single worker.
 /// * `Some("4")` — the unified pipeline with four workers, which was the
 ///   originally failing case before the serial-ordered `MI Assign` hook.
@@ -317,6 +314,142 @@ fn assert_mi_deterministic(
 #[case::dedup_threads_4("dedup", Some("4"))]
 fn test_paired_mi_deterministic(#[case] subcommand: &str, #[case] threads: Option<&str>) {
     assert_mi_deterministic(subcommand, threads, &[], 6);
+}
+
+/// B1 (audit): `fgumi group` with `--threads` unset must produce identical
+/// grouping to `--threads 1` — same record order and same per-record `MI:Z`
+/// tags. Historically the unset case took a bespoke `execute_single_threaded`
+/// orchestration while `--threads 1` routed through the typed-step chain; this
+/// pins that the two paths agree, which is the invariant that lets the
+/// single-threaded path be folded onto the chain (deleting the second
+/// orchestration). Uses the paired-orientation fixture — the case most sensitive
+/// to MI-numbering drift.
+///
+/// Beyond the unset-vs-`--threads 1` self-consistency check, this test also
+/// asserts the unset output against an INDEPENDENT oracle derived from the
+/// fixture construction (`assert_paired_fixture_oracle`), per the repo
+/// path-instruction that correctness-critical integration tests validate
+/// against an expectation not taken from the tool's own output — so that a
+/// grouping that is identical across the two paths but both wrong cannot pass.
+#[test]
+fn group_no_threads_matches_threads_1() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    build_mixed_orientation_bam(&input_bam);
+
+    let run = |out: &Path, threads: Option<&str>| {
+        let mut args: Vec<&str> = vec![
+            "group",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            out.to_str().unwrap(),
+            "--strategy",
+            "paired",
+            "--compression-level",
+            "1",
+        ];
+        if let Some(t) = threads {
+            args.extend(["--threads", t]);
+        }
+        let status =
+            Command::new(env!("CARGO_BIN_EXE_fgumi")).args(&args).status().expect("run group");
+        assert!(status.success(), "group (threads={threads:?}) failed");
+    };
+
+    let out_none = temp_dir.path().join("out_none.bam");
+    let out_t1 = temp_dir.path().join("out_t1.bam");
+    run(&out_none, None);
+    run(&out_t1, Some("1"));
+
+    let mi_none = read_qname_mi(&out_none);
+
+    // Independent oracle (satisfies the path-instruction that correctness-critical
+    // integration tests check against an expectation NOT derived from the tool's
+    // own output, so "identical-but-both-wrong" grouping cannot pass): assert the
+    // `--threads` unset output — the path PR 547 folds onto the chain — against
+    // the MI-group structure derived purely from the fixture construction.
+    assert_paired_fixture_oracle(&mi_none);
+
+    // Self-consistency: the folded unset path must match `--threads 1` exactly.
+    assert_eq!(
+        mi_none,
+        read_qname_mi(&out_t1),
+        "group --threads unset must match --threads 1 (record order + MI tags)"
+    );
+}
+
+/// Independent oracle for `build_mixed_orientation_bam` under `--strategy paired`.
+///
+/// Derived solely from the fixture construction (NOT the tool's output): the
+/// fixture emits, at each of 40 positions, for each of 256 distinct paired UMIs
+/// (4^4 prefixes; `{prefix}{prefix}-{suffix}{suffix}` with suffix = reversed
+/// prefix), one template in each of the two orientations (FR = `is_rf` false,
+/// RF = `is_rf` true).
+///
+/// Under the `paired` strategy the two orientations at the *same* position are
+/// distinct orientation subgroups, NOT the two strands of one duplex molecule:
+/// a duplex pair needs opposite-strand reads at *mirrored* coordinates, whereas
+/// here both orientations share identical coordinates. So each (position, UMI,
+/// orientation) is its own molecule and the orientations do NOT merge:
+///
+///   families = 40 positions × 256 UMIs × 2 orientations = 20480
+///
+/// (If they had merged it would be 40 × 256 = 10240; the empirical run confirms
+/// 20480, i.e. the 40 × 512 branch.) Each template is 2 reads and no two
+/// templates share a family, so every family holds exactly 2 records; fgumi
+/// numbers molecule IDs contiguously with no gaps, so the distinct numeric MI
+/// values form an exact gap-free range of length `families`.
+fn assert_paired_fixture_oracle(records: &[(String, u16, String)]) {
+    const POSITIONS: u64 = 40;
+    const UMIS: u64 = 256; // 4^4 distinct 4-mer prefixes
+    const ORIENTATIONS: u64 = 2; // FR + RF stay distinct under `paired`
+    const EXPECTED_FAMILIES: u64 = POSITIONS * UMIS * ORIENTATIONS; // 20480
+    const RECORDS_PER_FAMILY: usize = 2; // one 2-read template per family
+
+    // Family id per record: the numeric part of `MI:Z`, stripping any
+    // `/A`,`/B` strand suffix.
+    let mut family_sizes: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for (qname, _flags, mi) in records {
+        let numeric = mi.split('/').next().expect("non-empty MI");
+        let id: u64 = numeric
+            .parse()
+            .unwrap_or_else(|_| panic!("MI {mi:?} on {qname} is not <n> or <n>/strand"));
+        *family_sizes.entry(id).or_default() += 1;
+    }
+
+    // Family count matches the fixture-derived value (orientations do not merge).
+    assert_eq!(
+        family_sizes.len() as u64,
+        EXPECTED_FAMILIES,
+        "expected 40×256×2 = {EXPECTED_FAMILIES} MI families, got {}",
+        family_sizes.len(),
+    );
+
+    // Total records = families × 2.
+    assert_eq!(
+        records.len() as u64,
+        EXPECTED_FAMILIES * RECORDS_PER_FAMILY as u64,
+        "expected {EXPECTED_FAMILIES} families × {RECORDS_PER_FAMILY} records each",
+    );
+
+    // Every family is uniformly sized (exactly one 2-read template).
+    for (id, size) in &family_sizes {
+        assert_eq!(
+            *size, RECORDS_PER_FAMILY,
+            "family {id} has {size} records, expected {RECORDS_PER_FAMILY}",
+        );
+    }
+
+    // MI ids are numbered contiguously with no gaps: the distinct ids equal the
+    // exact range [min, min + families).
+    let min = family_sizes.keys().copied().min().expect("at least one family");
+    let expected_ids: std::collections::HashSet<u64> = (min..min + EXPECTED_FAMILIES).collect();
+    let actual_ids: std::collections::HashSet<u64> = family_sizes.keys().copied().collect();
+    assert_eq!(
+        actual_ids, expected_ids,
+        "MI ids must be a contiguous, gap-free range of {EXPECTED_FAMILIES} values starting at {min}",
+    );
 }
 
 /// `--parallel-group-min-templates` must route the chain `GroupProcess` step
