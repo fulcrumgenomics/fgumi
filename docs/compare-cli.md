@@ -41,16 +41,16 @@ fgumi compare bams <BAM1> <BAM2> [OPTIONS]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `-c, --command` | STRING | (none) | Preset `--mode`/`--ignore-order` for a specific fgumi pipeline stage (see [Command Presets](#command-presets---command) below). An explicit `--mode`/`--ignore-order` overrides the preset. |
+| `-c, --command` | STRING | (none) | Preset `--mode`/`--ignore-order` for a specific fgumi pipeline stage (see [Command Presets](#command-presets---command) below). For presets that support them, an explicit `--mode`/`--ignore-order` overrides the preset. The one exception is `--command sort`, which routes to the dedicated sort-verify engine and *rejects* both `--mode` and `--ignore-order` rather than letting them override. |
 | `--mode` | STRING | `content` | Comparison mode: `content` or `grouping` |
 | `-m, --max-diffs` | INT | 10 | Maximum differences to report |
 | `-q, --quiet` | FLAG | false | Only exit code indicates result (0=equal, 1=different) |
-| `--ignore-order` | FLAG | false | Ignore record order (for parallel consensus output) |
+| `--ignore-order` | FLAG | false | Ignore record order; **valid only with `--mode grouping`** (passing `--ignore-order=true` with any other mode is rejected). Grouping is inherently order-independent, so this flag is effectively a no-op there, retained for compatibility. |
 | `--buffer-size` | INT | 1000 | Initial buffer size for `--ignore-order` mode |
 | `-t, --threads` | INT | 1 | Threads for BGZF decompression and comparison |
 | `--batch-size` | INT | 10000 | Records per batch for parallel processing |
 | `--sort-memory` | STRING | `512M` | Total (not per-thread; not multiplied by `--threads`) memory budget for the internal queryname-canonicalization sort. Consumed only by `--command group`'s key-join engine; ignored by every other mode/preset. |
-| `--sort-tmp-dir` | PATH | (platform default) | Temporary directory for the `--command group` key-join canonicalization sort's spill files. Repeatable (may be passed more than once); same semantics as `fgumi sort -T`/`--tmp-dir`. |
+| `--sort-tmp-dir` | PATH | `FGUMI_TMP_DIRS`, else a disk-backed default | Temporary directory for the `--command group` key-join canonicalization sort's spill files. Repeatable (may be passed more than once); same semantics as `fgumi sort -T`/`--tmp-dir`. When unset, falls back to the `FGUMI_TMP_DIRS` env var, then to a disk-backed default — never a bare system temp directory, which may be tmpfs on some hosts (a large spill there would fill RAM). |
 
 ### Command Presets (`--command`)
 
@@ -59,7 +59,10 @@ defaults for comparing BAM output from a specific fgumi pipeline stage, so you d
 need to remember which mode/flags a given command's output requires. This is the
 primary, recommended way to compare a pipeline stage's output — especially for
 cross-tool comparisons (e.g. fgumi vs. fgbio) where MI values or record order may
-legitimately differ. An explicit `--mode` or `--ignore-order` overrides the preset.
+legitimately differ. For presets that support them, an explicit `--mode` or
+`--ignore-order` overrides the preset — the sole exception is `--command sort`,
+which routes to the dedicated sort-verify engine and *rejects* both options
+(passing either alongside it is an error).
 
 Presets: `extract`, `zipper`, `sort`, `correct`, `dedup`, `group`, `simplex`, `duplex`,
 `codec`, `filter`. See [Recommended Settings by Command](#recommended-settings-by-command)
@@ -79,23 +82,27 @@ The tool compares:
 
 ### Recommended Settings by Command
 
-These are the same defaults each `--command <stage>` preset applies automatically
-(see [Command Presets](#command-presets---command) above); use `--command` rather
-than setting `--mode`/`--ignore-order` by hand where a preset exists.
+Recommended `--mode`/`--ignore-order` settings for comparing each stage's output. The
+**Preset?** column says whether a `--command <stage>` preset exists: where it does, prefer
+`--command <stage>` over setting `--mode`/`--ignore-order` by hand (it applies exactly these
+defaults automatically). Stages *without* a preset have no `--command <stage>`; they use the
+default `content` mode, so no flags are needed.
 
-| fgumi Command | --mode | --ignore-order | Notes |
-|---------------|--------|----------------|-------|
-| `extract` | content | false | No MI tags; deterministic |
-| `zipper` | content | false | Preserves MI tags unchanged |
-| `group` | grouping (key-join engine) | true | Cross-tool: compares via key-join, pairing records by identity after canonicalizing both inputs to queryname order. Content is checked under `ExactMinusMi` (every field except MI) plus a separate fgumi-MI/fgbio-MI bijection check, since MI values or record order may legitimately differ between tools. |
-| `simplex` | content | false | Exact content comparison (compares the `cD`/`cM`/`cE` depth tags exactly; fgumi clamps them to fgbio's `Short` ceiling at the source, so no saturation carve-out is needed) |
-| `duplex` | content | false | Exact content comparison (compares `cD`/`cM`/`cE` plus duplex `aD`/`aM`/`bD`/`bM`/`aE`/`bE` exactly) |
-| `codec` | content | false | Exact content comparison, same as `simplex`/`duplex` |
-| `filter` | content | false | Passes through MI/depth tags unchanged; uses the same exact content comparison as consensus output |
-| `clip` | content | false | Does not modify MI tags |
-| `correct` | content | false | Modifies RX tag only, not MI |
-| `downsample` | content | false | Deterministic with seed |
-| `review` | content | false | Preserves MI tags |
+| fgumi Command | Preset? | --mode | --ignore-order | Notes |
+|---------------|---------|--------|----------------|-------|
+| `extract` | ✅ `--command extract` | content | false | No MI tags; deterministic |
+| `zipper` | ✅ `--command zipper` | content | false | Preserves MI tags unchanged |
+| `sort` | ✅ `--command sort` | (dedicated sort-verify engine) | n/a | Order *is* the payload: routes to the sort-verify engine, bypassing `--mode`/`ContentPredicate` entirely; explicit `--mode`/`--ignore-order` are rejected. |
+| `correct` | ✅ `--command correct` | content | false | Modifies RX tag only, not MI |
+| `dedup` | ✅ `--command dedup` | content | false | Deterministic; exact content comparison |
+| `group` | ✅ `--command group` | grouping (key-join engine) | true | Cross-tool: compares via key-join, pairing records by identity after canonicalizing both inputs to queryname order. Content is checked under `ExactMinusMi` (every field except MI) plus a separate fgumi-MI/fgbio-MI bijection check, since MI values or record order may legitimately differ between tools. |
+| `simplex` | ✅ `--command simplex` | content | false | Exact content comparison (compares the `cD`/`cM`/`cE` depth tags exactly; fgumi clamps them to fgbio's `Short` ceiling at the source, so no saturation carve-out is needed) |
+| `duplex` | ✅ `--command duplex` | content | false | Exact content comparison (compares `cD`/`cM`/`cE` plus duplex `aD`/`aM`/`bD`/`bM`/`aE`/`bE` exactly) |
+| `codec` | ✅ `--command codec` | content | false | Exact content comparison, same as `simplex`/`duplex` |
+| `filter` | ✅ `--command filter` | content | false | Passes through MI/depth tags unchanged; uses the same exact content comparison as consensus output |
+| `clip` | ❌ no preset (default `content` mode) | content | false | Does not modify MI tags |
+| `downsample` | ❌ no preset (default `content` mode) | content | false | Deterministic with seed |
+| `review` | ❌ no preset (default `content` mode) | content | false | Preserves MI tags |
 
 ### Examples
 
@@ -159,7 +166,7 @@ fgumi compare metrics <FILE1> <FILE2> [OPTIONS]
 | `--abs-tol` | FLOAT | 1e-9 | Absolute tolerance for float comparison |
 | `--key-columns` | STRING | (first column) | Comma-separated column name(s) or 0-based index(es) to join rows on, e.g. `ab_size,ba_size` |
 | `-m, --max-diffs` | INT | 20 | Maximum differences to display |
-| `-q, --quiet` | FLAG | false | Only exit code indicates result |
+| `-q, --quiet` | FLAG | false | Exit code is the only result signal (0=equal, 1=different): suppresses the stdout report and the command's own informational logging. Process-wide startup logging remains under `RUST_LOG` control (like fgbio's `--log-level`). |
 | `-v, --verbose` | FLAG | false | Print success message when files match |
 
 ### Comparison Behavior
@@ -208,7 +215,7 @@ fgumi compare metrics fgumi_metrics.txt fgbio_metrics.txt --quiet
 
 ### Use Cases
 
-1. **Comparing fgumi vs fgbio output**: Different tools may produce slightly different floating-point representations, and rows may legitimately appear in a different order or set (tracked fgbio-parity gaps, e.g. fgumi#498)
+1. **Comparing fgumi vs fgbio output**: Different tools may produce slightly different floating-point representations, and rows may legitimately appear in a *different order* (the key-join tolerates reordering). A *different row set* — a key present in one file but not the other, or an extra/missing row — is **not** tolerated: it is a known fgbio-parity gap (e.g. fgumi#498) and is reported as `DIFFER`, never a successful comparison.
 2. **Cross-platform validation**: Float formatting may differ between platforms
 3. **Regression testing**: Verify metrics haven't changed between versions
 
