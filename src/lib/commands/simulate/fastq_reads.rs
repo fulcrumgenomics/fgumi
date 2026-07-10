@@ -4,7 +4,8 @@ use crate::commands::command::Command;
 use crate::commands::common::parse_bool;
 use crate::commands::simulate::common::{
     FamilySizeArgs, InsertSizeArgs, MethylationArgs, MethylationConfig, QualityArgs,
-    ReferenceGenome, SimulationCommon, apply_methylation_conversion, generate_random_sequence,
+    ReferenceGenome, SimulationCommon, apply_methylation_conversion, body_error_rng,
+    generate_random_sequence, introduce_errors_inplace,
 };
 use crate::simulate::{FastqWriter, create_rng};
 use anyhow::{Context, Result, bail};
@@ -71,6 +72,12 @@ pub struct FastqReads {
     #[arg(short = 'i', long = "includelist")]
     pub includelist: Option<PathBuf>,
 
+    /// Per-base substitution error rate applied to read bodies beyond the UMI prefix (0.0-1.0). The
+    /// default of 0.0 emits error-free bodies (byte-identical to prior versions); set a positive
+    /// rate to inject realistic sequencing errors. The UMI prefix keeps its own fixed error rate.
+    #[arg(long = "error-rate", default_value = "0.0")]
+    pub error_rate: f64,
+
     /// Number of threads for parallel molecule generation
     #[arg(short = 't', long = "threads", default_value = "1")]
     pub threads: usize,
@@ -120,6 +127,9 @@ struct GenerationParams {
     /// When set, UMIs are sampled from this list instead of generated randomly.
     includelist: Option<Vec<Vec<u8>>>,
     methylation: MethylationConfig,
+    /// Per-base substitution error rate applied to read bodies beyond the UMI prefix (0.0 = no
+    /// body errors, byte-identical to prior versions; the UMI prefix keeps its own fixed rate).
+    error_rate: f64,
 }
 
 /// Load UMI sequences from an includelist file (one UMI per line).
@@ -227,6 +237,8 @@ impl Command for FastqReads {
             info!("  Conversion rate: {}", methylation.conversion_rate);
         }
 
+        crate::commands::simulate::common::validate_rate(self.error_rate, "error-rate")?;
+
         let reference = Arc::new(ReferenceGenome::load(&self.reference)?);
 
         // Validate that the reference has at least one contig >= read_length
@@ -257,6 +269,7 @@ impl Command for FastqReads {
             duplex: self.duplex,
             includelist,
             methylation,
+            error_rate: self.error_rate,
         });
 
         // Generate molecule IDs with seeds for reproducibility
@@ -523,11 +536,37 @@ fn generate_molecule_reads(
         // Pad R1 to read length if needed
         pad_sequence_inplace(&mut r1_seq_buf, params.read_length, &mut rng);
 
+        // Inject body sequencing errors beyond the UMI prefix (SIMU3-01) from a dedicated per-mate
+        // RNG (`body_error_rng`) rather than the molecule RNG. This keeps the molecule stream —
+        // R2's UMI errors, the next pair's strand coin flip, qualities, and every downstream draw —
+        // byte-identical to the error-free run, so enabling `--error-rate` changes only the read
+        // bodies. The UMI-prefix errors above stay on the molecule RNG (part of the base model).
+        // The `error_rate > 0.0` guard keeps the zero-rate path free of any RNG construction.
+        if params.error_rate > 0.0 {
+            let body_start = params.umi_length.min(r1_seq_buf.len());
+            let mut err_rng = body_error_rng(&read_name, true);
+            introduce_errors_inplace(
+                &mut r1_seq_buf[body_start..],
+                params.error_rate,
+                &mut err_rng,
+            );
+        }
+
         // Introduce UMI errors in R2 as well
         introduce_errors_inplace(&mut r2_seq_buf[..params.umi_length], 0.01, &mut rng);
 
         // Pad R2 to read length if needed
         pad_sequence_inplace(&mut r2_seq_buf, params.read_length, &mut rng);
+
+        if params.error_rate > 0.0 {
+            let body_start = params.umi_length.min(r2_seq_buf.len());
+            let mut err_rng = body_error_rng(&read_name, false);
+            introduce_errors_inplace(
+                &mut r2_seq_buf[body_start..],
+                params.error_rate,
+                &mut err_rng,
+            );
+        }
 
         // Generate quality scores
         let r1_quals = quality_model.generate_qualities(r1_seq_buf.len(), &mut rng);
@@ -563,28 +602,6 @@ fn reverse_complement_into(seq: &[u8], output: &mut Vec<u8>) {
     output.reserve(seq.len());
     for &b in seq.iter().rev() {
         output.push(complement_base(b));
-    }
-}
-
-/// Introduce random substitution errors in-place.
-/// Uses direct lookup tables to avoid retry loops.
-fn introduce_errors_inplace(seq: &mut [u8], error_rate: f64, rng: &mut impl Rng) {
-    // Lookup table: for each base, provides 3 alternatives
-    // A(65) -> C, G, T; C(67) -> A, G, T; G(71) -> A, C, T; T(84) -> A, C, G
-    const ALTERNATIVES: [&[u8; 3]; 256] = {
-        let mut table: [&[u8; 3]; 256] = [b"ACG"; 256]; // Default (shouldn't be used)
-        table[b'A' as usize] = b"CGT";
-        table[b'C' as usize] = b"AGT";
-        table[b'G' as usize] = b"ACT";
-        table[b'T' as usize] = b"ACG";
-        table
-    };
-
-    for base in seq.iter_mut() {
-        if rng.random::<f64>() < error_rate {
-            let alts = ALTERNATIVES[*base as usize];
-            *base = alts[rng.random_range(0..3)];
-        }
     }
 }
 
@@ -1025,6 +1042,7 @@ mod tests {
                 cpg_methylation_rate: 0.75,
                 conversion_rate: 0.98,
             },
+            error_rate: 0.0,
         };
 
         let quality_model =
@@ -1064,6 +1082,112 @@ mod tests {
                     parts[1],
                 );
             }
+        }
+    }
+
+    /// SIMU3-01 wiring: with `error_rate = 1.0` every read-body base (indices >= `umi_length`) is
+    /// substituted, so both R1 and R2 bodies must diverge from an otherwise-identical
+    /// `error_rate = 0.0` run (same seed), while the read length is preserved and the UMI prefix is
+    /// excluded from body injection. Fails if the body error-injection offset or wiring regresses.
+    ///
+    /// Also pins RNG isolation: because body errors are drawn from a dedicated per-mate RNG
+    /// (`body_error_rng`), enabling `--error-rate` must leave everything *except* the read bodies
+    /// byte-identical to the zero-rate run — UMI prefixes, qualities, strand/truth fields, and the
+    /// full family layout. If injection ever draws from the molecule RNG again, these equalities
+    /// break (qualities and later reads would shift).
+    #[test]
+    fn test_generate_molecule_reads_injects_body_errors() {
+        use std::io::Write as IoWrite;
+        use tempfile::NamedTempFile;
+
+        let mut fasta = NamedTempFile::new().unwrap();
+        writeln!(fasta, ">chr1").unwrap();
+        fasta.write_all(&b"ACGT".repeat(500)).unwrap();
+        writeln!(fasta).unwrap();
+        fasta.flush().unwrap();
+        let ref_genome = ReferenceGenome::load(fasta.path()).unwrap();
+
+        const UMI_LENGTH: usize = 5;
+        let make_params = |error_rate: f64| GenerationParams {
+            umi_length: UMI_LENGTH,
+            read_length: 50,
+            min_family_size: 1,
+            r2_quality_offset: 0,
+            duplex: false,
+            includelist: None,
+            methylation: MethylationConfig {
+                mode: fgumi_consensus::MethylationMode::Disabled,
+                cpg_methylation_rate: 0.75,
+                conversion_rate: 0.98,
+            },
+            error_rate,
+        };
+
+        let quality_model =
+            crate::simulate::PositionQualityModel::new(10, 25, 37, 100, 0.08, 2, 2.0);
+        let quality_bias = crate::simulate::ReadPairQualityBias::new(0);
+        let family_dist = crate::simulate::FamilySizeDistribution::log_normal(3.0, 1.0);
+        let insert_model = crate::simulate::InsertSizeModel::new(150.0, 30.0, 50, 500);
+
+        let seed = 7u64;
+        let generate = |error_rate: f64| {
+            generate_molecule_reads(
+                0,
+                seed,
+                &make_params(error_rate),
+                &quality_model,
+                &quality_bias,
+                &family_dist,
+                &insert_model,
+                &ref_genome,
+            )
+        };
+
+        let zero = generate(0.0);
+        let full = generate(1.0);
+        assert!(!zero.is_empty(), "expected at least one read in the family");
+        // Same seed -> same family size regardless of error rate (family size is drawn first).
+        assert_eq!(zero.len(), full.len());
+
+        for (z, f) in zero.iter().zip(full.iter()) {
+            // Read length is preserved through body error injection.
+            assert_eq!(z.r1_seq.len(), f.r1_seq.len());
+            assert_eq!(z.r2_seq.len(), f.r2_seq.len());
+            // At error_rate 1.0 every body base (beyond the UMI prefix) flips to a different base.
+            assert_ne!(
+                z.r1_seq[UMI_LENGTH..],
+                f.r1_seq[UMI_LENGTH..],
+                "R1 body should diverge from the zero-rate run"
+            );
+            assert_ne!(
+                z.r2_seq[UMI_LENGTH..],
+                f.r2_seq[UMI_LENGTH..],
+                "R2 body should diverge from the zero-rate run"
+            );
+
+            // RNG isolation: everything except the read bodies is byte-identical to the zero-rate
+            // run. UMI prefixes stay on the molecule RNG (base model), so they must not change.
+            assert_eq!(
+                z.r1_seq[..UMI_LENGTH],
+                f.r1_seq[..UMI_LENGTH],
+                "R1 UMI prefix must be unchanged by body error injection"
+            );
+            assert_eq!(
+                z.r2_seq[..UMI_LENGTH],
+                f.r2_seq[..UMI_LENGTH],
+                "R2 UMI prefix must be unchanged by body error injection"
+            );
+            // Qualities are drawn from the molecule RNG after injection — must be unperturbed.
+            assert_eq!(z.r1_quals, f.r1_quals, "R1 qualities must be unchanged");
+            assert_eq!(z.r2_quals, f.r2_quals, "R2 qualities must be unchanged");
+            // Strand assignment and all truth/metadata fields must be unchanged.
+            assert_eq!(z.strand, f.strand, "strand assignment must be unchanged");
+            assert_eq!(z.umi, f.umi, "combined UMI truth must be unchanged");
+            assert_eq!(z.read_name, f.read_name, "read name must be unchanged");
+            assert_eq!(z.mol_id, f.mol_id, "molecule id must be unchanged");
+            assert_eq!(z.family_id, f.family_id, "family id must be unchanged");
+            assert_eq!(z.chrom, f.chrom, "chrom must be unchanged");
+            assert_eq!(z.pos, f.pos, "position must be unchanged");
         }
     }
 

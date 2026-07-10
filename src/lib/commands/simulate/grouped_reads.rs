@@ -10,8 +10,8 @@ use crate::commands::common::{CompressionOptions, parse_bool};
 use crate::commands::simulate::common::{
     FamilySizeArgs, InsertSizeArgs, MethylationArgs, MethylationConfig, MoleculeInfo,
     PositionDistArgs, QualityArgs, ReferenceArgs, ReferenceGenome, SimulationCommon,
-    StrandBiasArgs, apply_methylation_conversion, build_sort_order_header_map,
-    generate_random_sequence, pad_sequence,
+    StrandBiasArgs, apply_methylation_conversion, body_error_rng, build_sort_order_header_map,
+    generate_random_sequence, introduce_errors_inplace, pad_sequence,
 };
 use crate::commands::simulate::region_to_bin;
 use crate::dna::reverse_complement;
@@ -62,6 +62,12 @@ pub struct GroupedReads {
     #[arg(long = "mapq", default_value = "60")]
     pub mapq: u8,
 
+    /// Per-base substitution error rate applied to read bodies (0.0-1.0). The default of 0.0 emits
+    /// error-free reads (byte-identical to prior versions); set a positive rate to inject realistic
+    /// sequencing errors so consensus/error-correction paths see genuine discordances.
+    #[arg(long = "error-rate", default_value = "0.0")]
+    pub error_rate: f64,
+
     /// Number of writer threads
     #[arg(short = 't', long = "threads", default_value = "1")]
     pub threads: usize,
@@ -108,6 +114,8 @@ struct GenerationParams {
     insert_model: InsertSizeModel,
     strand_bias_model: StrandBiasModel,
     methylation: MethylationConfig,
+    /// Per-base substitution error rate applied to read bodies (0.0 = no errors, byte-identical).
+    error_rate: f64,
 }
 
 impl Command for GroupedReads {
@@ -129,6 +137,8 @@ impl Command for GroupedReads {
             info!("  CpG methylation rate: {}", methylation.cpg_methylation_rate);
             info!("  Conversion rate: {}", methylation.conversion_rate);
         }
+
+        crate::commands::simulate::common::validate_rate(self.error_rate, "error-rate")?;
 
         // Load reference genome
         let ref_genome = ReferenceGenome::load(&self.reference.reference)?;
@@ -173,6 +183,7 @@ impl Command for GroupedReads {
             insert_model: self.insert_size.to_insert_size_model(),
             strand_bias_model: self.strand_bias.to_strand_bias_model(),
             methylation,
+            error_rate: self.error_rate,
         };
 
         // Pre-sample positions from reference (use a dedicated RNG so molecule seeds
@@ -227,9 +238,27 @@ impl Command for GroupedReads {
                 // Get insert_size
                 let insert_size = params.insert_model.sample(&mut mol_rng);
 
-                // Sort key — for_f1r2_pair gives the canonical template-coordinate sort
-                // key. This works for both F1R2 and R1F2 orientations because the
-                // template covers the same genomic positions regardless of strand.
+                // Sort key: a template-coordinate key derived from the *pre-sampled* locus.
+                //
+                // NOTE: grouped output is NOT guaranteed to be fully `SS:template-coordinate`
+                // sorted, for two independent reasons this pre-pass does not close:
+                //   1. Contig-end re-sample: `generate_molecule_reads` re-samples a new locus when
+                //      the pre-sampled one is too close to a contig end for the drawn insert size
+                //      (see the fallback below), so a fallback molecule is emitted at a locus that
+                //      differs from the one keyed here. Unlike mapped-reads (SIMU3-05, which re-keys
+                //      via `effective_molecule_locus`), grouped-reads does not re-key.
+                //   2. Duplex B-strand strand order: `for_f1r2_pair` always encodes
+                //      `neg1 = false, neg2 = true` (forward read earlier), but duplex B-strand pairs
+                //      are emitted R1F2 (reverse read earlier). samtools template-coordinate order
+                //      sorts reverse-before-forward at equal positions, so emitting a molecule's A
+                //      (forward-earlier) reads before its B (reverse-earlier) reads inverts strand
+                //      order at the same locus even with no fallback.
+                // Both gaps are fixed wholesale by #576, which emits records in molecule order and
+                // then sorts the *emitted* records through the canonical `fgumi-sort` engine, so no
+                // separate key can disagree with the emitted coordinates. The partial fix (re-keying
+                // only the fallback via `effective_molecule_locus`) is intentionally not applied
+                // here: it would be deleted by #576 and would leave gap 2 open while implying full
+                // sortedness.
                 let sort_key = TemplateCoordKey::for_f1r2_pair(
                     chrom_idx as i32, // real tid
                     local_pos,
@@ -383,8 +412,13 @@ fn generate_molecule_reads(
     let mut pairs = Vec::new();
 
     if params.duplex {
-        // Split reads between A and B strands
-        let (a_count, b_count) = params.strand_bias_model.split_reads(family_size, &mut rng);
+        // Split reads between A and B strands, guaranteeing at least one read per strand so a
+        // "duplex" family is actually two-stranded (SIMU3-07). For family_size == 1 the floor cannot
+        // be met and the split falls back to unconstrained (inherently single-stranded). This
+        // consumes the same RNG as `split_reads` (a single `sample_a_fraction` draw), so only the
+        // A/B partition changes, not the downstream RNG stream.
+        let (a_count, b_count) =
+            params.strand_bias_model.split_reads_with_minimum(family_size, 1, &mut rng);
 
         // A reads: orientation follows the coin flip
         let a_is_top = is_top_strand;
@@ -405,6 +439,7 @@ fn generate_molecule_reads(
                 &params.quality_model,
                 &params.quality_bias,
                 &params.methylation,
+                params.error_rate,
                 shared_template.as_deref(),
                 &mut rng,
             );
@@ -439,6 +474,7 @@ fn generate_molecule_reads(
                 &params.quality_model,
                 &params.quality_bias,
                 &params.methylation,
+                params.error_rate,
                 shared_template.as_deref(),
                 &mut rng,
             );
@@ -473,6 +509,7 @@ fn generate_molecule_reads(
                 &params.quality_model,
                 &params.quality_bias,
                 &params.methylation,
+                params.error_rate,
                 shared_template.as_deref(),
                 &mut rng,
             );
@@ -506,6 +543,7 @@ fn generate_read_pair_records(
     quality_model: &PositionQualityModel,
     quality_bias: &ReadPairQualityBias,
     methylation: &MethylationConfig,
+    error_rate: f64,
     shared_template: Option<&[u8]>,
     rng: &mut impl Rng,
 ) -> (RawRecord, RawRecord) {
@@ -530,7 +568,16 @@ fn generate_read_pair_records(
         methylation,
         rng,
     );
-    let fwd_seq = pad_sequence(fwd_seq, read_length, rng);
+    let mut fwd_seq = pad_sequence(fwd_seq, read_length, rng);
+    // Inject body sequencing errors (SIMU3-01) from a dedicated per-mate RNG (`body_error_rng`)
+    // rather than the molecule RNG, so enabling `--error-rate` changes only the read bodies and
+    // leaves qualities, positions, flags, and every downstream draw byte-identical to the
+    // error-free run. The `error_rate > 0.0` guard keeps the zero-rate path free of any RNG
+    // construction.
+    if error_rate > 0.0 {
+        let mut err_rng = body_error_rng(read_name, true);
+        introduce_errors_inplace(&mut fwd_seq, error_rate, &mut err_rng);
+    }
 
     // Compute reverse-read sequence (from end of template, bottom strand, revcomped)
     let rev_start = insert_size.saturating_sub(read_length);
@@ -545,7 +592,11 @@ fn generate_read_pair_records(
         rng,
     );
     let rev_seq = reverse_complement(&rev_template);
-    let rev_seq = pad_sequence(rev_seq, read_length, rng);
+    let mut rev_seq = pad_sequence(rev_seq, read_length, rng);
+    if error_rate > 0.0 {
+        let mut err_rng = body_error_rng(read_name, false);
+        introduce_errors_inplace(&mut rev_seq, error_rate, &mut err_rng);
+    }
 
     // Quality scores
     let r1_quals = quality_model.generate_qualities(read_length, rng);
@@ -672,6 +723,7 @@ mod tests {
     use super::*;
     use crate::simulate::create_rng;
     use fgumi_raw_bam::RawRecordView;
+    use rstest::rstest;
 
     const DISABLED_METHYLATION: MethylationConfig = MethylationConfig {
         mode: fgumi_consensus::MethylationMode::Disabled,
@@ -815,6 +867,7 @@ mod tests {
             &quality_model,
             &quality_bias,
             &DISABLED_METHYLATION,
+            0.0,
             None,
             &mut rng,
         );
@@ -849,6 +902,7 @@ mod tests {
             &quality_model,
             &quality_bias,
             &DISABLED_METHYLATION,
+            0.0,
             None,
             &mut rng,
         );
@@ -881,6 +935,7 @@ mod tests {
             &quality_model,
             &quality_bias,
             &DISABLED_METHYLATION,
+            0.0,
             None,
             &mut rng,
         );
@@ -914,6 +969,7 @@ mod tests {
             &quality_model,
             &quality_bias,
             &DISABLED_METHYLATION,
+            0.0,
             None,
             &mut rng,
         );
@@ -946,6 +1002,7 @@ mod tests {
             &quality_model,
             &quality_bias,
             &DISABLED_METHYLATION,
+            0.0,
             None,
             &mut rng1,
         );
@@ -963,6 +1020,7 @@ mod tests {
             &quality_model,
             &quality_bias,
             &DISABLED_METHYLATION,
+            0.0,
             None,
             &mut rng2,
         );
@@ -975,6 +1033,81 @@ mod tests {
         assert_eq!(
             RawRecordView::new(r2_a_raw.as_ref()).flags(),
             RawRecordView::new(r2_b_raw.as_ref()).flags()
+        );
+    }
+
+    /// SIMU3-01 wiring: with `error_rate = 1.0` every body base is substituted, so both reads of a
+    /// pair must diverge from an otherwise-identical `error_rate = 0.0` run (same seed, same shared
+    /// template), while the read length is preserved. Fails if the body error-injection call is
+    /// dropped or mis-wired.
+    ///
+    /// Also pins RNG isolation: body errors are drawn from a dedicated per-mate RNG
+    /// (`body_error_rng`), so both runs pass the *same* molecule RNG and it advances identically.
+    /// Enabling errors must therefore leave qualities, flags, positions, mapping quality, and names
+    /// byte-identical to the zero-rate run — only the sequence bytes change. If injection ever draws
+    /// from the passed RNG again, the qualities (drawn after injection) shift and this breaks.
+    #[test]
+    fn test_generate_read_pair_records_injects_body_errors() {
+        let quality_model = PositionQualityModel::default();
+        let quality_bias = ReadPairQualityBias::default();
+        // Deterministic 300 bp shared template so the body is derived from a known sequence.
+        let template = b"ACGT".repeat(75);
+
+        let run = |error_rate: f64| {
+            let mut rng = create_rng(Some(42));
+            generate_read_pair_records(
+                "read_001",
+                "ACGTACGT",
+                "0/A",
+                0,    // chrom_idx
+                1000, // local_pos
+                300,  // insert_size
+                150,  // read_length
+                60,
+                true, // is_top_strand
+                &quality_model,
+                &quality_bias,
+                &DISABLED_METHYLATION,
+                error_rate,
+                Some(&template),
+                &mut rng,
+            )
+        };
+
+        let (r1_zero_raw, r2_zero_raw) = run(0.0);
+        let (r1_full_raw, r2_full_raw) = run(1.0);
+
+        let seq = |raw: &RawRecord| to_record_buf(raw).sequence().as_ref().to_vec();
+        let (r1_zero, r2_zero) = (seq(&r1_zero_raw), seq(&r2_zero_raw));
+        let (r1_full, r2_full) = (seq(&r1_full_raw), seq(&r2_full_raw));
+
+        // Length is preserved through error injection.
+        assert_eq!(r1_zero.len(), r1_full.len());
+        assert_eq!(r2_zero.len(), r2_full.len());
+        // At error_rate 1.0 every body base flips to a different base, so both reads diverge.
+        assert_ne!(r1_zero, r1_full, "R1 body should diverge from the zero-rate run");
+        assert_ne!(r2_zero, r2_full, "R2 body should diverge from the zero-rate run");
+
+        // RNG isolation: every non-sequence field is byte-identical to the zero-rate run.
+        let non_seq = |raw: &RawRecord| {
+            let rec = to_record_buf(raw);
+            (
+                rec.flags().bits(),
+                rec.alignment_start().map(usize::from),
+                rec.mapping_quality().map(u8::from),
+                rec.name().map(|n| n.to_vec()),
+                rec.quality_scores().as_ref().to_vec(),
+            )
+        };
+        assert_eq!(
+            non_seq(&r1_zero_raw),
+            non_seq(&r1_full_raw),
+            "R1 non-sequence fields (incl. qualities) must be unchanged"
+        );
+        assert_eq!(
+            non_seq(&r2_zero_raw),
+            non_seq(&r2_full_raw),
+            "R2 non-sequence fields (incl. qualities) must be unchanged"
         );
     }
 
@@ -1148,6 +1281,7 @@ mod tests {
             &quality_model,
             &quality_bias,
             &DISABLED_METHYLATION,
+            0.0,
             None,
             &mut rng,
         );
@@ -1193,6 +1327,7 @@ mod tests {
             &quality_model,
             &quality_bias,
             &config,
+            0.0,
             Some(template),
             &mut rng,
         );
@@ -1241,6 +1376,7 @@ mod tests {
             &quality_model,
             &quality_bias,
             &emseq_config,
+            0.0,
             Some(template),
             &mut rng_a,
         );
@@ -1260,6 +1396,7 @@ mod tests {
             &quality_model,
             &quality_bias,
             &disabled_config,
+            0.0,
             Some(template),
             &mut rng_b,
         );
@@ -1279,6 +1416,7 @@ mod tests {
             &quality_model,
             &quality_bias,
             &emseq_config,
+            0.0,
             Some(template),
             &mut rng_b2,
         );
@@ -1333,6 +1471,7 @@ mod tests {
             insert_model: InsertSizeModel::new(100.0, 5.0, 80, 120),
             strand_bias_model: StrandBiasModel::no_bias(),
             methylation: DISABLED_METHYLATION,
+            error_rate: 0.0,
         };
 
         let (chrom_idx, local_pos) = positions[0];
@@ -1370,6 +1509,7 @@ mod tests {
             insert_model: InsertSizeModel::new(100.0, 5.0, 80, 120),
             strand_bias_model: StrandBiasModel::no_bias(),
             methylation: DISABLED_METHYLATION,
+            error_rate: 0.0,
         };
 
         let mut a_saw_top = false;
@@ -1392,5 +1532,57 @@ mod tests {
 
         assert!(a_saw_top, "A reads should sometimes be F1R2 (top strand)");
         assert!(a_saw_bottom, "A reads should sometimes be R1F2 (bottom strand)");
+    }
+
+    /// SIMU3-07: a duplex family with `family_size >= 2` must be genuinely two-stranded —
+    /// `split_reads_with_minimum(family_size, 1, ..)` guarantees at least one A read and one B
+    /// read. This asserts the emitted MI tags directly (not just A-strand orientation, which the
+    /// sibling `..coin_flip..` test covers): across many seeds and several minimum family sizes,
+    /// every molecule emits at least one `/A`- and one `/B`-tagged pair.
+    #[rstest]
+    fn test_duplex_family_ge_two_is_always_two_stranded(#[values(2, 3, 5)] min_family_size: usize) {
+        use std::io::Write as IoWrite;
+        use tempfile::NamedTempFile;
+
+        let mut fasta = NamedTempFile::new().unwrap();
+        writeln!(fasta, ">chr1").unwrap();
+        fasta.write_all(&b"ACGT".repeat(500)).unwrap();
+        writeln!(fasta).unwrap();
+        fasta.flush().unwrap();
+
+        let ref_genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let params = GenerationParams {
+            read_length: 50,
+            umi_length: 8,
+            mapq: 60,
+            duplex: true,
+            min_family_size,
+            quality_model: PositionQualityModel::default(),
+            quality_bias: ReadPairQualityBias::default(),
+            // Log-normal floored at `min_family_size` guarantees family_size >= min_family_size >= 2.
+            family_dist: FamilySizeDistribution::log_normal(2.0, 0.5),
+            insert_model: InsertSizeModel::new(100.0, 5.0, 80, 120),
+            // Extreme bias toward B (mean A-fraction ~= 0.02): under the old unconstrained
+            // `split_reads` this rounds a small family's A count to 0, so only the SIMU3-07 floor of
+            // `split_reads_with_minimum` keeps an A read present. This makes the test a genuine
+            // regression guard — reverting the fix drops the `/A` pair and fails the assert.
+            strand_bias_model: StrandBiasModel::new(1.0, 50.0),
+            methylation: DISABLED_METHYLATION,
+            error_rate: 0.0,
+        };
+
+        for seed in 0u64..100 {
+            let (pairs, _chrom, _pos) =
+                generate_molecule_reads(seed as usize, seed, 0, 500, &params, &ref_genome);
+
+            let saw_a = pairs.iter().any(|(_, _, _, _, mi_tag, _, _)| mi_tag.ends_with("/A"));
+            let saw_b = pairs.iter().any(|(_, _, _, _, mi_tag, _, _)| mi_tag.ends_with("/B"));
+
+            assert!(
+                saw_a && saw_b,
+                "duplex family (min_family_size={min_family_size}, seed={seed}) must emit both an \
+                 A-strand and a B-strand pair; saw_a={saw_a}, saw_b={saw_b}"
+            );
+        }
     }
 }

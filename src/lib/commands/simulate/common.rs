@@ -528,6 +528,109 @@ pub(super) fn generate_random_sequence(len: usize, rng: &mut impl Rng) -> Vec<u8
     seq
 }
 
+/// Introduce random substitution errors into `seq` in place.
+///
+/// Uses a direct alternative-base lookup table to avoid retry loops. When `error_rate <= 0.0` this
+/// returns early without drawing any RNG, so a zero (or non-positive) rate leaves the RNG stream
+/// untouched and callers may invoke it unconditionally. For `error_rate > 0.0` it draws exactly one
+/// `rng.random::<f64>()` uniform per base and substitutes that base when the draw falls below the
+/// rate.
+pub(super) fn introduce_errors_inplace(seq: &mut [u8], error_rate: f64, rng: &mut impl Rng) {
+    // Fast-path/footgun guard: at a non-positive rate there is nothing to substitute, and
+    // returning early keeps the RNG stream untouched (no draws) so a zero rate is deterministic
+    // and safe to call unconditionally.
+    if error_rate <= 0.0 {
+        return;
+    }
+
+    // Lookup table: for each base, provides 3 alternatives.
+    // A -> C,G,T; C -> A,G,T; G -> A,C,T; T -> A,C,G
+    const ALTERNATIVES: [&[u8; 3]; 256] = {
+        let mut table: [&[u8; 3]; 256] = [b"ACG"; 256]; // Default (shouldn't be used)
+        table[b'A' as usize] = b"CGT";
+        table[b'C' as usize] = b"AGT";
+        table[b'G' as usize] = b"ACT";
+        table[b'T' as usize] = b"ACG";
+        table
+    };
+
+    for base in seq.iter_mut() {
+        if rng.random::<f64>() < error_rate {
+            let alts = ALTERNATIVES[*base as usize];
+            *base = alts[rng.random_range(0..3)];
+        }
+    }
+}
+
+/// Derive a deterministic RNG dedicated to body-error injection for one mate of one read.
+///
+/// Body-error injection ([`introduce_errors_inplace`]) must not draw from the
+/// molecule-generation RNG. If it did, enabling `--error-rate > 0` would advance the shared
+/// stream and thereby perturb read qualities, mate/strand assignments, and every later
+/// stochastic draw — so an error-injected run would differ from the error-free run in far more
+/// than the read bodies. Seeding a dedicated stream keeps the molecule RNG byte-identical whether
+/// or not errors are injected, so the error-injected output differs from the error-free output
+/// *only* in the read-body bases.
+///
+/// The seed is an FNV-1a hash of the globally-unique `read_name` folded with `is_first_mate` (which
+/// simply distinguishes a pair's two mates so each gets an independent error stream). It consumes
+/// no draws from the caller's RNG, so the caller's stream is unaffected by the presence of errors.
+pub(super) fn body_error_rng(read_name: &str, is_first_mate: bool) -> rand::rngs::StdRng {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for &byte in read_name.as_bytes() {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME);
+    }
+    hash = (hash ^ u64::from(is_first_mate)).wrapping_mul(FNV_PRIME);
+    crate::simulate::create_rng(Some(hash))
+}
+
+/// Replay a mapped molecule's RNG stream up to the reference-locus sampling step and return the
+/// EFFECTIVE `(chrom_idx, local_pos, insert_size)` — the coordinates at which the molecule's reads
+/// are actually emitted.
+///
+/// The mapped/grouped generators pre-sample a candidate locus, but when it is too close to a contig
+/// end for the molecule's drawn insert size, generation re-samples a *new* locus. The
+/// template-coordinate sort-key pre-pass must key on this same effective locus; otherwise records
+/// are emitted out of order and the advertised `SS:template-coordinate` is violated (SIMU3-05). This
+/// walks the exact RNG sequence generation uses — UMI bases, family size, insert size, the strand
+/// coin flip, then the `sequence_at` / `sample_sequence` fallback — so the returned locus is
+/// identical to the one generation derives for the same `seed`. When the pre-sampled locus is valid
+/// (the common case) it is returned unchanged, so the sort key is unchanged for those molecules.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn effective_molecule_locus(
+    seed: u64,
+    chrom_idx: usize,
+    local_pos: usize,
+    umi_length: usize,
+    family_dist: &crate::simulate::FamilySizeDistribution,
+    min_family_size: usize,
+    insert_model: &crate::simulate::InsertSizeModel,
+    ref_genome: &ReferenceGenome,
+) -> (usize, usize, usize) {
+    let mut rng = crate::simulate::create_rng(Some(seed));
+    // UMI bases: `generate_random_sequence` draws `umi_length` times.
+    for _ in 0..umi_length {
+        let _: usize = rng.random_range(0..4);
+    }
+    // Family size, then insert size.
+    let _ = family_dist.sample(&mut rng, min_family_size);
+    let insert_size = insert_model.sample(&mut rng);
+    // Strand coin flip (drawn before the locus fallback in generation).
+    let _: bool = rng.random();
+    // Locus fallback: reuse the pre-sampled locus when it yields a valid template, otherwise
+    // re-sample exactly as generation does.
+    let (eff_chrom, eff_pos) = match ref_genome.sequence_at(chrom_idx, local_pos, insert_size) {
+        Some(_) => (chrom_idx, local_pos),
+        None => match ref_genome.sample_sequence(insert_size, &mut rng) {
+            Some((c, p, _)) => (c, p),
+            None => (chrom_idx, local_pos),
+        },
+    };
+    (eff_chrom, eff_pos, insert_size)
+}
+
 /// Pad a sequence to the target length with random bases, or truncate if too long.
 pub(super) fn pad_sequence(mut seq: Vec<u8>, target_len: usize, rng: &mut impl Rng) -> Vec<u8> {
     while seq.len() < target_len {
@@ -1711,5 +1814,28 @@ mod tests {
             "100 positions should span at least 2 chromosomes, got {}",
             unique_chroms.len()
         );
+    }
+
+    /// SIMU3-05: `effective_molecule_locus` returns a valid pre-sampled locus unchanged, but
+    /// re-samples to a valid locus when the pre-sampled one cannot fit the drawn insert size (as
+    /// happens near a contig end), so the sort-key pre-pass keys on the emitted coordinates.
+    #[test]
+    fn test_effective_molecule_locus_passthrough_and_fallback() {
+        let fasta = write_multi_contig_fasta();
+        let genome = ReferenceGenome::load(fasta.path()).unwrap(); // chr1 is 2000bp
+        let family = crate::simulate::FamilySizeDistribution::log_normal(3.0, 1.0);
+        let insert = crate::simulate::InsertSizeModel::new(100.0, 10.0, 50, 200);
+
+        // A valid pre-sampled locus (chr1 start) is returned unchanged.
+        let (c0, p0, ins0) = effective_molecule_locus(1, 0, 0, 8, &family, 1, &insert, &genome);
+        assert_eq!((c0, p0), (0, 0), "valid locus should pass through unchanged");
+        assert!(genome.sequence_at(c0, p0, ins0).is_some());
+
+        // A locus near the end of chr1 cannot fit any insert >= 50, so it must be re-sampled to a
+        // valid locus (and the same seed draws the same insert size, so ins matches).
+        let (c1, p1, ins1) = effective_molecule_locus(1, 0, 1990, 8, &family, 1, &insert, &genome);
+        assert_eq!(ins0, ins1, "same seed draws the same insert size");
+        assert_ne!((c1, p1), (0, 1990), "invalid near-end locus should be re-sampled");
+        assert!(genome.sequence_at(c1, p1, ins1).is_some(), "re-sampled locus must be valid");
     }
 }
