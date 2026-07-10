@@ -113,6 +113,15 @@ pub struct GroupByMi {
     held: HeldSlot<Unpushed<BatchedMiGroups>>,
     target_batch_count: usize,
     output_byte_limit: u64,
+    /// Records dropped because they carry no MI tag at all. Expected in small
+    /// numbers (e.g. unmapped mates upstream filters missed); reported at
+    /// end-of-stream so a silent whole-input drop cannot go unnoticed.
+    skipped_no_mi: u64,
+    /// Records dropped because MI is present but **not** a `Z` (string) tag.
+    /// Almost always a malformed input rather than a legitimate skip: `fgumi
+    /// group` and fgbio both write MI as a string (it can carry a `/A`,`/B`
+    /// strand suffix), so an `MI:i:` integer silently matches nothing.
+    skipped_non_string_mi: u64,
     name: &'static str,
 }
 
@@ -143,6 +152,8 @@ impl GroupByMi {
             held: HeldSlot::new(),
             target_batch_count: target_batch_count.max(1),
             output_byte_limit,
+            skipped_no_mi: 0,
+            skipped_non_string_mi: 0,
             name: "GroupByMi",
         }
     }
@@ -209,11 +220,14 @@ impl GroupByMi {
         }
         let same_group = match &self.current_key {
             Some(key) => {
-                match key.matches_record(raw.as_ref(), self.tag, self.cell_tag, self.transform()) {
-                    Some(matches) => matches,
-                    // No MI tag on this record: skip it.
-                    None => return,
-                }
+                // `None` means no usable MI tag on this record: count why, and skip.
+                let Some(matches) =
+                    key.matches_record(raw.as_ref(), self.tag, self.cell_tag, self.transform())
+                else {
+                    self.count_skipped_record(raw.as_ref());
+                    return;
+                };
+                matches
             }
             None => false,
         };
@@ -225,11 +239,56 @@ impl GroupByMi {
             let Some(key) =
                 MiKey::from_record(raw.as_ref(), self.tag, self.cell_tag, self.transform())
             else {
+                self.count_skipped_record(raw.as_ref());
                 return;
             };
             self.flush_current_group();
             self.current_key = Some(key);
             self.current_records.push(raw);
+        }
+    }
+
+    /// Classify a record that produced no usable MI key, so end-of-stream can tell
+    /// "no MI tag" apart from "MI present but the wrong type".
+    ///
+    /// Only runs on the skip path, so it costs nothing for records that group
+    /// normally.
+    #[inline]
+    fn count_skipped_record(&mut self, bam: &[u8]) {
+        let aux = fgumi_raw_bam::aux_data_slice(bam);
+        match fgumi_raw_bam::find_tag_type(aux, self.tag) {
+            // Present but not `Z`: the caller almost certainly meant this record
+            // to group, so it is tracked separately and warned about loudly.
+            Some(kind) if kind != b'Z' => self.skipped_non_string_mi += 1,
+            _ => self.skipped_no_mi += 1,
+        }
+    }
+
+    /// Report records dropped for want of a usable MI tag, once, at end-of-stream.
+    ///
+    /// A wrong-typed MI is warned about unconditionally: it means the input was
+    /// written with e.g. `MI:i:1` instead of `MI:Z:1`, which groups nothing and
+    /// otherwise surfaces only as an inexplicably empty output.
+    fn report_skipped_records(&self) {
+        if self.skipped_non_string_mi > 0 {
+            log::warn!(
+                "{}: dropped {} record(s) whose {} tag is present but not a string (Z) tag. \
+                 fgumi and fgbio write {} as a string because it may carry a /A or /B strand \
+                 suffix; an integer tag such as `MI:i:1` matches no group. Re-run `fgumi group` \
+                 on this input, or rewrite the tag as `MI:Z:`.",
+                self.name,
+                self.skipped_non_string_mi,
+                String::from_utf8_lossy(&self.tag),
+                String::from_utf8_lossy(&self.tag),
+            );
+        }
+        if self.skipped_no_mi > 0 {
+            log::warn!(
+                "{}: dropped {} record(s) carrying no {} tag.",
+                self.name,
+                self.skipped_no_mi,
+                String::from_utf8_lossy(&self.tag),
+            );
         }
     }
 
@@ -326,6 +385,7 @@ impl Step for GroupByMi {
             if !self.accumulator.is_empty() {
                 return Ok(self.emit_batch(ctx));
             }
+            self.report_skipped_records();
             return Ok(StepOutcome::Finished);
         }
         Ok(StepOutcome::NoProgress)
@@ -336,6 +396,7 @@ impl Step for GroupByMi {
 mod tests {
     use super::*;
     use fgumi_raw_bam::RawRecord;
+    use rstest::rstest;
 
     /// Build a minimal unmapped raw BAM record carrying a single Z-type tag.
     #[allow(clippy::cast_possible_truncation)]
@@ -343,15 +404,21 @@ mod tests {
         raw_with_tags(&[(tag, value)])
     }
 
+    /// Build a minimal unmapped raw BAM record carrying a single `i`-type
+    /// (signed 32-bit integer) tag, e.g. the malformed `MI:i:1` that groups
+    /// nothing because MI is defined as a string tag.
+    #[allow(clippy::cast_possible_truncation)]
+    fn raw_with_int_tag(tag: &str, value: i32) -> RawRecord {
+        let t = tag.as_bytes();
+        let mut aux: Vec<u8> = vec![t[0], t[1], b'i'];
+        aux.extend_from_slice(&value.to_le_bytes());
+        raw_with_aux(&aux)
+    }
+
     /// Build a minimal unmapped raw BAM record carrying the given Z-type tags
     /// in the supplied aux-block order.
     #[allow(clippy::cast_possible_truncation)]
     fn raw_with_tags(tags: &[(&str, &str)]) -> RawRecord {
-        let name = b"read";
-        let l_read_name: u8 = (name.len() + 1) as u8;
-        let seq_len: u32 = 4;
-        let seq_bytes = seq_len.div_ceil(2) as usize;
-
         let mut aux: Vec<u8> = Vec::new();
         for (tag, value) in tags {
             let t = tag.as_bytes();
@@ -359,6 +426,16 @@ mod tests {
             aux.extend_from_slice(value.as_bytes());
             aux.push(0);
         }
+        raw_with_aux(&aux)
+    }
+
+    /// Wrap a pre-encoded aux block in a minimal unmapped raw BAM record.
+    #[allow(clippy::cast_possible_truncation)]
+    fn raw_with_aux(aux: &[u8]) -> RawRecord {
+        let name = b"read";
+        let l_read_name: u8 = (name.len() + 1) as u8;
+        let seq_len: u32 = 4;
+        let seq_bytes = seq_len.div_ceil(2) as usize;
 
         let total = 32 + l_read_name as usize + seq_bytes + seq_len as usize + aux.len();
         let mut buf = vec![0u8; total];
@@ -373,7 +450,7 @@ mod tests {
         buf[name_start..name_start + name.len()].copy_from_slice(name);
         buf[name_start + name.len()] = 0;
         let aux_start = 32 + l_read_name as usize + seq_bytes + seq_len as usize;
-        buf[aux_start..aux_start + aux.len()].copy_from_slice(&aux);
+        buf[aux_start..aux_start + aux.len()].copy_from_slice(aux);
         RawRecord::from(buf)
     }
 
@@ -428,6 +505,44 @@ mod tests {
         ];
         let groups = run_grouping(&mut step, records);
         assert_eq!(groups, vec![("5".to_string(), 2)]);
+    }
+
+    /// A dropped record must be *counted*, and a wrong-typed MI counted apart from
+    /// an absent one, so end-of-stream can warn instead of emitting a silently
+    /// empty output.
+    ///
+    /// The `MI:i:` case is the one that bites: fgumi and fgbio write MI as a `Z`
+    /// string (it may carry a `/A`,`/B` suffix), so an integer MI matches no group
+    /// and the whole input vanishes with no diagnostic.
+    #[rstest]
+    #[case::integer_mi_is_wrong_type(vec![raw_with_int_tag("MI", 1), raw_with_int_tag("MI", 1)], 0, 2)]
+    #[case::absent_mi(vec![raw_without_tag(), raw_without_tag()], 2, 0)]
+    #[case::mixed(vec![raw_without_tag(), raw_with_int_tag("MI", 3)], 1, 1)]
+    #[case::valid_string_mi_counts_nothing(vec![raw_with_tag("MI", "1"), raw_with_tag("MI", "1")], 0, 0)]
+    fn skipped_records_are_counted_by_reason(
+        #[case] records: Vec<RawRecord>,
+        #[case] expected_no_mi: u64,
+        #[case] expected_non_string_mi: u64,
+    ) {
+        use crate::sam::SamTag;
+        let mut step = GroupByMi::new(*SamTag::MI, 1 << 20);
+        run_grouping(&mut step, records);
+
+        assert_eq!(step.skipped_no_mi, expected_no_mi, "records with no MI tag");
+        assert_eq!(
+            step.skipped_non_string_mi, expected_non_string_mi,
+            "records whose MI is present but not a Z tag",
+        );
+    }
+
+    /// An all-integer-MI input must produce zero groups — the regression that made
+    /// four simplex parity tests compare one empty BAM against another.
+    #[test]
+    fn integer_mi_groups_nothing() {
+        use crate::sam::SamTag;
+        let mut step = GroupByMi::new(*SamTag::MI, 1 << 20);
+        let records = (0..8).map(|_| raw_with_int_tag("MI", 1)).collect();
+        assert!(run_grouping(&mut step, records).is_empty());
     }
 
     #[test]
