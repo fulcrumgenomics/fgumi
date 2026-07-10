@@ -778,9 +778,10 @@ impl UmiAssigner for ParallelPairedAssigner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::umi::{AdjacencyUmiAssigner, SimpleErrorUmiAssigner};
+    use crate::umi::{AdjacencyUmiAssigner, PairedUmiAssigner, SimpleErrorUmiAssigner};
     use fgumi_umi::assigner::DEFAULT_INDEX_THRESHOLD;
     use proptest::prelude::*;
+    use rstest::rstest;
 
     // ==================== UnionFind Tests ====================
 
@@ -1382,9 +1383,9 @@ mod tests {
         // before encoding. Mixed-case UMIs therefore grouped differently depending on
         // `--threads` (sequential vs parallel path). Both must fold case.
         //
-        // fgbio baseline: `GroupReadsByUmi` uppercases every UMI before assignment
-        // (`canonicalize(rawTag.toUpperCase)`), so case-insensitive grouping is the
-        // fgbio-faithful behavior — this converges with fgbio's user-facing output.
+        // fgbio baseline: the edit assigner compares UMIs case-insensitively in its mismatch
+        // counter (`Sequences.countMismatches`), so case-insensitive grouping is fgbio-faithful
+        // for the edit strategy — this converges with fgbio.
         let umis: Vec<String> =
             vec!["ACGT", "acgt", "AcGt", "TTTT", "tttt"].into_iter().map(String::from).collect();
 
@@ -1730,15 +1731,131 @@ mod tests {
         }
     }
 
-    // NOTE on the paired strategy (S7-002 / FU-004 scope): the sequential `PairedUmiAssigner`
-    // tie-break is the case-SENSITIVE canonical string (`canonicalize_paired` normalizes
-    // orientation only, not case) — raw/fgbio-compatible, matching the single-UMI raw tie-break.
-    // The parallel `ParallelPairedAssigner` is NOT converged onto raw here, and a *full* paired
-    // parity proptest is intentionally NOT added: the two paired paths diverge on inputs
-    // unrelated to the tie-break key — `ParallelPairedAssigner::canonicalize` uppercases (so its
-    // node identity itself is case-insensitive, unlike the sequential), and the two paths
-    // implement reverse-orientation adjacency matching differently (e.g. `GAAA-CCCC` vs
-    // `AAAA-CCCC`, 1 edit apart, group in the parallel path but not the sequential one).
-    // Converging the paired paths means reconciling those deeper divergences, which is a
-    // pre-existing, out-of-scope follow-up distinct from the FU-004 tie-break-key fix.
+    // NOTE on the paired strategy (S7-002 / FU-004 scope): the paired paths have TWO independent
+    // divergences, and they are converged separately.
+    //
+    //  1. CASE (converged): `ParallelPairedAssigner::canonicalize` uppercases, so its node
+    //     identity is case-insensitive. The sequential `PairedUmiAssigner` used to count/match/
+    //     tie-break on the RAW string (unlike the parallel path), so on mixed-case paired UMIs —
+    //     which the CLI does NOT pre-uppercase — `--threads 1` and `--threads N` could group and
+    //     strand-assign differently. The sequential path now folds case (`assign` works on
+    //     uppercased UMIs; `is_same_umi`/`canonicalize` uppercase first), matching the parallel
+    //     path and fgbio's user-facing output. `paired_sequential_and_parallel_agree_on_mixed_case`
+    //     below pins this. This is INTENTIONALLY different from the single-UMI adjacency tie-break,
+    //     which stays RAW/case-sensitive (both paths) — there the parallel path was converged onto
+    //     raw, so no case fold is needed; here the parallel path is already uppercase, so the
+    //     sequential path is folded onto it instead.
+    //
+    //  2. REVERSE-ORIENTATION MATCHING (still divergent): the two paths implement reverse-
+    //     orientation adjacency matching differently (e.g. `GAAA-CCCC` vs `AAAA-CCCC`, 1 edit
+    //     apart, group in the parallel path but not the sequential one). Converging this is a
+    //     separate, pre-existing follow-up tracked by the reverse-orientation-edges fix on `main`
+    //     (GRP3-01); it arrives via the eventual `feat-runall` <- `main` reconcile and is NOT
+    //     ported here to avoid duplicating in-review work. Because of it, only a case-dimension
+    //     parity test (inputs 0 edits apart) is added, not a full paired parity proptest.
+
+    /// Case-dimension parity for the paired strategy (divergence #1 in the NOTE above). All three
+    /// inputs spell the SAME molecule and are 0 edits apart in canonical form — `"ACGT-TGCA"`
+    /// (forward), `"acgt-tgca"` (forward, lowercase), `"TGCA-ACGT"` (reverse strand) — so the
+    /// reverse-orientation-matching divergence (#2, still open) is NOT exercised and this test is
+    /// a clean guard for the case fold alone. The parallel paired assigner canonicalizes to
+    /// uppercase, so it already groups all three with consistent strand (A/B) assignment; the
+    /// sequential paired assigner must now agree. Without the case fold it counts/matches on the
+    /// raw string, splitting `"acgt-tgca"` from `"ACGT-TGCA"`.
+    ///
+    /// Expectation is fgumi-internal (sequential must match parallel), NOT fgbio parity: both
+    /// fgumi paired paths uppercase, so the two forward spellings (0, 1) collapse to the canonical
+    /// `"ACGT-TGCA"` (strand A) while the reverse spelling (2) lands on strand B. This DIVERGES
+    /// from fgbio, whose paired grouping comparator (`AdjacencyUmiAssigner.matches`) is
+    /// case-SENSITIVE and would keep the spellings separate — a no-op only for uppercase input.
+    /// Pin the concrete PairedA/PairedB variants so a global A/B inversion (which
+    /// `assert_same_partition_by_molecule` alone would accept) still fails.
+    #[test]
+    fn paired_sequential_and_parallel_agree_on_mixed_case() {
+        let umis: Vec<Umi> =
+            vec!["ACGT-TGCA", "acgt-tgca", "TGCA-ACGT"].into_iter().map(String::from).collect();
+
+        let sequential = PairedUmiAssigner::new(1).assign(&umis);
+        let parallel = ParallelPairedAssigner::new(1, 2).assign(&umis);
+
+        assert_same_partition_by_molecule(&sequential, &parallel);
+
+        for (label, mol) in [("sequential", &sequential), ("parallel", &parallel)] {
+            assert!(
+                matches!(mol[0], MoleculeId::PairedA(_))
+                    && matches!(mol[1], MoleculeId::PairedA(_))
+                    && matches!(mol[2], MoleculeId::PairedB(_)),
+                "{label}: expected fwd,fwd,rev => A,A,B; got {mol:?}",
+            );
+            assert_eq!(mol[0], mol[1], "{label}: forward spellings share a strand");
+            assert_eq!(
+                mol[0].base_id_string(),
+                mol[2].base_id_string(),
+                "{label}: reverse spelling shares the base molecule",
+            );
+            assert_ne!(mol[0], mol[2], "{label}: reverse spelling is the opposite strand");
+        }
+    }
+
+    /// Case parity on the **graph** path, where the fast path above cannot reach.
+    ///
+    /// `paired_sequential_and_parallel_agree_on_mixed_case` feeds three spellings of one
+    /// molecule, so `umi_counts.len() == 1` and `assign` early-returns before building any
+    /// adjacency graph — the count aggregation, the uppercase tie-break sort, and the
+    /// root/child strand assignment are all skipped. These cases supply two distinct canonical
+    /// UMIs so the graph path actually runs.
+    ///
+    /// Every input pair here matches in FORWARD orientation (a direct 1-edit neighbour), so the
+    /// still-open reverse-orientation-matching divergence (#2 in the NOTE above) is not
+    /// exercised and a failure here means the case dimension regressed.
+    ///
+    /// * `equal_count_roots` — `"TCGT-TGCA"` and `"acgt-tgca"` are 1 edit apart with equal
+    ///   counts, and their sort order *inverts* under the case fold: raw, `'T'` (0x54) sorts
+    ///   before `'a'` (0x61), so `TCGT-TGCA` would be the root; uppercased, `ACGT-TGCA` sorts
+    ///   first and becomes the root instead. Root choice drives the A/B strand assignment, so
+    ///   this pins the tie-break the fix changed.
+    /// * `count_aggregation_at_threshold` — the two uppercase and one lowercase spellings of
+    ///   `ACGT-TGCA` must aggregate to a single count of 3, which sets
+    ///   `max_child_count = 3 / 2 + 1 = 2` and lets the 1-edit `TCGT-TGCA` (count 2) be absorbed
+    ///   at exactly the threshold. Counting the lowercase spelling separately would leave the
+    ///   root at count 2 and change the graph.
+    #[rstest]
+    #[case::equal_count_roots(vec!["TCGT-TGCA", "acgt-tgca"])]
+    #[case::count_aggregation_at_threshold(
+        vec!["ACGT-TGCA", "ACGT-TGCA", "acgt-tgca", "TCGT-TGCA", "TCGT-TGCA"]
+    )]
+    fn paired_sequential_and_parallel_agree_on_mixed_case_graph_path(#[case] spellings: Vec<&str>) {
+        let umis: Vec<Umi> = spellings.iter().map(|s| String::from(*s)).collect();
+
+        let sequential = PairedUmiAssigner::new(1).assign(&umis);
+        let parallel = ParallelPairedAssigner::new(1, 2).assign(&umis);
+
+        // The graph path must actually have run — more than one canonical UMI.
+        let canonical: std::collections::HashSet<String> =
+            umis.iter().map(|u| u.to_uppercase()).collect();
+        assert!(
+            canonical.len() > 1,
+            "fixture must have >1 canonical UMI to reach the graph path, got {canonical:?}",
+        );
+
+        assert_same_partition_by_molecule(&sequential, &parallel);
+
+        // Spellings that differ only by case must land on the same molecule AND strand in both
+        // paths; that is the whole point of folding case in the sequential assigner.
+        for (i, a) in umis.iter().enumerate() {
+            for (j, b) in umis.iter().enumerate().skip(i + 1) {
+                if a.to_uppercase() != b.to_uppercase() {
+                    continue;
+                }
+                assert_eq!(
+                    sequential[i], sequential[j],
+                    "sequential: {a:?} and {b:?} differ only by case, so must share a strand",
+                );
+                assert_eq!(
+                    parallel[i], parallel[j],
+                    "parallel: {a:?} and {b:?} differ only by case, so must share a strand",
+                );
+            }
+        }
+    }
 }
