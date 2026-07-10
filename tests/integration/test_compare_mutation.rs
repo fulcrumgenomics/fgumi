@@ -483,8 +483,13 @@ fn positional_exact_minus_mi_still_flags_non_mi_tag_change() {
 }
 
 // =============================================================================
-// Section 2 — `ContentPredicate::ExactConsensus` (consensus saturation carve-out)
+// Section 2 — `ContentPredicate::ExactConsensus` (exact consensus depth/error tags)
 // =============================================================================
+//
+// fgumi clamps every scalar consensus depth tag to fgbio's `Short` ceiling (see
+// `nh/fix-consensus-depth-clamp-parity`), so cD/cM/aD/aM/bD/bM and cE/aE/bE are
+// bit-identical to fgbio and `ExactConsensus` compares them exactly — there is no
+// saturation tolerance. A former "saturated" pair (e.g. 32767 vs 59920) now DIFFERs.
 
 fn consensus_record_cd(cd: i32) -> RawRecord {
     let mut b = SamBuilder::new();
@@ -493,26 +498,23 @@ fn consensus_record_cd(cd: i32) -> RawRecord {
 }
 
 #[rstest]
-#[case::identical_matches_under_exact(100, 100, ContentPredicate::Exact, true)]
-#[case::saturated_pair_tolerated_under_consensus(
+#[case::identical_matches(100, 100, ContentPredicate::Exact, true)]
+#[case::identical_matches_under_consensus(100, 100, ContentPredicate::ExactConsensus, true)]
+// A former "saturation" pair is now a real diff under both predicates.
+#[case::former_saturated_pair_differs_under_consensus(
     32767,
     59920,
     ContentPredicate::ExactConsensus,
-    true
-)]
-#[case::saturated_pair_still_differs_under_plain_exact(
-    32767,
-    59920,
-    ContentPredicate::Exact,
     false
 )]
-#[case::non_saturated_pair_still_differs_under_consensus(
+#[case::former_saturated_pair_differs_under_exact(32767, 59920, ContentPredicate::Exact, false)]
+#[case::non_saturated_pair_differs_under_consensus(
     100,
     200,
     ContentPredicate::ExactConsensus,
     false
 )]
-fn positional_consensus_cd_saturation_carveout(
+fn positional_consensus_cd_compared_exactly(
     #[case] cd_a: i32,
     #[case] cd_b: i32,
     #[case] pred: ContentPredicate,
@@ -531,7 +533,7 @@ fn positional_consensus_cd_saturation_carveout(
 }
 
 #[test]
-fn positional_consensus_cm_and_ce_tolerated_alongside_saturated_cd() {
+fn positional_consensus_cm_and_ce_differences_are_flagged() {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
     let rec = |cd: i32, cm: i32, ce: f32| {
@@ -551,15 +553,15 @@ fn positional_consensus_cm_and_ce_tolerated_alongside_saturated_cd() {
 
     let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, ContentPredicate::ExactConsensus)
         .expect("positional_compare should succeed");
-    assert!(outcome.is_match(), "cM/cE must be tolerated alongside a saturated cD: {outcome:?}");
+    assert!(!outcome.is_match(), "cD/cM/cE differences must DIFFER (no tolerance): {outcome:?}");
 }
 
-// ---- Duplex depth-saturation carve-out (aD/bD at 32767, cD at 65534) ----
+// ---- Duplex depth tags: aD/bD and combined cD compared exactly ----
 //
-// fgbio's *duplex* consensus additionally saturates the per-strand `aD`/`bD` at
-// `i16::MAX` (32767) and the *combined* `cD` at `2 * i16::MAX` = 65534 (the sum of two
-// independently-saturated `Short`s). Real Phase-7 duplex data measured `aD 59034 vs
-// 32767` and `cD 118954 vs 65534`.
+// fgumi now clamps the duplex per-strand `aD`/`bD` and combined `cD` to fgbio's `Short`
+// ceiling (per strand at 32767; the combined caps each strand per base before summing,
+// matching fgbio's `totalDepths`), so all of them compare exactly. Former "saturated"
+// pairs (e.g. `aD 59034 vs 32767`, `cD 118954 vs 65534`) now DIFFER.
 
 fn consensus_record_with_tag(tag: SamTag, value: i32) -> RawRecord {
     let mut b = SamBuilder::new();
@@ -568,35 +570,26 @@ fn consensus_record_with_tag(tag: SamTag, value: i32) -> RawRecord {
 }
 
 #[rstest]
-#[case::ad_saturated_32767(SamTag::AD, 32767, 59034, ContentPredicate::ExactConsensus, true)]
-#[case::bd_saturated_32767(SamTag::BD, 32767, 61000, ContentPredicate::ExactConsensus, true)]
-#[case::cd_saturated_65534_duplex(
+#[case::ad_former_saturated_differs(SamTag::AD, 32767, 59034, ContentPredicate::ExactConsensus)]
+#[case::bd_former_saturated_differs(SamTag::BD, 32767, 61000, ContentPredicate::ExactConsensus)]
+#[case::cd_former_saturated_65534_differs(
     SamTag::CD,
     65534,
     118_954,
-    ContentPredicate::ExactConsensus,
-    true
+    ContentPredicate::ExactConsensus
 )]
-#[case::ad_non_saturated_still_differs(
-    SamTag::AD,
-    100,
-    200,
-    ContentPredicate::ExactConsensus,
-    false
-)]
-#[case::cd_saturated_65534_still_differs_under_plain_exact(
+#[case::ad_non_saturated_differs(SamTag::AD, 100, 200, ContentPredicate::ExactConsensus)]
+#[case::cd_former_saturated_differs_under_exact(
     SamTag::CD,
     65534,
     118_954,
-    ContentPredicate::Exact,
-    false
+    ContentPredicate::Exact
 )]
-fn positional_consensus_duplex_depth_saturation_carveout(
+fn positional_consensus_duplex_depth_compared_exactly(
     #[case] tag: SamTag,
     #[case] value_a: i32,
     #[case] value_b: i32,
     #[case] pred: ContentPredicate,
-    #[case] expect_match: bool,
 ) {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
@@ -607,32 +600,9 @@ fn positional_consensus_duplex_depth_saturation_carveout(
 
     let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, pred)
         .expect("positional_compare should succeed");
-    assert_eq!(
-        outcome.is_match(),
-        expect_match,
-        "{tag:?} {value_a} vs {value_b} under {pred:?}: {outcome:?}"
-    );
-}
-
-#[test]
-fn positional_consensus_ad_undercount_relative_to_saturation_still_differs() {
-    // An UNDERCOUNT relative to a saturated value (fgbio saturated at 32767, fgumi
-    // reports something *smaller*) must never be tolerated -- this is not the "true
-    // depth is at least as large" shape the carve-out permits, so it must still DIFFER
-    // even under ExactConsensus. This is the soundness proof for finding B: a real
-    // depth-undercount regression on a saturated family must still be caught.
-    let tmp = TempDir::new().unwrap();
-    let header = create_minimal_header("chr1", 10000);
-    let bam1 = tmp.path().join("a.bam");
-    let bam2 = tmp.path().join("b.bam");
-    write_bam(&bam1, &header, &[consensus_record_with_tag(SamTag::AD, 32767)]);
-    write_bam(&bam2, &header, &[consensus_record_with_tag(SamTag::AD, 5)]);
-
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, ContentPredicate::ExactConsensus)
-        .expect("positional_compare should succeed");
     assert!(
         !outcome.is_match(),
-        "an aD undercount relative to a saturated value must still DIFFER: {outcome:?}"
+        "{tag:?} {value_a} vs {value_b} under {pred:?} must DIFFER (no tolerance): {outcome:?}"
     );
 }
 
@@ -1442,8 +1412,8 @@ const MUTATION_CATALOG: &[CatalogEntry] = &[
     // Section 2: ExactConsensus
     CatalogEntry {
         engine: "positional/ExactConsensus",
-        mutation: "cD saturated pair tolerated",
-        must_differ: false,
+        mutation: "cD former-saturated pair differs",
+        must_differ: true,
         verify: || {
             positional_differs(
                 &create_minimal_header("chr1", 10000),
@@ -1481,8 +1451,8 @@ const MUTATION_CATALOG: &[CatalogEntry] = &[
     },
     CatalogEntry {
         engine: "positional/ExactConsensus",
-        mutation: "cM/cE tolerated alongside saturated cD",
-        must_differ: false,
+        mutation: "cM/cE differences flagged",
+        must_differ: true,
         verify: || {
             let rec = |cd: i32, cm: i32, ce: f32| {
                 let mut b = SamBuilder::new();
@@ -1515,13 +1485,13 @@ const MUTATION_CATALOG: &[CatalogEntry] = &[
             )
         },
     },
-    // Section 2 (duplex): the ExactConsensus saturation carve-out extended to the
-    // per-strand aD/bD (32767) and combined cD (65534 = 2 * i16::MAX) duplex depth
-    // tags -- Phase-7 finding B.
+    // Section 2 (duplex): the per-strand aD/bD and combined cD duplex depth tags are
+    // now clamped to fgbio's Short ceiling and compared exactly (former "saturated"
+    // pairs DIFFER).
     CatalogEntry {
         engine: "positional/ExactConsensus",
-        mutation: "duplex aD saturated pair tolerated",
-        must_differ: false,
+        mutation: "duplex aD former-saturated pair differs",
+        must_differ: true,
         verify: || {
             positional_differs(
                 &create_minimal_header("chr1", 10000),
@@ -1533,8 +1503,8 @@ const MUTATION_CATALOG: &[CatalogEntry] = &[
     },
     CatalogEntry {
         engine: "positional/ExactConsensus",
-        mutation: "duplex bD saturated pair tolerated",
-        must_differ: false,
+        mutation: "duplex bD former-saturated pair differs",
+        must_differ: true,
         verify: || {
             positional_differs(
                 &create_minimal_header("chr1", 10000),
@@ -1546,8 +1516,8 @@ const MUTATION_CATALOG: &[CatalogEntry] = &[
     },
     CatalogEntry {
         engine: "positional/ExactConsensus",
-        mutation: "duplex combined cD saturated at 65534 tolerated",
-        must_differ: false,
+        mutation: "duplex combined cD former-saturated differs",
+        must_differ: true,
         verify: || {
             positional_differs(
                 &create_minimal_header("chr1", 10000),
@@ -1861,12 +1831,12 @@ fn mutation_catalog_covers_every_compared_dimension() {
         "drop a record",
         "duplicate a record",
         "swap two distinct-key records",
-        // consensus saturation carve-out
-        "cD saturated pair tolerated",
+        // consensus depth/error tags (compared exactly)
+        "cD former-saturated pair differs",
         "cD non-saturated pair",
-        "duplex aD saturated pair tolerated",
-        "duplex bD saturated pair tolerated",
-        "duplex combined cD saturated at 65534 tolerated",
+        "duplex aD former-saturated pair differs",
+        "duplex bD former-saturated pair differs",
+        "duplex combined cD former-saturated differs",
         "duplex aD non-saturated pair",
         "duplex aD undercount relative to saturation",
         // header record types

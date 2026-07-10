@@ -99,19 +99,19 @@ pub enum CommandPreset {
     /// [`ContentPredicate::ExactMinusMi`] plus a separate fgumi-MI/fgbio-MI
     /// bijection check; see [`CommandPreset::resolve`] for the full rationale.
     Group,
-    /// Simplex consensus output: positional, saturation-aware exact content comparison
+    /// Simplex consensus output: positional, exact content comparison
     /// (see [`ContentPredicate::ExactConsensus`](super::engines::content::ContentPredicate::ExactConsensus)).
     Simplex,
-    /// Duplex consensus output: positional, saturation-aware exact content comparison
+    /// Duplex consensus output: positional, exact content comparison
     /// (see [`ContentPredicate::ExactConsensus`](super::engines::content::ContentPredicate::ExactConsensus)).
     Duplex,
-    /// CODEC consensus output: positional, saturation-aware exact content comparison
+    /// CODEC consensus output: positional, exact content comparison
     /// (see [`ContentPredicate::ExactConsensus`](super::engines::content::ContentPredicate::ExactConsensus)).
     Codec,
-    /// Filter output: consensus reads with reads dropped, but the same saturated depth
-    /// tags (`cD`/`cM`/`cE`, and duplex `aD`/`aM`/`bD`/`bM`/`aE`/`bE`) as the consensus
-    /// command that produced them, passed through unchanged. Compares via the same
-    /// saturation-aware predicate as consensus output
+    /// Filter output: consensus reads with reads dropped, but the same depth tags
+    /// (`cD`/`cM`/`cE`, and duplex `aD`/`aM`/`bD`/`bM`/`aE`/`bE`) as the consensus command
+    /// that produced them, passed through unchanged. Compares via the same predicate as
+    /// consensus output
     /// ([`ContentPredicate::ExactConsensus`](super::engines::content::ContentPredicate::ExactConsensus));
     /// see [`CommandPreset::resolve`] for the full rationale.
     Filter,
@@ -134,14 +134,14 @@ impl CommandPreset {
     ///   `CompareMode`/`ContentPredicate` at all. This arm exists only so the match stays
     ///   exhaustive without a wildcard.)
     /// - `Filter | Simplex | Duplex | Codec` → `(Content, false, ExactConsensus)`: all four
-    ///   deal in consensus reads carrying the same saturated depth tags (`cD`/`cM`/`cE`, and
-    ///   duplex `aD`/`aM`/`bD`/`bM`/`aE`/`bE`). `Simplex`/`Duplex`/`Codec` are the commands
-    ///   that write those tags; `filter` only drops reads afterward, it never rewrites them.
-    ///   All four therefore compare positionally under the saturation-aware
-    ///   [`ContentPredicate::ExactConsensus`](super::engines::content::ContentPredicate::ExactConsensus)
-    ///   rather than plain `Exact`, which would falsely `DIFFER` on the accepted
-    ///   depth-saturation divergence (see the compare-hardening design spec's §"Accepted
-    ///   divergences").
+    ///   deal in consensus reads carrying the depth tags (`cD`/`cM`/`cE`, and duplex
+    ///   `aD`/`aM`/`bD`/`bM`/`aE`/`bE`). `Simplex`/`Duplex`/`Codec` are the commands that
+    ///   write those tags; `filter` only drops reads afterward, it never rewrites them. All
+    ///   four compare positionally under
+    ///   [`ContentPredicate::ExactConsensus`](super::engines::content::ContentPredicate::ExactConsensus),
+    ///   which (now that fgumi clamps the depth tags to fgbio's `Short` ceiling) is an exact
+    ///   content comparison — retained as a distinct preset predicate for these consensus
+    ///   commands but behaviourally equivalent to `Exact`.
     /// - `Group` → `(Grouping, true, ExactMinusMi)`: MI values and record order may
     ///   legitimately differ between tools or runs, so `Group` is the only preset that
     ///   verifies grouping equivalence instead of routing to `execute_content`. It compares
@@ -247,7 +247,7 @@ COMMAND PRESETS (--command):
   sort            (dedicated sort-verify engine; --mode/--ignore-order rejected)
   correct         content     false            Modifies RX tag only, not MI
   dedup           content     false            Deterministic
-  filter          content     false            Passes through MI/depth tags unchanged; saturation-aware exact (like consensus)
+  filter          content     false            Passes through MI/depth tags unchanged; exact (like consensus)
   group           grouping    true             Key-join: EXACT-MI content + MI bijection (cross-tool)
   simplex         content     false            Saturation-aware exact (cD/cM/cE carve-out)
   duplex          content     false            Saturation-aware exact (cD/cM/cE carve-out)
@@ -1134,7 +1134,7 @@ impl Command for CompareBams {
 
         // When a `--command` preset is given, its content predicate comes from
         // `CommandPreset::resolve` (see that method's doc comment for the full per-preset
-        // rationale, e.g. why `Simplex`/`Duplex`/`Codec`/`Filter` use the saturation-aware
+        // rationale, e.g. why `Simplex`/`Duplex`/`Codec`/`Filter` use the
         // `ExactConsensus`). This predicate is only ever consumed below by the `Content`
         // mode branch (`self.execute_content(predicate)`); `CompareMode::Grouping` routes to
         // `execute_grouping_with`, which takes no predicate at all — the ordered
@@ -1227,7 +1227,7 @@ impl CompareBams {
     /// ([`positional_compare`]): records are paired purely by index, a
     /// [`RecordKey`](super::record_key::RecordKey) mismatch stops pairing immediately
     /// (never resyncing), and remaining pairs are compared under `predicate` (plain
-    /// `Exact`, or the saturation-aware `ExactConsensus` for the consensus and `filter`
+    /// `Exact`, or the `ExactConsensus` for the consensus and `filter`
     /// presets — see `execute()`).
     ///
     /// This preserves the external report contract other tooling depends on: the
@@ -2186,7 +2186,7 @@ mod tests {
     }
 
     /// Consensus presets (simplex/duplex/codec) reroute to positional `Content`
-    /// comparison under the saturation-aware `ExactConsensus` predicate (see
+    /// comparison under the `ExactConsensus` predicate (see
     /// `execute()`'s predicate selection) rather than MI-grouping equivalence — this
     /// is a breaking strictness change (see the commit message and the
     /// compare-hardening design spec's §"Accepted divergences").
@@ -2215,13 +2215,11 @@ mod tests {
         assert_eq!(CommandPreset::Group.content_predicate(), ContentPredicate::ExactMinusMi);
     }
 
-    /// `filter` output is consensus reads that still carry the same saturated depth tags
-    /// (`cD`/`cM`/`cE`, and duplex `aD`/`aM`/`bD`/`bM`/`aE`/`bE`) as the consensus command
-    /// that produced them -- `filter` only drops reads, it never rewrites these tags. So
-    /// `Filter`'s content predicate must route through the same saturation-aware
-    /// `ExactConsensus` predicate as `Simplex`/`Duplex`/`Codec`, not plain `Exact`: a plain
-    /// `Exact` predicate would falsely `DIFFER` on the accepted depth-saturation divergence
-    /// (see the compare-hardening design spec's §"Accepted divergences").
+    /// `filter` output is consensus reads that still carry the depth tags (`cD`/`cM`/`cE`,
+    /// and duplex `aD`/`aM`/`bD`/`bM`/`aE`/`bE`) as the consensus command that produced them
+    /// -- `filter` only drops reads, it never rewrites these tags. So `Filter` routes through
+    /// the same `ExactConsensus` predicate as `Simplex`/`Duplex`/`Codec`, keeping the four
+    /// consensus commands on one predicate.
     #[test]
     fn filter_preset_content_predicate_is_exact_consensus() {
         assert_eq!(CommandPreset::Filter.content_predicate(), ContentPredicate::ExactConsensus);

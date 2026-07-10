@@ -42,38 +42,25 @@ pub enum ContentPredicate {
     /// the design spec §"Accepted divergences"). The carve-out is narrow: only that tag is
     /// dropped, so a real difference in any other tag still reports a DIFFER.
     Exact,
-    /// [`Self::Exact`], plus a single accepted divergence for consensus BAM output
-    /// (`simplex`/`duplex`/`codec`, and `filter` output run over consensus reads, since
-    /// `filter` only drops reads and passes these tags through unchanged): fgbio stores
-    /// per-read consensus depth and disagreement-count tags as a signed 16-bit `Short`
-    /// and saturates at `i16::MAX` (32767) for families deeper than that, while fgumi
-    /// reports the true (larger) depth. fgumi's uncapped depth is the more correct value,
-    /// so this divergence is accepted rather than fixed (see the compare-hardening design
-    /// spec, §"Accepted divergences", "Consensus per-read depth saturation"; decision-b,
-    /// 2026-07-08).
+    /// Consensus BAM output (`simplex`/`duplex`/`codec`, and `filter` output run over
+    /// consensus reads). This compares **exactly like [`Self::Exact`]** — including the
+    /// per-read depth/disagreement tags `cD`/`cM`/`aD`/`aM`/`bD`/`bM` and their `cE`/`aE`/`bE`
+    /// error rates.
     ///
-    /// This applies to both simplex/codec (`cD`/`cM`/`cE` only) and duplex output,
-    /// where fgbio *also* saturates the per-strand `aD`/`aM` and `bD`/`bM` at 32767
-    /// each, and the *combined* `cD`/`cM` at `2 * i16::MAX` = 65534 (the sum of two
-    /// independently-saturated `Short`s) — e.g. measured Phase-7 duplex data: `aD 59034
-    /// vs 32767`, `cD 118954 vs 65534`.
+    /// Historically this predicate carried a saturation-aware carve-out that tolerated a
+    /// depth divergence: fgbio stores per-base consensus depth as a `Short` `Array` capped
+    /// at `i16::MAX` (32767) and derives the scalar depth tags from those capped arrays,
+    /// while fgumi's codec/duplex callers emitted uncapped depths. That divergence has been
+    /// fixed at the source — fgumi now clamps every scalar depth tag to fgbio's `Short`
+    /// ceiling (per-strand `aD`/`bD` at 32767; combined `cD` caps each strand per base
+    /// *before* summing, matching fgbio's `totalDepths`) — so the tags are bit-identical and
+    /// the tolerance is no longer needed. Comparing them exactly is now both sound and
+    /// complete; the old carve-out could not be made sound for the combined `cD` anyway
+    /// (fgbio caps-then-sums, which is unrecoverable from the scalar).
     ///
-    /// The carve-out is deliberately narrow (a "sound" tolerance, not a blanket ignore):
-    /// - Int depth tags `cD`/`cM`/`aD`/`aM`/`bD`/`bM` are each accepted as equal if
-    ///   `a == b`, OR (`SAT.contains(a) && b >= a`), OR (`SAT.contains(b) && a >= b`),
-    ///   where `SAT = {32767, 65534}` (`i16::MAX` and `2 * i16::MAX`) — i.e. one side hit
-    ///   a known saturation point and the other side's true depth is at least as large.
-    ///   An UNDERCOUNT relative to a saturated value (e.g. fgbio `32767` vs fgumi `5`) is
-    ///   never tolerated — `5 < 32767`, so this still `DIFFER`s.
-    /// - The corresponding float error tag (`cE` for `cD`, `aE` for `aD`, `bE` for `bD`)
-    ///   is accepted as differing *only* on a record whose own D-tag mismatch was itself
-    ///   accepted via the saturation rule above (`cE` gated on `cD`'s outcome, `aE` on
-    ///   `aD`'s, `bE` on `bD`'s — independently per strand); otherwise it must match
-    ///   exactly.
-    /// - Every other tag (including the per-base `cd`/`ce`/`ad`/`ae`/`bd`/`be` `B:s`
-    ///   arrays, which saturate identically in both tools) and every core SAM field stay
-    ///   exact, so a real depth regression on a normal (non-saturated) family still
-    ///   reports a DIFFER.
+    /// Retained as a distinct predicate for the consensus/`filter` presets; now that the
+    /// carve-out is gone it is behaviourally equivalent to [`Self::Exact`] and could be
+    /// consolidated with it in a follow-up.
     ExactConsensus,
     /// [`Self::Exact`], but excludes the `MI` tag entirely from tag comparison — neither its
     /// *value* nor its *presence* is compared. `group` legitimately renumbers MI values across
@@ -105,9 +92,8 @@ pub fn content_diffs(
     header_b: &Header,
 ) -> Option<Vec<String>> {
     // Byte-identical records are content-equal under every `ContentPredicate`: `Exact`
-    // trivially agrees, and both `ExactConsensus` and `ExactMinusMi` only ever *add*
-    // tolerance on top of `Exact` (the former tolerates saturated-depth divergence, the
-    // latter simply drops the MI check — neither ever adds *strictness*), so a byte-for-byte
+    // compares them exactly, `ExactConsensus` is now equivalent to `Exact`, and
+    // `ExactMinusMi` only *drops* the MI check (never adds strictness), so a byte-for-byte
     // match can never be a `Some` under any of the three. Checking this first skips building
     // any tag maps on the common (matching) case.
     if raw_records_byte_equal(a, b) {
@@ -254,105 +240,14 @@ fn tag_diffs_excluding_mi(a: &[u8], b: &[u8]) -> Vec<String> {
     tag_diffs_with(&tags_a, &tags_b, |_tag, va, vb| va == vb)
 }
 
-/// The saturation points fgbio's `Short`-typed depth tags clamp to: `i16::MAX` (32767)
-/// for the per-strand `aD`/`aM`/`bD`/`bM` (and for simplex/codec `cD`/`cM`), and
-/// `2 * i16::MAX` (65534) for *duplex* `cD`/`cM`, which sum two independently-saturated
-/// per-strand `Short`s.
-const SAT: [i64; 2] = [i16::MAX as i64, 2 * i16::MAX as i64];
-
-/// Returns `true` if two depth-tag values (`cD`/`cM`/`aD`/`aM`/`bD`/`bM`) are equal
-/// under the saturation-aware carve-out: either they agree exactly, or one side has hit
-/// a known saturation point in [`SAT`] and the other side's true (uncapped) value is at
-/// least as large. An undercount relative to a saturated value (e.g. `32767` vs `5`) is
-/// deliberately excluded — `5 < 32767`, so neither disjunct fires and this still counts
-/// as a mismatch.
-fn depth_tag_values_agree(a: i64, b: i64) -> bool {
-    a == b || (SAT.contains(&a) && b >= a) || (SAT.contains(&b) && a >= b)
-}
-
-/// Returns `true` if `a` and `b` both carry an int-valued `d_tag` whose values disagree
-/// but are accepted as equal purely via the saturation branch of
-/// [`depth_tag_values_agree`] (i.e. not already exactly equal). This is the trigger
-/// condition that additionally permits the D-tag's corresponding error-rate tag (`cE`
-/// for `cD`, `aE` for `aD`, `bE` for `bD`) to differ on the same record.
-fn d_tag_saturation_accepted(
-    tags_a: &BTreeMap<[u8; 2], TagValue<'_>>,
-    tags_b: &BTreeMap<[u8; 2], TagValue<'_>>,
-    d_tag: SamTag,
-) -> bool {
-    match (tags_a.get(&*d_tag), tags_b.get(&*d_tag)) {
-        (Some(TagValue::Int(va)), Some(TagValue::Int(vb))) => {
-            va != vb && depth_tag_values_agree(*va, *vb)
-        }
-        _ => false,
-    }
-}
-
-/// Precomputed per-record-pair saturation outcomes for the three depth families this
-/// carve-out covers (`cD` combined, `aD`/`bD` per-strand), used to gate whether the
-/// corresponding error-rate tag (`cE`/`aE`/`bE`) may differ on that same record. Each
-/// flag is independent: a duplex record can have `aD` saturate while `bD` does not (or
-/// vice versa), and each strand's error tag must be gated on its own D-tag only.
-struct DepthSaturation {
-    cd: bool,
-    ad: bool,
-    bd: bool,
-}
-
-impl DepthSaturation {
-    /// Computes all three saturation flags once for a record pair's tag maps.
-    fn compute(
-        tags_a: &BTreeMap<[u8; 2], TagValue<'_>>,
-        tags_b: &BTreeMap<[u8; 2], TagValue<'_>>,
-    ) -> Self {
-        Self {
-            cd: d_tag_saturation_accepted(tags_a, tags_b, SamTag::CD),
-            ad: d_tag_saturation_accepted(tags_a, tags_b, SamTag::AD),
-            bd: d_tag_saturation_accepted(tags_a, tags_b, SamTag::BD),
-        }
-    }
-}
-
-/// Returns `true` if the values of a single named tag are equal under
-/// [`ContentPredicate::ExactConsensus`]'s carve-out.
-///
-/// `saturation` must be precomputed once per record pair by [`DepthSaturation::compute`]
-/// and threaded through, since each error-rate tag's carve-out depends on its own D-tag's
-/// saturation outcome, not on the error-rate tag's own value.
-fn consensus_tag_value_equal(
-    tag: [u8; 2],
-    va: &TagValue<'_>,
-    vb: &TagValue<'_>,
-    saturation: &DepthSaturation,
-) -> bool {
-    if [SamTag::CD, SamTag::CM, SamTag::AD, SamTag::AM, SamTag::BD, SamTag::BM]
-        .iter()
-        .any(|t| tag == **t)
-    {
-        match (va, vb) {
-            (TagValue::Int(a), TagValue::Int(b)) => depth_tag_values_agree(*a, *b),
-            _ => va == vb,
-        }
-    } else if tag == *SamTag::CE {
-        saturation.cd || va == vb
-    } else if tag == *SamTag::AE {
-        saturation.ad || va == vb
-    } else if tag == *SamTag::BE {
-        saturation.bd || va == vb
-    } else {
-        va == vb
-    }
-}
-
 /// Extracts a record's aux tags as a map of tag name -> zero-copy typed value.
 ///
 /// Values are kept as [`TagValue`] (not stringified): `TagValue` derives `PartialEq` and
 /// widens integer tags to `i64` regardless of on-disk width (`c`/`C`/`s`/`S`/`i`/`I`), so
 /// comparing `TagValue`s directly already gives the same width-insensitive equality that
 /// [`super::super::raw_compare::raw_tags_equal_order_independent`] uses to decide
-/// `tag_order_match` — no separate stringified map is needed for [`tag_diffs`], and
-/// [`consensus_tag_value_equal`] can pattern-match on the `Int`/`Float` variants for the
-/// `cD`/`cM`/`cE`/`aD`/`aM`/`aE`/`bD`/`bM`/`bE` carve-out.
+/// `tag_order_match` — no separate stringified map is needed for [`tag_diffs`] or
+/// [`consensus_tag_diffs`].
 fn tag_typed_map(raw: &[u8]) -> BTreeMap<[u8; 2], TagValue<'_>> {
     let mut tags: BTreeMap<[u8; 2], TagValue<'_>> =
         RawRecordView::new(raw).tags().iter_typed().collect();
@@ -365,7 +260,8 @@ fn tag_typed_map(raw: &[u8]) -> BTreeMap<[u8; 2], TagValue<'_>> {
 }
 
 /// Returns `true` if `a` and `b` have the same tag set and every tag value is equal
-/// under [`ContentPredicate::ExactConsensus`] (see [`consensus_tag_value_equal`]).
+/// (exactly). Consensus depth/error tags are compared exactly like every other tag now
+/// that fgumi clamps them to fgbio's `Short` ceiling (see [`ContentPredicate::ExactConsensus`]).
 fn consensus_tags_match(a: &[u8], b: &[u8]) -> bool {
     // Byte-identical tag regions are trivially equal under every comparison this function
     // could otherwise perform, so this skips building either side's tag map on the common
@@ -378,22 +274,15 @@ fn consensus_tags_match(a: &[u8], b: &[u8]) -> bool {
     if tags_a.len() != tags_b.len() {
         return false;
     }
-    let saturation = DepthSaturation::compute(&tags_a, &tags_b);
-    tags_a.iter().all(|(tag, va)| {
-        tags_b.get(tag).is_some_and(|vb| consensus_tag_value_equal(*tag, va, vb, &saturation))
-    })
+    tags_a.iter().all(|(tag, va)| tags_b.get(tag).is_some_and(|vb| va == vb))
 }
 
 /// Builds one diff string per aux tag that is present on only one side, or whose value
-/// differs under [`ContentPredicate::ExactConsensus`], between `a` and `b`.
+/// differs (exactly), between `a` and `b`.
 fn consensus_tag_diffs(a: &[u8], b: &[u8]) -> Vec<String> {
     let tags_a = tag_typed_map(a);
     let tags_b = tag_typed_map(b);
-    let saturation = DepthSaturation::compute(&tags_a, &tags_b);
-    tag_diffs_with(&tags_a, &tags_b, |tag, va, vb| match (va, vb) {
-        (Some(a_val), Some(b_val)) => consensus_tag_value_equal(tag, a_val, b_val, &saturation),
-        _ => false,
-    })
+    tag_diffs_with(&tags_a, &tags_b, |_tag, va, vb| va == vb)
 }
 
 /// Builds one diff string per core SAM field (see [`FIELD_NAMES`]) whose rendered value
@@ -510,140 +399,14 @@ mod tests {
         );
     }
 
-    // ==================== ExactConsensus carve-out tests ====================
+    // ==================== ExactConsensus: exact depth/error tags ====================
     //
-    // These are mutation-style tests: each one flips a single value (a saturated `cD`,
-    // a non-saturated `cD`, or a `cE` difference) and asserts the DIFFER/no-DIFFER
-    // outcome the accepted-divergence carve-out promises (see
-    // `ContentPredicate::ExactConsensus`'s doc-comment and the compare-hardening
-    // design spec's §"Accepted divergences").
-
-    #[test]
-    fn exact_consensus_tolerates_saturated_cd_difference() {
-        // fgbio saturates cD at i16::MAX (32767); fgumi reports the true depth
-        // (59920). Under ExactConsensus this must NOT be a diff.
-        let a = SamBuilder::new()
-            .read_name(b"r")
-            .sequence(b"ACGT")
-            .add_int_tag(SamTag::CD, 32767)
-            .build();
-        let b = SamBuilder::new()
-            .read_name(b"r")
-            .sequence(b"ACGT")
-            .add_int_tag(SamTag::CD, 59920)
-            .build();
-        assert!(
-            content_diffs(a.as_ref(), b.as_ref(), ContentPredicate::ExactConsensus, &hdr(), &hdr())
-                .is_none(),
-            "a cD difference where one side saturated at 32767 must be tolerated"
-        );
-    }
-
-    #[test]
-    fn exact_consensus_still_flags_non_saturated_cd_difference() {
-        // Both values are below the saturation point (32767): this is a real depth
-        // discrepancy on a normal-depth family and the carve-out must NOT blind it.
-        let a = SamBuilder::new()
-            .read_name(b"r")
-            .sequence(b"ACGT")
-            .add_int_tag(SamTag::CD, 100)
-            .build();
-        let b = SamBuilder::new()
-            .read_name(b"r")
-            .sequence(b"ACGT")
-            .add_int_tag(SamTag::CD, 200)
-            .build();
-        let diffs =
-            content_diffs(a.as_ref(), b.as_ref(), ContentPredicate::ExactConsensus, &hdr(), &hdr())
-                .expect("a non-saturated cD difference must still be reported as a diff");
-        assert!(
-            diffs.iter().any(|d| d.starts_with("cD:")),
-            "diff must name the differing cD tag, got: {diffs:?}"
-        );
-    }
-
-    #[test]
-    fn exact_predicate_still_flags_saturated_cd_difference() {
-        // The saturation carve-out is exclusive to ExactConsensus: plain Exact must
-        // still DIFFER on the same 32767-vs-59920 pair used by the tolerated case above.
-        let a = SamBuilder::new()
-            .read_name(b"r")
-            .sequence(b"ACGT")
-            .add_int_tag(SamTag::CD, 32767)
-            .build();
-        let b = SamBuilder::new()
-            .read_name(b"r")
-            .sequence(b"ACGT")
-            .add_int_tag(SamTag::CD, 59920)
-            .build();
-        let diffs = content_diffs(a.as_ref(), b.as_ref(), ContentPredicate::Exact, &hdr(), &hdr())
-            .expect("plain Exact must not apply the consensus saturation carve-out");
-        assert!(
-            diffs.iter().any(|d| d.starts_with("cD:")),
-            "diff must name the differing cD tag, got: {diffs:?}"
-        );
-    }
-
-    #[test]
-    fn exact_consensus_tolerates_cd_saturated_cm_and_ce_differences() {
-        // cM gets its own independent saturation carve-out, and cE (derived from the
-        // saturated depth) is tolerated on a record whose cD accepted-via-saturation.
-        let a = SamBuilder::new()
-            .read_name(b"r")
-            .sequence(b"ACGT")
-            .add_int_tag(SamTag::CD, 32767)
-            .add_int_tag(SamTag::CM, 32767)
-            .add_float_tag(SamTag::CE, 0.01)
-            .build();
-        let b = SamBuilder::new()
-            .read_name(b"r")
-            .sequence(b"ACGT")
-            .add_int_tag(SamTag::CD, 59920)
-            .add_int_tag(SamTag::CM, 40000)
-            .add_float_tag(SamTag::CE, 0.02)
-            .build();
-        assert!(
-            content_diffs(a.as_ref(), b.as_ref(), ContentPredicate::ExactConsensus, &hdr(), &hdr())
-                .is_none(),
-            "cM and cE differences must be tolerated alongside a saturated cD"
-        );
-    }
-
-    #[test]
-    fn exact_consensus_flags_ce_difference_when_cd_not_saturated() {
-        // cD matches exactly (no saturation triggered), so cE must still compare
-        // exact — the cE carve-out is keyed off cD's saturation outcome, not off cE's
-        // own value.
-        let a = SamBuilder::new()
-            .read_name(b"r")
-            .sequence(b"ACGT")
-            .add_int_tag(SamTag::CD, 100)
-            .add_float_tag(SamTag::CE, 0.01)
-            .build();
-        let b = SamBuilder::new()
-            .read_name(b"r")
-            .sequence(b"ACGT")
-            .add_int_tag(SamTag::CD, 100)
-            .add_float_tag(SamTag::CE, 0.02)
-            .build();
-        let diffs =
-            content_diffs(a.as_ref(), b.as_ref(), ContentPredicate::ExactConsensus, &hdr(), &hdr())
-                .expect("a cE difference without a saturated cD must still be reported");
-        assert!(
-            diffs.iter().any(|d| d.starts_with("cE:")),
-            "diff must name the differing cE tag, got: {diffs:?}"
-        );
-    }
-
-    // ---- Duplex depth-saturation carve-out (aD/aM/bD/bM at 32767, cD/cM at 65534) ----
-    //
-    // fgbio's *duplex* consensus also saturates the per-strand `aD`/`aM`/`bD`/`bM` at
-    // `i16::MAX` (32767, the same single-strand saturation point as simplex `cD`/`cM`),
-    // and the *combined* `cD`/`cM` at `2 * i16::MAX` = 65534 (the sum of two saturated
-    // `Short`s). Real Phase-7 data: `aD 59034 vs 32767`, `cD 118954 vs 65534`. This
-    // table exercises every depth tag at its own saturation point, confirms a
-    // non-saturated difference on the same tags still DIFFERs, and proves an
-    // UNDERCOUNT (fgbio saturated, fgumi *smaller*) is never tolerated.
+    // fgumi clamps every scalar consensus depth tag to fgbio's `Short` ceiling (see
+    // `nh/fix-consensus-depth-clamp-parity`), so `cD`/`cM`/`aD`/`aM`/`bD`/`bM` and their
+    // `cE`/`aE`/`bE` error rates are bit-identical to fgbio. `ExactConsensus` therefore
+    // compares them EXACTLY, with no saturation tolerance: any difference — including a
+    // pre-fix "saturated" pair like `32767` vs `59920`, or the duplex `65534` sum — is a
+    // real divergence and must DIFFER.
 
     fn depth_tag_record(tag: SamTag, value: i32) -> RawRecord {
         let mut b = SamBuilder::new();
@@ -651,171 +414,73 @@ mod tests {
         b.build()
     }
 
+    /// Every consensus depth tag is compared exactly under both `ExactConsensus` and plain
+    /// `Exact`: a former "saturation" pair now DIFFERs, and an identical pair matches.
     #[rstest]
-    // -- saturated at 32767 (per-strand aD/aM/bD/bM, and simplex-style cD/cM) --
-    #[case::ad_saturated_32767(SamTag::AD, 32767, 59034, true)]
-    #[case::am_saturated_32767(SamTag::AM, 32767, 40000, true)]
-    #[case::bd_saturated_32767(SamTag::BD, 32767, 61000, true)]
-    #[case::bm_saturated_32767(SamTag::BM, 32767, 41000, true)]
-    // -- duplex combined cD/cM saturate at 65534 = 2 * i16::MAX --
-    #[case::cd_saturated_65534_duplex(SamTag::CD, 65534, 118_954, true)]
-    #[case::cm_saturated_65534_duplex(SamTag::CM, 65534, 90000, true)]
-    // -- non-saturated differences on the same tags must still DIFFER --
-    #[case::ad_non_saturated_still_differs(SamTag::AD, 100, 200, false)]
-    #[case::bd_non_saturated_still_differs(SamTag::BD, 100, 200, false)]
-    #[case::cd_non_saturated_still_differs_duplex(SamTag::CD, 40000, 50000, false)]
-    // -- an undercount relative to a saturated value is never tolerated: fgbio's
-    //    saturated depth is a floor, and 5 < 32767 (or < 65534) is a real regression,
-    //    not the "true depth is at least as large" carve-out shape --
-    #[case::ad_undercount_not_tolerated(SamTag::AD, 32767, 5, false)]
-    #[case::cd_undercount_not_tolerated_duplex(SamTag::CD, 65534, 5, false)]
-    fn exact_consensus_depth_tag_saturation_carveout(
-        #[case] tag: SamTag,
-        #[case] value_a: i32,
-        #[case] value_b: i32,
-        #[case] expect_tolerated: bool,
-    ) {
-        let a = depth_tag_record(tag, value_a);
-        let b = depth_tag_record(tag, value_b);
-        let diffs =
-            content_diffs(a.as_ref(), b.as_ref(), ContentPredicate::ExactConsensus, &hdr(), &hdr());
-        assert_eq!(
-            diffs.is_none(),
-            expect_tolerated,
-            "{tag:?}: {value_a} vs {value_b} (expect_tolerated={expect_tolerated}): diffs={diffs:?}"
+    #[case::cd(SamTag::CD)]
+    #[case::cm(SamTag::CM)]
+    #[case::ad(SamTag::AD)]
+    #[case::am(SamTag::AM)]
+    #[case::bd(SamTag::BD)]
+    #[case::bm(SamTag::BM)]
+    fn exact_consensus_compares_depth_tags_exactly(#[case] tag: SamTag) {
+        let saturated = depth_tag_record(tag, 32767);
+        let uncapped = depth_tag_record(tag, 59920);
+        for pred in [ContentPredicate::ExactConsensus, ContentPredicate::Exact] {
+            assert!(
+                content_diffs(saturated.as_ref(), uncapped.as_ref(), pred, &hdr(), &hdr())
+                    .is_some_and(|d| !d.is_empty()),
+                "{tag:?} 32767 vs 59920 must DIFFER under {pred:?} (no saturation tolerance)"
+            );
+        }
+        let same = depth_tag_record(tag, 32767);
+        assert!(
+            content_diffs(
+                saturated.as_ref(),
+                same.as_ref(),
+                ContentPredicate::ExactConsensus,
+                &hdr(),
+                &hdr()
+            )
+            .is_none(),
+            "identical {tag:?} must match under ExactConsensus"
         );
     }
 
+    /// Consensus error tags (`cE`/`aE`/`bE`) are also compared exactly: any float
+    /// difference DIFFERs, with no gating on depth saturation.
     #[rstest]
-    #[case::ad_saturated_32767(SamTag::AD, 32767, 59034)]
-    #[case::bd_saturated_32767(SamTag::BD, 32767, 61000)]
-    #[case::cd_saturated_65534_duplex(SamTag::CD, 65534, 118_954)]
-    fn exact_predicate_still_flags_saturated_duplex_depth_difference(
-        #[case] tag: SamTag,
-        #[case] value_a: i32,
-        #[case] value_b: i32,
-    ) {
-        // The saturation carve-out is exclusive to ExactConsensus: plain Exact must
-        // still DIFFER on the same saturated-vs-true-depth pairs used above, for every
-        // depth tag (not just cD).
-        let a = depth_tag_record(tag, value_a);
-        let b = depth_tag_record(tag, value_b);
-        let diffs = content_diffs(a.as_ref(), b.as_ref(), ContentPredicate::Exact, &hdr(), &hdr())
-            .expect("plain Exact must not apply the consensus saturation carve-out");
-        assert!(
-            !diffs.is_empty(),
-            "plain Exact must still report a diff for {tag:?}: {value_a} vs {value_b}"
-        );
-    }
-
-    #[test]
-    fn exact_consensus_tolerates_ae_when_ad_saturated() {
-        // aE (the per-strand-A error rate) is tolerated only on a record whose aD
-        // itself saturated -- mirroring cE's carve-out, but gated on aD specifically.
-        let a = SamBuilder::new()
-            .read_name(b"r")
-            .sequence(b"ACGT")
-            .add_int_tag(SamTag::AD, 32767)
-            .add_float_tag(SamTag::AE, 0.01)
-            .build();
-        let b = SamBuilder::new()
-            .read_name(b"r")
-            .sequence(b"ACGT")
-            .add_int_tag(SamTag::AD, 59034)
-            .add_float_tag(SamTag::AE, 0.05)
-            .build();
+    #[case::ce(SamTag::CE)]
+    #[case::ae(SamTag::AE)]
+    #[case::be(SamTag::BE)]
+    fn exact_consensus_compares_error_tags_exactly(#[case] tag: SamTag) {
+        let a =
+            SamBuilder::new().read_name(b"r").sequence(b"ACGT").add_float_tag(tag, 0.01).build();
+        let b =
+            SamBuilder::new().read_name(b"r").sequence(b"ACGT").add_float_tag(tag, 0.02).build();
         assert!(
             content_diffs(a.as_ref(), b.as_ref(), ContentPredicate::ExactConsensus, &hdr(), &hdr())
-                .is_none(),
-            "aE must be tolerated alongside a saturated aD"
+                .is_some_and(|d| !d.is_empty()),
+            "{tag:?} error-rate difference must DIFFER"
         );
-    }
-
-    #[test]
-    fn exact_consensus_tolerates_be_when_bd_saturated() {
-        let a = SamBuilder::new()
-            .read_name(b"r")
-            .sequence(b"ACGT")
-            .add_int_tag(SamTag::BD, 32767)
-            .add_float_tag(SamTag::BE, 0.01)
-            .build();
-        let b = SamBuilder::new()
-            .read_name(b"r")
-            .sequence(b"ACGT")
-            .add_int_tag(SamTag::BD, 61000)
-            .add_float_tag(SamTag::BE, 0.05)
-            .build();
+        let same =
+            SamBuilder::new().read_name(b"r").sequence(b"ACGT").add_float_tag(tag, 0.01).build();
         assert!(
-            content_diffs(a.as_ref(), b.as_ref(), ContentPredicate::ExactConsensus, &hdr(), &hdr())
-                .is_none(),
-            "bE must be tolerated alongside a saturated bD"
-        );
-    }
-
-    #[test]
-    fn exact_consensus_flags_ae_difference_when_ad_not_saturated() {
-        // aD matches exactly (no saturation triggered), so aE must still compare
-        // exact -- the aE carve-out is keyed off aD's saturation outcome, not aE's
-        // own value.
-        let a = SamBuilder::new()
-            .read_name(b"r")
-            .sequence(b"ACGT")
-            .add_int_tag(SamTag::AD, 100)
-            .add_float_tag(SamTag::AE, 0.01)
-            .build();
-        let b = SamBuilder::new()
-            .read_name(b"r")
-            .sequence(b"ACGT")
-            .add_int_tag(SamTag::AD, 100)
-            .add_float_tag(SamTag::AE, 0.02)
-            .build();
-        let diffs =
-            content_diffs(a.as_ref(), b.as_ref(), ContentPredicate::ExactConsensus, &hdr(), &hdr())
-                .expect("an aE difference without a saturated aD must still be reported");
-        assert!(
-            diffs.iter().any(|d| d.starts_with("aE:")),
-            "diff must name the differing aE tag, got: {diffs:?}"
-        );
-    }
-
-    #[test]
-    fn exact_consensus_gates_be_independently_of_ad_saturation() {
-        // aD saturates (so aE is tolerated) but bD does NOT saturate on the same
-        // record pair: bE must still be reported exactly, proving each strand's
-        // error-rate carve-out is gated on *its own* depth tag, not any depth tag.
-        let a = SamBuilder::new()
-            .read_name(b"r")
-            .sequence(b"ACGT")
-            .add_int_tag(SamTag::AD, 32767)
-            .add_float_tag(SamTag::AE, 0.01)
-            .add_int_tag(SamTag::BD, 100)
-            .add_float_tag(SamTag::BE, 0.01)
-            .build();
-        let b = SamBuilder::new()
-            .read_name(b"r")
-            .sequence(b"ACGT")
-            .add_int_tag(SamTag::AD, 59034)
-            .add_float_tag(SamTag::AE, 0.05)
-            .add_int_tag(SamTag::BD, 100)
-            .add_float_tag(SamTag::BE, 0.02)
-            .build();
-        let diffs =
-            content_diffs(a.as_ref(), b.as_ref(), ContentPredicate::ExactConsensus, &hdr(), &hdr())
-                .expect("bE must still be reported even though aE is tolerated");
-        assert!(
-            diffs.iter().any(|d| d.starts_with("bE:")),
-            "diff must name the differing bE tag, got: {diffs:?}"
-        );
-        assert!(
-            !diffs.iter().any(|d| d.starts_with("aD:") || d.starts_with("aE:")),
-            "aD/aE must not be reported -- aD saturated, so aE is tolerated: {diffs:?}"
+            content_diffs(
+                a.as_ref(),
+                same.as_ref(),
+                ContentPredicate::ExactConsensus,
+                &hdr(),
+                &hdr()
+            )
+            .is_none(),
+            "identical {tag:?} must match"
         );
     }
 
     #[test]
     fn exact_consensus_still_exact_on_unrelated_tags() {
-        // A tag unrelated to the consensus carve-out (NM) must still be compared
-        // exactly under ExactConsensus.
+        // A non-consensus tag (NM) must still be compared exactly under ExactConsensus.
         let a =
             SamBuilder::new().read_name(b"r").sequence(b"ACGT").add_int_tag(SamTag::NM, 1).build();
         let b =
