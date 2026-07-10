@@ -34,11 +34,19 @@
 //!
 //! Goals:
 //!
-//!   * **Parity**: byte-for-byte equal to running standalone
-//!     `fgumi sort` (when `--start-from sort`) then `fgumi group`
-//!     then `fgumi {simplex,duplex,codec}` on the same input.
-//!     Differences in MI numbering would break parity so MI
-//!     assignment uses the exact same cumulative counter as group.
+//!   * **Parity**: the record stream and the `@HD`/`@SQ`/`@RG`
+//!     header are identical to running standalone `fgumi sort`
+//!     (when `--start-from sort`) then `fgumi group` then
+//!     `fgumi {simplex,duplex,codec}` on the same input. The output
+//!     is NOT byte-for-byte identical: the fused chain writes a
+//!     single `@PG` record while the staged run writes one `@PG`
+//!     per command, so parity is defined over the records plus the
+//!     `@HD` (`SO`/`GO`/`SS`), `@SQ`, and `@RG` header records —
+//!     exactly what the parity oracle in
+//!     `tests/integration/helpers/parity.rs` checks (other non-`@PG`
+//!     records such as `@CO` are outside the contract). Differences in
+//!     MI numbering would break parity so MI assignment uses the
+//!     exact same cumulative counter as group.
 //!   * **No intermediate file**: data flows in memory between every
 //!     stage. The temp BAMs that a sequential run would produce are
 //!     elided.
@@ -134,7 +142,8 @@ pub enum RunAllStage {
     /// `--extract::inputs` and read structures via
     /// `--extract::read-structures`. `--start-from extract --stop-after
     /// extract` runs the extract-only chain and writes the unmapped BAM
-    /// (byte-identical to standalone `fgumi extract`). Otherwise Extract
+    /// (record- and non-`@PG` header-identical to standalone `fgumi
+    /// extract`; runall's `@PG` provenance differs). Otherwise Extract
     /// feeds into Correct (when `--correct::umi-files` is set) or Align.
     Extract,
     /// Correct UMIs in an unmapped BAM against a fixed whitelist of
@@ -177,14 +186,16 @@ pub enum RunAllStage {
     /// selected by `--consensus`, not by this stage. `--start-from
     /// consensus` accepts a grouped (MI-tagged) BAM; `--stop-after
     /// consensus` runs the chosen consensus caller and writes the
-    /// consensus BAM (byte-identical to `fgumi simplex` / `duplex` /
-    /// `codec`). `--stop-after filter` fuses consensus → filter into one
+    /// consensus BAM (record- and non-`@PG` header-identical to `fgumi
+    /// simplex` / `duplex` / `codec`; runall's `@PG` provenance differs).
+    /// `--stop-after filter` fuses consensus → filter into one
     /// in-memory pipeline (no intermediate consensus BAM).
     Consensus,
     /// Post-consensus filtering. `--start-from filter` accepts a
     /// consensus BAM (output of `fgumi simplex`/`duplex`/`codec`) via
     /// `--input`; `--stop-after filter` runs the filter stage and writes
-    /// the filtered BAM (byte-identical to standalone `fgumi filter`).
+    /// the filtered BAM (record- and non-`@PG` header-identical to
+    /// standalone `fgumi filter`; runall's `@PG` provenance differs).
     /// Tunable via `--filter::*`. Filter is the last stage in the linear
     /// order — no stage follows it. It runs either as the filter self-pair
     /// (`--start-from filter --stop-after filter`, input = a consensus
@@ -338,9 +349,11 @@ consensus calling (optionally followed by filter) into a single in-memory \
 pipeline. Select the slice to run with `--start-from` and `--stop-after` (both \
 required); the stages run in the fixed order extract < correct < align < zipper \
 < sort < group < consensus < filter. Records flow directly between stages in \
-memory, so every intermediate BAM a sequential run would write is elided, and \
-the output is byte-for-byte identical to running the equivalent standalone \
-commands in turn.
+memory, so every intermediate BAM a sequential run would write is elided. The \
+record stream and the `@HD`/`@SQ`/`@RG` header match running the equivalent \
+standalone commands in turn, but the output is NOT byte-for-byte identical: the \
+fused chain writes a single `@PG` record while the staged run writes one `@PG` \
+per command.
 
 `--start-from` declares the state of the input and selects the upstream work:
 
@@ -1857,7 +1870,8 @@ mod tests {
     /// `--start-from extract --stop-after extract` is the supported
     /// extract-only self-pair: it runs the FASTQ→unmapped-BAM extract
     /// chain inside runall and writes the unmapped BAM to `--output`
-    /// (byte-identical to standalone `fgumi extract`).
+    /// (record- and non-`@PG` header-identical to standalone `fgumi
+    /// extract`; runall's `@PG` provenance differs).
     #[test]
     fn validate_stages_for_accepts_extract_self_pair() {
         validate_stages_for(RunAllStage::Extract, RunAllStage::Extract).unwrap();

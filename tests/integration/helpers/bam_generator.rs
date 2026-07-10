@@ -229,6 +229,113 @@ pub fn create_paired_umi_family_at(
     records
 }
 
+/// Like [`create_paired_umi_family_at`] but emits the **FR-overlap flag shape**
+/// that the CODEC consensus caller requires to form a duplex consensus.
+///
+/// CODEC recognises a duplex pair by its flag/orientation shape, NOT by
+/// paired-UMI grouping: R1 must be `PAIRED | FIRST_SEGMENT | MATE_REVERSE` and
+/// R2 must be `PAIRED | LAST_SEGMENT | REVERSE`, with **both mates mapped at the
+/// SAME reference position** (a fully-overlapping FR pair). This mirrors the
+/// `create_codec_read_pair` helper in `tests/integration/test_codec_command.rs`
+/// and the `zipper_codec_fixture` in `test_runall_parity.rs`, both of which are
+/// known to yield non-empty CODEC output.
+///
+/// This contrasts with [`create_paired_umi_family_at`] /
+/// [`create_paired_umi_family`], which map R1 and R2 100bp apart with plain
+/// `PAIRED | FIRST_SEGMENT` / `PAIRED | LAST_SEGMENT` flags (no strand-
+/// orientation flags, no overlap) — a shape CODEC rejects, so those families
+/// produce **0** consensus records. Use this helper for any fixture whose chain
+/// reaches a CODEC consensus and must retain records.
+///
+/// Both mates are placed at `pos` (0-based), carry `mate_pos = pos`, an `MC`
+/// mate-cigar tag (`{mate_len}M`), the single-strand UMI in `RX`, a `{len}M`
+/// cigar, and template length `+len` (R1) / `-len` (R2). Use `depth >= 3` per
+/// family for enough duplex depth to form a consensus at `--min-reads 1`.
+///
+/// # Arguments
+///
+/// * `umi` - single-strand UMI sequence written to `RX` on both mates
+/// * `depth` - number of read pairs in the family (≥3 recommended)
+/// * `base_name` - base read name (suffixed with the pair index)
+/// * `r1_sequence` - R1 sequence
+/// * `r2_sequence` - R2 sequence (same length as R1 for a clean overlap)
+/// * `quality` - base quality score for every base
+/// * `pos` - shared 0-based reference position for both mates
+#[allow(clippy::too_many_arguments)]
+pub fn create_codec_fr_overlap_family_at(
+    umi: &str,
+    depth: usize,
+    base_name: &str,
+    r1_sequence: &str,
+    r2_sequence: &str,
+    quality: u8,
+    pos: i32,
+) -> Vec<RawRecord> {
+    let r1_seq = r1_sequence.as_bytes();
+    let r2_seq = r2_sequence.as_bytes();
+    let r1_cigar = u32::try_from(r1_seq.len()).expect("r1_seq.len() fits u32") << 4;
+    let r2_cigar = u32::try_from(r2_seq.len()).expect("r2_seq.len() fits u32") << 4;
+
+    // Each mate carries its partner's CIGAR in MC, exactly what
+    // `GroupByPosition` needs to compute the template span on paired input.
+    let r1_mc = format!("{}M", r2_seq.len());
+    let r2_mc = format!("{}M", r1_seq.len());
+
+    // Template length: the fully-overlapping FR pair spans a single read length,
+    // so both mates must agree on |TLEN| (htslib/samtools convention). Require
+    // equal-length reads rather than deriving each mate's TLEN independently — an
+    // unequal-length pair would carry mismatched |TLEN| and is not a well-formed
+    // FR-overlap family.
+    assert_eq!(
+        r1_seq.len(),
+        r2_seq.len(),
+        "create_codec_fr_overlap_family_at requires equal-length r1/r2 for a well-formed FR-overlap pair"
+    );
+    let tlen = i32::try_from(r1_seq.len()).expect("r1_seq length fits i32");
+
+    let mut records = Vec::new();
+    for i in 0..depth {
+        let read_name = format!("{base_name}_{i}");
+
+        // R1: PAIRED | FIRST_SEGMENT | MATE_REVERSE — the MATE_REVERSE flag
+        // marks the R2 partner as reverse-strand (the FR-overlap shape).
+        let mut b1 = SamBuilder::new();
+        b1.read_name(read_name.as_bytes())
+            .ref_id(0)
+            .pos(pos)
+            .mapq(60)
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+            .mate_ref_id(0)
+            .mate_pos(pos)
+            .template_length(tlen)
+            .cigar_ops(&[r1_cigar])
+            .sequence(r1_seq)
+            .qualities(&vec![quality; r1_seq.len()])
+            .add_string_tag(SamTag::RX, umi.as_bytes())
+            .add_string_tag(SamTag::MC, r1_mc.as_bytes());
+        records.push(b1.build());
+
+        // R2: PAIRED | LAST_SEGMENT | REVERSE — same position as R1.
+        let mut b2 = SamBuilder::new();
+        b2.read_name(read_name.as_bytes())
+            .ref_id(0)
+            .pos(pos)
+            .mapq(60)
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+            .mate_ref_id(0)
+            .mate_pos(pos)
+            .template_length(-tlen)
+            .cigar_ops(&[r2_cigar])
+            .sequence(r2_seq)
+            .qualities(&vec![quality; r2_seq.len()])
+            .add_string_tag(SamTag::RX, umi.as_bytes())
+            .add_string_tag(SamTag::MC, r2_mc.as_bytes());
+        records.push(b2.build());
+    }
+
+    records
+}
+
 /// Creates a both-unmapped paired-end read pair carrying a paired UMI in `RX`.
 ///
 /// Both R1 and R2 are `UNMAPPED | MATE_UNMAPPED` (no reference, no position),
@@ -529,6 +636,82 @@ mod tests {
         assert_ne!(r1_flags & flags::FIRST_SEGMENT, 0, "R1 should have FIRST_SEGMENT flag");
         assert_eq!(r2_flags & flags::FIRST_SEGMENT, 0, "R2 should not have FIRST_SEGMENT flag");
         assert_ne!(r2_flags & flags::LAST_SEGMENT, 0, "R2 should have LAST_SEGMENT flag");
+    }
+
+    #[test]
+    fn create_codec_fr_overlap_family_at_emits_codec_shape() {
+        // Pin the FR-overlap flag/position shape CODEC consensus requires: R1
+        // `PAIRED|FIRST|MATE_REVERSE`, R2 `PAIRED|LAST|REVERSE`, BOTH mates at
+        // the SAME position (unlike `create_paired_umi_family_at`'s 100bp gap /
+        // no strand flags, which CODEC rejects). A regression that dropped a
+        // strand flag or split the positions would silently re-vacuum the codec
+        // parity tests (RUN3-02), so assert the shape directly.
+        use noodles::sam::alignment::record::cigar::{Op, op::Kind};
+        use noodles::sam::alignment::record::data::field::Tag;
+
+        const POS: i32 = 512;
+        const UMI: &str = "ACGTACGT";
+        const SEQ: &str = "ACGT";
+        // Exact flag masks the helper contracts for — comparing the whole mask
+        // (not just individual bits) catches a stray extra flag as well as a
+        // dropped one.
+        let r1_flags_expected = flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE;
+        let r2_flags_expected = flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE;
+        let tlen = i32::try_from(SEQ.len()).expect("SEQ length fits i32");
+
+        let family = create_codec_fr_overlap_family_at(UMI, 3, "codec", SEQ, SEQ, 30, POS);
+        assert_eq!(family.len(), 6, "3 pairs → 6 records");
+
+        let rx_of = |raw: &RawRecord| -> Vec<u8> {
+            let buf = to_record_buf(raw);
+            match buf.data().get(&Tag::from(SamTag::RX)).expect("record carries an RX tag") {
+                noodles::sam::alignment::record_buf::data::field::Value::String(s) => s.to_vec(),
+                other => panic!("RX should be a string tag, got {other:?}"),
+            }
+        };
+        let mc_of = |raw: &RawRecord| -> Vec<u8> {
+            let buf = to_record_buf(raw);
+            match buf.data().get(&Tag::from(SamTag::MC)).expect("record carries an MC tag") {
+                noodles::sam::alignment::record_buf::data::field::Value::String(s) => s.to_vec(),
+                other => panic!("MC should be a string tag, got {other:?}"),
+            }
+        };
+        // Each mate is a single full-length match (`<len>M`); assert the record's
+        // own CIGAR directly so a bad `cigar_ops(&[len << 4])` encoding can't slip
+        // past the MC-tag checks (MC carries the *mate's* cigar, not the record's).
+        let cigar_of =
+            |raw: &RawRecord| -> Vec<Op> { to_record_buf(raw).cigar().as_ref().to_vec() };
+        let expected_cigar = vec![Op::new(Kind::Match, SEQ.len())];
+
+        for pair in family.chunks_exact(2) {
+            let (r1, r2) = (&pair[0], &pair[1]);
+
+            // R1: exact `PAIRED|FIRST_SEGMENT|MATE_REVERSE` — the FR-overlap
+            // shape; R2: exact `PAIRED|LAST_SEGMENT|REVERSE`, same position.
+            assert_eq!(r1.flags(), r1_flags_expected, "R1 flag mask");
+            assert_eq!(r2.flags(), r2_flags_expected, "R2 flag mask");
+
+            // Both mates map to the SAME position (the overlap CODEC needs) and
+            // each points at the other via mate_pos.
+            assert_eq!(r1.pos(), POS, "R1 at shared pos");
+            assert_eq!(r2.pos(), POS, "R2 at shared pos");
+            assert_eq!(r1.mate_pos(), POS, "R1 mate_pos = shared pos");
+            assert_eq!(r2.mate_pos(), POS, "R2 mate_pos = shared pos");
+
+            // Template length ±len (fully-overlapping single-read span).
+            assert_eq!(r1.template_length(), tlen, "R1 TLEN = +len");
+            assert_eq!(r2.template_length(), -tlen, "R2 TLEN = -len");
+
+            // Single-strand UMI shared in RX; MC carries the mate's cigar.
+            assert_eq!(rx_of(r1), UMI.as_bytes(), "R1 RX");
+            assert_eq!(rx_of(r2), UMI.as_bytes(), "R2 RX");
+            assert_eq!(mc_of(r1), format!("{}M", SEQ.len()).as_bytes(), "R1 MC = mate cigar");
+            assert_eq!(mc_of(r2), format!("{}M", SEQ.len()).as_bytes(), "R2 MC = mate cigar");
+
+            // The record's own CIGAR is `<len>M` for both mates.
+            assert_eq!(cigar_of(r1), expected_cigar, "R1 CIGAR = <len>M");
+            assert_eq!(cigar_of(r2), expected_cigar, "R2 CIGAR = <len>M");
+        }
     }
 
     #[test]
