@@ -39,6 +39,26 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+/// Validate that the read structures produce a valid SAM template: 1 or 2
+/// template (`T`) reads total. 0 template reads yields records with no sequence;
+/// 3+ produce more segments than a SAM template (R1/R2) can hold — either way
+/// the output BAM would be malformed. Shared by the standalone `Extract` command
+/// and the chain/runall `ChainBuilder::add_extract` so both paths reject it
+/// (the chain path previously skipped this check — silent malformed output).
+///
+/// # Errors
+///
+/// Returns an error unless the total template-read count is 1 or 2.
+pub(crate) fn validate_template_count(read_structures: &[ReadStructure]) -> anyhow::Result<()> {
+    let template_count: usize =
+        read_structures.iter().map(|rs| rs.segments_by_type(SegmentType::Template).count()).sum();
+    anyhow::ensure!(
+        (1..=2).contains(&template_count),
+        "read structures must contain 1-2 template reads total."
+    );
+    Ok(())
+}
+
 /// Per-stage options for [`crate::pipeline::chains::Stage::Extract`].
 ///
 /// Carries all the knobs that [`crate::pipeline::chains::commands::extract`]
@@ -601,14 +621,7 @@ impl Extract {
             "input and read-structure must be supplied the same number of times."
         );
 
-        let template_count: usize = read_structures
-            .iter()
-            .map(|rs| rs.segments_by_type(SegmentType::Template).count())
-            .sum();
-        ensure!(
-            (1..=2).contains(&template_count),
-            "read structures must contain 1-2 template reads total."
-        );
+        validate_template_count(&read_structures)?;
 
         ensure!(
             !self.extract_umis_from_read_names || !self.store_umi_quals,
@@ -1115,6 +1128,19 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use tempfile::TempDir;
+
+    #[rstest]
+    #[case::one_template(&["+T"], true)]
+    #[case::two_templates(&["8B+T", "+T"], true)]
+    #[case::zero_templates(&["+B"], false)]
+    #[case::three_templates(&["+T", "+T", "+T"], false)]
+    fn validate_template_count_requires_1_or_2(#[case] structures: &[&str], #[case] ok: bool) {
+        let read_structures: Vec<ReadStructure> = structures
+            .iter()
+            .map(|s| ReadStructure::from_str(s).expect("valid read structure"))
+            .collect();
+        assert_eq!(validate_template_count(&read_structures).is_ok(), ok);
+    }
 
     /// Create a FASTQ file for testing
     ///

@@ -1618,6 +1618,11 @@ impl<'a> ChainBuilder<'a> {
             other => bail!("add_extract requires SourceSpec::Fastqs, got {other:?}"),
         };
 
+        // Enforce the same read-structure guard the standalone `Extract` command
+        // applies (1-2 template reads total): the chain/runall path previously
+        // skipped it and would silently emit malformed BAM templates.
+        crate::commands::extract::validate_template_count(&read_structures)?;
+
         let input_path = self.resolve_log_input_path();
         log::info!("Starting Extract");
         log::info!("Input: {}", input_path.display());
