@@ -538,11 +538,21 @@ pub(crate) fn build_branch_ordered_bytes<T: Send + HeapSize + Ordered + 'static>
 /// for non-`ByItemOrdinal` orderings. `ByItemOrdinal` requires `T: Ordered`
 /// — use `build_branch_ordered_bytes` for the combined case.
 ///
-/// Currently exercised only by tests; production code uses
-/// `build_branch_ordered_bytes` (BAM steps need both `HeapSize` and
-/// `Ordered`). Kept for the rare case where a step needs byte-bounded
-/// outputs without ordering.
-#[allow(dead_code)]
+/// The build path `build_single_queues` uses for every `Single<T>` output
+/// (`T: HeapSize`, no `Ordered` bound): it honors `ByteBounded` for
+/// `BranchOrdering::None` and `ByOrdinal`, and delegates every other spec
+/// straight back to `build_branch::<T>`. Steps needing both `HeapSize` and
+/// `Ordered` go through `build_branch_ordered_bytes` instead.
+///
+/// # Panics
+///
+/// Panics on `ByteBounded` + `ByItemOrdinal`: reading an item-carried serial
+/// needs `T: Ordered`, which this signature does not bound — so the ordinal is
+/// unreachable here even when the item type happens to implement `Ordered`. A
+/// step needing both declares `OrderedBytesSingle<T>`, which routes to
+/// `build_branch_ordered_bytes`; reaching this arm means a step asked for
+/// `ByItemOrdinal` through `Single<T>`, whose build path cannot read one. The
+/// panic is that guard rather than a supported configuration.
 pub(crate) fn build_branch_byte_aware<T: Send + HeapSize + 'static>(
     spec: QueueSpec,
     ordering: BranchOrdering,
@@ -1310,10 +1320,12 @@ pub(crate) fn build_single_queues<T: Send + HeapSize + 'static>(
     assert_eq!(ordering.len(), 1, "Single<T>::build_queues requires 1 ordering");
 
     // `Single<T>` bounds `T: HeapSize`, so use the byte-aware build path: it
-    // honors `QueueSpec::ByteBounded` (documented as supported for `Single<T>`
-    // outputs without item-carried serials) and delegates every non-byte spec
-    // straight back to `build_branch::<T>`, so count/unbounded paths are
-    // unchanged.
+    // honors `QueueSpec::ByteBounded` for `BranchOrdering::None` and
+    // `ByOrdinal` — the two orderings a `Single<T>` output can declare, since it
+    // carries no item serial — and delegates every non-byte spec straight back
+    // to `build_branch::<T>`, so count/unbounded paths are unchanged. A step
+    // needing `ByItemOrdinal` declares `OrderedBytesSingle<T>` instead; asking
+    // for it here panics (see `build_branch_byte_aware`).
     let branch = build_branch_byte_aware::<T>(specs[0], ordering[0], level);
     let view = SingleOutputsView { primary: branch.output };
     let outputs_view = OutputsViewAny { inner: Box::new(view) };
