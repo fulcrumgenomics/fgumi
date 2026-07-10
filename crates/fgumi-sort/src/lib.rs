@@ -62,7 +62,7 @@ pub mod ref_sort;
 pub mod segmented_buf;
 pub mod template_arena;
 // Block-granular spill compression kernel for the block-parallel spill steps
-// (`SpillGather`/`SpillCompress`/`SpillWrite`). Surfaced via the re-exports
+// (`SpillGather`/`SpillBlockCompress`/`SpillWrite`). Surfaced via the re-exports
 // below.
 pub(crate) mod spill_block;
 pub(crate) mod spill_block_reader;

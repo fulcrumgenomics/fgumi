@@ -16,7 +16,7 @@
 //! work-stealing pool. There is no longer a Sort-terminal special case: the
 //! former self-contained file→file `SortBamFile` step was removed, and
 //! standalone sort now streams (`ParseBamRecords` → arena sort ingest →
-//! `SpillGather` → `SpillCompress` → `SpillWrite` → `SortSpillDecompress` →
+//! `SpillGather` → `SpillBlockCompress` → `SpillWrite` → `SortSpillDecompress` →
 //! `SortMerge` → sink) like every other command.
 
 use anyhow::{Result, bail};
