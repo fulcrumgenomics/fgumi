@@ -46,6 +46,9 @@ use crate::commands::common::{
 /// - `queryname` — lexicographic ordering (default, fast)
 /// - `queryname::lexicographic` — explicit lexicographic ordering
 /// - `queryname::natural` — natural numeric ordering (samtools-compatible)
+///
+/// The `@HD SS` sub-sort for lexicographic queryname is emitted with the
+/// SAM-spec spelling `lexicographical` (accepted back as `queryname::lexicographical`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortOrderArg {
     /// Coordinate sort (tid → pos → strand)
@@ -64,7 +67,9 @@ impl SortOrderArg {
     /// Valid values:
     /// - `coordinate`
     /// - `queryname` (default: lexicographic)
+    /// - `queryname::lex`
     /// - `queryname::lexicographic`
+    /// - `queryname::lexicographical` (alias; fgumi emits `queryname:lexicographical` in `@HD` SS)
     /// - `queryname::natural`
     /// - `template-coordinate`
     ///
@@ -75,7 +80,10 @@ impl SortOrderArg {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
             "coordinate" => Ok(Self::Coordinate),
-            "queryname" | "queryname::lex" | "queryname::lexicographic" => Ok(Self::Queryname),
+            "queryname"
+            | "queryname::lex"
+            | "queryname::lexicographic"
+            | "queryname::lexicographical" => Ok(Self::Queryname),
             "queryname::natural" => Ok(Self::QuerynameNatural),
             "template-coordinate" => Ok(Self::TemplateCoordinate),
             other => {
@@ -83,12 +91,14 @@ impl SortOrderArg {
                     let sub =
                         other.strip_prefix("queryname::").expect("guarded by starts_with check");
                     Err(format!(
-                        "unknown queryname sub-sort '{sub}', expected 'lex', 'lexicographic', or 'natural'"
+                        "unknown queryname sub-sort '{sub}', expected 'lex', 'lexicographic', \
+                         'lexicographical', or 'natural'"
                     ))
                 } else {
                     Err(format!(
                         "unknown sort order '{other}', expected 'coordinate', 'queryname', \
-                         'queryname::lex', 'queryname::lexicographic', 'queryname::natural', \
+                         'queryname::lex', 'queryname::lexicographic', \
+                         'queryname::lexicographical', 'queryname::natural', \
                          or 'template-coordinate'"
                     ))
                 }
@@ -129,6 +139,7 @@ SORT ORDERS:
   queryname                Lexicographic read name sort (fast, default sub-sort).
   queryname::lex           Short alias for lexicographic ordering (same as above).
   queryname::lexicographic Explicit lexicographic ordering (same as above).
+  queryname::lexicographical Alias for the above; fgumi emits `queryname:lexicographical` in @HD SS.
   queryname::natural       Natural numeric ordering (samtools-compatible).
                           Use for `fgumi zipper`, template-level operations.
 
@@ -200,6 +211,7 @@ pub struct Sort {
     /// Queryname sort supports sub-sort specifiers:
     ///   `queryname`                  Lexicographic byte ordering (default, fast)
     ///   `queryname::lexicographic`   Explicit lexicographic ordering (alias: `queryname::lex`)
+    ///   `queryname::lexicographical` Alias; fgumi emits `queryname:lexicographical` in `@HD` SS
     ///   `queryname::natural`         Natural numeric ordering (samtools-compatible)
     #[arg(long = "order", default_value = "template-coordinate", value_parser = SortOrderArg::parse)]
     pub order: SortOrderArg,
@@ -976,6 +988,9 @@ mod tests {
     #[case("coordinate", Ok(SortOrderArg::Coordinate))]
     #[case("queryname", Ok(SortOrderArg::Queryname))]
     #[case("queryname::lexicographic", Ok(SortOrderArg::Queryname))]
+    // SORT3-10: the spec-spelling alias is accepted so a user can pass back the
+    // `@HD SS:queryname:lexicographical` value fgumi now emits.
+    #[case("queryname::lexicographical", Ok(SortOrderArg::Queryname))]
     #[case("queryname::lex", Ok(SortOrderArg::Queryname))]
     #[case("queryname::natural", Ok(SortOrderArg::QuerynameNatural))]
     #[case("template-coordinate", Ok(SortOrderArg::TemplateCoordinate))]
@@ -1004,7 +1019,9 @@ mod tests {
     fn test_queryname_lex_header_has_subsort() {
         let order = SortOrder::from(SortOrderArg::Queryname);
         assert_eq!(order.header_so_tag(), "queryname");
-        assert_eq!(order.header_ss_tag(), Some("queryname:lexicographic"));
+        // SORT3-10: the emitted SS sub-sort value uses the spec spelling "lexicographical"
+        // (with the `<sort-order>:` prefix retained).
+        assert_eq!(order.header_ss_tag(), Some("queryname:lexicographical"));
     }
 
     #[test]
