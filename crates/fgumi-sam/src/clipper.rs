@@ -1126,9 +1126,27 @@ impl SamRecordClipper {
                 *record.sequence_mut() = Sequence::from(seq[..new_len].to_vec());
                 *record.quality_scores_mut() = QualityScores::from(quals[..new_len].to_vec());
             }
+        } else if self.mode == ClippingMode::SoftWithMask {
+            // SoftWithMask: leave the soft clipping in the CIGAR but mask the upgraded
+            // soft-clipped bases to N with minimum quality. Mirrors fgbio's
+            // hardMaskStartOfRead call in upgradeClipping (SamRecordClipper.scala:528-529).
+            // Bases are not removed, so the CIGAR and extended attributes are untouched
+            // (fgbio's clipExtendedAttributes is a no-op outside Hard mode).
+            let mut new_seq = record.sequence().as_ref().to_vec();
+            let mut new_qual = record.quality_scores().as_ref().to_vec();
+            let seq_len = new_seq.len();
+            let (mask_start, mask_end) = if from_start {
+                (0, length_to_upgrade)
+            } else {
+                (seq_len - length_to_upgrade, seq_len)
+            };
+            for i in mask_start..mask_end {
+                new_seq[i] = NO_CALL_BASE;
+                new_qual[i] = MIN_PHRED;
+            }
+            *record.sequence_mut() = Sequence::from(new_seq);
+            *record.quality_scores_mut() = QualityScores::from(new_qual);
         }
-        // Note: SoftWithMask mode would use hard_mask_start_of_read/hard_mask_end_of_read
-        // but we don't implement that yet
     }
 
     /// Ensures at least `clip_length` bases are clipped at the start of the read
@@ -1213,12 +1231,17 @@ impl SamRecordClipper {
 
     /// Upgrades all existing clipping in a read to the current clipping mode
     ///
-    /// E.g., converts soft clips to hard clips if mode is Hard,
-    /// or soft clips to soft-with-mask if mode is `SoftWithMask`
+    /// In `Hard` mode existing soft clips are converted to hard clips (and the
+    /// corresponding bases removed from the sequence); in `SoftWithMask` mode the
+    /// CIGAR is left intact and the soft-clipped bases are masked to N with minimum
+    /// quality. `Soft` mode is a no-op.
     ///
-    /// Returns `(leading_clipped, trailing_clipped)` - the number of soft-clipped
-    /// bases that were converted to hard clips at the 5' and 3' ends respectively.
-    /// Returns `(0, 0)` if no conversion occurred.
+    /// Returns `(leading, trailing)` - the number of soft-clipped bases upgraded at
+    /// the CIGAR-leading and CIGAR-trailing ends respectively (converted in `Hard`
+    /// mode, masked in `SoftWithMask` mode). The ordering is by CIGAR position, not
+    /// biological 5'/3' end, so it is independent of strand (on a reverse-strand read
+    /// the CIGAR-leading end is the biological 3' end). Returns `(0, 0)` if nothing
+    /// was upgraded.
     ///
     /// # Panics
     ///
@@ -1240,8 +1263,8 @@ impl SamRecordClipper {
         reason = "CIGAR rewriting with attribute clipping requires many branches"
     )]
     pub fn upgrade_all_clipping(&self, record: &mut RecordBuf) -> Result<(usize, usize)> {
-        // Only upgrade in Hard mode
-        if !matches!(self.mode, ClippingMode::Hard) {
+        // Only upgrade in Hard or SoftWithMask mode (Soft leaves clipping untouched).
+        if matches!(self.mode, ClippingMode::Soft) {
             return Ok((0, 0));
         }
 
@@ -1276,15 +1299,30 @@ impl SamRecordClipper {
         }
 
         // Count trailing soft clips (from the end)
+        let mut trailing_hard = 0;
         for op in ops.iter().rev() {
             match op.kind() {
-                Kind::HardClip => {}
+                Kind::HardClip => trailing_hard += op.len(),
                 Kind::SoftClip => {
                     trailing_soft += op.len();
                     break;
                 }
                 _ => break,
             }
+        }
+
+        // SoftWithMask: mask the existing soft-clipped bases at both ends to N/min-quality,
+        // leaving the CIGAR intact. Delegates to upgrade_clipping per end, mirroring fgbio
+        // upgradeAllClipping's clipStartOfRead/clipEndOfRead -> upgradeClipping path
+        // (SamRecordClipper.scala:274-290). Returns the soft counts that were masked.
+        if self.mode == ClippingMode::SoftWithMask {
+            if leading_soft > 0 {
+                self.upgrade_clipping(record, leading_hard + leading_soft, true);
+            }
+            if trailing_soft > 0 {
+                self.upgrade_clipping(record, trailing_hard + trailing_soft, false);
+            }
+            return Ok((leading_soft, trailing_soft));
         }
 
         // Build new CIGAR, converting soft clips to hard clips
@@ -2322,12 +2360,33 @@ impl RawRecordClipper {
                 record.set_sequence_and_qualities(&new_seq, &new_qual);
             }
             self.clip_extended_attributes_raw(record, length_to_upgrade, from_start);
+        } else if self.mode == ClippingMode::SoftWithMask {
+            // SoftWithMask: mask the upgraded soft-clipped bases to N/min-quality without
+            // altering the CIGAR (see the typed `upgrade_clipping` for rationale).
+            let mut new_seq = record.sequence_vec();
+            let mut new_qual = record.quality_scores().to_vec();
+            let seq_len = new_seq.len();
+            let (mask_start, mask_end) = if from_start {
+                (0, length_to_upgrade)
+            } else {
+                (seq_len - length_to_upgrade, seq_len)
+            };
+            for i in mask_start..mask_end {
+                new_seq[i] = fgumi_dna::NO_CALL_BASE;
+                new_qual[i] = fgumi_dna::MIN_PHRED;
+            }
+            record.set_sequence_and_qualities(&new_seq, &new_qual);
         }
     }
 
-    /// Upgrades all existing soft clips to hard clips in a raw record.
+    /// Upgrades all existing clipping in a raw record to the current clipping mode.
     ///
-    /// Returns `(leading_soft, trailing_soft)` — the counts converted.
+    /// In `Hard` mode soft clips are converted to hard clips (bases removed); in
+    /// `SoftWithMask` mode the CIGAR is left intact and the soft-clipped bases are
+    /// masked to N with minimum quality. `Soft` mode is a no-op.
+    ///
+    /// Returns `(leading_soft, trailing_soft)` — the soft-clip counts upgraded at
+    /// each end (converted in `Hard` mode, masked in `SoftWithMask` mode).
     ///
     /// # Errors
     ///
@@ -2345,7 +2404,7 @@ impl RawRecordClipper {
         &self,
         record: &mut fgumi_raw_bam::RawRecord,
     ) -> anyhow::Result<(usize, usize)> {
-        if !matches!(self.mode, ClippingMode::Hard) {
+        if matches!(self.mode, ClippingMode::Soft) {
             return Ok((0, 0));
         }
         if record.flags() & fgumi_raw_bam::flags::UNMAPPED != 0 {
@@ -2361,6 +2420,7 @@ impl RawRecordClipper {
         let mut leading_hard: usize = 0;
         let mut leading_soft: usize = 0;
         let mut trailing_soft: usize = 0;
+        let mut trailing_hard: usize = 0;
 
         for &op in &ops {
             match op & 0xF {
@@ -2375,13 +2435,25 @@ impl RawRecordClipper {
         }
         for &op in ops.iter().rev() {
             match op & 0xF {
-                5 => {}
+                5 => trailing_hard += (op >> 4) as usize,
                 4 => {
                     trailing_soft += (op >> 4) as usize;
                     break;
                 }
                 _ => break,
             }
+        }
+
+        // SoftWithMask: mask existing soft-clipped bases at both ends via upgrade_clipping_raw,
+        // leaving the CIGAR intact (see the typed upgrade_all_clipping for rationale).
+        if self.mode == ClippingMode::SoftWithMask {
+            if leading_soft > 0 {
+                self.upgrade_clipping_raw(record, leading_hard + leading_soft, true);
+            }
+            if trailing_soft > 0 {
+                self.upgrade_clipping_raw(record, trailing_hard + trailing_soft, false);
+            }
+            return Ok((leading_soft, trailing_soft));
         }
 
         let old_seq_len = record.l_seq() as usize;
@@ -5079,18 +5151,62 @@ mod tests {
     }
 
     #[test]
-    fn test_not_upgrade_soft_with_mask_to_soft_with_mask() {
-        // Same mode - should not upgrade
+    fn test_upgrade_all_clipping_soft_with_mask_masks_existing_soft_clips() {
+        // CLIP3-03: SoftWithMask must mask existing soft-clipped bases to N/min-quality
+        // (CIGAR unchanged), matching fgbio upgradeAllClipping. Previously a no-op.
         let clipper = SamRecordClipper::new(ClippingMode::SoftWithMask);
-        let seq = "12345678901234567890123456789012345678901234567890";
+        let seq = "ACGTGACGTGACGTGACGTGACGTGACGTGACGTGACGTGACGTGACGTG"; // 50 bases, no N
         let mut record = create_test_record("5S35M10S", seq, 10);
 
         let result =
             clipper.upgrade_all_clipping(&mut record).expect("upgrade_all_clipping should succeed");
-        assert_eq!(result, (0, 0));
+        assert_eq!(result, (5, 10), "returns the (leading, trailing) soft counts masked");
 
-        let cigar_str = format_cigar(&record.cigar());
-        assert_eq!(cigar_str, "5S35M10S");
+        // CIGAR is unchanged; only the bases/quals of the soft-clipped regions change.
+        assert_eq!(format_cigar(&record.cigar()), "5S35M10S");
+
+        let bases = record.sequence().as_ref().to_vec();
+        assert!(bases[..5].iter().all(|&b| b == NO_CALL_BASE), "leading soft bases masked to N");
+        assert!(bases[40..].iter().all(|&b| b == NO_CALL_BASE), "trailing soft bases masked to N");
+        assert!(bases[5..40].iter().all(|&b| b != NO_CALL_BASE), "aligned bases untouched");
+
+        let quals = record.quality_scores().as_ref().to_vec();
+        assert!(quals[..5].iter().all(|&q| q == MIN_PHRED), "leading soft quals masked");
+        assert!(quals[40..].iter().all(|&q| q == MIN_PHRED), "trailing soft quals masked");
+    }
+
+    #[test]
+    fn test_upgrade_all_clipping_raw_soft_with_mask_masks_existing_soft_clips() {
+        // CLIP3-03 (raw): same masking behavior for the raw-byte upgrade path.
+        use fgumi_raw_bam::encode_record_buf_to_raw;
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReferenceSequence;
+        use std::num::NonZeroUsize;
+
+        let seq = "ACGTGACGTGACGTGACGTGACGTGACGTGACGTGACGTGACGTGACGTG"; // 50 bases, no N
+        let buf = create_test_record("5S35M10S", seq, 10);
+        let ref_seq =
+            Map::<ReferenceSequence>::new(NonZeroUsize::new(100_000).expect("ref length nonzero"));
+        let header =
+            noodles::sam::Header::builder().add_reference_sequence(b"chr1", ref_seq).build();
+        let mut raw = encode_record_buf_to_raw(&buf, &header).expect("encode raw");
+
+        let clipper = RawRecordClipper::new(ClippingMode::SoftWithMask);
+        let result =
+            clipper.upgrade_all_clipping_raw(&mut raw).expect("upgrade_all_clipping_raw succeeds");
+        assert_eq!(result, (5, 10));
+
+        // CIGAR unchanged: 5S 35M 10S.
+        assert_eq!(raw.cigar_ops_vec(), vec![(5u32 << 4) | 4, 35u32 << 4, (10u32 << 4) | 4]);
+
+        let bases = raw.sequence_vec();
+        assert!(bases[..5].iter().all(|&b| b == fgumi_dna::NO_CALL_BASE), "leading masked to N");
+        assert!(bases[40..].iter().all(|&b| b == fgumi_dna::NO_CALL_BASE), "trailing masked to N");
+        assert!(bases[5..40].iter().all(|&b| b != fgumi_dna::NO_CALL_BASE), "aligned untouched");
+
+        let quals = raw.quality_scores().to_vec();
+        assert!(quals[..5].iter().all(|&q| q == fgumi_dna::MIN_PHRED), "leading quals masked");
+        assert!(quals[40..].iter().all(|&q| q == fgumi_dna::MIN_PHRED), "trailing quals masked");
     }
 
     #[test]
@@ -5951,8 +6067,13 @@ mod crosscheck_tests {
     // upgrade_all_clipping cross-checks
     // =========================================================================
 
-    #[test]
-    fn crosscheck_upgrade_all_clipping_hard() {
+    // Hard converts the soft clips to hard clips (removing bases); SoftWithMask masks the
+    // soft-clipped bases to N/min-quality while leaving the CIGAR intact. Both are checked for
+    // raw/typed parity here. Soft is a documented no-op for upgrade and is omitted.
+    #[rstest]
+    #[case::hard(ClippingMode::Hard)]
+    #[case::soft_with_mask(ClippingMode::SoftWithMask)]
+    fn crosscheck_upgrade_all_clipping(#[case] mode: ClippingMode) {
         // 10S30M10S: query length = 50
         let mut buf = RecordBuilder::mapped_read()
             .sequence(&"A".repeat(50))
@@ -5961,16 +6082,27 @@ mod crosscheck_tests {
             .build();
         let mut raw = to_raw(&buf);
 
-        let buf_result = SamRecordClipper::new(ClippingMode::Hard).upgrade_all_clipping(&mut buf);
-        let raw_result =
-            RawRecordClipper::new(ClippingMode::Hard).upgrade_all_clipping_raw(&mut raw);
+        let buf_result = SamRecordClipper::new(mode).upgrade_all_clipping(&mut buf);
+        let raw_result = RawRecordClipper::new(mode).upgrade_all_clipping_raw(&mut raw);
 
-        assert_eq!(buf_result.unwrap(), raw_result.unwrap(), "upgrade_all_clipping return value");
-        assert_raw_matches_buf(&raw, &buf, "upgrade_all_clipping Hard 10S30M10S");
+        assert_eq!(
+            buf_result.unwrap(),
+            raw_result.unwrap(),
+            "upgrade_all_clipping return value mode={mode:?}",
+        );
+        assert_raw_matches_buf(
+            &raw,
+            &buf,
+            &format!("upgrade_all_clipping mode={mode:?} 10S30M10S"),
+        );
     }
 
-    #[test]
-    fn crosscheck_upgrade_all_clipping_no_soft_clips() {
+    // With no soft clips both modes early-return (0, 0) and leave the record untouched; check
+    // raw/typed parity for each.
+    #[rstest]
+    #[case::hard(ClippingMode::Hard)]
+    #[case::soft_with_mask(ClippingMode::SoftWithMask)]
+    fn crosscheck_upgrade_all_clipping_no_soft_clips(#[case] mode: ClippingMode) {
         let mut buf = RecordBuilder::mapped_read()
             .sequence(&"A".repeat(50))
             .cigar("50M")
@@ -5978,19 +6110,29 @@ mod crosscheck_tests {
             .build();
         let mut raw = to_raw(&buf);
 
-        let buf_result = SamRecordClipper::new(ClippingMode::Hard).upgrade_all_clipping(&mut buf);
-        let raw_result =
-            RawRecordClipper::new(ClippingMode::Hard).upgrade_all_clipping_raw(&mut raw);
+        let buf_result = SamRecordClipper::new(mode).upgrade_all_clipping(&mut buf);
+        let raw_result = RawRecordClipper::new(mode).upgrade_all_clipping_raw(&mut raw);
 
-        assert_eq!(buf_result.unwrap(), raw_result.unwrap(), "no soft clips return value");
-        assert_raw_matches_buf(&raw, &buf, "upgrade_all_clipping Hard 50M (no-op)");
+        assert_eq!(
+            buf_result.unwrap(),
+            raw_result.unwrap(),
+            "no soft clips return value mode={mode:?}",
+        );
+        assert_raw_matches_buf(
+            &raw,
+            &buf,
+            &format!("upgrade_all_clipping mode={mode:?} 50M (no-op)"),
+        );
     }
 
     /// Ref-only CIGAR ops (D/N/P) must not advance `seq_pos` in the raw path,
     /// or trailing query bases get shifted vs. the typed path. Uses a varied
-    /// sequence and varied qualities so any mis-aligned copy is visible.
-    #[test]
-    fn crosscheck_upgrade_all_clipping_with_deletion() {
+    /// sequence and varied qualities so any mis-aligned copy (Hard) or mis-aligned
+    /// mask (`SoftWithMask`) is visible. Both modes are checked for raw/typed parity.
+    #[rstest]
+    #[case::hard(ClippingMode::Hard)]
+    #[case::soft_with_mask(ClippingMode::SoftWithMask)]
+    fn crosscheck_upgrade_all_clipping_with_deletion(#[case] mode: ClippingMode) {
         // 10S20M5D20M10S: query length = 60 (D does not consume query).
         let bases = b"ACGT";
         let seq: String = (0..60).map(|i| bases[i % bases.len()] as char).collect();
@@ -6003,16 +6145,19 @@ mod crosscheck_tests {
             .build();
         let mut raw = to_raw(&buf);
 
-        let buf_result = SamRecordClipper::new(ClippingMode::Hard).upgrade_all_clipping(&mut buf);
-        let raw_result =
-            RawRecordClipper::new(ClippingMode::Hard).upgrade_all_clipping_raw(&mut raw);
+        let buf_result = SamRecordClipper::new(mode).upgrade_all_clipping(&mut buf);
+        let raw_result = RawRecordClipper::new(mode).upgrade_all_clipping_raw(&mut raw);
 
         assert_eq!(
             buf_result.unwrap(),
             raw_result.unwrap(),
-            "upgrade_all_clipping return value with deletion",
+            "upgrade_all_clipping return value with deletion mode={mode:?}",
         );
-        assert_raw_matches_buf(&raw, &buf, "upgrade_all_clipping Hard 10S20M5D20M10S");
+        assert_raw_matches_buf(
+            &raw,
+            &buf,
+            &format!("upgrade_all_clipping mode={mode:?} 10S20M5D20M10S"),
+        );
     }
 
     // =========================================================================

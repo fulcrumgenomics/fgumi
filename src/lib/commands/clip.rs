@@ -2239,6 +2239,66 @@ mod tests {
         Ok(())
     }
 
+    /// CLIP3-03: `--upgrade-clipping` in `soft-with-mask` mode must mask existing
+    /// soft-clipped bases to N with minimum quality while leaving the CIGAR intact,
+    /// matching fgbio `ClipBam --upgrade-clipping --clipping-mode SoftWithMask`.
+    #[test]
+    fn test_upgrade_clipping_soft_with_mask_masks_existing_soft_bases() -> Result<()> {
+        let dir = TempDir::new()?;
+        let ref_path = create_test_reference(&dir);
+        let input_path = dir.path().join("input.bam");
+        let output_path = dir.path().join("output.bam");
+
+        // A fragment with 5 existing soft-clipped bases at the 5' end.
+        let mut builder = SamBuilder::with_single_ref("chr1", 200);
+        let _ = builder
+            .add_frag()
+            .name("maskme")
+            .contig(0)
+            .start(20)
+            .cigar("5S15M")
+            .bases("ACGTACGTACGTACGTACGT") // 20 bases
+            .strand(Strand::Plus)
+            .build();
+        mark_query_grouped(&mut builder);
+        builder.write(&input_path)?;
+
+        let clip = Clip {
+            io: BamIoOptions {
+                input: input_path,
+                output: output_path.clone(),
+                async_reader: false,
+            },
+            reference: ref_path,
+            clipping_mode: ClippingMode::SoftWithMask,
+            clip_overlapping_reads: false,
+            clip_extending_past_mate: false,
+            read_one_five_prime: 0,
+            read_one_three_prime: 0,
+            read_two_five_prime: 0,
+            read_two_three_prime: 0,
+            upgrade_clipping: true,
+            auto_clip_attributes: false,
+            metrics: None,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+        };
+        clip.execute("test")?;
+
+        let records = read_bam_records(&output_path)?;
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(cigar_string(record), "5S15M", "CIGAR unchanged");
+        let bases = record.sequence().as_ref().to_vec();
+        assert_eq!(&bases[..5], b"NNNNN", "leading soft bases masked to N");
+        assert!(bases[5..].iter().all(|&b| b != b'N'), "aligned bases untouched");
+        let quals = record.quality_scores().as_ref().to_vec();
+        assert!(quals[..5].iter().all(|&q| q == 2), "leading soft quals masked to 2");
+        Ok(())
+    }
+
     #[test]
     fn test_clip_execute_basic_overlapping() -> Result<()> {
         let dir = TempDir::new()?;
