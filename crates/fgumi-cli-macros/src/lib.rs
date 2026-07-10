@@ -45,9 +45,17 @@ use syn::{Lit, Meta};
 ///
 /// # Panics
 ///
-/// Panics if applied to a non-struct item, a struct without named fields,
-/// or a struct containing a `#[command(flatten)]` field (the struct must
-/// be flat — re-exposing nested clap-flattened state is out of scope).
+/// Panics (with a clear build-time message) if applied to:
+/// * a non-struct item, or a struct without named fields;
+/// * a struct containing a `#[command(flatten)]` field (the struct must be
+///   flat — re-exposing nested clap-flattened state is out of scope);
+/// * a field with a cross-field clap reference attribute — `requires`,
+///   `conflicts_with`, `required_if_eq`, `required_unless_present`, … — whose
+///   arg-id string would dangle once the field is prefixed. Enforce such
+///   couplings in the command's `validate()`/`resolve()` instead;
+/// * a field using clap's `key(value)` call form for `long`, `short`,
+///   `default_value`, `default_value_t`, or `required` — use the `key = value`
+///   (or bare `key`) spelling, which is the only form the macro classifies.
 #[proc_macro_attribute]
 pub fn multi_options(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = syn::parse::<MultiOptionsArgs>(attr).expect(
@@ -79,6 +87,13 @@ pub fn multi_options(attr: TokenStream, item: TokenStream) -> TokenStream {
                     field.ident.as_ref().unwrap()
                 );
             }
+        }
+        // Reject #[arg(...)] forms the macro cannot faithfully re-expose on the
+        // Multi struct (dangling cross-references, and the `key(value)` call
+        // form) — fail loud here rather than panic in clap or silently change
+        // behavior at runall parse time.
+        if let Some(err) = unsupported_arg_attr_error(field) {
+            panic!("{err}");
         }
     }
 
@@ -378,6 +393,90 @@ fn has_default_value_t(field: &syn::Field) -> bool {
     false
 }
 
+/// clap `#[arg(...)]` keys that reference *another argument by its string id*.
+/// The Multi struct renames every field to `<prefix>_<field>` and never emits a
+/// matching arg alias, so any of these ids would dangle on the Multi side and
+/// clap would panic ("arg id `x` not defined") when it builds the `runall`
+/// command. Reject them at macro-expansion time instead (D1).
+const CROSS_REFERENCE_ARG_KEYS: &[&str] = &[
+    "requires",
+    "requires_all",
+    "requires_if",
+    "requires_ifs",
+    "conflicts_with",
+    "conflicts_with_all",
+    "overrides_with",
+    "overrides_with_all",
+    "required_if_eq",
+    "required_if_eq_all",
+    "required_if_eq_any",
+    "required_unless_present",
+    "required_unless_present_any",
+    "required_unless_present_all",
+    "default_value_if",
+    "default_value_ifs",
+    "default_values_if",
+    "default_values_ifs",
+    "group",
+    "groups",
+];
+
+/// clap `#[arg(...)]` keys this macro classifies via `Meta::NameValue` / `Meta::Path`
+/// (to strip, rewrite, or read them). clap also accepts the equivalent `key(value)`
+/// call form, which arrives as `Meta::List` and would slip past every classifier —
+/// silently changing the flag name, the required-ness, or emitting a duplicate
+/// `long`. Reject the call form for these keys (D2).
+const CALL_FORM_SENSITIVE_ARG_KEYS: &[&str] =
+    &["long", "short", "default_value", "default_value_t", "required"];
+
+/// Returns an error message if a field carries an `#[arg(...)]` attribute that
+/// `multi_options` cannot faithfully re-expose on the Multi struct, or `None`
+/// when the field is safe.
+///
+/// Covers two latent traps: (D1) cross-field reference attrs whose arg-id
+/// strings dangle after the field is prefixed, and (D2) clap's `key(value)`
+/// call form for keys the macro only recognizes in `key = value` / bare-`key`
+/// form.
+fn unsupported_arg_attr_error(field: &syn::Field) -> Option<String> {
+    let field_name =
+        field.ident.as_ref().map_or_else(|| "<unnamed>".to_string(), ToString::to_string);
+    for attr in &field.attrs {
+        if !attr.path().is_ident("arg") {
+            continue;
+        }
+        let nested = attr
+            .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
+            .unwrap_or_else(|e| {
+                panic!("multi_options: failed to parse #[arg(...)] on field `{field_name}`: {e}")
+            });
+        for meta in &nested {
+            let (ident, is_call_form) = match meta {
+                Meta::NameValue(nv) => (nv.path.get_ident().map(ToString::to_string), false),
+                Meta::Path(p) => (p.get_ident().map(ToString::to_string), false),
+                Meta::List(l) => (l.path.get_ident().map(ToString::to_string), true),
+            };
+            let Some(ident) = ident else { continue };
+            if CROSS_REFERENCE_ARG_KEYS.contains(&ident.as_str()) {
+                return Some(format!(
+                    "multi_options: field `{field_name}` uses #[arg({ident} …)], which references \
+                     another argument by its unprefixed id. The Multi struct renames fields to \
+                     `<prefix>_<field>`, so that id would dangle and clap would panic when it \
+                     builds the runall command. Enforce this coupling in the command's \
+                     validate()/resolve() instead (see AlignerOptions::resolve)."
+                ));
+            }
+            if is_call_form && CALL_FORM_SENSITIVE_ARG_KEYS.contains(&ident.as_str()) {
+                return Some(format!(
+                    "multi_options: field `{field_name}` uses the call form #[arg({ident}(…))]. \
+                     Use the `{ident} = …` name-value form (or bare `{ident}`) — the macro only \
+                     classifies those spellings and would mishandle the call form."
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// Check whether a type is `Vec<T>`. The macro treats `Vec<T>` like
 /// `Option<T>`: pass-through with no `default_value_t` rewrite, since
 /// clap collects empty Vecs naturally and rejects `default_value_t`
@@ -521,4 +620,111 @@ fn extract_doc_string(attrs: &[syn::Attribute]) -> String {
         .collect();
 
     lines.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ").trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+    use syn::parse::Parser;
+
+    /// Parse a single named struct field from tokens (e.g.
+    /// `#[arg(long, requires = "x")] pub y: u32`).
+    fn named_field(tokens: proc_macro2::TokenStream) -> syn::Field {
+        syn::Field::parse_named.parse2(tokens).expect("parse named field")
+    }
+
+    #[test]
+    fn accepts_supported_arg_forms() {
+        // Bare + name-value forms the macro classifies are all fine.
+        for tokens in [
+            quote! { #[arg(long, short = 'x', default_value = "7")] pub a: u32 },
+            quote! { #[arg(long = "max-memory", default_value_t = 5)] pub b: usize },
+            quote! { #[arg(long)] pub c: Option<u32> },
+            quote! { #[arg(long, value_delimiter = ',', required = true)] pub d: Vec<usize> },
+            quote! { pub e: u32 },
+        ] {
+            let field = named_field(tokens);
+            assert_eq!(
+                unsupported_arg_attr_error(&field),
+                None,
+                "expected supported form to be accepted"
+            );
+        }
+    }
+
+    // D1: attrs that reference another arg by id would dangle after prefixing.
+    // Each row is its own `#[case]` so a failure names the scenario. The
+    // `needle` asserts the message names the offending attr key; `field_ident`
+    // asserts it names the actual field (the prior tautological `contains('a')
+    // || …` check passed for almost any string).
+    #[rstest]
+    #[case::requires(
+        quote! { #[arg(long, requires = "other")] pub a: u32 },
+        "a",
+        "requires"
+    )]
+    #[case::conflicts_with(
+        quote! { #[arg(long, conflicts_with = "other")] pub b: u32 },
+        "b",
+        "conflicts_with"
+    )]
+    #[case::required_if_eq(
+        quote! { #[arg(long, required_if_eq("mode", "x"))] pub c: u32 },
+        "c",
+        "required_if_eq"
+    )]
+    #[case::required_unless_present(
+        quote! { #[arg(long, required_unless_present = "other")] pub d: u32 },
+        "d",
+        "required_unless_present"
+    )]
+    #[case::default_values_if(
+        quote! { #[arg(long, default_values_if("mode", "x", Some("v")))] pub e: u32 },
+        "e",
+        "default_values_if"
+    )]
+    #[case::default_values_ifs(
+        quote! { #[arg(long, default_values_ifs([("mode", "x", Some("v"))]))] pub f: u32 },
+        "f",
+        "default_values_ifs"
+    )]
+    fn rejects_cross_reference_attrs(
+        #[case] tokens: proc_macro2::TokenStream,
+        #[case] field_ident: &str,
+        #[case] needle: &str,
+    ) {
+        let field = named_field(tokens);
+        let err =
+            unsupported_arg_attr_error(&field).expect("cross-reference attr must be rejected");
+        assert!(err.contains(needle), "message should name the attr {needle:?}: {err}");
+        assert!(
+            err.contains(&format!("field `{field_ident}`")),
+            "message should name the field {field_ident:?}: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_call_form_for_classified_keys() {
+        // D2: the `key(value)` call form slips past the NameValue/Path classifiers.
+        for (tokens, needle) in [
+            (quote! { #[arg(long("x"))] pub a: u32 }, "long"),
+            (quote! { #[arg(long, short('x'))] pub b: u32 }, "short"),
+            (quote! { #[arg(default_value_t(4))] pub c: u32 }, "default_value_t"),
+            (quote! { #[arg(long, required(true))] pub d: u32 }, "required"),
+        ] {
+            let field = named_field(tokens);
+            let err = unsupported_arg_attr_error(&field).expect("call form must be rejected");
+            assert!(err.contains(needle), "message should name the key {needle:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn allows_call_form_for_unclassified_keys() {
+        // `value_parser(...)` in call form is preserved verbatim and is not one of
+        // the classified keys, so it must not be rejected.
+        let field =
+            named_field(quote! { #[arg(long, value_parser(clap::value_parser!(u32)))] pub a: u32 });
+        assert_eq!(unsupported_arg_attr_error(&field), None);
+    }
 }

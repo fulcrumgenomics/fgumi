@@ -432,6 +432,17 @@ impl<T: Send + HeapSize + 'static> ReorderStage<T> {
                     // `usize → u64` is a lossless widen on every supported
                     // (≤64-bit) target, so this cast never truncates.
                     let item_bytes = seq.item.heap_size() as u64;
+                    // A duplicate ordinal would silently drop the buffered item and
+                    // leak its bytes into `buffer_bytes`. `ByOrdinal` serials are
+                    // unique by construction; a hit here means a `ByItemOrdinal`
+                    // upstream emitted two items with the same serial (a step bug).
+                    // Fail loud in release too (like the `next_serial` overflow guard
+                    // below): silently dropping a buffered record is a data-integrity bug.
+                    assert!(
+                        !state.buffer.contains_key(&seq.ordinal),
+                        "duplicate reorder ordinal {} — ByItemOrdinal upstream serials must be unique",
+                        seq.ordinal
+                    );
                     state.buffer.insert(seq.ordinal, (seq.item, item_bytes));
                     state.buffer_bytes = state.buffer_bytes.saturating_add(item_bytes);
                     if landed_next {
@@ -496,6 +507,15 @@ impl<T: Send + HeapSize + 'static> ReorderStage<T> {
                 // `usize → u64` is a lossless widen on every supported
                 // (≤64-bit) target, so this cast never truncates.
                 let bytes = seq.item.heap_size() as u64;
+                // See the drain-path insert above: a duplicate ordinal here would
+                // silently drop the buffered item and corrupt `buffer_bytes`.
+                // Fail loud in release too (like the `next_serial` overflow guard):
+                // silently dropping a buffered record is a data-integrity bug.
+                assert!(
+                    !state.buffer.contains_key(&seq.ordinal),
+                    "duplicate reorder ordinal {} — ByItemOrdinal upstream serials must be unique",
+                    seq.ordinal
+                );
                 state.buffer.insert(seq.ordinal, (seq.item, bytes));
                 state.buffer_bytes = state.buffer_bytes.saturating_add(bytes);
                 if state.buffer.contains_key(&next) {
@@ -576,6 +596,46 @@ mod tests {
         assert_eq!(s.try_pop_in_order(), Some(150));
         assert_eq!(s.try_pop_in_order(), Some(200));
         assert_eq!(s.try_pop_in_order(), None);
+    }
+
+    /// Q1 (audit D4): a `ByItemOrdinal` upstream supplies each item's serial, so
+    /// a buggy step could emit two items with the same ordinal. Inserting the
+    /// second would silently drop the first and leak its bytes into
+    /// `buffer_bytes`; the always-on `assert!` must turn that into a loud failure
+    /// (in release builds too).
+    #[test]
+    #[should_panic(expected = "duplicate reorder ordinal")]
+    fn duplicate_ordinal_trips_assert() {
+        let s = make_stage(8);
+        s.try_push(1, 100).unwrap();
+        s.try_push(1, 200).unwrap(); // duplicate ordinal (simulated upstream bug)
+        s.try_push(0, 0).unwrap();
+        // Draining moves both ordinal-1 items from the transport into the
+        // in-order buffer; the second insert hits the duplicate guard.
+        let _ = s.try_pop_in_order();
+    }
+
+    /// Sibling of `duplicate_ordinal_trips_assert`, covering the OTHER always-on
+    /// duplicate-ordinal guard: the must-accept *stash-insert* path in
+    /// `try_push_inner` (transport full → overflow into `state.buffer`), not the
+    /// transport-drain path in `try_pop_in_order_reporting_blocked`.
+    ///
+    /// With transport capacity 1 and `next_serial` (0) still absent, every push
+    /// is must-accept: the first fills the transport, and each later push finds
+    /// the transport full and overflows into the stash. The second and third
+    /// pushes both carry ordinal 1, so the second stashes it and the third trips
+    /// the stash-insert `assert!` — no `try_pop_in_order` runs, so the drain-path
+    /// guard is never reached. This test fails if that stash-insert guard is
+    /// removed.
+    #[test]
+    #[should_panic(expected = "duplicate reorder ordinal")]
+    fn duplicate_ordinal_trips_stash_assert() {
+        let s = make_stage(1); // capacity 1 so the transport fills and later items stash
+        s.try_push(1, 100).unwrap(); // ordinal 1 -> transport (fills capacity-1 transport)
+        s.try_push(1, 200).unwrap(); // transport full -> ordinal 1 stashed into buffer
+        // Transport still full and ordinal 1 already in the stash: the overflow
+        // insert hits the duplicate guard on the push path.
+        let _ = s.try_push(1, 300);
     }
 
     #[test]
