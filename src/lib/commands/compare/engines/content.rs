@@ -20,6 +20,7 @@ use crate::sam::SamTag;
 use super::super::bams::{FIELD_NAMES, get_core_fields_raw};
 use super::super::raw_compare::{
     raw_compare_structured, raw_core_fields_equal, raw_records_byte_equal, raw_tags_byte_equal,
+    raw_tags_equal_order_independent_excluding_mi,
 };
 
 /// A predicate for deciding whether two BAM records are content-equal.
@@ -42,26 +43,6 @@ pub enum ContentPredicate {
     /// the design spec §"Accepted divergences"). The carve-out is narrow: only that tag is
     /// dropped, so a real difference in any other tag still reports a DIFFER.
     Exact,
-    /// Consensus BAM output (`simplex`/`duplex`/`codec`, and `filter` output run over
-    /// consensus reads). This compares **exactly like [`Self::Exact`]** — including the
-    /// per-read depth/disagreement tags `cD`/`cM`/`aD`/`aM`/`bD`/`bM` and their `cE`/`aE`/`bE`
-    /// error rates.
-    ///
-    /// Historically this predicate carried a saturation-aware carve-out that tolerated a
-    /// depth divergence: fgbio stores per-base consensus depth as a `Short` `Array` capped
-    /// at `i16::MAX` (32767) and derives the scalar depth tags from those capped arrays,
-    /// while fgumi's codec/duplex callers emitted uncapped depths. That divergence has been
-    /// fixed at the source — fgumi now clamps every scalar depth tag to fgbio's `Short`
-    /// ceiling (per-strand `aD`/`bD` at 32767; combined `cD` caps each strand per base
-    /// *before* summing, matching fgbio's `totalDepths`) — so the tags are bit-identical and
-    /// the tolerance is no longer needed. Comparing them exactly is now both sound and
-    /// complete; the old carve-out could not be made sound for the combined `cD` anyway
-    /// (fgbio caps-then-sums, which is unrecoverable from the scalar).
-    ///
-    /// Retained as a distinct predicate for the consensus/`filter` presets; now that the
-    /// carve-out is gone it is behaviourally equivalent to [`Self::Exact`] and could be
-    /// consolidated with it in a follow-up.
-    ExactConsensus,
     /// [`Self::Exact`], but excludes the `MI` tag entirely from tag comparison — neither its
     /// *value* nor its *presence* is compared. `group` legitimately renumbers MI values across
     /// tools (compare-hardening design spec, §"Accepted divergences", "`group` MI numbering"),
@@ -92,17 +73,15 @@ pub fn content_diffs(
     header_b: &Header,
 ) -> Option<Vec<String>> {
     // Byte-identical records are content-equal under every `ContentPredicate`: `Exact`
-    // compares them exactly, `ExactConsensus` is now equivalent to `Exact`, and
-    // `ExactMinusMi` only *drops* the MI check (never adds strictness), so a byte-for-byte
-    // match can never be a `Some` under any of the three. Checking this first skips building
-    // any tag maps on the common (matching) case.
+    // compares them exactly, and `ExactMinusMi` only *drops* the MI check (never adds
+    // strictness), so a byte-for-byte match can never be a `Some` under either. Checking
+    // this first skips building any tag maps on the common (matching) case.
     if raw_records_byte_equal(a, b) {
         return None;
     }
 
     match pred {
         ContentPredicate::Exact => exact_diffs(a, b, header_a, header_b),
-        ContentPredicate::ExactConsensus => exact_consensus_diffs(a, b, header_a, header_b),
         ContentPredicate::ExactMinusMi => exact_minus_mi_diffs(a, b, header_a, header_b),
     }
 }
@@ -150,24 +129,6 @@ fn exact_diffs(a: &[u8], b: &[u8], header_a: &Header, header_b: &Header) -> Opti
     )
 }
 
-/// Implements [`ContentPredicate::ExactConsensus`] (see its doc-comment for the exact
-/// carve-out rules and the accepted-divergence citation).
-fn exact_consensus_diffs(
-    a: &[u8],
-    b: &[u8],
-    header_a: &Header,
-    header_b: &Header,
-) -> Option<Vec<String>> {
-    let core_match = raw_core_fields_equal(a, b);
-    let tags_match = consensus_tags_match(a, b);
-    finish_diffs(
-        core_match,
-        tags_match,
-        || core_field_diffs(a, b, header_a, header_b),
-        || consensus_tag_diffs(a, b),
-    )
-}
-
 /// Implements [`ContentPredicate::ExactMinusMi`] (see its doc-comment).
 fn exact_minus_mi_diffs(
     a: &[u8],
@@ -192,24 +153,29 @@ fn tag_typed_map_excluding_mi(raw: &[u8]) -> BTreeMap<[u8; 2], TagValue<'_>> {
     tags
 }
 
-/// Returns `true` if `a` and `b` have the same tag set and every tag value is equal,
-/// ignoring `MI` entirely (on either side, in any combination of present/absent/differing).
+/// Returns `true` if `a` and `b` have the same tags with equal values, ignoring `MI`
+/// entirely (on either side, in any combination of present/absent/differing).
+///
+/// Delegates to [`raw_tags_equal_order_independent_excluding_mi`] so the decision is an
+/// entry-level *multiset* match — identical to `ContentPredicate::Exact`'s decision, minus
+/// the MI tag. This deliberately does **not** collapse tags into a `BTreeMap` keyed by name:
+/// a `BTreeMap` would silently deduplicate a repeated tag, so `a=[NM=1, NM=2]` and
+/// `b=[NM=2]` would compare equal (a false MATCH). The multiset match keeps both `NM`
+/// entries distinct and reports the difference.
 fn tags_match_excluding_mi(a: &[u8], b: &[u8]) -> bool {
     // Byte-identical tag regions are trivially equal under every comparison this function
-    // could otherwise perform, so this skips building either side's tag map on the common
-    // (matching) case — mirroring `ContentPredicate::Exact`'s fast path in `raw_compare_structured`.
+    // could otherwise perform, so this skips the multiset walk on the common (matching) case
+    // — mirroring `ContentPredicate::Exact`'s fast path in `raw_compare_structured`.
     if raw_tags_byte_equal(a, b) {
         return true;
     }
-    let tags_a = tag_typed_map_excluding_mi(a);
-    let tags_b = tag_typed_map_excluding_mi(b);
-    tags_a.len() == tags_b.len() && tags_a.iter().all(|(tag, va)| tags_b.get(tag) == Some(va))
+    raw_tags_equal_order_independent_excluding_mi(a, b)
 }
 
 /// Shared "union tag names, sort+dedup, `filter_map` a `{tag}: {va:?} vs {vb:?}` line for
-/// unequal pairs" shape used by every per-predicate tag-diff builder ([`tag_diffs_excluding_mi`],
-/// [`consensus_tag_diffs`], [`tag_diffs`]) — these differ only in how a single tag's pair of
-/// (possibly absent) values is judged equal.
+/// unequal pairs" shape used by every per-predicate tag-diff builder ([`tag_diffs_excluding_mi`]
+/// and [`tag_diffs`]) — these differ only in how a single tag's pair of (possibly absent)
+/// values is judged equal.
 ///
 /// `values_equal` receives the tag name plus each side's value (`None` if that tag is absent
 /// on that side, which only happens when the tag is present on the other side, since `tag`
@@ -246,43 +212,16 @@ fn tag_diffs_excluding_mi(a: &[u8], b: &[u8]) -> Vec<String> {
 /// widens integer tags to `i64` regardless of on-disk width (`c`/`C`/`s`/`S`/`i`/`I`), so
 /// comparing `TagValue`s directly already gives the same width-insensitive equality that
 /// [`super::super::raw_compare::raw_tags_equal_order_independent`] uses to decide
-/// `tag_order_match` — no separate stringified map is needed for [`tag_diffs`] or
-/// [`consensus_tag_diffs`].
+/// `tag_order_match` — no separate stringified map is needed for [`tag_diffs`].
 fn tag_typed_map(raw: &[u8]) -> BTreeMap<[u8; 2], TagValue<'_>> {
     let mut tags: BTreeMap<[u8; 2], TagValue<'_>> =
         RawRecordView::new(raw).tags().iter_typed().collect();
     // Drop fgumi-only tags (e.g. `tc`) that fgbio never persists, so they are ignored — both
     // presence and value — by every predicate that builds its comparison off this map
-    // (`ExactConsensus`, `ExactMinusMi`, and all diff-string rendering). `Exact`'s match
-    // decision applies the same filter in `raw_tags_equal_order_independent`.
+    // (`ExactMinusMi` and all diff-string rendering). `Exact`'s match decision applies the
+    // same filter in `raw_tags_equal_order_independent`.
     tags.retain(|tag, _| !super::super::raw_compare::is_ignored_fgumi_only_tag(*tag));
     tags
-}
-
-/// Returns `true` if `a` and `b` have the same tag set and every tag value is equal
-/// (exactly). Consensus depth/error tags are compared exactly like every other tag now
-/// that fgumi clamps them to fgbio's `Short` ceiling (see [`ContentPredicate::ExactConsensus`]).
-fn consensus_tags_match(a: &[u8], b: &[u8]) -> bool {
-    // Byte-identical tag regions are trivially equal under every comparison this function
-    // could otherwise perform, so this skips building either side's tag map on the common
-    // (matching) case — mirroring `ContentPredicate::Exact`'s fast path in `raw_compare_structured`.
-    if raw_tags_byte_equal(a, b) {
-        return true;
-    }
-    let tags_a = tag_typed_map(a);
-    let tags_b = tag_typed_map(b);
-    if tags_a.len() != tags_b.len() {
-        return false;
-    }
-    tags_a.iter().all(|(tag, va)| tags_b.get(tag).is_some_and(|vb| va == vb))
-}
-
-/// Builds one diff string per aux tag that is present on only one side, or whose value
-/// differs (exactly), between `a` and `b`.
-fn consensus_tag_diffs(a: &[u8], b: &[u8]) -> Vec<String> {
-    let tags_a = tag_typed_map(a);
-    let tags_b = tag_typed_map(b);
-    tag_diffs_with(&tags_a, &tags_b, |_tag, va, vb| va == vb)
 }
 
 /// Builds one diff string per core SAM field (see [`FIELD_NAMES`]) whose rendered value
@@ -301,8 +240,7 @@ fn core_field_diffs(a: &[u8], b: &[u8], header_a: &Header, header_b: &Header) ->
 
 /// Builds one diff string per aux tag that is present on only one side, or whose value
 /// differs, between `a` and `b`. Used by [`ContentPredicate::Exact`] (via [`exact_diffs`]),
-/// which requires every tag value to match exactly — unlike [`consensus_tag_diffs`], no
-/// carve-out is applied.
+/// which requires every tag value to match exactly.
 fn tag_diffs(a: &[u8], b: &[u8]) -> Vec<String> {
     let tags_a = tag_typed_map(a);
     let tags_b = tag_typed_map(b);
@@ -399,14 +337,14 @@ mod tests {
         );
     }
 
-    // ==================== ExactConsensus: exact depth/error tags ====================
+    // ==================== Consensus depth/error tags under Exact ====================
     //
     // fgumi clamps every scalar consensus depth tag to fgbio's `Short` ceiling (see
     // `nh/fix-consensus-depth-clamp-parity`), so `cD`/`cM`/`aD`/`aM`/`bD`/`bM` and their
-    // `cE`/`aE`/`bE` error rates are bit-identical to fgbio. `ExactConsensus` therefore
-    // compares them EXACTLY, with no saturation tolerance: any difference — including a
-    // pre-fix "saturated" pair like `32767` vs `59920`, or the duplex `65534` sum — is a
-    // real divergence and must DIFFER.
+    // `cE`/`aE`/`bE` error rates are bit-identical to fgbio. The `Exact` predicate (which
+    // the consensus/`filter` presets use) therefore compares them EXACTLY, with no
+    // saturation tolerance: any difference — including a pre-fix "saturated" pair like
+    // `32767` vs `59920`, or the duplex `65534` sum — is a real divergence and must DIFFER.
 
     fn depth_tag_record(tag: SamTag, value: i32) -> RawRecord {
         let mut b = SamBuilder::new();
@@ -414,8 +352,8 @@ mod tests {
         b.build()
     }
 
-    /// Every consensus depth tag is compared exactly under both `ExactConsensus` and plain
-    /// `Exact`: a former "saturation" pair now DIFFERs, and an identical pair matches.
+    /// Every consensus depth tag is compared exactly under `Exact`: a former "saturation"
+    /// pair now DIFFERs, and an identical pair matches.
     #[rstest]
     #[case::cd(SamTag::CD)]
     #[case::cm(SamTag::CM)]
@@ -423,27 +361,31 @@ mod tests {
     #[case::am(SamTag::AM)]
     #[case::bd(SamTag::BD)]
     #[case::bm(SamTag::BM)]
-    fn exact_consensus_compares_depth_tags_exactly(#[case] tag: SamTag) {
+    fn exact_compares_depth_tags_exactly(#[case] tag: SamTag) {
         let saturated = depth_tag_record(tag, 32767);
         let uncapped = depth_tag_record(tag, 59920);
-        for pred in [ContentPredicate::ExactConsensus, ContentPredicate::Exact] {
-            assert!(
-                content_diffs(saturated.as_ref(), uncapped.as_ref(), pred, &hdr(), &hdr())
-                    .is_some_and(|d| !d.is_empty()),
-                "{tag:?} 32767 vs 59920 must DIFFER under {pred:?} (no saturation tolerance)"
-            );
-        }
+        assert!(
+            content_diffs(
+                saturated.as_ref(),
+                uncapped.as_ref(),
+                ContentPredicate::Exact,
+                &hdr(),
+                &hdr()
+            )
+            .is_some_and(|d| !d.is_empty()),
+            "{tag:?} 32767 vs 59920 must DIFFER under Exact (no saturation tolerance)"
+        );
         let same = depth_tag_record(tag, 32767);
         assert!(
             content_diffs(
                 saturated.as_ref(),
                 same.as_ref(),
-                ContentPredicate::ExactConsensus,
+                ContentPredicate::Exact,
                 &hdr(),
                 &hdr()
             )
             .is_none(),
-            "identical {tag:?} must match under ExactConsensus"
+            "identical {tag:?} must match under Exact"
         );
     }
 
@@ -453,44 +395,22 @@ mod tests {
     #[case::ce(SamTag::CE)]
     #[case::ae(SamTag::AE)]
     #[case::be(SamTag::BE)]
-    fn exact_consensus_compares_error_tags_exactly(#[case] tag: SamTag) {
+    fn exact_compares_error_tags_exactly(#[case] tag: SamTag) {
         let a =
             SamBuilder::new().read_name(b"r").sequence(b"ACGT").add_float_tag(tag, 0.01).build();
         let b =
             SamBuilder::new().read_name(b"r").sequence(b"ACGT").add_float_tag(tag, 0.02).build();
         assert!(
-            content_diffs(a.as_ref(), b.as_ref(), ContentPredicate::ExactConsensus, &hdr(), &hdr())
+            content_diffs(a.as_ref(), b.as_ref(), ContentPredicate::Exact, &hdr(), &hdr())
                 .is_some_and(|d| !d.is_empty()),
             "{tag:?} error-rate difference must DIFFER"
         );
         let same =
             SamBuilder::new().read_name(b"r").sequence(b"ACGT").add_float_tag(tag, 0.01).build();
         assert!(
-            content_diffs(
-                a.as_ref(),
-                same.as_ref(),
-                ContentPredicate::ExactConsensus,
-                &hdr(),
-                &hdr()
-            )
-            .is_none(),
+            content_diffs(a.as_ref(), same.as_ref(), ContentPredicate::Exact, &hdr(), &hdr())
+                .is_none(),
             "identical {tag:?} must match"
-        );
-    }
-
-    #[test]
-    fn exact_consensus_still_exact_on_unrelated_tags() {
-        // A non-consensus tag (NM) must still be compared exactly under ExactConsensus.
-        let a =
-            SamBuilder::new().read_name(b"r").sequence(b"ACGT").add_int_tag(SamTag::NM, 1).build();
-        let b =
-            SamBuilder::new().read_name(b"r").sequence(b"ACGT").add_int_tag(SamTag::NM, 2).build();
-        let diffs =
-            content_diffs(a.as_ref(), b.as_ref(), ContentPredicate::ExactConsensus, &hdr(), &hdr())
-                .expect("a differing NM tag must be reported under ExactConsensus");
-        assert!(
-            diffs.iter().any(|d| d.starts_with("NM:")),
-            "diff must name the differing NM tag, got: {diffs:?}"
         );
     }
 
@@ -574,6 +494,27 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::exact(ContentPredicate::Exact)]
+    #[case::exact_minus_mi(ContentPredicate::ExactMinusMi)]
+    fn duplicate_non_mi_tag_is_not_collapsed(#[case] pred: ContentPredicate) {
+        // Regression: a name-keyed `BTreeMap` would collapse `[NM=1, NM=2]` to a single `NM`,
+        // so it would compare equal to `[NM=2]` — a false MATCH. Both predicates must keep the
+        // duplicate `NM` entries distinct (multiset match) and report the difference.
+        let a = SamBuilder::new()
+            .read_name(b"r")
+            .sequence(b"ACGT")
+            .add_int_tag(SamTag::NM, 1)
+            .add_int_tag(SamTag::NM, 2)
+            .build();
+        let b =
+            SamBuilder::new().read_name(b"r").sequence(b"ACGT").add_int_tag(SamTag::NM, 2).build();
+        assert!(
+            content_diffs(a.as_ref(), b.as_ref(), pred, &hdr(), &hdr()).is_some(),
+            "a duplicate NM tag must not collapse into one under {pred:?} (false MATCH)"
+        );
+    }
+
     #[test]
     fn exact_predicate_still_flags_mi_value_difference() {
         // Sanity check that plain Exact is unaffected by ExactMinusMi's carve-out: an
@@ -592,7 +533,6 @@ mod tests {
 
     #[rstest]
     #[case::exact(ContentPredicate::Exact)]
-    #[case::exact_consensus(ContentPredicate::ExactConsensus)]
     #[case::exact_minus_mi(ContentPredicate::ExactMinusMi)]
     fn tc_tag_only_on_fgumi_side_is_tolerated(#[case] pred: ContentPredicate) {
         // fgumi carries the fgumi-only `tc` tag; the fgbio-style record does not. Every
@@ -613,7 +553,6 @@ mod tests {
 
     #[rstest]
     #[case::exact(ContentPredicate::Exact)]
-    #[case::exact_consensus(ContentPredicate::ExactConsensus)]
     #[case::exact_minus_mi(ContentPredicate::ExactMinusMi)]
     fn tc_carveout_is_narrow_other_tag_still_differs(#[case] pred: ContentPredicate) {
         // The carve-out drops only `tc`: a genuine difference in another tag (NM) still

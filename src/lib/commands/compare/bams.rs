@@ -93,19 +93,19 @@ pub enum CommandPreset {
     /// bijection check; see [`CommandPreset::resolve`] for the full rationale.
     Group,
     /// Simplex consensus output: positional, exact content comparison
-    /// (see [`ContentPredicate::ExactConsensus`](super::engines::content::ContentPredicate::ExactConsensus)).
+    /// (see [`ContentPredicate::Exact`](super::engines::content::ContentPredicate::Exact)).
     Simplex,
     /// Duplex consensus output: positional, exact content comparison
-    /// (see [`ContentPredicate::ExactConsensus`](super::engines::content::ContentPredicate::ExactConsensus)).
+    /// (see [`ContentPredicate::Exact`](super::engines::content::ContentPredicate::Exact)).
     Duplex,
     /// CODEC consensus output: positional, exact content comparison
-    /// (see [`ContentPredicate::ExactConsensus`](super::engines::content::ContentPredicate::ExactConsensus)).
+    /// (see [`ContentPredicate::Exact`](super::engines::content::ContentPredicate::Exact)).
     Codec,
     /// Filter output: consensus reads with reads dropped, but the same depth tags
     /// (`cD`/`cM`/`cE`, and duplex `aD`/`aM`/`bD`/`bM`/`aE`/`bE`) as the consensus command
     /// that produced them, passed through unchanged. Compares via the same predicate as
     /// consensus output
-    /// ([`ContentPredicate::ExactConsensus`](super::engines::content::ContentPredicate::ExactConsensus));
+    /// ([`ContentPredicate::Exact`](super::engines::content::ContentPredicate::Exact));
     /// see [`CommandPreset::resolve`] for the full rationale.
     Filter,
 }
@@ -126,15 +126,15 @@ impl CommandPreset {
     ///   [`super::engines::sort_verify::sort_verify_compare`] instead, which has no notion of
     ///   `CompareMode`/`ContentPredicate` at all. This arm exists only so the match stays
     ///   exhaustive without a wildcard.)
-    /// - `Filter | Simplex | Duplex | Codec` → `(Content, false, ExactConsensus)`: all four
+    /// - `Filter | Simplex | Duplex | Codec` → `(Content, false, Exact)`: all four
     ///   deal in consensus reads carrying the depth tags (`cD`/`cM`/`cE`, and duplex
     ///   `aD`/`aM`/`bD`/`bM`/`aE`/`bE`). `Simplex`/`Duplex`/`Codec` are the commands that
     ///   write those tags; `filter` only drops reads afterward, it never rewrites them. All
     ///   four compare positionally under
-    ///   [`ContentPredicate::ExactConsensus`](super::engines::content::ContentPredicate::ExactConsensus),
-    ///   which (now that fgumi clamps the depth tags to fgbio's `Short` ceiling) is an exact
-    ///   content comparison — retained as a distinct preset predicate for these consensus
-    ///   commands but behaviourally equivalent to `Exact`.
+    ///   [`ContentPredicate::Exact`](super::engines::content::ContentPredicate::Exact):
+    ///   because fgumi clamps the depth tags to fgbio's `Short` ceiling at the source, the
+    ///   tags are bit-identical and an exact comparison is both sound and complete — no
+    ///   consensus-specific predicate is needed.
     /// - `Group` → `(Grouping, true, ExactMinusMi)`: MI values and record order may
     ///   legitimately differ between tools or runs, so `Group` is the only preset that
     ///   verifies grouping equivalence instead of routing to `execute_content`. It compares
@@ -155,7 +155,7 @@ impl CommandPreset {
                 (CompareMode::Content, false, ContentPredicate::Exact)
             }
             Self::Filter | Self::Simplex | Self::Duplex | Self::Codec => {
-                (CompareMode::Content, false, ContentPredicate::ExactConsensus)
+                (CompareMode::Content, false, ContentPredicate::Exact)
             }
             Self::Group => (CompareMode::Grouping, true, ContentPredicate::ExactMinusMi),
         }
@@ -236,9 +236,9 @@ COMMAND PRESETS (--command):
   dedup           content     false            Deterministic
   filter          content     false            Passes through MI/depth tags unchanged; exact (like consensus)
   group           grouping    true             Key-join: EXACT-MI content + MI bijection (cross-tool)
-  simplex         content     false            Exact (ExactConsensus; cD/cM/cE compared exactly)
-  duplex          content     false            Exact (ExactConsensus; cD/cM/cE + aD/aM/bD/bM/aE/bE)
-  codec           content     false            Exact (ExactConsensus; same as simplex/duplex)
+  simplex         content     false            Exact (cD/cM/cE compared exactly; clamped at source)
+  duplex          content     false            Exact (cD/cM/cE + aD/aM/bD/bM/aE/bE, exact)
+  codec           content     false            Exact (same as simplex/duplex)
 
   `sort` verifies order instead of comparing content positionally: it detects the
   shared sort order from both inputs' @HD header, checks each file is itself
@@ -602,9 +602,11 @@ impl Command for CompareBams {
                      uses its own dedicated engine (see `fgumi compare bams --help`)"
                 );
             }
-            let timer = OperationTimer::new("Comparing BAMs");
+            let timer = (!self.quiet).then(|| OperationTimer::new("Comparing BAMs"));
             let total_records = self.execute_sort_verify()?;
-            timer.log_completion(total_records);
+            if let Some(timer) = timer {
+                timer.log_completion(total_records);
+            }
             return Ok(());
         }
 
@@ -619,7 +621,9 @@ impl Command for CompareBams {
             anyhow::bail!("--ignore-order is only valid with --mode grouping");
         }
 
-        if let Some(preset) = self.command {
+        // In `--quiet` mode only the exit code communicates the result, so suppress this
+        // command's own informational stderr logging and timer (matching `compare metrics`).
+        if let Some(preset) = self.command.filter(|_| !self.quiet) {
             let overridden = self.mode.is_some() || self.ignore_order.is_some();
             let preset_name = preset
                 .to_possible_value()
@@ -640,23 +644,27 @@ impl Command for CompareBams {
             );
         }
 
-        let timer = OperationTimer::new("Comparing BAMs");
+        let timer = (!self.quiet).then(|| OperationTimer::new("Comparing BAMs"));
 
-        // When a `--command` preset is given, its content predicate comes from
-        // `CommandPreset::resolve` (see that method's doc comment for the full per-preset
-        // rationale, e.g. why `Simplex`/`Duplex`/`Codec`/`Filter` use the
-        // `ExactConsensus`). This predicate is only ever consumed below by the `Content`
-        // mode branch (`self.execute_content(predicate)`); `CompareMode::Grouping` routes to
-        // the order-independent key-join engine (`execute_grouping`), which takes no
-        // predicate at all — it hardcodes `ContentPredicate::ExactMinusMi` inside
-        // `engines::keyjoin::keyjoin_compare` itself, not configurable via `--command`/
-        // `--mode`. The `None if matches!(mode, CompareMode::Grouping)` arm below therefore
-        // only matters for the (rare, preset-less) case where `--mode content` isn't in
-        // play; it does not affect the key-join path.
-        let predicate = match self.command {
-            Some(preset) => preset.content_predicate(),
-            None if matches!(mode, CompareMode::Grouping) => ContentPredicate::ExactMinusMi,
-            None => ContentPredicate::Exact,
+        // This predicate is only ever consumed below by the `Content` mode branch
+        // (`self.execute_content(predicate)`); `CompareMode::Grouping` routes to the
+        // order-independent key-join engine (`execute_grouping`), which takes no predicate at
+        // all — it hardcodes `ContentPredicate::ExactMinusMi` inside
+        // `engines::keyjoin::keyjoin_compare` itself, not configurable via `--command`/`--mode`
+        // (so the `Grouping` arm's value is never actually used).
+        //
+        // An *explicit* `--mode content` (`self.mode == Some(Content)`) always means exact
+        // content comparison — it overrides a preset's own predicate too, so
+        // `--command group --mode content` compares MI exactly (a preset supplies its
+        // relaxed predicate only when the user did *not* pin the mode themselves). A preset's
+        // `content_predicate` (see `CommandPreset::resolve`, e.g. why
+        // `Simplex`/`Duplex`/`Codec`/`Filter` use plain `Exact` while `group` uses
+        // `ExactMinusMi`) is therefore consulted only in the preset-with-implicit-mode case.
+        let predicate = match (mode, self.mode, self.command) {
+            (CompareMode::Content, Some(_), _) => ContentPredicate::Exact,
+            (CompareMode::Content, None, Some(preset)) => preset.content_predicate(),
+            (CompareMode::Content, None, None) => ContentPredicate::Exact,
+            (CompareMode::Grouping, _, _) => ContentPredicate::ExactMinusMi,
         };
 
         let total_records = match mode {
@@ -664,7 +672,9 @@ impl Command for CompareBams {
             CompareMode::Grouping => self.execute_grouping()?,
         };
 
-        timer.log_completion(total_records);
+        if let Some(timer) = timer {
+            timer.log_completion(total_records);
+        }
         Ok(())
     }
 }
@@ -692,9 +702,9 @@ impl CompareBams {
     /// Delegates pairing and equality entirely to the positional engine
     /// ([`positional_compare`]): records are paired purely by index, a
     /// [`RecordKey`](super::record_key::RecordKey) mismatch stops pairing immediately
-    /// (never resyncing), and remaining pairs are compared under `predicate` (plain
-    /// `Exact`, or the `ExactConsensus` for the consensus and `filter`
-    /// presets — see `execute()`).
+    /// (never resyncing), and remaining pairs are compared under `predicate` (`Exact`
+    /// for the default and the consensus/`filter` presets, or `ExactMinusMi` when a
+    /// grouping preset supplies it — see `execute()`).
     ///
     /// This preserves the external report contract other tooling depends on: the
     /// `RESULT: BAM files are IDENTICAL` / `RESULT: BAM files DIFFER` line (the
@@ -707,10 +717,12 @@ impl CompareBams {
     /// report now shows record counts, a content-diff count, and (if pairing
     /// desynced) the first `RecordKey` mismatch index instead.
     fn execute_content(&self, predicate: ContentPredicate) -> Result<u64> {
-        info!(
-            "Starting content comparison with {} threads, batch size {}",
-            self.threads, self.batch_size
-        );
+        if !self.quiet {
+            info!(
+                "Starting content comparison with {} threads, batch size {}",
+                self.threads, self.batch_size
+            );
+        }
 
         let outcome = positional_compare(
             &self.bam1,
@@ -749,10 +761,14 @@ impl CompareBams {
         }
 
         if is_equal {
-            info!("BAM files are identical");
+            if !self.quiet {
+                info!("BAM files are identical");
+            }
             Ok(outcome.bam1_count)
         } else {
-            info!("BAM files differ");
+            if !self.quiet {
+                info!("BAM files differ");
+            }
             Err(super::CompareMismatch("BAM files differ".to_owned()).into())
         }
     }
@@ -768,7 +784,9 @@ impl CompareBams {
     /// `execute_content`: the `RESULT: BAM files are IDENTICAL` / `RESULT: BAM files
     /// DIFFER` line and exit-1-on-mismatch behavior via [`super::CompareMismatch`].
     fn execute_sort_verify(&self) -> Result<u64> {
-        info!("Using --command sort preset: sort-key-run verification (no positional pairing)");
+        if !self.quiet {
+            info!("Using --command sort preset: sort-key-run verification (no positional pairing)");
+        }
 
         let outcome = super::engines::sort_verify::sort_verify_compare(
             &self.bam1,
@@ -814,10 +832,14 @@ impl CompareBams {
         }
 
         if is_equal {
-            info!("BAM files are identical");
+            if !self.quiet {
+                info!("BAM files are identical");
+            }
             Ok(outcome.bam1_count)
         } else {
-            info!("BAM files differ");
+            if !self.quiet {
+                info!("BAM files differ");
+            }
             Err(super::CompareMismatch("BAM files differ".to_owned()).into())
         }
     }
@@ -841,10 +863,12 @@ impl CompareBams {
     /// [`keyjoin::keyjoin_compare`]), or [`super::CompareMismatch`] if the two BAMs are
     /// found to differ (non-zero exit via the `Command` trait).
     fn execute_grouping(&self) -> Result<u64> {
-        info!(
-            "Starting key-join grouping comparison with {} threads, sort memory {:?}",
-            self.threads, self.sort_memory
-        );
+        if !self.quiet {
+            info!(
+                "Starting key-join grouping comparison with {} threads, sort memory {:?}",
+                self.threads, self.sort_memory
+            );
+        }
 
         let cfg = self.keyjoin_config()?;
         let outcome = keyjoin::keyjoin_compare(&self.bam1, &self.bam2, &cfg)?;
@@ -885,10 +909,14 @@ impl CompareBams {
         }
 
         if is_equivalent {
-            info!("BAM groupings are equivalent (key-join)");
+            if !self.quiet {
+                info!("BAM groupings are equivalent (key-join)");
+            }
             Ok(outcome.bam1_count + outcome.bam2_count)
         } else {
-            info!("BAM groupings differ (key-join)");
+            if !self.quiet {
+                info!("BAM groupings differ (key-join)");
+            }
             Err(super::CompareMismatch("BAM groupings differ (order-independent)".to_owned())
                 .into())
         }
@@ -949,10 +977,9 @@ mod tests {
     }
 
     /// Consensus presets (simplex/duplex/codec) reroute to positional `Content`
-    /// comparison under the `ExactConsensus` predicate (see
-    /// `execute()`'s predicate selection) rather than MI-grouping equivalence — this
-    /// is a breaking strictness change (see the commit message and the
-    /// compare-hardening design spec's §"Accepted divergences").
+    /// comparison under the `Exact` predicate (see `execute()`'s predicate selection)
+    /// rather than MI-grouping equivalence — this is a breaking strictness change (see
+    /// the commit message and the compare-hardening design spec's §"Accepted divergences").
     #[rstest]
     #[case(CommandPreset::Simplex)]
     #[case(CommandPreset::Duplex)]
@@ -981,11 +1008,11 @@ mod tests {
     /// `filter` output is consensus reads that still carry the depth tags (`cD`/`cM`/`cE`,
     /// and duplex `aD`/`aM`/`bD`/`bM`/`aE`/`bE`) as the consensus command that produced them
     /// -- `filter` only drops reads, it never rewrites these tags. So `Filter` routes through
-    /// the same `ExactConsensus` predicate as `Simplex`/`Duplex`/`Codec`, keeping the four
-    /// consensus commands on one predicate.
+    /// the same `Exact` predicate as `Simplex`/`Duplex`/`Codec`, keeping the four consensus
+    /// commands on one predicate.
     #[test]
-    fn filter_preset_content_predicate_is_exact_consensus() {
-        assert_eq!(CommandPreset::Filter.content_predicate(), ContentPredicate::ExactConsensus);
+    fn filter_preset_content_predicate_is_exact() {
+        assert_eq!(CommandPreset::Filter.content_predicate(), ContentPredicate::Exact);
     }
 
     #[test]

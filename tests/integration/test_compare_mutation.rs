@@ -483,13 +483,14 @@ fn positional_exact_minus_mi_still_flags_non_mi_tag_change() {
 }
 
 // =============================================================================
-// Section 2 — `ContentPredicate::ExactConsensus` (exact consensus depth/error tags)
+// Section 2 — consensus depth/error tags compared exactly (under `Exact`)
 // =============================================================================
 //
 // fgumi clamps every scalar consensus depth tag to fgbio's `Short` ceiling (see
 // `nh/fix-consensus-depth-clamp-parity`), so cD/cM/aD/aM/bD/bM and cE/aE/bE are
-// bit-identical to fgbio and `ExactConsensus` compares them exactly — there is no
-// saturation tolerance. A former "saturated" pair (e.g. 32767 vs 59920) now DIFFERs.
+// bit-identical to fgbio and the `Exact` predicate (which the consensus/`filter` presets
+// use) compares them exactly — there is no saturation tolerance. A former "saturated"
+// pair (e.g. 32767 vs 59920) now DIFFERs.
 
 fn consensus_record_cd(cd: i32) -> RawRecord {
     let mut b = SamBuilder::new();
@@ -497,23 +498,25 @@ fn consensus_record_cd(cd: i32) -> RawRecord {
     b.build()
 }
 
+/// A consensus record carrying all three combined-consensus quality tags (`cD` depth,
+/// `cM` min-depth/error count, `cE` error rate). Used to mutate exactly one of them at a
+/// time so each tag's exact comparison is independently load-bearing.
+fn consensus_record_cd_cm_ce(cd: i32, cm: i32, ce: f32) -> RawRecord {
+    let mut b = SamBuilder::new();
+    b.read_name(b"read1")
+        .sequence(b"ACGT")
+        .qualities(&[30; 4])
+        .add_int_tag(SamTag::CD, cd)
+        .add_int_tag(SamTag::CM, cm)
+        .add_float_tag(SamTag::CE, ce);
+    b.build()
+}
+
 #[rstest]
 #[case::identical_matches(100, 100, ContentPredicate::Exact, true)]
-#[case::identical_matches_under_consensus(100, 100, ContentPredicate::ExactConsensus, true)]
-// A former "saturation" pair is now a real diff under both predicates.
-#[case::former_saturated_pair_differs_under_consensus(
-    32767,
-    59920,
-    ContentPredicate::ExactConsensus,
-    false
-)]
-#[case::former_saturated_pair_differs_under_exact(32767, 59920, ContentPredicate::Exact, false)]
-#[case::non_saturated_pair_differs_under_consensus(
-    100,
-    200,
-    ContentPredicate::ExactConsensus,
-    false
-)]
+// A former "saturation" pair (32767 vs 59920) is now a real diff.
+#[case::former_saturated_pair_differs(32767, 59920, ContentPredicate::Exact, false)]
+#[case::non_saturated_pair_differs(100, 200, ContentPredicate::Exact, false)]
 fn positional_consensus_cd_compared_exactly(
     #[case] cd_a: i32,
     #[case] cd_b: i32,
@@ -532,28 +535,37 @@ fn positional_consensus_cd_compared_exactly(
     assert_eq!(outcome.is_match(), expect_match, "cD {cd_a} vs {cd_b} under {pred:?}: {outcome:?}");
 }
 
-#[test]
-fn positional_consensus_cm_and_ce_differences_are_flagged() {
+/// Each combined-consensus quality tag is compared exactly and *independently*: a mutation
+/// of only `cM` or only `cE` (the other two tags held identical) must DIFFER. Splitting
+/// these — rather than mutating cD/cM/cE together — keeps each tag load-bearing: a
+/// regression that stopped comparing `cM` or `cE` cannot hide behind a `cD` difference that
+/// forces DIFFER regardless. (`cD` alone is covered by `positional_consensus_cd_compared_exactly`.)
+#[rstest]
+#[case::cm_only(
+    consensus_record_cd_cm_ce(32767, 32767, 0.01),
+    consensus_record_cd_cm_ce(32767, 40000, 0.01)
+)]
+#[case::ce_only(
+    consensus_record_cd_cm_ce(32767, 32767, 0.01),
+    consensus_record_cd_cm_ce(32767, 32767, 0.02)
+)]
+fn positional_consensus_single_quality_tag_difference_is_flagged(
+    #[case] a: RawRecord,
+    #[case] b: RawRecord,
+) {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
-    let rec = |cd: i32, cm: i32, ce: f32| {
-        let mut b = SamBuilder::new();
-        b.read_name(b"read1")
-            .sequence(b"ACGT")
-            .qualities(&[30; 4])
-            .add_int_tag(SamTag::CD, cd)
-            .add_int_tag(SamTag::CM, cm)
-            .add_float_tag(SamTag::CE, ce);
-        b.build()
-    };
     let bam1 = tmp.path().join("a.bam");
     let bam2 = tmp.path().join("b.bam");
-    write_bam(&bam1, &header, &[rec(32767, 32767, 0.01)]);
-    write_bam(&bam2, &header, &[rec(59920, 40000, 0.02)]);
+    write_bam(&bam1, &header, &[a]);
+    write_bam(&bam2, &header, &[b]);
 
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, ContentPredicate::ExactConsensus)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, ContentPredicate::Exact)
         .expect("positional_compare should succeed");
-    assert!(!outcome.is_match(), "cD/cM/cE differences must DIFFER (no tolerance): {outcome:?}");
+    assert!(
+        !outcome.is_match(),
+        "a single consensus-quality tag difference must DIFFER (no tolerance): {outcome:?}"
+    );
 }
 
 // ---- Duplex depth tags: aD/bD and combined cD compared exactly ----
@@ -570,21 +582,10 @@ fn consensus_record_with_tag(tag: SamTag, value: i32) -> RawRecord {
 }
 
 #[rstest]
-#[case::ad_former_saturated_differs(SamTag::AD, 32767, 59034, ContentPredicate::ExactConsensus)]
-#[case::bd_former_saturated_differs(SamTag::BD, 32767, 61000, ContentPredicate::ExactConsensus)]
-#[case::cd_former_saturated_65534_differs(
-    SamTag::CD,
-    65534,
-    118_954,
-    ContentPredicate::ExactConsensus
-)]
-#[case::ad_non_saturated_differs(SamTag::AD, 100, 200, ContentPredicate::ExactConsensus)]
-#[case::cd_former_saturated_differs_under_exact(
-    SamTag::CD,
-    65534,
-    118_954,
-    ContentPredicate::Exact
-)]
+#[case::ad_former_saturated_differs(SamTag::AD, 32767, 59034, ContentPredicate::Exact)]
+#[case::bd_former_saturated_differs(SamTag::BD, 32767, 61000, ContentPredicate::Exact)]
+#[case::cd_former_saturated_65534_differs(SamTag::CD, 65534, 118_954, ContentPredicate::Exact)]
+#[case::ad_non_saturated_differs(SamTag::AD, 100, 200, ContentPredicate::Exact)]
 fn positional_consensus_duplex_depth_compared_exactly(
     #[case] tag: SamTag,
     #[case] value_a: i32,
@@ -617,11 +618,10 @@ fn per_base_consensus_record(cd_bases: &[i16]) -> RawRecord {
 
 #[rstest]
 #[case::exact(ContentPredicate::Exact)]
-#[case::exact_consensus(ContentPredicate::ExactConsensus)]
+#[case::exact_minus_mi(ContentPredicate::ExactMinusMi)]
 fn positional_per_base_consensus_tag_mutation_always_differs(#[case] pred: ContentPredicate) {
-    // The per-base `cd`/`ce` (`B:s`) arrays saturate identically in both tools and
-    // are NOT part of the per-read `cD`/`cM`/`cE` saturation carve-out — a change
-    // here must DIFFER under every predicate, including `ExactConsensus`.
+    // The per-base `cd`/`ce` (`B:s`) arrays saturate identically in both tools — a change
+    // here must DIFFER under every predicate.
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
     let bam1 = tmp.path().join("a.bam");
@@ -1409,9 +1409,9 @@ const MUTATION_CATALOG: &[CatalogEntry] = &[
             )
         },
     },
-    // Section 2: ExactConsensus
+    // Section 2: consensus depth/error tags compared exactly (Exact)
     CatalogEntry {
-        engine: "positional/ExactConsensus",
+        engine: "positional/Exact",
         mutation: "cD former-saturated pair differs",
         must_differ: true,
         verify: || {
@@ -1419,25 +1419,12 @@ const MUTATION_CATALOG: &[CatalogEntry] = &[
                 &create_minimal_header("chr1", 10000),
                 &[consensus_record_cd(32767)],
                 &[consensus_record_cd(59920)],
-                ContentPredicate::ExactConsensus,
-            )
-        },
-    },
-    CatalogEntry {
-        engine: "positional/Exact",
-        mutation: "cD saturated pair still differs under plain Exact",
-        must_differ: true,
-        verify: || {
-            positional_differs(
-                &create_minimal_header("chr1", 10000),
-                &[consensus_record_cd(32767)],
-                &[consensus_record_cd(59920)],
                 ContentPredicate::Exact,
             )
         },
     },
     CatalogEntry {
-        engine: "positional/ExactConsensus",
+        engine: "positional/Exact",
         mutation: "cD non-saturated pair still differs",
         must_differ: true,
         verify: || {
@@ -1445,35 +1432,41 @@ const MUTATION_CATALOG: &[CatalogEntry] = &[
                 &create_minimal_header("chr1", 10000),
                 &[consensus_record_cd(100)],
                 &[consensus_record_cd(200)],
-                ContentPredicate::ExactConsensus,
+                ContentPredicate::Exact,
             )
         },
     },
     CatalogEntry {
-        engine: "positional/ExactConsensus",
-        mutation: "cM/cE differences flagged",
+        engine: "positional/Exact",
+        mutation: "cM difference flagged",
         must_differ: true,
         verify: || {
-            let rec = |cd: i32, cm: i32, ce: f32| {
-                let mut b = SamBuilder::new();
-                b.read_name(b"read1")
-                    .sequence(b"ACGT")
-                    .qualities(&[30; 4])
-                    .add_int_tag(SamTag::CD, cd)
-                    .add_int_tag(SamTag::CM, cm)
-                    .add_float_tag(SamTag::CE, ce);
-                b.build()
-            };
+            // Only cM differs; cD and cE held identical, so this row fails if cM ever stops
+            // being compared — independent of any cD/cE difference.
             positional_differs(
                 &create_minimal_header("chr1", 10000),
-                &[rec(32767, 32767, 0.01)],
-                &[rec(59920, 40000, 0.02)],
-                ContentPredicate::ExactConsensus,
+                &[consensus_record_cd_cm_ce(32767, 32767, 0.01)],
+                &[consensus_record_cd_cm_ce(32767, 40000, 0.01)],
+                ContentPredicate::Exact,
             )
         },
     },
     CatalogEntry {
-        engine: "positional/ExactConsensus",
+        engine: "positional/Exact",
+        mutation: "cE difference flagged",
+        must_differ: true,
+        verify: || {
+            // Only cE differs; cD and cM held identical.
+            positional_differs(
+                &create_minimal_header("chr1", 10000),
+                &[consensus_record_cd_cm_ce(32767, 32767, 0.01)],
+                &[consensus_record_cd_cm_ce(32767, 32767, 0.02)],
+                ContentPredicate::Exact,
+            )
+        },
+    },
+    CatalogEntry {
+        engine: "positional/Exact",
         mutation: "per-base consensus tag change",
         must_differ: true,
         verify: || {
@@ -1481,7 +1474,7 @@ const MUTATION_CATALOG: &[CatalogEntry] = &[
                 &create_minimal_header("chr1", 10000),
                 &[per_base_consensus_record(&[10, 10, 10, 10])],
                 &[per_base_consensus_record(&[10, 10, 9, 10])],
-                ContentPredicate::ExactConsensus,
+                ContentPredicate::Exact,
             )
         },
     },
@@ -1489,7 +1482,7 @@ const MUTATION_CATALOG: &[CatalogEntry] = &[
     // now clamped to fgbio's Short ceiling and compared exactly (former "saturated"
     // pairs DIFFER).
     CatalogEntry {
-        engine: "positional/ExactConsensus",
+        engine: "positional/Exact",
         mutation: "duplex aD former-saturated pair differs",
         must_differ: true,
         verify: || {
@@ -1497,12 +1490,12 @@ const MUTATION_CATALOG: &[CatalogEntry] = &[
                 &create_minimal_header("chr1", 10000),
                 &[consensus_record_with_tag(SamTag::AD, 32767)],
                 &[consensus_record_with_tag(SamTag::AD, 59034)],
-                ContentPredicate::ExactConsensus,
+                ContentPredicate::Exact,
             )
         },
     },
     CatalogEntry {
-        engine: "positional/ExactConsensus",
+        engine: "positional/Exact",
         mutation: "duplex bD former-saturated pair differs",
         must_differ: true,
         verify: || {
@@ -1510,26 +1503,13 @@ const MUTATION_CATALOG: &[CatalogEntry] = &[
                 &create_minimal_header("chr1", 10000),
                 &[consensus_record_with_tag(SamTag::BD, 32767)],
                 &[consensus_record_with_tag(SamTag::BD, 61000)],
-                ContentPredicate::ExactConsensus,
-            )
-        },
-    },
-    CatalogEntry {
-        engine: "positional/ExactConsensus",
-        mutation: "duplex combined cD former-saturated differs",
-        must_differ: true,
-        verify: || {
-            positional_differs(
-                &create_minimal_header("chr1", 10000),
-                &[consensus_record_with_tag(SamTag::CD, 65534)],
-                &[consensus_record_with_tag(SamTag::CD, 118_954)],
-                ContentPredicate::ExactConsensus,
+                ContentPredicate::Exact,
             )
         },
     },
     CatalogEntry {
         engine: "positional/Exact",
-        mutation: "duplex combined cD saturated at 65534 still differs under plain Exact",
+        mutation: "duplex combined cD former-saturated differs",
         must_differ: true,
         verify: || {
             positional_differs(
@@ -1541,7 +1521,7 @@ const MUTATION_CATALOG: &[CatalogEntry] = &[
         },
     },
     CatalogEntry {
-        engine: "positional/ExactConsensus",
+        engine: "positional/Exact",
         mutation: "duplex aD non-saturated pair still differs",
         must_differ: true,
         verify: || {
@@ -1549,12 +1529,12 @@ const MUTATION_CATALOG: &[CatalogEntry] = &[
                 &create_minimal_header("chr1", 10000),
                 &[consensus_record_with_tag(SamTag::AD, 100)],
                 &[consensus_record_with_tag(SamTag::AD, 200)],
-                ContentPredicate::ExactConsensus,
+                ContentPredicate::Exact,
             )
         },
     },
     CatalogEntry {
-        engine: "positional/ExactConsensus",
+        engine: "positional/Exact",
         mutation: "duplex aD undercount relative to saturation still differs",
         must_differ: true,
         verify: || {
@@ -1562,7 +1542,7 @@ const MUTATION_CATALOG: &[CatalogEntry] = &[
                 &create_minimal_header("chr1", 10000),
                 &[consensus_record_with_tag(SamTag::AD, 32767)],
                 &[consensus_record_with_tag(SamTag::AD, 5)],
-                ContentPredicate::ExactConsensus,
+                ContentPredicate::Exact,
             )
         },
     },

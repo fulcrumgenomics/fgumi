@@ -34,7 +34,7 @@ fgumi compare bams <BAM1> <BAM2> [OPTIONS]
 
 | Mode | Description | Use Case |
 |------|-------------|----------|
-| `content` (default) | Pure record-by-record comparison of all fields, paired by `RecordKey` identity (order-sound: a reorder is reported as a difference, never masked) | `extract`, `zipper`, `correct`, `dedup`, `filter`, `clip`, `simplex`, `duplex`, `codec` output (the latter four via the `ExactConsensus` predicate) |
+| `content` (default) | Pure record-by-record comparison of all fields, paired by `RecordKey` identity (order-sound: a reorder is reported as a difference, never masked) | `extract`, `zipper`, `correct`, `dedup`, `filter`, `clip`, `simplex`, `duplex`, `codec` output (consensus depth tags compared exactly, clamped to fgbio parity at the source) |
 | `grouping` | Key-join content (excluding MI) + fgumi-MI/fgbio-MI bijection check; order-independent (canonicalizes both inputs to queryname order) | Cross-tool `group` output, where MI values/order may differ (see `--command group`) |
 
 ### Options
@@ -88,10 +88,10 @@ than setting `--mode`/`--ignore-order` by hand where a preset exists.
 | `extract` | content | false | No MI tags; deterministic |
 | `zipper` | content | false | Preserves MI tags unchanged |
 | `group` | grouping (key-join engine) | true | Cross-tool: compares via key-join, pairing records by identity after canonicalizing both inputs to queryname order. Content is checked under `ExactMinusMi` (every field except MI) plus a separate fgumi-MI/fgbio-MI bijection check, since MI values or record order may legitimately differ between tools. |
-| `simplex` | content | false | Exact content comparison via the `ExactConsensus` predicate (compares the `cD`/`cM`/`cE` depth tags exactly; fgumi clamps them to fgbio's `Short` ceiling, so no saturation carve-out is needed) |
-| `duplex` | content | false | Exact content comparison via the `ExactConsensus` predicate (compares `cD`/`cM`/`cE` plus duplex `aD`/`aM`/`bD`/`bM`/`aE`/`bE` exactly) |
-| `codec` | content | false | Exact content comparison via the `ExactConsensus` predicate, same as `simplex`/`duplex` |
-| `filter` | content | false | Passes through MI/depth tags unchanged; uses the same `ExactConsensus` predicate as consensus output |
+| `simplex` | content | false | Exact content comparison (compares the `cD`/`cM`/`cE` depth tags exactly; fgumi clamps them to fgbio's `Short` ceiling at the source, so no saturation carve-out is needed) |
+| `duplex` | content | false | Exact content comparison (compares `cD`/`cM`/`cE` plus duplex `aD`/`aM`/`bD`/`bM`/`aE`/`bE` exactly) |
+| `codec` | content | false | Exact content comparison, same as `simplex`/`duplex` |
+| `filter` | content | false | Passes through MI/depth tags unchanged; uses the same exact content comparison as consensus output |
 | `clip` | content | false | Does not modify MI tags |
 | `correct` | content | false | Modifies RX tag only, not MI |
 | `downsample` | content | false | Deterministic with seed |
@@ -106,7 +106,7 @@ fgumi compare bams extracted1.bam extracted2.bam --mode content
 # Compare group output (cross-tool: key-join + MI bijection check)
 fgumi compare bams grouped1.bam grouped2.bam --command group
 
-# Compare consensus output (exact content comparison, ExactConsensus predicate)
+# Compare consensus output (exact content comparison)
 fgumi compare bams consensus1.bam consensus2.bam --command simplex
 fgumi compare bams consensus1.bam consensus2.bam --command duplex
 fgumi compare bams consensus1.bam consensus2.bam --command codec
