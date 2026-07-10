@@ -246,7 +246,7 @@ fn test_simulate_grouped_reads_deterministic() {
     assert_bams_identical(
         &bam1,
         &bam2,
-        "full",
+        "content",
         "Two runs with same seed should produce identical BAMs",
     );
 }

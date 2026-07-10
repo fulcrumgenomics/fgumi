@@ -1,6 +1,6 @@
 //! Integration tests for the `fgumi compare bams` command.
 //!
-//! These tests exercise all three compare modes (content, full, grouping)
+//! These tests exercise both compare modes (content, grouping)
 //! using the raw byte comparison path.
 
 use clap::Parser;
@@ -22,12 +22,23 @@ use crate::helpers::bam_generator::{
     create_coordinate_sorted_header, create_minimal_header, keyjoin_cfg, mi_record, write_bam,
 };
 
-/// Runs `fgumi compare bams` via subprocess and returns (success, stdout).
+/// Runs `fgumi compare bams` via subprocess and returns `(exit_code, stdout, stderr)`.
 ///
-/// Used by tests that assert on specific substrings in the diagnostic report
-/// (e.g. EQUIVALENT vs IDENTICAL, mismatch counts). For tests that only need
-/// to know whether the BAMs matched, prefer `run_compare_in_process`.
-fn run_compare(bam1: &Path, bam2: &Path, mode: &str, extra_args: &[&str]) -> (bool, String) {
+/// Returns the *exact* exit code (not just success/failure) so a negative test can tell a
+/// clean DIFFER (`Some(1)`, set explicitly for `CompareMismatch` in `main`) apart from a
+/// panic/abort (`Some(101)`/`Some(134)`), a usage error (`Some(2)`), or a signal (`None`) —
+/// reducing all of those to `!success()` would let an unrelated crash satisfy a
+/// "must-not-match" assertion. `stderr` is returned so an argument-rejection test can assert
+/// the specific diagnostic (a generic `anyhow` runtime error also exits 1) rather than
+/// merely "did not succeed". Used by tests that assert on specific substrings in the
+/// diagnostic report (e.g. EQUIVALENT vs IDENTICAL, mismatch counts); for tests that only
+/// need to know whether the BAMs matched, prefer `run_compare_in_process`.
+fn run_compare(
+    bam1: &Path,
+    bam2: &Path,
+    mode: &str,
+    extra_args: &[&str],
+) -> (Option<i32>, String, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
         .args(["compare", "bams"])
         .arg(bam1)
@@ -37,8 +48,11 @@ fn run_compare(bam1: &Path, bam2: &Path, mode: &str, extra_args: &[&str]) -> (bo
         .output()
         .expect("Failed to run fgumi");
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    (output.status.success(), stdout)
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
 }
 
 /// Runs `CompareBams::execute()` in-process and returns true on match
@@ -57,8 +71,9 @@ fn run_compare_in_process(bam1: &Path, bam2: &Path, mode: &str, extra_args: &[&s
     }
 }
 
-/// Runs `fgumi compare bams --command <command>` via subprocess and returns (success,
-/// stdout).
+/// Runs `fgumi compare bams --command <command>` via subprocess and returns
+/// `(exit_code, stdout, stderr)` (see [`run_compare`] for why the exact code and stderr are
+/// returned rather than a bare `success()`).
 ///
 /// Unlike `run_compare` (which sets `--mode` directly), this drives the real
 /// `--command <stage>` CLI surface — i.e. the path an actual `group` cross-tool
@@ -69,7 +84,7 @@ fn run_compare_command(
     bam2: &Path,
     command: &str,
     extra_args: &[&str],
-) -> (bool, String) {
+) -> (Option<i32>, String, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
         .args(["compare", "bams"])
         .arg(bam1)
@@ -79,8 +94,11 @@ fn run_compare_command(
         .output()
         .expect("Failed to run fgumi");
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    (output.status.success(), stdout)
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
 }
 
 /// Builds a simple mapped record with a given name and position.
@@ -177,32 +195,11 @@ fn test_content_mode_multithreaded() {
 }
 
 // ---------------------------------------------------------------------------
-// Full mode tests
+// Content mode: MI treated as an ordinary tag
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_full_mode_identical_bams() {
-    let tmp = TempDir::new().unwrap();
-    let header = create_minimal_header("chr1", 10000);
-    let records = vec![
-        mi_record(b"read1", 100, "1"),
-        mi_record(b"read2", 200, "1"),
-        mi_record(b"read3", 300, "2"),
-    ];
-
-    let bam1 = tmp.path().join("a.bam");
-    let bam2 = tmp.path().join("b.bam");
-    write_bam(&bam1, &header, &records);
-    write_bam(&bam2, &header, &records);
-
-    assert!(
-        run_compare_in_process(&bam1, &bam2, "full", &[]),
-        "Expected match for identical BAMs in full mode"
-    );
-}
-
-#[test]
-fn test_full_mode_different_mi_tags() {
+fn test_content_mode_different_mi_tags() {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
 
@@ -214,9 +211,11 @@ fn test_full_mode_different_mi_tags() {
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
+    // Content mode compares MI as an ordinary tag value (exact), so read2's
+    // MI:Z:1 vs MI:Z:2 is a tag difference and the BAMs DIFFER.
     assert!(
-        !run_compare_in_process(&bam1, &bam2, "full", &[]),
-        "Expected mismatch for different MI tags in full mode"
+        !run_compare_in_process(&bam1, &bam2, "content", &[]),
+        "Expected mismatch for different MI tags in content mode"
     );
 }
 
@@ -264,19 +263,20 @@ fn test_grouping_mode_identical_bams() {
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
 
-    let (success, stdout) = run_compare(&bam1, &bam2, "grouping", &[]);
-    assert!(success, "Expected success for identical grouped BAMs, stdout:\n{stdout}");
+    let (code, stdout, _stderr) = run_compare(&bam1, &bam2, "grouping", &[]);
+    assert_eq!(code, Some(0), "Expected success for identical grouped BAMs, stdout:\n{stdout}");
     assert!(stdout.contains("EQUIVALENT"), "Expected EQUIVALENT in output, got:\n{stdout}");
 }
 
 #[test]
-fn test_grouping_mode_flag_mismatch_reported_separately() {
+fn test_grouping_mode_flag_mismatch_is_presence_differ() {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
 
     // BAM1: read1 is R1, read2 is R2. BAM2: read1 is R2, read2 is R1 (swapped).
-    // Names and order match, but R1/R2 flags do not — this is a flag mismatch,
-    // not an order/name mismatch.
+    // Grouping mode keys pairs on RecordKey (which encodes the R1/R2 segment),
+    // so an R1/R2 flag swap makes each side's records unmatchable against the
+    // other — the mismatch surfaces as presence differences, and the BAMs DIFFER.
     let make = |name: &[u8], pos: i32, flags: u16, mi: &str| -> RawRecord {
         let mut b = SamBuilder::new();
         b.read_name(name)
@@ -304,21 +304,21 @@ fn test_grouping_mode_flag_mismatch_reported_separately() {
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
-    let (success, stdout) = run_compare(&bam1, &bam2, "grouping", &[]);
-    assert!(!success, "Expected failure for flag mismatches, stdout:\n{stdout}");
+    let (code, stdout, _stderr) = run_compare(&bam1, &bam2, "grouping", &[]);
+    assert_eq!(code, Some(1), "Expected DIFFER (exit 1) for flag mismatches, stdout:\n{stdout}");
     assert!(stdout.contains("DIFFER"), "Expected DIFFER in output, got:\n{stdout}");
     assert!(
-        stdout.contains("Order/name mismatches: 0"),
-        "Expected order/name count to remain zero, got:\n{stdout}"
+        stdout.contains("Records only in BAM1: 2"),
+        "Expected 2 records unmatched in BAM1, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("R1/R2 flag mismatches: 2"),
-        "Expected flag mismatch count of 2, got:\n{stdout}"
+        stdout.contains("Records only in BAM2: 2"),
+        "Expected 2 records unmatched in BAM2, got:\n{stdout}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// Reordered tags tests (content and full modes)
+// Reordered tags tests (content mode)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -364,53 +364,13 @@ fn test_content_mode_reordered_tags_equivalent() {
     // across that reimplementation is the `RESULT: ... IDENTICAL`/`DIFFER` line and
     // the exit code, not this now-retired note; see the compare-hardening Phase 2
     // plan's report-contract fix.
-    let (success, stdout) = run_compare(&bam1, &bam2, "content", &[]);
-    assert!(success, "Expected success for reordered tags in content mode, stdout:\n{stdout}");
-    assert!(stdout.contains("IDENTICAL"), "Expected IDENTICAL in output, got:\n{stdout}");
-}
-
-#[test]
-fn test_full_mode_reordered_tags_equivalent() {
-    let tmp = TempDir::new().unwrap();
-    let header = create_minimal_header("chr1", 10000);
-
-    let records1 = vec![{
-        let mut b = SamBuilder::new();
-        b.read_name(b"read1")
-            .sequence(b"ACGTACGT")
-            .qualities(&[30; 8])
-            .ref_id(0)
-            .pos(99)
-            .mapq(60)
-            .add_string_tag(SamTag::MI, b"1")
-            .add_string_tag(SamTag::RX, b"AAAA");
-        b.build()
-    }];
-    let records2 = vec![{
-        let mut b = SamBuilder::new();
-        b.read_name(b"read1")
-            .sequence(b"ACGTACGT")
-            .qualities(&[30; 8])
-            .ref_id(0)
-            .pos(99)
-            .mapq(60)
-            .add_string_tag(SamTag::RX, b"AAAA")
-            .add_string_tag(SamTag::MI, b"1");
-        b.build()
-    }];
-
-    let bam1 = tmp.path().join("a.bam");
-    let bam2 = tmp.path().join("b.bam");
-    write_bam(&bam1, &header, &records1);
-    write_bam(&bam2, &header, &records2);
-
-    let (success, stdout) = run_compare(&bam1, &bam2, "full", &[]);
-    assert!(success, "Expected success for reordered tags in full mode, stdout:\n{stdout}");
-    assert!(stdout.contains("IDENTICAL"), "Expected IDENTICAL in output, got:\n{stdout}");
-    assert!(
-        stdout.contains("tags in different order"),
-        "Expected tag order diff note in output, got:\n{stdout}"
+    let (code, stdout, _stderr) = run_compare(&bam1, &bam2, "content", &[]);
+    assert_eq!(
+        code,
+        Some(0),
+        "Expected success for reordered tags in content mode, stdout:\n{stdout}"
     );
+    assert!(stdout.contains("IDENTICAL"), "Expected IDENTICAL in output, got:\n{stdout}");
 }
 
 // ---------------------------------------------------------------------------
@@ -483,16 +443,16 @@ fn test_grouping_mode_ignore_order() {
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
-    let (success, stdout) = run_compare(&bam1, &bam2, "grouping", &["--ignore-order"]);
-    assert!(success, "Expected success for ignore-order grouping mode, stdout:\n{stdout}");
+    let (code, stdout, _stderr) = run_compare(&bam1, &bam2, "grouping", &["--ignore-order"]);
+    assert_eq!(code, Some(0), "Expected success for ignore-order grouping mode, stdout:\n{stdout}");
     assert!(stdout.contains("EQUIVALENT"), "Expected EQUIVALENT in output, got:\n{stdout}");
 }
 
 // ---------------------------------------------------------------------------
 // Missing MI tag regression tests
 //
-// When both BAMs lack MI tags, the compare should NOT report them as
-// equivalent under grouping or full modes: no grouping has been verified.
+// When both BAMs lack MI tags, grouping mode should NOT report them as
+// equivalent: no grouping has been verified.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -530,30 +490,16 @@ fn test_grouping_mode_fails_when_mi_missing_in_both_bams() {
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
 
-    let (success, stdout) = run_compare(&bam1, &bam2, "grouping", &[]);
-    assert!(!success, "Expected failure when MI tags are missing in both BAMs, stdout:\n{stdout}");
+    let (code, stdout, _stderr) = run_compare(&bam1, &bam2, "grouping", &[]);
+    assert_eq!(
+        code,
+        Some(1),
+        "Expected DIFFER (exit 1) when MI tags are missing in both BAMs, stdout:\n{stdout}"
+    );
     assert!(stdout.contains("DIFFER"), "Expected DIFFER in output, got:\n{stdout}");
     assert!(
         stdout.contains("Missing MI in BAM1: 2") && stdout.contains("Missing MI in BAM2: 2"),
         "Expected missing-MI counts of 2 each, got:\n{stdout}"
-    );
-}
-
-#[test]
-fn test_full_mode_fails_when_mi_missing_in_both_bams() {
-    let tmp = TempDir::new().unwrap();
-    let header = create_minimal_header("chr1", 10000);
-    // Two identical records, neither has an MI tag.
-    let records = vec![mapped_record(b"read1", 100), mapped_record(b"read2", 200)];
-
-    let bam1 = tmp.path().join("a.bam");
-    let bam2 = tmp.path().join("b.bam");
-    write_bam(&bam1, &header, &records);
-    write_bam(&bam2, &header, &records);
-
-    assert!(
-        !run_compare_in_process(&bam1, &bam2, "full", &[]),
-        "Expected mismatch when MI tags are missing in both BAMs (full mode)"
     );
 }
 
@@ -631,8 +577,12 @@ fn test_grouping_mode_paired_strand_suffix_equivalent() {
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
 
-    let (success, stdout) = run_compare(&bam1, &bam2, "grouping", &[]);
-    assert!(success, "Expected EQUIVALENT for identical paired-strand BAMs, stdout:\n{stdout}");
+    let (code, stdout, _stderr) = run_compare(&bam1, &bam2, "grouping", &[]);
+    assert_eq!(
+        code,
+        Some(0),
+        "Expected EQUIVALENT for identical paired-strand BAMs, stdout:\n{stdout}"
+    );
     assert!(stdout.contains("EQUIVALENT"), "Expected EQUIVALENT, got:\n{stdout}");
     // Guards against regression to the old `parse::<i64>()` path where every
     // /A /B record was reported as missing MI.
@@ -657,8 +607,12 @@ fn test_grouping_unordered_paired_strand_suffix_equivalent() {
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
 
-    let (success, stdout) = run_compare(&bam1, &bam2, "grouping", &["--ignore-order"]);
-    assert!(success, "Expected EQUIVALENT for ignore-order paired-strand BAMs, stdout:\n{stdout}");
+    let (code, stdout, _stderr) = run_compare(&bam1, &bam2, "grouping", &["--ignore-order"]);
+    assert_eq!(
+        code,
+        Some(0),
+        "Expected EQUIVALENT for ignore-order paired-strand BAMs, stdout:\n{stdout}"
+    );
     assert!(stdout.contains("EQUIVALENT"), "Expected EQUIVALENT, got:\n{stdout}");
     assert!(
         stdout.contains("Missing MI in BAM1: 0") && stdout.contains("Missing MI in BAM2: 0"),
@@ -686,30 +640,26 @@ fn test_grouping_mode_paired_strand_a_flipped_to_b_is_mismatch() {
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
-    // Ordered grouping mode (no --ignore-order) is used deliberately so that
-    // the mismatch-sample path (which prints the conflicting MI values) is
-    // exercised, letting us assert they render via Display instead of Debug.
-    let (success, stdout) = run_compare(&bam1, &bam2, "grouping", &[]);
-    assert!(!success, "Expected DIFFER when /A and /B assignments disagree, stdout:\n{stdout}");
+    let (code, stdout, _stderr) = run_compare(&bam1, &bam2, "grouping", &[]);
+    assert_eq!(
+        code,
+        Some(1),
+        "Expected DIFFER (exit 1) when /A and /B assignments disagree, stdout:\n{stdout}"
+    );
     assert!(stdout.contains("DIFFER"), "Expected DIFFER, got:\n{stdout}");
-    // Specifically assert the mismatch reason: the paired MIs must be parsed as
-    // present (zero missing MI) and the failure must be a grouping mismatch, so
-    // regressing to the old "every /A /B counted as missing MI" path still trips
-    // this test.
+    // The paired MIs must be parsed as present (zero missing MI); read2's records
+    // pair by RecordKey (name+segment) across the two BAMs, so the disagreement is
+    // surfaced by the fgumi-MI/fgbio-MI bijection check (0/A and 0/B in BAM1 both
+    // map to 0/A in BAM2 — not a bijection), not by a missing-MI count.
     assert!(
         stdout.contains("Missing MI in BAM1: 0") && stdout.contains("Missing MI in BAM2: 0"),
         "Expected paired-strand MIs to be parsed as present, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("Grouping mismatches: 1"),
-        "Expected the failure to be a grouping mismatch, got:\n{stdout}"
+        stdout.contains("MI bijection mismatches: 1"),
+        "Expected the failure to be an MI bijection mismatch, got:\n{stdout}"
     );
-    // The sampled MIs in the mismatch detail must render via Display
-    // (`0/A`, `0/B`) not Debug (`Strand { base: 0, strand: 65 }`).
-    assert!(
-        stdout.contains("0/A") && stdout.contains("0/B"),
-        "Expected Display-formatted MiKeys in mismatch detail, got:\n{stdout}"
-    );
+    // Debug-formatting must not leak into user-facing output.
     assert!(
         !stdout.contains("Strand {"),
         "MiKey debug-formatting leaked into user-facing output:\n{stdout}"
@@ -882,22 +832,86 @@ fn test_positional_compare_header_sq_length_mismatch_is_a_diff() {
     );
 }
 
-/// Reads back every record's name from a BAM file, in on-disk order, via the raw
-/// (non-noodles) reader that the sort/key-join engines use internally.
-fn read_all_names(path: &Path) -> Vec<String> {
+/// An independent per-record fingerprint for the canonicalization test: the raw BAM record
+/// bytes (every semantic field — flags, loci, MAPQ, CIGAR, SEQ, QUAL, name, and all aux tags;
+/// the non-semantic `bin` index field is zeroed by [`strip_bin`]), plus the read name and
+/// flags pulled out for the ordering check. Comparing the bytes (not just the lossy read
+/// name) catches corruption of any field, or a payload swapped onto the wrong name; equal-name
+/// records let the segment/secondary/supplementary tie lanes be exercised.
+struct RecordFingerprint {
+    /// Raw record bytes with `bin` zeroed — the semantic identity used for multiset preservation.
+    bytes: Vec<u8>,
+    /// Read name (the primary queryname sort key).
+    name: Vec<u8>,
+    /// Raw SAM flags (feed the tie-break via [`samtools_queryname_flag_order`]).
+    flags: u16,
+}
+
+/// Zeroes a raw record's BAM `bin` field (bytes 10-11) in place, so it does not enter the
+/// semantic fingerprint. `bin` is a BAM index optimization, not part of the SAM data model:
+/// different writers legitimately compute it differently (the sort pipeline writes 0), so
+/// comparing it would flag a non-difference — exactly the reason `raw_core_fields_equal`
+/// excludes it from the real comparison.
+fn strip_bin(mut bytes: Vec<u8>) -> Vec<u8> {
+    if bytes.len() >= 12 {
+        bytes[10..12].fill(0);
+    }
+    bytes
+}
+
+/// Reads back every record from a BAM file, in on-disk order, via the raw (non-noodles)
+/// reader that the sort/key-join engines use internally.
+fn read_all_records(path: &Path) -> Vec<RecordFingerprint> {
     let file = fs::File::open(path).expect("open canonicalized BAM");
     let mut reader = fgumi_sort::RawBamRecordReader::new(file).expect("open raw reader");
     reader.skip_header().expect("skip header");
-    let mut names = Vec::new();
+    let mut records = Vec::new();
     while let Some(record) = reader.next_record().expect("read record") {
-        names.push(String::from_utf8_lossy(record.read_name()).into_owned());
+        records.push(RecordFingerprint {
+            bytes: strip_bin(record.as_ref().to_vec()),
+            name: record.read_name().to_vec(),
+            flags: record.flags(),
+        });
     }
-    names
+    records
 }
 
-/// `--command group`'s key-join canonicalization step must (a) preserve the exact
-/// set of input records and (b) leave the output in non-decreasing queryname order,
-/// whether or not the configured memory budget forces the sort to spill to disk.
+/// The samtools queryname flag-ordering tie-break (`bam_sort.c`): among records sharing a
+/// read name, the order is READ1, READ2, then PRIMARY < SUPPLEMENTARY < SECONDARY.
+/// Reimplemented here from the samtools formula, independently of `fgumi_sort`'s own
+/// `queryname_flag_order`, so it is a genuine oracle for the tie lanes rather than a mirror
+/// of the code under test.
+fn samtools_queryname_flag_order(flags: u16) -> u16 {
+    ((flags & 0xc0) << 8) | ((flags & 0x100) << 3) | ((flags & 0x800) >> 3)
+}
+
+/// The full queryname sort key: name first (lexicographic here — the fixture uses names with
+/// no numeric or leading-zero ambiguity, so lexicographic and natural ordering agree), then
+/// the flag tie-break. Used to assert non-decreasing output order across the tie lanes, not
+/// just by name.
+fn queryname_sort_key(fp: &RecordFingerprint) -> (Vec<u8>, u16) {
+    (fp.name.clone(), samtools_queryname_flag_order(fp.flags))
+}
+
+/// Builds a fully-specified record so each fingerprint is content-distinct: name, flags, a
+/// unique position, and a unique SEQ (with matching QUALs) let the multiset check detect any
+/// field corruption or a payload swapped onto the wrong name.
+fn canon_record(name: &[u8], flags: u16, pos: i32, seq: &[u8]) -> RawRecord {
+    let mut b = SamBuilder::new();
+    b.read_name(name)
+        .flags(flags)
+        .sequence(seq)
+        .qualities(&vec![30u8; seq.len()])
+        .ref_id(0)
+        .pos(pos - 1)
+        .mapq(60);
+    b.build()
+}
+
+/// `--command group`'s key-join canonicalization step must (a) preserve the exact *records*
+/// (every field, not just the read name) and (b) leave the output in non-decreasing queryname
+/// order under the **full** sort key (name plus the segment/secondary/supplementary tie
+/// lanes), whether or not the configured memory budget forces the sort to spill to disk.
 #[rstest]
 #[case::ample_memory(1024 * 1024, false)]
 #[case::tiny_memory_forces_spill(1, true)]
@@ -907,9 +921,28 @@ fn test_canonicalize_to_queryname_sorts_and_preserves_records(
 ) {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
-    let input_names = ["read3", "read1", "read2", "read0", "read4"];
-    let records: Vec<RawRecord> =
-        input_names.iter().map(|n| mapped_record(n.as_bytes(), 100)).collect();
+    // Scrambled input order. `dup` repeats across four flag lanes (R1 primary, R1
+    // supplementary, R1 secondary, R2 primary) so the tie-break — not just the name — is
+    // exercised; each record carries a distinct SEQ/pos so the fingerprint would catch a
+    // payload landing on the wrong name.
+    let records = vec![
+        canon_record(b"readZ", flags::PAIRED | flags::FIRST_SEGMENT, 500, b"AAAAAAAA"),
+        canon_record(b"dup", flags::PAIRED | flags::LAST_SEGMENT, 200, b"CCCCCCCC"),
+        canon_record(
+            b"dup",
+            flags::PAIRED | flags::FIRST_SEGMENT | flags::SUPPLEMENTARY,
+            300,
+            b"GGGGGGGG",
+        ),
+        canon_record(b"aaa", 0, 100, b"TTTTTTTT"),
+        canon_record(b"dup", flags::PAIRED | flags::FIRST_SEGMENT, 100, b"ACGTACGT"),
+        canon_record(
+            b"dup",
+            flags::PAIRED | flags::FIRST_SEGMENT | flags::SECONDARY,
+            400,
+            b"TGCATGCA",
+        ),
+    ];
     let input = tmp.path().join("in.bam");
     write_bam(&input, &header, &records);
 
@@ -918,8 +951,8 @@ fn test_canonicalize_to_queryname_sorts_and_preserves_records(
     let stats =
         canonicalize_to_queryname(&input, &output, &cfg).expect("canonicalize should succeed");
 
-    assert_eq!(stats.total_records, input_names.len() as u64);
-    assert_eq!(stats.output_records, input_names.len() as u64);
+    assert_eq!(stats.total_records, records.len() as u64);
+    assert_eq!(stats.output_records, records.len() as u64);
     assert_eq!(
         stats.chunks_written > 0,
         expect_spill,
@@ -927,16 +960,33 @@ fn test_canonicalize_to_queryname_sorts_and_preserves_records(
         stats.chunks_written
     );
 
-    let got_names = read_all_names(&output);
-    let mut expected_order = got_names.clone();
-    expected_order.sort();
-    assert_eq!(got_names, expected_order, "canonicalized output must be queryname-sorted");
+    let got = read_all_records(&output);
 
-    let mut got_set = got_names;
-    got_set.sort();
-    let mut want_set: Vec<String> = input_names.iter().map(|s| (*s).to_string()).collect();
-    want_set.sort();
-    assert_eq!(got_set, want_set, "canonicalization must preserve the record set");
+    // (b) Non-decreasing under the FULL queryname sort key (name + flag tie-break), so a
+    // mis-ordered tie lane — invisible to a name-only check — is caught.
+    for pair in got.windows(2) {
+        let (a, b) = (queryname_sort_key(&pair[0]), queryname_sort_key(&pair[1]));
+        assert!(
+            a <= b,
+            "canonicalized output must be non-decreasing by (name, flag-order): \
+             {:?}/{:#06x} then {:?}/{:#06x}",
+            String::from_utf8_lossy(&pair[0].name),
+            pair[0].flags,
+            String::from_utf8_lossy(&pair[1].name),
+            pair[1].flags,
+        );
+    }
+
+    // (a) The output must be an exact permutation of the input records — compared by full raw
+    // bytes (an independent semantic fingerprint), not by read name alone.
+    let mut want: Vec<Vec<u8>> = records.iter().map(|r| strip_bin(r.as_ref().to_vec())).collect();
+    want.sort();
+    let mut got_bytes: Vec<Vec<u8>> = got.iter().map(|r| r.bytes.clone()).collect();
+    got_bytes.sort();
+    assert_eq!(
+        got_bytes, want,
+        "canonicalization must preserve the exact record multiset (all fields), not just names"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1046,10 +1096,9 @@ fn test_keyjoin_compare_mi_renumbered_but_grouping_equivalent_match() {
 }
 
 /// (c) BS1 regression proof: a non-MI content bug (SEQ mutated) on one matched pair,
-/// with the MI partition completely untouched, must still DIFFER. Under the
-/// pre-hardening `execute_grouping_unordered`, only MI equivalence was checked, so this
-/// same input falsely reported EQUIVALENT — this is the load-bearing proof that the
-/// key-join engine now actually checks content.
+/// with the MI partition completely untouched, must still DIFFER. A pre-hardening
+/// MI-equivalence-only grouping check reported EQUIVALENT for this same input — this is
+/// the load-bearing proof that the key-join engine now actually checks content.
 #[test]
 fn test_keyjoin_compare_content_diff_with_intact_grouping_differs() {
     let tmp = TempDir::new().unwrap();
@@ -1139,6 +1188,75 @@ fn test_keyjoin_compare_record_dropped_in_bam2_presence_differs() {
     assert!(!outcome.is_match(), "a record dropped on one side must DIFFER: {outcome:?}");
 }
 
+/// (f) Duplicate-`RecordKey` soundness — the equal-key-run multiset match. Two records that
+/// share one `RecordKey` (same name/segment; `multimap_locus` is `None` for primaries) but
+/// differ in content, reordered between the two files. `RecordKey` has no intra-run
+/// tie-break and the canonicalization sort is stable for exact-key ties (audit C2), so the
+/// run stays reordered across the two streams. Pairing the run positionally would pair each
+/// file's first member with the other's first and invent two content diffs; matching the
+/// run's content as a multiset must instead MATCH.
+#[test]
+fn test_keyjoin_compare_reordered_duplicate_key_run_matches() {
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10000);
+
+    let x = mapped_record_with_mi_and_seq(b"dup", 100, "1", b"AAAAAAAA");
+    let y = mapped_record_with_mi_and_seq(b"dup", 100, "1", b"CCCCCCCC");
+
+    // Same two records, opposite physical order.
+    let records1 = vec![x.clone(), y.clone()];
+    let records2 = vec![y, x];
+
+    let bam1 = tmp.path().join("a.bam");
+    let bam2 = tmp.path().join("b.bam");
+    write_bam(&bam1, &header, &records1);
+    write_bam(&bam2, &header, &records2);
+
+    let cfg = keyjoin_cfg(&tmp);
+    let outcome: KeyJoinOutcome =
+        keyjoin_compare(&bam1, &bam2, &cfg).expect("keyjoin_compare should succeed");
+
+    assert_eq!(outcome.bam1_count, 2);
+    assert_eq!(outcome.bam2_count, 2);
+    assert_eq!(outcome.matched, 2, "both equal-key records must content-match across the reorder");
+    assert_eq!(outcome.content_diffs, 0, "an intra-run reorder must not be a content diff");
+    assert!(
+        outcome.is_match(),
+        "a reordered duplicate-key run with identical content must match: {outcome:?}"
+    );
+}
+
+/// (g) The converse of (f): a genuine content change inside a duplicate-`RecordKey` run —
+/// one run member mutated so it has no content-equal partner — must still DIFFER. Multiset
+/// matching tolerates reordering, not a real difference.
+#[test]
+fn test_keyjoin_compare_duplicate_key_run_real_content_diff_differs() {
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10000);
+
+    let x = mapped_record_with_mi_and_seq(b"dup", 100, "1", b"AAAAAAAA");
+    let y = mapped_record_with_mi_and_seq(b"dup", 100, "1", b"CCCCCCCC");
+    let z = mapped_record_with_mi_and_seq(b"dup", 100, "1", b"GGGGGGGG"); // differs from both
+
+    let records1 = vec![x.clone(), y];
+    let records2 = vec![x, z]; // one run member (y) has no counterpart in bam2's run
+
+    let bam1 = tmp.path().join("a.bam");
+    let bam2 = tmp.path().join("b.bam");
+    write_bam(&bam1, &header, &records1);
+    write_bam(&bam2, &header, &records2);
+
+    let cfg = keyjoin_cfg(&tmp);
+    let outcome: KeyJoinOutcome =
+        keyjoin_compare(&bam1, &bam2, &cfg).expect("keyjoin_compare should succeed");
+
+    assert_eq!(outcome.content_diffs, 1, "the unmatched run member must be one content diff");
+    assert!(
+        !outcome.is_match(),
+        "a real content difference within an equal-key run must DIFFER: {outcome:?}"
+    );
+}
+
 /// R2 header-comparison gap, wired into the key-join engine: `keyjoin_compare` internally
 /// canonicalizes both inputs to queryname order via a rewritten `@HD`, so the header check
 /// must compare the *original* inputs, not the canonicalized scratch copies — otherwise a
@@ -1192,11 +1310,14 @@ fn test_keyjoin_compare_header_rg_sample_mismatch_differs() {
 /// name and then by the *full* packed flag word `((flags & 0xc0) << 8) | ((flags & 0x100)
 /// << 3) | ((flags & 0x800) >> 3)` (`queryname_flag_order`), so a record with both R1 and
 /// R2 bits set (`0xc0`) sorts *after* a plain R2 record (`0x80`) in the canonicalized
-/// physical order. But `record_key::record_key` maps `(true, true)` to
-/// `Segment::Fragment`, which sorts *first* under `RecordKey`'s derived `Ord`. The two
-/// orderings disagree for this record, so the canonicalized stream is not actually
+/// physical order. But `record_key::record_key` maps `(true, true)` to its own
+/// `Segment::FirstAndLast` variant, deliberately ordered *before* `First`/`Last` (so it
+/// sorts *early* under `RecordKey`'s derived `Ord`; see the `Segment` enum's own note).
+/// The two orderings disagree for this record, so the canonicalized stream is not actually
 /// non-decreasing under the key the merge-join advances on — exactly the case the F1
-/// guard exists to catch as a loud failure instead of a silent miscompare.
+/// guard exists to catch as a loud failure instead of a silent miscompare. This test also
+/// locks the `Segment` variant order in: aligning `FirstAndLast` with the flag packing
+/// would make this stream monotonic and silently defeat the guard.
 #[test]
 fn test_keyjoin_compare_hard_errors_on_record_key_order_violation() {
     let tmp = TempDir::new().unwrap();
@@ -1259,11 +1380,12 @@ fn test_command_group_content_identical_mi_renumbered_and_reordered_matches() {
 
     let scratch = tmp.path().join("scratch");
     fs::create_dir_all(&scratch).expect("create scratch dir");
-    let (success, stdout) =
+    let (code, stdout, _stderr) =
         run_compare_command(&bam1, &bam2, "group", &["--sort-tmp-dir", scratch.to_str().unwrap()]);
 
-    assert!(
-        success,
+    assert_eq!(
+        code,
+        Some(0),
         "Expected EQUIVALENT for content-identical, MI-renumbered, reordered BAMs via \
          `--command group`, stdout:\n{stdout}"
     );
@@ -1274,11 +1396,50 @@ fn test_command_group_content_identical_mi_renumbered_and_reordered_matches() {
     );
 }
 
+/// Regression: an explicit `--mode content` overrides a preset's own predicate. Under
+/// `--command group` alone, an MI-only difference is a tolerated grouping renumbering
+/// (EQUIVALENT); but `--command group --mode content` asks for exact positional content
+/// comparison, so the same MI-only difference must DIFFER (the preset's `ExactMinusMi` must
+/// not silently weaken an explicitly-requested content compare).
+#[test]
+fn test_command_group_explicit_content_mode_flags_mi_only_difference() {
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10000);
+
+    // Two BAMs identical except for the MI tag value on the single record.
+    let bam1 = tmp.path().join("a.bam");
+    let bam2 = tmp.path().join("b.bam");
+    write_bam(&bam1, &header, &[mi_record(b"read1", 100, "1")]);
+    write_bam(&bam2, &header, &[mi_record(b"read1", 100, "2")]);
+
+    // `--command group` alone: the MI renumbering is a consistent bijection -> EQUIVALENT.
+    let scratch = tmp.path().join("scratch");
+    fs::create_dir_all(&scratch).expect("create scratch dir");
+    let (group_code, group_stdout, _) =
+        run_compare_command(&bam1, &bam2, "group", &["--sort-tmp-dir", scratch.to_str().unwrap()]);
+    assert_eq!(
+        group_code,
+        Some(0),
+        "`--command group` alone must tolerate an MI-only renumbering, stdout:\n{group_stdout}"
+    );
+
+    // `--command group --mode content`: explicit content mode forces the exact predicate,
+    // so the MI-only difference is now a real DIFFER.
+    let (content_code, content_stdout, _) =
+        run_compare_command(&bam1, &bam2, "group", &["--mode", "content"]);
+    assert_eq!(
+        content_code,
+        Some(1),
+        "explicit `--mode content` must DIFFER on an MI-only diff (exact predicate), \
+         stdout:\n{content_stdout}"
+    );
+    assert!(content_stdout.contains("DIFFER"), "expected DIFFER in output, got:\n{content_stdout}");
+}
+
 /// BS1 regression proof, end to end: a non-MI content bug (SEQ mutated on one matched
 /// pair) with the MI partition completely untouched must DIFFER via the real
-/// `--command group` path, not just via a direct `keyjoin_compare` call. Under the
-/// pre-hardening `execute_grouping_unordered` (MI-equivalence-only), this exact input
-/// falsely reported EQUIVALENT.
+/// `--command group` path, not just via a direct `keyjoin_compare` call. A pre-hardening
+/// MI-equivalence-only grouping check reported EQUIVALENT for this exact input.
 #[test]
 fn test_command_group_content_diff_with_intact_grouping_differs() {
     let tmp = TempDir::new().unwrap();
@@ -1301,13 +1462,14 @@ fn test_command_group_content_diff_with_intact_grouping_differs() {
 
     let scratch = tmp.path().join("scratch");
     fs::create_dir_all(&scratch).expect("create scratch dir");
-    let (success, stdout) =
+    let (code, stdout, _stderr) =
         run_compare_command(&bam1, &bam2, "group", &["--sort-tmp-dir", scratch.to_str().unwrap()]);
 
-    assert!(
-        !success,
-        "Expected DIFFER for a content bug with intact MI grouping via `--command group` \
-         (BS1 must be closed end-to-end), stdout:\n{stdout}"
+    assert_eq!(
+        code,
+        Some(1),
+        "Expected DIFFER (exit 1) for a content bug with intact MI grouping via `--command \
+         group` (BS1 must be closed end-to-end), stdout:\n{stdout}"
     );
     assert!(stdout.contains("DIFFER"), "Expected DIFFER in output, got:\n{stdout}");
     assert!(
@@ -1337,13 +1499,14 @@ fn test_command_group_missing_mi_in_both_bams_differs_with_preserved_tokens() {
 
     let scratch = tmp.path().join("scratch");
     fs::create_dir_all(&scratch).expect("create scratch dir");
-    let (success, stdout) =
+    let (code, stdout, _stderr) =
         run_compare_command(&bam1, &bam2, "group", &["--sort-tmp-dir", scratch.to_str().unwrap()]);
 
-    assert!(
-        !success,
-        "Expected DIFFER when MI tags are missing in both BAMs via `--command group`, \
-         stdout:\n{stdout}"
+    assert_eq!(
+        code,
+        Some(1),
+        "Expected DIFFER (exit 1) when MI tags are missing in both BAMs via `--command \
+         group`, stdout:\n{stdout}"
     );
     assert!(stdout.contains("DIFFER"), "Expected DIFFER in output, got:\n{stdout}");
     assert!(
@@ -1688,9 +1851,13 @@ fn test_command_sort_identical_bams_match() {
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
 
-    let (success, stdout) = run_compare_command(&bam1, &bam2, "sort", &[]);
+    let (code, stdout, _stderr) = run_compare_command(&bam1, &bam2, "sort", &[]);
 
-    assert!(success, "identical sorted BAMs must be IDENTICAL via --command sort:\n{stdout}");
+    assert_eq!(
+        code,
+        Some(0),
+        "identical sorted BAMs must be IDENTICAL (exit 0) via --command sort:\n{stdout}"
+    );
     assert!(stdout.contains("IDENTICAL"), "expected IDENTICAL in output, got:\n{stdout}");
 }
 
@@ -1710,9 +1877,13 @@ fn test_command_sort_mis_sorted_bam1_differs() {
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
-    let (success, stdout) = run_compare_command(&bam1, &bam2, "sort", &[]);
+    let (code, stdout, _stderr) = run_compare_command(&bam1, &bam2, "sort", &[]);
 
-    assert!(!success, "a genuine mis-sort must DIFFER via --command sort:\n{stdout}");
+    assert_eq!(
+        code,
+        Some(1),
+        "a genuine mis-sort must DIFFER (exit 1) via --command sort:\n{stdout}"
+    );
     assert!(stdout.contains("DIFFER"), "expected DIFFER in output, got:\n{stdout}");
 }
 
@@ -1729,8 +1900,20 @@ fn test_command_sort_rejects_explicit_mode() {
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
 
-    let (success, stdout) = run_compare_command(&bam1, &bam2, "sort", &["--mode", "content"]);
-    assert!(!success, "--mode with --command sort should be rejected, got:\n{stdout}");
+    let (code, stdout, stderr) = run_compare_command(&bam1, &bam2, "sort", &["--mode", "content"]);
+    // An argument rejection is a runtime `anyhow` error (exit 1 with an `Error:` diagnostic on
+    // stderr), which must be distinguished from a clean DIFFER (also exit 1, but a `RESULT`
+    // line on stdout and no `Error:`) and from a panic/usage error (exit 101/2). Assert both
+    // the code and the specific diagnostic so an unrelated failure can't satisfy this test.
+    assert_eq!(
+        code,
+        Some(1),
+        "--mode with --command sort must be rejected (exit 1), got stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--mode is not valid with --command sort"),
+        "rejection must name the offending flag, got stderr:\n{stderr}"
+    );
 }
 
 /// Mirrors `test_command_sort_rejects_explicit_mode` for `--ignore-order`: neither
@@ -1747,6 +1930,17 @@ fn test_command_sort_rejects_explicit_ignore_order() {
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
 
-    let (success, stdout) = run_compare_command(&bam1, &bam2, "sort", &["--ignore-order"]);
-    assert!(!success, "--ignore-order with --command sort should be rejected, got:\n{stdout}");
+    let (code, stdout, stderr) = run_compare_command(&bam1, &bam2, "sort", &["--ignore-order"]);
+    // Mirrors `test_command_sort_rejects_explicit_mode`: assert the exact exit code and the
+    // specific `--ignore-order` diagnostic, so a panic or an unrelated error can't stand in
+    // for the intended argument rejection.
+    assert_eq!(
+        code,
+        Some(1),
+        "--ignore-order with --command sort must be rejected (exit 1), got stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--ignore-order is not valid with --command sort"),
+        "rejection must name the offending flag, got stderr:\n{stderr}"
+    );
 }

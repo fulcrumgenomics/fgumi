@@ -34,16 +34,15 @@ fgumi compare bams <BAM1> <BAM2> [OPTIONS]
 
 | Mode | Description | Use Case |
 |------|-------------|----------|
-| `full` (default) | MI grouping check + full content comparison | Same-tool, same-order `group` output |
-| `content` | Pure record-by-record comparison of all fields | `extract`, `zipper`, `correct`, `dedup`, `filter`, `clip`, `simplex`, `duplex`, `codec` output (the latter three via the saturation-aware `ExactConsensus` predicate) |
-| `grouping` | MI equivalence only, or (with `--ignore-order`) key-join content + MI bijection | Cross-tool `group` output, where MI values/order may differ (see `--command group`) |
+| `content` (default) | Pure record-by-record comparison of all fields, paired by `RecordKey` identity (order-sound: a reorder is reported as a difference, never masked) | `extract`, `zipper`, `correct`, `dedup`, `filter`, `clip`, `simplex`, `duplex`, `codec` output (the latter four via the `ExactConsensus` predicate) |
+| `grouping` | Key-join content (excluding MI) + fgumi-MI/fgbio-MI bijection check; order-independent (canonicalizes both inputs to queryname order) | Cross-tool `group` output, where MI values/order may differ (see `--command group`) |
 
 ### Options
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `-c, --command` | STRING | (none) | Preset `--mode`/`--ignore-order` for a specific fgumi pipeline stage (see [Command Presets](#command-presets---command) below). An explicit `--mode`/`--ignore-order` overrides the preset. |
-| `--mode` | STRING | `full` | Comparison mode: `full`, `content`, or `grouping` |
+| `--mode` | STRING | `content` | Comparison mode: `content` or `grouping` |
 | `-m, --max-diffs` | INT | 10 | Maximum differences to report |
 | `-q, --quiet` | FLAG | false | Only exit code indicates result (0=equal, 1=different) |
 | `--ignore-order` | FLAG | false | Ignore record order (for parallel consensus output) |
@@ -89,10 +88,10 @@ than setting `--mode`/`--ignore-order` by hand where a preset exists.
 | `extract` | content | false | No MI tags; deterministic |
 | `zipper` | content | false | Preserves MI tags unchanged |
 | `group` | grouping (key-join engine) | true | Cross-tool: compares via key-join, pairing records by identity after canonicalizing both inputs to queryname order. Content is checked under `ExactMinusMi` (every field except MI) plus a separate fgumi-MI/fgbio-MI bijection check, since MI values or record order may legitimately differ between tools. |
-| `simplex` | content | false | Saturation-aware exact comparison (`ExactConsensus`): tolerates the accepted `cD`/`cM`/`cE` depth-saturation divergence, otherwise exact |
-| `duplex` | content | false | Saturation-aware exact comparison (`ExactConsensus`): tolerates the accepted depth-saturation divergence (`cD`/`cM`/`cE` plus duplex `aD`/`aM`/`bD`/`bM`/`aE`/`bE`), otherwise exact |
-| `codec` | content | false | Saturation-aware exact comparison (`ExactConsensus`), same carve-out as `simplex`/`duplex` |
-| `filter` | content | false | Passes through MI/depth tags unchanged; uses the same saturation-aware `ExactConsensus` predicate as consensus output |
+| `simplex` | content | false | Exact content comparison via the `ExactConsensus` predicate (compares the `cD`/`cM`/`cE` depth tags exactly; fgumi clamps them to fgbio's `Short` ceiling, so no saturation carve-out is needed) |
+| `duplex` | content | false | Exact content comparison via the `ExactConsensus` predicate (compares `cD`/`cM`/`cE` plus duplex `aD`/`aM`/`bD`/`bM`/`aE`/`bE` exactly) |
+| `codec` | content | false | Exact content comparison via the `ExactConsensus` predicate, same as `simplex`/`duplex` |
+| `filter` | content | false | Passes through MI/depth tags unchanged; uses the same `ExactConsensus` predicate as consensus output |
 | `clip` | content | false | Does not modify MI tags |
 | `correct` | content | false | Modifies RX tag only, not MI |
 | `downsample` | content | false | Deterministic with seed |
@@ -107,7 +106,7 @@ fgumi compare bams extracted1.bam extracted2.bam --mode content
 # Compare group output (cross-tool: key-join + MI bijection check)
 fgumi compare bams grouped1.bam grouped2.bam --command group
 
-# Compare consensus output (saturation-aware exact content comparison)
+# Compare consensus output (exact content comparison, ExactConsensus predicate)
 fgumi compare bams consensus1.bam consensus2.bam --command simplex
 fgumi compare bams consensus1.bam consensus2.bam --command duplex
 fgumi compare bams consensus1.bam consensus2.bam --command codec
@@ -248,7 +247,7 @@ set -e
 
 # Run tests and compare outputs
 fgumi group --input test.bam --output actual.bam --strategy adjacency
-fgumi compare bams expected.bam actual.bam --mode full --quiet
+fgumi compare bams expected.bam actual.bam --command group --quiet
 
 echo "BAM comparison passed"
 ```
