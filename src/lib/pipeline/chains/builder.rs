@@ -482,6 +482,13 @@ pub struct ChainBuilder<'a> {
     /// [`WriteBgzfFile`]: crate::pipeline::steps::sink::write_bgzf::WriteBgzfFile
     pending_header_handle: Option<crate::pipeline::core::header::HeaderHandle>,
 
+    /// When an aligner `HeaderHandle` is pending, this accumulates the header
+    /// changes made by later stages that *modify* the header (sort-order rewrite,
+    /// clip) so they are re-applied to the aligner's runtime-resolved header at
+    /// sink time — preserving the aligner `@PG`/`@RG`/`@CO` — instead of being
+    /// discarded. Forwarded to `WriteBgzfFile::new_with_handle` by `add_sink`.
+    pending_header_transform: Option<fgumi_pipeline_io::sink::write_bgzf::ResolvedHeaderTransform>,
+
     /// Tracks the logical output type of the current chain tail. Updated by
     /// `add_source` and each `add_<stage>` method. See [`ChainTailKind`]
     /// for the full enumeration and rationale.
@@ -550,6 +557,7 @@ impl<'a> ChainBuilder<'a> {
             override_pipeline_threads: None,
             use_drain_first_scheduler: false,
             pending_header_handle: None,
+            pending_header_transform: None,
             // Initialise to the default; add_source will set the correct kind
             // based on whether sort is the first intermediate stage.
             chain_tail_kind: ChainTailKind::DecodedRecordBatch,
@@ -1343,8 +1351,13 @@ impl<'a> ChainBuilder<'a> {
         // `HeaderHandle` stashed by `add_align` must be forwarded here so the
         // writer blocks until the handle is resolved before emitting any bytes.
         let write_step = if let Some(handle) = self.pending_header_handle.take() {
-            WriteBgzfFile::new_with_handle(output_path, handle, self.tuning.compression_level)
-                .map_err(|e| anyhow!("WriteBgzfFile::new_with_handle: {e}"))?
+            WriteBgzfFile::new_with_handle(
+                output_path,
+                handle,
+                self.tuning.compression_level,
+                self.pending_header_transform.take(),
+            )
+            .map_err(|e| anyhow!("WriteBgzfFile::new_with_handle: {e}"))?
         } else {
             WriteBgzfFile::new(output_path, &self.header, self.tuning.compression_level)
                 .map_err(|e| anyhow!("WriteBgzfFile::new: {e}"))?
@@ -1420,7 +1433,48 @@ impl<'a> ChainBuilder<'a> {
     /// [`HeaderHandle`]: crate::pipeline::core::header::HeaderHandle
     fn replace_header(&mut self, header: noodles::sam::Header) {
         self.header = header;
+        // A from-scratch header carries no aligner provenance, so drop BOTH the pending
+        // handle and any transform composed for it. Clearing only the handle would leave a
+        // stale transform that a later `add_align` handle would wrongly re-apply at sink time.
         self.pending_header_handle = None;
+        self.pending_header_transform = None;
+    }
+
+    /// Apply a header transform for a post-`Align` stage that *modifies* the
+    /// header (e.g. a sort-order rewrite or clip's `@HD` annotation).
+    ///
+    /// Updates the build-time `self.header` immediately (so downstream stage
+    /// construction and static checks see the change), and — when an aligner
+    /// `HeaderHandle` is still pending — composes the transform into
+    /// `self.pending_header_transform` so the same change is re-applied to the
+    /// aligner's runtime-resolved header at sink time, preserving its
+    /// `@PG`/`@RG`/`@CO`. When no handle is pending, `self.header` is
+    /// authoritative and no transform is retained.
+    ///
+    /// Prefer this over [`Self::replace_header`] for post-`Align` header
+    /// *modifications*. Stages that intentionally build a *fresh* header (e.g.
+    /// consensus, which emits an unmapped header with a single collapsed read
+    /// group and its own `@PG`) still use `replace_header`: there is no aligner
+    /// provenance to carry into a from-scratch header.
+    fn apply_output_header_transform<F>(&mut self, transform: F) -> Result<()>
+    where
+        F: Fn(noodles::sam::Header) -> std::io::Result<noodles::sam::Header>
+            + Send
+            + Sync
+            + 'static,
+    {
+        // Build-time: reflect the change now for downstream stages / static checks.
+        self.header = transform(self.header.clone())?;
+        // Runtime: compose onto the pending aligner-header transform chain so it
+        // re-runs on the resolved header at sink time.
+        if self.pending_header_handle.is_some() {
+            let prev = self.pending_header_transform.take();
+            self.pending_header_transform = Some(Box::new(move |header| match &prev {
+                Some(prev) => transform(prev(header)?),
+                None => transform(header),
+            }));
+        }
+        Ok(())
     }
 
     /// Build the final [`BuiltPipeline`] from the accumulated state.
@@ -2023,7 +2077,10 @@ impl<'a> ChainBuilder<'a> {
             self.chain_tail_kind = ChainTailKind::BamTemplateBatch;
         }
 
-        // Stash the HeaderHandle for add_sink to pick up.
+        // Stash the HeaderHandle for add_sink to pick up. This is a fresh aligner, so any
+        // transform composed for a *previous* align's handle is stale — drop it so it cannot
+        // be re-applied to this aligner's runtime-resolved header at sink time.
+        self.pending_header_transform = None;
         self.pending_header_handle = Some(header_handle);
 
         // AAM spawns two daemon threads + aligner subprocess; 4 workers
@@ -2648,12 +2705,15 @@ impl<'a> ChainBuilder<'a> {
                 self.chain_tail_kind = ChainTailKind::DecodedRecordBatch;
             }
 
-            // Update self.header to reflect template-coordinate sort order so
-            // downstream add_group's sort-order header check passes. This is
-            // the same header update that the external sorter writes into the
-            // temp BAM — here we apply it directly so the static check at
-            // chain-construction time sees the correct sort order.
-            self.replace_header(fgumi_sort::create_output_header(sort_order, &self.header));
+            // Update self.header to reflect the sort order so downstream
+            // add_group's sort-order header check passes. This is the same header
+            // update the external sorter writes into the temp BAM. Applied as a
+            // header *transform* so that, when Align is upstream, the sort-order
+            // rewrite is re-applied to the aligner's runtime-resolved header at
+            // sink time (preserving its @PG/@RG/@CO) instead of dropping it.
+            self.apply_output_header_transform(move |header| {
+                Ok(fgumi_sort::create_output_header(sort_order, &header))
+            })?;
 
             // Streaming sort does NOT register a SortFinalizeHook
             // (no output-path stats to log; the overall chain timing hook
@@ -3761,8 +3821,16 @@ impl<'a> ChainBuilder<'a> {
         // Apply clip's sort-order annotation to the output header. This must
         // happen before add_sink() consumes self.header for WriteBgzfFile.
         // Order relative to the @PG record (already in self.header from new())
-        // does not matter — @HD and @PG are independent header sections.
-        self.replace_header(clip.update_header_sort_order(self.header.clone())?);
+        // does not matter — @HD and @PG are independent header sections. Applied
+        // as a header *transform* so that, when Align is upstream, the annotation
+        // re-applies to the aligner's runtime-resolved header at sink time,
+        // preserving its @PG/@RG/@CO.
+        let clip_for_header = clip.clone();
+        self.apply_output_header_transform(move |header| {
+            clip_for_header
+                .update_header_sort_order(header)
+                .map_err(|e| std::io::Error::other(format!("{e:#}")))
+        })?;
 
         // Load reference (always required for clip).
         let reference = Arc::new(crate::reference::ReferenceReader::new(&clip.reference)?);
