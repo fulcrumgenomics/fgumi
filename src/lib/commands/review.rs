@@ -181,6 +181,16 @@ impl Command for Review {
 
         info!("Loaded {} variant positions", variants.len());
 
+        // Order variants by the reference sequence dictionary so the review file's rows
+        // are emitted in coordinate order, matching fgbio (issue #497). The consensus BAM
+        // header carries the same sequences, in the same order, as the reference `.dict`.
+        let variants = {
+            use noodles::bam;
+            let mut reader = bam::io::reader::Builder.build_from_path(&self.consensus_bam)?;
+            let header = reader.read_header()?;
+            Self::order_variants_by_dictionary(variants, &header)?
+        };
+
         // Extract consensus reads with variants
         info!("Extracting consensus reads with variants...");
         let mi_set = self.extract_consensus_reads(&variants, command_line)?;
@@ -241,6 +251,51 @@ impl Review {
             bam_bai.display(),
             bai.display()
         );
+    }
+
+    /// Orders variants by the reference sequence dictionary (coordinate order).
+    ///
+    /// fgbio processes variants by zipping `variants.iterator` with a
+    /// coordinate-ordered `SamLocusIterator` and `require`s the two stay in sync
+    /// (`ReviewConsensusVariants.scala:241`), so its review rows are emitted in
+    /// coordinate order and it errors on out-of-order input. fgumi previously used
+    /// input-file order, diverging for non-coordinate-sorted variants (issue #497).
+    /// Sorting here reproduces fgbio's row order regardless of the input order.
+    ///
+    /// The dictionary order is taken from `header`'s reference sequences, which match
+    /// the reference `.dict` fgbio reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a variant's contig is absent from the sequence dictionary
+    /// (fgbio likewise requires each variant interval's contig to exist in the dict).
+    fn order_variants_by_dictionary(
+        variants: Vec<Variant>,
+        header: &noodles::sam::Header,
+    ) -> Result<Vec<Variant>> {
+        use std::collections::HashMap;
+
+        let order: HashMap<String, usize> = header
+            .reference_sequences()
+            .keys()
+            .enumerate()
+            .map(|(idx, name)| (String::from_utf8_lossy(name).to_string(), idx))
+            .collect();
+
+        for variant in &variants {
+            if !order.contains_key(&variant.chrom) {
+                bail!(
+                    "Variant contig '{}' is not present in the consensus BAM sequence dictionary",
+                    variant.chrom
+                );
+            }
+        }
+
+        // Stable sort by (dictionary index, position); ties keep input order, matching
+        // fgbio's stable `sortBy` for equal keys.
+        let mut sorted = variants;
+        sorted.sort_by(|a, b| order[&a.chrom].cmp(&order[&b.chrom]).then(a.pos.cmp(&b.pos)));
+        Ok(sorted)
     }
 
     /// Checks if a file is a VCF file based on its extension.
@@ -822,6 +877,10 @@ impl Review {
                 }
             }
 
+            // Collect this variant's rows so they can be sorted by MI + read-number
+            // before writing, matching fgbio (ReviewConsensusVariants.scala:258).
+            let mut variant_rows: Vec<(String, ConsensusVariantReviewInfo)> = Vec::new();
+
             // Process each consensus read
             for record in consensus_reads {
                 // Get the base at the variant position
@@ -857,6 +916,12 @@ impl Review {
                 let read_name = String::from_utf8_lossy(record.read_name()).to_string();
                 let is_first = record.is_first_segment();
                 let consensus_read_name = format!("{}{}", read_name, read_number_suffix(is_first));
+
+                // fgbio sorts each variant's rows by the string `toMi(rec) +
+                // readNumberSuffix(rec)` (ReviewConsensusVariants.scala:258), so e.g.
+                // "10/1" sorts before "2/1". This key mirrors that (MI base, not the
+                // full read name, then the /1 or /2 suffix).
+                let sort_key = format!("{}{}", mi_base, read_number_suffix(is_first));
 
                 // Generate insert string
                 let insert_string = format_insert_string(&record, &consensus_header);
@@ -930,8 +995,13 @@ impl Review {
                     n: raw_counts.n,
                 };
 
-                all_metrics.push(info);
+                variant_rows.push((sort_key, info));
             }
+
+            // Emit this variant's rows in MI + read-number order; a stable sort keeps
+            // BAM-query order for ties, matching fgbio's stable `sortBy`.
+            variant_rows.sort_by(|a, b| a.0.cmp(&b.0));
+            all_metrics.extend(variant_rows.into_iter().map(|(_, info)| info));
         }
 
         // Write TSV
@@ -1468,6 +1538,100 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
             std::fs::write(&interval_path, interval_content).expect("failed to write file");
             interval_path
         }
+
+        /// One read-pair spec for [`create_ordering_bams`]:
+        /// `(name, chrom_idx, r1_start, r1_variant_base, mi, r2_override)`, where
+        /// `r2_override` is `Some((r2_start, r2_base))` to place R2 over a queried locus.
+        type OrderingRead<'a> = (&'a str, usize, i32, u8, &'a str, Option<(i32, u8)>);
+
+        /// Build consensus + grouped BAMs for the output-row-ordering test (issue #497).
+        ///
+        /// Each tuple is `(name, chrom_idx, start, variant_base, mi, r2_override)`. The
+        /// read pair's R1 is forward at `start` and carries `variant_base` at offset 4
+        /// (reference position `start + 4`). By default R2 is reverse at position 50 with
+        /// all-reference bases, off every variant, so it yields no review row. When
+        /// `r2_override` is `Some((r2_start, r2_base))`, R2 is instead placed at `r2_start`
+        /// carrying `r2_base` at offset 4, so it overlaps the queried locus and (when the
+        /// base is non-reference) emits a `/2` row — letting a single MI produce both a
+        /// `/1` and a `/2` row to exercise the read-number tie-break. Read pairs are
+        /// written in the given slice order, so the natural BAM/query order can differ from
+        /// fgbio's MI+read-number sorted order. The same pairs are written to the grouped
+        /// BAM so the raw-count lookups find a matching MI.
+        ///
+        /// Returns `(grouped_bam, consensus_bam)`.
+        pub fn create_ordering_bams(dir: &TempDir, reads: &[OrderingRead]) -> (PathBuf, PathBuf) {
+            use noodles::bam;
+            use noodles::bam::bai;
+            use noodles::sam::alignment::io::Write;
+
+            let grouped_path = dir.path().join("ordering_grouped.bam");
+            let consensus_path = dir.path().join("ordering_consensus.bam");
+            let header = create_test_header();
+
+            let mut grp_writer = bam::io::Writer::new(
+                std::fs::File::create(&grouped_path).expect("failed to create grouped BAM"),
+            );
+            grp_writer.write_header(&header).expect("failed to write grouped header");
+            let mut con_writer = bam::io::Writer::new(
+                std::fs::File::create(&consensus_path).expect("failed to create consensus BAM"),
+            );
+            con_writer.write_header(&header).expect("failed to write consensus header");
+
+            for (name, chrom_idx, start, variant_base, mi, r2_override) in reads {
+                let mut bases1 = vec![b'A'; 10];
+                bases1[4] = *variant_base;
+                // R2 defaults to position 50 with all-reference bases (off every queried
+                // variant); when overridden it moves to `r2_start` and carries `r2_base` at
+                // offset 4 so it overlaps the locus and can emit a `/2` row.
+                let mut bases2 = vec![b'A'; 10];
+                let start2 = match r2_override {
+                    Some((r2_start, r2_base)) => {
+                        bases2[4] = *r2_base;
+                        *r2_start
+                    }
+                    None => 50,
+                };
+                let (r1, r2) =
+                    create_read_pair(name, *chrom_idx, *start, start2, &bases1, &bases2, mi, None);
+                for rec in [&r1, &r2] {
+                    con_writer
+                        .write_alignment_record(&header, rec)
+                        .expect("failed to write consensus record");
+                    grp_writer
+                        .write_alignment_record(&header, rec)
+                        .expect("failed to write grouped record");
+                }
+            }
+
+            drop(grp_writer);
+            drop(con_writer);
+
+            for path in [&consensus_path, &grouped_path] {
+                let index = bam::fs::index(path).expect("failed to index BAM");
+                let mut writer = bai::io::Writer::new(
+                    std::fs::File::create(path.with_extension("bam.bai"))
+                        .expect("failed to create BAM index"),
+                );
+                writer.write_index(&index).expect("failed to write BAM index");
+            }
+
+            (grouped_path, consensus_path)
+        }
+
+        /// VCF for the ordering test: the chr1:10 variant is listed *before* chr1:5, so
+        /// the on-disk order differs from coordinate order (issue #497). No sample column,
+        /// so callers pass `sample: None`.
+        pub fn create_ordering_vcf(dir: &TempDir) -> PathBuf {
+            let vcf_path = dir.path().join("ordering.vcf");
+            let vcf_content = b"##fileformat=VCFv4.2\n\
+##contig=<ID=chr1,length=100>\n\
+##contig=<ID=chr2,length=100>\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+chr1\t10\t.\tA\tT\t.\tPASS\t.\n\
+chr1\t5\t.\tA\tC\t.\tPASS\t.\n";
+            std::fs::write(&vcf_path, vcf_content).expect("failed to write file");
+            vcf_path
+        }
     }
 
     #[test]
@@ -1880,6 +2044,116 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
         assert!(!columns.contains(&"ref_allele"), "column must not be `ref_allele`: {header}");
         assert!(columns.contains(&"consensus_read"));
         assert!(columns.contains(&"consensus_call"));
+    }
+
+    #[test]
+    fn test_order_variants_by_dictionary() {
+        // create_test_header defines chr1 then chr2.
+        let header = test_utils::create_test_header();
+
+        // Variants in a scrambled (non-coordinate) order.
+        let variants = vec![
+            Variant::new("chr2".to_string(), 20, 'C'),
+            Variant::new("chr1".to_string(), 30, 'A'),
+            Variant::new("chr1".to_string(), 10, 'A'),
+            Variant::new("chr1".to_string(), 20, 'A'),
+        ];
+
+        let sorted = Review::order_variants_by_dictionary(variants, &header)
+            .expect("ordering should succeed");
+        let got: Vec<(&str, i32)> = sorted.iter().map(|v| (v.chrom.as_str(), v.pos)).collect();
+        assert_eq!(
+            got,
+            vec![("chr1", 10), ("chr1", 20), ("chr1", 30), ("chr2", 20)],
+            "variants must be ordered by dictionary index then position"
+        );
+
+        // A contig absent from the dictionary is an error, matching fgbio's requirement
+        // that every variant interval exists in the sequence dictionary.
+        let bad = vec![Variant::new("chrX".to_string(), 1, 'A')];
+        assert!(
+            Review::order_variants_by_dictionary(bad, &header).is_err(),
+            "an unknown contig must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_review_output_row_order_matches_fgbio() {
+        use std::io::BufRead;
+
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let ref_path = test_utils::create_test_reference(&temp_dir);
+
+        // chr1:5 has one supporting read; chr1:10 has three with MIs "2", "3", "10"
+        // written in that (non-sorted) order. MI "10" additionally carries a non-reference
+        // R2 over chr1:10, so it emits both a `/1` and a `/2` row. fgbio emits variants in
+        // coordinate order (chr1:5 before chr1:10) and sorts each variant's rows by
+        // MI+read-number as strings, so the chr1:10 rows come out
+        // "10/1" < "10/2" < "2/1" < "3/1" — exercising the /1-before-/2 tie-break.
+        let reads = [
+            ("r_p5", 0usize, 1i32, b'C', "1", None),
+            ("r_mi2", 0usize, 6i32, b'T', "2", None),
+            ("r_mi3", 0usize, 6i32, b'T', "3", None),
+            ("r_mi10", 0usize, 6i32, b'T', "10", Some((6i32, b'T'))),
+        ];
+        let (grouped_path, consensus_path) = test_utils::create_ordering_bams(&temp_dir, &reads);
+        let vcf_path = test_utils::create_ordering_vcf(&temp_dir);
+        let output_path = temp_dir.path().join("output");
+
+        let review = Review {
+            input: vcf_path,
+            consensus_bam: consensus_path,
+            grouped_bam: grouped_path,
+            reference: ref_path,
+            output: output_path.clone(),
+            sample: None,
+            ignore_ns: false,
+            maf: 0.05,
+        };
+        review.execute("test").expect("execute should succeed");
+
+        let txt_out = output_path.with_extension("txt");
+        let file = std::fs::File::open(&txt_out).expect("failed to open review txt");
+        let lines: Vec<String> = std::io::BufReader::new(file)
+            .lines()
+            .map(|l| l.expect("failed to read line"))
+            .collect();
+
+        let cols: Vec<&str> = lines[0].split('\t').collect();
+        let pos_idx = cols.iter().position(|c| *c == "pos").expect("pos column");
+        let read_idx =
+            cols.iter().position(|c| *c == "consensus_read").expect("consensus_read column");
+
+        let rows: Vec<(String, String)> = lines[1..]
+            .iter()
+            .map(|l| {
+                let f: Vec<&str> = l.split('\t').collect();
+                (f[pos_idx].to_string(), f[read_idx].to_string())
+            })
+            .collect();
+
+        let expected = vec![
+            ("5".to_string(), "r_p5/1".to_string()),
+            ("10".to_string(), "r_mi10/1".to_string()),
+            ("10".to_string(), "r_mi10/2".to_string()),
+            ("10".to_string(), "r_mi2/1".to_string()),
+            ("10".to_string(), "r_mi3/1".to_string()),
+        ];
+        assert_eq!(
+            rows, expected,
+            "review rows must match fgbio coordinate + MI/read-number ordering"
+        );
+        // The same MI ("10") appears with both read numbers, so /1 must sort before /2.
+        let mi10: Vec<&String> = rows
+            .iter()
+            .filter(|(pos, read)| pos == "10" && read.starts_with("r_mi10/"))
+            .map(|(_, read)| read)
+            .collect();
+        assert_eq!(
+            mi10,
+            vec!["r_mi10/1", "r_mi10/2"],
+            "for the same MI, the /1 row must sort before the /2 row"
+        );
     }
 
     #[test]
