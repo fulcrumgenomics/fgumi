@@ -489,6 +489,92 @@ mod tests {
         assert_eq!(leftover, b"@read2\nTG");
     }
 
+    // ------------------------------------------------------------------------
+    // Cross-parser behavioral parity.
+    //
+    // fgumi has two independent single-record FASTQ validators:
+    //
+    //   - `FastqRecord::from_slice` (this module) — used by `parse_fastq_records` and,
+    //     transitively, by the `unified_pipeline` FASTQ parser, whose
+    //     `parse_single_fastq_record` delegates to `from_slice`.
+    //   - `fgumi_simd_fastq::try_parse_single_record` — the fallible core behind the SIMD
+    //     `parse_records` scan and the streaming `SimdFastqReader`.
+    //
+    // Both take a single framed record slice and must agree: either both accept it and
+    // return the identical name/sequence/quality, or both reject it as malformed. The
+    // helpers below normalize each result to `Option<(name, seq, qual)>` so a single
+    // shared case table (and the fuzz test that follows it) can drive both parsers and
+    // assert they never diverge as either implementation evolves.
+    // ------------------------------------------------------------------------
+
+    /// Normalize `FastqRecord::from_slice` to `Some((name, seq, qual))` / `None`.
+    fn from_slice_outcome(input: &[u8]) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        FastqRecord::from_slice(input)
+            .ok()
+            .map(|r| (r.name().to_vec(), r.sequence().to_vec(), r.quality().to_vec()))
+    }
+
+    /// Normalize `fgumi_simd_fastq::try_parse_single_record` to `Some((name, seq, qual))` / `None`.
+    fn simd_outcome(input: &[u8]) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        fgumi_simd_fastq::try_parse_single_record(input)
+            .ok()
+            .map(|r| (r.name.to_vec(), r.sequence.to_vec(), r.quality.to_vec()))
+    }
+
+    /// One shared case table run through both validators. Each case's `expected` is
+    /// `Some((name, seq, qual))` for a well-formed record or `None` for a record both
+    /// parsers must reject. Cases marked below consolidate scenarios that previously lived
+    /// in only one parser's own test suite.
+    #[rstest]
+    // Well-formed: trailing newline, no trailing newline (fastq_parse-only before),
+    // single-base read (SIMD-only before), empty seq+qual, empty name, and a name that
+    // itself contains a space and a `/1` (validators must preserve the raw name verbatim —
+    // read-name canonicalization is a separate concern, see `strip_read_suffix`).
+    #[case::simple(b"@r\nACGT\n+\nIIII\n", Some((b"r".as_slice(), b"ACGT".as_slice(), b"IIII".as_slice())))]
+    #[case::no_trailing_newline(b"@r\nACGT\n+\nIIII", Some((b"r".as_slice(), b"ACGT".as_slice(), b"IIII".as_slice())))]
+    #[case::single_base(b"@r\nA\n+\nI\n", Some((b"r".as_slice(), b"A".as_slice(), b"I".as_slice())))]
+    #[case::empty_seq_and_qual(b"@r\n\n+\n\n", Some((b"r".as_slice(), b"".as_slice(), b"".as_slice())))]
+    #[case::empty_name(b"@\nACGT\n+\nIIII\n", Some((b"".as_slice(), b"ACGT".as_slice(), b"IIII".as_slice())))]
+    #[case::name_with_space_and_slash(b"@a b/1\nACGT\n+\nIIII", Some((b"a b/1".as_slice(), b"ACGT".as_slice(), b"IIII".as_slice())))]
+    // Malformed: both validators must reject.
+    #[case::empty(b"", None)]
+    #[case::missing_at(b"r\nACGT\n+\nIIII\n", None)]
+    #[case::missing_plus(b"@r\nACGT\nx\nIIII\n", None)]
+    #[case::length_mismatch(b"@r\nACGT\n+\nII\n", None)]
+    // Length mismatch at EOF with no trailing newline (fastq_parse-only before).
+    #[case::length_mismatch_no_trailing_newline(b"@r\nACGT\n+\nIII", None)]
+    // Third newline is the final byte: no quality line at all (the underflow guard case;
+    // SIMD-only before, and previously a debug-build panic in `from_slice`).
+    #[case::missing_quality_line(b"@r\nAC\n+\n", None)]
+    #[case::too_few_lines(b"@r\nACGT\n", None)]
+    fn test_record_validator_parity(
+        #[case] input: &[u8],
+        #[case] expected: Option<(&[u8], &[u8], &[u8])>,
+    ) {
+        let from_slice = from_slice_outcome(input);
+        let simd = simd_outcome(input);
+
+        // The two independent validators must agree with each other ...
+        assert_eq!(from_slice, simd, "from_slice and SIMD disagree on {input:?}");
+        // ... and with the expected outcome.
+        let expected = expected.map(|(n, s, q)| (n.to_vec(), s.to_vec(), q.to_vec()));
+        assert_eq!(from_slice, expected, "unexpected parse result for {input:?}");
+    }
+
+    proptest::proptest! {
+        /// The two validators must agree on *every* input, not just the curated table:
+        /// for any byte slice, `from_slice` and the SIMD parser must both accept it
+        /// (returning identical name/sequence/quality) or both reject it, and neither may
+        /// panic. Fuzzing arbitrary bytes exercises adversarial framing — records ending
+        /// right after the `+` line, embedded/duplicated newlines, empty lines — that a
+        /// fixed table cannot enumerate. This generalizes the SIMD crate's own
+        /// `try_parse_single_record` never-panics fuzz test to a two-parser agreement check.
+        #[test]
+        fn test_record_validator_parity_fuzz(input in proptest::collection::vec(0u8..=255, 0..64)) {
+            proptest::prop_assert_eq!(from_slice_outcome(&input), simd_outcome(&input));
+        }
+    }
+
     #[rstest]
     // A trailing '/' + single digit is stripped (any digit, fgbio parity).
     #[case::slash_one(b"read/1", b"read")]

@@ -209,7 +209,7 @@ fn strip_trailing_cr(field: &[u8]) -> &[u8] {
 /// # Errors
 ///
 /// Returns a [`FastqParseError`] describing the first structural violation.
-pub(crate) fn try_parse_single_record(record: &[u8]) -> Result<FastqRecord<'_>, FastqParseError> {
+pub fn try_parse_single_record(record: &[u8]) -> Result<FastqRecord<'_>, FastqParseError> {
     if record.is_empty() || record[0] != b'@' {
         return Err(FastqParseError::MissingAtPrefix);
     }
