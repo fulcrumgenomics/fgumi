@@ -41,7 +41,7 @@
 //! ## Usage Example
 //!
 //! ```rust,ignore
-//! use fgumi_lib::consensus::codec_caller::{CodecConsensusCaller, CodecConsensusOptions};
+//! use fgumi_consensus::codec_caller::{CodecConsensusCaller, CodecConsensusOptions};
 //!
 //! let options = CodecConsensusOptions {
 //!     min_reads_per_strand: 1,

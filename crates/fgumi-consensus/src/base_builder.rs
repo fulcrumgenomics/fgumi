@@ -106,7 +106,7 @@
 //! Consensus callers typically use `ConsensusBaseBuilder` as follows:
 //!
 //! ```rust,ignore
-//! use fgumi_lib::consensus::base_builder::ConsensusBaseBuilder;
+//! use fgumi_consensus::base_builder::ConsensusBaseBuilder;
 //!
 //! // Create builder with error rates
 //! let mut builder = ConsensusBaseBuilder::new(
@@ -182,7 +182,7 @@
 //!
 //! ## See Also
 //!
-//! - `vanilla_consensus_caller`: Uses this builder to call consensus across entire reads
+//! - `vanilla_caller`: Uses this builder to call consensus across entire reads
 //! - `duplex_caller`: Uses this builder for single-strand consensus before duplex combination
 //! - `phred`: Utility functions for Phred score and probability conversions
 
