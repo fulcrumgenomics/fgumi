@@ -570,9 +570,11 @@ mod tests {
         let value = BufValue::from("acgt".to_string());
         let revcomp = revcomp_buf_value(&value);
 
-        // Lowercase is normalized to uppercase
+        // Case is preserved: fgumi_dna::reverse_complement uses the shared
+        // IUPAC-aware, case-preserving LUT (fgbio Sequences.complement parity,
+        // #491). "acgt" -> complement "tgca" -> reversed "acgt".
         if let BufValue::String(s) = revcomp {
-            assert_eq!(s.to_string(), "ACGT");
+            assert_eq!(s.to_string(), "acgt");
         } else {
             panic!("Expected String");
         }
@@ -583,9 +585,10 @@ mod tests {
         let value = BufValue::from("AcGt".to_string());
         let revcomp = revcomp_buf_value(&value);
 
-        // Mixed case is normalized to uppercase
+        // Case is preserved per base (#491): "AcGt" -> complement "TgCa" ->
+        // reversed "aCgT".
         if let BufValue::String(s) = revcomp {
-            assert_eq!(s.to_string(), "ACGT");
+            assert_eq!(s.to_string(), "aCgT");
         } else {
             panic!("Expected String");
         }
@@ -898,13 +901,14 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_revcomp_buf_value_ambiguous_bases_unchanged() {
-        // IUPAC ambiguity codes are not complemented
+    fn test_revcomp_buf_value_ambiguous_bases_complemented() {
+        // IUPAC ambiguity codes ARE complemented via the shared LUT (#491):
+        // R<->Y, K<->M, S and W are self-complementary.
         let value = BufValue::from("RYSWKM".to_string());
         let revcomp = revcomp_buf_value(&value);
         if let BufValue::String(s) = revcomp {
-            // Reversed but not complemented (our function only complements ACGTN)
-            assert_eq!(s.to_string(), "MKWSYR");
+            // complement "RYSWKM" -> "YRSWMK", reversed -> "KMWSRY".
+            assert_eq!(s.to_string(), "KMWSRY");
         } else {
             panic!("Expected String");
         }
