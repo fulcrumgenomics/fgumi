@@ -422,6 +422,113 @@ fn mapped_read(name: &[u8], flags: u16, pos: i32, match_len: u32, mapq: u8) -> R
     b.build()
 }
 
+/// Build a mapped read with an explicit CIGAR (raw BAM `(len << 4) | op` codes) and a
+/// matching-length sequence/qualities. `read_len` must equal the CIGAR's read-consuming length.
+fn read_with_cigar(
+    name: &[u8],
+    flags: u16,
+    pos: i32,
+    cigar_ops: &[u32],
+    read_len: usize,
+    mapq: u8,
+) -> RawRecord {
+    let mut b = SamBuilder::new();
+    b.read_name(name)
+        .sequence(&vec![b'A'; read_len])
+        .qualities(&vec![30; read_len])
+        .flags(flags)
+        .ref_id(0)
+        .pos(pos)
+        .mapq(mapq)
+        .cigar_ops(cigar_ops)
+        .mate_ref_id(0)
+        .mate_pos(pos);
+    b.build()
+}
+
+/// Runs `clip --upgrade-clipping` (Hard mode) over a template whose only clipped read is a
+/// supplementary alignment (`10S40M`), and asserts the supplementary's leading soft clip is
+/// upgraded to hard. fgbio `ClipBam` upgrades `template.allReads` (`ClipBam.scala:123`), not just
+/// the primary R1/R2, so the supplementary must be upgraded too. `threads` selects the
+/// single-threaded (`None`) vs `--threads` code path — the fix must hold on both.
+fn run_supplementary_upgrade_case(threads: Option<&str>) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+
+    // Primary pair, both 50M (no clipping to upgrade — they must stay 50M).
+    let r1 = mapped_read(b"t", flags::PAIRED | flags::FIRST_SEGMENT, 99, 50, 60);
+    let r2 = mapped_read(b"t", flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE, 99, 50, 60);
+    // R1 supplementary with a leading soft clip: 10S40M. The only read carrying clipping.
+    let supp = read_with_cigar(
+        b"t",
+        flags::PAIRED | flags::FIRST_SEGMENT | flags::SUPPLEMENTARY,
+        199,
+        &[(10u32 << 4) | 4, 40u32 << 4], // 10S40M
+        50,
+        60,
+    );
+    create_bam_from_records(&input_bam, &[r1, r2, supp]);
+
+    let mut args = vec![
+        "clip".to_string(),
+        "--input".to_string(),
+        input_bam.to_str().unwrap().to_string(),
+        "--output".to_string(),
+        output_bam.to_str().unwrap().to_string(),
+        "--reference".to_string(),
+        ref_path.to_str().unwrap().to_string(),
+        "--clipping-mode".to_string(),
+        "hard".to_string(),
+        "--upgrade-clipping".to_string(),
+        "true".to_string(),
+        "--compression-level".to_string(),
+        "1".to_string(),
+    ];
+    if let Some(t) = threads {
+        args.push("--threads".to_string());
+        args.push(t.to_string());
+    }
+    let cmd = Clip::try_parse_from(&args).expect("failed to parse clip args");
+    cmd.execute("fgumi clip").expect("Clip command failed");
+
+    let recs = read_output_records(&output_bam);
+    assert_eq!(recs.len(), 3, "all three reads retained");
+
+    // The supplementary read's leading 10S must have been upgraded to 10H.
+    let supp_out = recs
+        .iter()
+        .find(|(_, _, f)| f & flags::SUPPLEMENTARY != 0)
+        .expect("supplementary read present in output");
+    assert_eq!(
+        supp_out.1,
+        vec![(CigarKind::HardClip, 10), (CigarKind::Match, 40)],
+        "supplementary soft clip must be upgraded to hard (fgbio ClipBam.scala:123 upgrades \
+         template.allReads); got {:?}",
+        supp_out.1
+    );
+
+    // The primaries carried no clipping, so upgrade is a no-op on them.
+    for (_, ops, f) in &recs {
+        if f & flags::SUPPLEMENTARY == 0 {
+            assert_eq!(*ops, vec![(CigarKind::Match, 50)], "primary CIGAR must be unchanged");
+        }
+    }
+}
+
+/// Single-threaded path: `--upgrade-clipping` upgrades a supplementary alignment's clipping.
+#[test]
+fn test_upgrade_clipping_upgrades_supplementary_single_threaded() {
+    run_supplementary_upgrade_case(None);
+}
+
+/// `--threads` path: `--upgrade-clipping` upgrades a supplementary alignment's clipping.
+#[test]
+fn test_upgrade_clipping_upgrades_supplementary_threads_mode() {
+    run_supplementary_upgrade_case(Some("2"));
+}
+
 /// `--threads` mode routes through `execute_threads_mode`; exercise the `(Some, Some)` primary-pair
 /// branch with fixed R1/R2 clipping, overlap clipping, mate-extension clipping and clip upgrading
 /// all enabled. R1 (fwd, 150M) and R2 (rev, 100M) fully overlap, so overlap clipping engages.
