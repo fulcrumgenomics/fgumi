@@ -16,15 +16,25 @@
 //! 1. Detects the shared sort order from both inputs' `@HD` `SO`/`GO`/`SS` header tags
 //!    (see [`detect_sort_order`]) and errors if the two inputs disagree or declare an
 //!    order this engine cannot verify.
-//! 2. Verifies each file independently is non-decreasing under that order's key, via
-//!    [`fgumi_sort::verify_sort_order`] — this catches a genuine mis-sort in either file.
-//! 3. Walks both files in file order, grouping each into maximal runs of records that
-//!    share the same *core* sort key (the key without the name/hash tie-break lane — see
+//! 2. Reads each file exactly **once**, in file order, layering an [`OrderChecked`] stream
+//!    adapter over that single keyed-record read. The adapter watches every key flow past
+//!    and folds monotonicity into a per-file [`OrderTracker`] (violation count + first
+//!    violation) as a side effect — this catches a genuine mis-sort in either file, and is
+//!    the exact fold [`fgumi_sort::verify_sort_order`] performs in its own standalone pass.
+//! 3. Over that same single pass, groups each file into maximal runs of records that share
+//!    the same *core* sort key (the key without the name/hash tie-break lane — see
 //!    [`fgumi_sort::TemplateKey::core_cmp`] for template-coordinate; coordinate has no
 //!    tie-break lane beyond `(tid, pos, reverse)` in the first place), and asserts the
 //!    multiset of full records is equal between the two files' corresponding runs. This
 //!    tolerates intra-run reordering while still catching a missing/extra record or any
 //!    content difference.
+//!
+//! Reading each file once (rather than an order pass per file *plus* a reopened comparison
+//! pass — four full BAM traversals) roughly halves the BAM I/O + BGZF decode this
+//! benchmarking command spends on WGS-scale inputs. Because the comparison — including its
+//! desync "drain" path — pulls records *through* the [`OrderChecked`] adapter, each file's
+//! order is verified **completely**, even past a desync point, so the per-file violation
+//! counts are identical to the old two-pass computation for every input.
 //!
 //! Both checks run independently and are `AND`ed together in
 //! [`SortVerifyOutcome::is_match`]: an order violation in either file, or any run
@@ -37,11 +47,11 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 
 use fgumi_bam_io::create_raw_bam_reader;
-use fgumi_raw_bam::RawRecord;
+use fgumi_raw_bam::{RawRecord, RawRecordView};
 use fgumi_sort::{
     LibraryLookup, QuerynameComparator, RawBamRecordReader, RawQuerynameKey, RawQuerynameLexKey,
-    RawSortKey, SortContext, SortOrder, TemplateKey, VerifySummary, cb_hasher,
-    extract_coordinate_key_inline, extract_template_key_inline, verify_sort_order,
+    RawSortKey, SortContext, SortOrder, TemplateKey, cb_hasher, extract_coordinate_key_inline,
+    extract_template_key_inline, verify_sort_order,
 };
 use noodles::sam::Header;
 
@@ -61,8 +71,8 @@ pub struct SortVerifyOutcome {
     pub bam1_count: u64,
     /// Total number of records read from `bam2`.
     pub bam2_count: u64,
-    /// Number of sort-order violations found in `bam1` alone
-    /// (via [`fgumi_sort::verify_sort_order`]).
+    /// Number of sort-order violations found in `bam1` alone (accumulated by the per-file
+    /// order tracker, the inline fold of [`fgumi_sort::verify_sort_order`]).
     pub bam1_violations: u64,
     /// The first violation in `bam1`, if any: `(record_number, read_name)`.
     pub bam1_first_violation: Option<(u64, String)>,
@@ -223,33 +233,134 @@ fn open_raw_reader(path: &Path) -> Result<RawBamRecordReader<File>> {
 /// currently being assembled (the lookahead needed to detect a run boundary).
 type Keyed<K> = (K, RawRecord);
 
-/// Read one record and its key from `reader`, or `None` at EOF.
-fn read_keyed<K>(
-    reader: &mut RawBamRecordReader<File>,
-    extract_key: &impl Fn(&[u8]) -> K,
-) -> Result<Option<Keyed<K>>> {
-    match reader.next() {
-        Some(rec) => {
-            let rec = rec?;
-            let key = extract_key(rec.as_ref());
-            Ok(Some((key, rec)))
+/// The per-file monotonic sort-order accumulator, mirroring the fold in
+/// [`fgumi_sort::verify_sort_order`].
+///
+/// An [`OrderChecked`] adapter feeds every record's key through [`OrderTracker::observe`]
+/// exactly once, in file order, so the accumulated violation count and first violation are
+/// **complete** — even when the two compared streams desynchronize and the tail of one file
+/// is drained rather than compared. `is_violation` is borrowed (both files' trackers share
+/// one closure); the extracted key is cloned into `prev_key` to keep the yielded
+/// `(key, record)` intact for the run comparison downstream.
+struct OrderTracker<'a, K, IsViolation>
+where
+    IsViolation: Fn(&K, &K) -> bool,
+{
+    is_violation: &'a IsViolation,
+    prev_key: Option<K>,
+    total: u64,
+    violations: u64,
+    first_violation: Option<(u64, String)>,
+}
+
+impl<'a, K, IsViolation> OrderTracker<'a, K, IsViolation>
+where
+    K: Clone,
+    IsViolation: Fn(&K, &K) -> bool,
+{
+    fn new(is_violation: &'a IsViolation) -> Self {
+        Self { is_violation, prev_key: None, total: 0, violations: 0, first_violation: None }
+    }
+
+    /// Observe one record in file order: bump the running total and, if its key violates
+    /// the sort invariant relative to the previous key, bump the violation count and (once)
+    /// capture the first violation's `(record_number, read_name)`. This is exactly the
+    /// per-record body of [`fgumi_sort::verify_sort_order`], including the 1-based record
+    /// numbering and the `from_utf8_lossy` read-name extraction.
+    fn observe(&mut self, key: &K, record_bytes: &[u8]) {
+        self.total += 1;
+        if let Some(prev) = &self.prev_key
+            && (self.is_violation)(key, prev)
+        {
+            self.violations += 1;
+            if self.first_violation.is_none() {
+                let name = String::from_utf8_lossy(RawRecordView::new(record_bytes).read_name())
+                    .to_string();
+                self.first_violation = Some((self.total, name));
+            }
         }
-        None => Ok(None),
+        self.prev_key = Some(key.clone());
     }
 }
 
-/// Pull the next maximal run of records sharing the same core sort key from `reader`,
+/// A keyed-record stream that order-checks every record it yields, as a side effect.
+///
+/// Wraps the single keyed-record read the run comparison already consumes, threading each
+/// record's key through an [`OrderTracker`] before handing the `(key, record)` downstream
+/// unchanged. Because the comparison — including its desync [`OrderChecked::drain`] path —
+/// pulls records *through* this adapter, each file's order is verified completely even past
+/// a desync (the semantic invariant the old end-to-end `verify_sort_order` pass guaranteed),
+/// while the file is read only once.
+struct OrderChecked<'a, K, ExtractKey, IsViolation>
+where
+    ExtractKey: Fn(&[u8]) -> K,
+    IsViolation: Fn(&K, &K) -> bool,
+{
+    reader: RawBamRecordReader<File>,
+    extract_key: &'a ExtractKey,
+    tracker: OrderTracker<'a, K, IsViolation>,
+}
+
+impl<'a, K, ExtractKey, IsViolation> OrderChecked<'a, K, ExtractKey, IsViolation>
+where
+    K: Clone,
+    ExtractKey: Fn(&[u8]) -> K,
+    IsViolation: Fn(&K, &K) -> bool,
+{
+    fn new(
+        reader: RawBamRecordReader<File>,
+        extract_key: &'a ExtractKey,
+        is_violation: &'a IsViolation,
+    ) -> Self {
+        Self { reader, extract_key, tracker: OrderTracker::new(is_violation) }
+    }
+
+    /// Read the next record, extract and order-check its key, and yield `(key, record)`;
+    /// `None` at EOF.
+    fn next_keyed(&mut self) -> Result<Option<Keyed<K>>> {
+        match self.reader.next() {
+            Some(rec) => {
+                let rec = rec?;
+                let key = (self.extract_key)(rec.as_ref());
+                self.tracker.observe(&key, rec.as_ref());
+                Ok(Some((key, rec)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Drain the pending lookahead plus every remaining record *through* the order tracker.
+    /// Used once the two streams have desynchronized so both the per-file violation counts
+    /// and the tracker's record total (the authoritative count in [`SortVerifyOutcome`])
+    /// still reflect each file end to end.
+    ///
+    /// The lookahead record was already read — and so already order-checked and counted —
+    /// when [`Self::next_keyed`] produced it, so it is simply dropped here; only the
+    /// still-unread tail is pulled through the tracker.
+    fn drain(&mut self, next: &mut Option<Keyed<K>>) -> Result<()> {
+        *next = None;
+        while self.next_keyed()?.is_some() {}
+        Ok(())
+    }
+}
+
+/// Pull the next maximal run of records sharing the same core sort key from `stream`,
 /// using `next` as one-record lookahead state (carried across calls). Returns `None`
-/// once the stream (and lookahead) are exhausted.
-fn pull_run<K>(
-    reader: &mut RawBamRecordReader<File>,
+/// once the stream (and lookahead) are exhausted. Every record read here flows through
+/// `stream`'s order tracker exactly once.
+fn pull_run<K, ExtractKey, IsViolation>(
+    stream: &mut OrderChecked<'_, K, ExtractKey, IsViolation>,
     next: &mut Option<Keyed<K>>,
-    extract_key: &impl Fn(&[u8]) -> K,
     same_core: &impl Fn(&K, &K) -> bool,
-) -> Result<Option<(K, Vec<RawRecord>)>> {
+) -> Result<Option<(K, Vec<RawRecord>)>>
+where
+    K: Clone,
+    ExtractKey: Fn(&[u8]) -> K,
+    IsViolation: Fn(&K, &K) -> bool,
+{
     let Some((key, rec)) = next.take() else { return Ok(None) };
     let mut run = vec![rec];
-    while let Some((k, r)) = read_keyed(reader, extract_key)? {
+    while let Some((k, r)) = stream.next_keyed()? {
         if same_core(&k, &key) {
             run.push(r);
         } else {
@@ -258,20 +369,6 @@ fn pull_run<K>(
         }
     }
     Ok(Some((key, run)))
-}
-
-/// Drain the remainder of `reader` (plus any pending lookahead), returning the number of
-/// records consumed. Used once the two streams have desynchronized, so the final record
-/// counts in [`SortVerifyOutcome`] still reflect the true totals.
-fn drain_remaining<K>(
-    reader: &mut RawBamRecordReader<File>,
-    next: &mut Option<Keyed<K>>,
-) -> Result<u64> {
-    let mut count = u64::from(next.take().is_some());
-    while reader.next().transpose()?.is_some() {
-        count += 1;
-    }
-    Ok(count)
 }
 
 /// Returns `true` iff `a` and `b` contain the same multiset of records under
@@ -314,40 +411,41 @@ fn multiset_equal(a: &[RawRecord], b: &[RawRecord]) -> bool {
 /// violation counts are merged in by [`run_full_verify`]).
 #[derive(Debug, Default)]
 struct RunCompareOutcome {
-    bam1_count: u64,
-    bam2_count: u64,
     run_mismatches: u64,
     presence_mismatch: bool,
     diff_details: Vec<String>,
 }
 
-/// Walk `reader1`/`reader2` in file order, grouping each into maximal equal-core-key runs
+/// Walk `stream1`/`stream2` in file order, grouping each into maximal equal-core-key runs
 /// and asserting the record multiset matches within each pair of corresponding runs (see
 /// the module docs). Never resyncs: once a run boundary or stream-length mismatch is
-/// found, no further runs are compared, though both readers are drained for accurate
-/// counts.
-fn run_compare<K>(
-    mut reader1: RawBamRecordReader<File>,
-    mut reader2: RawBamRecordReader<File>,
-    extract_key: &impl Fn(&[u8]) -> K,
+/// found, no further runs are compared, though both streams are drained *through their
+/// order trackers* for accurate counts and complete per-file order verification.
+fn run_compare<K, ExtractKey, IsViolation>(
+    stream1: &mut OrderChecked<'_, K, ExtractKey, IsViolation>,
+    stream2: &mut OrderChecked<'_, K, ExtractKey, IsViolation>,
     same_core: &impl Fn(&K, &K) -> bool,
     max_diffs: usize,
-) -> Result<RunCompareOutcome> {
+) -> Result<RunCompareOutcome>
+where
+    K: Clone,
+    ExtractKey: Fn(&[u8]) -> K,
+    IsViolation: Fn(&K, &K) -> bool,
+{
     let mut out = RunCompareOutcome::default();
 
-    let mut next1 = read_keyed(&mut reader1, extract_key)?;
-    let mut next2 = read_keyed(&mut reader2, extract_key)?;
+    let mut next1 = stream1.next_keyed()?;
+    let mut next2 = stream2.next_keyed()?;
 
     let mut run_index = 0u64;
 
     loop {
-        let run1 = pull_run(&mut reader1, &mut next1, extract_key, same_core)?;
-        let run2 = pull_run(&mut reader2, &mut next2, extract_key, same_core)?;
+        let run1 = pull_run(stream1, &mut next1, same_core)?;
+        let run2 = pull_run(stream2, &mut next2, same_core)?;
 
         match (run1, run2) {
             (None, None) => break,
             (Some((_, recs1)), None) => {
-                out.bam1_count += recs1.len() as u64;
                 out.presence_mismatch = true;
                 if out.diff_details.len() < max_diffs {
                     out.diff_details.push(format!(
@@ -356,11 +454,10 @@ fn run_compare<K>(
                         recs1.len()
                     ));
                 }
-                out.bam1_count += drain_remaining(&mut reader1, &mut next1)?;
+                stream1.drain(&mut next1)?;
                 break;
             }
             (None, Some((_, recs2))) => {
-                out.bam2_count += recs2.len() as u64;
                 out.presence_mismatch = true;
                 if out.diff_details.len() < max_diffs {
                     out.diff_details.push(format!(
@@ -369,13 +466,10 @@ fn run_compare<K>(
                         recs2.len()
                     ));
                 }
-                out.bam2_count += drain_remaining(&mut reader2, &mut next2)?;
+                stream2.drain(&mut next2)?;
                 break;
             }
             (Some((k1, recs1)), Some((k2, recs2))) => {
-                out.bam1_count += recs1.len() as u64;
-                out.bam2_count += recs2.len() as u64;
-
                 if !same_core(&k1, &k2) {
                     out.presence_mismatch = true;
                     if out.diff_details.len() < max_diffs {
@@ -384,8 +478,8 @@ fn run_compare<K>(
                              bam2 groups do not align (no resync)"
                         ));
                     }
-                    out.bam1_count += drain_remaining(&mut reader1, &mut next1)?;
-                    out.bam2_count += drain_remaining(&mut reader2, &mut next2)?;
+                    stream1.drain(&mut next1)?;
+                    stream2.drain(&mut next2)?;
                     break;
                 }
 
@@ -429,38 +523,39 @@ where
     order: SortOrder,
 }
 
-/// Run both verification passes (per-file monotonic order, then run-grouped multiset
-/// equality) for a single key type `K` and assemble the combined [`SortVerifyOutcome`].
+/// Verify both files in a single synchronized streaming pass for a single key type `K` and
+/// assemble the combined [`SortVerifyOutcome`].
+///
+/// Each file is read exactly once through an [`OrderChecked`] adapter that folds the
+/// per-file monotonic-order check ([`OrderTracker`]) into the same read the run-grouped
+/// multiset comparison consumes. The per-file violation counts and first violations are
+/// read out of the two adapters' trackers after the comparison, and are complete even when
+/// the streams desynchronize because [`run_compare`] drains the tail *through* the trackers
+/// (see [`OrderChecked::drain`]).
 fn run_full_verify<K, ExtractKey, IsViolation, SameCore>(
     ctx: VerifyContext<'_, K, ExtractKey, IsViolation, SameCore>,
 ) -> Result<SortVerifyOutcome>
 where
+    K: Clone,
     ExtractKey: Fn(&[u8]) -> K,
     IsViolation: Fn(&K, &K) -> bool,
     SameCore: Fn(&K, &K) -> bool,
 {
     let VerifyContext { bam1, bam2, extract_key, is_violation, same_core, max_diffs, order } = ctx;
 
-    let verify_one = |path: &Path| -> Result<VerifySummary> {
-        let reader = open_raw_reader(path)?;
-        verify_sort_order(reader, &extract_key, &is_violation)
-    };
+    let mut stream1 = OrderChecked::new(open_raw_reader(bam1)?, &extract_key, &is_violation);
+    let mut stream2 = OrderChecked::new(open_raw_reader(bam2)?, &extract_key, &is_violation);
 
-    let (_, bam1_violations, bam1_first_violation) = verify_one(bam1)?;
-    let (_, bam2_violations, bam2_first_violation) = verify_one(bam2)?;
-
-    let reader1 = open_raw_reader(bam1)?;
-    let reader2 = open_raw_reader(bam2)?;
-    let runs = run_compare(reader1, reader2, &extract_key, &same_core, max_diffs)?;
+    let runs = run_compare(&mut stream1, &mut stream2, &same_core, max_diffs)?;
 
     Ok(SortVerifyOutcome {
         sort_order: order,
-        bam1_count: runs.bam1_count,
-        bam2_count: runs.bam2_count,
-        bam1_violations,
-        bam1_first_violation,
-        bam2_violations,
-        bam2_first_violation,
+        bam1_count: stream1.tracker.total,
+        bam2_count: stream2.tracker.total,
+        bam1_violations: stream1.tracker.violations,
+        bam1_first_violation: stream1.tracker.first_violation,
+        bam2_violations: stream2.tracker.violations,
+        bam2_first_violation: stream2.tracker.first_violation,
         run_mismatches: runs.run_mismatches,
         presence_mismatch: runs.presence_mismatch,
         header_mismatch: false,
@@ -585,13 +680,16 @@ pub fn sort_verify_compare(
 /// blindly — see `CompareMode::Content`'s doc comment).
 ///
 /// This is a separate, fail-fast entry point from `sort_verify_compare`'s own per-file
-/// violation *counting* (`run_full_verify`'s `verify_one`, part of the fuller `--command
-/// sort` report that also needs to keep going to compare run multisets even after finding
-/// violations). Both call sites route through the same underlying comparator machinery —
-/// the per-`SortOrder` key extractors (`extract_coordinate_key_inline`, `RawQuerynameKey`/
-/// `RawQuerynameLexKey::extract`, `extract_template_key_inline`), their key comparisons
-/// (`<`, `TemplateKey::core_cmp`), and [`verify_sort_order`] itself — so no comparator logic
-/// is reimplemented here, only the per-order dispatch.
+/// violation *counting* (`run_full_verify`'s [`OrderChecked`]/[`OrderTracker`] fold, part of
+/// the fuller `--command sort` report that also needs to keep going to compare run multisets
+/// even after finding violations). Both call sites route through the same underlying
+/// comparator machinery — the per-`SortOrder` key extractors
+/// (`extract_coordinate_key_inline`, `RawQuerynameKey`/`RawQuerynameLexKey::extract`,
+/// `extract_template_key_inline`) and their key comparisons (`<`, `TemplateKey::core_cmp`) —
+/// so no comparator logic is reimplemented here, only the per-order dispatch. This entry
+/// point calls [`verify_sort_order`] directly; the compare engine inlines that same
+/// per-record fold ([`OrderTracker::observe`]) so it can verify order within its single
+/// streaming pass.
 ///
 /// # Errors
 ///
