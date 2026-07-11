@@ -1,5 +1,5 @@
 [alias]
-ci-test = "nextest run --features compare,simulate,profile-adjacency --locked --no-tests=pass"
+ci-test = "nextest run --workspace --features compare,simulate,profile-adjacency --locked --no-tests=pass"
 ci-fmt = "fmt --all -- --check"
 ci-lint = "clippy --workspace --all-targets --features compare,simulate,profile-adjacency -- -D warnings -W clippy::pedantic"
 ci-tag-literals = "run --package xtask -- check-tag-literals"
