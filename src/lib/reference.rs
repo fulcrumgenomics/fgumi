@@ -277,16 +277,16 @@ impl ReferenceReader {
         Ok(self.fetch_slice(chrom, start, end)?.to_vec())
     }
 
-    /// Borrowed-slice variant of [`fetch`] that returns a reference into the
+    /// Borrowed-slice variant of [`Self::fetch`] that returns a reference into the
     /// in-memory sequence — same lookup semantics, no allocation.
     ///
-    /// Prefer this over [`fetch`] in hot loops (e.g., per-record reference
+    /// Prefer this over [`Self::fetch`] in hot loops (e.g., per-record reference
     /// access in `fgumi zipper`'s `--restore-unconverted-bases` path) where
     /// allocating a fresh `Vec<u8>` per call adds up to gigabytes of churn.
     ///
     /// # Errors
     ///
-    /// Same as [`fetch`]: returns an error if the chromosome is missing or the
+    /// Same as [`Self::fetch`]: returns an error if the chromosome is missing or the
     /// requested region exceeds the sequence length.
     pub fn fetch_slice(&self, chrom: &str, start: Position, end: Position) -> Result<&[u8]> {
         let sequence = self

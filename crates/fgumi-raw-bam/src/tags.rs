@@ -1003,7 +1003,7 @@ pub fn normalize_int_tag_to_smallest_signed(record: &mut Vec<u8>, tag: impl AsTa
 
 /// Append an integer tag using the smallest *signed* type that fits.
 ///
-/// Unlike [`append_int_tag`] (which prefers unsigned types), this uses only
+/// Unlike `append_int_tag` (which prefers unsigned types), this uses only
 /// signed types: `i8` (type `'c'`) -> `i16` (type `'s'`) -> `i32` (type `'i'`).
 /// This matches fgbio's `to_smallest_signed_int` encoding.
 #[inline]

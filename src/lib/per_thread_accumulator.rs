@@ -17,7 +17,7 @@
 //! pipeline completes, callers fold the slots into the final metric output.
 //!
 //! The slot index is assigned lazily from a process-wide atomic counter
-//! ([`SLOT_COUNTER`]) and cached in thread-local storage ([`THREAD_SLOT`]).
+//! (`SLOT_COUNTER`) and cached in thread-local storage (`THREAD_SLOT`).
 //! Indices are taken modulo the instance's slot count, so reused threads
 //! across test runs, or long-lived threads that touch multiple accumulators,
 //! remain correct — at worst two threads share a slot and merge under the same
@@ -100,7 +100,7 @@ impl<A: Default + Send> PerThreadAccumulator<A> {
 }
 
 /// Returns a process-wide unique index for the calling thread, lazily
-/// assigned from [`SLOT_COUNTER`] and cached in [`THREAD_SLOT`]. Callers map
+/// assigned from `SLOT_COUNTER` and cached in `THREAD_SLOT`. Callers map
 /// the index into their own slot range with modulo.
 #[inline]
 fn global_thread_index() -> usize {

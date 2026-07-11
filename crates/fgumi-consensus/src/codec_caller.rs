@@ -415,7 +415,7 @@ impl CodecConsensusCaller {
     /// Creates a new CODEC consensus caller with optional rejected-reads tracking.
     ///
     /// When `track_rejects` is `true`, raw BAM bytes of rejected reads are stored
-    /// and can be retrieved via [`rejected_reads`] / [`take_rejected_reads`].
+    /// and can be retrieved via [`Self::rejected_reads`] / [`Self::take_rejected_reads`].
     #[must_use]
     pub fn new_with_rejects_tracking(
         read_name_prefix: String,

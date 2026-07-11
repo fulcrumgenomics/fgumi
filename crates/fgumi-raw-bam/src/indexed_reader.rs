@@ -91,7 +91,7 @@ impl<R: Read + Seek> IndexedRawBamReader<R> {
 impl<R: Read> IndexedRawBamReader<R> {
     /// Read (and consume) the BAM header.
     ///
-    /// Must be called exactly once before [`query`], because the header
+    /// Must be called exactly once before [`Self::query`], because the header
     /// encodes the reference-sequence dictionary needed to resolve region
     /// names to reference-sequence IDs.
     ///
@@ -118,7 +118,7 @@ impl<R: Read + Seek> IndexedRawBamReader<R> {
     ///
     /// - Seek or read failures.
     /// - The index has no `last_first_record_start_position` AND
-    ///   [`read_header`](Self::read_header) has not been called — without
+    ///   [`Self::read_header`](Self::read_header) has not been called — without
     ///   either, the first-record position is unknown and falling back to
     ///   BGZF offset 0 would attempt to parse the BAM header as a record.
     pub fn query_unmapped(&mut self) -> anyhow::Result<UnmappedIter<'_, R>> {
@@ -150,7 +150,7 @@ impl<R: Read + Seek> IndexedRawBamReader<R> {
     ///
     /// # Arguments
     ///
-    /// * `header` — SAM header obtained from [`read_header`]; used to
+    /// * `header` — SAM header obtained from [`Self::read_header`]; used to
     ///   resolve the region name to a reference-sequence ID.
     /// * `region` — Genomic region to query (e.g. `"chr1:100-200".parse()`).
     ///

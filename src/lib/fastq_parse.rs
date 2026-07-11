@@ -193,7 +193,7 @@ enum FastqParseResult {
 /// Returns parsed records and leftover bytes for incomplete records.
 ///
 /// `at_eof` marks `data` as the complete, final input rather than one chunk of a
-/// stream. It is passed through to [`parse_single_fastq_record`]: only when
+/// stream. It is passed through to `parse_single_fastq_record`: only when
 /// `true` is a final record without a terminating newline accepted; when `false`
 /// such a tail is returned as leftover so an incremental caller (e.g.
 /// `FastqGrouper::add_bytes_for_stream`) can complete it with the next chunk.

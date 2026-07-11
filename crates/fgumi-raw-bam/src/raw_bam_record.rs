@@ -67,7 +67,7 @@ impl RawRecord {
 
     /// Returns the allocated capacity of the underlying byte buffer.
     ///
-    /// Useful for memory-estimation purposes (e.g., [`MemoryEstimate`] implementations).
+    /// Useful for memory-estimation purposes (e.g., `MemoryEstimate` implementations).
     #[inline]
     #[must_use]
     pub fn capacity(&self) -> usize {
