@@ -1,18 +1,17 @@
-//! Generate template-coordinate sorted BAM for group.
+//! Generate a template-coordinate sorted BAM for `fgumi group`.
 //!
-//! Uses a memory-efficient approach: sort molecule IDs by their position first,
-//! then generate records in sorted order (streaming). This avoids storing all
-//! records in memory before sorting.
+//! Records are generated in molecule order to an unsorted temp BAM, then rewritten
+//! into template-coordinate order by the canonical `fgumi-sort` engine — the same
+//! sort `fgumi sort`/`fgumi group` use and that is validated against
+//! `samtools sort --template-coordinate`.
 
-use super::sort::TemplateCoordKey;
 use crate::commands::command::Command;
 use crate::commands::common::CompressionOptions;
 use crate::commands::simulate::common::{
-    FamilySizeArgs, InsertSizeArgs, MethylationArgs, MethylationConfig, MoleculeInfo,
-    PositionDistArgs, QualityArgs, ReferenceArgs, ReferenceGenome, SimulationCommon,
-    apply_methylation_conversion, body_error_rng, build_sort_order_header_map,
-    effective_molecule_locus, generate_random_sequence, introduce_errors_inplace, pad_sequence,
-    validate_rate,
+    FamilySizeArgs, InsertSizeArgs, MethylationArgs, MethylationConfig, PositionDistArgs,
+    QualityArgs, ReferenceArgs, ReferenceGenome, SimulationCommon, apply_methylation_conversion,
+    body_error_rng, build_sort_order_header_map, generate_random_sequence,
+    introduce_errors_inplace, pad_sequence, validate_rate,
 };
 use crate::commands::simulate::region_to_bin;
 use crate::dna::reverse_complement;
@@ -25,13 +24,14 @@ use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::create_raw_bam_writer;
 use fgumi_raw_bam::{RawRecord, RawRecordView, SamBuilder, flags as raw_flags};
-use fgumi_sort::SortOrder;
+use fgumi_sort::{RawExternalSorter, SortOrder};
 use log::info;
 use noodles::sam::header::Header;
 use rand::{Rng, RngExt};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use tempfile::NamedTempFile;
 
 /// Generate template-coordinate sorted BAM with paired alignments for `fgumi group`.
 #[derive(Parser, Debug)]
@@ -222,69 +222,28 @@ impl Command for MappedReads {
         // mapped.
         let mut unmapped_rng = create_rng(self.common.seed.map(|s| s.wrapping_add(2)));
 
-        // MEMORY-EFFICIENT APPROACH: Sort molecule IDs by template-coordinate key first,
-        // then generate records in sorted order (streaming). This avoids storing all
-        // records in memory before sorting.
-        //
-        // We need to pre-compute insert_size to get pos2 for the sort key, since
-        // template-coordinate sorting considers both ends of the template.
-        info!("Computing molecule positions and sort keys...");
-        let mut molecules: Vec<MoleculeInfo> = (0..self.common.num_molecules)
-            .map(|mol_id| {
-                let seed: u64 = seed_rng.random();
-                // Draw per-molecule unmapped decision from the dedicated RNG so it
-                // stays deterministic across builds and uncorrelated with the other
-                // streams. Always draw (no short-circuit on `unmapped_fraction`) so
-                // the stream advances identically across molecules regardless of the
-                // fraction value.
-                let is_unmapped = unmapped_rng.random::<f64>() < self.unmapped_fraction;
+        // Generate molecules in `mol_id` order to an unsorted temp BAM, then let the
+        // canonical `fgumi-sort` engine produce the final template-coordinate order (see
+        // the sort pass after the write loop). This reuses the one sort implementation
+        // that `fgumi sort`/`fgumi group` use and that is validated against
+        // `samtools sort --template-coordinate`, instead of a bespoke key that has to
+        // re-derive the ordering (and previously mis-ordered reverse-R1 pairs). Because
+        // ordering is deferred to that external sort, generation can stream each molecule
+        // straight into the write loop below — no O(N) molecule-metadata buffer needed.
 
-                let sort_key = if is_unmapped {
-                    TemplateCoordKey::for_unmapped_pair(format!("mol{mol_id:08}"))
-                } else {
-                    let pos_idx = mol_id % num_positions;
-                    let (chrom_idx, local_pos) = position_table[pos_idx];
-
-                    // Key on the EFFECTIVE locus — the coordinates generation actually emits at
-                    // after the contig-end re-sample fallback — not the pre-sampled candidate, so
-                    // records stay template-coordinate sorted near contig ends (SIMU3-05). For loci
-                    // that don't trigger the fallback (the common case) this returns the pre-sampled
-                    // locus unchanged, leaving the sort key identical.
-                    let (eff_chrom_idx, eff_local_pos, insert_size) = effective_molecule_locus(
-                        seed,
-                        chrom_idx,
-                        local_pos,
-                        params.umi_length,
-                        &params.family_dist,
-                        params.min_family_size,
-                        &params.insert_model,
-                        &ref_genome,
-                    );
-
-                    // Sort key — for_f1r2_pair gives the canonical template-coordinate sort
-                    // key. This works for both F1R2 and R1F2 orientations because the
-                    // template covers the same genomic positions regardless of strand.
-                    TemplateCoordKey::for_f1r2_pair(
-                        eff_chrom_idx as i32, // real tid
-                        eff_local_pos,
-                        insert_size,
-                        String::new(), // empty mid for mapped-reads (no MI tag yet)
-                        format!("mol{mol_id:08}"),
-                    )
-                };
-
-                MoleculeInfo { mol_id, seed, sort_key, is_unmapped }
-            })
-            .collect();
-
-        // Sort molecules by template-coordinate key
-        // (matching samtools bam1_cmp_template_coordinate)
-        info!("Sorting {} molecules by template-coordinate...", molecules.len());
-        molecules.sort_unstable();
+        // Write records to an unsorted temp BAM alongside the final output; the sort
+        // pass below rewrites it into the destination in template-coordinate order.
+        let output_dir = self.output.parent().filter(|p| !p.as_os_str().is_empty());
+        let unsorted_temp = match output_dir {
+            Some(dir) => NamedTempFile::new_in(dir),
+            None => NamedTempFile::new(),
+        }
+        .context("Failed to create temporary BAM for the pre-sort write pass")?;
+        let unsorted_path = unsorted_temp.path().to_path_buf();
 
         // Set up writer with multi-threaded BGZF compression
         let mut writer = create_raw_bam_writer(
-            &self.output,
+            &unsorted_path,
             &header,
             self.threads,
             self.compression.compression_level,
@@ -296,15 +255,25 @@ impl Command for MappedReads {
         let mut truth_writer = BufWriter::new(truth_file);
         writeln!(truth_writer, "read_name\ttrue_umi\tmolecule_id\tchrom\tposition\tstrand")?;
 
-        // Generate and write records in position-sorted order (streaming)
-        info!("Generating and writing records in sorted order...");
+        // Generate and write records to the unsorted temp BAM (molecule order).
+        info!("Generating and writing records...");
         let progress = ProgressTracker::new("Processed molecules").with_interval(100_000);
         let mut total_pairs = 0usize;
 
-        for mol_info in molecules {
+        for mol_id in 0..self.common.num_molecules {
             progress.log_if_needed(1);
 
-            let pos_idx = mol_info.mol_id % num_positions;
+            // Draw this molecule's seed and unmapped decision inline (the draw order
+            // per molecule — seed, then unmapped — is exactly what the removed
+            // pre-collection pass used, so the deterministic output is unchanged).
+            // `is_unmapped` always draws from the dedicated `unmapped_rng` (no
+            // short-circuit on `unmapped_fraction`) so that stream advances identically
+            // across molecules regardless of the fraction, staying uncorrelated with the
+            // seed/UMI/sequence streams.
+            let seed: u64 = seed_rng.random();
+            let is_unmapped = unmapped_rng.random::<f64>() < self.unmapped_fraction;
+
+            let pos_idx = mol_id % num_positions;
             let (pos_chrom_idx, pos_local_pos) = position_table[pos_idx];
 
             // Generate all read pairs for this molecule. If the pre-sampled locus
@@ -312,28 +281,24 @@ impl Command for MappedReads {
             // back to sampling a new locus and returns the effective coordinates
             // so BAM records and truth rows stay in sync with the emitted sequence.
             let (pairs, chrom_idx, local_pos) = generate_molecule_reads(
-                mol_info.mol_id,
-                mol_info.seed,
+                mol_id,
+                seed,
                 pos_chrom_idx,
                 pos_local_pos,
-                mol_info.is_unmapped,
+                is_unmapped,
                 &params,
                 &ref_genome,
             );
 
             for (r1, r2, read_name, umi_str, is_top_strand) in pairs {
-                if mol_info.is_unmapped {
+                if is_unmapped {
                     // Unmapped pairs: emit R1 then R2 in the conventional order.
                     // Truth rows record unmapped-sentinel values for chrom/pos/strand
                     // so downstream validators can distinguish unmapped from mapped
                     // molecules.
                     writer.write_raw_record(r1.as_ref())?;
                     writer.write_raw_record(r2.as_ref())?;
-                    writeln!(
-                        truth_writer,
-                        "{}\t{}\t{}\t*\t*\t*",
-                        read_name, umi_str, mol_info.mol_id
-                    )?;
+                    writeln!(truth_writer, "{}\t{}\t{}\t*\t*\t*", read_name, umi_str, mol_id)?;
                 } else {
                     // Template-coordinate order: write the record whose reference start
                     // is lower first so pairs are emitted in coordinate order. R1F2
@@ -355,7 +320,7 @@ impl Command for MappedReads {
                         "{}\t{}\t{}\t{}\t{}\t{}",
                         read_name,
                         umi_str,
-                        mol_info.mol_id,
+                        mol_id,
                         ref_genome.name(chrom_idx),
                         local_pos,
                         strand_char,
@@ -370,6 +335,20 @@ impl Command for MappedReads {
         writer.finish()?;
 
         info!("Generated {total_pairs} read pairs");
+
+        // Produce the final template-coordinate order with the canonical fgumi-sort
+        // engine (the same one `fgumi sort`/`fgumi group` use), reading the unsorted
+        // temp and writing the destination. This is correct for every read orientation
+        // by construction and stays consistent with the rest of fgumi.
+        info!("Sorting into template-coordinate order...");
+        RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .threads(self.threads)
+            .output_compression(self.compression.compression_level)
+            .sort(&unsorted_path, &self.output)
+            .context("Failed to template-coordinate sort simulated reads")?;
+        // `unsorted_temp` is dropped here, removing the intermediate BAM.
+        drop(unsorted_temp);
+
         info!("Done");
 
         Ok(())
@@ -697,7 +676,6 @@ fn build_record(
 mod tests {
     use super::*;
     use crate::simulate::create_rng;
-    use rstest::rstest;
 
     /// Decode a raw BAM record into a noodles `RecordBuf` for higher-level test
     /// assertions.
@@ -1029,67 +1007,6 @@ mod tests {
             generate_molecule_reads(0, 42, 0, 500, false, &params, &ref_genome);
         // Multiple reads should be generated (family_size >= 3)
         assert!(pairs.len() >= 3, "Expected at least 3 reads, got {}", pairs.len());
-    }
-
-    /// SIMU3-05 regression: the sort-key helper `effective_molecule_locus` must return exactly the
-    /// coordinates `generate_molecule_reads` emits at — for both valid loci and loci near a contig
-    /// end that trigger the re-sample fallback. If the two ever drift, the output stops being
-    /// template-coordinate sorted.
-    #[rstest]
-    #[case::pos_start(0)]
-    #[case::pos_mid_low(500)]
-    #[case::pos_mid_high(1000)]
-    // pos 1950 is within one insert (80-120) of the 2000 bp contig end -> forces the fallback.
-    #[case::pos_near_end(1950)]
-    fn test_effective_molecule_locus_matches_generation(#[case] local_pos: usize) {
-        use std::io::Write;
-        use tempfile::NamedTempFile;
-
-        let mut fasta = NamedTempFile::new().unwrap();
-        writeln!(fasta, ">chr1").unwrap();
-        fasta.write_all(&b"ACGT".repeat(500)).unwrap(); // 2000 bp
-        writeln!(fasta).unwrap();
-        fasta.flush().unwrap();
-        let genome = ReferenceGenome::load(fasta.path()).unwrap();
-
-        let params = GenerationParams {
-            read_length: 50,
-            umi_length: 8,
-            mapq: 60,
-            min_family_size: 1,
-            quality_model: crate::simulate::PositionQualityModel::new(
-                10, 25, 37, 100, 0.08, 2, 0.0,
-            ),
-            quality_bias: crate::simulate::ReadPairQualityBias::new(0),
-            family_dist: crate::simulate::FamilySizeDistribution::log_normal(5.0, 1.0),
-            insert_model: crate::simulate::InsertSizeModel::new(100.0, 10.0, 80, 120),
-            methylation: MethylationConfig {
-                mode: fgumi_consensus::MethylationMode::Disabled,
-                cpg_methylation_rate: 0.75,
-                conversion_rate: 0.98,
-            },
-            error_rate: 0.0,
-        };
-
-        for seed in 0u64..8 {
-            let (_pairs, gen_chrom, gen_pos) =
-                generate_molecule_reads(0, seed, 0, local_pos, false, &params, &genome);
-            let (eff_chrom, eff_pos, _insert) = effective_molecule_locus(
-                seed,
-                0,
-                local_pos,
-                params.umi_length,
-                &params.family_dist,
-                params.min_family_size,
-                &params.insert_model,
-                &genome,
-            );
-            assert_eq!(
-                (gen_chrom, gen_pos),
-                (eff_chrom, eff_pos),
-                "sort-key helper must match generation for seed={seed} pos={local_pos}"
-            );
-        }
     }
 
     /// SIMU3-01 wiring: with `error_rate = 1.0` every read-body base is substituted, so both R1 and

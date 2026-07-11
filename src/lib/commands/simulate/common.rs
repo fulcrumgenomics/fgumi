@@ -1,6 +1,5 @@
 //! Shared CLI arguments and utilities for simulation commands.
 
-use super::sort::TemplateCoordKey;
 use crate::commands::common::MethylationModeArg;
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -586,51 +585,6 @@ pub(super) fn body_error_rng(read_name: &str, is_first_mate: bool) -> rand::rngs
     crate::simulate::create_rng(Some(hash))
 }
 
-/// Replay a mapped molecule's RNG stream up to the reference-locus sampling step and return the
-/// EFFECTIVE `(chrom_idx, local_pos, insert_size)` — the coordinates at which the molecule's reads
-/// are actually emitted.
-///
-/// The mapped/grouped generators pre-sample a candidate locus, but when it is too close to a contig
-/// end for the molecule's drawn insert size, generation re-samples a *new* locus. The
-/// template-coordinate sort-key pre-pass must key on this same effective locus; otherwise records
-/// are emitted out of order and the advertised `SS:template-coordinate` is violated (SIMU3-05). This
-/// walks the exact RNG sequence generation uses — UMI bases, family size, insert size, the strand
-/// coin flip, then the `sequence_at` / `sample_sequence` fallback — so the returned locus is
-/// identical to the one generation derives for the same `seed`. When the pre-sampled locus is valid
-/// (the common case) it is returned unchanged, so the sort key is unchanged for those molecules.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn effective_molecule_locus(
-    seed: u64,
-    chrom_idx: usize,
-    local_pos: usize,
-    umi_length: usize,
-    family_dist: &crate::simulate::FamilySizeDistribution,
-    min_family_size: usize,
-    insert_model: &crate::simulate::InsertSizeModel,
-    ref_genome: &ReferenceGenome,
-) -> (usize, usize, usize) {
-    let mut rng = crate::simulate::create_rng(Some(seed));
-    // UMI bases: `generate_random_sequence` draws `umi_length` times.
-    for _ in 0..umi_length {
-        let _: usize = rng.random_range(0..4);
-    }
-    // Family size, then insert size.
-    let _ = family_dist.sample(&mut rng, min_family_size);
-    let insert_size = insert_model.sample(&mut rng);
-    // Strand coin flip (drawn before the locus fallback in generation).
-    let _: bool = rng.random();
-    // Locus fallback: reuse the pre-sampled locus when it yields a valid template, otherwise
-    // re-sample exactly as generation does.
-    let (eff_chrom, eff_pos) = match ref_genome.sequence_at(chrom_idx, local_pos, insert_size) {
-        Some(_) => (chrom_idx, local_pos),
-        None => match ref_genome.sample_sequence(insert_size, &mut rng) {
-            Some((c, p, _)) => (c, p),
-            None => (chrom_idx, local_pos),
-        },
-    };
-    (eff_chrom, eff_pos, insert_size)
-}
-
 /// Pad a sequence to the target length with random bases, or truncate if too long.
 pub(super) fn pad_sequence(mut seq: Vec<u8>, target_len: usize, rng: &mut impl Rng) -> Vec<u8> {
     while seq.len() < target_len {
@@ -711,39 +665,6 @@ fn is_conversion_target(
         }
     }
 }
-
-/// Lightweight molecule info for position-first sorting.
-#[derive(Debug)]
-pub(super) struct MoleculeInfo {
-    pub mol_id: usize,
-    pub seed: u64,
-    pub sort_key: TemplateCoordKey,
-    /// Whether this molecule should be emitted as entirely unmapped.
-    ///
-    /// Set by `mapped-reads` when `--unmapped-fraction > 0`; other simulate
-    /// subcommands leave this `false`.
-    pub is_unmapped: bool,
-}
-
-impl Ord for MoleculeInfo {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.sort_key.cmp(&other.sort_key)
-    }
-}
-
-impl PartialOrd for MoleculeInfo {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for MoleculeInfo {
-    fn eq(&self, other: &Self) -> bool {
-        self.sort_key == other.sort_key
-    }
-}
-
-impl Eq for MoleculeInfo {}
 
 #[cfg(test)]
 mod tests {
@@ -1150,46 +1071,6 @@ mod tests {
         let _ = args_lower
             .to_family_size_distribution()
             .expect("lowercase distribution name should be accepted");
-    }
-
-    fn make_molecule_info(mol_id: usize, tid1: i32, pos1: i64) -> MoleculeInfo {
-        MoleculeInfo {
-            mol_id,
-            seed: 0,
-            sort_key: TemplateCoordKey {
-                tid1,
-                tid2: 0,
-                pos1,
-                pos2: 0,
-                neg1: false,
-                neg2: false,
-                mid: String::new(),
-                name: String::new(),
-                is_upper_of_pair: false,
-            },
-            is_unmapped: false,
-        }
-    }
-
-    #[test]
-    fn test_molecule_info_ordering() {
-        let a = make_molecule_info(0, 1, 100);
-        let b = make_molecule_info(1, 1, 200);
-        let c = make_molecule_info(2, 2, 50);
-
-        // Same tid, earlier position comes first
-        assert!(a < b);
-        assert!(b > a);
-        // Higher tid comes later regardless of position
-        assert!(b < c);
-
-        // PartialOrd consistent with Ord
-        assert_eq!(a.partial_cmp(&b), Some(std::cmp::Ordering::Less));
-
-        // Equal sort keys are equal
-        let a2 = make_molecule_info(99, 1, 100);
-        assert_eq!(a, a2);
-        assert_eq!(a.cmp(&a2), std::cmp::Ordering::Equal);
     }
 
     // ========================================================================
@@ -1814,28 +1695,5 @@ mod tests {
             "100 positions should span at least 2 chromosomes, got {}",
             unique_chroms.len()
         );
-    }
-
-    /// SIMU3-05: `effective_molecule_locus` returns a valid pre-sampled locus unchanged, but
-    /// re-samples to a valid locus when the pre-sampled one cannot fit the drawn insert size (as
-    /// happens near a contig end), so the sort-key pre-pass keys on the emitted coordinates.
-    #[test]
-    fn test_effective_molecule_locus_passthrough_and_fallback() {
-        let fasta = write_multi_contig_fasta();
-        let genome = ReferenceGenome::load(fasta.path()).unwrap(); // chr1 is 2000bp
-        let family = crate::simulate::FamilySizeDistribution::log_normal(3.0, 1.0);
-        let insert = crate::simulate::InsertSizeModel::new(100.0, 10.0, 50, 200);
-
-        // A valid pre-sampled locus (chr1 start) is returned unchanged.
-        let (c0, p0, ins0) = effective_molecule_locus(1, 0, 0, 8, &family, 1, &insert, &genome);
-        assert_eq!((c0, p0), (0, 0), "valid locus should pass through unchanged");
-        assert!(genome.sequence_at(c0, p0, ins0).is_some());
-
-        // A locus near the end of chr1 cannot fit any insert >= 50, so it must be re-sampled to a
-        // valid locus (and the same seed draws the same insert size, so ins matches).
-        let (c1, p1, ins1) = effective_molecule_locus(1, 0, 1990, 8, &family, 1, &insert, &genome);
-        assert_eq!(ins0, ins1, "same seed draws the same insert size");
-        assert_ne!((c1, p1), (0, 1990), "invalid near-end locus should be re-sampled");
-        assert!(genome.sequence_at(c1, p1, ins1).is_some(), "re-sampled locus must be valid");
     }
 }
