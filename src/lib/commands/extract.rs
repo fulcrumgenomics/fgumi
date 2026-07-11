@@ -21,6 +21,7 @@ use crate::commands::common::{
 use crate::fastq::FastqSegment;
 use crate::fastq::FastqSet;
 use crate::fastq::ReadSetIterator;
+use crate::fastq_parse::strip_read_suffix;
 use crate::grouper::FastqTemplate;
 use crate::logging::OperationTimer;
 use crate::sam::SamTag;
@@ -735,9 +736,9 @@ impl Extract {
     /// <https://support.illumina.com/help/BaseSpace_OLH_009008/Content/Source/Informatics/BS/FileFormat_FASTQ-files_swBS.htm>.
     ///
     /// An old-style Casava (<1.8) `/1` / `/2` read-number suffix is stripped from
-    /// the returned name (see [`strip_read_number_suffix`]) so both mates of a pair
-    /// share an identical QNAME, matching fgbio's `FastqSource`. Stripping happens
-    /// before UMI extraction so a read-number digit never leaks into the UMI.
+    /// the returned name (see [`strip_read_suffix`](crate::fastq_parse::strip_read_suffix))
+    /// so both mates of a pair share an identical QNAME, matching fgbio's `FastqSource`.
+    /// Stripping happens before UMI extraction so a read-number digit never leaks into the UMI.
     ///
     /// Some demultiplexers fold additional information (e.g. the sample index) into
     /// the colon-separated portion of the read name, producing names with 9+ fields
@@ -762,15 +763,13 @@ impl Extract {
         // Remove @ prefix if present
         let name_bytes = if header.starts_with(b"@") { &header[1..] } else { header };
 
-        // Split on space to get just the name part
-        let name_part = name_bytes.find_byte(b' ').map_or(name_bytes, |pos| &name_bytes[..pos]);
-
-        // Strip an old-style Casava (<1.8) `/1` / `/2` read-number suffix so both
-        // mates of a pair share an identical QNAME (required by the SAM spec).
-        // Matches fgbio's `FastqSource`: only `/` followed by a single digit is
-        // removed. Done before UMI extraction so the digit never leaks into the
-        // UMI's trailing `:` field.
-        let name_part = strip_read_number_suffix(name_part);
+        // Strip a trailing space comment and an old-style Casava (<1.8) `/1` / `/2`
+        // read-number suffix so both mates of a pair share an identical QNAME (required by
+        // the SAM spec). Matches fgbio's `FastqSource`: only `/` followed by a single digit
+        // is removed. Done before UMI extraction so a read-number digit never leaks into the
+        // UMI's trailing `:` field. This is the shared helper the paired-FASTQ sync
+        // validation also uses, keeping the written QNAME and validation in lock-step.
+        let name_part = strip_read_suffix(name_bytes);
 
         if !extract_umis {
             return Ok((name_part.to_vec(), None));
@@ -881,14 +880,14 @@ impl Extract {
         };
 
         // Strip space comments and /1, /2 suffixes for comparison
-        let first_name_part = strip_read_suffix_extract(first_name);
+        let first_name_part = strip_read_suffix(first_name);
 
         // Check that all other read sets have the same name
         for (i, read_set) in read_sets.iter().enumerate().skip(1) {
             let header = &read_set.header;
             let name = if header.starts_with(b"@") { &header[1..] } else { header.as_slice() };
 
-            let name_part = strip_read_suffix_extract(name);
+            let name_part = strip_read_suffix(name);
 
             if name_part != first_name_part {
                 bail!(
@@ -1171,9 +1170,9 @@ impl Extract {
 
                 // Validate read names match (synchronized mode defers this from Group step)
                 if template.records.len() >= 2 {
-                    let base_name = strip_read_suffix_extract(template.records[0].name());
+                    let base_name = strip_read_suffix(template.records[0].name());
                     for (i, record) in template.records.iter().enumerate().skip(1) {
-                        let other_base = strip_read_suffix_extract(record.name());
+                        let other_base = strip_read_suffix(record.name());
                         if base_name != other_base {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
@@ -1487,51 +1486,6 @@ impl Command for Extract {
         timer.log_completion(records_written);
         Ok(())
     }
-}
-
-/// Strip an old-style Casava (<1.8) `/<digit>` read-number suffix from a read name.
-///
-/// This is applied to the QNAME written to the unmapped BAM, mirroring fgbio's
-/// `FastqSource` header parsing: only a trailing `/` followed by a single digit is
-/// removed (e.g. `read/1` -> `read`). Stripping is intentionally conservative — `.`, `_`,
-/// and `:` are never treated as read-number separators because they can appear in
-/// legitimate read names (e.g. `sample_1`), so stripping them from the written QNAME could
-/// corrupt data. [`strip_read_suffix_extract`] applies this same suffix logic (after also
-/// stripping a trailing space comment) when validating that read names match across
-/// synchronized FASTQs, keeping validation and the written QNAME in lock-step.
-///
-/// Returns a slice of `name` without the suffix, or `name` unchanged if it has no
-/// `/<digit>` suffix.
-fn strip_read_number_suffix(name: &[u8]) -> &[u8] {
-    if name.len() >= 2 {
-        let last = name[name.len() - 1];
-        let sep = name[name.len() - 2];
-        if sep == b'/' && last.is_ascii_digit() {
-            return &name[..name.len() - 2];
-        }
-    }
-    name
-}
-
-/// Strip a trailing space comment and an old-style `/<digit>` read-number suffix from a
-/// read name, for validating that reads match across synchronized FASTQs.
-///
-/// This mirrors the QNAME write path (see [`strip_read_number_suffix`]) so that any pair
-/// of names accepted by validation is guaranteed to be written with an identical BAM
-/// QNAME. Only `/` followed by a single digit is treated as a read-number suffix; `.`,
-/// `_`, and `:` separators are preserved because they can appear in legitimate read names
-/// (e.g. `sample_1`), matching fgbio's `FastqSource`. Narrowing this to `/` alone keeps
-/// validation and the written QNAME in lock-step: a `read_1`/`read_2` pair is now
-/// correctly reported as out of sync rather than passing validation and being written
-/// with two different QNAMEs.
-///
-/// Returns a slice of `name` without the comment or read-number suffix.
-fn strip_read_suffix_extract(name: &[u8]) -> &[u8] {
-    // First strip any space-separated comment suffix (e.g., "read/1 extra" -> "read/1").
-    let name = name.iter().position(|&b| b == b' ').map_or(name, |pos| &name[..pos]);
-
-    // Then strip the same conservative `/<digit>` read-number suffix as the write path.
-    strip_read_number_suffix(name)
 }
 
 /// Returns true if `b` is a valid SAM UMI character (`ACGTN-`), matching fgbio's
@@ -2645,49 +2599,6 @@ mod tests {
         assert_eq!(umi, Some(b"ACGT".to_vec()));
     }
 
-    #[rstest]
-    // Strips a trailing `/<digit>` read-number suffix, matching the write path.
-    #[case::slash_one(b"read/1".as_slice(), b"read".as_slice())]
-    #[case::slash_two(b"read/2".as_slice(), b"read".as_slice())]
-    #[case::slash_any_digit(b"read/3".as_slice(), b"read".as_slice())]
-    // Strips a trailing space comment (before the read-number suffix).
-    #[case::space_comment(b"read 1:N:0:ACGT".as_slice(), b"read".as_slice())]
-    #[case::space_comment_then_slash(b"read/1 1:N:0:ACGT".as_slice(), b"read".as_slice())]
-    // Preserves `.`/`_`/`:` separators — they are not read-number delimiters and can
-    // appear in legitimate names, so validation must keep them (in lock-step with the
-    // write path, which also preserves them).
-    #[case::underscore(b"sample_1".as_slice(), b"sample_1".as_slice())]
-    #[case::dot(b"foo.2".as_slice(), b"foo.2".as_slice())]
-    #[case::colon(b"bar:1".as_slice(), b"bar:1".as_slice())]
-    // Preserves a multi-digit or non-digit `/` suffix.
-    #[case::slash_multi_digit(b"read/12".as_slice(), b"read/12".as_slice())]
-    #[case::slash_non_digit(b"read/x".as_slice(), b"read/x".as_slice())]
-    fn test_strip_read_suffix_extract(#[case] name: &[u8], #[case] expected: &[u8]) {
-        assert_eq!(strip_read_suffix_extract(name), expected);
-    }
-
-    proptest::proptest! {
-        /// Validation and the written QNAME must agree on the read-number suffix so that
-        /// any pair accepted by validation is written with an identical QNAME.
-        /// `strip_read_suffix_extract` first strips a trailing space comment, then delegates
-        /// to `strip_read_number_suffix`, so for any input *without* a space the two helpers
-        /// must return the identical slice. Generating arbitrary byte strings (not just
-        /// UTF-8) exercises trailing slashes, embedded digits, `.`/`_`/`:` separators, empty
-        /// names, and multi-byte edge cases that a fixed table misses.
-        #[test]
-        fn test_strip_read_suffix_extract_matches_write_path(
-            name in proptest::collection::vec(0u8..=255, 0..20),
-        ) {
-            // The invariant only holds for space-free inputs: the space-comment strip is the
-            // one step the write path performs separately before this helper is reached.
-            proptest::prop_assume!(!name.contains(&b' '));
-            proptest::prop_assert_eq!(
-                strip_read_suffix_extract(&name),
-                strip_read_number_suffix(&name),
-            );
-        }
-    }
-
     #[test]
     #[should_panic(expected = "Read names do not match")]
     fn test_extract_fails_on_underscore_read_number_suffix() {
@@ -2743,7 +2654,7 @@ mod tests {
         // as required by the SAM spec. Guards the wiring from
         // `extract_read_name_and_umi` through to the written BAM QNAME in both the
         // single-threaded (`make_raw_records`) and threaded
-        // (`make_raw_records_static` + `strip_read_suffix_extract`) record-building
+        // (`make_raw_records_static` + `strip_read_suffix`) record-building
         // paths.
         let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("SRR001.1/1", "AAAAAAAAAA", "==========")]);
