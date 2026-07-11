@@ -1025,6 +1025,30 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("out of sync"));
     }
 
+    #[test]
+    fn test_fastq_grouper_rejects_mismatched_underscore_pair() {
+        // Behavior tradeoff: read-name sync-validation strips only a trailing
+        // '/' + single digit (fgbio FastqSource parity), NOT '_1'/'_2'. So a
+        // genuinely mismatched pair — `read_1` on stream 0 and `read_2` on
+        // stream 1 — no longer collapses to a shared base name and is correctly
+        // rejected as out of sync. Under the previous over-lenient rule the
+        // '_1'/'_2' suffixes were stripped, both became `read`, and the mismatch
+        // was silently accepted. The cost of this correctness fix is that
+        // non-standard paired FASTQs legitimately using '_1'/'_2' suffixes are
+        // now rejected too — this matches fgbio, which also rejects them.
+        let mut grouper = FastqGrouper::new(2);
+        grouper
+            .add_bytes_for_stream(0, b"@read_1\nACGT\n+\nIIII\n")
+            .expect("add_bytes_for_stream failed");
+        grouper
+            .add_bytes_for_stream(1, b"@read_2\nTGCA\n+\nJJJJ\n")
+            .expect("add_bytes_for_stream failed");
+
+        let result = grouper.drain_complete_templates();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("out of sync"));
+    }
+
     // ========================================================================
     // RecordPositionGrouper tests
     // ========================================================================
