@@ -494,6 +494,49 @@ pub fn unclipped_end(record: &RecordBuf) -> Option<usize> {
     Some(start + ref_len.saturating_sub(1) + trailing)
 }
 
+/// Gets the un-*soft*-clipped start position of a read (alignment start minus leading
+/// **soft** clips only; hard clips are ignored because the hard-clipped bases are
+/// physically absent from the read).
+///
+/// This matches fgbio's `SamRecord.unSoftClippedStart`, used when bounding a mate's
+/// window for `clipExtendingPastMate` (see fgbio `SamRecordClipper`). Contrast
+/// [`unclipped_start`], which includes hard clips (htsjdk `getUnclippedStart`).
+///
+/// Returns `None` for unmapped reads.
+#[must_use]
+pub fn unsoftclipped_start(record: &RecordBuf) -> Option<usize> {
+    if record.flags().is_unmapped() {
+        return None;
+    }
+    let start = usize::from(record.alignment_start()?);
+    let leading = leading_soft_clipping(&cigar_to_ops(record));
+    Some(start.saturating_sub(leading))
+}
+
+/// Gets the un-*soft*-clipped end position of a read (alignment end plus trailing
+/// **soft** clips only; hard clips are ignored because the hard-clipped bases are
+/// physically absent from the read).
+///
+/// This matches fgbio's `SamRecord.unSoftClippedEnd`. Contrast [`unclipped_end`],
+/// which includes hard clips (htsjdk `getUnclippedEnd`).
+///
+/// Returns `None` for unmapped reads or records with no CIGAR ops (matching the raw
+/// sibling [`unsoftclipped_end_raw`]).
+#[must_use]
+pub fn unsoftclipped_end(record: &RecordBuf) -> Option<usize> {
+    if record.flags().is_unmapped() {
+        return None;
+    }
+    let start = usize::from(record.alignment_start()?);
+    let ops = cigar_to_ops(record);
+    if ops.is_empty() {
+        return None;
+    }
+    let ref_len = reference_length(&record.cigar());
+    let trailing = trailing_soft_clipping(&ops);
+    Some(start + ref_len.saturating_sub(1) + trailing)
+}
+
 /// Gets the unclipped 5' position of a read.
 ///
 /// For forward strand reads, returns the unclipped start position.
@@ -771,16 +814,43 @@ pub fn unclipped_end_raw(bam: &[u8]) -> Option<usize> {
     if cigar_ops.is_empty() {
         return None;
     }
-    let ref_len: usize = cigar_ops
-        .iter()
-        .map(|&op| {
-            let t = op & 0xF;
-            let len = (op >> 4) as usize;
-            if consumes_ref(t) { len } else { 0 }
-        })
-        .sum();
+    let ref_len = cigar_reference_length_raw(&cigar_ops);
     let trailing = trailing_clipping_raw(&cigar_ops);
     // alignment_end = start + ref_len - 1; unclipped_end = alignment_end + trailing
+    Some(start + ref_len.saturating_sub(1) + trailing)
+}
+
+/// Raw-byte sibling of [`unsoftclipped_start`]: alignment start minus leading **soft**
+/// clips only (hard clips ignored). Matches fgbio `SamRecord.unSoftClippedStart`.
+///
+/// Returns `None` for unmapped reads.
+#[must_use]
+pub fn unsoftclipped_start_raw(bam: &[u8]) -> Option<usize> {
+    if RawRecordView::new(bam).flags() & flags::UNMAPPED != 0 {
+        return None;
+    }
+    let start = alignment_start_from_raw(bam)?;
+    let cigar_ops = get_cigar_ops(bam);
+    let leading = leading_soft_clipping_raw(&cigar_ops);
+    Some(start.saturating_sub(leading))
+}
+
+/// Raw-byte sibling of [`unsoftclipped_end`]: alignment end plus trailing **soft**
+/// clips only (hard clips ignored). Matches fgbio `SamRecord.unSoftClippedEnd`.
+///
+/// Returns `None` for unmapped reads or records with no CIGAR ops.
+#[must_use]
+pub fn unsoftclipped_end_raw(bam: &[u8]) -> Option<usize> {
+    if RawRecordView::new(bam).flags() & flags::UNMAPPED != 0 {
+        return None;
+    }
+    let start = alignment_start_from_raw(bam)?;
+    let cigar_ops = get_cigar_ops(bam);
+    if cigar_ops.is_empty() {
+        return None;
+    }
+    let ref_len = cigar_reference_length_raw(&cigar_ops);
+    let trailing = trailing_soft_clipping_raw(&cigar_ops);
     Some(start + ref_len.saturating_sub(1) + trailing)
 }
 
@@ -1637,6 +1707,51 @@ mod tests {
         assert_eq!(unclipped_end(&read), Some(149));
     }
 
+    // R2-CLIP-03: un-*soft*-clipped positions ignore hard clips (fgbio `unSoftClipped*`),
+    // unlike `unclipped_*` (htsjdk `getUnclipped*`, which counts hard clips too).
+    #[test]
+    fn test_unsoftclipped_start_ignores_leading_hard_clip() {
+        // 5H10S35M at position 100: unclipped_start = 100 - 5 - 10 = 85 (counts hard);
+        // unsoftclipped_start = 100 - 10 = 90 (soft only).
+        let read = create_cigar_test_read("hs", 100, "5H10S35M");
+        assert_eq!(unclipped_start(&read), Some(85));
+        assert_eq!(unsoftclipped_start(&read), Some(90));
+    }
+
+    #[test]
+    fn test_unsoftclipped_end_ignores_trailing_hard_clip() {
+        // 35M10S5H at position 100: alignment_end = 134;
+        // unclipped_end = 134 + 10 + 5 = 149 (counts hard);
+        // unsoftclipped_end = 134 + 10 = 144 (soft only).
+        let read = create_cigar_test_read("sh", 100, "35M10S5H");
+        assert_eq!(unclipped_end(&read), Some(149));
+        assert_eq!(unsoftclipped_end(&read), Some(144));
+    }
+
+    #[test]
+    fn test_unsoftclipped_no_hard_matches_unclipped() {
+        // With no hard clips, soft-only equals the full unclipped positions.
+        let read = create_cigar_test_read("soft", 100, "10S30M10S");
+        assert_eq!(unsoftclipped_start(&read), unclipped_start(&read));
+        assert_eq!(unsoftclipped_end(&read), unclipped_end(&read));
+    }
+
+    #[test]
+    fn test_unsoftclipped_unmapped_returns_none() {
+        let read = RecordBuilder::new().name("u").sequence("ACGT").flags(Flags::UNMAPPED).build();
+        assert_eq!(unsoftclipped_start(&read), None);
+        assert_eq!(unsoftclipped_end(&read), None);
+    }
+
+    #[test]
+    fn test_unsoftclipped_end_empty_cigar_returns_none() {
+        // A mapped record with no CIGAR ops has no end position: the typed function must
+        // return None, matching the raw sibling `unsoftclipped_end_raw` (not `Some(start)`).
+        let read = create_cigar_test_read("empty", 100, "");
+        assert!(read.cigar().as_ref().is_empty(), "test setup: CIGAR must be empty");
+        assert_eq!(unsoftclipped_end(&read), None);
+    }
+
     #[test]
     fn test_unclipped_five_prime_forward_strand() {
         // Forward strand: 5' is at unclipped_start
@@ -1883,6 +1998,33 @@ mod tests {
         let record = RecordBuilder::new().name("u").sequence("ACGT").flags(Flags::UNMAPPED).build();
         let raw = to_raw(&record);
         assert_eq!(unclipped_end_raw(&raw), None);
+    }
+
+    // R2-CLIP-03 (raw): soft-only unclipped positions ignore hard clips.
+    #[test]
+    fn test_unsoftclipped_start_raw_ignores_hard_clip() {
+        let record = create_cigar_test_read("hs", 100, "5H10S35M");
+        let raw = to_raw(&record);
+        assert_eq!(unsoftclipped_start_raw(&raw), unsoftclipped_start(&record));
+        assert_eq!(unsoftclipped_start_raw(&raw), Some(90)); // 100 - 10S (hard ignored)
+        assert_eq!(unclipped_start_raw(&raw), Some(85)); // 100 - 5H - 10S
+    }
+
+    #[test]
+    fn test_unsoftclipped_end_raw_ignores_hard_clip() {
+        let record = create_cigar_test_read("sh", 100, "35M10S5H");
+        let raw = to_raw(&record);
+        assert_eq!(unsoftclipped_end_raw(&raw), unsoftclipped_end(&record));
+        assert_eq!(unsoftclipped_end_raw(&raw), Some(144)); // 134 + 10S (hard ignored)
+        assert_eq!(unclipped_end_raw(&raw), Some(149)); // 134 + 10S + 5H
+    }
+
+    #[test]
+    fn test_unsoftclipped_raw_unmapped_returns_none() {
+        let record = RecordBuilder::new().name("u").sequence("ACGT").flags(Flags::UNMAPPED).build();
+        let raw = to_raw(&record);
+        assert_eq!(unsoftclipped_start_raw(&raw), None);
+        assert_eq!(unsoftclipped_end_raw(&raw), None);
     }
 
     // =========================================================================

@@ -871,11 +871,13 @@ impl SamRecordClipper {
             return (0, 0);
         }
 
-        // Get unclipped positions for both reads
-        let r1_unclipped_start = Self::unclipped_start(r1);
-        let r1_unclipped_end = Self::unclipped_end(r1);
-        let r2_unclipped_start = Self::unclipped_start(r2);
-        let r2_unclipped_end = Self::unclipped_end(r2);
+        // Bound each read's window by the mate's *un-soft-clipped* span (soft clips only;
+        // hard-clipped bases are physically absent), matching fgbio's use of
+        // `mate.unSoftClippedStart` / `unSoftClippedEnd` in `clipExtendingPastMateEnds`.
+        let r1_unclipped_start = record_utils::unsoftclipped_start(r1);
+        let r1_unclipped_end = record_utils::unsoftclipped_end(r1);
+        let r2_unclipped_start = record_utils::unsoftclipped_start(r2);
+        let r2_unclipped_end = record_utils::unsoftclipped_end(r2);
 
         let (Some(r1_start), Some(r1_end), Some(r2_start), Some(r2_end)) =
             (r1_unclipped_start, r1_unclipped_end, r2_unclipped_start, r2_unclipped_end)
@@ -921,19 +923,6 @@ impl SamRecordClipper {
             // Negative strand: clip from start of read (5' in sequencing order, which is 3' in read orientation)
             self.clip_start_of_read(rec, total_clipped_bases)
         }
-    }
-
-    /// Get unclipped start position (delegates to `record_utils`)
-    // RecordBuf kept: thin wrapper over record_utils::unclipped_start which uses noodles
-    // typed flags and Position; serves RecordBuf callers within this module.
-    fn unclipped_start(rec: &RecordBuf) -> Option<usize> {
-        record_utils::unclipped_start(rec)
-    }
-
-    /// Get unclipped end position (delegates to `record_utils`)
-    // RecordBuf kept: same as unclipped_start; delegates to record_utils::unclipped_end.
-    fn unclipped_end(rec: &RecordBuf) -> Option<usize> {
-        record_utils::unclipped_end(rec)
     }
 
     /// Count leading soft clips
@@ -2108,10 +2097,12 @@ impl RawRecordClipper {
             return (0, 0);
         }
 
-        let r1_unclipped_start = crate::record_utils::unclipped_start_raw(r1.as_ref());
-        let r1_unclipped_end = crate::record_utils::unclipped_end_raw(r1.as_ref());
-        let r2_unclipped_start = crate::record_utils::unclipped_start_raw(r2.as_ref());
-        let r2_unclipped_end = crate::record_utils::unclipped_end_raw(r2.as_ref());
+        // Soft-only mate window (see the RecordBuf sibling above and fgbio
+        // `SamRecordClipper.clipExtendingPastMateEnds`); hard-clipped bases are absent.
+        let r1_unclipped_start = crate::record_utils::unsoftclipped_start_raw(r1.as_ref());
+        let r1_unclipped_end = crate::record_utils::unsoftclipped_end_raw(r1.as_ref());
+        let r2_unclipped_start = crate::record_utils::unsoftclipped_start_raw(r2.as_ref());
+        let r2_unclipped_end = crate::record_utils::unsoftclipped_end_raw(r2.as_ref());
 
         let (Some(r1_start), Some(r1_end), Some(r2_start), Some(r2_end)) =
             (r1_unclipped_start, r1_unclipped_end, r2_unclipped_start, r2_unclipped_end)
