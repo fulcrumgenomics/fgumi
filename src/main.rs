@@ -211,10 +211,10 @@ fn main() -> Result<()> {
     let result = args.subcommand.execute(&command_line);
 
     #[cfg(feature = "compare")]
-    if let Err(ref e) = result {
-        if e.downcast_ref::<CompareMismatch>().is_some() {
-            std::process::exit(1);
-        }
+    if let Err(ref e) = result
+        && e.downcast_ref::<CompareMismatch>().is_some()
+    {
+        std::process::exit(1);
     }
 
     result

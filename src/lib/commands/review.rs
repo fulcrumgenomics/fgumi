@@ -469,15 +469,15 @@ impl Review {
             // absent or `<= maf`. `!(maf <= self.maf)` reproduces that: it drops
             // both `maf > self.maf` and a NaN MAF (e.g. AD summing to zero, where
             // fgbio computes `1 - 0/0 = NaN` and `NaN <= maf` is false).
-            if let Some(ref sname) = sample_name {
-                if let Some(maf) = Self::calculate_maf(&record, &header, sname) {
-                    // Keep only when `maf <= threshold`; a MAF above the threshold
-                    // *and* a NaN MAF (partial comparison is false) both fall through
-                    // to `continue`, matching fgbio's `forall(_ <= maf)`.
-                    let within_threshold = maf <= self.maf;
-                    if !within_threshold {
-                        continue;
-                    }
+            if let Some(ref sname) = sample_name
+                && let Some(maf) = Self::calculate_maf(&record, &header, sname)
+            {
+                // Keep only when `maf <= threshold`; a MAF above the threshold
+                // *and* a NaN MAF (partial comparison is false) both fall through
+                // to `continue`, matching fgbio's `forall(_ <= maf)`.
+                let within_threshold = maf <= self.maf;
+                if !within_threshold {
+                    continue;
                 }
             }
 
@@ -700,28 +700,26 @@ impl Review {
         // Read the typed sample value directly — a `format!("{value:?}")` Debug parse
         // never matches noodles' `Float(..)` / `Array(Float(..))` rendering, so it
         // silently fails and disables MAF filtering entirely.
-        if let Some(af_idx) = keys.as_ref().iter().position(|k| k == "AF") {
-            if let Some(Some(value)) = sample.values().get(af_idx) {
-                if let Some(af) = Self::value_as_f64(value) {
-                    return Some(af);
-                }
-            }
+        if let Some(af_idx) = keys.as_ref().iter().position(|k| k == "AF")
+            && let Some(Some(value)) = sample.values().get(af_idx)
+            && let Some(af) = Self::value_as_f64(value)
+        {
+            return Some(af);
         }
 
         // Fall back to AD (allele depth), matching fgbio's `gt.getAD` → `1 - ad(0)/ad.sum`.
-        if let Some(ad_idx) = keys.as_ref().iter().position(|k| k == "AD") {
-            if let Some(Some(Value::Array(Array::Integer(depths)))) = sample.values().get(ad_idx) {
-                if !depths.is_empty() {
-                    // fgbio: `1 - ad(0) / ad.sum.toDouble`. When AD sums to zero this
-                    // is `1 - 0/0 = NaN`; the caller's `!(maf <= threshold)` check
-                    // then excludes the variant, matching fgbio's `forall(_ <= maf)`.
-                    // Missing (`.`) AD entries are treated as 0 (htsjdk's AD is a
-                    // dense int array).
-                    let total: i32 = depths.iter().map(|d| d.unwrap_or(0)).sum();
-                    let ref_depth = depths[0].unwrap_or(0);
-                    return Some(1.0 - (f64::from(ref_depth) / f64::from(total)));
-                }
-            }
+        if let Some(ad_idx) = keys.as_ref().iter().position(|k| k == "AD")
+            && let Some(Some(Value::Array(Array::Integer(depths)))) = sample.values().get(ad_idx)
+            && !depths.is_empty()
+        {
+            // fgbio: `1 - ad(0) / ad.sum.toDouble`. When AD sums to zero this
+            // is `1 - 0/0 = NaN`; the caller's `!(maf <= threshold)` check
+            // then excludes the variant, matching fgbio's `forall(_ <= maf)`.
+            // Missing (`.`) AD entries are treated as 0 (htsjdk's AD is a
+            // dense int array).
+            let total: i32 = depths.iter().map(|d| d.unwrap_or(0)).sum();
+            let ref_depth = depths[0].unwrap_or(0);
+            return Some(1.0 - (f64::from(ref_depth) / f64::from(total)));
         }
 
         None

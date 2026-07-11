@@ -496,17 +496,17 @@ impl Template {
 
             // Set mate score tags (ms) in all cases
             let rr = &mut self.records;
-            if let Some(as_value) = r2_as {
-                if let Ok(v) = i32::try_from(as_value) {
-                    fgumi_raw_bam::remove_tag(rr[r1_i].as_mut_vec(), SamTag::MS);
-                    fgumi_raw_bam::append_signed_int_tag(rr[r1_i].as_mut_vec(), SamTag::MS, v);
-                }
+            if let Some(as_value) = r2_as
+                && let Ok(v) = i32::try_from(as_value)
+            {
+                fgumi_raw_bam::remove_tag(rr[r1_i].as_mut_vec(), SamTag::MS);
+                fgumi_raw_bam::append_signed_int_tag(rr[r1_i].as_mut_vec(), SamTag::MS, v);
             }
-            if let Some(as_value) = r1_as {
-                if let Ok(v) = i32::try_from(as_value) {
-                    fgumi_raw_bam::remove_tag(rr[r2_i].as_mut_vec(), SamTag::MS);
-                    fgumi_raw_bam::append_signed_int_tag(rr[r2_i].as_mut_vec(), SamTag::MS, v);
-                }
+            if let Some(as_value) = r1_as
+                && let Ok(v) = i32::try_from(as_value)
+            {
+                fgumi_raw_bam::remove_tag(rr[r2_i].as_mut_vec(), SamTag::MS);
+                fgumi_raw_bam::append_signed_int_tag(rr[r2_i].as_mut_vec(), SamTag::MS, v);
             }
         }
 
@@ -545,11 +545,11 @@ impl Template {
                         fgumi_raw_bam::remove_tag(rec.as_mut_vec(), SamTag::MC);
                     }
 
-                    if let Some(as_value) = r2_as {
-                        if let Ok(v) = i32::try_from(as_value) {
-                            fgumi_raw_bam::remove_tag(rec.as_mut_vec(), SamTag::MS);
-                            fgumi_raw_bam::append_signed_int_tag(rec.as_mut_vec(), SamTag::MS, v);
-                        }
+                    if let Some(as_value) = r2_as
+                        && let Ok(v) = i32::try_from(as_value)
+                    {
+                        fgumi_raw_bam::remove_tag(rec.as_mut_vec(), SamTag::MS);
+                        fgumi_raw_bam::append_signed_int_tag(rec.as_mut_vec(), SamTag::MS, v);
                     }
                 }
             }
@@ -590,11 +590,11 @@ impl Template {
                         fgumi_raw_bam::remove_tag(rec.as_mut_vec(), SamTag::MC);
                     }
 
-                    if let Some(as_value) = r1_as {
-                        if let Ok(v) = i32::try_from(as_value) {
-                            fgumi_raw_bam::remove_tag(rec.as_mut_vec(), SamTag::MS);
-                            fgumi_raw_bam::append_signed_int_tag(rec.as_mut_vec(), SamTag::MS, v);
-                        }
+                    if let Some(as_value) = r1_as
+                        && let Ok(v) = i32::try_from(as_value)
+                    {
+                        fgumi_raw_bam::remove_tag(rec.as_mut_vec(), SamTag::MS);
+                        fgumi_raw_bam::append_signed_int_tag(rec.as_mut_vec(), SamTag::MS, v);
                     }
                 }
             }

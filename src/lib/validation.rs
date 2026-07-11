@@ -98,13 +98,13 @@ pub fn validate_min_max<T: Ord + Display>(
     min_name: &str,
     max_name: &str,
 ) -> Result<()> {
-    if let Some(max) = max_val {
-        if max < min_val {
-            return Err(FgumiError::InvalidParameter {
-                parameter: max_name.to_string(),
-                reason: format!("{max_name} ({max}) must be >= {min_name} ({min_val})"),
-            });
-        }
+    if let Some(max) = max_val
+        && max < min_val
+    {
+        return Err(FgumiError::InvalidParameter {
+            parameter: max_name.to_string(),
+            reason: format!("{max_name} ({max}) must be >= {min_name} ({min_val})"),
+        });
     }
     Ok(())
 }

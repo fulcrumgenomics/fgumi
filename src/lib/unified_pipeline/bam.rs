@@ -2115,10 +2115,8 @@ fn try_step_find_boundaries<G: Send, P: Send + MemoryEstimate>(
 
         // Release memory from atomic tracker when popping from reorder buffer
         let Some((batch, heap_size)) = batch_with_size else {
-            if !did_work {
-                if let Some(stats) = state.stats() {
-                    stats.record_queue_empty(2);
-                }
+            if !did_work && let Some(stats) = state.stats() {
+                stats.record_queue_empty(2);
             }
             break; // No more data available
         };
@@ -2489,10 +2487,8 @@ fn try_step_group<G: Send + BatchWeight + MemoryEstimate + 'static, P: Send + Me
 
         // Release memory from atomic tracker when popping from reorder buffer
         let Some((records, heap_size)) = records else {
-            if !did_work {
-                if let Some(stats) = state.stats() {
-                    stats.record_queue_empty(3);
-                }
+            if !did_work && let Some(stats) = state.stats() {
+                stats.record_queue_empty(3);
             }
             break; // No more data available
         };
@@ -2925,11 +2921,11 @@ fn try_step_serialize<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
     let mut total_record_count: u64 = 0;
     for item in batch {
         // Secondary serialize (borrows item) — must run before primary consumes it
-        if let Some(ref secondary_fn) = fns.secondary_serialize_fn {
-            if let Err(e) = (secondary_fn)(&item, &mut worker.core.secondary_serialization_buffer) {
-                state.set_error(e);
-                return false;
-            }
+        if let Some(ref secondary_fn) = fns.secondary_serialize_fn
+            && let Err(e) = (secondary_fn)(&item, &mut worker.core.secondary_serialization_buffer)
+        {
+            state.set_error(e);
+            return false;
         }
         // Primary serialize (consumes item)
         match (fns.serialize_fn)(item, &mut worker.core.serialization_buffer) {
@@ -3044,17 +3040,16 @@ fn try_step_write<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
             }
 
             // Write secondary data (e.g., rejects) in the same serial order
-            if let Some(ref secondary_data) = batch.secondary_data {
-                if !secondary_data.is_empty() {
-                    if let Some(ref secondary_mutex) = state.output.secondary_output {
-                        let mut sw_guard = secondary_mutex.lock();
-                        if let Some(ref mut sw) = *sw_guard {
-                            if let Err(e) = sw.write_raw_bytes(secondary_data) {
-                                state.set_error(e);
-                                return (false, false);
-                            }
-                        }
-                    }
+            if let Some(ref secondary_data) = batch.secondary_data
+                && !secondary_data.is_empty()
+                && let Some(ref secondary_mutex) = state.output.secondary_output
+            {
+                let mut sw_guard = secondary_mutex.lock();
+                if let Some(ref mut sw) = *sw_guard
+                    && let Err(e) = sw.write_raw_bytes(secondary_data)
+                {
+                    state.set_error(e);
+                    return (false, false);
                 }
             }
 
@@ -3082,10 +3077,11 @@ fn try_step_write<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
 
     // Record queue empty only if both Q7 queue AND reorder buffer are empty
     // (not when items are waiting out-of-order in the reorder buffer)
-    if !wrote_any && q7_truly_empty {
-        if let Some(stats) = state.stats() {
-            stats.record_queue_empty(7);
-        }
+    if !wrote_any
+        && q7_truly_empty
+        && let Some(stats) = state.stats()
+    {
+        stats.record_queue_empty(7);
     }
 
     (wrote_any, false) // Success or no work, no contention (we held lock)
@@ -3400,10 +3396,10 @@ where
                 compressor.write_blocks_to(output.as_mut())?;
 
                 // Write secondary data
-                if !buffers.secondary.is_empty() {
-                    if let Some(ref mut sw) = secondary_writer {
-                        sw.write_raw_bytes(&buffers.secondary)?;
-                    }
+                if !buffers.secondary.is_empty()
+                    && let Some(ref mut sw) = secondary_writer
+                {
+                    sw.write_raw_bytes(&buffers.secondary)?;
                 }
 
                 progress.log_if_needed(record_count);
@@ -3412,41 +3408,41 @@ where
     }
 
     // Handle any remaining bytes from boundary finding
-    if let Some(final_batch) = boundary_state.finish()? {
-        if final_batch.offsets.len() > 1 {
-            let decoded = decode_records(&final_batch, &group_key_config)?;
-            let groups = grouper.add_records(decoded)?;
+    if let Some(final_batch) = boundary_state.finish()?
+        && final_batch.offsets.len() > 1
+    {
+        let decoded = decode_records(&final_batch, &group_key_config)?;
+        let groups = grouper.add_records(decoded)?;
 
-            for group in groups {
-                let processed = (fns.process_fn)(group)?;
+        for group in groups {
+            let processed = (fns.process_fn)(group)?;
 
-                // Run MI Assign first so secondary_serialize sees the same
-                // post-assign state as the parallel path (matches Step 7 above).
-                let processed = run_mi_assign_single_threaded(
-                    fns.mi_assign_fn.as_deref(),
-                    &mut next_serial,
-                    processed,
-                )?;
+            // Run MI Assign first so secondary_serialize sees the same
+            // post-assign state as the parallel path (matches Step 7 above).
+            let processed = run_mi_assign_single_threaded(
+                fns.mi_assign_fn.as_deref(),
+                &mut next_serial,
+                processed,
+            )?;
 
-                buffers.secondary.clear();
-                if let Some(ref secondary_fn) = fns.secondary_serialize_fn {
-                    (secondary_fn)(&processed, &mut buffers.secondary)?;
-                }
-
-                buffers.serialized.clear();
-                let record_count = (fns.serialize_fn)(processed, &mut buffers.serialized)?;
-                compressor.write_all(&buffers.serialized)?;
-                compressor.maybe_compress()?;
-                compressor.write_blocks_to(output.as_mut())?;
-
-                if !buffers.secondary.is_empty() {
-                    if let Some(ref mut sw) = secondary_writer {
-                        sw.write_raw_bytes(&buffers.secondary)?;
-                    }
-                }
-
-                progress.log_if_needed(record_count);
+            buffers.secondary.clear();
+            if let Some(ref secondary_fn) = fns.secondary_serialize_fn {
+                (secondary_fn)(&processed, &mut buffers.secondary)?;
             }
+
+            buffers.serialized.clear();
+            let record_count = (fns.serialize_fn)(processed, &mut buffers.serialized)?;
+            compressor.write_all(&buffers.serialized)?;
+            compressor.maybe_compress()?;
+            compressor.write_blocks_to(output.as_mut())?;
+
+            if !buffers.secondary.is_empty()
+                && let Some(ref mut sw) = secondary_writer
+            {
+                sw.write_raw_bytes(&buffers.secondary)?;
+            }
+
+            progress.log_if_needed(record_count);
         }
     }
 
@@ -3481,10 +3477,10 @@ where
         compressor.write_blocks_to(output.as_mut())?;
 
         // Write secondary data
-        if !buffers.secondary.is_empty() {
-            if let Some(ref mut sw) = secondary_writer {
-                sw.write_raw_bytes(&buffers.secondary)?;
-            }
+        if !buffers.secondary.is_empty()
+            && let Some(ref mut sw) = secondary_writer
+        {
+            sw.write_raw_bytes(&buffers.secondary)?;
         }
 
         progress.log_if_needed(record_count);
@@ -3759,15 +3755,15 @@ where
     // Finalize secondary output writer (if present)
     if let Some(ref secondary_mutex) = state.output.secondary_output {
         let mut guard = secondary_mutex.lock();
-        if let Some(writer) = guard.take() {
-            if let Err(e) = writer.finish().map_err(|e| {
+        if let Some(writer) = guard.take()
+            && let Err(e) = writer.finish().map_err(|e| {
                 io::Error::new(e.kind(), format!("Failed to finalize secondary output: {e}"))
-            }) {
-                if result.is_err() {
-                    log::error!("Secondary output finalization also failed: {e}");
-                } else {
-                    return Err(e);
-                }
+            })
+        {
+            if result.is_err() {
+                log::error!("Secondary output finalization also failed: {e}");
+            } else {
+                return Err(e);
             }
         }
     }

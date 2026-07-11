@@ -251,11 +251,11 @@ impl MiGrouper {
 
     /// Flush current MI group to pending.
     fn flush_current_group(&mut self) {
-        if let Some(mi) = self.current_mi.take() {
-            if !self.current_records.is_empty() {
-                let records = std::mem::take(&mut self.current_records);
-                self.pending_groups.push_back(MiGroup::new(mi, records));
-            }
+        if let Some(mi) = self.current_mi.take()
+            && !self.current_records.is_empty()
+        {
+            let records = std::mem::take(&mut self.current_records);
+            self.pending_groups.push_back(MiGroup::new(mi, records));
         }
     }
 

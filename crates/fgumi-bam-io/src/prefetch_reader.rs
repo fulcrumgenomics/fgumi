@@ -377,10 +377,10 @@ impl Drop for PrefetchReader {
         // guarantee no leak.
         self.rx = None;
         self.current = None;
-        if let Some(handle) = self.handle.take() {
-            if handle.join().is_err() {
-                log::debug!("fgumi-prefetch producer thread panicked during shutdown");
-            }
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+        {
+            log::debug!("fgumi-prefetch producer thread panicked during shutdown");
         }
     }
 }

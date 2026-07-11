@@ -476,10 +476,10 @@ impl CorrectUmis {
         // Validate the input exists (stdin paths are exempt — the reader
         // streams them in a single pass).
         self.io.validate()?;
-        if let Some(min) = self.min_corrected {
-            if !(0.0..=1.0).contains(&min) {
-                bail!("--min-corrected must be between 0 and 1.");
-            }
+        if let Some(min) = self.min_corrected
+            && !(0.0..=1.0).contains(&min)
+        {
+            bail!("--min-corrected must be between 0 and 1.");
         }
         Ok(())
     }
@@ -725,14 +725,14 @@ impl CorrectUmis {
         let first_umi_bytes = fgumi_raw_bam::find_string_tag(first_aux, umi_tag);
 
         // If tag exists but is not a Z-type string, return an error
-        if first_umi_bytes.is_none() {
-            if let Some(tag_type) = fgumi_raw_bam::find_tag_type(first_aux, umi_tag) {
-                anyhow::bail!(
-                    "UMI tag {:?} exists but has non-string type '{}', expected 'Z'",
-                    std::str::from_utf8(&umi_tag).unwrap_or("??"),
-                    tag_type as char,
-                );
-            }
+        if first_umi_bytes.is_none()
+            && let Some(tag_type) = fgumi_raw_bam::find_tag_type(first_aux, umi_tag)
+        {
+            anyhow::bail!(
+                "UMI tag {:?} exists but has non-string type '{}', expected 'Z'",
+                std::str::from_utf8(&umi_tag).unwrap_or("??"),
+                tag_type as char,
+            );
         }
 
         for raw in &raw_records[1..] {
@@ -741,14 +741,14 @@ impl CorrectUmis {
 
             // Mirror the first-record check: reject any record whose UMI tag
             // exists with a non-string type instead of treating it as missing.
-            if current_umi_bytes.is_none() {
-                if let Some(tag_type) = fgumi_raw_bam::find_tag_type(aux, umi_tag) {
-                    anyhow::bail!(
-                        "UMI tag {:?} exists but has non-string type '{}', expected 'Z'",
-                        std::str::from_utf8(&umi_tag).unwrap_or("??"),
-                        tag_type as char,
-                    );
-                }
+            if current_umi_bytes.is_none()
+                && let Some(tag_type) = fgumi_raw_bam::find_tag_type(aux, umi_tag)
+            {
+                anyhow::bail!(
+                    "UMI tag {:?} exists but has non-string type '{}', expected 'Z'",
+                    std::str::from_utf8(&umi_tag).unwrap_or("??"),
+                    tag_type as char,
+                );
             }
 
             match (first_umi_bytes, current_umi_bytes) {
@@ -1278,11 +1278,9 @@ impl CorrectUmis {
                         // metric bucket (CorrectUmis.scala:199-202).
                         missing_umis += num_records;
 
-                        if track_rejects {
-                            if let Some(rw) = reject_writer.as_mut() {
-                                for raw in raw_records.drain(..) {
-                                    write_raw(rw, &raw)?;
-                                }
+                        if track_rejects && let Some(rw) = reject_writer.as_mut() {
+                            for raw in raw_records.drain(..) {
+                                write_raw(rw, &raw)?;
                             }
                         }
                     }
@@ -1329,11 +1327,9 @@ impl CorrectUmis {
                                 RejectionReason::None => {}
                             }
 
-                            if track_rejects {
-                                if let Some(rw) = reject_writer.as_mut() {
-                                    for raw in raw_records.drain(..) {
-                                        write_raw(rw, &raw)?;
-                                    }
+                            if track_rejects && let Some(rw) = reject_writer.as_mut() {
+                                for raw in raw_records.drain(..) {
+                                    write_raw(rw, &raw)?;
                                 }
                             }
                         }

@@ -134,10 +134,10 @@ impl OptimizedChaseScheduler {
         }
 
         // 2. For exclusive specialists, always include their specialty second
-        if let Some(specialty) = self.exclusive_specialty {
-            if specialty != self.current_step {
-                priorities.push(specialty);
-            }
+        if let Some(specialty) = self.exclusive_specialty
+            && specialty != self.current_step
+        {
+            priorities.push(specialty);
         }
 
         // 3. Bottleneck boost: Compress and Serialize always in top priorities

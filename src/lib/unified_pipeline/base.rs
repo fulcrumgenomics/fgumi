@@ -3138,11 +3138,11 @@ impl PipelineStats {
         }
 
         // Record per-thread stats if thread_id provided
-        if let Some(tid) = thread_id {
-            if tid < MAX_THREADS {
-                let step_idx = step as usize;
-                self.per_thread_step_counts[tid][step_idx].fetch_add(1, Ordering::Relaxed);
-            }
+        if let Some(tid) = thread_id
+            && tid < MAX_THREADS
+        {
+            let step_idx = step as usize;
+            self.per_thread_step_counts[tid][step_idx].fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -4438,14 +4438,12 @@ pub fn generic_worker_loop<C: StepContext>(ctx: &C, worker: &mut C::Worker) {
                 let success = if collect_stats {
                     let start = Instant::now();
                     let success = ctx.execute_read_step(worker);
-                    if success {
-                        if let Some(stats) = ctx.stats() {
-                            stats.record_step_for_thread(
-                                PipelineStep::Read,
-                                start.elapsed().as_nanos() as u64,
-                                Some(worker.core().scheduler.thread_id()),
-                            );
-                        }
+                    if success && let Some(stats) = ctx.stats() {
+                        stats.record_step_for_thread(
+                            PipelineStep::Read,
+                            start.elapsed().as_nanos() as u64,
+                            Some(worker.core().scheduler.thread_id()),
+                        );
                     }
                     success
                 } else {
@@ -4475,34 +4473,35 @@ pub fn generic_worker_loop<C: StepContext>(ctx: &C, worker: &mut C::Worker) {
         // BAM optimization: try owned exclusive step first (before priority loop)
         // This prevents starvation: since only this thread can do the step, prioritize it
         let owned_step = ctx.exclusive_step_owned(worker);
-        if let Some(step) = owned_step {
-            if step != PipelineStep::Read && !ctx.has_error() {
-                // Record attempt
+        if let Some(step) = owned_step
+            && step != PipelineStep::Read
+            && !ctx.has_error()
+        {
+            // Record attempt
+            if let Some(stats) = ctx.stats() {
+                stats.record_step_attempt(worker.core().scheduler.thread_id(), step);
+            }
+
+            let (success, elapsed_ns, was_contention) = if collect_stats {
+                let start = Instant::now();
+                let (success, was_contention) = ctx.execute_step(worker, step);
+                (success, start.elapsed().as_nanos() as u64, was_contention)
+            } else {
+                let (success, was_contention) = ctx.execute_step(worker, step);
+                (success, 0, was_contention)
+            };
+
+            worker.core_mut().scheduler.record_outcome(step, success, was_contention);
+
+            if success {
                 if let Some(stats) = ctx.stats() {
-                    stats.record_step_attempt(worker.core().scheduler.thread_id(), step);
+                    stats.record_step_for_thread(
+                        step,
+                        elapsed_ns,
+                        Some(worker.core().scheduler.thread_id()),
+                    );
                 }
-
-                let (success, elapsed_ns, was_contention) = if collect_stats {
-                    let start = Instant::now();
-                    let (success, was_contention) = ctx.execute_step(worker, step);
-                    (success, start.elapsed().as_nanos() as u64, was_contention)
-                } else {
-                    let (success, was_contention) = ctx.execute_step(worker, step);
-                    (success, 0, was_contention)
-                };
-
-                worker.core_mut().scheduler.record_outcome(step, success, was_contention);
-
-                if success {
-                    if let Some(stats) = ctx.stats() {
-                        stats.record_step_for_thread(
-                            step,
-                            elapsed_ns,
-                            Some(worker.core().scheduler.thread_id()),
-                        );
-                    }
-                    did_work = true;
-                }
+                did_work = true;
             }
         }
 

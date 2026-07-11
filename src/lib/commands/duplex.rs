@@ -485,10 +485,10 @@ impl Command for Duplex {
 
             // Apply overlapping consensus if enabled (modifies raw bytes in-place)
             // Skip if group doesn't have both strands - no duplex possible anyway
-            if let Some(ref mut oc) = overlapping_caller {
-                if has_both_strands_raw(&records) {
-                    apply_overlapping_consensus(&mut records, oc)?;
-                }
+            if let Some(ref mut oc) = overlapping_caller
+                && has_both_strands_raw(&records)
+            {
+                apply_overlapping_consensus(&mut records, oc)?;
             }
 
             // Call consensus directly — records are already RawRecord values.
@@ -712,16 +712,14 @@ impl Duplex {
                 // Skip if group doesn't have both strands — no duplex possible anyway.
                 // Propagate errors to match single-threaded behavior; silent drops here
                 // would turn real failures into output gaps in --threads mode only.
-                if let Some(ref mut oc) = overlapping_caller {
-                    if has_both_strands_raw(&group_reads) {
-                        oc.reset_stats();
-                        apply_overlapping_consensus(&mut group_reads, oc).map_err(|e| {
-                            io::Error::other(format!(
-                                "Overlapping consensus error for MI {mi}: {e}"
-                            ))
-                        })?;
-                        batch_overlapping.merge(oc.stats());
-                    }
+                if let Some(ref mut oc) = overlapping_caller
+                    && has_both_strands_raw(&group_reads)
+                {
+                    oc.reset_stats();
+                    apply_overlapping_consensus(&mut group_reads, oc).map_err(|e| {
+                        io::Error::other(format!("Overlapping consensus error for MI {mi}: {e}"))
+                    })?;
+                    batch_overlapping.merge(oc.stats());
                 }
 
                 // Call duplex consensus directly — records are already RawRecord values.

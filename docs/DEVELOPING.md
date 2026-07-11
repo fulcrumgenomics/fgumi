@@ -2,7 +2,7 @@
 
 ## Getting Started
 
-If you already have the Rust toolchain installed, make sure you have at least version `1.87.0` (e.g., with `rustup show` or `rustc --version`).
+If you already have the Rust toolchain installed, make sure you have at least version `1.93.0` (e.g., with `rustup show` or `rustc --version`).
 If not, you can run `rustup update` to install the latest version.
 
 If you do not have the Rust toolchain installed, the best way to install it is with [`rustup`](https://rustup.rs/) using the following command (which assumes that you have [`curl`](https://everything.curl.dev/get) installed):

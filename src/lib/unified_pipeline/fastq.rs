@@ -3465,10 +3465,11 @@ fn fastq_try_step_write<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 
         q7_truly_empty = reorder.is_empty();
     }
 
-    if !wrote_any && q7_truly_empty {
-        if let Some(stats) = state.stats() {
-            stats.record_queue_empty(7);
-        }
+    if !wrote_any
+        && q7_truly_empty
+        && let Some(stats) = state.stats()
+    {
+        stats.record_queue_empty(7);
     }
 
     wrote_any

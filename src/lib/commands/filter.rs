@@ -913,20 +913,19 @@ impl Filter {
         };
 
         // Conversion fraction filter (EM-Seq/TAPs read-level)
-        if pass {
-            if let Some(min_frac) = min_conversion_fraction {
-                if !check_conversion_fraction_raw_with_ref_bases_and_tags(
-                    record,
-                    min_frac,
-                    ref_base_map.as_deref(),
-                    methylation_tags
-                        .as_ref()
-                        .expect("methylation_tags set when conversion fraction enabled"),
-                    methylation_mode,
-                ) {
-                    pass = false;
-                }
-            }
+        if pass
+            && let Some(min_frac) = min_conversion_fraction
+            && !check_conversion_fraction_raw_with_ref_bases_and_tags(
+                record,
+                min_frac,
+                ref_base_map.as_deref(),
+                methylation_tags
+                    .as_ref()
+                    .expect("methylation_tags set when conversion fraction enabled"),
+                methylation_mode,
+            )
+        {
+            pass = false;
         }
 
         Ok((masked_count as u64, pass))
@@ -947,10 +946,10 @@ impl Filter {
         min_mean_qual: Option<f64>,
         max_no_call_frac: f64,
     ) -> bool {
-        if let Some(min_qual) = min_mean_qual {
-            if mean_qual < min_qual {
-                return false;
-            }
+        if let Some(min_qual) = min_mean_qual
+            && mean_qual < min_qual
+        {
+            return false;
         }
         let no_calls = count_no_calls(bam);
         let seq_len = fgumi_raw_bam::l_seq(bam) as usize;

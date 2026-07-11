@@ -410,14 +410,12 @@ fn filter_template(
             }
         }
 
-        if check_mq {
-            if let Some(mq) = found_mq {
-                // Compare as signed so a negative MQ (e.g., MQ:c:-1) fails the filter
-                // rather than wrapping to 255 via `as u8`.
-                if mq < i64::from(config.min_mapq) {
-                    metrics.discarded_poor_alignment += 1;
-                    return false;
-                }
+        if check_mq && let Some(mq) = found_mq {
+            // Compare as signed so a negative MQ (e.g., MQ:c:-1) fails the filter
+            // rather than wrapping to 255 via `as u8`.
+            if mq < i64::from(config.min_mapq) {
+                metrics.discarded_poor_alignment += 1;
+                return false;
             }
         }
 
@@ -433,11 +431,11 @@ fn filter_template(
                     return false;
                 }
                 UmiValidation::Valid(base_count) => {
-                    if let Some(min_len) = config.min_umi_length {
-                        if base_count < min_len {
-                            metrics.discarded_umi_too_short += 1;
-                            return false;
-                        }
+                    if let Some(min_len) = config.min_umi_length
+                        && base_count < min_len
+                    {
+                        metrics.discarded_umi_too_short += 1;
+                        return false;
                     }
                 }
             }

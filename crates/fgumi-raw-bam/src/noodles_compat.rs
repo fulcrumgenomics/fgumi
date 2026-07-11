@@ -41,11 +41,11 @@ pub fn simplify_cigar_from_raw(
         };
 
         // Coalesce adjacent operations of the same type
-        if let Some((last_kind, last_len)) = simplified.last_mut() {
-            if *last_kind == new_kind {
-                *last_len += op_len;
-                continue;
-            }
+        if let Some((last_kind, last_len)) = simplified.last_mut()
+            && *last_kind == new_kind
+        {
+            *last_len += op_len;
+            continue;
         }
 
         simplified.push((new_kind, op_len));

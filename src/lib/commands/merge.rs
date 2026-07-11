@@ -117,14 +117,14 @@ impl Command for Merge {
         // Check output doesn't alias any input
         if let Ok(output_canon) = std::fs::canonicalize(&self.output) {
             for path in &input_paths {
-                if let Ok(input_canon) = std::fs::canonicalize(path) {
-                    if output_canon == input_canon {
-                        bail!(
-                            "Output file '{}' is the same as input file '{}'",
-                            self.output.display(),
-                            path.display()
-                        );
-                    }
+                if let Ok(input_canon) = std::fs::canonicalize(path)
+                    && output_canon == input_canon
+                {
+                    bail!(
+                        "Output file '{}' is the same as input file '{}'",
+                        self.output.display(),
+                        path.display()
+                    );
                 }
             }
         }
@@ -240,22 +240,22 @@ fn order_flag_value(order: SortOrderArg) -> &'static str {
 /// Returns an error if the header declares an order that conflicts with `order`.
 fn check_input_declared_order(header: &Header, order: SortOrderArg, source: &str) -> Result<()> {
     let expected = expected_declared_order(order);
-    if let Some(declared) = classify_declared_order(header) {
-        if declared != expected {
-            // `{source}` names the input for identification only; the remediation
-            // command uses a `<input>` placeholder (matching the streaming-verify
-            // error) so a path with shell metacharacters can't turn the
-            // copy-pasteable hint into something unexpected.
-            bail!(
-                "Input '{source}' is sorted by {declared} but merge was asked for --order \
+    if let Some(declared) = classify_declared_order(header)
+        && declared != expected
+    {
+        // `{source}` names the input for identification only; the remediation
+        // command uses a `<input>` placeholder (matching the streaming-verify
+        // error) so a path with shell metacharacters can't turn the
+        // copy-pasteable hint into something unexpected.
+        bail!(
+            "Input '{source}' is sorted by {declared} but merge was asked for --order \
                  {requested}. Every input must already be sorted in the merge order, or the \
                  k-way merge silently corrupts the output.\n\nEither merge in the inputs' \
                  existing order:\n  fgumi merge --order {declared} ...\nor sort the inputs to \
                  {requested} first:\n  fgumi sort -i <input> -o sorted.bam --order {requested}",
-                declared = declared.as_str(),
-                requested = order_flag_value(order),
-            );
-        }
+            declared = declared.as_str(),
+            requested = order_flag_value(order),
+        );
     }
     Ok(())
 }

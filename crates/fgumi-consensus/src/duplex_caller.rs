@@ -1149,20 +1149,18 @@ impl DuplexConsensusCaller {
         builder.append_int_tag(SamTag::BM, ba_depth_min);
 
         // 7. Per-base BA tags if requested and BA strand exists
-        if produce_per_base_tags {
-            if let Some(ba) = ba_opt {
-                builder.append_string_tag(SamTag::BC_BASES, &ba.bases);
+        if produce_per_base_tags && let Some(ba) = ba_opt {
+            builder.append_string_tag(SamTag::BC_BASES, &ba.bases);
 
-                let ba_depths_i16: Vec<i16> =
-                    ba.depths.iter().map(|&d| i16::try_from(d).unwrap_or(i16::MAX)).collect();
-                builder.append_i16_array_tag(SamTag::BD_BASES, &ba_depths_i16);
+            let ba_depths_i16: Vec<i16> =
+                ba.depths.iter().map(|&d| i16::try_from(d).unwrap_or(i16::MAX)).collect();
+            builder.append_i16_array_tag(SamTag::BD_BASES, &ba_depths_i16);
 
-                let ba_errors_i16: Vec<i16> =
-                    ba.errors.iter().map(|&e| i16::try_from(e).unwrap_or(i16::MAX)).collect();
-                builder.append_i16_array_tag(SamTag::BE_BASES, &ba_errors_i16);
+            let ba_errors_i16: Vec<i16> =
+                ba.errors.iter().map(|&e| i16::try_from(e).unwrap_or(i16::MAX)).collect();
+            builder.append_i16_array_tag(SamTag::BE_BASES, &ba_errors_i16);
 
-                builder.append_phred33_string_tag(SamTag::BQ, &ba.quals);
-            }
+            builder.append_phred33_string_tag(SamTag::BQ, &ba.quals);
         }
 
         // 8. Duplex consensus tags (cD, cM, cE)
@@ -1248,21 +1246,21 @@ impl DuplexConsensusCaller {
                 builder.append_i16_array_tag(t_tag, &t_counts);
             }
 
-            if let Some(ba) = &consensus.ba_consensus {
-                if let Some(ba_annot) = &ba.methylation {
-                    if let Some(bm) = crate::methylation::build_mm_tag_no_ml(
-                        &ba.bases,
-                        ba_annot,
-                        false,
-                        methylation_mode,
-                    ) {
-                        builder.append_string_tag(SamTag::BM_BASES, bm.as_bytes());
-                    }
-                    let bu = ba_annot.unconverted_counts();
-                    let bt = ba_annot.converted_counts();
-                    builder.append_i16_array_tag(SamTag::BU, &bu);
-                    builder.append_i16_array_tag(SamTag::BT, &bt);
+            if let Some(ba) = &consensus.ba_consensus
+                && let Some(ba_annot) = &ba.methylation
+            {
+                if let Some(bm) = crate::methylation::build_mm_tag_no_ml(
+                    &ba.bases,
+                    ba_annot,
+                    false,
+                    methylation_mode,
+                ) {
+                    builder.append_string_tag(SamTag::BM_BASES, bm.as_bytes());
                 }
+                let bu = ba_annot.unconverted_counts();
+                let bt = ba_annot.converted_counts();
+                builder.append_i16_array_tag(SamTag::BU, &bu);
+                builder.append_i16_array_tag(SamTag::BT, &bt);
             }
 
             // Combined duplex methylation tags (MM/ML/cu/ct)

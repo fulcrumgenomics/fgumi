@@ -758,11 +758,11 @@ impl VanillaUmiConsensusCaller {
 
     /// Downsamples reads if there are more than `max_reads`
     fn downsample_reads(&mut self, mut reads: Vec<RawRecord>) -> Vec<RawRecord> {
-        if let Some(max_reads) = self.options.max_reads {
-            if reads.len() > max_reads {
-                reads.shuffle(&mut self.rng);
-                reads.truncate(max_reads);
-            }
+        if let Some(max_reads) = self.options.max_reads
+            && reads.len() > max_reads
+        {
+            reads.shuffle(&mut self.rng);
+            reads.truncate(max_reads);
         }
         reads
     }
@@ -1423,12 +1423,12 @@ impl VanillaUmiConsensusCaller {
         self.bam_builder.append_string_tag(SamTag::MI, umi.as_bytes());
 
         // Cell barcode tag (if configured and present in original reads)
-        if let Some(cell_tag) = self.options.cell_tag {
-            if let Some(first_raw) = original_raws.first() {
-                let tag_bytes = [cell_tag.as_ref()[0], cell_tag.as_ref()[1]];
-                if let Some(value) = RawRecordView::new(first_raw).tags().find_string(tag_bytes) {
-                    self.bam_builder.append_string_tag(tag_bytes, value);
-                }
+        if let Some(cell_tag) = self.options.cell_tag
+            && let Some(first_raw) = original_raws.first()
+        {
+            let tag_bytes = [cell_tag.as_ref()[0], cell_tag.as_ref()[1]];
+            if let Some(value) = RawRecordView::new(first_raw).tags().find_string(tag_bytes) {
+                self.bam_builder.append_string_tag(tag_bytes, value);
             }
         }
 
@@ -2705,11 +2705,11 @@ mod tests {
                 };
 
                 // Merge with previous if same kind
-                if let Some((prev_kind, prev_len)) = ops.last_mut() {
-                    if *prev_kind == kind {
-                        *prev_len += len;
-                        continue;
-                    }
+                if let Some((prev_kind, prev_len)) = ops.last_mut()
+                    && *prev_kind == kind
+                {
+                    *prev_len += len;
+                    continue;
                 }
                 ops.push((kind, len));
             }

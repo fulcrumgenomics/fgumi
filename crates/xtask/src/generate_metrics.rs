@@ -81,14 +81,14 @@ fn parse_metric_structs(source: &str) -> Result<Vec<ParsedMetric>> {
         .items
         .iter()
         .filter_map(|item| {
-            if let syn::Item::Impl(impl_item) = item {
-                if let Some((_, trait_path, _)) = &impl_item.trait_ {
-                    let trait_name = trait_path.segments.last().map(|s| s.ident.to_string())?;
-                    if trait_name == "Metric" {
-                        if let syn::Type::Path(type_path) = impl_item.self_ty.as_ref() {
-                            return type_path.path.segments.last().map(|s| s.ident.to_string());
-                        }
-                    }
+            if let syn::Item::Impl(impl_item) = item
+                && let Some((_, trait_path, _)) = &impl_item.trait_
+            {
+                let trait_name = trait_path.segments.last().map(|s| s.ident.to_string())?;
+                if trait_name == "Metric"
+                    && let syn::Type::Path(type_path) = impl_item.self_ty.as_ref()
+                {
+                    return type_path.path.segments.last().map(|s| s.ident.to_string());
                 }
             }
             None
@@ -118,14 +118,12 @@ fn extract_doc_comments(attrs: &[syn::Attribute]) -> String {
     let lines: Vec<String> = attrs
         .iter()
         .filter_map(|attr| {
-            if attr.path().is_ident("doc") {
-                if let syn::Meta::NameValue(nv) = &attr.meta {
-                    if let syn::Expr::Lit(lit) = &nv.value {
-                        if let syn::Lit::Str(s) = &lit.lit {
-                            return Some(s.value());
-                        }
-                    }
-                }
+            if attr.path().is_ident("doc")
+                && let syn::Meta::NameValue(nv) = &attr.meta
+                && let syn::Expr::Lit(lit) = &nv.value
+                && let syn::Lit::Str(s) = &lit.lit
+            {
+                return Some(s.value());
             }
             None
         })
