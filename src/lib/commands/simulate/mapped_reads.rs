@@ -1473,8 +1473,9 @@ mod tests {
 
     /// End-to-end: with a fractional `--unmapped-fraction`, the BAM must
     /// contain BOTH mapped and unmapped records, and all unmapped records
-    /// must sort after all mapped records (matching the `for_unmapped_pair`
-    /// sort-key convention).
+    /// must sort after all mapped records (unmapped-last is `fgumi-sort`'s
+    /// native template-coordinate behavior — simulate no longer keys unmapped
+    /// reads itself).
     #[test]
     fn test_execute_unmapped_fraction_mixed_sorts_unmapped_last() {
         use clap::Parser;

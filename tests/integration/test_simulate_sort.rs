@@ -1,249 +1,107 @@
-//! Integration tests for simulate command template-coordinate sorting.
+//! Integration tests: `fgumi simulate` emits template-coordinate sorted BAMs.
 //!
-//! These tests verify that the simulated BAM files are properly sorted
-//! in template-coordinate order, matching `samtools sort --template-coordinate`.
+//! These run the **prebuilt** `fgumi` binary (via `CARGO_BIN_EXE_fgumi`) — no
+//! recursive `cargo run`, so they are fast and hermetic — and verify the output
+//! with `fgumi sort --verify --order template-coordinate`, fgumi's own canonical
+//! sort-order checker (the same engine `fgumi sort`/`fgumi group` use, validated
+//! against `samtools sort --template-coordinate`). No external `samtools` is
+//! required. Gated on the `simulate` feature so the binary actually has the
+//! subcommand.
+//!
+//! This is what catches ordering regressions in `simulate` — e.g. the historical
+//! bug where reverse-R1 (F2R1) pairs were mis-positioned because `simulate`
+//! computed its own template-coordinate key instead of delegating to `fgumi-sort`.
 
+#![cfg(feature = "simulate")]
+
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use rstest::rstest;
 use tempfile::TempDir;
 
-/// Check if samtools is available in PATH.
-fn samtools_available() -> bool {
-    Command::new("samtools").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+/// The `fgumi` binary built for this test run (has the `simulate` feature).
+const FGUMI: &str = env!("CARGO_BIN_EXE_fgumi");
+
+/// Write a small, deterministic two-contig reference FASTA and return its path.
+///
+/// The sequence is generated programmatically (a fixed LCG over `ACGT`) so the
+/// test needs no committed data file yet has ample varied mapped positions.
+fn write_reference(dir: &Path) -> PathBuf {
+    const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+    const CONTIG_LEN: usize = 100_000;
+
+    let mut fasta = Vec::with_capacity(2 * CONTIG_LEN + 32);
+    for (name, salt) in [("chr1", 1u64), ("chr2", 7u64)] {
+        fasta.extend_from_slice(format!(">{name}\n").as_bytes());
+        let mut state = salt;
+        for _ in 0..CONTIG_LEN {
+            // SplitMix-ish LCG; deterministic and well-distributed over 2 bits.
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            fasta.push(BASES[((state >> 33) & 3) as usize]);
+        }
+        fasta.push(b'\n');
+    }
+
+    let path = dir.join("ref.fa");
+    std::fs::write(&path, fasta).expect("write reference FASTA");
+    path
 }
 
-/// Check if fgumi binary is built with simulate feature.
-fn fgumi_simulate_available() -> bool {
-    let output = Command::new("cargo")
-        .args(["build", "--features", "simulate", "--message-format=short"])
-        .output();
-    output.map(|o| o.status.success()).unwrap_or(false)
+/// Run the prebuilt `fgumi` binary and assert it exits successfully.
+fn fgumi(args: &[&str]) {
+    let status = Command::new(FGUMI).args(args).status().expect("failed to spawn fgumi");
+    assert!(status.success(), "`fgumi {}` failed: {status}", args.join(" "));
 }
 
-/// Run samtools sort --template-coordinate and compare with original.
-/// Returns true if the files are identical (original is already sorted).
-fn verify_template_coordinate_sorted(bam_path: &std::path::Path) -> bool {
-    let temp_dir = TempDir::new().unwrap();
-    let sorted_path = temp_dir.path().join("sorted.bam");
+/// `simulate` generates in molecule order and then sorts via the canonical
+/// `fgumi-sort` engine, so its output must be template-coordinate sorted for every
+/// subcommand and read orientation. `fgumi sort --verify` asserts exactly that
+/// (0 sort-order violations), and it is the check that fails if the ordering
+/// regresses.
+#[rstest]
+#[case::mapped_reads("mapped-reads", 1_000, false)]
+#[case::grouped_reads_simplex("grouped-reads", 1_000, false)]
+#[case::grouped_reads_duplex("grouped-reads", 1_000, true)]
+#[case::grouped_reads_duplex_large("grouped-reads", 10_000, true)]
+fn simulate_output_is_template_coordinate_sorted(
+    #[case] subcommand: &str,
+    #[case] num_molecules: usize,
+    #[case] duplex: bool,
+) {
+    let dir = TempDir::new().expect("create temp dir");
+    let reference = write_reference(dir.path());
+    let bam = dir.path().join("out.bam");
+    let truth = dir.path().join("truth.tsv");
 
-    // Sort with samtools
-    let status = Command::new("samtools")
-        .args([
-            "sort",
-            "--template-coordinate",
-            "-o",
-            sorted_path.to_str().unwrap(),
-            bam_path.to_str().unwrap(),
-        ])
-        .status()
-        .expect("Failed to run samtools sort");
+    let num_molecules = num_molecules.to_string();
+    let bam = bam.to_str().unwrap();
+    let reference = reference.to_str().unwrap();
+    let truth = truth.to_str().unwrap();
 
-    if !status.success() {
-        return false;
+    let mut args = vec![
+        "simulate",
+        subcommand,
+        "-o",
+        bam,
+        "--truth",
+        truth,
+        "--reference",
+        reference,
+        "--num-molecules",
+        &num_molecules,
+        "--seed",
+        "42",
+    ];
+    if duplex {
+        args.push("--duplex");
     }
+    fgumi(&args);
 
-    // Extract read names and positions from both files
-    let original = Command::new("samtools")
-        .args(["view", bam_path.to_str().unwrap()])
-        .output()
-        .expect("Failed to read original BAM");
-
-    let sorted = Command::new("samtools")
-        .args(["view", sorted_path.to_str().unwrap()])
-        .output()
-        .expect("Failed to read sorted BAM");
-
-    // Compare outputs
-    original.stdout == sorted.stdout
-}
-
-/// Test that mapped-reads produces template-coordinate sorted output.
-#[test]
-#[ignore = "requires samtools and fgumi with simulate feature"]
-fn test_mapped_reads_matches_samtools() {
-    if !samtools_available() {
-        eprintln!("Skipping: samtools not available");
-        return;
-    }
-    if !fgumi_simulate_available() {
-        eprintln!("Skipping: fgumi simulate feature not available");
-        return;
-    }
-
-    let temp_dir = TempDir::new().unwrap();
-    let bam_path = temp_dir.path().join("mapped.bam");
-    let truth_path = temp_dir.path().join("truth.tsv");
-
-    // Generate mapped reads
-    let status = Command::new("cargo")
-        .args([
-            "run",
-            "--features",
-            "simulate",
-            "--release",
-            "--",
-            "simulate",
-            "mapped-reads",
-            "-o",
-            bam_path.to_str().unwrap(),
-            "--truth",
-            truth_path.to_str().unwrap(),
-            "--num-molecules",
-            "1000",
-            "--seed",
-            "42",
-        ])
-        .status()
-        .expect("Failed to run fgumi simulate mapped-reads");
-
-    assert!(status.success(), "fgumi simulate mapped-reads failed");
-    assert!(bam_path.exists(), "BAM file not created");
-
-    // Verify sort order matches samtools
-    assert!(
-        verify_template_coordinate_sorted(&bam_path),
-        "mapped-reads output does not match samtools sort --template-coordinate"
-    );
-}
-
-/// Test that grouped-reads (simplex) produces template-coordinate sorted output.
-#[test]
-#[ignore = "requires samtools and fgumi with simulate feature"]
-fn test_grouped_reads_simplex_matches_samtools() {
-    if !samtools_available() {
-        eprintln!("Skipping: samtools not available");
-        return;
-    }
-    if !fgumi_simulate_available() {
-        eprintln!("Skipping: fgumi simulate feature not available");
-        return;
-    }
-
-    let temp_dir = TempDir::new().unwrap();
-    let bam_path = temp_dir.path().join("grouped.bam");
-    let truth_path = temp_dir.path().join("truth.tsv");
-
-    // Generate grouped reads (simplex)
-    let status = Command::new("cargo")
-        .args([
-            "run",
-            "--features",
-            "simulate",
-            "--release",
-            "--",
-            "simulate",
-            "grouped-reads",
-            "-o",
-            bam_path.to_str().unwrap(),
-            "--truth",
-            truth_path.to_str().unwrap(),
-            "--num-molecules",
-            "1000",
-            "--seed",
-            "42",
-        ])
-        .status()
-        .expect("Failed to run fgumi simulate grouped-reads");
-
-    assert!(status.success(), "fgumi simulate grouped-reads failed");
-    assert!(bam_path.exists(), "BAM file not created");
-
-    // Verify sort order matches samtools
-    assert!(
-        verify_template_coordinate_sorted(&bam_path),
-        "grouped-reads simplex output does not match samtools sort --template-coordinate"
-    );
-}
-
-/// Test that grouped-reads (duplex) produces template-coordinate sorted output.
-#[test]
-#[ignore = "requires samtools and fgumi with simulate feature"]
-fn test_grouped_reads_duplex_matches_samtools() {
-    if !samtools_available() {
-        eprintln!("Skipping: samtools not available");
-        return;
-    }
-    if !fgumi_simulate_available() {
-        eprintln!("Skipping: fgumi simulate feature not available");
-        return;
-    }
-
-    let temp_dir = TempDir::new().unwrap();
-    let bam_path = temp_dir.path().join("grouped_duplex.bam");
-    let truth_path = temp_dir.path().join("truth.tsv");
-
-    // Generate grouped reads (duplex)
-    let status = Command::new("cargo")
-        .args([
-            "run",
-            "--features",
-            "simulate",
-            "--release",
-            "--",
-            "simulate",
-            "grouped-reads",
-            "-o",
-            bam_path.to_str().unwrap(),
-            "--truth",
-            truth_path.to_str().unwrap(),
-            "--num-molecules",
-            "1000",
-            "--duplex",
-            "--seed",
-            "42",
-        ])
-        .status()
-        .expect("Failed to run fgumi simulate grouped-reads --duplex");
-
-    assert!(status.success(), "fgumi simulate grouped-reads --duplex failed");
-    assert!(bam_path.exists(), "BAM file not created");
-
-    // Verify sort order matches samtools
-    assert!(
-        verify_template_coordinate_sorted(&bam_path),
-        "grouped-reads duplex output does not match samtools sort --template-coordinate"
-    );
-}
-
-/// Test with larger dataset to catch edge cases.
-#[test]
-#[ignore = "requires samtools and fgumi with simulate feature; slow"]
-fn test_large_dataset_matches_samtools() {
-    if !samtools_available() {
-        eprintln!("Skipping: samtools not available");
-        return;
-    }
-    if !fgumi_simulate_available() {
-        eprintln!("Skipping: fgumi simulate feature not available");
-        return;
-    }
-
-    let temp_dir = TempDir::new().unwrap();
-    let bam_path = temp_dir.path().join("large.bam");
-    let truth_path = temp_dir.path().join("truth.tsv");
-
-    // Generate larger dataset to catch edge cases
-    let status = Command::new("cargo")
-        .args([
-            "run",
-            "--features",
-            "simulate",
-            "--release",
-            "--",
-            "simulate",
-            "grouped-reads",
-            "-o",
-            bam_path.to_str().unwrap(),
-            "--truth",
-            truth_path.to_str().unwrap(),
-            "--num-molecules",
-            "10000",
-            "--duplex",
-            "--seed",
-            "12345",
-        ])
-        .status()
-        .expect("Failed to run fgumi simulate grouped-reads");
-
-    assert!(status.success());
-    assert!(verify_template_coordinate_sorted(&bam_path));
+    // The canonical verifier: the output must already be in template-coordinate
+    // order. Exit code is non-zero (and this asserts) if any records are out of
+    // order — which is how the previous reverse-R1 mis-ordering was caught.
+    fgumi(&["sort", "-i", bam, "--verify", "--order", "template-coordinate"]);
 }
