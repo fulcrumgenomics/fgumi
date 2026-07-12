@@ -2771,12 +2771,17 @@ mod tests {
         );
 
         // ---- Grouping metrics ----
-        // 9 read pairs = 18 records accepted, 6 unique families
+        // 9 read pairs = 18 records accepted, 6 unique families.
+        // The `.grouping_metrics.txt` matches fgbio's 5-column `UmiGroupingMetric`;
+        // `total_records`/`total_families` are fgumi-internal and no longer serialized
+        // (family count is covered by the `.family_sizes.txt` assertions above).
         let grouping: Vec<UmiGroupingMetrics> = DelimFile::default().read_tsv(&grouping_path)?;
         assert_eq!(grouping.len(), 1);
-        assert_eq!(grouping[0].total_records, 18);
         assert_eq!(grouping[0].accepted_records, 18);
-        assert_eq!(grouping[0].total_families, 6);
+        assert_eq!(grouping[0].discarded_non_pf, 0);
+        assert_eq!(grouping[0].discarded_poor_alignment, 0);
+        assert_eq!(grouping[0].discarded_ns_in_umi, 0);
+        assert_eq!(grouping[0].discarded_umi_too_short, 0);
 
         // ---- Position group size histogram ----
         // 3 position groups: one with 1 family, one with 2, one with 3
@@ -2909,11 +2914,11 @@ mod tests {
 
         // Grouping counters: UmiGroupingMetrics has no PartialEq, so compare
         // the integer fields that the per-thread accumulators feed.
+        // The serialized metrics match fgbio's 5-column `UmiGroupingMetric`; the input
+        // total (20 = 18 accepted + 2 discarded) is fgumi-internal and no longer a column.
         let grouping: Vec<UmiGroupingMetrics> = DelimFile::default().read_tsv(&grouping_path)?;
         assert_eq!(grouping.len(), 1);
-        assert_eq!(grouping[0].total_records, 20);
         assert_eq!(grouping[0].accepted_records, 18);
-        assert_eq!(grouping[0].total_families, 6);
         assert_eq!(grouping[0].discarded_non_pf, 0);
         assert_eq!(grouping[0].discarded_poor_alignment, 0);
         assert_eq!(grouping[0].discarded_ns_in_umi, 2);
@@ -2999,9 +3004,22 @@ mod tests {
             DelimFile::default().read_tsv(&prefix_grouping)?;
         assert_eq!(individual_grouping.len(), 1);
         assert_eq!(prefix_grouping.len(), 1);
-        assert_eq!(individual_grouping[0].total_records, prefix_grouping[0].total_records);
+        // Compare the serialized fgbio columns (total_records/total_families are
+        // fgumi-internal and no longer written).
         assert_eq!(individual_grouping[0].accepted_records, prefix_grouping[0].accepted_records);
-        assert_eq!(individual_grouping[0].total_families, prefix_grouping[0].total_families);
+        assert_eq!(individual_grouping[0].discarded_non_pf, prefix_grouping[0].discarded_non_pf);
+        assert_eq!(
+            individual_grouping[0].discarded_poor_alignment,
+            prefix_grouping[0].discarded_poor_alignment
+        );
+        assert_eq!(
+            individual_grouping[0].discarded_ns_in_umi,
+            prefix_grouping[0].discarded_ns_in_umi
+        );
+        assert_eq!(
+            individual_grouping[0].discarded_umi_too_short,
+            prefix_grouping[0].discarded_umi_too_short
+        );
 
         // Position group sizes: only written via --metrics prefix
         let position: Vec<PositionGroupSizeMetrics> =

@@ -356,7 +356,7 @@ impl Clip {
             if let Some(mut metrics) = metrics_collection {
                 info!("Writing metrics to {}", metrics_path.display());
                 metrics.finalize();
-                let all_metrics = metrics.all_metrics();
+                let all_metrics = metrics.all_metrics().map(Clone::clone);
                 write_metrics_tsv(metrics_path, &all_metrics, "clipping")?;
                 info!("Metrics written successfully");
             }

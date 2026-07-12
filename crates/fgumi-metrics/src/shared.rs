@@ -24,8 +24,10 @@ pub struct UmiMetric {
     /// Number of double-stranded tag families observing this UMI
     pub unique_observations: usize,
     /// Fraction of all raw observations
+    #[serde(with = "crate::float")]
     pub fraction_raw_observations: f64,
     /// Fraction of all unique observations
+    #[serde(with = "crate::float")]
     pub fraction_unique_observations: f64,
 }
 

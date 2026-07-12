@@ -57,9 +57,11 @@ pub struct ConsensusMetrics {
     pub umi_groups_failed: u64,
 
     /// Average input reads per consensus read
+    #[serde(with = "crate::float")]
     pub avg_input_reads_per_consensus: f64,
 
     /// Average raw read depth per consensus read
+    #[serde(with = "crate::float")]
     pub avg_raw_read_depth: f64,
 
     /// Minimum raw read depth
@@ -728,5 +730,32 @@ mod tests {
         assert_eq!(kv.key, "test_key");
         assert_eq!(kv.value, "42");
         assert_eq!(kv.description, "A test metric");
+    }
+
+    #[test]
+    fn test_nan_infinity_serialization() -> anyhow::Result<()> {
+        use crate::writer::{read_metrics, write_metrics};
+        use tempfile::NamedTempFile;
+
+        let temp_file = NamedTempFile::new()?;
+        let path = temp_file.path();
+
+        // Both averaged-depth fields serialize through `crate::float`, so non-finite values
+        // (0/0 → NaN, n/0 → Infinity) must round-trip through fgumi's own writer/reader the
+        // same way `correct.rs::test_nan_infinity_serialization` pins them for the sibling
+        // metric type. Plain ryu `inf`/`-inf` tokens would fail fgbio's `Double.parseDouble`.
+        let mut metrics = ConsensusMetrics::new();
+        metrics.avg_input_reads_per_consensus = f64::NAN;
+        metrics.avg_raw_read_depth = f64::INFINITY;
+
+        write_metrics(path, &[metrics], "consensus")?;
+        let read_back: Vec<ConsensusMetrics> = read_metrics(path, "consensus")?;
+
+        assert_eq!(read_back.len(), 1);
+        assert!(read_back[0].avg_input_reads_per_consensus.is_nan());
+        assert!(read_back[0].avg_raw_read_depth.is_infinite());
+        assert!(read_back[0].avg_raw_read_depth > 0.0); // Positive infinity
+
+        Ok(())
     }
 }

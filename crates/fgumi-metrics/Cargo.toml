@@ -11,12 +11,15 @@ license.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 anyhow = "1.0"
 fgoxide = "0.6.0"
+tempfile = "3.3.0"
 noodles = { version = "0.111.0", features = ["sam"], optional = true }
 fgumi-raw-bam = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3.3.0"
 fgumi-sam = { workspace = true }
+rstest = "0.26"
+proptest = "1.10"
 
 [features]
 default = ["clip"]

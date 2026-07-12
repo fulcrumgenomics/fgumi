@@ -3,56 +3,10 @@
 //! This module provides metrics for tracking UMI correction operations.
 
 use anyhow::Result;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::Metric;
-
-/// Serializes an f64 as an integer string if it's a whole number.
-///
-/// This matches fgbio's output format where 0.0 is output as "0".
-#[expect(clippy::trivially_copy_pass_by_ref, reason = "serde requires &T signature")]
-fn serialize_f64_as_int<S>(value: &f64, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    let value = *value;
-    // Check for NaN and Infinity first
-    if value.is_nan() {
-        return serializer.serialize_str("NaN");
-    }
-    if value.is_infinite() {
-        return serializer.serialize_str(if value > 0.0 { "Infinity" } else { "-Infinity" });
-    }
-
-    // If the value is a whole number, serialize without decimal point
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "i64::MAX boundary check, exact precision not needed"
-    )]
-    let max_safe = i64::MAX as f64;
-    if value.fract() == 0.0 && value.abs() < max_safe {
-        #[expect(clippy::cast_possible_truncation, reason = "guarded by abs check above")]
-        let int_value = value as i64;
-        serializer.serialize_str(&format!("{int_value}"))
-    } else {
-        serializer.serialize_str(&format!("{value}"))
-    }
-}
-
-/// Deserializes an f64 from a string, handling special values like NaN and Infinity.
-fn deserialize_f64_from_str<'de, D>(deserializer: D) -> Result<f64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s: String = String::deserialize(deserializer)?;
-    match s.as_str() {
-        "NaN" => Ok(f64::NAN),
-        "Infinity" => Ok(f64::INFINITY),
-        "-Infinity" => Ok(f64::NEG_INFINITY),
-        _ => s.parse().map_err(serde::de::Error::custom),
-    }
-}
 
 /// Metrics tracking how well observed UMIs match expected UMI sequences.
 ///
@@ -90,17 +44,11 @@ pub struct UmiCorrectionMetrics {
     pub other_matches: u64,
 
     /// The fraction of all UMIs that matched or were corrected to this UMI.
-    #[serde(
-        serialize_with = "serialize_f64_as_int",
-        deserialize_with = "deserialize_f64_from_str"
-    )]
+    #[serde(with = "crate::float")]
     pub fraction_of_matches: f64,
 
     /// The `total_matches` for this UMI divided by the mean `total_matches` for all UMIs.
-    #[serde(
-        serialize_with = "serialize_f64_as_int",
-        deserialize_with = "deserialize_f64_from_str"
-    )]
+    #[serde(with = "crate::float")]
     pub representation: f64,
 }
 

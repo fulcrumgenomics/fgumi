@@ -55,17 +55,17 @@ fn test_group_command_writes_new_metrics() {
 
     let metric = &metrics[0];
 
-    // Verify basic fields are populated
-    assert!(metric.total_records > 0, "total_records should be positive");
-    assert!(metric.accepted_records > 0, "accepted_records should be positive");
-    assert!(metric.unique_molecule_ids > 0, "unique_molecule_ids should be positive");
-
-    // Rejection fields are validated by their presence in the struct (no runtime check needed
-    // since they are unsigned integers that are always >= 0)
-    let _ = metric.discarded_non_pf;
-    let _ = metric.discarded_poor_alignment;
-    let _ = metric.discarded_ns_in_umi;
-    let _ = metric.discarded_umi_too_short;
+    // Assert the exact serialized fgbio columns against `create_test_input_bam`'s known
+    // structure: three families of 10 + 5 + 15 single-end reads, all PF, all mapq 60, all
+    // carrying a valid 8bp UMI with no Ns — so every record is accepted and nothing is
+    // discarded. The `.grouping_metrics.txt` matches fgbio's 5-column `UmiGroupingMetric`;
+    // `total_records`/`unique_molecule_ids` are fgumi-internal (`#[serde(skip)]`) and read
+    // back as zero, so they are not asserted here.
+    assert_eq!(metric.accepted_records, 30, "all 30 input records should be accepted");
+    assert_eq!(metric.discarded_non_pf, 0);
+    assert_eq!(metric.discarded_poor_alignment, 0);
+    assert_eq!(metric.discarded_ns_in_umi, 0);
+    assert_eq!(metric.discarded_umi_too_short, 0);
 }
 
 /// Test that the group command handles UMIs with N bases correctly.
