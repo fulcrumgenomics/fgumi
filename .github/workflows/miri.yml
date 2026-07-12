@@ -1,0 +1,64 @@
+name: Miri (undefined-behavior check)
+
+# The approved `unsafe` hot paths document `# SAFETY` invariants that only human
+# review has enforced. Miri interprets the tests that exercise them and flags
+# undefined behavior (out-of-bounds, invalid pointer use, aliasing violations),
+# turning those invariants into a machine-checked gate.
+#
+# Scope: `fgumi-raw-bam`, which contains the raw-pointer queryname comparator
+# (`natural_compare` / `natural_compare_nul`, via `get_unchecked` and `*const u8`
+# walks) and has no FFI. `fgumi-sort` is intentionally not covered yet: its
+# `memory_probe` module calls the mimalloc / mach2 FFI, which Miri cannot execute,
+# so covering its radix-sort unsafe needs `#[cfg(not(miri))]` guards first
+# (tracked as a follow-up).
+#
+# Runs on a schedule (and on demand) rather than per-PR: Miri needs the nightly
+# toolchain (which can regress independently of this repo) and is much slower than
+# a normal test run, so a nightly-Miri hiccup should not block unrelated changes.
+on:
+  schedule:
+    - cron: "0 8 * * *" # daily at 08:00 UTC
+  workflow_dispatch: {}
+
+# The job only reads the repository and runs tests; it never writes back.
+permissions:
+  contents: read
+
+# A manual dispatch overlapping (or a delayed) scheduled run adds no signal, so
+# keep only the newest run of this workflow alive.
+concurrency:
+  group: miri-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep the raw-pointer proptest agreement test tractable under Miri's interpreter.
+  PROPTEST_CASES: "32"
+
+jobs:
+  miri:
+    runs-on: ubuntu-latest
+    # The scoped `sort` tests take seconds locally; anything near this cap means
+    # the interpreter (or a nightly regression) is hung, and on a daily cron that
+    # should fail fast rather than idle at GitHub's 6-hour default.
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # Nothing here pushes, so don't leave the token in `.git/config`.
+          persist-credentials: false
+      - name: Install Rust nightly + miri
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable action, nightly toolchain
+        with:
+          toolchain: nightly
+          components: miri
+      - name: Miri — fgumi-raw-bam raw-pointer comparator
+        # Scope to the `sort` module: that is where the approved `unsafe` lives
+        # (`natural_compare`/`natural_compare_nul` — `get_unchecked` and `*const u8`
+        # walks). The rest of the crate can't run under Miri anyway: the `sequence`
+        # SIMD tests call platform intrinsics (NEON on arm, SSE/AVX on x86) that Miri
+        # cannot interpret, and the BAM encode/decode roundtrip tests are slow and
+        # exercise no `unsafe` of ours. The `sort` tests (comparator + coordinate/
+        # queryname raw-key tests) run clean under Miri in a few seconds.
+        run: cargo +nightly miri test -p fgumi-raw-bam sort
