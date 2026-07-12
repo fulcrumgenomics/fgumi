@@ -37,9 +37,17 @@ struct WriterState {
     pending_header: Option<PendingHeader>,
 }
 
+/// Transform applied to the aligner's runtime-resolved header before it is
+/// written. Lets a post-`Align` stage (sort-order rewrite, consensus header,
+/// clip) re-apply its header change on top of the resolved header — which
+/// carries the aligner's runtime `@PG`/`@RG`/`@CO` — instead of discarding that
+/// provenance by writing a build-time header.
+pub type ResolvedHeaderTransform = Box<dyn Fn(Header) -> io::Result<Header> + Send + Sync>;
+
 struct PendingHeader {
     handle: HeaderHandle,
     compression_level: u32,
+    transform: Option<ResolvedHeaderTransform>,
 }
 
 impl WriteBgzfFile {
@@ -91,6 +99,10 @@ impl WriteBgzfFile {
     /// Open `path` and return the sink with the BAM header write
     /// deferred until an upstream step resolves `handle`.
     ///
+    /// `transform`, when `Some`, is applied to the resolved header before it is
+    /// written — see [`ResolvedHeaderTransform`] for why this exists; pass `None`
+    /// when the resolved header should be written unchanged.
+    ///
     /// # Errors
     ///
     /// Returns I/O errors from path open. Header-write errors are
@@ -99,13 +111,14 @@ impl WriteBgzfFile {
         path: P,
         handle: HeaderHandle,
         compression_level: u32,
+        transform: Option<ResolvedHeaderTransform>,
     ) -> io::Result<Self> {
         let file = File::create(path.as_ref())?;
         let out = BufWriter::with_capacity(256 * 1024, file);
         Ok(Self {
             state: Mutex::new(Some(WriterState {
                 out,
-                pending_header: Some(PendingHeader { handle, compression_level }),
+                pending_header: Some(PendingHeader { handle, compression_level, transform }),
             })),
             name: "WriteBgzfFile",
             detached_group: None,
@@ -122,6 +135,13 @@ impl WriteBgzfFile {
             Some(Ok(h)) => h.clone(),
         };
         let level = pending.compression_level;
+        // Re-apply the post-align header change (sort order / consensus / clip)
+        // on top of the aligner's runtime-resolved header so its @PG/@RG/@CO
+        // survive into the written header.
+        let header_clone = match &pending.transform {
+            Some(transform) => transform(header_clone)?,
+            None => header_clone,
+        };
 
         let mut header_bytes = Vec::new();
         fgumi_bam_io::write_bam_header(&mut header_bytes, &header_clone)
@@ -281,7 +301,7 @@ mod tests {
     fn new_with_handle_defers_header_until_resolved() {
         let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
         let handle = HeaderHandle::new();
-        let step = WriteBgzfFile::new_with_handle(&path, handle.clone(), 1).unwrap();
+        let step = WriteBgzfFile::new_with_handle(&path, handle.clone(), 1, None).unwrap();
 
         let bytes_before = std::fs::read(&path).unwrap();
         assert_eq!(bytes_before.len(), 0, "no bytes written until header resolves");
@@ -312,10 +332,59 @@ mod tests {
     }
 
     #[test]
+    fn resolved_header_transform_runs_on_the_resolved_header() {
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let handle = HeaderHandle::new();
+
+        // Capture the header the transform is handed, to prove it is the
+        // runtime-resolved (aligner) header — not a build-time header.
+        let seen: Arc<StdMutex<Option<Header>>> = Arc::new(StdMutex::new(None));
+        let seen_for_closure = Arc::clone(&seen);
+        let transform: ResolvedHeaderTransform = Box::new(move |resolved: Header| {
+            *seen_for_closure.lock().unwrap() = Some(resolved.clone());
+            Ok(resolved)
+        });
+
+        let step =
+            WriteBgzfFile::new_with_handle(&path, handle.clone(), 1, Some(transform)).unwrap();
+
+        // Nothing is written (and the transform must not run) until the handle
+        // resolves.
+        {
+            let mut guard = step.state.lock();
+            let state = guard.as_mut().expect("state present");
+            assert!(!WriteBgzfFile::try_write_pending_header(state).unwrap());
+        }
+        assert!(seen.lock().unwrap().is_none(), "transform must not run before resolution");
+
+        // Resolve with a distinctive header standing in for the aligner's
+        // runtime-resolved header.
+        let resolved = Header::builder().add_comment("ALIGNER-PROVENANCE").build();
+        handle.set(resolved.clone()).expect("set");
+        {
+            let mut guard = step.state.lock();
+            let state = guard.as_mut().expect("state present");
+            assert!(WriteBgzfFile::try_write_pending_header(state).unwrap(), "resolved -> written");
+            state.out.flush().unwrap();
+        }
+
+        // The transform ran, and it received the resolved header — so a
+        // post-align stage's transform is applied on top of the aligner header.
+        assert_eq!(
+            seen.lock().unwrap().as_ref(),
+            Some(&resolved),
+            "transform must receive the resolved header, preserving aligner provenance",
+        );
+        assert!(std::fs::read(&path).unwrap().len() >= 2, "header block was written");
+    }
+
+    #[test]
     fn new_with_handle_propagates_poison() {
         let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
         let handle = HeaderHandle::new();
-        let step = WriteBgzfFile::new_with_handle(&path, handle.clone(), 1).unwrap();
+        let step = WriteBgzfFile::new_with_handle(&path, handle.clone(), 1, None).unwrap();
 
         handle.poison(io::Error::new(io::ErrorKind::BrokenPipe, "aligner died")).unwrap();
         let mut guard = step.state.lock();
@@ -351,7 +420,7 @@ mod tests {
         let path = tempfile::NamedTempFile::new().unwrap();
         let path_buf = path.path().to_path_buf();
         let handle = HeaderHandle::new();
-        let step = WriteBgzfFile::new_with_handle(&path_buf, handle, 1).unwrap();
+        let step = WriteBgzfFile::new_with_handle(&path_buf, handle, 1, None).unwrap();
         drop(step);
 
         let bytes = std::fs::read(&path_buf).unwrap();

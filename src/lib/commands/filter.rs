@@ -626,7 +626,10 @@ impl FilterOptions {
     /// supplies separate CC/AB/BA values (indexed as `[0]` = CC/duplex,
     /// `[1]` = AB, `[2]` = BA), the more-stringent value must come first.
     /// - For min-reads: ba <= ab <= cc (more reads required = more stringent)
-    /// - For error rates: cc <= ab <= ba (lower error allowed = more stringent)
+    /// - For error rates: ONLY ab <= ba is enforced; CC is left unconstrained.
+    ///   This matches fgbio (`FilterConsensusReads` validates only
+    ///   `ba >= ab`), so e.g. `--max-base-error-rate 0.1 0.05 0.2` is valid
+    ///   (up to 10% overall, but only if at least one single strand is < 5%).
     pub(crate) fn validate_parameters(&self) -> Result<()> {
         // Validate min-reads
         if self.min_reads.is_empty() || self.min_reads.len() > 3 {
@@ -696,19 +699,13 @@ impl FilterOptions {
             }
         }
 
-        // Validate error rate ordering: CC (duplex) <= AB <= BA, where the lower
-        // allowed error is the more-stringent floor and must come first. The
-        // two-value case ([0]=CC, [1]=AB) is checked here; the three-value case
-        // adds the AB <= BA edge below.
-        if self.max_read_error_rate.len() >= 2 {
-            let cc_error = self.max_read_error_rate[0];
-            let ab_error = self.max_read_error_rate[1];
-            if cc_error > ab_error {
-                bail!(
-                    "max-read-error-rate for duplex (CC) must be <= AB (more stringent), got CC={cc_error} > AB={ab_error}"
-                );
-            }
-        }
+        // Validate error-rate ordering. Unlike min-reads (which must be strictly
+        // high to low), fgbio enforces ONLY that AB is at least as stringent as
+        // BA (AB <= BA) for the error rates — CC may be *larger* than AB. This
+        // deliberately allows e.g. `--max-base-error-rate 0.1 0.05 0.2` (up to 10%
+        // overall, but only if at least one single strand is < 5%). See fgbio
+        // FilterConsensusReads: "For error rates only enforce that ab is more
+        // stringent than ba". So only the three-value AB <= BA edge is checked.
         if self.max_read_error_rate.len() >= 3 {
             let ab_error = self.max_read_error_rate[1];
             let ba_error = self.max_read_error_rate[2];
@@ -719,15 +716,6 @@ impl FilterOptions {
             }
         }
 
-        if self.max_base_error_rate.len() >= 2 {
-            let cc_error = self.max_base_error_rate[0];
-            let ab_error = self.max_base_error_rate[1];
-            if cc_error > ab_error {
-                bail!(
-                    "max-base-error-rate for duplex (CC) must be <= AB (more stringent), got CC={cc_error} > AB={ab_error}"
-                );
-            }
-        }
         if self.max_base_error_rate.len() >= 3 {
             let ab_error = self.max_base_error_rate[1];
             let ba_error = self.max_base_error_rate[2];
@@ -1064,29 +1052,37 @@ mod tests {
         assert!(cmd.options.validate_parameters().is_err());
     }
 
-    #[test]
-    fn test_validate_read_error_rate_cc_gt_ab_rejected() {
-        // [0]=CC, [1]=AB: CC must be the more-stringent (lower) floor, so
-        // CC > AB violates the documented duplex-to-AB ordering even with only
-        // two values supplied (the prior code only checked the 3-value AB/BA edge).
+    // fgbio does NOT constrain CC <= AB for error rates (only AB <= BA), so a
+    // CC larger than AB is valid for BOTH the read- and base-error-rate vectors,
+    // at either the 2-value (CC, AB) or the 3-value (CC, AB, BA) length. The
+    // 3-value cases keep AB <= BA so only the CC-unconstrained behavior is
+    // exercised. Both fields are covered at both lengths so a regression in
+    // either field's two- or three-value path is caught.
+    #[rstest]
+    // read-error-rate, CC > AB, 2-value: `--max-read-error-rate 0.20 0.10`
+    #[case::read_two_value(true, vec![0.20, 0.10])]
+    // read-error-rate, CC > AB, 3-value (AB <= BA): `0.20 0.10 0.15`
+    #[case::read_three_value(true, vec![0.20, 0.10, 0.15])]
+    // base-error-rate, CC > AB, 2-value: `--max-base-error-rate 0.20 0.10`
+    #[case::base_two_value(false, vec![0.20, 0.10])]
+    // base-error-rate, CC > AB, 3-value (the fgbio-documented example): allow up
+    // to 10% overall but only if at least one single strand is < 5%
+    #[case::base_three_value(false, vec![0.1, 0.05, 0.2])]
+    fn test_validate_error_rate_cc_gt_ab_accepted(#[case] is_read: bool, #[case] values: Vec<f64>) {
         let mut cmd = create_filter_with_paths(
             PathBuf::from("input.bam"),
             PathBuf::from("output.bam"),
             PathBuf::from("ref.fa"),
         );
-        cmd.options.max_read_error_rate = vec![0.20, 0.10]; // CC=0.20 > AB=0.10
-        assert!(cmd.options.validate_parameters().is_err());
-    }
-
-    #[test]
-    fn test_validate_base_error_rate_cc_gt_ab_rejected() {
-        let mut cmd = create_filter_with_paths(
-            PathBuf::from("input.bam"),
-            PathBuf::from("output.bam"),
-            PathBuf::from("ref.fa"),
+        if is_read {
+            cmd.options.max_read_error_rate = values;
+        } else {
+            cmd.options.max_base_error_rate = values;
+        }
+        assert!(
+            cmd.options.validate_parameters().is_ok(),
+            "CC > AB error-rate vector must be accepted (is_read={is_read})"
         );
-        cmd.options.max_base_error_rate = vec![0.20, 0.10]; // CC=0.20 > AB=0.10
-        assert!(cmd.options.validate_parameters().is_err());
     }
 
     #[test]

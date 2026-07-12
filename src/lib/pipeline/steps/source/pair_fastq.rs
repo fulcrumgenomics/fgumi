@@ -321,13 +321,54 @@ impl Step2 for PairRawFastq {
             return Ok(StepOutcome::Progress);
         }
 
-        // Nothing pulled or emitted this call. If both input branches are
-        // drained, the pairing is complete — flush remaining pairs and finish.
+        // Nothing pulled or emitted this call. When over backpressure, pulling
+        // of the surplus (ahead) stream has stopped, so if the front pending pair
+        // is missing a record from a stream that is already drained, that stream
+        // can never complete the pair AND the ahead stream can never drain —
+        // `finalize_pairs` (both-drained) is unreachable, and `pending_total_bytes`
+        // plateaus below the 2x catastrophic-desync abort so that guard never
+        // fires either. This is the unequal-record-count case (e.g. a truncated
+        // R1): fail fast instead of spinning `NoProgress` forever (a silent hang).
+        // Under normal backpressure both streams still drain and the richer
+        // `finalize_pairs` desync report handles the mismatch.
+        if self.pending_total_bytes > self.pending_backpressure_bytes {
+            if let Some((&serial, (a_slot, b_slot))) = self.pending.iter().next() {
+                let a_short = a_slot.is_none() && ctx.a.is_drained();
+                let b_short = b_slot.is_none() && ctx.b.is_drained();
+                if a_short || b_short {
+                    // The stream whose front slot is missing is the one that ended
+                    // early. Report through the shared helper so this mid-stream
+                    // fail-fast names the short stream and orphaned serial exactly
+                    // like the both-drained `finalize_pairs` path.
+                    let short_stream = usize::from(!a_short);
+                    return Err(out_of_sync_error(short_stream, serial));
+                }
+            }
+        }
+
+        // If both input branches are drained, the pairing is complete — flush
+        // remaining pairs and finish.
         if ctx.a.is_drained() && ctx.b.is_drained() {
             return self.finalize_pairs(ctx);
         }
         Ok(StepOutcome::NoProgress)
     }
+}
+
+/// Build the canonical FASTQ out-of-sync error identifying the stream that ended
+/// early. `short_stream` is the 0-based index of the stream that ran out of
+/// records first (0 = R1/A, 1 = R2/B) and `chunk_serial` is the orphaned serial
+/// still holding only the other stream's chunk.
+///
+/// Shared by both fail paths — the both-drained [`PairRawFastq::finalize_pairs`]
+/// desync report and the over-backpressure mid-stream fail-fast — so the two
+/// surface byte-for-byte identical diagnostics regardless of which path detects
+/// the mismatch.
+fn out_of_sync_error(short_stream: usize, chunk_serial: u64) -> io::Error {
+    io::Error::other(format!(
+        "FASTQ sources out of sync: stream {short_stream} ended before chunk_serial \
+         {chunk_serial} while the other stream had more records"
+    ))
 }
 
 impl PairRawFastq {
@@ -344,10 +385,7 @@ impl PairRawFastq {
         let entry = self.pending.get(&lowest_serial).unwrap();
         if entry.0.is_none() || entry.1.is_none() {
             let short = usize::from(entry.0.is_some());
-            return Err(io::Error::other(format!(
-                "FASTQ sources out of sync: stream {short} ended before chunk_serial \
-                 {lowest_serial} while the other stream had more records"
-            )));
+            return Err(out_of_sync_error(short, lowest_serial));
         }
         let pair = self.try_emit_complete().expect("entry is complete");
         if let Err(unpushed) = ctx.outputs.push(pair) {
@@ -808,6 +846,14 @@ mod tests {
     /// both desync tests so the stream-0-short and stream-1-short cases exercise
     /// byte-for-byte the same wiring (only the lengths swap).
     fn run_desync_harness(serials0: u64, serials1: u64) -> Result<(), String> {
+        run_desync_harness_with_backpressure(serials0, serials1, None)
+    }
+
+    fn run_desync_harness_with_backpressure(
+        serials0: u64,
+        serials1: u64,
+        backpressure_bytes: Option<usize>,
+    ) -> Result<(), String> {
         use std::time::{Duration, Instant};
 
         // Both sources are leaders with no lag gate; the shared counter is
@@ -830,9 +876,14 @@ mod tests {
                     X3_SOURCE_QUEUE_BYTES,
                     progress_for_thread,
                 );
-                // Generous backpressure so the catastrophic-desync 2x abort never
-                // trips before the end-of-stream `finalize_pairs` desync path.
-                let pair = PairRawFastq::new(64 * 1024);
+                // Default (generous) backpressure lets the streams reach the
+                // end-of-stream `finalize_pairs` desync path; a small cap instead
+                // exercises the mid-stream fail-fast (surplus over 1x stops
+                // pulling before both branches drain).
+                let pair = match backpressure_bytes {
+                    Some(bytes) => PairRawFastq::new(64 * 1024).with_backpressure_bytes(bytes),
+                    None => PairRawFastq::new(64 * 1024),
+                };
                 let sink = PairSink {
                     seen_serials: Arc::new(Mutex::new(Vec::new())),
                     count: Arc::new(AtomicUsize::new(0)),
@@ -896,6 +947,42 @@ mod tests {
             err.contains("stream 0 ended before chunk_serial 2"),
             "desync error must name the short stream (index 0) and the orphaned \
              serial (2), got: {err}"
+        );
+    }
+
+    #[test]
+    fn truncated_stream_over_backpressure_fails_fast_instead_of_hanging() {
+        // Stream 0 (a) has 3 chunks (X3_CHUNK_BYTES each), stream 1 (b) has 1.
+        // With a small backpressure cap, after the first pair the surplus from
+        // stream 0 crosses 1x the cap, so per-stream backpressure STOPS pulling
+        // stream 0 — leaving its remaining chunks unpulled (so it never drains),
+        // and pending plateaus BELOW the 2x catastrophic-desync abort, which
+        // therefore never fires. The front pair is missing stream 1, which is
+        // drained. Pre-fix this spun `NoProgress` forever (the harness's 30s
+        // deadline would trip); the fix detects the unpairable record and fails
+        // fast. This also proves the run terminates (no hang).
+        let result = run_desync_harness_with_backpressure(3, 1, Some(X3_SOFT_LIMIT_BYTES));
+        let err = result.expect_err("truncated stream over backpressure must abort, not hang");
+        assert!(
+            err.contains("out of sync") && err.contains("stream 1 ended before chunk_serial 1"),
+            "backpressure fail-fast must reuse the shared out-of-sync error naming the \
+             short stream (index 1) and the orphaned serial (1), got: {err}"
+        );
+    }
+
+    #[test]
+    fn truncated_stream_zero_over_backpressure_fails_fast_instead_of_hanging() {
+        // Mirror of the above with the lengths swapped: stream 0 (a) has 1 chunk,
+        // stream 1 (b) has 3. Now the surplus is stream 1, and the front pair is
+        // missing stream 0, which is drained — so this drives the symmetric
+        // `a_slot.is_none() && ctx.a.is_drained()` branch that the stream-1-short
+        // test leaves unexercised. The abort must name the short stream (index 0).
+        let result = run_desync_harness_with_backpressure(1, 3, Some(X3_SOFT_LIMIT_BYTES));
+        let err = result.expect_err("truncated stream over backpressure must abort, not hang");
+        assert!(
+            err.contains("out of sync") && err.contains("stream 0 ended before chunk_serial 1"),
+            "backpressure fail-fast must reuse the shared out-of-sync error naming the \
+             short stream (index 0) and the orphaned serial (1), got: {err}"
         );
     }
 }
