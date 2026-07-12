@@ -184,223 +184,112 @@ struct CollectedClipMetrics {
     extend_clipped: u64,
 }
 
-impl Command for Clip {
-    #[allow(clippy::too_many_lines)]
-    fn execute(&self, command_line: &str) -> Result<()> {
-        // Validate the input exists (stdin paths are exempt).
-        self.io.validate()?;
-        validate_file_exists(&self.reference, "Reference FASTA")?;
-
-        info!("Clip");
-        info!("  Input: {}", self.io.input.display());
-        info!("  Output: {}", self.io.output.display());
-        info!("  Clipping mode: {}", self.clipping_mode);
-        info!("  Clip overlapping reads: {}", self.clip_overlapping_reads);
-        info!("  Clip extending past mate: {}", self.clip_extending_past_mate);
-        info!("  {}", self.threading.log_message());
-
-        let timer = OperationTimer::new("Clipping reads");
-
-        let mode = self.clipping_mode;
-
-        // Validate clipping parameters
-        if self.upgrade_clipping
-            || self.clip_overlapping_reads
-            || self.clip_extending_past_mate
-            || self.read_one_five_prime > 0
-            || self.read_one_three_prime > 0
-            || self.read_two_five_prime > 0
-            || self.read_two_three_prime > 0
-        {
-            // At least one clipping option is active
-        } else {
-            anyhow::bail!("At least one clipping option is required");
-        }
-
-        // --metrics is not produced in --threads mode; fail fast rather than
-        // silently dropping a user-requested output file.
-        if self.threading.threads.is_some()
-            && let Some(path) = &self.metrics
-        {
-            anyhow::bail!(
-                "--metrics {} cannot be used with --threads: detailed clipping metrics \
-                     are only produced by the single-threaded path",
-                path.display()
-            );
-        }
-
-        // ========================================================================
-        // CRITICAL: Check --threads mode BEFORE creating any file handles.
-        // The 7-step pipeline manages its own I/O and writer lifecycle, so we
-        // must not create a writer here if we're going to use the pipeline.
-        // Route: Some(threads) -> pipeline, None -> single-threaded fast path
-        // ========================================================================
-        let total_records = if let Some(threads) = self.threading.threads {
-            // Read header for the 7-step pipeline (supports stdin)
-            let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
-
-            // Synthesize @HD VN:1.6 SO:unsorted when the input lacks one (match fgbio).
-            // Run before require_query_grouped so both execution modes guard the same
-            // normalized header (matching execute_single_threaded's ordering).
-            let header = crate::commands::common::ensure_hd_record(header)?;
-
-            // CLIP3-05: fgbio's ClipBam calls Bams.requireQueryGrouped. Clipping is
-            // template-based (pair clip, overlap, past-mate, mate-fix), so coordinate-
-            // sorted input silently mis-groups mates. Guard the *input* header.
-            crate::commands::common::require_query_grouped(
-                &header,
-                &self.io.input.display().to_string(),
-            )?;
-
-            // Load reference (always required for clip)
-            let reference = Arc::new(ReferenceReader::new(&self.reference)?);
-
-            // Add @PG record with PP chaining to input's last program
-            let header = crate::commands::common::add_pg_record(header, command_line)?;
-
-            self.execute_threads_mode(reader, threads, header, reference)?
-        } else {
-            self.execute_single_threaded(mode, command_line)?
-        };
-
-        timer.log_completion(total_records);
-        Ok(())
-    }
+/// Per-template clipping configuration, decoupled from `&Clip`.
+///
+/// The single-threaded path holds a `&Clip` and could read these fields directly, but the
+/// multi-threaded pipeline's `process_fn` runs in a `move` closure that cannot borrow `&self`.
+/// Capturing this small `Copy` value lets both paths share the exact same per-template
+/// clipping logic (`clip_template`/`clip_pair`/`clip_fragment`) instead of maintaining two
+/// copies that can silently drift apart.
+#[derive(Debug, Clone, Copy)]
+struct ClipParams {
+    /// Upgrade existing clipping to the configured mode before applying new clipping.
+    upgrade_clipping: bool,
+    /// Clip the overlapping bases of an FR read pair.
+    clip_overlapping_reads: bool,
+    /// Clip bases of a read that extend past its mate's start.
+    clip_extending_past_mate: bool,
+    /// Minimum bases to clip from the 5' end of R1.
+    read_one_five_prime: usize,
+    /// Minimum bases to clip from the 3' end of R1.
+    read_one_three_prime: usize,
+    /// Minimum bases to clip from the 5' end of R2.
+    read_two_five_prime: usize,
+    /// Minimum bases to clip from the 3' end of R2.
+    read_two_three_prime: usize,
 }
 
-impl Clip {
-    /// Execute single-threaded clipping.
-    #[allow(clippy::too_many_lines)]
-    fn execute_single_threaded(&self, mode: ClippingMode, command_line: &str) -> Result<u64> {
-        // Create clipper
-        let clipper = if self.auto_clip_attributes {
-            RawRecordClipper::with_auto_clip(mode, true)
-        } else {
-            RawRecordClipper::new(mode)
-        };
+impl ClipParams {
+    /// Builds the per-template clip configuration from the parsed `Clip` command.
+    fn from_clip(clip: &Clip) -> Self {
+        Self {
+            upgrade_clipping: clip.upgrade_clipping,
+            clip_overlapping_reads: clip.clip_overlapping_reads,
+            clip_extending_past_mate: clip.clip_extending_past_mate,
+            read_one_five_prime: clip.read_one_five_prime,
+            read_one_three_prime: clip.read_one_three_prime,
+            read_two_five_prime: clip.read_two_five_prime,
+            read_two_three_prime: clip.read_two_three_prime,
+        }
+    }
 
-        // Create metrics collection if metrics output requested
-        let mut metrics_collection =
-            self.metrics.as_ref().map(|_| ClippingMetricsCollection::new());
-
-        // Load reference (always required and tags are always regenerated to match Scala fgbio)
-        let reference_reader = ReferenceReader::new(&self.reference)?;
-
-        // Open input BAM with MT BGZF decompression
-        let reader_threads = self.threading.num_threads();
-        let (reader, header) = create_raw_bam_reader(&self.io.input, reader_threads)?;
-
-        // Synthesize @HD VN:1.6 SO:unsorted when the input lacks one (match fgbio).
-        let header = crate::commands::common::ensure_hd_record(header)?;
-        // CLIP3-05: require query-grouped input (fgbio Bams.requireQueryGrouped).
-        crate::commands::common::require_query_grouped(
-            &header,
-            &self.io.input.display().to_string(),
-        )?;
-
-        // Add @PG record with PP chaining to input's last program
-        let header = crate::commands::common::add_pg_record(header, command_line)?;
-
-        // Create output BAM writer with multi-threaded BGZF compression
-        let writer_threads = self.threading.num_threads();
-        let mut writer = create_raw_bam_writer(
-            &self.io.output,
-            &header,
-            writer_threads,
-            self.compression.compression_level,
-        )?;
-
-        // Process templates
-        info!("Processing templates...");
-
-        let mut total_records: usize = 0;
-        let mut total_clipped_overlap: u64 = 0;
-        let mut total_clipped_mate_extension: u64 = 0;
-        let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
-
-        // Single-threaded processing: iterate raw templates, clip in place
-        let template_iter = TemplateIterator::new(reader);
-
-        for template in template_iter {
-            let template = template?;
-            let mut records: Vec<RawRecord> = template.into_records();
-
-            // Upgrade existing clipping on *every* read of the template first — including
-            // secondary/supplementary alignments — matching fgbio ClipBam, which runs
-            // `upgradeAllClipping` over `template.allReads` (ClipBam.scala:123) before clipping the
-            // primary pair. Doing it per-template here (rather than per-primary inside
-            // clip_pair/clip_fragment) is what lets supplementary reads' clipping be upgraded too.
-            if self.upgrade_clipping {
-                for record in &mut records {
-                    clipper.upgrade_all_clipping_raw(record)?;
-                }
+    /// Clips one template's primary reads and repairs mate information.
+    ///
+    /// Clips the primary R1/R2 pair (or a lone primary fragment) — located by SAM flags via
+    /// [`find_primary_pair_indices`], never positional `records[0]`/`records[1]` — so templates
+    /// carrying secondary/supplementary reads (len > 2) are clipped too, matching fgbio
+    /// `ClipBam`'s `Template.r1`/`r2` handling. For a pair it then fixes full mate-pair info
+    /// (mate coords/strand, mate-unmapped flag, MQ/MC, TLEN) via [`set_mate_info_raw`] — matching
+    /// fgbio's `SamPairUtil.setMateInfo` — and repairs mate info on any supplementary alignments.
+    ///
+    /// When `--upgrade-clipping` is set, existing clipping is first upgraded on *every* read of
+    /// the template — including secondary/supplementary alignments — before the primary pair is
+    /// clipped, matching fgbio `ClipBam`'s `template.allReads.foreach(upgradeAllClipping)`
+    /// (`ClipBam.scala:123`). Doing this template-wide pre-pass here (rather than per-primary
+    /// inside [`clip_pair`]/[`clip_fragment`]) is what lets supplementary reads' clipping be
+    /// upgraded too, and keeps both threading paths in lockstep since both go through this method.
+    ///
+    /// This is the single shared implementation used by both the single-threaded and
+    /// multi-threaded clip paths. When `metrics` is `Some`, per-read base-clip counts are
+    /// accumulated (single-threaded metrics output); the multi-threaded path passes `None` and
+    /// relies solely on the returned per-template flags.
+    ///
+    /// Returns `(overlap_clipped, extend_clipped)`: whether overlap and/or mate-extension
+    /// clipping removed any bases from the pair. A lone fragment returns `(false, false)`, as do
+    /// the non-clipping shapes fgbio also passes through untouched — a lone primary R2 (no R1) and
+    /// an empty / all-secondary-and-supplementary template.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if primary-pair detection or a clipping operation fails.
+    fn clip_template(
+        &self,
+        records: &mut [RawRecord],
+        clipper: &RawRecordClipper,
+        metrics: Option<&mut ClippingMetricsCollection>,
+    ) -> Result<(bool, bool)> {
+        // Upgrade existing clipping on *every* read of the template first — including
+        // secondary/supplementary alignments — matching fgbio ClipBam (ClipBam.scala:123) before
+        // clipping the primary pair. The per-read `clip_pair`/`clip_fragment` helpers deliberately
+        // do NOT upgrade, so this pre-pass is the sole upgrade site for both threading paths.
+        if self.upgrade_clipping {
+            for record in records.iter_mut() {
+                clipper.upgrade_all_clipping_raw(record)?;
             }
-
-            // Clip the primary R1/R2 (or a lone fragment) — never positional records[0]/[1] —
-            // so templates with secondary/supplementary reads (len > 2) are clipped too, matching
-            // fgbio ClipBam's Template.r1/r2 handling.
-            match find_primary_pair_indices(&records)? {
-                (Some(i1), Some(i2)) => {
-                    let [r1, r2] =
-                        records.get_disjoint_mut([i1, i2]).expect("distinct primary indices");
-
-                    let (overlap_clip, extend_clip) =
-                        self.clip_pair(&clipper, r1, r2, metrics_collection.as_mut())?;
-
-                    if overlap_clip {
-                        total_clipped_overlap += 1;
-                    }
-                    if extend_clip {
-                        total_clipped_mate_extension += 1;
-                    }
-
-                    // Fix full mate-pair info (mate coords/strand, mate-unmapped flag, MQ/MC,
-                    // TLEN), matching fgbio ClipBam's SamPairUtil.setMateInfo call, then repair
-                    // mate info on any supplementary alignments in the template.
-                    set_mate_info_raw(r1, r2);
-                    fix_supplemental_mate_info(&mut records, i1, i2);
-                }
-                (Some(i1), None) => {
-                    self.clip_fragment(&clipper, &mut records[i1], metrics_collection.as_mut())?;
-                }
-                _ => {}
-            }
-
-            // Regenerate alignment tags (always done to match Scala fgbio behavior)
-            for record in &mut records {
-                regenerate_alignment_tags_raw(record.as_mut_vec(), &header, &reference_reader)?;
-            }
-
-            // Count and write records
-            let batch_size = records.len();
-            total_records += batch_size;
-            for record in &records {
-                writer.write_raw_record(record.as_ref())?;
-            }
-            progress.log_if_needed(batch_size as u64);
         }
 
-        progress.log_final();
-        info!("Total records processed: {total_records}");
-        info!("Templates with overlap clipping: {total_clipped_overlap}");
-        info!("Templates with mate extension clipping: {total_clipped_mate_extension}");
-
-        // Write metrics if requested
-        if let Some(metrics_path) = &self.metrics
-            && let Some(mut metrics) = metrics_collection
-        {
-            info!("Writing metrics to {}", metrics_path.display());
-            metrics.finalize();
-            let all_metrics = metrics.all_metrics().map(Clone::clone);
-            write_metrics_tsv(metrics_path, &all_metrics, "clipping")?;
-            info!("Metrics written successfully");
+        match find_primary_pair_indices(records)? {
+            (Some(i1), Some(i2)) => {
+                let [r1, r2] =
+                    records.get_disjoint_mut([i1, i2]).expect("distinct primary indices");
+                let outcome = self.clip_pair(clipper, r1, r2, metrics)?;
+                set_mate_info_raw(r1, r2);
+                fix_supplemental_mate_info(records, i1, i2);
+                Ok(outcome)
+            }
+            (Some(i1), None) => {
+                self.clip_fragment(clipper, &mut records[i1], metrics)?;
+                Ok((false, false))
+            }
+            // A lone primary R2 (second-of-pair with no first-of-pair mate) — or an empty /
+            // all-secondary-and-supplementary template — is deliberately left unclipped and passed
+            // through untouched. This mirrors fgbio `ClipBam`'s `case _ => ()` (`ClipBam.scala:133`):
+            // fgbio clips only the `(r1, r2)` pair and the `(r1, None)` fragment cases, so a
+            // second-of-pair primary orphaned from its R1 is a malformed template that fgbio does not
+            // clip. Matching that exactly keeps fgumi's output byte-identical to fgbio's rather than
+            // clipping the R2 with fragment/read-one thresholds it should not receive.
+            (None, _) => Ok((false, false)),
         }
-
-        // Flush and finish the writer
-        writer.finish()?;
-
-        info!("Done!");
-        Ok(total_records as u64)
     }
 
     /// Clips a fragment (unpaired) read.
@@ -600,6 +489,197 @@ impl Clip {
 
         Ok((overlap_clipped, extend_clipped))
     }
+}
+
+impl Command for Clip {
+    #[allow(clippy::too_many_lines)]
+    fn execute(&self, command_line: &str) -> Result<()> {
+        // Validate the input exists (stdin paths are exempt).
+        self.io.validate()?;
+        validate_file_exists(&self.reference, "Reference FASTA")?;
+
+        info!("Clip");
+        info!("  Input: {}", self.io.input.display());
+        info!("  Output: {}", self.io.output.display());
+        info!("  Clipping mode: {}", self.clipping_mode);
+        info!("  Clip overlapping reads: {}", self.clip_overlapping_reads);
+        info!("  Clip extending past mate: {}", self.clip_extending_past_mate);
+        info!("  {}", self.threading.log_message());
+
+        let timer = OperationTimer::new("Clipping reads");
+
+        let mode = self.clipping_mode;
+
+        // Validate clipping parameters
+        if self.upgrade_clipping
+            || self.clip_overlapping_reads
+            || self.clip_extending_past_mate
+            || self.read_one_five_prime > 0
+            || self.read_one_three_prime > 0
+            || self.read_two_five_prime > 0
+            || self.read_two_three_prime > 0
+        {
+            // At least one clipping option is active
+        } else {
+            anyhow::bail!("At least one clipping option is required");
+        }
+
+        // --metrics is not produced in --threads mode; fail fast rather than
+        // silently dropping a user-requested output file.
+        if self.threading.threads.is_some()
+            && let Some(path) = &self.metrics
+        {
+            anyhow::bail!(
+                "--metrics {} cannot be used with --threads: detailed clipping metrics \
+                     are only produced by the single-threaded path",
+                path.display()
+            );
+        }
+
+        // ========================================================================
+        // CRITICAL: Check --threads mode BEFORE creating any file handles.
+        // The 7-step pipeline manages its own I/O and writer lifecycle, so we
+        // must not create a writer here if we're going to use the pipeline.
+        // Route: Some(threads) -> pipeline, None -> single-threaded fast path
+        // ========================================================================
+        let total_records = if let Some(threads) = self.threading.threads {
+            // Read header for the 7-step pipeline (supports stdin)
+            let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
+
+            // Synthesize @HD VN:1.6 SO:unsorted when the input lacks one (match fgbio).
+            // Run before require_query_grouped so both execution modes guard the same
+            // normalized header (matching execute_single_threaded's ordering).
+            let header = crate::commands::common::ensure_hd_record(header)?;
+
+            // CLIP3-05: fgbio's ClipBam calls Bams.requireQueryGrouped. Clipping is
+            // template-based (pair clip, overlap, past-mate, mate-fix), so coordinate-
+            // sorted input silently mis-groups mates. Guard the *input* header.
+            crate::commands::common::require_query_grouped(
+                &header,
+                &self.io.input.display().to_string(),
+            )?;
+
+            // Load reference (always required for clip)
+            let reference = Arc::new(ReferenceReader::new(&self.reference)?);
+
+            // Add @PG record with PP chaining to input's last program
+            let header = crate::commands::common::add_pg_record(header, command_line)?;
+
+            self.execute_threads_mode(reader, threads, header, reference)?
+        } else {
+            self.execute_single_threaded(mode, command_line)?
+        };
+
+        timer.log_completion(total_records);
+        Ok(())
+    }
+}
+
+impl Clip {
+    /// Execute single-threaded clipping.
+    #[allow(clippy::too_many_lines)]
+    fn execute_single_threaded(&self, mode: ClippingMode, command_line: &str) -> Result<u64> {
+        // Create clipper
+        let clipper = if self.auto_clip_attributes {
+            RawRecordClipper::with_auto_clip(mode, true)
+        } else {
+            RawRecordClipper::new(mode)
+        };
+
+        // Create metrics collection if metrics output requested
+        let mut metrics_collection =
+            self.metrics.as_ref().map(|_| ClippingMetricsCollection::new());
+
+        // Load reference (always required and tags are always regenerated to match Scala fgbio)
+        let reference_reader = ReferenceReader::new(&self.reference)?;
+
+        // Open input BAM with MT BGZF decompression
+        let reader_threads = self.threading.num_threads();
+        let (reader, header) = create_raw_bam_reader(&self.io.input, reader_threads)?;
+
+        // Synthesize @HD VN:1.6 SO:unsorted when the input lacks one (match fgbio).
+        let header = crate::commands::common::ensure_hd_record(header)?;
+        // CLIP3-05: require query-grouped input (fgbio Bams.requireQueryGrouped).
+        crate::commands::common::require_query_grouped(
+            &header,
+            &self.io.input.display().to_string(),
+        )?;
+
+        // Add @PG record with PP chaining to input's last program
+        let header = crate::commands::common::add_pg_record(header, command_line)?;
+
+        // Create output BAM writer with multi-threaded BGZF compression
+        let writer_threads = self.threading.num_threads();
+        let mut writer = create_raw_bam_writer(
+            &self.io.output,
+            &header,
+            writer_threads,
+            self.compression.compression_level,
+        )?;
+
+        // Process templates
+        info!("Processing templates...");
+
+        let mut total_records: usize = 0;
+        let mut total_clipped_overlap: u64 = 0;
+        let mut total_clipped_mate_extension: u64 = 0;
+        let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
+
+        // Shared per-template clip configuration (see `execute_threads_mode` for the parallel use).
+        let params = ClipParams::from_clip(self);
+
+        // Single-threaded processing: iterate raw templates, clip in place
+        let template_iter = TemplateIterator::new(reader);
+
+        for template in template_iter {
+            let template = template?;
+            let mut records: Vec<RawRecord> = template.into_records();
+
+            let (overlap_clip, extend_clip) =
+                params.clip_template(&mut records, &clipper, metrics_collection.as_mut())?;
+            if overlap_clip {
+                total_clipped_overlap += 1;
+            }
+            if extend_clip {
+                total_clipped_mate_extension += 1;
+            }
+
+            // Regenerate alignment tags (always done to match Scala fgbio behavior)
+            for record in &mut records {
+                regenerate_alignment_tags_raw(record.as_mut_vec(), &header, &reference_reader)?;
+            }
+
+            // Count and write records
+            let batch_size = records.len();
+            total_records += batch_size;
+            for record in &records {
+                writer.write_raw_record(record.as_ref())?;
+            }
+            progress.log_if_needed(batch_size as u64);
+        }
+
+        progress.log_final();
+        info!("Total records processed: {total_records}");
+        info!("Templates with overlap clipping: {total_clipped_overlap}");
+        info!("Templates with mate extension clipping: {total_clipped_mate_extension}");
+
+        // Write metrics if requested
+        if let Some(metrics_path) = &self.metrics
+            && let Some(mut metrics) = metrics_collection
+        {
+            info!("Writing metrics to {}", metrics_path.display());
+            metrics.finalize();
+            let all_metrics = metrics.all_metrics().map(Clone::clone);
+            write_metrics_tsv(metrics_path, &all_metrics, "clipping")?;
+            info!("Metrics written successfully");
+        }
+
+        // Flush and finish the writer
+        writer.finish()?;
+
+        info!("Done!");
+        Ok(total_records as u64)
+    }
 
     /// Execute using the 7-step unified pipeline with multi-threading.
     ///
@@ -631,13 +711,9 @@ impl Clip {
         const BATCH_SIZE: usize = 1000;
         let clipping_mode = self.clipping_mode;
         let auto_clip_attributes = self.auto_clip_attributes;
-        let upgrade_clipping = self.upgrade_clipping;
-        let clip_overlapping_reads = self.clip_overlapping_reads;
-        let clip_extending_past_mate = self.clip_extending_past_mate;
-        let read_one_five_prime = self.read_one_five_prime;
-        let read_one_three_prime = self.read_one_three_prime;
-        let read_two_five_prime = self.read_two_five_prime;
-        let read_two_three_prime = self.read_two_three_prime;
+        // Shared per-template clip configuration (Copy), captured by the `process_fn` closure so
+        // it runs the exact same clipping logic as the single-threaded path.
+        let params = ClipParams::from_clip(self);
         let reference_for_process = Arc::clone(&reference);
         let header_for_process = header.clone();
 
@@ -669,83 +745,17 @@ impl Clip {
                 templates_count += 1;
                 let mut records: Vec<RawRecord> = template.into_records();
 
-                // Upgrade existing clipping on *every* read of the template first — including
-                // secondary/supplementary alignments — matching fgbio ClipBam's
-                // `template.allReads.foreach(upgradeAllClipping)` (ClipBam.scala:123) before the
-                // primary pair is clipped.
-                if upgrade_clipping {
-                    for record in &mut records {
-                        clipper.upgrade_all_clipping_raw(record).map_err(io::Error::other)?;
-                    }
+                // Clip the primary R1/R2 (or a lone fragment) and repair mate info via the shared
+                // per-template logic (matches the single-threaded path exactly). This worker does
+                // not collect the detailed per-read metrics, so pass `None` and rely on the
+                // returned per-template flags for the overlap/extend counts.
+                let (overlap_clip, extend_clip) =
+                    params.clip_template(&mut records, &clipper, None).map_err(io::Error::other)?;
+                if overlap_clip {
+                    overlap_clipped_count += 1;
                 }
-
-                // Clip the primary R1/R2 (or a lone fragment) by flags, never positional
-                // records[0]/[1], so templates with secondary/supplementary reads are clipped
-                // too (matches fgbio ClipBam's Template.r1/r2 handling).
-                match find_primary_pair_indices(&records).map_err(io::Error::other)? {
-                    (Some(i1), Some(i2)) => {
-                        let [r1, r2] =
-                            records.get_disjoint_mut([i1, i2]).expect("distinct primary indices");
-
-                        // Determine read types (raw flags)
-                        let is_r1_first = r1.is_first_segment();
-
-                        // Apply fixed-position clipping for R1
-                        if is_r1_first && read_one_five_prime > 0 {
-                            clipper.clip_5_prime_end_of_read_raw(r1, read_one_five_prime);
-                        } else if !is_r1_first && read_two_five_prime > 0 {
-                            clipper.clip_5_prime_end_of_read_raw(r1, read_two_five_prime);
-                        }
-                        if is_r1_first && read_one_three_prime > 0 {
-                            clipper.clip_3_prime_end_of_read_raw(r1, read_one_three_prime);
-                        } else if !is_r1_first && read_two_three_prime > 0 {
-                            clipper.clip_3_prime_end_of_read_raw(r1, read_two_three_prime);
-                        }
-
-                        // Apply fixed-position clipping for R2. The primary R2 slot is always a
-                        // last-segment read (find_primary_pair_indices only fills it from an
-                        // is_last_segment read), so it always uses the read-two thresholds.
-                        if read_two_five_prime > 0 {
-                            clipper.clip_5_prime_end_of_read_raw(r2, read_two_five_prime);
-                        }
-                        if read_two_three_prime > 0 {
-                            clipper.clip_3_prime_end_of_read_raw(r2, read_two_three_prime);
-                        }
-
-                        // Clip overlapping reads
-                        if clip_overlapping_reads {
-                            let (num_r1, num_r2) = clipper.clip_overlapping_reads(r1, r2);
-                            if num_r1 > 0 || num_r2 > 0 {
-                                overlap_clipped_count += 1;
-                            }
-                        }
-
-                        // Clip reads extending past mate
-                        if clip_extending_past_mate {
-                            let (num_r1, num_r2) = clipper.clip_extending_past_mate_ends(r1, r2);
-                            if num_r1 > 0 || num_r2 > 0 {
-                                extend_clipped_count += 1;
-                            }
-                        }
-
-                        // Fix full mate-pair info (mate coords/strand, mate-unmapped flag,
-                        // MQ/MC, TLEN), matching fgbio ClipBam's SamPairUtil.setMateInfo call,
-                        // then repair mate info on any supplementary alignments.
-                        set_mate_info_raw(r1, r2);
-                        fix_supplemental_mate_info(&mut records, i1, i2);
-                    }
-                    (Some(i1), None) => {
-                        // Fragment - apply fixed-position clipping (R1 thresholds). Any clipping
-                        // upgrade was already applied over all template reads above.
-                        let record = &mut records[i1];
-                        if read_one_five_prime > 0 {
-                            clipper.clip_5_prime_end_of_read_raw(record, read_one_five_prime);
-                        }
-                        if read_one_three_prime > 0 {
-                            clipper.clip_3_prime_end_of_read_raw(record, read_one_three_prime);
-                        }
-                    }
-                    _ => {}
+                if extend_clip {
+                    extend_clipped_count += 1;
                 }
 
                 // Regenerate alignment tags (always done to match fgbio behavior)
@@ -3004,7 +3014,8 @@ mod tests {
             .mapq(60)
             .build();
 
-        clip.clip_fragment(&clipper, &mut record, Some(&mut metrics))
+        ClipParams::from_clip(&clip)
+            .clip_fragment(&clipper, &mut record, Some(&mut metrics))
             .expect("clip_fragment should succeed");
 
         // Fragment metrics should be updated
@@ -3033,7 +3044,8 @@ mod tests {
             .mapq(60)
             .build();
 
-        clip.clip_fragment(&clipper, &mut record, Some(&mut metrics))
+        ClipParams::from_clip(&clip)
+            .clip_fragment(&clipper, &mut record, Some(&mut metrics))
             .expect("clip_fragment should succeed");
 
         assert_eq!(metrics.fragment.reads, 1);
@@ -3082,7 +3094,7 @@ mod tests {
             .template_length(-120)
             .build();
 
-        let (overlap, extend) = clip
+        let (overlap, extend) = ClipParams::from_clip(&clip)
             .clip_pair(&clipper, &mut r1, &mut r2, Some(&mut metrics))
             .expect("clip_pair should succeed");
 
@@ -3141,7 +3153,7 @@ mod tests {
             .template_length(-120)
             .build();
 
-        let (overlap, extend) = clip
+        let (overlap, extend) = ClipParams::from_clip(&clip)
             .clip_pair(&clipper, &mut r1, &mut r2, Some(&mut metrics))
             .expect("clip_pair should succeed");
 

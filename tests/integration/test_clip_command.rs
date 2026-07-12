@@ -877,3 +877,228 @@ fn test_clip_command_threads_mode_supplementary_mate_repair() {
     assert_eq!(supp.mate_reference_sequence_id(), r2.reference_sequence_id());
     assert_eq!(supp.mate_alignment_start(), r2.alignment_start());
 }
+
+/// The single-threaded (`execute_single_threaded`) and multi-threaded (`execute_threads_mode`)
+/// paths share one per-template clipping implementation (`ClipParams::clip_template`), so clipping
+/// the same input under both must yield byte-identical output. This pins that invariant end-to-end:
+/// if the two paths ever diverge (e.g. a future edit touches only one), this comparison fails.
+#[test]
+fn test_clip_command_single_and_multi_threaded_outputs_match() {
+    let temp_dir = TempDir::new().unwrap();
+    let ref_path = create_test_reference(temp_dir.path());
+    let input_bam = temp_dir.path().join("input.bam");
+
+    // A fully-overlapping FR pair (exercises fixed + overlap + mate-extension clipping and mate
+    // repair) plus a lone fragment (exercises the fragment branch). Non-zero TLEN is required for
+    // FR detection to engage overlap/mate-extension clipping.
+    let mut r1 = mapped_read(
+        b"pair",
+        flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE,
+        99,
+        150,
+        60,
+    );
+    let mut r2 =
+        mapped_read(b"pair", flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE, 99, 100, 60);
+    fgumi_raw_bam::set_template_length(r1.as_mut_vec(), 150);
+    fgumi_raw_bam::set_template_length(r2.as_mut_vec(), -150);
+    let frag = mapped_read(b"frag", 0, 149, 80, 60);
+    create_bam_from_records(&input_bam, &[r1, r2, frag]);
+
+    let run_clip = |output: &Path, threads: Option<&str>| {
+        let mut args = vec![
+            "clip",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--reference",
+            ref_path.to_str().unwrap(),
+            "--read-one-five-prime",
+            "1",
+            "--read-one-three-prime",
+            "1",
+            "--read-two-five-prime",
+            "1",
+            "--read-two-three-prime",
+            "1",
+            "--clip-overlapping-reads",
+            "true",
+            "--clip-bases-past-mate",
+            "true",
+            "--compression-level",
+            "1",
+        ];
+        if let Some(t) = threads {
+            args.push("--threads");
+            args.push(t);
+        }
+        Clip::try_parse_from(args)
+            .expect("failed to parse clip args")
+            .execute("fgumi clip")
+            .unwrap();
+    };
+
+    let single_out = temp_dir.path().join("single.bam");
+    let multi_out = temp_dir.path().join("multi.bam");
+    run_clip(&single_out, None);
+    run_clip(&multi_out, Some("2"));
+
+    // Output order is the input order in both modes, so the full record sequences must be equal.
+    let single_records = read_output_record_bufs(&single_out);
+    let multi_records = read_output_record_bufs(&multi_out);
+    assert_eq!(
+        single_records, multi_records,
+        "single-threaded and multi-threaded clip output must be identical"
+    );
+
+    // Independent oracle: the cross-mode equality above only proves the two paths agree — a
+    // regression that broke (or silently no-op'd) clipping identically in both would still pass it.
+    // This asserts clipping actually happened and matches what fgbio produces for this input, so the
+    // test fails when clipping stops. `single_records == multi_records`, so checking one covers both.
+    assert_expected_clipping_applied(&single_records);
+}
+
+/// Independent (non-self-consistency) oracle for the
+/// [`test_clip_command_single_and_multi_threaded_outputs_match`] input: an overlapping FR pair
+/// (R1 150M, R2 100M) plus a lone fragment (80M), clipped 1 base at each end in the default Hard
+/// mode. Asserts the emitted records actually differ from the unclipped input the way fgbio would
+/// clip them, so a regression that turns clipping into a no-op is caught rather than passing a
+/// path-vs-path comparison.
+fn assert_expected_clipping_applied(records: &[RecordBuf]) {
+    let named = |name: &[u8]| -> &RecordBuf {
+        records
+            .iter()
+            .find(|r| r.name().is_some_and(|n| AsRef::<[u8]>::as_ref(n) == name))
+            .unwrap_or_else(|| panic!("missing record {}", String::from_utf8_lossy(name)))
+    };
+
+    // Default clipping mode is Hard, so the lone fragment loses exactly its 1 five-prime + 1
+    // three-prime base: input 80M at 1-based 150 becomes 1H78M1H, and the 5' hard clip advances the
+    // alignment start by one (150 -> 151). Hard-clipped bases are dropped from the payload (80 -> 78).
+    let frag = named(b"frag");
+    assert_eq!(
+        cigar_ops(frag),
+        vec![(CigarKind::HardClip, 1), (CigarKind::Match, 78), (CigarKind::HardClip, 1)],
+        "fragment must lose 1 base at each end (80M -> 1H78M1H)"
+    );
+    assert_eq!(
+        usize::from(frag.alignment_start().expect("fragment is mapped")),
+        151,
+        "fragment 5' hard clip advances the alignment start by one (150 -> 151)"
+    );
+    assert_eq!(
+        frag.sequence().as_ref().len(),
+        78,
+        "hard-clipped bases must be dropped from the fragment payload"
+    );
+
+    // Both reads of the "pair" template are clipped away from their unclipped 150M / 100M inputs.
+    let pair_r1 = records
+        .iter()
+        .find(|r| {
+            r.name().is_some_and(|n| AsRef::<[u8]>::as_ref(n) == b"pair")
+                && r.flags().is_first_segment()
+        })
+        .expect("missing pair R1");
+    let pair_r2 = records
+        .iter()
+        .find(|r| {
+            r.name().is_some_and(|n| AsRef::<[u8]>::as_ref(n) == b"pair")
+                && r.flags().is_last_segment()
+        })
+        .expect("missing pair R2");
+    assert_ne!(
+        cigar_ops(pair_r1),
+        vec![(CigarKind::Match, 150)],
+        "pair R1 must be clipped, not passed through as 150M"
+    );
+    assert_ne!(
+        cigar_ops(pair_r2),
+        vec![(CigarKind::Match, 100)],
+        "pair R2 must be clipped, not passed through as 100M"
+    );
+}
+
+/// A lone primary R2 (second-of-pair with no first-of-pair mate in the template) is a malformed
+/// template that fgbio `ClipBam` deliberately passes through unclipped (`case _ => ()`,
+/// `ClipBam.scala:133`). `clip_template` mirrors that with its explicit `(None, _)` arm, so such a
+/// read must emerge byte-for-byte unchanged under both threading modes: clipping thresholds that
+/// would trim a fragment or a pair must not touch it. This pins the fgbio-parity behavior so a
+/// future edit that starts clipping (or rejecting) lone R2s fails loudly.
+#[test]
+fn test_clip_command_lone_r2_primary_passed_through_unclipped() {
+    let temp_dir = TempDir::new().unwrap();
+    let ref_path = create_test_reference(temp_dir.path());
+    let input_bam = temp_dir.path().join("input.bam");
+
+    // A single paired, second-of-pair primary read with no R1 anywhere in the template.
+    let r2 =
+        mapped_read(b"orphan", flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE, 199, 100, 60);
+    create_bam_from_records(&input_bam, &[r2]);
+
+    let run_clip = |output: &Path, threads: Option<&str>| {
+        // Aggressive thresholds that would visibly clip a fragment or pair — a lone R2 must ignore
+        // them entirely.
+        let mut args = vec![
+            "clip",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--reference",
+            ref_path.to_str().unwrap(),
+            "--read-one-five-prime",
+            "5",
+            "--read-one-three-prime",
+            "5",
+            "--read-two-five-prime",
+            "5",
+            "--read-two-three-prime",
+            "5",
+            "--clip-overlapping-reads",
+            "true",
+            "--clip-bases-past-mate",
+            "true",
+            "--compression-level",
+            "1",
+        ];
+        if let Some(t) = threads {
+            args.push("--threads");
+            args.push(t);
+        }
+        Clip::try_parse_from(args)
+            .expect("failed to parse clip args")
+            .execute("fgumi clip")
+            .unwrap();
+    };
+
+    let single_out = temp_dir.path().join("single.bam");
+    let multi_out = temp_dir.path().join("multi.bam");
+    run_clip(&single_out, None);
+    run_clip(&multi_out, Some("2"));
+
+    let single_records = read_output_record_bufs(&single_out);
+    let multi_records = read_output_record_bufs(&multi_out);
+
+    // Both modes emit the single input record with no clipping applied (still 100M at 1-based 200).
+    for (label, records) in
+        [("single-threaded", &single_records), ("multi-threaded", &multi_records)]
+    {
+        assert_eq!(records.len(), 1, "{label}: expected exactly one output record");
+        assert_eq!(
+            cigar_ops(&records[0]),
+            vec![(CigarKind::Match, 100)],
+            "{label}: lone R2 must be passed through unclipped (still 100M)"
+        );
+        assert_eq!(
+            usize::from(records[0].alignment_start().expect("record is mapped")),
+            200,
+            "{label}: lone R2 alignment start must be unchanged"
+        );
+    }
+    assert_eq!(
+        single_records, multi_records,
+        "both threading modes agree on the lone-R2 passthrough"
+    );
+}
