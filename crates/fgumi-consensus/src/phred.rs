@@ -180,9 +180,24 @@ fn ln_one_minus_exp(x: f64) -> f64 {
     }
 }
 
-/// Computes log(exp(a) - exp(b)) where a > b.
+/// Computes log(exp(a) - exp(b)) where a >= b.
 ///
-/// Matches fgbio's `aOrNotB` function.
+/// Matches fgbio's `aOrNotB` function (`NumericTypes.scala:188-193`), including its guard:
+/// subtracting a larger probability from a smaller one is a caller error, so `a < b`
+/// panics rather than silently returning `-inf` (R2-NUM-01). The sole production caller
+/// (`ln_error_prob_two_trials`) always orders its arguments `a >= b`, so the guard is
+/// unreachable there — it is a defensive check.
+///
+/// # Divergence from fgbio
+/// fgbio's `aOrNotB` has no equality tolerance. fgumi treats `a` and `b` that differ by less
+/// than `f64::EPSILON` as equal and returns `-inf` (`LnZero`) so the defensive R2-NUM-01 panic
+/// cannot fire on inputs that are equal only up to float-rounding noise. Exact equality already
+/// returns `-inf` on its own (the `a + log1mexp(0)` path yields `-inf`), so the tolerance only
+/// affects the sub-`EPSILON` `a < b` region — turning a would-be panic there into `-inf`.
+/// Genuine `a < b` gaps wider than `f64::EPSILON` still panic. The
+/// `test_ln_a_minus_b_near_equal_within_epsilon_*` and `test_ln_a_minus_b_panics_*` tests pin
+/// this boundary.
+///
 /// Uses: a + log1mexp(a - b) for numerical stability.
 #[inline]
 fn ln_a_minus_b(a: f64, b: f64) -> f64 {
@@ -190,6 +205,8 @@ fn ln_a_minus_b(a: f64, b: f64) -> f64 {
         a
     } else if (a - b).abs() < f64::EPSILON {
         f64::NEG_INFINITY
+    } else if a < b {
+        panic!("Subtraction will be less than zero.");
     } else {
         // a + log(1 - exp(-(a-b))) = a + log1mexp(a-b)
         // In our convention, ln_one_minus_exp takes negative values, but here b < a
@@ -352,6 +369,8 @@ pub fn ln_not(x: LogProbability) -> LogProbability {
 )]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use rstest::rstest;
 
     #[test]
     fn test_phred_to_ln_error() {
@@ -479,6 +498,95 @@ mod tests {
         let ln_ten = 10.0_f64.ln();
         let result = ln_a_minus_b(ln_ten, f64::NEG_INFINITY);
         assert!((result - ln_ten).abs() < 0.00001);
+    }
+
+    /// R2-NUM-01: fgbio `aOrNotB` throws when `a < b` (`NumericTypesTest.scala:83`,
+    /// "aOrNotB(q20, q10)"); fgumi panics instead of silently returning `-inf`. The guard
+    /// tolerates an `a < b` gap narrower than `f64::EPSILON` as float noise (see
+    /// `test_ln_a_minus_b_near_equal_returns_neg_inf`), so only genuine `a < b` gaps wider than
+    /// `EPSILON` reach the panic.
+    ///
+    /// The tolerance is a *strict* `(a - b).abs() < f64::EPSILON`, so an `a < b` gap of exactly
+    /// `f64::EPSILON` is NOT absorbed — it reaches the panic. That pins the `<`-vs-`<=` boundary:
+    /// only gaps strictly inside `EPSILON` become `LnZero`. The exact-`EPSILON` case is repeated
+    /// across representative log-probability bases (0, `ln(0.5)`, and a negative base) so an
+    /// `EPSILON`-scaling regression in the absolute-tolerance guard would surface.
+    ///
+    /// - `a_well_below_b`: `q20 = ln(0.01) < q10 = ln(0.1)`, an obvious `a < b`.
+    /// - `gap_just_beyond_epsilon`: an `a < b` gap of `10 * f64::EPSILON`, just past the tolerance.
+    /// - `gap_exactly_epsilon_*`: an `a < b` gap of exactly `f64::EPSILON` at three bases; the
+    ///   strict `<` excludes it from the tolerance, so each must panic (fgbio-parity — fgbio's
+    ///   tolerance-free `aOrNotB` also throws here).
+    #[rstest]
+    #[case::a_well_below_b(phred_to_ln_error_prob(20), phred_to_ln_error_prob(10))]
+    #[case::gap_just_beyond_epsilon(1.0 - 10.0 * f64::EPSILON, 1.0)]
+    #[case::gap_exactly_epsilon_at_zero(0.0, f64::EPSILON)]
+    #[case::gap_exactly_epsilon_at_ln_half(0.5_f64.ln(), 0.5_f64.ln() + f64::EPSILON)]
+    #[case::gap_exactly_epsilon_at_negative_base(-0.5, -0.5 + f64::EPSILON)]
+    #[should_panic(expected = "Subtraction will be less than zero")]
+    fn test_ln_a_minus_b_panics_when_a_below_b(#[case] a: f64, #[case] b: f64) {
+        assert!(
+            a < b && (a - b).abs() >= f64::EPSILON,
+            "test setup: an a < b gap at or beyond EPSILON must reach the panic"
+        );
+        let _ = ln_a_minus_b(a, b);
+    }
+
+    /// Divergence from fgbio (documented on `ln_a_minus_b`): when `a` and `b` are equal or `a < b`
+    /// by less than `f64::EPSILON`, fgumi absorbs the float noise and returns `LnZero` (-inf)
+    /// instead of panicking, so the defensive R2-NUM-01 guard cannot fire on effectively-equal
+    /// inputs.
+    ///
+    /// - `exactly_equal`: `a == b` returns `LnZero` (the fgbio-parity case).
+    /// - `within_epsilon`: `a < b` by `EPSILON / 2` is absorbed rather than panicking.
+    /// - `within_epsilon_at_*`: the same sub-`EPSILON` `a < b` absorption at other log-probability
+    ///   bases, confirming the absolute tolerance is base-independent (mirror of the exact-`EPSILON`
+    ///   panic cases just above, one ULP short of the boundary).
+    #[rstest]
+    #[case::exactly_equal(10.0, 10.0)]
+    #[case::within_epsilon(0.0, f64::EPSILON / 2.0)]
+    #[case::within_epsilon_at_ln_half(0.5_f64.ln(), 0.5_f64.ln() + f64::EPSILON / 2.0)]
+    #[case::within_epsilon_at_negative_base(-0.5, -0.5 + f64::EPSILON / 2.0)]
+    fn test_ln_a_minus_b_near_equal_returns_neg_inf(#[case] a: f64, #[case] b: f64) {
+        assert!((a - b).abs() < f64::EPSILON, "test setup: the gap must be within EPSILON");
+        let result = ln_a_minus_b(a, b);
+        assert!(
+            result.is_infinite() && result < 0.0,
+            "near-equal a <= b within EPSILON must return LnZero (-inf), got {result}"
+        );
+    }
+
+    proptest! {
+        /// Sweep the Phred 2..=93 range to catch the `f64::EPSILON`-scaling gap: the guard uses an
+        /// absolute tolerance, which could spuriously panic (or spuriously absorb a real gap into
+        /// `-inf`) at large log-probability magnitudes. `phred_to_ln_error_prob` is monotonically
+        /// decreasing, so ordering the two log-probabilities with the lower phred as `a` guarantees
+        /// `a >= b`; in that regime `ln_a_minus_b` must never trip the `a < b` panic and must
+        /// reproduce `exp(a) - exp(b)` (returning `LnZero` only when the inputs are equal).
+        #[test]
+        fn test_ln_a_minus_b_epsilon_scaling_across_phreds(pa in 2u8..=93u8, pb in 2u8..=93u8) {
+            let lo_phred = pa.min(pb);
+            let hi_phred = pa.max(pb);
+            let a = phred_to_ln_error_prob(lo_phred); // larger (less negative) log-probability
+            let b = phred_to_ln_error_prob(hi_phred); // smaller (more negative) or equal
+            prop_assert!(a >= b, "ordering invariant: a must be >= b");
+            let result = ln_a_minus_b(a, b);
+            if lo_phred == hi_phred {
+                prop_assert!(
+                    result.is_infinite() && result < 0.0,
+                    "equal log-probabilities must return LnZero, got {result}"
+                );
+            } else {
+                prop_assert!(result.is_finite(), "a > b must give a finite result, got {result}");
+                let expected = a.exp() - b.exp();
+                let tol = expected.abs() * 1e-6 + 1e-12;
+                prop_assert!(
+                    (result.exp() - expected).abs() <= tol,
+                    "exp(result)={} vs expected={expected} for phreds {lo_phred},{hi_phred}",
+                    result.exp(),
+                );
+            }
+        }
     }
 
     /// Ported from fgbio's `NumericTypesTest`: "1 - probability in log space"
