@@ -8,6 +8,22 @@ ci-doctest = "test --doc --workspace --features compare,simulate,profile-adjacen
 # Build the docs and fail on any rustdoc warning (e.g. broken intra-doc links).
 # RUSTDOCFLAGS="-D warnings" is set by the caller (CI job / pre-push).
 ci-doc = "doc --no-deps --workspace --features compare,simulate,profile-adjacency --locked"
+# Run only the #[ignore]-d integration tests (the sort-correctness suites in
+# tests/integration/{test_sort_correctness,test_async_reader,test_sort_write_index}.rs).
+# They require the `samtools` binary on PATH — samtools builds the BAM fixtures,
+# counts records, and queries the fgumi-written .bai index; sort ordering itself is
+# checked by `fgumi sort --verify` (fgumi's own canonical order checker), not by
+# diffing against `samtools sort` — this gates internal sort-correctness, not
+# samtools output parity. The `sort-correctness` CI job installs samtools and runs
+# this, so these tests are actually gated instead of being permanently skipped.
+# NOTE: `--run-ignored ignored-only` alone would run EVERY #[ignore]-d test in the
+# workspace, which is more than the samtools-gated ones: fgumi-consensus also has
+# #[ignore]-d `regen_*` fixture writers (codec_caller.rs, duplex_caller.rs) that are
+# maintainer tools, not correctness gates -- they build large fixtures and persist a
+# temp BAM that nothing cleans up. The `binary_id(fgumi::integration)` filterset scopes
+# the run to the integration test binary, where every #[ignore] is samtools-gated. A new
+# #[ignore]-d integration test must therefore also be samtools-only.
+ci-test-samtools = "nextest run --workspace --features compare,simulate,profile-adjacency --locked --run-ignored ignored-only -E binary_id(fgumi::integration)"
 # Run tests with test-utils feature enabled (allows binary tests to use library test utilities)
 t = "test --features test-utils"
 # Generate and serve documentation locally (runs xtask then mdbook serve)

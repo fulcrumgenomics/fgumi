@@ -219,3 +219,44 @@ jobs:
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Build documentation
         run: cargo ci-doc
+
+  sort-correctness:
+    runs-on: ubuntu-latest
+    # This job only reads the repository -- it builds and runs tests, and never
+    # writes back to GitHub. Drop the default GITHUB_TOKEN scopes to read-only so
+    # the token exposed to test code cannot mutate the repo.
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Set up compilation cache (sccache)
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: Install nextest
+        uses: taiki-e/install-action@0631aa6515c7d545823c67cfae7ef4fc7f490154 # v2.81.8
+        with:
+          tool: nextest
+      - name: Install samtools
+        # The sort-correctness suites (tests/integration/test_sort_correctness.rs,
+        # test_async_reader.rs, test_sort_write_index.rs) need the `samtools` binary to
+        # build BAM fixtures, count records, and query the fgumi-written .bai index.
+        # Sort ordering itself is verified by `fgumi sort --verify` (fgumi's own order
+        # checker), not by diffing against `samtools sort` — this job gates internal
+        # sort-correctness, not samtools output parity. These tests are `#[ignore]`d
+        # because they need samtools; without this job they never run in CI, so
+        # sort-correctness was ungated. samtools is taken from the runner's apt repo —
+        # the tests never parse samtools' record order, so they do not depend on a
+        # specific samtools patch version.
+        run: sudo apt-get update && sudo apt-get install -y samtools
+      - name: Verify samtools is on PATH
+        # The samtools-gated suites early-return when `samtools_available()`
+        # (which shells out to `samtools --version`) is false, so a missing binary
+        # would let this job pass without running any of them. Fail loudly instead:
+        # this asserts the exact predicate the tests gate on.
+        run: samtools --version
+      - name: Run samtools-gated sort-correctness tests
+        run: cargo ci-test-samtools
