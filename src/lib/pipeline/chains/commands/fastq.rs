@@ -88,7 +88,8 @@ pub(crate) fn build_fastq_encode_step(
         move |state: &mut FastqEncodeState,
               batch: DecodedRecordBatch|
               -> io::Result<DecompressedBlock> {
-            let DecodedRecordBatch { batch_serial, records, .. } = batch;
+            let batch_serial = batch.batch_serial();
+            let records = batch.into_records();
             let mut out = Vec::with_capacity(records.len().saturating_mul(512));
             let mut written = 0u64;
             for record in &records {
@@ -135,7 +136,8 @@ fn encode_paired_batch(
     opts: &FastqOptions,
     records_written: &AtomicU64,
 ) -> io::Result<Process3Output<DecompressedBlock, DecompressedBlock, DecompressedBlock>> {
-    let DecodedRecordBatch { batch_serial, records, .. } = batch;
+    let batch_serial = batch.batch_serial();
+    let records = batch.into_records();
     let mut r1: Vec<u8> = Vec::new();
     let mut r2: Vec<u8> = Vec::new();
     let mut other: Vec<u8> = Vec::new();

@@ -3243,6 +3243,13 @@ impl<'a> ChainBuilder<'a> {
             bail!("--ref requires --methylation-mode to be set");
         }
 
+        // Validate min_reads UP FRONT (mirrors Duplex::execute's single-threaded
+        // path). The per-worker init closure builds DuplexConsensusCaller with
+        // `.expect()`, so an invalid ordering (e.g. `--duplex::min-reads 1 5`)
+        // would otherwise panic inside a worker thread — likely wedging the
+        // pipeline — instead of surfacing a clean error here before it is built.
+        fgumi_consensus::DuplexConsensusCaller::validate_min_reads(&duplex.min_reads)?;
+
         let tail = self.current_tail.expect("add_duplex called before add_source");
 
         // Resolve source path for log messages only.
