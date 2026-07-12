@@ -113,6 +113,9 @@ pub struct ConsensusMetrics {
     /// Reads rejected due to same strand only
     pub rejected_same_strand_only: u64,
 
+    /// Reads rejected because they were unpaired/fragment reads (duplex/codec)
+    pub rejected_non_paired_reads: u64,
+
     /// Reads rejected due to duplicate UMI
     pub rejected_duplicate_umi: u64,
 
@@ -126,23 +129,69 @@ pub struct ConsensusMetrics {
     pub rejected_not_primary_fr_pair: u64,
 }
 
-/// Core rejection reasons always included in KV metrics output.
-const CORE_REJECTIONS: [RejectionReason; 4] = [
+/// The consensus caller whose statistics are being rendered.
+///
+/// Used to seed the always-emitted KV rejection rows to match fgbio's per-caller
+/// `initializeRejectCounts` (`UmiConsensusCaller.scala:223-224`): the vanilla
+/// caller seeds `usedByVanilla` reasons, duplex additionally seeds `usedByDuplex`,
+/// and codec additionally seeds `usedByCodec`. Seeded rows are emitted even when
+/// their count is zero, exactly as fgbio does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsensusCallerKind {
+    /// Vanilla / simplex (`CallMolecularConsensusReads`).
+    Vanilla,
+    /// Duplex (`CallDuplexConsensusReads`).
+    Duplex,
+    /// Codec (`CallCodecConsensusReads`).
+    Codec,
+}
+
+/// Reasons fgbio always emits for every caller (`usedByVanilla`), in fgbio order.
+const VANILLA_SEEDED: [RejectionReason; 4] = [
     RejectionReason::InsufficientSupport,
     RejectionReason::MinorityAlignment,
     RejectionReason::OrphanConsensus,
     RejectionReason::ZeroBasesPostTrimming,
 ];
 
-/// Optional rejection reasons included in KV metrics output only when non-zero.
+/// Additional reasons the duplex/codec callers always emit (`usedByDuplex`), in fgbio order.
+const DUPLEX_EXTRA_SEEDED: [RejectionReason; 3] = [
+    RejectionReason::NonPairedReads,
+    RejectionReason::SameStrandOnly,
+    RejectionReason::DuplicateUmi,
+];
+
+/// Additional reason the codec caller always emits (`usedByCodec`).
+const CODEC_EXTRA_SEEDED: [RejectionReason; 1] = [RejectionReason::NotPrimaryFrPair];
+
+impl ConsensusCallerKind {
+    /// The rejection reasons this caller seeds (always emits), in fgbio's order.
+    fn seeded_reasons(self) -> Vec<RejectionReason> {
+        let mut reasons = VANILLA_SEEDED.to_vec();
+        if matches!(self, Self::Duplex | Self::Codec) {
+            reasons.extend(DUPLEX_EXTRA_SEEDED);
+        }
+        if matches!(self, Self::Codec) {
+            reasons.extend(CODEC_EXTRA_SEEDED);
+        }
+        reasons
+    }
+}
+
+/// All rejection reasons fgumi tracks, in a stable order (seeded reasons first).
 ///
-/// `NotPrimaryFrPair` is codec-only in fgbio (`usedByCodec` only), so it is optional here rather
-/// than a core reason: emitting it only when non-zero fixes the R2-CODEC-01 "reads vanish from
-/// the rejection metrics" defect for codec without making simplex/duplex emit a spurious `=0`
-/// row that fgbio never writes for those callers. (fgbio additionally seeds it to 0 for codec so
-/// its row is always present in codec output even at zero; that always-emit-zero seeding is a
-/// separate metric-format concern tracked with the rejection-row seeding work.)
-const OPTIONAL_REJECTIONS: [RejectionReason; 15] = [
+/// fgumi's taxonomy is finer-grained than fgbio's; the reasons not in any caller's
+/// seeded set (e.g. `LowBaseQuality`) are fgumi-specific and are emitted only when
+/// non-zero.
+const ALL_REJECTIONS: [RejectionReason; 20] = [
+    RejectionReason::InsufficientSupport,
+    RejectionReason::MinorityAlignment,
+    RejectionReason::OrphanConsensus,
+    RejectionReason::ZeroBasesPostTrimming,
+    RejectionReason::NonPairedReads,
+    RejectionReason::SameStrandOnly,
+    RejectionReason::DuplicateUmi,
+    RejectionReason::NotPrimaryFrPair,
     RejectionReason::InsufficientStrandSupport,
     RejectionReason::LowBaseQuality,
     RejectionReason::ExcessiveNBases,
@@ -155,14 +204,11 @@ const OPTIONAL_REJECTIONS: [RejectionReason; 15] = [
     RejectionReason::InsufficientMinDepth,
     RejectionReason::ExcessiveErrorRate,
     RejectionReason::UmiTooShort,
-    RejectionReason::SameStrandOnly,
-    RejectionReason::DuplicateUmi,
-    RejectionReason::NotPrimaryFrPair,
 ];
 
-/// Returns an iterator over all rejection reasons (core + optional).
+/// Returns an iterator over all rejection reasons fgumi tracks.
 fn all_rejections() -> impl Iterator<Item = RejectionReason> {
-    CORE_REJECTIONS.into_iter().chain(OPTIONAL_REJECTIONS)
+    ALL_REJECTIONS.into_iter()
 }
 
 impl ConsensusMetrics {
@@ -195,6 +241,7 @@ impl ConsensusMetrics {
             rejected_excessive_error_rate: 0,
             rejected_umi_too_short: 0,
             rejected_same_strand_only: 0,
+            rejected_non_paired_reads: 0,
             rejected_duplicate_umi: 0,
             rejected_orphan_consensus: 0,
             rejected_zero_bases_post_trimming: 0,
@@ -221,6 +268,7 @@ impl ConsensusMetrics {
             RejectionReason::ExcessiveErrorRate => self.rejected_excessive_error_rate,
             RejectionReason::UmiTooShort => self.rejected_umi_too_short,
             RejectionReason::SameStrandOnly => self.rejected_same_strand_only,
+            RejectionReason::NonPairedReads => self.rejected_non_paired_reads,
             RejectionReason::DuplicateUmi => self.rejected_duplicate_umi,
             RejectionReason::OrphanConsensus => self.rejected_orphan_consensus,
             RejectionReason::ZeroBasesPostTrimming => self.rejected_zero_bases_post_trimming,
@@ -250,6 +298,7 @@ impl ConsensusMetrics {
             RejectionReason::ExcessiveErrorRate => self.rejected_excessive_error_rate += count,
             RejectionReason::UmiTooShort => self.rejected_umi_too_short += count,
             RejectionReason::SameStrandOnly => self.rejected_same_strand_only += count,
+            RejectionReason::NonPairedReads => self.rejected_non_paired_reads += count,
             RejectionReason::DuplicateUmi => self.rejected_duplicate_umi += count,
             RejectionReason::OrphanConsensus => self.rejected_orphan_consensus += count,
             RejectionReason::ZeroBasesPostTrimming => {
@@ -281,9 +330,14 @@ impl ConsensusMetrics {
     /// Converts metrics to fgbio-compatible key-value-description format.
     ///
     /// Returns a vector of `ConsensusKvMetric` rows matching fgbio's vertical
-    /// metrics output format used by `CallMolecularConsensusReads`.
+    /// metrics output format (`UmiConsensusCaller.statistics`). The `kind`
+    /// selects which rejection rows are seeded (always emitted, even at zero),
+    /// matching fgbio's per-caller `initializeRejectCounts`: vanilla emits four
+    /// rows, duplex additionally emits `non_paired_reads`, `single_strand_only`,
+    /// and `potential_umi_collision`, and codec additionally `not_primary_fr_pair`.
+    /// fgumi-specific finer-grained reasons are emitted only when non-zero.
     #[must_use]
-    pub fn to_kv_metrics(&self) -> Vec<ConsensusKvMetric> {
+    pub fn to_kv_metrics(&self, kind: ConsensusCallerKind) -> Vec<ConsensusKvMetric> {
         let mut metrics = Vec::new();
 
         let raw_reads_used = self.total_input_reads.saturating_sub(self.filtered_reads);
@@ -311,8 +365,9 @@ impl ConsensusMetrics {
             "Fraction of raw reads used in consensus reads",
         ));
 
-        // Core rejection reasons (always included)
-        for reason in &CORE_REJECTIONS {
+        // Seeded rejection reasons for this caller: always emitted, in fgbio order.
+        let seeded = kind.seeded_reasons();
+        for reason in &seeded {
             metrics.push(ConsensusKvMetric::new(
                 reason.tsv_key(),
                 self.rejection_count(*reason).to_string(),
@@ -320,8 +375,19 @@ impl ConsensusMetrics {
             ));
         }
 
-        // Optional rejection reasons (only included when non-zero)
-        self.push_optional_rejections(&mut metrics);
+        // fgumi-specific reasons not in the seeded set: emit only when non-zero.
+        for reason in all_rejections() {
+            if !seeded.contains(&reason) {
+                let count = self.rejection_count(reason);
+                if count > 0 {
+                    metrics.push(ConsensusKvMetric::new(
+                        reason.tsv_key(),
+                        count.to_string(),
+                        reason.kv_description(),
+                    ));
+                }
+            }
+        }
 
         // Final output metric
         metrics.push(ConsensusKvMetric::new(
@@ -331,20 +397,6 @@ impl ConsensusMetrics {
         ));
 
         metrics
-    }
-
-    /// Appends fgumi-specific rejection metrics with non-zero counts.
-    fn push_optional_rejections(&self, metrics: &mut Vec<ConsensusKvMetric>) {
-        for reason in &OPTIONAL_REJECTIONS {
-            let count = self.rejection_count(*reason);
-            if count > 0 {
-                metrics.push(ConsensusKvMetric::new(
-                    reason.tsv_key(),
-                    count.to_string(),
-                    reason.kv_description(),
-                ));
-            }
-        }
     }
 }
 
@@ -500,7 +552,7 @@ mod tests {
         metrics.rejected_insufficient_support = 50;
         metrics.rejected_minority_alignment = 50;
 
-        let kv_metrics = metrics.to_kv_metrics();
+        let kv_metrics = metrics.to_kv_metrics(ConsensusCallerKind::Vanilla);
 
         // Should have core metrics
         let raw_reads = kv_metrics.iter().find(|m| m.key == "raw_reads_considered");
@@ -551,7 +603,7 @@ mod tests {
     #[test]
     fn test_to_kv_metrics_zero_reads() {
         let metrics = ConsensusMetrics::new();
-        let kv_metrics = metrics.to_kv_metrics();
+        let kv_metrics = metrics.to_kv_metrics(ConsensusCallerKind::Vanilla);
 
         // frac_raw_reads_used should be 0.0 when total_input_reads is 0
         let frac = kv_metrics.iter().find(|m| m.key == "frac_raw_reads_used");
@@ -565,7 +617,7 @@ mod tests {
         metrics.total_input_reads = 100;
         metrics.rejected_low_base_quality = 5; // This is an optional rejection
 
-        let kv_metrics = metrics.to_kv_metrics();
+        let kv_metrics = metrics.to_kv_metrics(ConsensusCallerKind::Vanilla);
 
         // Should have low_base_quality since it's non-zero
         let lbq = kv_metrics.iter().find(|m| m.key == "raw_reads_rejected_for_low_base_quality");
@@ -575,6 +627,99 @@ mod tests {
         // Should NOT have excessive_n_bases since it's zero
         let en = kv_metrics.iter().find(|m| m.key == "raw_reads_rejected_for_excessive_n_bases");
         assert!(en.is_none());
+    }
+
+    /// R2-MET-05: the duplex caller seeds (always emits) `non_paired_reads`,
+    /// `single_strand_only`, and `potential_umi_collision` even at zero, matching
+    /// fgbio's `initializeRejectCounts(usedByVanilla || usedByDuplex)`. The vanilla
+    /// caller emits none of them at zero.
+    ///
+    /// Assert the *complete ordered* key sequence for both callers (not just presence), so
+    /// row-order drift is caught. The two expected sequences also encode the semantics
+    /// checked before: the duplex-only rows appear (in fgbio order) for Duplex and are absent
+    /// for Vanilla.
+    #[test]
+    fn test_to_kv_metrics_duplex_seeds_duplex_rows() {
+        // Vanilla: four core metrics, the four seeded vanilla rejections in fgbio order, then
+        // the final emitted count. No duplex-only rows.
+        const EXPECTED_VANILLA: &[&str] = &[
+            "raw_reads_considered",
+            "raw_reads_rejected",
+            "raw_reads_used",
+            "frac_raw_reads_used",
+            "raw_reads_rejected_for_insufficient_support",
+            "raw_reads_rejected_for_minority_alignment",
+            "raw_reads_rejected_for_orphan_consensus",
+            "raw_reads_rejected_for_zero_bases_post_trimming",
+            "consensus_reads_emitted",
+        ];
+        // Duplex: the same sequence plus the three duplex-only rows seeded (in fgbio order)
+        // immediately after the vanilla rejections and before the final emitted count.
+        const EXPECTED_DUPLEX: &[&str] = &[
+            "raw_reads_considered",
+            "raw_reads_rejected",
+            "raw_reads_used",
+            "frac_raw_reads_used",
+            "raw_reads_rejected_for_insufficient_support",
+            "raw_reads_rejected_for_minority_alignment",
+            "raw_reads_rejected_for_orphan_consensus",
+            "raw_reads_rejected_for_zero_bases_post_trimming",
+            "raw_reads_rejected_for_non_paired_reads",
+            "raw_reads_rejected_for_single_strand_only",
+            "raw_reads_rejected_for_potential_umi_collision",
+            "consensus_reads_emitted",
+        ];
+
+        let metrics = ConsensusMetrics::new();
+
+        let vanilla = metrics.to_kv_metrics(ConsensusCallerKind::Vanilla);
+        let vanilla_keys: Vec<&str> = vanilla.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(vanilla_keys.as_slice(), EXPECTED_VANILLA, "vanilla KV row order drifted");
+
+        let duplex = metrics.to_kv_metrics(ConsensusCallerKind::Duplex);
+        let duplex_keys: Vec<&str> = duplex.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(duplex_keys.as_slice(), EXPECTED_DUPLEX, "duplex KV row order drifted");
+    }
+
+    /// R2-MET-05: the codec caller additionally seeds `not_primary_fr_pair`
+    /// (`usedByCodec`) on top of the duplex rows.
+    #[test]
+    fn test_to_kv_metrics_codec_seeds_codec_row() {
+        let metrics = ConsensusMetrics::new();
+        let codec = metrics.to_kv_metrics(ConsensusCallerKind::Codec);
+        let has_key = |key: &str| codec.iter().any(|m| m.key == key);
+        assert!(
+            has_key("raw_reads_rejected_for_not_primary_fr_pair"),
+            "codec KV metrics must always emit not_primary_fr_pair"
+        );
+        // ...and it still seeds the duplex rows.
+        assert!(has_key("raw_reads_rejected_for_non_paired_reads"));
+        // Duplex must NOT seed the codec-only row.
+        let duplex = metrics.to_kv_metrics(ConsensusCallerKind::Duplex);
+        assert!(
+            !duplex.iter().any(|m| m.key == "raw_reads_rejected_for_not_primary_fr_pair"),
+            "duplex KV metrics must not seed the codec-only row at zero"
+        );
+    }
+
+    /// R2-MET-05: seeded duplex rows carry fgbio's exact keys and descriptions.
+    #[test]
+    fn test_duplex_seeded_row_descriptions_match_fgbio() {
+        let metrics = ConsensusMetrics::new();
+        let kv = metrics.to_kv_metrics(ConsensusCallerKind::Duplex);
+        let find = |key: &str| kv.iter().find(|m| m.key == key).map(|m| m.description.clone());
+        assert_eq!(
+            find("raw_reads_rejected_for_non_paired_reads").as_deref(),
+            Some("Unpaired/fragment reads not supported by Duplex caller")
+        );
+        assert_eq!(
+            find("raw_reads_rejected_for_single_strand_only").as_deref(),
+            Some("Only Generating One Strand of Duplex Consensus")
+        );
+        assert_eq!(
+            find("raw_reads_rejected_for_potential_umi_collision").as_deref(),
+            Some("Potential collision between independent duplex molecules")
+        );
     }
 
     #[test]

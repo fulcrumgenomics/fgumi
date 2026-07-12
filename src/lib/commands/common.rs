@@ -17,7 +17,7 @@ use fgumi_bam_io::is_stdin_path;
 #[cfg(feature = "simplex")]
 use fgumi_consensus::methylation::RefBaseProvider;
 #[cfg(feature = "simplex")]
-use log::info;
+use log::{info, warn};
 use noodles::sam::Header;
 
 /// CLI argument value for `--methylation-mode`.
@@ -120,6 +120,56 @@ pub fn add_pg_to_builder(
     command_line: &str,
 ) -> anyhow::Result<noodles::sam::header::Builder> {
     fgumi_bam_io::header::add_pg_to_builder(builder, crate::version::VERSION.as_str(), command_line)
+}
+
+/// Verifies that a consensus-calling input BAM is sorted appropriately.
+///
+/// Mirrors fgbio's `UmiConsensusCaller.checkSortOrder`
+/// (`UmiConsensusCaller.scala:165-173`), which the `CallMolecularConsensusReads`,
+/// `CallDuplexConsensusReads`, and `CallCodecConsensusReads` tools all invoke on
+/// their input header. Consensus calling groups reads by molecule as they stream,
+/// so it requires template-coordinate order; coordinate-sorted (or otherwise
+/// mis-ordered) input silently interleaves molecules and every molecule is split,
+/// corrupting the entire output.
+///
+/// Behavior, matching fgbio exactly:
+/// - Template-coordinate (`SO:unsorted`, `GO:query`, `SS:template-coordinate`):
+///   accepted silently.
+/// - Query-grouped but unsorted without the `SS` sub-sort (`SO:unsorted`,
+///   `GO:query`): accepted with a warning (probably compatible, e.g. an fgbio
+///   `GroupReadsByUmi` output that omits the sub-sort).
+/// - Anything else (coordinate, queryname, ungrouped, …): rejected with an error.
+///
+/// This reads only the header and never touches or re-opens the record stream, so
+/// it is safe to call on a stdin-backed reader after the header has been read.
+///
+/// # Arguments
+///
+/// * `header` - the already-read input BAM header
+/// * `source` - a human-readable description of the input (path or `<stdin>`)
+///
+/// # Errors
+///
+/// Returns an error if the header advertises an order that is definitely
+/// incompatible with consensus calling.
+pub fn check_consensus_sort_order(header: &Header, source: &str) -> anyhow::Result<()> {
+    if fgumi_sam::is_template_coordinate_sorted(header) {
+        return Ok(());
+    }
+    if fgumi_sam::is_query_grouped_unsorted(header) {
+        warn!(
+            "File {source} may not be sorted correctly for consensus read generation \
+             (query-grouped but missing the template-coordinate sub-sort). Continuing, \
+             but sort with `fgumi sort --order template-coordinate` if the output looks wrong."
+        );
+        return Ok(());
+    }
+    anyhow::bail!(
+        "File {source} is not sorted correctly for consensus calling. The input must be \
+         template-coordinate sorted (header must advertise SO:unsorted, GO:query, and \
+         SS:template-coordinate).\n\nSort it first, e.g.:\n  \
+         fgumi sort -i input.bam -o sorted.bam --order template-coordinate"
+    );
 }
 
 /// EM-Seq methylation-aware consensus calling options.
@@ -973,6 +1023,35 @@ mod tests {
     fn enable_logging() {
         let _ =
             env_logger::builder().is_test(true).filter_level(log::LevelFilter::Trace).try_init();
+    }
+
+    /// CONS-01: `check_consensus_sort_order` mirrors fgbio's `UmiConsensusCaller.checkSortOrder`
+    /// (the cases pinned by `UmiConsensusCallerTest.scala:34-60`): template-coordinate is
+    /// accepted silently; query-grouped-unsorted (no `SS`) is accepted with a warning;
+    /// coordinate-sorted (silently splits every molecule) and ungrouped headers both error
+    /// with a message naming the source and suggesting template-coordinate.
+    #[rstest]
+    #[case::template_coordinate(
+        "@HD\tVN:1.6\tSO:unsorted\tGO:query\tSS:template-coordinate\n",
+        true
+    )]
+    #[case::unsorted_query_warns("@HD\tVN:1.6\tSO:unsorted\tGO:query\n", true)]
+    #[case::coordinate("@HD\tVN:1.6\tSO:coordinate\n", false)]
+    #[case::ungrouped("@HD\tVN:1.6\n", false)]
+    fn test_check_consensus_sort_order(#[case] header_str: &str, #[case] should_accept: bool) {
+        enable_logging();
+        let header: Header = header_str.parse().expect("parse");
+        let result = check_consensus_sort_order(&header, "foo.bam");
+        if should_accept {
+            assert!(result.is_ok(), "header must be accepted: {header_str:?}");
+        } else {
+            let err = result.expect_err("header must be rejected");
+            assert!(err.to_string().contains("foo.bam"), "error must name the source: {err}");
+            assert!(
+                err.to_string().contains("template-coordinate"),
+                "error must suggest template-coordinate: {err}"
+            );
+        }
     }
 
     #[test]

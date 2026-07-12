@@ -213,6 +213,44 @@ pub fn is_template_coordinate_sorted(header: &Header) -> bool {
     }
 }
 
+/// Checks if a header advertises `SO:unsorted` and `GO:query` (query-grouped but
+/// *without* a template-coordinate sub-sort).
+///
+/// This is the input order that fgbio's `UmiConsensusCaller.checkSortOrder`
+/// tolerates with a warning (rather than an error) for consensus calling: the
+/// reads are grouped by query name so molecules are contiguous, but the header
+/// does not assert full template-coordinate ordering. Following htsjdk (where an
+/// absent `SO` defaults to `unsorted`), a missing `SO` tag is treated as
+/// unsorted; `GO` must be explicitly `query`.
+///
+/// # Arguments
+///
+/// * `header` - SAM header to check
+///
+/// # Returns
+///
+/// `true` if the header is query-grouped and (explicitly or by default) unsorted,
+/// `false` otherwise.
+#[must_use]
+pub fn is_query_grouped_unsorted(header: &Header) -> bool {
+    if let Some(hdr_map) = header.header() {
+        let other_fields = hdr_map.other_fields();
+
+        // Absent SO defaults to "unsorted" (matches htsjdk `getSortOrder`); a
+        // present SO must equal "unsorted" (coordinate/queryname disqualify it).
+        let is_unsorted =
+            other_fields.get(b"SO").is_none_or(|so| <_ as AsRef<[u8]>>::as_ref(so) == UNSORTED);
+
+        // GO must be explicitly "query".
+        let is_query_grouped =
+            other_fields.get(b"GO").is_some_and(|go| <_ as AsRef<[u8]>>::as_ref(go) == b"query");
+
+        is_unsorted && is_query_grouped
+    } else {
+        false
+    }
+}
+
 /// Checks if a BAM file is queryname sorted and logs a warning if not.
 ///
 /// This function validates that the input file has the correct sort order for
@@ -266,6 +304,45 @@ pub fn header_as_unsorted(header: &Header) -> Header {
     other_fields.insert(SORT_ORDER, BString::from(UNSORTED));
     other_fields.shift_remove(b"GO");
     other_fields.shift_remove(b"SS");
+
+    let mut builder = Header::builder();
+    for (name, rg) in header.read_groups() {
+        builder = builder.add_read_group(name.clone(), rg.clone());
+    }
+    for (name, reference) in header.reference_sequences() {
+        builder = builder.add_reference_sequence(name.clone(), reference.clone());
+    }
+    for (id, pg) in header.programs().as_ref() {
+        builder = builder.add_program(id.clone(), pg.clone());
+    }
+    for comment in header.comments() {
+        builder = builder.add_comment(comment.clone());
+    }
+    builder.set_header(header_map).build()
+}
+
+/// Returns a copy of `header` advertising template-coordinate sort order.
+///
+/// Sets `SO:unsorted`, `GO:query`, and `SS:template-coordinate` — the order
+/// `is_template_coordinate_sorted` accepts and that `fgumi group`/`sort` emit.
+/// Primarily useful for constructing consensus-calling inputs (real or test).
+#[must_use]
+pub fn header_as_template_coordinate(header: &Header) -> Header {
+    use bstr::BString;
+    use noodles::sam::header::record::value::Map;
+    use noodles::sam::header::record::value::map::header::tag::{
+        GROUP_ORDER, SORT_ORDER, SUBSORT_ORDER,
+    };
+
+    let mut header_map = header
+        .header()
+        .cloned()
+        .unwrap_or_else(Map::<noodles::sam::header::record::value::map::Header>::default);
+
+    let other_fields = header_map.other_fields_mut();
+    other_fields.insert(SORT_ORDER, BString::from(UNSORTED));
+    other_fields.insert(GROUP_ORDER, BString::from("query"));
+    other_fields.insert(SUBSORT_ORDER, BString::from("template-coordinate"));
 
     let mut builder = Header::builder();
     for (name, rg) in header.read_groups() {
@@ -876,6 +953,73 @@ mod tests {
     fn test_is_template_coordinate_sorted_empty_header() {
         let header = create_empty_header();
         assert!(!is_template_coordinate_sorted(&header));
+    }
+
+    // =========================================================================
+    // Tests for is_query_grouped_unsorted()
+    // =========================================================================
+
+    #[test]
+    fn test_is_query_grouped_unsorted_true_for_unsorted_query() {
+        // SO:unsorted + GO:query (no SS) is the fgbio-tolerated "warn" order.
+        let header = create_template_coord_header("unsorted", Some("query"), None);
+        assert!(is_query_grouped_unsorted(&header));
+    }
+
+    #[test]
+    fn test_is_query_grouped_unsorted_true_for_template_coordinate() {
+        // Full template-coordinate order is also query-grouped and unsorted.
+        let header =
+            create_template_coord_header("unsorted", Some("query"), Some("template-coordinate"));
+        assert!(is_query_grouped_unsorted(&header));
+    }
+
+    #[test]
+    fn test_is_query_grouped_unsorted_false_for_coordinate() {
+        // SO:coordinate disqualifies it even when GO:query is present.
+        let header = create_template_coord_header("coordinate", Some("query"), None);
+        assert!(!is_query_grouped_unsorted(&header));
+    }
+
+    #[test]
+    fn test_is_query_grouped_unsorted_false_without_group_order() {
+        // GO must be explicitly "query".
+        let header = create_template_coord_header("unsorted", None, None);
+        assert!(!is_query_grouped_unsorted(&header));
+    }
+
+    #[test]
+    fn test_is_query_grouped_unsorted_true_when_so_absent_but_go_query() {
+        // Matches htsjdk: an absent SO defaults to unsorted, so GO:query alone qualifies.
+        let header: Header =
+            "@HD\tVN:1.6\tGO:query\n".parse().expect("failed to parse header with GO but no SO");
+        assert!(is_query_grouped_unsorted(&header));
+    }
+
+    // =========================================================================
+    // Tests for header_as_template_coordinate()
+    // =========================================================================
+
+    #[test]
+    fn test_header_as_template_coordinate_is_recognized() {
+        let header = create_template_coord_header("coordinate", None, None);
+        let stamped = header_as_template_coordinate(&header);
+        assert!(is_template_coordinate_sorted(&stamped));
+        assert!(!is_template_coordinate_sorted(&header));
+    }
+
+    #[test]
+    fn test_header_as_template_coordinate_preserves_read_groups_and_refs() {
+        let header_str = "@HD\tVN:1.6\tSO:coordinate\n\
+                          @SQ\tSN:chr1\tLN:1000\n\
+                          @RG\tID:rg1\tSM:sample1\n\
+                          @PG\tID:prog1\tPN:tool\n";
+        let header: Header = header_str.parse().expect("parse header");
+        let stamped = header_as_template_coordinate(&header);
+        assert!(is_template_coordinate_sorted(&stamped));
+        assert!(stamped.reference_sequences().contains_key(b"chr1".as_slice()));
+        assert!(stamped.read_groups().contains_key(b"rg1".as_slice()));
+        assert_eq!(stamped.programs().as_ref().len(), 1);
     }
 
     // =========================================================================

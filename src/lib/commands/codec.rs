@@ -312,6 +312,10 @@ impl Command for Codec {
                 &self.io.input,
                 self.io.pipeline_reader_opts(),
             )?;
+            crate::commands::common::check_consensus_sort_order(
+                &header,
+                &self.io.input.display().to_string(),
+            )?;
             let output_header = create_unmapped_consensus_header(
                 &header,
                 &self.read_group.read_group_id,
@@ -335,6 +339,10 @@ impl Command for Codec {
         // Single-threaded fast path: open the raw reader once and derive the header from it.
         let (mut raw_reader, header) =
             create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())?;
+        crate::commands::common::check_consensus_sort_order(
+            &header,
+            &self.io.input.display().to_string(),
+        )?;
         let output_header = create_unmapped_consensus_header(
             &header,
             &self.read_group.read_group_id,
@@ -933,6 +941,9 @@ mod tests {
         let rg = Map::<noodles::sam::header::record::value::map::ReadGroup>::default();
         header.read_groups_mut().insert(bstr::BString::from("A"), rg);
 
+        // Consensus callers require template-coordinate-sorted input (CONS-01).
+        let header = fgumi_sam::header_as_template_coordinate(&header);
+
         let mut writer = noodles::bam::io::writer::Builder.build_from_path(path)?;
         writer.write_header(&header)?;
 
@@ -975,6 +986,50 @@ mod tests {
 
         // Output file should be created
         assert!(output_path.exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_codec_execute_rejects_non_template_coordinate_input() -> Result<()> {
+        // CONS-01: codec requires template-coordinate-sorted input. An ungrouped header must be
+        // rejected by execute() (via check_consensus_sort_order) rather than silently
+        // mis-grouping molecules; the accept branch is covered by the other execute tests.
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::{ReferenceSequence, header::Version};
+        use std::num::NonZeroUsize;
+
+        let dir = TempDir::new()?;
+        let input_path = dir.path().join("input.bam");
+        let output_path = dir.path().join("output.bam");
+
+        // Plain header — deliberately NOT stamped template-coordinate (unlike write_codec_bam).
+        let mut header = Header::builder()
+            .set_header(Map::<noodles::sam::header::record::value::map::Header>::new(Version::new(
+                1, 6,
+            )))
+            .build();
+        header.reference_sequences_mut().insert(
+            bstr::BString::from("chr1"),
+            Map::<ReferenceSequence>::new(NonZeroUsize::new(1000).expect("non-zero length")),
+        );
+        header.read_groups_mut().insert(
+            bstr::BString::from("A"),
+            Map::<noodles::sam::header::record::value::map::ReadGroup>::default(),
+        );
+        let (r1, r2) = create_codec_fr_pair_overlapping("UMI001", 100, 105, 20, &[30; 20]);
+        let mut writer = noodles::bam::io::writer::Builder.build_from_path(&input_path)?;
+        writer.write_header(&header)?;
+        writer.write_alignment_record(&header, &r1)?;
+        writer.write_alignment_record(&header, &r2)?;
+        drop(writer);
+
+        let cmd = create_codec_with_paths(input_path, output_path);
+        let err = cmd.execute("test").expect_err("codec must reject non-template-coordinate input");
+        assert!(
+            err.to_string().contains("template-coordinate"),
+            "error must suggest template-coordinate sorting: {err}"
+        );
 
         Ok(())
     }

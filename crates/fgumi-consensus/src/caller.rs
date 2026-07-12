@@ -452,9 +452,9 @@ impl RejectionReason {
             Self::QualityTooLow | Self::QualityTrimmed => CentralReason::LowBaseQuality,
             Self::FailedQC => CentralReason::NotPassingFilter,
             Self::MissingUmi => CentralReason::MissingUmi,
-            // For reasons that don't have a direct centralized equivalent,
-            // we use the closest semantic match
-            Self::FragmentRead => CentralReason::SameStrandOnly,
+            // A fragment/unpaired read supplied to the duplex/codec caller maps to
+            // fgbio's NonPairedReads reason (UmiConsensusCaller.scala:81).
+            Self::FragmentRead => CentralReason::NonPairedReads,
             Self::Unmapped
             | Self::Mapped
             | Self::SecondaryOrSupplementary
@@ -1072,7 +1072,7 @@ mod tests {
 
         // Test every variant maps to a centralized reason
         let mappings = [
-            (RejectionReason::FragmentRead, CentralReason::SameStrandOnly),
+            (RejectionReason::FragmentRead, CentralReason::NonPairedReads),
             (RejectionReason::InsufficientReads, CentralReason::InsufficientSupport),
             (RejectionReason::QualityTooLow, CentralReason::LowBaseQuality),
             (RejectionReason::Unmapped, CentralReason::NoValidAlignment),

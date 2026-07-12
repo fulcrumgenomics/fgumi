@@ -244,6 +244,18 @@ impl SamBuilder {
         }
     }
 
+    /// Stamps template-coordinate sort order (`SO:unsorted`, `GO:query`,
+    /// `SS:template-coordinate`) onto the header.
+    ///
+    /// Consensus callers require template-coordinate-sorted input, so tests that
+    /// exercise `simplex`/`duplex`/`codec` end-to-end should call this before
+    /// writing the input BAM (the records must already be grouped by molecule,
+    /// which the builder's per-group insertion order satisfies).
+    pub fn set_template_coordinate_sort_order(&mut self) -> &mut Self {
+        self.header = crate::header_as_template_coordinate(&self.header);
+        self
+    }
+
     /// Returns the next sequential name.
     fn next_name(&self) -> String {
         format!("{:04}", self.counter.fetch_add(1, Ordering::SeqCst))

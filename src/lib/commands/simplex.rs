@@ -288,6 +288,10 @@ impl Command for Simplex {
                 &self.io.input,
                 self.io.pipeline_reader_opts(),
             )?;
+            crate::commands::common::check_consensus_sort_order(
+                &header,
+                &self.io.input.display().to_string(),
+            )?;
             let output_header = create_unmapped_consensus_header(
                 &header,
                 &self.read_group.read_group_id,
@@ -315,6 +319,10 @@ impl Command for Simplex {
         // Single-threaded fast path: open the raw reader once and derive the header from it.
         let (mut raw_reader, header) =
             create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())?;
+        crate::commands::common::check_consensus_sort_order(
+            &header,
+            &self.io.input.display().to_string(),
+        )?;
         let output_header = create_unmapped_consensus_header(
             &header,
             &self.read_group.read_group_id,
@@ -462,7 +470,7 @@ impl Command for Simplex {
 
         if let Some(stats_path) = &self.stats_opts.stats {
             // Convert to fgbio-compatible vertical key-value-description format
-            let kv_metrics = metrics.to_kv_metrics();
+            let kv_metrics = metrics.to_kv_metrics(fgumi_metrics::ConsensusCallerKind::Vanilla);
             DelimFile::default()
                 .write_tsv(stats_path, kv_metrics)
                 .with_context(|| format!("Failed to write statistics: {}", stats_path.display()))?;
@@ -738,7 +746,7 @@ impl Simplex {
 
         if let Some(stats_path) = &self.stats_opts.stats {
             // Convert to fgbio-compatible vertical key-value-description format
-            let kv_metrics = metrics.to_kv_metrics();
+            let kv_metrics = metrics.to_kv_metrics(fgumi_metrics::ConsensusCallerKind::Vanilla);
             DelimFile::default()
                 .write_tsv(stats_path, kv_metrics)
                 .with_context(|| format!("Failed to write statistics: {}", stats_path.display()))?;
@@ -830,6 +838,28 @@ mod tests {
         let result = cmd.execute("test");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn test_rejects_non_template_coordinate_input() -> Result<()> {
+        // CONS-01: consensus calling groups reads by molecule as they stream, so it
+        // requires template-coordinate-sorted input. A bare (ungrouped) header must be
+        // rejected — proceeding would silently split every molecule and corrupt output.
+        let mut builder = SamBuilder::new_unmapped();
+        let mut attrs = HashMap::new();
+        attrs.insert("MI", BufValue::from("GATTACA:0"));
+        attrs.insert("RX", BufValue::from("ACGT-TGCA"));
+        builder.add_pair_with_attrs("READ:0", None, None, true, true, &attrs);
+
+        let paths = TestPaths::new()?;
+        // Deliberately NOT stamped with template-coordinate order.
+        builder.write(&paths.input)?;
+
+        let cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
+        let result = cmd.execute("test");
+        assert!(result.is_err(), "simplex must reject non-template-coordinate input");
+        assert!(result.unwrap_err().to_string().contains("template-coordinate"));
+        Ok(())
     }
 
     // ========================================================================
@@ -940,7 +970,7 @@ mod tests {
         }
 
         let paths = TestPaths::new()?;
-        builder.write(&paths.input)?;
+        builder.set_template_coordinate_sort_order().write(&paths.input)?;
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
         cmd.read_group.read_group_id = "ABC".to_string();
@@ -1013,7 +1043,7 @@ mod tests {
         builder.add_frag_with_attrs("b2", None, true, &attrs_b);
 
         let paths = TestPaths::new()?;
-        builder.write(&paths.input)?;
+        builder.set_template_coordinate_sort_order().write(&paths.input)?;
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
         cmd.read_group.read_group_id = "ABC".to_string();
@@ -1078,7 +1108,7 @@ mod tests {
         builder.add_frag_with_attrs("c1", None, true, &attrs3);
 
         let paths = TestPaths::new()?;
-        builder.write(&paths.input)?;
+        builder.set_template_coordinate_sort_order().write(&paths.input)?;
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
         cmd.min_reads = 3;
@@ -1116,7 +1146,7 @@ mod tests {
         }
 
         let paths = TestPaths::new()?;
-        builder.write(&paths.input)?;
+        builder.set_template_coordinate_sort_order().write(&paths.input)?;
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
         cmd.consensus.output_per_base_tags = true;
@@ -1165,7 +1195,7 @@ mod tests {
 
         let paths = TestPaths::new()?;
         let output_multi_path = paths.dir.path().join("output_multi.bam");
-        builder.write(&paths.input)?;
+        builder.set_template_coordinate_sort_order().write(&paths.input)?;
 
         // Run with single thread
         let cmd_single = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
@@ -1205,7 +1235,7 @@ mod tests {
         }
 
         let paths = TestPaths::new()?;
-        builder.write(&paths.input)?;
+        builder.set_template_coordinate_sort_order().write(&paths.input)?;
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
         cmd.max_reads = Some(10);
@@ -1230,9 +1260,12 @@ mod tests {
     #[test]
     fn test_max_reads_less_than_min_reads_fails() {
         // Create a dummy BAM file so validation gets to tag check
-        let builder = SamBuilder::new_unmapped();
+        let mut builder = SamBuilder::new_unmapped();
         let paths = TestPaths::new().expect("failed to create test paths");
-        builder.write(&paths.input).expect("failed to write test BAM");
+        builder
+            .set_template_coordinate_sort_order()
+            .write(&paths.input)
+            .expect("failed to write test BAM");
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), PathBuf::from("out.bam"));
         cmd.min_reads = 5;
@@ -1262,7 +1295,7 @@ mod tests {
         builder.add_frag_with_attrs("f1", None, true, &attrs2);
 
         let paths = TestPaths::new()?;
-        builder.write(&paths.input)?;
+        builder.set_template_coordinate_sort_order().write(&paths.input)?;
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
         cmd.stats_opts.stats = Some(paths.stats.clone());
@@ -1307,7 +1340,7 @@ mod tests {
         builder.add_frag_with_attrs("read2", None, true, &attrs);
 
         let paths = TestPaths::new()?;
-        builder.write(&paths.input)?;
+        builder.set_template_coordinate_sort_order().write(&paths.input)?;
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
         cmd.read_group.read_name_prefix = Some("MYCONSENSUS".to_string());
@@ -1342,7 +1375,7 @@ mod tests {
         builder.add_frag_with_attrs("f1", None, true, &attrs2);
 
         let paths = TestPaths::new()?;
-        builder.write(&paths.input)?;
+        builder.set_template_coordinate_sort_order().write(&paths.input)?;
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
         cmd.rejects_opts.rejects = Some(paths.rejects.clone());
@@ -1384,7 +1417,7 @@ mod tests {
         }
 
         let paths = TestPaths::new()?;
-        builder.write(&paths.input)?;
+        builder.set_template_coordinate_sort_order().write(&paths.input)?;
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
         cmd.rejects_opts.rejects = Some(paths.rejects.clone());
@@ -1419,7 +1452,7 @@ mod tests {
         }
 
         let paths = TestPaths::new()?;
-        builder.write(&paths.input)?;
+        builder.set_template_coordinate_sort_order().write(&paths.input)?;
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
         cmd.stats_opts.stats = Some(paths.stats.clone());
@@ -1469,7 +1502,7 @@ mod tests {
         builder.add_pair_with_attrs("pair2", None, None, true, true, &attrs);
 
         let paths = TestPaths::new()?;
-        builder.write(&paths.input)?;
+        builder.set_template_coordinate_sort_order().write(&paths.input)?;
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
         cmd.overlapping.consensus_call_overlapping_bases = true;
@@ -1497,7 +1530,7 @@ mod tests {
         builder.add_frag_with_attrs("frag3", None, true, &attrs);
 
         let paths = TestPaths::new()?;
-        builder.write(&paths.input)?;
+        builder.set_template_coordinate_sort_order().write(&paths.input)?;
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
         cmd.overlapping.consensus_call_overlapping_bases = true;
@@ -1522,7 +1555,7 @@ mod tests {
         builder.add_frag_with_attrs("read2", None, true, &attrs);
 
         let paths = TestPaths::new()?;
-        builder.write(&paths.input)?;
+        builder.set_template_coordinate_sort_order().write(&paths.input)?;
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
         cmd.consensus.trim = true;
@@ -1547,7 +1580,7 @@ mod tests {
         builder.add_frag_with_attrs("read2", None, true, &attrs);
 
         let paths = TestPaths::new()?;
-        builder.write(&paths.input)?;
+        builder.set_template_coordinate_sort_order().write(&paths.input)?;
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
         cmd.consensus.min_consensus_base_quality = 30;
@@ -1577,7 +1610,7 @@ mod tests {
         builder.add_frag_with_attrs("no_umi2", None, true, &attrs_no_umi);
 
         let paths = TestPaths::new()?;
-        builder.write(&paths.input)?;
+        builder.set_template_coordinate_sort_order().write(&paths.input)?;
 
         let cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
 
@@ -1610,7 +1643,7 @@ mod tests {
         builder.add_frag_with_attrs("read1", None, true, &attrs);
         builder.add_frag_with_attrs("read2", None, true, &attrs);
         builder.add_frag_with_attrs("read3", None, true, &attrs);
-        builder.write(&paths.input)?;
+        builder.set_template_coordinate_sort_order().write(&paths.input)?;
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
         cmd.threading = threading;
@@ -1696,7 +1729,7 @@ mod tests {
         }
 
         let paths = TestPaths::new()?;
-        builder.write(&paths.input)?;
+        builder.set_template_coordinate_sort_order().write(&paths.input)?;
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
         cmd.methylation_mode = Some(crate::commands::common::MethylationModeArg::EmSeq);

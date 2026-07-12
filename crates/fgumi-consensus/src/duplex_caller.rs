@@ -706,6 +706,11 @@ impl DuplexConsensusCaller {
         }
     }
 
+    /// Returns true if the record is a paired read (fgbio's `_.paired`).
+    fn is_paired(record: &RawRecord) -> bool {
+        RawRecordView::new(record).flags() & flags::PAIRED != 0
+    }
+
     /// Returns true if the record is a paired first-of-pair read.
     ///
     /// An unpaired/fragment read is never treated as R1.
@@ -2206,8 +2211,22 @@ impl ConsensusCaller for DuplexConsensusCaller {
     fn consensus_reads(&mut self, records: Vec<RawRecord>) -> Result<ConsensusOutput> {
         self.stats.record_input(records.len());
 
+        // Partition out unpaired/fragment reads and reject them as NonPairedReads,
+        // matching fgbio's DuplexConsensusCaller
+        // (`val (pairs, frags) = recs.partition(_.paired); rejectRecords(frags, NonPairedReads)`).
+        // fgumi previously folded fragments into the strand groups where they were
+        // ignored but mis-accounted (R2-UCC-01).
+        let (paired, fragments): (Vec<RawRecord>, Vec<RawRecord>) =
+            records.into_iter().partition(Self::is_paired);
+        if !fragments.is_empty() {
+            self.stats.record_rejection(RejectionReason::FragmentRead, fragments.len());
+            if self.track_rejects {
+                self.rejected_reads.extend(fragments.into_iter().map(RawRecord::into_inner));
+            }
+        }
+
         // Partition records by strand using raw byte-level operations.
-        let (base_mi_opt, a_records, b_records) = Self::partition_records_by_strand(records)?;
+        let (base_mi_opt, a_records, b_records) = Self::partition_records_by_strand(paired)?;
 
         let Some(base_mi) = base_mi_opt else {
             return Ok(ConsensusOutput::default());
@@ -2344,6 +2363,73 @@ mod tests {
             raw_with_mi(b"read4", b"UMI1/B"),
         ];
         assert!(DuplexConsensusCaller::has_both_strands(&many_a_one_b));
+    }
+
+    #[test]
+    fn test_consensus_reads_rejects_fragments_as_non_paired() -> Result<()> {
+        // R2-UCC-01: unpaired/fragment reads are rejected as NonPairedReads — matching
+        // fgbio's `partition(_.paired); rejectRecords(frags, NonPairedReads)` — instead of
+        // being silently folded into the strand groups where they were mis-accounted.
+        let mut caller = DuplexConsensusCaller::new(
+            "consensus".to_string(),
+            "RG1".to_string(),
+            vec![1],
+            20,
+            false,
+            false,
+            None,
+            None,
+            false,
+            45,
+            40,
+        )?;
+
+        // raw_with_mi builds an unpaired read (PAIRED flag clear) => a fragment.
+        let _ = caller.consensus_reads(vec![raw_with_mi(b"frag", b"UMI1/A")])?;
+
+        let non_paired = caller
+            .stats
+            .rejection_reasons
+            .get(&RejectionReason::FragmentRead)
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(non_paired, 1, "fragment reads must be rejected as non-paired");
+
+        // ...and that reason maps to the central NonPairedReads metric row.
+        assert_eq!(
+            RejectionReason::FragmentRead.to_centralized(),
+            fgumi_metrics::rejection::RejectionReason::NonPairedReads
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_consensus_reads_retains_rejected_fragments_when_tracking() -> Result<()> {
+        // R2-UCC-01: with `track_rejects` enabled, the rejected unpaired/fragment read is not
+        // just counted but retained in `rejected_reads` so `fgumi duplex --rejects` can emit it.
+        let mut caller = DuplexConsensusCaller::new(
+            "consensus".to_string(),
+            "RG1".to_string(),
+            vec![1],
+            20,
+            false,
+            false,
+            None,
+            None,
+            true, // track_rejects
+            45,
+            40,
+        )?;
+
+        let _ = caller.consensus_reads(vec![raw_with_mi(b"frag", b"UMI1/A")])?;
+
+        assert_eq!(caller.rejected_reads.len(), 1, "the fragment must be retained for --rejects");
+        assert_eq!(
+            fgumi_raw_bam::read_name(&caller.rejected_reads[0]),
+            b"frag",
+            "the retained rejected read is the fragment"
+        );
+        Ok(())
     }
 
     #[test]
@@ -3398,6 +3484,83 @@ mod tests {
             result.count, 2,
             "Should produce 2 duplex consensus reads (R1 and R2), got {}",
             result.count
+        );
+
+        Ok(())
+    }
+
+    /// R2-UCC-01: a single MI group with *mixed* family composition — paired AB/BA
+    /// reads plus stray unpaired fragments carrying the same MI. fgbio partitions
+    /// the fragments out (`partition(_.paired)`) and rejects them as `NonPairedReads`
+    /// while the paired reads still form a duplex consensus. This exercises the
+    /// mixed-family edge case rather than the fragment-only groups the other two
+    /// tests cover.
+    #[test]
+    fn test_consensus_reads_mixed_paired_and_fragments() -> Result<()> {
+        let mut caller = DuplexConsensusCaller::new(
+            "consensus".to_string(),
+            "RG1".to_string(),
+            vec![1],
+            10,
+            false,
+            false,
+            None,
+            None,
+            false,
+            45,
+            40,
+        )?;
+
+        let cigar_10m = &[encode_op(0, 10)];
+        let quals = &[20u8; 10];
+        let mut b = SamBuilder::new();
+
+        // Two stray fragments (unpaired) sharing the group's MI base `foo`.
+        let frag = |b: &mut SamBuilder, name: &[u8], mi: &[u8]| -> RawRecord {
+            b.clear();
+            b.ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .flags(0) // unpaired => fragment
+                .read_name(name)
+                .cigar_ops(cigar_10m)
+                .sequence(b"AAAAAAAAAA")
+                .qualities(quals);
+            b.add_string_tag(SamTag::MI, mi);
+            b.build()
+        };
+
+        let reads = vec![
+            // Paired AB/BA reads that form a duplex consensus.
+            ab_r1(&mut b, b"q1", b"AAAAAAAAAA", quals, cigar_10m, b"foo/A", &[]),
+            ab_r2(&mut b, b"q1", b"CCCCCCCCCC", quals, cigar_10m, b"foo/A", &[]),
+            ba_r1(&mut b, b"q2", b"CCCCCCCCCC", quals, cigar_10m, b"foo/B", &[]),
+            ba_r2(&mut b, b"q2", b"AAAAAAAAAA", quals, cigar_10m, b"foo/B", &[]),
+            // Stray fragments in the same MI group.
+            frag(&mut b, b"frag1", b"foo/A"),
+            frag(&mut b, b"frag2", b"foo/B"),
+        ];
+
+        let result = caller.consensus_reads(reads)?;
+
+        // The paired reads still produce the R1/R2 duplex consensus...
+        assert_eq!(
+            result.count, 2,
+            "paired reads should still produce 2 duplex consensus reads despite the stray fragments, got {}",
+            result.count
+        );
+
+        // ...and both fragments are counted under NonPairedReads (via FragmentRead).
+        let non_paired = caller
+            .stats
+            .rejection_reasons
+            .get(&RejectionReason::FragmentRead)
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(non_paired, 2, "both stray fragments must be rejected as non-paired");
+        assert_eq!(
+            RejectionReason::FragmentRead.to_centralized(),
+            fgumi_metrics::rejection::RejectionReason::NonPairedReads
         );
 
         Ok(())
