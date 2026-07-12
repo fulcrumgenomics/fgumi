@@ -13,27 +13,49 @@ use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 use tempfile::TempDir;
 
+use crate::helpers::assertions::assert_bam_sorted;
 use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
 
 /// Create a template-coordinate sorted BAM with UMI-tagged reads.
 ///
 /// Template-coordinate sort groups reads by position, then by name within each position.
 /// The header must have SO:unsorted GO:query SS:template-coordinate tags.
-fn create_sorted_bam(path: &PathBuf, records: Vec<RawRecord>) {
+fn create_sorted_bam(path: &Path, records: Vec<RawRecord>) {
+    // Write the records to a temp BAM, then sort it into `path` with fgumi's own
+    // template-coordinate sorter so the dedup input is *genuinely* in
+    // template-coordinate order rather than merely labelled as such. (dedup trusts
+    // the header's SS tag; feeding it mislabelled-but-unsorted input produces
+    // mislabelled-but-unsorted output.)
+    let unsorted = path.with_file_name("dedup_input_unsorted.bam");
     let header = create_minimal_header("chr1", 10000);
     let mut writer =
-        bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
+        bam::io::Writer::new(fs::File::create(&unsorted).expect("Failed to create BAM file"));
     writer.write_header(&header).expect("Failed to write header");
-
     for record in records {
         writer
             .write_alignment_record(&header, &to_record_buf(&record))
             .expect("Failed to write record");
     }
     writer.try_finish().expect("Failed to finish BAM");
+
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "sort",
+            "-i",
+            unsorted.to_str().unwrap(),
+            "-o",
+            path.to_str().unwrap(),
+            "--order",
+            "template-coordinate",
+            "--key-types",
+            "mi",
+        ])
+        .status()
+        .expect("failed to spawn `fgumi sort` for dedup test input");
+    assert!(status.success(), "failed to template-coordinate sort dedup test input");
 }
 
 /// Create a group of paired-end reads at the same position with the same UMI
@@ -111,6 +133,10 @@ fn test_dedup_command_basic() {
     .expect("failed to parse dedup args");
     cmd.execute("fgumi dedup").expect("Dedup command failed");
     assert!(output_bam.exists(), "Output BAM not created");
+
+    // dedup consumes and re-emits template-coordinate order; gate that its output
+    // still verifies as template-coordinate sorted (SS:template-coordinate).
+    assert_bam_sorted(&output_bam, "template-coordinate", Some("mi"));
 
     // All reads should be present (duplicates are marked, not removed)
     let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());

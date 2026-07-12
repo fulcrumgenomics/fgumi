@@ -9,15 +9,22 @@
 use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::merge::Merge;
 use fgumi_lib::commands::sort::SortOrderArg;
-use fgumi_raw_bam::{RawRecord, SamBuilder};
+use fgumi_lib::sam::SamTag;
+use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::Header;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-use crate::helpers::bam_generator::{create_coordinate_sorted_header, to_record_buf};
+use crate::helpers::assertions::assert_bam_sorted;
+use crate::helpers::bam_generator::{
+    create_coordinate_sorted_header, create_minimal_header, to_record_buf,
+};
+
+/// Path to the built `fgumi` binary, for the end-to-end merge-output test.
+const FGUMI: &str = env!("CARGO_BIN_EXE_fgumi");
 
 /// A mapped 20M record on chr1 (ref 0) at the given 1-based position.
 fn mapped_record(name: &[u8], pos: i32) -> RawRecord {
@@ -495,4 +502,117 @@ fn test_merge_streaming_verify_accepts_sorted_for_each_order(
         ],
         "merged records must retain their identity and input order"
     );
+}
+
+// -----------------------------------------------------------------------------
+// End-to-end output-order gate (drives the built `fgumi` binary): `fgumi merge`
+// advertises `SS:template-coordinate` on its output, so build two genuinely
+// template-coordinate sorted inputs, merge them, and assert the merged bytes
+// verify as template-coordinate sorted via `fgumi sort --verify`.
+// -----------------------------------------------------------------------------
+
+/// A mapped F1R2 pair at `start` (0-based) on ref 0 with the given name/UMI.
+fn mapped_pair(name: &str, umi: &str, start: i32) -> Vec<RawRecord> {
+    let mut r1 = SamBuilder::new();
+    r1.read_name(name.as_bytes())
+        .sequence(b"ACGTACGT")
+        .qualities(&[30; 8])
+        .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+        .ref_id(0)
+        .pos(start)
+        .mapq(60)
+        .cigar_ops(&[8 << 4])
+        .mate_ref_id(0)
+        .mate_pos(start + 100)
+        .template_length(108)
+        .add_string_tag(SamTag::RX, umi.as_bytes())
+        .add_string_tag(SamTag::MC, b"8M");
+    let mut r2 = SamBuilder::new();
+    r2.read_name(name.as_bytes())
+        .sequence(b"ACGTACGT")
+        .qualities(&[30; 8])
+        .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+        .ref_id(0)
+        .pos(start + 100)
+        .mapq(60)
+        .cigar_ops(&[8 << 4])
+        .mate_ref_id(0)
+        .mate_pos(start)
+        .template_length(-108)
+        .add_string_tag(SamTag::RX, umi.as_bytes())
+        .add_string_tag(SamTag::MC, b"8M");
+    vec![r1.build(), r2.build()]
+}
+
+/// Write `records` to a temp BAM, then sort it into `path` in genuine
+/// template-coordinate order with fgumi's own sorter.
+fn write_template_coordinate_bam(dir: &Path, name: &str, records: Vec<RawRecord>) -> PathBuf {
+    let unsorted = dir.join(format!("{name}.unsorted.bam"));
+    let sorted = dir.join(format!("{name}.bam"));
+    let header = create_minimal_header("chr1", 100_000);
+    let mut writer = bam::io::Writer::new(fs::File::create(&unsorted).unwrap());
+    writer.write_header(&header).unwrap();
+    for record in records {
+        writer.write_alignment_record(&header, &to_record_buf(&record)).unwrap();
+    }
+    writer.try_finish().unwrap();
+
+    let status = std::process::Command::new(FGUMI)
+        .args([
+            "sort",
+            "-i",
+            unsorted.to_str().unwrap(),
+            "-o",
+            sorted.to_str().unwrap(),
+            "--order",
+            "template-coordinate",
+            "--key-types",
+            "mi",
+        ])
+        .status()
+        .expect("spawn fgumi sort");
+    assert!(status.success(), "failed to sort merge input {name}");
+    sorted
+}
+
+#[test]
+fn test_merge_output_is_template_coordinate_sorted() {
+    let dir = TempDir::new().unwrap();
+    // Two inputs whose positions interleave, so a correct merge must reorder across
+    // files (not just concatenate).
+    let in1 = write_template_coordinate_bam(
+        dir.path(),
+        "in1",
+        [mapped_pair("a", "ACGTACGT", 200), mapped_pair("c", "ACGTACGT", 5_000)]
+            .into_iter()
+            .flatten()
+            .collect(),
+    );
+    let in2 = write_template_coordinate_bam(
+        dir.path(),
+        "in2",
+        [mapped_pair("b", "TGCATGCA", 1_000), mapped_pair("d", "TGCATGCA", 8_000)]
+            .into_iter()
+            .flatten()
+            .collect(),
+    );
+
+    let merged = dir.path().join("merged.bam");
+    let status = std::process::Command::new(FGUMI)
+        .args([
+            "merge",
+            "-o",
+            merged.to_str().unwrap(),
+            "--order",
+            "template-coordinate",
+            in1.to_str().unwrap(),
+            in2.to_str().unwrap(),
+        ])
+        .status()
+        .expect("spawn fgumi merge");
+    assert!(status.success(), "fgumi merge failed");
+    assert!(merged.exists(), "merged BAM not created");
+
+    // The whole point of merge is the output claim: verify it holds.
+    assert_bam_sorted(&merged, "template-coordinate", Some("mi"));
 }
