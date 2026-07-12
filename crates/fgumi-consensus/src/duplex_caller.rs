@@ -125,7 +125,7 @@
 //!
 //! ## Usage Example
 //!
-//! ```rust,ignore
+//! ```text
 //! use fgumi_consensus::duplex_caller::DuplexConsensusCaller;
 //! use fgumi_consensus::caller::ConsensusCaller;
 //!

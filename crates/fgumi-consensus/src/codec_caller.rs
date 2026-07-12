@@ -40,7 +40,7 @@
 //!
 //! ## Usage Example
 //!
-//! ```rust,ignore
+//! ```text
 //! use fgumi_consensus::codec_caller::{CodecConsensusCaller, CodecConsensusOptions};
 //!
 //! let options = CodecConsensusOptions {
