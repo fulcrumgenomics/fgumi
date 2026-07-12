@@ -24,6 +24,10 @@ ci-doc = "doc --no-deps --workspace --features compare,simulate,profile-adjacenc
 # the run to the integration test binary, where every #[ignore] is samtools-gated. A new
 # #[ignore]-d integration test must therefore also be samtools-only.
 ci-test-samtools = "nextest run --workspace --features compare,simulate,profile-adjacency --locked --run-ignored ignored-only -E binary_id(fgumi::integration)"
+# Run the concurrency stress tests (behind the `stress-tests` feature). Timing-
+# sensitive, so run on a nightly schedule (see .github/workflows/stress.yml) rather
+# than per-PR, where a flake would block unrelated changes.
+ci-test-stress = "nextest run --workspace --features compare,simulate,profile-adjacency,stress-tests --locked"
 # Run tests with test-utils feature enabled (allows binary tests to use library test utilities)
 t = "test --features test-utils"
 # Generate and serve documentation locally (runs xtask then mdbook serve)
