@@ -17,8 +17,8 @@ pedantic = { level = "deny", priority = -1 }
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
 fgumi-bgzf = { workspace = true }
 fgumi-bam-io = { workspace = true }
-noodles = { version = "0.111.0", features = ["bam", "sam", "core", "csi"] }
-noodles-bgzf = { version = "0.47.0", features = ["libdeflate"] }
+noodles = { version = "0.112.0", features = ["bam", "sam", "core", "csi"] }
+noodles-bgzf = { version = "0.48.0", features = ["libdeflate"] }
 libdeflater = "1.22"
 libmimalloc-sys = { version = "0.1.44", features = ["extended"] }
 rayon = "1.10"
