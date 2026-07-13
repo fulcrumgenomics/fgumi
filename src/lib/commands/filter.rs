@@ -337,6 +337,14 @@ impl Command for Filter {
             self.io.pipeline_reader_opts(),
         )?;
 
+        // FILT3-02: fgbio's FilterConsensusReads calls Bams.requireQueryGrouped.
+        // Filtering is template-based, so coordinate-sorted input silently scatters
+        // mates and corrupts the both-primaries-pass logic. Reject it like fgbio.
+        crate::commands::common::require_query_grouped(
+            &header,
+            &self.io.input.display().to_string(),
+        )?;
+
         // Add @PG record with PP chaining to input's last program
         let header = crate::commands::common::add_pg_record(header, command_line)?;
 
@@ -2438,16 +2446,20 @@ mod tests {
     }
 
     /// Helper: build a minimal chr1 noodles `Header` for use with the noodles BAM writer.
+    ///
+    /// Stamped `SO:queryname` because `filter` now requires query-grouped input
+    /// (FILT3-02, matching fgbio `Bams.requireQueryGrouped`).
     fn test_bam_header() -> noodles::sam::Header {
         use noodles::sam::header::record::value::Map;
         use noodles::sam::header::record::value::map::ReferenceSequence;
         use std::num::NonZeroUsize;
-        noodles::sam::Header::builder()
+        let header = noodles::sam::Header::builder()
             .add_reference_sequence(
                 "chr1",
                 Map::<ReferenceSequence>::new(NonZeroUsize::new(1000).expect("1000 is non-zero")),
             )
-            .build()
+            .build();
+        fgumi_sam::header_as_queryname(&header)
     }
 
     /// Write a list of raw records as a BAM file with a single chr1 reference.

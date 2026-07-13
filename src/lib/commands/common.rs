@@ -172,6 +172,65 @@ pub fn check_consensus_sort_order(header: &Header, source: &str) -> anyhow::Resu
     );
 }
 
+/// Requires that the input header is queryname sorted or query grouped, matching
+/// fgbio's `Bams.requireQueryGrouped` (used by `FilterConsensusReads` and `ClipBam`).
+///
+/// Template-based commands group a template's reads by *adjacency*. On coordinate-
+/// sorted input the mates scatter, every read degrades to its own single-read
+/// "template", and pair-level logic (overlap clipping, mate-info fix,
+/// both-primaries-pass) is silently wrong with a success exit. fgbio hard-fails
+/// here; fgumi must too.
+///
+/// This is the query-grouped guard, weaker than [`check_consensus_sort_order`]:
+/// a plain `SO:queryname` file (no template-coordinate sub-sort) is accepted here
+/// but rejected there. Use this for filter/clip; use `check_consensus_sort_order`
+/// for consensus callers.
+///
+/// Reads only the header, so it is safe to call on a stdin-backed reader after the
+/// header has been read.
+///
+/// # Arguments
+///
+/// * `header` - the already-read input BAM header
+/// * `source` - a human-readable description of the input (path or `<stdin>`)
+///
+/// # Errors
+///
+/// Returns an error if the header is neither queryname sorted (`SO:queryname`) nor
+/// query grouped (`GO:query`).
+pub fn require_query_grouped(header: &Header, source: &str) -> anyhow::Result<()> {
+    if fgumi_sam::is_query_grouped(header) {
+        return Ok(());
+    }
+    let (so, go, ss) = header_sort_and_group_order(header);
+    // Mirror fgbio's requireQueryGrouped: append " SS:{ss}" only when present.
+    let ss_suffix = ss.map_or_else(String::new, |ss| format!(" SS:{ss}"));
+    anyhow::bail!(
+        "File {source} was not queryname sorted or query grouped, found: SO:{so} GO:{go}{ss_suffix}. \
+         A template's reads must be adjacent, so the input must advertise SO:queryname \
+         or GO:query.\n\nSort it first, e.g.:\n  \
+         fgumi sort -i input.bam -o sorted.bam --order queryname"
+    );
+}
+
+/// Returns the header's declared sort order (`SO`, default `unsorted` per htsjdk),
+/// group order (`GO`, default `none`), and sub-sort (`SS`, `None` when absent) as
+/// display strings for diagnostics — mirroring fgbio's `requireQueryGrouped`.
+fn header_sort_and_group_order(header: &Header) -> (String, String, Option<String>) {
+    let Some(hdr_map) = header.header() else {
+        return ("unsorted".to_string(), "none".to_string(), None);
+    };
+    let other = hdr_map.other_fields();
+    let read = |tag: &[u8; 2]| -> Option<String> {
+        other.get(tag).map(|v| String::from_utf8_lossy(<_ as AsRef<[u8]>>::as_ref(v)).into_owned())
+    };
+    (
+        read(b"SO").unwrap_or_else(|| "unsorted".to_string()),
+        read(b"GO").unwrap_or_else(|| "none".to_string()),
+        read(b"SS"),
+    )
+}
+
 /// EM-Seq methylation-aware consensus calling options.
 #[derive(Debug, Clone, Default, Args)]
 pub struct EmSeqOptions {
@@ -1051,6 +1110,50 @@ mod tests {
                 err.to_string().contains("template-coordinate"),
                 "error must suggest template-coordinate: {err}"
             );
+        }
+    }
+
+    /// FILT3-02 / CLIP3-05: `require_query_grouped` mirrors fgbio's
+    /// `Bams.requireQueryGrouped` (`isQueryGrouped = SO:queryname || GO:query`).
+    /// Error cases assert the found-order echo and the fgbio-style message.
+    #[rstest]
+    // A plain queryname sort qualifies (unlike the stricter consensus guard).
+    #[case::queryname("@HD\tVN:1.6\tSO:queryname\n", true, &[])]
+    // GO:query alone qualifies.
+    #[case::go_query("@HD\tVN:1.6\tSO:unsorted\tGO:query\n", true, &[])]
+    // Template-coordinate consensus output qualifies via GO:query.
+    #[case::template_coordinate(
+        "@HD\tVN:1.6\tSO:unsorted\tGO:query\tSS:template-coordinate\n",
+        true,
+        &[]
+    )]
+    // The FILT3-02/CLIP3-05 footgun: coordinate-sorted input scatters mates.
+    #[case::coordinate(
+        "@HD\tVN:1.6\tSO:coordinate\n",
+        false,
+        &["foo.bam", "queryname sorted or query grouped", "SO:coordinate", "GO:none"]
+    )]
+    // A rejected header with an SS sub-sort echoes it like fgbio (" SS:{ss}").
+    #[case::coordinate_with_ss(
+        "@HD\tVN:1.6\tSO:coordinate\tSS:coordinate:natural\n",
+        false,
+        &["SO:coordinate", "GO:none", "SS:coordinate:natural"]
+    )]
+    // No SO/GO at all (htsjdk default unsorted, GO none) → rejected.
+    #[case::bare_unsorted("@HD\tVN:1.6\n", false, &["queryname sorted or query grouped"])]
+    fn test_require_query_grouped(
+        #[case] header_str: &str,
+        #[case] expect_ok: bool,
+        #[case] expected_substrings: &[&str],
+    ) {
+        let header: Header = header_str.parse().expect("parse");
+        let result = require_query_grouped(&header, "foo.bam");
+        assert_eq!(result.is_ok(), expect_ok, "for header {header_str:?}");
+        if let Err(err) = result {
+            let msg = err.to_string();
+            for sub in expected_substrings {
+                assert!(msg.contains(sub), "message {msg:?} missing {sub:?}");
+            }
         }
     }
 

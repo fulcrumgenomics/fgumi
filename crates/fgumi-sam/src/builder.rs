@@ -256,6 +256,17 @@ impl SamBuilder {
         self
     }
 
+    /// Stamps queryname sort order (`SO:queryname`) onto the header.
+    ///
+    /// Template-based commands (`filter`, `clip`) require query-grouped input
+    /// (fgbio `Bams.requireQueryGrouped`), so tests that exercise them end-to-end
+    /// should call this before writing the input BAM. The builder's per-pair
+    /// insertion order keeps a template's reads adjacent, satisfying the grouping.
+    pub fn set_queryname_sort_order(&mut self) -> &mut Self {
+        self.header = crate::header_as_queryname(&self.header);
+        self
+    }
+
     /// Returns the next sequential name.
     fn next_name(&self) -> String {
         format!("{:04}", self.counter.fetch_add(1, Ordering::SeqCst))

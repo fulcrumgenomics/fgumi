@@ -237,6 +237,14 @@ impl Command for Clip {
             // Read header for the 7-step pipeline (supports stdin)
             let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
 
+            // CLIP3-05: fgbio's ClipBam calls Bams.requireQueryGrouped. Clipping is
+            // template-based (pair clip, overlap, past-mate, mate-fix), so coordinate-
+            // sorted input silently mis-groups mates. Guard the *input* header.
+            crate::commands::common::require_query_grouped(
+                &header,
+                &self.io.input.display().to_string(),
+            )?;
+
             // Load reference (always required for clip)
             let reference = Arc::new(ReferenceReader::new(&self.reference)?);
 
@@ -274,6 +282,12 @@ impl Clip {
         // Open input BAM with MT BGZF decompression
         let reader_threads = self.threading.num_threads();
         let (reader, header) = create_raw_bam_reader(&self.io.input, reader_threads)?;
+
+        // CLIP3-05: require query-grouped input (fgbio Bams.requireQueryGrouped).
+        crate::commands::common::require_query_grouped(
+            &header,
+            &self.io.input.display().to_string(),
+        )?;
 
         // Add @PG record with PP chaining to input's last program
         let header = crate::commands::common::add_pg_record(header, command_line)?;
@@ -2003,6 +2017,7 @@ mod tests {
 
         // Create overlapping read pair
         let mut builder = SamBuilder::with_single_ref("chr1", 200);
+        builder.set_queryname_sort_order(); // clip requires query-grouped input (CLIP3-05)
         let _ = builder
             .add_pair()
             .name("read1")
@@ -2053,6 +2068,7 @@ mod tests {
         let output_path = dir.path().join("output.bam");
 
         let mut builder = SamBuilder::with_single_ref("chr1", 200);
+        builder.set_queryname_sort_order(); // clip requires query-grouped input (CLIP3-05)
         let _ = builder
             .add_pair()
             .name("read1")
@@ -2102,6 +2118,7 @@ mod tests {
         let output_path = dir.path().join("output.bam");
 
         let mut builder = SamBuilder::with_single_ref("chr1", 200);
+        builder.set_queryname_sort_order(); // clip requires query-grouped input (CLIP3-05)
         let _ = builder
             .add_pair()
             .name("read1")
@@ -2151,6 +2168,7 @@ mod tests {
         let output_path = dir.path().join("output.bam");
 
         let mut builder = SamBuilder::with_single_ref("chr1", 200);
+        builder.set_queryname_sort_order(); // clip requires query-grouped input (CLIP3-05)
         let _ = builder
             .add_pair()
             .name("read1")
@@ -2200,6 +2218,7 @@ mod tests {
         let output_path = dir.path().join("output.bam");
 
         let mut builder = SamBuilder::with_single_ref("chr1", 200);
+        builder.set_queryname_sort_order(); // clip requires query-grouped input (CLIP3-05)
         let _ = builder
             .add_pair()
             .name("read1")
@@ -2249,6 +2268,7 @@ mod tests {
         let output_path = dir.path().join("output.bam");
 
         let mut builder = SamBuilder::with_single_ref("chr1", 200);
+        builder.set_queryname_sort_order(); // clip requires query-grouped input (CLIP3-05)
         let _ = builder
             .add_pair()
             .name("read1")
@@ -2299,6 +2319,7 @@ mod tests {
         let metrics_path = dir.path().join("metrics.txt");
 
         let mut builder = SamBuilder::with_single_ref("chr1", 200);
+        builder.set_queryname_sort_order(); // clip requires query-grouped input (CLIP3-05)
         let _ = builder
             .add_pair()
             .name("read1")
@@ -2350,6 +2371,7 @@ mod tests {
 
         // Create a fragment (unpaired) read
         let mut builder = SamBuilder::with_single_ref("chr1", 200);
+        builder.set_queryname_sort_order(); // clip requires query-grouped input (CLIP3-05)
         let _ = builder
             .add_frag()
             .name("frag1")
@@ -2399,6 +2421,7 @@ mod tests {
         let output_path = dir.path().join("output.bam");
 
         let mut builder = SamBuilder::with_single_ref("chr1", 200);
+        builder.set_queryname_sort_order(); // clip requires query-grouped input (CLIP3-05)
         let _ = builder
             .add_pair()
             .name("read1")
@@ -2449,6 +2472,7 @@ mod tests {
         let metrics_path = dir.path().join("metrics.txt");
 
         let mut builder = SamBuilder::with_single_ref("chr1", 200);
+        builder.set_queryname_sort_order(); // clip requires query-grouped input (CLIP3-05)
         let _ = builder
             .add_pair()
             .name("read1")
@@ -2499,6 +2523,7 @@ mod tests {
         let output_path = dir.path().join("output.bam");
 
         let mut builder = SamBuilder::with_single_ref("chr1", 200);
+        builder.set_queryname_sort_order(); // clip requires query-grouped input (CLIP3-05)
         let _ = builder
             .add_pair()
             .name("read1")
@@ -2552,6 +2577,7 @@ mod tests {
         let output_path = dir.path().join("output.bam");
 
         let mut builder = SamBuilder::with_single_ref("chr1", 200);
+        builder.set_queryname_sort_order(); // clip requires query-grouped input (CLIP3-05)
         let _ = builder
             .add_pair()
             .name("read1")

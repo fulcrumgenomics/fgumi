@@ -13,24 +13,104 @@ use noodles::bam;
 use noodles::sam::alignment::RecordBuf;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record::cigar::op::Kind as CigarKind;
+use rstest::rstest;
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
-use crate::helpers::bam_generator::{create_minimal_header, create_test_reference, to_record_buf};
+use crate::helpers::bam_generator::{
+    create_coordinate_sorted_header, create_minimal_header, create_test_reference, to_record_buf,
+};
 
-/// Create a BAM with paired reads.
-fn create_paired_bam(path: &Path, pairs: Vec<(RawRecord, RawRecord)>) {
-    let header = create_minimal_header("chr1", 10000);
+/// Create a BAM with paired reads using the given header.
+fn create_paired_bam_with_header(
+    path: &Path,
+    header: &noodles::sam::Header,
+    pairs: Vec<(RawRecord, RawRecord)>,
+) {
     let mut writer =
         bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
-    writer.write_header(&header).expect("Failed to write header");
+    writer.write_header(header).expect("Failed to write header");
 
     for (r1, r2) in pairs {
-        writer.write_alignment_record(&header, &to_record_buf(&r1)).expect("Failed to write R1");
-        writer.write_alignment_record(&header, &to_record_buf(&r2)).expect("Failed to write R2");
+        writer.write_alignment_record(header, &to_record_buf(&r1)).expect("Failed to write R1");
+        writer.write_alignment_record(header, &to_record_buf(&r2)).expect("Failed to write R2");
     }
     writer.try_finish().expect("Failed to finish BAM");
+}
+
+/// Create a BAM with paired reads and a query-grouped (template-coordinate) header.
+fn create_paired_bam(path: &Path, pairs: Vec<(RawRecord, RawRecord)>) {
+    let header = create_minimal_header("chr1", 10000);
+    create_paired_bam_with_header(path, &header, pairs);
+}
+
+/// CLIP3-05: clip must reject coordinate-sorted (non-query-grouped) input,
+/// matching fgbio's `Bams.requireQueryGrouped`. On coordinate-sorted input mates
+/// scatter, so pair clip / overlap / mate-fix silently no-op — hard-fail instead.
+///
+/// Exercised on both `Clip::execute` paths (the single-threaded fast path and the
+/// `--threads` pipeline) since the guard is wired into each.
+#[rstest]
+#[case::single_threaded(&[])]
+#[case::threaded(&["--threads", "2"])]
+fn test_clip_rejects_coordinate_sorted_input(#[case] extra_args: &[&str]) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+
+    let r1 = {
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[8 << 4])
+            .mate_ref_id(0)
+            .mate_pos(103)
+            .template_length(12);
+        b.build()
+    };
+    let r2 = {
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+            .ref_id(0)
+            .pos(103)
+            .mapq(60)
+            .cigar_ops(&[8 << 4])
+            .mate_ref_id(0)
+            .mate_pos(99)
+            .template_length(-12);
+        b.build()
+    };
+    let header = create_coordinate_sorted_header("chr1", 10000);
+    create_paired_bam_with_header(&input_bam, &header, vec![(r1, r2)]);
+
+    let mut args = vec![
+        "clip",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--clip-overlapping-reads",
+    ];
+    args.extend_from_slice(extra_args);
+    let cmd = Clip::try_parse_from(args).expect("failed to parse clip args");
+
+    let err = cmd.execute("fgumi clip").expect_err("must reject coordinate-sorted input");
+    assert!(
+        err.to_string().contains("queryname sorted or query grouped"),
+        "unexpected error message: {err}"
+    );
 }
 
 /// Test basic clip command with fixed-end clipping.
