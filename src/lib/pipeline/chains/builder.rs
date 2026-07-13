@@ -1618,6 +1618,11 @@ impl<'a> ChainBuilder<'a> {
             other => bail!("add_extract requires SourceSpec::Fastqs, got {other:?}"),
         };
 
+        // Enforce the same read-structure guard the standalone `Extract` command
+        // applies (1-2 template reads total): the chain/runall path previously
+        // skipped it and would silently emit malformed BAM templates.
+        crate::commands::extract::validate_template_count(&read_structures)?;
+
         let input_path = self.resolve_log_input_path();
         log::info!("Starting Extract");
         log::info!("Input: {}", input_path.display());
@@ -3765,6 +3770,20 @@ impl<'a> ChainBuilder<'a> {
             );
         }
 
+        // Clip groups the record stream internally (GroupBam), so it consumes a
+        // DecodedRecordBatch tail. If an upstream stage left a different tail type
+        // (e.g. an intermediate Group emits BatchedProcessedPositionGroups), the
+        // type-erased pipeline would build but panic at dispatch — reject it here
+        // with a clear error.
+        if self.chain_tail_kind != ChainTailKind::DecodedRecordBatch {
+            bail!(
+                "Stage::Clip requires a record-stream input (DecodedRecordBatch), but the chain \
+                 tail is {:?}; clip cannot follow a stage that emits grouped templates or \
+                 serialized bytes.",
+                self.chain_tail_kind
+            );
+        }
+
         let clip = self
             .spec
             .stage_opts
@@ -3915,6 +3934,21 @@ impl<'a> ChainBuilder<'a> {
             bail!(
                 "intermediate filter not implemented; filter is typically terminal \
                 (no Phase 3 runall combination requires it as an intermediate stage)"
+            );
+        }
+
+        // Filter consumes a record stream (either a GroupByQueryname step in
+        // filter-by-template mode or a single-record filter step), so it needs a
+        // DecodedRecordBatch tail — the same requirement as clip/dedup. If an upstream
+        // stage left a different tail type (e.g. an intermediate Group emits
+        // BatchedProcessedPositionGroups), the type-erased pipeline would build but
+        // panic at dispatch — reject it here.
+        if self.chain_tail_kind != ChainTailKind::DecodedRecordBatch {
+            bail!(
+                "Stage::Filter requires a record-stream input (DecodedRecordBatch), but the chain \
+                 tail is {:?}; filter cannot follow a stage that emits grouped templates or \
+                 serialized bytes.",
+                self.chain_tail_kind
             );
         }
 
@@ -4123,6 +4157,19 @@ impl<'a> ChainBuilder<'a> {
             bail!(
                 "intermediate dedup not implemented; dedup is typically terminal \
                 (no Phase 3 runall combination requires it as an intermediate stage)"
+            );
+        }
+
+        // Dedup groups the record stream internally (GroupByPosition), so it
+        // consumes a DecodedRecordBatch tail. Reject an incompatible upstream
+        // tail (e.g. an intermediate Group's BatchedProcessedPositionGroups) here
+        // rather than dispatch-panicking in the type-erased pipeline.
+        if self.chain_tail_kind != ChainTailKind::DecodedRecordBatch {
+            bail!(
+                "Stage::Dedup requires a record-stream input (DecodedRecordBatch), but the chain \
+                 tail is {:?}; dedup cannot follow a stage that emits grouped templates or \
+                 serialized bytes.",
+                self.chain_tail_kind
             );
         }
 

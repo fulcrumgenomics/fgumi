@@ -1282,34 +1282,23 @@ pub(crate) mod merge_step {
                         let mapped = self.pending_b.as_mut().unwrap().take_current().unwrap();
                         self.emit_merged(unmapped, mapped, ctx)?
                     }
-                    Some(ref n) => {
-                        // MISMATCH. Mapped is expected to be a subsequence of
-                        // unmapped in the same queryname order, so the mapped
-                        // head must never sort *before* the unmapped head: if
-                        // it does, a mapped read has no corresponding unmapped
-                        // read (or the inputs are out of order), which is
-                        // corruption — fail rather than silently emitting the
-                        // unmapped read as missing-mapped.
-                        if fgumi_raw_bam::sort::natural_compare(n, &pa_name)
-                            == std::cmp::Ordering::Less
-                        {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "Error: mapped read '{}' sorts before unmapped read '{}'; the \
-                                     mapped input has a read with no corresponding unmapped read, or \
-                                     the inputs are not in the same queryname order. Please ensure the \
-                                     unmapped and mapped reads have the same set of read names in the \
-                                     same order, and reads with the same name are consecutive (grouped) \
-                                     in each input.",
-                                    String::from_utf8_lossy(n),
-                                    String::from_utf8_lossy(&pa_name),
-                                ),
-                            ));
-                        }
-                        // Mapped head sorts after the unmapped head: the current
-                        // unmapped read is missing from mapped. Consume the
-                        // unmapped only; leave pending_b cursor where it is.
+                    Some(_) => {
+                        // MISMATCH: the mapped head names a different template.
+                        // The mapped BAM is a subsequence of the unmapped BAM in
+                        // the same queryname order, so a name mismatch means the
+                        // current unmapped read is simply missing from the mapped
+                        // BAM — emit it as unmapped-only and advance the unmapped
+                        // cursor (leaving the mapped cursor put), exactly as fgbio
+                        // ZipperBams does (name-equality only).
+                        //
+                        // We deliberately do NOT compare sort order here. The
+                        // inputs may be query-GROUPED (records with the same name
+                        // consecutive) rather than queryname-sorted, in which case
+                        // successive groups can be in any order and a `natural`
+                        // comparison would spuriously reject valid input. A
+                        // genuinely orphaned mapped read (no unmapped counterpart)
+                        // is still caught by the end-of-stream "mapped reads
+                        // remaining" check once the unmapped branch drains.
                         let unmapped = self.pending_a.as_mut().unwrap().take_current().unwrap();
                         self.emit_unmapped_only(unmapped, ctx)?
                     }
@@ -2787,6 +2776,53 @@ mod tests {
             "Supplementary without primary should not have pa tag"
         );
 
+        Ok(())
+    }
+
+    /// Query-GROUPED (not natural-sorted) input where the mapped BAM is missing
+    /// a read must be accepted. Unmapped templates are "q10" then "q2" (grouped,
+    /// not natural order); the mapped BAM has only "q2". At the "q10" step the
+    /// mapped head "q2" natural-sorts BEFORE "q10" — the old guard spuriously
+    /// rejected this as corruption. It must now emit "q10" unmapped-only and
+    /// merge "q2" (matching fgbio `ZipperBams`, which compares by name equality
+    /// only and never by sort order).
+    #[test]
+    fn grouped_out_of_natural_order_missing_mapped_read_is_accepted() -> Result<()> {
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
+
+        let empty = HashMap::new();
+        unmapped.add_pair_with_attrs("q10", None, None, true, true, &empty);
+        unmapped.add_pair_with_attrs("q2", None, None, true, true, &empty);
+        // Mapped is missing "q10"; it only has "q2".
+        let _ = mapped.add_pair().name("q2").start1(100).start2(200).build();
+
+        let records = run_zipper(&unmapped, &mapped, vec![], vec![], vec![])?;
+
+        // 2 unmapped-only q10 records (missing from the mapped BAM) + 2 merged q2
+        // records. A name-only check would miss q10 being dropped, duplicated, or
+        // wrongly merged against an unrelated mapped read.
+        assert_eq!(records.len(), 4, "expected 2 unmapped-only (q10) + 2 merged (q2) records");
+
+        let names: Vec<String> = records
+            .iter()
+            .map(|r| {
+                String::from_utf8(r.name().expect("record should have a name").as_bytes().to_vec())
+                    .expect("utf8 name")
+            })
+            .collect();
+        assert!(names.iter().any(|n| n == "q10"), "q10 must be emitted unmapped-only: {names:?}");
+        assert!(names.iter().any(|n| n == "q2"), "q2 must be merged: {names:?}");
+        // q10 has no mapped counterpart, so both its records must stay unmapped —
+        // mirrors the `flags().is_unmapped()` guard in `test_unmapped_only_reads`.
+        let mut q10_unmapped = 0;
+        for r in &records {
+            if r.name().expect("record should have a name").as_bytes() == b"q10" {
+                assert!(r.flags().is_unmapped(), "q10 must remain unmapped");
+                q10_unmapped += 1;
+            }
+        }
+        assert_eq!(q10_unmapped, 2, "both q10 mates must be emitted unmapped-only");
         Ok(())
     }
 

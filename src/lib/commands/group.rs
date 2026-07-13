@@ -777,7 +777,9 @@ are grouped by template, and then templates are sorted by the 5' mapping positio
 the reads from the template, used from earliest mapping position to latest. Reads that
 have the same end positions are then sub-grouped by UMI sequence.
 
-Accepts reads in any order (including unsorted) and outputs reads sorted by:
+Requires the input to be template-coordinate sorted (or queryname sorted when
+`--allow-unmapped` is given); unlike fgbio it does not re-sort internally, and
+rejects input that is not in one of those orders. Outputs reads sorted by:
 
    1. The lower genome coordinate of the two outer ends of the templates (strand-aware)
    2. The sequencing library
@@ -785,10 +787,9 @@ Accepts reads in any order (including unsorted) and outputs reads sorted by:
    4. The assigned UMI tag
    5. Read Name
 
-It is recommended to sort the reads into template-coordinate order prior to running
-this tool to avoid re-sorting the input. Use `fgumi sort --order template-coordinate`
-for the pre-sorting. The output will always be written
-in template-coordinate order.
+Pre-sort the reads into template-coordinate order before running this tool with
+`fgumi sort --order template-coordinate`. The output is always written in
+template-coordinate order.
 
 During grouping, reads and templates are filtered out as follows:
 
@@ -1313,8 +1314,16 @@ impl GroupReadsByUmi {
             filter_config.min_umi_length,
             filter_config.no_umi,
         ) {
-            // Log error but continue processing
+            // The whole group is dropped from the BAM (matching the chain path),
+            // so none of its filter-passing templates are actually accepted. This
+            // group's `accepted_templates` was already merged into the total
+            // above; roll it back so the summary/metrics match the (empty) output
+            // rather than over-counting. The discard counters stay — those
+            // templates were genuinely filtered out.
             log::warn!("Failed to assign UMI groups: {e}");
+            total_filter_metrics.accepted_templates = total_filter_metrics
+                .accepted_templates
+                .saturating_sub(filter_metrics.accepted_templates);
             return Ok(());
         }
 
@@ -5187,6 +5196,93 @@ mod tests {
         let mut metrics = FilterMetrics::new();
         assert!(filter_template_raw(&template, &config, &mut metrics));
         assert_eq!(metrics.accepted_templates, 1);
+    }
+
+    /// A group whose template PASSES filtering but then FAILS UMI assignment must
+    /// roll its `accepted_templates` contribution back out of the running total
+    /// (so the summary matches the empty output), while leaving the discard
+    /// counters untouched — that template was not filtered out, it was dropped
+    /// whole when assignment failed. Regression for the rollback branch in
+    /// `process_and_write_position_group`.
+    #[test]
+    fn assignment_failure_rolls_back_accepted_templates_but_not_discards() {
+        use fgumi_bam_io::{DecodedRecord, GroupKey};
+
+        // The RX value is 8 real bases plus a trailing non-UTF-8 byte: `validate_umi`
+        // skips the stray byte (so the filter accepts the template), but assignment's
+        // `str::from_utf8` rejects it — driving the `assign_umi_groups_impl` Err
+        // branch that triggers the rollback.
+        let raw = make_raw_bam_for_group(
+            b"rea",
+            flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_UNMAPPED,
+            30,
+            b"ACGTACGT\xff",
+        );
+        let group = RawPositionGroup {
+            group_key: GroupKey::default(),
+            records: vec![DecodedRecord::from_raw_bytes(raw, GroupKey::default())],
+        };
+        let filter_config = GroupFilterConfig {
+            umi_tag: [b'R', b'X'],
+            min_mapq: 20,
+            include_non_pf: false,
+            min_umi_length: None,
+            no_umi: false,
+            allow_unmapped: false,
+        };
+
+        // Pre-existing totals from earlier groups that must survive the rollback.
+        let mut total = FilterMetrics::new();
+        total.accepted_templates = 5;
+        total.discarded_poor_alignment = 2;
+        total.discarded_non_pf = 1;
+        let discards_before = (
+            total.discarded_non_pf,
+            total.discarded_poor_alignment,
+            total.discarded_ns_in_umi,
+            total.discarded_umi_too_short,
+        );
+
+        let mut family_sizes = AHashMap::new();
+        let mut position_group_sizes = AHashMap::new();
+        let mut next_mi_base = 0u64;
+        let header = create_test_header();
+        let tmp = NamedTempFile::new().expect("tempfile");
+        let mut writer = create_bam_writer(tmp.path(), &header, 1, 0).expect("writer");
+
+        let result = GroupReadsByUmi::process_and_write_position_group(
+            group,
+            &filter_config,
+            Strategy::Adjacency,
+            1,
+            0,
+            1,
+            None,
+            [b'R', b'X'],
+            [b'M', b'I'],
+            &mut total,
+            &mut family_sizes,
+            &mut position_group_sizes,
+            &mut next_mi_base,
+            &header,
+            &mut writer,
+        );
+
+        assert!(result.is_ok(), "assignment failure must be handled, not propagated: {result:?}");
+        assert_eq!(
+            total.accepted_templates, 5,
+            "the filter-passing template of the failed group must be rolled back to the pre-group total",
+        );
+        assert_eq!(
+            (
+                total.discarded_non_pf,
+                total.discarded_poor_alignment,
+                total.discarded_ns_in_umi,
+                total.discarded_umi_too_short,
+            ),
+            discards_before,
+            "discard counters must not change on an assignment-failure rollback",
+        );
     }
 
     #[test]

@@ -266,3 +266,67 @@ fn chain_build_group_to_codec() {
     let spec = spec_for(vec![Stage::Group, Stage::Codec], &input, bag);
     build_for(spec).expect("build_for([Group, Codec]) should succeed");
 }
+
+/// `[Group, Clip]` — an ordering-valid but type-incompatible chain: Group emits
+/// grouped templates (`BamTemplateBatch`) while Clip consumes a record stream
+/// (`DecodedRecordBatch`, which it groups internally). The stage-ordering
+/// validators pass, but the type-erased pipeline would panic at dispatch. The
+/// `chain_tail_kind` guard in `add_clip` must reject it cleanly at build time.
+#[test]
+fn chain_build_group_to_clip_rejected() {
+    use clap::Parser;
+    use fgumi_lib::assigner::Strategy;
+    use fgumi_lib::commands::clip::Clip;
+
+    let tmp = TempDir::new().unwrap();
+    let input = write_input_bam(tmp.path());
+
+    // Minimal parse only — the guard fires before Clip's own options are read.
+    let clip =
+        Clip::try_parse_from(["clip", "-i", "/dev/null", "-o", "/dev/null", "-r", "/dev/null"])
+            .expect("parse minimal clip");
+
+    let bag = StageOptionsBag {
+        group: Some(group_opts(Strategy::Adjacency)),
+        clip: Some(clip),
+        ..Default::default()
+    };
+
+    let spec = spec_for(vec![Stage::Group, Stage::Clip], &input, bag);
+    let Err(err) = build_for(spec) else {
+        panic!("Group -> Clip must be rejected at build time");
+    };
+    assert!(
+        err.to_string().contains("Stage::Clip requires a record-stream input (DecodedRecordBatch)"),
+        "expected the clip tail-kind guard to fire, got: {err}"
+    );
+}
+
+/// Filter is the same class of record-stream consumer as Clip/Dedup, so a `Group -> Filter`
+/// chain (grouped-template tail feeding a record-stream stage) must also be rejected at build
+/// time rather than building and panicking at dispatch.
+#[test]
+fn chain_build_group_to_filter_rejected() {
+    use fgumi_lib::assigner::Strategy;
+    use fgumi_lib::commands::filter::FilterOptions;
+
+    let tmp = TempDir::new().unwrap();
+    let input = write_input_bam(tmp.path());
+
+    // Default opts — the guard fires before Filter's own options are read.
+    let bag = StageOptionsBag {
+        group: Some(group_opts(Strategy::Adjacency)),
+        filter: Some(FilterOptions::default()),
+        ..Default::default()
+    };
+
+    let spec = spec_for(vec![Stage::Group, Stage::Filter], &input, bag);
+    let Err(err) = build_for(spec) else {
+        panic!("Group -> Filter must be rejected at build time");
+    };
+    assert!(
+        err.to_string()
+            .contains("Stage::Filter requires a record-stream input (DecodedRecordBatch)"),
+        "expected the filter tail-kind guard to fire, got: {err}"
+    );
+}
