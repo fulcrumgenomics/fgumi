@@ -463,16 +463,7 @@ impl Command for Codec {
         info!("Consensus calling complete");
         info!("Total records processed: {record_count}");
 
-        let metrics = merged_stats.to_metrics();
-        let consensus_count = metrics.consensus_reads;
-        log_consensus_summary(&metrics);
-
-        if let Some(stats_path) = &self.stats_opts.stats {
-            DelimFile::default()
-                .write_tsv(stats_path, [metrics])
-                .with_context(|| format!("Failed to write statistics: {}", stats_path.display()))?;
-            info!("Wrote statistics to: {}", stats_path.display());
-        }
+        let consensus_count = self.finalize_stats(&merged_stats)?;
 
         timer.log_completion(consensus_count);
 
@@ -486,6 +477,31 @@ impl Command for Codec {
     }
 }
 impl Codec {
+    /// Convert the caller's merged statistics to fgbio's KV metrics, log the
+    /// consensus summary, and write the seeded KV stats file when `--stats` is
+    /// requested. Returns the number of consensus reads.
+    ///
+    /// Shared by the single- and multi-threaded paths so their metrics output
+    /// cannot drift — emitting the wide table from one path and the KV format
+    /// from the other is exactly the bug this fix addresses. The KV format
+    /// matches `simplex`/`duplex` and is readable by fgbio's `Metric.read`; the
+    /// output must not depend on the number of threads.
+    fn finalize_stats(&self, merged_stats: &CodecConsensusStats) -> Result<u64> {
+        let metrics = merged_stats.to_metrics();
+        let consensus_count = metrics.consensus_reads;
+        log_consensus_summary(&metrics);
+
+        if let Some(stats_path) = &self.stats_opts.stats {
+            let kv_metrics = metrics.to_kv_metrics(fgumi_metrics::ConsensusCallerKind::Codec);
+            DelimFile::default()
+                .write_tsv(stats_path, kv_metrics)
+                .with_context(|| format!("Failed to write statistics: {}", stats_path.display()))?;
+            info!("Wrote statistics to: {}", stats_path.display());
+        }
+
+        Ok(consensus_count)
+    }
+
     /// Validates command-line arguments
     fn validate(&self) -> Result<()> {
         // Validate error rates
@@ -730,17 +746,7 @@ impl Codec {
         info!("Total MI groups processed: {total_groups}");
         info!("Total consensus reads written by pipeline: {consensus_reads_written}");
 
-        let metrics = merged_stats.to_metrics();
-        let consensus_count = metrics.consensus_reads;
-        log_consensus_summary(&metrics);
-
-        // Write statistics file if requested
-        if let Some(stats_path) = &self.stats_opts.stats {
-            DelimFile::default()
-                .write_tsv(stats_path, [metrics])
-                .with_context(|| format!("Failed to write statistics: {}", stats_path.display()))?;
-            info!("Wrote statistics to: {}", stats_path.display());
-        }
+        let consensus_count = self.finalize_stats(&merged_stats)?;
 
         info!("Wrote {consensus_count} CODEC consensus reads");
 
@@ -990,11 +996,19 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_codec_execute_rejects_non_template_coordinate_input() -> Result<()> {
+    #[rstest]
+    #[case::fast_path(ThreadingOptions::none())]
+    #[case::pipeline_1(ThreadingOptions::new(1))]
+    #[case::pipeline_2(ThreadingOptions::new(2))]
+    fn test_codec_execute_rejects_non_template_coordinate_input(
+        #[case] threading: ThreadingOptions,
+    ) -> Result<()> {
         // CONS-01: codec requires template-coordinate-sorted input. An ungrouped header must be
         // rejected by execute() (via check_consensus_sort_order) rather than silently
         // mis-grouping molecules; the accept branch is covered by the other execute tests.
+        // `check_consensus_sort_order` is invoked separately on the single-threaded fast path and
+        // inside the `--threads` pipeline path, so parameterize over both to guard either branch
+        // from silently dropping the check.
         use noodles::sam::header::record::value::Map;
         use noodles::sam::header::record::value::map::{ReferenceSequence, header::Version};
         use std::num::NonZeroUsize;
@@ -1024,7 +1038,8 @@ mod tests {
         writer.write_alignment_record(&header, &r2)?;
         drop(writer);
 
-        let cmd = create_codec_with_paths(input_path, output_path);
+        let mut cmd = create_codec_with_paths(input_path, output_path);
+        cmd.threading = threading;
         let err = cmd.execute("test").expect_err("codec must reject non-template-coordinate input");
         assert!(
             err.to_string().contains("template-coordinate"),
@@ -1361,19 +1376,36 @@ mod tests {
 
         // Run single-threaded
         let out_st = dir.path().join("out_st.bam");
+        let stats_st = dir.path().join("stats_st.txt");
         let mut cmd_st = create_codec_with_paths(input_path.clone(), out_st.clone());
         cmd_st.outer_bases_length = 0;
         cmd_st.threading = ThreadingOptions::none();
+        cmd_st.stats_opts.stats = Some(stats_st.clone());
         cmd_st.execute("test")?;
         let records_st = read_bam_records(&out_st)?;
 
         // Run multi-threaded
         let out_mt = dir.path().join("out_mt.bam");
+        let stats_mt = dir.path().join("stats_mt.txt");
         let mut cmd_mt = create_codec_with_paths(input_path, out_mt.clone());
         cmd_mt.outer_bases_length = 0;
         cmd_mt.threading = ThreadingOptions::new(2);
+        cmd_mt.stats_opts.stats = Some(stats_mt.clone());
         cmd_mt.execute("test")?;
         let records_mt = read_bam_records(&out_mt)?;
+
+        // The metrics output must not depend on thread count, and must be the
+        // fgbio KV format (seeded rejection rows), matching simplex/duplex.
+        let stats_content = std::fs::read_to_string(&stats_st)?;
+        assert_eq!(
+            stats_content,
+            std::fs::read_to_string(&stats_mt)?,
+            "single-threaded and multi-threaded codec must write identical stats"
+        );
+        assert!(
+            stats_content.contains("raw_reads_rejected_for_non_paired_reads"),
+            "codec stats must be the fgbio KV format with the seeded non_paired_reads row"
+        );
 
         assert_eq!(
             records_st.len(),
@@ -1381,14 +1413,29 @@ mod tests {
             "single-threaded and multi-threaded should produce the same number of consensus records"
         );
 
-        // Both runs should have the same CB tag presence on each record
-        let cb_presence_st: Vec<bool> =
-            records_st.iter().map(|r| r.data().get(&cb_tag).is_some()).collect();
-        let cb_presence_mt: Vec<bool> =
-            records_mt.iter().map(|r| r.data().get(&cb_tag).is_some()).collect();
+        // Assert record *identity*, not just count/CB presence: single- vs multi-threaded must
+        // emit byte-identical consensus records, so content divergence (name/sequence/quality
+        // reordering or corruption) is caught rather than masked by matching counts.
+        // Tuple: (name, sequence, base qualities, CB-tag presence) per record.
+        type RecordIdentity = (Vec<u8>, Vec<u8>, Vec<u8>, bool);
+        let record_identity = |records: &[RecordBuf]| -> Vec<RecordIdentity> {
+            records
+                .iter()
+                .map(|r| {
+                    (
+                        r.name().map(|n| n.to_vec()).unwrap_or_default(),
+                        r.sequence().as_ref().to_vec(),
+                        r.quality_scores().as_ref().to_vec(),
+                        r.data().get(&cb_tag).is_some(),
+                    )
+                })
+                .collect()
+        };
         assert_eq!(
-            cb_presence_st, cb_presence_mt,
-            "CB tag presence should match between single-threaded and multi-threaded modes"
+            record_identity(&records_st),
+            record_identity(&records_mt),
+            "single- and multi-threaded codec must emit byte-identical consensus records \
+             (name, sequence, base qualities, and CB-tag presence)"
         );
 
         Ok(())

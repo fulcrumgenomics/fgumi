@@ -20,6 +20,7 @@ tempfile = "3.3.0"
 fgumi-sam = { workspace = true }
 rstest = "0.26"
 proptest = "1.10"
+strum = { version = "0.26", features = ["derive"] }
 
 [features]
 default = ["clip"]
