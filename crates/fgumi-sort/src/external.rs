@@ -3873,7 +3873,7 @@ mod tests {
         assert_eq!(<_ as AsRef<[u8]>>::as_ref(go), b"query");
 
         let ss = fields.get(b"SS").expect("should have SS tag");
-        assert_eq!(<_ as AsRef<[u8]>>::as_ref(ss), b"template-coordinate");
+        assert_eq!(<_ as AsRef<[u8]>>::as_ref(ss), b"unsorted:template-coordinate");
     }
 
     // ========================================================================

@@ -137,8 +137,9 @@ pub(crate) fn create_output_header(sort_order: keys::SortOrder, header: &Header)
         keys::SortOrder::TemplateCoordinate => {
             hd.other_fields_mut().insert(header_tag::SORT_ORDER, BString::from("unsorted"));
             hd.other_fields_mut().insert(header_tag::GROUP_ORDER, BString::from("query"));
-            hd.other_fields_mut()
-                .insert(header_tag::SUBSORT_ORDER, BString::from("template-coordinate"));
+            if let Some(ss) = sort_order.header_ss_tag() {
+                hd.other_fields_mut().insert(header_tag::SUBSORT_ORDER, BString::from(ss));
+            }
         }
     }
 
@@ -246,5 +247,37 @@ mod tests {
         let hd = output.header().expect("should have @HD");
         let so = hd.other_fields().get(b"SO").expect("should have SO");
         assert_eq!(<_ as AsRef<[u8]>>::as_ref(so), b"coordinate");
+    }
+
+    #[test]
+    fn test_create_output_header_ss_has_sort_order_prefix() {
+        // fgbio/samtools write SS as `<sort-order>:<sub-sort>`; pin that fgumi
+        // does too, so fgbio's `SamOrder.apply` re-recognizes the header.
+        let empty = Header::builder().build();
+        let ss_of = |hd: &Map<noodles::sam::header::record::value::map::Header>| {
+            <_ as AsRef<[u8]>>::as_ref(hd.other_fields().get(b"SS").expect("SS")).to_vec()
+        };
+
+        // queryname (natural) -> SO:queryname, SS:queryname:natural
+        let out = create_output_header(
+            keys::SortOrder::Queryname(keys::QuerynameComparator::Natural),
+            &empty,
+        );
+        let hd = out.header().expect("@HD");
+        assert_eq!(
+            <_ as AsRef<[u8]>>::as_ref(hd.other_fields().get(b"SO").expect("SO")),
+            b"queryname"
+        );
+        assert_eq!(ss_of(hd), b"queryname:natural");
+
+        // template-coordinate -> SO:unsorted, GO:query, SS:unsorted:template-coordinate
+        let out = create_output_header(keys::SortOrder::TemplateCoordinate, &empty);
+        let hd = out.header().expect("@HD");
+        assert_eq!(
+            <_ as AsRef<[u8]>>::as_ref(hd.other_fields().get(b"SO").expect("SO")),
+            b"unsorted"
+        );
+        assert_eq!(<_ as AsRef<[u8]>>::as_ref(hd.other_fields().get(b"GO").expect("GO")), b"query");
+        assert_eq!(ss_of(hd), b"unsorted:template-coordinate");
     }
 }
