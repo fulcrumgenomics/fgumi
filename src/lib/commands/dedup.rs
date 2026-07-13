@@ -122,6 +122,9 @@ struct DedupMetricsOutput {
     total_templates: u64,
     unique_templates: u64,
     duplicate_templates: u64,
+    // DXM3-04: format the one fraction column like fgbio's DecimalFormat, matching
+    // the float serialization #504 wired onto the fgumi-metrics-crate structs.
+    #[serde(with = "fgumi_metrics::float")]
     duplicate_rate: f64,
     total_reads: u64,
     unique_reads: u64,
@@ -2373,6 +2376,34 @@ mod tests {
         assert_eq!(output.secondary_reads, 10);
         assert_eq!(output.supplementary_reads, 5);
         assert_eq!(output.missing_tc_tag, 2);
+    }
+
+    /// DXM3-04: `duplicate_rate` serializes through the fgbio-style float
+    /// formatter (#504's now-public `fgumi_metrics::float`), so a whole-number
+    /// rate is written as `1`, not serde's raw `1.0` — consistent with the other
+    /// fgumi metric files.
+    #[test]
+    fn test_dedup_metrics_duplicate_rate_uses_float_formatter() -> Result<()> {
+        let metrics = DedupMetrics {
+            total_templates: 2,
+            duplicate_templates: 2,
+            unique_templates: 0,
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("dedup.metrics.txt");
+        write_dedup_metrics(&metrics, &path)?;
+
+        let text = std::fs::read_to_string(&path)?;
+        let data_row = text.lines().nth(1).expect("metrics data row");
+        let columns: Vec<&str> = data_row.split('\t').collect();
+        // Field order: total, unique, duplicate templates, then duplicate_rate.
+        assert_eq!(
+            columns.get(3).copied(),
+            Some("1"),
+            "duplicate_rate must format as `1`, not `1.0`; row: {data_row:?}"
+        );
+        Ok(())
     }
 
     // ========================================================================

@@ -13,7 +13,7 @@ pub mod clip;
 pub mod consensus;
 pub mod correct;
 pub mod duplex;
-pub(crate) mod float;
+pub mod float;
 pub mod group;
 pub mod rejection;
 pub mod shared;

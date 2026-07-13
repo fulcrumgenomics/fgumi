@@ -98,6 +98,12 @@ impl Command for SimplexMetrics {
         // Validate inputs
         validate_file_exists(&self.input, "input BAM file")?;
 
+        // fgbio's analog validates minReads >= 1; --min-reads 0 would label every
+        // family (size >= 0) a consensus family, so reject it (SIMM3-02).
+        if self.min_reads == 0 {
+            anyhow::bail!("--min-reads must be >= 1 (got {})", self.min_reads);
+        }
+
         // Check that input is not a consensus BAM
         validate_not_consensus_bam(&self.input)?;
 
@@ -440,6 +446,25 @@ mod tests {
         }
         drop(writer);
         Ok(temp_file)
+    }
+
+    /// SIMM3-02: `--min-reads 0` is rejected (fgbio validates `minReads >= 1`);
+    /// otherwise every family of size >= 0 is silently labeled a consensus family.
+    #[test]
+    fn test_simplex_metrics_rejects_min_reads_zero() -> Result<()> {
+        let (r1, r2) = build_test_pair("q1", 0, 100, 200, "AAA", "1/A");
+        let input = create_test_bam(vec![r1, r2])?;
+        let output_dir = TempDir::new()?;
+        let cmd = SimplexMetrics {
+            input: input.path().to_path_buf(),
+            output: output_dir.path().join("output"),
+            min_reads: 0,
+            intervals: None,
+            description: None,
+        };
+        let err = cmd.execute("test").expect_err("must reject --min-reads 0");
+        assert!(err.to_string().contains("min-reads must be >= 1"), "unexpected: {err}");
+        Ok(())
     }
 
     #[test]
