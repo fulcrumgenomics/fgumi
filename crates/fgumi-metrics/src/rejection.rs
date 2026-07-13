@@ -55,6 +55,17 @@ pub enum RejectionReason {
     ZeroBasesPostTrimming,
     /// Template did not have a single primary FR pair of reads (codec)
     NotPrimaryFrPair,
+    /// Overlap between R1s and R2s too short for CODEC calling (fgbio
+    /// `r1_r2_overlap_too_short`; used by codec)
+    R1R2OverlapTooShort,
+    /// Indel error between the top/bottom strands (fgbio
+    /// `indel_error_between_strands`; used by codec)
+    IndelErrorBetweenStrands,
+    /// Too many errors between the top/bottom strands (fgbio
+    /// `high_duplex_disagreement`; used by codec)
+    HighDuplexDisagreement,
+    /// Overlap clipping failed (fgbio `clip_overlap_failed`; used by codec)
+    ClipOverlapFailed,
 }
 
 impl RejectionReason {
@@ -83,6 +94,11 @@ impl RejectionReason {
             Self::OrphanConsensus => "Only one of R1 or R2 consensus generated",
             Self::ZeroBasesPostTrimming => "Read or mate had zero bases post trimming",
             Self::NotPrimaryFrPair => "Template did not have a single primary FR pair of reads",
+            Self::R1R2OverlapTooShort => "Overlap between R1s and R2s too short for CODEC calling",
+            Self::IndelErrorBetweenStrands => "Indel error between top/bottom strands",
+            // fgbio's exact string (note the "top/bottoms" typo), matched for parity.
+            Self::HighDuplexDisagreement => "Too many errors between top/bottoms strands",
+            Self::ClipOverlapFailed => "See https://github.com/fulcrumgenomics/fgbio/issues/1090",
         }
     }
 
@@ -110,6 +126,10 @@ impl RejectionReason {
             Self::OrphanConsensus => "raw_reads_rejected_for_orphan_consensus",
             Self::ZeroBasesPostTrimming => "raw_reads_rejected_for_zero_bases_post_trimming",
             Self::NotPrimaryFrPair => "raw_reads_rejected_for_not_primary_fr_pair",
+            Self::R1R2OverlapTooShort => "raw_reads_rejected_for_r1_r2_overlap_too_short",
+            Self::IndelErrorBetweenStrands => "raw_reads_rejected_for_indel_error_between_strands",
+            Self::HighDuplexDisagreement => "raw_reads_rejected_for_high_duplex_disagreement",
+            Self::ClipOverlapFailed => "raw_reads_rejected_for_clip_overlap_failed",
         }
     }
 
@@ -138,6 +158,10 @@ impl RejectionReason {
             Self::OrphanConsensus => "Only one of R1 or R2 consensus generated",
             Self::ZeroBasesPostTrimming => "Read or mate had zero bases post trimming",
             Self::NotPrimaryFrPair => "Template did not have a single primary FR pair of reads",
+            Self::R1R2OverlapTooShort => "Overlap between R1s and R2s too short for CODEC calling",
+            Self::IndelErrorBetweenStrands => "Indel error between top/bottom strands",
+            Self::HighDuplexDisagreement => "Too many errors between top/bottoms strands",
+            Self::ClipOverlapFailed => "See https://github.com/fulcrumgenomics/fgbio/issues/1090",
         }
     }
 }
@@ -190,6 +214,42 @@ mod tests {
     }
 
     use strum::IntoEnumIterator;
+
+    /// The four codec-only reasons carry fgbio-verbatim strings (`UmiConsensusCaller.scala:84-87`),
+    /// including the deliberate "top/bottoms" typo and the issue-URL description. Pin the exact
+    /// `description()`, `kv_description()`, and `tsv_key()` so a well-meaning edit can't silently
+    /// break fgbio parity.
+    #[rstest::rstest]
+    #[case::r1_r2_overlap_too_short(
+        RejectionReason::R1R2OverlapTooShort,
+        "Overlap between R1s and R2s too short for CODEC calling",
+        "raw_reads_rejected_for_r1_r2_overlap_too_short"
+    )]
+    #[case::indel_error_between_strands(
+        RejectionReason::IndelErrorBetweenStrands,
+        "Indel error between top/bottom strands",
+        "raw_reads_rejected_for_indel_error_between_strands"
+    )]
+    #[case::high_duplex_disagreement(
+        RejectionReason::HighDuplexDisagreement,
+        "Too many errors between top/bottoms strands",
+        "raw_reads_rejected_for_high_duplex_disagreement"
+    )]
+    #[case::clip_overlap_failed(
+        RejectionReason::ClipOverlapFailed,
+        "See https://github.com/fulcrumgenomics/fgbio/issues/1090",
+        "raw_reads_rejected_for_clip_overlap_failed"
+    )]
+    fn test_codec_reason_strings_match_fgbio(
+        #[case] reason: RejectionReason,
+        #[case] expected_description: &str,
+        #[case] expected_tsv_key: &str,
+    ) {
+        // fgbio uses one description string per reason for both the human-readable and KV forms.
+        assert_eq!(reason.description(), expected_description);
+        assert_eq!(reason.kv_description(), expected_description);
+        assert_eq!(reason.tsv_key(), expected_tsv_key);
+    }
 
     #[test]
     fn test_tsv_key_prefix() {

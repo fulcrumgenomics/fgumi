@@ -444,9 +444,7 @@ impl RejectionReason {
     pub fn to_centralized(&self) -> fgumi_metrics::rejection::RejectionReason {
         use fgumi_metrics::rejection::RejectionReason as CentralReason;
         match self {
-            Self::InsufficientReads | Self::InsufficientOverlap | Self::Other => {
-                CentralReason::InsufficientSupport
-            }
+            Self::InsufficientReads | Self::Other => CentralReason::InsufficientSupport,
             Self::TooManyNs => CentralReason::ExcessiveNBases,
             Self::MinorityAlignment => CentralReason::MinorityAlignment,
             Self::QualityTooLow | Self::QualityTrimmed => CentralReason::LowBaseQuality,
@@ -455,10 +453,14 @@ impl RejectionReason {
             // A fragment/unpaired read supplied to the duplex/codec caller maps to
             // fgbio's NonPairedReads reason (UmiConsensusCaller.scala:81).
             Self::FragmentRead => CentralReason::NonPairedReads,
-            Self::Unmapped
-            | Self::Mapped
-            | Self::SecondaryOrSupplementary
-            | Self::IndelErrorBetweenStrands => CentralReason::NoValidAlignment,
+            Self::Unmapped | Self::Mapped | Self::SecondaryOrSupplementary => {
+                CentralReason::NoValidAlignment
+            }
+            // fgbio's codec caller counts these as `r1_r2_overlap_too_short` and
+            // `indel_error_between_strands` (UmiConsensusCaller.scala:84-85),
+            // not as generic insufficient-support / no-valid-alignment.
+            Self::InsufficientOverlap => CentralReason::R1R2OverlapTooShort,
+            Self::IndelErrorBetweenStrands => CentralReason::IndelErrorBetweenStrands,
             Self::ZeroLengthAfterTrimming => CentralReason::ZeroBasesPostTrimming,
             Self::OrphanConsensus => CentralReason::OrphanConsensus,
             Self::PotentialCollision => CentralReason::DuplicateUmi,
@@ -1057,6 +1059,7 @@ mod tests {
             RejectionReason::OrphanConsensus,
             RejectionReason::IndelErrorBetweenStrands,
             RejectionReason::PotentialCollision,
+            RejectionReason::NotPrimaryFrPair,
             RejectionReason::Other,
         ];
 
@@ -1084,10 +1087,11 @@ mod tests {
             (RejectionReason::MissingUmi, CentralReason::MissingUmi),
             (RejectionReason::QualityTrimmed, CentralReason::LowBaseQuality),
             (RejectionReason::ZeroLengthAfterTrimming, CentralReason::ZeroBasesPostTrimming),
-            (RejectionReason::InsufficientOverlap, CentralReason::InsufficientSupport),
+            (RejectionReason::InsufficientOverlap, CentralReason::R1R2OverlapTooShort),
             (RejectionReason::OrphanConsensus, CentralReason::OrphanConsensus),
-            (RejectionReason::IndelErrorBetweenStrands, CentralReason::NoValidAlignment),
+            (RejectionReason::IndelErrorBetweenStrands, CentralReason::IndelErrorBetweenStrands),
             (RejectionReason::PotentialCollision, CentralReason::DuplicateUmi),
+            (RejectionReason::NotPrimaryFrPair, CentralReason::NotPrimaryFrPair),
             (RejectionReason::Other, CentralReason::InsufficientSupport),
         ];
 
