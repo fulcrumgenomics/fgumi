@@ -6,10 +6,7 @@ use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
     parse_bool,
 };
-use crate::grouper::{
-    FilterMetrics, RawPositionGroup, RecordPositionGrouper, build_templates_from_records,
-};
-use crate::logging::{OperationTimer, log_umi_grouping_summary};
+use crate::grouper::FilterMetrics;
 use crate::metrics::group::UmiGroupingMetrics;
 use crate::sam::SamTag;
 use crate::template::Template;
@@ -18,21 +15,11 @@ use crate::umi::parallel_assigner::{
     ParallelPairedAssigner,
 };
 use crate::umi::{UmiValidation, validate_umi};
-use crate::validation::validate_file_exists;
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fgoxide::io::DelimFile;
-use fgumi_bam_io::DecodedRecord;
-use fgumi_bam_io::Grouper;
-use fgumi_bam_io::LibraryIndex;
-use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::compute_group_key_from_raw;
-use fgumi_bam_io::{create_bam_writer, is_stdin_path};
-use fgumi_raw_bam::{RawBamReader, RawRecord};
-use log::{info, warn};
-use noodles::sam::Header;
-use noodles::sam::alignment::record::data::field::Tag;
+use log::info;
 use std::path::{Path, PathBuf};
 
 // UmiGroupingMetrics and FamilySizeMetrics are imported from crate::metrics
@@ -585,9 +572,8 @@ pub(crate) fn parallel_threshold(strategy: Strategy, opt: &ParallelMinTemplates)
 
 /// Decide whether a position group should use the parallel UMI assigner.
 ///
-/// Shared by the streaming pipeline path (the chain `GroupProcess` step) and the
-/// single-threaded path (`process_and_write_position_group`) so the two stay in
-/// lockstep. Two independent triggers enable the parallel path:
+/// Used by the chain `GroupProcess` step (the sole group execution path). Two
+/// independent triggers enable the parallel path:
 ///
 /// 1. `allow_unmapped` is set (the `--allow-unmapped` flag). Such workflows
 ///    (e.g. ribosome display) are essentially all-unmapped reads forming one
@@ -609,13 +595,13 @@ pub(crate) fn should_use_parallel(
 
 /// Construct a UMI assigner, choosing between the parallel and sequential
 /// variants based on `use_parallel`. Centralizes the four-arm strategy match
-/// shared by the chain `GroupProcess` step (streaming pipeline path) and
-/// `process_and_write_position_group` (single-threaded path).
+/// used by the chain `GroupProcess` step.
 ///
 /// A parallel assigner is only built when `num_threads > 1`: a one-thread rayon
 /// pool delivers no parallelism while still paying pool-construction overhead,
-/// so `--threads 1` and `execute_single_threaded` (which passes `threads = 1`)
-/// always fall back to the sequential assigner regardless of `use_parallel`.
+/// so a one-worker chain (`--threads 1`, or `--threads` unset, which resolves to
+/// one worker) always falls back to the sequential assigner regardless of
+/// `use_parallel`.
 pub(crate) fn create_umi_assigner(
     strategy: Strategy,
     effective_edits: u32,
@@ -948,13 +934,10 @@ pub(crate) fn build_grouping_metrics(
 impl Command for GroupReadsByUmi {
     /// Execute the group-by-UMI command.
     ///
-    /// Pure CLI-flag validations run first. For the single-threaded fast path
-    /// (`--threads` unset, BAM-only) the source is opened here so the reader
-    /// can be passed to `execute_single_threaded`. For the multi-threaded path
-    /// the spec is handed to [`crate::pipeline::chains::build_for`] and
-    /// all header-based validation (sort order, etc.) runs inside the chain
-    /// builder — this ensures stdin is only opened once.
-    #[allow(clippy::too_many_lines)]
+    /// Pure CLI-flag validations run first, then the spec is handed to
+    /// [`crate::pipeline::chains::build_for`] for every thread count (`--threads`
+    /// unset resolves to a one-worker chain). All header-based validation (sort
+    /// order, etc.) and source opening run once inside the chain builder.
     fn execute(&self, command_line: &str) -> Result<()> {
         // ── Pure CLI-flag validations ─────────────────────────────────────────
         if self.options.min_umi_length.is_some()
@@ -985,100 +968,16 @@ impl Command for GroupReadsByUmi {
                 self.options.edits
             };
 
-        // ── Single-threaded fast path (--threads unset, BAM-only) ─────────────
-        // Open the source here so we can pass the already-open reader to
-        // `execute_single_threaded` (required for stdin support).
-        if self.threading.threads.is_none() {
-            // Validate file exists (skip for stdin).
-            if !is_stdin_path(&self.io.input) {
-                validate_file_exists(&self.io.input, "input BAM file")?;
-            }
-
-            let timer = OperationTimer::new("Grouping reads by UMI");
-
-            info!("Starting group");
-            info!("Input: {}", self.io.input.display());
-            info!("Output: {}", self.io.output.display());
-            info!("Strategy: {effective_strategy:?}");
-            info!("Edits: {effective_edits}");
-            if self.options.no_umi {
-                info!("No-UMI mode: grouping by position only");
-            }
-            if matches!(effective_strategy, Strategy::Adjacency | Strategy::Paired) {
-                info!("Index threshold: {}", self.options.index_threshold);
-            }
-            if self.options.allow_unmapped {
-                info!("Allow unmapped: enabled (unmapped templates will be grouped by UMI only)");
-                warn!(
-                    "WARNING: All unmapped reads are placed in a single position group. \
-                     Reads with identical/similar UMIs will be grouped together even if they \
-                     originate from different genomic locations."
-                );
-                if matches!(
-                    self.options.strategy,
-                    Strategy::Edit | Strategy::Adjacency | Strategy::Paired
-                ) {
-                    warn!(
-                        "WARNING: For paired UMIs (e.g., ACGT-TGCA), edit distance is computed \
-                         on the concatenated sequence with dashes removed. With --edits {}, \
-                         only {} mismatch(es) allowed across ALL bases.",
-                        self.options.edits, self.options.edits
-                    );
-                }
-            }
-
-            info!("{}", self.threading.log_message());
-            info!("Reading input");
-
-            let input_source = crate::pipeline::steps::source::InputSource::open(&self.io.input)?;
-            let header = input_source.header().clone();
-
-            // Sort-order precondition + info logging, shared verbatim with the
-            // chain builder's `add_group` so the two group orchestrations cannot
-            // drift on accepted orders or the remediation hint.
-            crate::commands::common::require_group_input_sort(
-                &header,
-                self.options.allow_unmapped,
-            )?;
-
-            let header = crate::commands::common::add_pg_record(header, command_line)?;
-
-            let raw_tag: [u8; 2] = *SamTag::RX;
-            let assign_tag_bytes: [u8; 2] = *SamTag::MI;
-            let cell_tag = Tag::from(SamTag::CB);
-            let filter_config = GroupFilterConfig {
-                umi_tag: raw_tag,
-                min_mapq: self.options.min_map_q,
-                include_non_pf: self.options.include_non_pf_reads,
-                min_umi_length: self.options.min_umi_length,
-                no_umi: self.options.no_umi,
-                allow_unmapped: self.options.allow_unmapped,
-            };
-
-            let reader = match input_source {
-                crate::pipeline::steps::source::InputSource::Bam { reader, .. } => reader,
-                crate::pipeline::steps::source::InputSource::Sam { .. } => {
-                    bail!(
-                        "SAM input requires --threads N (single-threaded group path is BAM-only; \
-                         the multi-threaded path handles SAM via ReadSamChunks + ParseSamChunk)"
-                    )
-                }
-            };
-            return self.execute_single_threaded(
-                reader,
-                &header,
-                effective_strategy,
-                effective_edits,
-                raw_tag,
-                assign_tag_bytes,
-                cell_tag,
-                &filter_config,
-                &timer,
-            );
-        }
-
-        // ── Multi-threaded path: route through chains::build_for ──────────────
-        // Do NOT open the source here — the chain builder opens it once.
+        // ── Route through chains::build_for (single orchestration) ────────────
+        // `group` uses one code path for every thread count. `--threads` unset
+        // resolves to `num_threads() == 1` — a one-worker chain that degrades to
+        // the sequential assigner — so it produces output identical to
+        // `--threads 1` (pinned by `group_no_threads_matches_threads_1`) without
+        // a second, hand-synced orchestration. The chain builder opens the source
+        // once (handling BAM and SAM alike, so `group` no longer rejects SAM when
+        // `--threads` is omitted) and runs the shared validation, logging, and
+        // metrics in `add_group`.
+        //
         // Populate the #[arg(skip)] chain-builder slots on a clone of
         // GroupOptions before handing it to the ChainSpec.
         let mut options = self.options.clone();
@@ -1104,302 +1003,6 @@ impl Command for GroupReadsByUmi {
         crate::pipeline::chains::build_for(spec)?.run()
     }
 }
-
-impl GroupReadsByUmi {
-    /// Execute in single-threaded mode for `--threads 1`.
-    ///
-    /// This provides a simpler, streaming implementation that avoids pipeline overhead
-    /// while maintaining identical output to the multi-threaded mode.
-    #[allow(clippy::too_many_arguments)]
-    fn execute_single_threaded(
-        &self,
-        reader: Box<dyn std::io::Read + Send>,
-        header: &Header,
-        effective_strategy: Strategy,
-        effective_edits: u32,
-        raw_tag: [u8; 2],
-        assign_tag_bytes: [u8; 2],
-        cell_tag: Tag,
-        filter_config: &GroupFilterConfig,
-        timer: &OperationTimer,
-    ) -> Result<()> {
-        info!("Using single-threaded mode");
-
-        // Wrap the reader in a BufReader and use noodles to skip past the BAM header bytes.
-        // The reader is positioned at file start; we must discard the header to reach records.
-        // This reuses the already-opened reader (required for stdin support).
-        let buf_reader = std::io::BufReader::new(reader);
-        let mut noodles_reader = noodles::bam::io::Reader::new(buf_reader);
-        let _ = noodles_reader.read_header().context("Failed to skip BAM header")?;
-
-        // After the header skip, extract the inner BufReader and wrap in RawBamReader.
-        // Raw-byte mode avoids the noodles decode/encode round-trip (~15% CPU savings).
-        let mut raw_reader = RawBamReader::new(noodles_reader.into_inner());
-
-        // Create output writer (single-threaded for strict thread control)
-        let mut writer =
-            create_bam_writer(&self.io.output, header, 1, self.compression.compression_level)?;
-
-        // Build library index for GroupKey computation
-        let library_index = LibraryIndex::from_header(header);
-
-        // Create RecordPositionGrouper (same grouper used in pipeline mode)
-        let mut grouper = RecordPositionGrouper::new();
-
-        // Metrics accumulators (no lock-free queue needed in single-threaded mode)
-        let mut total_filter_metrics = FilterMetrics::new();
-        let mut family_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
-        let mut position_group_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
-        let mut next_mi_base: u64 = 0;
-
-        // Progress tracking
-        let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
-
-        // Iterate over all records in raw-byte mode
-        let mut raw_rec = RawRecord::new();
-        loop {
-            let bytes_read = raw_reader.read_record(&mut raw_rec)?;
-            if bytes_read == 0 {
-                break; // EOF
-            }
-
-            // Compute GroupKey directly from raw bytes — no noodles decode needed
-            let key = compute_group_key_from_raw(&raw_rec, &library_index, Some(cell_tag));
-            let decoded = DecodedRecord::from_raw_bytes(raw_rec.clone(), key);
-
-            // Feed to RecordPositionGrouper - may emit a completed group
-            if let Some(group) = grouper.add_record(decoded)? {
-                Self::process_and_write_position_group(
-                    group,
-                    filter_config,
-                    effective_strategy,
-                    effective_edits,
-                    self.options.index_threshold,
-                    1, // Single-threaded mode
-                    self.options.parallel_group_min_templates.as_ref(),
-                    raw_tag,
-                    assign_tag_bytes,
-                    &mut total_filter_metrics,
-                    &mut family_size_counter,
-                    &mut position_group_size_counter,
-                    &mut next_mi_base,
-                    header,
-                    &mut writer,
-                )?;
-            }
-
-            progress.log_if_needed(1);
-        }
-
-        // Finish grouper - emit final group
-        if let Some(final_group) = grouper.finish()? {
-            Self::process_and_write_position_group(
-                final_group,
-                filter_config,
-                effective_strategy,
-                effective_edits,
-                self.options.index_threshold,
-                1, // Single-threaded mode
-                self.options.parallel_group_min_templates.as_ref(),
-                raw_tag,
-                assign_tag_bytes,
-                &mut total_filter_metrics,
-                &mut family_size_counter,
-                &mut position_group_size_counter,
-                &mut next_mi_base,
-                header,
-                &mut writer,
-            )?;
-        }
-
-        progress.log_final();
-
-        // Finish writer
-        writer.into_inner().finish().context("Failed to finish output BAM")?;
-        info!("Wrote output to {}", self.io.output.display());
-
-        let metrics = build_grouping_metrics(&total_filter_metrics, &family_size_counter);
-        log_umi_grouping_summary(&metrics);
-
-        // Write all metrics (individual flags and --metrics prefix)
-        self.write_all_metrics(&metrics, &family_size_counter, &position_group_size_counter)?;
-
-        // Log completion with timing
-        timer.log_completion(metrics.accepted_records);
-
-        info!("group completed successfully");
-        Ok(())
-    }
-
-    /// Process a single position group: build templates, filter, assign UMIs, and write output.
-    /// Used by `execute_single_threaded` for streaming processing.
-    ///
-    /// Operates on raw-byte records end-to-end: zero-allocation filter and direct raw-byte
-    /// MI-tag injection, no noodles decode/encode.
-    #[allow(clippy::too_many_arguments)]
-    fn process_and_write_position_group(
-        group: RawPositionGroup,
-        filter_config: &GroupFilterConfig,
-        strategy: Strategy,
-        effective_edits: u32,
-        index_threshold: usize,
-        threads: usize,
-        parallel_group_min_templates: Option<&ParallelMinTemplates>,
-        raw_tag: [u8; 2],
-        assign_tag_bytes: [u8; 2],
-        total_filter_metrics: &mut FilterMetrics,
-        family_size_counter: &mut AHashMap<usize, u64>,
-        position_group_size_counter: &mut AHashMap<usize, u64>,
-        next_mi_base: &mut u64,
-        _header: &Header,
-        writer: &mut fgumi_bam_io::BamWriter,
-    ) -> Result<()> {
-        // Build templates from raw records
-        let all_templates = build_templates_from_records(group.records)?;
-
-        let mut filter_metrics = FilterMetrics::new();
-
-        // Filter templates
-        let filtered_templates: Vec<Template> = all_templates
-            .into_iter()
-            .filter(|t| filter_template_raw(t, filter_config, &mut filter_metrics))
-            .collect();
-
-        // Merge filter metrics
-        total_filter_metrics.merge(&filter_metrics);
-
-        if filtered_templates.is_empty() {
-            return Ok(());
-        }
-
-        // Create UMI assigner. See `should_use_parallel` for the full
-        // rationale; this is the equivalent decision on the single-threaded
-        // path, kept in lockstep with the chain path via the shared helper.
-        let use_parallel = should_use_parallel(
-            filter_config.allow_unmapped,
-            filtered_templates.len(),
-            strategy,
-            parallel_group_min_templates,
-        );
-        let assigner =
-            create_umi_assigner(strategy, effective_edits, index_threshold, threads, use_parallel);
-
-        // Assign UMI groups
-        let mut templates = filtered_templates;
-        if let Err(e) = assign_umi_groups_impl(
-            &mut templates,
-            assigner.as_ref(),
-            raw_tag,
-            filter_config.min_umi_length,
-            filter_config.no_umi,
-        ) {
-            // The whole group is dropped from the BAM (matching the chain path),
-            // so none of its filter-passing templates are actually accepted. This
-            // group's `accepted_templates` was already merged into the total
-            // above; roll it back so the summary/metrics match the (empty) output
-            // rather than over-counting. The discard counters stay — those
-            // templates were genuinely filtered out.
-            log::warn!("Failed to assign UMI groups: {e}");
-            total_filter_metrics.accepted_templates = total_filter_metrics
-                .accepted_templates
-                .saturating_sub(filter_metrics.accepted_templates);
-            return Ok(());
-        }
-
-        // Sort templates directly by (MI index, name) - avoids Vec<Vec<Template>> allocation
-        templates.sort_by(|a, b| {
-            let a_idx = a.mi.to_vec_index();
-            let b_idx = b.mi.to_vec_index();
-            a_idx.cmp(&b_idx).then_with(|| a.name.cmp(&b.name))
-        });
-
-        // Count family sizes and position group size in one pass through sorted templates
-        if !templates.is_empty() {
-            let mut current_mi = templates[0].mi.to_vec_index();
-            let mut current_count = 1usize;
-            let mut num_families = 0usize;
-
-            for template in templates.iter().skip(1) {
-                let mi = template.mi.to_vec_index();
-                if mi == current_mi {
-                    current_count += 1;
-                } else {
-                    // Finish previous MI group
-                    if current_mi.is_some() {
-                        *family_size_counter.entry(current_count).or_insert(0) += 1;
-                        num_families += 1;
-                    }
-                    current_mi = mi;
-                    current_count = 1;
-                }
-            }
-            // Don't forget the last group
-            if current_mi.is_some() {
-                *family_size_counter.entry(current_count).or_insert(0) += 1;
-                num_families += 1;
-            }
-
-            if num_families > 0 {
-                *position_group_size_counter.entry(num_families).or_insert(0) += 1;
-            }
-        }
-
-        // Write templates (already sorted by MI, then by name).
-        //
-        // Advance the global MI counter by the number of distinct numeric MoleculeId
-        // IDs actually assigned in this group, not by the template count, so the
-        // emitted MI integers are consecutive 0..N-1 across all position groups
-        // (matching fgbio's `GroupReadsByUmi`; see issue #269). Assigners hand out
-        // numeric IDs 0, 1, 2, ... contiguously, so `max(id) + 1` equals the count.
-        let distinct_mi_count: u64 =
-            templates.iter().filter_map(|t| t.mi.id()).max().map(|max_id| max_id + 1).unwrap_or(0);
-        let base_mi = *next_mi_base;
-        // `checked_add` so wraparound is reported instead of silently reusing MI integers.
-        *next_mi_base = next_mi_base.checked_add(distinct_mi_count).ok_or_else(|| {
-            anyhow::anyhow!("MoleculeId offset overflow: cumulative MI counter exceeded u64::MAX")
-        })?;
-
-        // Raw-byte output: inject MI tag directly into raw bytes, write without noodles.
-        use std::io::Write as _;
-        let mut scratch = Vec::with_capacity(512);
-        let mut mi_buf = String::with_capacity(16);
-        let inner = writer.get_mut();
-        emit_templates_raw_with_mi(
-            &templates,
-            base_mi,
-            assign_tag_bytes,
-            &mut scratch,
-            &mut mi_buf,
-            |bytes| inner.write_all(bytes),
-        )?;
-
-        Ok(())
-    }
-
-    /// Write all metrics files: individual flags and --metrics prefix outputs.
-    fn write_all_metrics(
-        &self,
-        grouping_metrics: &UmiGroupingMetrics,
-        family_sizes: &AHashMap<usize, u64>,
-        position_group_sizes: &AHashMap<usize, u64>,
-    ) -> Result<()> {
-        write_metrics_for_chain(
-            grouping_metrics,
-            family_sizes,
-            position_group_sizes,
-            self.family_size_histogram.as_deref(),
-            self.grouping_metrics.as_deref(),
-            self.metrics.as_deref(),
-        )
-    }
-}
-
-// `emit_templates_raw_with_mi` moved to
-// `crate::pipeline::steps::serialize_processed` so the
-// threaded-pipeline serialize step and the single-threaded writer
-// can share a single source of truth. Re-exported here for callers
-// that previously imported it via this module.
-pub(crate) use crate::pipeline::steps::serialize_processed::emit_templates_raw_with_mi;
 
 /// Write metrics to a TSV file and log the output path.
 pub(crate) fn write_metrics<S: serde::Serialize>(
@@ -1557,8 +1160,8 @@ mod tests {
 
     /// Even with `use_parallel = true`, a single worker thread must not build a
     /// parallel assigner: a one-thread rayon pool is pure startup overhead with
-    /// zero parallelism. The `--threads 1` pipeline path and `execute_single_threaded`
-    /// (which passes `threads = 1`) both reach `create_umi_assigner` with
+    /// zero parallelism. A one-worker chain (`--threads 1`, or `--threads` unset,
+    /// which resolves to one worker) reaches `create_umi_assigner` with
     /// `num_threads == 1`, so this guards against spawning a useless pool there.
     #[rstest]
     #[case(Strategy::Identity)]
@@ -2454,13 +2057,13 @@ mod tests {
     }
 
     /// Regression test for #285: verify that the per-thread accumulator path
-    /// used in the multi-threaded pipeline produces metrics identical to the
-    /// single-threaded fast path. Runs the same dataset as
-    /// `test_metrics_prefix_writes_all_files` across three threading modes and
-    /// asserts family sizes, grouping metrics, and position-group sizes all
-    /// match.
+    /// used in the multi-threaded pipeline produces metrics identical to a
+    /// one-worker chain. Runs the same dataset as
+    /// `test_metrics_prefix_writes_all_files` across three threading modes
+    /// (`--threads` unset, `1`, and `4`) and asserts family sizes, grouping
+    /// metrics, and position-group sizes all match.
     #[rstest]
-    #[case::fast_path(ThreadingOptions::none())]
+    #[case::threads_unset(ThreadingOptions::none())]
     #[case::pipeline_1(ThreadingOptions::new(1))]
     #[case::pipeline_4(ThreadingOptions::new(4))]
     fn test_metrics_parity_across_threading_modes(
@@ -5177,91 +4780,93 @@ mod tests {
         assert_eq!(metrics.accepted_templates, 1);
     }
 
-    /// A group whose template PASSES filtering but then FAILS UMI assignment must
-    /// roll its `accepted_templates` contribution back out of the running total
-    /// (so the summary matches the empty output), while leaving the discard
-    /// counters untouched — that template was not filtered out, it was dropped
-    /// whole when assignment failed. Regression for the rollback branch in
-    /// `process_and_write_position_group`.
+    /// End-to-end regression for the assignment-failure rollback branch.
+    ///
+    /// A position group whose template PASSES group filtering but then FAILS UMI
+    /// assignment must have its whole group dropped from the BAM, with its
+    /// filter-passing template rolled back out of the accepted count (so the
+    /// emitted metrics match the empty output), while the discard counters that
+    /// accrued in the *same* group survive the rollback untouched.
+    ///
+    /// The bespoke single-threaded `process_and_write_position_group` that this
+    /// test used to white-box was deleted in PR 547; the behavior now lives in
+    /// the folded chain path (`pipeline/chains/commands/group.rs`, the
+    /// `assign_umi_groups_impl` Err branch that clones `filter_metrics`, sets
+    /// `dropped_metrics.accepted_templates = 0`, and records the empty group).
+    /// This test therefore drives the real chain via `cmd.execute` and asserts
+    /// on the emitted grouping-metrics TSV and the (empty) output BAM.
     #[test]
-    fn assignment_failure_rolls_back_accepted_templates_but_not_discards() {
-        use fgumi_bam_io::{DecodedRecord, GroupKey};
-
-        // The RX value is 8 real bases plus a trailing non-UTF-8 byte: `validate_umi`
-        // skips the stray byte (so the filter accepts the template), but assignment's
-        // `str::from_utf8` rejects it — driving the `assign_umi_groups_impl` Err
-        // branch that triggers the rollback.
-        let raw = make_raw_bam_for_group(
-            b"rea",
+    fn assignment_failure_rolls_back_accepted_templates_but_not_discards() -> Result<()> {
+        // Two single-end templates at the SAME position (tid 0, pos 100) so they
+        // land in one position group:
+        //
+        //   (a) `fail_rx` — RX is 8 real bases plus a trailing non-UTF-8 byte.
+        //       `validate_umi` skips the stray byte, so the filter ACCEPTS it
+        //       (accepted_templates += 1); but assignment's `str::from_utf8` on
+        //       that RX returns Err, driving the group-drop / rollback branch.
+        //   (b) `disc_n`  — RX contains an uppercase N, so it is DISCARDED
+        //       (discarded_ns_in_umi += 1) BEFORE assignment. Its discard counter
+        //       lives in the same group's `filter_metrics` and must survive the
+        //       rollback that zeroes only `accepted_templates`.
+        let mut fail_rx = make_raw_bam_for_group(
+            b"fail_rx",
             flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_UNMAPPED,
             30,
             b"ACGTACGT\xff",
         );
-        let group = RawPositionGroup {
-            group_key: GroupKey::default(),
-            records: vec![DecodedRecord::from_raw_bytes(raw, GroupKey::default())],
-        };
-        let filter_config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 20,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: false,
-        };
-
-        // Pre-existing totals from earlier groups that must survive the rollback.
-        let mut total = FilterMetrics::new();
-        total.accepted_templates = 5;
-        total.discarded_poor_alignment = 2;
-        total.discarded_non_pf = 1;
-        let discards_before = (
-            total.discarded_non_pf,
-            total.discarded_poor_alignment,
-            total.discarded_ns_in_umi,
-            total.discarded_umi_too_short,
+        let mut disc_n = make_raw_bam_for_group(
+            b"disc_n",
+            flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_UNMAPPED,
+            30,
+            b"AANAAAAA",
         );
+        // `make_raw_bam_for_group` backfills the BAM `block_size` over bytes
+        // [0..4], which for a `RawRecord` body (no length prefix) is the ref_id
+        // slot — harmless for the raw filter unit tests, but it must be restored
+        // to a valid tid (0) so the record decodes against the 2-ref test header.
+        for rec in [&mut fail_rx, &mut disc_n] {
+            rec.as_mut_vec()[0..4].copy_from_slice(&0i32.to_le_bytes());
+        }
 
-        let mut family_sizes = AHashMap::new();
-        let mut position_group_sizes = AHashMap::new();
-        let mut next_mi_base = 0u64;
+        // Write the raw records straight into the BGZF BAM (framing only, no
+        // noodles `RecordBuf` round-trip) — the non-UTF-8 RX byte must survive
+        // to the reader, and noodles' Z-tag validation would reject it.
+        let input = NamedTempFile::new()?;
         let header = create_test_header();
-        let tmp = NamedTempFile::new().expect("tempfile");
-        let mut writer = create_bam_writer(tmp.path(), &header, 1, 0).expect("writer");
+        let mut writer = fgumi_bam_io::create_raw_bam_writer(input.path(), &header, 1, 1)?;
+        writer.write_raw_record(fail_rx.as_ref())?;
+        writer.write_raw_record(disc_n.as_ref())?;
+        writer.finish()?;
 
-        let result = GroupReadsByUmi::process_and_write_position_group(
-            group,
-            &filter_config,
-            Strategy::Adjacency,
-            1,
-            0,
-            1,
-            None,
-            [b'R', b'X'],
-            [b'M', b'I'],
-            &mut total,
-            &mut family_sizes,
-            &mut position_group_sizes,
-            &mut next_mi_base,
-            &header,
-            &mut writer,
-        );
+        let paths = TestPaths::new()?;
 
-        assert!(result.is_ok(), "assignment failure must be handled, not propagated: {result:?}");
-        assert_eq!(
-            total.accepted_templates, 5,
-            "the filter-passing template of the failed group must be rolled back to the pre-group total",
-        );
-        assert_eq!(
-            (
-                total.discarded_non_pf,
-                total.discarded_poor_alignment,
-                total.discarded_ns_in_umi,
-                total.discarded_umi_too_short,
-            ),
-            discards_before,
-            "discard counters must not change on an assignment-failure rollback",
-        );
+        let mut cmd = with_group_opts(Strategy::Adjacency, 1, |o| o.min_map_q = 20);
+        cmd.io = BamIoOptions {
+            input: input.path().to_path_buf(),
+            output: paths.output.clone(),
+            ..Default::default()
+        };
+        cmd.grouping_metrics = Some(paths.grouping_metrics.clone());
+
+        // The non-UTF-8 RX must drop the GROUP (assignment Err -> empty group),
+        // NOT hard-fail the whole command.
+        cmd.execute("test")?;
+
+        let metrics: Vec<UmiGroupingMetrics> =
+            DelimFile::default().read_tsv(&paths.grouping_metrics)?;
+        assert_eq!(metrics.len(), 1);
+        // Core regression assertion: the filter-passing-but-assignment-failing
+        // template was rolled back and is NOT counted as accepted. Without the
+        // chain's `dropped_metrics.accepted_templates = 0`, this would be 1.
+        assert_eq!(metrics[0].accepted_records, 0);
+        // The discard counter from the same group survives the rollback.
+        assert_eq!(metrics[0].discarded_ns_in_umi, 1);
+
+        // The dropped group emits no records.
+        let output_records = read_bam_records(&paths.output)?;
+        assert_eq!(output_records.len(), 0, "the dropped group must emit no records");
+
+        Ok(())
     }
 
     #[test]

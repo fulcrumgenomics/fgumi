@@ -533,6 +533,48 @@ fn test_group_command_with_sam_input_new_pipeline_matches_bam_baseline() {
     compare_bam_records(&out_bam_baseline, &out_sam);
 }
 
+/// B1 (audit): folding the single-threaded group path onto the chain removed the
+/// BAM-only restriction — `fgumi group` with `--threads` unset now accepts SAM
+/// input (it previously bailed with "SAM input requires --threads N", since the
+/// bespoke `execute_single_threaded` path could not parse SAM). The SAM run must
+/// match the BAM run, both with `--threads` omitted.
+#[test]
+fn test_group_sam_input_without_threads_now_accepted() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let bam_input = temp_dir.path().join("input.bam");
+    let sam_input = temp_dir.path().join("input.sam");
+    let baseline_out = temp_dir.path().join("baseline_out.bam");
+    let streamed_out = temp_dir.path().join("streamed_out.bam");
+
+    create_test_input_bam(&bam_input);
+    convert_bam_to_sam(&bam_input, &sam_input);
+
+    let run = |input: &std::path::Path, output: &std::path::Path, label: &str| {
+        let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+            .args([
+                "group",
+                "--input",
+                input.to_str().unwrap(),
+                "--output",
+                output.to_str().unwrap(),
+                "--strategy",
+                "identity",
+                "--edits",
+                "0",
+                "--compression-level",
+                "1",
+                // No --threads: exercises the (now unified) unset path.
+            ])
+            .status()
+            .unwrap_or_else(|e| panic!("spawn group {label}: {e}"));
+        assert!(status.success(), "group {label} with --threads unset failed");
+    };
+
+    run(&bam_input, &baseline_out, "BAM");
+    run(&sam_input, &streamed_out, "SAM");
+    compare_bam_records(&baseline_out, &streamed_out);
+}
+
 /// SAM-input parity for simplex. Generates a SAM from the same grouped
 /// records as the BAM baseline (with MI tags), runs simplex on both,
 /// compares the consensus outputs.
