@@ -150,18 +150,50 @@ pub fn reference_length_from_cigar(cigar_ops: &[u32]) -> i32 {
 }
 
 /// Compute reference length directly from raw CIGAR bytes (zero allocation).
+///
+/// Returns `0` for a record with no CIGAR **and** for a malformed record whose
+/// declared read-name/CIGAR region extends past the buffer. Callers that must
+/// distinguish those two cases (e.g. to fail closed on corrupt input) should use
+/// [`reference_length_from_raw_bam_checked`] instead.
 #[inline]
 #[must_use]
 pub fn reference_length_from_raw_bam(bam: &[u8]) -> i32 {
-    let n_cigar_op = n_cigar_op(bam) as usize;
-    if n_cigar_op == 0 {
-        return 0;
+    reference_length_from_raw_bam_checked(bam).unwrap_or(0)
+}
+
+/// Like [`reference_length_from_raw_bam`], but validates the record's read-name
+/// and CIGAR bounds against the buffer and distinguishes a legitimately
+/// zero-length span from a truncated/malformed record.
+///
+/// Returns:
+/// - `Some(len)` for a well-formed record — `Some(0)` when it genuinely has no
+///   CIGAR (`n_cigar_op == 0`), otherwise the reference-consuming span.
+/// - `None` when the record is malformed: shorter than the 32-byte fixed core, or
+///   its declared read-name/CIGAR region extends past the buffer (validated with
+///   checked arithmetic so a corrupt `l_read_name`/`n_cigar_op` cannot overflow the
+///   offset math and wrap back into bounds). Callers must reject such records
+///   rather than treat them as a zero-length (point) alignment at their start.
+#[inline]
+#[must_use]
+pub fn reference_length_from_raw_bam_checked(bam: &[u8]) -> Option<i32> {
+    use crate::fields::MIN_BAM_RECORD_LEN;
+
+    // The 32-byte fixed core must be present to read `l_read_name`/`n_cigar_op`.
+    if bam.len() < MIN_BAM_RECORD_LEN {
+        return None;
     }
+    let n_cigar_op = n_cigar_op(bam) as usize;
     let l_read_name = l_read_name(bam) as usize;
-    let cigar_start = 32 + l_read_name;
-    let cigar_end = cigar_start + n_cigar_op * 4;
+    let cigar_start = MIN_BAM_RECORD_LEN.checked_add(l_read_name)?;
+    let cigar_end = cigar_start.checked_add(n_cigar_op.checked_mul(4)?)?;
     if cigar_end > bam.len() {
-        return 0;
+        return None;
+    }
+    // Validate the read-name/CIGAR bounds *before* short-circuiting on a zero-op
+    // CIGAR, so a core-only record declaring an oversized `l_read_name` fails closed
+    // rather than being accepted as a valid zero-length (point) alignment.
+    if n_cigar_op == 0 {
+        return Some(0);
     }
 
     let mut ref_len = 0i32;
@@ -169,10 +201,13 @@ pub fn reference_length_from_raw_bam(bam: &[u8]) -> i32 {
         let op = cigar_op_at(bam, cigar_start + i * 4);
         let op_type = op & 0xF;
         if consumes_ref(op_type) {
-            ref_len += (op >> 4).cast_signed();
+            // Fail closed on a malformed-but-in-bounds CIGAR whose ref-consuming
+            // lengths overflow `i32`: return `None` rather than a wrapped (negative)
+            // span that downstream span math would trust as non-negative.
+            ref_len = ref_len.checked_add((op >> 4).cast_signed())?;
         }
     }
-    ref_len
+    Some(ref_len)
 }
 
 /// Compute the query-consuming length of CIGAR operations (the "read length").
@@ -1484,6 +1519,62 @@ mod tests {
     fn test_reference_length_from_raw_bam_truncated_cigar() {
         let mut rec = make_bam_bytes(0, 100, 0, b"rea", &[(10 << 4)], 10, -1, -1, &[]);
         rec[12..14].copy_from_slice(&100u16.to_le_bytes());
+        assert_eq!(reference_length_from_raw_bam(&rec), 0);
+    }
+
+    #[test]
+    fn test_reference_length_from_raw_bam_checked_no_cigar_is_valid_zero() {
+        // A record that genuinely has no CIGAR is well-formed with a zero span.
+        let rec = make_bam_bytes(0, 100, 0, b"rea", &[], 0, -1, -1, &[]);
+        assert_eq!(reference_length_from_raw_bam_checked(&rec), Some(0));
+    }
+
+    #[test]
+    fn test_reference_length_from_raw_bam_checked_simple() {
+        let cigar = &[(50 << 4)]; // 50M
+        let rec = make_bam_bytes(0, 100, 0, b"rea", cigar, 50, -1, -1, &[]);
+        assert_eq!(reference_length_from_raw_bam_checked(&rec), Some(50));
+    }
+
+    #[test]
+    fn test_reference_length_from_raw_bam_checked_truncated_cigar_is_none() {
+        // n_cigar_op declares 100 ops but the buffer holds only one: malformed,
+        // must report `None` rather than the `0` the infallible variant returns.
+        let mut rec = make_bam_bytes(0, 100, 0, b"rea", &[(10 << 4)], 10, -1, -1, &[]);
+        rec[12..14].copy_from_slice(&100u16.to_le_bytes());
+        assert_eq!(reference_length_from_raw_bam_checked(&rec), None);
+        // The infallible variant still collapses the malformed record to `0`.
+        assert_eq!(reference_length_from_raw_bam(&rec), 0);
+    }
+
+    #[test]
+    fn test_reference_length_from_raw_bam_checked_too_short_is_none() {
+        // Shorter than the 32-byte fixed core: cannot be a valid record.
+        let rec = make_bam_bytes(0, 100, 0, b"rea", &[(10 << 4)], 10, -1, -1, &[]);
+        assert_eq!(reference_length_from_raw_bam_checked(&rec[..20]), None);
+    }
+
+    #[test]
+    fn test_reference_length_from_raw_bam_checked_zero_cigar_oversized_read_name_is_none() {
+        // Core-only record with no CIGAR but l_read_name corrupted to 255: the
+        // declared read name overruns the buffer, so it must fail closed rather than
+        // be accepted as a zero-length point alignment.
+        let mut rec = make_bam_bytes(0, 100, 0, b"rea", &[], 0, -1, -1, &[]);
+        rec[8] = 255; // l_read_name (byte 8) -> 255, far past the 36-byte buffer
+        assert_eq!(reference_length_from_raw_bam_checked(&rec), None);
+        assert_eq!(reference_length_from_raw_bam(&rec), 0);
+    }
+
+    #[test]
+    fn test_reference_length_from_raw_bam_checked_overflow_is_none() {
+        // Nine ref-consuming M ops of length 2^28-1 each sum to ~2.4B, past
+        // i32::MAX (~2.1B). The CIGAR is in-bounds but malformed: the accumulator
+        // must fail closed (None) rather than wrap negative (or panic in debug).
+        let big_m = 0x0FFF_FFFF_u32 << 4; // length = 2^28-1, op = M (0, consumes ref)
+        let cigar = vec![big_m; 9];
+        let rec = make_bam_bytes(0, 100, 0, b"rea", &cigar, 0, -1, -1, &[]);
+        assert_eq!(reference_length_from_raw_bam_checked(&rec), None);
+        // The infallible wrapper collapses the overflow to 0 like any other malform.
         assert_eq!(reference_length_from_raw_bam(&rec), 0);
     }
 

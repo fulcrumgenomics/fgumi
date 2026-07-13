@@ -81,6 +81,7 @@ pub use cigar::{
     read_pos_at_ref_pos_raw,
     reference_length_from_cigar,
     reference_length_from_raw_bam,
+    reference_length_from_raw_bam_checked,
     unclipped_5prime_from_raw_bam,
     unclipped_5prime_raw,
 };
