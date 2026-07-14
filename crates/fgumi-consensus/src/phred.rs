@@ -198,7 +198,7 @@ fn ln_one_minus_exp(x: f64) -> f64 {
 /// `test_ln_a_minus_b_near_equal_within_epsilon_*` and `test_ln_a_minus_b_panics_*` tests pin
 /// this boundary.
 ///
-/// Uses: a + log1mexp(a - b) for numerical stability.
+/// Uses: a + log1mexp(b - a) for numerical stability.
 #[inline]
 fn ln_a_minus_b(a: f64, b: f64) -> f64 {
     if b.is_infinite() && b < 0.0 {
@@ -208,7 +208,7 @@ fn ln_a_minus_b(a: f64, b: f64) -> f64 {
     } else if a < b {
         panic!("Subtraction will be less than zero.");
     } else {
-        // a + log(1 - exp(-(a-b))) = a + log1mexp(a-b)
+        // a + log(1 - exp(-(a-b))) = a + log1mexp(b-a)
         // In our convention, ln_one_minus_exp takes negative values, but here b < a
         a + ln_one_minus_exp(b - a)
     }
@@ -322,7 +322,14 @@ pub fn ln_sum_exp(ln_a: LogProbability, ln_b: LogProbability) -> LogProbability 
 /// ```
 #[must_use]
 pub fn ln_sum_exp_array(values: &[LogProbability]) -> LogProbability {
-    if values.is_empty() {
+    // Mirror fgbio's `NumericTypes.or(values)`: the result is `−∞` only when the
+    // array is empty or *every* lane is `−∞`. A single `−∞` lane (e.g. a candidate
+    // base contradicted by a Q0/`error_rate_post_umi=0` observation) must NOT sink
+    // the whole sum — it contributes probability 0 and is skipped, just as fgbio's
+    // scalar `or` (and our `ln_sum_exp`) absorbs a `−∞` operand. Returning `−∞` here
+    // whenever the *minimum* lane is `−∞` drives the posterior to `+∞`, inflating the
+    // consensus quality to the pre-UMI cap instead of the correct, lower value.
+    if values.is_empty() || values.iter().all(|value| *value == f64::NEG_INFINITY) {
         return f64::NEG_INFINITY;
     }
 
@@ -333,9 +340,6 @@ pub fn ln_sum_exp_array(values: &[LogProbability]) -> LogProbability {
             min_index = i;
             min_value = *value;
         }
-    }
-    if min_value.is_infinite() {
-        return min_value;
     }
     let mut sum = min_value;
     for (i, value) in values.iter().enumerate() {
@@ -410,6 +414,32 @@ mod tests {
         let values = vec![0.1_f64.ln(), 0.2_f64.ln(), 0.3_f64.ln()];
         let result = ln_sum_exp_array(&values);
         assert!((result - 0.6_f64.ln()).abs() < 1e-10);
+    }
+
+    /// SIMPLEX3-01: a single `−∞` lane (probability 0) must be skipped, not sink the
+    /// whole sum. Mirrors fgbio's `NumericTypes.or`, which returns `−∞` only when every
+    /// lane is `−∞`. The `−∞` lane can be the minimum, first, last, or interior element.
+    #[rstest]
+    #[case::neg_inf_is_minimum(&[0.1_f64.ln(), f64::NEG_INFINITY, 0.3_f64.ln()], 0.4_f64.ln())]
+    #[case::neg_inf_first(&[f64::NEG_INFINITY, 0.2_f64.ln(), 0.3_f64.ln()], 0.5_f64.ln())]
+    #[case::neg_inf_last(&[0.1_f64.ln(), 0.2_f64.ln(), f64::NEG_INFINITY], 0.3_f64.ln())]
+    #[case::two_neg_inf(&[f64::NEG_INFINITY, 0.25_f64.ln(), f64::NEG_INFINITY], 0.25_f64.ln())]
+    fn test_ln_sum_exp_array_skips_neg_inf_lanes(#[case] values: &[f64], #[case] expected: f64) {
+        let result = ln_sum_exp_array(values);
+        assert!(
+            (result - expected).abs() < 1e-10,
+            "got {result}, expected {expected} for {values:?}"
+        );
+    }
+
+    /// An all-`−∞` array (and the empty array) yields `−∞`, matching fgbio's
+    /// `values.forall(_.isNegInfinity)` guard.
+    #[rstest]
+    #[case::empty(&[])]
+    #[case::all_neg_inf(&[f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY])]
+    fn test_ln_sum_exp_array_all_neg_inf_is_neg_inf(#[case] values: &[f64]) {
+        let result = ln_sum_exp_array(values);
+        assert!(result.is_infinite() && result < 0.0, "expected −∞, got {result}");
     }
 
     #[test]
