@@ -180,6 +180,81 @@ impl<R: Read + Seek> IndexedRawBamReader<R> {
 
         Ok(RawQueryIter { reader: csi_query, ref_id, interval, record: RawRecord::new() })
     }
+
+    /// Return an iterator over [`RawRecord`]s overlapping **any** of `regions`,
+    /// in a single coordinate-ordered pass, with each record yielded exactly
+    /// once.
+    ///
+    /// This is the multi-interval analog of [`query`](Self::query) and mirrors
+    /// htsjdk's `SamReader.query(QueryInterval[])` (and therefore fgbio's
+    /// `SamSource.query(loci)`): the BAI chunks for every region are gathered
+    /// and [`merge_chunks`](noodles::csi::binning_index::merge_chunks)-ed into a
+    /// minimal, sorted, non-overlapping set, then scanned once. Because the
+    /// merged chunks are disjoint and read in virtual-position order (which, for
+    /// a coordinate-sorted BAM, is genomic-coordinate order), a record
+    /// overlapping several regions is visited a **single** time and records are
+    /// emitted in coordinate order. The caller therefore needs no external
+    /// buffering, sort, or de-duplication.
+    ///
+    /// `regions` may overlap, be unsorted, and span multiple reference
+    /// sequences; the output ordering and single-visit guarantee hold
+    /// regardless.
+    ///
+    /// # Arguments
+    ///
+    /// * `header` — SAM header obtained from [`read_header`](Self::read_header);
+    ///   resolves each region name to a reference-sequence ID.
+    /// * `regions` — genomic regions to query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a region name is not found in the header or if the
+    /// index cannot be queried.
+    pub fn query_intervals<'a>(
+        &'a mut self,
+        header: &'a sam::Header,
+        regions: &[noodles::core::Region],
+    ) -> anyhow::Result<RawMultiQueryIter<'a, R>> {
+        use noodles::csi::binning_index::index::reference_sequence::bin::Chunk;
+        use std::collections::BTreeMap;
+
+        // Resolve every region to a reference ID + interval, grouping the
+        // intervals per reference.
+        let mut intervals_by_ref: BTreeMap<usize, Vec<Interval>> = BTreeMap::new();
+        for region in regions {
+            let ref_id =
+                header.reference_sequences().get_index_of(region.name()).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "region reference sequence {:?} not found in BAM header",
+                        region.name()
+                    )
+                })?;
+            intervals_by_ref.entry(ref_id).or_default().push(region.interval());
+        }
+
+        // Optimize each reference's intervals into a sorted, non-overlapping set
+        // (htsjdk `QueryInterval.optimizeIntervals`), then gather the BAI chunks
+        // for every optimized interval. Optimizing first shrinks both the index
+        // queries and the per-record overlap filter below.
+        let mut chunks: Vec<Chunk> = Vec::new();
+        for (ref_id, intervals) in &mut intervals_by_ref {
+            *intervals = merge_intervals(std::mem::take(intervals));
+            for interval in intervals.iter() {
+                chunks.extend(self.index.query(*ref_id, *interval).context("querying BAI index")?);
+            }
+        }
+
+        // Merge into a minimal, sorted, non-overlapping chunk set so the scan
+        // reads each covered BGZF region exactly once. Overlapping chunks from
+        // adjacent regions collapse here, which is what makes a read spanning
+        // several regions surface only once (htsjdk `optimizeIntervals` analog).
+        let merged = noodles::csi::binning_index::merge_chunks(&chunks);
+
+        let bgzf_reader = self.inner.get_mut();
+        let csi_query = noodles::csi::io::Query::new(bgzf_reader, merged);
+
+        Ok(RawMultiQueryIter { reader: csi_query, intervals_by_ref, record: RawRecord::new() })
+    }
 }
 
 // ─── iterator ───────────────────────────────────────────────────────────────
@@ -219,6 +294,74 @@ impl<R: Read + Seek> Iterator for RawQueryIter<'_, R> {
     }
 }
 
+// ─── multi-interval iterator ─────────────────────────────────────────────────
+
+/// Iterator over raw BAM records overlapping any of several queried regions.
+///
+/// Created by [`IndexedRawBamReader::query_intervals`]. Scans the merged BAI
+/// chunk set for all queried regions in a single virtual-position-ordered pass,
+/// yielding each overlapping record exactly once and in coordinate order. Reuses
+/// a single [`RawRecord`] buffer internally; each `next()` clones the yielded
+/// bytes into a new owned [`RawRecord`].
+pub struct RawMultiQueryIter<'r, R> {
+    reader: noodles::csi::io::Query<'r, bgzf::io::Reader<R>>,
+    /// Queried intervals grouped by reference-sequence ID. A record is yielded
+    /// only when it overlaps one of the intervals for its own reference ID; the
+    /// chunk scan can surface records outside every queried region (chunk
+    /// granularity) or on a reference with no queried region, which are skipped.
+    intervals_by_ref: std::collections::BTreeMap<usize, Vec<Interval>>,
+    record: RawRecord,
+}
+
+impl<R: Read + Seek> Iterator for RawMultiQueryIter<'_, R> {
+    type Item = anyhow::Result<RawRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match read_raw_record(&mut self.reader, &mut self.record) {
+                Ok(0) => return None, // EOF / all chunks consumed
+                Ok(_) => {
+                    // Validate the record's structure *before* touching any
+                    // fixed-offset field: `record_span_1based` fails closed on a
+                    // record shorter than the 32-byte core, so a corrupt BGZF block
+                    // declaring a tiny nonzero size cannot reach the `ref_id`/`pos`
+                    // slice reads below and panic. Returns `Ok(None)` for unmapped
+                    // records (no reference span, cannot overlap).
+                    let (rec_start, rec_end) = match record_span_1based(&self.record) {
+                        Ok(Some(span)) => span,
+                        Ok(None) => continue, // no reference span (unmapped) cannot overlap
+                        Err(e) => return Some(Err(e)), // malformed record: fail closed
+                    };
+
+                    // The fixed core is now known to be present, so reading `ref_id`
+                    // can no longer index past the buffer. Keep the record only if it
+                    // overlaps one of the intervals queried on that reference.
+                    let record_ref_id = crate::fields::ref_id(&self.record);
+                    let Ok(ref_id) = usize::try_from(record_ref_id) else {
+                        continue; // unmapped / negative ref id cannot overlap a region
+                    };
+                    let Some(intervals) = self.intervals_by_ref.get(&ref_id) else {
+                        continue; // record on a reference with no queried region
+                    };
+
+                    // `intervals` is sorted by start and non-overlapping (`merge_intervals`),
+                    // so its ends are strictly increasing. Binary-search for the first
+                    // interval that could reach the record (its end `>= rec_start`); the
+                    // record overlaps iff that interval's start is `<= rec_end`. This scans
+                    // O(log intervals) rather than every queried interval per record.
+                    let idx = intervals.partition_point(|iv| interval_end(iv) < rec_start);
+                    let overlaps =
+                        intervals.get(idx).is_some_and(|iv| interval_start(iv) <= rec_end);
+                    if overlaps {
+                        return Some(Ok(self.record.clone()));
+                    }
+                }
+                Err(e) => return Some(Err(e.into())),
+            }
+        }
+    }
+}
+
 // ─── unmapped iterator ──────────────────────────────────────────────────────
 
 /// Iterator over unmapped raw BAM records.
@@ -248,7 +391,104 @@ impl<R: Read> Iterator for UnmappedIter<'_, R> {
     }
 }
 
+// ─── interval optimization ───────────────────────────────────────────────────
+
+/// Inclusive 1-based start of `interval` as a plain `usize` (unbounded → 1).
+fn interval_start(interval: &Interval) -> usize {
+    interval.start().map_or(1, usize::from)
+}
+
+/// Inclusive 1-based end of `interval` as a plain `usize` (unbounded → `usize::MAX`).
+fn interval_end(interval: &Interval) -> usize {
+    interval.end().map_or(usize::MAX, usize::from)
+}
+
+/// Build an [`Interval`] from 1-based `start`/`end` positions.
+///
+/// `end == usize::MAX` is the sentinel [`interval_end`] returns for an unbounded
+/// end (whole-contig `chr1` / right-open `chr1:100-` queries). It is preserved as
+/// a right-open [`Interval`] rather than round-tripped through `Position`, which
+/// would pin a finite end and stop those queries from covering the tail of a
+/// reference.
+fn make_interval(start: usize, end: usize) -> Interval {
+    use noodles::core::Position;
+    let start = Position::try_from(start.max(1)).expect("start >= 1 is a valid Position");
+    if end == usize::MAX {
+        return Interval::from(start..);
+    }
+    let end = Position::try_from(end.max(1)).expect("end >= 1 is a valid Position");
+    Interval::from(start..=end)
+}
+
+/// Sort and merge a reference's intervals into a minimal, non-overlapping set,
+/// mirroring htsjdk's `QueryInterval.optimizeIntervals`.
+///
+/// Two intervals merge when they overlap **or abut** — i.e. the next interval's
+/// start is `<= end + 1` of the running interval (1-based inclusive coordinates),
+/// so `[1520,1521]` and `[1522,1525]` collapse to `[1520,1525]` while
+/// `[1520,1521]` and `[1523,1525]` (a gap at 1522) stay separate. Optimizing
+/// keeps the per-record overlap filter small and matches the disjoint-interval
+/// precondition htsjdk's multi-interval query assumes.
+fn merge_intervals(mut intervals: Vec<Interval>) -> Vec<Interval> {
+    intervals.sort_by_key(|iv| (interval_start(iv), interval_end(iv)));
+
+    let mut merged: Vec<Interval> = Vec::with_capacity(intervals.len());
+    for interval in intervals {
+        let (start, end) = (interval_start(&interval), interval_end(&interval));
+        if let Some(last) = merged.last_mut() {
+            let last_end = interval_end(last);
+            if start <= last_end.saturating_add(1) {
+                // Overlapping or abutting: extend the running interval if needed.
+                if end > last_end {
+                    *last = make_interval(interval_start(last), end);
+                }
+                continue;
+            }
+        }
+        merged.push(make_interval(start, end));
+    }
+    merged
+}
+
 // ─── overlap test ───────────────────────────────────────────────────────────
+
+/// Compute a mapped record's 1-based inclusive reference span `[start, end]`.
+///
+/// Returns:
+/// - `Ok(Some((start, end)))` for a mapped record with a valid reference span. A
+///   record with a zero-length reference span (unmapped mate placed at a position,
+///   or no CIGAR) is treated as covering its single start position, so its span
+///   equals `intersects_region`'s single-position fallback.
+/// - `Ok(None)` when the record has no reference position (unmapped, or a negative
+///   `pos`) and therefore cannot overlap any queried interval.
+/// - `Err(..)` when the record is malformed — shorter than the fixed core or its
+///   declared CIGAR extends past the record buffer. Rather than silently treating a
+///   truncated record as a point alignment at its start, the span cannot be trusted,
+///   so callers fail closed and propagate the error.
+fn record_span_1based(record: &RawRecord) -> anyhow::Result<Option<(usize, usize)>> {
+    use crate::cigar::reference_length_from_raw_bam_checked;
+    use crate::fields::pos;
+
+    let bytes: &[u8] = record;
+    // Validate the record's structure (fixed core + read-name + CIGAR all within
+    // bounds) before trusting any field; this also guarantees `pos` is in bounds.
+    let ref_len_raw = reference_length_from_raw_bam_checked(bytes).context(
+        "malformed BAM record: truncated, or declared CIGAR/read-name length \
+             exceeds record buffer",
+    )?;
+
+    let p = pos(bytes);
+    if p < 0 {
+        return Ok(None); // unmapped / no position cannot overlap a region
+    }
+    #[allow(clippy::cast_sign_loss)] // guarded by `p >= 0` check above
+    let start_1based = p as usize + 1;
+
+    #[allow(clippy::cast_sign_loss)] // reference_length_from_raw_bam_checked returns non-negative
+    let ref_len = ref_len_raw as usize;
+    let end_1based = if ref_len == 0 { start_1based } else { start_1based + ref_len - 1 };
+    Ok(Some((start_1based, end_1based)))
+}
 
 /// Returns `true` if `record` overlaps `(ref_id, interval)`.
 ///
@@ -259,14 +499,18 @@ fn intersects_region(
     ref_id: usize,
     interval: Interval,
 ) -> anyhow::Result<bool> {
-    use crate::cigar::reference_length_from_raw_bam;
+    use crate::cigar::reference_length_from_raw_bam_checked;
     use crate::fields::{pos, ref_id as raw_ref_id};
     use noodles::core::Position;
 
     let bytes: &[u8] = record;
-    if bytes.len() < 8 {
-        return Ok(false);
-    }
+    // Validate the record's structure (fixed core + read-name + CIGAR all within
+    // bounds) before trusting any field; a truncated/malformed record fails closed
+    // instead of being mistaken for a point alignment at its start.
+    let ref_len_raw = reference_length_from_raw_bam_checked(bytes).context(
+        "malformed BAM record: truncated, or declared CIGAR/read-name length \
+             exceeds record buffer",
+    )?;
 
     // Reference-sequence ID check.
     let record_ref_id = raw_ref_id(bytes);
@@ -286,8 +530,7 @@ fn intersects_region(
     let start_1based = p as usize + 1;
 
     // Alignment end: start_1based + ref_length - 1
-    let ref_len_raw = reference_length_from_raw_bam(bytes);
-    #[allow(clippy::cast_sign_loss)] // reference_length_from_raw_bam returns non-negative
+    #[allow(clippy::cast_sign_loss)] // reference_length_from_raw_bam_checked returns non-negative
     let ref_len = ref_len_raw as usize;
     if ref_len == 0 {
         // Unmapped or no CIGAR; treat as single-position
@@ -314,6 +557,7 @@ mod tests {
     use crate::testutil::*;
     use noodles::bam::{self, bai};
     use noodles::sam::alignment::io::Write as _;
+    use rstest::rstest;
     use std::io::Cursor;
 
     // ── helpers ──────────────────────────────────────────────────────────────
@@ -421,6 +665,52 @@ mod tests {
 
     // ── tests ─────────────────────────────────────────────────────────────────
 
+    /// A well-formed mapped record yields its 1-based inclusive reference span.
+    #[test]
+    fn record_span_1based_accepts_well_formed_record() {
+        // pos=100 (0-based) -> 101 (1-based), 10M -> [101, 110].
+        let bytes = make_bam_bytes(0, 100, 0, b"rea", &[(10 << 4)], 10, -1, -1, &[]);
+        let record = RawRecord::from(bytes);
+        assert_eq!(record_span_1based(&record).expect("span"), Some((101, 110)));
+    }
+
+    /// A record whose declared CIGAR overruns its buffer must fail closed rather
+    /// than be mistaken for a point alignment at its start position.
+    #[test]
+    fn record_span_1based_rejects_truncated_cigar() {
+        // Well-formed 10M record, then corrupt n_cigar_op to claim 100 ops.
+        let mut bytes = make_bam_bytes(0, 100, 0, b"rea", &[(10 << 4)], 10, -1, -1, &[]);
+        bytes[12..14].copy_from_slice(&100u16.to_le_bytes());
+        let record = RawRecord::from(bytes);
+        assert!(record_span_1based(&record).is_err());
+    }
+
+    /// A record shorter than the 32-byte fixed core must fail closed rather than
+    /// let a fixed-offset field read index past the buffer and panic. This is the
+    /// guard `RawMultiQueryIter::next` runs *before* reading `ref_id`, so a corrupt
+    /// BGZF block declaring a tiny nonzero size fails closed instead of crashing
+    /// the scan (a bare `fields::ref_id` would slice `bam[0..4]` and panic here).
+    #[test]
+    fn record_span_1based_rejects_sub_core_length_record() {
+        // Three bytes: shorter than the fixed core, and shorter than the 4 bytes a
+        // bare `ref_id` read would index.
+        let record = RawRecord::from(vec![0u8; 3]);
+        assert!(record_span_1based(&record).is_err());
+    }
+
+    /// The single-interval overlap test shares the same malformed-CIGAR guard and
+    /// also fails closed on a truncated record.
+    #[test]
+    fn intersects_region_rejects_truncated_cigar() {
+        use noodles::core::Position;
+        let mut bytes = make_bam_bytes(0, 100, 0, b"rea", &[(10 << 4)], 10, -1, -1, &[]);
+        bytes[12..14].copy_from_slice(&100u16.to_le_bytes());
+        let record = RawRecord::from(bytes);
+        let interval =
+            Interval::from(Position::try_from(1).unwrap()..=Position::try_from(1000).unwrap());
+        assert!(intersects_region(&record, 0, interval).is_err());
+    }
+
     /// Query a region; verify the right records are returned.
     #[test]
     fn query_returns_overlapping_records() {
@@ -444,6 +734,195 @@ mod tests {
         let raw = results[0].as_ref().expect("record ok");
         // Verify position (0-based pos = 49 → 1-based start = 50).
         assert_eq!(raw.pos(), 49);
+    }
+
+    /// Ported from htsjdk `QueryIntervalTest.testOptimizeIntervals`: overlapping
+    /// and abutting intervals merge; a one-base gap keeps them separate; unsorted
+    /// input is sorted. Compared as `(start, end)` pairs so the assertion is
+    /// independent of `Interval`'s own equality. Each case names the scenario so a
+    /// failure reports the exact interval set and expected merged output.
+    #[rstest]
+    #[case::overlapping(vec![(1520, 1521), (1521, 1525)], vec![(1520, 1525)])]
+    #[case::abutting_zero_gap(vec![(1520, 1521), (1522, 1525)], vec![(1520, 1525)])]
+    #[case::one_base_gap_kept_separate(
+        vec![(1520, 1521), (1523, 1525)],
+        vec![(1520, 1521), (1523, 1525)]
+    )]
+    #[case::unsorted_overlapping(vec![(20, 30), (10, 20)], vec![(10, 30)])]
+    fn merge_intervals_matches_htsjdk_optimize_intervals(
+        #[case] input: Vec<(usize, usize)>,
+        #[case] expected: Vec<(usize, usize)>,
+    ) {
+        use noodles::core::Position;
+        let iv = |s: usize, e: usize| {
+            Interval::from(Position::try_from(s).unwrap()..=Position::try_from(e).unwrap())
+        };
+        let pairs = |ivs: Vec<Interval>| -> Vec<(usize, usize)> {
+            ivs.iter().map(|i| (interval_start(i), interval_end(i))).collect()
+        };
+
+        let intervals: Vec<Interval> = input.iter().map(|&(s, e)| iv(s, e)).collect();
+        assert_eq!(pairs(merge_intervals(intervals)), expected);
+    }
+
+    /// Ported from htsjdk `BAMFileIndexTest.testMultiIntervalQuery`: a
+    /// multi-interval query returns exactly the union of the per-interval
+    /// queries, with each record yielded once and in coordinate order. Records
+    /// are keyed by `(ref_id, pos)`, which is unique here by construction.
+    #[test]
+    fn query_intervals_equals_union_of_single_queries() {
+        use noodles::core::Region;
+        use std::collections::BTreeSet;
+
+        let header = make_header(&[("chr1", 1000), ("chr2", 1000)]);
+        // SPAN starts before every region and covers them all — a naive
+        // per-region loop would surface it once per region; the merged scan must
+        // surface it exactly once.
+        let records = [
+            mapped_record(0, 5, 300),  // chr1:5-304 (spans every chr1 region)
+            mapped_record(0, 50, 10),  // chr1:50-59
+            mapped_record(0, 100, 10), // chr1:100-109 (inside two overlapping regions)
+            mapped_record(0, 150, 10), // chr1:150-159
+            mapped_record(0, 400, 10), // chr1:400-409 (not queried)
+            mapped_record(1, 30, 10),  // chr2:30-39
+        ];
+        let (bam, index) = build_and_index(&header, &records);
+
+        let regions: Vec<Region> = ["chr1:45-105", "chr1:100-160", "chr2:25-35"]
+            .iter()
+            .map(|s| s.parse().expect("region"))
+            .collect();
+
+        let mut reader = IndexedRawBamReader::new(Cursor::new(bam), index);
+        let hdr = reader.read_header().expect("header");
+
+        // Union of the per-interval single-region queries.
+        let mut union: BTreeSet<(i32, i32)> = BTreeSet::new();
+        for region in &regions {
+            for result in reader.query(&hdr, region).expect("query") {
+                let rec = result.expect("record ok");
+                union.insert((rec.ref_id(), rec.pos()));
+            }
+        }
+
+        // Multi-interval query over the same reader.
+        let multi: Vec<_> = reader
+            .query_intervals(&hdr, &regions)
+            .expect("query_intervals")
+            .map(|r| r.expect("record ok"))
+            .collect();
+        let multi_keys: Vec<(i32, i32)> = multi.iter().map(|r| (r.ref_id(), r.pos())).collect();
+
+        // Each record appears exactly once.
+        let multi_set: BTreeSet<(i32, i32)> = multi_keys.iter().copied().collect();
+        assert_eq!(
+            multi_set.len(),
+            multi_keys.len(),
+            "multi-interval query yielded a record more than once: {multi_keys:?}"
+        );
+        // Same set as the union of the single-interval queries.
+        assert_eq!(multi_set, union, "multi-interval set differs from single-query union");
+        // Emitted in coordinate order.
+        let mut sorted = multi_keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(multi_keys, sorted, "records not in coordinate order: {multi_keys:?}");
+    }
+
+    /// `make_interval` must keep an unbounded end (`usize::MAX` sentinel) open
+    /// rather than pinning it to a finite `Position`, while a bounded end still
+    /// round-trips inclusively.
+    #[test]
+    fn make_interval_preserves_unbounded_end() {
+        let unbounded = make_interval(100, usize::MAX);
+        assert_eq!(interval_start(&unbounded), 100);
+        assert!(unbounded.end().is_none(), "unbounded end must not be pinned to a finite Position");
+        assert_eq!(interval_end(&unbounded), usize::MAX);
+
+        let bounded = make_interval(100, 200);
+        assert_eq!((interval_start(&bounded), interval_end(&bounded)), (100, 200));
+        assert_eq!(bounded.end().map(usize::from), Some(200));
+    }
+
+    /// A whole-contig (`chr1`) query carries an unbounded interval; every record on
+    /// the contig — including ones deep in its tail — must be returned, proving the
+    /// unbounded end is not pinned to a finite position.
+    #[test]
+    fn query_intervals_whole_contig_covers_tail() {
+        use noodles::core::Region;
+        use std::collections::BTreeSet;
+
+        let header = make_header(&[("chr1", 100_000)]);
+        let records = [
+            mapped_record(0, 10, 10),     // chr1:10-19
+            mapped_record(0, 100, 10),    // chr1:100-109
+            mapped_record(0, 50_000, 10), // chr1:50000-50009 (deep in the tail)
+        ];
+        let (bam, index) = build_and_index(&header, &records);
+        let mut reader = IndexedRawBamReader::new(Cursor::new(bam), index);
+        let hdr = reader.read_header().expect("header");
+
+        let regions: Vec<Region> = vec!["chr1".parse().expect("region")];
+        let got: BTreeSet<i32> = reader
+            .query_intervals(&hdr, &regions)
+            .expect("query_intervals")
+            .map(|r| r.expect("record ok").pos())
+            .collect();
+        // 0-based positions of all three records (10,100,50000 → -1).
+        let expected: BTreeSet<i32> = [9, 99, 49_999].into_iter().collect();
+        assert_eq!(got, expected, "whole-contig query must cover the entire reference");
+    }
+
+    /// Overlap boundaries for the merged-interval binary search: a record whose
+    /// span touches an interval at either edge overlaps, while one that falls in
+    /// the gap between two intervals — or entirely before/after them — does not.
+    /// Guards the `partition_point` bounds (`end >= rec_start` / `start <= rec_end`)
+    /// against off-by-one regressions.
+    #[test]
+    fn query_intervals_overlap_boundaries() {
+        use noodles::core::Region;
+        use std::collections::BTreeSet;
+
+        let header = make_header(&[("chr1", 1000)]);
+        // Two point regions at chr1:100 and chr1:200 → merged intervals
+        // [(100,100), (200,200)]. Records chosen to sit on each boundary and in
+        // the gaps; only those whose 1-based span includes 100 or 200 overlap.
+        let records = [
+            mapped_record(0, 50, 10),  // [50,59]    before first  → excluded
+            mapped_record(0, 91, 10),  // [91,100]   ends at 100    → included
+            mapped_record(0, 100, 1),  // [100,100]  exact point    → included
+            mapped_record(0, 101, 10), // [101,110]  gap            → excluded
+            mapped_record(0, 196, 5),  // [196,200]  ends at 200    → included
+            mapped_record(0, 200, 5),  // [200,204]  starts at 200  → included
+            mapped_record(0, 205, 5),  // [205,209]  after last     → excluded
+        ];
+        let (bam, index) = build_and_index(&header, &records);
+
+        let regions: Vec<Region> =
+            ["chr1:100-100", "chr1:200-200"].iter().map(|s| s.parse().expect("region")).collect();
+
+        let mut reader = IndexedRawBamReader::new(Cursor::new(bam), index);
+        let hdr = reader.read_header().expect("header");
+
+        let got: BTreeSet<i32> = reader
+            .query_intervals(&hdr, &regions)
+            .expect("query_intervals")
+            .map(|r| r.expect("record ok").pos())
+            .collect();
+
+        // 0-based positions of the four overlapping records (91,100,196,200 → -1).
+        let expected: BTreeSet<i32> = [90, 99, 195, 199].into_iter().collect();
+        assert_eq!(got, expected, "boundary overlap set mismatch");
+    }
+
+    /// `query_intervals` with no regions yields nothing.
+    #[test]
+    fn query_intervals_no_regions_is_empty() {
+        let header = make_header(&[("chr1", 1000)]);
+        let (bam, index) = build_and_index(&header, &[mapped_record(0, 10, 10)]);
+        let mut reader = IndexedRawBamReader::new(Cursor::new(bam), index);
+        let hdr = reader.read_header().expect("header");
+        let count = reader.query_intervals(&hdr, &[]).expect("query_intervals").count();
+        assert_eq!(count, 0, "no regions must yield no records");
     }
 
     /// Query a region with no overlapping records — iterator must be empty.

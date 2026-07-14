@@ -775,6 +775,7 @@ impl Review {
         command_line: &str,
     ) -> Result<HashSet<String>> {
         use noodles::bam;
+        use std::collections::HashMap;
 
         let index = Self::read_bam_index(&self.consensus_bam)?;
         let mut reader = IndexedRawBamReader::from_path(&self.consensus_bam, index)?;
@@ -790,60 +791,78 @@ impl Review {
 
         let mut mi_set = HashSet::new();
 
-        // Buffer the matching consensus reads, deduplicating those seen across the
-        // per-variant region queries, then emit them in coordinate order. A consensus
-        // read that is non-reference at two or more variant loci is returned by each of
-        // those loci's queries, but fgbio's single `consensusIn.query(variants)` emits
-        // every matching read exactly once and in coordinate order. Key on read identity
-        // (name, flags, ref id, position) so each physical record is buffered once.
-        let mut written_records: HashSet<(Vec<u8>, u16, i32, i32)> = HashSet::new();
-        let mut records: Vec<RawRecord> = Vec::new();
+        // Issue a single multi-interval query, one point region per variant. Mirroring
+        // fgbio's single `consensusIn.query(variants)`, `query_intervals` merges the
+        // regions' BAI chunks and scans them once, so every overlapping consensus read
+        // is visited exactly once and in coordinate order. We can therefore filter and
+        // stream straight to the writer — no buffering, de-duplication, or final sort is
+        // required, and the emitted `.consensus.bam` (indexed in `execute` via
+        // `bam::fs::index`) is coordinate-sorted by construction.
+        let regions = variants
+            .iter()
+            .map(|variant| -> Result<noodles::core::Region> {
+                let pos = noodles::core::Position::try_from(variant.pos as usize)?;
+                Ok(noodles::core::Region::new(variant.chrom.as_str(), pos..=pos))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        // Query each variant region
+        // Group variants by reference ID so each read is only tested against variants on
+        // its own contig — `has_non_reference_base` matches on position, not contig.
+        let ref_id_by_name: HashMap<String, i32> = header
+            .reference_sequences()
+            .keys()
+            .enumerate()
+            .map(|(idx, name)| (String::from_utf8_lossy(name).into_owned(), idx as i32))
+            .collect();
+        let mut variants_by_ref_id: HashMap<i32, Vec<&Variant>> = HashMap::new();
         for variant in variants {
-            let start = noodles::core::Position::try_from(variant.pos as usize)?;
-            let region = noodles::core::Region::new(variant.chrom.as_str(), start..=start);
-
-            for result in reader.query(&header, &region)? {
-                let record = result?;
-
-                // Check if this read has a non-reference base at the variant position
-                if self.has_non_reference_base(&record, variant)? {
-                    let identity = (
-                        record.read_name().to_vec(),
-                        record.flags(),
-                        record.ref_id(),
-                        record.pos(),
-                    );
-                    if !written_records.insert(identity) {
-                        continue; // Already extracted at another variant locus.
-                    }
-
-                    // fgbio records `toMi(rec)` in its source set for every
-                    // non-reference consensus read, erroring if the MI tag is
-                    // absent (ReviewConsensusVariantsTest.scala:166).
-                    let mi_base = to_mi(&record)?;
-                    mi_set.insert(mi_base);
-
-                    records.push(record);
-                }
+            if let Some(&ref_id) = ref_id_by_name.get(&variant.chrom) {
+                variants_by_ref_id.entry(ref_id).or_default().push(variant);
             }
         }
+        // Sort each reference's variants by position so a read only has to test the
+        // variants inside its aligned span, found by binary search below, rather than
+        // every variant on the contig.
+        for ref_variants in variants_by_ref_id.values_mut() {
+            ref_variants.sort_by_key(|variant| variant.pos);
+        }
 
-        // Emit in coordinate order so the indexed `.consensus.bam` (indexed in `execute`
-        // via `bam::fs::index`) is valid. The per-variant queries visit variants in
-        // coordinate order, but a read that is non-reference only at a later variant can
-        // still start before a read emitted at an earlier variant, so query order is not
-        // necessarily coordinate-sorted. A stable sort by (reference id, position) — with
-        // unmapped reads (ref id -1) placed last, matching BAM coordinate order —
-        // reproduces fgbio's `query(variants)` ordering.
-        records.sort_by_key(|record| {
-            let ref_id = record.ref_id();
-            let ref_key = if ref_id < 0 { i64::MAX } else { i64::from(ref_id) };
-            (ref_key, record.pos())
-        });
-        for record in &records {
-            write_raw_record(writer.get_mut(), record)?;
+        for result in reader.query_intervals(&header, &regions)? {
+            let record = result?;
+
+            let Some(overlapping) = variants_by_ref_id.get(&record.ref_id()) else {
+                continue; // read on a reference with no reviewed variant
+            };
+
+            // Only variants within the read's aligned span can be non-reference in it
+            // (`has_non_reference_base` returns false outside `[start, end]`). Restrict
+            // the scan to that position range via binary search on the sorted variants.
+            let (Some(start), Some(end)) =
+                (record.alignment_start_1based(), record.alignment_end_1based())
+            else {
+                continue; // unmapped / no aligned span cannot be non-reference at a variant
+            };
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let (start, end) = (start as i32, end as i32);
+            let lo = overlapping.partition_point(|variant| variant.pos < start);
+            let hi = overlapping.partition_point(|variant| variant.pos <= end);
+
+            // fgbio's `nonReferenceAtAnyVariant`: keep the read if it is non-reference at
+            // any variant it overlaps. The single ordered scan already guarantees each
+            // read is seen once and in coordinate order, so we write it in place.
+            let mut non_reference = false;
+            for &variant in &overlapping[lo..hi] {
+                if self.has_non_reference_base(&record, variant)? {
+                    non_reference = true;
+                    break;
+                }
+            }
+            if non_reference {
+                // fgbio records `toMi(rec)` for every non-reference consensus read,
+                // erroring if the MI tag is absent (ReviewConsensusVariantsTest.scala:166).
+                mi_set.insert(to_mi(&record)?);
+                write_raw_record(writer.get_mut(), &record)?;
+            }
         }
 
         Ok(mi_set)
