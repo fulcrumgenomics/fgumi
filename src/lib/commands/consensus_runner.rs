@@ -14,6 +14,8 @@ use log::info;
 use noodles::sam::Header;
 use noodles::sam::header::record::value::Map;
 use noodles::sam::header::record::value::map::ReadGroup;
+use noodles::sam::header::record::value::map::header::group_order::QUERY;
+use noodles::sam::header::record::value::map::header::sort_order::UNSORTED;
 use noodles::sam::header::record::value::map::header::tag as header_tag;
 use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
 use noodles::sam::header::record::value::map::tag::Other;
@@ -114,7 +116,8 @@ fn collapse_read_group_tag(input_header: &Header, tag: Other<rg_tag::Standard>) 
 /// - A single read group with the specified ID and attributes collapsed from all
 ///   input read groups (SM, LB, PL, PU, CN, DS tags are deduplicated and
 ///   comma-joined when multiple distinct values exist)
-/// - Sort order set to "unknown" and group order to "query"
+/// - Sort order set to "unsorted" and group order to "query" (matches fgbio's
+///   unmapped consensus output header exactly)
 /// - A comment indicating the number of input read groups
 /// - A @PG record with version and command line
 pub fn create_unmapped_consensus_header(
@@ -145,8 +148,8 @@ pub fn create_unmapped_consensus_header(
 
     // Set sort order
     let header_map = Map::<noodles::sam::header::record::value::map::Header>::builder()
-        .insert(header_tag::SORT_ORDER, BString::from("unknown"))
-        .insert(header_tag::GROUP_ORDER, BString::from("query"))
+        .insert(header_tag::SORT_ORDER, BString::from(UNSORTED))
+        .insert(header_tag::GROUP_ORDER, BString::from(QUERY))
         .build()?;
     output_header = output_header.set_header(header_map);
 
@@ -352,6 +355,29 @@ mod tests {
         assert!(rg.other_fields().get(&rg_tag::SAMPLE).is_none());
         assert!(rg.other_fields().get(&rg_tag::LIBRARY).is_none());
         assert!(rg.other_fields().get(&rg_tag::PLATFORM).is_none());
+    }
+
+    #[test]
+    fn test_create_unmapped_consensus_header_sort_order_matches_fgbio() {
+        // fgbio emits `@HD SO:unsorted GO:query` for unmapped consensus output
+        // (simplex/duplex/codec); fgumi must match exactly -- `SO:unknown` is a
+        // real header divergence `fgumi compare` now catches (compare-hardening
+        // §"Compare the header").
+        let input_header = Header::builder().build();
+        let output_header =
+            create_unmapped_consensus_header(&input_header, "A", "Read group", "fgumi simplex")
+                .expect("create_unmapped_consensus_header should succeed");
+
+        let hd = output_header.header().expect("@HD record must be present");
+        assert_eq!(
+            hd.other_fields().get(&header_tag::SORT_ORDER).map(|v| v.to_vec()),
+            Some(b"unsorted".to_vec()),
+            "SO must be 'unsorted' to match fgbio, not 'unknown'"
+        );
+        assert_eq!(
+            hd.other_fields().get(&header_tag::GROUP_ORDER).map(|v| v.to_vec()),
+            Some(b"query".to_vec())
+        );
     }
 
     #[test]
