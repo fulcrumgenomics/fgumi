@@ -393,6 +393,53 @@ pub fn template_passes(raw_records: &[RawRecord], pass_map: &AHashMap<usize, boo
 
     has_primary && all_primary_pass
 }
+
+/// Sums the masked-base counts that fgbio's `maskedBases` statistic includes: only the
+/// **primary** reads of a **retained** template contribute; every read of a dropped
+/// template and every secondary/supplementary read contributes zero.
+///
+/// This mirrors `FilterConsensusReads.scala:207-219`, where fgbio accumulates
+/// `maskedBases += r1Result.maskedBases + r2Result.maskedBases` **only** inside
+/// `if (r1Result.keepRead && r2Result.keepRead)` and **only** over the primary R1/R2 —
+/// supplementary/secondary reads are filtered and written out, but their masked bases are
+/// never added to the tally ("Masked X of Y bases in retained primary consensus reads").
+///
+/// `masked_by_record[i]` is the number of bases masked in `raw_records[i]`; the slices are
+/// parallel and must be the same length. `template_pass` is the result of
+/// [`template_passes`] for this template (for the per-record streaming path, a single-read
+/// "template" whose pass value is the record's own filter result).
+///
+/// # Panics
+///
+/// Panics if `raw_records` and `masked_by_record` differ in length. A release-mode-silent
+/// truncation here would under/over-count the exact "Total bases masked" statistic this
+/// helper exists to compute, so the invariant is enforced unconditionally rather than only
+/// under `debug_assert`.
+#[must_use]
+pub fn retained_primary_masked_bases(
+    raw_records: &[RawRecord],
+    masked_by_record: &[u64],
+    template_pass: bool,
+) -> u64 {
+    assert_eq!(
+        raw_records.len(),
+        masked_by_record.len(),
+        "raw_records and masked_by_record must be parallel"
+    );
+    if !template_pass {
+        return 0;
+    }
+    raw_records
+        .iter()
+        .zip(masked_by_record)
+        .filter(|(record, _)| {
+            let flags = RawRecordView::new(record).flags();
+            (flags & bam_fields::flags::SECONDARY) == 0
+                && (flags & bam_fields::flags::SUPPLEMENTARY) == 0
+        })
+        .map(|(_, &masked)| masked)
+        .sum()
+}
 /// Pre-parsed methylation aux tags from a raw BAM record.
 ///
 /// Avoids repeated linear scans of the aux block when multiple filters
@@ -2236,5 +2283,74 @@ mod tests {
             expected,
             "aD={with_ad} bD={with_bd}: duplex iff both present"
         );
+    }
+
+    // -- FILT-05: the masked-bases statistic counts retained primary reads only --
+
+    /// Builds a minimal one-base raw record carrying only the given SAM flag bits.
+    fn record_with_flags(flag: u16) -> RawRecord {
+        let mut b = RawSamBuilder::new();
+        b.ref_id(0).pos(0).mapq(0).flags(flag).cigar_ops(&[1 << 4]).sequence(b"A").qualities(&[30]);
+        b.build()
+    }
+
+    /// fgbio accumulates `maskedBases` only for the **primary** reads of a **retained**
+    /// template (`FilterConsensusReads.scala:207-219`): the increment lives inside
+    /// `if (r1.keepRead && r2.keepRead)` and sums only R1/R2, never secondary/supplementary.
+    /// [`retained_primary_masked_bases`] must reproduce that: a dropped template contributes
+    /// 0, secondary/supplementary reads contribute 0 even when the template is kept, and a
+    /// kept template contributes exactly the sum over its primary reads.
+    #[rstest]
+    #[case::kept_primary(vec![(bam_fields::flags::PAIRED | bam_fields::flags::FIRST_SEGMENT, 7)], true, 7)]
+    #[case::dropped_template(vec![(bam_fields::flags::PAIRED | bam_fields::flags::FIRST_SEGMENT, 7)], false, 0)]
+    #[case::secondary_excluded(vec![(bam_fields::flags::SECONDARY, 7)], true, 0)]
+    #[case::supplementary_excluded(vec![(bam_fields::flags::SUPPLEMENTARY, 7)], true, 0)]
+    #[case::primary_pair_sums(vec![
+        (bam_fields::flags::PAIRED | bam_fields::flags::FIRST_SEGMENT, 3),
+        (bam_fields::flags::PAIRED | bam_fields::flags::LAST_SEGMENT, 2),
+    ], true, 5)]
+    #[case::supplementary_excluded_from_kept_template(vec![
+        (bam_fields::flags::PAIRED | bam_fields::flags::FIRST_SEGMENT, 3),
+        (bam_fields::flags::SUPPLEMENTARY, 5),
+        (bam_fields::flags::PAIRED | bam_fields::flags::LAST_SEGMENT, 2),
+    ], true, 5)]
+    #[case::mixed_template_dropped(vec![
+        (bam_fields::flags::PAIRED | bam_fields::flags::FIRST_SEGMENT, 3),
+        (bam_fields::flags::SUPPLEMENTARY, 5),
+        (bam_fields::flags::PAIRED | bam_fields::flags::LAST_SEGMENT, 2),
+    ], false, 0)]
+    // Boundary: an empty family contributes nothing even when "retained".
+    #[case::empty_family(vec![], true, 0)]
+    // An unpaired (fragment) primary read is not secondary/supplementary, so a
+    // retained single read still contributes its masked bases.
+    #[case::unpaired_single_primary(vec![(0, 4)], true, 4)]
+    fn test_retained_primary_masked_bases(
+        #[case] flags_and_masked: Vec<(u16, u64)>,
+        #[case] template_pass: bool,
+        #[case] expected: u64,
+    ) {
+        let records: Vec<RawRecord> =
+            flags_and_masked.iter().map(|&(flag, _)| record_with_flags(flag)).collect();
+        let masked_by_record: Vec<u64> =
+            flags_and_masked.iter().map(|&(_, masked)| masked).collect();
+
+        assert_eq!(
+            retained_primary_masked_bases(&records, &masked_by_record, template_pass),
+            expected,
+            "template_pass={template_pass}, records={flags_and_masked:?}"
+        );
+    }
+
+    /// The parallel-slice invariant is enforced with `assert_eq!` (not `debug_assert_eq!`)
+    /// so a length mismatch cannot silently truncate the masked-base tally in release
+    /// builds. `template_pass` is `true` here to prove the panic guards the counting path
+    /// itself, not merely the early `!template_pass` return.
+    #[rstest]
+    #[should_panic(expected = "raw_records and masked_by_record must be parallel")]
+    fn test_retained_primary_masked_bases_length_mismatch_panics() {
+        let records =
+            vec![record_with_flags(bam_fields::flags::PAIRED | bam_fields::flags::FIRST_SEGMENT)];
+        let masked_by_record: Vec<u64> = vec![3, 4];
+        let _ = retained_primary_masked_bases(&records, &masked_by_record, true);
     }
 }
