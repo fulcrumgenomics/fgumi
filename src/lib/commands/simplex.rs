@@ -34,7 +34,7 @@ use fgumi_bam_io::{
     create_bam_reader_for_pipeline_with_opts, create_bam_writer, create_optional_bam_writer,
     create_raw_bam_reader_with_opts,
 };
-use fgumi_raw_bam::RawRecord;
+use fgumi_raw_bam::{RawRecord, RawRecordView};
 // RejectionTracker now used via ConsensusStatsOps trait in consensus_runner
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::sam::SamTag;
@@ -49,9 +49,10 @@ use std::sync::Arc;
 
 use crate::commands::command::Command;
 use crate::commands::common::{
-    BamIoOptions, CompressionOptions, ConsensusCallingOptions, OverlappingConsensusOptions,
-    QueueMemoryOptions, ReadGroupOptions, RejectsOptions, SchedulerOptions, StatsOptions,
-    ThreadingOptions, build_pipeline_config, serialize_raw_bam_records,
+    AllowUnmappedOptions, BamIoOptions, CompressionOptions, ConsensusCallingOptions,
+    OverlappingConsensusOptions, QueueMemoryOptions, ReadGroupOptions, RejectsOptions,
+    SchedulerOptions, StatsOptions, ThreadingOptions, build_pipeline_config,
+    consensus_pregroup_keep_flags, consensus_pregroup_keep_raw, serialize_raw_bam_records,
 };
 use crate::commands::consensus_runner::{
     ConsensusStatsOps, create_unmapped_consensus_header, log_overlapping_stats,
@@ -209,6 +210,10 @@ pub struct Simplex {
     /// Maximum reads to use per tag family (downsample if exceeded)
     #[arg(long = "max-reads")]
     pub max_reads: Option<usize>,
+
+    /// Whether to process unmapped reads (the shared `--allow-unmapped` flag).
+    #[command(flatten)]
+    pub allow_unmapped: AllowUnmappedOptions,
 
     /// Scheduler and pipeline statistics options.
     #[command(flatten)]
@@ -388,13 +393,26 @@ impl Command for Simplex {
         let mut record_count: usize = 0;
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
 
-        // Use the raw_reader opened above (single input open).
+        // Use the raw_reader opened above (single input open). Apply the fgbio
+        // pre-group filter: always drop secondary/supplementary; --allow-unmapped
+        // relaxes only the unmapped-without-mapped-mate rule.
+        let allow_unmapped = self.allow_unmapped.enabled;
         let raw_record_iter = std::iter::from_fn(move || {
-            let mut record = RawRecord::new();
-            match raw_reader.read_record(&mut record) {
-                Ok(0) => None, // EOF
-                Ok(_) => Some(Ok(record)),
-                Err(e) => Some(Err(e.into())),
+            loop {
+                let mut record = RawRecord::new();
+                match raw_reader.read_record(&mut record) {
+                    Ok(0) => return None, // EOF
+                    Ok(_) => {
+                        if consensus_pregroup_keep_flags(
+                            RawRecordView::new(&record).flags(),
+                            allow_unmapped,
+                        ) {
+                            return Some(Ok(record));
+                        }
+                        // Otherwise filtered out: keep reading.
+                    }
+                    Err(e) => return Some(Err(e.into())),
+                }
             }
         });
         let mi_group_iter =
@@ -562,9 +580,14 @@ impl Simplex {
         pipeline_config.group_key_config = Some(GroupKeyConfig::new(library_index, cell_tag));
 
         // ========== grouper_fn ==========
+        // Apply the fgbio pre-group filter (always drop secondary/supplementary;
+        // --allow-unmapped relaxes only the unmapped-without-mapped-mate rule).
+        let allow_unmapped = self.allow_unmapped.enabled;
         let grouper_fn = move |_header: &Header| {
-            Box::new(MiGrouper::new("MI", batch_size).with_cell_tag(Some(*SamTag::CB)))
-                as Box<dyn Grouper<Group = MiGroupBatch> + Send>
+            let grouper = MiGrouper::new("MI", batch_size)
+                .with_cell_tag(Some(*SamTag::CB))
+                .with_record_filter(move |raw| consensus_pregroup_keep_raw(raw, allow_unmapped));
+            Box::new(grouper) as Box<dyn Grouper<Group = MiGroupBatch> + Send>
         };
 
         // ========== process_fn: Consensus calling ==========
@@ -798,6 +821,12 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
             min_reads: 1,
             max_reads: None,
+            // These fixtures use `SamBuilder::new_unmapped()` synthetic reads to
+            // exercise consensus behavior; opt back into consensus on unmapped
+            // input so they survive the default fgbio pre-group filter. The
+            // real CLI default (false) is pinned by
+            // `test_allow_unmapped_defaults_to_false`.
+            allow_unmapped: AllowUnmappedOptions { enabled: true },
             scheduler_opts: SchedulerOptions::default(),
             methylation_mode: None,
             reference: None,
@@ -1082,6 +1111,94 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    /// `--allow-unmapped` gates the fgbio `ConsensusCallingIterator` pre-group
+    /// filter. By default (fgbio parity) unmapped, unpaired reads are dropped
+    /// before consensus calling, so no consensus is produced; with
+    /// `--allow-unmapped` they are consensus-called. Runs both the
+    /// single-threaded fast path and the multi-threaded pipeline path, which
+    /// install the filter at independent sites.
+    #[rstest]
+    #[case::fast_path(ThreadingOptions::none())]
+    #[case::threaded(ThreadingOptions::new(2))]
+    fn test_allow_unmapped_gates_pregroup_filter(
+        #[case] threading: ThreadingOptions,
+    ) -> Result<()> {
+        let mut builder = SamBuilder::new_unmapped();
+        let mut attrs = HashMap::new();
+        attrs.insert("RX", BufValue::from("ACGT"));
+        attrs.insert("MI", BufValue::from("m1"));
+        attrs.insert("CB", BufValue::from("AB"));
+        // Two unmapped, unpaired fragments in one MI group.
+        builder.add_frag_with_attrs("r1", None, true, &attrs);
+        builder.add_frag_with_attrs("r2", None, true, &attrs);
+        // Advertise template-coordinate order so the input clears the consensus
+        // sort-order guard (`check_consensus_sort_order`); this test exercises the
+        // pre-group filter, not the sort guard.
+        builder.set_template_coordinate_sort_order();
+
+        // Default (allow_unmapped = false): the pre-group filter drops
+        // unmapped-unpaired reads -> no consensus records. (The shared test
+        // helper enables the flag for its unmapped fixtures, so set it back to
+        // the CLI default here explicitly.)
+        let default_paths = TestPaths::new()?;
+        builder.write(&default_paths.input)?;
+        let mut default_cmd =
+            create_simplex_with_paths(default_paths.input.clone(), default_paths.output.clone());
+        default_cmd.threading = threading.clone();
+        default_cmd.allow_unmapped.enabled = false;
+        default_cmd.execute("test")?;
+        let default_records = read_bam_records(&default_paths.output)?;
+        assert_eq!(
+            default_records.len(),
+            0,
+            "default (fgbio parity) drops unmapped, unpaired reads before consensus"
+        );
+
+        // --allow-unmapped: the unmapped reads are consensus-called (one
+        // consensus read for the single MI group).
+        let allow_paths = TestPaths::new()?;
+        builder.write(&allow_paths.input)?;
+        let mut allow_cmd =
+            create_simplex_with_paths(allow_paths.input.clone(), allow_paths.output.clone());
+        allow_cmd.threading = threading;
+        allow_cmd.allow_unmapped.enabled = true;
+        allow_cmd.execute("test")?;
+        let allow_records = read_bam_records(&allow_paths.output)?;
+        assert_eq!(
+            allow_records.len(),
+            1,
+            "--allow-unmapped consensus-calls unmapped reads (one consensus per MI group)"
+        );
+
+        Ok(())
+    }
+
+    /// The `--allow-unmapped` CLI flag defaults to `false` (fgbio parity: the
+    /// pre-group filter is on). Pinned separately from the behavioral tests
+    /// because the shared test helper enables the flag for its unmapped
+    /// fixtures.
+    #[test]
+    fn test_allow_unmapped_defaults_to_false() {
+        let default_cmd = <Simplex as clap::Parser>::try_parse_from([
+            "simplex", "-i", "in.bam", "-o", "out.bam", "-M", "1",
+        ])
+        .expect("simplex should parse with only the required args");
+        assert!(!default_cmd.allow_unmapped.enabled, "--allow-unmapped must default to false");
+
+        let enabled_cmd = <Simplex as clap::Parser>::try_parse_from([
+            "simplex",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "-M",
+            "1",
+            "--allow-unmapped",
+        ])
+        .expect("simplex should parse with --allow-unmapped");
+        assert!(enabled_cmd.allow_unmapped.enabled, "bare --allow-unmapped must enable the flag");
     }
 
     #[test]

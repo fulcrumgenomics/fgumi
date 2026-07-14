@@ -198,6 +198,29 @@ impl MiGrouper {
         self
     }
 
+    /// Sets an optional per-record filter; records for which it returns `false`
+    /// are dropped before grouping. Enables applying the filter conditionally
+    /// (e.g. gating the consensus pre-group filter on `--allow-unmapped`).
+    #[must_use]
+    pub fn with_record_filter<F>(mut self, record_filter: F) -> Self
+    where
+        F: Fn(&[u8]) -> bool + Send + Sync + 'static,
+    {
+        self.record_filter = Some(Box::new(record_filter));
+        self
+    }
+
+    /// Sets an optional MI-tag transformation applied to each record's MI value
+    /// before grouping (e.g. stripping `/A` `/B` strand suffixes for duplex).
+    #[must_use]
+    pub fn with_mi_transform<T>(mut self, mi_transform: T) -> Self
+    where
+        T: Fn(&[u8]) -> String + Send + Sync + 'static,
+    {
+        self.mi_transform = Some(Box::new(mi_transform));
+        self
+    }
+
     /// Get MI tag from raw BAM bytes, optionally applying transformation.
     ///
     /// When `cell_tag` is set, returns a composite key of `"MI\tCELL"`.

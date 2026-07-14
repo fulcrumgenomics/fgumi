@@ -86,3 +86,10 @@ Any consensus base with quality below the minimum threshold is masked to `N`.
 - Indel errors in the reads are not considered in the consensus model
 - `simplex` and `codec` do not accept a `--sort-order` flag; consensus reads are emitted as
   unmapped and should be sorted by the downstream pipeline (`fgumi zipper` + `fgumi sort`)
+- By default, reads that are unmapped and lack a mapped mate — along with all secondary and
+  supplementary alignments — are dropped before consensus calling, matching fgbio's
+  `ConsensusCallingIterator`. Pass `--allow-unmapped` to `simplex`, `duplex`, or `codec` to call
+  consensus on fully-unmapped input (e.g. ribosome/protein display, or cell-free DNA fragments
+  that fall outside the target region but still share UMIs with mapped molecules). This mirrors
+  `fgumi group --allow-unmapped`. `--allow-unmapped` relaxes **only** the unmapped-without-mapped-mate
+  rule; secondary and supplementary alignments are always dropped before grouping, regardless of the flag.

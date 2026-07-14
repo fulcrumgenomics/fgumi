@@ -27,9 +27,9 @@ use fgumi_bam_io::{
 };
 
 use super::common::{
-    BamIoOptions, CompressionOptions, ConsensusCallingOptions, QueueMemoryOptions,
-    ReadGroupOptions, RejectsOptions, SchedulerOptions, StatsOptions, ThreadingOptions,
-    build_pipeline_config, serialize_raw_bam_records,
+    AllowUnmappedOptions, BamIoOptions, CompressionOptions, ConsensusCallingOptions,
+    QueueMemoryOptions, ReadGroupOptions, RejectsOptions, SchedulerOptions, StatsOptions,
+    ThreadingOptions, build_pipeline_config, serialize_raw_bam_records,
 };
 use crate::consensus::codec_caller::{
     CodecConsensusCaller, CodecConsensusError, CodecConsensusOptions, CodecConsensusStats,
@@ -43,7 +43,7 @@ use crate::unified_pipeline::{
     run_bam_pipeline_from_reader_with_secondary,
 };
 use fgumi_bam_io::ProgressTracker;
-use fgumi_raw_bam::RawRecord;
+use fgumi_raw_bam::{RawRecord, RawRecordView};
 // RejectionTracker now used via ConsensusStatsOps trait in consensus_runner
 use crate::sam::SamTag;
 use log::info;
@@ -231,6 +231,10 @@ pub struct Codec {
     #[arg(short = 'X', long = "max-duplex-disagreements")]
     pub max_duplex_disagreements: Option<usize>,
 
+    /// Whether to process unmapped reads (the shared `--allow-unmapped` flag).
+    #[command(flatten)]
+    pub allow_unmapped: AllowUnmappedOptions,
+
     /// Scheduler and pipeline statistics options.
     #[command(flatten)]
     pub scheduler_opts: SchedulerOptions,
@@ -397,13 +401,26 @@ impl Command for Codec {
         let mut record_count: usize = 0;
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
 
-        // Use the raw_reader opened above (single input open).
+        // Use the raw_reader opened above (single input open). Apply the fgbio
+        // pre-group filter: always drop secondary/supplementary; --allow-unmapped
+        // relaxes only the unmapped-without-mapped-mate rule.
+        let allow_unmapped = self.allow_unmapped.enabled;
         let raw_record_iter = std::iter::from_fn(move || {
-            let mut record = RawRecord::new();
-            match raw_reader.read_record(&mut record) {
-                Ok(0) => None, // EOF
-                Ok(_) => Some(Ok(record)),
-                Err(e) => Some(Err(e.into())),
+            loop {
+                let mut record = RawRecord::new();
+                match raw_reader.read_record(&mut record) {
+                    Ok(0) => return None, // EOF
+                    Ok(_) => {
+                        if crate::commands::common::consensus_pregroup_keep_flags(
+                            RawRecordView::new(&record).flags(),
+                            allow_unmapped,
+                        ) {
+                            return Some(Ok(record));
+                        }
+                        // Otherwise filtered out: keep reading.
+                    }
+                    Err(e) => return Some(Err(e.into())),
+                }
             }
         });
         let mi_group_iter =
@@ -601,9 +618,16 @@ impl Codec {
         pipeline_config.group_key_config = Some(GroupKeyConfig::new(library_index, cell_tag));
 
         // ========== grouper_fn ==========
+        // Apply the fgbio pre-group filter (always drop secondary/supplementary;
+        // --allow-unmapped relaxes only the unmapped-without-mapped-mate rule).
+        let allow_unmapped = self.allow_unmapped.enabled;
         let grouper_fn = move |_header: &Header| {
-            Box::new(MiGrouper::new("MI", batch_size).with_cell_tag(Some(*SamTag::CB)))
-                as Box<dyn Grouper<Group = MiGroupBatch> + Send>
+            let grouper = MiGrouper::new("MI", batch_size)
+                .with_cell_tag(Some(*SamTag::CB))
+                .with_record_filter(move |raw| {
+                    crate::commands::common::consensus_pregroup_keep_raw(raw, allow_unmapped)
+                });
+            Box::new(grouper) as Box<dyn Grouper<Group = MiGroupBatch> + Send>
         };
 
         // ========== process_fn: CODEC consensus calling ==========
@@ -785,6 +809,7 @@ mod tests {
             outer_bases_length: 5,
             max_duplex_disagreement_rate: 1.0,
             max_duplex_disagreements: None,
+            allow_unmapped: AllowUnmappedOptions { enabled: false },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         }
@@ -792,6 +817,88 @@ mod tests {
 
     fn create_test_codec() -> Codec {
         create_codec_with_paths(PathBuf::from("input.bam"), PathBuf::from("output.bam"))
+    }
+
+    /// The `--allow-unmapped` CLI flag defaults to `false` (fgbio parity: the
+    /// pre-group filter is applied before consensus calling).
+    #[test]
+    fn test_codec_allow_unmapped_defaults_to_false() {
+        let default_cmd =
+            <Codec as clap::Parser>::try_parse_from(["codec", "-i", "in.bam", "-o", "out.bam"])
+                .expect("codec should parse with only the required args");
+        assert!(!default_cmd.allow_unmapped.enabled, "--allow-unmapped must default to false");
+
+        let enabled_cmd = <Codec as clap::Parser>::try_parse_from([
+            "codec",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--allow-unmapped",
+        ])
+        .expect("codec should parse with --allow-unmapped");
+        assert!(enabled_cmd.allow_unmapped.enabled, "bare --allow-unmapped must enable the flag");
+    }
+
+    /// The codec pre-group filter drops secondary/supplementary alignments before
+    /// grouping (fgbio parity), and `--allow-unmapped` must **not** relax that
+    /// exclusion — it only relaxes the unmapped-without-mapped-mate rule.
+    ///
+    /// This is the codec counterpart to simplex's
+    /// `test_allow_unmapped_gates_pregroup_filter` /
+    /// duplex's `test_duplex_allow_unmapped_gates_pregroup_filter`. Those tests
+    /// gate on unmapped, unpaired reads, but the codec caller itself rejects
+    /// unmapped pairs (`codec_caller.rs`: "Reads must be mapped and overlap on the
+    /// genome"), so an unmapped fixture yields zero consensus regardless of the
+    /// flag and cannot exercise the gate. Instead we add a supplementary
+    /// alignment to a valid mapped molecule and assert it never reaches the
+    /// consensus caller (observed via `total_input_reads`, which counts
+    /// post-filter reads) — with the flag both off and on. This pins the leak
+    /// where a bypassed filter would let non-primary alignments into grouping.
+    /// Runs the single-threaded fast path and the multi-threaded pipeline path,
+    /// which install the filter at independent sites.
+    #[rstest]
+    #[case::fast_path_default(ThreadingOptions::none(), false)]
+    #[case::fast_path_allow_unmapped(ThreadingOptions::none(), true)]
+    #[case::threaded_default(ThreadingOptions::new(2), false)]
+    #[case::threaded_allow_unmapped(ThreadingOptions::new(2), true)]
+    fn test_codec_allow_unmapped_gates_pregroup_filter(
+        #[case] threading: ThreadingOptions,
+        #[case] allow_unmapped: bool,
+    ) -> Result<()> {
+        let dir = TempDir::new()?;
+        let input_path = dir.path().join("input.bam");
+        let output_path = dir.path().join("output.bam");
+        let stats_path = dir.path().join("stats.txt");
+
+        // A valid mapped, overlapping FR pair (one molecule) plus a supplementary
+        // alignment of R1, all sharing one MI. The pre-group filter must drop the
+        // supplementary before grouping, so only the two primaries reach the caller.
+        let (r1, r2) = create_codec_fr_pair_overlapping("UMI001", 100, 105, 20, &[30; 20]);
+        let supplementary = create_codec_supplementary_read("UMI001", 100, 20, &[30; 20]);
+        write_codec_bam(&input_path, vec![r1, r2, supplementary])?;
+
+        let mut cmd = create_codec_with_paths(input_path, output_path);
+        cmd.threading = threading;
+        cmd.allow_unmapped.enabled = allow_unmapped;
+        cmd.stats_opts.stats = Some(stats_path.clone());
+        cmd.read_group.read_name_prefix = Some("codec".to_string());
+        cmd.outer_bases_length = 0;
+        cmd.execute("test")?;
+
+        let metrics: Vec<ConsensusMetrics> = DelimFile::default().read_tsv(&stats_path)?;
+        let metrics = metrics.first().expect("stats file should contain one metrics row");
+        assert_eq!(
+            metrics.total_input_reads, 2,
+            "the supplementary alignment must be dropped before grouping (allow_unmapped={allow_unmapped}): \
+             only the two primary reads reach the codec caller"
+        );
+        assert_eq!(
+            metrics.consensus_reads, 1,
+            "the valid mapped FR pair is consensus-called (allow_unmapped={allow_unmapped})"
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -844,6 +951,7 @@ mod tests {
     }
 
     // Integration tests
+    use crate::metrics::consensus::ConsensusMetrics;
     use fgumi_raw_bam::{
         SamBuilder as RawSamBuilder, flags, raw_record_to_record_buf, testutil::encode_op,
     };
@@ -924,6 +1032,37 @@ mod tests {
         let r2 = to_record_buf(b2.build());
 
         (r1, r2)
+    }
+
+    /// A mapped supplementary alignment of R1 (`SUPPLEMENTARY` flag set) sharing
+    /// `mi_value`. Used to verify the consensus pre-group filter drops
+    /// non-primary alignments before grouping.
+    #[allow(clippy::cast_possible_truncation)]
+    fn create_codec_supplementary_read(
+        mi_value: &str,
+        start: usize,
+        read_len: usize,
+        quals: &[u8],
+    ) -> RecordBuf {
+        let seq_forward = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let seq = &seq_forward[..read_len];
+        let cigar = encode_op(0, read_len);
+        // PAIRED | FIRST_SEGMENT | SUPPLEMENTARY: a supplementary alignment of R1.
+        let sup_flags = flags::PAIRED | flags::FIRST_SEGMENT | flags::SUPPLEMENTARY;
+        let mut b = RawSamBuilder::new();
+        b.read_name(format!("read_{mi_value}").as_bytes())
+            .flags(sup_flags)
+            .ref_id(0)
+            .pos(start as i32 - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(seq)
+            .qualities(quals)
+            .mate_ref_id(0)
+            .mate_pos(start as i32 - 1);
+        b.add_string_tag(SamTag::MI, mi_value.as_bytes());
+        b.add_string_tag(SamTag::RG, b"A");
+        to_record_buf(b.build())
     }
 
     fn write_codec_bam(path: &std::path::Path, records: Vec<RecordBuf>) -> Result<()> {

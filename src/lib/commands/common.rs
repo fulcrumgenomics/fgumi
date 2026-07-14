@@ -231,6 +231,46 @@ fn header_sort_and_group_order(header: &Header) -> (String, String, Option<Strin
     )
 }
 
+/// The fgbio `ConsensusCallingIterator` pre-group filter
+/// (`ConsensusCallingIterator.scala:56-58`): drop secondary/supplementary
+/// alignments and any record that is unmapped **and** lacks a mapped mate.
+///
+/// fgbio applies this to *every* consensus caller (simplex, duplex, codec),
+/// for both the single- and multi-threaded execution paths, before grouping
+/// reads by molecular identifier. fgumi replicates it in the consensus
+/// commands.
+///
+/// `--allow-unmapped` relaxes **only** the unmapped-without-mapped-mate rule so
+/// fully-unmapped input can be consensus-called (mirroring
+/// `fgumi group --allow-unmapped`). Secondary/supplementary alignments are
+/// **always** dropped, matching fgbio — `--allow-unmapped` never lets
+/// non-primary alignments into grouping.
+///
+/// Returns `true` if the record should be kept.
+#[must_use]
+pub fn consensus_pregroup_keep_flags(flags: u16, allow_unmapped: bool) -> bool {
+    use fgumi_raw_bam::flags;
+    // Secondary/supplementary alignments are always excluded, regardless of
+    // --allow-unmapped: fgbio never groups non-primary alignments.
+    if flags & flags::SECONDARY != 0 || flags & flags::SUPPLEMENTARY != 0 {
+        return false;
+    }
+    // --allow-unmapped relaxes only the mapped-or-mate-mapped eligibility check.
+    if allow_unmapped {
+        return true;
+    }
+    let is_mapped = flags & flags::UNMAPPED == 0;
+    let has_mapped_mate = flags & flags::PAIRED != 0 && flags & flags::MATE_UNMAPPED == 0;
+    is_mapped || has_mapped_mate
+}
+
+/// Raw-BAM-bytes wrapper around [`consensus_pregroup_keep_flags`], suitable as
+/// a `MiGrouper` / raw-record-iterator record filter.
+#[must_use]
+pub fn consensus_pregroup_keep_raw(raw: &[u8], allow_unmapped: bool) -> bool {
+    consensus_pregroup_keep_flags(fgumi_raw_bam::RawRecordView::new(raw).flags(), allow_unmapped)
+}
+
 /// EM-Seq methylation-aware consensus calling options.
 #[derive(Debug, Clone, Default, Args)]
 pub struct EmSeqOptions {
@@ -535,6 +575,21 @@ pub struct CompressionOptions {
     /// Level 12 produces smallest files but is slowest.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(0..=12))]
     pub compression_level: u32,
+}
+
+/// Option controlling whether unmapped reads are processed by a consensus caller.
+///
+/// Shared by the `simplex`, `duplex`, and `codec` commands so the `--allow-unmapped` flag
+/// (name, default, and boolean parsing) stays identical across all three.
+#[derive(Debug, Clone, Args)]
+pub struct AllowUnmappedOptions {
+    /// Process reads that are unmapped and lack a mapped mate. By default
+    /// (fgbio parity, `ConsensusCallingIterator.scala:56-58`) such reads — and
+    /// all secondary/supplementary alignments — are dropped before consensus
+    /// calling. Enable for consensus on unmapped input (e.g. ribosome/protein
+    /// display), mirroring `fgumi group --allow-unmapped`.
+    #[arg(long = "allow-unmapped", value_name = "ALLOW_UNMAPPED", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    pub enabled: bool,
 }
 
 /// Options for pipeline scheduler configuration.
@@ -1527,6 +1582,62 @@ mod tests {
     }
 
     use rstest::rstest;
+
+    /// The `ConsensusCallingIterator` pre-group filter (fgbio parity,
+    /// `ConsensusCallingIterator.scala:56-58`): secondary and supplementary alignments are
+    /// always dropped, and an unmapped read is kept only when it has a mapped mate.
+    ///
+    /// `--allow-unmapped` (the `allow_unmapped` column) relaxes **only** the
+    /// unmapped-without-mapped-mate rule: it makes otherwise-eligible primary alignments pass
+    /// regardless of mapping, but secondary/supplementary alignments are still dropped. The
+    /// `*_dropped_even_with_allow_unmapped` cases pin that the flag never lets a non-primary
+    /// alignment into grouping (the regression this exists to prevent).
+    #[rstest]
+    // allow_unmapped = false (fgbio parity default)
+    #[case::mapped_primary_kept(0, false, true)]
+    #[case::secondary_dropped(fgumi_raw_bam::flags::SECONDARY, false, false)]
+    #[case::supplementary_dropped(fgumi_raw_bam::flags::SUPPLEMENTARY, false, false)]
+    #[case::unmapped_unpaired_dropped(fgumi_raw_bam::flags::UNMAPPED, false, false)]
+    #[case::unmapped_paired_mate_unmapped_dropped(
+        fgumi_raw_bam::flags::UNMAPPED | fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::MATE_UNMAPPED,
+        false,
+        false
+    )]
+    #[case::unmapped_paired_mate_mapped_kept(
+        fgumi_raw_bam::flags::UNMAPPED | fgumi_raw_bam::flags::PAIRED,
+        false,
+        true
+    )]
+    // allow_unmapped = true relaxes only the unmapped rule
+    #[case::mapped_primary_kept_with_allow_unmapped(0, true, true)]
+    #[case::unmapped_unpaired_kept_with_allow_unmapped(fgumi_raw_bam::flags::UNMAPPED, true, true)]
+    #[case::unmapped_paired_mate_unmapped_kept_with_allow_unmapped(
+        fgumi_raw_bam::flags::UNMAPPED | fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::MATE_UNMAPPED,
+        true,
+        true
+    )]
+    #[case::secondary_dropped_even_with_allow_unmapped(
+        fgumi_raw_bam::flags::SECONDARY,
+        true,
+        false
+    )]
+    #[case::supplementary_dropped_even_with_allow_unmapped(
+        fgumi_raw_bam::flags::SUPPLEMENTARY,
+        true,
+        false
+    )]
+    #[case::unmapped_secondary_dropped_even_with_allow_unmapped(
+        fgumi_raw_bam::flags::UNMAPPED | fgumi_raw_bam::flags::SECONDARY,
+        true,
+        false
+    )]
+    fn test_consensus_pregroup_keep_flags(
+        #[case] flags_bits: u16,
+        #[case] allow_unmapped: bool,
+        #[case] keep: bool,
+    ) {
+        assert_eq!(consensus_pregroup_keep_flags(flags_bits, allow_unmapped), keep);
+    }
 
     #[rstest]
     // --output-per-base-tags (default true)

@@ -22,9 +22,10 @@ use fgumi_bam_io::{
 };
 
 use super::common::{
-    BamIoOptions, CompressionOptions, ConsensusCallingOptions, OverlappingConsensusOptions,
-    QueueMemoryOptions, ReadGroupOptions, RejectsOptions, SchedulerOptions, StatsOptions,
-    ThreadingOptions, build_pipeline_config, serialize_raw_bam_records,
+    AllowUnmappedOptions, BamIoOptions, CompressionOptions, ConsensusCallingOptions,
+    OverlappingConsensusOptions, QueueMemoryOptions, ReadGroupOptions, RejectsOptions,
+    SchedulerOptions, StatsOptions, ThreadingOptions, build_pipeline_config,
+    consensus_pregroup_keep_flags, consensus_pregroup_keep_raw, serialize_raw_bam_records,
 };
 use crate::commands::consensus_runner::{
     ConsensusStatsOps, create_unmapped_consensus_header, log_overlapping_stats,
@@ -195,6 +196,10 @@ pub struct Duplex {
     #[arg(long = "max-reads-per-strand")]
     pub max_reads_per_strand: Option<usize>,
 
+    /// Whether to process unmapped reads (the shared `--allow-unmapped` flag).
+    #[command(flatten)]
+    pub allow_unmapped: AllowUnmappedOptions,
+
     /// Scheduler and pipeline stats options
     #[command(flatten)]
     pub scheduler_opts: SchedulerOptions,
@@ -248,7 +253,7 @@ impl Command for Duplex {
     /// # use fgumi_lib::commands::duplex::Duplex;
     /// # use fgumi_lib::commands::command::Command;
     /// # use fgumi_lib::commands::common::{
-    /// #     BamIoOptions, CompressionOptions, ConsensusCallingOptions,
+    /// #     AllowUnmappedOptions, BamIoOptions, CompressionOptions, ConsensusCallingOptions,
     /// #     OverlappingConsensusOptions, QueueMemoryOptions, ReadGroupOptions, RejectsOptions,
     /// #     SchedulerOptions, StatsOptions, ThreadingOptions,
     /// # };
@@ -274,6 +279,7 @@ impl Command for Duplex {
     ///     compression: CompressionOptions::default(),
     ///     min_reads: vec![1],
     ///     max_reads_per_strand: None,
+    ///     allow_unmapped: AllowUnmappedOptions { enabled: false },
     ///     scheduler_opts: SchedulerOptions::default(),
     ///     queue_memory: QueueMemoryOptions::default(),
     ///     methylation_mode: None,
@@ -433,29 +439,23 @@ impl Command for Duplex {
         let mut consensus_count = 0usize;
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
 
-        // Use the raw_reader opened above (single input open). Filter out
-        // secondary/supplementary and keep only mapped or mate-mapped reads.
+        // Use the raw_reader opened above (single input open). Apply the fgbio
+        // pre-group filter: always drop secondary/supplementary; --allow-unmapped
+        // relaxes only the unmapped-without-mapped-mate rule.
+        let allow_unmapped = self.allow_unmapped.enabled;
         let raw_record_iter = std::iter::from_fn(move || {
             loop {
                 let mut record = RawRecord::new();
                 match raw_reader.read_record(&mut record) {
                     Ok(0) => return None, // EOF
                     Ok(_) => {
-                        let flg = RawRecordView::new(&record).flags();
-                        // Skip secondary and supplementary reads
-                        if flg & fgumi_raw_bam::flags::SECONDARY != 0
-                            || flg & fgumi_raw_bam::flags::SUPPLEMENTARY != 0
-                        {
-                            continue;
-                        }
-                        // Only keep mapped reads or reads with mapped mates
-                        let is_mapped = flg & fgumi_raw_bam::flags::UNMAPPED == 0;
-                        let has_mapped_mate = flg & fgumi_raw_bam::flags::PAIRED != 0
-                            && flg & fgumi_raw_bam::flags::MATE_UNMAPPED == 0;
-                        if is_mapped || has_mapped_mate {
+                        if consensus_pregroup_keep_flags(
+                            RawRecordView::new(&record).flags(),
+                            allow_unmapped,
+                        ) {
                             return Some(Ok(record));
                         }
-                        // Skip unmapped reads without mapped mates
+                        // Otherwise filtered out: keep reading.
                     }
                     Err(e) => return Some(Err(e.into())),
                 }
@@ -629,21 +629,9 @@ impl Duplex {
         let cell_tag = Tag::from(SamTag::CB);
         let batch_size = 100; // MI groups per batch
 
-        // Record filter for duplex on raw bytes: skip secondary/supplementary, keep mapped or mate-mapped
-        let record_filter = |raw: &[u8]| -> bool {
-            let flg = RawRecordView::new(raw).flags();
-            // Skip secondary and supplementary reads
-            if flg & fgumi_raw_bam::flags::SECONDARY != 0
-                || flg & fgumi_raw_bam::flags::SUPPLEMENTARY != 0
-            {
-                return false;
-            }
-            // Only keep mapped reads or reads with mapped mates
-            let is_mapped = flg & fgumi_raw_bam::flags::UNMAPPED == 0;
-            let has_mapped_mate = flg & fgumi_raw_bam::flags::PAIRED != 0
-                && flg & fgumi_raw_bam::flags::MATE_UNMAPPED == 0;
-            is_mapped || has_mapped_mate
-        };
+        // Apply the fgbio pre-group filter: always drop secondary/supplementary;
+        // --allow-unmapped relaxes only the unmapped-without-mapped-mate rule.
+        let allow_unmapped = self.allow_unmapped.enabled;
 
         // MI transform for raw bytes: strip /A and /B suffixes for duplex grouping
         let mi_transform = |mi_bytes: &[u8]| -> String {
@@ -663,10 +651,11 @@ impl Duplex {
 
         // ========== grouper_fn ==========
         let grouper_fn = move |_header: &Header| {
-            Box::new(
-                MiGrouper::with_filter_and_transform("MI", batch_size, record_filter, mi_transform)
-                    .with_cell_tag(Some(*SamTag::CB)),
-            ) as Box<dyn Grouper<Group = MiGroupBatch> + Send>
+            let grouper = MiGrouper::new("MI", batch_size)
+                .with_mi_transform(mi_transform)
+                .with_cell_tag(Some(*SamTag::CB))
+                .with_record_filter(move |raw| consensus_pregroup_keep_raw(raw, allow_unmapped));
+            Box::new(grouper) as Box<dyn Grouper<Group = MiGroupBatch> + Send>
         };
 
         // ========== process_fn: Duplex consensus calling ==========
@@ -970,6 +959,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             min_reads: vec![1],
             max_reads_per_strand: None,
+            allow_unmapped: AllowUnmappedOptions { enabled: false },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             methylation_mode: None,
@@ -1304,6 +1294,131 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    /// Builds an unmapped read (no reference, no position) carrying an MI tag,
+    /// for exercising the `--allow-unmapped` pre-group filter gate.
+    fn build_unmapped_read(
+        name: &str,
+        raw_flags: u16,
+        mi: &str,
+        bases: &[u8],
+        rx: &str,
+    ) -> sam::alignment::RecordBuf {
+        let qual = vec![40u8; bases.len()];
+        let mut b = RawSamBuilder::new();
+        b.read_name(name.as_bytes())
+            .flags(raw_flags | flags::UNMAPPED | flags::MATE_UNMAPPED)
+            .ref_id(-1)
+            .pos(-1)
+            .mapq(0)
+            .cigar_ops(&[])
+            .sequence(bases)
+            .qualities(&qual);
+        b.add_string_tag(SamTag::MI, mi.as_bytes());
+        b.add_string_tag(SamTag::RX, rx.as_bytes());
+        to_record_buf(b.build())
+    }
+
+    /// The `--allow-unmapped` flag gates the fgbio pre-group filter for duplex.
+    /// The same AB/BA molecule as `test_duplex_consensus_basic_ab_ba_pairing`,
+    /// but with every read unmapped (and no mapped mate): dropped by default
+    /// (fgbio parity), consensus-called with `--allow-unmapped`. Covers both
+    /// the single-threaded fast path and the multi-threaded pipeline path.
+    #[rstest]
+    #[case::fast_path(ThreadingOptions::none())]
+    #[case::threaded(ThreadingOptions::new(2))]
+    fn test_duplex_allow_unmapped_gates_pregroup_filter(
+        #[case] threading: ThreadingOptions,
+    ) -> Result<()> {
+        let build_molecule = || {
+            vec![
+                // A strand (MI 1/A)
+                build_unmapped_read(
+                    "q1",
+                    flags::PAIRED | flags::FIRST_SEGMENT,
+                    "1/A",
+                    b"AAAAAAAAAA",
+                    "AAT-CCG",
+                ),
+                build_unmapped_read(
+                    "q1",
+                    flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE,
+                    "1/A",
+                    b"AAAAAAAAAA",
+                    "AAT-CCG",
+                ),
+                // B strand (MI 1/B) — reverse-complement strand
+                build_unmapped_read(
+                    "q2",
+                    flags::PAIRED | flags::FIRST_SEGMENT | flags::REVERSE,
+                    "1/B",
+                    b"TTTTTTTTTT",
+                    "CCG-AAT",
+                ),
+                build_unmapped_read(
+                    "q2",
+                    flags::PAIRED | flags::LAST_SEGMENT,
+                    "1/B",
+                    b"AAAAAAAAAA",
+                    "CCG-AAT",
+                ),
+            ]
+        };
+
+        // Default: the pre-group filter drops the unmapped reads -> no consensus.
+        let default_input = create_test_bam(build_molecule())?;
+        let default_paths = TestPaths::new()?;
+        let mut default_cmd = create_duplex_with_paths(
+            default_input.path().to_path_buf(),
+            default_paths.output.clone(),
+        );
+        default_cmd.threading = threading.clone();
+        default_cmd.allow_unmapped.enabled = false;
+        default_cmd.execute("test")?;
+        let default_records = read_bam_records(&default_paths.output)?;
+        assert!(
+            default_records.is_empty(),
+            "default (fgbio parity) drops unmapped reads before duplex consensus"
+        );
+
+        // --allow-unmapped: the unmapped molecule is consensus-called (duplex
+        // emits R1 + R2 = 2 records).
+        let allow_input = create_test_bam(build_molecule())?;
+        let allow_paths = TestPaths::new()?;
+        let mut allow_cmd =
+            create_duplex_with_paths(allow_input.path().to_path_buf(), allow_paths.output.clone());
+        allow_cmd.threading = threading;
+        allow_cmd.allow_unmapped.enabled = true;
+        allow_cmd.execute("test")?;
+        let allow_records = read_bam_records(&allow_paths.output)?;
+        assert_eq!(
+            allow_records.len(),
+            2,
+            "--allow-unmapped consensus-calls the unmapped duplex molecule (R1 + R2)"
+        );
+
+        Ok(())
+    }
+
+    /// The `--allow-unmapped` CLI flag defaults to `false` (fgbio parity).
+    #[test]
+    fn test_duplex_allow_unmapped_defaults_to_false() {
+        let default_cmd =
+            <Duplex as clap::Parser>::try_parse_from(["duplex", "-i", "in.bam", "-o", "out.bam"])
+                .expect("duplex should parse with only the required args");
+        assert!(!default_cmd.allow_unmapped.enabled, "--allow-unmapped must default to false");
+
+        let enabled_cmd = <Duplex as clap::Parser>::try_parse_from([
+            "duplex",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--allow-unmapped",
+        ])
+        .expect("duplex should parse with --allow-unmapped");
+        assert!(enabled_cmd.allow_unmapped.enabled, "bare --allow-unmapped must enable the flag");
     }
 
     #[test]
