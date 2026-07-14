@@ -886,15 +886,30 @@ mod tests {
         cmd.outer_bases_length = 0;
         cmd.execute("test")?;
 
-        let metrics: Vec<ConsensusMetrics> = DelimFile::default().read_tsv(&stats_path)?;
-        let metrics = metrics.first().expect("stats file should contain one metrics row");
+        // Codec emits fgbio's vertical key-value metrics format, so read the rows
+        // back as `ConsensusKvMetric` and look up the two counts by key: the
+        // supplementary read must be filtered before grouping, so exactly the two
+        // primaries are considered (`raw_reads_considered`) and the single FR
+        // molecule is emitted (`consensus_reads_emitted`).
+        let kv_metrics: Vec<ConsensusKvMetric> = DelimFile::default().read_tsv(&stats_path)?;
+        let value_for = |key: &str| -> u64 {
+            kv_metrics
+                .iter()
+                .find(|m| m.key == key)
+                .unwrap_or_else(|| panic!("stats file should contain a `{key}` row"))
+                .value
+                .parse()
+                .unwrap_or_else(|_| panic!("`{key}` value should be an integer"))
+        };
         assert_eq!(
-            metrics.total_input_reads, 2,
+            value_for("raw_reads_considered"),
+            2,
             "the supplementary alignment must be dropped before grouping (allow_unmapped={allow_unmapped}): \
              only the two primary reads reach the codec caller"
         );
         assert_eq!(
-            metrics.consensus_reads, 1,
+            value_for("consensus_reads_emitted"),
+            1,
             "the valid mapped FR pair is consensus-called (allow_unmapped={allow_unmapped})"
         );
 
@@ -951,7 +966,7 @@ mod tests {
     }
 
     // Integration tests
-    use crate::metrics::consensus::ConsensusMetrics;
+    use crate::metrics::consensus::ConsensusKvMetric;
     use fgumi_raw_bam::{
         SamBuilder as RawSamBuilder, flags, raw_record_to_record_buf, testutil::encode_op,
     };
