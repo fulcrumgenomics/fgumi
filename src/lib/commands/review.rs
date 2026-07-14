@@ -113,6 +113,36 @@ genotypes will be used.
 The `--maf` parameter controls which variants get detailed per-read information in the output file.
 Only variants with a minor allele frequency at or below this threshold will have detailed information
 written.
+
+## Known divergences from fgbio `ReviewConsensusVariants`
+
+These are intentional, documented behavior differences; the parity-relevant ones
+(SNP selection, base-count dedup, VCF REF, filters default, read-number suffix,
+MAF gating) are matched exactly.
+
+- **Overlapping interval lists are not merged (REV3-06):** fgbio applies
+  `IntervalList.uniqued(false)` (sorts and merges overlapping/abutting intervals);
+  fgumi emits one variant per position per interval, so overlapping intervals in
+  the input produce duplicate rows. Provide a pre-merged interval list to match.
+- **CIGAR `N` (ref-skip) sites (REV3-07):** an RNA read that skips over a variant
+  site with an `N` operator is extracted by fgbio (its `readPosAtRefPos==0` fires
+  for both `D` and `N` gaps) but not by fgumi. RNA-only; irrelevant to DNA
+  consensus review.
+- **Vendor-QC-fail reads (REV3-09):** fgbio's `SamLocusIterator` pileup runs with an
+  emptied filter list (`setSamFilters(Collections.emptyList())`) and a mapping-quality
+  cutoff of 0, so its only hardcoded exclusions are unmapped and vendor-QC-fail reads —
+  secondary/supplementary reads are *not* skipped. fgumi's region queries additionally
+  include vendor-QC-fail reads in counts and rows. Consensus reads essentially never set
+  the QC-fail flag, so this is a no-op in practice.
+- **Multi-valued `AF` (REV3-11):** fgbio parses a genotype `AF` with `toDouble`
+  (which throws on a comma-separated list); fgumi takes the first value. Divergent
+  only for multiallelic `AF` FORMAT fields.
+- **CLI / output surface (REV3-12):** the N-ignoring flag is `--ignore-ns` (`-N`)
+  rather than fgbio's `--ignore-ns-in-consensus-reads`; fgumi always writes
+  `.bam.bai` sidecars for the output BAMs.
+- **Empty result output (REV3-15):** when every variant is filtered out, fgumi
+  writes an empty `<output>.txt` while fgbio writes a header-only file. This
+  matches fgumi's metrics-writer behavior across all commands.
 "#
 )]
 pub struct Review {
@@ -389,10 +419,6 @@ impl Review {
         let header = reader.read_header()?;
         let mut variants = Vec::new();
 
-        // Load reference for getting ref bases
-        let mut fasta_reader = noodles::fasta::io::indexed_reader::Builder::default()
-            .build_from_path(&self.reference)?;
-
         // Determine which sample to use for genotype extraction
         let sample_name = if let Some(ref name) = self.sample {
             Some(name.clone())
@@ -405,6 +431,18 @@ impl Review {
         for result in reader.record_bufs(&header) {
             let record = result?;
 
+            // Only process SNPs, matching fgbio's `.filter(_.isSNP)`: the REF is a
+            // single base AND there is at least one ALT and every ALT is a single
+            // base. This drops insertions/deletions (`A -> ATG`), mixed sites
+            // (`A -> C,ATG`), and monomorphic records (no ALT) that fgbio excludes.
+            let alternate_bases = record.alternate_bases();
+            let is_snp = record.reference_bases().len() == 1
+                && !alternate_bases.as_ref().is_empty()
+                && alternate_bases.as_ref().iter().all(|alt| alt.len() == 1);
+            if !is_snp {
+                continue;
+            }
+
             // Get chromosome name
             let chrom = record.reference_sequence_name().to_string();
 
@@ -415,19 +453,30 @@ impl Review {
                     .ok_or_else(|| anyhow::anyhow!("Missing variant position"))?,
             ) as i32;
 
-            // Get reference base from FASTA
-            let ref_base = self.get_reference_base(&mut fasta_reader, &chrom, pos)?;
+            // Reference base comes from the VCF REF allele (fgbio uses
+            // `v.getReference.getBases()(0)`), not the FASTA — so a VCF whose REF
+            // disagrees with this FASTA still classifies reads against the VCF's
+            // REF. Safe to index [0] here: `is_snp` guaranteed REF length 1.
+            let ref_base = record
+                .reference_bases()
+                .chars()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("VCF record has an empty REF allele"))?
+                .to_ascii_uppercase();
 
-            // Only process SNPs (single base variants)
-            if record.reference_bases().len() != 1 {
-                continue;
-            }
-
-            // Apply MAF filtering if sample specified
+            // Apply MAF filtering if sample specified. fgbio keeps a variant when
+            // `mafFromGenotype(...).forall(_ <= maf)`, i.e. only when the MAF is
+            // absent or `<= maf`. `!(maf <= self.maf)` reproduces that: it drops
+            // both `maf > self.maf` and a NaN MAF (e.g. AD summing to zero, where
+            // fgbio computes `1 - 0/0 = NaN` and `NaN <= maf` is false).
             if let Some(ref sname) = sample_name {
                 if let Some(maf) = Self::calculate_maf(&record, &header, sname) {
-                    if maf > self.maf {
-                        continue; // Skip variants above MAF threshold
+                    // Keep only when `maf <= threshold`; a MAF above the threshold
+                    // *and* a NaN MAF (partial comparison is false) both fall through
+                    // to `continue`, matching fgbio's `forall(_ <= maf)`.
+                    let within_threshold = maf <= self.maf;
+                    if !within_threshold {
+                        continue;
                     }
                 }
             }
@@ -616,10 +665,10 @@ impl Review {
 
     /// Calculates minor allele frequency from genotype info.
     ///
-    /// Follows Scala logic exactly:
-    /// 1. Try to extract AF (allele frequency) attribute
-    /// 2. Fall back to calculating from AD (allelic depth) if AF not present
-    /// 3. Return None if neither is available
+    /// Mirrors fgbio's `mafFromGenotype`:
+    /// 1. Try to extract the `AF` (allele frequency) attribute.
+    /// 2. Fall back to `1 - ad(0)/ad.sum` from `AD` (allelic depth) if `AF` is absent.
+    /// 3. Return `None` if neither is available.
     ///
     /// # Arguments
     ///
@@ -629,61 +678,75 @@ impl Review {
     ///
     /// # Returns
     ///
-    /// MAF as f64 between 0 and 1, or None if cannot be calculated
+    /// A finite MAF, or `None` when neither `AF` nor `AD` is present. Returns
+    /// `NaN` when `AD` is present but sums to zero (fgbio computes `1 - 0/0`);
+    /// the caller treats a `NaN` MAF as "exclude this variant".
     fn calculate_maf(
         record: &noodles::vcf::variant::RecordBuf,
         header: &noodles::vcf::Header,
         sample_name: &str,
     ) -> Option<f64> {
-        use noodles::vcf::variant::record::samples::Sample;
+        use noodles::vcf::variant::record_buf::samples::sample::Value;
+        use noodles::vcf::variant::record_buf::samples::sample::value::Array;
 
         // Find the sample index
         let sample_idx = header.sample_names().iter().position(|s| s == sample_name)?;
 
         let samples = record.samples();
         let keys = samples.keys();
+        let sample = samples.get_index(sample_idx)?;
 
-        // Try to get AF (allele frequency) field first - matches Scala's getExtendedAttribute("AF")
+        // Try AF (allele frequency) first, matching fgbio's `getExtendedAttribute("AF")`.
+        // Read the typed sample value directly — a `format!("{value:?}")` Debug parse
+        // never matches noodles' `Float(..)` / `Array(Float(..))` rendering, so it
+        // silently fails and disables MAF filtering entirely.
         if let Some(af_idx) = keys.as_ref().iter().position(|k| k == "AF") {
-            if let Some(sample_values) = samples.get_index(sample_idx) {
-                if let Some(Ok(Some(value))) = sample_values.get_index(header, af_idx) {
-                    // Convert to string and parse - handles String, Float, or Array types
-                    let value_str = format!("{value:?}");
-                    // Handle array format like "[0.01]" or simple format like "0.01"
-                    let cleaned = value_str.trim_matches(|c| c == '[' || c == ']' || c == '"');
-                    // Take first value if comma-separated
-                    if let Some(first_val) = cleaned.split(',').next() {
-                        if let Ok(af) = first_val.trim().parse::<f64>() {
-                            return Some(af);
-                        }
-                    }
+            if let Some(Some(value)) = sample.values().get(af_idx) {
+                if let Some(af) = Self::value_as_f64(value) {
+                    return Some(af);
                 }
             }
         }
 
-        // Fall back to calculating from AD (allele depth) - matches Scala's getAD
+        // Fall back to AD (allele depth), matching fgbio's `gt.getAD` → `1 - ad(0)/ad.sum`.
         if let Some(ad_idx) = keys.as_ref().iter().position(|k| k == "AD") {
-            if let Some(sample_values) = samples.get_index(sample_idx) {
-                if let Some(Ok(Some(value))) = sample_values.get_index(header, ad_idx) {
-                    // AD should be an array like "[100,2]" or "100,2"
-                    let value_str = format!("{value:?}");
-                    let cleaned = value_str.trim_matches(|c| c == '[' || c == ']' || c == '"');
-                    let depths: Vec<i32> =
-                        cleaned.split(',').filter_map(|s| s.trim().parse::<i32>().ok()).collect();
-
-                    if !depths.is_empty() {
-                        let total: i32 = depths.iter().sum();
-                        if total > 0 {
-                            let ref_depth = depths[0];
-                            // Scala: 1 - ad(0) / ad.sum.toDouble
-                            return Some(1.0 - (ref_depth as f64 / total as f64));
-                        }
-                    }
+            if let Some(Some(Value::Array(Array::Integer(depths)))) = sample.values().get(ad_idx) {
+                if !depths.is_empty() {
+                    // fgbio: `1 - ad(0) / ad.sum.toDouble`. When AD sums to zero this
+                    // is `1 - 0/0 = NaN`; the caller's `!(maf <= threshold)` check
+                    // then excludes the variant, matching fgbio's `forall(_ <= maf)`.
+                    // Missing (`.`) AD entries are treated as 0 (htsjdk's AD is a
+                    // dense int array).
+                    let total: i32 = depths.iter().map(|d| d.unwrap_or(0)).sum();
+                    let ref_depth = depths[0].unwrap_or(0);
+                    return Some(1.0 - (f64::from(ref_depth) / f64::from(total)));
                 }
             }
         }
 
         None
+    }
+
+    /// Extracts the leading numeric value from a typed VCF sample [`Value`] (used to
+    /// read `AF`). Scalars convert directly; arrays take the first present element;
+    /// strings parse their first comma-separated token (fgbio does `AF.toDouble`).
+    fn value_as_f64(
+        value: &noodles::vcf::variant::record_buf::samples::sample::Value,
+    ) -> Option<f64> {
+        use noodles::vcf::variant::record_buf::samples::sample::Value;
+        use noodles::vcf::variant::record_buf::samples::sample::value::Array;
+
+        match value {
+            Value::Float(f) => Some(f64::from(*f)),
+            Value::Integer(i) => Some(f64::from(*i)),
+            Value::String(s) => s.split(',').next()?.trim().parse::<f64>().ok(),
+            Value::Array(Array::Float(vs)) => vs.iter().flatten().next().map(|f| f64::from(*f)),
+            Value::Array(Array::Integer(vs)) => vs.iter().flatten().next().map(|i| f64::from(*i)),
+            Value::Array(Array::String(vs)) => {
+                vs.iter().flatten().next()?.split(',').next()?.trim().parse::<f64>().ok()
+            }
+            _ => None,
+        }
     }
 
     /// Extracts consensus reads containing non-reference bases at variant positions.
@@ -727,6 +790,15 @@ impl Review {
 
         let mut mi_set = HashSet::new();
 
+        // Buffer the matching consensus reads, deduplicating those seen across the
+        // per-variant region queries, then emit them in coordinate order. A consensus
+        // read that is non-reference at two or more variant loci is returned by each of
+        // those loci's queries, but fgbio's single `consensusIn.query(variants)` emits
+        // every matching read exactly once and in coordinate order. Key on read identity
+        // (name, flags, ref id, position) so each physical record is buffered once.
+        let mut written_records: HashSet<(Vec<u8>, u16, i32, i32)> = HashSet::new();
+        let mut records: Vec<RawRecord> = Vec::new();
+
         // Query each variant region
         for variant in variants {
             let start = noodles::core::Position::try_from(variant.pos as usize)?;
@@ -737,16 +809,41 @@ impl Review {
 
                 // Check if this read has a non-reference base at the variant position
                 if self.has_non_reference_base(&record, variant)? {
+                    let identity = (
+                        record.read_name().to_vec(),
+                        record.flags(),
+                        record.ref_id(),
+                        record.pos(),
+                    );
+                    if !written_records.insert(identity) {
+                        continue; // Already extracted at another variant locus.
+                    }
+
                     // fgbio records `toMi(rec)` in its source set for every
                     // non-reference consensus read, erroring if the MI tag is
                     // absent (ReviewConsensusVariantsTest.scala:166).
                     let mi_base = to_mi(&record)?;
                     mi_set.insert(mi_base);
 
-                    // Write raw record to output BAM.
-                    write_raw_record(writer.get_mut(), &record)?;
+                    records.push(record);
                 }
             }
+        }
+
+        // Emit in coordinate order so the indexed `.consensus.bam` (indexed in `execute`
+        // via `bam::fs::index`) is valid. The per-variant queries visit variants in
+        // coordinate order, but a read that is non-reference only at a later variant can
+        // still start before a read emitted at an earlier variant, so query order is not
+        // necessarily coordinate-sorted. A stable sort by (reference id, position) — with
+        // unmapped reads (ref id -1) placed last, matching BAM coordinate order —
+        // reproduces fgbio's `query(variants)` ordering.
+        records.sort_by_key(|record| {
+            let ref_id = record.ref_id();
+            let ref_key = if ref_id < 0 { i64::MAX } else { i64::from(ref_id) };
+            (ref_key, record.pos())
+        });
+        for record in &records {
+            write_raw_record(writer.get_mut(), record)?;
         }
 
         Ok(mi_set)
@@ -868,12 +965,20 @@ impl Review {
                 consensus_reads.push(result?);
             }
 
-            // Build consensus-level base counts
+            // Build consensus-level base counts, deduplicated by distinct read name
+            // per base to match fgbio's `BaseCounts` (BaseCounts.scala:45-46:
+            // `groupBy(base).map((ch, rs) => rs.map(_.getReadName).distinct.size)`).
+            // Without the dedup, a short-insert FR pair whose R1 and R2 both overlap
+            // the locus double-counts the site A/C/G/T/N (which is repeated on every
+            // row for the variant).
             let mut consensus_counts = BaseCounts::default();
+            let mut counted_bases: HashSet<(u8, Vec<u8>)> = HashSet::new();
             for record in &consensus_reads {
                 if let Some(base) = self.get_base_at_position(record, variant.pos)? {
-                    consensus_counts
-                        .add_base(Self::normalize_base_for_variant(base, variant.ref_base));
+                    let normalized = Self::normalize_base_for_variant(base, variant.ref_base);
+                    if counted_bases.insert((normalized, record.read_name().to_vec())) {
+                        consensus_counts.add_base(normalized);
+                    }
                 }
             }
 
@@ -912,16 +1017,20 @@ impl Review {
                 // `toMi(rec)`, which errors when the MI tag is absent).
                 let mi_base = to_mi(&record)?;
 
-                // Format consensus read name with /1 or /2 suffix
+                // Format consensus read name with /1 or /2 suffix. fgbio's
+                // `readNumberSuffix` uses `/2` only for paired second-of-pair reads;
+                // unpaired reads get `/1`, so key off `paired && second`, not
+                // `!first` (which mislabels unpaired reads).
                 let read_name = String::from_utf8_lossy(record.read_name()).to_string();
-                let is_first = record.is_first_segment();
-                let consensus_read_name = format!("{}{}", read_name, read_number_suffix(is_first));
+                let is_second_of_pair = record.is_paired() && record.is_last_segment();
+                let consensus_read_name =
+                    format!("{}{}", read_name, read_number_suffix(is_second_of_pair));
 
                 // fgbio sorts each variant's rows by the string `toMi(rec) +
                 // readNumberSuffix(rec)` (ReviewConsensusVariants.scala:258), so e.g.
                 // "10/1" sorts before "2/1". This key mirrors that (MI base, not the
                 // full read name, then the /1 or /2 suffix).
-                let sort_key = format!("{}{}", mi_base, read_number_suffix(is_first));
+                let sort_key = format!("{}{}", mi_base, read_number_suffix(is_second_of_pair));
 
                 // Generate insert string
                 let insert_string = format_insert_string(&record, &consensus_header);
@@ -935,23 +1044,32 @@ impl Review {
 
                     let mut counts = BaseCounts::default();
                     let mut seen_reads = HashSet::new();
-                    let expected_read_num =
-                        if consensus_read_name.ends_with("/1") { "/1" } else { "/2" };
+                    // Reuse the suffix appended to `consensus_read_name` above rather
+                    // than re-parsing it back out of the formatted string.
+                    let expected_read_num = read_number_suffix(is_second_of_pair);
 
                     for result in grouped_reader.query(&grouped_header, &region)? {
                         let rec = result?;
 
-                        // Source molecule id for this grouped read. fgbio buckets
-                        // the locus's grouped reads with `toMi(rec)` (erroring on a
-                        // missing MI tag) before matching them to the consensus MI.
-                        let read_mi_base = to_mi(&rec)?;
-                        if read_mi_base != mi_base {
+                        // Source molecule id for this grouped read. Skip a read that
+                        // lacks an MI tag rather than erroring (mirroring
+                        // `extract_grouped_reads`): fgbio pileups the already
+                        // MI-filtered `.grouped.bam`, so its `toMi` never fails here.
+                        // An MI-less read can never match the consensus MI, so
+                        // skipping yields counts identical to fgbio while not aborting
+                        // the whole review on a single stray untagged read.
+                        let Some(mi_bytes) = find_string_tag_in_record(&rec, SamTag::MI) else {
+                            continue;
+                        };
+                        let read_mi_base = extract_mi_base(std::str::from_utf8(mi_bytes)?);
+                        if read_mi_base != mi_base.as_str() {
                             continue;
                         }
 
-                        // Check read number matches
-                        let is_first = rec.is_first_segment();
-                        let read_num = read_number_suffix(is_first);
+                        // Check read number matches (same `/2 iff paired && second`
+                        // rule as the consensus read above, for a consistent key).
+                        let is_second_of_pair = rec.is_paired() && rec.is_last_segment();
+                        let read_num = read_number_suffix(is_second_of_pair);
                         if read_num != expected_read_num {
                             continue;
                         }
@@ -978,7 +1096,10 @@ impl Review {
                     pos: variant.pos,
                     ref_allele: variant.ref_base.to_string(),
                     genotype: variant.genotype.clone().unwrap_or_else(|| "NA".to_string()),
-                    filters: variant.filters.clone().unwrap_or_else(|| "NA".to_string()),
+                    // fgbio renders `filters.getOrElse("PASS")` — a variant with no
+                    // recorded filters (every interval-list variant, and any VCF
+                    // record that is PASS) shows `PASS`, not `NA`.
+                    filters: variant.filters.clone().unwrap_or_else(|| "PASS".to_string()),
                     consensus_a: consensus_counts.a,
                     consensus_c: consensus_counts.c,
                     consensus_g: consensus_counts.g,
@@ -1360,6 +1481,86 @@ CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
             let r2 = to_record_buf(b2.build());
 
             (r1, r2)
+        }
+
+        /// Create a single unpaired mapped read (no PAIRED flag) with an `MI` tag.
+        #[allow(clippy::cast_possible_truncation)]
+        pub fn create_single_read(
+            name: &str,
+            chrom_idx: usize,
+            start: i32,
+            bases: &[u8],
+            cigar: Option<&str>,
+            mi: &str,
+        ) -> RecordBuf {
+            let cigar_str = cigar.map_or_else(|| format!("{}M", bases.len()), String::from);
+            let cigar_ops = parse_cigar_to_ops(&cigar_str);
+            let mut b = RawSamBuilder::new();
+            b.read_name(name.as_bytes())
+                .flags(0) // unpaired, mapped
+                .ref_id(chrom_idx as i32)
+                .pos(start - 1)
+                .mapq(60)
+                .cigar_ops(&cigar_ops)
+                .sequence(bases)
+                .qualities(&vec![45u8; bases.len()]);
+            b.add_string_tag(SamTag::MI, mi.as_bytes());
+            to_record_buf(b.build())
+        }
+
+        /// Write `records` to a coordinate-sorted, indexed BAM at `path`.
+        pub fn write_indexed_bam(path: &std::path::Path, records: &[RecordBuf]) {
+            use noodles::bam;
+            use noodles::bam::bai;
+            use noodles::sam::alignment::io::Write;
+
+            let header = create_test_header();
+            let mut writer = bam::io::Writer::new(std::fs::File::create(path).expect("create bam"));
+            writer.write_header(&header).expect("write header");
+            // Sort by (ref_id, pos) so the BAM is coordinate-ordered for indexing.
+            let mut sorted: Vec<&RecordBuf> = records.iter().collect();
+            sorted.sort_by_key(|r| {
+                (
+                    r.reference_sequence_id().unwrap_or(usize::MAX),
+                    r.alignment_start().map(usize::from).unwrap_or(0),
+                )
+            });
+            for rec in sorted {
+                writer.write_alignment_record(&header, rec).expect("write record");
+            }
+            drop(writer);
+
+            let index_path = path.with_extension("bam.bai");
+            let index = bam::fs::index(path).expect("index bam");
+            let mut index_writer =
+                bai::io::Writer::new(std::fs::File::create(&index_path).expect("create bai"));
+            index_writer.write_index(&index).expect("write bai");
+        }
+
+        /// Parse a review `.txt` into rows of string fields (row 0 is the header).
+        pub fn read_review_rows(txt_path: &std::path::Path) -> Vec<Vec<String>> {
+            std::fs::read_to_string(txt_path)
+                .expect("read review txt")
+                .lines()
+                .map(|line| line.split('\t').map(str::to_string).collect())
+                .collect()
+        }
+
+        /// Collect the read names present in a `.consensus.bam` output.
+        pub fn consensus_bam_read_names(path: &std::path::Path) -> Vec<String> {
+            use noodles::bam;
+            let mut reader = bam::io::indexed_reader::Builder::default()
+                .build_from_path(path)
+                .expect("open consensus bam");
+            let header = reader.read_header().expect("read header");
+            let mut names = Vec::new();
+            let mut record = RecordBuf::default();
+            while reader.read_record_buf(&header, &mut record).expect("read record") > 0 {
+                names.push(
+                    String::from_utf8_lossy(record.name().expect("name").as_ref()).to_string(),
+                );
+            }
+            names
         }
 
         /// Create a test BAM file with synthetic reads
@@ -2408,5 +2609,484 @@ chr1\t5\t.\tA\tC\t.\tPASS\t.\n";
         // Should fail due to missing .dict (now that we validate it)
         let result = review.execute("test");
         assert!(result.is_err(), "Should fail when FASTA dictionary is missing");
+    }
+
+    /// Helper: run `review` over the given VCF/interval input against the shared
+    /// `create_test_bams` fixture and return the parsed review rows (header at [0]).
+    fn run_review_over_test_bams(
+        temp_dir: &TempDir,
+        input: PathBuf,
+        sample: Option<String>,
+        maf: f64,
+    ) -> (PathBuf, Vec<Vec<String>>) {
+        let ref_path = test_utils::create_test_reference(temp_dir);
+        let (raw_path, consensus_path) = test_utils::create_test_bams(temp_dir);
+        let output_path = temp_dir.path().join("output");
+        let review = Review {
+            input,
+            consensus_bam: consensus_path,
+            grouped_bam: raw_path,
+            reference: ref_path,
+            output: output_path.clone(),
+            sample,
+            ignore_ns: false,
+            maf,
+        };
+        review.execute("test").expect("execute should succeed");
+        let rows = test_utils::read_review_rows(&output_path.with_extension("txt"));
+        (output_path, rows)
+    }
+
+    fn write_file(dir: &TempDir, name: &str, content: &str) -> PathBuf {
+        let path = dir.path().join(name);
+        std::fs::write(&path, content).expect("write fixture");
+        path
+    }
+
+    // Column indices in the review TSV.
+    const COL_CHROM: usize = 0;
+    const COL_POS: usize = 1;
+    const COL_REF: usize = 2;
+    const COL_FILTERS: usize = 4;
+    const COL_T: usize = 8;
+    const COL_CONSENSUS_READ: usize = 10;
+
+    /// REV3-02: site base counts dedup overlapping mates by read name. Read `H` has
+    /// both ends overlapping chr2:20 calling `T`; fgbio's `BaseCounts` counts the
+    /// template once (`T`=1), not once per mate (`T`=2).
+    #[test]
+    fn test_rev3_02_overlapping_mates_not_double_counted() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let vcf = test_utils::create_test_vcf(&temp_dir);
+        let (_out, rows) =
+            run_review_over_test_bams(&temp_dir, vcf, Some("tumor".to_string()), 0.05);
+
+        let chr2_20_t: Vec<&str> = rows[1..]
+            .iter()
+            .filter(|r| r[COL_CHROM] == "chr2" && r[COL_POS] == "20")
+            .map(|r| r[COL_T].as_str())
+            .collect();
+        assert!(!chr2_20_t.is_empty(), "expected rows at chr2:20");
+        for t in chr2_20_t {
+            assert_eq!(t, "1", "overlapping mates of H must count once, not twice");
+        }
+    }
+
+    /// REV3-14 (subsumes REV3-08): AF- and AD-based MAF gating actually filters.
+    /// The previous `format!(\"{{value:?}}\")` parse never matched noodles' typed
+    /// values, so every variant was kept regardless of AF/AD.
+    #[test]
+    fn test_rev3_14_maf_filtering_af_and_ad() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let vcf = write_file(
+            &temp_dir,
+            "maf.vcf",
+            "##fileformat=VCFv4.2\n\
+##contig=<ID=chr1,length=100>\n\
+##contig=<ID=chr2,length=100>\n\
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+##FORMAT=<ID=AF,Number=1,Type=Float,Description=\"Allele Frequency\">\n\
+##FORMAT=<ID=AD,Number=R,Type=Integer,Description=\"Allele Depth\">\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ttumor\n\
+chr1\t10\t.\tA\tT\t.\tPASS\t.\tGT:AF\t0/1:0.01\n\
+chr1\t20\t.\tA\tC\t.\tPASS\t.\tGT:AF\t0/1:0.9\n\
+chr1\t30\t.\tA\tG\t.\tPASS\t.\tGT:AD\t0/1:1,99\n\
+chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:99,1\n",
+        );
+        let (_out, rows) =
+            run_review_over_test_bams(&temp_dir, vcf, Some("tumor".to_string()), 0.05);
+
+        let present: std::collections::HashSet<(String, String)> =
+            rows[1..].iter().map(|r| (r[COL_CHROM].clone(), r[COL_POS].clone())).collect();
+        assert!(present.contains(&("chr1".into(), "10".into())), "AF=0.01 must be kept");
+        assert!(present.contains(&("chr2".into(), "20".into())), "AD 99,1 (maf 0.01) must be kept");
+        assert!(!present.contains(&("chr1".into(), "20".into())), "AF=0.9 must be filtered out");
+        assert!(
+            !present.contains(&("chr1".into(), "30".into())),
+            "AD 1,99 (maf 0.99) must be filtered out"
+        );
+    }
+
+    /// Builds a single-sample VCF record + header carrying the given typed `AF`/`AD`
+    /// sample values and runs [`Review::calculate_maf`] against it, mirroring the
+    /// production lookup path (prefer `AF`, fall back to `AD`). A `None` argument omits
+    /// that key entirely so the "attribute absent" branch is exercised too.
+    fn calculate_maf_for(
+        af: Option<noodles::vcf::variant::record_buf::samples::sample::Value>,
+        ad: Option<noodles::vcf::variant::record_buf::samples::sample::Value>,
+    ) -> Option<f64> {
+        use noodles::vcf::Header as VcfHeader;
+        use noodles::vcf::variant::RecordBuf;
+        use noodles::vcf::variant::record_buf::Samples;
+        use noodles::vcf::variant::record_buf::samples::Keys;
+
+        let mut key_names: Vec<String> = Vec::new();
+        let mut values = Vec::new();
+        if let Some(value) = af {
+            key_names.push("AF".to_string());
+            values.push(Some(value));
+        }
+        if let Some(value) = ad {
+            key_names.push("AD".to_string());
+            values.push(Some(value));
+        }
+        let keys: Keys = key_names.into_iter().collect();
+        let samples = Samples::new(keys, vec![values]);
+        let record = RecordBuf::builder().set_samples(samples).build();
+        let header = VcfHeader::builder().add_sample_name("s").build();
+        Review::calculate_maf(&record, &header, "s")
+    }
+
+    /// Neither `AF` nor `AD` present yields `None` (no MAF gate), matching fgbio's
+    /// `mafFromGenotype` returning `None`. A fixed case, so a plain test rather than a
+    /// property.
+    #[test]
+    fn no_af_or_ad_yields_none() {
+        assert_eq!(calculate_maf_for(None, None), None);
+    }
+
+    proptest::proptest! {
+        /// A scalar float `AF` is read back verbatim (bit-for-bit) and takes precedence
+        /// over any `AD` present, since `calculate_maf` tries `AF` first. Exercises the
+        /// `Value::Float` branch of `value_as_f64` over the realistic finite AF domain.
+        #[test]
+        fn af_scalar_float_takes_precedence(
+            af in proptest::num::f32::NORMAL | proptest::num::f32::ZERO,
+            ref_depth in 0i32..10_000,
+            alt_depth in 0i32..10_000,
+        ) {
+            use noodles::vcf::variant::record_buf::samples::sample::Value;
+            use noodles::vcf::variant::record_buf::samples::sample::value::Array;
+            let ad = Value::Array(Array::Integer(vec![Some(ref_depth), Some(alt_depth)]));
+            let got = calculate_maf_for(Some(Value::Float(af)), Some(ad));
+            proptest::prop_assert_eq!(got.map(f64::to_bits), Some(f64::from(af).to_bits()));
+        }
+
+        /// `value_as_f64` widens a scalar float / integer to exactly the same `f64`.
+        #[test]
+        fn value_as_f64_scalar_widens_exactly(
+            f in proptest::num::f32::NORMAL | proptest::num::f32::ZERO,
+            i in proptest::num::i32::ANY,
+        ) {
+            use noodles::vcf::variant::record_buf::samples::sample::Value;
+            // Compare bit patterns: `clippy::pedantic`'s `float_cmp` forbids `==` on floats,
+            // and both sides apply the identical widening so the bits match exactly.
+            proptest::prop_assert_eq!(
+                Review::value_as_f64(&Value::Float(f)).map(f64::to_bits),
+                Some(f64::from(f).to_bits())
+            );
+            proptest::prop_assert_eq!(
+                Review::value_as_f64(&Value::Integer(i)).map(f64::to_bits),
+                Some(f64::from(i).to_bits())
+            );
+        }
+
+        /// `value_as_f64` on a float array returns the first present (`Some`) element, or
+        /// `None` when every element is missing or the array is empty.
+        #[test]
+        fn value_as_f64_array_takes_first_present(
+            elements in proptest::collection::vec(
+                proptest::option::of(proptest::num::f32::NORMAL | proptest::num::f32::ZERO),
+                0..8,
+            ),
+        ) {
+            use noodles::vcf::variant::record_buf::samples::sample::Value;
+            use noodles::vcf::variant::record_buf::samples::sample::value::Array;
+            let expected = elements.iter().flatten().next().map(|f| f64::from(*f));
+            let got = Review::value_as_f64(&Value::Array(Array::Float(elements)));
+            proptest::prop_assert_eq!(got.map(f64::to_bits), expected.map(f64::to_bits));
+        }
+
+        /// `value_as_f64` parses only the first comma-separated token of a string, matching
+        /// fgbio's `AF.toDouble` on the leading value (the noodles `Value::String` branch).
+        #[test]
+        fn value_as_f64_string_parses_first_token(
+            head in proptest::num::f64::NORMAL | proptest::num::f64::ZERO,
+            tail in "[a-zA-Z, ]{0,8}",
+        ) {
+            use noodles::vcf::variant::record_buf::samples::sample::Value;
+            let text = format!("{head},{tail}");
+            proptest::prop_assert_eq!(
+                Review::value_as_f64(&Value::String(text)).map(f64::to_bits),
+                Some(head.to_bits())
+            );
+        }
+
+        /// With no `AF`, MAF is `1 - ad[0] / sum(ad)`; when the depths sum to zero the
+        /// result is `NaN` (fgbio's `1 - 0/0`), which the caller treats as "exclude".
+        #[test]
+        fn ad_only_matches_one_minus_ref_over_sum(
+            depths in proptest::collection::vec(0i32..10_000, 1..6),
+        ) {
+            use noodles::vcf::variant::record_buf::samples::sample::Value;
+            use noodles::vcf::variant::record_buf::samples::sample::value::Array;
+            let total: i32 = depths.iter().sum();
+            let ad = Value::Array(Array::Integer(depths.iter().map(|d| Some(*d)).collect()));
+            let got = calculate_maf_for(None, Some(ad)).expect("AD present yields Some");
+            if total == 0 {
+                proptest::prop_assert!(got.is_nan(), "AD summing to zero must be NaN, got {}", got);
+            } else {
+                let expected = 1.0 - f64::from(depths[0]) / f64::from(total);
+                proptest::prop_assert_eq!(got.to_bits(), expected.to_bits());
+            }
+        }
+
+        /// An `AF` string that does not parse as a float falls through to the `AD` fallback
+        /// rather than silently disabling MAF filtering (the pre-REV3-14 bug).
+        #[test]
+        fn unparseable_af_string_falls_back_to_ad(
+            garbage in "[a-zA-Z]{1,8}",
+            ref_depth in 1i32..10_000,
+            alt_depth in 1i32..10_000,
+        ) {
+            use noodles::vcf::variant::record_buf::samples::sample::Value;
+            use noodles::vcf::variant::record_buf::samples::sample::value::Array;
+            let af = Value::String(garbage);
+            let ad = Value::Array(Array::Integer(vec![Some(ref_depth), Some(alt_depth)]));
+            let got = calculate_maf_for(Some(af), Some(ad)).expect("AD fallback yields Some");
+            let total = ref_depth + alt_depth;
+            let expected = 1.0 - f64::from(ref_depth) / f64::from(total);
+            proptest::prop_assert_eq!(got.to_bits(), expected.to_bits());
+        }
+    }
+
+    /// REV3-01: only SNPs are reviewed. An insertion (`A -> AT`) at a covered site
+    /// is dropped, so no read is extracted or reviewed for it.
+    #[test]
+    fn test_rev3_01_insertion_variant_dropped() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let vcf = write_file(
+            &temp_dir,
+            "ins.vcf",
+            "##fileformat=VCFv4.2\n\
+##contig=<ID=chr1,length=100>\n\
+##contig=<ID=chr2,length=100>\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+chr1\t10\t.\tA\tAT\t.\tPASS\t.\n",
+        );
+        let (out, rows) = run_review_over_test_bams(&temp_dir, vcf, None, 0.05);
+        // The insertion is dropped, so there are no data rows. fgumi writes an empty
+        // file when there is nothing to report (REV3-15), so accept 0 lines (empty)
+        // or 1 line (header only) — the key signal is the empty `.consensus.bam`.
+        assert!(
+            rows.len() <= 1,
+            "insertion-only input must yield no data rows, got {}",
+            rows.len()
+        );
+        let names = test_utils::consensus_bam_read_names(&out.with_extension("consensus.bam"));
+        assert!(
+            names.is_empty(),
+            "no reads should be extracted for a dropped insertion: {names:?}"
+        );
+    }
+
+    /// REV3-03: on the VCF path the reference allele comes from the VCF `REF`, not
+    /// the FASTA. Here the VCF `REF` (`G`) deliberately disagrees with the FASTA
+    /// (`A`) at chr1:10; the `ref` column must show `G`.
+    #[test]
+    fn test_rev3_03_ref_base_from_vcf_not_fasta() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let vcf = write_file(
+            &temp_dir,
+            "ref.vcf",
+            "##fileformat=VCFv4.2\n\
+##contig=<ID=chr1,length=100>\n\
+##contig=<ID=chr2,length=100>\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+chr1\t10\t.\tG\tA\t.\tPASS\t.\n",
+        );
+        let (_out, rows) = run_review_over_test_bams(&temp_dir, vcf, None, 0.05);
+        let chr1_10: Vec<&Vec<String>> =
+            rows[1..].iter().filter(|r| r[COL_CHROM] == "chr1" && r[COL_POS] == "10").collect();
+        assert!(!chr1_10.is_empty(), "expected rows at chr1:10");
+        for r in chr1_10 {
+            assert_eq!(
+                r[COL_REF], "G",
+                "ref column must be the VCF REF (G), not the FASTA base (A)"
+            );
+        }
+    }
+
+    /// REV3-04: interval-list variants have no filters, and fgbio renders the
+    /// default as `PASS` (not `NA`).
+    #[test]
+    fn test_rev3_04_interval_list_filters_default_pass() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let interval = write_file(
+            &temp_dir,
+            "sites.interval_list",
+            "@HD\tVN:1.5\tSO:unsorted\n\
+@SQ\tSN:chr1\tLN:100\n\
+@SQ\tSN:chr2\tLN:100\n\
+chr1\t10\t10\t+\tsnp10\n",
+        );
+        let (_out, rows) = run_review_over_test_bams(&temp_dir, interval, None, 0.05);
+        let chr1_10: Vec<&Vec<String>> =
+            rows[1..].iter().filter(|r| r[COL_CHROM] == "chr1" && r[COL_POS] == "10").collect();
+        assert!(!chr1_10.is_empty(), "expected rows at chr1:10");
+        for r in chr1_10 {
+            assert_eq!(r[COL_FILTERS], "PASS", "interval-list filters default must be PASS");
+        }
+    }
+
+    /// REV3-05: a consensus read that is non-reference at two or more variant loci
+    /// is written to `.consensus.bam` exactly once (not once per locus).
+    #[test]
+    fn test_rev3_05_multi_locus_read_written_once() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ref_path = test_utils::create_test_reference(&temp_dir);
+
+        // A single read spanning chr1:10..30 (21bp), non-ref (T) at 10 and (G) at 30.
+        let mut bases = vec![b'A'; 21];
+        bases[0] = b'T'; // chr1:10
+        bases[20] = b'G'; // chr1:30
+        let read = test_utils::create_single_read("SPAN", 0, 10, &bases, None, "S");
+        let consensus_path = temp_dir.path().join("consensus.bam");
+        let grouped_path = temp_dir.path().join("grouped.bam");
+        test_utils::write_indexed_bam(&consensus_path, std::slice::from_ref(&read));
+        test_utils::write_indexed_bam(&grouped_path, std::slice::from_ref(&read));
+
+        let vcf = write_file(
+            &temp_dir,
+            "two.vcf",
+            "##fileformat=VCFv4.2\n\
+##contig=<ID=chr1,length=100>\n\
+##contig=<ID=chr2,length=100>\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+chr1\t10\t.\tA\tT\t.\tPASS\t.\n\
+chr1\t30\t.\tA\tG\t.\tPASS\t.\n",
+        );
+        let output_path = temp_dir.path().join("output");
+        Review {
+            input: vcf,
+            consensus_bam: consensus_path,
+            grouped_bam: grouped_path,
+            reference: ref_path,
+            output: output_path.clone(),
+            sample: None,
+            ignore_ns: false,
+            maf: 0.05,
+        }
+        .execute("test")
+        .expect("execute should succeed");
+
+        let names =
+            test_utils::consensus_bam_read_names(&output_path.with_extension("consensus.bam"));
+        let span_count = names.iter().filter(|n| *n == "SPAN").count();
+        assert_eq!(
+            span_count, 1,
+            "multi-locus read must be written once, got {span_count}: {names:?}"
+        );
+    }
+
+    /// REV3-05b: `.consensus.bam` is written in coordinate order regardless of which
+    /// variant locus first selected each read. fgbio's single `consensusIn.query(variants)`
+    /// yields matching reads coordinate-sorted; fgumi queries per variant, so a read that
+    /// is non-reference only at a *later* variant but starts *before* a read emitted at an
+    /// earlier variant would land out of order without the explicit sort — leaving the
+    /// indexed output BAM non-coordinate-sorted.
+    #[test]
+    fn test_rev3_05b_consensus_output_coordinate_sorted() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ref_path = test_utils::create_test_reference(&temp_dir);
+
+        // LATE_20: 5bp at chr1:20, non-ref (T) at chr1:20 only.
+        let mut late_bases = vec![b'A'; 5];
+        late_bases[0] = b'T'; // chr1:20
+        let late = test_utils::create_single_read("LATE_20", 0, 20, &late_bases, None, "L");
+
+        // EARLY_10: 21bp spanning chr1:10..30, reference (A) at chr1:20 but non-ref (G) at
+        // chr1:30. It is only selected at the chr1:30 locus, yet starts before LATE_20.
+        let mut early_bases = vec![b'A'; 21];
+        early_bases[20] = b'G'; // chr1:30
+        let early = test_utils::create_single_read("EARLY_10", 0, 10, &early_bases, None, "E");
+
+        let consensus_path = temp_dir.path().join("consensus.bam");
+        let grouped_path = temp_dir.path().join("grouped.bam");
+        // `write_indexed_bam` coordinate-sorts its input, so the *input* BAM is valid; the
+        // ordering under test is purely the *output* the extraction writes.
+        let reads = [late.clone(), early.clone()];
+        test_utils::write_indexed_bam(&consensus_path, &reads);
+        test_utils::write_indexed_bam(&grouped_path, &reads);
+
+        // Variants listed chr1:20 before chr1:30 (already coordinate order).
+        let vcf = write_file(
+            &temp_dir,
+            "sortcheck.vcf",
+            "##fileformat=VCFv4.2\n\
+##contig=<ID=chr1,length=100>\n\
+##contig=<ID=chr2,length=100>\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+chr1\t20\t.\tA\tT\t.\tPASS\t.\n\
+chr1\t30\t.\tA\tG\t.\tPASS\t.\n",
+        );
+        let output_path = temp_dir.path().join("output");
+        Review {
+            input: vcf,
+            consensus_bam: consensus_path,
+            grouped_bam: grouped_path,
+            reference: ref_path,
+            output: output_path.clone(),
+            sample: None,
+            ignore_ns: false,
+            maf: 0.05,
+        }
+        .execute("test")
+        .expect("execute should succeed");
+
+        // The output must be coordinate-sorted: EARLY_10 (chr1:10) before LATE_20 (chr1:20),
+        // even though LATE_20 was selected first (at the earlier chr1:20 variant locus).
+        let names =
+            test_utils::consensus_bam_read_names(&output_path.with_extension("consensus.bam"));
+        assert_eq!(
+            names,
+            vec!["EARLY_10".to_string(), "LATE_20".to_string()],
+            "consensus output must be coordinate-sorted, got {names:?}"
+        );
+    }
+
+    /// REV3-13: an unpaired consensus read gets a `/1` suffix (fgbio uses `/2` only
+    /// for paired second-of-pair reads).
+    #[test]
+    fn test_rev3_13_unpaired_read_suffix_is_slash_one() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ref_path = test_utils::create_test_reference(&temp_dir);
+
+        let read = test_utils::create_single_read("FRAG", 0, 6, b"AAAATAAAAA", None, "S");
+        let consensus_path = temp_dir.path().join("consensus.bam");
+        let grouped_path = temp_dir.path().join("grouped.bam");
+        test_utils::write_indexed_bam(&consensus_path, std::slice::from_ref(&read));
+        test_utils::write_indexed_bam(&grouped_path, std::slice::from_ref(&read));
+
+        let vcf = write_file(
+            &temp_dir,
+            "snp.vcf",
+            "##fileformat=VCFv4.2\n\
+##contig=<ID=chr1,length=100>\n\
+##contig=<ID=chr2,length=100>\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+chr1\t10\t.\tA\tT\t.\tPASS\t.\n",
+        );
+        let output_path = temp_dir.path().join("output");
+        Review {
+            input: vcf,
+            consensus_bam: consensus_path,
+            grouped_bam: grouped_path,
+            reference: ref_path,
+            output: output_path.clone(),
+            sample: None,
+            ignore_ns: false,
+            maf: 0.05,
+        }
+        .execute("test")
+        .expect("execute should succeed");
+
+        let rows = test_utils::read_review_rows(&output_path.with_extension("txt"));
+        let frag: Vec<&Vec<String>> =
+            rows[1..].iter().filter(|r| r[COL_CONSENSUS_READ].starts_with("FRAG")).collect();
+        assert!(!frag.is_empty(), "expected a row for FRAG");
+        for r in frag {
+            assert_eq!(r[COL_CONSENSUS_READ], "FRAG/1", "unpaired read must use the /1 suffix");
+        }
     }
 }
