@@ -421,6 +421,10 @@ impl Command for CorrectUmis {
             self.io.pipeline_reader_opts(),
         )?;
 
+        // Synthesize @HD VN:1.6 SO:unsorted when the input lacks one (match fgbio,
+        // which never passes a header-less BAM straight through).
+        let header = crate::commands::common::ensure_hd_record(header)?;
+
         // Add @PG record with PP chaining to input's last program
         let header = crate::commands::common::add_pg_record(header, command_line)?;
 
@@ -1894,6 +1898,55 @@ mod tests {
 
         assert_eq!(read_bam_record_names(&paths.output)?.len(), 0);
         assert_eq!(read_bam_record_names(&paths.rejects)?.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_synthesizes_hd_when_input_lacks_one() -> Result<()> {
+        // `create_test_bam` writes a header with only @SQ (no @HD) -- the same
+        // shape as the old `simulate correct-reads` 0.1.3 fixtures. fgbio's
+        // CorrectUmis synthesizes `@HD VN:1.6 SO:unsorted`; fgumi must match
+        // instead of passing a header-less BAM straight through (which yields a
+        // BAM whose header starts at @PG).
+        use noodles::sam::header::record::value::map::header::{Version, tag as header_tag};
+
+        let input_file = create_test_bam(vec![("q1", Some("AAAAAA"))])?;
+        let paths = TestPaths::new()?;
+
+        let corrector = CorrectUmis {
+            io: BamIoOptions {
+                input: input_file.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
+            rejects_opts: RejectsOptions { rejects: None },
+            metrics: None,
+            max_mismatches: 2,
+            min_distance_diff: 2,
+            umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
+            umi_files: vec![],
+            dont_store_original_umis: false,
+            cache_size: 100_000,
+            min_corrected: None,
+            revcomp: false,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+        };
+
+        corrector.execute("test")?;
+
+        let mut reader = noodles::bam::io::reader::Builder.build_from_path(&paths.output)?;
+        let header = reader.read_header()?;
+        let hd = header.header().expect("output BAM must carry an @HD line");
+        assert_eq!(hd.version(), Version::new(1, 6), "@HD VN must be 1.6");
+        assert_eq!(
+            hd.other_fields().get(&header_tag::SORT_ORDER).map(|v| v.to_vec()),
+            Some(b"unsorted".to_vec()),
+            "@HD SO must be 'unsorted' to match fgbio",
+        );
 
         Ok(())
     }

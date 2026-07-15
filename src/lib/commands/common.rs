@@ -112,6 +112,14 @@ pub fn add_pg_record(header: Header, command_line: &str) -> anyhow::Result<Heade
     fgumi_bam_io::header::add_pg_record(header, crate::version::VERSION.as_str(), command_line)
 }
 
+/// Ensure the header carries an `@HD` line, synthesizing `@HD VN:1.6 SO:unsorted`
+/// when it is absent (matching fgbio).
+///
+/// Wraps [`fgumi_bam_io::header::ensure_hd_record`].
+pub fn ensure_hd_record(header: Header) -> anyhow::Result<Header> {
+    fgumi_bam_io::header::ensure_hd_record(header)
+}
+
 /// Add a @PG record to a header builder, using the current fgumi version.
 ///
 /// Wraps [`fgumi_bam_io::header::add_pg_to_builder`] with the binary's version string.
