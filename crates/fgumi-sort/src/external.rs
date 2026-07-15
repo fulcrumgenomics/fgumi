@@ -3487,6 +3487,63 @@ pub fn extract_template_key_inline(
     };
     let name_hash = lib_lookup.hash_name(name);
 
+    // Secondary/supplementary reads cannot reconstruct their template coordinate
+    // from their own record (they carry their own and their mate's position, but
+    // not their own primary's). When `fgumi zipper` has stamped the exact
+    // template coordinate into the `tc` tag, key on it so the read sorts at its
+    // primary pair's coordinate — a placement per-record keying (samtools/fgbio)
+    // cannot achieve. Falls through to the position-based computation when absent.
+    let is_secondary = (flag & flags::SECONDARY) != 0;
+    let is_supplementary = (flag & flags::SUPPLEMENTARY) != 0;
+    if is_secondary || is_supplementary {
+        let aux_slice = fgumi_raw_bam::aux_data_slice(bam_bytes);
+        if let Some([tid1, pos1, neg1, tid2, pos2, neg2]) =
+            fgumi_raw_bam::read_tc_template_coordinate(aux_slice)
+        {
+            // `tc` is canonicalized by (tid, pos) only (see zipper's
+            // `add_template_coordinate_tags_raw`), whereas the per-record path
+            // additionally tiebreaks on strand for equal positions. In the
+            // degenerate case where both primaries share an identical tid and
+            // unclipped-5' position but differ in strand, the supplementary's
+            // secondary-lane strand order can differ from its primaries'. This is
+            // harmless: the primary lane (tid1, tid2, pos1) still matches, so the
+            // read co-locates with its template; only a same-coordinate tiebreak
+            // differs.
+            //
+            // `TemplateKey::new`'s final argument is the `is_upper` bit, packed
+            // into `name_hash_upper` as the *last* tiebreak (after position,
+            // strand, CB, library, MI, and name). For a mapped read it answers
+            // "is this read's own primary the upper (lane-2) end?", derived from
+            // this read's position vs. its mate. A secondary/supplementary read
+            // cannot recover that: `tc` is canonicalized by (tid, pos) and does
+            // not record which segment (R1/R2) landed on which lane, and the
+            // read's own alignment position is exactly the misleading coordinate
+            // this branch exists to avoid. We use `is_read2` because it mirrors
+            // the primary's `is_upper` for the standard FR pair (R1 is the lower
+            // lane -> is_upper=false; R2 is the upper lane -> is_upper=true) and
+            // is fully deterministic; see
+            // `test_extract_template_key_secondary_supplementary_matches_primary_via_tc`,
+            // which asserts the tc-keyed key is byte-identical to the primary's.
+            // Any residual disagreement (an exotic pair whose R2 is the lower
+            // lane) only reorders same-name records at an identical coordinate,
+            // so it cannot affect co-location or dedup grouping.
+            let is_read2 = (flag & 0x80) != 0;
+            return TemplateKey::new(
+                tid1,
+                pos1,
+                neg1 != 0,
+                tid2,
+                pos2,
+                neg2 != 0,
+                cb_hash,
+                library,
+                mi,
+                name_hash,
+                is_read2,
+            );
+        }
+    }
+
     // Handle unmapped reads
     if is_unmapped {
         if is_paired && !mate_unmapped {
@@ -3848,9 +3905,11 @@ fn dropped_lane_error(name: &str, v: DroppedLaneViolation) -> anyhow::Error {
 mod tests {
     use super::*;
     use bstr::BString;
+    use fgumi_raw_bam::flags;
     use fgumi_sam::{PairBuilder, SamBuilder};
     use noodles::sam::header::record::value::Map;
     use noodles::sam::header::record::value::map::ReadGroup;
+    use rstest::rstest;
 
     // ========================================================================
     // process_umask concurrency
@@ -4431,6 +4490,210 @@ mod tests {
         let key2 =
             extract_template_key_inline(&bam, &lib_lookup, Some(SamTag::CB), &test_cb_hasher());
         assert_eq!(key1.cb_hash, key2.cb_hash, "same input should produce same cb_hash");
+    }
+
+    /// Encode a `tc:B:i` aux tag carrying the 6-element template-coordinate
+    /// array `[tid1, pos1, neg1, tid2, pos2, neg2]` that `fgumi zipper` stamps
+    /// onto secondary/supplementary reads.
+    fn tc_aux(vals: &[i32; 6]) -> Vec<u8> {
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"tcB"); // tag "tc", array type 'B'
+        aux.push(b'i'); // subtype: int32
+        #[allow(clippy::cast_possible_truncation)]
+        aux.extend_from_slice(&(vals.len() as u32).to_le_bytes());
+        for v in vals {
+            aux.extend_from_slice(&v.to_le_bytes());
+        }
+        aux
+    }
+
+    /// Build minimal BAM bytes for a mapped secondary/supplementary alignment:
+    /// paired, mate mapped, at `own_pos`, with its mate at `mate_pos`, carrying the
+    /// caller-supplied `sec_supp_flag` (`flags::SECONDARY` or `flags::SUPPLEMENTARY`),
+    /// plus optional aux. Both flags route through the same `tc` keying branch.
+    #[allow(clippy::cast_possible_truncation)]
+    fn build_secondary_or_supplementary_bam(
+        own_pos: i32,
+        mate_pos: i32,
+        sec_supp_flag: u16,
+        name: &[u8],
+        aux: &[u8],
+    ) -> Vec<u8> {
+        let l_read_name = (name.len() + 1) as u8;
+        let mut bam = vec![0u8; 32];
+        bam[0..4].copy_from_slice(&0i32.to_le_bytes()); // ref_id = chr0
+        bam[4..8].copy_from_slice(&own_pos.to_le_bytes());
+        bam[8] = l_read_name;
+        // flags: PAIRED | (SECONDARY or SUPPLEMENTARY) -- mate is mapped.
+        bam[14..16].copy_from_slice(&(flags::PAIRED | sec_supp_flag).to_le_bytes());
+        bam[20..24].copy_from_slice(&0i32.to_le_bytes()); // mate ref_id = chr0
+        bam[24..28].copy_from_slice(&mate_pos.to_le_bytes());
+        bam.extend_from_slice(name);
+        bam.push(0);
+        bam.extend_from_slice(aux);
+        bam
+    }
+
+    /// Build minimal BAM bytes for a mapped primary read on `chr0` with the
+    /// caller-supplied `flag`, aligned at `own_pos` with its mate at `mate_pos`.
+    /// No CIGAR, so the unclipped 5' position equals `own_pos`/`mate_pos`. Used to
+    /// key the two primaries of a pair through the per-record (mapped) path so
+    /// their `TemplateKey`s can be compared against the tc-keyed sec/supp keys.
+    #[allow(clippy::cast_possible_truncation)]
+    fn build_primary_bam(own_pos: i32, mate_pos: i32, flag: u16, name: &[u8]) -> Vec<u8> {
+        let l_read_name = (name.len() + 1) as u8;
+        let mut bam = vec![0u8; 32];
+        bam[0..4].copy_from_slice(&0i32.to_le_bytes()); // ref_id = chr0
+        bam[4..8].copy_from_slice(&own_pos.to_le_bytes());
+        bam[8] = l_read_name;
+        bam[14..16].copy_from_slice(&flag.to_le_bytes());
+        bam[20..24].copy_from_slice(&0i32.to_le_bytes()); // mate ref_id = chr0
+        bam[24..28].copy_from_slice(&mate_pos.to_le_bytes());
+        bam.extend_from_slice(name);
+        bam.push(0);
+        bam
+    }
+
+    /// A secondary/supplementary alignment carries its own position and its mate's
+    /// position, but **not** its own primary's position. Per-record keying (samtools
+    /// / fgbio) can therefore only place it by the mate coordinate, which can drift a
+    /// fragment-length from the template's true coordinate. Because `fgumi zipper`
+    /// pre-computes the exact template coordinate into the `tc` tag, fgumi's
+    /// template-coordinate sort can place the read **exactly** at its primary pair's
+    /// coordinate — a placement samtools/fgbio cannot achieve. This is the novel
+    /// fgumi capability; both SECONDARY and SUPPLEMENTARY take the tc branch.
+    #[rstest]
+    #[case::secondary(flags::SECONDARY)]
+    #[case::supplementary(flags::SUPPLEMENTARY)]
+    fn test_extract_template_key_secondary_supplementary_uses_tc_tag(#[case] sec_supp_flag: u16) {
+        let header = Header::builder().build();
+        let lib_lookup = LibraryLookup::from_header(&header);
+
+        // Sec/supp of a left-anchored R1: the primary is at pos 1000, its mate (R2
+        // primary) at 1400, but this alignment is at 9000. The exact template
+        // coordinate (pos1) is 1000, carried in `tc`.
+        let tc = tc_aux(&[0, 1000, 0, 0, 1400, 1]);
+        let supp = build_secondary_or_supplementary_bam(9000, 1400, sec_supp_flag, b"tmpl", &tc);
+        let supp_key = extract_template_key_inline(&supp, &lib_lookup, None, &test_cb_hasher());
+
+        // A different template whose true coordinate (pos1) is 1200 — between the
+        // read's exact coordinate (1000, from tc) and the mate-only approximation
+        // (1400).
+        let filler = build_mapped_bam(0, 1200, b"fillr", &[]);
+        let filler_key = extract_template_key_inline(&filler, &lib_lookup, None, &test_cb_hasher());
+
+        assert!(
+            supp_key < filler_key,
+            "sec/supp must sort at its template coordinate (pos1=1000 via tc), before \
+             the pos1=1200 template; per-record keying misplaces it at the mate \
+             coordinate (1400), after the 1200 template"
+        );
+    }
+
+    /// Without a `tc` tag, a secondary/supplementary must fall back to the per-record
+    /// (own-position / mate) computation — the prior behavior — so the tc branch
+    /// never changes keying for reads zipper did not stamp.
+    #[rstest]
+    #[case::secondary(flags::SECONDARY)]
+    #[case::supplementary(flags::SUPPLEMENTARY)]
+    fn test_extract_template_key_secondary_supplementary_without_tc_falls_back(
+        #[case] sec_supp_flag: u16,
+    ) {
+        let header = Header::builder().build();
+        let lib_lookup = LibraryLookup::from_header(&header);
+
+        // Same geometry as the tc test, but no `tc` tag.
+        let supp = build_secondary_or_supplementary_bam(9000, 1400, sec_supp_flag, b"tmpl", &[]);
+        let supp_key = extract_template_key_inline(&supp, &lib_lookup, None, &test_cb_hasher());
+
+        // Fallback keys off the mate coordinate (1400), so it sorts AFTER the
+        // pos1=1200 template — the unchanged, pre-tc behavior.
+        let filler = build_mapped_bam(0, 1200, b"fillr", &[]);
+        let filler_key = extract_template_key_inline(&filler, &lib_lookup, None, &test_cb_hasher());
+
+        assert!(
+            supp_key > filler_key,
+            "without tc, a sec/supp keeps the per-record (mate=1400) placement"
+        );
+    }
+
+    /// Tie-case: with `(tid1, pos1, tid2, pos2)` held identical between a primary
+    /// pair and its tc-stamped sec/supp reads, the tc branch must place the
+    /// sec/supp read at the *exact same* `TemplateKey` as its primary — not merely
+    /// nearby. This is the strong property the reviewer asked for: it pins down the
+    /// full key (position lanes, strand lanes, CB, library, MI, name, **and** the
+    /// `is_upper`/`is_read2` tiebreak), verifying tc ordering matches the mapped
+    /// path rather than only asserting a coarse `<`/`>` placement.
+    ///
+    /// Geometry is a standard FR pair on `chr0`: R1 forward at unclipped-5' 1000
+    /// (the lower/lane-1 end), R2 reverse at 1400 (the upper/lane-2 end). The two
+    /// primaries key through the per-record path; the two sec/supp reads key
+    /// through the tc branch. `is_read2` mirrors the primary `is_upper` here (R1 ->
+    /// false, R2 -> true), so each sec/supp key is byte-identical to its primary's.
+    #[rstest]
+    #[case::secondary(flags::SECONDARY)]
+    #[case::supplementary(flags::SUPPLEMENTARY)]
+    fn test_extract_template_key_secondary_supplementary_matches_primary_via_tc(
+        #[case] sec_supp_flag: u16,
+    ) {
+        const FIRST_SEGMENT: u16 = 0x40;
+        const SECOND_SEGMENT: u16 = 0x80;
+        const REVERSE: u16 = 0x10;
+        const MATE_REVERSE: u16 = 0x20;
+
+        let header = Header::builder().build();
+        let lib_lookup = LibraryLookup::from_header(&header);
+        let key =
+            |bam: &[u8]| extract_template_key_inline(bam, &lib_lookup, None, &test_cb_hasher());
+
+        // Primaries through the per-record path. R1 (forward, lower) is lane 1;
+        // R2 (reverse, upper) is lane 2. Both canonicalize to the same coordinate.
+        let r1_primary =
+            build_primary_bam(1000, 1400, flags::PAIRED | FIRST_SEGMENT | MATE_REVERSE, b"tmpl");
+        let r2_primary =
+            build_primary_bam(1400, 1000, flags::PAIRED | SECOND_SEGMENT | REVERSE, b"tmpl");
+        let r1_primary_key = key(&r1_primary);
+        let r2_primary_key = key(&r2_primary);
+
+        // The two primaries co-locate but differ only in the is_upper tiebreak.
+        assert_eq!(
+            r1_primary_key.core_cmp(&r2_primary_key),
+            std::cmp::Ordering::Equal,
+            "the pair's two primaries share (tid1, pos1, tid2, pos2)"
+        );
+        assert_ne!(
+            r1_primary_key, r2_primary_key,
+            "primaries differ only in the is_upper tiebreak (R1 lower, R2 upper)"
+        );
+
+        // Sec/supp reads through the tc branch, stamped with the pair's exact
+        // canonical template coordinate, but aligned far away (own pos 9000).
+        let tc = tc_aux(&[0, 1000, 0, 0, 1400, 1]);
+        let r1_ss = build_secondary_or_supplementary_bam(
+            9000,
+            1400,
+            sec_supp_flag | FIRST_SEGMENT,
+            b"tmpl",
+            &tc,
+        );
+        let r2_ss = build_secondary_or_supplementary_bam(
+            9000,
+            1000,
+            sec_supp_flag | SECOND_SEGMENT,
+            b"tmpl",
+            &tc,
+        );
+
+        assert_eq!(
+            key(&r1_ss),
+            r1_primary_key,
+            "R1 sec/supp keyed via tc must be byte-identical to the R1 primary key"
+        );
+        assert_eq!(
+            key(&r2_ss),
+            r2_primary_key,
+            "R2 sec/supp keyed via tc must be byte-identical to the R2 primary key"
+        );
     }
 
     #[test]

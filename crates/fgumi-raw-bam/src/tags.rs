@@ -475,6 +475,36 @@ fn parse_array_tag_at(aux_data: &[u8], data_start: usize) -> Option<ArrayTagRef<
     Some(ArrayTagRef { data: &aux_data[elements_start..elements_end], elem_type, count, elem_size })
 }
 
+/// Read the `tc` template-coordinate tag from aux data.
+///
+/// `fgumi zipper` stamps the exact template coordinate of the primary pair onto
+/// secondary/supplementary reads as a 6-element `B:i` array
+/// `[tid1, pos1, neg1, tid2, pos2, neg2]` (canonically ordered `tid1 <= tid2`).
+/// This lets the template-coordinate sort and dedup place a supplementary read at
+/// its primary pair's coordinate — which a supplementary record cannot otherwise
+/// reconstruct, since it carries its own and its mate's position but not its own
+/// primary's.
+///
+/// Returns `None` when the tag is absent or is not a 6-element `B:i` array.
+#[must_use]
+pub fn read_tc_template_coordinate(aux_data: &[u8]) -> Option<[i32; 6]> {
+    let arr = find_array_tag(aux_data, [b't', b'c'])?;
+    if arr.elem_type != b'i' || arr.count != 6 {
+        return None;
+    }
+    let mut out = [0i32; 6];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let off = i * 4;
+        *slot = i32::from_le_bytes([
+            arr.data[off],
+            arr.data[off + 1],
+            arr.data[off + 2],
+            arr.data[off + 3],
+        ]);
+    }
+    Some(out)
+}
+
 /// Zero-copy typed BAM aux tag value.
 ///
 /// Borrows directly into the raw record bytes — no allocation, no decode beyond the tag header.

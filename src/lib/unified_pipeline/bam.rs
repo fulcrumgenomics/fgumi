@@ -448,6 +448,37 @@ pub fn compute_group_key_from_raw(
     let is_secondary = (flg & fgumi_raw_bam::flags::SECONDARY) != 0;
     let is_supplementary = (flg & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0;
     if is_secondary || is_supplementary {
+        // A secondary/supplementary read cannot compute its own template
+        // coordinate (it lacks its own primary's position). When `fgumi zipper`
+        // has stamped the exact coordinate into `tc`, key on it so the read
+        // groups into the same position group as its primary — instead of an
+        // UNKNOWN position that relies on the read sorting adjacent to its
+        // primary. Library/cell are extracted the same way as primaries so the
+        // position key matches (they share their template's RG/CB).
+        let aux_offset = fgumi_raw_bam::aux_data_offset_from_record(raw).unwrap_or(raw.len());
+        let aux_data = &raw[aux_offset..];
+        if let Some([tid1, pos1, neg1, tid2, pos2, neg2]) =
+            fgumi_raw_bam::read_tc_template_coordinate(aux_data)
+        {
+            let cell_tag_bytes = cell_tag.map_or([0u8; 2], |t| [t.as_ref()[0], t.as_ref()[1]]);
+            let aux_tags =
+                fgumi_raw_bam::extract_aux_string_tags(aux_data, cell_tag_bytes, umi_tag);
+            let library_idx =
+                aux_tags.rg.map_or(0, |rg| library_index.get(LibraryIndex::hash_rg(rg)));
+            let cell_hash = aux_tags.cell.map_or(0, |cb| LibraryIndex::hash_cell_barcode(Some(cb)));
+            let key = GroupKey::paired(
+                tid1,
+                pos1,
+                u8::from(neg1 != 0),
+                tid2,
+                pos2,
+                u8::from(neg2 != 0),
+                library_idx,
+                cell_hash,
+                name_hash,
+            );
+            return (key, None);
+        }
         return (GroupKey { name_hash, ..GroupKey::default() }, None);
     }
 
@@ -4930,6 +4961,82 @@ mod tests {
         let decoded = decode_records(&batch, &cfg).expect("decode succeeds");
         assert_eq!(decoded.len(), 1);
         assert!(decoded[0].cached_umi().is_none());
+    }
+
+    /// A secondary/supplementary read carries the exact template coordinate of its
+    /// primary pair in the `tc` tag (stamped by `fgumi zipper`). dedup must key such
+    /// a read into the SAME position group as its primary — rather than an UNKNOWN
+    /// position that relies on the read happening to sort adjacent to its primary.
+    ///
+    /// This asserts the stronger property: the tc-derived key is byte-for-byte equal
+    /// to the *real* primary pair's group key (computed independently from the primary
+    /// reads), not merely that its fields echo the raw tc values. Both the SECONDARY
+    /// and SUPPLEMENTARY flags take the tc branch, so both are exercised. Only fgumi
+    /// can do this, because only fgumi persists `tc`.
+    #[rstest]
+    #[case::secondary(fgumi_raw_bam::flags::SECONDARY)]
+    #[case::supplementary(fgumi_raw_bam::flags::SUPPLEMENTARY)]
+    fn test_group_key_secondary_supplementary_matches_primary_via_tc(#[case] sec_supp_flag: u16) {
+        use crate::unified_pipeline::GroupKey;
+        use fgumi_raw_bam::{SamBuilder as RawSamBuilder, flags as raw_flags};
+
+        let header = Header::default();
+        let library_index = LibraryIndex::from_header(&header);
+
+        // Build the REAL R1 primary of the pair: forward, ref 0, mate reverse and
+        // downstream (its unclipped 5' resolved from the MC tag). Its group key is
+        // the template's true position group — the target the sec/supp must join.
+        let mut r1 = RawSamBuilder::new();
+        r1.read_name(b"tmpl")
+            .sequence(b"ACGTACGT")
+            .qualities(&[30u8; 8])
+            .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT | raw_flags::MATE_REVERSE)
+            .ref_id(0)
+            .pos(999)
+            .mapq(60)
+            .cigar_ops(&[8u32 << 4]) // 8M
+            .mate_ref_id(0)
+            .mate_pos(1392);
+        r1.add_string_tag(SamTag::MC, b"8M"); // mate cigar → mate unclipped 5'
+        let r1 = r1.build();
+        let (primary_key, _) = compute_group_key_from_raw(r1.as_ref(), &library_index, None, None);
+
+        // Sanity: the primary produced a real two-lane paired key, not a fallback.
+        assert_ne!(primary_key.pos2, GroupKey::UNKNOWN_POS, "primary must be a paired key");
+        assert_ne!(primary_key.pos1, primary_key.pos2, "the two lanes differ in position");
+
+        // Stamp the primary's template coordinate into the 6-element `tc` array that
+        // zipper writes, and hang it on a sec/supp read whose OWN alignment is far
+        // away (pos 9000) — exactly the case where per-record keying misplaces it at
+        // its own/mate coordinate instead of the template's.
+        let tc = [
+            primary_key.ref_id1,
+            primary_key.pos1,
+            i32::from(primary_key.strand1),
+            primary_key.ref_id2,
+            primary_key.pos2,
+            i32::from(primary_key.strand2),
+        ];
+        let mut ss = RawSamBuilder::new();
+        ss.read_name(b"tmpl")
+            .sequence(b"ACGTACGT")
+            .qualities(&[30u8; 8])
+            .flags(raw_flags::PAIRED | sec_supp_flag)
+            .ref_id(0)
+            .pos(9000)
+            .mapq(60)
+            .cigar_ops(&[8u32 << 4])
+            .mate_ref_id(0)
+            .mate_pos(1392);
+        ss.add_array_i32(SamTag::TC, &tc);
+        let ss = ss.build();
+        let (ss_key, _) = compute_group_key_from_raw(ss.as_ref(), &library_index, None, None);
+
+        assert_eq!(
+            ss_key, primary_key,
+            "sec/supp read keyed via tc must group IDENTICALLY to its primary pair, \
+             not at its own (pos=9000) alignment"
+        );
     }
 
     #[test]
