@@ -137,6 +137,17 @@ The following external FFI calls are approved because they back core infrastruct
 - **`mach2`** (`crates/fgumi-sort/src/memory_probe.rs`, macOS only) — `task_info(TASK_VM_INFO)`
   is the only way to read `phys_footprint` (the RSS metric mimalloc reports accurately).
   Isolated to the same sub-module as the mimalloc FFI.
+- **`libc::umask`** (`crates/fgumi-sort/src/external.rs`, Unix only) — the merge command writes
+  its output through an atomic temp+persist (`MergeOutputTarget`) so a rejected/failed merge
+  never leaves a partial file. A `NamedTempFile` is created `0600`, so the persisted output must
+  be re-stamped with the mode a plain `File::create` would have produced. For a new file that is
+  `0o666 & !umask`, and reading the process `umask` requires the libc binding (POSIX `umask(2)`
+  only *sets* the mask, returning the previous value, so `process_umask` sets it to `0` and
+  restores it in the next call). The call is isolated to a single `#[allow(unsafe_code)]` site
+  with a `// SAFETY:` note; it has no preconditions and cannot fail. The read-modify-restore is
+  not atomic, so a process-global `Mutex` (`UMASK_LOCK`) serializes concurrent probes — required
+  because `fgumi_lib` is a library and callers may run merges concurrently in one process;
+  without the lock two interleaved probes could leave the process mask permanently `0`.
 
 ### Approved hot-path unsafe (sort engine)
 

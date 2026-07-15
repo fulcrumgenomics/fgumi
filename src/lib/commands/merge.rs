@@ -146,8 +146,9 @@ impl Command for Merge {
         }
         info!("Threads: {}", self.threads);
 
-        // Read and merge headers from all inputs
-        let header = merge_headers(&input_paths)?;
+        // Read and merge headers from all inputs (also validates each input's
+        // declared sort order against --order; MERGE3-01 fast check).
+        let header = merge_headers(&input_paths, self.order)?;
 
         let mut sorter = RawExternalSorter::new(self.order.into())
             .threads(self.threads)
@@ -168,13 +169,106 @@ impl Command for Merge {
     }
 }
 
+/// A BAM header's *declared* sort order, as far as merge validation cares.
+///
+/// `classify_declared_order` returns `None` when the header asserts no usable
+/// order (`SO` absent, or `SO:unsorted` without the template-coordinate
+/// sub-sort). Those inputs pass the fast header check and are instead verified
+/// record-by-record during the merge (the streaming monotonicity check).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeclaredOrder {
+    Coordinate,
+    Queryname,
+    TemplateCoordinate,
+}
+
+impl DeclaredOrder {
+    fn as_str(self) -> &'static str {
+        match self {
+            DeclaredOrder::Coordinate => "coordinate",
+            DeclaredOrder::Queryname => "queryname",
+            DeclaredOrder::TemplateCoordinate => "template-coordinate",
+        }
+    }
+}
+
+/// Classifies a header's declared sort order for merge-input validation.
+fn classify_declared_order(header: &Header) -> Option<DeclaredOrder> {
+    use noodles::sam::header::record::value::map::header::sort_order::{COORDINATE, QUERY_NAME};
+    if fgumi_sam::is_template_coordinate_sorted(header) {
+        Some(DeclaredOrder::TemplateCoordinate)
+    } else if fgumi_sam::is_sorted(header, COORDINATE) {
+        Some(DeclaredOrder::Coordinate)
+    } else if fgumi_sam::is_sorted(header, QUERY_NAME) {
+        Some(DeclaredOrder::Queryname)
+    } else {
+        None
+    }
+}
+
+/// The declared order an input must carry to be compatible with merge `order`.
+fn expected_declared_order(order: SortOrderArg) -> DeclaredOrder {
+    match order {
+        SortOrderArg::Coordinate => DeclaredOrder::Coordinate,
+        SortOrderArg::Queryname | SortOrderArg::QuerynameNatural => DeclaredOrder::Queryname,
+        SortOrderArg::TemplateCoordinate => DeclaredOrder::TemplateCoordinate,
+    }
+}
+
+/// The `fgumi sort --order` value string for an order (used in error hints).
+fn order_flag_value(order: SortOrderArg) -> &'static str {
+    match order {
+        SortOrderArg::Coordinate => "coordinate",
+        SortOrderArg::Queryname => "queryname",
+        SortOrderArg::QuerynameNatural => "queryname::natural",
+        SortOrderArg::TemplateCoordinate => "template-coordinate",
+    }
+}
+
+/// MERGE3-01 (fast header check): reject an input whose header *declares* a sort
+/// order that conflicts with the requested merge `order`.
+///
+/// The k-way merge only yields globally-sorted output if every input is already
+/// sorted in `order`; a coordinate-sorted BAM fed to the default
+/// `--order template-coordinate` merge (or any declared mismatch) silently
+/// corrupts the output with a success exit. This catches the common footgun
+/// before any records are read. Inputs that declare no usable order pass here
+/// and are verified record-by-record during the merge instead.
+///
+/// # Errors
+///
+/// Returns an error if the header declares an order that conflicts with `order`.
+fn check_input_declared_order(header: &Header, order: SortOrderArg, source: &str) -> Result<()> {
+    let expected = expected_declared_order(order);
+    if let Some(declared) = classify_declared_order(header) {
+        if declared != expected {
+            // `{source}` names the input for identification only; the remediation
+            // command uses a `<input>` placeholder (matching the streaming-verify
+            // error) so a path with shell metacharacters can't turn the
+            // copy-pasteable hint into something unexpected.
+            bail!(
+                "Input '{source}' is sorted by {declared} but merge was asked for --order \
+                 {requested}. Every input must already be sorted in the merge order, or the \
+                 k-way merge silently corrupts the output.\n\nEither merge in the inputs' \
+                 existing order:\n  fgumi merge --order {declared} ...\nor sort the inputs to \
+                 {requested} first:\n  fgumi sort -i <input> -o sorted.bam --order {requested}",
+                declared = declared.as_str(),
+                requested = order_flag_value(order),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Merge headers from multiple BAM files.
 ///
 /// Uses the first input's reference sequences and header line as the base.
 /// Combines read groups and program records from all inputs, with earlier
 /// inputs taking precedence for duplicate IDs (matching `samtools merge`).
-/// Validates that all inputs share the same reference sequences (names and order).
-fn merge_headers(input_paths: &[PathBuf]) -> Result<Header> {
+/// Validates that all inputs share the same reference sequences (names and order)
+/// and that each input's declared sort order is compatible with `order`
+/// (MERGE3-01 fast check).
+fn merge_headers(input_paths: &[PathBuf], order: SortOrderArg) -> Result<Header> {
     if input_paths.is_empty() {
         bail!("No input files to merge headers from");
     }
@@ -187,6 +281,13 @@ fn merge_headers(input_paths: &[PathBuf]) -> Result<Header> {
             Ok(header)
         })
         .collect::<Result<Vec<_>>>()?;
+
+    // MERGE3-01: reject any input whose declared order conflicts with the merge
+    // order (validated for every input, including the single-input case, since
+    // the output header is stamped with the requested order regardless).
+    for (path, header) in input_paths.iter().zip(headers.iter()) {
+        check_input_declared_order(header, order, &path.display().to_string())?;
+    }
 
     let first_header = &headers[0];
 
@@ -309,8 +410,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let bam = write_bam_with_read_groups(dir.path(), "single", &["RG1", "RG2"]);
 
-        let header =
-            merge_headers(std::slice::from_ref(&bam)).expect("merge_headers should succeed");
+        let header = merge_headers(std::slice::from_ref(&bam), SortOrderArg::Coordinate)
+            .expect("merge_headers should succeed");
 
         // Should be the same header (same RGs)
         let rg_ids: Vec<String> =
@@ -326,7 +427,8 @@ mod tests {
         let bam_a = write_bam_with_read_groups(dir.path(), "a", &["RG1"]);
         let bam_b = write_bam_with_read_groups(dir.path(), "b", &["RG2"]);
 
-        let header = merge_headers(&[bam_a, bam_b]).expect("merge_headers should succeed");
+        let header = merge_headers(&[bam_a, bam_b], SortOrderArg::Coordinate)
+            .expect("merge_headers should succeed");
 
         let rg_ids: Vec<String> =
             header.read_groups().iter().map(|(id, _)| id.to_string()).collect();
@@ -342,7 +444,8 @@ mod tests {
         let bam_a = write_bam_with_read_groups(dir.path(), "a", &["RG1"]);
         let bam_b = write_bam_with_read_groups(dir.path(), "b", &["RG1", "RG2"]);
 
-        let header = merge_headers(&[bam_a, bam_b]).expect("merge_headers should succeed");
+        let header = merge_headers(&[bam_a, bam_b], SortOrderArg::Coordinate)
+            .expect("merge_headers should succeed");
 
         let rg_ids: Vec<String> =
             header.read_groups().iter().map(|(id, _)| id.to_string()).collect();
@@ -390,7 +493,7 @@ mod tests {
         let bam_a = write_bam_with_refs(dir.path(), "a", &["chr1", "chr2"]);
         let bam_b = write_bam_with_refs(dir.path(), "b", &["chr1"]);
 
-        let result = merge_headers(&[bam_a, bam_b]);
+        let result = merge_headers(&[bam_a, bam_b], SortOrderArg::Coordinate);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("Reference sequence count mismatch"), "unexpected error: {msg}");
@@ -402,7 +505,7 @@ mod tests {
         let bam_a = write_bam_with_refs(dir.path(), "a", &["chr1", "chr2"]);
         let bam_b = write_bam_with_refs(dir.path(), "b", &["chr1", "chrX"]);
 
-        let result = merge_headers(&[bam_a, bam_b]);
+        let result = merge_headers(&[bam_a, bam_b], SortOrderArg::Coordinate);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("Reference sequence mismatch"), "unexpected error: {msg}");
@@ -453,5 +556,89 @@ mod tests {
         let rg_ids: Vec<String> =
             header.read_groups().iter().map(|(id, _)| id.to_string()).collect();
         assert_eq!(rg_ids.len(), 2);
+    }
+
+    /// MERGE3-01 fast header check: an input whose header *declares* an order
+    /// conflicting with `--order` is rejected; matching or undeclared inputs pass
+    /// (undeclared ones are verified record-by-record during the merge instead).
+    #[rstest::rstest]
+    // Declared coordinate.
+    #[case::coord_ok("@HD\tVN:1.6\tSO:coordinate\n", SortOrderArg::Coordinate, true)]
+    #[case::coord_into_tc("@HD\tVN:1.6\tSO:coordinate\n", SortOrderArg::TemplateCoordinate, false)]
+    #[case::coord_into_qname("@HD\tVN:1.6\tSO:coordinate\n", SortOrderArg::Queryname, false)]
+    // Declared queryname (both lex and natural merges accept a queryname header).
+    #[case::qname_ok("@HD\tVN:1.6\tSO:queryname\n", SortOrderArg::Queryname, true)]
+    #[case::qname_natural_ok("@HD\tVN:1.6\tSO:queryname\n", SortOrderArg::QuerynameNatural, true)]
+    #[case::qname_into_coord("@HD\tVN:1.6\tSO:queryname\n", SortOrderArg::Coordinate, false)]
+    #[case::qname_into_tc("@HD\tVN:1.6\tSO:queryname\n", SortOrderArg::TemplateCoordinate, false)]
+    // Declared template-coordinate.
+    #[case::tc_ok(
+        "@HD\tVN:1.6\tSO:unsorted\tGO:query\tSS:template-coordinate\n",
+        SortOrderArg::TemplateCoordinate,
+        true
+    )]
+    #[case::tc_into_coord(
+        "@HD\tVN:1.6\tSO:unsorted\tGO:query\tSS:template-coordinate\n",
+        SortOrderArg::Coordinate,
+        false
+    )]
+    #[case::tc_into_qname(
+        "@HD\tVN:1.6\tSO:unsorted\tGO:query\tSS:template-coordinate\n",
+        SortOrderArg::Queryname,
+        false
+    )]
+    // Undeclared: bare, plain unsorted, or query-grouped-without-SS → pass here.
+    #[case::bare_any("@HD\tVN:1.6\n", SortOrderArg::Coordinate, true)]
+    #[case::unsorted_any("@HD\tVN:1.6\tSO:unsorted\n", SortOrderArg::TemplateCoordinate, true)]
+    #[case::query_grouped_no_ss(
+        "@HD\tVN:1.6\tSO:unsorted\tGO:query\n",
+        SortOrderArg::TemplateCoordinate,
+        true
+    )]
+    fn test_check_input_declared_order(
+        #[case] header_str: &str,
+        #[case] order: SortOrderArg,
+        #[case] expect_ok: bool,
+    ) {
+        let header: Header = header_str.parse().expect("parse header");
+        let result = check_input_declared_order(&header, order, "in.bam");
+        assert_eq!(result.is_ok(), expect_ok, "header {header_str:?} into --order {order:?}");
+        if let Err(e) = result {
+            let msg = e.to_string();
+            assert!(msg.contains("in.bam"), "message missing source: {msg}");
+            assert!(msg.contains(order_flag_value(order)), "message missing order hint: {msg}");
+        }
+    }
+
+    /// MERGE3-01 hardening: the copy-pasteable remediation command must use a
+    /// fixed `<input>` placeholder, never the interpolated source path, so a
+    /// filename with shell metacharacters can't turn the hint into an unintended
+    /// command. The source is still named in the diagnostic text for identification.
+    #[test]
+    fn test_declared_order_error_does_not_interpolate_source_into_shell_command() {
+        // A coordinate header into a queryname merge triggers the declared-order
+        // conflict; the source path carries shell metacharacters.
+        let header: Header = "@HD\tVN:1.6\tSO:coordinate\n".parse().expect("parse header");
+        let malicious = "a'; rm -rf ~; echo '.bam";
+        let err = check_input_declared_order(&header, SortOrderArg::Queryname, malicious)
+            .expect_err("coordinate header into queryname merge must be rejected");
+        let msg = err.to_string();
+
+        // The remediation command uses the fixed placeholder...
+        assert!(
+            msg.contains("fgumi sort -i <input> -o sorted.bam"),
+            "remediation must use the <input> placeholder: {msg}"
+        );
+        // ...and the source path is never spliced into any `-i` argument.
+        assert!(
+            !msg.contains(&format!("-i '{malicious}'")),
+            "source path must not be interpolated into the sort command: {msg}"
+        );
+        assert!(
+            !msg.contains(&format!("-i {malicious}")),
+            "source path must not be interpolated into the sort command: {msg}"
+        );
+        // The source is still named for identification (in the descriptive text).
+        assert!(msg.contains(malicious), "message should still name the source: {msg}");
     }
 }
