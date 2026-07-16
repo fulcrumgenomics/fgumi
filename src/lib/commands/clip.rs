@@ -404,9 +404,13 @@ impl Clip {
     /// Clips a fragment (unpaired) read.
     ///
     /// Applies clipping operations to a single fragment read, including:
-    /// 1. Upgrading existing clipping if requested
-    /// 2. Applying fixed-position 5' and 3' clipping
-    /// 3. Updating metrics if a metrics collector is provided
+    /// 1. Applying fixed-position 5' and 3' clipping
+    /// 2. Updating metrics if a metrics collector is provided
+    ///
+    /// Clipping upgrades (`--upgrade-clipping`) are *not* performed here: the caller runs a
+    /// template-wide pre-pass that upgrades clipping on every read of the template (including
+    /// secondary/supplementary alignments) before this method runs, matching fgbio `ClipBam`
+    /// (`ClipBam.scala:123`).
     ///
     /// Fragment reads are treated as R1 for the purposes of fixed-position clipping.
     ///
@@ -466,11 +470,15 @@ impl Clip {
     /// Clips a pair of reads with comprehensive clipping logic.
     ///
     /// Applies multiple types of clipping to a read pair:
-    /// 1. Upgrading existing clipping if requested
-    /// 2. Fixed-position 5' and 3' clipping for each read
-    /// 3. Overlap clipping to remove duplicate coverage
-    /// 4. Mate-extension clipping to remove reads extending past mate start
-    /// 5. Updating metrics for both reads
+    /// 1. Fixed-position 5' and 3' clipping for each read
+    /// 2. Overlap clipping to remove duplicate coverage
+    /// 3. Mate-extension clipping to remove reads extending past mate start
+    /// 4. Updating metrics for both reads
+    ///
+    /// Clipping upgrades (`--upgrade-clipping`) are *not* performed here: the caller runs a
+    /// template-wide pre-pass that upgrades clipping on every read of the template (including
+    /// secondary/supplementary alignments) before this method runs, matching fgbio `ClipBam`
+    /// (`ClipBam.scala:123`).
     ///
     /// The method intelligently determines which read is R1 vs R2 based on SAM flags
     /// and applies the appropriate fixed-position clipping thresholds.

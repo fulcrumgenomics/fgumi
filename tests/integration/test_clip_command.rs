@@ -388,6 +388,29 @@ fn cigar_ops(rec: &RecordBuf) -> Vec<(CigarKind, usize)> {
     rec.cigar().as_ref().iter().map(|op| (op.kind(), op.len())).collect()
 }
 
+/// A record's identity for exact match/count assertions:
+/// `(name, flags, 1-based pos, 1-based mate-pos, CIGAR ops, SEQ bytes, QUAL scores)`.
+///
+/// SEQ and QUAL are included so a hard-clip upgrade that rewrites the CIGAR (e.g. `10S40M`
+/// -> `10H40M`) but fails to drop the hard-clipped bases from the payload — leaving 50
+/// SEQ/QUAL bytes under a 40-base-consuming CIGAR — is rejected, not silently accepted.
+type RecordIdentity = (String, u16, usize, usize, Vec<(CigarKind, usize)>, Vec<u8>, Vec<u8>);
+
+/// Extracts the [`RecordIdentity`] tuple from a mapped, mate-mapped record.
+fn record_identity(rec: &RecordBuf) -> RecordIdentity {
+    let name =
+        rec.name().map(|n| String::from_utf8_lossy(n.as_ref()).into_owned()).unwrap_or_default();
+    (
+        name,
+        u16::from(rec.flags()),
+        usize::from(rec.alignment_start().expect("mapped record has alignment start")),
+        usize::from(rec.mate_alignment_start().expect("record has mate alignment start")),
+        cigar_ops(rec),
+        rec.sequence().as_ref().to_vec(),
+        rec.quality_scores().as_ref().to_vec(),
+    )
+}
+
 /// The record's mate-CIGAR (`MC`) tag as a string, if present.
 fn mate_cigar(rec: &RecordBuf) -> Option<String> {
     use noodles::sam::alignment::record::data::field::Tag;
@@ -423,11 +446,13 @@ fn mapped_read(name: &[u8], flags: u16, pos: i32, match_len: u32, mapq: u8) -> R
 }
 
 /// Build a mapped read with an explicit CIGAR (raw BAM `(len << 4) | op` codes) and a
-/// matching-length sequence/qualities. `read_len` must equal the CIGAR's read-consuming length.
+/// matching-length sequence/qualities. `mate_pos` sets the mate's position (PNEXT); pass the
+/// mate read's start, not the read's own. `read_len` must equal the CIGAR's read-consuming length.
 fn read_with_cigar(
     name: &[u8],
     flags: u16,
     pos: i32,
+    mate_pos: i32,
     cigar_ops: &[u32],
     read_len: usize,
     mapq: u8,
@@ -442,7 +467,7 @@ fn read_with_cigar(
         .mapq(mapq)
         .cigar_ops(cigar_ops)
         .mate_ref_id(0)
-        .mate_pos(pos);
+        .mate_pos(mate_pos);
     b.build()
 }
 
@@ -465,6 +490,7 @@ fn run_supplementary_upgrade_case(threads: Option<&str>) {
         b"t",
         flags::PAIRED | flags::FIRST_SEGMENT | flags::SUPPLEMENTARY,
         199,
+        99, // mate = primary R2 at position 99, not the supplementary's own position
         &[(10u32 << 4) | 4, 40u32 << 4], // 10S40M
         50,
         60,
@@ -493,40 +519,73 @@ fn run_supplementary_upgrade_case(threads: Option<&str>) {
     let cmd = Clip::try_parse_from(&args).expect("failed to parse clip args");
     cmd.execute("fgumi clip").expect("Clip command failed");
 
-    let recs = read_output_records(&output_bam);
+    let recs = read_output_record_bufs(&output_bam);
     assert_eq!(recs.len(), 3, "all three reads retained");
 
-    // The supplementary read's leading 10S must have been upgraded to 10H.
-    let supp_out = recs
-        .iter()
-        .find(|(_, _, f)| f & flags::SUPPLEMENTARY != 0)
-        .expect("supplementary read present in output");
-    assert_eq!(
-        supp_out.1,
-        vec![(CigarKind::HardClip, 10), (CigarKind::Match, 40)],
-        "supplementary soft clip must be upgraded to hard (fgbio ClipBam.scala:123 upgrades \
-         template.allReads); got {:?}",
-        supp_out.1
-    );
-
-    // The primaries carried no clipping, so upgrade is a no-op on them.
-    for (_, ops, f) in &recs {
-        if f & flags::SUPPLEMENTARY == 0 {
-            assert_eq!(*ops, vec![(CigarKind::Match, 50)], "primary CIGAR must be unchanged");
-        }
+    // Assert the exact identity of all three expected records — (name, flags, 1-based pos,
+    // 1-based mate_pos, CIGAR) — each present exactly once. Count-only checks would pass even
+    // with two copies of the same primary, so this pins down every record.
+    //
+    // Values are hand-derived from the fixed inputs and the post-clip mate-info fixing:
+    //   * Only `--upgrade-clipping` (Hard) is on — no fixed/overlap/extension clipping — so both
+    //     primaries stay 50M and the supplementary's leading 10S is upgraded to 10H.
+    //   * `set_mate_info_raw` sets MATE_REVERSE on primary R1 (its mate R2 is reverse) and, via
+    //     `fix_supplemental_mate_info`, on the supplementary (its mate primary R2 is reverse); it
+    //     also points every read's mate at primary position 99 (0-based) => 100 (1-based).
+    // Fixtures build reads with SEQ = all `A` and QUAL = all 30 (`read_with_cigar` /
+    // `mapped_read`), so the unchanged 50M primaries keep 50 bytes each and the hard-clipped
+    // supplementary must drop its leading 10 to 40 bytes.
+    let expected: [RecordIdentity; 3] = [
+        // Primary R1: forward, unchanged 50M; MATE_REVERSE now set (mate R2 is reverse).
+        (
+            "t".to_string(),
+            flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE,
+            100,
+            100,
+            vec![(CigarKind::Match, 50)],
+            vec![b'A'; 50],
+            vec![30; 50],
+        ),
+        // Primary R2: reverse, unchanged 50M.
+        (
+            "t".to_string(),
+            flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE,
+            100,
+            100,
+            vec![(CigarKind::Match, 50)],
+            vec![b'A'; 50],
+            vec![30; 50],
+        ),
+        // Supplementary R1: leading 10S upgraded to 10H (fgbio ClipBam.scala:123 upgrades
+        // template.allReads); MATE_REVERSE set from the primary R2 mate. The hard clip drops the
+        // leading 10 bases, so SEQ/QUAL shrink 50 -> 40.
+        (
+            "t".to_string(),
+            flags::PAIRED | flags::FIRST_SEGMENT | flags::SUPPLEMENTARY | flags::MATE_REVERSE,
+            200,
+            100,
+            vec![(CigarKind::HardClip, 10), (CigarKind::Match, 40)],
+            vec![b'A'; 40],
+            vec![30; 40],
+        ),
+    ];
+    let actual: Vec<RecordIdentity> = recs.iter().map(record_identity).collect();
+    for want in &expected {
+        let count = actual.iter().filter(|got| *got == want).count();
+        assert_eq!(
+            count, 1,
+            "expected exactly one record matching {want:?}; got {count} in {actual:?}"
+        );
     }
 }
 
-/// Single-threaded path: `--upgrade-clipping` upgrades a supplementary alignment's clipping.
-#[test]
-fn test_upgrade_clipping_upgrades_supplementary_single_threaded() {
-    run_supplementary_upgrade_case(None);
-}
-
-/// `--threads` path: `--upgrade-clipping` upgrades a supplementary alignment's clipping.
-#[test]
-fn test_upgrade_clipping_upgrades_supplementary_threads_mode() {
-    run_supplementary_upgrade_case(Some("2"));
+/// `--upgrade-clipping` upgrades a supplementary alignment's clipping on both the single-threaded
+/// (`None`) and `--threads` (`Some("2")`) code paths.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::threaded(Some("2"))]
+fn test_upgrade_clipping_upgrades_supplementary(#[case] threads: Option<&str>) {
+    run_supplementary_upgrade_case(threads);
 }
 
 /// `--threads` mode routes through `execute_threads_mode`; exercise the `(Some, Some)` primary-pair
