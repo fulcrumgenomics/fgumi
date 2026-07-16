@@ -351,10 +351,15 @@ impl DuplexMetrics {
             ds_groups.clear();
             for m in &downsampled {
                 let entry = ds_groups.entry(m.base_umi).or_default();
-                if m.is_a_strand {
-                    entry.0 += 1;
-                } else if m.is_b_strand {
+                if m.is_b_strand {
                     entry.1 += 1;
+                } else {
+                    // /A or an unsuffixed MI counts toward the AB strand. fgbio treats a
+                    // single unsuffixed MI as Pair(ab=n, ba=0) — a valid single-strand DS
+                    // family (CollectDuplexSeqMetrics). Without this, unsuffixed families
+                    // get ds_size=0 and are silently dropped by the family-size histogram
+                    // (which iterates 1..=max), undercounting ds_families (DXM3-03).
+                    entry.0 += 1;
                 }
                 if is_full_fraction {
                     entry.2.push((
@@ -800,6 +805,212 @@ mod tests {
         };
         let err = cmd.execute("test").expect_err("must reject --min-ab-reads 0");
         assert!(err.to_string().contains("min-ab-reads must be >= 1"), "unexpected: {err}");
+        Ok(())
+    }
+
+    /// DXM3-07: the two strands of a duplex whose mates share an identical
+    /// (ref, unclipped-5') must co-group into ONE duplex family. Without a strand
+    /// tie-break in the canonical key they land in separate coordinate groups and are
+    /// reported as two single-strand (ab=1, ba=0) families instead of one (ab=1, ba=1).
+    #[test]
+    fn test_duplex_strands_cogroup_when_mates_share_five_prime() -> Result<()> {
+        // Palindromic fragment: both 5' ends map to reference position 100.
+        //   AB strand: R1 fwd @100 (5'=100), R2 rev @1 (5'=end=100), MI .../A
+        //   BA strand: R1 rev @1 (5'=100),  R2 fwd @100 (5'=100),    MI .../B
+        let mut records = Vec::new();
+        let (r1, r2) = build_test_pair("ab", 0, 100, 1, "AAA-TTT", "AAA-TTT/A", true, false);
+        records.push(r1);
+        records.push(r2);
+        let (r1, r2) = build_test_pair("ba", 0, 1, 100, "TTT-AAA", "AAA-TTT/B", false, true);
+        records.push(r1);
+        records.push(r2);
+
+        let input = create_test_bam(records)?;
+        let output_dir = TempDir::new()?;
+        let output = output_dir.path().join("output");
+
+        let cmd = DuplexMetrics {
+            input: input.path().to_path_buf(),
+            output: output.clone(),
+            min_ab_reads: 1,
+            min_ba_reads: 1,
+            duplex_umi_counts: false,
+            intervals: None,
+            description: None,
+        };
+        cmd.execute("test")?;
+
+        let duplex_family_path = format!("{}.duplex_family_sizes.txt", output.display());
+        let metrics: Vec<DuplexFamilySizeMetric> =
+            DelimFile::default().read_tsv(&duplex_family_path)?;
+
+        // Exactly one duplex family, with both strands observed (ab=1, ba=1).
+        let total: usize = metrics.iter().map(|m| m.count).sum();
+        assert_eq!(total, 1, "the two strands must form a single duplex family");
+        let family = metrics.iter().find(|m| m.count > 0).expect("one duplex family");
+        assert_eq!((family.ab_size, family.ba_size), (1, 1), "one read on each strand");
+        Ok(())
+    }
+
+    /// DXM3-02: reads from different libraries (RG -> LB) at the same coordinate/strand
+    /// must form SEPARATE families, not merge into one. fgbio's `ReadInfo` carries the
+    /// library; fgumi's own group/dedup partition by it too.
+    #[test]
+    fn test_families_partitioned_by_library() -> Result<()> {
+        use bstr::BString;
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::Value as BufValue;
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReadGroup;
+        use noodles::sam::header::record::value::map::ReferenceSequence;
+        use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
+
+        // Header: chr1 + two read groups with distinct libraries.
+        let rg_a = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("libA"))
+            .build()
+            .expect("read group A");
+        let rg_b = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("libB"))
+            .build()
+            .expect("read group B");
+        let header = sam::Header::builder()
+            .add_reference_sequence(
+                BString::from("chr1"),
+                Map::<ReferenceSequence>::new(
+                    NonZeroUsize::new(248_956_422).expect("non-zero length"),
+                ),
+            )
+            .add_read_group(BString::from("rgA"), rg_a)
+            .add_read_group(BString::from("rgB"), rg_b)
+            .build();
+
+        // Two templates at the same coordinate/strand, tagged to different read groups.
+        let rg_tag_id = Tag::new(b'R', b'G');
+        let mk = |name: &str, rg: &str| {
+            let (mut r1, mut r2) =
+                build_test_pair(name, 0, 100, 200, "AAA-TTT", "AAA-TTT/A", true, false);
+            r1.data_mut().insert(rg_tag_id, BufValue::String(rg.into()));
+            r2.data_mut().insert(rg_tag_id, BufValue::String(rg.into()));
+            [r1, r2]
+        };
+        let mut records = Vec::new();
+        records.extend(mk("q1", "rgA"));
+        records.extend(mk("q2", "rgB"));
+
+        let temp_file = NamedTempFile::new()?;
+        let mut writer = bam::io::writer::Builder.build_from_path(temp_file.path())?;
+        writer.write_header(&header)?;
+        for record in &records {
+            writer.write_alignment_record(&header, record)?;
+        }
+        drop(writer);
+
+        let output_dir = TempDir::new()?;
+        let output = output_dir.path().join("output");
+        let cmd = DuplexMetrics {
+            input: temp_file.path().to_path_buf(),
+            output: output.clone(),
+            min_ab_reads: 1,
+            min_ba_reads: 0,
+            duplex_umi_counts: false,
+            intervals: None,
+            description: None,
+        };
+        cmd.execute("test")?;
+
+        let family_path = format!("{}.family_sizes.txt", output.display());
+        let family_metrics: Vec<FamilySizeMetric> = DelimFile::default().read_tsv(&family_path)?;
+        let cs_families: usize = family_metrics.iter().map(|m| m.cs_count).sum();
+        assert_eq!(cs_families, 2, "different libraries must not merge into one CS family");
+        let size1 = family_metrics.iter().find(|m| m.family_size == 1).expect("size-1 row present");
+        assert_eq!(size1.cs_count, 2, "two CS families, each a single template");
+        Ok(())
+    }
+
+    /// DXM3-02: reads with different cell barcodes (CB) at the same
+    /// coordinate/strand/library must form SEPARATE families, not merge into one.
+    /// Mirrors `test_families_partitioned_by_library` for the `cell_barcode` key field,
+    /// which is otherwise unexercised (a regression dropping CB from the key would pass).
+    #[test]
+    fn test_families_partitioned_by_cell_barcode() -> Result<()> {
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::Value as BufValue;
+
+        // Two templates at the same coordinate/strand and (absent) library, tagged with
+        // distinct cell barcodes — they must not collapse into one family.
+        let cb_tag_id = Tag::new(b'C', b'B');
+        let mk = |name: &str, cb: &str| {
+            let (mut r1, mut r2) =
+                build_test_pair(name, 0, 100, 200, "AAA-TTT", "AAA-TTT/A", true, false);
+            r1.data_mut().insert(cb_tag_id, BufValue::String(cb.into()));
+            r2.data_mut().insert(cb_tag_id, BufValue::String(cb.into()));
+            [r1, r2]
+        };
+        let mut records = Vec::new();
+        records.extend(mk("q1", "CELL_A"));
+        records.extend(mk("q2", "CELL_B"));
+
+        let input = create_test_bam(records)?;
+        let output_dir = TempDir::new()?;
+        let output = output_dir.path().join("output");
+        let cmd = DuplexMetrics {
+            input: input.path().to_path_buf(),
+            output: output.clone(),
+            min_ab_reads: 1,
+            min_ba_reads: 0,
+            duplex_umi_counts: false,
+            intervals: None,
+            description: None,
+        };
+        cmd.execute("test")?;
+
+        let family_path = format!("{}.family_sizes.txt", output.display());
+        let family_metrics: Vec<FamilySizeMetric> = DelimFile::default().read_tsv(&family_path)?;
+        let cs_families: usize = family_metrics.iter().map(|m| m.cs_count).sum();
+        assert_eq!(cs_families, 2, "different cell barcodes must not merge into one CS family");
+        let size1 = family_metrics.iter().find(|m| m.family_size == 1).expect("size-1 row present");
+        assert_eq!(size1.cs_count, 2, "two CS families, each a single template");
+        Ok(())
+    }
+
+    /// DXM3-03: non-duplex (unsuffixed MI) input must still be counted as a
+    /// single-strand DS family (`ab=n`, `ba=0`, `ds_size=n`), matching fgbio — not dropped
+    /// via a size-0 family-size bucket.
+    #[test]
+    fn test_unsuffixed_mi_counts_as_single_strand_ds_family() -> Result<()> {
+        // Two read pairs at the same coordinate with an unsuffixed MI ("1").
+        let mut records = Vec::new();
+        let (r1, r2) = build_test_pair("q1", 0, 100, 200, "AAA-TTT", "1", true, false);
+        records.push(r1);
+        records.push(r2);
+        let (r1, r2) = build_test_pair("q2", 0, 100, 200, "AAA-TTT", "1", true, false);
+        records.push(r1);
+        records.push(r2);
+
+        let input = create_test_bam(records)?;
+        let output_dir = TempDir::new()?;
+        let output = output_dir.path().join("output");
+
+        let cmd = DuplexMetrics {
+            input: input.path().to_path_buf(),
+            output: output.clone(),
+            min_ab_reads: 1,
+            min_ba_reads: 0,
+            duplex_umi_counts: false,
+            intervals: None,
+            description: None,
+        };
+        cmd.execute("test")?;
+
+        let family_path = format!("{}.family_sizes.txt", output.display());
+        let family_metrics: Vec<FamilySizeMetric> = DelimFile::default().read_tsv(&family_path)?;
+
+        // Exactly one DS family, of size 2 (both reads on the AB strand).
+        let ds_families: usize = family_metrics.iter().map(|m| m.ds_count).sum();
+        assert_eq!(ds_families, 1, "unsuffixed-MI family must be counted, not dropped");
+        let size2 = family_metrics.iter().find(|m| m.family_size == 2).expect("size-2 row present");
+        assert_eq!(size2.ds_count, 1, "one DS family of size 2");
         Ok(())
     }
 

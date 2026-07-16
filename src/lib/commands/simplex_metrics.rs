@@ -139,7 +139,7 @@ impl Command for SimplexMetrics {
                     &mut collectors,
                     &mut umi_consensus_caller,
                     fraction_counts,
-                );
+                )?;
                 // simplex UMIs are N-component by design, so there is no
                 // wrong-segment-count guard (cf. DXM-03 for duplex).
                 Ok(())
@@ -227,15 +227,34 @@ impl SimplexMetrics {
         collectors: &mut [SimplexMetricsCollector],
         umi_consensus_caller: &mut SimpleUmiConsensusCaller,
         fraction_template_counts: &mut [usize],
-    ) {
+    ) -> Result<()> {
         use std::collections::HashMap;
 
         if group.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Pre-compute metadata once for the entire group
         let metadata = compute_template_metadata(group);
+
+        // SIMM3-01: simplex-metrics assumes single-strand (non-duplex) input. If a base
+        // UMI carries reads from BOTH the /A and /B strands, the input is duplex data:
+        // the per-base_umi RX consensus below would mix the two strands' swapped UMI
+        // orientations and produce garbage counts. Fail loud and point at duplex-metrics.
+        let mut base_umi_strands: HashMap<&str, (bool, bool)> = HashMap::new();
+        for m in &metadata {
+            let seen = base_umi_strands.entry(m.base_umi).or_default();
+            seen.0 |= m.is_a_strand;
+            seen.1 |= m.is_b_strand;
+            if seen.0 && seen.1 {
+                anyhow::bail!(
+                    "simplex-metrics received duplex-UMI data: base UMI '{}' has reads on \
+                     both the /A and /B strands. Run duplex-metrics for duplex data.",
+                    m.base_umi
+                );
+            }
+        }
+
         let last_fraction_idx = fractions.len() - 1;
 
         let mut ss_groups: HashMap<&str, usize> = HashMap::new();
@@ -301,6 +320,7 @@ impl SimplexMetrics {
                 }
             }
         }
+        Ok(())
     }
 
     /// Generates a yield metric from a collector at a specific downsampling fraction.
@@ -436,6 +456,58 @@ mod tests {
         (r1, r2)
     }
 
+    /// Like [`build_test_pair`] but with an explicit R1 strand, for constructing realistic
+    /// duplex geometry (the BA strand has R1 reverse and its mate positions swapped).
+    fn build_test_pair_stranded(
+        name: &str,
+        ref_id: usize,
+        pos1: i32,
+        pos2: i32,
+        rx_umi: &str,
+        mi_tag: &str,
+        r1_reverse: bool,
+    ) -> (sam::alignment::RecordBuf, sam::alignment::RecordBuf) {
+        let seq = vec![b'A'; 100];
+        let quals = vec![30u8; 100];
+        let cigar = encode_op(0, 100); // 100M
+        let (r1_rev, r1_mate_rev) =
+            if r1_reverse { (flags::REVERSE, 0) } else { (0, flags::MATE_REVERSE) };
+        let (r2_rev, r2_mate_rev) =
+            if r1_reverse { (0, flags::MATE_REVERSE) } else { (flags::REVERSE, 0) };
+
+        let mut b1 = RawSamBuilder::new();
+        b1.read_name(name.as_bytes())
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | r1_rev | r1_mate_rev)
+            .ref_id(ref_id as i32)
+            .pos(pos1 - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals)
+            .mate_ref_id(ref_id as i32)
+            .mate_pos(pos2 - 1);
+        b1.add_string_tag(SamTag::RX, rx_umi.as_bytes());
+        b1.add_string_tag(SamTag::MI, mi_tag.as_bytes());
+        let r1 = to_record_buf(b1.build());
+
+        let mut b2 = RawSamBuilder::new();
+        b2.read_name(name.as_bytes())
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | r2_rev | r2_mate_rev)
+            .ref_id(ref_id as i32)
+            .pos(pos2 - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals)
+            .mate_ref_id(ref_id as i32)
+            .mate_pos(pos1 - 1);
+        b2.add_string_tag(SamTag::RX, rx_umi.as_bytes());
+        b2.add_string_tag(SamTag::MI, mi_tag.as_bytes());
+        let r2 = to_record_buf(b2.build());
+
+        (r1, r2)
+    }
+
     fn create_test_bam(records: Vec<sam::alignment::RecordBuf>) -> Result<NamedTempFile> {
         let temp_file = NamedTempFile::new()?;
         let header = create_test_header();
@@ -465,6 +537,47 @@ mod tests {
         let err = cmd.execute("test").expect_err("must reject --min-reads 0");
         assert!(err.to_string().contains("min-reads must be >= 1"), "unexpected: {err}");
         Ok(())
+    }
+
+    /// SIMM3-01: simplex-metrics must reject duplex-UMI input (a base UMI observed on
+    /// both the /A and /B strands at one coordinate), rather than silently producing
+    /// garbage UMI counts from the mixed-orientation RX consensus.
+    #[test]
+    fn test_simplex_metrics_rejects_duplex_input() {
+        // Real duplex geometry for base UMI "1": the AB strand (R1 forward @100, R2
+        // reverse @200) and the BA strand (R1 reverse @200, R2 forward @100, UMI halves
+        // swapped) canonicalize to the same coordinate/strand key and so co-group.
+        let mut records = Vec::new();
+        let (r1, r2) = build_test_pair_stranded("q1", 0, 100, 200, "AAA-TTT", "1/A", false);
+        records.push(r1);
+        records.push(r2);
+        let (r1, r2) = build_test_pair_stranded("q2", 0, 200, 100, "TTT-AAA", "1/B", true);
+        records.push(r1);
+        records.push(r2);
+
+        let input = create_test_bam(records).expect("write test bam");
+        let output_dir = TempDir::new().expect("tempdir");
+        let output = output_dir.path().join("output");
+        let cmd = SimplexMetrics {
+            input: input.path().to_path_buf(),
+            output,
+            min_reads: 1,
+            intervals: None,
+            description: None,
+        };
+        let message =
+            cmd.execute("test").expect_err("duplex-UMI input must be rejected").to_string();
+        // Pin the full diagnostic contract, not just the word "duplex": the message must both
+        // name the offending input ("duplex-UMI data") and give the actionable next step (run
+        // "duplex-metrics"), so a regression that drops either half is caught.
+        assert!(
+            message.contains("duplex-UMI data"),
+            "error should name duplex-UMI data: {message}"
+        );
+        assert!(
+            message.contains("duplex-metrics"),
+            "error should point at duplex-metrics: {message}"
+        );
     }
 
     #[test]
