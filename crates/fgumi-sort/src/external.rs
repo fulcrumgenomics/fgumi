@@ -2632,7 +2632,12 @@ impl RawExternalSorter {
 
                 timer.time_sort(|| {
                     use rayon::prelude::*;
-                    rayon_pool.install(|| entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0)));
+                    // Stable sort: `entries` is in ingest order, so a stable sort keeps
+                    // exact-queryname-key ties in input order — matching `samtools sort -n`,
+                    // fgbio, and the arena/runall path. The loser-tree merge already breaks
+                    // cross-chunk ties by chunk (ingest) order, so this per-chunk stability
+                    // makes the whole queryname sort stable.
+                    rayon_pool.install(|| entries.par_sort_by(|a, b| a.0.cmp(&b.0)));
                 });
 
                 // Write keyed temp file with parallel BGZF compression via worker pool.
@@ -2680,7 +2685,9 @@ impl RawExternalSorter {
 
             timer.time_sort(|| {
                 use rayon::prelude::*;
-                rayon_pool.install(|| entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0)));
+                // Stable sort to preserve ingest order for exact-key ties (see the
+                // per-chunk sort above for the full rationale).
+                rayon_pool.install(|| entries.par_sort_by(|a, b| a.0.cmp(&b.0)));
             });
 
             timer.time_write_output(|| {
@@ -2711,7 +2718,10 @@ impl RawExternalSorter {
                     let chunk_size = entries.len().div_ceil(self.threads.max(1));
                     rayon_pool.install(|| {
                         entries.par_chunks_mut(chunk_size).for_each(|chunk| {
-                            chunk.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                            // Stable sort per chunk: chunks are contiguous ingest-ordered
+                            // slices, so stability preserves ingest order for ties within a
+                            // chunk; the loser-tree merge preserves it across chunks.
+                            chunk.sort_by(|a, b| a.0.cmp(&b.0));
                         });
                     });
                     // Carve sub-chunks aligned with par_chunks_mut boundaries.
@@ -2736,7 +2746,8 @@ impl RawExternalSorter {
                 })
             } else {
                 timer.time_sort(|| {
-                    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                    // Stable sort to preserve ingest order for exact-key ties.
+                    entries.sort_by(|a, b| a.0.cmp(&b.0));
                 });
                 vec![entries]
             };
@@ -4838,6 +4849,84 @@ mod tests {
         let expected = (num_pairs * 2) as u64;
         let observed = count_bam_records(&output);
         assert_eq!(observed, expected, "chunk filename collision likely lost data");
+    }
+
+    /// Collect (name, pos) for every record in a BAM, in file order.
+    fn collect_names_and_positions(path: &Path) -> Vec<(String, i32)> {
+        use crate::read_ahead::RawReadAheadReader;
+        let (reader, _) = create_raw_bam_reader(path, 1).expect("failed to create raw BAM reader");
+        RawReadAheadReader::new(reader)
+            .map(|rec| {
+                let v = fgumi_raw_bam::RawRecordView::new(rec.as_ref());
+                let name = String::from_utf8(v.read_name().to_vec()).expect("valid UTF-8 name");
+                (name, v.pos())
+            })
+            .collect()
+    }
+
+    /// Audit C2: standalone `fgumi sort --order queryname` must preserve input
+    /// order for records whose queryname keys are exactly equal (same name +
+    /// same flag class), matching `samtools sort -n` (stable `ks_mergesort`),
+    /// fgbio, and fgumi's own arena/runall path. The in-chunk sorts used
+    /// `sort_unstable`, so exact ties could emerge reordered.
+    ///
+    /// Construction: several distinct names, each appearing many times at
+    /// distinct, strictly increasing positions, added interleaved. A stable sort
+    /// must group by name and keep every name's records in ingest (position)
+    /// order; an unstable sort may reorder the equal-key runs. Exercised in both
+    /// the single-threaded (`entries.sort_unstable_by`) and multi-threaded
+    /// (`par_chunks_mut` + per-chunk `sort_unstable_by`) in-memory paths, and
+    /// with a small memory limit to also cover the per-chunk spill sort.
+    #[rstest::rstest]
+    #[case::single_threaded_in_memory(1, 64 * 1024 * 1024)]
+    #[case::multi_threaded_in_memory(4, 64 * 1024 * 1024)]
+    #[case::single_threaded_spill(1, 4096)]
+    #[case::multi_threaded_spill(4, 4096)]
+    fn test_sort_queryname_preserves_exact_tie_input_order(
+        #[case] threads: usize,
+        #[case] memory_limit: usize,
+    ) {
+        use fgumi_sam::SamBuilder;
+
+        const NAMES: usize = 8;
+        const COPIES: usize = 16;
+
+        let mut builder = SamBuilder::new();
+        let mut pos = 1usize;
+        for _copy in 0..COPIES {
+            for n in 0..NAMES {
+                let _ = builder.add_frag().name(&format!("read{n:02}")).start(pos).build();
+                pos += 1;
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
+        let input = dir.path().join("input.bam");
+        let output = dir.path().join("output.bam");
+        builder.write_bam(&input).expect("failed to write BAM");
+
+        RawExternalSorter::new(SortOrder::Queryname(QuerynameComparator::default()))
+            .threads(threads)
+            .memory_limit(memory_limit)
+            .output_compression(0)
+            .sort(&input, &output)
+            .expect("sort should succeed");
+
+        // For each name, the positions must come out strictly increasing — i.e.
+        // exactly the ingest order, since positions were assigned in ingest order.
+        let out = collect_names_and_positions(&output);
+        let mut last_pos_by_name: std::collections::HashMap<String, i32> =
+            std::collections::HashMap::new();
+        for (name, pos) in out {
+            if let Some(&prev) = last_pos_by_name.get(&name) {
+                assert!(
+                    pos > prev,
+                    "queryname sort reordered exact ties for {name}: saw pos {pos} after {prev} \
+                     (stable sort must preserve ingest order for equal keys)"
+                );
+            }
+            last_pos_by_name.insert(name, pos);
+        }
     }
 
     /// Verifies that sort with many chunks exercises the pool-integrated
