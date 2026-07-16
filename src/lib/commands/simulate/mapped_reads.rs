@@ -10,8 +10,9 @@ use crate::commands::common::CompressionOptions;
 use crate::commands::simulate::common::{
     FamilySizeArgs, InsertSizeArgs, MethylationArgs, MethylationConfig, MoleculeInfo,
     PositionDistArgs, QualityArgs, ReferenceArgs, ReferenceGenome, SimulationCommon,
-    apply_methylation_conversion, build_sort_order_header_map, generate_random_sequence,
-    pad_sequence, validate_rate,
+    apply_methylation_conversion, body_error_rng, build_sort_order_header_map,
+    effective_molecule_locus, generate_random_sequence, introduce_errors_inplace, pad_sequence,
+    validate_rate,
 };
 use crate::commands::simulate::region_to_bin;
 use crate::dna::reverse_complement;
@@ -68,6 +69,12 @@ pub struct MappedReads {
     #[arg(long = "unmapped-fraction", default_value = "0.0")]
     pub unmapped_fraction: f64,
 
+    /// Per-base substitution error rate applied to read bodies (0.0-1.0). The default of 0.0 emits
+    /// error-free reads (byte-identical to prior versions); set a positive rate to inject realistic
+    /// sequencing errors so consensus/error-correction paths see genuine discordances.
+    #[arg(long = "error-rate", default_value = "0.0")]
+    pub error_rate: f64,
+
     /// Number of writer threads
     #[arg(short = 't', long = "threads", default_value = "1")]
     pub threads: usize,
@@ -109,6 +116,9 @@ struct GenerationParams {
     family_dist: FamilySizeDistribution,
     insert_model: InsertSizeModel,
     methylation: MethylationConfig,
+    /// Per-base substitution error rate applied to read bodies (0.0 = no errors, byte-identical
+    /// to the error-free generator).
+    error_rate: f64,
 }
 
 impl Command for MappedReads {
@@ -118,6 +128,7 @@ impl Command for MappedReads {
         self.methylation.validate()?;
 
         validate_rate(self.unmapped_fraction, "unmapped-fraction")?;
+        validate_rate(self.error_rate, "error-rate")?;
 
         info!("Generating mapped reads");
         info!("  Output: {}", self.output.display());
@@ -175,6 +186,7 @@ impl Command for MappedReads {
             family_dist: self.family_size.to_family_size_distribution()?,
             insert_model: self.insert_size.to_insert_size_model(),
             methylation,
+            error_rate: self.error_rate,
         };
 
         // Pre-sample positions from reference (use a dedicated RNG so molecule seeds
@@ -233,24 +245,28 @@ impl Command for MappedReads {
                     let pos_idx = mol_id % num_positions;
                     let (chrom_idx, local_pos) = position_table[pos_idx];
 
-                    // Pre-compute insert_size using the molecule's seed (same RNG sequence
-                    // as generation)
-                    let mut mol_rng = create_rng(Some(seed));
-                    // Skip UMI generation RNG calls
-                    for _ in 0..params.umi_length {
-                        let _: usize = mol_rng.random_range(0..4);
-                    }
-                    // Skip family_size RNG call
-                    let _ = params.family_dist.sample(&mut mol_rng, params.min_family_size);
-                    // Get insert_size
-                    let insert_size = params.insert_model.sample(&mut mol_rng);
+                    // Key on the EFFECTIVE locus — the coordinates generation actually emits at
+                    // after the contig-end re-sample fallback — not the pre-sampled candidate, so
+                    // records stay template-coordinate sorted near contig ends (SIMU3-05). For loci
+                    // that don't trigger the fallback (the common case) this returns the pre-sampled
+                    // locus unchanged, leaving the sort key identical.
+                    let (eff_chrom_idx, eff_local_pos, insert_size) = effective_molecule_locus(
+                        seed,
+                        chrom_idx,
+                        local_pos,
+                        params.umi_length,
+                        &params.family_dist,
+                        params.min_family_size,
+                        &params.insert_model,
+                        &ref_genome,
+                    );
 
                     // Sort key — for_f1r2_pair gives the canonical template-coordinate sort
                     // key. This works for both F1R2 and R1F2 orientations because the
                     // template covers the same genomic positions regardless of strand.
                     TemplateCoordKey::for_f1r2_pair(
-                        chrom_idx as i32, // real tid
-                        local_pos,
+                        eff_chrom_idx as i32, // real tid
+                        eff_local_pos,
                         insert_size,
                         String::new(), // empty mid for mapped-reads (no MI tag yet)
                         format!("mol{mol_id:08}"),
@@ -455,7 +471,16 @@ fn generate_molecule_reads(
             &params.methylation,
             &mut rng,
         );
-        let fwd_seq = pad_sequence(fwd_seq, params.read_length, &mut rng);
+        let mut fwd_seq = pad_sequence(fwd_seq, params.read_length, &mut rng);
+        // Inject body sequencing errors (SIMU3-01). Injected from a dedicated per-mate RNG
+        // (`body_error_rng`) rather than the molecule RNG, so enabling `--error-rate` changes only
+        // the read bodies and leaves qualities, positions, flags, and every downstream draw
+        // byte-identical to the error-free run. The `error_rate > 0.0` guard keeps the zero-rate
+        // path free of any RNG construction.
+        if params.error_rate > 0.0 {
+            let mut err_rng = body_error_rng(&read_name, true);
+            introduce_errors_inplace(&mut fwd_seq, params.error_rate, &mut err_rng);
+        }
 
         // Compute reverse-read sequence (from end of template, bottom strand,
         // reverse complemented)
@@ -471,7 +496,11 @@ fn generate_molecule_reads(
             &mut rng,
         );
         let rev_seq = reverse_complement(&rev_template);
-        let rev_seq = pad_sequence(rev_seq, params.read_length, &mut rng);
+        let mut rev_seq = pad_sequence(rev_seq, params.read_length, &mut rng);
+        if params.error_rate > 0.0 {
+            let mut err_rng = body_error_rng(&read_name, false);
+            introduce_errors_inplace(&mut rev_seq, params.error_rate, &mut err_rng);
+        }
 
         // Quality scores
         let r1_quals = params.quality_model.generate_qualities(params.read_length, &mut rng);
@@ -668,6 +697,7 @@ fn build_record(
 mod tests {
     use super::*;
     use crate::simulate::create_rng;
+    use rstest::rstest;
 
     /// Decode a raw BAM record into a noodles `RecordBuf` for higher-level test
     /// assertions.
@@ -992,12 +1022,155 @@ mod tests {
                 cpg_methylation_rate: 0.75,
                 conversion_rate: 0.98,
             },
+            error_rate: 0.0,
         };
 
         let (pairs, _chrom, _pos) =
             generate_molecule_reads(0, 42, 0, 500, false, &params, &ref_genome);
         // Multiple reads should be generated (family_size >= 3)
         assert!(pairs.len() >= 3, "Expected at least 3 reads, got {}", pairs.len());
+    }
+
+    /// SIMU3-05 regression: the sort-key helper `effective_molecule_locus` must return exactly the
+    /// coordinates `generate_molecule_reads` emits at — for both valid loci and loci near a contig
+    /// end that trigger the re-sample fallback. If the two ever drift, the output stops being
+    /// template-coordinate sorted.
+    #[rstest]
+    #[case::pos_start(0)]
+    #[case::pos_mid_low(500)]
+    #[case::pos_mid_high(1000)]
+    // pos 1950 is within one insert (80-120) of the 2000 bp contig end -> forces the fallback.
+    #[case::pos_near_end(1950)]
+    fn test_effective_molecule_locus_matches_generation(#[case] local_pos: usize) {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut fasta = NamedTempFile::new().unwrap();
+        writeln!(fasta, ">chr1").unwrap();
+        fasta.write_all(&b"ACGT".repeat(500)).unwrap(); // 2000 bp
+        writeln!(fasta).unwrap();
+        fasta.flush().unwrap();
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+
+        let params = GenerationParams {
+            read_length: 50,
+            umi_length: 8,
+            mapq: 60,
+            min_family_size: 1,
+            quality_model: crate::simulate::PositionQualityModel::new(
+                10, 25, 37, 100, 0.08, 2, 0.0,
+            ),
+            quality_bias: crate::simulate::ReadPairQualityBias::new(0),
+            family_dist: crate::simulate::FamilySizeDistribution::log_normal(5.0, 1.0),
+            insert_model: crate::simulate::InsertSizeModel::new(100.0, 10.0, 80, 120),
+            methylation: MethylationConfig {
+                mode: fgumi_consensus::MethylationMode::Disabled,
+                cpg_methylation_rate: 0.75,
+                conversion_rate: 0.98,
+            },
+            error_rate: 0.0,
+        };
+
+        for seed in 0u64..8 {
+            let (_pairs, gen_chrom, gen_pos) =
+                generate_molecule_reads(0, seed, 0, local_pos, false, &params, &genome);
+            let (eff_chrom, eff_pos, _insert) = effective_molecule_locus(
+                seed,
+                0,
+                local_pos,
+                params.umi_length,
+                &params.family_dist,
+                params.min_family_size,
+                &params.insert_model,
+                &genome,
+            );
+            assert_eq!(
+                (gen_chrom, gen_pos),
+                (eff_chrom, eff_pos),
+                "sort-key helper must match generation for seed={seed} pos={local_pos}"
+            );
+        }
+    }
+
+    /// SIMU3-01 wiring: with `error_rate = 1.0` every read-body base is substituted, so both R1 and
+    /// R2 must diverge from an otherwise-identical `error_rate = 0.0` run (same seed, same locus),
+    /// while the read length is preserved. Fails if the body error-injection call is dropped or
+    /// mis-wired for the mapped generator.
+    ///
+    /// Also pins RNG isolation: body errors are drawn from a dedicated per-mate RNG
+    /// (`body_error_rng`), so enabling `--error-rate` must leave positions, flags, mapping quality,
+    /// read names, and qualities byte-identical to the zero-rate run across the whole family — only
+    /// the sequence bytes change. If injection ever draws from the molecule RNG again, the
+    /// qualities (drawn after injection) shift and these equalities break.
+    #[test]
+    fn test_mapped_reads_inject_body_errors() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut fasta = NamedTempFile::new().unwrap();
+        writeln!(fasta, ">chr1").unwrap();
+        fasta.write_all(&b"ACGT".repeat(500)).unwrap(); // 2000 bp
+        writeln!(fasta).unwrap();
+        fasta.flush().unwrap();
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+
+        let make_params = |error_rate: f64| GenerationParams {
+            read_length: 50,
+            umi_length: 8,
+            mapq: 60,
+            min_family_size: 1,
+            quality_model: crate::simulate::PositionQualityModel::new(
+                10, 25, 37, 100, 0.08, 2, 0.0,
+            ),
+            quality_bias: crate::simulate::ReadPairQualityBias::new(0),
+            family_dist: crate::simulate::FamilySizeDistribution::log_normal(3.0, 1.0),
+            insert_model: crate::simulate::InsertSizeModel::new(100.0, 10.0, 80, 120),
+            methylation: MethylationConfig {
+                mode: fgumi_consensus::MethylationMode::Disabled,
+                cpg_methylation_rate: 0.75,
+                conversion_rate: 0.98,
+            },
+            error_rate,
+        };
+
+        let seed = 7u64;
+        // Same seed + valid locus (pos 500 in a 2000 bp contig) -> identical family, template, and
+        // strand for both runs; only the body error injection differs.
+        let (zero, _c0, _p0) =
+            generate_molecule_reads(0, seed, 0, 500, false, &make_params(0.0), &genome);
+        let (full, _c1, _p1) =
+            generate_molecule_reads(0, seed, 0, 500, false, &make_params(1.0), &genome);
+
+        assert!(!zero.is_empty(), "expected at least one read pair in the family");
+        assert_eq!(zero.len(), full.len());
+
+        let seq = |raw: &RawRecord| to_record_buf(raw).sequence().as_ref().to_vec();
+        let (z_r1, z_r2) = (seq(&zero[0].0), seq(&zero[0].1));
+        let (f_r1, f_r2) = (seq(&full[0].0), seq(&full[0].1));
+
+        // Read length is preserved through body error injection.
+        assert_eq!(z_r1.len(), f_r1.len());
+        assert_eq!(z_r2.len(), f_r2.len());
+        // At error_rate 1.0 every body base flips to a different base, so both reads diverge.
+        assert_ne!(z_r1, f_r1, "R1 body should diverge from the zero-rate run");
+        assert_ne!(z_r2, f_r2, "R2 body should diverge from the zero-rate run");
+
+        // RNG isolation: positions, flags, mapping quality, names, and qualities are byte-identical
+        // to the zero-rate run across every record — only the sequence bytes change.
+        let non_seq = |raw: &RawRecord| {
+            let rec = to_record_buf(raw);
+            (
+                rec.flags().bits(),
+                rec.alignment_start().map(usize::from),
+                rec.mapping_quality().map(u8::from),
+                rec.name().map(|n| n.to_vec()),
+                rec.quality_scores().as_ref().to_vec(),
+            )
+        };
+        for (z, f) in zero.iter().zip(full.iter()) {
+            assert_eq!(non_seq(&z.0), non_seq(&f.0), "R1 non-sequence fields must be unchanged");
+            assert_eq!(non_seq(&z.1), non_seq(&f.1), "R2 non-sequence fields must be unchanged");
+        }
     }
 
     // ========================================================================
@@ -1042,6 +1215,7 @@ mod tests {
                 cpg_methylation_rate: 0.75,
                 conversion_rate: 0.98,
             },
+            error_rate: 0.0,
         };
 
         // Test that generate_molecule_reads produces records with correct ref_id
@@ -1098,6 +1272,7 @@ mod tests {
                 cpg_methylation_rate: 0.75,
                 conversion_rate: 0.98,
             },
+            error_rate: 0.0,
         };
 
         let mut saw_f1r2 = false;
@@ -1145,6 +1320,7 @@ mod tests {
                 cpg_methylation_rate: 0.75,
                 conversion_rate: 0.98,
             },
+            error_rate: 0.0,
         }
     }
 

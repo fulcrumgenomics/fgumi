@@ -356,15 +356,23 @@ fn generate_correct_read_pair(
     } else if r < edit2_threshold {
         (introduce_n_errors(true_umi, 2, &mut rng), 2, "edit2")
     } else {
-        // 3+ errors
-        let num_errors = rng.random_range(3..=params.umi_length.min(5));
+        // "multi": 3+ errors. A UMI shorter than 3 bases cannot carry 3 errors, so clamp the upper
+        // bound and never build an inverted range — `rng.random_range(3..=hi)` panics when `hi < 3`
+        // (SIMU3-04). `introduce_n_errors` caps at the UMI length internally, so `num_errors` is
+        // always achievable.
+        let hi = params.umi_length.min(5);
+        let num_errors = if hi >= 3 { rng.random_range(3..=hi) } else { hi.max(1) };
         (introduce_n_errors(true_umi, num_errors, &mut rng), num_errors, "multi")
     };
 
-    // Expected correction: for exact/edit1/edit2, should correct to true_umi
-    // For multi, should not correct (stays as observed)
-    let expected_correction =
-        if error_type == "multi" { observed_umi.clone() } else { true_umi.clone() };
+    // Expected correction: replicate what `fgumi correct` would actually do rather than assuming the
+    // error-type label determines the outcome (SIMU3-03). `correct` maps an observed UMI to the
+    // UNIQUE nearest includelist entry within the correctable radius; if a *different* includelist
+    // UMI is as close or closer — a nearest-neighbor collision, plausible with many random UMIs —
+    // the read is ambiguous and stays uncorrected. Computing the nearest neighbor over the actual
+    // includelist keeps the truth in agreement with `correct` for the generator's radius
+    // (max-mismatches 2, min-distance 1), instead of blindly asserting edit1/edit2 → true_umi.
+    let expected_correction = expected_correction_for(&observed_umi, umis, CORRECTABLE_RADIUS);
 
     // Generate template sequences for R1 and R2
     let template_r1 = generate_random_sequence(params.read_length, &mut rng);
@@ -408,6 +416,41 @@ fn generate_correct_read_pair(
     }
 }
 
+/// Correctable radius (max mismatches) used to compute the truth file's expected correction. The
+/// generator produces correctable reads at edit distance ≤ 2, so this mirrors a default
+/// `fgumi correct --max-mismatches 2 --min-distance 1`.
+const CORRECTABLE_RADIUS: usize = 2;
+
+/// Hamming distance between two equal-length UMI strings (extra length counts as mismatches).
+fn umi_hamming(a: &str, b: &str) -> usize {
+    a.bytes().zip(b.bytes()).filter(|(x, y)| x != y).count() + a.len().abs_diff(b.len())
+}
+
+/// Compute what `fgumi correct` would map `observed` to, given the `includelist`: the UNIQUE nearest
+/// includelist entry when it is within `radius` and strictly closer than every other entry;
+/// otherwise `observed` itself (uncorrectable — either beyond the radius or ambiguous because two
+/// entries tie for nearest). This mirrors `correct`'s max-mismatches / min-distance rule with
+/// `min_distance = 1`, so the truth file agrees with `correct` even for nearest-neighbor collisions.
+fn expected_correction_for(observed: &str, includelist: &[String], radius: usize) -> String {
+    let mut best = usize::MAX;
+    let mut best_umi: Option<&str> = None;
+    let mut unique = false;
+    for candidate in includelist {
+        let d = umi_hamming(observed, candidate);
+        if d < best {
+            best = d;
+            best_umi = Some(candidate.as_str());
+            unique = true;
+        } else if d == best {
+            unique = false;
+        }
+    }
+    match best_umi {
+        Some(umi) if unique && best <= radius => umi.to_string(),
+        _ => observed.to_string(),
+    }
+}
+
 fn introduce_n_errors(umi: &str, n: usize, rng: &mut impl Rng) -> String {
     const BASES: &[u8] = b"ACGT";
     let mut result: Vec<u8> = umi.as_bytes().to_vec();
@@ -443,6 +486,8 @@ mod tests {
     use super::*;
     use crate::simulate::create_rng;
     use noodles::sam::alignment::record::data::field::Tag;
+    use proptest::prelude::*;
+    use rstest::rstest;
 
     // Tests for generate_random_sequence
     #[test]
@@ -810,5 +855,46 @@ mod tests {
         let umi_length = 2;
         let max_possible_umis = 4_usize.saturating_pow(umi_length as u32);
         assert!(num_umis <= max_possible_umis, "16 UMIs should be allowed for 2-base UMIs");
+    }
+
+    // --- SIMU3-03: truth reflects a real nearest-neighbor correction ---
+
+    #[rstest]
+    // Observed is distance 1 from AAAA and >= 3 from the others -> corrects to AAAA.
+    #[case::unique_nearest(&["AAAA", "CCCC", "GGGG", "TTTT"], "AAAC", "AAAA")]
+    // Observed is distance 1 from BOTH AAAA and AAAT -> ambiguous -> stays observed (SIMU3-03).
+    #[case::collision_ambiguous(&["AAAA", "AAAT", "CCCC"], "AAAC", "AAAC")]
+    // "ACGT" is distance 3 from both entries -> beyond the radius -> uncorrectable.
+    #[case::beyond_radius(&["AAAA", "CCCC"], "ACGT", "ACGT")]
+    // Exact includelist match corrects to itself.
+    #[case::exact_match(&["AAAA", "CCCC"], "CCCC", "CCCC")]
+    fn test_expected_correction(
+        #[case] includelist: &[&str],
+        #[case] observed: &str,
+        #[case] expected: &str,
+    ) {
+        let includelist: Vec<String> = includelist.iter().map(|s| (*s).to_string()).collect();
+        assert_eq!(expected_correction_for(observed, &includelist, CORRECTABLE_RADIUS), expected);
+    }
+
+    // --- SIMU3-04: short UMIs must not panic in the "multi" branch ---
+
+    proptest! {
+        #[test]
+        fn test_generate_correct_read_pair_short_umi_no_panic(seed in 0u64..10_000) {
+            // umi_length == 2 makes `rng.random_range(3..=umi_length.min(5))` an inverted range;
+            // the guard must keep the "multi" branch (multi_fraction = 1.0) from panicking.
+            let params = GenerationParams {
+                read_length: 20,
+                quality: 30,
+                exact_fraction: 0.0,
+                edit1_fraction: 0.0,
+                edit2_fraction: 0.0,
+                umi_length: 2,
+            };
+            let umis = vec!["AC".to_string(), "GT".to_string()];
+            // Exercise many seeds so the "multi" branch is definitely taken.
+            let _ = generate_correct_read_pair(0, seed, &params, &umis);
+        }
     }
 }
