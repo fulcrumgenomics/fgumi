@@ -6,12 +6,37 @@ use anyhow::{Context, Result, bail};
 use clap::Args;
 use fgumi_consensus::MethylationMode;
 use fgumi_consensus::methylation::is_cpg_context;
+use fgumi_sort::SortOrder;
 use log::info;
 use noodles::fasta;
+use noodles::sam::header::record::value::Map;
+use noodles::sam::header::record::value::map::header::{self as HeaderRecord, Tag as HeaderTag};
 use rand::{Rng, RngExt};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
+
+/// Build the `@HD` header map carrying the `SO`/`GO`/`SS` sort-order tags for `order`.
+///
+/// Shared by the `simulate` subcommands so they emit the same `SO`/`GO`/`SS` values —
+/// including the `SS = <sort-order>:<sub-sort>` prefix — that `fgumi sort` writes (see
+/// [`SortOrder::header_ss_tag`]). `GO` and `SS` are inserted only when the order defines
+/// them, so this is safe for any [`SortOrder`], not just template-coordinate.
+#[must_use]
+pub fn build_sort_order_header_map(order: SortOrder) -> Map<HeaderRecord::Header> {
+    let HeaderTag::Other(so_tag) = HeaderTag::from([b'S', b'O']) else { unreachable!() };
+    let HeaderTag::Other(go_tag) = HeaderTag::from([b'G', b'O']) else { unreachable!() };
+    let HeaderTag::Other(ss_tag) = HeaderTag::from([b'S', b'S']) else { unreachable!() };
+
+    let mut builder = Map::<HeaderRecord::Header>::builder().insert(so_tag, order.header_so_tag());
+    if let Some(go) = order.header_go_tag() {
+        builder = builder.insert(go_tag, go);
+    }
+    if let Some(ss) = order.header_ss_tag() {
+        builder = builder.insert(ss_tag, ss);
+    }
+    builder.build().expect("header map with valid SO/GO/SS tags")
+}
 
 /// Common simulation options shared across all simulate subcommands.
 #[derive(Args, Debug, Clone)]

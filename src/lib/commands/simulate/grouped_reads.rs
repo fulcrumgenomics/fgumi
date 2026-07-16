@@ -10,7 +10,8 @@ use crate::commands::common::{CompressionOptions, parse_bool};
 use crate::commands::simulate::common::{
     FamilySizeArgs, InsertSizeArgs, MethylationArgs, MethylationConfig, MoleculeInfo,
     PositionDistArgs, QualityArgs, ReferenceArgs, ReferenceGenome, SimulationCommon,
-    StrandBiasArgs, apply_methylation_conversion, generate_random_sequence, pad_sequence,
+    StrandBiasArgs, apply_methylation_conversion, build_sort_order_header_map,
+    generate_random_sequence, pad_sequence,
 };
 use crate::commands::simulate::region_to_bin;
 use crate::dna::reverse_complement;
@@ -24,9 +25,9 @@ use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::create_raw_bam_writer;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
+use fgumi_sort::SortOrder;
 use log::info;
 use noodles::sam::header::Header;
-use noodles::sam::header::record::value::map::header::{self as HeaderRecord, Tag as HeaderTag};
 use rand::{Rng, RngExt};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -146,18 +147,9 @@ impl Command for GroupedReads {
         let ref_header = ref_genome.build_bam_header();
         let mut header_builder = Header::builder();
 
-        // Add sort order tags: SO:unsorted, GO:query, SS:template-coordinate
-        let HeaderTag::Other(so_tag) = HeaderTag::from([b'S', b'O']) else { unreachable!() };
-        let HeaderTag::Other(go_tag) = HeaderTag::from([b'G', b'O']) else { unreachable!() };
-        let HeaderTag::Other(ss_tag) = HeaderTag::from([b'S', b'S']) else { unreachable!() };
-
-        let header_map =
-            noodles::sam::header::record::value::Map::<HeaderRecord::Header>::builder()
-                .insert(so_tag, "unsorted")
-                .insert(go_tag, "query")
-                .insert(ss_tag, "template-coordinate")
-                .build()
-                .expect("header map with valid SO/GO/SS tags");
+        // Add sort order tags (SO/GO/SS) matching template-coordinate order; see
+        // `SortOrder::header_ss_tag()` for why the `SS` value is prefixed with the `SO` value.
+        let header_map = build_sort_order_header_map(SortOrder::TemplateCoordinate);
         header_builder = header_builder.set_header(header_map);
 
         for (name, map) in ref_header.reference_sequences() {
