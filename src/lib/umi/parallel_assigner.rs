@@ -262,6 +262,87 @@ pub fn discover_edges_parallel_k(
         .collect()
 }
 
+/// Parallel reverse-orientation edge discovery for the paired assigner.
+///
+/// Returns undirected edges `(i, j)` (with `i < j`) where the REVERSE of canonical
+/// form `i` is within `max_mismatches` of canonical form `j`. This is the half of
+/// fgbio's `matches = within(l, r) OR within(reverse(l), r)` that canonicalization
+/// alone misses: a single mismatch can flip which half is lexically smaller, so two
+/// reads of one molecule canonicalize to forms that are far apart forward yet within
+/// threshold when one is reversed (GRP3-01). `reverse_encs[i]` must be the encoding
+/// of the halves-swapped `i`th canonical form.
+#[must_use]
+fn discover_paired_reverse_edges(
+    forward: &[(BitEnc, usize)],
+    reverse_encs: &[BitEnc],
+    max_mismatches: u32,
+) -> Vec<(usize, usize)> {
+    let umi_to_idx: AHashMap<BitEnc, usize> =
+        forward.iter().enumerate().map(|(i, (enc, _))| (*enc, i)).collect();
+
+    reverse_encs
+        .par_iter()
+        .enumerate()
+        .flat_map(|(i, rev_enc)| {
+            let mut edges = Vec::new();
+            let neighbors: Vec<BitEnc> = if max_mismatches == 1 {
+                generate_neighbors(rev_enc).collect()
+            } else {
+                generate_neighbors_k(rev_enc, max_mismatches)
+            };
+            for neighbor in neighbors {
+                if let Some(&j) = umi_to_idx.get(&neighbor) {
+                    // Distinct canonical forms are never exact reverses of each other,
+                    // so `i == j` can only arise for a palindromic form; skip it.
+                    if i != j && rev_enc.hamming_distance(&neighbor) <= max_mismatches {
+                        edges.push((i.min(j), i.max(j)));
+                    }
+                }
+            }
+            edges
+        })
+        .collect()
+}
+
+/// Strand (`true` = A) for reads spelled exactly as each canonical form, relative to
+/// that molecule's root, mirroring the sequential `PairedUmiAssigner`.
+///
+/// The root's canonical is strand A; another member's canonical is strand A iff it is
+/// strictly closer (fewer mismatches) to the root's canonical than its reverse is.
+/// Reads in the reverse spelling take the opposite strand. Without this, reads reached
+/// via a reverse-orientation edge (which represent the OPPOSITE strand) would all be
+/// mislabeled strand A.
+///
+/// Palindromic canonical forms (identical halves) are their own reverse, so their
+/// forward and reverse spellings are the same string; the sequential assigner inserts
+/// the reverse spelling LAST for them. For a palindromic ROOT that reverse spelling is
+/// `B` (overwriting the `A` it would otherwise get); for a palindromic non-root child
+/// it is `A`.
+fn paired_canonical_strands(
+    unique_umis: &[(BitEnc, usize)],
+    reverse_encs: &[BitEnc],
+    mol_ids: &[u64],
+    cluster_root: &[usize],
+) -> Vec<bool> {
+    (0..unique_umis.len())
+        .map(|i| {
+            let mol_id = usize::try_from(mol_ids[i]).expect("molecule id fits in usize");
+            let root_i = cluster_root[mol_id];
+            let is_palindrome = unique_umis[i].0 == reverse_encs[i];
+            if i == root_i {
+                return !is_palindrome; // root: A, unless palindrome -> B
+            }
+            if is_palindrome {
+                return true; // non-root palindrome child -> A
+            }
+            let root_enc = &unique_umis[root_i].0;
+            let forward = root_enc.hamming_distance(&unique_umis[i].0);
+            let reversed = root_enc.hamming_distance(&reverse_encs[i]);
+            forward < reversed
+        })
+        .collect()
+}
+
 /// Parallel UMI assigner for Identity strategy.
 ///
 /// Uses a partition-merge approach: splits UMIs into chunks, builds per-chunk
@@ -666,6 +747,10 @@ impl ParallelPairedAssigner {
 }
 
 impl UmiAssigner for ParallelPairedAssigner {
+    // One cohesive algorithm (encode → build reverse-aware adjacency → BFS clusters →
+    // canonical strands → final per-UMI molecule/strand map); splitting it would hurt
+    // readability more than the length costs. Matches other assigner/pipeline sites.
+    #[allow(clippy::too_many_lines)]
     fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
         if raw_umis.is_empty() {
             return Vec::new();
@@ -710,24 +795,90 @@ impl UmiAssigner for ParallelPairedAssigner {
         // does. `BitEnc::len` excludes the dash, so this compares base length.
         assert_uniform_umi_length(unique_umis.iter().map(|(enc, _)| enc.len()));
 
-        // Phase 1: Parallel edge discovery (using configured thread pool)
-        // Use max_mismatches directly (not 2x) because canonicalization already handles
-        // reverse-orientation matching. The sequential PairedUmiAssigner checks both forward
-        // and reversed orientations with the same threshold; canonicalization achieves the
-        // same effect by ensuring reversed pairs share the same canonical form.
-        let max_mismatches = self.max_mismatches;
-        let edges = self.pool.install(|| discover_edges_parallel_k(&unique_umis, max_mismatches));
+        // Guard the pre-existing `BitEnc`-drops-dash limitation. `BitEnc::from_umi_str`
+        // discards the `-`, so the parallel path's forward AND reverse edit distances are
+        // dash-blind. fgbio (`GroupReadsByUmi.PairedUmiAssigner`) and the sequential
+        // `PairedUmiAssigner` instead compare the dash-delimited string byte-for-byte
+        // (dash-sensitive, both orientations). The two agree exactly when every UMI has
+        // SYMMETRIC halves (both sides the same length): the dash then sits at a fixed
+        // position, so dropping it loses no information and swapping halves is a clean
+        // reverse. With ASYMMETRIC halves the dash position varies, and the dash-blind path
+        // diverges in more than one way -- distinct forms with the same concatenated bases
+        // but different splits collide to one encoding (`AC-GTA` / `ACG-TA`), and the
+        // halves-swapped reverse encoding can forge a within-threshold reverse edge that the
+        // dash-sensitive reference never draws (`A-AC` reverse `ACA` is Hamming-1 from
+        // `A-CT`'s `ACT`). A collision-only check misses the latter.
+        //
+        // A full split-aware rework of the hot path is the complete fix (tracked in #586);
+        // until then, delegate any pool that contains an asymmetric-halves UMI to the
+        // sequential assigner, which is byte-for-byte faithful to fgbio. Symmetric pools
+        // (the common case) take the fast parallel path unchanged. Checked over `sorted_umis`
+        // -- the encodable canonical forms that actually feed edge discovery.
+        {
+            let has_asymmetric_halves = sorted_umis.iter().any(|(umi, _, _)| {
+                let (left, right) = umi.split_once('-').expect("validated paired UMI");
+                left.len() != right.len()
+            });
+            if has_asymmetric_halves {
+                return crate::umi::PairedUmiAssigner::new(self.max_mismatches).assign(raw_umis);
+            }
+        }
 
-        // Build adjacency list
+        // Encode the REVERSE of each canonical form (halves swapped) alongside it, so
+        // the reverse-orientation edge pass and the strand assignment can both use it.
+        let reverse_encs: Vec<BitEnc> = sorted_umis
+            .iter()
+            .map(|(umi, _, _)| {
+                let reversed = Self::reverse_paired(umi).unwrap_or_else(|| umi.clone());
+                BitEnc::from_umi_str(&reversed)
+                    .expect("canonical paired UMI reverses to a valid UMI")
+            })
+            .collect();
+
+        // Phase 1: Parallel edge discovery (using configured thread pool).
+        //
+        // Two reads map to the same molecule when they are within `max_mismatches`
+        // in EITHER orientation, exactly as the sequential `PairedUmiAssigner`'s
+        // `matches_paired` tests `within(l, r) OR within(reverse(l), r)`.
+        // Canonicalization alone does NOT capture the reverse case: a single mismatch
+        // can flip which half is lexically smaller, so two reads of one molecule
+        // canonicalize to forms that are far apart forward yet within threshold when
+        // one is reversed (GRP3-01). So we union the forward edges with a
+        // reverse-orientation edge pass.
+        let max_mismatches = self.max_mismatches;
+        let edges = self.pool.install(|| {
+            let forward = discover_edges_parallel_k(&unique_umis, max_mismatches);
+            let reverse =
+                discover_paired_reverse_edges(&unique_umis, &reverse_encs, max_mismatches);
+            let mut set: AHashSet<(usize, usize)> = forward.into_iter().collect();
+            set.extend(reverse);
+            set
+        });
+
+        // Build adjacency list. `edges` is an `AHashSet` whose iteration order is seeded
+        // per process at runtime (unlike the unpaired path, which feeds a deterministically
+        // ordered rayon `Vec` straight in), so the order neighbors land in each bucket is
+        // nondeterministic. The BFS below visits neighbors in bucket order and count-gates
+        // them (`neighbor_count <= max_child_count`), so a threshold-boundary neighbor
+        // reachable from more than one node can be claimed differently depending on that
+        // order -- a run-to-run nondeterministic partition. Sort each bucket after
+        // construction to pin a deterministic neighbor order (ascending index == count
+        // descending, then UMI string, matching the sorted order the BFS processes roots in).
         let mut adj_list: Vec<Vec<usize>> = vec![Vec::new(); unique_umis.len()];
         for (i, j) in edges {
             adj_list[i].push(j);
             adj_list[j].push(i);
         }
+        for neighbors in &mut adj_list {
+            neighbors.sort_unstable();
+        }
 
-        // Phase 2: Sequential BFS with adjacency constraints
+        // Phase 2: Sequential BFS with adjacency constraints. Track each molecule's
+        // root canonical (the highest-count member, first in sorted order) so strand
+        // can be assigned relative to it, matching the sequential assigner.
         let mut assigned = vec![false; unique_umis.len()];
         let mut mol_ids: Vec<u64> = vec![0; unique_umis.len()];
+        let mut cluster_root: Vec<usize> = Vec::new();
         let mut next_mol_id: u64 = 0;
 
         for root_idx in 0..unique_umis.len() {
@@ -737,6 +888,7 @@ impl UmiAssigner for ParallelPairedAssigner {
 
             let mol_id = next_mol_id;
             next_mol_id += 1;
+            cluster_root.push(root_idx);
 
             let mut queue = VecDeque::new();
             queue.push_back(root_idx);
@@ -760,32 +912,39 @@ impl UmiAssigner for ParallelPairedAssigner {
             }
         }
 
-        // Build map from canonical UMI to molecule ID
-        let canonical_to_mol: AHashMap<&str, u64> = sorted_umis
-            .iter()
-            .enumerate()
-            .map(|(i, (umi, _, _))| (umi.as_str(), mol_ids[i]))
-            .collect();
+        let canonical_strand =
+            paired_canonical_strands(&unique_umis, &reverse_encs, &mol_ids, &cluster_root);
 
-        // Map back to original UMI order with strand assignment. Each distinct invalid
-        // (non-encodable) UMI gets its own molecule keyed by its canonical form (identical
-        // strings share), mirroring fgbio's per-string assignment and the sequential paired
-        // assigner. An unencodable UMI has no valid strand, so it is a plain `Single`, not a
-        // `PairedA`/`PairedB`. See the cross-assigner parity note in the tests module.
+        // Final pass: map each raw UMI back to its molecule + strand via `canonical_to_idx`;
+        // each distinct invalid (non-encodable) UMI instead gets its own `Single` molecule
+        // keyed by its raw uppercase string (no valid strand so never `PairedA`/`PairedB`; see
+        // the tests-module parity note). Keying by the raw uppercase string -- not the canonical
+        // form -- matches the sequential paired assigner (`assign_with_invalid_fallback`) and the
+        // `all_invalid_molecule_ids` branch, which both key by `to_uppercase()`. Two invalid UMIs
+        // that are reverses of each other (`ACGN-TTTT` / `TTTT-ACGN`) canonicalize to the same
+        // form; keying by canonical would merge them into one molecule here while the sequential
+        // and all-invalid paths keep them distinct -- a `--threads`-dependent divergence. fgumi's
+        // chosen model is one molecule per distinct raw UMI string (an intentional fgbio
+        // divergence, since `BitEnc` cannot represent the invalid base).
+        let canonical_to_idx: AHashMap<&str, usize> =
+            sorted_umis.iter().enumerate().map(|(i, (umi, _, _))| (umi.as_str(), i)).collect();
         let mut invalid_to_id: AHashMap<String, MoleculeId> = AHashMap::new();
         raw_umis
             .iter()
             .map(|umi| {
                 let canonical = Self::canonicalize(umi);
-                if let Some(&base_id) = canonical_to_mol.get(canonical.as_str()) {
-                    // Assign /A or /B based on whether the original matches canonical
-                    if Self::matches_canonical(umi, &canonical) {
+                if let Some(&i) = canonical_to_idx.get(canonical.as_str()) {
+                    let base_id = mol_ids[i];
+                    // Reads spelled as the canonical form take `canonical_strand[i]`;
+                    // reads in the reverse spelling take the opposite strand.
+                    let is_canonical_spelling = Self::matches_canonical(umi, &canonical);
+                    if canonical_strand[i] == is_canonical_spelling {
                         MoleculeId::PairedA(base_id)
                     } else {
                         MoleculeId::PairedB(base_id)
                     }
                 } else {
-                    *invalid_to_id.entry(canonical).or_insert_with(|| {
+                    *invalid_to_id.entry(umi.to_uppercase()).or_insert_with(|| {
                         let id = MoleculeId::Single(next_mol_id);
                         next_mol_id += 1;
                         id
@@ -1370,10 +1529,46 @@ mod tests {
 
     /// Returns true iff two assignment vectors induce the same partition of input
     /// indices (i.e. identical grouping structure), ignoring the concrete
-    /// `MoleculeId` labels.
+    /// `MoleculeId` labels. Strand-sensitive: reads on opposite strands of the same
+    /// molecule are treated as different groups (their `MoleculeId`s differ).
     fn same_partition(a: &[MoleculeId], b: &[MoleculeId]) -> bool {
         a.len() == b.len()
             && (0..a.len()).all(|i| (0..a.len()).all(|j| (a[i] == a[j]) == (b[i] == b[j])))
+    }
+
+    /// Returns true iff two assignment vectors induce the same *base-molecule*
+    /// partition (ignoring the `/A` `/B` strand suffix). This is what detects
+    /// molecule over-splitting: two reads of one molecule on opposite strands share
+    /// a base id but not a full `MoleculeId`, so [`same_partition`] alone misses a
+    /// split that lands them in different base molecules (GRP3-01).
+    fn same_base_partition(a: &[MoleculeId], b: &[MoleculeId]) -> bool {
+        let base_same = |xs: &[MoleculeId], i: usize, j: usize| {
+            xs[i].base_id_string() == xs[j].base_id_string()
+        };
+        a.len() == b.len()
+            && (0..a.len()).all(|i| (0..a.len()).all(|j| base_same(a, i, j) == base_same(b, i, j)))
+    }
+
+    /// Full parallel-vs-sequential equivalence: identical base-molecule partition,
+    /// identical strand partition, AND identical ABSOLUTE strand orientation
+    /// (`PairedA` vs `PairedB` vs `Single`) at every read position.
+    ///
+    /// The base-molecule and strand partitions are compared up to molecule-id
+    /// relabeling, but the strand is pinned absolutely. `same_partition` alone still
+    /// passes under a per-molecule A<->B swap, so an inversion in the root-relative
+    /// strand logic (palindrome roots/children especially) would slip through every
+    /// caller. Requiring the [`MoleculeId`] enum discriminants to match
+    /// position-by-position closes that gap: any caller asserting
+    /// `assignments_equivalent(sequential, parallel)` is now asserting the parallel
+    /// assigner reproduces the sequential assigner's exact `/A` `/B` labeling, not merely
+    /// a partition that agrees up to strand relabeling.
+    fn assignments_equivalent(a: &[MoleculeId], b: &[MoleculeId]) -> bool {
+        same_base_partition(a, b)
+            && same_partition(a, b)
+            && a.len() == b.len()
+            && a.iter()
+                .zip(b)
+                .all(|(left, right)| std::mem::discriminant(left) == std::mem::discriminant(right))
     }
 
     // ==================== Mixed-case parity (sequential vs parallel) ====================
@@ -1615,6 +1810,18 @@ mod tests {
         || Box::new(ParallelPairedAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
         &["ACGT-TTTT", "GGGG-TTTT", "ACGN-TTTT"]
     )]
+    // Reversed invalid UMIs beside a valid one: `ACGN-TTTT` and `TTTT-ACGN` are reverses of each
+    // other and both non-encodable. fgumi keys each distinct invalid UMI by its raw uppercase
+    // string (not its canonical form), so the two reverses land in DISTINCT molecules -- matching
+    // the sequential assigner and the all-invalid branch. Before the fix the parallel main-path
+    // fallback keyed by canonical form, merging the two reverses into one molecule whenever a
+    // valid UMI was also present (so the all-invalid fast path was not taken) -- a
+    // `--threads`-dependent divergence. A valid `ACGT-ACGT` keeps that main path live.
+    #[case::paired_reversed_invalid(
+        || Box::new(PairedUmiAssigner::new(1)) as Box<dyn UmiAssigner>,
+        || Box::new(ParallelPairedAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["ACGT-ACGT", "ACGN-TTTT", "TTTT-ACGN"]
+    )]
     fn test_sequential_and_parallel_assigners_induce_same_partition(
         #[case] make_sequential: fn() -> Box<dyn UmiAssigner>,
         #[case] make_parallel: fn() -> Box<dyn UmiAssigner>,
@@ -1631,6 +1838,264 @@ mod tests {
             "sequential and parallel assigners must induce the same partition;\n  \
              umis:       {umis:?}\n  sequential: {sequential:?}\n  parallel:   {parallel:?}"
         );
+    }
+
+    /// GRP3-01: canonicalization is NOT sufficient to capture reverse-orientation
+    /// adjacency. A single mismatch can flip which half is lexically smaller, so two
+    /// reads of the same molecule land in canonical forms that are far apart FORWARD
+    /// but 1 apart REVERSED. "CAAA-GTTT" and "ATTT-CAAA" are the same molecule (the
+    /// reverse of "CAAA-GTTT" is "GTTT-CAAA", which is Hamming-1 from "ATTT-CAAA"),
+    /// but their canonical forms "CAAA-GTTT" and "ATTT-CAAA" differ at every base
+    /// forward. The sequential `PairedUmiAssigner` groups them via its reverse check;
+    /// the parallel assigner must too, or it over-splits the molecule.
+    #[test]
+    fn test_parallel_paired_groups_reverse_orientation_edge() {
+        let umis: Vec<String> =
+            vec!["CAAA-GTTT", "ATTT-CAAA"].into_iter().map(String::from).collect();
+
+        let sequential = crate::umi::PairedUmiAssigner::new(1).assign(&umis);
+        let parallel = ParallelPairedAssigner::new(1, 2).assign(&umis);
+
+        // Sanity: the sequential assigner groups them into one molecule.
+        assert_eq!(
+            sequential[0].base_id_string(),
+            sequential[1].base_id_string(),
+            "sequential should group the reverse-orientation pair; got {sequential:?}"
+        );
+        // The parallel assigner must match the sequential base-molecule partition
+        // (they are one molecule) AND the strand partition (opposite strands).
+        assert!(
+            assignments_equivalent(&sequential, &parallel),
+            "parallel paired must group the reverse-orientation pair like sequential;\n  \
+             sequential: {sequential:?}\n  parallel:   {parallel:?}"
+        );
+    }
+
+    /// A paired UMI's `-` split point is dropped by `BitEnc::from_umi_str`, so two
+    /// DISTINCT canonical forms with the same concatenated bases but different split
+    /// points encode to the same `BitEnc`. This is only possible with ASYMMETRIC halves
+    /// (read-1 UMI length != read-2 UMI length); with symmetric halves the dash sits at a
+    /// fixed position, so distinct forms can never share concatenated bases.
+    ///
+    /// fgbio (`GroupReadsByUmi.PairedUmiAssigner`) and fgumi's sequential
+    /// `PairedUmiAssigner` compare the dash-delimited string byte-for-byte (dash-sensitive,
+    /// both orientations), so they keep such forms in separate molecules. The parallel
+    /// path's `BitEnc`-keyed edge discovery cannot see the dash: an error-neighbour of the
+    /// shared encoding bridges the two forms in `BitEnc` space, over-merging (or, via the
+    /// `umi_to_idx` collision losing an index, mis-partitioning) versus the sequential
+    /// reference -- a `--threads`-dependent divergence.
+    ///
+    /// Here `AC-GTT` (x4) is a dash-sensitive 1-neighbour of `AC-GTA` but NOT of `ACG-TA`
+    /// (their dashes are at different positions -> >=2 mismatches). All three encode with
+    /// `AC-GTA` and `ACG-TA` colliding on `ACGTA`. The sequential/fgbio partition is
+    /// `{AC-GTT, AC-GTA}` + `{ACG-TA}`; the un-guarded parallel path instead isolates
+    /// `AC-GTA` and groups `ACG-TA` with `AC-GTT`. The collision guard detects the shared
+    /// encoding and delegates the pool to the sequential assigner, restoring parity.
+    #[test]
+    fn test_parallel_paired_mixed_half_length_collision_matches_sequential() {
+        let umis: Vec<String> = vec!["AC-GTT", "AC-GTT", "AC-GTT", "AC-GTT", "AC-GTA", "ACG-TA"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        let sequential = crate::umi::PairedUmiAssigner::new(1).assign(&umis);
+        let parallel = ParallelPairedAssigner::new(1, 2).assign(&umis);
+
+        // Sanity: the sequential (fgbio-faithful) partition keeps `ACG-TA` (index 5)
+        // separate from the `AC-GTT`/`AC-GTA` molecule (indices 0-4).
+        assert_ne!(
+            sequential[4].base_id_string(),
+            sequential[5].base_id_string(),
+            "sequential should keep the different-split-point form separate; got {sequential:?}"
+        );
+        assert_eq!(
+            sequential[0].base_id_string(),
+            sequential[4].base_id_string(),
+            "sequential should group AC-GTT with its 1-neighbour AC-GTA; got {sequential:?}"
+        );
+
+        // The parallel assigner must induce the same base-molecule partition despite the
+        // `BitEnc` collision between `AC-GTA` and `ACG-TA`.
+        assert!(
+            same_partition(&sequential, &parallel),
+            "parallel paired must match the sequential partition on mixed-half-length \
+             collisions;\n  sequential: {sequential:?}\n  parallel:   {parallel:?}"
+        );
+    }
+
+    /// Asymmetric halves can diverge WITHOUT a forward-encoding collision. Dropping the
+    /// `-` moves the split, so the halves-swapped reverse encoding used by
+    /// [`discover_paired_reverse_edges`] no longer corresponds to a dash-sensitive reverse:
+    /// it can spuriously fall within threshold of another form's forward encoding, forging a
+    /// reverse edge that fgbio and the sequential `PairedUmiAssigner` (both dash-sensitive in
+    /// each orientation) never draw.
+    ///
+    /// At `max_mismatches = 1`, `A-AC` (x2) and `A-CT` are distinct molecules sequentially:
+    /// `matches_paired` compares `A-AC`/`A-CT` (2 mismatches) and `AC-A`/`A-CT` (2
+    /// mismatches), both above threshold. But their forward encodings `AAC` and `ACT` are
+    /// distinct (no collision to catch), while the reverse encoding of `A-AC` is `ACA`, which
+    /// is Hamming-1 from `ACT` -> the parallel reverse pass forges an `A-AC`--`A-CT` edge and
+    /// over-merges. A collision-only guard misses this; delegating every asymmetric-halves
+    /// pool to the sequential assigner covers it.
+    #[test]
+    fn test_parallel_paired_asymmetric_noncollision_matches_sequential() {
+        let umis: Vec<String> =
+            vec!["A-AC", "A-AC", "A-CT"].into_iter().map(String::from).collect();
+
+        let sequential = crate::umi::PairedUmiAssigner::new(1).assign(&umis);
+        let parallel = ParallelPairedAssigner::new(1, 2).assign(&umis);
+
+        // Sanity: sequentially `A-CT` (index 2) is its own molecule, distinct from the
+        // `A-AC` pair (indices 0-1) -- no forward-encoding collision is involved.
+        assert_ne!(
+            sequential[0].base_id_string(),
+            sequential[2].base_id_string(),
+            "sequential should keep A-AC and A-CT separate; got {sequential:?}"
+        );
+
+        assert!(
+            assignments_equivalent(&sequential, &parallel),
+            "parallel paired must match sequential on asymmetric-halves pools even without \
+             a forward-encoding collision;\n  sequential: {sequential:?}\n  parallel:   {parallel:?}"
+        );
+    }
+
+    /// Assert `actual` matches a hand-derived fgbio oracle.
+    ///
+    /// `expected[i] = (group, strand)`, where `group` is an arbitrary label shared by
+    /// every read fgbio places in one *base* molecule and `strand` is fgbio's absolute
+    /// duplex suffix (`'A'` for `/A` / [`MoleculeId::PairedA`], `'B'` for `/B` /
+    /// [`MoleculeId::PairedB`]). This checks the base-molecule partition and each read's
+    /// absolute strand, but not the concrete numeric molecule id (a relabeling).
+    ///
+    /// The oracle values are derived by hand from fgbio's `PairedUmiAssigner`
+    /// (`GroupReadsByUmi.assignIdsToNodes`): the canonical (lexically-smaller-half-first)
+    /// spelling of a cluster's root maps to `/A` and its reverse to `/B`; a descendant
+    /// takes `/A` for the orientation closer to the root and `/B` for the other; and
+    /// fgbio's `Map` last-write-wins gives the palindrome quirks (a palindrome root
+    /// canonical spelling resolves to `/B`, a palindrome descendant to `/A`). Because the
+    /// oracle is independent of BOTH fgumi assigners, a shared sequential/parallel defect
+    /// cannot satisfy it.
+    fn assert_matches_fgbio_oracle(actual: &[MoleculeId], expected: &[(u32, char)]) {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "length mismatch: actual={actual:?} expected={expected:?}"
+        );
+        // Base-molecule partition: reads i and j share a base id IFF the oracle groups match.
+        for i in 0..actual.len() {
+            for j in 0..actual.len() {
+                let actual_same = actual[i].base_id_string() == actual[j].base_id_string();
+                let expected_same = expected[i].0 == expected[j].0;
+                assert_eq!(
+                    actual_same, expected_same,
+                    "base-partition mismatch at ({i},{j}); actual={actual:?} expected={expected:?}"
+                );
+            }
+        }
+        // Absolute strand per read.
+        for (i, (id, &(_, strand))) in actual.iter().zip(expected).enumerate() {
+            let actual_strand = match id {
+                MoleculeId::PairedA(_) => 'A',
+                MoleculeId::PairedB(_) => 'B',
+                other => panic!("read {i}: expected a paired strand, got {other:?}"),
+            };
+            assert_eq!(
+                actual_strand, strand,
+                "strand mismatch at read {i}; actual={actual:?} expected={expected:?}"
+            );
+        }
+    }
+
+    /// GRP3-01 fgbio oracle: pin the fgbio-derived base-molecule partition AND absolute
+    /// `/A` `/B` strand for the reverse-aware paired cases, and assert BOTH the sequential
+    /// `PairedUmiAssigner` and the parallel `ParallelPairedAssigner` reproduce it.
+    ///
+    /// The other reverse-orientation suites compare parallel against the sequential
+    /// assigner only, so a defect shared by both would pass. This table's expectations
+    /// are hand-derived from fgbio's `PairedUmiAssigner` (see
+    /// [`assert_matches_fgbio_oracle`]), giving an oracle independent of either fgumi
+    /// implementation. Each case carries its own `max_mismatches` threshold. Covers reverse
+    /// edges, palindrome roots, palindrome children, equal-count tie-breaking, the child-count
+    /// threshold boundary (inclusion and exclusion) at `max_mismatches = 1`, and a reverse-only
+    /// edge at `max_mismatches = 2`, per the grouping path's fgbio-parity requirement.
+    #[rstest]
+    // Reverse-orientation edge that canonicalization alone misses; equal counts, so the
+    // root is the lexically-smaller canonical "ATTT-CAAA" (=> /A) and "CAAA-GTTT" the
+    // reversed descendant (=> /B). The tie-break choosing the root is what fixes strand
+    // here: rooting on the other member would invert both labels.
+    #[case::reverse_edge_equal_count_tiebreak(
+        &["CAAA-GTTT", "ATTT-CAAA"],
+        &[(0, 'B'), (0, 'A')],
+        1,
+    )]
+    // Palindrome root (halves equal => umi == reverse(umi)): fgbio maps the root canonical
+    // spelling then its (identical) reverse, so last-write-wins lands the palindrome root
+    // on /B. Its non-palindrome descendant "ACGT-ACGA", reached in the reverse spelling,
+    // takes /A.
+    #[case::palindrome_root(
+        &["ACGT-ACGT", "ACGT-ACGT", "ACGT-ACGA"],
+        &[(0, 'B'), (0, 'B'), (0, 'A')],
+        1,
+    )]
+    // Palindrome descendant "AAAA-AAAA" under a non-palindrome root "AAAA-AAAC": fgbio's
+    // else-branch maps the palindrome child to /B then its identical reverse to /A, so
+    // last-write-wins lands the palindrome child on /A. The reverse spelling of the root
+    // ("AAAC-AAAA", index 2) is the strand-/B counterpart, so not every read is /A.
+    #[case::palindrome_child(
+        &["AAAA-AAAC", "AAAA-AAAC", "AAAC-AAAA", "AAAA-AAAA"],
+        &[(0, 'A'), (0, 'A'), (0, 'B'), (0, 'A')],
+        1,
+    )]
+    // Threshold boundary, INCLUDED: descendant count 3 == root_count(5)/2 + 1 == 3, so the
+    // "AAAA-CCCG" node joins the "AAAA-CCCC" molecule (one group).
+    #[case::threshold_boundary_included(
+        &[
+            "AAAA-CCCC", "AAAA-CCCC", "AAAA-CCCC", "AAAA-CCCC", "AAAA-CCCC",
+            "AAAA-CCCG", "AAAA-CCCG", "AAAA-CCCG",
+        ],
+        &[(0, 'A'), (0, 'A'), (0, 'A'), (0, 'A'), (0, 'A'), (0, 'A'), (0, 'A'), (0, 'A')],
+        1,
+    )]
+    // Threshold boundary, EXCLUDED: descendant count 4 > root_count(5)/2 + 1 == 3, so the
+    // "AAAA-CCCG" node splits off into its own molecule (group 1), each a /A root.
+    #[case::threshold_boundary_excluded(
+        &[
+            "AAAA-CCCC", "AAAA-CCCC", "AAAA-CCCC", "AAAA-CCCC", "AAAA-CCCC",
+            "AAAA-CCCG", "AAAA-CCCG", "AAAA-CCCG", "AAAA-CCCG",
+        ],
+        &[(0, 'A'), (0, 'A'), (0, 'A'), (0, 'A'), (0, 'A'), (1, 'A'), (1, 'A'), (1, 'A'), (1, 'A')],
+        1,
+    )]
+    // Reverse-only edge that needs BOTH orientation-awareness AND a distance-2 threshold: the
+    // two canonical forms "ATTT-CAAA" and "CAAT-GTTT" are 7 mismatches apart forward, so they
+    // never draw a forward edge, but reverse("ATTT-CAAA") = "CAAA-ATTT" is exactly 2 mismatches
+    // from "CAAT-GTTT" (positions 4 and 6). At max_mismatches = 1 they are separate molecules;
+    // at max_mismatches = 2 the reverse edge merges them. Equal counts, so the root is the
+    // lexically-smaller canonical "ATTT-CAAA" (=> /A); its reverse-orientation descendant
+    // "CAAT-GTTT" is closer to the root's reverse than to the root, so its canonical spelling
+    // takes /B. This exercises the k=2 fgbio oracle path, which the other reverse cases (all
+    // k=1) leave to sequential-vs-parallel parity only.
+    #[case::reverse_only_distance_two(
+        &["ATTT-CAAA", "CAAT-GTTT"],
+        &[(0, 'A'), (0, 'B')],
+        2,
+    )]
+    fn test_paired_matches_fgbio_oracle(
+        #[case] umis: &[&str],
+        #[case] expected: &[(u32, char)],
+        #[case] max_mismatches: u32,
+    ) {
+        let umis: Vec<Umi> = umis.iter().map(|s| (*s).to_string()).collect();
+
+        // Both the sequential assigner AND the parallel assigner (at multiple thread
+        // counts) must reproduce the independent fgbio oracle at the case's threshold.
+        let sequential = crate::umi::PairedUmiAssigner::new(max_mismatches).assign(&umis);
+        assert_matches_fgbio_oracle(&sequential, expected);
+        for threads in [1usize, 4, 16] {
+            let parallel = ParallelPairedAssigner::new(max_mismatches, threads).assign(&umis);
+            assert_matches_fgbio_oracle(&parallel, expected);
+        }
     }
 
     #[test]
@@ -1820,5 +2285,99 @@ mod tests {
         let result2 = assigner2.assign(&umis);
 
         assert_same_groupings(&result1, &result2);
+    }
+
+    /// GRP3-T2: parallel-vs-sequential PAIRED parity property test.
+    ///
+    /// Builds a pool of paired UMIs from a handful of random molecules, emitting each
+    /// molecule in both orientations (`L-R` and `R-L`) and occasionally mutating a
+    /// single base — the exact shape that produces reverse-orientation adjacency
+    /// edges (GRP3-01). The parallel `ParallelPairedAssigner` must produce a grouping
+    /// equivalent to the sequential `PairedUmiAssigner` (identical base-molecule AND
+    /// strand partition) at every thread count, which also pins thread-determinism
+    /// (threads 1 ≡ 4 ≡ 16).
+    mod paired_parity_proptest {
+        use super::*;
+        use proptest::prelude::*;
+
+        const BASES: [char; 4] = ['A', 'C', 'G', 'T'];
+
+        /// Build the UMI pool from random molecules and per-read (molecule, orientation,
+        /// optional single-base mutation) descriptors.
+        fn build_pool(
+            molecules: &[(Vec<u8>, Vec<u8>)],
+            reads: &[(usize, bool, Option<usize>)],
+        ) -> Vec<String> {
+            let half = |v: &[u8]| -> String { v.iter().map(|&b| BASES[b as usize]).collect() };
+            let mols: Vec<(String, String)> =
+                molecules.iter().map(|(l, r)| (half(l), half(r))).collect();
+            reads
+                .iter()
+                .map(|&(mi, reversed, mutate)| {
+                    let (l, r) = &mols[mi % mols.len()];
+                    let mut chars: Vec<char> = if reversed {
+                        format!("{r}-{l}").chars().collect()
+                    } else {
+                        format!("{l}-{r}").chars().collect()
+                    };
+                    if let Some(pos) = mutate {
+                        // Map a base index 0..8 to a string index, skipping the dash at 4.
+                        let idx = if pos < 4 { pos } else { pos + 1 };
+                        if let Some(cur) = chars.get(idx).copied() {
+                            if cur != '-' {
+                                let ci = BASES.iter().position(|&c| c == cur).unwrap_or(0);
+                                chars[idx] = BASES[(ci + 1) % 4];
+                            }
+                        }
+                    }
+                    chars.into_iter().collect()
+                })
+                .collect()
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(300))]
+            #[test]
+            fn prop_parallel_paired_matches_sequential(
+                molecules in prop::collection::vec(
+                    (prop::collection::vec(0u8..4, 4), prop::collection::vec(0u8..4, 4)),
+                    1..=5,
+                ),
+                reads in prop::collection::vec(
+                    (0usize..5, any::<bool>(), prop::option::of(0usize..8)),
+                    1..=24,
+                ),
+                // Exercise the k=2 reverse-edge path (`generate_neighbors_k`, k>1) too,
+                // not just the k=1 fast path. These pools stay well under the sequential
+                // assigner's index threshold, so the sequential also uses its matcher
+                // (reverse-aware) path and remains the correct oracle at k=2.
+                max_mismatches in 1u32..=2,
+            ) {
+                let umis = build_pool(&molecules, &reads);
+                let sequential = crate::umi::PairedUmiAssigner::new(max_mismatches).assign(&umis);
+                for threads in [1usize, 4, 16] {
+                    let parallel = ParallelPairedAssigner::new(max_mismatches, threads).assign(&umis);
+                    prop_assert!(
+                        assignments_equivalent(&sequential, &parallel),
+                        "max_mismatches={max_mismatches} threads={threads}\n  umis={umis:?}\n  \
+                         seq={sequential:?}\n  par={parallel:?}"
+                    );
+                    // Same thread count, run twice: the two runs build independent
+                    // edge-set `AHashMap`s/`AHashSet`s (seeded per process at runtime), so
+                    // this is the direct probe for the adjacency-order nondeterminism the
+                    // adjacency-bucket sort in `ParallelPairedAssigner::assign` guards
+                    // against: without that sort, a threshold-boundary assignment could
+                    // differ between these two runs.
+                    let parallel_again =
+                        ParallelPairedAssigner::new(max_mismatches, threads).assign(&umis);
+                    prop_assert!(
+                        assignments_equivalent(&parallel, &parallel_again),
+                        "same-thread nondeterminism: max_mismatches={max_mismatches} \
+                         threads={threads}\n  umis={umis:?}\n  run1={parallel:?}\n  \
+                         run2={parallel_again:?}"
+                    );
+                }
+            }
+        }
     }
 }
