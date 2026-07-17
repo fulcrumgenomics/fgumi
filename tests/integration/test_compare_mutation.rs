@@ -607,33 +607,41 @@ fn positional_consensus_duplex_depth_compared_exactly(
     );
 }
 
-fn per_base_consensus_record(cd_bases: &[i16]) -> RawRecord {
+fn per_base_consensus_record(tag: SamTag, bases: &[i16]) -> RawRecord {
     let mut b = SamBuilder::new();
-    b.read_name(b"read1")
-        .sequence(b"ACGT")
-        .qualities(&[30; 4])
-        .add_array_i16(SamTag::CD_BASES, cd_bases);
+    b.read_name(b"read1").sequence(b"ACGT").qualities(&[30; 4]).add_array_i16(tag, bases);
     b.build()
 }
 
 #[rstest]
-#[case::exact(ContentPredicate::Exact)]
-#[case::exact_minus_mi(ContentPredicate::ExactMinusMi)]
-fn positional_per_base_consensus_tag_mutation_always_differs(#[case] pred: ContentPredicate) {
-    // The per-base `cd`/`ce` (`B:s`) arrays saturate identically in both tools — a change
-    // here must DIFFER under every predicate.
+fn positional_per_base_consensus_tag_mutation_always_differs(
+    #[values(ContentPredicate::Exact, ContentPredicate::ExactMinusMi)] pred: ContentPredicate,
+    // Every per-base (`B:s`) consensus array named by the consensus contract — the simplex
+    // `cd`/`ce` plus the duplex per-strand `aM`/`bM`/`aE`/`bE`. All are compared exactly under
+    // both predicates (no saturation carve-out here — that is `ExactConsensus`'s job), so a
+    // single-element change in any of them must DIFFER. Previously only `cd` was exercised.
+    #[values(
+        SamTag::CD_BASES,
+        SamTag::CE_BASES,
+        SamTag::AM_BASES,
+        SamTag::BM_BASES,
+        SamTag::AE_BASES,
+        SamTag::BE_BASES
+    )]
+    tag: SamTag,
+) {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
     let bam1 = tmp.path().join("a.bam");
     let bam2 = tmp.path().join("b.bam");
-    write_bam(&bam1, &header, &[per_base_consensus_record(&[10, 10, 10, 10])]);
-    write_bam(&bam2, &header, &[per_base_consensus_record(&[10, 10, 9, 10])]);
+    write_bam(&bam1, &header, &[per_base_consensus_record(tag, &[10, 10, 10, 10])]);
+    write_bam(&bam2, &header, &[per_base_consensus_record(tag, &[10, 10, 9, 10])]);
 
     let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, pred)
         .expect("positional_compare should succeed");
     assert!(
         !outcome.is_match(),
-        "a per-base consensus tag change must DIFFER under {pred:?}: {outcome:?}"
+        "a per-base consensus tag {tag:?} change must DIFFER under {pred:?}: {outcome:?}"
     );
 }
 
@@ -821,11 +829,18 @@ fn molecule_join_reordered_molecules_same_grouping_is_not_a_diff() {
     // must NOT DIFFER.
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
-    let r1 = mi_record(b"read1", 100, "1");
-    let r2 = mi_record(b"read2", 200, "1");
-    let r3 = mi_record(b"read3", 300, "2");
-    let records1 = vec![r1.clone(), r2.clone(), r3.clone()];
-    let records2 = vec![r3, r1, r2];
+    // MI is a monotonic emission-order counter in both tools, so bam2 (which emits {read3}
+    // first) numbers it 1 and {read1,read2} 2 — reordered and renumbered, each file monotonic.
+    let records1 = vec![
+        mi_record(b"read1", 100, "1"),
+        mi_record(b"read2", 200, "1"),
+        mi_record(b"read3", 300, "2"),
+    ];
+    let records2 = vec![
+        mi_record(b"read3", 300, "1"),
+        mi_record(b"read1", 100, "2"),
+        mi_record(b"read2", 200, "2"),
+    ];
     let bam1 = tmp.path().join("a.bam");
     let bam2 = tmp.path().join("b.bam");
     write_bam(&bam1, &header, &records1);
@@ -1484,8 +1499,8 @@ const MUTATION_CATALOG: &[CatalogEntry] = &[
         verify: || {
             positional_differs(
                 &create_minimal_header("chr1", 10000),
-                &[per_base_consensus_record(&[10, 10, 10, 10])],
-                &[per_base_consensus_record(&[10, 10, 9, 10])],
+                &[per_base_consensus_record(SamTag::CD_BASES, &[10, 10, 10, 10])],
+                &[per_base_consensus_record(SamTag::CD_BASES, &[10, 10, 9, 10])],
                 ContentPredicate::Exact,
             )
         },
@@ -1666,10 +1681,20 @@ const MUTATION_CATALOG: &[CatalogEntry] = &[
         mutation: "reordered molecules same grouping",
         must_differ: false,
         verify: || {
-            let r1 = mi_record(b"read1", 100, "1");
-            let r2 = mi_record(b"read2", 200, "1");
-            let r3 = mi_record(b"read3", 300, "2");
-            molecule_join_differs(&[r1.clone(), r2.clone(), r3.clone()], &[r3, r1, r2])
+            // MI is a monotonic emission-order counter, so bam2 (emitting {read3} first)
+            // numbers it 1 and {read1,read2} 2 — reordered and renumbered, each file monotonic.
+            molecule_join_differs(
+                &[
+                    mi_record(b"read1", 100, "1"),
+                    mi_record(b"read2", 200, "1"),
+                    mi_record(b"read3", 300, "2"),
+                ],
+                &[
+                    mi_record(b"read3", 300, "1"),
+                    mi_record(b"read1", 100, "2"),
+                    mi_record(b"read2", 200, "2"),
+                ],
+            )
         },
     },
     CatalogEntry {

@@ -448,18 +448,18 @@ fn test_grouping_mode_ignore_order() {
 /// Runs `CompareBams::execute()` in-process under `--mode grouping` (plus any `extra_args`,
 /// e.g. `--ignore-order`) and returns the error's full display string. Panics if `execute`
 /// succeeds, or if it fails with a [`CompareMismatch`] (a genuine record-level DIFFER) rather
-/// than the fully-MI-less hard-fail this helper exists to capture (Finding A, Task 8) —
-/// mirrors `run_compare_content_expect_err`'s success/DIFFER-vs-hard-error distinction for
-/// the grouping-mode guard.
+/// than the MI-less hard-fail this helper exists to capture (`molecule_runs` rejects the first
+/// record with no/unparseable MI) — mirrors `run_compare_content_expect_err`'s
+/// success/DIFFER-vs-hard-error distinction for the grouping-mode MI-less rejection.
 fn run_compare_grouping_expect_err(bam1: &Path, bam2: &Path, extra_args: &[&str]) -> String {
     let mut args: Vec<&str> =
         vec!["bams", bam1.to_str().unwrap(), bam2.to_str().unwrap(), "--mode", "grouping"];
     args.extend(extra_args);
     let cmd = CompareBams::try_parse_from(args).expect("failed to parse compare bams args");
     match cmd.execute("fgumi compare bams") {
-        Ok(()) => panic!("expected compare bams to hard-fail on fully-MI-less input"),
+        Ok(()) => panic!("expected compare bams to hard-fail on MI-less input"),
         Err(e) if e.is::<CompareMismatch>() => {
-            panic!("expected the fully-MI-less guard error, got a CompareMismatch (DIFFER): {e:#}")
+            panic!("expected the MI-less rejection error, got a CompareMismatch (DIFFER): {e:#}")
         }
         Err(e) => format!("{e:#}"),
     }
@@ -470,31 +470,27 @@ fn run_compare_grouping_expect_err(bam1: &Path, bam2: &Path, extra_args: &[&str]
 //
 // The old (retired) key-join engine explicitly counted "missing MI" records and always
 // DIFFERed when both files entirely lacked MI tags, on the theory that "no grouping has
-// been verified" must never read as EQUIVALENT. The streaming molecule-join engine
-// (`molecule_runs`) has no such per-record check: consecutive records with no MI tag
-// (`base == None`) are simply grouped into one molecule, like any other base-MI value —
-// which, left unguarded, let two *content-identical* fully-MI-less BAMs MATCH (Task 7
-// finding). `molecule_join_compare` closes that gap with an explicit whole-input guard
-// (Finding A, Task 8): if EITHER side is non-empty and never saw an MI tag on any record,
-// the compare hard-fails rather than reporting MATCH or DIFFER — see the `saw_mi1`/
-// `saw_mi2` tracking and the `bail!` in `molecule_join_compare`. This is a deliberate,
-// user-facing oracle-semantics change: `--mode grouping`/`--command group` require
-// already-grouped (same-MI-consecutive) input, and feeding it any non-empty ungrouped
-// input on either side is now a hard error instead of silently reporting MATCH or an
-// ordinary molecule-count DIFFER.
+// been verified" must never read as EQUIVALENT. The streaming molecule-join engine enforces
+// the same principle, but *per record and upstream*: `molecule_runs` yields an `Err` on the
+// first record whose MI tag is missing or unparseable (`base == None`), and
+// `molecule_join_compare` propagates that error via `?`. So `--mode grouping`/`--command
+// group` require already-grouped (same-MI-consecutive, every-read-MI-tagged) input, and
+// feeding any non-empty input with an MI-less record on either side is a hard error rather
+// than silently reporting MATCH or an ordinary molecule-count DIFFER.
 //
-// The guard originally only fired when **both** sides were fully MI-less, which left a
-// soundness hole: a *partial*-MI-less pair (one side genuinely grouped, the other entirely
-// MI-less) still routed through the ordinary molecule-join path, so if the MI-less side's
-// single spanning run happened to canonical-id-match a real molecule on the other side
-// (same member records), the pair reported a false MATCH despite one side never having
-// verified any grouping at all — see
-// `test_grouping_mi_less_side_with_matching_records_on_other_side_now_errors` below, which
-// locks in the closed hole. The guard now rejects *either* non-empty MI-less side
-// unconditionally, so every partial-MI-less pair is a hard error now, not just the ones
-// that happened to produce a false MATCH (see the same test, and
-// `test_grouping_partial_mi_less_pair_now_errors_via_guard` for the count-asymmetry case
-// that used to DIFFER before this fix).
+// Enforcing this per record (rather than with a whole-input "never saw an MI" guard) is what
+// closes the *partial*-MI-less soundness hole. Consider a side with some records tagged and
+// some not, or an entirely-MI-less side whose single spanning run happens to
+// canonical-id/content-match a real molecule on the grouped side: because the join compares
+// content *excluding* MI, such a pair could report a false MATCH despite one side never
+// having verified any grouping. A whole-input guard that only checked "did this side ever see
+// an MI" would pass the mixed case (it *did* see one); the per-record check in `molecule_runs`
+// rejects the first MI-less record regardless. See
+// `test_grouping_mi_less_side_with_matching_records_on_other_side_now_errors` (the
+// canonical-id-collision false MATCH), `test_grouping_partial_mi_less_pair_now_errors` (the
+// count-asymmetry case that used to DIFFER), and
+// `test_grouping_mixed_mi_within_one_side_errors` (the mixed-within-a-side case a whole-input
+// guard would miss).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -550,19 +546,19 @@ fn test_grouping_unordered_content_identical_but_mi_missing_in_both_bams_errors(
     write_bam(&bam2, &header, &records);
 
     // See this section's header comment / Finding A: `--ignore-order` doesn't change the
-    // fully-MI-less guard outcome.
+    // fully-MI-less rejection outcome.
     let err = run_compare_grouping_expect_err(&bam1, &bam2, &["--ignore-order"]);
     assert!(err.contains("MI-tagged"), "got: {err}");
 }
 
-/// Review fix (guard hole closed): a partial-MI-less pair — one side grouped, the other
-/// not — is now a hard error via the guard, not an ordinary molecule-count DIFFER. Before
-/// this fix, the guard only fired when *both* sides were fully MI-less, so this case fell
-/// through to the normal molecule-join path and `DIFFERed` via `bam1_molecules` (2) !=
-/// `bam2_molecules` (1); the widened guard (either non-empty side being MI-less is
-/// misuse) now catches it up front regardless of whether the counts would have matched.
+/// Review fix (soundness hole closed): a partial-MI-less pair — one side grouped, the other
+/// not — is now a hard error, not an ordinary molecule-count DIFFER. Before this fix the check
+/// only fired when *both* sides were fully MI-less, so this case fell through to the normal
+/// molecule-join path and `DIFFERed` via `bam1_molecules` (2) != `bam2_molecules` (1);
+/// `molecule_runs`' per-record MI check now rejects the MI-less side up front, regardless of
+/// whether the counts would have matched.
 #[test]
-fn test_grouping_partial_mi_less_pair_now_errors_via_guard() {
+fn test_grouping_partial_mi_less_pair_now_errors() {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
 
@@ -581,15 +577,44 @@ fn test_grouping_partial_mi_less_pair_now_errors_via_guard() {
     assert!(err.contains("MI-tagged"), "got: {err}");
 }
 
-/// CRITICAL soundness regression: the guard hole this fix closes. bam1 is entirely
-/// MI-less, so `molecule_runs` folds its two records into a single spanning run; bam2
-/// has ONE real MI-tagged molecule containing the *same* two records (same canonical id —
-/// the lexicographically smallest read name — and the same member content). Before this
-/// fix the guard only fired when *both* sides were fully MI-less, so this partial-MI-less
-/// pair fell through to the ordinary molecule-join path: one run per side, matching
-/// canonical id, matching members -> a false MATCH despite bam1 never having verified any
-/// grouping at all. The widened guard (either non-empty MI-less side is misuse) now
-/// rejects this pair outright.
+/// Independent oracle (mixed-within-a-side): the case a whole-input "did this side ever see an
+/// MI" guard would MISS. bam2 is *partially* grouped — its first record carries an MI, its
+/// second does not — so such a guard would pass it (the side did see an MI). Because the join
+/// compares content excluding MI, `read2` losing its MI would otherwise still content-match its
+/// tagged counterpart in bam1, a false MATCH for a tool that dropped MI on one molecule. The
+/// per-record check in `molecule_runs` rejects bam2's first MI-less record (`read2`) outright.
+/// This is a genuinely different failure mode from the fully-MI-less-side tests above, not a
+/// self-consistency rephrasing of them.
+#[test]
+fn test_grouping_mixed_mi_within_one_side_errors() {
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10000);
+
+    // bam1: two fully MI-tagged molecules.
+    let grouped = vec![mi_record(b"read1", 100, "1"), mi_record(b"read2", 200, "2")];
+    // bam2: read1 keeps its MI, read2 has dropped it -> a *mixed* side. A whole-input guard
+    // that only asks "did this side ever see an MI" would pass this (it did, on read1); the
+    // per-record check rejects read2.
+    let mixed = vec![mi_record(b"read1", 100, "1"), mapped_record(b"read2", 200)];
+
+    let bam1 = tmp.path().join("a.bam");
+    let bam2 = tmp.path().join("b.bam");
+    write_bam(&bam1, &header, &grouped);
+    write_bam(&bam2, &header, &mixed);
+
+    let err = run_compare_grouping_expect_err(&bam1, &bam2, &[]);
+    assert!(err.contains("MI-tagged"), "got: {err}");
+    assert!(err.contains("not grouped"), "got: {err}");
+}
+
+/// CRITICAL soundness regression: the false-MATCH hole this fix closes. bam1 is entirely
+/// MI-less; absent a per-record check `molecule_runs` would fold its two records into a single
+/// spanning run. bam2 has ONE real MI-tagged molecule containing the *same* two records (same
+/// canonical id — the lexicographically smallest read name — and the same member content).
+/// Before this fix the check only fired when *both* sides were fully MI-less, so this pair fell
+/// through to the ordinary molecule-join path: one run per side, matching canonical id,
+/// matching members -> a false MATCH despite bam1 never having verified any grouping at all.
+/// `molecule_runs` now rejects bam1's first MI-less record outright, before any match is made.
 #[test]
 fn test_grouping_mi_less_side_with_matching_records_on_other_side_now_errors() {
     let tmp = TempDir::new().unwrap();
@@ -612,11 +637,10 @@ fn test_grouping_mi_less_side_with_matching_records_on_other_side_now_errors() {
 }
 
 /// Review fix (empty-vs-empty exemption): two EMPTY grouped BAMs (zero records on both
-/// sides) must MATCH, not hit the fully-MI-less guard. Neither side ever sees an MI tag —
-/// there are no records at all to see one on — but there is also nothing to compare, so this
-/// is a vacuous MATCH, not the "misuse" case (non-empty, fully MI-less input) the guard
-/// exists to catch. See `molecule_join_compare`'s guard condition, which only fires when at
-/// least one side actually produced molecules.
+/// sides) must MATCH, not be rejected as MI-less. There are no records at all, so
+/// `molecule_runs` yields no runs and never encounters an MI-less record to reject — and
+/// there is also nothing to compare, so this is a vacuous MATCH, not the "misuse" case
+/// (a non-empty input with an MI-less record) the per-record check exists to catch.
 #[test]
 fn test_grouping_mode_both_empty_bams_match() {
     let tmp = TempDir::new().unwrap();
@@ -640,21 +664,20 @@ fn test_grouping_mode_both_empty_bams_match() {
     );
 }
 
-/// Review fix (guard-vs-diff precedence): both existing MI-less-guard tests above use
-/// *identical* content on both sides, so the fully-MI-less guard firing was never
-/// distinguished from an ordinary content DIFFER also firing. This test uses genuinely
-/// different content (same read names/keys so the records would otherwise pair up and
-/// surface a POS content diff — see `RecordKey`'s doc comment on POS not being part of a
-/// primary record's identity) on two fully MI-less BAMs, and locks that the fully-MI-less
-/// guard still wins: the compare hard-fails with the guard's message rather than reporting
-/// an ordinary DIFFER.
+/// Review fix (error-vs-diff precedence): both existing MI-less tests above use *identical*
+/// content on both sides, so the MI-less rejection was never distinguished from an ordinary
+/// content DIFFER also firing. This test uses genuinely different content (same read
+/// names/keys so the records would otherwise pair up and surface a POS content diff — see
+/// `RecordKey`'s doc comment on POS not being part of a primary record's identity) on two
+/// fully MI-less BAMs, and locks that the MI-less rejection still wins: the compare hard-fails
+/// with the "not grouped / MI-tagged" message rather than reporting an ordinary DIFFER.
 #[test]
-fn test_grouping_mode_mi_missing_and_content_differs_still_errors_via_guard() {
+fn test_grouping_mode_mi_missing_and_content_differs_still_errors() {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
 
     // No MI tag on either side, but genuinely different content (different positions) so
-    // that, absent the guard, this would be an ordinary content DIFFER, not a MATCH.
+    // that, absent the MI-less rejection, this would be an ordinary content DIFFER, not a MATCH.
     let records1 = vec![mapped_record(b"read1", 100), mapped_record(b"read2", 200)];
     let records2 = vec![mapped_record(b"read1", 150), mapped_record(b"read2", 250)];
 
@@ -824,6 +847,29 @@ fn paired_record(name: &[u8], segment_flag: u16, pos: i32) -> RawRecord {
         .pos(pos - 1)
         .mapq(60);
     b.build()
+}
+
+/// `positional_compare` is publicly re-exported, so a direct caller bypasses the CLI's
+/// `--batch-size` parser guard. A zero batch size must error at the engine boundary (the guard
+/// in `start_raw_batch_reader`) rather than hang: `read_raw_batch` would otherwise yield empty,
+/// non-EOF batches forever and the consumer's `recv()` would never make progress.
+#[test]
+fn test_positional_compare_zero_batch_size_errors() {
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10000);
+    let records = vec![mapped_record(b"read1", 100)];
+
+    let bam1 = tmp.path().join("a.bam");
+    let bam2 = tmp.path().join("b.bam");
+    write_bam(&bam1, &header, &records);
+    write_bam(&bam2, &header, &records);
+
+    let err = positional_compare(&bam1, &bam2, 1, 0, 100, ContentPredicate::Exact)
+        .expect_err("batch_size 0 must error at the engine boundary, not hang");
+    assert!(
+        err.to_string().contains("batch size must be at least 1"),
+        "expected the batch-size guard message, got: {err}"
+    );
 }
 
 #[test]
@@ -1006,12 +1052,20 @@ fn molecule_join_compare_reordered_molecules_same_mi_numbering_match() {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
 
-    let r1 = mi_record(b"read1", 100, "1");
-    let r2 = mi_record(b"read2", 200, "1");
-    let r3 = mi_record(b"read3", 300, "2");
-
-    let records1 = vec![r1.clone(), r2.clone(), r3.clone()]; // molecule MI1={read1,read2}, MI2={read3}
-    let records2 = vec![r3, r1, r2]; // same molecules, different physical order
+    // molecule A = {read1,read2}, molecule B = {read3}. bam1 emits A then B (MI 1, 2).
+    let records1 = vec![
+        mi_record(b"read1", 100, "1"),
+        mi_record(b"read2", 200, "1"),
+        mi_record(b"read3", 300, "2"),
+    ];
+    // bam2 emits B then A (reordered). MI is a monotonic emission-order counter, so B (emitted
+    // first) gets 1 and A gets 2 — the same molecules, different physical order AND renumbered,
+    // exactly as a different tool / tie-break would produce.
+    let records2 = vec![
+        mi_record(b"read3", 300, "1"),
+        mi_record(b"read1", 100, "2"),
+        mi_record(b"read2", 200, "2"),
+    ];
 
     let bam1 = tmp.path().join("a.bam");
     let bam2 = tmp.path().join("b.bam");
@@ -1333,13 +1387,14 @@ fn test_command_group_content_identical_mi_renumbered_and_reordered_matches() {
     let r3 = mi_record(b"read3", 300, "2");
     let records1 = vec![r1, r2, r3]; // molecule MI1={read1,read2}, MI2={read3}, each contiguous
 
-    // Same content, molecules reordered relative to each other, and MI values renumbered
-    // (fgumi's 1/1/2 relabeled as fgbio's 9/5/5) — exactly what a cross-tool `group`
-    // comparison must tolerate. Each MI's own records stay contiguous within the file.
+    // Same content, molecules reordered relative to each other, and MI values renumbered —
+    // exactly what a cross-tool `group` comparison must tolerate. MI is a monotonic
+    // emission-order counter, so the molecule emitted first here ({read3}) gets the lower MI (5)
+    // and {read1,read2} the higher (9): reordered AND renumbered, each file still MI-monotonic.
     let records2 = vec![
-        mi_record(b"read3", 300, "9"),
-        mi_record(b"read1", 100, "5"),
-        mi_record(b"read2", 200, "5"),
+        mi_record(b"read3", 300, "5"),
+        mi_record(b"read1", 100, "9"),
+        mi_record(b"read2", 200, "9"),
     ];
 
     let bam1 = tmp.path().join("a.bam");
@@ -1461,11 +1516,11 @@ fn test_command_group_content_diff_differs_with_max_diffs_zero() {
 
     let (code, stdout, stderr) = run_compare_command(&bam1, &bam2, "group", &["--max-diffs", "0"]);
 
-    assert_ne!(
+    assert_eq!(
         code,
-        Some(0),
-        "`--max-diffs 0` must not turn a real content diff into EQUIVALENT (exit 0), \
-         stdout:\n{stdout}\nstderr:\n{stderr}"
+        Some(1),
+        "`--max-diffs 0` must report a real content diff as DIFFER (exit 1, not the \
+         EQUIVALENT exit 0 and not a signal/parse failure), stdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(stdout.contains("DIFFER"), "Expected DIFFER in output, got:\n{stdout}");
 }
@@ -1487,13 +1542,14 @@ fn test_command_group_content_identical_but_mi_missing_in_both_bams_errors() {
 
     let (code, stdout, stderr) = run_compare_command(&bam1, &bam2, "group", &[]);
 
-    assert_ne!(
+    assert_eq!(
         code,
-        Some(0),
-        "content-identical, fully MI-less BAMs must hard-fail via `--command group`, \
-         stdout:\n{stdout}\nstderr:\n{stderr}"
+        Some(1),
+        "content-identical, fully MI-less BAMs must hard-fail via `--command group` \
+         (`molecule_runs` rejects the MI-less input with an `Err`, so `main` exits 1 — \
+         not a signal/parse failure), stdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    assert!(stderr.contains("MI-tagged"), "expected the MI-less guard message, got:\n{stderr}");
+    assert!(stderr.contains("MI-tagged"), "expected the MI-less rejection message, got:\n{stderr}");
 }
 
 // ============================================================================
@@ -2150,9 +2206,11 @@ fn write_two_molecules_reordered_and_renumbered(dir: &Path) -> (PathBuf, PathBuf
     let mut bam1_records = vec![mi_record(b"mol_a1", 100, "5"), mi_record(b"mol_a2", 100, "5")];
     bam1_records.extend([mi_record(b"mol_b1", 200, "6"), mi_record(b"mol_b2", 200, "6")]);
 
-    // bam2: M_b before M_a (reversed file order), MI renumbered (5->7, 6->9).
-    let mut bam2_records = vec![mi_record(b"mol_b1", 200, "9"), mi_record(b"mol_b2", 200, "9")];
-    bam2_records.extend([mi_record(b"mol_a1", 100, "7"), mi_record(b"mol_a2", 100, "7")]);
+    // bam2: M_b before M_a (reversed file order), MI renumbered. Both tools assign the MI as a
+    // monotonically increasing counter in emission order, so the molecule emitted first (M_b)
+    // gets the lower MI (7) and M_a the higher (9) — different values from bam1, still monotonic.
+    let mut bam2_records = vec![mi_record(b"mol_b1", 200, "7"), mi_record(b"mol_b2", 200, "7")];
+    bam2_records.extend([mi_record(b"mol_a1", 100, "9"), mi_record(b"mol_a2", 100, "9")]);
 
     let bam1 = dir.join("molecule_join_reordered1.bam");
     let bam2 = dir.join("molecule_join_reordered2.bam");
@@ -2244,15 +2302,24 @@ fn molecule_join_flags_molecule_only_in_bam2() {
 /// insertion order; with `max_diffs` capping the reported residuals to 3, the residual
 /// diagnostics must consistently report the *lexicographically first* three ids, in sorted
 /// order, run after run.
-#[test]
-fn molecule_join_residual_diagnostics_are_deterministic_and_sorted() {
+/// Both residual sides are covered: the residual molecules live entirely on one file, the
+/// other is empty, and the sorted, `max_diffs`-capped `only in bamN` diagnostics must be
+/// deterministic run-to-run. `pending2` (the `only in bam2` side) is exercised as well as
+/// `pending1`, so a regression to hash-order or wrong capping on either side is caught.
+#[rstest]
+#[case::residuals_only_in_bam1(true, "bam1")]
+#[case::residuals_only_in_bam2(false, "bam2")]
+fn molecule_join_residual_diagnostics_are_deterministic_and_sorted(
+    #[case] residuals_in_bam1: bool,
+    #[case] side_label: &str,
+) {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
 
     // Insertion order deliberately not sorted, so a hash-order-dependent drain would
     // report a different subset/order than the lexicographically-sorted one.
     let canon_ids = ["zebra", "mango", "apple", "banana", "cherry"];
-    let bam1_records: Vec<RawRecord> = canon_ids
+    let records: Vec<RawRecord> = canon_ids
         .iter()
         .enumerate()
         .map(|(i, name)| mi_record(name.as_bytes(), 100, &i.to_string()))
@@ -2260,8 +2327,16 @@ fn molecule_join_residual_diagnostics_are_deterministic_and_sorted() {
 
     let bam1 = tmp.path().join("residuals1.bam");
     let bam2 = tmp.path().join("residuals2.bam");
-    write_bam(&bam1, &header, &bam1_records);
-    write_bam(&bam2, &header, &[]);
+    let (records1, records2): (&[RawRecord], &[RawRecord]) =
+        if residuals_in_bam1 { (&records, &[]) } else { (&[], &records) };
+    write_bam(&bam1, &header, records1);
+    write_bam(&bam2, &header, records2);
+
+    // Lexicographically first three of {zebra, mango, apple, banana, cherry}.
+    let expected: Vec<String> = ["apple", "banana", "cherry"]
+        .iter()
+        .map(|id| format!("molecule {id} only in {side_label}"))
+        .collect();
 
     let max_diffs = 3;
     for _ in 0..5 {
@@ -2269,12 +2344,7 @@ fn molecule_join_residual_diagnostics_are_deterministic_and_sorted() {
             .expect("molecule_join_compare should succeed");
         assert!(!out.is_match());
         assert_eq!(
-            out.diff_details,
-            vec![
-                "molecule apple only in bam1".to_string(),
-                "molecule banana only in bam1".to_string(),
-                "molecule cherry only in bam1".to_string(),
-            ],
+            out.diff_details, expected,
             "residual diagnostics must be sorted and deterministic across runs: {:?}",
             out.diff_details
         );
@@ -2333,35 +2403,20 @@ fn molecule_join_duplicate_record_key_within_a_molecule_now_differs() {
 // Unlike the retired keyjoin engine (deleted in Task 7), `molecule_join_compare` is a
 // streaming two-sided hash-join: it holds only the bounded set of currently in-flight
 // molecules in memory and never writes a sorted run, scratch file, or spill directory. The
-// test below proves that by pointing the process's temp-dir env vars at an isolated, empty
-// directory for a large grouped-pair compare and asserting that directory's contents —
-// checked recursively, not just its top level — stay empty throughout.
-
-/// Recursively counts every file/subdirectory entry under `dir`, at any depth.
-///
-/// A shallow `read_dir(dir).count()` (the original version of this check) only counts
-/// entries directly inside `dir` — it cannot see a spill written into a subdirectory that a
-/// spilling engine created under `dir` (e.g. a `tempfile::tempdir()`-style scratch
-/// directory holding several sorted-run files). Walking recursively closes that gap.
-fn count_entries_recursive(dir: &Path) -> usize {
-    let mut count = 0;
-    for entry in std::fs::read_dir(dir).expect("read temp dir entries") {
-        let entry = entry.expect("read temp dir entry");
-        count += 1;
-        if entry.path().is_dir() {
-            count += count_entries_recursive(&entry.path());
-        }
-    }
-    count
-}
+// test below proves that by pointing the process's temp-dir env vars at a *non-directory* for
+// a large grouped-pair compare: any attempt to materialize a scratch file there fails with
+// `ENOTDIR`, so a spilling implementation could not succeed — and the compare succeeds.
 
 /// Writes two large grouped BAMs encoding `n_molecules` molecules apiece, each molecule
 /// comprising two member reads (`m{i}_1`, `m{i}_2`) that share an MI tag.
 ///
-/// bam2's molecules are emitted in adjacent-pair-swapped order relative to bam1 (`0,1,2,3,...`
-/// becomes `1,0,3,2,...`) — a bounded-distance reordering (never more than one molecule of
-/// lookahead) that still forces the join to buffer more than a single molecule at a time,
-/// without requiring unbounded buffering the way a fully-scrambled order would.
+/// bam2's molecules are emitted in adjacent-pair-swapped physical order relative to bam1
+/// (`0,1,2,3,...` becomes `1,0,3,2,...`) — a bounded-distance reordering (never more than one
+/// molecule of lookahead) that still forces the join to buffer more than a single molecule at a
+/// time, without requiring unbounded buffering the way a fully-scrambled order would. The MI in
+/// each file is assigned by *file position* (a monotonic counter, as both grouping tools do), so
+/// a physical molecule carries a different MI in bam2 than in bam1 — exercising the join's
+/// renumber-tolerance and order-independence while keeping each file's MI monotonic.
 ///
 /// Used by [`molecule_join_does_not_spill_to_disk`] to prove the streaming molecule-join
 /// engine never spills: peak buffering scales with the (bounded) number of in-flight
@@ -2369,23 +2424,30 @@ fn count_entries_recursive(dir: &Path) -> usize {
 fn write_large_grouped_pair(dir: &Path, n_molecules: usize) -> (PathBuf, PathBuf) {
     let header = create_minimal_header("chr1", 10_000);
 
-    let molecule_records = |i: usize| -> Vec<RawRecord> {
-        let mi = i.to_string();
+    // A molecule's *identity* is its read names (`m{physical}_*`); its MI is assigned separately
+    // by emission-order file position so each file stays MI-monotonic.
+    let molecule_records = |physical: usize, mi: usize| -> Vec<RawRecord> {
+        let mi_s = mi.to_string();
         vec![
-            mi_record(format!("m{i}_1").as_bytes(), 100, &mi),
-            mi_record(format!("m{i}_2").as_bytes(), 100, &mi),
+            mi_record(format!("m{physical}_1").as_bytes(), 100, &mi_s),
+            mi_record(format!("m{physical}_2").as_bytes(), 100, &mi_s),
         ]
     };
 
-    let bam1_records: Vec<RawRecord> = (0..n_molecules).flat_map(molecule_records).collect();
+    // bam1: physical molecule i at position i, MI = i (monotonic).
+    let bam1_records: Vec<RawRecord> =
+        (0..n_molecules).flat_map(|i| molecule_records(i, i)).collect();
 
-    // bam2: adjacent-pair-swapped molecule order — bounded (distance-1) reordering.
+    // bam2: adjacent-pair-swapped physical order, MI = file position (still monotonic).
     let mut swapped_order: Vec<usize> = (0..n_molecules).collect();
     for pair in swapped_order.chunks_mut(2) {
         pair.reverse();
     }
-    let bam2_records: Vec<RawRecord> =
-        swapped_order.into_iter().flat_map(molecule_records).collect();
+    let bam2_records: Vec<RawRecord> = swapped_order
+        .into_iter()
+        .enumerate()
+        .flat_map(|(pos, physical)| molecule_records(physical, pos))
+        .collect();
 
     let bam1 = dir.join("large_grouped1.bam");
     let bam2 = dir.join("large_grouped2.bam");
@@ -2398,13 +2460,16 @@ fn write_large_grouped_pair(dir: &Path, n_molecules: usize) -> (PathBuf, PathBuf
 /// distance compares with bounded buffering, and writes nothing at all to the process's temp
 /// location.
 ///
-/// The BAM fixtures live in their own directory (`fixtures`), separate from the directory
-/// this test points `TMPDIR`/`TEMP`/`TMP` at (`isolated_tmp`) — counting entries beside the
-/// BAM fixtures (the original version of this test) cannot catch a spill routed through
-/// `tempfile`/`std::env::temp_dir()` to the *actual* system temp directory, since that has
-/// nothing to do with wherever the fixtures happen to live. Pointing the standard temp-dir
-/// env vars at a directory this test controls, and asserting its RECURSIVE contents (see
-/// [`count_entries_recursive`]) stay empty across the compare, closes that gap.
+/// Inspecting a temp *directory* after the run cannot catch a spill that a spilling engine
+/// creates and then deletes mid-compare — the directory is empty again by the time the check
+/// runs. This test closes that gap by pointing the standard temp-dir env vars
+/// (`TMPDIR`/`TEMP`/`TMP`) at a regular *file* rather than a directory: any attempt to
+/// materialize a scratch file *under* that path fails with `ENOTDIR`, so a spilling
+/// implementation would abort. The compare succeeding therefore proves nothing was spilled —
+/// transient or persisted.
+///
+/// The BAM fixtures live in their own directory, separate from the non-directory temp target,
+/// so the fixtures themselves are unaffected.
 ///
 /// This drives the real `fgumi compare bams --mode grouping` subprocess, rather than calling
 /// `molecule_join_compare` in-process, so the env vars are scoped to the child process; the
@@ -2416,34 +2481,29 @@ fn molecule_join_does_not_spill_to_disk() {
     let fixtures = TempDir::new().unwrap();
     let (bam1, bam2) = write_large_grouped_pair(fixtures.path(), 50_000 /* molecules */);
 
-    let isolated_tmp = TempDir::new().unwrap();
-    assert_eq!(
-        count_entries_recursive(isolated_tmp.path()),
-        0,
-        "isolated temp dir must start empty"
-    );
+    // A regular file, not a directory: creating any scratch file *under* this path fails with
+    // ENOTDIR, so a spilling implementation cannot succeed.
+    let tmp_holder = TempDir::new().unwrap();
+    let non_dir_tmp = tmp_holder.path().join("not-a-directory");
+    std::fs::write(&non_dir_tmp, b"").expect("failed to create non-directory temp target");
 
     let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
         .args(["compare", "bams"])
         .arg(&bam1)
         .arg(&bam2)
         .args(["--mode", "grouping"])
-        .env("TMPDIR", isolated_tmp.path())
-        .env("TEMP", isolated_tmp.path())
-        .env("TMP", isolated_tmp.path())
+        .env("TMPDIR", &non_dir_tmp)
+        .env("TEMP", &non_dir_tmp)
+        .env("TMP", &non_dir_tmp)
         .output()
         .expect("failed to run fgumi compare bams");
 
     assert!(
         output.status.success(),
-        "the large grouped pair must compare EQUIVALENT, got exit {:?}\nstdout: {}\nstderr: {}",
+        "the large grouped pair must compare EQUIVALENT with spilling made impossible (temp \
+         dir pointed at a non-directory), got exit {:?}\nstdout: {}\nstderr: {}",
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
-    );
-    assert_eq!(
-        count_entries_recursive(isolated_tmp.path()),
-        0,
-        "no spill/scratch file may be written to the isolated temp dir"
     );
 }

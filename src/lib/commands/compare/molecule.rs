@@ -8,7 +8,6 @@
 use anyhow::{Result, anyhow};
 use fgumi_raw_bam::RawRecord;
 use fgumi_sort::RawBamRecordReader;
-use std::collections::HashSet;
 use std::io::Read;
 
 use super::bams::get_mi_tag_raw;
@@ -34,52 +33,116 @@ impl MoleculeRun {
 
 /// Stream `reader` into per-molecule runs, cutting a run when the base MI (see
 /// [`super::bams::MiKey::base`]) changes. Assumes same-molecule reads are consecutive
-/// (guaranteed by grouped output; see the design doc) — and *enforces* that assumption:
-/// once a base MI's run has closed (a different base was seen and the run flushed), that
-/// base reappearing later in the stream means the input is not actually grouped, and is
-/// reported as an `Err` rather than silently starting a second, disconnected run under the
-/// same base (which would corrupt the molecule-join's canonical-id matching downstream).
-/// Records with no MI tag (`base == None`) form their own runs, cut on any change to/from
-/// `None`; a missing MI base is *not* tracked by this contiguity check (the fully-MI-less
-/// input case is rejected separately, by the guard in `molecule_join_compare`).
+/// (guaranteed by grouped output; see the design doc) and *enforces* two grouping invariants
+/// in O(1) memory, yielding an `Err` on the first record that violates either:
+///
+/// 1. **Every record is MI-tagged.** `fgumi group`/`fgbio GroupReadsByUmi` tag every emitted
+///    read with an MI, so a record with a missing or unparseable MI base (`base == None`)
+///    means the input is not grouped. Such a record is rejected immediately rather than folded
+///    into an MI-less run: because the molecule-join compares content *excluding* MI, an
+///    MI-less run could otherwise still canonical-id/content-match its tagged counterpart,
+///    silently passing a molecule that lost its MI (a false MATCH). Rejecting per-record is
+///    strictly stronger than any whole-input "never saw an MI" guard, which a *partial*-MI-less
+///    input (some records tagged, some not) slips through. An empty input yields no runs and no
+///    error.
+/// 2. **Base MI is strictly increasing across runs.** Both tools assign the MI as a
+///    monotonically increasing counter (fgbio: `counter.getAndIncrement()`; fgumi:
+///    `next_mi_base`) in template-coordinate scan order, so a valid grouped file's base MI is
+///    *strictly increasing* across runs. A new run whose base is not greater than a base
+///    already seen is either a reappearance (non-consecutive) or a non-monotonic id — i.e. not
+///    grouped — and is rejected rather than silently starting a second, disconnected run (which
+///    would corrupt the molecule-join's canonical-id matching downstream). Tracking only the
+///    largest base seen makes this O(1), not O(molecules); the engine never materializes either
+///    input's records.
+/// 3. **A single run is bounded.** A run accumulates its members in `pending` before being
+///    yielded, so a degenerate input where one MI spans (nearly) the whole file would grow
+///    `pending` to O(file size) *before* the run is ever handed to the join — which the
+///    downstream molecule-backlog cap ([`super::engines::molecule_join::MAX_PENDING_MOLECULES`])
+///    cannot prevent, since that bounds the number of *unmatched molecules*, not the size of one.
+///    A deliberately high per-run record ceiling ([`MAX_MOLECULE_RUN_RECORDS`]) turns that
+///    pathological O(file) accumulation into a clear error instead of an eventual OOM; a
+///    well-formed grouped input has bounded UMI families and never approaches it.
 pub(crate) fn molecule_runs<R: Read>(
+    reader: RawBamRecordReader<R>,
+) -> impl Iterator<Item = Result<MoleculeRun>> {
+    molecule_runs_capped(reader, MAX_MOLECULE_RUN_RECORDS)
+}
+
+/// Deliberately high last-resort ceiling on the number of records buffered for a *single*
+/// molecule run before it is yielded (see invariant 3 in [`molecule_runs`]'s doc comment).
+/// Not a tuning knob: legitimate UMI families are small (a handful to low thousands of reads),
+/// so this only fires on degenerate ungrouped input (e.g. one MI spanning the file), converting
+/// an O(file-size) buffer from an OOM into a clear error.
+pub(crate) const MAX_MOLECULE_RUN_RECORDS: usize = 100_000_000;
+
+/// [`molecule_runs`] with an explicit per-run record ceiling, so tests can exercise the
+/// over-cap error path without materializing 100M records. Production always calls through the
+/// public wrapper with [`MAX_MOLECULE_RUN_RECORDS`].
+pub(crate) fn molecule_runs_capped<R: Read>(
     mut reader: RawBamRecordReader<R>,
+    max_run_records: usize,
 ) -> impl Iterator<Item = Result<MoleculeRun>> {
     let mut pending: Vec<RawRecord> = Vec::new();
     let mut pending_base: Option<i64> = None;
-    // Base MI values whose run has already closed (a different base was seen and the run
-    // was flushed). Only `Some` bases are ever inserted — a missing MI (`None`) legitimately
-    // forms its own run on each occurrence and is not subject to this check.
-    let mut closed_bases: HashSet<i64> = HashSet::new();
+    // The largest base MI of any run started so far — O(1), not an O(molecules) set (see
+    // invariant 2 in the doc comment).
+    let mut last_base: Option<i64> = None;
     std::iter::from_fn(move || {
         loop {
             match reader.next_record() {
                 Ok(Some(rec)) => {
-                    let base = get_mi_tag_raw(&rec).map(|mi| mi.base());
-                    if !pending.is_empty() && base == pending_base {
+                    // Invariant 1: every record in a non-empty grouped input carries a
+                    // parseable MI. `get_mi_tag_raw` returns `None` for both a missing tag and
+                    // an unparseable one; reject the first such record (stricter than a
+                    // whole-input guard, which a partial-MI-less side would slip through).
+                    let base = match get_mi_tag_raw(&rec).map(|mi| mi.base()) {
+                        Some(b) => b,
+                        None => {
+                            return Some(Err(anyhow!(
+                                "input is not grouped: encountered a record with no (or an \
+                                 unparseable) MI tag; grouping comparison requires every record \
+                                 in a non-empty input to be MI-tagged (grouped output tags every \
+                                 read)"
+                            )));
+                        }
+                    };
+                    if !pending.is_empty() && Some(base) == pending_base {
+                        // Invariant 3: bound a single run's accumulation. `pending` already
+                        // holds this molecule's members; refuse to grow it past the ceiling
+                        // rather than buffering O(file-size) records for a degenerate one-MI
+                        // input.
+                        if pending.len() >= max_run_records {
+                            return Some(Err(anyhow!(
+                                "input is not grouped: a single molecule (MI base {base}) exceeds \
+                                 {max_run_records} buffered records before yielding; a well-formed \
+                                 grouped input has bounded UMI families, so this indicates \
+                                 ungrouped input (e.g. one MI spanning the file) that would \
+                                 otherwise buffer O(file-size) records and OOM"
+                            )));
+                        }
                         pending.push(rec);
                         continue;
                     }
                     // Starting a new run — either the very first record of the stream, or a
-                    // cut from the previous base. Reject a base that already closed a run.
-                    if let Some(b) = base {
-                        if closed_bases.contains(&b) {
-                            return Some(Err(anyhow!(
-                                "input is not grouped: MI base {b} reappears after its run \
-                                 closed; grouping comparison requires same-MI-consecutive \
-                                 (grouped) input"
-                            )));
-                        }
+                    // cut from the previous base. Invariant 2: enforce strictly-increasing MI
+                    // base.
+                    if let Some(m) = last_base
+                        && base <= m
+                    {
+                        return Some(Err(anyhow!(
+                            "input is not grouped: MI base {base} is not greater than a \
+                             previously seen base {m}; grouping comparison requires \
+                             same-MI-consecutive (grouped) input with monotonically \
+                             increasing molecule ids"
+                        )));
                     }
+                    last_base = Some(base);
                     if pending.is_empty() {
-                        pending_base = base;
+                        pending_base = Some(base);
                         pending.push(rec);
                     } else {
-                        if let Some(b) = pending_base {
-                            closed_bases.insert(b);
-                        }
                         let done = std::mem::take(&mut pending);
-                        pending_base = base;
+                        pending_base = Some(base);
                         pending.push(rec);
                         return Some(Ok(MoleculeRun::from_members(done)));
                     }
@@ -103,6 +166,7 @@ mod tests {
     use fgumi_raw_bam::{SamBuilder, flags};
     use noodles::sam::Header;
     use noodles::sam::alignment::io::Write as AlignmentWrite;
+    use rstest::rstest;
 
     fn rec(name: &[u8], mi: &str) -> RawRecord {
         // MI is a string-typed aux tag; `add_string_tag` is the chained setter
@@ -119,6 +183,13 @@ mod tests {
     /// [`molecule_runs`] into a `Vec`. Modeled on `read_all_records` in
     /// `tests/integration/test_compare_bams.rs:864`.
     fn try_collect_runs(records: Vec<RawRecord>) -> Result<Vec<MoleculeRun>> {
+        try_collect_runs_capped(records, MAX_MOLECULE_RUN_RECORDS)
+    }
+
+    fn try_collect_runs_capped(
+        records: Vec<RawRecord>,
+        max_run_records: usize,
+    ) -> Result<Vec<MoleculeRun>> {
         let tmp = tempfile::NamedTempFile::new().expect("create temp BAM");
         let header = Header::default();
         {
@@ -138,7 +209,7 @@ mod tests {
         let mut reader = RawBamRecordReader::new(file).expect("open raw reader");
         reader.skip_header().expect("skip header");
 
-        molecule_runs(reader).collect::<Result<Vec<_>>>()
+        molecule_runs_capped(reader, max_run_records).collect::<Result<Vec<_>>>()
     }
 
     fn collect_runs(records: Vec<RawRecord>) -> Vec<MoleculeRun> {
@@ -189,5 +260,65 @@ mod tests {
         let recs = vec![rec(b"r1", "1"), rec(b"r2", "1"), rec(b"r3", "2"), rec(b"r4", "2")];
         let runs = collect_runs(recs);
         assert_eq!(runs.len(), 2);
+    }
+
+    /// Contiguous but *non-monotonic* base MIs (`1`, then `3`, then `2`) are not valid grouped
+    /// output — both grouping tools assign the MI as a strictly increasing counter — so the
+    /// O(1) monotonicity check must reject it even though no base literally reappears (a plain
+    /// "seen this base before" set would have missed the `3`→`2` regression).
+    #[test]
+    fn non_monotonic_base_mi_is_rejected() {
+        let recs = vec![rec(b"r1", "1"), rec(b"r2", "3"), rec(b"r3", "2")];
+        let err = try_collect_runs(recs).expect_err("non-monotonic MI base must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("not grouped"), "got: {msg}");
+        assert!(msg.contains('2') && msg.contains('3'), "error should name the bases: {msg}");
+    }
+
+    /// Invariant 1: a record with no MI tag in a non-empty input is rejected on the spot,
+    /// rather than folded into an MI-less run (which — since the molecule-join excludes MI from
+    /// content comparison — could otherwise let a molecule that lost its MI still MATCH its
+    /// tagged counterpart). The reject fires on the *first* such record, so it applies to a
+    /// *mixed* input (some records tagged, some not), not only a wholly-MI-less one — the case
+    /// a whole-input "never saw MI" guard would slip through. The message names both "not
+    /// grouped" and "MI-tagged" so the engine- and CLI-level tests can key off either.
+    fn mi_less() -> RawRecord {
+        SamBuilder::new().read_name(b"r_none").flags(flags::FIRST_SEGMENT).build()
+    }
+
+    #[rstest]
+    #[case::leading_mi_less(vec![mi_less(), rec(b"r2", "1")])]
+    #[case::trailing_mi_less(vec![rec(b"r1", "1"), mi_less()])]
+    #[case::mixed_mid_stream(vec![rec(b"r1", "1"), rec(b"r2", "1"), mi_less(), rec(b"r4", "2")])]
+    fn mi_less_record_in_non_empty_input_is_rejected(#[case] recs: Vec<RawRecord>) {
+        let err = try_collect_runs(recs).expect_err("a record with no MI tag must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("not grouped"), "got: {msg}");
+        assert!(msg.contains("MI-tagged"), "got: {msg}");
+    }
+
+    /// Invariant 3: a single molecule that would buffer past the per-run ceiling is rejected
+    /// rather than growing `pending` unboundedly — the degenerate "one MI spans the file" case
+    /// that the downstream molecule-backlog cap cannot catch. A tiny cap makes the trip cheap;
+    /// production uses [`MAX_MOLECULE_RUN_RECORDS`].
+    #[test]
+    fn single_molecule_over_run_cap_is_rejected() {
+        // Three records sharing one MI base; a cap of 2 bails when the third would push.
+        let recs = vec![rec(b"r_a", "1"), rec(b"r_b", "1"), rec(b"r_c", "1")];
+        let err = try_collect_runs_capped(recs, 2)
+            .expect_err("a single molecule exceeding the per-run cap must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("not grouped"), "got: {msg}");
+        assert!(msg.contains("single molecule"), "got: {msg}");
+    }
+
+    /// The boundary counterpart: a run of exactly the ceiling is accepted (the cap bounds the
+    /// buffer, it does not reject a legitimately cap-sized family).
+    #[test]
+    fn single_molecule_at_run_cap_is_accepted() {
+        let recs = vec![rec(b"r_a", "1"), rec(b"r_b", "1")];
+        let runs = try_collect_runs_capped(recs, 2).expect("a run at the cap must be accepted");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].members.len(), 2);
     }
 }
