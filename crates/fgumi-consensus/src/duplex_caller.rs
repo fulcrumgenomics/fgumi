@@ -203,7 +203,8 @@ use noodles::sam::alignment::record_buf::RecordBuf;
 
 use crate::caller::ConsensusOutput;
 use crate::caller::{
-    ConsensusCaller, ConsensusCallingStats, RejectionReason, clamp_per_base_to_fgbio_short,
+    ConsensusCaller, ConsensusCallingStats, RejectionReason, clamp_combined_error_to_fgbio_short,
+    clamp_per_base_to_fgbio_short,
 };
 use crate::phred::MAX_PHRED;
 use crate::phred::{MIN_PHRED, PhredScore};
@@ -955,7 +956,7 @@ impl DuplexConsensusCaller {
                                 num_errors += 1;
                             }
                         }
-                        num_errors.clamp(0, i32::from(i16::MAX)) as u16
+                        clamp_combined_error_to_fgbio_short(i64::from(num_errors))
                     } else {
                         // Approximate method when source reads unavailable
                         let a_err = i32::from(a.errors[i]);
@@ -970,7 +971,7 @@ impl DuplexConsensusCaller {
                         } else {
                             b_err + (a_dep - a_err)
                         };
-                        err.clamp(0, i32::from(i16::MAX)) as u16
+                        clamp_combined_error_to_fgbio_short(i64::from(err))
                     };
 
                     errors.push(error_count);
@@ -1484,7 +1485,10 @@ impl DuplexConsensusCaller {
                 num_errors
             };
 
-            duplex_errors.push(error_at_i.clamp(0, i32::from(i16::MAX)) as i16);
+            // Cap at fgbio's `Short` ceiling via the shared combine-step helper (the same one
+            // the codec caller uses). It returns `u16` in `[0, 32767]`, which casts losslessly
+            // to the `i16` per-base error store fgbio's `Array[Short]` uses.
+            duplex_errors.push(clamp_combined_error_to_fgbio_short(i64::from(error_at_i)) as i16);
         }
 
         // Create duplex consensus record using ss_a as template
