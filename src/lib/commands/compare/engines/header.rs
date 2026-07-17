@@ -201,12 +201,25 @@ fn format_sq_entry((name, length, other): &SqEntry) -> String {
     format!("{base} {{{}}}", fields.join(", "))
 }
 
+/// Maximum number of differing `@SQ` positions rendered into the diff string. A reference
+/// dictionary can be arbitrarily large (a whole-genome assembly can carry tens of thousands
+/// of contigs/decoys/ALTs), so — unlike [`format_sq_entry`]'s per-entry rendering, which is
+/// only ever invoked for a *shown* entry — the diff string itself must stay bounded rather
+/// than growing with dictionary size.
+const MAX_SQ_DIFF_ENTRIES: usize = 5;
+
 /// Compares the `@SQ` reference sequence dictionary as an ordered list of every field —
 /// order is significant here (unlike `@RG`), since two dictionaries that agree on every field
 /// but disagree on order describe different `tid` numbering. Every non-`SN`/`LN` field
 /// (`M5`, `UR`, `AS`, `SP`, …) is compared too, not just name and length: two sequences with
 /// the same name and length but a different `M5` checksum describe *different* reference
 /// bases and must not match — exactly as `@RG` compares every non-`ID` field.
+///
+/// Any divergence anywhere in the dictionary (name, length, order, `M5`, or any other field,
+/// or one dictionary having more/fewer entries) is still reported as a difference — but the
+/// rendered diff string shows only the first [`MAX_SQ_DIFF_ENTRIES`] *differing* positions
+/// plus an "and N more" count, instead of allocating both entire dictionaries into one
+/// string. This keeps the diagnostic allocation bounded regardless of dictionary size.
 fn compare_sq(h1: &Header, h2: &Header) -> Vec<String> {
     let seqs = |h: &Header| -> Vec<SqEntry> {
         h.reference_sequences()
@@ -224,17 +237,39 @@ fn compare_sq(h1: &Header, h2: &Header) -> Vec<String> {
     let seqs1 = seqs(h1);
     let seqs2 = seqs(h2);
     if seqs1 == seqs2 {
-        Vec::new()
-    } else {
-        let render = |seqs: &[SqEntry]| -> String {
-            format!("[{}]", seqs.iter().map(format_sq_entry).collect::<Vec<_>>().join(", "))
-        };
-        vec![format!(
-            "@SQ reference sequences (name, length, fields, order): {} vs {}",
-            render(&seqs1),
-            render(&seqs2)
-        )]
+        return Vec::new();
     }
+
+    // Walk both dictionaries position-by-position (order is significant for @SQ) so a
+    // difference is localized to the specific index it occurs at, rather than requiring
+    // both full dictionaries to be rendered to show it. A one-sided length difference
+    // shows up here as `None` on the shorter side's positions past its end.
+    let max_len = seqs1.len().max(seqs2.len());
+    let render_entry = |e: Option<&SqEntry>| -> String {
+        e.map_or_else(|| "<absent>".to_string(), format_sq_entry)
+    };
+    let mut shown: Vec<String> = Vec::new();
+    let mut total_diffs = 0usize;
+    for i in 0..max_len {
+        let e1 = seqs1.get(i);
+        let e2 = seqs2.get(i);
+        if e1 != e2 {
+            total_diffs += 1;
+            if shown.len() < MAX_SQ_DIFF_ENTRIES {
+                shown.push(format!("idx {i}: {} vs {}", render_entry(e1), render_entry(e2)));
+            }
+        }
+    }
+    let omitted = total_diffs.saturating_sub(shown.len());
+    let omitted_suffix = if omitted > 0 {
+        format!(" (and {omitted} more difference{})", if omitted == 1 { "" } else { "s" })
+    } else {
+        String::new()
+    };
+    vec![format!(
+        "@SQ reference sequences differ ({total_diffs} of {max_len} position(s)): [{}]{omitted_suffix}",
+        shown.join(", ")
+    )]
 }
 
 /// One read group's non-`ID` fields, keyed by 2-byte tag, sorted for stable diff rendering.
@@ -452,6 +487,40 @@ mod tests {
         let h2 = header_with_sq("chr1", 1000);
         let diffs = compare_headers(&h1, &h2).expect("one-sided @SQ M5 must be reported");
         assert!(diffs.iter().any(|d| d.starts_with("@SQ")), "diffs: {diffs:?}");
+    }
+
+    /// A large reference dictionary (e.g. a whole-genome assembly with thousands of
+    /// contigs/decoys) with exactly one differing entry must still produce a BOUNDED diff
+    /// string, not one proportional to the dictionary size. Regression guard for
+    /// `compare_sq` previously rendering both entire `@SQ` dictionaries into a single diff
+    /// string regardless of how many entries actually diverged.
+    #[test]
+    fn large_sq_dictionary_single_diff_produces_bounded_diff() {
+        const N: usize = 5000;
+        let mut b1 = Header::builder();
+        let mut b2 = Header::builder();
+        for i in 0..N {
+            let name = BString::from(format!("chr{i}"));
+            let seq1 = Map::<ReferenceSequence>::new(NonZeroUsize::new(1000).expect("non-zero"));
+            let length2 = if i == N / 2 { 1001 } else { 1000 };
+            let seq2 = Map::<ReferenceSequence>::new(NonZeroUsize::new(length2).expect("non-zero"));
+            b1 = b1.add_reference_sequence(name.clone(), seq1);
+            b2 = b2.add_reference_sequence(name, seq2);
+        }
+        let h1 = b1.build();
+        let h2 = b2.build();
+
+        let diffs = compare_headers(&h1, &h2).expect("single differing @SQ entry must be reported");
+        let sq_diff = diffs
+            .iter()
+            .find(|d| d.starts_with("@SQ"))
+            .unwrap_or_else(|| panic!("expected an @SQ diff, got: {diffs:?}"));
+        assert!(
+            sq_diff.len() < 2_000,
+            "diff string must be bounded regardless of dictionary size ({N} entries), \
+             got {} bytes: {sq_diff}",
+            sq_diff.len()
+        );
     }
 
     #[rstest]
