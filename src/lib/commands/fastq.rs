@@ -12,7 +12,7 @@ use fgumi_bam_io::create_raw_bam_reader;
 use fgumi_raw_bam::{
     RawRecord, extract_sequence_into, quality_scores_slice, read_name as raw_read_name,
 };
-use log::info;
+use log::{info, warn};
 use std::io::{BufWriter, Write, stdout};
 use std::path::PathBuf;
 
@@ -68,6 +68,23 @@ EXAMPLES:
 
   # Exclude secondary and supplementary alignments (default)
   fgumi fastq -i aligned.bam -F 0x900 | bwa mem ...
+
+NOTES:
+
+  Read-name suffixes (/1, /2): appended from the FLAG unless --no-read-suffix,
+  matching `samtools fastq -N`. A QNAME that already carries a mate suffix
+  (a re-imported BAM; the SAM spec forbids it) is not stripped, so the output
+  would double it (`name/1/1`) -- same as samtools -N. Pass --no-read-suffix
+  to leave names untouched.
+
+  Missing base qualities: a read with no stored quality (all 0xFF, the SAM
+  no-quality sentinel) is emitted with a fixed Q33 ('B') per base, matching
+  `samtools fastq` -- not Q93, which would falsely claim near-perfect quality.
+
+  Interleaved pairing: output is interleaved for `bwa mem -p`. If a template
+  contributes a lone mate (its pair is absent or dropped by --exclude-flags /
+  --require-flags), the R1/R2 stream desyncs; fgumi warns when the paired R1/R2
+  counts differ.
 "#
 )]
 pub struct Fastq {
@@ -117,6 +134,7 @@ impl Fastq {
     /// Extracted so `execute` can dispatch between stdout (the default piping
     /// path) and a file (`--output`) without duplicating the conversion loop.
     fn run_with_writer<W: Write>(&self, mut writer: W) -> Result<()> {
+        use fgumi_raw_bam::flags as raw_flag_bits;
         let timer = OperationTimer::new("Converting BAM to FASTQ");
 
         info!("Input: {}", self.input.display());
@@ -130,6 +148,10 @@ impl Fastq {
 
         let mut total_records: u64 = 0;
         let mut written_records: u64 = 0;
+        // Track paired R1/R2 balance to detect singletons that would desync the
+        // interleaved stream under `bwa mem -p` (FASTQ3-02).
+        let mut paired_r1_written: u64 = 0;
+        let mut paired_r2_written: u64 = 0;
 
         // Batch tracking (mirrors bwa's logic)
         let mut bases_this_batch: u64 = 0;
@@ -170,6 +192,14 @@ impl Fastq {
                 &mut qual_buf,
             )?;
             written_records += 1;
+            if (flags & raw_flag_bits::PAIRED) != 0 {
+                if (flags & raw_flag_bits::FIRST_SEGMENT) != 0 {
+                    paired_r1_written += 1;
+                }
+                if (flags & raw_flag_bits::LAST_SEGMENT) != 0 {
+                    paired_r2_written += 1;
+                }
+            }
 
             // Track batch progress
             bases_this_batch += seq_len as u64;
@@ -185,6 +215,33 @@ impl Fastq {
 
         // Final flush
         writer.flush()?;
+
+        // FASTQ3-02: this is interleaved output. If the paired R1/R2 counts differ,
+        // at least one template contributed a lone mate (its pair was absent or
+        // dropped by `--exclude-flags`/`--require-flags`), which desyncs R1/R2 pairing
+        // for every subsequent read under `bwa mem -p`. Warn rather than fail —
+        // single-end input and deliberate mate filtering are legitimate uses.
+        //
+        // NOTE: this is a best-effort NET-count heuristic, not per-QNAME pairing. Two
+        // singletons that cancel — one template drops its R2, another drops its R1 —
+        // leave R1==R2 and are NOT detected here (a robust check would need per-read-name
+        // pairing, impractical for a streaming converter). So the absence of a warning
+        // does not guarantee a perfectly-synced interleaved stream.
+        if paired_r1_written != paired_r2_written {
+            // Net imbalance, a lower bound on the true singleton count: canceling
+            // singletons (one template drops its R2, another its R1) leave R1==R2
+            // and are not counted here (see NOTE above).
+            let net_imbalance = paired_r1_written.abs_diff(paired_r2_written);
+            warn!(
+                "Interleaved FASTQ paired-read counts differ (R1={paired_r1_written}, \
+                 R2={paired_r2_written}): net R1/R2 imbalance of {net_imbalance} (at least \
+                 {net_imbalance} singleton mate(s)) will desync R1/R2 pairing under \
+                 `bwa mem -p`. Ensure the input is queryname/template-coordinate sorted with \
+                 both mates present, or reconsider `--exclude-flags` (0x{:X}) / `--require-flags` \
+                 (0x{:X}).",
+                self.exclude_flags, self.require_flags
+            );
+        }
 
         info!("Read {total_records} records, wrote {written_records} FASTQ records");
         timer.log_completion(written_records);
@@ -227,6 +284,30 @@ impl Command for Fastq {
     }
 }
 
+/// ASCII quality emitted for a base whose quality is entirely absent.
+///
+/// Per the SAM spec, a record with no quality stores `0xFF` for every base.
+/// fgumi previously mapped `0xFF` through [`QUAL_TO_ASCII`] to `~` (Q93), which
+/// falsely claims near-perfect quality for a read that has none. Instead emit
+/// Q33 (`B`) for an entirely-absent quality string, matching `samtools fastq`
+/// (which `fgumi fastq` is modeled on).
+const MISSING_QUALITY_ASCII: u8 = b'B';
+
+/// Encode a record's raw quality bytes as Phred+33 ASCII into `out`.
+///
+/// When the quality is entirely absent (all `0xFF`), fills with
+/// [`MISSING_QUALITY_ASCII`] rather than the misleading Q93 that
+/// `QUAL_TO_ASCII[0xFF]` would produce. A partially-`0xFF` string is left to the
+/// per-byte mapping (a genuinely malformed record, not the "no quality" sentinel).
+fn encode_quality_into(quals: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    if !quals.is_empty() && quals.iter().all(|&q| q == 0xFF) {
+        out.resize(quals.len(), MISSING_QUALITY_ASCII);
+    } else {
+        out.extend(quals.iter().map(|&s| QUAL_TO_ASCII[s as usize]));
+    }
+}
+
 /// Write a single FASTQ record to the writer.
 #[inline]
 fn write_fastq_record<W: Write>(
@@ -258,9 +339,8 @@ fn write_fastq_record<W: Write>(
     // Decode sequence from 4-bit BAM encoding to ASCII bases (reuses seq_buf).
     extract_sequence_into(record, seq_buf);
 
-    // Copy quality bytes and transform to Phred+33 ASCII
-    qual_buf.clear();
-    qual_buf.extend(quality_scores_slice(record).iter().map(|&s| QUAL_TO_ASCII[s as usize]));
+    // Copy quality bytes and transform to Phred+33 ASCII (absent quality → default)
+    encode_quality_into(quality_scores_slice(record), qual_buf);
 
     if (flags & flag_bits::REVERSE) != 0 {
         // Reverse complement sequence in place using lookup table
@@ -288,6 +368,7 @@ fn write_fastq_record<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     /// Write reverse complement of sequence bytes to a buffer (test helper).
     fn write_reverse_complement_bytes<W: Write>(writer: &mut W, bases: &[u8]) -> Result<()> {
@@ -418,6 +499,25 @@ mod tests {
         write_reverse_complement_bytes(&mut output, b"ANCG")
             .expect("write_reverse_complement_bytes should succeed");
         assert_eq!(output, b"CGNT");
+    }
+
+    /// FASTQ3-03: a record whose quality is entirely absent (all `0xFF`, the SAM
+    /// no-quality sentinel) must not be emitted as `~` (Q93, near-perfect); it
+    /// gets the `MISSING_QUALITY_ASCII` default (`B`, Q33, matching samtools). A
+    /// present quality maps per-byte; a partially-`0xFF` (malformed) string is NOT
+    /// the sentinel and is left to the map; empty stays empty.
+    #[rstest]
+    #[case::absent_all_0xff(&[0xFF, 0xFF, 0xFF, 0xFF], b"BBBB")]
+    #[case::present_phred33(&[0, 30, 40, 93], &[33, 63, 73, 126])]
+    #[case::partial_0xff_is_not_sentinel(&[30, 0xFF], &[63, 126])]
+    #[case::empty(&[], b"")]
+    fn encode_quality_maps_present_and_defaults_absent(
+        #[case] quals: &[u8],
+        #[case] expected: &[u8],
+    ) {
+        let mut out = Vec::new();
+        encode_quality_into(quals, &mut out);
+        assert_eq!(out.as_slice(), expected);
     }
 
     #[test]
