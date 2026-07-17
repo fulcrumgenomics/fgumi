@@ -881,6 +881,37 @@ Note: Using `samtools sort` will NOT work correctly because it doesn't use the
 - Mark only (default): Set duplicate flag (0x400) on non-representative reads
 - Remove (--remove-duplicates): Exclude duplicate reads from output entirely
 
+# Filtering (same as fgbio GroupReadsByUmi)
+
+`fgumi dedup` is a re-implementation of `fgbio GroupReadsByUmi --mark-duplicates`, and like
+that tool it acts as a read *filter* in addition to marking duplicates: templates that do
+not pass the criteria below are dropped entirely and never reach the output, so the output
+record count can be lower than the input. This matches fgbio, which applies exactly these
+filters before grouping regardless of whether `--mark-duplicates` is set. It does, however,
+differ from Picard `MarkDuplicates`, which passes every record through and only sets the
+duplicate flag — so `fgumi dedup` is NOT a Picard record-count drop-in. A template is
+discarded (not marked) when:
+
+- Both mates are unmapped (a template with no mapped read).
+- Any read is flagged QC-fail (unless -n/--include-non-pf-reads is given).
+- A mapped read has mapping quality below -q/--min-map-q (default 0, i.e. no reads are
+  dropped for mapping quality unless a threshold is set).
+- The mate mapping quality (MQ tag) is below -q/--min-map-q, when the mate is mapped.
+- The UMI contains an N base (unless --no-umi is given).
+- The UMI is shorter than -l/--min-umi-length, when that option is set.
+- The RX UMI tag is missing (unless --no-umi is given).
+- A record is truncated/corrupt (shorter than the minimum BAM record length).
+
+To retain as many templates as possible, leave -q/--min-map-q at its default of 0, do not
+set -l/--min-umi-length, pass -n/--include-non-pf-reads to keep QC-fail reads, and, when the
+input has no usable UMIs, use --no-umi to bypass the UMI checks entirely. Two drops cannot
+be disabled, matching fgbio: templates with no mapped read (both mates unmapped) and
+truncated/corrupt records are always discarded.
+
+The counts of templates dropped for each reason are reported in the metrics output
+(--metrics). Deduplication of the templates that remain (representative selection, the
+0x400 flag, and --remove-duplicates) follows Picard `MarkDuplicates` semantics.
+
 # Cell Barcodes
 
 If the input data contains cell barcodes (e.g. from single-cell sequencing), reads at the same
