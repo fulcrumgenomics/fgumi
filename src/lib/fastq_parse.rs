@@ -34,8 +34,11 @@ pub struct FastqRecord {
 impl FastqRecord {
     /// Construct a `FastqRecord` from a raw FASTQ record slice.
     ///
-    /// The slice must contain exactly one complete FASTQ record in the form:
-    /// `@name\nseq\n+\nqual\n`
+    /// The slice must contain exactly one complete FASTQ record in the form
+    /// `@name\nseq\n+\nqual`, where the terminating newline after the quality line
+    /// is optional (a final record at EOF may omit it). CRLF (`\r\n`) line endings
+    /// are accepted: the `\r` before each `\n` is a line terminator and is stripped
+    /// from the name, sequence, and quality.
     ///
     /// # Errors
     ///
@@ -84,11 +87,25 @@ impl FastqRecord {
             ));
         }
 
-        // Validate sequence and quality lengths match.
-        let seq_len = seq_end - (name_end + 1);
+        // Validate sequence and quality lengths match. Compare the CRLF-stripped
+        // fields, not the raw spans: on a CRLF file every interior line keeps a
+        // trailing '\r', but an unterminated final quality line does not, so the
+        // raw spans would differ by one and spuriously reject a valid record.
+        let seq_len = strip_trailing_cr(&data[name_end + 1..seq_end]).len();
         // Quality ends at the trailing '\n' (excluded) or at data.len() if no trailing newline.
         let qual_end = if data.last() == Some(&b'\n') { data.len() - 1 } else { data.len() };
-        let qual_len = qual_end - qual_start;
+        // A quality-less record (`@name\nseq\n+\n`) leaves qual_start past qual_end;
+        // the slice below would panic. Reject it with a clean Err, matching the
+        // sibling parser (fgumi-simd-fastq try_parse_single_record). Reachable via
+        // stitch_cross_block_record / the middle-block path, which feed raw record
+        // windows straight to from_slice.
+        if qual_start > qual_end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "FASTQ record is missing its quality line",
+            ));
+        }
+        let qual_len = strip_trailing_cr(&data[qual_start..qual_end]).len();
 
         if seq_len != qual_len {
             return Err(io::Error::new(
@@ -114,14 +131,14 @@ impl FastqRecord {
     #[inline]
     #[must_use]
     pub fn name(&self) -> &[u8] {
-        &self.data[1..self.name_end as usize]
+        strip_trailing_cr(&self.data[1..self.name_end as usize])
     }
 
     /// Returns the sequence bytes.
     #[inline]
     #[must_use]
     pub fn sequence(&self) -> &[u8] {
-        &self.data[self.name_end as usize + 1..self.seq_end as usize]
+        strip_trailing_cr(&self.data[self.name_end as usize + 1..self.seq_end as usize])
     }
 
     /// Returns the quality bytes (Phred+33 encoded ASCII).
@@ -130,8 +147,22 @@ impl FastqRecord {
     pub fn quality(&self) -> &[u8] {
         let qual_end =
             if self.data.last() == Some(&b'\n') { self.data.len() - 1 } else { self.data.len() };
-        &self.data[self.qual_start as usize..qual_end]
+        strip_trailing_cr(&self.data[self.qual_start as usize..qual_end])
     }
+}
+
+/// Strip a single trailing carriage return so CRLF (`\r\n`)-terminated FASTQ
+/// files parse identically to LF-terminated ones. Record boundaries here are
+/// found by scanning for `\n` only, so on a CRLF file the `\r` preceding each
+/// `\n` is left as the last byte of the name, sequence, and quality fields; it
+/// is a line terminator, not data, and must be dropped (matching fgbio's
+/// `Source.getLines`). A stray `\r` in the quality string is byte 13, below the
+/// printable-ASCII floor, so leaving it in would derail quality-encoding
+/// detection. Only one trailing `\r` is removed.
+#[inline]
+#[must_use]
+fn strip_trailing_cr(field: &[u8]) -> &[u8] {
+    if let [rest @ .., b'\r'] = field { rest } else { field }
 }
 
 impl MemoryEstimate for FastqRecord {
@@ -161,10 +192,16 @@ enum FastqParseResult {
 ///
 /// Returns parsed records and leftover bytes for incomplete records.
 ///
+/// `at_eof` marks `data` as the complete, final input rather than one chunk of a
+/// stream. It is passed through to [`parse_single_fastq_record`]: only when
+/// `true` is a final record without a terminating newline accepted; when `false`
+/// such a tail is returned as leftover so an incremental caller (e.g.
+/// `FastqGrouper::add_bytes_for_stream`) can complete it with the next chunk.
+///
 /// # Errors
 ///
 /// Returns an error if a record has mismatched sequence and quality lengths.
-pub fn parse_fastq_records(data: &[u8]) -> io::Result<(Vec<FastqRecord>, Vec<u8>)> {
+pub fn parse_fastq_records(data: &[u8], at_eof: bool) -> io::Result<(Vec<FastqRecord>, Vec<u8>)> {
     let mut records = Vec::new();
     let mut pos = 0;
 
@@ -181,7 +218,7 @@ pub fn parse_fastq_records(data: &[u8]) -> io::Result<(Vec<FastqRecord>, Vec<u8>
         }
 
         // Try to parse a complete record
-        match parse_single_fastq_record(&data[pos..]) {
+        match parse_single_fastq_record(&data[pos..], at_eof) {
             Ok((record, consumed)) => {
                 records.push(record);
                 pos += consumed;
@@ -200,8 +237,19 @@ pub fn parse_fastq_records(data: &[u8]) -> io::Result<(Vec<FastqRecord>, Vec<u8>
 }
 
 /// Parse a single FASTQ record from the beginning of a buffer.
+///
+/// `at_eof` marks `data` as the complete, final input. When `true`, a record
+/// whose quality line lacks a terminating newline is accepted (a final record at
+/// EOF may omit it). When `false`, `data` is an incremental chunk that more bytes
+/// may follow, so an unterminated final quality line is reported as
+/// [`FastqParseResult::Incomplete`] and held for the next chunk rather than being
+/// mistaken for a complete (shorter) record.
+///
 /// Returns (record, `bytes_consumed`) or an error.
-fn parse_single_fastq_record(data: &[u8]) -> Result<(FastqRecord, usize), FastqParseResult> {
+fn parse_single_fastq_record(
+    data: &[u8],
+    at_eof: bool,
+) -> Result<(FastqRecord, usize), FastqParseResult> {
     let mut pos = 0;
 
     // Line 1: @name
@@ -220,7 +268,10 @@ fn parse_single_fastq_record(data: &[u8]) -> Result<(FastqRecord, usize), FastqP
         return Err(FastqParseResult::Incomplete);
     }
     let seq_end_rel = find_newline(&data[pos..]).ok_or(FastqParseResult::Incomplete)?;
-    let seq_len = seq_end_rel;
+    // Compare CRLF-stripped lengths below: on a CRLF file every interior line keeps
+    // a trailing '\r' that an unterminated final quality line would not, so raw
+    // spans would differ by one and spuriously reject a valid record.
+    let seq_len = strip_trailing_cr(&data[pos..pos + seq_end_rel]).len();
     pos += seq_end_rel + 1;
 
     // Line 3: + (separator)
@@ -240,13 +291,19 @@ fn parse_single_fastq_record(data: &[u8]) -> Result<(FastqRecord, usize), FastqP
     if pos >= data.len() {
         return Err(FastqParseResult::Incomplete);
     }
-    let (qual_len, advance) = if let Some(rel) = find_newline(&data[pos..]) {
+    let (qual_raw_len, advance) = if let Some(rel) = find_newline(&data[pos..]) {
         (rel, rel + 1)
-    } else {
-        // EOF without trailing newline — treat remaining bytes as the quality line.
+    } else if at_eof {
+        // Final input with no trailing newline — treat the remaining bytes as the
+        // quality line. Only valid when `data` is known to be the complete input:
+        // on an incremental chunk the tail may be a partial quality line that
+        // continues in the next chunk, so it must be held as leftover instead.
         let remaining = data.len() - pos;
         (remaining, remaining)
+    } else {
+        return Err(FastqParseResult::Incomplete);
     };
+    let qual_len = strip_trailing_cr(&data[pos..pos + qual_raw_len]).len();
     pos += advance;
 
     // Validate lengths match
@@ -309,7 +366,7 @@ mod tests {
     fn test_parse_single_fastq_record() {
         let data = b"@read1\nACGT\n+\nIIII\n";
         let (record, consumed) =
-            parse_single_fastq_record(data).expect("parse single FASTQ record");
+            parse_single_fastq_record(data, true).expect("parse single FASTQ record");
         assert_eq!(record.name(), b"read1");
         assert_eq!(record.sequence(), b"ACGT");
         assert_eq!(record.quality(), b"IIII");
@@ -319,26 +376,75 @@ mod tests {
     #[test]
     fn test_parse_fastq_records_multiple() {
         let data = b"@read1\nACGT\n+\nIIII\n@read2\nTGCA\n+\nJJJJ\n";
-        let (records, leftover) = parse_fastq_records(data).expect("failed to parse FASTQ records");
+        let (records, leftover) =
+            parse_fastq_records(data, true).expect("failed to parse FASTQ records");
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].name(), b"read1");
         assert_eq!(records[1].name(), b"read2");
         assert!(leftover.is_empty());
     }
 
+    /// EXT3-06: CRLF (`\r\n`)-terminated records must expose the same
+    /// name/sequence/quality as LF records — the `\r` is a line terminator, not
+    /// data, and must not leak into any field (a `\r` in the quality would be
+    /// byte 13, below the printable-ASCII floor, and derail encoding detection).
+    #[test]
+    fn from_slice_strips_crlf_terminators() {
+        let rec = FastqRecord::from_slice(b"@r1\r\nACGT\r\n+\r\nIIII\r\n")
+            .expect("CRLF record should parse");
+        assert_eq!(rec.name(), b"r1");
+        assert_eq!(rec.sequence(), b"ACGT");
+        assert_eq!(rec.quality(), b"IIII");
+
+        // Also through the streaming entry point, including a CRLF final record
+        // with no trailing newline.
+        let (records, leftover) =
+            parse_fastq_records(b"@r1\r\nACGT\r\n+\r\nIIII\r\n@r2\r\nTGCA\r\n+\r\nJJJJ", true)
+                .expect("CRLF stream should parse");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].name(), b"r2");
+        assert_eq!(records[1].sequence(), b"TGCA");
+        assert_eq!(records[1].quality(), b"JJJJ");
+        assert!(leftover.is_empty(), "the unterminated CRLF final record must be consumed");
+    }
+
+    /// A quality-less record (`@name\nseq\n+\n`, no quality line) yields
+    /// `qual_start > qual_end`. `from_slice` must reject it with a clean `Err`
+    /// rather than panicking on the `data[qual_start..qual_end]` slice. This is
+    /// reachable in production: `stitch_cross_block_record` and the middle-block
+    /// path hand raw record windows straight to `from_slice`, so a quality-less
+    /// record straddling a BGZF block boundary reconstructs to exactly this
+    /// shape. The sibling parser (`fgumi-simd-fastq::try_parse_single_record`)
+    /// already guards the identical case; both parsers must agree (reject, not
+    /// panic).
+    #[rstest]
+    #[case::lf(b"@r\nA\n+\n")]
+    #[case::crlf(b"@r\r\nA\r\n+\r\n")]
+    #[case::longer_lf(b"@read1\nACGT\n+\n")]
+    #[case::plus_only_no_trailing_newline(b"@r\nA\n+")]
+    fn from_slice_rejects_quality_less_record_without_panicking(#[case] data: &[u8]) {
+        let result = FastqRecord::from_slice(data);
+        assert!(
+            result.is_err(),
+            "quality-less record {data:?} must return Err, not panic or succeed"
+        );
+    }
+
     #[test]
     fn test_parse_fastq_incomplete_record() {
         let data = b"@read1\nACGT\n+\n";
-        let (records, leftover) = parse_fastq_records(data).expect("failed to parse FASTQ records");
+        let (records, leftover) =
+            parse_fastq_records(data, true).expect("failed to parse FASTQ records");
         assert!(records.is_empty());
         assert_eq!(leftover, data);
     }
 
     #[test]
     fn test_parse_fastq_eof_without_trailing_newline() {
-        // Quality line has no trailing newline — should still parse.
+        // Quality line has no trailing newline — should still parse at EOF.
         let data = b"@read1\nACGT\n+\nIIII";
-        let (records, leftover) = parse_fastq_records(data).expect("failed to parse FASTQ records");
+        let (records, leftover) =
+            parse_fastq_records(data, true).expect("failed to parse FASTQ records");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].name(), b"read1");
         assert_eq!(records[0].sequence(), b"ACGT");
@@ -346,11 +452,25 @@ mod tests {
         assert!(leftover.is_empty());
     }
 
+    /// Mirror of `test_parse_fastq_eof_without_trailing_newline` for the
+    /// incremental path: on a non-final chunk (`at_eof = false`) an unterminated
+    /// final record must NOT be consumed — its bytes are returned as leftover so
+    /// the caller can complete it with the next chunk. Otherwise a chunk boundary
+    /// landing mid-quality would be mistaken for a complete (shorter) record.
+    #[test]
+    fn test_parse_fastq_not_eof_holds_unterminated_record_as_leftover() {
+        let data = b"@read1\nACGT\n+\nIIII";
+        let (records, leftover) =
+            parse_fastq_records(data, false).expect("non-final chunk must not error");
+        assert!(records.is_empty(), "an unterminated final record must not be yielded mid-stream");
+        assert_eq!(leftover, data, "the whole record must be held as leftover for the next chunk");
+    }
+
     #[test]
     fn test_parse_fastq_eof_no_newline_seq_qual_mismatch() {
         // Quality shorter than sequence at EOF — should error.
         let data = b"@read1\nACGT\n+\nIII";
-        let result = parse_fastq_records(data);
+        let result = parse_fastq_records(data, true);
         assert!(
             result.is_err() || {
                 let (recs, leftover) = result.unwrap();
@@ -362,7 +482,8 @@ mod tests {
     #[test]
     fn test_parse_fastq_with_leftover() {
         let data = b"@read1\nACGT\n+\nIIII\n@read2\nTG";
-        let (records, leftover) = parse_fastq_records(data).expect("failed to parse FASTQ records");
+        let (records, leftover) =
+            parse_fastq_records(data, true).expect("failed to parse FASTQ records");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].name(), b"read1");
         assert_eq!(leftover, b"@read2\nTG");

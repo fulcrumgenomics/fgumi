@@ -155,9 +155,49 @@ impl<R: BufRead> Iterator for SimdFastqReader<R> {
             }
 
             if self.at_eof {
-                // Check for leftover bytes that form an incomplete record
+                // Leftover bytes after the last complete-record boundary. A final
+                // record with no trailing newline is still *complete* — it has the
+                // three internal newlines after name/seq/`+`, only the fourth
+                // (terminating) newline is absent — so yield it rather than
+                // erroring (fgbio's `lines.take(4)` accepts an unterminated final
+                // record). Only a leftover with fewer than three newlines is
+                // genuinely truncated.
                 let leftover_start = self.offsets.last().copied().unwrap_or(0);
                 if leftover_start < self.valid {
+                    let leftover = &self.buffer[leftover_start..self.valid];
+                    // A complete-but-unterminated final record has exactly the three
+                    // internal newlines after name/seq/`+`; cap the scan at four so a
+                    // longer malformed run still fails the `== 3` check. It must also
+                    // NOT end in a newline: a genuine unterminated record ends with
+                    // its quality bytes, whereas a leftover like `@n\nseq\n+\n` has a
+                    // terminated `+` line and an *absent* quality line — three
+                    // newlines but no quality — which must error, not be parsed (its
+                    // empty quality span is not a valid record).
+                    let internal_newlines =
+                        leftover.iter().filter(|&&b| b == b'\n').take(4).count();
+                    if leftover.first() == Some(&b'@')
+                        && leftover.last() != Some(&b'\n')
+                        && internal_newlines == 3
+                    {
+                        // Route through the fallible parser like the main record path
+                        // above: the coarse guard admits the leftover, but a typed
+                        // `FastqParseError` (e.g. length mismatch) still surfaces as a
+                        // clean io::Error rather than a panic.
+                        let borrowed = match try_parse_single_record(leftover) {
+                            Ok(rec) => rec,
+                            Err(e) => {
+                                return Some(Err(io::Error::new(io::ErrorKind::InvalidData, e)));
+                            }
+                        };
+                        let record = OwnedFastqRecord {
+                            name: borrowed.name.to_vec(),
+                            sequence: borrowed.sequence.to_vec(),
+                            quality: borrowed.quality.to_vec(),
+                        };
+                        // Mark the leftover consumed so the next call terminates.
+                        self.valid = leftover_start;
+                        return Some(Ok(record));
+                    }
                     return Some(Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
@@ -218,6 +258,52 @@ mod tests {
         assert_eq!(rec2.name, b"r2");
 
         assert!(reader.next().is_none());
+    }
+
+    /// EXT3-07: a final record with no trailing newline is complete (it has the
+    /// three internal newlines after name/seq/`+`); the reader must yield it
+    /// rather than erroring "Truncated FASTQ record at EOF". fgbio's
+    /// `lines.take(4)` likewise accepts an unterminated final record.
+    #[test]
+    fn reader_accepts_final_record_without_trailing_newline() {
+        let data = b"@r1\nACGT\n+\nIIII\n@r2\nTTTT\n+\nJJJJ"; // note: no trailing \n
+        let mut reader = SimdFastqReader::new(Cursor::new(&data[..]));
+
+        let rec1 = reader.next().expect("first record").expect("first record parses");
+        assert_eq!(rec1.name, b"r1");
+        let rec2 = reader
+            .next()
+            .expect("unterminated final record must still be yielded")
+            .expect("unterminated final record must parse, not error");
+        assert_eq!(rec2.name, b"r2");
+        assert_eq!(rec2.sequence, b"TTTT");
+        assert_eq!(rec2.quality, b"JJJJ");
+        assert!(reader.next().is_none(), "reader must terminate cleanly after the last record");
+    }
+
+    /// A malformed final record must surface an `InvalidData` error rather than
+    /// being silently dropped or mis-parsed, across every shape the coarse
+    /// end-of-stream gate can admit:
+    /// * `missing_quality_line` — genuinely truncated (fewer than the three
+    ///   internal newlines); the `+`/quality lines are absent entirely.
+    /// * `newline_terminated_plus_absent_quality` — the `+` line IS
+    ///   newline-terminated but the quality line is then entirely absent
+    ///   (`@n\nseq\n+\n`): exactly three internal newlines and a leading `@`, yet
+    ///   NOT a complete record (parsing it would compute `qual_start > qual_end`
+    ///   and panic). A genuine unterminated final record ends with its quality
+    ///   bytes, never a newline.
+    /// * `length_mismatch_via_eof` — passes the coarse gate (leading `@`, three
+    ///   internal newlines, no trailing `\n`) but the final record's quality is
+    ///   shorter than its sequence, so the coarse-gate→`try_parse_single_record`
+    ///   propagation path must reject it.
+    #[rstest]
+    #[case::missing_quality_line(b"@r1\nACGT\n+\nIIII\n@r2\nTTTT\n+")]
+    #[case::newline_terminated_plus_absent_quality(b"@r1\nACGT\n+\nIIII\n@r2\nTTTT\n+\n")]
+    #[case::length_mismatch_via_eof(b"@r1\nACGT\n+\nIIII\n@r2\nTTTT\n+\nJJ")]
+    fn reader_errors_on_malformed_final_record(#[case] data: &[u8]) {
+        let mut reader = SimdFastqReader::new(Cursor::new(data));
+        let _ = reader.next().expect("first record").expect("first record parses");
+        assert_next_is_invalid_data(&mut reader);
     }
 
     #[test]

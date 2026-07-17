@@ -184,6 +184,20 @@ impl<'a> Iterator for RecordIter<'a> {
     }
 }
 
+/// Strip a single trailing carriage return from a field so that CRLF
+/// (`\r\n`)-terminated FASTQ files parse identically to LF-terminated ones.
+///
+/// Record boundaries are found by scanning for `\n` only, so on a CRLF file the
+/// `\r` that precedes each `\n` is left as the last byte of the name, sequence,
+/// and quality fields. It is a line terminator, not data, and must be removed —
+/// fgbio's `Source.getLines` strips line terminators the same way. Only one
+/// trailing `\r` is dropped (a lone terminator); interior `\r` bytes, which are
+/// not valid in any of these fields anyway, are left untouched.
+#[inline]
+fn strip_trailing_cr(field: &[u8]) -> &[u8] {
+    if let [rest @ .., b'\r'] = field { rest } else { field }
+}
+
 /// Parse a single FASTQ record from a byte slice, validating its structure.
 ///
 /// Expects format: `@name\nsequence\n+\nquality\n`. Validates, in order, that
@@ -230,9 +244,9 @@ pub(crate) fn try_parse_single_record(record: &[u8]) -> Result<FastqRecord<'_>, 
     }
 
     // name: skip '@', up to first newline
-    let name = &record[1..name_end];
+    let name = strip_trailing_cr(&record[1..name_end]);
     // sequence: after first newline, up to second newline
-    let sequence = &record[name_end + 1..seq_end];
+    let sequence = strip_trailing_cr(&record[name_end + 1..seq_end]);
     // quality: after third newline, up to end (excluding trailing newline if present)
     let qual_start = plus_end + 1;
     let qual_end = if record.last() == Some(&b'\n') { record.len() - 1 } else { record.len() };
@@ -243,7 +257,7 @@ pub(crate) fn try_parse_single_record(record: &[u8]) -> Result<FastqRecord<'_>, 
     if qual_start > qual_end {
         return Err(FastqParseError::TooFewLines);
     }
-    let quality = &record[qual_start..qual_end];
+    let quality = strip_trailing_cr(&record[qual_start..qual_end]);
 
     if sequence.len() != quality.len() {
         return Err(FastqParseError::LengthMismatch {
@@ -331,6 +345,30 @@ mod tests {
         assert_eq!(records[0].name, b"read1");
         assert_eq!(records[0].sequence, b"ACGT");
         assert_eq!(records[0].quality, b"IIII");
+    }
+
+    /// EXT3-06: CRLF (`\r\n`)-terminated FASTQ must parse identically to LF —
+    /// the trailing `\r` is a line terminator, not data, and must not leak into
+    /// the name, sequence, or quality (fgbio's `Source.getLines` strips it). A
+    /// stray `\r` in the quality string is especially harmful: it is byte 13,
+    /// below the printable-ASCII floor, so it derails quality-encoding detection.
+    #[test]
+    fn parse_single_record_strips_crlf_terminators() {
+        let data = b"@read1\r\nACGT\r\n+\r\nIIII\r\n";
+        let records: Vec<_> = parse_records(data).collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name, b"read1", "name must not keep the \\r");
+        assert_eq!(records[0].sequence, b"ACGT", "sequence must not keep the \\r");
+        assert_eq!(records[0].quality, b"IIII", "quality must not keep the \\r");
+    }
+
+    /// EXT3-06 via the single-record entry point (used by the reader's EOF path).
+    #[test]
+    fn parse_single_record_strips_crlf_last_record_without_trailing_newline() {
+        let rec = parse_single_record(b"@r\r\nACGT\r\n+\r\nIIII");
+        assert_eq!(rec.name, b"r");
+        assert_eq!(rec.sequence, b"ACGT");
+        assert_eq!(rec.quality, b"IIII");
     }
 
     #[test]
