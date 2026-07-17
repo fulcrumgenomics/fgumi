@@ -491,6 +491,9 @@ pub fn sort_verify_compare(
     let order = order1;
     let header_diffs = compare_headers(&header1, &header2);
 
+    // IMPORTANT: The per-SortOrder extractor/comparator selection below must stay
+    // consistent with the matching arms in verify_records_in_order. Future changes
+    // to how an arm selects its key extractor or comparator must be applied to both sites.
     let mut outcome = match order {
         SortOrder::Coordinate => {
             let nref = header1.reference_sequences().len() as u32;
@@ -582,6 +585,9 @@ pub(crate) fn verify_records_in_order(path: &Path, order: SortOrder) -> Result<(
     let (_, header) = create_raw_bam_reader(path, 1)
         .with_context(|| format!("opening {} to verify sort order", path.display()))?;
 
+    // IMPORTANT: The per-SortOrder extractor/comparator selection below must stay
+    // consistent with the matching arms in sort_verify_compare. Future changes
+    // to how an arm selects its key extractor or comparator must be applied to both sites.
     let (_, violations, first_violation) = match order {
         SortOrder::Coordinate => {
             let nref = header.reference_sequences().len() as u32;
