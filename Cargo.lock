@@ -736,6 +736,7 @@ dependencies = [
  "anyhow",
  "approx",
  "bstr 1.12.1",
+ "fgumi-bam-io",
  "fgumi-dna",
  "fgumi-metrics",
  "fgumi-raw-bam",
@@ -745,6 +746,7 @@ dependencies = [
  "proptest",
  "rand 0.10.1",
  "rstest",
+ "tempfile",
  "thiserror 2.0.18",
  "wide 1.5.0",
 ]

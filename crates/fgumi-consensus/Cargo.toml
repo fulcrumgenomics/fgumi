@@ -24,6 +24,10 @@ fgumi-raw-bam = { workspace = true, features = ["noodles"] }
 
 [dev-dependencies]
 fgumi-raw-bam = { workspace = true, features = ["test-utils"] }
+# Read fgbio-oracle fixture BAMs back into RawRecords in the saturation-oracle
+# tests. fgumi-bam-io does NOT depend on fgumi-consensus, so this is cycle-free.
+fgumi-bam-io = { workspace = true }
+tempfile = "3.3.0"
 rstest = "0.26"
 proptest = "1.10"
 
