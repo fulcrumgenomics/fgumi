@@ -827,9 +827,12 @@ impl CodecConsensusCaller {
         };
 
         if consensus_length < ss_r1.bases.len() || consensus_length < ss_r2.bases.len() {
+            // fgbio labels this the `ClipOverlapFailed` reason (the consensus is
+            // shorter than a single strand, so the overlapping ends could not be
+            // clipped) rather than an indel error (CodecConsensusCaller.scala:243).
             self.reject_records_count(
                 r1_infos.len() + r2_infos.len(),
-                CallerRejectionReason::IndelErrorBetweenStrands,
+                CallerRejectionReason::ClipOverlapFailed,
             );
             return Ok(ConsensusOutput::default());
         }
@@ -844,7 +847,23 @@ impl CodecConsensusCaller {
         let padded_r1 = Self::pad_consensus(&ss_r1_oriented, consensus_length, r1_is_negative);
         let padded_r2 = Self::pad_consensus(&ss_r2_oriented, consensus_length, r2_is_negative);
 
-        let consensus = self.build_duplex_consensus_from_padded(&padded_r1, &padded_r2)?;
+        // On a high-duplex-disagreement reject, count the rejected records under
+        // the `HighDuplexDisagreement` reason and bump the dedicated HDD counter
+        // before propagating the (recoverable) error, matching fgbio, which does
+        // `rejectRecords(..., HighDuplexDisagreement)` and
+        // `consensusReadsFilteredHighDisagreement += 1` (CodecConsensusCaller.scala:255-256).
+        let consensus = match self.build_duplex_consensus_from_padded(&padded_r1, &padded_r2) {
+            Ok(consensus) => consensus,
+            Err(e) if e.is_duplex_disagreement() => {
+                self.reject_records_count(
+                    r1_infos.len() + r2_infos.len(),
+                    CallerRejectionReason::HighDuplexDisagreement,
+                );
+                self.stats.consensus_reads_rejected_hdd += 1;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
         let consensus = self.mask_consensus_quals_query_based(consensus, &padded_r1, &padded_r2);
         let consensus =
             if r1_is_negative { Self::reverse_complement_ss(&consensus) } else { consensus };
@@ -1498,7 +1517,20 @@ impl CodecConsensusCaller {
         &mut self,
         records: Vec<RawRecord>,
     ) -> std::result::Result<ConsensusOutput, CodecConsensusError> {
-        let result = self.consensus_reads_raw(&records)?;
+        let result = match self.consensus_reads_raw(&records) {
+            Ok(result) => result,
+            Err(e) => {
+                // On a recoverable duplex-disagreement reject, still route the
+                // group's raw records to the --rejects output when tracking is
+                // enabled, mirroring the count==0 path below and fgbio's
+                // rejectsWriter. The reject reason/counters were already recorded
+                // by consensus_reads_raw before it returned the error.
+                if self.track_rejects && e.is_duplex_disagreement() && !records.is_empty() {
+                    self.rejected_reads.extend(records.into_iter().map(RawRecord::into_inner));
+                }
+                return Err(e);
+            }
+        };
         // When a group fails to produce consensus, all its records are rejected
         if self.track_rejects && result.count == 0 && !records.is_empty() {
             self.rejected_reads.extend(records.into_iter().map(RawRecord::into_inner));
@@ -1689,6 +1721,7 @@ mod tests {
     };
     use fgumi_sam::clipper::cigar_utils;
     use noodles::sam::alignment::record::cigar::op::Kind;
+    use rstest::rstest;
 
     #[test]
     fn test_codec_caller_creation() {
@@ -2840,6 +2873,149 @@ mod tests {
             "expected DuplexDisagreementRate, got: {err:?}"
         );
         assert!(err.is_duplex_disagreement());
+    }
+
+    /// CODEC3-08: a high-duplex-disagreement reject is counted under the
+    /// `HighDuplexDisagreement` reason and bumps the dedicated HDD counter, mirroring
+    /// fgbio's `rejectRecords(..., HighDuplexDisagreement)` +
+    /// `consensusReadsFilteredHighDisagreement += 1` (CodecConsensusCaller.scala:255-256).
+    /// Before the fix the reject propagated uncounted, so both counters were zero. Each
+    /// case isolates one trigger by making the other threshold permissive.
+    #[rstest]
+    #[case::by_count(0, 1.0)] // permissive rate leaves count as the only trigger
+    #[case::by_rate(usize::MAX, 0.0)] // permissive count leaves rate as the only trigger
+    fn test_high_duplex_disagreement_counted(
+        #[case] max_duplex_disagreements: usize,
+        #[case] max_duplex_disagreement_rate: f64,
+    ) {
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            min_duplex_length: 1,
+            max_duplex_disagreements,
+            max_duplex_disagreement_rate,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        let fixture = duplex_disagreement_fixture();
+        let record_count = fixture.len();
+
+        let Err(err) = caller.consensus_reads_typed(fixture) else {
+            panic!("zero-tolerance disagreement threshold should produce an error");
+        };
+        assert!(err.is_duplex_disagreement());
+
+        let stats = caller.statistics();
+        assert_eq!(
+            stats.rejection_reasons.get(&CallerRejectionReason::HighDuplexDisagreement),
+            Some(&record_count),
+            "all rejected records should be counted under HighDuplexDisagreement"
+        );
+        assert_eq!(
+            stats.consensus_reads_rejected_hdd, 1,
+            "the dedicated HDD counter should be incremented once per rejected molecule"
+        );
+    }
+
+    /// CODEC3-08: with reject tracking enabled, the raw records of a
+    /// high-duplex-disagreement molecule must be preserved for the `--rejects`
+    /// output (fgbio routes these to its `rejectsWriter`). Before the fix the
+    /// recoverable error propagated before the reads were stored, so the
+    /// `--rejects` BAM silently dropped every HDD molecule.
+    ///
+    /// The `--rejects` contract is byte-for-byte preservation of the original
+    /// input records, so this asserts the retained bytes equal the fixture's raw
+    /// records verbatim (identity), not merely that the right *number* of records
+    /// was kept — a length-only check would pass even if the records were
+    /// truncated, reordered, or replaced.
+    #[test]
+    fn test_high_duplex_disagreement_tracks_rejects() {
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            min_duplex_length: 1,
+            max_duplex_disagreements: 0,
+            max_duplex_disagreement_rate: 1.0,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new_with_rejects_tracking(
+            "codec".to_string(),
+            "RG1".to_string(),
+            options,
+            true,
+        );
+
+        let fixture = duplex_disagreement_fixture();
+        // Snapshot each input record's full raw bytes before the fixture is moved
+        // into the caller, so we can assert byte-exact identity of the retained
+        // rejects. `consensus_reads_typed` stores `RawRecord::into_inner()` in
+        // input order, so the retained order matches this snapshot.
+        let expected_bytes: Vec<Vec<u8>> =
+            fixture.iter().map(|record| record.as_ref().to_vec()).collect();
+
+        let Err(err) = caller.consensus_reads_typed(fixture) else {
+            panic!("zero-tolerance count threshold should produce an error");
+        };
+        assert!(err.is_duplex_disagreement());
+        assert_eq!(
+            caller.rejected_reads(),
+            expected_bytes.as_slice(),
+            "every HDD record must be retained byte-for-byte (identity), in input order, \
+             for the --rejects output"
+        );
+    }
+
+    /// CODEC3-08: the `ClipOverlapFailed` reject (consensus shorter than a single
+    /// strand — the overlapping ends could not be clipped, `CodecConsensusCaller.scala:243`)
+    /// must be counted under its own reason and populate a metrics row under fgbio's
+    /// verbatim label, *not* leak into `IndelErrorBetweenStrands` the way it did before
+    /// the fix.
+    ///
+    /// The caller-level trigger (`consensus_length < ss.bases.len()` at the
+    /// `ClipOverlapFailed` site) is a degenerate overlap-clip boundary that fgbio itself
+    /// only reaches on specific real-data alignments; a synthetic pipeline fixture that
+    /// lands there without first tripping the earlier `IndelErrorBetweenStrands` phase
+    /// check would have to replicate fgbio's exact clip arithmetic and would be brittle.
+    /// This exercises the counting/labeling contract at the reject-tallying seam instead:
+    /// `reject_records_count` is the single site every reject flows through, so pinning
+    /// the count, the filtered total, and the central-reason mapping here is what
+    /// guarantees the emitted metrics row is right when the branch does fire.
+    #[test]
+    fn test_clip_overlap_failed_counted_and_labeled() {
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            min_duplex_length: 1,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        // A rejected molecule contributes both of its records (R1 + R2), matching how the
+        // caller passes `r1_infos.len() + r2_infos.len()` at the ClipOverlapFailed site.
+        caller.reject_records_count(2, CallerRejectionReason::ClipOverlapFailed);
+
+        assert_eq!(
+            caller.stats.rejection_reasons.get(&CallerRejectionReason::ClipOverlapFailed),
+            Some(&2),
+            "both rejected records must be tallied under ClipOverlapFailed"
+        );
+        // Regression guard: before the fix this reject was mislabeled as an indel error.
+        assert!(
+            !caller
+                .stats
+                .rejection_reasons
+                .contains_key(&CallerRejectionReason::IndelErrorBetweenStrands),
+            "a clip-overlap reject must not leak into IndelErrorBetweenStrands"
+        );
+        assert_eq!(
+            caller.stats.reads_filtered, 2,
+            "the filtered-reads total the metrics row is derived from must include the reject"
+        );
+        // The metrics row is emitted under the centralized reason; confirm it maps to
+        // fgbio's verbatim `ClipOverlapFailed` label so the row populates, not a fallback.
+        assert_eq!(
+            CallerRejectionReason::ClipOverlapFailed.to_centralized(),
+            fgumi_metrics::rejection::RejectionReason::ClipOverlapFailed,
+            "ClipOverlapFailed must map to the fgbio-verbatim central reason for the metrics row"
+        );
     }
 
     /// Port of fgbio test: "make a consensus where R2 has a deletion outside of the overlap region"

@@ -581,6 +581,15 @@ fn test_codec_command_recovers_from_duplex_disagreement_threaded() {
     let rejects_bam = temp_dir.path().join("rejects.bam");
 
     let (r1, r2) = create_offset_codec_pair("disagree_read_mt", "UMI_DISAGREE_MT");
+    // Capture each read's *complete* raw BAM bytes (every field and tag), keyed by
+    // flags, before the records are moved into the input BAM. The `--rejects`
+    // contract is byte-for-byte preservation of the original records, so asserting
+    // full-record identity — not just name + sequence — is what catches a pipeline
+    // that silently drops or rewrites a field (quals, CIGAR, pos, mate info,
+    // template length, MI/MC tags) on the reject path. R1 and R2 share a read name,
+    // so flags is the distinguishing key.
+    let expected_by_flags: std::collections::HashMap<u16, Vec<u8>> =
+        [&r1, &r2].into_iter().map(|read| (read.flags(), read.as_ref().to_vec())).collect();
     create_codec_test_bam(&input_bam, vec![(r1, r2)]);
 
     let cmd = Codec::try_parse_from([
@@ -613,18 +622,47 @@ fn test_codec_command_recovers_from_duplex_disagreement_threaded() {
 
     // Exercising --rejects forces the parallel-mode `flush_byte_records`
     // call inside the typed-disagreement arm (`is_duplex_disagreement()`
-    // branch in `execute_threads_mode`). The current behavior is that the
-    // disagreement short-circuit in `consensus_reads_typed` returns the
-    // typed error before populating `rejected_reads`, so the file is
-    // created but stays empty — match that here without baking the
-    // open question (whether disagreement-failed reads *should* land in
-    // --rejects) into the test.
+    // branch in `execute_threads_mode`). CODEC3-08: `consensus_reads_typed`
+    // now preserves the disagreeing molecule's raw records for the --rejects
+    // output before returning the recoverable error (fgbio routes these to its
+    // rejectsWriter), so the two input reads land in the rejects BAM.
     assert!(rejects_bam.exists(), "Rejects BAM file should be created");
-    let mut rejects_reader = bam::io::Reader::new(fs::File::open(&rejects_bam).unwrap());
-    let _ = rejects_reader.read_header().unwrap();
-    let reject_count = rejects_reader.records().count();
+
+    // Read the rejects back as raw BAM records so we can compare the *entire*
+    // serialized record (all fields + tags), not just the handful noodles decodes
+    // ergonomically. Each reject must be byte-for-byte identical to one generated
+    // read (keyed by flags), with no read matched twice.
+    let (mut rejects_reader, _rejects_header) =
+        fgumi_bam_io::create_raw_bam_reader(&rejects_bam, 1).expect("open rejects BAM");
+    let mut matched_flags: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    let mut reject_count = 0;
+    let mut record = RawRecord::new();
+    while rejects_reader.read_record(&mut record).expect("read reject record") != 0 {
+        reject_count += 1;
+
+        let flags = record.flags();
+        let expected_bytes = expected_by_flags
+            .get(&flags)
+            .unwrap_or_else(|| panic!("reject record has unexpected flags {flags}"));
+        assert_eq!(
+            record.as_ref(),
+            expected_bytes.as_slice(),
+            "reject record (flags={flags}) must be byte-for-byte identical to the generated \
+             read — every field and tag preserved on the --rejects path"
+        );
+        assert!(
+            matched_flags.insert(flags),
+            "reject record with flags {flags} appears more than once"
+        );
+    }
+
     assert_eq!(
-        reject_count, 0,
-        "Disagreement short-circuits before reject tracking; rejects file is empty"
+        reject_count, 2,
+        "The disagreeing molecule's R1 and R2 should be written to the rejects BAM"
+    );
+    assert_eq!(
+        matched_flags.len(),
+        expected_by_flags.len(),
+        "both generated reads (R1 and R2) should be present in the rejects BAM"
     );
 }
