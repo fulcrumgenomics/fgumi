@@ -25,9 +25,10 @@
 //! (not only through the `fgumi compare bams`/`metrics` CLI, though metrics goes
 //! through its `Command` entry point since that's its only public surface):
 //! [`positional_compare`] under all three [`ContentPredicate`] variants,
-//! [`keyjoin_compare`] (`group`'s merge-join + MI bijection), [`sort_verify_compare`]
-//! (`sort`'s independent-baseline order check), [`compare_headers`], and
-//! `fgumi compare metrics`'s row key-join (via [`CompareMetrics`]).
+//! [`molecule_join_compare`] (`group`'s streaming per-molecule hash-join),
+//! [`sort_verify_compare`] (`sort`'s independent-baseline order check),
+//! [`compare_headers`], and `fgumi compare metrics`'s row key-join (via
+//! [`CompareMetrics`]).
 //!
 //! Where a fixture in `harden-compare-corpus/fixtures` already exercises an
 //! equivalent adversarial case (e.g. the accepted `r2-ucc-02` per-cell-consensus
@@ -40,7 +41,7 @@
 use clap::Parser;
 use fgumi_lib::commands::command::Command as FgumiCommand;
 use fgumi_lib::commands::compare::{
-    CompareMetrics, CompareMismatch, ContentPredicate, compare_headers, keyjoin_compare,
+    CompareMetrics, CompareMismatch, ContentPredicate, compare_headers, molecule_join_compare,
     positional_compare, sort_verify_compare,
 };
 use fgumi_lib::sam::SamTag;
@@ -59,7 +60,7 @@ use std::path::Path;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{
-    create_coordinate_sorted_header, create_minimal_header, keyjoin_cfg, mi_record, write_bam,
+    create_coordinate_sorted_header, create_minimal_header, mi_record, write_bam,
 };
 use crate::helpers::write_tsv;
 
@@ -431,10 +432,9 @@ fn positional_exact_swap_of_distinct_key_records_differs() {
 // ---- ExactMinusMi via positional_compare --------------------------------
 //
 // `ExactMinusMi` is already unit-tested directly against `content_diffs` in
-// `engines/content.rs`, but until now it was only exercised end-to-end via
-// `keyjoin_compare` (Section 4) — never through `positional_compare`, even
-// though `ExactMinusMi` is routed through the positional engine in production
-// (the `group` comparison preset). These two cases close that gap.
+// `engines/content.rs`, and end-to-end via `molecule_join_compare` (Section 4, which
+// hardcodes it for `group`'s per-molecule content check) — but until now it was never
+// exercised through `positional_compare` directly. These two cases close that gap.
 
 fn record_with_mi_and_nm(mi: i32, nm: i32) -> RawRecord {
     let mut b = SamBuilder::new();
@@ -753,15 +753,19 @@ fn compare_headers_co_change_is_not_a_diff() {
 }
 
 // =============================================================================
-// Section 4 — `keyjoin_compare` (`group`: merge-join + MI bijection)
+// Section 4 — `molecule_join_compare` (`group`: streaming per-molecule hash-join)
 // =============================================================================
 //
-// `keyjoin_cfg` and `mi_record` are shared with `test_compare_bams.rs` and now
-// live in `helpers::bam_generator` (see the top-of-file import).
+// `mi_record` is shared with `test_compare_bams.rs` and lives in
+// `helpers::bam_generator` (see the top-of-file import). Unlike the retired key-join
+// engine, `molecule_join_compare` never re-sorts either input: both inputs must
+// already be grouped (same-MI reads consecutive within the file), so every fixture
+// below keeps each MI's records contiguous per file even when reordering molecules
+// relative to each other or between the two files.
 
 #[test]
-fn keyjoin_mi_renumber_preserving_partition_is_not_a_diff() {
-    // The accepted divergence `group` key-join exists for: fgumi and fgbio number
+fn molecule_join_mi_renumber_preserving_partition_is_not_a_diff() {
+    // The accepted divergence `group` comparison exists for: fgumi and fgbio number
     // molecules independently, so a pure MI relabel that preserves which reads
     // share a molecule must NOT DIFFER.
     let tmp = TempDir::new().unwrap();
@@ -782,16 +786,16 @@ fn keyjoin_mi_renumber_preserving_partition_is_not_a_diff() {
     write_bam(&bam2, &header, &records2);
 
     let outcome =
-        keyjoin_compare(&bam1, &bam2, &keyjoin_cfg(&tmp)).expect("keyjoin_compare should succeed");
-    assert_eq!(outcome.mi_bijection_mismatches, 0, "{outcome:?}");
+        molecule_join_compare(&bam1, &bam2, 10).expect("molecule_join_compare should succeed");
+    assert!(outcome.diff_details.is_empty(), "{outcome:?}");
     assert!(outcome.is_match(), "MI renumbering alone must NOT DIFFER: {outcome:?}");
 }
 
 #[test]
-fn keyjoin_mi_bijection_violation_differs() {
-    // Same reads as the tolerated case above, but read2/read3 are split into two
-    // molecules on one side: a genuine grouping (partition) change, which the MI
-    // bijection tracker must catch even though content and record presence are
+fn molecule_join_grouping_split_differs() {
+    // Same reads as the tolerated case above, but read2 is split into a distinct
+    // molecule on one side: a genuine grouping (partition) change, which membership
+    // matching on the MI-invariant canonical id must catch even though content is
     // otherwise untouched.
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
@@ -803,16 +807,17 @@ fn keyjoin_mi_bijection_violation_differs() {
     write_bam(&bam2, &header, &records2);
 
     let outcome =
-        keyjoin_compare(&bam1, &bam2, &keyjoin_cfg(&tmp)).expect("keyjoin_compare should succeed");
-    assert!(outcome.mi_bijection_mismatches > 0, "{outcome:?}");
+        molecule_join_compare(&bam1, &bam2, 10).expect("molecule_join_compare should succeed");
+    assert!(!outcome.diff_details.is_empty(), "{outcome:?}");
     assert!(!outcome.is_match(), "a grouping split must DIFFER: {outcome:?}");
 }
 
 #[test]
-fn keyjoin_reordered_records_same_grouping_is_not_a_diff() {
+fn molecule_join_reordered_molecules_same_grouping_is_not_a_diff() {
     // `group`'s output order legitimately differs between tools (they number
-    // molecules independently); the key-join canonicalizes both sides to
-    // queryname order internally, so a pure reorder with an unchanged partition
+    // molecules independently); the molecule-join matches molecules by an
+    // MI-invariant canonical id, so reordering molecules relative to each other (each
+    // MI's own records stay contiguous within the file) with an unchanged partition
     // must NOT DIFFER.
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
@@ -827,18 +832,18 @@ fn keyjoin_reordered_records_same_grouping_is_not_a_diff() {
     write_bam(&bam2, &header, &records2);
 
     let outcome =
-        keyjoin_compare(&bam1, &bam2, &keyjoin_cfg(&tmp)).expect("keyjoin_compare should succeed");
+        molecule_join_compare(&bam1, &bam2, 10).expect("molecule_join_compare should succeed");
     assert!(
         outcome.is_match(),
-        "reordering with an unchanged partition must NOT DIFFER: {outcome:?}"
+        "reordering molecules with an unchanged partition must NOT DIFFER: {outcome:?}"
     );
 }
 
 #[test]
-fn keyjoin_content_diff_with_intact_grouping_differs() {
+fn molecule_join_content_diff_with_intact_grouping_differs() {
     // BS1 regression proof: a non-MI content bug on one matched pair, with the MI
-    // partition completely untouched, must still DIFFER -- the key-join's job is
-    // not only MI equivalence but content equality too.
+    // partition completely untouched, must still DIFFER -- the molecule-join's job is
+    // not only grouping equivalence but content equality too.
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
     let good = |name: &[u8], pos: i32, seq: &[u8]| {
@@ -860,9 +865,8 @@ fn keyjoin_content_diff_with_intact_grouping_differs() {
     write_bam(&bam2, &header, &records2);
 
     let outcome =
-        keyjoin_compare(&bam1, &bam2, &keyjoin_cfg(&tmp)).expect("keyjoin_compare should succeed");
-    assert_eq!(outcome.mi_bijection_mismatches, 0, "the grouping itself is untouched: {outcome:?}");
-    assert_eq!(outcome.content_diffs, 1, "{outcome:?}");
+        molecule_join_compare(&bam1, &bam2, 10).expect("molecule_join_compare should succeed");
+    assert!(!outcome.diff_details.is_empty(), "{outcome:?}");
     assert!(
         !outcome.is_match(),
         "a content diff must DIFFER even with intact grouping: {outcome:?}"
@@ -870,7 +874,7 @@ fn keyjoin_content_diff_with_intact_grouping_differs() {
 }
 
 #[test]
-fn keyjoin_dropped_record_is_a_presence_diff() {
+fn molecule_join_dropped_record_is_a_presence_diff() {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
     let records1 = vec![mi_record(b"read1", 100, "1"), mi_record(b"read2", 200, "1")];
@@ -881,8 +885,8 @@ fn keyjoin_dropped_record_is_a_presence_diff() {
     write_bam(&bam2, &header, &records2);
 
     let outcome =
-        keyjoin_compare(&bam1, &bam2, &keyjoin_cfg(&tmp)).expect("keyjoin_compare should succeed");
-    assert_eq!(outcome.only_in_bam1, 1, "{outcome:?}");
+        molecule_join_compare(&bam1, &bam2, 10).expect("molecule_join_compare should succeed");
+    assert!(!outcome.diff_details.is_empty(), "{outcome:?}");
     assert!(!outcome.is_match(), "a dropped record must DIFFER: {outcome:?}");
 }
 
@@ -1069,7 +1073,7 @@ fn metrics_different_column_set_differs() {
 // self-consistent and the guard green. Each `CatalogEntry` now also carries a
 // `verify: fn() -> bool` closure that independently rebuilds a minimal fixture for
 // that exact mutation and re-runs it through the real engine (`positional_compare`,
-// `compare_headers`, `keyjoin_compare`, `sort_verify_compare`, or
+// `compare_headers`, `molecule_join_compare`, `sort_verify_compare`, or
 // `CompareMetrics::execute`), so `mutation_catalog_covers_every_compared_dimension`
 // re-derives every row's expected verdict from production code -- not merely from
 // this array's own `must_differ` field -- and would fail if a compared
@@ -1137,17 +1141,17 @@ fn headers_differ(h1: &Header, h2: &Header) -> bool {
     compare_headers(h1, h2).is_some()
 }
 
-/// Runs `keyjoin_compare` over two short BAMs built from `recs_a`/`recs_b`,
-/// returning `true` if it reported DIFFER.
-fn keyjoin_differs(recs_a: &[RawRecord], recs_b: &[RawRecord]) -> bool {
+/// Runs `molecule_join_compare` over two short, already-grouped BAMs built from
+/// `recs_a`/`recs_b`, returning `true` if it reported DIFFER.
+fn molecule_join_differs(recs_a: &[RawRecord], recs_b: &[RawRecord]) -> bool {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
     let bam1 = tmp.path().join("a.bam");
     let bam2 = tmp.path().join("b.bam");
     write_bam(&bam1, &header, recs_a);
     write_bam(&bam2, &header, recs_b);
-    !keyjoin_compare(&bam1, &bam2, &keyjoin_cfg(&tmp))
-        .expect("keyjoin_compare should succeed")
+    !molecule_join_compare(&bam1, &bam2, 10)
+        .expect("molecule_join_compare should succeed")
         .is_match()
 }
 
@@ -1626,13 +1630,13 @@ const MUTATION_CATALOG: &[CatalogEntry] = &[
             )
         },
     },
-    // Section 4: keyjoin (group)
+    // Section 4: molecule_join (group)
     CatalogEntry {
-        engine: "keyjoin",
+        engine: "molecule_join",
         mutation: "MI renumber preserving partition",
         must_differ: false,
         verify: || {
-            keyjoin_differs(
+            molecule_join_differs(
                 &[
                     mi_record(b"read1", 100, "1"),
                     mi_record(b"read2", 200, "1"),
@@ -1647,29 +1651,29 @@ const MUTATION_CATALOG: &[CatalogEntry] = &[
         },
     },
     CatalogEntry {
-        engine: "keyjoin",
-        mutation: "MI bijection violation",
+        engine: "molecule_join",
+        mutation: "grouping split",
         must_differ: true,
         verify: || {
-            keyjoin_differs(
+            molecule_join_differs(
                 &[mi_record(b"read1", 100, "1"), mi_record(b"read2", 200, "1")],
                 &[mi_record(b"read1", 100, "1"), mi_record(b"read2", 200, "2")],
             )
         },
     },
     CatalogEntry {
-        engine: "keyjoin",
-        mutation: "reordered records same grouping",
+        engine: "molecule_join",
+        mutation: "reordered molecules same grouping",
         must_differ: false,
         verify: || {
             let r1 = mi_record(b"read1", 100, "1");
             let r2 = mi_record(b"read2", 200, "1");
             let r3 = mi_record(b"read3", 300, "2");
-            keyjoin_differs(&[r1.clone(), r2.clone(), r3.clone()], &[r3, r1, r2])
+            molecule_join_differs(&[r1.clone(), r2.clone(), r3.clone()], &[r3, r1, r2])
         },
     },
     CatalogEntry {
-        engine: "keyjoin",
+        engine: "molecule_join",
         mutation: "content diff with intact grouping",
         must_differ: true,
         verify: || {
@@ -1684,18 +1688,18 @@ const MUTATION_CATALOG: &[CatalogEntry] = &[
                     .add_string_tag(SamTag::MI, b"1");
                 b.build()
             };
-            keyjoin_differs(
+            molecule_join_differs(
                 &[good(b"read1", 100, b"ACGTACGT"), good(b"read2", 200, b"ACGTACGT")],
                 &[good(b"read1", 100, b"ACGTACGT"), good(b"read2", 200, b"ACGTACGA")],
             )
         },
     },
     CatalogEntry {
-        engine: "keyjoin",
+        engine: "molecule_join",
         mutation: "dropped record presence diff",
         must_differ: true,
         verify: || {
-            keyjoin_differs(
+            molecule_join_differs(
                 &[mi_record(b"read1", 100, "1"), mi_record(b"read2", 200, "1")],
                 &[mi_record(b"read1", 100, "1")],
             )
@@ -1818,7 +1822,7 @@ fn mutation_catalog_covers_every_compared_dimension() {
         "per-base consensus tag",
         "MI value change",
         "MI renumber",
-        "MI bijection",
+        "grouping split",
         // records / order
         "drop a record",
         "duplicate a record",
@@ -1864,7 +1868,7 @@ fn mutation_catalog_covers_every_compared_dimension() {
     // (2) The load-bearing check: re-run every entry's `verify` closure against the
     // real comparator and confirm it agrees with the entry's claimed `must_differ`.
     // Unlike (1), this does not trust the catalog's own text -- it trusts only the
-    // production `positional_compare`/`compare_headers`/`keyjoin_compare`/
+    // production `positional_compare`/`compare_headers`/`molecule_join_compare`/
     // `sort_verify_compare`/`CompareMetrics` entry points. A catalog row can no
     // longer "silently pass" merely by existing: if the compared dimension it
     // names stops actually being compared (or never was), this loop fails.

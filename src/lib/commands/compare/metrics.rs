@@ -372,7 +372,7 @@ fn canonicalize_key_field(raw: &str, precision: Option<u32>) -> String {
 ///
 /// A `BTreeMap` (rather than a hash map) so the outer join in [`compare_metrics`]
 /// can walk both files' groups as two sorted streams, merge-join style -- the same
-/// discipline `engines::keyjoin::keyjoin_compare` uses for BAM records.
+/// discipline `engines::sort_verify::sort_verify_compare` uses for BAM records.
 ///
 /// # Errors
 ///
@@ -591,7 +591,7 @@ pub fn compare_metrics(
     let groups2 = group_by_key(&tsv2, &key_idx2, cfg.precision, file2)?;
 
     // Merge-join the two sorted key streams (mirrors
-    // `engines::keyjoin::keyjoin_compare`'s no-resync discipline): always compare
+    // `engines::sort_verify::sort_verify_compare`'s no-resync discipline): always compare
     // the two current keys and advance whichever side is behind (or both, on a
     // match), so a presence-only key is reported once and never causes the join
     // to desync.

@@ -187,8 +187,8 @@ fn fold_matched_pair(
 /// Two-sided streaming hash-join over `bam1`'s and `bam2`'s per-molecule runs (see
 /// [`molecule_runs`]), comparing each pair matched by canonical id via [`compare_molecule`].
 ///
-/// Unlike [`super::keyjoin`], this never re-sorts either input: both files are already
-/// template-coordinate sorted with same-molecule reads consecutive (grouped output), so
+/// Unlike the retired key-join engine, this never re-sorts either input: both files are
+/// already template-coordinate sorted with same-molecule reads consecutive (grouped output), so
 /// [`molecule_runs`] can cut each into per-molecule runs in a single streaming pass. The two
 /// streams are pulled in lockstep — one run from `bam1`, then one from `bam2`, each iteration —
 /// each newly pulled run probed against the *other* side's `pending` map: a hit compares and

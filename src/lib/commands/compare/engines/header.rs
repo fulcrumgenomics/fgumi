@@ -1,6 +1,6 @@
 //! `@HD`/`@SQ`/`@RG` header-equality comparison for `fgumi compare bams`.
 //!
-//! The comparison engines (`content`/`positional`, `keyjoin`, `sort_verify`) already parse
+//! The comparison engines (`content`/`positional`, `molecule_join`, `sort_verify`) already parse
 //! both inputs' `noodles::sam::Header`, but historically only ever used it to resolve
 //! RNAME/RNEXT reference names for diff rendering — the header itself was never compared,
 //! so two BAMs with genuinely different reference dictionaries, read groups, or sort-order
@@ -119,9 +119,11 @@ pub(crate) fn require_compatible_headers(h1: &Header, h2: &Header) -> Result<Opt
 /// Fold an optional [`compare_headers`] result into an engine's `header_mismatch` flag and
 /// `diff_details`, capping entries at `max_diffs` (via [`super::push_diff`]).
 ///
-/// Shared by every engine (`positional`, `keyjoin`, `sort_verify`) that calls
-/// [`compare_headers`] and needs to merge its result into its own outcome/diff-details
-/// state identically.
+/// Shared by every engine (`positional`, `sort_verify`) that calls [`compare_headers`] and
+/// needs to merge its result into its own outcome/diff-details state identically.
+/// `molecule_join` does not call this: header compatibility is instead enforced once, up
+/// front, by `require_compatible_headers` at the CLI entry point (see
+/// `super::molecule_join::molecule_join_compare`'s doc comment).
 pub(crate) fn fold_header_diffs(
     diffs: Option<Vec<String>>,
     mismatch: &mut bool,

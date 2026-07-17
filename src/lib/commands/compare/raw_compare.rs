@@ -155,7 +155,8 @@ pub fn raw_tags_equal_order_independent(r1: &[u8], r2: &[u8]) -> bool {
 /// *and* its presence) from the comparison — the multiset equivalent of
 /// [`super::engines::content::ContentPredicate::ExactMinusMi`]'s tag rule. `group`
 /// legitimately renumbers MI across tools, and MI equivalence is verified separately by the
-/// key-join engine's bijection check, so this predicate must not also react to an MI
+/// molecule-join engine's matching of molecules on an MI-invariant canonical id (plus its
+/// record-membership/strand-partition checks), so this predicate must not also react to an MI
 /// difference. Duplicate non-MI tags are still matched as a multiset (a duplicate `NM` does
 /// not collapse into one), so a genuine duplicate-tag divergence still reports a difference.
 #[must_use]

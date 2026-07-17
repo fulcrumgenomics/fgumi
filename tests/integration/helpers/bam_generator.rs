@@ -313,8 +313,6 @@ pub fn create_test_reference(dir: &std::path::Path) -> std::path::PathBuf {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "compare")]
-use fgumi_lib::commands::compare::KeyJoinConfig;
-#[cfg(feature = "compare")]
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 
 /// Writes a BAM file from the given header and records.
@@ -341,20 +339,6 @@ pub fn mi_record(name: &[u8], pos: i32, mi: &str) -> RawRecord {
         .mapq(60)
         .add_string_tag(SamTag::MI, mi.as_bytes());
     b.build()
-}
-
-/// Default [`KeyJoinConfig`] for `keyjoin_compare` tests: single-threaded, an
-/// ample in-memory budget (no forced spill), and scratch confined to the
-/// caller's own `TempDir` so tests never touch `/var/tmp` (the production
-/// default — see `keyjoin_compare`'s F2 fallback).
-#[cfg(feature = "compare")]
-pub fn keyjoin_cfg(tmp: &tempfile::TempDir) -> KeyJoinConfig {
-    KeyJoinConfig {
-        threads: 1,
-        sort_memory: 64 * 1024 * 1024,
-        sort_tmp_dirs: vec![tmp.path().to_path_buf()],
-        max_diffs: 10,
-    }
 }
 
 #[cfg(test)]

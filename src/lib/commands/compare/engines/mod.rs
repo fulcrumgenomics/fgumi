@@ -15,7 +15,6 @@
 
 pub mod content;
 pub mod header;
-pub mod keyjoin;
 pub(crate) mod molecule_join;
 pub mod positional;
 pub mod sort_verify;
@@ -29,7 +28,7 @@ use fgumi_sort::RawBamRecordReader;
 /// Append `msg()` to `details` unless it is already at the `max_diffs` cap — lazily, so
 /// callers only pay for building the message string when it will actually be kept.
 ///
-/// Shared by every engine's diff-collection loop (`keyjoin`, `metrics`, and, via
+/// Shared by every engine's diff-collection loop (`molecule_join`, `metrics`, and, via
 /// [`header::fold_header_diffs`], `positional`/`sort_verify`) — the capping/lazy-build
 /// discipline is identical everywhere `diff_details` is populated.
 pub(crate) fn push_diff(details: &mut Vec<String>, max_diffs: usize, msg: impl FnOnce() -> String) {
@@ -41,7 +40,7 @@ pub(crate) fn push_diff(details: &mut Vec<String>, max_diffs: usize, msg: impl F
 /// Open a raw-byte BAM record reader over `path`, positioned just past the header.
 ///
 /// Shared by every engine that needs to re-open one of its own input paths for
-/// sequential raw-record pulling: `keyjoin`'s canonicalized cursors and `sort_verify`'s
+/// sequential raw-record pulling: `molecule_join`'s per-file cursors and `sort_verify`'s
 /// per-file reader both open + skip-header identically, differing only in what error
 /// context they attach to a failure (added by the caller via `.with_context`, if at all).
 ///

@@ -39,17 +39,14 @@ use fgumi_raw_bam::RawRecord;
 /// including the malformed `FIRST | LAST` state, which must not be conflated with
 /// a plain `Fragment` (neither flag set).
 ///
-/// **The variant declaration order is load-bearing** (it defines the derived
-/// `Ord` used by [`RecordKey`]). `FirstAndLast` is deliberately ordered *before*
-/// `First`/`Last`, i.e. it does **not** match `fgumi_sort`'s
-/// `queryname_flag_order` bit-packing, which sorts the `FIRST | LAST` flag word
-/// (`0xc0`) *last*. That intentional disagreement is what keeps the key-join F1
-/// soundness guard ([`keyjoin_compare`](super::engines::keyjoin::keyjoin_compare))
-/// able to detect — and hard-fail on — a canonicalized stream containing such a
-/// malformed record, rather than silently joining it. The
-/// `test_keyjoin_compare_hard_errors_on_record_key_order_violation` integration
-/// test locks this coupling: reordering `FirstAndLast` to match the flag packing
-/// would break it.
+/// The variant declaration order defines the derived `Ord` used by [`RecordKey`].
+/// `FirstAndLast` is deliberately ordered *before* `First`/`Last`, i.e. it does **not**
+/// match `fgumi_sort`'s `queryname_flag_order` bit-packing, which sorts the `FIRST | LAST`
+/// flag word (`0xc0`) *last*. `RecordKey::Ord` and `fgumi_sort`'s queryname physical order
+/// are two independent orderings and must not be assumed interchangeable — today
+/// `RecordKey`'s `Ord` is consulted only for `BTreeMap`/`BTreeSet` lookup and deterministic
+/// iteration (e.g. the molecule-join engine's per-molecule membership index, see
+/// `super::engines::molecule_join`), not for any stream-monotonicity guard.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub enum Segment {
     /// Neither FIRST nor LAST segment set (unpaired / fragment read).

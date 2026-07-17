@@ -26,31 +26,31 @@ use super::super::raw_compare::{
 /// A predicate for deciding whether two BAM records are content-equal.
 ///
 /// Content predicates ignore each record's position within its stream (see
-/// [`super::positional`] for the ordering-aware engine) and compare only the byte-level
+/// `positional` for the ordering-aware engine) and compare only the byte-level
 /// content of a single pair of records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContentPredicate {
-    /// Every core SAM field must match exactly (via [`raw_compare_structured`]'s
+    /// Every core SAM field must match exactly (via `raw_compare_structured`'s
     /// `core_match`), and every aux tag must match under an order-independent, semantic
     /// comparison of tag values (`core_match`'s sibling `tag_order_match`, computed from
-    /// [`super::super::raw_compare::raw_tags_equal_order_independent`]). Tag order and
+    /// `raw_tags_equal_order_independent`). Tag order and
     /// on-disk integer width are *not* significant — only the decoded values are.
     ///
     /// One accepted divergence applies to *every* predicate (not just `Exact`): aux tags
     /// that fgumi emits but fgbio never persists — currently just `tc`, the
     /// template-coordinate sort key `fgumi zipper` writes and `fgumi dedup` consumes — are
-    /// ignored entirely (see [`super::super::raw_compare::is_ignored_fgumi_only_tag`] and
+    /// ignored entirely (see `is_ignored_fgumi_only_tag` and
     /// the design spec §"Accepted divergences"). The carve-out is narrow: only that tag is
     /// dropped, so a real difference in any other tag still reports a DIFFER.
     Exact,
     /// [`Self::Exact`], but excludes the `MI` tag entirely from tag comparison — neither its
     /// *value* nor its *presence* is compared. `group` legitimately renumbers MI values across
     /// tools (compare-hardening design spec, §"Accepted divergences", "`group` MI numbering"),
-    /// and the key-join engine (`super::keyjoin`) verifies MI equivalence separately via a
-    /// bijection over the joined records' MI values, plus its own "missing MI" accounting — so
-    /// this predicate must not also react to an MI value or presence difference, which would
-    /// double up (and could disagree) with those separate checks. Every other tag and every
-    /// core SAM field stay exact.
+    /// and the molecule-join engine (`super::molecule_join`) verifies MI equivalence
+    /// separately by matching molecules on an MI-invariant canonical id and checking record
+    /// membership/strand-partition, so this predicate must not also react to an MI value or
+    /// presence difference, which would double up (and could disagree) with those separate
+    /// checks. Every other tag and every core SAM field stay exact.
     ExactMinusMi,
 }
 
@@ -417,8 +417,9 @@ mod tests {
     // ==================== ExactMinusMi carve-out tests ====================
     //
     // `ExactMinusMi` excludes the `MI` tag entirely (value and presence) from the
-    // comparison, since `group` legitimately renumbers MI and the key-join engine
-    // verifies MI equivalence separately via its own bijection/missing-MI accounting
+    // comparison, since `group` legitimately renumbers MI and the molecule-join engine
+    // verifies MI equivalence separately by matching molecules on an MI-invariant
+    // canonical id and checking record membership/strand-partition
     // (see `ContentPredicate::ExactMinusMi`'s doc-comment).
 
     #[rstest]
@@ -457,8 +458,14 @@ mod tests {
 
     #[test]
     fn exact_minus_mi_ignores_mi_presence_difference() {
-        // MI present on `a`, absent on `b` — still not a diff under ExactMinusMi (the
-        // key-join engine's separate "missing MI" accounting owns this case).
+        // MI present on `a`, absent on `b` — still not a diff under ExactMinusMi: this
+        // predicate excludes the MI tag from content comparison entirely (value and
+        // presence). This test pins that predicate-level behavior directly. Note the
+        // grouping engine never actually hands an MI-less record to a content predicate:
+        // `molecule_runs` rejects the first record with a missing/unparseable MI in a
+        // non-empty input as a grouping precondition (see
+        // `super::super::molecule::molecule_runs`). ExactMinusMi stays presence-agnostic
+        // regardless — which is exactly what this test locks.
         let a =
             SamBuilder::new().read_name(b"r").sequence(b"ACGT").add_int_tag(SamTag::MI, 5).build();
         let b = SamBuilder::new().read_name(b"r").sequence(b"ACGT").build();

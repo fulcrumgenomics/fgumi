@@ -28,12 +28,11 @@ use std::path::PathBuf;
 use std::thread;
 
 use crate::commands::command::Command;
-use crate::commands::common::{MemoryReserve, parse_bool, resolve_memory_budget};
-use crate::commands::sort::TMP_DIRS_ENV;
+use crate::commands::common::parse_bool;
 
 use super::engines::content::ContentPredicate;
 use super::engines::header::require_compatible_headers;
-use super::engines::keyjoin::{self, KeyJoinConfig};
+use super::engines::molecule_join::molecule_join_compare;
 use super::engines::positional::positional_compare;
 
 /// Comparison mode for BAM files
@@ -50,12 +49,16 @@ pub enum CompareMode {
     Content,
     /// Grouping comparison: verify MI groupings are equivalent (for grouped BAMs).
     ///
-    /// Canonicalizes both inputs to queryname order and merge-joins by
-    /// [`RecordKey`](super::record_key::RecordKey), then verifies the
-    /// fgumi-MI/fgbio-MI mapping is a consistent
-    /// bijection (order-independent; see [`super::engines::keyjoin`]). Also
-    /// checks non-MI content on each matched pair under
-    /// [`ContentPredicate::ExactMinusMi`](super::engines::content::ContentPredicate::ExactMinusMi).
+    /// Streams both inputs' per-molecule runs (see [`super::engines::molecule_join`]) and
+    /// matches molecules across the two files by an MI-invariant canonical id (the
+    /// lexicographically smallest read name in the molecule), independent of file order or
+    /// MI numbering. Each matched pair is checked for record membership, non-MI content
+    /// under
+    /// [`ContentPredicate::ExactMinusMi`](super::engines::content::ContentPredicate::ExactMinusMi),
+    /// and duplex `/A`/`/B` strand-partition equivalence. Unlike `Content` mode, this
+    /// requires each input to already be grouped: same-MI reads must be consecutive within
+    /// the file (as `fgumi group`/`fgbio group` output is), since the join never re-sorts
+    /// either input.
     Grouping,
 }
 
@@ -87,11 +90,12 @@ pub enum CommandPreset {
     Correct,
     /// Dedup output: deterministic; exact content comparison.
     Dedup,
-    /// Group output: MI values and record order may differ between tools or
-    /// runs. Compares via the key-join engine
-    /// ([`super::engines::keyjoin::keyjoin_compare`]) under
-    /// [`ContentPredicate::ExactMinusMi`] plus a separate fgumi-MI/fgbio-MI
-    /// bijection check; see [`CommandPreset::resolve`] for the full rationale.
+    /// Group output: MI values and molecule order may differ between tools or
+    /// runs. Compares via the streaming molecule-join engine
+    /// ([`super::engines::molecule_join::molecule_join_compare`]), matching molecules by an
+    /// MI-invariant canonical id and checking membership, content under
+    /// [`ContentPredicate::ExactMinusMi`], and duplex strand-partition equivalence; see
+    /// [`CommandPreset::resolve`] for the full rationale.
     Group,
     /// Simplex consensus output: positional, exact content comparison
     /// (see [`ContentPredicate::Exact`](super::engines::content::ContentPredicate::Exact)).
@@ -136,17 +140,17 @@ impl CommandPreset {
     ///   because fgumi clamps the depth tags to fgbio's `Short` ceiling at the source, the
     ///   tags are bit-identical and an exact comparison is both sound and complete — no
     ///   consensus-specific predicate is needed.
-    /// - `Group` → `(Grouping, true, ExactMinusMi)`: MI values and record order may
+    /// - `Group` → `(Grouping, true, ExactMinusMi)`: MI values and molecule order may
     ///   legitimately differ between tools or runs, so `Group` is the only preset that
     ///   verifies grouping equivalence instead of routing to `execute_content`. It compares
-    ///   via the key-join engine ([`super::engines::keyjoin::keyjoin_compare`]): records are
-    ///   paired by [`RecordKey`](super::record_key::RecordKey) after canonicalizing both
-    ///   inputs to queryname order, content is compared under
+    ///   via the streaming molecule-join engine
+    ///   ([`super::engines::molecule_join::molecule_join_compare`]): molecules are matched by
+    ///   an MI-invariant canonical id (no re-sort — both inputs must already be grouped),
+    ///   and each matched pair is checked for record membership, content under
     ///   [`ContentPredicate::ExactMinusMi`](super::engines::content::ContentPredicate::ExactMinusMi)
-    ///   (everything except the MI tag), and the fgumi-MI/fgbio-MI mapping observed across
-    ///   matched pairs must separately be a consistent bijection — the predicate excludes MI
-    ///   precisely because that bijection check, not the content predicate, is what verifies
-    ///   MI equivalence.
+    ///   (everything except the MI tag), and duplex `/A`/`/B` strand-partition equivalence —
+    ///   the predicate excludes MI precisely because the canonical-id matching, not the
+    ///   content predicate, is what verifies MI equivalence.
     ///
     /// Exhaustive over every [`CommandPreset`] variant so that adding a new preset forces a
     /// conscious choice here rather than silently defaulting via a wildcard arm.
@@ -172,7 +176,7 @@ impl CommandPreset {
     /// The [`ContentPredicate`] to use for this preset's content comparison. See
     /// [`Self::resolve`] for the full resolution table and rationale. Note that for `Group`
     /// (resolved mode `CompareMode::Grouping`), this value is *not* consulted by the
-    /// key-join engine — [`engines::keyjoin::keyjoin_compare`] hardcodes
+    /// molecule-join engine — [`engines::molecule_join::molecule_join_compare`] hardcodes
     /// [`ContentPredicate::ExactMinusMi`] internally and is not configurable via
     /// `--command`/`--mode`. `Group` never reaches `execute_content`, but this method is
     /// still live for it (its resolved value is exercised only by the
@@ -211,14 +215,15 @@ MODES:
     default). Does not analyze MI groupings - just compares raw content.
 
   grouping:
-    For comparing grouped BAM files where MI assignment order may differ.
-    Order-independent: each input is internally canonicalized to queryname
-    order and merge-joined by record identity (so --ignore-order is a no-op
-    here, retained only for backward compatibility). Every matched pair is
-    compared under EXACT-MI (every field except the MI tag), so a non-MI
-    content difference DIFFERs even when the MI grouping itself is untouched,
-    in addition to verifying the fgumi-MI/fgbio-MI mapping is a consistent
-    bijection (including the base-level duplex strand-pairing check).
+    For comparing grouped BAM files where MI assignment order may differ. A
+    streaming molecule-join: both inputs must already be grouped (same-MI
+    reads consecutive, as fgumi group/fgbio group output is) since this mode
+    never re-sorts either input. Molecules are matched across the two files
+    by an MI-invariant canonical id (so --ignore-order is a no-op here,
+    retained only for backward compatibility). Every matched pair is checked
+    for record membership, non-MI content (EXACT-MI: every field except the
+    MI tag, so a non-MI content difference DIFFERs even when the MI grouping
+    itself is untouched), and duplex /A//B strand-partition equivalence.
 
 COMMAND PRESETS (--command):
 
@@ -236,7 +241,7 @@ COMMAND PRESETS (--command):
   correct         content     false            Modifies RX tag only, not MI
   dedup           content     false            Deterministic
   filter          content     false            Passes through MI/depth tags unchanged; exact (like consensus)
-  group           grouping    true             Key-join: EXACT-MI content + MI bijection (cross-tool)
+  group           grouping    true             Molecule-join: EXACT-MI content + membership/strand (cross-tool)
   simplex         content     false            Exact (cD/cM/cE compared exactly; clamped at source)
   duplex          content     false            Exact (cD/cM/cE + aD/aM/bD/bM/aE/bE, exact)
   codec           content     false            Exact (same as simplex/duplex)
@@ -286,9 +291,10 @@ pub struct CompareBams {
 
     /// Comparison mode: 'content' (all fields and tags, order-sound positional
     /// pairing — for extract/zipper/correct/dedup/simplex/duplex/codec/filter
-    /// output), or 'grouping' (MI equivalence via the order-independent key-join
-    /// engine — for group output). Overrides `--command` preset if both given.
-    /// Defaults to 'content' when neither `--mode` nor `--command` is set.
+    /// output), or 'grouping' (MI equivalence via the streaming molecule-join
+    /// engine — for group output; requires grouped, same-MI-consecutive input).
+    /// Overrides `--command` preset if both given. Defaults to 'content' when
+    /// neither `--mode` nor `--command` is set.
     #[arg(long = "mode")]
     pub mode: Option<CompareMode>,
 
@@ -302,9 +308,10 @@ pub struct CompareBams {
 
     /// Ignore record order when comparing. Only valid with `--mode grouping`
     /// (rejected with any other mode). Note that grouping mode is *already*
-    /// order-independent — it canonicalizes both inputs to queryname order via
-    /// the key-join engine — so this flag is effectively a no-op there, retained
-    /// for backward compatibility.
+    /// order-independent at the molecule level — it matches molecules across
+    /// the two files by an MI-invariant canonical id via the molecule-join
+    /// engine — so this flag is effectively a no-op there, retained for
+    /// backward compatibility.
     /// Overrides `--command` preset if both given. Defaults to false when
     /// neither `--ignore-order` nor `--command` is set.
     #[arg(long = "ignore-order", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
@@ -314,30 +321,18 @@ pub struct CompareBams {
     #[arg(long = "buffer-size", default_value = "1000")]
     pub buffer_size: usize,
 
-    /// Number of threads for BGZF decompression and parallel comparison.
+    /// Number of threads for BGZF decompression and parallel comparison. Used by `content`
+    /// mode only; the streaming molecule-join engine `grouping` mode (and `--command group`)
+    /// routes to is single-threaded and ignores this flag.
     /// Using more threads significantly speeds up processing of large BAM files.
     #[arg(short = 't', long = "threads", default_value = "1")]
     pub threads: usize,
 
-    /// Batch size for parallel processing (number of records per batch).
+    /// Batch size for parallel processing (number of records per batch). Used by `content`
+    /// mode only; ignored by `grouping` mode.
     /// Larger batches reduce synchronization overhead but use more memory.
     #[arg(long = "batch-size", default_value = "10000")]
     pub batch_size: usize,
-
-    /// Total memory budget for the internal queryname-canonicalization sort used by
-    /// `--command group`'s key-join engine. Ignored by every other mode/preset.
-    /// This is a total budget, not a per-thread budget: it is not multiplied by
-    /// `--threads`.
-    #[arg(long = "sort-memory", default_value = "512M", value_parser = crate::commands::common::parse_memory)]
-    pub sort_memory: crate::commands::common::MemoryLimit,
-
-    /// Temporary directory for the internal queryname-canonicalization sort's spill
-    /// files (`--command group` only). Repeatable, same semantics as `fgumi sort
-    /// -T`/`--tmp-dir`. Falls back to `FGUMI_TMP_DIRS` (see `fgumi sort --help`),
-    /// then a disk-backed default (never a bare system temp directory, which may be
-    /// tmpfs on some hosts).
-    #[arg(long = "sort-tmp-dir", action = clap::ArgAction::Append)]
-    pub sort_tmp_dirs: Vec<PathBuf>,
 }
 
 /// Core SAM field names for reporting.
@@ -598,7 +593,7 @@ impl Command for CompareBams {
 
         // `sort` has no notion of `CompareMode`/`ContentPredicate` — it verifies sort
         // order and compares by sort-key run instead of pairing records positionally or
-        // by key-join (see `CommandPreset::Sort`'s doc comment). Intercept before
+        // by molecule-join (see `CommandPreset::Sort`'s doc comment). Intercept before
         // `effective_settings()`/predicate resolution so those stay meaningful for every
         // other preset.
         if matches!(self.command, Some(CommandPreset::Sort)) {
@@ -639,8 +634,10 @@ impl Command for CompareBams {
         // rather than surfacing as an honest diff. Only verify when the gate determined a
         // verifiable order (`declared_order == None` means genuinely orderless input, e.g.
         // `extract`/`fastq`/`zipper` output — nothing to verify) and only for `Content` mode
-        // (`Grouping` canonicalizes to queryname order itself via the key-join engine, so it
-        // is order-independent and never trusts the declared order either).
+        // (`Grouping` routes through the streaming molecule-join engine, which matches
+        // molecules by MI-invariant canonical id — the lexicographically smallest read name
+        // in each molecule — rather than by position, so it is order-independent by
+        // construction and never needs the declared record order verified either).
         if let Some(order) = declared_order {
             if matches!(mode, CompareMode::Content) {
                 super::engines::sort_verify::verify_records_in_order(&self.bam1, order)?;
@@ -675,10 +672,10 @@ impl Command for CompareBams {
 
         // This predicate is only ever consumed below by the `Content` mode branch
         // (`self.execute_content(predicate)`); `CompareMode::Grouping` routes to the
-        // order-independent key-join engine (`execute_grouping`), which takes no predicate at
-        // all — it hardcodes `ContentPredicate::ExactMinusMi` inside
-        // `engines::keyjoin::keyjoin_compare` itself, not configurable via `--command`/`--mode`
-        // (so the `Grouping` arm's value is never actually used).
+        // order-independent streaming molecule-join engine (`execute_grouping`), which takes
+        // no predicate at all — it hardcodes `ContentPredicate::ExactMinusMi` inside
+        // `engines::molecule_join::molecule_join_compare` itself, not configurable via
+        // `--command`/`--mode` (so the `Grouping` arm's value is never actually used).
         //
         // An *explicit* `--mode content` (`self.mode == Some(Content)`) always means exact
         // content comparison — it overrides a preset's own predicate too, so
@@ -871,34 +868,34 @@ impl CompareBams {
         }
     }
 
-    /// Execute grouping comparison via the order-independent key-join engine.
+    /// Execute grouping comparison via the streaming, order-independent molecule-join engine.
     ///
-    /// This is the sole `CompareMode::Grouping` path (and what `--command group` uses).
-    /// Both inputs are canonicalized to queryname order and merge-joined by
-    /// [`RecordKey`](super::record_key::RecordKey) (see [`keyjoin::keyjoin_compare`]), so it
-    /// is inherently order-independent — `--ignore-order` is therefore a no-op under
-    /// `--mode grouping`. Besides verifying the fgumi-MI/fgbio-MI mapping is a consistent
-    /// bijection (including the `base()`-level duplex strand-pairing check), it also catches
-    /// a non-MI content difference on any matched pair. The content check always uses
-    /// [`ContentPredicate::ExactMinusMi`], hardcoded inside `keyjoin::keyjoin_compare` itself
-    /// — this engine takes no predicate argument and is not configurable via
+    /// This is the sole `CompareMode::Grouping` path (and what `--command group` uses). Both
+    /// inputs are cut into per-molecule runs and matched across the two files by an
+    /// MI-invariant canonical id (see [`molecule_join_compare`]) — no re-sort, so both inputs
+    /// must already be grouped (same-MI reads consecutive, as `fgumi group`/`fgbio group`
+    /// output is). This makes the comparison inherently order-independent at the molecule
+    /// level — `--ignore-order` is therefore a no-op under `--mode grouping`. Each matched
+    /// pair is checked for record membership, non-MI content, and duplex `/A`/`/B`
+    /// strand-partition equivalence. The content check always uses
+    /// [`ContentPredicate::ExactMinusMi`], hardcoded inside `molecule_join_compare` itself —
+    /// this engine takes no predicate argument and is not configurable via
     /// `--command`/`--mode`.
     ///
     /// # Errors
     ///
-    /// Returns an error if either input cannot be canonicalized or read (see
-    /// [`keyjoin::keyjoin_compare`]), or [`super::CompareMismatch`] if the two BAMs are
-    /// found to differ (non-zero exit via the `Command` trait).
+    /// Returns an error if either input cannot be read (see [`molecule_join_compare`]), or
+    /// [`super::CompareMismatch`] if the two BAMs are found to differ (non-zero exit via the
+    /// `Command` trait).
     fn execute_grouping(&self) -> Result<u64> {
         if !self.quiet {
             info!(
-                "Starting key-join grouping comparison with {} threads, sort memory {:?}",
-                self.threads, self.sort_memory
+                "Starting streaming molecule-join grouping comparison (max-diffs {})",
+                self.max_diffs
             );
         }
 
-        let cfg = self.keyjoin_config()?;
-        let outcome = keyjoin::keyjoin_compare(&self.bam1, &self.bam2, &cfg)?;
+        let outcome = molecule_join_compare(&self.bam1, &self.bam2, self.max_diffs)?;
         let is_equivalent = outcome.is_match();
 
         if !self.quiet {
@@ -906,22 +903,16 @@ impl CompareBams {
             println!("BAM1: {}", self.bam1.display());
             println!("BAM2: {}", self.bam2.display());
             println!();
-            println!("Total records in BAM1: {}", outcome.bam1_count);
-            println!("Total records in BAM2: {}", outcome.bam2_count);
-            println!("Records matched: {}", outcome.matched);
-            println!("Records only in BAM1: {}", outcome.only_in_bam1);
-            println!("Records only in BAM2: {}", outcome.only_in_bam2);
-            println!("Missing MI in BAM1: {}", outcome.missing_mi_bam1);
-            println!("Missing MI in BAM2: {}", outcome.missing_mi_bam2);
-            println!("Content diffs (excluding MI): {}", outcome.content_diffs);
-            println!("MI bijection mismatches: {}", outcome.mi_bijection_mismatches);
+            println!("Total molecules in BAM1: {}", outcome.bam1_molecules);
+            println!("Total molecules in BAM2: {}", outcome.bam2_molecules);
+            println!("Molecules matched: {}", outcome.matched);
             println!();
 
             if is_equivalent {
                 println!("RESULT: BAM groupings are EQUIVALENT");
                 println!(
-                    "  Content matches (excluding MI) and reads with the same MI in one file \
-                     have the same MI in the other."
+                    "  Every molecule in one file has an equivalent molecule (same member \
+                     records, same non-MI content, same duplex strand partition) in the other."
                 );
             } else {
                 println!("RESULT: BAM groupings DIFFER");
@@ -937,44 +928,16 @@ impl CompareBams {
 
         if is_equivalent {
             if !self.quiet {
-                info!("BAM groupings are equivalent (key-join)");
+                info!("BAM groupings are equivalent (molecule-join)");
             }
-            Ok(outcome.bam1_count + outcome.bam2_count)
+            Ok(outcome.bam1_molecules + outcome.bam2_molecules)
         } else {
             if !self.quiet {
-                info!("BAM groupings differ (key-join)");
+                info!("BAM groupings differ (molecule-join)");
             }
             Err(super::CompareMismatch("BAM groupings differ (order-independent)".to_owned())
                 .into())
         }
-    }
-
-    /// Resolve this run's [`KeyJoinConfig`] from `--threads`/`--sort-memory`/
-    /// `--sort-tmp-dir`/`--max-diffs`.
-    ///
-    /// `--sort-memory` is a **total** budget, not per-thread (`resolve_memory_budget`'s
-    /// `per_thread = false`), matching the flag's documented semantics. `sort_tmp_dirs` is
-    /// resolved via [`keyjoin::resolve_sort_tmp_dirs`], which never returns empty (falling
-    /// back to a disk-backed default rather than tmpfs) — so both the canonicalization
-    /// sort's spill chunks and the temp canonicalized BAMs it writes always land on the
-    /// same resolved, disk-backed directory.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the memory budget cannot be resolved (e.g. `--threads 0`).
-    fn keyjoin_config(&self) -> Result<KeyJoinConfig> {
-        let sort_memory =
-            resolve_memory_budget(self.sort_memory, MemoryReserve::Auto, self.threads, false)?;
-        let sort_tmp_dirs = keyjoin::resolve_sort_tmp_dirs(
-            &self.sort_tmp_dirs,
-            std::env::var(TMP_DIRS_ENV).ok().as_deref(),
-        );
-        Ok(KeyJoinConfig {
-            threads: self.threads,
-            sort_memory,
-            sort_tmp_dirs,
-            max_diffs: self.max_diffs,
-        })
     }
 }
 
@@ -1024,9 +987,10 @@ mod tests {
         assert!(ignore, "Group → ignore_order {ignore}");
     }
 
-    /// `Group`'s content predicate must be `ExactMinusMi` (Task 3.4): the key-join engine
-    /// checks everything except the MI tag as content, and checks the MI tag separately via
-    /// the fgumi-MI/fgbio-MI bijection.
+    /// `Group`'s content predicate must be `ExactMinusMi` (Task 3.4): the molecule-join
+    /// engine checks everything except the MI tag as content, and verifies MI equivalence
+    /// separately by matching molecules on an MI-invariant canonical id and checking record
+    /// membership/strand-partition (see `super::engines::molecule_join`).
     #[test]
     fn group_preset_content_predicate_is_exact_minus_mi() {
         assert_eq!(CommandPreset::Group.content_predicate(), ContentPredicate::ExactMinusMi);

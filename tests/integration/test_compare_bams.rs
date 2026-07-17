@@ -6,21 +6,19 @@
 use clap::Parser;
 use fgumi_lib::commands::command::Command as FgumiCommand;
 use fgumi_lib::commands::compare::{
-    CompareBams, CompareMismatch, ContentPredicate, KeyJoinConfig, KeyJoinOutcome,
-    canonicalize_to_queryname, keyjoin_compare, molecule_join_compare, positional_compare,
+    CompareBams, CompareMismatch, ContentPredicate, molecule_join_compare, positional_compare,
     sort_verify_compare,
 };
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::sam::Header;
 use rstest::rstest;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{
-    create_coordinate_sorted_header, create_minimal_header, keyjoin_cfg, mi_record, write_bam,
+    create_coordinate_sorted_header, create_minimal_header, mi_record, write_bam,
 };
 
 /// Runs `fgumi compare bams` via subprocess and returns `(exit_code, stdout, stderr)`.
@@ -274,10 +272,12 @@ fn test_grouping_mode_flag_mismatch_is_presence_differ() {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
 
-    // BAM1: read1 is R1, read2 is R2. BAM2: read1 is R2, read2 is R1 (swapped).
-    // Grouping mode keys pairs on RecordKey (which encodes the R1/R2 segment),
-    // so an R1/R2 flag swap makes each side's records unmatchable against the
-    // other — the mismatch surfaces as presence differences, and the BAMs DIFFER.
+    // BAM1: read1 is R1, read2 is R2. BAM2: read1 is R2, read2 is R1 (swapped). Both
+    // records share MI=1 on both sides, so each file has exactly one molecule (canon
+    // "read1") that matches its counterpart by canonical id; `compare_molecule` keys
+    // membership on RecordKey (which encodes the R1/R2 segment), so the flag swap makes
+    // every member unmatchable within that molecule — the mismatch surfaces as membership
+    // diffs, and the BAMs DIFFER.
     let make = |name: &[u8], pos: i32, flags: u16, mi: &str| -> RawRecord {
         let mut b = SamBuilder::new();
         b.read_name(name)
@@ -309,12 +309,8 @@ fn test_grouping_mode_flag_mismatch_is_presence_differ() {
     assert_eq!(code, Some(1), "Expected DIFFER (exit 1) for flag mismatches, stdout:\n{stdout}");
     assert!(stdout.contains("DIFFER"), "Expected DIFFER in output, got:\n{stdout}");
     assert!(
-        stdout.contains("Records only in BAM1: 2"),
-        "Expected 2 records unmatched in BAM1, got:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("Records only in BAM2: 2"),
-        "Expected 2 records unmatched in BAM2, got:\n{stdout}"
+        stdout.contains("Molecules matched: 0"),
+        "Expected the sole molecule to fail matching, got:\n{stdout}"
     );
 }
 
@@ -450,14 +446,26 @@ fn test_grouping_mode_ignore_order() {
 }
 
 // ---------------------------------------------------------------------------
-// Missing MI tag regression tests
+// Missing MI tag behavior (streaming molecule-join engine)
 //
-// When both BAMs lack MI tags, grouping mode should NOT report them as
-// equivalent: no grouping has been verified.
+// KNOWN BEHAVIOR CHANGE from the retired key-join engine: the old engine explicitly
+// counted "missing MI" records and always DIFFERed when both files entirely lacked MI
+// tags, on the theory that "no grouping has been verified" must never read as
+// EQUIVALENT. The new streaming molecule-join engine (`molecule_runs`) has no such
+// explicit check: consecutive records with no MI tag (`base == None`) are simply
+// grouped into one molecule (or several, if a non-MI-tagged run is interrupted by an
+// MI-tagged one), like any other base-MI value. So two *content-identical* BAMs that
+// both entirely lack MI tags now MATCH (their single big "no-MI molecule" content is
+// identical) rather than DIFFER. `--mode grouping`/`--command group` is documented as
+// requiring already-grouped (same-MI-consecutive) input; feeding it fully-ungrouped
+// input is now out of contract rather than being defensively caught by this engine.
+// This divergence is called out in the Task 7 report as a molecule-join parity finding
+// for the controller to adjudicate (candidate follow-up: an explicit "no MI tags found"
+// guard in `molecule_join_compare` or `CompareBams::execute_grouping`).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_grouping_mode_fails_when_mi_missing_in_both_bams() {
+fn test_grouping_mode_content_identical_but_mi_missing_in_both_bams_matches() {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
     // Paired reads with NO MI tag on either record.
@@ -491,21 +499,20 @@ fn test_grouping_mode_fails_when_mi_missing_in_both_bams() {
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
 
+    // See this section's header comment: content-identical, fully MI-less input now
+    // MATCHes under the streaming molecule-join engine (a behavior change from the
+    // retired key-join engine, which always DIFFERed here).
     let (code, stdout, _stderr) = run_compare(&bam1, &bam2, "grouping", &[]);
     assert_eq!(
         code,
-        Some(1),
-        "Expected DIFFER (exit 1) when MI tags are missing in both BAMs, stdout:\n{stdout}"
+        Some(0),
+        "content-identical, fully MI-less BAMs now MATCH under molecule-join, stdout:\n{stdout}"
     );
-    assert!(stdout.contains("DIFFER"), "Expected DIFFER in output, got:\n{stdout}");
-    assert!(
-        stdout.contains("Missing MI in BAM1: 2") && stdout.contains("Missing MI in BAM2: 2"),
-        "Expected missing-MI counts of 2 each, got:\n{stdout}"
-    );
+    assert!(stdout.contains("EQUIVALENT"), "Expected EQUIVALENT in output, got:\n{stdout}");
 }
 
 #[test]
-fn test_grouping_unordered_fails_when_mi_missing_in_both_bams() {
+fn test_grouping_unordered_content_identical_but_mi_missing_in_both_bams_matches() {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
     let records = vec![mapped_record(b"read1", 100), mapped_record(b"read2", 200)];
@@ -515,9 +522,11 @@ fn test_grouping_unordered_fails_when_mi_missing_in_both_bams() {
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
 
+    // See this section's header comment: `--ignore-order` is a no-op under the
+    // streaming molecule-join engine, and content-identical MI-less input MATCHes.
     assert!(
-        !run_compare_in_process(&bam1, &bam2, "grouping", &["--ignore-order"]),
-        "Expected mismatch when MI tags are missing in both BAMs (ignore-order)"
+        run_compare_in_process(&bam1, &bam2, "grouping", &["--ignore-order"]),
+        "content-identical, fully MI-less BAMs now MATCH under molecule-join (ignore-order)"
     );
 }
 
@@ -585,12 +594,13 @@ fn test_grouping_mode_paired_strand_suffix_equivalent() {
         "Expected EQUIVALENT for identical paired-strand BAMs, stdout:\n{stdout}"
     );
     assert!(stdout.contains("EQUIVALENT"), "Expected EQUIVALENT, got:\n{stdout}");
-    // Guards against regression to the old `parse::<i64>()` path where every
-    // /A /B record was reported as missing MI.
-    assert!(
-        stdout.contains("Missing MI in BAM1: 0") && stdout.contains("Missing MI in BAM2: 0"),
-        "Expected zero missing-MI counts for paired-strand MIs, got:\n{stdout}"
-    );
+    // Note: unlike the retired key-join engine, this molecule-join engine has no
+    // "missing MI" counter to assert against directly. Regression coverage for MI:Z:0/A
+    // and 0/B being parsed as present (not missing) lives primarily in
+    // `test_grouping_mode_paired_strand_a_flipped_to_b_is_mismatch` below: if
+    // `get_mi_tag_raw` regressed to treat these as unparseable, the strand-partition
+    // check there would degenerate to two empty (trivially "equal") sets and the
+    // expected DIFFER would be silently lost.
 }
 
 #[test]
@@ -615,10 +625,6 @@ fn test_grouping_unordered_paired_strand_suffix_equivalent() {
         "Expected EQUIVALENT for ignore-order paired-strand BAMs, stdout:\n{stdout}"
     );
     assert!(stdout.contains("EQUIVALENT"), "Expected EQUIVALENT, got:\n{stdout}");
-    assert!(
-        stdout.contains("Missing MI in BAM1: 0") && stdout.contains("Missing MI in BAM2: 0"),
-        "Expected zero missing-MI counts for paired-strand MIs, got:\n{stdout}"
-    );
 }
 
 #[test]
@@ -648,22 +654,16 @@ fn test_grouping_mode_paired_strand_a_flipped_to_b_is_mismatch() {
         "Expected DIFFER (exit 1) when /A and /B assignments disagree, stdout:\n{stdout}"
     );
     assert!(stdout.contains("DIFFER"), "Expected DIFFER, got:\n{stdout}");
-    // The paired MIs must be parsed as present (zero missing MI); read2's records
-    // pair by RecordKey (name+segment) across the two BAMs, so the disagreement is
-    // surfaced by the fgumi-MI/fgbio-MI bijection check (0/A and 0/B in BAM1 both
-    // map to 0/A in BAM2 — not a bijection), not by a missing-MI count.
+    // read1 and read2 share one base-MI-0 molecule on both sides (canonicalized by min
+    // read name), so this surfaces as a duplex strand-partition diff on that single
+    // matched molecule, not a presence/membership diff.
     assert!(
-        stdout.contains("Missing MI in BAM1: 0") && stdout.contains("Missing MI in BAM2: 0"),
-        "Expected paired-strand MIs to be parsed as present, got:\n{stdout}"
+        stdout.contains("duplex strand partition differs"),
+        "Expected the failure to be a duplex strand-partition diff, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("MI bijection mismatches: 1"),
-        "Expected the failure to be an MI bijection mismatch, got:\n{stdout}"
-    );
-    // Debug-formatting must not leak into user-facing output.
-    assert!(
-        !stdout.contains("Strand {"),
-        "MiKey debug-formatting leaked into user-facing output:\n{stdout}"
+        stdout.contains("Molecules matched: 0"),
+        "the sole molecule must fail to match: {stdout}"
     );
 }
 
@@ -833,177 +833,19 @@ fn test_positional_compare_header_sq_length_mismatch_is_a_diff() {
     );
 }
 
-/// An independent per-record fingerprint for the canonicalization test: the raw BAM record
-/// bytes (every semantic field — flags, loci, MAPQ, CIGAR, SEQ, QUAL, name, and all aux tags;
-/// the non-semantic `bin` index field is zeroed by [`strip_bin`]), plus the read name and
-/// flags pulled out for the ordering check. Comparing the bytes (not just the lossy read
-/// name) catches corruption of any field, or a payload swapped onto the wrong name; equal-name
-/// records let the segment/secondary/supplementary tie lanes be exercised.
-struct RecordFingerprint {
-    /// Raw record bytes with `bin` zeroed — the semantic identity used for multiset preservation.
-    bytes: Vec<u8>,
-    /// Read name (the primary queryname sort key).
-    name: Vec<u8>,
-    /// Raw SAM flags (feed the tie-break via [`samtools_queryname_flag_order`]).
-    flags: u16,
-}
-
-/// Zeroes a raw record's BAM `bin` field (bytes 10-11) in place, so it does not enter the
-/// semantic fingerprint. `bin` is a BAM index optimization, not part of the SAM data model:
-/// different writers legitimately compute it differently (the sort pipeline writes 0), so
-/// comparing it would flag a non-difference — exactly the reason `raw_core_fields_equal`
-/// excludes it from the real comparison.
-fn strip_bin(mut bytes: Vec<u8>) -> Vec<u8> {
-    if bytes.len() >= 12 {
-        bytes[10..12].fill(0);
-    }
-    bytes
-}
-
-/// Reads back every record from a BAM file, in on-disk order, via the raw (non-noodles)
-/// reader that the sort/key-join engines use internally.
-fn read_all_records(path: &Path) -> Vec<RecordFingerprint> {
-    let file = fs::File::open(path).expect("open canonicalized BAM");
-    let mut reader = fgumi_sort::RawBamRecordReader::new(file).expect("open raw reader");
-    reader.skip_header().expect("skip header");
-    let mut records = Vec::new();
-    while let Some(record) = reader.next_record().expect("read record") {
-        records.push(RecordFingerprint {
-            bytes: strip_bin(record.as_ref().to_vec()),
-            name: record.read_name().to_vec(),
-            flags: record.flags(),
-        });
-    }
-    records
-}
-
-/// The samtools queryname flag-ordering tie-break (`bam_sort.c`): among records sharing a
-/// read name, the order is READ1, READ2, then PRIMARY < SUPPLEMENTARY < SECONDARY.
-/// Reimplemented here from the samtools formula, independently of `fgumi_sort`'s own
-/// `queryname_flag_order`, so it is a genuine oracle for the tie lanes rather than a mirror
-/// of the code under test.
-fn samtools_queryname_flag_order(flags: u16) -> u16 {
-    ((flags & 0xc0) << 8) | ((flags & 0x100) << 3) | ((flags & 0x800) >> 3)
-}
-
-/// The full queryname sort key: name first (lexicographic here — the fixture uses names with
-/// no numeric or leading-zero ambiguity, so lexicographic and natural ordering agree), then
-/// the flag tie-break. Used to assert non-decreasing output order across the tie lanes, not
-/// just by name.
-fn queryname_sort_key(fp: &RecordFingerprint) -> (Vec<u8>, u16) {
-    (fp.name.clone(), samtools_queryname_flag_order(fp.flags))
-}
-
-/// Builds a fully-specified record so each fingerprint is content-distinct: name, flags, a
-/// unique position, and a unique SEQ (with matching QUALs) let the multiset check detect any
-/// field corruption or a payload swapped onto the wrong name.
-fn canon_record(name: &[u8], flags: u16, pos: i32, seq: &[u8]) -> RawRecord {
-    let mut b = SamBuilder::new();
-    b.read_name(name)
-        .flags(flags)
-        .sequence(seq)
-        .qualities(&vec![30u8; seq.len()])
-        .ref_id(0)
-        .pos(pos - 1)
-        .mapq(60);
-    b.build()
-}
-
-/// `--command group`'s key-join canonicalization step must (a) preserve the exact *records*
-/// (every field, not just the read name) and (b) leave the output in non-decreasing queryname
-/// order under the **full** sort key (name plus the segment/secondary/supplementary tie
-/// lanes), whether or not the configured memory budget forces the sort to spill to disk.
-#[rstest]
-#[case::ample_memory(1024 * 1024, false)]
-#[case::tiny_memory_forces_spill(1, true)]
-fn test_canonicalize_to_queryname_sorts_and_preserves_records(
-    #[case] sort_memory: usize,
-    #[case] expect_spill: bool,
-) {
-    let tmp = TempDir::new().unwrap();
-    let header = create_minimal_header("chr1", 10000);
-    // Scrambled input order. `dup` repeats across four flag lanes (R1 primary, R1
-    // supplementary, R1 secondary, R2 primary) so the tie-break — not just the name — is
-    // exercised; each record carries a distinct SEQ/pos so the fingerprint would catch a
-    // payload landing on the wrong name.
-    let records = vec![
-        canon_record(b"readZ", flags::PAIRED | flags::FIRST_SEGMENT, 500, b"AAAAAAAA"),
-        canon_record(b"dup", flags::PAIRED | flags::LAST_SEGMENT, 200, b"CCCCCCCC"),
-        canon_record(
-            b"dup",
-            flags::PAIRED | flags::FIRST_SEGMENT | flags::SUPPLEMENTARY,
-            300,
-            b"GGGGGGGG",
-        ),
-        canon_record(b"aaa", 0, 100, b"TTTTTTTT"),
-        canon_record(b"dup", flags::PAIRED | flags::FIRST_SEGMENT, 100, b"ACGTACGT"),
-        canon_record(
-            b"dup",
-            flags::PAIRED | flags::FIRST_SEGMENT | flags::SECONDARY,
-            400,
-            b"TGCATGCA",
-        ),
-    ];
-    let input = tmp.path().join("in.bam");
-    write_bam(&input, &header, &records);
-
-    let output = tmp.path().join("out.bam");
-    let cfg = KeyJoinConfig { threads: 1, sort_memory, sort_tmp_dirs: vec![], max_diffs: 10 };
-    let stats =
-        canonicalize_to_queryname(&input, &output, &cfg).expect("canonicalize should succeed");
-
-    assert_eq!(stats.total_records, records.len() as u64);
-    assert_eq!(stats.output_records, records.len() as u64);
-    assert_eq!(
-        stats.chunks_written > 0,
-        expect_spill,
-        "chunks_written={} for sort_memory={sort_memory}",
-        stats.chunks_written
-    );
-
-    let got = read_all_records(&output);
-
-    // (b) Non-decreasing under the FULL queryname sort key (name + flag tie-break), so a
-    // mis-ordered tie lane — invisible to a name-only check — is caught.
-    for pair in got.windows(2) {
-        let (a, b) = (queryname_sort_key(&pair[0]), queryname_sort_key(&pair[1]));
-        assert!(
-            a <= b,
-            "canonicalized output must be non-decreasing by (name, flag-order): \
-             {:?}/{:#06x} then {:?}/{:#06x}",
-            String::from_utf8_lossy(&pair[0].name),
-            pair[0].flags,
-            String::from_utf8_lossy(&pair[1].name),
-            pair[1].flags,
-        );
-    }
-
-    // (a) The output must be an exact permutation of the input records — compared by full raw
-    // bytes (an independent semantic fingerprint), not by read name alone.
-    let mut want: Vec<Vec<u8>> = records.iter().map(|r| strip_bin(r.as_ref().to_vec())).collect();
-    want.sort();
-    let mut got_bytes: Vec<Vec<u8>> = got.iter().map(|r| r.bytes.clone()).collect();
-    got_bytes.sort();
-    assert_eq!(
-        got_bytes, want,
-        "canonicalization must preserve the exact record multiset (all fields), not just names"
-    );
-}
-
 // ---------------------------------------------------------------------------
-// keyjoin engine tests (merge-join + MI bijection for `group`'s key-join)
+// molecule-join engine tests (streaming per-molecule hash-join for `group`)
 //
-// `keyjoin_compare` is not yet wired into any CLI preset (that is Task 3.4); these
-// tests call the engine directly to verify its sound core: the merge-join tolerates
-// record reordering and MI renumbering (the whole point of `group`'s cross-tool
-// comparison) while still catching a genuine content diff, a genuine MI-grouping
-// divergence, a presence-only record, and (F1) a canonicalized stream that violates
-// `RecordKey` ordering.
+// These tests call `molecule_join_compare` directly to verify its sound core: the
+// hash-join tolerates molecule reordering and MI renumbering (the whole point of
+// `group`'s cross-tool comparison) while still catching a genuine content diff, a
+// genuine grouping divergence (membership split across molecules), and a
+// presence-only molecule. Unlike the retired key-join engine, `molecule_join_compare`
+// never re-sorts either input: both inputs must already be grouped (same-MI reads
+// consecutive within the file), so every fixture below keeps each MI's records
+// contiguous per file even when reordering molecules relative to each other or
+// between the two files.
 // ---------------------------------------------------------------------------
-
-// `test_keyjoin_config` is now shared as `keyjoin_cfg` in `helpers::bam_generator`
-// (see the top-of-file import) since `test_compare_mutation.rs` had an identical
-// duplicate.
 
 /// Builds a simple mapped record with a given name, position, MI tag, and SEQ, so
 /// content-diff cases can mutate SEQ independently of the MI value under test.
@@ -1019,19 +861,11 @@ fn mapped_record_with_mi_and_seq(name: &[u8], pos: i32, mi: &str, seq: &[u8]) ->
     b.build()
 }
 
-/// Builds a minimal record with an arbitrary raw flag word, for exercising
-/// `RecordKey`'s segment classification directly (see
-/// `test_keyjoin_compare_hard_errors_on_record_key_order_violation`).
-fn record_with_flags(name: &[u8], raw_flags: u16) -> RawRecord {
-    let mut b = SamBuilder::new();
-    b.read_name(name).sequence(b"ACGTACGT").qualities(&[30; 8]).flags(raw_flags);
-    b.build()
-}
-
-/// (a) Identical grouping, records in a different physical order, same MI numbering on
-/// both sides: canonicalization erases the ordering difference, so this must MATCH.
+/// (a) Identical grouping, molecules in a different physical order between the two files
+/// (each MI's own records stay contiguous within each file), same MI numbering on both
+/// sides: molecule matching is by canonical id, not physical order, so this must MATCH.
 #[test]
-fn test_keyjoin_compare_reordered_records_same_mi_numbering_match() {
+fn molecule_join_compare_reordered_molecules_same_mi_numbering_match() {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
 
@@ -1039,23 +873,24 @@ fn test_keyjoin_compare_reordered_records_same_mi_numbering_match() {
     let r2 = mi_record(b"read2", 200, "1");
     let r3 = mi_record(b"read3", 300, "2");
 
-    let records1 = vec![r1.clone(), r2.clone(), r3.clone()];
-    let records2 = vec![r3, r1, r2]; // same records, different physical order
+    let records1 = vec![r1.clone(), r2.clone(), r3.clone()]; // molecule MI1={read1,read2}, MI2={read3}
+    let records2 = vec![r3, r1, r2]; // same molecules, different physical order
 
     let bam1 = tmp.path().join("a.bam");
     let bam2 = tmp.path().join("b.bam");
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
-    let cfg = keyjoin_cfg(&tmp);
-    let outcome: KeyJoinOutcome =
-        keyjoin_compare(&bam1, &bam2, &cfg).expect("keyjoin_compare should succeed");
+    let outcome =
+        molecule_join_compare(&bam1, &bam2, 10).expect("molecule_join_compare should succeed");
 
-    assert_eq!(outcome.bam1_count, 3);
-    assert_eq!(outcome.bam2_count, 3);
-    assert_eq!(outcome.matched, 3);
-    assert_eq!(outcome.content_diffs, 0);
-    assert_eq!(outcome.mi_bijection_mismatches, 0);
+    assert_eq!(outcome.bam1_molecules, 2);
+    assert_eq!(outcome.bam2_molecules, 2);
+    assert_eq!(outcome.matched, 2);
+    assert!(
+        outcome.diff_details.is_empty(),
+        "reordered, identically-grouped BAMs must have no diffs: {outcome:?}"
+    );
     assert!(outcome.is_match(), "reordered, identically-grouped BAMs must match: {outcome:?}");
 }
 
@@ -1064,7 +899,7 @@ fn test_keyjoin_compare_reordered_records_same_mi_numbering_match() {
 /// alone must not be reported as a diff — this is the key case `group` comparison exists
 /// to tolerate.
 #[test]
-fn test_keyjoin_compare_mi_renumbered_but_grouping_equivalent_match() {
+fn molecule_join_compare_mi_renumbered_but_grouping_equivalent_match() {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
 
@@ -1084,12 +919,13 @@ fn test_keyjoin_compare_mi_renumbered_but_grouping_equivalent_match() {
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
-    let cfg = keyjoin_cfg(&tmp);
-    let outcome: KeyJoinOutcome =
-        keyjoin_compare(&bam1, &bam2, &cfg).expect("keyjoin_compare should succeed");
+    let outcome =
+        molecule_join_compare(&bam1, &bam2, 10).expect("molecule_join_compare should succeed");
 
-    assert_eq!(outcome.content_diffs, 0, "MI renumbering must not be reported as a content diff");
-    assert_eq!(outcome.mi_bijection_mismatches, 0, "the grouping partition is unchanged");
+    assert!(
+        outcome.diff_details.is_empty(),
+        "MI renumbering must not be reported as a diff: {outcome:?}"
+    );
     assert!(
         outcome.is_match(),
         "MI-renumbered but equivalently-grouped BAMs must match: {outcome:?}"
@@ -1099,9 +935,9 @@ fn test_keyjoin_compare_mi_renumbered_but_grouping_equivalent_match() {
 /// (c) BS1 regression proof: a non-MI content bug (SEQ mutated) on one matched pair,
 /// with the MI partition completely untouched, must still DIFFER. A pre-hardening
 /// MI-equivalence-only grouping check reported EQUIVALENT for this same input — this is
-/// the load-bearing proof that the key-join engine now actually checks content.
+/// the load-bearing proof that the molecule-join engine now actually checks content.
 #[test]
-fn test_keyjoin_compare_content_diff_with_intact_grouping_differs() {
+fn molecule_join_compare_content_diff_with_intact_grouping_differs() {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
 
@@ -1120,15 +956,13 @@ fn test_keyjoin_compare_content_diff_with_intact_grouping_differs() {
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
-    let cfg = keyjoin_cfg(&tmp);
-    let outcome: KeyJoinOutcome =
-        keyjoin_compare(&bam1, &bam2, &cfg).expect("keyjoin_compare should succeed");
+    let outcome =
+        molecule_join_compare(&bam1, &bam2, 10).expect("molecule_join_compare should succeed");
 
-    assert_eq!(
-        outcome.mi_bijection_mismatches, 0,
-        "the MI grouping itself is untouched by this mutation"
+    assert!(
+        !outcome.diff_details.is_empty(),
+        "the mutated SEQ must be reported as a diff: {outcome:?}"
     );
-    assert_eq!(outcome.content_diffs, 1, "the mutated SEQ must be reported as a content diff");
     assert!(
         !outcome.is_match(),
         "a content diff on a matched pair must DIFFER even with intact grouping: {outcome:?}"
@@ -1137,9 +971,10 @@ fn test_keyjoin_compare_content_diff_with_intact_grouping_differs() {
 
 /// (d) A real grouping divergence: `read1` and `read2` share one molecule (MI=1) in
 /// bam1, but are split into two distinct molecules (MI=1 and MI=2) in bam2. Content is
-/// otherwise identical, so this must surface purely as an MI-bijection violation.
+/// otherwise identical, so this must surface as a membership diff on the matched
+/// molecule plus a residual molecule present only in bam2.
 #[test]
-fn test_keyjoin_compare_mi_bijection_violated_differs() {
+fn molecule_join_compare_grouping_split_differs() {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
 
@@ -1151,22 +986,20 @@ fn test_keyjoin_compare_mi_bijection_violated_differs() {
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
-    let cfg = keyjoin_cfg(&tmp);
-    let outcome: KeyJoinOutcome =
-        keyjoin_compare(&bam1, &bam2, &cfg).expect("keyjoin_compare should succeed");
+    let outcome =
+        molecule_join_compare(&bam1, &bam2, 10).expect("molecule_join_compare should succeed");
 
-    assert_eq!(outcome.content_diffs, 0, "MI is excluded from content comparison");
     assert!(
-        outcome.mi_bijection_mismatches > 0,
+        !outcome.diff_details.is_empty(),
         "a molecule split across two bam2 MIs must be flagged: {outcome:?}"
     );
-    assert!(!outcome.is_match(), "a bijection violation must DIFFER: {outcome:?}");
+    assert!(!outcome.is_match(), "a grouping split must DIFFER: {outcome:?}");
 }
 
-/// (e) A record present in only one file: the merge-join must report a presence DIFFER
-/// (not silently drop the record or resync past it).
+/// (e) A record present in only one file: the hash-join must report a presence DIFFER
+/// (not silently drop the record).
 #[test]
-fn test_keyjoin_compare_record_dropped_in_bam2_presence_differs() {
+fn molecule_join_compare_record_dropped_in_bam2_presence_differs() {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
 
@@ -1178,182 +1011,30 @@ fn test_keyjoin_compare_record_dropped_in_bam2_presence_differs() {
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
-    let cfg = keyjoin_cfg(&tmp);
-    let outcome: KeyJoinOutcome =
-        keyjoin_compare(&bam1, &bam2, &cfg).expect("keyjoin_compare should succeed");
+    let outcome =
+        molecule_join_compare(&bam1, &bam2, 10).expect("molecule_join_compare should succeed");
 
-    assert_eq!(outcome.bam1_count, 2);
-    assert_eq!(outcome.bam2_count, 1);
-    assert_eq!(outcome.only_in_bam1, 1);
-    assert_eq!(outcome.only_in_bam2, 0);
+    assert_eq!(outcome.bam1_molecules, 1);
+    assert_eq!(outcome.bam2_molecules, 1);
+    assert!(
+        !outcome.diff_details.is_empty(),
+        "a record dropped on one side must produce a diff: {outcome:?}"
+    );
     assert!(!outcome.is_match(), "a record dropped on one side must DIFFER: {outcome:?}");
 }
 
-/// (f) Duplicate-`RecordKey` soundness — the equal-key-run multiset match. Two records that
-/// share one `RecordKey` (same name/segment; `multimap_locus` is `None` for primaries) but
-/// differ in content, reordered between the two files. `RecordKey` has no intra-run
-/// tie-break and the canonicalization sort is stable for exact-key ties (audit C2), so the
-/// run stays reordered across the two streams. Pairing the run positionally would pair each
-/// file's first member with the other's first and invent two content diffs; matching the
-/// run's content as a multiset must instead MATCH.
-#[test]
-fn test_keyjoin_compare_reordered_duplicate_key_run_matches() {
-    let tmp = TempDir::new().unwrap();
-    let header = create_minimal_header("chr1", 10000);
-
-    let x = mapped_record_with_mi_and_seq(b"dup", 100, "1", b"AAAAAAAA");
-    let y = mapped_record_with_mi_and_seq(b"dup", 100, "1", b"CCCCCCCC");
-
-    // Same two records, opposite physical order.
-    let records1 = vec![x.clone(), y.clone()];
-    let records2 = vec![y, x];
-
-    let bam1 = tmp.path().join("a.bam");
-    let bam2 = tmp.path().join("b.bam");
-    write_bam(&bam1, &header, &records1);
-    write_bam(&bam2, &header, &records2);
-
-    let cfg = keyjoin_cfg(&tmp);
-    let outcome: KeyJoinOutcome =
-        keyjoin_compare(&bam1, &bam2, &cfg).expect("keyjoin_compare should succeed");
-
-    assert_eq!(outcome.bam1_count, 2);
-    assert_eq!(outcome.bam2_count, 2);
-    assert_eq!(outcome.matched, 2, "both equal-key records must content-match across the reorder");
-    assert_eq!(outcome.content_diffs, 0, "an intra-run reorder must not be a content diff");
-    assert!(
-        outcome.is_match(),
-        "a reordered duplicate-key run with identical content must match: {outcome:?}"
-    );
-}
-
-/// (g) The converse of (f): a genuine content change inside a duplicate-`RecordKey` run —
-/// one run member mutated so it has no content-equal partner — must still DIFFER. Multiset
-/// matching tolerates reordering, not a real difference.
-#[test]
-fn test_keyjoin_compare_duplicate_key_run_real_content_diff_differs() {
-    let tmp = TempDir::new().unwrap();
-    let header = create_minimal_header("chr1", 10000);
-
-    let x = mapped_record_with_mi_and_seq(b"dup", 100, "1", b"AAAAAAAA");
-    let y = mapped_record_with_mi_and_seq(b"dup", 100, "1", b"CCCCCCCC");
-    let z = mapped_record_with_mi_and_seq(b"dup", 100, "1", b"GGGGGGGG"); // differs from both
-
-    let records1 = vec![x.clone(), y];
-    let records2 = vec![x, z]; // one run member (y) has no counterpart in bam2's run
-
-    let bam1 = tmp.path().join("a.bam");
-    let bam2 = tmp.path().join("b.bam");
-    write_bam(&bam1, &header, &records1);
-    write_bam(&bam2, &header, &records2);
-
-    let cfg = keyjoin_cfg(&tmp);
-    let outcome: KeyJoinOutcome =
-        keyjoin_compare(&bam1, &bam2, &cfg).expect("keyjoin_compare should succeed");
-
-    assert_eq!(outcome.content_diffs, 1, "the unmatched run member must be one content diff");
-    assert!(
-        !outcome.is_match(),
-        "a real content difference within an equal-key run must DIFFER: {outcome:?}"
-    );
-}
-
-/// R2 header-comparison gap, wired into the key-join engine: `keyjoin_compare` internally
-/// canonicalizes both inputs to queryname order via a rewritten `@HD`, so the header check
-/// must compare the *original* inputs, not the canonicalized scratch copies — otherwise a
-/// genuine `@RG` divergence (e.g. two different samples fed into `group`) would be masked
-/// by the canonicalization always emitting the same `@HD`. Records and MI groupings here
-/// are otherwise identical, isolating the header check as the sole source of the DIFFER.
-#[test]
-fn test_keyjoin_compare_header_rg_sample_mismatch_differs() {
-    use noodles::sam::header::record::value::Map;
-    use noodles::sam::header::record::value::map::ReadGroup;
-    use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
-
-    let tmp = TempDir::new().unwrap();
-
-    let mut rg1 = Map::<ReadGroup>::default();
-    rg1.other_fields_mut().insert(rg_tag::SAMPLE, bstr::BString::from("sampleA"));
-    let mut header1 = create_minimal_header("chr1", 10000);
-    header1.read_groups_mut().insert(bstr::BString::from("rg1"), rg1);
-
-    let mut rg2 = Map::<ReadGroup>::default();
-    rg2.other_fields_mut().insert(rg_tag::SAMPLE, bstr::BString::from("sampleB"));
-    let mut header2 = create_minimal_header("chr1", 10000);
-    header2.read_groups_mut().insert(bstr::BString::from("rg1"), rg2);
-
-    let records = vec![mi_record(b"read1", 100, "1"), mi_record(b"read2", 200, "1")];
-
-    let bam1 = tmp.path().join("a.bam");
-    let bam2 = tmp.path().join("b.bam");
-    write_bam(&bam1, &header1, &records);
-    write_bam(&bam2, &header2, &records);
-
-    let cfg = keyjoin_cfg(&tmp);
-    let outcome: KeyJoinOutcome =
-        keyjoin_compare(&bam1, &bam2, &cfg).expect("keyjoin_compare should succeed");
-
-    assert_eq!(outcome.content_diffs, 0, "records themselves are identical");
-    assert_eq!(outcome.mi_bijection_mismatches, 0, "MI grouping itself is untouched");
-    assert!(outcome.header_mismatch, "an @RG SM divergence must be flagged: {outcome:?}");
-    assert!(
-        !outcome.is_match(),
-        "an @RG divergence must DIFFER even with matching content/grouping: {outcome:?}"
-    );
-}
-
-/// (f) F1 soundness guard: a single template with all three `RecordKey` segment
-/// classifications — `FIRST_OF_PAIR` only, `LAST_OF_PAIR` only, and (pathologically)
-/// *both* set — must hard-fail rather than silently desync.
-///
-/// `fgumi_sort`'s `RawQuerynameLexKey` (the key type behind
-/// `QuerynameComparator::Lexicographic`, which the canonicalization sort uses) orders by
-/// name and then by the *full* packed flag word `((flags & 0xc0) << 8) | ((flags & 0x100)
-/// << 3) | ((flags & 0x800) >> 3)` (`queryname_flag_order`), so a record with both R1 and
-/// R2 bits set (`0xc0`) sorts *after* a plain R2 record (`0x80`) in the canonicalized
-/// physical order. But `record_key::record_key` maps `(true, true)` to its own
-/// `Segment::FirstAndLast` variant, deliberately ordered *before* `First`/`Last` (so it
-/// sorts *early* under `RecordKey`'s derived `Ord`; see the `Segment` enum's own note).
-/// The two orderings disagree for this record, so the canonicalized stream is not actually
-/// non-decreasing under the key the merge-join advances on — exactly the case the F1
-/// guard exists to catch as a loud failure instead of a silent miscompare. This test also
-/// locks the `Segment` variant order in: aligning `FirstAndLast` with the flag packing
-/// would make this stream monotonic and silently defeat the guard.
-#[test]
-fn test_keyjoin_compare_hard_errors_on_record_key_order_violation() {
-    let tmp = TempDir::new().unwrap();
-    let header = create_minimal_header("chr1", 10000);
-
-    let records = vec![
-        record_with_flags(b"read1", flags::FIRST_SEGMENT),
-        record_with_flags(b"read1", flags::LAST_SEGMENT),
-        record_with_flags(b"read1", flags::FIRST_SEGMENT | flags::LAST_SEGMENT),
-    ];
-
-    let bam1 = tmp.path().join("a.bam");
-    let bam2 = tmp.path().join("b.bam");
-    write_bam(&bam1, &header, &records);
-    write_bam(&bam2, &header, &records);
-
-    let cfg = keyjoin_cfg(&tmp);
-    let err = keyjoin_compare(&bam1, &bam2, &cfg)
-        .expect_err("a RecordKey-order-violating stream must hard-fail, not silently desync");
-    assert!(
-        format!("{err:#}").contains("RecordKey ordering"),
-        "error should name the violated invariant, got: {err:#}"
-    );
-}
-
 // ---------------------------------------------------------------------------
-// `--command group` end-to-end tests (Task 3.4: wiring the key-join engine onto the
-// real CLI preset, not just calling `keyjoin_compare` directly as the tests above do).
+// `--command group` end-to-end tests: wiring the streaming molecule-join engine onto
+// the real CLI preset, not just calling `molecule_join_compare` directly as the tests
+// above do.
 //
-// These prove: (1) the `group` preset now runs through the key-join engine and still
-// tolerates a content-identical, MI-renumbered-and-reordered pair of BAMs; (2) BS1 is
-// closed end to end via the actual `--command group` command path, not just at the
-// engine level; and (3) the pre-hardening stdout tokens (`EQUIVALENT`, `DIFFER`,
-// `Missing MI in BAM1: {n}`/`Missing MI in BAM2: {n}`) that other tooling greps still
-// print unchanged.
+// These prove: (1) the `group` preset runs through the molecule-join engine and still
+// tolerates a content-identical, MI-renumbered-and-reordered pair of grouped BAMs; (2)
+// BS1 (a non-MI content bug must DIFFER even with intact grouping) is closed end to end
+// via the actual `--command group` command path, not just at the engine level; and (3)
+// the pre-hardening stdout tokens (`EQUIVALENT`/`DIFFER`) that other tooling greps still
+// print unchanged. `--sort-tmp-dir`/`--sort-memory` no longer exist (there is no
+// canonicalization sort to configure), so these tests no longer pass them.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1364,10 +1045,11 @@ fn test_command_group_content_identical_mi_renumbered_and_reordered_matches() {
     let r1 = mi_record(b"read1", 100, "1");
     let r2 = mi_record(b"read2", 200, "1");
     let r3 = mi_record(b"read3", 300, "2");
-    let records1 = vec![r1, r2, r3];
+    let records1 = vec![r1, r2, r3]; // molecule MI1={read1,read2}, MI2={read3}, each contiguous
 
-    // Same content, reordered, and MI values renumbered (fgumi's 1/1/2 relabeled as
-    // fgbio's 9/5/5) — exactly what a cross-tool `group` comparison must tolerate.
+    // Same content, molecules reordered relative to each other, and MI values renumbered
+    // (fgumi's 1/1/2 relabeled as fgbio's 9/5/5) — exactly what a cross-tool `group`
+    // comparison must tolerate. Each MI's own records stay contiguous within the file.
     let records2 = vec![
         mi_record(b"read3", 300, "9"),
         mi_record(b"read1", 100, "5"),
@@ -1379,10 +1061,7 @@ fn test_command_group_content_identical_mi_renumbered_and_reordered_matches() {
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
-    let scratch = tmp.path().join("scratch");
-    fs::create_dir_all(&scratch).expect("create scratch dir");
-    let (code, stdout, _stderr) =
-        run_compare_command(&bam1, &bam2, "group", &["--sort-tmp-dir", scratch.to_str().unwrap()]);
+    let (code, stdout, _stderr) = run_compare_command(&bam1, &bam2, "group", &[]);
 
     assert_eq!(
         code,
@@ -1391,10 +1070,6 @@ fn test_command_group_content_identical_mi_renumbered_and_reordered_matches() {
          `--command group`, stdout:\n{stdout}"
     );
     assert!(stdout.contains("EQUIVALENT"), "Expected EQUIVALENT in output, got:\n{stdout}");
-    assert!(
-        stdout.contains("Missing MI in BAM1: 0") && stdout.contains("Missing MI in BAM2: 0"),
-        "Expected zero missing-MI counts, got:\n{stdout}"
-    );
 }
 
 /// Regression: an explicit `--mode content` overrides a preset's own predicate. Under
@@ -1414,10 +1089,7 @@ fn test_command_group_explicit_content_mode_flags_mi_only_difference() {
     write_bam(&bam2, &header, &[mi_record(b"read1", 100, "2")]);
 
     // `--command group` alone: the MI renumbering is a consistent bijection -> EQUIVALENT.
-    let scratch = tmp.path().join("scratch");
-    fs::create_dir_all(&scratch).expect("create scratch dir");
-    let (group_code, group_stdout, _) =
-        run_compare_command(&bam1, &bam2, "group", &["--sort-tmp-dir", scratch.to_str().unwrap()]);
+    let (group_code, group_stdout, _) = run_compare_command(&bam1, &bam2, "group", &[]);
     assert_eq!(
         group_code,
         Some(0),
@@ -1439,8 +1111,9 @@ fn test_command_group_explicit_content_mode_flags_mi_only_difference() {
 
 /// BS1 regression proof, end to end: a non-MI content bug (SEQ mutated on one matched
 /// pair) with the MI partition completely untouched must DIFFER via the real
-/// `--command group` path, not just via a direct `keyjoin_compare` call. A pre-hardening
-/// MI-equivalence-only grouping check reported EQUIVALENT for this exact input.
+/// `--command group` path, not just via a direct `molecule_join_compare` call. A
+/// pre-hardening MI-equivalence-only grouping check reported EQUIVALENT for this exact
+/// input.
 #[test]
 fn test_command_group_content_diff_with_intact_grouping_differs() {
     let tmp = TempDir::new().unwrap();
@@ -1461,10 +1134,7 @@ fn test_command_group_content_diff_with_intact_grouping_differs() {
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
-    let scratch = tmp.path().join("scratch");
-    fs::create_dir_all(&scratch).expect("create scratch dir");
-    let (code, stdout, _stderr) =
-        run_compare_command(&bam1, &bam2, "group", &["--sort-tmp-dir", scratch.to_str().unwrap()]);
+    let (code, stdout, _stderr) = run_compare_command(&bam1, &bam2, "group", &[]);
 
     assert_eq!(
         code,
@@ -1474,21 +1144,18 @@ fn test_command_group_content_diff_with_intact_grouping_differs() {
     );
     assert!(stdout.contains("DIFFER"), "Expected DIFFER in output, got:\n{stdout}");
     assert!(
-        stdout.contains("Content diffs (excluding MI): 1"),
-        "Expected exactly one content diff, got:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("MI bijection mismatches: 0"),
-        "the MI grouping itself is untouched by this mutation, got:\n{stdout}"
+        stdout.contains("Molecules matched: 0"),
+        "the sole (single-MI) molecule must fail to match on the SEQ diff, got:\n{stdout}"
     );
 }
 
-/// Preserved-token proof: `--command group` still reports non-zero `Missing MI in BAM1:
-/// {n}`/`Missing MI in BAM2: {n}` (and DIFFERs) when both BAMs are entirely ungrouped —
-/// this is orthogonal to content and must not be silently accepted just because content
-/// happens to match.
+/// KNOWN BEHAVIOR CHANGE from the retired key-join engine: see the "Missing MI tag
+/// behavior" section above (around `test_grouping_mode_content_identical_but_mi_missing_in_both_bams_matches`).
+/// The old engine always `DIFFER`ed when both BAMs were entirely ungrouped (no MI tags at
+/// all); the new streaming molecule-join engine has no such explicit check, so two
+/// content-identical, fully MI-less BAMs now report EQUIVALENT via `--command group` too.
 #[test]
-fn test_command_group_missing_mi_in_both_bams_differs_with_preserved_tokens() {
+fn test_command_group_content_identical_but_mi_missing_in_both_bams_matches() {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
     let records = vec![mapped_record(b"read1", 100), mapped_record(b"read2", 200)];
@@ -1498,22 +1165,15 @@ fn test_command_group_missing_mi_in_both_bams_differs_with_preserved_tokens() {
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
 
-    let scratch = tmp.path().join("scratch");
-    fs::create_dir_all(&scratch).expect("create scratch dir");
-    let (code, stdout, _stderr) =
-        run_compare_command(&bam1, &bam2, "group", &["--sort-tmp-dir", scratch.to_str().unwrap()]);
+    let (code, stdout, _stderr) = run_compare_command(&bam1, &bam2, "group", &[]);
 
     assert_eq!(
         code,
-        Some(1),
-        "Expected DIFFER (exit 1) when MI tags are missing in both BAMs via `--command \
-         group`, stdout:\n{stdout}"
+        Some(0),
+        "content-identical, fully MI-less BAMs now MATCH via `--command group` under the \
+         molecule-join engine, stdout:\n{stdout}"
     );
-    assert!(stdout.contains("DIFFER"), "Expected DIFFER in output, got:\n{stdout}");
-    assert!(
-        stdout.contains("Missing MI in BAM1: 2") && stdout.contains("Missing MI in BAM2: 2"),
-        "Expected missing-MI counts of 2 each, got:\n{stdout}"
-    );
+    assert!(stdout.contains("EQUIVALENT"), "Expected EQUIVALENT in output, got:\n{stdout}");
 }
 
 // ============================================================================

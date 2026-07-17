@@ -35,7 +35,7 @@ fgumi compare bams <BAM1> <BAM2> [OPTIONS]
 | Mode | Description | Use Case |
 |------|-------------|----------|
 | `content` (default) | Pure record-by-record comparison of all fields, paired by `RecordKey` identity (order-sound: a reorder is reported as a difference, never masked) | `extract`, `zipper`, `correct`, `dedup`, `filter`, `clip`, `simplex`, `duplex`, `codec` output (consensus depth tags compared exactly, clamped to fgbio parity at the source) |
-| `grouping` | Key-join content (excluding MI) + fgumi-MI/fgbio-MI bijection check; order-independent (canonicalizes both inputs to queryname order) | Cross-tool `group` output, where MI values/order may differ (see `--command group`) |
+| `grouping` | Streaming molecule-join: matches molecules by an MI-invariant canonical id, then checks record membership, content (excluding MI), and duplex `/A`/`/B` strand-partition equivalence per molecule. Order-independent at the molecule level; **requires both inputs to already be grouped** (same-MI reads consecutive within the file, as `fgumi group`/`fgbio group` output is) since it never re-sorts either input. | Cross-tool `group` output, where MI values/molecule order may differ (see `--command group`) |
 
 ### Options
 
@@ -45,12 +45,15 @@ fgumi compare bams <BAM1> <BAM2> [OPTIONS]
 | `--mode` | STRING | `content` | Comparison mode: `content` or `grouping` |
 | `-m, --max-diffs` | INT | 10 | Maximum differences to report |
 | `-q, --quiet` | FLAG | false | Only exit code indicates result (0=equal, 1=different) |
-| `--ignore-order` | FLAG | false | Ignore record order; **valid only with `--mode grouping`** (passing `--ignore-order=true` with any other mode is rejected). Grouping is inherently order-independent, so this flag is effectively a no-op there, retained for compatibility. |
+| `--ignore-order` | FLAG | false | Ignore record order; **valid only with `--mode grouping`** (passing `--ignore-order=true` with any other mode is rejected). Grouping is already order-independent at the molecule level, so this flag is effectively a no-op there, retained for compatibility. |
 | `--buffer-size` | INT | 1000 | Initial buffer size for `--ignore-order` mode |
-| `-t, --threads` | INT | 1 | Threads for BGZF decompression and comparison |
-| `--batch-size` | INT | 10000 | Records per batch for parallel processing |
-| `--sort-memory` | STRING | `512M` | Total (not per-thread; not multiplied by `--threads`) memory budget for the internal queryname-canonicalization sort. Consumed only by `--command group`'s key-join engine; ignored by every other mode/preset. |
-| `--sort-tmp-dir` | PATH | `FGUMI_TMP_DIRS`, else a disk-backed default | Temporary directory for the `--command group` key-join canonicalization sort's spill files. Repeatable (may be passed more than once); same semantics as `fgumi sort -T`/`--tmp-dir`. When unset, falls back to the `FGUMI_TMP_DIRS` env var, then to a disk-backed default — never a bare system temp directory, which may be tmpfs on some hosts (a large spill there would fill RAM). |
+| `-t, --threads` | INT | 1 | Threads for BGZF decompression and comparison. `content` mode only; `grouping` mode routes to a single-threaded molecule-join engine and ignores this flag. |
+| `--batch-size` | INT | 10000 | Records per batch for parallel processing. `content` mode only; ignored by `grouping` mode. |
+
+> **Note:** `grouping` mode (and `--command group`) is a **streaming** molecule-join — it
+> never re-sorts either input, so there is no external-sort memory/temp-dir configuration
+> to expose (no `--sort-memory`/`--sort-tmp-dir`). Both inputs must already be grouped
+> (same-MI reads consecutive within the file), matching `fgumi group`/`fgbio group` output.
 
 ### Command Presets (`--command`)
 
@@ -95,7 +98,7 @@ default `content` mode, so no flags are needed.
 | `sort` | ✅ `--command sort` | (dedicated sort-verify engine) | n/a | Order *is* the payload: routes to the sort-verify engine, bypassing `--mode`/`ContentPredicate` entirely; explicit `--mode`/`--ignore-order` are rejected. |
 | `correct` | ✅ `--command correct` | content | false | Modifies RX tag only, not MI |
 | `dedup` | ✅ `--command dedup` | content | false | Deterministic; exact content comparison |
-| `group` | ✅ `--command group` | grouping (key-join engine) | true | Cross-tool: compares via key-join, pairing records by identity after canonicalizing both inputs to queryname order. Content is checked under `ExactMinusMi` (every field except MI) plus a separate fgumi-MI/fgbio-MI bijection check, since MI values or record order may legitimately differ between tools. |
+| `group` | ✅ `--command group` | grouping (streaming molecule-join engine) | true | Cross-tool: compares via a streaming molecule-join, matching molecules across the two files by an MI-invariant canonical id (no re-sort — both inputs must already be grouped). Each matched pair is checked for record membership, content under `ExactMinusMi` (every field except MI), and duplex `/A`/`/B` strand-partition equivalence, since MI values or molecule order may legitimately differ between tools. |
 | `simplex` | ✅ `--command simplex` | content | false | Exact content comparison (compares the `cD`/`cM`/`cE` depth tags exactly; fgumi clamps them to fgbio's `Short` ceiling at the source, so no saturation carve-out is needed) |
 | `duplex` | ✅ `--command duplex` | content | false | Exact content comparison (compares `cD`/`cM`/`cE` plus duplex `aD`/`aM`/`bD`/`bM`/`aE`/`bE` exactly) |
 | `codec` | ✅ `--command codec` | content | false | Exact content comparison, same as `simplex`/`duplex` |
@@ -110,7 +113,7 @@ default `content` mode, so no flags are needed.
 # Compare extract output (no MI tags)
 fgumi compare bams extracted1.bam extracted2.bam --mode content
 
-# Compare group output (cross-tool: key-join + MI bijection check)
+# Compare group output (cross-tool: streaming molecule-join)
 fgumi compare bams grouped1.bam grouped2.bam --command group
 
 # Compare consensus output (exact content comparison)
