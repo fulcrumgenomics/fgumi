@@ -7,7 +7,8 @@ use clap::Parser;
 use fgumi_lib::commands::command::Command as FgumiCommand;
 use fgumi_lib::commands::compare::{
     CompareBams, CompareMismatch, ContentPredicate, KeyJoinConfig, KeyJoinOutcome,
-    canonicalize_to_queryname, keyjoin_compare, positional_compare, sort_verify_compare,
+    canonicalize_to_queryname, keyjoin_compare, molecule_join_compare, positional_compare,
+    sort_verify_compare,
 };
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
@@ -2149,4 +2150,74 @@ fn content_mode_accepts_orderless_extract_headers() {
     let tmp = TempDir::new().unwrap();
     let (a, b) = write_identical_orderless_pair(tmp.path()); // SO:unsorted GO:query, no SS
     assert!(run_compare_in_process(&a, &b, "content", &[]), "orderless identical pair must MATCH");
+}
+
+// ============================================================================
+// Task 6: two-sided streaming molecule hash-join driver (`molecule_join_compare`).
+// ============================================================================
+
+/// Writes two grouped BAMs encoding the same two molecules (`M_a` = reads `mol_a1`/`mol_a2`,
+/// `M_b` = reads `mol_b1`/`mol_b2`), but with bam2's molecule *order* reversed relative to
+/// bam1's and each molecule's MI number changed between the files. Content
+/// (position/sequence) is otherwise identical, so
+/// [`compare_molecule`](fgumi_lib::commands::compare)'s MI-invariant checks should find both
+/// molecules equivalent despite neither the file order nor the MI numbering lining up — this
+/// is exactly the scenario the hash-join (rather than a simple merge-join assuming
+/// synchronized order) exists to handle.
+fn write_two_molecules_reordered_and_renumbered(dir: &Path) -> (PathBuf, PathBuf) {
+    let header = create_minimal_header("chr1", 10000);
+
+    let mut bam1_records = vec![mi_record(b"mol_a1", 100, "5"), mi_record(b"mol_a2", 100, "5")];
+    bam1_records.extend([mi_record(b"mol_b1", 200, "6"), mi_record(b"mol_b2", 200, "6")]);
+
+    // bam2: M_b before M_a (reversed file order), MI renumbered (5->7, 6->9).
+    let mut bam2_records = vec![mi_record(b"mol_b1", 200, "9"), mi_record(b"mol_b2", 200, "9")];
+    bam2_records.extend([mi_record(b"mol_a1", 100, "7"), mi_record(b"mol_a2", 100, "7")]);
+
+    let bam1 = dir.join("molecule_join_reordered1.bam");
+    let bam2 = dir.join("molecule_join_reordered2.bam");
+    write_bam(&bam1, &header, &bam1_records);
+    write_bam(&bam2, &header, &bam2_records);
+    (bam1, bam2)
+}
+
+/// Writes two grouped BAMs sharing one molecule (`M_a` = reads `mol_a1`/`mol_a2`), but bam1
+/// has a second molecule (`M_b` = reads `mol_b1`/`mol_b2`, canonical id `mol_b1`) that bam2
+/// lacks entirely.
+fn write_extra_molecule_in_bam1(dir: &Path) -> (PathBuf, PathBuf) {
+    let header = create_minimal_header("chr1", 10000);
+
+    let m_a = vec![mi_record(b"mol_a1", 100, "1"), mi_record(b"mol_a2", 100, "1")];
+    let m_b = vec![mi_record(b"mol_b1", 200, "2"), mi_record(b"mol_b2", 200, "2")];
+
+    let mut bam1_records = m_a.clone();
+    bam1_records.extend(m_b);
+    let bam2_records = m_a;
+
+    let bam1 = dir.join("molecule_join_extra1.bam");
+    let bam2 = dir.join("molecule_join_extra2.bam");
+    write_bam(&bam1, &header, &bam1_records);
+    write_bam(&bam2, &header, &bam2_records);
+    (bam1, bam2)
+}
+
+/// Reordered molecules across files, MI renumbered, still MATCH — no external sort, no window.
+#[test]
+fn molecule_join_matches_reordered_renumbered_molecules() {
+    let tmp = TempDir::new().unwrap();
+    // file1 molecules in order [M_a, M_b]; file2 in order [M_b, M_a], different MI numbers.
+    let (bam1, bam2) = write_two_molecules_reordered_and_renumbered(tmp.path());
+    let out = molecule_join_compare(&bam1, &bam2, 10).unwrap();
+    assert_eq!(out.matched, 2);
+    assert!(out.is_match(), "{out:?}");
+}
+
+/// A molecule present in only one file is a DIFFER named by its canonical id.
+#[test]
+fn molecule_join_flags_molecule_only_in_one_file() {
+    let tmp = TempDir::new().unwrap();
+    let (bam1, bam2) = write_extra_molecule_in_bam1(tmp.path());
+    let out = molecule_join_compare(&bam1, &bam2, 10).unwrap();
+    assert!(!out.is_match());
+    assert!(out.diff_details.iter().any(|d| d.contains("only in bam1")), "{:?}", out.diff_details);
 }

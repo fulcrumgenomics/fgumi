@@ -13,9 +13,6 @@ use std::io::Read;
 use super::bams::get_mi_tag_raw;
 
 /// One molecule's consecutive records, plus its MI-invariant canonical id.
-// `#[allow(dead_code)]`: not yet consumed outside tests — wired up by `molecule_join` in
-// Task 6.
-#[allow(dead_code)]
 pub(crate) struct MoleculeRun {
     /// Lexicographically smallest read name across `members` — a stable, MI-independent,
     /// collision-free molecule identity (a QNAME belongs to exactly one molecule).
@@ -37,9 +34,6 @@ impl MoleculeRun {
 /// [`super::bams::MiKey::base`]) changes. Assumes same-molecule reads are consecutive
 /// (guaranteed by grouped output; see the design doc). Records with no MI tag
 /// (`base == None`) form their own runs, cut on any change to/from `None`.
-// `#[allow(dead_code)]`: not yet consumed outside tests — wired up by `molecule_join` in
-// Task 6.
-#[allow(dead_code)]
 pub(crate) fn molecule_runs<R: Read>(
     mut reader: RawBamRecordReader<R>,
 ) -> impl Iterator<Item = Result<MoleculeRun>> {

@@ -28,6 +28,7 @@ pub use engines::header::compare_headers;
 pub use engines::keyjoin::{
     KeyJoinConfig, KeyJoinOutcome, canonicalize_to_queryname, keyjoin_compare,
 };
+pub use engines::molecule_join::{MoleculeJoinOutcome, molecule_join_compare};
 pub use engines::positional::positional_compare;
 pub use engines::sort_verify::{SortVerifyOutcome, sort_verify_compare};
 
