@@ -103,6 +103,11 @@ Named tag sets like "Consensus" are automatically expanded to their constituent 
 - --tags-to-revcomp Consensus:  ac bc  (per-base consensus base arrays; reverse-complemented)
 Per-read scalar tags (aD bD cD, aM bM cM, aE bE cE) are never reversed or reverse-complemented.
 
+Tag lists are comma-delimited in fgumi (e.g. `--tags-to-reverse cd,ce,ad`), whereas fgbio's
+`ZipperBams` takes space-separated values. Tags that are not present, or whose type does not
+support the requested transform (e.g. a scalar tag listed under --tags-to-reverse), are silently
+skipped rather than raising an error.
+
 ## Default Behavior
 
 By default, input is read from stdin and output is written to stdout, allowing for streaming

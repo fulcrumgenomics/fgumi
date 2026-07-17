@@ -659,8 +659,8 @@ len bases will be compared, where len is the length of the shortest UMI. The UMI
 of [ACGT] bases in the UMI (i.e. does not count dashes and other non-ACGT characters). This option is
 not implemented for reads with UMI pairs (i.e. using the paired assigner).
 
-Note: the --min-map-q parameter defaults to 0 in duplicate marking mode and 1 otherwise, and is
-directly settable on the command line.
+Note: the --min-map-q parameter defaults to 1 and is directly settable on the command line.
+(Duplicate marking is not performed by this command in fgumi; it is handled by `fgumi dedup`.)
 
 # Cell Barcodes
 
@@ -671,7 +671,9 @@ The cell barcode is read from the standard `CB` tag. No correction or
 error-handling is performed on cell barcodes; they must be corrected upstream.
 
 Multi-threaded operation is supported via --threads N, which spawns N pipeline threads
-allocated based on the command's workload profile to optimize performance.
+allocated based on the command's workload profile to optimize performance. Note this differs
+from fgbio, where --threads sizes only the pool of UMI-comparison worker threads; in fgumi
+--threads sizes the whole read/assign/write pipeline.
 
 Example: --threads 8 spawns 8 pipeline threads (2 reader, 4 workers, 2 writer)
 

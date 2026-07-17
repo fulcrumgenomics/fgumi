@@ -207,7 +207,10 @@ pub struct Simplex {
     #[arg(short = 'M', long = "min-reads")]
     pub min_reads: usize,
 
-    /// Maximum reads to use per tag family (downsample if exceeded)
+    /// Maximum reads to use per tag family (downsample if exceeded). Note: over-sized families are
+    /// downsampled with a different pseudo-random generator than fgbio's Scala `Random`, so which
+    /// reads survive (and therefore the consensus of a downsampled family) is not bit-identical to
+    /// fgbio, though it is deterministic within fgumi for a given input.
     #[arg(long = "max-reads")]
     pub max_reads: Option<usize>,
 

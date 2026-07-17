@@ -46,6 +46,9 @@ The input to this tool must be a BAM file that is either:
 2. A BAM file that has MI tags present on all reads (usually set by `group` and has been
    sorted into template-coordinate order
 
+Paired templates are expected to carry both mate records; templates for which the physical R2
+record is absent are skipped (a non-issue for properly grouped, template-coordinate-sorted BAMs).
+
 Calculation of metrics may be restricted to a set of regions using the `--intervals` parameter.
 This can significantly affect results as off-target reads in duplex sequencing experiments often
 have very different properties than on-target reads due to the lack of enrichment.
@@ -107,7 +110,9 @@ pub struct DuplexMetrics {
     #[arg(short = 'l', long = "intervals")]
     pub intervals: Option<PathBuf>,
 
-    /// Optional sample name or description for PDF plot titles
+    /// Optional sample name or description for PDF plot titles. When omitted, fgumi uses the
+    /// literal "Sample" (fgbio instead derives the sample/library name from the BAM `@RG` header,
+    /// so plot titles differ unless this is set).
     #[arg(long = "description")]
     pub description: Option<String>,
 }

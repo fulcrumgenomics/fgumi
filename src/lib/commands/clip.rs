@@ -48,7 +48,8 @@ between the reads. This ensures that downstream processes, particularly variant 
 evidence from the same template when both reads span a variant site in the same template.
 
 Clipping overlapping reads is only performed on FR read pairs, and is implemented by clipping approximately half
-the overlapping bases from each read. By default soft clipping is performed.
+the overlapping bases from each read. By default hard clipping is performed; the mode may be changed with
+--clipping-mode.
 
 Secondary alignments and supplemental alignments are not clipped, but are passed through into the output.
 
@@ -127,7 +128,8 @@ pub struct Clip {
     #[arg(short = 'a', long = "auto-clip-attributes", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub auto_clip_attributes: bool,
 
-    /// Output file for clipping metrics
+    /// Output file for clipping metrics (only produced by the single-threaded path; cannot be
+    /// combined with --threads)
     #[arg(short = 'm', long = "metrics")]
     pub metrics: Option<PathBuf>,
 

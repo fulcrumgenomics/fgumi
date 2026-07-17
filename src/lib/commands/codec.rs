@@ -198,11 +198,11 @@ pub struct Codec {
     pub compression: CompressionOptions,
 
     // --- CODEC-specific options below ---
-    /// Minimum read pairs per strand to form consensus (same as --min-reads)
+    /// Minimum read pairs per strand to form consensus (fgbio's `--min-read-pairs`)
     #[arg(short = 'M', long = "min-reads", default_value = "1")]
     pub min_reads: usize,
 
-    /// Maximum read pairs per strand (downsample if exceeded)
+    /// Maximum read pairs per strand, downsample if exceeded (fgbio's `--max-read-pairs`)
     #[arg(long = "max-reads")]
     pub max_reads: Option<usize>,
 
