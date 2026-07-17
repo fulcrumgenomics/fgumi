@@ -16,6 +16,7 @@
 pub mod content;
 pub mod header;
 pub mod keyjoin;
+pub(crate) mod molecule_join;
 pub mod positional;
 pub mod sort_verify;
 
