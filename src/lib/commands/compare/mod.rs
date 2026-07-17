@@ -6,6 +6,7 @@
 pub mod bams;
 pub(crate) mod engines;
 pub mod metrics;
+pub(crate) mod molecule;
 pub(crate) mod raw_compare;
 pub(crate) mod record_key;
 
