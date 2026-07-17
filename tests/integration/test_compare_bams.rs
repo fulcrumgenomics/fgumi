@@ -1189,6 +1189,68 @@ fn molecule_join_compare_equivalent_pair_matches_with_max_diffs_zero() {
     );
 }
 
+/// CRITICAL soundness regression: the "balanced-residual" case. bam1 has one molecule
+/// (`only1`) that bam2 lacks, and bam2 has a *different* molecule (`only2`) that bam1
+/// lacks, alongside one molecule (`shared`) present, identically, on both sides. Each
+/// file therefore has 2 molecules total, so `bam1_molecules == bam2_molecules` even
+/// though a real presence difference exists on both sides. Combined with `max_diffs ==
+/// 0` (which forces `diff_details` empty regardless of how many diffs were found — see
+/// `molecule_join_compare_content_diff_survives_max_diffs_zero`), the OLD verdict
+/// (`diff_details.is_empty() && bam1_molecules == bam2_molecules`) would report a FALSE
+/// MATCH here: both conditions hold despite two molecules genuinely differing in
+/// presence. The NEW verdict (`matched == bam1_molecules && matched == bam2_molecules`)
+/// correctly DIFFERs because only the one `shared` molecule pair actually matched
+/// (`matched == 1 < bam1_molecules == 2`).
+#[test]
+fn molecule_join_compare_balanced_residual_differs_with_max_diffs_zero() {
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10000);
+
+    // bam1: one molecule shared with bam2, plus one molecule ("only1") bam2 lacks.
+    let records1 = vec![
+        mi_record(b"shared1", 100, "1"),
+        mi_record(b"shared2", 100, "1"),
+        mi_record(b"only1", 200, "2"),
+    ];
+    // bam2: the same shared molecule, plus a *different* molecule ("only2") bam1 lacks.
+    // Total molecule count on each side is 2, so bam1_molecules == bam2_molecules.
+    let records2 = vec![
+        mi_record(b"shared1", 100, "1"),
+        mi_record(b"shared2", 100, "1"),
+        mi_record(b"only2", 300, "3"),
+    ];
+
+    let bam1 = tmp.path().join("a.bam");
+    let bam2 = tmp.path().join("b.bam");
+    write_bam(&bam1, &header, &records1);
+    write_bam(&bam2, &header, &records2);
+
+    let outcome =
+        molecule_join_compare(&bam1, &bam2, 0).expect("molecule_join_compare should succeed");
+
+    assert_eq!(outcome.bam1_molecules, 2);
+    assert_eq!(outcome.bam2_molecules, 2);
+    assert_eq!(
+        outcome.bam1_molecules, outcome.bam2_molecules,
+        "molecule counts must be equal (the balanced-residual setup): {outcome:?}"
+    );
+    assert!(
+        outcome.diff_details.is_empty(),
+        "max_diffs == 0 must suppress diff_details entirely (this is the trap): {outcome:?}"
+    );
+    assert_eq!(
+        outcome.matched, 1,
+        "only the shared molecule pair should match; the two residuals must not count: \
+         {outcome:?}"
+    );
+    assert!(
+        !outcome.is_match(),
+        "a balanced residual (equal molecule counts, but one molecule only-in-bam1 and a \
+         DIFFERENT molecule only-in-bam2) must DIFFER even with max_diffs == 0 — a verdict \
+         keyed off diff_details.is_empty() && equal counts would falsely MATCH here: {outcome:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // `--command group` end-to-end tests: wiring the streaming molecule-join engine onto
 // the real CLI preset, not just calling `molecule_join_compare` directly as the tests
