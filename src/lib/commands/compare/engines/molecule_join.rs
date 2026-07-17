@@ -219,13 +219,17 @@ fn fold_matched_pair(
 /// `pending` record inside it would otherwise silently leak into the next run's boundary), so
 /// resuming past a first error would corrupt subsequent run boundaries.
 ///
-/// Also returns an error if **neither** input ever saw an MI tag on any record. Grouping mode
-/// compares *grouped* output (same-molecule reads consecutive under a shared MI), so a pair of
-/// BAMs with zero MI tags between them is misuse of this comparison, not a legitimate "no
-/// diffs" input — without this guard, two content-identical fully-MI-less BAMs would fold into
-/// one giant MI-less "molecule" on each side and spuriously MATCH. A *partial* MI-less pair
-/// (one side grouped, the other not) is unaffected by this guard: it is still caught downstream
-/// as an ordinary molecule-count/membership asymmetry.
+/// Also returns an error if **neither** input ever saw an MI tag on any record *and* at least
+/// one of the two inputs is non-empty. Grouping mode compares *grouped* output (same-molecule
+/// reads consecutive under a shared MI), so a non-empty pair of BAMs with zero MI tags between
+/// them is misuse of this comparison, not a legitimate "no diffs" input — without this guard,
+/// two content-identical fully-MI-less BAMs would fold into one giant MI-less "molecule" on
+/// each side and spuriously MATCH. A *partial* MI-less pair (one side grouped, the other not)
+/// is unaffected by this guard: it is still caught downstream as an ordinary molecule-count/
+/// membership asymmetry. Two BAMs that are both entirely *empty* (zero records, hence zero
+/// molecules and trivially zero MI tags on either side) are exempted: there is nothing to
+/// compare, so that is a vacuous MATCH, not misuse — the guard is scoped to fire only when at
+/// least one side actually produced molecules (`bam1_molecules > 0 || bam2_molecules > 0`).
 pub fn molecule_join_compare(
     bam1: &Path,
     bam2: &Path,
@@ -311,8 +315,11 @@ pub fn molecule_join_compare(
     }
 
     // Fully-MI-less guard (see this function's doc comment): if neither side ever saw an MI
-    // tag, this is misuse of grouping comparison, not a legitimate "no diffs" verdict.
-    if !saw_mi1 && !saw_mi2 {
+    // tag AND at least one side actually produced molecules, this is misuse of grouping
+    // comparison, not a legitimate "no diffs" verdict. Two empty inputs (zero molecules on
+    // both sides) fall through this guard and proceed to the normal match path below, where
+    // they vacuously MATCH (nothing to compare).
+    if !saw_mi1 && !saw_mi2 && (bam1_molecules > 0 || bam2_molecules > 0) {
         bail!(
             "grouping comparison requires MI-tagged (grouped) input; neither BAM contains any \
              MI tags"

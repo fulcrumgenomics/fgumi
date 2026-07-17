@@ -569,6 +569,62 @@ fn test_grouping_partial_mi_less_pair_still_differs() {
     assert!(!outcome.is_match(), "a partial-MI-less pair must DIFFER, not error: {outcome:?}");
 }
 
+/// Review fix (empty-vs-empty exemption): two EMPTY grouped BAMs (zero records on both
+/// sides) must MATCH, not hit the fully-MI-less guard. Neither side ever sees an MI tag —
+/// there are no records at all to see one on — but there is also nothing to compare, so this
+/// is a vacuous MATCH, not the "misuse" case (non-empty, fully MI-less input) the guard
+/// exists to catch. See `molecule_join_compare`'s guard condition, which only fires when at
+/// least one side actually produced molecules.
+#[test]
+fn test_grouping_mode_both_empty_bams_match() {
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10000);
+
+    let bam1 = tmp.path().join("a.bam");
+    let bam2 = tmp.path().join("b.bam");
+    write_bam(&bam1, &header, &[]);
+    write_bam(&bam2, &header, &[]);
+
+    let outcome = molecule_join_compare(&bam1, &bam2, 10).expect("empty-vs-empty must not error");
+    assert_eq!(outcome.bam1_molecules, 0);
+    assert_eq!(outcome.bam2_molecules, 0);
+    assert!(outcome.is_match(), "two empty BAMs should vacuously MATCH: {outcome:?}");
+
+    // Also confirm via the real CLI entry point (`CompareBams::execute`), not just the
+    // engine function directly.
+    assert!(
+        run_compare_in_process(&bam1, &bam2, "grouping", &[]),
+        "two empty BAMs should MATCH via --mode grouping"
+    );
+}
+
+/// Review fix (guard-vs-diff precedence): both existing MI-less-guard tests above use
+/// *identical* content on both sides, so the fully-MI-less guard firing was never
+/// distinguished from an ordinary content DIFFER also firing. This test uses genuinely
+/// different content (same read names/keys so the records would otherwise pair up and
+/// surface a POS content diff — see `RecordKey`'s doc comment on POS not being part of a
+/// primary record's identity) on two fully MI-less BAMs, and locks that the fully-MI-less
+/// guard still wins: the compare hard-fails with the guard's message rather than reporting
+/// an ordinary DIFFER.
+#[test]
+fn test_grouping_mode_mi_missing_and_content_differs_still_errors_via_guard() {
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10000);
+
+    // No MI tag on either side, but genuinely different content (different positions) so
+    // that, absent the guard, this would be an ordinary content DIFFER, not a MATCH.
+    let records1 = vec![mapped_record(b"read1", 100), mapped_record(b"read2", 200)];
+    let records2 = vec![mapped_record(b"read1", 150), mapped_record(b"read2", 250)];
+
+    let bam1 = tmp.path().join("a.bam");
+    let bam2 = tmp.path().join("b.bam");
+    write_bam(&bam1, &header, &records1);
+    write_bam(&bam2, &header, &records2);
+
+    let err = run_compare_grouping_expect_err(&bam1, &bam2, &[]);
+    assert!(err.contains("MI-tagged"), "got: {err}");
+}
+
 // ---------------------------------------------------------------------------
 // Paired-UMI MI strand-suffix regression tests
 //
