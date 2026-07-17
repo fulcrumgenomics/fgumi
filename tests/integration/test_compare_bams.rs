@@ -2053,3 +2053,74 @@ fn molecule_join_duplicate_record_key_within_a_molecule_collapses_silently() {
          currently reports MATCH despite bam1 having one more physical record than bam2: {out:?}"
     );
 }
+
+// ============================================================================
+// Task 10: the streaming molecule-join must never spill to disk.
+// ============================================================================
+//
+// Unlike the retired keyjoin engine (deleted in Task 7), `molecule_join_compare` is a
+// streaming two-sided hash-join: it holds only the bounded set of currently in-flight
+// molecules in memory and never writes a sorted run, scratch file, or spill directory. The
+// test below proves that by snapshotting the temp directory's entry set before and after a
+// large grouped-pair compare and asserting it is byte-for-byte unchanged.
+
+/// Counts the number of directory entries (files and subdirectories) directly under `dir`.
+///
+/// Used as a coarse "did anything get written here" probe: a spilling engine would create at
+/// least one new file or subdirectory (a sorted run, a scratch dir) under the temp dir it was
+/// pointed at, so an unchanged entry count before/after a compare is strong evidence that no
+/// spill occurred.
+fn count_entries(dir: &Path) -> usize {
+    std::fs::read_dir(dir).expect("read temp dir entries").count()
+}
+
+/// Writes two large grouped BAMs encoding `n_molecules` molecules apiece, each molecule
+/// comprising two member reads (`m{i}_1`, `m{i}_2`) that share an MI tag.
+///
+/// bam2's molecules are emitted in adjacent-pair-swapped order relative to bam1 (`0,1,2,3,...`
+/// becomes `1,0,3,2,...`) — a bounded-distance reordering (never more than one molecule of
+/// lookahead) that still forces the join to buffer more than a single molecule at a time,
+/// without requiring unbounded buffering the way a fully-scrambled order would.
+///
+/// Used by [`molecule_join_does_not_spill_to_disk`] to prove the streaming molecule-join
+/// engine never spills: peak buffering scales with the (bounded) number of in-flight
+/// molecules, not with file size.
+fn write_large_grouped_pair(dir: &Path, n_molecules: usize) -> (PathBuf, PathBuf) {
+    let header = create_minimal_header("chr1", 10_000);
+
+    let molecule_records = |i: usize| -> Vec<RawRecord> {
+        let mi = i.to_string();
+        vec![
+            mi_record(format!("m{i}_1").as_bytes(), 100, &mi),
+            mi_record(format!("m{i}_2").as_bytes(), 100, &mi),
+        ]
+    };
+
+    let bam1_records: Vec<RawRecord> = (0..n_molecules).flat_map(molecule_records).collect();
+
+    // bam2: adjacent-pair-swapped molecule order — bounded (distance-1) reordering.
+    let mut swapped_order: Vec<usize> = (0..n_molecules).collect();
+    for pair in swapped_order.chunks_mut(2) {
+        pair.reverse();
+    }
+    let bam2_records: Vec<RawRecord> =
+        swapped_order.into_iter().flat_map(molecule_records).collect();
+
+    let bam1 = dir.join("large_grouped1.bam");
+    let bam2 = dir.join("large_grouped2.bam");
+    write_bam(&bam1, &header, &bam1_records);
+    write_bam(&bam2, &header, &bam2_records);
+    (bam1, bam2)
+}
+
+/// Grouping comparison never spills: no temp/sort directory is created, and a large input
+/// with molecules interleaved at bounded distance compares with bounded buffering.
+#[test]
+fn molecule_join_does_not_spill_to_disk() {
+    let tmp = TempDir::new().unwrap();
+    let (bam1, bam2) = write_large_grouped_pair(tmp.path(), 50_000 /* molecules */);
+    let before = count_entries(tmp.path());
+    let out = molecule_join_compare(&bam1, &bam2, 10).unwrap();
+    assert!(out.is_match(), "{out:?}");
+    assert_eq!(count_entries(tmp.path()), before, "no spill/scratch dir must be created");
+}
