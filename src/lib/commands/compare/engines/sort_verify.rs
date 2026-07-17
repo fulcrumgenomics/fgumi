@@ -81,7 +81,7 @@ pub struct SortVerifyOutcome {
     /// `true` if the two inputs' `@HD`/`@SQ`/`@RG` headers disagreed on a field
     /// [`compare_headers`](super::header::compare_headers) considers significant (`@PG`/`@CO`
     /// are normalized and never contribute here). Note that `@HD` `SO`/`GO`/`SS` agreement is
-    /// already implied by [`detect_sort_order`] succeeding on both inputs with a matching
+    /// already implied by `detect_sort_order` succeeding on both inputs with a matching
     /// [`SortOrder`] (checked before this field is ever populated) *only when both writers use
     /// the same bare-vs-prefixed `SS` convention* — this field catches the case where they
     /// don't (see `R2-HDR-01`), plus any `@SQ`/`@RG` divergence `detect_sort_order` never looks
@@ -154,7 +154,23 @@ pub(crate) fn sort_order_from_header(header: &Header) -> Result<SortOrder> {
     let ss = unknown.get(b"SS").map(|v| String::from_utf8_lossy(v).into_owned());
 
     match so.as_deref() {
-        Some("coordinate") => Ok(SortOrder::Coordinate),
+        // This engine implements no coordinate sub-sort, so plain `SO:coordinate` with no
+        // `SS` tag is accepted, but ANY declared `SS` sub-sort must be rejected rather than
+        // silently validated as plain coordinate: `run_compare`'s equal-core-sort-key
+        // grouping only ever verifies `(tid, pos, reverse)`, which is weaker than whatever a
+        // declared sub-sort would promise. fgumi itself never emits a coordinate `SS` (see
+        // `header_ss_tag` in `fgumi-sort`), so this cannot reject fgumi's own output.
+        Some("coordinate") => match ss.as_deref().map(|s| ss_subsort(s, "coordinate")) {
+            None => Ok(SortOrder::Coordinate),
+            Some(Ok(bad_ss)) => bail!(
+                "unrecognized/unsupported @HD SS sub-sort '{bad_ss}' for SO:coordinate \
+                 (no coordinate sub-sort is currently implemented; expected no SS tag)"
+            ),
+            Some(Err(prefix)) => bail!(
+                "@HD SS sort-order prefix '{prefix}' disagrees with SO:coordinate \
+                 (expected no SS tag, since no coordinate sub-sort is currently implemented)"
+            ),
+        },
         // Validate the *whole* `SS` value, not just its suffix: a bare sub-sort or a
         // `queryname:`-prefixed one is accepted, but a value whose sort-order prefix
         // disagrees with `SO:queryname` (e.g. `coordinate:natural`) is rejected rather
@@ -467,7 +483,7 @@ where
 ///
 /// Returns an error if either file cannot be opened or read, if the two files' `@HD`
 /// headers declare different sort orders, or if the declared sort order isn't one this
-/// engine can verify (see [`detect_sort_order`]).
+/// engine can verify (see `detect_sort_order`).
 pub fn sort_verify_compare(
     bam1: &Path,
     bam2: &Path,
@@ -729,6 +745,48 @@ mod tests {
             .expect_err("SS with a sort-order prefix disagreeing with SO must error");
         assert!(
             err.to_string().contains("disagrees with SO:queryname"),
+            "error should call out the prefix disagreement: {err}"
+        );
+    }
+
+    /// Plain `SO:coordinate` with no `SS` tag must still be accepted as `SortOrder::Coordinate`
+    /// (this engine implements no coordinate sub-sort, so the common case is bare `SO` alone).
+    #[test]
+    fn detect_sort_order_accepts_bare_coordinate() {
+        let header = header_with_hd(Some("coordinate"), None, None);
+        let order = detect_sort_order(&header).expect("bare SO:coordinate must be accepted");
+        assert_eq!(order, SortOrder::Coordinate);
+    }
+
+    /// `SO:coordinate` with ANY `SS` sub-sort must be rejected, not silently validated as plain
+    /// coordinate: this engine implements no coordinate sub-sort, so a declared
+    /// `coordinate:<something>` sub-order is stronger than what `run_compare`'s
+    /// equal-core-sort-key grouping actually verifies. Silently accepting it would let a file
+    /// that only satisfies plain coordinate order falsely validate against a sub-sort it never
+    /// promised.
+    #[rstest]
+    #[case::bare_unrecognized_subsort("bogus")]
+    #[case::prefixed_unrecognized_subsort("coordinate:bogus")]
+    fn detect_sort_order_rejects_coordinate_subsort(#[case] ss: &str) {
+        let header = header_with_hd(Some("coordinate"), None, Some(ss));
+        let err = detect_sort_order(&header)
+            .expect_err("SO:coordinate with any SS sub-sort must be rejected");
+        assert!(
+            err.to_string().contains("coordinate"),
+            "error should mention SO:coordinate: {err}"
+        );
+    }
+
+    /// An `SS` whose sort-order prefix disagrees with `SO:coordinate` (e.g.
+    /// `queryname:natural`) must be rejected with a message calling out the disagreement,
+    /// mirroring the `SO:queryname` prefix-disagreement check above.
+    #[test]
+    fn detect_sort_order_rejects_coordinate_ss_prefix_disagreement() {
+        let header = header_with_hd(Some("coordinate"), None, Some("queryname:natural"));
+        let err = detect_sort_order(&header)
+            .expect_err("SS with a sort-order prefix disagreeing with SO must error");
+        assert!(
+            err.to_string().contains("disagrees with SO:coordinate"),
             "error should call out the prefix disagreement: {err}"
         );
     }
