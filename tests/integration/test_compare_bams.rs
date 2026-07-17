@@ -2333,17 +2333,26 @@ fn molecule_join_duplicate_record_key_within_a_molecule_now_differs() {
 // Unlike the retired keyjoin engine (deleted in Task 7), `molecule_join_compare` is a
 // streaming two-sided hash-join: it holds only the bounded set of currently in-flight
 // molecules in memory and never writes a sorted run, scratch file, or spill directory. The
-// test below proves that by snapshotting the temp directory's entry set before and after a
-// large grouped-pair compare and asserting it is byte-for-byte unchanged.
+// test below proves that by pointing the process's temp-dir env vars at an isolated, empty
+// directory for a large grouped-pair compare and asserting that directory's contents —
+// checked recursively, not just its top level — stay empty throughout.
 
-/// Counts the number of directory entries (files and subdirectories) directly under `dir`.
+/// Recursively counts every file/subdirectory entry under `dir`, at any depth.
 ///
-/// Used as a coarse "did anything get written here" probe: a spilling engine would create at
-/// least one new file or subdirectory (a sorted run, a scratch dir) under the temp dir it was
-/// pointed at, so an unchanged entry count before/after a compare is strong evidence that no
-/// spill occurred.
-fn count_entries(dir: &Path) -> usize {
-    std::fs::read_dir(dir).expect("read temp dir entries").count()
+/// A shallow `read_dir(dir).count()` (the original version of this check) only counts
+/// entries directly inside `dir` — it cannot see a spill written into a subdirectory that a
+/// spilling engine created under `dir` (e.g. a `tempfile::tempdir()`-style scratch
+/// directory holding several sorted-run files). Walking recursively closes that gap.
+fn count_entries_recursive(dir: &Path) -> usize {
+    let mut count = 0;
+    for entry in std::fs::read_dir(dir).expect("read temp dir entries") {
+        let entry = entry.expect("read temp dir entry");
+        count += 1;
+        if entry.path().is_dir() {
+            count += count_entries_recursive(&entry.path());
+        }
+    }
+    count
 }
 
 /// Writes two large grouped BAMs encoding `n_molecules` molecules apiece, each molecule
@@ -2385,14 +2394,56 @@ fn write_large_grouped_pair(dir: &Path, n_molecules: usize) -> (PathBuf, PathBuf
     (bam1, bam2)
 }
 
-/// Grouping comparison never spills: no temp/sort directory is created, and a large input
-/// with molecules interleaved at bounded distance compares with bounded buffering.
+/// Grouping comparison never spills: a large input with molecules interleaved at bounded
+/// distance compares with bounded buffering, and writes nothing at all to the process's temp
+/// location.
+///
+/// The BAM fixtures live in their own directory (`fixtures`), separate from the directory
+/// this test points `TMPDIR`/`TEMP`/`TMP` at (`isolated_tmp`) — counting entries beside the
+/// BAM fixtures (the original version of this test) cannot catch a spill routed through
+/// `tempfile`/`std::env::temp_dir()` to the *actual* system temp directory, since that has
+/// nothing to do with wherever the fixtures happen to live. Pointing the standard temp-dir
+/// env vars at a directory this test controls, and asserting its RECURSIVE contents (see
+/// [`count_entries_recursive`]) stay empty across the compare, closes that gap.
+///
+/// This drives the real `fgumi compare bams --mode grouping` subprocess, rather than calling
+/// `molecule_join_compare` in-process, so the env vars are scoped to the child process; the
+/// test crate denies `unsafe_code`, and `std::env::set_var` requires `unsafe` as of the 2024
+/// edition (mutating process-global env state is not thread-safe), so scoping via
+/// `Command::env` on a subprocess is the sound way to do this here.
 #[test]
 fn molecule_join_does_not_spill_to_disk() {
-    let tmp = TempDir::new().unwrap();
-    let (bam1, bam2) = write_large_grouped_pair(tmp.path(), 50_000 /* molecules */);
-    let before = count_entries(tmp.path());
-    let out = molecule_join_compare(&bam1, &bam2, 10).unwrap();
-    assert!(out.is_match(), "{out:?}");
-    assert_eq!(count_entries(tmp.path()), before, "no spill/scratch dir must be created");
+    let fixtures = TempDir::new().unwrap();
+    let (bam1, bam2) = write_large_grouped_pair(fixtures.path(), 50_000 /* molecules */);
+
+    let isolated_tmp = TempDir::new().unwrap();
+    assert_eq!(
+        count_entries_recursive(isolated_tmp.path()),
+        0,
+        "isolated temp dir must start empty"
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args(["compare", "bams"])
+        .arg(&bam1)
+        .arg(&bam2)
+        .args(["--mode", "grouping"])
+        .env("TMPDIR", isolated_tmp.path())
+        .env("TEMP", isolated_tmp.path())
+        .env("TMP", isolated_tmp.path())
+        .output()
+        .expect("failed to run fgumi compare bams");
+
+    assert!(
+        output.status.success(),
+        "the large grouped pair must compare EQUIVALENT, got exit {:?}\nstdout: {}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        count_entries_recursive(isolated_tmp.path()),
+        0,
+        "no spill/scratch file may be written to the isolated temp dir"
+    );
 }
