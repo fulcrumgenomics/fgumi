@@ -710,13 +710,21 @@ fn compare_headers_sq_order_change_differs() {
     assert!(diffs.iter().any(|d| d.starts_with("@SQ")), "{diffs:?}");
 }
 
+/// `compare_headers` no longer byte-compares `@HD SS` (see `compare_hd`'s doc comment in
+/// `engines/header.rs`): sort-order identity — including a genuine `SS` divergence like
+/// `queryname:natural` vs `queryname:lexicographical` — is now decided semantically by
+/// `require_compatible_headers`, the hard-exit precondition `CompareBams::execute` runs
+/// before any engine dispatch, not by this per-comparison-time header check. So a
+/// differing `SS` with matching `SO`/`GO` must NOT be reported as an `@HD` diff here.
 #[test]
-fn compare_headers_hd_ss_change_differs() {
+fn compare_headers_hd_ss_change_is_not_a_diff() {
     let h1 = header_with_hd(Some("queryname"), None, Some("queryname:natural"));
     let h2 = header_with_hd(Some("queryname"), None, Some("queryname:lexicographical"));
     assert!(compare_headers(&h1, &h1).is_none(), "baseline must MATCH itself");
-    let diffs = compare_headers(&h1, &h2).expect("@HD SS divergence must DIFFER");
-    assert!(diffs.iter().any(|d| d.starts_with("@HD")), "{diffs:?}");
+    assert!(
+        compare_headers(&h1, &h2).is_none(),
+        "SS is no longer byte-compared by compare_headers"
+    );
 }
 
 #[test]
@@ -1570,10 +1578,14 @@ const MUTATION_CATALOG: &[CatalogEntry] = &[
             )
         },
     },
+    // `compare_headers` no longer byte-compares `SS` (see `compare_hd`'s doc comment in
+    // `engines/header.rs`): sort-order identity, including this SS divergence, is now
+    // decided semantically by `require_compatible_headers`, the hard-exit precondition
+    // `CompareBams::execute` runs before any engine dispatch.
     CatalogEntry {
         engine: "compare_headers",
         mutation: "@HD SS change",
-        must_differ: true,
+        must_differ: false,
         verify: || {
             headers_differ(
                 &header_with_hd(Some("queryname"), None, Some("queryname:natural")),

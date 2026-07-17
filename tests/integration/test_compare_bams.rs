@@ -14,7 +14,7 @@ use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::sam::Header;
 use rstest::rstest;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -1943,4 +1943,122 @@ fn test_command_sort_rejects_explicit_ignore_order() {
         stderr.contains("--ignore-order is not valid with --command sort"),
         "rejection must name the offending flag, got stderr:\n{stderr}"
     );
+}
+
+// ============================================================================
+// Header precondition gate (Task 2): `require_compatible_headers` is wired into
+// `CompareBams::execute` as a hard exit before any engine/record comparison runs.
+// ============================================================================
+
+/// Builds a header declaring `SO:unsorted GO:query` with the given `SS` value and a single
+/// `@SQ` (`chr1`, 10000) — used to exercise the bare-vs-prefixed template-coordinate `SS`
+/// spelling through the real `@HD` a BAM file carries (mirrors
+/// `create_queryname_sorted_header` above, but for the template-coordinate `SO`/`GO`
+/// combination).
+fn header_with_ss(ss: &str) -> Header {
+    use bstr::BString;
+    use noodles::sam::header::record::value::map::Map as HeaderRecordMap;
+    use noodles::sam::header::record::value::map::header::tag::Tag as HeaderTag;
+    use noodles::sam::header::record::value::{
+        Map, map::Header as HeaderRecord, map::ReferenceSequence,
+    };
+    use std::num::NonZeroUsize;
+
+    let HeaderTag::Other(tag) = HeaderTag::from(*b"SO") else { unreachable!() };
+    let mut builder = HeaderRecordMap::<HeaderRecord>::builder().insert(tag, "unsorted");
+    let HeaderTag::Other(tag) = HeaderTag::from(*b"GO") else { unreachable!() };
+    builder = builder.insert(tag, "query");
+    let HeaderTag::Other(tag) = HeaderTag::from(*b"SS") else { unreachable!() };
+    builder = builder.insert(tag, ss);
+    let header_map = builder.build().expect("valid header map");
+
+    let reference_sequence =
+        Map::<ReferenceSequence>::new(NonZeroUsize::new(10000).expect("non-zero"));
+    Header::builder()
+        .set_header(header_map)
+        .add_reference_sequence(BString::from("chr1"), reference_sequence)
+        .build()
+}
+
+/// Writes two BAMs encoding the identical single paired molecule (one MI group), one with
+/// fgumi's bare `SS:template-coordinate` `@HD` spelling and the other with fgbio's
+/// SO-prefixed `SS:unsorted:template-coordinate` spelling. `@SQ` and every record are
+/// otherwise identical — the only difference between the two files is the `SS` tag's
+/// spelling, which `require_compatible_headers`/`sort_order_from_header` must normalize to
+/// the same `SortOrder::TemplateCoordinate` (regression: the old byte-wise `@HD` compare in
+/// `compare_hd` treated these as different `SS` values and false-failed every
+/// fgumi-vs-fgbio grouping comparison).
+fn write_same_molecule_two_ss_spellings(dir: &Path) -> (PathBuf, PathBuf) {
+    let header_bare = header_with_ss("template-coordinate");
+    let header_prefixed = header_with_ss("unsorted:template-coordinate");
+    let records = paired_record_pair(b"read1", "1");
+
+    let bam_bare = dir.join("bare.bam");
+    let bam_prefixed = dir.join("prefixed.bam");
+    write_bam(&bam_bare, &header_bare, &records);
+    write_bam(&bam_prefixed, &header_prefixed, &records);
+    (bam_bare, bam_prefixed)
+}
+
+/// Thin wrapper over [`run_compare_in_process`] naming the `grouping` mode explicitly at
+/// call sites that only care about the header-gate behavior, not the other `run_compare_*`
+/// knobs.
+fn compare_bams_grouping(bam1: &Path, bam2: &Path) -> bool {
+    run_compare_in_process(bam1, bam2, "grouping", &[])
+}
+
+/// Writes a minimal single-record BAM declaring `SO:coordinate` and one `@SQ` with the
+/// given name/length, for exercising a genuine `@SQ` dictionary mismatch between two files.
+fn write_bam_with_ref(dir: &Path, filename: &str, ref_name: &str, ref_len: usize) -> PathBuf {
+    let header = create_coordinate_sorted_header(ref_name, ref_len);
+    let path = dir.join(filename);
+    write_bam(&path, &header, &[mapped_record(b"read1", 100)]);
+    path
+}
+
+/// Runs `CompareBams::execute()` in-process under `--mode content` and returns the error's
+/// full display string. Panics if `execute` succeeds, or if it fails with a
+/// [`CompareMismatch`] (a genuine record-level DIFFER) rather than the hard header-gate
+/// error this helper exists to capture — the two must never be confused (see
+/// `run_compare_in_process`'s doc comment for the same distinction in the success path).
+fn run_compare_content_expect_err(bam1: &Path, bam2: &Path) -> String {
+    let cmd = CompareBams::try_parse_from([
+        "bams",
+        bam1.to_str().unwrap(),
+        bam2.to_str().unwrap(),
+        "--mode",
+        "content",
+    ])
+    .expect("failed to parse compare bams args");
+    match cmd.execute("fgumi compare bams") {
+        Ok(()) => panic!("expected compare bams to hard-fail on incompatible headers"),
+        Err(e) if e.is::<CompareMismatch>() => {
+            panic!("expected a hard header-gate error, got a CompareMismatch (DIFFER): {e:#}")
+        }
+        Err(e) => format!("{e:#}"),
+    }
+}
+
+/// Two grouped BAMs whose only `@HD SS` difference is the bare-vs-prefixed template-coordinate
+/// spelling must NOT be reported as a header difference (regression: the old byte-wise SS
+/// compare false-failed every fgumi-vs-fgbio grouping comparison).
+#[test]
+fn grouping_accepts_bare_vs_prefixed_template_coordinate_ss() {
+    let tmp = TempDir::new().unwrap();
+    // identical single molecule, one file bare-SS, one file prefixed-SS in the @HD.
+    let (bam_bare, bam_prefixed) = write_same_molecule_two_ss_spellings(tmp.path());
+    assert!(
+        compare_bams_grouping(&bam_bare, &bam_prefixed),
+        "same order, different SS spelling must MATCH, not report a header diff"
+    );
+}
+
+/// A `@SQ` dictionary mismatch is a hard failure (nonzero), not a record cascade.
+#[test]
+fn compare_hard_fails_on_sq_dictionary_mismatch() {
+    let tmp = TempDir::new().unwrap();
+    let a = write_bam_with_ref(tmp.path(), "a.bam", "chr1", 1000);
+    let b = write_bam_with_ref(tmp.path(), "b.bam", "chr1", 2000);
+    let err = run_compare_content_expect_err(&a, &b);
+    assert!(err.contains("@SQ"), "got: {err}");
 }

@@ -16,7 +16,7 @@
 use crate::logging::OperationTimer;
 use crate::sam::SamTag;
 use crate::validation::validate_file_exists;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use crossbeam_channel::{Receiver, bounded};
 use fgumi_bam_io::{RawBamReaderAuto, create_raw_bam_reader};
@@ -32,6 +32,7 @@ use crate::commands::common::{MemoryReserve, parse_bool, resolve_memory_budget};
 use crate::commands::sort::TMP_DIRS_ENV;
 
 use super::engines::content::ContentPredicate;
+use super::engines::header::require_compatible_headers;
 use super::engines::keyjoin::{self, KeyJoinConfig};
 use super::engines::positional::positional_compare;
 
@@ -583,6 +584,16 @@ impl Command for CompareBams {
     fn execute(&self, _command_line: &str) -> Result<()> {
         validate_file_exists(&self.bam1, "First BAM")?;
         validate_file_exists(&self.bam2, "Second BAM")?;
+
+        // Hard precondition for every comparison mode/preset (including `sort`, dispatched
+        // just below): the two inputs must agree on their `@SQ` dictionary, `@RG` read
+        // groups, and semantic sort order before a single record is read. Checking this
+        // first — ahead of any mode/preset dispatch — means an incompatible pair always
+        // hard-exits here instead of silently cascading into per-record diffs (content/
+        // grouping) or a differently-worded engine-level error (`sort`).
+        let (_, h1) = create_raw_bam_reader(&self.bam1, 1)?;
+        let (_, h2) = create_raw_bam_reader(&self.bam2, 1)?;
+        require_compatible_headers(&h1, &h2).context("input BAM headers are incompatible")?;
 
         // `sort` has no notion of `CompareMode`/`ContentPredicate` — it verifies sort
         // order and compares by sort-key run instead of pairing records positionally or

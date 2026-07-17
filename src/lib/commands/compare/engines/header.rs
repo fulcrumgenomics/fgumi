@@ -12,13 +12,18 @@
 //! fgbio (or between two independent tool invocations) even on functionally equivalent
 //! output:
 //!
-//! - **`@HD`** — the `SO` (sort order), `GO` (group order), and `SS` (sub-sort) tags are
-//!   compared byte-for-byte. This is what surfaces `R2-HDR-01` (fgumi previously wrote the
-//!   `SS` sub-sort tag without its `<sort-order>:` prefix, e.g. `SS:natural` instead of
-//!   `SS:queryname:natural`): before that writer fix, comparing a fgumi-sorted BAM against
-//!   an equivalently-sorted fgbio/samtools BAM would have spuriously flagged `SS` as
-//!   different. The `VN` (format version) tag is deliberately not compared here — it is a
-//!   SAM-spec version marker, not a content field.
+//! - **`@HD`** — the `SO` (sort order) and `GO` (group order) tags are compared
+//!   byte-for-byte. The `SS` (sub-sort) tag is deliberately **not** byte-compared here:
+//!   fgumi writes the bare form (e.g. `SS:template-coordinate`) while fgbio/samtools write
+//!   the `<sort-order>:`-prefixed form (`SS:unsorted:template-coordinate`) for the same
+//!   sort order (`R2-HDR-01`), so a byte comparison would spuriously flag every
+//!   fgumi-vs-fgbio comparison as different even though the two files declare the same
+//!   order. `SS`/sort-order identity is instead decided semantically by
+//!   [`require_compatible_headers`]/[`sort_order_from_header`], which the CLI entry point
+//!   (`CompareBams::execute`) runs as a hard precondition before any engine dispatch — see
+//!   that function's own tests for the bare-vs-prefixed normalization. The `VN` (format
+//!   version) tag is deliberately not compared here either — it is a SAM-spec version
+//!   marker, not a content field.
 //! - **`@SQ`** — the reference sequence dictionary is compared as an ordered list of every
 //!   field: a name, length, *order*, **or any other field** (`M5`, `UR`, `AS`, `SP`, …)
 //!   difference is a genuine divergence (two BAMs aligned to different references, or a
@@ -41,7 +46,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use fgumi_sort::SortOrder;
 use noodles::sam::Header;
 use noodles::sam::header::record::value::map::header::tag as header_tag;
@@ -66,24 +71,49 @@ pub fn compare_headers(h1: &Header, h2: &Header) -> Option<Vec<String>> {
 /// dictionary (`@SQ`), read groups (`@RG`), and *semantic* sort order (`@HD`, bare vs
 /// SO-prefixed `SS` normalized). `@PG`/`@CO` are per-invocation metadata and never compared.
 ///
-/// Returns the shared `SortOrder` on success; a human-readable error (for a hard program exit)
-/// on any incompatibility.
+/// Returns `Ok(Some(order))` when both headers declare the same *determinable*
+/// [`SortOrder`] (see [`sort_order_from_header`] — this is the case for `sort`/`group`
+/// output and any coordinate/queryname-sorted BAM). Returns `Ok(None)` when **neither**
+/// header's sort order is determinable but the two headers' raw `@HD SO`/`GO` tags still
+/// agree byte-for-byte: this is the legitimate case for pre-sort pipeline stages
+/// (`extract`/`fastq`/`zipper`/unmapped `consensus` output all declare bare
+/// `SO:unsorted GO:query` with no `SS` — genuinely unordered data, not a recognized sort
+/// order, but still a valid same-format pair to content-compare). A human-readable error
+/// (for a hard program exit) is returned for any genuine incompatibility.
 ///
 /// # Errors
 ///
-/// Returns an error if the two headers' `@SQ` dictionaries or `@RG` read groups differ, if
-/// either header's declared sort order cannot be determined (see
-/// [`sort_order_from_header`]), or if the two headers' declared sort orders differ.
-// Not yet called from the CLI — wired in as a hard-exit precondition in a follow-up task.
-// Only exercised by tests today.
-#[allow(dead_code)]
-pub(crate) fn require_compatible_headers(h1: &Header, h2: &Header) -> Result<SortOrder> {
+/// Returns an error if the two headers' `@SQ` dictionaries or `@RG` read groups differ; if
+/// exactly one header's sort order is determinable and the other's is not (comparing a
+/// sorted BAM against an unsorted one is never valid); if both headers' sort orders are
+/// determinable but differ; or if neither is determinable and the raw `@HD SO`/`GO` tags
+/// also disagree.
+///
+/// Called from `CompareBams::execute` before any mode/preset dispatch, so an incompatible
+/// pair of inputs always hard-exits here rather than cascading into per-record diffs.
+pub(crate) fn require_compatible_headers(h1: &Header, h2: &Header) -> Result<Option<SortOrder>> {
     ensure!(compare_sq(h1, h2).is_empty(), "@SQ reference dictionaries differ between inputs");
     ensure!(compare_rg(h1, h2).is_empty(), "@RG read groups differ between inputs");
-    let a = sort_order_from_header(h1).context("reading BAM1 declared sort order")?;
-    let b = sort_order_from_header(h2).context("reading BAM2 declared sort order")?;
-    ensure!(a == b, "declared sort orders differ: {a:?} vs {b:?}");
-    Ok(a)
+    match (sort_order_from_header(h1), sort_order_from_header(h2)) {
+        (Ok(a), Ok(b)) => {
+            ensure!(a == b, "declared sort orders differ: {a:?} vs {b:?}");
+            Ok(Some(a))
+        }
+        (Err(_), Err(_)) => {
+            // Neither header declares a sort order this engine recognizes (e.g. `extract`/
+            // `fastq`/`zipper` output: bare `SO:unsorted GO:query` with no `SS`). That's a
+            // legitimate pre-sort format, not an error, as long as the two headers still
+            // agree on what `@HD` they DO declare — a genuine `SO`/`GO` divergence here
+            // (via `compare_hd`) is still a hard incompatibility.
+            ensure!(
+                compare_hd(h1, h2).is_empty(),
+                "@HD SO/GO tags differ and neither input's sort order could be determined"
+            );
+            Ok(None)
+        }
+        (Err(e), Ok(_)) => Err(e.context("reading BAM1 declared sort order")),
+        (Ok(_), Err(e)) => Err(e.context("reading BAM2 declared sort order")),
+    }
 }
 
 /// Fold an optional [`compare_headers`] result into an engine's `header_mismatch` flag and
@@ -120,14 +150,17 @@ fn format_opt_bytes(v: Option<&[u8]>) -> String {
     }
 }
 
-/// Compares the `@HD` `SO`/`GO`/`SS` tags (see the module docs for why exactly these three,
-/// and not `VN`).
+/// Compares the `@HD` `SO`/`GO` tags (see the module docs for why exactly these two, and
+/// not `VN`).
+///
+/// `SS` is intentionally NOT byte-compared here: sort-order identity (including the
+/// bare-vs-`<sort-order>:`-prefixed `SS` spelling) is decided semantically by
+/// [`require_compatible_headers`]/[`sort_order_from_header`], which normalizes fgbio's
+/// `unsorted:template-coordinate` and fgumi's bare `template-coordinate` to the same
+/// order — byte-comparing `SS` here would re-introduce that spelling false-positive.
 fn compare_hd(h1: &Header, h2: &Header) -> Vec<String> {
-    let fields: [(&str, [u8; 2]); 3] = [
-        ("SO", *header_tag::SORT_ORDER.as_ref()),
-        ("GO", *header_tag::GROUP_ORDER.as_ref()),
-        ("SS", *header_tag::SUBSORT_ORDER.as_ref()),
-    ];
+    let fields: [(&str, [u8; 2]); 2] =
+        [("SO", *header_tag::SORT_ORDER.as_ref()), ("GO", *header_tag::GROUP_ORDER.as_ref())];
     fields
         .iter()
         .filter_map(|(name, tag)| {
@@ -422,14 +455,6 @@ mod tests {
     #[rstest]
     #[case::sort_order(Some("coordinate"), None, None, Some("queryname"), None, None)]
     #[case::group_order(Some("unsorted"), Some("query"), None, Some("unsorted"), None, None)]
-    #[case::subsort(
-        Some("queryname"),
-        None,
-        Some("queryname:natural"),
-        Some("queryname"),
-        None,
-        Some("queryname:lexicographical")
-    )]
     fn differing_hd_sort_fields_is_a_diff(
         #[case] so1: Option<&str>,
         #[case] go1: Option<&str>,
@@ -444,13 +469,15 @@ mod tests {
         assert!(diffs.iter().any(|d| d.starts_with("@HD")), "diffs: {diffs:?}");
     }
 
-    /// The R2-HDR-01 regression check: once the writer emits the prefixed `SS` form on both
-    /// sides (fix applied), two headers that both declare `queryname:natural` must compare
-    /// equal — this is the case that would have spuriously reported `DIFFER` before the writer fix
-    /// (fgumi's bare `SS:natural` vs. fgbio/samtools' `SS:queryname:natural`).
+    /// `compare_hd` no longer byte-compares `SS` at all (see its doc comment): a genuinely
+    /// different `SS` value — here, fgumi's bare `SS:natural` vs. fgbio/samtools'
+    /// `SS:queryname:natural` — must NOT be reported as an `@HD` diff as long as `SO`/`GO`
+    /// agree. `SS`-level equivalence (this exact bare-vs-prefixed pair) is now covered by
+    /// `require_compatible_headers_accepts_fgumi_vs_fgbio_template_coordinate_ss_spelling`
+    /// below, which is the semantic gate that replaced this byte comparison.
     #[test]
-    fn matching_prefixed_ss_tag_is_not_a_diff() {
-        let h1 = header_with_hd(Some("queryname"), None, Some("queryname:natural"));
+    fn differing_ss_tag_is_not_a_diff() {
+        let h1 = header_with_hd(Some("queryname"), None, Some("natural"));
         let h2 = header_with_hd(Some("queryname"), None, Some("queryname:natural"));
         assert!(compare_headers(&h1, &h2).is_none());
     }
@@ -493,7 +520,7 @@ mod tests {
         let fgbio = header_tc_unsorted_query(Some("unsorted:template-coordinate"));
         let so = require_compatible_headers(&fgumi, &fgbio)
             .expect("bare vs SO-prefixed SS must be the same order");
-        assert_eq!(so, SortOrder::TemplateCoordinate);
+        assert_eq!(so, Some(SortOrder::TemplateCoordinate));
     }
 
     /// A genuine sort-order divergence is a hard incompatibility.
@@ -504,6 +531,43 @@ mod tests {
         let err = require_compatible_headers(&coord, &qname)
             .expect_err("coordinate vs queryname must be rejected");
         assert!(format!("{err}").contains("sort orders differ"), "got: {err}");
+    }
+
+    /// `extract`/`fastq`/`zipper` output declares bare `SO:unsorted GO:query` with no `SS`
+    /// — genuinely unordered data with no `SortOrder` this engine can determine. Two such
+    /// headers, agreeing on `SO`/`GO`, must be accepted as compatible (`Ok(None)`, no
+    /// verifiable order) rather than hard-erroring — otherwise every `--command extract`
+    /// comparison (and any other pre-sort pipeline stage) would be unusable.
+    #[test]
+    fn require_compatible_headers_accepts_unsorted_query_grouped_headers_with_no_ss() {
+        let h1 = header_with_hd(Some("unsorted"), Some("query"), None);
+        let h2 = header_with_hd(Some("unsorted"), Some("query"), None);
+        let order = require_compatible_headers(&h1, &h2)
+            .expect("two undeterminable-but-agreeing headers must be compatible");
+        assert_eq!(order, None, "no SortOrder is determinable for bare SO:unsorted GO:query");
+    }
+
+    /// The converse: if the two headers *disagree* on `SO`/`GO` and neither side's sort
+    /// order is determinable, that is still a genuine incompatibility, not a silent pass.
+    #[test]
+    fn require_compatible_headers_rejects_disagreeing_undeterminable_headers() {
+        let h1 = header_with_hd(Some("unsorted"), Some("query"), None);
+        let h2 = header_with_hd(None, None, None);
+        let err = require_compatible_headers(&h1, &h2)
+            .expect_err("disagreeing SO/GO with no determinable order must be rejected");
+        assert!(format!("{err}").contains("SO/GO"), "got: {err}");
+    }
+
+    /// Comparing a BAM with a determinable sort order (e.g. `sort`/`group` output) against
+    /// one without (e.g. `extract` output) must hard-fail rather than silently picking a
+    /// side — the two inputs are simply not the same kind of comparison.
+    #[test]
+    fn require_compatible_headers_rejects_one_determinable_one_not() {
+        let sorted = header_with_hd(Some("coordinate"), None, None);
+        let unsorted = header_with_hd(Some("unsorted"), Some("query"), None);
+        let err = require_compatible_headers(&sorted, &unsorted)
+            .expect_err("sorted vs undeterminable-order must be rejected");
+        assert!(format!("{err}").contains("declared sort order"), "got: {err}");
     }
 
     /// A `@SQ` dictionary divergence is a hard incompatibility (not a record-level diff).
