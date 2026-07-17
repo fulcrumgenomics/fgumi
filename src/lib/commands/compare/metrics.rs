@@ -17,12 +17,14 @@
 //! The only tolerated divergence is float **representation** (fgbio's
 //! `DecimalFormat("0.######")` vs fgumi's full precision): floats are compared
 //! numerically within `--rel-tol`/`--abs-tol` (optionally pre-rounded via
-//! `--precision`); integers and strings are compared exactly. Column *names* must
-//! match exactly between the two files (a column-set difference is itself a
+//! `--precision`); integer-to-integer comparisons are exact, but a MIXED
+//! integer/float pair (one file emits `1`, the other `1.0`) is compared with the
+//! same tolerance as float/float; strings are compared exactly. Column *names*
+//! must match exactly between the two files (a column-set difference is itself a
 //! `DIFFER` — e.g. fgumi#498's `UmiGroupingMetrics` 12-vs-5 columns).
 //!
 //! **Key columns are also numeric-representation-normalized before joining** (see
-//! [`canonicalize_key_field`]): a key value that parses as a number is canonicalized
+//! `canonicalize_key_field`): a key value that parses as a number is canonicalized
 //! (int/float parse, float optionally rounded to `--precision`) before being used to
 //! join rows, so e.g. `duplex_yield_metrics`'s `fraction` key of `1.0` in one file and
 //! `1` in the other still join as the same row instead of producing a spurious
@@ -62,10 +64,12 @@ Compare two TSV metrics files by row key-join.
 The comparator parses both files' header (column names) and data rows, verifies
 the two files declare the same column set, then outer-joins the data rows on a
 key column set:
-- Integers are compared exactly
+- Integer-to-integer values are compared exactly
 - Floats are optionally rounded to a specified precision, then compared with
-  relative/absolute tolerance (the only tolerated divergence -- this accounts
-  for fgbio's `DecimalFormat("0.######")` vs fgumi's full-precision output)
+  relative/absolute tolerance (this accounts for fgbio's
+  `DecimalFormat("0.######")` vs fgumi's full-precision output)
+- A mixed integer/float pair (one file emits `1`, the other `1.0`) is compared
+  with the same relative/absolute tolerance as float/float, not exactly
 - Strings are compared exactly
 - A row whose key is present in only one file is reported as a localized
   difference naming that key, instead of cascading into every following line
@@ -191,8 +195,43 @@ fn values_equal(val1: &ParsedValue, val2: &ParsedValue, rel_tol: f64, abs_tol: f
         // Try to compare as floats if one is int and one is float
         (ParsedValue::Int(i), ParsedValue::Float(f))
         | (ParsedValue::Float(f), ParsedValue::Int(i)) => {
-            let f1 = *i as f64;
+            // An `i64` is always finite once cast to `f64` (|i64| << 2^1024), so the only
+            // way this arm can involve a non-finite value is the float operand. Reject it
+            // outright, mirroring the `Float`/`Float` arm above: otherwise `rel_tol * ∞ = ∞`
+            // and `∞ <= ∞` would report a false MATCH for `<int>` vs `+∞`/`-∞` (fgbio writes
+            // these as the literal `"Infinity"`/`"-Infinity"`, which `parse_value` accepts).
+            if !f.is_finite() {
+                return false;
+            }
             let f2 = *f;
+            // When the float is an exact integer within `i64` range, compute the difference in
+            // integer space. `*i as f64` is lossy above 2^53 — distinct integers collapse onto
+            // one float — so a float-space `diff` could read 0 for `Int(2^53+1)` vs
+            // `Float(2^53)` and manufacture a false MATCH in exact mode (`rel_tol == abs_tol ==
+            // 0`). The integer difference stays exact; it is still held to the same tolerance
+            // window, so tolerance-mode fuzzy matching is unchanged (at these magnitudes the
+            // window dwarfs a 1-unit gap).
+            if f2.fract() == 0.0 {
+                if (i64::MIN as f64) <= f2 && f2 < (i64::MAX as f64) {
+                    let f2_int = f2 as i64;
+                    let diff = i.abs_diff(f2_int) as f64;
+                    let max_val = i.unsigned_abs().max(f2_int.unsigned_abs()) as f64;
+                    return diff <= (rel_tol * max_val).max(abs_tol);
+                }
+                // `f2` is integral but `|f2| >= 2^63`, so no `i64` can equal it — the exact
+                // difference is at least 1. `i64::MAX as f64` rounds *up* to `2^63`, which is
+                // exactly the boundary float `9223372036854775808.0`; the float-space fallback
+                // below would then read `diff == 0` and manufacture a false MATCH in exact mode
+                // (`rel_tol == abs_tol == 0`). Short-circuit that here. Tolerance mode still falls
+                // through: at magnitude 2^63 the window dwarfs the 1-unit gap, so the fallback's
+                // answer is correct there.
+                if rel_tol == 0.0 && abs_tol == 0.0 {
+                    return false;
+                }
+            }
+            // Non-integral (or out-of-i64-range) float: compare in float space. Any 1-ULP loss
+            // from `*i as f64` at magnitude >2^53 is swamped by the tolerance window there.
+            let f1 = *i as f64;
             let diff = (f1 - f2).abs();
             let max_val = f1.abs().max(f2.abs());
             diff <= (rel_tol * max_val).max(abs_tol)
@@ -450,7 +489,7 @@ pub struct MetricsCompareConfig {
     pub rel_tol: f64,
     /// Absolute tolerance for float comparison.
     pub abs_tol: f64,
-    /// Column(s) (name or 0-based index, see [`KeyColumnSpec`]) to join rows on.
+    /// Column(s) (name or 0-based index, see `KeyColumnSpec`) to join rows on.
     /// `None` defaults to the first file's first column.
     pub key_columns: Option<Vec<String>>,
     /// Maximum number of entries collected in
@@ -859,6 +898,66 @@ mod tests {
         let nan = ParsedValue::Float(f64::NAN);
         let num = ParsedValue::Float(1.0);
         assert!(!values_equal(&nan, &num, 1e-9, 1e-9));
+    }
+
+    /// An integer must never MATCH a non-finite float in the mixed `Int`/`Float`
+    /// arm. This is reachable from genuine fgbio output: fgbio's `Metric` serializes
+    /// non-finite doubles via `d.toString`, emitting the literal strings `"Infinity"`,
+    /// `"-Infinity"`, and `"NaN"`, all of which `parse_value` turns into a
+    /// `ParsedValue::Float`. Without an `is_finite` guard, `rel_tol * ∞ = ∞` and
+    /// `∞ <= ∞` would return a false MATCH — the worst failure mode for the oracle.
+    /// The float spellings here are fgbio's exact serializations, so this doubles as a
+    /// parse-and-compare parity check. Each case is run with the `Int` on both sides.
+    /// Above 2^53, `i64 as f64` is lossy: distinct integers collapse onto the same float. A
+    /// mixed `Int`/`Float` comparison must not let that rounding manufacture a MATCH in exact
+    /// mode (`rel_tol == abs_tol == 0`) — `Int(2^53 + 1)` vs `Float(2^53)` are different values
+    /// and must DIFFER. Tolerance mode is unaffected: at magnitude 2^53 the tolerance window
+    /// dwarfs a 1-unit gap, so the same pair `MATCHes` when a positive tolerance is supplied
+    /// (the difference is computed in integer space so it stays exact, then held to the same
+    /// window). Small integers keep exact-mode integer identity too.
+    #[rstest]
+    //                              i                     float_repr          rel   abs   equal
+    #[case::collapse_exact_mode((1_i64 << 53) + 1, "9007199254740992.0", 0.0, 0.0, false)]
+    #[case::collapse_tolerated((1_i64 << 53) + 1, "9007199254740992.0", 1e-9, 0.0, true)]
+    // `i64::MAX as f64` rounds up to `2^63` (== `9223372036854775808.0`), so the boundary
+    // float sits just outside the i64 range. Exact mode must still DIFFER — the two values are
+    // one apart — even though the naive `*i as f64` cast collapses them onto the same float.
+    #[case::i64_max_boundary_exact(i64::MAX, "9223372036854775808.0", 0.0, 0.0, false)]
+    #[case::i64_max_boundary_tolerated(i64::MAX, "9223372036854775808.0", 1e-9, 0.0, true)]
+    #[case::small_int_exact_match(5, "5.0", 0.0, 0.0, true)]
+    #[case::small_int_exact_differ(5, "6.0", 0.0, 0.0, false)]
+    fn mixed_int_float_preserves_large_integer_identity(
+        #[case] i: i64,
+        #[case] float_repr: &str,
+        #[case] rel_tol: f64,
+        #[case] abs_tol: f64,
+        #[case] expect_equal: bool,
+    ) {
+        let int = ParsedValue::Int(i);
+        let float = parse_value(float_repr, None);
+        assert_eq!(values_equal(&int, &float, rel_tol, abs_tol), expect_equal, "int-first");
+        assert_eq!(values_equal(&float, &int, rel_tol, abs_tol), expect_equal, "float-first");
+    }
+
+    #[rstest]
+    #[case::int_vs_pos_infinity("Infinity")]
+    #[case::int_vs_neg_infinity("-Infinity")]
+    #[case::int_vs_nan("NaN")]
+    fn int_never_matches_non_finite_float(#[case] float_repr: &str) {
+        let int = ParsedValue::Int(1);
+        let float = parse_value(float_repr, None);
+        assert!(
+            matches!(float, ParsedValue::Float(f) if !f.is_finite()),
+            "fixture {float_repr:?} must parse to a non-finite float, got {float:?}",
+        );
+        assert!(
+            !values_equal(&int, &float, 1e-9, 1e-9),
+            "Int(1) must not MATCH non-finite float {float_repr:?}",
+        );
+        assert!(
+            !values_equal(&float, &int, 1e-9, 1e-9),
+            "non-finite float {float_repr:?} must not MATCH Int(1) (order-swapped)",
+        );
     }
 
     #[test]

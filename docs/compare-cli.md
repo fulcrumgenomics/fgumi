@@ -143,9 +143,14 @@ Compare two TSV metrics files by outer-joining their data rows on a key column
 set, so rows may legitimately appear in different order (or one side may be
 missing a row entirely -- e.g. fgumi#498's dense-vs-sparse family-size rows)
 without the comparison cascading into spurious diffs on every following line.
-Only float *representation* is tolerated (fgbio's `DecimalFormat("0.######")`
-vs fgumi's full precision); everything else -- including the row set and any
-non-key value -- is compared faithfully.
+Numeric slack is confined to *finite floats*: they are first rounded to
+`--precision` decimal places, then accepted if they agree within `--rel-tol` or
+`--abs-tol`. The defaults are sized to absorb float *representation* differences
+(fgbio's `DecimalFormat("0.######")` vs fgumi's full precision), but any finite
+difference inside that window is accepted, not just a reformatting of the same
+number. Everything else -- the row set, integer/integer pairs, and strings -- is
+compared exactly; a mixed integer/float pair is tolerance-compared but keeps the
+integer's exact identity (see [Comparison Behavior](#comparison-behavior)).
 
 ### Usage
 
@@ -181,8 +186,16 @@ fgumi compare metrics <FILE1> <FILE2> [OPTIONS]
   **outer join**: a key present in both files has its remaining columns
   compared; a key present in only one file is reported individually (e.g.
   `row 3 only in file1`) instead of cascading into every following row.
-- Within a matched key: **integers** are compared exactly, **floats** are
-  optionally rounded then compared with tolerance, **strings** are compared
+- Within a matched key: **integer-to-integer** values are compared exactly;
+  **floats** are optionally rounded then compared with tolerance; a **mixed
+  integer/float** pair (one file emits `1`, the other `1.0`) is compared with
+  the same tolerance as float/float, with two soundness carve-outs: (a) if the
+  float side is **non-finite** -- `Infinity`/`-Infinity`/`NaN`, exactly as fgbio
+  serializes them -- the pair is **not equal** rather than tolerance-matched (an
+  integer can never equal +/-inf or NaN); and (b) if the float side is itself an
+  integer, the comparison is done in **integer space**, so a large integer
+  (above 2^53, where `i64 as f64` loses precision) keeps its **exact identity**
+  instead of collapsing onto a neighbouring float. **strings** are compared
   exactly.
 - The key column(s) must **uniquely identify** each row. Every metric is emitted
   from a map or histogram keyed by its dimensions, so a key that appears on more
@@ -193,9 +206,20 @@ fgumi compare metrics <FILE1> <FILE2> [OPTIONS]
 
 ### Float Comparison
 
-Floats are considered equal if either condition is met:
+**Finite** floats are rounded to `--precision` decimal places first (`-1`
+disables rounding), then considered equal if either condition is met:
 - `|a - b| <= abs_tol`
 - `|a - b| <= rel_tol * max(|a|, |b|)`
+
+Non-finite floats bypass the tolerance formulas entirely and are compared by
+identity instead (fgbio serializes these as the literals `NaN`, `Infinity`, and
+`-Infinity`, which the parser accepts):
+- `NaN` equals `NaN` -- deliberately *unlike* IEEE 754, so that a metric which
+  is legitimately `NaN` in both files (e.g. a ratio with a zero denominator)
+  reports as equal rather than as a spurious diff.
+- An infinity equals only the **same-sign** infinity: `Infinity == Infinity` and
+  `-Infinity == -Infinity`, but `Infinity != -Infinity`.
+- A non-finite value is never equal to a finite one, at any tolerance.
 
 ### Examples
 
