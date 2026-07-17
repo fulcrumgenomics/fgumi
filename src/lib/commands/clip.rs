@@ -323,6 +323,17 @@ impl Clip {
             let template = template?;
             let mut records: Vec<RawRecord> = template.into_records();
 
+            // Upgrade existing clipping on *every* read of the template first — including
+            // secondary/supplementary alignments — matching fgbio ClipBam, which runs
+            // `upgradeAllClipping` over `template.allReads` (ClipBam.scala:123) before clipping the
+            // primary pair. Doing it per-template here (rather than per-primary inside
+            // clip_pair/clip_fragment) is what lets supplementary reads' clipping be upgraded too.
+            if self.upgrade_clipping {
+                for record in &mut records {
+                    clipper.upgrade_all_clipping_raw(record)?;
+                }
+            }
+
             // Clip the primary R1/R2 (or a lone fragment) — never positional records[0]/[1] —
             // so templates with secondary/supplementary reads (len > 2) are clipped too, matching
             // fgbio ClipBam's Template.r1/r2 handling.
@@ -393,9 +404,13 @@ impl Clip {
     /// Clips a fragment (unpaired) read.
     ///
     /// Applies clipping operations to a single fragment read, including:
-    /// 1. Upgrading existing clipping if requested
-    /// 2. Applying fixed-position 5' and 3' clipping
-    /// 3. Updating metrics if a metrics collector is provided
+    /// 1. Applying fixed-position 5' and 3' clipping
+    /// 2. Updating metrics if a metrics collector is provided
+    ///
+    /// Clipping upgrades (`--upgrade-clipping`) are *not* performed here: the caller runs a
+    /// template-wide pre-pass that upgrades clipping on every read of the template (including
+    /// secondary/supplementary alignments) before this method runs, matching fgbio `ClipBam`
+    /// (`ClipBam.scala:123`).
     ///
     /// Fragment reads are treated as R1 for the purposes of fixed-position clipping.
     ///
@@ -420,10 +435,8 @@ impl Clip {
     ) -> Result<()> {
         let prior_bases_clipped = clipped_bases_raw(record);
 
-        // Upgrade existing clipping if requested
-        if self.upgrade_clipping {
-            clipper.upgrade_all_clipping_raw(record)?;
-        }
+        // Note: clipping upgrades (`--upgrade-clipping`) are applied once per template over all
+        // reads by the caller (matching fgbio ClipBam.scala:123), not here.
 
         // Apply fixed-position clipping
         let num_five_prime = if self.read_one_five_prime > 0 {
@@ -457,11 +470,15 @@ impl Clip {
     /// Clips a pair of reads with comprehensive clipping logic.
     ///
     /// Applies multiple types of clipping to a read pair:
-    /// 1. Upgrading existing clipping if requested
-    /// 2. Fixed-position 5' and 3' clipping for each read
-    /// 3. Overlap clipping to remove duplicate coverage
-    /// 4. Mate-extension clipping to remove reads extending past mate start
-    /// 5. Updating metrics for both reads
+    /// 1. Fixed-position 5' and 3' clipping for each read
+    /// 2. Overlap clipping to remove duplicate coverage
+    /// 3. Mate-extension clipping to remove reads extending past mate start
+    /// 4. Updating metrics for both reads
+    ///
+    /// Clipping upgrades (`--upgrade-clipping`) are *not* performed here: the caller runs a
+    /// template-wide pre-pass that upgrades clipping on every read of the template (including
+    /// secondary/supplementary alignments) before this method runs, matching fgbio `ClipBam`
+    /// (`ClipBam.scala:123`).
     ///
     /// The method intelligently determines which read is R1 vs R2 based on SAM flags
     /// and applies the appropriate fixed-position clipping thresholds.
@@ -491,11 +508,8 @@ impl Clip {
         let prior_bases_clipped_r1 = clipped_bases_raw(r1);
         let prior_bases_clipped_r2 = clipped_bases_raw(r2);
 
-        // Upgrade existing clipping if requested
-        if self.upgrade_clipping {
-            clipper.upgrade_all_clipping_raw(r1)?;
-            clipper.upgrade_all_clipping_raw(r2)?;
-        }
+        // Note: clipping upgrades (`--upgrade-clipping`) are applied once per template over all
+        // reads by the caller (matching fgbio ClipBam.scala:123), not here.
 
         // Determine read types (raw flags: bit 6 = first segment, bit 7 = last segment)
         let (is_r1_first, is_r2_last) = (r1.is_first_segment(), r2.is_last_segment());
@@ -653,6 +667,16 @@ impl Clip {
                 templates_count += 1;
                 let mut records: Vec<RawRecord> = template.into_records();
 
+                // Upgrade existing clipping on *every* read of the template first — including
+                // secondary/supplementary alignments — matching fgbio ClipBam's
+                // `template.allReads.foreach(upgradeAllClipping)` (ClipBam.scala:123) before the
+                // primary pair is clipped.
+                if upgrade_clipping {
+                    for record in &mut records {
+                        clipper.upgrade_all_clipping_raw(record).map_err(io::Error::other)?;
+                    }
+                }
+
                 // Clip the primary R1/R2 (or a lone fragment) by flags, never positional
                 // records[0]/[1], so templates with secondary/supplementary reads are clipped
                 // too (matches fgbio ClipBam's Template.r1/r2 handling).
@@ -660,11 +684,6 @@ impl Clip {
                     (Some(i1), Some(i2)) => {
                         let [r1, r2] =
                             records.get_disjoint_mut([i1, i2]).expect("distinct primary indices");
-
-                        if upgrade_clipping {
-                            clipper.upgrade_all_clipping_raw(r1).map_err(io::Error::other)?;
-                            clipper.upgrade_all_clipping_raw(r2).map_err(io::Error::other)?;
-                        }
 
                         // Determine read types (raw flags)
                         let is_r1_first = r1.is_first_segment();
@@ -714,11 +733,9 @@ impl Clip {
                         fix_supplemental_mate_info(&mut records, i1, i2);
                     }
                     (Some(i1), None) => {
-                        // Fragment - apply fixed-position clipping (R1 thresholds)
+                        // Fragment - apply fixed-position clipping (R1 thresholds). Any clipping
+                        // upgrade was already applied over all template reads above.
                         let record = &mut records[i1];
-                        if upgrade_clipping {
-                            clipper.upgrade_all_clipping_raw(record).map_err(io::Error::other)?;
-                        }
                         if read_one_five_prime > 0 {
                             clipper.clip_5_prime_end_of_alignment(record, read_one_five_prime);
                         }
