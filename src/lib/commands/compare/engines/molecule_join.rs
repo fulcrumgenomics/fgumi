@@ -143,14 +143,30 @@ pub struct MoleculeJoinOutcome {
 }
 
 impl MoleculeJoinOutcome {
-    /// Returns `true` iff every matched molecule compared equivalent, no molecule was
-    /// present in only one file, no header divergence was found, and both files contained
-    /// the same number of molecules.
+    /// Returns `true` iff every molecule on both sides matched cleanly: `matched` (which
+    /// increments in [`fold_matched_pair`] only when [`compare_molecule`] returns zero
+    /// diffs for a canonical-id-matched pair) equals *both* `bam1_molecules` and
+    /// `bam2_molecules`, and no header divergence was found.
+    ///
+    /// This is deliberately keyed off the `matched` counter rather than
+    /// `diff_details.is_empty()`. `diff_details` is populated exclusively via [`push_diff`],
+    /// which caps at the caller-supplied `max_diffs` (`details.len() < max_diffs`) — with
+    /// `max_diffs == 0` (a plausible CI invocation: `--max-diffs` is a plain `usize` with no
+    /// range validator) `diff_details` is *always* empty regardless of how many real diffs
+    /// were found. A verdict keyed off `diff_details.is_empty()` would therefore collapse to
+    /// `bam1_molecules == bam2_molecules`, silently reporting EQUIVALENT for a genuine
+    /// content/membership/strand divergence between matched molecules, or for a
+    /// present-in-only-one-file residual on each side that happens to balance the counts.
+    /// `matched` is never subject to the cap — it is incremented directly in
+    /// [`fold_matched_pair`], independent of `diff_details`/`max_diffs` entirely — so this
+    /// check is sound for every `max_diffs` value, including `0`. A residual (only-in-one-
+    /// file) molecule is counted in `bam1_molecules`/`bam2_molecules` but never in `matched`,
+    /// so it correctly fails this equality too.
     #[must_use]
     pub fn is_match(&self) -> bool {
-        self.diff_details.is_empty()
+        self.matched == self.bam1_molecules
+            && self.matched == self.bam2_molecules
             && !self.header_mismatch
-            && self.bam1_molecules == self.bam2_molecules
     }
 }
 

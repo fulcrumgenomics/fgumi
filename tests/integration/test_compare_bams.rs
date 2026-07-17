@@ -1118,6 +1118,77 @@ fn molecule_join_compare_record_dropped_in_bam2_presence_differs() {
     assert!(!outcome.is_match(), "a record dropped on one side must DIFFER: {outcome:?}");
 }
 
+/// CRITICAL soundness regression: `--max-diffs 0` must not collapse `is_match()` into a
+/// bare molecule-count comparison. `push_diff` (see `engines/mod.rs`) is capped by
+/// `max_diffs`, so with `max_diffs == 0` `diff_details` is *always* empty regardless of
+/// how many real diffs were found — an `is_match()` keyed off `diff_details.is_empty()`
+/// would report EQUIVALENT for this genuine content mismatch (equal molecule counts, one
+/// matched pair's SEQ mutated) purely because the cap ate the evidence. `is_match()` must
+/// instead key off the `matched` counter, which only increments on a molecule pair
+/// `compare_molecule` found fully equivalent — independent of `max_diffs` entirely.
+#[test]
+fn molecule_join_compare_content_diff_survives_max_diffs_zero() {
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10000);
+
+    let records1 = vec![
+        mapped_record_with_mi_and_seq(b"read1", 100, "1", b"ACGTACGT"),
+        mapped_record_with_mi_and_seq(b"read2", 200, "1", b"ACGTACGT"),
+    ];
+    // Same grouping (both MI=1 on both sides, so bam1_molecules == bam2_molecules == 1),
+    // but read2's SEQ is mutated on bam2 — a real content diff that `max_diffs == 0` would
+    // hide entirely from `diff_details`.
+    let records2 = vec![
+        mapped_record_with_mi_and_seq(b"read1", 100, "1", b"ACGTACGT"),
+        mapped_record_with_mi_and_seq(b"read2", 200, "1", b"ACGTACGA"),
+    ];
+
+    let bam1 = tmp.path().join("a.bam");
+    let bam2 = tmp.path().join("b.bam");
+    write_bam(&bam1, &header, &records1);
+    write_bam(&bam2, &header, &records2);
+
+    let outcome =
+        molecule_join_compare(&bam1, &bam2, 0).expect("molecule_join_compare should succeed");
+
+    assert!(
+        outcome.diff_details.is_empty(),
+        "max_diffs == 0 must suppress diff_details entirely (this is the trap): {outcome:?}"
+    );
+    assert_eq!(outcome.bam1_molecules, outcome.bam2_molecules, "molecule counts must be equal");
+    assert_eq!(outcome.matched, 0, "the sole molecule pair must fail to match on the SEQ diff");
+    assert!(
+        !outcome.is_match(),
+        "a real content diff must DIFFER even with max_diffs == 0 and equal molecule counts \
+         (this is the CRITICAL soundness bug): {outcome:?}"
+    );
+}
+
+/// Control for the above: a fully-equivalent pair must still MATCH under `max_diffs == 0`
+/// — the cap must not turn a genuine match into a spurious DIFFER either.
+#[test]
+fn molecule_join_compare_equivalent_pair_matches_with_max_diffs_zero() {
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10000);
+
+    let records = vec![mi_record(b"read1", 100, "1"), mi_record(b"read2", 200, "1")];
+
+    let bam1 = tmp.path().join("a.bam");
+    let bam2 = tmp.path().join("b.bam");
+    write_bam(&bam1, &header, &records);
+    write_bam(&bam2, &header, &records);
+
+    let outcome =
+        molecule_join_compare(&bam1, &bam2, 0).expect("molecule_join_compare should succeed");
+
+    assert_eq!(outcome.matched, outcome.bam1_molecules);
+    assert_eq!(outcome.matched, outcome.bam2_molecules);
+    assert!(
+        outcome.is_match(),
+        "a genuinely equivalent pair must MATCH even with max_diffs == 0: {outcome:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // `--command group` end-to-end tests: wiring the streaming molecule-join engine onto
 // the real CLI preset, not just calling `molecule_join_compare` directly as the tests
@@ -1242,6 +1313,41 @@ fn test_command_group_content_diff_with_intact_grouping_differs() {
         stdout.contains("Molecules matched: 0"),
         "the sole (single-MI) molecule must fail to match on the SEQ diff, got:\n{stdout}"
     );
+}
+
+/// CRITICAL soundness regression, end to end: the same content bug as the test above, but
+/// run through the real CLI with `--max-diffs 0` (a plausible CI invocation — `--max-diffs`
+/// is an unvalidated `usize`, so `0` is accepted). `push_diff` suppresses every diff line at
+/// this cap, so a pre-fix `is_match()` keyed off `diff_details.is_empty()` would report
+/// EQUIVALENT (exit 0) for a genuine content mismatch. Must still DIFFER (nonzero exit).
+#[test]
+fn test_command_group_content_diff_differs_with_max_diffs_zero() {
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10000);
+
+    let records1 = vec![
+        mapped_record_with_mi_and_seq(b"read1", 100, "1", b"ACGTACGT"),
+        mapped_record_with_mi_and_seq(b"read2", 200, "1", b"ACGTACGT"),
+    ];
+    let records2 = vec![
+        mapped_record_with_mi_and_seq(b"read1", 100, "1", b"ACGTACGT"),
+        mapped_record_with_mi_and_seq(b"read2", 200, "1", b"ACGTACGA"),
+    ];
+
+    let bam1 = tmp.path().join("a.bam");
+    let bam2 = tmp.path().join("b.bam");
+    write_bam(&bam1, &header, &records1);
+    write_bam(&bam2, &header, &records2);
+
+    let (code, stdout, stderr) = run_compare_command(&bam1, &bam2, "group", &["--max-diffs", "0"]);
+
+    assert_ne!(
+        code,
+        Some(0),
+        "`--max-diffs 0` must not turn a real content diff into EQUIVALENT (exit 0), \
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("DIFFER"), "Expected DIFFER in output, got:\n{stdout}");
 }
 
 /// Finding A (Task 8), end to end: see the "Missing MI tag behavior" section above (around
