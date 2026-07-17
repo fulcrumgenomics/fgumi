@@ -208,6 +208,45 @@ enum QualityEncoding {
     Illumina, // Phred+64 (Illumina 1.3-1.7)
 }
 
+/// Fixed-size summary of the pooled quality bytes scanned during encoding
+/// detection.
+///
+/// Detection only needs the global min/max quality byte and whether any
+/// (non-empty) quality was seen, so accumulating this while scanning lets the
+/// sampler avoid retaining every sampled quality string — memory stays O(1) in
+/// the number of inputs, sample size, and read length rather than
+/// `inputs × sample × read_length`.
+#[derive(Debug, Clone, Copy)]
+struct QualDetectionStats {
+    /// Minimum quality byte observed across all non-empty sampled reads.
+    min_qual: u8,
+    /// Maximum quality byte observed across all non-empty sampled reads.
+    max_qual: u8,
+    /// Total number of quality bytes observed (0 if every sampled read was empty).
+    total_bases: u64,
+    /// Number of records sampled (including empty-quality reads); 0 means no
+    /// records were available at all.
+    num_records: u64,
+}
+
+impl QualDetectionStats {
+    fn new() -> Self {
+        Self { min_qual: u8::MAX, max_qual: u8::MIN, total_bases: 0, num_records: 0 }
+    }
+
+    /// Fold one sampled read's quality bytes into the running summary. Empty
+    /// qualities still count as a record (so detection can tell "no records" from
+    /// "records with empty qualities") but contribute no min/max/base statistics.
+    fn observe(&mut self, qual: &[u8]) {
+        self.num_records += 1;
+        for &q in qual {
+            self.min_qual = self.min_qual.min(q);
+            self.max_qual = self.max_qual.max(q);
+            self.total_bases += 1;
+        }
+    }
+}
+
 impl QualityEncoding {
     /// Convert quality scores to standard numeric format (Phred+33)
     fn to_standard_numeric(self, quals: &[u8]) -> Vec<u8> {
@@ -217,33 +256,24 @@ impl QualityEncoding {
         }
     }
 
-    /// Detect encoding from sample records using robust heuristics
+    /// Decide the encoding from pooled quality statistics using robust heuristics.
     ///
     /// This implements a more robust detection algorithm that:
     /// - Checks for quality scores in the Illumina 1.3-1.7 range (64-126)
     /// - Checks for quality scores in the Sanger/Illumina 1.8+ range (33-126)
     /// - Handles edge cases like empty reads or very short reads
     /// - Provides informative error messages for invalid encodings
-    fn detect(records: &[Vec<u8>]) -> Result<Self> {
-        if records.is_empty() {
+    ///
+    /// Takes pre-accumulated [`QualDetectionStats`] rather than the raw sampled
+    /// quality strings so the sampler can reduce every head to a fixed-size
+    /// (min, max, counts) summary instead of retaining `inputs × sample × read`
+    /// bytes in memory (see [`sample_detection_quals`]).
+    fn from_stats(stats: &QualDetectionStats) -> Result<Self> {
+        if stats.num_records == 0 {
             bail!("Cannot detect quality encoding: no records provided");
         }
 
-        let mut min_qual = u8::MAX;
-        let mut max_qual = u8::MIN;
-        let mut total_bases = 0;
-
-        // Collect statistics from all quality scores
-        for qual in records {
-            if qual.is_empty() {
-                continue; // Skip empty reads
-            }
-            for &q in qual {
-                min_qual = min_qual.min(q);
-                max_qual = max_qual.max(q);
-                total_bases += 1;
-            }
-        }
+        let QualDetectionStats { min_qual, max_qual, total_bases, .. } = *stats;
 
         // If all reads were empty, we can't detect encoding but we'll default to Standard
         if total_bases == 0 {
@@ -286,6 +316,21 @@ impl QualityEncoding {
             // Default to Phred+33 as it's more common and these are reasonable quality scores
             Ok(QualityEncoding::Standard)
         }
+    }
+
+    /// Test-only convenience: decide the encoding directly from raw sampled
+    /// quality strings, folding them into [`QualDetectionStats`] first. Production
+    /// code streams the stats via [`sample_detection_quals`] and calls
+    /// [`Self::from_stats`] instead of materializing this slice; this wrapper lets
+    /// the boundary-condition tests keep exercising the decision logic from
+    /// hand-crafted quality vectors.
+    #[cfg(test)]
+    fn detect(records: &[Vec<u8>]) -> Result<Self> {
+        let mut stats = QualDetectionStats::new();
+        for qual in records {
+            stats.observe(qual);
+        }
+        Self::from_stats(&stats)
     }
 }
 
@@ -1343,6 +1388,39 @@ fn make_raw_records_static(
     Ok(ExtractedBatch { data, num_records: num_templates as u64 })
 }
 
+/// Pool quality strings for encoding detection across the first
+/// [`QUALITY_DETECTION_SAMPLE_SIZE`] records of **every** input FASTQ.
+///
+/// fgbio's `FastqToBam` detects the encoding from `heads.transpose.flatten` — the
+/// pooled heads of all sources — so that a non-template first file (e.g. an
+/// all-high-quality index read) cannot skew detection toward the wrong encoding
+/// and shift every template base quality by ~31 (EXT3-01). Sampling only
+/// `inputs[0]` (the previous behavior) did exactly that: a Phred+64-looking first
+/// file forced Illumina detection even when the template reads in `inputs[1..]`
+/// were Phred+33.
+///
+/// A fresh reader is opened per input purely for sampling, so the caller's main
+/// readers are not consumed. Sampling is always synchronous — a bounded head-scan
+/// of at most [`QUALITY_DETECTION_SAMPLE_SIZE`] records gains nothing from the
+/// async reader (which the main extraction still uses per `--async-reader`).
+fn sample_detection_quals(inputs: &[PathBuf]) -> Result<QualDetectionStats> {
+    let mut stats = QualDetectionStats::new();
+    for input in inputs {
+        let mut reader =
+            SimdFastqReader::with_capacity(open_fastq_reader(input, 1, false)?, BUFFER_SIZE);
+        for _ in 0..QUALITY_DETECTION_SAMPLE_SIZE {
+            match reader.next() {
+                // Fold each sampled read into the running summary and drop it —
+                // no per-read quality string is retained.
+                Some(Ok(rec)) => stats.observe(&rec.quality),
+                Some(Err(e)) => return Err(e.into()),
+                None => break,
+            }
+        }
+    }
+    Ok(stats)
+}
+
 impl Command for Extract {
     fn execute(&self, command_line: &str) -> Result<()> {
         // Validate inputs
@@ -1351,22 +1429,10 @@ impl Command for Extract {
         let timer = OperationTimer::new("Extracting UMIs");
         let read_structures = self.get_read_structures()?;
 
-        // Detect quality encoding from first 400 records
-        // Use a separate reader for sampling to avoid consuming records from the main reader
-        let mut sample_quals = Vec::new();
-        let mut temp_reader = SimdFastqReader::with_capacity(
-            open_fastq_reader(&self.inputs[0], 1, self.async_reader)?,
-            BUFFER_SIZE,
-        );
-        for _i in 0..QUALITY_DETECTION_SAMPLE_SIZE {
-            match temp_reader.next() {
-                Some(Ok(rec)) => sample_quals.push(rec.quality),
-                Some(Err(e)) => return Err(e.into()),
-                None => break,
-            }
-        }
-
-        let encoding = QualityEncoding::detect(&sample_quals)?;
+        // Detect quality encoding from the pooled heads of ALL input FASTQs
+        // (uses a separate reader per input so the main readers are not consumed).
+        let detection_stats = sample_detection_quals(&self.inputs)?;
+        let encoding = QualityEncoding::from_stats(&detection_stats)?;
 
         // Create header with @PG record
         let header = self.create_header(command_line)?;
@@ -3411,6 +3477,138 @@ mod tests {
     // ========================================================================
     // Quality Encoding Detection Tests
     // ========================================================================
+
+    /// EXT3-01: encoding detection must pool the heads of ALL input FASTQs, not
+    /// just `inputs[0]`. A non-template first file whose quality range alone
+    /// implies Phred+64 (e.g. an all-high-quality index read) must not force
+    /// Illumina detection when the template reads in `inputs[1..]` are Phred+33 —
+    /// that would shift every template base quality by ~31. Mirrors fgbio
+    /// `FastqToBam`, which detects from `heads.transpose.flatten` across all
+    /// sources.
+    #[test]
+    fn sample_detection_quals_pools_all_inputs_not_just_first() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        // R1: all-high-quality ('h' = 104). On its own, min>=64 & max>=75 → Illumina.
+        let r1 = create_fastq(
+            &tmp,
+            "R1.fq",
+            &[("read0", "ACGTACGT", "hhhhhhhh"), ("read1", "ACGTACGT", "hhhhhhhh")],
+        );
+        // R2: low-quality Phred+33 ('(' = 40 = Q7). Pooled with R1 → min 40 < 59 → Standard.
+        let r2 = create_fastq(
+            &tmp,
+            "R2.fq",
+            &[("read0", "ACGTACGT", "(((((((("), ("read1", "ACGTACGT", "((((((((")],
+        );
+
+        // Sampling only the first input mis-detects Illumina (the EXT3-01 trap).
+        let first_only = sample_detection_quals(std::slice::from_ref(&r1))
+            .expect("sampling first input should succeed");
+        assert_eq!(
+            QualityEncoding::from_stats(&first_only).expect("detect should succeed"),
+            QualityEncoding::Illumina,
+            "the first file alone looks like Phred+64 — this is exactly the trap"
+        );
+
+        // Pooling both inputs detects Phred+33 (Standard), matching fgbio.
+        let pooled = sample_detection_quals(&[r1, r2]).expect("sampling all inputs should succeed");
+        assert_eq!(
+            QualityEncoding::from_stats(&pooled).expect("detect should succeed"),
+            QualityEncoding::Standard,
+            "pooling the low-quality template read must recover Phred+33"
+        );
+    }
+
+    /// A legitimately-empty FASTQ among the pooled inputs must contribute nothing
+    /// (the per-input read loop hits `None` immediately) WITHOUT aborting detection
+    /// over its non-empty siblings — the multi-input pooling loop has to be robust
+    /// to an empty input file, with the empty one listed first so a naive
+    /// `break`-the-whole-scan bug would surface as a mis-detection.
+    #[test]
+    fn sample_detection_quals_skips_empty_input_and_pools_the_rest() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        // A genuinely empty FASTQ (no records), listed first.
+        let empty = create_fastq(&tmp, "empty.fq", &[]);
+        // A non-empty low-quality Phred+33 sibling ('(' = 40 = Q7).
+        let low = create_fastq(
+            &tmp,
+            "low.fq",
+            &[("read0", "ACGTACGT", "(((((((("), ("read1", "ACGTACGT", "((((((((")],
+        );
+
+        let pooled =
+            sample_detection_quals(&[empty, low]).expect("sampling should skip the empty input");
+        assert_eq!(
+            QualityEncoding::from_stats(&pooled).expect("detect should succeed"),
+            QualityEncoding::Standard,
+            "an empty pooled input must not abort detection over its non-empty siblings"
+        );
+    }
+
+    /// EXT3-01 (end-to-end): `Extract::execute` must apply the POOLED encoding
+    /// detection to the emitted BAM quality scores, not just decide it in
+    /// isolation. A high-quality first file (looks Phred+64 alone) pooled with a
+    /// low-quality Phred+33 second file must resolve to Standard, so the output
+    /// qualities are the raw bytes minus 33 — NOT minus 64 (which mis-detected
+    /// Illumina would apply, shifting every base by ~31 and saturating the
+    /// low-quality read to 0). Exercises the changed
+    /// `sample_detection_quals`/`from_stats` call site through the real command.
+    #[test]
+    fn extract_execute_applies_pooled_standard_encoding_to_output_quals() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        // R1 all-high-quality 'h' (104): min>=64 & max>=75 → Illumina *if judged alone*.
+        let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "ACGTACGT", "hhhhhhhh")]);
+        // R2 low-quality Phred+33 '(' (40 = Q7): pooling pulls min to 40 (<59) → Standard.
+        let r2 = create_fastq(&tmp, "r2.fq", &[("q1", "ACGTACGT", "((((((((")]);
+        let output = tmp.path().join("output.bam");
+
+        let extract = Extract {
+            inputs: vec![r1, r2],
+            output: output.clone(),
+            read_structures: vec![],
+            store_umi_quals: false,
+            store_cell_quals: false,
+            store_sample_barcode_qualities: false,
+            extract_umis_from_read_names: false,
+            annotate_read_names: false,
+            single_tag: None,
+            clipping_attribute: None,
+            read_group_id: "A".to_string(),
+            sample: "s".to_string(),
+            library: "l".to_string(),
+            barcode: None,
+            platform: "illumina".to_string(),
+            platform_unit: None,
+            platform_model: None,
+            sequencing_center: None,
+            predicted_insert_size: None,
+            description: None,
+            comment: vec![],
+            run_date: None,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
+        };
+
+        extract.execute("test").expect("execute should succeed");
+
+        let recs = read_bam_records(&output);
+        assert_eq!(recs.len(), 2, "one R1 + one R2 record");
+        // Standard (Phred+33) decode: 'h'(104)-33 = 71, '('(40)-33 = 7. A
+        // mis-detected Illumina (Phred+64) would instead yield 40 and 0 (saturated).
+        assert_eq!(
+            recs[0].quality_scores().as_ref(),
+            &[71u8; 8],
+            "R1 quals must be Phred+33-decoded (pooled Standard), not Phred+64"
+        );
+        assert_eq!(
+            recs[1].quality_scores().as_ref(),
+            &[7u8; 8],
+            "R2 low-quality read must decode to Q7 under pooled Standard, not saturate to 0"
+        );
+    }
 
     #[test]
     fn test_quality_encoding_detection_phred33() {
