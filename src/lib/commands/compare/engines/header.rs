@@ -74,20 +74,26 @@ pub fn compare_headers(h1: &Header, h2: &Header) -> Option<Vec<String>> {
 /// Returns `Ok(Some(order))` when both headers declare the same *determinable*
 /// [`SortOrder`] (see [`sort_order_from_header`] — this is the case for `sort`/`group`
 /// output and any coordinate/queryname-sorted BAM). Returns `Ok(None)` when **neither**
-/// header's sort order is determinable but the two headers' raw `@HD SO`/`GO` tags still
-/// agree byte-for-byte: this is the legitimate case for pre-sort pipeline stages
-/// (`extract`/`fastq`/`zipper`/unmapped `consensus` output all declare bare
-/// `SO:unsorted GO:query` with no `SS` — genuinely unordered data, not a recognized sort
-/// order, but still a valid same-format pair to content-compare). A human-readable error
-/// (for a hard program exit) is returned for any genuine incompatibility.
+/// header's raw `@HD SO` claims a recognized orderable order (`coordinate`/`queryname`) —
+/// i.e. both are genuinely orderless (absent `SO`, or `SO:unsorted`) — and the two headers'
+/// raw `@HD SO`/`GO` tags still agree byte-for-byte: this is the legitimate case for
+/// pre-sort pipeline stages (`extract`/`fastq`/`zipper`/unmapped `consensus` output all
+/// declare bare `SO:unsorted GO:query` with no `SS` — genuinely unordered data, not a
+/// recognized sort order, but still a valid same-format pair to content-compare). A
+/// human-readable error (for a hard program exit) is returned for any genuine
+/// incompatibility.
 ///
 /// # Errors
 ///
 /// Returns an error if the two headers' `@SQ` dictionaries or `@RG` read groups differ; if
 /// exactly one header's sort order is determinable and the other's is not (comparing a
 /// sorted BAM against an unsorted one is never valid); if both headers' sort orders are
-/// determinable but differ; or if neither is determinable and the raw `@HD SO`/`GO` tags
-/// also disagree.
+/// determinable but differ; if neither is determinable but one header's raw `@HD SO` still
+/// claims a recognized orderable order (`coordinate`/`queryname`) that failed to resolve
+/// (e.g. an unrecognized `SS` sub-sort) — a header that *claims* verifiable order must not
+/// be silently treated as unverifiable-but-fine; or if neither header's sort order is
+/// determinable, neither claims an orderable `SO`, and the raw `@HD SO`/`GO` tags also
+/// disagree.
 ///
 /// Called from `CompareBams::execute` before any mode/preset dispatch, so an incompatible
 /// pair of inputs always hard-exits here rather than cascading into per-record diffs.
@@ -99,7 +105,32 @@ pub(crate) fn require_compatible_headers(h1: &Header, h2: &Header) -> Result<Opt
             ensure!(a == b, "declared sort orders differ: {a:?} vs {b:?}");
             Ok(Some(a))
         }
-        (Err(_), Err(_)) => {
+        (Err(e1), Err(e2)) => {
+            // `sort_order_from_header` errors for two very different reasons, and only one
+            // of them is benign:
+            //
+            //   1. Genuinely orderless input (e.g. `extract`/`fastq`/`zipper` output: bare
+            //      `SO:unsorted GO:query` with no `SS`, or no `@HD SO` at all). Nothing was
+            //      *claimed* that this engine failed to verify, so falling back to a raw
+            //      `SO`/`GO` byte comparison is a legitimate pass.
+            //   2. A header whose raw `SO` claims a recognized orderable order
+            //      (`coordinate` or `queryname`) but whose `SS` sub-sort this engine
+            //      doesn't recognize/support (e.g. `SO:coordinate SS:coordinate:foo`).
+            //      That is a hard incompatibility, not an unverifiable-but-fine case: the
+            //      header is asserting an order this engine cannot confirm, so silently
+            //      falling through to `Ok(None)` would let the default/content-compare
+            //      path skip order verification entirely for a BAM that claims to be
+            //      sorted.
+            //
+            // Distinguish the two by reading the raw `@HD SO` tag directly (bypassing
+            // `sort_order_from_header`'s SS validation) rather than by matching on the
+            // error text, so this stays correct if the error messages change.
+            if hd_so_claims_orderable(h1) {
+                return Err(e1.context("reading BAM1 declared sort order"));
+            }
+            if hd_so_claims_orderable(h2) {
+                return Err(e2.context("reading BAM2 declared sort order"));
+            }
             // Neither header declares a sort order this engine recognizes (e.g. `extract`/
             // `fastq`/`zipper` output: bare `SO:unsorted GO:query` with no `SS`). That's a
             // legitimate pre-sort format, not an error, as long as the two headers still
@@ -114,6 +145,16 @@ pub(crate) fn require_compatible_headers(h1: &Header, h2: &Header) -> Result<Opt
         (Err(e), Ok(_)) => Err(e.context("reading BAM1 declared sort order")),
         (Ok(_), Err(e)) => Err(e.context("reading BAM2 declared sort order")),
     }
+}
+
+/// Reads the raw (unvalidated) `@HD SO` tag and reports whether it names a sort order this
+/// engine recognizes as orderable (`coordinate` or `queryname`) — regardless of whether
+/// [`sort_order_from_header`] was able to fully determine the [`SortOrder`] (e.g. because of
+/// an unrecognized `SS` sub-sort). Used by [`require_compatible_headers`] to distinguish a
+/// header that claims an order this engine can't verify (hard incompatibility) from a
+/// genuinely orderless header (benign).
+fn hd_so_claims_orderable(h: &Header) -> bool {
+    matches!(hd_tag_value(h, *header_tag::SORT_ORDER.as_ref()), Some(b"coordinate" | b"queryname"))
 }
 
 /// Fold an optional [`compare_headers`] result into an engine's `header_mismatch` flag and
@@ -662,5 +703,45 @@ mod tests {
         let b = header_with_sq("chr1", 2000);
         let err = require_compatible_headers(&a, &b).expect_err("@SQ mismatch must be rejected");
         assert!(format!("{err}").contains("@SQ"), "got: {err}");
+    }
+
+    /// A header claiming `SO:coordinate` with an unrecognized `SS` sub-sort is a genuine
+    /// incompatibility, not a benign unverifiable-order pass-through: `SO:coordinate` is a
+    /// recognized orderable order this engine failed to verify (because of the bad `SS`),
+    /// so `require_compatible_headers` must hard-reject rather than fall back to the
+    /// `(Err, Err)` orderless `SO`/`GO` comparison and return `Ok(None)`.
+    #[test]
+    fn require_compatible_headers_rejects_coordinate_with_unrecognized_subsort() {
+        let h1 = header_with_hd(Some("coordinate"), None, Some("coordinate:foo"));
+        let h2 = header_with_hd(Some("coordinate"), None, Some("coordinate:foo"));
+        let err = require_compatible_headers(&h1, &h2).expect_err(
+            "SO:coordinate with unrecognized SS must be rejected, not silently unverified",
+        );
+        assert!(format!("{err}").contains("declared sort order"), "got: {err}");
+    }
+
+    /// Same gap, closed for the pre-existing `SO:queryname` arm: an unrecognized `SS`
+    /// sub-sort under `SO:queryname` must also hard-reject rather than fall through to
+    /// `Ok(None)`.
+    #[test]
+    fn require_compatible_headers_rejects_queryname_with_unrecognized_subsort() {
+        let h1 = header_with_hd(Some("queryname"), None, Some("queryname:weird"));
+        let h2 = header_with_hd(Some("queryname"), None, Some("queryname:weird"));
+        let err = require_compatible_headers(&h1, &h2).expect_err(
+            "SO:queryname with unrecognized SS must be rejected, not silently unverified",
+        );
+        assert!(format!("{err}").contains("declared sort order"), "got: {err}");
+    }
+
+    /// A well-formed `SO:coordinate` with no `SS` on both sides is unaffected by the
+    /// `(Err, Err)`-arm fix above: it takes the `(Ok, Ok)` branch entirely and must still
+    /// resolve to `Ok(Some(SortOrder::Coordinate))`.
+    #[test]
+    fn require_compatible_headers_accepts_plain_coordinate_with_no_ss() {
+        let h1 = header_with_hd(Some("coordinate"), None, None);
+        let h2 = header_with_hd(Some("coordinate"), None, None);
+        let order = require_compatible_headers(&h1, &h2)
+            .expect("plain SO:coordinate with no SS must be accepted");
+        assert_eq!(order, Some(SortOrder::Coordinate));
     }
 }
