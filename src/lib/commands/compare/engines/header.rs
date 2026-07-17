@@ -41,8 +41,12 @@
 
 use std::collections::BTreeMap;
 
+use anyhow::{Context, Result, ensure};
+use fgumi_sort::SortOrder;
 use noodles::sam::Header;
 use noodles::sam::header::record::value::map::header::tag as header_tag;
+
+use super::sort_verify::sort_order_from_header;
 
 /// Compares two BAM headers, returning human-readable diff strings for every genuine
 /// divergence (see the module docs for exactly which fields are compared vs. normalized).
@@ -56,6 +60,30 @@ pub fn compare_headers(h1: &Header, h2: &Header) -> Option<Vec<String>> {
     diffs.extend(compare_sq(h1, h2));
     diffs.extend(compare_rg(h1, h2));
     if diffs.is_empty() { None } else { Some(diffs) }
+}
+
+/// Hard precondition for any BAM comparison: the two inputs must agree on their reference
+/// dictionary (`@SQ`), read groups (`@RG`), and *semantic* sort order (`@HD`, bare vs
+/// SO-prefixed `SS` normalized). `@PG`/`@CO` are per-invocation metadata and never compared.
+///
+/// Returns the shared `SortOrder` on success; a human-readable error (for a hard program exit)
+/// on any incompatibility.
+///
+/// # Errors
+///
+/// Returns an error if the two headers' `@SQ` dictionaries or `@RG` read groups differ, if
+/// either header's declared sort order cannot be determined (see
+/// [`sort_order_from_header`]), or if the two headers' declared sort orders differ.
+// Not yet called from the CLI — wired in as a hard-exit precondition in a follow-up task.
+// Only exercised by tests today.
+#[allow(dead_code)]
+pub(crate) fn require_compatible_headers(h1: &Header, h2: &Header) -> Result<SortOrder> {
+    ensure!(compare_sq(h1, h2).is_empty(), "@SQ reference dictionaries differ between inputs");
+    ensure!(compare_rg(h1, h2).is_empty(), "@RG read groups differ between inputs");
+    let a = sort_order_from_header(h1).context("reading BAM1 declared sort order")?;
+    let b = sort_order_from_header(h2).context("reading BAM2 declared sort order")?;
+    ensure!(a == b, "declared sort orders differ: {a:?} vs {b:?}");
+    Ok(a)
 }
 
 /// Fold an optional [`compare_headers`] result into an engine's `header_mismatch` flag and
@@ -239,6 +267,7 @@ fn compare_rg(h1: &Header, h2: &Header) -> Vec<String> {
 mod tests {
     use super::*;
     use bstr::BString;
+    use fgumi_sort::SortOrder;
     use noodles::sam::header::record::value::Map;
     use noodles::sam::header::record::value::map::header::tag as hd_tag;
     use noodles::sam::header::record::value::map::{
@@ -264,6 +293,19 @@ mod tests {
         if let Some(go) = go {
             hd.other_fields_mut().insert(hd_tag::GROUP_ORDER, BString::from(go));
         }
+        if let Some(ss) = ss {
+            hd.other_fields_mut().insert(hd_tag::SUBSORT_ORDER, BString::from(ss));
+        }
+        let seq = Map::<ReferenceSequence>::new(NonZeroUsize::new(1000).expect("non-zero"));
+        Header::builder().set_header(hd).add_reference_sequence(BString::from("chr1"), seq).build()
+    }
+
+    /// Header advertising `SO:unsorted GO:query` with the given `SS` value verbatim
+    /// (used to exercise the bare-vs-prefixed template-coordinate SS spellings).
+    fn header_tc_unsorted_query(ss: Option<&str>) -> Header {
+        let mut hd = Map::<HeaderRecord>::default();
+        hd.other_fields_mut().insert(hd_tag::SORT_ORDER, BString::from("unsorted"));
+        hd.other_fields_mut().insert(hd_tag::GROUP_ORDER, BString::from("query"));
         if let Some(ss) = ss {
             hd.other_fields_mut().insert(hd_tag::SUBSORT_ORDER, BString::from(ss));
         }
@@ -441,5 +483,35 @@ mod tests {
         let h1 = Header::builder().add_comment(BString::from("built by fgumi")).build();
         let h2 = Header::builder().add_comment(BString::from("built by fgbio")).build();
         assert!(compare_headers(&h1, &h2).is_none(), "@CO must be normalized, not compared");
+    }
+
+    /// fgbio writes `SS:unsorted:template-coordinate`; fgumi writes bare
+    /// `SS:template-coordinate`. Both denote template-coordinate — the gate must accept them.
+    #[test]
+    fn require_compatible_headers_accepts_fgumi_vs_fgbio_template_coordinate_ss_spelling() {
+        let fgumi = header_tc_unsorted_query(Some("template-coordinate"));
+        let fgbio = header_tc_unsorted_query(Some("unsorted:template-coordinate"));
+        let so = require_compatible_headers(&fgumi, &fgbio)
+            .expect("bare vs SO-prefixed SS must be the same order");
+        assert_eq!(so, SortOrder::TemplateCoordinate);
+    }
+
+    /// A genuine sort-order divergence is a hard incompatibility.
+    #[test]
+    fn require_compatible_headers_rejects_different_sort_orders() {
+        let coord = header_with_hd(Some("coordinate"), None, None);
+        let qname = header_with_hd(Some("queryname"), None, None);
+        let err = require_compatible_headers(&coord, &qname)
+            .expect_err("coordinate vs queryname must be rejected");
+        assert!(format!("{err}").contains("sort orders differ"), "got: {err}");
+    }
+
+    /// A `@SQ` dictionary divergence is a hard incompatibility (not a record-level diff).
+    #[test]
+    fn require_compatible_headers_rejects_sq_dictionary_mismatch() {
+        let a = header_with_sq("chr1", 1000);
+        let b = header_with_sq("chr1", 2000);
+        let err = require_compatible_headers(&a, &b).expect_err("@SQ mismatch must be rejected");
+        assert!(format!("{err}").contains("@SQ"), "got: {err}");
     }
 }

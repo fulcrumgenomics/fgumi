@@ -141,7 +141,10 @@ fn ss_subsort<'a>(ss: &'a str, expected_so: &str) -> std::result::Result<&'a str
     }
 }
 
-pub(crate) fn detect_sort_order(header: &Header) -> Result<SortOrder> {
+/// Map a BAM header's `@HD` `SO`/`GO`/`SS` tags to the single `SortOrder` enum value they
+/// denote, normalizing fgbio's `unsorted:`-prefixed `SS` and fgumi's bare `SS` to the same
+/// variant. This is the fgbio↔fgumi special-case builder.
+pub(crate) fn sort_order_from_header(header: &Header) -> Result<SortOrder> {
     let hd = header
         .header()
         .ok_or_else(|| anyhow!("BAM header has no @HD line; cannot verify sort order"))?;
@@ -186,6 +189,11 @@ pub(crate) fn detect_sort_order(header: &Header) -> Result<SortOrder> {
         ),
         None => bail!("BAM header has no @HD SO tag; cannot verify sort order"),
     }
+}
+
+/// Back-compat alias for existing internal callers.
+pub(crate) fn detect_sort_order(header: &Header) -> Result<SortOrder> {
+    sort_order_from_header(header)
 }
 
 /// Open a fresh raw-byte record reader over `path`, positioned just past the header, via
