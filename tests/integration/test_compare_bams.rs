@@ -2236,31 +2236,75 @@ fn molecule_join_flags_molecule_only_in_bam2() {
     assert!(out.diff_details.iter().any(|d| d.contains("only in bam2")), "{:?}", out.diff_details);
 }
 
-/// Documents the accepted `RecordKey`-collision residual (`record_key.rs:20-24`): `RecordKey`
-/// is collision-resistant, not collision-free — for a primary record it reduces to
+/// Deterministic residual diagnostics: the EOF residual drain used to iterate
+/// `pending1`/`pending2` (both `AHashMap`) via `.drain()`, so which residual canonical ids
+/// got reported (once the count exceeded `max_diffs`) and their relative order varied
+/// across runs with the hash map's iteration order. bam1 has five residual-only molecules
+/// (no counterpart in bam2) with canonical ids that sort very differently from their
+/// insertion order; with `max_diffs` capping the reported residuals to 3, the residual
+/// diagnostics must consistently report the *lexicographically first* three ids, in sorted
+/// order, run after run.
+#[test]
+fn molecule_join_residual_diagnostics_are_deterministic_and_sorted() {
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10000);
+
+    // Insertion order deliberately not sorted, so a hash-order-dependent drain would
+    // report a different subset/order than the lexicographically-sorted one.
+    let canon_ids = ["zebra", "mango", "apple", "banana", "cherry"];
+    let bam1_records: Vec<RawRecord> = canon_ids
+        .iter()
+        .enumerate()
+        .map(|(i, name)| mi_record(name.as_bytes(), 100, &i.to_string()))
+        .collect();
+
+    let bam1 = tmp.path().join("residuals1.bam");
+    let bam2 = tmp.path().join("residuals2.bam");
+    write_bam(&bam1, &header, &bam1_records);
+    write_bam(&bam2, &header, &[]);
+
+    let max_diffs = 3;
+    for _ in 0..5 {
+        let out = molecule_join_compare(&bam1, &bam2, max_diffs)
+            .expect("molecule_join_compare should succeed");
+        assert!(!out.is_match());
+        assert_eq!(
+            out.diff_details,
+            vec![
+                "molecule apple only in bam1".to_string(),
+                "molecule banana only in bam1".to_string(),
+                "molecule cherry only in bam1".to_string(),
+            ],
+            "residual diagnostics must be sorted and deterministic across runs: {:?}",
+            out.diff_details
+        );
+    }
+}
+
+/// Regression guard for the multiset-membership fix: `RecordKey` is collision-resistant,
+/// not collision-free (`record_key.rs:20-24`) — for a primary record it reduces to
 /// `(name, segment)`, with no locus discriminator, so two records that share a name and
-/// segment but differ in position/content collapse to one entry in `index_by_key`'s
-/// `BTreeMap` (the later one, in file order, wins). This is a malformed molecule (`group`
-/// should never actually emit two same-name/same-segment primaries in one molecule), but
-/// when it happens, `compare_molecule` silently only ever "sees" the winner.
+/// segment but differ in position/content share one `RecordKey`. `index_by_key` used to
+/// build a `RecordKey -> &RawRecord` `BTreeMap` (last-wins on a collision), so two records
+/// sharing a key inside one molecule silently collapsed to one entry — a genuine 3-vs-2
+/// physical-record multiplicity difference reported MATCH. `index_by_key` now maps each
+/// `RecordKey` to *all* its member records (a multiset), and `compare_molecule` compares
+/// per-key multiplicity, so this same fixture must now DIFFER.
 ///
 /// bam1's molecule holds THREE physical records: `r1`, plus two same-name/same-segment `dup`
 /// records at different positions (200 and 300) that collide to one `RecordKey`. bam2's
 /// molecule holds only TWO: `r1` and a `dup` matching the position (300) of whichever bam1
-/// record wins the collapse (the later one in file order). The observed verdict is MATCH —
-/// bam1's second physical `dup`@200 record vanishes from the comparison entirely, silently
-/// hiding a real difference in record count between the two files. This test locks in that
-/// *actual* observed behavior (not a should-be) so a future change to the collision
-/// resolution order is a deliberate, visible decision rather than a silent behavior change.
+/// record used to win the `BTreeMap` collapse.
 #[test]
-fn molecule_join_duplicate_record_key_within_a_molecule_collapses_silently() {
+fn molecule_join_duplicate_record_key_within_a_molecule_now_differs() {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
 
     // bam1: r1, plus two colliding same-name/same-segment "dup" records (pos 200 then 300).
     let bam1_records =
         vec![mi_record(b"r1", 100, "5"), mi_record(b"dup", 200, "5"), mi_record(b"dup", 300, "5")];
-    // bam2: r1, plus only the "dup" record matching the collapse winner (pos 300).
+    // bam2: r1, plus only one "dup" record (pos 300) -> a 2-vs-1 multiplicity difference
+    // for the "dup" RecordKey.
     let bam2_records = vec![mi_record(b"r1", 100, "9"), mi_record(b"dup", 300, "9")];
 
     let bam1 = tmp.path().join("dup_key1.bam");
@@ -2270,13 +2314,15 @@ fn molecule_join_duplicate_record_key_within_a_molecule_collapses_silently() {
 
     let out =
         molecule_join_compare(&bam1, &bam2, 10).expect("molecule_join_compare should succeed");
-    // OBSERVED (not desired) verdict: MATCH. bam1's "dup"@200 record silently vanishes from
-    // the comparison, so a genuine 3-vs-2 physical-record-count difference is not reported.
     assert!(
-        out.is_match(),
-        "documents the RecordKey-collision residual: bam1's colliding \"dup\"@200 record is \
-         silently dropped by index_by_key's BTreeMap collapse, so this (malformed) case \
-         currently reports MATCH despite bam1 having one more physical record than bam2: {out:?}"
+        !out.is_match(),
+        "multiset membership must catch the 2-vs-1 \"dup\" RecordKey multiplicity \
+         difference, not silently collapse it to a MATCH: {out:?}"
+    );
+    assert!(
+        out.diff_details.iter().any(|d| d.contains("dup") && d.contains("multiplicity")),
+        "expected a multiplicity diff naming the colliding \"dup\" key: {:?}",
+        out.diff_details
     );
 }
 
