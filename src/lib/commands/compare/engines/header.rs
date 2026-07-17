@@ -103,6 +103,13 @@ pub(crate) fn require_compatible_headers(h1: &Header, h2: &Header) -> Result<Opt
     match (sort_order_from_header(h1), sort_order_from_header(h2)) {
         (Ok(a), Ok(b)) => {
             ensure!(a == b, "declared sort orders differ: {a:?} vs {b:?}");
+            // A determinable `SortOrder` is derived from `SO` (plus `SS` for the
+            // queryname-comparator variant) alone; it never consults `GO`. Two headers can
+            // therefore agree on `SortOrder` while declaring genuinely different `@HD GO`
+            // tags, so this arm must apply the same `compare_hd` gate the `(Err, Err)`
+            // orderless fallback below already applies, rather than treating `SortOrder`
+            // equality as sufficient on its own.
+            ensure!(compare_hd(h1, h2).is_empty(), "@HD SO/GO tags differ between inputs");
             Ok(Some(a))
         }
         (Err(e1), Err(e2)) => {
@@ -743,5 +750,23 @@ mod tests {
         let order = require_compatible_headers(&h1, &h2)
             .expect("plain SO:coordinate with no SS must be accepted");
         assert_eq!(order, Some(SortOrder::Coordinate));
+    }
+
+    /// The `(Ok, Ok)` arm (both headers' sort order is determinable) must also enforce
+    /// `@HD` `GO` equality, not just `SortOrder` equality: two headers can agree on
+    /// `SortOrder::Coordinate` (`sort_order_from_header` does not consult `GO`) while
+    /// declaring genuinely different `@HD GO` tags (`query` vs absent). Before this fix
+    /// the `(Ok, Ok)` arm only compared the normalized `SortOrder`, so this divergence
+    /// passed silently; `compare_hd` (already the `(Err, Err)` fallback's own check) must
+    /// gate this arm identically.
+    #[test]
+    fn require_compatible_headers_rejects_go_divergence_with_same_determinable_sort_order() {
+        let h1 = header_with_hd(Some("coordinate"), Some("query"), None);
+        let h2 = header_with_hd(Some("coordinate"), None, None);
+        let err = require_compatible_headers(&h1, &h2).expect_err(
+            "same SortOrder::Coordinate but differing @HD GO must be rejected, not silently \
+             accepted by the (Ok, Ok) arm",
+        );
+        assert!(format!("{err}").contains("SO/GO"), "got: {err}");
     }
 }

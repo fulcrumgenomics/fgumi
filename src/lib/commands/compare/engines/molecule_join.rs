@@ -23,6 +23,7 @@ use super::super::bams::{MiKey, get_mi_tag_raw};
 use super::super::molecule::{MoleculeRun, molecule_runs};
 use super::super::record_key::{RecordKey, record_key};
 use super::content::{ContentPredicate, content_diffs};
+use super::header::require_compatible_headers;
 use super::push_diff;
 
 /// Build a `RecordKey -> &RawRecord` index for a molecule's members.
@@ -136,9 +137,11 @@ pub struct MoleculeJoinOutcome {
     /// [`compare_molecule`] divergences, plus one entry per residual molecule present in
     /// only one of the two files.
     pub diff_details: Vec<String>,
-    /// `true` if the two inputs' headers disagreed (reserved for a future header check on
-    /// this path; always `false` today — see the module-level note on the CLI entry
-    /// already enforcing header compatibility before this driver runs).
+    /// `true` if the two inputs' headers disagreed (reserved; always `false` today — a
+    /// header disagreement is instead a hard `Err` returned directly from
+    /// [`molecule_join_compare`] via its own [`require_compatible_headers`] precondition
+    /// check, so this outcome is never actually constructed for a header-incompatible pair;
+    /// this field stays `false` by construction, not because it's checked and found clean).
     pub header_mismatch: bool,
 }
 
@@ -223,29 +226,44 @@ fn fold_matched_pair(
 /// within the same iteration, which a single array literal can't express without borrowing
 /// one of the two maps mutably twice at once.
 ///
-/// Header compatibility is not re-checked here: `require_compatible_headers` already gates
-/// the CLI entry point (`CompareBams::execute`) before this driver ever runs, so by the time
-/// `molecule_join_compare` is called the two headers are known compatible.
+/// Header compatibility: the CLI entry point (`CompareBams::execute`) already gates on
+/// `require_compatible_headers` before dispatching to this driver, but `molecule_join_compare`
+/// is a `pub` function and must be sound for any caller, not just the CLI — so it re-runs the
+/// same check itself, immediately after opening both headers below. This is redundant (but
+/// cheap — one more header parse) for the CLI path; for any other caller it is the only thing
+/// standing between an incompatible `@SQ`/`@RG`/sort-order pair and a molecule-join that
+/// silently pairs records against the wrong reference dictionary.
 ///
 /// # Errors
 ///
-/// Returns an error if either file cannot be opened/read, or if [`molecule_runs`] yields an
+/// Returns an error if either file cannot be opened/read, if the two inputs' headers are
+/// incompatible (see [`require_compatible_headers`]), or if [`molecule_runs`] yields an
 /// `Err` from either stream. On an `Err` from either side, the join stops immediately without
 /// polling either iterator again: `molecule_runs` does not fuse after an `Err` (a stale
 /// `pending` record inside it would otherwise silently leak into the next run's boundary), so
 /// resuming past a first error would corrupt subsequent run boundaries.
 ///
-/// Also returns an error if **neither** input ever saw an MI tag on any record *and* at least
-/// one of the two inputs is non-empty. Grouping mode compares *grouped* output (same-molecule
-/// reads consecutive under a shared MI), so a non-empty pair of BAMs with zero MI tags between
-/// them is misuse of this comparison, not a legitimate "no diffs" input — without this guard,
-/// two content-identical fully-MI-less BAMs would fold into one giant MI-less "molecule" on
-/// each side and spuriously MATCH. A *partial* MI-less pair (one side grouped, the other not)
-/// is unaffected by this guard: it is still caught downstream as an ordinary molecule-count/
-/// membership asymmetry. Two BAMs that are both entirely *empty* (zero records, hence zero
-/// molecules and trivially zero MI tags on either side) are exempted: there is nothing to
-/// compare, so that is a vacuous MATCH, not misuse — the guard is scoped to fire only when at
-/// least one side actually produced molecules (`bam1_molecules > 0 || bam2_molecules > 0`).
+/// Also returns an error if **either** input is non-empty and never saw an MI tag on any
+/// record. Grouping mode compares *grouped* output (same-molecule reads consecutive under a
+/// shared MI), so a non-empty, entirely MI-less side is misuse of this comparison, not a
+/// legitimate "no diffs" input.
+///
+/// This guard is intentionally per-side, not "both sides fully MI-less": an earlier version
+/// only fired when *neither* side ever saw an MI tag, on the theory that a *partial*
+/// MI-less pair (one side grouped, the other not) would always be caught downstream as an
+/// ordinary molecule-count/membership asymmetry. That was a soundness hole — if the
+/// MI-less side's single spanning run (every record with no MI tag folds into one run; see
+/// [`molecule_runs`]) happened to canonical-id-match a real molecule on the grouped side
+/// (same member records), the pair reported a false MATCH despite the MI-less side never
+/// having verified any grouping at all. Rejecting either non-empty MI-less side
+/// unconditionally closes that hole: every partial-MI-less pair is now a hard error, not
+/// just the ones that happened to produce a false MATCH.
+///
+/// Two BAMs that are both entirely *empty* (zero records, hence zero molecules and
+/// trivially zero MI tags on either side) are exempted: there is nothing to compare, so
+/// that is a vacuous MATCH, not misuse — each side of the guard is scoped to fire only
+/// when *that* side actually produced molecules (`bam1_molecules > 0`/`bam2_molecules >
+/// 0`), so an empty side never trips it.
 pub fn molecule_join_compare(
     bam1: &Path,
     bam2: &Path,
@@ -253,7 +271,9 @@ pub fn molecule_join_compare(
 ) -> Result<MoleculeJoinOutcome> {
     let (_, h1) = create_raw_bam_reader(bam1, 1)?;
     let (_, h2) = create_raw_bam_reader(bam2, 1)?;
-    // Header precondition already enforced at the CLI entry; header content is equal here.
+    // Make this public API sound on its own, independent of the CLI's own (redundant but
+    // cheap) call — see this function's doc comment.
+    require_compatible_headers(&h1, &h2)?;
 
     let mut it1 = molecule_runs(open_raw(bam1)?);
     let mut it2 = molecule_runs(open_raw(bam2)?);
@@ -330,15 +350,16 @@ pub fn molecule_join_compare(
         }
     }
 
-    // Fully-MI-less guard (see this function's doc comment): if neither side ever saw an MI
-    // tag AND at least one side actually produced molecules, this is misuse of grouping
-    // comparison, not a legitimate "no diffs" verdict. Two empty inputs (zero molecules on
-    // both sides) fall through this guard and proceed to the normal match path below, where
-    // they vacuously MATCH (nothing to compare).
-    if !saw_mi1 && !saw_mi2 && (bam1_molecules > 0 || bam2_molecules > 0) {
+    // Non-empty-MI-less guard (see this function's doc comment): if EITHER side is
+    // non-empty and never saw an MI tag, this is misuse of grouping comparison, not a
+    // legitimate "no diffs" verdict — this also catches the partial-MI-less case (one side
+    // grouped, the other not) that the old both-sides-MI-less-only guard let slip through
+    // as a potential false MATCH. Two empty inputs (zero molecules on both sides) fall
+    // through this guard and proceed to the normal match path below, where they vacuously
+    // MATCH (nothing to compare).
+    if (!saw_mi1 && bam1_molecules > 0) || (!saw_mi2 && bam2_molecules > 0) {
         bail!(
-            "grouping comparison requires MI-tagged (grouped) input; neither BAM contains any \
-             MI tags"
+            "grouping comparison requires every non-empty input to contain MI-tagged grouped data"
         );
     }
 

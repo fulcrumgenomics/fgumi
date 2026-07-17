@@ -475,14 +475,26 @@ fn run_compare_grouping_expect_err(bam1: &Path, bam2: &Path, extra_args: &[&str]
 // (`base == None`) are simply grouped into one molecule, like any other base-MI value —
 // which, left unguarded, let two *content-identical* fully-MI-less BAMs MATCH (Task 7
 // finding). `molecule_join_compare` closes that gap with an explicit whole-input guard
-// (Finding A, Task 8): if **neither** side ever saw an MI tag on any record, the compare
-// hard-fails rather than reporting MATCH or DIFFER — see the `saw_mi1`/`saw_mi2` tracking
-// and the `bail!` in `molecule_join_compare`. This is a deliberate, user-facing
-// oracle-semantics change: `--mode grouping`/`--command group` require already-grouped
-// (same-MI-consecutive) input, and feeding it fully-ungrouped input is now a hard error
-// instead of silently reporting MATCH. A *partial*-MI-less pair (one side grouped, the
-// other not) is untouched by this guard and still DIFFERs via ordinary molecule-count/
-// membership asymmetry (see `test_grouping_partial_mi_less_pair_still_differs` below).
+// (Finding A, Task 8): if EITHER side is non-empty and never saw an MI tag on any record,
+// the compare hard-fails rather than reporting MATCH or DIFFER — see the `saw_mi1`/
+// `saw_mi2` tracking and the `bail!` in `molecule_join_compare`. This is a deliberate,
+// user-facing oracle-semantics change: `--mode grouping`/`--command group` require
+// already-grouped (same-MI-consecutive) input, and feeding it any non-empty ungrouped
+// input on either side is now a hard error instead of silently reporting MATCH or an
+// ordinary molecule-count DIFFER.
+//
+// The guard originally only fired when **both** sides were fully MI-less, which left a
+// soundness hole: a *partial*-MI-less pair (one side genuinely grouped, the other entirely
+// MI-less) still routed through the ordinary molecule-join path, so if the MI-less side's
+// single spanning run happened to canonical-id-match a real molecule on the other side
+// (same member records), the pair reported a false MATCH despite one side never having
+// verified any grouping at all — see
+// `test_grouping_mi_less_side_with_matching_records_on_other_side_now_errors` below, which
+// locks in the closed hole. The guard now rejects *either* non-empty MI-less side
+// unconditionally, so every partial-MI-less pair is a hard error now, not just the ones
+// that happened to produce a false MATCH (see the same test, and
+// `test_grouping_partial_mi_less_pair_now_errors_via_guard` for the count-asymmetry case
+// that used to DIFFER before this fix).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -543,18 +555,21 @@ fn test_grouping_unordered_content_identical_but_mi_missing_in_both_bams_errors(
     assert!(err.contains("MI-tagged"), "got: {err}");
 }
 
-/// Finding A must NOT touch the partial-MI-less case: one side grouped, the other not, is
-/// still an ordinary DIFFER (via molecule-count asymmetry — see `molecule_runs`' doc comment
-/// on how consecutive no-MI records fold into one molecule), not the whole-input hard error.
+/// Review fix (guard hole closed): a partial-MI-less pair — one side grouped, the other
+/// not — is now a hard error via the guard, not an ordinary molecule-count DIFFER. Before
+/// this fix, the guard only fired when *both* sides were fully MI-less, so this case fell
+/// through to the normal molecule-join path and `DIFFERed` via `bam1_molecules` (2) !=
+/// `bam2_molecules` (1); the widened guard (either non-empty side being MI-less is
+/// misuse) now catches it up front regardless of whether the counts would have matched.
 #[test]
-fn test_grouping_partial_mi_less_pair_still_differs() {
+fn test_grouping_partial_mi_less_pair_now_errors_via_guard() {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
 
     // bam1: two distinct MI-tagged molecules (2 runs).
     let grouped = vec![mi_record(b"read1", 100, "1"), mi_record(b"read2", 200, "2")];
     // bam2: same two records, but with NO MI tag at all -> molecule_runs folds them into
-    // one run (consecutive base == None), so bam1_molecules (2) != bam2_molecules (1).
+    // one run (consecutive base == None).
     let ungrouped = vec![mapped_record(b"read1", 100), mapped_record(b"read2", 200)];
 
     let bam1 = tmp.path().join("a.bam");
@@ -562,11 +577,38 @@ fn test_grouping_partial_mi_less_pair_still_differs() {
     write_bam(&bam1, &header, &grouped);
     write_bam(&bam2, &header, &ungrouped);
 
-    let outcome =
-        molecule_join_compare(&bam1, &bam2, 10).expect("molecule_join_compare should succeed");
-    assert_eq!(outcome.bam1_molecules, 2);
-    assert_eq!(outcome.bam2_molecules, 1);
-    assert!(!outcome.is_match(), "a partial-MI-less pair must DIFFER, not error: {outcome:?}");
+    let err = run_compare_grouping_expect_err(&bam1, &bam2, &[]);
+    assert!(err.contains("MI-tagged"), "got: {err}");
+}
+
+/// CRITICAL soundness regression: the guard hole this fix closes. bam1 is entirely
+/// MI-less, so `molecule_runs` folds its two records into a single spanning run; bam2
+/// has ONE real MI-tagged molecule containing the *same* two records (same canonical id —
+/// the lexicographically smallest read name — and the same member content). Before this
+/// fix the guard only fired when *both* sides were fully MI-less, so this partial-MI-less
+/// pair fell through to the ordinary molecule-join path: one run per side, matching
+/// canonical id, matching members -> a false MATCH despite bam1 never having verified any
+/// grouping at all. The widened guard (either non-empty MI-less side is misuse) now
+/// rejects this pair outright.
+#[test]
+fn test_grouping_mi_less_side_with_matching_records_on_other_side_now_errors() {
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10000);
+
+    // bam1: entirely MI-less -> one spanning run, canon = min("read1", "read2") = "read1".
+    let bam1_records = vec![mapped_record(b"read1", 100), mapped_record(b"read2", 200)];
+    // bam2: the SAME two records (content-identical aside from the added MI tag),
+    // MI-tagged as one real molecule -> also one run with canon "read1" and the same
+    // member records. Absent the fix, this pair would MATCH.
+    let bam2_records = vec![mi_record(b"read1", 100, "1"), mi_record(b"read2", 200, "1")];
+
+    let bam1 = tmp.path().join("a.bam");
+    let bam2 = tmp.path().join("b.bam");
+    write_bam(&bam1, &header, &bam1_records);
+    write_bam(&bam2, &header, &bam2_records);
+
+    let err = run_compare_grouping_expect_err(&bam1, &bam2, &[]);
+    assert!(err.contains("MI-tagged"), "got: {err}");
 }
 
 /// Review fix (empty-vs-empty exemption): two EMPTY grouped BAMs (zero records on both
@@ -1116,6 +1158,22 @@ fn molecule_join_compare_record_dropped_in_bam2_presence_differs() {
         "a record dropped on one side must produce a diff: {outcome:?}"
     );
     assert!(!outcome.is_match(), "a record dropped on one side must DIFFER: {outcome:?}");
+}
+
+/// `molecule_join_compare` must enforce its own header-compatibility precondition rather
+/// than trusting the CLI caller to have run `require_compatible_headers` first: called
+/// directly (as this test does, bypassing `CompareBams::execute`) on two BAMs with
+/// incompatible `@SQ` dictionaries, it must return an `Err` naming the `@SQ` mismatch
+/// rather than silently molecule-joining records against the wrong reference dictionary.
+#[test]
+fn molecule_join_compare_rejects_incompatible_sq_dictionaries() {
+    let tmp = TempDir::new().unwrap();
+    let bam1 = write_bam_with_ref(tmp.path(), "a.bam", "chr1", 1000);
+    let bam2 = write_bam_with_ref(tmp.path(), "b.bam", "chr1", 2000);
+
+    let err = molecule_join_compare(&bam1, &bam2, 10)
+        .expect_err("incompatible @SQ dictionaries must be rejected by molecule_join_compare");
+    assert!(format!("{err:#}").contains("@SQ"), "got: {err:#}");
 }
 
 /// CRITICAL soundness regression: `--max-diffs 0` must not collapse `is_match()` into a

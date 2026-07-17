@@ -41,20 +41,20 @@ pub enum CompareMode {
     /// Content comparison (default): all fields and tags must match exactly.
     ///
     /// A pure record-by-record comparison. Records are paired by their
-    /// [`RecordKey`](super::record_key::RecordKey) identity (see
-    /// [`super::engines::positional`]), so a difference in record order is
+    /// `RecordKey` identity (see
+    /// `positional`), so a difference in record order is
     /// reported honestly as a difference rather than silently masked — this is
     /// the *sound* default.
     #[default]
     Content,
     /// Grouping comparison: verify MI groupings are equivalent (for grouped BAMs).
     ///
-    /// Streams both inputs' per-molecule runs (see [`super::engines::molecule_join`]) and
+    /// Streams both inputs' per-molecule runs (see `molecule_join`) and
     /// matches molecules across the two files by an MI-invariant canonical id (the
     /// lexicographically smallest read name in the molecule), independent of file order or
     /// MI numbering. Each matched pair is checked for record membership, non-MI content
     /// under
-    /// [`ContentPredicate::ExactMinusMi`](super::engines::content::ContentPredicate::ExactMinusMi),
+    /// [`ContentPredicate::ExactMinusMi`],
     /// and duplex `/A`/`/B` strand-partition equivalence. Unlike `Content` mode, this
     /// requires each input to already be grouped: same-MI reads must be consecutive within
     /// the file (as `fgumi group`/`fgbio group` output is), since the join never re-sorts
@@ -95,23 +95,23 @@ pub enum CommandPreset {
     /// ([`super::engines::molecule_join::molecule_join_compare`]), matching molecules by an
     /// MI-invariant canonical id and checking membership, content under
     /// [`ContentPredicate::ExactMinusMi`], and duplex strand-partition equivalence; see
-    /// [`CommandPreset::resolve`] for the full rationale.
+    /// `CommandPreset::resolve` for the full rationale.
     Group,
     /// Simplex consensus output: positional, exact content comparison
-    /// (see [`ContentPredicate::Exact`](super::engines::content::ContentPredicate::Exact)).
+    /// (see [`ContentPredicate::Exact`]).
     Simplex,
     /// Duplex consensus output: positional, exact content comparison
-    /// (see [`ContentPredicate::Exact`](super::engines::content::ContentPredicate::Exact)).
+    /// (see [`ContentPredicate::Exact`]).
     Duplex,
     /// CODEC consensus output: positional, exact content comparison
-    /// (see [`ContentPredicate::Exact`](super::engines::content::ContentPredicate::Exact)).
+    /// (see [`ContentPredicate::Exact`]).
     Codec,
     /// Filter output: consensus reads with reads dropped, but the same depth tags
     /// (`cD`/`cM`/`cE`, and duplex `aD`/`aM`/`bD`/`bM`/`aE`/`bE`) as the consensus command
     /// that produced them, passed through unchanged. Compares via the same predicate as
     /// consensus output
-    /// ([`ContentPredicate::Exact`](super::engines::content::ContentPredicate::Exact));
-    /// see [`CommandPreset::resolve`] for the full rationale.
+    /// ([`ContentPredicate::Exact`]);
+    /// see `CommandPreset::resolve` for the full rationale.
     Filter,
 }
 
@@ -331,8 +331,19 @@ pub struct CompareBams {
     /// Batch size for parallel processing (number of records per batch). Used by `content`
     /// mode only; ignored by `grouping` mode.
     /// Larger batches reduce synchronization overhead but use more memory.
-    #[arg(long = "batch-size", default_value = "10000")]
+    #[arg(long = "batch-size", default_value = "10000", value_parser = parse_batch_size)]
     pub batch_size: usize,
+}
+
+/// Reject `--batch-size 0`. `read_raw_batch` reads `for _ in 0..batch_size` records, so a
+/// zero size yields an empty, non-EOF batch every call; the reader thread would then loop
+/// forever without ever sending a batch or signaling EOF, hanging the consumer's `recv()`.
+fn parse_batch_size(s: &str) -> Result<usize, String> {
+    let n: usize = s.parse().map_err(|e| format!("invalid batch size '{s}': {e}"))?;
+    if n == 0 {
+        return Err("batch size must be at least 1".to_string());
+    }
+    Ok(n)
 }
 
 /// Core SAM field names for reporting.
@@ -545,6 +556,14 @@ pub(crate) fn start_raw_batch_reader(
     threads: usize,
     batch_size: usize,
 ) -> Result<(Receiver<RawBatchMessage>, Header)> {
+    // A zero batch size makes `read_raw_batch` return an empty, non-EOF batch on every call,
+    // so the reader thread spawned below would loop forever — never sending a batch, never
+    // signaling EOF — and hang the consumer's `recv()`. The CLI parser rejects `--batch-size
+    // 0`, but this `pub(crate)` reader is also reachable through the public `positional_compare`
+    // engine, so guard at this single choke point (both of that engine's readers, and
+    // `execute_content`, start here) before spawning anything.
+    anyhow::ensure!(batch_size >= 1, "batch size must be at least 1");
+
     // Open the reader on the main thread to get the header
     let (mut reader, header) = create_raw_bam_reader(&path, threads)?;
 
@@ -636,13 +655,17 @@ impl Command for CompareBams {
         // `extract`/`fastq`/`zipper` output — nothing to verify) and only for `Content` mode
         // (`Grouping` routes through the streaming molecule-join engine, which matches
         // molecules by MI-invariant canonical id — the lexicographically smallest read name
-        // in each molecule — rather than by position, so it is order-independent by
-        // construction and never needs the declared record order verified either).
-        if let Some(order) = declared_order {
-            if matches!(mode, CompareMode::Content) {
-                super::engines::sort_verify::verify_records_in_order(&self.bam1, order)?;
-                super::engines::sort_verify::verify_records_in_order(&self.bam2, order)?;
-            }
+        // in each molecule — rather than by position, so it is order-INDEPENDENT ACROSS
+        // molecules and never needs `verify_records_in_order`'s stream-level check. That is
+        // not the same as "no validation needed", though: `molecule_runs` (see
+        // `super::molecule`) enforces its own precondition — that each molecule's own
+        // records are consecutive, i.e. same-MI-consecutive/grouped input — and returns an
+        // `Err` if a base MI's run is found non-contiguous, rather than silently trusting it).
+        if let Some(order) = declared_order
+            && matches!(mode, CompareMode::Content)
+        {
+            super::engines::sort_verify::verify_records_in_order(&self.bam1, order)?;
+            super::engines::sort_verify::verify_records_in_order(&self.bam2, order)?;
         }
 
         // In `--quiet` mode only the exit code communicates the result, so suppress this
@@ -951,6 +974,19 @@ mod tests {
         let mut argv = vec!["bams", "a.bam", "b.bam"];
         argv.extend_from_slice(args);
         CompareBams::try_parse_from(argv).expect("parse")
+    }
+
+    /// `--batch-size 0` would make the reader thread spin on empty, non-EOF batches forever
+    /// (hanging the consumer's `recv()`), so it must be rejected at parse time; positive values
+    /// pass through unchanged.
+    #[test]
+    fn batch_size_zero_is_rejected_positive_is_accepted() {
+        assert!(
+            CompareBams::try_parse_from(["bams", "a.bam", "b.bam", "--batch-size", "0"]).is_err(),
+            "--batch-size 0 must be rejected"
+        );
+        assert_eq!(parse(&["--batch-size", "1"]).batch_size, 1);
+        assert_eq!(parse(&["--batch-size", "10000"]).batch_size, 10000);
     }
 
     #[rstest]
