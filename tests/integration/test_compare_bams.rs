@@ -445,27 +445,48 @@ fn test_grouping_mode_ignore_order() {
     assert!(stdout.contains("EQUIVALENT"), "Expected EQUIVALENT in output, got:\n{stdout}");
 }
 
+/// Runs `CompareBams::execute()` in-process under `--mode grouping` (plus any `extra_args`,
+/// e.g. `--ignore-order`) and returns the error's full display string. Panics if `execute`
+/// succeeds, or if it fails with a [`CompareMismatch`] (a genuine record-level DIFFER) rather
+/// than the fully-MI-less hard-fail this helper exists to capture (Finding A, Task 8) —
+/// mirrors `run_compare_content_expect_err`'s success/DIFFER-vs-hard-error distinction for
+/// the grouping-mode guard.
+fn run_compare_grouping_expect_err(bam1: &Path, bam2: &Path, extra_args: &[&str]) -> String {
+    let mut args: Vec<&str> =
+        vec!["bams", bam1.to_str().unwrap(), bam2.to_str().unwrap(), "--mode", "grouping"];
+    args.extend(extra_args);
+    let cmd = CompareBams::try_parse_from(args).expect("failed to parse compare bams args");
+    match cmd.execute("fgumi compare bams") {
+        Ok(()) => panic!("expected compare bams to hard-fail on fully-MI-less input"),
+        Err(e) if e.is::<CompareMismatch>() => {
+            panic!("expected the fully-MI-less guard error, got a CompareMismatch (DIFFER): {e:#}")
+        }
+        Err(e) => format!("{e:#}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Missing MI tag behavior (streaming molecule-join engine)
 //
-// KNOWN BEHAVIOR CHANGE from the retired key-join engine: the old engine explicitly
-// counted "missing MI" records and always DIFFERed when both files entirely lacked MI
-// tags, on the theory that "no grouping has been verified" must never read as
-// EQUIVALENT. The new streaming molecule-join engine (`molecule_runs`) has no such
-// explicit check: consecutive records with no MI tag (`base == None`) are simply
-// grouped into one molecule (or several, if a non-MI-tagged run is interrupted by an
-// MI-tagged one), like any other base-MI value. So two *content-identical* BAMs that
-// both entirely lack MI tags now MATCH (their single big "no-MI molecule" content is
-// identical) rather than DIFFER. `--mode grouping`/`--command group` is documented as
-// requiring already-grouped (same-MI-consecutive) input; feeding it fully-ungrouped
-// input is now out of contract rather than being defensively caught by this engine.
-// This divergence is called out in the Task 7 report as a molecule-join parity finding
-// for the controller to adjudicate (candidate follow-up: an explicit "no MI tags found"
-// guard in `molecule_join_compare` or `CompareBams::execute_grouping`).
+// The old (retired) key-join engine explicitly counted "missing MI" records and always
+// DIFFERed when both files entirely lacked MI tags, on the theory that "no grouping has
+// been verified" must never read as EQUIVALENT. The streaming molecule-join engine
+// (`molecule_runs`) has no such per-record check: consecutive records with no MI tag
+// (`base == None`) are simply grouped into one molecule, like any other base-MI value —
+// which, left unguarded, let two *content-identical* fully-MI-less BAMs MATCH (Task 7
+// finding). `molecule_join_compare` closes that gap with an explicit whole-input guard
+// (Finding A, Task 8): if **neither** side ever saw an MI tag on any record, the compare
+// hard-fails rather than reporting MATCH or DIFFER — see the `saw_mi1`/`saw_mi2` tracking
+// and the `bail!` in `molecule_join_compare`. This is a deliberate, user-facing
+// oracle-semantics change: `--mode grouping`/`--command group` require already-grouped
+// (same-MI-consecutive) input, and feeding it fully-ungrouped input is now a hard error
+// instead of silently reporting MATCH. A *partial*-MI-less pair (one side grouped, the
+// other not) is untouched by this guard and still DIFFERs via ordinary molecule-count/
+// membership asymmetry (see `test_grouping_partial_mi_less_pair_still_differs` below).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_grouping_mode_content_identical_but_mi_missing_in_both_bams_matches() {
+fn test_grouping_mode_content_identical_but_mi_missing_in_both_bams_errors() {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
     // Paired reads with NO MI tag on either record.
@@ -499,20 +520,14 @@ fn test_grouping_mode_content_identical_but_mi_missing_in_both_bams_matches() {
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
 
-    // See this section's header comment: content-identical, fully MI-less input now
-    // MATCHes under the streaming molecule-join engine (a behavior change from the
-    // retired key-join engine, which always DIFFERed here).
-    let (code, stdout, _stderr) = run_compare(&bam1, &bam2, "grouping", &[]);
-    assert_eq!(
-        code,
-        Some(0),
-        "content-identical, fully MI-less BAMs now MATCH under molecule-join, stdout:\n{stdout}"
-    );
-    assert!(stdout.contains("EQUIVALENT"), "Expected EQUIVALENT in output, got:\n{stdout}");
+    // See this section's header comment / Finding A: fully-MI-less input on both sides is
+    // now a hard error, not a MATCH.
+    let err = run_compare_grouping_expect_err(&bam1, &bam2, &[]);
+    assert!(err.contains("MI-tagged"), "got: {err}");
 }
 
 #[test]
-fn test_grouping_unordered_content_identical_but_mi_missing_in_both_bams_matches() {
+fn test_grouping_unordered_content_identical_but_mi_missing_in_both_bams_errors() {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
     let records = vec![mapped_record(b"read1", 100), mapped_record(b"read2", 200)];
@@ -522,12 +537,36 @@ fn test_grouping_unordered_content_identical_but_mi_missing_in_both_bams_matches
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
 
-    // See this section's header comment: `--ignore-order` is a no-op under the
-    // streaming molecule-join engine, and content-identical MI-less input MATCHes.
-    assert!(
-        run_compare_in_process(&bam1, &bam2, "grouping", &["--ignore-order"]),
-        "content-identical, fully MI-less BAMs now MATCH under molecule-join (ignore-order)"
-    );
+    // See this section's header comment / Finding A: `--ignore-order` doesn't change the
+    // fully-MI-less guard outcome.
+    let err = run_compare_grouping_expect_err(&bam1, &bam2, &["--ignore-order"]);
+    assert!(err.contains("MI-tagged"), "got: {err}");
+}
+
+/// Finding A must NOT touch the partial-MI-less case: one side grouped, the other not, is
+/// still an ordinary DIFFER (via molecule-count asymmetry — see `molecule_runs`' doc comment
+/// on how consecutive no-MI records fold into one molecule), not the whole-input hard error.
+#[test]
+fn test_grouping_partial_mi_less_pair_still_differs() {
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10000);
+
+    // bam1: two distinct MI-tagged molecules (2 runs).
+    let grouped = vec![mi_record(b"read1", 100, "1"), mi_record(b"read2", 200, "2")];
+    // bam2: same two records, but with NO MI tag at all -> molecule_runs folds them into
+    // one run (consecutive base == None), so bam1_molecules (2) != bam2_molecules (1).
+    let ungrouped = vec![mapped_record(b"read1", 100), mapped_record(b"read2", 200)];
+
+    let bam1 = tmp.path().join("a.bam");
+    let bam2 = tmp.path().join("b.bam");
+    write_bam(&bam1, &header, &grouped);
+    write_bam(&bam2, &header, &ungrouped);
+
+    let outcome =
+        molecule_join_compare(&bam1, &bam2, 10).expect("molecule_join_compare should succeed");
+    assert_eq!(outcome.bam1_molecules, 2);
+    assert_eq!(outcome.bam2_molecules, 1);
+    assert!(!outcome.is_match(), "a partial-MI-less pair must DIFFER, not error: {outcome:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1149,13 +1188,12 @@ fn test_command_group_content_diff_with_intact_grouping_differs() {
     );
 }
 
-/// KNOWN BEHAVIOR CHANGE from the retired key-join engine: see the "Missing MI tag
-/// behavior" section above (around `test_grouping_mode_content_identical_but_mi_missing_in_both_bams_matches`).
-/// The old engine always `DIFFER`ed when both BAMs were entirely ungrouped (no MI tags at
-/// all); the new streaming molecule-join engine has no such explicit check, so two
-/// content-identical, fully MI-less BAMs now report EQUIVALENT via `--command group` too.
+/// Finding A (Task 8), end to end: see the "Missing MI tag behavior" section above (around
+/// `test_grouping_mode_content_identical_but_mi_missing_in_both_bams_errors`). Two
+/// content-identical, fully MI-less BAMs must hard-fail via the real `--command group` path
+/// too, not just at the `molecule_join_compare` engine level.
 #[test]
-fn test_command_group_content_identical_but_mi_missing_in_both_bams_matches() {
+fn test_command_group_content_identical_but_mi_missing_in_both_bams_errors() {
     let tmp = TempDir::new().unwrap();
     let header = create_minimal_header("chr1", 10000);
     let records = vec![mapped_record(b"read1", 100), mapped_record(b"read2", 200)];
@@ -1165,15 +1203,15 @@ fn test_command_group_content_identical_but_mi_missing_in_both_bams_matches() {
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
 
-    let (code, stdout, _stderr) = run_compare_command(&bam1, &bam2, "group", &[]);
+    let (code, stdout, stderr) = run_compare_command(&bam1, &bam2, "group", &[]);
 
-    assert_eq!(
+    assert_ne!(
         code,
         Some(0),
-        "content-identical, fully MI-less BAMs now MATCH via `--command group` under the \
-         molecule-join engine, stdout:\n{stdout}"
+        "content-identical, fully MI-less BAMs must hard-fail via `--command group`, \
+         stdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    assert!(stdout.contains("EQUIVALENT"), "Expected EQUIVALENT in output, got:\n{stdout}");
+    assert!(stderr.contains("MI-tagged"), "expected the MI-less guard message, got:\n{stderr}");
 }
 
 // ============================================================================
@@ -1880,4 +1918,82 @@ fn molecule_join_flags_molecule_only_in_one_file() {
     let out = molecule_join_compare(&bam1, &bam2, 10).unwrap();
     assert!(!out.is_match());
     assert!(out.diff_details.iter().any(|d| d.contains("only in bam1")), "{:?}", out.diff_details);
+}
+
+/// Mirror of [`write_extra_molecule_in_bam1`] with bam1/bam2 swapped: bam2 has the extra
+/// molecule this time. Exists solely so a bam1/bam2 swap bug in the residual-drain loop
+/// (`pending1.drain()` vs `pending2.drain()` in `molecule_join_compare`) is caught — without
+/// it, a bug that swapped those two drains would still pass `molecule_join_flags_molecule_only_in_one_file`
+/// (which only ever produces a "bam1" residual).
+fn write_extra_molecule_in_bam2(dir: &Path) -> (PathBuf, PathBuf) {
+    let header = create_minimal_header("chr1", 10000);
+
+    let m_a = vec![mi_record(b"mol_a1", 100, "1"), mi_record(b"mol_a2", 100, "1")];
+    let m_b = vec![mi_record(b"mol_b1", 200, "2"), mi_record(b"mol_b2", 200, "2")];
+
+    let bam1_records = m_a.clone();
+    let mut bam2_records = m_a;
+    bam2_records.extend(m_b);
+
+    let bam1 = dir.join("molecule_join_extra_bam2_1.bam");
+    let bam2 = dir.join("molecule_join_extra_bam2_2.bam");
+    write_bam(&bam1, &header, &bam1_records);
+    write_bam(&bam2, &header, &bam2_records);
+    (bam1, bam2)
+}
+
+/// Task 6 Minor: the mirror of `molecule_join_flags_molecule_only_in_one_file` with the
+/// extra molecule on bam2 instead of bam1 — catches a bam1/bam2 swap bug in the residual
+/// drain that the bam1-only version can't.
+#[test]
+fn molecule_join_flags_molecule_only_in_bam2() {
+    let tmp = TempDir::new().unwrap();
+    let (bam1, bam2) = write_extra_molecule_in_bam2(tmp.path());
+    let out = molecule_join_compare(&bam1, &bam2, 10).unwrap();
+    assert!(!out.is_match());
+    assert!(out.diff_details.iter().any(|d| d.contains("only in bam2")), "{:?}", out.diff_details);
+}
+
+/// Documents the accepted `RecordKey`-collision residual (`record_key.rs:20-24`): `RecordKey`
+/// is collision-resistant, not collision-free — for a primary record it reduces to
+/// `(name, segment)`, with no locus discriminator, so two records that share a name and
+/// segment but differ in position/content collapse to one entry in `index_by_key`'s
+/// `BTreeMap` (the later one, in file order, wins). This is a malformed molecule (`group`
+/// should never actually emit two same-name/same-segment primaries in one molecule), but
+/// when it happens, `compare_molecule` silently only ever "sees" the winner.
+///
+/// bam1's molecule holds THREE physical records: `r1`, plus two same-name/same-segment `dup`
+/// records at different positions (200 and 300) that collide to one `RecordKey`. bam2's
+/// molecule holds only TWO: `r1` and a `dup` matching the position (300) of whichever bam1
+/// record wins the collapse (the later one in file order). The observed verdict is MATCH —
+/// bam1's second physical `dup`@200 record vanishes from the comparison entirely, silently
+/// hiding a real difference in record count between the two files. This test locks in that
+/// *actual* observed behavior (not a should-be) so a future change to the collision
+/// resolution order is a deliberate, visible decision rather than a silent behavior change.
+#[test]
+fn molecule_join_duplicate_record_key_within_a_molecule_collapses_silently() {
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10000);
+
+    // bam1: r1, plus two colliding same-name/same-segment "dup" records (pos 200 then 300).
+    let bam1_records =
+        vec![mi_record(b"r1", 100, "5"), mi_record(b"dup", 200, "5"), mi_record(b"dup", 300, "5")];
+    // bam2: r1, plus only the "dup" record matching the collapse winner (pos 300).
+    let bam2_records = vec![mi_record(b"r1", 100, "9"), mi_record(b"dup", 300, "9")];
+
+    let bam1 = tmp.path().join("dup_key1.bam");
+    let bam2 = tmp.path().join("dup_key2.bam");
+    write_bam(&bam1, &header, &bam1_records);
+    write_bam(&bam2, &header, &bam2_records);
+
+    let out =
+        molecule_join_compare(&bam1, &bam2, 10).expect("molecule_join_compare should succeed");
+    // OBSERVED (not desired) verdict: MATCH. bam1's "dup"@200 record silently vanishes from
+    // the comparison, so a genuine 3-vs-2 physical-record-count difference is not reported.
+    assert!(
+        out.is_match(),
+        "documents the RecordKey-collision residual: bam1's colliding \"dup\"@200 record is \
+         silently dropped by index_by_key's BTreeMap collapse, so this (malformed) case \
+         currently reports MATCH despite bam1 having one more physical record than bam2: {out:?}"
+    );
 }

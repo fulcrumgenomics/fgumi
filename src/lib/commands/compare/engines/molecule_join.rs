@@ -13,7 +13,7 @@ use std::fs::File;
 use std::path::Path;
 
 use ahash::AHashMap;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use fgumi_bam_io::create_raw_bam_reader;
 use fgumi_raw_bam::RawRecord;
 use fgumi_sort::RawBamRecordReader;
@@ -218,6 +218,14 @@ fn fold_matched_pair(
 /// polling either iterator again: `molecule_runs` does not fuse after an `Err` (a stale
 /// `pending` record inside it would otherwise silently leak into the next run's boundary), so
 /// resuming past a first error would corrupt subsequent run boundaries.
+///
+/// Also returns an error if **neither** input ever saw an MI tag on any record. Grouping mode
+/// compares *grouped* output (same-molecule reads consecutive under a shared MI), so a pair of
+/// BAMs with zero MI tags between them is misuse of this comparison, not a legitimate "no
+/// diffs" input — without this guard, two content-identical fully-MI-less BAMs would fold into
+/// one giant MI-less "molecule" on each side and spuriously MATCH. A *partial* MI-less pair
+/// (one side grouped, the other not) is unaffected by this guard: it is still caught downstream
+/// as an ordinary molecule-count/membership asymmetry.
 pub fn molecule_join_compare(
     bam1: &Path,
     bam2: &Path,
@@ -238,6 +246,10 @@ pub fn molecule_join_compare(
     let mut bam2_molecules = 0u64;
     let mut matched = 0u64;
     let mut diff_details: Vec<String> = Vec::new();
+    // A side "saw MI" iff any member of any run it produced carries an MI tag; see the
+    // fully-MI-less guard below.
+    let mut saw_mi1 = false;
+    let mut saw_mi2 = false;
 
     // Alternate pulling one run from each side; probe the opposite pending map on each pull.
     // Because both inputs are template-coordinate ordered, corresponding molecules arrive at
@@ -252,6 +264,9 @@ pub fn molecule_join_compare(
                 Some(run) => {
                     let run = run?;
                     bam1_molecules += 1;
+                    if run.members.iter().any(|m| get_mi_tag_raw(m).is_some()) {
+                        saw_mi1 = true;
+                    }
                     if let Some(partner) = pending2.remove(&run.canon) {
                         fold_matched_pair(
                             &run,
@@ -274,6 +289,9 @@ pub fn molecule_join_compare(
                 Some(run) => {
                     let run = run?;
                     bam2_molecules += 1;
+                    if run.members.iter().any(|m| get_mi_tag_raw(m).is_some()) {
+                        saw_mi2 = true;
+                    }
                     if let Some(partner) = pending1.remove(&run.canon) {
                         fold_matched_pair(
                             &partner,
@@ -290,6 +308,15 @@ pub fn molecule_join_compare(
                 }
             }
         }
+    }
+
+    // Fully-MI-less guard (see this function's doc comment): if neither side ever saw an MI
+    // tag, this is misuse of grouping comparison, not a legitimate "no diffs" verdict.
+    if !saw_mi1 && !saw_mi2 {
+        bail!(
+            "grouping comparison requires MI-tagged (grouped) input; neither BAM contains any \
+             MI tags"
+        );
     }
 
     // Residual molecules present in only one file.

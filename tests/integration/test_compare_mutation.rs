@@ -1705,6 +1705,50 @@ const MUTATION_CATALOG: &[CatalogEntry] = &[
             )
         },
     },
+    CatalogEntry {
+        engine: "molecule_join",
+        mutation: "duplex strand split",
+        must_differ: true,
+        verify: || {
+            let strand = |name: &[u8], pos: i32, mi: &str| {
+                let mut b = SamBuilder::new();
+                b.read_name(name)
+                    .sequence(b"ACGTACGT")
+                    .qualities(&[30; 8])
+                    .ref_id(0)
+                    .pos(pos - 1)
+                    .mapq(60)
+                    .add_string_tag(SamTag::MI, mi.as_bytes());
+                b.build()
+            };
+            // bam1: read1 on strand A, read2 on strand B of the same molecule (base "1").
+            // bam2: same base MI, but BOTH reads land on strand A -- a real strand-pairing
+            // split, not just a global A<->B relabel (which `compare_molecule` tolerates).
+            molecule_join_differs(
+                &[strand(b"read1", 100, "1/A"), strand(b"read2", 200, "1/B")],
+                &[strand(b"read1", 100, "1/A"), strand(b"read2", 200, "1/A")],
+            )
+        },
+    },
+    CatalogEntry {
+        engine: "molecule_join",
+        mutation: "molecule only in one file",
+        must_differ: true,
+        verify: || {
+            // bam1 has two distinct molecules (MI=1, MI=2); bam2 has only the first --
+            // an entire molecule missing (a hash-join residual), not just a member
+            // dropped from within an otherwise-matched molecule (see "dropped record
+            // presence diff" above for that case).
+            molecule_join_differs(
+                &[
+                    mi_record(b"read1", 100, "1"),
+                    mi_record(b"read2", 200, "1"),
+                    mi_record(b"read3", 300, "2"),
+                ],
+                &[mi_record(b"read1", 100, "1"), mi_record(b"read2", 200, "1")],
+            )
+        },
+    },
     // Section 5: sort_verify_compare
     CatalogEntry {
         engine: "sort_verify",
@@ -1823,6 +1867,8 @@ fn mutation_catalog_covers_every_compared_dimension() {
         "MI value change",
         "MI renumber",
         "grouping split",
+        "duplex strand split",
+        "molecule only in one file",
         // records / order
         "drop a record",
         "duplicate a record",
