@@ -171,6 +171,32 @@ fn run_filter(input: &Path, output: &Path, min_reads: u32, min_base_quality: u32
     cmd.execute("fgumi filter").expect("filter failed");
 }
 
+/// Sort a BAM into genuine template-coordinate order.
+///
+/// `simulate grouped-reads` declares `SS:template-coordinate` in its output header but does
+/// not itself guarantee the emitted records are actually in that order (see the `NOTE` in
+/// `grouped_reads.rs`'s molecule-sort-key comment — this is a documented, tracked gap fixed
+/// wholesale by #576, not something this test suite should paper over by weakening the
+/// `@HD` claim). Real pipelines always sort before a template-coordinate-order-dependent
+/// step, so tests that content-compare `simulate grouped-reads` output (or anything
+/// downstream that preserves record order, like `dedup`) must do the same or `fgumi compare
+/// bams`'s universal sort-order verification precondition correctly rejects the merely
+/// declared-but-not-actual order before a single record is paired.
+fn sort_template_coordinate(input: &Path, output: &Path) {
+    Sort::try_parse_from([
+        OsStr::new("sort"),
+        OsStr::new("--input"),
+        input.as_os_str(),
+        OsStr::new("--output"),
+        output.as_os_str(),
+        OsStr::new("--order"),
+        OsStr::new("template-coordinate"),
+    ])
+    .expect("failed to parse sort args")
+    .execute("fgumi sort")
+    .expect("sort failed");
+}
+
 /// Run dedup on a grouped BAM.
 fn run_dedup(input: &Path, output: &Path) {
     let cmd = MarkDuplicates::try_parse_from([
@@ -218,12 +244,18 @@ fn assert_bams_identical(bam1: &Path, bam2: &Path, mode: &str, context: &str) {
 // ---------------------------------------------------------------------------
 
 /// Create a `TempDir` and simulate grouped reads, returning (tmpdir, grouped bam path).
+///
+/// The returned BAM is sorted into genuine template-coordinate order (see
+/// [`sort_template_coordinate`]) so it is safe to feed directly into template-coordinate-
+/// order-dependent commands (`dedup`) and to content-compare downstream output against.
 fn setup_grouped_reads(seed: u32, num_molecules: u32) -> (TempDir, PathBuf) {
     let tmp = TempDir::new().expect("failed to create temp dir");
     let reference = create_test_reference(tmp.path());
-    let grouped = tmp.path().join("grouped.bam");
+    let unsorted = tmp.path().join("grouped_unsorted.bam");
     let truth = tmp.path().join("truth.tsv");
-    simulate_grouped_reads(&grouped, &truth, &reference, seed, num_molecules);
+    simulate_grouped_reads(&unsorted, &truth, &reference, seed, num_molecules);
+    let grouped = tmp.path().join("grouped.bam");
+    sort_template_coordinate(&unsorted, &grouped);
     (tmp, grouped)
 }
 
@@ -243,9 +275,17 @@ fn test_simulate_grouped_reads_deterministic() {
     simulate_grouped_reads(&bam1, &truth1, &reference, 42, 100);
     simulate_grouped_reads(&bam2, &truth2, &reference, 42, 100);
 
+    // `simulate grouped-reads` declares template-coordinate order without guaranteeing it
+    // (see `sort_template_coordinate`'s doc comment) — sort before content-comparing so the
+    // universal sort-order verification precondition sees genuinely ordered input.
+    let sorted1 = tmp.path().join("grouped1_sorted.bam");
+    let sorted2 = tmp.path().join("grouped2_sorted.bam");
+    sort_template_coordinate(&bam1, &sorted1);
+    sort_template_coordinate(&bam2, &sorted2);
+
     assert_bams_identical(
-        &bam1,
-        &bam2,
+        &sorted1,
+        &sorted2,
         "content",
         "Two runs with same seed should produce identical BAMs",
     );
@@ -498,8 +538,16 @@ fn test_different_seeds_produce_different_output() {
     simulate_grouped_reads(&bam1, &truth1, &reference, 42, 100);
     simulate_grouped_reads(&bam2, &truth2, &reference, 99, 100);
 
+    // See `sort_template_coordinate`'s doc comment: sort before content-comparing so the
+    // universal sort-order verification precondition sees genuinely ordered input rather
+    // than rejecting the pair before content is ever compared.
+    let sorted1 = tmp.path().join("seed1_sorted.bam");
+    let sorted2 = tmp.path().join("seed2_sorted.bam");
+    sort_template_coordinate(&bam1, &sorted1);
+    sort_template_coordinate(&bam2, &sorted2);
+
     assert!(
-        !compare_bams_in_process(&bam1, &bam2, "content"),
+        !compare_bams_in_process(&sorted1, &sorted2, "content"),
         "Expected compare bams to report content differences between distinct seeds",
     );
 }

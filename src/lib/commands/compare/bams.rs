@@ -593,7 +593,8 @@ impl Command for CompareBams {
         // grouping) or a differently-worded engine-level error (`sort`).
         let (_, h1) = create_raw_bam_reader(&self.bam1, 1)?;
         let (_, h2) = create_raw_bam_reader(&self.bam2, 1)?;
-        require_compatible_headers(&h1, &h2).context("input BAM headers are incompatible")?;
+        let declared_order =
+            require_compatible_headers(&h1, &h2).context("input BAM headers are incompatible")?;
 
         // `sort` has no notion of `CompareMode`/`ContentPredicate` — it verifies sort
         // order and compares by sort-key run instead of pairing records positionally or
@@ -630,6 +631,21 @@ impl Command for CompareBams {
         // errors and must not produce an `--ignore-order` error message.
         if self.ignore_order == Some(true) && !matches!(mode, CompareMode::Grouping) {
             anyhow::bail!("--ignore-order is only valid with --mode grouping");
+        }
+
+        // Universal sort-order verification precondition: `Content` mode pairs records
+        // purely by position (see `CompareMode::Content`'s doc comment), so an `@HD`-declared
+        // order that the records don't actually honor would silently corrupt that pairing
+        // rather than surfacing as an honest diff. Only verify when the gate determined a
+        // verifiable order (`declared_order == None` means genuinely orderless input, e.g.
+        // `extract`/`fastq`/`zipper` output — nothing to verify) and only for `Content` mode
+        // (`Grouping` canonicalizes to queryname order itself via the key-join engine, so it
+        // is order-independent and never trusts the declared order either).
+        if let Some(order) = declared_order {
+            if matches!(mode, CompareMode::Content) {
+                super::engines::sort_verify::verify_records_in_order(&self.bam1, order)?;
+                super::engines::sort_verify::verify_records_in_order(&self.bam2, order)?;
+            }
         }
 
         // In `--quiet` mode only the exit code communicates the result, so suppress this

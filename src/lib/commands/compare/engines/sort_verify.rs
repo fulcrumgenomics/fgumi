@@ -560,6 +560,85 @@ pub fn sort_verify_compare(
     Ok(outcome)
 }
 
+/// Verify every record in `path` is non-decreasing under `order`'s comparator. Err names the
+/// first violating pair. Used as a universal precondition for order-dependent comparisons
+/// (`CompareBams::execute`'s content-mode gate: an `@HD`-declared order must not be trusted
+/// blindly — see `CompareMode::Content`'s doc comment).
+///
+/// This is a separate, fail-fast entry point from `sort_verify_compare`'s own per-file
+/// violation *counting* (`run_full_verify`'s `verify_one`, part of the fuller `--command
+/// sort` report that also needs to keep going to compare run multisets even after finding
+/// violations). Both call sites route through the same underlying comparator machinery —
+/// the per-`SortOrder` key extractors (`extract_coordinate_key_inline`, `RawQuerynameKey`/
+/// `RawQuerynameLexKey::extract`, `extract_template_key_inline`), their key comparisons
+/// (`<`, `TemplateKey::core_cmp`), and [`verify_sort_order`] itself — so no comparator logic
+/// is reimplemented here, only the per-order dispatch.
+///
+/// # Errors
+///
+/// Returns an error if `path` cannot be opened/read, or if any record violates `order`
+/// (naming the first violating record's 1-based position and read name).
+pub(crate) fn verify_records_in_order(path: &Path, order: SortOrder) -> Result<()> {
+    let (_, header) = create_raw_bam_reader(path, 1)
+        .with_context(|| format!("opening {} to verify sort order", path.display()))?;
+
+    let (_, violations, first_violation) = match order {
+        SortOrder::Coordinate => {
+            let nref = header.reference_sequences().len() as u32;
+            let reader = open_raw_reader(path)?;
+            verify_sort_order(
+                reader,
+                |bam: &[u8]| extract_coordinate_key_inline(bam, nref),
+                |key: &u64, prev: &u64| key < prev,
+            )?
+        }
+        SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
+            let ctx = SortContext::from_header(&header);
+            let reader = open_raw_reader(path)?;
+            verify_sort_order(
+                reader,
+                move |bam: &[u8]| RawQuerynameLexKey::extract(bam, &ctx),
+                |key: &RawQuerynameLexKey, prev: &RawQuerynameLexKey| key < prev,
+            )?
+        }
+        SortOrder::Queryname(QuerynameComparator::Natural) => {
+            let ctx = SortContext::from_header(&header);
+            let reader = open_raw_reader(path)?;
+            verify_sort_order(
+                reader,
+                move |bam: &[u8]| RawQuerynameKey::extract(bam, &ctx),
+                |key: &RawQuerynameKey, prev: &RawQuerynameKey| key < prev,
+            )?
+        }
+        SortOrder::TemplateCoordinate => {
+            let lib_lookup = LibraryLookup::from_header(&header);
+            let hasher = cb_hasher();
+            // Matches `fgumi sort`'s own `--verify` (crate::commands::sort::parse_cell_tag):
+            // template-coordinate always hashes the CB tag into the sort key when present.
+            let cell_tag = Some(SamTag::CB);
+            let reader = open_raw_reader(path)?;
+            verify_sort_order(
+                reader,
+                move |bam: &[u8]| extract_template_key_inline(bam, &lib_lookup, cell_tag, &hasher),
+                |key: &TemplateKey, prev: &TemplateKey| key.core_cmp(prev) == Ordering::Less,
+            )?
+        }
+    };
+
+    if violations > 0 {
+        let (record_num, name) = first_violation
+            .expect("verify_sort_order must report a first_violation when violations > 0");
+        bail!(
+            "{}: {violations} record(s) violate the declared {order:?} sort order (first at \
+             record {record_num}, read name '{name}'); records must actually be in {order:?} \
+             order, not merely declare it, for order-dependent comparison",
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use bstr::BString;

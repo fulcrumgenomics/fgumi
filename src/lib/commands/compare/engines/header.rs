@@ -570,6 +570,20 @@ mod tests {
         assert!(format!("{err}").contains("declared sort order"), "got: {err}");
     }
 
+    /// A semantically different queryname sub-sort (natural vs lexicographical) is a genuine
+    /// sort-order divergence, not a spelling difference `compare_hd`'s `SS` normalization
+    /// should paper over (Task 2 Minor M2b): `sort_order_from_header` maps the two to
+    /// different `SortOrder::Queryname(QuerynameComparator)` variants, so the gate's
+    /// `a == b` check must catch it just like `coordinate` vs `queryname` does.
+    #[test]
+    fn require_compatible_headers_rejects_natural_vs_lexicographical_queryname() {
+        let nat = header_with_hd(Some("queryname"), None, Some("queryname:natural"));
+        let lex = header_with_hd(Some("queryname"), None, Some("queryname:lexicographical"));
+        let err = require_compatible_headers(&nat, &lex)
+            .expect_err("natural vs lexicographical are different orders");
+        assert!(format!("{err}").contains("sort orders differ"), "got: {err}");
+    }
+
     /// A `@SQ` dictionary divergence is a hard incompatibility (not a record-level diff).
     #[test]
     fn require_compatible_headers_rejects_sq_dictionary_mismatch() {

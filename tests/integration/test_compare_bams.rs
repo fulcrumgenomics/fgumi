@@ -2062,3 +2062,91 @@ fn compare_hard_fails_on_sq_dictionary_mismatch() {
     let err = run_compare_content_expect_err(&a, &b);
     assert!(err.contains("@SQ"), "got: {err}");
 }
+
+// ============================================================================
+// Universal sort-order verification precondition (Task 3): `require_compatible_headers`'
+// declared order is a header claim, not proof — `Content` mode pairs records purely by
+// position, so a file that DECLARES an order but whose records don't actually honor it must
+// be rejected up front rather than silently corrupting the positional pairing. Orderless
+// (undeterminable) pairs — e.g. `extract`/`fastq`/`zipper` output — have nothing to verify
+// and must proceed untouched.
+// ============================================================================
+
+/// A BAM declaring `SO:coordinate` whose records are genuinely out of coordinate order
+/// (pos 500 before pos 100) — the `@HD` claim must not be trusted at face value.
+fn write_bam_declaring_coordinate_but_unsorted(dir: &Path) -> PathBuf {
+    let header = create_coordinate_sorted_header("chr1", 10000);
+    let records =
+        vec![fragment_record(b"read1", 0, 500, false), fragment_record(b"read2", 0, 100, false)];
+    let path = dir.join("bad_coordinate.bam");
+    write_bam(&path, &header, &records);
+    path
+}
+
+/// A companion BAM, genuinely coordinate-sorted, sharing the same header/`@SQ` as
+/// [`write_bam_declaring_coordinate_but_unsorted`] so the pair is header-compatible.
+fn write_sorted_coordinate_bam(dir: &Path) -> PathBuf {
+    let header = create_coordinate_sorted_header("chr1", 10000);
+    let records =
+        vec![fragment_record(b"read1", 0, 100, false), fragment_record(b"read2", 0, 500, false)];
+    let path = dir.join("good_coordinate.bam");
+    write_bam(&path, &header, &records);
+    path
+}
+
+/// Builds a header declaring `SO:unsorted GO:query` with no `SS` tag — the shape
+/// `extract`/`fastq`/`zipper` output declare: genuinely unordered data with no `SortOrder`
+/// this engine can determine (see `require_compatible_headers`'s `Ok(None)` case).
+fn header_unsorted_query_no_ss(ref_name: &str, ref_len: usize) -> Header {
+    use bstr::BString;
+    use noodles::sam::header::record::value::map::Map as HeaderRecordMap;
+    use noodles::sam::header::record::value::map::header::tag::Tag as HeaderTag;
+    use noodles::sam::header::record::value::{
+        Map, map::Header as HeaderRecord, map::ReferenceSequence,
+    };
+    use std::num::NonZeroUsize;
+
+    let HeaderTag::Other(tag) = HeaderTag::from(*b"SO") else { unreachable!() };
+    let mut builder = HeaderRecordMap::<HeaderRecord>::builder().insert(tag, "unsorted");
+    let HeaderTag::Other(tag) = HeaderTag::from(*b"GO") else { unreachable!() };
+    builder = builder.insert(tag, "query");
+    let header_map = builder.build().expect("valid header map");
+
+    let reference_sequence =
+        Map::<ReferenceSequence>::new(NonZeroUsize::new(ref_len).expect("non-zero"));
+    Header::builder()
+        .set_header(header_map)
+        .add_reference_sequence(BString::from(ref_name), reference_sequence)
+        .build()
+}
+
+/// Writes two identical, orderless (`extract`-style `SO:unsorted GO:query`, no `SS`) BAMs.
+fn write_identical_orderless_pair(dir: &Path) -> (PathBuf, PathBuf) {
+    let header = header_unsorted_query_no_ss("chr1", 10000);
+    let records = vec![mapped_record(b"read1", 100), mapped_record(b"read2", 200)];
+    let a = dir.join("orderless_a.bam");
+    let b = dir.join("orderless_b.bam");
+    write_bam(&a, &header, &records);
+    write_bam(&b, &header, &records);
+    (a, b)
+}
+
+/// A BAM that DECLARES coordinate order but whose records are out of coordinate order must be
+/// rejected up-front (don't trust the @HD tag), independent of record content.
+#[test]
+fn content_mode_rejects_records_not_in_declared_coordinate_order() {
+    let tmp = TempDir::new().unwrap();
+    let bad = write_bam_declaring_coordinate_but_unsorted(tmp.path()); // pos 500 then pos 100
+    let good = write_sorted_coordinate_bam(tmp.path());
+    let err = run_compare_content_expect_err(&good, &bad);
+    assert!(err.to_lowercase().contains("order"), "got: {err}");
+}
+
+/// An orderless (extract-style `SO:unsorted GO:query`, no SS) pair has no verifiable order:
+/// content comparison must proceed (no spurious order-verification error).
+#[test]
+fn content_mode_accepts_orderless_extract_headers() {
+    let tmp = TempDir::new().unwrap();
+    let (a, b) = write_identical_orderless_pair(tmp.path()); // SO:unsorted GO:query, no SS
+    assert!(run_compare_in_process(&a, &b, "content", &[]), "orderless identical pair must MATCH");
+}
