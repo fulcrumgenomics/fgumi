@@ -6,6 +6,8 @@
 //! 3. Remove duplicates mode
 
 use clap::Parser;
+use rstest::rstest;
+
 use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::dedup::MarkDuplicates;
 use fgumi_lib::sam::SamTag;
@@ -181,6 +183,89 @@ fn test_dedup_command_remove_duplicates() {
     let count = reader.records().count();
     assert!(count < 6, "Remove-duplicates should produce fewer reads than input");
     assert!(count >= 2, "Should keep at least one pair");
+}
+
+/// Create a paired-end template whose *both* mates are unmapped (`ref_id=-1`, `pos=-1`),
+/// simulating a read pair that failed to align.
+fn create_unmapped_pair(name: &str, umi: &str) -> Vec<RawRecord> {
+    let make = |segment_flag: u16| {
+        let mut b = SamBuilder::new();
+        b.read_name(name.as_bytes())
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | flags::UNMAPPED | flags::MATE_UNMAPPED | segment_flag)
+            .add_string_tag(SamTag::RX, umi.as_bytes());
+        b.build()
+    };
+    vec![make(flags::FIRST_SEGMENT), make(flags::LAST_SEGMENT)]
+}
+
+/// `--include-unmapped` emits templates with no mapped read untouched, while the default
+/// drops them. Input is 3 mapped duplicate pairs (6 reads) + 1 fully-unmapped pair (2 reads);
+/// the default keeps only the 6 mapped reads, and `--include-unmapped` keeps all 8.
+#[rstest]
+#[case::default_drops_unmapped(false, 6, 0)]
+#[case::include_unmapped_keeps(true, 8, 2)]
+fn test_dedup_include_unmapped(
+    #[case] include_unmapped: bool,
+    #[case] expected_total: usize,
+    #[case] expected_unmapped: usize,
+) {
+    use noodles::sam::alignment::record::data::field::Tag;
+    use noodles::sam::alignment::record_buf::RecordBuf;
+    use noodles::sam::alignment::record_buf::data::field::value::Value as DataValue;
+
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    let mut records = create_duplicate_group("dup1", "ACGTACGT", 3, 100);
+    records.extend(create_unmapped_pair("unmapped1", "TGCATGCA"));
+    create_sorted_bam(&input_bam, records);
+
+    let mut args: Vec<String> = vec![
+        "dedup".into(),
+        "--input".into(),
+        input_bam.to_str().unwrap().into(),
+        "--output".into(),
+        output_bam.to_str().unwrap().into(),
+        "--strategy".into(),
+        "identity".into(),
+        "--compression-level".into(),
+        "1".into(),
+    ];
+    if include_unmapped {
+        args.push("--include-unmapped".into());
+    }
+    let cmd = MarkDuplicates::try_parse_from(&args).expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("Dedup command failed");
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let out_header = reader.read_header().unwrap();
+
+    let mi_tag = Tag::from(SamTag::MI);
+    let mut total = 0usize;
+    let mut unmapped_seen = 0usize;
+    for result in reader.record_bufs(&out_header) {
+        let record: RecordBuf = result.expect("read record");
+        total += 1;
+        let record_flags = record.flags();
+        if record_flags.is_unmapped() {
+            unmapped_seen += 1;
+            // Pass-through reads are emitted untouched: never duplicate-marked, never MI-tagged.
+            assert!(
+                !record_flags.is_duplicate(),
+                "unmapped pass-through read must not be duplicate-marked"
+            );
+            assert!(
+                !matches!(record.data().get(&mi_tag), Some(DataValue::String(_))),
+                "unmapped pass-through read must not carry an MI tag"
+            );
+        }
+    }
+
+    assert_eq!(total, expected_total, "unexpected output record count");
+    assert_eq!(unmapped_seen, expected_unmapped, "unexpected unmapped-read count");
 }
 
 /// Regression test for OOM with large position groups in `--no-umi` mode.
