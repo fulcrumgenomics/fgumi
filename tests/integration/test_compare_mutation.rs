@@ -1876,6 +1876,8 @@ fn mutation_catalog_covers_every_compared_dimension() {
         // consensus depth/error tags (compared exactly)
         "cD former-saturated pair differs",
         "cD non-saturated pair",
+        "cM difference flagged",
+        "cE difference flagged",
         "duplex aD former-saturated pair differs",
         "duplex bD former-saturated pair differs",
         "duplex combined cD former-saturated differs",
