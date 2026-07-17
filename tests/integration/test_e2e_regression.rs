@@ -240,6 +240,73 @@ fn assert_bams_identical(bam1: &Path, bam2: &Path, mode: &str, context: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers: record-byte-exact comparison
+// ---------------------------------------------------------------------------
+//
+// `assert_bams_identical(..., "content", ...)` above normalizes tag order, integer tag
+// width, the `tc` tag, and `@PG`/`@CO` (see `raw_compare::content_key_exact`) -- by design,
+// so genuinely equivalent output from different tools/writers still matches. But that same
+// normalization means a *same-seed, same-binary* determinism test using "content" mode
+// cannot detect writer nondeterminism confined to exactly those normalized dimensions (e.g.
+// two runs emitting the same tags in a different order, or a different integer tag width for
+// the same value). The helpers below instead compare every record's raw on-disk bytes
+// exactly, so a same-seed run is held to a strictly stronger bar: not just semantically
+// equivalent, but byte-identical.
+
+/// Zeroes a raw record's BAM `bin` field (bytes 10-11) in place, so it does not enter the
+/// byte-exact fingerprint. `bin` is a BAM index optimization recomputed from the record's
+/// position, not part of the SAM data model — comparing it would risk flagging a
+/// non-difference. Modeled on the `strip_bin` helper from the (now-removed, pre-redesign)
+/// key-join canonicalization test that used to live in `test_compare_bams.rs`.
+fn strip_bin(mut bytes: Vec<u8>) -> Vec<u8> {
+    if bytes.len() >= 12 {
+        bytes[10..12].fill(0);
+    }
+    bytes
+}
+
+/// Reads every record from `path`, in on-disk order, as raw BAM bytes (`bin` zeroed via
+/// [`strip_bin`]) via the same non-noodles reader the sort/compare engines use internally.
+/// The header is intentionally never read past (`skip_header`): `@PG` carries this process's
+/// own invocation (e.g. absolute temp-dir paths), which differs run-to-run even for
+/// genuinely deterministic record output, so a byte-exact header comparison would produce
+/// false positives unrelated to the writer determinism this helper exists to check.
+fn read_all_record_bytes(path: &Path) -> Vec<Vec<u8>> {
+    let file = File::open(path).expect("open BAM for record-byte-exact read");
+    let mut reader = fgumi_sort::RawBamRecordReader::new(file).expect("open raw BAM reader");
+    reader.skip_header().expect("skip header");
+    let mut records = Vec::new();
+    while let Some(record) = reader.next_record().expect("read raw BAM record") {
+        records.push(strip_bin(record.as_ref().to_vec()));
+    }
+    records
+}
+
+/// Assert that two BAM files carry exactly the same records, in the same on-disk order,
+/// down to the raw byte (`bin` field excluded — see [`strip_bin`]; header excluded — see
+/// [`read_all_record_bytes`]). Unlike `assert_bams_identical(..., "content", ...)`, this
+/// does NOT normalize tag order, integer tag width, or the `tc` tag, so it catches same-seed
+/// writer nondeterminism confined to exactly those dimensions.
+fn assert_bams_record_byte_identical(bam1: &Path, bam2: &Path, context: &str) {
+    let records1 = read_all_record_bytes(bam1);
+    let records2 = read_all_record_bytes(bam2);
+    assert_eq!(
+        records1.len(),
+        records2.len(),
+        "{context}: record count differs byte-exact ({} vs {})",
+        records1.len(),
+        records2.len()
+    );
+    for (i, (r1, r2)) in records1.iter().zip(records2.iter()).enumerate() {
+        assert_eq!(
+            r1, r2,
+            "{context}: record {i} is not byte-identical (bin field excluded) -- \
+             same-seed run produced different bytes for the same logical record"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers: test setup
 // ---------------------------------------------------------------------------
 
@@ -289,6 +356,11 @@ fn test_simulate_grouped_reads_deterministic() {
         "content",
         "Two runs with same seed should produce identical BAMs",
     );
+    assert_bams_record_byte_identical(
+        &sorted1,
+        &sorted2,
+        "Two runs with same seed should produce identical BAMs",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +380,11 @@ fn test_simplex_pipeline_deterministic() {
         &simplex1,
         &simplex2,
         "content",
+        "Two simplex runs should produce identical BAMs",
+    );
+    assert_bams_record_byte_identical(
+        &simplex1,
+        &simplex2,
         "Two simplex runs should produce identical BAMs",
     );
 }
@@ -332,6 +409,11 @@ fn test_simplex_filter_pipeline_deterministic() {
         &filtered1,
         &filtered2,
         "content",
+        "Two filter runs should produce identical BAMs",
+    );
+    assert_bams_record_byte_identical(
+        &filtered1,
+        &filtered2,
         "Two filter runs should produce identical BAMs",
     );
 }
@@ -417,6 +499,11 @@ fn test_full_pipeline_extract_to_filter() {
         &tmp.path().join("filtered_a.bam"),
         &tmp.path().join("filtered_b.bam"),
         "content",
+        "Two full pipeline runs should produce identical BAMs",
+    );
+    assert_bams_record_byte_identical(
+        &tmp.path().join("filtered_a.bam"),
+        &tmp.path().join("filtered_b.bam"),
         "Two full pipeline runs should produce identical BAMs",
     );
 }
@@ -518,6 +605,11 @@ fn test_dedup_pipeline_deterministic() {
         &dedup1,
         &dedup2,
         "content",
+        "Two dedup runs should produce identical BAMs",
+    );
+    assert_bams_record_byte_identical(
+        &dedup1,
+        &dedup2,
         "Two dedup runs should produce identical BAMs",
     );
 }
