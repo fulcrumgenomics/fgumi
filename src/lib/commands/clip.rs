@@ -440,13 +440,13 @@ impl Clip {
 
         // Apply fixed-position clipping
         let num_five_prime = if self.read_one_five_prime > 0 {
-            clipper.clip_5_prime_end_of_alignment(record, self.read_one_five_prime)
+            clipper.clip_5_prime_end_of_read_raw(record, self.read_one_five_prime)
         } else {
             0
         };
 
         let num_three_prime = if self.read_one_three_prime > 0 {
-            clipper.clip_3_prime_end_of_alignment(record, self.read_one_three_prime)
+            clipper.clip_3_prime_end_of_read_raw(record, self.read_one_three_prime)
         } else {
             0
         };
@@ -516,34 +516,34 @@ impl Clip {
 
         // Apply fixed-position clipping for R1
         let num_r1_five_prime = if is_r1_first && self.read_one_five_prime > 0 {
-            clipper.clip_5_prime_end_of_alignment(r1, self.read_one_five_prime)
+            clipper.clip_5_prime_end_of_read_raw(r1, self.read_one_five_prime)
         } else if !is_r1_first && self.read_two_five_prime > 0 {
-            clipper.clip_5_prime_end_of_alignment(r1, self.read_two_five_prime)
+            clipper.clip_5_prime_end_of_read_raw(r1, self.read_two_five_prime)
         } else {
             0
         };
 
         let num_r1_three_prime = if is_r1_first && self.read_one_three_prime > 0 {
-            clipper.clip_3_prime_end_of_alignment(r1, self.read_one_three_prime)
+            clipper.clip_3_prime_end_of_read_raw(r1, self.read_one_three_prime)
         } else if !is_r1_first && self.read_two_three_prime > 0 {
-            clipper.clip_3_prime_end_of_alignment(r1, self.read_two_three_prime)
+            clipper.clip_3_prime_end_of_read_raw(r1, self.read_two_three_prime)
         } else {
             0
         };
 
         // Apply fixed-position clipping for R2
         let num_r2_five_prime = if is_r2_last && self.read_two_five_prime > 0 {
-            clipper.clip_5_prime_end_of_alignment(r2, self.read_two_five_prime)
+            clipper.clip_5_prime_end_of_read_raw(r2, self.read_two_five_prime)
         } else if !is_r2_last && self.read_one_five_prime > 0 {
-            clipper.clip_5_prime_end_of_alignment(r2, self.read_one_five_prime)
+            clipper.clip_5_prime_end_of_read_raw(r2, self.read_one_five_prime)
         } else {
             0
         };
 
         let num_r2_three_prime = if is_r2_last && self.read_two_three_prime > 0 {
-            clipper.clip_3_prime_end_of_alignment(r2, self.read_two_three_prime)
+            clipper.clip_3_prime_end_of_read_raw(r2, self.read_two_three_prime)
         } else if !is_r2_last && self.read_one_three_prime > 0 {
-            clipper.clip_3_prime_end_of_alignment(r2, self.read_one_three_prime)
+            clipper.clip_3_prime_end_of_read_raw(r2, self.read_one_three_prime)
         } else {
             0
         };
@@ -690,24 +690,24 @@ impl Clip {
 
                         // Apply fixed-position clipping for R1
                         if is_r1_first && read_one_five_prime > 0 {
-                            clipper.clip_5_prime_end_of_alignment(r1, read_one_five_prime);
+                            clipper.clip_5_prime_end_of_read_raw(r1, read_one_five_prime);
                         } else if !is_r1_first && read_two_five_prime > 0 {
-                            clipper.clip_5_prime_end_of_alignment(r1, read_two_five_prime);
+                            clipper.clip_5_prime_end_of_read_raw(r1, read_two_five_prime);
                         }
                         if is_r1_first && read_one_three_prime > 0 {
-                            clipper.clip_3_prime_end_of_alignment(r1, read_one_three_prime);
+                            clipper.clip_3_prime_end_of_read_raw(r1, read_one_three_prime);
                         } else if !is_r1_first && read_two_three_prime > 0 {
-                            clipper.clip_3_prime_end_of_alignment(r1, read_two_three_prime);
+                            clipper.clip_3_prime_end_of_read_raw(r1, read_two_three_prime);
                         }
 
                         // Apply fixed-position clipping for R2. The primary R2 slot is always a
                         // last-segment read (find_primary_pair_indices only fills it from an
                         // is_last_segment read), so it always uses the read-two thresholds.
                         if read_two_five_prime > 0 {
-                            clipper.clip_5_prime_end_of_alignment(r2, read_two_five_prime);
+                            clipper.clip_5_prime_end_of_read_raw(r2, read_two_five_prime);
                         }
                         if read_two_three_prime > 0 {
-                            clipper.clip_3_prime_end_of_alignment(r2, read_two_three_prime);
+                            clipper.clip_3_prime_end_of_read_raw(r2, read_two_three_prime);
                         }
 
                         // Clip overlapping reads
@@ -737,10 +737,10 @@ impl Clip {
                         // upgrade was already applied over all template reads above.
                         let record = &mut records[i1];
                         if read_one_five_prime > 0 {
-                            clipper.clip_5_prime_end_of_alignment(record, read_one_five_prime);
+                            clipper.clip_5_prime_end_of_read_raw(record, read_one_five_prime);
                         }
                         if read_one_three_prime > 0 {
-                            clipper.clip_3_prime_end_of_alignment(record, read_one_three_prime);
+                            clipper.clip_3_prime_end_of_read_raw(record, read_one_three_prime);
                         }
                     }
                     _ => {}
@@ -1237,12 +1237,15 @@ mod tests {
         assert_eq!(supp.tags().find_int(SamTag::MQ), Some(40));
     }
 
-    // With an unmapped mate, set_supplemental_mate_info_raw flags the mate unmapped and drops MC.
+    // With an unmapped mate, set_supplemental_mate_info_raw flags the mate unmapped and drops MC,
+    // but still writes MQ from the mate's mapping quality (htsjdk 5.0.0 sets MQ unconditionally).
     #[test]
     fn test_set_supplemental_mate_info_raw_unmapped_mate() {
         use crate::sam::RecordBuilder;
         use fgumi_raw_bam::flags as rflags;
 
+        // Give the unmapped mate a distinct, non-zero MAPQ so the MQ assertion below proves the
+        // value was copied from the mate rather than defaulting to 0.
         let mate = encode_raw(
             &RecordBuilder::mapped_read()
                 .name("q")
@@ -1251,6 +1254,7 @@ mod tests {
                 .unmapped(true)
                 .reference_sequence_id(0)
                 .alignment_start(301)
+                .mapping_quality(37)
                 .cigar("50M")
                 .sequence(&"A".repeat(50))
                 .build(),
@@ -1264,6 +1268,8 @@ mod tests {
 
         assert_ne!(supp.flags() & rflags::MATE_UNMAPPED, 0, "mate is unmapped");
         assert!(!supp.tags().contains(SamTag::MC), "MC dropped when mate unmapped");
+        // MQ is set unconditionally to the mate's mapping quality, even for an unmapped mate.
+        assert_eq!(supp.tags().find_int(SamTag::MQ), Some(37), "MQ set from unmapped mate MAPQ");
     }
 
     // fix_supplemental_mate_info points R1 supplementals at the primary R2 and R2 supplementals
@@ -2009,7 +2015,7 @@ mod tests {
     }
 
     // Integration tests
-    use crate::sam::SamBuilder;
+    use crate::sam::{SamBuilder, Strand};
     use anyhow::Result;
     use tempfile::TempDir;
 
@@ -2030,6 +2036,284 @@ mod tests {
         let header = reader.read_header()?;
         let records: Vec<_> = reader.record_bufs(&header).collect::<std::io::Result<Vec<_>>>()?;
         Ok(records)
+    }
+
+    /// Renders a record's CIGAR as a string (e.g. `"5S15M"`) for assertions.
+    fn cigar_string(record: &noodles::sam::alignment::RecordBuf) -> String {
+        use noodles::sam::alignment::record::Cigar as _;
+        use noodles::sam::alignment::record::cigar::op::Kind;
+        use std::fmt::Write as _;
+        record.cigar().iter().filter_map(std::result::Result::ok).fold(
+            String::new(),
+            |mut acc, op| {
+                let kind = match op.kind() {
+                    Kind::Match => 'M',
+                    Kind::Insertion => 'I',
+                    Kind::Deletion => 'D',
+                    Kind::Skip => 'N',
+                    Kind::SoftClip => 'S',
+                    Kind::HardClip => 'H',
+                    Kind::Pad => 'P',
+                    Kind::SequenceMatch => '=',
+                    Kind::SequenceMismatch => 'X',
+                };
+                let _ = write!(acc, "{}{}", op.len(), kind);
+                acc
+            },
+        )
+    }
+
+    /// Rewrites `builder`'s `@HD` line to advertise `SO:unsorted GO:query` (query grouped).
+    /// `SamBuilder` writes a template's reads adjacently, so the emitted BAM is genuinely
+    /// query grouped; the overlap-clip / clip-past-mate pipeline rejects input whose header
+    /// does not advertise queryname sorting or query grouping (`clip` requires a template's
+    /// reads to be adjacent).
+    fn mark_query_grouped(builder: &mut SamBuilder) {
+        builder.header = crate::sam::header_as_query_grouped(&builder.header);
+    }
+
+    /// CLIP3-02: fixed-position clipping must ensure *at least* N bases are clipped at
+    /// the 5'/3' end *including any existing clipping*, matching fgbio `ClipBam`'s use of
+    /// `clip5PrimeEndOfRead`/`clip3PrimeEndOfRead`. A read that already carries >= N
+    /// bases of clipping at the requested end must not be clipped further.
+    #[rstest]
+    #[case::single_threaded(ThreadingOptions::none())]
+    #[case::multi_threaded(ThreadingOptions::new(2))]
+    fn test_fixed_position_clip_counts_existing_clipping(
+        #[case] threading: ThreadingOptions,
+    ) -> Result<()> {
+        let dir = TempDir::new()?;
+        let ref_path = create_test_reference(&dir);
+        let input_path = dir.path().join("input.bam");
+        let output_path = dir.path().join("output.bam");
+
+        // R1 forward with 5 bases already soft-clipped at its 5' (start) end.
+        // R2 reverse with 4 bases already soft-clipped at its 5' (end) end.
+        let mut builder = SamBuilder::with_single_ref("chr1", 200);
+        let _ = builder
+            .add_pair()
+            .name("read1")
+            .contig(0)
+            .start1(10)
+            .cigar1("5S15M")
+            .bases1("ACGTACGTACGTACGTACGT") // 20 bases
+            .start2(120)
+            .cigar2("16M4S")
+            .bases2("ACGTACGTACGTACGTACGT") // 20 bases
+            .build();
+        mark_query_grouped(&mut builder);
+        builder.write(&input_path)?;
+
+        let clip = Clip {
+            io: BamIoOptions {
+                input: input_path,
+                output: output_path.clone(),
+                async_reader: false,
+            },
+            reference: ref_path,
+            clipping_mode: ClippingMode::Soft,
+            clip_overlapping_reads: false,
+            clip_extending_past_mate: false,
+            // Request fewer 5' bases than already exist on each read: fgbio clips 0 more there
+            // (the existing-clipping check). Also request 5 bases at R1's 3' end, which has no
+            // existing clipping, so clipping *is* applied there — this makes the command path
+            // exercise real clipping rather than a no-op.
+            read_one_five_prime: 3,
+            read_one_three_prime: 5,
+            read_two_five_prime: 2,
+            read_two_three_prime: 0,
+            upgrade_clipping: false,
+            auto_clip_attributes: false,
+            metrics: None,
+            threading,
+            compression: CompressionOptions { compression_level: 1 },
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+        };
+        clip.execute("test")?;
+
+        let records = read_bam_records(&output_path)?;
+        assert_eq!(records.len(), 2);
+        for record in &records {
+            let cigar = cigar_string(record);
+            if record.flags().is_first_segment() {
+                assert_eq!(
+                    cigar, "5S10M5S",
+                    "R1: existing 5' clip counted (5S retained, no extra 5' clip), and the \
+                     requested 5 bases newly clipped at the 3' end"
+                );
+            } else {
+                assert_eq!(
+                    cigar, "16M4S",
+                    "R2 already had >= 2 bases 5'-clipped; expected no change"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// CLIP3-01 (command level): overlap clipping must be strand-normalized end to end.
+    /// A pair whose first-of-pair read is the reverse strand must yield the same
+    /// per-strand output as the mirror pair whose first-of-pair read is the forward
+    /// strand — the `clip` command must not clip the wrong (outer) ends. Exercised in
+    /// both the single-threaded (`threads == 0`) and multi-threaded pipeline paths.
+    #[rstest]
+    #[case::single_threaded(0)]
+    #[case::multi_threaded(4)]
+    fn test_clip_overlap_negative_strand_first_matches_mirror(
+        #[case] threads: usize,
+    ) -> Result<()> {
+        let dir = TempDir::new()?;
+        let ref_path = create_test_reference(&dir);
+
+        // Runs `clip --clip-overlapping-reads` on an FR pair with the given strands and
+        // returns (forward-read CIGAR, reverse-read CIGAR) from the output.
+        let run = |tag: &str,
+                   r1_minus: bool,
+                   r1_start: usize,
+                   r2_start: usize|
+         -> Result<(String, String)> {
+            let input_path = dir.path().join(format!("in_{tag}.bam"));
+            let output_path = dir.path().join(format!("out_{tag}.bam"));
+            let mut builder = SamBuilder::with_single_ref("chr1", 200);
+            let _ = builder
+                .add_pair()
+                .name("read1")
+                .contig(0)
+                .start1(r1_start)
+                .start2(r2_start)
+                .strand1(if r1_minus { Strand::Minus } else { Strand::Plus })
+                .strand2(if r1_minus { Strand::Plus } else { Strand::Minus })
+                .build();
+            mark_query_grouped(&mut builder);
+            builder.write(&input_path)?;
+
+            let threading = if threads == 0 {
+                ThreadingOptions::none()
+            } else {
+                ThreadingOptions::new(threads)
+            };
+            let clip = Clip {
+                io: BamIoOptions {
+                    input: input_path,
+                    output: output_path.clone(),
+                    async_reader: false,
+                },
+                reference: ref_path.clone(),
+                clipping_mode: ClippingMode::Soft,
+                clip_overlapping_reads: true,
+                clip_extending_past_mate: false,
+                read_one_five_prime: 0,
+                read_one_three_prime: 0,
+                read_two_five_prime: 0,
+                read_two_three_prime: 0,
+                upgrade_clipping: false,
+                auto_clip_attributes: false,
+                metrics: None,
+                threading,
+                compression: CompressionOptions { compression_level: 1 },
+                scheduler_opts: SchedulerOptions::default(),
+                queue_memory: QueueMemoryOptions::default(),
+            };
+            clip.execute("test")?;
+
+            let records = read_bam_records(&output_path)?;
+            assert_eq!(records.len(), 2);
+            let forward = records
+                .iter()
+                .find(|r| !r.flags().is_reverse_complemented())
+                .map(cigar_string)
+                .expect("a forward-strand read");
+            let reverse = records
+                .iter()
+                .find(|r| r.flags().is_reverse_complemented())
+                .map(cigar_string)
+                .expect("a reverse-strand read");
+            Ok((forward, reverse))
+        };
+
+        // Forward-first mirror: R1 forward on the left, R2 reverse on the right.
+        let (fwd_forward, fwd_reverse) = run("fwdfirst", false, 10, 20)?;
+        // Negative-strand first: R1 reverse on the right, R2 forward on the left.
+        let (rev_forward, rev_reverse) = run("revfirst", true, 20, 10)?;
+
+        // Pin the canonical (forward-first) output so the test fails if the command path
+        // becomes a no-op: the 100bp reads overlap over [20, 110), so overlap clipping trims
+        // 45bp from each read's 3' end where they meet (forward keeps [10, 65) -> 55M45S;
+        // reverse keeps [65, 120) -> 45S55M). Both differ from the unclipped 100M input, so
+        // a pipeline that silently skipped clipping would not satisfy these assertions.
+        assert_eq!(fwd_forward, "55M45S", "forward-read must be 3'-clipped over the overlap");
+        assert_eq!(fwd_reverse, "45S55M", "reverse-read must be 3'-clipped over the overlap");
+
+        assert_eq!(
+            fwd_forward, rev_forward,
+            "forward-read CIGAR must not depend on R1/R2 strand order"
+        );
+        assert_eq!(
+            fwd_reverse, rev_reverse,
+            "reverse-read CIGAR must not depend on R1/R2 strand order"
+        );
+        Ok(())
+    }
+
+    /// CLIP3-03: `--upgrade-clipping` in `soft-with-mask` mode must mask existing
+    /// soft-clipped bases to N with minimum quality while leaving the CIGAR intact,
+    /// matching fgbio `ClipBam --upgrade-clipping --clipping-mode SoftWithMask`.
+    #[test]
+    fn test_upgrade_clipping_soft_with_mask_masks_existing_soft_bases() -> Result<()> {
+        let dir = TempDir::new()?;
+        let ref_path = create_test_reference(&dir);
+        let input_path = dir.path().join("input.bam");
+        let output_path = dir.path().join("output.bam");
+
+        // A fragment with 5 existing soft-clipped bases at the 5' end.
+        let mut builder = SamBuilder::with_single_ref("chr1", 200);
+        let _ = builder
+            .add_frag()
+            .name("maskme")
+            .contig(0)
+            .start(20)
+            .cigar("5S15M")
+            .bases("ACGTACGTACGTACGTACGT") // 20 bases
+            .strand(Strand::Plus)
+            .build();
+        mark_query_grouped(&mut builder);
+        builder.write(&input_path)?;
+
+        let clip = Clip {
+            io: BamIoOptions {
+                input: input_path,
+                output: output_path.clone(),
+                async_reader: false,
+            },
+            reference: ref_path,
+            clipping_mode: ClippingMode::SoftWithMask,
+            clip_overlapping_reads: false,
+            clip_extending_past_mate: false,
+            read_one_five_prime: 0,
+            read_one_three_prime: 0,
+            read_two_five_prime: 0,
+            read_two_three_prime: 0,
+            upgrade_clipping: true,
+            auto_clip_attributes: false,
+            metrics: None,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+        };
+        clip.execute("test")?;
+
+        let records = read_bam_records(&output_path)?;
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(cigar_string(record), "5S15M", "CIGAR unchanged");
+        let bases = record.sequence().as_ref().to_vec();
+        assert_eq!(&bases[..5], b"NNNNN", "leading soft bases masked to N");
+        assert!(bases[5..].iter().all(|&b| b != b'N'), "aligned bases untouched");
+        let quals = record.quality_scores().as_ref().to_vec();
+        assert!(quals[..5].iter().all(|&q| q == 2), "leading soft quals masked to 2");
+        Ok(())
     }
 
     #[test]
