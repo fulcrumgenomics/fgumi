@@ -359,6 +359,28 @@ pub fn clamp_per_base_to_fgbio_short(depth: u16) -> i32 {
     i32::from(depth.min(FGBIO_SHORT_DEPTH_MAX))
 }
 
+/// Clamp a combined per-base duplex error count to fgbio's `Short` ceiling, matching
+/// fgbio's per-base `errors` `Array[Short]` (capped at 32767 at storage).
+///
+/// The duplex and codec callers combine two single-strand consensuses per base, summing
+/// each strand's per-base error (`ea + eb`, and the disagreement `ea + (db - eb)` /
+/// `eb + (da - ea)` variants). Both callers build those strands through
+/// `VanillaUmiConsensusCaller::consensus_call`, which already caps each per-base depth and
+/// error at the `Short` ceiling at push, so in the real pipeline every term is `<= 32767`
+/// and the combined sum is `<= 65534` (fits `u16`). This is therefore a **defensive**
+/// bound: it is computed in a wider signed type and saturated so a hypothetical
+/// above-ceiling strand value can never overflow the `u16` per-base error store or wrap
+/// negative, exactly as fgbio's `Short` array would saturate. The downstream `cE`
+/// numerator re-clamps to the same ceiling, so this changes only the stored intermediate,
+/// never the emitted tag.
+#[must_use]
+pub fn clamp_combined_error_to_fgbio_short(error_sum: i64) -> u16 {
+    // The clamp bounds the value to `[0, 32767]`, which always fits `u16`; the `unwrap_or`
+    // fallback (the ceiling itself) is unreachable and keeps this panic-free.
+    u16::try_from(error_sum.clamp(0, i64::from(FGBIO_SHORT_DEPTH_MAX)))
+        .unwrap_or(FGBIO_SHORT_DEPTH_MAX)
+}
+
 /// Reasons why reads might be rejected and not used in consensus calling
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RejectionReason {

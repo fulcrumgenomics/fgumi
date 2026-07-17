@@ -636,7 +636,8 @@ impl VanillaUmiConsensusCaller {
 
         // For EM-seq/TAPs: annotate methylation first (counts conversions), then normalize
         // source read bases before consensus scoring so that C↔T / G↔A conversion
-        // events at ref-C positions don't inflate error counts or depress quality.
+        // events at ref-C positions don't inflate error counts or depress quality. This runs
+        // over the full (uncapped) set, independent of the per-strand consensus cap below.
         let (methylation, source_reads) = if self.options.methylation_mode.is_enabled() {
             let (annot, normalized) = self.annotate_and_normalize(source_reads);
             (annot, normalized)
@@ -644,9 +645,40 @@ impl VanillaUmiConsensusCaller {
             (None, source_reads)
         };
 
-        // Build consensus from (possibly normalized) source reads
+        // Cap the reads contributing to the single-strand CONSENSUS, matching fgbio's
+        // `consensusCall` (`VanillaUmiConsensusCaller.scala:288`: `shuffle.take(maxReads)`).
+        // The duplex and codec callers reach the single-strand consensus through
+        // `consensus_call`, so without this cap `--max-reads-per-strand` is silently ignored
+        // on those paths (DUPLEX3-01). The vanilla path caps raw records earlier in
+        // `process_group` and does not route through here, so it is unaffected.
+        //
+        // The cap shapes ONLY the consensus bases/quals/depths: the FULL (uncapped)
+        // `source_reads` are retained on the output below. fgbio caps inside `consensusCall`
+        // but passes the *pre-cap* `filteredAbR1s ++ filteredBaR2s` to `duplexConsensus`
+        // (`DuplexConsensusCaller.scala:331,337`, verified at tag 4.1.0), so the duplex caller —
+        // which counts per-base errors and calls the consensus UMI over `output.source_reads` —
+        // must see the uncapped set. Capping it here would systematically undercount duplex
+        // errors under `--max-reads-per-strand`, biasing the `ce`/error-rate tags.
+        let capped_for_consensus = match self.options.max_reads {
+            Some(max_reads) if source_reads.len() > max_reads => {
+                Some(self.downsample_source_reads(&source_reads))
+            }
+            _ => None,
+        };
+        let consensus_reads: &[SourceRead] =
+            capped_for_consensus.as_deref().unwrap_or(source_reads.as_slice());
+
+        // A degenerate cap (`max_reads = 0`, or a cap below `min_reads`) can leave fewer reads
+        // than are required; return no consensus rather than reaching `lengths[min_reads - 1]`
+        // or the empty-source `bail!` in `create_consensus_from_source_reads`. This is a no-op
+        // for every sane configuration (`max_reads >= min_reads`, or `max_reads` unset).
+        if consensus_reads.len() < self.options.min_reads {
+            return Ok(None);
+        }
+
+        // Build consensus from the (capped, possibly normalized) scoring reads.
         let (bases, quals, depths, errors) =
-            self.create_consensus_from_source_reads(&source_reads)?;
+            self.create_consensus_from_source_reads(consensus_reads)?;
 
         // Truncate methylation annotation to consensus length (the anchor read may be
         // longer than the consensus when min_reads > 1 trims to shorter coverage).
@@ -765,6 +797,44 @@ impl VanillaUmiConsensusCaller {
             }
         }
         reads
+    }
+
+    /// Downsamples already-filtered `SourceReads` if there are more than `max_reads`.
+    ///
+    /// This is the `SourceRead` analogue of [`Self::downsample_reads`], applied inside
+    /// [`Self::consensus_call`] so the per-strand cap reaches the duplex and codec callers
+    /// (which build consensus from pre-filtered `SourceReads` rather than raw records). It
+    /// mirrors fgbio's `consensusCall` (`shuffle.take(maxReads)`): the retained subset is
+    /// selected by shuffling with the caller's seeded RNG (default seed 42) so the selection is
+    /// deterministic and unbiased, then keeping `max_reads`. When `max_reads` is unset or the
+    /// strand is at or below the cap this simply clones the input, preserving byte-identical
+    /// output for the default configuration.
+    ///
+    /// To avoid deep-cloning the entire (potentially very large) family just to discard most of
+    /// it, this shuffles an *index* vector `[0, len)` and clones only the `max_reads` retained
+    /// reads. This is bit-identical to shuffling the reads themselves and truncating:
+    /// `SliceRandom::shuffle` is Fisher-Yates, and its RNG-call sequence depends only on the
+    /// slice LENGTH, not the element type. So shuffling `[0..len]` yields the SAME permutation as
+    /// shuffling the reads, hence `idxs[0..max_reads]` selects exactly the reads (in the same
+    /// order) that `reads.shuffle().truncate(max_reads)` would keep. Selection therefore stays
+    /// deterministic-per-seed and unchanged from the prior implementation.
+    ///
+    /// The *rule* matches fgbio, but the *selection* does not byte-match it when downsampling
+    /// actually triggers: fgumi shuffles with `StdRng` (`ChaCha`) while fgbio uses Scala's
+    /// `Random.shuffle` over `java.util.Random` (an LCG), so the same seed value yields a
+    /// different permutation and therefore a different surviving subset. Downsampled consensus
+    /// bases/quals/depths are thus deterministic within fgumi but not byte-identical to fgbio on
+    /// any strand that exceeds the cap.
+    fn downsample_source_reads(&mut self, source_reads: &[SourceRead]) -> Vec<SourceRead> {
+        match self.options.max_reads {
+            Some(max_reads) if source_reads.len() > max_reads => {
+                let mut idxs: Vec<usize> = (0..source_reads.len()).collect();
+                idxs.shuffle(&mut self.rng);
+                idxs.truncate(max_reads);
+                idxs.into_iter().map(|i| source_reads[i].clone()).collect()
+            }
+            _ => source_reads.to_vec(),
+        }
     }
 
     /// Implements phred-style quality trimming from the 3' end.
@@ -1556,6 +1626,8 @@ mod tests {
     use fgumi_raw_bam::{
         ParsedBamRecord, SamBuilder, encode_op, num_bases_extending_past_mate_raw,
     };
+    use proptest::prelude::*;
+    use rstest::rstest;
 
     /// Call `consensus_reads` with a batch of already-built [`RawRecord`]s.
     fn consensus_reads_from_raw(
@@ -1861,6 +1933,219 @@ mod tests {
 
         // Should produce exactly 3 reads (max_reads)
         assert_eq!(downsampled.len(), 3);
+    }
+
+    #[test]
+    fn test_consensus_call_caps_reads_per_strand() {
+        // DUPLEX3-01: `consensus_call` is the single-strand consensus entry point used by the
+        // duplex and codec callers (the vanilla path downsamples raw records earlier and never
+        // reaches this method). fgbio caps the contributing reads inside `consensusCall`
+        // (`shuffle.take(maxReads)`), so `--max-reads-per-strand` must limit how many reads
+        // contribute here. Without the cap, every read contributes and the per-strand depth
+        // exceeds the requested maximum.
+        let options = VanillaUmiConsensusOptions {
+            min_reads: 1,
+            max_reads: Some(3),
+            seed: Some(42),
+            ..Default::default()
+        };
+        let mut caller =
+            VanillaUmiConsensusCaller::new("consensus".to_string(), "A".to_string(), options);
+
+        // Eight identical, full-length source reads: the deepest position sees all eight
+        // unless the per-strand cap is applied.
+        let source_reads: Vec<SourceRead> =
+            (0..8).map(|_| create_source_read_with_cigar("4M")).collect();
+
+        let consensus = caller
+            .consensus_call("umi", source_reads)
+            .expect("consensus_call should succeed")
+            .expect("consensus should be produced");
+
+        let max_depth = consensus.depths.iter().copied().max().unwrap_or(0);
+        assert_eq!(
+            max_depth, 3,
+            "per-strand depth must be capped at max_reads (3), got {max_depth}"
+        );
+    }
+
+    /// The `--max-reads-per-strand` cap must shape ONLY the single-strand consensus
+    /// (bases/quals/depths), NOT the `source_reads` the output carries. The duplex caller
+    /// counts per-base errors and calls the consensus UMI over `output.source_reads`, and fgbio
+    /// uses the *pre-cap* `filteredAbR1s ++ filteredBaR2s` for `duplexConsensus`
+    /// (`DuplexConsensusCaller.scala:337`, verified at tag 4.1.0). Capping the retained source
+    /// reads too would shrink the duplex error denominator and systematically undercount duplex
+    /// errors, biasing the `ce`/error-rate tags a base/read is filtered on. So: the consensus
+    /// depth is capped, but the full uncapped read set survives in `source_reads`.
+    #[test]
+    fn consensus_call_caps_consensus_but_retains_full_source_reads() {
+        let options = VanillaUmiConsensusOptions {
+            min_reads: 1,
+            max_reads: Some(3),
+            seed: Some(42),
+            ..Default::default()
+        };
+        let mut caller =
+            VanillaUmiConsensusCaller::new("consensus".to_string(), "A".to_string(), options);
+
+        let source_reads: Vec<SourceRead> =
+            (0..8).map(|_| create_source_read_with_cigar("4M")).collect();
+
+        let consensus = caller
+            .consensus_call("umi", source_reads)
+            .expect("consensus_call should succeed")
+            .expect("consensus should be produced");
+
+        // The consensus itself is capped at max_reads (DUPLEX3-01) ...
+        assert_eq!(
+            consensus.depths.iter().copied().max().unwrap_or(0),
+            3,
+            "per-strand consensus depth must be capped at max_reads (3)"
+        );
+        // ... but the retained source reads are the FULL uncapped set, so the duplex caller's
+        // downstream error counting / UMI calling sees every read, matching fgbio.
+        assert_eq!(
+            consensus.source_reads.as_ref().map(Vec::len),
+            Some(8),
+            "output.source_reads must retain all 8 uncapped reads for duplex error counting"
+        );
+    }
+
+    /// The per-strand downsampling is deterministic for a fixed seed: two `consensus_call`s over
+    /// the same reads from a caller seeded identically select the same subset and so produce a
+    /// byte-identical consensus. Reads carry a distinct base composition so *which* reads survive
+    /// the cap changes the consensus — the selection (not just the count) is what is pinned.
+    /// (Determinism only: the shuffle uses fgumi's `StdRng`, not fgbio's `java.util.Random`, so
+    /// the selection is not byte-parity with fgbio even at the same seed — see
+    /// `downsample_source_reads`.)
+    #[test]
+    fn consensus_call_downsampling_is_deterministic_for_a_fixed_seed() {
+        let make_reads = || -> Vec<SourceRead> {
+            (0..8)
+                .map(|i| {
+                    let mut sr = create_source_read_with_cigar("4M");
+                    // A third of the reads read 'C' instead of 'A', so the consensus base at each
+                    // position depends on which reads the cap keeps.
+                    if i % 3 == 0 {
+                        sr.bases = vec![b'C'; sr.bases.len()];
+                    }
+                    sr
+                })
+                .collect()
+        };
+        let call = || {
+            let options = VanillaUmiConsensusOptions {
+                min_reads: 1,
+                max_reads: Some(3),
+                seed: Some(42),
+                ..Default::default()
+            };
+            let mut caller =
+                VanillaUmiConsensusCaller::new("consensus".to_string(), "A".to_string(), options);
+            caller
+                .consensus_call("umi", make_reads())
+                .expect("consensus_call should succeed")
+                .expect("consensus should be produced")
+        };
+        let first = call();
+        let second = call();
+        assert_eq!(first.bases, second.bases, "same seed must select the same reads → same bases");
+        assert_eq!(first.quals, second.quals, "same seed → identical quals");
+        assert_eq!(first.depths, second.depths, "same seed → identical depths");
+    }
+
+    #[rstest]
+    // Cap above the read count: no downsampling, every read contributes.
+    #[case::cap_above_count(Some(12), 8)]
+    // Cap equal to the read count: boundary, no downsampling, full depth.
+    #[case::cap_equals_count(Some(8), 8)]
+    // Cap below the read count: downsampled to the cap.
+    #[case::cap_below_count(Some(3), 3)]
+    // No cap: full depth (default configuration, byte-identical behavior).
+    #[case::no_cap(None, 8)]
+    // Degenerate zero cap: fewer than `min_reads` survive, so no consensus is produced
+    // (and, critically, no panic / empty-source bail leaks out).
+    #[case::zero_cap(Some(0), 0)]
+    fn test_consensus_call_max_reads_boundaries(
+        #[case] max_reads: Option<usize>,
+        #[case] expected_max_depth: u16,
+    ) {
+        let options = VanillaUmiConsensusOptions {
+            min_reads: 1,
+            max_reads,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let mut caller =
+            VanillaUmiConsensusCaller::new("consensus".to_string(), "A".to_string(), options);
+
+        let source_reads: Vec<SourceRead> =
+            (0..8).map(|_| create_source_read_with_cigar("4M")).collect();
+
+        let consensus = caller
+            .consensus_call("umi", source_reads)
+            .expect("consensus_call should never error on the cap boundaries");
+
+        let observed_max_depth =
+            consensus.map_or(0, |c| c.depths.iter().copied().max().unwrap_or(0));
+        assert_eq!(
+            observed_max_depth, expected_max_depth,
+            "max_reads={max_reads:?} should yield max depth {expected_max_depth}"
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// DUPLEX3-01 cap invariants over arbitrary family sizes, caps, and `min_reads`.
+        /// Whenever a consensus is produced: (a) at most `max_reads` reads contribute to it —
+        /// observed as the maximum per-base depth, which equals the contributing-read count here
+        /// because every read is identical and full length — and (b) the FULL uncapped family is
+        /// always retained on `output.source_reads`, so the duplex caller's downstream per-base
+        /// error counting and UMI calling see every read (the invariant the PR establishes).
+        #[test]
+        fn consensus_call_cap_invariants(
+            n in 1usize..=12,
+            max_reads in 1usize..=12,
+            min_reads in 1usize..=4,
+        ) {
+            let options = VanillaUmiConsensusOptions {
+                min_reads,
+                max_reads: Some(max_reads),
+                seed: Some(42),
+                ..Default::default()
+            };
+            let mut caller = VanillaUmiConsensusCaller::new(
+                "consensus".to_string(),
+                "A".to_string(),
+                options,
+            );
+
+            let source_reads: Vec<SourceRead> =
+                (0..n).map(|_| create_source_read_with_cigar("4M")).collect();
+
+            let consensus = caller
+                .consensus_call("umi", source_reads)
+                .expect("consensus_call must not error on any cap/size/min_reads combination");
+
+            if let Some(consensus) = consensus {
+                // (a) The consensus is capped: the deepest position sees at most `max_reads`
+                // reads (the family exceeds the cap exactly when `n > max_reads`).
+                let observed_max_depth = consensus.depths.iter().copied().max().unwrap_or(0);
+                prop_assert!(
+                    usize::from(observed_max_depth) <= max_reads,
+                    "consensus depth {} exceeded cap {}",
+                    observed_max_depth,
+                    max_reads
+                );
+                // (b) The full uncapped family survives on the output for duplex error counting.
+                prop_assert_eq!(
+                    consensus.source_reads.as_ref().map(Vec::len),
+                    Some(n),
+                    "output.source_reads must retain all uncapped reads"
+                );
+            }
+        }
     }
 
     /// Parse a CIGAR string into BAM-encoded `u32` ops for use with [`SamBuilder::cigar_ops`].

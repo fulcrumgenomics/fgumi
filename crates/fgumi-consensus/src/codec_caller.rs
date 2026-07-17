@@ -74,7 +74,8 @@
 
 use crate::caller::{
     ConsensusCaller, ConsensusCallingStats, ConsensusOutput,
-    RejectionReason as CallerRejectionReason, clamp_per_base_to_fgbio_short,
+    RejectionReason as CallerRejectionReason, clamp_combined_error_to_fgbio_short,
+    clamp_per_base_to_fgbio_short,
 };
 use crate::phred::{MIN_PHRED, NO_CALL_BASE, NO_CALL_BASE_LOWER, PhredScore};
 use crate::simple_umi::consensus_umis;
@@ -1164,17 +1165,22 @@ impl CodecConsensusCaller {
                     // - When bases agree: sum of both errors
                     // - When bases disagree: count errors from the chosen strand + non-errors from other strand
                     //   (because the non-errors from the other strand now disagree with the consensus)
+                    // Sum in `i64` (each term is a `u16` per-base count) and saturate at the
+                    // `Short` ceiling via the shared combine-step cap: single-strand errors are
+                    // already Short-capped at push, so this is a defensive bound (a raw `ea + eb`
+                    // on `u16` would overflow if a strand ever exceeded the ceiling).
                     let duplex_error = if ba == bb {
                         // Agreement: sum errors from both strands
-                        ea + eb
+                        i64::from(ea) + i64::from(eb)
                     } else if ba == raw_base {
                         // We chose A's base (including equal quality disagreements where fgbio uses aBase)
                         // Count A's errors + B's non-errors (which now disagree with consensus)
-                        ea + db.saturating_sub(eb)
+                        i64::from(ea) + i64::from(db.saturating_sub(eb))
                     } else {
                         // We chose B's base: count B's errors + A's non-errors
-                        eb + da.saturating_sub(ea)
+                        i64::from(eb) + i64::from(da.saturating_sub(ea))
                     };
+                    let duplex_error = clamp_combined_error_to_fgbio_short(duplex_error);
 
                     // Per-base duplex depth = sum of each strand's per-base depth,
                     // each CAPPED at fgbio's `Short` ceiling first (fgbio's
@@ -1208,8 +1214,10 @@ impl CodecConsensusCaller {
                 (false, false) => {
                     // Neither has data - N
                     // fgbio still calculates errors for these positions:
-                    // since both bases are the same (N == N), errors = a.errors + b.errors
-                    let duplex_error = ea + eb;
+                    // since both bases are the same (N == N), errors = a.errors + b.errors.
+                    // Same shared combine-step cap as the duplex branch above.
+                    let duplex_error =
+                        clamp_combined_error_to_fgbio_short(i64::from(ea) + i64::from(eb));
                     (NO_CALL_BASE, MIN_PHRED, 0, duplex_error)
                 }
             };
@@ -3260,6 +3268,49 @@ mod tests {
             vec![65_534, 65_534],
             "per-base duplex depth must be the sum of Short-capped strand depths, not the raw \
              (overflowing) da + db"
+        );
+    }
+
+    /// Defensive regression: the per-base combined duplex ERROR count must sum the two
+    /// strands' per-base errors in a type wider than `u16` and saturate at fgbio's `Short`
+    /// ceiling, so a strand value above the ceiling can never overflow the `u16` error store.
+    /// The single-strand caller already Short-caps per-base errors at push, so this
+    /// above-ceiling input (`errors = [40000, …]`) is a contract-level state the real
+    /// pipeline does not produce — but a raw `ea + eb` on `u16` would still panic in debug
+    /// (and wrap in release) on it. Companion of
+    /// `test_duplex_per_base_depth_caps_each_strand_before_summing` for the error array.
+    #[test]
+    fn test_duplex_per_base_error_caps_before_summing() {
+        let options = CodecConsensusOptions::default();
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        // Both strands agree on both bases (drives the `ea + eb` agreement branch), each
+        // carrying a per-base error above the `Short` ceiling (a contract-level input; the
+        // single-strand caller would have capped these to 32767 at push).
+        let deep = SingleStrandConsensus {
+            bases: b"AC".to_vec(),
+            quals: vec![40, 40],
+            depths: vec![u16::MAX, u16::MAX],
+            errors: vec![40_000, 40_000], // 40000 + 40000 = 80000 > u16::MAX
+            raw_read_count: u16::MAX as usize,
+            ref_start: 0,
+            ref_end: 1,
+            is_negative_strand: false,
+        };
+        let ss_a = deep.clone();
+        let ss_b = SingleStrandConsensus { is_negative_strand: true, ..deep };
+
+        let duplex = caller
+            .build_duplex_consensus_from_padded(&ss_a, &ss_b)
+            .expect("Should build duplex consensus without overflowing the error sum");
+
+        // min(40000+40000, 32767) = 32767 per base — capped at the Short ceiling, not the
+        // (overflowing) raw u16 sum. The downstream cE numerator re-clamps to the same value.
+        assert_eq!(
+            duplex.errors,
+            vec![32_767, 32_767],
+            "per-base duplex error must be the Short-capped wide-int sum of the strand errors, \
+             not the raw (overflowing) ea + eb"
         );
     }
 
