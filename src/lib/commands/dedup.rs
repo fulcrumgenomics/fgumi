@@ -451,6 +451,36 @@ fn filter_template(
     true
 }
 
+/// Returns `true` when a template has no mapped primary read (both mates unmapped,
+/// or a single unmapped read) and is not truncated/corrupt.
+///
+/// Such templates carry no alignment coordinate and thus no deduplication signal.
+/// With `--include-unmapped` they are emitted untouched (never marked, never
+/// MI-tagged) rather than discarded, mirroring Picard `MarkDuplicates`, which never
+/// drops unmapped reads. Truncated/corrupt records are deliberately *excluded* here
+/// so they still fall through to `filter_template` and are dropped — a corrupt record
+/// must never be passed through to the output.
+fn template_is_unmapped_passthrough(template: &Template) -> bool {
+    // A truncated record indicates corrupt input; leave it for `filter_template` to
+    // reject rather than emitting a malformed record.
+    if template.records().iter().any(|r| r.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN) {
+        return false;
+    }
+
+    let raw_r1 = template.r1();
+    let raw_r2 = template.r2();
+
+    // A template with no primary read at all is a poor-alignment discard, not a
+    // pass-through; let `filter_template` account for it.
+    if raw_r1.is_none() && raw_r2.is_none() {
+        return false;
+    }
+
+    raw_r1.is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::UNMAPPED) != 0)
+        && raw_r2
+            .is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::UNMAPPED) != 0)
+}
+
 //////////////////////////////////////////////////////////////////////////////
 // UMI assignment (adapted from group command)
 //////////////////////////////////////////////////////////////////////////////
@@ -722,6 +752,7 @@ fn process_position_group(
     raw_tag: SamTag,
     min_umi_length: Option<usize>,
     no_umi: bool,
+    include_unmapped: bool,
 ) -> io::Result<ProcessedDedupGroup> {
     let mut dedup_metrics = DedupMetrics::default();
     let input_record_count = group.records.len() as u64;
@@ -729,16 +760,27 @@ fn process_position_group(
     // Build templates from raw records (deferred from Group step)
     let all_templates = build_templates_from_records(group.records)?;
 
+    // When --include-unmapped is set, split off templates with no mapped read so they
+    // bypass filtering and deduplication entirely and are emitted untouched. They carry
+    // no coordinate, so passing them through leaves the dedup result unchanged while
+    // preserving a complete record set (mirrors Picard MarkDuplicates).
+    let (passthrough_templates, candidate_templates): (Vec<Template>, Vec<Template>) =
+        if include_unmapped {
+            all_templates.into_iter().partition(template_is_unmapped_passthrough)
+        } else {
+            (Vec::new(), all_templates)
+        };
+
     // Filter templates
     let mut filter_metrics = FilterMetrics::new();
-    let filtered_templates: Vec<Template> = all_templates
+    let filtered_templates: Vec<Template> = candidate_templates
         .into_iter()
         .filter(|t| filter_template(t, filter_config, &mut filter_metrics))
         .collect();
 
     dedup_metrics.filter_metrics = filter_metrics;
 
-    if filtered_templates.is_empty() {
+    if filtered_templates.is_empty() && passthrough_templates.is_empty() {
         return Ok(ProcessedDedupGroup {
             templates: Vec::new(),
             family_sizes: AHashMap::new(),
@@ -831,6 +873,26 @@ fn process_position_group(
         }
     }
 
+    // Emit --include-unmapped pass-through templates untouched. They were never
+    // filtered, marked, or MI-assigned, so their `MoleculeId` stays `None` and the
+    // serialize step writes them verbatim (no MI tag, duplicate flag left as in the
+    // input). Count them as unique output so the record totals match what is written.
+    for template in &passthrough_templates {
+        dedup_metrics.total_templates += 1;
+        dedup_metrics.unique_templates += 1;
+        for raw in template.records() {
+            dedup_metrics.total_reads += 1;
+            let flg = RawRecordView::new(raw.as_ref()).flags();
+            if (flg & fgumi_raw_bam::flags::SECONDARY) != 0 {
+                dedup_metrics.secondary_reads += 1;
+            }
+            if (flg & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0 {
+                dedup_metrics.supplementary_reads += 1;
+            }
+        }
+    }
+    templates.extend(passthrough_templates);
+
     dedup_metrics.unique_reads = dedup_metrics.total_reads - dedup_metrics.duplicate_reads;
 
     // Compute the number of distinct numeric molecule IDs assigned in this group.
@@ -892,7 +954,8 @@ differ from Picard `MarkDuplicates`, which passes every record through and only 
 duplicate flag — so `fgumi dedup` is NOT a Picard record-count drop-in. A template is
 discarded (not marked) when:
 
-- Both mates are unmapped (a template with no mapped read).
+- Both mates are unmapped (a template with no mapped read), unless --include-unmapped is
+  given, in which case such templates are emitted untouched instead of discarded.
 - Any read is flagged QC-fail (unless -n/--include-non-pf-reads is given).
 - A mapped read has mapping quality below -q/--min-map-q (default 0, i.e. no reads are
   dropped for mapping quality unless a threshold is set).
@@ -903,10 +966,12 @@ discarded (not marked) when:
 - A record is truncated/corrupt (shorter than the minimum BAM record length).
 
 To retain as many templates as possible, leave -q/--min-map-q at its default of 0, do not
-set -l/--min-umi-length, pass -n/--include-non-pf-reads to keep QC-fail reads, and, when the
-input has no usable UMIs, use --no-umi to bypass the UMI checks entirely. Two drops cannot
-be disabled, matching fgbio: templates with no mapped read (both mates unmapped) and
-truncated/corrupt records are always discarded.
+set -l/--min-umi-length, pass -n/--include-non-pf-reads to keep QC-fail reads, add
+--include-unmapped to emit no-mapped-read templates untouched, and, when the input has no
+usable UMIs, use --no-umi to bypass the UMI checks entirely. Unlike fgbio, --include-unmapped
+lets you keep no-mapped-read templates; only truncated/corrupt records are always discarded.
+Pass-through templates are written verbatim: never marked, never MI-tagged, and counted as
+unique in the metrics.
 
 The counts of templates dropped for each reason are reported in the metrics output
 (--metrics). Deduplication of the templates that remain (representative selection, the
@@ -941,6 +1006,10 @@ fixed-RAM host, prefer one of:
 pathological high-coverage position group is still processed whole.
 "#
 )]
+// Each bool is an independent CLI toggle (--remove-duplicates, --include-non-pf-reads,
+// --no-umi, --include-unmapped); a state machine or enum would obscure, not clarify, the
+// flat argument surface clap expects.
+#[allow(clippy::struct_excessive_bools)]
 pub struct MarkDuplicates {
     /// Input and output BAM files
     #[command(flatten)]
@@ -965,6 +1034,13 @@ pub struct MarkDuplicates {
     /// Include reads flagged as not passing QC
     #[arg(short = 'n', long = "include-non-pf-reads", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub include_non_pf_reads: bool,
+
+    /// Emit templates with no mapped read (both mates unmapped) untouched instead of
+    /// discarding them. Such templates carry no alignment coordinate and no duplicate
+    /// signal; passing them through preserves a complete record set (like Picard
+    /// `MarkDuplicates`). Truncated/corrupt records are still dropped.
+    #[arg(long = "include-unmapped", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    pub include_unmapped: bool,
 
     /// UMI grouping strategy
     #[arg(short = 's', long = "strategy", value_enum, default_value = "adjacency")]
@@ -1098,6 +1174,7 @@ impl Command for MarkDuplicates {
         let index_threshold = self.index_threshold;
         let min_umi_length = self.min_umi_length;
         let no_umi = self.no_umi;
+        let include_unmapped = self.include_unmapped;
         let remove_duplicates = self.remove_duplicates;
         let collected_metrics_clone = Arc::clone(&collected_metrics);
 
@@ -1156,6 +1233,7 @@ impl Command for MarkDuplicates {
                     raw_tag,
                     min_umi_length,
                     no_umi,
+                    include_unmapped,
                 )
             },
             // Serialize function (parallel, output ordered by serial numbers)
@@ -1682,6 +1760,93 @@ mod tests {
 
         assert!(filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.accepted_templates, 1);
+    }
+
+    // ========================================================================
+    // template_is_unmapped_passthrough tests (--include-unmapped)
+    // ========================================================================
+
+    /// Build a single-read template, OR-ing `extra_flags` into the base flags so a
+    /// caller can set (or omit) `flags::UNMAPPED`.
+    fn create_single_read_template(name: &str, extra_flags: u16) -> Template {
+        let mut b = RawSamBuilder::new();
+        b.read_name(name.as_bytes())
+            .sequence(b"ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | extra_flags);
+        Template::from_records(vec![b.build()]).expect("test template construction should not fail")
+    }
+
+    /// Build a paired template, setting each mate's `UNMAPPED` bit per the args.
+    fn create_paired_mapping_template(
+        name: &str,
+        r1_unmapped: bool,
+        r2_unmapped: bool,
+    ) -> Template {
+        let build = |seq: &[u8], segment_flag: u16, unmapped: bool| {
+            let mut base = flags::PAIRED | segment_flag;
+            if unmapped {
+                base |= flags::UNMAPPED;
+            }
+            let mut b = RawSamBuilder::new();
+            b.read_name(name.as_bytes()).sequence(seq).qualities(&[30, 30, 30, 30]).flags(base);
+            b.build()
+        };
+        let r1 = build(b"ACGT", flags::FIRST_SEGMENT, r1_unmapped);
+        let r2 = build(b"TGCA", flags::LAST_SEGMENT, r2_unmapped);
+        Template::from_records(vec![r1, r2]).expect("test template construction should not fail")
+    }
+
+    /// A paired template is a pass-through candidate only when *both* mates are
+    /// unmapped; any mapped read gives it a coordinate and excludes it.
+    #[rstest]
+    #[case::both_unmapped(true, true, true)]
+    #[case::r1_mapped_r2_unmapped(false, true, false)]
+    #[case::r1_unmapped_r2_mapped(true, false, false)]
+    #[case::both_mapped(false, false, false)]
+    fn test_unmapped_passthrough_paired(
+        #[case] r1_unmapped: bool,
+        #[case] r2_unmapped: bool,
+        #[case] expected: bool,
+    ) {
+        let template = create_paired_mapping_template("q1", r1_unmapped, r2_unmapped);
+        assert_eq!(template_is_unmapped_passthrough(&template), expected);
+    }
+
+    /// A single-read template passes through only when its one read is unmapped.
+    #[rstest]
+    #[case::unmapped(flags::UNMAPPED, true)]
+    #[case::mapped(0, false)]
+    fn test_unmapped_passthrough_single(#[case] extra_flags: u16, #[case] expected: bool) {
+        let template = create_single_read_template("q1", extra_flags);
+        assert_eq!(template_is_unmapped_passthrough(&template), expected);
+    }
+
+    /// A truncated/corrupt record must never be treated as pass-through even when the
+    /// other mate is unmapped: it has to fall through to `filter_template`, which drops
+    /// it, rather than being emitted verbatim.
+    #[test]
+    fn test_unmapped_passthrough_rejects_truncated() {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"q1")
+            .sequence(b"ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::UNMAPPED);
+        let unmapped_r1 = b.build();
+        let truncated_r2 = RawRecord::from(vec![0u8; 16]); // < MIN_BAM_RECORD_LEN (32)
+        let template = Template {
+            name: b"q1".to_vec(),
+            records: vec![unmapped_r1, truncated_r2],
+            r1: Some((0, 1)),
+            r2: Some((1, 2)),
+            r1_supplementals: None,
+            r2_supplementals: None,
+            r1_secondaries: None,
+            r2_secondaries: None,
+            mi: crate::umi::MoleculeId::None,
+            cached_umi_position: None,
+        };
+        assert!(!template_is_unmapped_passthrough(&template));
     }
 
     #[test]
