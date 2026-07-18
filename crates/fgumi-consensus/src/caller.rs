@@ -87,7 +87,7 @@
 //! To implement a custom consensus caller, implement the `ConsensusCaller` trait:
 //!
 //! ```rust,ignore
-//! use fgumi_lib::consensus::caller::{ConsensusCaller, ConsensusCallingStats, ConsensusOutput};
+//! use fgumi_consensus::caller::{ConsensusCaller, ConsensusCallingStats, ConsensusOutput};
 //! use fgumi_raw_bam::RawRecord;
 //! use anyhow::Result;
 //!
@@ -120,8 +120,8 @@
 //! ### Basic Consensus Calling
 //!
 //! ```rust,ignore
-//! use fgumi_lib::consensus::vanilla_consensus_caller::VanillaUmiConsensusCaller;
-//! use fgumi_lib::consensus::caller::ConsensusCaller;
+//! use fgumi_consensus::vanilla_caller::VanillaUmiConsensusCaller;
+//! use fgumi_consensus::caller::ConsensusCaller;
 //! use fgumi_raw_bam::RawRecord;
 //!
 //! // Create consensus caller
@@ -156,7 +156,7 @@
 //!
 //! ## See Also
 //!
-//! - `vanilla_consensus_caller`: Standard single-strand consensus implementation
+//! - `vanilla_caller`: Standard single-strand consensus implementation
 //! - `duplex_caller`: Two-stage consensus for duplex sequencing
 //! - `base_builder`: Core likelihood-based consensus base calling logic
 

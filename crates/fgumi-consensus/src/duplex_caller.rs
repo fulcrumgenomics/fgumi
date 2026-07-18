@@ -126,8 +126,8 @@
 //! ## Usage Example
 //!
 //! ```rust,ignore
-//! use fgumi_lib::consensus::duplex_caller::DuplexConsensusCaller;
-//! use fgumi_lib::consensus::caller::ConsensusCaller;
+//! use fgumi_consensus::duplex_caller::DuplexConsensusCaller;
+//! use fgumi_consensus::caller::ConsensusCaller;
 //!
 //! // Create duplex consensus caller
 //! let mut caller = DuplexConsensusCaller::new(
@@ -182,7 +182,7 @@
 //!
 //! ## See Also
 //!
-//! - `vanilla_consensus_caller`: Single-strand consensus calling used in Stage 1
+//! - `vanilla_caller`: Single-strand consensus calling used in Stage 1
 //! - `caller`: Base consensus calling infrastructure and trait definitions
 //! - `base_builder`: Likelihood-based consensus algorithm for individual bases
 

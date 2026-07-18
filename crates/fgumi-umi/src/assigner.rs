@@ -123,7 +123,7 @@
 //! ### Basic Usage - Identity Strategy
 //!
 //! ```
-//! use fgumi_lib::umi::assigner::{Strategy, UmiAssigner};
+//! use fgumi_umi::assigner::{Strategy, UmiAssigner};
 //!
 //! let strategy = Strategy::Identity;
 //! let assigner = strategy.new_assigner(0); // No mismatches allowed
@@ -145,7 +145,7 @@
 //! ### Error-Tolerant Assignment - Adjacency Strategy
 //!
 //! ```
-//! use fgumi_lib::umi::assigner::{Strategy, UmiAssigner};
+//! use fgumi_umi::assigner::{Strategy, UmiAssigner};
 //!
 //! let strategy = Strategy::Adjacency;
 //! let assigner = strategy.new_assigner(1); // Allow 1 mismatch
@@ -166,7 +166,7 @@
 //! ### Paired UMI Assignment - Duplex Sequencing
 //!
 //! ```
-//! use fgumi_lib::umi::assigner::{Strategy, UmiAssigner, TOP_STRAND_DUPLEX, BOTTOM_STRAND_DUPLEX};
+//! use fgumi_umi::assigner::{Strategy, UmiAssigner, TOP_STRAND_DUPLEX, BOTTOM_STRAND_DUPLEX};
 //!
 //! let strategy = Strategy::Paired;
 //! let assigner = strategy.new_assigner(1); // Allow 1 mismatch per UMI half
@@ -633,7 +633,7 @@ impl Strategy {
 /// # Examples
 ///
 /// ```
-/// use fgumi_lib::umi::assigner::count_mismatches;
+/// use fgumi_umi::assigner::count_mismatches;
 ///
 /// assert_eq!(count_mismatches("ACGT", "ACGT"), 0);
 /// assert_eq!(count_mismatches("ACGT", "ACTT"), 1);
@@ -723,7 +723,7 @@ fn assign_with_invalid_fallback(
 /// # Examples
 ///
 /// ```
-/// use fgumi_lib::umi::assigner::matches_within_threshold;
+/// use fgumi_umi::assigner::matches_within_threshold;
 ///
 /// assert!(matches_within_threshold("ACGT", "ACGT", 1));
 /// assert!(matches_within_threshold("ACGT", "ACTT", 1));

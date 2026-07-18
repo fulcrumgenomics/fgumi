@@ -28,7 +28,9 @@ jobs:
           tool: nextest
       - name: Unit tests
         run: cargo ci-test
-  
+      - name: Doctests
+        run: cargo ci-doctest
+
   lint:
     runs-on: ubuntu-latest
     steps:

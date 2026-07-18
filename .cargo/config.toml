@@ -3,6 +3,8 @@ ci-test = "nextest run --workspace --features compare,simulate,profile-adjacency
 ci-fmt = "fmt --all -- --check"
 ci-lint = "clippy --workspace --all-targets --features compare,simulate,profile-adjacency -- -D warnings -W clippy::pedantic"
 ci-tag-literals = "run --package xtask -- check-tag-literals"
+# Run documentation tests (nextest does not run doctests, so ci-test skips them)
+ci-doctest = "test --doc --workspace --features compare,simulate,profile-adjacency --locked"
 # Run tests with test-utils feature enabled (allows binary tests to use library test utilities)
 t = "test --features test-utils"
 # Generate and serve documentation locally (runs xtask then mdbook serve)

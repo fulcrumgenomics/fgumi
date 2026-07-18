@@ -18,7 +18,7 @@
 /// # Example
 ///
 /// ```
-/// use fgumi_lib::consensus::ConsensusSequence;
+/// use fgumi_consensus::ConsensusSequence;
 ///
 /// let mut seq = ConsensusSequence::new();
 /// seq.push(b'A', 30, 10, 0);
