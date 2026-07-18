@@ -87,7 +87,10 @@ pub use cigar::{
 };
 
 // -- overlap --
-pub use overlap::{is_fr_pair_raw, is_primary_fr_pair_raw, num_bases_extending_past_mate_raw};
+pub use overlap::{
+    is_fr_pair_raw, is_primary_fr_pair_raw, num_bases_extending_past_mate_raw,
+    num_bases_extending_past_mate_vs_mate_raw,
+};
 
 // -- raw_bam_record --
 pub use raw_bam_record::{

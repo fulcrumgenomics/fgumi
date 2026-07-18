@@ -155,6 +155,109 @@ fn test_codec_command_basic_consensus() {
     assert!(consensus_count > 0, "Should have produced at least one consensus read");
 }
 
+/// CODEC3-05 (end-to-end): `--single-strand-qual` must mask the single-strand tails, which are
+/// padded with lowercase `n`. The offset molecule spans ref[0..40) with 10 single-strand
+/// positions on each end. Asserts the *complete* emitted output — record count, all consensus
+/// bases, and the full per-base quality vector — for both option states against fixed
+/// expectations (pinned to fgumi's output, externally verified byte-identical to fgbio 4.1.0),
+/// so wrong bases, drifted interior qualities, or an extra/dropped record all fail the test.
+/// Before the fix the option had no effect on the tails (the mask check missed lowercase `n`).
+#[test]
+fn test_codec_command_masks_single_strand_tails() {
+    // The two same-UMI molecules collapse to a single 40bp consensus. The overlap window
+    // (ref[10..30]) disagrees between the two synthetic strands, so its bases are called `N`; the
+    // single-strand tails (ref[0..10] from R1, ref[30..40] from R2) carry each read's base. Only
+    // the per-base qualities change under masking. All values are pinned to what fgumi emits
+    // (externally verified byte-identical to fgbio 4.1.0), so the test fails on any drift in
+    // bases, interior qualities, or record count.
+    const EXPECTED_BASES: &[u8; 40] = b"AAAAAAAAAANNNNNNNNNNNNNNNNNNNNGGGGGGGGGG";
+    // ref[10..30] is the 20bp overlap (single-strand-disagreement `N` calls); tails (ref[0..10],
+    // ref[30..40]) are the lowercase-'n'-padded single-strand positions the option masks.
+    const OVERLAP_QUALS: [u8; 20] = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2];
+    // Without --single-strand-qual the single-strand tails keep their unmasked Q45.
+    let expected_baseline_quals: Vec<u8> = {
+        let mut q = vec![45u8; 40];
+        q[10..30].copy_from_slice(&OVERLAP_QUALS);
+        q
+    };
+    // With --single-strand-qual 2 the single-strand tails are masked to Q2; the overlap
+    // (already Q2 from the disagreement calls) is untouched.
+    let expected_masked_quals: Vec<u8> = {
+        let mut q = vec![2u8; 40];
+        q[10..30].copy_from_slice(&OVERLAP_QUALS);
+        q
+    };
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    create_codec_test_bam(
+        &input_bam,
+        vec![create_offset_codec_pair("m1", "UMI1"), create_offset_codec_pair("m2", "UMI1")],
+    );
+
+    // Run the codec command with the given single-strand-qual (None = option omitted) and return
+    // every emitted consensus record's (bases, qualities). Reading *all* records (not just the
+    // first) guards against extra/dropped records; returning full base+quality vectors guards
+    // against wrong bases or interior qualities that a tail-only threshold check would miss.
+    let run_codec = |ssq: Option<&str>| -> Vec<(Vec<u8>, Vec<u8>)> {
+        let output_bam = temp_dir.path().join(format!("out_{}.bam", ssq.unwrap_or("none")));
+        let mut args = vec![
+            "codec",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--min-reads",
+            "1",
+            "--min-duplex-length",
+            "1",
+            "--max-duplex-disagreements",
+            "1000",
+            "--max-duplex-disagreement-rate",
+            "1.0",
+            "--compression-level",
+            "1",
+        ];
+        if let Some(q) = ssq {
+            args.push("--single-strand-qual");
+            args.push(q);
+        }
+        Codec::try_parse_from(args)
+            .expect("failed to parse codec args")
+            .execute("fgumi codec")
+            .expect("Failed to run codec command");
+        let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+        let _header = reader.read_header().unwrap();
+        reader
+            .records()
+            .map(|r| {
+                let record = r.expect("read record");
+                let bases = record.sequence().iter().collect::<Vec<u8>>();
+                let quals = record.quality_scores().as_ref().to_vec();
+                (bases, quals)
+            })
+            .collect()
+    };
+
+    let baseline = run_codec(None);
+    let masked = run_codec(Some("2"));
+
+    assert_eq!(baseline.len(), 1, "exactly one consensus record without masking");
+    assert_eq!(masked.len(), 1, "exactly one consensus record with masking");
+
+    let (baseline_bases, baseline_quals) = &baseline[0];
+    let (masked_bases, masked_quals) = &masked[0];
+
+    // Masking must not perturb the called bases.
+    assert_eq!(baseline_bases, EXPECTED_BASES, "unmasked consensus bases");
+    assert_eq!(masked_bases, EXPECTED_BASES, "masked consensus bases");
+
+    // Full quality-vector identity for both states — before the fix the tails stayed at Q45 even
+    // with --single-strand-qual set (the mask check missed the lowercase-'n' padding).
+    assert_eq!(baseline_quals, &expected_baseline_quals, "unmasked consensus qualities");
+    assert_eq!(masked_quals, &expected_masked_quals, "masked consensus qualities");
+}
+
 /// Test CODEC command with statistics output.
 #[test]
 fn test_codec_command_with_stats() {

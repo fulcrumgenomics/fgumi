@@ -663,9 +663,14 @@ impl CodecConsensusCaller {
                 }
             };
 
-            // Compute clip amounts from raw bytes
-            let clip_r1 = bam_fields::num_bases_extending_past_mate_raw(&records[i1]);
-            let clip_r2 = bam_fields::num_bases_extending_past_mate_raw(&records[i2]);
+            // Compute overlap-clip amounts from the mate record in hand (not the MC tag), so
+            // clipping still occurs when MC is absent — mirroring fgbio `updateMateCigars`, which
+            // backfills the mate CIGAR from the in-group mate before clipping (CODEC3-04). The
+            // mate boundary is soft-only, matching fgbio `mateUnSoftClippedStart/End` (CODEC3-03).
+            let clip_r1 =
+                bam_fields::num_bases_extending_past_mate_vs_mate_raw(&records[i1], &records[i2]);
+            let clip_r2 =
+                bam_fields::num_bases_extending_past_mate_vs_mate_raw(&records[i2], &records[i1]);
 
             // Build ClippedRecordInfo for R1
             let r1_info = Self::build_clipped_info(&records[i1], i1, clip_r1);
@@ -1286,36 +1291,48 @@ impl CodecConsensusCaller {
         })
     }
 
-    /// Masks consensus qualities for query-based consensus.
-    /// Identifies single-strand regions by checking if either padded consensus has 'N'.
-    /// This matches fgbio's maskCodecConsensusQuals behavior.
+    /// Masks consensus qualities for query-based consensus, matching fgbio's
+    /// `CodecConsensusCaller.maskCodecConsensusQuals`.
+    ///
+    /// Two masks are applied in fgbio's order:
+    /// 1. **Outer bases** (`--outer-bases-qual`): the first/last `outer_bases_length` qualities are
+    ///    **assigned** the outer quality (not `min`-ed) so the mask can raise as well as lower.
+    /// 2. **Single-strand regions** (`--single-strand-qual`): positions where either padded strand
+    ///    lacks coverage are assigned the single-strand quality. "Lacks coverage" is represented by
+    ///    lowercase `n` padding (`NO_CALL_BASE_LOWER`) OR an uppercase `N` no-call, matching fgbio's
+    ///    `a(i)∈{n,N} || b(i)∈{n,N}` check.
+    ///
+    /// Outer masking runs first so single-strand masking wins where the two regions overlap.
     fn mask_consensus_quals_query_based(
         &self,
         mut consensus: SingleStrandConsensus,
         padded_r1: &SingleStrandConsensus,
         padded_r2: &SingleStrandConsensus,
     ) -> SingleStrandConsensus {
-        let len = consensus.bases.len();
+        let len = consensus.quals.len();
 
-        for idx in 0..len {
-            // Mask single-strand regions first
-            // Single-strand positions are where one padded consensus has 'N'
-            // This matches fgbio's check: if (a(i) == 'N' || b(i) == 'N')
-            let a_is_n = padded_r1.bases.get(idx).copied().unwrap_or(NO_CALL_BASE) == NO_CALL_BASE;
-            let b_is_n = padded_r2.bases.get(idx).copied().unwrap_or(NO_CALL_BASE) == NO_CALL_BASE;
-
-            if (a_is_n || b_is_n) && consensus.bases[idx] != NO_CALL_BASE {
-                // This is a single-strand position with a base
-                if let Some(ss_qual) = self.options.single_strand_qual {
-                    consensus.quals[idx] = ss_qual;
+        // 1. Outer bases: assign the outer quality to the first/last `outer_bases_length` bases.
+        if self.options.outer_bases_length > 0 {
+            if let Some(outer_qual) = self.options.outer_bases_qual {
+                let last_idx = len.saturating_sub(1);
+                for i in 0..min(self.options.outer_bases_length, len) {
+                    consensus.quals[i] = outer_qual;
+                    consensus.quals[last_idx - i] = outer_qual;
                 }
             }
+        }
 
-            // Mask outer bases
-            if let Some(outer_qual) = self.options.outer_bases_qual {
-                let outer_len = self.options.outer_bases_length;
-                if idx < outer_len || idx >= len.saturating_sub(outer_len) {
-                    consensus.quals[idx] = min(consensus.quals[idx], outer_qual);
+        // 2. Single-strand regions: assign the single-strand quality where either strand lacks
+        //    coverage. Lowercase `n` padding must count here — otherwise the single-strand tails
+        //    (the exact target of `--single-strand-qual`) are never masked (CODEC3-05).
+        if let Some(ss_qual) = self.options.single_strand_qual {
+            for idx in 0..len {
+                let a = padded_r1.bases.get(idx).copied().unwrap_or(NO_CALL_BASE);
+                let b = padded_r2.bases.get(idx).copied().unwrap_or(NO_CALL_BASE);
+                let a_is_n = a == NO_CALL_BASE || a == NO_CALL_BASE_LOWER;
+                let b_is_n = b == NO_CALL_BASE || b == NO_CALL_BASE_LOWER;
+                if a_is_n || b_is_n {
+                    consensus.quals[idx] = ss_qual;
                 }
             }
         }
@@ -1455,7 +1472,15 @@ impl CodecConsensusCaller {
             self.bam_builder.append_phred33_string_tag(SamTag::BQ, &ss_b.quals);
         }
 
-        // Cell barcode tag - extract from first source read if configured
+        // Cell barcode tag - extract from the first source read carrying it.
+        //
+        // Unlike fgbio `CodecConsensusCaller` (which groups by MI only, then `require`s a single
+        // distinct CB across the molecule and errors on conflict), fgumi groups reads by the
+        // composite key `MI\tCB` (see `MiGroupIterator::with_cell_tag`, wired in `codec.rs`). Every
+        // record reaching a single consensus group therefore already shares one cell barcode, so
+        // fgbio's cross-barcode conflict guard is inapplicable here — an intentional single-cell
+        // divergence, not a missing check (CODEC3-07). Because the group is CB-homogeneous, taking
+        // the first present value is unambiguous.
         if let Some(cell_tag) = &self.options.cell_tag {
             let cell_tag_bytes: [u8; 2] = [cell_tag.as_ref()[0], cell_tag.as_ref()[1]];
             for raw in source_raws {
@@ -3338,6 +3363,70 @@ mod tests {
             has_low_qual || quals.is_empty(),
             "Should have some low-quality single-strand regions (or be filtered)"
         );
+    }
+
+    /// Builds a `SingleStrandConsensus` for masking tests: `bases` + `quals`, everything else zeroed.
+    fn ss_for_mask(bases: &[u8], quals: Vec<PhredScore>) -> SingleStrandConsensus {
+        let len = bases.len();
+        SingleStrandConsensus {
+            bases: bases.to_vec(),
+            quals,
+            depths: vec![2; len],
+            errors: vec![0; len],
+            raw_read_count: 2,
+            ref_start: 0,
+            ref_end: len.saturating_sub(1),
+            is_negative_strand: false,
+        }
+    }
+
+    /// CODEC3-05: single-strand tails are padded with lowercase `n`; `--single-strand-qual`
+    /// masking must fire on them (the previous code only matched uppercase `N`).
+    #[test]
+    fn test_mask_consensus_quals_masks_lowercase_n_single_strand_tails() {
+        let options = CodecConsensusOptions {
+            single_strand_qual: Some(20),
+            outer_bases_qual: None,
+            outer_bases_length: 0,
+            ..CodecConsensusOptions::default()
+        };
+        let caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        let consensus = ss_for_mask(b"ACGTA", vec![40, 40, 40, 40, 40]);
+        // padded_r1 lacks coverage at 0,1 (lowercase 'n'); padded_r2 lacks coverage at 4.
+        let padded_r1 = ss_for_mask(b"nnGTA", vec![0, 0, 40, 40, 40]);
+        let padded_r2 = ss_for_mask(b"ACGTn", vec![40, 40, 40, 40, 0]);
+
+        let masked = caller.mask_consensus_quals_query_based(consensus, &padded_r1, &padded_r2);
+        // Single-strand positions {0,1,4} -> Q20; duplex positions {2,3} unchanged.
+        assert_eq!(masked.quals, vec![20, 20, 40, 40, 20]);
+    }
+
+    /// CODEC3-06: outer masking is applied FIRST and ASSIGNS (not `min`), and single-strand
+    /// masking (applied second) wins where the two regions overlap.
+    #[test]
+    fn test_mask_consensus_quals_outer_first_then_single_strand_wins() {
+        let options = CodecConsensusOptions {
+            single_strand_qual: Some(20),
+            outer_bases_qual: Some(10),
+            outer_bases_length: 2,
+            ..CodecConsensusOptions::default()
+        };
+        let caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        // Position 1 starts at Q5 (below the Q10 outer quality) so this case distinguishes
+        // assignment from `min`: outer masking assigning Q10 raises it to Q10, whereas
+        // `min(Q5, Q10)` would leave it at Q5.
+        let consensus = ss_for_mask(b"ACGTAC", vec![40, 5, 40, 40, 40, 40]);
+        // Position 0 is single-strand (a='n'); the rest are duplex.
+        let padded_r1 = ss_for_mask(b"nCGTAC", vec![0, 40, 40, 40, 40, 40]);
+        let padded_r2 = ss_for_mask(b"ACGTAC", vec![40, 40, 40, 40, 40, 40]);
+
+        let masked = caller.mask_consensus_quals_query_based(consensus, &padded_r1, &padded_r2);
+        // Outer (len 2) assigns Q10 to {0,1,4,5} (position 1's Q5 is raised to Q10, proving
+        // assignment rather than min); then single-strand assigns Q20 to {0}, winning over the
+        // outer Q10 there. (The old min+single-strand-first order left position 0 at Q10.)
+        assert_eq!(masked.quals, vec![20, 10, 40, 40, 10, 10]);
     }
 
     /// Test that uppercase 'N' (`NoCall`) from one strand masks the result to N,
