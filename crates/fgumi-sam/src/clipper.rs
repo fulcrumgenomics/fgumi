@@ -1598,6 +1598,8 @@ impl RawRecordClipper {
         record.set_mapq(0);
         record.set_template_length(0);
         record.set_cigar_ops(&[]);
+        // Now unmapped (POS = -1): the bin must become the SAM unmapped bin (4680).
+        record.recompute_bin();
     }
 
     /// Clips a specified number of bases from the start (left side) of the alignment.
@@ -1774,6 +1776,10 @@ impl RawRecordClipper {
             }
         }
 
+        // POS and/or the CIGAR changed above; refresh the BAM bin so the verbatim
+        // raw write emits a correct index bin (the encoder step that would normally
+        // recompute it is bypassed by the raw pipeline).
+        record.recompute_bin();
         read_bases_clipped
     }
 
@@ -1923,6 +1929,9 @@ impl RawRecordClipper {
             }
         }
 
+        // End-clipping leaves POS unchanged but shrinks the aligned span, which can
+        // move the read into a finer bin; refresh it for the verbatim raw write.
+        record.recompute_bin();
         read_bases_clipped
     }
 
@@ -5776,6 +5785,56 @@ mod crosscheck_tests {
         let raw_qual = raw.quality_scores().to_vec();
         let buf_qual: Vec<u8> = buf.quality_scores().as_ref().to_vec();
         assert_eq!(raw_qual, buf_qual, "{context}: quality mismatch");
+    }
+
+    // =========================================================================
+    // BAM bin field is recomputed after raw clip mutations (fgbio parity)
+    //
+    // The raw pipeline emits record bytes verbatim, so a clip that moves POS or
+    // rewrites the CIGAR must refresh the bin (bytes 10-11) itself. A read placed
+    // at 16300 with 200M straddles the 16 kb bin boundary (level-4 bin 585);
+    // clipping that changes its span moves it into a level-5 (16 kb) bin.
+    // =========================================================================
+
+    /// Build a raw mapped read at `pos` (0-based) with `cigar`, encoded through
+    /// noodles so the starting bin is correct.
+    fn raw_mapped(pos: i32, cigar: &str, seq_len: usize) -> RawRecord {
+        let start_1based = usize::try_from(pos + 1).expect("1-based start must be non-negative");
+        let buf = RecordBuilder::mapped_read()
+            .sequence(&"A".repeat(seq_len))
+            .cigar(cigar)
+            .alignment_start(start_1based)
+            .build();
+        to_raw(&buf)
+    }
+
+    #[test]
+    fn raw_clip_start_of_alignment_recomputes_bin_after_pos_shift() {
+        let mut raw = raw_mapped(16300, "200M", 200);
+        assert_eq!(raw.bin(), fgumi_raw_bam::reg2bin(16300, 16500), "precondition: bin 585");
+        // Soft-clip 116 from the start: pos -> 16416, CIGAR 116S84M, span [16416, 16500).
+        RawRecordClipper::new(ClippingMode::Soft).clip_start_of_alignment(&mut raw, 116);
+        assert_eq!(raw.pos(), 16416, "precondition: pos shifted");
+        assert_eq!(raw.bin(), fgumi_raw_bam::reg2bin(16416, 16416 + 84));
+    }
+
+    #[test]
+    fn raw_clip_end_of_alignment_recomputes_bin_after_span_shrinks() {
+        let mut raw = raw_mapped(16300, "200M", 200);
+        // Soft-clip 116 from the end: pos stays 16300, span shrinks to [16300, 16384),
+        // which no longer straddles the 16 kb boundary -> level-5 bin.
+        RawRecordClipper::new(ClippingMode::Soft).clip_end_of_alignment(&mut raw, 116);
+        assert_eq!(raw.pos(), 16300, "precondition: end-clip leaves pos unchanged");
+        assert_eq!(raw.bin(), fgumi_raw_bam::reg2bin(16300, 16300 + 84));
+    }
+
+    #[test]
+    fn raw_clip_that_unmaps_read_sets_unmapped_bin() {
+        let mut raw = raw_mapped(16300, "200M", 200);
+        // Clipping every clippable base unmaps the read (fgbio SamRecordClipper).
+        RawRecordClipper::new(ClippingMode::Soft).clip_start_of_alignment(&mut raw, 200);
+        assert!(raw.flags() & fgumi_raw_bam::flags::UNMAPPED != 0, "precondition: unmapped");
+        assert_eq!(raw.bin(), fgumi_raw_bam::UNMAPPED_BIN);
     }
 
     // =========================================================================
