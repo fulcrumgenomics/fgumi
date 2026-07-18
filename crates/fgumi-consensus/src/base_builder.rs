@@ -105,7 +105,7 @@
 //!
 //! Consensus callers typically use `ConsensusBaseBuilder` as follows:
 //!
-//! ```rust,ignore
+//! ```text
 //! use fgumi_consensus::base_builder::ConsensusBaseBuilder;
 //!
 //! // Create builder with error rates

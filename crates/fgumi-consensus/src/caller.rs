@@ -86,7 +86,7 @@
 //!
 //! To implement a custom consensus caller, implement the `ConsensusCaller` trait:
 //!
-//! ```rust,ignore
+//! ```text
 //! use fgumi_consensus::caller::{ConsensusCaller, ConsensusCallingStats, ConsensusOutput};
 //! use fgumi_raw_bam::RawRecord;
 //! use anyhow::Result;
@@ -119,7 +119,7 @@
 //!
 //! ### Basic Consensus Calling
 //!
-//! ```rust,ignore
+//! ```text
 //! use fgumi_consensus::vanilla_caller::VanillaUmiConsensusCaller;
 //! use fgumi_consensus::caller::ConsensusCaller;
 //! use fgumi_raw_bam::RawRecord;
@@ -143,7 +143,7 @@
 //!
 //! ### Tracking Rejection Reasons
 //!
-//! ```rust,ignore
+//! ```text
 //! let stats = caller.statistics();
 //! println!("Total reads processed: {}", stats.total_reads);
 //! println!("Consensus reads generated: {}", stats.consensus_reads);
