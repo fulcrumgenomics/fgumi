@@ -695,24 +695,24 @@ impl CodecConsensusCaller {
         }
 
         // Downsample if needed
-        if let Some(max_reads) = self.options.max_reads_per_strand {
-            if r1_infos.len() > max_reads {
-                let mut indices: Vec<usize> = (0..r1_infos.len()).collect();
-                indices.shuffle(&mut self.rng);
-                indices.truncate(max_reads);
-                indices.sort_unstable();
+        if let Some(max_reads) = self.options.max_reads_per_strand
+            && r1_infos.len() > max_reads
+        {
+            let mut indices: Vec<usize> = (0..r1_infos.len()).collect();
+            indices.shuffle(&mut self.rng);
+            indices.truncate(max_reads);
+            indices.sort_unstable();
 
-                let new_r1: Vec<_> = indices
-                    .iter()
-                    .map(|&i| std::mem::replace(&mut r1_infos[i], Self::dummy_info()))
-                    .collect();
-                let new_r2: Vec<_> = indices
-                    .iter()
-                    .map(|&i| std::mem::replace(&mut r2_infos[i], Self::dummy_info()))
-                    .collect();
-                r1_infos = new_r1;
-                r2_infos = new_r2;
-            }
+            let new_r1: Vec<_> = indices
+                .iter()
+                .map(|&i| std::mem::replace(&mut r1_infos[i], Self::dummy_info()))
+                .collect();
+            let new_r2: Vec<_> = indices
+                .iter()
+                .map(|&i| std::mem::replace(&mut r2_infos[i], Self::dummy_info()))
+                .collect();
+            r1_infos = new_r1;
+            r2_infos = new_r2;
         }
 
         // Phase 3: Filter to most common alignment on ClippedRecordInfo
@@ -1484,11 +1484,11 @@ impl CodecConsensusCaller {
         if let Some(cell_tag) = &self.options.cell_tag {
             let cell_tag_bytes: [u8; 2] = [cell_tag.as_ref()[0], cell_tag.as_ref()[1]];
             for raw in source_raws {
-                if let Some(cell_bc) = RawRecordView::new(raw).tags().find_string(cell_tag_bytes) {
-                    if !cell_bc.is_empty() {
-                        self.bam_builder.append_string_tag(cell_tag_bytes, cell_bc);
-                        break;
-                    }
+                if let Some(cell_bc) = RawRecordView::new(raw).tags().find_string(cell_tag_bytes)
+                    && !cell_bc.is_empty()
+                {
+                    self.bam_builder.append_string_tag(cell_tag_bytes, cell_bc);
+                    break;
                 }
             }
         }

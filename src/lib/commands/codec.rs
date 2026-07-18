@@ -533,10 +533,10 @@ impl Codec {
         if self.min_reads == 0 {
             bail!("min-reads must be >= 1");
         }
-        if let Some(max) = self.max_reads {
-            if max < self.min_reads {
-                bail!("max-reads ({}) must be >= min-reads ({})", max, self.min_reads);
-            }
+        if let Some(max) = self.max_reads
+            && max < self.min_reads
+        {
+            bail!("max-reads ({}) must be >= min-reads ({})", max, self.min_reads);
         }
 
         // Validate duplex length

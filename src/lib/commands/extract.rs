@@ -783,18 +783,14 @@ impl Extract {
         // before the UMI.
         let parts: Vec<&[u8]> = name_part.split(|&b| b == b':').collect();
 
-        if parts.len() >= 8 {
-            if let Some(last) = parts.last() {
-                if !last.is_empty() {
-                    let umi = Self::normalize_read_name_umi(last).with_context(|| {
-                        format!(
-                            "extracting UMI from read name '{}'",
-                            String::from_utf8_lossy(name_part)
-                        )
-                    })?;
-                    return Ok((name_part.to_vec(), Some(umi)));
-                }
-            }
+        if parts.len() >= 8
+            && let Some(last) = parts.last()
+            && !last.is_empty()
+        {
+            let umi = Self::normalize_read_name_umi(last).with_context(|| {
+                format!("extracting UMI from read name '{}'", String::from_utf8_lossy(name_part))
+            })?;
+            return Ok((name_part.to_vec(), Some(umi)));
         }
 
         Ok((name_part.to_vec(), None))

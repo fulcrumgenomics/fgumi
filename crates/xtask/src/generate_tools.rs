@@ -120,12 +120,12 @@ fn collect_commands() -> Vec<CommandInfo> {
 /// Format: `\x1b[38;5;NNNm[CATEGORY]\x1b[0m \x1b[36mDescription\x1b[0m`
 fn parse_about(about: &str) -> (String, String) {
     let stripped = strip_ansi(about);
-    if stripped.starts_with('[') {
-        if let Some(end_bracket) = stripped.find(']') {
-            let category = stripped[1..end_bracket].to_string();
-            let description = stripped[end_bracket + 1..].trim().to_string();
-            return (category, description);
-        }
+    if stripped.starts_with('[')
+        && let Some(end_bracket) = stripped.find(']')
+    {
+        let category = stripped[1..end_bracket].to_string();
+        let description = stripped[end_bracket + 1..].trim().to_string();
+        return (category, description);
     }
     ("Uncategorized".to_string(), stripped)
 }

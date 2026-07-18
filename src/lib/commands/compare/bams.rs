@@ -1290,10 +1290,10 @@ impl CompareBams {
 
             // Collect diff details (limited by max_diffs)
             for r in results {
-                if let Some(detail) = r.diff_detail {
-                    if stats.diff_details.len() < self.max_diffs {
-                        stats.diff_details.push(detail);
-                    }
+                if let Some(detail) = r.diff_detail
+                    && stats.diff_details.len() < self.max_diffs
+                {
+                    stats.diff_details.push(detail);
                 }
             }
 
@@ -1511,10 +1511,10 @@ impl CompareBams {
             stats.tag_order_diffs += tag_ord as u64;
 
             for r in results {
-                if let Some(detail) = r.diff_detail {
-                    if stats.diff_details.len() < self.max_diffs {
-                        stats.diff_details.push(detail);
-                    }
+                if let Some(detail) = r.diff_detail
+                    && stats.diff_details.len() < self.max_diffs
+                {
+                    stats.diff_details.push(detail);
                 }
             }
 
@@ -1764,20 +1764,20 @@ impl CompareBams {
 
                 if !r.name_match {
                     stats.order_mismatches += 1;
-                    if let Some(detail) = r.diff_detail {
-                        if diff_details.len() < self.max_diffs {
-                            diff_details.push(detail);
-                        }
+                    if let Some(detail) = r.diff_detail
+                        && diff_details.len() < self.max_diffs
+                    {
+                        diff_details.push(detail);
                     }
                     continue;
                 }
 
                 if !r.flag_match {
                     stats.flag_mismatches += 1;
-                    if let Some(detail) = r.diff_detail {
-                        if diff_details.len() < self.max_diffs {
-                            diff_details.push(detail);
-                        }
+                    if let Some(detail) = r.diff_detail
+                        && diff_details.len() < self.max_diffs
+                    {
+                        diff_details.push(detail);
                     }
                     continue;
                 }

@@ -769,27 +769,27 @@ pub fn remove_tag(record: &mut Vec<u8>, tag: impl AsTagBytes) {
 pub fn update_string_tag(record: &mut Vec<u8>, tag: impl AsTagBytes, new_value: &[u8]) {
     let tag = tag.as_tag_bytes();
     let aux_start = aux_data_offset_from_record(record).unwrap_or(record.len());
-    if aux_start < record.len() {
-        if let Some((start, end)) = find_tag_bounds(&record[aux_start..], tag) {
-            let abs_start = aux_start + start;
-            let abs_end = aux_start + end;
-            let old_value_len = end - start - 4; // subtract tag(2) + type(1) + NUL(1)
-            if old_value_len == new_value.len() {
-                // Same length: overwrite value bytes in-place (no memmove)
-                let value_start = abs_start + 3; // skip tag(2) + type(1)
-                record[value_start..value_start + new_value.len()].copy_from_slice(new_value);
-            } else {
-                // Different length: splice replacement
-                let mut replacement = Vec::with_capacity(3 + new_value.len() + 1);
-                replacement.push(tag[0]);
-                replacement.push(tag[1]);
-                replacement.push(b'Z');
-                replacement.extend_from_slice(new_value);
-                replacement.push(0);
-                record.splice(abs_start..abs_end, replacement);
-            }
-            return;
+    if aux_start < record.len()
+        && let Some((start, end)) = find_tag_bounds(&record[aux_start..], tag)
+    {
+        let abs_start = aux_start + start;
+        let abs_end = aux_start + end;
+        let old_value_len = end - start - 4; // subtract tag(2) + type(1) + NUL(1)
+        if old_value_len == new_value.len() {
+            // Same length: overwrite value bytes in-place (no memmove)
+            let value_start = abs_start + 3; // skip tag(2) + type(1)
+            record[value_start..value_start + new_value.len()].copy_from_slice(new_value);
+        } else {
+            // Different length: splice replacement
+            let mut replacement = Vec::with_capacity(3 + new_value.len() + 1);
+            replacement.push(tag[0]);
+            replacement.push(tag[1]);
+            replacement.push(b'Z');
+            replacement.extend_from_slice(new_value);
+            replacement.push(0);
+            record.splice(abs_start..abs_end, replacement);
         }
+        return;
     }
     // Tag not found — append
     append_string_tag(record, tag, new_value);
@@ -804,21 +804,21 @@ pub fn update_string_tag(record: &mut Vec<u8>, tag: impl AsTagBytes, new_value: 
 pub fn update_int_tag(record: &mut Vec<u8>, tag: impl AsTagBytes, value: i32) {
     let tag = tag.as_tag_bytes();
     let aux_start = aux_data_offset_from_record(record).unwrap_or(record.len());
-    if aux_start < record.len() {
-        if let Some((start, end)) = find_tag_bounds(&record[aux_start..], tag) {
-            let abs_start = aux_start + start;
-            let abs_end = aux_start + end;
-            let val_type = record[abs_start + 2];
-            // If 4-byte integer type, overwrite in-place
-            if matches!(val_type, b'i' | b'I') && (abs_end - abs_start) == 7 {
-                record[abs_start + 3..abs_start + 7].copy_from_slice(&value.to_le_bytes());
-                return;
-            }
-            // Different size — remove and re-append
-            record.drain(abs_start..abs_end);
-            append_int_tag(record, tag, value);
+    if aux_start < record.len()
+        && let Some((start, end)) = find_tag_bounds(&record[aux_start..], tag)
+    {
+        let abs_start = aux_start + start;
+        let abs_end = aux_start + end;
+        let val_type = record[abs_start + 2];
+        // If 4-byte integer type, overwrite in-place
+        if matches!(val_type, b'i' | b'I') && (abs_end - abs_start) == 7 {
+            record[abs_start + 3..abs_start + 7].copy_from_slice(&value.to_le_bytes());
             return;
         }
+        // Different size — remove and re-append
+        record.drain(abs_start..abs_end);
+        append_int_tag(record, tag, value);
+        return;
     }
     // Tag not found — append
     append_int_tag(record, tag, value);

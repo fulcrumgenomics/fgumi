@@ -233,13 +233,12 @@ fn filter_template_raw(
         // Check mate MAPQ. Compare in i64 so a malformed `MQ:i:-1` (or any
         // negative value from a signed integer aux type) reads as below the
         // threshold instead of wrapping into a large positive u8.
-        if check_mq {
-            if let Some(mq) = found_mq {
-                if mq < i64::from(config.min_mapq) {
-                    metrics.discarded_poor_alignment += num_primary_reads;
-                    return false;
-                }
-            }
+        if check_mq
+            && let Some(mq) = found_mq
+            && mq < i64::from(config.min_mapq)
+        {
+            metrics.discarded_poor_alignment += num_primary_reads;
+            return false;
         }
 
         // Skip UMI validation in no-umi mode
@@ -255,11 +254,11 @@ fn filter_template_raw(
                     return false;
                 }
                 UmiValidation::Valid(base_count) => {
-                    if let Some(min_len) = config.min_umi_length {
-                        if base_count < min_len {
-                            metrics.discarded_umi_too_short += num_primary_reads;
-                            return false;
-                        }
+                    if let Some(min_len) = config.min_umi_length
+                        && base_count < min_len
+                    {
+                        metrics.discarded_umi_too_short += num_primary_reads;
+                        return false;
                     }
                 }
             }
@@ -1216,11 +1215,10 @@ impl Command for GroupReadsByUmi {
 
                 if filtered_templates.is_empty() {
                     #[cfg(feature = "memory-debug")]
-                    if debug_memory_flag {
-                        if let Some(stats) = stats_for_tracking.as_ref() {
+                    if debug_memory_flag
+                        && let Some(stats) = stats_for_tracking.as_ref() {
                             stats.track_position_group_memory(initial_group_size, false);
                         }
-                    }
                     return Ok(ProcessedPositionGroup {
                         templates: Vec::new(),
                         family_sizes: AHashMap::new(),
@@ -1260,12 +1258,11 @@ impl Command for GroupReadsByUmi {
                 ) {
                     log::warn!("UMI assignment failed, returning empty group: {e}");
                     #[cfg(feature = "memory-debug")]
-                    if debug_memory_flag {
-                        if let Some(stats) = stats_for_tracking.as_ref() {
+                    if debug_memory_flag
+                        && let Some(stats) = stats_for_tracking.as_ref() {
                             stats.track_position_group_memory(initial_group_size, false);
                             stats.track_template_memory(_template_memory_size, false);
                         }
-                    }
                     return Ok(ProcessedPositionGroup {
                         templates: Vec::new(),
                         family_sizes: AHashMap::new(),
@@ -1324,11 +1321,10 @@ impl Command for GroupReadsByUmi {
 
                 // Track memory deallocation when processing completes (if debug mode)
                 #[cfg(feature = "memory-debug")]
-                if debug_memory_flag {
-                    if let Some(stats) = stats_for_tracking.as_ref() {
+                if debug_memory_flag
+                    && let Some(stats) = stats_for_tracking.as_ref() {
                         stats.track_position_group_memory(initial_group_size, false);
                     }
-                }
 
                 Ok(ProcessedPositionGroup {
                     templates,
@@ -1346,12 +1342,11 @@ impl Command for GroupReadsByUmi {
                 #[cfg(feature = "memory-debug")]
                 if short_circuit_serialize {
                     let count = processed.input_record_count;
-                    if debug_memory_flag {
-                        if let Some(stats) = stats_for_serialize.as_ref() {
+                    if debug_memory_flag
+                        && let Some(stats) = stats_for_serialize.as_ref() {
                             let tmpl_size = estimate_templates_heap_size(&processed.templates);
                             stats.track_template_memory(tmpl_size, false);
                         }
-                    }
                     drop(processed);
                     return Ok(count);
                 }
@@ -1367,12 +1362,11 @@ impl Command for GroupReadsByUmi {
 
                 // Track template memory deallocation (templates are consumed here)
                 #[cfg(feature = "memory-debug")]
-                if debug_memory_flag {
-                    if let Some(stats) = stats_for_serialize.as_ref() {
+                if debug_memory_flag
+                    && let Some(stats) = stats_for_serialize.as_ref() {
                         let tmpl_size = estimate_templates_heap_size(&processed.templates);
                         stats.track_template_memory(tmpl_size, false);
                     }
-                }
 
                 // Serialize primary reads directly from templates — no
                 // intermediate `Vec<RecordBuf>`. Templates already carry

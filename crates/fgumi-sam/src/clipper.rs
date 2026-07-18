@@ -397,12 +397,11 @@ impl SamRecordClipper {
         *record.cigar_mut() = CigarBuf::from(final_ops);
 
         // Update alignment start position
-        if ref_bases_clipped > 0 {
-            if let Some(start_pos) = record.alignment_start() {
-                if let Some(new_start) = Position::new(usize::from(start_pos) + ref_bases_clipped) {
-                    *record.alignment_start_mut() = Some(new_start);
-                }
-            }
+        if ref_bases_clipped > 0
+            && let Some(start_pos) = record.alignment_start()
+            && let Some(new_start) = Position::new(usize::from(start_pos) + ref_bases_clipped)
+        {
+            *record.alignment_start_mut() = Some(new_start);
         }
 
         // Handle sequence and quality updates based on mode
@@ -2674,11 +2673,11 @@ pub mod cigar_utils {
             };
 
             // Coalesce adjacent operations of the same type
-            if let Some((last_kind, last_len)) = simplified.last_mut() {
-                if *last_kind == new_kind {
-                    *last_len += len;
-                    continue;
-                }
+            if let Some((last_kind, last_len)) = simplified.last_mut()
+                && *last_kind == new_kind
+            {
+                *last_len += len;
+                continue;
             }
 
             simplified.push((new_kind, len));

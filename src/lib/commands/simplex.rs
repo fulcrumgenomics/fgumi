@@ -246,10 +246,10 @@ impl Command for Simplex {
         // Validate inputs
         self.io.validate()?;
 
-        if let Some(max) = self.max_reads {
-            if max < self.min_reads {
-                bail!("--max-reads ({}) must be >= --min-reads ({})", max, self.min_reads);
-            }
+        if let Some(max) = self.max_reads
+            && max < self.min_reads
+        {
+            bail!("--max-reads ({}) must be >= --min-reads ({})", max, self.min_reads);
         }
 
         info!("Starting Simplex");

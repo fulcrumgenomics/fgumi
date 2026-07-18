@@ -219,14 +219,14 @@ impl Command for Clip {
 
         // --metrics is not produced in --threads mode; fail fast rather than
         // silently dropping a user-requested output file.
-        if self.threading.threads.is_some() {
-            if let Some(path) = &self.metrics {
-                anyhow::bail!(
-                    "--metrics {} cannot be used with --threads: detailed clipping metrics \
+        if self.threading.threads.is_some()
+            && let Some(path) = &self.metrics
+        {
+            anyhow::bail!(
+                "--metrics {} cannot be used with --threads: detailed clipping metrics \
                      are only produced by the single-threaded path",
-                    path.display()
-                );
-            }
+                path.display()
+            );
         }
 
         // ========================================================================
@@ -386,14 +386,14 @@ impl Clip {
         info!("Templates with mate extension clipping: {total_clipped_mate_extension}");
 
         // Write metrics if requested
-        if let Some(metrics_path) = &self.metrics {
-            if let Some(mut metrics) = metrics_collection {
-                info!("Writing metrics to {}", metrics_path.display());
-                metrics.finalize();
-                let all_metrics = metrics.all_metrics().map(Clone::clone);
-                write_metrics_tsv(metrics_path, &all_metrics, "clipping")?;
-                info!("Metrics written successfully");
-            }
+        if let Some(metrics_path) = &self.metrics
+            && let Some(mut metrics) = metrics_collection
+        {
+            info!("Writing metrics to {}", metrics_path.display());
+            metrics.finalize();
+            let all_metrics = metrics.all_metrics().map(Clone::clone);
+            write_metrics_tsv(metrics_path, &all_metrics, "clipping")?;
+            info!("Metrics written successfully");
         }
 
         // Flush and finish the writer

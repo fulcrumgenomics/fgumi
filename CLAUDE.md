@@ -113,7 +113,14 @@ Types: `feat`, `fix`, `build`, `chore`, `ci`, `config`, `docs`, `example`, `perf
 
 ## Rust Version
 
-Minimum: 1.87.0 (uses edition 2024)
+Minimum supported and pinned build version: 1.93.0 (edition 2024).
+
+fgumi supports exactly the Rust it is developed and tested on: `rust-version`
+in `Cargo.toml` (the published MSRV) is kept identical to the `channel` in
+`rust-toolchain.toml`, and CI's `msrv-lockstep` job fails if they drift. When
+raising the toolchain, bump `rust-version` in the same change and adopt any
+idioms the newer compiler unlocks (e.g. let-chains) rather than suppressing the
+clippy lints that flag them.
 
 ## Allocator
 

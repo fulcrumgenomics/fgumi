@@ -210,10 +210,10 @@ pub fn discover_edges_parallel_k1(
         .flat_map(|(i, (enc, _))| {
             let mut edges = Vec::new();
             for neighbor in generate_neighbors(enc) {
-                if let Some(&j) = umi_to_idx.get(&neighbor) {
-                    if i < j {
-                        edges.push((i, j));
-                    }
+                if let Some(&j) = umi_to_idx.get(&neighbor)
+                    && i < j
+                {
+                    edges.push((i, j));
                 }
             }
             edges
@@ -248,12 +248,12 @@ pub fn discover_edges_parallel_k(
             let mut edges = Vec::new();
             let neighbors = generate_neighbors_k(enc, max_mismatches);
             for neighbor in neighbors {
-                if let Some(&j) = umi_to_idx.get(&neighbor) {
-                    if i < j {
-                        // Verify actual distance (neighbors may include closer matches)
-                        if enc.hamming_distance(&neighbor) <= max_mismatches {
-                            edges.push((i, j));
-                        }
+                if let Some(&j) = umi_to_idx.get(&neighbor)
+                    && i < j
+                {
+                    // Verify actual distance (neighbors may include closer matches)
+                    if enc.hamming_distance(&neighbor) <= max_mismatches {
+                        edges.push((i, j));
                     }
                 }
             }
@@ -2323,11 +2323,11 @@ mod tests {
                     if let Some(pos) = mutate {
                         // Map a base index 0..8 to a string index, skipping the dash at 4.
                         let idx = if pos < 4 { pos } else { pos + 1 };
-                        if let Some(cur) = chars.get(idx).copied() {
-                            if cur != '-' {
-                                let ci = BASES.iter().position(|&c| c == cur).unwrap_or(0);
-                                chars[idx] = BASES[(ci + 1) % 4];
-                            }
+                        if let Some(cur) = chars.get(idx).copied()
+                            && cur != '-'
+                        {
+                            let ci = BASES.iter().position(|&c| c == cur).unwrap_or(0);
+                            chars[idx] = BASES[(ci + 1) % 4];
                         }
                     }
                     chars.into_iter().collect()

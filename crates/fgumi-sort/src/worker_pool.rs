@@ -458,10 +458,10 @@ impl PermitPool {
 
     /// Release a permit back to the pool after a block has been written to disk.
     pub(crate) fn release(&self) {
-        if let Ok(guard) = self.tx.lock() {
-            if let Some(tx) = guard.as_ref() {
-                let _ = tx.try_send(());
-            }
+        if let Ok(guard) = self.tx.lock()
+            && let Some(tx) = guard.as_ref()
+        {
+            let _ = tx.try_send(());
         }
     }
 
@@ -1081,20 +1081,15 @@ impl SortWorkerPool {
             let owned_step = Self::exclusive_step_for(worker.worker_id, shared, current_phase);
 
             // 5. Try owned exclusive step first (prevents starvation)
-            if !did_work {
-                if let Some(step) = owned_step {
-                    if Self::is_step_eligible(step, shared, worker, current_phase) {
-                        let t0 = Instant::now();
-                        let result = Self::execute_step(shared, worker, step);
-                        if result == StepResult::Success {
-                            pstats.record_step(
-                                worker.worker_id,
-                                step,
-                                Self::nanos_u64(t0.elapsed()),
-                            );
-                            did_work = true;
-                        }
-                    }
+            if !did_work
+                && let Some(step) = owned_step
+                && Self::is_step_eligible(step, shared, worker, current_phase)
+            {
+                let t0 = Instant::now();
+                let result = Self::execute_step(shared, worker, step);
+                if result == StepResult::Success {
+                    pstats.record_step(worker.worker_id, step, Self::nanos_u64(t0.elapsed()));
+                    did_work = true;
                 }
             }
 

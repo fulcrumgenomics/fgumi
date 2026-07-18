@@ -521,10 +521,10 @@ pub fn filter_read(aux_data: &[u8], thresholds: &FilterThresholds) -> Result<Fil
     }
 
     // Check maximum error rate (cE tag — Float)
-    if let Some(error_rate) = error_rate {
-        if f64::from(error_rate) > thresholds.max_read_error_rate {
-            return Ok(FilterResult::ExcessiveErrorRate);
-        }
+    if let Some(error_rate) = error_rate
+        && f64::from(error_rate) > thresholds.max_read_error_rate
+    {
+        return Ok(FilterResult::ExcessiveErrorRate);
     }
 
     Ok(FilterResult::Pass)

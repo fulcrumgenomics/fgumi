@@ -41,15 +41,15 @@ pub fn verify_sort_order<K>(
         let bam: &[u8] = &record_bytes;
         let key = extract_key(bam);
 
-        if let Some(ref prev) = prev_key {
-            if is_violation(&key, prev) {
-                violations += 1;
-                if first_violation.is_none() {
-                    let name =
-                        String::from_utf8_lossy(fgumi_raw_bam::RawRecordView::new(bam).read_name())
-                            .to_string();
-                    first_violation = Some((total_records, name));
-                }
+        if let Some(ref prev) = prev_key
+            && is_violation(&key, prev)
+        {
+            violations += 1;
+            if first_violation.is_none() {
+                let name =
+                    String::from_utf8_lossy(fgumi_raw_bam::RawRecordView::new(bam).read_name())
+                        .to_string();
+                first_violation = Some((total_records, name));
             }
         }
         prev_key = Some(key);
