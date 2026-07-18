@@ -609,6 +609,17 @@ impl RawRecord {
         RawRecordMut::new(&mut self.0).set_bin(v);
     }
 
+    /// Recompute the BAM bin field from this record's current `POS` and CIGAR.
+    ///
+    /// Call after any in-place mutation of `POS` or the CIGAR (clipping, mate
+    /// relocation, unmapping) so the emitted record carries a correct bin — the
+    /// raw pipeline writes record bytes verbatim, with no encode step to refresh
+    /// it. Unmapped records (`POS < 0`) get [`crate::bin::UNMAPPED_BIN`].
+    #[inline]
+    pub fn recompute_bin(&mut self) {
+        crate::bin::set_bin_from_raw_bam(&mut self.0);
+    }
+
     /// Set the mate reference sequence ID.
     #[inline]
     pub fn set_mate_ref_id(&mut self, v: i32) {
@@ -928,6 +939,31 @@ mod tests {
             ed.update_int(SamTag::NM, 8);
         }
         assert_eq!(rec.tags().find_int(SamTag::NM), Some(8));
+    }
+
+    #[test]
+    fn test_recompute_bin_tracks_pos_and_cigar_mutations() {
+        use crate::bin::UNMAPPED_BIN;
+        use crate::testutil::*;
+
+        // 200M at pos 16300 straddles the 16 kb boundary -> level-4 bin 585.
+        let bytes = make_bam_bytes(0, 16300, 0, b"r", &[encode_op(0, 200)], 200, -1, -1, &[]);
+        let mut rec = RawRecord::from(bytes);
+        assert_eq!(rec.bin(), 0, "make_bam_bytes leaves the bin field zeroed");
+        rec.recompute_bin();
+        assert_eq!(rec.bin(), 585);
+
+        // Shift start across the boundary (set_pos + shorter CIGAR): 84M at 16416 -> 4682.
+        rec.set_pos(16416);
+        rec.set_cigar_ops(&[encode_op(0, 84)]);
+        rec.recompute_bin();
+        assert_eq!(rec.bin(), 4682);
+
+        // Unmapping the record (pos = -1, empty CIGAR) -> UNMAPPED_BIN.
+        rec.set_pos(-1);
+        rec.set_cigar_ops(&[]);
+        rec.recompute_bin();
+        assert_eq!(rec.bin(), UNMAPPED_BIN);
     }
 
     #[test]

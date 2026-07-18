@@ -1,3 +1,6 @@
+// Unmapped BAM bin (SAM spec §4.2.1: `reg2bin(-1, 0)` = 4680), shared with the
+// bin module so both encoders agree on the constant.
+use crate::bin::UNMAPPED_BIN;
 use crate::raw_bam_record::RawRecord;
 use crate::sequence::pack_sequence_into;
 use crate::tags::{
@@ -44,9 +47,6 @@ pub struct UnmappedSamBuilder {
     buf: Vec<u8>,
     sealed: bool,
 }
-
-/// Unmapped BAM bin (SAM spec §4.2.1: `reg2bin(-1, 0)` = 4680).
-const UNMAPPED_BIN: u16 = 4680;
 
 impl UnmappedSamBuilder {
     /// Create a new builder with default capacity (512 bytes).
