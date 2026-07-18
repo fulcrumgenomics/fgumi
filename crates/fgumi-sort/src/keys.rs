@@ -209,7 +209,12 @@ impl SortOrder {
     pub fn header_ss_tag(&self) -> Option<&'static str> {
         match self {
             Self::Coordinate => None,
-            Self::Queryname(QuerynameComparator::Lexicographic) => Some("queryname:lexicographic"),
+            // The `@HD SS` sub-sort spelling for lexicographic queryname is the SAM-spec /
+            // samtools-ecosystem `lexicographical` (SORT3-10), not fgumi's CLI vocabulary
+            // `lexicographic` (this type's `Display`). The `<sort-order>:` prefix is retained.
+            Self::Queryname(QuerynameComparator::Lexicographic) => {
+                Some("queryname:lexicographical")
+            }
             Self::Queryname(QuerynameComparator::Natural) => Some("queryname:natural"),
             Self::TemplateCoordinate => Some("unsorted:template-coordinate"),
         }
@@ -1501,7 +1506,9 @@ mod tests {
         assert_eq!(SortOrder::Coordinate.header_ss_tag(), None);
         assert_eq!(
             SortOrder::Queryname(QuerynameComparator::Lexicographic).header_ss_tag(),
-            Some("queryname:lexicographic")
+            // The SAM-spec / samtools sub-sort spelling is "lexicographical" (SORT3-10);
+            // fgumi previously emitted the non-standard "lexicographic". Prefix retained.
+            Some("queryname:lexicographical")
         );
         assert_eq!(
             SortOrder::Queryname(QuerynameComparator::Natural).header_ss_tag(),
