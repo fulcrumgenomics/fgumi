@@ -66,36 +66,44 @@ impl SimulateCommand {
 /// commands when constructing mapped BAM records via `fgumi_raw_bam::SamBuilder`,
 /// which does not compute the bin field automatically.
 ///
-/// The bin layer constants `((1 << k) - 1) / 7` are written verbatim from the SAM
-/// specification reference C code; clippy's `eq_op` lint flags the smallest layer
-/// (`((1 << 3) - 1) / 7 == 7 / 7 == 1`) as a tautology, but we keep the form to
-/// stay textually identical to the spec.
-#[allow(clippy::eq_op, clippy::cast_possible_truncation)]
+/// Delegates to the canonical [`fgumi_raw_bam::reg2bin`] so the simulate encoder
+/// and the raw clip/zipper pipelines share one implementation of the binning
+/// scheme. `reg2bin` takes a 0-based half-open `[beg, end)` interval, so the
+/// 1-based inclusive `start`/`end` map to `start - 1` and `end` respectively.
 #[must_use]
 pub fn region_to_bin(start_1based: Option<u32>, end_1based: Option<u32>) -> u16 {
-    /// SAM spec §4.2.1: `reg2bin(-1, 0)` = 4680.
-    const UNMAPPED_BIN: u16 = 4680;
-
     let (Some(start_1), Some(end_1)) = (start_1based, end_1based) else {
-        return UNMAPPED_BIN;
+        return fgumi_raw_bam::UNMAPPED_BIN;
     };
-    let start = (start_1.saturating_sub(1)) as usize;
-    let end = (end_1.saturating_sub(1)) as usize;
+    let beg = i32::try_from(start_1.saturating_sub(1)).unwrap_or(i32::MAX);
+    // `reg2bin` takes an exclusive end; clamp to 1 so a degenerate `end_1 == 0`
+    // maps to the same bin the pre-delegation code produced (which saturated the
+    // 0-based inclusive end to 0, i.e. an exclusive end of 1).
+    let end = i32::try_from(end_1.max(1)).unwrap_or(i32::MAX);
+    fgumi_raw_bam::reg2bin(beg, end)
+}
 
-    let bin = if start >> 14 == end >> 14 {
-        ((1 << 15) - 1) / 7 + (start >> 14)
-    } else if start >> 17 == end >> 17 {
-        ((1 << 12) - 1) / 7 + (start >> 17)
-    } else if start >> 20 == end >> 20 {
-        ((1 << 9) - 1) / 7 + (start >> 20)
-    } else if start >> 23 == end >> 23 {
-        ((1 << 6) - 1) / 7 + (start >> 23)
-    } else if start >> 26 == end >> 26 {
-        ((1 << 3) - 1) / 7 + (start >> 26)
-    } else {
-        0
-    };
+#[cfg(test)]
+mod tests {
+    use super::region_to_bin;
+    use rstest::rstest;
 
-    // Truncate overflowing bin IDs (matches noodles behaviour).
-    bin as u16
+    #[rstest]
+    // 1-based inclusive coordinates -> BAM bin (SAM spec §5.3 reg2bin).
+    #[case::single_base(Some(1), Some(1), 4681)]
+    #[case::within_first_16kb(Some(101), Some(300), 4681)]
+    #[case::second_16kb_window(Some(16417), Some(16500), 4682)]
+    #[case::straddles_16kb_boundary(Some(16301), Some(16500), 585)]
+    #[case::unmapped_start(None, Some(100), 4680)]
+    #[case::unmapped_end(Some(100), None, 4680)]
+    #[case::unmapped_both(None, None, 4680)]
+    // Degenerate 1-based end of 0 clamps to the first bin, matching pre-refactor behavior.
+    #[case::degenerate_zero_end(Some(1), Some(0), 4681)]
+    fn region_to_bin_matches_sam_spec(
+        #[case] start_1based: Option<u32>,
+        #[case] end_1based: Option<u32>,
+        #[case] expected: u16,
+    ) {
+        assert_eq!(region_to_bin(start_1based, end_1based), expected);
+    }
 }
