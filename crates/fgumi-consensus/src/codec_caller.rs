@@ -1312,13 +1312,13 @@ impl CodecConsensusCaller {
         let len = consensus.quals.len();
 
         // 1. Outer bases: assign the outer quality to the first/last `outer_bases_length` bases.
-        if self.options.outer_bases_length > 0 {
-            if let Some(outer_qual) = self.options.outer_bases_qual {
-                let last_idx = len.saturating_sub(1);
-                for i in 0..min(self.options.outer_bases_length, len) {
-                    consensus.quals[i] = outer_qual;
-                    consensus.quals[last_idx - i] = outer_qual;
-                }
+        if self.options.outer_bases_length > 0
+            && let Some(outer_qual) = self.options.outer_bases_qual
+        {
+            let last_idx = len.saturating_sub(1);
+            for i in 0..min(self.options.outer_bases_length, len) {
+                consensus.quals[i] = outer_qual;
+                consensus.quals[last_idx - i] = outer_qual;
             }
         }
 
