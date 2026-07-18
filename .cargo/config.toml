@@ -5,6 +5,9 @@ ci-lint = "clippy --workspace --all-targets --features compare,simulate,profile-
 ci-tag-literals = "run --package xtask -- check-tag-literals"
 # Run documentation tests (nextest does not run doctests, so ci-test skips them)
 ci-doctest = "test --doc --workspace --features compare,simulate,profile-adjacency --locked"
+# Build the docs and fail on any rustdoc warning (e.g. broken intra-doc links).
+# RUSTDOCFLAGS="-D warnings" is set by the caller (CI job / pre-push).
+ci-doc = "doc --no-deps --workspace --features compare,simulate,profile-adjacency --locked"
 # Run tests with test-utils feature enabled (allows binary tests to use library test utilities)
 t = "test --features test-utils"
 # Generate and serve documentation locally (runs xtask then mdbook serve)

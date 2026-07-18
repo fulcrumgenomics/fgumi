@@ -100,7 +100,7 @@ fn parse_noise_stddev(s: &str) -> Result<f64, String> {
 }
 
 impl QualityArgs {
-    /// Convert to a [`PositionQualityModel`].
+    /// Convert to a [`PositionQualityModel`](crate::simulate::PositionQualityModel).
     pub fn to_quality_model(&self) -> crate::simulate::PositionQualityModel {
         crate::simulate::PositionQualityModel::new(
             self.warmup_bases,
@@ -113,7 +113,7 @@ impl QualityArgs {
         )
     }
 
-    /// Convert to a [`ReadPairQualityBias`].
+    /// Convert to a [`ReadPairQualityBias`](crate::simulate::ReadPairQualityBias).
     pub fn to_quality_bias(&self) -> crate::simulate::ReadPairQualityBias {
         crate::simulate::ReadPairQualityBias::new(self.r2_quality_offset)
     }
@@ -140,7 +140,7 @@ pub struct InsertSizeArgs {
 }
 
 impl InsertSizeArgs {
-    /// Convert to an [`InsertSizeModel`].
+    /// Convert to an [`InsertSizeModel`](crate::simulate::InsertSizeModel).
     pub fn to_insert_size_model(&self) -> crate::simulate::InsertSizeModel {
         crate::simulate::InsertSizeModel::new(
             self.insert_size_mean,
@@ -180,7 +180,7 @@ pub struct FamilySizeArgs {
 }
 
 impl FamilySizeArgs {
-    /// Convert to a [`FamilySizeDistribution`].
+    /// Convert to a [`FamilySizeDistribution`](crate::simulate::FamilySizeDistribution).
     pub fn to_family_size_distribution(
         &self,
     ) -> anyhow::Result<crate::simulate::FamilySizeDistribution> {
@@ -214,7 +214,7 @@ pub struct StrandBiasArgs {
 }
 
 impl StrandBiasArgs {
-    /// Convert to a [`StrandBiasModel`].
+    /// Convert to a [`StrandBiasModel`](crate::simulate::StrandBiasModel).
     pub fn to_strand_bias_model(&self) -> crate::simulate::StrandBiasModel {
         crate::simulate::StrandBiasModel::new(self.strand_alpha, self.strand_beta)
     }

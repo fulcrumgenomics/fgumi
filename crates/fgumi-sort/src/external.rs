@@ -1640,7 +1640,7 @@ impl RawExternalSorter {
 
     /// Set the codec used for temporary chunk files.
     ///
-    /// Defaults to [`SpillCodec::Zstd`] which is significantly faster than
+    /// Defaults to [`SpillCodec::Zstd`](crate::codec::SpillCodec::Zstd) which is significantly faster than
     /// BGZF at comparable ratios for BAM-record data.
     #[must_use]
     pub fn spill_codec(mut self, codec: crate::codec::SpillCodec) -> Self {

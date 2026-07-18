@@ -60,13 +60,13 @@ pub fn simplify_cigar_from_raw(
 /// field before the record payload.  This constant names that prefix so it can be stripped.
 const BLOCK_SIZE_PREFIX_LEN: usize = 4;
 
-/// Encode a single `RecordBuf` to raw BAM bytes and wrap in a [`RawRecord`].
+/// Encode a single `RecordBuf` to raw BAM bytes and wrap in a [`RawRecord`](crate::RawRecord).
 ///
 /// Uses noodles' BAM writer machinery writing to an in-memory buffer to produce
 /// the record's binary representation. The 4-byte `block_size` prefix written
 /// by the BAM framing protocol is stripped so the returned `RawRecord` contains
 /// only the record payload bytes (matching the layout of records produced by
-/// [`raw_records_to_record_bufs`] and consumed by [`RawRecord`] field accessors).
+/// [`raw_records_to_record_bufs`] and consumed by [`RawRecord`](crate::RawRecord) field accessors).
 ///
 /// # Errors
 ///
@@ -118,7 +118,7 @@ pub fn raw_record_to_record_buf(
 ///
 /// Holds a reference to the SAM header and an internal scratch `Vec<u8>` so
 /// that per-call allocations for the encoded output are avoided.  The scratch
-/// buffer is reused on every call to [`encode`] and [`encode_into`].
+/// buffer is reused on every call to [`RecordBufEncoder::encode`] and [`RecordBufEncoder::encode_into`].
 ///
 /// # Examples
 ///
@@ -142,10 +142,11 @@ impl<'h> RecordBufEncoder<'h> {
         Self { header, scratch: Vec::with_capacity(512) }
     }
 
-    /// Encode `buf` into a freshly-allocated [`RawRecord`].
+    /// Encode `buf` into a freshly-allocated [`RawRecord`](crate::RawRecord).
     ///
-    /// The internal scratch buffer is reused for the encoding step, so no
-    /// allocation is needed there.  The returned [`RawRecord`] owns its bytes.
+    /// The internal scratch buffer is reused for the encoding step and may grow
+    /// when a record exceeds its current capacity. The returned
+    /// [`RawRecord`](crate::RawRecord) owns its bytes.
     ///
     /// # Errors
     ///
@@ -171,7 +172,7 @@ impl<'h> RecordBufEncoder<'h> {
         Ok(crate::RawRecord::from(self.scratch[BLOCK_SIZE_PREFIX_LEN..].to_vec()))
     }
 
-    /// Encode `buf` into the caller-supplied `out` [`RawRecord`], replacing its
+    /// Encode `buf` into the caller-supplied `out` [`RawRecord`](crate::RawRecord), replacing its
     /// contents.
     ///
     /// Reuses both the internal scratch buffer and the storage inside `out` to

@@ -1029,7 +1029,7 @@ impl CigarOp {
 
     /// True if this op type consumes query bases (M, I, S, =, X).
     ///
-    /// Uses the [`BAM_CIGAR_TYPE`] bitmask for a branchless test.
+    /// Uses the `BAM_CIGAR_TYPE` bitmask for a branchless test.
     #[inline]
     #[must_use]
     pub fn consumes_query(self) -> bool {
@@ -1038,7 +1038,7 @@ impl CigarOp {
 
     /// True if this op type consumes reference bases (M, D, N, =, X).
     ///
-    /// Uses the [`BAM_CIGAR_TYPE`] bitmask for a branchless test.
+    /// Uses the `BAM_CIGAR_TYPE` bitmask for a branchless test.
     #[inline]
     #[must_use]
     pub fn consumes_ref(self) -> bool {
