@@ -13,6 +13,7 @@ use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
+use crate::helpers::assertions::assert_bam_sorted;
 use crate::helpers::bam_generator::{create_minimal_header, create_umi_family, to_record_buf};
 
 /// Test that the group command properly writes metrics in the new format.
@@ -46,6 +47,10 @@ fn test_group_command_writes_new_metrics() {
     cmd.execute("fgumi group").expect("Failed to run group command");
     assert!(output_bam.exists(), "Output BAM not created");
     assert!(metrics_file.exists(), "Metrics file not created");
+
+    // group's `@HD` advertises SS:template-coordinate ("Output is always written in
+    // template-coordinate order"); gate that claim against the bytes it wrote.
+    assert_bam_sorted(&output_bam, "template-coordinate", Some("mi"));
 
     // Read and validate metrics
     let metrics: Vec<UmiGroupingMetrics> =

@@ -220,6 +220,31 @@ pub fn assert_different_molecule_ids(family1: &[RecordBuf], family2: &[RecordBuf
     assert_ne!(mi1, mi2, "Different UMI families should have different molecule IDs");
 }
 
+/// Asserts that `bam` is actually sorted in `order`, using fgumi's own canonical
+/// sort-order verifier (`fgumi sort --verify`).
+///
+/// A command's `@HD` `SO`/`GO`/`SS` tags are only a *promise* that the output is in
+/// that order; this checks the promise against the bytes the command wrote. Pass
+/// `key_types = Some("mi")` for template-coordinate BAMs that carry MI tags (e.g.
+/// `group`/`dedup` output), mirroring `fgumi sort --key-types`.
+///
+/// # Panics
+///
+/// Panics if the `fgumi` binary cannot be spawned or reports any sort-order violation.
+pub fn assert_bam_sorted(bam: &std::path::Path, order: &str, key_types: Option<&str>) {
+    let bam_path = bam.to_str().expect("BAM path is valid UTF-8");
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"));
+    cmd.args(["sort", "-i", bam_path, "--verify", "--order", order]);
+    if let Some(kt) = key_types {
+        cmd.args(["--key-types", kt]);
+    }
+    let status = cmd.status().expect("failed to spawn `fgumi sort --verify`");
+    assert!(
+        status.success(),
+        "{bam_path} is not sorted by {order}: `fgumi sort --verify` reported violations"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
