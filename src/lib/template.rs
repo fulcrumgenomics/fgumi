@@ -688,6 +688,8 @@ impl Template {
         fgumi_raw_bam::remove_tag(rr[r1_i].as_mut_vec(), SamTag::MQ);
         fgumi_raw_bam::remove_tag(rr[r1_i].as_mut_vec(), SamTag::MC);
         fgumi_raw_bam::set_template_length(&mut rr[r1_i], 0);
+        // Now unmapped (POS = -1): bin must be the SAM unmapped bin (4680).
+        fgumi_raw_bam::set_bin_from_raw_bam(&mut rr[r1_i]);
 
         // R2: set to unmapped coordinates
         fgumi_raw_bam::set_ref_id(&mut rr[r2_i], -1);
@@ -698,6 +700,8 @@ impl Template {
         fgumi_raw_bam::remove_tag(rr[r2_i].as_mut_vec(), SamTag::MQ);
         fgumi_raw_bam::remove_tag(rr[r2_i].as_mut_vec(), SamTag::MC);
         fgumi_raw_bam::set_template_length(&mut rr[r2_i], 0);
+        // Now unmapped (POS = -1): bin must be the SAM unmapped bin (4680).
+        fgumi_raw_bam::set_bin_from_raw_bam(&mut rr[r2_i]);
     }
 
     /// Raw-byte: one mapped, one unmapped. Places unmapped at mapped coords.
@@ -747,6 +751,9 @@ impl Template {
             fgumi_raw_bam::remove_tag(rr[unmapped_i].as_mut_vec(), SamTag::MC);
         }
         fgumi_raw_bam::set_template_length(&mut rr[unmapped_i], 0);
+        // POS moved from unmapped (-1) to the mate's coordinate; refresh the bin so
+        // the placed read carries its position's bin (htsjdk recomputes on write).
+        fgumi_raw_bam::set_bin_from_raw_bam(&mut rr[unmapped_i]);
     }
 }
 
@@ -1297,6 +1304,48 @@ mod tests {
             "R2 ms should be 55"
         );
 
+        Ok(())
+    }
+
+    /// A read left unmapped is relocated to its mapped mate's coordinate by
+    /// `fix_mate_info` (used by `zipper`). fgbio emits the placed position's bin
+    /// (htsjdk recomputes the indexing bin on write); the raw pipeline must
+    /// recompute it rather than keep the stale unmapped bin (4680).
+    #[test]
+    fn test_fix_mate_info_recomputes_bin_for_relocated_unmapped_mate() -> Result<()> {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(&[b'A'; 100])
+            .qualities(&[30u8; 100])
+            .flags(FLAG_PAIRED | FLAG_READ1)
+            .ref_id(0)
+            .pos(99)
+            .mapq(30)
+            .cigar_ops(&[fgumi_raw_bam::testutil::encode_op(0, 100)]);
+        let r1 = b.build();
+
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(&[b'A'; 100])
+            .qualities(&[30u8; 100])
+            .flags(FLAG_PAIRED | FLAG_READ2 | FLAG_UNMAPPED)
+            .ref_id(-1)
+            .pos(-1)
+            .mapq(0)
+            .cigar_ops(&[]);
+        let r2 = b.build();
+        assert_eq!(r2.bin(), fgumi_raw_bam::UNMAPPED_BIN, "precondition: unmapped bin");
+
+        let mut template = Template::from_records(vec![r1, r2])?;
+        template.fix_mate_info()?;
+
+        let r2 = &template.records()[1];
+        assert_eq!(r2.pos(), 99, "precondition: relocated to mate coord");
+        assert_eq!(
+            r2.bin(),
+            fgumi_raw_bam::reg2bin(99, 100),
+            "relocated unmapped mate must carry its placed position's bin, not the stale 4680"
+        );
         Ok(())
     }
 
