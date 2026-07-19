@@ -304,6 +304,43 @@ pub fn create_test_reference(dir: &std::path::Path) -> std::path::PathBuf {
     ref_path
 }
 
+// ---------------------------------------------------------------------------
+// `compare`-feature-only helpers.
+//
+// Shared by `test_compare_bams.rs` and `test_compare_mutation.rs` (previously
+// duplicated in both files) since both build small BAMs from `RawRecord`
+// fixtures and run them through the `compare` engines.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "compare")]
+use noodles::sam::alignment::io::Write as AlignmentWrite;
+
+/// Writes a BAM file from the given header and records.
+#[cfg(feature = "compare")]
+pub fn write_bam(path: &std::path::Path, header: &Header, records: &[RawRecord]) {
+    let mut writer =
+        noodles::bam::io::Writer::new(std::fs::File::create(path).expect("create test BAM"));
+    writer.write_header(header).expect("write test header");
+    for record in records {
+        writer.write_alignment_record(header, &to_record_buf(record)).expect("write test record");
+    }
+    writer.try_finish().expect("finish test BAM");
+}
+
+/// Builds a simple mapped record with a given name, position, and MI tag.
+#[cfg(feature = "compare")]
+pub fn mi_record(name: &[u8], pos: i32, mi: &str) -> RawRecord {
+    let mut b = SamBuilder::new();
+    b.read_name(name)
+        .sequence(b"ACGTACGT")
+        .qualities(&[30; 8])
+        .ref_id(0)
+        .pos(pos - 1) // pos is 1-based in tests, BAM uses 0-based
+        .mapq(60)
+        .add_string_tag(SamTag::MI, mi.as_bytes());
+    b.build()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

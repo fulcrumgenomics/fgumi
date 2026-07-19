@@ -16,6 +16,10 @@ mod test_codec_command;
 mod test_codec_pipeline;
 #[cfg(feature = "compare")]
 mod test_compare_bams;
+#[cfg(feature = "compare")]
+mod test_compare_metrics_command;
+#[cfg(feature = "compare")]
+mod test_compare_mutation;
 mod test_correct_command;
 mod test_dedup_command;
 mod test_downsample_command;
