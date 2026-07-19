@@ -2864,6 +2864,11 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:99,1\n",
         ) {
             use noodles::vcf::variant::record_buf::samples::sample::Value;
             use noodles::vcf::variant::record_buf::samples::sample::value::Array;
+            // `[a-zA-Z]{1,8}` can spell the case-insensitive `inf`/`infinity`/`nan`
+            // forms that `f64::from_str` parses as genuine floats; those take the `AF`
+            // path, not the `AD` fallback this test asserts. Only truly unparseable
+            // garbage exercises the fallback, so skip any sample that parses.
+            proptest::prop_assume!(garbage.parse::<f64>().is_err());
             let af = Value::String(garbage);
             let ad = Value::Array(Array::Integer(vec![Some(ref_depth), Some(alt_depth)]));
             let got = calculate_maf_for(Some(af), Some(ad)).expect("AD fallback yields Some");
