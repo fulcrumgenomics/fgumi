@@ -9,7 +9,6 @@ pub mod correct_reads;
 pub mod fastq_reads;
 pub mod grouped_reads;
 pub mod mapped_reads;
-pub mod sort;
 
 use crate::commands::command::Command;
 use anyhow::Result;
