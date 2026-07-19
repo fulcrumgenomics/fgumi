@@ -8,16 +8,15 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-ahash = "0.8"
-anyhow = "1.0"
-approx = "0.5"
-bstr = "1.12.1"
-log = "0"
-# held at 0.111 workspace-wide; see crates/fgumi-bam-io/Cargo.toml for why
-noodles = { version = "0.111.0", features = ["bam", "sam", "core"] }
-rand = "0.10"
-thiserror = "2"
-wide = "1.5"
+ahash = { workspace = true }
+anyhow = { workspace = true }
+approx = { workspace = true }
+bstr = { workspace = true }
+log = { workspace = true }
+noodles = { workspace = true, features = ["bam", "sam", "core"] }
+rand = { workspace = true }
+thiserror = { workspace = true }
+wide = { workspace = true }
 fgumi-dna = { workspace = true }
 fgumi-sam = { workspace = true }
 fgumi-metrics = { workspace = true }
@@ -28,9 +27,9 @@ fgumi-raw-bam = { workspace = true, features = ["test-utils"] }
 # Read fgbio-oracle fixture BAMs back into RawRecords in the saturation-oracle
 # tests. fgumi-bam-io does NOT depend on fgumi-consensus, so this is cycle-free.
 fgumi-bam-io = { workspace = true }
-tempfile = "3.3.0"
-rstest = "0.26"
-proptest = "1.10"
+tempfile = { workspace = true }
+rstest = { workspace = true }
+proptest = { workspace = true }
 
 [features]
 default = ["simplex", "duplex", "codec"]

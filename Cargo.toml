@@ -10,6 +10,7 @@ repository = "https://github.com/fulcrumgenomics/fgumi"
 license = "MIT"
 
 [workspace.dependencies]
+# Internal crates. Versions are bumped in lockstep by release-plz.
 fgumi-bam-io = { version = "0.4.0", path = "crates/fgumi-bam-io" }
 fgumi-bgzf = { version = "0.4.0", path = "crates/fgumi-bgzf" }
 fgumi-consensus = { version = "0.4.0", path = "crates/fgumi-consensus", default-features = false }
@@ -21,7 +22,49 @@ fgumi-simd-fastq = { version = "0.4.0", path = "crates/fgumi-simd-fastq" }
 fgumi-sort = { version = "0.4.0", path = "crates/fgumi-sort" }
 fgumi-tag = { version = "0.4.0", path = "crates/fgumi-tag" }
 fgumi-umi = { version = "0.4.0", path = "crates/fgumi-umi" }
+
+# Third-party crates shared by two or more members. Declared once here so a member can
+# never drift onto a different version: two versions of a crate whose types cross crate
+# boundaries (e.g. noodles' `Header`/`RecordBuf`) do not unify and fail to compile.
+ahash = "0.8"
+anyhow = "1.0.102"
+approx = "0.5.1"
+bgzf = "0.4.0"
+bstr = "1.12.1"
 bytemuck = { version = "1.14", features = ["derive"] }
+bytes = "1"
+bytesize = "2.3"
+clap = { version = "4", features = ["derive"] }
+crc32fast = "1.4"
+criterion = { version = "0.8", features = ["html_reports"] }
+crossbeam-channel = "0.5"
+crossbeam-queue = "0.3"
+crossbeam-utils = "0.8.21"
+fgoxide = "0.6.0"
+fs4 = { version = "1.1", default-features = false, features = ["sync"] }
+libdeflater = "1.22"
+libmimalloc-sys = { version = "0.1.44", features = ["extended"] }
+log = "0"
+mach2 = "0.6"
+memchr = "2"
+nix = { version = "0.31", default-features = false, features = ["fs"] }
+# The noodles stack is held one minor behind (noodles 0.111 / noodles-bgzf 0.47 / noodles-csi
+# 0.56). noodles-bgzf 0.48 deprecates `MultithreadedReader::with_worker_count` and
+# `multithreaded_writer::Builder::set_worker_count` into no-ops that defer to rayon's *global*
+# thread pool, so `--threads` would silently stop bounding BGZF decompression/compression
+# parallelism — and fgumi already runs work inside its own scoped rayon pools. Upgrading needs a
+# dedicated, benchmarked migration PR.
+noodles = "0.111.0"
+noodles-bgzf = { version = "0.47.0", features = ["libdeflate"] }
+noodles-csi = "0.56.0"
+parking_lot = "0.12"
+proptest = "1.10"
+rand = "0.10"
+rayon = "1.10"
+rstest = "0.26"
+serde = { version = "1.0.228", features = ["derive"] }
+tempfile = "3.3.0"
+thiserror = "2"
 wide = "1.5"
 
 [package]
@@ -40,45 +83,42 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-clap = { version = "4", features = ["derive", "string"] }
-log = "0"
-thiserror = "2"
-# held at 0.111 workspace-wide; see crates/fgumi-bam-io/Cargo.toml for why. Every member must
-# move in lockstep — a split leaves two `noodles-sam` versions whose `Header`/`RecordBuf` types
-# do not unify, which fails to compile.
-noodles = { version = "0.111.0", features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
-noodles-bgzf = { version = "0.47.0", features = ["libdeflate"] }
+clap = { workspace = true, features = ["string"] }
+log = { workspace = true }
+thiserror = { workspace = true }
+noodles = { workspace = true, features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
+noodles-bgzf = { workspace = true }
 mimalloc = { version = "0.1.52", default-features = false }
-libmimalloc-sys = { version = "0.1.44", features = ["extended"] }
+libmimalloc-sys = { workspace = true }
 env_logger = "0.11.8"
 enum_dispatch = "0.3.13"
-anyhow = "1.0.102"
+anyhow = { workspace = true }
 read-structure = "0.2.0" # held at 0.2 because 0.3 is a breaking API + behavior change (zero-length-read handling) that needs a dedicated migration PR
-bstr = "1.12.1"
-bytes = "1"
-fgoxide = "0.6.0"
-tempfile = "3.3.0"
+bstr = { workspace = true }
+bytes = { workspace = true }
+fgoxide = { workspace = true }
+tempfile = { workspace = true }
 lru = "0.18.0"
-crc32fast = "1.4"
-crossbeam-channel = "0.5"
-crossbeam-queue = "0.3"
-crossbeam-utils = "0.8.21"
-parking_lot = "0.12"
-libdeflater = "1.22"
-serde = { version = "1.0.228", features = ["derive"] }
+crc32fast = { workspace = true }
+crossbeam-channel = { workspace = true }
+crossbeam-queue = { workspace = true }
+crossbeam-utils = { workspace = true }
+parking_lot = { workspace = true }
+libdeflater = { workspace = true }
+serde = { workspace = true }
 itertools = "0.14.0"
 indexmap = "2"
-rand = "0.10"
+rand = { workspace = true }
 csv = "1.1"
-memchr = "2"
+memchr = { workspace = true }
 statrs = "0.18"
-bytesize = "2.3"
+bytesize = { workspace = true }
 sysinfo = { version = "0.38", default-features = false, features = ["system"] } # unconditionally used by validate_against_system_memory; held at 0.38 because sysinfo >=0.39 requires rustc 1.95 > our MSRV (rust-toolchain.toml pins 1.93)
-fs4 = { version = "1.1", default-features = false, features = ["sync"] } # cross-platform filesystem free-space queries
+fs4 = { workspace = true } # cross-platform filesystem free-space queries
 num_cpus = "1.16"
-rayon = "1.10"
-approx = "0.5.1"
-ahash = "0.8"
+rayon = { workspace = true }
+approx = { workspace = true }
+ahash = { workspace = true }
 bytemuck = { workspace = true }
 rand_distr = "0.6"
 # `zlib-rs` selects flate2's fast Rust-zlib DEFLATE backend for gzipped FASTQ
@@ -101,10 +141,10 @@ fgumi-bam-io = { workspace = true }
 fgumi-sort = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-mach2 = "0.6"
+mach2 = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["fs"] }
+nix = { workspace = true }
 
 [features]
 default = ["simplex", "duplex", "codec"]
@@ -127,12 +167,11 @@ profile-adjacency = []
 stress-tests = []
 
 [dev-dependencies]
-rstest = "0"
-proptest = "1.10"
-criterion = { version = "0.8", features = ["html_reports"] }
+rstest = { workspace = true }
+proptest = { workspace = true }
+criterion = { workspace = true }
 fgumi-raw-bam = { workspace = true, features = ["test-utils", "noodles"] }
-# held at 0.111 workspace-wide; see crates/fgumi-bam-io/Cargo.toml for why
-noodles = { version = "0.111.0", features = ["bam", "sam"] }
+noodles = { workspace = true, features = ["bam", "sam"] }
 
 [[bench]]
 name = "core_functions"

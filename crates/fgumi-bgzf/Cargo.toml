@@ -8,12 +8,12 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-libdeflater = "1.22"
-crc32fast = "1.4"
-bgzf = "0.4.0"
+libdeflater = { workspace = true }
+crc32fast = { workspace = true }
+bgzf = { workspace = true }
 
 [dev-dependencies]
-criterion = { version = "0.8", features = ["html_reports"] }
+criterion = { workspace = true }
 
 [[bench]]
 name = "stored_block_decode"

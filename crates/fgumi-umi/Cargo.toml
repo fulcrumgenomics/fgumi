@@ -8,15 +8,15 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-ahash = "0.8"
-anyhow = "1.0"
-clap = { version = "4", features = ["derive"], optional = true }
-rayon = "1.10"
+ahash = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true, optional = true }
+rayon = { workspace = true }
 fgumi-dna = { workspace = true }
 
 [dev-dependencies]
-rstest = "0.26"
-proptest = "1"
+rstest = { workspace = true }
+proptest = { workspace = true }
 
 [features]
 default = ["cli"]
