@@ -405,10 +405,17 @@ impl IoRead for PooledInputStream {
 // RecordSource — unified iterator for pool and non-pool paths
 // ============================================================================
 
+/// Boxed record stream handed to [`RecordSource::Stream`].
+///
+/// Each item is either a record or the producer's terminal error; the first
+/// `Err` ends the stream and is surfaced through [`RecordSource::take_error`].
+pub type BoxedRecordStream = Box<dyn Iterator<Item = anyhow::Result<RawRecord>> + Send>;
+
 /// Unified record source for Phase 1 reading.
 ///
-/// Wraps either a `RawReadAheadReader` (non-pool path, has background thread)
-/// or a direct `RawBamReader<PooledInputStream>` (pool path, no extra threads).
+/// Wraps a `RawReadAheadReader` (non-pool path, has background thread), a
+/// direct `RawBamReader<PooledInputStream>` (pool path, no extra threads), or a
+/// caller-supplied in-process stream (no BAM input file at all).
 pub enum RecordSource {
     /// Legacy path: background thread prefetches records.
     #[allow(dead_code)] // retained for potential future use / benchmarking
@@ -419,6 +426,13 @@ pub enum RecordSource {
     /// if any. Callers should call `take_error()` after the iteration loop to
     /// propagate errors rather than silently treating them as EOF.
     Direct(RawBamReader<PooledInputStream>, Option<std::io::Error>),
+    /// In-process path: records are produced by the caller (e.g. a simulator or
+    /// a pipeline stage) rather than read from a BAM file.
+    ///
+    /// The second field mirrors `Direct`'s error slot: a producer error stops
+    /// iteration and is reported by `take_error()`, so the sort aborts instead
+    /// of writing a silently truncated output.
+    Stream(BoxedRecordStream, Option<std::io::Error>),
 }
 
 impl RecordSource {
@@ -428,13 +442,23 @@ impl RecordSource {
         Self::Direct(reader, None)
     }
 
+    /// Wrap a caller-supplied fallible record iterator as the `Stream` variant.
+    #[must_use]
+    pub fn stream<I>(records: I) -> Self
+    where
+        I: IntoIterator<Item = anyhow::Result<RawRecord>>,
+        I::IntoIter: Send + 'static,
+    {
+        Self::Stream(Box::new(records.into_iter()), None)
+    }
+
     /// Take any I/O error that occurred during iteration.
     ///
     /// Returns `Some(err)` if the iterator stopped due to a read error rather than
     /// clean EOF. Call this after exhausting the iterator to detect truncated input.
     pub fn take_error(&mut self) -> Option<std::io::Error> {
         match self {
-            Self::Direct(_, err) => err.take(),
+            Self::Direct(_, err) | Self::Stream(_, err) => err.take(),
             Self::ReadAhead(r) => r.take_error(),
         }
     }
@@ -461,6 +485,21 @@ impl Iterator for RecordSource {
                     }
                 }
             }
+            Self::Stream(records, error_slot) => match records.next() {
+                Some(Ok(record)) => Some(record),
+                None => None,
+                Some(Err(e)) => {
+                    log::error!("Error producing record for sort: {e:#}");
+                    // Preserve the first error; don't overwrite with later ones.
+                    if error_slot.is_none() {
+                        // `anyhow::Error` converts into the boxed source type
+                        // `io::Error::other` takes, so the message and cause
+                        // chain survive the round-trip through `take_error()`.
+                        *error_slot = Some(std::io::Error::other(e));
+                    }
+                    None
+                }
+            },
         }
     }
 }
