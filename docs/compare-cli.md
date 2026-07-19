@@ -68,7 +68,7 @@ which routes to the dedicated sort-verify engine and *rejects* both options
 (passing either alongside it is an error).
 
 Presets: `extract`, `zipper`, `sort`, `correct`, `dedup`, `group`, `simplex`, `duplex`,
-`codec`, `filter`. See [Recommended Settings by Command](#recommended-settings-by-command)
+`codec`, `filter`, `clip`. See [Recommended Settings by Command](#recommended-settings-by-command)
 below for what each resolves to.
 
 ```bash
@@ -102,8 +102,8 @@ default `content` mode, so no flags are needed.
 | `simplex` | ✅ `--command simplex` | content | false | Exact content comparison (compares the `cD`/`cM`/`cE` depth tags exactly; fgumi clamps them to fgbio's `Short` ceiling at the source, so no saturation carve-out is needed) |
 | `duplex` | ✅ `--command duplex` | content | false | Exact content comparison (compares `cD`/`cM`/`cE` plus duplex `aD`/`aM`/`bD`/`bM`/`aE`/`bE` exactly) |
 | `codec` | ✅ `--command codec` | content | false | Exact content comparison, same as `simplex`/`duplex` |
-| `filter` | ✅ `--command filter` | content | false | Passes through MI/depth tags unchanged; uses the same exact content comparison as consensus output |
-| `clip` | ❌ no preset (default `content` mode) | content | false | Does not modify MI tags |
+| `filter` | ✅ `--command filter` | content | false | Drops failing reads and masks failing bases (rewriting SEQ/QUAL on the reads it keeps), but passes the MI/depth tags through unchanged; uses the same exact content comparison as consensus output, so a masking divergence is caught as a SEQ/QUAL difference |
+| `clip` | ✅ `--command clip` | content | false | Post-consensus reads with overlapping/read-end clipping applied. Clipping rewrites CIGAR/SEQ/QUAL in the clipped span and, as a consequence, regenerates the alignment tags (`NM`/`UQ`/`MD`) and repairs mate-pair metadata; only the MI/depth tags pass through unchanged. Uses the same exact content comparison as `filter`/consensus output, which checks the regenerated alignment tags and repaired mate fields as well as SEQ/QUAL/CIGAR — sound because fgumi and fgbio clip regenerate them identically, so clipping-correctness diffs are caught |
 | `downsample` | ❌ no preset (default `content` mode) | content | false | Deterministic with seed |
 | `review` | ❌ no preset (default `content` mode) | content | false | Preserves MI tags |
 
@@ -235,6 +235,12 @@ fgumi compare metrics file1.txt file2.txt --rel-tol 1e-6 --abs-tol 1e-9
 
 # Multi-column key, e.g. duplex_family_sizes keyed on (ab_size, ba_size)
 fgumi compare metrics file1.txt file2.txt --key-columns ab_size,ba_size
+
+# Compare a `review` command's <output>.txt (a headered TSV, one
+# variant-site x consensus-read row per line): join on the site+read key so
+# row-order differences are tolerated and a per-read consensus base/quality
+# divergence is localized to the offending variant/read
+fgumi compare metrics review1.txt review2.txt --key-columns chrom,pos,consensus_read
 
 # Quiet mode for CI
 fgumi compare metrics fgumi_metrics.txt fgbio_metrics.txt --quiet

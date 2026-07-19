@@ -80,11 +80,18 @@ By default the join key is the first column (works for metrics files keyed by
 `umi`, `family_size`, `fraction`, or `key`). Pass `--key-columns` for a
 multi-column key, e.g. `duplex_family_sizes`'s `ab_size,ba_size`.
 
+This is also the comparator for the `review` command's `<output>.txt` file: it
+is a headered TSV with one `<variant-site> x <consensus-read>` row per line, so
+join it on `chrom,pos,consensus_read` to tolerate row-order differences between
+two `review` runs while still catching a per-read consensus base/quality
+divergence, localized to the offending variant/read.
+
 Example usage:
   fgumi compare metrics file1.txt file2.txt
   fgumi compare metrics file1.txt file2.txt --precision 6
   fgumi compare metrics file1.txt file2.txt --rel-tol 1e-6 --abs-tol 1e-9
   fgumi compare metrics file1.txt file2.txt --key-columns ab_size,ba_size
+  fgumi compare metrics review1.txt review2.txt --key-columns chrom,pos,consensus_read
   fgumi compare metrics file1.txt file2.txt --quiet
 "#
 )]
@@ -171,6 +178,16 @@ fn parse_value(value: &str, precision: Option<u32>) -> ParsedValue {
     ParsedValue::String(value.to_string())
 }
 
+/// Whether `diff` falls inside the combined relative/absolute tolerance window for two values
+/// whose larger magnitude is `max_val`.
+///
+/// The single definition of the tolerance rule, shared by every numeric arm of
+/// [`values_equal`] (float/float, in-range int/float, out-of-`i64`-range int/float, and the
+/// float-space fallback) so the rule can only ever be changed in one place.
+fn within_tolerance(diff: f64, max_val: f64, rel_tol: f64, abs_tol: f64) -> bool {
+    diff <= (rel_tol * max_val).max(abs_tol)
+}
+
 /// Compare two values, using tolerance for floats.
 fn values_equal(val1: &ParsedValue, val2: &ParsedValue, rel_tol: f64, abs_tol: f64) -> bool {
     match (val1, val2) {
@@ -190,7 +207,7 @@ fn values_equal(val1: &ParsedValue, val2: &ParsedValue, rel_tol: f64, abs_tol: f
             }
             let diff = (f1 - f2).abs();
             let max_val = f1.abs().max(f2.abs());
-            diff <= (rel_tol * max_val).max(abs_tol)
+            within_tolerance(diff, max_val, rel_tol, abs_tol)
         }
         // Try to compare as floats if one is int and one is float
         (ParsedValue::Int(i), ParsedValue::Float(f))
@@ -216,25 +233,30 @@ fn values_equal(val1: &ParsedValue, val2: &ParsedValue, rel_tol: f64, abs_tol: f
                     let f2_int = f2 as i64;
                     let diff = i.abs_diff(f2_int) as f64;
                     let max_val = i.unsigned_abs().max(f2_int.unsigned_abs()) as f64;
-                    return diff <= (rel_tol * max_val).max(abs_tol);
+                    return within_tolerance(diff, max_val, rel_tol, abs_tol);
                 }
                 // `f2` is integral but `|f2| >= 2^63`, so no `i64` can equal it — the exact
                 // difference is at least 1. `i64::MAX as f64` rounds *up* to `2^63`, which is
-                // exactly the boundary float `9223372036854775808.0`; the float-space fallback
-                // below would then read `diff == 0` and manufacture a false MATCH in exact mode
-                // (`rel_tol == abs_tol == 0`). Short-circuit that here. Tolerance mode still falls
-                // through: at magnitude 2^63 the window dwarfs the 1-unit gap, so the fallback's
-                // answer is correct there.
-                if rel_tol == 0.0 && abs_tol == 0.0 {
-                    return false;
+                // exactly the boundary float `9223372036854775808.0`, so the float-space fallback
+                // `*i as f64 - f2` reads `diff == 0` and manufactures a false MATCH — not only in
+                // exact mode but under any `abs_tol`/`rel_tol` window narrower than the real gap
+                // (e.g. `abs_tol == 0.5 < 1`). Compute the distance exactly against the boundary in
+                // `i128` (an integral `f64` with `|f2| < 2^127` converts losslessly) and hold it to
+                // the same tolerance window, so every mode sees the true gap. Only `|f2| >= 2^127`
+                // still falls through to float space, where the diff is astronomically large and a
+                // ULP of `*i as f64` loss cannot flip any realistic tolerance decision.
+                if f2.abs() < (i128::MAX as f64) {
+                    let diff = (i128::from(*i) - f2 as i128).unsigned_abs() as f64;
+                    let max_val = (*i as f64).abs().max(f2.abs());
+                    return within_tolerance(diff, max_val, rel_tol, abs_tol);
                 }
             }
-            // Non-integral (or out-of-i64-range) float: compare in float space. Any 1-ULP loss
+            // Non-integral (or `|f2| >= 2^127`) float: compare in float space. Any 1-ULP loss
             // from `*i as f64` at magnitude >2^53 is swamped by the tolerance window there.
             let f1 = *i as f64;
             let diff = (f1 - f2).abs();
             let max_val = f1.abs().max(f2.abs());
-            diff <= (rel_tol * max_val).max(abs_tol)
+            within_tolerance(diff, max_val, rel_tol, abs_tol)
         }
         (ParsedValue::String(s1), ParsedValue::String(s2)) => s1 == s2,
         _ => false,
@@ -924,6 +946,12 @@ mod tests {
     // one apart — even though the naive `*i as f64` cast collapses them onto the same float.
     #[case::i64_max_boundary_exact(i64::MAX, "9223372036854775808.0", 0.0, 0.0, false)]
     #[case::i64_max_boundary_tolerated(i64::MAX, "9223372036854775808.0", 1e-9, 0.0, true)]
+    // A nonzero `abs_tol` smaller than the true 1-unit gap must still DIFFER: the distance is
+    // computed against the i64 boundary (exact `1`), not in the collapsed float space where
+    // `*i as f64 == 9223372036854775808.0` reads `0` and would falsely fall inside `abs_tol`.
+    #[case::i64_max_boundary_abs_tol_below_gap(i64::MAX, "9223372036854775808.0", 0.0, 0.5, false)]
+    // A nonzero `abs_tol` at or above the true 1-unit gap tolerates it, same as any other pair.
+    #[case::i64_max_boundary_abs_tol_covers_gap(i64::MAX, "9223372036854775808.0", 0.0, 1.0, true)]
     #[case::small_int_exact_match(5, "5.0", 0.0, 0.0, true)]
     #[case::small_int_exact_differ(5, "6.0", 0.0, 0.0, false)]
     fn mixed_int_float_preserves_large_integer_identity(

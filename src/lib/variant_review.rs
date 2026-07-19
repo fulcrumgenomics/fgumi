@@ -66,6 +66,94 @@ pub struct ConsensusVariantReviewInfo {
     pub n: usize,
 }
 
+impl ConsensusVariantReviewInfo {
+    /// The tab-delimited column header for the review `.txt` output.
+    ///
+    /// Derived by csv-serializing an instance of this struct — the exact
+    /// mechanism the `review` command uses when it writes rows (see
+    /// `commands::review`), so the header always reflects this struct's serde
+    /// field order and `#[serde(rename = ...)]` attributes. This is the single
+    /// source of truth for the header; consumers (e.g. test fixtures that need a
+    /// faithful review header) should call it rather than hardcode the columns,
+    /// so they cannot silently drift when a field is added, removed, or renamed.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: serializing this fixed, fully-owned struct through an
+    /// in-memory `csv` writer cannot fail, and the resulting header bytes are
+    /// always valid UTF-8. The `expect`s guard those internal invariants only.
+    #[must_use]
+    pub fn tsv_header() -> String {
+        // Field values are irrelevant to the header row; use zero/empty values.
+        let sample = Self {
+            chrom: String::new(),
+            pos: 0,
+            ref_allele: String::new(),
+            genotype: String::new(),
+            filters: String::new(),
+            consensus_a: 0,
+            consensus_c: 0,
+            consensus_g: 0,
+            consensus_t: 0,
+            consensus_n: 0,
+            consensus_read: String::new(),
+            consensus_insert: String::new(),
+            consensus_call: '.',
+            consensus_qual: 0,
+            a: 0,
+            c: 0,
+            g: 0,
+            t: 0,
+            n: 0,
+        };
+        let mut writer = csv::WriterBuilder::new().delimiter(b'\t').from_writer(Vec::new());
+        writer.serialize(&sample).expect("serialize review header row");
+        let bytes = writer.into_inner().expect("flush review header writer");
+        let text = String::from_utf8(bytes).expect("review header is valid UTF-8");
+        // The default writer has `has_headers = true`, so `serialize` emits the
+        // header row *followed by* the sample's data row; take only the first line.
+        // (Header column names are constant identifiers and never embed a newline,
+        // so first-line truncation is safe here — unlike `to_tsv_row`, whose data
+        // fields can, which is why that companion strips only the trailing
+        // terminator.)
+        text.lines().next().expect("csv writer emits a header line").to_string()
+    }
+
+    /// This instance serialized as a single tab-delimited review-`.txt` data row
+    /// (no header, no trailing newline).
+    ///
+    /// The row companion to [`tsv_header`](Self::tsv_header): both drive the same
+    /// serde/`csv` serialization the `review` command uses (see
+    /// `commands::review`), so a header produced by `tsv_header()` and a row
+    /// produced here always agree on column order and `#[serde(rename = ...)]`
+    /// mapping — they cannot drift when a field is added, removed, renamed, or
+    /// reordered. Consumers (e.g. test fixtures that need faithful review rows)
+    /// should build a typed instance and call this rather than hand-assemble a
+    /// positional tab-joined string, so field values stay bound to named struct
+    /// fields and a reorder shifts the row in lockstep with the header instead of
+    /// silently misassigning columns.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: serializing this fully-owned struct through an
+    /// in-memory `csv` writer cannot fail, and the resulting bytes are always
+    /// valid UTF-8. The `expect`s guard those internal invariants only.
+    #[must_use]
+    pub fn to_tsv_row(&self) -> String {
+        let mut writer =
+            csv::WriterBuilder::new().delimiter(b'\t').has_headers(false).from_writer(Vec::new());
+        writer.serialize(self).expect("serialize review row");
+        let bytes = writer.into_inner().expect("flush review row writer");
+        let text = String::from_utf8(bytes).expect("review row is valid UTF-8");
+        // Strip only the trailing record terminator (`csv` writes a single `\n`),
+        // not everything after the first embedded newline. `lines().next()` would
+        // truncate a field whose serialized value contains a `\n` (the `csv` writer
+        // quotes such a field, keeping the row well-formed), silently dropping the
+        // remaining columns; stripping the suffix preserves the embedded newline.
+        text.strip_suffix('\n').expect("csv writer emits a row terminator").to_string()
+    }
+}
+
 /// Represents a variant position
 #[derive(Debug, Clone)]
 pub struct Variant {
@@ -241,6 +329,85 @@ mod tests {
     #[case::first_of_pair_or_unpaired(false, "/1")]
     fn test_read_number_suffix(#[case] is_second_of_pair: bool, #[case] expected: &str) {
         assert_eq!(read_number_suffix(is_second_of_pair), expected);
+    }
+
+    /// A representative review record for the header/row serialization tests.
+    fn sample_review_info() -> ConsensusVariantReviewInfo {
+        ConsensusVariantReviewInfo {
+            chrom: "chr1".to_string(),
+            pos: 100,
+            ref_allele: "A".to_string(),
+            genotype: "0/1".to_string(),
+            filters: "PASS".to_string(),
+            consensus_a: 3,
+            consensus_c: 0,
+            consensus_g: 1,
+            consensus_t: 0,
+            consensus_n: 0,
+            consensus_read: "readX".to_string(),
+            consensus_insert: "chr1:100-200 | F1R2".to_string(),
+            consensus_call: 'A',
+            consensus_qual: 40,
+            a: 5,
+            c: 0,
+            g: 2,
+            t: 0,
+            n: 0,
+        }
+    }
+
+    #[test]
+    fn test_tsv_header_reflects_serde_field_order_and_renames() {
+        // `#[serde(rename = ...)]` maps the count fields to bare base letters; the
+        // rest use their field names verbatim, in declaration order.
+        assert_eq!(
+            ConsensusVariantReviewInfo::tsv_header(),
+            "chrom\tpos\tref\tgenotype\tfilters\tA\tC\tG\tT\tN\t\
+             consensus_read\tconsensus_insert\tconsensus_call\tconsensus_qual\ta\tc\tg\tt\tn",
+        );
+    }
+
+    #[test]
+    fn test_to_tsv_row_serializes_values_in_header_order() {
+        assert_eq!(
+            sample_review_info().to_tsv_row(),
+            "chr1\t100\tA\t0/1\tPASS\t3\t0\t1\t0\t0\t\
+             readX\tchr1:100-200 | F1R2\tA\t40\t5\t0\t2\t0\t0",
+        );
+    }
+
+    #[test]
+    fn test_to_tsv_row_preserves_embedded_newline_in_field() {
+        // A field whose serialized value contains a newline is quoted by the `csv`
+        // writer, keeping the row well-formed. `to_tsv_row` must strip only the
+        // trailing record terminator, preserving the embedded newline — the old
+        // `lines().next()` truncated the row at the first internal `\n`, dropping
+        // every column after it.
+        let mut info = sample_review_info();
+        info.consensus_read = "read\nY".to_string();
+
+        let row = info.to_tsv_row();
+
+        // The embedded newline survives inside the quoted field, every trailing
+        // column is still present (not truncated at the `\n`), and the trailing
+        // record terminator is excluded.
+        assert_eq!(
+            row,
+            "chr1\t100\tA\t0/1\tPASS\t3\t0\t1\t0\t0\t\
+             \"read\nY\"\tchr1:100-200 | F1R2\tA\t40\t5\t0\t2\t0\t0",
+        );
+        assert!(row.contains("\"read\nY\""), "embedded newline dropped: {row:?}");
+        assert!(!row.ends_with('\n'), "trailing terminator not stripped: {row:?}");
+    }
+
+    #[test]
+    fn test_header_and_row_have_matching_column_counts() {
+        // The header/row pair is the review-`.txt` contract; a field added to one
+        // but not reflected by the other would desynchronize the output. Both are
+        // struct-derived, so their column counts must always agree.
+        let header_cols = ConsensusVariantReviewInfo::tsv_header().split('\t').count();
+        let row_cols = sample_review_info().to_tsv_row().split('\t').count();
+        assert_eq!(header_cols, row_cols);
     }
 
     #[test]
