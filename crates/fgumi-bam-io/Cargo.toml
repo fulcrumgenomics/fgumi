@@ -15,10 +15,16 @@ pedantic = { level = "deny", priority = -1 }
 
 [dependencies]
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
+# The noodles stack is held one minor behind (noodles 0.111 / noodles-bgzf 0.47 / noodles-csi
+# 0.56) across the whole workspace. noodles-bgzf 0.48 deprecates
+# `MultithreadedReader::with_worker_count` and `multithreaded_writer::Builder::set_worker_count`
+# into no-ops that defer to rayon's *global* thread pool, so `--threads` would silently stop
+# bounding BGZF decompression/compression parallelism — and fgumi already runs work inside its
+# own scoped rayon pools. Upgrading needs a dedicated, benchmarked migration PR.
 noodles = { version = "0.111.0", features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
 noodles-bgzf = { version = "0.47.0", features = ["libdeflate"] }
 noodles-csi = "0.56.0"
-bgzf = "0.3.0"
+bgzf = "0.4.0"
 anyhow = "1.0.102"
 bstr = "1.12.1"
 bytes = "1"

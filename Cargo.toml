@@ -43,6 +43,9 @@ rust-version.workspace = true
 clap = { version = "4", features = ["derive", "string"] }
 log = "0"
 thiserror = "2"
+# held at 0.111 workspace-wide; see crates/fgumi-bam-io/Cargo.toml for why. Every member must
+# move in lockstep — a split leaves two `noodles-sam` versions whose `Header`/`RecordBuf` types
+# do not unify, which fails to compile.
 noodles = { version = "0.111.0", features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
 noodles-bgzf = { version = "0.47.0", features = ["libdeflate"] }
 mimalloc = { version = "0.1.52", default-features = false }
@@ -128,6 +131,7 @@ rstest = "0"
 proptest = "1.10"
 criterion = { version = "0.8", features = ["html_reports"] }
 fgumi-raw-bam = { workspace = true, features = ["test-utils", "noodles"] }
+# held at 0.111 workspace-wide; see crates/fgumi-bam-io/Cargo.toml for why
 noodles = { version = "0.111.0", features = ["bam", "sam"] }
 
 [[bench]]
