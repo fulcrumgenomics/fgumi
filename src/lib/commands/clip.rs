@@ -943,6 +943,8 @@ fn set_mate_info_raw(r1: &mut RawRecord, r2: &mut RawRecord) {
             set_mate_flags_raw(rec, mate_neg, true);
             clear_mate_mq_mc_raw(rec);
             rec.set_template_length(0);
+            // Now unmapped (POS = -1): bin must be the SAM unmapped bin (4680).
+            rec.recompute_bin();
         }
     } else {
         // Exactly one is unmapped: relocate it to the mapped mate's coordinate.
@@ -960,6 +962,9 @@ fn set_mate_info_raw(r1: &mut RawRecord, r2: &mut RawRecord) {
         set_mate_flags_raw(unmapped, mapped_snap.neg, false);
         set_mate_mq_mc_raw(unmapped, mapped_snap.mapq, &mapped_snap.cigar);
         unmapped.set_template_length(0);
+        // POS moved from unmapped (-1) to the mate's coordinate; refresh the bin so
+        // the placed read carries its position's bin (htsjdk recomputes on write).
+        unmapped.recompute_bin();
 
         // The mapped read points its mate fields at the (now co-located) unmapped read.
         // Its mate-reverse flag reflects the unmapped read's *actual* strand (htsjdk
@@ -3264,6 +3269,45 @@ mod tests {
             assert!(!has_tag(rec, *SamTag::MQ) && !has_tag(rec, *SamTag::MC), "MQ/MC removed");
             assert_eq!(rec.template_length(), 0, "TLEN 0");
         }
+    }
+
+    /// A read that clipping left unmapped is relocated to its mapped mate's
+    /// coordinate by `set_mate_info_raw` (htsjdk `SamPairUtil.setMateInfo`). fgbio
+    /// emits the placed position's bin for such a read (htsjdk recomputes the
+    /// indexing bin on write); the raw pipeline must do so explicitly.
+    #[test]
+    fn set_mate_info_raw_recomputes_bin_for_relocated_unmapped_read() {
+        use fgumi_raw_bam::flags as raw_flags;
+        let mut mapped = fgumi_raw_bam::SamBuilder::new()
+            .read_name(b"t")
+            .sequence(b"ACGTACGTACGTACGTACGT")
+            .qualities(&[30; 20])
+            .cigar_ops(&[20u32 << 4])
+            .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT)
+            .ref_id(0)
+            .pos(99)
+            .mapq(40)
+            .build();
+        let mut unmapped = fgumi_raw_bam::SamBuilder::new()
+            .read_name(b"t")
+            .sequence(b"ACGTACGTACGTACGTACGT")
+            .qualities(&[30; 20])
+            .cigar_ops(&[])
+            .flags(raw_flags::PAIRED | raw_flags::LAST_SEGMENT | raw_flags::UNMAPPED)
+            .ref_id(-1)
+            .pos(-1)
+            .mapq(0)
+            .build();
+        assert_eq!(unmapped.bin(), fgumi_raw_bam::UNMAPPED_BIN, "precondition: unmapped bin");
+
+        set_mate_info_raw(&mut mapped, &mut unmapped);
+
+        assert_eq!(unmapped.pos(), 99, "precondition: relocated to mate coord");
+        assert_eq!(
+            unmapped.bin(),
+            fgumi_raw_bam::reg2bin(99, 100),
+            "relocated unmapped read must carry its placed position's bin, not the stale 4680"
+        );
     }
 
     /// htsjdk's one-mapped branch sets the mapped read's mate-reverse flag from the

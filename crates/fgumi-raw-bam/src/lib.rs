@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+pub mod bin;
 pub mod builder;
 pub mod cigar;
 pub mod fields;
@@ -56,6 +57,9 @@ pub use fields::{
     tag_value_size,
     template_length,
 };
+
+// -- bin (reg2bin) --
+pub use bin::{UNMAPPED_BIN, bin_from_raw_bam, reg2bin, set_bin_from_raw_bam};
 
 // -- builder --
 pub use builder::{SamBuilder, UnmappedSamBuilder};
