@@ -15,14 +15,14 @@ compare = ["fgumi/compare"]
 simulate = ["fgumi/simulate"]
 
 [dependencies]
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+anyhow = { workspace = true }
+clap = { workspace = true }
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 fgumi = { path = "../.." }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }

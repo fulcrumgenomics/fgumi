@@ -17,35 +17,34 @@ pedantic = { level = "deny", priority = -1 }
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
 fgumi-bgzf = { workspace = true }
 fgumi-bam-io = { workspace = true }
-# held at 0.111 workspace-wide; see crates/fgumi-bam-io/Cargo.toml for why
-noodles = { version = "0.111.0", features = ["bam", "sam", "core", "csi"] }
-noodles-bgzf = { version = "0.47.0", features = ["libdeflate"] }
-libdeflater = "1.22"
-libmimalloc-sys = { version = "0.1.44", features = ["extended"] }
-rayon = "1.10"
-crossbeam-channel = "0.5"
-crossbeam-queue = "0.3"
-crossbeam-utils = "0.8.21"
-parking_lot = "0.12"
-tempfile = "3.3.0"
+noodles = { workspace = true, features = ["bam", "sam", "core", "csi"] }
+noodles-bgzf = { workspace = true }
+libdeflater = { workspace = true }
+libmimalloc-sys = { workspace = true }
+rayon = { workspace = true }
+crossbeam-channel = { workspace = true }
+crossbeam-queue = { workspace = true }
+crossbeam-utils = { workspace = true }
+parking_lot = { workspace = true }
+tempfile = { workspace = true }
 bytemuck = { workspace = true }
-ahash = "0.8"
-anyhow = "1.0.102"
-bstr = "1.12.1"
-bytes = "1"
-bytesize = "2.3"
-fs4 = { version = "1.1", default-features = false, features = ["sync"] }
-log = "0"
+ahash = { workspace = true }
+anyhow = { workspace = true }
+bstr = { workspace = true }
+bytes = { workspace = true }
+bytesize = { workspace = true }
+fs4 = { workspace = true }
+log = { workspace = true }
 zstd = "0.13"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-mach2 = "0.6"
+mach2 = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["fs"] }
+nix = { workspace = true }
 
 [features]
 default = []
@@ -55,7 +54,7 @@ memory-debug = []
 fgumi-bam-io = { workspace = true }
 fgumi-raw-bam = { workspace = true, features = ["test-utils", "noodles"] }
 fgumi-sam = { workspace = true }
-rstest = "0"
-proptest = "1.10"
-criterion = { version = "0.8", features = ["html_reports"] }
-tempfile = "3"
+rstest = { workspace = true }
+proptest = { workspace = true }
+criterion = { workspace = true }
+tempfile = { workspace = true }
