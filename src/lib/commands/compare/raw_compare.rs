@@ -238,10 +238,11 @@ fn tag_values_equal(
 /// [`ContentPredicate::Exact`](super::engines::content::ContentPredicate::Exact) equality:
 /// two records produce byte-equal keys **iff**
 /// [`content_diffs(.., Exact, ..)`](super::engines::content::content_diffs) reports them
-/// content-equal. This lets an equal-sort-key run be multiset-compared by linear-time
-/// counting (hash the keys) instead of the O(n²) pairwise matching in
-/// [`sort_verify::multiset_equal`](super::engines::sort_verify) — the same equality
-/// relation, without the quadratic blow-up on a large tied-coordinate run.
+/// content-equal. This lets an equal-sort-key run be multiset-compared by cancelling each
+/// record against its counterpart as it arrives (hashing the keys) instead of buffering and
+/// pairwise-matching the run — see the run canceller in
+/// [`sort_verify`](super::engines::sort_verify), whose per-key byte-equality cancellation is
+/// exactly this `Exact` relation, bounded by order divergence rather than run length.
 ///
 /// The encoding mirrors `Exact`'s equality decision
 /// (`raw_core_fields_equal && raw_tags_equal_order_independent`) and its three tolerances
@@ -1112,8 +1113,8 @@ mod tests {
     proptest! {
         /// The core equivalence: for two independently generated records (same core), the
         /// canonical keys are byte-equal **iff** `content_diffs(.., Exact, ..)` calls them
-        /// content-equal. This is the property `multiset_equal`'s linear-counting rewrite
-        /// relies on.
+        /// content-equal. This is the property the sort-verify run canceller's key-based
+        /// cancellation relies on.
         #[test]
         fn content_key_exact_matches_content_diffs_random(
             tags_a in proptest::collection::vec(tag_gen_strategy(), 0..6),
