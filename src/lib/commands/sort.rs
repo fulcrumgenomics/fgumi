@@ -330,7 +330,7 @@ pub struct Sort {
 
 /// Environment variable name for the fallback temp-dir list, parsed as a
 /// `PATH`-style list when no `-T/--tmp-dir` flags are passed.
-const TMP_DIRS_ENV: &str = "FGUMI_TMP_DIRS";
+pub(crate) const TMP_DIRS_ENV: &str = "FGUMI_TMP_DIRS";
 
 /// Resolve the final list of temp directories for a sort run.
 ///

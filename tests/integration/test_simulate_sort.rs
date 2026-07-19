@@ -56,11 +56,66 @@ fn fgumi(args: &[&str]) {
     assert!(status.success(), "`fgumi {}` failed: {status}", args.join(" "));
 }
 
-/// `simulate` generates in molecule order and then sorts via the canonical
+/// Run `fgumi simulate <subcommand>` into `dir`, returning the output BAM path.
+///
+/// `max_memory` is passed straight through to `--max-memory`, which bounds the
+/// streaming sort's in-memory buffer: a large value keeps the whole run in
+/// memory, a tiny one forces spill-to-disk plus a k-way merge.
+fn simulate(
+    dir: &Path,
+    subcommand: &str,
+    num_molecules: usize,
+    duplex: bool,
+    max_memory: &str,
+    name: &str,
+) -> PathBuf {
+    let reference = write_reference(dir);
+    let bam = dir.join(format!("{name}.bam"));
+    let truth = dir.join(format!("{name}.truth.tsv"));
+
+    let num_molecules = num_molecules.to_string();
+    let bam_arg = bam.to_str().unwrap().to_string();
+    let reference = reference.to_str().unwrap().to_string();
+    let truth = truth.to_str().unwrap().to_string();
+    // Keep spill files inside the test's temp dir rather than the system temp.
+    let tmp_dir = dir.to_str().unwrap().to_string();
+
+    let mut args = vec![
+        "simulate",
+        subcommand,
+        "-o",
+        &bam_arg,
+        "--truth",
+        &truth,
+        "--reference",
+        &reference,
+        "--num-molecules",
+        &num_molecules,
+        "--seed",
+        "42",
+        "--max-memory",
+        max_memory,
+        "--tmp-dir",
+        &tmp_dir,
+    ];
+    if duplex {
+        args.push("--duplex");
+    }
+    fgumi(&args);
+
+    bam
+}
+
+/// `simulate` generates in molecule order and streams into the canonical
 /// `fgumi-sort` engine, so its output must be template-coordinate sorted for every
 /// subcommand and read orientation. `fgumi sort --verify` asserts exactly that
 /// (0 sort-order violations), and it is the check that fails if the ordering
 /// regresses.
+///
+/// Each case runs twice — once with a memory budget that holds the whole run
+/// (the sort's in-memory fast path) and once with a tiny budget that forces
+/// spill-to-disk and a k-way merge — because streaming generation feeds both
+/// paths and only the second exercises the spill/merge code.
 #[rstest]
 #[case::mapped_reads("mapped-reads", 1_000, false)]
 #[case::grouped_reads_simplex("grouped-reads", 1_000, false)]
@@ -70,38 +125,51 @@ fn simulate_output_is_template_coordinate_sorted(
     #[case] subcommand: &str,
     #[case] num_molecules: usize,
     #[case] duplex: bool,
+    #[values("768M", "1M")] max_memory: &str,
 ) {
     let dir = TempDir::new().expect("create temp dir");
-    let reference = write_reference(dir.path());
-    let bam = dir.path().join("out.bam");
-    let truth = dir.path().join("truth.tsv");
-
-    let num_molecules = num_molecules.to_string();
-    let bam = bam.to_str().unwrap();
-    let reference = reference.to_str().unwrap();
-    let truth = truth.to_str().unwrap();
-
-    let mut args = vec![
-        "simulate",
-        subcommand,
-        "-o",
-        bam,
-        "--truth",
-        truth,
-        "--reference",
-        reference,
-        "--num-molecules",
-        &num_molecules,
-        "--seed",
-        "42",
-    ];
-    if duplex {
-        args.push("--duplex");
-    }
-    fgumi(&args);
+    let bam = simulate(dir.path(), subcommand, num_molecules, duplex, max_memory, "out");
 
     // The canonical verifier: the output must already be in template-coordinate
     // order. Exit code is non-zero (and this asserts) if any records are out of
     // order — which is how the previous reverse-R1 mis-ordering was caught.
-    fgumi(&["sort", "-i", bam, "--verify", "--order", "template-coordinate"]);
+    fgumi(&["sort", "-i", bam.to_str().unwrap(), "--verify", "--order", "template-coordinate"]);
+}
+
+/// Read every alignment record of a BAM, excluding the header.
+///
+/// The header cannot be part of an output comparison: its `@PG` record embeds
+/// the command line, which differs between any two runs invoked with different
+/// flags.
+fn read_records(path: &Path) -> Vec<noodles::sam::alignment::RecordBuf> {
+    let mut reader = noodles::bam::io::Reader::new(
+        std::fs::File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display())),
+    );
+    let header = reader.read_header().expect("read BAM header");
+    reader.record_bufs(&header).map(|r| r.expect("read BAM record")).collect()
+}
+
+/// The output must not depend on how much memory the sort was given: spilling
+/// to disk and merging has to reproduce the in-memory result exactly.
+///
+/// This is what pins the streaming design — records enter the sort in
+/// generation order regardless of budget, so tie-breaking between equal sort
+/// keys cannot drift with the spill boundaries.
+#[rstest]
+#[case::mapped_reads("mapped-reads", 2_000, false)]
+#[case::grouped_reads_duplex("grouped-reads", 2_000, true)]
+fn simulate_output_is_identical_regardless_of_spilling(
+    #[case] subcommand: &str,
+    #[case] num_molecules: usize,
+    #[case] duplex: bool,
+) {
+    let dir = TempDir::new().expect("create temp dir");
+    let in_memory = simulate(dir.path(), subcommand, num_molecules, duplex, "768M", "in_memory");
+    let spilled = simulate(dir.path(), subcommand, num_molecules, duplex, "1M", "spilled");
+
+    assert_eq!(
+        read_records(&in_memory),
+        read_records(&spilled),
+        "spilling changed the simulated output"
+    );
 }

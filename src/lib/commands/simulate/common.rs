@@ -1,11 +1,18 @@
 //! Shared CLI arguments and utilities for simulation commands.
 
-use crate::commands::common::MethylationModeArg;
+use crate::commands::common::{
+    MemoryLimit, MemoryReserve, MethylationModeArg, parse_bool, parse_memory, parse_memory_reserve,
+    resolve_memory_budget,
+};
+use crate::commands::sort::{TMP_DIRS_ENV, resolve_tmp_dirs};
 use anyhow::{Context, Result, bail};
+use bytesize::ByteSize;
 use clap::Args;
+use crossbeam_channel::{Receiver, Sender, bounded};
 use fgumi_consensus::MethylationMode;
 use fgumi_consensus::methylation::is_cpg_context;
-use fgumi_sort::SortOrder;
+use fgumi_raw_bam::RawRecord;
+use fgumi_sort::{RawExternalSorter, SortOrder};
 use log::info;
 use noodles::fasta;
 use noodles::sam::header::record::value::Map;
@@ -515,6 +522,197 @@ pub struct PositionDistArgs {
     /// Number of unique UMIs per position
     #[arg(long = "umis-per-position", default_value = "1")]
     pub umis_per_position: usize,
+}
+
+/// Sort-engine resource options for the simulation commands that stream their
+/// records through `fgumi-sort`.
+///
+/// These mirror the equivalent `fgumi sort` flags (same names, same defaults)
+/// so a simulation that has to spill behaves — and is tuned — exactly like a
+/// standalone sort.
+#[derive(Args, Debug, Clone)]
+pub struct SortResourceArgs {
+    /// Maximum memory for in-memory sorting of the generated records.
+    ///
+    /// Default is "768M" per thread (matching `fgumi sort` and samtools). Pass
+    /// "auto" to detect system memory and subtract --memory-reserve. When the
+    /// limit is reached, sorted chunks spill to temporary files.
+    #[arg(short = 'm', long = "max-memory", default_value = "768M", value_parser = parse_memory)]
+    pub max_memory: MemoryLimit,
+
+    /// Memory to reserve for other processes when --max-memory=auto.
+    ///
+    /// Ignored when --max-memory is set to an explicit value.
+    #[arg(long = "memory-reserve", default_value = "auto", value_parser = parse_memory_reserve)]
+    pub memory_reserve: MemoryReserve,
+
+    /// Scale the memory limit by thread count (samtools behavior).
+    ///
+    /// When enabled (default), --max-memory specifies memory per thread.
+    #[arg(long = "memory-per-thread", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    pub memory_per_thread: bool,
+
+    /// Temporary directory for sort spill files. Repeatable.
+    ///
+    /// If no flags are given and `FGUMI_TMP_DIRS` is set, its value is parsed as
+    /// a `PATH`-style list and used instead. If neither is provided, the system
+    /// default temp directory is used — note that on many modern Linux distros
+    /// `/tmp` is a RAM-backed tmpfs, so point this at real disk for large runs.
+    #[arg(short = 'T', long = "tmp-dir", action = clap::ArgAction::Append)]
+    pub tmp_dirs: Vec<PathBuf>,
+}
+
+impl SortResourceArgs {
+    /// Apply the resolved memory budget and temp directories to `sorter`.
+    ///
+    /// `threads` is the command's thread count, which scales the per-thread
+    /// memory budget exactly as it does in `fgumi sort`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the memory budget cannot be resolved (e.g. zero
+    /// threads, or an overflowing per-thread limit).
+    pub fn apply(&self, sorter: RawExternalSorter, threads: usize) -> Result<RawExternalSorter> {
+        let effective_memory = resolve_memory_budget(
+            self.max_memory,
+            self.memory_reserve,
+            threads,
+            self.memory_per_thread,
+        )?;
+        info!("Sort memory: {}", ByteSize(effective_memory as u64));
+
+        let mut sorter = sorter.memory_limit(effective_memory);
+
+        // For auto mode, cap the initial buffer pre-allocation at 768 MiB/thread
+        // so an `auto` budget on a large host doesn't allocate the whole budget
+        // upfront for what may be a tiny simulation. Mirrors `fgumi sort`.
+        if matches!(self.max_memory, MemoryLimit::Auto) {
+            let init = 768_usize
+                .checked_mul(1024 * 1024)
+                .and_then(|b| b.checked_mul(threads))
+                .ok_or_else(|| anyhow::anyhow!("initial auto buffer size overflowed"))?;
+            sorter = sorter.initial_capacity(effective_memory.min(init));
+        }
+
+        let env_value = std::env::var(TMP_DIRS_ENV).ok();
+        let tmp_dirs = resolve_tmp_dirs(&self.tmp_dirs, env_value.as_deref());
+        if !tmp_dirs.is_empty() {
+            let joined =
+                tmp_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ");
+            info!("Sort temp directories: {joined}");
+            sorter = sorter.temp_dirs(tmp_dirs);
+        }
+
+        Ok(sorter)
+    }
+}
+
+/// Number of record *batches* in flight between the generator thread and the
+/// sort's accumulate loop.
+///
+/// With `RECORD_BATCH_SIZE` this buffers ~16k records (a few MiB). Deep enough
+/// that the generator is not stalled by short pauses in the sort (e.g. a
+/// spill), small enough that the queue itself is not a meaningful memory
+/// consumer next to the sort buffer.
+const RECORD_CHANNEL_CAPACITY: usize = 64;
+
+/// Records per batch handed across the channel.
+///
+/// Records move in batches, not one at a time: a per-record send costs more
+/// than the whole intermediate-BAM round-trip this streaming design removes
+/// (measured: ~7% slower end-to-end when unbatched). 256 matches the batch size
+/// the sort's own read-ahead reader uses.
+const RECORD_BATCH_SIZE: usize = 256;
+
+/// A batch of generated records, or the generator's terminal error.
+type RecordBatch = Result<Vec<RawRecord>>;
+
+/// Sending half of the generator → sorter record stream.
+///
+/// The simulation commands generate records on a background thread and hand
+/// them straight to [`RawExternalSorter::sort_records`], so no unsorted
+/// intermediate BAM is ever written: runs that fit in memory touch disk only
+/// for the final output, and runs that don't spill exactly like `fgumi sort`.
+pub(super) struct RecordSink {
+    sender: Sender<RecordBatch>,
+    batch: Vec<RawRecord>,
+}
+
+impl RecordSink {
+    /// Create a sink/stream pair to connect a generator thread to the sorter.
+    ///
+    /// Pass the receiver through [`into_record_stream`] to get the per-record
+    /// iterator [`RawExternalSorter::sort_records`] takes; the sink goes to the
+    /// generator.
+    ///
+    /// The generator must **own** the sink and drop it when it finishes:
+    /// dropping the sender is what signals end-of-stream. A sink kept alive
+    /// elsewhere (e.g. left in the caller's scope) leaves the sort blocked
+    /// waiting for records that will never arrive. Call [`Self::finish`] before
+    /// dropping so the last partial batch is not lost.
+    pub(super) fn new() -> (Self, Receiver<RecordBatch>) {
+        let (sender, receiver) = bounded(RECORD_CHANNEL_CAPACITY);
+        (Self { sender, batch: Vec::with_capacity(RECORD_BATCH_SIZE) }, receiver)
+    }
+
+    /// Hand one record to the sorter, sending it once a batch has accumulated.
+    ///
+    /// Returns `false` once the sorter has hung up, which only happens when the
+    /// sort itself failed. Generators must stop on `false` — continuing would
+    /// buffer forever against a receiver that is gone — and let the sort's own
+    /// error surface as the reported failure.
+    pub(super) fn send(&mut self, record: RawRecord) -> bool {
+        self.batch.push(record);
+        if self.batch.len() < RECORD_BATCH_SIZE {
+            return true;
+        }
+        self.flush()
+    }
+
+    /// Send any buffered records, ending the stream cleanly.
+    ///
+    /// Returns `false` if the sorter had already hung up, exactly as
+    /// [`Self::send`] does.
+    pub(super) fn finish(mut self) -> bool {
+        self.flush()
+    }
+
+    /// Report a generator failure to the sorter, which aborts the sort and
+    /// propagates the error instead of writing a truncated output.
+    ///
+    /// Buffered records are dropped: the stream is being abandoned, and sending
+    /// them would only delay the abort.
+    pub(super) fn fail(self, error: anyhow::Error) {
+        // If the sorter already hung up it is failing on its own error, which
+        // is the one the user should see; dropping ours is correct.
+        let _ = self.sender.send(Err(error));
+    }
+
+    /// Send the current batch if it is non-empty, leaving the buffer empty.
+    fn flush(&mut self) -> bool {
+        if self.batch.is_empty() {
+            return true;
+        }
+        let batch = std::mem::replace(&mut self.batch, Vec::with_capacity(RECORD_BATCH_SIZE));
+        self.sender.send(Ok(batch)).is_ok()
+    }
+}
+
+/// Adapt a [`RecordSink`]'s batched receiver into the per-record stream
+/// [`RawExternalSorter::sort_records`] consumes.
+///
+/// Batching is a transport detail of the generator → sorter handoff, so it is
+/// unwrapped here rather than pushed into the sort's API.
+pub(super) fn into_record_stream(
+    receiver: Receiver<RecordBatch>,
+) -> impl Iterator<Item = Result<RawRecord>> + Send + 'static {
+    receiver.into_iter().flat_map(|batch| -> Box<dyn Iterator<Item = Result<RawRecord>> + Send> {
+        // One `Box` per batch, not per record.
+        match batch {
+            Ok(records) => Box::new(records.into_iter().map(Ok)),
+            Err(e) => Box::new(std::iter::once(Err(e))),
+        }
+    })
 }
 
 /// Generate a random DNA sequence of the given length.
