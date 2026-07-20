@@ -1,17 +1,18 @@
 //! Generate a template-coordinate sorted BAM for `fgumi group`.
 //!
-//! Records are generated in molecule order to an unsorted temp BAM, then rewritten
-//! into template-coordinate order by the canonical `fgumi-sort` engine — the same
-//! sort `fgumi sort`/`fgumi group` use and that is validated against
+//! Records are generated in molecule order on a background thread and streamed
+//! straight into the canonical `fgumi-sort` engine — the same sort
+//! `fgumi sort`/`fgumi group` use and that is validated against
 //! `samtools sort --template-coordinate`.
 
 use crate::commands::command::Command;
 use crate::commands::common::CompressionOptions;
 use crate::commands::simulate::common::{
     FamilySizeArgs, InsertSizeArgs, MethylationArgs, MethylationConfig, PositionDistArgs,
-    QualityArgs, ReferenceArgs, ReferenceGenome, SimulationCommon, apply_methylation_conversion,
-    body_error_rng, build_sort_order_header_map, generate_random_sequence,
-    introduce_errors_inplace, pad_sequence, validate_rate,
+    QualityArgs, RecordSink, ReferenceArgs, ReferenceGenome, SimulationCommon, SortResourceArgs,
+    apply_methylation_conversion, body_error_rng, build_sort_order_header_map,
+    generate_random_sequence, into_record_stream, introduce_errors_inplace, pad_sequence,
+    validate_rate,
 };
 use crate::commands::simulate::region_to_bin;
 use crate::dna::reverse_complement;
@@ -22,7 +23,6 @@ use crate::simulate::{
 use anyhow::{Context, Result};
 use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::create_raw_bam_writer;
 use fgumi_raw_bam::{RawRecord, RawRecordView, SamBuilder, flags as raw_flags};
 use fgumi_sort::{RawExternalSorter, SortOrder};
 use log::info;
@@ -31,7 +31,6 @@ use rand::{Rng, RngExt};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use tempfile::NamedTempFile;
 
 /// Generate template-coordinate sorted BAM with paired alignments for `fgumi group`.
 #[derive(Parser, Debug)]
@@ -75,13 +74,16 @@ pub struct MappedReads {
     #[arg(long = "error-rate", default_value = "0.0")]
     pub error_rate: f64,
 
-    /// Number of writer threads
+    /// Number of threads for sorting and BAM compression
     #[arg(short = 't', long = "threads", default_value = "1")]
     pub threads: usize,
 
     /// Compression options for output BAM.
     #[command(flatten)]
     pub compression: CompressionOptions,
+
+    #[command(flatten)]
+    pub sort_resources: SortResourceArgs,
 
     #[command(flatten)]
     pub common: SimulationCommon,
@@ -222,41 +224,128 @@ impl Command for MappedReads {
         // mapped.
         let mut unmapped_rng = create_rng(self.common.seed.map(|s| s.wrapping_add(2)));
 
-        // Generate molecules in `mol_id` order to an unsorted temp BAM, then let the
-        // canonical `fgumi-sort` engine produce the final template-coordinate order (see
-        // the sort pass after the write loop). This reuses the one sort implementation
-        // that `fgumi sort`/`fgumi group` use and that is validated against
-        // `samtools sort --template-coordinate`, instead of a bespoke key that has to
-        // re-derive the ordering (and previously mis-ordered reverse-R1 pairs). Because
-        // ordering is deferred to that external sort, generation can stream each molecule
-        // straight into the write loop below — no O(N) molecule-metadata buffer needed.
+        // Generate molecules in `mol_id` order and stream them straight into the
+        // canonical `fgumi-sort` engine, which produces the final template-coordinate
+        // order. This reuses the one sort implementation that `fgumi sort`/`fgumi group`
+        // use and that is validated against `samtools sort --template-coordinate`,
+        // instead of a bespoke key that has to re-derive the ordering (and previously
+        // mis-ordered reverse-R1 pairs). Because ordering is deferred to that sort,
+        // generation can stream each molecule as it is produced — no O(N)
+        // molecule-metadata buffer, and no unsorted intermediate BAM: runs that fit in
+        // `--max-memory` touch disk only for the final output, and larger runs spill
+        // sorted chunks exactly like `fgumi sort` would.
+        info!("Generating records and sorting into template-coordinate order...");
 
-        // Write records to an unsorted temp BAM alongside the final output; the sort
-        // pass below rewrites it into the destination in template-coordinate order.
-        let output_dir = self.output.parent().filter(|p| !p.as_os_str().is_empty());
-        let unsorted_temp = match output_dir {
-            Some(dir) => NamedTempFile::new_in(dir),
-            None => NamedTempFile::new(),
+        let sorter = self
+            .sort_resources
+            .apply(
+                RawExternalSorter::new(SortOrder::TemplateCoordinate)
+                    .threads(self.threads)
+                    .output_compression(self.compression.compression_level),
+                self.threads,
+            )
+            .context("Failed to configure the sort for simulated reads")?;
+
+        let (sink, records) = RecordSink::new();
+
+        // Generation runs on its own thread so it overlaps the sort's accumulate,
+        // spill, and merge work. `scope` lets it borrow the reference genome and
+        // parameters instead of cloning them. `sink` is moved into the closure so
+        // its sender is dropped when generation ends — that is what signals
+        // end-of-stream to the sort.
+        let total_pairs = std::thread::scope(|scope| -> Result<usize> {
+            let generator = scope.spawn(|| {
+                self.generate_records(
+                    sink,
+                    &params,
+                    &ref_genome,
+                    &position_table,
+                    num_positions,
+                    &mut seed_rng,
+                    &mut unmapped_rng,
+                )
+            });
+
+            // Consumes `records`, so a sort failure drops the receiver and the
+            // generator's next `send` returns false, unblocking it.
+            sorter
+                .sort_records(into_record_stream(records), &header, &self.output)
+                .context("Failed to template-coordinate sort simulated reads")?;
+
+            generator.join().unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+        })?;
+
+        info!("Generated {total_pairs} read pairs");
+        info!("Done");
+
+        Ok(())
+    }
+}
+
+impl MappedReads {
+    /// Generate every molecule's read pairs, sending records to `sink` and
+    /// writing the truth TSV.
+    ///
+    /// Returns the number of read pairs generated. A generator failure is
+    /// reported to `sink` so the sort aborts rather than writing a truncated
+    /// BAM, and is also returned.
+    ///
+    /// Takes `sink` by value: it is consumed at the end of this call, which
+    /// closes the record stream and is how the sort learns generation is
+    /// finished.
+    #[allow(clippy::too_many_arguments)]
+    fn generate_records(
+        &self,
+        mut sink: RecordSink,
+        params: &GenerationParams,
+        ref_genome: &ReferenceGenome,
+        position_table: &[(usize, usize)],
+        num_positions: usize,
+        seed_rng: &mut impl Rng,
+        unmapped_rng: &mut impl Rng,
+    ) -> Result<usize> {
+        let result = self.generate_records_inner(
+            &mut sink,
+            params,
+            ref_genome,
+            position_table,
+            num_positions,
+            seed_rng,
+            unmapped_rng,
+        );
+        match result {
+            // Flush the final partial batch, then close the stream.
+            Ok(total_pairs) => {
+                sink.finish();
+                Ok(total_pairs)
+            }
+            // Surface the failure to the sort so it aborts instead of treating
+            // the truncated stream as a clean end of input.
+            Err(e) => {
+                sink.fail(anyhow::anyhow!("{e:#}"));
+                Err(e)
+            }
         }
-        .context("Failed to create temporary BAM for the pre-sort write pass")?;
-        let unsorted_path = unsorted_temp.path().to_path_buf();
+    }
 
-        // Set up writer with multi-threaded BGZF compression
-        let mut writer = create_raw_bam_writer(
-            &unsorted_path,
-            &header,
-            self.threads,
-            self.compression.compression_level,
-        )?;
-
+    /// Body of [`Self::generate_records`]; see it for the contract.
+    #[allow(clippy::too_many_arguments)]
+    fn generate_records_inner(
+        &self,
+        sink: &mut RecordSink,
+        params: &GenerationParams,
+        ref_genome: &ReferenceGenome,
+        position_table: &[(usize, usize)],
+        num_positions: usize,
+        seed_rng: &mut impl Rng,
+        unmapped_rng: &mut impl Rng,
+    ) -> Result<usize> {
         // Create truth file
         let truth_file = File::create(&self.truth_output)
             .with_context(|| format!("Failed to create {}", self.truth_output.display()))?;
         let mut truth_writer = BufWriter::new(truth_file);
         writeln!(truth_writer, "read_name\ttrue_umi\tmolecule_id\tchrom\tposition\tstrand")?;
 
-        // Generate and write records to the unsorted temp BAM (molecule order).
-        info!("Generating and writing records...");
         let progress = ProgressTracker::new("Processed molecules").with_interval(100_000);
         let mut total_pairs = 0usize;
 
@@ -286,34 +375,35 @@ impl Command for MappedReads {
                 pos_chrom_idx,
                 pos_local_pos,
                 is_unmapped,
-                &params,
-                &ref_genome,
+                params,
+                ref_genome,
             );
 
             for (r1, r2, read_name, umi_str, is_top_strand) in pairs {
+                // Emit the record whose reference start is lower first. This does not
+                // affect the sorted output (the sort decides that), but it keeps the
+                // stream in the same order the pre-streaming implementation wrote it,
+                // which pins tie-breaking between records with equal sort keys.
+                // Unmapped pairs have no coordinates, so they keep R1-then-R2 order.
+                let r2_first = if is_unmapped {
+                    false
+                } else {
+                    RawRecordView::new(r1.as_ref()).pos() > RawRecordView::new(r2.as_ref()).pos()
+                };
+                let (first, second) = if r2_first { (r2, r1) } else { (r1, r2) };
+                if !sink.send(first) || !sink.send(second) {
+                    // The sorter hung up, which means it failed; its error is the
+                    // one worth reporting, so stop quietly.
+                    truth_writer.flush()?;
+                    return Ok(total_pairs);
+                }
+
                 if is_unmapped {
-                    // Unmapped pairs: emit R1 then R2 in the conventional order.
                     // Truth rows record unmapped-sentinel values for chrom/pos/strand
                     // so downstream validators can distinguish unmapped from mapped
                     // molecules.
-                    writer.write_raw_record(r1.as_ref())?;
-                    writer.write_raw_record(r2.as_ref())?;
                     writeln!(truth_writer, "{}\t{}\t{}\t*\t*\t*", read_name, umi_str, mol_id)?;
                 } else {
-                    // Template-coordinate order: write the record whose reference start
-                    // is lower first so pairs are emitted in coordinate order. R1F2
-                    // pairs have R1 (reverse read) at the higher coordinate, so emit R2
-                    // first when R1's alignment_start is strictly greater.
-                    let r1_pos = RawRecordView::new(r1.as_ref()).pos();
-                    let r2_pos = RawRecordView::new(r2.as_ref()).pos();
-                    let r2_first = r1_pos > r2_pos;
-                    if r2_first {
-                        writer.write_raw_record(r2.as_ref())?;
-                        writer.write_raw_record(r1.as_ref())?;
-                    } else {
-                        writer.write_raw_record(r1.as_ref())?;
-                        writer.write_raw_record(r2.as_ref())?;
-                    }
                     let strand_char = if is_top_strand { '+' } else { '-' };
                     writeln!(
                         truth_writer,
@@ -332,26 +422,8 @@ impl Command for MappedReads {
 
         progress.log_final();
         truth_writer.flush()?;
-        writer.finish()?;
 
-        info!("Generated {total_pairs} read pairs");
-
-        // Produce the final template-coordinate order with the canonical fgumi-sort
-        // engine (the same one `fgumi sort`/`fgumi group` use), reading the unsorted
-        // temp and writing the destination. This is correct for every read orientation
-        // by construction and stays consistent with the rest of fgumi.
-        info!("Sorting into template-coordinate order...");
-        RawExternalSorter::new(SortOrder::TemplateCoordinate)
-            .threads(self.threads)
-            .output_compression(self.compression.compression_level)
-            .sort(&unsorted_path, &self.output)
-            .context("Failed to template-coordinate sort simulated reads")?;
-        // `unsorted_temp` is dropped here, removing the intermediate BAM.
-        drop(unsorted_temp);
-
-        info!("Done");
-
-        Ok(())
+        Ok(total_pairs)
     }
 }
 

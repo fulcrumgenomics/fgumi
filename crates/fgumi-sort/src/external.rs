@@ -1884,6 +1884,71 @@ impl RawExternalSorter {
     ///
     /// Returns an error if reading, sorting, or writing the BAM file fails.
     pub fn sort(&self, input: &Path, output: &Path) -> Result<RawSortStats> {
+        let pool = self.create_worker_pool()?;
+
+        // Open input BAM and create record source
+        // N+2 model: workers do ReadInputBlocks + DecompressInput,
+        // main thread reads records directly from PooledInputStream.
+        debug!(
+            "Phase 1: Pool-integrated input reading ({} workers, N+2 model)",
+            pool.num_workers()
+        );
+        let (record_source, header) = {
+            let (reader, header) =
+                create_raw_bam_reader_pool_integrated(input, &pool, self.async_reader)?;
+            (RecordSource::direct(reader), header)
+        };
+
+        self.sort_from_source(record_source, &header, output, pool)
+    }
+
+    /// Sort records produced in-process, without a BAM input file.
+    ///
+    /// This is the streaming counterpart to [`Self::sort`]: instead of reading
+    /// an input BAM, records are pulled from `records` as the sort's accumulate
+    /// phase consumes them. Producers that would otherwise write an unsorted BAM
+    /// only to hand it straight back for sorting should use this — it removes a
+    /// full compress/write/read/decompress round-trip, and removes the
+    /// intermediate file's disk footprint entirely (which for inputs that exceed
+    /// `memory_limit` would otherwise sit alongside the spill chunks).
+    ///
+    /// Spill and merge behave exactly as in [`Self::sort`]: when everything fits
+    /// within `memory_limit` nothing touches disk except the output; past that
+    /// limit, sorted chunks spill to the configured temp directories and are
+    /// k-way merged.
+    ///
+    /// `header` is the input header — the output header's sort-order tags are
+    /// derived from it the same way [`Self::sort`] derives them from the input
+    /// BAM's header, and `pg_info` (if set) is applied to it.
+    ///
+    /// An `Err` item from `records` aborts the sort and is propagated; the
+    /// output file is not written, so a producer failure can never leave a
+    /// silently truncated result behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the producer yields one, or if sorting, spilling, or
+    /// writing the output BAM fails.
+    pub fn sort_records<I>(
+        &self,
+        records: I,
+        header: &Header,
+        output: &Path,
+    ) -> Result<RawSortStats>
+    where
+        I: IntoIterator<Item = Result<fgumi_raw_bam::RawRecord>>,
+        I::IntoIter: Send + 'static,
+    {
+        let pool = self.create_worker_pool()?;
+        debug!("Phase 1: In-process record stream (no input BAM)");
+        self.sort_from_source(RecordSource::stream(records), header, output, pool)
+    }
+
+    /// Build the shared worker pool used by every phase of a sort run.
+    ///
+    /// Also enforces the spill-codec/compression-level invariant, so no entry
+    /// point can reach a misconfigured pool.
+    fn create_worker_pool(&self) -> Result<Arc<SortWorkerPool>> {
         // zstd has no level-0 "stored" mode; silently remapping to 1 would
         // surprise API callers who set temp_compression(0) expecting an
         // uncompressed spill (which works for BGZF). Mirror the CLI guard so
@@ -1902,31 +1967,31 @@ impl RawExternalSorter {
         debug!("Threads: {}", self.threads);
 
         // Shared worker pool for parallel BGZF compress/decompress across all phases
-        let pool = Arc::new(SortWorkerPool::new(
+        Ok(Arc::new(SortWorkerPool::new(
             self.threads.max(1),
             self.temp_compression,
             self.output_compression,
             self.spill_codec,
-        ));
+        )))
+    }
 
-        // Open input BAM and create record source
-        // N+2 model: workers do ReadInputBlocks + DecompressInput,
-        // main thread reads records directly from PooledInputStream.
-        debug!(
-            "Phase 1: Pool-integrated input reading ({} workers, N+2 model)",
-            pool.num_workers()
-        );
-        let (record_source, header) = {
-            let (reader, header) =
-                create_raw_bam_reader_pool_integrated(input, &pool, self.async_reader)?;
-            (RecordSource::direct(reader), header)
-        };
-
+    /// Run the sort over an already-constructed record source.
+    ///
+    /// Shared tail of [`Self::sort`] and [`Self::sort_records`]: applies
+    /// `pg_info` to the header, provisions temp directories, and dispatches to
+    /// the per-order implementation.
+    fn sort_from_source(
+        &self,
+        record_source: RecordSource,
+        header: &Header,
+        output: &Path,
+        pool: Arc<SortWorkerPool>,
+    ) -> Result<RawSortStats> {
         // Add @PG record if pg_info was provided
         let header = if let Some((ref version, ref command_line)) = self.pg_info {
-            fgumi_bam_io::header::add_pg_record(header, version, command_line)?
+            fgumi_bam_io::header::add_pg_record(header.clone(), version, command_line)?
         } else {
-            header
+            header.clone()
         };
 
         // _temp_dirs: RAII handles; kept alive until sort returns.
@@ -5115,6 +5180,170 @@ mod tests {
             .sort(&unsorted, &sorted)
             .expect("sort should succeed");
         (sorted, names)
+    }
+
+    // ========================================================================
+    // sort_records (in-process record stream) tests
+    // ========================================================================
+
+    /// Read a BAM into its header plus every record, for replaying through
+    /// [`RawExternalSorter::sort_records`].
+    fn read_bam_records(path: &Path) -> (Header, Vec<fgumi_raw_bam::RawRecord>) {
+        use crate::read_ahead::RawReadAheadReader;
+        let (reader, header) =
+            create_raw_bam_reader(path, 1).expect("failed to create raw BAM reader");
+        (header, RawReadAheadReader::new(reader).collect())
+    }
+
+    /// Build an unsorted BAM of `num_pairs` pairs whose coordinates deliberately
+    /// do not follow input order, so a sort has real work to do.
+    fn build_unsorted_bam(dir: &Path, num_pairs: usize) -> PathBuf {
+        let mut builder = SamBuilder::new();
+        for i in 0..num_pairs {
+            // Interleave high and low coordinates so input order != sort order.
+            let start = if i % 2 == 0 { (num_pairs - i) * 200 + 1 } else { i * 200 + 1 };
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i:04}"))
+                .start1(start)
+                .start2(start + 100)
+                .build();
+        }
+        let path = dir.join("unsorted.bam");
+        builder.write_bam(&path).expect("failed to write BAM");
+        path
+    }
+
+    /// `sort_records` must produce byte-identical output to `sort` over the same
+    /// records in the same order, for every sort order and on both the
+    /// fits-in-memory and spill-and-merge paths.
+    ///
+    /// This is the invariant callers rely on when they replace an
+    /// "write unsorted BAM, then sort it" round-trip with a direct stream:
+    /// removing the intermediate file must not change a single output byte.
+    #[rstest::rstest]
+    fn test_sort_records_matches_sort_from_file(
+        #[values(
+            SortOrder::Coordinate,
+            SortOrder::Queryname(QuerynameComparator::Lexicographic),
+            SortOrder::Queryname(QuerynameComparator::Natural),
+            SortOrder::TemplateCoordinate
+        )]
+        sort_order: SortOrder,
+        // 8 MiB fits the whole 100-pair set in memory (no spill); 16 KiB forces
+        // several spills and a k-way merge.
+        #[values(8 * 1024 * 1024, 16 * 1024)] memory_limit: usize,
+    ) {
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
+        let input = build_unsorted_bam(dir.path(), 100);
+        let (header, records) = read_bam_records(&input);
+
+        let from_file = dir.path().join("from_file.bam");
+        let from_stream = dir.path().join("from_stream.bam");
+
+        let sorter = || {
+            RawExternalSorter::new(sort_order)
+                .memory_limit(memory_limit)
+                .threads(2)
+                .spill_codec(crate::codec::SpillCodec::Bgzf)
+                .temp_compression(0)
+                .output_compression(0)
+        };
+
+        let file_stats = sorter().sort(&input, &from_file).expect("file sort should succeed");
+        let stream_stats = sorter()
+            .sort_records(records.into_iter().map(Ok), &header, &from_stream)
+            .expect("stream sort should succeed");
+
+        assert_eq!(file_stats.total_records, stream_stats.total_records);
+        assert_eq!(file_stats.output_records, stream_stats.output_records);
+        assert_eq!(
+            file_stats.chunks_written, stream_stats.chunks_written,
+            "stream path should spill exactly like the file path"
+        );
+        assert_eq!(
+            std::fs::read(&from_file).expect("read file output"),
+            std::fs::read(&from_stream).expect("read stream output"),
+            "sort_records output must be byte-identical to sort()"
+        );
+    }
+
+    /// An empty stream produces a header-only BAM, matching `sort` on an empty
+    /// input rather than erroring.
+    #[test]
+    fn test_sort_records_empty_stream_writes_header_only() {
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
+        let input = build_unsorted_bam(dir.path(), 1);
+        let (header, _) = read_bam_records(&input);
+        let output = dir.path().join("empty.bam");
+
+        let stats = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .output_compression(0)
+            .sort_records(std::iter::empty(), &header, &output)
+            .expect("empty stream should succeed");
+
+        assert_eq!(stats.total_records, 0);
+        assert_eq!(count_bam_records(&output), 0);
+    }
+
+    /// A producer error must abort the sort and propagate, leaving no output
+    /// file behind — a truncated "successful" result would be worse than a
+    /// failure, since callers would ship a silently short BAM.
+    ///
+    /// Covered on both the fits-in-memory path and after a spill, since the
+    /// error is only observed once the stream is drained.
+    #[rstest::rstest]
+    #[case::before_spill(8 * 1024 * 1024)]
+    #[case::after_spill(16 * 1024)]
+    fn test_sort_records_producer_error_aborts(#[case] memory_limit: usize) {
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
+        let input = build_unsorted_bam(dir.path(), 100);
+        let (header, records) = read_bam_records(&input);
+        let output = dir.path().join("aborted.bam");
+
+        // Emit every record, then fail instead of ending cleanly.
+        let stream = records
+            .into_iter()
+            .map(Ok)
+            .chain(std::iter::once(Err(anyhow::anyhow!("producer exploded"))));
+
+        let err = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .memory_limit(memory_limit)
+            .threads(2)
+            .spill_codec(crate::codec::SpillCodec::Bgzf)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort_records(stream, &header, &output)
+            .expect_err("producer error should abort the sort");
+
+        assert!(
+            format!("{err:#}").contains("producer exploded"),
+            "producer error should be propagated, got: {err:#}"
+        );
+        assert!(!output.exists(), "aborted sort must not leave an output BAM behind");
+    }
+
+    /// A producer that fails before yielding anything aborts too, rather than
+    /// falling through the empty-input path and writing a header-only BAM.
+    #[test]
+    fn test_sort_records_error_on_first_record_aborts() {
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
+        let input = build_unsorted_bam(dir.path(), 1);
+        let (header, _) = read_bam_records(&input);
+        let output = dir.path().join("aborted_first.bam");
+
+        let stream = std::iter::once(Err(anyhow::anyhow!("failed before first record")));
+
+        let err = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .output_compression(0)
+            .sort_records(stream, &header, &output)
+            .expect_err("producer error should abort the sort");
+
+        assert!(
+            format!("{err:#}").contains("failed before first record"),
+            "producer error should be propagated, got: {err:#}"
+        );
+        assert!(!output.exists(), "aborted sort must not leave an output BAM behind");
     }
 
     /// Collect all read names from a BAM file as strings.
