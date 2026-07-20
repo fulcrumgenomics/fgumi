@@ -5,15 +5,17 @@
 
 use crate::commands::common::parse_bool;
 use crate::logging::OperationTimer;
+use crate::sam::SamTag;
 use crate::validation::validate_file_exists;
 use anyhow::Result;
 use clap::Parser;
 use fgumi_bam_io::create_raw_bam_reader;
 use fgumi_raw_bam::{
-    RawRecord, extract_sequence_into, quality_scores_slice, read_name as raw_read_name,
+    RawRecord, aux_data_slice, extract_sequence_into, find_string_tag, quality_scores_slice,
+    read_name as raw_read_name,
 };
 use log::{info, warn};
-use std::io::{BufWriter, Write, stdout};
+use std::io::{self, BufWriter, Write, stdout};
 use std::path::PathBuf;
 
 use crate::commands::command::Command;
@@ -117,6 +119,28 @@ pub struct Fastq {
     /// batch size for optimal pipe throughput. Default matches common bwa mem usage.
     #[arg(short = 'K', long = "bwa-chunk-size", default_value = "150000000")]
     pub bwa_chunk_size: u64,
+
+    /// Append the record's UMI to the read name, before any /1 or /2 suffix.
+    ///
+    /// With the default delimiters this matches `samtools fastq -U`
+    /// (`readname:AAAA+CCCC`), the layout DRAGEN expects.
+    #[arg(short = 'a', short_alias = 'U', long = "annotate-read-names", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    pub annotate_read_names: bool,
+
+    /// Tags to read the UMI from, in priority order; the first present wins.
+    #[arg(long = "umi-tag", default_value = "RX,OX", value_delimiter = ',')]
+    pub umi_tag: Vec<String>,
+
+    /// Delimiter between the read name and the UMI.
+    #[arg(long = "umi-name-delim", default_value = ":")]
+    pub umi_name_delim: String,
+
+    /// Separator between the two halves of a duplex UMI in the read name.
+    ///
+    /// fgumi stores duplex UMIs as `AAAA-CCCC`; `samtools fastq -U` and DRAGEN
+    /// expect `AAAA+CCCC`, so the stored `-` is rewritten to this value.
+    #[arg(long = "umi-sep", default_value = "+")]
+    pub umi_sep: String,
 }
 
 /// Parse flag values supporting both decimal and hex (0x) notation.
@@ -133,7 +157,7 @@ impl Fastq {
     ///
     /// Extracted so `execute` can dispatch between stdout (the default piping
     /// path) and a file (`--output`) without duplicating the conversion loop.
-    fn run_with_writer<W: Write>(&self, mut writer: W) -> Result<()> {
+    fn run_with_writer<W: Write>(&self, writer: &mut W) -> Result<()> {
         use fgumi_raw_bam::flags as raw_flag_bits;
         let timer = OperationTimer::new("Converting BAM to FASTQ");
 
@@ -158,9 +182,15 @@ impl Fastq {
         let mut records_this_batch: usize = 0;
 
         // Reusable buffers to avoid per-record allocations
-        let mut seq_buf: Vec<u8> = Vec::with_capacity(512);
-        let mut qual_buf: Vec<u8> = Vec::with_capacity(512);
+        let mut buffers = FastqRecordBuffers::with_capacity(512);
         let mut record = RawRecord::new();
+
+        // Resolve the UMI annotation config once, outside the per-record loop.
+        let umi_annotation = if self.annotate_read_names {
+            Some(UmiNameAnnotation::new(&self.umi_tag, &self.umi_name_delim, &self.umi_sep)?)
+        } else {
+            None
+        };
 
         loop {
             let n = reader.read_record(&mut record)?;
@@ -184,12 +214,12 @@ impl Fastq {
 
             // Write FASTQ record
             write_fastq_record(
-                &mut writer,
+                &mut *writer,
                 &record,
                 flags,
                 self.no_suffix,
-                &mut seq_buf,
-                &mut qual_buf,
+                &mut buffers,
+                umi_annotation.as_ref(),
             )?;
             written_records += 1;
             if (flags & raw_flag_bits::PAIRED) != 0 {
@@ -275,11 +305,29 @@ impl Command for Fastq {
         // Use 64MB buffer for efficient pipe throughput.
         const BUF_CAPACITY: usize = 64 * 1024 * 1024;
         match &self.output {
+            // A `.gz`/`.bgz` output path must actually be compressed. Writing plain
+            // text under a `.gz` name produces a file every downstream tool rejects.
+            // BGZF is gzip-compatible, so `zcat`/`gzip -d` read it, and it stays
+            // block-indexable.
+            Some(path) if is_gzip_output_path(path) => {
+                let file = std::fs::File::create(path)?;
+                let mut writer = BgzfFastqWriter::new(file, BGZF_OUTPUT_COMPRESSION_LEVEL);
+                self.run_with_writer(&mut writer)?;
+                // Append the BGZF EOF marker so the stream is not seen as truncated.
+                writer.finish()?;
+                Ok(())
+            }
             Some(path) => {
                 let file = std::fs::File::create(path)?;
-                self.run_with_writer(BufWriter::with_capacity(BUF_CAPACITY, file))
+                let mut writer = BufWriter::with_capacity(BUF_CAPACITY, file);
+                self.run_with_writer(&mut writer)
             }
-            None => self.run_with_writer(BufWriter::with_capacity(BUF_CAPACITY, stdout().lock())),
+            // stdout stays uncompressed: this stream is meant to be piped into an
+            // aligner, which wants plain FASTQ.
+            None => {
+                let mut writer = BufWriter::with_capacity(BUF_CAPACITY, stdout().lock());
+                self.run_with_writer(&mut writer)
+            }
         }
     }
 }
@@ -308,6 +356,145 @@ fn encode_quality_into(quals: &[u8], out: &mut Vec<u8>) {
     }
 }
 
+/// BGZF compression level used for `.gz`/`.bgz` FASTQ output.
+///
+/// 6 is the zlib/bgzip default: a middle trade-off between output size and CPU,
+/// appropriate for an intermediate file handed straight to an aligner.
+const BGZF_OUTPUT_COMPRESSION_LEVEL: u32 = 6;
+
+/// Returns `true` if `path` names a gzip-family output that must be compressed.
+fn is_gzip_output_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("gz") || e.eq_ignore_ascii_case("bgz"))
+}
+
+/// `io::Write` adapter that block-compresses FASTQ text as BGZF.
+///
+/// BGZF is gzip-compatible, so any consumer that reads `.gz` reads this, while the
+/// output stays block-indexable. The BGZF EOF marker is appended on drop-free
+/// finalization (`finish`), which `Write::flush` alone must not do — flush can be
+/// called mid-stream.
+struct BgzfFastqWriter<W: Write> {
+    inner: W,
+    compressor: fgumi_bgzf::InlineBgzfCompressor,
+}
+
+impl<W: Write> BgzfFastqWriter<W> {
+    fn new(inner: W, compression_level: u32) -> Self {
+        Self { inner, compressor: fgumi_bgzf::InlineBgzfCompressor::new(compression_level) }
+    }
+
+    /// Flushes remaining buffered bytes and appends the BGZF EOF marker so the
+    /// stream is complete and tools do not report a truncated file.
+    fn finish(&mut self) -> io::Result<()> {
+        self.compressor.flush()?;
+        self.compressor.write_blocks_to(&mut self.inner)?;
+        self.inner.write_all(&fgumi_bgzf::BGZF_EOF)?;
+        self.inner.flush()
+    }
+}
+
+impl<W: Write> Write for BgzfFastqWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.compressor.write_all(buf)?;
+        // Drain any blocks the compressor completed so memory stays bounded.
+        self.compressor.write_blocks_to(&mut self.inner)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.compressor.write_blocks_to(&mut self.inner)?;
+        self.inner.flush()
+    }
+}
+
+/// How to append a record's UMI to its read name.
+///
+/// Built once per run from the CLI options so the per-record path does no
+/// string parsing or allocation beyond the name buffer itself.
+#[derive(Debug, Clone)]
+pub struct UmiNameAnnotation {
+    /// Tags to consult, in priority order; the first present wins.
+    tags: Vec<SamTag>,
+    /// Delimiter between the read name and the UMI.
+    name_delim: Vec<u8>,
+    /// Separator written between duplex UMI halves (replaces the stored `-`).
+    umi_sep: Vec<u8>,
+}
+
+impl UmiNameAnnotation {
+    /// Builds the annotation config from raw CLI strings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a tag name is not exactly two characters.
+    pub fn new(tags: &[String], name_delim: &str, umi_sep: &str) -> Result<Self> {
+        let tags = tags
+            .iter()
+            .map(|t| {
+                let bytes = t.as_bytes();
+                if bytes.len() != 2 || !SamTag::is_valid_tag_bytes(bytes[0], bytes[1]) {
+                    anyhow::bail!(
+                        "--umi-tag values must be a valid two-character SAM tag, got '{t}'"
+                    );
+                }
+                Ok(SamTag::new(bytes[0], bytes[1]))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if tags.is_empty() {
+            anyhow::bail!("--umi-tag requires at least one tag");
+        }
+        Ok(Self {
+            tags,
+            name_delim: name_delim.as_bytes().to_vec(),
+            umi_sep: umi_sep.as_bytes().to_vec(),
+        })
+    }
+
+    /// Appends `<delim><umi>` to `out` if the record carries one of the configured
+    /// tags, rewriting the stored duplex `-` separator to the configured one.
+    ///
+    /// Records without any of the tags are left unannotated rather than failing —
+    /// a BAM can legitimately mix UMI-bearing and UMI-free reads.
+    fn append_to(&self, record: &RawRecord, out: &mut Vec<u8>) {
+        let aux = aux_data_slice(record);
+        let Some(umi) = self.tags.iter().find_map(|&tag| find_string_tag(aux, tag)) else {
+            return;
+        };
+        out.extend_from_slice(&self.name_delim);
+        for &byte in umi {
+            if byte == b'-' {
+                out.extend_from_slice(&self.umi_sep);
+            } else {
+                out.push(byte);
+            }
+        }
+    }
+}
+
+/// Reusable per-record scratch buffers, kept across the conversion loop so the
+/// hot path does not allocate.
+#[derive(Debug, Default)]
+struct FastqRecordBuffers {
+    /// Decoded sequence bases.
+    seq: Vec<u8>,
+    /// Phred+33 encoded qualities.
+    qual: Vec<u8>,
+    /// Read name, used only when a UMI is appended.
+    name: Vec<u8>,
+}
+
+impl FastqRecordBuffers {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            seq: Vec::with_capacity(capacity),
+            qual: Vec::with_capacity(capacity),
+            name: Vec::with_capacity(256),
+        }
+    }
+}
+
 /// Write a single FASTQ record to the writer.
 #[inline]
 fn write_fastq_record<W: Write>(
@@ -315,8 +502,8 @@ fn write_fastq_record<W: Write>(
     record: &RawRecord,
     flags: u16,
     no_suffix: bool,
-    seq_buf: &mut Vec<u8>,
-    qual_buf: &mut Vec<u8>,
+    buffers: &mut FastqRecordBuffers,
+    umi_annotation: Option<&UmiNameAnnotation>,
 ) -> Result<()> {
     use fgumi_raw_bam::flags as flag_bits;
 
@@ -336,30 +523,38 @@ fn write_fastq_record<W: Write>(
         b"" // Single-end or both flags set
     };
 
-    // Decode sequence from 4-bit BAM encoding to ASCII bases (reuses seq_buf).
-    extract_sequence_into(record, seq_buf);
+    // Decode sequence from 4-bit BAM encoding to ASCII bases (reuses the scratch buffer).
+    extract_sequence_into(record, &mut buffers.seq);
 
     // Copy quality bytes and transform to Phred+33 ASCII (absent quality → default)
-    encode_quality_into(quality_scores_slice(record), qual_buf);
+    encode_quality_into(quality_scores_slice(record), &mut buffers.qual);
 
     if (flags & flag_bits::REVERSE) != 0 {
         // Reverse complement sequence in place using lookup table
-        seq_buf.reverse();
-        for base in seq_buf.iter_mut() {
+        buffers.seq.reverse();
+        for base in buffers.seq.iter_mut() {
             *base = COMPLEMENT[*base as usize];
         }
         // Reverse quality in place
-        qual_buf.reverse();
+        buffers.qual.reverse();
     }
 
-    // Write all parts
+    // Write all parts. The UMI goes between the name and the /1 /2 suffix, matching
+    // `samtools fastq -U`.
     writer.write_all(b"@")?;
-    writer.write_all(name)?;
+    if let Some(annotation) = umi_annotation {
+        buffers.name.clear();
+        buffers.name.extend_from_slice(name);
+        annotation.append_to(record, &mut buffers.name);
+        writer.write_all(&buffers.name)?;
+    } else {
+        writer.write_all(name)?;
+    }
     writer.write_all(suffix)?;
     writer.write_all(b"\n")?;
-    writer.write_all(seq_buf)?;
+    writer.write_all(&buffers.seq)?;
     writer.write_all(b"\n+\n")?;
-    writer.write_all(qual_buf)?;
+    writer.write_all(&buffers.qual)?;
     writer.write_all(b"\n")?;
 
     Ok(())
@@ -369,6 +564,100 @@ fn write_fastq_record<W: Write>(
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    /// Build a single-end record carrying an optional UMI tag.
+    fn record_with_umi(name: &[u8], umi: Option<(&str, &[u8])>) -> RawRecord {
+        let mut b = fgumi_raw_bam::SamBuilder::new();
+        b.read_name(name);
+        if let Some((tag, value)) = umi {
+            let t = tag.as_bytes();
+            b.add_string_tag(SamTag::new(t[0], t[1]), value);
+        }
+        b.build()
+    }
+
+    #[rstest]
+    #[case::gz_lower("out.fq.gz", true)]
+    #[case::gz_upper("OUT.FQ.GZ", true)]
+    #[case::bgz("out.fq.bgz", true)]
+    #[case::plain_fq("out.fq", false)]
+    #[case::plain_fastq("out.fastq", false)]
+    #[case::no_extension("out", false)]
+    #[case::gz_in_stem("out.gz.fq", false)]
+    fn test_is_gzip_output_path(#[case] path: &str, #[case] expected: bool) {
+        assert_eq!(is_gzip_output_path(std::path::Path::new(path)), expected);
+    }
+
+    #[rstest]
+    // Default delimiters reproduce `samtools fastq -U`: name:UMI, duplex `-` -> `+`.
+    #[case::simplex_umi(Some(("RX", &b"ACGT"[..])), ":", "+", "read1:ACGT")]
+    #[case::duplex_umi(Some(("RX", &b"ACGT-TTTT"[..])), ":", "+", "read1:ACGT+TTTT")]
+    #[case::custom_delims(Some(("RX", &b"ACGT-TTTT"[..])), "_", "|", "read1_ACGT|TTTT")]
+    // A record without any of the configured tags is left unannotated rather than failing.
+    #[case::no_umi_tag(None, ":", "+", "read1")]
+    // OX is consulted when RX is absent (tag priority order).
+    #[case::fallback_tag(Some(("OX", &b"GGGG"[..])), ":", "+", "read1:GGGG")]
+    fn test_umi_name_annotation(
+        #[case] umi: Option<(&str, &[u8])>,
+        #[case] name_delim: &str,
+        #[case] umi_sep: &str,
+        #[case] expected: &str,
+    ) {
+        let record = record_with_umi(b"read1", umi);
+        let annotation =
+            UmiNameAnnotation::new(&["RX".to_string(), "OX".to_string()], name_delim, umi_sep)
+                .expect("valid annotation config");
+
+        let mut out = b"read1".to_vec();
+        annotation.append_to(&record, &mut out);
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case::too_short("R")]
+    #[case::too_long("RXX")]
+    #[case::invalid_first_char("1X")]
+    fn test_umi_name_annotation_rejects_bad_tag(#[case] tag: &str) {
+        assert!(UmiNameAnnotation::new(&[tag.to_string()], ":", "+").is_err());
+    }
+
+    #[test]
+    fn test_umi_name_annotation_rejects_empty_tag_list() {
+        assert!(UmiNameAnnotation::new(&[], ":", "+").is_err());
+    }
+
+    /// The BGZF writer must emit a real, decompressible BGZF stream terminated by
+    /// the EOF marker — a plain-text file under a `.gz` name is exactly the bug
+    /// this path exists to prevent.
+    #[test]
+    fn test_bgzf_fastq_writer_round_trips() {
+        let payload = b"@read1\nACGT\n+\nIIII\n@read2\nTTTT\n+\nJJJJ\n";
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut writer = BgzfFastqWriter::new(&mut out, BGZF_OUTPUT_COMPRESSION_LEVEL);
+            writer.write_all(payload).expect("write");
+            writer.finish().expect("finish");
+        }
+
+        // Real BGZF/gzip magic, not plain text.
+        assert_eq!(&out[..2], &[0x1f, 0x8b], "output must carry gzip magic");
+        assert_ne!(&out[..1], b"@", "output must not be plain FASTQ text");
+
+        // Terminated by the BGZF EOF marker so readers do not see a truncated file.
+        assert!(out.ends_with(&fgumi_bgzf::BGZF_EOF), "BGZF stream must end with the EOF marker");
+
+        // And it decompresses back to exactly what went in.
+        let mut cursor = std::io::Cursor::new(&out);
+        let blocks = fgumi_bgzf::read_raw_blocks(&mut cursor, 64).expect("read blocks");
+        let mut decompressor = libdeflater::Decompressor::new();
+        let mut decoded = Vec::new();
+        for block in &blocks {
+            decoded.extend_from_slice(
+                &fgumi_bgzf::decompress_block(block, &mut decompressor).expect("decompress block"),
+            );
+        }
+        assert_eq!(decoded, payload);
+    }
 
     /// Write reverse complement of sequence bytes to a buffer (test helper).
     fn write_reverse_complement_bytes<W: Write>(writer: &mut W, bases: &[u8]) -> Result<()> {
