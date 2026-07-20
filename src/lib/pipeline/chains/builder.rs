@@ -2769,9 +2769,8 @@ impl<'a> ChainBuilder<'a> {
             build_group_serialize_step,
         };
         use crate::pipeline::steps::group::position::GroupByPosition;
-        use crate::sam::{SamTag, is_sorted, is_template_coordinate_sorted};
+        use crate::sam::SamTag;
         use log::{info, warn};
-        use noodles::sam::header::record::value::map::header::sort_order::QUERY_NAME;
 
         let group = self
             .spec
@@ -2844,32 +2843,9 @@ impl<'a> ChainBuilder<'a> {
         info!("Using pipeline with {num_threads} threads");
 
         // Check sort order — identical validation to GroupReadsByUmi::execute.
-        let is_tc_sorted = is_template_coordinate_sorted(&self.header);
-        let is_qname_sorted = is_sorted(&self.header, QUERY_NAME);
-
-        if !(is_tc_sorted || group.allow_unmapped && is_qname_sorted) {
-            if group.allow_unmapped {
-                bail!(
-                    "Input BAM must be template-coordinate sorted or queryname sorted \
-                    when --allow-unmapped is enabled.\n\n\
-                    To queryname sort your BAM file, run:\n  \
-                    samtools sort -n input.bam -o sorted.bam"
-                );
-            }
-            bail!(
-                "Input BAM must be template-coordinate sorted (header must advertise \
-                SO:unsorted, GO:query, and SS:template-coordinate).\n\n\
-                To sort your BAM file, run:\n  \
-                fgumi sort -i input.bam -o sorted.bam --order template-coordinate"
-            );
-        }
-
-        if is_tc_sorted {
-            info!("Input is template-coordinate sorted");
-        } else {
-            info!("Input is queryname sorted (accepted with --allow-unmapped)");
-            info!("All unmapped reads will form a single position group per library/cell");
-        }
+        // Sort-order precondition + info logging, shared verbatim with
+        // `Group::execute`'s single-threaded path (see `require_group_input_sort`).
+        crate::commands::common::require_group_input_sort(&self.header, group.allow_unmapped)?;
 
         // Tag constants per SAM specification.
         let raw_tag: [u8; 2] = *SamTag::RX;

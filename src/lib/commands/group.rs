@@ -12,7 +12,6 @@ use crate::grouper::{
 use crate::logging::{OperationTimer, log_umi_grouping_summary};
 use crate::metrics::group::UmiGroupingMetrics;
 use crate::sam::SamTag;
-use crate::sam::{is_sorted, is_template_coordinate_sorted};
 use crate::template::Template;
 use crate::umi::parallel_assigner::{
     ParallelAdjacencyAssigner, ParallelEditAssigner, ParallelIdentityAssigner,
@@ -34,7 +33,6 @@ use fgumi_raw_bam::{RawBamReader, RawRecord};
 use log::{info, warn};
 use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
-use noodles::sam::header::record::value::map::header::sort_order::QUERY_NAME;
 use std::path::{Path, PathBuf};
 
 // UmiGroupingMetrics and FamilySizeMetrics are imported from crate::metrics
@@ -1035,32 +1033,13 @@ impl Command for GroupReadsByUmi {
             let input_source = crate::pipeline::steps::source::InputSource::open(&self.io.input)?;
             let header = input_source.header().clone();
 
-            // Sort order check for single-threaded path.
-            let is_tc_sorted = is_template_coordinate_sorted(&header);
-            let is_qname_sorted = is_sorted(&header, QUERY_NAME);
-            if !(is_tc_sorted || self.options.allow_unmapped && is_qname_sorted) {
-                if self.options.allow_unmapped {
-                    bail!(
-                        "Input BAM must be template-coordinate sorted or queryname sorted \
-                        when --allow-unmapped is enabled.\n\n\
-                        To queryname sort your BAM file, run:\n  \
-                        samtools sort -n input.bam -o sorted.bam"
-                    );
-                } else {
-                    bail!(
-                        "Input BAM must be template-coordinate sorted (header must advertise \
-                        SO:unsorted, GO:query, and SS:template-coordinate).\n\n\
-                        To sort your BAM file, run:\n  \
-                        fgumi sort -i input.bam -o sorted.bam --order template-coordinate"
-                    );
-                }
-            }
-            if is_tc_sorted {
-                info!("Input is template-coordinate sorted");
-            } else {
-                info!("Input is queryname sorted (accepted with --allow-unmapped)");
-                info!("All unmapped reads will form a single position group per library/cell");
-            }
+            // Sort-order precondition + info logging, shared verbatim with the
+            // chain builder's `add_group` so the two group orchestrations cannot
+            // drift on accepted orders or the remediation hint.
+            crate::commands::common::require_group_input_sort(
+                &header,
+                self.options.allow_unmapped,
+            )?;
 
             let header = crate::commands::common::add_pg_record(header, command_line)?;
 
