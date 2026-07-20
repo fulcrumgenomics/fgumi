@@ -388,6 +388,13 @@ impl Command for Duplex {
         let methylation_ref: MethylationRef =
             load_methylation_reference(methylation_mode, &self.reference, &header)?;
 
+        // Consensus reads are unmapped and carry the single collapsed read group, so the
+        // output advertises a freshly built consensus header (no @SQ, no SS sub-sort)
+        // rather than the input header — matching fgbio and the `--threads` path below.
+        let read_group_id = &self.read_group.read_group_id;
+        let output_header =
+            create_unmapped_consensus_header(&header, read_group_id, "Read group", command_line)?;
+
         // ============================================================
         // For non-pipeline modes, create output writers here
         // ============================================================
@@ -395,7 +402,7 @@ impl Command for Duplex {
         // Create output BAM writer with multi-threaded BGZF compression
         let mut writer = create_bam_writer(
             &self.io.output,
-            &header,
+            &output_header,
             writer_threads,
             self.compression.compression_level,
         )?;
