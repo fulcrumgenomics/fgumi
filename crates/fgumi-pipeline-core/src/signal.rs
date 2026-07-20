@@ -231,10 +231,10 @@ pub struct CancelHandle {
 }
 
 impl CancelHandle {
-    /// Construct a `CancelHandle` from a shared signal. Used internally by
-    /// `Pipeline::run` (Phase 2) to hand a handle to the caller before
-    /// kicking off worker threads.
-    #[allow(dead_code)] // wired up by Phase 2 Pipeline::run.
+    /// Construct a `CancelHandle` from a shared signal. Used by
+    /// `Pipeline::cancel_handle` (see `builder.rs`) to hand a handle to the
+    /// caller of a built pipeline, before `Pipeline::run` kicks off worker
+    /// threads.
     pub(crate) fn from_signal(signal: Arc<PipelineSignal>) -> Self {
         Self { signal }
     }

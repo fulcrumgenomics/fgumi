@@ -676,18 +676,18 @@ impl Default for AlignerOptions {
 /// `pub(crate)` because only the runall AAM dispatch consumes it;
 /// promote to `pub` if a cross-crate caller materializes.
 ///
-/// Fields are flagged `#[allow(dead_code)]` because the AAM validation path
-/// currently only validates them (via `_resolved` in
-/// `validate_align_and_merge`); the wired chain sources its parameters
-/// independently.
-#[allow(dead_code)]
+/// Every field is read when the chain builder wires the AAM stage
+/// (`chains/builder.rs`): `command` seeds `AlignAndMergeStep`, `chunk_size`
+/// derives the step's `in_flight_unmapped_budget` (via
+/// `in_flight_budget_for_chunk_size`), and `mode`/`threads` are info-logged.
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedAligner {
     /// The shell command to spawn (already substituted and validated).
     /// Passed directly to [`AlignerProcess::spawn`].
     pub command: String,
-    /// Bases per batch. Step 1 of the AAM chain uses this to size
-    /// outgoing batches so the aligner sees full `-K` chunks.
+    /// The aligner's `-K` chunk size, in bases. The chain builder converts
+    /// it into `AlignAndMergeStep`'s `in_flight_unmapped_budget` so the
+    /// resident unmapped backlog stays proportional to one aligner chunk.
     pub chunk_size: u64,
     /// Resolved thread count (default-substituted for preset mode;
     /// `None` if command mode let the user hardcode their own).
@@ -697,9 +697,11 @@ pub(crate) struct ResolvedAligner {
     pub mode: ResolvedAlignerMode,
 }
 
-/// How a [`ResolvedAligner`] was produced. Same dead-code rationale
-/// as [`ResolvedAligner`].
-#[allow(dead_code)]
+/// How a [`ResolvedAligner`] was produced. The AAM chain builder logs the mode
+/// (`chains/builder.rs`), so the `Preset` payload is consumed only through the
+/// derived `Debug` — the `allow(dead_code)` suppresses the never-read lint,
+/// which fires for a field read solely via a derived trait.
+#[allow(dead_code)] // `Preset`'s payload is diagnostic-only (Debug-logged).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ResolvedAlignerMode {
     /// `--aligner::preset <preset>`. Carries the chosen preset so the
