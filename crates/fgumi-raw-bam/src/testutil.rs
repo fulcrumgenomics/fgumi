@@ -151,16 +151,16 @@ fn find_i16_array_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<Vec<i16>> {
                 };
                 i += count * elem_size;
             }
-            b'c' => {
+            b'A' | b'c' | b'C' => {
                 i += 1;
             }
-            b's' => {
+            b's' | b'S' => {
                 i += 2;
             }
-            b'i' | b'f' => {
+            b'i' | b'I' | b'f' => {
                 i += 4;
             }
-            b'Z' => {
+            b'Z' | b'H' => {
                 while i < aux.len() && aux[i] != 0 {
                     i += 1;
                 }
