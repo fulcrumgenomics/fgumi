@@ -378,9 +378,16 @@ fn generate_consensus_pair(
         let ad = ((cd as f64) * a_frac).round() as i32;
         let bd = cd - ad;
 
-        // Min depths for each strand
-        let am = (ad.min(cm)).max(0);
-        let bm = (bd.min(cm)).max(0);
+        // Min depths for each strand. These must satisfy aM + bM == cM, because a
+        // duplex consensus position's combined depth is the sum of its two strand
+        // depths — the real duplex caller derives cM as the per-base minimum of
+        // (ab_i + ba_i). Splitting cM by the same strand fraction as cD keeps the
+        // truth file and the emitted tags mutually consistent.
+        //
+        // The split is feasible because cM <= cD == aD + bD; clamping the A share to
+        // [cM - bD, min(aD, cM)] guarantees both aM <= aD and bM = cM - aM <= bD.
+        let am = (((cm as f64) * a_frac).round() as i32).clamp((cm - bd).max(0), ad.min(cm));
+        let bm = cm - am;
 
         // Errors distributed proportionally
         let ae = ((ce as f64) * a_frac).round() as i32;
@@ -729,18 +736,40 @@ fn build_consensus_record(
         if total_depth > 0 { (total_errors as f64 / total_depth as f64) as f32 } else { 0.0 }
     };
 
-    // Single-strand consensus summary + per-base arrays.
-    let (cd_bases, ce_bases) = per_base_arrays(cd, cm, ce);
-    b.add_int_tag(SamTag::CD, cd)
-        .add_int_tag(SamTag::CM, cm)
-        .add_float_tag(SamTag::CE, error_rate(&ce_bases, &cd_bases));
-    b.add_array_i16(SamTag::CD_BASES, &cd_bases).add_array_i16(SamTag::CE_BASES, &ce_bases);
-
-    // Add duplex-specific tags if present: per-strand summary (aD/bD/aM/bM int,
-    // aE/bE float rate) plus the per-base strand depth/error arrays filter needs.
     if let Some((ad, bd, am, bm, ae, be)) = duplex_tags {
+        // Duplex: emit per-strand summary (aD/bD/aM/bM int, aE/bE float rate) plus
+        // the per-base strand arrays `fgumi filter` masks with (`mask_duplex_bases`
+        // reads AD/AE/BD/BE only).
+        //
+        // The combined cD/cM/cE scalars are derived from the strand sums rather than
+        // the independently sampled values, matching `duplex_caller`, which computes
+        // them over the per-base combined depth (ab_i + ba_i).
+        //
+        // No CD_BASES/CE_BASES here: the real duplex caller never emits the combined
+        // arrays, so writing them would make simulated duplex BAMs diverge from
+        // anything production produces.
         let (ad_bases, ae_bases) = per_base_arrays(ad, am, ae);
         let (bd_bases, be_bases) = per_base_arrays(bd, bm, be);
+
+        let combined_depths: Vec<i16> = ad_bases
+            .iter()
+            .zip(&bd_bases)
+            .map(|(&a, &b)| i16::try_from(i32::from(a) + i32::from(b)).unwrap_or(i16::MAX))
+            .collect();
+        let combined_errors: Vec<i16> = ae_bases
+            .iter()
+            .zip(&be_bases)
+            .map(|(&a, &b)| i16::try_from(i32::from(a) + i32::from(b)).unwrap_or(i16::MAX))
+            .collect();
+
+        // Sum the scalars rather than taking max/min over `combined_depths`: the two
+        // agree whenever the arrays carry the min anchor, but `per_base_arrays` only
+        // anchors it when `read_len >= 2`, so a 1-base read would report cM == cD (and
+        // a 0-base read cD == cM == 0) and drift from the truth TSV again.
+        b.add_int_tag(SamTag::CD, ad + bd)
+            .add_int_tag(SamTag::CM, am + bm)
+            .add_float_tag(SamTag::CE, error_rate(&combined_errors, &combined_depths));
+
         b.add_int_tag(SamTag::AD, ad)
             .add_int_tag(SamTag::BD, bd)
             .add_int_tag(SamTag::AM, am)
@@ -751,6 +780,13 @@ fn build_consensus_record(
             .add_array_i16(SamTag::AE_BASES, &ae_bases)
             .add_array_i16(SamTag::BD_BASES, &bd_bases)
             .add_array_i16(SamTag::BE_BASES, &be_bases);
+    } else {
+        // Simplex: combined summary + the per-base arrays `mask_bases` reads.
+        let (cd_bases, ce_bases) = per_base_arrays(cd, cm, ce);
+        b.add_int_tag(SamTag::CD, cd)
+            .add_int_tag(SamTag::CM, cm)
+            .add_float_tag(SamTag::CE, error_rate(&ce_bases, &cd_bases));
+        b.add_array_i16(SamTag::CD_BASES, &cd_bases).add_array_i16(SamTag::CE_BASES, &ce_bases);
     }
 
     // Add methylation tags if enabled.
@@ -806,6 +842,7 @@ mod tests {
     use super::*;
     use crate::commands::simulate::common::generate_random_sequence;
     use crate::simulate::create_rng;
+    use rstest::rstest;
 
     /// Decode a raw BAM record into a noodles `RecordBuf` for higher-level test
     /// assertions.
@@ -1926,6 +1963,180 @@ mod tests {
         assert_eq!(
             r2_ct, r1_ct_rev,
             "R2 ct tag should be reversed relative to R1: R1={r1_ct:?}, R2={r2_ct:?}"
+        );
+    }
+
+    /// Build `GenerationParams` over a small synthetic reference, duplex-configurable.
+    fn strand_test_params(fasta: &tempfile::NamedTempFile, duplex: bool) -> Arc<GenerationParams> {
+        strand_test_params_with_read_length(fasta, duplex, 50)
+    }
+
+    /// As [`strand_test_params`], with an explicit read length so tests can reach the
+    /// short-read boundaries (`--read-length 1` skips the per-base min anchor).
+    fn strand_test_params_with_read_length(
+        fasta: &tempfile::NamedTempFile,
+        duplex: bool,
+        read_length: usize,
+    ) -> Arc<GenerationParams> {
+        let ref_genome = Arc::new(ReferenceGenome::load(fasta.path()).unwrap());
+        Arc::new(GenerationParams {
+            read_length,
+            min_depth: 1,
+            max_depth: 30,
+            depth_mean: 12.0,
+            depth_stddev: 6.0,
+            error_rate_mean: 0.02,
+            error_rate_stddev: 0.01,
+            duplex,
+            consensus_quality: 40,
+            methylation_mode: MethylationMode::Disabled,
+            methylation_depth_dist: create_depth_distribution(5.0, 2.5),
+            cpg_methylation_rate: 0.75,
+            conversion_rate: 0.98,
+            ref_genome,
+        })
+    }
+
+    fn small_test_fasta() -> tempfile::NamedTempFile {
+        use std::io::Write as IoWrite;
+        let mut fasta = tempfile::NamedTempFile::new().unwrap();
+        writeln!(fasta, ">chr1").unwrap();
+        fasta.write_all(&b"ACGT".repeat(500)).unwrap();
+        writeln!(fasta).unwrap();
+        fasta.flush().unwrap();
+        fasta
+    }
+
+    /// Duplex strand minimum depths must sum to the combined minimum, and each
+    /// strand's minimum must not exceed its own maximum.
+    ///
+    /// Previously `aM` and `bM` were each computed as `strand_depth.min(cM)`, so both
+    /// could equal `cM` and `aM + bM` routinely exceeded it — making the truth file
+    /// and the emitted tags mutually inconsistent. The strand fraction is sampled per
+    /// read, so the invariants are checked as a property over generated seeds rather
+    /// than at a handful of fixed points; the reference and params are built once and
+    /// shared across cases because loading them is the expensive part.
+    #[test]
+    fn test_duplex_strand_minimums_sum_to_combined_minimum() {
+        use proptest::prelude::*;
+
+        let fasta = small_test_fasta();
+        let params = strand_test_params(&fasta, true);
+        let strand_bias = StrandBiasModel::new(5.0, 5.0);
+
+        proptest!(|(seed in any::<u64>())| {
+            let pair = generate_consensus_pair(0, seed, &params, &strand_bias);
+            let aux = fgumi_raw_bam::aux_data_slice(&pair.r1_record);
+
+            let get = |tag: SamTag| -> i64 {
+                fgumi_raw_bam::find_int_tag(aux, tag)
+                    .unwrap_or_else(|| panic!("tag {tag:?} missing for seed {seed}"))
+            };
+            let (cd, cm, ad, bd, am, bm) = (
+                get(SamTag::CD),
+                get(SamTag::CM),
+                get(SamTag::AD),
+                get(SamTag::BD),
+                get(SamTag::AM),
+                get(SamTag::BM),
+            );
+
+            // The truth TSV and the emitted tags must not drift apart: the truth
+            // tuple carries the sampled values while duplex CD/CM are derived from
+            // the strand sums, and only the aM+bM==cM invariant keeps them equal.
+            let (truth_cd, truth_cm) = (pair.truth.0, pair.truth.1);
+            prop_assert_eq!(
+                i64::from(truth_cd),
+                cd,
+                "truth cD ({}) disagrees with emitted CD ({}) for seed {}",
+                truth_cd,
+                cd,
+                seed
+            );
+            prop_assert_eq!(
+                i64::from(truth_cm),
+                cm,
+                "truth cM ({}) disagrees with emitted CM ({}) for seed {}",
+                truth_cm,
+                cm,
+                seed
+            );
+
+            prop_assert_eq!(am + bm, cm, "aM + bM != cM (aM={} bM={} cM={})", am, bm, cm);
+            prop_assert_eq!(ad + bd, cd, "aD + bD != cD (aD={} bD={} cD={})", ad, bd, cd);
+            prop_assert!(am <= ad, "aM ({}) > aD ({})", am, ad);
+            prop_assert!(bm <= bd, "bM ({}) > bD ({})", bm, bd);
+            prop_assert!(am >= 0 && bm >= 0, "negative strand minimum (aM={} bM={})", am, bm);
+        });
+    }
+
+    /// The duplex cD/cM tags must match the truth TSV at short read lengths too.
+    ///
+    /// `per_base_arrays` only anchors the per-base minimum when `read_len >= 2`, so
+    /// deriving the scalars as max/min over the combined per-base depths would report
+    /// `cM == cD` for a 1-base read — the same truth-vs-tag drift this change fixes.
+    #[rstest]
+    #[case::single_base(1)]
+    #[case::two_bases(2)]
+    #[case::typical(50)]
+    fn test_duplex_combined_scalars_match_truth_at_short_read_lengths(#[case] read_length: usize) {
+        let fasta = small_test_fasta();
+        let params = strand_test_params_with_read_length(&fasta, true, read_length);
+        let strand_bias = StrandBiasModel::new(5.0, 5.0);
+
+        for seed in 0..8u64 {
+            let pair = generate_consensus_pair(0, seed, &params, &strand_bias);
+            let aux = fgumi_raw_bam::aux_data_slice(&pair.r1_record);
+            let cd = fgumi_raw_bam::find_int_tag(aux, SamTag::CD).expect("CD missing");
+            let cm = fgumi_raw_bam::find_int_tag(aux, SamTag::CM).expect("CM missing");
+            let (truth_cd, truth_cm) = (pair.truth.0, pair.truth.1);
+            assert_eq!(
+                i64::from(truth_cd),
+                cd,
+                "truth cD ({truth_cd}) != emitted CD ({cd}) at read_length {read_length}, seed {seed}"
+            );
+            assert_eq!(
+                i64::from(truth_cm),
+                cm,
+                "truth cM ({truth_cm}) != emitted CM ({cm}) at read_length {read_length}, seed {seed}"
+            );
+        }
+    }
+
+    /// Duplex records must not carry the combined per-base arrays: the real
+    /// `duplex_caller` emits only the per-strand AD/AE/BD/BE arrays, so emitting
+    /// `CD_BASES`/`CE_BASES` would make simulated duplex BAMs unfaithful fixtures.
+    /// Simplex records must still carry them (`fgumi filter`'s `mask_bases` reads them).
+    #[test]
+    fn test_duplex_omits_combined_per_base_arrays_simplex_keeps_them() {
+        let fasta = small_test_fasta();
+        let strand_bias = StrandBiasModel::new(5.0, 5.0);
+
+        let duplex_params = strand_test_params(&fasta, true);
+        let duplex_pair = generate_consensus_pair(0, 7, &duplex_params, &strand_bias);
+        let duplex_aux = fgumi_raw_bam::aux_data_slice(&duplex_pair.r1_record);
+        assert!(
+            fgumi_raw_bam::find_array_tag(duplex_aux, SamTag::CD_BASES).is_none(),
+            "duplex record must not carry CD_BASES (no real caller emits it)"
+        );
+        assert!(
+            fgumi_raw_bam::find_array_tag(duplex_aux, SamTag::CE_BASES).is_none(),
+            "duplex record must not carry CE_BASES (no real caller emits it)"
+        );
+        // The per-strand arrays filter masks with must still be present.
+        for tag in [SamTag::AD_BASES, SamTag::AE_BASES, SamTag::BD_BASES, SamTag::BE_BASES] {
+            assert!(
+                fgumi_raw_bam::find_array_tag(duplex_aux, tag).is_some(),
+                "duplex record missing {tag:?}"
+            );
+        }
+
+        let simplex_params = strand_test_params(&fasta, false);
+        let simplex_pair = generate_consensus_pair(0, 7, &simplex_params, &strand_bias);
+        let simplex_aux = fgumi_raw_bam::aux_data_slice(&simplex_pair.r1_record);
+        assert!(
+            fgumi_raw_bam::find_array_tag(simplex_aux, SamTag::CD_BASES).is_some(),
+            "simplex record must keep CD_BASES for filter's mask_bases"
         );
     }
 
