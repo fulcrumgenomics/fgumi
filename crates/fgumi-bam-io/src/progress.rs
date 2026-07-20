@@ -5,6 +5,7 @@
 //! When a total is known, it also displays percentage complete and ETA using an exponential
 //! moving average (EMA) of the processing rate with bias correction (tqdm-style).
 
+use fgumi_fmt::format_duration;
 use log::info;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -66,22 +67,6 @@ impl EmaState {
         let beta = 1.0 - EMA_ALPHA;
         let correction = 1.0 - beta.powi(self.calls.cast_signed());
         if correction <= 0.0 { 0.0 } else { self.smoothed_rate / correction }
-    }
-}
-
-/// Formats a [`Duration`] as a human-readable string (e.g. `"2m 15s"`, `"1h 30m"`).
-fn format_duration(duration: Duration) -> String {
-    let secs = duration.as_secs();
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        let mins = secs / 60;
-        let remaining_secs = secs % 60;
-        if remaining_secs == 0 { format!("{mins}m") } else { format!("{mins}m {remaining_secs}s") }
-    } else {
-        let hours = secs / 3600;
-        let mins = (secs % 3600) / 60;
-        if mins == 0 { format!("{hours}h") } else { format!("{hours}h {mins}m") }
     }
 }
 
