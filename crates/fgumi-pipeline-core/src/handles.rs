@@ -849,6 +849,33 @@ pub(crate) struct UnitOutputsView;
 // Typed accessors on OutputHandles<O>
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The single canonical definition of the held-slot re-hold invariant, shared by
+/// every single-output shape's `retry_held` (the `Single<T>` and
+/// `OrderedBytesSingle<T>` variants differ only in which `retry` they hand in).
+///
+/// If the slot holds an item, `retry` it; on rejection put it **back** in the slot
+/// (so it is never dropped) and report [`HeldRetry::StillHeld`]. Used by step
+/// flush-first preambles so each step doesn't re-implement the take/retry/put-back
+/// dance (a copy that forgot the put-back would silently drop a final batch).
+/// **Never spins** — the caller maps `StillHeld` to a yield (`NoProgress`/`Contention`)
+/// and retries on the next dispatch.
+#[inline]
+fn retry_held_impl<T: Send + HeapSize + 'static>(
+    held: &mut crate::held::HeldSlot<Unpushed<T>>,
+    retry: impl FnOnce(Unpushed<T>) -> Result<(), Unpushed<T>>,
+) -> HeldRetry {
+    match held.take() {
+        None => HeldRetry::WasEmpty,
+        Some(unpushed) => match retry(unpushed) {
+            Ok(()) => HeldRetry::Flushed,
+            Err(again) => {
+                held.put(again);
+                HeldRetry::StillHeld
+            }
+        },
+    }
+}
+
 impl<T: Send + HeapSize + 'static> OutputHandles<Single<T>> {
     /// Push a fresh item to the (single) output.
     ///
@@ -894,27 +921,12 @@ impl<T: Send + HeapSize + 'static> OutputHandles<Single<T>> {
 
     /// Retry a step's held output slot, re-holding on backpressure.
     ///
-    /// The single canonical definition of the held-slot re-hold invariant for
-    /// the `Single<T>` output shape — mirror of the `OrderedBytesSingle<T>`
-    /// variant. If the slot holds an
-    /// item, [`retry`](Self::retry) it; on rejection put it **back** in the slot
-    /// (so it is never dropped) and report [`HeldRetry::StillHeld`]. Used by step
-    /// flush-first preambles so each step doesn't re-implement the
-    /// take/retry/put-back dance (a copy that forgot the put-back would silently
-    /// drop a final batch). **Never spins** — the caller maps `StillHeld` to a
-    /// yield (`NoProgress`/`Contention`) and retries on the next dispatch.
+    /// Retry the held output slot for the `Single<T>` shape, re-holding on
+    /// backpressure. Delegates to [`retry_held_impl`], the shared canonical
+    /// re-hold invariant.
     #[inline]
     pub fn retry_held(&self, held: &mut crate::held::HeldSlot<Unpushed<T>>) -> HeldRetry {
-        match held.take() {
-            None => HeldRetry::WasEmpty,
-            Some(unpushed) => match self.retry(unpushed) {
-                Ok(()) => HeldRetry::Flushed,
-                Err(again) => {
-                    held.put(again);
-                    HeldRetry::StillHeld
-                }
-            },
-        }
+        retry_held_impl(held, |unpushed| self.retry(unpushed))
     }
 }
 
@@ -961,28 +973,12 @@ impl<T: Send + HeapSize + Ordered + 'static> OutputHandles<crate::outputs::Order
         view.primary.retry(unpushed)
     }
 
-    /// Retry a step's held output slot, re-holding on backpressure.
-    ///
-    /// The single canonical definition of the held-slot re-hold invariant: if
-    /// the slot holds an item, [`retry`](Self::retry) it; on rejection put it
-    /// **back** in the slot (so it is never dropped) and report
-    /// [`HeldRetry::StillHeld`]. Used by step flush-first preambles so each
-    /// step doesn't re-implement the take/retry/put-back dance (a copy that
-    /// forgot the put-back would silently drop a final batch). **Never spins** —
-    /// the caller maps `StillHeld` to a yield (`NoProgress`/`Contention`) and
-    /// retries on the next dispatch.
+    /// Retry the held output slot for the `OrderedBytesSingle<T>` shape,
+    /// re-holding on backpressure. Delegates to [`retry_held_impl`], the shared
+    /// canonical re-hold invariant.
     #[inline]
     pub fn retry_held(&self, held: &mut crate::held::HeldSlot<Unpushed<T>>) -> HeldRetry {
-        match held.take() {
-            None => HeldRetry::WasEmpty,
-            Some(unpushed) => match self.retry(unpushed) {
-                Ok(()) => HeldRetry::Flushed,
-                Err(again) => {
-                    held.put(again);
-                    HeldRetry::StillHeld
-                }
-            },
-        }
+        retry_held_impl(held, |unpushed| self.retry(unpushed))
     }
 }
 
