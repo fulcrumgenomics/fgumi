@@ -2133,6 +2133,21 @@ fn fastq_try_step_read<R: BufRead + Send, P: Send + MemoryEstimate>(
                             }
                             continue;
                         }
+                        // Count this batch in `batches_read` BEFORE publishing
+                        // `read_done`. The pair step's completion predicate is
+                        // `read_done && chunks_paired == batches_read` (see
+                        // `fastq_try_step_find_boundaries`). If `read_done` were
+                        // stored first, another worker could observe it while this
+                        // final batch is still uncounted (`chunks_paired ==
+                        // batches_read` transiently true with the batch in flight),
+                        // set `boundaries_done`, and orphan the batch in
+                        // `q1_decompressed` — a deadlock. Incrementing first, with
+                        // the `read_done` release store ordered after it, guarantees
+                        // any thread that sees `read_done == true` also sees this
+                        // batch counted, so the predicate stays false until the
+                        // batch is actually paired. The BGZF and BAM read paths avoid
+                        // this by only setting `read_done` on a zero-batch (EOF) read.
+                        let serial = state.batches_read.fetch_add(1, Ordering::Release);
                         // Set EOF flag now if at_eof, even though we have records
                         // to push. This avoids an extra wasted read call and
                         // ensures read_done is set promptly for pipeline shutdown.
@@ -2142,7 +2157,6 @@ fn fastq_try_step_read<R: BufRead + Send, P: Send + MemoryEstimate>(
                                 state.read_done.store(true, Ordering::Release);
                             }
                         }
-                        let serial = state.batches_read.fetch_add(1, Ordering::Release);
                         let chunk =
                             PerStreamChunk { stream_idx, batch_num, data, offsets: Some(offsets) };
                         match state.q0_chunks.push((serial, chunk)) {
