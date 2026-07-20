@@ -12,7 +12,10 @@
 //! # Quality Encoding
 //!
 //! Automatically detects and handles both Phred+33 (standard) and Phred+64 (Illumina 1.3-1.7)
-//! quality encodings.
+//! quality encodings. Detection pools the heads of all input FASTQs (EXT3-01), matching fgbio
+//! `FastqToBam`. When no encoding matches the observed qualities, fgumi fails like fgbio's
+//! `case Nil => fail(...)` (EXT3-03) but improves on its static message by reporting the
+//! observed quality range in the error (see [`QualityEncoding::from_stats`]).
 
 use crate::commands::command::Command;
 use crate::commands::common::{
@@ -281,7 +284,22 @@ impl QualityEncoding {
             return Ok(QualityEncoding::Standard);
         }
 
-        // Quality scores should be printable ASCII (33-126)
+        // No-compatible-encoding failure (fgbio parity: EXT3-03).
+        //
+        // fgbio `FastqToBam` derives this failure from its encoding model: it builds
+        // the set of encodings whose ASCII range contains every observed quality char,
+        // and `case Nil => fail("Quality scores in FASTQ files do not match any known
+        // encoding.")` when that set is empty (`FastqToBam.scala:131`). Because the
+        // Standard (Phred+33) ASCII range `[33, 126]` is the union of all three fgbio
+        // encodings' ranges (Solexa `[59, 126]` and Illumina `[64, 126]` are subsets),
+        // fgbio's compatible set is empty on *exactly* the condition below: an observed
+        // char `< 33` or `> 126`. So this bail is fgbio-equivalent on the failure set.
+        //
+        // fgumi intentionally *improves* on fgbio's message here rather than copying it.
+        // fgbio emits a static string; fgumi reports the observed `[min, max]` range and
+        // the required range, which points the user straight at the offending file
+        // instead of just asserting no encoding matched. This divergence is deliberate,
+        // not a parity gap (see `detect_reports_observed_range_on_no_compatible_encoding`).
         if min_qual < 33 || max_qual > 126 {
             bail!(
                 "Invalid quality scores detected: range [{min_qual}, {max_qual}]. \
@@ -3597,28 +3615,31 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("no records provided"));
     }
 
-    #[test]
-    fn test_quality_encoding_detection_invalid_low() {
-        // Test that quality scores below 33 produce an error
-        let records = vec![vec![20u8, 30, 40, 50]]; // 20 is below valid range
-
-        let result = QualityEncoding::detect(&records);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("Invalid quality scores"));
-        assert!(err_msg.contains("20"));
-    }
-
-    #[test]
-    fn test_quality_encoding_detection_invalid_high() {
-        // Test that quality scores above 126 produce an error
-        let records = vec![vec![50u8, 60, 70, 127]]; // 127 is above valid range
-
-        let result = QualityEncoding::detect(&records);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("Invalid quality scores"));
-        assert!(err_msg.contains("127"));
+    /// EXT3-03 (fgbio parity + message improvement): fgbio `FastqToBam` fails with
+    /// `case Nil => fail("Quality scores in FASTQ files do not match any known encoding.")`
+    /// when no encoding's ASCII range contains every observed quality char. Because
+    /// Standard's `[33, 126]` range is the union of all three fgbio encodings (Solexa
+    /// `[59, 126]` and Illumina `[64, 126]` are subsets), fgbio's compatible set is empty
+    /// on exactly the condition fgumi bails on: a char `< 33` or `> 126`. So fgumi's
+    /// failure *set* matches fgbio. fgumi deliberately *improves* on fgbio's static
+    /// message by naming the observed `[min, max]` range; these cases assert both that
+    /// each fgbio-Nil input fails and that the improved range-reporting message survives.
+    #[rstest]
+    #[case::below_min_char(vec![vec![20u8, 30, 40, 50]], "20", "50")]
+    #[case::above_max_char(vec![vec![50u8, 60, 70, 127]], "50", "127")]
+    #[case::both_out_of_range(vec![vec![20u8], vec![127u8]], "20", "127")]
+    fn detect_reports_observed_range_on_no_compatible_encoding(
+        #[case] records: Vec<Vec<u8>>,
+        #[case] expected_min: &str,
+        #[case] expected_max: &str,
+    ) {
+        let err = QualityEncoding::detect(&records).expect_err("no compatible encoding must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("Invalid quality scores"), "unexpected message: {msg}");
+        assert!(
+            msg.contains(&format!("[{expected_min}, {expected_max}]")),
+            "message must report the observed range (the fgbio-message improvement): {msg}"
+        );
     }
 
     #[test]
