@@ -13,6 +13,7 @@ use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::sam::Header;
 use rstest::rstest;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
@@ -1825,6 +1826,58 @@ fn test_sort_verify_content_diff_differs(#[case] header: Header) {
     assert!(!outcome.is_match(), "a content difference must DIFFER: {outcome:?}");
 }
 
+/// The run *multiset* comparison itself: an equal-key run of size 2 that lines up on both
+/// sides (same key, same length — so neither the run-boundary/desync path nor a run-length
+/// difference can catch it), where one record's content differs. Only comparing the two runs'
+/// record multisets detects this. The expectations are hand-computed rather than derived from
+/// the engine: exactly one of the two runs differs, so `run_mismatches == 1`; the runs stay
+/// aligned so there is no desync; and every record on both sides is read.
+#[test]
+fn test_sort_verify_content_diff_within_aligned_multi_record_run_differs() {
+    let tmp = TempDir::new().unwrap();
+    let header = create_coordinate_sorted_header("chr1", 10000);
+
+    // The tied run at pos 100: readA is identical on both sides, readB's sequence differs by
+    // its last base in bam2 while keeping the same name and coordinate (so it stays in the
+    // same run and both files remain correctly coordinate-sorted).
+    let read_a = fragment_record(b"readA", 0, 100, false);
+    let read_b = fragment_record(b"readB", 0, 100, false);
+    let read_b_mutated = {
+        let mut b = SamBuilder::new();
+        b.read_name(b"readB")
+            .sequence(b"ACGTACGA") // last base differs from `fragment_record`'s ACGTACGT
+            .qualities(&[30; 8])
+            .ref_id(0)
+            .pos(99) // same 1-based pos 100 as `read_b`
+            .mapq(60);
+        b.build()
+    };
+    // A second, fully identical run at pos 200 — it must not be counted as a mismatch.
+    let read_c = fragment_record(b"readC", 0, 200, false);
+
+    let bam1 = tmp.path().join("a.bam");
+    let bam2 = tmp.path().join("b.bam");
+    write_bam(&bam1, &header, &[read_a.clone(), read_b, read_c.clone()]);
+    write_bam(&bam2, &header, &[read_a, read_b_mutated, read_c]);
+
+    let outcome =
+        sort_verify_compare(&bam1, &bam2, 100).expect("sort_verify_compare should succeed");
+
+    assert_eq!(outcome.bam1_violations, 0, "bam1 is itself correctly sorted: {outcome:?}");
+    assert_eq!(outcome.bam2_violations, 0, "bam2 is itself correctly sorted: {outcome:?}");
+    assert!(!outcome.presence_mismatch, "the runs line up on both sides: {outcome:?}");
+    assert_eq!(outcome.bam1_count, 3, "{outcome:?}");
+    assert_eq!(outcome.bam2_count, 3, "{outcome:?}");
+    assert_eq!(
+        outcome.run_mismatches, 1,
+        "exactly the pos-100 run's multiset differs; the pos-200 run matches: {outcome:?}"
+    );
+    assert!(
+        !outcome.is_match(),
+        "a content difference inside an aligned tied run must DIFFER: {outcome:?}"
+    );
+}
+
 /// R2 header-comparison gap, wired into the sort-verify engine: two files that agree on
 /// sort order (so `detect_sort_order` succeeds and never bails) and on every record's
 /// content can still DIFFER if their `@SQ` reference dictionaries disagree — a field
@@ -1852,6 +1905,60 @@ fn test_sort_verify_header_sq_length_mismatch_differs() {
     assert!(
         !outcome.is_match(),
         "a @SQ divergence must DIFFER even with matching sort order/content: {outcome:?}"
+    );
+}
+
+/// Appends an additional `@SQ` entry to `header`, yielding a reference dictionary one
+/// longer than the input's.
+fn header_with_extra_reference(mut header: Header, ref_name: &str, ref_len: usize) -> Header {
+    use bstr::BString;
+    use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
+    use std::num::NonZeroUsize;
+
+    header.reference_sequences_mut().insert(
+        BString::from(ref_name),
+        Map::<ReferenceSequence>::new(
+            NonZeroUsize::new(ref_len).expect("reference length must be non-zero"),
+        ),
+    );
+    header
+}
+
+/// Companion to the `@SQ` *length* mismatch above, covering the other way a reference
+/// dictionary can diverge: a differing `@SQ` *count* (`nref`). bam2 declares a second
+/// reference that bam1 does not, while every record still lives on `chr1` and both files
+/// remain correctly coordinate-sorted — so neither the per-file order check nor the run
+/// comparison can see it, and only the header comparison catches the divergence.
+#[test]
+fn test_sort_verify_header_sq_count_mismatch_differs() {
+    let tmp = TempDir::new().unwrap();
+    let header1 = create_coordinate_sorted_header("chr1", 10000);
+    let header2 =
+        header_with_extra_reference(create_coordinate_sorted_header("chr1", 10000), "chr2", 20000);
+
+    // Pin the divergence the test is about: same first @SQ, different reference counts.
+    assert_eq!(header1.reference_sequences().len(), 1, "bam1 declares one @SQ");
+    assert_eq!(header2.reference_sequences().len(), 2, "bam2 declares two @SQ");
+
+    let records = vec![fragment_record(b"read1", 0, 100, false)];
+
+    let bam1 = tmp.path().join("a.bam");
+    let bam2 = tmp.path().join("b.bam");
+    write_bam(&bam1, &header1, &records);
+    write_bam(&bam2, &header2, &records);
+
+    let outcome =
+        sort_verify_compare(&bam1, &bam2, 100).expect("sort_verify_compare should succeed");
+
+    assert_eq!(outcome.bam1_violations, 0, "bam1 is itself correctly sorted: {outcome:?}");
+    assert_eq!(outcome.bam2_violations, 0, "bam2 is itself correctly sorted: {outcome:?}");
+    assert_eq!(outcome.bam1_count, 1, "{outcome:?}");
+    assert_eq!(outcome.bam2_count, 1, "{outcome:?}");
+    assert_eq!(outcome.run_mismatches, 0, "record content itself is identical");
+    assert!(outcome.header_mismatch, "a @SQ count mismatch must be flagged: {outcome:?}");
+    assert!(
+        !outcome.is_match(),
+        "an nref divergence must DIFFER even with matching sort order/content: {outcome:?}"
     );
 }
 
@@ -2506,4 +2613,141 @@ fn molecule_join_does_not_spill_to_disk() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+}
+
+// ============================================================================
+// Single-pass sort-verify: complete per-file order verification past a desync
+// ============================================================================
+//
+// The single-streaming-pass engine reads each file once, folding the per-file monotonic
+// sort-order check into the same read the run-grouped comparison consumes (via an
+// order-checking stream adapter). The invariant most at risk under that fold: once the two
+// files' runs desynchronize (a run-boundary mismatch or one file exhausting first), the
+// comparison stops but each file's *tail* must still be pulled through its order tracker, so
+// the per-file violation count and first violation stay complete — identical to the old
+// end-to-end `verify_sort_order` pass. These tests pin that behavior for a violation that
+// lands in the tail, *past* the desync point (discovered by the drain path, not by the
+// comparison).
+
+/// Independently recompute the coordinate-order verification of `path` via the reference
+/// `fgumi_sort::verify_sort_order` two-pass primitive (the exact fold the single-pass engine
+/// folds inline), returning `(violations, first_violation)`. Used to lock the equivalence.
+fn reference_coordinate_violations(path: &Path, nref: u32) -> (u64, Option<(u64, String)>) {
+    let mut reader = fgumi_sort::RawBamRecordReader::new(fs::File::open(path).expect("open bam"))
+        .expect("reader");
+    reader.skip_header().expect("skip header");
+    let (_total, violations, first) = fgumi_sort::verify_sort_order(
+        reader,
+        |bam: &[u8]| fgumi_sort::extract_coordinate_key_inline(bam, nref),
+        |key: &u64, prev: &u64| key < prev,
+    )
+    .expect("verify_sort_order");
+    (violations, first)
+}
+
+/// A desynced coordinate-sorted pair where *each* file additionally hides a monotonic-order
+/// violation deep in its tail — after the run boundaries stop lining up. The comparison
+/// desyncs at the second run (bam1's pos-200 group vs bam2's pos-300 group don't align) and
+/// never resyncs, so the violating tail records (`readD` @ pos 50 in bam1, `readZ` @ pos 10
+/// in bam2) are only ever seen by the drain path. Both must still be counted, with the
+/// correct 1-based record number and read name, matching the reference two-pass computation.
+#[test]
+fn test_sort_verify_counts_order_violation_in_tail_past_desync() {
+    let tmp = TempDir::new().unwrap();
+    let header = create_coordinate_sorted_header("chr1", 10000);
+
+    // bam1: readA/readB/readC are non-decreasing; readD @ pos 50 violates (50 < 210) and
+    // sits past the run boundary the comparison desyncs on.
+    let records1 = vec![
+        fragment_record(b"readA", 0, 100, false),
+        fragment_record(b"readB", 0, 200, false),
+        fragment_record(b"readC", 0, 210, false),
+        fragment_record(b"readD", 0, 50, false),
+    ];
+    // bam2: readX/readY are non-decreasing after the shared readA; readZ @ pos 10 violates
+    // (10 < 310), likewise in the drained tail.
+    let records2 = vec![
+        fragment_record(b"readA", 0, 100, false),
+        fragment_record(b"readX", 0, 300, false),
+        fragment_record(b"readY", 0, 310, false),
+        fragment_record(b"readZ", 0, 10, false),
+    ];
+
+    let bam1 = tmp.path().join("a.bam");
+    let bam2 = tmp.path().join("b.bam");
+    write_bam(&bam1, &header, &records1);
+    write_bam(&bam2, &header, &records2);
+
+    let outcome =
+        sort_verify_compare(&bam1, &bam2, 100).expect("sort_verify_compare should succeed");
+
+    // The streams desynchronized (run boundaries do not align), and no resync happened.
+    assert!(outcome.presence_mismatch, "the pair must desync on the mismatched run: {outcome:?}");
+
+    // Every record in each file was still read: counts are complete.
+    assert_eq!(outcome.bam1_count, 4, "bam1 fully drained past the desync: {outcome:?}");
+    assert_eq!(outcome.bam2_count, 4, "bam2 fully drained past the desync: {outcome:?}");
+
+    // The tail-past-desync order violation in each file is fully counted, with the correct
+    // 1-based record number and read name.
+    assert_eq!(outcome.bam1_violations, 1, "bam1's tail violation must be counted: {outcome:?}");
+    assert_eq!(outcome.bam1_first_violation, Some((4, "readD".to_string())));
+    assert_eq!(outcome.bam2_violations, 1, "bam2's tail violation must be counted: {outcome:?}");
+    assert_eq!(outcome.bam2_first_violation, Some((4, "readZ".to_string())));
+
+    // And it matches the reference two-pass computation exactly.
+    let nref = u32::try_from(header.reference_sequences().len()).expect("nref fits in u32");
+    assert_eq!(reference_coordinate_violations(&bam1, nref), (1, Some((4, "readD".to_string()))));
+    assert_eq!(reference_coordinate_violations(&bam2, nref), (1, Some((4, "readZ".to_string()))));
+
+    assert!(!outcome.is_match(), "a desynced pair with mis-sorted tails must DIFFER: {outcome:?}");
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+    /// Parity/equivalence property: over randomized coordinate-keyed inputs — including
+    /// pairs that desynchronize — the single-pass engine's per-file `(violations,
+    /// first_violation)` must equal the reference `fgumi_sort::verify_sort_order` two-pass
+    /// computation run independently over each file. This locks the single-pass fold to the
+    /// primitive it replaced, for both correctly-sorted and mis-sorted inputs.
+    #[test]
+    fn prop_sort_verify_per_file_violations_match_reference(
+        positions1 in proptest::collection::vec(1i32..500, 1..12),
+        positions2 in proptest::collection::vec(1i32..500, 1..12),
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let header = create_coordinate_sorted_header("chr1", 10000);
+        let nref = u32::try_from(header.reference_sequences().len()).expect("nref fits in u32");
+
+        let to_records = |positions: &[i32]| -> Vec<RawRecord> {
+            positions
+                .iter()
+                .enumerate()
+                .map(|(i, &pos)| fragment_record(format!("r{i}").as_bytes(), 0, pos, false))
+                .collect()
+        };
+        let records1 = to_records(&positions1);
+        let records2 = to_records(&positions2);
+
+        let bam1 = tmp.path().join("a.bam");
+        let bam2 = tmp.path().join("b.bam");
+        write_bam(&bam1, &header, &records1);
+        write_bam(&bam2, &header, &records2);
+
+        let outcome =
+            sort_verify_compare(&bam1, &bam2, 100).expect("sort_verify_compare should succeed");
+
+        let (ref1_violations, ref1_first) = reference_coordinate_violations(&bam1, nref);
+        let (ref2_violations, ref2_first) = reference_coordinate_violations(&bam2, nref);
+
+        proptest::prop_assert_eq!(outcome.bam1_violations, ref1_violations);
+        proptest::prop_assert_eq!(outcome.bam1_first_violation, ref1_first);
+        proptest::prop_assert_eq!(outcome.bam2_violations, ref2_violations);
+        proptest::prop_assert_eq!(outcome.bam2_first_violation, ref2_first);
+
+        // Record counts must also be complete regardless of any desync.
+        proptest::prop_assert_eq!(outcome.bam1_count, records1.len() as u64);
+        proptest::prop_assert_eq!(outcome.bam2_count, records2.len() as u64);
+    }
 }
