@@ -650,7 +650,6 @@ mod tests {
 
     /// Helper struct for managing temporary test file paths.
     struct TestPaths {
-        #[allow(dead_code)]
         dir: TempDir,
         pub input: PathBuf,
         pub output: PathBuf,
