@@ -909,6 +909,12 @@ impl UmiAssigner for IdentityUmiAssigner {
 /// are merged. This can lead to transitive clustering where UMIs are grouped together even
 /// if they differ by more than the threshold.
 ///
+/// UMI matching is case-insensitive: bases are folded to uppercase before comparison, so this
+/// agrees with the parallel edit assigner (`ParallelEditAssigner`, which uppercases before
+/// encoding) on mixed-case input. This matches fgbio's edit-distance assigner, which compares
+/// UMIs case-insensitively inside its mismatch counter (`Sequences.countMismatches`) rather than
+/// uppercasing before assignment — the same grouping result, folded at a different point.
+///
 /// # Algorithm
 ///
 /// 1. For each UMI, find all existing groups that contain at least one UMI within threshold
@@ -957,12 +963,22 @@ impl UmiAssigner for SimpleErrorUmiAssigner {
             return Vec::new();
         }
 
+        // Match case-insensitively, consistent with the parallel edit assigner (which
+        // uppercases before encoding). Folding case here keeps the two implementations in
+        // agreement on mixed-case input; it is a no-op for the uppercase UMIs the CLI emits
+        // (fgbio's edit assigner instead folds case inside its `Sequences.countMismatches`
+        // comparator, reaching the same grouping).
+        // UMI bases are ASCII, so `to_ascii_uppercase` is both cheaper (no allocation for the
+        // already-uppercase common case, no locale-aware Unicode mapping) and avoids any
+        // length-changing Unicode case-fold surprises.
+        let upper_umis: Vec<Umi> = raw_umis.iter().map(|umi| umi.to_ascii_uppercase()).collect();
+
         let mut umi_sets: Vec<BTreeSet<Umi>> = Vec::new();
         // Track seen UMIs to skip duplicate processing
         let mut seen: std::collections::HashSet<&str> =
-            std::collections::HashSet::with_capacity(raw_umis.len());
+            std::collections::HashSet::with_capacity(upper_umis.len());
 
-        for umi in raw_umis {
+        for umi in &upper_umis {
             // Skip duplicate UMIs - they're already in a set
             if !seen.insert(umi.as_str()) {
                 continue;
@@ -1023,7 +1039,7 @@ impl UmiAssigner for SimpleErrorUmiAssigner {
         }
 
         // Build result Vec indexed by input position
-        raw_umis.iter().map(|umi| umi_to_id[umi]).collect()
+        upper_umis.iter().map(|umi| umi_to_id[umi]).collect()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -2023,6 +2039,90 @@ mod tests {
         }
     }
 
+    /// Canonical partition of input indices induced by an assignment vector, keyed on the
+    /// underlying molecule id (`MoleculeId::id()`). Concrete id *values* are irrelevant — only
+    /// which inputs share a molecule — so the result is directly comparable against a reference
+    /// baseline.
+    fn molecule_partition(ids: &[MoleculeId]) -> Vec<Vec<usize>> {
+        let mut groups: HashMap<Option<u64>, Vec<usize>> = HashMap::new();
+        for (i, id) in ids.iter().enumerate() {
+            groups.entry(id.id()).or_default().push(i);
+        }
+        let mut sorted: Vec<Vec<usize>> = groups.into_values().collect();
+        for group in &mut sorted {
+            group.sort_unstable();
+        }
+        sorted.sort();
+        sorted
+    }
+
+    /// Programmatic fgbio-faithful baseline partition for the *edit* ("simple error") strategy.
+    ///
+    /// fgbio's `GroupReadsByUmi` uppercases every UMI before assignment
+    /// (`canonicalize(rawTag.toUpperCase)`), then its edit/`SimpleErrorUmiAssigner` strategy groups
+    /// transitively: two UMIs share a molecule when they are within `max_mismatches`, and that
+    /// relation is closed transitively (chains merge). The fgbio-faithful partition is therefore
+    /// the connected components of the graph over the *uppercased* UMIs whose edges join pairs
+    /// within `max_mismatches`.
+    ///
+    /// This is an independent reference — a dead-simple O(n^2) union-find over the pairwise
+    /// within-threshold relation, not the production assigner's clustering — so matching it is a
+    /// genuine identity check against fgbio's documented behavior, and it takes no fgbio dependency
+    /// (fgbio's mixed-case behavior is fully determined by the up-front uppercasing).
+    fn fgbio_edit_baseline_partition(umis: &[Umi], max_mismatches: u32) -> Vec<Vec<usize>> {
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+
+        let upper: Vec<String> = umis.iter().map(|umi| umi.to_ascii_uppercase()).collect();
+        let within = |a: &str, b: &str| -> bool {
+            a.len() == b.len()
+                && a.bytes().zip(b.bytes()).filter(|(x, y)| x != y).count()
+                    <= max_mismatches as usize
+        };
+
+        let mut parent: Vec<usize> = (0..upper.len()).collect();
+        for i in 0..upper.len() {
+            for j in (i + 1)..upper.len() {
+                if within(&upper[i], &upper[j]) {
+                    let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                    if ri != rj {
+                        parent[ri] = rj;
+                    }
+                }
+            }
+        }
+
+        let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+        for i in 0..upper.len() {
+            let root = find(&mut parent, i);
+            groups.entry(root).or_default().push(i);
+        }
+        let mut sorted: Vec<Vec<usize>> = groups.into_values().collect();
+        for group in &mut sorted {
+            group.sort_unstable();
+        }
+        sorted.sort();
+        sorted
+    }
+
+    /// Assert an edit-assigner's output partition is identical to the programmatic fgbio baseline.
+    fn assert_matches_fgbio_edit_baseline(
+        assignments: &[MoleculeId],
+        umis: &[Umi],
+        max_mismatches: u32,
+    ) {
+        assert_eq!(
+            molecule_partition(assignments),
+            fgbio_edit_baseline_partition(umis, max_mismatches),
+            "assignment partition diverges from the programmatic fgbio edit baseline"
+        );
+    }
+
     // ========================================================================
     // Basic Function Tests
     // ========================================================================
@@ -2181,6 +2281,24 @@ mod tests {
 
         // With 0 edits, should behave like identity
         assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn test_simple_error_assigner_is_case_insensitive() {
+        // Audit P2: the sequential edit assigner must fold case so it agrees with the
+        // parallel edit assigner (which uppercases before encoding) and with fgbio (which
+        // uppercases every UMI before assignment). Different spellings of the same UMI must
+        // collapse into a single molecule even at zero edits.
+        let assigner = SimpleErrorUmiAssigner::new(0);
+        let umis = vec!["ACGTAC".to_string(), "acgtac".to_string(), "AcGtAc".to_string()];
+        let assignments = assigner.assign(&umis);
+
+        assert_eq!(assignments[0], assignments[1], "ACGTAC and acgtac are the same UMI");
+        assert_eq!(assignments[1], assignments[2], "acgtac and AcGtAc are the same UMI");
+
+        // Pin the mixed-case partition against the programmatic fgbio baseline (uppercase, then
+        // edit-distance grouping): fgbio collapses all three spellings into one molecule.
+        assert_matches_fgbio_edit_baseline(&assignments, &umis, 0);
     }
 
     #[test]

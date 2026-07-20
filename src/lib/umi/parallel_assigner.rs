@@ -323,7 +323,15 @@ impl UmiAssigner for ParallelIdentityAssigner {
 /// Parallel UMI assigner for Edit strategy.
 ///
 /// Uses parallel edge discovery and union-find for fully parallel execution.
-/// Produces identical results to `SimpleErrorUmiAssigner` in `assigner.rs`.
+///
+/// Matches `SimpleErrorUmiAssigner` in `assigner.rs` on all UMIs the `group`/`dedup` CLI can
+/// deliver: both fold case, and both never see `N`-containing UMIs (those templates are
+/// discarded up front with `discarded_ns_in_umi`, mirroring fgbio). The one residual
+/// difference is for UMIs that are not `BitEnc`-encodable for a reason other than `N`
+/// (length > 32 bases, or a non-`ACGTN` character): this assigner gives each such UMI its
+/// own molecule id (see `assign`), whereas the sequential assigner groups them by string
+/// edit distance. That case is unreachable via the CLI's validation and left as a documented
+/// divergence rather than converged here.
 pub struct ParallelEditAssigner {
     max_mismatches: u32,
     pool: rayon::ThreadPool,
@@ -408,7 +416,12 @@ impl UmiAssigner for ParallelEditAssigner {
                     id
                 })
             } else {
-                // Invalid UMI gets its own molecule ID (consistent with sequential)
+                // UMI is not `BitEnc`-encodable (length > 32 or a non-`ACGTN` base): give it
+                // its own molecule id. `N`-containing UMIs never reach here — those templates
+                // are discarded up front (`discarded_ns_in_umi`) — so this branch is
+                // unreachable via the CLI. It is the one documented divergence from the
+                // sequential edit assigner, which would group such UMIs by string edit
+                // distance (see the type doc above).
                 let id = MoleculeId::Single(next_mol_id);
                 next_mol_id += 1;
                 id
@@ -765,7 +778,7 @@ impl UmiAssigner for ParallelPairedAssigner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::umi::AdjacencyUmiAssigner;
+    use crate::umi::{AdjacencyUmiAssigner, SimpleErrorUmiAssigner};
     use fgumi_umi::assigner::DEFAULT_INDEX_THRESHOLD;
     use proptest::prelude::*;
 
@@ -1362,6 +1375,76 @@ mod tests {
         assert_ne!(parallel_result[0], parallel_result[3]);
     }
 
+    #[test]
+    fn test_edit_sequential_parallel_agree_on_mixed_case() {
+        // Regression (audit P2): the sequential edit assigner (`SimpleErrorUmiAssigner`)
+        // matched raw bytes case-sensitively, while the parallel edit assigner uppercases
+        // before encoding. Mixed-case UMIs therefore grouped differently depending on
+        // `--threads` (sequential vs parallel path). Both must fold case.
+        //
+        // fgbio baseline: `GroupReadsByUmi` uppercases every UMI before assignment
+        // (`canonicalize(rawTag.toUpperCase)`), so case-insensitive grouping is the
+        // fgbio-faithful behavior — this converges with fgbio's user-facing output.
+        let umis: Vec<String> =
+            vec!["ACGT", "acgt", "AcGt", "TTTT", "tttt"].into_iter().map(String::from).collect();
+
+        let sequential = SimpleErrorUmiAssigner::new(1);
+        let parallel = ParallelEditAssigner::new(1, 4);
+
+        let seq = sequential.assign(&umis);
+        let par = parallel.assign(&umis);
+
+        // Both must fold case: {ACGT, acgt, AcGt} in one molecule, {TTTT, tttt} in another.
+        assert_eq!(seq[0], seq[1], "sequential must fold case: ACGT == acgt");
+        assert_eq!(seq[1], seq[2], "sequential must fold case: acgt == AcGt");
+        assert_eq!(seq[3], seq[4], "sequential must fold case: TTTT == tttt");
+        assert_ne!(seq[0], seq[3], "ACGT and TTTT are 3 edits apart, separate molecules");
+
+        // And the two implementations must produce the same grouping structure.
+        assert_same_groupings(&seq, &par);
+
+        // Both must also match the programmatic fgbio baseline (uppercase, then transitive
+        // edit-distance grouping), not merely agree with each other.
+        assert_matches_fgbio_edit_baseline(&seq, &umis, 1);
+        assert_matches_fgbio_edit_baseline(&par, &umis, 1);
+    }
+
+    proptest! {
+        /// `ParallelEditAssigner` and the sequential `SimpleErrorUmiAssigner` must induce the
+        /// same partition for any UMI multiset, including mixed-case input — and that partition
+        /// must be the fgbio-faithful one. This is the generated-coverage parity guard for the
+        /// audit-P2 case-folding fix: the single hand-picked case in
+        /// `test_edit_sequential_parallel_agree_on_mixed_case` can't reach the case-collision
+        /// patterns at the tie-break / edit-boundary for random multisets, so exercise both fgumi
+        /// edit paths over random mixed-case input.
+        ///
+        /// Both paths are additionally pinned to `fgbio_edit_baseline_partition`, an independent
+        /// programmatic fgbio baseline (uppercase, then transitive edit-distance grouping). This
+        /// is stronger than cross-checking the two fgumi paths against each other: they share the
+        /// union-find grouping algorithm and could drift together, whereas the baseline is an
+        /// independent reference that reproduces fgbio's mixed-case behavior
+        /// (`canonicalize(rawTag.toUpperCase)`) without an fgbio dependency. UMIs are drawn from a
+        /// small mixed-case alphabet over a short fixed length to maximize case collisions and
+        /// 1-edit adjacency.
+        #[test]
+        fn proptest_edit_parallel_matches_sequential(
+            indices in prop::collection::vec(0usize..16, 1..40),
+        ) {
+            const POOL: [&str; 16] = [
+                "aAAA", "AAAA", "CAAA", "cAAA", "GAAA", "gAAA", "TAAA", "tAAA",
+                "AACA", "aaca", "AAGA", "aaga", "ACGT", "acgt", "TGCA", "tgca",
+            ];
+            let umis: Vec<Umi> = indices.iter().map(|&i| POOL[i].to_string()).collect();
+
+            let parallel = ParallelEditAssigner::new(1, 4).assign(&umis);
+            let sequential = SimpleErrorUmiAssigner::new(1).assign(&umis);
+
+            assert_same_partition_by_molecule(&parallel, &sequential);
+            assert_matches_fgbio_edit_baseline(&parallel, &umis, 1);
+            assert_matches_fgbio_edit_baseline(&sequential, &umis, 1);
+        }
+    }
+
     /// Helper to check if two assignment vectors produce the same groupings.
     /// Molecule IDs may differ, but the grouping structure must match.
     fn assert_same_groupings(a: &[MoleculeId], b: &[MoleculeId]) {
@@ -1439,21 +1522,97 @@ mod tests {
     /// id *values* are irrelevant — only which inputs share a molecule.
     fn assert_same_partition_by_molecule(a: &[MoleculeId], b: &[MoleculeId]) {
         assert_eq!(a.len(), b.len());
+        assert_eq!(
+            molecule_partition(a),
+            molecule_partition(b),
+            "Partitions diverge between assigners"
+        );
+    }
 
-        let partition = |ids: &[MoleculeId]| -> Vec<Vec<usize>> {
-            let mut groups: AHashMap<Option<u64>, Vec<usize>> = AHashMap::new();
-            for (i, id) in ids.iter().enumerate() {
-                groups.entry(id.id()).or_default().push(i);
+    /// Canonical partition of input indices induced by an assignment vector, keyed on the
+    /// underlying molecule id (`MoleculeId::id()`). `PairedA`/`PairedB` of the same molecule
+    /// collapse into one group. Concrete id *values* are irrelevant — only which inputs share a
+    /// molecule — so the result is directly comparable across assigners and against a reference
+    /// baseline.
+    fn molecule_partition(ids: &[MoleculeId]) -> Vec<Vec<usize>> {
+        let mut groups: AHashMap<Option<u64>, Vec<usize>> = AHashMap::new();
+        for (i, id) in ids.iter().enumerate() {
+            groups.entry(id.id()).or_default().push(i);
+        }
+        let mut sorted: Vec<Vec<usize>> = groups.into_values().collect();
+        for group in &mut sorted {
+            group.sort_unstable();
+        }
+        sorted.sort();
+        sorted
+    }
+
+    /// Programmatic fgbio-faithful baseline partition for the *edit* ("simple error") strategy.
+    ///
+    /// fgbio's `GroupReadsByUmi` uppercases every UMI before assignment
+    /// (`canonicalize(rawTag.toUpperCase)`), then its edit/`SimpleErrorUmiAssigner` strategy groups
+    /// transitively: two UMIs share a molecule when they are within `max_mismatches`, and that
+    /// relation is closed transitively (chains merge). The fgbio-faithful partition is therefore
+    /// the connected components of the graph over the *uppercased* UMIs whose edges join pairs
+    /// within `max_mismatches`.
+    ///
+    /// This is an independent reference — a dead-simple O(n^2) union-find over the pairwise
+    /// within-threshold relation, not the lock-free union-find / BFS the production assigners use —
+    /// so matching it is a genuine identity check against fgbio's documented behavior rather than a
+    /// same-algorithm-drifts-together tautology. It takes no fgbio dependency: fgbio's mixed-case
+    /// behavior is fully determined by the up-front uppercasing, which the oracle reproduces.
+    fn fgbio_edit_baseline_partition(umis: &[Umi], max_mismatches: u32) -> Vec<Vec<usize>> {
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
             }
-            let mut sorted: Vec<Vec<usize>> = groups.into_values().collect();
-            for group in &mut sorted {
-                group.sort_unstable();
-            }
-            sorted.sort();
-            sorted
+            x
+        }
+
+        let upper: Vec<String> = umis.iter().map(|umi| umi.to_ascii_uppercase()).collect();
+        let within = |a: &str, b: &str| -> bool {
+            a.len() == b.len()
+                && a.bytes().zip(b.bytes()).filter(|(x, y)| x != y).count()
+                    <= max_mismatches as usize
         };
 
-        assert_eq!(partition(a), partition(b), "Partitions diverge between assigners");
+        let mut parent: Vec<usize> = (0..upper.len()).collect();
+        for i in 0..upper.len() {
+            for j in (i + 1)..upper.len() {
+                if within(&upper[i], &upper[j]) {
+                    let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                    if ri != rj {
+                        parent[ri] = rj;
+                    }
+                }
+            }
+        }
+
+        let mut groups: AHashMap<usize, Vec<usize>> = AHashMap::new();
+        for i in 0..upper.len() {
+            let root = find(&mut parent, i);
+            groups.entry(root).or_default().push(i);
+        }
+        let mut sorted: Vec<Vec<usize>> = groups.into_values().collect();
+        for group in &mut sorted {
+            group.sort_unstable();
+        }
+        sorted.sort();
+        sorted
+    }
+
+    /// Assert an edit-assigner's output partition is identical to the programmatic fgbio baseline.
+    fn assert_matches_fgbio_edit_baseline(
+        assignments: &[MoleculeId],
+        umis: &[Umi],
+        max_mismatches: u32,
+    ) {
+        assert_eq!(
+            molecule_partition(assignments),
+            fgbio_edit_baseline_partition(umis, max_mismatches),
+            "assignment partition diverges from the programmatic fgbio edit baseline"
+        );
     }
 
     proptest! {
