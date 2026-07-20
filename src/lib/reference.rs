@@ -376,6 +376,17 @@ impl fgumi_sam::ReferenceProvider for ReferenceReader {
     ) -> anyhow::Result<Vec<u8>> {
         self.fetch(chrom, start, end)
     }
+
+    /// Returns a borrow into the in-memory sequence, avoiding the per-call `Vec`
+    /// allocation `fetch` performs.
+    fn fetch_borrowed(
+        &self,
+        chrom: &str,
+        start: noodles::core::Position,
+        end: noodles::core::Position,
+    ) -> anyhow::Result<std::borrow::Cow<'_, [u8]>> {
+        Ok(std::borrow::Cow::Borrowed(self.fetch_slice(chrom, start, end)?))
+    }
 }
 
 #[cfg(feature = "simplex")]
@@ -394,6 +405,64 @@ impl fgumi_consensus::methylation::RefBaseProvider for ReferenceReader {
 mod tests {
     use super::*;
     use crate::sam::builder::create_default_test_fasta;
+
+    /// `fetch_borrowed` must hand back a borrow, not an owned copy — that is the
+    /// entire point of the override. A `Cow::Owned` here means the default trait
+    /// implementation is being used and the per-record allocation is still happening.
+    #[test]
+    fn test_fetch_borrowed_borrows_and_matches_fetch() -> Result<()> {
+        use fgumi_sam::ReferenceProvider;
+
+        let fasta = create_default_test_fasta()?;
+        let reader = ReferenceReader::new(fasta.path())?;
+        let (start, end) = (Position::try_from(1)?, Position::try_from(4)?);
+
+        let borrowed = ReferenceProvider::fetch_borrowed(&reader, "chr1", start, end)?;
+        assert!(
+            matches!(borrowed, std::borrow::Cow::Borrowed(_)),
+            "expected a borrowed slice; an owned value means the allocation is still happening"
+        );
+
+        // Same bytes as the allocating path.
+        let owned = ReferenceProvider::fetch(&reader, "chr1", start, end)?;
+        assert_eq!(borrowed.as_ref(), owned.as_slice());
+
+        // Errors propagate identically for a missing chromosome.
+        assert!(ReferenceProvider::fetch_borrowed(&reader, "nope", start, end).is_err());
+        Ok(())
+    }
+
+    /// The production call sites (`clip.rs`, `filter.rs`) pass `&ReferenceReader`
+    /// into a `R: ReferenceProvider` generic, so they resolve through the `T: Deref`
+    /// blanket impl rather than `ReferenceReader`'s own. If that blanket stops
+    /// forwarding `fetch_borrowed`, it silently falls back to the trait default —
+    /// which returns `Cow::Owned`, reinstating the per-record allocation with no
+    /// output change and no other test failing. This pins the forwarding.
+    #[test]
+    fn test_fetch_borrowed_forwards_through_reference() -> Result<()> {
+        use fgumi_sam::ReferenceProvider;
+
+        /// Mirrors how `regenerate_alignment_tags_raw` takes its provider.
+        fn borrows_via_generic<R: ReferenceProvider>(
+            provider: R,
+            chrom: &str,
+            start: Position,
+            end: Position,
+        ) -> Result<bool> {
+            Ok(matches!(provider.fetch_borrowed(chrom, start, end)?, std::borrow::Cow::Borrowed(_)))
+        }
+
+        let fasta = create_default_test_fasta()?;
+        let reader = ReferenceReader::new(fasta.path())?;
+        let (start, end) = (Position::try_from(1)?, Position::try_from(4)?);
+
+        assert!(
+            borrows_via_generic(&reader, "chr1", start, end)?,
+            "&ReferenceReader must still borrow; an owned value means the Deref blanket \
+             impl stopped forwarding fetch_borrowed and the allocation is back"
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_fetch_subsequence() -> Result<()> {

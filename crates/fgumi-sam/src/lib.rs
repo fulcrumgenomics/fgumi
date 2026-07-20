@@ -62,6 +62,25 @@ pub trait ReferenceProvider {
         start: noodles::core::Position,
         end: noodles::core::Position,
     ) -> anyhow::Result<Vec<u8>>;
+
+    /// Borrowed-slice variant of [`Self::fetch`] — same lookup semantics, but an
+    /// implementation backed by an in-memory sequence can return a borrow instead
+    /// of allocating.
+    ///
+    /// Prefer this in per-record hot loops. The default implementation delegates to
+    /// [`Self::fetch`] and yields [`std::borrow::Cow::Owned`], so existing
+    /// implementors keep working unchanged.
+    ///
+    /// # Errors
+    /// Returns an error if the chromosome is not found or the region is out of bounds.
+    fn fetch_borrowed(
+        &self,
+        chrom: &str,
+        start: noodles::core::Position,
+        end: noodles::core::Position,
+    ) -> anyhow::Result<std::borrow::Cow<'_, [u8]>> {
+        Ok(std::borrow::Cow::Owned(self.fetch(chrom, start, end)?))
+    }
 }
 
 impl<T: std::ops::Deref> ReferenceProvider for T
@@ -75,6 +94,15 @@ where
         end: noodles::core::Position,
     ) -> anyhow::Result<Vec<u8>> {
         self.deref().fetch(chrom, start, end)
+    }
+
+    fn fetch_borrowed(
+        &self,
+        chrom: &str,
+        start: noodles::core::Position,
+        end: noodles::core::Position,
+    ) -> anyhow::Result<std::borrow::Cow<'_, [u8]>> {
+        self.deref().fetch_borrowed(chrom, start, end)
     }
 }
 
