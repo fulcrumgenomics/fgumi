@@ -1,0 +1,55 @@
+name: Nightly Stress Tests
+
+# The concurrency stress tests (`test_pipeline_concurrency::stress_tests`, behind the
+# `stress-tests` feature) exercise the BAM pipeline under adversarial thread counts,
+# tiny queues, injected failures, and deadlock detection. They are timing-sensitive,
+# so they run on a schedule (and on demand) rather than per-PR, where an occasional
+# flake would block unrelated changes. The `all-features-check` job in check.yml only
+# *compiles* the suite (via `--all-features`); no other CI job runs it, so without this
+# workflow the tests never execute.
+on:
+  schedule:
+    - cron: "0 7 * * *" # daily at 07:00 UTC
+  workflow_dispatch: {}
+
+# Read-only by default: this workflow only builds and runs tests, so it needs no
+# write access to repo contents, issues, or the token's other scopes.
+permissions:
+  contents: read
+
+# The suite is timing-sensitive, so two overlapping runs (e.g. a manual dispatch during
+# the nightly one) would contend for the same runner capacity and produce spurious
+# failures. Serialize them, and let an in-flight run finish rather than cancelling it --
+# a partial stress run reports nothing useful.
+concurrency:
+  group: nightly-stress-tests
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
+
+jobs:
+  stress-tests:
+    runs-on: ubuntu-latest
+    # The suite exercises deadlock detection and timing-sensitive concurrency, so a
+    # regression could otherwise hang until the runner's 6h hard limit. This bound is
+    # well above the normal runtime (build + ~6s of tests) but fails fast on a hang.
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Set up compilation cache (sccache)
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: Install nextest
+        uses: taiki-e/install-action@0631aa6515c7d545823c67cfae7ef4fc7f490154 # v2.81.8
+        with:
+          tool: nextest
+      - name: Concurrency stress tests
+        run: cargo ci-test-stress
