@@ -467,6 +467,24 @@ fn extract_raw_name_and_flags(bam: &[u8]) -> (&[u8], u16) {
     (name, queryname_flag_order(raw_flags))
 }
 
+/// Read-name bytes *including* the trailing NUL that BAM stores: `l_read_name`
+/// (offset 8) counts the terminator, so `bam[32..32 + l_read_name]` is already
+/// a NUL-terminated name ready for `natural_compare_nul`.
+///
+/// Returns `None` unless the slice is in bounds *and* genuinely NUL-terminated,
+/// so the caller can fall back to the stripped-name path. Both conditions
+/// matter: a truncated record would slice out of bounds, and a record whose
+/// declared `l_read_name` does not actually land on a terminator would yield a
+/// name that [`RawQuerynameKey::cmp`] reads past the end of while scanning for
+/// a NUL. The fallback re-appends the terminator unconditionally, so the
+/// null-termination invariant holds for every record, well-formed or not.
+#[inline]
+fn raw_name_with_nul(bam: &[u8]) -> Option<&[u8]> {
+    let l_read_name = bam[8] as usize;
+    (l_read_name > 0 && 32 + l_read_name <= bam.len() && bam[32 + l_read_name - 1] == 0)
+        .then(|| &bam[32..32 + l_read_name])
+}
+
 /// Serialize a queryname key as `[name_len: u16][name: bytes][flags: u16]`.
 #[inline]
 fn write_queryname_key<W: Write>(name: &[u8], flags: u16, writer: &mut W) -> std::io::Result<()> {
@@ -542,11 +560,15 @@ impl RawQuerynameKey {
     #[inline]
     #[must_use]
     fn extract_queryname_key(bam: &[u8]) -> Self {
-        let (raw_name, flags) = extract_raw_name_and_flags(bam);
-        let mut name = Vec::with_capacity(raw_name.len() + 1);
-        name.extend_from_slice(raw_name);
-        name.push(0);
-        Self { name, flags }
+        let flags = queryname_flag_order(u16::from_le_bytes([bam[14], bam[15]]));
+        match raw_name_with_nul(bam) {
+            // BAM stores the name NUL-terminated, so copy those bytes directly
+            // instead of stripping the NUL and re-appending it.
+            Some(name) => Self { name: name.to_vec(), flags },
+            // Truncated or non-terminated record: fall back to the stripped-name
+            // path (`new` re-adds the terminator), preserving the prior bytes.
+            None => Self::new(extract_raw_name_and_flags(bam).0.to_vec(), flags),
+        }
     }
 }
 
@@ -1634,5 +1656,72 @@ mod tests {
         const { assert!(RawQuerynameLexKey::EMBEDDED_IN_RECORD) };
         const { assert!(RawQuerynameKey::EMBEDDED_IN_RECORD) };
         const { assert!(RawCoordinateKey::EMBEDDED_IN_RECORD) };
+    }
+
+    // ========================================================================
+    // RawQuerynameKey::extract_queryname_key tests
+    // ========================================================================
+
+    /// Build a minimal BAM record body: the 32-byte fixed block followed by
+    /// `name_bytes`. Only `l_read_name` (offset 8) and `flag` (offsets 14-15)
+    /// affect queryname key extraction, so everything else stays zeroed.
+    ///
+    /// `l_read_name` is passed separately from `name_bytes` so a test can
+    /// declare a length that disagrees with the bytes actually present, which
+    /// is how malformed records reach the extractor.
+    fn bam_record_with_name(l_read_name: u8, name_bytes: &[u8], flags: u16) -> Vec<u8> {
+        let mut bam = vec![0u8; 32];
+        bam[8] = l_read_name;
+        bam[14..16].copy_from_slice(&flags.to_le_bytes());
+        bam.extend_from_slice(name_bytes);
+        bam
+    }
+
+    /// Independent oracle: the pre-optimization extraction, which strips the
+    /// declared terminator and re-appends one unconditionally. The fast path
+    /// reads the stored NUL directly instead, so it must agree with this byte
+    /// for byte on every input — well-formed or not.
+    fn oracle_queryname_key(bam: &[u8]) -> (Vec<u8>, u16) {
+        let (raw_name, flags) = extract_raw_name_and_flags(bam);
+        let mut name = Vec::with_capacity(raw_name.len() + 1);
+        name.extend_from_slice(raw_name);
+        name.push(0);
+        (name, flags)
+    }
+
+    #[rstest]
+    // Well-formed: `l_read_name` counts the stored NUL, so the fast path applies.
+    #[case::well_formed(6, b"readX\0", 0x0040)]
+    // Empty name: `l_read_name` of 1 means the name is the terminator alone.
+    #[case::empty_name(1, b"\0", 0x0000)]
+    // Declared length runs past the buffer, so the name bytes are truncated.
+    #[case::truncated_name(6, b"read", 0x0080)]
+    // Name bytes are present but the declared terminator byte was cut off.
+    #[case::missing_terminator_byte(6, b"readX", 0x0000)]
+    // In bounds, but the byte `l_read_name` points at is not a NUL at all.
+    #[case::not_nul_terminated(6, b"readXY", 0x0840)]
+    // Degenerate `l_read_name` of 0: no name and no terminator declared.
+    #[case::zero_declared_length(0, b"", 0x0000)]
+    fn test_extract_queryname_key_matches_oracle_and_is_nul_terminated(
+        #[case] l_read_name: u8,
+        #[case] name_bytes: &[u8],
+        #[case] flags: u16,
+    ) {
+        let bam = bam_record_with_name(l_read_name, name_bytes, flags);
+        let key = RawQuerynameKey::extract_queryname_key(&bam);
+        let (expected_name, expected_flags) = oracle_queryname_key(&bam);
+
+        assert_eq!(key.name(), expected_name, "name bytes must match the pre-optimization path");
+        assert_eq!(key.flags, expected_flags, "flag-order value must match");
+
+        // `RawQuerynameKey::cmp` hands `name.as_ptr()` to `natural_compare_nul`,
+        // which scans until it finds a NUL. A key without one reads past the
+        // end of its own allocation, so this invariant is a soundness
+        // requirement, not just a formatting detail.
+        assert_eq!(
+            key.name().last(),
+            Some(&0),
+            "extracted name must be NUL-terminated for natural_compare_nul"
+        );
     }
 }
