@@ -15,7 +15,7 @@
 //! quality encodings. Detection pools the heads of all input FASTQs (EXT3-01), matching fgbio
 //! `FastqToBam`. When no encoding matches the observed qualities, fgumi fails like fgbio's
 //! `case Nil => fail(...)` (EXT3-03) but improves on its static message by reporting the
-//! observed quality range in the error (see [`QualityEncoding::from_stats`]).
+//! observed quality range in the error (see `QualityEncoding::from_stats`).
 
 use crate::commands::command::Command;
 use crate::commands::common::{
