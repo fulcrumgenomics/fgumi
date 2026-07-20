@@ -1305,6 +1305,106 @@ fn bench_queryname_sort_strategies(c: &mut Criterion) {
     group.finish();
 }
 
+/// Coordinate-sort radix throughput across the three ways `bytes_needed` can be
+/// sized, isolating the two independent wins:
+///
+/// - `full_width` reproduces the pre-optimization behavior by passing the
+///   unmapped sentinel as the bound, forcing all 8 radix passes — which is what
+///   a sentinel-inclusive max scan yields the moment a single unmapped read is
+///   present, i.e. on essentially every real coordinate-sorted BAM.
+/// - `scan_mapped_max` scans for the largest *mapped* key, sizing the passes to
+///   the ~4–5 bytes such a key occupies. The delta against `full_width` is the
+///   pass-count win.
+/// - `tracked_max` supplies that same bound without scanning, using a value the
+///   benchmark precomputed while building the input. The delta against
+///   `scan_mapped_max` is the scan-elimination win, and it is small enough that
+///   `RecordBuffer` deliberately does not chase it: it scans once per sort
+///   rather than maintaining a running bound across pushes.
+///
+/// `sort_unstable` is a comparison-sort baseline. Note it is *unstable*, so it
+/// is not a drop-in substitute — coordinate sort order must be stable to match
+/// `samtools sort`. The input mixes 25 tids with a 5% unmapped tail to exercise
+/// the sentinel handling.
+fn bench_coordinate_radix_sort(c: &mut Criterion) {
+    use fgumi_sort::{
+        PackedCoordinateKey, RecordRef, radix_sort_record_refs, radix_sort_record_refs_with_max,
+    };
+
+    let nref = 25u32; // chr1-22, X, Y, MT
+    let mut group = c.benchmark_group("coordinate_radix_sort");
+
+    for &n in &[1_000_000usize, 8_000_000] {
+        // Deterministic xorshift so the dataset is reproducible without an RNG dep.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let mut refs: Vec<RecordRef> = Vec::with_capacity(n);
+        let mut mapped_max = 0u64;
+        for _ in 0..n {
+            let r = next();
+            let key = if r % 20 == 0 {
+                u64::MAX // ~5% unmapped (sentinel)
+            } else {
+                let tid = i32::try_from(r % u64::from(nref)).unwrap();
+                let pos = i32::try_from((r >> 16) % 250_000_000).unwrap();
+                let k = PackedCoordinateKey::new(tid, pos, false, nref).0;
+                mapped_max = mapped_max.max(k);
+                k
+            };
+            refs.push(RecordRef::new(key, 0, 0));
+        }
+
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::new("full_width", n), &refs, |b, refs| {
+            b.iter_batched(
+                || refs.clone(),
+                |mut v| {
+                    radix_sort_record_refs_with_max(&mut v, u64::MAX);
+                    black_box(v)
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        });
+        group.bench_with_input(BenchmarkId::new("scan_mapped_max", n), &refs, |b, refs| {
+            b.iter_batched(
+                || refs.clone(),
+                |mut v| {
+                    radix_sort_record_refs(&mut v);
+                    black_box(v)
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        });
+        group.bench_with_input(BenchmarkId::new("tracked_max", n), &refs, |b, refs| {
+            b.iter_batched(
+                || refs.clone(),
+                |mut v| {
+                    radix_sort_record_refs_with_max(&mut v, mapped_max);
+                    black_box(v)
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        });
+        group.bench_with_input(BenchmarkId::new("sort_unstable", n), &refs, |b, refs| {
+            b.iter_batched(
+                || refs.clone(),
+                |mut v| {
+                    v.sort_unstable_by_key(|r| r.sort_key);
+                    black_box(v)
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_phred_conversions,
@@ -1318,5 +1418,6 @@ criterion_group!(
     bench_vanilla_consensus_caller,
     bench_queryname_comparators,
     bench_queryname_sort_strategies,
+    bench_coordinate_radix_sort,
 );
 criterion_main!(benches);

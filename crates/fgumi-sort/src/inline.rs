@@ -212,6 +212,15 @@ pub struct RecordRef {
     padding: u32,
 }
 
+impl RecordRef {
+    /// Construct a `RecordRef` from its public fields (padding is internal).
+    /// Primarily for tests and benchmarks that build sort indices directly.
+    #[must_use]
+    pub fn new(sort_key: u64, offset: u64, len: u32) -> Self {
+        Self { sort_key, offset, len, padding: 0 }
+    }
+}
+
 impl PartialEq for RecordRef {
     fn eq(&self, other: &Self) -> bool {
         self.sort_key == other.sort_key
@@ -300,7 +309,7 @@ const SORT_SEGMENT_SIZE: usize = 256 * 1024 * 1024;
 /// (`HEADER_SIZE` for `RecordBuffer`, `TEMPLATE_HEADER_SIZE` for
 /// `TemplateRecordBuffer`).
 macro_rules! par_sort_into_chunks_impl {
-    ($self:expr, $threads:expr, $sort_fn:ident, $header_size:expr, $key_fn:expr) => {{
+    ($self:expr, $threads:expr, $sort_fn:expr, $header_size:expr, $key_fn:expr) => {{
         use rayon::prelude::*;
         use std::sync::Arc;
 
@@ -453,13 +462,13 @@ impl RecordBuffer {
         &mut self,
         threads: usize,
     ) -> Vec<InMemoryChunk<RawCoordinateKey>> {
-        par_sort_into_chunks_impl!(
-            self,
-            threads,
-            radix_sort_record_refs,
-            HEADER_SIZE,
-            |r: &RecordRef| RawCoordinateKey { sort_key: r.sort_key }
-        )
+        // Scan once for the whole-buffer bound and hand it to every chunk's sort,
+        // so no chunk re-scans for its own maximum.
+        let max_key = max_non_sentinel_key(&self.refs);
+        let sort_chunk = |refs: &mut [RecordRef]| radix_sort_record_refs_with_max(refs, max_key);
+        par_sort_into_chunks_impl!(self, threads, sort_chunk, HEADER_SIZE, |r: &RecordRef| {
+            RawCoordinateKey { sort_key: r.sort_key }
+        })
     }
 
     /// Drain the (already-sorted) buffer into a single in-memory chunk
@@ -1612,11 +1621,51 @@ const RADIX_THRESHOLD: usize = 256;
 /// Sorts by the `sort_key` field using 8-bit radix (256 buckets).
 /// This is O(n×k) where k is the number of bytes to sort (typically 5-8).
 ///
+/// Scans `refs` for the maximum key, then defers to
+/// [`radix_sort_record_refs_with_max`]. A caller that already holds a valid
+/// bound — such as a chunked sort that derived one for the whole slice — can
+/// call that directly to skip the scan, at the cost of upholding its
+/// precondition.
+///
+/// The scan deliberately ignores `u64::MAX` keys (the unmapped coordinate
+/// sentinel), which is what keeps `bytes_needed` at the ~5–6 bytes a mapped
+/// coordinate key occupies instead of widening to the full 8 the moment a
+/// single unmapped read appears — and coordinate-sorted BAMs essentially always
+/// carry an unmapped tail. Ignoring it needs no contract from the caller:
+/// `u64::MAX` is the largest `u64` *and* truncates to the all-`0xFF` maximum at
+/// every radix width, so it sorts after every other key and stays stable among
+/// its peers no matter how many passes run.
+///
 /// # Stability
 /// Radix sort is inherently stable - records with equal keys maintain their
 /// relative input order, matching samtools behavior.
-#[allow(clippy::uninit_vec, unsafe_code)]
 pub fn radix_sort_record_refs(refs: &mut [RecordRef]) {
+    let max_key = max_non_sentinel_key(refs);
+    radix_sort_record_refs_with_max(refs, max_key);
+}
+
+/// Largest key in `refs` that is not the unmapped sentinel (`u64::MAX`), or 0
+/// if there is no such key. See [`radix_sort_record_refs`] for why excluding
+/// the sentinel preserves the sort order.
+#[inline]
+fn max_non_sentinel_key(refs: &[RecordRef]) -> u64 {
+    refs.iter().map(|r| r.sort_key).filter(|&k| k != u64::MAX).max().unwrap_or(0)
+}
+
+/// Radix sort for `RecordRef` arrays using a precomputed maximum key, skipping
+/// the standalone max-finding scan that [`radix_sort_record_refs`] performs.
+///
+/// `max_key` sizes the number of radix byte-passes (`bytes_needed`). Each key
+/// must be **either `<= max_key` or exactly `u64::MAX`** (the unmapped
+/// coordinate sentinel). Keys `<= max_key` fit within `bytes_needed` bytes and
+/// are ordered correctly; `u64::MAX` keys truncate to all-`0xFF` under any
+/// width, so they sort *after* every other key and remain stable among
+/// themselves. This lets a coordinate sort size the passes from the maximum
+/// *mapped* key (~5–6 bytes) instead of the full 8 even when unmapped reads are
+/// present. A key strictly between `max_key` and `u64::MAX` would under-size the
+/// byte count and mis-order records — debug builds assert against this.
+#[allow(clippy::uninit_vec, unsafe_code)]
+pub fn radix_sort_record_refs_with_max(refs: &mut [RecordRef], max_key: u64) {
     let n = refs.len();
     if n < RADIX_THRESHOLD {
         // Use insertion sort for small arrays
@@ -1624,21 +1673,49 @@ pub fn radix_sort_record_refs(refs: &mut [RecordRef]) {
         return;
     }
 
-    // Find max key to determine how many bytes we need to sort
-    let max_key = refs.iter().map(|r| r.sort_key).max().unwrap_or(0);
-    let bytes_needed =
-        if max_key == 0 { 0 } else { ((64 - max_key.leading_zeros()) as usize).div_ceil(8) };
+    debug_assert!(
+        refs.iter().all(|r| r.sort_key <= max_key || r.sort_key == u64::MAX),
+        "radix_sort_record_refs_with_max: a key exceeds max_key ({max_key}) without being the \
+         unmapped sentinel (u64::MAX); bytes_needed would be too small and records would mis-sort",
+    );
 
-    if bytes_needed == 0 {
-        return; // All keys are 0, already sorted
+    // `max_key == 0` does NOT mean every key is equal: the slice may still mix
+    // zero keys with `u64::MAX` sentinels, and those must not be left in input
+    // order. (A zero key is reachable — `PackedCoordinateKey::new` packs
+    // `tid = 0, pos = -1, reverse = false` to exactly 0 — so this is not a
+    // hypothetical.) One pass separates them, since 0 scatters to bucket 0x00
+    // and the sentinel to 0xFF, and is a stable no-op when the keys really are
+    // all identical. So never skip the sort entirely.
+    let mut bytes_needed =
+        if max_key == 0 { 1 } else { ((64 - max_key.leading_zeros()) as usize).div_ceil(8) };
+
+    // A mapped `max_key` that fills all `bytes_needed` bytes (all-`0xFF`, e.g.
+    // `0xFFFF` from tid=0/pos=32766/reverse) truncates to the same value the
+    // `u64::MAX` sentinel does at that width, so the two tie across every pass
+    // and the sentinel is left in input order rather than sorting to the tail.
+    // Only the max can collide — any smaller key would need all its low bytes
+    // set, which would make it the max — so widen by one byte in exactly that
+    // case to force a pass where the sentinel (`0xFF`) and the key (`0x00`)
+    // differ. `bytes_needed` is at most 8 already (a non-sentinel key is
+    // `< u64::MAX`), and the guard only fires below 8, so it never overflows.
+    if bytes_needed < 8 && max_key == u64::MAX >> ((8 - bytes_needed) * 8) {
+        bytes_needed += 1;
     }
 
     // Allocate auxiliary buffer
     let mut aux: Vec<RecordRef> = Vec::with_capacity(n);
+    // SAFETY: `aux` is written exactly once per radix pass (the scatter loop
+    // below) before any element is read; `RecordRef` is `Copy`/`Pod`, so leaving
+    // it uninitialized until the first scatter is sound. See CLAUDE.md
+    // "Approved hot-path unsafe".
     unsafe {
         aux.set_len(n);
     }
 
+    // SAFETY: `src`/`dst` always point at the disjoint, properly-aligned
+    // `[RecordRef]` storage of `refs`/`aux` (same length `n`); each pass writes
+    // every `dst` slot exactly once (the scatter loop) before that buffer is read
+    // as `src` on the next pass. See CLAUDE.md "Approved hot-path unsafe".
     let mut src = refs as *mut [RecordRef];
     let mut dst = aux.as_mut_slice() as *mut [RecordRef];
 
@@ -1686,12 +1763,21 @@ pub fn radix_sort_record_refs(refs: &mut [RecordRef]) {
 /// Divides the array into chunks, sorts each chunk with radix sort,
 /// then performs k-way merge. This provides near-linear speedup.
 pub fn parallel_radix_sort_record_refs(refs: &mut [RecordRef]) {
+    let max_key = max_non_sentinel_key(refs);
+    parallel_radix_sort_record_refs_with_max(refs, max_key);
+}
+
+/// Parallel radix sort using a precomputed maximum key (see
+/// [`radix_sort_record_refs_with_max`] for the `max_key` contract). The same
+/// upper bound is handed to every chunk's sort, so no chunk re-scans for its
+/// own maximum.
+pub fn parallel_radix_sort_record_refs_with_max(refs: &mut [RecordRef], max_key: u64) {
     use rayon::prelude::*;
 
     let n = refs.len();
     if n < RADIX_THRESHOLD * 2 {
         // Small array - just use single-threaded radix sort
-        radix_sort_record_refs(refs);
+        radix_sort_record_refs_with_max(refs, max_key);
         return;
     }
 
@@ -1702,9 +1788,10 @@ pub fn parallel_radix_sort_record_refs(refs: &mut [RecordRef]) {
     if n_threads > 1 && n > 10_000 {
         let chunk_size = n.div_ceil(n_threads);
 
-        // Sort each chunk in parallel using radix sort
+        // Sort each chunk in parallel using radix sort. Every chunk's max key is
+        // bounded by the whole-slice `max_key`, so the shared bound is safe.
         refs.par_chunks_mut(chunk_size).for_each(|chunk| {
-            radix_sort_record_refs(chunk);
+            radix_sort_record_refs_with_max(chunk, max_key);
         });
 
         // K-way merge the sorted chunks
@@ -1721,7 +1808,7 @@ pub fn parallel_radix_sort_record_refs(refs: &mut [RecordRef]) {
         merge_sorted_chunks(refs, &chunk_boundaries);
     } else {
         // Single-threaded radix sort
-        radix_sort_record_refs(refs);
+        radix_sort_record_refs_with_max(refs, max_key);
     }
 }
 
@@ -2655,6 +2742,283 @@ mod tests {
         record
     }
 
+    #[test]
+    fn test_record_buffer_excludes_unmapped_sentinel_and_sorts_correctly() {
+        // Unmapped reads (tid < 0) carry the u64::MAX sentinel key. They must NOT
+        // inflate the bound the radix derives (which would force it to the full
+        // 8-byte width), yet must still sort to the tail. Exercise a mix above the
+        // radix threshold so the real radix path (not insertion sort) runs.
+        let nref = 5;
+        let mut buffer = RecordBuffer::with_capacity(2048, 2048 * 64, nref);
+
+        // 1500 mapped records with small keys (tid 0-3), interleaved with 500
+        // unmapped (tid = -1 -> u64::MAX). Push order is intentionally scrambled.
+        let mut expected_mapped_max = 0u64;
+        for i in 0..2000u32 {
+            if i % 4 == 3 {
+                buffer.push_coordinate(&make_coordinate_bam_record(-1, -1)).expect("push unmapped");
+            } else {
+                let tid = i32::try_from(i % 3).unwrap();
+                let pos = i32::try_from((i * 7) % 100_000).unwrap();
+                buffer.push_coordinate(&make_coordinate_bam_record(tid, pos)).expect("push mapped");
+                expected_mapped_max =
+                    expected_mapped_max.max(PackedCoordinateKey::new(tid, pos, false, nref).0);
+            }
+        }
+
+        // The derived bound excludes the sentinel: it equals the max mapped key,
+        // far below u64::MAX (so bytes_needed stays ~3-4, not 8).
+        let bound = max_non_sentinel_key(buffer.refs());
+        assert_eq!(bound, expected_mapped_max);
+        assert_ne!(bound, u64::MAX);
+        assert!(bound < (1u64 << 48), "mapped max should be well under 8 bytes");
+
+        // Sorting with the mapped-only max must still produce a fully ordered
+        // result: mapped keys ascending, all unmapped (u64::MAX) at the tail.
+        buffer.sort();
+        let keys: Vec<u64> = buffer.refs().iter().map(|r| r.sort_key).collect();
+        assert!(keys.windows(2).all(|w| w[0] <= w[1]), "result is not sorted by sort_key");
+        let unmapped = keys.iter().filter(|&&k| k == u64::MAX).count();
+        assert_eq!(unmapped, 500, "all unmapped reads should be present");
+        assert!(
+            keys[keys.len() - unmapped..].iter().all(|&k| k == u64::MAX),
+            "unmapped reads must sort to the tail",
+        );
+    }
+
+    /// `radix_sort_record_refs` and its parallel sibling scan for their own
+    /// bound, and that scan must ignore the unmapped sentinel — otherwise a
+    /// single unmapped read widens `bytes_needed` to the full 8 and the whole
+    /// optimization is lost on exactly the inputs it targets (real coordinate
+    /// BAMs, which always carry an unmapped tail). Sorting must stay correct
+    /// either way, so assert both the ordering and the narrowed width.
+    #[rstest::rstest]
+    #[case::serial(false)]
+    #[case::parallel(true)]
+    fn test_scanning_radix_entry_points_ignore_unmapped_sentinel(#[case] parallel: bool) {
+        // Well above RADIX_THRESHOLD * 2 so the real radix (and, for the
+        // parallel case, the chunk-and-merge path) runs rather than insertion sort.
+        let n = 20_000usize;
+        let mut refs: Vec<RecordRef> = Vec::with_capacity(n);
+        let mut expected_mapped_max = 0u64;
+        for i in 0..n {
+            // Every 4th record is unmapped; the rest get small, scrambled keys.
+            let key = if i % 4 == 3 {
+                u64::MAX
+            } else {
+                let k = ((i as u64 * 7919) % 100_000) + 1;
+                expected_mapped_max = expected_mapped_max.max(k);
+                k
+            };
+            refs.push(RecordRef::new(key, i as u64, 1));
+        }
+        let unmapped_count = refs.iter().filter(|r| r.sort_key == u64::MAX).count();
+
+        // The bound the entry points derive must be the mapped max, not u64::MAX.
+        assert_eq!(max_non_sentinel_key(&refs), expected_mapped_max);
+        assert!(
+            expected_mapped_max < (1u64 << 24),
+            "mapped keys should need ~3 bytes, so the sentinel-inclusive max would cost 5 extra passes",
+        );
+
+        if parallel {
+            parallel_radix_sort_record_refs(&mut refs);
+        } else {
+            radix_sort_record_refs(&mut refs);
+        }
+
+        let keys: Vec<u64> = refs.iter().map(|r| r.sort_key).collect();
+        assert!(keys.windows(2).all(|w| w[0] <= w[1]), "result is not sorted by sort_key");
+        assert_eq!(
+            keys.iter().filter(|&&k| k == u64::MAX).count(),
+            unmapped_count,
+            "no unmapped record may be lost or duplicated",
+        );
+        assert!(
+            keys[keys.len() - unmapped_count..].iter().all(|&k| k == u64::MAX),
+            "unmapped records must sort to the tail",
+        );
+    }
+
+    /// A buffer holding nothing but unmapped reads derives a bound of 0, which
+    /// drives `bytes_needed` to 0 and takes the early return. That is a real
+    /// input shape (an unmapped-only BAM), not a degenerate one, so it must come
+    /// back with every record intact rather than panicking or dropping the tail.
+    #[test]
+    fn test_radix_sort_all_unmapped_records() {
+        let n = 1_000usize; // above RADIX_THRESHOLD so the radix path is taken
+        let mut refs: Vec<RecordRef> =
+            (0..n).map(|i| RecordRef::new(u64::MAX, i as u64, 1)).collect();
+
+        assert_eq!(max_non_sentinel_key(&refs), 0, "an all-unmapped buffer has no mapped bound");
+        radix_sort_record_refs(&mut refs);
+
+        assert_eq!(refs.len(), n, "no record may be dropped");
+        assert!(refs.iter().all(|r| r.sort_key == u64::MAX), "all keys stay the sentinel");
+        // Equal keys means the sort is a no-op, so the stable order is the input
+        // order -- offsets must still read 0..n.
+        assert!(
+            refs.iter().enumerate().all(|(i, r)| r.offset == i as u64),
+            "equal keys must preserve input order",
+        );
+    }
+
+    /// A zero key mixed with unmapped sentinels is the one case where deriving
+    /// the bound from mapped keys alone yields `max_key == 0` while the keys are
+    /// *not* all equal. Skipping the sort there would leave the sentinels ahead
+    /// of the zero keys. A zero key is reachable, not hypothetical:
+    /// `PackedCoordinateKey::new` packs `tid = 0, pos = -1, reverse = false` to
+    /// exactly 0, which a malformed record can carry.
+    #[test]
+    fn test_radix_sort_zero_keys_mixed_with_unmapped_sentinel() {
+        // Confirm the packing really does produce a zero key, so this test keeps
+        // tracking the reachable case rather than a synthetic one.
+        assert_eq!(
+            PackedCoordinateKey::new(0, -1, false, 25).0,
+            0,
+            "tid=0, pos=-1 should pack to a zero key",
+        );
+
+        // Above RADIX_THRESHOLD so the radix path runs rather than insertion sort.
+        let n = 1_000usize;
+        let mut refs: Vec<RecordRef> = (0..n)
+            .map(|i| {
+                // Alternate sentinel and zero keys, sentinels first, so an
+                // unsorted result is immediately visible.
+                let key = if i % 2 == 0 { u64::MAX } else { 0 };
+                RecordRef::new(key, i as u64, 1)
+            })
+            .collect();
+
+        assert_eq!(max_non_sentinel_key(&refs), 0, "the mapped bound here really is 0");
+        radix_sort_record_refs(&mut refs);
+
+        let keys: Vec<u64> = refs.iter().map(|r| r.sort_key).collect();
+        assert!(
+            keys.windows(2).all(|w| w[0] <= w[1]),
+            "zero keys must sort ahead of the unmapped sentinels, not stay in input order",
+        );
+        assert_eq!(keys.iter().filter(|&&k| k == 0).count(), n / 2, "no zero-key record lost");
+        assert_eq!(keys.iter().filter(|&&k| k == u64::MAX).count(), n / 2, "no sentinel lost");
+    }
+
+    /// `parallel_radix_sort_record_refs` falls back to the single-threaded sort
+    /// when the slice is above the insertion-sort threshold but below the
+    /// parallel cutoff. That branch has its own call into the bounded sort, so
+    /// exercise it at a size that lands between the two.
+    #[test]
+    fn test_parallel_radix_sort_single_threaded_fallback_range() {
+        // RADIX_THRESHOLD * 2 = 512 < n < 10_000 -> parallel cutoff not met.
+        let n = 5_000usize;
+        let mut refs: Vec<RecordRef> =
+            (0..n).map(|i| RecordRef::new(((n - i) as u64) + 1, i as u64, 1)).collect();
+
+        parallel_radix_sort_record_refs(&mut refs);
+
+        let keys: Vec<u64> = refs.iter().map(|r| r.sort_key).collect();
+        assert!(keys.windows(2).all(|w| w[0] <= w[1]), "fallback path must still sort");
+        assert_eq!(keys.len(), n, "no record may be dropped");
+    }
+
+    /// Sorting with a bound derived from the mapped keys must be
+    /// indistinguishable from sorting at full 8-byte width. This is the
+    /// output-identity check behind the pass-narrowing: the sentinel's
+    /// truncation to all-`0xFF` has to leave the ordering *and* the stable
+    /// tie-break order untouched, not merely sorted-looking.
+    #[test]
+    fn test_narrowed_radix_matches_full_width_output_exactly() {
+        let n = 5_000usize;
+        let mut refs: Vec<RecordRef> = Vec::with_capacity(n);
+        for i in 0..n {
+            // Deliberate duplicate keys so stability is observable: distinct
+            // `offset` values act as the tie-break witness.
+            let key = if i % 5 == 0 { u64::MAX } else { ((i as u64 * 37) % 500) + 1 };
+            refs.push(RecordRef::new(key, i as u64, 1));
+        }
+
+        let mut narrowed = refs.clone();
+        radix_sort_record_refs(&mut narrowed);
+
+        let mut full_width = refs.clone();
+        radix_sort_record_refs_with_max(&mut full_width, u64::MAX);
+
+        let as_pairs =
+            |v: &[RecordRef]| v.iter().map(|r| (r.sort_key, r.offset)).collect::<Vec<_>>();
+        assert_eq!(
+            as_pairs(&narrowed),
+            as_pairs(&full_width),
+            "narrowing the radix width changed the output; the sentinel must sort identically \
+             at every width, including the stable order among equal keys",
+        );
+    }
+
+    /// The one mapped key that collides with the `u64::MAX` sentinel under a
+    /// narrowed radix is an all-`0xFF` key (`0xFF`, `0xFFFF`, `0xFFFFFF`, ...):
+    /// it fills every bit of `bytes_needed` bytes, so it truncates to the same
+    /// all-`0xFF` value the sentinel does at that width, and the two become
+    /// indistinguishable across every pass. Such a key is ordinary — `0xFFFF`
+    /// packs from `tid = 0, pos = 32766, reverse = true` — so a sentinel pushed
+    /// ahead of it in input order would otherwise sort ahead of a mapped read.
+    /// Placing the sentinels first makes any such mis-order visible, and the
+    /// full-8-byte sort is an independent oracle for the correct output.
+    #[rstest::rstest]
+    #[case::one_byte(0xFFu64)]
+    #[case::two_bytes(0xFFFFu64)]
+    #[case::three_bytes(0xFF_FFFFu64)]
+    fn test_narrowed_radix_separates_all_ones_key_from_sentinel(#[case] all_ones_key: u64) {
+        // `0xFFFF` is a real coordinate key: tid=0, pos=32766, reverse=true.
+        if all_ones_key == 0xFFFF {
+            assert_eq!(
+                PackedCoordinateKey::new(0, 32766, true, 25).0,
+                0xFFFF,
+                "0xFFFF must be a reachable mapped key, not a synthetic one",
+            );
+        }
+
+        // Above RADIX_THRESHOLD so the real radix path runs, not insertion sort.
+        let n = 1_000usize;
+        let refs: Vec<RecordRef> = (0..n)
+            .map(|i| {
+                // Sentinels on even indices, the all-`0xFF` mapped key on odd:
+                // every sentinel sits immediately before a colliding mapped key,
+                // so leaving them in input order is unmistakably unsorted.
+                let key = if i % 2 == 0 { u64::MAX } else { all_ones_key };
+                RecordRef::new(key, i as u64, 1)
+            })
+            .collect();
+        let sentinel_count = refs.iter().filter(|r| r.sort_key == u64::MAX).count();
+
+        // The derived bound is exactly the all-`0xFF` mapped key, which is what
+        // triggers the collision the fix guards against.
+        assert_eq!(max_non_sentinel_key(&refs), all_ones_key);
+
+        let mut narrowed = refs.clone();
+        radix_sort_record_refs(&mut narrowed);
+
+        // Full-width sort as an independent oracle.
+        let mut full_width = refs.clone();
+        radix_sort_record_refs_with_max(&mut full_width, u64::MAX);
+
+        let as_pairs =
+            |v: &[RecordRef]| v.iter().map(|r| (r.sort_key, r.offset)).collect::<Vec<_>>();
+        assert_eq!(
+            as_pairs(&narrowed),
+            as_pairs(&full_width),
+            "an all-0xFF mapped key ({all_ones_key:#x}) tied with the sentinel under the \
+             narrowed radix; the two must be separated at the same output as a full-width sort",
+        );
+
+        let keys: Vec<u64> = narrowed.iter().map(|r| r.sort_key).collect();
+        assert!(
+            keys.windows(2).all(|w| w[0] <= w[1]),
+            "result is not sorted: the all-0xFF mapped key and the sentinel were left tied",
+        );
+        assert!(
+            keys[keys.len() - sentinel_count..].iter().all(|&k| k == u64::MAX),
+            "every unmapped sentinel must sort to the tail, after the all-0xFF mapped key",
+        );
+    }
+
     /// Assert that `chunks` are each individually sorted and that the total
     /// record count across all chunks equals `expected_total`.
     fn assert_chunks_sorted_and_complete<K: RawSortKey + Default + Ord + 'static>(
@@ -2760,6 +3124,55 @@ mod tests {
             );
         }
         assert_chunks_sorted_and_complete(&chunks, n);
+    }
+
+    /// `par_sort_into_chunks` derives one bound for the whole buffer and shares
+    /// it across every chunk, so the sentinel exclusion has to hold there too:
+    /// each chunk must come back sorted and no unmapped record may be lost, on
+    /// both the single-threaded early-return path and the multi-threaded path
+    /// (which drain `refs` through different branches of the macro).
+    #[rstest::rstest]
+    #[case::single_threaded(100, 1)]
+    #[case::parallel(10_500, 4)]
+    fn test_par_sort_into_chunks_handles_unmapped_sentinel(
+        #[case] n: usize,
+        #[case] threads: usize,
+    ) {
+        let nref = 10u32;
+        let mut buffer = RecordBuffer::with_capacity(n, n * 50, nref);
+        let mut expected_unmapped = 0usize;
+        for i in 0..n {
+            // Every 4th record unmapped, so the shared bound must exclude the
+            // sentinel or the chunks would all sort at full width.
+            if i % 4 == 3 {
+                buffer
+                    .push_coordinate(&make_coordinate_bam_record(-1, -1))
+                    .expect("push_coordinate should succeed in tests");
+                expected_unmapped += 1;
+            } else {
+                let pos = i32::try_from(n - i).expect("test n fits in i32");
+                buffer
+                    .push_coordinate(&make_coordinate_bam_record(0, pos))
+                    .expect("push_coordinate should succeed in tests");
+            }
+        }
+
+        let chunks = if threads > 1 {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("failed to build rayon thread pool");
+            pool.install(|| buffer.par_sort_into_chunks(threads))
+        } else {
+            buffer.par_sort_into_chunks(threads)
+        };
+
+        assert_chunks_sorted_and_complete(&chunks, n);
+        let unmapped: usize = chunks
+            .iter()
+            .map(|c| (0..c.len()).filter(|&i| c.key_at(i).sort_key == u64::MAX).count())
+            .sum();
+        assert_eq!(unmapped, expected_unmapped, "no unmapped record may be lost across chunks");
     }
 
     /// Helper: build a `SegmentedBuf` containing the given byte chunks
