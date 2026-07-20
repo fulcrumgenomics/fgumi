@@ -44,8 +44,9 @@ use rstest::rstest;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{
-    create_both_unmapped_pair, create_minimal_header, create_paired_umi_family,
-    create_paired_umi_family_at, create_umi_family, create_umi_family_at, to_record_buf,
+    create_both_unmapped_pair, create_codec_fr_overlap_family_at, create_minimal_header,
+    create_paired_umi_family, create_paired_umi_family_at, create_umi_family, create_umi_family_at,
+    to_record_buf,
 };
 use crate::helpers::cli_runner::{
     ParityArgs, Stage, fgumi, fgumi_binary, run_runall, run_runall_consensus_to_filter,
@@ -241,19 +242,24 @@ fn unsorted_codec_fixture(dir: &Path) -> PathBuf {
     let header = create_minimal_header("chr1", 10000);
     let mut writer = bam::io::Writer::new(fs::File::create(&path).expect("create fixture BAM"));
     writer.write_header(&header).expect("write fixture header");
-    // 4 paired-end families × 4 read-pairs. Each pair shares one
-    // single-strand UMI in the RX tag; CODEC pairs the two strands at
-    // consensus time, not at grouping time. `--strategy adjacency`
-    // (not `paired`) is the documented grouping for CODEC.
+    // 4 CODEC-formable FR-overlap families, one per distinct reference
+    // position (99, 999, 1999, 2999 — all inside the 10000bp `chr1`).
+    // Each family is 3 read-pairs sharing one single-strand UMI in RX,
+    // built with the FR-overlap flag shape (R1 `PAIRED|FIRST|MATE_REVERSE`,
+    // R2 `PAIRED|LAST|REVERSE`, both mates at the SAME position) that CODEC
+    // consensus requires. R1/R2 sequences match so the overlap is clean.
+    // `--strategy adjacency` (not `paired`) is the documented grouping for
+    // CODEC. Contrast `create_paired_umi_family` (100bp gap, no strand
+    // flags), which CODEC rejects → 0 consensus.
     let families = [
-        ("ACGTACGT", "fam_a", "ACGTACGT", "TTTTAAAA"),
-        ("TGCATGCA", "fam_b", "TGCATGCA", "CCCCGGGG"),
-        ("CCAATTGG", "fam_c", "CCAATTGG", "GGTTAACC"),
-        ("GGTTAACC", "fam_d", "GGTTAACC", "CCAATTGG"),
+        ("ACGTACGT", "fam_a", "ACGTACGT", "ACGTACGT", 99),
+        ("TGCATGCA", "fam_b", "TGCATGCA", "TGCATGCA", 999),
+        ("CCAATTGG", "fam_c", "CCAATTGG", "CCAATTGG", 1999),
+        ("GGTTAACC", "fam_d", "GGTTAACC", "GGTTAACC", 2999),
     ];
     let mut all_records = Vec::new();
-    for (umi, name, r1_seq, r2_seq) in families {
-        for r in create_paired_umi_family(umi, 4, name, r1_seq, r2_seq, 30) {
+    for (umi, name, r1_seq, r2_seq, pos) in families {
+        for r in create_codec_fr_overlap_family_at(umi, 3, name, r1_seq, r2_seq, 30, pos) {
             all_records.push(r);
         }
     }
@@ -400,18 +406,17 @@ fn parity_a_duplex_to_duplex() {
 }
 
 /// `Codec → Codec` parity vs standalone `fgumi codec`. Runs through the
-/// consensus-only delegation fast path. Uses `grouped_codec_fixture`
-/// (paired-end, single-UMI, grouped with `--strategy adjacency`).
+/// consensus-only delegation fast path. Uses `grouped_codec_fixture`, whose
+/// families now carry the **FR-overlap flag shape** CODEC requires (R1
+/// `PAIRED|FIRST|MATE_REVERSE` / R2 `PAIRED|LAST|REVERSE`, both mates at the
+/// same position, depth 3, `--strategy adjacency`, `--min-reads 1`), so the
+/// CODEC caller forms one duplex consensus per family (RUN3-02).
 ///
-/// NOTE (S9a-001): this fixture lacks the FR-overlap flag shape CODEC
-/// consensus requires (R1 `PAIRED|FIRST|MATE_REVERSE` / R2 `PAIRED|LAST|REVERSE`
-/// at the same position), so every pair is rejected and BOTH the fused and
-/// standalone paths emit **0 consensus records**. The parity therefore holds
-/// only because both sides are empty. The explicit `== 0` assertion below makes
-/// that deliberate zero VISIBLE: if a future change gives the codec fixture
-/// FR-overlap flags (making it non-empty), this test fails loudly and forces an
-/// upgrade to a real non-empty parity check (the `zipper_*_codec` smoke tests
-/// already cover the non-empty FR-overlap shape via `zipper_codec_fixture`).
+/// This pins a real, ≥1-record fused-vs-standalone CODEC parity floor: the
+/// fused and standalone paths must emit the SAME non-empty consensus record
+/// stream (plus matching `@HD`/`@SQ`/`@RG`). It replaces the former vacuous
+/// `0 == 0` check, which passed only because the codec fixture lacked the
+/// FR-overlap shape and both sides were empty.
 #[cfg(feature = "consensus")]
 #[test]
 fn parity_a_codec_to_codec() {
@@ -427,15 +432,8 @@ fn parity_a_codec_to_codec() {
     let r = run_standalone(Stage::Codec, &fixture, &standalone_out, &args);
     assert!(r.status.success(), "standalone: {}", String::from_utf8_lossy(&r.stderr));
 
-    assert_bams_record_equivalent(&runall_out, &standalone_out);
-    // Header parity matters most in this empty-stream case: a wrong fused
-    // @HD/@SQ/@RG would otherwise stay green behind the zero-record assertion.
+    assert_bams_record_equivalent_nonempty(&runall_out, &standalone_out);
     assert_bam_headers_equivalent_ignoring_pg(&runall_out, &standalone_out);
-    assert_eq!(
-        read_bam_records(&runall_out).len(),
-        0,
-        "codec fixture lacks the FR-overlap shape → 0 consensus by design (S9a-001)"
-    );
 }
 
 // ────────────────────────── Class B — multi-stage parity ──────────────────────────
@@ -535,9 +533,11 @@ fn parity_b_sort_to_duplex() {
 }
 
 /// `Sort → Codec` parity vs staged `fgumi sort | fgumi group | fgumi codec`.
-/// Uses the codec fixture family (paired-end, single-strand UMI,
-/// `--strategy adjacency`) so the consensus stage actually exercises
-/// CODEC's duplex logic.
+/// Uses the FR-overlap codec fixture family (paired-end, single-strand UMI,
+/// R1 `PAIRED|FIRST|MATE_REVERSE` / R2 `PAIRED|LAST|REVERSE` at the same
+/// position, `--strategy adjacency`, `--min-reads 1`) so the consensus stage
+/// actually exercises CODEC's duplex logic and yields ≥1 consensus per family.
+/// Pins a real, non-empty fused-vs-staged CODEC parity floor (RUN3-02).
 #[cfg(feature = "consensus")]
 #[test]
 fn parity_b_sort_to_codec() {
@@ -559,14 +559,11 @@ fn parity_b_sort_to_codec() {
     );
     assert!(r.status.success(), "staged: {}", String::from_utf8_lossy(&r.stderr));
 
-    assert_bams_record_equivalent(&runall_out, &staged_out);
-    // S9a-005: header parity holds even for the zero-record codec branch (both
-    // sides still emit @HD/@SQ/@RG) — assert it before the zero-count pin below.
+    // RUN3-02: the FR-overlap codec fixture forms ≥1 consensus, so the fused
+    // and staged paths must emit the SAME non-empty record stream.
+    assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
+    // S9a-005: also pin @HD/@SQ/@RG parity across the fused-vs-staged paths.
     assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
-    // S9a-001: the codec fixture lacks the FR-overlap shape → 0 consensus by
-    // design; pin the deliberate zero so a future non-empty fixture forces a
-    // real parity check.
-    assert_eq!(read_bam_records(&runall_out).len(), 0, "codec fixture → 0 consensus by design");
 }
 
 /// `Group → Simplex` parity vs staged `fgumi group | fgumi simplex`.
@@ -808,8 +805,9 @@ fn new_002_group_to_duplex_allow_unmapped_parity() {
 }
 
 /// `Group → Codec` parity vs staged `fgumi group | fgumi codec`.
-/// Uses the codec fixture family; see [`parity_b_sort_to_codec`] for
-/// the rationale.
+/// Uses the FR-overlap codec fixture family; see [`parity_b_sort_to_codec`]
+/// for the rationale. Pins a real, non-empty fused-vs-staged CODEC parity
+/// floor (RUN3-02).
 #[cfg(feature = "consensus")]
 #[test]
 fn parity_b_group_to_codec() {
@@ -826,11 +824,11 @@ fn parity_b_group_to_codec() {
         run_staged_chain(&[Stage::Group, Stage::Codec], &fixture, &staged_out, tmp.path(), &args);
     assert!(r.status.success(), "staged: {}", String::from_utf8_lossy(&r.stderr));
 
-    assert_bams_record_equivalent(&runall_out, &staged_out);
-    // S9a-005: header parity holds even for the zero-record codec branch.
+    // RUN3-02: the FR-overlap codec fixture forms ≥1 consensus, so the fused
+    // and staged paths must emit the SAME non-empty record stream.
+    assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
+    // S9a-005: also pin @HD/@SQ/@RG parity across the fused-vs-staged paths.
     assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
-    // S9a-001: codec fixture lacks FR-overlap → 0 consensus by design.
-    assert_eq!(read_bam_records(&runall_out).len(), 0, "codec fixture → 0 consensus by design");
 }
 
 // ──────────────── Fused consensus → filter parity (issue #330 option a) ────────────────
@@ -911,6 +909,9 @@ fn parity_group_to_duplex_to_filter() {
 }
 
 /// `Group → Codec → Filter` (fused) vs staged consensus BAM + `fgumi filter`.
+/// Uses the FR-overlap codec fixture, so the fused consensus→filter stream is
+/// non-empty and pins a real, ≥1-record fused-vs-staged CODEC→filter parity
+/// floor (RUN3-02).
 #[cfg(feature = "consensus")]
 #[test]
 fn parity_group_to_codec_to_filter() {
@@ -929,11 +930,12 @@ fn parity_group_to_codec_to_filter() {
     let r = run_standalone_filter(&consensus_bam, &staged_out, &args);
     assert!(r.status.success(), "staged filter: {}", String::from_utf8_lossy(&r.stderr));
 
-    assert_bams_record_equivalent(&fused_out, &staged_out);
-    // S9a-005: header parity holds even for the zero-record codec→filter branch.
+    // RUN3-02: the FR-overlap codec fixture forms ≥1 consensus that survives
+    // `filter --min-reads 1`, so the fused consensus→filter stream is non-empty
+    // and must equal the staged consensus + standalone-filter chain.
+    assert_bams_record_equivalent_nonempty(&fused_out, &staged_out);
+    // S9a-005: also pin @HD/@SQ/@RG parity across the fused-vs-staged paths.
     assert_bam_headers_equivalent_ignoring_pg(&fused_out, &staged_out);
-    // S9a-001: codec fixture → 0 consensus → 0 after filter, by design.
-    assert_eq!(read_bam_records(&fused_out).len(), 0, "codec fixture → 0 consensus by design");
 }
 
 // ───────────────────── Run-to-run / thread-count determinism ─────────────────────
@@ -1777,11 +1779,10 @@ fn zipper_duplex_fixture(dir: &StdPath) -> ZipperInputs {
 /// `PAIRED | FIRST_SEGMENT | MATE_REVERSE`, R2 `PAIRED |
 /// LAST_SEGMENT | REVERSE`, both at the SAME position), NOT by
 /// paired-UMI grouping. Without those flags, CODEC consensus
-/// rejects every pair and emits 0 records — which is what
-/// `parity_b_sort_to_codec`'s `unsorted_codec_fixture` actually
-/// does in practice (the existing test passes only because both
-/// fused and staged produce 0 records, so they're trivially
-/// equivalent).
+/// rejects every pair and emits 0 records. `parity_b_sort_to_codec`'s
+/// `unsorted_codec_fixture` now shares this same FR-overlap recipe (via
+/// `create_codec_fr_overlap_family_at`, RUN3-02), so both fixtures yield
+/// non-empty CODEC output.
 ///
 /// This fixture mirrors the `create_codec_read_pair` helper from
 /// `tests/integration/test_codec_command.rs`, which IS known to
