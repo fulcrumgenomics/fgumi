@@ -313,6 +313,63 @@ fn test_extract_plain_async_reader_multithreaded() {
     assert_bam_records_equal(&baseline, &async_out);
 }
 
+/// Regression test for a pipeline deadlock on the multithreaded plain/gzip FASTQ
+/// extract path.
+///
+/// The read step (`fastq_try_step_read`, `StreamReader::Decompressed` branch)
+/// used to publish `read_done` *before* incrementing `batches_read` for the
+/// final at-EOF batch. Because the pair step completes when
+/// `read_done && chunks_paired == batches_read`, a concurrent worker could
+/// observe that predicate as satisfied while the final batch was still in
+/// flight, set `boundaries_done`, and orphan the batch in `q1_decompressed` —
+/// which trips the deadlock detector. It reproduced roughly 1 in a few hundred
+/// runs under CPU contention (never on the BGZF/BAM paths, which only set
+/// `read_done` on a zero-batch read).
+///
+/// This drives many multithreaded runs with a short `--deadlock-timeout` so any
+/// regression surfaces in seconds rather than hanging for the 10s default. The
+/// plain path exercises the same code as the gzip path. Post-fix every run
+/// completes and writes all six records.
+#[test]
+fn test_extract_multithreaded_no_deadlock_regression() {
+    let tmp = TempDir::new().unwrap();
+    let (r1_recs, r2_recs) = paired_end_records();
+    let r1 = create_plain_fastq(&tmp, "r1.fq", &r1_recs);
+    let r2 = create_plain_fastq(&tmp, "r2.fq", &r2_recs);
+
+    for i in 0..40 {
+        let output = tmp.path().join(format!("out_{i}.bam"));
+        let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+            .args([
+                "extract",
+                "--inputs",
+                r1.to_str().unwrap(),
+                r2.to_str().unwrap(),
+                "--output",
+                output.to_str().unwrap(),
+                "--read-structures",
+                "5M+T",
+                "5M+T",
+                "--sample",
+                "test_sample",
+                "--library",
+                "test_library",
+                "--compression-level",
+                "1",
+                "--threads",
+                "8",
+                "--async-reader",
+                "--deadlock-timeout",
+                "3",
+            ])
+            .status()
+            .expect("Failed to execute extract command");
+        assert!(status.success(), "extract deadlocked or failed on iteration {i}");
+        let records = read_bam_records(&output);
+        assert_eq!(records.len(), 6, "iteration {i}: expected 6 records, got {}", records.len());
+    }
+}
+
 // ============================================================================
 // BAM commands: group (file input, with and without --threads)
 // ============================================================================
