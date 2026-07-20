@@ -224,6 +224,71 @@ fn chain_build_group_to_simplex() {
     build_for(spec).expect("build_for([Group, Simplex]) should succeed");
 }
 
+/// V5 (audit): `runall` builds the chain via `build_for` and never calls
+/// `Simplex::execute`, so the `--min-reads` / `--max-reads` range check the
+/// standalone command enforces must be re-applied in `add_simplex`. This pins
+/// the parity contract: `build_for` must *accept* exactly the read-bound
+/// configurations the standalone `fgumi simplex` command accepts and *reject*
+/// exactly the degenerate ones it rejects.
+///
+/// The `expected` column is an explicit expected-validity oracle, authored
+/// independently of the validator rather than derived from it: `None` means the
+/// configuration is valid and the chain must build; `Some(msg)` means it is
+/// degenerate and `build_for` must reject it with an error containing `msg`.
+/// Exercising both the accept and reject decisions — not just echoing the
+/// validator's own error text — means a shared regression cannot make the test
+/// pass: a validator gutted to accept everything breaks the `Some(..)` cases,
+/// and one that rejects everything breaks the `None` cases.
+#[cfg(feature = "consensus")]
+#[rstest::rstest]
+#[case::default_bounds(1, None, None)]
+#[case::min_one_max_one(1, Some(1), None)]
+#[case::min_two_max_five(2, Some(5), None)]
+#[case::min_reads_zero(0, None, Some("--min-reads must be >= 1"))]
+#[case::max_below_min(5, Some(2), Some("--max-reads (2) must be >= --min-reads (5)"))]
+fn chain_build_simplex_enforces_read_bounds(
+    #[case] min_reads: usize,
+    #[case] max_reads: Option<usize>,
+    #[case] expected: Option<&str>,
+) {
+    use fgumi_lib::assigner::Strategy;
+    use fgumi_lib::commands::simplex::SimplexOptions;
+
+    let tmp = TempDir::new().unwrap();
+    let input = write_input_bam(tmp.path());
+
+    let build = || {
+        let simplex = SimplexOptions { min_reads, max_reads, ..SimplexOptions::default() };
+        let bag = StageOptionsBag {
+            group: Some(group_opts(Strategy::Adjacency)),
+            simplex: Some(simplex),
+            ..Default::default()
+        };
+        build_for(spec_for(vec![Stage::Group, Stage::Simplex], &input, bag))
+    };
+
+    match expected {
+        None => {
+            build().unwrap_or_else(|err| {
+                panic!(
+                    "build_for([Group, Simplex]) with min_reads={min_reads} max_reads={max_reads:?} must be accepted, got: {err}"
+                )
+            });
+        }
+        Some(msg) => {
+            let Err(err) = build() else {
+                panic!(
+                    "build_for([Group, Simplex]) with min_reads={min_reads} max_reads={max_reads:?} must be rejected"
+                );
+            };
+            assert!(
+                err.to_string().contains(msg),
+                "expected simplex read-bounds error containing {msg:?}, got: {err}"
+            );
+        }
+    }
+}
+
 /// `[Group, Duplex]` — duplex requires the `Paired` grouping strategy (MIs
 /// carry `/A`/`/B` suffixes), enforced by the cross-stage validator. Pins
 /// the Group→Duplex hand-off under that constraint.

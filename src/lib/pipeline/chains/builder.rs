@@ -3059,6 +3059,13 @@ impl<'a> ChainBuilder<'a> {
             bail!("--ref requires --methylation-mode to be set");
         }
 
+        // V5 fix: runall never calls Simplex::execute, so mirror its
+        // --min-reads / --max-reads range check here. Without this, runall
+        // silently accepts degenerate configs (`--simplex::min-reads 0`,
+        // `--simplex::max-reads < --simplex::min-reads`) the standalone command
+        // rejects, breaking the "same as standalone" contract.
+        simplex.validate_read_bounds()?;
+
         let tail = self.current_tail.expect("add_simplex called before add_source");
 
         // Resolve source path for log messages only.
