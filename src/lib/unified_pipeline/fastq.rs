@@ -2950,7 +2950,17 @@ fn fastq_try_step_find_boundaries<R: BufRead + Send, P: Send + MemoryEstimate>(
     }
 
     // Completion: all chunks paired and all batches emitted.
-    if all_arrived && pair.is_empty() {
+    //
+    // The `q1_decompressed.is_empty()` guard is defense-in-depth: the drain loop
+    // above already empties `q1_decompressed` under `pair_state`, and the
+    // `read_done && chunks_paired == batches_read` counter relation in `all_arrived`
+    // is what guarantees no chunk is still upstream (in Q1, held, or Q2). But the
+    // sibling `parse_done` check also requires its input queue (`q2_5_boundaries`)
+    // to be empty, and matching that here means a future counter-accounting change
+    // can never let this stage declare itself done while a chunk sits in its input
+    // queue — which would orphan that chunk and deadlock the pipeline. The check is
+    // effectively free (the queue is already empty whenever `all_arrived` holds).
+    if all_arrived && pair.is_empty() && state.q1_decompressed.is_empty() {
         state.boundaries_done.store(true, Ordering::Release);
     }
 
