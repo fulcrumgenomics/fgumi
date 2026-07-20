@@ -128,6 +128,36 @@ fn count_records(bam_path: &Path) -> u64 {
         .expect("samtools view -c output should be a valid integer")
 }
 
+/// Collect a sorted multiset of per-record identities (`QNAME`, `FLAG`, `RNAME`, `POS`).
+///
+/// Sorting reorders records, so identity has to be compared order-independently.
+/// A record count alone cannot distinguish "all records present" from "one record
+/// dropped and another duplicated" — which is exactly the failure mode the sort
+/// engine's spill/merge paths can produce under memory pressure. `RNAME` and `POS`
+/// are included so a record whose alignment was corrupted in the spill/merge round
+/// trip is caught too, not just one that vanished; fields beyond `POS` (`SEQ`,
+/// `QUAL`, tags) are not compared.
+fn record_identities(bam_path: &Path) -> Vec<String> {
+    let output = Command::new("samtools")
+        .args(["view", bam_path.to_str().unwrap()])
+        .output()
+        .expect("samtools view");
+    assert!(output.status.success(), "samtools view failed for {}", bam_path.display());
+    let mut identities: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| {
+            let mut fields = line.split('\t');
+            let qname = fields.next().unwrap_or_default();
+            let flag = fields.next().unwrap_or_default();
+            let rname = fields.next().unwrap_or_default();
+            let pos = fields.next().unwrap_or_default();
+            format!("{qname}\t{flag}\t{rname}\t{pos}")
+        })
+        .collect();
+    identities.sort_unstable();
+    identities
+}
+
 /// Sort a BAM file with fgumi and return the output path.
 fn sort_bam(input: &Path, output: &Path, order: &str, threads: usize, max_memory: &str) {
     sort_bam_with_args(input, output, order, threads, max_memory, &[]);
@@ -389,5 +419,55 @@ fn test_sort_coordinate_consistent_across_threads() {
     let input_count = count_records(&input);
     for output in &outputs {
         assert_eq!(input_count, count_records(output), "count mismatch for {}", output.display());
+    }
+}
+
+/// Phase-1 input-serial reservation must not drop a worker's trailing blocks.
+///
+/// `try_read_input_blocks` reserves its batch's serial range while holding the
+/// input-file lock. If serials were instead assigned after releasing the lock, a
+/// worker preempted in that window would leave its already-read blocks
+/// unaccounted for in `input_read_serial` while another worker read the empty EOF
+/// batch and set `input_eof`; the done-check would fire early and those blocks
+/// would be pushed after the merge finalized — a short output BAM with exit 0.
+///
+/// The race is timing-dependent, so this is a stress guard rather than a
+/// deterministic reproducer: many input blocks and a high worker count maximize
+/// contention on the input lock, and any lost block shows up as a count mismatch.
+#[test]
+#[ignore = "requires samtools"]
+fn test_sort_multithreaded_does_not_truncate_output() {
+    if !samtools_available() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    // Enough reads to span many BGZF input blocks, so multiple workers contend
+    // on the input-file lock rather than one worker draining the whole file.
+    let input = create_test_bam(dir.path(), 50_000);
+    let input_count = count_records(&input);
+    // Independent oracle: the exact multiset of records that must survive the sort.
+    // Count alone would pass a regression that dropped one record and duplicated
+    // another.
+    let input_identities = record_identities(&input);
+
+    for iteration in 0..3 {
+        let output = dir.path().join(format!("sorted_stress_{iteration}.bam"));
+        // Small memory forces spills; 8 threads maximizes lock contention.
+        sort_bam(&input, &output, "coordinate", 8, "1M");
+
+        assert_eq!(
+            input_count,
+            count_records(&output),
+            "sorted output lost records on iteration {iteration} — Phase-1 serial \
+             reservation regression (silent truncation)"
+        );
+        assert_eq!(
+            input_identities,
+            record_identities(&output),
+            "sorted output is not the same multiset of records as the input on \
+             iteration {iteration} (records dropped, duplicated, or their \
+             QNAME/FLAG/RNAME/POS altered)"
+        );
+        assert!(verify_sorted(&output, "coordinate"), "iteration {iteration} not sorted");
     }
 }

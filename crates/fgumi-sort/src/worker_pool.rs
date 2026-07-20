@@ -696,6 +696,13 @@ pub(crate) struct SharedPipelineState {
     /// this only increments when a block reaches the queue. `decompressed_input_done`
     /// is set only when this equals `input_read_serial`, preventing the race where a
     /// worker with a held (not-yet-queued) block causes premature EOF signalling.
+    ///
+    /// This comparison is only sound because `try_read_input_blocks` reserves a
+    /// batch's whole serial range from `input_read_serial` *while still holding the
+    /// input-file lock*. Reserving after releasing the lock would let a worker's
+    /// already-read blocks go unaccounted for while a sibling reads the EOF batch and
+    /// sets `input_eof`, so the two counters could compare equal with reads still in
+    /// flight and the merge would finalize early.
     input_blocks_queued: AtomicU64,
 
     // --- Phase 2 per-file state (work-stealing) ---
@@ -1365,27 +1372,34 @@ impl SortWorkerPool {
             return StepResult::InputEmpty;
         }
 
+        // Reserve this batch's serial range while STILL HOLDING the input lock.
+        //
+        // Assigning serials after releasing the lock is racy: a worker preempted
+        // between `drop(guard)` and the per-block `fetch_add` leaves its already-read
+        // blocks unaccounted for in `input_read_serial`, while another worker acquires
+        // the lock, reads the empty EOF batch, and sets `input_eof`. The done-check
+        // (`input_blocks_queued == input_read_serial && input_eof`) then fires early,
+        // the merge finalizes, and this worker's trailing blocks are pushed after
+        // termination — silently truncating the sorted output. Reserving under the lock
+        // guarantees `input_read_serial` accounts for every block that has been read
+        // before `input_eof` can be observed as set.
+        // `AcqRel` rather than `Relaxed`, matching the other coordination counters
+        // (`input_blocks_queued`, `sources_at_eof`, `decomp_in_flight`): it makes the
+        // reservation's visibility explicit at this site instead of resting on an implicit
+        // happens-before chain through the input-file mutex, which a future refactor of the
+        // locking or EOF signalling could break with no local signal here.
+        let batch_len = blocks.len() as u64;
+        let base_serial = shared.input_read_serial.fetch_add(batch_len, Ordering::AcqRel);
+
         // Drop the lock before pushing to queue
         drop(guard);
 
-        // Assign serial numbers and push to raw_input_blocks ArrayQueue.
-        // Once the queue is full, hold this block and all remaining blocks.
-        let mut blocks_iter = blocks.into_iter();
-        for block in blocks_iter.by_ref() {
-            let serial = shared.input_read_serial.fetch_add(1, Ordering::Relaxed);
-            match shared.raw_input_blocks.push((serial, block)) {
-                Ok(()) => {}
-                Err((serial, block)) => {
-                    worker.held_raw_input_blocks.push((serial, block));
-                    break;
-                }
-            }
-        }
-        // Hold any remaining blocks we didn't attempt to push
-        for block in blocks_iter {
-            let serial = shared.input_read_serial.fetch_add(1, Ordering::Relaxed);
-            worker.held_raw_input_blocks.push((serial, block));
-        }
+        dispatch_reserved_blocks(
+            base_serial,
+            blocks,
+            &shared.raw_input_blocks,
+            &mut worker.held_raw_input_blocks,
+        );
 
         StepResult::Success
     }
@@ -2046,6 +2060,41 @@ impl Drop for SortWorkerPool {
     }
 }
 
+/// Push a batch of already-serial-reserved blocks to the shared input queue,
+/// holding any the queue cannot accept.
+///
+/// Serials are pre-reserved under the input-file lock by `try_read_input_blocks`
+/// (see `SharedPipelineState::input_blocks_queued`), so this assigns them
+/// sequentially from `base_serial`. Every block is accounted for: it is either
+/// queued or moved to `held`. Once the queue rejects a push, this block and all
+/// remaining ones are held, preserving serial order within the batch.
+fn dispatch_reserved_blocks(
+    base_serial: u64,
+    blocks: Vec<RawBgzfBlock>,
+    queue: &ArrayQueue<(u64, RawBgzfBlock)>,
+    held: &mut Vec<(u64, RawBgzfBlock)>,
+) {
+    let mut next_serial = base_serial;
+    let mut blocks_iter = blocks.into_iter();
+    for block in blocks_iter.by_ref() {
+        let serial = next_serial;
+        next_serial += 1;
+        match queue.push((serial, block)) {
+            Ok(()) => {}
+            Err((serial, block)) => {
+                held.push((serial, block));
+                break;
+            }
+        }
+    }
+    // Hold any remaining blocks we didn't attempt to push.
+    for block in blocks_iter {
+        let serial = next_serial;
+        next_serial += 1;
+        held.push((serial, block));
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -2053,6 +2102,50 @@ impl Drop for SortWorkerPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build `n` distinguishable placeholder blocks.
+    fn dummy_blocks(n: usize) -> Vec<RawBgzfBlock> {
+        (0..n).map(|i| RawBgzfBlock { data: vec![u8::try_from(i % 256).unwrap()] }).collect()
+    }
+
+    /// Every reserved serial must be accounted for exactly once, whether the block
+    /// lands in the queue or is held — a serial that is reserved but never attached
+    /// to a block would leave `input_read_serial` permanently ahead of
+    /// `input_blocks_queued` and stall the done-check. When the queue fills
+    /// mid-batch, the rejected block and every block after it are held in ascending
+    /// serial order.
+    #[rstest]
+    // Queue has room for the whole batch: everything is queued, nothing held.
+    #[case::all_fit(8, 100, 5, vec![100, 101, 102, 103, 104], vec![])]
+    // Queue fills after two blocks: the third is rejected and the 4th/5th follow it.
+    #[case::queue_fills_mid_batch(2, 10, 5, vec![10, 11], vec![12, 13, 14])]
+    // An empty batch must not consume serials or touch the queue.
+    #[case::empty_batch(4, 7, 0, vec![], vec![])]
+    fn test_dispatch_reserved_blocks_accounts_for_every_serial(
+        #[case] capacity: usize,
+        #[case] base_serial: u64,
+        #[case] num_blocks: usize,
+        #[case] expected_queued: Vec<u64>,
+        #[case] expected_held: Vec<u64>,
+    ) {
+        let queue: ArrayQueue<(u64, RawBgzfBlock)> = ArrayQueue::new(capacity);
+        let mut held = Vec::new();
+
+        dispatch_reserved_blocks(base_serial, dummy_blocks(num_blocks), &queue, &mut held);
+
+        let mut queued: Vec<u64> = std::iter::from_fn(|| queue.pop()).map(|(s, _)| s).collect();
+        let held_serials: Vec<u64> = held.iter().map(|(s, _)| *s).collect();
+
+        queued.sort_unstable();
+        assert_eq!(queued, expected_queued, "queued serials");
+        assert_eq!(held_serials, expected_held, "held blocks keep ascending serial order");
+
+        // The union must be exactly the reserved range — no gaps, no duplicates.
+        queued.extend(&held_serials);
+        queued.sort_unstable();
+        let reserved: Vec<u64> = (base_serial..base_serial + num_blocks as u64).collect();
+        assert_eq!(queued, reserved, "reserved range fully accounted for");
+    }
 
     #[test]
     fn test_buffer_pool_checkout_empty() {
