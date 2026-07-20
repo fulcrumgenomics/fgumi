@@ -40,11 +40,11 @@ use fgumi_pipeline_core::{
 /// residual chunks, emitting [`SortPhase1Event`]s to `SortSpillDecompress`.
 ///
 /// Not to be confused with the similarly-named
-/// [`SpillCompress`](super::SpillCompress): this `CompressSpill` is the
+/// [`SpillBlockCompress`](super::SpillBlockCompress): this `CompressSpill` is the
 /// **composite compress-and-write-to-disk** step of the coarser
 /// `SortBuffer → CompressSpill → SortSpillDecompress → SortMerge` chain, whereas
-/// `SpillCompress` is the **pure block-compression** middle step of the finer
-/// `SpillGather → SpillCompress → SpillWrite` split (where the disk write is a
+/// `SpillBlockCompress` is the **pure block-compression** middle step of the finer
+/// `SpillGather → SpillBlockCompress → SpillWrite` split (where the disk write is a
 /// separate `SpillWrite` step).
 pub struct CompressSpill {
     /// Shared temp-directory allocator (free-space-aware round-robin). Behind a
