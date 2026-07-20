@@ -348,63 +348,288 @@ where
 /// using `next` as one-record lookahead state (carried across calls). Returns `None`
 /// once the stream (and lookahead) are exhausted. Every record read here flows through
 /// `stream`'s order tracker exactly once.
-fn pull_run<K, ExtractKey, IsViolation>(
+fn next_in_run<K, ExtractKey, IsViolation>(
     stream: &mut OrderChecked<'_, K, ExtractKey, IsViolation>,
     next: &mut Option<Keyed<K>>,
+    key: &K,
     same_core: &impl Fn(&K, &K) -> bool,
-) -> Result<Option<(K, Vec<RawRecord>)>>
+) -> Result<Option<RawRecord>>
 where
     K: Clone,
     ExtractKey: Fn(&[u8]) -> K,
     IsViolation: Fn(&K, &K) -> bool,
 {
-    let Some((key, rec)) = next.take() else { return Ok(None) };
-    let mut run = vec![rec];
-    while let Some((k, r)) = stream.next_keyed()? {
-        if same_core(&k, &key) {
-            run.push(r);
-        } else {
-            *next = Some((k, r));
-            break;
-        }
+    let Some((k, rec)) = next.take() else { return Ok(None) };
+    if !same_core(&k, key) {
+        // Belongs to the next run: put it back untouched so the run boundary is preserved.
+        *next = Some((k, rec));
+        return Ok(None);
     }
-    Ok(Some((key, run)))
+    *next = stream.next_keyed()?;
+    Ok(Some(rec))
 }
 
-/// Returns `true` iff `a` and `b` contain the same multiset of records under
-/// [`ContentPredicate::Exact`](super::content::ContentPredicate::Exact) (order-independent
-/// tag comparison, all core fields exact).
-///
-/// Linear-time counting: each record is reduced to a canonical content key
-/// ([`content_key_exact`]) whose byte-equality is *exactly* `Exact` content-equality (a
-/// true equivalence relation — reflexive/symmetric/transitive, no epsilon tolerance), then
-/// the two runs' key multisets are compared with a hash-count map. This replaces the
-/// previous O(n²) greedy first-fit match, so a large tied-sort-key run — e.g. many records
-/// piled on one genomic coordinate in high-depth data — no longer costs quadratic time.
-///
-/// Memory is O(run size): the run is already fully buffered by [`pull_run`], so counting
-/// its keys adds no new unbounded buffering (and introduces no spill — see the design note
-/// on why an external spill was judged unnecessary for this dev-only oracle path). The
-/// canonical-key equivalence is locked to `content_diffs` by a proptest in
-/// [`super::content`].
-fn multiset_equal(a: &[RawRecord], b: &[RawRecord]) -> bool {
-    if a.len() != b.len() {
-        return false;
+/// Consume the remainder of the run identified by `key`, returning how many records it held.
+/// Counting only — used on the desync paths where one file ended first and the other's
+/// current run just needs its length reported.
+fn count_rest_of_run<K, ExtractKey, IsViolation>(
+    stream: &mut OrderChecked<'_, K, ExtractKey, IsViolation>,
+    next: &mut Option<Keyed<K>>,
+    key: &K,
+    same_core: &impl Fn(&K, &K) -> bool,
+) -> Result<u64>
+where
+    K: Clone,
+    ExtractKey: Fn(&[u8]) -> K,
+    IsViolation: Fn(&K, &K) -> bool,
+{
+    let mut count = 0;
+    while next_in_run(stream, next, key, same_core)?.is_some() {
+        count += 1;
     }
-    // Net count per canonical content key: +1 per `a` record, -1 per `b` record. With equal
-    // lengths, the two multisets are equal iff every net count ends at zero; a `b` key that
-    // never appeared in `a` is an immediate mismatch.
-    let mut counts: AHashMap<Vec<u8>, i64> = AHashMap::with_capacity(a.len());
-    for rec in a {
-        *counts.entry(content_key_exact(rec.as_ref())).or_insert(0) += 1;
-    }
-    for rec in b {
-        match counts.get_mut(&content_key_exact(rec.as_ref())) {
-            Some(count) => *count -= 1,
-            None => return false,
+    Ok(count)
+}
+
+/// Outcome of comparing one pair of corresponding equal-core-key runs.
+struct RunPairOutcome {
+    residual: RunResidual,
+    count1: u64,
+    count2: u64,
+}
+
+/// Compare the two files' records for the run identified by `key`, consuming both sides in
+/// lockstep and cancelling each record against its counterpart as it arrives (see
+/// [`RunCanceller`]). Never materializes the run, so an unmapped tail spanning the whole
+/// file costs memory proportional only to how far the two orderings diverge.
+///
+/// Cancellation is confined to one run, but note *why* that is not what keeps it sound: a
+/// record's run membership is a function of its content ([`content_key_exact`] covers the
+/// core-field bytes carrying `ref_id`/`pos`/`flags`, from which the coordinate key
+/// `(tid, pos, reverse)` — and likewise the queryname and template-coordinate core keys — is
+/// derived). Two records with equal content keys therefore always fall in the same run, so a
+/// record that moved to a different sort key can never find its old self to cancel against,
+/// scoping or no scoping. Run scoping is what preserves the engine's *per-run* structure —
+/// run-boundary misalignment detection, per-run record counts, the `run {n}` diff labels, and
+/// the deliberate no-resync behavior — not what prevents a false MATCH.
+fn compare_run<K, ExtractKey, IsViolation>(
+    stream1: &mut OrderChecked<'_, K, ExtractKey, IsViolation>,
+    next1: &mut Option<Keyed<K>>,
+    stream2: &mut OrderChecked<'_, K, ExtractKey, IsViolation>,
+    next2: &mut Option<Keyed<K>>,
+    key: &K,
+    same_core: &impl Fn(&K, &K) -> bool,
+) -> Result<RunPairOutcome>
+where
+    K: Clone,
+    ExtractKey: Fn(&[u8]) -> K,
+    IsViolation: Fn(&K, &K) -> bool,
+{
+    let mut canceller = RunCanceller::new(MAX_PENDING_RUN_RECORDS);
+    let (mut count1, mut count2) = (0u64, 0u64);
+
+    loop {
+        // Lockstep: taking one record from each side per iteration keeps pending at ~one
+        // record when the two files agree on order, instead of draining one side first.
+        let from1 = next_in_run(stream1, next1, key, same_core)?;
+        let from2 = next_in_run(stream2, next2, key, same_core)?;
+        if from1.is_none() && from2.is_none() {
+            break;
+        }
+        if let Some(rec) = from1 {
+            canceller.observe_bam1(rec.as_ref())?;
+            count1 += 1;
+        }
+        if let Some(rec) = from2 {
+            canceller.observe_bam2(rec.as_ref())?;
+            count2 += 1;
         }
     }
-    counts.values().all(|&count| count == 0)
+
+    Ok(RunPairOutcome { residual: canceller.finish(), count1, count2 })
+}
+
+/// Cap on records held pending inside a single equal-core-key run comparison
+/// ([`RunCanceller`]), counted across both sides.
+///
+/// Not a tuning knob for run *length*: a run of any length costs O(1) pending as long as the
+/// two files list its records in the same order, because each record cancels against its
+/// counterpart on arrival. Pending grows only with the *displacement* between the two
+/// orderings, so this fires when the inputs disagree about intra-run order beyond this
+/// window — e.g. two independently-produced unmapped tails that were never re-sorted into a
+/// common order. Re-sorting both inputs (`samtools sort`/`fgbio SortBam`) makes the
+/// displacement zero.
+const MAX_PENDING_RUN_RECORDS: usize = 5_000_000;
+
+/// One side's unmatched records for a single canonical content key, plus a read name for
+/// diagnostics. `count` is the multiplicity (a BAM may legitimately hold several records
+/// with one content key), and `name` is the read name of the first such record — kept once
+/// per distinct key so a residual can be reported by name rather than by opaque key bytes.
+#[derive(Debug)]
+struct PendingEntry {
+    count: usize,
+    name: Vec<u8>,
+}
+
+/// Records left unmatched on each side once a run is fully consumed: the exact symmetric
+/// difference of the two sides' record multisets, by read name.
+#[derive(Debug, Default)]
+struct RunResidual {
+    only_in_bam1: Vec<Vec<u8>>,
+    only_in_bam2: Vec<Vec<u8>>,
+}
+
+/// Read names listed per side in a residual diagnostic before truncating. A mismatched run
+/// can have arbitrarily many unmatched records; naming a few identifies the divergence
+/// without letting one run emit an unbounded message.
+const RESIDUAL_NAMES_SHOWN: usize = 5;
+
+impl RunResidual {
+    /// `true` when the two sides' record multisets were equal (nothing left over).
+    fn is_empty(&self) -> bool {
+        self.only_in_bam1.is_empty() && self.only_in_bam2.is_empty()
+    }
+
+    /// Render the unmatched read names per side, e.g.
+    /// `; only in bam1: lonely_read`. Empty when nothing is left over.
+    fn describe(&self) -> String {
+        let side = |label: &str, names: &[Vec<u8>]| -> String {
+            if names.is_empty() {
+                return String::new();
+            }
+            let shown: Vec<String> = names
+                .iter()
+                .take(RESIDUAL_NAMES_SHOWN)
+                .map(|name| String::from_utf8_lossy(name).into_owned())
+                .collect();
+            let more = names.len().saturating_sub(shown.len());
+            let suffix = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+            format!("; only in {label}: {}{suffix}", shown.join(", "))
+        };
+        format!("{}{}", side("bam1", &self.only_in_bam1), side("bam2", &self.only_in_bam2))
+    }
+}
+
+/// Streaming multiset comparison of one equal-core-key run, in memory proportional to how
+/// far the two files' orderings diverge rather than to the run's length.
+///
+/// Each arriving record is reduced to its canonical content key ([`content_key_exact`],
+/// whose byte-equality is *exactly* `Exact` content-equality) and cancelled against the
+/// opposite side's pending set if a counterpart is waiting; otherwise it joins its own
+/// side's pending set. Two files listing a run's records in the same order therefore never
+/// hold more than one record pending, however long the run — which is what keeps a BAM's
+/// unmapped tail (a single run spanning the whole file, since every `tid = -1` record packs
+/// to one constant coordinate key) from being materialized in full.
+///
+/// Whatever remains at [`finish`](Self::finish) is the exact symmetric difference, so a
+/// mismatch is reported as the specific reads involved instead of only a record count.
+struct RunCanceller {
+    pending1: AHashMap<Vec<u8>, PendingEntry>,
+    pending2: AHashMap<Vec<u8>, PendingEntry>,
+    pending1_len: usize,
+    pending2_len: usize,
+    peak_pending: usize,
+    max_pending: usize,
+}
+
+impl RunCanceller {
+    fn new(max_pending: usize) -> Self {
+        Self {
+            pending1: AHashMap::new(),
+            pending2: AHashMap::new(),
+            pending1_len: 0,
+            pending2_len: 0,
+            peak_pending: 0,
+            max_pending,
+        }
+    }
+
+    /// Observe a record from bam1: cancel it against a waiting bam2 record, else hold it.
+    fn observe_bam1(&mut self, record: &[u8]) -> Result<()> {
+        Self::observe(
+            record,
+            &mut self.pending2,
+            &mut self.pending2_len,
+            &mut self.pending1,
+            &mut self.pending1_len,
+        );
+        self.after_observe()
+    }
+
+    /// Observe a record from bam2: cancel it against a waiting bam1 record, else hold it.
+    fn observe_bam2(&mut self, record: &[u8]) -> Result<()> {
+        Self::observe(
+            record,
+            &mut self.pending1,
+            &mut self.pending1_len,
+            &mut self.pending2,
+            &mut self.pending2_len,
+        );
+        self.after_observe()
+    }
+
+    /// Cancel `record` against `opposite` if a counterpart waits there, otherwise add it to
+    /// `own`. Side-agnostic so both directions share one implementation.
+    fn observe(
+        record: &[u8],
+        opposite: &mut AHashMap<Vec<u8>, PendingEntry>,
+        opposite_len: &mut usize,
+        own: &mut AHashMap<Vec<u8>, PendingEntry>,
+        own_len: &mut usize,
+    ) {
+        let key = content_key_exact(record);
+        if let Some(entry) = opposite.get_mut(&key) {
+            entry.count -= 1;
+            if entry.count == 0 {
+                opposite.remove(&key);
+            }
+            *opposite_len -= 1;
+            return;
+        }
+        let name = RawRecordView::new(record).read_name().to_vec();
+        own.entry(key)
+            .and_modify(|entry| entry.count += 1)
+            .or_insert(PendingEntry { count: 1, name });
+        *own_len += 1;
+    }
+
+    /// Refresh the peak watermark and enforce the pending cap.
+    fn after_observe(&mut self) -> Result<()> {
+        let pending = self.pending1_len + self.pending2_len;
+        self.peak_pending = self.peak_pending.max(pending);
+        if pending > self.max_pending {
+            bail!(
+                "sort-verify: more than {} records held pending while comparing one \
+                 equal-sort-key run — the two inputs disagree about the order of records \
+                 within that run by more than this window (an unmapped tail is one such \
+                 run). Re-sort both inputs into a common order and retry.",
+                self.max_pending
+            );
+        }
+        Ok(())
+    }
+
+    /// Highest number of records held pending at any point, across both sides. Exists so
+    /// tests can assert the bounded-memory contract directly (an in-order run must peak at
+    /// ~1 record however long it is) rather than inferring it from process RSS.
+    #[cfg(test)]
+    fn peak_pending(&self) -> usize {
+        self.peak_pending
+    }
+
+    /// Consume the canceller, reporting the records that never found a counterpart.
+    fn finish(self) -> RunResidual {
+        let names = |pending: AHashMap<Vec<u8>, PendingEntry>| -> Vec<Vec<u8>> {
+            let mut names: Vec<Vec<u8>> = pending
+                .into_values()
+                .flat_map(|entry| std::iter::repeat_n(entry.name, entry.count))
+                .collect();
+            // Hash-map iteration order is unspecified; sort so diagnostics are deterministic
+            // across runs and platforms.
+            names.sort_unstable();
+            names
+        };
+        RunResidual { only_in_bam1: names(self.pending1), only_in_bam2: names(self.pending2) }
+    }
 }
 
 /// Result of the run-grouped multiset comparison pass (before the per-file sort-order
@@ -440,37 +665,38 @@ where
     let mut run_index = 0u64;
 
     loop {
-        let run1 = pull_run(stream1, &mut next1, same_core)?;
-        let run2 = pull_run(stream2, &mut next2, same_core)?;
+        // Peek each side's current run key without consuming the lookahead record.
+        let key1 = next1.as_ref().map(|(k, _)| k.clone());
+        let key2 = next2.as_ref().map(|(k, _)| k.clone());
 
-        match (run1, run2) {
+        match (key1, key2) {
             (None, None) => break,
-            (Some((_, recs1)), None) => {
+            (Some(key1), None) => {
+                let extra = count_rest_of_run(stream1, &mut next1, &key1, same_core)?;
                 out.presence_mismatch = true;
                 if out.diff_details.len() < max_diffs {
                     out.diff_details.push(format!(
-                        "run {run_index}: bam1 has {} more record(s) than bam2 \
-                         (bam2 exhausted first — no resync)",
-                        recs1.len()
+                        "run {run_index}: bam1 has {extra} more record(s) than bam2 \
+                         (bam2 exhausted first — no resync)"
                     ));
                 }
                 stream1.drain(&mut next1)?;
                 break;
             }
-            (None, Some((_, recs2))) => {
+            (None, Some(key2)) => {
+                let extra = count_rest_of_run(stream2, &mut next2, &key2, same_core)?;
                 out.presence_mismatch = true;
                 if out.diff_details.len() < max_diffs {
                     out.diff_details.push(format!(
-                        "run {run_index}: bam2 has {} more record(s) than bam1 \
-                         (bam1 exhausted first — no resync)",
-                        recs2.len()
+                        "run {run_index}: bam2 has {extra} more record(s) than bam1 \
+                         (bam1 exhausted first — no resync)"
                     ));
                 }
                 stream2.drain(&mut next2)?;
                 break;
             }
-            (Some((k1, recs1)), Some((k2, recs2))) => {
-                if !same_core(&k1, &k2) {
+            (Some(key1), Some(key2)) => {
+                if !same_core(&key1, &key2) {
                     out.presence_mismatch = true;
                     if out.diff_details.len() < max_diffs {
                         out.diff_details.push(format!(
@@ -483,14 +709,16 @@ where
                     break;
                 }
 
-                if !multiset_equal(&recs1, &recs2) {
+                let pair = compare_run(stream1, &mut next1, stream2, &mut next2, &key1, same_core)?;
+                if !pair.residual.is_empty() {
                     out.run_mismatches += 1;
                     if out.diff_details.len() < max_diffs {
                         out.diff_details.push(format!(
                             "run {run_index}: record multiset differs ({} record(s) in \
-                             bam1 vs {} in bam2)",
-                            recs1.len(),
-                            recs2.len()
+                             bam1 vs {} in bam2){}",
+                            pair.count1,
+                            pair.count2,
+                            pair.residual.describe()
                         ));
                     }
                 }
@@ -762,6 +990,8 @@ pub(crate) fn verify_records_in_order(path: &Path, order: SortOrder) -> Result<(
 #[cfg(test)]
 mod tests {
     use bstr::BString;
+    use fgumi_raw_bam::{SamBuilder, flags};
+    use noodles::sam::alignment::io::Write as AlignmentWrite;
     use noodles::sam::header::record::value::Map;
     use noodles::sam::header::record::value::map::Header as HeaderRecord;
     use noodles::sam::header::record::value::map::header::tag as hd_tag;
@@ -887,5 +1117,255 @@ mod tests {
             err.to_string().contains("disagrees with SO:coordinate"),
             "error should call out the prefix disagreement: {err}"
         );
+    }
+
+    /// A record with a distinct read name, so each one is its own canonical content key.
+    fn named(name: &[u8]) -> RawRecord {
+        SamBuilder::new().read_name(name).flags(flags::FIRST_SEGMENT).build()
+    }
+
+    /// The memory contract for the whole engine: comparing an equal-core-key run must cost
+    /// memory proportional to how far the two files' *orderings* diverge, not to the run's
+    /// length. Every `tid = -1` record packs to one constant coordinate key
+    /// (`extract_coordinate_key_inline`), so a BAM's unmapped tail is a single run whose
+    /// length is the file's — buffering it whole is what made a 1M-read unmapped tail cost
+    /// ~1 GB. Two files listing the same records in the same order cancel on arrival, so
+    /// pending never exceeds one record per side regardless of run length.
+    #[test]
+    fn identical_run_cancels_on_arrival_and_keeps_pending_bounded() {
+        let mut canceller = RunCanceller::new(MAX_PENDING_RUN_RECORDS);
+        for i in 0..10_000u32 {
+            let rec = named(format!("read{i}").as_bytes());
+            canceller.observe_bam1(rec.as_ref()).expect("bam1 observe within cap");
+            canceller.observe_bam2(rec.as_ref()).expect("bam2 observe within cap");
+        }
+        assert!(
+            canceller.peak_pending() <= 1,
+            "in-order identical runs must cancel on arrival, peaked at {}",
+            canceller.peak_pending()
+        );
+        let residual = canceller.finish();
+        assert!(residual.is_empty(), "identical runs must leave no residual: {residual:?}");
+    }
+
+    /// Writes `records` to a temp BAM declaring `SO:coordinate`. All records are unmapped
+    /// with no reference (`tid = -1`), so they pack to one constant coordinate key and form
+    /// a single equal-core-key run — the shape this engine must compare without buffering.
+    fn unmapped_tail_bam(records: &[RawRecord]) -> tempfile::NamedTempFile {
+        let tmp = tempfile::NamedTempFile::new().expect("create temp BAM");
+        let header = header_with_hd(Some("coordinate"), None, None);
+        let mut writer = noodles::bam::io::Writer::new(
+            std::fs::File::create(tmp.path()).expect("create test BAM"),
+        );
+        writer.write_header(&header).expect("write test header");
+        for record in records {
+            let record_buf = fgumi_raw_bam::raw_record_to_record_buf(record, &header)
+                .expect("raw_record_to_record_buf should succeed in test");
+            writer.write_alignment_record(&header, &record_buf).expect("write test record");
+        }
+        writer.try_finish().expect("finish test BAM");
+        tmp
+    }
+
+    /// A mismatch inside the unmapped tail must name the read that differs. The whole tail
+    /// is one run, so reporting only its record counts ("multiset differs (N vs M)") points
+    /// at every unmapped read in the file at once and is useless for diagnosis; the
+    /// cancellation residual knows exactly which read went unmatched.
+    #[test]
+    fn unmapped_tail_mismatch_names_the_offending_read() {
+        let shared: Vec<RawRecord> =
+            (0..64u32).map(|i| named(format!("shared{i:03}").as_bytes())).collect();
+        let mut with_extra = shared.clone();
+        with_extra.push(named(b"lonely_read"));
+
+        let bam1 = unmapped_tail_bam(&with_extra);
+        let bam2 = unmapped_tail_bam(&shared);
+
+        let outcome = sort_verify_compare(bam1.path(), bam2.path(), 20).expect("compare runs");
+        assert!(!outcome.is_match(), "an extra read in bam1 must not compare equal");
+        assert!(
+            outcome.diff_details.iter().any(|d| d.contains("lonely_read")),
+            "diagnostics must name the unmatched read, got: {:?}",
+            outcome.diff_details
+        );
+    }
+
+    /// Cancellation tracks *multiplicity*, not mere presence. Read names are not unique in a
+    /// BAM (mates, secondary/supplementary records share one), so a set-based canceller
+    /// would let a second copy match the first and report a dropped duplicate as equal.
+    #[rstest]
+    #[case::bam1_has_the_extra_copy(2, 1, 1, 0)]
+    #[case::bam2_has_the_extra_copy(1, 2, 0, 1)]
+    #[case::equal_multiplicity_cancels(3, 3, 0, 0)]
+    fn duplicate_records_cancel_by_multiplicity(
+        #[case] copies_in_bam1: usize,
+        #[case] copies_in_bam2: usize,
+        #[case] expected_only_in_bam1: usize,
+        #[case] expected_only_in_bam2: usize,
+    ) {
+        let mut canceller = RunCanceller::new(MAX_PENDING_RUN_RECORDS);
+        let rec = named(b"duplicated");
+        for _ in 0..copies_in_bam1 {
+            canceller.observe_bam1(rec.as_ref()).expect("within cap");
+        }
+        for _ in 0..copies_in_bam2 {
+            canceller.observe_bam2(rec.as_ref()).expect("within cap");
+        }
+        let residual = canceller.finish();
+        assert_eq!(residual.only_in_bam1.len(), expected_only_in_bam1, "bam1 residual");
+        assert_eq!(residual.only_in_bam2.len(), expected_only_in_bam2, "bam2 residual");
+    }
+
+    /// Records the two files list in opposite order still cancel completely — the run's
+    /// multiset is what matters, not its internal order (that is the whole reason this
+    /// engine compares runs as multisets). Memory is what degrades, not correctness.
+    #[test]
+    fn reversed_run_cancels_completely() {
+        let records: Vec<RawRecord> =
+            (0..256u32).map(|i| named(format!("read{i:03}").as_bytes())).collect();
+        let mut canceller = RunCanceller::new(MAX_PENDING_RUN_RECORDS);
+        for rec in &records {
+            canceller.observe_bam1(rec.as_ref()).expect("within cap");
+        }
+        for rec in records.iter().rev() {
+            canceller.observe_bam2(rec.as_ref()).expect("within cap");
+        }
+        assert!(canceller.finish().is_empty(), "a reversed run is still the same multiset");
+    }
+
+    /// The cap must fail with an actionable message rather than growing without bound. This
+    /// is the reversed-order worst case: nothing cancels until the second side arrives, so
+    /// pending grows to the run's length.
+    #[test]
+    fn exceeding_the_pending_cap_reports_an_actionable_error() {
+        let mut canceller = RunCanceller::new(8);
+        let err = (0..64u32)
+            .find_map(|i| {
+                let rec = named(format!("read{i:03}").as_bytes());
+                canceller.observe_bam1(rec.as_ref()).err()
+            })
+            .expect("feeding only one side past the cap must error");
+        let msg = err.to_string();
+        assert!(msg.contains("held pending"), "error should explain the cap: {msg}");
+        assert!(msg.contains("Re-sort both inputs"), "error should say how to fix it: {msg}");
+    }
+
+    /// A mapped record at a given coordinate, so distinct positions form distinct runs.
+    fn mapped(name: &[u8], pos: i32) -> RawRecord {
+        SamBuilder::new().read_name(name).ref_id(0).pos(pos).flags(0).build()
+    }
+
+    /// Writes `records` to a temp BAM declaring `SO:coordinate` with a single reference
+    /// sequence, so mapped records (`ref_id = 0`) can be written and distinct positions
+    /// form distinct equal-core-key runs.
+    fn mapped_bam(records: &[RawRecord]) -> tempfile::NamedTempFile {
+        use noodles::sam::header::record::value::map::ReferenceSequence;
+
+        let tmp = tempfile::NamedTempFile::new().expect("create temp BAM");
+        let mut hd = Map::<HeaderRecord>::default();
+        hd.other_fields_mut().insert(hd_tag::SORT_ORDER, BString::from("coordinate"));
+        let header = Header::builder()
+            .set_header(hd)
+            .add_reference_sequence(
+                BString::from("chr1"),
+                Map::<ReferenceSequence>::new(
+                    std::num::NonZeroUsize::new(100_000).expect("nonzero length"),
+                ),
+            )
+            .build();
+
+        let mut writer = noodles::bam::io::Writer::new(
+            std::fs::File::create(tmp.path()).expect("create test BAM"),
+        );
+        writer.write_header(&header).expect("write test header");
+        for record in records {
+            let record_buf = fgumi_raw_bam::raw_record_to_record_buf(record, &header)
+                .expect("raw_record_to_record_buf should succeed in test");
+            writer.write_alignment_record(&header, &record_buf).expect("write test record");
+        }
+        writer.try_finish().expect("finish test BAM");
+        tmp
+    }
+
+    /// A record that moved to a different coordinate must be reported, not absorbed — the
+    /// regression a sort oracle exists to catch. It holds for a reason worth stating:
+    /// [`content_key_exact`] covers the core-field bytes carrying `ref_id`/`pos`/`flags`,
+    /// exactly the fields the coordinate run key `(tid, pos, reverse)` is derived from, so a
+    /// moved record has a different content key from its old self and cannot cancel against
+    /// it. See the note on [`compare_run`] for why that makes cross-run cancellation
+    /// impossible independently of run scoping.
+    #[test]
+    fn a_record_that_moved_to_another_coordinate_is_reported() {
+        let bam1 = mapped_bam(&[mapped(b"stationary", 100), mapped(b"wanderer", 200)]);
+        let bam2 = mapped_bam(&[mapped(b"stationary", 100), mapped(b"wanderer", 300)]);
+
+        let outcome = sort_verify_compare(bam1.path(), bam2.path(), 20).expect("compare runs");
+        assert!(
+            !outcome.is_match(),
+            "a record moved to another coordinate must DIFFER: {:?}",
+            outcome.diff_details
+        );
+    }
+
+    /// One file having an entire *trailing run* the other lacks — unequal run counts, not a
+    /// within-run difference — must be reported as a presence mismatch that names which side
+    /// is longer and by how many records. This is the desync path where one stream is
+    /// exhausted while the other still holds a run to count and drain
+    /// ([`count_rest_of_run`]); the extra run has two records at one coordinate so the count
+    /// is exercised past a single element.
+    #[rstest]
+    #[case::bam1_has_the_extra_trailing_run(true, "bam1 has 2 more")]
+    #[case::bam2_has_the_extra_trailing_run(false, "bam2 has 2 more")]
+    fn a_trailing_run_present_in_only_one_file_is_reported(
+        #[case] extra_in_bam1: bool,
+        #[case] expected_detail: &str,
+    ) {
+        let shared = [mapped(b"stationary", 100)];
+        let longer =
+            [mapped(b"stationary", 100), mapped(b"trailing_a", 200), mapped(b"trailing_b", 200)];
+
+        let (bam1, bam2) = if extra_in_bam1 {
+            (mapped_bam(&longer), mapped_bam(&shared))
+        } else {
+            (mapped_bam(&shared), mapped_bam(&longer))
+        };
+
+        let outcome = sort_verify_compare(bam1.path(), bam2.path(), 20).expect("compare runs");
+        assert!(
+            !outcome.is_match(),
+            "an extra trailing run in one file must DIFFER: {:?}",
+            outcome.diff_details
+        );
+        assert!(
+            outcome.diff_details.iter().any(|d| d.contains(expected_detail)),
+            "diagnostics must name the longer side and its extra record count, got: {:?}",
+            outcome.diff_details
+        );
+    }
+
+    // The residual is empty exactly when the two sides hold equal record multisets — the
+    // property the whole run comparison rests on. Checked against a straightforward sorted
+    // content-key reference over randomized inputs.
+    proptest::proptest! {
+        #[test]
+        fn residual_is_empty_iff_content_multisets_are_equal(
+            left in proptest::collection::vec(0u32..6, 0..12),
+            right in proptest::collection::vec(0u32..6, 0..12),
+        ) {
+            let mut canceller = RunCanceller::new(MAX_PENDING_RUN_RECORDS);
+            for i in &left {
+                canceller.observe_bam1(named(format!("read{i}").as_bytes()).as_ref()).unwrap();
+            }
+            for i in &right {
+                canceller.observe_bam2(named(format!("read{i}").as_bytes()).as_ref()).unwrap();
+            }
+            let (mut sorted_left, mut sorted_right) = (left.clone(), right.clone());
+            sorted_left.sort_unstable();
+            sorted_right.sort_unstable();
+            proptest::prop_assert_eq!(
+                canceller.finish().is_empty(),
+                sorted_left == sorted_right
+            );
+        }
     }
 }
