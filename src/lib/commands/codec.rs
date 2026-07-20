@@ -544,9 +544,34 @@ impl Codec {
             bail!("min-duplex-length must be >= 1");
         }
 
-        // Validate disagreement rate
+        // Validate disagreement rate. The non-finite check must come first: `NaN`
+        // compares `false` against both bounds, so a bare range test admits it, and
+        // every downstream `rate > threshold` comparison is then false — silently
+        // disabling duplex-disagreement rejection so molecules that should be
+        // rejected are emitted as consensus reads.
+        if !self.max_duplex_disagreement_rate.is_finite() {
+            bail!(
+                "max-duplex-disagreement-rate must be a finite number, got {}",
+                self.max_duplex_disagreement_rate
+            );
+        }
         if self.max_duplex_disagreement_rate < 0.0 || self.max_duplex_disagreement_rate > 1.0 {
             bail!("max-duplex-disagreement-rate must be between 0.0 and 1.0");
+        }
+
+        // Validate the fixed quality overrides. These are written straight into the
+        // consensus record's QUAL array, so a value above the maximum Phred score
+        // would emit BAM quality bytes outside the legal SAM `!`..`~` range.
+        let max_phred = ConsensusCallingOptions::MAX_PHRED;
+        for (name, value) in [
+            ("single-strand-qual", self.single_strand_qual),
+            ("outer-bases-qual", self.outer_bases_qual),
+        ] {
+            if let Some(qual) = value
+                && qual > max_phred
+            {
+                bail!("{name} ({qual}) exceeds maximum Phred score ({max_phred})");
+            }
         }
 
         Ok(())
@@ -817,6 +842,43 @@ mod tests {
 
     fn create_test_codec() -> Codec {
         create_codec_with_paths(PathBuf::from("input.bam"), PathBuf::from("output.bam"))
+    }
+
+    #[rstest]
+    #[case::typical(0.1, true)]
+    #[case::lower_bound(0.0, true)]
+    #[case::upper_bound(1.0, true)]
+    #[case::negative(-0.1, false)]
+    #[case::above_one(1.1, false)]
+    #[case::nan(f64::NAN, false)]
+    #[case::infinity(f64::INFINITY, false)]
+    fn test_validate_max_duplex_disagreement_rate(#[case] rate: f64, #[case] expected_ok: bool) {
+        let mut codec = create_test_codec();
+        codec.max_duplex_disagreement_rate = rate;
+        assert_eq!(
+            codec.validate().is_ok(),
+            expected_ok,
+            "unexpected validation result for rate {rate}"
+        );
+    }
+
+    #[rstest]
+    #[case::ss_qual_valid(Some(40), None, true)]
+    #[case::ss_qual_at_max(Some(93), None, true)]
+    #[case::ss_qual_too_high(Some(94), None, false)]
+    #[case::outer_qual_valid(None, Some(2), true)]
+    #[case::outer_qual_at_max(None, Some(93), true)]
+    #[case::outer_qual_too_high(None, Some(94), false)]
+    #[case::both_unset(None, None, true)]
+    fn test_validate_fixed_quality_overrides(
+        #[case] single_strand_qual: Option<u8>,
+        #[case] outer_bases_qual: Option<u8>,
+        #[case] expected_ok: bool,
+    ) {
+        let mut codec = create_test_codec();
+        codec.single_strand_qual = single_strand_qual;
+        codec.outer_bases_qual = outer_bases_qual;
+        assert_eq!(codec.validate().is_ok(), expected_ok);
     }
 
     /// The `--allow-unmapped` CLI flag defaults to `false` (fgbio parity: the

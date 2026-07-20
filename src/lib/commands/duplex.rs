@@ -577,6 +577,13 @@ impl Duplex {
         if self.consensus.error_rate_post_umi == 0 {
             bail!("error-rate-post-umi must be > 0");
         }
+        // Matches simplex and codec: 0 admits empty groups, making the
+        // minimum-family-size filter a silent no-op rather than an error.
+        // `DuplexConsensusCaller::new` validates emptiness and high-to-low
+        // ordering but never a lower bound.
+        if self.min_reads.contains(&0) {
+            bail!("--min-reads must be >= 1 (a value of 0 admits empty groups)");
+        }
         Ok(())
     }
 
@@ -1166,6 +1173,22 @@ mod tests {
             create_duplex_with_paths(PathBuf::from("test.bam"), PathBuf::from("output.bam"));
         duplex.consensus.error_rate_pre_umi = pre_umi;
         duplex.consensus.error_rate_post_umi = post_umi;
+        assert_eq!(duplex.validate().is_ok(), expect_ok);
+    }
+
+    #[rstest]
+    #[case::single_zero(vec![0], false)]
+    #[case::zero_in_tail(vec![3, 0], false)]
+    #[case::all_zero(vec![0, 0, 0], false)]
+    #[case::single_one(vec![1], true)]
+    #[case::descending(vec![3, 2, 1], true)]
+    fn test_validate_rejects_zero_min_reads(
+        #[case] min_reads: Vec<usize>,
+        #[case] expect_ok: bool,
+    ) {
+        let mut duplex =
+            create_duplex_with_paths(PathBuf::from("test.bam"), PathBuf::from("output.bam"));
+        duplex.min_reads = min_reads;
         assert_eq!(duplex.validate().is_ok(), expect_ok);
     }
 
