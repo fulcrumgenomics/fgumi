@@ -1912,14 +1912,18 @@ impl DuplexConsensusCaller {
         // Split filtered results back by firstOfPair flag (matching fgbio lines 347-350)
         // X = AB-R1 + BA-R2, Y = AB-R2 + BA-R1 (combined for alignment filtering)
         // Now split them back into the four groups using sr.flags:
-        let filtered_ab_r1s: Vec<SourceRead> =
-            filtered_xs.iter().filter(|sr| sr.flags & flags::FIRST_SEGMENT != 0).cloned().collect();
-        let filtered_ba_r2s: Vec<SourceRead> =
-            filtered_xs.iter().filter(|sr| sr.flags & flags::FIRST_SEGMENT == 0).cloned().collect();
-        let filtered_ab_r2s: Vec<SourceRead> =
-            filtered_ys.iter().filter(|sr| sr.flags & flags::FIRST_SEGMENT == 0).cloned().collect();
-        let filtered_ba_r1s: Vec<SourceRead> =
-            filtered_ys.iter().filter(|sr| sr.flags & flags::FIRST_SEGMENT != 0).cloned().collect();
+        // The two halves of each split are exact complements on FIRST_SEGMENT, so
+        // `partition` produces the same groups in the same order as the four
+        // filter-and-clone passes it replaces -- without deep-copying every
+        // surviving SourceRead (bases, quals, and two cigar Vecs each).
+        //
+        // Binding order matters: `partition` yields (predicate true, predicate
+        // false), so with `FIRST_SEGMENT != 0` the R1 group always comes first.
+        // Swapping either pair silently transposes the strand groups.
+        let (filtered_ab_r1s, filtered_ba_r2s): (Vec<SourceRead>, Vec<SourceRead>) =
+            filtered_xs.into_iter().partition(|sr| sr.flags & flags::FIRST_SEGMENT != 0);
+        let (filtered_ba_r1s, filtered_ab_r2s): (Vec<SourceRead>, Vec<SourceRead>) =
+            filtered_ys.into_iter().partition(|sr| sr.flags & flags::FIRST_SEGMENT != 0);
 
         debug!(
             "MI {}: After split (filtered_AB-R1={}, filtered_AB-R2={}, filtered_BA-R1={}, filtered_BA-R2={})",
@@ -6375,14 +6379,18 @@ mod tests {
 }
 
 // ============================================================================
-// fgbio-oracle saturation tests (offline-pinned)
+// fgbio-oracle tests (offline-pinned)
 //
-// These tests drive fgumi's own duplex caller on a DEEP fixture and assert the
+// These tests drive fgumi's own duplex caller on a fixture and assert the
 // emitted depth/error tags equal values CAPTURED FROM A REAL fgbio RUN on the
 // exact same input BAM, rather than re-derived from the implementation's own
 // formula. This closes the CodeRabbit finding that the hand-authored saturation
 // tests "repeat the implementation's expected formulas, so a shared
 // misunderstanding of fgbio's cap-before-sum behavior would still pass".
+//
+// Two families live here: the DEEP saturation fixtures that pin fgbio's
+// cap-before-sum behavior, and the small strand-split fixtures that pin which
+// group each alignment-filtered read lands in.
 //
 // Equivalence: one `fgumi_sam::builder::SamBuilder` produces the fixture and
 // writes ONE BAM. That exact file is (1) what the offline fgbio run consumes and
@@ -6390,7 +6398,7 @@ mod tests {
 // `regen_*` tests to re-emit the fixture BAM for a fresh fgbio capture.
 // ============================================================================
 #[cfg(test)]
-mod fgbio_oracle_saturation_tests {
+mod fgbio_oracle_tests {
     use super::*;
     use crate::oracle_test_support::{ExpectedOracleTags, records_from_builder, regen_write};
     use fgumi_raw_bam::ParsedBamRecord;
@@ -6562,6 +6570,112 @@ mod fgbio_oracle_saturation_tests {
         expected.assert_matches(rec);
     }
 
+    /// fgumi's strand split -- the partition that puts each alignment-filtered
+    /// read back into its AB-R1 / AB-R2 / BA-R1 / BA-R2 group -- must place reads
+    /// exactly where fgbio places them. Assertions cover BOTH consensus records
+    /// because the two records are fed by DIFFERENT partitions: the R1 duplex
+    /// record's strands come from the X split (AB-R1 and BA-R2), the R2 record's
+    /// from the Y split (AB-R2 and BA-R1). A single record would leave one of the
+    /// two partitions unpinned.
+    ///
+    /// The `3`/`2` case is what makes a transposed binding visible: the strands
+    /// carry different depths, so swapping either partition's halves swaps aD/bD
+    /// on the affected record, and the AB-R1-only error moves from `aE`/`ae` to
+    /// `bE`/`be`. The `1`/`1` case pins the min-reads floor -- one pair per strand
+    /// is the smallest input this caller (`min_reads = [1]`) accepts.
+    ///
+    /// Oracle provenance is the same fgbio jar and invocation as
+    /// `duplex_saturation_matches_fgbio_oracle`; re-emit the fixtures with the
+    /// matching `#[ignore]`d `regen_duplex_strand_split_*` tests.
+    #[rstest]
+    // 3 /A pairs (one with a disagreeing R1 base) and 2 /B pairs. R1 record:
+    // aD = 3 (AB-R1), bD = 2 (BA-R2), and the injected error lands on the AB
+    // strand only (ae[0] = 1, aE = 1/24). R2 record: aD = 3 (AB-R2), bD = 2
+    // (BA-R1), no errors -- the variant was injected into R1s only.
+    #[case::asymmetric_depths_with_ab_r1_error(
+        3, 2, "ACGTACGT", Some("CCGTACGT"), 1,
+        ExpectedOracleTags {
+            cd: 5, cm: 5, ce: 0.025,
+            ad: 3, am: 3, ae: 0.041_666_7,
+            bd: 2, bm: 2, be: 0.0,
+            ad_bases: vec![3; 8], bd_bases: vec![2; 8],
+            ae_bases: vec![1, 0, 0, 0, 0, 0, 0, 0], be_bases: vec![0; 8],
+        },
+        ExpectedOracleTags {
+            cd: 5, cm: 5, ce: 0.0,
+            ad: 3, am: 3, ae: 0.0,
+            bd: 2, bm: 2, be: 0.0,
+            ad_bases: vec![3; 8], bd_bases: vec![2; 8],
+            ae_bases: vec![0; 8], be_bases: vec![0; 8],
+        },
+    )]
+    // One pair per strand: the minimum input `min_reads = [1]` accepts. Each of
+    // the four groups holds exactly one read, so every depth is 1.
+    #[case::one_pair_per_strand(
+        1, 1, "ACGTACGT", None, 0,
+        ExpectedOracleTags {
+            cd: 2, cm: 2, ce: 0.0,
+            ad: 1, am: 1, ae: 0.0,
+            bd: 1, bm: 1, be: 0.0,
+            ad_bases: vec![1; 8], bd_bases: vec![1; 8],
+            ae_bases: vec![0; 8], be_bases: vec![0; 8],
+        },
+        ExpectedOracleTags {
+            cd: 2, cm: 2, ce: 0.0,
+            ad: 1, am: 1, ae: 0.0,
+            bd: 1, bm: 1, be: 0.0,
+            ad_bases: vec![1; 8], bd_bases: vec![1; 8],
+            ae_bases: vec![0; 8], be_bases: vec![0; 8],
+        },
+    )]
+    fn duplex_strand_split_matches_fgbio_oracle(
+        #[case] n_ab: usize,
+        #[case] n_ba: usize,
+        #[case] bases: &str,
+        #[case] variant: Option<&str>,
+        #[case] variant_count: usize,
+        #[case] expected_r1: ExpectedOracleTags,
+        #[case] expected_r2: ExpectedOracleTags,
+    ) {
+        let builder =
+            build_duplex_fixture(n_ab, n_ba, bases, variant, variant_count, NON_OVERLAP_R2_START);
+        let records = records_from_builder(&builder);
+        let mut caller = duplex_caller();
+        let output = caller.consensus_reads(records).expect("duplex consensus succeeds");
+        let parsed = ParsedBamRecord::parse_all(&output.data);
+        assert_eq!(parsed.len(), 2, "duplex emits R1 and R2 consensus records");
+
+        let r1 = parsed
+            .iter()
+            .find(|r| r.flag & flags::FIRST_SEGMENT != 0)
+            .expect("R1 (first-of-pair) consensus present");
+        expected_r1.assert_matches(r1);
+        let r2 = parsed
+            .iter()
+            .find(|r| r.flag & flags::FIRST_SEGMENT == 0)
+            .expect("R2 (second-of-pair) consensus present");
+        expected_r2.assert_matches(r2);
+    }
+
+    /// The empty-strand boundary: with only /A pairs present the BA groups of both
+    /// partitions come out empty, and `min_reads = [1]` (padded to `[1, 1, 1]`)
+    /// requires at least one read on EACH strand. fgbio emits zero consensus reads
+    /// for this fixture ("Consensus reads emitted: 0" on the same jar and
+    /// invocation as the cases above), so fgumi must emit zero too rather than
+    /// falling back to a single-strand consensus.
+    #[test]
+    fn duplex_empty_ba_strand_emits_nothing_like_fgbio() {
+        let builder = build_duplex_fixture(2, 0, "ACGTACGT", None, 0, NON_OVERLAP_R2_START);
+        let records = records_from_builder(&builder);
+        let mut caller = duplex_caller();
+        let output = caller.consensus_reads(records).expect("duplex consensus succeeds");
+        assert_eq!(output.count, 0, "an empty BA strand must yield no consensus reads");
+        assert!(
+            ParsedBamRecord::parse_all(&output.data).is_empty(),
+            "no consensus records may be emitted when one strand is empty",
+        );
+    }
+
     /// Re-emit the duplex open-interval depth-saturation fixture BAM for fgbio.
     #[test]
     #[ignore = "regen: writes the fixture BAM (set FGUMI_ORACLE_BAM_OUT), then run fgbio on it"]
@@ -6581,5 +6695,33 @@ mod fgbio_oracle_saturation_tests {
             33_000,
             NON_OVERLAP_R2_START,
         ));
+    }
+
+    /// Re-emit the asymmetric-depth strand-split fixture BAM for fgbio.
+    #[test]
+    #[ignore = "regen: writes the fixture BAM (set FGUMI_ORACLE_BAM_OUT), then run fgbio on it"]
+    fn regen_duplex_strand_split_fixture() {
+        regen_write(&build_duplex_fixture(
+            3,
+            2,
+            "ACGTACGT",
+            Some("CCGTACGT"),
+            1,
+            NON_OVERLAP_R2_START,
+        ));
+    }
+
+    /// Re-emit the one-pair-per-strand strand-split fixture BAM for fgbio.
+    #[test]
+    #[ignore = "regen: writes the fixture BAM (set FGUMI_ORACLE_BAM_OUT), then run fgbio on it"]
+    fn regen_duplex_strand_split_single_read_fixture() {
+        regen_write(&build_duplex_fixture(1, 1, "ACGTACGT", None, 0, NON_OVERLAP_R2_START));
+    }
+
+    /// Re-emit the empty-BA-strand strand-split fixture BAM for fgbio.
+    #[test]
+    #[ignore = "regen: writes the fixture BAM (set FGUMI_ORACLE_BAM_OUT), then run fgbio on it"]
+    fn regen_duplex_strand_split_empty_strand_fixture() {
+        regen_write(&build_duplex_fixture(2, 0, "ACGTACGT", None, 0, NON_OVERLAP_R2_START));
     }
 }

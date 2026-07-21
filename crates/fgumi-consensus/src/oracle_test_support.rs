@@ -1,8 +1,8 @@
-//! Shared test-only helpers for the offline-pinned fgbio-oracle saturation
-//! tests in [`codec_caller`](crate::codec_caller) and
+//! Shared test-only helpers for the offline-pinned fgbio-oracle tests in
+//! [`codec_caller`](crate::codec_caller) and
 //! [`duplex_caller`](crate::duplex_caller).
 //!
-//! Each oracle test drives fgumi's own caller on a DEEP fixture and asserts the
+//! Each oracle test drives fgumi's own caller on a fixture and asserts the
 //! emitted depth/error tags equal values CAPTURED FROM A REAL fgbio RUN on the
 //! exact same input BAM, rather than re-derived from the implementation's own
 //! formula. This closes the CodeRabbit finding that the hand-authored

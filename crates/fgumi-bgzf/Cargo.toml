@@ -14,6 +14,7 @@ bgzf = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+rstest = { workspace = true }
 
 [[bench]]
 name = "stored_block_decode"

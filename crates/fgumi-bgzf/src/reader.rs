@@ -143,20 +143,35 @@ impl RawBgzfBlock {
 
 /// Read a single raw BGZF block from the input.
 ///
-/// Returns `Ok(Some(block))` if a block was read, `Ok(None)` at EOF,
-/// or an error if reading failed or the data is invalid.
+/// Returns `Ok(Some(block))` if a block was read, or `Ok(None)` at a clean EOF
+/// -- meaning the stream ended *before* the first header byte. Input that ends
+/// part-way through a block, header included, is truncated rather than finished
+/// and reports `UnexpectedEof`.
 ///
 /// # Errors
 ///
-/// Returns an error if the block header is invalid or reading fails.
+/// Returns an error if the block header is invalid, the block is truncated, or
+/// reading fails.
 fn read_raw_block<R: Read + ?Sized>(reader: &mut R) -> io::Result<Option<RawBgzfBlock>> {
-    // Read the 18-byte header
+    // Read the 18-byte header. Only a stream that ends *before* the first header
+    // byte is a clean EOF; a header that starts and then runs out is truncated
+    // input and must surface as `UnexpectedEof`, the same contract the block-body
+    // length check below enforces. Reading the header with a single `read_exact`
+    // would collapse both cases into `Ok(None)` and silently drop a partial block.
+    // Splitting the header read costs nothing on the paths that matter: every
+    // production caller wraps its input in a `BufReader`, so the one-byte probe is
+    // a buffer memcpy rather than a second syscall.
     let mut header = [0u8; BGZF_HEADER_SIZE];
-    match reader.read_exact(&mut header) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
+    loop {
+        match reader.read(&mut header[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(_) => break,
+            // `read` (unlike `read_exact`) surfaces `Interrupted` to the caller.
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
     }
+    reader.read_exact(&mut header[1..])?;
 
     // Validate gzip magic bytes
     if header[0] != 0x1f || header[1] != 0x8b {
@@ -206,12 +221,24 @@ fn read_raw_block<R: Read + ?Sized>(reader: &mut R) -> io::Result<Option<RawBgzf
         ));
     }
 
-    // Allocate buffer and copy header
-    let mut data = vec![0u8; block_size];
-    data[..BGZF_HEADER_SIZE].copy_from_slice(&header);
+    // Reserve exactly what the block needs and fill it, rather than
+    // `vec![0u8; block_size]`, which memsets up to 64 KiB that is immediately
+    // overwritten.
+    let mut data = Vec::with_capacity(block_size);
+    data.extend_from_slice(&header);
 
-    // Read remaining block data
-    reader.read_exact(&mut data[BGZF_HEADER_SIZE..])?;
+    // Read remaining block data. `read_to_end` on a bounded `take` avoids
+    // pre-zeroing, but unlike `read_exact` it returns `Ok` on early EOF, so the
+    // length must be checked explicitly -- without this a truncated BAM would
+    // silently short-read instead of erroring.
+    let remaining = block_size - BGZF_HEADER_SIZE;
+    reader.take(remaining as u64).read_to_end(&mut data)?;
+    if data.len() != block_size {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("truncated BGZF block: expected {block_size} bytes, got {}", data.len()),
+        ));
+    }
 
     Ok(Some(RawBgzfBlock { data }))
 }
@@ -593,7 +620,98 @@ fn copy_stored_and_verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::io::Cursor;
+
+    /// Compress `payload` into a single BGZF block and return its raw bytes.
+    fn single_block_bytes(payload: &[u8]) -> Vec<u8> {
+        let mut compressor = crate::writer::InlineBgzfCompressor::new(1);
+        compressor.write_all(payload).expect("buffer payload");
+        compressor.flush().expect("flush to a block");
+        let mut bytes = Vec::new();
+        compressor.write_blocks_to(&mut bytes).expect("emit block bytes");
+        bytes
+    }
+
+    /// `read_raw_block` reserves capacity and fills with `read_to_end` rather
+    /// than `vec![0u8; block_size]`, avoiding a memset of up to 64 KiB that is
+    /// immediately overwritten. Unlike `read_exact`, `read_to_end` returns `Ok`
+    /// on early EOF, so the explicit length check is what keeps a truncated BAM
+    /// from silently short-reading. Without it this test would see `Ok(Some(..))`
+    /// carrying a short block.
+    #[test]
+    fn test_read_raw_block_rejects_a_truncated_block() {
+        // Build a well-formed block, then cut bytes off the end.
+        let full = single_block_bytes(b"the quick brown fox jumps over the lazy dog");
+        assert!(full.len() > BGZF_HEADER_SIZE + BGZF_FOOTER_SIZE, "need a real block");
+
+        // Full block round-trips.
+        let mut cursor = Cursor::new(full.clone());
+        let block = read_raw_block(&mut cursor).expect("full block should read").expect("a block");
+        let full_len = block.data.len();
+
+        // Dropping even one byte must be an error, not a short block.
+        let truncated = full[..full_len - 1].to_vec();
+        let mut cursor = Cursor::new(truncated);
+        let err = read_raw_block(&mut cursor)
+            .expect_err("a truncated block must error rather than short-read");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::UnexpectedEof,
+            "expected UnexpectedEof for a truncated block, got: {err}",
+        );
+    }
+
+    /// A stream that ends before the first header byte is a clean EOF -- the
+    /// only case that may report `Ok(None)`.
+    #[test]
+    fn test_read_raw_block_reports_eof_on_an_empty_stream() {
+        let mut cursor = Cursor::new(Vec::new());
+        assert!(
+            read_raw_block(&mut cursor).expect("empty stream is a clean EOF").is_none(),
+            "an empty stream must read as EOF, not a block",
+        );
+    }
+
+    /// A header that starts and then runs out is truncated input, not EOF. Every
+    /// non-empty prefix shorter than a full header must surface `UnexpectedEof`,
+    /// the same contract the block-body length check enforces. The value list is
+    /// exhaustive over `1..BGZF_HEADER_SIZE`; the assertion below fails loudly if
+    /// the constant ever changes out from under it.
+    #[rstest]
+    fn test_read_raw_block_rejects_a_partial_header(
+        #[values(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)] prefix_len: usize,
+    ) {
+        assert_eq!(BGZF_HEADER_SIZE, 18, "prefix_len values must cover 1..BGZF_HEADER_SIZE");
+
+        let full = single_block_bytes(b"payload behind a header that gets cut short");
+        let mut cursor = Cursor::new(full[..prefix_len].to_vec());
+        let err = read_raw_block(&mut cursor)
+            .expect_err("a partial header must error rather than read as EOF");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::UnexpectedEof,
+            "expected UnexpectedEof for a {prefix_len}-byte header prefix, got: {err}",
+        );
+    }
+
+    /// The block bytes must be byte-identical to what the pre-optimization
+    /// `vec![0u8; n]` + `read_exact` path produced, header included.
+    #[test]
+    fn test_read_raw_block_bytes_match_a_prezeroed_read() {
+        let full = single_block_bytes(b"payload bytes for comparison");
+
+        let mut cursor = Cursor::new(full.clone());
+        let block = read_raw_block(&mut cursor).expect("read").expect("a block");
+
+        // Independent oracle: the block is a prefix of the stream of exactly
+        // its own length, so compare against the raw bytes directly.
+        assert_eq!(
+            block.data.as_slice(),
+            &full[..block.data.len()],
+            "block bytes must match the stream verbatim",
+        );
+    }
 
     #[test]
     fn test_eof_block_detection() {
