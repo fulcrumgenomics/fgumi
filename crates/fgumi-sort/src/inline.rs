@@ -462,10 +462,11 @@ impl RecordBuffer {
         &mut self,
         threads: usize,
     ) -> Vec<InMemoryChunk<RawCoordinateKey>> {
-        // Scan once for the whole-buffer bound and hand it to every chunk's sort,
-        // so no chunk re-scans for its own maximum.
-        let max_key = max_non_sentinel_key(&self.refs);
-        let sort_chunk = |refs: &mut [RecordRef]| radix_sort_record_refs_with_max(refs, max_key);
+        // Each chunk derives its own bound inside its byte-0 counting pass, so
+        // there is no whole-buffer scan to share and no bound to pass around. A
+        // per-chunk bound is also never wider than a shared one, so chunks whose
+        // keys happen to be narrow run fewer passes.
+        let sort_chunk = |refs: &mut [RecordRef]| radix_sort_record_refs(refs);
         par_sort_into_chunks_impl!(self, threads, sort_chunk, HEADER_SIZE, |r: &RecordRef| {
             RawCoordinateKey { sort_key: r.sort_key }
         })
@@ -1621,14 +1622,13 @@ const RADIX_THRESHOLD: usize = 256;
 /// Sorts by the `sort_key` field using 8-bit radix (256 buckets).
 /// This is O(n×k) where k is the number of bytes to sort (typically 5-8).
 ///
-/// Scans `refs` for the maximum key, then defers to
-/// [`radix_sort_record_refs_with_max`]. A caller that already holds a valid
-/// bound — such as a chunked sort that derived one for the whole slice — can
-/// call that directly to skip the scan, at the cost of upholding its
-/// precondition.
+/// Derives the maximum non-sentinel key and the byte-0 histogram in a single
+/// fused counting pass, then dispatches to `radix_sort_sized` directly. See
+/// [`radix_sort_record_refs_with_max`] for the (non-production) entry point
+/// that accepts a caller-supplied bound instead.
 ///
-/// The scan deliberately ignores `u64::MAX` keys (the unmapped coordinate
-/// sentinel), which is what keeps `bytes_needed` at the ~5–6 bytes a mapped
+/// That counting pass deliberately ignores `u64::MAX` keys (the unmapped
+/// coordinate sentinel), which is what keeps `bytes_needed` at the ~5–6 bytes a mapped
 /// coordinate key occupies instead of widening to the full 8 the moment a
 /// single unmapped read appears — and coordinate-sorted BAMs essentially always
 /// carry an unmapped tail. Ignoring it needs no contract from the caller:
@@ -1640,20 +1640,82 @@ const RADIX_THRESHOLD: usize = 256;
 /// Radix sort is inherently stable - records with equal keys maintain their
 /// relative input order, matching samtools behavior.
 pub fn radix_sort_record_refs(refs: &mut [RecordRef]) {
-    let max_key = max_non_sentinel_key(refs);
-    radix_sort_record_refs_with_max(refs, max_key);
+    let n = refs.len();
+    if n < RADIX_THRESHOLD {
+        insertion_sort_refs(refs);
+        return;
+    }
+
+    // Derive the bound inside the byte-0 counting pass rather than in a separate
+    // traversal. That pass already loads every `sort_key` to build its
+    // histogram, so tracking the max costs a compare per record instead of a
+    // second pass over the array -- and because it happens before any element is
+    // scattered, the width is known in time to size the run.
+    //
+    // This is why `RecordBuffer` does not maintain a running bound across
+    // pushes: doing so would buy the same saved traversal at the cost of a field
+    // to keep in sync, and a bound that is wrong in release silently mis-sorts.
+    // Here the bound is recomputed from the data every time and cannot drift.
+    let mut counts = [0usize; 256];
+    let mut max_key = 0u64;
+    for r in refs.iter() {
+        counts[(r.sort_key & 0xFF) as usize] += 1;
+        if r.sort_key != u64::MAX {
+            max_key = max_key.max(r.sort_key);
+        }
+    }
+
+    radix_sort_sized(refs, bytes_needed_for(max_key), Some(&counts));
+}
+
+/// Number of radix byte-passes needed to order keys up to `max_key`.
+///
+/// Never zero: a bound of 0 does not mean the keys are all equal, since a zero
+/// key can coexist with `u64::MAX` sentinels and those do not compare equal. One
+/// pass separates them and is a stable no-op when the keys really are identical.
+///
+/// Widens by one byte when `max_key` exactly fills its byte count: a mapped
+/// `max_key` that is all-`0xFF` at `bytes_needed` bytes (e.g. `0xFFFF` from
+/// `tid = 0, pos = 32766, reverse`) truncates to the same value the `u64::MAX`
+/// sentinel does at that width, so the two would tie across every pass and the
+/// sentinel would be left in input order rather than sorting to the tail. Only
+/// the max can collide — any smaller key would need all its low bytes set, which
+/// would make it the max — so one extra byte forces a pass where the sentinel
+/// (`0xFF`) and the key (`0x00`) differ. `bytes_needed` is at most 8 already (a
+/// non-sentinel key is `< u64::MAX`), and the guard only fires below 8, so it
+/// never overflows.
+#[inline]
+fn bytes_needed_for(max_key: u64) -> usize {
+    let mut bytes_needed =
+        if max_key == 0 { 1 } else { ((64 - max_key.leading_zeros()) as usize).div_ceil(8) };
+    if bytes_needed < 8 && max_key == u64::MAX >> ((8 - bytes_needed) * 8) {
+        bytes_needed += 1;
+    }
+    bytes_needed
 }
 
 /// Largest key in `refs` that is not the unmapped sentinel (`u64::MAX`), or 0
 /// if there is no such key. See [`radix_sort_record_refs`] for why excluding
 /// the sentinel preserves the sort order.
+///
+/// The sort itself derives this inside its byte-0 counting pass rather than in a
+/// separate traversal; this standalone form remains for tests and benchmarks
+/// that need the bound without running a sort.
 #[inline]
 fn max_non_sentinel_key(refs: &[RecordRef]) -> u64 {
     refs.iter().map(|r| r.sort_key).filter(|&k| k != u64::MAX).max().unwrap_or(0)
 }
 
-/// Radix sort for `RecordRef` arrays using a precomputed maximum key, skipping
-/// the standalone max-finding scan that [`radix_sort_record_refs`] performs.
+/// Radix sort for `RecordRef` arrays using a caller-supplied maximum key.
+///
+/// No production path uses this: [`radix_sort_record_refs`] derives the bound
+/// from the data inside its first counting pass, which costs no extra traversal
+/// and cannot disagree with the keys it is sorting. This entry point exists for
+/// benchmarks and tests that need to pin a specific radix width -- passing
+/// `u64::MAX`, for instance, forces the full 8 passes to measure what narrowing
+/// saves. Prefer [`radix_sort_record_refs`] everywhere else: its bound carries
+/// no precondition, whereas this one silently mis-sorts if `max_key` is wrong in
+/// a release build.
 ///
 /// `max_key` sizes the number of radix byte-passes (`bytes_needed`). Each key
 /// must be **either `<= max_key` or exactly `u64::MAX`** (the unmapped
@@ -1679,28 +1741,24 @@ pub fn radix_sort_record_refs_with_max(refs: &mut [RecordRef], max_key: u64) {
          unmapped sentinel (u64::MAX); bytes_needed would be too small and records would mis-sort",
     );
 
-    // `max_key == 0` does NOT mean every key is equal: the slice may still mix
-    // zero keys with `u64::MAX` sentinels, and those must not be left in input
-    // order. (A zero key is reachable — `PackedCoordinateKey::new` packs
-    // `tid = 0, pos = -1, reverse = false` to exactly 0 — so this is not a
-    // hypothetical.) One pass separates them, since 0 scatters to bucket 0x00
-    // and the sentinel to 0xFF, and is a stable no-op when the keys really are
-    // all identical. So never skip the sort entirely.
-    let mut bytes_needed =
-        if max_key == 0 { 1 } else { ((64 - max_key.leading_zeros()) as usize).div_ceil(8) };
+    radix_sort_sized(refs, bytes_needed_for(max_key), None);
+}
 
-    // A mapped `max_key` that fills all `bytes_needed` bytes (all-`0xFF`, e.g.
-    // `0xFFFF` from tid=0/pos=32766/reverse) truncates to the same value the
-    // `u64::MAX` sentinel does at that width, so the two tie across every pass
-    // and the sentinel is left in input order rather than sorting to the tail.
-    // Only the max can collide — any smaller key would need all its low bytes
-    // set, which would make it the max — so widen by one byte in exactly that
-    // case to force a pass where the sentinel (`0xFF`) and the key (`0x00`)
-    // differ. `bytes_needed` is at most 8 already (a non-sentinel key is
-    // `< u64::MAX`), and the guard only fires below 8, so it never overflows.
-    if bytes_needed < 8 && max_key == u64::MAX >> ((8 - bytes_needed) * 8) {
-        bytes_needed += 1;
-    }
+/// Run `bytes_needed` LSD radix passes over `refs`.
+///
+/// `first_counts`, when supplied, is the byte-0 histogram the caller already
+/// built (see [`radix_sort_record_refs`], which builds it while deriving the
+/// bound). Reusing it keeps the fused bound derivation free of an extra
+/// traversal; passing `None` just counts byte 0 here as every later pass does.
+#[allow(clippy::uninit_vec, unsafe_code)]
+fn radix_sort_sized(
+    refs: &mut [RecordRef],
+    bytes_needed: usize,
+    first_counts: Option<&[usize; 256]>,
+) {
+    let n = refs.len();
+    debug_assert!(n >= RADIX_THRESHOLD, "callers handle short slices with insertion sort");
+    debug_assert!(bytes_needed >= 1, "a zero-width sort would leave zero keys behind sentinels");
 
     // Allocate auxiliary buffer
     let mut aux: Vec<RecordRef> = Vec::with_capacity(n);
@@ -1718,18 +1776,22 @@ pub fn radix_sort_record_refs_with_max(refs: &mut [RecordRef], max_key: u64) {
     // as `src` on the next pass. See CLAUDE.md "Approved hot-path unsafe".
     let mut src = refs as *mut [RecordRef];
     let mut dst = aux.as_mut_slice() as *mut [RecordRef];
+    let mut precomputed = first_counts.copied();
 
     // LSD radix sort - byte by byte from least significant
     for byte_idx in 0..bytes_needed {
         let src_slice = unsafe { &*src };
         let dst_slice = unsafe { &mut *dst };
 
-        // Count occurrences of each byte value
-        let mut counts = [0usize; 256];
-        for r in src_slice {
-            let byte = ((r.sort_key >> (byte_idx * 8)) & 0xFF) as usize;
-            counts[byte] += 1;
-        }
+        // Count occurrences of each byte value, unless the caller already did.
+        let mut counts = precomputed.take().unwrap_or_else(|| {
+            let mut counts = [0usize; 256];
+            for r in src_slice {
+                let byte = ((r.sort_key >> (byte_idx * 8)) & 0xFF) as usize;
+                counts[byte] += 1;
+            }
+            counts
+        });
 
         // Convert to cumulative offsets
         let mut total = 0;
@@ -2920,6 +2982,57 @@ mod tests {
         assert_eq!(keys.len(), n, "no record may be dropped");
     }
 
+    /// The bound is now derived inside the byte-0 counting pass and its
+    /// histogram is reused for that pass's scatter. Reusing a histogram across
+    /// the width decision is the part that could go wrong, so this pins that the
+    /// fused entry point agrees exactly -- ordering and stable tie-break -- with
+    /// the same sort driven by an externally supplied bound.
+    #[rstest::rstest]
+    #[case::mixed_with_sentinels(5_000, 5, false)]
+    #[case::no_sentinels(5_000, 0, false)]
+    #[case::mostly_sentinels(5_000, 90, false)]
+    #[case::just_over_threshold(RADIX_THRESHOLD + 1, 20, false)]
+    #[case::wide_keys(20_000, 10, true)]
+    fn test_fused_bound_matches_externally_supplied_bound(
+        #[case] n: usize,
+        #[case] sentinel_pct: usize,
+        #[case] wide: bool,
+    ) {
+        let mut refs: Vec<RecordRef> = Vec::with_capacity(n);
+        for i in 0..n {
+            // Deterministic scramble so equal keys occur and stability is observable.
+            let key = if sentinel_pct > 0 && (i * 37) % 100 < sentinel_pct {
+                u64::MAX
+            } else if wide {
+                // Spread non-sentinel keys across the low 7 bytes so the derived
+                // bound needs 4-8 radix passes, exercising `bytes_needed_for`'s
+                // wide-width path (and its all-`0xFF` collision widening) rather
+                // than the sub-2-byte range the other cases stay within.
+                (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) & 0x00FF_FFFF_FFFF_FFFF
+            } else {
+                ((i as u64 * 7919) % 50_000) + 1
+            };
+            refs.push(RecordRef::new(key, i as u64, 1));
+        }
+
+        let mut fused = refs.clone();
+        radix_sort_record_refs(&mut fused);
+
+        let mut supplied = refs.clone();
+        radix_sort_record_refs_with_max(&mut supplied, max_non_sentinel_key(&refs));
+
+        let as_pairs =
+            |v: &[RecordRef]| v.iter().map(|r| (r.sort_key, r.offset)).collect::<Vec<_>>();
+        assert_eq!(
+            as_pairs(&fused),
+            as_pairs(&supplied),
+            "fused bound derivation changed the output for n={n}, sentinels={sentinel_pct}%",
+        );
+
+        // And it really is sorted, not merely consistent with the other path.
+        assert!(fused.windows(2).all(|w| w[0].sort_key <= w[1].sort_key), "result is not sorted");
+    }
+
     /// Sorting with a bound derived from the mapped keys must be
     /// indistinguishable from sorting at full 8-byte width. This is the
     /// output-identity check behind the pass-narrowing: the sentinel's
@@ -3126,8 +3239,8 @@ mod tests {
         assert_chunks_sorted_and_complete(&chunks, n);
     }
 
-    /// `par_sort_into_chunks` derives one bound for the whole buffer and shares
-    /// it across every chunk, so the sentinel exclusion has to hold there too:
+    /// `par_sort_into_chunks` has each chunk derive its own bound inside its
+    /// byte-0 counting pass, so the sentinel exclusion has to hold per chunk:
     /// each chunk must come back sorted and no unmapped record may be lost, on
     /// both the single-threaded early-return path and the multi-threaded path
     /// (which drain `refs` through different branches of the macro).
@@ -3142,7 +3255,7 @@ mod tests {
         let mut buffer = RecordBuffer::with_capacity(n, n * 50, nref);
         let mut expected_unmapped = 0usize;
         for i in 0..n {
-            // Every 4th record unmapped, so the shared bound must exclude the
+            // Every 4th record unmapped, so each chunk's bound must exclude the
             // sentinel or the chunks would all sort at full width.
             if i % 4 == 3 {
                 buffer

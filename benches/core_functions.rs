@@ -1370,11 +1370,29 @@ fn bench_coordinate_radix_sort(c: &mut Criterion) {
                 criterion::BatchSize::LargeInput,
             );
         });
-        group.bench_with_input(BenchmarkId::new("scan_mapped_max", n), &refs, |b, refs| {
+        group.bench_with_input(BenchmarkId::new("fused_bound", n), &refs, |b, refs| {
             b.iter_batched(
                 || refs.clone(),
                 |mut v| {
                     radix_sort_record_refs(&mut v);
+                    black_box(v)
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        });
+        group.bench_with_input(BenchmarkId::new("scan_mapped_max", n), &refs, |b, refs| {
+            b.iter_batched(
+                || refs.clone(),
+                |mut v| {
+                    // The pre-fusion shape: a standalone traversal to derive the
+                    // bound, then the sort. Kept to measure what fusing saves.
+                    let max = v
+                        .iter()
+                        .map(|r: &RecordRef| r.sort_key)
+                        .filter(|&k| k != u64::MAX)
+                        .max()
+                        .unwrap_or(0);
+                    radix_sort_record_refs_with_max(&mut v, max);
                     black_box(v)
                 },
                 criterion::BatchSize::LargeInput,
