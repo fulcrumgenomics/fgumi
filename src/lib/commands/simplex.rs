@@ -246,11 +246,7 @@ impl Command for Simplex {
         // Validate inputs
         self.io.validate()?;
 
-        if let Some(max) = self.max_reads
-            && max < self.min_reads
-        {
-            bail!("--max-reads ({}) must be >= --min-reads ({})", max, self.min_reads);
-        }
+        self.validate_read_bounds()?;
 
         info!("Starting Simplex");
         info!("Input: {}", self.io.input.display());
@@ -510,6 +506,27 @@ impl Command for Simplex {
     }
 }
 impl Simplex {
+    /// Validates the `--min-reads` / `--max-reads` family-size bounds.
+    ///
+    /// `--min-reads 0` is rejected because it admits empty groups, silently turning
+    /// the minimum-family-size filter into a no-op (the `raw_records.len() < min_reads`
+    /// test can never fire). `codec` already enforces the same lower bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `min_reads` is 0, or if `max_reads` is below `min_reads`.
+    fn validate_read_bounds(&self) -> Result<()> {
+        if self.min_reads == 0 {
+            bail!("--min-reads must be >= 1 (a value of 0 admits empty groups)");
+        }
+        if let Some(max) = self.max_reads
+            && max < self.min_reads
+        {
+            bail!("--max-reads ({}) must be >= --min-reads ({})", max, self.min_reads);
+        }
+        Ok(())
+    }
+
     /// Execute using 7-step unified pipeline with --threads.
     ///
     /// This method is called when `--threads N` is specified with N > 1.
@@ -804,6 +821,28 @@ mod tests {
     /// A `Simplex` instance configured for testing
     fn create_test_simplex() -> Simplex {
         create_simplex_with_paths(PathBuf::from("test.bam"), PathBuf::from("out.bam"))
+    }
+
+    #[rstest]
+    #[case::min_reads_zero_rejected(0, None, false)]
+    #[case::min_reads_one(1, None, true)]
+    #[case::min_reads_three(3, None, true)]
+    #[case::max_below_min(3, Some(2), false)]
+    #[case::max_equals_min(3, Some(3), true)]
+    #[case::max_above_min(3, Some(9), true)]
+    fn test_validate_read_bounds(
+        #[case] min_reads: usize,
+        #[case] max_reads: Option<usize>,
+        #[case] expected_ok: bool,
+    ) {
+        let mut simplex = create_test_simplex();
+        simplex.min_reads = min_reads;
+        simplex.max_reads = max_reads;
+        assert_eq!(
+            simplex.validate_read_bounds().is_ok(),
+            expected_ok,
+            "unexpected result for min_reads={min_reads} max_reads={max_reads:?}"
+        );
     }
 
     /// Creates a Simplex command with the given input/output paths and default parameters.

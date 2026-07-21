@@ -7,7 +7,6 @@
 
 use crate::logging::OperationTimer;
 use crate::sam::{SamTag, is_template_coordinate_sorted};
-use crate::validation::validate_file_exists;
 use anyhow::{Result, bail};
 use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
@@ -103,18 +102,37 @@ pub struct Downsample {
     pub compression: CompressionOptions,
 }
 
+impl Downsample {
+    /// Validates that `--fraction` is a finite value in `(0.0, 1.0]`.
+    ///
+    /// The non-finite check must come first: `NaN` compares `false` against both
+    /// `<= 0.0` and `> 1.0`, so a bare range test admits it. A `NaN` fraction then
+    /// makes every `rng < fraction` sampling decision false, silently producing an
+    /// empty output BAM with exit code 0.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `fraction` is not finite or falls outside `(0.0, 1.0]`.
+    fn validate_fraction(fraction: f64) -> Result<()> {
+        if !fraction.is_finite() {
+            bail!("--fraction must be a finite number, got {fraction}");
+        }
+        if fraction <= 0.0 || fraction > 1.0 {
+            bail!("--fraction must be between 0.0 (exclusive) and 1.0 (inclusive), got {fraction}");
+        }
+        Ok(())
+    }
+}
+
 impl Command for Downsample {
     fn execute(&self, command_line: &str) -> Result<()> {
-        // Validate inputs
-        validate_file_exists(&self.io.input, "Input BAM")?;
+        // Validate inputs. Use the shared validator so stdin (`-` / `/dev/stdin`)
+        // is exempt from the file-existence check, matching every other streaming
+        // command; the BAM reader already handles stdin.
+        self.io.validate()?;
 
         // Validate fraction
-        if self.fraction <= 0.0 || self.fraction > 1.0 {
-            bail!(
-                "--fraction must be between 0.0 (exclusive) and 1.0 (inclusive), got {}",
-                self.fraction
-            );
-        }
+        Self::validate_fraction(self.fraction)?;
 
         let timer = OperationTimer::new("Downsampling reads");
 
@@ -384,6 +402,24 @@ fn get_mi_tag(record: &RawRecord) -> Result<String> {
 mod tests {
     use super::*;
     use fgumi_raw_bam::SamBuilder as RawSamBuilder;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::typical(0.5, true)]
+    #[case::lower_bound_exclusive(0.0, false)]
+    #[case::upper_bound_inclusive(1.0, true)]
+    #[case::negative(-0.1, false)]
+    #[case::above_one(1.5, false)]
+    #[case::nan(f64::NAN, false)]
+    #[case::infinity(f64::INFINITY, false)]
+    #[case::neg_infinity(f64::NEG_INFINITY, false)]
+    fn test_validate_fraction(#[case] fraction: f64, #[case] expected_ok: bool) {
+        assert_eq!(
+            Downsample::validate_fraction(fraction).is_ok(),
+            expected_ok,
+            "unexpected validation result for fraction {fraction}"
+        );
+    }
 
     /// Create a test record with a string MI tag.
     fn create_test_record(name: &str, mi: &str) -> RawRecord {
@@ -497,55 +533,6 @@ mod tests {
 
         let family = iter.next_family().expect("next_family should succeed");
         assert!(family.is_none());
-    }
-
-    #[test]
-    fn test_validate_fraction_too_low() {
-        let cmd = Downsample {
-            io: test_bam_io_options(),
-            fraction: 0.0,
-            rejects: None,
-            seed: None,
-            validate_mi_order: false,
-            histogram_kept: None,
-            histogram_rejected: None,
-            compression: CompressionOptions { compression_level: 1 },
-        };
-
-        // We can't call execute() without a real BAM file, but we can test the validation
-        assert!(cmd.fraction <= 0.0);
-    }
-
-    #[test]
-    fn test_validate_fraction_too_high() {
-        let cmd = Downsample {
-            io: test_bam_io_options(),
-            fraction: 1.5,
-            rejects: None,
-            seed: None,
-            validate_mi_order: false,
-            histogram_kept: None,
-            histogram_rejected: None,
-            compression: CompressionOptions { compression_level: 1 },
-        };
-
-        assert!(cmd.fraction > 1.0);
-    }
-
-    #[test]
-    fn test_validate_fraction_valid() {
-        let cmd = Downsample {
-            io: test_bam_io_options(),
-            fraction: 0.5,
-            rejects: None,
-            seed: None,
-            validate_mi_order: false,
-            histogram_kept: None,
-            histogram_rejected: None,
-            compression: CompressionOptions { compression_level: 1 },
-        };
-
-        assert!(cmd.fraction > 0.0 && cmd.fraction <= 1.0);
     }
 
     #[test]

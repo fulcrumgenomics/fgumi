@@ -425,7 +425,10 @@ impl Default for ConsensusCallingOptions {
 
 impl ConsensusCallingOptions {
     /// Maximum valid Phred score (Illumina 1.8+ uses 0-41, but we allow up to 93).
-    const MAX_PHRED: u8 = 93;
+    ///
+    /// 93 is the largest score representable in the SAM `!`..`~` QUAL alphabet;
+    /// anything above it would serialize to a byte outside that range.
+    pub(crate) const MAX_PHRED: u8 = 93;
 
     /// Validates the consensus calling options.
     ///
