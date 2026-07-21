@@ -189,6 +189,34 @@ pub fn validate_positive<T: Ord + Display + Default>(value: T, name: &str) -> Re
     Ok(())
 }
 
+/// Does `s` contain a genuine scientific-notation exponent?
+///
+/// True only for a digit or `.` followed by `e`/`E` and then an optional sign
+/// and at least one digit -- `1e5`, `1.5e10`, `2E+3`. A bare `e`/`E` test would
+/// also match the exabyte units `EB` and `EiB`, which are the only units
+/// `bytesize` accepts that contain an `E`, so `1EB` would be rejected as
+/// scientific notation.
+fn looks_like_scientific_notation(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.iter().enumerate().skip(1).any(|(i, &c)| {
+        if c != b'e' && c != b'E' {
+            return false;
+        }
+        // Mantissa: the character before must end a number.
+        let prev = bytes[i - 1];
+        if !prev.is_ascii_digit() && prev != b'.' {
+            return false;
+        }
+        // Exponent: an optional sign then at least one digit.
+        let mut rest = bytes[i + 1..].iter();
+        match rest.next() {
+            Some(&b'+' | &b'-') => rest.next().is_some_and(u8::is_ascii_digit),
+            Some(c) => c.is_ascii_digit(),
+            None => false,
+        }
+    })
+}
+
 /// Parses a memory size string into bytes.
 ///
 /// Accepts both plain numbers (interpreted as MiB) and human-readable formats like:
@@ -249,8 +277,11 @@ pub fn parse_memory_size(size_str: &str) -> Result<u64> {
         });
     }
 
-    // Reject scientific notation (e.g. "1e3") but allow decimals in human-readable sizes (e.g. "1.5GB")
-    if trimmed.contains('e') || trimmed.contains('E') {
+    // Reject scientific notation (e.g. "1e3") but allow decimals in human-readable
+    // sizes (e.g. "1.5GB"). Testing for a bare 'e'/'E' would also reject the
+    // exabyte units "EB"/"EiB" -- the only supported units containing 'E' -- so
+    // match a genuine mantissa-and-exponent instead.
+    if looks_like_scientific_notation(trimmed) {
         return Err(FgumiError::InvalidMemorySize {
             reason: format!(
                 "Scientific notation not supported: '{trimmed}'. Use integer values or human-readable formats like '2GB'."
@@ -291,6 +322,53 @@ pub fn parse_memory_size(size_str: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `EB`/`EiB` are the only units `bytesize` accepts that contain an `E`, so
+    /// a bare `contains('e')` check rejected them as scientific notation. The
+    /// replacement must still reject real exponents.
+    #[rstest]
+    #[case::exabyte("1EB", true)]
+    #[case::exbibyte("1EiB", true)]
+    #[case::exabyte_lower("1eb", true)]
+    #[case::gigabyte_unaffected("2GB", true)]
+    #[case::decimal_with_unit("1.5GB", true)]
+    #[case::plain_integer_mib("768", true)]
+    #[case::simple_exponent("1e5", false)]
+    #[case::decimal_exponent("1.5e10", false)]
+    #[case::signed_exponent("2E+3", false)]
+    #[case::negative_exponent("2e-3", false)]
+    fn test_parse_memory_size_exabytes_are_not_scientific_notation(
+        #[case] input: &str,
+        #[case] expect_ok: bool,
+    ) {
+        let result = parse_memory_size(input);
+        assert_eq!(result.is_ok(), expect_ok, "{input}: expected ok={expect_ok}, got {result:?}",);
+        if !expect_ok {
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("Scientific notation"),
+                "{input} should be rejected as scientific notation, got: {msg}",
+            );
+        }
+    }
+
+    /// The exponent detector on its own, including the shapes that are *not*
+    /// exponents and must be left for `bytesize` to parse.
+    #[rstest]
+    #[case::plain_exponent("1e5", true)]
+    #[case::uppercase_exponent("1E5", true)]
+    #[case::after_decimal_point("1.e5", true)]
+    #[case::signed("3e+2", true)]
+    #[case::exabyte_unit("1EB", false)]
+    #[case::exbibyte_unit("1EiB", false)]
+    #[case::leading_e("e5", false)]
+    #[case::trailing_e("5e", false)]
+    #[case::sign_without_digit("5e+", false)]
+    #[case::letter_before_e("Xe5", false)]
+    #[case::no_e_at_all("1024MB", false)]
+    fn test_looks_like_scientific_notation(#[case] input: &str, #[case] expected: bool) {
+        assert_eq!(looks_like_scientific_notation(input), expected, "input: {input}");
+    }
     use rstest::rstest;
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
