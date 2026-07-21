@@ -11,11 +11,18 @@
 //! Rejects land in batch-input order rather than mutex-acquisition order, and the
 //! rejects BAM inherits the input header. The pattern matches `commands::filter`.
 //!
+//! By default (`--target umi`) the tool reads and writes the `RX` UMI tag and
+//! stores the pre-correction value in `OX`. With `--target barcode` it instead
+//! reads and writes the `BC` sample/library-barcode tag and stores the
+//! pre-correction value in the fgumi-local `ob` tag. Only these two SAM-spec
+//! standard tags are selectable — there is no free-form tag override (see
+//! fgumi #239).
+//!
 //! # Example
 //!
 //! ```no_run
 //! use std::path::PathBuf;
-//! use fgumi_lib::commands::correct::CorrectUmis;
+//! use fgumi_lib::commands::correct::{CorrectUmis, Target};
 //! use fgumi_lib::commands::command::Command;
 //! use fgumi_lib::commands::common::{
 //!     BamIoOptions, CompressionOptions, QueueMemoryOptions, RejectsOptions,
@@ -30,6 +37,7 @@
 //!     },
 //!     rejects_opts: RejectsOptions { rejects: Some(PathBuf::from("rejects.bam")) },
 //!     metrics: Some(PathBuf::from("metrics.txt")),
+//!     target: Target::Umi,
 //!     max_mismatches: 2,
 //!     min_distance_diff: 2,
 //!     umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
@@ -85,6 +93,41 @@ use crate::commands::common::{
     ThreadingOptions, build_pipeline_config, parse_bool, serialize_raw_bam_records,
 };
 
+/// Which SAM tag `correct` operates on.
+///
+/// Bounded on purpose: unlike fgbio's free-form `-t/--umi-tag`, only the two
+/// SAM-spec standard tags below are selectable, so a pipeline cannot be pointed
+/// at an arbitrary tag (the misconfiguration class removed in fgumi #239).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Default)]
+pub enum Target {
+    /// Correct the raw UMI tag `RX`; stash the pre-correction value in `OX`.
+    #[default]
+    Umi,
+    /// Correct the sample/library barcode tag `BC`; stash the pre-correction
+    /// value in the fgumi-local `ob` tag.
+    Barcode,
+}
+
+impl Target {
+    /// Tag the observed sequence is read from and the corrected sequence
+    /// written to.
+    pub const fn sequence_tag(self) -> SamTag {
+        match self {
+            Target::Umi => SamTag::RX,
+            Target::Barcode => SamTag::BC,
+        }
+    }
+
+    /// Tag the pre-correction original sequence is stashed in when original
+    /// storage is enabled.
+    pub const fn original_tag(self) -> SamTag {
+        match self {
+            Target::Umi => SamTag::OX,
+            Target::Barcode => SamTag::OB,
+        }
+    }
+}
+
 /// Result of matching an observed UMI to an expected UMI.
 ///
 /// Contains information about whether the match was acceptable and the details
@@ -122,7 +165,7 @@ pub struct UmiMatch {
 /// # Example
 ///
 /// ```no_run
-/// # use fgumi_lib::commands::correct::CorrectUmis;
+/// # use fgumi_lib::commands::correct::{CorrectUmis, Target};
 /// # use fgumi_lib::commands::command::Command;
 /// # use fgumi_lib::commands::common::{
 /// #     BamIoOptions, CompressionOptions, QueueMemoryOptions, RejectsOptions,
@@ -137,6 +180,7 @@ pub struct UmiMatch {
 ///     },
 ///     rejects_opts: RejectsOptions { rejects: Some(PathBuf::from("rejects.bam")) },
 ///     metrics: Some(PathBuf::from("metrics.txt")),
+///     target: Target::Umi,
 ///     max_mismatches: 2,
 ///     min_distance_diff: 2,
 ///     umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
@@ -163,14 +207,16 @@ pub struct UmiMatch {
     long_about = r#"
 Corrects UMIs stored in BAM files when a set of fixed UMIs is in use.
 
-If the set of UMIs used in an experiment is known and is a _subset_ of the possible randomers
-of the same length, it is possible to error-correct UMIs prior to grouping reads by UMI. This
-tool takes an input BAM with UMIs in the `RX` tag and set of known UMIs (either on
-the command line or in a file) and produces:
+If the set of sequences used in an experiment is known and is a _subset_ of the possible randomers
+of the same length, it is possible to error-correct them prior to grouping reads. By default
+(`--target umi`), the tool corrects the `RX` UMI tag and stores the original in `OX`. With
+`--target barcode`, it corrects the `BC` barcode tag and stores the original in the fgumi-local
+`ob` tag. The tool accepts a set of known sequences (either on the command line or in a file)
+and produces:
 
-1. A new BAM with corrected UMIs written to the `RX` tag
-2. Optionally a set of metrics about the representation of each UMI in the set
-3. Optionally a second BAM file of reads whose UMIs could not be corrected within the specific parameters
+1. A new BAM with corrected sequences written back to the same tag they were read from (`RX` for `umi`, `BC` for `barcode`)
+2. Optionally a set of metrics about the representation of each sequence in the set
+3. Optionally a second BAM file of reads whose sequences could not be corrected within the specific parameters
 
 All of the fixed UMIs must be of the same length, and all UMIs in the BAM file must also have
 the same length. Multiple UMIs that are concatenated with hyphens (e.g. `AACCAGT-AGGTAGA`) are
@@ -199,11 +245,12 @@ If there are multiple UMIs per template, leading to hyphenated UMI tags, the val
 UMIs should be single, non-hyphenated UMIs (e.g. if a record has `RX:Z:ACGT-GGCA`, you would use
 `--umis ACGT GGCA`).
 
-## Original UMI Storage
+## Original Sequence Storage
 
-Records which have their UMIs corrected (i.e. the UMI is not identical to one of the expected
-UMIs but is close enough to be corrected) will by default have their original UMI stored in the
-`OX` tag. This can be disabled with the `--dont-store-original-umis` option.
+Records which have their sequences corrected (i.e. the sequence is not identical to one of the
+expected sequences but is close enough to be corrected) will by default have their original
+sequence stored in a backup tag: `OX` for `--target umi` or the fgumi-local `ob` tag for
+`--target barcode`. This can be disabled with the `--dont-store-original` option.
 "#
 )]
 pub struct CorrectUmis {
@@ -218,6 +265,11 @@ pub struct CorrectUmis {
     /// Optional output path for metrics TSV file.
     #[arg(short = 'M', long)]
     pub metrics: Option<PathBuf>,
+
+    /// Which SAM tag to correct: `umi` (RX; original stashed in OX) or
+    /// `barcode` (BC; original stashed in the fgumi-local `ob` tag).
+    #[arg(short = 't', long, value_enum, default_value_t = Target::Umi)]
+    pub target: Target,
 
     /// Maximum number of mismatches allowed.
     #[arg(long, default_value = "2")]
@@ -235,8 +287,17 @@ pub struct CorrectUmis {
     #[arg(short = 'U', long)]
     pub umi_files: Vec<PathBuf>,
 
-    /// Don't store original UMIs in a separate tag.
-    #[arg(long, default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    /// Don't store the pre-correction original sequence in a separate tag
+    /// (OX for umi, ob for barcode).
+    #[arg(
+        long = "dont-store-original",
+        alias = "dont-store-original-umis",
+        default_value = "false",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+        value_parser = parse_bool
+    )]
     pub dont_store_original_umis: bool,
 
     /// Size of the LRU cache for UMI matching.
@@ -373,7 +434,7 @@ impl Command for CorrectUmis {
     /// # Example
     ///
     /// ```no_run
-    /// # use fgumi_lib::commands::correct::CorrectUmis;
+    /// # use fgumi_lib::commands::correct::{CorrectUmis, Target};
     /// # use fgumi_lib::commands::common::{
     /// #     BamIoOptions, CompressionOptions, QueueMemoryOptions, RejectsOptions,
     /// #     SchedulerOptions, ThreadingOptions,
@@ -385,6 +446,7 @@ impl Command for CorrectUmis {
     /// #   io: BamIoOptions { input: PathBuf::new(), output: PathBuf::new(), async_reader: false },
     /// #   rejects_opts: RejectsOptions::default(),
     /// #   metrics: None,
+    /// #   target: Target::Umi,
     /// #   max_mismatches: 2,
     /// #   min_distance_diff: 2,
     /// #   umis: vec![],
@@ -775,12 +837,13 @@ impl CorrectUmis {
         record: &mut RawRecord,
         correction: &TemplateCorrection,
         umi_tag: [u8; 2],
+        original_tag: [u8; 2],
         dont_store_original_umis: bool,
     ) {
         use fgumi_raw_bam;
 
         if correction.needs_correction {
-            // Write corrected UMI first (in-place update avoids scanning past OX)
+            // Write corrected UMI first (in-place update avoids scanning past the original tag)
             if let Some(ref corrected) = correction.corrected_umi {
                 fgumi_raw_bam::update_string_tag(
                     record.as_mut_vec(),
@@ -790,11 +853,11 @@ impl CorrectUmis {
             }
 
             // Store original UMI if there were actual mismatches
-            // Use update_string_tag to avoid duplicate OX tags
+            // Use update_string_tag to avoid duplicate original-tag writes
             if !dont_store_original_umis && correction.has_mismatches {
                 fgumi_raw_bam::update_string_tag(
                     record.as_mut_vec(),
-                    SamTag::OX,
+                    original_tag,
                     correction.original_umi.as_bytes(),
                 );
             }
@@ -885,7 +948,8 @@ impl CorrectUmis {
         const BATCH_SIZE: usize = 1000; // Templates per batch
         let max_mismatches = self.max_mismatches;
         let min_distance_diff = self.min_distance_diff;
-        let umi_tag = Tag::from(SamTag::RX);
+        let umi_tag = Tag::from(self.target.sequence_tag());
+        let original_tag_sam = self.target.original_tag();
         let revcomp = self.revcomp;
         let cache_size = self.cache_size;
         let dont_store_original_umis = self.dont_store_original_umis;
@@ -935,6 +999,8 @@ impl CorrectUmis {
                 // Count ALL input records for progress tracking (not just kept/rejected)
                 let mut total_input_records = 0u64;
                 let umi_tag_bytes: [u8; 2] = [umi_tag.as_ref()[0], umi_tag.as_ref()[1]];
+                let original_tag_bytes: [u8; 2] =
+                    [original_tag_sam.as_ref()[0], original_tag_sam.as_ref()[1]];
 
                 for template in batch {
                     // Count input records BEFORE processing
@@ -994,6 +1060,7 @@ impl CorrectUmis {
                                             &mut raw,
                                             &correction,
                                             umi_tag_bytes,
+                                            original_tag_bytes,
                                             dont_store_original_umis,
                                         );
                                         kept_raw_records.push(raw);
@@ -1224,7 +1291,8 @@ impl CorrectUmis {
         let mut mismatched = 0u64;
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
 
-        let umi_tag_bytes: [u8; 2] = SamTag::RX.into();
+        let umi_tag_bytes: [u8; 2] = self.target.sequence_tag().into();
+        let original_tag_bytes: [u8; 2] = self.target.original_tag().into();
         let max_mismatches = self.max_mismatches;
         let min_distance_diff = self.min_distance_diff;
         let revcomp = self.revcomp;
@@ -1315,6 +1383,7 @@ impl CorrectUmis {
                                     &mut raw,
                                     &correction,
                                     umi_tag_bytes,
+                                    original_tag_bytes,
                                     dont_store_original_umis,
                                 );
                                 write_raw(&mut writer, &raw)?;
@@ -1660,6 +1729,36 @@ mod tests {
     }
 
     #[test]
+    fn parses_default_target_as_umi() {
+        let cmd = CorrectUmis::try_parse_from([
+            "correct", "-i", "in.bam", "-o", "out.bam", "-u", "ACGT", "-d", "2",
+        ])
+        .expect("parses with defaults");
+        assert_eq!(cmd.target, Target::Umi);
+    }
+
+    #[test]
+    fn parses_barcode_target_and_alias_flag() {
+        let cmd = CorrectUmis::try_parse_from([
+            "correct",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "-u",
+            "ACGT",
+            "-d",
+            "2",
+            "--target",
+            "barcode",
+            "--dont-store-original-umis",
+        ])
+        .expect("parses barcode target and the hidden alias");
+        assert_eq!(cmd.target, Target::Barcode);
+        assert!(cmd.dont_store_original_umis);
+    }
+
+    #[test]
     fn test_find_best_match_perfect() {
         let umi_set = get_encoded_umi_set();
 
@@ -1876,6 +1975,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions { rejects: Some(paths.rejects.clone()) },
             metrics: None,
+            target: Target::Umi,
             max_mismatches: 2,
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
@@ -1918,6 +2018,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions { rejects: None },
             metrics: None,
+            target: Target::Umi,
             max_mismatches: 2,
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
@@ -1960,6 +2061,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions::default(),
             metrics: None,
+            target: Target::Umi,
             max_mismatches: 2,
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string(), "CCC".to_string()],
@@ -1992,6 +2094,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions { rejects: Some(rejects.clone()) },
             metrics: None,
+            target: Target::Umi,
             max_mismatches: 2,
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
@@ -2042,6 +2145,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions { rejects: Some(rejects.clone()) },
             metrics: Some(metrics.clone()),
+            target: Target::Umi,
             max_mismatches: 3,
             min_distance_diff: 2,
             umis: vec![
@@ -2108,6 +2212,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions { rejects: Some(rejects.clone()) },
             metrics: None,
+            target: Target::Umi,
             max_mismatches: 3,
             min_distance_diff: 2,
             umis: vec![
@@ -2168,6 +2273,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions::default(),
             metrics: Some(metrics1.clone()),
+            target: Target::Umi,
             max_mismatches: 3,
             min_distance_diff: 2,
             umis: vec![
@@ -2197,6 +2303,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions::default(),
             metrics: Some(metrics2.clone()),
+            target: Target::Umi,
             max_mismatches: 3,
             min_distance_diff: 2,
             umis: vec![],
@@ -2242,6 +2349,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions::default(),
             metrics: None,
+            target: Target::Umi,
             max_mismatches: 2,
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string(), "TTTTTT".to_string(), "CCCCCC".to_string()],
@@ -2285,6 +2393,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions::default(),
             metrics: None,
+            target: Target::Umi,
             max_mismatches: 2,
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string(), "TTTTTT".to_string(), "CCCCCC".to_string()],
@@ -2329,6 +2438,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions::default(),
             metrics: None,
+            target: Target::Umi,
             max_mismatches: 2,
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string(), "TTTTTT".to_string(), "CCCCCC".to_string()],
@@ -2386,6 +2496,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions { rejects: Some(paths.rejects.clone()) },
             metrics: None,
+            target: Target::Umi,
             max_mismatches: 0, // Exact match only
             min_distance_diff: 1,
             umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
@@ -2434,6 +2545,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions { rejects: Some(paths.rejects.clone()) },
             metrics: Some(paths.metrics.clone()),
+            target: Target::Umi,
             max_mismatches: 2,
             min_distance_diff: 2,
             umis: vec![
@@ -2493,6 +2605,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions { rejects: Some(paths.rejects.clone()) },
             metrics: None,
+            target: Target::Umi,
             max_mismatches: 2,
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string()], // Only one UMI
@@ -2538,6 +2651,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions { rejects: Some(paths.rejects.clone()) },
             metrics: None,
+            target: Target::Umi,
             max_mismatches: 2,
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string()],
@@ -2582,6 +2696,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions { rejects: Some(paths.rejects.clone()) },
             metrics: None,
+            target: Target::Umi,
             max_mismatches: 1,
             min_distance_diff: 5, // Large distance for long UMIs
             umis: vec!["AAAAAAAAAAAAAAAAAAAA".to_string(), "CCCCCCCCCCCCCCCCCCCC".to_string()],
@@ -2625,6 +2740,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions::default(),
             metrics: None,
+            target: Target::Umi,
             max_mismatches: 1,
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string()],
@@ -2662,6 +2778,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions::default(),
             metrics: None,
+            target: Target::Umi,
             max_mismatches: 1,
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string()],
@@ -2703,6 +2820,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions::default(),
             metrics: None,
+            target: Target::Umi,
             max_mismatches: 0, // Exact match
             min_distance_diff: 1,
             umis: vec!["AAAAAA".to_string()],
@@ -2755,6 +2873,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions::default(),
             metrics: None,
+            target: Target::Umi,
             max_mismatches: 2,
             min_distance_diff: 2,
             umis: vec![
@@ -2817,6 +2936,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions::default(),
             metrics: None,
+            target: Target::Umi,
             max_mismatches: 2,
             min_distance_diff: 2,
             umis: vec![
@@ -2979,6 +3099,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions::default(),
             metrics: Some(paths.metrics.clone()),
+            target: Target::Umi,
             max_mismatches: 1, // Strict matching
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
@@ -3041,6 +3162,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions::default(),
             metrics: Some(paths.metrics.clone()),
+            target: Target::Umi,
             max_mismatches: 3,
             min_distance_diff: 2,
             umis: vec![
@@ -3102,6 +3224,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions::default(),
             metrics: Some(paths.metrics.clone()),
+            target: Target::Umi,
             max_mismatches: 2,
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
@@ -3145,6 +3268,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions::default(),
             metrics: Some(paths.metrics.clone()),
+            target: Target::Umi,
             max_mismatches: 4,
             min_distance_diff: 0,
             umis: vec!["AAAAAAAAA".to_string(), "TTTTTTTTT".to_string()],
@@ -3183,6 +3307,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions::default(),
             metrics: Some(paths.metrics.clone()),
+            target: Target::Umi,
             max_mismatches: 1,
             min_distance_diff: 2,
             umis: vec![
@@ -3272,6 +3397,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions::default(),
             metrics: Some(paths.metrics.clone()),
+            target: Target::Umi,
             max_mismatches: 1,
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
@@ -3344,6 +3470,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions::default(),
             metrics: None,
+            target: Target::Umi,
             max_mismatches: 2,
             min_distance_diff: 2,
             umis: FIXED_UMIS.iter().map(|s| (*s).to_string()).collect(),
@@ -3594,7 +3721,13 @@ mod tests {
             rejection_reason: RejectionReason::None,
         };
 
-        CorrectUmis::apply_correction_to_raw(&mut raw, &correction, *SamTag::RX, false);
+        CorrectUmis::apply_correction_to_raw(
+            &mut raw,
+            &correction,
+            *SamTag::RX,
+            *SamTag::OX,
+            false,
+        );
 
         // Verify corrected UMI
         let umi = fgumi_raw_bam::find_string_tag_in_record(&raw, SamTag::RX);
@@ -3626,7 +3759,13 @@ mod tests {
             rejection_reason: RejectionReason::None,
         };
 
-        CorrectUmis::apply_correction_to_raw(&mut raw, &correction, *SamTag::RX, false);
+        CorrectUmis::apply_correction_to_raw(
+            &mut raw,
+            &correction,
+            *SamTag::RX,
+            *SamTag::OX,
+            false,
+        );
 
         // Record should be unchanged
         assert_eq!(raw.len(), orig_len);
@@ -3714,6 +3853,7 @@ mod tests {
             },
             rejects_opts: RejectsOptions { rejects: Some(paths.rejects.clone()) },
             metrics: Some(paths.metrics.clone()),
+            target: Target::Umi,
             max_mismatches: 2,
             min_distance_diff: 2,
             umis: FIXED_UMIS.iter().map(|s| (*s).to_string()).collect(),
@@ -3835,7 +3975,7 @@ mod tests {
             rejection_reason: RejectionReason::None,
         };
 
-        CorrectUmis::apply_correction_to_raw(&mut raw, &correction, *SamTag::RX, true);
+        CorrectUmis::apply_correction_to_raw(&mut raw, &correction, *SamTag::RX, *SamTag::OX, true);
 
         // Corrected UMI should be present
         let umi = fgumi_raw_bam::find_string_tag_in_record(&raw, SamTag::RX);
@@ -3899,5 +4039,22 @@ mod tests {
             "estimate should account for kept-record capacities, rejects inner capacities, \
              and both outer-vec overheads",
         );
+    }
+
+    #[rstest]
+    #[case::umi(Target::Umi, SamTag::RX, SamTag::OX)]
+    #[case::barcode(Target::Barcode, SamTag::BC, SamTag::OB)]
+    fn target_maps_to_expected_tags(
+        #[case] target: Target,
+        #[case] expected_sequence: SamTag,
+        #[case] expected_original: SamTag,
+    ) {
+        assert_eq!(target.sequence_tag(), expected_sequence);
+        assert_eq!(target.original_tag(), expected_original);
+    }
+
+    #[test]
+    fn target_default_is_umi() {
+        assert_eq!(Target::default(), Target::Umi);
     }
 }

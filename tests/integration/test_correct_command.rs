@@ -7,15 +7,22 @@
 
 use clap::Parser;
 use fgumi_lib::commands::command::Command;
-use fgumi_lib::commands::correct::CorrectUmis;
+use fgumi_lib::commands::correct::{CorrectUmis, Target};
+use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::RawRecord;
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
+use noodles::sam::alignment::record::data::field::Tag;
+use noodles::sam::alignment::record_buf::data::field::Value;
+use rstest::rstest;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-use crate::helpers::bam_generator::{create_minimal_header, create_umi_family, to_record_buf};
+use crate::helpers::bam_generator::{
+    create_family_with_tag, create_minimal_header, create_umi_family, to_record_buf,
+};
 
 /// Write a BAM with UMI-tagged reads.
 fn create_umi_bam(path: &PathBuf, families: Vec<Vec<RawRecord>>) {
@@ -37,6 +44,59 @@ fn create_umi_bam(path: &PathBuf, families: Vec<Vec<RawRecord>>) {
 /// Write a UMI whitelist file.
 fn create_whitelist(path: &PathBuf, umis: &[&str]) {
     fs::write(path, umis.join("\n")).expect("Failed to write whitelist");
+}
+
+/// Read the output BAM into an independent per-record oracle: a map from read
+/// name to that record's values for `tags` (aligned to `tags`, `None` when a
+/// tag is absent). Enables order-independent, per-record identity assertions
+/// (`{QNAME -> (RX, BC, OX, ob)}`) instead of aggregate counts. Panics on a
+/// duplicate read name so the oracle stays unambiguous.
+fn records_by_name(path: &PathBuf, tags: &[SamTag]) -> BTreeMap<String, Vec<Option<String>>> {
+    let noodles_tags: Vec<Tag> = tags.iter().map(|t| t.to_noodles_tag()).collect();
+    let mut reader = bam::io::Reader::new(fs::File::open(path).expect("open bam"));
+    let header = reader.read_header().expect("read header");
+    let mut out: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
+    for result in reader.record_bufs(&header) {
+        let record = result.expect("read record");
+        let name = record
+            .name()
+            .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned())
+            .expect("record missing read name");
+        let values = noodles_tags
+            .iter()
+            .zip(tags)
+            .map(|(noodles_tag, tag)| {
+                record.data().get(noodles_tag).map(|value| match value {
+                    Value::String(s) => s.to_string(),
+                    other => panic!("{tag} tag is not a string: {other:?}"),
+                })
+            })
+            .collect();
+        assert!(out.insert(name.clone(), values).is_none(), "duplicate read name {name}");
+    }
+    out
+}
+
+/// Build the expected per-record oracle for `records_by_name(.., &[seq_tag,
+/// original_tag])` over a fixture of `exact_{0..exact}` reads (correct as-is,
+/// no original stored) and `corr_{0..corrected}` reads (one-mismatch, corrected
+/// with the original stored). `store_original` reflects whether the run kept
+/// the original value (`false` under `--dont-store-original`).
+fn expected_target_records(
+    exact: usize,
+    corrected: usize,
+    store_original: bool,
+) -> BTreeMap<String, Vec<Option<String>>> {
+    let seq = Some("ACGTACGT".to_string());
+    let original = store_original.then(|| "ACGTACGA".to_string());
+    let mut expected: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
+    for i in 0..exact {
+        expected.insert(format!("exact_{i}"), vec![seq.clone(), None]);
+    }
+    for i in 0..corrected {
+        expected.insert(format!("corr_{i}"), vec![seq.clone(), original.clone()]);
+    }
+    expected
 }
 
 /// Test basic UMI correction.
@@ -245,4 +305,202 @@ fn test_correct_command_rejects_streaming_threaded_integrity() {
     let observed_names: std::collections::HashSet<String> =
         observed_order.iter().cloned().collect();
     assert_eq!(observed_names, expected_names, "unexpected reject-name set");
+}
+
+/// Corrected value lands in the target's sequence tag (`RX` for UMI, `BC` for
+/// barcode) and the pre-correction original lands in the target's original
+/// tag (`OX` for UMI, `ob` for barcode); exact-match reads carry no original.
+///
+/// Asserts per-record identity (`{QNAME -> (seq_tag, original_tag)}`) against
+/// an independently constructed expected map, so a broken tag mapping — or one
+/// that drops/duplicates records — fails rather than passing an aggregate
+/// count. `seq_tag`/`original_tag` come from the case table (literal tags),
+/// not from `Target::sequence_tag()`, so the oracle does not derive its
+/// expectations from the code under test. Both the single-thread (`None`) and
+/// multi-threaded (`Some(2)`) pipeline paths are covered per target.
+#[rstest]
+#[case::umi_serial(Target::Umi, SamTag::RX, SamTag::OX, None)]
+#[case::umi_threaded(Target::Umi, SamTag::RX, SamTag::OX, Some(2))]
+#[case::barcode_serial(Target::Barcode, SamTag::BC, SamTag::OB, None)]
+#[case::barcode_threaded(Target::Barcode, SamTag::BC, SamTag::OB, Some(2))]
+fn correct_writes_corrected_value_and_original_by_target(
+    #[case] target: Target,
+    #[case] seq_tag: SamTag,
+    #[case] original_tag: SamTag,
+    #[case] threads: Option<usize>,
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let whitelist = temp_dir.path().join("whitelist.txt");
+
+    // 3 exact-match + 2 one-mismatch (correctable) reads on the target tag.
+    let exact = create_family_with_tag(seq_tag, "ACGTACGT", 3, "exact", "AAAAGGGG", 30);
+    let corrected = create_family_with_tag(seq_tag, "ACGTACGA", 2, "corr", "AAAAGGGG", 30);
+    create_umi_bam(&input_bam, vec![exact, corrected]);
+    create_whitelist(&whitelist, &["ACGTACGT"]);
+
+    let target_str = match target {
+        Target::Umi => "umi",
+        Target::Barcode => "barcode",
+    };
+    let mut args = vec![
+        "correct".to_string(),
+        "-i".to_string(),
+        input_bam.to_str().unwrap().to_string(),
+        "-o".to_string(),
+        output_bam.to_str().unwrap().to_string(),
+        "-U".to_string(),
+        whitelist.to_str().unwrap().to_string(),
+        "--max-mismatches".to_string(),
+        "1".to_string(),
+        "--min-distance".to_string(),
+        "1".to_string(),
+        "--target".to_string(),
+        target_str.to_string(),
+    ];
+    if let Some(n) = threads {
+        args.push("--threads".to_string());
+        args.push(n.to_string());
+    }
+    let cmd = CorrectUmis::try_parse_from(args).expect("parse");
+    cmd.execute("test").expect("correct runs");
+
+    // Independent per-record oracle: each named record must carry exactly the
+    // expected sequence-tag and original-tag values.
+    let actual = records_by_name(&output_bam, &[seq_tag, original_tag]);
+    let expected = expected_target_records(3, 2, true);
+    assert_eq!(actual, expected);
+}
+
+/// `--dont-store-original` suppresses the original-tag write for both targets,
+/// on both pipeline paths. The corrected reads are still kept and carry the
+/// corrected value in the sequence tag — asserted via the per-record oracle so
+/// the suppression check cannot pass vacuously on an empty (all-rejected)
+/// output. `seq_tag`/`original_tag` are literal case-table tags, decoupled from
+/// `Target::sequence_tag()`.
+#[rstest]
+#[case::umi_serial(Target::Umi, SamTag::RX, SamTag::OX, None)]
+#[case::umi_threaded(Target::Umi, SamTag::RX, SamTag::OX, Some(2))]
+#[case::barcode_serial(Target::Barcode, SamTag::BC, SamTag::OB, None)]
+#[case::barcode_threaded(Target::Barcode, SamTag::BC, SamTag::OB, Some(2))]
+fn correct_dont_store_original_suppresses_original_by_target(
+    #[case] target: Target,
+    #[case] seq_tag: SamTag,
+    #[case] original_tag: SamTag,
+    #[case] threads: Option<usize>,
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let whitelist = temp_dir.path().join("whitelist.txt");
+
+    // 3 exact-match + 2 one-mismatch (correctable) reads on the target tag, so
+    // the oracle can confirm kept records exist (guarding a vacuous pass).
+    let exact = create_family_with_tag(seq_tag, "ACGTACGT", 3, "exact", "AAAAGGGG", 30);
+    let corrected = create_family_with_tag(seq_tag, "ACGTACGA", 2, "corr", "AAAAGGGG", 30);
+    create_umi_bam(&input_bam, vec![exact, corrected]);
+    create_whitelist(&whitelist, &["ACGTACGT"]);
+
+    let target_str = match target {
+        Target::Umi => "umi",
+        Target::Barcode => "barcode",
+    };
+    let mut args = vec![
+        "correct".to_string(),
+        "-i".to_string(),
+        input_bam.to_str().unwrap().to_string(),
+        "-o".to_string(),
+        output_bam.to_str().unwrap().to_string(),
+        "-U".to_string(),
+        whitelist.to_str().unwrap().to_string(),
+        "--max-mismatches".to_string(),
+        "1".to_string(),
+        "--min-distance".to_string(),
+        "1".to_string(),
+        "--target".to_string(),
+        target_str.to_string(),
+        "--dont-store-original".to_string(),
+    ];
+    if let Some(n) = threads {
+        args.push("--threads".to_string());
+        args.push(n.to_string());
+    }
+    let cmd = CorrectUmis::try_parse_from(args).expect("parse");
+    cmd.execute("test").expect("correct runs");
+
+    // Corrected reads are still present and corrected, but NO original was
+    // stored (store_original = false) — even for the corrected reads.
+    let actual = records_by_name(&output_bam, &[seq_tag, original_tag]);
+    let expected = expected_target_records(3, 2, false);
+    assert_eq!(actual, expected);
+}
+
+/// Records carrying BOTH an `RX` (UMI) tag and a `BC` (barcode) tag, when run
+/// through `--target barcode`, should have only `BC`/`ob` touched: `BC` is
+/// corrected as expected, while `RX` is left byte-for-byte as the input wrote
+/// it and no `OX` tag is written. This guards against a correction pass
+/// bleeding across the two tag pairs when both are present on a record.
+#[test]
+fn correct_barcode_leaves_umi_tags_untouched() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let whitelist = temp_dir.path().join("whitelist.txt");
+
+    // Build families via the RX helper, then add a second BC tag to every
+    // record so each carries both tags: an untouched, unmatched-to-any-fixed
+    // UMI on RX and a barcode on BC that we want corrected.
+    let build_dual_tag_family = |bc: &str, depth: usize, base_name: &str| -> Vec<RawRecord> {
+        create_family_with_tag(SamTag::RX, "TTTTTTTT", depth, base_name, "AAAAGGGG", 30)
+            .into_iter()
+            .map(|mut record| {
+                fgumi_raw_bam::update_string_tag(record.as_mut_vec(), SamTag::BC, bc.as_bytes());
+                record
+            })
+            .collect()
+    };
+
+    let exact = build_dual_tag_family("ACGTACGT", 3, "exact");
+    let corrected = build_dual_tag_family("ACGTACGA", 2, "corr");
+    create_umi_bam(&input_bam, vec![exact, corrected]);
+    create_whitelist(&whitelist, &["ACGTACGT"]);
+
+    let cmd = CorrectUmis::try_parse_from([
+        "correct",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-o",
+        output_bam.to_str().unwrap(),
+        "-U",
+        whitelist.to_str().unwrap(),
+        "--max-mismatches",
+        "1",
+        "--min-distance",
+        "1",
+        "--target",
+        "barcode",
+    ])
+    .expect("parse");
+    cmd.execute("test").expect("correct runs");
+
+    // Per-record identity over both tag pairs (`RX`, `BC`, `OX`, `ob`): `BC` is
+    // corrected to the fixed barcode with the original stashed in `ob` for the
+    // corrected reads only, while the UMI pair is left exactly as the input
+    // wrote it — `RX` still the uncorrected "TTTTTTTT" and no `OX` on any
+    // record. Asserting full per-record identity (not aggregates) catches any
+    // cross-contamination between the two tag pairs.
+    let actual = records_by_name(&output_bam, &[SamTag::RX, SamTag::BC, SamTag::OX, SamTag::OB]);
+    let rx = || Some("TTTTTTTT".to_string());
+    let bc = || Some("ACGTACGT".to_string());
+    let mut expected: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
+    for i in 0..3 {
+        // exact-match barcode reads: BC unchanged in value, no `ob`.
+        expected.insert(format!("exact_{i}"), vec![rx(), bc(), None, None]);
+    }
+    for i in 0..2 {
+        // corrected barcode reads: BC corrected, original barcode in `ob`.
+        expected.insert(format!("corr_{i}"), vec![rx(), bc(), None, Some("ACGTACGA".to_string())]);
+    }
+    assert_eq!(actual, expected);
 }
