@@ -235,19 +235,11 @@ impl Command for Review {
         let consensus_out_path = self.output.with_extension("consensus.bam");
         let grouped_out_path = self.output.with_extension("grouped.bam");
 
-        use noodles::bam;
-        use noodles::bam::bai;
-        let consensus_index = bam::fs::index(&consensus_out_path)?;
-        let mut consensus_index_writer = bai::io::Writer::new(std::fs::File::create(
-            consensus_out_path.with_extension("bam.bai"),
-        )?);
-        consensus_index_writer.write_index(&consensus_index)?;
-
-        let grouped_index = bam::fs::index(&grouped_out_path)?;
-        let mut grouped_index_writer = bai::io::Writer::new(std::fs::File::create(
-            grouped_out_path.with_extension("bam.bai"),
-        )?);
-        grouped_index_writer.write_index(&grouped_index)?;
+        // Both paths are built with a `.bam` suffix above, so the sidecar naming
+        // is unchanged here; going through the shared helper keeps every writer
+        // on one convention rather than re-deriving it per call site.
+        fgumi_bam_io::write_bai_sidecar(&consensus_out_path)?;
+        fgumi_bam_io::write_bai_sidecar(&grouped_out_path)?;
 
         // Generate detailed review file
         info!("Generating detailed review file...");
@@ -260,12 +252,17 @@ impl Command for Review {
 }
 
 impl Review {
-    /// Load a BAM index, preferring the `<prefix>.bam.bai` sidecar and falling back
-    /// to `<prefix>.bai` for callers that used samtools' default naming.
+    /// Load a BAM index, preferring the samtools sidecar (`.bai` appended to the
+    /// full BAM path, e.g. `foo.bam` → `foo.bam.bai`) and falling back to the
+    /// extension-replaced form (`foo.bam` → `foo.bai`) that some tools emit.
+    ///
+    /// The lookup must derive the primary path the same way the writers do, or a
+    /// BAM whose name does not end in `.bam` would be indexed at one path and
+    /// searched for at another.
     fn read_bam_index(path: &Path) -> Result<noodles::bam::bai::Index> {
         use noodles::bam;
 
-        let bam_bai = path.with_extension("bam.bai");
+        let bam_bai = fgumi_bam_io::bai_sidecar_path(path);
         if bam_bai.exists() {
             return Ok(bam::bai::fs::read(&bam_bai)?);
         }
@@ -1553,7 +1550,7 @@ CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
             }
             drop(writer);
 
-            let index_path = path.with_extension("bam.bai");
+            let index_path = fgumi_bam_io::bai_sidecar_path(path);
             let index = bam::fs::index(path).expect("index bam");
             let mut index_writer =
                 bai::io::Writer::new(std::fs::File::create(&index_path).expect("create bai"));
@@ -1706,7 +1703,7 @@ CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
             use noodles::bam::bai;
 
             // Index raw BAM
-            let raw_index_path = raw_path.with_extension("bam.bai");
+            let raw_index_path = fgumi_bam_io::bai_sidecar_path(&raw_path);
             let raw_index = bam::fs::index(&raw_path).expect("failed to index BAM file");
             let mut raw_index_writer = bai::io::Writer::new(
                 std::fs::File::create(&raw_index_path).expect("failed to create file"),
@@ -1714,7 +1711,7 @@ CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
             raw_index_writer.write_index(&raw_index).expect("failed to write BAM index");
 
             // Index consensus BAM
-            let consensus_index_path = consensus_path.with_extension("bam.bai");
+            let consensus_index_path = fgumi_bam_io::bai_sidecar_path(&consensus_path);
             let con_index = bam::fs::index(&consensus_path).expect("failed to index BAM file");
             let mut con_index_writer = bai::io::Writer::new(
                 std::fs::File::create(&consensus_index_path).expect("failed to create file"),
@@ -1833,7 +1830,7 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
             for path in [&consensus_path, &grouped_path] {
                 let index = bam::fs::index(path).expect("failed to index BAM");
                 let mut writer = bai::io::Writer::new(
-                    std::fs::File::create(path.with_extension("bam.bai"))
+                    std::fs::File::create(fgumi_bam_io::bai_sidecar_path(path))
                         .expect("failed to create BAM index"),
                 );
                 writer.write_index(&index).expect("failed to write BAM index");

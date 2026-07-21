@@ -1,7 +1,10 @@
 //! BAM writer factories and related types.
 //!
 //! This module provides writer factories for BAM output, including standard BAM writers,
-//! raw-bytes BAM writers, and an incremental-indexing BAM writer.
+//! raw-bytes BAM writers, an incremental-indexing BAM writer, and BAI sidecar
+//! helpers (`bai_sidecar_path` for the naming convention, `write_bai_index` for
+//! a prebuilt index, and `write_bai_sidecar` to index a finished BAM and write
+//! its sidecar in one call).
 
 use anyhow::{Context, Result};
 use bgzf::CompressionLevel;
@@ -17,7 +20,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};
 use std::num::NonZero;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::paths::is_stdout_path;
 use crate::vendored::{BlockInfoRx, MultithreadedWriter, MultithreadedWriterBuilder};
@@ -598,10 +601,62 @@ pub fn create_indexing_bam_writer<P: AsRef<Path>>(
     Ok(writer)
 }
 
+/// Append `.bai` to a BAM path to form its conventional sidecar index path.
+///
+/// This appends to the **full** path, which is the samtools convention, rather
+/// than replacing the final extension:
+///
+/// - `foo.bam` → `foo.bam.bai`
+/// - `foo` (no extension) → `foo.bai`
+/// - `foo.sorted` → `foo.sorted.bai`
+///
+/// `Path::with_extension("bam.bai")` is not equivalent and must not be used
+/// here: it replaces everything after the last `.`, so it is correct only for
+/// paths ending in exactly `.bam`. For anything else it rewrites the basename
+/// itself — `foo.sorted` and `foo.other` both collapse to `foo.bam.bai`, so the
+/// index lands beside a file that does not exist and two sorts in one directory
+/// silently overwrite each other's index.
+#[must_use]
+pub fn bai_sidecar_path<P: AsRef<Path>>(bam_path: P) -> PathBuf {
+    let mut index_os = bam_path.as_ref().as_os_str().to_owned();
+    index_os.push(".bai");
+    PathBuf::from(index_os)
+}
+
+/// Build a BAI index for a finished coordinate-sorted BAM and write it to the
+/// conventional `<bam_path>.bai` sidecar, returning the path written.
+///
+/// The sidecar path comes from [`bai_sidecar_path`], so a BAM whose path does
+/// not end in `.bam` still gets a correctly named index.
+///
+/// **Invariant:** the BAM at `bam_path` must already be closed by its writer.
+/// [`noodles::bam::fs::index`] re-reads the file from disk to compute virtual
+/// offsets, so any buffered writes must have been flushed first.
+///
+/// Callers that already hold an in-memory index (for example an incrementally
+/// indexing writer) should not use this — it would re-read the whole BAM. Pair
+/// [`bai_sidecar_path`] with [`write_bai_index`] instead.
+///
+/// # Errors
+/// Returns an error if indexing the BAM or writing the BAI sidecar fails.
+pub fn write_bai_sidecar<P: AsRef<Path>>(bam_path: P) -> Result<PathBuf> {
+    let bam_path = bam_path.as_ref();
+
+    let index = noodles::bam::fs::index(bam_path)
+        .with_context(|| format!("Failed to index {}", bam_path.display()))?;
+
+    let index_path = bai_sidecar_path(bam_path);
+    write_bai_index(&index_path, &index)
+        .with_context(|| format!("Failed to write BAI to {}", index_path.display()))?;
+
+    Ok(index_path)
+}
+
 /// Write a BAI index to a file.
 ///
 /// # Arguments
-/// * `path` - Path for the output BAI file (typically `output.bam.bai`)
+/// * `path` - Path for the output BAI file; derive it with [`bai_sidecar_path`]
+///   rather than by replacing the BAM path's extension
 /// * `index` - The BAI index to write
 ///
 /// # Errors
@@ -1146,5 +1201,44 @@ mod tests {
 
         assert!(temp.path().metadata()?.len() > 0);
         Ok(())
+    }
+
+    /// The samtools convention appends `.bai` to the whole BAM path rather than
+    /// replacing the final extension. `Path::with_extension("bam.bai")` -- what
+    /// these call sites used to do -- happens to agree only for paths ending in
+    /// exactly `.bam`; for anything else it rewrites the basename, so distinct
+    /// outputs collide on one index path.
+    #[rstest::rstest]
+    #[case::plain_bam("foo.bam", "foo.bam.bai")]
+    #[case::no_extension("foo", "foo.bai")]
+    #[case::non_bam_extension("foo.sorted", "foo.sorted.bai")]
+    #[case::dotted_stem("sample.v2.bam", "sample.v2.bam.bai")]
+    #[case::with_directory("a/b/out", "a/b/out.bai")]
+    #[case::directory_with_dots("a.d/out.bam", "a.d/out.bam.bai")]
+    fn test_bai_sidecar_path_appends_to_full_path(#[case] bam: &str, #[case] expected: &str) {
+        assert_eq!(bai_sidecar_path(bam), PathBuf::from(expected));
+    }
+
+    /// The old expression and the new helper must agree exactly on `.bam` paths
+    /// (so this change is a no-op for the common case) and must differ on the
+    /// paths that were broken -- including two distinct outputs that previously
+    /// collapsed onto the same index path and would silently clobber each other.
+    #[test]
+    fn test_bai_sidecar_path_differs_from_with_extension_only_off_dot_bam() {
+        let with_ext = |p: &str| Path::new(p).with_extension("bam.bai");
+
+        assert_eq!(bai_sidecar_path("foo.bam"), with_ext("foo.bam"), "no change for .bam paths");
+
+        for broken in ["foo", "foo.sorted", "foo.other"] {
+            assert_ne!(
+                bai_sidecar_path(broken),
+                with_ext(broken),
+                "{broken} was mis-named by the old expression and must change",
+            );
+        }
+
+        // The collision the old expression produced: distinct outputs, one index.
+        assert_eq!(with_ext("foo.sorted"), with_ext("foo.other"));
+        assert_ne!(bai_sidecar_path("foo.sorted"), bai_sidecar_path("foo.other"));
     }
 }
