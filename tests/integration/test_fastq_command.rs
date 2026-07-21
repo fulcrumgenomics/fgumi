@@ -433,3 +433,113 @@ fn test_fastq_output_symlink_to_input_rejected() {
         "input BAM was truncated/clobbered through symlinked --output"
     );
 }
+
+/// Create a single-end BAM whose reads carry an `RX` UMI tag.
+fn create_bam_with_umis(path: &PathBuf, reads: &[(&str, &str)]) {
+    let header = create_minimal_header("chr1", 10000);
+    let mut writer =
+        bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
+    writer.write_header(&header).expect("Failed to write header");
+
+    for (name, umi) in reads {
+        let record = {
+            let mut b = SamBuilder::new();
+            b.read_name(name.as_bytes())
+                .sequence(b"ACGTACGT")
+                .qualities(&[30u8; 8])
+                .flags(0)
+                .ref_id(0)
+                .pos(99)
+                .mapq(60);
+            b.add_string_tag(fgumi_lib::sam::SamTag::RX, umi.as_bytes());
+            b.build()
+        };
+        writer
+            .write_alignment_record(&header, &to_record_buf(&record))
+            .expect("Failed to write record");
+    }
+    writer.try_finish().expect("Failed to finish BAM");
+}
+
+/// `-a` appends the record's UMI to the read name, rewriting fgumi's stored `-`
+/// duplex separator to `+` — reproducing `samtools fastq -U` / the DRAGEN layout.
+#[test]
+fn test_fastq_annotates_read_names_with_umi() {
+    let dir = TempDir::new().expect("temp dir");
+    let input_bam = dir.path().join("umi.bam");
+    let output_fq = dir.path().join("out.fq");
+    create_bam_with_umis(&input_bam, &[("readA", "ACGT"), ("readB", "ACGT-TTTT")]);
+
+    let cmd = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-o",
+        output_fq.to_str().unwrap(),
+        "-a",
+        "true",
+    ])
+    .expect("failed to parse fastq args");
+    cmd.execute("fgumi fastq").expect("fastq command failed");
+
+    let records = parse_fastq_records(&output_fq);
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].0, "readA:ACGT", "simplex UMI appended after ':'");
+    assert_eq!(records[1].0, "readB:ACGT+TTTT", "duplex '-' rewritten to '+'");
+
+    // Without -a the names are untouched.
+    let plain_fq = dir.path().join("plain.fq");
+    let cmd = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-o",
+        plain_fq.to_str().unwrap(),
+    ])
+    .expect("failed to parse fastq args");
+    cmd.execute("fgumi fastq").expect("fastq command failed");
+    assert_eq!(parse_fastq_records(&plain_fq)[0].0, "readA");
+}
+
+/// A `.gz` output path must be real BGZF, not plain text under a compressed name.
+#[test]
+fn test_fastq_gz_output_is_real_bgzf() {
+    let dir = TempDir::new().expect("temp dir");
+    let input_bam = dir.path().join("umi.bam");
+    let output_gz = dir.path().join("out.fq.gz");
+    let output_fq = dir.path().join("out.fq");
+    create_bam_with_umis(&input_bam, &[("readA", "ACGT"), ("readB", "TTTT")]);
+
+    for output in [&output_gz, &output_fq] {
+        let cmd = Fastq::try_parse_from([
+            "fastq",
+            "-i",
+            input_bam.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .expect("failed to parse fastq args");
+        cmd.execute("fgumi fastq").expect("fastq command failed");
+    }
+
+    let bytes = fs::read(&output_gz).expect("read gz output");
+    assert_eq!(&bytes[..2], &[0x1f, 0x8b], "output must carry gzip magic, not plain text");
+    assert!(bytes.ends_with(&fgumi_bgzf::BGZF_EOF), "BGZF stream must end with the EOF marker");
+
+    // Decompresses byte-for-byte to the FASTQ the uncompressed path produces.
+    let mut cursor = std::io::Cursor::new(&bytes);
+    let blocks = fgumi_bgzf::read_raw_blocks(&mut cursor, 64).expect("read blocks");
+    let mut decompressor = libdeflater::Decompressor::new();
+    let mut decoded = Vec::new();
+    for block in &blocks {
+        decoded.extend_from_slice(
+            &fgumi_bgzf::decompress_block(block, &mut decompressor).expect("decompress"),
+        );
+    }
+    let text = String::from_utf8(decoded).expect("utf8");
+    let expected = fs::read_to_string(&output_fq).expect("read plain fq output");
+    // Guard the oracle itself, so a shared defect in both paths cannot pass vacuously.
+    assert_eq!(expected.lines().count(), 8, "plain-path oracle: two records, four lines each");
+    assert!(text.starts_with("@readA\n"), "decompressed FASTQ should start with readA");
+    assert_eq!(text, expected, "BGZF output must decompress to the plain-path FASTQ byte-for-byte");
+}
