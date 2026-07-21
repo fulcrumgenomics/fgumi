@@ -283,6 +283,24 @@ pub struct Sort {
     #[arg(short = '@', short_alias = 't', long = "threads", default_value = "1")]
     pub threads: usize,
 
+    /// Number of threads for the sort phase (accumulate, sort, spill).
+    ///
+    /// Defaults to `--threads`. Lower this to cede cores to an upstream
+    /// producer while keeping the merge wide -- e.g. in
+    /// `bwa mem -t 32 ... | fgumi sort -@ 8 --sort-threads 4`, ingest competes
+    /// with the aligner but the merge does not.
+    ///
+    /// This only changes scheduling; the output is byte-identical.
+    #[arg(long = "sort-threads")]
+    pub sort_threads: Option<usize>,
+
+    /// Number of threads for the merge phase (k-way merge and output write).
+    ///
+    /// Defaults to `--threads`. This only changes scheduling; the output is
+    /// byte-identical.
+    #[arg(long = "merge-threads")]
+    pub merge_threads: Option<usize>,
+
     /// Compression options for output BAM.
     #[command(flatten)]
     pub compression: CompressionOptions,
@@ -432,6 +450,33 @@ impl Command for Sort {
 }
 
 impl Sort {
+    /// Construct the sorter from this command's options.
+    ///
+    /// Extracted from `execute` so the option-to-builder wiring is testable on
+    /// its own. That matters most for `--sort-threads` / `--merge-threads`:
+    /// they only affect scheduling, so an end-to-end run cannot distinguish a
+    /// correctly wired flag from one that was parsed and then dropped.
+    fn build_sorter(&self, effective_memory: usize, command_line: &str) -> RawExternalSorter {
+        let mut sorter = RawExternalSorter::new(self.order.into())
+            .memory_limit(effective_memory)
+            .threads(self.threads)
+            .output_compression(self.compression.compression_level)
+            .temp_compression(self.temp_compression)
+            .spill_codec(self.temp_codec)
+            .write_index(self.write_index)
+            .async_reader(self.async_reader)
+            .pg_info(crate::version::VERSION.to_string(), command_line.to_string());
+
+        // Each per-phase override is optional and falls back to `--threads`.
+        if let Some(n) = self.sort_threads {
+            sorter = sorter.sort_threads(n);
+        }
+        if let Some(n) = self.merge_threads {
+            sorter = sorter.merge_threads(n);
+        }
+        sorter
+    }
+
     /// Parse the cell tag for template-coordinate sort/verify, returning `None`
     /// for other sort orders.
     fn parse_cell_tag(&self) -> Result<Option<SamTag>> {
@@ -508,15 +553,7 @@ impl Sort {
         }
 
         // Sort using raw-bytes sorter for optimal memory efficiency and speed
-        let mut sorter = RawExternalSorter::new(self.order.into())
-            .memory_limit(effective_memory)
-            .threads(self.threads)
-            .output_compression(self.compression.compression_level)
-            .temp_compression(self.temp_compression)
-            .spill_codec(self.temp_codec)
-            .write_index(self.write_index)
-            .async_reader(self.async_reader)
-            .pg_info(crate::version::VERSION.to_string(), command_line.to_string());
+        let mut sorter = self.build_sorter(effective_memory, command_line);
 
         // For auto mode, cap initial buffer pre-allocation at 768 MiB/thread
         // (matching samtools default) to avoid huge upfront allocations.
@@ -750,6 +787,97 @@ mod tests {
         assert_eq!(sort.temp_codec, expected);
     }
 
+    /// The per-phase flags must parse and reach the command struct, defaulting
+    /// to `None` (which the builder resolves to `--threads`) when not passed.
+    #[rstest]
+    #[case::neither(&[], None, None)]
+    #[case::sort_only(&["--sort-threads", "4"], Some(4), None)]
+    #[case::merge_only(&["--merge-threads", "3"], None, Some(3))]
+    #[case::both(&["--sort-threads", "2", "--merge-threads", "8"], Some(2), Some(8))]
+    fn test_parse_per_phase_threads(
+        #[case] extra: &[&str],
+        #[case] expected_sort: Option<usize>,
+        #[case] expected_merge: Option<usize>,
+    ) {
+        let base = ["sort", "-i", "in.bam", "-o", "out.bam", "--order", "coordinate"];
+        let args: Vec<&str> = base.iter().copied().chain(extra.iter().copied()).collect();
+        let sort = Sort::try_parse_from(args).expect("parse should succeed");
+        assert_eq!(sort.sort_threads, expected_sort);
+        assert_eq!(sort.merge_threads, expected_merge);
+    }
+
+    /// The flags must actually reach the sorter. This cannot be checked through
+    /// an end-to-end run: the per-phase counts only affect scheduling, so a flag
+    /// that parsed and was then silently dropped produces byte-identical output
+    /// to one that was wired correctly. Assert the resolved per-phase counts on
+    /// the built sorter instead.
+    #[rstest]
+    #[case::defaults(None, None, 2, 2)]
+    #[case::narrow_sort(Some(1), Some(4), 1, 4)]
+    #[case::narrow_merge(Some(4), Some(1), 4, 1)]
+    #[case::sort_only(Some(3), None, 3, 2)]
+    #[case::merge_only(None, Some(3), 2, 3)]
+    fn test_build_sorter_wires_per_phase_threads(
+        #[case] sort_threads: Option<usize>,
+        #[case] merge_threads: Option<usize>,
+        #[case] expected_phase1: usize,
+        #[case] expected_phase2: usize,
+    ) {
+        let mut sort = make_sort(SortOrderArg::Coordinate);
+        sort.threads = 2;
+        sort.sort_threads = sort_threads;
+        sort.merge_threads = merge_threads;
+
+        let sorter = sort.build_sorter(512 * 1024 * 1024, "fgumi sort (test)");
+        assert_eq!(sorter.phase1_threads(), expected_phase1);
+        assert_eq!(sorter.phase2_threads(), expected_phase2);
+    }
+
+    /// Separately, the knob must not change what is written. Covers the same
+    /// asymmetric splits end-to-end through `execute`.
+    #[rstest]
+    #[case::defaults(None, None)]
+    #[case::narrow_sort(Some(1), Some(4))]
+    #[case::narrow_merge(Some(4), Some(1))]
+    fn test_execute_with_per_phase_threads_is_output_identical(
+        #[case] sort_threads: Option<usize>,
+        #[case] merge_threads: Option<usize>,
+    ) {
+        use fgumi_sam::SamBuilder;
+
+        let mut builder = SamBuilder::new();
+        for i in 0..60 {
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i:04}"))
+                .start1((60 - i) * 100 + 1)
+                .start2((60 - i) * 100 + 51)
+                .build();
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("in.bam");
+        builder.write_bam(&input).expect("write bam");
+
+        let run = |st: Option<usize>, mt: Option<usize>, out: PathBuf| {
+            let mut sort = make_sort(SortOrderArg::Coordinate);
+            sort.input = input.clone();
+            sort.output = Some(out.clone());
+            sort.threads = 2;
+            sort.sort_threads = st;
+            sort.merge_threads = mt;
+            sort.execute("fgumi sort (test)").expect("sort should succeed");
+            std::fs::read(&out).expect("read output")
+        };
+
+        let baseline = run(None, None, dir.path().join("baseline.bam"));
+        let actual = run(sort_threads, merge_threads, dir.path().join("actual.bam"));
+        assert_eq!(
+            actual, baseline,
+            "per-phase threads must not change output bytes (sort={sort_threads:?}, \
+             merge={merge_threads:?})",
+        );
+    }
+
     /// Helper to construct a `Sort` struct with a given order.
     fn make_sort(order: SortOrderArg) -> Sort {
         Sort {
@@ -763,6 +891,8 @@ mod tests {
             memory_per_thread: true,
             tmp_dirs: Vec::new(),
             threads: 1,
+            sort_threads: None,
+            merge_threads: None,
             compression: CompressionOptions::default(),
             temp_compression: 1,
             temp_codec: fgumi_sort::SpillCodec::default(),
