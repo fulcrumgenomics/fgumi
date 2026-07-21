@@ -117,7 +117,7 @@ Enable with: `cargo build --release --features <feature>`
 |---------|-------------|------------------|
 | `extract` | Extract UMIs from FASTQ files | `fgbio ExtractUmisFromBam` |
 | `correct` | Correct UMIs based on sequence similarity | `fgbio CorrectUmis` |
-| `zipper` | Restore original FASTQ from unaligned BAM | `fgbio ZipperBams`, `picard MergeBamAlignment` |
+| `zipper` | Merge alignments back onto the unmapped BAM, restoring its tags | `fgbio ZipperBams`, `picard MergeBamAlignment` |
 | `fastq` | Convert BAM to FASTQ format | `samtools fastq` |
 | `sort` | Sort BAM by coordinate/queryname/template | — |
 | `group` | Group reads by UMI | `fgbio GroupReadsByUmi` |

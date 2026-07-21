@@ -137,8 +137,9 @@ source molecule. The likelihood model is as follows:
    preparation, through preparing the library for sequencing (e.g. amplification, target selection), and finally,
    through sequencing.
 
-This tool assumes that reads with the same tag are grouped together (consecutive in the file). Also, this tool
-calls each end of a pair independently, and does not jointly call bases that overlap within a pair. Insertion or
+This tool assumes that reads with the same tag are grouped together (consecutive in the file). Bases that
+overlap within a read pair are consensus called jointly before UMI consensus calling; pass
+--consensus-call-overlapping-bases false to call each end of a pair independently, as fgbio does. Insertion or
 deletion errors in the reads are not considered in the consensus model.
 
 The consensus reads produced are unaligned, due to the difficulty and error-prone nature of inferring the consensus
