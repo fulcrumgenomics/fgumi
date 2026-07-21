@@ -1041,6 +1041,11 @@ impl DuplexConsensusCaller {
     /// * `first_of_pair` - Whether this is first of pair (for RX orientation)
     /// * `cell_tag` - Optional cell barcode tag (e.g., CB)
     /// * `cell_barcode` - Optional cell barcode value to add to record
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `<prefix>:<UMI>` read name exceeds BAM's
+    /// 254-byte limit, which an over-long input-derived `umi` can cause.
     #[expect(
         clippy::too_many_arguments,
         reason = "duplex record construction requires many parameters from the calling context"
@@ -1048,10 +1053,6 @@ impl DuplexConsensusCaller {
     #[expect(
         clippy::too_many_lines,
         reason = "BAM record construction has many sequential tag-writing steps"
-    )]
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "Result return type kept for API consistency with other consensus record builders"
     )]
     pub(crate) fn duplex_read_into(
         builder: &mut UnmappedSamBuilder,
@@ -1085,7 +1086,9 @@ impl DuplexConsensusCaller {
 
         // Build the record (name, flags, bases, quals)
         let read_name = format!("{read_name_prefix}:{umi}");
-        builder.build_record(read_name.as_bytes(), flag, &consensus.bases, &consensus.quals);
+        // The UMI is input-derived, so an over-long name is bad data rather than
+        // a bug; propagate instead of panicking mid-write.
+        builder.try_build_record(read_name.as_bytes(), flag, &consensus.bases, &consensus.quals)?;
 
         // 1. MI tag (string)
         builder.append_string_tag(SamTag::MI, umi.as_bytes());

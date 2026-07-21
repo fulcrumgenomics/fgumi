@@ -1318,7 +1318,7 @@ impl VanillaUmiConsensusCaller {
             &depths,
             &errors,
             methylation.as_ref(),
-        );
+        )?;
 
         Ok((true, surviving_count, surviving_reads))
     }
@@ -1433,6 +1433,11 @@ impl VanillaUmiConsensusCaller {
     }
 
     /// Builds a consensus record as raw BAM bytes and writes it into a `ConsensusOutput`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `<prefix>:<UMI>` read name exceeds BAM's
+    /// 254-byte limit, which an over-long input-derived `umi` can cause.
     #[expect(
         clippy::too_many_arguments,
         reason = "consensus record building requires many parameters from the calling context"
@@ -1448,7 +1453,7 @@ impl VanillaUmiConsensusCaller {
         depths: &[u16],
         errors: &[u16],
         methylation: Option<&crate::methylation::MethylationAnnotation>,
-    ) {
+    ) -> Result<()> {
         let read_name = format!("{}:{}", self.read_name_prefix, umi);
 
         let mut flag = flags::UNMAPPED;
@@ -1462,7 +1467,9 @@ impl VanillaUmiConsensusCaller {
             ReadType::Fragment => {}
         }
 
-        self.bam_builder.build_record(read_name.as_bytes(), flag, bases, quals);
+        // The UMI is input-derived, so an over-long name is bad data rather than
+        // a bug; propagate instead of panicking mid-write.
+        self.bam_builder.try_build_record(read_name.as_bytes(), flag, bases, quals)?;
 
         // RG tag
         self.bam_builder.append_string_tag(SamTag::RG, self.read_group_id.as_bytes());
@@ -1545,6 +1552,7 @@ impl VanillaUmiConsensusCaller {
         // Write record with block_size prefix
         self.bam_builder.write_with_block_size(&mut output.data);
         output.count += 1;
+        Ok(())
     }
 }
 
@@ -4600,6 +4608,65 @@ mod tests {
 
         // This should panic - can't pad to smaller length
         let _ = read.padded_default(7, true);
+    }
+
+    /// A consensus read name is `<prefix>:<UMI>` and the UMI comes straight from
+    /// the input BAM's MI tag, so its length is data-controlled. An over-long
+    /// UMI must surface as an error, not abort the command with a Rust panic
+    /// partway through writing the output BAM and leave a truncated file behind.
+    ///
+    /// The boundary is exact: BAM stores the name length in one byte including
+    /// the NUL, so `prefix:` plus the UMI must stay at 254 bytes or fewer.
+    #[rstest]
+    #[case::just_fits(244, true)]
+    #[case::one_too_long(245, false)]
+    #[case::absurdly_long(4096, false)]
+    fn test_over_long_umi_errors_instead_of_panicking(
+        #[case] umi_len: usize,
+        #[case] expect_ok: bool,
+    ) {
+        // "consensus:" is 10 bytes, so a 244-byte UMI lands exactly on the 254 limit.
+        let umi = vec![b'A'; umi_len];
+        let mut b1 = SamBuilder::new();
+        b1.read_name(b"read1")
+            .ref_id(0)
+            .pos(0)
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+            .sequence(b"ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .cigar_ops(&[encode_op(0, 4)])
+            .add_string_tag(SamTag::MI, &umi);
+        let r1 = b1.build();
+
+        let mut b2 = SamBuilder::new();
+        b2.read_name(b"read1")
+            .ref_id(0)
+            .pos(0)
+            .flags(flags::PAIRED | flags::LAST_SEGMENT)
+            .sequence(b"ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .cigar_ops(&[encode_op(0, 4)])
+            .add_string_tag(SamTag::MI, &umi);
+        let r2 = b2.build();
+
+        let options = VanillaUmiConsensusOptions {
+            min_reads: 1,
+            min_consensus_base_quality: 0,
+            ..Default::default()
+        };
+        let mut caller =
+            VanillaUmiConsensusCaller::new("consensus".to_string(), "A".to_string(), options);
+
+        // `consensus_reads` returns Result, so a too-long name must come back as
+        // Err. If the assertion path were still in play this would panic and the
+        // test would fail rather than report a clean error.
+        let result = caller.consensus_reads(vec![r1, r2]);
+
+        assert_eq!(result.is_ok(), expect_ok, "UMI of {umi_len} bytes: expected ok={expect_ok}",);
+        if let Err(e) = result {
+            let msg = format!("{e:#}");
+            assert!(msg.contains("read name too long"), "unexpected error for {umi_len}: {msg}");
+        }
     }
 
     /// Test that statistics are counted correctly without double-counting.
