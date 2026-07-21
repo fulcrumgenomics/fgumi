@@ -162,7 +162,10 @@ pub use codec::SpillCodec;
 pub use external::{
     KeyTypesSpec, LibraryLookup, RawExternalSorter, cb_hasher, extract_template_key_inline,
 };
-pub use inline::{TemplateKey, extract_coordinate_key_inline};
+pub use inline::{
+    PackedCoordinateKey, RecordRef, TemplateKey, extract_coordinate_key_inline,
+    radix_sort_record_refs, radix_sort_record_refs_with_max,
+};
 pub use keys::{
     QuerynameComparator, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
     SortContext, SortOrder, natural_compare, natural_compare_nul, normalize_natural_key,
