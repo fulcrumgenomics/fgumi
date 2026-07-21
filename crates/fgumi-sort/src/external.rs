@@ -58,6 +58,31 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+/// Maximum number of records held in one in-memory chunk.
+///
+/// Each key carries its ingest position within the chunk (see
+/// [`RawSortKey::set_position`](crate::keys::RawSortKey::set_position)) so that
+/// the key is a *total* order and the chunk sort can be unstable. That position
+/// is a `u32`, so a chunk that grew past `u32::MAX` records would have to stamp
+/// two records with the same position — exact name/flag ties would stop being
+/// totally ordered and the unstable sort could reorder them, breaking output
+/// identity with `samtools sort -n`.
+///
+/// A chunk spills on `memory_limit` long before this in any real run (holding
+/// this many records needs hundreds of GB). This is the backstop that makes the
+/// `usize` -> `u32` narrowing at the stamp site provably lossless rather than
+/// merely unlikely to overflow.
+const MAX_CHUNK_RECORDS: usize = u32::MAX as usize;
+
+/// Whether the current chunk must be spilled before accepting another record.
+///
+/// Spilling is normally driven by `memory_limit`; `MAX_CHUNK_RECORDS` is the
+/// second, independent trigger that keeps ingest positions unique within a
+/// chunk (see [`MAX_CHUNK_RECORDS`]).
+fn should_spill_chunk(memory_used: usize, memory_limit: usize, chunk_records: usize) -> bool {
+    memory_used >= memory_limit || chunk_records >= MAX_CHUNK_RECORDS
+}
+
 // ============================================================================
 // Per-Phase Timing for Sort Pipeline
 // ============================================================================
@@ -2665,8 +2690,14 @@ impl RawExternalSorter {
             stats.total_records += 1;
             progress.log_if_needed(1);
 
-            // Extract key from raw bytes
-            let key = K::extract(record.as_ref(), &ctx);
+            // Extract key from raw bytes. Stamp the ingest position within this
+            // chunk so the key is totally ordered: read name + flags alone is not
+            // (secondary alignments of one read collide), and without a tiebreak
+            // the chunk sort would have to be stable to preserve ingest order.
+            let mut key = K::extract(record.as_ref(), &ctx);
+            key.set_position(
+                u32::try_from(entries.len()).expect("chunk length is capped at MAX_CHUNK_RECORDS"),
+            );
 
             // Estimate memory: record bytes + key overhead
             let record_size = record.as_ref().len() + 50; // approximate key size
@@ -2680,7 +2711,7 @@ impl RawExternalSorter {
             }
 
             // Check if we need to spill to disk
-            if memory_used >= self.memory_limit {
+            if should_spill_chunk(memory_used, self.memory_limit, entries.len()) {
                 timer.end_read_span();
                 let bstats = BufferProbeStats::simple(memory_used as u64, entries.len() as u64);
                 let depths = Some(pool.phase1_queue_depths());
@@ -2701,12 +2732,14 @@ impl RawExternalSorter {
 
                 timer.time_sort(|| {
                     use rayon::prelude::*;
-                    // Stable sort: `entries` is in ingest order, so a stable sort keeps
-                    // exact-queryname-key ties in input order — matching `samtools sort -n`,
-                    // fgbio, and the arena/runall path. The loser-tree merge already breaks
-                    // cross-chunk ties by chunk (ingest) order, so this per-chunk stability
-                    // makes the whole queryname sort stable.
-                    rayon_pool.install(|| entries.par_sort_by(|a, b| a.0.cmp(&b.0)));
+                    // `entries` is in ingest order, and exact-queryname-key ties must keep
+                    // that order — matching `samtools sort -n`, fgbio, and the arena/runall
+                    // path. The key carries its ingest position (see
+                    // `RawSortKey::set_position`), so it is a total order and an unstable
+                    // sort reproduces ingest order for ties without paying for a stable
+                    // sort. The loser-tree merge breaks cross-chunk ties by chunk (ingest)
+                    // order, so the whole queryname sort stays deterministic.
+                    rayon_pool.install(|| entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0)));
                 });
 
                 // Write keyed temp file with parallel BGZF compression via worker pool.
@@ -2754,9 +2787,10 @@ impl RawExternalSorter {
 
             timer.time_sort(|| {
                 use rayon::prelude::*;
-                // Stable sort to preserve ingest order for exact-key ties (see the
-                // per-chunk sort above for the full rationale).
-                rayon_pool.install(|| entries.par_sort_by(|a, b| a.0.cmp(&b.0)));
+                // Unstable sort over a totally ordered key: position is part of the key,
+                // so ingest order is preserved for exact-key ties (see the per-chunk sort
+                // above for the full rationale).
+                rayon_pool.install(|| entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0)));
             });
 
             timer.time_write_output(|| {
@@ -2787,10 +2821,11 @@ impl RawExternalSorter {
                     let chunk_size = entries.len().div_ceil(self.threads.max(1));
                     rayon_pool.install(|| {
                         entries.par_chunks_mut(chunk_size).for_each(|chunk| {
-                            // Stable sort per chunk: chunks are contiguous ingest-ordered
-                            // slices, so stability preserves ingest order for ties within a
-                            // chunk; the loser-tree merge preserves it across chunks.
-                            chunk.sort_by(|a, b| a.0.cmp(&b.0));
+                            // Unstable sort per chunk: the key's ingest position totally
+                            // orders records within a chunk, so ties keep ingest order
+                            // without stability; the loser-tree merge preserves it across
+                            // chunks.
+                            chunk.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                         });
                     });
                     // Carve sub-chunks aligned with par_chunks_mut boundaries.
@@ -2815,8 +2850,9 @@ impl RawExternalSorter {
                 })
             } else {
                 timer.time_sort(|| {
-                    // Stable sort to preserve ingest order for exact-key ties.
-                    entries.sort_by(|a, b| a.0.cmp(&b.0));
+                    // Unstable sort: the key's ingest position preserves ingest order
+                    // for exact-key ties.
+                    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                 });
                 vec![entries]
             };
@@ -3994,6 +4030,49 @@ mod tests {
     use rstest::rstest;
 
     // ========================================================================
+    // Chunk spill triggers
+    // ========================================================================
+
+    /// The unstable chunk sort is only correct because each key carries a unique
+    /// ingest position, and that position is a `u32`. `MAX_CHUNK_RECORDS` is
+    /// what keeps the stamp site's `usize` -> `u32` narrowing lossless, so it
+    /// must never exceed what a `u32` can hold.
+    ///
+    /// The stamp happens *before* the push, so the largest position a chunk can
+    /// produce is `MAX_CHUNK_RECORDS - 1`.
+    #[test]
+    fn test_max_chunk_records_keeps_ingest_positions_in_u32() {
+        let largest_position = MAX_CHUNK_RECORDS - 1;
+
+        assert!(
+            u32::try_from(largest_position).is_ok(),
+            "a full chunk would stamp position {largest_position}, which must fit in u32",
+        );
+    }
+
+    /// Memory pressure and the record cap are independent spill triggers: either
+    /// one alone must force the spill.
+    #[rstest]
+    #[case::empty(0, 1_000, 0, false)]
+    #[case::under_both(999, 1_000, 10, false)]
+    #[case::at_memory_limit(1_000, 1_000, 10, true)]
+    #[case::over_memory_limit(1_001, 1_000, 10, true)]
+    #[case::one_under_record_cap(0, usize::MAX, MAX_CHUNK_RECORDS - 1, false)]
+    #[case::at_record_cap(0, usize::MAX, MAX_CHUNK_RECORDS, true)]
+    // `MAX_CHUNK_RECORDS` is `u32::MAX`, which on a 32-bit target is `usize::MAX`
+    // — `+ 1` would not be representable there. Saturating leaves the case at the
+    // cap on such a target, which is still a spill.
+    #[case::over_record_cap(0, usize::MAX, MAX_CHUNK_RECORDS.saturating_add(1), true)]
+    fn test_should_spill_chunk(
+        #[case] memory_used: usize,
+        #[case] memory_limit: usize,
+        #[case] chunk_records: usize,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(should_spill_chunk(memory_used, memory_limit, chunk_records), expected);
+    }
+
+    // ========================================================================
     // process_umask concurrency
     // ========================================================================
 
@@ -4998,6 +5077,107 @@ mod tests {
             }
             last_pos_by_name.insert(name, pos);
         }
+    }
+
+    /// A `memory_limit` the whole fixture fits under, so the sort stays in memory.
+    const IN_MEMORY_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+
+    /// A `memory_limit` the fixture exceeds several times over, forcing spills.
+    const SPILLING_MEMORY_LIMIT: usize = 4096;
+
+    /// Sorter-level output identity for both queryname comparators.
+    ///
+    /// `test_sort_queryname_preserves_exact_tie_input_order` pins the tie rule
+    /// for the default comparator; this pins the *entire* emitted record
+    /// sequence, for the natural comparator as well, against the sequence a
+    /// stable sort of the input produces. Names are chosen so the two
+    /// comparators disagree ("read2" < "read10" naturally, "read10" < "read2"
+    /// lexicographically), and each name repeats at strictly increasing
+    /// positions so exact-key ties are present in every run.
+    ///
+    /// The `threads` x `memory_limit` product covers the single-threaded and
+    /// `par_chunks_mut` in-memory paths plus the spill path, where keys are
+    /// serialized without the ingest position and rebuilt at merge time with
+    /// position 0 — so identity there rests on the merge breaking cross-chunk
+    /// ties by source (ingest) order. The body asserts which path each limit
+    /// took, so the spill case cannot quietly become a third in-memory run if
+    /// the per-record memory estimate or the fixture size changes.
+    #[rstest::rstest]
+    #[case::lexicographic(
+        QuerynameComparator::Lexicographic,
+        ["read1", "read10", "read2", "read20", "read3"]
+    )]
+    #[case::natural(
+        QuerynameComparator::Natural,
+        ["read1", "read2", "read3", "read10", "read20"]
+    )]
+    fn test_sort_queryname_output_identity_matches_stable_baseline(
+        #[case] comparator: QuerynameComparator,
+        #[case] expected_name_order: [&str; 5],
+        #[values(1, 4)] threads: usize,
+        #[values(IN_MEMORY_MEMORY_LIMIT, SPILLING_MEMORY_LIMIT)] memory_limit: usize,
+    ) {
+        use fgumi_sam::SamBuilder;
+
+        const COPIES: usize = 16;
+        const NAMES: [&str; 5] = ["read1", "read2", "read3", "read10", "read20"];
+
+        // Ingest order: every name once per copy, each at the next position, so a
+        // record's position is also its ingest rank. `start` is 1-based while the
+        // BAM record — and so `collect_names_and_positions` — stores it 0-based.
+        let mut builder = SamBuilder::new();
+        let mut ingested: Vec<(String, i32)> = Vec::new();
+        let mut pos = 0usize;
+        for _copy in 0..COPIES {
+            for name in NAMES {
+                let _ = builder.add_frag().name(name).start(pos + 1).build();
+                ingested.push((name.to_string(), i32::try_from(pos).expect("position fits i32")));
+                pos += 1;
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
+        let input = dir.path().join("input.bam");
+        let output = dir.path().join("output.bam");
+        builder.write_bam(&input).expect("failed to write BAM");
+
+        let stats = RawExternalSorter::new(SortOrder::Queryname(comparator))
+            .threads(threads)
+            .memory_limit(memory_limit)
+            .output_compression(0)
+            .sort(&input, &output)
+            .expect("sort should succeed");
+
+        // Pin which path each limit took. Identity through the spill path is the
+        // interesting half of this test — that is where the ingest position is
+        // dropped on serialization and the merge has to break ties by source
+        // order instead — so a spilling limit that quietly stopped spilling
+        // would leave that half uncovered with the test still green.
+        assert_eq!(
+            stats.chunks_written > 0,
+            memory_limit == SPILLING_MEMORY_LIMIT,
+            "a {memory_limit}-byte limit wrote {} spill chunk(s), which is not the path this \
+             case is meant to exercise",
+            stats.chunks_written
+        );
+
+        // The stable baseline: ingest order, stably sorted by the comparator's
+        // name order. `sort_by_key` is stable, so records sharing a name keep
+        // their ingest order — exactly what the sorter must reproduce.
+        let mut expected = ingested;
+        expected.sort_by_key(|(name, _)| {
+            expected_name_order
+                .iter()
+                .position(|expected_name| expected_name == name)
+                .expect("every ingested name appears in the expected order")
+        });
+
+        assert_eq!(
+            collect_names_and_positions(&output),
+            expected,
+            "{comparator} sort with {threads} thread(s) and a {memory_limit}-byte limit did not \
+             reproduce the stable baseline sequence"
+        );
     }
 
     /// Verifies that sort with many chunks exercises the pool-integrated

@@ -64,12 +64,34 @@ pub trait RawSortKey: Ord + Clone + Send + Sync + Sized {
     /// parsing overhead by reading only the fields needed for comparison.
     fn extract(bam: &[u8], ctx: &SortContext) -> Self;
 
+    /// Record this key's ingest position within the current in-memory chunk.
+    ///
+    /// Keys whose natural fields already form a total order leave this as the
+    /// default no-op. Queryname keys override it: read name plus flags is *not*
+    /// a total order (secondary alignments of one read collide), so without a
+    /// tiebreak the chunk sort has to be stable to keep ingest order, which
+    /// costs 2.3x on the in-memory sort phase (13.4s -> 31.1s over 219M records)
+    /// and 17% end-to-end. Carrying the position makes the key totally ordered,
+    /// so an unstable sort yields the same output.
+    ///
+    /// Only meaningful for the in-memory chunk sort. Keys reconstructed during
+    /// merge via [`RawSortKey::extract_from_record`] carry position 0 — see the
+    /// note there.
+    fn set_position(&mut self, _pos: u32) {}
+
     /// Extract a sort key from raw BAM record bytes without a `SortContext`.
     ///
     /// Only valid when `EMBEDDED_IN_RECORD` is `true`. Used during merge to
     /// reconstruct the key from the record itself, avoiding separate key storage.
     ///
     /// Default implementation panics — only override for embedded key types.
+    ///
+    /// Any position set by [`RawSortKey::set_position`] is NOT recovered here:
+    /// the position is not stored in the record, so keys rebuilt during merge
+    /// compare as position 0. That is sound because the merge only ever compares
+    /// the *heads of different sources* — records within one source are already
+    /// emitted in file order, and ties across sources are broken by source index
+    /// in the loser tree. Do not rely on position after spill.
     #[must_use]
     fn extract_from_record(_bam: &[u8]) -> Self {
         unimplemented!("extract_from_record only valid when EMBEDDED_IN_RECORD is true")
@@ -527,6 +549,10 @@ pub struct RawQuerynameKey {
     name: Vec<u8>,
     /// Flags for segment ordering (R1 before R2).
     flags: u16,
+    /// Ingest position within the current in-memory chunk; see
+    /// [`RawSortKey::set_position`]. Lands in existing padding on 64-bit targets,
+    /// so the key does not grow there. Zero after a merge-time rebuild.
+    pos: u32,
 }
 
 impl PartialEq for RawQuerynameKey {
@@ -546,7 +572,7 @@ impl RawQuerynameKey {
         if name.last() != Some(&0) {
             name.push(0);
         }
-        Self { name, flags }
+        Self { name, flags, pos: 0 }
     }
 
     /// Returns the read name bytes (including the null terminator).
@@ -563,10 +589,12 @@ impl RawQuerynameKey {
         let flags = queryname_flag_order(u16::from_le_bytes([bam[14], bam[15]]));
         match raw_name_with_nul(bam) {
             // BAM stores the name NUL-terminated, so copy those bytes directly
-            // instead of stripping the NUL and re-appending it.
-            Some(name) => Self { name: name.to_vec(), flags },
+            // instead of stripping the NUL and re-appending it. `pos` is filled in
+            // later by `set_position`; a merge-time rebuild leaves it 0.
+            Some(name) => Self { name: name.to_vec(), flags, pos: 0 },
             // Truncated or non-terminated record: fall back to the stripped-name
-            // path (`new` re-adds the terminator), preserving the prior bytes.
+            // path (`new` re-adds the terminator and sets `pos: 0`), preserving
+            // the prior bytes.
             None => Self::new(extract_raw_name_and_flags(bam).0.to_vec(), flags),
         }
     }
@@ -579,6 +607,7 @@ impl Ord for RawQuerynameKey {
         // SAFETY: `name` is always null-terminated (see `extract_queryname_key` and `new`).
         unsafe { natural_compare_nul(self.name.as_ptr(), other.name.as_ptr()) }
             .then_with(|| self.flags.cmp(&other.flags))
+            .then_with(|| self.pos.cmp(&other.pos))
     }
 }
 
@@ -596,6 +625,11 @@ impl RawSortKey for RawQuerynameKey {
     #[inline]
     fn extract(bam: &[u8], _ctx: &SortContext) -> Self {
         Self::extract_queryname_key(bam)
+    }
+
+    #[inline]
+    fn set_position(&mut self, pos: u32) {
+        self.pos = pos;
     }
 
     #[inline]
@@ -631,13 +665,17 @@ pub struct RawQuerynameLexKey {
     name: Vec<u8>,
     /// Flags for segment ordering (R1 before R2).
     flags: u16,
+    /// Ingest position within the current in-memory chunk; see
+    /// [`RawSortKey::set_position`]. Lands in existing padding on 64-bit targets,
+    /// so the key does not grow there. Zero after a merge-time rebuild.
+    pos: u32,
 }
 
 impl RawQuerynameLexKey {
     /// Create a new lexicographic queryname key.
     #[must_use]
     pub fn new(name: Vec<u8>, flags: u16) -> Self {
-        Self { name, flags }
+        Self { name, flags, pos: 0 }
     }
 
     /// Returns the read name bytes.
@@ -651,14 +689,17 @@ impl RawQuerynameLexKey {
     #[must_use]
     fn extract_queryname_key(bam: &[u8]) -> Self {
         let (raw_name, flags) = extract_raw_name_and_flags(bam);
-        Self { name: raw_name.to_vec(), flags }
+        Self { name: raw_name.to_vec(), flags, pos: 0 }
     }
 }
 
 impl Ord for RawQuerynameLexKey {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        self.name.cmp(&other.name).then_with(|| self.flags.cmp(&other.flags))
+        self.name
+            .cmp(&other.name)
+            .then_with(|| self.flags.cmp(&other.flags))
+            .then_with(|| self.pos.cmp(&other.pos))
     }
 }
 
@@ -679,6 +720,11 @@ impl RawSortKey for RawQuerynameLexKey {
     }
 
     #[inline]
+    fn set_position(&mut self, pos: u32) {
+        self.pos = pos;
+    }
+
+    #[inline]
     fn extract_from_record(bam: &[u8]) -> Self {
         Self::extract_queryname_key(bam)
     }
@@ -691,7 +737,7 @@ impl RawSortKey for RawQuerynameLexKey {
     #[inline]
     fn read_from<R: Read>(reader: &mut R) -> std::io::Result<Self> {
         let (name, flags) = read_queryname_key(reader)?;
-        Ok(Self { name, flags })
+        Ok(Self { name, flags, pos: 0 })
     }
 }
 
@@ -702,6 +748,73 @@ impl RawSortKey for RawQuerynameLexKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ingest position must land in the key's existing tail padding.
+    ///
+    /// On a 64-bit target `Vec<u8>` (24 bytes, align 8) plus a `u16` leaves 6 bytes of
+    /// padding, so the `u32` is free. If this ever fails the tiebreak has started
+    /// costing memory per record, and the trade against a stable sort needs
+    /// re-evaluating: the whole point is that a total order is cheaper than
+    /// stable-sorting.
+    ///
+    /// The assertion is scoped to 64-bit because the padding is. A 32-bit `Vec<u8>` is
+    /// 12 bytes, which leaves only 2 bytes after the `u16`, so the key grows from 16 to
+    /// 20 bytes there. That is a cost question, not a correctness one — the total order
+    /// the unstable sort depends on holds on every target — and fgumi's sort is a
+    /// 64-bit workload, so the zero-growth claim is made for 64-bit only.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn position_fits_in_existing_key_padding() {
+        assert_eq!(std::mem::size_of::<RawQuerynameLexKey>(), 32);
+        assert_eq!(std::mem::size_of::<RawQuerynameKey>(), 32);
+    }
+
+    /// Name and flags alone are not a total order; position makes them one.
+    ///
+    /// This is the invariant the unstable chunk sort depends on. Several secondary
+    /// alignments of one read share a name and flag class, and if their keys compare
+    /// equal an unstable sort may emit them in any order.
+    #[test]
+    fn position_totally_orders_otherwise_equal_lex_keys() {
+        let mut first = RawQuerynameLexKey::new(b"read1".to_vec(), 99);
+        let mut second = RawQuerynameLexKey::new(b"read1".to_vec(), 99);
+        assert_eq!(first, second, "name+flags alone must collide");
+
+        first.set_position(0);
+        second.set_position(1);
+        assert_ne!(first, second);
+        assert!(first < second, "earlier ingest position must sort first");
+    }
+
+    /// Same invariant for the natural-order comparator.
+    #[test]
+    fn position_totally_orders_otherwise_equal_natural_keys() {
+        let mut first = RawQuerynameKey::new(b"read1".to_vec(), 99);
+        let mut second = RawQuerynameKey::new(b"read1".to_vec(), 99);
+        assert_eq!(first.cmp(&second), Ordering::Equal, "name+flags alone must collide");
+
+        first.set_position(0);
+        second.set_position(1);
+        assert_eq!(first.cmp(&second), Ordering::Less);
+    }
+
+    /// Position must not outrank the fields it breaks ties for.
+    #[test]
+    fn position_only_applies_after_name_and_flags() {
+        let mut later_name = RawQuerynameLexKey::new(b"read2".to_vec(), 0);
+        later_name.set_position(0);
+        let mut earlier_name = RawQuerynameLexKey::new(b"read1".to_vec(), 0);
+        earlier_name.set_position(u32::MAX);
+        assert!(earlier_name < later_name, "name must dominate position");
+    }
+
+    /// Keys default to position 0, so a merge-time rebuild is well defined.
+    #[test]
+    fn extracted_keys_default_to_position_zero() {
+        let a = RawQuerynameLexKey::new(b"read1".to_vec(), 0);
+        let b = RawQuerynameLexKey::new(b"read1".to_vec(), 0);
+        assert_eq!(a, b);
+    }
 
     // ========================================================================
     // queryname_flag_order tests
