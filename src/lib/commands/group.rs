@@ -388,6 +388,63 @@ fn parallel_threshold(strategy: Strategy, opt: &ParallelMinTemplates) -> usize {
     }
 }
 
+/// How an input header satisfies `group`'s record-ordering requirement.
+///
+/// The three cases are mutually exclusive and are what the diagnostics and the
+/// rejection message key off. They must be decided in priority order: a
+/// template-coordinate header also advertises `GO:query`, so it satisfies
+/// [`crate::sam::is_query_grouped`] too and would otherwise be misreported as
+/// merely query-grouped whenever `--allow-unmapped` is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputOrdering {
+    /// Template-coordinate sorted: records sharing a position key are adjacent,
+    /// so mapped templates group by position as intended.
+    TemplateCoordinate,
+    /// Query-grouped but not template-coordinate sorted. Accepted only under
+    /// `--allow-unmapped`, which groups unmapped reads by UMI alone.
+    QueryGroupedUnmapped,
+    /// Neither ordering holds, so a template's records may not be adjacent.
+    Unusable,
+}
+
+/// Classify how an input header orders its records.
+///
+/// Template-coordinate is the ordering `group` is built around. The streaming
+/// `RecordPositionGrouper` emits a group whenever the position key changes
+/// between consecutive records, so any input where records sharing a position
+/// key aren't already adjacent (queryname-sorted, coordinate-sorted,
+/// FASTQ-order, etc.) would be split into many small groups and assigned
+/// distinct `MoleculeIds` -- silently wrong. Template-coordinate sort is what
+/// makes adjacency match the grouping key.
+///
+/// `--allow-unmapped` places every unmapped read in a single position group, so
+/// the position adjacency that template-coordinate sort exists to provide is not
+/// needed: every unmapped record lands in that one group regardless of order.
+/// Requiring a template-coordinate sort there would tell a user with unaligned
+/// data to sort by coordinates that do not exist, which is not actionable -- it
+/// blocked the unaligned-only workflow (ribosome display, for example)
+/// outright.
+///
+/// Query grouping is still required, and that is a correctness requirement
+/// rather than a policy choice: templates are assembled by comparing each
+/// record's name to the previous one, so if a template's records are not
+/// adjacent an R1/R2 pair splits into two partial templates.
+///
+/// Mapped reads in a query-grouped (rather than template-coordinate) input are
+/// not position-adjacent, so each mapped template forms its own position group
+/// and therefore its own family. That under-groups rather than merging unrelated
+/// molecules, and `--allow-unmapped` already warns that it groups by UMI alone;
+/// the caller's warning names the case explicitly so it is not a surprise.
+fn classify_input_ordering(header: &Header, allow_unmapped: bool) -> InputOrdering {
+    if is_template_coordinate_sorted(header) {
+        InputOrdering::TemplateCoordinate
+    } else if allow_unmapped && crate::sam::is_query_grouped(header) {
+        InputOrdering::QueryGroupedUnmapped
+    } else {
+        InputOrdering::Unusable
+    }
+}
+
 /// Decide whether a position group should use the parallel UMI assigner.
 ///
 /// Shared by the streaming pipeline path (`Command::execute`) and the
@@ -953,23 +1010,40 @@ impl Command for GroupReadsByUmi {
         info!("Reading input BAM");
         let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
 
-        // Sort order: template-coordinate is the only accepted ordering. The streaming
-        // `RecordPositionGrouper` emits a group whenever the position key changes between
-        // consecutive records, so any input where records sharing a position key aren't
-        // already adjacent (queryname-sorted, coordinate-sorted, FASTQ-order, etc.) would
-        // be split into many small groups and assigned distinct MoleculeIds — silently
-        // wrong. Template-coordinate sort is what makes adjacency match the grouping key.
-        if !is_template_coordinate_sorted(&header) {
-            bail!(
-                "Input BAM must be template-coordinate sorted (header must advertise \
-                 SO:unsorted, GO:query, and SS:template-coordinate).\n\n\
-                 To sort your BAM file, run:\n  \
-                 fgumi sort -i input.bam -o sorted.bam --order template-coordinate"
-            );
-        }
-        info!("Input is template-coordinate sorted");
-        if self.allow_unmapped {
-            info!("All unmapped reads will form a single position group per library/cell");
+        // Sort order: see `classify_input_ordering` for why template-coordinate
+        // is required, and why `--allow-unmapped` relaxes it to query grouping.
+        match classify_input_ordering(&header, self.allow_unmapped) {
+            InputOrdering::TemplateCoordinate => {
+                info!("Input is template-coordinate sorted");
+            }
+            InputOrdering::QueryGroupedUnmapped => {
+                info!("Input is query-grouped; grouping unmapped reads by UMI only");
+                if !header.reference_sequences().is_empty() {
+                    warn!(
+                        "Input declares reference sequences but is not template-coordinate \
+                         sorted. Any mapped templates will not be position-grouped, so each \
+                         will form its own family. Sort with --order template-coordinate if \
+                         the input contains mapped reads you want grouped by position."
+                    );
+                }
+            }
+            InputOrdering::Unusable => {
+                if self.allow_unmapped {
+                    bail!(
+                        "With --allow-unmapped the input must be either template-coordinate \
+                         sorted or query-grouped, so that a template's records are adjacent \
+                         (header must advertise SO:queryname or GO:query).\n\n\
+                         To sort your BAM file, run:\n  \
+                         fgumi sort -i input.bam -o sorted.bam --order queryname"
+                    );
+                }
+                bail!(
+                    "Input BAM must be template-coordinate sorted (header must advertise \
+                     SO:unsorted, GO:query, and SS:template-coordinate).\n\n\
+                     To sort your BAM file, run:\n  \
+                     fgumi sort -i input.bam -o sorted.bam --order template-coordinate"
+                );
+            }
         }
 
         // Add @PG record with PP chaining to input's last program
@@ -6211,6 +6285,193 @@ mod tests {
         Ok(temp_file)
     }
 
+    /// Build a header with no `@SQ` lines and the given sort tags -- what an
+    /// unaligned BAM out of `extract` looks like.
+    fn create_unaligned_header_with_sort_tags(so: &str, go: Option<&str>) -> sam::Header {
+        use noodles::sam::header::record::value::{
+            Map as HeaderRecordMap,
+            map::{Header as HeaderRecord, Tag as HeaderTag},
+        };
+
+        let HeaderTag::Other(so_tag) = HeaderTag::from([b'S', b'O']) else { unreachable!() };
+        let HeaderTag::Other(go_tag) = HeaderTag::from([b'G', b'O']) else { unreachable!() };
+
+        let mut map_builder = HeaderRecordMap::<HeaderRecord>::builder().insert(so_tag, so);
+        if let Some(go_val) = go {
+            map_builder = map_builder.insert(go_tag, go_val);
+        }
+        sam::Header::builder().set_header(map_builder.build().expect("valid header record")).build()
+    }
+
+    fn write_bam_with_header(
+        records: &[fgumi_raw_bam::RawRecord],
+        header: &sam::Header,
+    ) -> Result<NamedTempFile> {
+        let temp_file = NamedTempFile::new()?;
+        let mut writer = bam::io::writer::Builder.build_from_path(temp_file.path())?;
+        writer.write_header(header)?;
+        for record in records {
+            let record_buf =
+                raw_record_to_record_buf(record, header).map_err(std::io::Error::other)?;
+            writer.write_alignment_record(header, &record_buf)?;
+        }
+        drop(writer);
+        Ok(temp_file)
+    }
+
+    /// `--allow-unmapped` puts every unmapped read in one position group, so the
+    /// position adjacency template-coordinate sort provides is unnecessary --
+    /// query grouping is enough. Telling such a user to sort by coordinates that
+    /// do not exist is not actionable, which is the gap this closes.
+    ///
+    /// Query grouping is still required, and for a different reason than sort
+    /// order: templates are assembled by comparing each record's name to the
+    /// previous one, so without adjacency an R1/R2 pair splits into two partial
+    /// templates. The rejection cases pin that.
+    ///
+    /// Whether the header declares reference sequences is deliberately *not*
+    /// part of the decision -- an all-unmapped BAM keeps its `@SQ` lines after
+    /// something like `samtools view -f 4`, and gating on their absence would
+    /// reject it for no benefit.
+    #[rstest]
+    // Accepted: query-grouped with --allow-unmapped, with or without @SQ.
+    #[case::unaligned_queryname_allowed("queryname", None, false, true, true)]
+    #[case::unaligned_go_query_allowed("unsorted", Some("query"), false, true, true)]
+    #[case::aligned_queryname_allowed("queryname", None, true, true, true)]
+    #[case::aligned_go_query_allowed("unsorted", Some("query"), true, true, true)]
+    // Rejected: not query-grouped, so a template's records may not be adjacent.
+    #[case::unaligned_unsorted_rejected("unsorted", None, false, true, false)]
+    #[case::unaligned_coordinate_rejected("coordinate", None, false, true, false)]
+    // Rejected: query-grouped but --allow-unmapped not passed.
+    #[case::unaligned_queryname_without_flag("queryname", None, false, false, false)]
+    fn test_group_accepts_query_grouped_unaligned_input(
+        #[case] so: &str,
+        #[case] go: Option<&str>,
+        #[case] with_references: bool,
+        #[case] allow_unmapped: bool,
+        #[case] expect_ok: bool,
+    ) -> Result<()> {
+        let (r1, r2) = build_unmapped_test_pair("frag", "ACGTACGT");
+        let header = if with_references {
+            create_header_with_sort_tags(so, go, None)
+        } else {
+            create_unaligned_header_with_sort_tags(so, go)
+        };
+        let input = write_bam_with_header(&[r1, r2], &header)?;
+        let paths = TestPaths::new()?;
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
+            allow_unmapped,
+            min_map_q: Some(0),
+            ..test_group_cmd(Strategy::Identity, 0)
+        };
+
+        let result = cmd.execute("test");
+        assert_eq!(
+            result.is_ok(),
+            expect_ok,
+            "so={so} go={go:?} refs={with_references} allow_unmapped={allow_unmapped}: \
+             expected ok={expect_ok}, got {result:?}",
+        );
+
+        if expect_ok {
+            // The whole point is that the reads come through, in one group.
+            let records = read_bam_records(&paths.output)?;
+            assert_eq!(records.len(), 2, "both unmapped reads should be emitted");
+            assert_eq!(count_unique_mi_tags(&records), 1, "they should form a single group");
+        } else {
+            let msg = format!("{:#}", result.unwrap_err());
+            if allow_unmapped {
+                // Not query-grouped: the remediation is a queryname sort, not a
+                // template-coordinate one, since coordinates may not exist.
+                assert!(
+                    msg.contains("query-grouped") && msg.contains("--order queryname"),
+                    "with --allow-unmapped the error should ask for query grouping: {msg}",
+                );
+            } else {
+                assert!(
+                    msg.contains("SS:template-coordinate"),
+                    "without --allow-unmapped the error should ask for a template-coordinate \
+                     sort: {msg}",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The acceptance table above pins accept-vs-reject; this pins *which*
+    /// ordering the input was accepted as, which is what the diagnostics and the
+    /// rejection message key off.
+    ///
+    /// A template-coordinate header also advertises `GO:query`, so it satisfies
+    /// `is_query_grouped` as well. Classifying on that alone would report a
+    /// correctly-sorted BAM as merely query-grouped whenever `--allow-unmapped`
+    /// is set -- warning that its mapped templates "will not be position-grouped"
+    /// when in fact they are.
+    #[rstest]
+    // Template-coordinate wins over the weaker query-grouped match, flag or not.
+    #[case::tc_sorted(
+        "unsorted",
+        Some("query"),
+        Some("template-coordinate"),
+        false,
+        InputOrdering::TemplateCoordinate
+    )]
+    #[case::tc_sorted_allow_unmapped(
+        "unsorted",
+        Some("query"),
+        Some("template-coordinate"),
+        true,
+        InputOrdering::TemplateCoordinate
+    )]
+    #[case::tc_sorted_prefixed_ss(
+        "unsorted",
+        Some("query"),
+        Some("unsorted:template-coordinate"),
+        true,
+        InputOrdering::TemplateCoordinate
+    )]
+    // Query-grouped without the template-coordinate sub-sort: only the flag accepts it.
+    #[case::go_query_allow_unmapped(
+        "unsorted",
+        Some("query"),
+        None,
+        true,
+        InputOrdering::QueryGroupedUnmapped
+    )]
+    #[case::queryname_allow_unmapped(
+        "queryname",
+        None,
+        None,
+        true,
+        InputOrdering::QueryGroupedUnmapped
+    )]
+    #[case::go_query_no_flag("unsorted", Some("query"), None, false, InputOrdering::Unusable)]
+    #[case::queryname_no_flag("queryname", None, None, false, InputOrdering::Unusable)]
+    // Not query-grouped at all: rejected either way.
+    #[case::coordinate_allow_unmapped("coordinate", None, None, true, InputOrdering::Unusable)]
+    #[case::unsorted_allow_unmapped("unsorted", None, None, true, InputOrdering::Unusable)]
+    fn test_classify_input_ordering(
+        #[case] so: &str,
+        #[case] go: Option<&str>,
+        #[case] ss: Option<&str>,
+        #[case] allow_unmapped: bool,
+        #[case] expected: InputOrdering,
+    ) {
+        let header = create_header_with_sort_tags(so, go, ss);
+
+        assert_eq!(
+            classify_input_ordering(&header, allow_unmapped),
+            expected,
+            "so={so} go={go:?} ss={ss:?} allow_unmapped={allow_unmapped}",
+        );
+    }
+
     #[test]
     fn test_filter_template_allows_unmapped_when_enabled() -> Result<()> {
         let (r1, r2) = build_unmapped_test_pair("unmapped", "AAAAAA");
@@ -6459,16 +6720,22 @@ mod tests {
         Ok(())
     }
 
-    /// `fgumi group` only accepts template-coordinate-sorted input — even with
-    /// `--allow-unmapped`. Every non-template-coordinate header (queryname,
-    /// extract-style `SO:unsorted GO:query` without `SS`, or `SS` set to anything
-    /// other than `template-coordinate`) must be rejected with a clear error
-    /// pointing at `fgumi sort`. Both `--allow-unmapped` modes are exercised so
-    /// the rejection is not gated on that flag.
+    /// Without `--allow-unmapped`, `fgumi group` accepts only
+    /// template-coordinate-sorted input. Every other header (queryname,
+    /// extract-style `SO:unsorted GO:query` without `SS`, or `SS` set to
+    /// anything other than `template-coordinate`) must be rejected with a clear
+    /// error pointing at `fgumi sort`.
     ///
     /// The `extract_style_no_ss` case is the direct regression test for the
     /// silent-acceptance bug: `fgumi extract` emits `SO:unsorted GO:query` with
-    /// no `SS`, and the previous lenient check treated that as template-coordinate.
+    /// no `SS`, and a previous lenient check treated that as
+    /// template-coordinate. That must keep failing here -- accepting it under
+    /// `--allow-unmapped` routes it to the unmapped-only grouping path
+    /// deliberately, which is a different thing from mistaking it for a
+    /// template-coordinate sort.
+    ///
+    /// The `--allow-unmapped` contract is different (query grouping suffices)
+    /// and is covered by `test_group_accepts_query_grouped_unaligned_input`.
     #[rstest]
     #[case::queryname("queryname", None, None)]
     #[case::extract_style_no_ss("unsorted", Some("query"), None)]
@@ -6479,8 +6746,8 @@ mod tests {
         #[case] so: &str,
         #[case] go: Option<&str>,
         #[case] ss: Option<&str>,
-        #[values(true, false)] allow_unmapped: bool,
     ) -> Result<()> {
+        let allow_unmapped = false;
         let (r1, r2) = build_unmapped_test_pair("read_a", "AAAAAA");
         let input = create_test_bam_with_sort_tags(vec![r1, r2], so, go, ss)?;
         let paths = TestPaths::new()?;
