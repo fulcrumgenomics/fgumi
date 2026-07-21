@@ -493,6 +493,41 @@ impl ConsensusBaseBuilder {
 mod tests {
     use super::*;
 
+    /// The per-base error count in the consensus callers is
+    /// `contributions() - observations_for_base(base)`. Both operands must stay
+    /// unsaturated `u32` counters: the callers clamp only the *stored* cD/cE
+    /// values to fgbio's `Short` ceiling, and clamping the operands instead
+    /// would collapse the difference toward zero on a deep pileup and understate
+    /// cE. This pins that on a pileup deep enough that a `u16`/`i16` counter
+    /// would have saturated.
+    #[test]
+    fn test_deep_pileup_keeps_error_count_exact_past_the_short_ceiling() {
+        let short_ceiling = u32::from(i16::MAX.unsigned_abs()); // 32_767
+        let matching = short_ceiling + 5_000;
+        let mismatching = short_ceiling + 1_000;
+
+        let mut builder = ConsensusBaseBuilder::new(45, 40);
+        for _ in 0..matching {
+            builder.add(b'A', 30);
+        }
+        for _ in 0..mismatching {
+            builder.add(b'C', 30);
+        }
+
+        let depth = builder.contributions();
+        assert_eq!(depth, matching + mismatching, "depth must not saturate");
+        assert!(depth > short_ceiling, "precondition: the pileup exceeds the Short ceiling");
+
+        let (base, _qual) = builder.call();
+        assert_eq!(base, b'A', "the majority base should win");
+
+        // The subtraction is exact because neither operand is clamped. Were both
+        // saturated at the ceiling first, this difference would collapse to 0.
+        let error_count = depth - builder.observations_for_base(base);
+        assert_eq!(error_count, mismatching, "error count must be exact, not a clamped difference");
+        assert_ne!(error_count, 0, "a saturated-operand subtraction would collapse to zero here");
+    }
+
     #[test]
     fn test_single_base_perfect() {
         let mut builder = ConsensusBaseBuilder::new(45, 40);
