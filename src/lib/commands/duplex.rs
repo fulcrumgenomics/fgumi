@@ -5,38 +5,22 @@
 //! 1. Single-strand consensus for /A and /B reads separately
 //! 2. Duplex consensus from paired single-strand consensuses
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::Parser;
-use fgoxide::io::DelimFile;
-use fgumi_bam_io::{create_bam_writer, create_optional_bam_writer};
 
 use super::common::{
     BamIoOptions, CompressionOptions, ConsensusCallingOptions, OverlappingConsensusOptions,
     QueueMemoryOptions, ReadGroupOptions, RejectsOptions, SchedulerOptions, StatsOptions,
     ThreadingOptions,
 };
-use crate::commands::consensus_runner::{ConsensusStatsOps, log_overlapping_stats};
-use crate::consensus_caller::ConsensusCaller;
-use crate::duplex_consensus_caller::DuplexConsensusCaller;
-use crate::logging::{OperationTimer, log_consensus_summary};
-use crate::mi_group::MiGroupIterator;
-use crate::overlapping_consensus::{
-    AgreementStrategy, CorrectionStats, DisagreementStrategy, OverlappingBasesConsensusCaller,
-    apply_overlapping_consensus,
-};
+use crate::logging::OperationTimer;
 use crate::sam::SamTag;
-use crate::umi::extract_mi_base;
 use crate::validation::validate_file_exists;
-use fgumi_bam_io::ProgressTracker;
-use fgumi_raw_bam::{RawRecord, RawRecordView};
+use fgumi_raw_bam::RawRecord;
 use log::info;
 use noodles::sam::alignment::record::data::field::Tag;
-use std::io::Write as IoWrite;
-use std::sync::Arc;
 
 use super::command::Command;
-
-use super::common::{MethylationRef, load_methylation_reference};
 
 /// Duplex-specific tuning, flattened into both the standalone `Duplex`
 /// command (as bare `--max-reads-per-strand`, `--error-rate-pre-umi`,
@@ -350,7 +334,7 @@ impl Command for Duplex {
     /// ```
     fn execute(&self, command_line: &str) -> Result<()> {
         // Start timing
-        let timer = OperationTimer::new("Calling duplex consensus");
+        let _timer = OperationTimer::new("Calling duplex consensus");
 
         // Validate input file exists (skip for stdin paths — `-` / `/dev/stdin`)
         if !fgumi_bam_io::is_stdin_path(&self.io.input) {
@@ -358,7 +342,7 @@ impl Command for Duplex {
         }
 
         // Get threading configuration (duplex is worker-heavy with consensus calling)
-        let writer_threads = self.threading.num_threads();
+        let _writer_threads = self.threading.num_threads();
 
         // Reconstruct the shared option structs from the inlined DuplexOptions
         // flat fields.
@@ -379,15 +363,15 @@ impl Command for Duplex {
         );
 
         // Cell barcode tag is fixed to the SAM standard CB tag
-        let cell_tag = Tag::from(SamTag::CB);
+        let _cell_tag = Tag::from(SamTag::CB);
 
         // Enable rejects tracking if rejects file is specified
-        let track_rejects = self.rejects_opts.is_enabled();
+        let _track_rejects = self.rejects_opts.is_enabled();
 
         if self.reference.is_some() && self.methylation_mode.is_none() {
             bail!("--ref requires --methylation-mode to be set");
         }
-        let methylation_mode =
+        let _methylation_mode =
             crate::commands::common::resolve_methylation_mode(self.methylation_mode);
 
         // Track overlapping consensus settings (callers created per-thread in threaded mode)
@@ -399,229 +383,34 @@ impl Command for Duplex {
         // Process reads grouped by MI tag (streaming approach)
         info!("Processing reads...");
 
-        // ============================================================
-        // --threads N mode: route through chains::build_for.
-        // None: Use single-threaded fast path (below).
-        // ============================================================
-        // IMPORTANT: Do NOT open the source here — the chain builder opens
-        // it once. This avoids double-open (wastes I/O, breaks stdin).
-        if self.threading.threads.is_some() {
-            use crate::pipeline::chains::{
-                ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag,
-            };
-            // Populate the #[arg(skip)] chain-builder slots on a clone of
-            // DuplexOptions before handing it to the ChainSpec.
-            let mut options = self.options.clone();
-            options.io.clone_from(&self.io);
-            options.rejects_opts.clone_from(&self.rejects_opts);
-            options.stats_opts.clone_from(&self.stats_opts);
-            options.read_group.clone_from(&self.read_group);
-            options.methylation_mode = self.methylation_mode;
-            options.reference.clone_from(&self.reference);
+        // Route through the typed-step chain for every thread count. `--threads`
+        // unset resolves to a one-worker chain (`num_threads() == 1`) — output
+        // identical to `--threads 1`, with no separate single-threaded path. The
+        // chain opens the source once (BAM or SAM) and runs the two-stage duplex
+        // consensus in `add_duplex`. Populate the #[arg(skip)] chain-builder slots
+        // on a clone of DuplexOptions before handing it to the ChainSpec.
+        use crate::pipeline::chains::{ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag};
+        let mut options = self.options.clone();
+        options.io.clone_from(&self.io);
+        options.rejects_opts.clone_from(&self.rejects_opts);
+        options.stats_opts.clone_from(&self.stats_opts);
+        options.read_group.clone_from(&self.read_group);
+        options.methylation_mode = self.methylation_mode;
+        options.reference.clone_from(&self.reference);
 
-            let spec = ChainSpec {
-                async_reader: self.io.async_reader,
-                stages: vec![Stage::Duplex],
-                source: SourceSpec::Bam(self.io.input.clone()),
-                sink: SinkSpec::Bam(self.io.output.clone()),
-                stage_opts: StageOptionsBag { duplex: Some(options), ..Default::default() },
-                threading: self.threading.clone(),
-                compression: self.compression.clone(),
-                scheduler: self.scheduler_opts.clone(),
-                queue_memory: self.queue_memory.clone(),
-                command_line: command_line.to_string(),
-            };
-            return crate::pipeline::chains::build_for(spec)?.run();
-        }
-
-        // Single-threaded fast path is BAM-only: open the raw reader once and
-        // derive the header from it (shared with codec/simplex). SAM input (not
-        // BGZF) fails the header read with a --threads hint instead of a cryptic
-        // BGZF-magic error.
-        let (mut raw_reader, header) =
-            crate::commands::consensus_runner::open_single_threaded_consensus_input(
-                &self.io.input,
-                self.io.pipeline_reader_opts(),
-                "duplex",
-            )?;
-        let header = crate::commands::common::add_pg_record(header, command_line)?;
-        let read_name_prefix = self.read_group.prefix_or_from_header(&header);
-        let methylation_ref: MethylationRef =
-            load_methylation_reference(methylation_mode, &self.reference, &header)?;
-
-        // ============================================================
-        // For non-pipeline modes, create output writers here
-        // ============================================================
-
-        // Create output BAM writer with multi-threaded BGZF compression
-        let mut writer = create_bam_writer(
-            &self.io.output,
-            &header,
-            writer_threads,
-            self.compression.compression_level,
-        )?;
-
-        // Create optional rejects writer
-        let mut rejects_writer = create_optional_bam_writer(
-            self.rejects_opts.rejects.as_ref(),
-            &header,
-            writer_threads,
-            self.compression.compression_level,
-        )?;
-
-        // Create duplex consensus caller
-        // Note: Threading is handled here in duplex.rs, not in DuplexConsensusCaller
-        let mut consensus_caller = DuplexConsensusCaller::new(
-            read_name_prefix.clone(),
-            self.read_group.read_group_id.clone(),
-            self.options.min_reads.clone(),
-            consensus.min_input_base_quality,
-            consensus.output_per_base_tags,
-            consensus.trim,
-            self.options.max_reads_per_strand,
-            Some(cell_tag),
-            track_rejects,
-            consensus.error_rate_pre_umi,
-            consensus.error_rate_post_umi,
-        )?;
-
-        // Set reference for methylation-aware consensus if enabled
-        if let Some((ref reference, ref ref_names)) = methylation_ref {
-            consensus_caller.set_reference(
-                Arc::clone(reference),
-                Arc::clone(ref_names),
-                methylation_mode,
-            );
-        }
-
-        // Accumulator for overlapping stats from parallel processing
-        let mut merged_overlapping_stats = CorrectionStats::new();
-
-        // Track progress and aggregate stats
-        let mut consensus_count = 0usize;
-        let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
-
-        // Use the raw_reader opened above (single input open). Filter out
-        // secondary/supplementary and keep only mapped or mate-mapped reads.
-        let raw_record_iter = std::iter::from_fn(move || {
-            loop {
-                let mut record = RawRecord::new();
-                match raw_reader.read_record(&mut record) {
-                    Ok(0) => return None, // EOF
-                    Ok(_) => {
-                        let flg = RawRecordView::new(&record).flags();
-                        // Skip secondary and supplementary reads
-                        if flg & fgumi_raw_bam::flags::SECONDARY != 0
-                            || flg & fgumi_raw_bam::flags::SUPPLEMENTARY != 0
-                        {
-                            continue;
-                        }
-                        // Only keep mapped reads or reads with mapped mates
-                        let is_mapped = flg & fgumi_raw_bam::flags::UNMAPPED == 0;
-                        let has_mapped_mate = flg & fgumi_raw_bam::flags::PAIRED != 0
-                            && flg & fgumi_raw_bam::flags::MATE_UNMAPPED == 0;
-                        if is_mapped || has_mapped_mate {
-                            return Some(Ok(record));
-                        }
-                        // Skip unmapped reads without mapped mates
-                    }
-                    Err(e) => return Some(Err(e.into())),
-                }
-            }
-        });
-
-        // Group by base MI (strip /A, /B suffix) for streaming using raw bytes
-        let mi_group_iter =
-            MiGroupIterator::with_transform(raw_record_iter, "MI", |mi_bytes: &[u8]| {
-                let mi_str = String::from_utf8_lossy(mi_bytes);
-                extract_mi_base(&mi_str).to_string()
-            })
-            .with_cell_tag(Some(*SamTag::CB));
-        // Single-threaded processing
-        // Create overlapping consensus caller for single-threaded mode
-        let mut overlapping_caller = if overlapping_enabled {
-            Some(OverlappingBasesConsensusCaller::new(
-                AgreementStrategy::Consensus,
-                DisagreementStrategy::Consensus,
-            ))
-        } else {
-            None
+        let spec = ChainSpec {
+            async_reader: self.io.async_reader,
+            stages: vec![Stage::Duplex],
+            source: SourceSpec::Bam(self.io.input.clone()),
+            sink: SinkSpec::Bam(self.io.output.clone()),
+            stage_opts: StageOptionsBag { duplex: Some(options), ..Default::default() },
+            threading: self.threading.clone(),
+            compression: self.compression.clone(),
+            scheduler: self.scheduler_opts.clone(),
+            queue_memory: self.queue_memory.clone(),
+            command_line: command_line.to_string(),
         };
-
-        for group_result in mi_group_iter {
-            let (_base_mi, mut records) = group_result.context("Failed to read MI group")?;
-
-            // Apply overlapping consensus if enabled (modifies raw bytes in-place)
-            // Skip if group doesn't have both strands - no duplex possible anyway
-            if let Some(ref mut oc) = overlapping_caller {
-                if has_both_strands_raw(&records) {
-                    apply_overlapping_consensus(&mut records, oc)?;
-                }
-            }
-
-            // Call consensus directly — records are already RawRecord values.
-            let output = consensus_caller.consensus_reads(records)?;
-
-            // Write pre-serialized consensus reads
-            let batch_size = output.count;
-            consensus_count += batch_size;
-            writer.get_mut().write_all(&output.data).context("Failed to write consensus read")?;
-            progress.log_if_needed(batch_size as u64);
-        }
-
-        // Collect stats from single-threaded caller and merge overlapping stats
-        let merged_stats = consensus_caller.statistics();
-        if let Some(ref oc) = overlapping_caller {
-            merged_overlapping_stats.merge(oc.stats());
-        }
-
-        // Write rejected reads as raw BAM bytes if tracking is enabled
-        if let Some(ref mut rw) = rejects_writer {
-            let rejected_reads = consensus_caller.rejected_reads();
-            for raw_record in rejected_reads {
-                let block_size = raw_record.len() as u32;
-                rw.get_mut()
-                    .write_all(&block_size.to_le_bytes())
-                    .context("Failed to write rejected read block size")?;
-                rw.get_mut().write_all(raw_record).context("Failed to write rejected read")?;
-            }
-            info!("Wrote {} rejected reads", rejected_reads.len());
-        }
-
-        // Finish the rejects writer to ensure BGZF EOF marker is written
-        if let Some(rw) = rejects_writer {
-            rw.into_inner().finish().context("Failed to finish rejects file")?;
-        }
-
-        progress.log_final();
-
-        // Finish the buffered writer (flush remaining records and wait for writer thread)
-        writer.into_inner().finish().context("Failed to finish output BAM")?;
-
-        // Log overlapping consensus statistics if enabled
-        if overlapping_enabled {
-            log_overlapping_stats(&merged_overlapping_stats);
-        }
-
-        // Convert stats to metrics and log
-        let mut metrics = merged_stats.to_metrics();
-        // Use local count since we tracked it during streaming
-        metrics.consensus_reads = consensus_count as u64;
-        log_consensus_summary(&metrics);
-
-        // Write statistics file if requested
-        if let Some(stats_path) = &self.stats_opts.stats {
-            DelimFile::default().write_tsv(stats_path, [metrics]).map_err(|e| {
-                anyhow::anyhow!("Failed to write statistics to {}: {}", stats_path.display(), e)
-            })?;
-            info!("Statistics written to: {}", stats_path.display());
-        }
-
-        // Log timing completion
-        timer.log_completion(consensus_count as u64);
-
-        info!("Done!");
-        Ok(())
+        crate::pipeline::chains::build_for(spec)?.run()
     }
 }
 

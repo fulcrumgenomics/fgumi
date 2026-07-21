@@ -12,8 +12,9 @@
 //! Mirrors the dedup (6423252), filter (8eead93), clip (8e95428), group
 //! (d371d84) reference migrations.
 //!
-//! The single-threaded fast path (`--threads` unset, BAM-only) is **not**
-//! migrated here — it stays inline in `Simplex::execute`.
+//! This is the sole standalone execution path — `Simplex::execute` always routes
+//! here, and `--threads` unset resolves to a one-worker chain (no separate
+//! single-threaded path).
 
 use std::io;
 use std::sync::Arc;
@@ -446,8 +447,8 @@ pub(crate) fn build_simplex_consensus_step_kept_only(
 /// [`ChainBuilder`]'s `add_simplex` method in
 /// [`crate::pipeline::chains::builder`].
 ///
-/// The single-threaded fast path (`--threads` unset, BAM-only) is **not**
-/// migrated here — it stays inline in `Simplex::execute`.
+/// This is the sole standalone execution path — `Simplex::execute` always routes
+/// here, and `--threads` unset resolves to a one-worker chain.
 ///
 /// # Errors
 ///
