@@ -437,6 +437,16 @@ impl Clone for BufferPool {
 pub(crate) struct PermitPool {
     tx: std::sync::Mutex<Option<Sender<()>>>,
     rx: Receiver<()>,
+    /// Set by [`PermitPool::close`] so `acquire` fails immediately instead of
+    /// draining permits that are still buffered in the channel.
+    ///
+    /// Dropping the `Sender` alone is not enough: `recv` keeps succeeding until
+    /// the buffered permits run out, so after the I/O writer errors, producers
+    /// would each take one more permit and compress another block -- up to
+    /// `num_workers * 4` blocks of work thrown away -- before the disconnect
+    /// finally surfaced. This never produced wrong output or a hang; it just
+    /// wasted work on the failure path.
+    closed: AtomicBool,
 }
 
 impl PermitPool {
@@ -446,17 +456,36 @@ impl PermitPool {
         for _ in 0..capacity {
             tx.try_send(()).expect("fresh channel has capacity for initial permits");
         }
-        Self { tx: std::sync::Mutex::new(Some(tx)), rx }
+        Self { tx: std::sync::Mutex::new(Some(tx)), rx, closed: AtomicBool::new(false) }
     }
 
     /// Acquire a permit, blocking until one is available.
     ///
-    /// Returns an error if the pool has been closed (I/O writer exited with an error).
+    /// Returns an error if the pool has been closed (I/O writer exited with an
+    /// error). The closed flag is checked both before *and* after taking a
+    /// permit: the pre-check fails fast when the pool is already closed, and the
+    /// post-`recv` re-check closes the race where [`close`](Self::close) sets the
+    /// flag (and drops the sender) while this producer is parked, yet `recv`
+    /// still hands back a permit that was buffered before the close. Without the
+    /// re-check that producer would compress another block no writer will ever
+    /// service. The permit received in that race is simply dropped — a closed
+    /// pool never returns permits to the channel.
     pub(crate) fn acquire(&self) -> anyhow::Result<()> {
-        self.rx.recv().map_err(|_| anyhow::anyhow!("permit pool closed: I/O writer thread exited"))
+        if self.closed.load(Ordering::Acquire) {
+            anyhow::bail!("permit pool closed: I/O writer thread exited");
+        }
+        self.rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("permit pool closed: I/O writer thread exited"))?;
+        if self.closed.load(Ordering::Acquire) {
+            anyhow::bail!("permit pool closed: I/O writer thread exited");
+        }
+        Ok(())
     }
 
     /// Release a permit back to the pool after a block has been written to disk.
+    ///
+    /// A release after `close` is a no-op: the sender is already gone.
     pub(crate) fn release(&self) {
         if let Ok(guard) = self.tx.lock()
             && let Some(tx) = guard.as_ref()
@@ -471,6 +500,9 @@ impl PermitPool {
     /// returns `Err`, which is mapped to an `anyhow` error. Called by
     /// `io_writer_loop` on write error to prevent producers from parking forever.
     pub(crate) fn close(&self) {
+        // Set the flag before dropping the sender so any producer that observes
+        // the disconnect also observes the closed state.
+        self.closed.store(true, Ordering::Release);
         if let Ok(mut guard) = self.tx.lock() {
             guard.take(); // drops the Sender, closing the channel
         }
@@ -977,6 +1009,55 @@ enum StepResult {
     InputEmpty,
 }
 
+/// Publishes a worker panic to `worker_panicked` and wakes the main thread if
+/// the worker loop unwinds.
+///
+/// `SortWorkerPool::do_shutdown` also sets this flag when a join reports a
+/// panic, but that only happens after Phase 2 has finished. A worker that
+/// panics mid-run -- especially while holding a reader mutex, which leaves
+/// `eof` unset and every later `try_lock` returning `Poisoned` -- would
+/// otherwise leave the merge loop spinning forever. Publishing from the worker
+/// itself turns that silent hang into a surfaced error.
+///
+/// Call [`Self::disarm`] on the normal exit path so a clean shutdown does not
+/// report a panic.
+struct WorkerPanicGuard {
+    shared: Arc<SharedPipelineState>,
+    /// `true` until [`disarm`](Self::disarm) runs. `Drop` reports a panic only
+    /// while armed, so the clean exit path can defuse the guard without leaking.
+    armed: bool,
+}
+
+impl WorkerPanicGuard {
+    /// Arm a guard that reports a worker panic on drop unless disarmed first.
+    fn new(shared: Arc<SharedPipelineState>) -> Self {
+        Self { shared, armed: true }
+    }
+
+    /// Defuse the guard after the worker loop returns normally.
+    ///
+    /// This clears the armed flag and lets the guard drop normally, releasing
+    /// its `Arc<SharedPipelineState>`. Using `mem::forget` here would skip the
+    /// destructor and leak that `Arc`, keeping the shared pipeline state (and
+    /// its queued buffers / phase-2 state) alive for the whole process after
+    /// every clean worker exit.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WorkerPanicGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            // Clean exit: `disarm` already ran, so there is nothing to report.
+            return;
+        }
+        // Reached only when the worker loop unwound.
+        self.shared.worker_panicked.store(true, Ordering::Release);
+        self.shared.main_thread_handle.unpark();
+    }
+}
+
 impl SortWorkerPool {
     /// Create a new worker pool with `num_workers` threads.
     ///
@@ -1028,7 +1109,15 @@ impl SortWorkerPool {
                         idle_iter: 0,
                     };
 
+                    // Publish a panic as soon as the worker unwinds, not at
+                    // join time. `do_shutdown` also sets this flag, but only
+                    // after the merge has finished; a worker that panics
+                    // mid-run while holding a reader mutex would otherwise
+                    // leave `eof` unset and the merge loop spinning, turning a
+                    // diagnosable panic into a silent 100%-CPU hang.
+                    let panic_guard = WorkerPanicGuard::new(Arc::clone(&shared));
                     Self::worker_loop(&shared, &mut worker, &pstats);
+                    panic_guard.disarm();
                 })
             })
             .collect();
@@ -2145,6 +2234,141 @@ mod tests {
         queued.sort_unstable();
         let reserved: Vec<u64> = (base_serial..base_serial + num_blocks as u64).collect();
         assert_eq!(queued, reserved, "reserved range fully accounted for");
+    }
+
+    // ── PermitPool fail-closed ───────────────────────────────────────────────
+
+    #[test]
+    fn permit_pool_acquire_fails_immediately_after_close() {
+        // Buffered permits remain in the channel after close. Without the
+        // closed flag, `recv` would hand them out and each producer would
+        // compress another block before noticing the writer is gone.
+        let pool = PermitPool::new(4);
+        pool.acquire().expect("permit available before close");
+
+        pool.close();
+
+        for attempt in 0..4 {
+            let err = pool
+                .acquire()
+                .expect_err("acquire must fail once closed, even with buffered permits");
+            assert!(
+                err.to_string().contains("permit pool closed"),
+                "attempt {attempt} gave an unexpected error: {err}",
+            );
+        }
+    }
+
+    #[test]
+    fn permit_pool_release_after_close_is_a_noop() {
+        let pool = PermitPool::new(2);
+        pool.close();
+        pool.release(); // must not panic or resurrect the pool
+        assert!(pool.acquire().is_err(), "a release after close must not make permits available");
+    }
+
+    #[test]
+    fn permit_pool_hands_out_permits_up_to_capacity() {
+        let pool = PermitPool::new(2);
+        pool.acquire().expect("first permit");
+        pool.acquire().expect("second permit");
+        pool.release();
+        pool.acquire().expect("released permit is reusable");
+    }
+
+    #[test]
+    fn permit_pool_close_unblocks_parked_acquirers_with_error() {
+        // Drain every permit so the acquirers below must park in `recv()`.
+        let pool = Arc::new(PermitPool::new(2));
+        pool.acquire().expect("first permit");
+        pool.acquire().expect("second permit");
+
+        // `close()` must wake every parked producer with an error and never hand
+        // out a permit: whichever side of the race a producer lands on, the
+        // pre-check or the disconnected `recv` returns the closure error. The
+        // join also proves no producer hangs after the writer is gone.
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let pool = Arc::clone(&pool);
+                std::thread::spawn(move || pool.acquire())
+            })
+            .collect();
+
+        pool.close();
+
+        for handle in handles {
+            let result = handle.join().expect("acquirer thread must not panic");
+            let err = result.expect_err("a parked acquirer must fail once the pool is closed");
+            assert!(
+                err.to_string().contains("permit pool closed"),
+                "unexpected error from a closed pool: {err}",
+            );
+        }
+    }
+
+    // ── Worker panic surfaces mid-run ────────────────────────────────────────
+
+    /// A worker that panics must publish `worker_panicked` immediately, not at
+    /// join time. `do_shutdown` sets the same flag, but only after Phase 2; a
+    /// mid-run panic reported that late leaves the merge loop spinning while
+    /// the main thread waits for work that will never arrive.
+    ///
+    /// The wait is bounded so a regression fails fast instead of hanging CI.
+    #[test]
+    fn worker_panic_sets_flag_before_shutdown() {
+        let shared = Arc::new(SharedPipelineState::new(1, std::thread::current()));
+        let flag = Arc::clone(&shared.worker_panicked);
+        assert!(!flag.load(Ordering::Acquire), "flag starts clear");
+
+        let guard_shared = Arc::clone(&shared);
+        let handle = std::thread::spawn(move || {
+            let _panic_guard = WorkerPanicGuard::new(guard_shared);
+            panic!("simulated worker panic");
+        });
+
+        // Bounded wait: the flag must be set by the time the panicking thread
+        // has unwound, which is well before any pool shutdown would run.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !flag.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(
+            flag.load(Ordering::Acquire),
+            "worker_panicked must be set by the unwinding worker, not deferred to join",
+        );
+        assert!(handle.join().is_err(), "the worker thread should have panicked");
+    }
+
+    /// The guard must not report a panic on the normal exit path.
+    #[test]
+    fn disarmed_worker_panic_guard_does_not_set_flag() {
+        let shared = Arc::new(SharedPipelineState::new(1, std::thread::current()));
+        let flag = Arc::clone(&shared.worker_panicked);
+
+        let guard = WorkerPanicGuard::new(Arc::clone(&shared));
+        guard.disarm();
+
+        assert!(!flag.load(Ordering::Acquire), "a clean worker exit must not report a panic");
+    }
+
+    /// `disarm` must let the guard drop normally so its `Arc<SharedPipelineState>`
+    /// is released. The old `mem::forget` path leaked one `Arc` per clean worker
+    /// exit, pinning the shared pipeline state (and its buffers) for the process.
+    #[test]
+    fn disarmed_worker_panic_guard_releases_its_shared_arc() {
+        let shared = Arc::new(SharedPipelineState::new(1, std::thread::current()));
+        assert_eq!(Arc::strong_count(&shared), 1, "only the test holds the Arc");
+
+        let guard = WorkerPanicGuard::new(Arc::clone(&shared));
+        assert_eq!(Arc::strong_count(&shared), 2, "the guard holds a second reference");
+
+        guard.disarm();
+        assert_eq!(
+            Arc::strong_count(&shared),
+            1,
+            "disarm must drop the guard's Arc rather than leaking it via mem::forget",
+        );
     }
 
     #[test]
