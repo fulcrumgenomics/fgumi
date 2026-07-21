@@ -2422,7 +2422,7 @@ impl RawExternalSorter {
         alloc: &mut TmpDirAllocator,
     ) -> Result<RawSortStats> {
         use crate::keys::RawCoordinateKey;
-        use fgumi_bam_io::{create_indexing_bam_writer, write_bai_index};
+        use fgumi_bam_io::{bai_sidecar_path, create_indexing_bam_writer, write_bai_index};
 
         debug!("Indexing enabled: will write BAM index alongside output");
 
@@ -2539,7 +2539,7 @@ impl RawExternalSorter {
 
                 let index = writer.finish()?;
 
-                let index_path = output.with_extension("bam.bai");
+                let index_path = bai_sidecar_path(output);
                 write_bai_index(&index_path, &index)?;
                 info!("Wrote BAM index: {}", index_path.display());
                 Ok(())
@@ -2574,7 +2574,7 @@ impl RawExternalSorter {
                     &pool,
                 )?;
 
-                let index_path = output.with_extension("bam.bai");
+                let index_path = bai_sidecar_path(output);
                 write_bai_index(&index_path, &index)?;
                 info!("Wrote BAM index: {}", index_path.display());
                 Ok(())
@@ -5763,8 +5763,62 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_sort_coordinate_with_index_spilled_preserves_records() {
+    /// The indexed coordinate sort derives the sidecar path in two independent
+    /// places: the in-memory path (everything fits under the memory limit) and
+    /// the spilling merge path. This covers the in-memory one; the spilling
+    /// sibling below covers the other. Both must land on the samtools sidecar
+    /// path even when the output is not named `*.bam`.
+    #[rstest::rstest]
+    #[case::dot_bam_output("output.bam")]
+    #[case::non_bam_output("output.sorted")]
+    fn test_sort_coordinate_with_index_in_memory_writes_sidecar(#[case] output_name: &str) {
+        use fgumi_sam::SamBuilder;
+
+        let mut builder = SamBuilder::new();
+        for i in 0..20 {
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i:05}"))
+                .start1(i * 200 + 1)
+                .start2(i * 200 + 101)
+                .build();
+        }
+
+        let workdir = tempfile::tempdir().expect("workdir");
+        let input = workdir.path().join("input.bam");
+        let output = workdir.path().join(output_name);
+        builder.write_bam(&input).expect("write bam");
+
+        let stats = RawExternalSorter::new(SortOrder::Coordinate)
+            // Generous limit so nothing spills and the in-memory branch runs.
+            .memory_limit(64 * 1024 * 1024)
+            .threads(1)
+            .write_index(true)
+            .output_compression(0)
+            .sort(&input, &output)
+            .expect("indexed coordinate sort should succeed");
+
+        assert_eq!(stats.chunks_written, 0, "expected no spill for the in-memory path");
+        assert_eq!(collect_read_names(&output).len(), 40, "record count mismatch");
+
+        let bai = fgumi_bam_io::bai_sidecar_path(&output);
+        assert!(bai.exists(), "index should exist at the sidecar path {}", bai.display());
+
+        let stale = output.with_extension("bam.bai");
+        if stale != bai {
+            assert!(!stale.exists(), "no index at the extension-replaced path {}", stale.display());
+        }
+    }
+
+    /// `output_name` covers both the `.bam` case (where the old
+    /// `with_extension("bam.bai")` happened to be right) and a name that does
+    /// not end in `.bam` (where it silently wrote the index under a different
+    /// basename entirely).
+    #[rstest::rstest]
+    #[case::dot_bam_output("output.bam")]
+    #[case::non_bam_output("output.sorted")]
+    #[case::no_extension_output("output")]
+    fn test_sort_coordinate_with_index_spilled_preserves_records(#[case] output_name: &str) {
         use fgumi_sam::SamBuilder;
 
         // Enough pairs that an 8 KiB memory limit forces multiple spills,
@@ -5784,7 +5838,7 @@ mod tests {
 
         let workdir = tempfile::tempdir().expect("workdir");
         let input = workdir.path().join("input.bam");
-        let output = workdir.path().join("output.bam");
+        let output = workdir.path().join(output_name);
         builder.write_bam(&input).expect("write bam");
 
         let stats = RawExternalSorter::new(SortOrder::Coordinate)
@@ -5803,9 +5857,29 @@ mod tests {
         let names = collect_read_names(&output);
         assert_eq!(names.len(), num_pairs * 2, "record count mismatch");
 
-        // A .bai index was produced alongside the output.
-        let bai = output.with_extension("bam.bai");
-        assert!(bai.exists() || output.with_extension("bai").exists(), "index file should exist");
+        // The index must land at exactly the samtools sidecar path -- append
+        // `.bai` to the full output path. Asserting the exact path (rather than
+        // accepting either naming) is the point: the old
+        // `with_extension("bam.bai")` put it under a different basename for any
+        // output not ending in `.bam`, where no indexed reader would find it.
+        let bai = fgumi_bam_io::bai_sidecar_path(&output);
+        assert!(
+            bai.exists(),
+            "index should exist at the sidecar path {} for output {}",
+            bai.display(),
+            output.display(),
+        );
+
+        // And nowhere else: a stray index under the rewritten basename would
+        // mean the old expression is still in play somewhere.
+        let stale = output.with_extension("bam.bai");
+        if stale != bai {
+            assert!(
+                !stale.exists(),
+                "no index should be written to the extension-replaced path {}",
+                stale.display(),
+            );
+        }
     }
 
     // ========================================================================
