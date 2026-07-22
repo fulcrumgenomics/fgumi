@@ -182,11 +182,15 @@ pub struct Zipper {
     #[arg(long = "exclude-missing-reads", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub exclude_missing_reads: bool,
 
-    /// Skip adding `pa` (primary alignment) tags to secondary/supplementary reads.
-    /// By default, zipper adds a `pa` tag containing the primary alignment's template
+    /// Skip adding `tc` (template coordinate) tags to secondary/supplementary reads.
+    /// By default, zipper adds a `tc` tag containing the primary alignment's template
     /// sort key coordinates, which enables correct template-coordinate sorting and
     /// deduplication of these reads. Use this flag if you don't need this functionality.
-    #[arg(long = "skip-pa-tags", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    ///
+    /// The former name `--skip-pa-tags` is accepted as an alias. It described a `pa`
+    /// tag that this command has never written, so grepping the output for `pa`
+    /// found nothing; the tag is and always was `tc`.
+    #[arg(long = "skip-tc-tags", alias = "skip-pa-tags", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub skip_tc_tags: bool,
 
     /// Restore unconverted bases in EM-seq consensus reads after bwameth re-alignment.
@@ -532,7 +536,7 @@ pub fn merge_raw(
         fgumi_raw_bam::normalize_int_tag_to_smallest_signed(record.as_mut_vec(), SamTag::XS);
     }
 
-    // Step 6: Add PA tags
+    // Step 6: Add tc (template coordinate) tags
     if !skip_tc_tags {
         add_template_coordinate_tags_raw(mapped);
     }
@@ -3677,9 +3681,19 @@ mod tests {
         assert_eq!(cmd.exclude_missing_reads, expected);
     }
 
+    /// The flag is named for the tag it actually controls (`tc`); the former
+    /// `--skip-pa-tags` spelling stays accepted as an alias so existing scripts
+    /// keep working. Repo precedent for that is the `--queue-memory*` aliases.
     #[rstest]
-    // --skip-pa-tags (default false)
+    // default (neither spelling passed)
     #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam"], false)]
+    // --skip-tc-tags: the name that matches the tag actually written
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-tc-tags"], true)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-tc-tags", "true"], true)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-tc-tags", "false"], false)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-tc-tags=true"], true)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-tc-tags=false"], false)]
+    // --skip-pa-tags: retained alias, must behave identically
     #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags"], true)]
     #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags", "true"], true)]
     #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags", "false"], false)]
