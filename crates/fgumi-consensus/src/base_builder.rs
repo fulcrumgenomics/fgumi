@@ -317,6 +317,66 @@ const BASE_TO_INDEX: [u8; 256] = {
     table
 };
 
+/// The post-UMI-adjusted per-quality probability tables used by `ConsensusBaseBuilder`.
+///
+/// Both tables are indexed by the observed base quality (`0..=MAX_PHRED`) and depend *only*
+/// on the post-UMI error rate they were computed for. Because that error rate and the base
+/// quality are both integer Phred scores drawn from a tiny finite domain, the whole table is
+/// a pure function of a single `u8` — so it can be computed once and shared, rather than
+/// recomputed per `ConsensusBaseBuilder`.
+struct AdjustedProbabilityTables {
+    /// Log probability that an observation of quality `q` is correct, adjusted for post-UMI error.
+    correct: Box<[LogProbability]>,
+
+    /// Log probability of any one *specific* alternate base (total error / 3) for quality `q`.
+    error_per_alt: Box<[LogProbability]>,
+}
+
+impl AdjustedProbabilityTables {
+    /// Computes both tables for a given post-UMI error rate.
+    ///
+    /// This performs exactly the arithmetic the per-builder loop used to perform inline, in the
+    /// same order, so the resulting `f64` values are bit-identical to the un-memoized version.
+    fn compute(error_rate_post_umi: PhredScore) -> Self {
+        let ln_error_post = phred_to_ln_error_prob(error_rate_post_umi);
+        let ln_three = 3.0_f64.ln();
+
+        let mut correct = Vec::with_capacity(MAX_PHRED as usize + 1);
+        let mut error_per_alt = Vec::with_capacity(MAX_PHRED as usize + 1);
+
+        for q in 0..=MAX_PHRED {
+            let ln_error_seq = phred_to_ln_error_prob(q);
+            let adjusted_error = ln_error_prob_two_trials(ln_error_post, ln_error_seq);
+
+            correct.push(ln_not(adjusted_error));
+            // Error for any specific alternate base is 1/3 of total error
+            // ln(p/3) = ln(p) - ln(3)
+            error_per_alt.push(adjusted_error - ln_three);
+        }
+
+        Self {
+            correct: correct.into_boxed_slice(),
+            error_per_alt: error_per_alt.into_boxed_slice(),
+        }
+    }
+}
+
+/// Lazily-populated cache of `AdjustedProbabilityTables`, one slot per possible post-UMI Phred.
+///
+/// The post-UMI error rate is a `u8`, so 256 slots cover the entire input domain exactly — no
+/// clamping, and therefore no behaviour change for out-of-range Phred values. Each slot is
+/// initialized at most once; after that, building a `ConsensusBaseBuilder` is a pair of atomic
+/// loads instead of 94 `exp`/`log1p` evaluations plus two heap allocations. This matters because
+/// `consensus_umis()` constructs a fresh caller (and thus a fresh builder) for every UMI family.
+static ADJUSTED_TABLE_CACHE: [OnceLock<AdjustedProbabilityTables>; 256] =
+    [const { OnceLock::new() }; 256];
+
+/// Returns the shared, memoized adjusted-probability tables for a post-UMI error rate.
+fn adjusted_tables(error_rate_post_umi: PhredScore) -> &'static AdjustedProbabilityTables {
+    ADJUSTED_TABLE_CACHE[error_rate_post_umi as usize]
+        .get_or_init(|| AdjustedProbabilityTables::compute(error_rate_post_umi))
+}
+
 /// Builder for calling consensus at a single base position
 ///
 /// Accumulates observations (base + quality) and uses a likelihood model to
@@ -340,11 +400,15 @@ pub struct ConsensusBaseBuilder {
     /// match fgbio's `Short` consensus-depth representation.
     observations: [u32; DNA_BASE_COUNT],
 
-    /// Pre-computed correct probabilities adjusted for post-UMI errors
-    adjusted_correct_table: Vec<LogProbability>,
+    /// Pre-computed correct probabilities adjusted for post-UMI errors.
+    ///
+    /// Borrowed from the process-wide `ADJUSTED_TABLE_CACHE`; see `adjusted_tables`.
+    adjusted_correct_table: &'static [LogProbability],
 
-    /// Pre-computed 1/3 of error probability (for wrong base likelihoods)
-    adjusted_error_per_alt: Vec<LogProbability>,
+    /// Pre-computed 1/3 of error probability (for wrong base likelihoods).
+    ///
+    /// Borrowed from the process-wide `ADJUSTED_TABLE_CACHE`; see `adjusted_tables`.
+    adjusted_error_per_alt: &'static [LogProbability],
 
     /// Pre-UMI error rate (log probability)
     ln_error_pre_umi: LogProbability,
@@ -564,22 +628,10 @@ impl ConsensusBaseBuilder {
     /// * `error_rate_post_umi` - Phred-scaled error rate after UMI integration
     #[must_use]
     pub fn new(error_rate_pre_umi: PhredScore, error_rate_post_umi: PhredScore) -> Self {
-        let ln_error_post = phred_to_ln_error_prob(error_rate_post_umi);
-
-        // Pre-compute adjusted probabilities for all possible quality scores
-        // Must start from 0 since we index by phred score directly
-        let mut adjusted_correct_table = Vec::with_capacity(MAX_PHRED as usize + 1);
-        let mut adjusted_error_per_alt = Vec::with_capacity(MAX_PHRED as usize + 1);
-
-        for q in 0..=MAX_PHRED {
-            let ln_error_seq = phred_to_ln_error_prob(q);
-            let adjusted_error = ln_error_prob_two_trials(ln_error_post, ln_error_seq);
-
-            adjusted_correct_table.push(ln_not(adjusted_error));
-            // Error for any specific alternate base is 1/3 of total error
-            // ln(p/3) = ln(p) - ln(3)
-            adjusted_error_per_alt.push(adjusted_error - 3.0_f64.ln());
-        }
+        // The adjusted probability tables depend only on the post-UMI error rate, and both it
+        // and the base quality are integer Phred scores, so the tables are memoized process-wide
+        // and shared rather than recomputed (94 `exp`/`log1p` evaluations) per builder.
+        let tables = adjusted_tables(error_rate_post_umi);
 
         let ln_error_pre_umi = phred_to_ln_error_prob(error_rate_pre_umi);
 
@@ -587,8 +639,8 @@ impl ConsensusBaseBuilder {
             likelihoods: f64x4::splat(LN_ONE),
             compensations: f64x4::splat(0.0),
             observations: [0; DNA_BASE_COUNT],
-            adjusted_correct_table,
-            adjusted_error_per_alt,
+            adjusted_correct_table: &tables.correct,
+            adjusted_error_per_alt: &tables.error_per_alt,
             ln_error_pre_umi,
             gap_tables: cached_unanimous_gap_tables(error_rate_pre_umi),
         }
@@ -893,6 +945,100 @@ mod tests {
     fn cap_gap_threshold(rate: PhredScore) -> f64 {
         let cap = ln_prob_to_phred(phred_to_ln_error_prob(rate)) as usize;
         build_unanimous_gap_thresholds(rate)[cap]
+    }
+
+    /// Recomputes one adjusted-probability entry with the formula the builder used inline
+    /// before the tables were memoized, in the same order, so a drift in `compute` shows up
+    /// as a bit-level difference rather than an approximate one.
+    fn reference_adjusted_entry(
+        error_rate_post_umi: PhredScore,
+        qual: PhredScore,
+    ) -> (LogProbability, LogProbability) {
+        let ln_error_post = phred_to_ln_error_prob(error_rate_post_umi);
+        let ln_error_seq = phred_to_ln_error_prob(qual);
+        let adjusted_error = ln_error_prob_two_trials(ln_error_post, ln_error_seq);
+        (ln_not(adjusted_error), adjusted_error - 3.0_f64.ln())
+    }
+
+    /// The memoized tables must reproduce the pre-memoization inline math exactly, across the
+    /// full `0..=MAX_PHRED` quality domain, for every post-UMI error rate the callers use.
+    #[rstest]
+    #[case::post_umi_q0(0)]
+    #[case::post_umi_q10(10)]
+    #[case::post_umi_default_q40(40)]
+    #[case::post_umi_q45(45)]
+    #[case::post_umi_max_phred(MAX_PHRED)]
+    #[case::post_umi_above_max_phred(u8::MAX)]
+    fn test_adjusted_tables_match_the_inline_formula_bit_for_bit(
+        #[case] error_rate_post_umi: PhredScore,
+    ) {
+        let tables = adjusted_tables(error_rate_post_umi);
+
+        assert_eq!(tables.correct.len(), MAX_PHRED as usize + 1, "table must cover every Phred");
+        assert_eq!(tables.error_per_alt.len(), MAX_PHRED as usize + 1);
+
+        for qual in 0..=MAX_PHRED {
+            let (correct, error_per_alt) = reference_adjusted_entry(error_rate_post_umi, qual);
+            let actual_correct = tables.correct[qual as usize];
+            let actual_error_per_alt = tables.error_per_alt[qual as usize];
+
+            // Compared as bit patterns, not approximately: the memoized computation is meant to
+            // be the identical arithmetic in the identical order, so any drift is a regression.
+            assert_eq!(
+                actual_correct.to_bits(),
+                correct.to_bits(),
+                "correct probability drifted at post-UMI Q{error_rate_post_umi}, base Q{qual}: \
+                 {actual_correct} != {correct}"
+            );
+            assert_eq!(
+                actual_error_per_alt.to_bits(),
+                error_per_alt.to_bits(),
+                "alt-error probability drifted at post-UMI Q{error_rate_post_umi}, base Q{qual}: \
+                 {actual_error_per_alt} != {error_per_alt}"
+            );
+        }
+    }
+
+    /// The cache must hand out the *same* tables on every call, otherwise the memoization is
+    /// not actually happening and every builder pays the transcendental math again.
+    #[rstest]
+    #[case::post_umi_q0(0)]
+    #[case::post_umi_default_q40(40)]
+    #[case::post_umi_above_max_phred(u8::MAX)]
+    fn test_adjusted_tables_are_memoized(#[case] error_rate_post_umi: PhredScore) {
+        let first = adjusted_tables(error_rate_post_umi);
+        let second = adjusted_tables(error_rate_post_umi);
+
+        assert!(std::ptr::eq(first, second), "the cache slot must be initialized at most once");
+        assert!(std::ptr::eq(first.correct.as_ptr(), second.correct.as_ptr()));
+        assert!(std::ptr::eq(first.error_per_alt.as_ptr(), second.error_per_alt.as_ptr()));
+    }
+
+    /// Distinct post-UMI error rates must land in distinct cache slots — a shared slot would
+    /// silently apply one family's error model to another's.
+    #[test]
+    fn test_adjusted_tables_are_keyed_by_post_umi_error_rate() {
+        let q40 = adjusted_tables(40);
+        let q45 = adjusted_tables(45);
+
+        assert!(!std::ptr::eq(q40, q45), "different error rates must not share a slot");
+        assert_ne!(q40.correct[30].to_bits(), q45.correct[30].to_bits());
+    }
+
+    /// The builder must borrow the shared tables rather than computing its own copy.
+    #[test]
+    fn test_builder_borrows_the_shared_tables() {
+        let first = ConsensusBaseBuilder::new(45, 40);
+        let second = ConsensusBaseBuilder::new(10, 40);
+
+        assert!(std::ptr::eq(
+            first.adjusted_correct_table.as_ptr(),
+            second.adjusted_correct_table.as_ptr()
+        ));
+        assert!(std::ptr::eq(
+            first.adjusted_error_per_alt.as_ptr(),
+            second.adjusted_error_per_alt.as_ptr()
+        ));
     }
 
     /// The per-base error count in the consensus callers is
