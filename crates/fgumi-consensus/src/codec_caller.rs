@@ -75,7 +75,7 @@
 use crate::caller::{
     ConsensusCaller, ConsensusCallingStats, ConsensusOutput,
     RejectionReason as CallerRejectionReason, clamp_combined_error_to_fgbio_short,
-    clamp_per_base_to_fgbio_short,
+    clamp_per_base_to_fgbio_short, write_consensus_read_name,
 };
 use crate::phred::{MIN_PHRED, NO_CALL_BASE, NO_CALL_BASE_LOWER, PhredScore};
 use crate::simple_umi::consensus_umis;
@@ -342,6 +342,9 @@ pub struct CodecConsensusCaller {
     /// Reusable builder for raw-byte BAM record output
     bam_builder: UnmappedSamBuilder,
 
+    /// Reusable buffer holding the read name of the consensus record being built
+    read_name_buf: Vec<u8>,
+
     /// Whether to store rejected reads (raw bytes) for output
     track_rejects: bool,
 
@@ -407,6 +410,7 @@ impl CodecConsensusCaller {
             consensus_counter: 0,
             ss_caller,
             bam_builder: UnmappedSamBuilder::new(),
+            read_name_buf: Vec::new(),
             track_rejects: false,
             rejected_reads: Vec::new(),
         }
@@ -1340,6 +1344,23 @@ impl CodecConsensusCaller {
         consensus
     }
 
+    /// Writes the read name of the next consensus record into the reusable buffer.
+    ///
+    /// Records carrying a UMI are named `"<prefix>:<umi>"`, matching the vanilla and duplex
+    /// callers; records without one fall back to a running counter so every emitted name is
+    /// still unique.
+    fn write_read_name(&mut self, umi: Option<&str>) {
+        self.consensus_counter += 1;
+        if let Some(umi_str) = umi {
+            write_consensus_read_name(&mut self.read_name_buf, &self.read_name_prefix, umi_str);
+        } else {
+            use std::io::Write as _;
+            self.read_name_buf.clear();
+            write!(&mut self.read_name_buf, "{}:{}", self.read_name_prefix, self.consensus_counter)
+                .expect("writing to a Vec<u8> cannot fail");
+        }
+    }
+
     /// Builds the output record from the consensus and writes raw bytes into `output`.
     ///
     /// # Errors
@@ -1361,12 +1382,7 @@ impl CodecConsensusCaller {
         all_records: &[RawRecord],
     ) -> Result<()> {
         // Generate read name - use ':' delimiter to match fgbio format
-        self.consensus_counter += 1;
-        let read_name = if let Some(umi_str) = umi {
-            format!("{}:{}", self.read_name_prefix, umi_str)
-        } else {
-            format!("{}:{}", self.read_name_prefix, self.consensus_counter)
-        };
+        self.write_read_name(umi);
 
         // Codec always outputs unmapped fragments
         let flag = flags::UNMAPPED;
@@ -1375,7 +1391,7 @@ impl CodecConsensusCaller {
         // not a bug: return an error rather than panicking partway through
         // writing the output.
         self.bam_builder.try_build_record(
-            read_name.as_bytes(),
+            &self.read_name_buf,
             flag,
             &consensus.bases,
             &consensus.quals,

@@ -523,6 +523,26 @@ impl RejectionReason {
     }
 }
 
+/// Writes the consensus read name `"<read_name_prefix>:<umi>"` into `buf`, replacing whatever
+/// it held before.
+///
+/// Every consensus caller (vanilla, duplex, CODEC) names its output reads this way, once per
+/// emitted record. Sharing one implementation keeps the three callers from drifting, and
+/// writing into a caller-owned buffer instead of building a fresh `String` with `format!`
+/// keeps the name off the allocator on a path that runs once per output record.
+///
+/// # Arguments
+/// * `buf` - Reusable buffer that receives the read name
+/// * `read_name_prefix` - Prefix shared by every consensus read (see [`make_prefix_from_header`])
+/// * `umi` - Molecule identifier that distinguishes this consensus read
+pub fn write_consensus_read_name(buf: &mut Vec<u8>, read_name_prefix: &str, umi: &str) {
+    buf.clear();
+    buf.reserve(read_name_prefix.len() + 1 + umi.len());
+    buf.extend_from_slice(read_name_prefix.as_bytes());
+    buf.push(b':');
+    buf.extend_from_slice(umi.as_bytes());
+}
+
 /// Creates a read name prefix from the SAM header read groups.
 ///
 /// This matches fgbio's `makePrefixFromSamHeader` behavior:
