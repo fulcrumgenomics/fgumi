@@ -12,7 +12,7 @@
 //! These produce identical results to the sequential implementations in `assigner.rs`.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use ahash::{AHashMap, AHashSet};
 use rayon::prelude::*;
@@ -23,6 +23,45 @@ use crate::template::MoleculeId;
 use fgumi_umi::assigner::assert_uniform_umi_length;
 
 use super::{Umi, UmiAssigner};
+
+/// Counter handing out globally unique molecule-id blocks across `assign()` calls.
+///
+/// Every parallel assigner numbers the molecules of one `assign()` call locally as
+/// `0..k`, which is what its (partitioned, order-sensitive) algorithms naturally
+/// produce. `group` reuses one assigner across the pair-orientation subgroups of a
+/// position group and then derives that group's MI offset from `max(id) + 1`, so
+/// two calls that both start at 0 collide on the same MI tag. Reserving a block of
+/// `k` ids per call and rebasing onto it makes successive calls disjoint, matching
+/// the sequential assigners' `AtomicU64` counter.
+#[derive(Debug, Default)]
+struct MoleculeIdCounter {
+    next: AtomicU64,
+}
+
+impl MoleculeIdCounter {
+    /// Reserve `count` consecutive ids and return the first one.
+    fn reserve(&self, count: u64) -> u64 {
+        self.next.fetch_add(count, Ordering::SeqCst)
+    }
+
+    /// Rebase locally-numbered (`0..k`) assignments onto a freshly reserved block.
+    ///
+    /// The block size is `max(local id) + 1` rather than `assignments.len()`,
+    /// because assigners hand out ids contiguously and several reads can share one
+    /// molecule (and a paired molecule's `/A` and `/B` share a base id).
+    fn rebase(&self, assignments: &mut [MoleculeId]) {
+        let Some(max_local_id) = assignments.iter().filter_map(MoleculeId::id).max() else {
+            return;
+        };
+        let base = self.reserve(max_local_id + 1);
+        if base == 0 {
+            return;
+        }
+        for assignment in assignments.iter_mut() {
+            *assignment = assignment.with_offset(base);
+        }
+    }
+}
 
 /// Assign each distinct invalid (non-encodable) UMI its own molecule, with identical uppercased
 /// strings sharing -- mirroring fgbio's `Map[Umi, MoleculeId]` (every UMI it sees is assigned a
@@ -350,6 +389,7 @@ fn paired_canonical_strands(
 /// Produces identical results to `IdentityUmiAssigner` in `assigner.rs`.
 pub struct ParallelIdentityAssigner {
     pool: rayon::ThreadPool,
+    counter: MoleculeIdCounter,
 }
 
 impl ParallelIdentityAssigner {
@@ -366,12 +406,13 @@ impl ParallelIdentityAssigner {
             .num_threads(threads)
             .build()
             .expect("Failed to build rayon thread pool");
-        Self { pool }
+        Self { pool, counter: MoleculeIdCounter::default() }
     }
-}
 
-impl UmiAssigner for ParallelIdentityAssigner {
-    fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
+    /// Assign molecules numbered locally as `0..k` for this call alone.
+    ///
+    /// [`UmiAssigner::assign`] rebases the result onto a globally unique block.
+    fn assign_local(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
         if raw_umis.is_empty() {
             return Vec::new();
         }
@@ -416,6 +457,14 @@ impl UmiAssigner for ParallelIdentityAssigner {
             canonicals.par_iter().map(|canonical| canonical_to_id[canonical.as_str()]).collect()
         })
     }
+}
+
+impl UmiAssigner for ParallelIdentityAssigner {
+    fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
+        let mut assignments = self.assign_local(raw_umis);
+        self.counter.rebase(&mut assignments);
+        assignments
+    }
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -429,6 +478,7 @@ impl UmiAssigner for ParallelIdentityAssigner {
 pub struct ParallelEditAssigner {
     max_mismatches: u32,
     pool: rayon::ThreadPool,
+    counter: MoleculeIdCounter,
 }
 
 impl ParallelEditAssigner {
@@ -446,12 +496,13 @@ impl ParallelEditAssigner {
             .num_threads(threads)
             .build()
             .expect("Failed to build rayon thread pool");
-        Self { max_mismatches, pool }
+        Self { max_mismatches, pool, counter: MoleculeIdCounter::default() }
     }
-}
 
-impl UmiAssigner for ParallelEditAssigner {
-    fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
+    /// Assign molecules numbered locally as `0..k` for this call alone.
+    ///
+    /// [`UmiAssigner::assign`] rebases the result onto a globally unique block.
+    fn assign_local(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
         if raw_umis.is_empty() {
             return Vec::new();
         }
@@ -529,6 +580,14 @@ impl UmiAssigner for ParallelEditAssigner {
 
         result
     }
+}
+
+impl UmiAssigner for ParallelEditAssigner {
+    fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
+        let mut assignments = self.assign_local(raw_umis);
+        self.counter.rebase(&mut assignments);
+        assignments
+    }
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -542,6 +601,7 @@ impl UmiAssigner for ParallelEditAssigner {
 pub struct ParallelAdjacencyAssigner {
     max_mismatches: u32,
     pool: rayon::ThreadPool,
+    counter: MoleculeIdCounter,
 }
 
 impl ParallelAdjacencyAssigner {
@@ -559,12 +619,13 @@ impl ParallelAdjacencyAssigner {
             .num_threads(threads)
             .build()
             .expect("Failed to build rayon thread pool");
-        Self { max_mismatches, pool }
+        Self { max_mismatches, pool, counter: MoleculeIdCounter::default() }
     }
-}
 
-impl UmiAssigner for ParallelAdjacencyAssigner {
-    fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
+    /// Assign molecules numbered locally as `0..k` for this call alone.
+    ///
+    /// [`UmiAssigner::assign`] rebases the result onto a globally unique block.
+    fn assign_local(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
         if raw_umis.is_empty() {
             return Vec::new();
         }
@@ -685,6 +746,14 @@ impl UmiAssigner for ParallelAdjacencyAssigner {
             })
             .collect()
     }
+}
+
+impl UmiAssigner for ParallelAdjacencyAssigner {
+    fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
+        let mut assignments = self.assign_local(raw_umis);
+        self.counter.rebase(&mut assignments);
+        assignments
+    }
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -702,6 +771,7 @@ impl UmiAssigner for ParallelAdjacencyAssigner {
 pub struct ParallelPairedAssigner {
     max_mismatches: u32,
     pool: rayon::ThreadPool,
+    counter: MoleculeIdCounter,
 }
 
 impl ParallelPairedAssigner {
@@ -719,7 +789,7 @@ impl ParallelPairedAssigner {
             .num_threads(threads)
             .build()
             .expect("Failed to build rayon thread pool");
-        Self { max_mismatches, pool }
+        Self { max_mismatches, pool, counter: MoleculeIdCounter::default() }
     }
 
     /// Reverse a paired UMI: "AAAA-CCCC" -> "CCCC-AAAA"
@@ -746,12 +816,16 @@ impl ParallelPairedAssigner {
     }
 }
 
-impl UmiAssigner for ParallelPairedAssigner {
-    // One cohesive algorithm (encode → build reverse-aware adjacency → BFS clusters →
-    // canonical strands → final per-UMI molecule/strand map); splitting it would hurt
-    // readability more than the length costs. Matches other assigner/pipeline sites.
+impl ParallelPairedAssigner {
+    /// Assign molecules numbered locally as `0..k` for this call alone.
+    ///
+    /// [`UmiAssigner::assign`] rebases the result onto a globally unique block.
+    ///
+    /// One cohesive algorithm (encode → build reverse-aware adjacency → BFS clusters →
+    /// canonical strands → final per-UMI molecule/strand map); splitting it would hurt
+    /// readability more than the length costs. Matches other assigner/pipeline sites.
     #[allow(clippy::too_many_lines)]
-    fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
+    fn assign_local(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
         if raw_umis.is_empty() {
             return Vec::new();
         }
@@ -953,6 +1027,14 @@ impl UmiAssigner for ParallelPairedAssigner {
             })
             .collect()
     }
+}
+
+impl UmiAssigner for ParallelPairedAssigner {
+    fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
+        let mut assignments = self.assign_local(raw_umis);
+        self.counter.rebase(&mut assignments);
+        assignments
+    }
 
     fn split_templates_by_pair_orientation(&self) -> bool {
         false
@@ -966,7 +1048,9 @@ impl UmiAssigner for ParallelPairedAssigner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::umi::{AdjacencyUmiAssigner, PairedUmiAssigner, SimpleErrorUmiAssigner};
+    use crate::umi::{
+        AdjacencyUmiAssigner, IdentityUmiAssigner, PairedUmiAssigner, SimpleErrorUmiAssigner,
+    };
     use rstest::rstest;
 
     // ==================== UnionFind Tests ====================
@@ -1520,11 +1604,87 @@ mod tests {
         let assignments1 = assigner.assign(&umis);
         let assignments2 = assigner.assign(&umis);
 
-        // Should be deterministic
-        assert_eq!(assignments1, assignments2);
+        // Should be deterministic. Compare the induced partition, not the raw ids:
+        // successive `assign()` calls draw from disjoint id blocks by design (see
+        // `test_successive_assign_calls_use_disjoint_molecule_ids`), so identical
+        // labels would mean the counter was NOT advancing between calls.
+        assert!(
+            same_partition(&assignments1, &assignments2),
+            "repeated assign() must group identically;\n  run1={assignments1:?}\n  \
+             run2={assignments2:?}"
+        );
 
         // AAAAAA and AAAAAC should be grouped (AAAAAA is lexicographically first)
         assert_eq!(assignments1[0], assignments1[4]);
+    }
+
+    /// Successive `assign()` calls on one assigner must hand out molecule ids from
+    /// disjoint ranges.
+    ///
+    /// `group` reuses a single assigner across the pair-orientation subgroups of a
+    /// position group (see `assign_umi_groups_impl`), then derives that group's MI
+    /// offset from `max(id) + 1` over all of its templates. An assigner whose
+    /// counter restarts at 0 on every call therefore hands the same local id to an
+    /// FR template and an RF template with unrelated UMIs, and the shared offset
+    /// merges them into one MI tag. The sequential assigners carry an `AtomicU64`
+    /// across calls for exactly this reason; the parallel ones must match.
+    #[rstest]
+    #[case::identity_sequential(
+        || Box::new(IdentityUmiAssigner::new()) as Box<dyn UmiAssigner>,
+        &["AAAA", "CCCC"], &["GGGG", "TTTT"]
+    )]
+    #[case::identity_parallel(
+        || Box::new(ParallelIdentityAssigner::new(2)) as Box<dyn UmiAssigner>,
+        &["AAAA", "CCCC"], &["GGGG", "TTTT"]
+    )]
+    #[case::edit_sequential(
+        || Box::new(SimpleErrorUmiAssigner::new(1)) as Box<dyn UmiAssigner>,
+        &["AAAA", "CCCC"], &["GGGG", "TTTT"]
+    )]
+    #[case::edit_parallel(
+        || Box::new(ParallelEditAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["AAAA", "CCCC"], &["GGGG", "TTTT"]
+    )]
+    #[case::adjacency_sequential(
+        || Box::new(AdjacencyUmiAssigner::new(1, 1, 100)) as Box<dyn UmiAssigner>,
+        &["AAAA", "CCCC"], &["GGGG", "TTTT"]
+    )]
+    #[case::adjacency_parallel(
+        || Box::new(ParallelAdjacencyAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["AAAA", "CCCC"], &["GGGG", "TTTT"]
+    )]
+    #[case::paired_sequential(
+        || Box::new(PairedUmiAssigner::new(1)) as Box<dyn UmiAssigner>,
+        &["AAAA-CCCC", "CCCC-AAAA"], &["GGGG-TTTT", "TTTT-GGGG"]
+    )]
+    #[case::paired_parallel(
+        || Box::new(ParallelPairedAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["AAAA-CCCC", "CCCC-AAAA"], &["GGGG-TTTT", "TTTT-GGGG"]
+    )]
+    fn test_successive_assign_calls_use_disjoint_molecule_ids(
+        #[case] make_assigner: fn() -> Box<dyn UmiAssigner>,
+        #[case] first_umis: &[&str],
+        #[case] second_umis: &[&str],
+    ) {
+        let to_umis = |xs: &[&str]| -> Vec<Umi> { xs.iter().map(|s| (*s).to_string()).collect() };
+        let assigner = make_assigner();
+
+        let first = assigner.assign(&to_umis(first_umis));
+        let second = assigner.assign(&to_umis(second_umis));
+
+        let first_ids: AHashSet<u64> = first.iter().filter_map(MoleculeId::id).collect();
+        let second_ids: AHashSet<u64> = second.iter().filter_map(MoleculeId::id).collect();
+
+        assert!(!first_ids.is_empty(), "first call assigned no molecule ids");
+        assert!(!second_ids.is_empty(), "second call assigned no molecule ids");
+
+        let overlap: Vec<u64> = first_ids.intersection(&second_ids).copied().collect();
+        assert!(
+            overlap.is_empty(),
+            "successive assign() calls reused molecule ids {overlap:?};\n  \
+             first  umis={first_umis:?} -> {first:?}\n  \
+             second umis={second_umis:?} -> {second:?}"
+        );
     }
 
     /// Returns true iff two assignment vectors induce the same partition of input
