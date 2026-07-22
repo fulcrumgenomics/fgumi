@@ -2231,6 +2231,7 @@ fn dispatch_reserved_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// Build `n` distinguishable placeholder blocks.
     fn dummy_blocks(n: usize) -> Vec<RawBgzfBlock> {
@@ -2523,7 +2524,12 @@ mod tests {
 
         // Run one batch on `pool` (moved in, returned out so the next batch can
         // reuse it) and report the cumulative per-worker CompressSpill counts.
-        let run_batch = |pool: SortWorkerPool, num_jobs: usize| -> (SortWorkerPool, Vec<u64>) {
+        // `cumulative_jobs` is the total submitted across all batches so far —
+        // the counters are cumulative, so it is what they must settle at.
+        let run_batch = |pool: SortWorkerPool,
+                         num_jobs: usize,
+                         cumulative_jobs: u64|
+         -> (SortWorkerPool, Vec<u64>) {
             let (result_tx, result_rx) = pool.compress_result_channel();
             let submit_tx = result_tx.clone();
             let submit_handle = std::thread::spawn(move || {
@@ -2545,9 +2551,34 @@ mod tests {
             }
             assert_eq!(received, num_jobs);
             let pool = submit_handle.join().expect("submit thread should not panic");
-            let counts: Vec<u64> = (0..6)
-                .map(|t| pool.pipeline_stats.per_thread_step_counts[t][cs].load(Ordering::Relaxed))
-                .collect();
+
+            // A worker sends the job's result — and drops the job, closing its
+            // sender — inside `execute_step`, and only records the step counter
+            // after `execute_step` returns. So draining the result channel does
+            // NOT imply the counters are up to date: the last worker can still
+            // be between the send and the increment. Wait for the counters to
+            // settle instead of reading a value that is still in flight.
+            let read_counts = || -> Vec<u64> {
+                (0..6)
+                    .map(|t| {
+                        pool.pipeline_stats.per_thread_step_counts[t][cs].load(Ordering::Relaxed)
+                    })
+                    .collect()
+            };
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let counts = loop {
+                let counts = read_counts();
+                if counts.iter().sum::<u64>() >= cumulative_jobs {
+                    break counts;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for step counters to reach {cumulative_jobs}; \
+                     per-worker counts {counts:?}"
+                );
+                std::thread::sleep(Duration::from_micros(50));
+            };
+
             (pool, counts)
         };
 
@@ -2555,7 +2586,7 @@ mod tests {
 
         // Batch 1: capped at 2 — only workers 0..2 may run.
         pool.set_active_workers(2);
-        let (pool, after_capped) = run_batch(pool, 300);
+        let (pool, after_capped) = run_batch(pool, 300, 300);
         assert!(
             after_capped.iter().filter(|&&c| c > 0).count() <= 2,
             "cap=2 must bound active workers; per-worker counts {after_capped:?}"
@@ -2568,7 +2599,7 @@ mod tests {
 
         // Batch 2: raise the cap on the SAME pool and run again.
         pool.set_active_workers(6);
-        let (pool, after_full) = run_batch(pool, 300);
+        let (pool, after_full) = run_batch(pool, 300, 600);
         // Workers >= the old cap did nothing in batch 1, so any cumulative work
         // they now show was processed solely in batch 2 — i.e. reactivation worked.
         let reactivated_work: u64 = after_full[2..].iter().sum();
