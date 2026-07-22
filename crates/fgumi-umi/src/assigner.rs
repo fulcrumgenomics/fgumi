@@ -203,8 +203,10 @@
 //! - **Use Identity** if: UMI quality is very high (Q35+), you want maximum speed, or
 //!   you need to exactly match reference implementations.
 //!
-//! - **Use Edit** if: You have moderate error rates, smaller datasets (<100K UMIs per
-//!   position), and transitive clustering is acceptable for your application.
+//! - **Use Edit** if: You have moderate error rates and transitive clustering is
+//!   acceptable for your application. Above `--index-threshold` distinct UMIs at a
+//!   position, candidate neighbours come from an N-gram index rather than an
+//!   all-pairs scan, so large position groups no longer cost quadratic time.
 //!
 //! - **Use Adjacency** if: You have high sequencing depth (10-100x+ per molecule),
 //!   need conservative error correction, or are doing variant calling where
@@ -228,6 +230,46 @@ use fgumi_dna::BitEnc;
 /// Below this threshold, linear scan is used. Based on benchmarks: index provides ~10%
 /// speedup even at 100 UMIs/position with negligible construction overhead.
 pub const DEFAULT_INDEX_THRESHOLD: usize = 100;
+
+/// Minimum distinct UMIs before the `Edit` strategy builds its N-gram index.
+///
+/// Higher than [`DEFAULT_INDEX_THRESHOLD`] because edit's crossover is further
+/// out. Measured on a c8g.4xlarge over the `umi_assigner_threshold` sweep, index
+/// vs. scan at one mismatch:
+///
+/// | distinct UMIs | indexed | scan | |
+/// |---|---|---|---|
+/// | 118 | 104.9 us | 98.5 us | index **loses** 6.5% |
+/// | 213 | 203.7 us | 275.8 us | index wins 26% |
+/// | 898 | 1.08 ms | 3.63 ms | 3.4x |
+/// | 3,493 | 7.08 ms | 78.5 ms | 11x |
+/// | 12,967 | 61.6 ms | 961 ms | 15.6x |
+///
+/// So the crossover sits between 118 and 213; 200 clears the losing band while
+/// giving up none of the wins. Adjacency and paired keep
+/// [`DEFAULT_INDEX_THRESHOLD`] -- their crossovers were not re-measured here.
+///
+/// One shape defeats the index: if a UMI half has much lower entropy than the
+/// whole (a constant anchor or linker, say), every UMI lands in one partition
+/// bucket and each lookup degenerates to a full scan *plus* the per-query
+/// bookkeeping. Measured at 4,000 distinct 16-base UMIs with only 8 distinct
+/// first halves, indexing is ~1.7x slower than scanning, and ~6x slower with a
+/// constant first half. Raising `--index-threshold` above the largest position
+/// restores the scan for such designs.
+pub const EDIT_INDEX_THRESHOLD: usize = 200;
+
+/// Distinct-UMI count at which the `Edit` strategy stops merging and simply
+/// counts, deferring the choice of algorithm until the position is fully read.
+///
+/// Deliberately far below [`EDIT_INDEX_THRESHOLD`]: the point of stopping early
+/// is that whichever way the count lands, little work is in flight. Below the
+/// crossover the merge resumes from here and nothing is repeated; above it, the
+/// only cost is having merged this many UMIs the slow way -- a couple of
+/// thousand comparisons against a job orders of magnitude larger.
+///
+/// Stopping *at* the crossover instead would be far worse: merging 200 UMIs is
+/// most of the work for a position holding 213, so it would be paid twice.
+const MERGE_DEFER_POINT: usize = 64;
 
 /// A node in the BK-tree.
 ///
@@ -420,8 +462,14 @@ impl NgramIndex {
         let num_partitions = (max_mismatches + 1) as usize;
         let partition_len = umi_len / num_partitions;
 
-        // Need at least 1 base per partition for meaningful filtering
-        if partition_len == 0 {
+        // Need at least 1 base per partition for meaningful filtering, and at
+        // most 16: `extract_bits` packs 2 bits per base into a `u32`, so a wider
+        // partition would silently truncate the key (and trips its own
+        // `debug_assert!` in debug builds). Only reachable at
+        // `max_mismatches == 0`, where `partition_len == umi_len`; every caller
+        // in this crate gates on `max_mismatches == 1`, so this guards the
+        // `pub` constructor rather than closing a live hole.
+        if partition_len == 0 || partition_len > 16 {
             return None;
         }
 
@@ -605,7 +653,14 @@ impl Strategy {
                 assert_eq!(edits, 0, "Edits should be zero when using the identity UMI assigner");
                 Box::new(IdentityUmiAssigner::new())
             }
-            Strategy::Edit => Box::new(SimpleErrorUmiAssigner::new(edits)),
+            // Edit's index crossover is further out than adjacency's, so the
+            // shared `--index-threshold` is floored at `EDIT_INDEX_THRESHOLD`.
+            // Asking edit for a lower value only buys a slower run; a higher one
+            // is honoured.
+            Strategy::Edit => Box::new(SimpleErrorUmiAssigner::new_with_index_threshold(
+                edits,
+                index_threshold.max(EDIT_INDEX_THRESHOLD),
+            )),
             Strategy::Adjacency => {
                 Box::new(AdjacencyUmiAssigner::new(edits, threads, index_threshold))
             }
@@ -940,6 +995,42 @@ impl UmiAssigner for IdentityUmiAssigner {
     }
 }
 
+/// Disjoint-set forest over UMI indices, used to build connected components.
+///
+/// Path halving plus union by size, so a group of `n` UMIs costs effectively
+/// `O(n)` for the merges regardless of the order edges arrive in — which is what
+/// makes the indexed and unindexed neighbour searches interchangeable.
+struct UnionFind {
+    parent: Vec<usize>,
+    size: Vec<usize>,
+}
+
+impl UnionFind {
+    fn new(n: usize) -> Self {
+        Self { parent: (0..n).collect(), size: vec![1; n] }
+    }
+
+    fn find(&mut self, mut x: usize) -> usize {
+        while self.parent[x] != x {
+            self.parent[x] = self.parent[self.parent[x]];
+            x = self.parent[x];
+        }
+        x
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let (mut ra, mut rb) = (self.find(a), self.find(b));
+        if ra == rb {
+            return;
+        }
+        if self.size[ra] < self.size[rb] {
+            std::mem::swap(&mut ra, &mut rb);
+        }
+        self.parent[rb] = ra;
+        self.size[ra] += self.size[rb];
+    }
+}
+
 /// Simple error-tolerant UMI assigner
 ///
 /// Groups UMIs that are within a specified edit distance using a simple clustering algorithm.
@@ -965,11 +1056,14 @@ impl UmiAssigner for IdentityUmiAssigner {
 /// Uses atomic counter for ID generation, making it safe to use across threads.
 pub struct SimpleErrorUmiAssigner {
     max_mismatches: u32,
+    index_threshold: usize,
     counter: AtomicU64,
 }
 
 impl SimpleErrorUmiAssigner {
-    /// Create a new simple error-tolerant UMI assigner
+    /// Create a new simple error-tolerant UMI assigner using edit's own N-gram
+    /// index threshold ([`EDIT_INDEX_THRESHOLD`]), which is higher than the
+    /// shared [`DEFAULT_INDEX_THRESHOLD`] because edit's crossover is further out.
     ///
     /// # Arguments
     ///
@@ -980,7 +1074,110 @@ impl SimpleErrorUmiAssigner {
     /// A new `SimpleErrorUmiAssigner` instance
     #[must_use]
     pub fn new(max_mismatches: u32) -> Self {
-        Self { max_mismatches, counter: AtomicU64::new(0) }
+        Self::new_with_index_threshold(max_mismatches, EDIT_INDEX_THRESHOLD)
+    }
+
+    /// Create a new simple error-tolerant UMI assigner with an explicit N-gram
+    /// index threshold.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_mismatches` - Maximum number of mismatches allowed between UMIs in the same group
+    /// * `index_threshold` - Build the N-gram index once a position group has at
+    ///   least this many distinct, encodable UMIs. Consulted only once a
+    ///   position exceeds `MERGE_DEFER_POINT` distinct UMIs and only when
+    ///   `max_mismatches == 1`, so any value at or below `MERGE_DEFER_POINT`
+    ///   behaves identically, and no value indexes at other distances.
+    ///   `usize::MAX` never indexes.
+    #[must_use]
+    pub fn new_with_index_threshold(max_mismatches: u32, index_threshold: usize) -> Self {
+        Self { max_mismatches, index_threshold, counter: AtomicU64::new(0) }
+    }
+
+    /// Add one UMI to the accumulated groups, merging any it bridges.
+    ///
+    /// This is the incremental single-linkage step: find every existing group
+    /// holding a UMI within `max_mismatches`, and fold them together with this
+    /// one. `any()` stops at a group's first match, so a lightly-clustered
+    /// position costs about `distinct x groups` rather than `distinct^2 / 2`.
+    fn merge_umi_into_sets(umi: &Umi, max_mismatches: u32, umi_sets: &mut Vec<BTreeSet<Umi>>) {
+        let mut matched_sets = Vec::new();
+
+        // Find all sets that match this UMI
+        for (idx, set) in umi_sets.iter().enumerate() {
+            if set.iter().any(|other| matches_within_threshold(other, umi, max_mismatches as usize))
+            {
+                matched_sets.push(idx);
+            }
+        }
+
+        match matched_sets.len() {
+            0 => {
+                // No matches - create new set
+                umi_sets.push(BTreeSet::from([umi.clone()]));
+            }
+            1 => {
+                // One match - add to that set
+                umi_sets[matched_sets[0]].insert(umi.clone());
+            }
+            _ => {
+                // Collect UMIs from all matched sets
+                let mut merged = BTreeSet::from([umi.clone()]);
+
+                for &idx in matched_sets.iter().rev() {
+                    let set = umi_sets.remove(idx);
+                    merged.extend(set);
+                }
+
+                umi_sets.push(merged);
+            }
+        }
+    }
+
+    /// Build the components for a group diverse enough to index.
+    ///
+    /// An N-gram index supplies each UMI's exact neighbours -- `find_within`
+    /// verifies each candidate's Hamming distance before returning it -- and
+    /// union-find assembles them. The index is built over `distinct` and queried
+    /// with `distinct`: indexing a subset while querying the whole set would
+    /// under-merge.
+    ///
+    /// `NgramIndex::new` declines input it cannot encode, which falls back to
+    /// comparing every pair over the identical relation, so the components come
+    /// out the same either way. The notable case is dashed dual UMIs
+    /// (`AAAA-CCCC`): the caller's `BitEnc::from_umi_str` filter *admits* them
+    /// (it skips `-`) but the index's `BitEnc::from_bytes` rejects them.
+    fn components_via_index(&self, distinct: &[&Umi]) -> Vec<BTreeSet<Umi>> {
+        let umis: Vec<(usize, &str)> =
+            distinct.iter().enumerate().map(|(i, umi)| (i, umi.as_str())).collect();
+        let index = NgramIndex::new(&umis, self.max_mismatches);
+
+        let mut components = UnionFind::new(distinct.len());
+        if let Some(index) = index {
+            for (i, umi) in distinct.iter().enumerate() {
+                for (j, _dist) in index.find_within(umi, self.max_mismatches) {
+                    components.union(i, j);
+                }
+            }
+        } else {
+            for i in 0..distinct.len() {
+                for j in (i + 1)..distinct.len() {
+                    if matches_within_threshold(
+                        distinct[i],
+                        distinct[j],
+                        self.max_mismatches as usize,
+                    ) {
+                        components.union(i, j);
+                    }
+                }
+            }
+        }
+
+        let mut by_root: AHashMap<usize, BTreeSet<Umi>> = AHashMap::new();
+        for (i, umi) in distinct.iter().enumerate() {
+            by_root.entry(components.find(i)).or_default().insert((*umi).clone());
+        }
+        by_root.into_values().collect()
     }
 
     /// Generate the next unique molecule ID
@@ -1020,10 +1217,46 @@ impl UmiAssigner for SimpleErrorUmiAssigner {
         // Genuinely differing-length *valid* UMIs (e.g. ["AAAA", "CCC"]) still trip the guard.
         assert_uniform_umi_length(encodings.iter().filter_map(|enc| enc.map(|enc| enc.len())));
 
-        let mut umi_sets: Vec<BTreeSet<Umi>> = Vec::new();
-        // Track seen UMIs to skip duplicate processing
+        // Group the distinct UMIs into connected components under the
+        // "within `max_mismatches`" relation, in a single pass over the records.
+        //
+        // Two methods, and which one is right depends on the *distinct* UMI
+        // count -- which is not known until the position has been read:
+        //
+        // - The incremental set-merge. It is not an all-pairs scan: it walks the
+        //   existing sets and `any()` stops at a set's first match, so a
+        //   lightly-clustered position costs about `distinct x sets`.
+        // - An N-gram index plus union-find, once the position is diverse enough
+        //   for the quadratic term to dominate (`index_threshold`).
+        //
+        // The count arriving late is the whole difficulty. Pre-counting in a
+        // separate pass would cost every position, including the many that never
+        // index. So merging runs immediately and simply *pauses* at
+        // `MERGE_DEFER_POINT` -- far below the decision point -- after which the
+        // loop only collects. Then little work is in flight whichever way the
+        // count lands:
+        //
+        // - below `index_threshold`, the merge resumes from where it paused, and
+        //   because the set-merge is incremental and order-independent nothing is
+        //   repeated;
+        // - at or above it, the only waste is having merged `MERGE_DEFER_POINT`
+        //   UMIs the slow way.
+        //
+        // Pausing *at* the decision point instead measured 32% slower at 213
+        // distinct UMIs: merging 200 of them is most of the work for a position
+        // holding 213, so it gets paid for twice.
+        //
+        // `distinct` is tracked only when indexing is possible at all, so
+        // `max_mismatches != 1` pays nothing for any of this.
+        //
+        // `test_edit_matches_brute_force_across_regimes` checks all three
+        // regimes against an independent oracle.
+        let can_index = self.max_mismatches == 1;
+        let mut distinct: Vec<&Umi> = Vec::new();
         let mut seen: std::collections::HashSet<&str> =
             std::collections::HashSet::with_capacity(upper_umis.len());
+        let mut umi_sets: Vec<BTreeSet<Umi>> = Vec::new();
+        let mut deferred = false;
 
         for (idx, umi) in upper_umis.iter().enumerate() {
             // Skip invalid (non-encodable) UMIs: they cannot be reliably compared (BitEnc
@@ -1042,40 +1275,44 @@ impl UmiAssigner for SimpleErrorUmiAssigner {
                 continue;
             }
 
-            let mut matched_sets = Vec::new();
+            if can_index {
+                distinct.push(umi);
 
-            // Find all sets that match this UMI
-            for (idx, set) in umi_sets.iter().enumerate() {
-                if set
-                    .iter()
-                    .any(|other| matches_within_threshold(other, umi, self.max_mismatches as usize))
-                {
-                    matched_sets.push(idx);
+                if !deferred && distinct.len() > MERGE_DEFER_POINT {
+                    // Enough diversity that this *might* end up indexed. Stop
+                    // merging and just keep collecting, so that little work is
+                    // in flight whichever way the count lands. Nothing is
+                    // discarded: if the group turns out to be small the merge
+                    // resumes below from exactly here.
+                    //
+                    // The test is `>` so that exactly `MERGE_DEFER_POINT` UMIs
+                    // have been merged when it fires -- this UMI is the first
+                    // deferred one, and the resume slice starts at its index.
+                    deferred = true;
+                }
+
+                if deferred {
+                    continue;
                 }
             }
 
-            match matched_sets.len() {
-                0 => {
-                    // No matches - create new set
-                    let mut new_set = BTreeSet::new();
-                    new_set.insert(umi.clone());
-                    umi_sets.push(new_set);
-                }
-                1 => {
-                    // One match - add to that set
-                    umi_sets[matched_sets[0]].insert(umi.clone());
-                }
-                _ => {
-                    // Collect UMIs from all matched sets
-                    let mut merged = BTreeSet::new();
-                    merged.insert(umi.clone());
+            Self::merge_umi_into_sets(umi, self.max_mismatches, &mut umi_sets);
+        }
 
-                    for &idx in matched_sets.iter().rev() {
-                        let set = umi_sets.remove(idx);
-                        merged.extend(set);
-                    }
-
-                    umi_sets.push(merged);
+        if deferred {
+            if distinct.len() >= self.index_threshold {
+                // Diverse enough for the index to pay for itself. The paused
+                // merge covered at most `MERGE_DEFER_POINT` UMIs, so discarding
+                // it and rebuilding every component from the index is cheap
+                // relative to the position being grouped.
+                umi_sets = self.components_via_index(&distinct);
+            } else {
+                // Below the crossover after all: resume the merge for the UMIs
+                // set aside while counting. The set-merge is incremental and
+                // order-independent, so this costs exactly what it would have
+                // cost had it never paused -- no work is repeated.
+                for umi in &distinct[MERGE_DEFER_POINT..] {
+                    Self::merge_umi_into_sets(umi, self.max_mismatches, &mut umi_sets);
                 }
             }
         }
@@ -2373,6 +2610,312 @@ mod tests {
     }
 
     // ========================================================================
+    /// `NgramIndex` packs each partition into a `u32` (2 bits/base), so a
+    /// partition wider than 16 bases would silently truncate the key. At
+    /// `max_mismatches == 0` the single partition spans the whole UMI, so this
+    /// is reachable for any UMI longer than 16 bases; the constructor must
+    /// decline rather than build a degenerate index.
+    #[rstest]
+    #[case::zero_mismatches_long_umi(0, 20, None)]
+    #[case::zero_mismatches_short_umi(0, 16, Some(()))]
+    #[case::one_mismatch_long_umi(1, 20, Some(()))]
+    fn test_ngram_index_declines_oversized_partitions(
+        #[case] max_mismatches: u32,
+        #[case] umi_len: usize,
+        #[case] expected: Option<()>,
+    ) {
+        let umi = "ACGT".repeat(umi_len.div_ceil(4))[..umi_len].to_string();
+        let other = format!("T{}", &umi[1..]);
+        let umis = vec![(0usize, umi.as_str()), (1usize, other.as_str())];
+        assert_eq!(NgramIndex::new(&umis, max_mismatches).map(|_| ()), expected);
+    }
+
+    /// Group `umis` into components by brute force, independent of the
+    /// assigner: every pair within `max_mismatches` joins, transitively.
+    ///
+    /// This is the programmatic **fgbio baseline** for the Edit strategy, not
+    /// merely an internal-consistency check. It reproduces fgbio's
+    /// `GroupReadsByUmi.SimpleErrorUmiAssigner.assign` (fgbio
+    /// `src/main/scala/com/fulcrumgenomics/umi/GroupReadsByUmi.scala`) directly:
+    /// fgbio joins a UMI to any set already holding a member within
+    /// `maxMismatches` mismatches and merges sets that a single UMI links,
+    /// i.e. it forms the transitive closure (connected components) of the
+    /// `countMismatches <= maxMismatches` relation and emits one molecule per
+    /// component. fgumi's Edit strategy matches fgbio here — there is no
+    /// intentional divergence — so a partition this oracle rejects is a real
+    /// divergence from fgbio, not just from a sibling code path. (This perf
+    /// change only indexes the neighbour search; it does not alter the
+    /// partition, which is exactly what pinning it against the fgbio definition
+    /// guarantees.)
+    ///
+    /// The assigner has three internal regimes -- merge only, merge-then-resume,
+    /// and merge-then-index -- and its own two paths check each other, so this
+    /// implementation-independent fgbio reference is what pins that *all* of them
+    /// compute fgbio's answer rather than the same wrong one. Molecule-id values
+    /// themselves (fgbio hands them out per component in first-seen order) are
+    /// pinned separately by `test_edit_ids_are_dense_and_ordered_by_group_minimum`;
+    /// this oracle compares only the partition. Returns the partition as a sorted
+    /// list of sorted UMI groups.
+    fn brute_force_components(umis: &[Umi], max_mismatches: u32) -> Vec<Vec<Umi>> {
+        fn root(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                x = parent[x];
+            }
+            x
+        }
+
+        let mut distinct: Vec<&Umi> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for umi in umis {
+            if seen.insert(umi.as_str()) {
+                distinct.push(umi);
+            }
+        }
+
+        let n = distinct.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                // Hamming computed inline rather than via
+                // `matches_within_threshold`, so a bug in that predicate cannot
+                // pass both the implementation and its oracle.
+                let within = distinct[i].len() == distinct[j].len()
+                    && distinct[i].bytes().zip(distinct[j].bytes()).filter(|(a, b)| a != b).count()
+                        <= max_mismatches as usize;
+                if within {
+                    let (ri, rj) = (root(&mut parent, i), root(&mut parent, j));
+                    parent[ri] = rj;
+                }
+            }
+        }
+
+        let mut groups: std::collections::HashMap<usize, Vec<Umi>> =
+            std::collections::HashMap::new();
+        for (i, umi) in distinct.iter().enumerate() {
+            let r = root(&mut parent, i);
+            groups.entry(r).or_default().push((*umi).clone());
+        }
+        let mut out: Vec<Vec<Umi>> = groups
+            .into_values()
+            .map(|mut g| {
+                g.sort();
+                g
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The partition the assigner produces, in the same shape as the oracle.
+    fn partition_from_ids(umis: &[Umi], ids: &[MoleculeId]) -> Vec<Vec<Umi>> {
+        let mut groups: std::collections::HashMap<String, Vec<Umi>> =
+            std::collections::HashMap::new();
+        let mut already_counted = std::collections::HashSet::new();
+        for (umi, id) in umis.iter().zip(ids) {
+            if already_counted.insert(umi.as_str()) {
+                groups.entry(format!("{id:?}")).or_default().push(umi.clone());
+            }
+        }
+        let mut out: Vec<Vec<Umi>> = groups
+            .into_values()
+            .map(|mut g| {
+                g.sort();
+                g
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Deterministic UMIs with a controllable number of distinct sequences, so a
+    /// test can land in a chosen regime.
+    fn umis_with_distinct(target_distinct: usize, umi_len: usize, seed: u64) -> Vec<Umi> {
+        let bases = [b'A', b'C', b'G', b'T'];
+        let mut state = seed | 1;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut out: Vec<Umi> = Vec::new();
+        let mut generated = std::collections::HashSet::new();
+        while generated.len() < target_distinct {
+            let umi: String =
+                (0..umi_len).map(|_| bases[(next() % 4) as usize] as char).collect::<String>();
+            if generated.insert(umi.clone()) {
+                // Two copies each, so dedup and copy handling are exercised.
+                out.push(umi.clone());
+                out.push(umi);
+            }
+        }
+        out
+    }
+
+    /// Every internal regime must agree with the fgbio baseline oracle
+    /// (`brute_force_components`, which reproduces fgbio's
+    /// `SimpleErrorUmiAssigner` partition definition).
+    ///
+    /// The counts straddle both internal boundaries: `MERGE_DEFER_POINT` (64,
+    /// where merging pauses) and `EDIT_INDEX_THRESHOLD` (200, where the index is
+    /// chosen). 63/64/65 pin the pause boundary, 199/200/201 the decision
+    /// boundary, and the two together pin the resume path in between -- the one
+    /// that must reproduce work it deliberately postponed.
+    #[rstest]
+    #[case::below_defer_point(10)]
+    #[case::just_below_defer(63)]
+    #[case::at_defer_point(64)]
+    #[case::just_above_defer(65)]
+    #[case::between_defer_and_index(120)]
+    #[case::just_below_index(199)]
+    #[case::at_index_threshold(200)]
+    #[case::just_above_index(201)]
+    #[case::well_above_index(600)]
+    fn test_edit_matches_brute_force_across_regimes(#[case] target_distinct: usize) {
+        for edits in 1..=2u32 {
+            let umis = umis_with_distinct(target_distinct, 8, 0x51ED ^ target_distinct as u64);
+            let ids = SimpleErrorUmiAssigner::new(edits).assign(&umis);
+            assert_eq!(
+                partition_from_ids(&umis, &ids),
+                brute_force_components(&umis, edits),
+                "regime mismatch at {target_distinct} distinct, edits={edits}"
+            );
+        }
+    }
+
+    /// Molecule ids must be dense and ordered by each group's smallest UMI --
+    /// the property that makes the index and scan paths interchangeable.
+    #[test]
+    fn test_edit_ids_are_dense_and_ordered_by_group_minimum() {
+        let umis = umis_with_distinct(300, 8, 0xA11CE);
+        let ids = SimpleErrorUmiAssigner::new(1).assign(&umis);
+
+        let mut first_id_by_group_min: Vec<(Umi, String)> = Vec::new();
+        let mut distinct_ids = std::collections::HashSet::new();
+        let partition = partition_from_ids(&umis, &ids);
+        for group in &partition {
+            let id = umis
+                .iter()
+                .zip(&ids)
+                .find(|(u, _)| *u == &group[0])
+                .map(|(_, id)| format!("{id:?}"))
+                .expect("group member must have an id");
+            assert!(distinct_ids.insert(id.clone()), "two groups share an id");
+            first_id_by_group_min.push((group[0].clone(), id));
+        }
+
+        // Sorting by group minimum must sort by id, i.e. ids were handed out in
+        // ascending order of each group's smallest UMI.
+        let mut by_min = first_id_by_group_min.clone();
+        by_min.sort_by(|a, b| a.0.cmp(&b.0));
+        let numeric = |s: &str| -> u64 {
+            let digits: String = s.chars().filter(char::is_ascii_digit).collect();
+            // Not `unwrap_or(0)`: if `MoleculeId`'s Debug form ever stops
+            // carrying a number, every id would collapse to 0 and the ordering
+            // assertion below would pass vacuously.
+            digits.parse().expect("MoleculeId Debug form must contain its numeric id")
+        };
+        let ids_in_min_order: Vec<u64> = by_min.iter().map(|(_, id)| numeric(id)).collect();
+        let mut sorted = ids_in_min_order.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids_in_min_order, sorted, "ids are not ordered by group minimum");
+
+        // Dense: one id per component, numbered 0..n with no gaps.
+        assert_eq!(sorted, (0..sorted.len() as u64).collect::<Vec<_>>(), "ids are not dense");
+    }
+
+    /// The index must be a pure discovery optimisation: forcing it on
+    /// (`index_threshold = 0`) and off (`usize::MAX`) must produce identical
+    /// molecule ids for the same input.
+    ///
+    /// Each case is padded past [`MERGE_DEFER_POINT`] with filler UMIs, because
+    /// the index is unreachable below it *whatever* the threshold -- merging
+    /// only pauses once a position exceeds that many distinct UMIs. An earlier
+    /// version of this test used 3-5 UMIs per case and silently compared the
+    /// scan against itself; `assert!(distinct > MERGE_DEFER_POINT)` below keeps
+    /// that from recurring.
+    #[rstest]
+    #[case::pure_acgt(&["AAAAAAAA", "AAAAAAAC", "AAAAAACC", "TTTTTTTT", "TTTTTTTG"])]
+    #[case::all_singletons(&["AAAAAAAA", "CCCCCCCC", "GGGGGGGG", "TTTTTTTT"])]
+    #[case::one_component(&["AAAAAAAA", "AAAAAAAC", "AAAAAAAG", "AAAAAAAT"])]
+    #[case::duplicates(&["AAAAAAAA", "AAAAAAAA", "AAAAAAAC", "AAAAAAAC", "TTTTTTTT"])]
+    // N-containing UMIs are not BitEnc-encodable and are excluded from matching
+    // (deliberate parity with the parallel assigner); each gets its own id.
+    #[case::n_containing(&["AAAAAAAA", "AAAAAAAN", "AAAAAAAC", "NNNNNNNN"])]
+    fn test_edit_index_matches_scan(#[case] interesting: &[&str]) {
+        // Filler shares the UMI length so `assert_uniform_umi_length` is happy,
+        // and is far from the interesting UMIs so it forms its own components.
+        let mut umis: Vec<Umi> = interesting.iter().map(|u| (*u).to_string()).collect();
+        umis.extend(umis_with_distinct(MERGE_DEFER_POINT * 2, 8, 0xF11E7));
+
+        let distinct: std::collections::HashSet<&str> =
+            umis.iter().map(std::string::String::as_str).collect();
+        assert!(
+            distinct.len() > MERGE_DEFER_POINT,
+            "case must exceed MERGE_DEFER_POINT or the index is never reached"
+        );
+
+        for edits in 0..=3u32 {
+            let indexed = SimpleErrorUmiAssigner::new_with_index_threshold(edits, 0).assign(&umis);
+            let scanned =
+                SimpleErrorUmiAssigner::new_with_index_threshold(edits, usize::MAX).assign(&umis);
+            assert_eq!(indexed, scanned, "index/scan divergence at edits={edits}");
+        }
+    }
+
+    /// Dashed dual UMIs reach the index build and are declined by it
+    /// (`BitEnc::from_bytes` rejects `-`, while the caller's `from_umi_str`
+    /// filter admits it), so the indexed path must fall back to comparing every
+    /// pair and produce the same components as the scan. Sized past
+    /// [`MERGE_DEFER_POINT`] so the fallback is genuinely exercised.
+    #[test]
+    fn test_edit_dashed_umis_fall_back_within_indexed_path() {
+        let halves = umis_with_distinct(MERGE_DEFER_POINT * 2, 4, 0xDA54);
+        let dashed: Vec<Umi> = halves.iter().map(|h| format!("{h}-{h}")).collect();
+        // Dashed and plain together: `from_umi_str` skips the dash, so both
+        // encode to 8 bases and the uniform-length guard is satisfied, while
+        // `NgramIndex`'s `from_bytes` rejects the dashed ones and declines.
+        let plain: Vec<Umi> = umis_with_distinct(MERGE_DEFER_POINT, 8, 0xBEEF);
+        let umis: Vec<Umi> = dashed.into_iter().chain(plain).collect();
+
+        let indexed = SimpleErrorUmiAssigner::new_with_index_threshold(1, 0).assign(&umis);
+        let scanned = SimpleErrorUmiAssigner::new_with_index_threshold(1, usize::MAX).assign(&umis);
+        assert_eq!(indexed, scanned);
+    }
+
+    /// Same equivalence above the real threshold, on a group large enough that
+    /// the index actually engages, and with genuine components to merge.
+    #[test]
+    fn test_edit_index_matches_scan_above_threshold() {
+        // 1,000 distinct 10-mers plus a 1-mismatch neighbour for each, so the
+        // relation has real edges rather than being all-singletons.
+        let mut umis: Vec<Umi> = Vec::new();
+        let bases = [b'A', b'C', b'G', b'T'];
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut rnd = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..1000 {
+            let umi: String =
+                (0..10).map(|_| bases[(rnd() % 4) as usize] as char).collect::<String>();
+            let mut neighbour = umi.clone().into_bytes();
+            let pos = (rnd() % 10) as usize;
+            neighbour[pos] = if neighbour[pos] == b'A' { b'C' } else { b'A' };
+            umis.push(umi);
+            umis.push(String::from_utf8(neighbour).expect("ASCII"));
+        }
+
+        let indexed = SimpleErrorUmiAssigner::new_with_index_threshold(1, 0).assign(&umis);
+        let scanned = SimpleErrorUmiAssigner::new_with_index_threshold(1, usize::MAX).assign(&umis);
+        assert_eq!(indexed, scanned);
+        // Sanity: the input really does form non-trivial components.
+        let distinct_ids: std::collections::HashSet<_> = indexed.iter().collect();
+        assert!(distinct_ids.len() < umis.len(), "expected merging, got all singletons");
+    }
+
     // SimpleErrorUmiAssigner Tests
     // ========================================================================
 

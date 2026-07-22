@@ -24,7 +24,9 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-use fgumi_lib::umi::assigner::{Strategy, Umi, UmiAssigner};
+use fgumi_lib::umi::assigner::{
+    EDIT_INDEX_THRESHOLD, SimpleErrorUmiAssigner, Strategy, Umi, UmiAssigner,
+};
 use fgumi_lib::umi::parallel_assigner::{
     ParallelAdjacencyAssigner, ParallelEditAssigner, ParallelIdentityAssigner,
     ParallelPairedAssigner,
@@ -129,19 +131,59 @@ fn bench_identity(c: &mut Criterion) {
     group.finish();
 }
 
+/// Edit-strategy sizes extend past `GROUP_SIZES` because the sequential edit
+/// assigner is the one whose cost is quadratic in *distinct* UMIs.
+///
+/// Measured distinct counts, which are what the cost depends on and are well
+/// above `n / COPIES_PER_UMI` (see `EDIT_INDEX_THRESHOLDS`): 64 templates -> 14
+/// distinct, 256 -> 61, 512 -> 118, 1024 -> 213, 2048 -> 446, 4096 -> 898,
+/// 8192 -> 1778, 16384 -> 3493, 32768 -> 6759, 65536 -> 12967. So the sweep
+/// spans both sides of edit's crossover and reaches the regime the N-gram index
+/// is meant to flatten. Each run prints its own counts, so a change to
+/// `make_umis` shows up rather than silently invalidating this list.
+const EDIT_GROUP_SIZES: &[usize] = &[64, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
+
+/// Index thresholds swept for the edit strategy. The gate is
+/// `distinct_umis >= threshold`, so `usize::MAX` never indexes (pure scan) and a
+/// low value always does. Sweeping locates the crossover in *distinct* UMIs,
+/// which is what the cost actually depends on -- `make_umis` injects a
+/// single-base substitution 10% of the time and each one mints a new sequence,
+/// so distinct runs well above `n / COPIES_PER_UMI`.
+const EDIT_INDEX_THRESHOLDS: &[usize] = &[100, EDIT_INDEX_THRESHOLD, 512, 1024, usize::MAX];
+
 fn bench_edit(c: &mut Criterion) {
     let mut group = c.benchmark_group("umi_assigner/edit_1");
+    // The largest sizes run tens of millions of comparisons per iteration on
+    // the unindexed path; the default 100 samples would take minutes each.
+    group.sample_size(10);
     let threads = bench_threads();
-    for &n in GROUP_SIZES {
+    for &n in EDIT_GROUP_SIZES {
         let umis = make_umis(n);
+        let distinct: std::collections::HashSet<&str> =
+            umis.iter().map(std::string::String::as_str).collect();
+        println!("edit_1: {n} templates -> {} distinct UMIs", distinct.len());
         group.throughput(Throughput::Elements(n as u64));
 
-        group.bench_with_input(BenchmarkId::new("sequential", n), &umis, |b, umis| {
-            b.iter(|| {
-                let assigner = Strategy::Edit.new_assigner_full(1, 1, INDEX_THRESHOLD);
-                black_box(assigner.assign(black_box(umis)))
+        for &threshold in EDIT_INDEX_THRESHOLDS {
+            // Derive the label from the threshold so it cannot drift from
+            // `EDIT_INDEX_THRESHOLD` if that constant changes.
+            let label = if threshold == usize::MAX {
+                "scan".to_string()
+            } else {
+                format!("thr{threshold}")
+            };
+            group.bench_with_input(BenchmarkId::new(label, n), &umis, |b, umis| {
+                b.iter(|| {
+                    // Constructed directly rather than via
+                    // `Strategy::new_assigner_full`, which floors the threshold
+                    // at `EDIT_INDEX_THRESHOLD` -- routing through it would make
+                    // every sub-200 arm identical to the default and the sweep
+                    // unable to locate the crossover it exists to find.
+                    let assigner = SimpleErrorUmiAssigner::new_with_index_threshold(1, threshold);
+                    black_box(assigner.assign(black_box(umis)))
+                });
             });
-        });
+        }
 
         group.bench_with_input(BenchmarkId::new("parallel", n), &umis, |b, umis| {
             b.iter(|| {
