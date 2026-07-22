@@ -18,6 +18,24 @@ const DEFAULT_ERROR_RATE_POST: u8 = 90;
 /// Default quality score for observations (Q20)
 const DEFAULT_Q_ERROR: u8 = 20;
 
+/// The Phred-scaled error rates a consensus caller was configured with.
+///
+/// Both rates are plain `u8`s, so passing them as separate arguments makes them trivially
+/// swappable at a call site; bundling them keeps `pre` and `post` attached to their names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UmiErrorRates {
+    /// Phred-scaled error rate prior to UMI labeling
+    pub pre_umi: u8,
+    /// Phred-scaled error rate after UMI labeling
+    pub post_umi: u8,
+}
+
+impl Default for UmiErrorRates {
+    fn default() -> Self {
+        Self { pre_umi: DEFAULT_ERROR_RATE_PRE, post_umi: DEFAULT_ERROR_RATE_POST }
+    }
+}
+
 /// Simple consensus caller for UMI sequences.
 ///
 /// Uses position-by-position likelihood-based consensus calling, matching
@@ -143,10 +161,19 @@ pub struct SimpleUmiConsensusCaller {
 }
 
 impl SimpleUmiConsensusCaller {
-    /// Creates a new simple UMI consensus caller
+    /// Creates a new simple UMI consensus caller using the given error rates.
+    ///
+    /// Callers should pass the rates configured on the command line so that the consensus UMI
+    /// derived here is called the same way as the one written to a consensus BAM.
     #[must_use]
-    pub fn new() -> Self {
-        Self { caller: SimpleConsensusCaller::default() }
+    pub fn new(error_rates: UmiErrorRates) -> Self {
+        Self {
+            caller: SimpleConsensusCaller::new(
+                error_rates.pre_umi,
+                error_rates.post_umi,
+                DEFAULT_Q_ERROR,
+            ),
+        }
     }
 
     /// Calls consensus on a list of UMIs, returning the consensus UMI and whether errors were corrected.
@@ -218,7 +245,7 @@ impl SimpleUmiConsensusCaller {
 
 impl Default for SimpleUmiConsensusCaller {
     fn default() -> Self {
-        Self::new()
+        Self::new(UmiErrorRates::default())
     }
 }
 
@@ -227,20 +254,26 @@ impl Default for SimpleUmiConsensusCaller {
 /// This is the single shared function for UMI consensus calling across all
 /// consensus callers (Vanilla, Duplex, CODEC), matching fgbio's behavior.
 ///
+/// The caller's configured error rates must be passed in so that the consensus UMI is called
+/// under the same error model as the consensus bases themselves; using the defaults here would
+/// silently ignore `--error-rate-pre-umi` / `--error-rate-post-umi`.
+///
 /// # Arguments
 /// * `umis` - Slice of UMI strings observed in a family
+/// * `error_rates` - The caller's configured pre-/post-UMI error rates
 ///
 /// # Returns
 /// The consensus UMI string, or empty string if input is empty
 #[must_use]
-pub fn consensus_umis(umis: &[String]) -> String {
+pub fn consensus_umis(umis: &[String], error_rates: UmiErrorRates) -> String {
     if umis.is_empty() {
         return String::new();
     }
     if umis.len() == 1 {
         return umis[0].clone();
     }
-    let mut caller = SimpleConsensusCaller::default();
+    let mut caller =
+        SimpleConsensusCaller::new(error_rates.pre_umi, error_rates.post_umi, DEFAULT_Q_ERROR);
     caller.call_consensus(umis)
 }
 

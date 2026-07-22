@@ -10,7 +10,7 @@ use crate::phred::{
     MIN_PHRED, NO_CALL_BASE, NO_CALL_BASE_LOWER, PhredScore, ln_error_prob_two_trials,
     ln_prob_to_phred, phred_to_ln_error_prob,
 };
-use crate::simple_umi::consensus_umis;
+use crate::simple_umi::{UmiErrorRates, consensus_umis};
 use anyhow::{Result, anyhow, bail};
 use fgumi_dna::dna::reverse_complement;
 use fgumi_raw_bam::{RawRecord, RawRecordView, UnmappedSamBuilder, flags};
@@ -394,6 +394,15 @@ pub struct VanillaUmiConsensusCaller {
     reason = "consensus calling uses numeric casts for quality/position math"
 )]
 impl VanillaUmiConsensusCaller {
+    /// Returns the configured pre-/post-UMI error rates, for calling the consensus UMI (RX).
+    #[must_use]
+    pub fn umi_error_rates(&self) -> UmiErrorRates {
+        UmiErrorRates {
+            pre_umi: self.options.error_rate_pre_umi,
+            post_umi: self.options.error_rate_post_umi,
+        }
+    }
+
     /// Creates a new vanilla consensus caller
     ///
     /// # Arguments
@@ -1521,7 +1530,7 @@ impl VanillaUmiConsensusCaller {
             .collect();
 
         if !umis.is_empty() {
-            let consensus_umi = consensus_umis(&umis);
+            let consensus_umi = consensus_umis(&umis, self.umi_error_rates());
             self.bam_builder.append_string_tag(SamTag::RX, consensus_umi.as_bytes());
         }
 
@@ -1631,6 +1640,7 @@ pub(crate) enum ReadType {
 )]
 mod tests {
     use super::*;
+    use crate::phred::MAX_PHRED;
     use fgumi_raw_bam::{
         ParsedBamRecord, SamBuilder, encode_op, num_bases_extending_past_mate_raw,
     };
@@ -4503,6 +4513,65 @@ mod tests {
             consensus_rx,
             Some(b"TNT".to_vec()),
             "Consensus RX should be TNT (from filtered reads TTT and TAT)"
+        );
+    }
+
+    /// Port of fgbio test (fulcrumgenomics/fgbio#1163): the consensus UMI (RX) must be called
+    /// with the *configured* pre-/post-UMI error rates, not hardcoded defaults.
+    ///
+    /// With UMIs `A`, `A`, `C` a negligible post-UMI error rate calls the majority base `A`.
+    /// A post-UMI error rate of Q1 (~79% error) makes an observed base *less* likely than each
+    /// unobserved one, so the two unobserved bases (G, T) tie for the maximum likelihood and the
+    /// position is a no-call. The two cases therefore differ only if the configured rate is used.
+    #[rstest]
+    #[case::negligible_post_umi_error(MAX_PHRED, b"A")]
+    #[case::extreme_post_umi_error(1, b"N")]
+    fn test_consensus_umi_uses_configured_error_rates(
+        #[case] error_rate_post_umi: PhredScore,
+        #[case] expected_rx: &[u8; 1],
+    ) {
+        let len = 10;
+        let bases = vec![b'A'; len];
+        let quals = vec![30u8; len];
+
+        let reads: Vec<_> = [(b"READ0", &b"A"[..]), (b"READ1", &b"A"[..]), (b"READ2", &b"C"[..])]
+            .iter()
+            .map(|(name, umi)| {
+                let mut b = SamBuilder::new();
+                b.read_name(*name)
+                    .ref_id(0)
+                    .pos(0)
+                    .sequence(&bases)
+                    .qualities(&quals)
+                    .cigar_ops(&[encode_op(0, len)])
+                    .add_string_tag(SamTag::MI, b"AAA")
+                    .add_string_tag(SamTag::RX, umi);
+                b.build()
+            })
+            .collect();
+
+        let options = VanillaUmiConsensusOptions {
+            min_reads: 1,
+            min_input_base_quality: 2,
+            min_consensus_base_quality: 0,
+            error_rate_pre_umi: MAX_PHRED,
+            error_rate_post_umi,
+            ..VanillaUmiConsensusOptions::default()
+        };
+
+        let mut caller =
+            VanillaUmiConsensusCaller::new("c".to_string(), "AAA".to_string(), options);
+
+        let output =
+            consensus_reads_from_raw(&mut caller, reads).expect("consensus should succeed");
+
+        assert_eq!(output.count, 1, "Should produce 1 consensus");
+        let records = ParsedBamRecord::parse_all(&output.data);
+
+        assert_eq!(
+            records[0].get_string_tag(SamTag::RX),
+            Some(expected_rx.to_vec()),
+            "Consensus RX should reflect the configured post-UMI error rate"
         );
     }
 
