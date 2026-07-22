@@ -10,10 +10,9 @@ use std::sync::Arc;
 #[cfg(feature = "simplex")]
 use crate::logging::OperationTimer;
 use crate::unified_pipeline::{BamPipelineConfig, SchedulerStrategy};
-use crate::validation::validate_file_exists;
+use crate::validation::validate_input_exists;
 use bytesize::ByteSize;
 use clap::Args;
-use fgumi_bam_io::is_stdin_path;
 #[cfg(feature = "simplex")]
 use fgumi_consensus::methylation::RefBaseProvider;
 #[cfg(feature = "simplex")]
@@ -338,9 +337,7 @@ impl BamIoOptions {
     ///
     /// Returns an error if the input file does not exist.
     pub fn validate(&self) -> anyhow::Result<()> {
-        if !is_stdin_path(&self.input) {
-            validate_file_exists(&self.input, "Input BAM")?;
-        }
+        validate_input_exists(&self.input, "Input BAM")?;
         Ok(())
     }
 }

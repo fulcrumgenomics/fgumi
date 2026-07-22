@@ -165,8 +165,17 @@ simulate = ["simplex"]
 profile-adjacency = []
 # Enable slow stress tests for concurrency testing
 stress-tests = []
+# Expose test-only helpers that are not part of the supported public API
+# (currently `unified_pipeline::run_bam_pipeline_with_grouper`, whose only
+# callers are integration tests). Enabled automatically for `cargo test` via
+# the self dev-dependency below; never enabled for a normal build.
+test-utils = []
 
 [dev-dependencies]
+# Self dev-dependency: the only way to turn `test-utils` on for the integration
+# test targets, which link the library as an external crate. Test-only, so it
+# never affects `cargo build`.
+fgumi = { path = ".", features = ["test-utils"] }
 rstest = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }

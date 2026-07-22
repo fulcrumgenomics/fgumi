@@ -71,6 +71,17 @@ impl<R: BufRead> SimdFastqReader<R> {
         }
     }
 
+    /// Consume the reader and return the underlying source.
+    ///
+    /// Any bytes this reader pulled from the source but has not yielded as
+    /// records are **discarded** — they live in the internal buffer, not in the
+    /// source. A caller that needs the whole stream afterwards must therefore
+    /// have been capturing the source's bytes independently (e.g. through a tee)
+    /// rather than relying on the source's own position.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+
     /// Fill the internal buffer, preserving any leftover bytes from incomplete records.
     ///
     /// Returns `true` if new data was read (or there are still records to yield).

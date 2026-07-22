@@ -6,17 +6,17 @@
 use crate::commands::common::parse_bool;
 use crate::logging::OperationTimer;
 use crate::sam::SamTag;
-use crate::validation::validate_file_exists;
+use crate::validation::validate_input_exists;
 use anyhow::Result;
 use clap::Parser;
-use fgumi_bam_io::create_raw_bam_reader;
+use fgumi_bam_io::{create_raw_bam_reader, is_stdin_path};
 use fgumi_raw_bam::{
     RawRecord, aux_data_slice, extract_sequence_into, find_string_tag, quality_scores_slice,
     read_name as raw_read_name,
 };
 use log::{info, warn};
 use std::io::{self, BufWriter, Write, stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::commands::command::Command;
 
@@ -279,28 +279,45 @@ impl Fastq {
     }
 }
 
+/// Refuse an `--output` that would clobber the `--input` BAM.
+///
+/// `File::create(path)` truncates before the input is opened in
+/// `run_with_writer`, so an `--output` naming the same file silently destroys
+/// the input data. Lexical equality catches the obvious case; canonicalising
+/// both sides also catches `./in.bam` vs `in.bam`, symlinks, and absolute vs
+/// relative paths pointing at the same file.
+///
+/// # Errors
+///
+/// Returns an error if `output` and `input` name the same file, or if either
+/// path exists but cannot be canonicalised.
+fn reject_output_clobbering_input(input: &Path, output: Option<&PathBuf>) -> Result<()> {
+    let Some(output) = output else { return Ok(()) };
+
+    // Stdin has no filesystem entity to canonicalise -- `canonicalize("-")`
+    // fails with `NotFound` -- and cannot name the output file, so there is
+    // nothing to clobber. Without this the guard turns `--input -` into a
+    // confusing IO error whenever `--output` happens to already exist.
+    if is_stdin_path(input) {
+        return Ok(());
+    }
+
+    let same_path = output == input
+        || (output.exists() && std::fs::canonicalize(output)? == std::fs::canonicalize(input)?);
+    if same_path {
+        anyhow::bail!(
+            "--output {} must differ from --input {} (would truncate the input BAM)",
+            output.display(),
+            input.display()
+        );
+    }
+    Ok(())
+}
+
 impl Command for Fastq {
     fn execute(&self, _command_line: &str) -> Result<()> {
-        validate_file_exists(&self.input, "Input BAM")?;
-
-        // Refuse to clobber the input BAM. `File::create(path)` truncates
-        // before the input is opened in `run_with_writer`, so an `--output`
-        // pointing at the same file silently destroys the input data.
-        // Lexical equality catches the obvious case; canonicalising both
-        // sides also catches `./in.bam` vs `in.bam`, symlinks, and absolute
-        // vs relative paths pointing at the same file.
-        if let Some(output) = &self.output {
-            let same_path = output == &self.input
-                || (output.exists()
-                    && std::fs::canonicalize(output)? == std::fs::canonicalize(&self.input)?);
-            if same_path {
-                anyhow::bail!(
-                    "--output {} must differ from --input {} (would truncate the input BAM)",
-                    output.display(),
-                    self.input.display()
-                );
-            }
-        }
+        validate_input_exists(&self.input, "Input BAM")?;
+        reject_output_clobbering_input(&self.input, self.output.as_ref())?;
 
         // Use 64MB buffer for efficient pipe throughput.
         const BUF_CAPACITY: usize = 64 * 1024 * 1024;
@@ -825,6 +842,57 @@ mod tests {
             .expect("write_reversed_quality_bytes should succeed");
         // Reversed: [40, 30, 0] -> [73, 63, 33]
         assert_eq!(output, vec![73, 63, 33]);
+    }
+
+    /// Resolve a case-table path spec against `dir`. `-` and `/dev/stdin` are
+    /// returned verbatim; anything else names a file inside `dir`.
+    fn resolve_path(dir: &std::path::Path, spec: &str) -> PathBuf {
+        if spec == "-" || spec == "/dev/stdin" { PathBuf::from(spec) } else { dir.join(spec) }
+    }
+
+    /// The clobber guard must reject an `--output` that names the `--input`
+    /// file, and must exempt stdin: `canonicalize("-")` fails with `NotFound`,
+    /// so canonicalising a stdin input would turn `--input -` into a confusing
+    /// IO error the moment `--output` happens to already exist.
+    #[rstest]
+    #[case::stdin_dash_with_existing_output("-", "out.fq", true, true)]
+    #[case::stdin_dev_stdin_with_existing_output("/dev/stdin", "out.fq", true, true)]
+    #[case::stdin_dash_with_new_output("-", "out.fq", false, true)]
+    #[case::distinct_paths_output_exists("in.bam", "out.fq", true, true)]
+    #[case::distinct_paths_output_missing("in.bam", "out.fq", false, true)]
+    #[case::output_is_input("in.bam", "in.bam", true, false)]
+    fn test_reject_output_clobbering_input(
+        #[case] input: &str,
+        #[case] output: &str,
+        #[case] output_exists: bool,
+        #[case] accepted: bool,
+    ) {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        std::fs::write(dir.path().join("in.bam"), b"not a real bam").expect("write input");
+
+        let input_path = resolve_path(dir.path(), input);
+        let output_path = resolve_path(dir.path(), output);
+        if output_exists && !output_path.exists() {
+            std::fs::write(&output_path, b"prior run").expect("write output");
+        }
+
+        let result = reject_output_clobbering_input(&input_path, Some(&output_path));
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "unexpected verdict for --input {input} --output {output}: {result:?}"
+        );
+        if !accepted {
+            let err = result.expect_err("case expects rejection").to_string();
+            assert!(err.contains("must differ"), "unexpected error message: {err}");
+        }
+    }
+
+    /// No `--output` means FASTQ goes to stdout, so there is nothing to clobber.
+    #[test]
+    fn test_reject_output_clobbering_input_allows_no_output() {
+        reject_output_clobbering_input(&PathBuf::from("in.bam"), None)
+            .expect("stdout output has nothing to clobber");
     }
 
     #[test]

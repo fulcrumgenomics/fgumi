@@ -39,6 +39,64 @@ const BLOCKS_PER_BATCH: usize = 64;
 
 use fgumi_raw_bam::{BAM_MAGIC, RawRecord};
 
+/// A raw BAM record reader over an owned, already-normalized byte stream.
+///
+/// The concrete reader type is erased because the stream may be a file, stdin,
+/// or a SAM-to-BAM transcode, depending on what the input turned out to be.
+pub type OwnedRawBamRecordReader = RawBamRecordReader<Box<dyn Read + Send>>;
+
+/// Open `path` for raw BAM record reading, accepting uncompressed SAM.
+///
+/// Sniffs the input and transcodes SAM text to BGZF, so the raw record readers
+/// accept the same inputs as the pipeline readers instead of requiring BGZF.
+/// The BAM header is skipped, leaving the reader positioned at the first
+/// record.
+///
+/// # Errors
+///
+/// Returns an error if the input cannot be opened, is neither BAM nor SAM, or
+/// its header cannot be skipped.
+pub fn open_raw_bam_record_reader<P: AsRef<std::path::Path>>(
+    path: P,
+) -> anyhow::Result<OwnedRawBamRecordReader> {
+    let path = path.as_ref();
+    let normalized = fgumi_bam_io::open_normalized_input(path)?;
+    skip_header_for(normalized, path)
+}
+
+/// Open `path` for raw BAM record reading and return its parsed header too.
+///
+/// The header is parsed through a tee and the consumed bytes replayed, so this
+/// costs a single open — which is what lets a caller that needs both the header
+/// and the records (`sort --verify`) read from a pipe. Opening the path twice,
+/// once per need, is what previously forced those callers to reject stdin.
+///
+/// # Errors
+///
+/// Returns an error if the input cannot be opened, is neither BAM nor SAM, or
+/// its header cannot be parsed or skipped.
+pub fn open_raw_bam_record_reader_with_header<P: AsRef<std::path::Path>>(
+    path: P,
+) -> anyhow::Result<(OwnedRawBamRecordReader, noodles::sam::Header)> {
+    let path = path.as_ref();
+    let normalized = fgumi_bam_io::open_normalized_input(path)?;
+    let (header, replayed) = fgumi_bam_io::read_header_and_replay(normalized, path)?;
+    Ok((skip_header_for(replayed, path)?, header))
+}
+
+/// Wrap `reader` in a [`RawBamRecordReader`] positioned at the first record.
+fn skip_header_for(
+    reader: Box<dyn Read + Send>,
+    path: &std::path::Path,
+) -> anyhow::Result<OwnedRawBamRecordReader> {
+    let mut reader = RawBamRecordReader::new(reader)
+        .map_err(|e| anyhow::anyhow!("Failed to read BAM header from {}: {e}", path.display()))?;
+    reader
+        .skip_header()
+        .map_err(|e| anyhow::anyhow!("Failed to skip header from {}: {e}", path.display()))?;
+    Ok(reader)
+}
+
 /// A raw BAM record reader that reads directly from BGZF blocks.
 ///
 /// This reader bypasses noodles and reads raw BAM record bytes directly,

@@ -46,7 +46,6 @@
 //! - `TemplateIterator`: Groups raw BAM bytes from the unmapped reader into Templates
 //! - `TagInfo`: Holds sets of tags to remove/reverse/revcomp
 //! - `merge_raw()`: Core function that transfers metadata between templates using raw bytes
-use crate::batched_sam_reader::BatchedSamReader;
 use crate::commands::command::Command;
 use crate::commands::common::{CompressionOptions, parse_bool};
 use crate::logging::OperationTimer;
@@ -54,19 +53,21 @@ use crate::reference::{ReferenceReader, find_dict_path};
 use crate::sam::{SamTag, TemplateCoordinateInfo, check_sort};
 use crate::template::{Template, TemplateIterator};
 use crate::umi::TagInfo;
-use crate::validation::validate_file_exists;
-use anyhow::{Context, Result};
+use crate::validation::{validate_file_exists, validate_input_exists};
+use anyhow::{Context, Result, ensure};
 use bstr::ByteSlice;
 use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::{RawBamReaderAuto, create_raw_bam_reader, create_raw_bam_writer, is_stdin_path};
+use fgumi_bam_io::{
+    RawBamReaderAuto, create_raw_bam_reader, create_raw_bam_writer, is_stdin_path, make_bgzf_reader,
+};
 use fgumi_raw_bam;
-use fgumi_raw_bam::{BAM_BASE_TO_ASCII, RawRecord, RawRecordView, RecordBufEncoder};
+use fgumi_raw_bam::{BAM_BASE_TO_ASCII, RawRecord, RawRecordView};
 use log::{debug, info};
 use noodles::core::Position;
 use noodles::sam::Header;
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 /// Command-line arguments for `zipper`
@@ -171,10 +172,16 @@ pub struct Zipper {
     #[command(flatten)]
     pub compression: CompressionOptions,
 
-    /// BWA -K parameter value (bases per batch). Used to optimize buffer sizing
-    /// for stdin input. The buffer grows adaptively based on observed bytes per batch.
-    /// Default matches common bwa mem usage.
-    #[arg(short = 'K', long = "bwa-chunk-size", default_value = "150000000")]
+    /// Accepted for backward compatibility; has no effect.
+    ///
+    /// This once sized an adaptive input buffer for piped SAM, but that buffer's
+    /// batch tracking was driven only by an API the command never called, so the
+    /// value was already inert. The buffer has since been removed — the mapped
+    /// input goes through the shared normalizing reader, which buffers on its
+    /// own. Still parsed so existing command lines keep working, and hidden so
+    /// new ones do not adopt it.
+    /// (`fgumi fastq` has its own `--bwa-chunk-size`, which *is* live.)
+    #[arg(short = 'K', long = "bwa-chunk-size", default_value = "150000000", hide = true)]
     pub bwa_chunk_size: u64,
 
     /// Exclude reads from the unmapped BAM that are not present in the aligned BAM.
@@ -773,77 +780,52 @@ fn restore_unconverted_bases_in_raw_record(
     Ok(())
 }
 
-/// Groups consecutive `RecordBuf` records by query name into `Template` objects.
-///
-/// Used for the mapped (SAM/BAM) reader path where noodles decodes records as `RecordBuf`.
-/// Each group is encoded to raw bytes via [`RecordBufEncoder`] and assembled into a
-/// [`Template`] via [`Template::from_records`].
-fn record_bufs_to_templates<'a, I>(
-    iter: I,
-    header: &'a Header,
-) -> impl Iterator<Item = Result<Template>> + 'a
-where
-    I: Iterator<Item = Result<noodles::sam::alignment::RecordBuf>> + 'a,
-{
-    let mut encoder = RecordBufEncoder::new(header);
-    let mut pending: Option<noodles::sam::alignment::RecordBuf> = None;
-    let mut exhausted = false;
-    let mut iter = iter;
-
-    std::iter::from_fn(move || {
-        if exhausted && pending.is_none() {
-            return None;
-        }
-
-        let mut batch: Vec<noodles::sam::alignment::RecordBuf> = Vec::with_capacity(2);
-
-        if let Some(p) = pending.take() {
-            batch.push(p);
-        }
-
-        loop {
-            if exhausted {
-                break;
-            }
-            match iter.next() {
-                Some(Ok(rec)) => {
-                    if batch.is_empty() {
-                        batch.push(rec);
-                    } else {
-                        let first_name = batch[0].name().map(|n| n.to_vec());
-                        let this_name = rec.name().map(|n| n.to_vec());
-                        if first_name == this_name {
-                            batch.push(rec);
-                        } else {
-                            pending = Some(rec);
-                            break;
-                        }
-                    }
-                }
-                Some(Err(e)) => return Some(Err(e)),
-                None => {
-                    exhausted = true;
-                    break;
-                }
-            }
-        }
-
-        if batch.is_empty() {
-            return None;
-        }
-
-        let mut raw_records = Vec::with_capacity(batch.len());
-        for rec in &batch {
-            match encoder.encode(rec) {
-                Ok(raw) => raw_records.push(raw),
-                Err(e) => return Some(Err(anyhow::anyhow!("Failed to encode record: {e}"))),
-            }
-        }
-        Some(Template::from_records(raw_records))
-    })
-}
-
 impl Zipper {
+    /// Build the mapped reader from an already-opened stream, detecting BAM vs SAM
+    /// from the leading bytes.
+    ///
+    /// Used for every input that cannot be re-opened — stdin, FIFOs, and process
+    /// substitution — so the input is consumed exactly once. Without the peeked
+    /// bytes being replayed, piping `samtools view -b ...` in fails with a
+    /// confusing "invalid flags / lexical parse error" as the SAM text parser
+    /// misreads the binary BGZF stream.
+    ///
+    /// `label` names the input in log lines and errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stream is empty or its header cannot be read.
+    fn stream_mapped_reader(
+        &self,
+        opened: Box<dyn Read + Send>,
+        label: &str,
+    ) -> Result<(MappedReader, Header)> {
+        info!("Reading mapped input from {label}");
+
+        // Buffer before sniffing: the BGZF frame reader issues small `read_exact`
+        // calls, which are expensive straight off a pipe.
+        let buffered = BufReader::with_capacity(64 * 1024, opened);
+
+        // One call handles both formats. BAM passes through; SAM is transcoded to
+        // BGZF rather than parsed into `RecordBuf`s, which measured ~30% faster
+        // end-to-end on a 2.4M-record zip — the transcode's encode replaces the
+        // `RecordBuf` decode *and* the re-encode the merge would have paid, and
+        // framing is nearly free at `CompressionLevel::NONE`. It also means this
+        // path does not need to know which format arrived.
+        let normalized =
+            fgumi_bam_io::sam_input::normalize_to_bgzf(Box::new(buffered), Path::new(label))?;
+
+        let bgzf = make_bgzf_reader(normalized, self.threads);
+        let mut bam_reader = noodles::bam::io::Reader::from(bgzf);
+        // `normalize_to_bgzf` above names `label` in its errors; noodles does not,
+        // so without this a header fault here reads as if it came from `--unmapped`
+        // rather than from the mapped stream.
+        let header = bam_reader
+            .read_header()
+            .with_context(|| format!("Failed to read mapped BAM header from {label}"))?;
+        Ok((fgumi_raw_bam::RawBamReader::new(bam_reader.into_inner()), header))
+    }
+
     /// Process templates using raw-byte merge path with BGZF compression.
     ///
     /// Thread count is controlled by `self.threads` (1 = single-threaded).
@@ -965,56 +947,24 @@ impl Zipper {
     }
 }
 
-/// Raw BAM reader for stdin: single-threaded BGZF over a buffered `Box<dyn Read + Send>`.
+/// The mapped-input reader, moved into the thread that iterates records.
 ///
-/// Stdin is non-seekable, so we use a single-threaded BGZF reader. `BufReader` wraps
-/// stdin so we can peek the BGZF magic bytes for format auto-detection without
-/// consuming them.
-type RawBamStdinReader =
-    fgumi_raw_bam::RawBamReader<noodles::bgzf::io::Reader<BufReader<Box<dyn Read + Send>>>>;
+/// Every input format converges here: BAM is decoded directly and SAM is
+/// transcoded to BGZF at the boundary, so records are always yielded as raw
+/// bytes and fed to `TemplateIterator` without a decode/encode round-trip.
+/// There is no separate text-mode orchestration to keep in step.
+type MappedReader = RawBamReaderAuto;
 
-/// Wraps SAM and BAM readers so the mapped-reader thread can handle either format.
-/// Moved into the thread that iterates records, since the iterator owns the reader.
+/// Whether `path` is a regular file, and so can be re-opened after sniffing.
 ///
-/// The SAM arm decodes via noodles `RecordBuf` (text-mode SAM has no raw-byte path).
-/// Both BAM arms use `RawBamReader` so records are yielded as raw bytes and fed
-/// directly to `TemplateIterator` without a decode/encode round-trip.
-enum MappedReader {
-    Sam(noodles::sam::io::Reader<Box<dyn BufRead + Send>>),
-    Bam(RawBamReaderAuto),
-    StdinBam(RawBamStdinReader),
-}
-
-/// First four bytes of a BGZF stream (gzip magic + extra-flag byte unique to BGZF).
-const BGZF_MAGIC: [u8; 4] = [0x1f, 0x8b, 0x08, 0x04];
-
-/// Peeks up to [`BGZF_MAGIC.len()`] bytes from `stdin` to classify it as BGZF (BAM) vs SAM text.
-///
-/// A single `read()` on a pipe may return fewer bytes than requested even when more
-/// data is coming (e.g. the aligner hasn't flushed its first block yet), so this loops
-/// until the peek buffer is full or EOF is reached. The peeked bytes are then chained
-/// back onto the stream so downstream parsers see the complete input.
-///
-/// # Returns
-///
-/// `(is_bgzf, reader)` where `reader` yields the peeked bytes followed by the rest of
-/// the original stream.
-fn peek_stdin_bgzf(mut stdin: Box<dyn Read + Send>) -> Result<(bool, Box<dyn Read + Send>)> {
-    let mut prefix = [0u8; BGZF_MAGIC.len()];
-    let mut filled = 0usize;
-    while filled < prefix.len() {
-        match stdin.read(&mut prefix[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e).context("Failed to peek stdin"),
-        }
-    }
-    let is_bgzf = filled == BGZF_MAGIC.len() && prefix == BGZF_MAGIC;
-    // Prepend the peeked bytes back onto the stream so the chosen reader sees them.
-    let restored: Box<dyn Read + Send> =
-        Box::new(std::io::Cursor::new(prefix[..filled].to_vec()).chain(stdin));
-    Ok((is_bgzf, restored))
+/// Anything else — a FIFO, a character device, `/dev/fd/N` from process
+/// substitution — yields no second chance at the bytes already read, so it must
+/// be opened once and replayed via [`Zipper::stream_mapped_reader`] instead of
+/// sniffed by path.
+/// A path that cannot be stat'd is treated as non-regular: opening it once is
+/// always safe, whereas re-opening it may not be.
+fn is_regular_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| meta.file_type().is_file())
 }
 
 impl Command for Zipper {
@@ -1045,9 +995,16 @@ impl Command for Zipper {
 
         let timer = OperationTimer::new("Zipping BAMs");
 
-        // Validate input files exist
-        validate_file_exists(&self.unmapped, "unmapped BAM file")?;
-        validate_file_exists(&self.reference, "reference FASTA file")?;
+        // Validate input files exist. Either record input may be stdin, but not
+        // both: one stream cannot supply two BAMs, and reading it twice yields a
+        // confusing `invalid BAM header` from deep inside the second reader.
+        ensure!(
+            !(is_stdin_path(&self.input) && is_stdin_path(&self.unmapped)),
+            "only one of --input and --unmapped can be stdin (`-`); one stream cannot \
+             supply both. Provide a file path for the other."
+        );
+        validate_input_exists(&self.unmapped, "unmapped BAM")?;
+        validate_file_exists(&self.reference, "reference FASTA")?;
         let dict_path = find_dict_path(&self.reference).ok_or_else(|| {
             anyhow::anyhow!(
                 "Reference dictionary file not found. Tried:\n  \
@@ -1063,51 +1020,33 @@ impl Command for Zipper {
 
         let (unmapped_raw_reader, unmapped_header) = create_raw_bam_reader(&self.unmapped, 1)?;
 
-        // Read mapped input — detect format by extension.
+        // Read mapped input — format is detected from content, never from the
+        // file extension.
+        //
         // The reader and header are separated here; record_bufs() is called inside
         // the spawned thread (it borrows &self, so the reader must live there).
-        let (mapped_reader, mapped_header) = if is_stdin_path(&self.input) {
-            // Auto-detect BAM (BGZF magic) vs SAM text on stdin so callers can pipe either,
-            // matching the file-input path. Without this, piping `samtools view -b ...` to
-            // zipper crashes with a confusing "invalid flags / lexical parse error" because
-            // the SAM text parser misreads the binary BGZF stream.
-            //
-            // `peek_stdin_bgzf` reads up to the magic length in a loop (a single `read()` on
-            // a pipe may return fewer bytes than requested) and returns a reader that prepends
-            // the peeked bytes back onto the stream for the chosen downstream reader.
-            let stdin: Box<dyn Read + Send> = Box::new(std::io::stdin());
-            let (is_bgzf, stdin) = peek_stdin_bgzf(stdin)?;
-            let buffered = BufReader::with_capacity(64 * 1024, stdin);
-            if is_bgzf {
-                info!("Reading BAM from stdin");
-                let bgzf = noodles::bgzf::io::Reader::new(buffered);
-                let mut bam_reader = noodles::bam::io::Reader::from(bgzf);
-                let header = bam_reader.read_header()?;
-                let bgzf = bam_reader.into_inner();
-                (MappedReader::StdinBam(fgumi_raw_bam::RawBamReader::new(bgzf)), header)
-            } else {
-                info!(
-                    "Reading SAM from stdin with adaptive buffer (bwa -K {})",
-                    self.bwa_chunk_size
-                );
-                let reader: Box<dyn BufRead + Send> =
-                    Box::new(BatchedSamReader::new(buffered, self.bwa_chunk_size));
-                let mut sam_reader = noodles::sam::io::Reader::new(reader);
-                let header = sam_reader.read_header()?;
-                (MappedReader::Sam(sam_reader), header)
-            }
-        } else if self.input.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("bam")) {
-            let (raw_reader, header) = create_raw_bam_reader(&self.input, self.threads)?;
-            (MappedReader::Bam(raw_reader), header)
+        //
+        // Only a *regular file* can be sniffed and then re-opened by the chosen
+        // reader. stdin, FIFOs and process substitution (`-i <(samtools view -h
+        // ...)`) cannot be rewound or re-opened, so any byte read to classify them
+        // is gone; those are opened exactly once and the peeked bytes replayed.
+        let (mapped_reader, mapped_header) = if is_regular_file(&self.input) {
+            // Opening by path is not what buys multi-threaded decode — the stream
+            // path gets that too. What it buys is `advise_sequential` and the
+            // option of a prefetch thread, which need the `File` itself.
+            // `create_raw_bam_reader` sniffs and normalizes, so SAM and BAM both
+            // arrive as raw records here.
+            create_raw_bam_reader(&self.input, self.threads)?
         } else {
-            // SAM file input
-            let reader: Box<dyn BufRead + Send> = Box::new(BufReader::with_capacity(
-                256 * 1024,
-                std::fs::File::open(&self.input).context("Failed to open mapped SAM")?,
-            ));
-            let mut sam_reader = noodles::sam::io::Reader::new(reader);
-            let header = sam_reader.read_header()?;
-            (MappedReader::Sam(sam_reader), header)
+            let (opened, label): (Box<dyn Read + Send>, String) = if is_stdin_path(&self.input) {
+                (Box::new(std::io::stdin()), "stdin".to_string())
+            } else {
+                let file = std::fs::File::open(&self.input).with_context(|| {
+                    format!("Failed to open mapped input: {}", self.input.display())
+                })?;
+                (Box::new(file), self.input.display().to_string())
+            };
+            self.stream_mapped_reader(opened, &label)?
         };
 
         check_sort(&unmapped_header, &self.unmapped, "unmapped");
@@ -1155,38 +1094,16 @@ impl Command for Zipper {
         });
         let unmapped_iter = std::iter::from_fn(move || unmapped_rx.recv().ok());
 
-        // Create async mapped reader - spawn thread to read ahead and prevent backpressure on stdin
-        // (e.g., when reading piped output from bwa)
+        // Spawn a reader thread so a slow consumer never backpressures the input
+        // (e.g. when reading piped output from bwa). The thread owns the reader so
+        // its record iterator outlives each iteration.
         let (mapped_tx, mapped_rx) = std::sync::mpsc::sync_channel::<Result<Template>>(self.buffer);
-        let mapped_header_for_reader = mapped_header.clone();
         std::thread::spawn(move || {
             // The reader is owned by this thread so its record iterator
             // outlives each iteration.
-            match mapped_reader {
-                MappedReader::Sam(mut r) => {
-                    let record_iter = r
-                        .record_bufs(&mapped_header_for_reader)
-                        .map(|rec| rec.map_err(anyhow::Error::from));
-                    for template in record_bufs_to_templates(record_iter, &mapped_header_for_reader)
-                    {
-                        if mapped_tx.send(template).is_err() {
-                            break;
-                        }
-                    }
-                }
-                MappedReader::Bam(r) => {
-                    for template in TemplateIterator::new(r) {
-                        if mapped_tx.send(template).is_err() {
-                            break;
-                        }
-                    }
-                }
-                MappedReader::StdinBam(r) => {
-                    for template in TemplateIterator::new(r) {
-                        if mapped_tx.send(template).is_err() {
-                            break;
-                        }
-                    }
+            for template in TemplateIterator::new(mapped_reader) {
+                if mapped_tx.send(template).is_err() {
+                    break;
                 }
             }
         });
@@ -1223,7 +1140,6 @@ mod tests {
     use noodles::sam::alignment::record_buf::data::field::Value as BufValue;
     use rstest::rstest;
     use std::collections::HashMap;
-    use std::io::Read;
     use tempfile::TempDir;
 
     /// Convert a `RawRecord` built with [`RawSamBuilder`] into a noodles `RecordBuf`.
@@ -1260,81 +1176,6 @@ mod tests {
             pos2: read_i32(4),
             neg2: read_i32(5) != 0,
         })
-    }
-
-    /// A `Read` implementation that returns at most one byte per `read` call,
-    /// mimicking the behavior of a slow pipe or small kernel buffer. Used to
-    /// regression-test `peek_stdin_bgzf`, which must tolerate short reads.
-    struct TrickleReader(std::collections::VecDeque<u8>);
-
-    impl Read for TrickleReader {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            if buf.is_empty() {
-                return Ok(0);
-            }
-            match self.0.pop_front() {
-                Some(b) => {
-                    buf[0] = b;
-                    Ok(1)
-                }
-                None => Ok(0),
-            }
-        }
-    }
-
-    fn trickle(bytes: &[u8]) -> Box<dyn Read + Send> {
-        Box::new(TrickleReader(bytes.iter().copied().collect()))
-    }
-
-    /// Regression: `BufReader::fill_buf` can return fewer than `BGZF_MAGIC.len()`
-    /// bytes on a pipe even when more data is coming. Before the fix, that caused
-    /// BAM-on-stdin to be misclassified as SAM. Simulate it with a reader that
-    /// returns one byte per `read` call and confirm classification + stream
-    /// reconstruction both work.
-    #[test]
-    fn test_peek_stdin_bgzf_classifies_bam_under_short_reads() -> Result<()> {
-        let mut stream = BGZF_MAGIC.to_vec();
-        stream.extend_from_slice(b"rest-of-bgzf-stream");
-        let (is_bgzf, mut restored) = peek_stdin_bgzf(trickle(&stream))?;
-        assert!(is_bgzf);
-        let mut round_trip = Vec::new();
-        restored.read_to_end(&mut round_trip)?;
-        assert_eq!(round_trip, stream);
-        Ok(())
-    }
-
-    #[test]
-    fn test_peek_stdin_bgzf_classifies_sam_text() -> Result<()> {
-        let stream = b"@HD\tVN:1.6\tSO:queryname\n".to_vec();
-        let (is_bgzf, mut restored) = peek_stdin_bgzf(trickle(&stream))?;
-        assert!(!is_bgzf);
-        let mut round_trip = Vec::new();
-        restored.read_to_end(&mut round_trip)?;
-        assert_eq!(round_trip, stream);
-        Ok(())
-    }
-
-    #[test]
-    fn test_peek_stdin_bgzf_handles_stream_shorter_than_magic() -> Result<()> {
-        // Fewer bytes than BGZF_MAGIC.len() — must not be misclassified as BAM,
-        // and the short prefix must still be recoverable from the returned reader.
-        let stream = b"@H".to_vec();
-        let (is_bgzf, mut restored) = peek_stdin_bgzf(trickle(&stream))?;
-        assert!(!is_bgzf);
-        let mut round_trip = Vec::new();
-        restored.read_to_end(&mut round_trip)?;
-        assert_eq!(round_trip, stream);
-        Ok(())
-    }
-
-    #[test]
-    fn test_peek_stdin_bgzf_handles_empty_stream() -> Result<()> {
-        let (is_bgzf, mut restored) = peek_stdin_bgzf(Box::new(std::io::empty()))?;
-        assert!(!is_bgzf);
-        let mut round_trip = Vec::new();
-        restored.read_to_end(&mut round_trip)?;
-        assert!(round_trip.is_empty());
-        Ok(())
     }
 
     /// Runs `zipper-bams` and returns the output records

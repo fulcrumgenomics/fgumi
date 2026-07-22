@@ -22,11 +22,10 @@
 
 use crate::logging::OperationTimer;
 use crate::sam::SamTag;
-use crate::validation::validate_file_exists;
+use crate::validation::validate_input_exists;
 use anyhow::{Result, bail};
 use bytesize::ByteSize;
 use clap::Parser;
-use fgumi_bam_io::create_raw_bam_reader;
 use fgumi_sort::{
     KeyTypesSpec, QuerynameComparator, RawExternalSorter, SortOrder, verify_sort_order,
 };
@@ -443,20 +442,9 @@ impl Command for Sort {
         // engine reads stdin in a single pass (a `TeeReader` reads the header,
         // then a `ChainedReader` replays it and streams the rest), so a
         // file-existence check would spuriously reject it — matching the stdin
-        // exemption in group/dedup/clip. `--verify` is the exception: it
-        // re-scans the input (header probe + a fresh `File::open` record pass),
-        // which a non-seekable stdin can't satisfy, so reject stdin there up
-        // front with a clear message.
-        if fgumi_bam_io::is_stdin_path(&self.input) {
-            if self.verify {
-                bail!(
-                    "fgumi sort --verify cannot read from stdin (it re-scans the input); \
-                     provide a file path instead"
-                );
-            }
-        } else {
-            validate_file_exists(&self.input, "Input BAM")?;
-        }
+        // exemption in group/dedup/clip. `--verify` takes the same single-pass
+        // path, so it is not an exception.
+        validate_input_exists(&self.input, "Input BAM")?;
 
         // Either --output or --verify must be specified
         if !self.verify && self.output.is_none() {
@@ -625,13 +613,12 @@ impl Sort {
 
     /// Execute verify mode: read records and check sort order.
     fn execute_verify(&self) -> Result<()> {
-        use fgumi_sort::RawBamRecordReader;
+        use fgumi_sort::open_raw_bam_record_reader_with_header;
         use fgumi_sort::{
             LibraryLookup, RawQuerynameKey, RawQuerynameLexKey, RawSortKey, SortContext, cb_hasher,
             extract_coordinate_key_inline, extract_template_key_inline,
         };
         use std::cmp::Ordering;
-        use std::fs::File;
 
         let cell_tag = self.parse_cell_tag()?;
 
@@ -645,12 +632,10 @@ impl Sort {
             info!("Cell tag: {}{}", ct_bytes[0] as char, ct_bytes[1] as char);
         }
 
-        // Get header via the raw-byte reader, then re-open for raw record iteration.
-        let (_, header) = create_raw_bam_reader(&self.input, 1)?;
-
-        let file = File::open(&self.input)?;
-        let mut raw_reader = RawBamRecordReader::new(file)?;
-        raw_reader.skip_header()?;
+        // One open yields both the header and the records: the header is parsed
+        // through a tee and the consumed bytes replayed. Reading the path twice
+        // is what used to make `--verify` reject a pipe.
+        let (raw_reader, header) = open_raw_bam_record_reader_with_header(&self.input)?;
 
         let (total_records, violations, first_violation) = match self.order {
             SortOrderArg::Coordinate => {

@@ -40,7 +40,7 @@ use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::create_raw_bam_reader;
-use fgumi_bam_io::{ChainedReader, TeeReader, is_stdin_path, is_stdout_path};
+use fgumi_bam_io::{is_stdin_path, is_stdout_path};
 use fgumi_raw_bam::SamTag;
 use log::{debug, info};
 use noodles::sam::Header;
@@ -73,6 +73,15 @@ use tempfile::TempDir;
 /// `usize` -> `u32` narrowing at the stamp site provably lossless rather than
 /// merely unlikely to overflow.
 const MAX_CHUNK_RECORDS: usize = u32::MAX as usize;
+
+/// Buffer wrapped around sort's input when it is read synchronously.
+///
+/// The worker pool's block reader pulls in large gulps, so the input is
+/// buffered well above the 8 KiB `io::Stdin` and `File` default. stdin always
+/// gets this buffer; a regular file gets it only on the synchronous path,
+/// because `--async-reader` hands the file to `PrefetchReader`, which already
+/// reads ahead into its own bounded queue.
+const SORT_INPUT_BUFFER_SIZE: usize = 2 * 1024 * 1024;
 
 /// Whether the current chunk must be spilled before accepting another record.
 ///
@@ -3908,15 +3917,16 @@ pub(crate) use crate::SortStats as RawSortStats;
 ///
 /// # Flow
 ///
-/// 1. Parse header with noodles (first pass, single-threaded)
-/// 2. Open file again, set as pool's input file
-/// 3. Set pool to PHASE1 — workers start reading/decompressing
-/// 4. Main thread skips header bytes from decompressed stream
-/// 5. Returns `RawBamReader<PooledInputStream>` for direct record iteration
+/// 1. Open the input once, transcoding it if it is uncompressed SAM
+/// 2. Parse the header, capturing the bytes it consumed so they can be replayed
+/// 3. Set the replaying stream as the pool's input file
+/// 4. Set pool to PHASE1 — workers start reading/decompressing
+/// 5. Main thread skips header bytes from decompressed stream
+/// 6. Returns `RawBamReader<PooledInputStream>` for direct record iteration
 ///
 /// # Errors
 ///
-/// Returns an error if the BAM file cannot be opened, the header cannot be
+/// Returns an error if the input cannot be opened, the header cannot be
 /// parsed, or header bytes cannot be skipped from the decompressed stream.
 fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
     path: P,
@@ -3928,46 +3938,49 @@ fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
 
     let path_ref = path.as_ref();
 
-    let (header, reader): (Header, Box<dyn io::Read + Send>) = if is_stdin_path(path_ref) {
-        let stdin = io::stdin();
-        let tee = TeeReader::new(stdin);
-        let bgzf = BgzfReader::new(tee);
-        let mut noodles_reader = noodles::bam::io::Reader::from(bgzf);
-        let header =
-            noodles_reader.read_header().with_context(|| "Failed to read BAM header from stdin")?;
-
-        let bgzf = noodles_reader.into_inner();
-        let tee = bgzf.into_inner();
-        let (buffered_bytes, stdin) = tee.into_parts();
-        let chained = ChainedReader::new(buffered_bytes, stdin);
-        (header, Box::new(io::BufReader::with_capacity(2 * 1024 * 1024, chained)))
+    let opened: Box<dyn io::Read + Send> = if is_stdin_path(path_ref) {
+        if async_reader {
+            // `--async-reader` is about decoupling the read from the block
+            // reader, which stdin needs at least as much as a file does: the
+            // prefetch thread also subsumes the buffering below, reading ahead
+            // in chunks into a bounded queue.
+            log::debug!("async sort reader enabled: spawning fgumi-prefetch thread for stdin");
+            Box::new(fgumi_bam_io::prefetch_reader::PrefetchReader::new(io::stdin()))
+        } else {
+            // `io::Stdin` re-acquires a mutex and reads through an 8 KiB buffer
+            // on every call; the pool's block reader wants far bigger gulps than
+            // that, so give the stdin path the same 2 MiB buffer the file path
+            // gets.
+            Box::new(io::BufReader::with_capacity(SORT_INPUT_BUFFER_SIZE, io::stdin()))
+        }
     } else {
-        let mut file = std::fs::File::open(path_ref)
+        let file = std::fs::File::open(path_ref)
             .with_context(|| format!("Failed to open input BAM: {}", path_ref.display()))?;
 
-        let header = {
-            let bgzf = BgzfReader::new(&mut file);
-            let mut noodles_reader = noodles::bam::io::Reader::from(bgzf);
-            noodles_reader
-                .read_header()
-                .with_context(|| format!("Failed to read header from: {}", path_ref.display()))?
-        };
+        // Grow the per-fd readahead window. This is the plain sequential hint
+        // and applies however the bytes are subsequently read; the WILLNEED
+        // hints that `PrefetchReader` issues are a separate, async-only extra.
+        fgumi_bam_io::os_hints::advise_sequential(&file);
 
-        file.seek(SeekFrom::Start(0))
-            .with_context(|| format!("Failed to rewind input BAM: {}", path_ref.display()))?;
-
-        let reader: Box<dyn io::Read + Send> = if async_reader {
-            fgumi_bam_io::os_hints::advise_sequential(&file);
+        if async_reader {
             log::debug!(
                 "async sort reader enabled: spawning fgumi-prefetch thread for {}",
                 path_ref.display()
             );
             Box::new(fgumi_bam_io::prefetch_reader::PrefetchReader::from_file(file))
         } else {
-            Box::new(io::BufReader::with_capacity(2 * 1024 * 1024, file))
-        };
-        (header, reader)
+            Box::new(io::BufReader::with_capacity(SORT_INPUT_BUFFER_SIZE, file))
+        }
     };
+
+    // Uncompressed SAM becomes a BGZF stream here, so the worker pool below
+    // only ever decompresses BGZF blocks.
+    let opened = fgumi_bam_io::sam_input::normalize_to_bgzf(opened, path_ref)?;
+
+    // Parse the header through a tee and replay the bytes it consumed, rather
+    // than rewinding: the input is opened exactly once, which keeps stdin,
+    // FIFOs and transcoded SAM on the same path as a plain file.
+    let (header, reader) = fgumi_bam_io::read_header_and_replay(opened, path_ref)?;
 
     pool.set_input_file(reader);
     pool.set_phase(phase::PHASE1);
@@ -3979,8 +3992,14 @@ fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
         pool.decompress_error_flag(),
     );
 
+    // Deliberately not phrased as a header failure. The header was parsed
+    // successfully above; by the time the main thread skips its bytes here the
+    // pool's workers have already read and decompressed well past it, so a
+    // fault surfacing at this point is usually a *record* fault (a malformed
+    // SAM line, a truncated block) rather than anything to do with the header.
+    // The worker logs the specific cause before setting the flag this reads.
     skip_bam_header(&mut pooled_input)
-        .with_context(|| format!("Failed to skip header from: {}", path_ref.display()))?;
+        .with_context(|| format!("Failed to read input: {}", path_ref.display()))?;
 
     let raw_reader = fgumi_raw_bam::RawBamReader::new(pooled_input);
     Ok((raw_reader, header))

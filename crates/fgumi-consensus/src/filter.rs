@@ -495,6 +495,26 @@ pub fn is_duplex_consensus(aux_data: &[u8]) -> bool {
         && bam_fields::find_tag_type(aux_data, SamTag::BD).is_some()
 }
 
+/// Detects if a raw BAM record is a simplex consensus.
+///
+/// The raw-aux counterpart of [`crate::tags::is_simplex_consensus`]: the `cD`
+/// (`RawReadCount`) tag without the duplex pair. A read carrying only one of
+/// `aD`/`bD` counts as simplex, matching fgbio — see [`is_duplex_consensus`].
+#[must_use]
+pub fn is_simplex_consensus(aux_data: &[u8]) -> bool {
+    bam_fields::find_tag_type(aux_data, SamTag::CD).is_some() && !is_duplex_consensus(aux_data)
+}
+
+/// Detects if a raw BAM record is any kind of consensus read.
+///
+/// The raw-aux counterpart of [`crate::tags::is_consensus`], which matches
+/// fgbio's `Umis.isFgbioStyleConsensus()`. Use this to reject consensus input to
+/// tools that require pre-consensus, UMI-grouped reads.
+#[must_use]
+pub fn is_consensus(aux_data: &[u8]) -> bool {
+    is_simplex_consensus(aux_data) || is_duplex_consensus(aux_data)
+}
+
 /// Filters a raw consensus read based on per-read tags (cD depth, cE error rate).
 ///
 /// # Errors
@@ -2283,6 +2303,40 @@ mod tests {
             expected,
             "aD={with_ad} bD={with_bd}: duplex iff both present"
         );
+    }
+
+    /// The raw-aux consensus predicates over the `{cD, aD, bD}` presence lattice.
+    ///
+    /// The asymmetry is deliberate and fgbio-compatible: `aD`/`bD` must *both* be
+    /// present for duplex, and a read carrying only one of them counts as simplex
+    /// (fgbio routes it to the vanilla filter). That is exactly the property a
+    /// future "simplification" would flatten, so every combination is pinned.
+    #[rstest]
+    #[case::nothing(&[], false, false, false)]
+    #[case::cd_only(&[SamTag::CD], true, false, true)]
+    #[case::ad_only(&[SamTag::AD], false, false, false)]
+    #[case::bd_only(&[SamTag::BD], false, false, false)]
+    #[case::ad_and_bd(&[SamTag::AD, SamTag::BD], false, true, true)]
+    #[case::cd_and_ad_only(&[SamTag::CD, SamTag::AD], true, false, true)]
+    #[case::cd_and_bd_only(&[SamTag::CD, SamTag::BD], true, false, true)]
+    #[case::all_three(&[SamTag::CD, SamTag::AD, SamTag::BD], false, true, true)]
+    fn raw_aux_consensus_predicates(
+        #[case] tags: &[SamTag],
+        #[case] simplex: bool,
+        #[case] duplex: bool,
+        #[case] any: bool,
+    ) {
+        let mut b = fgumi_raw_bam::SamBuilder::new();
+        b.read_name(b"r").sequence(b"A").qualities(&[30]);
+        for tag in tags {
+            b.add_int_tag(*tag, 1);
+        }
+        let record = b.build();
+        let aux = fgumi_raw_bam::aux_data_slice(record.as_ref());
+
+        assert_eq!(is_simplex_consensus(aux), simplex, "is_simplex_consensus");
+        assert_eq!(is_duplex_consensus(aux), duplex, "is_duplex_consensus");
+        assert_eq!(is_consensus(aux), any, "is_consensus");
     }
 
     // -- FILT-05: the masked-bases statistic counts retained primary reads only --

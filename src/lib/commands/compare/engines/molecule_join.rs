@@ -9,14 +9,12 @@
 //! of file order or MI numbering) and feeds each matched pair here.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
 use std::path::Path;
 
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
-use fgumi_bam_io::create_raw_bam_reader;
 use fgumi_raw_bam::RawRecord;
-use fgumi_sort::RawBamRecordReader;
+use fgumi_sort::OwnedRawBamRecordReader;
 use noodles::sam::Header;
 
 use super::super::bams::{MiKey, get_mi_tag_raw};
@@ -264,10 +262,23 @@ impl MoleculeJoinOutcome {
     }
 }
 
-/// Open a fresh raw-byte record reader over `path`, positioned just past the header, via
-/// the shared [`super::open_raw_bam_reader`] helper.
-fn open_raw(path: &Path) -> Result<RawBamRecordReader<File>> {
-    super::open_raw_bam_reader(path)
+/// Open `path` once, returning its parsed header and a raw-byte record reader
+/// positioned just past that header.
+///
+/// One open per input rather than two. This engine needs the header (to compare
+/// the two inputs' headers for compatibility) *and* the records, and taking them
+/// from separate opens meant the input had to be re-openable — which a FIFO, a
+/// process substitution and stdin are not.
+/// [`fgumi_sort::open_raw_bam_record_reader_with_header`] parses the header
+/// through a tee and replays the bytes it consumed, so one stream serves both.
+/// Uncompressed SAM is sniffed and normalized there too.
+///
+/// This makes the *engine* single-open, which is what its own entry points
+/// promise; the `compare bams` CLI still opens both inputs once more up front for
+/// its header-compatibility precondition — see
+/// [`open_raw_reader_with_header`](super::sort_verify) for the full note.
+fn open_raw_with_header(path: &Path) -> Result<(OwnedRawBamRecordReader, Header)> {
+    fgumi_sort::open_raw_bam_record_reader_with_header(path)
         .with_context(|| format!("opening raw BAM reader for {}", path.display()))
 }
 
@@ -376,14 +387,16 @@ pub(crate) fn molecule_join_compare_capped(
     max_diffs: usize,
     max_pending: usize,
 ) -> Result<MoleculeJoinOutcome> {
-    let (_, h1) = create_raw_bam_reader(bam1, 1)?;
-    let (_, h2) = create_raw_bam_reader(bam2, 1)?;
+    // One open per input; the readers below stream the same streams these headers
+    // were parsed from — see `open_raw_with_header`.
+    let (reader1, h1) = open_raw_with_header(bam1)?;
+    let (reader2, h2) = open_raw_with_header(bam2)?;
     // Make this public API sound on its own, independent of the CLI's own (redundant but
     // cheap) call — see this function's doc comment.
     require_compatible_headers(&h1, &h2)?;
 
-    let mut it1 = molecule_runs(open_raw(bam1)?);
-    let mut it2 = molecule_runs(open_raw(bam2)?);
+    let mut it1 = molecule_runs(reader1);
+    let mut it2 = molecule_runs(reader2);
     let mut pending1: AHashMap<Vec<u8>, MoleculeRun> = AHashMap::new();
     let mut pending2: AHashMap<Vec<u8>, MoleculeRun> = AHashMap::new();
     let mut done1 = false;

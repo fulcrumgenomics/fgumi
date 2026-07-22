@@ -10,7 +10,7 @@
 use crate::logging::OperationTimer;
 use crate::metrics::simplex::{SimplexMetricsCollector, SimplexYieldMetric};
 use crate::simple_umi_consensus::SimpleUmiConsensusCaller;
-use crate::validation::validate_file_exists;
+use crate::validation::validate_input_exists;
 use anyhow::Result;
 use clap::Parser;
 use log::info;
@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use super::command::Command;
 use super::shared_metrics::{
     DOWNSAMPLING_FRACTIONS, TemplateInfo, compute_template_metadata, execute_r_script,
-    is_r_available, parse_intervals, process_templates_from_bam, validate_not_consensus_bam,
+    is_r_available, parse_intervals, process_templates_from_bam,
 };
 
 /// Embedded R script for PDF plot generation (bundled with binary).
@@ -99,16 +99,13 @@ impl Command for SimplexMetrics {
         let timer = OperationTimer::new("Computing simplex metrics");
 
         // Validate inputs
-        validate_file_exists(&self.input, "input BAM file")?;
+        validate_input_exists(&self.input, "input BAM")?;
 
         // fgbio's analog validates minReads >= 1; --min-reads 0 would label every
         // family (size >= 0) a consensus family, so reject it (SIMM3-02).
         if self.min_reads == 0 {
             anyhow::bail!("--min-reads must be >= 1 (got {})", self.min_reads);
         }
-
-        // Check that input is not a consensus BAM
-        validate_not_consensus_bam(&self.input)?;
 
         // Load intervals if provided
         let intervals = if let Some(intervals_path) = &self.intervals {
@@ -374,6 +371,9 @@ impl SimplexMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::shared_metrics::{
+        consensus_guard_record, ensure_not_consensus_record, is_consensus_guard_record,
+    };
     use crate::metrics::shared::UmiMetric;
     use crate::metrics::simplex::{SimplexFamilySizeMetric, SimplexMetricsCollector};
     use crate::sam::SamTag;
@@ -385,7 +385,9 @@ mod tests {
     use noodles::bam;
     use noodles::sam;
     use noodles::sam::alignment::io::Write;
+    use rstest::rstest;
     use std::num::NonZeroUsize;
+    use std::path::Path;
     use tempfile::{NamedTempFile, TempDir};
 
     fn create_test_header() -> sam::Header {
@@ -804,13 +806,17 @@ mod tests {
         assert_eq!(cmd.min_reads, 1);
     }
 
-    #[test]
-    fn test_reject_consensus_bam() -> Result<()> {
-        let temp_file = NamedTempFile::new()?;
-        let header = create_test_header();
-        let mut writer = bam::io::writer::Builder.build_from_path(temp_file.path())?;
-        writer.write_header(&header)?;
-
+    /// Both consensus flavours must be rejected — simplex (`cD` without the
+    /// `aD`+`bD` pair) and duplex (`aD`+`bD`, with or without `cD`) — while a
+    /// plain grouped read must not be. The check runs against a single record —
+    /// `process_templates_from_bam` applies it to the first qualifying record of
+    /// its own pass — so the test builds records rather than a BAM file.
+    #[rstest]
+    #[case::simplex_consensus(&[(SamTag::CD, 5)], true)]
+    #[case::duplex_consensus(&[(SamTag::AD, 3), (SamTag::BD, 2)], true)]
+    #[case::duplex_consensus_with_depth(&[(SamTag::CD, 5), (SamTag::AD, 3), (SamTag::BD, 2)], true)]
+    #[case::grouped_not_consensus(&[], false)]
+    fn test_reject_consensus_reads(#[case] int_tags: &[(SamTag, i32)], #[case] is_consensus: bool) {
         let mut b = RawSamBuilder::new();
         b.read_name(b"read1")
             .flags(flags::PAIRED | flags::FIRST_SEGMENT)
@@ -820,15 +826,77 @@ mod tests {
             .cigar_ops(&[encode_op(0, 100)])
             .sequence(&[b'A'; 100])
             .qualities(&[30u8; 100]);
-        b.add_int_tag(SamTag::CD, 5);
-        let record = to_record_buf(b.build());
-        writer.write_alignment_record(&header, &record)?;
-        drop(writer);
+        for (tag, value) in int_tags {
+            b.add_int_tag(*tag, *value);
+        }
+        let record = b.build();
 
-        let result = validate_not_consensus_bam(temp_file.path());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("consensus BAM"));
+        assert!(
+            is_consensus_guard_record(&record),
+            "a paired primary R1 must be the record the guard inspects"
+        );
 
-        Ok(())
+        let result = ensure_not_consensus_record(&record, Path::new("in.bam"));
+        assert_eq!(result.is_err(), is_consensus);
+        if let Err(e) = result {
+            assert!(e.to_string().contains("consensus"), "unexpected error: {e}");
+        }
+    }
+
+    /// Builds one record with `record_flags` and no consensus tags.
+    fn guard_candidate(name: &[u8], record_flags: u16) -> fgumi_raw_bam::RawRecord {
+        let mut b = RawSamBuilder::new();
+        b.read_name(name)
+            .flags(record_flags)
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[encode_op(0, 100)])
+            .sequence(&[b'A'; 100])
+            .qualities(&[30u8; 100]);
+        b.build()
+    }
+
+    /// Which record of a template the guard inspects.
+    ///
+    /// A paired primary R1 is preferred, but a template without one must still
+    /// yield a record: a fragment or single-end consensus BAM has no R1 anywhere,
+    /// and returning `None` for it is what let it through the guard entirely. Only
+    /// a template of nothing but secondary/supplementary records has no answer,
+    /// which defers the check to the next template rather than skipping it.
+    #[rstest]
+    #[case::prefers_paired_r1(
+        &[
+            (&b"r2"[..], flags::PAIRED | flags::LAST_SEGMENT),
+            (&b"r1"[..], flags::PAIRED | flags::FIRST_SEGMENT),
+        ],
+        Some(&b"r1"[..])
+    )]
+    #[case::falls_back_to_fragment(&[(&b"frag"[..], 0)], Some(&b"frag"[..]))]
+    #[case::falls_back_to_r2_when_r1_absent(
+        &[(&b"r2"[..], flags::PAIRED | flags::LAST_SEGMENT)],
+        Some(&b"r2"[..])
+    )]
+    #[case::skips_secondary_and_supplementary(
+        &[(&b"sec"[..], flags::SECONDARY), (&b"sup"[..], flags::SUPPLEMENTARY)],
+        None
+    )]
+    #[case::falls_back_past_secondary(
+        &[(&b"sec"[..], flags::SECONDARY), (&b"frag"[..], 0)],
+        Some(&b"frag"[..])
+    )]
+    fn test_consensus_guard_record_selection(
+        #[case] records: &[(&[u8], u16)],
+        #[case] expected_name: Option<&[u8]>,
+    ) {
+        let records: Vec<_> = records
+            .iter()
+            .map(|(name, record_flags)| guard_candidate(name, *record_flags))
+            .collect();
+
+        let selected = consensus_guard_record(&records)
+            .map(|raw| fgumi_raw_bam::read_name(raw.as_ref()).to_vec());
+
+        assert_eq!(selected.as_deref(), expected_name);
     }
 }

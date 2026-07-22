@@ -13,7 +13,7 @@ use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::create_raw_bam_reader;
 use fgumi_raw_bam::{
     AsTagBytes, RawRecord, alignment_end_from_raw, aux_data_slice, find_string_tag_in_record,
-    find_tag_type, flags as raw_flags, unclipped_5prime_from_raw_bam,
+    flags as raw_flags, unclipped_5prime_from_raw_bam,
 };
 
 use log::info;
@@ -304,62 +304,75 @@ pub fn overlaps_intervals(template: &TemplateInfo, intervals: &[Interval]) -> bo
     }
 }
 
-/// Validates that a BAM file is not a consensus BAM.
+/// Whether `raw` is a primary record — neither secondary nor supplementary.
 ///
-/// Consensus BAMs (output from simplex/duplex callers) should not be used with
-/// metrics tools. This checks the first valid R1 record and errors if it contains
-/// consensus tags.
+/// Deliberately does **not** exclude `UNMAPPED`: consensus BAMs are documented as
+/// unaligned, so skipping unmapped records here would let exactly the input the
+/// consensus guard exists to reject slip past unchecked. That makes this
+/// predicate looser than [`process_templates_from_bam`]'s own R1/R2 filter, which
+/// does require both mates mapped.
+fn is_primary_record(raw: &RawRecord) -> bool {
+    let flags = raw.flags();
+    (flags & raw_flags::SECONDARY) == 0 && (flags & raw_flags::SUPPLEMENTARY) == 0
+}
+
+/// Whether `raw` is the record the consensus-BAM guard prefers to inspect.
+///
+/// A paired, primary R1 — the record fgbio's own check looks at, and the one the
+/// metrics pass itself goes on to read tags from. See [`is_primary_record`] for
+/// why `UNMAPPED` is not excluded.
+pub(crate) fn is_consensus_guard_record(raw: &RawRecord) -> bool {
+    let flags = raw.flags();
+    (flags & raw_flags::PAIRED) != 0
+        && (flags & raw_flags::FIRST_SEGMENT) != 0
+        && is_primary_record(raw)
+}
+
+/// The record in `records` that the consensus-BAM guard inspects, if any.
+///
+/// A paired primary R1 when the template has one ([`is_consensus_guard_record`]);
+/// otherwise the first primary record. The fallback is what makes the guard
+/// unconditional: a fragment or single-end consensus BAM has no paired R1 at all,
+/// so requiring one meant the check never ran, and the very input it exists to
+/// reject fell through the `len() < 2` skip in
+/// [`process_templates_from_bam`] to an empty metrics file rather than the
+/// explicit error. Consensus tags sit on every consensus record, so any primary
+/// record answers the question just as well.
+///
+/// Returns `None` only for a template holding nothing but secondary and
+/// supplementary records, which leaves the caller to try the next template.
+pub(crate) fn consensus_guard_record(records: &[RawRecord]) -> Option<&RawRecord> {
+    records
+        .iter()
+        .find(|raw| is_consensus_guard_record(raw))
+        .or_else(|| records.iter().find(|raw| is_primary_record(raw)))
+}
+
+/// Errors if `raw` carries consensus-calling tags.
+///
+/// Consensus BAMs (output from the simplex/duplex callers) must not be fed to
+/// the metrics tools, which expect the UMI-grouped BAM produced by `group`.
+///
+/// The check reads raw aux bytes rather than decoding to a `RecordBuf`, via
+/// [`fgumi_consensus::is_consensus`].
 ///
 /// # Errors
 ///
-/// Returns an error if the BAM file cannot be read or if it appears to be a consensus BAM.
-pub fn validate_not_consensus_bam(input: &Path) -> Result<()> {
-    let (mut reader, _header) = create_raw_bam_reader(input, 1)?;
-
-    // Look at the first valid R1 record
-    let mut raw = RawRecord::new();
-    loop {
-        let n = reader.read_record(&mut raw).context("failed to read BAM record")?;
-        if n == 0 {
-            break; // EOF
-        }
-
-        // Only check R1 records that are paired and primary (raw flag checks).
-        // Do not skip UNMAPPED: consensus BAMs are documented as unaligned, so
-        // excluding unmapped records here would let consensus BAMs slip past this
-        // guard unchecked.
-        let flags = raw.flags();
-        if (flags & raw_flags::PAIRED) == 0
-            || (flags & raw_flags::FIRST_SEGMENT) == 0
-            || (flags & raw_flags::SECONDARY) != 0
-            || (flags & raw_flags::SUPPLEMENTARY) != 0
-        {
-            continue;
-        }
-
-        // Consensus-tag check on raw aux bytes (mirrors
-        // fgumi_consensus::tags::is_consensus: simplex = cD without aD+bD;
-        // duplex = aD and bD). Avoids decoding the record to RecordBuf.
-        let aux = aux_data_slice(raw.as_ref());
-        let has_ad = find_tag_type(aux, SamTag::AD).is_some();
-        let has_bd = find_tag_type(aux, SamTag::BD).is_some();
-        let has_cd = find_tag_type(aux, SamTag::CD).is_some();
-        let is_duplex_consensus = has_ad && has_bd;
-        let is_simplex_consensus = has_cd && !is_duplex_consensus;
-        if is_simplex_consensus || is_duplex_consensus {
-            let name = String::from_utf8_lossy(fgumi_raw_bam::read_name(raw.as_ref())).into_owned();
-            anyhow::bail!(
-                "Input BAM file ({}) appears to contain consensus sequences. \
-                This metrics tool cannot run on consensus BAMs, and instead requires \
-                the UMI-grouped BAM generated by group which is run prior to consensus calling.\n\
-                First R1 record '{}' has consensus SAM tags present.",
-                input.display(),
-                name
-            );
-        }
-
-        // Only need to check the first valid R1 record
-        break;
+/// Returns an error if `raw` appears to be a consensus read.
+pub(crate) fn ensure_not_consensus_record(raw: &RawRecord, input: &Path) -> Result<()> {
+    // The predicate lives in `fgumi-consensus` next to the record-level form, so
+    // "what counts as a consensus read" has one definition rather than a copy
+    // per consumer.
+    if fgumi_consensus::is_consensus(aux_data_slice(raw.as_ref())) {
+        let name = String::from_utf8_lossy(fgumi_raw_bam::read_name(raw.as_ref())).into_owned();
+        anyhow::bail!(
+            "Input BAM file ({}) appears to contain consensus sequences. \
+            This metrics tool cannot run on consensus BAMs, and instead requires \
+            the UMI-grouped BAM generated by group which is run prior to consensus calling.\n\
+            Record '{}' has consensus SAM tags present.",
+            input.display(),
+            name
+        );
     }
 
     Ok(())
@@ -506,8 +519,20 @@ where
             && (f & raw_flags::SUPPLEMENTARY) == 0
     };
 
+    // Reject a consensus BAM against the first qualifying record of this pass,
+    // rather than by re-opening the input beforehand. Folding it in is what lets
+    // the metrics tools read from a pipe: they no longer need the input twice.
+    let mut consensus_checked = false;
+
     for template in template_iter {
         let template = template?;
+
+        if !consensus_checked && let Some(guard_record) = consensus_guard_record(template.records())
+        {
+            ensure_not_consensus_record(guard_record, input)?;
+            consensus_checked = true;
+        }
+
         if template.records().len() < 2 {
             continue;
         }

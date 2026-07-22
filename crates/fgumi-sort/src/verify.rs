@@ -5,7 +5,7 @@
 //! the location of the first violation (if any).
 
 use anyhow::Result;
-use std::fs::File;
+use std::io::Read;
 
 use crate::reader::RawBamRecordReader;
 
@@ -25,8 +25,8 @@ pub type VerifySummary = (u64, u64, Option<(u64, String)>);
 /// # Errors
 ///
 /// Returns any I/O error from the underlying record stream.
-pub fn verify_sort_order<K>(
-    raw_reader: RawBamRecordReader<File>,
+pub fn verify_sort_order<R: Read, K>(
+    raw_reader: RawBamRecordReader<R>,
     extract_key: impl Fn(&[u8]) -> K,
     is_violation: impl Fn(&K, &K) -> bool,
 ) -> Result<VerifySummary> {

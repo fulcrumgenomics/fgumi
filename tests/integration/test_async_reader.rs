@@ -728,3 +728,73 @@ fn test_sort_template_coordinate_async_reader_multithreaded() {
     let async_out = run_sort(&tmp, &input, "async.bam", "template-coordinate", 4, "50K", true);
     assert_bam_records_equal(&baseline, &async_out);
 }
+
+// ============================================================================
+// BAM commands: sort with stdin input
+// ============================================================================
+
+/// Runs `fgumi sort` over stdin at debug verbosity, returning `(output, stderr)`.
+fn run_sort_from_stdin(
+    tmp: &TempDir,
+    input: &Path,
+    output_name: &str,
+    async_reader: bool,
+) -> (PathBuf, String) {
+    let output = tmp.path().join(output_name);
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "-v".into(), // the prefetch decision is logged at debug level
+        "sort".into(),
+        "-i".into(),
+        "-".into(),
+        "-o".into(),
+        output.as_os_str().to_owned(),
+        "--order".into(),
+        "queryname".into(),
+    ];
+    if async_reader {
+        args.push("--async-reader".into());
+    }
+
+    let result = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args(&args)
+        .stdin(Stdio::from(File::open(input).expect("open sort input")))
+        .output()
+        .expect("fgumi sort");
+    assert!(
+        result.status.success(),
+        "fgumi sort from stdin failed (async={async_reader}):\n{}",
+        String::from_utf8_lossy(&result.stderr),
+    );
+    (output, String::from_utf8_lossy(&result.stderr).into_owned())
+}
+
+/// `--async-reader` must reach the stdin path, not only file inputs.
+///
+/// sort's pool-integrated reader spawns a `fgumi-prefetch` thread when the flag is
+/// given, but its stdin branch used to hand back a plain buffered reader whatever
+/// the flag said — so `fgumi sort --async-reader -i -` silently ran without the
+/// prefetch thread while the same command over a file got one.
+///
+/// The assertion is on the log rather than on the records: both readers deliver the
+/// same bytes, so comparing output alone cannot tell whether the flag was honored.
+/// Output equality is checked too, because honoring it must not change the result.
+#[test]
+fn test_sort_async_reader_reaches_stdin() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("input.bam");
+    create_test_bam(&input);
+
+    let (baseline, baseline_log) = run_sort_from_stdin(&tmp, &input, "baseline.bam", false);
+    assert!(
+        !baseline_log.contains("fgumi-prefetch thread for stdin"),
+        "no prefetch thread should be spawned without --async-reader:\n{baseline_log}"
+    );
+
+    let (async_out, async_log) = run_sort_from_stdin(&tmp, &input, "async.bam", true);
+    assert!(
+        async_log.contains("fgumi-prefetch thread for stdin"),
+        "--async-reader must spawn the prefetch thread for stdin too:\n{async_log}"
+    );
+
+    assert_bam_records_equal(&baseline, &async_out);
+}

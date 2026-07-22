@@ -193,10 +193,10 @@ impl Command for Review {
         let timer = OperationTimer::new("Reviewing variants");
 
         // Validate inputs
-        validate_file_exists(&self.input, "input file")?;
+        validate_file_exists(&self.input, "input")?;
         validate_file_exists(&self.consensus_bam, "consensus BAM")?;
         validate_file_exists(&self.grouped_bam, "grouped BAM")?;
-        validate_file_exists(&self.reference, "reference file")?;
+        validate_file_exists(&self.reference, "reference")?;
 
         // Validate FASTA index and dictionary
         self.validate_reference_files()?;

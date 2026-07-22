@@ -955,18 +955,18 @@ impl<R: std::io::Read> Iterator for TemplateIterator<R> {
                     break;
                 }
                 Ok(_) => {
-                    let name = fgumi_raw_bam::read_name(&rec).to_vec();
-                    if batch.is_empty() {
+                    // Compare the name bytes in place. Copying both names to
+                    // owned `Vec`s just to test equality cost two heap
+                    // allocations per record — on a billion-record BAM that is
+                    // two billion allocations to answer a `memcmp`.
+                    if batch.is_empty()
+                        || fgumi_raw_bam::read_name(&rec) == fgumi_raw_bam::read_name(&batch[0])
+                    {
                         batch.push(rec);
                     } else {
-                        let first_name = fgumi_raw_bam::read_name(&batch[0]).to_vec();
-                        if name == first_name {
-                            batch.push(rec);
-                        } else {
-                            // Different name — save for the next template
-                            self.pending = Some(rec);
-                            break;
-                        }
+                        // Different name — save for the next template
+                        self.pending = Some(rec);
+                        break;
                     }
                 }
                 Err(e) => return Some(Err(anyhow::Error::from(e))),

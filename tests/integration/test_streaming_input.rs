@@ -383,23 +383,38 @@ fn test_sort_reads_stdin_once(#[case] threads: &str) {
     });
 }
 
-/// `sort --verify` reads its input twice (header probe + a fresh record
-/// re-scan via `File::open`), which a non-seekable stdin stream can't satisfy,
-/// so it must be rejected up front with a clear message rather than failing
-/// deep in a re-open. (Plain `sort` streams stdin once and IS supported.)
+/// `sort --verify` streams stdin like every other reading command.
 ///
-/// The rejection keys off `is_stdin_path`, so both `-` and `/dev/stdin` must be
-/// rejected — `/dev/stdin` is a real path (`Path::exists` is `true`), so a gate
-/// keyed on the literal `-` would let it slip into the double-read path.
+/// It used to open its input twice — a header probe, then a fresh `File::open`
+/// record pass — which a non-seekable stream cannot satisfy, so stdin was
+/// rejected up front. It now takes both from one open, parsing the header
+/// through a tee and replaying the consumed bytes, so the rejection is gone.
+///
+/// Both `-` and `/dev/stdin` are covered: `/dev/stdin` is a real path
+/// (`Path::exists` is `true`), so a path handled only by a literal `-` check
+/// would take a different branch here.
 #[rstest]
 #[case("-")]
 #[case("/dev/stdin")]
-fn test_sort_verify_rejects_stdin_with_clear_message(#[case] input_arg: &str) {
+fn test_sort_verify_streams_stdin(#[case] input_arg: &str) {
     let dir = TempDir::new().unwrap();
     let input = dir.path().join("input.bam");
     create_test_input_bam(&input);
+
+    // Sort to coordinate order first so `--verify` has something that passes.
+    let sorted = dir.path().join("sorted.bam");
+    let sort = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args(["sort", "--input"])
+        .arg(&input)
+        .arg("--output")
+        .arg(&sorted)
+        .args(["--order", "coordinate"])
+        .output()
+        .expect("run sort");
+    assert!(sort.status.success(), "sort failed: {}", String::from_utf8_lossy(&sort.stderr));
+
     let cat = Command::new("cat")
-        .arg(input.to_str().unwrap())
+        .arg(sorted.to_str().unwrap())
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn cat");
@@ -408,11 +423,17 @@ fn test_sort_verify_rejects_stdin_with_clear_message(#[case] input_arg: &str) {
         .stdin(cat.stdout.unwrap())
         .output()
         .unwrap_or_else(|e| panic!("run sort --verify -i {input_arg}: {e}"));
-    assert!(!output.status.success(), "sort --verify from stdin ({input_arg}) must be rejected");
+
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("stdin"),
-        "sort --verify stdin ({input_arg}) rejection should mention stdin; stderr: {stderr}"
+        output.status.success(),
+        "sort --verify from stdin ({input_arg}) must be accepted; stderr: {stderr}"
+    );
+
+    // Exiting zero is not enough — a verify that read nothing would also pass.
+    assert!(
+        crate::helpers::records_checked(&stderr) > 0,
+        "sort --verify from stdin ({input_arg}) checked no records"
     );
 }
 

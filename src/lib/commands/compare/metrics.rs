@@ -716,8 +716,8 @@ pub fn compare_metrics(
 
 impl Command for CompareMetrics {
     fn execute(&self, _command_line: &str) -> Result<()> {
-        validate_file_exists(&self.file1, "First file")?;
-        validate_file_exists(&self.file2, "Second file")?;
+        validate_file_exists(&self.file1, "First")?;
+        validate_file_exists(&self.file2, "Second")?;
 
         // `--quiet` means "only the exit code communicates the comparison result": suppress
         // not just the stdout report but also this command's own informational stderr logging
