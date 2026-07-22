@@ -188,9 +188,7 @@
 
 #[cfg(test)]
 use ahash::AHashMap;
-#[cfg(test)]
-use anyhow::Context;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 #[cfg(test)]
 use bstr::BString;
 #[cfg(test)]
@@ -204,7 +202,7 @@ use noodles::sam::alignment::record_buf::RecordBuf;
 use crate::caller::ConsensusOutput;
 use crate::caller::{
     ConsensusCaller, ConsensusCallingStats, RejectionReason, clamp_combined_error_to_fgbio_short,
-    clamp_per_base_to_fgbio_short, write_consensus_read_name,
+    clamp_per_base_to_fgbio_short, consensus_read_name_too_long_context, write_consensus_read_name,
 };
 use crate::phred::MAX_PHRED;
 use crate::phred::{MIN_PHRED, PhredScore};
@@ -1089,8 +1087,11 @@ impl DuplexConsensusCaller {
         // Build the record (name, flags, bases, quals)
         write_consensus_read_name(read_name_buf, read_name_prefix, umi);
         // The UMI is input-derived, so an over-long name is bad data rather than
-        // a bug; propagate instead of panicking mid-write.
-        builder.try_build_record(read_name_buf, flag, &consensus.bases, &consensus.quals)?;
+        // a bug; propagate instead of panicking mid-write, naming the offending read so the
+        // failing molecule is findable in a batch run.
+        builder
+            .try_build_record(read_name_buf, flag, &consensus.bases, &consensus.quals)
+            .with_context(|| consensus_read_name_too_long_context(read_name_buf))?;
 
         // 1. MI tag (string)
         builder.append_string_tag(SamTag::MI, umi.as_bytes());

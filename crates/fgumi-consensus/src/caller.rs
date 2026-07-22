@@ -543,6 +543,43 @@ pub fn write_consensus_read_name(buf: &mut Vec<u8>, read_name_prefix: &str, umi:
     buf.extend_from_slice(umi.as_bytes());
 }
 
+/// Context for a consensus read name that BAM cannot represent.
+///
+/// The builder's own `ReadNameTooLong` reports the length and the limit but not *which*
+/// consensus group hit it. The UMI is input-derived, so on a large batch job a single
+/// malformed molecule identifier otherwise aborts the run with no way to find it. `name` is
+/// the fully-built consensus read name (see [`write_consensus_read_name`]), so it identifies
+/// the group by both prefix and UMI. A long name is truncated to a bounded head AND tail so
+/// it stays readable, and so the identifying bytes survive at *either* end: the read-group
+/// prefix leads and the UMI trails (see [`write_consensus_read_name`]). Showing only the head
+/// would drop the UMI — the very identifier this context exists to surface — for two groups
+/// that share a prefix. The tail is bounded too, so a name that is over-long *because* of an
+/// input-derived UMI cannot produce a multi-kilobyte line.
+///
+/// Shared by all three callers (vanilla, duplex, CODEC) for the same reason the name-writing
+/// itself is: three copies of this drift.
+#[must_use]
+pub fn consensus_read_name_too_long_context(name: &[u8]) -> String {
+    format!("could not write the consensus record for read {}", render_bounded_read_name(name))
+}
+
+/// Render a read name for a diagnostic, bounded at both ends.
+///
+/// A name within the budget is shown whole; a longer one becomes `head...tail` with the
+/// `(name shown truncated)` marker, retaining the leading `HEAD` and trailing `TAIL` bytes so
+/// distinguishing content at either end survives. `HEAD + TAIL` equals the whole-name budget,
+/// so a name at the budget is shown in full and the boundary is exact.
+fn render_bounded_read_name(name: &[u8]) -> String {
+    const HEAD: usize = 44;
+    const TAIL: usize = 20;
+    if name.len() <= HEAD + TAIL {
+        return format!("'{}'", String::from_utf8_lossy(name));
+    }
+    let head = String::from_utf8_lossy(&name[..HEAD]);
+    let tail = String::from_utf8_lossy(&name[name.len() - TAIL..]);
+    format!("'{head}...{tail}' (name shown truncated)")
+}
+
 /// Creates a read name prefix from the SAM header read groups.
 ///
 /// This matches fgbio's `makePrefixFromSamHeader` behavior:
@@ -603,6 +640,114 @@ mod tests {
     #[case::u16_max(65_535, 32_767)]
     fn test_clamp_per_base_to_fgbio_short(#[case] input: u16, #[case] expected: i32) {
         assert_eq!(clamp_per_base_to_fgbio_short(input), expected);
+    }
+
+    /// A name with a recognizable leading and trailing token, padded to `total` bytes, so a
+    /// truncated rendering can be checked for retaining *both* ends.
+    fn tagged_name(total: usize) -> Vec<u8> {
+        const LEAD: &[u8] = b"LEADmarker"; // 10 bytes — stands in for the read-group prefix
+        const TAIL: &[u8] = b"tailUMI0"; //   8 bytes — stands in for the UMI at the tail
+        assert!(total >= LEAD.len() + TAIL.len());
+        let mut v = Vec::with_capacity(total);
+        v.extend_from_slice(LEAD);
+        v.resize(total - TAIL.len(), b'x');
+        v.extend_from_slice(TAIL);
+        v
+    }
+
+    /// The context must name the offending consensus read, and stay readable when the name is
+    /// long — which, for a `ReadNameTooLong` failure, it always is (255+ bytes by definition).
+    /// A truncated name must retain its head (read-group prefix) AND tail (UMI), so two groups
+    /// that differ only in their UMI stay distinguishable.
+    #[rstest]
+    // Within budget: shown whole (both tokens present verbatim), no marker.
+    #[case::short(b"LEADmarker:AAA-tailUMI0".to_vec(), false)]
+    // Exactly at the 64-byte whole-name budget: still shown whole.
+    #[case::at_budget(tagged_name(64), false)]
+    // One past the budget: truncated to head+tail; both tokens must survive.
+    #[case::one_past_budget(tagged_name(65), true)]
+    // A real `ReadNameTooLong` name: truncated, both ends retained.
+    #[case::over_bam_limit(tagged_name(255), true)]
+    fn test_consensus_read_name_too_long_context(
+        #[case] name: Vec<u8>,
+        #[case] expect_truncated: bool,
+    ) {
+        let message = consensus_read_name_too_long_context(&name);
+
+        assert!(
+            message.starts_with("could not write the consensus record for read '"),
+            "unexpected message: {message}"
+        );
+        // The head (read-group prefix) and tail (UMI) tokens survive at both ends regardless
+        // of truncation — this is what keeps two same-prefix, different-UMI groups distinct.
+        assert!(message.contains("LEADmarker"), "{message} should retain the head token");
+        assert!(message.contains("tailUMI0"), "{message} should retain the tail token");
+        assert_eq!(
+            message.contains("(name shown truncated)"),
+            expect_truncated,
+            "a {}-byte name should{} be marked truncated: {message}",
+            name.len(),
+            if expect_truncated { "" } else { " not" }
+        );
+        if expect_truncated {
+            assert!(
+                message.contains("..."),
+                "a truncated name must show the ... elision: {message}"
+            );
+        } else {
+            // A within-budget name is shown in full, byte for byte.
+            let whole = String::from_utf8_lossy(&name);
+            assert!(
+                message.contains(whole.as_ref()),
+                "a within-budget name must be shown whole: {message}"
+            );
+        }
+    }
+
+    /// Two names sharing a prefix but differing only in their trailing UMI must produce
+    /// *different* diagnostics even once truncated — the whole reason the tail is retained.
+    #[test]
+    fn test_consensus_read_name_too_long_context_distinguishes_by_umi() {
+        let mut a = vec![b'p'; 250];
+        let mut b = a.clone();
+        a.extend_from_slice(b":UMI-AAAA");
+        b.extend_from_slice(b":UMI-CCCC");
+        let (msg_a, msg_b) =
+            (consensus_read_name_too_long_context(&a), consensus_read_name_too_long_context(&b));
+        assert_ne!(
+            msg_a, msg_b,
+            "different UMIs must give different diagnostics: {msg_a} vs {msg_b}"
+        );
+        assert!(msg_a.contains("UMI-AAAA") && msg_b.contains("UMI-CCCC"), "each UMI must survive");
+    }
+
+    /// The message must not grow with the name: a `ReadNameTooLong` name is unbounded, and a
+    /// multi-kilobyte error line is unreadable.
+    #[test]
+    fn test_consensus_read_name_too_long_context_length_is_bounded() {
+        let long = consensus_read_name_too_long_context(&vec![b'N'; 255]);
+        let much_longer = consensus_read_name_too_long_context(&vec![b'N'; 100_000]);
+
+        assert_eq!(long, much_longer, "the message must not grow with the name");
+        assert!(long.len() < 160, "message must stay readable, got {} bytes", long.len());
+
+        // All-invalid-UTF-8 at a realistic over-long length: lossy replacement expands each bad
+        // byte to the 3-byte U+FFFD, so the bound must hold against that worst case too.
+        let invalid = consensus_read_name_too_long_context(&vec![0xffu8; 4096]);
+        assert!(invalid.contains("(name shown truncated)"), "must be truncated: {invalid}");
+        assert!(
+            invalid.len() < 300,
+            "invalid-UTF-8 message must stay bounded, got {} bytes",
+            invalid.len()
+        );
+    }
+
+    /// Non-UTF-8 bytes in a name must not panic the error path — the context is built while
+    /// already reporting a failure, so it has to be total.
+    #[test]
+    fn test_consensus_read_name_too_long_context_tolerates_invalid_utf8() {
+        let message = consensus_read_name_too_long_context(&[0xff, 0xfe, b'x']);
+        assert!(message.contains('x'), "unexpected message: {message}");
     }
 
     #[test]
