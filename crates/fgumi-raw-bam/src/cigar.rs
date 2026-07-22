@@ -313,7 +313,7 @@ pub fn mate_unclipped_5prime_1based(
     mate_reverse: bool,
     mc_cigar: &str,
 ) -> i32 {
-    let mate_pos_1based = mate_pos_0based + 1;
+    let mate_pos_1based = mate_pos_0based.saturating_add(1);
     if mate_reverse {
         unclipped_other_end(mate_pos_1based, mc_cigar)
     } else {
@@ -324,20 +324,34 @@ pub fn mate_unclipped_5prime_1based(
 /// Calculate mate's unclipped start from MC tag CIGAR string.
 ///
 /// For forward strand mates, this is the 5' position.
+///
+/// The result is deliberately *not* clamped to the first coordinate: a read
+/// whose leading clips extend past the start of the contig has an unclipped
+/// start below it, and that is true of real data, not just malformed MC values.
+/// The record's own side ([`unclipped_start_from_raw_cigar`]) does not clamp
+/// either, and the template-coordinate key compares the two against each other
+/// (see `external.rs`), so clamping only here would make the two records of one
+/// template canonicalize differently — and would diverge from fgbio and
+/// `samtools sort --template-coordinate`.
 #[inline]
 #[must_use]
 pub(crate) fn unclipped_other_start(mate_pos: i32, mc_cigar: &str) -> i32 {
-    mate_pos - parse_leading_clips(mc_cigar)
+    mate_pos.saturating_sub(parse_leading_clips(mc_cigar.as_bytes()))
 }
 
 /// Calculate mate's unclipped end from MC tag CIGAR string.
 ///
 /// For reverse strand mates, this is the 5' position.
+///
+/// The `-1` that converts a length to an inclusive end is applied *before* the
+/// saturating additions: doing it last would turn a sum that legitimately lands
+/// on [`i32::MAX`] into `i32::MAX - 1`, because the addition saturates first and
+/// the subtraction then walks the saturated value back.
 #[inline]
 #[must_use]
 pub(crate) fn unclipped_other_end(mate_pos: i32, mc_cigar: &str) -> i32 {
-    let (ref_len, trailing_clips) = parse_ref_len_and_trailing_clips(mc_cigar);
-    mate_pos + ref_len + trailing_clips - 1
+    let (ref_len, trailing_clips) = parse_ref_len_and_trailing_clips(mc_cigar.as_bytes());
+    mate_pos.saturating_sub(1).saturating_add(ref_len).saturating_add(trailing_clips)
 }
 
 /// Compute 1-based alignment end position from raw BAM bytes.
@@ -542,25 +556,69 @@ fn unclipped_end_from_raw_cigar(pos: i32, bam: &[u8], cigar_start: usize, n_ops:
     pos + ref_len + trailing_clips - 1
 }
 
-/// Parse leading clips (S or H) from a CIGAR string.
+/// Accumulator for one CIGAR run-length, matching `str::parse::<i32>()`'s
+/// behavior on the digit runs these parsers can produce.
 ///
-/// Returns the total length of leading soft/hard clips.
-#[inline]
-fn parse_leading_clips(cigar: &str) -> i32 {
-    let mut clipped = 0i32;
-    let mut num_start = 0;
-    let bytes = cigar.as_bytes();
+/// The MC tag is *text*, so its run lengths are not bounded by BAM's 28-bit
+/// CIGAR op field and its bytes are not guaranteed to be ASCII. Accumulating
+/// here — rather than slicing the `&str` by byte offset and calling `parse` —
+/// matters for three reasons:
+///
+/// 1. **No panic.** Slicing a `&str` at an offset landing inside a multi-byte
+///    UTF-8 character panics. `std::str::from_utf8` admits such values (they are
+///    valid UTF-8, merely not ASCII), so the previous form could panic in
+///    release on a malformed MC reaching `fgumi sort`'s template key or the
+///    decode step's `GroupKey`.
+/// 2. **No re-scan.** The caller is already iterating those digits.
+/// 3. **Overflow parity.** `str::parse::<i32>()` *fails* on a run wider than
+///    `i32`, which `unwrap_or(0)` turns into `0` — it does not saturate. The
+///    `u64` accumulator plus `i32::try_from(..).unwrap_or(0)` reproduces that
+///    exactly, including runs too wide even for `u64`, and the empty run
+///    (`"".parse()` is likewise an error, hence `0`).
+///
+/// `parse_mi_bytes` in `tags.rs` uses the same idiom.
+struct DigitRun(u64);
 
-    for (i, &c) in bytes.iter().enumerate() {
-        if c.is_ascii_digit() {
+impl DigitRun {
+    const fn new() -> Self {
+        Self(0)
+    }
+
+    /// Feeds one byte. Returns `true` when it was a digit and was consumed.
+    fn push(&mut self, byte: u8) -> bool {
+        if byte.is_ascii_digit() {
+            self.0 = self.0.saturating_mul(10).saturating_add(u64::from(byte - b'0'));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns the accumulated run and resets, mirroring
+    /// `slice.parse::<i32>().unwrap_or(0)`.
+    fn take(&mut self) -> i32 {
+        let value = std::mem::replace(&mut self.0, 0);
+        i32::try_from(value).unwrap_or(0)
+    }
+}
+
+/// Parse leading clips (S or H) from CIGAR bytes.
+///
+/// Returns the total length of leading soft/hard clips, saturating rather than
+/// wrapping if a malformed MC tag declares runs that overflow `i32`.
+#[inline]
+fn parse_leading_clips(cigar: &[u8]) -> i32 {
+    let mut clipped = 0i32;
+    let mut run = DigitRun::new();
+
+    for &c in cigar {
+        if run.push(c) {
             continue;
         }
-        // Parse the number before this operation
-        let num: i32 = cigar[num_start..i].parse().unwrap_or(0);
+        let num = run.take();
 
         if c == b'S' || c == b'H' {
-            clipped += num;
-            num_start = i + 1;
+            clipped = clipped.saturating_add(num);
         } else {
             // Non-clip operation, stop processing
             break;
@@ -570,35 +628,32 @@ fn parse_leading_clips(cigar: &str) -> i32 {
     clipped
 }
 
-/// Parse reference length and trailing clips from a CIGAR string.
+/// Parse reference length and trailing clips from CIGAR bytes.
 ///
 /// Returns `(reference_length, trailing_clips)`.
 /// Reference length is the sum of M/D/N/=/X operations.
 /// Trailing clips are S/H operations after the last reference-consuming op.
 #[inline]
-fn parse_ref_len_and_trailing_clips(cigar: &str) -> (i32, i32) {
+fn parse_ref_len_and_trailing_clips(cigar: &[u8]) -> (i32, i32) {
     let mut ref_len = 0i32;
     let mut trailing_clips = 0i32;
-    let mut num_start = 0;
+    let mut run = DigitRun::new();
     let mut saw_ref_op = false;
-    let bytes = cigar.as_bytes();
 
-    for (i, &c) in bytes.iter().enumerate() {
-        if c.is_ascii_digit() {
+    for &c in cigar {
+        if run.push(c) {
             continue;
         }
-
-        let num: i32 = cigar[num_start..i].parse().unwrap_or(0);
-        num_start = i + 1;
+        let num = run.take();
 
         match c {
             b'M' | b'D' | b'N' | b'=' | b'X' => {
-                ref_len += num;
+                ref_len = ref_len.saturating_add(num);
                 trailing_clips = 0; // Reset trailing clips
                 saw_ref_op = true;
             }
             b'S' | b'H' if saw_ref_op => {
-                trailing_clips += num;
+                trailing_clips = trailing_clips.saturating_add(num);
             }
             _ => {}
         }
@@ -1400,25 +1455,25 @@ mod tests {
     #[test]
     fn test_parse_leading_clips_soft() {
         // "5S10M" -> leading clips = 5
-        assert_eq!(parse_leading_clips("5S10M"), 5);
+        assert_eq!(parse_leading_clips(b"5S10M"), 5);
     }
 
     #[test]
     fn test_parse_leading_clips_hard_and_soft() {
         // "3H5S10M" -> leading clips = 3 + 5 = 8
-        assert_eq!(parse_leading_clips("3H5S10M"), 8);
+        assert_eq!(parse_leading_clips(b"3H5S10M"), 8);
     }
 
     #[test]
     fn test_parse_leading_clips_no_clips() {
         // "10M" -> leading clips = 0
-        assert_eq!(parse_leading_clips("10M"), 0);
+        assert_eq!(parse_leading_clips(b"10M"), 0);
     }
 
     #[test]
     fn test_parse_leading_clips_all_clips() {
         // "5S3H" — all clips, no ref ops
-        assert_eq!(parse_leading_clips("5S3H"), 8);
+        assert_eq!(parse_leading_clips(b"5S3H"), 8);
     }
 
     // ========================================================================
@@ -1428,7 +1483,7 @@ mod tests {
     #[test]
     fn test_parse_ref_len_and_trailing_clips_basic() {
         // "10M5S" -> ref_len=10, trailing_clips=5
-        assert_eq!(parse_ref_len_and_trailing_clips("10M5S"), (10, 5));
+        assert_eq!(parse_ref_len_and_trailing_clips(b"10M5S"), (10, 5));
     }
 
     #[test]
@@ -1436,19 +1491,171 @@ mod tests {
         // "5S10M2I3D5M3S2H"
         // ref consuming: 10M + 3D + 5M = 18
         // trailing clips: 3S + 2H = 5
-        assert_eq!(parse_ref_len_and_trailing_clips("5S10M2I3D5M3S2H"), (18, 5));
+        assert_eq!(parse_ref_len_and_trailing_clips(b"5S10M2I3D5M3S2H"), (18, 5));
+    }
+
+    /// Malformed MC values must not panic and must not produce a negative
+    /// coordinate.
+    ///
+    /// MC is a *text* tag, so its run lengths are not bounded by BAM's 28-bit
+    /// CIGAR op field, and its bytes are not guaranteed to be ASCII. Both
+    /// parsers are reachable in release builds from `fgumi sort`'s template
+    /// key (`external.rs`) and from the decode step's `GroupKey` construction.
+    ///
+    /// Expectations are literal, not computed from the previous implementation
+    /// -- for these inputs the old code panicked or wrapped, so it cannot serve
+    /// as an oracle.
+    #[rstest]
+    // Non-ASCII but valid UTF-8: `str::from_utf8` admits it, so it reaches the
+    // parser. Byte 4 falls inside 'e-acute', which panicked when the old code
+    // sliced the &str there.
+    #[case::non_ascii_utf8("10M\u{e9}", (10, 0))]
+    #[case::non_ascii_leading("\u{e9}10M", (10, 0))]
+    // Unknown ASCII operators are ignored, as before.
+    #[case::unknown_operator("10Mfoo5S", (10, 5))]
+    #[case::placeholder_star("*", (0, 0))]
+    // A single run wider than i32: `str::parse::<i32>` returns Err, and
+    // `unwrap_or(0)` makes it 0. Saturation would wrongly give i32::MAX.
+    #[case::run_overflows_i32("99999999999M", (0, 0))]
+    // Totals that overflow across operators must clamp, not wrap to negative.
+    #[case::sum_overflows_i32("2000000000M2000000000M", (i32::MAX, 0))]
+    #[case::trailing_sum_overflows("1M2000000000S2000000000S", (1, i32::MAX))]
+    // A non-ref, non-clip operator between the last ref op and the trailing
+    // clips must not reset the run (matches htsjdk's getUnclippedEnd).
+    #[case::insertion_before_trailing_clip("10M5I3S", (10, 3))]
+    #[case::padding_before_trailing_clip("10M5P3S", (10, 3))]
+    // An unknown operator AFTER a trailing clip must not clear the run --
+    // only a reference-consuming operator resets it.
+    #[case::garbage_after_trailing_clip("10M3Sfoo", (10, 3))]
+    // A run too wide for u64 itself: the accumulator must saturate, not wrap
+    // back into i32 range. 18446744073709551617 == u64::MAX + 2.
+    #[case::run_overflows_u64("18446744073709551617M", (0, 0))]
+    #[case::leading_zeros("0007M", (7, 0))]
+    #[case::empty("", (0, 0))]
+    #[case::digits_only("10", (0, 0))]
+    fn test_parse_ref_len_and_trailing_clips_malformed(
+        #[case] cigar: &str,
+        #[case] expected: (i32, i32),
+    ) {
+        assert_eq!(parse_ref_len_and_trailing_clips(cigar.as_bytes()), expected);
+    }
+
+    /// Same contract for the leading-clip parser.
+    #[rstest]
+    #[case::non_ascii_utf8("\u{e9}10M", 0)]
+    #[case::run_overflows_i32("99999999999S", 0)]
+    #[case::run_overflows_u64("18446744073709551617S", 0)]
+    #[case::sum_overflows_i32("2000000000S2000000000S", i32::MAX)]
+    #[case::leading_zeros("0007S", 7)]
+    #[case::empty("", 0)]
+    #[case::digits_only("10", 0)]
+    #[case::stops_at_first_non_clip("5S10M5S", 5)]
+    fn test_parse_leading_clips_malformed(#[case] cigar: &str, #[case] expected: i32) {
+        assert_eq!(parse_leading_clips(cigar.as_bytes()), expected);
+    }
+
+    /// One token of a generated MC value: a run of digits, a CIGAR operator, a
+    /// whole non-ASCII character, or an arbitrary byte.
+    ///
+    /// Generating *tokens* rather than independent bytes is what makes this
+    /// property worth running, for two reasons.
+    ///
+    /// A per-byte digit generator has to emit ~20 consecutive digits by chance
+    /// to reach the `u64` accumulator's ceiling and ~10 to reach `i32`'s, which
+    /// effectively never happens -- it would exercise little beyond the
+    /// "unknown byte" arm. Drawing a run length up to 24 instead puts both
+    /// overflow ceilings, and the saturating totals that span several
+    /// operators, in reach on nearly every case.
+    ///
+    /// The multi-byte-character arm matters for the same reason in the other
+    /// direction: a *lone* high byte is not valid UTF-8, so an `any::<u8>()`
+    /// arm alone can essentially never build a value that survives
+    /// `str::from_utf8` while still being non-ASCII -- exactly the shape that
+    /// panicked the old `&str`-slicing parsers. Emitting a whole `char`'s
+    /// encoding keeps that case reachable. The `any::<u8>()` arm still covers
+    /// arbitrary and invalid-UTF-8 bytes for the byte-slice parsers.
+    fn cigar_ish_token() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+        use proptest::strategy::Strategy as _;
+        proptest::prop_oneof![
+            6 => proptest::collection::vec(b'0'..=b'9', 1..24),
+            6 => proptest::sample::select(vec![b'M', b'I', b'D', b'N', b'S', b'H', b'P', b'=', b'X'])
+                .prop_map(|op| vec![op]),
+            3 => proptest::prelude::any::<char>()
+                .prop_map(|ch| ch.to_string().into_bytes()),
+            2 => proptest::prelude::any::<u8>().prop_map(|byte| vec![byte]),
+        ]
+    }
+
+    /// An MC-tag-shaped byte string built from [`cigar_ish_token`].
+    fn cigar_ish_bytes() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+        use proptest::strategy::Strategy as _;
+        proptest::collection::vec(cigar_ish_token(), 0..12).prop_map(|tokens| tokens.concat())
+    }
+
+    proptest::proptest! {
+        /// The parsers must tolerate the full input space, not just the cases
+        /// the tables above name.
+        ///
+        /// MC is a text tag copied verbatim from another record, so the bytes
+        /// reaching these parsers are untrusted: the contract is that *any*
+        /// byte string returns non-negative lengths without panicking or
+        /// wrapping. The tables pin specific expectations; this pins the
+        /// contract itself.
+        #[test]
+        fn test_parse_leading_clips_never_panics_or_goes_negative(
+            cigar in cigar_ish_bytes(),
+        ) {
+            proptest::prop_assert!(parse_leading_clips(&cigar) >= 0);
+        }
+
+        #[test]
+        fn test_parse_ref_len_and_trailing_clips_never_panics_or_goes_negative(
+            cigar in cigar_ish_bytes(),
+        ) {
+            let (ref_len, trailing_clips) = parse_ref_len_and_trailing_clips(&cigar);
+            proptest::prop_assert!(ref_len >= 0);
+            proptest::prop_assert!(trailing_clips >= 0);
+        }
+
+        /// The public entry point must not panic either, on any MC that
+        /// survives `str::from_utf8` -- the filter these values pass through.
+        #[test]
+        fn test_mate_unclipped_5prime_never_panics(
+            cigar in cigar_ish_bytes(),
+            mate_pos in proptest::prelude::any::<i32>(),
+            mate_reverse in proptest::prelude::any::<bool>(),
+        ) {
+            if let Ok(mc) = std::str::from_utf8(&cigar) {
+                // Only asserting it returns: the panic and the debug-build
+                // overflow are what this is guarding against.
+                let _ = mate_unclipped_5prime(mate_pos, mate_reverse, mc);
+                let _ = mate_unclipped_5prime_1based(mate_pos, mate_reverse, mc);
+            }
+        }
+    }
+
+    /// The public entry points must not panic on a non-ASCII MC either.
+    #[rstest]
+    #[case::forward(false, 96)]
+    #[case::reverse(true, 110)]
+    fn test_mate_unclipped_5prime_1based_non_ascii_mc(
+        #[case] mate_reverse: bool,
+        #[case] expected: i32,
+    ) {
+        // "5S10M\u{e9}": leading clips 5, ref_len 10, no trailing clips.
+        assert_eq!(mate_unclipped_5prime_1based(100, mate_reverse, "5S10M\u{e9}"), expected);
     }
 
     #[test]
     fn test_parse_ref_len_and_trailing_clips_no_ref_ops() {
         // "5S3H" — no ref-consuming ops
-        assert_eq!(parse_ref_len_and_trailing_clips("5S3H"), (0, 0));
+        assert_eq!(parse_ref_len_and_trailing_clips(b"5S3H"), (0, 0));
     }
 
     #[test]
     fn test_parse_ref_len_and_trailing_clips_eq_and_x() {
         // "10=3X" → ref_len=13, trailing_clips=0
-        assert_eq!(parse_ref_len_and_trailing_clips("10=3X"), (13, 0));
+        assert_eq!(parse_ref_len_and_trailing_clips(b"10=3X"), (13, 0));
     }
 
     // ========================================================================
@@ -2242,6 +2449,48 @@ mod tests {
     fn test_unclipped_other_end_complex() {
         // 10M5S3H: ref=10, trailing=5+3=8, end = 100 + 10 + 8 - 1 = 117
         assert_eq!(unclipped_other_end(100, "10M5S3H"), 117);
+    }
+
+    /// The inclusive-end `-1` must be applied before the saturating additions.
+    /// Applying it last saturates the sum to `i32::MAX` and then walks it back,
+    /// reporting `i32::MAX - 1` for a coordinate whose exact value is `i32::MAX`.
+    #[rstest::rstest]
+    // 1M at MAX: MAX + 1 - 1 == MAX exactly, so no saturation is warranted.
+    #[case::exactly_max(i32::MAX, "1M", i32::MAX)]
+    // Genuinely past the top: saturation is correct here.
+    #[case::past_max(i32::MAX, "10M", i32::MAX)]
+    // A malformed MC whose spans saturate must still clamp at the top, not wrap.
+    #[case::saturated_spans(100, "2000000000M2000000000M", i32::MAX)]
+    fn test_unclipped_other_end_saturates_at_the_coordinate_ceiling(
+        #[case] mate_pos: i32,
+        #[case] mc_cigar: &str,
+        #[case] expected: i32,
+    ) {
+        assert_eq!(unclipped_other_end(mate_pos, mc_cigar), expected);
+    }
+
+    /// An unclipped start below the first coordinate is real data, not a bug:
+    /// a read whose leading clips run off the front of the contig has one.
+    ///
+    /// The record's own side (`unclipped_start_from_raw_cigar`) does not clamp,
+    /// and the template-coordinate key compares the two against each other, so
+    /// clamping only the mate side would make the two records of one template
+    /// canonicalize differently -- and would diverge from fgbio and
+    /// `samtools sort --template-coordinate`. This pins the choice against a
+    /// well-meaning `.max(0)`.
+    #[rstest::rstest]
+    // 1-based pos 3 with 10 leading clips: 3 - 10 = -7, before the contig start.
+    #[case::clips_past_contig_start(3, "10S5M", -7)]
+    #[case::clips_exactly_to_zero(10, "10S5M", 0)]
+    // Even a malformed, saturated clip stays a (very negative) number rather
+    // than wrapping: `saturating_sub` bottoms out at `i32::MIN`.
+    #[case::saturated_clip_does_not_wrap(100, "2000000000S2000000000S", 100 - i32::MAX)]
+    fn test_unclipped_other_start_is_not_clamped_to_the_contig_start(
+        #[case] mate_pos: i32,
+        #[case] mc_cigar: &str,
+        #[case] expected: i32,
+    ) {
+        assert_eq!(unclipped_other_start(mate_pos, mc_cigar), expected);
     }
 
     // ========================================================================
