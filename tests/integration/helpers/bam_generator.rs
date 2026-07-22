@@ -337,16 +337,19 @@ pub fn create_test_reference(dir: &std::path::Path) -> std::path::PathBuf {
 // ---------------------------------------------------------------------------
 // `compare`-feature-only helpers.
 //
-// Shared by `test_compare_bams.rs` and `test_compare_mutation.rs` (previously
-// duplicated in both files) since both build small BAMs from `RawRecord`
-// fixtures and run them through the `compare` engines.
+// Originally shared by `test_compare_bams.rs` and `test_compare_mutation.rs`
+// (previously duplicated in both files) since both build small BAMs from
+// `RawRecord` fixtures and run them through the `compare` engines.
+// `write_bam` is now used outside those too, so only the compare-specific
+// record builders below stay feature-gated.
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "compare")]
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 
 /// Writes a BAM file from the given header and records.
-#[cfg(feature = "compare")]
+///
+/// Not gated on `compare`: `test_sam_input.rs` builds its fixtures with this
+/// too, and that test runs in every feature configuration.
 pub fn write_bam(path: &std::path::Path, header: &Header, records: &[RawRecord]) {
     let mut writer =
         noodles::bam::io::Writer::new(std::fs::File::create(path).expect("create test BAM"));

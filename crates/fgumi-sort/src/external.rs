@@ -3908,15 +3908,16 @@ pub(crate) use crate::SortStats as RawSortStats;
 ///
 /// # Flow
 ///
-/// 1. Parse header with noodles (first pass, single-threaded)
-/// 2. Open file again, set as pool's input file
-/// 3. Set pool to PHASE1 — workers start reading/decompressing
-/// 4. Main thread skips header bytes from decompressed stream
-/// 5. Returns `RawBamReader<PooledInputStream>` for direct record iteration
+/// 1. Open the input once, transcoding it if it is uncompressed SAM
+/// 2. Parse the header, capturing the bytes it consumed so they can be replayed
+/// 3. Set the replaying stream as the pool's input file
+/// 4. Set pool to PHASE1 — workers start reading/decompressing
+/// 5. Main thread skips header bytes from decompressed stream
+/// 6. Returns `RawBamReader<PooledInputStream>` for direct record iteration
 ///
 /// # Errors
 ///
-/// Returns an error if the BAM file cannot be opened, the header cannot be
+/// Returns an error if the input cannot be opened, the header cannot be
 /// parsed, or header bytes cannot be skipped from the decompressed stream.
 fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
     path: P,
@@ -3928,35 +3929,13 @@ fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
 
     let path_ref = path.as_ref();
 
-    let (header, reader): (Header, Box<dyn io::Read + Send>) = if is_stdin_path(path_ref) {
-        let stdin = io::stdin();
-        let tee = TeeReader::new(stdin);
-        let bgzf = BgzfReader::new(tee);
-        let mut noodles_reader = noodles::bam::io::Reader::from(bgzf);
-        let header =
-            noodles_reader.read_header().with_context(|| "Failed to read BAM header from stdin")?;
-
-        let bgzf = noodles_reader.into_inner();
-        let tee = bgzf.into_inner();
-        let (buffered_bytes, stdin) = tee.into_parts();
-        let chained = ChainedReader::new(buffered_bytes, stdin);
-        (header, Box::new(io::BufReader::with_capacity(2 * 1024 * 1024, chained)))
+    let opened: Box<dyn io::Read + Send> = if is_stdin_path(path_ref) {
+        Box::new(io::stdin())
     } else {
-        let mut file = std::fs::File::open(path_ref)
+        let file = std::fs::File::open(path_ref)
             .with_context(|| format!("Failed to open input BAM: {}", path_ref.display()))?;
 
-        let header = {
-            let bgzf = BgzfReader::new(&mut file);
-            let mut noodles_reader = noodles::bam::io::Reader::from(bgzf);
-            noodles_reader
-                .read_header()
-                .with_context(|| format!("Failed to read header from: {}", path_ref.display()))?
-        };
-
-        file.seek(SeekFrom::Start(0))
-            .with_context(|| format!("Failed to rewind input BAM: {}", path_ref.display()))?;
-
-        let reader: Box<dyn io::Read + Send> = if async_reader {
+        if async_reader {
             fgumi_bam_io::os_hints::advise_sequential(&file);
             log::debug!(
                 "async sort reader enabled: spawning fgumi-prefetch thread for {}",
@@ -3965,9 +3944,25 @@ fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
             Box::new(fgumi_bam_io::prefetch_reader::PrefetchReader::from_file(file))
         } else {
             Box::new(io::BufReader::with_capacity(2 * 1024 * 1024, file))
-        };
-        (header, reader)
+        }
     };
+
+    // Uncompressed SAM becomes a BGZF stream here, so the worker pool below
+    // only ever decompresses BGZF blocks.
+    let opened = fgumi_bam_io::sam_input::normalize_to_bgzf(opened, path_ref)?;
+
+    // Parse the header through a tee and replay the bytes it consumed, rather
+    // than rewinding: the input is opened exactly once, which keeps stdin,
+    // FIFOs and transcoded SAM on the same path as a plain file.
+    let tee = TeeReader::new(opened);
+    let bgzf = BgzfReader::new(tee);
+    let mut noodles_reader = noodles::bam::io::Reader::from(bgzf);
+    let header = noodles_reader
+        .read_header()
+        .with_context(|| format!("Failed to read header from: {}", path_ref.display()))?;
+
+    let (buffered_bytes, rest) = noodles_reader.into_inner().into_inner().into_parts();
+    let reader: Box<dyn io::Read + Send> = Box::new(ChainedReader::new(buffered_bytes, rest));
 
     pool.set_input_file(reader);
     pool.set_phase(phase::PHASE1);

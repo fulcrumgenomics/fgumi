@@ -19,6 +19,7 @@ pub mod prefetch_reader;
 pub mod progress;
 pub mod reader;
 pub mod reorder;
+pub mod sam_input;
 pub mod writer;
 
 pub(crate) mod vendored;
