@@ -472,3 +472,63 @@ fn test_dedup_no_umi_large_position_group() {
     // All templates should share the same MI value (one group in identity strategy).
     assert_eq!(mi_values.len(), 1, "all records should share a single MI tag value");
 }
+
+/// `dedup` carries its own copy of `--index-threshold`, so it needs the same
+/// unsatisfiable-request check `group` has: `always` under a strategy with no index
+/// code path must be rejected, not silently ignored.
+#[test]
+fn test_dedup_rejects_index_threshold_always_when_index_unreachable() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    create_sorted_bam(&input_bam, create_duplicate_group("dup1", "ACGTACGT", 3, 100));
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--index-threshold",
+        "always",
+    ])
+    .expect("failed to parse dedup args");
+
+    let err = cmd.execute("fgumi dedup").expect_err("must reject an unsatisfiable request");
+    let message = err.to_string();
+    assert!(
+        message.contains("--index-threshold always")
+            && message.contains("never uses the UMI index"),
+        "error should say why the request cannot be honoured, got: {message}"
+    );
+}
+
+/// `never` is always satisfiable, so it must be accepted everywhere -- including under
+/// a strategy that would not have indexed anyway.
+#[test]
+fn test_dedup_accepts_index_threshold_never() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    create_sorted_bam(&input_bam, create_duplicate_group("dup1", "ACGTACGT", 3, 100));
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--index-threshold",
+        "never",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+
+    cmd.execute("fgumi dedup").expect("--index-threshold never must be accepted");
+    assert!(output_bam.exists(), "Output BAM not created");
+}

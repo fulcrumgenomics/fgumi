@@ -224,10 +224,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::MoleculeId;
 use fgumi_dna::BitEnc;
 
-/// Default minimum number of unique UMIs to use N-gram/BK-tree index for candidate search.
-/// Below this threshold, linear scan is used. Based on benchmarks: index provides ~10%
-/// speedup even at 100 UMIs/position with negligible construction overhead.
-pub const DEFAULT_INDEX_THRESHOLD: usize = 100;
+use crate::index_threshold::{DEFAULT_INDEX_THRESHOLD, IndexThreshold};
 
 /// A node in the BK-tree.
 ///
@@ -545,6 +542,26 @@ pub enum Strategy {
 }
 
 impl Strategy {
+    /// Whether this strategy consults the UMI index at all, at `edits`.
+    ///
+    /// `Identity` and `Edit` have no index code path. `Adjacency` indexes only at
+    /// `edits == 1` — `build_adjacency_graph_bitenc` gates on it, and the BK-tree branch
+    /// that would serve larger distances is reachable only from the generic
+    /// `build_adjacency_graph` the paired strategy uses. `Paired` therefore indexes at
+    /// every edit distance.
+    ///
+    /// Callers use this to reject an [`IndexThreshold`] that
+    /// [demands indexing](IndexThreshold::demands_indexing) under a configuration that
+    /// cannot deliver it.
+    #[must_use]
+    pub fn can_use_index(&self, edits: u32) -> bool {
+        match self {
+            Strategy::Identity | Strategy::Edit => false,
+            Strategy::Adjacency => edits == 1,
+            Strategy::Paired => true,
+        }
+    }
+
     /// Create a new UMI assigner for this strategy
     ///
     /// # Arguments
@@ -560,7 +577,7 @@ impl Strategy {
     /// Panics if `edits` is non-zero when using the Identity strategy.
     #[must_use]
     pub fn new_assigner(&self, edits: u32) -> Box<dyn UmiAssigner> {
-        self.new_assigner_full(edits, 1, DEFAULT_INDEX_THRESHOLD)
+        self.new_assigner_full(edits, 1, IndexThreshold::default())
     }
 
     /// Create a new UMI assigner with thread count specified
@@ -575,7 +592,7 @@ impl Strategy {
     /// A boxed trait object implementing the `UmiAssigner` trait
     #[must_use]
     pub fn new_assigner_with_threads(&self, edits: u32, threads: usize) -> Box<dyn UmiAssigner> {
-        self.new_assigner_full(edits, threads, DEFAULT_INDEX_THRESHOLD)
+        self.new_assigner_full(edits, threads, IndexThreshold::default())
     }
 
     /// Create a new UMI assigner with all parameters specified
@@ -596,12 +613,13 @@ impl Strategy {
     ///
     /// Panics if `edits` is non-zero with the `Identity` strategy.
     #[must_use]
-    pub fn new_assigner_full(
+    pub fn new_assigner_full<T: Into<IndexThreshold>>(
         &self,
         edits: u32,
         threads: usize,
-        index_threshold: usize,
+        index_threshold: T,
     ) -> Box<dyn UmiAssigner> {
+        let index_threshold = index_threshold.into();
         match self {
             Strategy::Identity => {
                 assert_eq!(edits, 0, "Edits should be zero when using the identity UMI assigner");
@@ -1176,7 +1194,7 @@ struct Node {
 pub struct AdjacencyUmiAssigner {
     max_mismatches: u32,
     threads: usize,
-    index_threshold: usize,
+    index_threshold: IndexThreshold,
     counter: AtomicU64,
 }
 
@@ -1194,8 +1212,17 @@ impl AdjacencyUmiAssigner {
     ///
     /// A new `AdjacencyUmiAssigner` instance
     #[must_use]
-    pub fn new(max_mismatches: u32, threads: usize, index_threshold: usize) -> Self {
-        Self { max_mismatches, threads, index_threshold, counter: AtomicU64::new(0) }
+    pub fn new<T: Into<IndexThreshold>>(
+        max_mismatches: u32,
+        threads: usize,
+        index_threshold: T,
+    ) -> Self {
+        Self {
+            max_mismatches,
+            threads,
+            index_threshold: index_threshold.into(),
+            counter: AtomicU64::new(0),
+        }
     }
 
     /// Whether a position group of `num_umis` distinct UMIs is *eligible* to be
@@ -1216,7 +1243,7 @@ impl AdjacencyUmiAssigner {
     /// and edit-distance conditions permit indexing", not "an index was built".
     #[must_use]
     pub fn uses_index(&self, num_umis: usize) -> bool {
-        num_umis >= self.index_threshold && self.max_mismatches == 1
+        self.index_threshold.admits(num_umis) && self.max_mismatches == 1
     }
 
     /// Generate the next unique molecule ID
@@ -1461,7 +1488,7 @@ impl AdjacencyUmiAssigner {
         // Unlike `build_adjacency_graph_bitenc`, this path indexes at every edit
         // distance: N-gram for k=1 (most efficient), BK-tree for k>1. Only the
         // `index_threshold` minimum applies -- see `PairedUmiAssigner::uses_index`.
-        let (ngram_index, bktree) = if nodes.len() >= self.index_threshold {
+        let (ngram_index, bktree) = if self.index_threshold.admits(nodes.len()) {
             let umis: Vec<(usize, &str)> =
                 umi_counts.iter().enumerate().map(|(i, (umi, _, _))| (i, umi.as_str())).collect();
 
@@ -1793,7 +1820,11 @@ impl PairedUmiAssigner {
     ///
     /// A new `PairedUmiAssigner` instance
     #[must_use]
-    pub fn new_with_threads(max_mismatches: u32, threads: usize, index_threshold: usize) -> Self {
+    pub fn new_with_threads<T: Into<IndexThreshold>>(
+        max_mismatches: u32,
+        threads: usize,
+        index_threshold: T,
+    ) -> Self {
         let prefix_len = max_mismatches as usize + 1;
         Self {
             adjacency: AdjacencyUmiAssigner::new(max_mismatches, threads, index_threshold),
@@ -1816,7 +1847,7 @@ impl PairedUmiAssigner {
     /// then falls back to the linear scan.
     #[must_use]
     pub fn uses_index(&self, num_umis: usize) -> bool {
-        num_umis >= self.adjacency.index_threshold
+        self.adjacency.index_threshold.admits(num_umis)
     }
 
     /// Get the prefix for lower-ordered reads in a pair
@@ -3859,23 +3890,36 @@ mod tests {
     // ========================================================================
 
     /// Pins what `--index-threshold` actually does, so the CLI help can be checked
-    /// against it. The gate is `num_umis >= index_threshold`, so `0` means the index
-    /// is ALWAYS built -- it does not disable the index. Disabling it requires a
-    /// threshold larger than any position group, e.g. `usize::MAX`.
+    /// against it. A bare integer is a MINIMUM group size, not a switch, so `0` turns
+    /// the index fully on. `never` is the only way to turn it off.
     #[rstest]
-    #[case::zero_always_indexes(0, 1, true)]
-    #[case::zero_indexes_empty_group(0, 0, true)]
-    #[case::below_threshold_scans(100, 99, false)]
-    #[case::at_threshold_indexes(100, 100, true)]
-    #[case::above_threshold_indexes(100, 101, true)]
-    #[case::usize_max_never_indexes(usize::MAX, 1_000_000, false)]
+    #[case::zero_always_indexes(IndexThreshold::MinUmis(0), 1, true)]
+    #[case::zero_indexes_empty_group(IndexThreshold::MinUmis(0), 0, true)]
+    #[case::below_threshold_scans(IndexThreshold::MinUmis(100), 99, false)]
+    #[case::at_threshold_indexes(IndexThreshold::MinUmis(100), 100, true)]
+    #[case::above_threshold_indexes(IndexThreshold::MinUmis(100), 101, true)]
+    #[case::always_indexes_singleton(IndexThreshold::Always, 1, true)]
+    #[case::never_skips_huge_group(IndexThreshold::Never, 1_000_000, false)]
     fn test_adjacency_index_threshold_is_a_minimum_not_a_switch(
-        #[case] index_threshold: usize,
+        #[case] index_threshold: IndexThreshold,
         #[case] num_umis: usize,
         #[case] expected: bool,
     ) {
         let assigner = AdjacencyUmiAssigner::new(1, 1, index_threshold);
         assert_eq!(assigner.uses_index(num_umis), expected);
+    }
+
+    /// `never` wins over every other consideration, including an edit distance that
+    /// would otherwise index (paired) -- there is no combination that resurrects it.
+    #[rstest]
+    #[case::adjacency_edits_one(1)]
+    #[case::adjacency_edits_two(2)]
+    fn test_never_suppresses_the_index_at_every_edit_distance(#[case] max_mismatches: u32) {
+        let adjacency = AdjacencyUmiAssigner::new(max_mismatches, 1, IndexThreshold::Never);
+        assert!(!adjacency.uses_index(1_000_000));
+
+        let paired = PairedUmiAssigner::new_with_threads(max_mismatches, 1, IndexThreshold::Never);
+        assert!(!paired.uses_index(1_000_000));
     }
 
     /// The adjacency assigner only indexes at `--edits 1`; every other value falls
@@ -3908,7 +3952,8 @@ mod tests {
         #[case] num_umis: usize,
         #[case] expected: bool,
     ) {
-        let assigner = PairedUmiAssigner::new_with_threads(max_mismatches, 1, 100);
+        let assigner =
+            PairedUmiAssigner::new_with_threads(max_mismatches, 1, IndexThreshold::MinUmis(100));
         assert_eq!(assigner.uses_index(num_umis), expected);
     }
 }
