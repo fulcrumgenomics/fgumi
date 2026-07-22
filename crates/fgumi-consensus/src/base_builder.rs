@@ -136,15 +136,18 @@
 //! ## Handling Edge Cases
 //!
 //! ### No Observations
-//! Returns `(N, 0)` - no-call with minimum quality.
+//! Returns `(N, MIN_PHRED)` - a no-call at the minimum quality, Q2.
 //!
 //! ### N Bases
 //! N (no-call) bases in input reads are ignored. They don't contribute evidence for any
 //! particular base.
 //!
 //! ### Ties
-//! If multiple bases have exactly equal posterior probability, returns `(N, 0)` to indicate
-//! ambiguity. In practice, this is rare due to quality score differences.
+//! If the greatest likelihood is not unique, returns `(N, MIN_PHRED)` to indicate ambiguity.
+//! "Not unique" means within a few ULPs, not bit-for-bit equal: the likelihoods are running
+//! sums, so a separation narrower than summation noise is not evidence. The tolerance is
+//! relative to the magnitude, so it holds at every family size — see `TIE_TOLERANCE_ULPS`.
+//! In practice ties are rare, since quality scores differ between observations.
 //!
 //! ### Low Depth
 //! With only 1-2 observations, the consensus quality will be similar to the input qualities.
@@ -191,8 +194,7 @@ use crate::phred::{
     ln_error_prob_two_trials, ln_normalize, ln_not, ln_prob_to_phred, ln_sum_exp_array,
     phred_to_ln_error_prob,
 };
-use approx::abs_diff_eq;
-use std::cmp::Ordering;
+use approx::ulps_eq;
 use std::sync::OnceLock;
 use wide::f64x4;
 
@@ -273,6 +275,68 @@ static ADJUSTED_TABLE_CACHE: [OnceLock<AdjustedProbabilityTables>; 256] =
 fn adjusted_tables(error_rate_post_umi: PhredScore) -> &'static AdjustedProbabilityTables {
     ADJUSTED_TABLE_CACHE[error_rate_post_umi as usize]
         .get_or_init(|| AdjustedProbabilityTables::compute(error_rate_post_umi))
+}
+
+/// Tolerance, in ULPs, within which two log-likelihoods are considered tied.
+///
+/// The likelihoods are running sums of log-probabilities, so their magnitude grows with
+/// the family size: values near `-500` are routine for a large family. Any tie tolerance
+/// must therefore be *relative* to that magnitude. An absolute epsilon such as
+/// [`f64::EPSILON`] (the ULP of `1.0`, ~2.2e-16) is meaningless at that scale, because a
+/// single ULP near `-500` is already ~5.7e-14 — roughly 250x larger — so no two distinct
+/// values could ever compare equal. The failure inverts below unit scale, where the same
+/// absolute epsilon is *far too wide*: a shallow family of high-quality observations sits
+/// near `-1e-4`, and one `f64::EPSILON` spans hundreds of ULPs there, so clearly-separated
+/// bases would read as tied. ULP comparison scales automatically in both directions, so this
+/// one constant behaves consistently for a 2-read family and a 2000-read family alike —
+/// provided the absolute epsilon is explicitly disabled at the comparison site (see
+/// [`unique_max_index`]).
+const TIE_TOLERANCE_ULPS: u32 = 4;
+
+/// Returns the index of the strictly-greatest likelihood, or `None` when that maximum is
+/// tied with another base and the call is therefore ambiguous (a no-call).
+///
+/// Two properties matter here, and both were violated by the previous inline implementation:
+///
+/// * **Order independence.** Ties are measured against the *final* maximum, not a running
+///   one. Comparing against a running maximum meant a near-tie was only ever detected when
+///   the tied lane happened to appear *after* the maximum; for likelihoods arriving in
+///   ascending order every comparison took the `Greater` branch and no tie was recorded at
+///   all. That made the outcome depend on the fixed `A,C,G,T` lane order rather than on the
+///   data.
+/// * **Scale independence.** See [`TIE_TOLERANCE_ULPS`].
+///
+/// `NaN` lanes are ignored. An array with no finite entry (no evidence for any base) yields
+/// `None`, since there is nothing to call.
+fn unique_max_index(likelihoods: &[LogProbability; DNA_BASE_COUNT]) -> Option<usize> {
+    let mut max = f64::NEG_INFINITY;
+    let mut max_index = None;
+    for (index, &likelihood) in likelihoods.iter().enumerate() {
+        if likelihood > max {
+            max = likelihood;
+            max_index = Some(index);
+        }
+    }
+
+    // No finite evidence for any base (every lane `-inf` or `NaN`) is not a callable position.
+    let max_index = max_index.filter(|_| max.is_finite())?;
+
+    // The maximum always matches itself, so a unique maximum yields exactly one match.
+    //
+    // `epsilon = 0.0` is required, not cosmetic: `ulps_eq!` applies an *absolute* epsilon
+    // before its ULP comparison, and that epsilon defaults to `f64::EPSILON` — the ULP of
+    // `1.0`. Likelihoods below unit scale are routine (a single high-quality observation
+    // contributes only ~`-1e-4`), and there one default epsilon spans hundreds of ULPs, so
+    // leaving it at the default would silently widen the window far past
+    // `TIE_TOLERANCE_ULPS` and re-introduce the scale dependence this function exists to
+    // remove. Zeroing it makes the rule purely relative; exact equality still ties, since
+    // `|a - b| <= 0.0` holds when `a == b`.
+    let tied_lanes = likelihoods
+        .iter()
+        .filter(|&&ll| ulps_eq!(ll, max, epsilon = 0.0, max_ulps = TIE_TOLERANCE_ULPS))
+        .count();
+
+    (tied_lanes == 1).then_some(max_index)
 }
 
 /// Builder for calling consensus at a single base position
@@ -439,12 +503,8 @@ impl ConsensusBaseBuilder {
     /// Calls the consensus base and quality
     ///
     /// Returns (`consensus_base`, `consensus_quality`)
-    /// Returns (N, 0) if no observations or multiple equally likely bases
-    ///
-    /// # Panics
-    ///
-    /// Panics if there are observations but no maximum likelihood base is found
-    /// (should not occur in practice since we check for ties).
+    /// Returns (N, [`MIN_PHRED`]) if there are no observations, or if the greatest likelihood
+    /// is tied with another base — "tied" meaning within a few ULPs, not bit-for-bit equal
     #[must_use]
     pub fn call(&self) -> (u8, PhredScore) {
         if self.contributions() == 0 {
@@ -463,37 +523,11 @@ impl ConsensusBaseBuilder {
         // Compute the sum of likelihoods for normalization
         let ln_sum = ln_sum_exp_array(likelihoods);
 
-        // Find the maximum likelihood and check if it's unique
-        let mut max_likelihood = f64::NEG_INFINITY;
-        let mut max_index = None;
-        let mut tie = false;
-
-        for (i, &ll) in likelihoods.iter().enumerate() {
-            match ll.partial_cmp(&max_likelihood) {
-                Some(Ordering::Greater) => {
-                    max_likelihood = ll;
-                    max_index = Some(i);
-                    tie = false;
-                }
-                Some(Ordering::Equal) => {
-                    tie = true;
-                }
-                Some(Ordering::Less) => {
-                    // Check for epsilon-level tie (within machine precision)
-                    if abs_diff_eq!(ll, max_likelihood, epsilon = f64::EPSILON) {
-                        tie = true;
-                    }
-                }
-                None => {}
-            }
-        }
-
-        // If there's a tie, return no-call
-        if tie || max_index.is_none() {
+        // Find the maximum likelihood, which must be unique; a tie is a no-call.
+        let Some(max_idx) = unique_max_index(likelihoods) else {
             return (NO_CALL_BASE, MIN_PHRED);
-        }
-
-        let max_idx = max_index.expect("max_index is Some after is_none() check above");
+        };
+        let max_likelihood = likelihoods[max_idx];
         let consensus_base = DNA_BASES[max_idx];
 
         // Calculate posterior probability
@@ -674,6 +708,132 @@ mod tests {
         let error_count = depth - builder.observations_for_base(base);
         assert_eq!(error_count, mismatching, "error count must be exact, not a clamped difference");
         assert_ne!(error_count, 0, "a saturated-operand subtraction would collapse to zero here");
+    }
+
+    /// One ULP at the given magnitude, i.e. the gap to the next representable `f64`.
+    pub(super) fn one_ulp(at: f64) -> f64 {
+        let next = f64::from_bits(at.abs().to_bits() + 1);
+        next - at.abs()
+    }
+
+    /// The value exactly `ulps` steps further from zero than `at` (more negative when `at` is).
+    pub(super) fn step_away_from_zero(at: f64, ulps: u32) -> f64 {
+        let magnitude = f64::from_bits(at.abs().to_bits() + u64::from(ulps));
+        if at.is_sign_negative() { -magnitude } else { magnitude }
+    }
+
+    /// Exact ties must be no-calls regardless of lane order.
+    ///
+    /// These cases pass on the pre-fix implementation too (an exact tie always hit its
+    /// `Equal` branch); they are kept as regression guards, not as evidence of the bug.
+    #[rstest]
+    #[case::tied_pair_leading([-500.0, -500.0, -600.0, -700.0], None)]
+    #[case::tied_pair_trailing([-700.0, -600.0, -500.0, -500.0], None)]
+    #[case::tied_pair_split([-500.0, -600.0, -500.0, -700.0], None)]
+    #[case::unique_max_first([-100.0, -600.0, -500.0, -700.0], Some(0))]
+    #[case::unique_max_last([-600.0, -500.0, -700.0, -100.0], Some(3))]
+    #[case::all_four_tied([-500.0, -500.0, -500.0, -500.0], None)]
+    fn exact_ties_are_no_calls(
+        #[case] likelihoods: [LogProbability; DNA_BASE_COUNT],
+        #[case] expected: Option<usize>,
+    ) {
+        assert_eq!(unique_max_index(&likelihoods), expected);
+    }
+
+    /// A near-tie must resolve the same way whichever lane order it arrives in.
+    ///
+    /// The pre-fix implementation compared each lane against a *running* maximum, so a
+    /// near-tie was only detected when the tied lane appeared after the maximum. At unit
+    /// scale (where the old absolute `f64::EPSILON` was comparable to one ULP) the same two
+    /// values returned `None` in descending order but `Some(1)` in ascending order — the
+    /// answer depended on the fixed `A,C,G,T` lane order rather than on the data.
+    #[rstest]
+    #[case::descending([-1.0, -1.0 - f64::EPSILON, -1.0e9, -1.0e9])]
+    #[case::ascending([-1.0 - f64::EPSILON, -1.0, -1.0e9, -1.0e9])]
+    fn near_ties_are_order_independent(#[case] likelihoods: [LogProbability; DNA_BASE_COUNT]) {
+        assert_eq!(unique_max_index(&likelihoods), None);
+    }
+
+    /// The tie tolerance must scale with the magnitude of the likelihoods.
+    ///
+    /// A sum of log-probabilities for a large family sits far from `1.0`, where the old
+    /// absolute `f64::EPSILON` tolerance was orders of magnitude smaller than a single ULP
+    /// and so could never fire. A one-ULP separation is noise from summation order, not
+    /// real evidence, and must read as a tie at every scale.
+    #[rstest]
+    #[case::single_observation(-1.0e-4)]
+    #[case::sub_unit(-0.01)]
+    #[case::near_zero(-1.0)]
+    #[case::small(-10.0)]
+    #[case::typical_family(-500.0)]
+    #[case::large_family(-5000.0)]
+    fn one_ulp_separation_is_a_tie_at_any_scale(#[case] magnitude: f64) {
+        let ulp = one_ulp(magnitude);
+        let likelihoods = [magnitude, magnitude - ulp, -1.0e9, -1.0e9];
+        assert_eq!(
+            unique_max_index(&likelihoods),
+            None,
+            "lanes separated by 1 ULP at {magnitude} must tie (ulp = {ulp:e})"
+        );
+    }
+
+    /// A separation far wider than the tolerance must still resolve to a definite call,
+    /// at the same magnitudes — otherwise the fix would simply no-call everything.
+    #[rstest]
+    #[case::single_observation(-1.0e-4)]
+    #[case::sub_unit(-0.01)]
+    #[case::near_zero(-1.0)]
+    #[case::small(-10.0)]
+    #[case::typical_family(-500.0)]
+    #[case::large_family(-5000.0)]
+    fn clear_separation_is_not_a_tie_at_any_scale(#[case] magnitude: f64) {
+        let likelihoods = [magnitude, magnitude - 1.0, -1.0e9, -1.0e9];
+        assert_eq!(unique_max_index(&likelihoods), Some(0));
+    }
+
+    /// Below unit scale the tie window must stay exactly [`TIE_TOLERANCE_ULPS`] wide.
+    ///
+    /// `ulps_eq!` checks an *absolute* epsilon before comparing ULPs, and that epsilon defaults
+    /// to `f64::EPSILON` — the ULP of `1.0`. Likelihoods below `1.0` are routine (one
+    /// high-quality observation contributes only ~`-1e-4`), and there the default epsilon spans
+    /// hundreds of ULPs. Leaving it at the default would no-call lanes separated far beyond the
+    /// tolerance, which is the same scale dependence — just inverted — that the fix removes at
+    /// the large-magnitude end. This pins the explicit `epsilon = 0.0`.
+    #[rstest]
+    #[case::tenth(-0.1)]
+    #[case::hundredth(-0.01)]
+    #[case::single_observation(-1.0e-4)]
+    fn tie_window_stays_ulp_relative_below_unit_scale(#[case] magnitude: f64) {
+        let separated = step_away_from_zero(magnitude, TIE_TOLERANCE_ULPS + 1);
+        let gap = (magnitude - separated).abs();
+
+        assert!(
+            gap < f64::EPSILON,
+            "precondition: a {}-ULP gap at {magnitude} ({gap:e}) must fall inside the default \
+             absolute epsilon ({:e}), or this case would pass without the fix",
+            TIE_TOLERANCE_ULPS + 1,
+            f64::EPSILON
+        );
+
+        let likelihoods = [magnitude, separated, -1.0e9, -1.0e9];
+        assert_eq!(
+            unique_max_index(&likelihoods),
+            Some(0),
+            "a {}-ULP gap at {magnitude} must resolve to a call, not a tie",
+            TIE_TOLERANCE_ULPS + 1
+        );
+    }
+
+    #[rstest]
+    #[case::all_neg_inf([f64::NEG_INFINITY; DNA_BASE_COUNT], None)]
+    #[case::single_finite_lane([f64::NEG_INFINITY, -3.0, f64::NEG_INFINITY, f64::NEG_INFINITY], Some(1))]
+    #[case::nan_lanes_ignored([f64::NAN, -3.0, f64::NAN, -9.0], Some(1))]
+    #[case::all_nan([f64::NAN; DNA_BASE_COUNT], None)]
+    fn tie_detection_handles_non_finite_lanes(
+        #[case] likelihoods: [LogProbability; DNA_BASE_COUNT],
+        #[case] expected: Option<usize>,
+    ) {
+        assert_eq!(unique_max_index(&likelihoods), expected);
     }
 
     #[test]
@@ -1026,5 +1186,183 @@ mod tests {
                 "Q{input_q} should become ~Q{expected_q}, got Q{qual}"
             );
         }
+    }
+}
+
+/// Parity — and *documented, intentional divergence* — against fgbio's tie rule.
+///
+/// fgbio decides "is the maximum unique?" in `MathUtil.maxWithIndex(requireUniqueMaximum=true)`
+/// (`src/main/scala/com/fulcrumgenomics/util/MathUtil.scala`), which
+/// `ConsensusCaller.call()` uses to emit a no-call. Rather than pin a captured fixture, these
+/// tests port that method exactly and run both rules over the same inputs, so the oracle is
+/// generated programmatically and the boundary between "we match fgbio" and "we deliberately
+/// do not" is checked rather than asserted in prose.
+///
+/// fgbio's rule has the two defects this module's [`unique_max_index`] was written to remove:
+///
+/// 1. **Order dependence.** The tie test lives in the `else` branch of `v > max`, so it only
+///    fires for a lane that arrives *after* the maximum. The same two values therefore
+///    no-call in one lane order and call in the other.
+/// 2. **Scale dependence.** The tolerance is the absolute constant `2^-52` (numerically
+///    `f64::EPSILON`). At the magnitudes a real family reaches it is orders of magnitude
+///    below one ULP, so it can never fire; below unit scale it spans hundreds of ULPs and
+///    fires far too readily.
+///
+/// The divergence is confined to near-ties: on exact ties and on clearly-separated lanes —
+/// which is what real pileups almost always produce, and what the ported fgbio behaviour
+/// tests in the module above exercise end to end — the two rules agree.
+#[cfg(test)]
+mod fgbio_tie_oracle_tests {
+    use super::tests::{one_ulp, step_away_from_zero};
+    use super::*;
+    use rstest::rstest;
+
+    /// fgbio's `MathUtil.epsilon`, transcribed as `1.0 / Math.pow(2, 52)` (`2^52` spelled out
+    /// so the constant stays exact and independent of `f64::EPSILON`, which
+    /// `fgbio_epsilon_is_f64_epsilon` then proves it equals).
+    const FGBIO_EPSILON: f64 = 1.0 / 4_503_599_627_370_496.0;
+
+    /// A faithful port of fgbio's `MathUtil.maxWithIndex(ds, requireUniqueMaximum = true)`,
+    /// returning `None` where fgbio returns a `maxIndex` of `-1`.
+    ///
+    /// Kept structurally identical to the Scala original — running maximum, tie test only in
+    /// the `else` branch, `NaN` lanes skipped — so the divergences below are the real ones and
+    /// not artifacts of a paraphrase. fgbio throws when every lane is `NaN`; that arm is
+    /// mapped to `None` because a panic is not a comparable outcome.
+    fn fgbio_unique_max_index(likelihoods: &[LogProbability; DNA_BASE_COUNT]) -> Option<usize> {
+        let mut max = f64::MIN;
+        let mut max_index: i32 = -1;
+        let mut assigned = false;
+
+        for (index, &value) in likelihoods.iter().enumerate() {
+            if value.is_nan() {
+                continue;
+            }
+            if !assigned || value > max {
+                max = value;
+                max_index = i32::try_from(index).expect("four lanes fit in an i32");
+                assigned = true;
+            } else if (value - max).abs() <= FGBIO_EPSILON {
+                max_index = -1;
+            }
+        }
+
+        if !assigned || max_index < 0 {
+            return None;
+        }
+        Some(usize::try_from(max_index).expect("checked non-negative above"))
+    }
+
+    /// The constant fgbio compares against is precisely `f64::EPSILON`, so the "absolute
+    /// epsilon" characterisation of fgbio's rule above is exact, not approximate.
+    #[test]
+    fn fgbio_epsilon_is_f64_epsilon() {
+        assert_eq!(FGBIO_EPSILON.to_bits(), f64::EPSILON.to_bits());
+    }
+
+    /// Where a pileup is unambiguous — an exact tie, or lanes separated far beyond either
+    /// tolerance — fgumi and fgbio must agree. This is the parity half of the contract.
+    #[rstest]
+    #[case::exact_tie_leading([-500.0, -500.0, -600.0, -700.0], None)]
+    #[case::exact_tie_trailing([-700.0, -600.0, -500.0, -500.0], None)]
+    #[case::all_four_tied([-500.0; DNA_BASE_COUNT], None)]
+    #[case::clear_max_first([-100.0, -600.0, -500.0, -700.0], Some(0))]
+    #[case::clear_max_last([-600.0, -500.0, -700.0, -100.0], Some(3))]
+    #[case::clear_max_sub_unit([-0.01, -1.0, -2.0, -3.0], Some(0))]
+    #[case::nan_lanes_ignored([f64::NAN, -3.0, f64::NAN, -9.0], Some(1))]
+    fn unambiguous_pileups_match_fgbio(
+        #[case] likelihoods: [LogProbability; DNA_BASE_COUNT],
+        #[case] expected: Option<usize>,
+    ) {
+        assert_eq!(unique_max_index(&likelihoods), expected, "fgumi");
+        assert_eq!(fgbio_unique_max_index(&likelihoods), expected, "fgbio oracle");
+    }
+
+    /// Divergence 1 — order dependence. fgbio answers differently for the same two values
+    /// depending only on which lane they land in; fgumi no-calls either way.
+    #[test]
+    fn fgumi_is_order_independent_where_fgbio_is_not() {
+        let descending = [-1.0, -1.0 - f64::EPSILON, -1.0e9, -1.0e9];
+        let ascending = [-1.0 - f64::EPSILON, -1.0, -1.0e9, -1.0e9];
+
+        assert_eq!(unique_max_index(&descending), None, "fgumi ties regardless of lane order");
+        assert_eq!(unique_max_index(&ascending), None, "fgumi ties regardless of lane order");
+
+        // The documented fgbio defect: the tie is seen only when the tied lane trails the max.
+        assert_eq!(fgbio_unique_max_index(&descending), None);
+        assert_eq!(
+            fgbio_unique_max_index(&ascending),
+            Some(1),
+            "fgbio's running-maximum tie test cannot fire on an ascending lane order"
+        );
+    }
+
+    /// Divergence 2a — at family scale fgbio's absolute epsilon is far below one ULP, so a
+    /// one-ULP separation (summation-order noise, not evidence) reads as a definite call.
+    #[rstest]
+    #[case::typical_family(-500.0)]
+    #[case::large_family(-5000.0)]
+    fn fgumi_ties_summation_noise_that_fgbio_calls(#[case] magnitude: f64) {
+        let ulp = one_ulp(magnitude);
+        assert!(
+            ulp > FGBIO_EPSILON,
+            "precondition: one ULP at {magnitude} exceeds fgbio's epsilon"
+        );
+
+        let likelihoods = [magnitude, magnitude - ulp, -1.0e9, -1.0e9];
+
+        assert_eq!(unique_max_index(&likelihoods), None, "fgumi treats 1 ULP as a tie");
+        assert_eq!(
+            fgbio_unique_max_index(&likelihoods),
+            Some(0),
+            "fgbio's absolute epsilon cannot reach one ULP at {magnitude}"
+        );
+    }
+
+    /// Divergence 2b — the inverse, below unit scale: fgbio's epsilon spans hundreds of ULPs
+    /// and no-calls lanes that are separated well past the tolerance. This is the case the
+    /// explicit `epsilon = 0.0` in [`unique_max_index`] exists to avoid inheriting.
+    #[rstest]
+    #[case::tenth(-0.1)]
+    #[case::hundredth(-0.01)]
+    #[case::single_observation(-1.0e-4)]
+    fn fgumi_calls_separations_that_fgbio_no_calls_below_unit_scale(#[case] magnitude: f64) {
+        let separated = step_away_from_zero(magnitude, TIE_TOLERANCE_ULPS + 1);
+        let gap = (magnitude - separated).abs();
+        assert!(
+            gap < FGBIO_EPSILON,
+            "precondition: the gap at {magnitude} is inside fgbio's epsilon"
+        );
+
+        // Descending lane order, so fgbio's running-maximum tie test does fire — isolating the
+        // scale defect from the order defect.
+        let likelihoods = [magnitude, separated, -1.0e9, -1.0e9];
+
+        assert_eq!(
+            unique_max_index(&likelihoods),
+            Some(0),
+            "{} ULPs at {magnitude} is a real separation for fgumi",
+            TIE_TOLERANCE_ULPS + 1
+        );
+        assert_eq!(
+            fgbio_unique_max_index(&likelihoods),
+            None,
+            "fgbio's absolute epsilon swallows {} ULPs at {magnitude}",
+            TIE_TOLERANCE_ULPS + 1
+        );
+    }
+
+    /// Divergence 3 — a position with no evidence at all. fgbio assigns the first `-inf` lane
+    /// as the maximum and calls it; fgumi requires a finite maximum and no-calls.
+    #[test]
+    fn fgumi_no_calls_an_all_neg_inf_position_that_fgbio_calls() {
+        let likelihoods = [f64::NEG_INFINITY; DNA_BASE_COUNT];
+
+        assert_eq!(unique_max_index(&likelihoods), None, "no finite evidence is not callable");
+        assert_eq!(
+            fgbio_unique_max_index(&likelihoods),
+            Some(0),
+            "fgbio assigns on the first non-NaN lane, even at -inf"
+        );
     }
 }
