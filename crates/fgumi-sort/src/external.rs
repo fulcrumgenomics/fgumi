@@ -3487,8 +3487,13 @@ impl RawExternalSorter {
 
     /// Merge keyed chunks with BAM index generation.
     ///
-    /// Similar to `merge_chunks_generic` but uses `IndexingBamWriter` to build
-    /// the BAI index incrementally during the merge. Returns the generated index.
+    /// Identical input/output pipeline to `merge_chunks_generic` — the shared
+    /// worker pool decompresses the input runs (`PoolDisk` sources) and
+    /// compresses the output blocks — but the output goes through
+    /// [`PooledBamWriter::new_indexing`], which tracks each record's virtual
+    /// file offset and returns the generated BAI index. A single pool of
+    /// workers therefore serves both decompression and compression; there is no
+    /// separate writer thread pool and no serialized single-reader input.
     fn merge_chunks_with_index<K: RawSortKey + Default + 'static>(
         &self,
         chunk_files: &[PathBuf],
@@ -3499,34 +3504,46 @@ impl RawExternalSorter {
         pool: &Arc<SortWorkerPool>,
     ) -> Result<noodles::bam::bai::Index> {
         use crate::loser_tree::LoserTree;
-        use fgumi_bam_io::create_indexing_bam_writer;
+        use crate::pooled_bam_writer::PooledBamWriter;
+        use crate::worker_pool::phase;
 
-        // Thread budget: writer gets the Phase 2 (merge/write) thread count
-        // (merge is output-compression-bound), readers use semaphore concurrency
-        // of 1. Same split as merge_chunks_generic, whose PooledBamWriter inherits
-        // the same cap via the shared pool raised to `phase2_threads()`.
-        // TODO: Replace create_indexing_bam_writer with PooledIndexingBamWriter
-        let writer_threads = self.phase2_threads();
         let reader_concurrency: usize = 1;
+        let num_disk = chunk_files.len();
 
-        // The indexing path uses a non-pooled writer and has no pool consumer set up,
-        // so use GenericKeyedChunkReader (pool_decompress=false).
-        // TODO: Replace create_indexing_bam_writer with PooledIndexingBamWriter to
-        // enable pool-integrated decompression for the indexing path.
+        if num_disk > 0 {
+            debug!(
+                "Pool-integrated indexed merge: {} disk sources, {} pool workers (N+2 model)",
+                num_disk,
+                pool.num_workers()
+            );
+        }
+
         let mut sources = Self::build_chunk_sources::<K>(
             chunk_files,
             memory_chunks,
             reader_concurrency,
-            false,
+            true,
             pool,
         )?;
 
         let num_sources = sources.len();
-        debug!(
-            "Merge thread budget (indexing): {writer_threads} writer + {reader_concurrency} reader + 1 main = {} total",
-            writer_threads + reader_concurrency + 1
-        );
         debug!("Merging from {num_sources} sources (indexing)...");
+
+        // Create the pool consumer for PoolDisk sources and activate Phase 2,
+        // exactly as merge_chunks_generic does.
+        let mut guard: Phase2Guard<'_, K> = if num_disk > 0 {
+            let files = pool.phase2_files();
+            let consumer = MainThreadChunkConsumer::new(
+                files,
+                pool.decompress_error_flag(),
+                pool.chunk_read_error_flag(),
+                pool.worker_panicked_flag(),
+            );
+            pool.set_phase(phase::PHASE2);
+            Phase2Guard { pool, consumer: Some(consumer), active: true }
+        } else {
+            Phase2Guard { pool, consumer: None, active: false }
+        };
 
         let output_header = self.create_output_header(header);
 
@@ -3535,32 +3552,23 @@ impl RawExternalSorter {
         let mut source_map: Vec<usize> = Vec::with_capacity(sources.len());
 
         for (idx, source) in sources.iter_mut().enumerate() {
-            if let Some(key) = source.advance(None)? {
+            if let Some(key) = source.advance(guard.consumer_mut())? {
                 initial_keys.push(key);
                 source_map.push(idx);
             }
         }
 
         if initial_keys.is_empty() {
-            let writer = create_indexing_bam_writer(
-                output,
-                &output_header,
-                self.output_compression,
-                writer_threads,
-            )?;
-            let index = writer.finish()?;
+            guard.deactivate();
+            let writer = PooledBamWriter::new_indexing(Arc::clone(pool), output, &output_header)?;
+            let index = writer.finish_index()?;
             debug!("Merge complete: 0 records merged");
             return Ok(index);
         }
 
         let mut tree = LoserTree::new(initial_keys);
 
-        let mut writer = create_indexing_bam_writer(
-            output,
-            &output_header,
-            self.output_compression,
-            writer_threads,
-        )?;
+        let mut writer = PooledBamWriter::new_indexing(Arc::clone(pool), output, &output_header)?;
         let merge_progress = ProgressTracker::new("Merged records")
             .with_interval(1_000_000)
             .with_total(total_records);
@@ -3571,14 +3579,20 @@ impl RawExternalSorter {
             writer.write_raw_record(sources[src_idx].current_bytes())?;
             merge_progress.log_if_needed(1);
 
-            if let Some(key) = sources[src_idx].advance(None)? {
+            if let Some(key) = sources[src_idx].advance(guard.consumer_mut())? {
                 tree.replace_winner(key);
             } else {
                 tree.remove_winner();
             }
         }
 
-        let index = writer.finish()?;
+        // Return the pool to legacy mode before finishing the writer — the
+        // workers still compress the trailing output blocks during
+        // finish_index() (CompressOutput is eligible whenever the queue is
+        // non-empty). Same ordering as merge_chunks_generic.
+        guard.deactivate();
+
+        let index = writer.finish_index()?;
         merge_progress.log_final();
         Ok(index)
     }

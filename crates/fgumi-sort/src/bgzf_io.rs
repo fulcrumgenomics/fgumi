@@ -16,6 +16,21 @@ use std::sync::Arc;
 /// Padding beyond `BGZF_MAX_BLOCK_SIZE` for the staging buffer capacity.
 const STAGING_PADDING: usize = 4096;
 
+/// Per-block position notification emitted by the I/O writer loop when index
+/// generation is enabled.
+///
+/// `serial` is the block's serial number (assigned by [`StagingBuffer`] at
+/// flush time, and equal to its block number since one compress job produces
+/// exactly one BGZF block). `compressed_start` is the cumulative number of
+/// compressed bytes written to the file *before* this block — i.e. its on-disk
+/// byte offset. The pooled indexing writer uses these to resolve BAI virtual
+/// offsets.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BlockOffset {
+    pub serial: u64,
+    pub compressed_start: u64,
+}
+
 /// Staging buffer that accumulates data and submits full blocks to the pool.
 pub(crate) struct StagingBuffer {
     pool: Arc<SortWorkerPool>,
@@ -57,6 +72,25 @@ impl StagingBuffer {
     #[inline]
     pub(crate) fn is_full(&self) -> bool {
         self.buf.len() >= BGZF_MAX_BLOCK_SIZE
+    }
+
+    /// Current uncompressed length of the pending (not-yet-flushed) block.
+    ///
+    /// This is the uncompressed offset at which the next appended byte will
+    /// land in the current block — used by the indexing writer to record where
+    /// a record starts.
+    #[inline]
+    pub(crate) fn buf_len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Serial number the pending block will be assigned when flushed.
+    ///
+    /// Because one compress job produces exactly one BGZF block, this is also
+    /// the block number the indexing writer pairs with [`BlockOffset`].
+    #[inline]
+    pub(crate) fn next_serial(&self) -> u64 {
+        self.next_serial
     }
 
     /// Flush the staging buffer: swap it with a recycled buffer and submit for compression.
@@ -124,6 +158,31 @@ impl StagingBuffer {
     }
 }
 
+/// Write one output block in serial order: emit its compressed start offset
+/// (when indexing is enabled), write the bytes, advance the running compressed
+/// offset, and release one reorder permit.
+///
+/// `compressed_start` is captured *before* the write, so it is the on-disk byte
+/// offset at which this block begins. The BGZF EOF marker is written separately
+/// and is intentionally never passed here (no record references it).
+fn write_block_in_order(
+    writer: &mut BufWriter<std::fs::File>,
+    serial: u64,
+    data: &[u8],
+    compressed_offset: &mut u64,
+    block_offset_tx: Option<&Sender<BlockOffset>>,
+    permit_pool: &Arc<PermitPool>,
+) -> Result<()> {
+    if let Some(tx) = block_offset_tx {
+        // Best-effort: the indexing consumer keeps the receiver alive until finish.
+        let _ = tx.send(BlockOffset { serial, compressed_start: *compressed_offset });
+    }
+    writer.write_all(data)?;
+    *compressed_offset += data.len() as u64;
+    permit_pool.release();
+    Ok(())
+}
+
 /// I/O writer loop: receives compressed blocks and writes them in serial order.
 ///
 /// Uses a `BTreeMap` as a reorder buffer. When the next expected serial arrives,
@@ -132,6 +191,10 @@ impl StagingBuffer {
 /// unblocking the corresponding `StagingBuffer::flush()` call and bounding the
 /// number of in-flight compressed blocks to the pool capacity.
 /// Writes BGZF EOF marker and flushes when all blocks are received.
+///
+/// When `block_offset_tx` is `Some`, each written block's `(serial,
+/// compressed_start)` is emitted on it (in strict block order) for BAI virtual
+/// offset resolution; when `None`, this is a no-op with zero overhead.
 ///
 /// # Errors
 ///
@@ -144,8 +207,16 @@ pub(crate) fn io_writer_loop(
     buffer_pool: BufferPool,
     permit_pool: Arc<PermitPool>,
     codec: SpillCodec,
+    block_offset_tx: Option<Sender<BlockOffset>>,
 ) -> Result<()> {
-    let result = io_writer_loop_inner(&mut writer, &result_rx, &buffer_pool, &permit_pool, codec);
+    let result = io_writer_loop_inner(
+        &mut writer,
+        &result_rx,
+        &buffer_pool,
+        &permit_pool,
+        codec,
+        block_offset_tx.as_ref(),
+    );
     if result.is_err() {
         // Unblock any producers waiting on acquire() so they don't park forever.
         permit_pool.close();
@@ -159,21 +230,36 @@ fn io_writer_loop_inner(
     buffer_pool: &BufferPool,
     permit_pool: &Arc<PermitPool>,
     codec: SpillCodec,
+    block_offset_tx: Option<&Sender<BlockOffset>>,
 ) -> Result<()> {
     let mut next_expected: u64 = 0;
     let mut reorder_buf: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    let mut compressed_offset: u64 = 0;
+    let tx = block_offset_tx;
 
     while let Ok(result) = result_rx.recv() {
         buffer_pool.checkin(result.recycled_buf);
 
         if result.serial == next_expected {
-            writer.write_all(&result.compressed)?;
-            permit_pool.release();
+            write_block_in_order(
+                writer,
+                next_expected,
+                &result.compressed,
+                &mut compressed_offset,
+                tx,
+                permit_pool,
+            )?;
             next_expected += 1;
 
             while let Some(data) = reorder_buf.remove(&next_expected) {
-                writer.write_all(&data)?;
-                permit_pool.release();
+                write_block_in_order(
+                    writer,
+                    next_expected,
+                    &data,
+                    &mut compressed_offset,
+                    tx,
+                    permit_pool,
+                )?;
                 next_expected += 1;
             }
         } else {
@@ -186,8 +272,14 @@ fn io_writer_loop_inner(
     while let Some((&serial, _)) = reorder_buf.first_key_value() {
         if serial == next_expected {
             let data = reorder_buf.remove(&serial).expect("key just checked");
-            writer.write_all(&data)?;
-            permit_pool.release();
+            write_block_in_order(
+                writer,
+                next_expected,
+                &data,
+                &mut compressed_offset,
+                tx,
+                permit_pool,
+            )?;
             next_expected += 1;
         } else {
             return Err(anyhow::anyhow!(
@@ -235,8 +327,9 @@ mod tests {
         let out_file = std::fs::File::create(&out_path).unwrap();
         let writer = std::io::BufWriter::new(out_file);
         let pp = Arc::clone(&permit_pool);
-        let io_handle =
-            std::thread::spawn(move || io_writer_loop(writer, result_rx, buffer_pool, pp, codec));
+        let io_handle = std::thread::spawn(move || {
+            io_writer_loop(writer, result_rx, buffer_pool, pp, codec, None)
+        });
 
         let mut staging = StagingBuffer::new(Arc::clone(&pool), result_tx, permit_pool, codec);
         staging.write_chunked(data).unwrap();
@@ -307,8 +400,9 @@ mod tests {
         let out_file = std::fs::File::create(&out_path).unwrap();
         let writer = std::io::BufWriter::new(out_file);
         let pp = Arc::clone(&permit_pool);
-        let io_handle =
-            std::thread::spawn(move || io_writer_loop(writer, result_rx, buffer_pool, pp, codec));
+        let io_handle = std::thread::spawn(move || {
+            io_writer_loop(writer, result_rx, buffer_pool, pp, codec, None)
+        });
 
         let mut staging = StagingBuffer::new(Arc::clone(&pool), result_tx, permit_pool, codec);
         staging.write_chunked(&large).unwrap();
@@ -346,8 +440,9 @@ mod tests {
         let out_file = std::fs::File::create(&out_path).unwrap();
         let writer = std::io::BufWriter::new(out_file);
         let pp = Arc::clone(&permit_pool);
-        let io_handle =
-            std::thread::spawn(move || io_writer_loop(writer, result_rx, buffer_pool, pp, codec));
+        let io_handle = std::thread::spawn(move || {
+            io_writer_loop(writer, result_rx, buffer_pool, pp, codec, None)
+        });
 
         // Submit block 1 first, then block 0 (out of order).
         // Each needs a pre-acquired permit since they bypass StagingBuffer::flush().

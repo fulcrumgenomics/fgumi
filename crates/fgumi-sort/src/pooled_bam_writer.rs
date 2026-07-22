@@ -20,12 +20,14 @@
 //!                                              ──────► write ordered
 //! ```
 
-use crate::bgzf_io::{StagingBuffer, io_writer_loop};
+use crate::bgzf_io::{BlockOffset, StagingBuffer, io_writer_loop};
 use crate::codec::SpillCodec;
 use crate::worker_pool::{CompressResult, PermitPool, SortWorkerPool};
 use anyhow::Result;
-use crossbeam_channel::bounded;
+use crossbeam_channel::{Receiver, bounded, unbounded};
+use fgumi_bam_io::BaiBuilder;
 use fgumi_bgzf::BGZF_MAX_BLOCK_SIZE;
+use noodles::bam::bai;
 use noodles::sam::Header;
 use std::io::BufWriter;
 use std::path::Path;
@@ -45,6 +47,19 @@ pub struct PooledBamWriter {
     /// `None` only after `start_finish()` transfers ownership to `SpillWriteHandle`.
     staging: Option<StagingBuffer>,
     io_handle: Option<JoinHandle<Result<()>>>,
+    /// Present only for writers created via [`PooledBamWriter::new_indexing`];
+    /// drives incremental BAI generation.
+    index: Option<IndexState>,
+}
+
+/// State for incremental BAI generation, held only by an indexing writer.
+struct IndexState {
+    /// Shared virtual-offset accumulator (identical logic to `IndexingBamWriter`).
+    bai: BaiBuilder,
+    /// Per-block `(serial, compressed_start)` notifications from the I/O thread.
+    block_offset_rx: Receiver<BlockOffset>,
+    /// Number of reference sequences, needed to finalize the index.
+    num_refs: usize,
 }
 
 impl PooledBamWriter {
@@ -59,6 +74,32 @@ impl PooledBamWriter {
     /// Returns an error if the output file cannot be created or the header cannot
     /// be serialized.
     pub fn new(pool: Arc<SortWorkerPool>, path: &Path, header: &Header) -> Result<Self> {
+        Self::new_inner(pool, path, header, false)
+    }
+
+    /// Create a pooled BAM writer that also builds a BAI index during the write.
+    ///
+    /// Output bytes are identical to [`new`](Self::new); additionally, each
+    /// record's virtual file offset is tracked and the index is returned by
+    /// [`finish_index`](Self::finish_index). Only meaningful for
+    /// coordinate-sorted output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the output file cannot be created or the header
+    /// cannot be serialized.
+    pub fn new_indexing(pool: Arc<SortWorkerPool>, path: &Path, header: &Header) -> Result<Self> {
+        Self::new_inner(pool, path, header, true)
+    }
+
+    /// Shared constructor for [`new`](Self::new) and
+    /// [`new_indexing`](Self::new_indexing).
+    fn new_inner(
+        pool: Arc<SortWorkerPool>,
+        path: &Path,
+        header: &Header,
+        indexing: bool,
+    ) -> Result<Self> {
         let file = std::fs::File::create(path)?;
         let writer = BufWriter::with_capacity(256 * 1024, file);
 
@@ -67,9 +108,20 @@ impl PooledBamWriter {
         let buffer_pool = pool.buffer_pool.clone();
         let permit_pool = Arc::new(PermitPool::new(reorder_capacity));
 
+        // When indexing, wire an unbounded channel so the I/O thread can emit
+        // each block's compressed start offset without ever blocking on send
+        // (the consumer drains it during writes and once more at finish).
+        let (block_offset_tx, index) = if indexing {
+            let (tx, rx) = unbounded::<BlockOffset>();
+            let num_refs = header.reference_sequences().len();
+            (Some(tx), Some(IndexState { bai: BaiBuilder::new(), block_offset_rx: rx, num_refs }))
+        } else {
+            (None, None)
+        };
+
         let pp = Arc::clone(&permit_pool);
         let io_handle = thread::spawn(move || {
-            io_writer_loop(writer, result_rx, buffer_pool, pp, SpillCodec::Bgzf)
+            io_writer_loop(writer, result_rx, buffer_pool, pp, SpillCodec::Bgzf, block_offset_tx)
         });
 
         let mut staging = StagingBuffer::new(pool, result_tx, permit_pool, SpillCodec::Bgzf);
@@ -81,7 +133,7 @@ impl PooledBamWriter {
         staging.write_chunked(&header_buf)?;
         staging.flush()?;
 
-        Ok(Self { staging: Some(staging), io_handle: Some(io_handle) })
+        Ok(Self { staging: Some(staging), io_handle: Some(io_handle), index })
     }
 
     /// Write a raw BAM record to the output.
@@ -107,6 +159,15 @@ impl PooledBamWriter {
         if staging.buf().len() + needed > BGZF_MAX_BLOCK_SIZE {
             staging.flush()?;
         }
+        // For indexing, capture the record's start position *after* any pre-flush
+        // and *before* appending. `next_serial`/`buf_len` are the writer's own
+        // block number and uncompressed offset, so the recorded position matches
+        // the block layout exactly (records never straddle a block except the
+        // oversized case below, which `compute_end_vpos` resolves by walking
+        // full-size blocks forward).
+        if let Some(index) = self.index.as_mut() {
+            index.bai.record(staging.next_serial(), staging.buf_len(), needed, record_bytes);
+        }
         // Write the 4-byte length prefix (always fits: staging is empty after the pre-flush,
         // and 4 bytes is well within BGZF_MAX_BLOCK_SIZE).
         staging.buf().extend_from_slice(&block_size.to_le_bytes());
@@ -117,6 +178,14 @@ impl PooledBamWriter {
         } else {
             staging.buf().extend_from_slice(record_bytes);
             staging.flush_if_full()?;
+        }
+        // Drain block-offset notifications and resolve completed records so the
+        // pending-entry cache stays bounded by the in-flight block count.
+        if let Some(index) = self.index.as_mut() {
+            while let Ok(bo) = index.block_offset_rx.try_recv() {
+                index.bai.note_block(bo.serial, bo.compressed_start);
+            }
+            index.bai.resolve()?;
         }
         Ok(())
     }
@@ -145,6 +214,50 @@ impl PooledBamWriter {
             drop(staging); // closes result_tx → I/O thread exits after draining
         }
         Ok(SpillWriteHandle::new(self.io_handle.take()))
+    }
+
+    /// Finish writing and return the BAI index built during the write.
+    ///
+    /// Flushes remaining data, joins the I/O thread (ensuring every block is
+    /// written and every block-offset notification emitted), resolves the
+    /// trailing records, and builds the index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a writer not created via
+    /// [`new_indexing`](Self::new_indexing).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if flushing, the I/O thread, or index construction
+    /// fails (the latter includes any record whose block offset was never
+    /// observed).
+    pub fn finish_index(mut self) -> Result<bai::Index> {
+        let mut index = self.index.take().expect("finish_index requires an indexing writer");
+
+        // Flush remaining staging and close the input to the I/O thread.
+        if let Some(mut staging) = self.staging.take() {
+            if !staging.buf().is_empty() {
+                staging.flush()?;
+            }
+            // Closes result_tx → I/O thread drains, writes all blocks, emits all
+            // offsets, then exits (dropping its block-offset sender).
+            drop(staging);
+        }
+
+        // Join the I/O thread so every block offset has been emitted before we
+        // drain the channel for the last time.
+        if let Some(handle) = self.io_handle.take() {
+            handle.join().map_err(|_| anyhow::anyhow!("I/O writer thread panicked"))??;
+        }
+
+        // Drain the final block offsets and resolve the remaining records.
+        while let Ok(bo) = index.block_offset_rx.try_recv() {
+            index.bai.note_block(bo.serial, bo.compressed_start);
+        }
+        index.bai.resolve()?;
+        let idx = index.bai.build(index.num_refs)?;
+        Ok(idx)
     }
 }
 
@@ -219,6 +332,103 @@ mod tests {
         rec.resize(rec.len() + seq_len, 0xFF); // qual
 
         rec
+    }
+
+    /// Create a mapped raw BAM record with a single `seq_len`M CIGAR at
+    /// `(ref_id, pos)` (0-based pos), mapq 60, flag 0.
+    #[allow(clippy::cast_possible_truncation)]
+    fn make_mapped_record(name: &[u8], ref_id: i32, pos: i32, seq_len: usize) -> Vec<u8> {
+        let name_len = name.len() + 1;
+        let seq_bytes = seq_len.div_ceil(2);
+        let mut rec = Vec::new();
+
+        rec.extend_from_slice(&ref_id.to_le_bytes());
+        rec.extend_from_slice(&pos.to_le_bytes());
+        let bin_mq_nl: u32 = (name_len as u32) | (60u32 << 8) | (4680u32 << 16); // mapq 60
+        rec.extend_from_slice(&bin_mq_nl.to_le_bytes());
+        let flag_nc: u32 = 1; // n_cigar_op = 1, flag = 0 (mapped)
+        rec.extend_from_slice(&flag_nc.to_le_bytes());
+        rec.extend_from_slice(&(seq_len as u32).to_le_bytes());
+        rec.extend_from_slice(&(-1i32).to_le_bytes()); // mate_ref_id
+        rec.extend_from_slice(&(-1i32).to_le_bytes()); // mate_pos
+        rec.extend_from_slice(&0i32.to_le_bytes()); // tlen
+        rec.extend_from_slice(name);
+        rec.push(0); // null terminator
+        let cigar_op: u32 = (seq_len as u32) << 4; // seq_len M (op code 0)
+        rec.extend_from_slice(&cigar_op.to_le_bytes());
+        rec.resize(rec.len() + seq_bytes, 0x11); // seq
+        rec.resize(rec.len() + seq_len, 0xFF); // qual
+        rec
+    }
+
+    /// The indexing writer must produce byte-identical BAM output to the plain
+    /// pooled writer (indexing is a pure side-channel) and yield a writable BAI.
+    ///
+    /// Covers a coordinate-sorted mix that spans many BGZF blocks: mapped reads
+    /// on two references, trailing unmapped reads, and an oversized record that
+    /// spans multiple blocks (exercising cross-block virtual-offset accounting).
+    #[test]
+    fn test_indexing_writer_output_matches_plain_and_writes_bai() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let header = test_header(); // chr1 (100k), chr2 (200k)
+
+        let mut records: Vec<Vec<u8>> = Vec::new();
+        for i in 0..1500 {
+            records.push(make_mapped_record(format!("c1_{i:05}").as_bytes(), 0, i * 30, 60));
+        }
+        for i in 0..1500 {
+            records.push(make_mapped_record(format!("c2_{i:05}").as_bytes(), 1, i * 30, 60));
+        }
+        for i in 0..100 {
+            records.push(make_test_record(format!("unm_{i:03}").as_bytes(), 60)); // unmapped
+        }
+        // Oversized (unmapped) record that spans multiple BGZF blocks.
+        records.push(make_test_record(b"oversized", BGZF_MAX_BLOCK_SIZE + 500));
+
+        let pool = Arc::new(SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf));
+
+        let plain_path = dir.path().join("plain.bam");
+        {
+            let mut w = PooledBamWriter::new(Arc::clone(&pool), &plain_path, &header)
+                .expect("plain writer");
+            for r in &records {
+                w.write_raw_record(r).expect("write");
+            }
+            w.finish().expect("finish plain");
+        }
+
+        let indexed_path = dir.path().join("indexed.bam");
+        let index = {
+            let mut w = PooledBamWriter::new_indexing(Arc::clone(&pool), &indexed_path, &header)
+                .expect("indexing writer");
+            for r in &records {
+                w.write_raw_record(r).expect("write");
+            }
+            w.finish_index().expect("finish_index")
+        };
+
+        // Indexing must not change a single output byte.
+        assert_eq!(
+            std::fs::read(&plain_path).expect("read plain"),
+            std::fs::read(&indexed_path).expect("read indexed"),
+            "indexing writer must produce byte-identical BAM output to the plain writer"
+        );
+
+        // The returned index must serialize to a sidecar that loads back cleanly
+        // and covers every reference: a non-empty file alone would not catch a
+        // corrupt virtual offset, which is the contract this writer owes.
+        let bai_path = dir.path().join("indexed.bam.bai");
+        fgumi_bam_io::write_bai_index(&bai_path, &index).expect("write bai");
+        let loaded = bai::fs::read(&bai_path).expect("BAI must be loadable");
+        assert_eq!(
+            loaded.reference_sequences().len(),
+            header.reference_sequences().len(),
+            "index should cover every reference sequence"
+        );
+
+        if let Ok(pool) = Arc::try_unwrap(pool) {
+            pool.shutdown();
+        }
     }
 
     #[test]
