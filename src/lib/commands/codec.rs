@@ -166,7 +166,40 @@ struct CollectedCodecMetrics {
 #[command(
     name = "codec",
     about = "\x1b[38;5;180m[CONSENSUS]\x1b[0m      \x1b[36mCall CODEC consensus reads from grouped BAM\x1b[0m",
-    long_about = None
+    long_about = r#"
+Calls consensus reads from CODEC (Concatenating Original Duplex for Error Correction) data. CODEC
+libraries place both strands of a source duplex molecule into a single read pair, so unlike `duplex`
+-- which combines two separately sequenced single-strand consensus reads -- the two strands arrive
+already paired: R1 carries one strand and R2 carries the other.
+
+Consequently each input read pair yields at most one consensus fragment, and the duplex evidence
+comes from comparing R1 against R2 rather than from grouping reads across the file. Prior to running
+this tool, reads must have been grouped with `group`.
+
+The consensus reads produced are unaligned fragments, so they should be aligned afterwards.
+
+Quality masking
+---------------
+
+Several options reduce base qualities in regions where the duplex evidence is weaker, rather than
+discarding the bases outright:
+
+  --single-strand-qual         caps quality in regions covered by only one strand, where there is
+                               no duplex confirmation
+  --outer-bases-qual /         caps quality for the first and last --outer-bases-length bases (5 by
+  --outer-bases-length         default) of the fragment, which are the most error-prone
+
+Duplex agreement filters
+------------------------
+
+  --min-duplex-length          minimum overlap, in bases, between the two strands for a fragment to
+                               be emitted (default 1)
+  --max-duplex-disagreement-rate  maximum fraction of overlapping positions where the strands may
+                               disagree (default 1.0, i.e. no limit)
+  --max-duplex-disagreements   maximum absolute count of such disagreements
+
+Note that `--methylation-mode` is not supported for CODEC data.
+"#
 )]
 pub struct Codec {
     /// Input/output BAM options
