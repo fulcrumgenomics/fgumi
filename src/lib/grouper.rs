@@ -394,6 +394,14 @@ impl MemoryEstimate for RawPositionGroup {
 /// Without MC tags, R1 and R2 would get different `position_key()` values and
 /// be incorrectly split.
 ///
+/// That requirement is enforced by reading [`GroupKey::has_mate_position`] on
+/// each eligible record — **not** by re-reading the `MC` tag bytes. Anything
+/// that changes how `compute_group_key_from_raw` falls back when `MC` is absent
+/// must keep that method meaning "the mate position was resolved", or this
+/// grouper silently stops rejecting MC-less input. A caller that hand-builds
+/// [`DecodedRecord`]s with keys from some other source is likewise not
+/// validated; both in-tree producers go through `compute_group_key_from_raw`.
+///
 /// By default, secondary/supplementary reads are skipped (they have UNKNOWN
 /// position keys). Use [`with_secondary_supplementary`](Self::with_secondary_supplementary)
 /// to include them — they are coalesced by `name_hash` into the group of their
@@ -405,8 +413,6 @@ pub struct RecordPositionGrouper {
     current_group_key: Option<GroupKey>,
     /// Records at the current position.
     current_records: Vec<DecodedRecord>,
-    /// Whether MC tags have been validated on paired records.
-    mc_validated: bool,
     /// Whether to include secondary and supplementary reads in groups.
     /// When true, secondary/supplementary reads (which have UNKNOWN position keys)
     /// are kept and coalesced by `name_hash` into the group of their primary read.
@@ -424,7 +430,6 @@ impl RecordPositionGrouper {
             current_position_key: None,
             current_group_key: None,
             current_records: Vec::new(),
-            mc_validated: false,
             include_secondary_supplementary: false,
         }
     }
@@ -438,13 +443,25 @@ impl RecordPositionGrouper {
         Self { include_secondary_supplementary: true, ..Self::new() }
     }
 
-    /// Validate that a paired primary record has an MC tag.
+    /// Validate that a paired primary record has a resolved mate position.
     ///
     /// Skips validation for records that are unmapped or whose mates are unmapped,
     /// since unmapped reads have no CIGAR to report in an MC tag. Every eligible
-    /// paired primary record is checked — `mc_validated` is kept only as a
-    /// "seen at least one valid MC" marker, not a short-circuit.
-    fn validate_mc_tag(&mut self, decoded: &DecodedRecord) -> io::Result<()> {
+    /// paired primary record is checked.
+    ///
+    /// The check reads [`GroupKey::has_mate_position`] rather than re-walking the
+    /// record's aux data: the Decode step already resolved the mate position from
+    /// the `MC` tag, and falls back to a single-ended key when it could not (see
+    /// `compute_group_key_from_raw`). Re-deriving that here cost a second full
+    /// aux-TLV walk plus a UTF-8 validation, per record, on this serial step.
+    ///
+    /// This makes validation agree with the value grouping actually uses. It also
+    /// makes fgumi marginally more permissive for one malformed shape: a record
+    /// carrying `MC` **twice** with a non-`Z` copy first is accepted here, where a
+    /// byte-level `find_mc_tag_in_record` scan rejected it. Duplicate aux tags
+    /// violate SAM §1.5; see `test_mc_presence_matches_key_shape` for the pinned
+    /// case.
+    fn validate_mc_tag(decoded: &DecodedRecord) -> io::Result<()> {
         use fgumi_raw_bam::RawRecordView;
 
         let raw = &decoded.data;
@@ -455,15 +472,18 @@ impl RecordPositionGrouper {
         let is_unmapped = (flg & fgumi_raw_bam::flags::UNMAPPED) != 0;
         let is_mate_unmapped = (flg & fgumi_raw_bam::flags::MATE_UNMAPPED) != 0;
 
-        if is_paired && !is_secondary && !is_supplementary && !is_unmapped && !is_mate_unmapped {
-            if fgumi_raw_bam::find_mc_tag_in_record(raw).is_none() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "RecordPositionGrouper requires MC tags on paired-end reads. \
-                     Run `fgumi zipper` to add MC tags before `fgumi group`.",
-                ));
-            }
-            self.mc_validated = true;
+        if is_paired
+            && !is_secondary
+            && !is_supplementary
+            && !is_unmapped
+            && !is_mate_unmapped
+            && !decoded.key.has_mate_position()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RecordPositionGrouper requires MC tags on paired-end reads. \
+                 Run `fgumi zipper` to add MC tags before `fgumi group`.",
+            ));
         }
 
         Ok(())
@@ -487,8 +507,8 @@ impl RecordPositionGrouper {
             return Ok(None);
         }
 
-        // Validate MC tag on first paired primary record
-        self.validate_mc_tag(&decoded)?;
+        // Validate the mate position resolved during decode (i.e. the MC tag was usable)
+        Self::validate_mc_tag(&decoded)?;
 
         let record_pos_key = decoded.key.position_key();
 
@@ -1120,6 +1140,7 @@ mod tests {
     // ========================================================================
 
     use fgumi_raw_bam::{SamBuilder as RawSamBuilder, SamTag, flags as raw_flags};
+    use rstest::rstest;
 
     /// Helper: create a `DecodedRecord` with the given `GroupKey` and flags/tags.
     fn make_decoded(
@@ -1370,49 +1391,124 @@ mod tests {
         assert_eq!(groups[0].records.len(), 1);
     }
 
-    #[test]
-    fn test_record_position_grouper_mc_validation_skips_unmapped_mate() {
-        // Paired records with unmapped mates have no MC tag — validation should skip them.
+    /// Build the raw bytes of a paired record, optionally carrying an `MC` tag.
+    ///
+    /// `prepend_non_z_mc` puts a non-`Z` `MC` entry ahead of the real one, the
+    /// one shape where the byte-level scan and decode's aux pass disagree.
+    fn build_raw(
+        flags: u16,
+        pos: i32,
+        mc: Option<&str>,
+        name: &[u8],
+        prepend_non_z_mc: bool,
+    ) -> fgumi_raw_bam::RawRecord {
         use fgumi_raw_bam::testutil::encode_op;
-        let mut grouper = RecordPositionGrouper::new();
-        let key = GroupKey::single(0, 100, 0, 0, 0, 12345);
+
         let mut b = RawSamBuilder::new();
-        b.read_name(b"read1")
+        b.read_name(name)
             .sequence(b"ACGT")
             .qualities(&[30; 4])
-            .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT | raw_flags::MATE_UNMAPPED)
+            .flags(flags)
             .ref_id(0)
-            .pos(99)
+            .pos(pos)
+            .mate_ref_id(0)
+            .mate_pos(pos + 100)
             .cigar_ops(&[encode_op(0, 4)]);
-        let decoded = DecodedRecord::from_raw_bytes(b.build(), key);
-
-        // Should NOT error even though there's no MC tag
-        let result = grouper.add_records(vec![decoded]);
-        assert!(result.is_ok());
-        assert!(!grouper.mc_validated); // Not validated — skipped due to unmapped mate
+        if prepend_non_z_mc {
+            b.add_int_tag(SamTag::MC, 5);
+        }
+        if let Some(mc_val) = mc {
+            b.add_string_tag(SamTag::MC, mc_val.as_bytes());
+        }
+        b.build()
     }
 
-    #[test]
-    fn test_record_position_grouper_mc_validation_fails_without_mc() {
-        let mut grouper = RecordPositionGrouper::new();
-        // Paired record without MC tag
-        let key = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 12345);
-        let decoded = make_decoded(key, true, true, None); // No MC tag
+    /// Build a `DecodedRecord` whose `GroupKey` is derived from its own bytes by
+    /// the real decode path, rather than hand-supplied.
+    ///
+    /// MC validation reads the key that decode produced, so a test that hands in
+    /// a key unrelated to the record's bytes proves nothing about the decode →
+    /// group contract. Every MC-validation test below builds its record this way.
+    fn decoded_via_decode(flags: u16, pos: i32, mc: Option<&str>, name: &[u8]) -> DecodedRecord {
+        use crate::read_info::LibraryIndex;
+        use crate::unified_pipeline::compute_group_key_from_raw;
 
-        let result = grouper.add_records(vec![decoded]);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("MC tags"), "Error should mention MC tags: {err_msg}");
+        let raw = build_raw(flags, pos, mc, name, false);
+        let (key, _) = compute_group_key_from_raw(&raw, &LibraryIndex::default(), None, None);
+        DecodedRecord::from_raw_bytes(raw, key)
     }
 
-    #[test]
-    fn test_record_position_grouper_mc_validation_passes_with_mc() {
+    const PRIMARY_PAIRED: u16 = raw_flags::PAIRED | raw_flags::FIRST_SEGMENT;
+
+    /// The invariant Design C rests on: for every record the grouper validates,
+    /// the byte-level MC scan and the decoded key shape agree — **except** for
+    /// duplicate `MC` entries, pinned as the last case here.
+    ///
+    /// That divergence is deliberate and documented on `validate_mc_tag`.
+    /// `find_tag_position` matches the first entry with the `MC` name whatever
+    /// its type and then rejects it for not being `Z`; `extract_aux_string_tags`
+    /// skips non-`Z` entries and finds the second copy. Duplicate aux tags
+    /// violate SAM §1.5, and the relaxation only makes validation agree with the
+    /// value grouping actually uses.
+    #[rstest]
+    #[case::mc_present(PRIMARY_PAIRED, Some("4M"), false, true)]
+    #[case::mc_absent(PRIMARY_PAIRED, None, false, false)]
+    #[case::mc_present_reverse_strands(
+        PRIMARY_PAIRED | raw_flags::REVERSE | raw_flags::MATE_REVERSE,
+        Some("4M"),
+        false,
+        true
+    )]
+    #[case::duplicate_mc_non_z_first(PRIMARY_PAIRED, Some("4M"), true, false)]
+    fn test_mc_presence_matches_key_shape(
+        #[case] flags: u16,
+        #[case] mc: Option<&str>,
+        #[case] prepend_non_z_mc: bool,
+        #[case] byte_scan_finds_mc: bool,
+    ) {
+        use crate::read_info::LibraryIndex;
+        use crate::unified_pipeline::compute_group_key_from_raw;
+
+        let raw = build_raw(flags, 99, mc, b"read1", prepend_non_z_mc);
+        let (key, _) = compute_group_key_from_raw(&raw, &LibraryIndex::default(), None, None);
+
+        assert_eq!(
+            fgumi_raw_bam::find_mc_tag_in_record(&raw).is_some(),
+            byte_scan_finds_mc,
+            "byte-level MC scan disagreed with the case table"
+        );
+        assert_eq!(
+            key.has_mate_position(),
+            mc.is_some(),
+            "decode must resolve a mate position exactly when it can read an MC tag"
+        );
+    }
+
+    #[rstest]
+    // Paired primary, mate mapped, MC present → validates.
+    #[case::paired_with_mc(PRIMARY_PAIRED, Some("4M"), true)]
+    // Paired primary, mate mapped, no MC → rejected. This is the whole point.
+    #[case::paired_without_mc(PRIMARY_PAIRED, None, false)]
+    // Mate unmapped: no CIGAR exists to report, so MC absence is expected.
+    #[case::mate_unmapped(PRIMARY_PAIRED | raw_flags::MATE_UNMAPPED, None, true)]
+    // Read itself unmapped — excluded from the requirement.
+    #[case::self_unmapped(PRIMARY_PAIRED | raw_flags::UNMAPPED, None, true)]
+    // Unpaired reads have no mate to describe.
+    #[case::unpaired(0, None, true)]
+    fn test_record_position_grouper_mc_validation(
+        #[case] flags: u16,
+        #[case] mc: Option<&str>,
+        #[case] expected_ok: bool,
+    ) {
         let mut grouper = RecordPositionGrouper::new();
-        let key = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 12345);
-        let decoded = make_decoded(key, true, true, Some("4M"));
+        let decoded = decoded_via_decode(flags, 99, mc, b"read1");
 
         let result = grouper.add_records(vec![decoded]);
-        assert!(result.is_ok());
+        assert_eq!(result.is_ok(), expected_ok);
+        if !expected_ok {
+            let err_msg = result.unwrap_err().to_string();
+            assert!(err_msg.contains("MC tags"), "Error should mention MC tags: {err_msg}");
+        }
     }
 
     #[test]
@@ -1420,29 +1516,35 @@ mod tests {
         // Regression: after a record with a valid MC tag, a later paired primary
         // missing MC must still fail validation (no short-circuit).
         let mut grouper = RecordPositionGrouper::new();
-        let key_ok = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 11111);
-        let ok_record = make_decoded(key_ok, true, true, Some("4M"));
+        let ok_record = decoded_via_decode(PRIMARY_PAIRED, 99, Some("4M"), b"readA");
         grouper.add_records(vec![ok_record]).expect("first record with MC should validate");
-        assert!(grouper.mc_validated);
 
-        let key_bad = GroupKey::paired(0, 300, 0, 0, 400, 1, 0, 0, 22222);
-        let bad_record = make_decoded(key_bad, true, true, None);
+        let bad_record = decoded_via_decode(PRIMARY_PAIRED, 299, None, b"readB");
         let result = grouper.add_records(vec![bad_record]);
         assert!(result.is_err(), "later paired primary missing MC must fail");
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("MC tags"), "Error should mention MC tags: {err_msg}");
     }
 
-    #[test]
-    fn test_record_position_grouper_mc_validation_skips_unpaired() {
-        // Unpaired records should not trigger MC validation
-        let mut grouper = RecordPositionGrouper::new();
-        let key = GroupKey::single(0, 100, 0, 0, 0, 12345);
-        let decoded = make_decoded(key, false, false, None); // Unpaired, no MC tag
+    /// `fgumi dedup` builds this grouper with `with_secondary_supplementary()`,
+    /// which disables the `UNKNOWN_REF` early return in `process_record`. Paired
+    /// secondary/supplementary reads therefore reach validation carrying a
+    /// default-shaped key, and must not be rejected for lacking an MC tag.
+    #[rstest]
+    #[case::secondary(PRIMARY_PAIRED | raw_flags::SECONDARY)]
+    #[case::supplementary(PRIMARY_PAIRED | raw_flags::SUPPLEMENTARY)]
+    fn test_record_position_grouper_dedup_mode_allows_paired_secondary_without_mc(
+        #[case] flags: u16,
+    ) {
+        let mut grouper = RecordPositionGrouper::with_secondary_supplementary();
+        let decoded = decoded_via_decode(flags, 99, None, b"read1");
+        assert!(
+            !decoded.key.has_mate_position(),
+            "precondition: a secondary read without `tc` gets a single-ended key"
+        );
 
         let result = grouper.add_records(vec![decoded]);
-        assert!(result.is_ok());
-        assert!(!grouper.mc_validated); // Should not be validated for unpaired
+        assert!(result.is_ok(), "dedup must accept paired secondary reads without MC tags");
     }
 
     #[test]

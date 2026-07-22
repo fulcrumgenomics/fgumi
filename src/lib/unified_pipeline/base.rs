@@ -1354,6 +1354,12 @@ impl GroupKey {
     /// Create a `GroupKey` for a paired-end read with mate info.
     ///
     /// Positions are automatically normalized so the lower position comes first.
+    ///
+    /// Both strands must be `0` (forward) or `1` (reverse). Every caller derives
+    /// them from a boolean — either a flag bit or a `!= 0` test on a `tc` field —
+    /// so `UNKNOWN_STRAND` can never reach `strand2` through this constructor.
+    /// [`GroupKey::has_mate_position`] depends on that, so the invariant is
+    /// asserted here rather than left to convention.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn paired(
@@ -1367,6 +1373,12 @@ impl GroupKey {
         cell_hash: u64,
         name_hash: u64,
     ) -> Self {
+        debug_assert!(
+            strand <= 1 && mate_strand <= 1,
+            "GroupKey::paired requires boolean strands (got {strand}, {mate_strand}); \
+             UNKNOWN_STRAND in a paired key would break GroupKey::has_mate_position"
+        );
+
         // Normalize: put lower position first (matching ReadInfo behavior)
         let (ref_id1, pos1, strand1, ref_id2, pos2, strand2) =
             if (ref_id, pos, strand) <= (mate_ref_id, mate_pos, mate_strand) {
@@ -1399,6 +1411,25 @@ impl GroupKey {
             cell_hash,
             name_hash,
         }
+    }
+
+    /// Returns whether this key carries a resolved mate position.
+    ///
+    /// True for keys built by [`GroupKey::paired`], false for
+    /// [`GroupKey::single`] and [`GroupKey::default`].
+    ///
+    /// `strand2` is the discriminator because [`GroupKey::paired`] always
+    /// receives boolean strands (asserted there), so only the single-ended
+    /// constructors can produce [`GroupKey::UNKNOWN_STRAND`]. `ref_id2` and
+    /// `pos2` are weaker: `i32::MAX` is a legal-looking coordinate.
+    ///
+    /// Decode resolves the mate position from the `MC` tag, falling back to a
+    /// single-ended key when it is absent (see `compute_group_key_from_raw`).
+    /// `RecordPositionGrouper` therefore reads this instead of re-walking the
+    /// record's aux data.
+    #[must_use]
+    pub fn has_mate_position(&self) -> bool {
+        self.strand2 != Self::UNKNOWN_STRAND
     }
 
     /// Returns the position-only key for grouping by genomic position.
@@ -5198,6 +5229,8 @@ pub fn shared_try_step_write_new<S: WritePipelineState>(state: &S) -> StepResult
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     #[test]
@@ -5474,6 +5507,40 @@ mod tests {
         assert_eq!(key.ref_id2, 5);
         assert_eq!(key.pos2, 500);
         assert_eq!(key.strand2, 1);
+    }
+
+    /// `has_mate_position` must key on `strand2` alone.
+    ///
+    /// The byte-derived keys built by `GroupKey::single` set all three sentinels
+    /// together, so a `ref_id2`-based implementation is indistinguishable from a
+    /// `strand2`-based one on any real record. The two mixed-sentinel struct
+    /// literals below are therefore the only cases that can tell them apart, and
+    /// they exist to make the wrong implementations fail.
+    #[rstest]
+    // Real shapes, both constructors.
+    #[case::paired_forward_forward(GroupKey::paired(0, 100, 0, 0, 200, 0, 0, 0, 1), true)]
+    #[case::paired_reverse_reverse(GroupKey::paired(0, 100, 1, 0, 200, 1, 0, 0, 1), true)]
+    #[case::single_ended(GroupKey::single(0, 100, 0, 0, 0, 1), false)]
+    #[case::default_key(GroupKey::default(), false)]
+    // Mixed sentinels: resolved positions but an unknown strand2 → NOT a mate
+    // position. Kills an implementation that tests `ref_id2 != UNKNOWN_REF`.
+    #[case::resolved_positions_unknown_strand(
+        GroupKey { ref_id2: 0, pos2: 0, strand2: GroupKey::UNKNOWN_STRAND, ..GroupKey::default() },
+        false
+    )]
+    // Unknown positions but a real strand2 → IS a mate position. Kills an
+    // implementation that tests `strand2 != 0`.
+    #[case::unknown_positions_forward_strand(
+        GroupKey {
+            ref_id2: GroupKey::UNKNOWN_REF,
+            pos2: GroupKey::UNKNOWN_POS,
+            strand2: 0,
+            ..GroupKey::default()
+        },
+        true
+    )]
+    fn test_group_key_has_mate_position(#[case] key: GroupKey, #[case] expected: bool) {
+        assert_eq!(key.has_mate_position(), expected);
     }
 
     #[test]
