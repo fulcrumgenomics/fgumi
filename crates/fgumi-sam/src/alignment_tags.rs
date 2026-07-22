@@ -238,9 +238,12 @@ use fgumi_raw_bam::{self, RawRecordView, RawTagsEditor};
 /// Regenerates NM, UQ, and MD tags for a raw BAM record after base masking.
 ///
 /// For unmapped reads, the tags are removed. For mapped reads, the tags are
-/// recalculated based on the alignment and reference.
+/// recalculated based on the alignment and reference. A record flagged mapped
+/// but carrying a negative reference id is malformed and has nothing to
+/// recompute against, so its tags are removed as well rather than left stale.
 ///
-/// Returns `Ok(true)` if tags were regenerated, `Ok(false)` for unmapped reads.
+/// Returns `Ok(true)` if tags were regenerated, `Ok(false)` if they were removed
+/// (an unmapped read, or a mapped read with no reference id).
 ///
 /// # Errors
 ///
@@ -277,6 +280,16 @@ pub fn regenerate_alignment_tags_raw(
     // Get reference sequence ID and look up name in header
     let ref_seq_id = RawRecordView::new(record).ref_id();
     if ref_seq_id < 0 {
+        // A record flagged mapped but carrying no reference is malformed: there
+        // is nothing to recompute against. Strip the alignment tags rather than
+        // leaving whatever stale NM/UQ/MD the record arrived with, matching the
+        // unmapped branch above and fgbio's `regenerateNmUqMdTags`. Failing
+        // closed here means a downstream consumer sees no tag instead of a
+        // wrong one.
+        let mut editor = RawTagsEditor::from_vec(record);
+        editor.remove(SamTag::NM);
+        editor.remove(SamTag::UQ);
+        editor.remove(SamTag::MD);
         return Ok(false);
     }
     let ref_seqs = header.reference_sequences();
@@ -906,6 +919,57 @@ mod tests {
         assert_eq!(record.data().get(&nm_tag()), Some(&Value::from(2)));
         assert_eq!(record.data().get(&uq_tag()), Some(&Value::from(25)));
         assert_eq!(record.data().get(&md_tag()), Some(&Value::from("2G1A1".to_string())));
+
+        Ok(())
+    }
+
+    /// A record flagged mapped but carrying `ref_id < 0` is malformed: there is
+    /// no reference to recompute against. It must not keep whatever stale
+    /// NM/UQ/MD it arrived with, since a downstream consumer cannot tell a
+    /// stale tag from a correct one. Failing closed matches both the unmapped
+    /// branch and fgbio's `regenerateNmUqMdTags`.
+    #[test]
+    fn test_regenerate_alignment_tags_raw_strips_stale_tags_on_negative_ref_id() -> Result<()> {
+        let (_fasta, reference) = create_test_reference()?;
+        let header = create_test_header();
+        let record = create_mapped_record("ACGTACGT", &[30, 30, 30, 30, 30, 30, 30, 30], "8M", 1);
+        let mut raw = encode_record_buf_to_raw(&header, &record)?;
+
+        // Plant stale alignment tags, then blank the reference id while leaving
+        // the record flagged as mapped.
+        {
+            let mut editor = RawTagsEditor::from_vec(&mut raw);
+            editor.update_int(SamTag::NM, 99);
+            editor.update_int(SamTag::UQ, 12_345);
+            editor.update_string(SamTag::MD, b"8");
+        }
+        assert!(
+            fgumi_raw_bam::find_int_tag(fgumi_raw_bam::aux_data_slice(&raw), SamTag::NM).is_some(),
+            "precondition: the stale NM tag should be present before the call",
+        );
+
+        // These bytes exclude the block_size prefix, so refID sits at 0..4.
+        raw[0..4].copy_from_slice(&(-1i32).to_le_bytes());
+        assert!(
+            !RawRecordView::new(&raw).is_unmapped(),
+            "precondition: the record must still be flagged mapped, or the \
+             unmapped branch would handle it instead",
+        );
+
+        let changed = regenerate_alignment_tags_raw(&mut raw, &header, &reference)?;
+        assert!(!changed, "no tags can be recomputed without a reference");
+        assert!(
+            !RawRecordView::new(&raw).is_unmapped(),
+            "the record must remain flagged mapped after tag cleanup",
+        );
+
+        let aux = fgumi_raw_bam::aux_data_slice(&raw);
+        for tag in [SamTag::NM, SamTag::UQ, SamTag::MD] {
+            assert!(
+                fgumi_raw_bam::find_tag_type(aux, tag).is_none(),
+                "{tag:?} must be stripped rather than left stale on a negative ref_id",
+            );
+        }
 
         Ok(())
     }
