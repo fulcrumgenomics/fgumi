@@ -669,10 +669,9 @@ different cells are never grouped together, even if they share a UMI sequence an
 The cell barcode is read from the standard `CB` tag. No correction or
 error-handling is performed on cell barcodes; they must be corrected upstream.
 
-Multi-threaded operation is supported via --threads N, which spawns N pipeline threads
-allocated based on the command's workload profile to optimize performance. Note this differs
-from fgbio, where --threads sizes only the pool of UMI-comparison worker threads; in fgumi
---threads sizes the whole read/assign/write pipeline.
+Multi-threaded operation is supported via --threads N, which spawns N pipeline threads.
+Note this differs from fgbio, where --threads sizes only the pool of UMI-comparison worker
+threads; in fgumi --threads sizes the whole read/assign/write pipeline.
 
 Example: --threads 8 spawns 8 pipeline threads (2 reader, 4 workers, 2 writer)
 

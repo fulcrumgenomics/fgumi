@@ -37,7 +37,7 @@ fgumi group --input in.bam --output out.bam --strategy adjacency
 fgumi group --input in.bam --output out.bam --strategy adjacency --threads 8
 ```
 
-Thread allocation is automatically optimized per-command based on workload profiling.
+`--threads` sizes each command's pipeline directly; there is no automatic per-command tuning, so pick a value that suits the machine and the rest of the pipeline.
 
 ### Memory
 

@@ -57,7 +57,7 @@ cargo build --release
 | `extract` | Extract UMIs from FASTQ files |
 | `correct` | Correct UMIs based on sequence similarity |
 | `fastq` | Convert BAM to FASTQ format |
-| `zipper` | Restore original FASTQ from unaligned BAM |
+| `zipper` | Merge alignments back onto the unmapped BAM, restoring its tags |
 | `sort` | Sort BAM by coordinate/queryname/template |
 | `group` | Group reads by UMI |
 | `dedup` | Mark/remove UMI-aware duplicates |
