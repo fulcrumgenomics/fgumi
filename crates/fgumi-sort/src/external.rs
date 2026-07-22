@@ -1116,6 +1116,29 @@ impl<K: RawSortKey + Default + 'static> ChunkSource<K> {
     }
 }
 
+/// Bytes of `source`'s current record to hand to the merge writer.
+///
+/// For `PoolDisk` sources this borrows directly from the pooled decompressed
+/// block when the record fit in one block (the zero-copy fast path), falling
+/// back to the source's scratch buffer for a record that straddled a block
+/// boundary. All other source variants borrow from their own backing store via
+/// [`ChunkSource::current_bytes`] and ignore `consumer`.
+///
+/// `consumer` must be `Some` whenever `source` is `PoolDisk`; the merge loops
+/// uphold this (a `PoolDisk` source only exists when Phase 2 is active).
+#[inline]
+fn winner_record_bytes<'a, K: RawSortKey + Default + 'static>(
+    source: &'a ChunkSource<K>,
+    consumer: Option<&'a MainThreadChunkConsumer<K>>,
+) -> &'a [u8] {
+    match source {
+        ChunkSource::PoolDisk { source_id, scratch } => {
+            consumer.and_then(|c| c.current_record_bytes(*source_id)).unwrap_or(scratch.as_slice())
+        }
+        other => other.current_bytes(),
+    }
+}
+
 // ============================================================================
 // MainThreadChunkConsumer — pool-integrated merge reader
 // ============================================================================
@@ -1132,6 +1155,21 @@ impl<K: RawSortKey + Default + 'static> ChunkSource<K> {
 // buffer reaches `PHASE2_DECOMP_CAP`, workers stop pulling new raw blocks for
 // that file (with a deadlock-free escape hatch for the gap-filling serial).
 
+/// Where the current record's bytes live for zero-copy presentation to the
+/// merge loop.
+///
+/// The common case (`Borrowed`) is a record that lies contiguously inside the
+/// source's current decompressed block, so it can be handed to the writer as a
+/// slice with no intermediate copy. A record that straddles a block boundary is
+/// reassembled into the source's scratch buffer (`Scratch`) as before.
+#[derive(Clone, Copy)]
+enum CurRecord {
+    /// Record occupies `current_buf[start..end]` — borrow it directly.
+    Borrowed { start: usize, end: usize },
+    /// Record was reassembled into the `ChunkSource`'s scratch buffer.
+    Scratch,
+}
+
 /// Per-source byte-stream parser state owned by the main thread.
 ///
 /// As blocks are pulled from `Phase2FileState.decompressed`, the bytes are
@@ -1141,11 +1179,13 @@ struct SourceParserState {
     current_buf: Vec<u8>,
     /// Read position within `current_buf`.
     current_pos: usize,
+    /// Location of the most recently parsed record's bytes.
+    cur_record: CurRecord,
 }
 
 impl SourceParserState {
     fn new() -> Self {
-        Self { current_buf: Vec::new(), current_pos: 0 }
+        Self { current_buf: Vec::new(), current_pos: 0, cur_record: CurRecord::Scratch }
     }
 
     fn remaining(&self) -> usize {
@@ -1218,6 +1258,23 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
         self.parse_next_record(source_id, buf)
     }
 
+    /// Bytes of `source_id`'s current record when they were borrowed directly
+    /// from the decompressed block (the zero-copy fast path). Returns `None`
+    /// when the record straddled a block boundary and was reassembled into the
+    /// source's scratch buffer, in which case the caller reads it from there.
+    ///
+    /// The returned slice is valid until the next `advance` of this source
+    /// (which is what may replace `current_buf`); the merge loop always writes
+    /// the current record before advancing its source, so this holds.
+    #[inline]
+    fn current_record_bytes(&self, source_id: usize) -> Option<&[u8]> {
+        let st = &self.parser_state[source_id];
+        match st.cur_record {
+            CurRecord::Borrowed { start, end } => Some(&st.current_buf[start..end]),
+            CurRecord::Scratch => None,
+        }
+    }
+
     /// Pull the next decompressed block for `source_id` from the per-file
     /// reorder buffer, blocking the main thread (`std::thread::park`) until
     /// either a block becomes available, the source drains, or a worker error
@@ -1285,11 +1342,31 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
             }
             let len = u32::from_le_bytes(len_buf) as usize;
 
+            // Fast path: the whole record is contiguous in the current block, so
+            // borrow it in place rather than copying it into `buf` (the source's
+            // scratch). A record only straddles a block boundary right at the
+            // ~64KB block edges, so this hits for the vast majority of records
+            // and removes one full-record memcpy per record from the merge.
+            if self.parser_state[source_id].remaining() >= len {
+                let start = self.parser_state[source_id].current_pos;
+                let end = start + len;
+                {
+                    let st = &mut self.parser_state[source_id];
+                    st.current_pos = end;
+                    st.cur_record = CurRecord::Borrowed { start, end };
+                }
+                let key =
+                    K::extract_from_record(&self.parser_state[source_id].current_buf[start..end]);
+                return Ok(Some(key));
+            }
+
+            // Slow path: record spans a block boundary — reassemble into scratch.
             buf.clear();
             buf.resize(len, 0);
             if !self.read_exact_from_source(source_id, buf)? {
                 return Err(anyhow::anyhow!("truncated record in chunk source {source_id}"));
             }
+            self.parser_state[source_id].cur_record = CurRecord::Scratch;
             let key = K::extract_from_record(buf);
             Ok(Some(key))
         } else {
@@ -1307,6 +1384,9 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
             if !self.read_exact_from_source(source_id, buf)? {
                 return Err(anyhow::anyhow!("truncated record in chunk source {source_id}"));
             }
+            // Keyed records are always presented from scratch — only the
+            // EMBEDDED coordinate/template path is zero-copy for now.
+            self.parser_state[source_id].cur_record = CurRecord::Scratch;
             Ok(Some(key))
         }
     }
@@ -1548,6 +1628,10 @@ struct Phase2Guard<'a, K: RawSortKey + 'static> {
 impl<K: RawSortKey + 'static> Phase2Guard<'_, K> {
     fn consumer_mut(&mut self) -> Option<&mut MainThreadChunkConsumer<K>> {
         self.consumer.as_mut()
+    }
+
+    fn consumer_ref(&self) -> Option<&MainThreadChunkConsumer<K>> {
+        self.consumer.as_ref()
     }
 
     fn deactivate(&mut self) {
@@ -3420,12 +3504,13 @@ impl RawExternalSorter {
             let src_idx = source_map[winner];
             let sample_this = debug_timing && records_merged.is_multiple_of(merge_sample_interval);
 
+            let record_bytes = winner_record_bytes(&sources[src_idx], guard.consumer_ref());
             if sample_this {
                 let t0 = Instant::now();
-                writer.write_raw_record(sources[src_idx].current_bytes())?;
+                writer.write_raw_record(record_bytes)?;
                 merge_write_secs += t0.elapsed().as_secs_f64();
             } else {
-                writer.write_raw_record(sources[src_idx].current_bytes())?;
+                writer.write_raw_record(record_bytes)?;
             }
 
             records_merged += 1;
@@ -3576,7 +3661,8 @@ impl RawExternalSorter {
         while tree.winner_is_active() {
             let winner = tree.winner();
             let src_idx = source_map[winner];
-            writer.write_raw_record(sources[src_idx].current_bytes())?;
+            let record_bytes = winner_record_bytes(&sources[src_idx], guard.consumer_ref());
+            writer.write_raw_record(record_bytes)?;
             merge_progress.log_if_needed(1);
 
             if let Some(key) = sources[src_idx].advance(guard.consumer_mut())? {
@@ -5262,6 +5348,100 @@ mod tests {
         let expected = (num_pairs * 2) as u64;
         let observed = count_bam_records(&output);
         assert_eq!(observed, expected, "sort lost data");
+    }
+
+    /// A record larger than one BGZF block must survive a spill followed by a
+    /// pool-integrated merge.
+    ///
+    /// When records are spilled, the writer pre-flushes so a normal record
+    /// never straddles a BGZF block boundary — only an oversized record
+    /// (written via `write_chunked`) spans blocks. On merge that oversized
+    /// record is the one case that cannot be borrowed in place from a single
+    /// decompressed block, so it exercises the reassemble-into-scratch slow
+    /// path that the zero-copy fast path falls back to. This guards that
+    /// fast/slow split: the fast path handles the ~200 normal reads, the slow
+    /// path the one oversized read, and every byte must round-trip.
+    #[rstest::rstest]
+    #[case::coordinate(SortOrder::Coordinate)]
+    #[case::template_coordinate(SortOrder::TemplateCoordinate)]
+    fn test_oversized_record_survives_spill_and_pool_merge(#[case] sort_order: SortOrder) {
+        use fgumi_sam::SamBuilder;
+
+        // Well over one ~64 KB BGZF block; default refs are 200 MB so a mapped
+        // read this long is still in-bounds. The bases are position-dependent
+        // rather than a uniform run so they can serve as their own oracle: a
+        // scratch reassembly that shuffled or duplicated bytes within the
+        // record would preserve the length (and round-trip a run of `A`s) but
+        // must not survive an exact base-by-base comparison below.
+        let big_len = 70_000usize;
+        let big_seq: String = {
+            let mut state = 0x2545_f491_4f6c_dd1d_u64;
+            (0..big_len)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    ['A', 'C', 'G', 'T'][((state >> 33) & 0b11) as usize]
+                })
+                .collect()
+        };
+
+        let mut builder = SamBuilder::new();
+        for i in 0..100 {
+            let _ = builder.add_frag().name(&format!("n{i:04}")).contig(0).start(i + 1).build();
+        }
+        let _ = builder.add_frag().name("oversized").contig(0).start(50).bases(&big_seq).build();
+        for i in 0..100 {
+            let _ = builder.add_frag().name(&format!("m{i:04}")).contig(0).start(i + 1).build();
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("input.bam");
+        let output = dir.path().join("output.bam");
+        builder.write_bam(&input).expect("write_bam");
+
+        // Memory limit below the oversized record forces it into its own spill
+        // chunk (so it is read back through the PoolDisk merge, not from memory);
+        // two threads give a genuine multi-source merge.
+        let stats = RawExternalSorter::new(sort_order)
+            .memory_limit(64 * 1024)
+            .threads(2)
+            .spill_codec(crate::codec::SpillCodec::Bgzf)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&input, &output)
+            .expect("sort should succeed");
+        assert!(
+            stats.chunks_written > 0,
+            "test must spill to disk so the oversized record is read back through the \
+             PoolDisk merge (slow path); got chunks_written = 0"
+        );
+
+        let mut reader =
+            noodles::bam::io::reader::Builder.build_from_path(&output).expect("open output");
+        let _header = reader.read_header().expect("read header");
+        let mut count = 0u64;
+        let mut oversized_bases: Option<Vec<u8>> = None;
+        for result in reader.records() {
+            let record = result.expect("read record");
+            let name: &[u8] = record.name().expect("read name").as_ref();
+            if name == b"oversized" {
+                oversized_bases = Some(record.sequence().iter().collect());
+            }
+            count += 1;
+        }
+        assert_eq!(count, 201, "spill + pool merge lost records");
+        let oversized_bases = oversized_bases.expect("oversized read must survive the merge");
+        assert_eq!(
+            oversized_bases.len(),
+            big_len,
+            "oversized read lost bases across the spill + pool merge"
+        );
+        assert_eq!(
+            oversized_bases,
+            big_seq.as_bytes(),
+            "oversized read's bases were corrupted across the spill + pool merge"
+        );
     }
 
     // ========================================================================
