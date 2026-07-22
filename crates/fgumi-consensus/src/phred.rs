@@ -15,6 +15,14 @@ use std::f64::consts::LN_10;
 /// Natural log of 2, used as threshold in log1mexp (Equation 7)
 const LN_TWO: f64 = std::f64::consts::LN_2; // ln(2) ≈ 0.693
 
+/// `log1pexp(0)`, the value [`ln_sum_exp`] adds when both operands are equal.
+///
+/// `log1pexp(0) = ln_1p(exp(0)) = ln_1p(1) = ln 2`. It is spelled as a constant
+/// because `f64::ln_1p` is not a `const fn`, and pinned to `log1pexp(0.0)` bit for
+/// bit by `test_log1pexp_zero_constant_is_bit_exact` — that test is what makes the
+/// short-circuit safe on a platform whose `ln_1p` is not correctly rounded.
+const LOG1PEXP_ZERO: f64 = LN_TWO;
+
 /// Natural log of 4/3, used in probabilityOfErrorTwoTrials
 const LN_FOUR_THIRDS: f64 = 0.287_682_072_451_780_9; // ln(4/3)
 
@@ -275,6 +283,15 @@ pub fn ln_error_prob_two_trials(ln_p1: LogProbability, ln_p2: LogProbability) ->
 /// This is essential for adding probabilities while working in log-space, avoiding
 /// numerical underflow that would occur when converting back to linear space.
 ///
+/// Equal operands short-circuit to `ln_a + ln 2`, which is what the general
+/// expression evaluates to when `ln_b - ln_a` is zero.
+///
+/// # Divergence from fgbio
+/// fgbio's `or` computes `inf - inf = NaN` for two positive-infinite operands and
+/// returns `NaN`; the short-circuit returns `+inf`, the correct sum. No fgumi
+/// caller can reach it — likelihoods are `<= 0`, `-inf`, or `NaN` — so this cannot
+/// affect consensus output.
+///
 /// # Examples
 /// ```
 /// use fgumi_consensus::phred::ln_sum_exp;
@@ -294,6 +311,22 @@ pub fn ln_sum_exp(ln_a: LogProbability, ln_b: LogProbability) -> LogProbability 
     }
     if ln_b.is_infinite() && ln_b < 0.0 {
         return ln_a;
+    }
+
+    // Equal operands are common: every lane of a never-observed base carries the
+    // identical value by construction, so `ln_sum_exp_array` folds equal pairs
+    // constantly. `log1pexp(0)` is `ln 2`, so the whole transcendental call
+    // collapses to one addition. Bit-identical to the general path below, which
+    // would compute `ln_a + log1pexp(±0.0)` — see `LOG1PEXP_ZERO`.
+    #[expect(
+        clippy::float_cmp,
+        reason = "exact equality is the precondition being exploited: only when the two \
+                  operands are bitwise equal is `ln_b - ln_a` exactly ±0.0, making \
+                  `log1pexp` return `LOG1PEXP_ZERO`. An approximate comparison would \
+                  change results."
+    )]
+    if ln_a == ln_b {
+        return ln_a + LOG1PEXP_ZERO;
     }
 
     // Match fgbio's `or` function: ensure ln_a <= ln_b, then use log1pexp
@@ -836,5 +869,155 @@ mod tests {
         assert_eq!(MAX_PHRED, 93);
         assert_eq!(NO_CALL_BASE, b'N');
         assert_eq!(NO_CALL_BASE_LOWER, b'n');
+    }
+
+    /// `LOG1PEXP_ZERO` stands in for `log1pexp(0.0)`, so it must equal it *bit for
+    /// bit* — an equal-but-one-ULP-off constant would silently shift every
+    /// equal-lane consensus quality. `log1pexp(0.0)` is `(1.0f64).ln_1p()`, which is
+    /// `ln 2`; this pins that the platform's `ln_1p` agrees with the constant rather
+    /// than merely coming close.
+    #[test]
+    fn test_log1pexp_zero_constant_is_bit_exact() {
+        assert_eq!(
+            LOG1PEXP_ZERO.to_bits(),
+            log1pexp(0.0).to_bits(),
+            "LOG1PEXP_ZERO ({LOG1PEXP_ZERO}) is not bitwise equal to log1pexp(0.0) ({})",
+            log1pexp(0.0)
+        );
+    }
+
+    /// For equal inputs the short-circuit must return exactly what the general path
+    /// would have computed. The reference expression is written out literally rather
+    /// than calling `ln_sum_exp`, so the test cannot be satisfied by the very
+    /// short-circuit it is checking.
+    #[rstest]
+    #[case::zero(0.0)]
+    #[case::negative_zero(-0.0)]
+    #[case::typical_log_probability(-2.5)]
+    #[case::small_magnitude(-1e-8)]
+    #[case::large_negative(-700.0)]
+    #[case::positive(3.25)]
+    #[case::subnormal(5e-324)]
+    #[case::max_finite(f64::MAX)]
+    #[case::min_finite(f64::MIN)]
+    fn test_ln_sum_exp_equal_inputs_matches_the_general_path(#[case] ln_a: f64) {
+        let ln_b = ln_a;
+        let expected = ln_a + log1pexp(ln_b - ln_a);
+
+        assert_eq!(
+            ln_sum_exp(ln_a, ln_b).to_bits(),
+            expected.to_bits(),
+            "ln_sum_exp({ln_a}, {ln_b}) diverged from the general path"
+        );
+    }
+
+    /// Programmatic fgbio baseline: `ln_sum_exp` must be bit-for-bit identical to
+    /// fgbio's `NumericTypes.LogProbability.or`.
+    ///
+    /// `ln_sum_exp` is a direct port of that function; the two closures below
+    /// transcribe fgbio's Scala `or` and its private `log1pexp`
+    /// (`fgbio/src/main/scala/com/fulcrumgenomics/util/NumericTypes.scala`) verbatim,
+    /// so the oracle is fgbio's *definition* rather than fgumi's own general path
+    /// (which `test_ln_sum_exp_equal_inputs_matches_the_general_path` already pins).
+    /// Every reachable consensus likelihood is a log-probability (`<= 0`, possibly
+    /// `-inf`), and the equal-lane fold is exactly what this PR short-circuits;
+    /// both must match fgbio bit-for-bit. Cases cover equal lanes (ordered and
+    /// signed-zero), unequal lanes in both operand orders, and `-inf` absorption.
+    ///
+    /// The one intentional divergence — `+inf/+inf`, where fgbio computes
+    /// `inf + log1pexp(NaN) = NaN` but the short-circuit returns `+inf` — is
+    /// unreachable (likelihoods are never `+inf`) and is pinned separately by
+    /// `test_ln_sum_exp_positive_infinity_returns_infinity`, so it is excluded here.
+    #[rstest]
+    #[case::equal_zero(0.0, 0.0)]
+    #[case::equal_typical(-2.5, -2.5)]
+    #[case::equal_large_negative(-700.0, -700.0)]
+    #[case::equal_subnormal(-5e-324, -5e-324)]
+    #[case::unequal_ordered(-3.0, -1.0)]
+    #[case::unequal_reversed(-1.0, -3.0)]
+    #[case::unequal_tiny_gap(-2.5, -2.500_000_1)]
+    #[case::unequal_wide_gap(-0.5, -650.0)]
+    #[case::a_neg_inf(f64::NEG_INFINITY, -3.0)]
+    #[case::b_neg_inf(-3.0, f64::NEG_INFINITY)]
+    #[case::both_neg_inf(f64::NEG_INFINITY, f64::NEG_INFINITY)]
+    fn test_ln_sum_exp_matches_fgbio_or_baseline(#[case] ln_a: f64, #[case] ln_b: f64) {
+        // fgbio NumericTypes.LogProbability.log1pexp, transcribed from the Scala source.
+        fn fgbio_log1pexp(value: f64) -> f64 {
+            if value <= -37.0 {
+                value.exp()
+            } else if value <= 18.0 {
+                value.exp().ln_1p()
+            } else if value <= 33.3 {
+                value + (-value).exp()
+            } else {
+                value
+            }
+        }
+
+        // fgbio NumericTypes.LogProbability.or, transcribed from the Scala source
+        // (`a.isNegInfinity`/`b.isNegInfinity` guards, then order so `a <= b`, then
+        // `a + log1pexp(b - a)`).
+        fn fgbio_or(a: f64, b: f64) -> f64 {
+            if a.is_infinite() && a < 0.0 {
+                b
+            } else if b.is_infinite() && b < 0.0 {
+                a
+            } else if b < a {
+                fgbio_or(b, a)
+            } else {
+                a + fgbio_log1pexp(b - a)
+            }
+        }
+
+        assert_eq!(
+            ln_sum_exp(ln_a, ln_b).to_bits(),
+            fgbio_or(ln_a, ln_b).to_bits(),
+            "ln_sum_exp({ln_a}, {ln_b}) diverged from the fgbio LogProbability.or baseline"
+        );
+    }
+
+    /// Mixed signed zeros compare equal, so the short-circuit fires; both orderings
+    /// must still agree with the general path, whose `ln_b - ln_a` is `+0.0` one way
+    /// and `-0.0` the other.
+    #[rstest]
+    #[case::positive_then_negative(0.0, -0.0)]
+    #[case::negative_then_positive(-0.0, 0.0)]
+    fn test_ln_sum_exp_signed_zeros(#[case] ln_a: f64, #[case] ln_b: f64) {
+        let expected = ln_a + log1pexp(ln_b - ln_a);
+
+        assert_eq!(ln_sum_exp(ln_a, ln_b).to_bits(), expected.to_bits());
+    }
+
+    /// The negative-infinity guards run before the equality short-circuit, so an
+    /// absent operand still absorbs rather than contributing `ln 2`.
+    #[rstest]
+    #[case::both_neg_inf(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY)]
+    #[case::a_neg_inf(f64::NEG_INFINITY, -3.0, -3.0)]
+    #[case::b_neg_inf(-3.0, f64::NEG_INFINITY, -3.0)]
+    fn test_ln_sum_exp_absorbs_negative_infinity(
+        #[case] ln_a: f64,
+        #[case] ln_b: f64,
+        #[case] expected: f64,
+    ) {
+        assert_eq!(ln_sum_exp(ln_a, ln_b).to_bits(), expected.to_bits());
+    }
+
+    /// Two `+inf` operands are the one input whose result this change *does* alter:
+    /// the old path computed `inf - inf = NaN` and returned `NaN`, whereas the
+    /// short-circuit returns `+inf`. `+inf` is the correct sum of two infinite
+    /// probabilities, and no fgumi caller can reach it (likelihoods are `<= 0`,
+    /// `-inf`, or `NaN`), but `ln_sum_exp` is public, so pin the new answer.
+    #[test]
+    fn test_ln_sum_exp_positive_infinity_returns_infinity() {
+        let result = ln_sum_exp(f64::INFINITY, f64::INFINITY);
+
+        assert!(result.is_infinite() && result.is_sign_positive(), "expected +inf, got {result}");
+    }
+
+    /// `NaN` is never equal to itself, so the short-circuit cannot capture it and
+    /// the general path still governs.
+    #[test]
+    fn test_ln_sum_exp_nan_is_unchanged() {
+        assert!(ln_sum_exp(f64::NAN, f64::NAN).is_nan());
     }
 }
