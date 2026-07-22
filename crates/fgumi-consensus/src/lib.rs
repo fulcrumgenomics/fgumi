@@ -34,8 +34,8 @@ pub mod codec_caller;
 #[cfg(feature = "simplex")]
 pub mod methylation;
 
-/// Shared helpers for the offline-pinned fgbio-oracle saturation tests in the
-/// codec and duplex caller modules. Test-only: depends on the `fgumi-bam-io`
+/// Shared helpers for the offline-pinned fgbio-oracle tests in the codec and
+/// duplex caller modules. Test-only: depends on the `fgumi-bam-io`
 /// and `tempfile` dev-dependencies, so it is gated behind `cfg(test)`. Gated on
 /// `codec`/`duplex` too so it is not compiled (and flagged unused) when neither
 /// caller that uses it is enabled.

@@ -4845,7 +4845,7 @@ mod fgbio_oracle_saturation_tests {
     // CODEC saturation shape is aD == bD == 32767 → cD = 65534 (the cap-before-sum
     // boundary; an uncapped sum would overflow/wrap). The OPEN-interval mixed-strand
     // case (aD != bD) is exercised by the duplex caller, whose /A and /B strand read
-    // sets are independent (see duplex_caller.rs fgbio_oracle_saturation_tests).
+    // sets are independent (see duplex_caller.rs fgbio_oracle_tests).
 
     /// fgumi's CODEC caller, driven on a DEEP fixture, must emit depth/error tags
     /// equal to values CAPTURED FROM A REAL fgbio RUN on the exact same input BAM.

@@ -482,7 +482,15 @@ fn compress_block(
         buffer[buffer.len() - 5],
     ]);
 
-    Ok((buffer.clone(), crc32, input.len()))
+    // Hand the compressed frame off instead of copying it: `buffer.clone()` was a
+    // full memcpy of up to ~64 KiB on every output block, kept only so the
+    // scratch buffer stayed warm for the next call. Swapping in a fresh buffer
+    // pre-sized to what this frame needed keeps it warm without the copy.
+    //
+    // `mem::take` would be wrong here: it leaves a zero-capacity Vec behind, so
+    // the next frame reallocates from scratch and the optimization regresses.
+    let frame = std::mem::replace(buffer, Vec::with_capacity(buffer.len()));
+    Ok((frame, crc32, input.len()))
 }
 
 fn spawn_writer<W>(
