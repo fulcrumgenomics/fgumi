@@ -193,6 +193,7 @@ use crate::phred::{
 };
 use approx::abs_diff_eq;
 use std::cmp::Ordering;
+use std::sync::OnceLock;
 use wide::f64x4;
 
 /// The four DNA bases in the order used throughout consensus calling
@@ -249,8 +250,9 @@ pub struct ConsensusBaseBuilder {
     /// Smallest winner-minus-loser log-likelihood gap at which the unanimous fast
     /// path is provably exact for this `ln_error_pre_umi`.
     ///
-    /// Derived once in [`Self::new`] by [`min_exact_unanimous_gap`]; see there for
-    /// why a single constant cannot serve every pre-UMI error rate.
+    /// Derived once per pre-UMI error rate by [`cached_min_exact_unanimous_gap`];
+    /// see [`min_exact_unanimous_gap`] for why a single constant cannot serve every
+    /// pre-UMI error rate.
     min_unanimous_gap: f64,
 }
 
@@ -318,6 +320,29 @@ fn min_exact_unanimous_gap(ln_error_pre_umi: LogProbability) -> f64 {
     wide_enough
 }
 
+/// Memoized [`min_exact_unanimous_gap`], one slot per possible pre-UMI Phred.
+///
+/// The bisection above costs ~200 iterations of the full quality chain — several
+/// thousand `exp`/`log1p` evaluations — which is far too expensive to repeat per
+/// builder: `consensus_umis` constructs a fresh `SimpleConsensusCaller`, and hence a
+/// fresh `ConsensusBaseBuilder`, for every UMI family. Since `PhredScore` is a `u8`,
+/// 256 slots cover the input domain exactly, so every `u8` is memoized without
+/// clamping. `--error-rate-pre-umi` accepts any `u8` (nothing validates the range),
+/// and the cache intentionally supports all 256 of them.
+static UNANIMOUS_GAP_CACHE: [OnceLock<f64>; 256] = [const { OnceLock::new() }; 256];
+
+/// Returns the memoized minimum exact unanimous gap for a pre-UMI error rate.
+///
+/// The gap is a pure function of `error_rate_pre_umi`: it depends only on
+/// `phred_to_ln_error_prob` of that one `u8`, so memoizing on the `u8` returns the
+/// bit-identical `f64` the direct computation would have produced. The rate is taken
+/// as a Phred score rather than as an already-converted `LogProbability` so that the
+/// cache key and the value's provenance cannot drift apart.
+fn cached_min_exact_unanimous_gap(error_rate_pre_umi: PhredScore) -> f64 {
+    *UNANIMOUS_GAP_CACHE[error_rate_pre_umi as usize]
+        .get_or_init(|| min_exact_unanimous_gap(phred_to_ln_error_prob(error_rate_pre_umi)))
+}
+
 impl ConsensusBaseBuilder {
     /// Creates a new consensus base builder
     ///
@@ -352,7 +377,7 @@ impl ConsensusBaseBuilder {
             adjusted_correct_table,
             adjusted_error_per_alt,
             ln_error_pre_umi,
-            min_unanimous_gap: min_exact_unanimous_gap(ln_error_pre_umi),
+            min_unanimous_gap: cached_min_exact_unanimous_gap(error_rate_pre_umi),
         }
     }
 
@@ -1054,5 +1079,48 @@ mod tests {
                 pair[1]
             );
         }
+    }
+
+    /// The memoized gap must equal the directly computed one for every representable
+    /// pre-UMI Phred, bit for bit. Sweeps the whole `u8` domain — including the
+    /// values above `MAX_PHRED`, which the CLI accepts unvalidated — because the cache
+    /// is indexed by the raw `u8` and must be exact across every index it can ever be given.
+    #[test]
+    fn test_cached_gap_matches_uncached_across_the_whole_u8_domain() {
+        for q in 0..=u8::MAX {
+            let cached = cached_min_exact_unanimous_gap(q);
+            let direct = min_exact_unanimous_gap(phred_to_ln_error_prob(q));
+            assert_eq!(
+                cached.to_bits(),
+                direct.to_bits(),
+                "memoized gap for Q{q} ({cached}) differs from the direct computation ({direct})"
+            );
+        }
+    }
+
+    /// The gap a builder stores must be derived from the **pre**-UMI rate, not the
+    /// post-UMI one. The asymmetric cases are what discriminate a transposed
+    /// argument; `umi_consensus_defaults` is symmetric and cannot, but is kept
+    /// because Q90/Q90 is the pair `SimpleConsensusCaller` actually uses.
+    #[rstest]
+    #[case::default_cli_rates(45, 40)]
+    #[case::pre_below_post(40, 45)]
+    #[case::umi_consensus_defaults(90, 90)]
+    #[case::max_pre_low_post(93, 2)]
+    #[case::low_pre_max_post(2, 93)]
+    fn test_builder_gap_is_keyed_on_the_pre_umi_rate(
+        #[case] error_rate_pre_umi: PhredScore,
+        #[case] error_rate_post_umi: PhredScore,
+    ) {
+        let builder = ConsensusBaseBuilder::new(error_rate_pre_umi, error_rate_post_umi);
+        let expected = min_exact_unanimous_gap(phred_to_ln_error_prob(error_rate_pre_umi));
+
+        assert_eq!(
+            builder.min_unanimous_gap.to_bits(),
+            expected.to_bits(),
+            "builder built with pre={error_rate_pre_umi}, post={error_rate_post_umi} stored gap \
+             {} but the pre-UMI rate requires {expected}",
+            builder.min_unanimous_gap
+        );
     }
 }
