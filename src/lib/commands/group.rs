@@ -857,8 +857,11 @@ pub struct GroupReadsByUmi {
     #[command(flatten)]
     pub compression: CompressionOptions,
 
-    /// Minimum UMIs per position to use N-gram/BK-tree index for faster grouping.
-    /// Set to 0 to always use linear scan. Only affects Adjacency/Paired strategies.
+    /// Minimum distinct UMIs at a position before the N-gram/BK-tree index is used
+    /// instead of a linear scan over all UMI pairs. This is a minimum, not a switch:
+    /// 0 indexes every position group, and disabling the index takes a value larger
+    /// than any group. Only affects Adjacency/Paired strategies, and Adjacency only
+    /// indexes at --edits 1.
     #[arg(long = "index-threshold", default_value = "100")]
     pub index_threshold: usize,
 

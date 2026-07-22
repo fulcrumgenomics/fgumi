@@ -1119,7 +1119,11 @@ pub struct MarkDuplicates {
     #[command(flatten)]
     pub compression: CompressionOptions,
 
-    /// Minimum UMIs per position to use index for faster grouping
+    /// Minimum distinct UMIs at a position before the N-gram/BK-tree index is used
+    /// instead of a linear scan over all UMI pairs. This is a minimum, not a switch:
+    /// 0 indexes every position group, and disabling the index takes a value larger
+    /// than any group. Only affects Adjacency/Paired strategies, and Adjacency only
+    /// indexes at --edits 1.
     #[arg(long = "index-threshold", default_value = "100")]
     pub index_threshold: usize,
 
