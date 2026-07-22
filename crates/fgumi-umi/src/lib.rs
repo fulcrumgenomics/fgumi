@@ -11,8 +11,8 @@ pub mod assigner;
 
 // Re-export commonly used items
 pub use assigner::{
-    AdjacencyUmiAssigner, IdentityUmiAssigner, PairedUmiAssigner, SimpleErrorUmiAssigner, Strategy,
-    Umi, UmiAssigner,
+    AdjacencyUmiAssigner, EDIT_INDEX_THRESHOLD, IdentityUmiAssigner, PairedUmiAssigner,
+    SimpleErrorUmiAssigner, Strategy, Umi, UmiAssigner,
 };
 
 use std::collections::HashSet;

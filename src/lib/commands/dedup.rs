@@ -1119,7 +1119,12 @@ pub struct MarkDuplicates {
     #[command(flatten)]
     pub compression: CompressionOptions,
 
-    /// Minimum UMIs per position to use index for faster grouping
+    /// Minimum distinct UMIs at a position before an N-gram/BK-tree index is
+    /// built, instead of comparing every pair. Set high (e.g. a value larger
+    /// than any position group) to always use the linear scan.
+    /// Affects the Edit, Adjacency and Paired strategies. Edit floors this at
+    /// its own measured crossover (200 distinct UMIs), below which the index
+    /// costs more than the scan it replaces, and indexes only at --edits 1.
     #[arg(long = "index-threshold", default_value = "100")]
     pub index_threshold: usize,
 
@@ -1186,9 +1191,11 @@ impl Command for MarkDuplicates {
         if self.no_umi {
             info!("No-UMI mode: deduplicating by position only");
         }
-        if matches!(effective_strategy, Strategy::Adjacency | Strategy::Paired) {
-            info!("Index threshold: {}", self.index_threshold);
-        }
+        crate::commands::common::log_index_threshold(
+            effective_strategy,
+            effective_edits,
+            self.index_threshold,
+        );
         info!("{}", self.threading.log_message());
 
         // Open input BAM

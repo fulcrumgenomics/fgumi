@@ -857,8 +857,12 @@ pub struct GroupReadsByUmi {
     #[command(flatten)]
     pub compression: CompressionOptions,
 
-    /// Minimum UMIs per position to use N-gram/BK-tree index for faster grouping.
-    /// Set to 0 to always use linear scan. Only affects Adjacency/Paired strategies.
+    /// Minimum distinct UMIs at a position before an N-gram/BK-tree index is
+    /// built, instead of comparing every pair. Set high (e.g. a value larger
+    /// than any position group) to always use the linear scan.
+    /// Affects the Edit, Adjacency and Paired strategies. Edit floors this at
+    /// its own measured crossover (200 distinct UMIs), below which the index
+    /// costs more than the scan it replaces, and indexes only at --edits 1.
     #[arg(long = "index-threshold", default_value = "100")]
     pub index_threshold: usize,
 
@@ -988,9 +992,11 @@ impl Command for GroupReadsByUmi {
         if self.no_umi {
             info!("No-UMI mode: grouping by position only");
         }
-        if matches!(effective_strategy, Strategy::Adjacency | Strategy::Paired) {
-            info!("Index threshold: {}", self.index_threshold);
-        }
+        crate::commands::common::log_index_threshold(
+            effective_strategy,
+            effective_edits,
+            self.index_threshold,
+        );
         if self.allow_unmapped {
             info!("Allow unmapped: enabled (unmapped templates will be grouped by UMI only)");
             warn!(

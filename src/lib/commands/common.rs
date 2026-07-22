@@ -7,6 +7,7 @@ use std::path::PathBuf;
 #[cfg(feature = "simplex")]
 use std::sync::Arc;
 
+use crate::assigner::Strategy;
 #[cfg(feature = "simplex")]
 use crate::logging::OperationTimer;
 use crate::unified_pipeline::{BamPipelineConfig, SchedulerStrategy};
@@ -128,6 +129,69 @@ pub fn add_pg_to_builder(
     command_line: &str,
 ) -> anyhow::Result<noodles::sam::header::Builder> {
     fgumi_bam_io::header::add_pg_to_builder(builder, crate::version::VERSION.as_str(), command_line)
+}
+
+/// Builds the `Index threshold:` startup line for a UMI-assignment command.
+///
+/// `group` and `dedup` both report the N-gram index threshold that is actually in
+/// effect, which is not always the raw `--index-threshold` value:
+///
+/// - [`Strategy::Edit`] indexes only at one mismatch, and floors the flag at its own
+///   measured crossover ([`fgumi_umi::EDIT_INDEX_THRESHOLD`], higher than the shared
+///   default), so it reports `max(flag, EDIT_INDEX_THRESHOLD)` at one mismatch and
+///   "not used" otherwise.
+/// - [`Strategy::Adjacency`] and [`Strategy::Paired`] use the flag verbatim.
+/// - [`Strategy::Identity`] never indexes, so it reports nothing.
+///
+/// # Arguments
+///
+/// * `strategy` - the strategy actually in effect (after any `--no-umi` override)
+/// * `effective_edits` - the mismatch count actually in effect
+/// * `index_threshold` - the raw `--index-threshold` flag value
+///
+/// # Returns
+///
+/// The line to log, or `None` when the strategy reports no threshold.
+pub fn index_threshold_log_message(
+    strategy: Strategy,
+    effective_edits: u32,
+    index_threshold: usize,
+) -> Option<String> {
+    match strategy {
+        Strategy::Edit if effective_edits == 1 => Some(format!(
+            "Index threshold: {} (edit)",
+            index_threshold.max(fgumi_umi::EDIT_INDEX_THRESHOLD)
+        )),
+        Strategy::Edit => {
+            Some("Index threshold: not used (edit indexes only at --edits 1)".to_string())
+        }
+        Strategy::Adjacency | Strategy::Paired => {
+            Some(format!("Index threshold: {index_threshold}"))
+        }
+        Strategy::Identity => None,
+    }
+}
+
+/// The `--index-threshold` doc-comments on `MarkDuplicates` (`dedup.rs`) and
+/// `GroupReadsByUmi` (`group.rs`) both recite edit's floor as a literal `200`,
+/// because clap's `help` must be a string literal and cannot interpolate a
+/// constant. Breaking the build here is what keeps those two help texts honest
+/// when the constant moves.
+const _: () = assert!(
+    fgumi_umi::EDIT_INDEX_THRESHOLD == 200,
+    "EDIT_INDEX_THRESHOLD changed: update the `--index-threshold` help text in \
+     src/lib/commands/dedup.rs and src/lib/commands/group.rs, which hardcode 200."
+);
+
+/// Logs the `Index threshold:` startup line built by [`index_threshold_log_message`].
+///
+/// Shared by `group` and `dedup` so the two cannot drift apart when a threshold
+/// changes. See [`index_threshold_log_message`] for the arguments and the
+/// per-strategy behavior.
+pub fn log_index_threshold(strategy: Strategy, effective_edits: u32, index_threshold: usize) {
+    if let Some(message) = index_threshold_log_message(strategy, effective_edits, index_threshold) {
+        log::info!("{message}");
+    }
 }
 
 /// Verifies that a consensus-calling input BAM is sorted appropriately.
@@ -1144,6 +1208,71 @@ pub fn build_pipeline_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `index_threshold_log_message` reports the threshold that is actually in effect,
+    /// which is not always the raw `--index-threshold` value. `Edit` floors the flag at
+    /// its own measured crossover and indexes only at one mismatch; `Adjacency`/`Paired`
+    /// use the flag verbatim; `Identity` never indexes and so reports nothing.
+    #[rstest]
+    // Edit at one mismatch floors the flag at EDIT_INDEX_THRESHOLD (200).
+    #[case::edit_flag_below_floor(Strategy::Edit, 1, 100, Some("Index threshold: 200 (edit)"))]
+    // A flag above the floor wins, so the user can still raise it.
+    #[case::edit_flag_above_floor(Strategy::Edit, 1, 500, Some("Index threshold: 500 (edit)"))]
+    // Zero does not disable indexing: the gate is `distinct >= threshold`, so the
+    // floor still applies.
+    #[case::edit_flag_zero(Strategy::Edit, 1, 0, Some("Index threshold: 200 (edit)"))]
+    // Edit only indexes at one mismatch.
+    #[case::edit_two_mismatches(
+        Strategy::Edit,
+        2,
+        100,
+        Some("Index threshold: not used (edit indexes only at --edits 1)")
+    )]
+    #[case::edit_zero_mismatches(
+        Strategy::Edit,
+        0,
+        100,
+        Some("Index threshold: not used (edit indexes only at --edits 1)")
+    )]
+    // Adjacency and paired report the raw flag, with no floor.
+    #[case::adjacency(Strategy::Adjacency, 1, 100, Some("Index threshold: 100"))]
+    #[case::paired(Strategy::Paired, 1, 37, Some("Index threshold: 37"))]
+    // Identity never indexes, so it emits no line at all.
+    #[case::identity(Strategy::Identity, 0, 100, None)]
+    fn test_index_threshold_log_message(
+        #[case] strategy: Strategy,
+        #[case] effective_edits: u32,
+        #[case] index_threshold: usize,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(
+            index_threshold_log_message(strategy, effective_edits, index_threshold).as_deref(),
+            expected
+        );
+    }
+
+    /// The floor the Edit branch applies is the crate constant, not a copy of it — if
+    /// `EDIT_INDEX_THRESHOLD` moves, the reported value moves with it.
+    #[test]
+    fn test_index_threshold_log_message_uses_crate_floor() {
+        let floor = fgumi_umi::EDIT_INDEX_THRESHOLD;
+        assert_eq!(
+            index_threshold_log_message(Strategy::Edit, 1, 0),
+            Some(format!("Index threshold: {floor} (edit)"))
+        );
+    }
+
+    /// `log_index_threshold` is the logging wrapper; it must not panic for any strategy,
+    /// including the `Identity` case where there is no message to emit.
+    #[rstest]
+    fn test_log_index_threshold_emits_without_panicking(
+        #[values(Strategy::Identity, Strategy::Edit, Strategy::Adjacency, Strategy::Paired)]
+        strategy: Strategy,
+        #[values(0, 1, 2)] effective_edits: u32,
+    ) {
+        enable_logging();
+        log_index_threshold(strategy, effective_edits, 100);
+    }
 
     /// Enable an at-Trace logger so `log::warn!`/`debug!` macros evaluate their
     /// arguments — without an enabled logger the `log` crate skips argument
