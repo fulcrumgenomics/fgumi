@@ -1960,6 +1960,25 @@ impl SortWorkerPool {
         self.shared.active_worker_limit.store(n, Ordering::Release);
     }
 
+    /// Hand the pool over to Phase 2 once ingest is done, widening it to
+    /// `active_workers`.
+    ///
+    /// Both halves belong to the same transition and must happen together.
+    /// Widening alone was not enough: the phase is what makes workers schedule
+    /// [`SortStep::CompressOutput`], and that step is what selects
+    /// `output_compressor` over the Phase 1 spill compressor. A sort that stayed in
+    /// Phase 1 through its output write therefore compressed the output BAM at
+    /// `temp_compression`, silently discarding the caller's `output_compression`.
+    ///
+    /// Call this once ingest has finished — after that point every remaining byte
+    /// the pool touches is merge input or output. Callers must not leave spill
+    /// compression outstanding: Phase 1 spill jobs still queued when the phase flips
+    /// would be picked up by `CompressOutput` and written at the output level.
+    pub fn begin_phase2(&self, active_workers: usize) {
+        self.set_active_workers(active_workers);
+        self.set_phase(phase::PHASE2);
+    }
+
     /// Set the input file for Phase 1 reading.
     ///
     /// Must be called before `set_phase(PHASE1)`.

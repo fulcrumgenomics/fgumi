@@ -1773,6 +1773,23 @@ impl RawExternalSorter {
         self.merge_threads.unwrap_or(self.threads).max(1)
     }
 
+    /// Transition the worker pool from ingest (Phase 1) to output (Phase 2).
+    ///
+    /// Every sort path calls this exactly once, immediately after ingest
+    /// completes, to hand the pool over to Phase 2 and lift the active-worker cap
+    /// to `merge_threads`. Centralized here so the invariant cannot drift between
+    /// sort orders: it is precisely the transition whose omission left the
+    /// in-memory output writing at the wrong compression level.
+    ///
+    /// Workers idled by the Phase-1 cap re-check within `MAX_BACKOFF_US`, so no
+    /// explicit wake is needed; capped workers always drained their held items, so
+    /// raising the cap can never be required for correctness, only for width. The
+    /// phase half is what routes output blocks to `output_compressor` — see
+    /// [`SortWorkerPool::begin_phase2`].
+    fn enter_output_phase(&self, pool: &SortWorkerPool) {
+        pool.begin_phase2(self.phase2_threads());
+    }
+
     /// Configured maximum number of temporary spill files kept before the
     /// oldest runs are consolidated into one (`0` means unlimited). Exposed so
     /// callers can assert how their `max_temp_files` setting resolved.
@@ -2520,12 +2537,8 @@ impl RawExternalSorter {
         )?;
         probe.phase1_end(buffer.memory_usage() as u64);
 
-        // Ingest is done: everything from here is Phase 2 (merge/write), so
-        // lift the active-worker cap to `merge_threads`. Workers idled by the
-        // Phase-1 cap re-check within MAX_BACKOFF_US, so no explicit wake is
-        // needed; capped workers always drained their held items, so raising
-        // the cap can never be required for correctness, only for width.
-        pool.set_active_workers(self.phase2_threads());
+        // Ingest is done: everything from here is Phase 2 (merge/write).
+        self.enter_output_phase(&pool);
 
         if chunk_files.is_empty() {
             // All records fit in memory - no merge needed
@@ -2705,12 +2718,8 @@ impl RawExternalSorter {
 
         let output_header = self.create_output_header(header);
 
-        // Ingest is done: everything from here is Phase 2 (merge/write), so
-        // lift the active-worker cap to `merge_threads`. Workers idled by the
-        // Phase-1 cap re-check within MAX_BACKOFF_US, so no explicit wake is
-        // needed; capped workers always drained their held items, so raising
-        // the cap can never be required for correctness, only for width.
-        pool.set_active_workers(self.phase2_threads());
+        // Ingest is done: everything from here is Phase 2 (merge/write).
+        self.enter_output_phase(&pool);
 
         if chunk_files.is_empty() {
             // All records fit in memory - no merge needed
@@ -2949,12 +2958,8 @@ impl RawExternalSorter {
         )?;
         probe.phase1_end(memory_used as u64);
 
-        // Ingest is done: everything from here is Phase 2 (merge/write), so
-        // lift the active-worker cap to `merge_threads`. Workers idled by the
-        // Phase-1 cap re-check within MAX_BACKOFF_US, so no explicit wake is
-        // needed; capped workers always drained their held items, so raising
-        // the cap can never be required for correctness, only for width.
-        pool.set_active_workers(self.phase2_threads());
+        // Ingest is done: everything from here is Phase 2 (merge/write).
+        self.enter_output_phase(&pool);
 
         if chunk_files.is_empty() {
             // All records fit in memory
@@ -3322,12 +3327,8 @@ impl RawExternalSorter {
         )?;
         probe.phase1_end(buffer.memory_usage() as u64);
 
-        // Ingest is done: everything from here is Phase 2 (merge/write), so
-        // lift the active-worker cap to `merge_threads`. Workers idled by the
-        // Phase-1 cap re-check within MAX_BACKOFF_US, so no explicit wake is
-        // needed; capped workers always drained their held items, so raising
-        // the cap can never be required for correctness, only for width.
-        pool.set_active_workers(self.phase2_threads());
+        // Ingest is done: everything from here is Phase 2 (merge/write).
+        self.enter_output_phase(&pool);
 
         if chunk_files.is_empty() {
             // All records fit in memory
@@ -3429,8 +3430,16 @@ impl RawExternalSorter {
     /// ([`merge_chunks_with_index`]) merges so the Phase-2 lifecycle is
     /// single-sourced and the two paths cannot drift. Returns the sources plus
     /// an RAII [`Phase2Guard`] (borrowing `pool`) that resets Phase 2 on drop or
-    /// explicit `deactivate()`. When there are no disk chunks the guard is
-    /// inactive and carries no consumer.
+    /// explicit `deactivate()`. Phase 2 is armed whether or not there are disk
+    /// chunks: it is what makes workers reach for `output_compressor`
+    /// (`SortStep::CompressOutput`) rather than the Phase 1 spill compressor, so
+    /// leaving an all-in-memory merge in Phase 1 would silently write the output
+    /// BAM at `temp_compression` and discard the caller's `output_compression`.
+    /// With no spill files `try_phase2_file_work` sees an empty file vector and
+    /// returns immediately, so the only Phase 2 work available is output
+    /// compression. The consumer is created only for disk sources — it drains the
+    /// pool's per-file reorder buffers, and there is nothing to drain when
+    /// everything is already in memory.
     fn setup_phase2_merge<'a, K: RawSortKey + Default + 'static>(
         chunk_files: &[PathBuf],
         memory_chunks: MemorySources<K>,
@@ -3448,23 +3457,22 @@ impl RawExternalSorter {
         let sources = Self::build_chunk_sources::<K>(chunk_files, memory_chunks, pool)?;
         debug!("Merging from {} sources...", sources.len());
 
-        // Create the pool consumer for PoolDisk sources and activate Phase 2.
-        // The consumer holds an Arc snapshot of the pool's per-file Phase 2
-        // state — workers populate per-file reorder buffers, the consumer pops
-        // from them.
-        let guard = if num_disk > 0 {
-            let files = pool.phase2_files();
-            let consumer = MainThreadChunkConsumer::new(
-                files,
+        // Activate Phase 2 for the whole merge, spill files or not, so the output
+        // BAM is compressed at `output_compression` rather than `temp_compression`.
+        // The consumer is created only for disk sources: it holds an Arc snapshot of
+        // the pool's per-file Phase 2 state — workers populate per-file reorder
+        // buffers, the consumer pops from them. There is nothing to consume when
+        // everything is already in memory.
+        let consumer = (num_disk > 0).then(|| {
+            MainThreadChunkConsumer::new(
+                pool.phase2_files(),
                 pool.decompress_error_flag(),
                 pool.chunk_read_error_flag(),
                 pool.worker_panicked_flag(),
-            );
-            pool.set_phase(crate::worker_pool::phase::PHASE2);
-            Phase2Guard { pool, consumer: Some(consumer), active: true }
-        } else {
-            Phase2Guard { pool, consumer: None, active: false }
-        };
+            )
+        });
+        pool.set_phase(crate::worker_pool::phase::PHASE2);
+        let guard = Phase2Guard { pool, consumer, active: true };
 
         Ok((sources, guard))
     }
