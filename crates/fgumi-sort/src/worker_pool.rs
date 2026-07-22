@@ -656,6 +656,16 @@ pub(crate) struct SharedPipelineState {
     /// Current phase: 0=shutdown, 1=Phase1, 2=Phase2, 255=Legacy.
     pub(crate) phase: AtomicU8,
 
+    /// Number of workers permitted to be active in the current phase. Workers
+    /// with `worker_id >= active_worker_limit` idle (backoff) instead of taking
+    /// work. Lets the sort driver run Phase 1 (accumulate/sort/spill) on fewer
+    /// threads than Phase 2 (merge/write) — e.g. to cede cores to an upstream
+    /// producer in a pipeline. Defaults to `num_workers` (all active), so the
+    /// behavior is unchanged unless the driver calls `set_active_workers`.
+    /// Capped workers re-check this within `MAX_BACKOFF_US`, so raising the
+    /// limit reactivates them without an explicit wake.
+    pub(crate) active_worker_limit: AtomicUsize,
+
     // --- Phase 1 queues ---
     /// Input BAM file (Mutex because only one worker reads at a time).
     pub(crate) input_file: std::sync::Mutex<Option<Box<dyn Read + Send>>>,
@@ -743,6 +753,7 @@ impl SharedPipelineState {
 
         Self {
             phase: AtomicU8::new(phase::LEGACY),
+            active_worker_limit: AtomicUsize::new(num_workers),
 
             input_file: std::sync::Mutex::new(None),
             input_eof: AtomicBool::new(false),
@@ -1068,6 +1079,25 @@ impl SortWorkerPool {
             let current_phase = shared.phase.load(Ordering::Acquire);
             if current_phase == phase::SHUTDOWN {
                 break;
+            }
+
+            // 1b. Honor the per-phase active-worker cap: workers above the limit
+            //     take no NEW work, but must still drain any items they already
+            //     hold — held items are per-worker, so a capped worker that
+            //     froze with held work would strand that output (no other worker
+            //     can advance it). So advance held items first, then idle without
+            //     acquiring fresh work. Capped workers re-check the limit within
+            //     MAX_BACKOFF_US, so a later raise reactivates them. Default
+            //     limit == num_workers ⇒ no worker is ever capped (no-op).
+            if worker.worker_id >= shared.active_worker_limit.load(Ordering::Acquire) {
+                if Self::try_advance_all_held(shared, worker) {
+                    worker.backoff_us = MIN_BACKOFF_US;
+                } else {
+                    sleep_with_jitter(worker.backoff_us, worker.worker_id, worker.idle_iter);
+                    worker.idle_iter = worker.idle_iter.wrapping_add(1);
+                    worker.backoff_us = (worker.backoff_us * 2).min(MAX_BACKOFF_US);
+                }
+                continue;
             }
 
             // 2. Check phase completion — wait for next phase, only exit on SHUTDOWN.
@@ -1831,6 +1861,16 @@ impl SortWorkerPool {
         self.shared.phase.store(new_phase, Ordering::Release);
     }
 
+    /// Cap the number of workers active in the current phase to `n` (clamped to
+    /// `[1, num_workers]`). Workers with `worker_id >= n` idle until the limit is
+    /// raised. Used to run Phase 1 on fewer threads than Phase 2; raising the
+    /// limit reactivates idled workers within `MAX_BACKOFF_US` (no explicit wake
+    /// needed). Defaults to `num_workers` (all active) when never called.
+    pub fn set_active_workers(&self, n: usize) {
+        let n = n.clamp(1, self.num_workers);
+        self.shared.active_worker_limit.store(n, Ordering::Release);
+    }
+
     /// Set the input file for Phase 1 reading.
     ///
     /// Must be called before `set_phase(PHASE1)`.
@@ -2230,6 +2270,94 @@ mod tests {
         assert_eq!(received, num_jobs);
 
         let pool = submit_handle.join().expect("submit thread should not panic");
+        pool.shutdown();
+    }
+
+    #[test]
+    fn set_active_workers_clamps() {
+        let pool = SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf);
+        // Clamp to [1, num_workers].
+        pool.set_active_workers(0);
+        assert_eq!(pool.shared.active_worker_limit.load(Ordering::Acquire), 1);
+        pool.set_active_workers(100);
+        assert_eq!(pool.shared.active_worker_limit.load(Ordering::Acquire), 4);
+        pool.set_active_workers(2);
+        assert_eq!(pool.shared.active_worker_limit.load(Ordering::Acquire), 2);
+        pool.shutdown();
+    }
+
+    #[test]
+    fn active_worker_limit_caps_then_reactivates() {
+        // Reactivation must be observable on the SAME pool: a fresh pool can never
+        // prove that raising the cap re-enables workers idled by an earlier cap.
+        // With a cap of 2 over 6 workers, only workers 0..2 may run compress steps;
+        // workers >= 2 stay idle. Raising the cap to 6 and running a second batch
+        // must bring those workers online — and because per-worker counts are
+        // cumulative and they did nothing under the cap, any work they show after
+        // the second batch was done exclusively in that batch.
+        let cs = SortStep::CompressSpill as usize;
+
+        // Run one batch on `pool` (moved in, returned out so the next batch can
+        // reuse it) and report the cumulative per-worker CompressSpill counts.
+        let run_batch = |pool: SortWorkerPool, num_jobs: usize| -> (SortWorkerPool, Vec<u64>) {
+            let (result_tx, result_rx) = pool.compress_result_channel();
+            let submit_tx = result_tx.clone();
+            let submit_handle = std::thread::spawn(move || {
+                for i in 0..num_jobs {
+                    pool.submit_compress(CompressJob {
+                        data: vec![b'X'; 4096],
+                        serial: i as u64,
+                        result_tx: submit_tx.clone(),
+                        codec: SpillCodec::Bgzf,
+                    });
+                }
+                drop(submit_tx);
+                pool
+            });
+            drop(result_tx);
+            let mut received = 0;
+            while result_rx.recv().is_ok() {
+                received += 1;
+            }
+            assert_eq!(received, num_jobs);
+            let pool = submit_handle.join().expect("submit thread should not panic");
+            let counts: Vec<u64> = (0..6)
+                .map(|t| pool.pipeline_stats.per_thread_step_counts[t][cs].load(Ordering::Relaxed))
+                .collect();
+            (pool, counts)
+        };
+
+        let pool = SortWorkerPool::new(6, 1, 6, crate::codec::SpillCodec::Bgzf);
+
+        // Batch 1: capped at 2 — only workers 0..2 may run.
+        pool.set_active_workers(2);
+        let (pool, after_capped) = run_batch(pool, 300);
+        assert!(
+            after_capped.iter().filter(|&&c| c > 0).count() <= 2,
+            "cap=2 must bound active workers; per-worker counts {after_capped:?}"
+        );
+        assert!(
+            after_capped[2..].iter().all(|&c| c == 0),
+            "workers >= cap must do no work; per-worker counts {after_capped:?}"
+        );
+        assert_eq!(after_capped.iter().sum::<u64>(), 300, "all batch-1 jobs accounted for");
+
+        // Batch 2: raise the cap on the SAME pool and run again.
+        pool.set_active_workers(6);
+        let (pool, after_full) = run_batch(pool, 300);
+        // Workers >= the old cap did nothing in batch 1, so any cumulative work
+        // they now show was processed solely in batch 2 — i.e. reactivation worked.
+        let reactivated_work: u64 = after_full[2..].iter().sum();
+        assert!(
+            reactivated_work > 0,
+            "raising the cap on the same pool must reactivate workers >= old cap; \
+             after_capped {after_capped:?}, after_full {after_full:?}"
+        );
+        assert_eq!(
+            after_full.iter().sum::<u64>(),
+            600,
+            "all jobs across both batches accounted for; per-worker counts {after_full:?}"
+        );
         pool.shutdown();
     }
 
