@@ -62,7 +62,7 @@ pub use fields::{
 pub use bin::{UNMAPPED_BIN, bin_from_raw_bam, reg2bin, set_bin_from_raw_bam};
 
 // -- builder --
-pub use builder::{SamBuilder, UnmappedSamBuilder};
+pub use builder::{ReadNameTooLong, SamBuilder, UnmappedSamBuilder};
 
 // -- cigar --
 #[cfg(feature = "noodles")]

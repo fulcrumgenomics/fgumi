@@ -1341,10 +1341,11 @@ impl CodecConsensusCaller {
     }
 
     /// Builds the output record from the consensus and writes raw bytes into `output`.
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "Result return type kept for API consistency with other callers"
-    )]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `<prefix>:<UMI>` read name exceeds BAM's
+    /// 254-byte limit, which an over-long input-derived `umi` can cause.
     #[expect(
         clippy::too_many_arguments,
         reason = "all_records needed separately from source_raws for UMI consensus"
@@ -1370,12 +1371,15 @@ impl CodecConsensusCaller {
         // Codec always outputs unmapped fragments
         let flag = flags::UNMAPPED;
 
-        self.bam_builder.build_record(
+        // The UMI comes from the input BAM, so an over-long name is bad data,
+        // not a bug: return an error rather than panicking partway through
+        // writing the output.
+        self.bam_builder.try_build_record(
             read_name.as_bytes(),
             flag,
             &consensus.bases,
             &consensus.quals,
-        );
+        )?;
 
         // RG tag
         self.bam_builder.append_string_tag(SamTag::RG, self.read_group_id.as_bytes());

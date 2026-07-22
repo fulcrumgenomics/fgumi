@@ -9,6 +9,29 @@ use crate::tags::{
     append_u16_array_tag,
 };
 
+/// A read name that does not fit BAM's single-byte name-length field.
+///
+/// BAM stores `l_read_name` as a `u8` that counts the trailing NUL, so a name
+/// of 255 bytes or more cannot be represented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadNameTooLong {
+    /// Length of the offending name, in bytes.
+    pub len: usize,
+}
+
+impl std::fmt::Display for ReadNameTooLong {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "read name too long ({} bytes, max 254); BAM stores the name length in one byte \
+             including its NUL terminator",
+            self.len
+        )
+    }
+}
+
+impl std::error::Error for ReadNameTooLong {}
+
 // ============================================================================
 // Unmapped BAM Record Builder
 // ============================================================================
@@ -67,6 +90,50 @@ impl UnmappedSamBuilder {
         self.sealed = false;
     }
 
+    /// Fallible counterpart to [`Self::build_record`] for names that come from
+    /// input data rather than from the caller.
+    ///
+    /// Consensus read names are `<prefix>:<UMI>`, and the UMI is read from the
+    /// input BAM's `MI`/`RX` tag. A long or malformed UMI is therefore
+    /// attacker- or accident-controlled, and letting it reach the length
+    /// assertion aborts the whole command with a Rust panic partway through
+    /// writing the output BAM, leaving a truncated file. Callers handling
+    /// data-derived names should use this and propagate the error instead.
+    ///
+    /// On success this writes exactly what [`Self::build_record`] would; see
+    /// that method for the record layout and argument meanings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `name` is 255 bytes or longer; BAM stores the name
+    /// length in a single byte including its NUL terminator, so 254 is the
+    /// maximum.
+    ///
+    /// On failure the builder is reset, exactly as [`Self::build_record`]
+    /// leaves it when its own length assertion fires, so a caller that ignores
+    /// the error cannot append tags onto — and re-emit — the previous record.
+    ///
+    /// # Panics
+    ///
+    /// Only the name length is checked. This still panics, like
+    /// [`Self::build_record`], if `quals` is non-empty and
+    /// `bases.len() != quals.len()`, which is a caller bug rather than bad
+    /// input.
+    pub fn try_build_record(
+        &mut self,
+        name: &[u8],
+        flag: u16,
+        bases: &[u8],
+        quals: &[u8],
+    ) -> Result<(), ReadNameTooLong> {
+        if name.len() >= 255 {
+            self.clear();
+            return Err(ReadNameTooLong { len: name.len() });
+        }
+        self.build_record(name, flag, bases, quals);
+        Ok(())
+    }
+
     /// Write the 32-byte fixed header, read name, packed sequence, and
     /// quality scores for an unmapped record.
     ///
@@ -87,6 +154,10 @@ impl UnmappedSamBuilder {
     /// # Panics
     ///
     /// Panics if `quals` is non-empty and `bases.len() != quals.len()`.
+    ///
+    /// Panics if `name` is 255 bytes or longer. Use [`Self::try_build_record`]
+    /// when the name is derived from input data, where an over-long name is bad
+    /// input rather than a bug.
     pub fn build_record(&mut self, name: &[u8], flag: u16, bases: &[u8], quals: &[u8]) {
         assert!(
             bases.len() == quals.len() || quals.is_empty(),
@@ -594,6 +665,74 @@ mod tests {
     use crate::tags::*;
     use crate::testutil::*;
     use fgumi_tag::SamTag;
+    use rstest::rstest;
+
+    // ── try_build_record: data-derived names must error, not panic ───────────
+
+    /// Consensus read names are `<prefix>:<UMI>` with the UMI read from the
+    /// input BAM, so an over-long name is bad input rather than a bug. It must
+    /// come back as a typed error; the asserting `build_record` would abort the
+    /// command partway through writing the output BAM.
+    #[rstest]
+    #[case::at_limit(254, true)]
+    #[case::one_over(255, false)]
+    #[case::far_over(1024, false)]
+    #[case::empty(0, true)]
+    fn test_try_build_record_rejects_over_long_names(
+        #[case] name_len: usize,
+        #[case] expect_ok: bool,
+    ) {
+        let mut builder = UnmappedSamBuilder::new();
+        let name = vec![b'N'; name_len];
+        let result = builder.try_build_record(&name, 4, b"ACGT", &[30, 30, 30, 30]);
+
+        assert_eq!(
+            result.is_ok(),
+            expect_ok,
+            "name of {name_len} bytes: expected ok={expect_ok}, got {result:?}",
+        );
+        if let Err(e) = result {
+            assert_eq!(e.len, name_len, "the error should report the offending length");
+            assert!(e.to_string().contains("read name too long"), "unhelpful error message: {e}");
+        }
+    }
+
+    /// A name accepted by `try_build_record` must produce exactly the record
+    /// `build_record` would have, so routing the fallible path through it is
+    /// not a behavior change for valid input.
+    #[test]
+    fn test_try_build_record_matches_build_record_for_valid_names() {
+        let name = b"prefix:ACGTACGT";
+
+        let mut fallible = UnmappedSamBuilder::new();
+        fallible.try_build_record(name, 4, b"ACGT", &[30, 31, 32, 33]).expect("valid name");
+        let fallible_bytes = fallible.as_bytes().to_vec();
+
+        let mut asserting = UnmappedSamBuilder::new();
+        asserting.build_record(name, 4, b"ACGT", &[30, 31, 32, 33]);
+
+        assert_eq!(fallible_bytes, asserting.as_bytes(), "record bytes must be identical");
+    }
+
+    /// The builder is reused across records, so a rejected name must not leave
+    /// the previous record sealed in the buffer: a caller that ignores the
+    /// error would otherwise append tags onto, and re-emit, the prior record.
+    #[test]
+    fn test_try_build_record_resets_builder_on_rejection() {
+        let mut builder = UnmappedSamBuilder::new();
+        builder.build_record(b"first", 4, b"ACGT", &[30, 30, 30, 30]);
+        assert!(!builder.as_bytes().is_empty(), "precondition: a record was built");
+
+        let too_long = vec![b'N'; 255];
+        builder
+            .try_build_record(&too_long, 4, b"ACGT", &[30, 30, 30, 30])
+            .expect_err("a 255-byte name must be rejected");
+
+        // Inspect the fields directly: `as_bytes` debug-asserts that the
+        // builder is sealed, which is exactly the state under test.
+        assert!(builder.buf.is_empty(), "the rejected call must clear the prior record");
+        assert!(!builder.sealed, "the rejected call must leave the builder unsealed");
+    }
 
     #[test]
     fn test_builder_basic_unmapped_record() {
