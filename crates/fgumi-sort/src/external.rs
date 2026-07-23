@@ -1021,16 +1021,10 @@ impl<K: RawSortKey + Default + 'static> MemorySources<K> {
 ///
 /// Each variant owns its "current record" state internally so the merge loop
 /// can borrow the current record's bytes via [`Self::current_bytes`] without
-/// copying. Disk-backed variants own a `scratch: Vec<u8>` holding the most
+/// copying. The `PoolDisk` variant owns a `scratch: Vec<u8>` holding the most
 /// recently read record's bytes; `Memory`/`MemoryOwned` borrow directly from
 /// their backing store, eliminating the per-record memcpy on the in-memory path.
 enum ChunkSource<K: RawSortKey + Default + 'static> {
-    /// Disk-based chunk with prefetching reader (legacy path with per-source threads).
-    Disk {
-        reader: GenericKeyedChunkReader<K>,
-        /// Bytes for the current record (filled by the most recent `advance`).
-        scratch: Vec<u8>,
-    },
     /// In-memory chunk from an inline-buffer sort (coordinate / template).
     /// All records borrow their bytes from a shared `Arc<SegmentedBuf>`;
     /// `current_bytes` borrows them directly (zero-copy).
@@ -1059,7 +1053,6 @@ impl<K: RawSortKey + Default + 'static> ChunkSource<K> {
     /// record's bytes without copying.
     fn advance(&mut self, consumer: Option<&mut MainThreadChunkConsumer<K>>) -> Result<Option<K>> {
         match self {
-            ChunkSource::Disk { reader, scratch } => reader.next_record(scratch),
             ChunkSource::PoolDisk { source_id, scratch } => {
                 let c = consumer.ok_or_else(|| {
                     anyhow::anyhow!(
@@ -1099,11 +1092,11 @@ impl<K: RawSortKey + Default + 'static> ChunkSource<K> {
     /// Caller MUST have received `Some(_)` from a prior `advance`. The merge
     /// loops uphold this: the init loop only retains a source whose first
     /// `advance` returned `Some`, and the main loop only calls this on the
-    /// active tree winner — so the `Disk`/`PoolDisk` empty-scratch case is
+    /// active tree winner — so the `PoolDisk` empty-scratch case is
     /// unreachable.
     fn current_bytes(&self) -> &[u8] {
         match self {
-            ChunkSource::Disk { scratch, .. } | ChunkSource::PoolDisk { scratch, .. } => scratch,
+            ChunkSource::PoolDisk { scratch, .. } => scratch,
             ChunkSource::Memory { chunk, idx } => {
                 debug_assert!(*idx != usize::MAX, "current_bytes called before advance");
                 chunk.record_bytes(*idx)
@@ -1126,22 +1119,27 @@ impl<K: RawSortKey + Default + 'static> ChunkSource<K> {
 ///
 /// `consumer` must be `Some` whenever `source` is `PoolDisk` (a `PoolDisk`
 /// source only exists when Phase 2 is active, which is exactly when the merge
-/// loops set the consumer); a missing consumer is a pipeline bug and panics here
-/// rather than silently writing empty/stale scratch bytes.
+/// loops set the consumer); a missing consumer is a pipeline bug and returns an
+/// error here — matching [`ChunkSource::advance`]'s handling of the same
+/// invariant — rather than silently writing empty/stale scratch bytes.
 #[inline]
 fn winner_record_bytes<'a, K: RawSortKey + Default + 'static>(
     source: &'a ChunkSource<K>,
     consumer: Option<&'a MainThreadChunkConsumer<K>>,
-) -> &'a [u8] {
+) -> Result<&'a [u8]> {
     match source {
         ChunkSource::PoolDisk { source_id, scratch } => {
-            let consumer =
-                consumer.expect("PoolDisk source requires a MainThreadChunkConsumer during merge");
+            let consumer = consumer.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "PoolDisk source (id {source_id}) requires a MainThreadChunkConsumer \
+                     during merge but none was provided — this is a bug in the sort pipeline"
+                )
+            })?;
             // `Some` on the zero-copy fast path; `None` means the record
             // straddled a block boundary and was reassembled into `scratch`.
-            consumer.current_record_bytes(*source_id).unwrap_or(scratch.as_slice())
+            Ok(consumer.current_record_bytes(*source_id).unwrap_or(scratch.as_slice()))
         }
-        other => other.current_bytes(),
+        other => Ok(other.current_bytes()),
     }
 }
 
@@ -3359,26 +3357,21 @@ impl RawExternalSorter {
 
     /// Build chunk sources from disk files and in-memory chunks.
     ///
-    /// When `pool_decompress` is true, disk sources become `PoolDisk` variants —
-    /// workers read and decompress in the background, main thread parses records.
-    /// No per-source threads are spawned.
-    ///
-    /// When `pool_decompress` is false, disk sources use `GenericKeyedChunkReader`
-    /// with its own per-source background thread — the legacy per-source-reader
-    /// path, now unused since both the plain and indexed merges are
-    /// pool-integrated.
+    /// Disk chunks become `PoolDisk` sources: the shared worker pool reads and
+    /// decompresses them in the background while the main thread parses records,
+    /// so no per-source threads are spawned. Both the plain
+    /// ([`merge_chunks_generic`]) and indexed ([`merge_chunks_with_index`])
+    /// merges go through this pool-integrated path.
     fn build_chunk_sources<K: RawSortKey + Default + 'static>(
         chunk_files: &[PathBuf],
         memory_chunks: MemorySources<K>,
-        reader_concurrency: usize,
-        pool_decompress: bool,
         pool: &Arc<SortWorkerPool>,
     ) -> Result<Vec<ChunkSource<K>>> {
         let num_disk = chunk_files.len();
         let num_memory = memory_chunks.num_non_empty();
         let mut sources: Vec<ChunkSource<K>> = Vec::with_capacity(num_disk + num_memory);
 
-        if pool_decompress && !chunk_files.is_empty() {
+        if !chunk_files.is_empty() {
             // Pool-integrated path: install per-file Phase 2 state on the
             // pool, then create one PoolDisk source per file. Workers
             // cooperatively read+decompress all files via work-stealing.
@@ -3386,15 +3379,6 @@ impl RawExternalSorter {
 
             for source_id in 0..num_disk {
                 sources.push(ChunkSource::PoolDisk { source_id, scratch: Vec::new() });
-            }
-        } else {
-            // Legacy path: per-source reader threads (used by indexing path)
-            let sem = make_reader_semaphore(reader_concurrency);
-            for path in chunk_files {
-                sources.push(ChunkSource::Disk {
-                    reader: GenericKeyedChunkReader::<K>::open(path, Some(Arc::clone(&sem)))?,
-                    scratch: Vec::new(),
-                });
             }
         }
 
@@ -3425,10 +3409,7 @@ impl RawExternalSorter {
             );
         }
 
-        // The pooled path decompresses on the workers, so reader_concurrency is
-        // irrelevant here; pass 1 (build_chunk_sources only uses it for the
-        // legacy per-source-reader path, which pool_decompress=true skips).
-        let sources = Self::build_chunk_sources::<K>(chunk_files, memory_chunks, 1, true, pool)?;
+        let sources = Self::build_chunk_sources::<K>(chunk_files, memory_chunks, pool)?;
         debug!("Merging from {} sources...", sources.len());
 
         // Create the pool consumer for PoolDisk sources and activate Phase 2.
@@ -3522,7 +3503,7 @@ impl RawExternalSorter {
             let src_idx = source_map[winner];
             let sample_this = debug_timing && records_merged.is_multiple_of(merge_sample_interval);
 
-            let record_bytes = winner_record_bytes(&sources[src_idx], guard.consumer_ref());
+            let record_bytes = winner_record_bytes(&sources[src_idx], guard.consumer_ref())?;
             if sample_this {
                 let t0 = Instant::now();
                 writer.write_raw_record(record_bytes)?;
@@ -3643,7 +3624,7 @@ impl RawExternalSorter {
         while tree.winner_is_active() {
             let winner = tree.winner();
             let src_idx = source_map[winner];
-            let record_bytes = winner_record_bytes(&sources[src_idx], guard.consumer_ref());
+            let record_bytes = winner_record_bytes(&sources[src_idx], guard.consumer_ref())?;
             writer.write_raw_record(record_bytes)?;
             merge_progress.log_if_needed(1);
 
