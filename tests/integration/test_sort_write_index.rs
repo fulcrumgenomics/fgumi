@@ -192,10 +192,9 @@ fn create_large_test_bam(dir: &Path, mapped_per_contig: usize) -> PathBuf {
         let _ = writeln!(sam, "u_{i}\t4\t*\t0\t0\t*\t*\t0\t0\tACGTACGTAC\tIIIIIIIIII");
     }
     // Placed-but-unmapped reads: FUNMAP (0x4) set, but with a reference + position
-    // (e.g. the unmapped mate of a mapped read). samtools position-bins these so
-    // they appear in region queries; fgumi's indexer classifies them as unmapped
-    // and does not position-bin them (pre-existing behavior, unchanged by the
-    // pooled-writer work). The test therefore compares MAPPED-only retrieval.
+    // (e.g. the unmapped mate of a mapped read). Both samtools and fgumi
+    // position-bin these, so they appear in region queries and idxstats; the test
+    // asserts fgumi matches samtools over ALL reads, these included.
     for i in 0..2000 {
         let p1 = 1 + (i * 101) % 999_000;
         let p2 = 1 + (i * 149 + 7) % 999_000;
@@ -216,39 +215,51 @@ fn create_large_test_bam(dir: &Path, mapped_per_contig: usize) -> PathBuf {
 
 /// `samtools view -c [extra] <bam> <region>` — record count in a region via the
 /// `.bai`. `extra` carries filter flags (e.g. `-F 4` to count mapped reads only).
-fn region_count(bam: &Path, region: &str, extra: &[&str]) -> i64 {
+/// `samtools view <bam> <region>` — the records a region query returns, verbatim.
+///
+/// Returns the records rather than a count. The two BAMs being compared are
+/// byte-identical copies that differ only in which `.bai` retrieves from them, so a
+/// matching count cannot distinguish "returned the right records" from "returned the
+/// right *number* of the wrong records" — which is exactly what a mis-recovered
+/// virtual offset, or a bin pointing at a neighbouring chunk, would produce.
+fn region_records(bam: &Path, region: &str, extra: &[&str]) -> String {
     let out = Command::new("samtools")
         .arg("view")
-        .arg("-c")
         .args(extra)
         .args([bam.to_str().unwrap(), region])
         .output()
-        .expect("run samtools view -c");
+        .expect("run samtools view");
     assert!(
         out.status.success(),
-        "samtools view -c {region} failed on {}: {}",
+        "samtools view {region} failed on {}: {}",
         bam.display(),
         String::from_utf8_lossy(&out.stderr)
     );
-    String::from_utf8_lossy(&out.stdout).trim().parse().expect("parse count")
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// Per-reference MAPPED counts (`ref\tlen\tmapped`) from idxstats. Excludes the
-/// unmapped column, which legitimately differs for placed-but-unmapped reads.
-fn idxstats_mapped(bam: &Path) -> String {
-    idxstats(bam)
-        .lines()
-        .map(|line| {
-            let mut f = line.split('\t');
-            format!(
-                "{}\t{}\t{}",
-                f.next().unwrap_or_default(),
-                f.next().unwrap_or_default(),
-                f.next().unwrap_or_default()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+/// Assert two region-query outputs hold the identical records, reporting the first
+/// divergence compactly — these regions return tens of thousands of records, so a
+/// whole-output `assert_eq!` diff would be unreadable.
+fn assert_same_records(region: &str, via_fgumi: &str, via_samtools: &str) {
+    if via_fgumi == via_samtools {
+        return;
+    }
+    let fgumi_lines: Vec<&str> = via_fgumi.lines().collect();
+    let samtools_lines: Vec<&str> = via_samtools.lines().collect();
+    let detail = match fgumi_lines.iter().zip(samtools_lines.iter()).position(|(a, b)| a != b) {
+        Some(i) => format!(
+            "first differing record at index {i}:\n  via fgumi:    {}\n  via samtools: {}",
+            fgumi_lines[i], samtools_lines[i]
+        ),
+        None => "one output is a strict prefix of the other".to_string(),
+    };
+    panic!(
+        "region {region}: records retrieved via fgumi's .bai differ from samtools' .bai \
+         ({} vs {} records); {detail}",
+        fgumi_lines.len(),
+        samtools_lines.len()
+    );
 }
 
 /// `samtools idxstats <bam>` — per-reference mapped/unmapped counts from the `.bai`.
@@ -313,7 +324,8 @@ fn test_sort_write_index_matches_samtools_index() {
         .expect("run samtools index");
     assert!(status.success(), "samtools index failed");
 
-    // Region counts via fgumi's .bai must equal those via samtools' .bai.
+    // The records a region query returns via fgumi's .bai must be identical to those
+    // returned via samtools' .bai.
     let regions = [
         "chr1",
         "chr2",
@@ -324,27 +336,25 @@ fn test_sort_write_index_matches_samtools_index() {
         "chr1:999500-1000000",
         "chr1:1-1000000",
     ];
-    // MAPPED-read retrieval (`-F 4`) via fgumi's .bai must exactly match samtools'
-    // .bai over the same bytes — this validates the recovered virtual offsets.
-    // (Placed-but-unmapped reads are position-binned by samtools but not by fgumi;
-    // see create_large_test_bam. That is a pre-existing indexing choice, not a
-    // property of the pooled writer, so it is deliberately excluded here.)
-    let mut total = 0i64;
+    // Retrieval via fgumi's .bai must exactly match samtools' .bai over the same
+    // bytes — for ALL reads, including the placed-but-unmapped reads
+    // (`create_large_test_bam` seeds many): fgumi now position-bins them like
+    // htslib, so they are returned by region queries too. This validates both the
+    // recovered virtual offsets and the placed-unmapped binning.
+    let mut total = 0usize;
     for r in regions {
-        let via_fgumi = region_count(&sorted, r, &["-F", "4"]);
-        let via_samtools = region_count(&reference, r, &["-F", "4"]);
-        assert_eq!(
-            via_fgumi, via_samtools,
-            "region {r}: fgumi .bai mapped count {via_fgumi} != samtools .bai {via_samtools}"
-        );
-        total += via_fgumi;
+        let via_fgumi = region_records(&sorted, r, &[]);
+        let via_samtools = region_records(&reference, r, &[]);
+        assert_same_records(r, &via_fgumi, &via_samtools);
+        total += via_fgumi.lines().count();
     }
-    assert!(total > 0, "expected non-empty mapped region queries");
+    assert!(total > 0, "expected non-empty region queries");
 
-    // Per-reference mapped counts must match exactly.
+    // Per-reference mapped AND unmapped counts must match exactly (the unmapped
+    // column now agrees because placed-but-unmapped reads are position-binned).
     assert_eq!(
-        idxstats_mapped(&sorted),
-        idxstats_mapped(&reference),
-        "per-reference mapped counts via fgumi .bai must match samtools"
+        idxstats(&sorted),
+        idxstats(&reference),
+        "idxstats via fgumi .bai must match samtools"
     );
 }

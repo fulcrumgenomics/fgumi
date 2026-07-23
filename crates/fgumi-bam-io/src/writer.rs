@@ -366,8 +366,14 @@ struct CachedIndexEntry {
 
 /// Extract alignment context from raw BAM bytes.
 ///
-/// Returns `Some((ref_id, start, end, is_mapped))` for mapped reads, or `None`
-/// for unmapped reads (the indexer still counts them via a `None` context).
+/// Returns `Some((ref_id, start, end, is_mapped))` for any read that has a
+/// reference and a position — **including a placed-but-unmapped read** (e.g. the
+/// unmapped mate of a mapped read, which carries its mate's `tid`/`pos` so it
+/// sorts alongside it). Such reads are position-binned exactly as htslib/samtools
+/// do, so region queries and `idxstats` see them; the `is_mapped` flag records
+/// that they are unmapped without excluding them from the index. Only a truly
+/// unplaced read (no reference or no position) returns `None`, which the indexer
+/// counts toward the unplaced total.
 #[inline]
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
 pub(crate) fn extract_alignment_context(bam: &[u8]) -> Option<(usize, Position, Position, bool)> {
@@ -376,22 +382,26 @@ pub(crate) fn extract_alignment_context(bam: &[u8]) -> Option<(usize, Position, 
     let pos = v.pos();
     let flags = v.flags();
 
-    let is_unmapped = (flags & fgumi_raw_bam::flags::UNMAPPED) != 0;
-
-    // Unmapped reads: return None (indexer handles them specially).
-    if tid < 0 || is_unmapped {
+    // Only a read with no reference / no position is unplaced. A read carrying a
+    // valid tid+pos is binned by position regardless of its mapped flag — this is
+    // what htslib does, and what makes placed-but-unmapped mates queryable.
+    if tid < 0 || pos < 0 {
         return None;
     }
 
-    // Calculate alignment end from CIGAR using byte-safe access
-    // (doesn't require 4-byte alignment like get_cigar_ops).
-    let ref_len = fgumi_raw_bam::reference_length_from_raw_bam(bam);
+    let is_mapped = (flags & fgumi_raw_bam::flags::UNMAPPED) == 0;
+
+    // Reference span from the CIGAR (byte-safe access; no 4-byte alignment
+    // needed). A placed-but-unmapped read has no CIGAR, so this is 0; htslib
+    // bins such a read over `[pos, pos + 1)`, so floor the span at one base
+    // (matching `bam_endpos`, which returns `pos + max(rlen, 1)`).
+    let ref_len = fgumi_raw_bam::reference_length_from_raw_bam(bam).max(1);
 
     // BAM positions are 0-based, Position is 1-based.
     let start = Position::try_from((pos + 1) as usize).ok()?;
     let end = Position::try_from((pos + ref_len) as usize).ok()?;
 
-    Some((tid as usize, start, end, true))
+    Some((tid as usize, start, end, is_mapped))
 }
 
 /// Incrementally builds a BAI index from per-record positions plus per-block
@@ -1411,6 +1421,62 @@ mod tests {
         record.extend_from_slice(&[30u8; 10]);
 
         record
+    }
+
+    /// Build a raw BAM record for a *placed-but-unmapped* read: a valid
+    /// reference/position, the UNMAPPED flag set, and no CIGAR — as produced for
+    /// the unmapped mate of a mapped read.
+    #[allow(clippy::cast_possible_truncation)]
+    fn create_placed_unmapped_bam_record(ref_id: i32, pos: i32, read_name: &[u8]) -> Vec<u8> {
+        let name_with_null = read_name.len() + 1;
+        let padding = (4 - (name_with_null % 4)) % 4;
+        let l_read_name = (name_with_null + padding) as u8;
+
+        let mut record = Vec::new();
+        record.extend_from_slice(&ref_id.to_le_bytes());
+        record.extend_from_slice(&pos.to_le_bytes());
+        record.push(l_read_name);
+        record.push(0); // mapq
+        record.extend_from_slice(&0u16.to_le_bytes()); // bin
+        record.extend_from_slice(&0u16.to_le_bytes()); // n_cigar_op = 0 (no CIGAR)
+        record.extend_from_slice(&fgumi_raw_bam::flags::UNMAPPED.to_le_bytes()); // flag
+        record.extend_from_slice(&0u32.to_le_bytes()); // l_seq = 0
+        record.extend_from_slice(&(-1i32).to_le_bytes()); // next_ref_id
+        record.extend_from_slice(&(-1i32).to_le_bytes()); // next_pos
+        record.extend_from_slice(&0i32.to_le_bytes()); // tlen
+        record.extend_from_slice(read_name);
+        record.push(0);
+        record.extend(std::iter::repeat_n(0u8, padding));
+        record
+    }
+
+    #[test]
+    fn extract_alignment_context_bins_placed_unmapped_reads() {
+        // Placed-but-unmapped (valid ref+pos, UNMAPPED flag, no CIGAR) must be
+        // binned over a 1-base span at its position, flagged unmapped — so region
+        // queries and idxstats see it, matching htslib.
+        let rec = create_placed_unmapped_bam_record(0, 100, b"unmapped_mate");
+        let (ref_id, start, end, is_mapped) =
+            extract_alignment_context(&rec).expect("placed-unmapped read must be binned");
+        assert_eq!(ref_id, 0);
+        assert_eq!(usize::from(start), 101, "0-based pos 100 -> 1-based 101");
+        assert_eq!(usize::from(end), 101, "no CIGAR -> 1-base span [pos, pos+1)");
+        assert!(!is_mapped, "flag must still record it as unmapped");
+
+        // A mapped read is binned over its CIGAR span and flagged mapped.
+        let mapped = create_test_bam_record(0, 100, b"mapped");
+        let (_, m_start, m_end, m_mapped) =
+            extract_alignment_context(&mapped).expect("mapped read must be binned");
+        assert_eq!(usize::from(m_start), 101);
+        assert_eq!(usize::from(m_end), 110, "10M CIGAR -> span of 10");
+        assert!(m_mapped);
+
+        // A truly unplaced read (no reference) is not binned.
+        assert!(
+            extract_alignment_context(&create_placed_unmapped_bam_record(-1, -1, b"unplaced"))
+                .is_none(),
+            "unplaced read -> None (counted as unplaced by the indexer)"
+        );
     }
 
     #[test]
