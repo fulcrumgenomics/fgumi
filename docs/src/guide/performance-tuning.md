@@ -362,6 +362,11 @@ Requested memory 16GB exceeds 90% of system memory (14.4GB)
   better than a simple heap merge when the number of sorted runs is large
 - `--max-memory` controls how much RAM is used for sort buffers; increase for large files to
   reduce the number of intermediate merge passes
+- `--max-temp-files` sets how many spilled runs may accumulate before the oldest are
+  consolidated into a single run (default 64, matching samtools). Consolidation is a
+  single-threaded merge pass, so on very large inputs raising this limit avoids repeated
+  consolidation passes at the cost of more open file descriptors during the final merge; the
+  output is unchanged. Must be at least 2
 - For template-coordinate sort with single-cell data, the `CB` tag is included automatically
 - `--async-reader` is supported and can improve Phase 1 (input reading) throughput when disk
   latency is high or the OS page cache readahead is small

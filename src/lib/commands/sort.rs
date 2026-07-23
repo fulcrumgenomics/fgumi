@@ -154,6 +154,9 @@ PERFORMANCE:
   - Configurable temp file compression (--temp-compression)
   - Default 768M per-thread memory limit (samtools-compatible); pass
     `--max-memory auto` to detect system memory (opt-in)
+  - Spilled runs are consolidated once they reach `--max-temp-files`
+    (default 64, matching samtools); raise it to avoid repeated
+    consolidation passes on very large inputs
 
 EXAMPLES:
 
@@ -177,6 +180,9 @@ EXAMPLES:
 
   # Reserve extra memory for bwa mem running in a pipeline
   fgumi sort -i input.bam -o sorted.bam --memory-reserve 12GiB --threads 4
+
+  # Allow more spilled runs before consolidating (fewer consolidation passes)
+  fgumi sort -i input.bam -o sorted.bam --order coordinate --max-temp-files 512
 
   # Verify a BAM file is correctly sorted
   fgumi sort -i sorted.bam --verify --order template-coordinate
@@ -328,6 +334,22 @@ pub struct Sort {
     #[arg(long = "temp-codec", default_value = "zstd")]
     pub temp_codec: fgumi_sort::SpillCodec,
 
+    /// Maximum number of temporary spill files kept before the oldest are
+    /// consolidated into a single run.
+    ///
+    /// Large inputs spill many sorted runs to disk. When the number of runs
+    /// reaches this limit, the oldest are merged together in a single pass so
+    /// the final k-way merge opens fewer files at once. Raising it avoids
+    /// repeated consolidation passes on very large inputs (at the cost of more
+    /// open file descriptors during the final merge); lowering it keeps fewer
+    /// files open. Must be at least 2; to effectively disable consolidation,
+    /// pass a value larger than the number of runs you expect to spill.
+    ///
+    /// When unset, a built-in default is used (see this command's help
+    /// overview for the default value).
+    #[arg(long = "max-temp-files", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(2..))]
+    pub max_temp_files: Option<usize>,
+
     /// Write BAM index (.bai) alongside output.
     ///
     /// Only valid for coordinate sort. The index file will be written to
@@ -473,6 +495,10 @@ impl Sort {
         }
         if let Some(n) = self.merge_threads {
             sorter = sorter.merge_threads(n);
+        }
+        // Optional; falls back to the engine default when unset.
+        if let Some(n) = self.max_temp_files {
+            sorter = sorter.max_temp_files(n);
         }
         sorter
     }
@@ -833,6 +859,139 @@ mod tests {
         assert_eq!(sorter.phase2_threads(), expected_phase2);
     }
 
+    /// `--max-temp-files` parses onto the struct and defaults to `None` (the
+    /// builder then applies the engine default).
+    #[rstest]
+    #[case::unset(&[], None)]
+    #[case::minimum(&["--max-temp-files", "2"], Some(2))]
+    #[case::explicit(&["--max-temp-files", "256"], Some(256))]
+    #[case::large(&["--max-temp-files", "100000"], Some(100_000))]
+    fn test_parse_max_temp_files(#[case] extra: &[&str], #[case] expected: Option<usize>) {
+        let base = ["sort", "-i", "in.bam", "-o", "out.bam", "--order", "coordinate"];
+        let args: Vec<&str> = base.iter().copied().chain(extra.iter().copied()).collect();
+        let sort = Sort::try_parse_from(args).expect("parse should succeed");
+        assert_eq!(sort.max_temp_files, expected);
+    }
+
+    /// Invalid values are rejected at parse time rather than silently clamped or
+    /// truncated: values below the floor of 2 (a merge needs at least two
+    /// inputs), and non-numeric, negative, or overflowing input.
+    #[rstest]
+    #[case::zero("0")]
+    #[case::one("1")]
+    #[case::non_numeric("abc")]
+    #[case::negative("-1")]
+    #[case::overflow("99999999999999999999999999")]
+    fn test_parse_max_temp_files_rejects_invalid(#[case] value: &str) {
+        let args = [
+            "sort",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--order",
+            "coordinate",
+            "--max-temp-files",
+            value,
+        ];
+        assert!(Sort::try_parse_from(args).is_err(), "--max-temp-files {value} must be rejected");
+    }
+
+    /// The flag reaches the sorter: `Some(n)` sets the limit; `None` leaves the
+    /// engine default (read from a fresh sorter rather than hardcoded, so this
+    /// test does not pin fgumi's default number).
+    #[rstest]
+    #[case::set(Some(256))]
+    #[case::unset(None)]
+    fn test_build_sorter_wires_max_temp_files(#[case] max_temp_files: Option<usize>) {
+        let engine_default =
+            RawExternalSorter::new(SortOrderArg::Coordinate.into()).temp_file_limit();
+        let mut sort = make_sort(SortOrderArg::Coordinate);
+        sort.max_temp_files = max_temp_files;
+
+        let sorter = sort.build_sorter(512 * 1024 * 1024, "fgumi sort (test)");
+        assert_eq!(sorter.temp_file_limit(), max_temp_files.unwrap_or(engine_default));
+    }
+
+    /// The accessor test above only proves the flag reaches the builder. This
+    /// one proves `--max-temp-files` is purely a *how-we-consolidate* knob and
+    /// never changes *what* is written: with a 1 KiB memory budget (no floor in
+    /// `Fixed` mode) and enough records to spill many runs, `Some(2)` forces the
+    /// consolidation merge to fire repeatedly (oldest runs are merged once their
+    /// count reaches the limit), while the default engine limit (64) never
+    /// consolidates and merges every run in the final k-way pass. Both paths
+    /// must emit the same records in the same order — this guards the
+    /// consolidation path against a stable-order or record-loss regression the
+    /// accessor test cannot catch.
+    ///
+    /// We compare decoded records rather than the raw BGZF bytes on purpose:
+    /// the two write paths flush BGZF blocks at different points, so the
+    /// compressed framing legitimately differs even when the record stream is
+    /// identical. The contract consolidation must uphold is record identity,
+    /// not byte identity of the container.
+    #[test]
+    fn test_max_temp_files_consolidation_is_record_identical() {
+        use fgumi_sam::SamBuilder;
+
+        // Reverse-ordered, all-distinct starts so the coordinate sort is a total
+        // order (no ties whose order could depend on merge grouping); 60 pairs
+        // at a 1 KiB budget spill well over a dozen runs.
+        let mut builder = SamBuilder::new();
+        for i in 0..60 {
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i:04}"))
+                .start1((60 - i) * 100 + 1)
+                .start2((60 - i) * 100 + 51)
+                .build();
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("in.bam");
+        builder.write_bam(&input).expect("write bam");
+
+        // 1 KiB memory forces spilling; `build_sorter` is the exact option ->
+        // builder path `execute` uses, so this exercises the real wiring.
+        let run = |max_temp_files: Option<usize>, out: PathBuf| {
+            let mut sort = make_sort(SortOrderArg::Coordinate);
+            sort.input = input.clone();
+            sort.output = Some(out.clone());
+            sort.threads = 1;
+            sort.max_temp_files = max_temp_files;
+
+            let sorter = sort.build_sorter(1024, "fgumi sort (test)");
+            let stats = sorter.sort(&input, &out).expect("sort should succeed");
+
+            let mut reader =
+                noodles::bam::io::reader::Builder.build_from_path(&out).expect("open output");
+            let header = reader.read_header().expect("read header");
+            let records = reader
+                .record_bufs(&header)
+                .collect::<std::io::Result<Vec<_>>>()
+                .expect("read records");
+            (stats, records)
+        };
+
+        let (default_stats, default_records) = run(None, dir.path().join("default.bam"));
+        let (limited_stats, limited_records) = run(Some(2), dir.path().join("limited.bam"));
+
+        // Precondition: the tiny budget really did spill multiple runs, so the
+        // `Some(2)` run exercised consolidation rather than a trivial in-memory
+        // sort. Without this the identity assertion below could pass vacuously.
+        assert!(
+            default_stats.chunks_written >= 2,
+            "test must spill multiple runs to exercise consolidation, got {} chunk(s)",
+            default_stats.chunks_written,
+        );
+        assert_eq!(
+            limited_stats.output_records, default_stats.output_records,
+            "consolidation must not drop or duplicate records",
+        );
+        assert_eq!(
+            limited_records, default_records,
+            "--max-temp-files is a consolidation knob and must not change the emitted records",
+        );
+    }
+
     /// Separately, the knob must not change what is written. Covers the same
     /// asymmetric splits end-to-end through `execute`.
     #[rstest]
@@ -896,6 +1055,7 @@ mod tests {
             compression: CompressionOptions::default(),
             temp_compression: 1,
             temp_codec: fgumi_sort::SpillCodec::default(),
+            max_temp_files: None,
             write_index: false,
             async_reader: false,
         }

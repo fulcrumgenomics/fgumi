@@ -1660,6 +1660,14 @@ impl RawExternalSorter {
         self.merge_threads.unwrap_or(self.threads).max(1)
     }
 
+    /// Configured maximum number of temporary spill files kept before the
+    /// oldest runs are consolidated into one (`0` means unlimited). Exposed so
+    /// callers can assert how their `max_temp_files` setting resolved.
+    #[must_use]
+    pub fn temp_file_limit(&self) -> usize {
+        self.max_temp_files
+    }
+
     /// Set the output compression level.
     #[must_use]
     pub fn output_compression(mut self, level: u32) -> Self {
