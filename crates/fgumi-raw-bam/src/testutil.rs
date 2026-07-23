@@ -131,25 +131,31 @@ fn find_i16_array_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<Vec<i16>> {
         i += 3;
         match typ {
             b'B' => {
-                let sub = aux[i];
-                i += 1;
+                // Fail closed on a truncated or unrecognized array rather than
+                // indexing past the end, mirroring `tags::parse_array_tag_at`.
+                let header = aux.get(i..i + 5)?;
+                let sub = header[0];
                 let count =
-                    u32::from_le_bytes([aux[i], aux[i + 1], aux[i + 2], aux[i + 3]]) as usize;
-                i += 4;
-                if t == tag && sub == b's' {
-                    let mut vals = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        vals.push(i16::from_le_bytes([aux[i], aux[i + 1]]));
-                        i += 2;
-                    }
-                    return Some(vals);
-                }
+                    u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
+                i += 5;
                 let elem_size = match sub {
+                    b'c' | b'C' => 1,
                     b's' | b'S' => 2,
                     b'i' | b'I' | b'f' => 4,
-                    _ => 1,
+                    // An unknown subtype has no known width, so the walker cannot
+                    // resynchronize past it.
+                    _ => return None,
                 };
-                i += count * elem_size;
+                let payload = aux.get(i..i.checked_add(count.checked_mul(elem_size)?)?)?;
+                i += payload.len();
+                if t == tag && sub == b's' {
+                    return Some(
+                        payload
+                            .chunks_exact(2)
+                            .map(|elem| i16::from_le_bytes([elem[0], elem[1]]))
+                            .collect(),
+                    );
+                }
             }
             b'A' | b'c' | b'C' => {
                 i += 1;
@@ -372,4 +378,322 @@ pub fn make_b_uint32_array_tag(tag: [u8; 2], values: &[u32]) -> Vec<u8> {
         u32::try_from(values.len()).expect("array length must fit in u32"),
         &bytes,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Append a tag of the given type code to an aux block.
+    fn push_tag(aux: &mut Vec<u8>, tag: [u8; 2], typ: u8, payload: &[u8]) {
+        aux.extend_from_slice(&tag);
+        aux.push(typ);
+        aux.extend_from_slice(payload);
+    }
+
+    /// Append a `B:s` (int16 array) tag.
+    fn push_i16_array(aux: &mut Vec<u8>, tag: [u8; 2], values: &[i16]) {
+        aux.extend_from_slice(&tag);
+        aux.push(b'B');
+        aux.push(b's');
+        aux.extend_from_slice(&u32::try_from(values.len()).expect("count fits u32").to_le_bytes());
+        for v in values {
+            aux.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+
+    /// The aux walker has to skip a tag of every BAM type code to reach a later
+    /// tag. If it advances by the wrong width for any of them it desynchronizes
+    /// and reads garbage as tag identifiers -- which, in a test oracle, means
+    /// real tag assertions can silently pass against the wrong bytes. Each case
+    /// places one preceding tag type in front of the target array.
+    #[rstest::rstest]
+    #[case::char_a(b'A', b"x")]
+    #[case::int8_c(b'c', b"\xFF")]
+    #[case::uint8_upper_c(b'C', b"\xC8")]
+    #[case::int16_s(b's', &[0x34, 0x12])]
+    #[case::uint16_upper_s(b'S', &[0xFF, 0xFF])]
+    #[case::int32_i(b'i', &[1, 0, 0, 0])]
+    #[case::uint32_upper_i(b'I', &[0xFF, 0xFF, 0xFF, 0xFF])]
+    #[case::float_f(b'f', &[0, 0, 0x80, 0x3F])]
+    #[case::string_z(b'Z', b"hello\0")]
+    #[case::hex_h(b'H', b"1AE301\0")]
+    fn test_aux_walker_skips_every_type_code(#[case] typ: u8, #[case] payload: &[u8]) {
+        let expected = vec![10i16, -20, 30];
+
+        let mut aux = Vec::new();
+        push_tag(&mut aux, *fgumi_tag::SamTag::MI, typ, payload);
+        push_i16_array(&mut aux, *fgumi_tag::SamTag::AD_BASES, &expected);
+
+        assert_eq!(
+            find_i16_array_tag_in_aux(&aux, *fgumi_tag::SamTag::AD_BASES),
+            Some(expected),
+            "walker desynchronized while skipping a '{}' tag",
+            typ as char,
+        );
+    }
+
+    /// Arrays of every element type must also be skipped at the right width.
+    #[rstest::rstest]
+    #[case::int8_array(b'c', 1)]
+    #[case::uint8_array(b'C', 1)]
+    #[case::int16_array(b's', 2)]
+    #[case::uint16_array(b'S', 2)]
+    #[case::int32_array(b'i', 4)]
+    #[case::uint32_array(b'I', 4)]
+    #[case::float_array(b'f', 4)]
+    fn test_aux_walker_skips_arrays_of_every_element_type(
+        #[case] subtype: u8,
+        #[case] elem_size: usize,
+    ) {
+        let expected = vec![7i16, 8];
+        let count = 3usize;
+
+        let mut aux = Vec::new();
+        // A non-matching array tag of the given subtype, then the target.
+        aux.extend_from_slice(&*fgumi_tag::SamTag::MI);
+        aux.push(b'B');
+        aux.push(subtype);
+        aux.extend_from_slice(&u32::try_from(count).expect("fits").to_le_bytes());
+        aux.extend(std::iter::repeat_n(0u8, count * elem_size));
+        push_i16_array(&mut aux, *fgumi_tag::SamTag::AD_BASES, &expected);
+
+        assert_eq!(
+            find_i16_array_tag_in_aux(&aux, *fgumi_tag::SamTag::AD_BASES),
+            Some(expected),
+            "walker desynchronized while skipping a 'B:{}' array",
+            subtype as char,
+        );
+    }
+
+    /// A same-subtype array whose tag does not match must be skipped rather than
+    /// returned -- the `B:s` branch returns early only on a tag match.
+    #[test]
+    fn test_aux_walker_skips_non_matching_i16_array() {
+        let expected = vec![1i16, 2, 3];
+        let mut aux = Vec::new();
+        push_i16_array(&mut aux, *fgumi_tag::SamTag::BD_BASES, &[99, 98]);
+        push_i16_array(&mut aux, *fgumi_tag::SamTag::AD_BASES, &expected);
+
+        assert_eq!(find_i16_array_tag_in_aux(&aux, *fgumi_tag::SamTag::AD_BASES), Some(expected));
+    }
+
+    #[test]
+    fn test_aux_walker_returns_none_for_absent_tag() {
+        let mut aux = Vec::new();
+        push_i16_array(&mut aux, *fgumi_tag::SamTag::BD_BASES, &[1, 2]);
+        assert_eq!(find_i16_array_tag_in_aux(&aux, *fgumi_tag::SamTag::AD_BASES), None);
+    }
+
+    /// Malformed `B` encodings must fail closed rather than index past the end
+    /// of the aux block. Each case truncates the target array after a different
+    /// part of its encoding.
+    #[rstest::rstest]
+    #[case::truncated_before_subtype(0)]
+    #[case::truncated_mid_count(3)]
+    #[case::truncated_before_payload(5)]
+    #[case::truncated_mid_payload(8)]
+    fn test_aux_walker_fails_closed_on_truncated_array(#[case] kept_after_type_byte: usize) {
+        let mut aux = Vec::new();
+        push_i16_array(&mut aux, *fgumi_tag::SamTag::AD_BASES, &[1i16, 2, 3]);
+        // Keep the tag name and `B` type byte, then cut the encoding short.
+        aux.truncate(3 + kept_after_type_byte);
+
+        assert_eq!(find_i16_array_tag_in_aux(&aux, *fgumi_tag::SamTag::AD_BASES), None);
+    }
+
+    #[test]
+    fn test_aux_walker_fails_closed_on_unknown_array_subtype() {
+        let mut aux = Vec::new();
+        aux.extend_from_slice(&*fgumi_tag::SamTag::MI);
+        aux.push(b'B');
+        aux.push(b'?');
+        aux.extend_from_slice(&2u32.to_le_bytes());
+        aux.extend_from_slice(&[0, 0]);
+        // A well-formed target after the bad array is unreachable: the walker
+        // cannot know how wide the unknown subtype is, so it must stop.
+        push_i16_array(&mut aux, *fgumi_tag::SamTag::AD_BASES, &[1i16, 2]);
+
+        assert_eq!(find_i16_array_tag_in_aux(&aux, *fgumi_tag::SamTag::AD_BASES), None);
+    }
+
+    /// An unterminated `Z`/`H` payload has no NUL to stop the scan on, so the
+    /// walk must end at the end of the block rather than running off it.
+    #[rstest::rstest]
+    #[case::unterminated_string(b'Z', b"nonul")]
+    #[case::unterminated_hex(b'H', b"1AE3")]
+    fn test_aux_walker_fails_closed_on_malformed_scalar(#[case] typ: u8, #[case] payload: &[u8]) {
+        let mut aux = Vec::new();
+        push_tag(&mut aux, *fgumi_tag::SamTag::MI, typ, payload);
+
+        assert_eq!(find_i16_array_tag_in_aux(&aux, *fgumi_tag::SamTag::AD_BASES), None);
+    }
+
+    /// An unknown scalar type code has no width to advance by, so the walk must
+    /// stop there rather than guess one. An aux block that simply ends after the
+    /// bad tag would return `None` either way; a well-formed target placed after
+    /// it is what proves the walker stopped instead of resynchronizing onto it.
+    #[test]
+    fn test_aux_walker_stops_at_unknown_scalar_type_code() {
+        let mut aux = Vec::new();
+        push_tag(&mut aux, *fgumi_tag::SamTag::MI, b'?', &[0, 0, 0, 0]);
+        push_i16_array(&mut aux, *fgumi_tag::SamTag::AD_BASES, &[1i16, 2]);
+
+        assert_eq!(find_i16_array_tag_in_aux(&aux, *fgumi_tag::SamTag::AD_BASES), None);
+    }
+
+    /// Trailing bytes too short to hold a tag must end the walk without being
+    /// read as one -- the target found earlier still comes back. Querying an
+    /// absent tag is what actually reaches the remainder: a match returns from
+    /// inside the `B` arm before the outer bounds guard is re-tested, so only a
+    /// miss carries the walk into the partial header.
+    #[test]
+    fn test_aux_walker_ignores_trailing_partial_tag() {
+        let expected = vec![5i16];
+        let mut aux = Vec::new();
+        push_i16_array(&mut aux, *fgumi_tag::SamTag::AD_BASES, &expected);
+        aux.extend_from_slice(&*fgumi_tag::SamTag::MI);
+
+        assert_eq!(find_i16_array_tag_in_aux(&aux, *fgumi_tag::SamTag::AD_BASES), Some(expected));
+        assert_eq!(find_i16_array_tag_in_aux(&aux, *fgumi_tag::SamTag::BD_BASES), None);
+    }
+
+    /// A count that overflows the aux block must be rejected on the *matching*
+    /// tag too -- that is the branch that reads the payload out.
+    #[test]
+    fn test_aux_walker_fails_closed_on_overlong_count() {
+        let mut aux = Vec::new();
+        aux.extend_from_slice(&*fgumi_tag::SamTag::AD_BASES);
+        aux.push(b'B');
+        aux.push(b's');
+        aux.extend_from_slice(&u32::MAX.to_le_bytes());
+        aux.extend_from_slice(&[1, 0, 2, 0]);
+
+        assert_eq!(find_i16_array_tag_in_aux(&aux, *fgumi_tag::SamTag::AD_BASES), None);
+    }
+
+    // ========================================================================
+    // proptest: the aux walker fails closed on arbitrary and truncated bytes
+    //
+    // The cases above pin hand-picked malformed encodings; random buffers cover
+    // the offsets nobody thought to enumerate (partial trailing tags of every
+    // length, truncations behind an arbitrary run of preceding tags).
+    // ========================================================================
+
+    /// Fixed-width scalar type codes and their payload widths.
+    const SCALAR_TYPES: [(u8, usize); 8] =
+        [(b'A', 1), (b'c', 1), (b'C', 1), (b's', 2), (b'S', 2), (b'i', 4), (b'I', 4), (b'f', 4)];
+
+    /// `B` array element types and their element widths.
+    const ARRAY_ELEMENT_TYPES: [(u8, usize); 7] =
+        [(b'c', 1), (b'C', 1), (b's', 2), (b'S', 2), (b'i', 4), (b'I', 4), (b'f', 4)];
+
+    /// Every tag encoding [`encode_tag`] can emit: one per scalar type code, one
+    /// per array element type, then `Z` and `H`. Derived from the tables so a
+    /// new type code widens the generated space instead of going untested.
+    const TAG_KIND_COUNT: usize = SCALAR_TYPES.len() + ARRAY_ELEMENT_TYPES.len() + 2;
+
+    /// Payload bytes supplied to [`encode_tag`], sized for the widest tag it
+    /// emits: a two-element `B:i`/`B:f` array.
+    const FILLER_LEN: usize = 8;
+
+    /// Encode one well-formed aux tag of the `kind`-th type code, drawing its
+    /// payload from `filler`.
+    ///
+    /// No byte this emits is `b'a'` or `b'd'`, so no window of the encoding can
+    /// spell the `ad` tag name. That is what lets the truncation property below
+    /// assert the walker returns *the planted array or nothing*: a walk that
+    /// desynchronizes into these bytes cannot resynchronize onto a header that
+    /// looks like the target.
+    fn encode_tag(name: [u8; 2], kind: usize, filler: [u8; FILLER_LEN]) -> Vec<u8> {
+        let mut out = name.to_vec();
+        if let Some(&(typ, width)) = SCALAR_TYPES.get(kind) {
+            out.push(typ);
+            out.extend_from_slice(&filler[..width]);
+        } else if let Some(&(subtype, width)) = ARRAY_ELEMENT_TYPES.get(kind - SCALAR_TYPES.len()) {
+            let count = usize::from(filler[0]) % 3;
+            out.push(b'B');
+            out.push(subtype);
+            out.extend_from_slice(&u32::try_from(count).expect("count fits u32").to_le_bytes());
+            out.extend_from_slice(&filler[..count * width]);
+        } else {
+            let terminated = if kind == TAG_KIND_COUNT - 2 { b'Z' } else { b'H' };
+            out.push(terminated);
+            out.extend_from_slice(&filler[..usize::from(filler[0]) % 5]);
+            out.push(0);
+        }
+        out
+    }
+
+    /// Bytes that make random buffers actually look like aux data: mostly
+    /// structural bytes the walker branches on, with arbitrary bytes mixed in.
+    fn aux_ish_byte() -> impl proptest::strategy::Strategy<Value = u8> {
+        proptest::prop_oneof![
+            4 => proptest::strategy::Just(b'B'),
+            4 => proptest::strategy::Just(b's'),
+            2 => proptest::strategy::Just(b'a'),
+            2 => proptest::strategy::Just(b'd'),
+            2 => proptest::strategy::Just(b'Z'),
+            2 => proptest::strategy::Just(0u8),
+            8 => proptest::prelude::any::<u8>(),
+        ]
+    }
+
+    proptest::proptest! {
+        /// Aux bytes reach this walker straight off disk, so arbitrary input has
+        /// to fail closed rather than panic. Anything it does hand back must
+        /// have come from inside the block: an array of `n` `i16`s cannot fit in
+        /// fewer than `2n` bytes, so a longer result means it read past the end.
+        #[test]
+        fn test_aux_walker_fails_closed_on_arbitrary_bytes(
+            aux in proptest::collection::vec(aux_ish_byte(), 0..64),
+            query in proptest::array::uniform2(proptest::prelude::any::<u8>()),
+        ) {
+            for tag in [query, *fgumi_tag::SamTag::AD_BASES] {
+                if let Some(found) = find_i16_array_tag_in_aux(&aux, tag) {
+                    proptest::prop_assert!(found.len() * 2 <= aux.len());
+                }
+            }
+        }
+
+        /// A planted array must be reachable behind any run of well-formed tags
+        /// -- each has to be skipped at exactly the right width -- and every
+        /// truncation of that block must yield the planted array or nothing.
+        #[test]
+        fn test_aux_walker_finds_planted_array_behind_arbitrary_tags(
+            prefix in proptest::collection::vec(
+                (
+                    (b'A'..=b'Z', b'0'..=b'9'),
+                    0..TAG_KIND_COUNT,
+                    proptest::array::uniform8(0x01u8..=0x39),
+                ),
+                0..6,
+            ),
+            // Values are built from two low bytes rather than arbitrary `i16`s
+            // so the payload cannot spell an `ad` tag name either.
+            value_bytes in proptest::collection::vec((0x01u8..=0x39, 0x01u8..=0x39), 0..8),
+        ) {
+            let values: Vec<i16> =
+                value_bytes.iter().map(|&(lo, hi)| i16::from_le_bytes([lo, hi])).collect();
+
+            let mut aux = Vec::new();
+            for &((first, second), kind, filler) in &prefix {
+                aux.extend_from_slice(&encode_tag([first, second], kind, filler));
+            }
+            push_i16_array(&mut aux, *fgumi_tag::SamTag::AD_BASES, &values);
+
+            proptest::prop_assert_eq!(
+                find_i16_array_tag_in_aux(&aux, *fgumi_tag::SamTag::AD_BASES),
+                Some(values.clone()),
+            );
+
+            for cut in 0..aux.len() {
+                let found = find_i16_array_tag_in_aux(&aux[..cut], *fgumi_tag::SamTag::AD_BASES);
+                proptest::prop_assert!(
+                    found.is_none() || found.as_ref() == Some(&values),
+                    "truncating to {cut} bytes produced {found:?}, not the planted {values:?}",
+                );
+            }
+        }
+    }
 }
