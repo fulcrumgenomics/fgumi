@@ -75,7 +75,7 @@ impl<K: RawSortKey> PooledChunkWriter<K> {
 
         let pp = Arc::clone(&permit_pool);
         let io_handle =
-            thread::spawn(move || io_writer_loop(writer, result_rx, buffer_pool, pp, codec));
+            thread::spawn(move || io_writer_loop(writer, result_rx, buffer_pool, pp, codec, None));
 
         Ok(Self {
             staging: Some(StagingBuffer::new(pool, result_tx, permit_pool, codec)),

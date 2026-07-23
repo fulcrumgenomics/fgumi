@@ -16,8 +16,9 @@ use noodles_bgzf::io::Writer as BgzfWriter;
 use noodles_csi::binning_index::Indexer;
 use noodles_csi::binning_index::index::reference_sequence::bin::Chunk;
 use noodles_csi::binning_index::index::reference_sequence::index::LinearIndex;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{self, Write};
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
@@ -25,8 +26,57 @@ use std::path::{Path, PathBuf};
 use crate::paths::is_stdout_path;
 use crate::vendored::{BlockInfoRx, MultithreadedWriter, MultithreadedWriterBuilder};
 
-/// Maximum uncompressed BGZF block size (64KB - 256 bytes for overhead).
-const MAX_BLOCK_SIZE: usize = 65280;
+/// Maximum uncompressed BGZF block size.
+///
+/// [`compute_end_vpos`] serves two writers, so this must match the block size
+/// both of them flush at:
+///
+/// - The sort engine's pooled writer flushes at `fgumi_bgzf::BGZF_MAX_BLOCK_SIZE`,
+///   which is itself this same `bgzf::BGZF_BLOCK_SIZE` — deriving the constant
+///   here (rather than hardcoding 65280) means that path's virtual-offset math
+///   and block layout cannot silently diverge.
+/// - [`IndexingBamWriter`] flushes at the vendored `MultithreadedWriter`'s own
+///   `BGZF_BLOCK_SIZE` (`crate::vendored::bgzf_multithreaded`), a deliberately
+///   independent copy that keeps the vendored module self-contained. It is equal
+///   to this value today; keep the two in step, since nothing enforces it.
+const MAX_BLOCK_SIZE: usize = bgzf::BGZF_BLOCK_SIZE;
+
+/// Fast, non-cryptographic hasher for the dense sequential `u64` block numbers
+/// used as `block_positions` keys.
+///
+/// One multiplicative (Fibonacci) step spreads sequential keys across the full
+/// 64-bit space — enough entropy for both hashbrown's bucket index and its
+/// control byte — at the cost of a single multiply and no DoS-resistant mixing,
+/// which this internal, non-adversarial map does not need. A standard hasher
+/// (`ahash`, `FxHash`) would also serve, but each costs several
+/// multiply-equivalents per `u64`; this map is hot in the merge, so the single
+/// multiply is deliberate.
+#[derive(Default)]
+struct BlockHasher(u64);
+
+impl Hasher for BlockHasher {
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        // 2^64 / golden ratio; odd, so the multiply is a bijection over u64.
+        self.0 = (self.0 ^ n).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // `u64` keys hash via `write_u64`; this path is unused but required by
+        // the trait. Fold bytes in (FNV-style) so any stray key still hashes.
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3);
+        }
+    }
+}
+
+/// `block_number -> compressed start offset`, hashed with [`BlockHasher`].
+type BlockPositions = HashMap<u64, u64, BuildHasherDefault<BlockHasher>>;
 
 /// Resolve the end virtual position for a BAM record that begins in
 /// `start_block` at offset `start_block_start` in the compressed stream.
@@ -39,7 +89,7 @@ const MAX_BLOCK_SIZE: usize = 65280;
 /// block hasn't been completed yet (caller should defer the entry).
 #[allow(clippy::cast_possible_truncation)]
 fn compute_end_vpos(
-    block_positions: &HashMap<u64, u64>,
+    block_positions: &BlockPositions,
     start_block: u64,
     start_block_start: u64,
     end_offset: usize,
@@ -310,6 +360,188 @@ struct CachedIndexEntry {
     alignment_context: Option<(usize, Position, Position, bool)>,
 }
 
+/// Extract alignment context from raw BAM bytes.
+///
+/// Returns `Some((ref_id, start, end, is_mapped))` for mapped reads, or `None`
+/// for unmapped reads (the indexer still counts them via a `None` context).
+#[inline]
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+pub(crate) fn extract_alignment_context(bam: &[u8]) -> Option<(usize, Position, Position, bool)> {
+    let v = fgumi_raw_bam::RawRecordView::new(bam);
+    let tid = v.ref_id();
+    let pos = v.pos();
+    let flags = v.flags();
+
+    let is_unmapped = (flags & fgumi_raw_bam::flags::UNMAPPED) != 0;
+
+    // Unmapped reads: return None (indexer handles them specially).
+    if tid < 0 || is_unmapped {
+        return None;
+    }
+
+    // Calculate alignment end from CIGAR using byte-safe access
+    // (doesn't require 4-byte alignment like get_cigar_ops).
+    let ref_len = fgumi_raw_bam::reference_length_from_raw_bam(bam);
+
+    // BAM positions are 0-based, Position is 1-based.
+    let start = Position::try_from((pos + 1) as usize).ok()?;
+    let end = Position::try_from((pos + ref_len) as usize).ok()?;
+
+    Some((tid as usize, start, end, true))
+}
+
+/// Incrementally builds a BAI index from per-record positions plus per-block
+/// compressed offsets, independent of the concrete BGZF writer.
+///
+/// A writer feeds each written record's `(block_number, offset_in_block,
+/// record_len)` via [`BaiBuilder::record`], and each finalized block's
+/// `(block_number, compressed_start)` via [`BaiBuilder::note_block`].
+/// [`BaiBuilder::resolve`] converts every record whose block position is now
+/// known into an indexed chunk (records spanning multiple blocks are deferred
+/// until their terminal block is known). [`BaiBuilder::build`] produces the
+/// final [`bai::Index`] once all records are resolved.
+///
+/// This is the shared core behind both [`IndexingBamWriter`] (over the vendored
+/// multi-threaded writer) and the sort engine's pool-integrated indexing writer,
+/// so the virtual-offset accounting lives in exactly one place.
+pub struct BaiBuilder {
+    indexer: Indexer<LinearIndex>,
+    /// Records awaiting block-position resolution, in write order (which is
+    /// non-decreasing block order) — resolved strictly from the front.
+    entry_cache: VecDeque<CachedIndexEntry>,
+    /// `block_number` -> compressed start offset in the file.
+    block_positions: BlockPositions,
+    /// Watermark: every block number below this has been pruned from
+    /// `block_positions` once its records resolved. Keeps the map bounded by the
+    /// in-flight block window instead of growing one entry per output block for
+    /// the whole (WGS-scale) file.
+    pruned_below: u64,
+}
+
+impl BaiBuilder {
+    /// Create an empty builder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            indexer: Indexer::default(),
+            entry_cache: VecDeque::new(),
+            block_positions: BlockPositions::default(),
+            pruned_below: 0,
+        }
+    }
+
+    /// Record a written BAM record's position for later index resolution.
+    ///
+    /// `block_number`/`offset_in_block` locate the record's first byte in the
+    /// uncompressed stream; `record_len` includes the 4-byte length prefix.
+    /// The alignment context is extracted from `record_bytes` eagerly.
+    pub fn record(
+        &mut self,
+        block_number: u64,
+        offset_in_block: usize,
+        record_len: usize,
+        record_bytes: &[u8],
+    ) {
+        let alignment_context = extract_alignment_context(record_bytes);
+        self.entry_cache.push_back(CachedIndexEntry {
+            block_number,
+            offset_in_block,
+            record_len,
+            alignment_context,
+        });
+    }
+
+    /// Note the compressed start offset of a finalized block.
+    pub fn note_block(&mut self, block_number: u64, compressed_start: u64) {
+        self.block_positions.insert(block_number, compressed_start);
+    }
+
+    /// Resolve pending records whose block positions are now known.
+    ///
+    /// Records are cached in write order (non-decreasing block number) and
+    /// blocks are noted in increasing order, so resolution proceeds strictly
+    /// from the front — which is also the order the indexer must receive records
+    /// in. It stops at the first record whose start (or, for a record spanning
+    /// multiple blocks, terminal) block has not yet been noted, leaving it and
+    /// everything after it cached. This is `O(records resolved)` per call, not
+    /// `O(cache length)`, so per-record resolution stays amortized `O(1)`.
+    ///
+    /// # Errors
+    /// Returns an error if the indexer rejects a record.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn resolve(&mut self) -> io::Result<()> {
+        while let Some(entry) = self.entry_cache.front() {
+            // Copy out the fields so the front() borrow ends before pop_front().
+            let block_number = entry.block_number;
+            let offset_in_block = entry.offset_in_block;
+            let record_len = entry.record_len;
+            let alignment_context = entry.alignment_context;
+
+            let Some(&block_start) = self.block_positions.get(&block_number) else {
+                break;
+            };
+
+            // End position may fall in this block or a later one (long reads /
+            // large aux payloads can span more than one BGZF block). If the
+            // terminal block isn't noted yet, wait for it.
+            let end_offset = offset_in_block + record_len;
+            let Some(end_vpos) =
+                compute_end_vpos(&self.block_positions, block_number, block_start, end_offset)
+            else {
+                break;
+            };
+
+            let start_vpos = VirtualPosition::try_from((block_start, offset_in_block as u16))
+                .unwrap_or(VirtualPosition::MIN);
+            let chunk = Chunk::new(start_vpos, end_vpos);
+            self.indexer.add_record(alignment_context, chunk).map_err(io::Error::other)?;
+            self.entry_cache.pop_front();
+        }
+
+        // Prune block offsets no remaining or future record can reference. Every
+        // pending entry has block_number >= the front's, and future records are
+        // recorded with even larger block numbers, so blocks below the front are
+        // dead. Advancing a watermark (block numbers are dense sequential
+        // serials) makes this O(1) amortized and bounds `block_positions` to the
+        // in-flight window.
+        if let Some(front_block) = self.entry_cache.front().map(|e| e.block_number) {
+            while self.pruned_below < front_block {
+                self.block_positions.remove(&self.pruned_below);
+                self.pruned_below += 1;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Number of records still awaiting block-position resolution.
+    #[must_use]
+    pub(crate) fn pending(&self) -> usize {
+        self.entry_cache.len()
+    }
+
+    /// Build the final BAI index.
+    ///
+    /// # Errors
+    /// Returns an error if any record remains unresolved (its block position was
+    /// never noted), which would indicate a lost or miscounted block.
+    pub fn build(self, num_refs: usize) -> io::Result<bai::Index> {
+        if !self.entry_cache.is_empty() {
+            return Err(io::Error::other(format!(
+                "Unflushed index entries remain: {} entries",
+                self.entry_cache.len()
+            )));
+        }
+        Ok(self.indexer.build(num_refs))
+    }
+}
+
+impl Default for BaiBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// BAM writer that builds an index incrementally during write.
 ///
 /// This writer generates a BAI (BAM index) file alongside the BAM output by tracking
@@ -332,11 +564,8 @@ struct CachedIndexEntry {
 pub struct IndexingBamWriter {
     inner: MultithreadedWriter<File>,
     block_info_rx: BlockInfoRx,
-    indexer: Indexer<LinearIndex>,
+    bai: BaiBuilder,
     num_refs: usize,
-    // Block-aware caching (htslib-style)
-    entry_cache: Vec<CachedIndexEntry>,
-    block_positions: HashMap<u64, u64>,
     current_block_number: u64,
     current_block_offset: usize,
 }
@@ -353,10 +582,8 @@ impl IndexingBamWriter {
             current_block_offset: inner.buffer_offset(),
             inner,
             block_info_rx,
-            indexer: Indexer::default(),
+            bai: BaiBuilder::new(),
             num_refs,
-            entry_cache: Vec::new(),
-            block_positions: HashMap::new(),
         }
     }
 
@@ -407,101 +634,19 @@ impl IndexingBamWriter {
             self.current_block_offset = self.inner.buffer_offset();
         }
 
-        // Cache entry for later resolution
-        let alignment_context = Self::extract_alignment_context(record_bytes);
-        self.entry_cache.push(CachedIndexEntry {
-            block_number,
-            offset_in_block,
-            record_len,
-            alignment_context,
-        });
-
-        // Process any completed blocks
+        // Cache the record's position, then resolve any completed blocks.
+        self.bai.record(block_number, offset_in_block, record_len, record_bytes);
         self.flush_completed_blocks()?;
 
         Ok(())
     }
 
-    /// Process block completion notifications and resolve cached index entries.
-    #[allow(clippy::cast_possible_truncation)]
+    /// Drain block-position notifications and resolve any now-complete records.
     fn flush_completed_blocks(&mut self) -> io::Result<()> {
-        // Drain block info from receiver
         while let Ok(info) = self.block_info_rx.try_recv() {
-            self.block_positions.insert(info.block_number, info.compressed_start);
+            self.bai.note_block(info.block_number, info.compressed_start);
         }
-
-        // Flush cached entries for completed blocks
-        let mut i = 0;
-        while i < self.entry_cache.len() {
-            let entry = &self.entry_cache[i];
-
-            if let Some(&block_start) = self.block_positions.get(&entry.block_number) {
-                // Block is complete - calculate virtual positions
-                let start_vpos =
-                    VirtualPosition::try_from((block_start, entry.offset_in_block as u16))
-                        .unwrap_or(VirtualPosition::MIN);
-
-                // End position: same block, next block, or any block further
-                // along (long reads / large aux payloads can span more than two
-                // BGZF blocks).
-                let end_offset = entry.offset_in_block + entry.record_len;
-                let Some(end_vpos) = compute_end_vpos(
-                    &self.block_positions,
-                    entry.block_number,
-                    block_start,
-                    end_offset,
-                ) else {
-                    // A later block isn't ready yet — defer this entry.
-                    i += 1;
-                    continue;
-                };
-
-                let chunk = Chunk::new(start_vpos, end_vpos);
-                if let Some(ctx) = entry.alignment_context {
-                    self.indexer.add_record(Some(ctx), chunk).map_err(io::Error::other)?;
-                } else {
-                    // Unmapped record
-                    self.indexer.add_record(None, chunk).map_err(io::Error::other)?;
-                }
-
-                self.entry_cache.remove(i);
-            } else {
-                i += 1;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Extract alignment context from raw BAM bytes.
-    ///
-    /// Returns `Some((ref_id, start, end, is_mapped))` for mapped reads,
-    /// or `None` for unmapped reads (needed for unmapped record counting).
-    #[inline]
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-    fn extract_alignment_context(bam: &[u8]) -> Option<(usize, Position, Position, bool)> {
-        // Extract fields from BAM record
-        let v = fgumi_raw_bam::RawRecordView::new(bam);
-        let tid = v.ref_id();
-        let pos = v.pos();
-        let flags = v.flags();
-
-        let is_unmapped = (flags & fgumi_raw_bam::flags::UNMAPPED) != 0;
-
-        // Unmapped reads: return None (indexer handles them specially)
-        if tid < 0 || is_unmapped {
-            return None;
-        }
-
-        // Calculate alignment end from CIGAR using byte-safe access
-        // (doesn't require 4-byte alignment like get_cigar_ops)
-        let ref_len = fgumi_raw_bam::reference_length_from_raw_bam(bam);
-
-        // BAM positions are 0-based, Position is 1-based
-        let start = Position::try_from((pos + 1) as usize).ok()?;
-        let end = Position::try_from((pos + ref_len) as usize).ok()?;
-
-        Some((tid as usize, start, end, true))
+        self.bai.resolve()
     }
 
     /// Finish writing, flush the BGZF stream, and return the index.
@@ -516,7 +661,7 @@ impl IndexingBamWriter {
         // Wait a bit for the writer thread to finish processing
         for _ in 0..100 {
             self.flush_completed_blocks()?;
-            if self.entry_cache.is_empty() {
+            if self.bai.pending() == 0 {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -528,17 +673,9 @@ impl IndexingBamWriter {
         // Final flush of any remaining entries
         self.flush_completed_blocks()?;
 
-        // All entries should be flushed now
-        if !self.entry_cache.is_empty() {
-            return Err(io::Error::other(format!(
-                "Unflushed index entries remain: {} entries",
-                self.entry_cache.len()
-            )));
-        }
-
-        // Build the final index
-        let index = self.indexer.build(self.num_refs);
-        Ok(index)
+        // Build the final index (errors if any entry remained unresolved).
+        let num_refs = self.num_refs;
+        self.bai.build(num_refs)
     }
 }
 
@@ -663,11 +800,16 @@ pub fn write_bai_sidecar<P: AsRef<Path>>(bam_path: P) -> Result<PathBuf> {
 /// Returns an error if the file cannot be created or writing the index fails.
 pub fn write_bai_index<P: AsRef<Path>>(path: P, index: &bai::Index) -> Result<()> {
     let path_ref = path.as_ref();
-    let file = File::create(path_ref)
-        .with_context(|| format!("Failed to create index file: {}", path_ref.display()))?;
-    let mut writer = bai::io::Writer::new(file);
-    writer
+    // `bai::io::Writer` serializes the index as a great many tiny fields (each
+    // bin and chunk writes 8-byte virtual offsets), so writing straight to the
+    // file issues one `write()` syscall per field. For a WGS-scale index (tens
+    // of MB) that unbuffered tail dominates the post-merge main-thread time.
+    // Serialize into memory first, then write the whole sidecar in one call.
+    let mut buf = Vec::new();
+    bai::io::Writer::new(&mut buf)
         .write_index(index)
+        .with_context(|| format!("Failed to serialize BAI index for: {}", path_ref.display()))?;
+    std::fs::write(path_ref, &buf)
         .with_context(|| format!("Failed to write index to: {}", path_ref.display()))?;
     Ok(())
 }
@@ -1093,7 +1235,7 @@ mod tests {
 
     /// Build a `block_positions` map mapping `[0..n)` to deterministic
     /// compressed offsets so virtual positions are easy to assert against.
-    fn make_block_positions(n: u64) -> HashMap<u64, u64> {
+    fn make_block_positions(n: u64) -> BlockPositions {
         // Use 0x10000-step starts so each block is at a distinct, recognizable
         // virtual offset.
         (0..n).map(|i| (i, i * 0x1_0000)).collect()
@@ -1147,7 +1289,7 @@ mod tests {
     #[test]
     fn test_compute_end_vpos_multi_block_lookup_uses_terminal_block() {
         // A record that spans blocks 5..7 (start block 5, ends in block 7).
-        let mut positions = HashMap::new();
+        let mut positions = BlockPositions::default();
         positions.insert(5u64, 0x5_0000u64);
         // Block 6 missing on purpose — we only need the terminal block start.
         positions.insert(7u64, 0x7_0000u64);
@@ -1168,7 +1310,7 @@ mod tests {
     #[test]
     fn test_compute_end_vpos_offset_within_starting_block() {
         // Start somewhere in the middle of block 3; record extends into block 4.
-        let mut positions = HashMap::new();
+        let mut positions = BlockPositions::default();
         positions.insert(3u64, 0x3_0000u64);
         positions.insert(4u64, 0x4_0000u64);
 
