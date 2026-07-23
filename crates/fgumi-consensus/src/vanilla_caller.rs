@@ -5,7 +5,10 @@
 //! sequence using a likelihood-based model.
 
 use crate::base_builder::ConsensusBaseBuilder;
-use crate::caller::{ConsensusCaller, ConsensusCallingStats, ConsensusOutput, RejectionReason};
+use crate::caller::{
+    ConsensusCaller, ConsensusCallingStats, ConsensusOutput, RejectionReason,
+    write_consensus_read_name,
+};
 use crate::phred::{
     MIN_PHRED, NO_CALL_BASE, NO_CALL_BASE_LOWER, PhredScore, ln_error_prob_two_trials,
     ln_prob_to_phred, phred_to_ln_error_prob,
@@ -386,6 +389,9 @@ pub struct VanillaUmiConsensusCaller {
 
     /// Reference sequence names indexed by `ref_id` (for mapping `ref_id` → contig name).
     ref_names: Option<std::sync::Arc<Vec<String>>>,
+
+    /// Reusable buffer holding the read name of the consensus record being built.
+    read_name_buf: Vec<u8>,
 }
 
 #[expect(
@@ -450,6 +456,7 @@ impl VanillaUmiConsensusCaller {
             bam_builder: UnmappedSamBuilder::new(),
             reference: None,
             ref_names: None,
+            read_name_buf: Vec::new(),
         }
     }
 
@@ -1454,7 +1461,7 @@ impl VanillaUmiConsensusCaller {
         errors: &[u16],
         methylation: Option<&crate::methylation::MethylationAnnotation>,
     ) -> Result<()> {
-        let read_name = format!("{}:{}", self.read_name_prefix, umi);
+        write_consensus_read_name(&mut self.read_name_buf, &self.read_name_prefix, umi);
 
         let mut flag = flags::UNMAPPED;
         match read_type {
@@ -1469,7 +1476,7 @@ impl VanillaUmiConsensusCaller {
 
         // The UMI is input-derived, so an over-long name is bad data rather than
         // a bug; propagate instead of panicking mid-write.
-        self.bam_builder.try_build_record(read_name.as_bytes(), flag, bases, quals)?;
+        self.bam_builder.try_build_record(&self.read_name_buf, flag, bases, quals)?;
 
         // RG tag
         self.bam_builder.append_string_tag(SamTag::RG, self.read_group_id.as_bytes());

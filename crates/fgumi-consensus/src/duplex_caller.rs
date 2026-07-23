@@ -204,7 +204,7 @@ use noodles::sam::alignment::record_buf::RecordBuf;
 use crate::caller::ConsensusOutput;
 use crate::caller::{
     ConsensusCaller, ConsensusCallingStats, RejectionReason, clamp_combined_error_to_fgbio_short,
-    clamp_per_base_to_fgbio_short,
+    clamp_per_base_to_fgbio_short, write_consensus_read_name,
 };
 use crate::phred::MAX_PHRED;
 use crate::phred::{MIN_PHRED, PhredScore};
@@ -1029,6 +1029,7 @@ impl DuplexConsensusCaller {
     ///
     /// # Arguments
     /// * `builder` - Reusable builder for raw BAM record construction
+    /// * `read_name_buf` - Reusable buffer holding the record's read name
     /// * `output` - `ConsensusOutput` to append the record into
     /// * `consensus` - The duplex consensus read to convert
     /// * `read_type` - Whether this is R1 or R2
@@ -1056,6 +1057,7 @@ impl DuplexConsensusCaller {
     )]
     pub(crate) fn duplex_read_into(
         builder: &mut UnmappedSamBuilder,
+        read_name_buf: &mut Vec<u8>,
         output: &mut ConsensusOutput,
         consensus: &DuplexConsensusRead,
         read_type: ReadType,
@@ -1085,10 +1087,10 @@ impl DuplexConsensusCaller {
         }
 
         // Build the record (name, flags, bases, quals)
-        let read_name = format!("{read_name_prefix}:{umi}");
+        write_consensus_read_name(read_name_buf, read_name_prefix, umi);
         // The UMI is input-derived, so an over-long name is bad data rather than
         // a bug; propagate instead of panicking mid-write.
-        builder.try_build_record(read_name.as_bytes(), flag, &consensus.bases, &consensus.quals)?;
+        builder.try_build_record(read_name_buf, flag, &consensus.bases, &consensus.quals)?;
 
         // 1. MI tag (string)
         builder.append_string_tag(SamTag::MI, umi.as_bytes());
@@ -1765,6 +1767,7 @@ impl DuplexConsensusCaller {
     ) -> Result<(ConsensusOutput, ConsensusCallingStats, Vec<Vec<u8>>)> {
         let mut stats = ConsensusCallingStats::new();
         let mut builder = UnmappedSamBuilder::new();
+        let mut read_name_buf = Vec::new();
         let mut output = ConsensusOutput::default();
         let methylation_mode = ss_caller.options.methylation_mode;
 
@@ -2081,6 +2084,7 @@ impl DuplexConsensusCaller {
                         // Write DuplexConsensusReads as raw bytes
                         Self::duplex_read_into(
                             &mut builder,
+                            &mut read_name_buf,
                             &mut output,
                             &dr1,
                             ReadType::R1,
@@ -2097,6 +2101,7 @@ impl DuplexConsensusCaller {
                         )?;
                         Self::duplex_read_into(
                             &mut builder,
+                            &mut read_name_buf,
                             &mut output,
                             &dr2,
                             ReadType::R2,
@@ -2133,6 +2138,7 @@ impl DuplexConsensusCaller {
                         let empty: &[&RawRecord] = &[];
                         Self::duplex_read_into(
                             &mut builder,
+                            &mut read_name_buf,
                             &mut output,
                             &dr1,
                             ReadType::R1,
@@ -2149,6 +2155,7 @@ impl DuplexConsensusCaller {
                         )?;
                         Self::duplex_read_into(
                             &mut builder,
+                            &mut read_name_buf,
                             &mut output,
                             &dr2,
                             ReadType::R2,
@@ -2185,6 +2192,7 @@ impl DuplexConsensusCaller {
                         let empty: &[&RawRecord] = &[];
                         Self::duplex_read_into(
                             &mut builder,
+                            &mut read_name_buf,
                             &mut output,
                             &dr1,
                             ReadType::R1,
@@ -2201,6 +2209,7 @@ impl DuplexConsensusCaller {
                         )?;
                         Self::duplex_read_into(
                             &mut builder,
+                            &mut read_name_buf,
                             &mut output,
                             &dr2,
                             ReadType::R2,
@@ -4379,9 +4388,12 @@ mod tests {
         };
 
         let mut builder = UnmappedSamBuilder::new();
+
+        let mut read_name_buf = Vec::new();
         let mut output = ConsensusOutput::default();
         DuplexConsensusCaller::duplex_read_into(
             &mut builder,
+            &mut read_name_buf,
             &mut output,
             &duplex,
             ReadType::Fragment,
@@ -4780,9 +4792,12 @@ mod tests {
         let cell_barcode = "ACGTACGT-1";
 
         let mut builder = UnmappedSamBuilder::new();
+
+        let mut read_name_buf = Vec::new();
         let mut output = ConsensusOutput::default();
         DuplexConsensusCaller::duplex_read_into(
             &mut builder,
+            &mut read_name_buf,
             &mut output,
             &duplex,
             ReadType::Fragment,
@@ -4831,9 +4846,12 @@ mod tests {
         };
 
         let mut builder = UnmappedSamBuilder::new();
+
+        let mut read_name_buf = Vec::new();
         let mut output = ConsensusOutput::default();
         DuplexConsensusCaller::duplex_read_into(
             &mut builder,
+            &mut read_name_buf,
             &mut output,
             &duplex,
             ReadType::Fragment,
@@ -4962,9 +4980,12 @@ mod tests {
         };
 
         let mut builder = UnmappedSamBuilder::new();
+
+        let mut read_name_buf = Vec::new();
         let mut output = ConsensusOutput::default();
         DuplexConsensusCaller::duplex_read_into(
             &mut builder,
+            &mut read_name_buf,
             &mut output,
             &duplex,
             ReadType::R1,
@@ -5035,9 +5056,12 @@ mod tests {
         };
 
         let mut builder = UnmappedSamBuilder::new();
+
+        let mut read_name_buf = Vec::new();
         let mut output = ConsensusOutput::default();
         DuplexConsensusCaller::duplex_read_into(
             &mut builder,
+            &mut read_name_buf,
             &mut output,
             &duplex,
             ReadType::R1,
@@ -5105,9 +5129,12 @@ mod tests {
         };
 
         let mut builder = UnmappedSamBuilder::new();
+
+        let mut read_name_buf = Vec::new();
         let mut output = ConsensusOutput::default();
         DuplexConsensusCaller::duplex_read_into(
             &mut builder,
+            &mut read_name_buf,
             &mut output,
             &duplex,
             ReadType::R1,
@@ -5213,9 +5240,12 @@ mod tests {
         };
 
         let mut builder = UnmappedSamBuilder::new();
+
+        let mut read_name_buf = Vec::new();
         let mut output = ConsensusOutput::default();
         DuplexConsensusCaller::duplex_read_into(
             &mut builder,
+            &mut read_name_buf,
             &mut output,
             &duplex,
             ReadType::R1,
@@ -5274,9 +5304,11 @@ mod tests {
         // Helper to build and parse a single record
         let build_and_parse = |read_type: ReadType| -> ParsedBamRecord {
             let mut builder = UnmappedSamBuilder::new();
+            let mut read_name_buf = Vec::new();
             let mut output = ConsensusOutput::default();
             DuplexConsensusCaller::duplex_read_into(
                 &mut builder,
+                &mut read_name_buf,
                 &mut output,
                 &duplex,
                 read_type,
@@ -6106,9 +6138,12 @@ mod tests {
         let duplex = duplex_result.expect("Should produce duplex consensus");
 
         let mut builder = UnmappedSamBuilder::new();
+
+        let mut read_name_buf = Vec::new();
         let mut output = ConsensusOutput::default();
         DuplexConsensusCaller::duplex_read_into(
             &mut builder,
+            &mut read_name_buf,
             &mut output,
             &duplex,
             ReadType::Fragment,
