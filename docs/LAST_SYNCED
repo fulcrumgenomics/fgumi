@@ -1,4 +1,4 @@
 # Last commit reviewed for guide accuracy.
 # Run: git log <hash>..HEAD -- src/lib/commands/ src/commands/
 # to see what changed since the last guide update.
-2f14de1cc487c4d0fe2f3f8cf28abfc9fc12ae28
+fb814f2a9f1a26d77fa29d878527579d3b10bd4c

@@ -154,7 +154,7 @@ PERFORMANCE:
   - Configurable temp file compression (--temp-compression)
   - Default 768M per-thread memory limit (samtools-compatible); pass
     `--max-memory auto` to detect system memory (opt-in)
-  - Spilled runs are consolidated once they exceed `--max-temp-files`
+  - Spilled runs are consolidated once they reach `--max-temp-files`
     (default 64, matching samtools); raise it to avoid repeated
     consolidation passes on very large inputs
 
@@ -342,12 +342,12 @@ pub struct Sort {
     /// the final k-way merge opens fewer files at once. Raising it avoids
     /// repeated consolidation passes on very large inputs (at the cost of more
     /// open file descriptors during the final merge); lowering it keeps fewer
-    /// files open. Must be at least 2; for effectively unlimited, pass a large
-    /// value.
+    /// files open. Must be at least 2; to effectively disable consolidation,
+    /// pass a value larger than the number of runs you expect to spill.
     ///
     /// When unset, a built-in default is used (see this command's help
     /// overview for the default value).
-    #[arg(long = "max-temp-files", value_parser = parse_max_temp_files)]
+    #[arg(long = "max-temp-files", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(2..))]
     pub max_temp_files: Option<usize>,
 
     /// Write BAM index (.bai) alongside output.
@@ -428,19 +428,6 @@ pub(crate) fn parse_key_types(s: &str) -> Result<KeyTypesSpec, String> {
         }
     }
     Ok(KeyTypesSpec::Explicit { cb, tertiary })
-}
-
-/// Parse `--max-temp-files`: a spill-file consolidation limit of at least 2.
-///
-/// Values below 2 are meaningless (a merge needs at least two inputs) and are
-/// rejected rather than silently clamped. For an effectively unlimited limit,
-/// pass a large value.
-pub(crate) fn parse_max_temp_files(s: &str) -> Result<usize, String> {
-    let n: usize = s.parse().map_err(|_| format!("`{s}` is not a non-negative integer"))?;
-    if n < 2 {
-        return Err(format!("must be at least 2 (got {n})"));
-    }
-    Ok(n)
 }
 
 impl Command for Sort {
@@ -876,6 +863,7 @@ mod tests {
     /// builder then applies the engine default).
     #[rstest]
     #[case::unset(&[], None)]
+    #[case::minimum(&["--max-temp-files", "2"], Some(2))]
     #[case::explicit(&["--max-temp-files", "256"], Some(256))]
     #[case::large(&["--max-temp-files", "100000"], Some(100_000))]
     fn test_parse_max_temp_files(#[case] extra: &[&str], #[case] expected: Option<usize>) {
@@ -885,11 +873,16 @@ mod tests {
         assert_eq!(sort.max_temp_files, expected);
     }
 
-    /// Values below 2 are rejected at parse time rather than silently clamped.
+    /// Invalid values are rejected at parse time rather than silently clamped or
+    /// truncated: values below the floor of 2 (a merge needs at least two
+    /// inputs), and non-numeric, negative, or overflowing input.
     #[rstest]
     #[case::zero("0")]
     #[case::one("1")]
-    fn test_parse_max_temp_files_rejects_below_two(#[case] value: &str) {
+    #[case::non_numeric("abc")]
+    #[case::negative("-1")]
+    #[case::overflow("99999999999999999999999999")]
+    fn test_parse_max_temp_files_rejects_invalid(#[case] value: &str) {
         let args = [
             "sort",
             "-i",
