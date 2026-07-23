@@ -1330,26 +1330,21 @@ impl Command for GroupReadsByUmi {
                     filter_config.min_umi_length,
                     no_umi,
                 ) {
-                    log::warn!("UMI assignment failed, returning empty group: {e}");
-                    // The caller merges these metrics, so zero the accepted count
-                    // to match the zero records this group contributes. Otherwise
-                    // the grouping metrics report more accepted templates than the
-                    // output BAM holds.
-                    let mut filter_metrics = filter_metrics;
-                    filter_metrics.accepted_templates = 0;
+                    // A failed assignment means this position group's reads cannot be
+                    // grouped at all — an unparseable UMI for the chosen strategy, a
+                    // missing `RX` tag, mixed UMI lengths. Substituting an empty group
+                    // would silently drop every read in it and still exit 0, so fail
+                    // the run and let the user fix the input or the strategy.
                     #[cfg(feature = "memory-debug")]
                     if debug_memory_flag
                         && let Some(stats) = stats_for_tracking.as_ref() {
                             stats.track_position_group_memory(initial_group_size, false);
                             stats.track_template_memory(_template_memory_size, false);
                         }
-                    return Ok(ProcessedPositionGroup {
-                        templates: Vec::new(),
-                        family_sizes: AHashMap::new(),
-                        filter_metrics,
-                        input_record_count,
-                        distinct_mi_count: 0,
-                    });
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Failed to assign UMI groups: {e:#}"),
+                    ));
                 }
 
                 // Compute the number of distinct numeric molecule IDs assigned in this group.
@@ -1721,9 +1716,6 @@ impl GroupReadsByUmi {
             .filter(|t| filter_template_raw(t, filter_config, &mut filter_metrics))
             .collect();
 
-        // Merge filter metrics. Remember this group's contribution so it can be
-        // rolled back if UMI assignment fails below and the group emits nothing.
-        let accepted_before_assignment = filter_metrics.accepted_templates;
         total_filter_metrics.merge(&filter_metrics);
 
         if filtered_templates.is_empty() {
@@ -1742,25 +1734,20 @@ impl GroupReadsByUmi {
         let assigner =
             create_umi_assigner(strategy, effective_edits, index_threshold, threads, use_parallel);
 
-        // Assign UMI groups
+        // Assign UMI groups. A failure means this position group's reads cannot be
+        // grouped at all — an unparseable UMI for the chosen strategy, a missing
+        // `RX` tag, mixed UMI lengths — so fail the run rather than skipping the
+        // group. Skipping silently dropped every read in it while still exiting 0.
+        // Kept in lockstep with the streaming path's equivalent check.
         let mut templates = filtered_templates;
-        if let Err(e) = assign_umi_groups_impl(
+        assign_umi_groups_impl(
             &mut templates,
             assigner.as_ref(),
             raw_tag,
             filter_config.min_umi_length,
             filter_config.no_umi,
-        ) {
-            // Log error but continue processing. The group's filter metrics were
-            // already merged above, so roll back its accepted count: no records
-            // are emitted for this group, and leaving the count in place would
-            // make the `--metrics` grouping file and the run summary claim more
-            // accepted templates than the output BAM actually contains.
-            log::warn!("Failed to assign UMI groups: {e}");
-            total_filter_metrics.accepted_templates =
-                total_filter_metrics.accepted_templates.saturating_sub(accepted_before_assignment);
-            return Ok(());
-        }
+        )
+        .context("Failed to assign UMI groups")?;
 
         // Sort templates directly by (MI index, name) - avoids Vec<Vec<Template>> allocation
         templates.sort_by(|a, b| {
@@ -2129,15 +2116,6 @@ mod tests {
 
     /// Creates a `GroupReadsByUmi` with common test defaults.
     /// Tests override specific fields as needed via struct update syntax.
-    /// Pull a single named column out of the one-row grouping metrics TSV.
-    fn parse_grouping_metric(text: &str, column: &str) -> Option<u64> {
-        let mut lines = text.lines().filter(|l| !l.trim().is_empty());
-        let header = lines.next()?;
-        let idx = header.split('\t').position(|c| c == column)?;
-        let row = lines.next()?;
-        row.split('\t').nth(idx)?.trim().parse().ok()
-    }
-
     fn test_group_cmd(strategy: Strategy, edits: u32) -> GroupReadsByUmi {
         GroupReadsByUmi {
             io: BamIoOptions {
@@ -2550,25 +2528,24 @@ mod tests {
     // Integration Tests
     // ========================================================================
 
-    /// When UMI assignment fails for a position group, `group` warns, emits zero
-    /// records for that group, and continues. The grouping metrics must not
-    /// still count that group's templates as accepted -- the `--metrics` file
-    /// and the run summary would then claim more accepted templates than the
-    /// output BAM actually contains.
+    /// A UMI-assignment failure must abort the run, not silently drop the group.
+    ///
+    /// Both call sites used to log a warning and substitute an empty position
+    /// group, so `fgumi group` exited 0 having written a header-only BAM with the
+    /// entire input discarded. A warning on stderr is not a sufficient signal for
+    /// total data loss, and downstream consensus calling sees only an empty file.
     ///
     /// The trigger is a real one: `--strategy paired` requires the RX tag to
     /// carry two `-`-delimited segments, and a single-segment UMI passes every
     /// filter before failing in the assigner.
     ///
     /// Both execution paths are covered. `--allow-unmapped` forces the threaded
-    /// path (see `should_use_parallel`), which returns an empty group from a
-    /// different early return than the single-threaded path uses.
+    /// path (see `should_use_parallel`), which swallowed the error at a different
+    /// call site than the single-threaded path uses.
     #[rstest]
     #[case::single_threaded(false)]
     #[case::threaded(true)]
-    fn test_umi_assignment_failure_does_not_overcount_accepted(
-        #[case] force_parallel_path: bool,
-    ) -> Result<()> {
+    fn test_umi_assignment_failure_fails_the_run(#[case] force_parallel_path: bool) -> Result<()> {
         // Single-segment UMIs: accepted by every filter, rejected by the paired
         // assigner because it needs `<a>-<b>`.
         let mut records = Vec::new();
@@ -2597,28 +2574,14 @@ mod tests {
             ..test_group_cmd(Strategy::Paired, 1)
         };
 
-        cmd.execute("test")?;
+        let err = cmd
+            .execute("test")
+            .expect_err("group must fail when UMI assignment fails, not emit an empty BAM");
 
-        // Assignment failed, so no records are emitted for the group.
-        let output_records = read_bam_records(&paths.output)?;
+        let message = format!("{err:#}");
         assert!(
-            output_records.is_empty(),
-            "expected no records when UMI assignment fails, got {}",
-            output_records.len(),
-        );
-
-        // The metrics must agree with the BAM rather than with the pre-failure
-        // filter tally.
-        let metrics_text = std::fs::read_to_string(&paths.grouping_metrics)?;
-        // Serialized column name for `UmiGroupingMetrics::accepted_records`.
-        let accepted = parse_grouping_metric(&metrics_text, "accepted_sam_records")
-            .unwrap_or_else(|| panic!("no accepted_sam_records column in:\n{metrics_text}"));
-        assert_eq!(
-            accepted,
-            output_records.len() as u64,
-            "accepted_sam_records ({accepted}) must match the {} records actually written; \
-             metrics:\n{metrics_text}",
-            output_records.len(),
+            message.contains("2 segments delimited by '-'"),
+            "error should name the UMI-assignment failure, got: {message}"
         );
         Ok(())
     }
