@@ -18,7 +18,7 @@ use noodles_csi::binning_index::index::reference_sequence::bin::Chunk;
 use noodles_csi::binning_index::index::reference_sequence::index::LinearIndex;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{self, Write};
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
@@ -26,17 +26,31 @@ use std::path::{Path, PathBuf};
 use crate::paths::is_stdout_path;
 use crate::vendored::{BlockInfoRx, MultithreadedWriter, MultithreadedWriterBuilder};
 
-/// Maximum uncompressed BGZF block size (64KB - 256 bytes for overhead).
-const MAX_BLOCK_SIZE: usize = 65280;
+/// Maximum uncompressed BGZF block size.
+///
+/// [`compute_end_vpos`] serves two writers, so this must match the block size
+/// both of them flush at:
+///
+/// - The sort engine's pooled writer flushes at `fgumi_bgzf::BGZF_MAX_BLOCK_SIZE`,
+///   which is itself this same `bgzf::BGZF_BLOCK_SIZE` — deriving the constant
+///   here (rather than hardcoding 65280) means that path's virtual-offset math
+///   and block layout cannot silently diverge.
+/// - [`IndexingBamWriter`] flushes at the vendored `MultithreadedWriter`'s own
+///   `BGZF_BLOCK_SIZE` (`crate::vendored::bgzf_multithreaded`), a deliberately
+///   independent copy that keeps the vendored module self-contained. It is equal
+///   to this value today; keep the two in step, since nothing enforces it.
+const MAX_BLOCK_SIZE: usize = bgzf::BGZF_BLOCK_SIZE;
 
 /// Fast, non-cryptographic hasher for the dense sequential `u64` block numbers
 /// used as `block_positions` keys.
 ///
-/// Multiplicative (Fibonacci) hashing spreads sequential keys across the full
-/// 64-bit space, so hashbrown gets entropy in both the bucket index and the
-/// control byte (top 7 bits) — unlike an identity hash, whose high bits stay
-/// zero for small keys. It costs a single multiply and avoids the DoS-resistant
-/// mixing of a general-purpose hasher, which this internal map does not need.
+/// One multiplicative (Fibonacci) step spreads sequential keys across the full
+/// 64-bit space — enough entropy for both hashbrown's bucket index and its
+/// control byte — at the cost of a single multiply and no DoS-resistant mixing,
+/// which this internal, non-adversarial map does not need. A standard hasher
+/// (`ahash`, `FxHash`) would also serve, but each costs several
+/// multiply-equivalents per `u64`; this map is hot in the merge, so the single
+/// multiply is deliberate.
 #[derive(Default)]
 struct BlockHasher(u64);
 
@@ -74,8 +88,8 @@ type BlockPositions = HashMap<u64, u64, BuildHasherDefault<BlockHasher>>;
 /// overflow fits in a single block. Returns `None` if any required subsequent
 /// block hasn't been completed yet (caller should defer the entry).
 #[allow(clippy::cast_possible_truncation)]
-fn compute_end_vpos<S: BuildHasher>(
-    block_positions: &HashMap<u64, u64, S>,
+fn compute_end_vpos(
+    block_positions: &BlockPositions,
     start_block: u64,
     start_block_start: u64,
     end_offset: usize,
@@ -397,12 +411,11 @@ pub struct BaiBuilder {
     entry_cache: VecDeque<CachedIndexEntry>,
     /// `block_number` -> compressed start offset in the file.
     block_positions: BlockPositions,
-}
-
-impl Default for BaiBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Watermark: every block number below this has been pruned from
+    /// `block_positions` once its records resolved. Keeps the map bounded by the
+    /// in-flight block window instead of growing one entry per output block for
+    /// the whole (WGS-scale) file.
+    pruned_below: u64,
 }
 
 impl BaiBuilder {
@@ -413,6 +426,7 @@ impl BaiBuilder {
             indexer: Indexer::default(),
             entry_cache: VecDeque::new(),
             block_positions: BlockPositions::default(),
+            pruned_below: 0,
         }
     }
 
@@ -484,12 +498,25 @@ impl BaiBuilder {
             self.entry_cache.pop_front();
         }
 
+        // Prune block offsets no remaining or future record can reference. Every
+        // pending entry has block_number >= the front's, and future records are
+        // recorded with even larger block numbers, so blocks below the front are
+        // dead. Advancing a watermark (block numbers are dense sequential
+        // serials) makes this O(1) amortized and bounds `block_positions` to the
+        // in-flight window.
+        if let Some(front_block) = self.entry_cache.front().map(|e| e.block_number) {
+            while self.pruned_below < front_block {
+                self.block_positions.remove(&self.pruned_below);
+                self.pruned_below += 1;
+            }
+        }
+
         Ok(())
     }
 
     /// Number of records still awaiting block-position resolution.
     #[must_use]
-    pub fn pending(&self) -> usize {
+    pub(crate) fn pending(&self) -> usize {
         self.entry_cache.len()
     }
 
@@ -506,6 +533,12 @@ impl BaiBuilder {
             )));
         }
         Ok(self.indexer.build(num_refs))
+    }
+}
+
+impl Default for BaiBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1202,7 +1235,7 @@ mod tests {
 
     /// Build a `block_positions` map mapping `[0..n)` to deterministic
     /// compressed offsets so virtual positions are easy to assert against.
-    fn make_block_positions(n: u64) -> HashMap<u64, u64> {
+    fn make_block_positions(n: u64) -> BlockPositions {
         // Use 0x10000-step starts so each block is at a distinct, recognizable
         // virtual offset.
         (0..n).map(|i| (i, i * 0x1_0000)).collect()
@@ -1256,7 +1289,7 @@ mod tests {
     #[test]
     fn test_compute_end_vpos_multi_block_lookup_uses_terminal_block() {
         // A record that spans blocks 5..7 (start block 5, ends in block 7).
-        let mut positions = HashMap::new();
+        let mut positions = BlockPositions::default();
         positions.insert(5u64, 0x5_0000u64);
         // Block 6 missing on purpose — we only need the terminal block start.
         positions.insert(7u64, 0x7_0000u64);
@@ -1277,7 +1310,7 @@ mod tests {
     #[test]
     fn test_compute_end_vpos_offset_within_starting_block() {
         // Start somewhere in the middle of block 3; record extends into block 4.
-        let mut positions = HashMap::new();
+        let mut positions = BlockPositions::default();
         positions.insert(3u64, 0x3_0000u64);
         positions.insert(4u64, 0x4_0000u64);
 

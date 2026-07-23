@@ -1124,8 +1124,10 @@ impl<K: RawSortKey + Default + 'static> ChunkSource<K> {
 /// boundary. All other source variants borrow from their own backing store via
 /// [`ChunkSource::current_bytes`] and ignore `consumer`.
 ///
-/// `consumer` must be `Some` whenever `source` is `PoolDisk`; the merge loops
-/// uphold this (a `PoolDisk` source only exists when Phase 2 is active).
+/// `consumer` must be `Some` whenever `source` is `PoolDisk` (a `PoolDisk`
+/// source only exists when Phase 2 is active, which is exactly when the merge
+/// loops set the consumer); a missing consumer is a pipeline bug and panics here
+/// rather than silently writing empty/stale scratch bytes.
 #[inline]
 fn winner_record_bytes<'a, K: RawSortKey + Default + 'static>(
     source: &'a ChunkSource<K>,
@@ -1133,7 +1135,11 @@ fn winner_record_bytes<'a, K: RawSortKey + Default + 'static>(
 ) -> &'a [u8] {
     match source {
         ChunkSource::PoolDisk { source_id, scratch } => {
-            consumer.and_then(|c| c.current_record_bytes(*source_id)).unwrap_or(scratch.as_slice())
+            let consumer =
+                consumer.expect("PoolDisk source requires a MainThreadChunkConsumer during merge");
+            // `Some` on the zero-copy fast path; `None` means the record
+            // straddled a block boundary and was reassembled into `scratch`.
+            consumer.current_record_bytes(*source_id).unwrap_or(scratch.as_slice())
         }
         other => other.current_bytes(),
     }
@@ -3358,8 +3364,9 @@ impl RawExternalSorter {
     /// No per-source threads are spawned.
     ///
     /// When `pool_decompress` is false, disk sources use `GenericKeyedChunkReader`
-    /// with its own per-source background thread. Used by the indexing path, which
-    /// does not yet support pool-integrated decompression.
+    /// with its own per-source background thread — the legacy per-source-reader
+    /// path, now unused since both the plain and indexed merges are
+    /// pool-integrated.
     fn build_chunk_sources<K: RawSortKey + Default + 'static>(
         chunk_files: &[PathBuf],
         memory_chunks: MemorySources<K>,
@@ -3396,6 +3403,55 @@ impl RawExternalSorter {
         Ok(sources)
     }
 
+    /// Build the pooled merge sources and activate Phase 2.
+    ///
+    /// Shared by both the plain ([`merge_chunks_generic`]) and indexed
+    /// ([`merge_chunks_with_index`]) merges so the Phase-2 lifecycle is
+    /// single-sourced and the two paths cannot drift. Returns the sources plus
+    /// an RAII [`Phase2Guard`] (borrowing `pool`) that resets Phase 2 on drop or
+    /// explicit `deactivate()`. When there are no disk chunks the guard is
+    /// inactive and carries no consumer.
+    fn setup_phase2_merge<'a, K: RawSortKey + Default + 'static>(
+        chunk_files: &[PathBuf],
+        memory_chunks: MemorySources<K>,
+        pool: &'a Arc<SortWorkerPool>,
+    ) -> Result<(Vec<ChunkSource<K>>, Phase2Guard<'a, K>)> {
+        let num_disk = chunk_files.len();
+        if num_disk > 0 {
+            debug!(
+                "Pool-integrated merge: {} disk sources, {} pool workers (N+2 model)",
+                num_disk,
+                pool.num_workers()
+            );
+        }
+
+        // The pooled path decompresses on the workers, so reader_concurrency is
+        // irrelevant here; pass 1 (build_chunk_sources only uses it for the
+        // legacy per-source-reader path, which pool_decompress=true skips).
+        let sources = Self::build_chunk_sources::<K>(chunk_files, memory_chunks, 1, true, pool)?;
+        debug!("Merging from {} sources...", sources.len());
+
+        // Create the pool consumer for PoolDisk sources and activate Phase 2.
+        // The consumer holds an Arc snapshot of the pool's per-file Phase 2
+        // state — workers populate per-file reorder buffers, the consumer pops
+        // from them.
+        let guard = if num_disk > 0 {
+            let files = pool.phase2_files();
+            let consumer = MainThreadChunkConsumer::new(
+                files,
+                pool.decompress_error_flag(),
+                pool.chunk_read_error_flag(),
+                pool.worker_panicked_flag(),
+            );
+            pool.set_phase(crate::worker_pool::phase::PHASE2);
+            Phase2Guard { pool, consumer: Some(consumer), active: true }
+        } else {
+            Phase2Guard { pool, consumer: None, active: false }
+        };
+
+        Ok((sources, guard))
+    }
+
     /// Generic merge for keyed chunks using `O(1)` key comparisons.
     ///
     /// This is the unified merge function that works with any `RawSortKey` type.
@@ -3413,47 +3469,9 @@ impl RawExternalSorter {
     ) -> Result<u64> {
         use crate::loser_tree::LoserTree;
         use crate::pooled_bam_writer::PooledBamWriter;
-        use crate::worker_pool::phase;
 
-        let reader_concurrency: usize = 1;
-        let num_disk = chunk_files.len();
-
-        if num_disk > 0 {
-            debug!(
-                "Pool-integrated merge: {} disk sources, {} pool workers (N+2 model)",
-                num_disk,
-                pool.num_workers()
-            );
-        }
-
-        let mut sources = Self::build_chunk_sources::<K>(
-            chunk_files,
-            memory_chunks,
-            reader_concurrency,
-            true,
-            pool,
-        )?;
-
-        let num_sources = sources.len();
-        debug!("Merging from {num_sources} sources...");
-
-        // Create pool consumer for PoolDisk sources and activate Phase 2.
-        // The consumer holds an Arc snapshot of the pool's per-file Phase 2
-        // state — workers populate per-file reorder buffers, the consumer pops
-        // from them.
-        let mut guard: Phase2Guard<'_, K> = if num_disk > 0 {
-            let files = pool.phase2_files();
-            let consumer = MainThreadChunkConsumer::new(
-                files,
-                pool.decompress_error_flag(),
-                pool.chunk_read_error_flag(),
-                pool.worker_panicked_flag(),
-            );
-            pool.set_phase(phase::PHASE2);
-            Phase2Guard { pool, consumer: Some(consumer), active: true }
-        } else {
-            Phase2Guard { pool, consumer: None, active: false }
-        };
+        let (mut sources, mut guard) =
+            Self::setup_phase2_merge::<K>(chunk_files, memory_chunks, pool)?;
 
         let output_header = self.create_output_header(header);
 
@@ -3590,45 +3608,9 @@ impl RawExternalSorter {
     ) -> Result<noodles::bam::bai::Index> {
         use crate::loser_tree::LoserTree;
         use crate::pooled_bam_writer::PooledBamWriter;
-        use crate::worker_pool::phase;
 
-        let reader_concurrency: usize = 1;
-        let num_disk = chunk_files.len();
-
-        if num_disk > 0 {
-            debug!(
-                "Pool-integrated indexed merge: {} disk sources, {} pool workers (N+2 model)",
-                num_disk,
-                pool.num_workers()
-            );
-        }
-
-        let mut sources = Self::build_chunk_sources::<K>(
-            chunk_files,
-            memory_chunks,
-            reader_concurrency,
-            true,
-            pool,
-        )?;
-
-        let num_sources = sources.len();
-        debug!("Merging from {num_sources} sources (indexing)...");
-
-        // Create the pool consumer for PoolDisk sources and activate Phase 2,
-        // exactly as merge_chunks_generic does.
-        let mut guard: Phase2Guard<'_, K> = if num_disk > 0 {
-            let files = pool.phase2_files();
-            let consumer = MainThreadChunkConsumer::new(
-                files,
-                pool.decompress_error_flag(),
-                pool.chunk_read_error_flag(),
-                pool.worker_panicked_flag(),
-            );
-            pool.set_phase(phase::PHASE2);
-            Phase2Guard { pool, consumer: Some(consumer), active: true }
-        } else {
-            Phase2Guard { pool, consumer: None, active: false }
-        };
+        let (mut sources, mut guard) =
+            Self::setup_phase2_merge::<K>(chunk_files, memory_chunks, pool)?;
 
         let output_header = self.create_output_header(header);
 
@@ -6178,6 +6160,63 @@ mod tests {
                 stale.display(),
             );
         }
+    }
+
+    /// A record spanning multiple BGZF blocks must resolve correct virtual
+    /// offsets through the pool-integrated indexed merge.
+    ///
+    /// Normal records never straddle a block boundary (the spill writer
+    /// pre-flushes), so an oversized record is the only thing that drives
+    /// `BaiBuilder`'s cross-block `compute_end_vpos` walk while
+    /// `merge_chunks_with_index` builds the index — a wrong block stride there
+    /// would fail the index build or emit a corrupt `.bai`. This is the
+    /// non-samtools counterpart to the `#[ignore]` samtools cross-check: it
+    /// forces the oversized record through a spilled indexed merge, then loads
+    /// the produced `.bai` back and checks it is well-formed.
+    #[test]
+    fn test_write_index_oversized_record_builds_loadable_bai() {
+        use fgumi_sam::SamBuilder;
+
+        let big_seq = "A".repeat(70_000); // > one ~64 KB BGZF block
+        let mut builder = SamBuilder::new();
+        for i in 0..80 {
+            let _ = builder.add_frag().name(&format!("n{i:04}")).contig(0).start(i + 1).build();
+        }
+        let _ = builder.add_frag().name("oversized").contig(0).start(40).bases(&big_seq).build();
+        for i in 0..80 {
+            let _ = builder.add_frag().name(&format!("m{i:04}")).contig(0).start(i + 1).build();
+        }
+        let expected_refs = builder.header.reference_sequences().len();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("input.bam");
+        let output = dir.path().join("output.bam");
+        builder.write_bam(&input).expect("write_bam");
+
+        let stats = RawExternalSorter::new(SortOrder::Coordinate)
+            .memory_limit(64 * 1024) // below the oversized record → forces it into a spill chunk
+            .threads(2) // multi-source pool-integrated indexed merge
+            .write_index(true) // routes through merge_chunks_with_index
+            .spill_codec(crate::codec::SpillCodec::Bgzf)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&input, &output)
+            .expect("indexed coordinate sort should succeed");
+        assert!(stats.chunks_written > 0, "test must spill so the indexed pool merge runs");
+
+        // Every record (including the oversized one) survives the merge.
+        assert_eq!(count_bam_records(&output), 161);
+
+        // The .bai the indexed merge produced must load cleanly and cover every
+        // reference: a corrupt cross-block virtual offset would have failed the
+        // index build above or produced an unreadable sidecar here.
+        let bai = fgumi_bam_io::bai_sidecar_path(&output);
+        let index = noodles::bam::bai::fs::read(&bai).expect("BAI must be loadable");
+        assert_eq!(
+            index.reference_sequences().len(),
+            expected_refs,
+            "index should cover every reference sequence"
+        );
     }
 
     /// Per-phase thread counts are a scheduling knob only: whatever the split,

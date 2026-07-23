@@ -199,6 +199,22 @@ impl PooledBamWriter {
         self.start_finish()?.wait()
     }
 
+    /// Flush any remaining staged data and drop the staging buffer.
+    ///
+    /// Dropping the staging buffer closes the result channel, so the I/O thread
+    /// drains its queue, writes every block (and, for an indexing writer, emits
+    /// every block offset), then exits. Shared by
+    /// [`start_finish`](Self::start_finish) and [`finish_index`](Self::finish_index).
+    fn flush_and_close_staging(&mut self) -> Result<()> {
+        if let Some(mut staging) = self.staging.take() {
+            if !staging.buf().is_empty() {
+                staging.flush()?;
+            }
+            drop(staging);
+        }
+        Ok(())
+    }
+
     /// Flush remaining data and signal the I/O thread, but don't wait for it.
     ///
     /// Returns a [`SpillWriteHandle`] that can be waited on later.
@@ -207,12 +223,7 @@ impl PooledBamWriter {
     ///
     /// Returns an error if flushing the staging buffer fails.
     pub fn start_finish(mut self) -> Result<SpillWriteHandle> {
-        if let Some(mut staging) = self.staging.take() {
-            if !staging.buf().is_empty() {
-                staging.flush()?;
-            }
-            drop(staging); // closes result_tx → I/O thread exits after draining
-        }
+        self.flush_and_close_staging()?;
         Ok(SpillWriteHandle::new(self.io_handle.take()))
     }
 
@@ -235,15 +246,10 @@ impl PooledBamWriter {
     pub fn finish_index(mut self) -> Result<bai::Index> {
         let mut index = self.index.take().expect("finish_index requires an indexing writer");
 
-        // Flush remaining staging and close the input to the I/O thread.
-        if let Some(mut staging) = self.staging.take() {
-            if !staging.buf().is_empty() {
-                staging.flush()?;
-            }
-            // Closes result_tx → I/O thread drains, writes all blocks, emits all
-            // offsets, then exits (dropping its block-offset sender).
-            drop(staging);
-        }
+        // Flush remaining staging and close the input to the I/O thread: it then
+        // drains, writes all blocks, emits all offsets, and exits (dropping its
+        // block-offset sender).
+        self.flush_and_close_staging()?;
 
         // Join the I/O thread so every block offset has been emitted before we
         // drain the channel for the last time.
