@@ -509,6 +509,11 @@ fn assign_umi_groups_impl(
 ) -> Result<()> {
     // All templates are in raw-byte mode (Template always uses RawRecord)
 
+    // Unlike `dedup`, `group` keeps the strand-of-origin split even under `--no-umi`:
+    // its output feeds consensus calling, which is a positional pileup that requires
+    // every read 1 in a molecule to be the same physical strand. `dedup` gates the
+    // same split on `!no_umi` (see `dedup::splits_by_strand_of_origin`); this site
+    // deliberately does not, so do not "harmonize" the two by adding `&& !no_umi` here.
     if assigner.split_templates_by_pair_orientation() {
         // Group by pair orientation
         let mut subgroups: AHashMap<(bool, bool), Vec<usize>> = AHashMap::new();

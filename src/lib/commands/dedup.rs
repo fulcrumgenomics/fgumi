@@ -215,7 +215,7 @@ struct DedupFilterConfig {
     include_non_pf: bool,
     /// Minimum UMI length.
     min_umi_length: Option<usize>,
-    /// Skip UMI validation; group by template coordinate and strand of origin alone.
+    /// Skip UMI validation; group by template coordinate alone, orientation-agnostically.
     no_umi: bool,
 }
 
@@ -612,7 +612,41 @@ fn assign_umi_groups_for_indices(
     Ok(())
 }
 
+/// Whether to sub-partition a position group by strand of origin before grouping.
+///
+/// Standard library prep ligates the same asymmetric Y-adapter to both ends of a
+/// double-stranded fragment, so the top strand carries P5 at the left breakpoint
+/// and the bottom strand carries P5 at the right. Read 1 is always primed from the
+/// P5 end, so a *single* input fragment yields both an F1R2 and an F2R1 cluster.
+/// Strand of origin therefore distinguishes the two halves of one molecule, not two
+/// molecules.
+///
+/// That distinction is essential for consensus calling, which is a positional
+/// pileup over a molecule's reads: every read 1 in a group must be the same
+/// physical strand read from the same 5' start for base `i` to mean the same thing
+/// in each. `group` keeps the split for exactly that reason.
+///
+/// `dedup` calls no consensus. Its job is to keep one read per input *molecule*, so
+/// splitting on strand of origin makes it keep two — double-counting every fragment
+/// sequenced from both strands. Under `--no-umi` there is no UMI to separate
+/// molecules either, so the split is pure harm and is disabled: grouping is then
+/// orientation-agnostic, matching Picard `MarkDuplicates`.
+///
+/// With UMIs the split is retained. `identity`/`adjacency` already separate the
+/// strands anyway (a duplex pair reads `A-B` on one strand and `B-A` on the other),
+/// and `paired` re-introduces the separation through `MoleculeId::PairedA`/`PairedB`
+/// instead — which is why it reports `false` here.
+fn splits_by_strand_of_origin(assigner: &dyn UmiAssigner, no_umi: bool) -> bool {
+    assigner.split_templates_by_pair_orientation() && !no_umi
+}
+
 /// Assign UMI groups to templates.
+///
+/// Templates are normally sub-partitioned by strand of origin (which mate defines
+/// the forward end) before grouping, so the two strands of a duplex molecule stay
+/// separate for consensus calling. `--no-umi` is the exception: it deliberately
+/// groups orientation-agnostically, like Picard `MarkDuplicates`. See
+/// [`splits_by_strand_of_origin`] for why.
 fn assign_umi_groups(
     templates: &mut [Template],
     assigner: &dyn UmiAssigner,
@@ -620,7 +654,7 @@ fn assign_umi_groups(
     min_umi_length: Option<usize>,
     no_umi: bool,
 ) -> Result<()> {
-    if assigner.split_templates_by_pair_orientation() {
+    if splits_by_strand_of_origin(assigner, no_umi) {
         let mut subgroups: AHashMap<(bool, bool), Vec<usize>> = AHashMap::new();
         for (idx, template) in templates.iter().enumerate() {
             let orientation = get_pair_orientation(template);
@@ -978,28 +1012,27 @@ grouping key does not — see below.
 
 # Grouping key (strand of origin)
 
-Templates are grouped by template coordinate — the unclipped 5' position of both ends —
-*and* by strand of origin, i.e. which mate defines the forward end. Two templates at the
-same coordinates whose read 1 is on opposite strands (F1R2 vs F2R1) are therefore two
-molecules, not one, and each keeps its own representative. This matches
-`fgbio GroupReadsByUmi`, whose model exists to tell the two strands of a duplex molecule
-apart for consensus calling, and it applies to every strategy except `paired`, which
-deliberately pairs the two strands back together.
+With UMIs, templates are grouped by template coordinate — the unclipped 5' position of
+both ends — *and* by strand of origin, i.e. which mate defines the forward end. Two
+templates at the same coordinates whose read 1 is on opposite strands (F1R2 vs F2R1) are
+kept as separate molecules. This matches `fgbio GroupReadsByUmi`, whose model exists to
+tell the two strands of a duplex molecule apart for consensus calling, and it applies to
+every strategy except `paired`, which re-introduces the same separation through the
+`/A` and `/B` molecule-id suffixes instead.
 
-Picard `MarkDuplicates` is orientation-agnostic: it collapses F1R2 and F2R1 at the same
-coordinates into one duplicate set with one survivor. So `fgumi dedup` finds more molecules
-and marks *fewer* duplicates than Picard on the same input:
+**--no-umi groups orientation-agnostically**, collapsing F1R2 and F2R1 at the same
+coordinates into one molecule, exactly as Picard `MarkDuplicates` does. That is deliberate.
+Standard library prep ligates the same asymmetric Y-adapter to both ends of a
+double-stranded fragment, so read 1 — always primed from the P5 end — starts at the left
+breakpoint on one strand and the right breakpoint on the other. A *single* input fragment
+therefore produces both an F1R2 and an F2R1 read pair. Strand of origin distinguishes the
+two halves of one molecule, not two molecules, so splitting on it while marking duplicates
+keeps two reads per input fragment and double-counts it.
 
-  marked duplicates = templates - molecule groups
-
-The gap is made up entirely of fragments sequenced from both strands at the same
-coordinates, so it grows with duplication depth — roughly 2 percentage points of duplicate
-rate on a moderately duplicated capture panel, and more on deeper libraries.
-
---no-umi turns off UMI grouping but does NOT turn off the strand split, so it is not a
-drop-in for Picard `MarkDuplicates`; there is currently no option to group
-orientation-agnostically. Use Picard `MarkDuplicates` itself if you need
-orientation-agnostic duplicate marking.
+The distinction still matters for consensus calling, which is a positional pileup and
+requires every read 1 in a molecule to be the same physical strand read from the same 5'
+start — which is why `fgumi group` keeps the split even under --no-umi, and why the two
+commands deliberately differ here. `dedup` runs no consensus and so needs no such split.
 
 # Cell Barcodes
 
@@ -1090,10 +1123,10 @@ pub struct MarkDuplicates {
     #[arg(long = "index-threshold", default_value = "100")]
     pub index_threshold: usize,
 
-    /// Skip UMI-based grouping; group by template coordinate and strand of origin. Forces
-    /// identity strategy and ignores any existing UMI tags. Because templates are still split
-    /// by strand of origin, this is not equivalent to Picard `MarkDuplicates` (see "Grouping
-    /// key" in --help).
+    /// Skip UMI-based grouping; group by template coordinate alone. Forces identity
+    /// strategy and ignores any existing UMI tags. Templates are NOT split by strand of
+    /// origin in this mode, so F1R2 and F2R1 at the same coordinates are one molecule,
+    /// matching Picard `MarkDuplicates` (see "Grouping key" in --help).
     #[arg(long = "no-umi", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub no_umi: bool,
 
@@ -1420,6 +1453,7 @@ fn write_family_size_histogram(family_sizes: &AHashMap<usize, u64>, path: &PathB
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::umi::IdentityUmiAssigner;
     use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags, testutil::encode_op};
     use rstest::rstest;
 
@@ -2270,6 +2304,119 @@ mod tests {
         let (r1_positive, r2_positive) = get_pair_orientation(&template);
         assert!(!r1_positive);
         assert!(!r2_positive);
+    }
+
+    // ========================================================================
+    // strand-of-origin split (--no-umi is orientation-agnostic)
+    // ========================================================================
+
+    /// Builds a template at a fixed pair of coordinates with the requested strand of
+    /// origin. `r1_reverse == false` gives F1R2 (read 1 at the left breakpoint on the
+    /// forward strand); `true` gives F2R1, the other strand of the same fragment.
+    fn template_with_strand_of_origin(name: &[u8], r1_reverse: bool, umi: &[u8]) -> Template {
+        // Both strands of one fragment share the same two breakpoints; only which mate
+        // sits at which end differs.
+        const LEFT: i32 = 99;
+        const RIGHT: i32 = 199;
+        let (r1_pos, r2_pos) = if r1_reverse { (RIGHT, LEFT) } else { (LEFT, RIGHT) };
+        let (r1_extra, r2_extra) =
+            if r1_reverse { (flags::REVERSE, 0) } else { (0, flags::REVERSE) };
+
+        let build = |pos: i32, seg: u16, extra: u16| {
+            let mut b = RawSamBuilder::new();
+            b.read_name(name)
+                .sequence(b"ACGT")
+                .qualities(&[30, 30, 30, 30])
+                .ref_id(0)
+                .pos(pos)
+                .cigar_ops(&[encode_op(0, 4)])
+                .mapq(30)
+                .flags(flags::PAIRED | seg | extra);
+            b.add_string_tag(SamTag::RX, umi);
+            b.build()
+        };
+
+        Template::from_records(vec![
+            build(r1_pos, flags::FIRST_SEGMENT, r1_extra),
+            build(r2_pos, flags::LAST_SEGMENT, r2_extra),
+        ])
+        .expect("test template construction should not fail")
+    }
+
+    /// Groups one F1R2 and one F2R1 template at identical coordinates and reports how
+    /// many distinct molecule ids came back.
+    fn distinct_molecules_across_strands(no_umi: bool, umi: &[u8]) -> usize {
+        let mut templates = vec![
+            template_with_strand_of_origin(b"top", false, umi),
+            template_with_strand_of_origin(b"bottom", true, umi),
+        ];
+        let assigner = IdentityUmiAssigner::new();
+        assign_umi_groups(&mut templates, &assigner, SamTag::RX, None, no_umi)
+            .expect("grouping should succeed");
+        // Exactly two templates, so distinctness is a single comparison of their ids.
+        if templates[0].mi == templates[1].mi { 1 } else { 2 }
+    }
+
+    #[rstest]
+    // --no-umi: the two strands of one fragment are ONE molecule, matching Picard
+    // MarkDuplicates. Splitting them would keep two reads per input fragment.
+    #[case::no_umi_merges_strands(true, b"ACGT-TGCA", 1)]
+    // With UMIs the split is retained so consensus callers still see one strand per
+    // molecule; `paired` re-introduces the same separation via /A and /B.
+    #[case::with_umi_splits_strands(false, b"ACGT-TGCA", 2)]
+    fn strand_of_origin_split_applies_only_when_umis_are_used(
+        #[case] no_umi: bool,
+        #[case] umi: &[u8],
+        #[case] expected_molecules: usize,
+    ) {
+        // Exercises `splits_by_strand_of_origin` end-to-end: IdentityUmiAssigner
+        // always requests the split, so the molecule count is decided purely by
+        // `no_umi` — one molecule when the split is off, two when it is on.
+        assert_eq!(distinct_molecules_across_strands(no_umi, umi), expected_molecules);
+    }
+
+    /// Groups `templates` and marks duplicates per family exactly as
+    /// `process_position_group` does (assign, bucket by molecule id, then
+    /// `mark_duplicates_in_family` per bucket), returning the number of templates
+    /// flagged `0x400`.
+    fn mark_and_count_duplicates(mut templates: Vec<Template>, no_umi: bool) -> usize {
+        let assigner = IdentityUmiAssigner::new();
+        assign_umi_groups(&mut templates, &assigner, SamTag::RX, None, no_umi)
+            .expect("grouping should succeed");
+
+        let mut by_family: AHashMap<Option<usize>, Vec<&mut Template>> = AHashMap::new();
+        for template in &mut templates {
+            by_family.entry(template.mi.to_vec_index()).or_default().push(template);
+        }
+        let mut metrics = DedupMetrics::default();
+        for (_mi, mut family) in by_family {
+            mark_duplicates_in_family(&mut family, &mut metrics);
+        }
+
+        templates.iter().filter(|t| is_duplicate(t)).count()
+    }
+
+    #[rstest]
+    // Three templates at one coordinate family: two F1R2 and one F2R1. The
+    // independent oracle is Picard MarkDuplicates, which marks (family - 1) per
+    // coordinate family regardless of strand.
+    //
+    // --no-umi: one coordinate family of 3 -> 2 marked, matching Picard.
+    #[case::no_umi_marks_picard_count(true, 2)]
+    // With UMIs the strand split makes two families -- F1R2 {2} and F2R1 {1} --
+    // so only the F1R2 family contributes a duplicate: 1 marked total.
+    #[case::with_umi_splits_then_marks(false, 1)]
+    fn no_umi_marks_the_same_duplicate_count_as_picard(
+        #[case] no_umi: bool,
+        #[case] expected_marked: usize,
+    ) {
+        let umi = b"ACGT-TGCA";
+        let templates = vec![
+            template_with_strand_of_origin(b"f1r2_a", false, umi),
+            template_with_strand_of_origin(b"f1r2_b", false, umi),
+            template_with_strand_of_origin(b"f2r1", true, umi),
+        ];
+        assert_eq!(mark_and_count_duplicates(templates, no_umi), expected_marked);
     }
 
     // ========================================================================
