@@ -680,8 +680,10 @@ pub fn assert_uniform_umi_length(lengths: impl IntoIterator<Item = usize>) {
 /// Build the per-input `MoleculeId` vector, resolving each raw UMI with `resolve` and falling
 /// back to a per-string molecule for the ones `resolve` cannot place.
 ///
-/// `resolve` returns `Some(id)` for a UMI that the strategy grouped (an encodable/valid UMI) and
-/// `None` for one it could not (a non-`BitEnc`-encodable, invalid UMI). Every distinct invalid
+/// `resolve` is called with each UMI's position in `raw_umis` and the UMI itself. It returns
+/// `Some(id)` for a UMI that the strategy grouped (an encodable/valid UMI) and `None` for one it
+/// could not (a non-`BitEnc`-encodable, invalid UMI). The position lets callers read a
+/// precomputed per-UMI encoding instead of re-deriving it inside the closure. Every distinct invalid
 /// UMI string gets its own molecule from `mint`, with identical (case-folded) invalid strings
 /// sharing -- mirroring fgbio's `Map[Umi, MoleculeId]`, where every UMI it sees is assigned a
 /// molecule and identical strings collapse. This keeps the sequential and parallel assigners in
@@ -689,14 +691,15 @@ pub fn assert_uniform_umi_length(lengths: impl IntoIterator<Item = usize>) {
 /// tests) and ensures an invalid UMI never joins a valid molecule.
 fn assign_with_invalid_fallback(
     raw_umis: &[Umi],
-    mut resolve: impl FnMut(&str) -> Option<MoleculeId>,
+    mut resolve: impl FnMut(usize, &str) -> Option<MoleculeId>,
     mut mint: impl FnMut() -> MoleculeId,
 ) -> Vec<MoleculeId> {
     let mut invalid_to_id: AHashMap<String, MoleculeId> = AHashMap::new();
     raw_umis
         .iter()
-        .map(|umi| {
-            resolve(umi).unwrap_or_else(|| {
+        .enumerate()
+        .map(|(idx, umi)| {
+            resolve(idx, umi).unwrap_or_else(|| {
                 *invalid_to_id.entry(umi.to_uppercase()).or_insert_with(&mut mint)
             })
         })
@@ -1003,22 +1006,26 @@ impl UmiAssigner for SimpleErrorUmiAssigner {
         // agreement on mixed-case input; it is a no-op for the uppercase UMIs the CLI emits.
         let upper_umis: Vec<Umi> = raw_umis.iter().map(|umi| umi.to_uppercase()).collect();
 
+        // Encode each UMI exactly once and reuse the result for both the length guard below and
+        // the per-UMI encodability check in the matching loop. `BitEnc` is a 16-byte `Copy`
+        // struct, so caching it costs less than re-running the per-byte encode twice.
+        let encodings: Vec<Option<BitEnc>> =
+            upper_umis.iter().map(|umi| BitEnc::from_umi_str(umi)).collect();
+
         // Reject differing-length UMIs the way fgbio does (see assert_uniform_umi_length),
         // but only over the BitEnc-encodable UMIs — the same set the parallel edit assigner
         // length-checks (it drops non-encodable UMIs before its guard). Without this filter,
         // mixed valid/invalid input such as ["AAAA", "NNN"] panics here on differing lengths
         // while the parallel path silently continues on the valid subset (GRP-01 parity).
         // Genuinely differing-length *valid* UMIs (e.g. ["AAAA", "CCC"]) still trip the guard.
-        assert_uniform_umi_length(
-            upper_umis.iter().filter_map(|umi| BitEnc::from_umi_str(umi).map(|enc| enc.len())),
-        );
+        assert_uniform_umi_length(encodings.iter().filter_map(|enc| enc.map(|enc| enc.len())));
 
         let mut umi_sets: Vec<BTreeSet<Umi>> = Vec::new();
         // Track seen UMIs to skip duplicate processing
         let mut seen: std::collections::HashSet<&str> =
             std::collections::HashSet::with_capacity(upper_umis.len());
 
-        for umi in &upper_umis {
+        for (idx, umi) in upper_umis.iter().enumerate() {
             // Skip invalid (non-encodable) UMIs: they cannot be reliably compared (BitEnc
             // can't represent them) and are left unassigned (MoleculeId::None), identical to
             // the parallel edit assigner. Without this, a same-length invalid UMI such as
@@ -1026,7 +1033,7 @@ impl UmiAssigner for SimpleErrorUmiAssigner {
             // silently group with it, diverging from the parallel path (which encodes with
             // BitEnc and cannot see "ACGN" at all). See the cross-assigner parity note in the
             // parallel_assigner tests module.
-            if BitEnc::from_umi_str(umi).is_none() {
+            if encodings[idx].is_none() {
                 continue;
             }
 
@@ -1095,7 +1102,7 @@ impl UmiAssigner for SimpleErrorUmiAssigner {
         // were excluded from matching above.
         assign_with_invalid_fallback(
             &upper_umis,
-            |umi| umi_to_id.get(umi).copied(),
+            |_, umi| umi_to_id.get(umi).copied(),
             || MoleculeId::Single(self.next_id()),
         )
     }
@@ -1376,7 +1383,9 @@ impl AdjacencyUmiAssigner {
     ///
     /// # Arguments
     ///
-    /// * `umi_counts` - Pre-sorted vector of (UMI, count) tuples (sorted by descending count)
+    /// * `umi_counts` - Pre-sorted vector of (UMI, count, underlying base length) tuples (sorted
+    ///   by descending count). The third element is unused here and carried only so callers do
+    ///   not have to rebuild the vector to drop it.
     /// * `matcher` - Function that returns true if two UMIs should be considered adjacent
     ///
     /// # Returns
@@ -1385,7 +1394,7 @@ impl AdjacencyUmiAssigner {
     #[expect(clippy::too_many_lines, reason = "complex graph-building algorithm with profiling")]
     fn build_adjacency_graph<F>(
         &self,
-        umi_counts: &[(Umi, usize)],
+        umi_counts: &[(Umi, usize, Option<usize>)],
         matcher: F,
     ) -> (Vec<Node>, Vec<usize>)
     where
@@ -1394,7 +1403,7 @@ impl AdjacencyUmiAssigner {
         // Build nodes (UMI is not stored; use node index to look up from umi_counts)
         let mut nodes: Vec<Node> = umi_counts
             .iter()
-            .map(|(_, count)| Node { count: *count, children: Vec::new(), assigned: false })
+            .map(|(_, count, _)| Node { count: *count, children: Vec::new(), assigned: false })
             .collect();
 
         // Build count index lookup for optimization
@@ -1428,7 +1437,7 @@ impl AdjacencyUmiAssigner {
         // Use N-gram index for k=1 (most efficient), BK-tree for k>1
         let (ngram_index, bktree) = if nodes.len() >= self.index_threshold {
             let umis: Vec<(usize, &str)> =
-                umi_counts.iter().enumerate().map(|(i, (umi, _))| (i, umi.as_str())).collect();
+                umi_counts.iter().enumerate().map(|(i, (umi, _, _))| (i, umi.as_str())).collect();
 
             if self.max_mismatches == 1 {
                 // N-gram is most efficient for k=1
@@ -1549,6 +1558,14 @@ impl UmiAssigner for AdjacencyUmiAssigner {
         #[cfg(feature = "profile-adjacency")]
         let t_start = std::time::Instant::now();
 
+        // Encode each UMI exactly once (skips dashes in paired UMIs; `None` means the UMI
+        // contains characters `BitEnc` cannot represent). The counting pass below, the
+        // single-molecule fast path, and the final result mapping all read from this rather
+        // than re-encoding. `BitEnc` is a 16-byte `Copy` struct, so this costs far less than
+        // repeating the per-byte encode.
+        let encodings: Vec<Option<BitEnc>> =
+            raw_umis.iter().map(|umi| BitEnc::from_umi_str(umi)).collect();
+
         // Count UMIs using compact BitEnc representation (saves ~60-70% memory)
         // We store index into raw_umis to avoid cloning strings
         // Also build a map from BitEnc -> unique_index for result lookup
@@ -1557,10 +1574,9 @@ impl UmiAssigner for AdjacencyUmiAssigner {
             let mut counts: AHashMap<BitEnc, (usize, usize)> =
                 AHashMap::with_capacity(raw_umis.len() / 4); // Estimate ~4 reads per UMI
 
-            for (i, umi) in raw_umis.iter().enumerate() {
-                // Convert to compact representation (skips dashes in paired UMIs)
-                let Some(encoded) = BitEnc::from_umi_str(umi) else {
-                    // UMI contains invalid characters - skip it
+            for (i, encoded) in encodings.iter().enumerate() {
+                // Skip UMIs that contain invalid characters
+                let Some(encoded) = *encoded else {
                     continue;
                 };
 
@@ -1580,7 +1596,7 @@ impl UmiAssigner for AdjacencyUmiAssigner {
         if umi_counts.is_empty() {
             return assign_with_invalid_fallback(
                 raw_umis,
-                |_| None,
+                |_, _| None,
                 || MoleculeId::Single(self.next_id()),
             );
         }
@@ -1618,7 +1634,7 @@ impl UmiAssigner for AdjacencyUmiAssigner {
             // the upstream N filter) as part of the real molecule.
             return assign_with_invalid_fallback(
                 raw_umis,
-                |umi| BitEnc::from_umi_str(umi).is_some().then_some(id),
+                |idx, _| encodings[idx].is_some().then_some(id),
                 || MoleculeId::Single(self.next_id()),
             );
         }
@@ -1640,8 +1656,8 @@ impl UmiAssigner for AdjacencyUmiAssigner {
         // (non-encodable) UMI gets its own molecule (see `assign_with_invalid_fallback`).
         let result = assign_with_invalid_fallback(
             raw_umis,
-            |umi| {
-                BitEnc::from_umi_str(umi).and_then(|enc| {
+            |raw_idx, _| {
+                encodings[raw_idx].and_then(|enc| {
                     bitenc_to_unique_idx.get(&enc).map(|&idx| unique_assignments[idx])
                 })
             },
@@ -1897,21 +1913,34 @@ impl PairedUmiAssigner {
     ///
     /// Counts canonical forms of paired UMIs, so A-B and B-A contribute to the same count.
     ///
+    /// Each entry also carries the canonical UMI's underlying (prefix-stripped) base length,
+    /// taken from `underlying` rather than recomputed. That is sound because canonicalization
+    /// only ever swaps the two halves (`A-B` <-> `B-A`), which leaves the base multiset — and
+    /// therefore both `BitEnc`-encodability and the summed base count — unchanged. So every raw
+    /// UMI folding into a canonical form contributes the same value, and taking the first is
+    /// equivalent to recomputing it. See [`underlying_umi_len`](Self::underlying_umi_len).
+    ///
     /// # Arguments
     ///
     /// * `umis` - Slice of paired UMI sequences
+    /// * `underlying` - Per-UMI underlying base length (`None` if not `BitEnc`-encodable),
+    ///   parallel to `umis`
     ///
     /// # Returns
     ///
-    /// Vector of (canonical UMI, count) tuples
-    fn count_paired(umis: &[Umi]) -> Vec<(Umi, usize)> {
-        let mut counts: AHashMap<Umi, usize> = AHashMap::new();
-        for umi in umis {
+    /// Vector of (canonical UMI, count, underlying base length) tuples
+    fn count_paired(
+        umis: &[Umi],
+        underlying: &[Option<usize>],
+    ) -> Vec<(Umi, usize, Option<usize>)> {
+        let mut counts: AHashMap<Umi, (usize, Option<usize>)> = AHashMap::new();
+        for (umi, len) in umis.iter().zip(underlying) {
             let canonical = Self::canonicalize_paired(umi)
                 .expect("UMI should be valid paired format (validated in assign())");
-            *counts.entry(canonical).or_insert(0) += 1;
+            let entry = counts.entry(canonical).or_insert((0, *len));
+            entry.0 += 1;
         }
-        counts.into_iter().collect()
+        counts.into_iter().map(|(umi, (count, len))| (umi, count, len)).collect()
     }
 
     /// Check if UMIs match (including reversed)
@@ -1958,8 +1987,16 @@ impl UmiAssigner for PairedUmiAssigner {
         // and is a no-op for the uppercase UMIs the CLI emits.
         let upper_umis: Vec<Umi> = raw_umis.iter().map(|umi| umi.to_uppercase()).collect();
 
+        // Resolve each UMI's underlying (prefix-stripped) base length exactly once. `None` means
+        // the UMI is not `BitEnc`-encodable. Every site below — the encodability filter, the
+        // differing-length guard, and the per-UMI strand resolution in the single-molecule fast
+        // path — reads this instead of re-running `underlying_umi_len`, which splits the key and
+        // encodes both halves on every call.
+        let underlying: Vec<Option<usize>> =
+            upper_umis.iter().map(|umi| Self::underlying_umi_len(umi)).collect();
+
         // Count with A-B and B-A combined
-        let mut umi_counts = Self::count_paired(&upper_umis);
+        let mut umi_counts = Self::count_paired(&upper_umis, &underlying);
 
         // Exclude paired UMIs whose underlying sequence is non-BitEnc-encodable before the
         // length guard, the `umi_counts.len() == 1` fast path, and adjacency grouping. The edit
@@ -1973,7 +2010,7 @@ impl UmiAssigner for PairedUmiAssigner {
         // the fast path and get `PairedA`/`PairedB`, and a *same-length* invalid neighbour
         // (`ACGN-TTTT` beside `ACGT-TTTT`) would string-match into a valid molecule's adjacency
         // tree, while the parallel path isolates it.
-        umi_counts.retain(|(umi, _)| Self::underlying_umi_len(umi).is_some());
+        umi_counts.retain(|(_, _, underlying_len)| underlying_len.is_some());
         umi_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         // All UMIs were invalid: give each distinct invalid string its own molecule, matching the
@@ -1982,7 +2019,7 @@ impl UmiAssigner for PairedUmiAssigner {
         if umi_counts.is_empty() {
             return assign_with_invalid_fallback(
                 &upper_umis,
-                |_| None,
+                |_, _| None,
                 || MoleculeId::Single(self.adjacency.next_id()),
             );
         }
@@ -1995,9 +2032,7 @@ impl UmiAssigner for PairedUmiAssigner {
         // prefixed production keys (a whole-key `BitEnc::from_umi_str` returned `None` for them, so
         // the guard was previously a silent no-op in production). Genuinely differing-length *valid*
         // paired UMIs still trip the guard.
-        assert_uniform_umi_length(
-            umi_counts.iter().filter_map(|(umi, _)| Self::underlying_umi_len(umi)),
-        );
+        assert_uniform_umi_length(umi_counts.iter().filter_map(|(_, _, len)| *len));
 
         if umi_counts.len() == 1 {
             let id = self.adjacency.next_id();
@@ -2009,8 +2044,8 @@ impl UmiAssigner for PairedUmiAssigner {
             // matching the parallel paired assigner. Strand is by the UMI's own orientation.
             return assign_with_invalid_fallback(
                 &upper_umis,
-                |umi| {
-                    Self::underlying_umi_len(umi).is_some().then(|| {
+                |idx, umi| {
+                    underlying[idx].is_some().then(|| {
                         let reversed = Self::reverse(umi)
                             .expect("UMI should be valid paired format (validated above)");
                         if umi < reversed.as_str() { ab } else { ba }
@@ -2068,7 +2103,7 @@ impl UmiAssigner for PairedUmiAssigner {
         // paired assigner. An unencodable UMI has no valid strand, so it is a plain `Single`.
         assign_with_invalid_fallback(
             &upper_umis,
-            |umi| umi_to_id.get(umi).copied(),
+            |_, umi| umi_to_id.get(umi).copied(),
             || MoleculeId::Single(self.adjacency.next_id()),
         )
     }
@@ -2681,19 +2716,95 @@ mod tests {
             "ACGT-TGCA".to_string(),
         ];
 
-        let counts = PairedUmiAssigner::count_paired(&umis);
+        let underlying: Vec<Option<usize>> =
+            umis.iter().map(|umi| PairedUmiAssigner::underlying_umi_len(umi)).collect();
+        assert_eq!(underlying, vec![Some(8), Some(8), Some(8), Some(8)]);
+
+        let counts = PairedUmiAssigner::count_paired(&umis, &underlying);
 
         // ACGT-TGCA and TGCA-ACGT should be counted together (canonicalized to ACGT-TGCA)
         // So we should have ACGT-TGCA: 3, AAAA-TTTT: 1
         assert_eq!(counts.len(), 2);
 
         let mut count_map: HashMap<String, usize> = HashMap::new();
-        for (umi, count) in counts {
+        for (umi, count, underlying_len) in counts {
+            // The carried length must survive canonicalization: `TGCA-ACGT` folds into
+            // `ACGT-TGCA`, and both spell the same 8 bases.
+            assert_eq!(underlying_len, Some(8), "underlying length not carried for {umi}");
             count_map.insert(umi, count);
         }
 
         assert_eq!(count_map.get("ACGT-TGCA"), Some(&3));
         assert_eq!(count_map.get("AAAA-TTTT"), Some(&1));
+    }
+
+    /// A non-`BitEnc`-encodable UMI must carry `None` through counting, since that is what the
+    /// encodability filter and the differing-length guard in `assign()` now read instead of
+    /// recomputing `underlying_umi_len`.
+    #[test]
+    fn test_paired_count_carries_invalid_underlying_length() {
+        let umis = vec![
+            "ACGT-TGCA".to_string(),
+            "ACGN-TGCA".to_string(), // N is not BitEnc-encodable
+            "TGCA-ACGN".to_string(), // reverse of the above: same bases, still invalid
+        ];
+        let underlying: Vec<Option<usize>> =
+            umis.iter().map(|umi| PairedUmiAssigner::underlying_umi_len(umi)).collect();
+        assert_eq!(underlying, vec![Some(8), None, None]);
+
+        let counts = PairedUmiAssigner::count_paired(&umis, &underlying);
+
+        let by_umi: HashMap<String, Option<usize>> =
+            counts.into_iter().map(|(umi, _, len)| (umi, len)).collect();
+        assert_eq!(by_umi.get("ACGT-TGCA"), Some(&Some(8)));
+        // The two invalid spellings canonicalize together and stay invalid.
+        assert_eq!(by_umi.get("ACGN-TGCA"), Some(&None));
+    }
+
+    /// Pins the `assign()` partition for the same mixed valid/invalid input as
+    /// `test_paired_count_carries_invalid_underlying_length`: the carried-length checks only
+    /// exercise `count_paired`, so this asserts the intended invalid-UMI divergence end-to-end
+    /// once the `None`-underlying entries are filtered out of `umi_counts`. The one encodable
+    /// UMI takes the single-molecule fast path and gets a paired strand; each invalid UMI is
+    /// routed to its own `Single` by `assign_with_invalid_fallback`. Crucially, the two invalid
+    /// spellings that `count_paired` folds together (`ACGN-TGCA` / `TGCA-ACGN`) do *not* share a
+    /// molecule here: the fallback keys on the raw (case-folded) string, not the canonical form,
+    /// so distinct spellings stay isolated -- matching the parallel paired assigner and enforced
+    /// by `test_sequential_and_parallel_assigners_induce_same_partition`.
+    #[test]
+    fn test_paired_assign_isolates_invalid_umis_after_none_filtering() {
+        let assigner = PairedUmiAssigner::new(1);
+        let umis = vec![
+            "ACGT-TGCA".to_string(),
+            "ACGN-TGCA".to_string(), // N is not BitEnc-encodable
+            "TGCA-ACGN".to_string(), // reverse of the above: same bases, still invalid
+        ];
+
+        let ids = assigner.assign(&umis);
+        assert_eq!(ids.len(), umis.len());
+
+        // The lone encodable UMI keeps its paired strand.
+        assert!(
+            matches!(ids[0], MoleculeId::PairedA(_) | MoleculeId::PairedB(_)),
+            "encodable UMI must keep its paired strand; got {ids:?}"
+        );
+        // Each invalid UMI is isolated as its own Single.
+        assert!(
+            matches!(ids[1], MoleculeId::Single(_)),
+            "invalid UMI must be isolated as a Single; got {ids:?}"
+        );
+        assert!(
+            matches!(ids[2], MoleculeId::Single(_)),
+            "invalid UMI must be isolated as a Single; got {ids:?}"
+        );
+        // No invalid UMI joins the valid molecule, and the two invalid spellings -- folded
+        // together by `count_paired` but keyed by raw string in the fallback -- stay distinct.
+        assert_ne!(ids[0], ids[1], "invalid UMI must not join the valid molecule");
+        assert_ne!(ids[0], ids[2], "invalid UMI must not join the valid molecule");
+        assert_ne!(
+            ids[1], ids[2],
+            "distinct invalid spellings must not share a molecule despite canonicalizing together"
+        );
     }
 
     #[test]
