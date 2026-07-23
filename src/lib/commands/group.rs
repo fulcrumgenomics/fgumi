@@ -96,7 +96,7 @@ struct GroupFilterConfig {
     include_non_pf: bool,
     /// Minimum UMI length (None to disable).
     min_umi_length: Option<usize>,
-    /// Skip UMI validation (position-only grouping).
+    /// Skip UMI validation; group by template coordinate and strand of origin alone.
     no_umi: bool,
     /// Whether to allow fully unmapped templates (both reads unmapped).
     allow_unmapped: bool,
@@ -857,8 +857,9 @@ pub struct GroupReadsByUmi {
     #[arg(long = "index-threshold", default_value = "100")]
     pub index_threshold: usize,
 
-    /// Skip UMI-based grouping; group by position only. Forces identity strategy
-    /// and ignores any existing UMI tags.
+    /// Skip UMI-based grouping; group by template coordinate and strand of origin. Forces
+    /// identity strategy and ignores any existing UMI tags. An F1R2 and an F2R1 template at
+    /// the same coordinates therefore remain separate molecules.
     #[arg(long = "no-umi", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub no_umi: bool,
 
