@@ -78,7 +78,7 @@ use crate::caller::{
     clamp_per_base_to_fgbio_short,
 };
 use crate::phred::{MIN_PHRED, NO_CALL_BASE, NO_CALL_BASE_LOWER, PhredScore};
-use crate::simple_umi::consensus_umis;
+use crate::simple_umi::{UmiErrorRates, consensus_umis};
 use crate::vanilla_caller::{
     VanillaConsensusRead, VanillaUmiConsensusCaller, VanillaUmiConsensusOptions,
 };
@@ -1340,6 +1340,41 @@ impl CodecConsensusCaller {
         consensus
     }
 
+    /// Calls the consensus UMI (RX) across every record in the MI group.
+    ///
+    /// All records are used — not just the ones that passed filtering for sequence consensus —
+    /// to match fgbio, which includes reads excluded from sequence consensus (unmapped, non-FR,
+    /// etc.) when building the UMI consensus. Their UMI bases help resolve N's at ambiguous
+    /// positions. The consensus is called with the *configured* error rates so that
+    /// `--error-rate-pre-umi` / `--error-rate-post-umi` apply to the UMI as well as the bases.
+    ///
+    /// Returns `None` when no record carries an RX tag, or the consensus came back empty.
+    fn consensus_umi(&self, all_records: &[RawRecord]) -> Option<String> {
+        let umis: Vec<String> = all_records
+            .iter()
+            .filter_map(|raw| {
+                RawRecordView::new(raw)
+                    .tags()
+                    .find_string(SamTag::RX)
+                    .and_then(|b| String::from_utf8(b.to_vec()).ok())
+            })
+            .collect();
+
+        if umis.is_empty() {
+            return None;
+        }
+
+        let consensus_umi = consensus_umis(
+            &umis,
+            UmiErrorRates {
+                pre_umi: self.options.error_rate_pre_umi,
+                post_umi: self.options.error_rate_post_umi,
+            },
+        );
+
+        (!consensus_umi.is_empty()).then_some(consensus_umi)
+    }
+
     /// Builds the output record from the consensus and writes raw bytes into `output`.
     ///
     /// # Errors
@@ -1497,25 +1532,9 @@ impl CodecConsensusCaller {
             }
         }
 
-        // RX tag (UmiBases) - extract from ALL records in the MI group and build consensus.
-        // This must use all_records (not just filtered source_raws) to match fgbio, which
-        // includes reads excluded from sequence consensus (unmapped, non-FR, etc.) when
-        // building the UMI consensus. Their UMI bases help resolve N's at ambiguous positions.
-        let umis: Vec<String> = all_records
-            .iter()
-            .filter_map(|raw| {
-                RawRecordView::new(raw)
-                    .tags()
-                    .find_string(SamTag::RX)
-                    .and_then(|b| String::from_utf8(b.to_vec()).ok())
-            })
-            .collect();
-
-        if !umis.is_empty() {
-            let consensus_umi = consensus_umis(&umis);
-            if !consensus_umi.is_empty() {
-                self.bam_builder.append_string_tag(SamTag::RX, consensus_umi.as_bytes());
-            }
+        // RX tag (UmiBases)
+        if let Some(consensus_umi) = self.consensus_umi(all_records) {
+            self.bam_builder.append_string_tag(SamTag::RX, consensus_umi.as_bytes());
         }
 
         // Write the completed record with block_size prefix
@@ -2419,6 +2438,60 @@ mod tests {
         // Check RX tag is preserved (UmiBases consensus)
         let rx = consensus.get_string_tag(SamTag::RX).expect("RX tag not found in consensus");
         assert_eq!(&rx[..], b"ACC-TGA", "RX tag should be preserved");
+    }
+
+    /// Regression for fulcrumgenomics/fgbio#1163: the CODEC consensus UMI (RX) must be called
+    /// with the *configured* pre-/post-UMI error rates, not hardcoded defaults.
+    ///
+    /// Two pairs carry UMI `A` and one carries `C`, so the group sees four `A`s and two `C`s.
+    /// A negligible post-UMI error rate calls the majority base `A`; at Q1 (~79% error) an
+    /// observed base is *less* likely than each unobserved one, so the two unobserved bases
+    /// tie and the position is a no-call.
+    #[rstest]
+    #[case::negligible_post_umi_error(93, b"A")]
+    #[case::extreme_post_umi_error(1, b"N")]
+    fn test_codec_consensus_umi_uses_configured_error_rates(
+        #[case] error_rate_post_umi: u8,
+        #[case] expected_rx: &[u8; 1],
+    ) {
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            min_duplex_length: 1,
+            error_rate_pre_umi: 93, // no pre-UMI adjustment
+            error_rate_post_umi,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        let mut reads = Vec::new();
+        for (name, umi) in [("read1", "A"), ("read2", "A"), ("read3", "C")] {
+            reads.extend(create_fr_pair(
+                name,
+                1,
+                11,
+                30,
+                35,
+                &[(Kind::Match, 30)],
+                &[(Kind::Match, 30)],
+                "hi",
+                Some(umi),
+                false, // R1 forward
+                true,  // R2 reverse
+            ));
+        }
+
+        let output = caller
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
+
+        assert_eq!(output.count, 1, "Should produce one consensus read");
+        let records = ParsedBamRecord::parse_all(&output.data);
+
+        assert_eq!(
+            records[0].get_string_tag(SamTag::RX).as_deref(),
+            Some(&expected_rx[..]),
+            "CODEC RX should reflect the configured post-UMI error rate"
+        );
     }
 
     /// Port of fgbio test: "make a consensus where R1 has a deletion outside of the overlap region"

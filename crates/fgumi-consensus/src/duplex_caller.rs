@@ -208,7 +208,7 @@ use crate::caller::{
 };
 use crate::phred::MAX_PHRED;
 use crate::phred::{MIN_PHRED, PhredScore};
-use crate::simple_umi::consensus_umis;
+use crate::simple_umi::{UmiErrorRates, consensus_umis};
 use crate::vanilla_caller::{
     VanillaConsensusRead, VanillaUmiConsensusCaller, VanillaUmiConsensusOptions,
 };
@@ -1069,6 +1069,7 @@ impl DuplexConsensusCaller {
         methylation_mode: crate::MethylationMode,
         cell_tag: Option<Tag>,
         cell_barcode: Option<&str>,
+        umi_error_rates: UmiErrorRates,
     ) -> Result<()> {
         // Build flags
         let mut flag = flags::UNMAPPED;
@@ -1241,7 +1242,7 @@ impl DuplexConsensusCaller {
         }
 
         if !all_umis.is_empty() {
-            let consensus_umi = consensus_umis(&all_umis);
+            let consensus_umi = consensus_umis(&all_umis, umi_error_rates);
             builder.append_string_tag(SamTag::RX, consensus_umi.as_bytes());
         }
 
@@ -1732,7 +1733,7 @@ impl DuplexConsensusCaller {
 
         // Call consensus on all UMI sequences and update RX tag
         if !all_umis.is_empty() {
-            let consensus_umi = consensus_umis(&all_umis);
+            let consensus_umi = consensus_umis(&all_umis, ss_caller.umi_error_rates());
             duplex.data_mut().insert(rx_tag, Value::from(consensus_umi));
         }
 
@@ -1767,6 +1768,9 @@ impl DuplexConsensusCaller {
         let mut builder = UnmappedSamBuilder::new();
         let mut output = ConsensusOutput::default();
         let methylation_mode = ss_caller.options.methylation_mode;
+        // The consensus UMI (RX) must be called under the same error model as the consensus
+        // bases; the single-strand caller carries the configured rates.
+        let umi_error_rates = ss_caller.umi_error_rates();
 
         // Helper: move raw input records into the reject payload if rejects are being
         // tracked. Each rejection site moves `a_records`/`b_records` into the reject
@@ -2094,6 +2098,7 @@ impl DuplexConsensusCaller {
                             methylation_mode,
                             cell_tag,
                             cell_barcode.as_deref(),
+                            umi_error_rates,
                         )?;
                         Self::duplex_read_into(
                             &mut builder,
@@ -2110,6 +2115,7 @@ impl DuplexConsensusCaller {
                             methylation_mode,
                             cell_tag,
                             cell_barcode.as_deref(),
+                            umi_error_rates,
                         )?;
                         stats.record_consensus();
                         return Ok((output, stats, Vec::new()));
@@ -2146,6 +2152,7 @@ impl DuplexConsensusCaller {
                             methylation_mode,
                             cell_tag,
                             cell_barcode.as_deref(),
+                            umi_error_rates,
                         )?;
                         Self::duplex_read_into(
                             &mut builder,
@@ -2162,6 +2169,7 @@ impl DuplexConsensusCaller {
                             methylation_mode,
                             cell_tag,
                             cell_barcode.as_deref(),
+                            umi_error_rates,
                         )?;
                         stats.record_consensus();
                         return Ok((output, stats, Vec::new()));
@@ -2198,6 +2206,7 @@ impl DuplexConsensusCaller {
                             methylation_mode,
                             cell_tag,
                             cell_barcode.as_deref(),
+                            umi_error_rates,
                         )?;
                         Self::duplex_read_into(
                             &mut builder,
@@ -2214,6 +2223,7 @@ impl DuplexConsensusCaller {
                             methylation_mode,
                             cell_tag,
                             cell_barcode.as_deref(),
+                            umi_error_rates,
                         )?;
                         stats.record_consensus();
                         return Ok((output, stats, Vec::new()));
@@ -2344,6 +2354,7 @@ mod tests {
     use super::*;
     use fgumi_raw_bam::{ParsedBamRecord, SamBuilder, testutil::encode_op};
     use noodles::sam::alignment::record_buf::data::field::Value;
+    use rstest::rstest;
 
     #[test]
     fn test_parse_mi_tag() {
@@ -3695,6 +3706,63 @@ mod tests {
         Ok(())
     }
 
+    /// Regression for fulcrumgenomics/fgbio#1163: the duplex consensus UMI (RX) must be called
+    /// with the *configured* pre-/post-UMI error rates, not hardcoded defaults.
+    ///
+    /// Two AB pairs carry UMI `A` and one BA pair carries `C`, so each duplex read sees UMIs
+    /// `A`, `A`, `C`. A negligible post-UMI error rate calls the majority base `A`; at Q1
+    /// (~79% error) an observed base is *less* likely than each unobserved one, so the two
+    /// unobserved bases tie and the position is a no-call.
+    #[rstest]
+    #[case::negligible_post_umi_error(93, b"A")]
+    #[case::extreme_post_umi_error(1, b"N")]
+    fn test_duplex_consensus_umi_uses_configured_error_rates(
+        #[case] error_rate_post_umi: u8,
+        #[case] expected_rx: &[u8; 1],
+    ) -> Result<()> {
+        let mut caller = DuplexConsensusCaller::new(
+            "consensus".to_string(),
+            "RG1".to_string(),
+            vec![1],
+            10,
+            false,
+            false,
+            None,
+            None,
+            false,
+            93, // error_rate_pre_umi: no pre-UMI adjustment
+            error_rate_post_umi,
+        )?;
+
+        let cigar_10m = &[encode_op(0, 10)];
+        let quals = &[20u8; 10];
+        let mut b = SamBuilder::new();
+        let rx_a: &[(SamTag, &[u8])] = &[(SamTag::RX, b"A")];
+        let rx_c: &[(SamTag, &[u8])] = &[(SamTag::RX, b"C")];
+
+        let reads = vec![
+            ab_r1(&mut b, b"q1", b"AAAAAAAAAA", quals, cigar_10m, b"foo/A", rx_a),
+            ab_r2(&mut b, b"q1", b"CCCCCCCCCC", quals, cigar_10m, b"foo/A", rx_a),
+            ab_r1(&mut b, b"q2", b"AAAAAAAAAA", quals, cigar_10m, b"foo/A", rx_a),
+            ab_r2(&mut b, b"q2", b"CCCCCCCCCC", quals, cigar_10m, b"foo/A", rx_a),
+            ba_r1(&mut b, b"q3", b"CCCCCCCCCC", quals, cigar_10m, b"foo/B", rx_c),
+            ba_r2(&mut b, b"q3", b"AAAAAAAAAA", quals, cigar_10m, b"foo/B", rx_c),
+        ];
+
+        let result = caller.consensus_reads(reads)?;
+        assert_eq!(result.count, 2, "Should produce 2 duplex consensus reads");
+
+        for rec in &ParsedBamRecord::parse_all(&result.data) {
+            assert_eq!(
+                rec.get_string_tag(SamTag::RX).as_deref(),
+                Some(&expected_rx[..]),
+                "Duplex RX should reflect the configured post-UMI error rate"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Port of fgbio test: "handle absent UMI (left)"
     /// Tests the reverse case where left UMI is absent in A family
     #[test]
@@ -4395,6 +4463,7 @@ mod tests {
             crate::MethylationMode::Disabled,
             None,
             None,
+            UmiErrorRates::default(),
         )
         .expect("write_duplex_consensus_record should succeed");
 
@@ -4796,6 +4865,7 @@ mod tests {
             crate::MethylationMode::Disabled,
             Some(cell_tag),
             Some(cell_barcode),
+            UmiErrorRates::default(),
         )
         .expect("write_duplex_consensus_record should succeed");
 
@@ -4847,6 +4917,7 @@ mod tests {
             crate::MethylationMode::Disabled,
             None,
             None,
+            UmiErrorRates::default(),
         )
         .expect("write_duplex_consensus_record should succeed");
 
@@ -4978,6 +5049,7 @@ mod tests {
             crate::MethylationMode::Disabled,
             None,
             None,
+            UmiErrorRates::default(),
         )
         .expect("write_duplex_consensus_record should succeed");
 
@@ -5051,6 +5123,7 @@ mod tests {
             crate::MethylationMode::Disabled,
             None,
             None,
+            UmiErrorRates::default(),
         )
         .expect("duplex_read_into should succeed");
 
@@ -5121,6 +5194,7 @@ mod tests {
             crate::MethylationMode::Disabled,
             None,
             None,
+            UmiErrorRates::default(),
         )
         .expect("duplex_read_into should succeed");
 
@@ -5229,6 +5303,7 @@ mod tests {
             crate::MethylationMode::Disabled,
             None,
             None,
+            UmiErrorRates::default(),
         )
         .expect("write_duplex_consensus_record should succeed");
 
@@ -5290,6 +5365,7 @@ mod tests {
                 crate::MethylationMode::Disabled,
                 None,
                 None,
+                UmiErrorRates::default(),
             )
             .expect("write_duplex_consensus_record should succeed");
             let records = ParsedBamRecord::parse_all(&output.data);
@@ -6122,6 +6198,7 @@ mod tests {
             crate::MethylationMode::EmSeq,
             None,
             None,
+            UmiErrorRates::default(),
         )
         .unwrap();
 

@@ -9,11 +9,12 @@
 use crate::commands::common::parse_bool;
 use crate::logging::OperationTimer;
 use crate::metrics::duplex::{DuplexMetricsCollector, DuplexYieldMetric, FamilySizeMetric};
-use crate::simple_umi_consensus::SimpleUmiConsensusCaller;
+use crate::simple_umi_consensus::{SimpleUmiConsensusCaller, UmiErrorRates};
 use crate::umi::extract_mi_base;
 use crate::validation::validate_file_exists;
 use anyhow::Result;
 use clap::Parser;
+use fgumi_consensus::phred::MAX_PHRED;
 use log::info;
 use statrs::distribution::{Binomial, DiscreteCDF};
 use std::path::PathBuf;
@@ -106,6 +107,14 @@ pub struct DuplexMetrics {
     #[arg(long = "duplex-umi-counts", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub duplex_umi_counts: bool,
 
+    /// Phred-scaled error rate prior to UMI integration, used when calling the consensus UMI
+    #[arg(short = '1', long = "error-rate-pre-umi", default_value = "45")]
+    pub error_rate_pre_umi: u8,
+
+    /// Phred-scaled error rate post UMI integration, used when calling the consensus UMI
+    #[arg(short = '2', long = "error-rate-post-umi", default_value = "40")]
+    pub error_rate_post_umi: u8,
+
     /// Optional intervals file to restrict analysis (BED or Picard interval list format)
     #[arg(short = 'l', long = "intervals")]
     pub intervals: Option<PathBuf>,
@@ -145,6 +154,21 @@ impl Command for DuplexMetrics {
             );
         }
 
+        // The consensus UMI is called with these rates, so apply the same bounds the consensus
+        // commands do: a Phred score of 0 is not a meaningful prior, and MAX_PHRED is the top of
+        // the lookup tables.
+        for (name, value) in [
+            ("error-rate-pre-umi", self.error_rate_pre_umi),
+            ("error-rate-post-umi", self.error_rate_post_umi),
+        ] {
+            if value == 0 {
+                anyhow::bail!("--{name} must be > 0");
+            }
+            if value > MAX_PHRED {
+                anyhow::bail!("--{name} ({value}) exceeds maximum Phred score ({MAX_PHRED})");
+            }
+        }
+
         // Check that input is not a consensus BAM
         validate_not_consensus_bam(&self.input)?;
 
@@ -170,7 +194,10 @@ impl Command for DuplexMetrics {
             })
             .collect();
 
-        let mut umi_consensus_caller = SimpleUmiConsensusCaller::default();
+        let mut umi_consensus_caller = SimpleUmiConsensusCaller::new(UmiErrorRates {
+            pre_umi: self.error_rate_pre_umi,
+            post_umi: self.error_rate_post_umi,
+        });
 
         info!("Processing templates in single pass at {} sampling fractions...", fractions.len());
 
@@ -683,6 +710,7 @@ mod tests {
     use noodles::bam;
     use noodles::sam;
     use noodles::sam::alignment::io::Write;
+    use rstest::rstest;
     use std::num::NonZeroUsize;
     use tempfile::{NamedTempFile, TempDir};
 
@@ -805,6 +833,8 @@ mod tests {
             min_ab_reads: 0,
             min_ba_reads: 0,
             duplex_umi_counts: false,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };
@@ -840,6 +870,8 @@ mod tests {
             min_ab_reads: 1,
             min_ba_reads: 1,
             duplex_umi_counts: false,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };
@@ -919,6 +951,8 @@ mod tests {
             min_ab_reads: 1,
             min_ba_reads: 0,
             duplex_umi_counts: false,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };
@@ -965,6 +999,8 @@ mod tests {
             min_ab_reads: 1,
             min_ba_reads: 0,
             duplex_umi_counts: false,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };
@@ -1003,6 +1039,8 @@ mod tests {
             min_ab_reads: 1,
             min_ba_reads: 0,
             duplex_umi_counts: false,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };
@@ -1044,6 +1082,8 @@ mod tests {
             min_ab_reads: 1,
             min_ba_reads: 1,
             duplex_umi_counts: false,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };
@@ -1105,6 +1145,8 @@ mod tests {
             min_ab_reads: 1,
             min_ba_reads: 1,
             duplex_umi_counts: true,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };
@@ -1143,6 +1185,108 @@ mod tests {
         Ok(())
     }
 
+    /// Regression for fulcrumgenomics/fgbio#1163: the consensus UMI this tool derives for its
+    /// metrics must be called with the *configured* pre-/post-UMI error rates, matching how the
+    /// consensus BAM's `RX` tag is called, rather than hardcoded defaults.
+    ///
+    /// The family below observes each UMI position five-to-one. A normal post-UMI error rate
+    /// calls the majority base, so metrics are keyed on `AAA`/`TTT`. At Q1 (~79% error) an
+    /// observed base is *less* likely than each of the three unobserved ones, so every position
+    /// no-calls — even the unanimous ones — and both UMIs collapse to a single `NNN` key.
+    #[rstest]
+    #[case::normal_post_umi_error(40, &["AAA", "TTT"])]
+    #[case::extreme_post_umi_error(1, &["NNN"])]
+    fn test_umi_consensus_uses_configured_error_rates(
+        #[case] error_rate_post_umi: u8,
+        #[case] expected_umis: &[&str],
+    ) -> Result<()> {
+        let mut records = Vec::new();
+
+        // A strand: AAA-TTT (2 exact + 1 with 1 error: CAA-TTT)
+        for i in 1..=3 {
+            let umi = if i == 3 { "CAA-TTT" } else { "AAA-TTT" };
+            let (r1, r2) = build_test_pair(&format!("a{i}"), 0, 100, 200, umi, "1/A", true, false);
+            records.push(r1);
+            records.push(r2);
+        }
+
+        // B strand: TTT-AAA (2 exact + 1 with 1 error: CTT-AAA)
+        for i in 1..=3 {
+            let umi = if i == 3 { "CTT-AAA" } else { "TTT-AAA" };
+            let (r1, r2) = build_test_pair(&format!("b{i}"), 0, 200, 100, umi, "1/B", false, true);
+            records.push(r1);
+            records.push(r2);
+        }
+
+        let input = create_test_bam(records)?;
+        let output_dir = TempDir::new()?;
+        let output = output_dir.path().join("output");
+
+        let cmd = DuplexMetrics {
+            input: input.path().to_path_buf(),
+            output: output.clone(),
+            min_ab_reads: 1,
+            min_ba_reads: 1,
+            duplex_umi_counts: false,
+            error_rate_pre_umi: 93, // no pre-UMI adjustment
+            error_rate_post_umi,
+            intervals: None,
+            description: None,
+        };
+
+        cmd.execute("test")?;
+
+        let umi_path = format!("{}.umi_counts.txt", output.display());
+        let umi_metrics: Vec<UmiMetric> = DelimFile::default().read_tsv(&umi_path)?;
+
+        let mut umis: Vec<&str> = umi_metrics.iter().map(|m| m.umi.as_str()).collect();
+        umis.sort_unstable();
+
+        assert_eq!(
+            umis, expected_umis,
+            "consensus UMIs should reflect the configured post-UMI error rate"
+        );
+
+        Ok(())
+    }
+
+    /// A Phred-scaled error rate of 0 means "always wrong", which is not a meaningful prior;
+    /// fgbio rejects it, and anything above `MAX_PHRED` is out of range for the lookup tables.
+    #[rstest]
+    #[case::pre_umi_zero(0, 40, "error-rate-pre-umi")]
+    #[case::post_umi_zero(45, 0, "error-rate-post-umi")]
+    #[case::pre_umi_too_high(94, 40, "error-rate-pre-umi")]
+    #[case::post_umi_too_high(45, 94, "error-rate-post-umi")]
+    fn test_invalid_error_rates_are_rejected(
+        #[case] error_rate_pre_umi: u8,
+        #[case] error_rate_post_umi: u8,
+        #[case] expected_message: &str,
+    ) -> Result<()> {
+        let (r1, r2) = build_test_pair("a1", 0, 100, 200, "AAA-TTT", "1/A", true, false);
+        let input = create_test_bam(vec![r1, r2])?;
+        let output_dir = TempDir::new()?;
+
+        let cmd = DuplexMetrics {
+            input: input.path().to_path_buf(),
+            output: output_dir.path().join("output"),
+            min_ab_reads: 1,
+            min_ba_reads: 1,
+            duplex_umi_counts: false,
+            error_rate_pre_umi,
+            error_rate_post_umi,
+            intervals: None,
+            description: None,
+        };
+
+        let err = cmd.execute("test").expect_err("invalid error rate should be rejected");
+        assert!(
+            err.to_string().contains(expected_message),
+            "error should name the offending option, got: {err}"
+        );
+
+        Ok(())
+    }
+
     /// DXM-03: a malformed duplex UMI whose `RX` is not exactly two `-`-delimited
     /// segments (e.g. no dash) must be rejected with a clear error, matching fgbio
     /// (`split("-", -1)` + `case Array(u1, u2)` throws a `MatchError`) and fgumi's own
@@ -1166,6 +1310,8 @@ mod tests {
             min_ab_reads: 1,
             min_ba_reads: 1,
             duplex_umi_counts: false,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };
@@ -1210,6 +1356,8 @@ mod tests {
             min_ab_reads: 1,
             min_ba_reads: 1,
             duplex_umi_counts: true,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };
@@ -1271,6 +1419,8 @@ mod tests {
             min_ab_reads: 1,
             min_ba_reads: 1,
             duplex_umi_counts: false,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };
@@ -1375,6 +1525,8 @@ mod tests {
             min_ab_reads: 1,
             min_ba_reads: 1,
             duplex_umi_counts: false,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };
@@ -1501,6 +1653,8 @@ mod tests {
             min_ab_reads: 1,
             min_ba_reads: 1,
             duplex_umi_counts: false,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };
@@ -1594,6 +1748,8 @@ mod tests {
                 min_ab_reads: 1,
                 min_ba_reads: 1,
                 duplex_umi_counts: false,
+                error_rate_pre_umi: 45,
+                error_rate_post_umi: 40,
                 intervals: None,
                 description: None,
             };
@@ -1621,6 +1777,8 @@ mod tests {
                 min_ab_reads: 2,
                 min_ba_reads: 1,
                 duplex_umi_counts: false,
+                error_rate_pre_umi: 45,
+                error_rate_post_umi: 40,
                 intervals: None,
                 description: None,
             };
@@ -1648,6 +1806,8 @@ mod tests {
                 min_ab_reads: 2,
                 min_ba_reads: 2,
                 duplex_umi_counts: false,
+                error_rate_pre_umi: 45,
+                error_rate_post_umi: 40,
                 intervals: None,
                 description: None,
             };
@@ -1772,6 +1932,8 @@ mod tests {
             min_ab_reads: 1,
             min_ba_reads: 1,
             duplex_umi_counts: false,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: Some(intervals_path),
             description: None,
         };
@@ -1831,6 +1993,8 @@ mod tests {
             min_ab_reads: 1,
             min_ba_reads: 1,
             duplex_umi_counts: false,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };
@@ -2035,6 +2199,8 @@ mod tests {
             min_ab_reads: 1,
             min_ba_reads: 1,
             duplex_umi_counts: false,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };
@@ -2059,6 +2225,8 @@ mod tests {
             min_ab_reads: 1,
             min_ba_reads: 1,
             duplex_umi_counts: false,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };
@@ -2078,6 +2246,8 @@ mod tests {
             min_ab_reads: 3,
             min_ba_reads: 2,
             duplex_umi_counts: true,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: Some(PathBuf::from("intervals.bed")),
             description: Some("Test Sample".to_string()),
         };
@@ -2096,6 +2266,8 @@ mod tests {
             min_ab_reads: 1,
             min_ba_reads: 2, // Invalid: BA > AB
             duplex_umi_counts: false,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };
@@ -2329,6 +2501,8 @@ mod tests {
             min_ab_reads: 1,
             min_ba_reads: 1,
             duplex_umi_counts: false,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: Some(intervals_path),
             description: None,
         };
@@ -2415,6 +2589,8 @@ mod tests {
             min_ab_reads: 1,
             min_ba_reads: 1,
             duplex_umi_counts: false,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };

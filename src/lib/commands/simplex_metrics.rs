@@ -9,10 +9,11 @@
 
 use crate::logging::OperationTimer;
 use crate::metrics::simplex::{SimplexMetricsCollector, SimplexYieldMetric};
-use crate::simple_umi_consensus::SimpleUmiConsensusCaller;
+use crate::simple_umi_consensus::{SimpleUmiConsensusCaller, UmiErrorRates};
 use crate::validation::validate_file_exists;
 use anyhow::Result;
 use clap::Parser;
+use fgumi_consensus::phred::MAX_PHRED;
 use log::info;
 use std::path::PathBuf;
 
@@ -77,6 +78,14 @@ pub struct SimplexMetrics {
     #[arg(long = "min-reads", default_value = "1")]
     pub min_reads: usize,
 
+    /// Phred-scaled error rate prior to UMI integration, used when calling the consensus UMI
+    #[arg(short = '1', long = "error-rate-pre-umi", default_value = "45")]
+    pub error_rate_pre_umi: u8,
+
+    /// Phred-scaled error rate post UMI integration, used when calling the consensus UMI
+    #[arg(short = '2', long = "error-rate-post-umi", default_value = "40")]
+    pub error_rate_post_umi: u8,
+
     /// Optional intervals file to restrict analysis. Both BED and Picard interval-list formats are
     /// auto-detected (an fgumi superset; fgbio's duplex analog accepts only the Picard interval list).
     #[arg(short = 'l', long = "intervals")]
@@ -107,6 +116,21 @@ impl Command for SimplexMetrics {
             anyhow::bail!("--min-reads must be >= 1 (got {})", self.min_reads);
         }
 
+        // The consensus UMI is called with these rates, so apply the same bounds the consensus
+        // commands do: a Phred score of 0 is not a meaningful prior, and MAX_PHRED is the top of
+        // the lookup tables.
+        for (name, value) in [
+            ("error-rate-pre-umi", self.error_rate_pre_umi),
+            ("error-rate-post-umi", self.error_rate_post_umi),
+        ] {
+            if value == 0 {
+                anyhow::bail!("--{name} must be > 0");
+            }
+            if value > MAX_PHRED {
+                anyhow::bail!("--{name} ({value}) exceeds maximum Phred score ({MAX_PHRED})");
+            }
+        }
+
         // Check that input is not a consensus BAM
         validate_not_consensus_bam(&self.input)?;
 
@@ -126,7 +150,10 @@ impl Command for SimplexMetrics {
         let mut collectors: Vec<SimplexMetricsCollector> =
             fractions.iter().map(|_| SimplexMetricsCollector::new()).collect();
 
-        let mut umi_consensus_caller = SimpleUmiConsensusCaller::default();
+        let mut umi_consensus_caller = SimpleUmiConsensusCaller::new(UmiErrorRates {
+            pre_umi: self.error_rate_pre_umi,
+            post_umi: self.error_rate_post_umi,
+        });
 
         info!("Processing templates in single pass at {} sampling fractions...", fractions.len());
 
@@ -385,6 +412,7 @@ mod tests {
     use noodles::bam;
     use noodles::sam;
     use noodles::sam::alignment::io::Write;
+    use rstest::rstest;
     use std::num::NonZeroUsize;
     use tempfile::{NamedTempFile, TempDir};
 
@@ -534,6 +562,8 @@ mod tests {
             input: input.path().to_path_buf(),
             output: output_dir.path().join("output"),
             min_reads: 0,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };
@@ -565,6 +595,8 @@ mod tests {
             input: input.path().to_path_buf(),
             output,
             min_reads: 1,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };
@@ -658,6 +690,8 @@ mod tests {
             input: input.path().to_path_buf(),
             output: output.clone(),
             min_reads: 1,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };
@@ -726,6 +760,8 @@ mod tests {
             input: input.path().to_path_buf(),
             output: output.clone(),
             min_reads: 1,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };
@@ -754,6 +790,94 @@ mod tests {
         Ok(())
     }
 
+    /// Regression for fulcrumgenomics/fgbio#1163: the consensus UMI this tool derives for its
+    /// metrics must be called with the *configured* pre-/post-UMI error rates rather than
+    /// hardcoded defaults, matching `duplex-metrics` and the consensus commands.
+    ///
+    /// The family below observes each UMI position two-to-one. A normal post-UMI error rate calls
+    /// the majority base, so metrics are keyed on `AAA`/`TTT`. At Q1 (~79% error) an observed base
+    /// is *less* likely than each of the three unobserved ones, so every position no-calls — even
+    /// the unanimous ones — and both UMIs collapse to a single `NNN` key.
+    #[rstest]
+    #[case::normal_post_umi_error(40, &["AAA", "TTT"])]
+    #[case::extreme_post_umi_error(1, &["NNN"])]
+    fn test_umi_consensus_uses_configured_error_rates(
+        #[case] error_rate_post_umi: u8,
+        #[case] expected_umis: &[&str],
+    ) -> Result<()> {
+        let mut records = Vec::new();
+
+        // One family whose UMIs disagree two-to-one at the first position of each half.
+        for (i, umi) in ["AAA-TTT", "AAA-TTT", "CAA-CTT"].iter().enumerate() {
+            let (r1, r2) = build_test_pair(&format!("q{i}"), 0, 100, 200, umi, "1/A");
+            records.push(r1);
+            records.push(r2);
+        }
+
+        let input = create_test_bam(records)?;
+        let output_dir = TempDir::new()?;
+        let output = output_dir.path().join("output");
+
+        let cmd = SimplexMetrics {
+            input: input.path().to_path_buf(),
+            output: output.clone(),
+            min_reads: 1,
+            error_rate_pre_umi: 93, // no pre-UMI adjustment
+            error_rate_post_umi,
+            intervals: None,
+            description: None,
+        };
+        cmd.execute("test")?;
+
+        let umi_path = format!("{}.umi_counts.txt", output.display());
+        let umi_metrics: Vec<UmiMetric> = DelimFile::default().read_tsv(&umi_path)?;
+
+        let mut umis: Vec<&str> = umi_metrics.iter().map(|m| m.umi.as_str()).collect();
+        umis.sort_unstable();
+
+        assert_eq!(
+            umis, expected_umis,
+            "consensus UMIs should reflect the configured post-UMI error rate"
+        );
+
+        Ok(())
+    }
+
+    /// A Phred-scaled error rate of 0 means "always wrong", which is not a meaningful prior;
+    /// fgbio rejects it, and anything above `MAX_PHRED` is out of range for the lookup tables.
+    #[rstest]
+    #[case::pre_umi_zero(0, 40, "error-rate-pre-umi")]
+    #[case::post_umi_zero(45, 0, "error-rate-post-umi")]
+    #[case::pre_umi_too_high(94, 40, "error-rate-pre-umi")]
+    #[case::post_umi_too_high(45, 94, "error-rate-post-umi")]
+    fn test_invalid_error_rates_are_rejected(
+        #[case] error_rate_pre_umi: u8,
+        #[case] error_rate_post_umi: u8,
+        #[case] expected_message: &str,
+    ) -> Result<()> {
+        let (r1, r2) = build_test_pair("q1", 0, 100, 200, "AAA-TTT", "1/A");
+        let input = create_test_bam(vec![r1, r2])?;
+        let output_dir = TempDir::new()?;
+
+        let cmd = SimplexMetrics {
+            input: input.path().to_path_buf(),
+            output: output_dir.path().join("output"),
+            min_reads: 1,
+            error_rate_pre_umi,
+            error_rate_post_umi,
+            intervals: None,
+            description: None,
+        };
+
+        let err = cmd.execute("test").expect_err("invalid error rate should be rejected");
+        assert!(
+            err.to_string().contains(expected_message),
+            "error should name the offending option, got: {err}"
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn test_downsampling_generates_multiple_fractions() -> Result<()> {
         let mut records = Vec::new();
@@ -774,6 +898,8 @@ mod tests {
             input: input.path().to_path_buf(),
             output: output.clone(),
             min_reads: 1,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };
@@ -798,6 +924,8 @@ mod tests {
             input: PathBuf::from("test.bam"),
             output: PathBuf::from("output"),
             min_reads: 1,
+            error_rate_pre_umi: 45,
+            error_rate_post_umi: 40,
             intervals: None,
             description: None,
         };
