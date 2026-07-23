@@ -13,9 +13,13 @@ use noodles::bgzf::VirtualPosition;
 use noodles::core::Position;
 use noodles::sam::Header;
 use noodles_bgzf::io::Writer as BgzfWriter;
-use noodles_csi::binning_index::Indexer;
-use noodles_csi::binning_index::index::reference_sequence::bin::Chunk;
+use noodles_csi::binning_index::index::ReferenceSequence;
+use noodles_csi::binning_index::index::reference_sequence::bin::{Bin, Chunk};
 use noodles_csi::binning_index::index::reference_sequence::index::LinearIndex;
+// The `ReferenceSequence` trait (aliased to avoid colliding with the concrete
+// `index::ReferenceSequence` above) provides `metadata()`.
+use noodles_csi::binning_index::ReferenceSequence as _;
+use noodles_csi::binning_index::{BinningIndex, Indexer};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -416,6 +420,25 @@ pub struct BaiBuilder {
     /// in-flight block window instead of growing one entry per output block for
     /// the whole (WGS-scale) file.
     pruned_below: u64,
+    /// The in-progress run of consecutive records mapping to the same bin, whose
+    /// chunks are coalesced into one (see [`Self::resolve`]). `None` before the
+    /// first placed record and after any unplaced one.
+    run: Option<ChunkRun>,
+}
+
+/// A run of consecutive same-bin records being coalesced into a single chunk.
+///
+/// noodles' `Indexer` merges two chunks only when they are exactly adjacent in
+/// virtual-position space, which breaks at every BGZF block boundary and leaves
+/// one chunk per block per bin. htslib instead emits one chunk per run of
+/// same-bin records, spanning blocks. Anchoring every record's chunk at the
+/// run's start (rather than the record's own start) makes noodles coalesce the
+/// whole run — reproducing htslib's chunk shape. This mirrors the
+/// `save_bin`/`save_off` state in htslib's `hts_idx_push` (`hts.c`).
+struct ChunkRun {
+    reference_sequence_id: usize,
+    bin: usize,
+    start: VirtualPosition,
 }
 
 impl BaiBuilder {
@@ -427,6 +450,7 @@ impl BaiBuilder {
             entry_cache: VecDeque::new(),
             block_positions: BlockPositions::default(),
             pruned_below: 0,
+            run: None,
         }
     }
 
@@ -493,8 +517,40 @@ impl BaiBuilder {
 
             let start_vpos = VirtualPosition::try_from((block_start, offset_in_block as u16))
                 .unwrap_or(VirtualPosition::MIN);
-            let chunk = Chunk::new(start_vpos, end_vpos);
-            self.indexer.add_record(alignment_context, chunk).map_err(io::Error::other)?;
+
+            // Anchor the chunk at the current run's start so noodles coalesces
+            // the whole run of same-bin records into one block-spanning chunk
+            // (see [`ChunkRun`]). A new bin/reference — or an unplaced record —
+            // starts a fresh run. The record's own context still drives bin
+            // routing and the linear index inside `add_record`; only the chunk's
+            // start position is widened.
+            let chunk_start = if let Some((reference_sequence_id, start, end, _)) =
+                alignment_context
+            {
+                let bin = reg2bin(start, end);
+                // Read the current run out by value first, so reassigning
+                // `self.run` below doesn't overlap the borrow.
+                let current = self.run.as_ref().map(|r| (r.reference_sequence_id, r.bin, r.start));
+                match current {
+                    Some((run_ref, run_bin, run_start))
+                        if run_ref == reference_sequence_id && run_bin == bin =>
+                    {
+                        run_start
+                    }
+                    _ => {
+                        self.run = Some(ChunkRun { reference_sequence_id, bin, start: start_vpos });
+                        start_vpos
+                    }
+                }
+            } else {
+                // Unplaced record: `add_record` ignores the chunk and counts it
+                // as unplaced. End any run so the next placed record starts fresh.
+                self.run = None;
+                start_vpos
+            };
+            self.indexer
+                .add_record(alignment_context, Chunk::new(chunk_start, end_vpos))
+                .map_err(io::Error::other)?;
             self.entry_cache.pop_front();
         }
 
@@ -522,6 +578,10 @@ impl BaiBuilder {
 
     /// Build the final BAI index.
     ///
+    /// The index is compacted (see `compact_bai_index`) so its on-disk size
+    /// matches what htslib/samtools produce; noodles' `Indexer` alone emits a
+    /// spec-valid but far larger index (see that function for why).
+    ///
     /// # Errors
     /// Returns an error if any record remains unresolved (its block position was
     /// never noted), which would indicate a lost or miscounted block.
@@ -532,7 +592,17 @@ impl BaiBuilder {
                 self.entry_cache.len()
             )));
         }
-        Ok(self.indexer.build(num_refs))
+        let index = self.indexer.build(num_refs);
+        // `reg2bin` (run-batching) hardcodes BAI's binning parameters, which must
+        // match the ones the indexer actually routed records with — otherwise a
+        // run's bin could disagree with the bin noodles binned into. They agree
+        // today (`Indexer::default()` is 14/5); this catches a future drift.
+        debug_assert_eq!(
+            (u32::from(index.min_shift()), u32::from(index.depth())),
+            (BAI_MIN_SHIFT, BAI_DEPTH),
+            "reg2bin's BAI constants must match the indexer's binning parameters",
+        );
+        Ok(compact_bai_index(&index))
     }
 }
 
@@ -540,6 +610,190 @@ impl Default for BaiBuilder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Minimum compressed-offset span, in bytes, below which htslib folds a bin
+/// into its parent. Matches htslib's `HTS_MIN_MARKER_DIST` (`hts.c`); a 64 KiB
+/// compressed span is roughly one BGZF block.
+const HTS_MIN_MARKER_DIST: u64 = 0x1_0000;
+
+/// Compact a freshly built BAI index the way htslib's `compress_binning`
+/// (`hts.c`) does — a finalization step noodles' `Indexer` does not perform.
+///
+/// noodles builds a spec-valid index but, for dense short-read data, one that
+/// is roughly an order of magnitude larger than samtools': it keeps a distinct
+/// bin at every level down to the 16 KiB leaves (redundant with the linear
+/// index it also stores) and merges only exactly-adjacent chunks. htslib folds
+/// the small fine-grained bins into their parents and merges every chunk that
+/// shares a BGZF block, then relies on the linear index for finer lookup. This
+/// reproduces that pass on the built index.
+///
+/// Only the binning index changes: the linear index, metadata, and header are
+/// carried over untouched (htslib leaves them alone here too), so region
+/// queries return the same records — the index just shrinks.
+fn compact_bai_index(index: &bai::Index) -> bai::Index {
+    let depth = index.depth();
+
+    let reference_sequences: Vec<ReferenceSequence<LinearIndex>> = index
+        .reference_sequences()
+        .iter()
+        .map(|reference_sequence| {
+            // Pull the bins into a plain map we can freely mutate, keyed by bin
+            // number. Cloning here also lets us leave `indexmap` out of this
+            // crate's direct dependencies (the rebuilt map's type is inferred
+            // from `ReferenceSequence::new`).
+            let bins: HashMap<usize, Vec<Chunk>> = reference_sequence
+                .bins()
+                .iter()
+                .map(|(&bin_id, bin)| (bin_id, bin.chunks().to_vec()))
+                .collect();
+            // `compress_binning` already yields `(bin_id, Bin)`; collect into the
+            // `IndexMap` `ReferenceSequence::new` wants (type inferred, so
+            // `indexmap` stays out of this crate's direct dependencies).
+            let bins = compress_binning(bins, depth).into_iter().collect();
+            ReferenceSequence::new(
+                bins,
+                reference_sequence.index().clone(),
+                reference_sequence.metadata().cloned(),
+            )
+        })
+        .collect();
+
+    let mut builder = bai::Index::builder()
+        .set_min_shift(index.min_shift())
+        .set_depth(depth)
+        .set_reference_sequences(reference_sequences);
+    if let Some(header) = index.header() {
+        builder = builder.set_header(header.clone());
+    }
+    if let Some(count) = index.unplaced_unmapped_record_count() {
+        builder = builder.set_unplaced_unmapped_record_count(count);
+    }
+    builder.build()
+}
+
+/// Port of htslib's `compress_binning` for one reference sequence's bins.
+///
+/// Returns the surviving bins (in ascending bin-number order for a
+/// deterministic index) after two passes:
+///
+/// 1. **Fold small bins into their parent**, walking finest level to coarsest
+///    so folding cascades: a bin whose chunks span less than
+///    [`HTS_MIN_MARKER_DIST`] *compressed* bytes has its chunks appended to its
+///    parent bin and is dropped — but only if the parent bin already exists
+///    (htslib never creates one), matching htslib exactly. This removes the
+///    per-16 KiB leaf bins that dominate an un-compacted index.
+/// 2. **Merge chunks that share a BGZF block** within each surviving bin,
+///    collapsing the many single-record chunks a coordinate sort produces.
+///
+/// `depth` is the index depth / number of non-root levels (5 for BAI).
+fn compress_binning(mut bins: HashMap<usize, Vec<Chunk>>, depth: u8) -> Vec<(usize, Bin)> {
+    // Pass 1: fold, finest level (`depth`) up to level 1. The root (bin 0) has
+    // no parent and is never folded.
+    for level in (1..=depth).rev() {
+        let level_first = bin_level_first(level);
+        // Snapshot the candidate bins: pass 1 removes folded bins as it goes.
+        // Sorting keeps folding order (and thus the result) deterministic.
+        let mut bin_ids: Vec<usize> =
+            bins.keys().copied().filter(|&bin_id| bin_id >= level_first).collect();
+        bin_ids.sort_unstable();
+
+        for bin_id in bin_ids {
+            let Some(chunks) = bins.get_mut(&bin_id) else { continue };
+            if chunks.is_empty() {
+                continue;
+            }
+            // htslib measures the span over start-sorted chunks: first chunk's
+            // start to last chunk's end.
+            chunks.sort_unstable_by_key(|chunk| u64::from(chunk.start()));
+            let span = coffset(chunks.last().unwrap().end())
+                .saturating_sub(coffset(chunks.first().unwrap().start()));
+            if span >= HTS_MIN_MARKER_DIST {
+                continue;
+            }
+
+            let parent = bin_parent(bin_id);
+            if bins.contains_key(&parent) {
+                let mut folded = bins.remove(&bin_id).unwrap();
+                bins.get_mut(&parent).unwrap().append(&mut folded);
+            }
+            // Parent absent: keep the bin, as htslib does.
+        }
+    }
+
+    // Pass 2: merge same-block chunks within each surviving bin, emitting bins
+    // in ascending order.
+    let mut bin_ids: Vec<usize> = bins.keys().copied().collect();
+    bin_ids.sort_unstable();
+    bin_ids
+        .into_iter()
+        .map(|bin_id| {
+            let mut chunks = bins.remove(&bin_id).unwrap();
+            chunks.sort_unstable_by_key(|chunk| u64::from(chunk.start()));
+            (bin_id, Bin::new(merge_same_block_chunks(chunks)))
+        })
+        .collect()
+}
+
+/// Merge chunks that begin in the same BGZF block as the running chunk ends in
+/// (comparing compressed offsets), matching htslib's post-fold chunk merge.
+/// Input must be sorted by start virtual position.
+fn merge_same_block_chunks(chunks: Vec<Chunk>) -> Vec<Chunk> {
+    let mut merged: Vec<Chunk> = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        if let Some(last) = merged.last_mut()
+            && coffset(last.end()) >= coffset(chunk.start())
+        {
+            if u64::from(last.end()) < u64::from(chunk.end()) {
+                *last = Chunk::new(last.start(), chunk.end());
+            }
+            continue;
+        }
+        merged.push(chunk);
+    }
+    merged
+}
+
+/// Compressed-file offset (top 48 bits) of a BGZF virtual position — htslib's
+/// `voffset >> 16`.
+fn coffset(virtual_position: VirtualPosition) -> u64 {
+    u64::from(virtual_position) >> 16
+}
+
+/// First bin number at binning-tree `level` (0 = root). Matches htslib's
+/// `hts_bin_first(l) = ((1 << 3l) - 1) / 7`.
+fn bin_level_first(level: u8) -> usize {
+    ((1usize << (3 * u32::from(level))) - 1) / 7
+}
+
+/// Parent of a non-root bin in the 8-ary binning tree. Matches htslib's
+/// `hts_bin_parent(b) = (b - 1) >> 3`.
+fn bin_parent(bin_id: usize) -> usize {
+    (bin_id - 1) >> 3
+}
+
+/// BAI binning parameters, fixed by the format. These must match the values
+/// noodles' `Indexer::default()` uses (14 / 5), because [`reg2bin`] here decides
+/// where a run breaks and must agree with the bin noodles routes each record to.
+const BAI_MIN_SHIFT: u32 = 14;
+const BAI_DEPTH: u32 = 5;
+
+/// Smallest bin fully containing the 1-based, closed interval `[start, end]`. Used
+/// only to detect run boundaries; the on-disk bin is still assigned by noodles.
+///
+/// Delegates to [`fgumi_raw_bam::reg2bin`], the single implementation of the SAM
+/// spec's binning scheme, rather than repeating it here — a second copy of the same
+/// scheme is exactly what that one was factored out to prevent. Only the coordinate
+/// convention is adapted: it takes a 0-based start and a *half-open* end, so a
+/// 1-based inclusive `end` is already the half-open 0-based end.
+///
+/// Its `u16` return cannot truncate for any interval BAI can represent: the largest
+/// BAI bin id is 37,448 (`((1 << 15) - 1) / 7 + (2^29 >> 14) - 1`), well inside
+/// `u16::MAX`, and BAI cannot address beyond 2^29 at all.
+fn reg2bin(start: Position, end: Position) -> usize {
+    let beg = i32::try_from(usize::from(start) - 1).unwrap_or(i32::MAX);
+    let end = i32::try_from(usize::from(end)).unwrap_or(i32::MAX);
+    usize::from(fgumi_raw_bam::reg2bin(beg, end))
 }
 
 /// BAM writer that builds an index incrementally during write.
@@ -1382,5 +1636,151 @@ mod tests {
         // The collision the old expression produced: distinct outputs, one index.
         assert_eq!(with_ext("foo.sorted"), with_ext("foo.other"));
         assert_ne!(bai_sidecar_path("foo.sorted"), bai_sidecar_path("foo.other"));
+    }
+
+    // ---- BAI index compaction (port of htslib's compress_binning) ----
+    // (`vpos(compressed, uncompressed)` helper is defined above.)
+
+    /// Collect the compacted bins into a plain map keyed by bin number.
+    fn compacted(bins: HashMap<usize, Vec<Chunk>>) -> HashMap<usize, Vec<Chunk>> {
+        compress_binning(bins, 5)
+            .into_iter()
+            .map(|(bin_id, bin)| (bin_id, bin.chunks().to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn compress_binning_folds_small_leaf_bin_into_existing_parent() {
+        // Leaf bin 4681 (chunks within a tiny compressed span) and its L4
+        // parent bin 585 = (4681 - 1) >> 3.
+        let mut bins = HashMap::new();
+        bins.insert(
+            4681,
+            vec![
+                Chunk::new(vpos(1000, 0), vpos(1000, 500)),
+                Chunk::new(vpos(1200, 0), vpos(1400, 10)),
+            ],
+        );
+        bins.insert(585, vec![Chunk::new(vpos(900, 0), vpos(950, 0))]);
+
+        let out = compacted(bins);
+
+        assert!(!out.contains_key(&4681), "small leaf bin must fold into its parent");
+        assert!(out.contains_key(&585), "parent bin (no grandparent present) survives");
+        // The parent now covers both its own and the leaf's chunk range.
+        let lo = out[&585].iter().map(|c| u64::from(c.start())).min().unwrap();
+        let hi = out[&585].iter().map(|c| u64::from(c.end())).max().unwrap();
+        assert!(lo <= u64::from(vpos(900, 0)) && hi >= u64::from(vpos(1400, 10)));
+    }
+
+    #[test]
+    fn compress_binning_keeps_leaf_bin_when_parent_absent() {
+        // Small leaf bin, but bin 585 is not present, so htslib (and this port)
+        // keep it rather than synthesizing a parent.
+        let mut bins = HashMap::new();
+        bins.insert(4681, vec![Chunk::new(vpos(1000, 0), vpos(1000, 500))]);
+
+        let out = compacted(bins);
+
+        assert!(out.contains_key(&4681), "leaf with no existing parent bin must survive");
+    }
+
+    #[test]
+    fn compress_binning_keeps_bin_spanning_at_least_one_block() {
+        // Span exceeds HTS_MIN_MARKER_DIST (64 KiB compressed), so it stays put
+        // even though its parent exists.
+        let mut bins = HashMap::new();
+        bins.insert(4681, vec![Chunk::new(vpos(0, 0), vpos(70_000, 0))]);
+        bins.insert(585, vec![Chunk::new(vpos(0, 0), vpos(10, 0))]);
+
+        let out = compacted(bins);
+
+        assert!(out.contains_key(&4681), "leaf spanning >= 64 KiB compressed must not fold");
+        assert!(out.contains_key(&585));
+    }
+
+    #[test]
+    fn compress_binning_merges_chunks_in_same_bgzf_block() {
+        // Bin 0 (the root, never folded) with three chunks that each begin in
+        // the same compressed block the previous one ends in -> one chunk.
+        let mut bins = HashMap::new();
+        bins.insert(
+            0,
+            vec![
+                Chunk::new(vpos(5000, 0), vpos(5000, 100)),
+                Chunk::new(vpos(5000, 100), vpos(5000, 200)),
+                Chunk::new(vpos(5000, 200), vpos(6000, 0)),
+            ],
+        );
+
+        let out = compacted(bins);
+
+        assert_eq!(out[&0].len(), 1, "chunks sharing a block must merge into one");
+        assert_eq!(u64::from(out[&0][0].start()), u64::from(vpos(5000, 0)));
+        assert_eq!(u64::from(out[&0][0].end()), u64::from(vpos(6000, 0)));
+    }
+
+    #[test]
+    fn compress_binning_keeps_chunks_in_different_blocks() {
+        let mut bins = HashMap::new();
+        bins.insert(
+            0,
+            vec![
+                Chunk::new(vpos(1000, 0), vpos(1000, 100)),
+                Chunk::new(vpos(9000, 0), vpos(9000, 100)),
+            ],
+        );
+
+        let out = compacted(bins);
+
+        assert_eq!(out[&0].len(), 2, "chunks in different blocks must not merge");
+    }
+
+    #[test]
+    fn compact_bai_index_folds_leaf_bin_and_preserves_reference_count() {
+        // Ten mapped reads packed into the first 16 KiB window land in leaf bin
+        // 4681; one read straddling the 16 KiB boundary lands in parent bin 585
+        // (so the parent exists). All chunks sit in one compressed block, so the
+        // leaf's span is tiny and must fold.
+        let mut indexer = Indexer::<LinearIndex>::default();
+        let context = |start: usize, end: usize| {
+            Some((0usize, Position::new(start).unwrap(), Position::new(end).unwrap(), true))
+        };
+        for i in 0..10u16 {
+            let start = vpos(100, i * 20);
+            let end = vpos(100, i * 20 + 20);
+            let pos = usize::from(i) * 30 + 1;
+            indexer.add_record(context(pos, pos + 149), Chunk::new(start, end)).unwrap();
+        }
+        // Boundary-spanning read -> parent bin 585, later in the file.
+        indexer
+            .add_record(context(16_300, 16_449), Chunk::new(vpos(100, 250), vpos(100, 300)))
+            .unwrap();
+
+        let index = indexer.build(1);
+        assert!(
+            index.reference_sequences()[0].bins().contains_key(&4681),
+            "sanity: the uncompacted noodles index keeps the 16 KiB leaf bin",
+        );
+
+        let index = compact_bai_index(&index);
+        let reference_sequences = index.reference_sequences();
+        assert_eq!(reference_sequences.len(), 1, "reference count is preserved");
+        let bins = reference_sequences[0].bins();
+        assert!(!bins.contains_key(&4681), "compaction folds the leaf bin away");
+        assert!(bins.contains_key(&585), "the parent bin is retained");
+    }
+
+    #[test]
+    fn reg2bin_matches_bai_bin_numbering() {
+        let pos = |p: usize| Position::new(p).unwrap();
+        // Reads within a single 16 KiB window -> consecutive leaf bins.
+        assert_eq!(reg2bin(pos(1), pos(150)), 4681);
+        assert_eq!(reg2bin(pos(16_385), pos(16_534)), 4682);
+        // A read straddling a 16 KiB boundary but inside one 128 KiB window ->
+        // the level-4 parent bin 585 (this is the bin leaf reads fold into).
+        assert_eq!(reg2bin(pos(16_300), pos(16_449)), 585);
+        // reg2bin(4681)'s parent must be 585, matching the fold target.
+        assert_eq!(bin_parent(4681), 585);
     }
 }
