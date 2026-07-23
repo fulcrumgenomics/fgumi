@@ -215,7 +215,7 @@ struct DedupFilterConfig {
     include_non_pf: bool,
     /// Minimum UMI length.
     min_umi_length: Option<usize>,
-    /// Skip UMI validation (position-only grouping).
+    /// Skip UMI validation; group by template coordinate and strand of origin alone.
     no_umi: bool,
 }
 
@@ -972,8 +972,34 @@ Pass-through templates are written verbatim: never marked, never MI-tagged, and 
 unique in the metrics.
 
 The counts of templates dropped for each reason are reported in the metrics output
-(--metrics). Deduplication of the templates that remain (representative selection, the
-0x400 flag, and --remove-duplicates) follows Picard `MarkDuplicates` semantics.
+(--metrics). For the templates that remain, representative selection (the duplicate score),
+the 0x400 flag, and --remove-duplicates follow Picard `MarkDuplicates` semantics; the
+grouping key does not — see below.
+
+# Grouping key (strand of origin)
+
+Templates are grouped by template coordinate — the unclipped 5' position of both ends —
+*and* by strand of origin, i.e. which mate defines the forward end. Two templates at the
+same coordinates whose read 1 is on opposite strands (F1R2 vs F2R1) are therefore two
+molecules, not one, and each keeps its own representative. This matches
+`fgbio GroupReadsByUmi`, whose model exists to tell the two strands of a duplex molecule
+apart for consensus calling, and it applies to every strategy except `paired`, which
+deliberately pairs the two strands back together.
+
+Picard `MarkDuplicates` is orientation-agnostic: it collapses F1R2 and F2R1 at the same
+coordinates into one duplicate set with one survivor. So `fgumi dedup` finds more molecules
+and marks *fewer* duplicates than Picard on the same input:
+
+  marked duplicates = templates - molecule groups
+
+The gap is made up entirely of fragments sequenced from both strands at the same
+coordinates, so it grows with duplication depth — roughly 2 percentage points of duplicate
+rate on a moderately duplicated capture panel, and more on deeper libraries.
+
+--no-umi turns off UMI grouping but does NOT turn off the strand split, so it is not a
+drop-in for Picard `MarkDuplicates`; there is currently no option to group
+orientation-agnostically. Use Picard `MarkDuplicates` itself if you need
+orientation-agnostic duplicate marking.
 
 # Cell Barcodes
 
@@ -1064,8 +1090,10 @@ pub struct MarkDuplicates {
     #[arg(long = "index-threshold", default_value = "100")]
     pub index_threshold: usize,
 
-    /// Skip UMI-based grouping; group by position only. Forces identity strategy
-    /// and ignores any existing UMI tags.
+    /// Skip UMI-based grouping; group by template coordinate and strand of origin. Forces
+    /// identity strategy and ignores any existing UMI tags. Because templates are still split
+    /// by strand of origin, this is not equivalent to Picard `MarkDuplicates` (see "Grouping
+    /// key" in --help).
     #[arg(long = "no-umi", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub no_umi: bool,
 
