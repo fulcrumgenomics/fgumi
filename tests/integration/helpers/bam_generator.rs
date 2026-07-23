@@ -58,6 +58,36 @@ pub fn create_umi_family(
         .collect()
 }
 
+/// Like [`create_umi_family`] but tags each read with an arbitrary `SamTag`
+/// (e.g. `SamTag::RX` for UMI mode or `SamTag::BC` for barcode mode).
+pub fn create_family_with_tag(
+    tag: SamTag,
+    umi: &str,
+    depth: usize,
+    base_name: &str,
+    sequence: &str,
+    quality: u8,
+) -> Vec<RawRecord> {
+    let seq = sequence.as_bytes();
+    let cigar_op = u32::try_from(seq.len()).expect("seq.len() fits u32") << 4;
+    (0..depth)
+        .map(|i| {
+            let name = format!("{base_name}_{i}");
+            let mut b = SamBuilder::new();
+            b.read_name(name.as_bytes())
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .flags(0)
+                .cigar_ops(&[cigar_op])
+                .sequence(seq)
+                .qualities(&vec![quality; seq.len()])
+                .add_string_tag(tag, umi.as_bytes());
+            b.build()
+        })
+        .collect()
+}
+
 /// Creates a paired-end UMI family.
 ///
 /// All reads are mapped to reference sequence 0. R1 is mapped at position 100,

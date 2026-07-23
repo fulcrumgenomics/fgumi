@@ -94,6 +94,13 @@ impl SamTag {
     pub const QT: SamTag = SamTag::new(b'Q', b'T');
     /// Original UMI bases, before error correction (SAM spec).
     pub const OX: SamTag = SamTag::new(b'O', b'X');
+    /// Original barcode bases, before error correction.
+    ///
+    /// fgumi-local tag (not SAM-spec): the SAM spec has no "original barcode"
+    /// tag and reserves tags containing lowercase letters for local use, so
+    /// this deliberately uses lowercase `ob` to signal a local convention
+    /// rather than masquerade as a standard tag.
+    pub const OB: SamTag = SamTag::new(b'o', b'b');
     /// Original UMI base quality scores, before error correction (SAM spec).
     pub const BZ: SamTag = SamTag::new(b'B', b'Z');
     /// Read group (SAM spec).
@@ -590,5 +597,12 @@ mod tests {
                 "REVERSE tag {t} missing from PER_BASE_CONSENSUS_TAGS",
             );
         }
+    }
+
+    #[test]
+    fn ob_tag_is_lowercase_and_valid() {
+        // fgumi-local "original barcode" tag: SAM reserves lowercase tags for local use.
+        assert_eq!(SamTag::OB.to_string(), "ob");
+        assert!(SamTag::is_valid_tag_bytes(b'o', b'b'));
     }
 }
