@@ -778,24 +778,22 @@ fn bin_parent(bin_id: usize) -> usize {
 const BAI_MIN_SHIFT: u32 = 14;
 const BAI_DEPTH: u32 = 5;
 
-/// Smallest bin fully containing the 1-based, closed interval `[start, end]` —
-/// a port of noodles' (and htslib's) `reg2bin` with BAI's fixed parameters. Used
+/// Smallest bin fully containing the 1-based, closed interval `[start, end]`. Used
 /// only to detect run boundaries; the on-disk bin is still assigned by noodles.
+///
+/// Delegates to [`fgumi_raw_bam::reg2bin`], the single implementation of the SAM
+/// spec's binning scheme, rather than repeating it here — a second copy of the same
+/// scheme is exactly what that one was factored out to prevent. Only the coordinate
+/// convention is adapted: it takes a 0-based start and a *half-open* end, so a
+/// 1-based inclusive `end` is already the half-open 0-based end.
+///
+/// Its `u16` return cannot truncate for any interval BAI can represent: the largest
+/// BAI bin id is 37,448 (`((1 << 15) - 1) / 7 + (2^29 >> 14) - 1`), well inside
+/// `u16::MAX`, and BAI cannot address beyond 2^29 at all.
 fn reg2bin(start: Position, end: Position) -> usize {
-    let beg = usize::from(start) - 1; // 0-based, inclusive
-    let end = usize::from(end) - 1; // 0-based, inclusive
-    let mut level = BAI_DEPTH;
-    let mut shift = BAI_MIN_SHIFT;
-    let mut offset = ((1usize << (BAI_DEPTH * 3)) - 1) / 7;
-    while level > 0 {
-        if beg >> shift == end >> shift {
-            return offset + (beg >> shift);
-        }
-        level -= 1;
-        shift += 3;
-        offset -= 1usize << (level * 3);
-    }
-    0
+    let beg = i32::try_from(usize::from(start) - 1).unwrap_or(i32::MAX);
+    let end = i32::try_from(usize::from(end)).unwrap_or(i32::MAX);
+    usize::from(fgumi_raw_bam::reg2bin(beg, end))
 }
 
 /// BAM writer that builds an index incrementally during write.
