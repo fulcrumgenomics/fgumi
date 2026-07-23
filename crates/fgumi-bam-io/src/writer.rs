@@ -767,11 +767,16 @@ pub fn write_bai_sidecar<P: AsRef<Path>>(bam_path: P) -> Result<PathBuf> {
 /// Returns an error if the file cannot be created or writing the index fails.
 pub fn write_bai_index<P: AsRef<Path>>(path: P, index: &bai::Index) -> Result<()> {
     let path_ref = path.as_ref();
-    let file = File::create(path_ref)
-        .with_context(|| format!("Failed to create index file: {}", path_ref.display()))?;
-    let mut writer = bai::io::Writer::new(file);
-    writer
+    // `bai::io::Writer` serializes the index as a great many tiny fields (each
+    // bin and chunk writes 8-byte virtual offsets), so writing straight to the
+    // file issues one `write()` syscall per field. For a WGS-scale index (tens
+    // of MB) that unbuffered tail dominates the post-merge main-thread time.
+    // Serialize into memory first, then write the whole sidecar in one call.
+    let mut buf = Vec::new();
+    bai::io::Writer::new(&mut buf)
         .write_index(index)
+        .with_context(|| format!("Failed to serialize BAI index for: {}", path_ref.display()))?;
+    std::fs::write(path_ref, &buf)
         .with_context(|| format!("Failed to write index to: {}", path_ref.display()))?;
     Ok(())
 }
