@@ -21,7 +21,8 @@ pub use fgumi_sam::{TC_TAG, TemplateCoordinateInfo};
 // `check_sort` calls it internally within fgumi-sam.
 pub use fgumi_sam::{
     buf_value_to_smallest_signed_int, check_sort, header_as_query_grouped, header_as_unsorted,
-    is_template_coordinate_sorted, revcomp_buf_value, reverse_buf_value, to_smallest_signed_int,
+    is_query_grouped, is_template_coordinate_sorted, revcomp_buf_value, reverse_buf_value,
+    to_smallest_signed_int,
 };
 
 // Re-export commonly used items from submodules
