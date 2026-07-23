@@ -578,7 +578,7 @@ impl BaiBuilder {
 
     /// Build the final BAI index.
     ///
-    /// The index is compacted ([`compact_bai_index`]) so its on-disk size
+    /// The index is compacted (see `compact_bai_index`) so its on-disk size
     /// matches what htslib/samtools produce; noodles' `Indexer` alone emits a
     /// spec-valid but far larger index (see that function for why).
     ///
