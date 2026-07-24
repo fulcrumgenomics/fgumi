@@ -176,6 +176,7 @@ fn open_bgzf_reader(
         } else {
             Box::new(io::stdin())
         };
+        let reader = crate::sam_input::normalize_to_bgzf(reader, path)?;
         return Ok(make_bgzf_reader(reader, threads));
     }
 
@@ -192,6 +193,7 @@ fn open_bgzf_reader(
     } else {
         Box::new(file)
     };
+    let reader = crate::sam_input::normalize_to_bgzf(reader, path)?;
     Ok(make_bgzf_reader(reader, threads))
 }
 
@@ -368,73 +370,74 @@ pub fn create_bam_reader_for_pipeline_with_opts<P: AsRef<Path>>(
     path: P,
     opts: PipelineReaderOpts,
 ) -> Result<(Box<dyn Read + Send>, Header)> {
-    use std::io::{Seek, SeekFrom};
-
     let path_ref = path.as_ref();
 
-    if is_stdin_path(path_ref) {
-        // Read from stdin with buffering
-        let stdin = io::stdin();
-        let tee_reader = TeeReader::new(stdin);
-        let bgzf_reader = BgzfReader::new(tee_reader);
-        let mut bam_reader = noodles::bam::io::Reader::from(bgzf_reader);
-
-        // Read header (this consumes and buffers the raw bytes)
-        let header =
-            bam_reader.read_header().with_context(|| "Failed to read header from stdin")?;
-
-        // Get the buffered bytes and remaining stdin
-        let bgzf_reader = bam_reader.into_inner();
-        let tee_reader = bgzf_reader.into_inner();
-        let (buffered_bytes, stdin) = tee_reader.into_parts();
-
-        // Create a chained reader: buffered bytes first, then remaining stdin
-        let chained = ChainedReader::new(buffered_bytes, stdin);
-
+    // Prefetch wraps the opened input, not the replaying reader: only the
+    // `File` itself can carry the kernel WILLNEED hints that
+    // `PrefetchReader::from_file` issues, and wrapping later would lose them.
+    let reader: Box<dyn Read + Send> = if is_stdin_path(path_ref) {
         if opts.async_reader {
             log::info!("async BAM reader enabled: spawning fgumi-prefetch thread for stdin");
-            let prefetch = crate::prefetch_reader::PrefetchReader::new(chained);
-            Ok((Box::new(prefetch), header))
+            Box::new(crate::prefetch_reader::PrefetchReader::new(io::stdin()))
         } else {
-            Ok((Box::new(chained), header))
+            Box::new(io::stdin())
         }
     } else {
-        // Read from file - we can seek back
-        let mut file = File::open(path_ref)
+        let file = File::open(path_ref)
             .with_context(|| format!("Failed to open input BAM: {}", path_ref.display()))?;
 
         // Tell the kernel to grow the per-fd read-ahead window. Best-effort;
         // failure is logged and ignored. On non-Linux targets this is a no-op.
         crate::os_hints::advise_sequential(&file);
 
-        // Read header using noodles
-        let bgzf_reader = BgzfReader::new(&file);
-        let mut bam_reader = noodles::bam::io::Reader::from(bgzf_reader);
-        let header = bam_reader
-            .read_header()
-            .with_context(|| format!("Failed to read header from: {}", path_ref.display()))?;
-
-        // Seek file back to start
-        file.seek(SeekFrom::Start(0))
-            .with_context(|| format!("Failed to seek in file: {}", path_ref.display()))?;
-
         if opts.async_reader {
             log::info!(
                 "async BAM reader enabled: spawning fgumi-prefetch thread for {}",
                 path_ref.display()
             );
-            let prefetch = crate::prefetch_reader::PrefetchReader::from_file(file);
-            Ok((Box::new(prefetch), header))
+            Box::new(crate::prefetch_reader::PrefetchReader::from_file(file))
         } else {
-            Ok((Box::new(file), header))
+            Box::new(file)
         }
-    }
+    };
+
+    // SAM text is transcoded to BGZF here so the rest of this function — and
+    // every pipeline stage downstream of it — sees one stream format.
+    let reader = crate::sam_input::normalize_to_bgzf(reader, path_ref)?;
+    let (header, rest) = read_header_and_replay(reader, path_ref)?;
+
+    Ok((rest, header))
+}
+
+/// Parse the BAM header from `reader`, then return a reader that replays the
+/// whole stream from byte zero.
+///
+/// The bytes the header parse consumed are captured by a [`TeeReader`] and
+/// chained back in front of the remainder, so callers get the header without
+/// the input having to be seekable. That matters for stdin and FIFOs, and it
+/// means the input is opened exactly once.
+fn read_header_and_replay(
+    reader: Box<dyn Read + Send>,
+    path: &Path,
+) -> Result<(Header, Box<dyn Read + Send>)> {
+    let tee_reader = TeeReader::new(reader);
+    let bgzf_reader = BgzfReader::new(tee_reader);
+    let mut bam_reader = noodles::bam::io::Reader::from(bgzf_reader);
+
+    let header = bam_reader
+        .read_header()
+        .with_context(|| format!("Failed to read header from: {}", path.display()))?;
+
+    let (buffered_bytes, rest) = bam_reader.into_inner().into_inner().into_parts();
+
+    Ok((header, Box::new(ChainedReader::new(buffered_bytes, rest))))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::writer::create_bam_writer;
+    use noodles::sam::alignment::record::cigar::op::Kind as CigarKind;
     use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
     use std::num::NonZeroUsize;
     use tempfile::NamedTempFile;
@@ -446,6 +449,99 @@ mod tests {
         );
         builder = builder.add_reference_sequence(b"chr1", ref_seq);
         builder.build()
+    }
+
+    /// Minimal uncompressed SAM text: one reference, one aligned record.
+    const SAM_TEXT: &str = "@HD\tVN:1.6\tSO:unsorted\n\
+                            @SQ\tSN:chr1\tLN:100\n\
+                            r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\tIIII\n";
+
+    /// Writes [`SAM_TEXT`] to a temp file with the given suffix and returns it.
+    fn write_sam_text(suffix: &str) -> NamedTempFile {
+        let file =
+            tempfile::Builder::new().suffix(suffix).tempfile().expect("create temp SAM file");
+        std::fs::write(file.path(), SAM_TEXT).expect("write SAM text");
+        file
+    }
+
+    /// Asserts a decoded header + records match [`SAM_TEXT`] field for field, so a
+    /// transcode that silently corrupted a field cannot pass on record count alone.
+    fn assert_matches_sam_text(header: &noodles::sam::Header, records: &[noodles::bam::Record]) {
+        let refs = header.reference_sequences();
+        assert_eq!(refs.len(), 1, "header @SQ lost");
+        let (name, seq) = refs.get_index(0).expect("one @SQ");
+        assert_eq!(AsRef::<[u8]>::as_ref(name), b"chr1", "@SQ SN");
+        assert_eq!(usize::from(seq.length()), 100, "@SQ LN");
+
+        assert_eq!(records.len(), 1, "record count");
+        let r = &records[0];
+        assert_eq!(r.name().map(std::convert::AsRef::as_ref), Some(b"r1" as &[u8]), "QNAME");
+        assert_eq!(r.flags().bits(), 0, "FLAG");
+        assert_eq!(r.alignment_start().expect("mapped").expect("pos").get(), 1, "POS (1-based)");
+        let cigar: Vec<_> = r
+            .cigar()
+            .iter()
+            .map(|op| op.map(|o| (o.kind(), o.len())))
+            .collect::<io::Result<_>>()
+            .expect("cigar");
+        assert_eq!(cigar, [(CigarKind::Match, 4)], "CIGAR");
+        assert_eq!(r.sequence().iter().collect::<Vec<u8>>(), b"ACGT", "SEQ");
+        assert_eq!(r.quality_scores().as_ref(), &[40, 40, 40, 40], "QUAL ('IIII' = Q40)");
+    }
+
+    /// Every reader factory must accept uncompressed SAM, not just BGZF BAM:
+    /// a command that takes BAM takes SAM. The typed reader is the surface
+    /// used by whole-record consumers.
+    #[test]
+    fn test_create_bam_reader_accepts_uncompressed_sam() -> Result<()> {
+        let input = write_sam_text(".sam");
+
+        let (mut reader, header) = create_bam_reader(input.path(), 1)?;
+
+        let records = reader.records().collect::<io::Result<Vec<_>>>()?;
+        assert_matches_sam_text(&header, &records);
+        Ok(())
+    }
+
+    /// The raw-byte reader backs the single-threaded fast paths, so it must
+    /// accept SAM on the same terms as the typed reader.
+    #[test]
+    fn test_create_raw_bam_reader_accepts_uncompressed_sam() -> Result<()> {
+        let input = write_sam_text(".sam");
+
+        let (mut reader, header) = create_raw_bam_reader(input.path(), 1)?;
+
+        assert_eq!(header.reference_sequences().len(), 1, "header @SQ lost");
+        let mut record = fgumi_raw_bam::RawRecord::new();
+        assert!(reader.read_record(&mut record)? > 0, "expected one record");
+        // Identity, not just presence: a transcode that dropped a field would
+        // still return a record, so pin the fields the SAM text specifies.
+        let view = record.view();
+        assert_eq!(view.read_name(), b"r1", "QNAME");
+        assert_eq!(view.flags(), 0, "FLAG");
+        assert_eq!(view.ref_id(), 0, "RNAME -> first @SQ");
+        assert_eq!(view.pos(), 0, "POS (0-based in BAM)");
+        assert_eq!(reader.read_record(&mut record)?, 0, "expected EOF");
+        Ok(())
+    }
+
+    /// The pipeline reader hands the caller a byte stream that downstream
+    /// stages BGZF-decode themselves, so the SAM path must present the same
+    /// compressed-stream contract.
+    #[test]
+    fn test_create_bam_reader_for_pipeline_accepts_uncompressed_sam() -> Result<()> {
+        let input = write_sam_text(".sam");
+
+        let (stream, header) = create_bam_reader_for_pipeline(input.path())?;
+
+        assert_eq!(header.reference_sequences().len(), 1, "header @SQ lost");
+        let mut reader = noodles::bam::io::Reader::new(io::BufReader::new(stream));
+        // The pipeline hands back a raw BGZF byte stream; decode it and assert the
+        // replayed header + record match the SAM text, not merely that one arrived.
+        let stream_header = reader.read_header()?;
+        let records = reader.records().collect::<io::Result<Vec<_>>>()?;
+        assert_matches_sam_text(&stream_header, &records);
+        Ok(())
     }
 
     #[test]
