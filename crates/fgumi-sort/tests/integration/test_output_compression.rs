@@ -26,6 +26,9 @@ const N_PAIRS: usize = 5_000;
 /// walks every index exactly once.
 const EMIT_STRIDE: usize = 2001;
 
+/// Memory limit small enough that the sort has to spill chunk files.
+const SPILL_MEMORY_LIMIT: usize = 1024 * 1024;
+
 /// Builds a BAM whose records compress well, so level 0 and level 9 differ a lot.
 ///
 /// Pairs are emitted in scrambled index order so the input is *not* already in
@@ -122,31 +125,29 @@ fn count_sort_violations(sort_order: SortOrder, path: &std::path::Path) -> u64 {
     violations
 }
 
-/// Sorts `input` in `sort_order` at the given output compression level and
-/// returns `(output_size_bytes, chunks_written, decoded_records)`.
+/// Sorts `input` in `sort_order` at the given compression levels and returns
+/// `(output_size_bytes, chunks_written, decoded_records)`.
 ///
 /// `expected` is the independent baseline the output is checked against — the
 /// multiset of the *input* records, decoded straight from the input BAM without
 /// going through the sorter. Combined with the sort-order verification below,
 /// it pins the output exactly: a correct sort emits every input record, no
-/// others, in non-decreasing key order. Neither check involves the other
-/// compression run, so they cannot both drift the same way.
+/// others, in non-decreasing key order. Neither check involves any other sort
+/// run, so two runs cannot drift the same way.
 fn sort_at_level(
     sort_order: SortOrder,
     input: &std::path::Path,
     output: &std::path::Path,
     memory_limit: usize,
     output_compression: u32,
+    temp_compression: u32,
     expected: &[Vec<u8>],
 ) -> (u64, usize, Vec<RawRecord>) {
     let stats = RawExternalSorter::new(sort_order)
         .threads(2)
         .memory_limit(memory_limit)
         .spill_codec(SpillCodec::Bgzf)
-        // Held constant across levels, and deliberately different from both
-        // output levels under test: if the output is compressed at the temp
-        // level, both runs produce the same size.
-        .temp_compression(1)
+        .temp_compression(temp_compression)
         .output_compression(output_compression)
         .sort(input, output)
         .expect("sort should succeed");
@@ -211,7 +212,7 @@ fn test_output_compression_level_reaches_the_output_bam(
         SortOrder::TemplateCoordinate
     )]
     sort_order: SortOrder,
-    #[values((256 * 1024 * 1024, false), (1024 * 1024, true))] memory: (usize, bool),
+    #[values((256 * 1024 * 1024, false), (SPILL_MEMORY_LIMIT, true))] memory: (usize, bool),
 ) {
     let (memory_limit, expect_spill) = memory;
     let dir = tempfile::tempdir().expect("tempdir");
@@ -222,13 +223,16 @@ fn test_output_compression_level_reaches_the_output_bam(
     // from the input BAM before any sort runs.
     let expected = record_multiset(&decode_records(&input));
 
+    // The temp level is held constant across both runs, and is deliberately
+    // different from both output levels under test: if the output were
+    // compressed at the temp level, both runs would produce the same size.
     let uncompressed = dir.path().join("level0.bam");
     let (size_level_0, chunks_0, records_level_0) =
-        sort_at_level(sort_order, &input, &uncompressed, memory_limit, 0, &expected);
+        sort_at_level(sort_order, &input, &uncompressed, memory_limit, 0, 1, &expected);
 
     let compressed = dir.path().join("level9.bam");
     let (size_level_9, chunks_9, records_level_9) =
-        sort_at_level(sort_order, &input, &compressed, memory_limit, 9, &expected);
+        sort_at_level(sort_order, &input, &compressed, memory_limit, 9, 1, &expected);
 
     assert_eq!(
         chunks_0 > 0,
@@ -256,5 +260,65 @@ fn test_output_compression_level_reaches_the_output_bam(
         "output_compression was ignored for {sort_order:?}: level 9 wrote {size_level_9} bytes and \
          level 0 wrote {size_level_0} bytes (spill={expect_spill}). Equal sizes mean the output was \
          compressed at temp_compression instead."
+    );
+}
+
+/// `temp_compression` must not reach the output BAM.
+///
+/// A spilling merge releases its drained sources before finishing the writer.
+/// If it also left Phase 2 at that moment, every output block still queued —
+/// plus the writer's final flush — would be dispatched as
+/// `SortStep::CompressSpill` and compressed by the *temp* compressor, because
+/// `CompressOutput` is only on a worker's priority list in Phase 2. Raising
+/// `temp_compression` alone would then shrink the output.
+///
+/// So: sort twice at `output_compression = 0`, changing only the temp level.
+/// The written BAM must be byte-for-byte the same size both times. Level 0 is
+/// used for the output because it makes any block that slipped through the temp
+/// compressor strictly smaller, and therefore visible in the total.
+///
+/// Only the spilling path is exercised — the in-memory path never builds a
+/// `Phase2Guard`, so it has no early teardown to get wrong.
+#[rstest]
+fn test_temp_compression_does_not_reach_the_output_bam(
+    #[values(
+        SortOrder::Coordinate,
+        SortOrder::Queryname(QuerynameComparator::Natural),
+        SortOrder::TemplateCoordinate
+    )]
+    sort_order: SortOrder,
+) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("input.bam");
+    build_input(&input);
+    let expected = record_multiset(&decode_records(&input));
+
+    let sort_with_temp = |tag: &str, temp_compression: u32| {
+        let output = dir.path().join(format!("{tag}.bam"));
+        let (size, chunks, _) = sort_at_level(
+            sort_order,
+            &input,
+            &output,
+            SPILL_MEMORY_LIMIT,
+            0,
+            temp_compression,
+            &expected,
+        );
+        assert!(
+            chunks > 0,
+            "test must exercise the spilling path, but no chunks were written \
+             ({sort_order:?}, temp_compression={temp_compression})"
+        );
+        size
+    };
+
+    let size_temp_0 = sort_with_temp("temp0", 0);
+    let size_temp_9 = sort_with_temp("temp9", 9);
+
+    assert_eq!(
+        size_temp_0, size_temp_9,
+        "temp_compression leaked into the output for {sort_order:?}: the same sort wrote \
+         {size_temp_0} bytes at temp_compression=0 and {size_temp_9} bytes at \
+         temp_compression=9, but only output_compression (0 for both) may affect the output"
     );
 }

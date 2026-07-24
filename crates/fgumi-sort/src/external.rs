@@ -1663,11 +1663,38 @@ impl<K: RawSortKey + 'static> Phase2Guard<'_, K> {
         self.consumer.as_ref()
     }
 
-    fn deactivate(&mut self) {
+    /// Release the merge *sources* — drop the consumer and unpublish the spill
+    /// files — while leaving the pool in Phase 2.
+    ///
+    /// Call this once the merge loop has drained every source but *before*
+    /// finishing the output writer. Phase 2 is what puts
+    /// [`SortStep::CompressOutput`](crate::worker_pool::SortStep::CompressOutput)
+    /// on a worker's priority list, and that step is what selects
+    /// `output_compressor`. Returning to `LEGACY` here instead would leave
+    /// `CompressSpill` as the only compress step workers schedule, so every
+    /// output block still queued — plus the writer's final flush — would be
+    /// compressed at `temp_compression` and the tail of the BAM would silently
+    /// ignore the caller's `output_compression`.
+    ///
+    /// Unpublishing the files is what stops workers touching spill files that
+    /// are about to be deleted: `try_phase2_file_work` returns immediately on an
+    /// empty file vector, leaving output compression as the only Phase 2 work.
+    fn release_sources(&mut self) {
         if self.active {
             drop(self.consumer.take());
-            self.pool.set_phase(crate::worker_pool::phase::LEGACY);
             self.pool.clear_phase2_files();
+        }
+    }
+
+    /// Leave Phase 2 entirely, releasing the sources first if that has not
+    /// already happened, and return the pool to `LEGACY`.
+    ///
+    /// Safe to call after [`release_sources`](Self::release_sources); the
+    /// source-release half is idempotent.
+    fn deactivate(&mut self) {
+        if self.active {
+            self.release_sources();
+            self.pool.set_phase(crate::worker_pool::phase::LEGACY);
             self.active = false;
         }
     }
@@ -3515,9 +3542,10 @@ impl RawExternalSorter {
 
         if initial_keys.is_empty() {
             debug!("Merge complete: 0 records merged");
-            guard.deactivate();
+            guard.release_sources();
             let writer = PooledBamWriter::new(Arc::clone(pool), output, &output_header)?;
             writer.finish()?;
+            guard.deactivate();
             return Ok(0);
         }
 
@@ -3588,10 +3616,11 @@ impl RawExternalSorter {
             }
         }
 
-        // Return to legacy mode before finishing writer (workers still need to compress).
-        // The guard's deactivate() drops the consumer, resets phase, and clears the
-        // pool's published file vector in the correct order.
-        guard.deactivate();
+        // Every source is drained, so release them — but stay in Phase 2 across
+        // `finish()`. The writer's trailing blocks are still compressed by the
+        // pool, and only Phase 2 schedules `CompressOutput`; dropping to LEGACY
+        // here would compress the tail of the BAM at `temp_compression`.
+        guard.release_sources();
 
         if debug_timing {
             let loop_total = loop_start.elapsed().as_secs_f64();
@@ -3607,6 +3636,7 @@ impl RawExternalSorter {
         }
 
         writer.finish()?;
+        guard.deactivate();
         merge_progress.log_final();
         log_snapshot("phase2.end", 0);
 
@@ -3651,9 +3681,10 @@ impl RawExternalSorter {
         }
 
         if initial_keys.is_empty() {
-            guard.deactivate();
+            guard.release_sources();
             let writer = PooledBamWriter::new_indexing(Arc::clone(pool), output, &output_header)?;
             let index = writer.finish_index()?;
+            guard.deactivate();
             debug!("Merge complete: 0 records merged");
             return Ok(index);
         }
@@ -3679,13 +3710,14 @@ impl RawExternalSorter {
             }
         }
 
-        // Return the pool to legacy mode before finishing the writer — the
-        // workers still compress the trailing output blocks during
-        // finish_index() (CompressOutput is eligible whenever the queue is
-        // non-empty). Same ordering as merge_chunks_generic.
-        guard.deactivate();
+        // Release the drained sources but stay in Phase 2 through
+        // finish_index() — the workers still compress the trailing output
+        // blocks, and only Phase 2 schedules `CompressOutput`. Same ordering as
+        // merge_chunks_generic.
+        guard.release_sources();
 
         let index = writer.finish_index()?;
+        guard.deactivate();
         merge_progress.log_final();
         Ok(index)
     }
