@@ -42,6 +42,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fgoxide::io::DelimFile;
 use fgumi_bam_io::create_bam_reader_for_pipeline_with_opts;
+use fgumi_umi::IndexThreshold;
 
 use log::info;
 use noodles::sam::Header;
@@ -1119,13 +1120,13 @@ pub struct MarkDuplicates {
     #[command(flatten)]
     pub compression: CompressionOptions,
 
-    /// Minimum distinct UMIs at a position before the N-gram/BK-tree index is used
-    /// instead of a linear scan over all UMI pairs. This is a minimum, not a switch:
-    /// 0 indexes every position group, and disabling the index takes a value larger
-    /// than any group. Only affects Adjacency/Paired strategies, and Adjacency only
-    /// indexes at --edits 1.
+    /// When to match UMIs through the N-gram/BK-tree index instead of comparing every
+    /// pair. Either `always`, `never`, or a minimum number of distinct UMIs at a
+    /// position (so `0` behaves like `always`). The index is a pure optimization: it
+    /// never changes which reads group together. Only Adjacency and Paired index at
+    /// all, and Adjacency only at --edits 1.
     #[arg(long = "index-threshold", default_value = "100")]
-    pub index_threshold: usize,
+    pub index_threshold: IndexThreshold,
 
     /// Skip UMI-based grouping; group by template coordinate alone. Forces identity
     /// strategy and ignores any existing UMI tags. Templates are NOT split by strand of
@@ -1165,11 +1166,6 @@ impl Command for MarkDuplicates {
             (self.strategy, false)
         };
 
-        // Validate the input exists (stdin paths are exempt).
-        self.io.validate()?;
-
-        let min_mapq: u8 = self.min_map_q.unwrap_or(0);
-
         // Identity strategy requires edits=0, others use the configured value
         // Also force edits=0 in no-umi mode
         let effective_edits =
@@ -1178,6 +1174,19 @@ impl Command for MarkDuplicates {
             } else {
                 self.edits
             };
+
+        // `--index-threshold always` asserts that indexing will happen; reject it when
+        // the resolved strategy/edits can never index rather than ignoring the flag.
+        crate::commands::common::validate_index_threshold(
+            self.index_threshold,
+            effective_strategy,
+            effective_edits,
+        )?;
+
+        // Validate the input exists (stdin paths are exempt).
+        self.io.validate()?;
+
+        let min_mapq: u8 = self.min_map_q.unwrap_or(0);
 
         let timer = OperationTimer::new("Marking duplicates");
 
