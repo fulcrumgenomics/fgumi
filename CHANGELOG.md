@@ -4,6 +4,136 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-24
+
+### Bug Fixes
+
+- Write tool/metric index as index.md to fix broken readthedocs link ([#456](https://github.com/fulcrumgenomics/fgumi/pull/456))
+- Make sequential and parallel assigners agree on UMI case ([#455](https://github.com/fulcrumgenomics/fgumi/pull/455))
+- Pair duplex strands sharing an unclipped 5' coordinate ([#485](https://github.com/fulcrumgenomics/fgumi/pull/485))
+- Correct consensus reverse/revcomp tag sets to match fgbio ConsensusTags ([#488](https://github.com/fulcrumgenomics/fgumi/pull/488))
+- Score duplicates by Picard SUM_OF_BASE_QUALITIES (DEDUP-02)
+- Match fgbio FilterConsensusReads parity (FILT-01/02/03/04)
+- Match fgbio strict read-name UMI extraction (EXT-01/03/04) ([#489](https://github.com/fulcrumgenomics/fgumi/pull/489))
+- Unmap reads when clipping consumes the whole alignment ([#492](https://github.com/fulcrumgenomics/fgumi/pull/492))
+- Require both aD and bD to treat a read as duplex ([#495](https://github.com/fulcrumgenomics/fgumi/pull/495))
+- IUPAC-aware, case-preserving complement via shared 256-byte LUT ([#491](https://github.com/fulcrumgenomics/fgumi/pull/491))
+- Match fgbio CorrectUmis metrics and log level (COR-01/02/03/04) ([#503](https://github.com/fulcrumgenomics/fgumi/pull/503))
+- Count empty molecule-end halves, orient duplex UMIs by R1 strand, guard malformed UMIs (DXM-01/02/03, SIM-01) ([#506](https://github.com/fulcrumgenomics/fgumi/pull/506))
+- Match fgbio ReviewConsensusVariants output and MI handling (REV-01/02/03/04/05) ([#500](https://github.com/fulcrumgenomics/fgumi/pull/500))
+- Accept non-terminal + and reject over-long reads in read structures (R2-RS-01, R2-RS-02) ([#496](https://github.com/fulcrumgenomics/fgumi/pull/496))
+- Emit review rows in fgbio coordinate + MI/read-number order ([#501](https://github.com/fulcrumgenomics/fgumi/pull/501))
+- Clip chimeric templates, soft-only mate window, drop --sort-order (R2-CLIP-02/03/04) ([#502](https://github.com/fulcrumgenomics/fgumi/pull/502))
+- Narrow read-name sync suffix strip to fgbio parity ([#512](https://github.com/fulcrumgenomics/fgumi/pull/512))
+- Panic in aOrNotB/ln_a_minus_b when a < b (R2-NUM-01) ([#507](https://github.com/fulcrumgenomics/fgumi/pull/507))
+- Sort-order + error-rate guards and duplex rejection rows (CONS-01, DUP-01, R2-MET-05, R2-UCC-01) ([#508](https://github.com/fulcrumgenomics/fgumi/pull/508))
+- Align TSV metric output with fgbio Metric format ([#498](https://github.com/fulcrumgenomics/fgumi/pull/498)) ([#504](https://github.com/fulcrumgenomics/fgumi/pull/504))
+- Write SS sub-sort tag as <sort-order>:<sub-sort> for fgbio/samtools parity ([#514](https://github.com/fulcrumgenomics/fgumi/pull/514))
+- Require query-grouped input (FILT3-02, CLIP3-05) ([#517](https://github.com/fulcrumgenomics/fgumi/pull/517))
+- Finish fgbio float format + reads-threshold guards (DXM3-04, DXM3-06, SIMM3-02) ([#520](https://github.com/fulcrumgenomics/fgumi/pull/520))
+- Emit fgbio KV metrics format instead of the wide table ([#513](https://github.com/fulcrumgenomics/fgumi/pull/513))
+- Reject UMIs of differing length in all assigners (GRP-01) ([#510](https://github.com/fulcrumgenomics/fgumi/pull/510))
+- Match fgbio ReviewConsensusVariants parity (REV3-01..15) ([#522](https://github.com/fulcrumgenomics/fgumi/pull/522))
+- Count masked bases only for retained primary reads (FILT-05) ([#523](https://github.com/fulcrumgenomics/fgumi/pull/523))
+- Emit @HD SO:unsorted to match fgbio ([#526](https://github.com/fulcrumgenomics/fgumi/pull/526))
+- [**breaking**] Apply fgbio pre-group filter to simplex/codec, add --allow-unmapped ([#509](https://github.com/fulcrumgenomics/fgumi/pull/509))
+- Synthesize @HD when input lacks one ([#527](https://github.com/fulcrumgenomics/fgumi/pull/527))
+- Validate input sort order to prevent silent corruption (MERGE3-01) ([#519](https://github.com/fulcrumgenomics/fgumi/pull/519))
+- Place secondary/supplementary reads at exact template coordinate via tc ([#529](https://github.com/fulcrumgenomics/fgumi/pull/529))
+- Write SS sub-sort tag via SortOrder accessors (R2-HDR-01) ([#531](https://github.com/fulcrumgenomics/fgumi/pull/531))
+- Grouping-key correctness — strand tie-break, unsuffixed MI, library/cell partition, reject duplex-to-simplex (DXM3-02/03/05/07, SIMM3-01) ([#532](https://github.com/fulcrumgenomics/fgumi/pull/532))
+- Add reverse-orientation edges to the parallel paired assigner (GRP3-01) ([#525](https://github.com/fulcrumgenomics/fgumi/pull/525))
+- Upgrade clipping on all template reads, not just the primary pair ([#570](https://github.com/fulcrumgenomics/fgumi/pull/570))
+- Strand-normalize overlap clipping, count existing fixed clipping, honor SoftWithMask upgrade (CLIP3-01/02/03) ([#528](https://github.com/fulcrumgenomics/fgumi/pull/528))
+- Detect quality encoding from all input FASTQs, not just the first (EXT3-01) ([#550](https://github.com/fulcrumgenomics/fgumi/pull/550))
+- Honest missing-quality default + singleton desync warning (FASTQ3-02/03) ([#560](https://github.com/fulcrumgenomics/fgumi/pull/560))
+- [**breaking**] Clamp codec/duplex scalar depth+error tags to fgbio's Short ceiling ([#552](https://github.com/fulcrumgenomics/fgumi/pull/552))
+- Accept CRLF and unterminated final records (W9b: EXT3-06/07) ([#554](https://github.com/fulcrumgenomics/fgumi/pull/554))
+- Align reject-reason labels with fgbio wording (CODEC3-08) ([#566](https://github.com/fulcrumgenomics/fgumi/pull/566))
+- Soft-only overlap-clip boundary, MC-independent codec clip, fgbio-faithful quality masking ([#533](https://github.com/fulcrumgenomics/fgumi/pull/533))
+- Emit spec sub-sort spelling `lexicographical` in @HD SS (SORT3-10) ([#567](https://github.com/fulcrumgenomics/fgumi/pull/567))
+- Template-coordinate order via canonical fgumi-sort + hermetic tests ([#576](https://github.com/fulcrumgenomics/fgumi/pull/576))
+- Recompute the BAM bin field after raw POS/CIGAR mutations (clip, zipper) ([#591](https://github.com/fulcrumgenomics/fgumi/pull/591))
+- Count final FASTQ batch before publishing read_done ([#598](https://github.com/fulcrumgenomics/fgumi/pull/598))
+- Reject degenerate CLI values instead of silently misbehaving ([#601](https://github.com/fulcrumgenomics/fgumi/pull/601))
+- Reserve Phase-1 input serials under the input lock ([#600](https://github.com/fulcrumgenomics/fgumi/pull/600))
+- Emit faithful duplex consensus tags ([#603](https://github.com/fulcrumgenomics/fgumi/pull/603))
+- Do not count a failed UMI-assignment group as accepted ([#610](https://github.com/fulcrumgenomics/fgumi/pull/610))
+- Write the BAI sidecar to the samtools path, not an extension-replaced one ([#607](https://github.com/fulcrumgenomics/fgumi/pull/607))
+- Emit unmapped consensus header on the single-threaded path ([#602](https://github.com/fulcrumgenomics/fgumi/pull/602))
+- Accept EB/EiB memory sizes instead of rejecting them as scientific notation ([#615](https://github.com/fulcrumgenomics/fgumi/pull/615))
+- Name the tag-skipping flag after the tag it actually writes ([#617](https://github.com/fulcrumgenomics/fgumi/pull/617))
+- Give parallel UMI assigners a persistent molecule-id counter ([#630](https://github.com/fulcrumgenomics/fgumi/pull/630))
+- Fail the run when UMI assignment fails ([#631](https://github.com/fulcrumgenomics/fgumi/pull/631))
+- [**breaking**] Group --no-umi orientation-agnostically like Picard MarkDuplicates ([#649](https://github.com/fulcrumgenomics/fgumi/pull/649))
+- Position-bin placed-but-unmapped reads in the BAI ([#651](https://github.com/fulcrumgenomics/fgumi/pull/651))
+- Error on an over-long read name instead of panicking ([#629](https://github.com/fulcrumgenomics/fgumi/pull/629))
+
+### Documentation
+
+- Correct --write-index threading note ([#464](https://github.com/fulcrumgenomics/fgumi/pull/464))
+- Document MI tag value divergence between fgumi group and fgbio GroupReadsByUmi ([#499](https://github.com/fulcrumgenomics/fgumi/pull/499))
+- Clear fgbio-parity doc tail across commands (W11) ([#558](https://github.com/fulcrumgenomics/fgumi/pull/558))
+- Document that dedup filters templates like fgbio GroupReadsByUmi (DEDUP3-01) ([#565](https://github.com/fulcrumgenomics/fgumi/pull/565))
+- Fix stale doctest crate paths in consensus/umi and gate doctests in CI ([#573](https://github.com/fulcrumgenomics/fgumi/pull/573))
+- Fix broken intra-doc links and gate rustdoc in CI ([#574](https://github.com/fulcrumgenomics/fgumi/pull/574))
+- Document EXT3-03 encoding-failure parity with fgbio ([#587](https://github.com/fulcrumgenomics/fgumi/pull/587))
+- Fix private intra-doc link breaking the docs build ([#597](https://github.com/fulcrumgenomics/fgumi/pull/597))
+- Point Zenodo DOI badge at the concept DOI ([#596](https://github.com/fulcrumgenomics/fgumi/pull/596))
+- Correct four statements that are false of the current behavior ([#619](https://github.com/fulcrumgenomics/fgumi/pull/619))
+- Document the CODEC model and its quality-masking options ([#616](https://github.com/fulcrumgenomics/fgumi/pull/616))
+- Document that --no-umi still splits by strand of origin ([#648](https://github.com/fulcrumgenomics/fgumi/pull/648))
+
+### Features
+
+- Strip old-style /1 and /2 read-number suffixes from QNAME ([#486](https://github.com/fulcrumgenomics/fgumi/pull/486))
+- Body error injection, template-coordinate sort fix, and correctness guards ([#541](https://github.com/fulcrumgenomics/fgumi/pull/541))
+- Add --include-unmapped to pass through no-mapped-read templates ([#589](https://github.com/fulcrumgenomics/fgumi/pull/589))
+- [**breaking**] Harden fgumi compare into a sound, faithful fgbio-parity oracle ([#530](https://github.com/fulcrumgenomics/fgumi/pull/530))
+- Add clip preset and lock review-.txt comparison (CMP3-02/03) ([#548](https://github.com/fulcrumgenomics/fgumi/pull/548))
+- UMI-in-read-name output and real BGZF for .gz paths ([#605](https://github.com/fulcrumgenomics/fgumi/pull/605))
+- Add per-phase --sort-threads / --merge-threads ([#608](https://github.com/fulcrumgenomics/fgumi/pull/608))
+- Accept query-grouped input with --allow-unmapped ([#620](https://github.com/fulcrumgenomics/fgumi/pull/620))
+- Add --max-temp-files to tune the spill-file consolidation limit ([#643](https://github.com/fulcrumgenomics/fgumi/pull/643))
+- Add -t/--target {umi,barcode} to correct RX or BC ([#624](https://github.com/fulcrumgenomics/fgumi/pull/624))
+
+### Miscellaneous Tasks
+
+- Auto-review stacked PRs on non-default base branches ([#453](https://github.com/fulcrumgenomics/fgumi/pull/453))
+- Fail the docs build on dead internal links via mdbook-linkcheck2 ([#457](https://github.com/fulcrumgenomics/fgumi/pull/457))
+- Run the whole workspace in tests + fix stale fgumi-sam revcomp assertions ([#569](https://github.com/fulcrumgenomics/fgumi/pull/569))
+- [**breaking**] Honest MSRV in lockstep with the toolchain + let-chain adoption ([#575](https://github.com/fulcrumgenomics/fgumi/pull/575))
+- Gate sort correctness against samtools ([#577](https://github.com/fulcrumgenomics/fgumi/pull/577))
+- Compile-gate all features + nightly stress-tests ([#578](https://github.com/fulcrumgenomics/fgumi/pull/578))
+- Add a Miri gate for the raw-pointer comparator unsafe ([#581](https://github.com/fulcrumgenomics/fgumi/pull/581))
+
+### Performance
+
+- Stream consensus-read extraction via multi-interval query ([#584](https://github.com/fulcrumgenomics/fgumi/pull/584))
+- Verify sort order in a single streaming pass ([#568](https://github.com/fulcrumgenomics/fgumi/pull/568))
+- Stream records into the sort instead of an intermediate BAM ([#593](https://github.com/fulcrumgenomics/fgumi/pull/593))
+- Bound sort-verify run comparison to O(order divergence) ([#594](https://github.com/fulcrumgenomics/fgumi/pull/594))
+- Borrow reference bases in regenerate_alignment_tags ([#604](https://github.com/fulcrumgenomics/fgumi/pull/604))
+- Narrow radix passes, reuse the stored queryname NUL, and borrow record bytes on ingest ([#606](https://github.com/fulcrumgenomics/fgumi/pull/606))
+- Remove three per-block and per-read allocations ([#614](https://github.com/fulcrumgenomics/fgumi/pull/614))
+- Derive the radix bound inside the first counting pass ([#622](https://github.com/fulcrumgenomics/fgumi/pull/622))
+- Pool-integrate and optimize the coordinate --write-index merge ([#647](https://github.com/fulcrumgenomics/fgumi/pull/647))
+- Validate mate CIGARs from the decoded key, not a second aux walk ([#639](https://github.com/fulcrumgenomics/fgumi/pull/639))
+
+### Refactor
+
+- Consolidate read-name suffix stripping and assert cross-parser parity ([#572](https://github.com/fulcrumgenomics/fgumi/pull/572))
+- Unify per-template clip/mate-repair across threading paths ([#582](https://github.com/fulcrumgenomics/fgumi/pull/582))
+- Guard FASTQ boundaries completion on empty input queue ([#599](https://github.com/fulcrumgenomics/fgumi/pull/599))
+
+### Testing
+
+- Read stats as fgbio KV metrics in pre-group-filter test ([#585](https://github.com/fulcrumgenomics/fgumi/pull/585))
+- Gate command output against its @HD sort-order claim ([#580](https://github.com/fulcrumgenomics/fgumi/pull/580))
+- Skip float-parseable garbage in AF-fallback proptest ([#592](https://github.com/fulcrumgenomics/fgumi/pull/592))
+
+<!-- generated by git-cliff -->
+
 ## [0.4.0] - 2026-06-20
 
 ### Miscellaneous Tasks
