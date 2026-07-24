@@ -16,6 +16,7 @@ use clap::Args;
 use fgumi_bam_io::is_stdin_path;
 #[cfg(feature = "simplex")]
 use fgumi_consensus::methylation::RefBaseProvider;
+use fgumi_umi::{IndexThreshold, Strategy};
 #[cfg(feature = "simplex")]
 use log::{info, warn};
 use noodles::sam::Header;
@@ -1139,6 +1140,46 @@ pub fn build_pipeline_config(
     config.pipeline.queue_memory_limit = queue_memory_limit_bytes;
     queue_memory.log_memory_config(num_threads, queue_memory_limit_bytes);
     Ok(config)
+}
+
+/// Reject an `--index-threshold` that demands indexing under a configuration that can
+/// never index.
+///
+/// `always` is an assertion that the UMI index will be used, so a strategy/edits
+/// combination with no index code path has to be an error rather than a flag that is
+/// quietly ignored. Pass the EFFECTIVE strategy and edits, so `--no-umi` (which forces
+/// identity) is caught too.
+///
+/// A bare integer is deliberately not checked. It is a tuning knob allowed to end up
+/// inert — otherwise the default `100` could not coexist with `--strategy identity` —
+/// and that includes `0`, even though `0` admits every group exactly as `always` does.
+///
+/// # Errors
+///
+/// Returns an error naming the conflict and how to resolve it.
+pub fn validate_index_threshold(
+    index_threshold: IndexThreshold,
+    strategy: Strategy,
+    edits: u32,
+) -> anyhow::Result<()> {
+    if !index_threshold.demands_indexing() || strategy.can_use_index(edits) {
+        return Ok(());
+    }
+
+    let name = format!("{strategy:?}").to_lowercase();
+    let (context, reason) = match strategy {
+        Strategy::Adjacency => (
+            format!(" --edits {edits}"),
+            "the adjacency strategy only indexes at --edits 1".to_string(),
+        ),
+        _ => (String::new(), format!("the {name} strategy never uses the UMI index")),
+    };
+
+    anyhow::bail!(
+        "--index-threshold always cannot be honoured with --strategy {name}{context}: \
+         {reason}. Drop --index-threshold to leave indexing to the default threshold, \
+         or pass --index-threshold never to state that a linear scan is intended."
+    )
 }
 
 #[cfg(test)]

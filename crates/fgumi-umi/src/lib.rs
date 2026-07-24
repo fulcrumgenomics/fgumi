@@ -8,12 +8,14 @@
 //! - UMI grouping and family analysis
 
 pub mod assigner;
+pub mod index_threshold;
 
 // Re-export commonly used items
 pub use assigner::{
     AdjacencyUmiAssigner, IdentityUmiAssigner, PairedUmiAssigner, SimpleErrorUmiAssigner, Strategy,
     Umi, UmiAssigner,
 };
+pub use index_threshold::{DEFAULT_INDEX_THRESHOLD, IndexThreshold};
 
 use std::collections::HashSet;
 
