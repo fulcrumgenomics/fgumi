@@ -75,7 +75,7 @@
 use crate::caller::{
     ConsensusCaller, ConsensusCallingStats, ConsensusOutput,
     RejectionReason as CallerRejectionReason, clamp_combined_error_to_fgbio_short,
-    clamp_per_base_to_fgbio_short, write_consensus_read_name,
+    clamp_per_base_to_fgbio_short, consensus_read_name_too_long_context, write_consensus_read_name,
 };
 use crate::phred::{MIN_PHRED, NO_CALL_BASE, NO_CALL_BASE_LOWER, PhredScore};
 use crate::simple_umi::consensus_umis;
@@ -83,7 +83,7 @@ use crate::vanilla_caller::{
     VanillaConsensusRead, VanillaUmiConsensusCaller, VanillaUmiConsensusOptions,
 };
 use crate::{IndexedSourceRead, SourceRead, select_most_common_alignment_group};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use fgumi_dna::dna::reverse_complement;
 use fgumi_raw_bam::{
     self as bam_fields, RawRecord, RawRecordView, SamTag, UnmappedSamBuilder, flags,
@@ -1387,15 +1387,12 @@ impl CodecConsensusCaller {
         // Codec always outputs unmapped fragments
         let flag = flags::UNMAPPED;
 
-        // The UMI comes from the input BAM, so an over-long name is bad data,
-        // not a bug: return an error rather than panicking partway through
-        // writing the output.
-        self.bam_builder.try_build_record(
-            &self.read_name_buf,
-            flag,
-            &consensus.bases,
-            &consensus.quals,
-        )?;
+        // The UMI comes from the input BAM, so an over-long name is bad data, not a bug:
+        // return an error rather than panicking partway through writing the output, naming
+        // the offending read so the failing molecule is findable in a batch run.
+        self.bam_builder
+            .try_build_record(&self.read_name_buf, flag, &consensus.bases, &consensus.quals)
+            .with_context(|| consensus_read_name_too_long_context(&self.read_name_buf))?;
 
         // RG tag
         self.bam_builder.append_string_tag(SamTag::RG, self.read_group_id.as_bytes());

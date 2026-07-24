@@ -7,14 +7,14 @@
 use crate::base_builder::ConsensusBaseBuilder;
 use crate::caller::{
     ConsensusCaller, ConsensusCallingStats, ConsensusOutput, RejectionReason,
-    write_consensus_read_name,
+    consensus_read_name_too_long_context, write_consensus_read_name,
 };
 use crate::phred::{
     MIN_PHRED, NO_CALL_BASE, NO_CALL_BASE_LOWER, PhredScore, ln_error_prob_two_trials,
     ln_prob_to_phred, phred_to_ln_error_prob,
 };
 use crate::simple_umi::consensus_umis;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use fgumi_dna::dna::reverse_complement;
 use fgumi_raw_bam::{RawRecord, RawRecordView, UnmappedSamBuilder, flags};
 use fgumi_sam::SamTag;
@@ -1475,8 +1475,11 @@ impl VanillaUmiConsensusCaller {
         }
 
         // The UMI is input-derived, so an over-long name is bad data rather than
-        // a bug; propagate instead of panicking mid-write.
-        self.bam_builder.try_build_record(&self.read_name_buf, flag, bases, quals)?;
+        // a bug; propagate instead of panicking mid-write, naming the offending read so the
+        // failing molecule is findable in a batch run.
+        self.bam_builder
+            .try_build_record(&self.read_name_buf, flag, bases, quals)
+            .with_context(|| consensus_read_name_too_long_context(&self.read_name_buf))?;
 
         // RG tag
         self.bam_builder.append_string_tag(SamTag::RG, self.read_group_id.as_bytes());

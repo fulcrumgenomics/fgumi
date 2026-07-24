@@ -920,6 +920,56 @@ impl Extract {
         Ok(())
     }
 
+    /// Context for a read name that BAM cannot represent.
+    ///
+    /// The builder's own error reports the length and the limit but not which
+    /// read hit it, which is what the user needs to find the offending FASTQ
+    /// record. `name` is the final name as written, so it already includes the
+    /// `+<UMI>` suffix when `--annotate-read-names` is set. Long names are
+    /// truncated so the message stays readable.
+    fn read_name_too_long_context(name: &[u8]) -> String {
+        // Bounded head AND tail: the name is the FASTQ header plus an optional `+<UMI>` suffix
+        // (`--annotate-read-names`), so head-only truncation would drop a UMI that lands past
+        // the budget. Retaining both ends keeps two otherwise-similar reads distinguishable,
+        // and bounding the tail keeps the line readable for an over-long input-derived name.
+        const HEAD: usize = 44;
+        const TAIL: usize = 20;
+        let shown = if name.len() <= HEAD + TAIL {
+            format!("'{}'", String::from_utf8_lossy(name))
+        } else {
+            let head = String::from_utf8_lossy(&name[..HEAD]);
+            let tail = String::from_utf8_lossy(&name[name.len() - TAIL..]);
+            format!("'{head}...{tail}' (name shown truncated)")
+        };
+        format!("could not write the record for read {shown}")
+    }
+
+    /// Builds one raw BAM record for a template segment, substituting a single `N` @ Q2 when
+    /// the segment has no sequence.
+    ///
+    /// The name comes from the input FASTQ header (plus the UMI when `--annotate-read-names`
+    /// is set), so an over-long name is bad input rather than a bug: fail cleanly via
+    /// `try_build_record` instead of panicking partway through writing the output BAM, and
+    /// attach [`Self::read_name_too_long_context`] so the message names the offending read.
+    ///
+    /// Shared by the single-threaded (`make_raw_records`) and threaded
+    /// (`make_raw_records_static`) paths, which are otherwise easy to let drift apart.
+    fn build_template_record(
+        builder: &mut UnmappedSamBuilder,
+        name: &[u8],
+        flag: u16,
+        seq: &[u8],
+        quals: &[u8],
+        encoding: QualityEncoding,
+    ) -> Result<()> {
+        if seq.is_empty() {
+            builder.try_build_record(name, flag, b"N", &[2u8])
+        } else {
+            builder.try_build_record(name, flag, seq, &encoding.to_standard_numeric(quals))
+        }
+        .with_context(|| Self::read_name_too_long_context(name))
+    }
+
     /// Write raw BAM records from a read set directly to a writer.
     ///
     /// Uses `UnmappedSamBuilder` to construct records as raw bytes,
@@ -1011,13 +1061,14 @@ impl Extract {
             };
             let final_read_name: &[u8] = annotated_name.as_deref().unwrap_or(&read_name_bytes);
 
-            // Build the record - if empty seq, substitute with single N @ Q2
-            if template.seq.is_empty() {
-                builder.build_record(final_read_name, flag, b"N", &[2u8]);
-            } else {
-                let numeric_quals = encoding.to_standard_numeric(&template.quals);
-                builder.build_record(final_read_name, flag, &template.seq, &numeric_quals);
-            }
+            Self::build_template_record(
+                builder,
+                final_read_name,
+                flag,
+                &template.seq,
+                &template.quals,
+                encoding,
+            )?;
 
             // Append tags
             // Read group
@@ -1222,9 +1273,13 @@ impl Extract {
                 let combined = FastqSet::combine_readsets(fastq_sets);
 
                 // Build raw BAM records
+                // Render the whole `anyhow` chain (`{:#}`), not just the
+                // outermost context: the pipeline carries `io::Error`, so
+                // `to_string()` here would drop the underlying cause and leave
+                // the user with a context line and no reason for it.
                 let result = make_raw_records_static(&combined, encoding, &extract_config)
                     .map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}"))
                     })?;
 
                 // Debug: Check if we produce fewer records than template has
@@ -1349,13 +1404,14 @@ fn make_raw_records_static(
         };
         let final_read_name: &[u8] = annotated_name.as_deref().unwrap_or(&read_name_bytes);
 
-        // Build the record - if empty seq, substitute with single N @ Q2
-        if template.seq.is_empty() {
-            builder.build_record(final_read_name, flag, b"N", &[2u8]);
-        } else {
-            let numeric_quals = encoding.to_standard_numeric(&template.quals);
-            builder.build_record(final_read_name, flag, &template.seq, &numeric_quals);
-        }
+        Extract::build_template_record(
+            &mut builder,
+            final_read_name,
+            flag,
+            &template.seq,
+            &template.quals,
+            encoding,
+        )?;
 
         // Append tags
         // Read group
@@ -2716,6 +2772,90 @@ mod tests {
         // Both mates share the suffix-free QNAME.
         assert_eq!(recs[0].name().map(|n| n.as_bytes()), Some(b"SRR001.1".as_slice()));
         assert_eq!(recs[1].name().map(|n| n.as_bytes()), Some(b"SRR001.1".as_slice()));
+    }
+
+    /// A BAM read name is length-prefixed by a single byte that counts the
+    /// trailing NUL, so names of 255 bytes or more cannot be represented. The
+    /// name here comes straight from the input FASTQ header, so an over-long
+    /// one is bad input: `extract` must fail cleanly rather than abort with a
+    /// Rust panic partway through writing the output BAM and leave a truncated
+    /// file behind.
+    ///
+    /// Both record-building paths are covered: `make_raw_records`
+    /// (single-threaded) and `make_raw_records_static` (threaded).
+    #[rstest]
+    #[case::at_limit(254, true)]
+    #[case::one_over(255, false)]
+    #[case::far_over(4096, false)]
+    fn test_extract_rejects_over_long_read_name(
+        #[case] name_len: usize,
+        #[case] expect_ok: bool,
+        #[values(ThreadingOptions::none(), ThreadingOptions::new(2))] threading: ThreadingOptions,
+    ) {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let read_name = "N".repeat(name_len);
+        let r1 = create_fastq(&tmp, "r1.fq", &[(&read_name, "AAAAAAAAAA", "==========")]);
+        let output = tmp.path().join("output.bam");
+
+        let extract = Extract {
+            inputs: vec![r1],
+            output: output.clone(),
+            read_structures: vec![],
+            store_umi_quals: false,
+            store_cell_quals: false,
+            store_sample_barcode_qualities: false,
+            extract_umis_from_read_names: false,
+            annotate_read_names: false,
+            single_tag: None,
+            clipping_attribute: None,
+            read_group_id: "A".to_string(),
+            sample: "s".to_string(),
+            library: "l".to_string(),
+            barcode: None,
+            platform: "illumina".to_string(),
+            platform_unit: None,
+            platform_model: None,
+            sequencing_center: None,
+            predicted_insert_size: None,
+            description: None,
+            comment: vec![],
+            run_date: None,
+            threading,
+            compression: CompressionOptions { compression_level: 1 },
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
+        };
+
+        // Before the fix this panicked in the builder instead of returning Err.
+        let result = extract.execute("test");
+
+        assert_eq!(result.is_ok(), expect_ok, "name of {name_len} bytes: expected ok={expect_ok}");
+        match result {
+            Ok(()) => {
+                let recs = read_bam_records(&output);
+                assert_eq!(recs.len(), 1);
+                assert_eq!(
+                    recs[0].name().map(|n| n.as_bytes()),
+                    Some(read_name.as_bytes()),
+                    "an accepted name must round-trip unchanged"
+                );
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(msg.contains("read name too long"), "unexpected error: {msg}");
+                assert!(
+                    msg.contains("could not write the record for read 'NNN"),
+                    "the error should name the offending read: {msg}"
+                );
+                // A rejected name is always over-long (255+ bytes), so it is truncated for the
+                // diagnostic — the marker must say so rather than silently showing a partial name.
+                assert!(
+                    msg.contains("(name shown truncated)"),
+                    "an over-long name must be marked truncated: {msg}"
+                );
+            }
+        }
     }
 
     /// EXT-03: fgbio `Umis.extractUmisFromReadName` upper-cases the extracted UMI
