@@ -205,11 +205,14 @@
 //!
 //! - **Use Edit** if: You have moderate error rates and transitive clustering is
 //!   acceptable for your application. At one mismatch (`--edits 1`), once a
-//!   position reaches `--index-threshold` distinct UMIs -- floored at
-//!   [`EDIT_INDEX_THRESHOLD`], edit's own measured crossover -- candidate
-//!   neighbours come from an N-gram index rather than from the incremental
-//!   set-merge, so large position groups no longer cost quadratic time. Other
-//!   edit distances always use the set-merge.
+//!   position reaches `--index-threshold` distinct UMIs -- a numeric threshold
+//!   being floored at [`EDIT_INDEX_THRESHOLD`], edit's own measured crossover --
+//!   candidate neighbours come from an N-gram index rather than from the
+//!   incremental set-merge, so large position groups no longer cost quadratic
+//!   time. Every other `--edits` value always uses the set-merge, whatever the
+//!   threshold: the crossover was measured at one mismatch, and past it the
+//!   index's partitions get too short to be selective while single linkage
+//!   collapses the group, which makes the scan cheaper rather than dearer.
 //!
 //! - **Use Adjacency** if: You have high sequencing depth (10-100x+ per molecule),
 //!   need conservative error correction, or are doing variant calling where
@@ -229,10 +232,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::MoleculeId;
 use fgumi_dna::BitEnc;
 
-/// Default minimum number of unique UMIs to use N-gram/BK-tree index for candidate search.
-/// Below this threshold, linear scan is used. Based on benchmarks: index provides ~10%
-/// speedup even at 100 UMIs/position with negligible construction overhead.
-pub const DEFAULT_INDEX_THRESHOLD: usize = 100;
+use crate::index_threshold::{DEFAULT_INDEX_THRESHOLD, IndexThreshold};
 
 /// Minimum distinct UMIs before the `Edit` strategy builds its N-gram index.
 ///
@@ -468,10 +468,15 @@ impl NgramIndex {
         // Need at least 1 base per partition for meaningful filtering, and at
         // most 16: `extract_bits` packs 2 bits per base into a `u32`, so a wider
         // partition would silently truncate the key (and trips its own
-        // `debug_assert!` in debug builds). Only reachable at
-        // `max_mismatches == 0`, where `partition_len == umi_len`; every caller
-        // in this crate gates on `max_mismatches == 1`, so this guards the
-        // `pub` constructor rather than closing a live hole.
+        // `debug_assert!` in debug builds). Every caller in this crate gates on
+        // `max_mismatches == 1`, so `partition_len == umi_len / 2`, and the two
+        // arms differ in reachability:
+        //
+        // - `== 0` is live: a 1-base UMI splits into two 0-base pieces. The build
+        //   declines and the caller stays on its linear scan.
+        // - `> 16` is not: `BitEnc::from_bytes` rejects anything over 32 bases, so
+        //   half of an encodable UMI is always at most 16. It guards the `pub`
+        //   constructor, whose `max_mismatches == 0` gives `partition_len == umi_len`.
         if partition_len == 0 || partition_len > 16 {
             return None;
         }
@@ -596,6 +601,32 @@ pub enum Strategy {
 }
 
 impl Strategy {
+    /// Whether this strategy consults the UMI index at all, at `edits`.
+    ///
+    /// `Identity` has no index code path. `Edit` and `Adjacency` index only at
+    /// `edits == 1`; `Paired` indexes at every edit distance, N-gram for k=1 and BK-tree
+    /// for k>1.
+    ///
+    /// Both `edits == 1` gates are read from the assigner that enforces them
+    /// (`SimpleErrorUmiAssigner::indexes_at_edit_distance` and
+    /// `AdjacencyUmiAssigner::indexes_at_edit_distance`) rather than restated here, so
+    /// what this reports and what the assigner does cannot drift apart. Restating them
+    /// is how the two came to disagree once already: the N-gram index *can* serve k>1,
+    /// but neither assigner *reaches* it there.
+    ///
+    /// Callers use this to reject an [`IndexThreshold`] that
+    /// [demands indexing](IndexThreshold::demands_indexing) under a configuration that
+    /// cannot deliver it.
+    #[must_use]
+    pub fn can_use_index(&self, edits: u32) -> bool {
+        match self {
+            Strategy::Identity => false,
+            Strategy::Edit => SimpleErrorUmiAssigner::indexes_at_edit_distance(edits),
+            Strategy::Adjacency => AdjacencyUmiAssigner::indexes_at_edit_distance(edits),
+            Strategy::Paired => true,
+        }
+    }
+
     /// Create a new UMI assigner for this strategy
     ///
     /// # Arguments
@@ -611,7 +642,7 @@ impl Strategy {
     /// Panics if `edits` is non-zero when using the Identity strategy.
     #[must_use]
     pub fn new_assigner(&self, edits: u32) -> Box<dyn UmiAssigner> {
-        self.new_assigner_full(edits, 1, DEFAULT_INDEX_THRESHOLD)
+        self.new_assigner_full(edits, 1, IndexThreshold::default())
     }
 
     /// Create a new UMI assigner with thread count specified
@@ -626,7 +657,7 @@ impl Strategy {
     /// A boxed trait object implementing the `UmiAssigner` trait
     #[must_use]
     pub fn new_assigner_with_threads(&self, edits: u32, threads: usize) -> Box<dyn UmiAssigner> {
-        self.new_assigner_full(edits, threads, DEFAULT_INDEX_THRESHOLD)
+        self.new_assigner_full(edits, threads, IndexThreshold::default())
     }
 
     /// Create a new UMI assigner with all parameters specified
@@ -635,9 +666,10 @@ impl Strategy {
     ///
     /// * `edits` - Maximum number of mismatches allowed between UMIs
     /// * `threads` - Number of threads to use (only applies to Adjacency and Paired strategies)
-    /// * `index_threshold` - Minimum distinct UMIs at a position before an index is used
-    ///   instead of a linear scan; see [`AdjacencyUmiAssigner::uses_index`] and
-    ///   [`PairedUmiAssigner::uses_index`]
+    /// * `index_threshold` - When a position group is matched through an index rather
+    ///   than by comparing every pair; see [`SimpleErrorUmiAssigner::uses_index`],
+    ///   [`AdjacencyUmiAssigner::uses_index`] and [`PairedUmiAssigner::uses_index`] for
+    ///   the per-strategy gate. `Edit` floors a numeric value at [`EDIT_INDEX_THRESHOLD`].
     ///
     /// # Returns
     ///
@@ -647,12 +679,13 @@ impl Strategy {
     ///
     /// Panics if `edits` is non-zero with the `Identity` strategy.
     #[must_use]
-    pub fn new_assigner_full(
+    pub fn new_assigner_full<T: Into<IndexThreshold>>(
         &self,
         edits: u32,
         threads: usize,
-        index_threshold: usize,
+        index_threshold: T,
     ) -> Box<dyn UmiAssigner> {
+        let index_threshold = index_threshold.into();
         match self {
             Strategy::Identity => {
                 assert_eq!(edits, 0, "Edits should be zero when using the identity UMI assigner");
@@ -664,7 +697,7 @@ impl Strategy {
             // is honoured.
             Strategy::Edit => Box::new(SimpleErrorUmiAssigner::new_with_index_threshold(
                 edits,
-                index_threshold.max(EDIT_INDEX_THRESHOLD),
+                index_threshold.floored_at(EDIT_INDEX_THRESHOLD),
             )),
             Strategy::Adjacency => {
                 Box::new(AdjacencyUmiAssigner::new(edits, threads, index_threshold))
@@ -1061,7 +1094,7 @@ impl UnionFind {
 /// Uses atomic counter for ID generation, making it safe to use across threads.
 pub struct SimpleErrorUmiAssigner {
     max_mismatches: u32,
-    index_threshold: usize,
+    index_threshold: IndexThreshold,
     counter: AtomicU64,
 }
 
@@ -1088,15 +1121,57 @@ impl SimpleErrorUmiAssigner {
     /// # Arguments
     ///
     /// * `max_mismatches` - Maximum number of mismatches allowed between UMIs in the same group
-    /// * `index_threshold` - Build the N-gram index once a position group has at
-    ///   least this many distinct, encodable UMIs. Consulted only once a
-    ///   position exceeds `MERGE_DEFER_POINT` distinct UMIs and only when
-    ///   `max_mismatches == 1`, so any value at or below `MERGE_DEFER_POINT`
-    ///   behaves identically, and no value indexes at other distances.
-    ///   `usize::MAX` never indexes.
+    /// * `index_threshold` - When to build the N-gram index rather than merge UMIs
+    ///   into sets pairwise. Consulted only once a position exceeds
+    ///   `MERGE_DEFER_POINT` distinct UMIs, so every [`IndexThreshold::MinUmis`] at
+    ///   or below `MERGE_DEFER_POINT` — including `0` — behaves identically, as does
+    ///   [`IndexThreshold::Always`]. [`IndexThreshold::Never`] never indexes.
     #[must_use]
-    pub fn new_with_index_threshold(max_mismatches: u32, index_threshold: usize) -> Self {
-        Self { max_mismatches, index_threshold, counter: AtomicU64::new(0) }
+    pub fn new_with_index_threshold<T: Into<IndexThreshold>>(
+        max_mismatches: u32,
+        index_threshold: T,
+    ) -> Self {
+        Self { max_mismatches, index_threshold: index_threshold.into(), counter: AtomicU64::new(0) }
+    }
+
+    /// Whether the edit strategy consults its N-gram index at all, at `max_mismatches`.
+    ///
+    /// This is the single source of truth for edit's edit-distance gate: `assign` gates
+    /// its defer/index branch on it, [`Self::uses_index`] folds it in, and
+    /// [`Strategy::can_use_index`] reports it to the CLI. Binding all three to one
+    /// predicate is deliberate — when the gate lived only in `assign` as a bare
+    /// `max_mismatches == 1`, the docs, the startup log line and the index/scan parity
+    /// test all drifted into claiming the opposite.
+    ///
+    /// [`NgramIndex`] itself is not so limited: it partitions into `max_mismatches + 1`
+    /// pieces and its pigeonhole recall holds at any distance. The restriction is a
+    /// measured one, not a capability one — [`EDIT_INDEX_THRESHOLD`]'s crossover was
+    /// measured at one mismatch only, and above it the index loses: the pieces get too
+    /// short to be selective (4 bases at k=1 but 2 at k=2 for an 8-base UMI) while
+    /// single linkage collapses the group into one component, which makes the set-merge's
+    /// early-exiting scan *cheaper*. Widening this needs a `-e 2`/`-e 3` benchmark arm
+    /// first; `benches/umi_assigner_threshold.rs` sweeps one mismatch only.
+    #[must_use]
+    pub const fn indexes_at_edit_distance(max_mismatches: u32) -> bool {
+        max_mismatches == 1
+    }
+
+    /// Whether a position group of `num_umis` distinct UMIs is *eligible* to be matched
+    /// through the N-gram index rather than by merging UMIs into sets pairwise.
+    ///
+    /// As for [`AdjacencyUmiAssigner::uses_index`], this is the threshold *and* an
+    /// edit-distance condition: see [`Self::indexes_at_edit_distance`]. (The paired
+    /// strategy is the only one with no such condition — see
+    /// [`PairedUmiAssigner::uses_index`].)
+    ///
+    /// Eligibility is necessary but not sufficient. The index is only *reached* once a
+    /// position exceeds `MERGE_DEFER_POINT` distinct UMIs, and [`NgramIndex::new`] then
+    /// declines an empty group, a UMI containing non-ACGT bases, inconsistent UMI
+    /// lengths, or a UMI too short to split into `max_mismatches + 1` pieces — after
+    /// which the paused set-merge resumes.
+    #[must_use]
+    pub fn uses_index(&self, num_umis: usize) -> bool {
+        self.index_threshold.admits(num_umis) && Self::indexes_at_edit_distance(self.max_mismatches)
     }
 
     /// Add one UMI to the accumulated groups, merging any it bridges.
@@ -1245,7 +1320,12 @@ impl UmiAssigner for SimpleErrorUmiAssigner {
         //
         // `test_edit_matches_brute_force_across_regimes` checks all three
         // regimes against an independent oracle.
-        let can_index = self.max_mismatches == 1;
+        //
+        // The edit-distance gate is `indexes_at_edit_distance`, not a bare
+        // `max_mismatches == 1` written out here, so that `Strategy::can_use_index`
+        // (which the CLI validates `--index-threshold always` against) reports exactly
+        // what this branch does.
+        let can_index = Self::indexes_at_edit_distance(self.max_mismatches);
         let mut distinct: Vec<&Umi> = Vec::new();
         let mut seen: std::collections::HashSet<&str> =
             std::collections::HashSet::with_capacity(upper_umis.len());
@@ -1298,7 +1378,7 @@ impl UmiAssigner for SimpleErrorUmiAssigner {
             // covered at most `MERGE_DEFER_POINT` UMIs, so discarding it and
             // rebuilding every component from the index is cheap relative to the
             // position being grouped.
-            let indexed = if distinct.len() >= self.index_threshold {
+            let indexed = if self.uses_index(distinct.len()) {
                 self.components_via_index(&distinct)
             } else {
                 None
@@ -1413,7 +1493,7 @@ struct Node {
 pub struct AdjacencyUmiAssigner {
     max_mismatches: u32,
     threads: usize,
-    index_threshold: usize,
+    index_threshold: IndexThreshold,
     counter: AtomicU64,
 }
 
@@ -1424,28 +1504,39 @@ impl AdjacencyUmiAssigner {
     ///
     /// * `max_mismatches` - Maximum number of mismatches allowed for UMIs to be adjacent
     /// * `threads` - Number of threads to use for matching (default: 1)
-    /// * `index_threshold` - Minimum distinct UMIs at a position before the N-gram index
-    ///   is used instead of a linear scan; see [`AdjacencyUmiAssigner::uses_index`]
+    /// * `index_threshold` - When a position group is matched through the N-gram index
+    ///   rather than by a linear scan; see [`AdjacencyUmiAssigner::uses_index`]
     ///
     /// # Returns
     ///
     /// A new `AdjacencyUmiAssigner` instance
     #[must_use]
-    pub fn new(max_mismatches: u32, threads: usize, index_threshold: usize) -> Self {
-        Self { max_mismatches, threads, index_threshold, counter: AtomicU64::new(0) }
+    pub fn new<T: Into<IndexThreshold>>(
+        max_mismatches: u32,
+        threads: usize,
+        index_threshold: T,
+    ) -> Self {
+        Self {
+            max_mismatches,
+            threads,
+            index_threshold: index_threshold.into(),
+            counter: AtomicU64::new(0),
+        }
     }
 
     /// Whether a position group of `num_umis` distinct UMIs is *eligible* to be
     /// matched through the N-gram index rather than a linear scan over all UMI pairs.
     ///
-    /// `index_threshold` is a MINIMUM, not a switch: the index is built once a group
-    /// is at least that large, so `0` indexes every group and disabling the index
-    /// entirely takes a threshold larger than any group (e.g. `usize::MAX`).
+    /// An [`IndexThreshold::MinUmis`] is a MINIMUM, not a switch: the index is built
+    /// once a group is at least that large, so `0` indexes every group exactly as
+    /// [`IndexThreshold::Always`] does. [`IndexThreshold::Never`] is what turns the
+    /// index off.
     ///
-    /// The index is additionally limited to `max_mismatches == 1`, which is all
-    /// `NgramIndex` serves here; every other edit distance falls back to the linear
-    /// scan whatever the threshold. (The paired strategy is not so limited — see
-    /// [`PairedUmiAssigner::uses_index`].)
+    /// The index is additionally limited to `max_mismatches == 1` (see
+    /// [`Self::indexes_at_edit_distance`]); every other edit distance falls back to the
+    /// linear scan whatever the threshold. The edit strategy has the same condition
+    /// ([`SimpleErrorUmiAssigner::uses_index`]); the paired strategy is the only one
+    /// without it — see [`PairedUmiAssigner::uses_index`].
     ///
     /// Eligibility is necessary but not sufficient: [`NgramIndex::new`] declines an
     /// empty group, a UMI containing non-ACGT bases, or inconsistent UMI lengths, and
@@ -1453,7 +1544,33 @@ impl AdjacencyUmiAssigner {
     /// and edit-distance conditions permit indexing", not "an index was built".
     #[must_use]
     pub fn uses_index(&self, num_umis: usize) -> bool {
-        num_umis >= self.index_threshold && self.max_mismatches == 1
+        self.index_admits(num_umis) && Self::indexes_at_edit_distance(self.max_mismatches)
+    }
+
+    /// Whether the adjacency strategy consults its N-gram index at all, at
+    /// `max_mismatches`.
+    ///
+    /// The single source of truth for adjacency's edit-distance gate: [`Self::uses_index`]
+    /// folds it in (and `build_adjacency_graph_bitenc` gates on `uses_index`), and
+    /// [`Strategy::can_use_index`] reports it to the CLI, so what the CLI validates
+    /// `--index-threshold always` against is what this assigner actually does. The
+    /// BK-tree branch that would serve larger distances is reachable only from the
+    /// generic `build_adjacency_graph` the paired strategy uses.
+    #[must_use]
+    pub const fn indexes_at_edit_distance(max_mismatches: u32) -> bool {
+        max_mismatches == 1
+    }
+
+    /// Whether `index_threshold` alone admits a position group of `num_umis` distinct
+    /// UMIs, before any edit-distance condition.
+    ///
+    /// This is the gate [`Self::build_adjacency_graph`] runs *and* the one
+    /// [`PairedUmiAssigner::uses_index`] reports — the paired strategy drives that path
+    /// and has no edit-distance condition of its own. Both go through here rather than
+    /// spelling out `index_threshold.admits(..)` twice, so the paired `uses_index` tests
+    /// exercise the live gate instead of a parallel copy of it.
+    fn index_admits(&self, num_umis: usize) -> bool {
+        self.index_threshold.admits(num_umis)
     }
 
     /// Generate the next unique molecule ID
@@ -1697,8 +1814,9 @@ impl AdjacencyUmiAssigner {
         // Try to build index for fast candidate search (if enough UMIs).
         // Unlike `build_adjacency_graph_bitenc`, this path indexes at every edit
         // distance: N-gram for k=1 (most efficient), BK-tree for k>1. Only the
-        // `index_threshold` minimum applies -- see `PairedUmiAssigner::uses_index`.
-        let (ngram_index, bktree) = if nodes.len() >= self.index_threshold {
+        // `index_threshold` minimum applies -- see `PairedUmiAssigner::uses_index`,
+        // which reports this same `index_admits` gate.
+        let (ngram_index, bktree) = if self.index_admits(nodes.len()) {
             let umis: Vec<(usize, &str)> =
                 umi_counts.iter().enumerate().map(|(i, (umi, _, _))| (i, umi.as_str())).collect();
 
@@ -2022,15 +2140,18 @@ impl PairedUmiAssigner {
     ///
     /// * `max_mismatches` - Maximum number of mismatches allowed for UMIs to be adjacent
     /// * `threads` - Number of threads to use for matching
-    /// * `index_threshold` - Minimum distinct UMIs at a position before an index is used
-    ///   instead of a linear scan; see [`AdjacencyUmiAssigner::uses_index`] and
-    ///   [`PairedUmiAssigner::uses_index`]
+    /// * `index_threshold` - When a position group is matched through an index rather
+    ///   than by a linear scan; see [`PairedUmiAssigner::uses_index`]
     ///
     /// # Returns
     ///
     /// A new `PairedUmiAssigner` instance
     #[must_use]
-    pub fn new_with_threads(max_mismatches: u32, threads: usize, index_threshold: usize) -> Self {
+    pub fn new_with_threads<T: Into<IndexThreshold>>(
+        max_mismatches: u32,
+        threads: usize,
+        index_threshold: T,
+    ) -> Self {
         let prefix_len = max_mismatches as usize + 1;
         Self {
             adjacency: AdjacencyUmiAssigner::new(max_mismatches, threads, index_threshold),
@@ -2042,10 +2163,11 @@ impl PairedUmiAssigner {
     /// Whether a position group of `num_umis` distinct UMIs is *eligible* to be
     /// matched through an index rather than a linear scan over all UMI pairs.
     ///
-    /// As for [`AdjacencyUmiAssigner::uses_index`], `index_threshold` is a MINIMUM:
-    /// `0` indexes every group. Unlike the adjacency strategy, the paired strategy
-    /// indexes at every `--edits` value — N-gram for k=1, BK-tree for k>1 — so only
-    /// the threshold applies.
+    /// As for [`AdjacencyUmiAssigner::uses_index`], an [`IndexThreshold::MinUmis`] is a
+    /// MINIMUM: `0` indexes every group, and [`IndexThreshold::Never`] is what turns the
+    /// index off. Unlike the adjacency and edit strategies, the paired strategy indexes at
+    /// every `--edits` value — N-gram for k=1, BK-tree for k>1 — so only the threshold
+    /// applies. This reads the very gate `build_adjacency_graph` runs, not a copy of it.
     ///
     /// As there, eligibility is necessary but not sufficient: [`NgramIndex::new`] and
     /// [`BkTree::from_umis`] both decline UMIs they cannot encode (non-ACGT bases, and
@@ -2053,7 +2175,7 @@ impl PairedUmiAssigner {
     /// then falls back to the linear scan.
     #[must_use]
     pub fn uses_index(&self, num_umis: usize) -> bool {
-        num_umis >= self.adjacency.index_threshold
+        self.adjacency.index_admits(num_umis)
     }
 
     /// Get the prefix for lower-ordered reads in a pair
@@ -2915,9 +3037,11 @@ mod tests {
     /// boundary, and the two together pin the resume path in between -- the one
     /// that must reproduce work it deliberately postponed.
     ///
-    /// Both edit distances are swept because they take different paths:
-    /// `can_index` gates on `max_mismatches == 1`, so one mismatch reaches the
-    /// index while two is always the pure set-merge.
+    /// Both edit distances are swept because they take different paths: `can_index` gates
+    /// on `indexes_at_edit_distance`, so one mismatch reaches the index above the
+    /// threshold while two is always the pure set-merge. Unlike the index/scan parity
+    /// test, this one is non-vacuous either way -- the oracle is independent of both
+    /// paths.
     #[rstest]
     #[case::below_defer_point(10)]
     #[case::just_below_defer(63)]
@@ -2983,7 +3107,7 @@ mod tests {
     }
 
     /// The index must be a pure discovery optimisation: forcing it on
-    /// (`index_threshold = 0`) and off (`usize::MAX`) must produce identical
+    /// (`--index-threshold always`) and off (`never`) must produce identical
     /// molecule ids for the same input.
     ///
     /// Each case is padded past [`MERGE_DEFER_POINT`] with filler UMIs, because
@@ -2993,12 +3117,12 @@ mod tests {
     /// scan against itself; `assert!(distinct > MERGE_DEFER_POINT)` below keeps
     /// that from recurring.
     ///
-    /// Only one mismatch is swept: `can_index` gates on `max_mismatches == 1`,
-    /// so at any other edit distance the threshold is never consulted and both
-    /// sides run the identical set-merge -- the comparison would be vacuous in
-    /// exactly the way the padding above exists to prevent. The set-merge itself
-    /// is checked at two mismatches against an independent oracle by
-    /// `test_edit_matches_brute_force_across_regimes`.
+    /// Only one mismatch is swept: `can_index` gates on `indexes_at_edit_distance`, so at
+    /// any other distance the threshold is never consulted and both sides run the
+    /// identical set-merge -- the comparison would be vacuous in exactly the way the
+    /// padding above exists to prevent. The set-merge itself is checked against an
+    /// independent oracle by `test_edit_matches_brute_force_across_regimes`, and the
+    /// index's recall at other distances by `test_ngram_index_matches_brute_force`.
     #[rstest]
     #[case::pure_acgt(&["AAAAAAAA", "AAAAAAAC", "AAAAAACC", "TTTTTTTT", "TTTTTTTG"])]
     #[case::all_singletons(&["AAAAAAAA", "CCCCCCCC", "GGGGGGGG", "TTTTTTTT"])]
@@ -3008,6 +3132,7 @@ mod tests {
     // (deliberate parity with the parallel assigner); each gets its own id.
     #[case::n_containing(&["AAAAAAAA", "AAAAAAAN", "AAAAAAAC", "NNNNNNNN"])]
     fn test_edit_index_matches_scan(#[case] interesting: &[&str]) {
+        let max_mismatches = 1;
         // Filler shares the UMI length so `assert_uniform_umi_length` is happy,
         // and is far from the interesting UMIs so it forms its own components.
         let mut umis: Vec<Umi> = interesting.iter().map(|u| (*u).to_string()).collect();
@@ -3020,9 +3145,17 @@ mod tests {
             "case must exceed MERGE_DEFER_POINT or the index is never reached"
         );
 
-        let indexed = SimpleErrorUmiAssigner::new_with_index_threshold(1, 0).assign(&umis);
-        let scanned = SimpleErrorUmiAssigner::new_with_index_threshold(1, usize::MAX).assign(&umis);
-        assert_eq!(indexed, scanned, "index/scan divergence at one mismatch");
+        // `Always` and `Never` name the two sides directly, so the test cannot
+        // silently compare the scan against itself the way a pair of numbers can.
+        let indexed = SimpleErrorUmiAssigner::new_with_index_threshold(
+            max_mismatches,
+            IndexThreshold::Always,
+        )
+        .assign(&umis);
+        let scanned =
+            SimpleErrorUmiAssigner::new_with_index_threshold(max_mismatches, IndexThreshold::Never)
+                .assign(&umis);
+        assert_eq!(indexed, scanned, "index/scan divergence at {max_mismatches} mismatch(es)");
     }
 
     /// Dashed dual UMIs reach the index build and are declined by it
@@ -3032,9 +3165,9 @@ mod tests {
     /// the fallback is genuinely exercised.
     ///
     /// Checked against `brute_force_components` rather than against the
-    /// `index_threshold = usize::MAX` scan: because the index *always* declines
-    /// dashed input, both thresholds now take the same resume-merge branch, so
-    /// comparing them would assert nothing. The independent oracle is what makes
+    /// [`IndexThreshold::Never`] scan: because the index *always* declines dashed
+    /// input, both thresholds now take the same resume-merge branch, so comparing
+    /// them would assert nothing. The independent oracle is what makes
     /// this test load-bearing.
     #[test]
     fn test_edit_dashed_umis_fall_back_within_indexed_path() {
@@ -4596,6 +4729,97 @@ mod tests {
         assert!(indices.contains(&2)); // second partition matches (CCCC)
     }
 
+    /// `NgramIndex` finds *exactly* the neighbour set, at every distance and UMI length
+    /// it accepts -- no false negatives (pigeonhole) and no false positives
+    /// (`find_within` re-verifies each candidate's Hamming distance).
+    ///
+    /// The lengths deliberately include ones that `max_mismatches + 1` does not divide.
+    /// `partition_len` is a FLOOR, so the partitions leave a tail uncovered -- an 8-base
+    /// UMI at k=2 covers bases 0..6 and ignores the last two. Recall survives it because
+    /// pigeonhole needs only that the blocks be disjoint: `k` differences can dirty at
+    /// most `k` of the `k + 1` blocks, and any difference landing in the uncovered tail
+    /// simply leaves fewer to distribute.
+    ///
+    /// The edit strategy is gated to one mismatch on measured grounds (see
+    /// `SimpleErrorUmiAssigner::indexes_at_edit_distance`), so this is the coverage that
+    /// keeps that a benchmarking decision: the index is already known-correct wherever a
+    /// future sweep might want to enable it.
+    #[rstest]
+    fn test_ngram_index_matches_brute_force(
+        #[values(8, 9, 11, 12, 16)] umi_len: usize,
+        #[values(0, 1, 2, 3)] max_mismatches: u32,
+    ) {
+        let mut distinct: Vec<Umi> = {
+            let generated = umis_with_distinct(150, umi_len, 0x0FEE_D5EE);
+            let mut seen = HashSet::new();
+            generated.into_iter().filter(|umi| seen.insert(umi.clone())).collect()
+        };
+
+        // Plant neighbours at EXACTLY `max_mismatches` distance. Random UMIs alone leave
+        // the relation empty at the longer lengths (no two random 16-mers are within 3),
+        // which would make the recall half of the assertion vacuous while the test still
+        // passed -- so the planted pairs are what make it load-bearing.
+        let planted: Vec<Umi> = distinct
+            .iter()
+            .take(20)
+            .map(|umi| {
+                let mut bytes = umi.clone().into_bytes();
+                // Every one of the first `max_mismatches` bases changes, whatever it was.
+                for base in bytes.iter_mut().take(max_mismatches as usize) {
+                    *base = if *base == b'A' { b'C' } else { b'A' };
+                }
+                String::from_utf8(bytes).expect("ASCII")
+            })
+            .collect();
+        distinct.extend(planted);
+        let distinct: Vec<&str> = {
+            let mut seen = HashSet::new();
+            distinct.iter().map(String::as_str).filter(|umi| seen.insert(*umi)).collect()
+        };
+        let indexed: Vec<(usize, &str)> = distinct.iter().copied().enumerate().collect();
+
+        let index = NgramIndex::new(&indexed, max_mismatches)
+            .expect("index must build for these lengths and distances");
+
+        // Every unordered pair within `max_mismatches`, computed independently of the
+        // index by comparing bases directly.
+        let mut expected: HashSet<(usize, usize)> = HashSet::new();
+        for (i, a) in distinct.iter().enumerate() {
+            for (j, b) in distinct.iter().enumerate().skip(i + 1) {
+                let dist = a.bytes().zip(b.bytes()).filter(|(x, y)| x != y).count();
+                if dist <= max_mismatches as usize {
+                    expected.insert((i, j));
+                }
+            }
+        }
+
+        let mut found: HashSet<(usize, usize)> = HashSet::new();
+        for (i, umi) in distinct.iter().enumerate() {
+            for (j, _dist) in index.find_within(umi, max_mismatches) {
+                if i != j {
+                    found.insert((i.min(j), i.max(j)));
+                }
+            }
+        }
+
+        // At zero mismatches the only neighbours would be identical strings, which a
+        // distinct set cannot hold, so an empty relation there is correct -- the
+        // assertion is pure precision. Everywhere else the planted pairs must show up,
+        // or recall is being asserted against nothing.
+        if max_mismatches > 0 {
+            assert!(
+                !expected.is_empty(),
+                "planted neighbours vanished at len {umi_len}, {max_mismatches} mismatch(es): \
+                 the recall half of this test would be vacuous"
+            );
+        }
+
+        assert_eq!(
+            found, expected,
+            "index/brute-force disagreement at len {umi_len}, {max_mismatches} mismatch(es)"
+        );
+    }
+
     #[test]
     fn test_ngram_index_find_invalid_query() {
         let umis = vec![(0, "AAAAAAAA")];
@@ -4746,24 +4970,118 @@ mod tests {
     // --index-threshold semantics
     // ========================================================================
 
-    /// Pins what `--index-threshold` actually does, so the CLI help can be checked
-    /// against it. The gate is `num_umis >= index_threshold`, so `0` means the index
-    /// is ALWAYS built -- it does not disable the index. Disabling it requires a
-    /// threshold larger than any position group, e.g. `usize::MAX`.
+    /// `Strategy::can_use_index` is what turns `--index-threshold always` into a
+    /// command-line error, so it must name exactly the combinations that have an
+    /// index code path. Identity has none; edit's and adjacency's are gated on one
+    /// mismatch; paired's is not gated on the edit distance at all.
     #[rstest]
-    #[case::zero_always_indexes(0, 1, true)]
-    #[case::zero_indexes_empty_group(0, 0, true)]
-    #[case::below_threshold_scans(100, 99, false)]
-    #[case::at_threshold_indexes(100, 100, true)]
-    #[case::above_threshold_indexes(100, 101, true)]
-    #[case::usize_max_never_indexes(usize::MAX, 1_000_000, false)]
+    #[case::identity(crate::assigner::Strategy::Identity, 0, false)]
+    #[case::edit_zero_edits(crate::assigner::Strategy::Edit, 0, false)]
+    #[case::edit_one_edit(crate::assigner::Strategy::Edit, 1, true)]
+    #[case::edit_two_edits(crate::assigner::Strategy::Edit, 2, false)]
+    #[case::adjacency_zero_edits(crate::assigner::Strategy::Adjacency, 0, false)]
+    #[case::adjacency_one_edit(crate::assigner::Strategy::Adjacency, 1, true)]
+    #[case::adjacency_two_edits(crate::assigner::Strategy::Adjacency, 2, false)]
+    #[case::paired_one_edit(crate::assigner::Strategy::Paired, 1, true)]
+    #[case::paired_two_edits(crate::assigner::Strategy::Paired, 2, true)]
+    fn test_strategy_can_use_index(
+        #[case] strategy: crate::assigner::Strategy,
+        #[case] edits: u32,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(strategy.can_use_index(edits), expected);
+    }
+
+    /// The edit assigner indexes only at one mismatch, and no threshold overrides that:
+    /// `uses_index` is the gate `assign` consults, so `Always` on a group far past
+    /// `EDIT_INDEX_THRESHOLD` still yields `false` at every other distance.
+    ///
+    /// This is the pairing that matters, and the one whose absence let the gate and its
+    /// advertisement disagree: `Strategy::can_use_index` is what the CLI validates
+    /// `--index-threshold always` against, so it must equal what the assigner does at
+    /// every distance, not merely at the default.
+    #[rstest]
+    fn test_edit_index_is_gated_to_one_mismatch(#[values(0, 1, 2, 3, 6)] max_mismatches: u32) {
+        let expected = max_mismatches == 1;
+        let assigner = SimpleErrorUmiAssigner::new_with_index_threshold(
+            max_mismatches,
+            IndexThreshold::Always,
+        );
+
+        assert_eq!(
+            assigner.uses_index(EDIT_INDEX_THRESHOLD + 50),
+            expected,
+            "`always` must not resurrect the index at {max_mismatches} mismatch(es)"
+        );
+        assert_eq!(
+            crate::assigner::Strategy::Edit.can_use_index(max_mismatches),
+            expected,
+            "`can_use_index` must report what the assigner does at {max_mismatches} \
+             mismatch(es), or `--index-threshold always` validates against a fiction"
+        );
+    }
+
+    /// The gate is a *measured* restriction, not a capability one -- `NgramIndex` itself
+    /// serves any distance an 8-base UMI can be split into, because it partitions into
+    /// `max_mismatches + 1` pieces and `find_within` re-verifies each candidate's
+    /// Hamming distance. Pinned so that widening the gate stays a benchmarking question
+    /// (`benches/umi_assigner_threshold.rs` sweeps one mismatch only) rather than
+    /// looking like a correctness one.
+    #[rstest]
+    fn test_ngram_index_builds_at_every_edit_distance(#[values(0, 1, 2, 3)] max_mismatches: u32) {
+        let umis = umis_with_distinct(EDIT_INDEX_THRESHOLD + 50, 8, 0xED17);
+        let distinct: Vec<&Umi> = {
+            let mut seen = std::collections::HashSet::new();
+            umis.iter().filter(|umi| seen.insert(umi.as_str())).collect()
+        };
+        let indexed: Vec<(usize, &str)> =
+            distinct.iter().enumerate().map(|(i, umi)| (i, umi.as_str())).collect();
+
+        assert!(
+            NgramIndex::new(&indexed, max_mismatches).is_some(),
+            "the index must be buildable at {max_mismatches} mismatch(es), not declined"
+        );
+    }
+
+    /// `never` reaches the edit assigner too, so no group size resurrects the index --
+    /// at one mismatch, where it would otherwise have fired.
+    #[test]
+    fn test_edit_never_suppresses_the_index() {
+        let assigner = SimpleErrorUmiAssigner::new_with_index_threshold(1, IndexThreshold::Never);
+        assert!(!assigner.uses_index(1_000_000));
+    }
+
+    /// Pins what `--index-threshold` actually does, so the CLI help can be checked
+    /// against it. A bare integer is a MINIMUM group size, not a switch, so `0` turns
+    /// the index fully on. `never` is the only way to turn it off.
+    #[rstest]
+    #[case::zero_always_indexes(IndexThreshold::MinUmis(0), 1, true)]
+    #[case::zero_indexes_empty_group(IndexThreshold::MinUmis(0), 0, true)]
+    #[case::below_threshold_scans(IndexThreshold::MinUmis(100), 99, false)]
+    #[case::at_threshold_indexes(IndexThreshold::MinUmis(100), 100, true)]
+    #[case::above_threshold_indexes(IndexThreshold::MinUmis(100), 101, true)]
+    #[case::always_indexes_singleton(IndexThreshold::Always, 1, true)]
+    #[case::never_skips_huge_group(IndexThreshold::Never, 1_000_000, false)]
     fn test_adjacency_index_threshold_is_a_minimum_not_a_switch(
-        #[case] index_threshold: usize,
+        #[case] index_threshold: IndexThreshold,
         #[case] num_umis: usize,
         #[case] expected: bool,
     ) {
         let assigner = AdjacencyUmiAssigner::new(1, 1, index_threshold);
         assert_eq!(assigner.uses_index(num_umis), expected);
+    }
+
+    /// `never` wins over every other consideration, including an edit distance that
+    /// would otherwise index (paired) -- there is no combination that resurrects it.
+    #[rstest]
+    #[case::edits_one(1)]
+    #[case::edits_two(2)]
+    fn test_never_suppresses_the_index_at_every_edit_distance(#[case] max_mismatches: u32) {
+        let adjacency = AdjacencyUmiAssigner::new(max_mismatches, 1, IndexThreshold::Never);
+        assert!(!adjacency.uses_index(1_000_000));
+
+        let paired = PairedUmiAssigner::new_with_threads(max_mismatches, 1, IndexThreshold::Never);
+        assert!(!paired.uses_index(1_000_000));
     }
 
     /// The adjacency assigner only indexes at `--edits 1`; every other value falls
@@ -4796,7 +5114,8 @@ mod tests {
         #[case] num_umis: usize,
         #[case] expected: bool,
     ) {
-        let assigner = PairedUmiAssigner::new_with_threads(max_mismatches, 1, 100);
+        let assigner =
+            PairedUmiAssigner::new_with_threads(max_mismatches, 1, IndexThreshold::MinUmis(100));
         assert_eq!(assigner.uses_index(num_umis), expected);
     }
 }

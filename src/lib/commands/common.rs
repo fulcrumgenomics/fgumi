@@ -17,6 +17,7 @@ use clap::Args;
 use fgumi_bam_io::is_stdin_path;
 #[cfg(feature = "simplex")]
 use fgumi_consensus::methylation::RefBaseProvider;
+use fgumi_umi::IndexThreshold;
 #[cfg(feature = "simplex")]
 use log::{info, warn};
 use noodles::sam::Header;
@@ -136,11 +137,13 @@ pub fn add_pg_to_builder(
 /// `group` and `dedup` both report the N-gram index threshold that is actually in
 /// effect, which is not always the raw `--index-threshold` value:
 ///
-/// - [`Strategy::Edit`] indexes only at one mismatch, and floors the flag at its own
-///   measured crossover ([`fgumi_umi::EDIT_INDEX_THRESHOLD`], higher than the shared
+/// - [`Strategy::Edit`] indexes only at one mismatch, and floors a numeric flag at its
+///   own measured crossover ([`fgumi_umi::EDIT_INDEX_THRESHOLD`], higher than the shared
 ///   default), so it reports `max(flag, EDIT_INDEX_THRESHOLD)` at one mismatch and
 ///   "not used" otherwise.
-/// - [`Strategy::Adjacency`] and [`Strategy::Paired`] use the flag verbatim.
+/// - [`Strategy::Adjacency`] also indexes only at one mismatch, so it reports "not used"
+///   at any other, and the flag verbatim at one.
+/// - [`Strategy::Paired`] uses the flag verbatim at every mismatch count.
 /// - [`Strategy::Identity`] never indexes, so it reports nothing.
 ///
 /// # Arguments
@@ -155,15 +158,18 @@ pub fn add_pg_to_builder(
 pub fn index_threshold_log_message(
     strategy: Strategy,
     effective_edits: u32,
-    index_threshold: usize,
+    index_threshold: IndexThreshold,
 ) -> Option<String> {
     match strategy {
-        Strategy::Edit if effective_edits == 1 => Some(format!(
-            "Index threshold: {} (edit)",
-            index_threshold.max(fgumi_umi::EDIT_INDEX_THRESHOLD)
-        )),
-        Strategy::Edit => {
+        Strategy::Edit if effective_edits != 1 => {
             Some("Index threshold: not used (edit indexes only at --edits 1)".to_string())
+        }
+        Strategy::Edit => Some(format!(
+            "Index threshold: {} (edit)",
+            index_threshold.floored_at(fgumi_umi::EDIT_INDEX_THRESHOLD)
+        )),
+        Strategy::Adjacency if effective_edits != 1 => {
+            Some("Index threshold: not used (adjacency indexes only at --edits 1)".to_string())
         }
         Strategy::Adjacency | Strategy::Paired => {
             Some(format!("Index threshold: {index_threshold}"))
@@ -188,7 +194,11 @@ const _: () = assert!(
 /// Shared by `group` and `dedup` so the two cannot drift apart when a threshold
 /// changes. See [`index_threshold_log_message`] for the arguments and the
 /// per-strategy behavior.
-pub fn log_index_threshold(strategy: Strategy, effective_edits: u32, index_threshold: usize) {
+pub fn log_index_threshold(
+    strategy: Strategy,
+    effective_edits: u32,
+    index_threshold: IndexThreshold,
+) {
     if let Some(message) = index_threshold_log_message(strategy, effective_edits, index_threshold) {
         log::info!("{message}");
     }
@@ -1205,44 +1215,141 @@ pub fn build_pipeline_config(
     Ok(config)
 }
 
+/// Reject an `--index-threshold` that demands indexing under a configuration that can
+/// never index.
+///
+/// `always` is an assertion that the UMI index will be used, so a strategy/edits
+/// combination with no index code path has to be an error rather than a flag that is
+/// quietly ignored. Pass the EFFECTIVE strategy and edits, so `--no-umi` (which forces
+/// identity) is caught too.
+///
+/// A bare integer is deliberately not checked. It is a tuning knob allowed to end up
+/// inert — otherwise the default `100` could not coexist with `--strategy identity` —
+/// and that includes `0`, even though `0` admits every group exactly as `always` does.
+///
+/// # Errors
+///
+/// Returns an error naming the conflict and how to resolve it.
+pub fn validate_index_threshold(
+    index_threshold: IndexThreshold,
+    strategy: Strategy,
+    edits: u32,
+) -> anyhow::Result<()> {
+    if !index_threshold.demands_indexing() || strategy.can_use_index(edits) {
+        return Ok(());
+    }
+
+    let name = format!("{strategy:?}").to_lowercase();
+    let (context, reason) = match strategy {
+        // Edit and adjacency both have an index, just not at this edit distance, so the
+        // reason has to name the distance rather than claim they never index.
+        Strategy::Edit | Strategy::Adjacency => {
+            (format!(" --edits {edits}"), format!("the {name} strategy only indexes at --edits 1"))
+        }
+        _ => (String::new(), format!("the {name} strategy never uses the UMI index")),
+    };
+
+    anyhow::bail!(
+        "--index-threshold always cannot be honoured with --strategy {name}{context}: \
+         {reason}. Drop --index-threshold to leave indexing to the default threshold, \
+         or pass --index-threshold never to state that a linear scan is intended."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// `index_threshold_log_message` reports the threshold that is actually in effect,
-    /// which is not always the raw `--index-threshold` value. `Edit` floors the flag at
-    /// its own measured crossover and indexes only at one mismatch; `Adjacency`/`Paired`
-    /// use the flag verbatim; `Identity` never indexes and so reports nothing.
+    /// which is not always the raw `--index-threshold` value. `Edit` floors a numeric
+    /// flag at its own measured crossover and indexes only at one mismatch; `Adjacency`
+    /// uses the flag verbatim and also only indexes at one mismatch; `Paired` uses the
+    /// flag verbatim always; `Identity` never indexes and so reports nothing.
     #[rstest]
-    // Edit at one mismatch floors the flag at EDIT_INDEX_THRESHOLD (200).
-    #[case::edit_flag_below_floor(Strategy::Edit, 1, 100, Some("Index threshold: 200 (edit)"))]
-    // A flag above the floor wins, so the user can still raise it.
-    #[case::edit_flag_above_floor(Strategy::Edit, 1, 500, Some("Index threshold: 500 (edit)"))]
-    // Zero does not disable indexing: the gate is `distinct >= threshold`, so the
-    // floor still applies.
-    #[case::edit_flag_zero(Strategy::Edit, 1, 0, Some("Index threshold: 200 (edit)"))]
-    // Edit only indexes at one mismatch.
+    // Edit floors a numeric flag at EDIT_INDEX_THRESHOLD (200)...
+    #[case::edit_flag_below_floor(
+        Strategy::Edit,
+        1,
+        IndexThreshold::MinUmis(100),
+        Some("Index threshold: 200 (edit)")
+    )]
+    // ...a flag above the floor wins, so the user can still raise it...
+    #[case::edit_flag_above_floor(
+        Strategy::Edit,
+        1,
+        IndexThreshold::MinUmis(500),
+        Some("Index threshold: 500 (edit)")
+    )]
+    // ...and `0` does not disable indexing (the gate is `distinct >= threshold`), so
+    // the floor still applies to it.
+    #[case::edit_flag_zero(
+        Strategy::Edit,
+        1,
+        IndexThreshold::MinUmis(0),
+        Some("Index threshold: 200 (edit)")
+    )]
+    // The keywords state an intent rather than a group size, so the floor leaves them be.
+    #[case::edit_always(
+        Strategy::Edit,
+        1,
+        IndexThreshold::Always,
+        Some("Index threshold: always (edit)")
+    )]
+    #[case::edit_never(
+        Strategy::Edit,
+        1,
+        IndexThreshold::Never,
+        Some("Index threshold: never (edit)")
+    )]
+    // Edit indexes only at one mismatch, so every other distance reports "not used".
     #[case::edit_two_mismatches(
         Strategy::Edit,
         2,
-        100,
+        IndexThreshold::MinUmis(100),
         Some("Index threshold: not used (edit indexes only at --edits 1)")
     )]
     #[case::edit_zero_mismatches(
         Strategy::Edit,
         0,
-        100,
+        IndexThreshold::MinUmis(100),
         Some("Index threshold: not used (edit indexes only at --edits 1)")
     )]
-    // Adjacency and paired report the raw flag, with no floor.
-    #[case::adjacency(Strategy::Adjacency, 1, 100, Some("Index threshold: 100"))]
-    #[case::paired(Strategy::Paired, 1, 37, Some("Index threshold: 37"))]
+    // The edit-distance condition outranks the keyword: `never` at two mismatches is
+    // "not used" for the stronger reason, not "never". (`always` cannot reach here at
+    // all -- `validate_index_threshold` rejects it before anything is logged.)
+    #[case::edit_never_two_mismatches(
+        Strategy::Edit,
+        2,
+        IndexThreshold::Never,
+        Some("Index threshold: not used (edit indexes only at --edits 1)")
+    )]
+    // Adjacency reports the raw flag, with no floor, but only indexes at one mismatch.
+    #[case::adjacency(
+        Strategy::Adjacency,
+        1,
+        IndexThreshold::MinUmis(100),
+        Some("Index threshold: 100")
+    )]
+    #[case::adjacency_two_mismatches(
+        Strategy::Adjacency,
+        2,
+        IndexThreshold::MinUmis(100),
+        Some("Index threshold: not used (adjacency indexes only at --edits 1)")
+    )]
+    // Paired reports the raw flag at every mismatch count.
+    #[case::paired(Strategy::Paired, 1, IndexThreshold::MinUmis(37), Some("Index threshold: 37"))]
+    #[case::paired_two_mismatches(
+        Strategy::Paired,
+        2,
+        IndexThreshold::Never,
+        Some("Index threshold: never")
+    )]
     // Identity never indexes, so it emits no line at all.
-    #[case::identity(Strategy::Identity, 0, 100, None)]
+    #[case::identity(Strategy::Identity, 0, IndexThreshold::MinUmis(100), None)]
     fn test_index_threshold_log_message(
         #[case] strategy: Strategy,
         #[case] effective_edits: u32,
-        #[case] index_threshold: usize,
+        #[case] index_threshold: IndexThreshold,
         #[case] expected: Option<&str>,
     ) {
         assert_eq!(
@@ -1257,7 +1364,7 @@ mod tests {
     fn test_index_threshold_log_message_uses_crate_floor() {
         let floor = fgumi_umi::EDIT_INDEX_THRESHOLD;
         assert_eq!(
-            index_threshold_log_message(Strategy::Edit, 1, 0),
+            index_threshold_log_message(Strategy::Edit, 1, IndexThreshold::MinUmis(0)),
             Some(format!("Index threshold: {floor} (edit)"))
         );
     }
@@ -1269,9 +1376,11 @@ mod tests {
         #[values(Strategy::Identity, Strategy::Edit, Strategy::Adjacency, Strategy::Paired)]
         strategy: Strategy,
         #[values(0, 1, 2)] effective_edits: u32,
+        #[values(IndexThreshold::Always, IndexThreshold::Never, IndexThreshold::MinUmis(100))]
+        index_threshold: IndexThreshold,
     ) {
         enable_logging();
-        log_index_threshold(strategy, effective_edits, 100);
+        log_index_threshold(strategy, effective_edits, index_threshold);
     }
 
     /// Enable an at-Trace logger so `log::warn!`/`debug!` macros evaluate their
