@@ -4001,4 +4001,101 @@ mod tests {
             );
         }
     }
+
+    /// `assign_with_invalid_fallback` must mint an id only for UMIs `resolve`
+    /// rejects, share one id between repeats of the same rejected UMI (case-folded),
+    /// and leave resolved UMIs untouched — whatever the interleaving. The cases put
+    /// rejected UMIs before, between and after resolved ones, and repeat a rejected
+    /// UMI across a run of resolved ones, because that is where an eager mint (or a
+    /// map built at the wrong time) shifts ids.
+    ///
+    /// **This asserts fgumi's intentional divergence from fgbio for invalid UMIs,
+    /// not fgbio identity.** fgbio's `GroupReadsByUmi` discards every SAM record
+    /// whose UMI contains an `N` *before* assignment (fgbio
+    /// `GroupReadsByUmi.scala`, `filteredNsInUmi` / `discarded_ns_in_umi`), so a
+    /// rejected UMI has no fgbio molecule id to be identical to. fgumi's `group`
+    /// and `dedup` commands filter the same reads upstream
+    /// (`src/lib/commands/group.rs`, `UmiValidation::ContainsN`), matching fgbio
+    /// there; `assign_with_invalid_fallback` is the defensive backstop for a
+    /// non-`BitEnc`-encodable UMI that reaches the assigner anyway. Its behavior —
+    /// one `Single` molecule per distinct case-folded invalid string, never joined
+    /// to a valid molecule — is a deliberate fgumi choice (it also keeps the
+    /// sequential and parallel assigners in lockstep, see the `parallel_assigner`
+    /// parity harness), so this test pins that documented divergence rather than an
+    /// fgbio baseline. The fgbio-identical path — valid ACGT UMIs handled by
+    /// `resolve` — is covered by the per-strategy grouping tests
+    /// (`test_simple_error_assigner_groups_by_mismatches`,
+    /// `test_identity_assigner_groups_exact_matches`, the `test_adjacency_*` tests)
+    /// and the sequential-vs-parallel parity harness in `parallel_assigner`.
+    #[rstest]
+    #[case::all_resolved(&["AAAA", "CCCC"], &[] as &[&str], &[0, 1])]
+    #[case::all_rejected(&["AAAN", "CCCN"], &["AAAN", "CCCN"], &[100, 101])]
+    #[case::rejected_first(&["AAAN", "CCCC"], &["AAAN"], &[100, 0])]
+    #[case::rejected_last(&["AAAA", "CCCN"], &["CCCN"], &[0, 100])]
+    #[case::rejected_between_resolved(&["AAAA", "CCCN", "GGGG"], &["CCCN"], &[0, 100, 1])]
+    #[case::repeat_rejected_after_resolved(
+        &["AAAN", "CCCC", "GGGG", "AAAN"], &["AAAN"], &[100, 0, 1, 100]
+    )]
+    #[case::repeat_rejected_case_folded(&["aaan", "AAAN"], &["aaan", "AAAN"], &[100, 100])]
+    // A repeat must not consume an id. If it did, the *next* distinct rejected UMI
+    // would be minted 102 instead of 101 — the only interleaving in which a wasted
+    // mint is observable, since a discarded id never appears in the output itself.
+    #[case::repeat_rejected_then_new_rejected(
+        &["AAAN", "AAAN", "CCCN"], &["AAAN", "CCCN"], &[100, 100, 101]
+    )]
+    fn test_assign_with_invalid_fallback_id_assignment(
+        #[case] raw_umis: &[&str],
+        #[case] rejected: &[&str],
+        #[case] expected_ids: &[u64],
+    ) {
+        // `resolve` stands in for a real assigner: it rejects the listed UMIs and
+        // hands every other one a distinct id in first-seen order, so a spurious
+        // mint or a reordered mint is visible in the output vector.
+        let mut resolved_ids: AHashMap<String, MoleculeId> = AHashMap::new();
+        let mut next_resolved = 0u64;
+        let resolve = |_: usize, umi: &str| {
+            if rejected.iter().any(|r| r.eq_ignore_ascii_case(umi)) {
+                return None;
+            }
+            Some(*resolved_ids.entry(umi.to_uppercase()).or_insert_with(|| {
+                let id = MoleculeId::Single(next_resolved);
+                next_resolved += 1;
+                id
+            }))
+        };
+
+        // Count how many times `mint` fired. `assign_with_invalid_fallback` must mint
+        // exactly once per DISTINCT (case-folded) rejected UMI — never per rejected
+        // occurrence — so a repeated rejection sharing its predecessor's id, and a
+        // successful resolution after the final rejection, both leave the count
+        // untouched. Tracked via a Cell so the counter is observable after the
+        // `mint` closure is dropped at the end of the call.
+        let mints = std::cell::Cell::new(0u64);
+        let mint = || {
+            let id = MoleculeId::Single(100 + mints.get());
+            mints.set(mints.get() + 1);
+            id
+        };
+
+        let umis: Vec<Umi> = raw_umis.iter().map(|u| (*u).to_string()).collect();
+        let expected: Vec<MoleculeId> =
+            expected_ids.iter().copied().map(MoleculeId::Single).collect();
+
+        assert_eq!(assign_with_invalid_fallback(&umis, resolve, mint), expected);
+
+        // Derive the expected mint count from the inputs, not from a literal: the
+        // number of distinct case-folded rejected UMIs actually present in `raw_umis`.
+        let expected_mints = raw_umis
+            .iter()
+            .filter(|u| rejected.iter().any(|r| r.eq_ignore_ascii_case(u)))
+            .map(|u| u.to_uppercase())
+            .collect::<std::collections::HashSet<_>>()
+            .len() as u64;
+        assert_eq!(
+            mints.get(),
+            expected_mints,
+            "mint fired {} times; expected one per distinct rejected UMI ({expected_mints})",
+            mints.get(),
+        );
+    }
 }
