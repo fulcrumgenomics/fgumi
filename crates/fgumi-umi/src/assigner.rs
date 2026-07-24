@@ -1812,11 +1812,62 @@ impl PairedUmiAssigner {
     /// every molecule (as a filter) or never fire (as the length guard).
     fn underlying_umi_len(key: &str) -> Option<usize> {
         let mut total = 0;
-        for half in key.split('-') {
-            let seq = half.rsplit(':').next().unwrap_or(half);
-            total += BitEnc::from_umi_str(seq)?.len();
+        let mut rest = key.as_bytes();
+        loop {
+            // Split off the next dash-delimited half via a byte search, avoiding the
+            // `split('-')` iterator's per-call state on this hot path.
+            let (half, more) = match rest.iter().position(|&b| b == b'-') {
+                Some(pos) => (&rest[..pos], Some(&rest[pos + 1..])),
+                None => (rest, None),
+            };
+            // The sequence is the bytes after the last ':' (orientation prefix), or the whole
+            // half when unprefixed. `rposition` is a plain byte search (memrchr); crucially the
+            // prefix bytes before it are never validated, so a prefix like `bb:` (containing the
+            // non-base `b`) is correctly ignored rather than rejected.
+            let seq = match half.iter().rposition(|&b| b == b':') {
+                Some(pos) => &half[pos + 1..],
+                None => half,
+            };
+            // Count ACGT bases and reject anything `BitEnc` cannot represent, matching
+            // `BitEnc::from_umi_str` exactly (both cases accepted; >32 bases per half rejected)
+            // without allocating the discarded 2-bit packing. This is the sole hot-path use of
+            // the result, so the packed value was pure waste.
+            let mut half_len = 0;
+            for &b in seq {
+                if !matches!(b, b'A' | b'a' | b'C' | b'c' | b'G' | b'g' | b'T' | b't') {
+                    return None;
+                }
+                if half_len >= 32 {
+                    return None;
+                }
+                half_len += 1;
+            }
+            total += half_len;
+            match more {
+                Some(r) => rest = r,
+                None => break,
+            }
         }
         Some(total)
+    }
+
+    /// Whether a paired UMI's own orientation takes the `PairedA` strand, i.e. whether it sorts
+    /// strictly before its reverse (`A-B` vs `B-A`). Exactly `umi < reverse(umi)` but with no
+    /// allocation: `umi` is `first + "-" + second`, so its reverse is `second + "-" + first`, and
+    /// comparing `umi`'s bytes against that virtual sequence is byte-for-byte identical to the
+    /// allocating `umi < reverse(umi)` for *every* input. Ties (`umi == reverse(umi)`) return
+    /// `false`.
+    ///
+    /// Comparing the halves directly (`first < second`) is *not* equivalent: when one half is a
+    /// strict prefix of the other and the next byte sorts below `-` (`0x2D`), the separator
+    /// reorders the whole-string comparison the other way. Valid `A`/`C`/`G`/`T`/`N` halves never
+    /// trigger it (all sort above `-`), but `split`/`assign` do not constrain halves to those
+    /// bases, so a leniently-accepted malformed UMI could otherwise flip the A/B strand versus the
+    /// code this replaced.
+    fn orientation_is_ab(umi: &str) -> bool {
+        let (first, second) =
+            Self::split(umi).expect("UMI should be valid paired format (validated above)");
+        umi.bytes().cmp(second.bytes().chain(std::iter::once(b'-')).chain(first.bytes())).is_lt()
     }
 
     /// Split paired UMI into two parts
@@ -1962,11 +2013,52 @@ impl PairedUmiAssigner {
         if matches_within_threshold(lhs, rhs, max_mismatches) {
             return true;
         }
-        if let Ok(lhs_rev) = Self::reverse(lhs) {
-            matches_within_threshold(&lhs_rev, rhs, max_mismatches)
-        } else {
-            false
+        // Compare `reverse(lhs)` against `rhs` without materializing the reversed string. This
+        // runs once per candidate pair while building the adjacency graph, so the per-comparison
+        // allocation `Self::reverse` used to incur was pure overhead.
+        Self::reversed_matches_within(lhs, rhs, max_mismatches)
+    }
+
+    /// Whether `reverse(lhs)` (the `B-A` form of `lhs = "A-B"`) is within `max_mismatches` of
+    /// `rhs`, computed allocation-free. Positionally equivalent to
+    /// `matches_within_threshold(&reverse(lhs), rhs, max_mismatches)`: reversal preserves total
+    /// length, so this requires `lhs.len() == rhs.len()` and then counts byte differences between
+    /// the virtual `second-first` layout of `lhs` and `rhs`, short-circuiting past the threshold.
+    /// Returns `false` for a non-paired `lhs` (no `-`), matching `reverse`'s error path.
+    fn reversed_matches_within(lhs: &str, rhs: &str, max_mismatches: usize) -> bool {
+        let lb = lhs.as_bytes();
+        let rb = rhs.as_bytes();
+        if lb.len() != rb.len() {
+            return false;
         }
+        let Some(dash) = lb.iter().position(|&b| b == b'-') else {
+            return false;
+        };
+        let (first, second) = (&lb[..dash], &lb[dash + 1..]);
+        let too_many = max_mismatches + 1;
+        let mut mismatches = 0usize;
+        // Virtual reverse is `second` ++ '-' ++ `first`; compare to `rhs` position-for-position.
+        let mut check = |a: u8, b: u8| -> bool {
+            if a != b {
+                mismatches += 1;
+            }
+            mismatches < too_many
+        };
+        let sl = second.len();
+        for i in 0..sl {
+            if !check(second[i], rb[i]) {
+                return false;
+            }
+        }
+        if !check(b'-', rb[sl]) {
+            return false;
+        }
+        for i in 0..first.len() {
+            if !check(first[i], rb[sl + 1 + i]) {
+                return false;
+            }
+        }
+        mismatches <= max_mismatches
     }
 }
 
@@ -1976,16 +2068,33 @@ impl UmiAssigner for PairedUmiAssigner {
             return Vec::new();
         }
 
-        // Validate all are paired UMIs
+        // Validate all are paired UMIs (exactly one '-'). Locate the first '-' and confirm no
+        // second one, short-circuiting without the substring machinery of `split('-').count()`
+        // on this per-UMI hot path.
         for umi in raw_umis {
-            assert!((umi.split('-').count() == 2), "UMI {umi} is not a paired UMI");
+            let bytes = umi.as_bytes();
+            assert!(
+                bytes
+                    .iter()
+                    .position(|&b| b == b'-')
+                    .is_some_and(|pos| !bytes[pos + 1..].contains(&b'-')),
+                "UMI {umi} is not a paired UMI"
+            );
         }
 
         // Work on uppercased UMIs so counting, matching, and strand assignment are all
         // case-insensitive, matching the parallel paired assigner (which canonicalizes to
-        // uppercase). This keeps the two implementations in agreement on mixed-case input
-        // and is a no-op for the uppercase UMIs the CLI emits.
-        let upper_umis: Vec<Umi> = raw_umis.iter().map(|umi| umi.to_uppercase()).collect();
+        // uppercase). The CLI already emits uppercase UMIs, so when no input UMI contains a
+        // lowercase byte -- the common case -- borrow `raw_umis` directly and allocate nothing.
+        // Only when some UMI is mixed-case do we materialize an uppercased copy.
+        let upper_owned: Vec<Umi>;
+        let upper_umis: &[Umi] =
+            if raw_umis.iter().any(|umi| umi.bytes().any(|b| b.is_ascii_lowercase())) {
+                upper_owned = raw_umis.iter().map(|umi| umi.to_uppercase()).collect();
+                &upper_owned
+            } else {
+                raw_umis
+            };
 
         // Resolve each UMI's underlying (prefix-stripped) base length exactly once. `None` means
         // the UMI is not `BitEnc`-encodable. Every site below — the encodability filter, the
@@ -1996,7 +2105,7 @@ impl UmiAssigner for PairedUmiAssigner {
             upper_umis.iter().map(|umi| Self::underlying_umi_len(umi)).collect();
 
         // Count with A-B and B-A combined
-        let mut umi_counts = Self::count_paired(&upper_umis, &underlying);
+        let mut umi_counts = Self::count_paired(upper_umis, &underlying);
 
         // Exclude paired UMIs whose underlying sequence is non-BitEnc-encodable before the
         // length guard, the `umi_counts.len() == 1` fast path, and adjacency grouping. The edit
@@ -2018,7 +2127,7 @@ impl UmiAssigner for PairedUmiAssigner {
         // assigners' all-invalid branch.
         if umi_counts.is_empty() {
             return assign_with_invalid_fallback(
-                &upper_umis,
+                upper_umis,
                 |_, _| None,
                 || MoleculeId::Single(self.adjacency.next_id()),
             );
@@ -2043,13 +2152,11 @@ impl UmiAssigner for PairedUmiAssigner {
             // (non-encodable) UMI gets its own `Single` (see `assign_with_invalid_fallback`),
             // matching the parallel paired assigner. Strand is by the UMI's own orientation.
             return assign_with_invalid_fallback(
-                &upper_umis,
+                upper_umis,
                 |idx, umi| {
-                    underlying[idx].is_some().then(|| {
-                        let reversed = Self::reverse(umi)
-                            .expect("UMI should be valid paired format (validated above)");
-                        if umi < reversed.as_str() { ab } else { ba }
-                    })
+                    underlying[idx]
+                        .is_some()
+                        .then(|| if Self::orientation_is_ab(umi) { ab } else { ba })
                 },
                 || MoleculeId::Single(self.adjacency.next_id()),
             );
@@ -2102,7 +2209,7 @@ impl UmiAssigner for PairedUmiAssigner {
         // gets its own molecule (see `assign_with_invalid_fallback`), matching the parallel
         // paired assigner. An unencodable UMI has no valid strand, so it is a plain `Single`.
         assign_with_invalid_fallback(
-            &upper_umis,
+            upper_umis,
             |_, umi| umi_to_id.get(umi).copied(),
             || MoleculeId::Single(self.adjacency.next_id()),
         )
@@ -2804,6 +2911,92 @@ mod tests {
         assert_ne!(
             ids[1], ids[2],
             "distinct invalid spellings must not share a molecule despite canonicalizing together"
+        );
+    }
+
+    /// `underlying_umi_len` must stay bug-for-bug equivalent to summing
+    /// `BitEnc::from_umi_str(half).len()` over the prefix-stripped halves — the definition
+    /// #510's GRP-01 parity depends on — now that it scans bytes directly instead of encoding.
+    /// Covers: clean and prefixed keys, both cases, non-ACGT rejection, the 32-base-per-half
+    /// limit `from_umi_str` enforces, and empty halves.
+    #[rstest]
+    #[case::clean("ACGT-TGCA", Some(8))]
+    #[case::prefixed("aa:ACGT-bb:TTTT", Some(8))]
+    #[case::prefixed_upper("AA:ACGT-BB:TTTT", Some(8))]
+    #[case::lowercase_bases("acgt-tgca", Some(8))]
+    #[case::uneven_halves("ACG-TTTTT", Some(8))]
+    #[case::invalid_n("ACGN-TTTT", None)]
+    #[case::invalid_iupac("ACGT-TTTR", None)]
+    #[case::empty_half("ACGT-", Some(4))]
+    #[case::exactly_32("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-CCCC", Some(36))]
+    #[case::over_32_rejected("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-CCCC", None)]
+    fn test_underlying_umi_len_matches_bitenc(#[case] key: &str, #[case] expected: Option<usize>) {
+        // Reference: the pre-optimization definition, summing BitEnc encode lengths per half.
+        let reference: Option<usize> = key
+            .split('-')
+            .map(|half| {
+                let seq = half.rsplit(':').next().unwrap_or(half);
+                BitEnc::from_umi_str(seq).map(|enc| enc.len())
+            })
+            .try_fold(0usize, |acc, len| len.map(|l| acc + l));
+        assert_eq!(reference, expected, "reference disagrees with expectation for {key:?}");
+        assert_eq!(
+            PairedUmiAssigner::underlying_umi_len(key),
+            expected,
+            "underlying_umi_len diverged from BitEnc semantics for {key:?}"
+        );
+    }
+
+    /// `orientation_is_ab` must equal the allocation-based `umi < reverse(umi)` it replaces, for
+    /// clean UMIs, prefixed production keys, and ties. This is what selects the `PairedA` vs
+    /// `PairedB` strand in the single-molecule fast path.
+    #[rstest]
+    #[case::clean_ab("ACGT-TGCA")]
+    #[case::clean_ba("TGCA-ACGT")]
+    #[case::clean_tie("ACGT-ACGT")]
+    #[case::prefixed_ab("aa:ACGT-bb:TGCA")]
+    #[case::prefixed_ba("bb:ACGT-aa:TGCA")]
+    #[case::uneven_prefix_first_shorter("aa:ACG-bb:TGCAA")]
+    #[case::first_prefix_of_second("aa:AC-bb:ACGT")]
+    // A half that is a strict prefix of the other, where the extra byte (`!`, 0x21) sorts below
+    // the `-` separator: the direct half comparison `first < second` diverges from
+    // `umi < reverse(umi)` here. Reachable because `split`/`assign` do not reject non-ACGTN bytes.
+    #[case::sub_dash_byte_in_second_half("A-A!:")]
+    fn test_orientation_is_ab_matches_reverse_compare(#[case] umi: &str) {
+        let reversed = PairedUmiAssigner::reverse(umi).expect("valid paired");
+        let expected = umi < reversed.as_str();
+        assert_eq!(
+            PairedUmiAssigner::orientation_is_ab(umi),
+            expected,
+            "orientation_is_ab({umi:?}) diverged from `umi < reverse(umi)`"
+        );
+    }
+
+    /// `reversed_matches_within` must equal `matches_within_threshold(&reverse(lhs), rhs, k)` — the
+    /// allocating form it replaces in `matches_paired` — across match/mismatch, both orientations,
+    /// prefixed keys, differing lengths, and threshold boundaries.
+    #[rstest]
+    #[case::exact_reverse("ACGT-TGCA", "TGCA-ACGT", 1)]
+    #[case::one_mismatch_reverse("ACGT-TGCA", "TGCA-ACGA", 1)]
+    #[case::two_mismatch_over_threshold("ACGT-TGCA", "TGCA-AGGA", 1)]
+    #[case::no_match("ACGT-TGCA", "GGGG-CCCC", 1)]
+    #[case::forward_not_reverse("ACGT-TGCA", "ACGT-TGCA", 1)]
+    #[case::differing_length("ACGT-TGCA", "TGCA-ACG", 1)]
+    #[case::prefixed("aa:ACGT-bb:TGCA", "bb:TGCA-aa:ACGT", 1)]
+    #[case::threshold_zero("ACGT-TGCA", "TGCA-ACGA", 0)]
+    fn test_reversed_matches_within_matches_alloc(
+        #[case] lhs: &str,
+        #[case] rhs: &str,
+        #[case] k: usize,
+    ) {
+        let expected = match PairedUmiAssigner::reverse(lhs) {
+            Ok(rev) => matches_within_threshold(&rev, rhs, k),
+            Err(_) => false,
+        };
+        assert_eq!(
+            PairedUmiAssigner::reversed_matches_within(lhs, rhs, k),
+            expected,
+            "reversed_matches_within({lhs:?},{rhs:?},{k}) diverged from reverse-then-compare"
         );
     }
 
