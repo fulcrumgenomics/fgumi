@@ -552,7 +552,12 @@ pub fn compute_group_key_from_raw(
             name_hash,
         ),
         None => {
-            // No MC tag — fall back to single-end behavior
+            // No MC tag — fall back to single-end behavior.
+            //
+            // `RecordPositionGrouper::validate_mc_tag` detects a missing MC tag by
+            // testing `GroupKey::has_mate_position()` on the key produced here,
+            // instead of re-walking the aux data on its serial step. Keep this the
+            // only way an eligible paired record can receive a single-ended key.
             GroupKey::single(own_ref_id, own_pos, strand, library_idx, cell_hash, name_hash)
         }
     };
