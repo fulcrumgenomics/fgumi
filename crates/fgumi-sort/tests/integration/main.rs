@@ -5,5 +5,6 @@
 //! fixtures, so they live under `tests/integration/` per the project
 //! convention.
 
+mod test_output_compression;
 mod test_read_ahead;
 mod test_verify;
