@@ -245,6 +245,77 @@ pub struct ConsensusBaseBuilder {
 
     /// Pre-UMI error rate (log probability)
     ln_error_pre_umi: LogProbability,
+
+    /// Smallest winner-minus-loser log-likelihood gap at which the unanimous fast
+    /// path is provably exact for this `ln_error_pre_umi`.
+    ///
+    /// Derived once in [`Self::new`] by [`min_exact_unanimous_gap`]; see there for
+    /// why a single constant cannot serve every pre-UMI error rate.
+    min_unanimous_gap: f64,
+}
+
+/// Smallest winner-minus-loser log-likelihood gap at which a unanimous call's
+/// quality is guaranteed to round to the pre-UMI cap.
+///
+/// The fast path returns `ln_prob_to_phred(ln_error_pre_umi)` — the cap — without
+/// running the full calculation. That is only correct once the consensus error has
+/// fallen far enough below the pre-UMI error that combining them no longer changes
+/// the rounded Phred. How far "far enough" is depends on the pre-UMI rate: the
+/// larger it is, the smaller the consensus error must be relative to it, so the
+/// required gap grows as the pre-UMI quality rises. A single hardcoded threshold is
+/// therefore too small above some pre-UMI quality (inflating qualities) and
+/// needlessly large below it (skipping fewer calls than it safely could).
+///
+/// For a unanimous position the four likelihoods are one winner and three equal
+/// losers `gap` below it, so the posterior is `1 / (1 + 3e^-gap)` independent of the
+/// winner's absolute value. That makes the required gap a pure function of
+/// `ln_error_pre_umi`, resolved here by bisection over the real calculation rather
+/// than a closed form — the quality chain floors, clamps and has a short-circuit
+/// branch in `ln_error_prob_two_trials`, and reproducing all of that in algebra is
+/// how the threshold drifts out of step with the code again. Quality is monotone
+/// non-decreasing in the gap and bounded above by the cap, so the predicate
+/// "rounds to the cap" flips exactly once and bisection is exact.
+///
+/// Returns the known-good (upper) end of the final bracket, so the answer is never
+/// optimistic.
+fn min_exact_unanimous_gap(ln_error_pre_umi: LogProbability) -> f64 {
+    /// Gap wide enough that the consensus error underflows to nothing; the true
+    /// answer is far below this for every representable pre-UMI rate.
+    const MAX_GAP: f64 = 256.0;
+    /// Enough halvings of `MAX_GAP` to converge past f64 resolution. The bracket
+    /// collapses below an ULP of the returned gap by ~56 halvings across the whole
+    /// representable pre-UMI range, so 64 is comfortably converged with headroom;
+    /// further halvings are no-ops that leave the result bit-identical.
+    const ITERATIONS: usize = 64;
+
+    let cap = ln_prob_to_phred(ln_error_pre_umi);
+
+    // Mirrors `call_full` for a unanimous position, using the same log-sum-exp
+    // helper so the two agree bit for bit. The winner is pinned at 0 and the losers
+    // at -gap; `ln_sum_exp_array` factors out the max, so the absolute offset the
+    // real likelihoods carry does not change the result.
+    let rounds_to_cap = |gap: f64| {
+        let ln_sum = ln_sum_exp_array(&[0.0, -gap, -gap, -gap]);
+        let ln_posterior = ln_normalize(0.0, ln_sum);
+        let ln_consensus_error = ln_not(ln_posterior);
+        let ln_final_error = ln_error_prob_two_trials(ln_error_pre_umi, ln_consensus_error);
+        ln_prob_to_phred(ln_final_error) == cap
+    };
+
+    if rounds_to_cap(0.0) {
+        return 0.0;
+    }
+
+    let (mut too_small, mut wide_enough) = (0.0_f64, MAX_GAP);
+    for _ in 0..ITERATIONS {
+        let midpoint = 0.5 * (too_small + wide_enough);
+        if rounds_to_cap(midpoint) {
+            wide_enough = midpoint;
+        } else {
+            too_small = midpoint;
+        }
+    }
+    wide_enough
 }
 
 impl ConsensusBaseBuilder {
@@ -272,13 +343,16 @@ impl ConsensusBaseBuilder {
             adjusted_error_per_alt.push(adjusted_error - 3.0_f64.ln());
         }
 
+        let ln_error_pre_umi = phred_to_ln_error_prob(error_rate_pre_umi);
+
         Self {
             likelihoods: f64x4::splat(LN_ONE),
             compensations: f64x4::splat(0.0),
             observations: [0; DNA_BASE_COUNT],
             adjusted_correct_table,
             adjusted_error_per_alt,
-            ln_error_pre_umi: phred_to_ln_error_prob(error_rate_pre_umi),
+            ln_error_pre_umi,
+            min_unanimous_gap: min_exact_unanimous_gap(ln_error_pre_umi),
         }
     }
 
@@ -360,19 +434,15 @@ impl ConsensusBaseBuilder {
         let base_idx = observed_base_idx?;
 
         // Check if the likelihood difference is large enough to skip full calculation.
-        // When ln(L_winner) - ln(L_loser) > threshold, the posterior is essentially 1.
-        // threshold = 23 corresponds to likelihood ratio > 10^10, giving Q > 90
-        #[expect(
-            clippy::items_after_statements,
-            reason = "const is logically scoped to this fast-path check"
-        )]
-        const FAST_PATH_THRESHOLD: f64 = 23.0;
-
+        // Beyond `min_unanimous_gap` the combined error rounds to the pre-UMI cap, so
+        // the full calculation cannot return anything else. The bound is derived per
+        // pre-UMI error rate in `min_exact_unanimous_gap`; it is not a constant,
+        // because how wide the gap must be depends on that rate.
         let likelihoods = self.likelihoods.as_array();
         let winner_ll = likelihoods[base_idx];
         let loser_ll = likelihoods[(base_idx + 1) % 4]; // Any loser will do (all same)
 
-        if winner_ll - loser_ll > FAST_PATH_THRESHOLD {
+        if winner_ll - loser_ll > self.min_unanimous_gap {
             // Very high confidence - return quality capped by pre-UMI error rate
             // The pre-UMI error rate limits the maximum achievable quality
             let max_qual = ln_prob_to_phred(self.ln_error_pre_umi);
@@ -404,6 +474,16 @@ impl ConsensusBaseBuilder {
             return (base, qual);
         }
 
+        self.call_full()
+    }
+
+    /// The full log-sum-exp consensus calculation, with no fast path.
+    ///
+    /// [`Self::call`] short-circuits to [`Self::try_unanimous_fast_path`] when that
+    /// is provably exact; this is the answer it must agree with. Kept separate so
+    /// the agreement is directly testable — see
+    /// `test_unanimous_fast_path_matches_full_calculation`.
+    fn call_full(&self) -> (u8, PhredScore) {
         // Extract likelihoods as array for iteration and function calls
         let likelihoods = self.likelihoods.as_array();
 
@@ -492,6 +572,7 @@ impl ConsensusBaseBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     /// The per-base error count in the consensus callers is
     /// `contributions() - observations_for_base(base)`. Both operands must stay
@@ -876,6 +957,101 @@ mod tests {
             assert!(
                 (i16::from(qual) - i16::from(*expected_q)).abs() <= 1,
                 "Q{input_q} should become ~Q{expected_q}, got Q{qual}"
+            );
+        }
+    }
+
+    // ========================================================================
+    // Unanimous fast-path exactness
+    // ========================================================================
+
+    /// The unanimous fast path must return exactly what the full calculation
+    /// returns, at every pre-UMI error rate the CLI accepts.
+    ///
+    /// `-1/--error-rate-pre-umi` takes any `u8` and nothing validates it, but the
+    /// fast path's gap threshold was a single hardcoded constant reasoned about for
+    /// one quality regime. The gap actually required for the capped answer to be
+    /// provably correct grows with the pre-UMI rate, so above some pre-UMI quality
+    /// the shortcut fired on calls whose true answer is below the cap and inflated
+    /// them.
+    ///
+    /// Sweeping the pre-UMI rate is the part that matters, and it is the axis the
+    /// rest of the suite never varies: everything else runs at the Q45 default,
+    /// where the old constant happened to be safe, so this bug was invisible to it.
+    /// Pre-UMI and post-UMI are the `#[case]` axes so a regression names the rate it
+    /// broke at; depth and observation quality are swept inside the body — together
+    /// they only walk the gap across the threshold (it grows linearly with depth),
+    /// and giving them their own cases multiplies into thousands of near-duplicate
+    /// tests. The assertion still names the exact combination that failed.
+    #[rstest]
+    fn test_unanimous_fast_path_matches_full_calculation(
+        #[values(20, 30, 40, 45, 50, 60, 69, 70, 80, 90, 93)] error_rate_pre_umi: PhredScore,
+        #[values(10, 30, 40)] error_rate_post_umi: PhredScore,
+    ) {
+        for depth in [1usize, 2, 3, 4, 5, 8, 12, 20, 50] {
+            for obs_qual in [10u8, 20, 30, 40, 60, 93] {
+                let mut builder =
+                    ConsensusBaseBuilder::new(error_rate_pre_umi, error_rate_post_umi);
+                for _ in 0..depth {
+                    builder.add(b'A', obs_qual);
+                }
+
+                let full = builder.call_full();
+                let fast = builder.call();
+
+                assert_eq!(
+                    fast, full,
+                    "unanimous fast path disagreed with the full calculation at \
+                     pre-UMI Q{error_rate_pre_umi}, post-UMI Q{error_rate_post_umi}, \
+                     depth {depth}, obs Q{obs_qual}: fast={fast:?} full={full:?}"
+                );
+            }
+        }
+    }
+
+    /// The derived bound must both preserve the old threshold's safety at typical
+    /// pre-UMI rates and be tighter than it there — the fix is not a slowdown at the
+    /// default. Above Q69 the required gap exceeds the old hardcoded 23.0, which is
+    /// exactly the range where the constant was silently inflating qualities.
+    #[rstest]
+    #[case::q40(40, false)]
+    #[case::q45_default(45, false)]
+    #[case::q69_last_safe(69, false)]
+    #[case::q70_first_unsafe(70, true)]
+    #[case::q93_max(93, true)]
+    fn test_derived_gap_brackets_the_old_hardcoded_threshold(
+        #[case] error_rate_pre_umi: PhredScore,
+        #[case] expected_above_old_threshold: bool,
+    ) {
+        /// The constant this bound replaces.
+        const OLD_THRESHOLD: f64 = 23.0;
+
+        let gap = min_exact_unanimous_gap(phred_to_ln_error_prob(error_rate_pre_umi));
+        assert_eq!(
+            gap > OLD_THRESHOLD,
+            expected_above_old_threshold,
+            "pre-UMI Q{error_rate_pre_umi} needs a gap of {gap:.2}; expected it to be \
+             {} 23.0",
+            if expected_above_old_threshold { "above" } else { "at or below" }
+        );
+    }
+
+    /// The required gap rises monotonically with pre-UMI quality — the property that
+    /// makes a single constant unable to serve the whole range.
+    #[test]
+    fn test_required_gap_increases_with_pre_umi_quality() {
+        let gaps: Vec<f64> =
+            (0..=MAX_PHRED).map(|q| min_exact_unanimous_gap(phred_to_ln_error_prob(q))).collect();
+
+        for (q, pair) in gaps.windows(2).enumerate() {
+            assert!(
+                pair[1] >= pair[0],
+                "gap must not shrink as pre-UMI quality rises, but Q{} needs {:.4} and \
+                 Q{} needs {:.4}",
+                q,
+                pair[0],
+                q + 1,
+                pair[1]
             );
         }
     }
