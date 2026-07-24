@@ -207,7 +207,9 @@ fn bases_extending_past_mate(
         // `this_pos + ref_len - 1` would overflow i32 before clipping can fail closed — panic in
         // debug, wrap to garbage in release.
         let ref_len = reference_length_from_cigar(&cigar_ops);
-        let alignment_end = this_pos.saturating_add(ref_len).saturating_sub(1);
+        // `-1` first, matching the mate-boundary helpers: subtracting it after the
+        // saturating add clamps a genuinely-at-the-ceiling end inward to `i32::MAX - 1`.
+        let alignment_end = this_pos.saturating_sub(1).saturating_add(ref_len);
 
         if alignment_end >= mate_unclipped_end {
             // Compute read position at mate's unclipped end
@@ -232,9 +234,15 @@ fn mate_soft_unclipped_from_mc(mate_pos_1based: i32, mc_cigar: &str) -> Option<(
     let (leading_soft, ref_len, trailing_soft) = parse_soft_clips_and_ref_len(mc_cigar)?;
     // saturating: a saturated ref_len/soft-clip (from an adversarial MC CIGAR) must
     // clamp the boundary, not overflow-panic (debug) / wrap to a negative (release).
+    // The inclusive-end `-1` is applied *first*, for the reason given on
+    // `cigar::unclipped_other_end`: applied last it would saturate the sum to
+    // `i32::MAX` and then walk it back to `i32::MAX - 1`, clamping inward rather
+    // than outward -- the opposite of what the fail-closed contract wants. As a
+    // plain `- 1` it also underflow-panicked in debug when `mate_pos_1based` was
+    // `i32::MIN` and the spans were zero.
     Some((
         mate_pos_1based.saturating_sub(leading_soft),
-        mate_pos_1based.saturating_add(ref_len).saturating_add(trailing_soft) - 1,
+        mate_pos_1based.saturating_sub(1).saturating_add(ref_len).saturating_add(trailing_soft),
     ))
 }
 
@@ -247,9 +255,10 @@ fn mate_soft_unclipped_from_ops(mate_pos_1based: i32, mate_ops: &[u32]) -> (i32,
     let leading_soft = i32::try_from(leading_soft_clip_from_ops(mate_ops)).unwrap_or(i32::MAX);
     let trailing_soft = i32::try_from(trailing_soft_clip_from_ops(mate_ops)).unwrap_or(i32::MAX);
     let ref_len = reference_length_from_cigar(mate_ops);
+    // The inclusive-end `-1` is applied first; see `mate_soft_unclipped_from_mc`.
     (
         mate_pos_1based.saturating_sub(leading_soft),
-        mate_pos_1based.saturating_add(ref_len).saturating_add(trailing_soft) - 1,
+        mate_pos_1based.saturating_sub(1).saturating_add(ref_len).saturating_add(trailing_soft),
     )
 }
 
@@ -502,7 +511,7 @@ mod tests {
 
     /// A crafted (valid-UTF-8) MC-tag CIGAR with an op length that saturates
     /// `ref_len` must not overflow the boundary arithmetic
-    /// (`mate_pos_1based + ref_len + trailing_soft - 1`). Pre-fix this panicked in
+    /// (`mate_pos_1based - 1 + ref_len + trailing_soft`). Pre-fix this panicked in
     /// debug/test and wrapped to a bogus negative boundary in release, corrupting
     /// the overlap-clip amount. A well-formed BAM cannot reach this (real ref
     /// lengths are chromosome-bounded), but the MC Z-string is never length-checked.
@@ -512,7 +521,46 @@ mod tests {
         let (start, end) = bounds.expect("well-formed (if oversized) CIGAR parses");
         assert_eq!(start, 100, "no leading soft clip -> start stays at mate_pos");
         assert!(end >= start, "end boundary must stay >= start, not wrap negative");
-        assert_eq!(end, i32::MAX - 1, "saturated ref_len clamps the end boundary");
+        assert_eq!(end, i32::MAX, "saturated ref_len clamps the end boundary");
+    }
+
+    /// The inclusive-end `-1` must be applied before the saturating additions, in
+    /// both mate-boundary helpers.
+    ///
+    /// Applied last it saturates the sum to `i32::MAX` and then walks it back, so a
+    /// boundary whose exact value *is* `i32::MAX` was reported as `i32::MAX - 1` --
+    /// clamping the fail-closed boundary inward by one base rather than outward.
+    /// This is the `overlap.rs` sibling of `cigar::unclipped_other_end`.
+    #[rstest]
+    // Exact ceiling, no saturation warranted: MAX + 1M - 1 == MAX.
+    #[case::from_mc_exactly_max(mate_soft_unclipped_from_mc(i32::MAX, "1M"), i32::MAX)]
+    // Genuinely past the ceiling: clamping outward to MAX is correct.
+    #[case::from_mc_past_max(mate_soft_unclipped_from_mc(i32::MAX, "10M"), i32::MAX)]
+    // The ordinary case must be untouched by the reordering: 100 + 10 - 1 == 109.
+    #[case::from_mc_ordinary(mate_soft_unclipped_from_mc(100, "10M"), 109)]
+    // A trailing soft clip still extends the boundary: 100 + 10 + 5 - 1 == 114.
+    #[case::from_mc_trailing_soft(mate_soft_unclipped_from_mc(100, "10M5S"), 114)]
+    fn mate_soft_unclipped_end_applies_the_inclusive_minus_one_first(
+        #[case] bounds: Option<(i32, i32)>,
+        #[case] expected_end: i32,
+    ) {
+        let (_, end) = bounds.expect("well-formed CIGAR parses");
+        assert_eq!(end, expected_end);
+    }
+
+    /// Same contract for the mate-record-based helper, which shares the formula.
+    #[rstest]
+    #[case::exactly_max(i32::MAX, &[encode_op(0, 1)], i32::MAX)]
+    #[case::past_max(i32::MAX, &[encode_op(0, 10)], i32::MAX)]
+    #[case::ordinary(100, &[encode_op(0, 10)], 109)]
+    #[case::trailing_soft(100, &[encode_op(0, 10), encode_op(4, 5)], 114)]
+    fn mate_soft_unclipped_from_ops_applies_the_inclusive_minus_one_first(
+        #[case] mate_pos_1based: i32,
+        #[case] ops: &[u32],
+        #[case] expected_end: i32,
+    ) {
+        let (_, end) = mate_soft_unclipped_from_ops(mate_pos_1based, ops);
+        assert_eq!(end, expected_end);
     }
 
     /// A malformed MC CIGAR fails closed through the whole MC-tag boundary path:
@@ -544,7 +592,7 @@ mod tests {
         assert_eq!(start, 100, "no leading soft clip -> start stays at mate_pos");
         assert_eq!(
             end,
-            i32::MAX - 1,
+            i32::MAX,
             "oversized trailing soft clip clamps the boundary outward, not to a shrunken 109"
         );
     }
@@ -1118,7 +1166,7 @@ mod tests {
     /// `8 * (2^28 - 1) = 2_147_483_640` (just under `i32::MAX`, so `reference_length_from_cigar`
     /// itself does not overflow), and `this_pos (101) + ref_len` then exceeds `i32::MAX` — a plain
     /// subtraction would panic in debug / wrap in release. The saturating computation instead
-    /// clamps `alignment_end` to `i32::MAX - 1`, which still exceeds the mate's unclipped end (210),
+    /// clamps `alignment_end` to `i32::MAX`, which still exceeds the mate's unclipped end (210),
     /// so the read is measured to extend past the mate by `read_length - 110` bases.
     #[test]
     fn test_num_bases_extending_past_mate_raw_oversized_ref_cigar_saturates() {
