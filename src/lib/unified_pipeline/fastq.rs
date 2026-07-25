@@ -2504,6 +2504,70 @@ fn drain_exhausted_stream<R: BufRead + Send, P: Send + MemoryEstimate>(
     DrainResult::Ok { did_work, batches_this_call }
 }
 
+/// Whether `BlockMerge` has nothing left to do and may declare the pipeline done.
+///
+/// Completion is only safe when every parsed block has been *consumed*, not
+/// merely produced, so all three holding places must be empty at once:
+///
+/// - `q2_block_parsed` — blocks pushed but not yet drained into the pending maps;
+/// - `merge` — the pending maps, surplus records and cross-block suffix bytes;
+/// - `held_parsed` — a merged batch the worker could not push downstream.
+///
+/// Checking the counters alone is *not* sufficient, and omitting the
+/// `q2_block_parsed` term strands blocks: `BlockMerge`'s drain loop can observe
+/// a momentarily empty queue, `BlockParseFast` can then push the last blocks and
+/// bring `chunks_block_parsed` level with `batches_read`, and this predicate
+/// would report completion with those blocks still queued. Nothing pops them
+/// afterwards — `BlockParseFast` returns early once `block_merge_done` is set —
+/// so the run stalls until the deadlock detector fires.
+///
+/// The queue check is sound because `BlockParseFast` pushes *before* it counts
+/// (with a `Release` increment), and deliberately does not count a block it is
+/// still holding. Observing `chunks_block_parsed == batches_read` through an
+/// `Acquire` load therefore happens-after every one of those pushes, so each
+/// pushed block is visible to this thread. Reading the queue *after* that load —
+/// `&&` sequences its operands left to right — means an empty queue can only mean
+/// the blocks were drained, never that they had not landed yet.
+///
+/// `held_parsed_is_none` is only the *calling* worker's held slot, so another
+/// worker can hold a merged batch while this one declares completion. That is
+/// benign here, unlike the equivalent in `bam.rs`'s `FindBoundaries`, which needs a
+/// globally visible count: the held batch is pushed at Priority 1 before the
+/// `block_merge_done` early-return can strand it,
+/// [`FastqPipelineState::is_complete`] separately requires the output queues to be
+/// empty, and the BGZF path skips `Group` entirely, so there is no one-way
+/// `finished` latch to trip.
+fn block_merge_is_complete<R: BufRead + Send, P: Send + MemoryEstimate>(
+    state: &FastqPipelineState<R, P>,
+    merge: &BlockMergeState,
+    held_parsed_is_none: bool,
+) -> bool {
+    state.read_done.load(Ordering::Acquire)
+        && state.chunks_block_parsed.load(Ordering::Acquire)
+            == state.batches_read.load(Ordering::Acquire)
+        // Must be observed *after* the counter load above — see the doc comment.
+        && state.q2_block_parsed.is_empty()
+        && merge.is_empty()
+        && held_parsed_is_none
+}
+
+/// Publishes `BlockMerge`'s completion flags if [`block_merge_is_complete`] holds.
+///
+/// Both of `BlockMerge`'s exits end in the same three stores, and the drift between
+/// its two completion *conditions* is what stranded blocks in the first place, so
+/// condition and action are kept together in one place rather than repeated.
+fn finish_block_merge_if_complete<R: BufRead + Send, P: Send + MemoryEstimate>(
+    state: &FastqPipelineState<R, P>,
+    merge: &BlockMergeState,
+    worker: &FastqWorkerState<P>,
+) {
+    if block_merge_is_complete(state, merge, worker.held_parsed.is_none()) {
+        state.block_merge_done.store(true, Ordering::Release);
+        state.parse_done.store(true, Ordering::Release);
+        state.group_done.store(true, Ordering::Release);
+    }
+}
+
 /// `BlockMerge` step: serial step that assembles `BlockParsed` items into
 /// `FastqTemplate`s and pushes them to the output groups queue.
 ///
@@ -2593,14 +2657,7 @@ fn fastq_try_step_block_merge<R: BufRead + Send, P: Send + MemoryEstimate>(
     }
     if drained == 0 && merge.r1_pending.is_empty() && merge.r2_pending.is_empty() {
         // Nothing to do. Check for completion.
-        let all_chunks_block_parsed = state.read_done.load(Ordering::Acquire)
-            && state.chunks_block_parsed.load(Ordering::Acquire)
-                == state.batches_read.load(Ordering::Acquire);
-        if all_chunks_block_parsed && merge.is_empty() {
-            state.block_merge_done.store(true, Ordering::Release);
-            state.parse_done.store(true, Ordering::Release);
-            state.group_done.store(true, Ordering::Release);
-        }
+        finish_block_merge_if_complete(state, &merge, worker);
         return (did_work, false);
     }
 
@@ -2811,23 +2868,7 @@ fn fastq_try_step_block_merge<R: BufRead + Send, P: Send + MemoryEstimate>(
     }
 
     // Check for completion: all chunks processed, queue drained, and merge state empty.
-    let all_chunks_block_parsed = state.read_done.load(Ordering::Acquire)
-        && state.chunks_block_parsed.load(Ordering::Acquire)
-            == state.batches_read.load(Ordering::Acquire);
-    if all_chunks_block_parsed
-        && state.q2_block_parsed.is_empty()
-        && merge.r1_pending.is_empty()
-        && merge.r2_pending.is_empty()
-        && merge.r1_surplus.is_empty()
-        && merge.r2_surplus.is_empty()
-        && merge.r1_suffix_bytes.is_empty()
-        && merge.r2_suffix_bytes.is_empty()
-        && worker.held_parsed.is_none()
-    {
-        state.block_merge_done.store(true, Ordering::Release);
-        state.parse_done.store(true, Ordering::Release);
-        state.group_done.store(true, Ordering::Release);
-    }
+    finish_block_merge_if_complete(state, &merge, worker);
 
     (did_work, false)
 }
@@ -5392,6 +5433,56 @@ mod tests {
         // Block 0 must be processed first (BTreeMap ordering by key).
         let first_key = *state.r1_pending.keys().next().unwrap();
         assert_eq!(first_key, 0, "BTreeMap must yield block 0 first");
+    }
+
+    /// `BlockMerge` may only declare completion when every parsed block has been
+    /// *consumed*, so each of the three places a block can sit must independently
+    /// veto completion.
+    ///
+    /// `blocks_still_queued` is the regression — it stalled the run until the deadlock
+    /// detector fired (`Q2b=2, merged=0, block_merge_done=true`). See
+    /// [`block_merge_is_complete`] for why a counters-only predicate strands blocks.
+    #[rstest]
+    #[case::all_drained(true, true, false, false, false, true)]
+    #[case::blocks_still_queued(true, true, true, false, false, false)]
+    #[case::counters_behind(true, false, false, false, false, false)]
+    #[case::reader_still_going(false, true, false, false, false, false)]
+    #[case::merge_state_pending(true, true, false, true, false, false)]
+    #[case::batch_held_downstream(true, true, false, false, true, false)]
+    fn test_block_merge_completion_requires_every_block_consumed(
+        #[case] read_done: bool,
+        #[case] counters_caught_up: bool,
+        #[case] blocks_queued: bool,
+        #[case] merge_pending: bool,
+        #[case] batch_held: bool,
+        #[case] expected_complete: bool,
+    ) {
+        let state = make_fastq_state();
+        let mut merge = BlockMergeState::new();
+
+        // `read_done` plus a counter level with `batches_read` is what tells
+        // BlockMerge that no further blocks will ever be produced.
+        state.read_done.store(read_done, Ordering::Release);
+        state.batches_read.store(2, Ordering::Release);
+        state.chunks_block_parsed.store(if counters_caught_up { 2 } else { 1 }, Ordering::Release);
+
+        if blocks_queued {
+            let block =
+                make_block_parsed(0, 0, vec![make_record("r1", "ACGT", "IIII")], vec![], vec![]);
+            state.q2_block_parsed.push(block).expect("queue has capacity");
+        }
+        if merge_pending {
+            merge.r1_pending.insert(
+                0,
+                make_block_parsed(0, 0, vec![make_record("r1", "ACGT", "IIII")], vec![], vec![]),
+            );
+        }
+
+        assert_eq!(
+            block_merge_is_complete(&state, &merge, !batch_held),
+            expected_complete,
+            "completion must require an empty queue, empty merge state and no held batch"
+        );
     }
 
     #[test]
