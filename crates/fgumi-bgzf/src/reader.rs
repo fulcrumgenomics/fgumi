@@ -39,7 +39,10 @@ use std::io::{self, Read};
 // ============================================================================
 
 /// Size of the BGZF block header.
-pub const BGZF_HEADER_SIZE: usize = 18;
+///
+/// Re-exported from [`crate::header`], which owns the layout this reader frames
+/// blocks with, so the constant and the field offsets cannot drift apart.
+pub use crate::header::BGZF_HEADER_SIZE;
 
 /// Size of the BGZF block footer (CRC32 + ISIZE).
 pub const BGZF_FOOTER_SIZE: usize = 8;
@@ -173,53 +176,34 @@ fn read_raw_block<R: Read + ?Sized>(reader: &mut R) -> io::Result<Option<RawBgzf
     }
     reader.read_exact(&mut header[1..])?;
 
-    // Validate gzip magic bytes
-    if header[0] != 0x1f || header[1] != 0x8b {
+    // One predicate for every reader, so a header this accepts is one the input
+    // classifier and `noodles_bgzf` accept too. This is stricter than the checks
+    // that used to live here, which took `FLG & FEXTRA` and never looked at XLEN
+    // or SLEN at all. A `BC`-first header with a trailing subfield (XLEN 10) was
+    // framed happily — `BSIZE` is still at 16-17 in that layout — and the four
+    // extra bytes then rode into the payload, which every consumer takes as
+    // `[18 .. len - 8]`. The failure surfaced downstream as `BGZF stored block
+    // size mismatch: LEN=89, payload=16`, a message about stored-block internals
+    // that says nothing about the header being the problem.
+    // The rejection is carried, not stringified: `HeaderRejection` is an
+    // `std::error::Error`, so passing it whole keeps it reachable through
+    // `source()` / `downcast_ref` for a caller that wants the failing field
+    // programmatically. `io::Error`'s `Display` delegates to it, so the rendered
+    // message is unchanged.
+    crate::header::validate(&header)
+        .map_err(|rejection| io::Error::new(io::ErrorKind::InvalidData, rejection))?;
+
+    // BSIZE is the total block size minus one, and must be big enough to describe
+    // a header plus a footer — see `block_size_checked`, which is the one
+    // definition of that floor.
+    let Some(block_size) = crate::header::block_size_checked(&header) else {
+        let stored = crate::header::block_size(&header)
+            .expect("a validated header is long enough to carry BSIZE");
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "Invalid BGZF magic: expected 0x1f 0x8b, got 0x{:02x} 0x{:02x}",
-                header[0], header[1]
-            ),
+            format!("BGZF block too small: {stored} bytes"),
         ));
-    }
-
-    // Validate compression method (deflate)
-    if header[2] != 0x08 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Invalid compression method: expected 0x08, got 0x{:02x}", header[2]),
-        ));
-    }
-
-    // Validate FEXTRA flag
-    if header[3] & 0x04 == 0 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "BGZF block missing FEXTRA flag"));
-    }
-
-    // Validate BC subfield identifier
-    if header[12] != b'B' || header[13] != b'C' {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Invalid BGZF subfield ID: expected 'BC', got '{}{}'",
-                header[12] as char, header[13] as char
-            ),
-        ));
-    }
-
-    // Get block size from BSIZE field (bytes 16-17, little-endian)
-    // BSIZE = total_block_size - 1
-    // BSIZE is u16, so block_size fits in usize on all platforms
-    let bsize = usize::from(u16::from_le_bytes([header[16], header[17]]));
-    let block_size = bsize + 1;
-
-    if block_size < BGZF_HEADER_SIZE + BGZF_FOOTER_SIZE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("BGZF block too small: {block_size} bytes"),
-        ));
-    }
+    };
 
     // Reserve exactly what the block needs and fill it, rather than
     // `vec![0u8; block_size]`, which memsets up to 64 KiB that is immediately
@@ -631,6 +615,33 @@ mod tests {
         let mut bytes = Vec::new();
         compressor.write_blocks_to(&mut bytes).expect("emit block bytes");
         bytes
+    }
+
+    /// A `BC`-first header with a trailing extra subfield must be rejected at the
+    /// header, not carried into the payload.
+    ///
+    /// RFC 1952 permits the second subfield, and `BSIZE` is still at bytes 16-17,
+    /// so the block used to *frame* correctly — the four extra bytes then rode
+    /// into the deflate payload, which this reader takes as `[18 .. len - 8]`,
+    /// and the run died downstream on `BGZF stored block size mismatch`, a
+    /// message about stored-block internals that named nothing about the header.
+    #[test]
+    fn test_read_raw_block_rejects_a_trailing_extra_subfield() {
+        let full = single_block_bytes(b"the quick brown fox");
+        let mut block = full[..10].to_vec(); // magic, CM, FLG, MTIME, XFL, OS
+        block.extend_from_slice(&10u16.to_le_bytes()); // XLEN = 10, was 6
+        block.extend_from_slice(&full[12..18]); // BC, SLEN, BSIZE — still first
+        block.extend_from_slice(b"XY"); // a foreign subfield behind `BC`
+        block.extend_from_slice(&0u16.to_le_bytes()); // ...of zero length
+        block.extend_from_slice(&full[18..]); // payload and footer
+
+        let err = read_raw_block(&mut Cursor::new(block))
+            .expect_err("a header whose extra field is not exactly `BC` must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "unexpected kind: {err}");
+        assert!(
+            err.to_string().contains("extra-field length"),
+            "the error must name the offending field, got: {err}"
+        );
     }
 
     /// `read_raw_block` reserves capacity and fills with `read_to_end` rather

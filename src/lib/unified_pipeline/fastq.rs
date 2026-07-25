@@ -37,6 +37,7 @@ use crate::fastq_parse::FastqRecord;
 use crate::grouper::FastqTemplate;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::ReorderBuffer;
+use fgumi_bgzf::{block_size as bgzf_block_size, block_size_checked as bgzf_block_size_checked};
 use libdeflater::Decompressor;
 
 use super::base::{
@@ -1039,8 +1040,12 @@ fn estimate_uncompressed_size(raw_data: &[u8]) -> usize {
     let mut offset = 0;
 
     while offset + BGZF_HEADER_SIZE + BGZF_FOOTER_SIZE <= raw_data.len() {
-        let bsize = u16::from_le_bytes([raw_data[offset + 16], raw_data[offset + 17]]) as usize;
-        let block_size = bsize + 1;
+        // Shared with the block reader so both the BSIZE offset and the minimum
+        // block size have one definition. The checked form matters here: a
+        // malformed BSIZE below the floor would underflow `offset + block_size - 4`
+        // and then index far out of bounds. This is only a capacity estimate, so
+        // stop summing and let `decompress_bgzf_chunk` report the malformed block.
+        let Some(block_size) = bgzf_block_size_checked(&raw_data[offset..]) else { break };
 
         if offset + block_size > raw_data.len() {
             break;
@@ -1078,9 +1083,26 @@ fn decompress_bgzf_chunk(raw_data: &[u8], decompressor: &mut Decompressor) -> io
             break; // Incomplete block at end
         }
 
-        // Parse BSIZE from header (bytes 16-17, little-endian)
-        let bsize = u16::from_le_bytes([raw_data[offset + 16], raw_data[offset + 17]]) as usize;
-        let block_size = bsize + 1;
+        // Parse the block's total size, via the same helper the block reader
+        // frames with. The header's *fields* were validated when the stream was
+        // classified and, for a streamed input, again per block by
+        // `read_raw_blocks`; re-checking them here would cost a branch per block
+        // to learn nothing new.
+        // The loop guard above already proved there are at least `BGZF_HEADER_SIZE`
+        // bytes left, so `None` here means the stored BSIZE is below the floor, not
+        // that the slice is short. Such a block holds no deflate payload at all and
+        // `decompress_block_slice_into` would no-op on it — silently dropping data
+        // instead of reporting corruption. This is the real decode, so error.
+        let Some(block_size) = bgzf_block_size_checked(&raw_data[offset..]) else {
+            let stored = bgzf_block_size(&raw_data[offset..]).unwrap_or(0);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "BGZF block too small: offset={offset}, block_size={stored}, minimum={}",
+                    fgumi_bgzf::MIN_BLOCK_SIZE
+                ),
+            ));
+        };
 
         // Validate block size
         if offset + block_size > raw_data.len() {
@@ -5566,6 +5588,47 @@ mod tests {
         assert!(
             bp.memory_drained,
             "memory_drained should be true after draining below low-water mark"
+        );
+    }
+
+    /// A BGZF header whose `BSIZE` is smaller than a header plus a footer must not
+    /// be trusted as a block length.
+    ///
+    /// `fgumi_bgzf::block_size` documents that it reads `BSIZE` without validating
+    /// it — the floor is the caller's job, which is why
+    /// `fgumi_bgzf::reader::read_raw_block` checks it explicitly. Both loops here
+    /// take the same unvalidated value, so a corrupt or malformed block claiming
+    /// `BSIZE = 0` (a 1-byte block) used to make `estimate_uncompressed_size`
+    /// compute `offset + 1 - 4`, which underflows `usize` and then indexes far out
+    /// of bounds — a crash driven purely by input bytes, on a streaming path.
+    ///
+    /// `estimate_uncompressed_size` only estimates a capacity and has no error
+    /// channel, so it stops summing; `decompress_bgzf_chunk` is the real decode and
+    /// must reject the block rather than silently skipping it.
+    #[test]
+    fn test_undersized_bgzf_block_size_is_rejected_not_trusted() {
+        // A structurally valid BGZF header (so `block_size` returns `Some`) whose
+        // BSIZE field says 0, i.e. a total block size of one byte.
+        let mut raw = vec![
+            0x1f, 0x8b, 0x08, 0x04, 0, 0, 0, 0, 0, 0xff, 0x06, 0x00, b'B', b'C', 0x02, 0x00,
+            /* BSIZE = 0 -> block_size = 1 */ 0x00, 0x00,
+        ];
+        // Pad past `BGZF_HEADER_SIZE + BGZF_FOOTER_SIZE` so both loops enter.
+        raw.extend_from_slice(&[0u8; 16]);
+
+        assert_eq!(
+            estimate_uncompressed_size(&raw),
+            0,
+            "an undersized BSIZE must stop the estimate, not underflow the ISIZE offset"
+        );
+
+        let mut decompressor = Decompressor::new();
+        let err = decompress_bgzf_chunk(&raw, &mut decompressor)
+            .expect_err("an undersized BSIZE must be rejected, not skipped");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("too small"),
+            "the error must name the undersized block, got: {err}"
         );
     }
 }

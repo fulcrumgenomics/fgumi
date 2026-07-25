@@ -708,6 +708,7 @@ dependencies = [
  "bytes",
  "criterion",
  "crossbeam-channel",
+ "fgumi-bgzf",
  "fgumi-raw-bam",
  "log",
  "nix",
