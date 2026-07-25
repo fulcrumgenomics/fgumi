@@ -22,7 +22,7 @@
 
 use crate::bgzf_io::{BlockOffset, StagingBuffer, io_writer_loop};
 use crate::codec::SpillCodec;
-use crate::worker_pool::{CompressResult, PermitPool, SortWorkerPool};
+use crate::worker_pool::{CompressResult, CompressTarget, PermitPool, SortWorkerPool};
 use anyhow::Result;
 use crossbeam_channel::{Receiver, bounded, unbounded};
 use fgumi_bam_io::BaiBuilder;
@@ -124,7 +124,15 @@ impl PooledBamWriter {
             io_writer_loop(writer, result_rx, buffer_pool, pp, SpillCodec::Bgzf, block_offset_tx)
         });
 
-        let mut staging = StagingBuffer::new(pool, result_tx, permit_pool, SpillCodec::Bgzf);
+        // `CompressTarget::Output`: every block this writer submits is the sort's
+        // output BAM and must be compressed at `output_compression`.
+        let mut staging = StagingBuffer::new(
+            pool,
+            result_tx,
+            permit_pool,
+            SpillCodec::Bgzf,
+            CompressTarget::Output,
+        );
 
         // Write BAM header into a temporary buffer then flush in BGZF-sized chunks.
         // Headers can exceed BGZF_MAX_BLOCK_SIZE; write_chunked handles the splitting.

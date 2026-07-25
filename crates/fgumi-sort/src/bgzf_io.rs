@@ -5,7 +5,9 @@
 //! accumulating data into ~64KB blocks before submitting compression jobs.
 
 use crate::codec::SpillCodec;
-use crate::worker_pool::{BufferPool, CompressJob, CompressResult, PermitPool, SortWorkerPool};
+use crate::worker_pool::{
+    BufferPool, CompressJob, CompressResult, CompressTarget, PermitPool, SortWorkerPool,
+};
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
 use fgumi_bgzf::{BGZF_EOF, BGZF_MAX_BLOCK_SIZE};
@@ -39,6 +41,10 @@ pub(crate) struct StagingBuffer {
     result_tx: Sender<CompressResult>,
     permit_pool: Arc<PermitPool>,
     codec: SpillCodec,
+    /// Stamped onto every job this buffer submits, so the worker that pops it
+    /// compresses at the level this writer asked for regardless of the pool's
+    /// phase at that moment.
+    target: CompressTarget,
 }
 
 impl StagingBuffer {
@@ -49,6 +55,7 @@ impl StagingBuffer {
         result_tx: Sender<CompressResult>,
         permit_pool: Arc<PermitPool>,
         codec: SpillCodec,
+        target: CompressTarget,
     ) -> Self {
         Self {
             pool,
@@ -57,6 +64,7 @@ impl StagingBuffer {
             result_tx,
             permit_pool,
             codec,
+            target,
         }
     }
 
@@ -123,6 +131,7 @@ impl StagingBuffer {
             serial,
             result_tx: self.result_tx.clone(),
             codec: self.codec,
+            target: self.target,
         });
         Ok(())
     }
@@ -331,7 +340,13 @@ mod tests {
             io_writer_loop(writer, result_rx, buffer_pool, pp, codec, None)
         });
 
-        let mut staging = StagingBuffer::new(Arc::clone(&pool), result_tx, permit_pool, codec);
+        let mut staging = StagingBuffer::new(
+            Arc::clone(&pool),
+            result_tx,
+            permit_pool,
+            codec,
+            CompressTarget::Spill,
+        );
         staging.write_chunked(data).unwrap();
         staging.flush().unwrap();
         drop(staging); // closes result_tx senders → io_writer_loop exits
@@ -352,7 +367,13 @@ mod tests {
         let (result_tx, _result_rx) = pool.compress_result_channel();
         let permit_pool = make_permit_pool(&pool);
 
-        let mut staging = StagingBuffer::new(Arc::clone(&pool), result_tx, permit_pool, codec);
+        let mut staging = StagingBuffer::new(
+            Arc::clone(&pool),
+            result_tx,
+            permit_pool,
+            codec,
+            CompressTarget::Spill,
+        );
         // Flush with empty buffer: should not submit a compress job
         staging.flush().unwrap();
 
@@ -373,7 +394,13 @@ mod tests {
         let pool = Arc::new(SortWorkerPool::new(1, 1, 6, codec));
         let (result_tx, _result_rx) = pool.compress_result_channel();
         let permit_pool = make_permit_pool(&pool);
-        let mut staging = StagingBuffer::new(Arc::clone(&pool), result_tx, permit_pool, codec);
+        let mut staging = StagingBuffer::new(
+            Arc::clone(&pool),
+            result_tx,
+            permit_pool,
+            codec,
+            CompressTarget::Spill,
+        );
 
         assert!(!staging.is_full(), "empty buffer should not be full");
         staging.buf().extend(vec![0u8; BGZF_MAX_BLOCK_SIZE]);
@@ -404,7 +431,13 @@ mod tests {
             io_writer_loop(writer, result_rx, buffer_pool, pp, codec, None)
         });
 
-        let mut staging = StagingBuffer::new(Arc::clone(&pool), result_tx, permit_pool, codec);
+        let mut staging = StagingBuffer::new(
+            Arc::clone(&pool),
+            result_tx,
+            permit_pool,
+            codec,
+            CompressTarget::Spill,
+        );
         staging.write_chunked(&large).unwrap();
         staging.flush().unwrap();
         drop(staging);
@@ -452,9 +485,16 @@ mod tests {
             serial: 1,
             result_tx: result_tx.clone(),
             codec,
+            target: CompressTarget::Spill,
         });
         permit_pool.acquire().unwrap();
-        pool.submit_compress(CompressJob { data: data1, serial: 0, result_tx, codec });
+        pool.submit_compress(CompressJob {
+            data: data1,
+            serial: 0,
+            result_tx,
+            codec,
+            target: CompressTarget::Spill,
+        });
 
         // Wait for both compress results to be received by io_writer_loop
         io_handle.join().unwrap().unwrap();

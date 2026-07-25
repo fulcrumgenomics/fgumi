@@ -1679,32 +1679,25 @@ impl<K: RawSortKey + 'static> Phase2Guard<'_, K> {
 
     /// Release the drained merge sources, finalize the output, then leave Phase 2.
     ///
-    /// **The output must be finalized inside Phase 2.** Phase 2 is what puts
-    /// [`SortStep::CompressOutput`](crate::worker_pool::SortStep::CompressOutput)
-    /// on a worker's priority list, and that step is what selects
-    /// `output_compressor`. In `LEGACY` the only compress step workers schedule
-    /// is `CompressSpill`, so every output block still queued — plus the
-    /// writer's final flush — would be compressed at `temp_compression`, and the
-    /// tail of the BAM would silently ignore the caller's `output_compression`.
-    /// This method exists so that ordering cannot be got wrong at a call site:
-    /// `finish` runs between the source release and the return to `LEGACY`.
+    /// Releasing the sources first is the point: it keeps a slow `finish` from
+    /// holding the merge's file descriptors and per-file reorder buffers (a 2 MiB
+    /// `BufReader` per spill file) alive while it drains. Leaving Phase 2 last
+    /// then costs nothing, and keeps the pool's phase an accurate description of
+    /// what the pool is doing for as long as it is doing it.
     ///
-    /// Releasing the sources first is what keeps a slow `finish` from holding
-    /// the merge's file descriptors and per-file reorder buffers (a 2 MiB
-    /// `BufReader` per spill file) alive while it drains.
-    ///
-    /// The underlying coupling — "which compressor a block gets" being a
-    /// function of the pool's *global phase* rather than of the block's own
-    /// origin — is what makes this ordering load-bearing at all. Tagging each
-    /// `CompressJob` with its target at submit time would retire this contract
-    /// (and the mirror-image one on `set_phase`); that is a separate change.
+    /// Note what this ordering is *not* responsible for. The output's compression
+    /// level does not depend on it: each block carries its own
+    /// [`CompressTarget`](crate::worker_pool::CompressTarget), stamped by the
+    /// writer that produced it, so trailing output blocks are compressed at
+    /// `output_compression` whatever phase the pool is in when a worker pops
+    /// them. That was not always true — the compressor used to be selected from
+    /// the pool's phase at pop time, which is why finalizing after the return to
+    /// `LEGACY` silently wrote the tail of the BAM at `temp_compression`.
     ///
     /// Takes `self` by value: finalizing the output is the guard's terminal
-    /// operation, so a second call — which would run `finish` with the pool
-    /// already back in `LEGACY`, silently compressing the output at
-    /// `temp_compression` and reporting success — is a compile error rather than
-    /// a runtime check. The remaining `Drop` at the end of this method is a
-    /// no-op, since `deactivate` has already cleared `active`.
+    /// operation, so a second call is a compile error rather than a runtime
+    /// check. The `Drop` at the end of this method is a no-op, since
+    /// `deactivate` has already cleared `active`.
     fn finish_output<T>(mut self, finish: impl FnOnce() -> Result<T>) -> Result<T> {
         self.release_sources();
         let finished = finish();
@@ -1837,14 +1830,18 @@ impl RawExternalSorter {
     ///
     /// Every sort path calls this exactly once, immediately after ingest
     /// completes, to hand the pool over to Phase 2 and lift the active-worker cap
-    /// to `merge_threads`. Centralized here so the invariant cannot drift between
-    /// sort orders: it is precisely the transition whose omission left the
-    /// in-memory output writing at the wrong compression level.
+    /// to `merge_threads`. Centralized here so the transition cannot drift
+    /// between sort orders.
     ///
     /// Workers idled by the Phase-1 cap re-check within `MAX_BACKOFF_US`, so no
     /// explicit wake is needed; capped workers always drained their held items, so
-    /// raising the cap can never be required for correctness, only for width. The
-    /// phase half is what routes output blocks to `output_compressor` — see
+    /// raising the cap can never be required for correctness, only for width.
+    ///
+    /// Omitting this call once left in-memory sorts writing their output at
+    /// `temp_compression`, because the phase used to decide which compressor a
+    /// block went through. It no longer does — blocks carry their own
+    /// [`CompressTarget`](crate::worker_pool::CompressTarget) — so what the
+    /// phase buys now is Phase 2 scheduling and the wider worker cap. See
     /// [`SortWorkerPool::begin_phase2`].
     fn enter_output_phase(&self, pool: &SortWorkerPool) {
         pool.begin_phase2(self.phase2_threads());
@@ -3491,16 +3488,17 @@ impl RawExternalSorter {
     /// single-sourced and the two paths cannot drift. Returns the sources plus
     /// an RAII [`Phase2Guard`] (borrowing `pool`); callers finish through
     /// [`Phase2Guard::finish_output`], and `Drop` resets Phase 2 on any path
-    /// that does not get that far. Phase 2 is armed whether or not there are disk
-    /// chunks: it is what makes workers reach for `output_compressor`
-    /// (`SortStep::CompressOutput`) rather than the Phase 1 spill compressor, so
-    /// leaving an all-in-memory merge in Phase 1 would silently write the output
-    /// BAM at `temp_compression` and discard the caller's `output_compression`.
-    /// With no spill files `try_phase2_file_work` sees an empty file vector and
-    /// returns immediately, so the only Phase 2 work available is output
-    /// compression. The consumer is created only for disk sources — it drains the
-    /// pool's per-file reorder buffers, and there is nothing to drain when
-    /// everything is already in memory.
+    /// that does not get that far.
+    ///
+    /// Phase 2 is armed whether or not there are disk chunks: it is what lets
+    /// workers schedule `SortStep::Phase2FileWork` and reach the merge's
+    /// per-file reorder buffers. With no spill files `try_phase2_file_work` sees
+    /// an empty file vector and returns immediately, so the only work left is
+    /// compression — which is correct in any phase, since each block carries its
+    /// own [`CompressTarget`](crate::worker_pool::CompressTarget). The consumer
+    /// is created only for disk sources — it drains the pool's per-file reorder
+    /// buffers, and there is nothing to drain when everything is already in
+    /// memory.
     fn setup_phase2_merge<'a, K: RawSortKey + Default + 'static>(
         chunk_files: &[PathBuf],
         memory_chunks: MemorySources<K>,
@@ -3518,8 +3516,10 @@ impl RawExternalSorter {
         let sources = Self::build_chunk_sources::<K>(chunk_files, memory_chunks, pool)?;
         debug!("Merging from {} sources...", sources.len());
 
-        // Activate Phase 2 for the whole merge, spill files or not, so the output
-        // BAM is compressed at `output_compression` rather than `temp_compression`.
+        // Activate Phase 2 for the whole merge, spill files or not, so workers can
+        // schedule `SortStep::Phase2FileWork` and reach the per-file reorder
+        // buffers. Compression level is no longer a reason to arm it — each block
+        // carries its own `CompressTarget` and is compressed correctly in any phase.
         // The consumer is created only for disk sources: it holds an Arc snapshot of
         // the pool's per-file Phase 2 state — workers populate per-file reorder
         // buffers, the consumer pops from them. There is nothing to consume when
@@ -4827,19 +4827,22 @@ mod tests {
         }
     }
 
-    /// The output must be finalized while the pool is still in Phase 2.
+    /// The merge sources are released *before* the output is finalized, and the
+    /// pool leaves Phase 2 only *after*.
     ///
-    /// This is the invariant [`Phase2Guard::finish_output`] exists to enforce,
-    /// and the one the bug violated: the trailing output blocks are compressed
-    /// while the writer is being finished, and `CompressOutput` — the step that
-    /// selects `output_compressor` — is only on a worker's priority list in
-    /// Phase 2. Finalizing in `LEGACY` sends those blocks through the spill
-    /// compressor at `temp_compression`.
+    /// [`Phase2Guard::finish_output`] exists for the first half: a `finish` that
+    /// blocks draining the writer must not still be pinning the merge's file
+    /// descriptors and 2 MiB-per-chunk reorder buffers. So the observation is
+    /// made from *inside* the finalize closure, where the real writer's
+    /// `finish()` runs — not merely before and after it.
     ///
-    /// So the assertion is made from *inside* the finalize closure, where the
-    /// real writer's `finish()` would run — not merely before and after it.
+    /// The phase is checked in the same place, but note it is no longer
+    /// load-bearing for compression: blocks carry their own `CompressTarget`, so
+    /// the tail is written at `output_compression` in any phase. What it pins is
+    /// that the pool's phase still describes what the pool is doing while it is
+    /// doing it.
     #[test]
-    fn test_phase2_guard_finishes_output_while_still_in_phase2() {
+    fn test_phase2_guard_releases_sources_before_finalizing_output() {
         use crate::keys::RawCoordinateKey;
         use crate::worker_pool::phase;
 
@@ -4862,8 +4865,8 @@ mod tests {
         assert_eq!(
             observed,
             (phase::PHASE2, 0),
-            "the output must be finalized in Phase 2 (so its blocks are compressed at \
-             output_compression) with the drained spill files already unpublished"
+            "the output must be finalized with the drained spill files already unpublished, and \
+             before the pool leaves Phase 2"
         );
         // `finish_output` consumed the guard, so its `Drop` has already run — a
         // second deactivate must not have disturbed the phase it just set.

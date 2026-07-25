@@ -14,10 +14,14 @@
 //! # Design
 //!
 //! - **Phase-aware scheduling**: Workers check the current phase to pick eligible steps.
-//!   Phase 1: `DecompressInput` > `ReadInputBlocks` > `CompressSpill`.
+//!   Phase 1: `DecompressInput` > `ReadInputBlocks` > `Compress`.
 //!   Phase 2: `Phase2FileWork` (read+decompress the next block of any file that has
-//!   room in its reorder buffer) > `CompressOutput`.
-//! - **Per-worker state**: Each worker owns an `InlineBgzfCompressor`, a
+//!   room in its reorder buffer) > `Compress`.
+//!   The phase orders the steps; it never decides which *compressor* a block goes
+//!   through — that is carried per-job as a `CompressTarget`.
+//! - **Per-worker state**: Each worker owns two `InlineBgzfCompressor`s (one at
+//!   `temp_compression` for spill blocks, one at `output_compression` for output
+//!   blocks, selected by the job's `CompressTarget`), a
 //!   `libdeflater::Decompressor`, a `zstd::bulk::Compressor`, and a
 //!   `zstd::bulk::Decompressor` (the latter pair are used only when the
 //!   selected spill codec is `Zstd`). Per-worker contexts avoid cross-thread
@@ -133,11 +137,33 @@ const ZSTD_MAX_CLEVEL: u32 = 22;
 // Job and Result Types
 // ============================================================================
 
+/// Which of the pool's two compressors a queued block must go through, and so
+/// which compression level it is written at.
+///
+/// One `compress_queue` carries both spill and output blocks, so a worker
+/// popping a job has to know which kind it has. That is recorded here, at submit
+/// time, by the only code that knows it for certain — the staging buffer of the
+/// writer that produced the block. It is deliberately *not* inferred from the
+/// pool's current phase: the phase is shared mutable state that advances
+/// independently of what is already sitting in the queue, so inferring from it
+/// silently mis-compresses every block that outlives the transition (an output
+/// block popped in Phase 1 or `LEGACY` at `temp_compression`, a Phase 1 spill
+/// block popped after `begin_phase2` at `output_compression`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressTarget {
+    /// A Phase 1 spill chunk — compress at `temp_compression`.
+    Spill,
+    /// The sort's output BAM — compress at `output_compression`.
+    Output,
+}
+
 /// A compression job: compress uncompressed data into one compressed block.
 ///
 /// The codec determines the output framing:
 /// - `SpillCodec::Bgzf` produces one BGZF block (header + deflate + footer).
 /// - `SpillCodec::Zstd` produces `[u32 LE frame-len][zstd frame]`.
+///
+/// The target determines the compression *level* — see [`CompressTarget`].
 pub struct CompressJob {
     /// Uncompressed data to compress.
     pub data: Vec<u8>,
@@ -147,6 +173,8 @@ pub struct CompressJob {
     pub result_tx: Sender<CompressResult>,
     /// Codec to use when compressing.
     pub codec: SpillCodec,
+    /// Which compressor (and therefore which level) this block belongs to.
+    pub target: CompressTarget,
 }
 
 /// Result of a compression job.
@@ -188,17 +216,19 @@ pub enum SortStep {
     ReadInputBlocks = 0,
     /// Decompress input BGZF blocks during Phase 1.
     DecompressInput = 1,
-    /// Compress data for spill files during Phase 1.
-    CompressSpill = 2,
+    /// Compress one queued block — spill or output.
+    ///
+    /// There is a single `compress_queue`, so this is a single step. Which
+    /// compressor the popped block goes through is carried on the job as a
+    /// [`CompressTarget`], never derived from the step or the phase.
+    Compress = 2,
     /// Read+decompress one unit of work for some Phase 2 spill file (work-stealing).
     Phase2FileWork = 3,
-    /// Compress data for merge output during Phase 2.
-    CompressOutput = 4,
 }
 
 impl SortStep {
     /// Number of distinct sort steps.
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 4;
 
     /// Short label for display.
     #[must_use]
@@ -206,9 +236,8 @@ impl SortStep {
         match self {
             Self::ReadInputBlocks => "RdInp",
             Self::DecompressInput => "DecInp",
-            Self::CompressSpill => "CmpSpl",
+            Self::Compress => "Cmprs",
             Self::Phase2FileWork => "P2File",
-            Self::CompressOutput => "CmpOut",
         }
     }
 }
@@ -280,9 +309,8 @@ impl SortPipelineStats {
         let all_steps = [
             SortStep::ReadInputBlocks,
             SortStep::DecompressInput,
-            SortStep::CompressSpill,
+            SortStep::Compress,
             SortStep::Phase2FileWork,
-            SortStep::CompressOutput,
         ];
 
         for &step in &all_steps {
@@ -662,10 +690,10 @@ pub mod phase {
 /// # Phase-Aware Scheduling
 ///
 /// Workers check the current phase to determine eligible steps:
-/// - **Phase 1**: `DecompressInput` > `ReadInputBlocks` > `CompressSpill`
+/// - **Phase 1**: `DecompressInput` > `ReadInputBlocks` > `Compress`
 /// - **Phase 2**: `Phase2FileWork` (per-file work stealing: read next raw block
 ///   batch from any file with FIFO room, OR decompress the next queued raw
-///   block for any file whose reorder buffer has capacity) > `CompressOutput`
+///   block for any file whose reorder buffer has capacity) > `Compress`
 pub struct SortWorkerPool {
     // Shared pipeline state (visible to workers and main thread)
     shared: Arc<SharedPipelineState>,
@@ -918,10 +946,10 @@ fn get_sort_priorities(bp: &SortBackpressureState) -> &'static [SortStep] {
             } else if bp.compress_has_items && !bp.decompressed_input_low {
                 // Spill compression is the bottleneck (13.7s at t4). Drain compress
                 // while decompressed blocks are plentiful for the main thread.
-                &[SortStep::CompressSpill, SortStep::DecompressInput, SortStep::ReadInputBlocks]
+                &[SortStep::Compress, SortStep::DecompressInput, SortStep::ReadInputBlocks]
             } else {
                 // Default/starving: feed the main thread first, compress if available
-                &[SortStep::DecompressInput, SortStep::ReadInputBlocks, SortStep::CompressSpill]
+                &[SortStep::DecompressInput, SortStep::ReadInputBlocks, SortStep::Compress]
             }
         }
         phase::PHASE2 => {
@@ -931,13 +959,14 @@ fn get_sort_priorities(bp: &SortBackpressureState) -> &'static [SortStep] {
             // continue until all per-file reorder buffers empty.
             if bp.compress_has_items {
                 // Drain output compression while we can; it's the writer-side bottleneck.
-                &[SortStep::CompressOutput, SortStep::Phase2FileWork]
+                &[SortStep::Compress, SortStep::Phase2FileWork]
             } else {
-                &[SortStep::Phase2FileWork, SortStep::CompressOutput]
+                &[SortStep::Phase2FileWork, SortStep::Compress]
             }
         }
-        // Legacy/transition: compress only (drain any remaining jobs)
-        _ => &[SortStep::CompressSpill],
+        // Legacy/transition: compress only (drain any remaining jobs, of either
+        // kind — each carries its own `CompressTarget`).
+        _ => &[SortStep::Compress],
     }
 }
 
@@ -1372,7 +1401,7 @@ impl SortWorkerPool {
                         || (shared.input_eof.load(Ordering::Acquire)
                             && !shared.decompressed_input_done.load(Ordering::Acquire)))
             }
-            SortStep::CompressSpill | SortStep::CompressOutput => !shared.compress_queue.is_empty(),
+            SortStep::Compress => !shared.compress_queue.is_empty(),
             SortStep::Phase2FileWork => current_phase == phase::PHASE2,
         }
     }
@@ -1386,18 +1415,7 @@ impl SortWorkerPool {
         match step {
             SortStep::ReadInputBlocks => Self::try_read_input_blocks(shared, worker),
             SortStep::DecompressInput => Self::try_decompress_input(shared, worker),
-            // Bind the compressor to the dispatched step, not shared.phase, to avoid
-            // the race where a worker pops a spill job then set_phase(PHASE2) fires
-            // before the compressor is chosen, causing spill data to be compressed
-            // at the output level.
-            SortStep::CompressSpill => {
-                Self::try_compress(shared, &mut worker.compressor, &mut worker.zstd_compressor)
-            }
-            SortStep::CompressOutput => Self::try_compress(
-                shared,
-                &mut worker.output_compressor,
-                &mut worker.zstd_compressor,
-            ),
+            SortStep::Compress => Self::try_compress(shared, worker),
             SortStep::Phase2FileWork => Self::try_phase2_file_work(shared, worker),
         }
     }
@@ -1851,17 +1869,27 @@ impl SortWorkerPool {
 
     /// Try to pick up a compress job from the `ArrayQueue` (non-blocking).
     ///
-    /// The compressor is passed in by the caller (dispatched from `execute_step`)
-    /// so the choice is bound to the scheduled `SortStep`, not `shared.phase`.
-    /// This avoids the race where a worker pops a Phase-1 spill job and then
-    /// `set_phase(PHASE2)` fires before the compressor is selected.
-    fn try_compress(
-        shared: &SharedPipelineState,
-        bgzf_compressor: &mut InlineBgzfCompressor,
-        zstd_compressor: &mut ZstdCompressor<'static>,
-    ) -> StepResult {
+    /// The compressor is selected from the job's own [`CompressTarget`], which
+    /// the producing staging buffer stamped on it at submit time. Nothing about
+    /// this choice depends on shared mutable state, so a block is compressed at
+    /// the level its writer asked for no matter how long it waited in the queue
+    /// or which phase the pool is in when a worker gets to it.
+    ///
+    /// This is the third and final form of that selection. It was originally
+    /// read from `shared.phase` at pop time; that was narrowed to the dispatched
+    /// `SortStep` to close the window where `set_phase` fired between the pop
+    /// and the choice — but a step is still chosen from the phase, so blocks
+    /// that outlived a phase transition were still mis-compressed.
+    fn try_compress(shared: &SharedPipelineState, worker: &mut SortWorkerState) -> StepResult {
         let Some(job) = shared.compress_queue.pop() else {
             return StepResult::InputEmpty;
+        };
+        // Destructured so the BGZF compressor and the zstd one are borrowed as
+        // disjoint fields rather than through `worker` twice.
+        let SortWorkerState { compressor, output_compressor, zstd_compressor, .. } = worker;
+        let bgzf_compressor = match job.target {
+            CompressTarget::Spill => compressor,
+            CompressTarget::Output => output_compressor,
         };
         Self::handle_compress_job(shared, job, bgzf_compressor, zstd_compressor);
         StepResult::Success
@@ -1953,11 +1981,12 @@ impl SortWorkerPool {
     /// The current pipeline phase (see [`phase`]), the read counterpart to
     /// [`set_phase`](Self::set_phase).
     ///
-    /// The phase selects which compress step workers schedule — and therefore
-    /// which compressor the output blocks go through — so it is the observable
-    /// the Phase 2 teardown tests assert on. Workers read the phase constantly,
-    /// but no caller *outside* the pool needs it, so this accessor exists for
-    /// those tests.
+    /// The phase orders the steps workers schedule, and nothing else — notably
+    /// *not* which compressor a block goes through, which `try_compress` takes
+    /// from the job's own [`CompressTarget`]. It is the observable the Phase 2
+    /// teardown tests assert on. Workers read the phase constantly, but no
+    /// caller *outside* the pool needs it, so this accessor exists for those
+    /// tests.
     #[cfg(test)]
     pub(crate) fn current_phase(&self) -> u8 {
         self.shared.phase.load(Ordering::Acquire)
@@ -1976,17 +2005,19 @@ impl SortWorkerPool {
     /// Hand the pool over to Phase 2 once ingest is done, widening it to
     /// `active_workers`.
     ///
-    /// Both halves belong to the same transition and must happen together.
-    /// Widening alone was not enough: the phase is what makes workers schedule
-    /// [`SortStep::CompressOutput`], and that step is what selects
-    /// `output_compressor` over the Phase 1 spill compressor. A sort that stayed in
-    /// Phase 1 through its output write therefore compressed the output BAM at
-    /// `temp_compression`, silently discarding the caller's `output_compression`.
+    /// Both halves belong to the same transition and must happen together: the
+    /// phase is what makes workers schedule [`SortStep::Phase2FileWork`], and
+    /// widening is what gives them the threads to do it on.
     ///
     /// Call this once ingest has finished — after that point every remaining byte
-    /// the pool touches is merge input or output. Callers must not leave spill
-    /// compression outstanding: Phase 1 spill jobs still queued when the phase flips
-    /// would be picked up by `CompressOutput` and written at the output level.
+    /// the pool touches is merge input or output.
+    ///
+    /// The phase deliberately says nothing about *compression levels*. Each
+    /// queued block carries its own [`CompressTarget`], so spill jobs still
+    /// outstanding when the phase flips are compressed at `temp_compression`
+    /// regardless, and output blocks are compressed at `output_compression` even
+    /// if the pool has already left Phase 2. Callers used to owe this method a
+    /// drained spill queue for exactly that reason; they no longer do.
     pub fn begin_phase2(&self, active_workers: usize) {
         self.set_active_workers(active_workers);
         self.set_phase(phase::PHASE2);
@@ -2167,6 +2198,20 @@ impl SortWorkerPool {
                 out
             }
             SpillCodec::Zstd => {
+                // Unlike BGZF, there is one zstd compressor per worker, fixed at
+                // `temp_compression` — zstd is a spill-only codec (the output BAM
+                // is always BGZF, so `PooledBamWriter` always submits
+                // `SpillCodec::Bgzf`). An Output job reaching here would be
+                // compressed at the temp level, which is the silent wrong-level
+                // output this whole selection mechanism exists to prevent — so
+                // assert unconditionally rather than only in debug builds. The
+                // check is one compare on a `Copy` enum per spill block, inside
+                // the zstd arm, so the BGZF path never evaluates it.
+                assert_eq!(
+                    job.target,
+                    CompressTarget::Spill,
+                    "zstd is spill-only; its per-worker compressor is fixed at temp_compression"
+                );
                 // One self-contained zstd frame per job, length-prefixed so the
                 // reader can split frames without scanning the stream.
                 let frame =
@@ -2473,6 +2518,98 @@ mod tests {
         assert_eq!(stats.compress_jobs_submitted.load(Ordering::Relaxed), 42);
     }
 
+    /// A job's [`CompressTarget`] decides its compression level, in every phase.
+    ///
+    /// This is the invariant that replaced deriving the compressor from the
+    /// pool's phase at pop time. That derivation produced the same bug twice:
+    /// output blocks popped outside Phase 2 were written at `temp_compression`,
+    /// and Phase 1 spill blocks still queued when `begin_phase2` fired were
+    /// written at `output_compression`. Both are impossible if the level travels
+    /// with the block, so the phase is swept across all three values here and
+    /// must not change either result.
+    ///
+    /// `temp_compression = 0` and `output_compression = 9` make the two levels
+    /// separable by size on compressible data: a `Spill` job must stay at the
+    /// (larger) stored size and an `Output` job must come back compressed.
+    #[rstest]
+    #[case::legacy(phase::LEGACY)]
+    #[case::phase1(phase::PHASE1)]
+    #[case::phase2(phase::PHASE2)]
+    fn test_compress_target_decides_level_regardless_of_phase(#[case] phase_under_test: u8) {
+        // Compressible: 8 KiB of one byte shrinks to almost nothing at level 9.
+        let data = vec![b'A'; 8192];
+        let pool = SortWorkerPool::new(2, 0, 9, crate::codec::SpillCodec::Bgzf);
+        pool.set_phase(phase_under_test);
+
+        let compressed_len = |target: CompressTarget| {
+            let (result_tx, result_rx) = pool.compress_result_channel();
+            pool.submit_compress(CompressJob {
+                data: data.clone(),
+                serial: 0,
+                result_tx,
+                codec: SpillCodec::Bgzf,
+                target,
+            });
+            result_rx.recv().expect("compress result").compressed.len()
+        };
+
+        let spill_len = compressed_len(CompressTarget::Spill);
+        let output_len = compressed_len(CompressTarget::Output);
+
+        assert!(
+            spill_len > data.len(),
+            "a Spill job must be compressed at temp_compression=0 (stored), so it must not shrink \
+             below the {} input bytes; got {spill_len} in phase {phase_under_test}",
+            data.len()
+        );
+        assert!(
+            output_len < data.len() / 4,
+            "an Output job must be compressed at output_compression=9, so 8 KiB of one repeated \
+             byte must shrink far below a quarter of its size; got {output_len} in phase \
+             {phase_under_test}"
+        );
+
+        pool.shutdown();
+    }
+
+    /// zstd is spill-only, and `handle_compress_job` asserts that unconditionally.
+    ///
+    /// The assert is the backstop for the one target/codec combination the
+    /// per-job `CompressTarget` cannot express correctly: there is a single zstd
+    /// compressor per worker, fixed at `temp_compression`, so an `Output` job
+    /// arriving on the zstd arm would be written at the *spill* level — exactly
+    /// the silent wrong-level output this mechanism exists to prevent. Without a
+    /// test, a future output-zstd feature (or a mis-stamped call site) would only
+    /// trip it in production.
+    ///
+    /// `handle_compress_job` is called directly, on the test thread, rather than
+    /// through `submit_compress`: a panic on a pool worker unwinds only that
+    /// worker — its guard publishes `worker_panicked` and the unwind stops at the
+    /// thread boundary — so `#[should_panic]` would never observe it, and the
+    /// test would need a sleep just to reach the panic. Calling the handler
+    /// inline puts the assert on the test thread and makes it deterministic.
+    #[test]
+    #[should_panic(expected = "zstd is spill-only")]
+    fn test_zstd_output_job_trips_the_spill_only_assert() {
+        let shared = SharedPipelineState::new(1, std::thread::current());
+        let mut bgzf_compressor = InlineBgzfCompressor::new(0);
+        let mut zstd_compressor = ZstdCompressor::new(1).expect("zstd compressor init");
+        let (result_tx, _result_rx) = bounded(1);
+
+        SortWorkerPool::handle_compress_job(
+            &shared,
+            CompressJob {
+                data: vec![b'A'; 64],
+                serial: 0,
+                result_tx,
+                codec: SpillCodec::Zstd,
+                target: CompressTarget::Output,
+            },
+            &mut bgzf_compressor,
+            &mut zstd_compressor,
+        );
+    }
+
     #[test]
     fn test_pool_compress_roundtrip() {
         let pool = SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf);
@@ -2480,7 +2617,13 @@ mod tests {
 
         // Submit a compress job
         let data = vec![b'A'; 1000];
-        pool.submit_compress(CompressJob { data, serial: 0, result_tx, codec: SpillCodec::Bgzf });
+        pool.submit_compress(CompressJob {
+            data,
+            serial: 0,
+            result_tx,
+            codec: SpillCodec::Bgzf,
+            target: CompressTarget::Spill,
+        });
 
         // Wait for result
         let result = result_rx.recv().expect("should receive compress result");
@@ -2513,6 +2656,7 @@ mod tests {
                     serial: i as u64,
                     result_tx: submit_tx.clone(),
                     codec: SpillCodec::Bgzf,
+                    target: CompressTarget::Spill,
                 });
             }
             drop(submit_tx);
@@ -2552,10 +2696,10 @@ mod tests {
         // must bring those workers online — and because per-worker counts are
         // cumulative and they did nothing under the cap, any work they show after
         // the second batch was done exclusively in that batch.
-        let cs = SortStep::CompressSpill as usize;
+        let cs = SortStep::Compress as usize;
 
         // Run one batch on `pool` (moved in, returned out so the next batch can
-        // reuse it) and report the cumulative per-worker CompressSpill counts.
+        // reuse it) and report the cumulative per-worker Compress counts.
         // `cumulative_jobs` is the total submitted across all batches so far —
         // the counters are cumulative, so it is what they must settle at.
         let run_batch = |pool: SortWorkerPool,
@@ -2571,6 +2715,7 @@ mod tests {
                         serial: i as u64,
                         result_tx: submit_tx.clone(),
                         codec: SpillCodec::Bgzf,
+                        target: CompressTarget::Spill,
                     });
                 }
                 drop(submit_tx);
@@ -2659,6 +2804,7 @@ mod tests {
             serial: 0,
             result_tx: c_tx,
             codec: SpillCodec::Bgzf,
+            target: CompressTarget::Spill,
         });
         let _ = c_rx.recv();
 
@@ -2674,13 +2820,13 @@ mod tests {
         stats.record_step(0, SortStep::ReadInputBlocks, 1_000_000);
         stats.record_step(0, SortStep::ReadInputBlocks, 500_000);
         stats.record_step(1, SortStep::DecompressInput, 2_000_000);
-        stats.record_step(0, SortStep::CompressSpill, 300_000);
+        stats.record_step(0, SortStep::Compress, 300_000);
         stats.record_idle(0, 100_000);
         stats.record_idle(1, 200_000);
 
         let read_idx = SortStep::ReadInputBlocks as usize;
         let decomp_idx = SortStep::DecompressInput as usize;
-        let compress_idx = SortStep::CompressSpill as usize;
+        let compress_idx = SortStep::Compress as usize;
 
         assert_eq!(stats.step_count[read_idx].load(Ordering::Relaxed), 2);
         assert_eq!(stats.step_ns[read_idx].load(Ordering::Relaxed), 1_500_000);
@@ -2696,7 +2842,7 @@ mod tests {
     fn test_pipeline_stats_log_summary_does_not_panic() {
         let stats = SortPipelineStats::new(4);
         stats.record_step(0, SortStep::ReadInputBlocks, 1_000_000_000);
-        stats.record_step(1, SortStep::CompressSpill, 500_000_000);
+        stats.record_step(1, SortStep::Compress, 500_000_000);
         stats.record_idle(0, 10_000_000);
         // Verify log_summary doesn't panic (output goes to log, not captured in tests)
         stats.log_summary();
@@ -2748,7 +2894,7 @@ mod tests {
             phase: phase::PHASE1,
         };
         let priorities = get_sort_priorities(&bp);
-        assert_eq!(priorities[0], SortStep::CompressSpill);
+        assert_eq!(priorities[0], SortStep::Compress);
     }
 
     #[test]
@@ -2786,7 +2932,7 @@ mod tests {
             phase: phase::PHASE2,
         };
         let priorities = get_sort_priorities(&bp);
-        assert_eq!(priorities[0], SortStep::CompressOutput);
+        assert_eq!(priorities[0], SortStep::Compress);
     }
 
     #[test]
@@ -2815,7 +2961,7 @@ mod tests {
         };
         let priorities = get_sort_priorities(&bp);
         assert_eq!(priorities.len(), 1);
-        assert_eq!(priorities[0], SortStep::CompressSpill);
+        assert_eq!(priorities[0], SortStep::Compress);
     }
 
     #[test]
