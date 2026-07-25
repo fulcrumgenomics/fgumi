@@ -1643,15 +1643,20 @@ pub struct RawExternalSorter {
 }
 
 /// RAII guard that ensures Phase 2 teardown runs on every exit path between
-/// `pool.set_phase(PHASE2)` and the explicit `deactivate()` in the merge loop.
-/// Without this, any `?` early-return would leave the pool stuck in PHASE2 with
-/// `phase2_files` still published. `deactivate()` drops the consumer (releasing
-/// the Arc snapshot of the per-file vector), resets the phase to `LEGACY`, and
-/// clears the pool's published file vector — in that order.
+/// `pool.set_phase(PHASE2)` and the end of the merge. Without this, any `?`
+/// early-return would leave the pool stuck in PHASE2 with `phase2_files` still
+/// published.
+///
+/// Merges finish by handing the guard to
+/// [`finish_output`](Self::finish_output), which owns the whole teardown order —
+/// the merge is done with its *sources* well before it is done with the *pool*,
+/// and getting that order wrong is silent. `Drop` still deactivates, so a merge
+/// that fails before it gets that far tears down completely.
 struct Phase2Guard<'a, K: RawSortKey + 'static> {
     pool: &'a Arc<SortWorkerPool>,
     consumer: Option<MainThreadChunkConsumer<K>>,
     active: bool,
+    sources_released: bool,
 }
 
 impl<K: RawSortKey + 'static> Phase2Guard<'_, K> {
@@ -1663,11 +1668,57 @@ impl<K: RawSortKey + 'static> Phase2Guard<'_, K> {
         self.consumer.as_ref()
     }
 
+    /// Release the drained merge sources, finalize the output, then leave Phase 2.
+    ///
+    /// **The output must be finalized inside Phase 2.** Phase 2 is what puts
+    /// [`SortStep::CompressOutput`](crate::worker_pool::SortStep::CompressOutput)
+    /// on a worker's priority list, and that step is what selects
+    /// `output_compressor`. In `LEGACY` the only compress step workers schedule
+    /// is `CompressSpill`, so every output block still queued — plus the
+    /// writer's final flush — would be compressed at `temp_compression`, and the
+    /// tail of the BAM would silently ignore the caller's `output_compression`.
+    /// This method exists so that ordering cannot be got wrong at a call site:
+    /// `finish` runs between the source release and the return to `LEGACY`.
+    ///
+    /// Releasing the sources first is what keeps a slow `finish` from holding
+    /// the merge's file descriptors and per-file reorder buffers (a 2 MiB
+    /// `BufReader` per spill file) alive while it drains.
+    ///
+    /// The underlying coupling — "which compressor a block gets" being a
+    /// function of the pool's *global phase* rather than of the block's own
+    /// origin — is what makes this ordering load-bearing at all. Tagging each
+    /// `CompressJob` with its target at submit time would retire this contract
+    /// (and the mirror-image one on `set_phase`); that is a separate change.
+    ///
+    /// Takes `self` by value: finalizing the output is the guard's terminal
+    /// operation, so a second call — which would run `finish` with the pool
+    /// already back in `LEGACY`, silently compressing the output at
+    /// `temp_compression` and reporting success — is a compile error rather than
+    /// a runtime check. The remaining `Drop` at the end of this method is a
+    /// no-op, since `deactivate` has already cleared `active`.
+    fn finish_output<T>(mut self, finish: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.release_sources();
+        let finished = finish();
+        self.deactivate();
+        finished
+    }
+
+    /// Drop the consumer (releasing the Arc snapshot of the per-file vector) and
+    /// unpublish the spill files, while leaving the pool in Phase 2.
+    fn release_sources(&mut self) {
+        if self.active && !self.sources_released {
+            drop(self.consumer.take());
+            self.pool.clear_phase2_files();
+            self.sources_released = true;
+        }
+    }
+
+    /// Leave Phase 2 entirely: release the sources if that has not happened yet,
+    /// then return the pool to `LEGACY`.
     fn deactivate(&mut self) {
         if self.active {
-            drop(self.consumer.take());
+            self.release_sources();
             self.pool.set_phase(crate::worker_pool::phase::LEGACY);
-            self.pool.clear_phase2_files();
             self.active = false;
         }
     }
@@ -3429,8 +3480,9 @@ impl RawExternalSorter {
     /// Shared by both the plain ([`merge_chunks_generic`]) and indexed
     /// ([`merge_chunks_with_index`]) merges so the Phase-2 lifecycle is
     /// single-sourced and the two paths cannot drift. Returns the sources plus
-    /// an RAII [`Phase2Guard`] (borrowing `pool`) that resets Phase 2 on drop or
-    /// explicit `deactivate()`. Phase 2 is armed whether or not there are disk
+    /// an RAII [`Phase2Guard`] (borrowing `pool`); callers finish through
+    /// [`Phase2Guard::finish_output`], and `Drop` resets Phase 2 on any path
+    /// that does not get that far. Phase 2 is armed whether or not there are disk
     /// chunks: it is what makes workers reach for `output_compressor`
     /// (`SortStep::CompressOutput`) rather than the Phase 1 spill compressor, so
     /// leaving an all-in-memory merge in Phase 1 would silently write the output
@@ -3472,7 +3524,7 @@ impl RawExternalSorter {
             )
         });
         pool.set_phase(crate::worker_pool::phase::PHASE2);
-        let guard = Phase2Guard { pool, consumer, active: true };
+        let guard = Phase2Guard { pool, consumer, active: true, sources_released: false };
 
         Ok((sources, guard))
     }
@@ -3515,9 +3567,9 @@ impl RawExternalSorter {
 
         if initial_keys.is_empty() {
             debug!("Merge complete: 0 records merged");
-            guard.deactivate();
-            let writer = PooledBamWriter::new(Arc::clone(pool), output, &output_header)?;
-            writer.finish()?;
+            guard.finish_output(|| {
+                PooledBamWriter::new(Arc::clone(pool), output, &output_header)?.finish()
+            })?;
             return Ok(0);
         }
 
@@ -3588,11 +3640,6 @@ impl RawExternalSorter {
             }
         }
 
-        // Return to legacy mode before finishing writer (workers still need to compress).
-        // The guard's deactivate() drops the consumer, resets phase, and clears the
-        // pool's published file vector in the correct order.
-        guard.deactivate();
-
         if debug_timing {
             let loop_total = loop_start.elapsed().as_secs_f64();
             #[allow(clippy::cast_precision_loss)]
@@ -3606,7 +3653,7 @@ impl RawExternalSorter {
             );
         }
 
-        writer.finish()?;
+        guard.finish_output(|| writer.finish())?;
         merge_progress.log_final();
         log_snapshot("phase2.end", 0);
 
@@ -3651,9 +3698,10 @@ impl RawExternalSorter {
         }
 
         if initial_keys.is_empty() {
-            guard.deactivate();
-            let writer = PooledBamWriter::new_indexing(Arc::clone(pool), output, &output_header)?;
-            let index = writer.finish_index()?;
+            let index = guard.finish_output(|| {
+                PooledBamWriter::new_indexing(Arc::clone(pool), output, &output_header)?
+                    .finish_index()
+            })?;
             debug!("Merge complete: 0 records merged");
             return Ok(index);
         }
@@ -3679,13 +3727,7 @@ impl RawExternalSorter {
             }
         }
 
-        // Return the pool to legacy mode before finishing the writer — the
-        // workers still compress the trailing output blocks during
-        // finish_index() (CompressOutput is eligible whenever the queue is
-        // non-empty). Same ordering as merge_chunks_generic.
-        guard.deactivate();
-
-        let index = writer.finish_index()?;
+        let index = guard.finish_output(|| writer.finish_index())?;
         merge_progress.log_final();
         Ok(index)
     }
@@ -4706,6 +4748,231 @@ mod tests {
         assert!(names.is_empty());
         assert!(sorted.exists(), "empty-input sort must still produce an output file");
         assert_eq!(count_bam_records(&sorted), 0, "output must contain only the header");
+    }
+
+    // ========================================================================
+    // Phase 2 teardown: Phase2Guard::finish_output
+    // ========================================================================
+
+    /// Everything an empty-source merge needs: a sorter, its pool (already
+    /// handed over to Phase 2), the output header, and a temp dir holding one
+    /// spill chunk that decodes to zero records plus the output path.
+    ///
+    /// `_dir` is returned only to keep the temp dir alive for the caller's
+    /// lifetime; dropping it deletes both paths.
+    struct EmptyMergeFixture {
+        sorter: RawExternalSorter,
+        pool: Arc<SortWorkerPool>,
+        header: Header,
+        chunk: PathBuf,
+        output: PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    /// Builds an [`EmptyMergeFixture`].
+    ///
+    /// A real Phase 1 checks its spill trigger only after pushing a record, so
+    /// it never writes an empty chunk and the "every source is empty" merge
+    /// branch is unreachable from `sort()`. Handing the merge a chunk that holds
+    /// nothing but a BGZF EOF block is the way to drive that branch directly,
+    /// and it is the shape `consolidate_chunks` emits for a zero-record run.
+    ///
+    /// No compression setting is configured, because none affects these tests:
+    /// the read side derives the chunk's codec from its magic bytes
+    /// (`SortWorkerPool::set_phase2_files`) rather than from `spill_codec`, and
+    /// the assertions are on the pipeline phase and the record count, not on
+    /// output size. `threads` is set because it sizes the pool.
+    fn empty_merge_fixture() -> EmptyMergeFixture {
+        use crate::keys::RawCoordinateKey;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let chunk = dir.path().join("empty.chunk");
+        GenericKeyedChunkWriter::<RawCoordinateKey>::create(
+            &chunk, /* compression_level */ 1, /* num_threads */ 1,
+        )
+        .expect("create empty chunk")
+        .finish()
+        .expect("finish empty chunk");
+
+        let sorter = RawExternalSorter::new(SortOrder::Coordinate).threads(2);
+        let pool = sorter.create_worker_pool().expect("worker pool");
+        sorter.enter_output_phase(&pool);
+
+        EmptyMergeFixture {
+            sorter,
+            pool,
+            header: default_merge_header(),
+            output: dir.path().join("output.bam"),
+            chunk,
+            _dir: dir,
+        }
+    }
+
+    /// The output must be finalized while the pool is still in Phase 2.
+    ///
+    /// This is the invariant [`Phase2Guard::finish_output`] exists to enforce,
+    /// and the one the bug violated: the trailing output blocks are compressed
+    /// while the writer is being finished, and `CompressOutput` — the step that
+    /// selects `output_compressor` — is only on a worker's priority list in
+    /// Phase 2. Finalizing in `LEGACY` sends those blocks through the spill
+    /// compressor at `temp_compression`.
+    ///
+    /// So the assertion is made from *inside* the finalize closure, where the
+    /// real writer's `finish()` would run — not merely before and after it.
+    #[test]
+    fn test_phase2_guard_finishes_output_while_still_in_phase2() {
+        use crate::keys::RawCoordinateKey;
+        use crate::worker_pool::phase;
+
+        let fixture = empty_merge_fixture();
+        let pool = &fixture.pool;
+        let (_sources, guard) = RawExternalSorter::setup_phase2_merge::<RawCoordinateKey>(
+            std::slice::from_ref(&fixture.chunk),
+            MemorySources::Shared(Vec::new()),
+            pool,
+        )
+        .expect("setup phase 2");
+
+        assert_eq!(pool.current_phase(), phase::PHASE2, "setup must arm Phase 2");
+        assert_eq!(pool.phase2_files().len(), 1, "the disk source must be published");
+
+        let observed = guard
+            .finish_output(|| Ok((pool.current_phase(), pool.phase2_files().len())))
+            .expect("finish_output must propagate the closure's Ok");
+
+        assert_eq!(
+            observed,
+            (phase::PHASE2, 0),
+            "the output must be finalized in Phase 2 (so its blocks are compressed at \
+             output_compression) with the drained spill files already unpublished"
+        );
+        // `finish_output` consumed the guard, so its `Drop` has already run — a
+        // second deactivate must not have disturbed the phase it just set.
+        assert_eq!(
+            pool.current_phase(),
+            phase::LEGACY,
+            "finish_output must return the pool to LEGACY once the output is done"
+        );
+    }
+
+    /// A failing finalizer still hands the pool back in `LEGACY` with the spill
+    /// files unpublished, and the error still reaches the caller unwrapped.
+    ///
+    /// A writer that fails mid-`finish` is the one exit the merge cannot retry,
+    /// so the pool it leaves behind is what the rest of the sort — and the
+    /// pool's own shutdown — has to cope with. Because
+    /// [`Phase2Guard::finish_output`] consumes the guard, the reset here is
+    /// guaranteed twice over (explicitly, then by `Drop` as the method returns);
+    /// this pins the resulting contract rather than either mechanism.
+    #[test]
+    fn test_phase2_guard_finish_output_resets_phase_on_error() {
+        use crate::keys::RawCoordinateKey;
+        use crate::worker_pool::phase;
+
+        let fixture = empty_merge_fixture();
+        let pool = &fixture.pool;
+        let (_sources, guard) = RawExternalSorter::setup_phase2_merge::<RawCoordinateKey>(
+            std::slice::from_ref(&fixture.chunk),
+            MemorySources::Shared(Vec::new()),
+            pool,
+        )
+        .expect("setup phase 2");
+
+        let failed =
+            guard.finish_output(|| -> Result<()> { Err(anyhow::anyhow!("writer blew up")) });
+
+        assert!(failed.is_err(), "finish_output must propagate the finalizer's error");
+        assert_eq!(
+            failed.unwrap_err().to_string(),
+            "writer blew up",
+            "the finalizer's own error must reach the caller, not a wrapped one"
+        );
+        assert_eq!(
+            pool.current_phase(),
+            phase::LEGACY,
+            "a failed finalize must still return the pool to LEGACY"
+        );
+        assert!(
+            pool.phase2_files().is_empty(),
+            "a failed finalize must still unpublish the spill files"
+        );
+    }
+
+    /// A merge whose every source is empty writes a header-only BAM and still
+    /// hands the pool back in `LEGACY`.
+    ///
+    /// This early-return branch finalizes its writer through the same
+    /// [`Phase2Guard::finish_output`] as the main loop, so it has the same way
+    /// to go wrong.
+    #[test]
+    fn test_merge_chunks_generic_with_only_empty_sources() {
+        use crate::keys::RawCoordinateKey;
+        use crate::worker_pool::phase;
+
+        let fixture = empty_merge_fixture();
+        let merged = fixture
+            .sorter
+            .merge_chunks_generic::<RawCoordinateKey>(
+                std::slice::from_ref(&fixture.chunk),
+                MemorySources::Shared(Vec::new()),
+                &fixture.header,
+                &fixture.output,
+                0,
+                &fixture.pool,
+            )
+            .expect("empty merge should succeed");
+
+        assert_eq!(merged, 0, "an all-empty merge must report zero records merged");
+        assert_eq!(
+            count_bam_records(&fixture.output),
+            0,
+            "output must hold the header and nothing else"
+        );
+        assert_eq!(
+            fixture.pool.current_phase(),
+            phase::LEGACY,
+            "the merge must hand the pool back in LEGACY"
+        );
+        assert!(fixture.pool.phase2_files().is_empty(), "the merge must unpublish the spill files");
+    }
+
+    /// The indexed counterpart of
+    /// [`test_merge_chunks_generic_with_only_empty_sources`]: the BAI still has
+    /// to be built and cover every reference, even with no records to index.
+    #[test]
+    fn test_merge_chunks_with_index_with_only_empty_sources() {
+        use crate::keys::RawCoordinateKey;
+        use crate::worker_pool::phase;
+
+        let fixture = empty_merge_fixture();
+        let index = fixture
+            .sorter
+            .merge_chunks_with_index::<RawCoordinateKey>(
+                std::slice::from_ref(&fixture.chunk),
+                MemorySources::Shared(Vec::new()),
+                &fixture.header,
+                &fixture.output,
+                0,
+                &fixture.pool,
+            )
+            .expect("empty indexed merge should succeed");
+
+        assert_eq!(
+            count_bam_records(&fixture.output),
+            0,
+            "output must hold the header and nothing else"
+        );
+        assert_eq!(
+            index.reference_sequences().len(),
+            fixture.header.reference_sequences().len(),
+            "the index must cover every reference sequence even with no records"
+        );
+        assert_eq!(
+            fixture.pool.current_phase(),
+            phase::LEGACY,
+            "the indexed merge must hand the pool back in LEGACY"
+        );
+        assert!(fixture.pool.phase2_files().is_empty(), "the merge must unpublish the spill files");
     }
 
     // ========================================================================

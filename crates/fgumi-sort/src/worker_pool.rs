@@ -1950,6 +1950,19 @@ impl SortWorkerPool {
         self.shared.phase.store(new_phase, Ordering::Release);
     }
 
+    /// The current pipeline phase (see [`phase`]), the read counterpart to
+    /// [`set_phase`](Self::set_phase).
+    ///
+    /// The phase selects which compress step workers schedule — and therefore
+    /// which compressor the output blocks go through — so it is the observable
+    /// the Phase 2 teardown tests assert on. Workers read the phase constantly,
+    /// but no caller *outside* the pool needs it, so this accessor exists for
+    /// those tests.
+    #[cfg(test)]
+    pub(crate) fn current_phase(&self) -> u8 {
+        self.shared.phase.load(Ordering::Acquire)
+    }
+
     /// Cap the number of workers active in the current phase to `n` (clamped to
     /// `[1, num_workers]`). Workers with `worker_id >= n` idle until the limit is
     /// raised. Used to run Phase 1 on fewer threads than Phase 2; raising the
