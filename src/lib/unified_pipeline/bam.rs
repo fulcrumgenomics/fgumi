@@ -2031,6 +2031,46 @@ fn try_step_decompress<G: Send, P: Send + MemoryEstimate>(
     }
 }
 
+/// Whether `FindBoundaries` has consumed all its input and pushed all its output,
+/// and so may set `boundary_done`.
+///
+/// Two things must hold, and the second is easy to miss.
+///
+/// **All input consumed.** `batches_boundary_processed == next_read_serial` implies
+/// `Decompress` also finished, since no more can be processed than was
+/// decompressed, so this also rules out data still sitting in `q2_decompressed`.
+///
+/// **No output still outstanding.** `batches_boundary_processed` is incremented
+/// when a batch is popped from `q2_reorder` — *before* its boundaries are pushed —
+/// so a batch whose push failed is already counted as processed while it waits in
+/// some worker's `held_boundaries`, in no queue and invisible to the other workers.
+/// Setting `boundary_done` there lets `Group` finish on
+/// `batches_grouped == batches_boundary_found`, which excludes that batch, and latch
+/// its one-way `finished` flag; the batch is then pushed and decoded, and reaches an
+/// already-finalized grouper.
+///
+/// `next_boundary_serial == batches_boundary_found` is what rules that out. A serial
+/// is minted only immediately before a push is attempted, and
+/// `batches_boundary_found` is incremented only when a push succeeds (including the
+/// retry of a held batch, which reuses its serial rather than minting a new one), so
+/// the two are equal exactly when nothing is outstanding. Note this cannot be done
+/// with `batches_boundary_processed`: a batch with no records is counted as processed
+/// but mints no serial and is never pushed, so `found == processed` is not an
+/// invariant even when nothing is held.
+///
+/// `batches_boundary_found` is loaded before `next_boundary_serial` so the comparison
+/// errs toward "not complete": a batch outstanding at the first load forces
+/// `next_boundary_serial` above the value read, and it only ever grows.
+fn boundary_finding_is_complete<G: Send, P: Send + MemoryEstimate>(
+    state: &BamPipelineState<G, P>,
+) -> bool {
+    state.read_done.load(Ordering::Acquire)
+        && state.batches_boundary_processed.load(Ordering::Acquire)
+            == state.next_read_serial.load(Ordering::Acquire)
+        && state.batches_boundary_found.load(Ordering::Acquire)
+            == state.next_boundary_serial.load(Ordering::Acquire)
+}
+
 /// Try to execute Step 3: Find record boundaries in decompressed data.
 ///
 /// SYNC WITH: fastq.rs `fastq_try_step_find_boundaries()`
@@ -2066,7 +2106,8 @@ fn try_step_find_boundaries<G: Send, P: Send + MemoryEstimate>(
                 did_work = true;
             }
             Err((serial, held)) => {
-                // Still can't push - put it back and signal backpressure
+                // Still can't push - put it back and signal backpressure. The serial
+                // it already holds keeps it visible to `boundary_finding_is_complete`.
                 worker.held_boundaries = Some((serial, held));
                 return (false, false); // Backpressure, not contention
             }
@@ -2150,7 +2191,10 @@ fn try_step_find_boundaries<G: Send, P: Send + MemoryEstimate>(
                             state.deadlock_state.record_q2b_push();
                         }
                         Err((serial, boundary_batch)) => {
-                            // Output full - hold the result and stop processing
+                            // Output full - hold the result and stop processing. The
+                            // serial is already minted and `batches_boundary_found` is
+                            // not, which is what keeps this batch visible to
+                            // `boundary_finding_is_complete` while it waits.
                             worker.held_boundaries = Some((serial, boundary_batch));
                             return (true, false); // Did work (processed data), will retry push later
                         }
@@ -2169,20 +2213,10 @@ fn try_step_find_boundaries<G: Send, P: Send + MemoryEstimate>(
         return (true, false); // Success, no contention (we held the lock)
     }
 
-    // No batches processed - check if we should finish
-    // Completion check: Only finish when THIS step has processed all input batches.
-    // We check batches_boundary_processed == total_read directly, which implies that
-    // Decompress has also finished (since we can't process more than was decompressed).
-    // This prevents a race where FindBoundaries sets boundary_done while data is still
-    // in q2_decompressed waiting to be processed.
-    let read_done = state.read_done.load(Ordering::Acquire);
-    let total_read = state.next_read_serial.load(Ordering::Acquire);
-    let batches_boundary_processed = state.batches_boundary_processed.load(Ordering::Acquire);
-
-    if read_done
-        && batches_boundary_processed == total_read
-        && !state.boundary_done.load(Ordering::Acquire)
-    {
+    // No batches processed - check if we should finish. The flag is tested first so
+    // the drain-down spin, which reaches here on every pass, does not re-read the
+    // counters only to be rejected by an already-set flag.
+    if !state.boundary_done.load(Ordering::Acquire) && boundary_finding_is_complete(state) {
         // All input processed - finish and emit any remaining boundaries
         match boundary_guard.finish() {
             Ok(Some(final_batch)) => {
@@ -2196,7 +2230,9 @@ fn try_step_find_boundaries<G: Send, P: Send + MemoryEstimate>(
                             state.deadlock_state.record_q2b_push();
                         }
                         Err((serial, final_batch)) => {
-                            // Hold final batch for next attempt
+                            // Hold final batch for next attempt. `boundary_done` is
+                            // deliberately not set on this path — the retry re-enters
+                            // `finish()` after Priority 1 pushes this batch.
                             worker.held_boundaries = Some((serial, final_batch));
                             return (true, false);
                         }
@@ -4617,6 +4653,53 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.non_empty_queues.iter().any(|s| s.contains("q2_decompressed")));
+    }
+
+    /// `FindBoundaries` may only set `boundary_done` once every input batch has been
+    /// consumed *and* every boundary batch it minted has actually been pushed.
+    ///
+    /// `batch_held` is the regression: a batch whose push failed is already counted in
+    /// `batches_boundary_processed` while it waits in a worker's `held_boundaries`. See
+    /// [`boundary_finding_is_complete`] for why that orphans the batch.
+    #[rstest]
+    #[case::all_pushed(true, 5, 5, true)]
+    #[case::batch_held(true, 5, 4, false)]
+    #[case::input_outstanding(true, 3, 5, false)]
+    #[case::reader_still_going(false, 5, 5, false)]
+    fn test_boundary_finding_completion_requires_no_held_batch(
+        #[case] read_done: bool,
+        #[case] batches_processed: u64,
+        #[case] batches_pushed: u64,
+        #[case] expected_complete: bool,
+    ) {
+        let state = create_test_state(0);
+        state.read_done.store(read_done, Ordering::SeqCst);
+        state.next_read_serial.store(5, Ordering::SeqCst);
+        state.batches_boundary_processed.store(batches_processed, Ordering::SeqCst);
+        // Five batches minted a serial; `batches_pushed` of them reached the queue, so
+        // a shortfall is a batch held for a retried push.
+        state.next_boundary_serial.store(5, Ordering::SeqCst);
+        state.batches_boundary_found.store(batches_pushed, Ordering::SeqCst);
+
+        assert_eq!(
+            boundary_finding_is_complete(&state),
+            expected_complete,
+            "completion must require all input consumed and every minted batch pushed"
+        );
+    }
+
+    /// An empty input completes immediately: every counter is zero, so both equalities
+    /// hold trivially. Worth pinning because the failure mode is a stage that never
+    /// declares itself done and hangs on a file with no records.
+    #[test]
+    fn test_boundary_finding_completes_on_empty_input() {
+        let state = create_test_state(0);
+        state.read_done.store(true, Ordering::SeqCst);
+
+        assert!(
+            boundary_finding_is_complete(&state),
+            "an input with no batches must complete rather than hang"
+        );
     }
 
     #[test]

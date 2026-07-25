@@ -4289,6 +4289,34 @@ pub trait HasRecycledBuffers {
 ///
 /// This trait ensures both BAM and FASTQ pipelines use the same exit logic,
 /// preventing the race condition where data in held items is lost on exit.
+///
+/// **A related rule governs per-stage done flags, and is not enforced here.** Worker
+/// exit is covered by `has_any_held_items()` above; a stage's `*_done` flag is not.
+/// Before setting it, a stage must account for *every* place an item can sit between
+/// produced and consumed, because a downstream stage may latch finished off that flag
+/// and orphan whatever it missed. There are three such places, and a completion
+/// predicate that omits any of them is a stalled pipeline:
+///
+/// 1. **its own input/output queue** — items pushed but not yet drained. Counters do
+///    not cover this: a producer that counts *after* pushing can leave the counter
+///    level with its target while the items are still queued, so the predicate must
+///    test the queue itself. Omitting this term is what stranded blocks in FASTQ
+///    `BlockMerge`.
+/// 2. **a worker-local held slot** — an item whose push failed. This one cannot be
+///    queried, since a held item is invisible to every other worker, so the counters
+///    have to be arranged such that a held item keeps the predicate false. Getting
+///    that backwards is what stranded a batch in BAM `FindBoundaries`.
+/// 3. **the stage's own intermediate state** — pending maps, surplus records,
+///    cross-block remainders (`BlockMergeState`, `Group`'s `pending_groups`).
+///
+/// For (2) specifically, a stage is exposed only when its predicate compares against
+/// a counter incremented *before* the push, so a held item is already counted as
+/// done. Existing stages avoid that in one of three ways, any of which suffices:
+/// counting *after* the push (`Decompress`, FASTQ `Parse`, FASTQ `BlockParseFast`);
+/// counting at serial-assignment time, so a held item raises the target rather than
+/// lowering it (`Read`, FASTQ gzip `FindBoundaries`, and BAM `FindBoundaries` via
+/// `next_boundary_serial`); or keeping the un-pushed item inside the shared lock so
+/// it is globally visible (`Group`). Prefer one of those to a new counter.
 pub trait WorkerStateCommon {
     /// Check if this worker is holding any items that haven't been pushed yet.
     ///
