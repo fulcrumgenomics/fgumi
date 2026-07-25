@@ -710,6 +710,7 @@ dependencies = [
  "crossbeam-channel",
  "fgumi-bgzf",
  "fgumi-raw-bam",
+ "flate2",
  "log",
  "nix",
  "noodles",

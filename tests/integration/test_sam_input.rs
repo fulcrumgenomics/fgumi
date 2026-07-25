@@ -536,3 +536,157 @@ fn a_stream_header_fault_names_the_mapped_input() {
         "a header fault on the mapped stream must name it, got: {stderr}"
     );
 }
+
+// ============================================================================
+// Plain gzip, accepted at the normalization boundary
+// ============================================================================
+
+/// gzip-compresses `source` into `dest`.
+fn gzip_file(source: &Path, dest: &Path) {
+    use std::io::Write as _;
+
+    let bytes = std::fs::read(source).expect("read gzip source");
+    let mut encoder = flate2::write::GzEncoder::new(
+        File::create(dest).expect("create gzip output"),
+        flate2::Compression::fast(),
+    );
+    encoder.write_all(&bytes).expect("gzip the input");
+    encoder.finish().expect("finish gzip stream");
+}
+
+/// Rewrites every BGZF block in `source` to carry a second extra subfield.
+///
+/// `BC` stays first and `BSIZE` stays correct, so the result is a spec-legal BGZF
+/// file per RFC 1952 — and one that no fgumi decoder can frame, because they all
+/// require `XLEN` to be exactly 6 (as do htslib and noodles). It is still a valid
+/// gzip member, which is the whole point: the boundary decompresses it with a
+/// spec-complete gzip reader and re-frames what comes out.
+fn add_trailing_extra_subfield(source: &Path, dest: &Path) {
+    let data = std::fs::read(source).expect("read BGZF source");
+    let mut out = Vec::with_capacity(data.len());
+    let mut offset = 0;
+
+    while offset < data.len() {
+        let bsize = u16::from_le_bytes([data[offset + 16], data[offset + 17]]) as usize;
+        let total = bsize + 1;
+        let new_total = total + 4; // the foreign subfield's four bytes
+
+        out.extend_from_slice(&data[offset..offset + 10]); // magic, CM, FLG, MTIME, XFL, OS
+        out.extend_from_slice(&10u16.to_le_bytes()); // XLEN: 6 -> 10
+        out.extend_from_slice(&data[offset + 12..offset + 16]); // BC, SLEN
+        out.extend_from_slice(&u16::try_from(new_total - 1).expect("BSIZE fits").to_le_bytes());
+        out.extend_from_slice(b"XY"); // the foreign subfield, behind `BC`
+        out.extend_from_slice(&0u16.to_le_bytes()); // ...of zero length
+        out.extend_from_slice(&data[offset + 18..offset + total]); // payload and footer
+
+        offset += total;
+    }
+
+    std::fs::write(dest, out).expect("write reframed BGZF");
+}
+
+/// gzip is accepted at the boundary, whatever it turns out to be wrapping.
+///
+/// fgumi reads BGZF so it can decompress blocks in parallel, and plain gzip gives
+/// that up — but rejecting it outright made `fgumi` the only tool in the pipeline
+/// that could not read a file `gzip` produced. It is now decompressed at the
+/// boundary and re-classified, so the rest of the pipeline still sees only BGZF.
+///
+/// Each case must produce exactly what the equivalent BAM input produces; matching
+/// exit status alone would not catch a transcode that dropped records.
+#[rstest]
+// `gzip -c reads.sam`: text inside, so it takes the SAM transcode.
+#[case::gzipped_sam(false, false)]
+// `gzip -c reads.bam`: BGZF inside, which needs no transcode at all.
+#[case::gzipped_bam(true, false)]
+// A BGZF file carrying a second extra subfield. Spec-legal, unframeable by every
+// decoder in the pipeline, and a plain gzip member — so it arrives here.
+#[case::bgzf_with_a_trailing_subfield(true, true)]
+fn gzip_input_is_accepted_and_matches_bam(#[case] from_bam: bool, #[case] reframe: bool) {
+    let dir = TempDir::new().expect("create temp dir");
+    let (bam_input, sam_input) = write_input_pair(dir.path());
+    let args = &["sort", "-i", "{input}", "-o", "{output}", "--order", "queryname"];
+
+    let gzipped = dir.path().join("input.gz");
+    if reframe {
+        add_trailing_extra_subfield(&bam_input, &gzipped);
+    } else {
+        gzip_file(if from_bam { &bam_input } else { &sam_input }, &gzipped);
+    }
+
+    let gzip_output = dir.path().join("from_gzip.bam");
+    let result = run(args, &gzipped, &gzip_output);
+    assert!(
+        result.status.success(),
+        "gzip input rejected: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    // Succeeding is not enough: the records have to survive the round trip.
+    let bam_output = dir.path().join("from_bam.bam");
+    let baseline = run(args, &bam_input, &bam_output);
+    assert!(baseline.status.success(), "BAM input failed, so the gzip result proves nothing");
+    assert_eq!(
+        read_output(&gzip_output),
+        read_output(&bam_output),
+        "gzip input produced different records than the same data as BGZF",
+    );
+}
+
+/// Two gzip layers are named rather than peeled.
+///
+/// Unwrapping until something recognisable appears would let a small crafted input
+/// cost unbounded work for one open, so the boundary decompresses exactly once and
+/// says what it found.
+#[test]
+fn doubly_gzipped_input_is_rejected() {
+    let dir = TempDir::new().expect("create temp dir");
+    let (_, sam_input) = write_input_pair(dir.path());
+
+    let once = dir.path().join("once.gz");
+    gzip_file(&sam_input, &once);
+    let twice = dir.path().join("twice.gz");
+    gzip_file(&once, &twice);
+
+    let output = dir.path().join("out.bam");
+    let result =
+        run(&["sort", "-i", "{input}", "-o", "{output}", "--order", "queryname"], &twice, &output);
+
+    assert!(!result.status.success(), "doubly-gzipped input was accepted");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("gzip-compressed twice"),
+        "the error should name the double compression, got: {stderr}"
+    );
+}
+
+/// A gzip member holding nothing is named as such, not as a SAM parse failure.
+///
+/// The empty-input check at the boundary runs on the bytes *as they arrive*, so a
+/// gzip member that decompresses to nothing slips past it and is caught on the
+/// second classification instead. Without that arm the empty result would take the
+/// SAM transcode and fail with a message about an absent `@` header line, which
+/// says nothing about the file being empty.
+#[test]
+fn empty_gzip_member_is_rejected() {
+    let dir = TempDir::new().expect("create temp dir");
+
+    let empty = dir.path().join("empty");
+    File::create(&empty).expect("create empty source");
+    let gzipped = dir.path().join("empty.gz");
+    gzip_file(&empty, &gzipped);
+
+    let output = dir.path().join("out.bam");
+    let result = run(
+        &["sort", "-i", "{input}", "-o", "{output}", "--order", "queryname"],
+        &gzipped,
+        &output,
+    );
+
+    assert!(!result.status.success(), "an empty gzip member was accepted");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("empty gzip member"),
+        "the error should name the empty member, got: {stderr}"
+    );
+}

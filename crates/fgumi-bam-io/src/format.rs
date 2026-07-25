@@ -31,9 +31,13 @@ pub enum InputFormat {
     /// Plain gzip — one deflate stream, so not seekable or block-addressable —
     /// and also the rare gzip member that carries a `BC` subfield but does not
     /// match the fixed BGZF layout every fgumi decoder requires (see
-    /// [`classify_input`]). Either way fgumi's readers cannot consume it even
-    /// though it decompresses, and the remedy is the same: recompress with
-    /// `bgzip`.
+    /// [`classify_input`]).
+    ///
+    /// This is a supported alignment input, not an error: the normalization
+    /// boundary decompresses the member and re-frames what comes out, so the rest
+    /// of the pipeline still sees only BGZF. What it costs is block-parallel
+    /// decode — one deflate stream cannot be split across threads — so `bgzip` is
+    /// a performance recommendation here rather than a requirement.
     Gzip,
     /// Uncompressed text; for alignment inputs, SAM.
     Text,
@@ -64,11 +68,14 @@ pub enum InputFormat {
 /// decoder that rejects it — `invalid BGZF header` from noodles, or a named field
 /// rejection from `fgumi_bgzf` — which is the misleading diagnosis this
 /// classifier exists to prevent. Answering `Gzip` names it as
-/// gzip-that-is-not-BGZF and points at `bgzip`, which is the actual remedy — the
-/// member has to be recompressed before fgumi can read it either way. For FASTQ,
-/// where [`InputFormat::Gzip`] is a supported input rather than an error, the
-/// verdict costs only block-parallel decode: `extract` reads it with
-/// `MultiGzDecoder`, and BGZF is valid gzip.
+/// gzip-that-is-not-BGZF, which routes it to a spec-complete gzip decoder rather
+/// than to a BGZF block reader that would reject it.
+///
+/// `Gzip` is a supported verdict on every input path, not an error. `extract`
+/// reads FASTQ with `MultiGzDecoder`, and alignment inputs go through
+/// `normalize_to_bgzf`, which decompresses the member and re-frames the result.
+/// In both cases the only cost is block-parallel decode — one deflate stream
+/// cannot be split across threads — so `bgzip` buys throughput, not readability.
 #[must_use]
 pub fn classify_input(prefix: &[u8]) -> InputFormat {
     if prefix.is_empty() {

@@ -1,4 +1,4 @@
-//! Transparent support for uncompressed SAM input.
+//! Transparent support for uncompressed SAM and plain-gzip input.
 //!
 //! Every fgumi reader factory is a BGZF reader: the single-threaded fast
 //! paths hand out raw BAM record bytes, and the multi-threaded pipelines hand
@@ -17,8 +17,16 @@
 //!
 //! Detection is by content, never by file extension (see [`crate::format`]), so
 //! a misnamed `reads.bam` holding SAM text and a `reads.sam` holding BGZF both
-//! read correctly. gzip that is *not* BGZF is named as such rather than handed
-//! to the block decoder, which would fail as though the file were corrupt.
+//! read correctly.
+//!
+//! Plain gzip lands here for the same reason: it is decompressed once at the
+//! boundary and re-classified, so a `gzip`-compressed SAM or BAM reads like any
+//! other input while the rest of the pipeline still sees only BGZF. That also
+//! covers a gzip member whose BGZF framing fgumi's own decoders cannot read (see
+//! [`fgumi_bgzf::header`]) — a spec-complete gzip reader handles the framing they
+//! reject, and whatever comes out is re-framed. What it costs is block-parallel
+//! decode: gzip is one deflate stream, so `--threads` stops helping on the read
+//! side, which is warned about per input rather than left as a silent cliff.
 
 use anyhow::{Context, Result, bail};
 use noodles::sam;
@@ -31,6 +39,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::format::{FORMAT_PREFIX_LEN, InputFormat, classify_input};
 use crate::reader::ChainedReader;
+use flate2::read::MultiGzDecoder;
 
 /// Read buffer wrapped around SAM text input. SAM is line-oriented and much
 /// larger than the equivalent BAM, so it is read in big gulps.
@@ -280,6 +289,123 @@ impl<R: Read> Read for SamToBamStream<R> {
     }
 }
 
+/// BAM's magic bytes, which begin the unframed byte stream inside a BAM file.
+const BAM_MAGIC: &[u8; 4] = b"BAM\x01";
+
+/// How much of an unframed BAM stream to pull per `produce` call.
+///
+/// This is a read granularity, not a block size: BGZF blocking is the writer's
+/// job, and it stages up to its own `MAX_BUF_SIZE` (~64 KiB — one block's ISIZE
+/// less the gzip and deflate overheads) before emitting anything. So chunks and
+/// blocks deliberately do not line up — at 32 KiB the first chunk emits no block
+/// at all and the second one is split across the boundary. Sizing this to match a
+/// block would buy nothing, since the writer would still choose its own cut
+/// points; what it does buy is amortizing the read over a useful span while
+/// keeping one reusable scratch buffer small.
+const REFRAME_CHUNK_SIZE: usize = 32 * 1024;
+
+/// Wraps a raw, unframed BAM byte stream in BGZF framing.
+///
+/// BAM is BGZF-framed by definition, but a BAM that has been through a
+/// spec-complete gzip decompressor comes out as the naked byte stream — that is
+/// what `gzip -dc reads.bam` produces, and what a BGZF member whose framing fgumi
+/// cannot read decompresses to. The bytes are a perfectly good BAM; only the
+/// framing is missing, and every consumer downstream reads BGZF.
+///
+/// So this re-frames rather than parses: the bytes are copied into a BGZF writer
+/// and served back out, with no record decoding anywhere. [`CompressionLevel::NONE`]
+/// for the same reason [`SamToBamStream`] uses it — the blocks are decoded again
+/// microseconds later in the same process.
+struct BgzfFramer<R> {
+    /// The unframed BAM byte stream.
+    inner: R,
+    /// Encoder writing BGZF blocks into `sink`.
+    writer: noodles_bgzf::io::Writer<SharedBuffer>,
+    /// Where the encoder's bytes land.
+    sink: SharedBuffer,
+    /// Framed bytes not yet handed to the caller.
+    staged: Vec<u8>,
+    /// How much of `staged` has been handed over.
+    offset: usize,
+    /// Whether `inner` has been read to the end and the writer finished.
+    done: bool,
+    /// Scratch for one chunk of `inner`, reused across `produce` calls.
+    ///
+    /// Held as a field rather than a local so a stream of `n` chunks does not
+    /// allocate and zero-fill `n` separate `REFRAME_CHUNK_SIZE` buffers — the
+    /// same reason [`SamToBamStream`] keeps its scratch buffers as fields.
+    chunk: Vec<u8>,
+}
+
+impl<R: Read> BgzfFramer<R> {
+    /// Wrap `inner`, which must be a raw BAM byte stream.
+    fn new(inner: R) -> Self {
+        let sink = SharedBuffer::default();
+        let writer = noodles_bgzf::io::writer::Builder::default()
+            .set_compression_level(CompressionLevel::NONE)
+            .build_from_writer(sink.clone());
+        Self {
+            inner,
+            writer,
+            sink,
+            staged: Vec::new(),
+            offset: 0,
+            done: false,
+            chunk: vec![0u8; REFRAME_CHUNK_SIZE],
+        }
+    }
+
+    /// Frame the next chunk, or finish the stream at end of input.
+    fn produce(&mut self) -> io::Result<()> {
+        let filled = crate::reader::read_prefix(&mut self.inner, &mut self.chunk)?;
+        if filled == 0 {
+            // `try_finish` writes the BGZF EOF block, which consumers require.
+            self.writer.try_finish()?;
+            self.done = true;
+        } else {
+            self.writer.write_all(&self.chunk[..filled])?;
+        }
+
+        // Same drop-guard as `SamToBamStream::stage_encoded`, for the same reason:
+        // `read` only calls `produce` with the staging buffer drained, and the
+        // `clear` below would silently discard anything still unread if that ever
+        // stopped holding.
+        debug_assert!(
+            self.offset >= self.staged.len(),
+            "produce() ran with {} unread staged bytes; clearing here would drop them",
+            self.staged.len() - self.offset
+        );
+        self.staged.clear();
+        self.offset = 0;
+        self.sink.swap_into(&mut self.staged);
+        Ok(())
+    }
+}
+
+impl<R: Read> Read for BgzfFramer<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // Same guard, same reason, same point in the chain as
+        // `SamToBamStream::read`: without it a zero-length request satisfies the
+        // refill condition below and drives a whole chunk through the BGZF encoder
+        // to produce nothing. Nothing is lost either way (`offset` does not
+        // advance), but the work is wasted.
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        while self.offset >= self.staged.len() {
+            if self.done {
+                return Ok(0);
+            }
+            self.produce()?;
+        }
+
+        let n = (&self.staged[self.offset..]).read(buf)?;
+        self.offset += n;
+        Ok(n)
+    }
+}
+
 /// Consume up to [`FORMAT_PREFIX_LEN`] bytes from `reader`.
 ///
 /// Returns fewer bytes only at end of input. The bytes are returned rather
@@ -291,7 +417,11 @@ fn read_format_prefix<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     Ok(prefix[..filled].to_vec())
 }
 
-/// Normalize `reader` to a BGZF byte stream, transcoding it if it is SAM text.
+/// Normalize `reader` to a BGZF byte stream, whatever it arrived as.
+///
+/// BGZF passes through; SAM text is transcoded; plain gzip is decompressed once
+/// and then handled as whichever of those it turns out to wrap, including an
+/// unframed BAM byte stream, which is re-framed rather than parsed.
 ///
 /// `path` is used only to describe the input in errors.
 ///
@@ -300,8 +430,9 @@ fn read_format_prefix<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
 ///
 /// # Errors
 ///
-/// Returns an error if the input is empty, is gzip but not BGZF, or is text
-/// whose SAM header cannot be parsed (or is absent).
+/// Returns an error if the input is empty, decompresses to an empty gzip member,
+/// is gzip-compressed more than once, or is text whose SAM header cannot be
+/// parsed (or is absent).
 pub fn normalize_to_bgzf(
     mut reader: Box<dyn Read + Send>,
     path: &Path,
@@ -309,48 +440,71 @@ pub fn normalize_to_bgzf(
     let magic = read_format_prefix(&mut reader)
         .with_context(|| format!("Failed to read from: {}", path.display()))?;
 
-    match classify_input(&magic) {
+    // What reaches the SAM transcode below: the leading bytes already consumed,
+    // and the stream they came off. For a gzip member that is the *decompressed*
+    // stream, which is why this is a pair rather than the original reader.
+    let (prefix, stream): (Vec<u8>, Box<dyn Read + Send>) = match classify_input(&magic) {
         InputFormat::Empty => {
             bail!("Input is empty: {} (expected BAM or SAM records)", path.display())
         }
         InputFormat::Bgzf => return Ok(Box::new(ChainedReader::new(magic, reader))),
-        // Distinguished from BGZF so the error names the real problem. Left
-        // undetected, a plain-gzipped file reaches the BGZF decoder and fails
-        // with "Failed to read header", which reads as a corrupt BAM.
-        //
-        // FUTURE: support plain-gzip SAM rather than rejecting it. Now that the
-        // transcode exists this is a small arm — decode with
-        // `flate2::read::MultiGzDecoder` and hand the result to
-        // `SamToBamStream`, landing on the same normalized stream. Two things to
-        // settle first:
-        //
-        //   1. It costs block-parallel decode. gzip is one deflate stream, so
-        //      `--threads` would silently stop helping on the read side; that
-        //      wants a one-time `log::warn!` rather than a silent cliff.
-        //   2. Gzipped *SAM* is a legitimate text file and worth accepting;
-        //      gzipped *BAM* is a malformed artifact that samtools cannot read
-        //      either, so accepting it would just move the failure downstream.
-        //      The arm should therefore transcode as SAM and still reject if the
-        //      decompressed bytes turn out to be BGZF/BAM.
-        //
-        // `extract` already accepts plain-gzip FASTQ, so the asymmetry users see
-        // today is real; it is defensible only while it stays explained.
-        // Phrased as "not readable as BGZF" rather than "not BGZF": the verdict also
-        // covers a gzip member carrying a `BC` subfield in a layout fgumi's decoder
-        // rejects, which is BGZF by the letter of RFC 1952 (see
-        // `classify_input`). The remedy is the same for both, so the message does not
-        // split them.
-        InputFormat::Gzip => bail!(
-            "Input is gzip-compressed but not readable as BGZF: {} — fgumi reads BGZF (bgzip) \
-             so it can decompress blocks in parallel. Recompress with `bgzip`, or pipe it in: \
-             `gzip -dc {} | fgumi ... -i -`",
-            path.display(),
-            path.display()
-        ),
-        InputFormat::Text => {}
-    }
+        // Plain gzip: decompress at the boundary and classify what comes out, so
+        // the rest of the pipeline still sees only BGZF. `MultiGzDecoder` handles
+        // concatenated members and, unlike fgumi's own block reader, the whole of
+        // RFC 1952 -- extra subfields, FNAME and all -- which is what makes this
+        // arm the right home for a gzip member fgumi's BGZF decoder cannot frame.
+        InputFormat::Gzip => {
+            // gzip is a single deflate stream, so `--threads` stops helping on the
+            // read side. Warned per input rather than left as a silent cliff.
+            log::warn!(
+                "Input is gzip-compressed rather than BGZF: {} — decompressing it \
+                 single-threaded, so --threads will not speed up reading. Recompress \
+                 with `bgzip` for block-parallel decode.",
+                path.display()
+            );
 
-    let sam = SamToBamStream::new(ChainedReader::new(magic, reader))
+            let mut decoded: Box<dyn Read + Send> =
+                Box::new(MultiGzDecoder::new(ChainedReader::new(magic, reader)));
+            let inner = read_format_prefix(&mut decoded).with_context(|| {
+                format!("Failed to read gzip-decompressed input: {}", path.display())
+            })?;
+
+            match classify_input(&inner) {
+                // A BGZF stream inside a gzip wrapper — `gzip -c reads.bam`, where
+                // the outer member decompresses to the BAM's own BGZF blocks. Those
+                // are already framed, so they go straight down the normal path.
+                InputFormat::Bgzf => {
+                    return Ok(Box::new(ChainedReader::new(inner, decoded)));
+                }
+                // A BAM that lost its framing on the way through a gzip
+                // decompressor: the bytes are BAM, so re-frame rather than try to
+                // parse them as SAM text, which would fail with a message about a
+                // missing `@` header line for a file that is not text at all.
+                //
+                // This is also where a BGZF member fgumi's own decoder cannot frame
+                // ends up — `MultiGzDecoder` reads the whole of RFC 1952, so what
+                // comes out of it is the naked BAM byte stream, not BGZF.
+                InputFormat::Text if inner.starts_with(BAM_MAGIC) => {
+                    return Ok(Box::new(BgzfFramer::new(ChainedReader::new(inner, decoded))));
+                }
+                InputFormat::Text => (inner, decoded),
+                InputFormat::Empty => bail!(
+                    "Input is an empty gzip member: {} (expected BAM or SAM records)",
+                    path.display()
+                ),
+                // Two gzip layers. Unwrapping repeatedly would let a crafted input
+                // cost unbounded work for one open, so say what it is instead.
+                InputFormat::Gzip => bail!(
+                    "Input is gzip-compressed twice over: {} — decompress it once \
+                     (`gzip -dc`) before handing it to fgumi",
+                    path.display()
+                ),
+            }
+        }
+        InputFormat::Text => (magic, reader),
+    };
+
+    let sam = SamToBamStream::new(ChainedReader::new(prefix, stream))
         .with_context(|| format!("Failed to read SAM input: {}", path.display()))?;
 
     // A SAM header parse consumes only lines beginning with `@`, so arbitrary
@@ -612,6 +766,66 @@ mod tests {
 
         assert!(header.reference_sequences().is_empty(), "no @SQ expected");
         assert_eq!(records.len(), 1, "the unmapped record must survive");
+        Ok(())
+    }
+
+    /// `BgzfFramer` must reproduce its input byte-for-byte across many chunks.
+    ///
+    /// The integration coverage only ever feeds it a handful of short records —
+    /// well under one `REFRAME_CHUNK_SIZE`, let alone the writer's ~64 KiB staging
+    /// buffer — so the framer emits a single block plus EOF and the repeated
+    /// `produce`/`offset` bookkeeping is never exercised. This drives several
+    /// hundred KiB through it, which is many chunks and many blocks, and reads the
+    /// result back in deliberately awkward slice sizes so a partially-consumed
+    /// `staged` buffer is crossed on almost every call.
+    #[test]
+    fn frames_a_multi_block_stream_without_altering_the_bytes() -> Result<()> {
+        // Not compressible to nothing and not uniform, so a dropped or duplicated
+        // chunk changes the bytes rather than hiding in a run of identical ones.
+        let payload: Vec<u8> = (0..300_usize * 1024)
+            .map(|i| u8::try_from((i * 31 + i / 251) % 251).unwrap())
+            .collect();
+        assert!(
+            payload.len() > 4 * REFRAME_CHUNK_SIZE,
+            "the payload must span several chunks for this test to mean anything"
+        );
+
+        let mut framer = BgzfFramer::new(io::Cursor::new(payload.clone()));
+
+        // Awkward, varying read sizes: 7 bytes, then 60_000, then 1, repeating.
+        let mut framed_bytes = Vec::new();
+        let mut sizes = [7_usize, 60_000, 1].into_iter().cycle();
+        loop {
+            let mut buf = vec![0u8; sizes.next().unwrap()];
+            let n = framer.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            framed_bytes.extend_from_slice(&buf[..n]);
+        }
+
+        // A zero-length request must not consume anything or end the stream early.
+        assert_eq!(framer.read(&mut [])?, 0, "empty read must be a no-op");
+
+        // Pin the premise rather than assuming it: if the framer ever emitted one
+        // giant block, the multi-block bookkeeping would still be untested and this
+        // test's name would be a lie.
+        let mut blocks = 0;
+        let mut offset = 0;
+        while let Some(len) = fgumi_bgzf::block_size(&framed_bytes[offset..]) {
+            blocks += 1;
+            offset += len;
+            if offset >= framed_bytes.len() {
+                break;
+            }
+        }
+        assert!(blocks > 4, "expected several BGZF blocks, got {blocks}");
+
+        let mut decoded = Vec::new();
+        noodles_bgzf::io::Reader::new(io::Cursor::new(framed_bytes.clone()))
+            .read_to_end(&mut decoded)?;
+        assert_eq!(decoded.len(), payload.len(), "framing changed the byte count");
+        assert!(decoded == payload, "framing altered the bytes");
         Ok(())
     }
 }

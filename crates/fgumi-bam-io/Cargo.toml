@@ -20,6 +20,7 @@ noodles = { workspace = true, features = ["bam", "fasta", "sam", "bgzf", "core",
 noodles-bgzf = { workspace = true }
 noodles-csi = { workspace = true }
 bgzf = { workspace = true }
+flate2 = { workspace = true }
 anyhow = { workspace = true }
 bstr = { workspace = true }
 bytes = { workspace = true }
