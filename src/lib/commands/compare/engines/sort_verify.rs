@@ -55,6 +55,7 @@ use noodles::sam::Header;
 
 use ahash::AHashMap;
 
+use super::OpenedInput;
 use crate::sam::SamTag;
 
 use super::super::raw_compare::content_key_exact;
@@ -218,28 +219,6 @@ pub(crate) fn sort_order_from_header(header: &Header) -> Result<SortOrder> {
 /// Back-compat alias for existing internal callers.
 pub(crate) fn detect_sort_order(header: &Header) -> Result<SortOrder> {
     sort_order_from_header(header)
-}
-
-/// Open `path` once, returning its parsed header and a raw-byte record reader
-/// positioned just past that header.
-///
-/// One open per input rather than two. Every caller here needs both the header
-/// (to pick a key extractor) and the records, and taking them from separate opens
-/// meant the input had to be re-openable — which a FIFO, a process substitution
-/// and stdin are not. [`fgumi_sort::open_raw_bam_record_reader_with_header`]
-/// parses the header through a tee and replays the bytes it consumed, so one
-/// stream serves both. Uncompressed SAM is sniffed and normalized there too.
-///
-/// This makes the *engine* single-open, which is what its own entry points
-/// promise. The `compare bams` CLI is a separate question: it opens both inputs
-/// once more up front for its header-compatibility precondition, deliberately, so
-/// that an incompatible pair hard-exits before any engine runs
-/// (see [`CompareBams::execute`](super::super::bams::CompareBams)). A command line
-/// therefore still names re-openable inputs — `compare`'s declared contract, since
-/// it compares two named files against each other.
-fn open_raw_reader_with_header(path: &Path) -> Result<(OwnedRawBamRecordReader, Header)> {
-    fgumi_sort::open_raw_bam_record_reader_with_header(path)
-        .with_context(|| format!("opening raw BAM reader for {}", path.display()))
 }
 
 /// A record together with its extracted sort key, read one step ahead of the run
@@ -756,8 +735,7 @@ where
     SameCore: Fn(&K, &K) -> bool,
 {
     /// Record reader over the first input, already past its header. Carried rather
-    /// than the path so the input is opened exactly once — see
-    /// [`open_raw_reader_with_header`].
+    /// than the path so the input is opened exactly once — see [`OpenedInput`].
     reader1: OwnedRawBamRecordReader,
     /// Record reader over the second input, already past its header.
     reader2: OwnedRawBamRecordReader,
@@ -831,9 +809,29 @@ pub fn sort_verify_compare(
     max_diffs: usize,
 ) -> Result<SortVerifyOutcome> {
     // One open per input, which is what the record readers below then stream —
-    // see `open_raw_reader_with_header`.
-    let (reader1, header1) = open_raw_reader_with_header(bam1)?;
-    let (reader2, header2) = open_raw_reader_with_header(bam2)?;
+    // see `OpenedInput::open`.
+    sort_verify_compare_opened(OpenedInput::open(bam1)?, OpenedInput::open(bam2)?, max_diffs)
+}
+
+/// [`sort_verify_compare`] over inputs the caller already opened.
+///
+/// The entry point for `CompareBams::execute`, which has to read both headers to
+/// check them for compatibility before dispatching here, and would otherwise have
+/// to reopen both paths for their records — see [`OpenedInput`]. Handing the
+/// streams over instead is what lets `compare bams --command sort` take a FIFO or
+/// a process substitution.
+///
+/// # Errors
+///
+/// As [`sort_verify_compare`], minus the opens the caller already made.
+pub(crate) fn sort_verify_compare_opened(
+    input1: OpenedInput,
+    input2: OpenedInput,
+    max_diffs: usize,
+) -> Result<SortVerifyOutcome> {
+    let OpenedInput { reader: reader1, header: header1, path: bam1 } = input1;
+    let OpenedInput { reader: reader2, header: header2, path: bam2 } = input2;
+    let (bam1, bam2) = (bam1.as_path(), bam2.as_path());
 
     let order1 = detect_sort_order(&header1)
         .map_err(|e| anyhow!("detecting sort order from {}: {e}", bam1.display()))?;
@@ -944,9 +942,10 @@ pub fn sort_verify_compare(
 /// Returns an error if `path` cannot be opened/read, or if any record violates `order`
 /// (naming the first violating record's 1-based position and read name).
 pub(crate) fn verify_records_in_order(path: &Path, order: SortOrder) -> Result<()> {
-    // One open, header and records from the same stream — see
-    // `open_raw_reader_with_header`.
-    let (reader, header) = open_raw_reader_with_header(path)
+    // One open, header and records from the same stream — see `OpenedInput::open`.
+    // The `path` field goes unused here: this entry point takes a single input and
+    // already has it, so there is nothing to disambiguate in its diagnostics.
+    let OpenedInput { reader, header, path: _ } = OpenedInput::open(path)
         .with_context(|| format!("opening {} to verify sort order", path.display()))?;
 
     // IMPORTANT: The per-SortOrder extractor/comparator selection below must stay

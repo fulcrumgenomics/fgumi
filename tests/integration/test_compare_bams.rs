@@ -265,7 +265,10 @@ fn test_grouping_mode_identical_bams() {
 
     let (code, stdout, _stderr) = run_compare(&bam1, &bam2, "grouping", &[]);
     assert_eq!(code, Some(0), "Expected success for identical grouped BAMs, stdout:\n{stdout}");
-    assert!(stdout.contains("EQUIVALENT"), "Expected EQUIVALENT in output, got:\n{stdout}");
+    assert!(
+        stdout.contains("RESULT: BAM groupings are EQUIVALENT"),
+        "expected 'RESULT: BAM groupings are EQUIVALENT' in output, got:\n{stdout}"
+    );
 }
 
 #[test]
@@ -368,7 +371,10 @@ fn test_content_mode_reordered_tags_equivalent() {
         Some(0),
         "Expected success for reordered tags in content mode, stdout:\n{stdout}"
     );
-    assert!(stdout.contains("IDENTICAL"), "Expected IDENTICAL in output, got:\n{stdout}");
+    assert!(
+        stdout.contains("RESULT: BAM files are IDENTICAL"),
+        "expected 'RESULT: BAM files are IDENTICAL' in output, got:\n{stdout}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -443,7 +449,10 @@ fn test_grouping_mode_ignore_order() {
 
     let (code, stdout, _stderr) = run_compare(&bam1, &bam2, "grouping", &["--ignore-order"]);
     assert_eq!(code, Some(0), "Expected success for ignore-order grouping mode, stdout:\n{stdout}");
-    assert!(stdout.contains("EQUIVALENT"), "Expected EQUIVALENT in output, got:\n{stdout}");
+    assert!(
+        stdout.contains("RESULT: BAM groupings are EQUIVALENT"),
+        "expected 'RESULT: BAM groupings are EQUIVALENT' in output, got:\n{stdout}"
+    );
 }
 
 /// Runs `CompareBams::execute()` in-process under `--mode grouping` (plus any `extra_args`,
@@ -754,7 +763,10 @@ fn test_grouping_mode_paired_strand_suffix_equivalent() {
         Some(0),
         "Expected EQUIVALENT for identical paired-strand BAMs, stdout:\n{stdout}"
     );
-    assert!(stdout.contains("EQUIVALENT"), "Expected EQUIVALENT, got:\n{stdout}");
+    assert!(
+        stdout.contains("RESULT: BAM groupings are EQUIVALENT"),
+        "expected 'RESULT: BAM groupings are EQUIVALENT' in output, got:\n{stdout}"
+    );
     // Note: unlike the retired key-join engine, this molecule-join engine has no
     // "missing MI" counter to assert against directly. Regression coverage for MI:Z:0/A
     // and 0/B being parsed as present (not missing) lives primarily in
@@ -785,7 +797,10 @@ fn test_grouping_unordered_paired_strand_suffix_equivalent() {
         Some(0),
         "Expected EQUIVALENT for ignore-order paired-strand BAMs, stdout:\n{stdout}"
     );
-    assert!(stdout.contains("EQUIVALENT"), "Expected EQUIVALENT, got:\n{stdout}");
+    assert!(
+        stdout.contains("RESULT: BAM groupings are EQUIVALENT"),
+        "expected 'RESULT: BAM groupings are EQUIVALENT' in output, got:\n{stdout}"
+    );
 }
 
 #[test]
@@ -1411,7 +1426,10 @@ fn test_command_group_content_identical_mi_renumbered_and_reordered_matches() {
         "Expected EQUIVALENT for content-identical, MI-renumbered, reordered BAMs via \
          `--command group`, stdout:\n{stdout}"
     );
-    assert!(stdout.contains("EQUIVALENT"), "Expected EQUIVALENT in output, got:\n{stdout}");
+    assert!(
+        stdout.contains("RESULT: BAM groupings are EQUIVALENT"),
+        "expected 'RESULT: BAM groupings are EQUIVALENT' in output, got:\n{stdout}"
+    );
 }
 
 /// Regression: an explicit `--mode content` overrides a preset's own predicate. Under
@@ -2002,7 +2020,10 @@ fn test_command_sort_identical_bams_match() {
         Some(0),
         "identical sorted BAMs must be IDENTICAL (exit 0) via --command sort:\n{stdout}"
     );
-    assert!(stdout.contains("IDENTICAL"), "expected IDENTICAL in output, got:\n{stdout}");
+    assert!(
+        stdout.contains("RESULT: BAM files are IDENTICAL"),
+        "expected 'RESULT: BAM files are IDENTICAL' in output, got:\n{stdout}"
+    );
 }
 
 /// End-to-end smoke test: `--command sort` reports DIFFER (and exits non-zero) when
@@ -2854,11 +2875,14 @@ fn test_sort_verify_reads_a_non_reopenable_input() {
     let bam = tmp.path().join("a.bam");
     write_bam(&bam, &header, &records);
 
-    let (fifo, feeder) = serve_over_fifo(tmp.path(), "a.fifo", &bam);
-    let oracle = bam.clone();
-    let outcome = bounded(move || sort_verify_compare(&fifo, &oracle, 100))
-        .expect("sort_verify_compare must accept an input it can only open once");
-    join_feeder(feeder);
+    // Both arguments are FIFOs: serving only the first would leave a regression that
+    // reopens just the second indistinguishable from a passing run.
+    let (fifo1, feeder1) = serve_over_fifo(tmp.path(), "a.fifo", &bam);
+    let (fifo2, feeder2) = serve_over_fifo(tmp.path(), "b.fifo", &bam);
+    let outcome = bounded(move || sort_verify_compare(&fifo1, &fifo2, 100))
+        .expect("sort_verify_compare must accept inputs it can only open once");
+    join_feeder(feeder1);
+    join_feeder(feeder2);
 
     assert!(outcome.is_match(), "the same data over a FIFO must match itself: {outcome:?}");
     assert_eq!(outcome.bam1_count, records.len() as u64, "every record must be read from the FIFO");
@@ -2879,14 +2903,141 @@ fn test_molecule_join_reads_a_non_reopenable_input() {
     let bam = tmp.path().join("a.bam");
     write_bam(&bam, &header, &records);
 
-    let (fifo, feeder) = serve_over_fifo(tmp.path(), "a.fifo", &bam);
-    let oracle = bam.clone();
-    let outcome = bounded(move || molecule_join_compare(&fifo, &oracle, 100))
-        .expect("molecule_join_compare must accept an input it can only open once");
-    join_feeder(feeder);
+    // Both arguments are FIFOs, for the reason given in
+    // [`test_sort_verify_reads_a_non_reopenable_input`].
+    let (fifo1, feeder1) = serve_over_fifo(tmp.path(), "a.fifo", &bam);
+    let (fifo2, feeder2) = serve_over_fifo(tmp.path(), "b.fifo", &bam);
+    let outcome = bounded(move || molecule_join_compare(&fifo1, &fifo2, 100))
+        .expect("molecule_join_compare must accept inputs it can only open once");
+    join_feeder(feeder1);
+    join_feeder(feeder2);
 
     assert!(outcome.is_match(), "the same data over a FIFO must match itself: {outcome:?}");
     assert_eq!(outcome.matched, 1, "the single molecule must be matched");
     assert_eq!(outcome.bam1_molecules, 1);
     assert_eq!(outcome.bam2_molecules, 1);
+}
+
+/// Waits for `child`, failing the test if it has not exited within a generous bound.
+///
+/// A second open of a FIFO **blocks** rather than erroring — there is no writer left
+/// to attach — so a command that regresses to two opens would hang this test
+/// indefinitely instead of failing it, and CI would report a timeout with no
+/// indication of which property broke. The child is killed so the run does not leak
+/// a blocked process.
+///
+/// Both pipes are drained on their own threads for the whole wait, rather than only
+/// after the child exits. `stdout` and `stderr` are both `piped()`, so a child whose
+/// combined output outgrows the OS pipe buffer (16 KiB on macOS, 64 KiB on Linux)
+/// would block in `write` before reaching `exit`, `try_wait` would never return
+/// `Some`, and the timeout would fire — blaming a second open that never happened.
+/// Today's output is far short of that, but the diagnostic must not be able to lie.
+#[cfg(unix)]
+fn wait_bounded(mut child: std::process::Child, label: &str) -> std::process::Output {
+    use std::io::Read;
+
+    let mut child_stdout = child.stdout.take().expect("stdout was piped");
+    let mut child_stderr = child.stderr.take().expect("stderr was piped");
+    let drain_stdout = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        child_stdout.read_to_end(&mut buf).expect("drain fgumi stdout");
+        buf
+    });
+    let drain_stderr = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        child_stderr.read_to_end(&mut buf).expect("drain fgumi stderr");
+        buf
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match child.try_wait().expect("poll fgumi") {
+            Some(status) => {
+                return std::process::Output {
+                    status,
+                    stdout: drain_stdout.join().expect("stdout drain thread"),
+                    stderr: drain_stderr.join().expect("stderr drain thread"),
+                };
+            }
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "compare bams --command {label} did not exit within 30s on a FIFO input; \
+                     the likely cause is a second open of the input, which blocks forever on a \
+                     FIFO because no writer is left to attach"
+                );
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+}
+
+/// `compare bams` must accept inputs it can only open once, end to end.
+///
+/// The engine-level tests above pin the engines; this pins the *command*, which is
+/// where the second open used to live: `execute` read both headers for its
+/// compatibility precondition and the engine then reopened both paths for their
+/// records, so the CLI required a re-openable input even though each half read the
+/// stream once. Both single-pass presets are covered — `--command sort` and
+/// `--command group` — because they dispatch to different engines.
+///
+/// Content mode is deliberately absent: it makes two passes over each input (order
+/// verification, then the record comparison) and so cannot stream a FIFO at all.
+#[cfg(unix)]
+#[rstest]
+#[case::sort_preset("sort")]
+#[case::group_preset("group")]
+fn test_compare_bams_cli_reads_a_non_reopenable_input(#[case] preset: &str) {
+    let tmp = TempDir::new().unwrap();
+    // `create_minimal_header` advertises SO:unsorted GO:query SS:template-coordinate,
+    // which satisfies the sort-verify engine and the grouping engine alike.
+    let header = create_minimal_header("chr1", 10000);
+    let records = vec![mi_record(b"read1", 100, "1"), mi_record(b"read2", 200, "1")];
+
+    let bam = tmp.path().join("a.bam");
+    write_bam(&bam, &header, &records);
+
+    // Both arguments are FIFOs. Serving only the first would leave the second
+    // re-openable, so a regression that reopened just `bam2` — `execute` opens the two
+    // independently — would still pass.
+    let (fifo1, feeder1) = serve_over_fifo(tmp.path(), "a.fifo", &bam);
+    let (fifo2, feeder2) = serve_over_fifo(tmp.path(), "b.fifo", &bam);
+
+    let child = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args(["compare", "bams"])
+        .arg(&fifo1)
+        .arg(&fifo2)
+        .args(["--command", preset])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn fgumi");
+    let output = wait_bounded(child, preset);
+
+    // Assert before joining: a regression leaves a feeder blocked in its `open`
+    // forever, so joining first would hang rather than fail. See `serve_over_fifo`.
+    assert!(
+        output.status.success(),
+        "compare bams --command {preset} rejected FIFOs it accepts as regular files:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    join_feeder(feeder1);
+    join_feeder(feeder2);
+
+    // Each preset has its own result line — `execute_sort_verify` prints "BAM files
+    // are IDENTICAL", `execute_grouping` prints "BAM groupings are EQUIVALENT". Accepting
+    // either would let a dispatch regression that ran the wrong engine for the preset
+    // still pass, so pin the one this preset must print.
+    let expected_result_line = match preset {
+        "sort" => "RESULT: BAM files are IDENTICAL",
+        "group" => "RESULT: BAM groupings are EQUIVALENT",
+        other => panic!("unexpected preset {other}: add its RESULT line to this match"),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(expected_result_line),
+        "the same data over a FIFO must compare equal to itself: --command {preset} must print \
+         {expected_result_line:?}, got:\n{stdout}"
+    );
 }
