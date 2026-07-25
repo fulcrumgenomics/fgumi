@@ -13,11 +13,14 @@ use fgumi_lib::commands::extract::Extract;
 use fgumi_lib::commands::filter::Filter;
 use fgumi_lib::commands::group::GroupReadsByUmi;
 use fgumi_lib::commands::simplex::Simplex;
+use fgumi_lib::commands::simulate::consensus_reads::ConsensusReads;
+use fgumi_lib::commands::simulate::correct_reads::CorrectReads;
 use fgumi_lib::commands::simulate::fastq_reads::FastqReads;
 use fgumi_lib::commands::simulate::grouped_reads::GroupedReads;
 use fgumi_lib::commands::sort::Sort;
 use fgumi_lib::sam::SamTag;
 use noodles::bam;
+use rstest::rstest;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::Write;
@@ -761,4 +764,110 @@ fn assert_simplex_has_methylation_tags(bam_path: &Path) {
     assert!(with_ml > 0, "Expected at least one record with an ML tag; got {total} records");
     assert!(with_cu > 0, "Expected at least one record with a cu tag; got {total} records");
     assert!(with_ct > 0, "Expected at least one record with a ct tag; got {total} records");
+}
+
+/// A writer that dies must report *its* error, not the send failure it causes.
+///
+/// The writer thread owns the output files; the generator only learns something
+/// went wrong because its channel closed. The command used to return on that send
+/// failure without joining the writer, so it reported "Failed to send record to
+/// writer: sending on a disconnected channel" — the symptom — and discarded the
+/// writer's own error along with the unjoined handle. It also left the writer
+/// running over its output while the caller unwound.
+///
+/// A directory where R1 should go makes the writer fail at its first `File::create`,
+/// which is the cheapest way to reach that path deterministically.
+#[test]
+fn simulate_fastq_reads_reports_the_writer_error_not_the_send_failure() {
+    let dir = TempDir::new().expect("create temp dir");
+    let reference = create_test_reference(dir.path());
+
+    // R1's path is a directory, so the writer cannot create it.
+    let r1 = dir.path().join("r1.fastq.gz");
+    std::fs::create_dir(&r1).expect("create the blocking directory");
+
+    let cmd = FastqReads::try_parse_from([
+        OsStr::new("fastq-reads"),
+        OsStr::new("-1"),
+        r1.as_os_str(),
+        OsStr::new("-2"),
+        dir.path().join("r2.fastq.gz").as_os_str(),
+        OsStr::new("--truth"),
+        dir.path().join("truth.txt").as_os_str(),
+        OsStr::new("--reference"),
+        reference.as_os_str(),
+        OsStr::new("--num-molecules"),
+        OsStr::new("200"),
+    ])
+    .expect("failed to parse fastq-reads args");
+
+    let err = cmd.execute("fgumi simulate fastq-reads").expect_err("the writer cannot succeed");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("Failed to create"),
+        "the writer's own error must be reported, got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("Failed to send record to writer"),
+        "the send failure is the symptom, not the cause: {rendered}"
+    );
+}
+
+/// The BAM-writing siblings of the test above must report the writer's error too.
+///
+/// `consensus_reads`, `correct_reads` and `fastq_reads` each spawn a writer thread
+/// and each had the same early return, so fixing one and testing only that one is
+/// how the other two would quietly regress. A directory where the output BAM
+/// should go makes the writer fail at `create_raw_bam_writer`, which reaches the
+/// same path as the FASTQ case.
+#[rstest]
+#[case::consensus_reads(false)]
+#[case::correct_reads(true)]
+fn simulate_bam_commands_report_the_writer_error_not_the_send_failure(#[case] correct: bool) {
+    let dir = TempDir::new().expect("create temp dir");
+    let reference = create_test_reference(dir.path());
+
+    // The output BAM's path is a directory, so the writer cannot create it.
+    let output = dir.path().join("out.bam");
+    std::fs::create_dir(&output).expect("create the blocking directory");
+
+    let err = if correct {
+        let includelist = dir.path().join("umis.txt");
+        std::fs::write(&includelist, "ACGTACGT\nTTTTGGGG\n").expect("write include list");
+        let cmd = CorrectReads::try_parse_from([
+            OsStr::new("correct-reads"),
+            OsStr::new("-o"),
+            output.as_os_str(),
+            OsStr::new("--includelist"),
+            includelist.as_os_str(),
+            OsStr::new("--truth"),
+            dir.path().join("truth.txt").as_os_str(),
+            OsStr::new("--num-reads"),
+            OsStr::new("200"),
+        ])
+        .expect("failed to parse correct-reads args");
+        cmd.execute("fgumi simulate correct-reads").expect_err("the writer cannot succeed")
+    } else {
+        let cmd = ConsensusReads::try_parse_from([
+            OsStr::new("consensus-reads"),
+            OsStr::new("-o"),
+            output.as_os_str(),
+            OsStr::new("--reference"),
+            reference.as_os_str(),
+            OsStr::new("--num-reads"),
+            OsStr::new("200"),
+        ])
+        .expect("failed to parse consensus-reads args");
+        cmd.execute("fgumi simulate consensus-reads").expect_err("the writer cannot succeed")
+    };
+
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("Failed to create output BAM"),
+        "the writer's own error must be reported, got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("Failed to send record to writer"),
+        "the send failure is the symptom, not the cause: {rendered}"
+    );
 }

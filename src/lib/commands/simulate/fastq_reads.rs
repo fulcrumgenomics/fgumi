@@ -5,7 +5,7 @@ use crate::commands::common::parse_bool;
 use crate::commands::simulate::common::{
     FamilySizeArgs, InsertSizeArgs, MethylationArgs, MethylationConfig, QualityArgs,
     ReferenceGenome, SimulationCommon, apply_methylation_conversion, body_error_rng,
-    generate_random_sequence, introduce_errors_inplace,
+    generate_random_sequence, introduce_errors_inplace, join_writer_result,
 };
 use crate::simulate::{FastqWriter, create_rng};
 use anyhow::{Context, Result, bail};
@@ -359,14 +359,7 @@ impl Command for FastqReads {
         // Drop sender to signal writer thread that we're done
         drop(sender);
 
-        // Check generation result
-        if let Err(e) = generation_result {
-            return Err(anyhow::anyhow!("Failed to send record to writer: {e}"));
-        }
-
-        // Wait for writer thread to finish
-        let read_count =
-            writer_handle.join().map_err(|_| anyhow::anyhow!("Writer thread panicked"))??;
+        let read_count = join_writer_result(writer_handle, generation_result)?;
 
         info!("Generated {read_count} read pairs");
         info!("Done");
