@@ -52,6 +52,152 @@ pub fn create_grouped_family(
     )
 }
 
+/// Creates one duplex-grouped molecule: `depth` read pairs on each strand.
+///
+/// The duplex consensus caller and both metrics commands key off an `MI` tag
+/// carrying a `/A` or `/B` strand suffix, and a molecule seen on only one strand
+/// yields no duplex output at all — so the minimum shape that makes those
+/// commands emit anything is both strands of one molecule. Reads also carry
+/// `RX`, which is what the `umi_counts` table is keyed on; with `MI` alone the
+/// metrics commands write an empty UMI table.
+///
+/// Orientation mirrors a real duplex pair: `/A` is FR (R1 forward at
+/// `ref_start`, R2 reverse 100bp downstream) and `/B` is RF. The two strands see
+/// the paired UMI in opposite order, so `RX` is swapped between them.
+///
+/// `test_duplex_command` has its own private builder of the same shape that
+/// tags `MI` only. This one lives here because several test modules need it and
+/// because it also tags `RX`; folding that one into this would add `RX` to the
+/// records those duplex tests assert on, which is a change to them, not to this.
+pub fn create_duplex_grouped_family(
+    mi: &str,
+    depth: usize,
+    sequence: &str,
+    quality: u8,
+    ref_start: i32,
+) -> Vec<RawRecord> {
+    let mut records = Vec::with_capacity(depth * 4);
+    for (strand, umi, is_b_strand) in [("A", "AAA-TTT", false), ("B", "TTT-AAA", true)] {
+        records.extend(strand_reads(
+            mi,
+            strand,
+            umi,
+            depth,
+            sequence,
+            quality,
+            ref_start,
+            is_b_strand,
+        ));
+    }
+    records
+}
+
+/// Creates a single-strand (`/A`-only) grouped molecule of `depth` read pairs.
+///
+/// `simplex-metrics` *rejects* input whose base UMI appears on both strands —
+/// "received duplex-UMI data … run duplex-metrics" — so it cannot share
+/// [`create_duplex_grouped_family`]'s fixture. This is the same shape with the
+/// `/B` half left off.
+pub fn create_single_strand_family(
+    mi: &str,
+    depth: usize,
+    sequence: &str,
+    quality: u8,
+    ref_start: i32,
+) -> Vec<RawRecord> {
+    strand_reads(mi, "A", "AAA-TTT", depth, sequence, quality, ref_start, false)
+}
+
+/// `depth` read pairs on one strand of molecule `mi`.
+#[expect(clippy::too_many_arguments, reason = "internal builder; every field varies per strand")]
+fn strand_reads(
+    mi: &str,
+    strand: &str,
+    umi: &str,
+    depth: usize,
+    sequence: &str,
+    quality: u8,
+    ref_start: i32,
+    is_b_strand: bool,
+) -> Vec<RawRecord> {
+    let mut records = Vec::with_capacity(depth * 2);
+    for i in 0..depth {
+        let (r1, r2) = duplex_read_pair(
+            &format!("{mi}{strand}{i}"),
+            &format!("{mi}/{strand}"),
+            umi,
+            sequence,
+            quality,
+            ref_start,
+            is_b_strand,
+        );
+        records.push(r1);
+        records.push(r2);
+    }
+    records
+}
+
+/// One `RX`+`MI`-tagged read pair on the `/A` (FR) or `/B` (RF) strand.
+///
+/// The strand's orientation is the whole point: the duplex caller pairs an
+/// FR template with the RF template at the same coordinates, so getting the
+/// flags or the mate positions wrong silently produces two single-strand
+/// molecules rather than one duplex.
+fn duplex_read_pair(
+    name: &str,
+    mi: &str,
+    umi: &str,
+    sequence: &str,
+    quality: u8,
+    ref_start: i32,
+    is_b_strand: bool,
+) -> (RawRecord, RawRecord) {
+    let seq = sequence.as_bytes();
+    let read_len = seq.len();
+    let cigar_op = u32::try_from(read_len).expect("read_len fits u32") << 4;
+    let span = i32::try_from(read_len + 100).expect("template span fits i32");
+
+    // B strand is the same molecule read the other way round: R1 reverse at the
+    // far position, R2 forward at the near one.
+    let (r1_start, r2_start, r1_rev, r2_rev) = if is_b_strand {
+        (ref_start + 100, ref_start, true, false)
+    } else {
+        (ref_start, ref_start + 100, false, true)
+    };
+    let tlen = if is_b_strand { -span } else { span };
+
+    let build = |first: bool| {
+        let (pos, mate_pos, rev, mate_rev) = if first {
+            (r1_start, r2_start, r1_rev, r2_rev)
+        } else {
+            (r2_start, r1_start, r2_rev, r1_rev)
+        };
+        let segment = if first { flags::FIRST_SEGMENT } else { flags::LAST_SEGMENT };
+        let mut b = SamBuilder::new();
+        b.read_name(name.as_bytes())
+            .sequence(seq)
+            .qualities(&vec![quality; read_len])
+            .flags(
+                flags::PAIRED
+                    | segment
+                    | if rev { flags::REVERSE } else { 0 }
+                    | if mate_rev { flags::MATE_REVERSE } else { 0 },
+            )
+            .ref_id(0)
+            .pos(pos - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar_op])
+            .mate_ref_id(0)
+            .mate_pos(mate_pos - 1)
+            .template_length(if first { tlen } else { -tlen })
+            .add_string_tag(SamTag::RX, umi.as_bytes())
+            .add_string_tag(SamTag::MI, mi.as_bytes());
+        b.build()
+    };
+
+    (build(true), build(false))
+}
+
 /// Creates mapped consensus records carrying the per-read and per-base consensus
 /// tags (`cD`/`cE` and `cd`/`ce`).
 ///
