@@ -1,0 +1,809 @@
+//! Every command declares — and is held to — its input-source contract.
+//!
+//! Two properties are easy to get wrong per-command and impossible to eyeball
+//! across the whole CLI:
+//!
+//! 1. **Uncompressed SAM** must be accepted anywhere BAM is, because input
+//!    format is a property of the data, not of the command.
+//! 2. **stdin** (`-i -`) must be accepted by anything that streams, so commands
+//!    compose in a pipeline.
+//!
+//! Both were previously true of some commands and not others, and nothing
+//! failed when a new command picked the wrong reader. The table below is the
+//! contract: every command the binary advertises must appear in it with an
+//! explicit stance, and [`every_command_declares_an_input_contract`] fails when
+//! one does not — so adding a command forces a decision rather than inheriting
+//! whichever default its reader happened to have.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use tempfile::TempDir;
+
+use crate::helpers::bam_generator::{
+    create_consensus_family, create_grouped_family, create_minimal_header, create_test_reference,
+    create_umi_family, transcode_bam_to_sam, write_bam,
+};
+
+/// Whether a command reads alignment records from a caller-supplied path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Support {
+    /// The command must accept this input source.
+    Required,
+    /// The command legitimately cannot accept it; the string is why.
+    NotApplicable(&'static str),
+}
+
+use Support::{NotApplicable, Required};
+
+/// One command's declared input-source contract.
+struct InputContract {
+    /// Subcommand name as it appears in `fgumi --help`.
+    command: &'static str,
+    /// Whether `-i in.sam` must work.
+    sam: Support,
+    /// Whether `-i -` must work.
+    stdin: Support,
+}
+
+/// The contract for every command the binary advertises.
+///
+/// A `NotApplicable` reason is a claim about the command's design, not a
+/// to-do — if the reason stops being true, the entry should change.
+const CONTRACTS: &[InputContract] = &[
+    InputContract {
+        command: "extract",
+        sam: NotApplicable("reads FASTQ, not alignment records"),
+        // Only with a single input: one stdin cannot supply two FASTQs.
+        stdin: Required,
+    },
+    InputContract { command: "correct", sam: Required, stdin: Required },
+    InputContract { command: "fastq", sam: Required, stdin: Required },
+    InputContract { command: "zipper", sam: Required, stdin: Required },
+    InputContract { command: "sort", sam: Required, stdin: Required },
+    InputContract {
+        command: "merge",
+        sam: Required,
+        stdin: NotApplicable("merges N pre-sorted inputs named in a list file"),
+    },
+    InputContract { command: "group", sam: Required, stdin: Required },
+    InputContract { command: "dedup", sam: Required, stdin: Required },
+    #[cfg(feature = "simplex")]
+    InputContract { command: "simplex", sam: Required, stdin: Required },
+    #[cfg(feature = "duplex")]
+    InputContract { command: "duplex", sam: Required, stdin: Required },
+    #[cfg(feature = "codec")]
+    InputContract { command: "codec", sam: Required, stdin: Required },
+    InputContract { command: "filter", sam: Required, stdin: Required },
+    InputContract { command: "clip", sam: Required, stdin: Required },
+    #[cfg(feature = "duplex")]
+    InputContract { command: "duplex-metrics", sam: Required, stdin: Required },
+    #[cfg(feature = "simplex")]
+    InputContract { command: "simplex-metrics", sam: Required, stdin: Required },
+    InputContract {
+        command: "review",
+        sam: NotApplicable("requires BAI indexes and does random access, which needs BGZF"),
+        stdin: NotApplicable("does random access against a BAI index"),
+    },
+    InputContract { command: "downsample", sam: Required, stdin: Required },
+    #[cfg(feature = "compare")]
+    InputContract {
+        command: "compare",
+        sam: Required,
+        stdin: NotApplicable("compares two named files against each other"),
+    },
+    #[cfg(feature = "simulate")]
+    InputContract {
+        command: "simulate",
+        sam: NotApplicable("generates data rather than reading it"),
+        stdin: NotApplicable("generates data rather than reading it"),
+    },
+];
+
+/// Subcommands that `fgumi --help` lists but that are not fgumi commands.
+const NOT_A_COMMAND: &[&str] = &["help"];
+
+/// Parses the subcommand names out of `fgumi --help`.
+///
+/// Reading the binary's own help keeps this test honest against the real CLI
+/// rather than a hand-maintained copy of it: a command added to the clap enum
+/// shows up here immediately.
+fn advertised_commands() -> Vec<String> {
+    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .arg("--help")
+        .output()
+        .expect("failed to run fgumi --help");
+    let help = String::from_utf8_lossy(&output.stdout);
+
+    let mut commands = Vec::new();
+    let mut in_commands = false;
+    for line in help.lines() {
+        if line.starts_with("Commands:") {
+            in_commands = true;
+            continue;
+        }
+        if in_commands {
+            // The section ends at the first blank line before `Options:`.
+            if line.trim().is_empty() {
+                break;
+            }
+            // Entries are indented; continuation lines are indented further and
+            // carry no new name in the first column.
+            let Some(name) = line.split_whitespace().next() else { continue };
+            if line.starts_with("  ") && !name.starts_with('-') {
+                commands.push(name.to_string());
+            }
+        }
+    }
+
+    assert!(!commands.is_empty(), "parsed no commands out of `fgumi --help`:\n{help}");
+    commands
+}
+
+/// The contract table must cover exactly the commands the binary advertises.
+///
+/// This is the test that makes the rest of the file exhaustive: a new command
+/// fails here until someone states whether it takes SAM and stdin.
+#[test]
+fn every_command_declares_an_input_contract() {
+    let advertised: Vec<String> = advertised_commands()
+        .into_iter()
+        .filter(|name| !NOT_A_COMMAND.contains(&name.as_str()))
+        .collect();
+
+    let declared: Vec<&str> = CONTRACTS.iter().map(|c| c.command).collect();
+
+    let undeclared: Vec<&String> =
+        advertised.iter().filter(|name| !declared.contains(&name.as_str())).collect();
+    assert!(
+        undeclared.is_empty(),
+        "these commands are advertised by `fgumi --help` but declare no input contract in \
+         CONTRACTS: {undeclared:?}. Add an entry stating whether each accepts SAM and stdin."
+    );
+
+    let stale: Vec<&&str> =
+        declared.iter().filter(|name| !advertised.contains(&(**name).to_string())).collect();
+    assert!(
+        stale.is_empty(),
+        "these commands declare an input contract but are no longer advertised by \
+         `fgumi --help`: {stale:?}. Remove their CONTRACTS entries."
+    );
+}
+
+/// Test data shaped for whichever command is under test.
+///
+/// Commands reject inputs that don't carry what they consume (MI tags, a
+/// query-grouped header), so "does it accept SAM/stdin" can only be answered
+/// with an input the command would otherwise be happy with.
+struct Fixture {
+    bam: PathBuf,
+    sam: PathBuf,
+    /// One-line list files naming `bam` / `sam`, for commands that take `-b`.
+    bam_list: PathBuf,
+    sam_list: PathBuf,
+    /// A small uncompressed FASTQ, for `extract`, which reads FASTQ not BAM.
+    fastq: PathBuf,
+}
+
+impl Fixture {
+    /// The path to hand a command as its input, in the requested format.
+    ///
+    /// `merge` names its inputs in a list file rather than via `-i`, so its
+    /// format coverage comes from the list pointing at a SAM path.
+    fn input_for(&self, command: &str, sam: bool) -> &Path {
+        match (command, sam) {
+            // `extract` reads FASTQ; it has no BAM/SAM axis at all.
+            ("extract", _) => &self.fastq,
+            ("merge", true) => &self.sam_list,
+            ("merge", false) => &self.bam_list,
+            (_, true) => &self.sam,
+            (_, false) => &self.bam,
+        }
+    }
+}
+
+/// The record shape a command accepts.
+///
+/// A command rejects input that doesn't carry what it consumes, so "does it
+/// accept SAM/stdin" can only be answered with an input it would otherwise be
+/// happy with — otherwise a fixture mismatch masquerades as a format failure.
+#[derive(Debug, Clone, Copy)]
+enum Shape {
+    /// Two UMI families tagged `RX`, un-grouped.
+    Ungrouped,
+    /// One already-grouped family tagged `RX` + `MI`, trivially sorted.
+    Grouped,
+    /// Consensus-called reads tagged `cD`/`cE`.
+    Consensus,
+}
+
+/// The record shape `command` requires.
+fn shape_for(command: &str) -> Shape {
+    match command {
+        // Rejects any read lacking cD/cE consensus-calling tags.
+        "filter" => Shape::Consensus,
+        // `downsample` requires MI; `merge` refuses an input that is not already
+        // in template-coordinate order, which a single one-position family is.
+        "downsample" | "merge" => Shape::Grouped,
+        _ => Shape::Ungrouped,
+    }
+}
+
+/// Writes the input `command` accepts, as both BAM and the equivalent SAM.
+fn write_fixture(dir: &Path, command: &str) -> Fixture {
+    let bam = dir.join("input.bam");
+    let sam = dir.join("input.sam");
+
+    // `create_minimal_header` advertises SO:unsorted GO:query
+    // SS:template-coordinate, which the grouping and consensus commands require.
+    let header = create_minimal_header("chr1", 10_000);
+    let records = match shape_for(command) {
+        Shape::Consensus => create_consensus_family(2, "cons", "ACGTACGT"),
+        Shape::Grouped => create_grouped_family("ACGTACGT", "1", 3, "fam_a", "ACGTACGTAC", 35),
+        Shape::Ungrouped => {
+            let mut records = create_umi_family("ACGTACGT", 3, "fam_a", "ACGTACGTAC", 35);
+            records.extend(create_umi_family("TTTTGGGG", 2, "fam_b", "ACGTACGTAC", 35));
+            records
+        }
+    };
+    write_bam(&bam, &header, &records);
+
+    // `merge` refuses an input that is not already in template-coordinate order,
+    // and that order tie-breaks the name lane by hash — so hand-ordering the
+    // records is not reliably sorted. Sort with the tool rather than guessing.
+    if command == "merge" {
+        let sorted = dir.join("sorted.bam");
+        let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+            .args(["sort", "-i"])
+            .arg(&bam)
+            .arg("-o")
+            .arg(&sorted)
+            .args(["--order", "template-coordinate"])
+            .status()
+            .expect("failed to run fgumi sort");
+        assert!(status.success(), "failed to template-coordinate sort the merge fixture");
+        std::fs::rename(&sorted, &bam).expect("replace fixture with its sorted form");
+    }
+
+    transcode_bam_to_sam(&bam, &sam);
+
+    // Four reads: enough for `extract` to emit records, small enough to stay cheap.
+    let fastq = dir.join("input.fq");
+    let fastq_text = (0..4).fold(String::new(), |mut text, i| {
+        use std::fmt::Write as _;
+        writeln!(text, "@read_{i}\nACGTACGTACGTACGTAC\n+\nIIIIIIIIIIIIIIIIII")
+            .expect("writing to a String cannot fail");
+        text
+    });
+    std::fs::write(&fastq, fastq_text).expect("write FASTQ");
+
+    let bam_list = dir.join("bam.list");
+    std::fs::write(&bam_list, format!("{}\n", bam.display())).expect("write BAM list");
+    let sam_list = dir.join("sam.list");
+    std::fs::write(&sam_list, format!("{}\n", sam.display())).expect("write SAM list");
+
+    Fixture { bam, sam, bam_list, sam_list, fastq }
+}
+
+/// The arguments that exercise `command`'s record-reading path.
+///
+/// `{input}` and `{output}` are substituted. Returns `None` for commands whose
+/// contract is `NotApplicable` on both axes, which are never invoked here.
+fn invocation(command: &str) -> Option<Vec<&'static str>> {
+    let args: Vec<&'static str> = match command {
+        "correct" => vec!["correct", "-i", "{input}", "-o", "{output}", "-U", "{umis}", "-d", "1"],
+        "fastq" => vec!["fastq", "-i", "{input}", "-o", "{output}"],
+        "zipper" => {
+            vec!["zipper", "-i", "{input}", "-u", "{bam}", "-r", "{reference}", "-o", "{output}"]
+        }
+        "sort" => vec!["sort", "-i", "{input}", "-o", "{output}", "--order", "queryname"],
+        "merge" => {
+            vec!["merge", "-b", "{input}", "-o", "{output}", "--order", "template-coordinate"]
+        }
+        "group" => vec!["group", "-i", "{input}", "-o", "{output}", "--strategy", "adjacency"],
+        "dedup" => vec!["dedup", "-i", "{input}", "-o", "{output}"],
+        "simplex" => vec!["simplex", "-i", "{input}", "-o", "{output}", "--min-reads", "1"],
+        "duplex" => vec!["duplex", "-i", "{input}", "-o", "{output}", "--min-reads", "1"],
+        "codec" => vec!["codec", "-i", "{input}", "-o", "{output}"],
+        "filter" => {
+            vec![
+                "filter",
+                "-i",
+                "{input}",
+                "-o",
+                "{output}",
+                "-r",
+                "{reference}",
+                "--min-reads",
+                "1",
+            ]
+        }
+        "clip" => {
+            vec![
+                "clip",
+                "-i",
+                "{input}",
+                "-o",
+                "{output}",
+                "-r",
+                "{reference}",
+                "--clip-overlapping-reads",
+            ]
+        }
+        "duplex-metrics" => vec!["duplex-metrics", "-i", "{input}", "-o", "{output}"],
+        "simplex-metrics" => vec!["simplex-metrics", "-i", "{input}", "-o", "{output}"],
+        "downsample" => {
+            vec!["downsample", "-i", "{input}", "-o", "{output}", "-f", "1.0", "--seed", "42"]
+        }
+        "compare" => vec!["compare", "bams", "{input}", "{bam}"],
+        "extract" => vec![
+            "extract",
+            "-i",
+            "{input}",
+            "-o",
+            "{output}",
+            "-r",
+            "8M+T",
+            "--sample",
+            "S1",
+            "--library",
+            "L1",
+        ],
+        _ => return None,
+    };
+    Some(args)
+}
+
+/// Runs `command`'s invocation with `input` substituted in.
+///
+/// `run_tag` names a per-run subdirectory to write `{output}` into. Two runs of
+/// the same command in one fixture directory would otherwise write to the same
+/// path, so the second silently overwrites the first — which is fatal when one
+/// run is meant to be the other's oracle. It also keeps the multi-file outputs
+/// (the metrics commands write several files off one prefix) separated without
+/// having to know each command's file naming.
+fn run_command(
+    command: &str,
+    input: &str,
+    dir: &Path,
+    fixture: &Fixture,
+    pipe: Option<&Path>,
+    run_tag: &str,
+) -> std::process::Output {
+    let args = invocation(command).expect("command has an invocation");
+
+    let run_dir = dir.join(run_tag);
+    std::fs::create_dir_all(&run_dir).expect("create per-run output dir");
+    let output = run_dir.join(format!("{command}.out"));
+    let reference = create_test_reference(dir);
+    let umis = dir.join("umis.txt");
+    std::fs::write(&umis, "ACGTACGT\nTTTTGGGG\n").expect("write UMI list");
+
+    let substituted: Vec<String> = args
+        .iter()
+        .map(|arg| match *arg {
+            "{input}" => input.to_string(),
+            "{output}" => output.display().to_string(),
+            "{bam}" => fixture.bam.display().to_string(),
+            "{reference}" => reference.display().to_string(),
+            "{umis}" => umis.display().to_string(),
+            other => other.to_string(),
+        })
+        .collect();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fgumi"));
+    cmd.args(&substituted);
+    if let Some(path) = pipe {
+        cmd.stdin(Stdio::from(std::fs::File::open(path).expect("open input to pipe")));
+    }
+    cmd.output().expect("failed to run fgumi")
+}
+
+/// Runs `check` over every command whose contract selects it, reporting *all*
+/// failures rather than dying on the first.
+///
+/// Driving the command list from [`CONTRACTS`] instead of a hand-written
+/// `#[values(...)]` list is what makes these matrices exhaustive: a command that
+/// declares `Required` is exercised because it declared it, so the declaration
+/// and the coverage cannot drift apart. (Feature-gated commands compile out of
+/// `CONTRACTS` along with themselves, so they are simply absent here.)
+fn for_each_command_requiring(
+    axis: impl Fn(&InputContract) -> Support,
+    check: impl Fn(&str, &Fixture, &Path) -> Result<(), String>,
+) {
+    let mut failures = Vec::new();
+    let mut exercised = 0;
+
+    for contract in CONTRACTS.iter().filter(|c| axis(c) == Required) {
+        let dir = TempDir::new().expect("create temp dir");
+        let fixture = write_fixture(dir.path(), contract.command);
+        exercised += 1;
+        if let Err(failure) = check(contract.command, &fixture, dir.path()) {
+            failures.push(failure);
+        }
+    }
+
+    assert!(exercised > 0, "no command declared this axis Required — the matrix ran nothing");
+    assert!(
+        failures.is_empty(),
+        "{} command(s) failed:\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+}
+
+/// A run's output, reduced to something comparable across input formats.
+///
+/// BAM outputs are rendered back to SAM text, so a dropped, reordered or
+/// altered record fails while two things that legitimately differ are
+/// normalized away:
+///
+/// - the `@PG` `CL` line, which names the input path;
+/// - the **width** of integer aux values. SAM's `i` type carries no width, so a
+///   `cD:i:10` read from SAM text is re-encoded as `Int32` while the same tag in
+///   the original BAM may have been stored as `Int8`. Every tool picks its own
+///   width (htslib narrows to the smallest that fits; noodles does not), so
+///   requiring byte-identical aux encoding across a SAM round-trip would be
+///   requiring something no BAM writer guarantees. Rendering to SAM compares the
+///   values, which is the property that actually has to hold.
+///
+/// Everything else — FASTQ, metrics tables — is compared as text with the parts
+/// that name the run scrubbed.
+#[derive(Debug, PartialEq)]
+enum OutputDigest {
+    Bam(String),
+    Text(String),
+}
+
+/// Renders a BAM output back to SAM text for comparison. See [`OutputDigest`].
+fn render_bam_as_sam(path: &Path) -> String {
+    use noodles::sam::alignment::io::Write as _;
+
+    let (header, records) = crate::helpers::read_bam_output(path);
+    let mut text = Vec::new();
+    {
+        let mut writer = noodles::sam::io::Writer::new(&mut text);
+        writer.write_header(&header).expect("render SAM header");
+        for record in &records {
+            writer.write_alignment_record(&header, record).expect("render SAM record");
+        }
+    }
+    String::from_utf8(text).expect("rendered SAM is UTF-8")
+}
+
+/// The digest key holding a run's stdout. See [`digest_run`].
+///
+/// Angle-bracketed so it reads as "not a file" in a failure message. No command's
+/// `invocation` writes an output by this name, so it cannot collide with one; a key
+/// present twice would surface as a difference rather than silently overwrite,
+/// since the digest is a sorted `Vec` compared element-wise.
+const STDOUT_KEY: &str = "<stdout>";
+
+/// Reduces a run to a name-keyed digest: every file it wrote, plus its stdout.
+///
+/// Keyed by name rather than compared as a blob because the metrics commands write
+/// several files from one `--output` prefix; a missing file must read as a
+/// difference, not as a shorter list.
+///
+/// `stdout` is folded in under [`STDOUT_KEY`] because a command's output is not
+/// necessarily a file: `compare bams` writes its report to stdout and takes no
+/// `--output` at all, so a files-only digest was empty for both runs and the SAM
+/// comparison silently degenerated to comparing exit statuses — the very weakness
+/// this comparison exists to close. Empty stdout contributes no entry, so commands
+/// that only write files are unaffected.
+fn digest_run(run_dir: &Path, stdout: &[u8]) -> Vec<(String, OutputDigest)> {
+    let mut digests = digest_files(run_dir);
+    if !stdout.is_empty() {
+        digests.push((
+            STDOUT_KEY.to_string(),
+            OutputDigest::Text(scrub_run_identity(&String::from_utf8_lossy(stdout))),
+        ));
+    }
+    digests.sort_by(|a, b| a.0.cmp(&b.0));
+    digests
+}
+
+/// Reduces every file `run_dir` holds to a name-keyed digest, in no particular
+/// order — [`digest_run`] owns the sort, since it also contributes an entry. See
+/// [`digest_run`].
+fn digest_files(run_dir: &Path) -> Vec<(String, OutputDigest)> {
+    let Ok(entries) = std::fs::read_dir(run_dir) else { return Vec::new() };
+
+    let digests: Vec<(String, OutputDigest)> = entries
+        .map(|entry| entry.expect("read output dir entry").path())
+        .filter(|path| path.is_file())
+        .map(|path| {
+            // The file name is the same in both runs — only the parent
+            // directory differs — so it is a stable key.
+            let name =
+                path.file_name().expect("output file has a name").to_string_lossy().to_string();
+            let bytes = std::fs::read(&path).expect("read output file");
+            let digest = if bytes.starts_with(&[0x1f, 0x8b]) {
+                OutputDigest::Bam(render_bam_as_sam(&path))
+            } else {
+                OutputDigest::Text(scrub_run_identity(&String::from_utf8_lossy(&bytes)))
+            };
+            (name, digest)
+        })
+        .collect();
+    digests
+}
+
+/// Removes the parts of a text output that name *which* run produced it.
+///
+/// The runs differ only in their input source and their output directory, and
+/// commands that echo either into their output would otherwise never compare
+/// equal. Anything else that differs is a real difference.
+fn scrub_run_identity(text: &str) -> String {
+    // Longest tag first: `STDIN_SAM_RUN` contains `SAM_RUN`, so scrubbing the
+    // short one first would leave `stdin-<RUN>` behind and every stdin-SAM
+    // comparison would fail on a difference that is not one.
+    text.replace("input.sam", "<INPUT>")
+        .replace("input.bam", "<INPUT>")
+        .replace("sam.list", "<LIST>")
+        .replace("bam.list", "<LIST>")
+        .replace(STDIN_SAM_RUN, "<RUN>")
+        .replace(STDIN_RUN, "<RUN>")
+        .replace(SAM_RUN, "<RUN>")
+        .replace(BAM_RUN, "<RUN>")
+}
+
+/// Per-run output subdirectory names (see `run_command`'s `run_tag`).
+const BAM_RUN: &str = "bam-run";
+const SAM_RUN: &str = "sam-run";
+const STDIN_RUN: &str = "stdin-run";
+const STDIN_SAM_RUN: &str = "stdin-sam-run";
+
+/// Describes the first way two runs' outputs differ, or `None` if they match.
+///
+/// A bare `assert_eq!` on the digests would dump two multi-megabyte record
+/// dumps into the failure, which is unreadable. This names the file and the
+/// offset that first diverges and quotes a window around it.
+///
+/// The oracle is always the run that read a named path (see
+/// [`run_named_path_oracle`]); `candidate_label` names the input source being
+/// held to it, so a failure says which axis broke rather than always blaming
+/// SAM.
+fn describe_difference(
+    oracle: &[(String, OutputDigest)],
+    candidate: &[(String, OutputDigest)],
+    candidate_label: &str,
+) -> Option<String> {
+    let oracle_files: Vec<&String> = oracle.iter().map(|(name, _)| name).collect();
+    let candidate_files: Vec<&String> = candidate.iter().map(|(name, _)| name).collect();
+    if oracle_files != candidate_files {
+        return Some(format!(
+            "  files from a named path: {oracle_files:?}\n  \
+             files from {candidate_label}: {candidate_files:?}"
+        ));
+    }
+
+    for ((name, bam), (_, sam)) in oracle.iter().zip(candidate) {
+        if bam == sam {
+            continue;
+        }
+        let (kind, oracle_text, candidate_text) = match (bam, sam) {
+            (OutputDigest::Bam(b), OutputDigest::Bam(s)) => ("BAM records", b, s),
+            (OutputDigest::Text(b), OutputDigest::Text(s)) => ("text", b, s),
+            _ => return Some(format!("  {name}: one run wrote BAM, the other wrote text")),
+        };
+        let at = oracle_text
+            .char_indices()
+            .zip(candidate_text.chars())
+            .find(|((_, b), s)| b != s)
+            .map_or_else(|| oracle_text.len().min(candidate_text.len()), |((i, _), _)| i);
+        let window =
+            |text: &str| -> String { text.chars().skip(at.saturating_sub(60)).take(180).collect() };
+        return Some(format!(
+            "  {name} ({kind}) diverges at byte {at}\n    \
+             from a named path: …{}…\n    from {candidate_label}: …{}…",
+            window(oracle_text),
+            window(candidate_text)
+        ));
+    }
+    None
+}
+
+/// Runs `command` over its fixture named on the command line — the input source
+/// every other axis is held to.
+///
+/// That fixture is a BAM for every command but `extract`, which reads FASTQ, so
+/// the wording here stays "a named path" rather than "BAM".
+///
+/// This is the control as much as the oracle: if the command cannot process the
+/// fixture at all, whatever the SAM or stdin run did proves nothing, so that is
+/// reported as the failure rather than a difference nobody can interpret.
+fn run_named_path_oracle(
+    command: &str,
+    fixture: &Fixture,
+    dir: &Path,
+    candidate_label: &str,
+) -> Result<std::process::Output, String> {
+    let named_input = fixture.input_for(command, false).display().to_string();
+    let oracle_run = run_command(command, &named_input, dir, fixture, None, BAM_RUN);
+    if oracle_run.status.success() {
+        Ok(oracle_run)
+    } else {
+        Err(format!(
+            "{command}: failed on a named path, so its {candidate_label} result would \
+             prove nothing: {}",
+            String::from_utf8_lossy(&oracle_run.stderr)
+        ))
+    }
+}
+
+/// Holds a run to the named-path oracle's output, file by file.
+///
+/// Exit status alone is too weak for any of these contracts: a command that read
+/// the input a different way and dropped, reordered or altered records still
+/// exits zero, and on the stdin axis a lost prefix or a double-read of fd 0
+/// leaves a header-only output that also exits zero. Comparing against the
+/// named-path run is what turns "it ran" into "it produced the same thing".
+///
+/// # What the `oracle.is_empty()` guard does and does not prove
+///
+/// It proves the harness can *see* the run's artifacts, not that those artifacts
+/// are sensitive to the records that went in. Measured by fault injection —
+/// piping a header-only BAM, i.e. a stdin path that consumed nothing yet still
+/// exited 0 — the comparison catches that for `correct`, `fastq`, `sort`,
+/// `group`, `dedup`, `filter`, `clip` and `downsample` (`extract` is caught a
+/// step earlier, by the exit status). It cannot catch it for five commands, for
+/// two distinct reasons, neither fixable by a stronger guard here:
+///
+/// - `simplex`, `duplex` and `codec` write a header-only BAM from *any* input,
+///   because [`write_fixture`] gives them ungrouped reads. Grouping the fixture
+///   gets `simplex` to one consensus record but not the other two: `duplex`
+///   needs strand-suffixed (`/A`, `/B`) `MI` families and `codec` needs CODEC
+///   read structure, so closing this needs new fixture generators.
+/// - `simplex-metrics` and `duplex-metrics` emit the same all-zero tables either
+///   way, since their fixture carries no consensus tags to count.
+///
+/// `zipper` is insensitive for a third reason that is *not* a gap: its output is
+/// driven by the uBAM it is given as `-u`, so an empty `-i` legitimately still
+/// yields every unmapped template. Its stdin coverage is the exit status.
+fn compare_to_oracle(
+    command: &str,
+    dir: &Path,
+    oracle_run: &std::process::Output,
+    candidate_run: &std::process::Output,
+    candidate_tag: &str,
+    candidate_label: &str,
+) -> Result<(), String> {
+    let oracle = digest_run(&dir.join(BAM_RUN), &oracle_run.stdout);
+    let candidate = digest_run(&dir.join(candidate_tag), &candidate_run.stdout);
+
+    // A command whose artifacts this harness cannot see would compare two empty
+    // digests and pass, which is indistinguishable from a genuine match. Fail
+    // loudly instead, so a new command that writes somewhere unexpected has to
+    // be taught about rather than silently exempted.
+    if oracle.is_empty() {
+        return Err(format!(
+            "{command}: the named-path run produced no comparable output, so the \
+             {candidate_label} comparison would be vacuous — give this command an \
+             `{{output}}` in `invocation`, or have it write something this digest can see"
+        ));
+    }
+
+    if let Some(difference) = describe_difference(&oracle, &candidate, candidate_label) {
+        return Err(format!(
+            "{command}: accepted {candidate_label} but produced different output than the \
+             same records from a named path\n{difference}"
+        ));
+    }
+    Ok(())
+}
+
+/// Every command declaring `sam: Required` must accept a `.sam` input **and
+/// produce the same output from it**.
+///
+/// SAM must be accepted *anywhere BAM is*, so the BAM run is the oracle and the
+/// SAM run is compared against it file by file. See [`compare_to_oracle`].
+#[test]
+fn declared_sam_support_holds() {
+    for_each_command_requiring(
+        |c| c.sam,
+        |command, fixture, dir| {
+            let oracle_run = run_named_path_oracle(command, fixture, dir, "SAM")?;
+
+            let sam_input = fixture.input_for(command, true).display().to_string();
+            let sam_run = run_command(command, &sam_input, dir, fixture, None, SAM_RUN);
+            if !sam_run.status.success() {
+                return Err(format!(
+                    "{command}: declares SAM support but rejected SAM input: {}",
+                    String::from_utf8_lossy(&sam_run.stderr)
+                ));
+            }
+
+            compare_to_oracle(command, dir, &oracle_run, &sam_run, SAM_RUN, "SAM")
+        },
+    );
+}
+
+/// Every command declaring `stdin: Required` must accept `-i -` **and produce
+/// the same output from it as from the same records in a named file**.
+///
+/// stdin is the non-rewindable path this harness exists to cover: the format is
+/// sniffed by tee-and-replay rather than by seeking, so a prefix consumed and
+/// not replayed, or a second reader that re-reads an already-drained fd 0, is
+/// the live failure mode — and every one of those still exits zero over a
+/// header-only output. See [`compare_to_oracle`].
+#[test]
+fn declared_stdin_support_holds() {
+    for_each_command_requiring(
+        |c| c.stdin,
+        |command, fixture, dir| {
+            let oracle_run = run_named_path_oracle(command, fixture, dir, "stdin")?;
+
+            let piped_source = fixture.input_for(command, false).to_path_buf();
+            let piped = run_command(command, "-", dir, fixture, Some(&piped_source), STDIN_RUN);
+            if !piped.status.success() {
+                return Err(format!(
+                    "{command}: declares stdin support but rejected `-i -`: {}",
+                    String::from_utf8_lossy(&piped.stderr)
+                ));
+            }
+
+            compare_to_oracle(command, dir, &oracle_run, &piped, STDIN_RUN, "stdin")
+        },
+    );
+}
+
+/// SAM on stdin is the compound case: the format is sniffed from a stream that
+/// cannot be rewound, so it exercises the tee-and-replay header parse rather
+/// than the seek-based one — and the replayed prefix is SAM text rather than a
+/// BGZF block, so both normalizations run over a pipe at once.
+///
+/// Only commands that require *both* axes qualify — `extract` streams stdin but
+/// reads FASTQ, so there is no SAM form of its input.
+#[test]
+fn declared_stdin_support_accepts_piped_sam() {
+    for_each_command_requiring(
+        |c| {
+            if c.sam == Required && c.stdin == Required {
+                Required
+            } else {
+                NotApplicable("needs both a SAM form and stdin support")
+            }
+        },
+        |command, fixture, dir| {
+            let oracle_run = run_named_path_oracle(command, fixture, dir, "piped SAM")?;
+
+            let piped = run_command(command, "-", dir, fixture, Some(&fixture.sam), STDIN_SAM_RUN);
+            if !piped.status.success() {
+                return Err(format!(
+                    "{command}: accepts piped BAM but rejected piped SAM: {}",
+                    String::from_utf8_lossy(&piped.stderr)
+                ));
+            }
+
+            compare_to_oracle(command, dir, &oracle_run, &piped, STDIN_SAM_RUN, "piped SAM")
+        },
+    );
+}
+
+/// One stdin cannot supply two FASTQs, so `extract` must reject `-` alongside a
+/// second input rather than reading the same stream twice and silently emitting
+/// records for only one of them.
+#[test]
+fn extract_rejects_stdin_when_more_than_one_input_is_given() {
+    let dir = TempDir::new().expect("create temp dir");
+    let fixture = write_fixture(dir.path(), "extract");
+    let output = dir.path().join("extract.bam");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args(["extract", "-i", "-", "-i"])
+        .arg(&fixture.fastq)
+        .args(["-r", "8M+T", "-r", "8M+T", "-o"])
+        .arg(&output)
+        .args(["--sample", "S1", "--library", "L1"])
+        .stdin(Stdio::from(std::fs::File::open(&fixture.fastq).expect("open FASTQ to pipe")))
+        .output()
+        .expect("failed to run fgumi");
+
+    assert!(!result.status.success(), "extract accepted stdin alongside a second input");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("exactly one --input"),
+        "error should explain the single-input restriction, got: {stderr}"
+    );
+}

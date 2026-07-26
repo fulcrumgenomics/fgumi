@@ -41,17 +41,15 @@
 //! mismatch, is a `DIFFER`.
 
 use std::cmp::Ordering;
-use std::fs::File;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use fgumi_bam_io::create_raw_bam_reader;
 use fgumi_raw_bam::{RawRecord, RawRecordView};
 use fgumi_sort::{
-    LibraryLookup, QuerynameComparator, RawBamRecordReader, RawQuerynameKey, RawQuerynameLexKey,
-    RawSortKey, SortContext, SortOrder, TemplateKey, cb_hasher, extract_coordinate_key_inline,
-    extract_template_key_inline, verify_sort_order,
+    LibraryLookup, OwnedRawBamRecordReader, QuerynameComparator, RawQuerynameKey,
+    RawQuerynameLexKey, RawSortKey, SortContext, SortOrder, TemplateKey, cb_hasher,
+    extract_coordinate_key_inline, extract_template_key_inline, verify_sort_order,
 };
 use noodles::sam::Header;
 
@@ -222,10 +220,25 @@ pub(crate) fn detect_sort_order(header: &Header) -> Result<SortOrder> {
     sort_order_from_header(header)
 }
 
-/// Open a fresh raw-byte record reader over `path`, positioned just past the header, via
-/// the shared [`super::open_raw_bam_reader`] helper.
-fn open_raw_reader(path: &Path) -> Result<RawBamRecordReader<File>> {
-    super::open_raw_bam_reader(path)
+/// Open `path` once, returning its parsed header and a raw-byte record reader
+/// positioned just past that header.
+///
+/// One open per input rather than two. Every caller here needs both the header
+/// (to pick a key extractor) and the records, and taking them from separate opens
+/// meant the input had to be re-openable — which a FIFO, a process substitution
+/// and stdin are not. [`fgumi_sort::open_raw_bam_record_reader_with_header`]
+/// parses the header through a tee and replays the bytes it consumed, so one
+/// stream serves both. Uncompressed SAM is sniffed and normalized there too.
+///
+/// This makes the *engine* single-open, which is what its own entry points
+/// promise. The `compare bams` CLI is a separate question: it opens both inputs
+/// once more up front for its header-compatibility precondition, deliberately, so
+/// that an incompatible pair hard-exits before any engine runs
+/// (see [`CompareBams::execute`](super::super::bams::CompareBams)). A command line
+/// therefore still names re-openable inputs — `compare`'s declared contract, since
+/// it compares two named files against each other.
+fn open_raw_reader_with_header(path: &Path) -> Result<(OwnedRawBamRecordReader, Header)> {
+    fgumi_sort::open_raw_bam_record_reader_with_header(path)
         .with_context(|| format!("opening raw BAM reader for {}", path.display()))
 }
 
@@ -296,7 +309,7 @@ where
     ExtractKey: Fn(&[u8]) -> K,
     IsViolation: Fn(&K, &K) -> bool,
 {
-    reader: RawBamRecordReader<File>,
+    reader: OwnedRawBamRecordReader,
     extract_key: &'a ExtractKey,
     tracker: OrderTracker<'a, K, IsViolation>,
 }
@@ -308,7 +321,7 @@ where
     IsViolation: Fn(&K, &K) -> bool,
 {
     fn new(
-        reader: RawBamRecordReader<File>,
+        reader: OwnedRawBamRecordReader,
         extract_key: &'a ExtractKey,
         is_violation: &'a IsViolation,
     ) -> Self {
@@ -736,14 +749,18 @@ where
 /// Bundled into a struct (rather than nine positional arguments) purely to keep the
 /// function signature readable — this is a structural fix for `clippy::too_many_arguments`,
 /// not a suppression of it.
-struct VerifyContext<'a, K, ExtractKey, IsViolation, SameCore>
+struct VerifyContext<K, ExtractKey, IsViolation, SameCore>
 where
     ExtractKey: Fn(&[u8]) -> K,
     IsViolation: Fn(&K, &K) -> bool,
     SameCore: Fn(&K, &K) -> bool,
 {
-    bam1: &'a Path,
-    bam2: &'a Path,
+    /// Record reader over the first input, already past its header. Carried rather
+    /// than the path so the input is opened exactly once — see
+    /// [`open_raw_reader_with_header`].
+    reader1: OwnedRawBamRecordReader,
+    /// Record reader over the second input, already past its header.
+    reader2: OwnedRawBamRecordReader,
     extract_key: ExtractKey,
     is_violation: IsViolation,
     same_core: SameCore,
@@ -761,7 +778,7 @@ where
 /// the streams desynchronize because [`run_compare`] drains the tail *through* the trackers
 /// (see [`OrderChecked::drain`]).
 fn run_full_verify<K, ExtractKey, IsViolation, SameCore>(
-    ctx: VerifyContext<'_, K, ExtractKey, IsViolation, SameCore>,
+    ctx: VerifyContext<K, ExtractKey, IsViolation, SameCore>,
 ) -> Result<SortVerifyOutcome>
 where
     K: Clone,
@@ -769,10 +786,11 @@ where
     IsViolation: Fn(&K, &K) -> bool,
     SameCore: Fn(&K, &K) -> bool,
 {
-    let VerifyContext { bam1, bam2, extract_key, is_violation, same_core, max_diffs, order } = ctx;
+    let VerifyContext { reader1, reader2, extract_key, is_violation, same_core, max_diffs, order } =
+        ctx;
 
-    let mut stream1 = OrderChecked::new(open_raw_reader(bam1)?, &extract_key, &is_violation);
-    let mut stream2 = OrderChecked::new(open_raw_reader(bam2)?, &extract_key, &is_violation);
+    let mut stream1 = OrderChecked::new(reader1, &extract_key, &is_violation);
+    let mut stream2 = OrderChecked::new(reader2, &extract_key, &is_violation);
 
     let runs = run_compare(&mut stream1, &mut stream2, &same_core, max_diffs)?;
 
@@ -812,8 +830,10 @@ pub fn sort_verify_compare(
     bam2: &Path,
     max_diffs: usize,
 ) -> Result<SortVerifyOutcome> {
-    let (_, header1) = create_raw_bam_reader(bam1, 1)?;
-    let (_, header2) = create_raw_bam_reader(bam2, 1)?;
+    // One open per input, which is what the record readers below then stream —
+    // see `open_raw_reader_with_header`.
+    let (reader1, header1) = open_raw_reader_with_header(bam1)?;
+    let (reader2, header2) = open_raw_reader_with_header(bam2)?;
 
     let order1 = detect_sort_order(&header1)
         .map_err(|e| anyhow!("detecting sort order from {}: {e}", bam1.display()))?;
@@ -837,8 +857,8 @@ pub fn sort_verify_compare(
         SortOrder::Coordinate => {
             let nref = header1.reference_sequences().len() as u32;
             run_full_verify(VerifyContext {
-                bam1,
-                bam2,
+                reader1,
+                reader2,
                 extract_key: |bam: &[u8]| extract_coordinate_key_inline(bam, nref),
                 is_violation: |key: &u64, prev: &u64| key < prev,
                 same_core: |a: &u64, b: &u64| a == b,
@@ -849,8 +869,8 @@ pub fn sort_verify_compare(
         SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
             let ctx = SortContext::from_header(&header1);
             run_full_verify(VerifyContext {
-                bam1,
-                bam2,
+                reader1,
+                reader2,
                 extract_key: move |bam: &[u8]| RawQuerynameLexKey::extract(bam, &ctx),
                 is_violation: |key: &RawQuerynameLexKey, prev: &RawQuerynameLexKey| key < prev,
                 same_core: |a: &RawQuerynameLexKey, b: &RawQuerynameLexKey| a == b,
@@ -861,8 +881,8 @@ pub fn sort_verify_compare(
         SortOrder::Queryname(QuerynameComparator::Natural) => {
             let ctx = SortContext::from_header(&header1);
             run_full_verify(VerifyContext {
-                bam1,
-                bam2,
+                reader1,
+                reader2,
                 extract_key: move |bam: &[u8]| RawQuerynameKey::extract(bam, &ctx),
                 is_violation: |key: &RawQuerynameKey, prev: &RawQuerynameKey| key < prev,
                 same_core: |a: &RawQuerynameKey, b: &RawQuerynameKey| a == b,
@@ -877,8 +897,8 @@ pub fn sort_verify_compare(
             // template-coordinate always hashes the CB tag into the sort key when present.
             let cell_tag = Some(SamTag::CB);
             run_full_verify(VerifyContext {
-                bam1,
-                bam2,
+                reader1,
+                reader2,
                 extract_key: move |bam: &[u8]| {
                     extract_template_key_inline(bam, &lib_lookup, cell_tag, &hasher)
                 },
@@ -924,7 +944,9 @@ pub fn sort_verify_compare(
 /// Returns an error if `path` cannot be opened/read, or if any record violates `order`
 /// (naming the first violating record's 1-based position and read name).
 pub(crate) fn verify_records_in_order(path: &Path, order: SortOrder) -> Result<()> {
-    let (_, header) = create_raw_bam_reader(path, 1)
+    // One open, header and records from the same stream — see
+    // `open_raw_reader_with_header`.
+    let (reader, header) = open_raw_reader_with_header(path)
         .with_context(|| format!("opening {} to verify sort order", path.display()))?;
 
     // IMPORTANT: The per-SortOrder extractor/comparator selection below must stay
@@ -933,7 +955,6 @@ pub(crate) fn verify_records_in_order(path: &Path, order: SortOrder) -> Result<(
     let (_, violations, first_violation) = match order {
         SortOrder::Coordinate => {
             let nref = header.reference_sequences().len() as u32;
-            let reader = open_raw_reader(path)?;
             verify_sort_order(
                 reader,
                 |bam: &[u8]| extract_coordinate_key_inline(bam, nref),
@@ -942,7 +963,6 @@ pub(crate) fn verify_records_in_order(path: &Path, order: SortOrder) -> Result<(
         }
         SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
             let ctx = SortContext::from_header(&header);
-            let reader = open_raw_reader(path)?;
             verify_sort_order(
                 reader,
                 move |bam: &[u8]| RawQuerynameLexKey::extract(bam, &ctx),
@@ -951,7 +971,6 @@ pub(crate) fn verify_records_in_order(path: &Path, order: SortOrder) -> Result<(
         }
         SortOrder::Queryname(QuerynameComparator::Natural) => {
             let ctx = SortContext::from_header(&header);
-            let reader = open_raw_reader(path)?;
             verify_sort_order(
                 reader,
                 move |bam: &[u8]| RawQuerynameKey::extract(bam, &ctx),
@@ -964,7 +983,6 @@ pub(crate) fn verify_records_in_order(path: &Path, order: SortOrder) -> Result<(
             // Matches `fgumi sort`'s own `--verify` (crate::commands::sort::parse_cell_tag):
             // template-coordinate always hashes the CB tag into the sort key when present.
             let cell_tag = Some(SamTag::CB);
-            let reader = open_raw_reader(path)?;
             verify_sort_order(
                 reader,
                 move |bam: &[u8]| extract_template_key_inline(bam, &lib_lookup, cell_tag, &hasher),

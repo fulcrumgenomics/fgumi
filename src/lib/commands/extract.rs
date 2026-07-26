@@ -29,7 +29,7 @@ use crate::grouper::FastqTemplate;
 use crate::logging::OperationTimer;
 use crate::sam::SamTag;
 use crate::unified_pipeline::{FastqPipelineConfig, MemoryEstimate, run_fastq_pipeline};
-use crate::validation::validate_file_exists;
+use crate::validation::validate_input_exists;
 use anyhow::{Context, Result, bail, ensure};
 use bstr::{BString, ByteSlice};
 use clap::Parser;
@@ -44,6 +44,7 @@ use noodles_bgzf::io::MultithreadedReader;
 use crate::read_structure::{ReadStructure, SegmentType};
 #[cfg(test)]
 use fgumi_bam_io::create_bam_reader;
+use fgumi_bam_io::{ChainedReader, InputFormat, TeeReader, is_stdin_path};
 use fgumi_simd_fastq::SimdFastqReader;
 use noodles::sam::header::Header;
 use noodles::sam::header::record::value::Map;
@@ -57,7 +58,7 @@ use noodles::sam::header::record::value::{
     map::{Header as HeaderRecord, Tag as HeaderTag},
 };
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -102,46 +103,28 @@ enum CompressionFormat {
 
 /// Detect the compression format of a file by reading its header.
 ///
-/// BGZF files are identified by:
-/// - Gzip magic number (0x1f 0x8b)
-/// - Deflate compression method (0x08)
-/// - FEXTRA flag set (0x04)
-/// - Extra field with SI1='B' (0x42), SI2='C' (0x43)
-///
-/// Regular gzip files have the magic number but don't have the BGZF extra field.
+/// Classification is delegated to [`fgumi_bam_io::classify_input`]; see
+/// [`classify_compression_header`] for how the verdict maps onto FASTQ.
 fn detect_compression_format(path: &Path) -> Result<CompressionFormat> {
     let mut file = File::open(path)?;
-    let mut header = [0u8; 18];
+    let mut header = [0u8; fgumi_bam_io::FORMAT_PREFIX_LEN];
+    let bytes_read = fgumi_bam_io::read_prefix(&mut file, &mut header)?;
 
-    use std::io::Read;
-    let bytes_read = file.read(&mut header)?;
+    Ok(classify_compression_header(&header[..bytes_read]))
+}
 
-    if bytes_read < 2 {
-        return Ok(CompressionFormat::Plain);
+/// Classify a FASTQ's compression from its leading bytes.
+///
+/// Delegates to [`fgumi_bam_io::classify_input`], the classifier every fgumi
+/// input sniff shares, so a file gets the same verdict whichever command opens
+/// it. Unlike the alignment inputs, FASTQ legitimately comes plain-gzipped, so
+/// `Gzip` is a supported format here rather than an error.
+fn classify_compression_header(header: &[u8]) -> CompressionFormat {
+    match fgumi_bam_io::classify_input(header) {
+        InputFormat::Bgzf => CompressionFormat::Bgzf,
+        InputFormat::Gzip => CompressionFormat::Gzip,
+        InputFormat::Text | InputFormat::Empty => CompressionFormat::Plain,
     }
-
-    // Check for gzip magic number
-    if header[0] != 0x1f || header[1] != 0x8b {
-        return Ok(CompressionFormat::Plain);
-    }
-
-    // It's gzip - check if it's BGZF
-    if bytes_read >= 18 {
-        // Check for deflate method (0x08) and FEXTRA flag (0x04)
-        if header[2] == 0x08 && (header[3] & 0x04) != 0 {
-            // Extra field starts at byte 10
-            // XLEN is at bytes 10-11 (little-endian)
-            let xlen = u16::from_le_bytes([header[10], header[11]]) as usize;
-            if xlen >= 6 {
-                // Check for BGZF signature: SI1='B', SI2='C'
-                if header[12] == b'B' && header[13] == b'C' {
-                    return Ok(CompressionFormat::Bgzf);
-                }
-            }
-        }
-    }
-
-    Ok(CompressionFormat::Gzip)
 }
 
 /// Open a FASTQ file with automatic detection of compression format.
@@ -164,34 +147,48 @@ fn open_fastq_reader(
 ) -> Result<Box<dyn BufRead + Send>> {
     use flate2::read::MultiGzDecoder;
 
-    let format = detect_compression_format(path)?;
-
-    // Open file, optionally wrap in PrefetchReader for async I/O.
-    let open_reader = |path: &Path| -> Result<Box<dyn std::io::Read + Send>> {
+    // stdin cannot be sniffed by path and then re-opened — the bytes read to
+    // classify it are gone. Peek them off the stream and chain them back in
+    // front of it instead, so the input is consumed exactly once.
+    let (format, reader) = if is_stdin_path(path) {
+        // Honor --async-reader for stdin too (parity with the file path below):
+        // a pipe benefits from prefetch overlapping upstream production with us.
+        let raw: Box<dyn std::io::Read + Send> = if async_reader {
+            log::info!("async FASTQ reader enabled: spawning fgumi-prefetch thread for stdin");
+            Box::new(fgumi_bam_io::prefetch_reader::PrefetchReader::new(io::stdin()))
+        } else {
+            Box::new(io::stdin())
+        };
+        let (format, restored) = detect_compression_format_from_stream(raw)?;
+        debug!("Detected {format:?} FASTQ on stdin");
+        (format, restored)
+    } else {
+        let format = detect_compression_format(path)?;
         let file = File::open(path)?;
-        if async_reader {
+        // Only a real `File` can carry the kernel hints `PrefetchReader` issues,
+        // so the async wrap happens here rather than around the format decode.
+        let reader: Box<dyn std::io::Read + Send> = if async_reader {
             fgumi_bam_io::os_hints::advise_sequential(&file);
             log::info!(
                 "async FASTQ reader enabled: spawning fgumi-prefetch thread for {}",
                 path.display()
             );
-            Ok(Box::new(fgumi_bam_io::prefetch_reader::PrefetchReader::from_file(file)))
+            Box::new(fgumi_bam_io::prefetch_reader::PrefetchReader::from_file(file))
         } else {
-            Ok(Box::new(file))
-        }
+            Box::new(file)
+        };
+        (format, reader)
     };
 
     match format {
         CompressionFormat::Bgzf if threads > 1 => {
             info!("Detected BGZF-compressed FASTQ, using {threads} decompression threads");
-            let reader = open_reader(path)?;
             let worker_count = std::num::NonZero::new(threads).expect("threads > 1 checked above");
             let reader = MultithreadedReader::with_worker_count(worker_count, reader);
             Ok(Box::new(BufReader::with_capacity(BUFFER_SIZE, reader)))
         }
         CompressionFormat::Bgzf | CompressionFormat::Gzip => {
             debug!("Detected {format:?}-compressed FASTQ, using single-threaded decompression");
-            let reader = open_reader(path)?;
             Ok(Box::new(BufReader::with_capacity(
                 BUFFER_SIZE,
                 MultiGzDecoder::new(BufReader::with_capacity(BUFFER_SIZE, reader)),
@@ -199,10 +196,35 @@ fn open_fastq_reader(
         }
         CompressionFormat::Plain => {
             debug!("Detected uncompressed FASTQ");
-            let reader = open_reader(path)?;
             Ok(Box::new(BufReader::with_capacity(BUFFER_SIZE, reader)))
         }
     }
+}
+
+/// Classify a FASTQ stream's compression, returning a reader that replays the
+/// bytes the classification consumed.
+///
+/// The path-based [`detect_compression_format`] opens the file, reads its
+/// header, and drops the handle, relying on the caller to re-open. That is fine
+/// for a regular file and impossible for a pipe, so this variant peeks from the
+/// stream and chains the peeked bytes back on.
+///
+/// # Errors
+///
+/// Returns an error if the stream cannot be read.
+fn detect_compression_format_from_stream(
+    mut reader: Box<dyn std::io::Read + Send>,
+) -> Result<(CompressionFormat, Box<dyn std::io::Read + Send>)> {
+    // Same window the shared classifier needs: gzip magic, deflate method and
+    // flag bytes, and the BGZF extra field.
+    let mut header = [0u8; fgumi_bam_io::FORMAT_PREFIX_LEN];
+    let filled =
+        fgumi_bam_io::read_prefix(&mut reader, &mut header).context("Failed to read from stdin")?;
+
+    let format = classify_compression_header(&header[..filled]);
+    let restored: Box<dyn std::io::Read + Send> =
+        Box::new(ChainedReader::new(header[..filled].to_vec(), reader));
+    Ok((format, restored))
 }
 
 /// Quality encoding type
@@ -601,6 +623,31 @@ impl Extract {
         }
     }
 
+    /// Open every input FASTQ as a decompressed reader.
+    ///
+    /// `stdin_reader` is the already-opened stdin stream, if one of the inputs
+    /// is `-`. It is moved in rather than re-opened: stdin can be consumed only
+    /// once, and re-opening it yields an empty stream and a silently
+    /// record-less run. [`Self::validate`] guarantees stdin is the *sole* input
+    /// when present, so it is the whole reader list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a file input cannot be opened.
+    fn open_input_readers(
+        &self,
+        decomp_threads: usize,
+        stdin_reader: Option<Box<dyn BufRead + Send>>,
+    ) -> Result<Vec<Box<dyn BufRead + Send>>> {
+        if let Some(reader) = stdin_reader {
+            return Ok(vec![reader]);
+        }
+        self.inputs
+            .iter()
+            .map(|path| open_fastq_reader(path, decomp_threads, self.async_reader))
+            .collect()
+    }
+
     /// Validate inputs
     fn validate(&self) -> Result<()> {
         let read_structures = self.get_read_structures()?;
@@ -626,9 +673,18 @@ impl Extract {
 
         // Validate threads parameter (ThreadingOptions handles minimum of 1 internally)
 
-        // Validate input files exist
+        // Validate input files exist. `-` names stdin, which is a stream rather
+        // than a path — but one stdin cannot supply two FASTQs, so it is only
+        // accepted when it is the sole input.
+        let stdin_inputs = self.inputs.iter().filter(|p| is_stdin_path(p)).count();
+        ensure!(
+            stdin_inputs == 0 || self.inputs.len() == 1,
+            "stdin (`-`) can only be used as the input when there is exactly one --input; \
+             got {} inputs. Read the other FASTQs from paths, or interleave them first.",
+            self.inputs.len()
+        );
         for input in &self.inputs {
-            validate_file_exists(input, "Input FASTQ")?;
+            validate_input_exists(input, "Input FASTQ")?;
         }
 
         // Validate read structures are not empty
@@ -1171,11 +1227,15 @@ impl Extract {
         output: Box<dyn std::io::Write + Send>,
         encoding: QualityEncoding,
         read_structures: &[ReadStructure],
+        stdin_reader: Option<Box<dyn BufRead + Send>>,
     ) -> Result<u64> {
-        // Detect if all inputs are BGZF
-        let all_bgzf = self.inputs.iter().all(|p| {
-            detect_compression_format(p).map(|f| f == CompressionFormat::Bgzf).unwrap_or(false)
-        });
+        // Detect if all inputs are BGZF. stdin is never "all BGZF" for this
+        // purpose: that path has the pipeline open the files itself, which stdin
+        // cannot support, so it must take the pre-opened-reader path below.
+        let all_bgzf = stdin_reader.is_none()
+            && self.inputs.iter().all(|p| {
+                detect_compression_format(p).map(|f| f == CompressionFormat::Bgzf).unwrap_or(false)
+            });
 
         let num_threads = self.threading.threads.unwrap_or(1);
 
@@ -1198,12 +1258,7 @@ impl Extract {
         let decompressed_readers: Option<Vec<Box<dyn BufRead + Send>>> = if all_bgzf {
             None
         } else {
-            Some(
-                self.inputs
-                    .iter()
-                    .map(|p| open_fastq_reader(p, decomp_threads, self.async_reader))
-                    .collect::<Result<Vec<_>>>()?,
-            )
+            Some(self.open_input_readers(decomp_threads, stdin_reader)?)
         };
 
         // Clone read_structures for the closure
@@ -1477,17 +1532,60 @@ fn sample_detection_quals(inputs: &[PathBuf]) -> Result<QualDetectionStats> {
     for input in inputs {
         let mut reader =
             SimdFastqReader::with_capacity(open_fastq_reader(input, 1, false)?, BUFFER_SIZE);
-        for _ in 0..QUALITY_DETECTION_SAMPLE_SIZE {
-            match reader.next() {
-                // Fold each sampled read into the running summary and drop it —
-                // no per-read quality string is retained.
-                Some(Ok(rec)) => stats.observe(&rec.quality),
-                Some(Err(e)) => return Err(e.into()),
-                None => break,
-            }
-        }
+        sample_into(&mut reader, &mut stats)?;
     }
     Ok(stats)
+}
+
+/// Fold up to [`QUALITY_DETECTION_SAMPLE_SIZE`] records' qualities into `stats`.
+///
+/// Each sampled read is folded into the running summary and dropped — no
+/// per-read quality string is retained.
+fn sample_into<R: BufRead>(
+    reader: &mut SimdFastqReader<R>,
+    stats: &mut QualDetectionStats,
+) -> Result<()> {
+    for _ in 0..QUALITY_DETECTION_SAMPLE_SIZE {
+        match reader.next() {
+            Some(Ok(rec)) => stats.observe(&rec.quality),
+            Some(Err(e)) => return Err(e.into()),
+            None => break,
+        }
+    }
+    Ok(())
+}
+
+/// Sample quality stats from a stream, returning a reader that replays every
+/// byte the sampling consumed.
+///
+/// [`sample_detection_quals`] re-opens each input by path so the main pass gets
+/// a fresh reader. stdin has no second open: whatever the sample reads is gone,
+/// and the main pass would silently see an empty FASTQ. Capturing the sampled
+/// bytes through a [`TeeReader`] and chaining them back makes the stream
+/// re-readable from byte zero without buffering the whole input.
+///
+/// The tee captures what was pulled from the *source*, not what the FASTQ
+/// parser yielded, so the replay stays complete no matter how far the parser
+/// read ahead internally.
+///
+/// # Errors
+///
+/// Returns an error if the stream cannot be read or contains malformed FASTQ.
+fn sample_detection_quals_from_stream(
+    reader: Box<dyn BufRead + Send>,
+) -> Result<(QualDetectionStats, Box<dyn BufRead + Send>)> {
+    let mut stats = QualDetectionStats::new();
+
+    let tee = TeeReader::new(reader);
+    let mut sampler =
+        SimdFastqReader::with_capacity(BufReader::with_capacity(BUFFER_SIZE, tee), BUFFER_SIZE);
+    sample_into(&mut sampler, &mut stats)?;
+
+    let (consumed, source) = sampler.into_inner().into_inner().into_parts();
+    let replayed: Box<dyn BufRead + Send> =
+        Box::new(BufReader::with_capacity(BUFFER_SIZE, ChainedReader::new(consumed, source)));
+
+    Ok((stats, replayed))
 }
 
 impl Command for Extract {
@@ -1498,9 +1596,29 @@ impl Command for Extract {
         let timer = OperationTimer::new("Extracting UMIs");
         let read_structures = self.get_read_structures()?;
 
-        // Detect quality encoding from the pooled heads of ALL input FASTQs
-        // (uses a separate reader per input so the main readers are not consumed).
-        let detection_stats = sample_detection_quals(&self.inputs)?;
+        // Detect quality encoding from the pooled heads of ALL input FASTQs.
+        //
+        // For file inputs this opens a separate reader per input, so the main
+        // readers are untouched. stdin has no second open, so it is opened once
+        // here and the sampled bytes are replayed to the main pass; the reader
+        // below is that replaying stream, handed to whichever branch runs.
+        //
+        // It is opened with the *main pass's* decompression thread count, not a
+        // sampling one: this same reader decompresses every record that follows,
+        // so a hardcoded single thread would leave `--threads` unable to reach
+        // the BGZF decoder on the stdin path, where file inputs get the full
+        // count from [`Self::open_input_readers`].
+        let mut stdin_reader: Option<Box<dyn BufRead + Send>> = None;
+        let detection_stats =
+            if let Some(stdin_input) = self.inputs.iter().find(|p| is_stdin_path(p)) {
+                let decomp_threads = self.threading.num_threads().max(1);
+                let opened = open_fastq_reader(stdin_input, decomp_threads, self.async_reader)?;
+                let (stats, replayed) = sample_detection_quals_from_stream(opened)?;
+                stdin_reader = Some(replayed);
+                stats
+            } else {
+                sample_detection_quals(&self.inputs)?
+            };
         let encoding = QualityEncoding::from_stats(&detection_stats)?;
 
         // Create header with @PG record
@@ -1513,18 +1631,15 @@ impl Command for Extract {
             let output: Box<dyn std::io::Write + Send> =
                 Box::new(std::io::BufWriter::new(File::create(&self.output)?));
 
-            self.process_with_pipeline(&header, output, encoding, &read_structures)?
+            self.process_with_pipeline(&header, output, encoding, &read_structures, stdin_reader)?
         } else {
             // Single-threaded mode: raw BAM writer
             // Determine thread count for parallel BGZF decompression
             let decomp_threads = self.threading.num_threads().max(1);
 
             // Open input FASTQs with automatic BGZF detection
-            let fq_readers: Vec<Box<dyn BufRead + Send>> = self
-                .inputs
-                .iter()
-                .map(|p| open_fastq_reader(p, decomp_threads, self.async_reader))
-                .collect::<Result<Vec<_>>>()?;
+            let fq_readers: Vec<Box<dyn BufRead + Send>> =
+                self.open_input_readers(decomp_threads, stdin_reader)?;
 
             let fq_sources: Vec<SimdFastqReader<Box<dyn BufRead + Send>>> = fq_readers
                 .into_iter()

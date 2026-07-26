@@ -2751,3 +2751,142 @@ proptest::proptest! {
         proptest::prop_assert_eq!(outcome.bam2_count, records2.len() as u64);
     }
 }
+
+// ============================================================================
+// Both engines read each input exactly once
+// ============================================================================
+
+/// Serves `source`'s bytes over a fresh FIFO in `dir`, returning it and its feeder.
+///
+/// A FIFO delivers its bytes exactly once and cannot be re-opened for a second
+/// read, so it fails any consumer that opens its input twice — which is what these
+/// tests are for.
+///
+/// The write end is opened write-only, which blocks until the consumer attaches its
+/// read end. That blocking open is the hand-off: opening `O_RDWR` instead would
+/// return immediately, and this thread could then copy the whole (small) file into
+/// the pipe buffer and close both ends before the consumer ever opened it, leaving
+/// the bytes discarded and the consumer waiting on a writer that no longer exists.
+/// A failed copy returns quietly rather than panicking so the consumer's own error
+/// is the one that reports.
+///
+/// The returned handle must only be joined once the consumer is known to have
+/// finished — see [`bounded`] — because a consumer that dies before opening the
+/// FIFO leaves this thread blocked in `open` forever.
+#[cfg(unix)]
+fn serve_over_fifo(
+    dir: &Path,
+    name: &str,
+    source: &Path,
+) -> (PathBuf, std::thread::JoinHandle<()>) {
+    let fifo = dir.join(name);
+    let status = Command::new("mkfifo").arg(&fifo).status().expect("failed to run mkfifo");
+    assert!(status.success(), "mkfifo failed for {}", fifo.display());
+
+    let source = source.to_path_buf();
+    let fifo_path = fifo.clone();
+    let feeder = std::thread::spawn(move || {
+        // `source` is a regular file this test just wrote, so opening it cannot
+        // block: tolerating a failure here would buy no hang-safety and would
+        // instead strand the consumer on an empty FIFO, making the timeout below
+        // report a second open that never happened. The FIFO open and the copy are
+        // the calls that can legitimately block or fail (`EPIPE`) when the consumer
+        // dies, so those stay quiet.
+        let mut src = fs::File::open(&source).expect("open FIFO source");
+        let Ok(mut sink) = fs::File::create(&fifo_path) else { return };
+        let _ = std::io::copy(&mut src, &mut sink);
+    });
+
+    (fifo, feeder)
+}
+
+/// Runs `engine` on its own thread, failing the test if it has not returned within
+/// a generous bound.
+///
+/// A second open of a FIFO **blocks** rather than erroring — there is no writer
+/// left to attach — so an engine that regresses to two opens would hang the suite
+/// instead of failing it, and CI would report a timeout with no indication of
+/// which property broke. This turns that into a named assertion. The stuck thread
+/// is left behind deliberately: it cannot be cancelled, and the harness reaps it
+/// when the process exits.
+#[cfg(unix)]
+fn bounded<T, Engine>(engine: Engine) -> anyhow::Result<T>
+where
+    Engine: FnOnce() -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(engine());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap_or_else(|_| {
+        panic!(
+            "engine did not return within 30s on a FIFO input; the likely cause is a \
+             second open of the input, which blocks forever on a FIFO because no writer \
+             is left to attach"
+        )
+    })
+}
+
+/// Joins a [`serve_over_fifo`] feeder, which is safe only once its consumer has
+/// returned: the consumer having drained the FIFO is what lets the feeder's copy
+/// finish.
+#[cfg(unix)]
+fn join_feeder(feeder: std::thread::JoinHandle<()>) {
+    feeder.join().expect("FIFO feeder thread panicked");
+}
+
+/// `sort_verify_compare` must take a single open per input.
+///
+/// It needs both the header (to pick a key extractor) and the records, and used to
+/// take them from two separate opens of the same path. That quietly required the
+/// input to be re-openable, so the engine rejected a FIFO or a process
+/// substitution that `fgumi sort` itself reads happily. Both now come from one
+/// stream, the header parsed through a tee with its bytes replayed.
+#[cfg(unix)]
+#[test]
+fn test_sort_verify_reads_a_non_reopenable_input() {
+    let tmp = TempDir::new().unwrap();
+    let header = create_coordinate_sorted_header("chr1", 10000);
+    let records =
+        vec![fragment_record(b"read1", 0, 100, false), fragment_record(b"read2", 0, 200, false)];
+
+    let bam = tmp.path().join("a.bam");
+    write_bam(&bam, &header, &records);
+
+    let (fifo, feeder) = serve_over_fifo(tmp.path(), "a.fifo", &bam);
+    let oracle = bam.clone();
+    let outcome = bounded(move || sort_verify_compare(&fifo, &oracle, 100))
+        .expect("sort_verify_compare must accept an input it can only open once");
+    join_feeder(feeder);
+
+    assert!(outcome.is_match(), "the same data over a FIFO must match itself: {outcome:?}");
+    assert_eq!(outcome.bam1_count, records.len() as u64, "every record must be read from the FIFO");
+    assert_eq!(outcome.bam2_count, records.len() as u64);
+    assert_eq!(outcome.bam1_violations, 0);
+}
+
+/// `molecule_join_compare` must take a single open per input, for the same reason
+/// as [`test_sort_verify_reads_a_non_reopenable_input`]: it reads the header to
+/// check the two inputs are compatible, and the records to join molecules.
+#[cfg(unix)]
+#[test]
+fn test_molecule_join_reads_a_non_reopenable_input() {
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10000);
+    let records = vec![mi_record(b"read1", 100, "1"), mi_record(b"read2", 200, "1")];
+
+    let bam = tmp.path().join("a.bam");
+    write_bam(&bam, &header, &records);
+
+    let (fifo, feeder) = serve_over_fifo(tmp.path(), "a.fifo", &bam);
+    let oracle = bam.clone();
+    let outcome = bounded(move || molecule_join_compare(&fifo, &oracle, 100))
+        .expect("molecule_join_compare must accept an input it can only open once");
+    join_feeder(feeder);
+
+    assert!(outcome.is_match(), "the same data over a FIFO must match itself: {outcome:?}");
+    assert_eq!(outcome.matched, 1, "the single molecule must be matched");
+    assert_eq!(outcome.bam1_molecules, 1);
+    assert_eq!(outcome.bam2_molecules, 1);
+}

@@ -11,6 +11,7 @@
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
 
+pub mod format;
 pub mod header;
 pub mod mem_estimate;
 pub mod os_hints;
@@ -19,10 +20,12 @@ pub mod prefetch_reader;
 pub mod progress;
 pub mod reader;
 pub mod reorder;
+pub mod sam_input;
 pub mod writer;
 
 pub(crate) mod vendored;
 
+pub use format::{FORMAT_PREFIX_LEN, InputFormat, classify_input};
 pub use mem_estimate::MemoryEstimate;
 pub use paths::{is_stdin_path, is_stdout_path};
 pub use progress::ProgressTracker;
@@ -30,6 +33,7 @@ pub use reader::{
     BamReaderAuto, BgzfReaderEnum, ChainedReader, PipelineReaderOpts, RawBamReaderAuto, TeeReader,
     create_bam_reader, create_bam_reader_for_pipeline, create_bam_reader_for_pipeline_with_opts,
     create_bam_reader_with_opts, create_raw_bam_reader, create_raw_bam_reader_with_opts,
+    make_bgzf_reader, open_normalized_input, read_header_and_replay, read_prefix,
 };
 pub use reorder::{DrainReady, ReorderBuffer};
 pub use writer::{

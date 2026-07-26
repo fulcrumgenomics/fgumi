@@ -5,6 +5,84 @@ use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::sam::Header;
 use noodles::sam::alignment::record_buf::RecordBuf;
 
+/// Rewrites a BAM as uncompressed SAM text.
+///
+/// Done in-process with noodles rather than by shelling out to `samtools`, so
+/// tests do not depend on an external tool being installed. Shared by the
+/// SAM-input tests, which need the same records in both encodings to prove a
+/// command reads them identically.
+pub fn transcode_bam_to_sam(bam_path: &std::path::Path, sam_path: &std::path::Path) {
+    use noodles::sam::alignment::io::Write as _;
+
+    let mut reader = noodles::bam::io::Reader::new(std::io::BufReader::new(
+        std::fs::File::open(bam_path).expect("open BAM to transcode"),
+    ));
+    let header = reader.read_header().expect("read BAM header");
+
+    let mut writer =
+        noodles::sam::io::Writer::new(std::fs::File::create(sam_path).expect("create SAM"));
+    writer.write_header(&header).expect("write SAM header");
+    for result in reader.record_bufs(&header) {
+        let record = result.expect("read BAM record");
+        writer.write_alignment_record(&header, &record).expect("write SAM record");
+    }
+}
+
+/// Creates a UMI family that is already grouped: every read carries both `RX`
+/// and the same `MI` molecule id.
+///
+/// `downsample` and the other post-grouping commands reject reads without `MI`.
+/// All reads share one position and one molecule, so the result is trivially in
+/// template-coordinate order and can also be fed to `merge`, which refuses an
+/// input that is not sorted.
+pub fn create_grouped_family(
+    umi: &str,
+    mi: &str,
+    depth: usize,
+    base_name: &str,
+    sequence: &str,
+    quality: u8,
+) -> Vec<RawRecord> {
+    create_family_with_tags(
+        &[(SamTag::RX, umi.as_bytes()), (SamTag::MI, mi.as_bytes())],
+        depth,
+        base_name,
+        sequence,
+        quality,
+    )
+}
+
+/// Creates mapped consensus records carrying the per-read and per-base consensus
+/// tags (`cD`/`cE` and `cd`/`ce`).
+///
+/// `filter` rejects any read without consensus-calling tags, so this is the
+/// minimum shape that command accepts. Records are placed at increasing
+/// positions on reference 0 so they are also coordinate-ordered.
+pub fn create_consensus_family(depth: usize, base_name: &str, sequence: &str) -> Vec<RawRecord> {
+    let seq = sequence.as_bytes();
+    let cigar_op = u32::try_from(seq.len()).expect("seq.len() fits u32") << 4; // M
+    (0..depth)
+        .map(|i| {
+            let name = format!("{base_name}_{i}");
+            let pos = i32::try_from(99 + i * 100).expect("position fits i32");
+            let mut b = SamBuilder::new();
+            b.read_name(name.as_bytes())
+                .ref_id(0)
+                .pos(pos)
+                .mapq(60)
+                .flags(0)
+                .cigar_ops(&[cigar_op])
+                .sequence(seq)
+                .qualities(&vec![35; seq.len()])
+                .add_int_tag(SamTag::CD, 10)
+                .add_float_tag(SamTag::CE, 0.0_f32)
+                .add_array_u16(SamTag::CD_BASES, &vec![10; seq.len()])
+                .add_array_u16(SamTag::CE_BASES, &vec![0; seq.len()]);
+            b.build()
+        })
+        .collect()
+}
+
 /// Convert a `RawRecord` to a noodles `RecordBuf` using the default (empty) header.
 ///
 /// Used to bridge the raw-byte builder API with the noodles BAM writer for test
@@ -38,24 +116,7 @@ pub fn create_umi_family(
     sequence: &str,
     quality: u8,
 ) -> Vec<RawRecord> {
-    let seq = sequence.as_bytes();
-    let cigar_op = u32::try_from(seq.len()).expect("seq.len() fits u32") << 4; // NM
-    (0..depth)
-        .map(|i| {
-            let name = format!("{base_name}_{i}");
-            let mut b = SamBuilder::new();
-            b.read_name(name.as_bytes())
-                .ref_id(0)
-                .pos(99)
-                .mapq(60)
-                .flags(0)
-                .cigar_ops(&[cigar_op])
-                .sequence(seq)
-                .qualities(&vec![quality; seq.len()])
-                .add_string_tag(SamTag::RX, umi.as_bytes());
-            b.build()
-        })
-        .collect()
+    create_family_with_tags(&[(SamTag::RX, umi.as_bytes())], depth, base_name, sequence, quality)
 }
 
 /// Like [`create_umi_family`] but tags each read with an arbitrary `SamTag`
@@ -68,8 +129,23 @@ pub fn create_family_with_tag(
     sequence: &str,
     quality: u8,
 ) -> Vec<RawRecord> {
+    create_family_with_tags(&[(tag, umi.as_bytes())], depth, base_name, sequence, quality)
+}
+
+/// Creates a mapped family where every read carries each of `tags`.
+///
+/// The shared builder behind [`create_umi_family`], [`create_family_with_tag`]
+/// and [`create_grouped_family`] — all reads sit at one position on reference 0
+/// with a full-length match CIGAR, differing only in which aux tags they carry.
+pub fn create_family_with_tags(
+    tags: &[(SamTag, &[u8])],
+    depth: usize,
+    base_name: &str,
+    sequence: &str,
+    quality: u8,
+) -> Vec<RawRecord> {
     let seq = sequence.as_bytes();
-    let cigar_op = u32::try_from(seq.len()).expect("seq.len() fits u32") << 4;
+    let cigar_op = u32::try_from(seq.len()).expect("seq.len() fits u32") << 4; // M
     (0..depth)
         .map(|i| {
             let name = format!("{base_name}_{i}");
@@ -81,8 +157,10 @@ pub fn create_family_with_tag(
                 .flags(0)
                 .cigar_ops(&[cigar_op])
                 .sequence(seq)
-                .qualities(&vec![quality; seq.len()])
-                .add_string_tag(tag, umi.as_bytes());
+                .qualities(&vec![quality; seq.len()]);
+            for (tag, value) in tags {
+                b.add_string_tag(*tag, value);
+            }
             b.build()
         })
         .collect()
@@ -337,16 +415,19 @@ pub fn create_test_reference(dir: &std::path::Path) -> std::path::PathBuf {
 // ---------------------------------------------------------------------------
 // `compare`-feature-only helpers.
 //
-// Shared by `test_compare_bams.rs` and `test_compare_mutation.rs` (previously
-// duplicated in both files) since both build small BAMs from `RawRecord`
-// fixtures and run them through the `compare` engines.
+// Originally shared by `test_compare_bams.rs` and `test_compare_mutation.rs`
+// (previously duplicated in both files) since both build small BAMs from
+// `RawRecord` fixtures and run them through the `compare` engines.
+// `write_bam` is now used outside those too, so only the compare-specific
+// record builders below stay feature-gated.
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "compare")]
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 
 /// Writes a BAM file from the given header and records.
-#[cfg(feature = "compare")]
+///
+/// Not gated on `compare`: `test_sam_input.rs` builds its fixtures with this
+/// too, and that test runs in every feature configuration.
 pub fn write_bam(path: &std::path::Path, header: &Header, records: &[RawRecord]) {
     let mut writer =
         noodles::bam::io::Writer::new(std::fs::File::create(path).expect("create test BAM"));

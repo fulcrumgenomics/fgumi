@@ -3909,10 +3909,28 @@ fn open_pipeline_output(output_path: &Path) -> io::Result<Box<dyn Write + Send>>
     }
 }
 
+/// Convert an input-open failure into an `io::Error`, preserving its kind.
+///
+/// `create_bam_reader_for_pipeline` returns `anyhow::Error`; flattening every
+/// cause to `InvalidData` would lose `NotFound`/`PermissionDenied`, which the
+/// bare `File::open` this replaced used to surface.
+#[cfg(any(test, feature = "test-utils"))]
+fn open_input_error(e: &anyhow::Error) -> io::Error {
+    let kind =
+        e.downcast_ref::<io::Error>().map_or(io::ErrorKind::InvalidData, std::io::Error::kind);
+    io::Error::new(kind, format!("{e:#}"))
+}
+
 /// Run a BAM file through the pipeline with a grouper factory.
 ///
 /// This is a convenience function that handles BAM header I/O and
 /// sets up the pipeline correctly for BAM processing.
+///
+/// **Test-only.** Behind the `test-utils` feature: every production command
+/// drives the pipeline through the [`run_bam_pipeline_from_reader`] family,
+/// which takes an already-opened reader and header. This path-taking wrapper
+/// exists only so integration tests can go from a fixture path to a finished
+/// output in one call, and it is not part of the supported public API.
 ///
 /// # Type Parameters
 ///
@@ -3935,6 +3953,7 @@ fn open_pipeline_output(output_path: &Path) -> io::Result<Box<dyn Write + Send>>
 /// # Errors
 ///
 /// Returns an I/O error if any pipeline step or file I/O fails.
+#[cfg(any(test, feature = "test-utils"))]
 pub fn run_bam_pipeline_with_grouper<G, P, GrouperFn, ProcessFn, SerializeFn>(
     config: BamPipelineConfig,
     input_path: &Path,
@@ -3950,15 +3969,13 @@ where
     ProcessFn: Fn(G) -> io::Result<P> + Send + Sync + 'static,
     SerializeFn: Fn(P, &Header, &mut Vec<u8>) -> io::Result<u64> + Send + Sync + 'static,
 {
-    // First pass: Read header only (we need it for grouper creation and output writing)
-    let header = {
-        let input_file = File::open(input_path)
-            .map_err(|e| io::Error::new(e.kind(), format!("Failed to open input: {e}")))?;
-        let mut bam_reader = bam::io::Reader::new(input_file);
-        bam_reader.read_header().map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("Failed to read BAM header: {e}"))
-        })?
-    };
+    // Open once, through the normalizing reader: this accepts uncompressed SAM
+    // and stdin, and hands back both the header and a stream replaying from byte
+    // zero for the pipeline's block reader. Opening the path twice — once for the
+    // header, once for the blocks — is what used to make these entry points
+    // reject the inputs every command accepts.
+    let (input, header) = fgumi_bam_io::create_bam_reader_for_pipeline(input_path)
+        .map_err(|e| open_input_error(&e))?;
 
     // Create output writer (supports stdout via "-" or "/dev/stdout")
     let output_writer = open_pipeline_output(output_path)?;
@@ -3982,10 +3999,7 @@ where
         .map_err(|e| io::Error::other(format!("Failed to finish BGZF header: {e}")))?;
     let output = bgzf_writer.into_inner();
 
-    // Re-open input file for pipeline (raw file reader for BGZF block reading)
-    // Wrap in BufReader to reduce syscalls
-    let input = File::open(input_path)
-        .map_err(|e| io::Error::new(e.kind(), format!("Failed to re-open input: {e}")))?;
+    // Wrap in BufReader to reduce syscalls.
     let input = BufReader::with_capacity(IO_BUFFER_SIZE, input);
 
     let output = BufWriter::with_capacity(IO_BUFFER_SIZE, output);
@@ -4005,114 +4019,6 @@ where
     let header_clone = header.clone();
     let fns = PipelineFunctions::new(process_fn, move |p: P, buf: &mut Vec<u8>| {
         serialize_fn(p, &header_clone, buf)
-    });
-
-    run_bam_pipeline(
-        config.pipeline,
-        Box::new(input),
-        Box::new(output),
-        grouper,
-        fns,
-        group_key_config,
-        None,
-    )
-}
-
-/// Run a BAM file through the pipeline with a custom output header.
-///
-/// This variant allows specifying a different output header than the input header,
-/// useful for commands like `simplex` that produce unmapped consensus reads.
-///
-/// # Type Parameters
-///
-/// - `G`: Group type produced by the grouper (e.g., `RecordBuf`, `RawPositionGroup`, `MiGroup`)
-/// - `P`: Processed type produced by the process function (e.g., `Vec<RecordBuf>`)
-///
-/// # Arguments
-///
-/// - `config`: Pipeline configuration
-/// - `input_path`: Path to input BAM file
-/// - `output_path`: Path to output BAM file
-/// - `output_header`: Custom header to write to output file (and use for serialization)
-/// - `grouper_fn`: Function that creates a grouper given the input header
-/// - `process_fn`: Function to process each group
-/// - `serialize_fn`: Function to serialize processed output (receives output header reference)
-///
-/// # Returns
-///
-/// Number of groups processed, or an error.
-///
-/// # Errors
-///
-/// Returns an I/O error if any pipeline step or file I/O fails.
-pub fn run_bam_pipeline_with_header<G, P, GrouperFn, ProcessFn, SerializeFn>(
-    config: BamPipelineConfig,
-    input_path: &Path,
-    output_path: &Path,
-    output_header: Header,
-    grouper_fn: GrouperFn,
-    process_fn: ProcessFn,
-    serialize_fn: SerializeFn,
-) -> io::Result<u64>
-where
-    G: Send + BatchWeight + MemoryEstimate + 'static,
-    P: Send + MemoryEstimate + 'static,
-    GrouperFn: FnOnce(&Header) -> Box<dyn Grouper<Group = G> + Send>,
-    ProcessFn: Fn(G) -> io::Result<P> + Send + Sync + 'static,
-    SerializeFn: Fn(P, &Header, &mut Vec<u8>) -> io::Result<u64> + Send + Sync + 'static,
-{
-    // First pass: Read input header only (for grouper creation)
-    let input_header = {
-        let input_file = File::open(input_path)
-            .map_err(|e| io::Error::new(e.kind(), format!("Failed to open input: {e}")))?;
-        let mut bam_reader = bam::io::Reader::new(input_file);
-        bam_reader.read_header().map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("Failed to read BAM header: {e}"))
-        })?
-    };
-
-    // Create output writer (supports stdout via "-" or "/dev/stdout")
-    let output_writer = open_pipeline_output(output_path)?;
-
-    // Write BAM header using BGZF compression
-    let mut header_writer = bam::io::Writer::new(output_writer);
-    header_writer
-        .write_header(&output_header)
-        .map_err(|e| io::Error::other(format!("Failed to write BAM header: {e}")))?;
-
-    // Finish the BGZF writer and get the underlying writer for the pipeline.
-    // We need to:
-    // 1. Get the BGZF writer from the BAM writer
-    // 2. Flush/finish the BGZF stream (writes any pending data)
-    // 3. Get the underlying writer
-    let mut bgzf_writer = header_writer.into_inner();
-    bgzf_writer
-        .try_finish()
-        .map_err(|e| io::Error::other(format!("Failed to finish BGZF header: {e}")))?;
-    let output = bgzf_writer.into_inner();
-
-    // Re-open input file for pipeline (raw file reader for BGZF block reading)
-    // Wrap in BufReader to reduce syscalls
-    let input = File::open(input_path)
-        .map_err(|e| io::Error::new(e.kind(), format!("Failed to re-open input: {e}")))?;
-    let input = BufReader::with_capacity(IO_BUFFER_SIZE, input);
-
-    let output = BufWriter::with_capacity(IO_BUFFER_SIZE, output);
-
-    // Build GroupKeyConfig from input header if not provided
-    let group_key_config = config.group_key_config.unwrap_or_else(|| {
-        let library_index = LibraryIndex::from_header(&input_header);
-        let cell_tag = Tag::from(SamTag::CB);
-        GroupKeyConfig::new(library_index, cell_tag)
-    });
-
-    // Create the grouper using INPUT header
-    // Note: Header skipping is now handled by BoundaryState in the pipeline
-    let grouper = grouper_fn(&input_header);
-
-    // Create step functions with OUTPUT header captured (for serialization)
-    let fns = PipelineFunctions::new(process_fn, move |p: P, buf: &mut Vec<u8>| {
-        serialize_fn(p, &output_header, buf)
     });
 
     run_bam_pipeline(
@@ -4194,6 +4100,13 @@ where
     // can capture it. This is the only piece that must stay caller-side
     // because the closure type is otherwise unnameable.
     let fns = build_fns(output_header);
+
+    // Wrap in BufReader to reduce syscalls. The caller hands us the unbuffered
+    // stream from `create_bam_reader_for_pipeline*`, and the pipeline's block
+    // reader (`read_raw_blocks`) issues a one-byte probe, a 17-byte header read
+    // and a body read per BGZF block — three syscalls per block straight off a
+    // file or pipe without this. The by-path entry point buffers identically.
+    let input = BufReader::with_capacity(IO_BUFFER_SIZE, input);
 
     run_bam_pipeline(
         config.pipeline,
@@ -4449,6 +4362,10 @@ where
     .with_secondary_serialize(secondary_serialize_fn);
 
     let pipeline_config = config.pipeline;
+
+    // Buffered for the same reason as the other from-reader entry point: the
+    // caller's stream is unbuffered and `read_raw_blocks` reads block by block.
+    let input = BufReader::with_capacity(IO_BUFFER_SIZE, input);
 
     run_bam_pipeline(
         pipeline_config,

@@ -11,7 +11,7 @@ use crate::logging::OperationTimer;
 use crate::metrics::duplex::{DuplexMetricsCollector, DuplexYieldMetric, FamilySizeMetric};
 use crate::simple_umi_consensus::SimpleUmiConsensusCaller;
 use crate::umi::extract_mi_base;
-use crate::validation::validate_file_exists;
+use crate::validation::validate_input_exists;
 use anyhow::Result;
 use clap::Parser;
 use log::info;
@@ -22,7 +22,6 @@ use super::command::Command;
 use super::shared_metrics::{
     DOWNSAMPLING_FRACTIONS, TemplateInfo, TemplateMetadata, compute_template_metadata,
     execute_r_script, is_r_available, parse_intervals, process_templates_from_bam,
-    validate_not_consensus_bam,
 };
 
 /// Embedded R script for PDF plot generation (bundled with binary)
@@ -129,7 +128,7 @@ impl Command for DuplexMetrics {
         let timer = OperationTimer::new("Computing duplex metrics");
 
         // Validate inputs
-        validate_file_exists(&self.input, "input BAM file")?;
+        validate_input_exists(&self.input, "input BAM")?;
 
         // Validate parameters (fgbio CollectDuplexSeqMetrics requires minAb >= 1,
         // minBa >= 0, minBa <= minAb; DXM3-06). min_ab == 0 would label every
@@ -144,9 +143,6 @@ impl Command for DuplexMetrics {
                 self.min_ba_reads
             );
         }
-
-        // Check that input is not a consensus BAM
-        validate_not_consensus_bam(&self.input)?;
 
         // Load intervals if provided
         let intervals = if let Some(intervals_path) = &self.intervals {
@@ -683,6 +679,7 @@ mod tests {
     use noodles::bam;
     use noodles::sam;
     use noodles::sam::alignment::io::Write;
+    use rstest::rstest;
     use std::num::NonZeroUsize;
     use tempfile::{NamedTempFile, TempDir};
 
@@ -1983,20 +1980,51 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_reject_consensus_bam() -> Result<()> {
-        use tempfile::NamedTempFile;
+    /// Both consensus flavours must be rejected end-to-end through
+    /// [`DuplexMetrics::execute`] — simplex (`cD` without the `aD`+`bD` pair) and
+    /// duplex (`aD`+`bD`, with or without `cD`) — while a plain grouped read must
+    /// run through. `duplex-metrics` reaching the duplex branch of the shared
+    /// guard matters most here: a duplex consensus BAM is precisely the input a
+    /// user is most likely to hand this command by mistake.
+    ///
+    /// The record-level counterpart lives in `simplex_metrics`; this one drives
+    /// the whole command so the guard is proven to run on the pass the command
+    /// actually makes.
+    ///
+    /// The `fragment_*` cases carry no `PAIRED`/`FIRST_SEGMENT` flags, so they have
+    /// no paired R1 for the guard to prefer. They must be rejected all the same:
+    /// consensus calling over single-end reads produces exactly this BAM, and
+    /// letting it through means the run reports empty metrics rather than saying
+    /// what is wrong with the input.
+    #[rstest]
+    #[case::simplex_consensus(flags::PAIRED | flags::FIRST_SEGMENT, &[(SamTag::CD, 10)], true)]
+    #[case::duplex_consensus(
+        flags::PAIRED | flags::FIRST_SEGMENT,
+        &[(SamTag::AD, 6), (SamTag::BD, 4)],
+        true
+    )]
+    #[case::duplex_consensus_with_depth(
+        flags::PAIRED | flags::FIRST_SEGMENT,
+        &[(SamTag::CD, 10), (SamTag::AD, 6), (SamTag::BD, 4)],
+        true
+    )]
+    #[case::grouped_not_consensus(flags::PAIRED | flags::FIRST_SEGMENT, &[], false)]
+    #[case::fragment_simplex_consensus(0, &[(SamTag::CD, 10)], true)]
+    #[case::fragment_duplex_consensus(0, &[(SamTag::AD, 6), (SamTag::BD, 4)], true)]
+    #[case::fragment_grouped_not_consensus(0, &[], false)]
+    fn test_reject_consensus_bam(
+        #[case] record_flags: u16,
+        #[case] int_tags: &[(SamTag, i32)],
+        #[case] is_consensus: bool,
+    ) -> Result<()> {
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReferenceSequence;
 
-        // Create a temporary BAM with consensus reads
+        // Create a temporary BAM with the case's tags
         let temp_bam = NamedTempFile::new()?;
         let bam_path = temp_bam.path().to_path_buf();
 
-        // Create header
-        use noodles::sam::header::record::value::Map;
-        use noodles::sam::header::record::value::map::ReferenceSequence;
-        use std::num::NonZeroUsize;
-
-        let header = noodles::sam::Header::builder()
+        let header = sam::Header::builder()
             .add_reference_sequence(
                 "chr1",
                 Map::<ReferenceSequence>::new(
@@ -2005,28 +2033,29 @@ mod tests {
             )
             .build();
 
-        // Create a simplex consensus record (has cD tag)
         let mut b = RawSamBuilder::new();
         b.read_name(b"read1")
-            .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+            .flags(record_flags)
             .ref_id(0)
             .pos(99)
             .mapq(60)
             .cigar_ops(&[encode_op(0, 100)])
             .sequence(&[b'A'; 100])
             .qualities(&[30u8; 100]);
-        b.add_int_tag(SamTag::CD, 10_i32);
+        for (tag, value) in int_tags {
+            b.add_int_tag(*tag, *value);
+        }
         let rec = to_record_buf(b.build());
 
         // Write BAM
-        let mut writer = noodles::bam::io::Writer::new(std::fs::File::create(&bam_path)?);
+        let mut writer = bam::io::Writer::new(std::fs::File::create(&bam_path)?);
         writer.write_header(&header)?;
         writer.write_alignment_record(&header, &rec)?;
         writer.try_finish()?;
         drop(writer);
 
-        // Try to run duplex-metrics on this consensus BAM
-        let temp_output = tempfile::tempdir()?;
+        // Try to run duplex-metrics on this BAM
+        let temp_output = TempDir::new()?;
         let output_prefix = temp_output.path().join("metrics");
 
         let cmd = DuplexMetrics {
@@ -2039,14 +2068,25 @@ mod tests {
             description: None,
         };
 
-        // This should fail with an error about consensus BAM
         let result = cmd.execute("test");
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("appears to contain consensus sequences"),
-            "Error message should mention consensus sequences, got: {err}"
-        );
+        if is_consensus {
+            let err = result.expect_err("a consensus BAM must be rejected").to_string();
+            assert!(
+                err.contains("appears to contain consensus sequences"),
+                "Error message should mention consensus sequences, got: {err}"
+            );
+        } else {
+            // A grouped read must not trip the guard. It carries no `RX`/`MI`, so
+            // the run itself may still fail downstream — what must not happen is
+            // rejection *as a consensus BAM*.
+            if let Err(err) = result {
+                let err = err.to_string();
+                assert!(
+                    !err.contains("appears to contain consensus sequences"),
+                    "a grouped read must not be rejected as consensus, got: {err}"
+                );
+            }
+        }
 
         Ok(())
     }

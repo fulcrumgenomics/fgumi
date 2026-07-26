@@ -19,12 +19,6 @@ pub(crate) mod molecule_join;
 pub mod positional;
 pub mod sort_verify;
 
-use std::fs::File;
-use std::path::Path;
-
-use anyhow::Result;
-use fgumi_sort::RawBamRecordReader;
-
 /// Append `msg()` to `details` unless it is already at the `max_diffs` cap — lazily, so
 /// callers only pay for building the message string when it will actually be kept.
 ///
@@ -35,21 +29,4 @@ pub(crate) fn push_diff(details: &mut Vec<String>, max_diffs: usize, msg: impl F
     if details.len() < max_diffs {
         details.push(msg());
     }
-}
-
-/// Open a raw-byte BAM record reader over `path`, positioned just past the header.
-///
-/// Shared by every engine that needs to re-open one of its own input paths for
-/// sequential raw-record pulling: `molecule_join`'s per-file cursors and `sort_verify`'s
-/// per-file reader both open + skip-header identically, differing only in what error
-/// context they attach to a failure (added by the caller via `.with_context`, if at all).
-///
-/// # Errors
-///
-/// Returns an error if `path` cannot be opened, its BAM header cannot be read, or the
-/// header cannot be skipped.
-pub(crate) fn open_raw_bam_reader<P: AsRef<Path>>(path: P) -> Result<RawBamRecordReader<File>> {
-    let mut reader = RawBamRecordReader::new(File::open(path.as_ref())?)?;
-    reader.skip_header()?;
-    Ok(reader)
 }

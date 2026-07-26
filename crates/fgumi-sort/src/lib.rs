@@ -170,7 +170,10 @@ pub use keys::{
     QuerynameComparator, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
     SortContext, SortOrder, natural_compare, natural_compare_nul, normalize_natural_key,
 };
-pub use reader::RawBamRecordReader;
+pub use reader::{
+    OwnedRawBamRecordReader, RawBamRecordReader, open_raw_bam_record_reader,
+    open_raw_bam_record_reader_with_header,
+};
 pub use verify::{VerifySummary, verify_sort_order};
 
 #[cfg(test)]

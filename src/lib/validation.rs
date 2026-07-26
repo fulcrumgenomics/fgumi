@@ -11,11 +11,37 @@ use bytesize::ByteSize;
 use std::fmt::Display;
 use std::path::Path;
 
+/// Validate that a streamable record input exists, allowing stdin.
+///
+/// `-` and `/dev/stdin` name the process's standard input rather than a path on
+/// disk, so they must not be checked for existence — doing so rejects a piped
+/// input with the nonsensical `File does not exist`.
+///
+/// Use this for BAM/SAM inputs a command can stream. Use [`validate_file_exists`]
+/// for paths that must be real files on disk (references, indexes, include
+/// lists), where `-` is not meaningful and should still be rejected.
+///
+/// # Arguments
+/// * `path` - Path to validate
+/// * `description` - Type of file, without a trailing "file" (e.g. "Input BAM").
+///   The error renders as ``Invalid {description} file '{path}'``.
+///
+/// # Errors
+/// Returns an error if `path` is neither stdin nor an existing file
+pub fn validate_input_exists<P: AsRef<Path>>(path: P, description: &str) -> Result<()> {
+    if fgumi_bam_io::is_stdin_path(path.as_ref()) {
+        return Ok(());
+    }
+    validate_file_exists(path, description)
+}
+
 /// Validate that a file exists
 ///
 /// # Arguments
 /// * `path` - Path to validate
-/// * `description` - Human-readable description of the file (e.g., "Input file", "Reference")
+/// * `description` - Type of file, without a trailing "file" (e.g. "Input BAM",
+///   "Reference"). The error renders as ``Invalid {description} file '{path}'``,
+///   so a description that itself ends in "file" reads as "file file".
 ///
 /// # Errors
 /// Returns an error if the file does not exist
