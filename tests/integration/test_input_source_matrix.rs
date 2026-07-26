@@ -14,6 +14,15 @@
 //! explicit stance, and [`every_command_declares_an_input_contract`] fails when
 //! one does not — so adding a command forces a decision rather than inheriting
 //! whichever default its reader happened to have.
+//!
+//! Checking either property means running a command two ways and comparing what
+//! it wrote, which is only evidence if what it writes depends on what it read. A
+//! command handed input it cannot form a molecule from exits zero and writes a
+//! header-only file, so both comparisons pass however badly the reader behaved.
+//! That is why the table carries a third axis, `output_depends_on_input`, and
+//! why [`every_command_output_depends_on_its_input`] drains each fixture and
+//! demands the output change: it is the assertion that keeps the other two
+//! honest.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -21,16 +30,17 @@ use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{
-    create_consensus_family, create_grouped_family, create_minimal_header, create_test_reference,
-    create_umi_family, transcode_bam_to_sam, write_bam,
+    create_consensus_family, create_duplex_grouped_family, create_grouped_family,
+    create_minimal_header, create_single_strand_family, create_test_reference, create_umi_family,
+    transcode_bam_to_sam, write_bam,
 };
 
-/// Whether a command reads alignment records from a caller-supplied path.
+/// Whether a command is held to one of the properties [`CONTRACTS`] declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Support {
-    /// The command must accept this input source.
+    /// The command must satisfy it.
     Required,
-    /// The command legitimately cannot accept it; the string is why.
+    /// The command legitimately cannot; the string is why.
     NotApplicable(&'static str),
 }
 
@@ -44,6 +54,14 @@ struct InputContract {
     sam: Support,
     /// Whether `-i -` must work.
     stdin: Support,
+    /// Whether emptying the input must change the output.
+    ///
+    /// This is what keeps the other two axes honest. A command handed input it
+    /// cannot form a molecule from exits zero and writes a header-only file, so
+    /// its SAM and stdin runs match the oracle no matter how badly the reader
+    /// behaved. Declaring `Required` here puts that failure mode under test —
+    /// see [`every_command_output_depends_on_its_input`].
+    output_depends_on_input: Support,
 }
 
 /// The contract for every command the binary advertises.
@@ -56,47 +74,125 @@ const CONTRACTS: &[InputContract] = &[
         sam: NotApplicable("reads FASTQ, not alignment records"),
         // Only with a single input: one stdin cannot supply two FASTQs.
         stdin: Required,
+        output_depends_on_input: Required,
     },
-    InputContract { command: "correct", sam: Required, stdin: Required },
-    InputContract { command: "fastq", sam: Required, stdin: Required },
-    InputContract { command: "zipper", sam: Required, stdin: Required },
-    InputContract { command: "sort", sam: Required, stdin: Required },
+    InputContract {
+        command: "correct",
+        sam: Required,
+        stdin: Required,
+        output_depends_on_input: Required,
+    },
+    InputContract {
+        command: "fastq",
+        sam: Required,
+        stdin: Required,
+        output_depends_on_input: Required,
+    },
+    InputContract {
+        command: "zipper",
+        sam: Required,
+        stdin: Required,
+        output_depends_on_input: NotApplicable(
+            "emits one output template per uBAM template, and the uBAM arrives on `-u`; an \
+             empty `-i` yields the same templates, unmapped",
+        ),
+    },
+    InputContract {
+        command: "sort",
+        sam: Required,
+        stdin: Required,
+        output_depends_on_input: Required,
+    },
     InputContract {
         command: "merge",
         sam: Required,
         stdin: NotApplicable("merges N pre-sorted inputs named in a list file"),
+        output_depends_on_input: Required,
     },
-    InputContract { command: "group", sam: Required, stdin: Required },
-    InputContract { command: "dedup", sam: Required, stdin: Required },
+    InputContract {
+        command: "group",
+        sam: Required,
+        stdin: Required,
+        output_depends_on_input: Required,
+    },
+    InputContract {
+        command: "dedup",
+        sam: Required,
+        stdin: Required,
+        output_depends_on_input: Required,
+    },
     #[cfg(feature = "simplex")]
-    InputContract { command: "simplex", sam: Required, stdin: Required },
+    InputContract {
+        command: "simplex",
+        sam: Required,
+        stdin: Required,
+        output_depends_on_input: Required,
+    },
     #[cfg(feature = "duplex")]
-    InputContract { command: "duplex", sam: Required, stdin: Required },
+    InputContract {
+        command: "duplex",
+        sam: Required,
+        stdin: Required,
+        output_depends_on_input: Required,
+    },
     #[cfg(feature = "codec")]
-    InputContract { command: "codec", sam: Required, stdin: Required },
-    InputContract { command: "filter", sam: Required, stdin: Required },
-    InputContract { command: "clip", sam: Required, stdin: Required },
+    InputContract {
+        command: "codec",
+        sam: Required,
+        stdin: Required,
+        output_depends_on_input: Required,
+    },
+    InputContract {
+        command: "filter",
+        sam: Required,
+        stdin: Required,
+        output_depends_on_input: Required,
+    },
+    InputContract {
+        command: "clip",
+        sam: Required,
+        stdin: Required,
+        output_depends_on_input: Required,
+    },
     #[cfg(feature = "duplex")]
-    InputContract { command: "duplex-metrics", sam: Required, stdin: Required },
+    InputContract {
+        command: "duplex-metrics",
+        sam: Required,
+        stdin: Required,
+        output_depends_on_input: Required,
+    },
     #[cfg(feature = "simplex")]
-    InputContract { command: "simplex-metrics", sam: Required, stdin: Required },
+    InputContract {
+        command: "simplex-metrics",
+        sam: Required,
+        stdin: Required,
+        output_depends_on_input: Required,
+    },
     InputContract {
         command: "review",
         sam: NotApplicable("requires BAI indexes and does random access, which needs BGZF"),
         stdin: NotApplicable("does random access against a BAI index"),
+        output_depends_on_input: NotApplicable("declares no axis this harness invokes"),
     },
-    InputContract { command: "downsample", sam: Required, stdin: Required },
+    InputContract {
+        command: "downsample",
+        sam: Required,
+        stdin: Required,
+        output_depends_on_input: Required,
+    },
     #[cfg(feature = "compare")]
     InputContract {
         command: "compare",
         sam: Required,
         stdin: NotApplicable("compares two named files against each other"),
+        output_depends_on_input: Required,
     },
     #[cfg(feature = "simulate")]
     InputContract {
         command: "simulate",
         sam: NotApplicable("generates data rather than reading it"),
         stdin: NotApplicable("generates data rather than reading it"),
+        output_depends_on_input: NotApplicable("generates data rather than reading it"),
     },
 ];
 
@@ -215,9 +311,21 @@ enum Shape {
     Grouped,
     /// Consensus-called reads tagged `cD`/`cE`.
     Consensus,
+    /// Both strands of one molecule, tagged `RX` + strand-suffixed `MI`.
+    DuplexGrouped,
+    /// Two single-strand (`/A`-only) molecules of differing depth.
+    SimplexGrouped,
+    /// Overlapping read pairs tagged `MI` + `MC`, the CODEC shape.
+    Codec,
 }
 
 /// The record shape `command` requires.
+///
+/// "Requires" here means more than "is accepted by": a command handed input it
+/// cannot form a molecule from exits zero and writes a header-only file, which
+/// passes every comparison in this file vacuously. So the shape has to be one
+/// the command produces *records* from — see
+/// [`every_command_output_depends_on_its_input`], which enforces exactly that.
 fn shape_for(command: &str) -> Shape {
     match command {
         // Rejects any read lacking cD/cE consensus-calling tags.
@@ -225,6 +333,15 @@ fn shape_for(command: &str) -> Shape {
         // `downsample` requires MI; `merge` refuses an input that is not already
         // in template-coordinate order, which a single one-position family is.
         "downsample" | "merge" => Shape::Grouped,
+        // Given ungrouped reads these emit nothing at all, so they need a real
+        // molecule: `duplex` and `duplex-metrics` need both strands present.
+        "duplex" | "duplex-metrics" => Shape::DuplexGrouped,
+        // `simplex-metrics` rejects a base UMI seen on both strands, so it and
+        // the simplex caller get single-strand molecules instead.
+        "simplex" | "simplex-metrics" => Shape::SimplexGrouped,
+        // CODEC gets duplex from a single overlapping pair rather than from two
+        // strand-tagged templates, so it needs its own shape.
+        "codec" => Shape::Codec,
         _ => Shape::Ungrouped,
     }
 }
@@ -245,6 +362,31 @@ fn write_fixture(dir: &Path, command: &str) -> Fixture {
             records.extend(create_umi_family("TTTTGGGG", 2, "fam_b", "ACGTACGTAC", 35));
             records
         }
+        Shape::DuplexGrouped => create_duplex_grouped_family("1", 2, "ACGTACGT", 30, 100),
+        // Two families of different depth at different coordinates, so the
+        // family-size table has more than one row to get wrong.
+        Shape::SimplexGrouped => {
+            let mut records = create_single_strand_family("1", 3, "ACGTACGT", 30, 100);
+            records.extend(create_single_strand_family("2", 1, "ACGTACGT", 30, 400));
+            records
+        }
+        // Reuses the CODEC command's own pair builder rather than a second copy
+        // of the MI/MC/overlap invariants it encodes.
+        Shape::Codec => (0..2)
+            .flat_map(|i| {
+                let (r1, r2) = crate::test_codec_command::create_codec_read_pair(
+                    &format!("codec_{i}"),
+                    b"ACGTACGT",
+                    b"ACGTACGT",
+                    &[30; 8],
+                    &[30; 8],
+                    100,
+                    "UMI001",
+                    None,
+                );
+                [r1, r2]
+            })
+            .collect(),
     };
     write_bam(&bam, &header, &records);
 
@@ -304,7 +446,17 @@ fn invocation(command: &str) -> Option<Vec<&'static str>> {
         "dedup" => vec!["dedup", "-i", "{input}", "-o", "{output}"],
         "simplex" => vec!["simplex", "-i", "{input}", "-o", "{output}", "--min-reads", "1"],
         "duplex" => vec!["duplex", "-i", "{input}", "-o", "{output}", "--min-reads", "1"],
-        "codec" => vec!["codec", "-i", "{input}", "-o", "{output}"],
+        "codec" => vec![
+            "codec",
+            "-i",
+            "{input}",
+            "-o",
+            "{output}",
+            "--min-reads",
+            "1",
+            "--min-duplex-length",
+            "1",
+        ],
         "filter" => {
             vec![
                 "filter",
@@ -540,12 +692,21 @@ fn scrub_run_identity(text: &str) -> String {
     // comparison would fail on a difference that is not one.
     text.replace("input.sam", "<INPUT>")
         .replace("input.bam", "<INPUT>")
+        .replace("input.fq", "<INPUT>")
+        // The drained fixture is a different file, so its name must scrub to the
+        // same token: a difference that is only the input's name would let
+        // `every_command_output_depends_on_its_input` pass without the records
+        // having mattered.
+        .replace("empty.bam", "<INPUT>")
+        .replace("empty.fq", "<INPUT>")
         .replace("sam.list", "<LIST>")
         .replace("bam.list", "<LIST>")
+        .replace("empty.list", "<LIST>")
         .replace(STDIN_SAM_RUN, "<RUN>")
         .replace(STDIN_RUN, "<RUN>")
         .replace(SAM_RUN, "<RUN>")
         .replace(BAM_RUN, "<RUN>")
+        .replace(EMPTY_RUN, "<RUN>")
 }
 
 /// Per-run output subdirectory names (see `run_command`'s `run_tag`).
@@ -553,6 +714,7 @@ const BAM_RUN: &str = "bam-run";
 const SAM_RUN: &str = "sam-run";
 const STDIN_RUN: &str = "stdin-run";
 const STDIN_SAM_RUN: &str = "stdin-sam-run";
+const EMPTY_RUN: &str = "empty-run";
 
 /// Describes the first way two runs' outputs differ, or `None` if they match.
 ///
@@ -625,7 +787,7 @@ fn run_named_path_oracle(
         Ok(oracle_run)
     } else {
         Err(format!(
-            "{command}: failed on a named path, so its {candidate_label} result would \
+            "{command}: failed on a named path, so the {candidate_label} comparison would \
              prove nothing: {}",
             String::from_utf8_lossy(&oracle_run.stderr)
         ))
@@ -643,24 +805,12 @@ fn run_named_path_oracle(
 /// # What the `oracle.is_empty()` guard does and does not prove
 ///
 /// It proves the harness can *see* the run's artifacts, not that those artifacts
-/// are sensitive to the records that went in. Measured by fault injection —
-/// piping a header-only BAM, i.e. a stdin path that consumed nothing yet still
-/// exited 0 — the comparison catches that for `correct`, `fastq`, `sort`,
-/// `group`, `dedup`, `filter`, `clip` and `downsample` (`extract` is caught a
-/// step earlier, by the exit status). It cannot catch it for five commands, for
-/// two distinct reasons, neither fixable by a stronger guard here:
-///
-/// - `simplex`, `duplex` and `codec` write a header-only BAM from *any* input,
-///   because [`write_fixture`] gives them ungrouped reads. Grouping the fixture
-///   gets `simplex` to one consensus record but not the other two: `duplex`
-///   needs strand-suffixed (`/A`, `/B`) `MI` families and `codec` needs CODEC
-///   read structure, so closing this needs new fixture generators.
-/// - `simplex-metrics` and `duplex-metrics` emit the same all-zero tables either
-///   way, since their fixture carries no consensus tags to count.
-///
-/// `zipper` is insensitive for a third reason that is *not* a gap: its output is
-/// driven by the uBAM it is given as `-u`, so an empty `-i` legitimately still
-/// yields every unmapped template. Its stdin coverage is the exit status.
+/// are sensitive to the records that went in — a command that writes a
+/// header-only BAM from any input compares equal here no matter what the reader
+/// did. That is the vacuity this comparison exists to avoid, so it is checked
+/// separately rather than assumed: every command declares
+/// `output_depends_on_input`, and [`every_command_output_depends_on_its_input`]
+/// holds it to that by draining the fixture and requiring the output to change.
 fn compare_to_oracle(
     command: &str,
     dir: &Path,
@@ -778,6 +928,215 @@ fn declared_stdin_support_accepts_piped_sam() {
 
             compare_to_oracle(command, dir, &oracle_run, &piped, STDIN_SAM_RUN, "piped SAM")
         },
+    );
+}
+
+/// An input with no records, in whatever form `command` reads.
+///
+/// Same header and same shape as the real fixture, minus the records — so the
+/// only thing that changed between the two runs is the data itself.
+///
+/// The header is read back from the fixture rather than re-minted with
+/// `create_minimal_header`, because for `merge` those two are *not* the same
+/// header: `write_fixture` re-writes the merge fixture through `fgumi sort` to
+/// get template-coordinate order, and that stamps an `@PG ID:fgumi` line a fresh
+/// header does not have. `merge` propagates input `@PG` records into its output
+/// and `read_bam_output` normalizes only each `@PG`'s `CL` value, not its
+/// presence — so a re-minted header left the populated and drained outputs
+/// differing by that one line, and `merge` satisfied this whole test on a
+/// provenance difference with zero records on either side. That is precisely the
+/// vacuity the test exists to reject.
+fn drained_input(command: &str, dir: &Path) -> PathBuf {
+    /// Write a record-free copy of the fixture's own header to `path`.
+    fn empty_bam_matching_fixture(dir: &Path, path: &Path) {
+        let (header, records) = crate::helpers::read_bam_output(&dir.join("input.bam"));
+        assert!(
+            !records.is_empty(),
+            "the fixture must have records for draining it to mean anything"
+        );
+        write_bam(path, &header, &[]);
+    }
+
+    match command {
+        // `extract` reads FASTQ, where "no records" is an empty file.
+        "extract" => {
+            let path = dir.join("empty.fq");
+            std::fs::write(&path, "").expect("write empty FASTQ");
+            path
+        }
+        // `merge` names its inputs in a list file, so the list must point at an
+        // empty BAM rather than being empty itself — an empty list is a
+        // different error, not a drained input.
+        "merge" => {
+            let bam = dir.join("empty.bam");
+            empty_bam_matching_fixture(dir, &bam);
+            let list = dir.join("empty.list");
+            std::fs::write(&list, format!("{}\n", bam.display())).expect("write empty list");
+            list
+        }
+        _ => {
+            let path = dir.join("empty.bam");
+            empty_bam_matching_fixture(dir, &path);
+            path
+        }
+    }
+}
+
+/// Commands that answer a drained input with a non-zero exit, and the phrase
+/// whose presence in stderr identifies that answer.
+///
+/// A non-zero exit is a legitimate — and stronger — form of "the output depends
+/// on the input" than writing different bytes, but only when the command exits
+/// for the declared reason. The reason is pinned, not just the command name,
+/// because the two entries here fail in genuinely different ways and neither
+/// would notice being replaced by an unrelated failure:
+///
+/// - `extract` *refuses* the input: it cannot infer a quality encoding with no
+///   records to look at.
+/// - `compare` does not refuse anything — it runs to completion and exits 1
+///   because the drained file and the populated oracle **differ**, which is
+///   itself the dependence being tested.
+///
+/// A command that starts failing for a new reason — a bad flag combination, a
+/// rejected header, a panic — no longer matches its phrase and surfaces here
+/// instead of being absorbed.
+/// Each phrase must be one the command emits regardless of `RUST_LOG`. `extract`
+/// fails with an `anyhow` error, which reaches stderr unconditionally. `compare`
+/// is pinned to its **stdout** `RESULT:` line rather than the matching
+/// `info!("BAM files differ")`: log records are filtered by `RUST_LOG`
+/// (`main.rs` builds the logger with `Env::default().default_filter_or("info")`),
+/// and `run_command` inherits the parent environment, so a developer running
+/// under `RUST_LOG=warn` would lose the log line and see this test fail on a
+/// correctly-behaving binary. The `RESULT:` line is a `println!` gated only on
+/// `--quiet`, which this harness never passes.
+const DRAINED_INPUT_NONZERO_EXITS: &[(&str, &str)] = &[
+    ("extract", "Cannot detect quality encoding: no records provided"),
+    #[cfg(feature = "compare")]
+    ("compare", "RESULT: BAM files DIFFER"),
+];
+
+/// Hold a drained run's non-zero exit to what [`DRAINED_INPUT_NONZERO_EXITS`]
+/// declares for `command`.
+///
+/// Both streams are searched: which one carries the phrase is an implementation
+/// detail of how the command reports (an `anyhow` bail on stderr, a `println!`
+/// report on stdout), and pinning the wrong stream is a test failure that says
+/// nothing about the binary.
+fn check_declared_nonzero_exit(command: &str, stdout: &[u8], stderr: &[u8]) -> Result<(), String> {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+
+    let Some((_, expected)) =
+        DRAINED_INPUT_NONZERO_EXITS.iter().find(|(declared, _)| *declared == command)
+    else {
+        return Err(format!(
+            "{command}: exited non-zero on a drained input, so the output comparison never ran \
+             and this command's matrices could still be passing vacuously. Either fix the \
+             invocation so it succeeds, or — if refusing a drained input is the contract — add \
+             it to `DRAINED_INPUT_NONZERO_EXITS` with the phrase that identifies the refusal. \
+             stdout:\n{stdout}\nstderr:\n{stderr}"
+        ));
+    };
+
+    if stdout.contains(expected) || stderr.contains(expected) {
+        return Ok(());
+    }
+    Err(format!(
+        "{command}: exited non-zero on a drained input, but not for the reason \
+         `DRAINED_INPUT_NONZERO_EXITS` declares — expected stdout or stderr to contain \
+         {expected:?}. A different failure means the declared exemption is now hiding something \
+         else; update the declaration or fix the failure. stdout:\n{stdout}\nstderr:\n{stderr}"
+    ))
+}
+
+/// Every command declaring `output_depends_on_input: Required` must produce
+/// different output when its input has no records.
+///
+/// This is the test that stops the other two from passing vacuously. Both of
+/// them compare a SAM or stdin run against a named-path run, which proves
+/// nothing about a command whose output is the same either way: `simplex` on
+/// ungrouped reads, or `duplex-metrics` with no consensus tags to count, emits
+/// an identical header-only file whether the reader delivered every record or
+/// none, so a reader that silently dropped the whole stream would still pass.
+///
+/// Rather than curating a list of which commands are safe, this drives the same
+/// fixture through each command twice — once populated, once drained — and
+/// fails if the two agree. A future fixture that stops producing records for a
+/// command breaks here, at the cause, instead of quietly hollowing out the
+/// matrices.
+///
+/// The one thing that *is* declared rather than derived is a non-zero exit on
+/// the drained run: it can only be compared as bytes if the command produced
+/// bytes, so [`DRAINED_INPUT_NONZERO_EXITS`] names the commands that legitimately
+/// exit non-zero and the reason each must give.
+#[test]
+fn every_command_output_depends_on_its_input() {
+    // Which declared exemptions actually fired, so a stale one cannot outlive the
+    // contract it documents — the same guard `CONTRACTS` gets from its `stale`
+    // check. If a command grows a fallback and starts exiting zero on a drained
+    // input, it takes the byte-comparison branch below, its entry is never
+    // consulted, and the declaration silently becomes a lie.
+    let consulted = std::cell::RefCell::new(Vec::<&str>::new());
+
+    for_each_command_requiring(
+        |c| c.output_depends_on_input,
+        |command, fixture, dir| {
+            let populated = run_named_path_oracle(command, fixture, dir, "drained input")?;
+
+            let drained_path = drained_input(command, dir);
+            let drained = run_command(
+                command,
+                &drained_path.display().to_string(),
+                dir,
+                fixture,
+                None,
+                EMPTY_RUN,
+            );
+
+            // A non-zero exit can itself be the dependence on the input — but only
+            // when it is the exit this command is declared to give, for the declared
+            // reason. Accepting *any* failure would re-open the vacuity hole this
+            // test exists to close: a bad flag combination, a rejected header or a
+            // panic would all be absorbed, and the output comparison below would
+            // silently never run.
+            if !drained.status.success() {
+                let verdict =
+                    check_declared_nonzero_exit(command, &drained.stdout, &drained.stderr);
+                if verdict.is_ok()
+                    && let Some((declared, _)) = DRAINED_INPUT_NONZERO_EXITS
+                        .iter()
+                        .find(|(declared, _)| *declared == command)
+                {
+                    consulted.borrow_mut().push(declared);
+                }
+                return verdict;
+            }
+
+            let with_records = digest_run(&dir.join(BAM_RUN), &populated.stdout);
+            let without_records = digest_run(&dir.join(EMPTY_RUN), &drained.stdout);
+            if describe_difference(&with_records, &without_records, "drained input").is_none() {
+                return Err(format!(
+                    "{command}: produced identical output from its fixture and from an input \
+                     with no records, so every comparison in this file passes vacuously for \
+                     it — give it a fixture it emits records from (see `shape_for`), or \
+                     declare `output_depends_on_input: NotApplicable` with the reason"
+                ));
+            }
+            Ok(())
+        },
+    );
+
+    let consulted = consulted.into_inner();
+    let stale: Vec<&str> = DRAINED_INPUT_NONZERO_EXITS
+        .iter()
+        .map(|(command, _)| *command)
+        .filter(|command| !consulted.contains(command))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "these commands are declared in `DRAINED_INPUT_NONZERO_EXITS` but exited zero on a \
+         drained input, so their declared exemption was never used: {stale:?}. They now go \
+         through the output comparison like every other command — remove their entries."
     );
 }
 
