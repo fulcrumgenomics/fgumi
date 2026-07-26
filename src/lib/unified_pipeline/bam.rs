@@ -595,8 +595,11 @@ pub struct BamPipelineState<G, P: MemoryEstimate> {
 
     // ========== Step 2: Decompress (parallel) ==========
     // No state needed - each thread has its own Decompressor
-    /// Flag indicating all decompression is done.
-    pub decompress_done: AtomicBool,
+    //
+    // There is no `decompress_done` flag: downstream stages track this step through
+    // `batches_decompressed`, and `FindBoundaries` infers it from
+    // `batches_boundary_processed == next_read_serial` (nothing can be processed that
+    // was not decompressed first).
     /// Count of batches that have completed decompression (for completion tracking).
     pub batches_decompressed: AtomicU64,
 
@@ -630,8 +633,11 @@ pub struct BamPipelineState<G, P: MemoryEstimate> {
     pub q2b_boundaries: ArrayQueue<(u64, BoundaryBatch)>,
 
     // ========== Step 4: Decode (parallel) ==========
-    /// Flag indicating all decoding is done.
-    pub decode_done: AtomicBool,
+    //
+    // There is no `decode_done` flag: `Group` tracks this step through
+    // `batches_grouped == batches_boundary_found`, which counts batches only once they
+    // have been pushed, and so cannot conclude early while one is still held for a
+    // retried push.
     /// Count of batches that have completed decoding (for completion tracking).
     pub batches_decoded: AtomicU64,
     /// Configuration for computing `GroupKey` during decode.
@@ -706,7 +712,6 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
             #[cfg(feature = "memory-debug")]
             q1_heap_bytes: AtomicU64::new(0),
             // Step 2: Decompress
-            decompress_done: AtomicBool::new(false),
             batches_decompressed: AtomicU64::new(0),
             // Q2: Decompress → FindBoundaries (with reorder)
             q2_decompressed: ArrayQueue::new(cap),
@@ -723,7 +728,6 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
             // Q2b: FindBoundaries → Decode
             q2b_boundaries: ArrayQueue::new(cap),
             // Step 4: Decode
-            decode_done: AtomicBool::new(false),
             batches_decoded: AtomicU64::new(0),
             group_key_config,
             // Q3: Decode → Group (with reorder)
@@ -2307,13 +2311,13 @@ fn try_step_decode<G: Send, P: Send + MemoryEstimate>(
     let Some((serial, boundary_batch)) = state.q2b_boundaries.pop() else {
         if let Some(stats) = state.stats() {
             stats.record_queue_empty(25); // Q2b (boundaries queue)
-        }
-        // Check if boundary finding is done and queue is empty
-        if state.boundary_done.load(Ordering::SeqCst) && state.q2b_boundaries.is_empty() {
-            state.decode_done.store(true, Ordering::SeqCst);
-        } else if let Some(stats) = state.stats() {
-            // Q2b is extension of Q2
-            stats.record_queue_empty(2);
+
+            // Q2b is an extension of Q2, but an empty Q2b only counts as a stall
+            // while `FindBoundaries` might still deliver more. Once it is done and the
+            // queue has drained, this is the terminal state, not starvation.
+            if !state.boundary_done.load(Ordering::SeqCst) || !state.q2b_boundaries.is_empty() {
+                stats.record_queue_empty(2);
+            }
         }
         return advanced_held;
     };
@@ -4764,6 +4768,47 @@ mod tests {
     /// (`compression_level=6`, `thread_id=0`, `num_threads=2`).
     fn create_test_worker() -> WorkerState<()> {
         WorkerState::new(6, 0, 2, SchedulerStrategy::default())
+    }
+
+    /// `Decode` finding `q2b_boundaries` empty always counts as Q2b starvation, but
+    /// only counts as Q2 starvation while `FindBoundaries` might still deliver more.
+    /// Once it is done and the queue has drained, an empty Q2b is the terminal state.
+    ///
+    /// This is the condition that used to sit in the `else` arm of the `decode_done`
+    /// store; the flag is gone, so the behaviour is pinned here instead.
+    #[rstest]
+    #[case::boundaries_may_still_arrive(false, 1)]
+    #[case::boundary_finding_done(true, 0)]
+    fn test_decode_records_q2_starvation_only_while_boundaries_may_arrive(
+        #[case] boundary_done: bool,
+        #[case] expected_q2_empty: u64,
+    ) {
+        let config = PipelineConfig::new(2, 6).with_stats(true);
+        let input: Box<dyn Read + Send> = Box::new(std::io::empty());
+        let output: Box<dyn Write + Send> = Box::new(std::io::sink());
+        let header = Header::default();
+        let library_index = LibraryIndex::from_header(&header);
+        let group_key_config = GroupKeyConfig::new(library_index, SamTag::CB.into());
+        let state: BamPipelineState<(), ()> =
+            BamPipelineState::new(config, input, output, group_key_config);
+        let mut worker = create_test_worker();
+
+        state.boundary_done.store(boundary_done, Ordering::SeqCst);
+
+        // Nothing in q2b, nothing held: Decode falls through to the starvation check.
+        assert!(!try_step_decode(&state, &mut worker), "no input means no work done");
+
+        let stats = state.stats().expect("stats were enabled");
+        assert_eq!(
+            stats.q2b_empty.load(Ordering::Relaxed),
+            1,
+            "an empty Q2b is always recorded as Q2b starvation"
+        );
+        assert_eq!(
+            stats.q2_empty.load(Ordering::Relaxed),
+            expected_q2_empty,
+            "Q2 starvation must be recorded only while more boundaries may arrive"
+        );
     }
 
     /// Seed a reorder buffer state with a held-item stress scenario: a
