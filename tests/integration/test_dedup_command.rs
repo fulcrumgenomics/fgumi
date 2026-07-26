@@ -14,6 +14,8 @@ use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
+use noodles::sam::alignment::record::data::field::Tag;
+use noodles::sam::alignment::record_buf::data::field::Value;
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
@@ -471,4 +473,151 @@ fn test_dedup_no_umi_large_position_group() {
 
     // All templates should share the same MI value (one group in identity strategy).
     assert_eq!(mi_values.len(), 1, "all records should share a single MI tag value");
+}
+
+/// `dedup` carries its own copy of `--index-threshold`, so it needs the same
+/// unsatisfiable-request check `group` has: `always` under a strategy with no index
+/// code path must be rejected, not silently ignored.
+#[test]
+fn test_dedup_rejects_index_threshold_always_when_index_unreachable() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    create_sorted_bam(&input_bam, create_duplicate_group("dup1", "ACGTACGT", 3, 100));
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--index-threshold",
+        "always",
+    ])
+    .expect("failed to parse dedup args");
+
+    let err = cmd.execute("fgumi dedup").expect_err("must reject an unsatisfiable request");
+    let message = err.to_string();
+    assert!(
+        message.contains("--index-threshold always")
+            && message.contains("never uses the UMI index"),
+        "error should say why the request cannot be honoured, got: {message}"
+    );
+}
+
+/// Read back (name, flags, MI) per record, in file order.
+///
+/// `never` only ever changes *how* neighbours are discovered, so this is the granularity
+/// the contract is stated at: which molecule each read landed in, and whether it was
+/// marked a duplicate.
+fn dedup_output_summary(path: &Path) -> Vec<(String, u16, Option<String>)> {
+    let mi_tag = Tag::from(SamTag::MI);
+    let mut reader = bam::io::Reader::new(fs::File::open(path).expect("failed to open output BAM"));
+    let header = reader.read_header().expect("failed to read output header");
+    reader
+        .record_bufs(&header)
+        .map(|record| {
+            let record = record.expect("failed to read output record");
+            let mi = record.data().get(&mi_tag).map(|value| match value {
+                Value::String(mi) => mi.to_string(),
+                other => panic!("MI must be a string tag, got {other:?}"),
+            });
+            let name = record.name().expect("output record must be named").to_string();
+            (name, record.flags().bits(), mi)
+        })
+        .collect()
+}
+
+/// Run dedup on `input_bam`, appending `extra_args`, and summarise the output.
+fn run_dedup(
+    input_bam: &Path,
+    output_bam: &Path,
+    extra_args: &[&str],
+) -> Vec<(String, u16, Option<String>)> {
+    let mut args = vec![
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--compression-level",
+        "1",
+    ];
+    args.extend_from_slice(extra_args);
+
+    MarkDuplicates::try_parse_from(args)
+        .expect("failed to parse dedup args")
+        .execute("fgumi dedup")
+        .expect("dedup must succeed");
+    dedup_output_summary(output_bam)
+}
+
+/// `never` is always satisfiable, so it must be accepted everywhere -- including under
+/// a strategy that would not have indexed anyway.
+///
+/// The index is a pure optimisation: it changes which UMI pairs are *compared*, never
+/// which reads group together. So the contract is output identity with the default
+/// threshold, not merely "a file appeared" -- and the absolute grouping is pinned too,
+/// since comparing the two runs alone would pass if both regressed the same way.
+#[test]
+fn test_dedup_accepts_index_threshold_never() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let never_bam = temp_dir.path().join("never.bam");
+    let default_bam = temp_dir.path().join("default.bam");
+    // Three pairs sharing one UMI at one position: one molecule, six records.
+    create_sorted_bam(&input_bam, create_duplicate_group("dup1", "ACGTACGT", 3, 100));
+
+    let never = run_dedup(&input_bam, &never_bam, &["--index-threshold", "never"]);
+    let default = run_dedup(&input_bam, &default_bam, &[]);
+
+    assert_eq!(
+        never, default,
+        "--index-threshold never must not change the output; it only suppresses the index"
+    );
+
+    // Absolute expectations, so this still fails if both runs regress together.
+    assert_eq!(never.len(), 6, "all six records must be emitted (marked, not removed)");
+
+    // All six records, pinned by name, flags and molecule. The two ends sit in
+    // different template-coordinate position groups (99 and 199), so each end gets its
+    // own molecule id -- the three copies of each end share one, which is the grouping
+    // the index would have had to get wrong to matter here.
+    let expected = vec![
+        ("dup1_0".to_string(), flags::PAIRED | flags::FIRST_SEGMENT, Some("0".to_string())),
+        (
+            "dup1_1".to_string(),
+            flags::PAIRED | flags::FIRST_SEGMENT | flags::DUPLICATE,
+            Some("0".to_string()),
+        ),
+        (
+            "dup1_2".to_string(),
+            flags::PAIRED | flags::FIRST_SEGMENT | flags::DUPLICATE,
+            Some("0".to_string()),
+        ),
+        (
+            "dup1_0".to_string(),
+            flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE,
+            Some("1".to_string()),
+        ),
+        (
+            "dup1_1".to_string(),
+            flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE | flags::DUPLICATE,
+            Some("1".to_string()),
+        ),
+        (
+            "dup1_2".to_string(),
+            flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE | flags::DUPLICATE,
+            Some("1".to_string()),
+        ),
+    ];
+    assert_eq!(never, expected, "--index-threshold never changed the grouping");
+
+    // One template is the primary; the other two pairs are marked duplicates.
+    let duplicates = never.iter().filter(|(_, flags, _)| flags & flags::DUPLICATE != 0).count();
+    assert_eq!(duplicates, 4, "two of the three pairs must be marked duplicate: {never:?}");
 }

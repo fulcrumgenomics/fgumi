@@ -32,6 +32,7 @@ use clap::Parser;
 use fgoxide::io::DelimFile;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::{create_bam_reader_for_pipeline, create_bam_writer};
+use fgumi_umi::IndexThreshold;
 // MemoryEstimate is gated because it's only used in memory-debug blocks below
 use crate::sam::SamTag;
 #[cfg(feature = "memory-debug")]
@@ -481,7 +482,7 @@ fn should_use_parallel(
 fn create_umi_assigner(
     strategy: Strategy,
     effective_edits: u32,
-    index_threshold: usize,
+    index_threshold: IndexThreshold,
     num_threads: usize,
     use_parallel: bool,
 ) -> Box<dyn UmiAssigner> {
@@ -857,14 +858,19 @@ pub struct GroupReadsByUmi {
     #[command(flatten)]
     pub compression: CompressionOptions,
 
-    /// Minimum distinct UMIs at a position before an N-gram/BK-tree index is
-    /// built, instead of comparing every pair. Set high (e.g. a value larger
-    /// than any position group) to always use the linear scan.
-    /// Affects the Edit, Adjacency and Paired strategies. Edit floors this at
-    /// its own measured crossover (200 distinct UMIs), below which the index
-    /// costs more than the scan it replaces, and indexes only at --edits 1.
+    /// When to match UMIs through the N-gram/BK-tree index instead of comparing every
+    /// pair. Either `always`, `never`, or a minimum number of distinct UMIs at a
+    /// position. The number is a minimum, not a switch, so `0` gates the index on for
+    /// every group exactly as `always` does; only `always` additionally errors when the
+    /// strategy can never index. The index is a pure optimization: it never changes
+    /// which reads group together. Edit and Adjacency index only at --edits 1, and Edit
+    /// floors a numeric threshold at its own measured crossover (200 distinct UMIs);
+    /// Paired indexes at every --edits value. Ignored for any position group handed to a
+    /// parallel assigner, which with --threads above 1 means every group under
+    /// --allow-unmapped and any group meeting --parallel-group-min-templates: those
+    /// assigners find neighbours by enumeration and never consult the index.
     #[arg(long = "index-threshold", default_value = "100")]
-    pub index_threshold: usize,
+    pub index_threshold: IndexThreshold,
 
     /// Skip UMI-based grouping; group by template coordinate and strand of origin. Forces
     /// identity strategy and ignores any existing UMI tags. An F1R2 and an F2R1 template at
@@ -966,12 +972,6 @@ impl Command for GroupReadsByUmi {
             (self.strategy, false)
         };
 
-        // Validate the input exists (stdin paths are exempt).
-        self.io.validate()?;
-
-        // Set minimum mapping quality
-        let min_mapq: u8 = self.min_map_q.unwrap_or(1);
-
         // Identity strategy requires edits=0, others use the configured value
         // Also force edits=0 in no-umi mode
         let effective_edits =
@@ -980,6 +980,20 @@ impl Command for GroupReadsByUmi {
             } else {
                 self.edits
             };
+
+        // `--index-threshold always` asserts that indexing will happen; reject it when
+        // the resolved strategy/edits can never index rather than ignoring the flag.
+        crate::commands::common::validate_index_threshold(
+            self.index_threshold,
+            effective_strategy,
+            effective_edits,
+        )?;
+
+        // Validate the input exists (stdin paths are exempt).
+        self.io.validate()?;
+
+        // Set minimum mapping quality
+        let min_mapq: u8 = self.min_map_q.unwrap_or(1);
 
         // Initialize tracking infrastructure
         let timer = OperationTimer::new("Grouping reads by UMI");
@@ -1704,7 +1718,7 @@ impl GroupReadsByUmi {
         filter_config: &GroupFilterConfig,
         strategy: Strategy,
         effective_edits: u32,
-        index_threshold: usize,
+        index_threshold: IndexThreshold,
         threads: usize,
         parallel_group_min_templates: Option<&ParallelMinTemplates>,
         raw_tag: [u8; 2],
@@ -2013,7 +2027,7 @@ mod tests {
     #[case(Strategy::Adjacency)]
     #[case(Strategy::Paired)]
     fn create_umi_assigner_parallel_builds_parallel_variant(#[case] strategy: Strategy) {
-        let assigner = create_umi_assigner(strategy, 1, 0, 2, true);
+        let assigner = create_umi_assigner(strategy, 1, IndexThreshold::MinUmis(0), 2, true);
         let any = assigner.as_any();
         let is_parallel = match strategy {
             Strategy::Identity => any.is::<ParallelIdentityAssigner>(),
@@ -2036,7 +2050,7 @@ mod tests {
     #[case(Strategy::Paired)]
     fn create_umi_assigner_single_thread_builds_non_parallel_variant(#[case] strategy: Strategy) {
         // num_threads = 1 with use_parallel = true must still fall back to sequential.
-        let assigner = create_umi_assigner(strategy, 0, 0, 1, true);
+        let assigner = create_umi_assigner(strategy, 0, IndexThreshold::MinUmis(0), 1, true);
         let any = assigner.as_any();
         assert!(
             !any.is::<ParallelIdentityAssigner>()
@@ -2056,7 +2070,7 @@ mod tests {
     #[case(Strategy::Paired)]
     fn create_umi_assigner_sequential_builds_non_parallel_variant(#[case] strategy: Strategy) {
         // Identity requires zero edits; the other strategies accept zero too.
-        let assigner = create_umi_assigner(strategy, 0, 0, 2, false);
+        let assigner = create_umi_assigner(strategy, 0, IndexThreshold::MinUmis(0), 2, false);
         let any = assigner.as_any();
         assert!(
             !any.is::<ParallelIdentityAssigner>()
@@ -2144,7 +2158,7 @@ mod tests {
             min_umi_length: None,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
+            index_threshold: IndexThreshold::default(),
             no_umi: false,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
@@ -2502,7 +2516,8 @@ mod tests {
         assert_ne!(truncated[0], truncated[3], "truncated UMIs must stay distinct");
 
         // Sequential adjacency assigner, max 1 mismatch (num_threads = 1, use_parallel = false).
-        let assigner = create_umi_assigner(Strategy::Adjacency, 1, 100, 1, false);
+        let assigner =
+            create_umi_assigner(Strategy::Adjacency, 1, IndexThreshold::default(), 1, false);
         let assignments = assigner.assign(&truncated);
 
         assert_eq!(assignments.len(), 5);
@@ -3829,6 +3844,82 @@ mod tests {
             error_msg.contains("--no-umi cannot be used with --strategy paired"),
             "Error message should mention the conflict"
         );
+    }
+
+    /// `--index-threshold always` is an assertion that indexing will happen, so a
+    /// strategy/edits combination that can never index must be rejected rather than
+    /// silently ignoring the request.
+    ///
+    /// Only `always` is checked. A bare integer -- including `0`, which admits every
+    /// group just as `always` does -- is a tuning knob allowed to end up inert; that is
+    /// what lets the default `100` coexist with `--strategy identity`.
+    #[rstest]
+    // The expected substring names the STRATEGY as well as the distance: edit and
+    // adjacency share the "only indexes at --edits 1" wording, so asserting the distance
+    // alone would pass even if the message blamed the wrong strategy.
+    #[case::identity_never_indexes(
+        Strategy::Identity,
+        0,
+        "the identity strategy never uses the UMI index"
+    )]
+    #[case::adjacency_needs_one_edit(
+        Strategy::Adjacency,
+        2,
+        "the adjacency strategy only indexes at --edits 1"
+    )]
+    #[case::adjacency_zero_edits(
+        Strategy::Adjacency,
+        0,
+        "the adjacency strategy only indexes at --edits 1"
+    )]
+    #[case::edit_needs_one_edit(Strategy::Edit, 2, "the edit strategy only indexes at --edits 1")]
+    #[case::edit_zero_edits(Strategy::Edit, 0, "the edit strategy only indexes at --edits 1")]
+    fn test_index_threshold_always_rejected_when_index_unreachable(
+        #[case] strategy: Strategy,
+        #[case] edits: u32,
+        #[case] expected_in_message: &str,
+    ) {
+        let mut cmd = test_group_cmd(strategy, edits);
+        cmd.index_threshold = IndexThreshold::Always;
+
+        let err = cmd.execute("test").expect_err("must reject an unsatisfiable --index-threshold");
+        let message = err.to_string();
+        assert!(
+            message.contains("--index-threshold always") && message.contains(expected_in_message),
+            "error should say why the request cannot be honoured, got: {message}"
+        );
+    }
+
+    /// The combinations that CAN index must not be rejected, and neither must a bare
+    /// integer under a strategy that never indexes.
+    #[rstest]
+    #[case::adjacency_one_edit(Strategy::Adjacency, 1, IndexThreshold::Always)]
+    #[case::paired_two_edits(Strategy::Paired, 2, IndexThreshold::Always)]
+    #[case::edit_one_edit(Strategy::Edit, 1, IndexThreshold::Always)]
+    // Edit at two edits cannot index, but a bare integer there is still inert-and-legal,
+    // exactly as it is for identity.
+    #[case::edit_two_edits_with_number(Strategy::Edit, 2, IndexThreshold::MinUmis(100))]
+    #[case::edit_two_edits_with_never(Strategy::Edit, 2, IndexThreshold::Never)]
+    #[case::identity_with_number(Strategy::Identity, 0, IndexThreshold::MinUmis(100))]
+    #[case::identity_with_zero(Strategy::Identity, 0, IndexThreshold::MinUmis(0))]
+    #[case::identity_with_never(Strategy::Identity, 0, IndexThreshold::Never)]
+    fn test_index_threshold_accepted_when_satisfiable(
+        #[case] strategy: Strategy,
+        #[case] edits: u32,
+        #[case] index_threshold: IndexThreshold,
+    ) {
+        let mut cmd = test_group_cmd(strategy, edits);
+        cmd.index_threshold = index_threshold;
+
+        // `test_group_cmd` points at /dev/null, so execution fails later on I/O. All
+        // that matters here is that it is not rejected by the index-threshold check.
+        if let Err(e) = cmd.execute("test") {
+            let message = e.to_string();
+            assert!(
+                !message.contains("--index-threshold"),
+                "must not be rejected for --index-threshold, got: {message}"
+            );
+        }
     }
 
     #[test]
