@@ -5,7 +5,7 @@ use crate::commands::common::{
     resolve_memory_budget,
 };
 use crate::commands::sort::{TMP_DIRS_ENV, resolve_tmp_dirs};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use bytesize::ByteSize;
 use clap::Args;
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -21,6 +21,7 @@ use rand::{Rng, RngExt};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
+use std::thread::JoinHandle;
 
 /// Build the `@HD` header map carrying the `SO`/`GO`/`SS` sort-order tags for `order`.
 ///
@@ -862,6 +863,37 @@ fn is_conversion_target(
             MethylationMode::Disabled => false,
         }
     }
+}
+
+/// Join the writer thread, then decide which of the two failures to report.
+///
+/// Every `simulate` subcommand that streams records to a writer thread ends the
+/// same way: the generation pass returns a channel `SendError` or `Ok(())`, and
+/// the writer thread returns the counts it accumulated. Joining is unconditional
+/// because the writer owns the output file — returning while it is still running
+/// leaves the file being written behind the error.
+///
+/// A send failure is a *symptom*: the channel only closes because the writer
+/// already died, so the writer's error is the cause and is reported in preference
+/// to it. The send failure is reported only when the writer itself succeeded,
+/// which means the receiver was dropped for some other reason.
+///
+/// # Errors
+///
+/// Returns an error if the writer thread panicked, if the writer thread returned
+/// an error, or — only when the writer succeeded — if generation failed to send.
+pub fn join_writer_result<T, E: std::fmt::Display>(
+    writer_handle: JoinHandle<Result<T>>,
+    generation_result: std::result::Result<(), E>,
+) -> Result<T> {
+    let writer_result = writer_handle.join().map_err(|_| anyhow!("Writer thread panicked"))?;
+
+    if let Err(e) = generation_result {
+        writer_result?;
+        return Err(anyhow!("Failed to send record to writer: {e}"));
+    }
+
+    writer_result
 }
 
 #[cfg(test)]

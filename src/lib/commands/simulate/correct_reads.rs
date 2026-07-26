@@ -2,7 +2,7 @@
 
 use crate::commands::command::Command;
 use crate::commands::common::CompressionOptions;
-use crate::commands::simulate::common::generate_random_sequence;
+use crate::commands::simulate::common::{generate_random_sequence, join_writer_result};
 use crate::sam::SamTag;
 use crate::simulate::create_rng;
 use anyhow::{Context, Result};
@@ -291,14 +291,8 @@ impl Command for CorrectReads {
         // Drop sender to signal writer thread that we're done
         drop(sender);
 
-        // Check generation result
-        if let Err(e) = generation_result {
-            return Err(anyhow::anyhow!("Failed to send record to writer: {e}"));
-        }
-
-        // Wait for writer thread to finish
         let (read_count, exact_count, edit1_count, edit2_count, multi_count) =
-            writer_handle.join().map_err(|_| anyhow::anyhow!("Writer thread panicked"))??;
+            join_writer_result(writer_handle, generation_result)?;
 
         info!("Generated {read_count} reads:");
         info!(

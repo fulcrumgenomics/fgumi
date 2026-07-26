@@ -95,7 +95,11 @@ pub struct ParallelGzipWriter {
     /// Next serial number to assign.
     next_serial: u64,
     /// Channel to send uncompressed blocks to compression workers.
-    compress_tx: Sender<UncompressedBlock>,
+    ///
+    /// `Option` so shutdown can close it — dropping the sender is what tells the
+    /// workers to finish — while leaving the struct intact for [`Drop`] to run
+    /// over a second time without repeating the work.
+    compress_tx: Option<Sender<UncompressedBlock>>,
     /// Handles for compression worker threads.
     compression_handles: Vec<JoinHandle<()>>,
     /// Handle for the I/O writer thread.
@@ -157,7 +161,7 @@ impl ParallelGzipWriter {
             block_buffer: Vec::with_capacity(config.block_size),
             block_size: config.block_size,
             next_serial: 0,
-            compress_tx,
+            compress_tx: Some(compress_tx),
             compression_handles,
             io_handle: Some(io_handle),
         })
@@ -222,6 +226,8 @@ impl ParallelGzipWriter {
         self.next_serial += 1;
 
         self.compress_tx
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Writer already finished"))?
             .send(block)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Compression channel closed"))
     }
@@ -230,25 +236,78 @@ impl ParallelGzipWriter {
     ///
     /// # Errors
     ///
-    /// Returns an error if flushing or joining worker threads fails.
+    /// Returns an error if flushing or joining worker threads fails. Every thread
+    /// is joined regardless — see `shutdown`, which this delegates to.
     pub fn finish(mut self) -> io::Result<()> {
-        // Dispatch any remaining data
-        self.dispatch_block()?;
+        self.shutdown()
+    }
 
-        // Close the compression channel
-        drop(self.compress_tx);
+    /// Close the channel and join every thread, returning the first error.
+    ///
+    /// Joining is unconditional. It used to happen behind three `?`s — a failed
+    /// final dispatch returned before any join, and a worker that panicked
+    /// returned before the remaining workers and the I/O thread were joined — so
+    /// the error surfaced while detached threads were still compressing and still
+    /// writing to the output file. The caller would see the failure, and the file
+    /// would keep growing behind it.
+    ///
+    /// The first error a join discovers wins, so the cause is reported rather than
+    /// whatever the unwinding happened to hit last; later errors are dropped, not
+    /// hidden behind an earlier `Ok`. The final dispatch's own error ranks below
+    /// all of them because it is usually a symptom: an I/O thread that fails
+    /// closes `output_rx`, the workers break out of their loop, and the dispatch
+    /// then reports a generic "Compression channel closed" for a write that
+    /// actually failed on a full disk.
+    ///
+    /// Idempotent: the sender and the handles are taken, so the [`Drop`] that runs
+    /// after [`Self::finish`] finds nothing left to do.
+    fn shutdown(&mut self) -> io::Result<()> {
+        // Not `?`: a failed dispatch must not skip the joins below.
+        let dispatch_result = self.dispatch_block();
 
-        // Wait for compression workers (they return () so just check for panic)
-        for handle in self.compression_handles {
-            handle.join().map_err(|_| io::Error::other("Compression worker thread panicked"))?;
+        // Dropping the sender is what lets the workers see the channel close and
+        // exit, so it has to happen before the joins or they would block forever.
+        drop(self.compress_tx.take());
+
+        let mut result: io::Result<()> = Ok(());
+        for handle in self.compression_handles.drain(..) {
+            if handle.join().is_err() && result.is_ok() {
+                result = Err(io::Error::other("Compression worker thread panicked"));
+            }
         }
 
-        // Wait for I/O thread
         if let Some(handle) = self.io_handle.take() {
-            handle.join().map_err(|_| io::Error::other("I/O thread panicked"))??;
+            let io_result = match handle.join() {
+                Ok(io_result) => io_result,
+                Err(_) => Err(io::Error::other("I/O thread panicked")),
+            };
+            if let Err(e) = io_result
+                && result.is_ok()
+            {
+                result = Err(e);
+            }
         }
 
-        Ok(())
+        // Only if every thread shut down cleanly is the dispatch failure the cause.
+        result.and(dispatch_result)
+    }
+}
+
+impl Drop for ParallelGzipWriter {
+    /// Join the worker threads even when [`Self::finish`] was never reached.
+    ///
+    /// Without this, any `?` between construction and `finish` — a failed
+    /// `write_record`, or the first of two writers failing to finish — detached
+    /// threads that were still compressing and writing. The caller unwound while
+    /// its output file was still being written to, and whether those writes landed
+    /// depended on how quickly the process exited.
+    ///
+    /// Errors cannot propagate from a drop, so they are logged rather than
+    /// swallowed silently. A caller that wants them calls [`Self::finish`].
+    fn drop(&mut self) {
+        if let Err(e) = self.shutdown() {
+            log::warn!("Error shutting down the parallel gzip writer: {e}");
+        }
     }
 }
 
@@ -277,6 +336,115 @@ mod tests {
     use std::fs::File;
     use std::io::Read;
     use tempfile::NamedTempFile;
+
+    /// A sink that fails every write, to drive the I/O thread's error path.
+    struct FailingSink;
+
+    impl Write for FailingSink {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("sink is broken"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A failing I/O thread must surface its error from `finish`, not hang.
+    ///
+    /// The joins used to sit behind `?`, so an error on one of them returned with
+    /// the remaining threads unjoined. This drives that path: the payload is small
+    /// enough that nothing is dispatched until shutdown, so the final dispatch
+    /// succeeds and the I/O thread's failure is the first error — which is the one
+    /// the caller has to see.
+    #[test]
+    fn test_finish_reports_an_io_thread_failure() {
+        let config = ParallelGzipConfig::with_threads(2);
+        let mut writer =
+            ParallelGzipWriter::new(FailingSink, &config).expect("writer construction");
+        writer.write_all(b"ACGT").expect("buffered, not yet dispatched");
+
+        let err = writer.finish().expect_err("a failing sink must surface as an error");
+        assert!(
+            err.to_string().contains("sink is broken"),
+            "the I/O thread's own error must be reported, got: {err}"
+        );
+    }
+
+    /// The I/O thread's error must outrank the channel closure it causes.
+    ///
+    /// With enough payload to dispatch mid-write, the failing sink kills the I/O
+    /// thread first: `output_rx` closes, the compression workers break out of
+    /// their loop, and the final dispatch in `shutdown` then fails with a generic
+    /// "Compression channel closed". Seeding the shutdown result from that
+    /// dispatch let the symptom win over the sink's real error, which is the one
+    /// the caller has to see. Writes are expected to fail here for the same
+    /// reason — the assertion is on what `finish` reports.
+    #[test]
+    fn test_finish_prefers_the_io_error_over_the_closed_channel() {
+        let config = ParallelGzipConfig::with_threads(2);
+        let mut writer =
+            ParallelGzipWriter::new(FailingSink, &config).expect("writer construction");
+
+        let block = vec![b'A'; DEFAULT_BLOCK_SIZE];
+        for _ in 0..64 {
+            if writer.write_all(&block).is_err() {
+                break;
+            }
+        }
+        // Leave a partial block buffered so shutdown has something left to dispatch
+        // down the by-now-closed channel — that failed dispatch is the symptom.
+        let _ = writer.write(b"ACGT");
+
+        let err = writer.finish().expect_err("a failing sink must surface as an error");
+        assert!(
+            err.to_string().contains("sink is broken"),
+            "the I/O thread's own error must outrank the channel-closed symptom, got: {err}"
+        );
+    }
+
+    /// Dropping a writer whose sink fails must log, not panic.
+    ///
+    /// This is the path that runs when a caller is already unwinding: a write
+    /// failed, the `?` propagated, and the writer is dropped on the way out. A
+    /// panic from `Drop` during an unwind aborts the process, so the shutdown error
+    /// has to be logged and swallowed here — the caller that wants it calls
+    /// `finish`. The test passing without an abort is the assertion.
+    #[test]
+    fn test_drop_swallows_a_shutdown_error() {
+        let config = ParallelGzipConfig::with_threads(2);
+        let mut writer =
+            ParallelGzipWriter::new(FailingSink, &config).expect("writer construction");
+        writer.write_all(b"ACGT").expect("buffered, not yet dispatched");
+        drop(writer);
+    }
+
+    /// Dropping a writer without calling `finish` must still complete the output.
+    ///
+    /// Any `?` between construction and `finish` drops the writer — a failed
+    /// `write_record`, or the first of two writers failing to finish. Without a
+    /// `Drop` that joins, the compression and I/O threads were detached and went
+    /// on writing to the file while the caller unwound, so what ended up on disk
+    /// depended on how quickly the process exited. Reading the file straight after
+    /// the drop is the assertion: it can only be complete if the drop waited.
+    #[test]
+    fn test_drop_without_finish_completes_the_output() -> io::Result<()> {
+        let temp = NamedTempFile::new()?;
+        let path = temp.path().to_path_buf();
+        let payload: Vec<u8> = (0..200_000u32).map(|i| b"ACGT"[(i % 4) as usize]).collect();
+
+        {
+            let config = ParallelGzipConfig::with_threads(4);
+            let mut writer = ParallelGzipWriter::new(File::create(&path)?, &config)?;
+            writer.write_all(&payload)?;
+            // Deliberately no `finish()`: this is the path a `?` takes.
+        }
+
+        let mut decoded = Vec::new();
+        MultiGzDecoder::new(File::open(&path)?).read_to_end(&mut decoded)?;
+        assert_eq!(decoded, payload, "the dropped writer left an incomplete file");
+        Ok(())
+    }
 
     #[test]
     fn test_basic_compression() -> io::Result<()> {

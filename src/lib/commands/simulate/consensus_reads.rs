@@ -2,7 +2,9 @@
 
 use crate::commands::command::Command;
 use crate::commands::common::{CompressionOptions, parse_bool};
-use crate::commands::simulate::common::{MethylationArgs, ReferenceGenome, StrandBiasArgs};
+use crate::commands::simulate::common::{
+    MethylationArgs, ReferenceGenome, StrandBiasArgs, join_writer_result,
+};
 use crate::commands::simulate::region_to_bin;
 use crate::dna::reverse_complement;
 use crate::sam::SamTag;
@@ -321,14 +323,7 @@ impl Command for ConsensusReads {
         // Drop sender to signal writer thread that we're done
         drop(sender);
 
-        // Check generation result
-        if let Err(e) = generation_result {
-            return Err(anyhow::anyhow!("Failed to send record to writer: {e}"));
-        }
-
-        // Wait for writer thread to finish
-        let read_count =
-            writer_handle.join().map_err(|_| anyhow::anyhow!("Writer thread panicked"))??;
+        let read_count = join_writer_result(writer_handle, generation_result)?;
 
         info!("Generated {read_count} consensus read pairs");
         info!("Done");
