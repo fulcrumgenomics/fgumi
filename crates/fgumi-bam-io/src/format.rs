@@ -15,25 +15,11 @@ const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 
 /// Bytes needed to tell BGZF from plain gzip.
 ///
-/// BGZF is gzip with a mandatory `BC` extra subfield, which lives at bytes
-/// 12-13 behind the `XLEN` at 10-11. Anything shorter can only answer "gzip or
-/// not", which is how a plain-gzipped file gets mistaken for BAM.
-pub const FORMAT_PREFIX_LEN: usize = 18;
-
-/// The deflate compression method, the only one BGZF uses.
-const DEFLATE: u8 = 0x08;
-
-/// `FEXTRA`, and nothing else: BGZF sets exactly this one gzip flag.
-const FEXTRA_ONLY: u8 = 0x04;
-
-/// `XLEN`: the extra field is exactly the 6-byte `BC` subfield, no more.
-const BGZF_XLEN: [u8; 2] = [0x06, 0x00];
-
-/// The `BC` subfield identifier, which is what makes a gzip member BGZF.
-const BC_SUBFIELD_ID: [u8; 2] = [b'B', b'C'];
-
-/// `SLEN` for `BC`: two bytes, holding the total block size minus one.
-const BC_SUBFIELD_LEN: [u8; 2] = [0x02, 0x00];
+/// A whole BGZF block header, because that is what the shared predicate reads:
+/// BGZF is gzip with a mandatory `BC` extra subfield behind the `XLEN` at 10-11.
+/// Anything shorter can only answer "gzip or not", which is how a plain-gzipped
+/// file gets mistaken for BAM.
+pub const FORMAT_PREFIX_LEN: usize = fgumi_bgzf::BGZF_HEADER_SIZE;
 
 /// What an input's leading bytes say it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,9 +31,13 @@ pub enum InputFormat {
     /// Plain gzip — one deflate stream, so not seekable or block-addressable —
     /// and also the rare gzip member that carries a `BC` subfield but does not
     /// match the fixed BGZF layout every fgumi decoder requires (see
-    /// [`classify_input`]). Either way fgumi's readers cannot consume it even
-    /// though it decompresses, and the remedy is the same: recompress with
-    /// `bgzip`.
+    /// [`classify_input`]).
+    ///
+    /// This is a supported alignment input, not an error: the normalization
+    /// boundary decompresses the member and re-frames what comes out, so the rest
+    /// of the pipeline still sees only BGZF. What it costs is block-parallel
+    /// decode — one deflate stream cannot be split across threads — so `bgzip` is
+    /// a performance recommendation here rather than a requirement.
     Gzip,
     /// Uncompressed text; for alignment inputs, SAM.
     Text,
@@ -63,37 +53,29 @@ pub enum InputFormat {
 ///
 /// Detection is by content, never by file extension.
 ///
-/// # The BGZF check is at fixed offsets, deliberately
+/// # The BGZF verdict comes from the decoder's own predicate
 ///
-/// RFC 1952 permits several extra subfields per gzip member in any order, so
-/// `BC` need not be first and a spec-literal check would have to walk the
-/// `FEXTRA` area looking for it. This does not, and must not: the verdict's job
-/// is to predict what the *decoder* will accept, and every decoder downstream of
-/// it is keyed to these same fixed offsets.
+/// The `Bgzf` arm delegates to [`fgumi_bgzf::is_bgzf_header`], which is the same
+/// check [`fgumi_bgzf::reader`] applies to every block it frames. That shared
+/// definition is the point: the verdict's job is to predict what the decoder will
+/// accept, so answering it with a *second*, hand-rolled copy of the layout is how
+/// the two came to disagree in the first place. See [`fgumi_bgzf::header`] for
+/// why the layout is matched at fixed offsets rather than walked, and why the
+/// predicate is the intersection of what fgumi's decoders accept rather than what
+/// RFC 1952 permits.
 ///
-/// * `fgumi_bgzf`'s `read_raw_block` (behind `read_raw_blocks`) — the sort
-///   worker pool, the BAM writers, `fastq` — checks `BC` at bytes 12-13 and
-///   takes `BSIZE` from bytes 16-17 to *frame* the block. The layout is
-///   load-bearing for where one block ends and the next begins, not merely for
-///   validation, and the deflate payload is taken as `[18 .. len - 8]`.
-/// * `noodles_bgzf`'s `is_valid_header` additionally requires `FLG` to be
-///   `FEXTRA` alone and `XLEN` to be exactly 6.
-/// * htslib's `check_header` (`bgzf.c`) requires the same `XLEN == 6`, `BC` at
-///   12-13, and `SLEN == 2`; it differs from noodles only in tolerating other
-///   `FLG` bits alongside `FEXTRA`.
+/// Answering `Bgzf` for a member that misses this layout would hand it to a
+/// decoder that rejects it — `invalid BGZF header` from noodles, or a named field
+/// rejection from `fgumi_bgzf` — which is the misleading diagnosis this
+/// classifier exists to prevent. Answering `Gzip` names it as
+/// gzip-that-is-not-BGZF, which routes it to a spec-complete gzip decoder rather
+/// than to a BGZF block reader that would reject it.
 ///
-/// bgzip, samtools, htsjdk and noodles all *write* exactly this layout, so no
-/// BGZF a user can produce with them is missed.
-///
-/// Answering `Bgzf` for a member that misses this layout would therefore hand it
-/// to a decoder that rejects it — `invalid BGZF header` from noodles, or
-/// `Invalid BGZF subfield ID` from `fgumi_bgzf` — which is the misleading
-/// diagnosis this classifier exists to prevent. Answering `Gzip` names it as
-/// gzip-that-is-not-BGZF and points at `bgzip`, which is the actual remedy — the
-/// member has to be recompressed before fgumi can read it either way. For FASTQ,
-/// where [`InputFormat::Gzip`] is a supported input rather than an error, the
-/// verdict costs only block-parallel decode: `extract` reads it with
-/// `MultiGzDecoder`, and BGZF is valid gzip.
+/// `Gzip` is a supported verdict on every input path, not an error. `extract`
+/// reads FASTQ with `MultiGzDecoder`, and alignment inputs go through
+/// `normalize_to_bgzf`, which decompresses the member and re-frames the result.
+/// In both cases the only cost is block-parallel decode — one deflate stream
+/// cannot be split across threads — so `bgzip` buys throughput, not readability.
 #[must_use]
 pub fn classify_input(prefix: &[u8]) -> InputFormat {
     if prefix.is_empty() {
@@ -103,19 +85,8 @@ pub fn classify_input(prefix: &[u8]) -> InputFormat {
         return InputFormat::Text;
     }
 
-    // gzip. BGZF is gzip whose sole extra subfield is `BC`, at a fixed offset —
-    // see this function's doc comment for why the offsets are not walked.
-    if prefix.len() >= FORMAT_PREFIX_LEN
-        && prefix[2] == DEFLATE
-        && prefix[3] == FEXTRA_ONLY
-        && prefix[10..12] == BGZF_XLEN
-        && prefix[12..14] == BC_SUBFIELD_ID
-        && prefix[14..16] == BC_SUBFIELD_LEN
-    {
-        InputFormat::Bgzf
-    } else {
-        InputFormat::Gzip
-    }
+    // gzip. Whether it is BGZF is the block reader's question, so it answers it.
+    if fgumi_bgzf::is_bgzf_header(prefix) { InputFormat::Bgzf } else { InputFormat::Gzip }
 }
 
 #[cfg(test)]
@@ -143,42 +114,14 @@ mod tests {
     #[case::gzip_magic_but_truncated(&[0x1f, 0x8b, 0x08, 0x04], InputFormat::Gzip)]
     // A short *text* prefix is still unambiguously text.
     #[case::short_text(b"@H", InputFormat::Text)]
-    // FEXTRA set but the subfield is not `BC` — some other gzip extension.
+    // The per-field near misses — a foreign subfield, `BC` with a trailing
+    // subfield, FEXTRA plus FNAME, a wrong SLEN, a non-deflate method — are the
+    // shared predicate's contract and are pinned in `fgumi_bgzf::header`'s own
+    // table. Duplicating them here would be a second copy of exactly the thing
+    // this delegation removed. What belongs here is the dispatch: that a gzip
+    // member which is not a BGZF block reads as `Gzip` rather than `Bgzf`.
     #[case::gzip_with_non_bc_extra(
         &[0x1f, 0x8b, 0x08, 0x04, 0, 0, 0, 0, 0, 0xff, 0x06, 0x00, b'X', b'Y', 0x02, 0x00, 0x1b, 0x00],
-        InputFormat::Gzip
-    )]
-    // `BC` first but XLEN 10, so a second subfield trails it. RFC 1952 allows
-    // this; `noodles_bgzf` and htslib both reject it (XLEN must be exactly 6),
-    // so calling it BGZF would promise a decode that cannot happen — see
-    // `classify_input`'s doc comment.
-    #[case::bc_first_with_trailing_subfield(
-        &[0x1f, 0x8b, 0x08, 0x04, 0, 0, 0, 0, 0, 0xff, 0x0a, 0x00, b'B', b'C', 0x02, 0x00, 0x1b, 0x00],
-        InputFormat::Gzip
-    )]
-    // A foreign subfield ahead of `BC`: same reasoning, and here the fixed
-    // offsets cannot see `BC` at all within the 18-byte window.
-    #[case::foreign_subfield_before_bc(
-        &[0x1f, 0x8b, 0x08, 0x04, 0, 0, 0, 0, 0, 0xff, 0x0a, 0x00, b'X', b'Y', 0x02, 0x00, 0x00, 0x00],
-        InputFormat::Gzip
-    )]
-    // FEXTRA plus FNAME. The extra field precedes FNAME in a gzip member, so
-    // `XLEN` and `BC` are still where they belong and htslib would take this
-    // (`header[3] & 4`); `noodles_bgzf` requires FLG to be FEXTRA alone and
-    // rejects it, and this verdict tracks our decoder rather than the spec.
-    #[case::fextra_with_fname(
-        &[0x1f, 0x8b, 0x08, 0x0c, 0, 0, 0, 0, 0, 0xff, 0x06, 0x00, b'B', b'C', 0x02, 0x00, 0x1b, 0x00],
-        InputFormat::Gzip
-    )]
-    // `BC` at the right offset but SLEN != 2, so the block size it carries is
-    // not the two bytes every decoder reads.
-    #[case::bc_with_wrong_slen(
-        &[0x1f, 0x8b, 0x08, 0x04, 0, 0, 0, 0, 0, 0xff, 0x06, 0x00, b'B', b'C', 0x04, 0x00, 0x1b, 0x00],
-        InputFormat::Gzip
-    )]
-    // Compression method other than deflate: gzip's framing, nothing fgumi reads.
-    #[case::non_deflate_method(
-        &[0x1f, 0x8b, 0x00, 0x04, 0, 0, 0, 0, 0, 0xff, 0x06, 0x00, b'B', b'C', 0x02, 0x00, 0x1b, 0x00],
         InputFormat::Gzip
     )]
     fn classifies(#[case] prefix: &[u8], #[case] expected: InputFormat) {

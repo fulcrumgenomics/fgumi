@@ -15,10 +15,12 @@ pedantic = { level = "deny", priority = -1 }
 
 [dependencies]
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
+fgumi-bgzf = { workspace = true }
 noodles = { workspace = true, features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
 noodles-bgzf = { workspace = true }
 noodles-csi = { workspace = true }
 bgzf = { workspace = true }
+flate2 = { workspace = true }
 anyhow = { workspace = true }
 bstr = { workspace = true }
 bytes = { workspace = true }

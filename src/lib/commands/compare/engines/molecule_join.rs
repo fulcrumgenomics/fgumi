@@ -12,14 +12,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use ahash::AHashMap;
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use fgumi_raw_bam::RawRecord;
-use fgumi_sort::OwnedRawBamRecordReader;
 use noodles::sam::Header;
 
 use super::super::bams::{MiKey, get_mi_tag_raw};
 use super::super::molecule::{MoleculeRun, molecule_runs};
 use super::super::record_key::{RecordKey, record_key};
+use super::OpenedInput;
 use super::content::{ContentPredicate, content_diffs};
 use super::header::require_compatible_headers;
 use super::push_diff;
@@ -262,26 +262,6 @@ impl MoleculeJoinOutcome {
     }
 }
 
-/// Open `path` once, returning its parsed header and a raw-byte record reader
-/// positioned just past that header.
-///
-/// One open per input rather than two. This engine needs the header (to compare
-/// the two inputs' headers for compatibility) *and* the records, and taking them
-/// from separate opens meant the input had to be re-openable — which a FIFO, a
-/// process substitution and stdin are not.
-/// [`fgumi_sort::open_raw_bam_record_reader_with_header`] parses the header
-/// through a tee and replays the bytes it consumed, so one stream serves both.
-/// Uncompressed SAM is sniffed and normalized there too.
-///
-/// This makes the *engine* single-open, which is what its own entry points
-/// promise; the `compare bams` CLI still opens both inputs once more up front for
-/// its header-compatibility precondition — see
-/// [`open_raw_reader_with_header`](super::sort_verify) for the full note.
-fn open_raw_with_header(path: &Path) -> Result<(OwnedRawBamRecordReader, Header)> {
-    fgumi_sort::open_raw_bam_record_reader_with_header(path)
-        .with_context(|| format!("opening raw BAM reader for {}", path.display()))
-}
-
 /// Fold one matched pair (already known bam1-run/bam2-run in that order) into `matched`/
 /// `diff_details` via [`compare_molecule`]. Shared by both sides of [`molecule_join_compare`]'s
 /// hash-join loop so the "compare, then either count as matched or record diffs" step isn't
@@ -387,10 +367,34 @@ pub(crate) fn molecule_join_compare_capped(
     max_diffs: usize,
     max_pending: usize,
 ) -> Result<MoleculeJoinOutcome> {
-    // One open per input; the readers below stream the same streams these headers
-    // were parsed from — see `open_raw_with_header`.
-    let (reader1, h1) = open_raw_with_header(bam1)?;
-    let (reader2, h2) = open_raw_with_header(bam2)?;
+    // One open per input: `OpenedInput::open` mints the stream and parses its
+    // header off the front, and the capped variant below reads its records from
+    // that same stream rather than reopening the path.
+    molecule_join_compare_capped_opened(
+        OpenedInput::open(bam1)?,
+        OpenedInput::open(bam2)?,
+        max_diffs,
+        max_pending,
+    )
+}
+
+/// [`molecule_join_compare_capped`] over inputs the caller already opened.
+///
+/// See [`OpenedInput`]: `CompareBams::execute` reads both headers before it can
+/// dispatch, so taking the streams from it rather than reopening the paths is what
+/// lets `compare bams --command group` take a FIFO or a process substitution.
+///
+/// # Errors
+///
+/// As [`molecule_join_compare_capped`], minus the opens the caller already made.
+pub(crate) fn molecule_join_compare_capped_opened(
+    input1: OpenedInput,
+    input2: OpenedInput,
+    max_diffs: usize,
+    max_pending: usize,
+) -> Result<MoleculeJoinOutcome> {
+    let OpenedInput { reader: reader1, header: h1, path: _ } = input1;
+    let OpenedInput { reader: reader2, header: h2, path: _ } = input2;
     // Make this public API sound on its own, independent of the CLI's own (redundant but
     // cheap) call — see this function's doc comment.
     require_compatible_headers(&h1, &h2)?;

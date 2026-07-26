@@ -30,9 +30,9 @@ use std::thread;
 use crate::commands::command::Command;
 use crate::commands::common::parse_bool;
 
+use super::engines::OpenedInput;
 use super::engines::content::ContentPredicate;
 use super::engines::header::require_compatible_headers;
-use super::engines::molecule_join::molecule_join_compare;
 use super::engines::positional::positional_compare;
 
 /// Comparison mode for BAM files
@@ -627,10 +627,16 @@ impl Command for CompareBams {
         // first — ahead of any mode/preset dispatch — means an incompatible pair always
         // hard-exits here instead of silently cascading into per-record diffs (content/
         // grouping) or a differently-worded engine-level error (`sort`).
-        let (_, h1) = create_raw_bam_reader(&self.bam1, 1)?;
-        let (_, h2) = create_raw_bam_reader(&self.bam2, 1)?;
-        let declared_order =
-            require_compatible_headers(&h1, &h2).context("input BAM headers are incompatible")?;
+        //
+        // Each input is opened *once*, for both its header and its records: the
+        // single-pass engines below take the streams this reads from rather than
+        // reopening the paths, so `--command sort` and `--command group` accept an
+        // input that can only be opened once (a FIFO, a process substitution). See
+        // `engines::OpenedInput`.
+        let input1 = OpenedInput::open(&self.bam1)?;
+        let input2 = OpenedInput::open(&self.bam2)?;
+        let declared_order = require_compatible_headers(&input1.header, &input2.header)
+            .context("input BAM headers are incompatible")?;
 
         // `sort` has no notion of `CompareMode`/`ContentPredicate` — it verifies sort
         // order and compares by sort-key run instead of pairing records positionally or
@@ -651,7 +657,7 @@ impl Command for CompareBams {
                 );
             }
             let timer = (!self.quiet).then(|| OperationTimer::new("Comparing BAMs"));
-            let total_records = self.execute_sort_verify()?;
+            let total_records = self.execute_sort_verify(input1, input2)?;
             if let Some(timer) = timer {
                 timer.log_completion(total_records);
             }
@@ -737,8 +743,16 @@ impl Command for CompareBams {
         };
 
         let total_records = match mode {
-            CompareMode::Content => self.execute_content(predicate)?,
-            CompareMode::Grouping => self.execute_grouping()?,
+            // Content mode makes two passes over each input — the order verification
+            // already done above and then the record comparison itself — so it cannot
+            // stream a one-shot input and reopens by path. Releasing the streams here
+            // keeps it from holding a pipe open for a read it will never make.
+            CompareMode::Content => {
+                drop(input1);
+                drop(input2);
+                self.execute_content(predicate)?
+            }
+            CompareMode::Grouping => self.execute_grouping(input1, input2)?,
         };
 
         if let Some(timer) = timer {
@@ -852,14 +866,15 @@ impl CompareBams {
     /// [`CommandPreset::Sort`]'s). Preserves the same external report contract as
     /// `execute_content`: the `RESULT: BAM files are IDENTICAL` / `RESULT: BAM files
     /// DIFFER` line and exit-1-on-mismatch behavior via [`super::CompareMismatch`].
-    fn execute_sort_verify(&self) -> Result<u64> {
+    fn execute_sort_verify(&self, input1: OpenedInput, input2: OpenedInput) -> Result<u64> {
         if !self.quiet {
             info!("Using --command sort preset: sort-key-run verification (no positional pairing)");
         }
 
-        let outcome = super::engines::sort_verify::sort_verify_compare(
-            &self.bam1,
-            &self.bam2,
+        // The streams `execute` already opened, not the paths — see `OpenedInput`.
+        let outcome = super::engines::sort_verify::sort_verify_compare_opened(
+            input1,
+            input2,
             self.max_diffs,
         )?;
 
@@ -932,7 +947,7 @@ impl CompareBams {
     /// Returns an error if either input cannot be read (see [`molecule_join_compare`]), or
     /// [`super::CompareMismatch`] if the two BAMs are found to differ (non-zero exit via the
     /// `Command` trait).
-    fn execute_grouping(&self) -> Result<u64> {
+    fn execute_grouping(&self, input1: OpenedInput, input2: OpenedInput) -> Result<u64> {
         if !self.quiet {
             info!(
                 "Starting streaming molecule-join grouping comparison (max-diffs {})",
@@ -940,7 +955,13 @@ impl CompareBams {
             );
         }
 
-        let outcome = molecule_join_compare(&self.bam1, &self.bam2, self.max_diffs)?;
+        // The streams `execute` already opened, not the paths — see `OpenedInput`.
+        let outcome = super::engines::molecule_join::molecule_join_compare_capped_opened(
+            input1,
+            input2,
+            self.max_diffs,
+            super::engines::molecule_join::MAX_PENDING_MOLECULES,
+        )?;
         let is_equivalent = outcome.is_match();
 
         if !self.quiet {

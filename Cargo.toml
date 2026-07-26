@@ -10,6 +10,15 @@ repository = "https://github.com/fulcrumgenomics/fgumi"
 license = "MIT"
 
 [workspace.dependencies]
+# `zlib-rs` selects flate2's fast Rust-zlib DEFLATE backend. It must be requested
+# explicitly: the backend is otherwise chosen by Cargo feature unification, and a
+# transitive change can silently drop it back to the ~2x slower `miniz_oxide`
+# default — which regressed extract throughput ~1.6x at high thread counts. Pinned
+# here rather than per-crate so `fgumi` (gzipped FASTQ in `extract`) and
+# `fgumi-bam-io` (gzipped SAM/BAM at the input boundary) cannot end up on
+# different backends.
+flate2 = { version = "1.1", features = ["zlib-rs"] }
+
 # Internal crates. Versions are bumped in lockstep by release-plz.
 fgumi-bam-io = { version = "0.4.0", path = "crates/fgumi-bam-io" }
 fgumi-bgzf = { version = "0.4.0", path = "crates/fgumi-bgzf" }
@@ -121,13 +130,7 @@ approx = { workspace = true }
 ahash = { workspace = true }
 bytemuck = { workspace = true }
 rand_distr = "0.6"
-# `zlib-rs` selects flate2's fast Rust-zlib DEFLATE backend for gzipped FASTQ
-# decompression (used by `fgumi extract`). It must be requested explicitly: the
-# backend is otherwise chosen by Cargo feature unification, and a transitive
-# change can silently drop it back to the ~2x slower `miniz_oxide` default —
-# which regressed extract throughput ~1.6x at high thread counts. Keep this
-# feature pinned so the producer-thread decompressor stays on zlib-rs.
-flate2 = { version = "1.1", features = ["zlib-rs"] }
+flate2 = { workspace = true }
 dhat = { version = "0.3", optional = true }
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
 fgumi-dna = { workspace = true }
