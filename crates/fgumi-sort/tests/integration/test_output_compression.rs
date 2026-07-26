@@ -1,23 +1,27 @@
 //! Integration test: `output_compression` must reach the BAM the sorter writes,
 //! on both the spilling and the fully-in-memory merge paths.
 //!
-//! Output BGZF blocks are compressed by the worker pool, and which compressor a
-//! worker reaches for is chosen by the pool's phase. Phase 2 used to be entered
-//! only when there were spill files to merge, so an in-memory sort left the pool
-//! in Phase 1 — where the only compress step is the *spill* one, using
-//! `temp_compression`. The user's `--compression-level` was silently replaced by
-//! the temp level.
+//! Output BGZF blocks are compressed by the worker pool. Which compressor a
+//! worker reaches for *used to* be chosen by the pool's phase at the moment the
+//! block was popped, and that produced the same bug twice, from opposite sides:
 //!
-//! The spilling merge had the mirror-image defect at the other end: it returned
-//! the pool to `LEGACY` *before* finishing the writer, so the output blocks
-//! still queued at teardown — plus the writer's final flush — went through the
-//! spill compressor and the tail of the BAM came out at `temp_compression`.
-//! Both defects are the same coupling seen from opposite sides: which
-//! compressor a block gets is decided by the pool's phase when a worker pops
-//! it, not by where the block came from.
+//! - Phase 2 was entered only when there were spill files to merge, so an
+//!   in-memory sort left the pool in Phase 1 — where the only compress step was
+//!   the *spill* one, at `temp_compression`.
+//! - A spilling merge returned the pool to `LEGACY` *before* finishing the
+//!   writer, so the output blocks still queued at teardown — plus the writer's
+//!   final flush — went through the spill compressor, and the tail of the BAM
+//!   came out at `temp_compression`.
+//!
+//! Either way the user's `--compression-level` was silently replaced by the temp
+//! level. Each block now carries a `CompressTarget` stamped on it by the writer
+//! that produced it, so the level no longer depends on the pool's phase, on
+//! scheduling, or on how long a block sat in the queue.
 //!
 //! Hence the two tests below: the first asserts `output_compression` reaches
-//! the file, the second that `temp_compression` never does.
+//! the file, the second that `temp_compression` never does. They are the
+//! regression tests for that whole class, so they are deliberately end-to-end —
+//! they assert on the bytes of the written BAM, not on any pool internals.
 
 use fgumi_raw_bam::{IndexedRawBamReader, RawRecord};
 use fgumi_sam::SamBuilder;
@@ -249,8 +253,9 @@ fn sort_at_level(
 ///
 /// Both merge paths are covered: a memory limit large enough to hold everything
 /// (no spill, `chunks_written == 0`) and one small enough to force spill files.
-/// Only the in-memory case was broken — it never entered Phase 2, so the pool
-/// compressed output blocks with the Phase 1 spill compressor.
+/// Only the in-memory case was broken — it never entered Phase 2, and back then
+/// the phase was what chose the compressor, so the pool used the Phase 1 spill
+/// one.
 ///
 /// Every sort order that routes its in-memory output through `PooledBamWriter`
 /// is exercised, because the `begin_phase2` transition is duplicated per order
@@ -336,17 +341,17 @@ fn test_output_compression_level_reaches_the_output_bam(
 /// `temp_compression` must not reach the output BAM.
 ///
 /// The mirror image of the check above, at the other end of the sort: see this
-/// file's module header for the defect. The output must be finalized while the
-/// pool is still in Phase 2, or the trailing blocks go through the *temp*
-/// compressor — so raising `temp_compression` alone would change the output.
+/// file's module header for the defect. If any output block can reach the spill
+/// compressor, raising `temp_compression` alone would change the output.
 ///
 /// So: sort twice at `output_compression = 0`, changing only the temp level.
 /// The written BAM must be exactly the same size both times. Level 0 is used
 /// for the output because it makes any block that slipped through the temp
 /// compressor strictly smaller, and therefore visible in the total.
 ///
-/// Only the spilling path is exercised — the in-memory path never builds a
-/// `Phase2Guard`, so it has no teardown to get wrong.
+/// Only the spilling path is exercised, because it is the only one that produces
+/// spill blocks at all — an in-memory sort has no `temp_compression` for the
+/// output to be confused with.
 ///
 /// Both spilling finalizations are covered: `merge_chunks_generic`
 /// (`writer.finish()`) and, via the `coordinate_indexed` case,

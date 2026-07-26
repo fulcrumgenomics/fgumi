@@ -25,7 +25,7 @@
 use crate::bgzf_io::{StagingBuffer, io_writer_loop};
 use crate::codec::{SpillCodec, ZSPILL_MAGIC};
 use crate::keys::RawSortKey;
-use crate::worker_pool::{CompressResult, PermitPool, SortWorkerPool};
+use crate::worker_pool::{CompressResult, CompressTarget, PermitPool, SortWorkerPool};
 use anyhow::Result;
 use crossbeam_channel::bounded;
 use fgumi_bgzf::BGZF_MAX_BLOCK_SIZE;
@@ -78,7 +78,15 @@ impl<K: RawSortKey> PooledChunkWriter<K> {
             thread::spawn(move || io_writer_loop(writer, result_rx, buffer_pool, pp, codec, None));
 
         Ok(Self {
-            staging: Some(StagingBuffer::new(pool, result_tx, permit_pool, codec)),
+            // `CompressTarget::Spill`: every block this writer submits is a
+            // Phase 1 spill chunk and must be compressed at `temp_compression`.
+            staging: Some(StagingBuffer::new(
+                pool,
+                result_tx,
+                permit_pool,
+                codec,
+                CompressTarget::Spill,
+            )),
             key_buf: Vec::new(),
             io_handle: Some(io_handle),
             _phantom: PhantomData,
