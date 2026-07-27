@@ -121,6 +121,54 @@ pub fn add_pg_to_builder(
     fgumi_bam_io::header::add_pg_to_builder(builder, crate::version::VERSION.as_str(), command_line)
 }
 
+/// Validate that `header` advertises a sort order the group stage accepts, and
+/// emit the accompanying info logging.
+///
+/// Accepts template-coordinate order always, and queryname order when
+/// `allow_unmapped` is set. On rejection, bails with the order-specific
+/// remediation hint. Shared by `Group::execute`'s single-threaded path and the
+/// chain builder's `add_group` so the two orchestrations of the same stage
+/// cannot drift on the accepted orders, the error text, or the info logging —
+/// the standalone-vs-runall divergence class. The predicates themselves are the
+/// shared `crate::sam::{is_template_coordinate_sorted, is_sorted}`.
+pub(crate) fn require_group_input_sort(
+    header: &Header,
+    allow_unmapped: bool,
+) -> anyhow::Result<()> {
+    use crate::sam::{is_sorted, is_template_coordinate_sorted};
+    use anyhow::bail;
+    use log::info;
+    use noodles::sam::header::record::value::map::header::sort_order::QUERY_NAME;
+
+    let is_tc_sorted = is_template_coordinate_sorted(header);
+    let is_qname_sorted = is_sorted(header, QUERY_NAME);
+
+    if !(is_tc_sorted || allow_unmapped && is_qname_sorted) {
+        if allow_unmapped {
+            bail!(
+                "Input BAM must be template-coordinate sorted or queryname sorted \
+                when --allow-unmapped is enabled.\n\n\
+                To queryname sort your BAM file, run:\n  \
+                samtools sort -n input.bam -o sorted.bam"
+            );
+        }
+        bail!(
+            "Input BAM must be template-coordinate sorted (header must advertise \
+            SO:unsorted, GO:query, and SS:template-coordinate).\n\n\
+            To sort your BAM file, run:\n  \
+            fgumi sort -i input.bam -o sorted.bam --order template-coordinate"
+        );
+    }
+
+    if is_tc_sorted {
+        info!("Input is template-coordinate sorted");
+    } else {
+        info!("Input is queryname sorted (accepted with --allow-unmapped)");
+        info!("All unmapped reads will form a single position group per library/cell");
+    }
+    Ok(())
+}
+
 /// EM-Seq methylation-aware consensus calling options.
 #[derive(Debug, Clone, Default, Args)]
 pub struct EmSeqOptions {
@@ -924,6 +972,44 @@ fn parse_instrumentation_level(raw: &str) -> crate::pipeline::core::builder::Ins
 mod tests {
     use super::*;
     use crate::pipeline::core::builder::InstrumentationLevel;
+
+    /// Build a SAM header with the given `@HD` line plus one `@SQ`, for the
+    /// `require_group_input_sort` matrix below.
+    fn header(hd: &str) -> Header {
+        format!("{hd}\n@SQ\tSN:chr1\tLN:1000\n").parse().expect("parse SAM header")
+    }
+
+    /// B2 (audit): `require_group_input_sort` is the single source of the group
+    /// stage's sort-order precondition, shared by the single-threaded command path
+    /// and the chain builder's `add_group`. Pin its ACCEPT matrix — template-coordinate
+    /// is accepted regardless of `--allow-unmapped`; queryname only with it — so the two
+    /// callers cannot drift.
+    #[rstest]
+    #[case::tc_no_allow("@HD\tVN:1.6\tSO:unsorted\tGO:query\tSS:template-coordinate", false)]
+    #[case::tc_allow("@HD\tVN:1.6\tSO:unsorted\tGO:query\tSS:template-coordinate", true)]
+    #[case::queryname_allow("@HD\tVN:1.6\tSO:queryname", true)]
+    fn require_group_input_sort_accepts(#[case] hd: &str, #[case] allow_unmapped: bool) {
+        assert!(require_group_input_sort(&header(hd), allow_unmapped).is_ok());
+    }
+
+    /// B2 (audit): the REJECT side of the same precondition — the diagnostic differs by
+    /// `--allow-unmapped` (queryname without the flag points at template-coordinate;
+    /// coordinate with the flag mentions the queryname escape hatch).
+    #[rstest]
+    #[case::queryname_no_allow(
+        "@HD\tVN:1.6\tSO:queryname",
+        false,
+        "must be template-coordinate sorted"
+    )]
+    #[case::coordinate_allow("@HD\tVN:1.6\tSO:coordinate", true, "queryname sorted")]
+    fn require_group_input_sort_rejects(
+        #[case] hd: &str,
+        #[case] allow_unmapped: bool,
+        #[case] expected_substr: &str,
+    ) {
+        let err = require_group_input_sort(&header(hd), allow_unmapped).unwrap_err().to_string();
+        assert!(err.contains(expected_substr), "got: {err}");
+    }
 
     // Pure mapping — independent of the ambient `FGUMI_PIPELINE_TRACE`, so every
     // case always runs (no skip-on-set that could silently no-op if another test
