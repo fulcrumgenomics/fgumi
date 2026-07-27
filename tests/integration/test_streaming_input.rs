@@ -356,8 +356,18 @@ fn test_simplex_single_threaded_reads_stdin_once() {
 /// and the multi-threaded path is the SAM-capable one. Guards the `with_context`
 /// message that replaced the removed SAM pre-sniff (codec/simplex) and the
 /// matching hint added to duplex.
-#[test]
-fn test_single_threaded_consensus_rejects_sam_with_threads_hint() {
+///
+/// Each single-threaded consensus command must reject SAM input with a
+/// `--threads` hint. One `#[case]` per command so a regression names the
+/// command instead of dying on the first bad assert (repo rstest convention).
+#[rstest]
+#[case::codec("codec", &["--min-reads", "1", "--min-duplex-length", "1"])]
+#[case::simplex("simplex", &["--min-reads", "1"])]
+#[case::duplex("duplex", &["--min-reads", "1"])]
+fn test_single_threaded_consensus_rejects_sam_with_threads_hint(
+    #[case] cmd: &str,
+    #[case] extra: &[&str],
+) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let bam = temp_dir.path().join("grouped.bam");
     let sam = temp_dir.path().join("grouped.sam");
@@ -365,35 +375,26 @@ fn test_single_threaded_consensus_rejects_sam_with_threads_hint() {
     convert_bam_to_sam(&bam, &sam);
     let input = sam.to_str().unwrap();
 
-    // Per-command minimal args; each runs single-threaded (no `--threads`).
-    let extra_args: [(&str, &[&str]); 3] = [
-        ("codec", &["--min-reads", "1", "--min-duplex-length", "1"]),
-        ("simplex", &["--min-reads", "1"]),
-        ("duplex", &["--min-reads", "1"]),
-    ];
-    for (cmd, extra) in extra_args {
-        let out = temp_dir.path().join(format!("{cmd}_out.bam"));
-        let mut args: Vec<&str> = vec![
-            cmd,
-            "--input",
-            input,
-            "--output",
-            out.to_str().unwrap(),
-            "--compression-level",
-            "1",
-        ];
-        args.extend_from_slice(extra);
-        let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-            .args(&args)
-            .output()
-            .unwrap_or_else(|e| panic!("failed to spawn {cmd}: {e}"));
-        assert!(!output.status.success(), "single-threaded {cmd} must reject SAM input");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("--threads"),
-            "single-threaded {cmd} SAM error should hint at --threads; stderr: {stderr}"
-        );
-    }
+    let out = temp_dir.path().join(format!("{cmd}_out.bam"));
+    // `--threads` is deliberately absent, and must stay absent: omitting it is the
+    // *only* way to select the single-threaded fast path this test is about.
+    // `--threads 1` is not a synonym — per `--threads`' own help, "when specified
+    // (even with --threads 1), uses the typed-step work-stealing pipeline", which is
+    // the SAM-capable path, so adding it makes all three cases accept the SAM input
+    // and the assertion below fail.
+    let mut args: Vec<&str> =
+        vec![cmd, "--input", input, "--output", out.to_str().unwrap(), "--compression-level", "1"];
+    args.extend_from_slice(extra);
+    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args(&args)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {cmd}: {e}"));
+    assert!(!output.status.success(), "single-threaded {cmd} must reject SAM input");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--threads"),
+        "single-threaded {cmd} SAM error should hint at --threads; stderr: {stderr}"
+    );
 }
 
 /// `--async-reader` over stdin must spawn the prefetch thread (the stdin branch
@@ -407,7 +408,8 @@ fn test_simplex_single_threaded_async_reader_over_stdin() {
     let output_from_pipe = temp_dir.path().join("output_pipe.bam");
     create_grouped_test_bam(&input_bam);
 
-    // Baseline: single-threaded + --async-reader from a file.
+    // Baseline: single-threaded (no `--threads`, which is what selects the
+    // single-threaded fast path) + --async-reader from a file.
     let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
         .args([
             "simplex",
