@@ -10,7 +10,7 @@
 //! ## Sort pipeline topology
 //!
 //! A sole-`[Stage::Sort]` chain runs through the same streaming source → arena
-//! sort ingest → `SpillGather` → `SpillCompress` → `SpillWrite` →
+//! sort ingest → `SpillGather` → `SpillBlockCompress` → `SpillWrite` →
 //! `SortSpillDecompress` → `SortMerge` → sink pipeline as a
 //! fused sort stage, via the normal `add_source` / `add_sink` flow that
 //! [`crate::pipeline::chains::build::build_for`] drives for every stage; there

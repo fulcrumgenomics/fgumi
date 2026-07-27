@@ -19,7 +19,7 @@ fn make_writer(codec: SpillCodec) -> (SpillWrite, TempDir) {
     (writer, dir)
 }
 
-/// Kernel-compress one raw block for `codec`, mirroring `SpillCompress`.
+/// Kernel-compress one raw block for `codec`, mirroring `SpillBlockCompress`.
 fn compress(codec: SpillCodec, raw: &[u8]) -> Vec<u8> {
     SpillBlockCompressor::new(codec, 1).unwrap().compress_block(raw).unwrap()
 }

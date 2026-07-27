@@ -1,5 +1,5 @@
 //! Block-granular spill compression kernel shared by the Phase-1 spill steps
-//! (`SpillGather` → `SpillCompress` → `SpillWrite`).
+//! (`SpillGather` → `SpillBlockCompress` → `SpillWrite`).
 //!
 //! The legacy [`SyncSpillWriter`](crate::sync_spill_writer) streams a whole
 //! sorted chunk through one stateful compressor on a single worker. To compress

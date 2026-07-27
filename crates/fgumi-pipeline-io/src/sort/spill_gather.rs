@@ -1,11 +1,11 @@
 //! `SpillGather` — first step of the block-parallel spill-write split
-//! (`SpillGather` → `SpillCompress` → `SpillWrite`), replacing the monolithic
+//! (`SpillGather` → `SpillBlockCompress` → `SpillWrite`), replacing the monolithic
 //! single-worker `CompressSpill`.
 //!
 //! `SpillGather` (`Serial`) consumes the [`SortChunkEvent`]s `SortBuffer`
 //! emits and fans each `Spill` chunk into record-aligned **raw** (uncompressed)
 //! [`SpillBlockEvent::Block`]s of ≤`BGZF_MAX_BLOCK_SIZE`, so the downstream
-//! `Parallel` `SpillCompress` can compress them across the framework pool. The
+//! `Parallel` `SpillBlockCompress` can compress them across the framework pool. The
 //! in-memory `Residual` and the terminal `AllAnnounced` pass straight through.
 //!
 //! # Ordinal minting
@@ -29,7 +29,7 @@
 //! `MAX_EVENTS_PER_LOCK` blocks into `pending`, drains them, and only frees the
 //! source chunk once its last record is framed. `pending` therefore holds ≤ a
 //! handful of 64 KiB blocks (~½ MiB) regardless of chunk size, and the chunk
-//! drains as fast as `SpillCompress` consumes blocks.
+//! drains as fast as `SpillBlockCompress` consumes blocks.
 
 use std::collections::VecDeque;
 use std::io;
@@ -137,7 +137,7 @@ struct ActiveSpill {
     records_ingested_so_far: u64,
 }
 
-/// `Serial` step that fans sorted spill chunks into raw blocks for `SpillCompress`.
+/// `Serial` step that fans sorted spill chunks into raw blocks for `SpillBlockCompress`.
 pub struct SpillGather {
     /// The spill chunk currently being framed incrementally (`None` between
     /// chunks). Holding it here — rather than materializing all its blocks into

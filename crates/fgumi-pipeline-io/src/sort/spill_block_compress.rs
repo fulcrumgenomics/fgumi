@@ -1,7 +1,7 @@
-//! `SpillCompress` — middle step of the block-parallel spill-write split
-//! (`SpillGather` → `SpillCompress` → `SpillWrite`).
+//! `SpillBlockCompress` — middle step of the block-parallel spill-write split
+//! (`SpillGather` → `SpillBlockCompress` → `SpillWrite`).
 //!
-//! `SpillCompress` (`Parallel + ByItemOrdinal`) compresses each raw
+//! `SpillBlockCompress` (`Parallel + ByItemOrdinal`) compresses each raw
 //! [`SpillBlockEvent::Block`] from `SpillGather` into a self-contained
 //! compressed unit (framed BGZF block(s) for bgzf, or a `[u32 len][zstd frame]`
 //! for zstd) via the shared [`SpillBlockCompressor`] kernel, replacing the
@@ -32,13 +32,13 @@ use fgumi_pipeline_core::{
 /// `Parallel + ByItemOrdinal` block compressor for the spill-write split.
 ///
 /// Not to be confused with the similarly-named
-/// [`CompressSpill`](super::CompressSpill): this `SpillCompress` is the
+/// [`CompressSpill`](super::CompressSpill): this `SpillBlockCompress` is the
 /// **pure block-compression** middle step of the finer
-/// `SpillGather → SpillCompress → SpillWrite` split (the disk write is the
+/// `SpillGather → SpillBlockCompress → SpillWrite` split (the disk write is the
 /// separate `SpillWrite` step), whereas `CompressSpill` is the **composite
 /// compress-and-write-to-disk** step of the coarser
 /// `SortBuffer → CompressSpill → SortSpillDecompress → SortMerge` chain.
-pub struct SpillCompress {
+pub struct SpillBlockCompress {
     codec: SpillCodec,
     compression: u32,
     /// Per-worker compressor, built lazily on the first block. `None` until then
@@ -48,8 +48,8 @@ pub struct SpillCompress {
     output_byte_limit: u64,
 }
 
-impl SpillCompress {
-    /// Build a `SpillCompress` for `codec` at `compression`. `output_byte_limit`
+impl SpillBlockCompress {
+    /// Build a `SpillBlockCompress` for `codec` at `compression`. `output_byte_limit`
     /// byte-bounds the compressed-block output queue.
     #[must_use]
     pub fn new(codec: SpillCodec, compression: u32, output_byte_limit: u64) -> Self {
@@ -97,7 +97,7 @@ impl SpillCompress {
     }
 }
 
-impl Clone for SpillCompress {
+impl Clone for SpillBlockCompress {
     fn clone(&self) -> Self {
         // Fresh per-worker compressor + held slot; shared config copied.
         Self {
@@ -110,13 +110,13 @@ impl Clone for SpillCompress {
     }
 }
 
-impl Step for SpillCompress {
+impl Step for SpillBlockCompress {
     type Input = SpillBlockEvent;
     type Outputs = OrderedBytesSingle<SpillBlockEvent>;
 
     fn profile(&self) -> StepProfile {
         StepProfile {
-            name: "SpillCompress",
+            name: "SpillBlockCompress",
             kind: StepKind::Parallel,
             sticky: false,
             output_queues: vec![QueueSpec::ByteBounded { limit_bytes: self.output_byte_limit }],

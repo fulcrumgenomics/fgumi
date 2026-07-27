@@ -1,5 +1,5 @@
 //! `SpillWrite` — final step of the block-parallel spill-write split
-//! (`SpillGather` → `SpillCompress` → `SpillWrite`).
+//! (`SpillGather` → `SpillBlockCompress` → `SpillWrite`).
 //!
 //! `SpillWrite` (`Serial + Affinity::Writer`) receives the compressed
 //! [`SpillBlockEvent`]s in dense `ordinal` order (the framework's `ByItemOrdinal`
@@ -103,7 +103,7 @@ impl SpillWrite {
     /// instead of as a pool-scheduled `Serial + Affinity::Writer` step. Used
     /// ONLY on the standalone-sort spill path (the Phase-1 analogue of Lever 2's
     /// detached terminal writer): it frees a pool worker for the
-    /// compression-bound `SpillCompress` work, matching feat-runall's dedicated
+    /// compression-bound `SpillBlockCompress` work, matching feat-runall's dedicated
     /// spill-I/O thread — but as a single persistent thread for the whole run,
     /// not one per spill chunk.
     ///

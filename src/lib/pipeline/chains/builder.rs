@@ -2262,7 +2262,7 @@ impl<'a> ChainBuilder<'a> {
     ///     ↓ arena sort ingest:
     ///        SAM → SortBuffer (Serial)
     ///        BAM → ReadBlocks → InflateToArena → FindBoundariesAndSort
-    ///     ↓ SpillGather (Serial) → SpillCompress (Parallel) → SpillWrite (Serial)
+    ///     ↓ SpillGather (Serial) → SpillBlockCompress (Parallel) → SpillWrite (Serial)
     /// SortPhase1Event
     ///     ↓ SortSpillDecompress (Parallel)
     /// SortPhase2Event
@@ -2302,7 +2302,7 @@ impl<'a> ChainBuilder<'a> {
             //
             // Every sort — including a sole-`[Stage::Sort]` standalone sort —
             // runs through the streaming source → arena sort ingest →
-            // SpillGather → SpillCompress → SpillWrite → SortSpillDecompress →
+            // SpillGather → SpillBlockCompress → SpillWrite → SortSpillDecompress →
             // SortMerge → sink pipeline. `add_source` always runs first (even
             // for `[Sort]`), so `current_tail` is always `Some` here.
             //
@@ -2314,7 +2314,7 @@ impl<'a> ChainBuilder<'a> {
             //       ↓ arena sort ingest (SortBuffer, or ReadBlocks →
             //         InflateToArena → FindBoundariesAndSort for BAM)
             //       ↓
-            //   SpillGather (Serial) → SpillCompress (Parallel) → SpillWrite
+            //   SpillGather (Serial) → SpillBlockCompress (Parallel) → SpillWrite
             //       (Serial) → SortPhase1Event
             //       ↓
             //   SortSpillDecompress (Parallel)
@@ -2339,7 +2339,7 @@ impl<'a> ChainBuilder<'a> {
             use crate::pipeline::steps::parse::decode::DecodeFromRecords;
             use crate::pipeline::steps::sort::{
                 BlockOutput, RecordBatchOutput, SortBuffer, SortDecompressTuning, SortMerge,
-                SortSpillDecompress, SpillCompress, SpillGather, SpillWrite,
+                SortSpillDecompress, SpillBlockCompress, SpillGather, SpillWrite,
             };
             use fgumi_sort::{RawExternalSorter, SortOrder};
 
@@ -2487,7 +2487,7 @@ impl<'a> ChainBuilder<'a> {
             // Phase-1 head — the block-parallel spill-write split for ALL sort
             // orders: `SortBuffer` (Serial: ingest + par-sort + emit sorted
             // chunks) → `SpillGather` (Serial: fan each chunk into raw blocks,
-            // mint a dense ordinal) → `SpillCompress` (Parallel + ByItemOrdinal:
+            // mint a dense ordinal) → `SpillBlockCompress` (Parallel + ByItemOrdinal:
             // compress blocks across the work-stealing pool) → `SpillWrite`
             // (Serial + Writer: demux blocks to per-file spill files, emit
             // `SortPhase1Event`). This mirrors the output BAM tail
@@ -2612,13 +2612,13 @@ impl<'a> ChainBuilder<'a> {
                 // head, so it never contends a pool worker — the driver frames the
                 // just-sorted chunk into blocks while the pool inflates/compresses.
                 let serialize = SpillGather::new(byte_limit);
-                let compress = SpillCompress::new(temp_codec, temp_compression, byte_limit);
+                let compress = SpillBlockCompress::new(temp_codec, temp_compression, byte_limit);
                 let write = SpillWrite::new(alloc, temp_codec, byte_limit, temp_dirs);
                 // Lever 2, Phase-1 analogue: on the standalone-sort terminal,
                 // detach the spill writer onto its own dedicated thread as well,
                 // so the single serial spill-write stream stops occupying a pool
                 // worker that could be running the compression-bound
-                // `SpillCompress`. One persistent writer thread for the whole run
+                // `SpillBlockCompress`. One persistent writer thread for the whole run
                 // (not one per spill chunk). Same gate as the terminal output
                 // writer set above; every other chain keeps the pool-scheduled
                 // `Serial + Affinity::Writer` spill writer.

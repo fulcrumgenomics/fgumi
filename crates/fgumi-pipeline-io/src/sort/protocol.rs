@@ -146,13 +146,13 @@ impl SortChunkEvent {
     }
 }
 
-/// Events from `SpillGather` → `SpillCompress` → `SpillWrite` (the
+/// Events from `SpillGather` → `SpillBlockCompress` → `SpillWrite` (the
 /// block-parallel spill-write split that replaces the monolithic single-worker
 /// `CompressSpill`).
 ///
 /// `SpillGather` (Serial) fans each `SortChunkEvent::Spill` chunk into
 /// record-aligned raw [`Block`](Self::Block)s and forwards `Residual` /
-/// `AllAnnounced`. `SpillCompress` (Parallel) compresses each `Block`'s `bytes`
+/// `AllAnnounced`. `SpillBlockCompress` (Parallel) compresses each `Block`'s `bytes`
 /// in place. `SpillWrite` (Serial) demultiplexes blocks back to per-`file_id`
 /// spill files and emits the existing [`SortPhase1Event`].
 ///
@@ -165,7 +165,7 @@ impl SortChunkEvent {
 /// **contiguous** in the ordinal stream — so `SpillWrite` only ever has one
 /// spill file open at a time.
 pub enum SpillBlockEvent {
-    /// One raw (pre-compression) or compressed (post-`SpillCompress`) block of a
+    /// One raw (pre-compression) or compressed (post-`SpillBlockCompress`) block of a
     /// spill file. `file_id` is the spill `seq` (the eventual slot `file_id`),
     /// `is_last_in_file` marks the final block so `SpillWrite` can finalize the
     /// file and emit `SpillReady`. `SpillWrite` (Serial) owns the path allocation,
