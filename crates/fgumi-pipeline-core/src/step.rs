@@ -221,9 +221,14 @@ pub struct OutputHandles<O: StepOutputs> {
 }
 
 impl<O: StepOutputs> OutputHandles<O> {
-    /// Wrap a type-erased outputs view. Constructed by `TypedStep<S>`
-    /// (Phase 1 Task 15) when assembling the step's `StepCtx`.
-    #[allow(dead_code)] // wired up by Phase 1 Task 15 (TypedStep::wrap_outputs_view).
+    /// Wrap a type-erased outputs view into a typed `OutputHandles<O>`.
+    ///
+    /// Called from the `ErasedStep::wrap_outputs_view` impls in `erased.rs` —
+    /// `TypedStep<S>` for one-input steps and `TypedStep2<S>` for the two-input
+    /// (zipper) shape — while `build_chain_contexts` assembles one context per
+    /// step. That happens on the thread calling `Pipeline::run`, *before* any
+    /// worker is spawned; workers never construct one, they borrow the box built
+    /// here (which is what `TypedStep::resolve_outputs`' cache relies on).
     pub(crate) fn new(inner: OutputsViewAny) -> Self {
         Self { inner, _phantom: std::marker::PhantomData }
     }
