@@ -199,6 +199,7 @@ use noodles::sam::alignment::record::data::field::Tag;
 #[cfg(test)]
 use noodles::sam::alignment::record_buf::RecordBuf;
 
+use crate::base_builder::TieRule;
 use crate::caller::ConsensusOutput;
 use crate::caller::{
     ConsensusCaller, ConsensusCallingStats, RejectionReason, clamp_combined_error_to_fgbio_short,
@@ -432,6 +433,17 @@ impl DuplexConsensusCaller {
             rejected_reads: Vec::new(),
             track_rejects,
         })
+    }
+
+    /// Returns the caller with near-ties resolved under *rule* instead of the default.
+    ///
+    /// Duplex consensus is built on top of the single-strand caller, so the rule is forwarded
+    /// there; see [`TieRule`]. Offered as a builder method rather than a twelfth constructor
+    /// parameter because [`DuplexConsensusCaller::new`] is already at its argument limit.
+    #[must_use]
+    pub fn with_tie_rule(mut self, rule: TieRule) -> Self {
+        self.ss_caller.set_tie_rule(rule);
+        self
     }
 
     /// Configures the duplex caller for methylation-aware consensus calling.
@@ -2354,6 +2366,7 @@ mod tests {
     use super::*;
     use fgumi_raw_bam::{ParsedBamRecord, SamBuilder, testutil::encode_op};
     use noodles::sam::alignment::record_buf::data::field::Value;
+    use rstest::rstest;
 
     #[test]
     fn test_parse_mi_tag() {
@@ -2575,6 +2588,43 @@ mod tests {
         assert!(msg.contains("MI"), "error should mention the missing MI tag: {msg}");
     }
 
+    /// `--tie-rule` must reach the single-strand caller that actually calls the bases.
+    ///
+    /// Regression guard: `DuplexConsensusCaller::new` builds its `ss_options` with
+    /// `..Default::default()`, which silently absorbed `tie_rule` when the field was added —
+    /// so `fgumi duplex --tie-rule ulp-relative` parsed and then did nothing. Both the
+    /// default and the override are pinned so a future `..Default::default()` regression fails
+    /// here rather than in a parity run.
+    #[rstest]
+    #[case::default_is_fgbio_compat(None, TieRule::FgbioCompat)]
+    #[case::override_to_ulp_relative(Some(TieRule::UlpRelative), TieRule::UlpRelative)]
+    #[case::override_to_fgbio_compat(Some(TieRule::FgbioCompat), TieRule::FgbioCompat)]
+    fn tie_rule_reaches_the_single_strand_caller(
+        #[case] requested: Option<TieRule>,
+        #[case] expected: TieRule,
+    ) -> Result<()> {
+        let caller = DuplexConsensusCaller::new(
+            "consensus".to_string(),
+            "RG1".to_string(),
+            vec![1],
+            20,
+            false,
+            false,
+            None,
+            None,
+            false,
+            45,
+            40,
+        )?;
+        let caller = match requested {
+            Some(rule) => caller.with_tie_rule(rule),
+            None => caller,
+        };
+
+        assert_eq!(caller.ss_caller.options.tie_rule, expected);
+        Ok(())
+    }
+
     // Helper function to create a test VanillaUmiConsensusCaller
     fn create_test_ss_caller() -> VanillaUmiConsensusCaller {
         VanillaUmiConsensusCaller::new(
@@ -2593,6 +2643,7 @@ mod tests {
                 min_consensus_base_quality: 40,
                 cell_tag: None,
                 methylation_mode: crate::MethylationMode::Disabled,
+                tie_rule: crate::TieRule::default(),
             },
         )
     }

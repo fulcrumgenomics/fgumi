@@ -429,7 +429,8 @@ impl Command for Duplex {
             track_rejects,
             self.consensus.error_rate_pre_umi,
             self.consensus.error_rate_post_umi,
-        )?;
+        )?
+        .with_tie_rule(self.consensus.tie_rule.into());
 
         // Set reference for methylation-aware consensus if enabled
         if let Some((ref reference, ref ref_names)) = methylation_ref {
@@ -639,6 +640,7 @@ impl Duplex {
         let max_reads_per_strand = self.max_reads_per_strand;
         let error_rate_pre_umi = self.consensus.error_rate_pre_umi;
         let error_rate_post_umi = self.consensus.error_rate_post_umi;
+        let tie_rule: fgumi_consensus::TieRule = self.consensus.tie_rule.into();
         let overlapping_enabled = self.overlapping.consensus_call_overlapping_bases;
         let read_group_id = self.read_group.read_group_id.clone();
         let cell_tag = Tag::from(SamTag::CB);
@@ -689,9 +691,8 @@ impl Duplex {
                 error_rate_pre_umi,
                 error_rate_post_umi,
             )
-            .map_err(|e| {
-                io::Error::other(format!("Failed to create DuplexConsensusCaller: {e}"))
-            })?;
+            .map_err(|e| io::Error::other(format!("Failed to create DuplexConsensusCaller: {e}")))?
+            .with_tie_rule(tie_rule);
 
             // Set reference for methylation-aware consensus if enabled
             if let Some((ref reference, ref ref_names)) = methylation_ref {

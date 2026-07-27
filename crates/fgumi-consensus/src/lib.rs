@@ -68,7 +68,7 @@ impl MethylationMode {
 }
 
 // Re-export commonly used items
-pub use base_builder::ConsensusBaseBuilder;
+pub use base_builder::{ConsensusBaseBuilder, TieRule};
 pub use caller::{ConsensusCaller, calculate_error_rate, log_consensus_statistics};
 pub use filter::{
     ConsensusType, FilterConfig, FilterResult, FilterThresholds, compute_read_stats,

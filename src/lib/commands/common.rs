@@ -46,6 +46,36 @@ impl From<MethylationModeArg> for fgumi_consensus::MethylationMode {
     }
 }
 
+/// CLI argument value for `--tie-rule`.
+///
+/// Maps to [`fgumi_consensus::TieRule`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum TieRuleArg {
+    /// No-call a maximum separated from the runner-up by only a few ULPs.
+    ///
+    /// The default. A separation that small is summation-order noise rather than evidence,
+    /// and the rule is independent of both read order and family depth.
+    #[value(name = "ulp-relative")]
+    UlpRelative,
+    /// Reproduce fgbio's tie rule exactly, defects included.
+    ///
+    /// For byte-parity with fgbio output — chiefly cross-tool equivalency testing. Inherits
+    /// fgbio's order dependence and scale dependence, so it will call a base off one ULP of
+    /// accumulation noise.
+    #[default]
+    #[value(name = "fgbio-compat")]
+    FgbioCompat,
+}
+
+impl From<TieRuleArg> for fgumi_consensus::TieRule {
+    fn from(arg: TieRuleArg) -> Self {
+        match arg {
+            TieRuleArg::UlpRelative => Self::UlpRelative,
+            TieRuleArg::FgbioCompat => Self::FgbioCompat,
+        }
+    }
+}
+
 /// Resolves an optional `--methylation-mode` CLI arg to a [`MethylationMode`].
 ///
 /// Returns `Disabled` when `None` (flag not provided).
@@ -479,6 +509,20 @@ pub struct ConsensusCallingOptions {
     /// this as a flag is an fgumi superset.
     #[arg(long = "min-consensus-base-quality", default_value = "2")]
     pub min_consensus_base_quality: u8,
+
+    /// How to resolve a near-tie between the two most likely consensus bases.
+    ///
+    /// `fgbio-compat` (default) reproduces fgbio's rule, calling a base off a one-ULP
+    /// separation, because matching fgbio is the contract. `ulp-relative` treats a separation
+    /// of a few ULPs as summation-order noise and emits a no-call instead — the better rule on
+    /// the merits, and independent of read order and family depth.
+    ///
+    /// Applies to consensus base calling. Consensus UMI calling (the `RX` tag) always uses the
+    /// fgbio-compatible rule.
+    ///
+    /// Hidden: this is a cross-tool equivalency-testing knob, not a routine analysis option.
+    #[arg(long = "tie-rule", default_value = "fgbio-compat", value_enum, hide = true)]
+    pub tie_rule: TieRuleArg,
 }
 
 impl Default for ConsensusCallingOptions {
@@ -490,6 +534,7 @@ impl Default for ConsensusCallingOptions {
             output_per_base_tags: true,
             trim: false,
             min_consensus_base_quality: 2,
+            tie_rule: TieRuleArg::default(),
         }
     }
 }
@@ -1532,6 +1577,7 @@ mod tests {
             output_per_base_tags: true,
             trim: false,
             min_consensus_base_quality: 13,
+            tie_rule: TieRuleArg::default(),
         };
         assert!(opts.validate().is_ok());
     }
