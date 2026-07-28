@@ -9,14 +9,21 @@
 
 # fgumi
 
-**⚠️ RESEARCH PREVIEW - USE AT YOUR OWN RISK**
+**Production ready as of v0.5.0 — the fgbio-parity release.**
 
-This software is currently a **research preview**. While we have extensively
-tested these tools across a wide variety of vendor-provided data, **no
-guarantees are made** regarding correctness or stability.
+fgumi's output is validated against
+[fgbio](https://github.com/fulcrumgenomics/fgbio) across a wide range of
+vendor-provided data, and we now recommend fgumi over fgbio for UMI
+processing. The two intentionally differ in a handful of places — most visibly
+`MI` tag values, and `dedup --no-umi`, which drops fgbio's strand-of-origin
+split to match Picard `MarkDuplicates`. The divergences we know of are
+catalogued in the
+[migration guide](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/src/guide/migration-from-fgbio.md).
 
-We are targeting **July 31, 2026** to recommend fgumi over
-[fgbio](https://github.com/fulcrumgenomics/fgbio) for production use.
+As with any change to a production pipeline, validate against your own data
+before switching, and please
+[open an issue](https://github.com/fulcrumgenomics/fgumi/issues) for any
+divergence that isn't documented.
 
 Fulcrum Genomics Unique Molecular Indexing (UMI) Tools - a suite of high-performance tools for working with UMI-tagged sequencing data.
 
@@ -62,6 +69,7 @@ The diagram shows the workflow from FASTQ files to filtered consensus reads:
 
 * [Documentation](https://docs.rs/fgumi)
 * [Best Practice Pipeline](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/src/guide/best-practices.md): Recommended workflow from FASTQ to consensus
+* [Migration from fgbio](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/src/guide/migration-from-fgbio.md): Tool mapping, key differences, and known divergences
 * [Performance Tuning Guide](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/src/guide/performance-tuning.md): Threading, memory, and compression optimization
 * [Snakemake Pipeline](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/FastqToConsensus-RnD.smk): Reference implementation
 * [Metrics](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/src/guide/working-with-metrics.md): Output metrics documentation
