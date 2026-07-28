@@ -1316,6 +1316,10 @@ impl VanillaUmiConsensusCaller {
         }
 
         // Multi-read consensus calling
+        //
+        // fgbio stores per-base depths/errors as `Short`, clamping above i16::MAX (32_767); see
+        // the per-position push below.
+        let max_short: u16 = i16::MAX.unsigned_abs(); // 32_767
         for pos in 0..consensus_len {
             self.consensus_builder.reset();
 
@@ -1334,8 +1338,15 @@ impl VanillaUmiConsensusCaller {
             let (base, qual) = self.consensus_builder.call();
             let depth = self.consensus_builder.contributions(); // u16
 
-            // Record depth
-            depths.push(depth);
+            // fgbio's VanillaUmiConsensusCaller stores per-base depths and errors as `Short`,
+            // clamping anything above i16::MAX (32_767), and derives cD/cM/cE from those clamped
+            // arrays (DuplexConsensusCaller sums the two clamped strand depths without re-clamping).
+            // Clamp at push so the depths/errors vectors — and everything derived from them (the
+            // summary cD/cM/cE tags, the per-base cd/ce tags, and duplex's strand-sum) — match
+            // fgbio. The unclamped `depth` local is still used for the min-reads threshold below
+            // (as fgbio does at VanillaUmiConsensusCaller.scala:329). `contributions()` already
+            // saturates at u16::MAX, so a raw `.min` here cannot see a wrapped value.
+            depths.push(depth.min(max_short));
 
             // Errors = contributing bases that disagree with the consensus call. Derived by summing
             // the non-consensus base counters at full width (see `non_consensus_contributions`)
@@ -1343,7 +1354,7 @@ impl VanillaUmiConsensusCaller {
             // *saturated* `u16` operands and collapses to 0 in deep mixed pileups (e.g.
             // A = u16::MAX, C = 1). In the non-saturated case the two are identical, matching fgbio.
             let error_count = self.consensus_builder.non_consensus_contributions(base);
-            errors.push(error_count);
+            errors.push(error_count.min(max_short));
 
             // Apply minimum depth and quality thresholds
             let (final_base, final_qual) = if (depth as usize) < min_reads {
@@ -2474,6 +2485,170 @@ mod tests {
                 assert_eq!(e, 0, "Position {i} should have 0 errors");
             }
         }
+    }
+
+    /// Independent, programmatic fgbio oracle for the summary consensus tags.
+    ///
+    /// Reimplements fgbio's `VanillaUmiConsensusCaller` derivation from per-position
+    /// `(depth, errors)`: each is stored as a `Short` — clamped at `i16::MAX` — and the
+    /// summary tags come off those clamped arrays, `cD` as the max depth, `cM` as the min,
+    /// and `cE` as `sum(errors) / sum(depths)`. No fgbio dependency; the same
+    /// reimplement-the-algorithm shape as `fgbio_edit_baseline_partition` in `fgumi-umi`.
+    ///
+    /// Having the oracle be a function rather than a hand-computed constant is what makes
+    /// the saturation tests below independent: they assert against fgbio's rule applied to
+    /// the fixture's known pileup, not against a number read back out of fgumi.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "mirrors the production error-rate computation exactly, including its cast"
+    )]
+    fn fgbio_summary_tags_baseline(per_position: &[(u32, u32)]) -> (i32, i32, f32) {
+        const SHORT_MAX: u32 = i16::MAX as u32;
+        let depths: Vec<u32> = per_position.iter().map(|(d, _)| (*d).min(SHORT_MAX)).collect();
+        let errors: Vec<u32> = per_position.iter().map(|(_, e)| (*e).min(SHORT_MAX)).collect();
+
+        let max_depth = i32::try_from(*depths.iter().max().unwrap_or(&0)).expect("fits i32");
+        let min_depth = i32::try_from(*depths.iter().min().unwrap_or(&0)).expect("fits i32");
+        let total_errors: u64 = errors.iter().map(|&e| u64::from(e)).sum();
+        let total_depth: u64 = depths.iter().map(|&d| u64::from(d)).sum();
+        let error_rate =
+            if total_depth > 0 { total_errors as f32 / total_depth as f32 } else { 0.0 };
+        (max_depth, min_depth, error_rate)
+    }
+
+    #[test]
+    fn test_consensus_depth_saturates_at_i16_max_like_fgbio() {
+        // A UMI family deeper than i16::MAX (32_767) must report consensus depth saturated at
+        // 32_767 — matching fgbio's VanillaUmiConsensusCaller, which stores depths/errors as
+        // `Short` and derives cD/cM/cE from those clamped arrays — rather than the true depth
+        // (which would diverge from fgbio) or a wrapped value. The SUMMARY tags cD/cM/cE must use
+        // the clamped depth too, not just the per-base cd/ce arrays; before the clamp-at-push fix
+        // the summary tags were computed from the unclamped depths and diverged for families
+        // deeper than 32_767 at a position. cE must use the clamped depth as its denominator,
+        // exactly as fgbio derives it from the clamped arrays.
+        let options =
+            VanillaUmiConsensusOptions { produce_per_base_tags: true, ..Default::default() };
+        let mut caller =
+            VanillaUmiConsensusCaller::new("consensus".to_string(), "A".to_string(), options);
+
+        let read_len = 4;
+        let depth = 40_000u32; // > i16::MAX, so depth must clamp
+        let quals = vec![30u8; read_len];
+        let mut reads = Vec::with_capacity(depth as usize);
+        for i in 0..depth {
+            let mut bases = vec![b'A'; read_len];
+            if i == 0 {
+                bases[0] = b'C'; // a single disagreeing observation at position 0
+            }
+            reads.push(create_consensus_test_read(&format!("r{i}"), &bases, &quals, "UMI1"));
+        }
+
+        let output = consensus_reads_from_raw(&mut caller, reads)
+            .expect("consensus_reads_from_raw should succeed");
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
+
+        assert_eq!(consensus.bases, vec![b'A'; read_len]);
+        assert_eq!(
+            consensus.get_int_tag(SamTag::CD).expect("cD present"),
+            32_767,
+            "cD (max depth) must saturate at i16::MAX like fgbio"
+        );
+        assert_eq!(
+            consensus.get_int_tag(SamTag::CM).expect("cM present"),
+            32_767,
+            "cM (min depth) must saturate at i16::MAX like fgbio"
+        );
+        let cd_bases = consensus.get_i16_array_tag(SamTag::CD_BASES).expect("cd present");
+        assert_eq!(
+            cd_bases,
+            vec![32_767i16; read_len],
+            "per-base cd must all saturate at i16::MAX"
+        );
+
+        // Independent oracle: position 0 carries the single disagreement, the rest none.
+        let (_, _, expected_ce) =
+            fgbio_summary_tags_baseline(&[(depth, 1), (depth, 0), (depth, 0), (depth, 0)]);
+        let ce = consensus.get_float_tag(SamTag::CE).expect("cE present");
+        assert!(
+            (ce - expected_ce).abs() < expected_ce * 0.01,
+            "cE must be computed from the clamped depth: expected ~{expected_ce}, got {ce}"
+        );
+    }
+
+    /// The *error* clamp, which the depth test above never reaches.
+    ///
+    /// `test_consensus_depth_saturates_at_i16_max_like_fgbio` has a single disagreeing
+    /// observation, so `errors.push(error_count.min(max_short))` is never exercised — only the
+    /// depth half of the clamp is. Saturating errors needs depth above `2 * i16::MAX`, because
+    /// the error count is `depth - observations_for(consensus_base)` and the consensus base is
+    /// the majority: a family of `70_000` reads split `36_000` `A` / `34_000` `C` at position 0
+    /// puts `34_000` errors there, past the `32_767` ceiling.
+    ///
+    /// The oracle is derived from fgbio's algorithm, not from fgumi's output. fgbio stores
+    /// depths and errors as `Short` and computes the summary `cE` from those clamped arrays, so
+    /// with all four positions at clamped depth `32_767` and only position 0 carrying (clamped)
+    /// errors, `cE` is `32_767 / (32_767 * 4)` — exactly `0.25`.
+    ///
+    /// That constant is what makes this test discriminating: the per-base `ce` array is clamped
+    /// a second time when the tag is written, so it reads `32_767` either way — only the summary
+    /// `cE` reveals whether the *stored* error was clamped. Without the error clamp the sum is
+    /// `34_000`, giving `34_000 / 131_068` = `0.2594`, which this assertion rejects.
+    #[test]
+    fn test_consensus_errors_saturate_at_i16_max_like_fgbio() {
+        let options =
+            VanillaUmiConsensusOptions { produce_per_base_tags: true, ..Default::default() };
+        let mut caller =
+            VanillaUmiConsensusCaller::new("consensus".to_string(), "A".to_string(), options);
+
+        let read_len = 4;
+        let majority = 36_000u32; // consensus 'A' at position 0
+        let minority = 34_000u32; // disagreeing 'C' -> 34_000 errors, past i16::MAX
+        let quals = vec![30u8; read_len];
+
+        let mut reads = Vec::with_capacity((majority + minority) as usize);
+        for i in 0..(majority + minority) {
+            let mut bases = vec![b'A'; read_len];
+            if i >= majority {
+                bases[0] = b'C';
+            }
+            reads.push(create_consensus_test_read(&format!("r{i}"), &bases, &quals, "UMI1"));
+        }
+
+        let output = consensus_reads_from_raw(&mut caller, reads)
+            .expect("consensus_reads_from_raw should succeed");
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
+
+        assert_eq!(
+            consensus.bases,
+            vec![b'A'; read_len],
+            "the majority base wins at every position"
+        );
+
+        let ce_bases = consensus.get_i16_array_tag(SamTag::CE_BASES).expect("ce present");
+        assert_eq!(
+            ce_bases[0], 32_767,
+            "position 0 carries 34_000 errors and must saturate at i16::MAX"
+        );
+        assert_eq!(&ce_bases[1..], &[0i16; 3], "positions 1-3 have no disagreement");
+
+        // The discriminating assertion: cE is summed from the CLAMPED error array.
+        // Position 0 carries `minority` errors at full depth; the rest carry none.
+        let total = majority + minority;
+        let (oracle_max_depth, oracle_min_depth, expected_ce) =
+            fgbio_summary_tags_baseline(&[(total, minority), (total, 0), (total, 0), (total, 0)]);
+        assert_eq!(consensus.get_int_tag(SamTag::CD).expect("cD present"), oracle_max_depth);
+        assert_eq!(consensus.get_int_tag(SamTag::CM).expect("cM present"), oracle_min_depth);
+
+        let ce = consensus.get_float_tag(SamTag::CE).expect("cE present");
+        assert!(
+            (ce - expected_ce).abs() < 1e-4,
+            "cE must sum the clamped errors: expected {expected_ce} (clamped), \
+             got {ce} (0.2594 would mean the stored error was never clamped)"
+        );
     }
 
     /// Port of fgbio test: "calculate the # of errors relative to the most likely consensus call"

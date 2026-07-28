@@ -183,6 +183,19 @@ impl SimplexOptions {
         if self.min_reads == 0 {
             bail!("--min-reads must be >= 1 (a value of 0 admits empty groups)");
         }
+        // The per-position depth the threshold is compared against is a `u16` that
+        // saturates at `u16::MAX` (see `ConsensusBaseBuilder::contributions`), so a
+        // larger `--min-reads` can never be satisfied: every position in an
+        // arbitrarily deep family would be silently no-called as `NotEnoughReads`.
+        // Reject it up front rather than masking valid ultra-deep families.
+        if self.min_reads > usize::from(u16::MAX) {
+            bail!(
+                "--min-reads ({}) must be <= {} — consensus depth saturates at that value, so a \
+                 larger threshold can never be met",
+                self.min_reads,
+                u16::MAX,
+            );
+        }
         if let Some(max) = self.max_reads {
             if max < self.min_reads {
                 bail!("--max-reads ({}) must be >= --min-reads ({})", max, self.min_reads);
@@ -1062,12 +1075,22 @@ mod tests {
         assert!(error_msg.contains("--min-reads"));
     }
 
+    /// `--min-reads` / `--max-reads` range validation.
+    ///
+    /// The ceiling cases guard a silent failure mode rather than a typo: the threshold is
+    /// compared against a `u16` per-position depth that saturates at `u16::MAX`, so a larger
+    /// value can never be met and would no-call every position of an arbitrarily deep family
+    /// as `NotEnoughReads` while looking like a legitimate filter. `u16::MAX` itself stays
+    /// accepted — it is exactly reachable.
     #[rstest]
     #[case::valid_min_only(1, None, None)]
     #[case::valid_min_and_max(3, Some(10), None)]
     #[case::valid_min_equals_max(5, Some(5), None)]
     #[case::min_reads_zero(0, None, Some("--min-reads must be >= 1"))]
     #[case::max_below_min(5, Some(2), Some("--max-reads (2) must be >= --min-reads (5)"))]
+    #[case::min_reads_at_depth_ceiling(65_535, None, None)]
+    #[case::min_reads_one_past_depth_ceiling(65_536, None, Some("must be <= 65535"))]
+    #[case::min_reads_far_past_depth_ceiling(1_000_000, None, Some("must be <= 65535"))]
     fn test_validate_read_bounds(
         #[case] min_reads: usize,
         #[case] max_reads: Option<usize>,
