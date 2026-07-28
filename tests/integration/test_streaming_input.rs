@@ -535,6 +535,48 @@ fn test_group_command_with_sam_input_new_pipeline_matches_bam_baseline() {
     compare_bam_records(&out_bam_baseline, &out_sam);
 }
 
+/// B1 (audit): folding the single-threaded group path onto the chain removed the
+/// BAM-only restriction — `fgumi group` with `--threads` unset now accepts SAM
+/// input (it previously bailed with "SAM input requires --threads N", since the
+/// bespoke `execute_single_threaded` path could not parse SAM). The SAM run must
+/// match the BAM run, both with `--threads` omitted.
+#[test]
+fn test_group_sam_input_without_threads_now_accepted() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let bam_input = temp_dir.path().join("input.bam");
+    let sam_input = temp_dir.path().join("input.sam");
+    let baseline_out = temp_dir.path().join("baseline_out.bam");
+    let streamed_out = temp_dir.path().join("streamed_out.bam");
+
+    create_test_input_bam(&bam_input);
+    convert_bam_to_sam(&bam_input, &sam_input);
+
+    let run = |input: &std::path::Path, output: &std::path::Path, label: &str| {
+        let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+            .args([
+                "group",
+                "--input",
+                input.to_str().unwrap(),
+                "--output",
+                output.to_str().unwrap(),
+                "--strategy",
+                "identity",
+                "--edits",
+                "0",
+                "--compression-level",
+                "1",
+                // No --threads: exercises the (now unified) unset path.
+            ])
+            .status()
+            .unwrap_or_else(|e| panic!("spawn group {label}: {e}"));
+        assert!(status.success(), "group {label} with --threads unset failed");
+    };
+
+    run(&bam_input, &baseline_out, "BAM");
+    run(&sam_input, &streamed_out, "SAM");
+    compare_bam_records(&baseline_out, &streamed_out);
+}
+
 /// SAM-input parity for simplex. Generates a SAM from the same grouped
 /// records as the BAM baseline (with MI tags), runs simplex on both,
 /// compares the consensus outputs.
@@ -647,7 +689,7 @@ fn test_correct_command_with_sam_input_new_pipeline_with_rejects_matches_bam_bas
     // UMIs, rejecting none — so only the kept output is guarded.)
     assert!(count_bam_records(&out_bam_baseline) > 0, "BAM baseline kept output is empty");
     compare_bam_records(&out_bam_baseline, &out_sam);
-    compare_bam_records(&out_bam_rejects_baseline, &out_sam_rejects);
+    compare_bam_records_allow_empty(&out_bam_rejects_baseline, &out_sam_rejects);
 }
 
 /// Build an unmapped-consensus BAM with depth tags so filter accepts it
@@ -883,7 +925,33 @@ fn test_group_command_with_piped_input_new_pipeline() {
 /// field including bases, qualities, flags, CIGAR, positions, and aux tags — so
 /// a record-level corruption from mishandled input (dropped or garbled bytes)
 /// fails here, not just a count/name mismatch.
+///
+/// Asserts both sides are non-empty: two empty BAMs are trivially equal, so a
+/// regression that made the command emit nothing on *both* inputs would otherwise
+/// pass every parity test in this file. Use [`compare_bam_records_allow_empty`]
+/// for the outputs that are legitimately empty (e.g. rejects with nothing rejected).
 fn compare_bam_records(path1: &PathBuf, path2: &PathBuf) {
+    let (records1, records2) = read_both_for_compare(path1, path2);
+    assert!(
+        !records1.is_empty(),
+        "{} is empty — parity against an empty baseline is vacuous",
+        path1.display()
+    );
+    assert_records_equal(&records1, &records2);
+}
+
+/// [`compare_bam_records`] without the non-empty guard, for outputs whose empty
+/// case is a legitimate result rather than a regression.
+fn compare_bam_records_allow_empty(path1: &PathBuf, path2: &PathBuf) {
+    let (records1, records2) = read_both_for_compare(path1, path2);
+    assert_records_equal(&records1, &records2);
+}
+
+/// Decodes both BAMs to eager `RecordBuf`s for comparison.
+fn read_both_for_compare(
+    path1: &PathBuf,
+    path2: &PathBuf,
+) -> (Vec<noodles::sam::alignment::RecordBuf>, Vec<noodles::sam::alignment::RecordBuf>) {
     use noodles::sam::alignment::RecordBuf;
 
     let mut reader1 =
@@ -899,6 +967,14 @@ fn compare_bam_records(path1: &PathBuf, path2: &PathBuf) {
     let records2: Vec<RecordBuf> =
         reader2.record_bufs(&header2).map(|r| r.expect("Failed to read record 2")).collect();
 
+    (records1, records2)
+}
+
+/// Asserts full record-level identity between two decoded BAMs.
+fn assert_records_equal(
+    records1: &[noodles::sam::alignment::RecordBuf],
+    records2: &[noodles::sam::alignment::RecordBuf],
+) {
     assert_eq!(records1.len(), records2.len(), "BAM files have different record counts");
 
     for (i, (r1, r2)) in records1.iter().zip(records2.iter()).enumerate() {
@@ -938,24 +1014,28 @@ fn create_grouped_test_bam(path: &PathBuf) {
         bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
     writer.write_header(&header).expect("Failed to write header");
 
-    // Create grouped reads with MI tag
+    // Create grouped reads with MI tag.
+    //
+    // MI must be written as a *string* (`MI:Z:1`), the way `fgumi group` and fgbio emit it —
+    // the tag can carry a strand suffix (`1/A`), so the consumers parse it as text. An integer
+    // `MI:i:1` is silently ignored by the consensus callers (no consensus read, no rejection,
+    // no warning), which previously made every simplex parity test below compare one empty
+    // BAM against another.
     let mi_tag = Tag::from(fgumi_lib::sam::SamTag::MI);
     let records = create_umi_family("AAAAAAAA", 5, "mol1", "ACGTACGT", 30);
 
     // Add MI tag to each record (convert to RecordBuf first to enable tag mutation)
-    let mi_value = 1;
     for raw in &records {
         let mut rec = to_record_buf(raw);
-        rec.data_mut().insert(mi_tag, Value::from(mi_value));
+        rec.data_mut().insert(mi_tag, Value::from("1"));
         writer.write_alignment_record(&header, &rec).expect("Failed to write record");
     }
 
     // Second family with different MI
-    let mi_value2 = 2;
     let records2 = create_umi_family("CCCCCCCC", 3, "mol2", "TGCATGCA", 30);
     for raw in &records2 {
         let mut rec = to_record_buf(raw);
-        rec.data_mut().insert(mi_tag, Value::from(mi_value2));
+        rec.data_mut().insert(mi_tag, Value::from("2"));
         writer.write_alignment_record(&header, &rec).expect("Failed to write record");
     }
 
