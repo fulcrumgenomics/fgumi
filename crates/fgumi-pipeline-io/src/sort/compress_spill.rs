@@ -75,7 +75,6 @@ pub struct CompressSpill {
     /// unlink-after-emit lifetime (correct on the Unix targets). Empty in tests
     /// that hold their own `TempDir`. Held purely for RAII (`Arc`-cloned to each
     /// worker), never read for its value.
-    #[allow(dead_code)]
     temp_dirs: Arc<Vec<TempDir>>,
 }
 

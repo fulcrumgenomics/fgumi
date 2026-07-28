@@ -37,7 +37,6 @@ pub struct SegmentedBuf {
     cur: usize,
 }
 
-#[allow(dead_code)] // Some methods are only exercised from tests for now.
 impl SegmentedBuf {
     /// Create a new buffer with the given initial capacity hint and segment size.
     ///
