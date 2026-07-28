@@ -72,6 +72,7 @@
 //!   - `ac, bc` - Single-strand consensus bases (string)
 //!   - `aq, bq` - Single-strand consensus qualities (string)
 
+use crate::base_builder::TieRule;
 use crate::caller::{
     ConsensusCaller, ConsensusCallingStats, ConsensusOutput,
     RejectionReason as CallerRejectionReason, clamp_combined_error_to_fgbio_short,
@@ -187,6 +188,11 @@ pub struct CodecConsensusOptions {
 
     /// Minimum consensus base quality (output bases below this are masked to N)
     pub min_consensus_base_quality: PhredScore,
+
+    /// How near-ties between the two greatest base likelihoods are resolved.
+    ///
+    /// Forwarded to the single-strand caller; see [`TieRule`].
+    pub tie_rule: TieRule,
 }
 
 impl Default for CodecConsensusOptions {
@@ -207,6 +213,7 @@ impl Default for CodecConsensusOptions {
             produce_per_base_tags: false,
             trim: false,
             min_consensus_base_quality: 0,
+            tie_rule: TieRule::default(),
         }
     }
 }
@@ -393,6 +400,7 @@ impl CodecConsensusCaller {
             min_consensus_base_quality: 0, // MIN - we handle quality masking
             cell_tag: None,
             methylation_mode: crate::MethylationMode::Disabled, // CODEC does not support methylation
+            tie_rule: options.tie_rule,
         };
 
         let ss_caller = VanillaUmiConsensusCaller::new(

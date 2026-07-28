@@ -144,10 +144,17 @@
 //!
 //! ### Ties
 //! If the greatest likelihood is not unique, returns `(N, MIN_PHRED)` to indicate ambiguity.
-//! "Not unique" means within a few ULPs, not bit-for-bit equal: the likelihoods are running
-//! sums, so a separation narrower than summation noise is not evidence. The tolerance is
-//! relative to the magnitude, so it holds at every family size — see `TIE_TOLERANCE_ULPS`.
-//! In practice ties are rare, since quality scores differ between observations.
+//! What counts as "not unique" is selected by `TieRule`, and the default is
+//! `TieRule::FgbioCompat`: fgbio's absolute `f64::EPSILON` comparison, reproduced so fgumi
+//! matches fgbio byte-for-byte. Because that tolerance is absolute it is far below one ULP at
+//! family scale, so a one-ULP separation reads as a definite call.
+//!
+//! `TieRule::UlpRelative` is the alternative: "not unique" means within a few ULPs rather than
+//! bit-for-bit equal, on the grounds that the likelihoods are running sums and a separation
+//! narrower than summation noise is not evidence. That tolerance is relative to the magnitude,
+//! so it holds at every family size — see `TIE_TOLERANCE_ULPS`.
+//!
+//! In practice ties are rare either way, since quality scores differ between observations.
 //!
 //! ### Low Depth
 //! With only 1-2 observations, the consensus quality will be similar to the input qualities.
@@ -395,6 +402,73 @@ fn adjusted_tables(error_rate_post_umi: PhredScore) -> &'static AdjustedProbabil
 /// [`unique_max_index`]).
 const TIE_TOLERANCE_ULPS: u32 = 4;
 
+/// Absolute tolerance fgbio compares likelihood gaps against, precisely `f64::EPSILON`.
+///
+/// Spelled as the literal ratio rather than `f64::EPSILON` so the value is legible next to
+/// [`TIE_TOLERANCE_ULPS`]: the point of [`TieRule::FgbioCompat`] is that this is an
+/// *absolute* constant where ours is relative.
+const FGBIO_TIE_EPSILON: LogProbability = 1.0 / 4_503_599_627_370_496.0;
+
+/// How a near-tie between the two greatest likelihoods is resolved.
+///
+/// The two rules agree on exact ties and on clearly-separated lanes. They differ only on
+/// near-ties — separations of a few ULPs, which are summation-order noise rather than
+/// evidence — and that difference is *not* negligible on real data: on the
+/// `fgumi-benchmarks` corpus it moves 170 records of `idt-cfdna` and 7,827 of `qiaseq-umi`,
+/// and reaches 40+ cells across 9 samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TieRule {
+    /// Treat a separation within `TIE_TOLERANCE_ULPS` as a tie, and no-call it.
+    ///
+    /// Independent of both lane order and likelihood magnitude, so a position resolves the
+    /// same way regardless of the order reads arrive in or how deep the family is. A 2-2 split
+    /// at equal quality genuinely carries no information about which base is right, and this
+    /// reports that — the better rule on the merits, but not the compatible one.
+    UlpRelative,
+
+    /// Reproduce fgbio's `MathUtil.maxWithIndex(requireUniqueMaximum = true)`, defects included.
+    ///
+    /// The default: fgumi is a drop-in replacement for fgbio, so matching its output is the
+    /// contract, and a near-tie is the one place the two rules disagree. It inherits fgbio's
+    /// order and scale dependence, calling a base off one ULP of accumulation noise rather
+    /// than reporting the position as unresolvable. Deterministic in practice because the
+    /// four lanes are always visited in `A,C,G,T` order and a molecule's reads are always
+    /// accumulated in one thread, in file order.
+    #[default]
+    FgbioCompat,
+}
+
+/// A faithful port of fgbio's `MathUtil.maxWithIndex(ds, requireUniqueMaximum = true)`,
+/// returning `None` where fgbio returns a `maxIndex` of `-1`.
+///
+/// Kept structurally identical to the Scala original — running maximum, tie test only in the
+/// `else` branch, `NaN` lanes skipped — so its divergences from [`unique_max_index`] are the
+/// real ones and not artifacts of a paraphrase. fgbio throws when every lane is `NaN`; that
+/// arm is mapped to `None` because a panic is not a comparable outcome.
+fn fgbio_unique_max_index(likelihoods: &[LogProbability; DNA_BASE_COUNT]) -> Option<usize> {
+    let mut max = f64::MIN;
+    let mut max_index: i32 = -1;
+    let mut assigned = false;
+
+    for (index, &value) in likelihoods.iter().enumerate() {
+        if value.is_nan() {
+            continue;
+        }
+        if !assigned || value > max {
+            max = value;
+            max_index = i32::try_from(index).expect("four lanes fit in an i32");
+            assigned = true;
+        } else if (value - max).abs() <= FGBIO_TIE_EPSILON {
+            max_index = -1;
+        }
+    }
+
+    if !assigned || max_index < 0 {
+        return None;
+    }
+    Some(usize::try_from(max_index).expect("checked non-negative above"))
+}
+
 /// Returns the index of the strictly-greatest likelihood, or `None` when that maximum is
 /// tied with another base and the call is therefore ambiguous (a no-call).
 ///
@@ -441,6 +515,17 @@ fn unique_max_index(likelihoods: &[LogProbability; DNA_BASE_COUNT]) -> Option<us
     (tied_lanes == 1).then_some(max_index)
 }
 
+/// Resolve the unique maximum under *rule*.
+fn unique_max_index_with(
+    likelihoods: &[LogProbability; DNA_BASE_COUNT],
+    rule: TieRule,
+) -> Option<usize> {
+    match rule {
+        TieRule::UlpRelative => unique_max_index(likelihoods),
+        TieRule::FgbioCompat => fgbio_unique_max_index(likelihoods),
+    }
+}
+
 /// Builder for calling consensus at a single base position
 ///
 /// Accumulates observations (base + quality) and uses a likelihood model to
@@ -463,6 +548,9 @@ pub struct ConsensusBaseBuilder {
     /// The per-base depth is later clamped to `i16::MAX` only at tag emission, to
     /// match fgbio's `Short` consensus-depth representation.
     observations: [u32; DNA_BASE_COUNT],
+
+    /// How near-ties between the two greatest likelihoods are resolved.
+    tie_rule: TieRule,
 
     /// Pre-computed correct probabilities adjusted for post-UMI errors.
     ///
@@ -707,7 +795,27 @@ impl ConsensusBaseBuilder {
             adjusted_error_per_alt: &tables.error_per_alt,
             ln_error_pre_umi,
             gap_tables: cached_unanimous_gap_tables(error_rate_pre_umi),
+            tie_rule: TieRule::default(),
         }
+    }
+
+    /// Returns the builder with near-ties resolved under *rule* instead of the default.
+    ///
+    /// The default is [`TieRule::FgbioCompat`], so the only reason to call this is to opt *out*
+    /// of byte-parity with fgbio in favour of the order- and scale-independent rule.
+    #[must_use]
+    pub fn with_tie_rule(mut self, rule: TieRule) -> Self {
+        self.tie_rule = rule;
+        self
+    }
+
+    /// Sets how near-ties are resolved, in place.
+    ///
+    /// The `&mut` counterpart of [`ConsensusBaseBuilder::with_tie_rule`], for callers that own a
+    /// long-lived builder. The rule is consulted at [`ConsensusBaseBuilder::call`] time and is
+    /// not touched by [`ConsensusBaseBuilder::reset`], so changing it mid-stream is safe.
+    pub fn set_tie_rule(&mut self, rule: TieRule) {
+        self.tie_rule = rule;
     }
 
     /// Resets the builder to process a new position
@@ -920,7 +1028,7 @@ impl ConsensusBaseBuilder {
         let ln_sum = ln_sum_exp_array(likelihoods);
 
         // Find the maximum likelihood, which must be unique; a tie is a no-call.
-        let Some(max_idx) = unique_max_index(likelihoods) else {
+        let Some(max_idx) = unique_max_index_with(likelihoods, self.tie_rule) else {
             return (NO_CALL_BASE, MIN_PHRED);
         };
         let max_likelihood = likelihoods[max_idx];
@@ -2446,47 +2554,11 @@ mod fgbio_tie_oracle_tests {
     use super::*;
     use rstest::rstest;
 
-    /// fgbio's `MathUtil.epsilon`, transcribed as `1.0 / Math.pow(2, 52)` (`2^52` spelled out
-    /// so the constant stays exact and independent of `f64::EPSILON`, which
-    /// `fgbio_epsilon_is_f64_epsilon` then proves it equals).
-    const FGBIO_EPSILON: f64 = 1.0 / 4_503_599_627_370_496.0;
-
-    /// A faithful port of fgbio's `MathUtil.maxWithIndex(ds, requireUniqueMaximum = true)`,
-    /// returning `None` where fgbio returns a `maxIndex` of `-1`.
-    ///
-    /// Kept structurally identical to the Scala original — running maximum, tie test only in
-    /// the `else` branch, `NaN` lanes skipped — so the divergences below are the real ones and
-    /// not artifacts of a paraphrase. fgbio throws when every lane is `NaN`; that arm is
-    /// mapped to `None` because a panic is not a comparable outcome.
-    fn fgbio_unique_max_index(likelihoods: &[LogProbability; DNA_BASE_COUNT]) -> Option<usize> {
-        let mut max = f64::MIN;
-        let mut max_index: i32 = -1;
-        let mut assigned = false;
-
-        for (index, &value) in likelihoods.iter().enumerate() {
-            if value.is_nan() {
-                continue;
-            }
-            if !assigned || value > max {
-                max = value;
-                max_index = i32::try_from(index).expect("four lanes fit in an i32");
-                assigned = true;
-            } else if (value - max).abs() <= FGBIO_EPSILON {
-                max_index = -1;
-            }
-        }
-
-        if !assigned || max_index < 0 {
-            return None;
-        }
-        Some(usize::try_from(max_index).expect("checked non-negative above"))
-    }
-
     /// The constant fgbio compares against is precisely `f64::EPSILON`, so the "absolute
     /// epsilon" characterisation of fgbio's rule above is exact, not approximate.
     #[test]
     fn fgbio_epsilon_is_f64_epsilon() {
-        assert_eq!(FGBIO_EPSILON.to_bits(), f64::EPSILON.to_bits());
+        assert_eq!(FGBIO_TIE_EPSILON.to_bits(), f64::EPSILON.to_bits());
     }
 
     /// Where a pileup is unambiguous — an exact tie, or lanes separated far beyond either
@@ -2534,7 +2606,7 @@ mod fgbio_tie_oracle_tests {
     fn fgumi_ties_summation_noise_that_fgbio_calls(#[case] magnitude: f64) {
         let ulp = one_ulp(magnitude);
         assert!(
-            ulp > FGBIO_EPSILON,
+            ulp > FGBIO_TIE_EPSILON,
             "precondition: one ULP at {magnitude} exceeds fgbio's epsilon"
         );
 
@@ -2559,7 +2631,7 @@ mod fgbio_tie_oracle_tests {
         let separated = step_away_from_zero(magnitude, TIE_TOLERANCE_ULPS + 1);
         let gap = (magnitude - separated).abs();
         assert!(
-            gap < FGBIO_EPSILON,
+            gap < FGBIO_TIE_EPSILON,
             "precondition: the gap at {magnitude} is inside fgbio's epsilon"
         );
 
@@ -2593,5 +2665,88 @@ mod fgbio_tie_oracle_tests {
             Some(0),
             "fgbio assigns on the first non-NaN lane, even at -inf"
         );
+    }
+}
+
+#[cfg(test)]
+mod tie_rule_tests {
+    use super::*;
+
+    /// The pileup behind the divergence, taken from real benchmark data.
+    ///
+    /// Molecule `library:502` of the `idt-cfdna` panel: four R2 reads whose only disagreement
+    /// is `C,C,T,T`, every observation at Q37, called at the production error rates. The two
+    /// bases carry mathematically identical evidence, so their log-likelihoods differ by
+    /// exactly one ULP of accumulation noise (`-18.424618431273778` vs `-18.424618431273785`)
+    /// — measured, not assumed.
+    fn two_two_split_at_equal_quality(rule: TieRule) -> (u8, PhredScore) {
+        let mut builder = ConsensusBaseBuilder::new(45, 40).with_tie_rule(rule);
+        for (base, qual) in [(b'C', 37), (b'C', 37), (b'T', 37), (b'T', 37)] {
+            builder.add(base, qual);
+        }
+        builder.call()
+    }
+
+    /// The default must keep no-calling one-ULP separations; that is the point of the rule.
+    #[test]
+    fn ulp_relative_no_calls_the_two_two_split() {
+        let (base, qual) = two_two_split_at_equal_quality(TieRule::UlpRelative);
+        assert_eq!(base, NO_CALL_BASE, "one ULP is noise, not evidence");
+        assert_eq!(qual, MIN_PHRED);
+    }
+
+    /// Compat mode must reproduce fgbio 4.0.0 on the same pileup: `T` at Q3.
+    ///
+    /// Verified against fgbio 4.0.0 output for this molecule, which emits the
+    /// reverse-complement `A` at Q3 with `cE` 0.00403226 (0.5 expected errors over 124
+    /// bases — a coin flip, which is what a 2-2 split is).
+    #[test]
+    fn fgbio_compat_calls_the_two_two_split() {
+        let (base, qual) = two_two_split_at_equal_quality(TieRule::FgbioCompat);
+        assert_eq!(base, b'T', "fgbio resolves this to T");
+        assert_eq!(qual, 3, "fgbio scores this coin-flip position Q3");
+    }
+
+    /// Both rules must still no-call a bit-exact tie; compat mode is not "always call".
+    #[test]
+    fn both_rules_no_call_an_exact_tie() {
+        for rule in [TieRule::UlpRelative, TieRule::FgbioCompat] {
+            let mut builder = ConsensusBaseBuilder::new(MAX_PHRED, MAX_PHRED).with_tie_rule(rule);
+            builder.add(b'A', 20);
+            builder.add(b'C', 20);
+            let (base, _) = builder.call();
+            assert_eq!(base, NO_CALL_BASE, "{rule:?} must no-call an exact tie");
+        }
+    }
+
+    /// `set_tie_rule` must move the same lever `with_tie_rule` does.
+    ///
+    /// It is the path `VanillaUmiConsensusCaller::set_tie_rule` uses to retune a live builder,
+    /// so a no-op here would silently strand `fgumi duplex --tie-rule` on the default.
+    #[test]
+    fn set_tie_rule_matches_with_tie_rule() {
+        let mut builder = ConsensusBaseBuilder::new(45, 40).with_tie_rule(TieRule::FgbioCompat);
+        builder.set_tie_rule(TieRule::UlpRelative);
+        for (base, qual) in [(b'C', 37), (b'C', 37), (b'T', 37), (b'T', 37)] {
+            builder.add(base, qual);
+        }
+        let (base, qual) = builder.call();
+
+        assert_eq!(base, NO_CALL_BASE, "set_tie_rule must select the ULP-relative rule");
+        assert_eq!(qual, MIN_PHRED);
+    }
+
+    /// Both rules must agree wherever the lanes are clearly separated.
+    #[test]
+    fn both_rules_agree_on_a_clear_winner() {
+        for rule in [TieRule::UlpRelative, TieRule::FgbioCompat] {
+            let mut builder = ConsensusBaseBuilder::new(45, 40).with_tie_rule(rule);
+            for _ in 0..5 {
+                builder.add(b'A', 37);
+            }
+            builder.add(b'C', 10);
+            let (base, _) = builder.call();
+            assert_eq!(base, b'A', "{rule:?} must call a clearly-separated maximum");
+        }
     }
 }

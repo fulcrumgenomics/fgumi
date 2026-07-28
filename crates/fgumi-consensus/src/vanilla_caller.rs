@@ -4,7 +4,7 @@
 //! reads from the same source molecule (same UMI/MI tag) and calls a consensus
 //! sequence using a likelihood-based model.
 
-use crate::base_builder::ConsensusBaseBuilder;
+use crate::base_builder::{ConsensusBaseBuilder, TieRule};
 use crate::caller::{
     ConsensusCaller, ConsensusCallingStats, ConsensusOutput, RejectionReason,
     consensus_read_name_too_long_context, write_consensus_read_name,
@@ -322,6 +322,13 @@ pub struct VanillaUmiConsensusOptions {
     /// When enabled, C→T conversions at reference cytosine positions are tracked
     /// and MM/ML methylation tags are emitted on consensus reads.
     pub methylation_mode: crate::MethylationMode,
+
+    /// How near-ties between the two greatest base likelihoods are resolved.
+    ///
+    /// Defaults to [`TieRule::FgbioCompat`], because matching fgbio byte-for-byte is the
+    /// contract; set [`TieRule::UlpRelative`] to opt into the order- and scale-independent
+    /// rule instead.
+    pub tie_rule: TieRule,
 }
 
 impl Default for VanillaUmiConsensusOptions {
@@ -339,6 +346,7 @@ impl Default for VanillaUmiConsensusOptions {
             min_consensus_base_quality: 40, // Match fgbio default
             cell_tag: None,
             methylation_mode: crate::MethylationMode::Disabled,
+            tie_rule: TieRule::default(),
         }
     }
 }
@@ -430,7 +438,8 @@ impl VanillaUmiConsensusCaller {
         track_rejects: bool,
     ) -> Self {
         let consensus_builder =
-            ConsensusBaseBuilder::new(options.error_rate_pre_umi, options.error_rate_post_umi);
+            ConsensusBaseBuilder::new(options.error_rate_pre_umi, options.error_rate_post_umi)
+                .with_tie_rule(options.tie_rule);
 
         // Create RNG - either seeded or from OS entropy
         let rng = if let Some(seed) = options.seed {
@@ -499,6 +508,15 @@ impl VanillaUmiConsensusCaller {
         // Use the corrected implementations from phred.rs
         let ln_result = ln_error_prob_two_trials(ln_prob_one, ln_prob_two);
         ln_prob_to_phred(ln_result)
+    }
+
+    /// Sets how near-ties between the two greatest base likelihoods are resolved.
+    ///
+    /// Updates both the retained options and the live base builder, so it takes effect on the
+    /// next call regardless of how far through a stream the caller is. See [`TieRule`].
+    pub fn set_tie_rule(&mut self, rule: TieRule) {
+        self.options.tie_rule = rule;
+        self.consensus_builder.set_tie_rule(rule);
     }
 
     /// Sets the reference genome and contig names for EM-Seq methylation annotation.

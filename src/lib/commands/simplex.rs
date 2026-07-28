@@ -371,6 +371,7 @@ impl Command for Simplex {
             min_consensus_base_quality: self.consensus.min_consensus_base_quality,
             cell_tag: Some(cell_tag),
             methylation_mode,
+            tie_rule: self.consensus.tie_rule.into(),
         };
 
         // Create a single-threaded caller for stats collection
@@ -586,6 +587,7 @@ impl Simplex {
             min_consensus_base_quality,
             cell_tag: Some(cell_tag),
             methylation_mode,
+            tie_rule: self.consensus.tie_rule.into(),
         };
 
         // Rejects (`--rejects`) flow through the unified pipeline's first-class
