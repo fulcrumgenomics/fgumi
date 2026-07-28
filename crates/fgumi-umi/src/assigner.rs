@@ -1884,12 +1884,27 @@ impl UmiAssigner for PairedUmiAssigner {
             assert!((umi.split('-').count() == 2), "UMI {umi} is not a paired UMI");
         }
 
+        // Work on uppercased UMIs so counting, matching, tie-break, and strand assignment are
+        // all case-insensitive. Unlike the single-UMI adjacency tie-break (deliberately RAW /
+        // case-sensitive per S7-002 / FU-004), the parallel paired assigner
+        // (`ParallelPairedAssigner::canonicalize`) already uppercases, so its node identity is
+        // case-insensitive; the sequential paired path MUST fold case too, or `group`/`dedup
+        // --threads 1` (sequential) and `--threads N` (parallel) group mixed-case paired UMIs —
+        // which the CLI does NOT pre-uppercase — differently. Folding here converges the two
+        // paired paths on the case dimension. NOTE: this is an intentional DIVERGENCE from
+        // fgbio, whose paired *grouping* comparator (`AdjacencyUmiAssigner.matches`,
+        // `GroupReadsByUmi.scala:248-256`) is case-SENSITIVE — only `countMismatches` (strand
+        // assignment / the edit strategy) folds case. fgumi opts for case-insensitive paired
+        // grouping for robustness and sequential/parallel consistency; it is a no-op for the
+        // uppercase UMIs the CLI emits, and only differs from fgbio on mixed-case paired input.
+        // (The reverse-orientation adjacency-matching divergence between the two paired paths is a
+        // separate, still-open follow-up — see the NOTE in `parallel_assigner.rs`.)
+        let upper_umis: Vec<Umi> = raw_umis.iter().map(|umi| umi.to_uppercase()).collect();
+
         // Count with A-B and B-A combined
-        let mut umi_counts = Self::count_paired(raw_umis);
-        // Tie-break equal-count canonical UMIs by the case-SENSITIVE canonical string
-        // (`canonicalize_paired` normalizes orientation only, not case), matching fgbio's
-        // raw ordering — consistent with the single-UMI raw tie-break in
-        // `AdjacencyUmiAssigner::assign` (S7-002/FU-004).
+        let mut umi_counts = Self::count_paired(&upper_umis);
+        // Tie-break equal-count canonical UMIs by the (now uppercase) canonical string so the
+        // ordering is case-insensitive, agreeing with the parallel paired assigner.
         umi_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         if umi_counts.len() == 1 {
@@ -1897,7 +1912,7 @@ impl UmiAssigner for PairedUmiAssigner {
             let ab = MoleculeId::PairedA(id);
             let ba = MoleculeId::PairedB(id);
 
-            return raw_umis
+            return upper_umis
                 .iter()
                 .map(|umi| {
                     let reversed = Self::reverse(umi)
@@ -1950,16 +1965,24 @@ impl UmiAssigner for PairedUmiAssigner {
             }
         }
 
-        // Build result Vec indexed by input position
-        raw_umis.iter().map(|umi| umi_to_id.get(umi).copied().unwrap_or(MoleculeId::None)).collect()
+        // Build result Vec indexed by input position (keyed on the uppercased UMIs the graph
+        // was built from).
+        upper_umis
+            .iter()
+            .map(|umi| umi_to_id.get(umi).copied().unwrap_or(MoleculeId::None))
+            .collect()
     }
 
     fn is_same_umi(&self, a: &str, b: &str) -> bool {
+        // Fold case so this helper matches `assign()` (which works on uppercased UMIs) and the
+        // parallel paired canonicalizer; mixed-case callers must not disagree.
+        let a = a.to_uppercase();
+        let b = b.to_uppercase();
         if a == b {
             return true;
         }
         // Check if A-B equals B-A
-        if let (Ok((a1, a2)), Ok((b1, b2))) = (Self::split(a), Self::split(b)) {
+        if let (Ok((a1, a2)), Ok((b1, b2))) = (Self::split(&a), Self::split(&b)) {
             a1 == b2 && a2 == b1
         } else {
             false
@@ -1967,7 +1990,10 @@ impl UmiAssigner for PairedUmiAssigner {
     }
 
     fn canonicalize(&self, umi: &str) -> String {
-        Self::canonicalize_paired(umi).unwrap_or_else(|_| umi.to_string())
+        // Fold case before canonicalizing so mixed-case spellings collapse to the same
+        // uppercase canonical form, matching `assign()` and the parallel paired assigner.
+        let upper = umi.to_uppercase();
+        Self::canonicalize_paired(&upper).unwrap_or(upper)
     }
 
     fn split_templates_by_pair_orientation(&self) -> bool {
@@ -2286,9 +2312,10 @@ mod tests {
     #[test]
     fn test_simple_error_assigner_is_case_insensitive() {
         // Audit P2: the sequential edit assigner must fold case so it agrees with the
-        // parallel edit assigner (which uppercases before encoding) and with fgbio (which
-        // uppercases every UMI before assignment). Different spellings of the same UMI must
-        // collapse into a single molecule even at zero edits.
+        // parallel edit assigner (which uppercases before encoding) and with fgbio's edit
+        // assigner (which compares case-insensitively via `Sequences.countMismatches`).
+        // Different spellings of the same UMI must collapse into a single molecule even at
+        // zero edits.
         let assigner = SimpleErrorUmiAssigner::new(0);
         let umis = vec!["ACGTAC".to_string(), "acgtac".to_string(), "AcGtAc".to_string()];
         let assignments = assigner.assign(&umis);
@@ -2652,6 +2679,31 @@ mod tests {
 
         // Different UMI
         assert!(!assigner.is_same_umi("ACGT-TGCA", "AAAA-TTTT"));
+    }
+
+    #[test]
+    fn test_paired_helpers_are_case_insensitive() {
+        // `assign()` folds case (see `upper_umis`); the trait helpers that make up the rest of
+        // the paired assigner's public, case-insensitive contract must agree, so that mixed-case
+        // callers reaching these helpers directly cannot disagree with `assign()` or the parallel
+        // paired canonicalizer (which uppercases). This is the paired analogue of the edit
+        // assigner's case fold (P2). NOTE: unlike the edit assigner — whose case-insensitivity
+        // matches fgbio's `countMismatches` — fgbio's paired *grouping* (`AdjacencyUmiAssigner.matches`)
+        // is case-SENSITIVE, so fgumi's case-insensitive paired grouping is an intentional divergence
+        // (robustness + sequential/parallel consistency), a no-op for conventional uppercase UMIs.
+        let assigner = PairedUmiAssigner::new(1);
+
+        // is_same_umi: lower vs upper spelling of the same orientation.
+        assert!(assigner.is_same_umi("acgt-tgca", "ACGT-TGCA"));
+        // is_same_umi: lower vs upper spelling of the reversed orientation.
+        assert!(assigner.is_same_umi("acgt-tgca", "TGCA-ACGT"));
+        // is_same_umi: still distinguishes genuinely different UMIs regardless of case.
+        assert!(!assigner.is_same_umi("acgt-tgca", "aaaa-tttt"));
+
+        // canonicalize: case spelling does not change the canonical form, and reversed spellings
+        // canonicalize to the same uppercase string.
+        assert_eq!(assigner.canonicalize("acgt-tgca"), "ACGT-TGCA");
+        assert_eq!(assigner.canonicalize("tgca-ACGT"), assigner.canonicalize("ACGT-TGCA"));
     }
 
     #[test]
