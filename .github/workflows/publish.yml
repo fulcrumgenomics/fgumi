@@ -142,8 +142,18 @@ jobs:
           ORDER_ERRORS=""
           for i in "${!CRATES[@]}"; do
             crate="${CRATES[$i]}"
+            # Dev-dependencies with no version requirement (path-only, `req == "*"`)
+            # are stripped from the manifest cargo uploads, so they impose no
+            # ordering constraint.  This is what makes the root crate's self
+            # dev-dependency -- `fgumi = { path = ".", features = ["test-utils"] }`,
+            # the only way to enable `test-utils` for the integration test targets
+            # -- publishable: without this filter it reads as "fgumi depends on
+            # fgumi", which no ordering can satisfy.  Dev-dependencies that do
+            # carry a version (e.g. `fgumi-raw-bam = { workspace = true, ... }`)
+            # survive packaging and must still be published first.
             DEPS=$(echo "$META" | jq -r --arg c "$crate" --argjson ws "$WS_JSON" '
-              .packages[] | select(.name == $c) | .dependencies[].name
+              .packages[] | select(.name == $c) | .dependencies[]
+              | select(.kind != "dev" or .req != "*") | .name
               | select(. as $d | $ws | index($d))' | sort -u)
             for dep in $DEPS; do
               j=$(index_of "$dep")
