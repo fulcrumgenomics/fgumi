@@ -180,6 +180,9 @@ EXAMPLES:
   # Reserve extra memory for bwa mem running in a pipeline
   fgumi sort -i input.bam -o sorted.bam --memory-reserve 12GiB --threads 4
 
+  # Cede cores to the aligner during ingest, but keep the merge wide
+  bwa mem -t 32 ref.fa r1.fq r2.fq | fgumi sort -i - -o sorted.bam -@ 8 --sort-threads 4
+
   # Allow more spilled runs before consolidating (fewer consolidation passes)
   fgumi sort -i input.bam -o sorted.bam --order coordinate --max-temp-files 512
 
@@ -216,7 +219,7 @@ pub struct Sort {
     /// Queryname sort supports sub-sort specifiers:
     ///   `queryname`                  Lexicographic byte ordering (default, fast)
     ///   `queryname::lexicographic`   Explicit lexicographic ordering (alias: `queryname::lex`)
-    ///   `queryname::lexicographical` Alias; fgumi emits `queryname:lexicographical` in `@HD` SS
+    ///   `queryname::lexicographical` Alias; written as `queryname:lexicographical` in `@HD` SS
     ///   `queryname::natural`         Natural numeric ordering (samtools-compatible)
     #[arg(long = "order", default_value = "template-coordinate", value_parser = SortOrderArg::parse)]
     pub order: SortOrderArg,
@@ -291,9 +294,10 @@ pub struct Sort {
     /// Number of threads for the sort phase (accumulate, sort, spill).
     ///
     /// Defaults to `--threads`. Lower this to cede cores to an upstream
-    /// producer while keeping the merge wide -- e.g. in
-    /// `bwa mem -t 32 ... | fgumi sort -@ 8 --sort-threads 4`, ingest competes
-    /// with the aligner but the merge does not.
+    /// producer while keeping the merge wide -- with `-@ 8 --sort-threads 4`,
+    /// ingest contends with the producer over only 4 threads, while the merge
+    /// still uses 8 because it cannot start until the input is exhausted, by
+    /// which point the producer has finished writing.
     ///
     /// This only changes scheduling; the output is byte-identical.
     #[arg(long = "sort-threads")]
@@ -703,8 +707,69 @@ mod tests {
     // Memory-budget helpers moved to `commands::common`; import the `pub(crate)`
     // items these tests exercise that are not re-exported through `super::*`.
     use crate::commands::common::{MIN_MEMORY_PER_THREAD, detect_total_memory, resolve_reserve};
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use rstest::rstest;
+
+    // ========================================================================
+    // Help-text tests
+    // ========================================================================
+
+    /// Returns true if `help` names the `fgumi` binary as a standalone token.
+    ///
+    /// Splits on every character that cannot appear inside a Rust identifier, so
+    /// a bare `fgumi`, a trailing `fgumi`, and punctuated forms (`` `fgumi` ``,
+    /// `fgumi.`, `fgumi-sort`) all match, while `fgumi` embedded in a longer word
+    /// (`fgumidocs`) and identifier-shaped mentions (`fgumi_sort`) do not.
+    fn names_the_binary(help: &str) -> bool {
+        help.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').any(|token| token == "fgumi")
+    }
+
+    #[rstest]
+    #[case::bare_invocation("run fgumi sort to order records", true)]
+    #[case::trailing_token("this flag mirrors fgumi", true)]
+    #[case::followed_by_period("see fgumi.", true)]
+    #[case::backticked("see `fgumi` for details", true)]
+    #[case::hyphenated("see fgumi-sort", true)]
+    #[case::embedded_in_word("see the fgumidocs site", false)]
+    #[case::suffix_of_word("see myfgumi", false)]
+    #[case::rust_identifier("handled by fgumi_sort::run", false)]
+    #[case::no_mention("Sort records by template coordinate", false)]
+    fn test_names_the_binary(#[case] help: &str, #[case] expected: bool) {
+        assert_eq!(names_the_binary(help), expected, "help was: {help}");
+    }
+
+    /// `Sort` is `#[command(flatten)]`-ed into other binaries, so its
+    /// per-argument help renders under a program name that is not `fgumi` — a
+    /// concrete `fgumi ...` invocation there tells those users to run a command
+    /// they do not have. Per-argument help must therefore describe the flag
+    /// without naming the binary.
+    ///
+    /// The command-level `long_about` is deliberately exempt, and is not walked
+    /// here: a wrapper replaces it wholesale, so its EXAMPLES block is the right
+    /// home for worked `fgumi sort` invocations.
+    #[test]
+    fn test_arg_help_does_not_name_the_binary() {
+        let command = Sort::command();
+
+        // Guard against a vacuous pass: an empty (or trivially short) arg walk
+        // would satisfy the loop below without checking anything.
+        let arg_count = command.get_arguments().count();
+        assert!(arg_count > 10, "expected Sort to expose its flags, walked only {arg_count}");
+
+        for arg in command.get_arguments() {
+            let help = format!(
+                "{} {}",
+                arg.get_help().map(ToString::to_string).unwrap_or_default(),
+                arg.get_long_help().map(ToString::to_string).unwrap_or_default(),
+            );
+            assert!(
+                !names_the_binary(&help),
+                "help for `--{}` names the `fgumi` binary; describe the flag instead and put \
+                 worked invocations in the command-level EXAMPLES block. Help was: {help}",
+                arg.get_id()
+            );
+        }
+    }
 
     // ========================================================================
     // Temp-dir resolution tests
