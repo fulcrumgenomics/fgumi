@@ -123,6 +123,23 @@ fn find_u8_array_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<Vec<u8>> {
     (arr.elem_type == b'C').then(|| arr.data.to_vec())
 }
 
+/// Advance `i` by `n` bytes, or `None` if that would run past `len`.
+///
+/// Every payload step in [`find_i16_array_tag_in_aux`] goes through this so a
+/// truncated aux block returns `None` instead of panicking on an out-of-range
+/// index.
+fn advance_within(i: usize, n: usize, len: usize) -> Option<usize> {
+    let end = i.checked_add(n)?;
+    (end <= len).then_some(end)
+}
+
+/// Scan an aux block for a `B:s` (int16 array) tag.
+///
+/// Fails closed on malformed input: a truncated scalar, an unterminated `Z`/`H`
+/// string, a `B` header or payload that runs past the end of `aux`, an unknown
+/// `B` subtype (whose element width is unknowable, so the cursor cannot be
+/// advanced safely), or an unknown type code all yield `None` rather than
+/// indexing out of bounds.
 fn find_i16_array_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<Vec<i16>> {
     let mut i = 0;
     while i + 3 <= aux.len() {
@@ -131,42 +148,43 @@ fn find_i16_array_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<Vec<i16>> {
         i += 3;
         match typ {
             b'B' => {
+                // Subtype byte + 4-byte little-endian element count.
+                let header_end = advance_within(i, 5, aux.len())?;
                 let sub = aux[i];
-                i += 1;
                 let count =
-                    u32::from_le_bytes([aux[i], aux[i + 1], aux[i + 2], aux[i + 3]]) as usize;
-                i += 4;
-                if t == tag && sub == b's' {
-                    let mut vals = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        vals.push(i16::from_le_bytes([aux[i], aux[i + 1]]));
-                        i += 2;
-                    }
-                    return Some(vals);
-                }
+                    u32::from_le_bytes([aux[i + 1], aux[i + 2], aux[i + 3], aux[i + 4]]) as usize;
+                i = header_end;
+
                 let elem_size = match sub {
+                    b'c' | b'C' => 1,
                     b's' | b'S' => 2,
                     b'i' | b'I' | b'f' => 4,
-                    _ => 1,
+                    // Not a BAM array subtype: the payload width is unknown, so
+                    // skipping it would resync the cursor onto garbage.
+                    _ => return None,
                 };
-                i += count * elem_size;
-            }
-            b'c' => {
-                i += 1;
-            }
-            b's' => {
-                i += 2;
-            }
-            b'i' | b'f' => {
-                i += 4;
-            }
-            b'Z' => {
-                while i < aux.len() && aux[i] != 0 {
-                    i += 1;
+                let payload_end = advance_within(i, count.checked_mul(elem_size)?, aux.len())?;
+
+                if t == tag && sub == b's' {
+                    return Some(
+                        aux[i..payload_end]
+                            .chunks_exact(2)
+                            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                            .collect(),
+                    );
                 }
-                i += 1;
+                i = payload_end;
             }
-            _ => break,
+            b'A' | b'c' | b'C' => i = advance_within(i, 1, aux.len())?,
+            b's' | b'S' => i = advance_within(i, 2, aux.len())?,
+            b'i' | b'I' | b'f' => i = advance_within(i, 4, aux.len())?,
+            b'Z' | b'H' => {
+                // NUL-terminated; a missing terminator is malformed, not an
+                // implicit end-of-block.
+                let nul = aux.get(i..)?.iter().position(|&b| b == 0)?;
+                i = advance_within(i, nul + 1, aux.len())?;
+            }
+            _ => return None,
         }
     }
     None
@@ -372,4 +390,99 @@ pub fn make_b_uint32_array_tag(tag: [u8; 2], values: &[u32]) -> Vec<u8> {
         u32::try_from(values.len()).expect("array length must fit in u32"),
         &bytes,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use rstest::rstest;
+
+    /// A well-formed `B:s` array is still found after the bounds hardening.
+    #[test]
+    fn finds_a_well_formed_i16_array() {
+        // MI:i:7 then CD:B:s,[1,2]
+        let mut aux = vec![b'M', b'I', b'i'];
+        aux.extend_from_slice(&7i32.to_le_bytes());
+        aux.extend_from_slice(b"CDBs");
+        aux.extend_from_slice(&2u32.to_le_bytes());
+        aux.extend_from_slice(&1i16.to_le_bytes());
+        aux.extend_from_slice(&2i16.to_le_bytes());
+
+        assert_eq!(find_i16_array_tag_in_aux(&aux, [b'C', b'D']), Some(vec![1, 2]));
+        assert_eq!(find_i16_array_tag_in_aux(&aux, [b'X', b'X']), None);
+    }
+
+    /// Malformed aux data must return `None`, never panic.
+    ///
+    /// The scanner walks caller-supplied bytes, so every payload step has to be
+    /// bounds-checked; before hardening each of these indexed past the end of the
+    /// slice and panicked.
+    #[rstest]
+    #[case::truncated_b_header(vec![b'C', b'D', b'B'])]
+    #[case::truncated_b_count(vec![b'C', b'D', b'B', b's', 0x02, 0x00])]
+    #[case::b_payload_shorter_than_count({
+        let mut v = vec![b'C', b'D', b'B', b's'];
+        v.extend_from_slice(&9u32.to_le_bytes()); // claims 9 elements
+        v.extend_from_slice(&1i16.to_le_bytes()); // supplies 1
+        v
+    })]
+    #[case::b_count_overflows_usize({
+        let mut v = vec![b'C', b'D', b'B', b'i'];
+        v.extend_from_slice(&u32::MAX.to_le_bytes());
+        v
+    })]
+    #[case::unknown_b_subtype({
+        let mut v = vec![b'C', b'D', b'B', b'?'];
+        v.extend_from_slice(&1u32.to_le_bytes());
+        v.push(0);
+        v
+    })]
+    #[case::truncated_scalar(vec![b'N', b'M', b'i', 0x01, 0x02])]
+    #[case::unterminated_z_string(vec![b'R', b'X', b'Z', b'A', b'C', b'G'])]
+    #[case::unknown_type_code(vec![b'Z', b'Z', b'?', 0x00])]
+    fn malformed_aux_returns_none_instead_of_panicking(#[case] aux: Vec<u8>) {
+        assert_eq!(find_i16_array_tag_in_aux(&aux, [b'C', b'D']), None);
+    }
+
+    proptest! {
+        /// The "fail closed, never read past the buffer" contract, over arbitrary bytes.
+        ///
+        /// The case table above pins the truncation shapes worth naming; this covers the
+        /// ones nobody thought of. The scanner walks caller-supplied bytes with a cursor
+        /// it advances by type-dependent widths, which is exactly the shape where a
+        /// hand-picked corpus misses a case — so the property is simply that no input
+        /// panics, and that a returned array is self-consistent.
+        #[test]
+        fn arbitrary_aux_bytes_never_panic(aux in proptest::collection::vec(any::<u8>(), 0..256)) {
+            // Must not panic for any tag, present or absent.
+            let found = find_i16_array_tag_in_aux(&aux, [b'C', b'D']);
+            let _ = find_i16_array_tag_in_aux(&aux, [b'M', b'I']);
+
+            // Any array we do return must fit inside the block it was parsed from:
+            // two bytes per element cannot exceed the input length.
+            if let Some(vals) = found {
+                prop_assert!(
+                    vals.len() * 2 <= aux.len(),
+                    "returned {} i16 values from a {}-byte aux block",
+                    vals.len(),
+                    aux.len(),
+                );
+            }
+        }
+
+        /// A well-formed `B:s` array is always recovered exactly, whatever the values.
+        ///
+        /// Guards the hardening against the opposite failure: bounds checks that are too
+        /// strict and start rejecting valid input.
+        #[test]
+        fn well_formed_i16_arrays_round_trip(vals in proptest::collection::vec(any::<i16>(), 0..64)) {
+            let mut aux: Vec<u8> = vec![b'C', b'D', b'B', b's'];
+            aux.extend_from_slice(&u32::try_from(vals.len()).unwrap().to_le_bytes());
+            for v in &vals {
+                aux.extend_from_slice(&v.to_le_bytes());
+            }
+            prop_assert_eq!(find_i16_array_tag_in_aux(&aux, [b'C', b'D']), Some(vals));
+        }
+    }
 }
