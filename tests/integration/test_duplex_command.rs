@@ -6,6 +6,7 @@
 //! 3. Rejected reads output
 
 use clap::Parser;
+use fgumi_dna::reverse_complement;
 use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::duplex::Duplex;
 use fgumi_lib::sam::SamTag;
@@ -17,6 +18,7 @@ use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
+use crate::helpers::assertions::parse_stats_kv_usize;
 use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
 
 /// Create a paired-end read pair for duplex consensus testing.
@@ -472,4 +474,115 @@ fn test_duplex_command_with_stats() {
     .expect("failed to parse duplex args");
     cmd.execute("fgumi duplex").expect("Duplex command with stats failed");
     assert!(stats_path.exists(), "Stats file not created");
+}
+
+/// Consensus-unify regression: `duplex` with `--threads` unset must produce output
+/// **identical** to `--threads 1` — same records, same output header (`@HD SO`/`GO`,
+/// collapsed `@RG`, `@CO`), and same `--stats` file (vertical fgbio-KV layout +
+/// `consensus_reads` value). Before the fold, single-threaded duplex used a divergent
+/// header (`add_pg_record(input)`, preserving input `@RG`/sort order) and a horizontal
+/// stats layout with a locally-counted `consensus_reads`; both paths now route through
+/// the chain, so single-threaded output equals multi-threaded exactly.
+#[test]
+fn duplex_no_threads_matches_threads_1() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let molecule = create_duplex_molecule("1", "ACGTACGT", 30, 100, 3);
+    create_duplex_bam(&input_bam, vec![molecule]);
+
+    let run = |out: &Path, stats: &Path, threads: Option<&str>| {
+        let mut args: Vec<String> = vec![
+            "duplex".into(),
+            "--input".into(),
+            input_bam.to_str().unwrap().into(),
+            "--output".into(),
+            out.to_str().unwrap().into(),
+            "--stats".into(),
+            stats.to_str().unwrap().into(),
+            "--min-reads".into(),
+            "1".into(),
+            "--compression-level".into(),
+            "1".into(),
+        ];
+        if let Some(t) = threads {
+            args.push("--threads".into());
+            args.push(t.into());
+        }
+        Duplex::try_parse_from(args).expect("parse").execute("fgumi duplex").expect("duplex");
+    };
+    let out_none = temp_dir.path().join("none.bam");
+    let out_t1 = temp_dir.path().join("t1.bam");
+    let stats_none = temp_dir.path().join("none.stats.txt");
+    let stats_t1 = temp_dir.path().join("t1.stats.txt");
+    run(&out_none, &stats_none, None);
+    run(&out_t1, &stats_t1, Some("1"));
+
+    // Read the output header and records from each BAM.
+    let read = |p: &Path| {
+        let mut r = bam::io::Reader::new(fs::File::open(p).unwrap());
+        let h = r.read_header().unwrap();
+        let recs: Vec<RecordBuf> = r.record_bufs(&h).map(|x| x.unwrap()).collect();
+        (h, recs)
+    };
+    let (h_none, recs_none) = read(&out_none);
+    let (h_t1, recs_t1) = read(&out_t1);
+
+    assert_eq!(recs_none, recs_t1, "duplex unset must match --threads 1 (records)");
+    // The output header (sort order, collapsed read group, comment) was the primary
+    // single-vs-multi divergence before the fold.
+    assert_eq!(h_none, h_t1, "duplex unset must match --threads 1 (output header)");
+    // The `--stats` file layout AND the `consensus_reads` value must also match.
+    assert_eq!(
+        fs::read_to_string(&stats_none).unwrap(),
+        fs::read_to_string(&stats_t1).unwrap(),
+        "duplex unset must match --threads 1 (--stats file)"
+    );
+
+    // --- Independent oracle (NOT a snapshot) -------------------------------
+    // The parity asserts above only prove the two --threads paths AGREE; a
+    // shared bug in the folded chain would corrupt BOTH identically and still
+    // pass. Derive the expected output from the input and pin it against
+    // `recs_none` (the --threads-unset path PR 549 folds onto the chain).
+    //
+    // Input: one clean duplex molecule — 3 /A pairs + 3 /B pairs, all reads
+    // error-free with SEQ `ACGTACGT` (R1 and R2 share the sequence), with
+    // `--min-reads 1`. One duplex molecule → one paired-end consensus template
+    // → 2 consensus records (R1 + R2). The consensus of identical error-free
+    // reads is the input template, so both R1 and R2 SEQ equal `ACGTACGT`.
+    // Consensus reads are emitted unmapped in read (forward) orientation, so
+    // neither record is reverse-complemented; we still revcomp defensively for
+    // any reverse-strand record.
+    let expected_consensus_reads: usize = 2; // one molecule → R1 + R2
+    assert_eq!(
+        recs_none.len(),
+        expected_consensus_reads,
+        "one clean duplex molecule → paired R1+R2 consensus",
+    );
+    let r1 = recs_none.iter().find(|r| r.flags().is_first_segment()).expect("R1 consensus present");
+    let r2 = recs_none.iter().find(|r| r.flags().is_last_segment()).expect("R2 consensus present");
+    // The two `find`s must land on *different* records: if the chain emitted two
+    // records each flagged FIRST_SEGMENT-and-LAST_SEGMENT, both lookups would
+    // return `recs_none[0]` and the SEQ loop below would happily check the same
+    // record twice while the stated "R1 + R2" contract was violated.
+    assert!(
+        r1.flags().is_segmented() && r2.flags().is_segmented(),
+        "duplex consensus records must be flagged as paired",
+    );
+    assert!(!r1.flags().is_last_segment(), "R1 consensus must not also be the last segment");
+    assert!(!r2.flags().is_first_segment(), "R2 consensus must not also be the first segment");
+    for (label, rec) in [("R1", r1), ("R2", r2)] {
+        let seq = rec.sequence().as_ref().to_vec();
+        let forward =
+            if rec.flags().is_reverse_complemented() { reverse_complement(&seq) } else { seq };
+        assert_eq!(
+            forward,
+            b"ACGTACGT".to_vec(),
+            "duplex {label} consensus SEQ equals the input template (forward-oriented)",
+        );
+    }
+    // Second independent oracle: the duplex --stats `consensus_reads_emitted`
+    // counts consensus *templates* (pairs), not BAM records — one molecule → 1
+    // (the two R1/R2 records above share it). Vertical KV layout.
+    let emitted = parse_stats_kv_usize(&stats_none, "consensus_reads_emitted");
+    assert_eq!(emitted, 1, "one duplex molecule → one emitted consensus template in --stats");
 }

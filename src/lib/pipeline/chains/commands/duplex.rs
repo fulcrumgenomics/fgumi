@@ -13,8 +13,9 @@
 //! different consensus caller, a record filter, and an MI-tag transform that
 //! strips `/A`/`/B` suffixes.
 //!
-//! The single-threaded fast path (`--threads` unset, BAM-only) is **not**
-//! migrated here — it stays inline in `Duplex::execute`.
+//! This is the sole standalone execution path — `Duplex::execute` always routes
+//! here, and `--threads` unset resolves to a one-worker chain (no separate
+//! single-threaded path).
 
 use std::io;
 use std::sync::Arc;
@@ -478,8 +479,8 @@ pub(crate) fn build_duplex_consensus_step_kept_only(
 /// [`ChainBuilder`]'s `add_duplex` method in
 /// [`crate::pipeline::chains::builder`].
 ///
-/// The single-threaded fast path (`--threads` unset, BAM-only) is **not**
-/// migrated here — it stays inline in `Duplex::execute`.
+/// This is the sole standalone execution path — `Duplex::execute` always routes
+/// here, and `--threads` unset resolves to a one-worker chain.
 ///
 /// # Errors
 ///

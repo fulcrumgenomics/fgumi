@@ -351,37 +351,68 @@ fn test_simplex_single_threaded_reads_stdin_once() {
     compare_bam_records(&output_from_file, &output_from_pipe);
 }
 
-/// SAM (non-BGZF) input to the single-threaded codec/simplex/duplex paths must
-/// fail at the header read with a `--threads` hint — those paths are BAM-only,
-/// and the multi-threaded path is the SAM-capable one. Guards the `with_context`
-/// message that replaced the removed SAM pre-sniff (codec/simplex) and the
-/// matching hint added to duplex.
+/// Build an input BAM that `cmd` will actually produce consensus output from.
 ///
-/// Each single-threaded consensus command must reject SAM input with a
-/// `--threads` hint. One `#[case]` per command so a regression names the
-/// command instead of dying on the first bad assert (repo rstest convention).
+/// Each consensus command needs a different molecule shape — duplex rejects MI
+/// tags without an `/A`,`/B` strand suffix outright, and codec needs
+/// FR-overlapping pairs — so a single shared fixture would make the tests below
+/// either fail or (worse) pass while grouping nothing.
+#[cfg(feature = "consensus")]
+fn create_consensus_fixture_bam(cmd: &str, path: &PathBuf) {
+    match cmd {
+        "simplex" => create_grouped_test_bam(path),
+        "duplex" => {
+            let molecule =
+                crate::test_duplex_command::create_duplex_molecule("MI001", "ACGTACGT", 30, 100, 3);
+            crate::test_duplex_command::create_duplex_bam(path, vec![molecule]);
+        }
+        "codec" => {
+            let pairs = (0..3)
+                .map(|i| {
+                    crate::test_codec_command::create_codec_read_pair(
+                        &format!("read{i}"),
+                        b"ACGTACGT",
+                        b"ACGTACGT",
+                        &[30; 8],
+                        &[30; 8],
+                        100,
+                        "UMI001",
+                        None,
+                    )
+                })
+                .collect();
+            crate::test_codec_command::create_codec_test_bam(path, pairs);
+        }
+        other => panic!("unhandled consensus command {other}"),
+    }
+}
+
+/// Consensus-unify behavior change: after folding the single-threaded
+/// codec/simplex/duplex paths onto the chain, all three ACCEPT SAM input with
+/// `--threads` unset. They previously bailed with a `--threads` hint, since the
+/// single-threaded path opened the input as raw BAM only; the chain's
+/// `ReadSamChunks` source handles SAM at any worker count. This replaces the
+/// former `test_single_threaded_consensus_rejects_sam_with_threads_hint`, whose
+/// expectation this change deliberately inverts.
+///
+/// `--threads` is deliberately absent, and must stay absent: omitting it is the
+/// *only* way to select the single-threaded path this test is about. One
+/// `#[case]` per command so a regression names the command instead of dying on
+/// the first bad assert (repo rstest convention).
+#[cfg(feature = "consensus")]
 #[rstest]
 #[case::codec("codec", &["--min-reads", "1", "--min-duplex-length", "1"])]
 #[case::simplex("simplex", &["--min-reads", "1"])]
 #[case::duplex("duplex", &["--min-reads", "1"])]
-fn test_single_threaded_consensus_rejects_sam_with_threads_hint(
-    #[case] cmd: &str,
-    #[case] extra: &[&str],
-) {
+fn test_single_threaded_consensus_accepts_sam(#[case] cmd: &str, #[case] extra: &[&str]) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let bam = temp_dir.path().join("grouped.bam");
     let sam = temp_dir.path().join("grouped.sam");
-    create_grouped_test_bam(&bam);
+    create_consensus_fixture_bam(cmd, &bam);
     convert_bam_to_sam(&bam, &sam);
     let input = sam.to_str().unwrap();
 
     let out = temp_dir.path().join(format!("{cmd}_out.bam"));
-    // `--threads` is deliberately absent, and must stay absent: omitting it is the
-    // *only* way to select the single-threaded fast path this test is about.
-    // `--threads 1` is not a synonym — per `--threads`' own help, "when specified
-    // (even with --threads 1), uses the typed-step work-stealing pipeline", which is
-    // the SAM-capable path, so adding it makes all three cases accept the SAM input
-    // and the assertion below fail.
     let mut args: Vec<&str> =
         vec![cmd, "--input", input, "--output", out.to_str().unwrap(), "--compression-level", "1"];
     args.extend_from_slice(extra);
@@ -389,11 +420,19 @@ fn test_single_threaded_consensus_rejects_sam_with_threads_hint(
         .args(&args)
         .output()
         .unwrap_or_else(|e| panic!("failed to spawn {cmd}: {e}"));
-    assert!(!output.status.success(), "single-threaded {cmd} must reject SAM input");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--threads"),
-        "single-threaded {cmd} SAM error should hint at --threads; stderr: {stderr}"
+        output.status.success(),
+        "{cmd} with --threads unset must now accept SAM input; stderr: {stderr}"
+    );
+    // Sentinel taken verbatim from the hint this PR deletes — the removed
+    // `open_single_threaded_consensus_input` said "The single-threaded {command}
+    // path is BAM-only; if this is SAM input, pass --threads N ...". Match on
+    // "BAM-only", the distinctive fragment of that exact string: a paraphrase
+    // would never fire, leaving this assertion vacuously green.
+    assert!(
+        !stderr.contains("BAM-only"),
+        "{cmd} must not emit the old BAM-only SAM-rejection hint; stderr: {stderr}"
     );
 }
 
@@ -632,6 +671,66 @@ fn test_simplex_command_with_sam_input_new_pipeline_matches_bam_baseline() {
     assert!(status.success(), "simplex SAM run failed");
 
     compare_bam_records(&out_bam_baseline, &out_sam);
+}
+
+/// Consensus-unify behavior change: folding the bespoke single-threaded consensus
+/// path onto the chain removed the BAM-only restriction, so a consensus command
+/// with `--threads` unset now accepts SAM input (it previously bailed with a
+/// `--threads` hint, since the single-threaded path opened the input as raw BAM
+/// only). The SAM run must match the BAM run *record for record*, both with
+/// `--threads` omitted.
+///
+/// All three commands are covered, not just simplex: codec and duplex reach the
+/// SAM source through their own option plumbing, so a SAM parse that produced
+/// wrong or incomplete records for one of them specifically would not show up in
+/// a simplex-only check. `test_single_threaded_consensus_accepts_sam` above
+/// asserts only exit status; this is the identity oracle.
+///
+/// Each command gets a fixture that actually yields consensus output (duplex needs
+/// A/B-strand molecules, codec needs FR-overlapping pairs), and the comparison is
+/// the `_nonempty` variant — otherwise two header-only BAMs would satisfy it
+/// vacuously.
+#[cfg(feature = "consensus")]
+#[rstest]
+#[case::simplex("simplex", &["--min-reads", "1", "--min-consensus-base-quality", "0"])]
+#[case::duplex("duplex", &["--min-reads", "1"])]
+#[case::codec("codec", &["--min-reads", "1", "--min-duplex-length", "1"])]
+fn test_consensus_sam_input_without_threads_matches_bam(#[case] cmd: &str, #[case] extra: &[&str]) {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let bam_input = temp_dir.path().join("input.bam");
+    let sam_input = temp_dir.path().join("input.sam");
+    let out_from_bam = temp_dir.path().join("out_from_bam.bam");
+    let out_via_sam = temp_dir.path().join("out_via_sam.bam");
+
+    create_consensus_fixture_bam(cmd, &bam_input);
+    convert_bam_to_sam(&bam_input, &sam_input);
+
+    let run = |input: &std::path::Path, output: &std::path::Path, label: &str| {
+        let mut args: Vec<&str> = vec![
+            cmd,
+            "--input",
+            input.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--compression-level",
+            "1",
+            // No --threads: the (now unified) unset path.
+        ];
+        args.extend_from_slice(extra);
+        let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+            .args(&args)
+            .output()
+            .unwrap_or_else(|e| panic!("spawn {cmd} {label}: {e}"));
+        assert!(
+            output.status.success(),
+            "{cmd} {label} with --threads unset failed; stderr: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    };
+
+    run(&bam_input, &out_from_bam, "BAM");
+    run(&sam_input, &out_via_sam, "SAM");
+    crate::helpers::parity::assert_bams_record_equivalent_nonempty(&out_from_bam, &out_via_sam);
 }
 
 /// SAM-input parity for `correct` — exercises the `(Sam, true)` arm of
@@ -1019,8 +1118,8 @@ fn create_grouped_test_bam(path: &PathBuf) {
     // MI must be written as a *string* (`MI:Z:1`), the way `fgumi group` and fgbio emit it —
     // the tag can carry a strand suffix (`1/A`), so the consumers parse it as text. An integer
     // `MI:i:1` is silently ignored by the consensus callers (no consensus read, no rejection,
-    // no warning), which previously made every simplex parity test below compare one empty
-    // BAM against another.
+    // no warning), which previously made every parity check built on this fixture compare one
+    // empty BAM against another.
     let mi_tag = Tag::from(fgumi_lib::sam::SamTag::MI);
     let records = create_umi_family("AAAAAAAA", 5, "mol1", "ACGTACGT", 30);
 

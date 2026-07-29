@@ -298,6 +298,47 @@ pub fn assert_different_molecule_ids(family1: &[RecordBuf], family2: &[RecordBuf
     assert_ne!(mi1, mi2, "Different UMI families should have different molecule IDs");
 }
 
+/// Parse a `usize` value from a vertical `key<TAB>value<TAB>description` stats
+/// file (the fgbio-style consensus stats layout), by key.
+///
+/// Shared by the simplex, duplex, and codec `--stats` tests so the layout is
+/// parsed in exactly one place; a change to the vertical format updates all
+/// callers at once.
+pub fn parse_stats_kv_usize(path: &std::path::Path, key: &str) -> usize {
+    let text = std::fs::read_to_string(path).expect("read stats file");
+    let prefix = format!("{key}\t");
+    text.lines()
+        .find(|line| line.starts_with(&prefix))
+        .and_then(|line| line.split('\t').nth(1))
+        .unwrap_or_else(|| panic!("stats file missing key {key}"))
+        .parse()
+        .expect("stats value parses as usize")
+}
+
+/// Parse a `usize` value from a horizontal `header row / values row` stats file
+/// (the layout `fgumi codec --stats` writes), by column name.
+///
+/// The sibling of [`parse_stats_kv_usize`] for the other stats layout in the tree:
+/// simplex and duplex write vertical key/value rows, codec writes a header row
+/// followed by one values row. Each layout is parsed in exactly one place.
+pub fn parse_stats_column_usize(path: &std::path::Path, column: &str) -> usize {
+    let text = std::fs::read_to_string(path).expect("read stats file");
+    let mut lines = text.lines();
+    let header = lines.next().expect("stats file has a header row");
+    let values = lines.next().expect("stats file has a values row");
+
+    let index = header
+        .split('\t')
+        .position(|c| c == column)
+        .unwrap_or_else(|| panic!("stats file has no {column} column"));
+    values
+        .split('\t')
+        .nth(index)
+        .unwrap_or_else(|| panic!("values row has no entry for {column}"))
+        .parse()
+        .expect("stats value parses as usize")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

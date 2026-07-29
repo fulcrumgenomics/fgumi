@@ -18,28 +18,6 @@ use noodles::sam::header::record::value::map::header::tag as header_tag;
 use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
 use noodles::sam::header::record::value::map::tag::Other;
 
-/// Open the single-threaded consensus fast path's input as a raw BAM reader,
-/// reading the input exactly once. That path is BAM-only; if the input is SAM
-/// (not BGZF) the header read fails, and the returned error carries a
-/// `--threads` hint pointing at the SAM-capable multi-threaded path. Shared by
-/// `codec`/`simplex`/`duplex`'s `execute` (their open logic and error message
-/// are identical bar the command name).
-#[cfg(feature = "consensus")]
-pub(crate) fn open_single_threaded_consensus_input(
-    input: &std::path::Path,
-    reader_opts: fgumi_bam_io::PipelineReaderOpts,
-    command: &str,
-) -> Result<(fgumi_bam_io::RawBamReaderAuto, Header)> {
-    use anyhow::Context;
-    fgumi_bam_io::create_raw_bam_reader_with_opts(input, 1, reader_opts).with_context(|| {
-        format!(
-            "Failed to open input as BAM. The single-threaded {command} path is BAM-only; \
-             if this is SAM input, pass --threads N to use the SAM-capable multi-threaded \
-             path (ReadSamChunks + ParseSamChunk)."
-        )
-    })
-}
-
 /// Trait for converting command-specific statistics to metrics.
 pub trait ConsensusStatsOps: Clone + Default + Send {
     /// Merges another stats instance into this one.
