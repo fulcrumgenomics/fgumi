@@ -118,6 +118,34 @@ mismatch even when the molecules are identical — verify equivalence at the **g
 `fgumi compare bams --mode grouping`, which preserves the input read names, rather than at the
 consensus stage.
 
+### Deduplication Without UMIs
+
+`fgumi dedup --no-umi` groups templates by coordinate, with neither UMI nor strand-of-origin
+sub-partitioning, matching Picard `MarkDuplicates` rather than fgbio's `GroupReadsByUmi`. It is
+not coordinate-*only*: the grouping key also carries the read group's library and, for
+cell-barcoded input, the `CB` tag, so duplicates are still never called across libraries or
+across cells. `--no-umi` removes the UMI and strand-of-origin splits, nothing else.
+
+Dropping the strand-of-origin split is deliberate. A standard library prep ligates the same
+asymmetric Y-adapter to both ends of a double-stranded fragment, and read 1 is primed from the P5
+end, so a *single* input fragment yields both an F1R2 and an F2R1 read pair at the same unclipped
+5' coordinates. Strand of origin therefore distinguishes the two halves of one molecule, not two
+molecules — sub-partitioning on it while marking duplicates keeps two reads per input fragment and
+double-counts it.
+
+Validated against Picard `MarkDuplicates` 3.4.0 on a 15.8M-primary-read duplex panel: fgumi's
+marked count equals Picard's expectation exactly, with per-template flag agreement
+of 99.9%. The residual is a representative tie-break — fgumi keeps the first template in
+template-coordinate order, Picard the earliest `read1IndexInFile` — and is symmetric.
+
+`fgumi group --no-umi` **does** still split by strand of origin, because consensus calling is a
+positional pileup that requires every read 1 in a molecule to be the same physical strand from the
+same 5' start. `dedup` calls no consensus, so it needs no such split.
+
+> **Changed in v0.5.0.** Earlier versions split `dedup --no-umi` by strand of origin, so v0.5.0
+> marks more duplicates (+~2 percentage points on a moderately duplicated panel). There is no flag
+> to restore the previous behavior; use the UMI grouping path if you need strand separation.
+
 ### Group Metrics
 
 fgumi's `group` command now produces a third metrics file beyond family sizes and grouping

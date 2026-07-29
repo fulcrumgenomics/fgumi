@@ -216,7 +216,7 @@ struct DedupFilterConfig {
     include_non_pf: bool,
     /// Minimum UMI length.
     min_umi_length: Option<usize>,
-    /// Skip UMI validation; group by template coordinate alone, orientation-agnostically.
+    /// Skip UMI validation; group by template coordinate, orientation-agnostically.
     no_umi: bool,
 }
 
@@ -1131,10 +1131,11 @@ pub struct MarkDuplicates {
     #[arg(long = "index-threshold", default_value = "100")]
     pub index_threshold: IndexThreshold,
 
-    /// Skip UMI-based grouping; group by template coordinate alone. Forces identity
-    /// strategy and ignores any existing UMI tags. Templates are NOT split by strand of
-    /// origin in this mode, so F1R2 and F2R1 at the same coordinates are one molecule,
-    /// matching Picard `MarkDuplicates` (see "Grouping key" in --help).
+    /// Skip UMI-based grouping; group by template coordinate. Forces identity strategy
+    /// and ignores any existing UMI tags. Templates are NOT split by strand of origin in
+    /// this mode, so F1R2 and F2R1 at the same coordinates are one molecule, matching
+    /// Picard `MarkDuplicates`. Library and cell barcode still partition the grouping key
+    /// (see "Grouping key" in --help).
     #[arg(long = "no-umi", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub no_umi: bool,
 
