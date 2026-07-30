@@ -291,9 +291,9 @@ pub fn parse_memory_size(size_str: &str) -> Result<u64> {
             // Sanity guard: >1TB as a plain number likely means the user forgot a unit suffix.
             return Err(FgumiError::InvalidMemorySize {
                 reason: format!(
-                    "Plain number memory size too large: {} MiB. Use human-readable format like '{}GB' instead.",
+                    "Plain number memory size too large: {} MiB. Use human-readable format like '{}GiB' instead.",
                     mb_value,
-                    mb_value / 1000
+                    mb_value / 1024
                 ),
             });
         }
@@ -633,5 +633,20 @@ mod tests {
     fn test_parse_memory_size_overflow() {
         let very_large = format!("{}", u64::MAX / 1024);
         assert!(parse_memory_size(&very_large).is_err());
+    }
+
+    /// A plain number above 1,000,000 is rejected as a probably-missing unit suffix, and the
+    /// error suggests the equivalent binary size. The input is MiB, so the suggested figure
+    /// must be `MiB / 1024` labelled `GiB` — dividing by 1000 and labelling it `GB` understates
+    /// the true decimal-gigabyte value by roughly 5%.
+    #[test]
+    fn test_parse_memory_size_too_large_suggests_the_binary_equivalent() {
+        let err = parse_memory_size("2000000").expect_err("2,000,000 MiB must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("Plain number memory size too large"), "got: {msg}");
+        assert!(
+            msg.contains("1953GiB"),
+            "expected the GiB equivalent of 2,000,000 MiB; got: {msg}"
+        );
     }
 }
