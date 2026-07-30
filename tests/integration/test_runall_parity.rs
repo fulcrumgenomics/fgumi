@@ -44,8 +44,9 @@ use rstest::rstest;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{
-    create_both_unmapped_pair, create_minimal_header, create_paired_umi_family,
-    create_paired_umi_family_at, create_umi_family, create_umi_family_at, to_record_buf,
+    create_both_unmapped_pair, create_codec_fr_overlap_family_at, create_minimal_header,
+    create_paired_umi_family, create_paired_umi_family_at, create_umi_family, create_umi_family_at,
+    to_record_buf,
 };
 use crate::helpers::cli_runner::{
     ParityArgs, Stage, fgumi, fgumi_binary, run_runall, run_runall_consensus_to_filter,
@@ -236,24 +237,131 @@ fn sorted_duplex_with_unmapped_fixture(dir: &Path) -> PathBuf {
     sorted
 }
 
+/// The CODEC fixture's families: `(umi, base_name, template, pos)`.
+///
+/// Single source of truth for both the fixture writer and the output oracle
+/// below, so the two cannot drift. `template` is the reference-oriented sequence
+/// stored by **both** mates — BAM `SEQ` is in reference orientation (SAM spec
+/// §1.4), so a fully-overlapping FR pair carries identical bases on R1 and on the
+/// REVERSE-flagged R2. There is deliberately no separate R2 column: writing R2 as
+/// the reverse complement of R1 would present the caller with two mates that
+/// disagree at every base and collapse the family to all-`N`.
+///
+/// `fam_b`'s template is deliberately **not** its own reverse complement. The
+/// other three are RC-palindromes, and a table of only palindromes cannot
+/// distinguish a template from its reverse complement — a caller that emitted
+/// every consensus reverse-complemented would satisfy the oracle. `fam_b` breaks
+/// that symmetry.
+const CODEC_FAMILIES: [(&str, &str, &str, i32); 4] = [
+    ("ACGTACGT", "fam_a", "ACGTACGT", 99),
+    ("AAAACCCC", "fam_b", "AAAACCCC", 999),
+    ("CCAATTGG", "fam_c", "CCAATTGG", 1999),
+    ("GGTTAACC", "fam_d", "GGTTAACC", 2999),
+];
+
+/// Independent oracle for any CODEC output built from [`CODEC_FAMILIES`].
+///
+/// Fused-vs-staged equality plus a non-empty check cannot catch a CODEC
+/// regression that affects BOTH paths identically — dropping three of the four
+/// families, or emitting the same wrong base on each. This asserts what the
+/// output must be on its own terms, derived from the fixture definition rather
+/// than from what the tool produced: every family is three *identical* Q30
+/// read-pairs whose R1 and R2 fully overlap and store the same reference-oriented
+/// bases, so there is no disagreement for the caller to resolve and each family's
+/// consensus sequence must be exactly that family's template. All four families
+/// must therefore appear, no sequence outside the fixture may, and the record
+/// count must be exactly one per family — the count is what catches a family
+/// emitted twice, which set equality alone collapses away.
+///
+/// Sequences are compared verbatim. CODEC emits *unmapped* consensus records, so
+/// there is no strand to normalize — that contract is asserted rather than
+/// assumed, because silently reverse-complementing on a flag that can never be
+/// set would make this oracle blind to the day it starts being set.
+fn assert_codec_output_matches_oracle(bam: &Path, label: &str) {
+    use fgumi_dna::reverse_complement_str;
+    use std::collections::BTreeSet;
+
+    // With an all-palindrome table, `expected` cannot tell a template from its
+    // own reverse complement: a caller that reverse-complemented every consensus
+    // would still pass. At least one family must break that symmetry.
+    assert!(
+        CODEC_FAMILIES
+            .iter()
+            .any(|(_, _, template, _)| reverse_complement_str(template) != *template),
+        "CODEC_FAMILIES must contain at least one non-RC-palindromic template, otherwise this \
+         oracle cannot tell a correct consensus from a reverse-complemented one"
+    );
+
+    let records = read_bam_records(bam);
+    assert!(!records.is_empty(), "{label}: CODEC emitted no records at all");
+    // The set-equality check below collapses duplicates, so it is blind to a
+    // regression that emits one family's consensus twice: `[A, A, B, C, D]`
+    // still reduces to `{A, B, C, D}` and passes. Fused-vs-staged equality does
+    // not catch it either when both paths regress identically. CODEC collapses
+    // each FR-overlap family into exactly one consensus record, so pin the
+    // count as well as the sequence set.
+    assert_eq!(
+        records.len(),
+        CODEC_FAMILIES.len(),
+        "{label}: CODEC must emit exactly one consensus record per fixture family ({} expected), \
+         got {}",
+        CODEC_FAMILIES.len(),
+        records.len(),
+    );
+
+    for rec in &records {
+        assert!(
+            rec.flags().is_unmapped() && !rec.flags().is_reverse_complemented(),
+            "{label}: CODEC consensus records are expected to be unmapped and forward-oriented, \
+             so the sequences below can be compared verbatim; got flags {:#06x}. If CODEC now \
+             emits mapped/reverse-strand consensus records, this oracle must normalize strand \
+             before comparing.",
+            u16::from(rec.flags()),
+        );
+    }
+
+    let observed: BTreeSet<Vec<u8>> =
+        records.iter().map(|rec| rec.sequence().as_ref().to_vec()).collect();
+
+    let expected: BTreeSet<Vec<u8>> =
+        CODEC_FAMILIES.iter().map(|(_, _, template, _)| template.as_bytes().to_vec()).collect();
+
+    let render = |s: &BTreeSet<Vec<u8>>| -> Vec<String> {
+        s.iter().map(|v| String::from_utf8_lossy(v).into_owned()).collect()
+    };
+    assert_eq!(
+        observed,
+        expected,
+        "{label}: CODEC consensus sequences must be exactly the {} fixture templates \
+         (every family formable, none dropped, none miscalled); observed {:?}, expected {:?}",
+        CODEC_FAMILIES.len(),
+        render(&observed),
+        render(&expected),
+    );
+}
+
 fn unsorted_codec_fixture(dir: &Path) -> PathBuf {
     let path = dir.join("unsorted_codec.bam");
     let header = create_minimal_header("chr1", 10000);
     let mut writer = bam::io::Writer::new(fs::File::create(&path).expect("create fixture BAM"));
     writer.write_header(&header).expect("write fixture header");
-    // 4 paired-end families × 4 read-pairs. Each pair shares one
-    // single-strand UMI in the RX tag; CODEC pairs the two strands at
-    // consensus time, not at grouping time. `--strategy adjacency`
-    // (not `paired`) is the documented grouping for CODEC.
-    let families = [
-        ("ACGTACGT", "fam_a", "ACGTACGT", "TTTTAAAA"),
-        ("TGCATGCA", "fam_b", "TGCATGCA", "CCCCGGGG"),
-        ("CCAATTGG", "fam_c", "CCAATTGG", "GGTTAACC"),
-        ("GGTTAACC", "fam_d", "GGTTAACC", "CCAATTGG"),
-    ];
+    // 4 CODEC-formable FR-overlap families, one per distinct reference
+    // position (99, 999, 1999, 2999 — all inside the 10000bp `chr1`).
+    // Each family is 3 read-pairs sharing one single-strand UMI in RX,
+    // built with the FR-overlap flag shape (R1 `PAIRED|FIRST|MATE_REVERSE`,
+    // R2 `PAIRED|LAST|REVERSE`, both mates at the SAME position) that CODEC
+    // consensus requires. `--strategy adjacency` (not `paired`) is the
+    // documented grouping for CODEC. Contrast `create_paired_umi_family`
+    // (100bp gap, no strand flags), which CODEC rejects → 0 consensus.
+    //
+    // Both mates store `template` verbatim, which is what makes the overlap
+    // clean: BAM `SEQ` is in *reference* orientation (SAM spec §1.4), so a
+    // fully-overlapping FR pair stores the same bases on R1 and on the
+    // REVERSE-flagged R2 even when the template is not its own reverse
+    // complement.
     let mut all_records = Vec::new();
-    for (umi, name, r1_seq, r2_seq) in families {
-        for r in create_paired_umi_family(umi, 4, name, r1_seq, r2_seq, 30) {
+    for (umi, name, template, pos) in CODEC_FAMILIES {
+        for r in create_codec_fr_overlap_family_at(umi, 3, name, template, template, 30, pos) {
             all_records.push(r);
         }
     }
@@ -400,18 +508,17 @@ fn parity_a_duplex_to_duplex() {
 }
 
 /// `Codec → Codec` parity vs standalone `fgumi codec`. Runs through the
-/// consensus-only delegation fast path. Uses `grouped_codec_fixture`
-/// (paired-end, single-UMI, grouped with `--strategy adjacency`).
+/// consensus-only delegation fast path. Uses `grouped_codec_fixture`, whose
+/// families now carry the **FR-overlap flag shape** CODEC requires (R1
+/// `PAIRED|FIRST|MATE_REVERSE` / R2 `PAIRED|LAST|REVERSE`, both mates at the
+/// same position, depth 3, `--strategy adjacency`, `--min-reads 1`), so the
+/// CODEC caller forms one duplex consensus per family (RUN3-02).
 ///
-/// NOTE (S9a-001): this fixture lacks the FR-overlap flag shape CODEC
-/// consensus requires (R1 `PAIRED|FIRST|MATE_REVERSE` / R2 `PAIRED|LAST|REVERSE`
-/// at the same position), so every pair is rejected and BOTH the fused and
-/// standalone paths emit **0 consensus records**. The parity therefore holds
-/// only because both sides are empty. The explicit `== 0` assertion below makes
-/// that deliberate zero VISIBLE: if a future change gives the codec fixture
-/// FR-overlap flags (making it non-empty), this test fails loudly and forces an
-/// upgrade to a real non-empty parity check (the `zipper_*_codec` smoke tests
-/// already cover the non-empty FR-overlap shape via `zipper_codec_fixture`).
+/// This pins a real, ≥1-record fused-vs-standalone CODEC parity floor: the
+/// fused and standalone paths must emit the SAME non-empty consensus record
+/// stream (plus matching `@HD`/`@SQ`/`@RG`). It replaces the former vacuous
+/// `0 == 0` check, which passed only because the codec fixture lacked the
+/// FR-overlap shape and both sides were empty.
 #[cfg(feature = "consensus")]
 #[test]
 fn parity_a_codec_to_codec() {
@@ -427,15 +534,10 @@ fn parity_a_codec_to_codec() {
     let r = run_standalone(Stage::Codec, &fixture, &standalone_out, &args);
     assert!(r.status.success(), "standalone: {}", String::from_utf8_lossy(&r.stderr));
 
-    assert_bams_record_equivalent(&runall_out, &standalone_out);
-    // Header parity matters most in this empty-stream case: a wrong fused
-    // @HD/@SQ/@RG would otherwise stay green behind the zero-record assertion.
+    assert_bams_record_equivalent_nonempty(&runall_out, &standalone_out);
+    assert_codec_output_matches_oracle(&runall_out, "standalone CODEC (runall)");
+    assert_codec_output_matches_oracle(&standalone_out, "standalone CODEC (staged)");
     assert_bam_headers_equivalent_ignoring_pg(&runall_out, &standalone_out);
-    assert_eq!(
-        read_bam_records(&runall_out).len(),
-        0,
-        "codec fixture lacks the FR-overlap shape → 0 consensus by design (S9a-001)"
-    );
 }
 
 // ────────────────────────── Class B — multi-stage parity ──────────────────────────
@@ -535,9 +637,11 @@ fn parity_b_sort_to_duplex() {
 }
 
 /// `Sort → Codec` parity vs staged `fgumi sort | fgumi group | fgumi codec`.
-/// Uses the codec fixture family (paired-end, single-strand UMI,
-/// `--strategy adjacency`) so the consensus stage actually exercises
-/// CODEC's duplex logic.
+/// Uses the FR-overlap codec fixture family (paired-end, single-strand UMI,
+/// R1 `PAIRED|FIRST|MATE_REVERSE` / R2 `PAIRED|LAST|REVERSE` at the same
+/// position, `--strategy adjacency`, `--min-reads 1`) so the consensus stage
+/// actually exercises CODEC's duplex logic and yields ≥1 consensus per family.
+/// Pins a real, non-empty fused-vs-staged CODEC parity floor (RUN3-02).
 #[cfg(feature = "consensus")]
 #[test]
 fn parity_b_sort_to_codec() {
@@ -559,14 +663,13 @@ fn parity_b_sort_to_codec() {
     );
     assert!(r.status.success(), "staged: {}", String::from_utf8_lossy(&r.stderr));
 
-    assert_bams_record_equivalent(&runall_out, &staged_out);
-    // S9a-005: header parity holds even for the zero-record codec branch (both
-    // sides still emit @HD/@SQ/@RG) — assert it before the zero-count pin below.
+    // RUN3-02: the FR-overlap codec fixture forms ≥1 consensus, so the fused
+    // and staged paths must emit the SAME non-empty record stream.
+    assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
+    assert_codec_output_matches_oracle(&runall_out, "sort→group→CODEC (runall)");
+    assert_codec_output_matches_oracle(&staged_out, "sort→group→CODEC (staged)");
+    // S9a-005: also pin @HD/@SQ/@RG parity across the fused-vs-staged paths.
     assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
-    // S9a-001: the codec fixture lacks the FR-overlap shape → 0 consensus by
-    // design; pin the deliberate zero so a future non-empty fixture forces a
-    // real parity check.
-    assert_eq!(read_bam_records(&runall_out).len(), 0, "codec fixture → 0 consensus by design");
 }
 
 /// `Group → Simplex` parity vs staged `fgumi group | fgumi simplex`.
@@ -808,8 +911,9 @@ fn new_002_group_to_duplex_allow_unmapped_parity() {
 }
 
 /// `Group → Codec` parity vs staged `fgumi group | fgumi codec`.
-/// Uses the codec fixture family; see [`parity_b_sort_to_codec`] for
-/// the rationale.
+/// Uses the FR-overlap codec fixture family; see [`parity_b_sort_to_codec`]
+/// for the rationale. Pins a real, non-empty fused-vs-staged CODEC parity
+/// floor (RUN3-02).
 #[cfg(feature = "consensus")]
 #[test]
 fn parity_b_group_to_codec() {
@@ -826,11 +930,13 @@ fn parity_b_group_to_codec() {
         run_staged_chain(&[Stage::Group, Stage::Codec], &fixture, &staged_out, tmp.path(), &args);
     assert!(r.status.success(), "staged: {}", String::from_utf8_lossy(&r.stderr));
 
-    assert_bams_record_equivalent(&runall_out, &staged_out);
-    // S9a-005: header parity holds even for the zero-record codec branch.
+    // RUN3-02: the FR-overlap codec fixture forms ≥1 consensus, so the fused
+    // and staged paths must emit the SAME non-empty record stream.
+    assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
+    assert_codec_output_matches_oracle(&runall_out, "group→CODEC (runall)");
+    assert_codec_output_matches_oracle(&staged_out, "group→CODEC (staged)");
+    // S9a-005: also pin @HD/@SQ/@RG parity across the fused-vs-staged paths.
     assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
-    // S9a-001: codec fixture lacks FR-overlap → 0 consensus by design.
-    assert_eq!(read_bam_records(&runall_out).len(), 0, "codec fixture → 0 consensus by design");
 }
 
 // ──────────────── Fused consensus → filter parity (issue #330 option a) ────────────────
@@ -911,6 +1017,9 @@ fn parity_group_to_duplex_to_filter() {
 }
 
 /// `Group → Codec → Filter` (fused) vs staged consensus BAM + `fgumi filter`.
+/// Uses the FR-overlap codec fixture, so the fused consensus→filter stream is
+/// non-empty and pins a real, ≥1-record fused-vs-staged CODEC→filter parity
+/// floor (RUN3-02).
 #[cfg(feature = "consensus")]
 #[test]
 fn parity_group_to_codec_to_filter() {
@@ -929,11 +1038,18 @@ fn parity_group_to_codec_to_filter() {
     let r = run_standalone_filter(&consensus_bam, &staged_out, &args);
     assert!(r.status.success(), "staged filter: {}", String::from_utf8_lossy(&r.stderr));
 
-    assert_bams_record_equivalent(&fused_out, &staged_out);
-    // S9a-005: header parity holds even for the zero-record codec→filter branch.
+    // RUN3-02: the FR-overlap codec fixture forms ≥1 consensus that survives
+    // `filter --min-reads 1`, so the fused consensus→filter stream is non-empty
+    // and must equal the staged consensus + standalone-filter chain.
+    assert_bams_record_equivalent_nonempty(&fused_out, &staged_out);
+    // Independent oracle on both sides: fused-vs-staged equality alone would
+    // still pass if CODEC dropped families or miscalled bases on both paths.
+    // Every fixture family is a clean, fully-agreeing FR-overlap trio, so all
+    // four survive `filter --min-reads 1` unchanged.
+    assert_codec_output_matches_oracle(&fused_out, "group→CODEC→filter (fused)");
+    assert_codec_output_matches_oracle(&staged_out, "group→CODEC→filter (staged)");
+    // S9a-005: also pin @HD/@SQ/@RG parity across the fused-vs-staged paths.
     assert_bam_headers_equivalent_ignoring_pg(&fused_out, &staged_out);
-    // S9a-001: codec fixture → 0 consensus → 0 after filter, by design.
-    assert_eq!(read_bam_records(&fused_out).len(), 0, "codec fixture → 0 consensus by design");
 }
 
 // ───────────────────── Run-to-run / thread-count determinism ─────────────────────
@@ -1914,11 +2030,10 @@ fn zipper_duplex_fixture(dir: &StdPath) -> ZipperInputs {
 /// `PAIRED | FIRST_SEGMENT | MATE_REVERSE`, R2 `PAIRED |
 /// LAST_SEGMENT | REVERSE`, both at the SAME position), NOT by
 /// paired-UMI grouping. Without those flags, CODEC consensus
-/// rejects every pair and emits 0 records — which is what
-/// `parity_b_sort_to_codec`'s `unsorted_codec_fixture` actually
-/// does in practice (the existing test passes only because both
-/// fused and staged produce 0 records, so they're trivially
-/// equivalent).
+/// rejects every pair and emits 0 records. `parity_b_sort_to_codec`'s
+/// `unsorted_codec_fixture` now shares this same FR-overlap recipe (via
+/// `create_codec_fr_overlap_family_at`, RUN3-02), so both fixtures yield
+/// non-empty CODEC output.
 ///
 /// This fixture mirrors the `create_codec_read_pair` helper from
 /// `tests/integration/test_codec_command.rs`, which IS known to

@@ -72,9 +72,8 @@ pub fn assert_bams_record_equivalent(a: &Path, b: &Path) {
 /// green even if the fused pipeline silently emitted a header-only BAM
 /// (S9a-001). Use this variant for every parity chain that must carry
 /// records; reserve the bare `assert_bams_record_equivalent` (paired with
-/// an explicit `assert_eq!(read_bam_records(..).len(), 0, ..)`) for chains
-/// that legitimately produce zero records by design (the codec fixtures
-/// lack the FR-overlap shape — see the codec parity tests).
+/// an explicit `assert_eq!(read_bam_records(..).len(), 0, ..)`) only for
+/// chains that legitimately produce zero records by design.
 ///
 /// # Panics
 ///
