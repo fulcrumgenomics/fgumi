@@ -1,0 +1,24 @@
+[package]
+name = "fgumi-cli-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Shared CLI types and helpers for fgumi commands"
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+bytesize = { workspace = true }
+clap = { workspace = true }
+fgumi-fmt = { workspace = true }
+log = { workspace = true }
+sysinfo = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+tempfile = { workspace = true }
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
