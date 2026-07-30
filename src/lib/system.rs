@@ -16,11 +16,11 @@
 //!
 //! # CPU (`detect_cpu_count`)
 //!
-//! Uses the `num_cpus` crate which reads the CFS quota:
+//! Uses `std::thread::available_parallelism`, which reads the CFS quota:
 //! - cgroup v2: `cpu.max`
 //! - cgroup v1: `cpu.cfs_quota_us` / `cpu.cfs_period_us`
 //!
-//! Falls back to `/proc/cpuinfo` on Linux and `sysctl` on macOS.
+//! Falls back to the platform core count when no quota is configured.
 //! Note: CFS quota is the *hard* limit set by `--cpus`; it is not the same as
 //! `cpu.shares` which is a soft scheduling weight.
 
@@ -34,16 +34,20 @@ pub fn detect_total_memory() -> usize {
     system.refresh_memory();
     let physical = system.total_memory();
     let bytes = system.cgroup_limits().map_or(physical, |c| c.total_memory.min(physical));
-    usize::try_from(bytes).unwrap_or(usize::MAX)
+    // Saturate at usize::MAX / 2 rather than usize::MAX on 32-bit platforms so the
+    // downstream `budget > total` overflow check in `resolve_memory_budget` can fire
+    // correctly (no value can exceed usize::MAX, so using it as the fallback renders
+    // the check dead).
+    usize::try_from(bytes).unwrap_or(usize::MAX / 2)
 }
 
 /// Returns the number of logical CPUs available to this process.
 ///
 /// Respects cgroup CPU quotas (set by `--cpus` in Docker or resource limits in
-/// Kubernetes), falling back to the physical core count. Returns at least 1.
+/// Kubernetes), falling back to the platform core count. Returns at least 1.
 #[must_use]
 pub fn detect_cpu_count() -> usize {
-    num_cpus::get().max(1)
+    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
 }
 
 #[cfg(test)]
