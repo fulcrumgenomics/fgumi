@@ -135,6 +135,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -720,7 +726,6 @@ dependencies = [
  "nix",
  "noodles",
  "noodles-bgzf",
- "num_cpus",
  "parking_lot",
  "proptest",
  "rand 0.10.2",
@@ -770,6 +775,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fgumi-cli-common"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "bytesize",
+ "clap",
+ "fgumi-fmt",
+ "log",
+ "rstest",
+ "sysinfo",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "fgumi-consensus"
 version = "0.6.0"
 dependencies = [
@@ -795,6 +815,14 @@ dependencies = [
 name = "fgumi-dna"
 version = "0.6.0"
 dependencies = [
+ "rstest",
+]
+
+[[package]]
+name = "fgumi-fmt"
+version = "0.6.0"
+dependencies = [
+ "num-format",
  "rstest",
 ]
 
@@ -1088,12 +1116,6 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
-
-[[package]]
-name = "hermit-abi"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
 name = "iana-time-zone"
@@ -1604,6 +1626,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-format"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a652d9771a63711fd3c3deb670acfbe5c30a4072e664d7a3bf5a9e1056ac72c3"
+dependencies = [
+ "arrayvec",
+ "itoa 1.0.18",
+]
+
+[[package]]
 name = "num-integer"
 version = "0.1.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1631,16 +1663,6 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
  "libm",
-]
-
-[[package]]
-name = "num_cpus"
-version = "1.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
-dependencies = [
- "hermit-abi",
- "libc",
 ]
 
 [[package]]

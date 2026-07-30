@@ -849,7 +849,7 @@ pub struct ThreadingOptions {
 /// Options for output compression.
 ///
 /// Controls BGZF compression level for BAM output files.
-#[derive(Debug, Clone, Default, Args)]
+#[derive(Debug, Clone, Args)]
 pub struct CompressionOptions {
     /// Compression level for output BAM (0-12).
     ///
@@ -859,6 +859,15 @@ pub struct CompressionOptions {
     /// Level 12 produces smallest files but is slowest.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(0..=12))]
     pub compression_level: u32,
+}
+
+impl Default for CompressionOptions {
+    /// Mirrors the clap `default_value_t = 1` so programmatic and default-constructed callers
+    /// emit level-1 compression rather than the `u32` default of `0`, which would silently
+    /// write uncompressed BGZF.
+    fn default() -> Self {
+        Self { compression_level: 1 }
+    }
 }
 
 /// Option controlling whether unmapped reads are processed by a consensus caller.
@@ -1197,14 +1206,27 @@ fn resolve_memory_budget_with_total(
                     ByteSize(margin as u64),
                 );
             }
-            log::debug!(
-                "Auto memory: {} of {} ({}/thread × {} threads, reserve {})",
-                ByteSize(budget as u64),
-                ByteSize(total as u64),
-                ByteSize((budget / threads) as u64),
-                threads,
-                ByteSize(margin as u64),
-            );
+            // Only the per-thread arm allocates `budget` as `threads` independent slices;
+            // otherwise it is one shared pool and `budget / threads` would misdescribe it.
+            // Mirrors the framing `log_memory_config` already uses below.
+            if per_thread {
+                log::debug!(
+                    "Auto memory: {} of {} ({}/thread × {} threads, reserve {})",
+                    ByteSize(budget as u64),
+                    ByteSize(total as u64),
+                    ByteSize((budget / threads) as u64),
+                    threads,
+                    ByteSize(margin as u64),
+                );
+            } else {
+                log::debug!(
+                    "Auto memory: {} of {} (shared across {} threads, reserve {})",
+                    ByteSize(budget as u64),
+                    ByteSize(total as u64),
+                    threads,
+                    ByteSize(margin as u64),
+                );
+            }
             budget
         }
     };
@@ -1685,6 +1707,15 @@ mod tests {
     fn make_fifo(path: &Path) {
         let status = std::process::Command::new("mkfifo").arg(path).status().expect("run mkfifo");
         assert!(status.success(), "mkfifo {} failed: {status}", path.display());
+    }
+
+    /// A default-constructed `CompressionOptions` must agree with the clap
+    /// `default_value_t = 1`. The derived `Default` would yield `0`, which is a valid but
+    /// *uncompressed* BGZF level, so programmatic callers would silently write uncompressed
+    /// BAM while the same command run from the CLI wrote level 1.
+    #[test]
+    fn compression_options_default_matches_the_cli_default() {
+        assert_eq!(CompressionOptions::default().compression_level, 1);
     }
 
     /// `index_threshold_log_message` reports the threshold that is actually in effect,
