@@ -299,6 +299,79 @@ mod tests {
         fn test_try_parse_single_record_never_panics(record in proptest::collection::vec(any::<u8>(), 0..64)) {
             let _ = try_parse_single_record(&record);
         }
+
+        // `find_record_offsets` consumes the SIMD lexer's newline bitmask and is
+        // the only code that stitches results across 64-byte block boundaries, so
+        // it needs inputs longer than one block. The length range spans several
+        // blocks and deliberately includes exact multiples of 64, where the final
+        // block is full and the "remaining bytes" tail path is empty.
+        #[test]
+        fn test_find_record_offsets_never_panics(data in proptest::collection::vec(any::<u8>(), 0..300)) {
+            let offsets = find_record_offsets(&data);
+
+            // Whatever it returns must be usable for slicing: offsets are in
+            // bounds and strictly increasing, or a later slice would panic in a
+            // caller rather than here.
+            for pair in offsets.windows(2) {
+                prop_assert!(pair[0] < pair[1], "offsets not strictly increasing: {:?}", pair);
+            }
+            for &offset in &offsets {
+                prop_assert!(offset <= data.len(), "offset {} past end {}", offset, data.len());
+            }
+        }
+
+        // NB: `parse_records` is deliberately NOT fuzzed for panics. It is
+        // documented as assuming well-formed input and routes through
+        // `parse_single_record`, which panics by contract on malformed records.
+        // The untrusted-input entry points are `try_parse_single_record` and
+        // `SimdFastqReader`, which uses the fallible form at every call site;
+        // those are what the no-panic properties above and the reader's own
+        // tests cover. Asserting that `parse_records` never panics would assert
+        // the opposite of its documented contract.
+
+        // Well-formed input must round-trip: every record the parser yields has
+        // to carry back the exact name, sequence, and quality that went in. This
+        // is the counterpart to the no-panic properties above -- those only prove
+        // the parser does not crash, not that it parses correctly.
+        // Bases and their quality bytes are generated as pairs so the two lines
+        // are the same length by construction. Qualities span the whole printable
+        // Phred+33 range rather than a constant, so a parser that returned the
+        // right number of quality bytes but the wrong ones would fail here.
+        #[test]
+        fn test_well_formed_records_round_trip(
+            records in proptest::collection::vec(
+                (
+                    "[A-Za-z0-9_:.-]{1,20}",
+                    proptest::collection::vec(
+                        (prop::sample::select(vec![b'A', b'C', b'G', b'T', b'N']), b'!'..=b'~'),
+                        1..40,
+                    ),
+                ),
+                1..8,
+            )
+        ) {
+            let mut input = Vec::new();
+            for (name, bases) in &records {
+                input.push(b'@');
+                input.extend_from_slice(name.as_bytes());
+                input.push(b'\n');
+                input.extend(bases.iter().map(|(base, _)| *base));
+                input.extend_from_slice(b"\n+\n");
+                // One quality byte per base, so the record is internally consistent.
+                input.extend(bases.iter().map(|(_, quality)| *quality));
+                input.push(b'\n');
+            }
+
+            let parsed: Vec<_> = parse_records(&input).collect();
+            prop_assert_eq!(parsed.len(), records.len(), "record count mismatch");
+            for (parsed_record, (name, bases)) in parsed.iter().zip(records.iter()) {
+                let sequence: Vec<u8> = bases.iter().map(|(base, _)| *base).collect();
+                let quality: Vec<u8> = bases.iter().map(|(_, quality)| *quality).collect();
+                prop_assert_eq!(parsed_record.name, name.as_bytes(), "name mismatch");
+                prop_assert_eq!(parsed_record.sequence, sequence.as_slice(), "sequence mismatch");
+                prop_assert_eq!(parsed_record.quality, quality.as_slice(), "quality mismatch");
+            }
+        }
     }
 
     #[test]

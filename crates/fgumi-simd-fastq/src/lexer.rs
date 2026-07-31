@@ -447,6 +447,98 @@ const fn interleave_bits_32(lo: u32, hi: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    /// Build the `two_bits` mask covering only the lanes flagged in `is_acgt`.
+    ///
+    /// The 2-bit encoding is only defined for A/C/G/T lanes: `ENCODE_LUT` maps
+    /// every other byte to a don't-care value, and the SIMD paths write that
+    /// value through unconditionally (`two_bits |= chunk_two_bits`) while the
+    /// scalar path leaves non-ACGT lanes zero. Comparing whole `two_bits` words
+    /// would therefore assert agreement the implementations never promised.
+    /// Restricting the comparison to `is_acgt` lanes is the actual contract, and
+    /// because `is_acgt` is itself asserted equal first, no divergence can hide
+    /// behind a disagreeing mask.
+    fn acgt_lane_mask(is_acgt: u64) -> u128 {
+        let mut mask: u128 = 0;
+        for lane in 0..64 {
+            if is_acgt & (1u64 << lane) != 0 {
+                mask |= 0b11u128 << (lane * 2);
+            }
+        }
+        mask
+    }
+
+    /// Bytes weighted toward what a real FASTQ block contains.
+    ///
+    /// Uniform `any::<u8>()` almost never produces a newline or a base, so it
+    /// exercises the classification masks far less than it appears to. This
+    /// generator keeps newlines and ACGT dense enough to hit the interesting
+    /// lanes, while still emitting arbitrary bytes.
+    fn fastq_ish_byte() -> impl Strategy<Value = u8> {
+        prop_oneof![
+            6 => prop::sample::select(vec![b'A', b'C', b'G', b'T', b'a', b'c', b'g', b't']),
+            2 => Just(b'\n'),
+            1 => prop::sample::select(vec![b'N', b'n', b'@', b'+', b'I', b'J', b' ']),
+            1 => any::<u8>(),
+        ]
+    }
+
+    fn block_strategy() -> impl Strategy<Value = [u8; 64]> {
+        prop::collection::vec(fastq_ish_byte(), 64)
+            .prop_map(|bytes| <[u8; 64]>::try_from(bytes.as_slice()).expect("64 bytes"))
+    }
+
+    proptest! {
+        // Miri cannot execute SIMD intrinsics, so `miri.yml` does not cover this
+        // crate (see CLAUDE.md). Agreement with the scalar reference over
+        // randomized blocks is what stands in for it: the fixed-input tests below
+        // pin specific shapes, but only a sweep exercises arbitrary lane
+        // combinations across all four NEON / two AVX2 loads at once.
+        #[test]
+        fn simd_newlines_match_scalar_on_arbitrary_blocks(block in block_strategy()) {
+            prop_assert_eq!(lex_block(&block), lex_block_scalar(&block).newlines);
+        }
+
+        #[test]
+        fn simd_full_matches_scalar_on_arbitrary_blocks(block in block_strategy()) {
+            let simd = lex_block_full(&block);
+            let scalar = lex_block_scalar(&block);
+
+            prop_assert_eq!(simd.newlines, scalar.newlines, "newlines diverged");
+            prop_assert_eq!(simd.is_acgt, scalar.is_acgt, "is_acgt diverged");
+
+            let mask = acgt_lane_mask(scalar.is_acgt);
+            prop_assert_eq!(
+                simd.two_bits & mask,
+                scalar.two_bits & mask,
+                "two_bits diverged on an ACGT lane"
+            );
+        }
+
+        // The newline-only fast path and the full classifier are separate
+        // implementations of the same predicate, so they must agree with each
+        // other and not merely each with the scalar reference.
+        #[test]
+        fn newline_fast_path_matches_full_classifier(block in block_strategy()) {
+            prop_assert_eq!(lex_block(&block), lex_block_full(&block).newlines);
+        }
+
+        // Uniformly random bytes, as an adversarial complement to the weighted
+        // generator: sparse in newlines and bases, dense in everything else.
+        #[test]
+        fn simd_matches_scalar_on_uniform_random_blocks(bytes in prop::collection::vec(any::<u8>(), 64)) {
+            let block = <[u8; 64]>::try_from(bytes.as_slice()).expect("64 bytes");
+            let simd = lex_block_full(&block);
+            let scalar = lex_block_scalar(&block);
+
+            prop_assert_eq!(simd.newlines, scalar.newlines, "newlines diverged");
+            prop_assert_eq!(simd.is_acgt, scalar.is_acgt, "is_acgt diverged");
+
+            let mask = acgt_lane_mask(scalar.is_acgt);
+            prop_assert_eq!(simd.two_bits & mask, scalar.two_bits & mask, "two_bits diverged");
+        }
+    }
 
     fn make_block(data: &[u8]) -> [u8; 64] {
         let mut block = [0u8; 64];
