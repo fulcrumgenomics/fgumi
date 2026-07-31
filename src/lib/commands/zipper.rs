@@ -3245,16 +3245,19 @@ mod tests {
             "R1 supp ms should be R2 primary's AS (55), got {supp_ms:?}"
         );
 
-        // TLEN on supplementary should be negative of R2 primary's TLEN
-        let r1_primary_tlen = r1_primary.template_length();
-        let r1_supp_tlen = r1_supp.template_length();
-        // Supplementary TLEN = -(R2 primary TLEN) = -(-R1 primary TLEN) = R1 primary TLEN... no
-        // Actually: supplementary's TLEN = -(mate primary's TLEN) = -(R2's TLEN) = R1's TLEN
-        // Wait, the code says: *self.records[i].template_length_mut() = -r2_tlen;
-        // R2's TLEN is the negative of R1's TLEN, so -r2_tlen = R1's TLEN
+        // TLEN on the supplementary is computed from its own alignment against the mate primary,
+        // not copied from that primary's TLEN. See issue #673.
+        //
+        // R1 primary  100..149 forward -> 5' = 100
+        // R2 primary  300..374 reverse -> 5' = 374   => primaries are +275 / -275
+        // R1 supp     500..559 reverse -> 5' = 559
+        //
+        // The supplementary is the rightmost segment, so its TLEN is negative: 374 - 559 - 1.
+        assert_eq!(r1_primary.template_length(), 275, "R1 primary TLEN");
         assert_eq!(
-            r1_supp_tlen, r1_primary_tlen,
-            "R1 supp TLEN should equal R1 primary TLEN (both = -R2_TLEN)"
+            r1_supp.template_length(),
+            -186,
+            "R1 supp TLEN is computed against the mate primary, not copied from it"
         );
 
         Ok(())

@@ -518,7 +518,7 @@ impl Template {
             let r2_flags = RawRecordView::new(&rr[r2_i]).flags();
             let r2_is_reverse = (r2_flags & fgumi_raw_bam::flags::REVERSE) != 0;
             let r2_is_unmapped = (r2_flags & fgumi_raw_bam::flags::UNMAPPED) != 0;
-            let r2_tlen = fgumi_raw_bam::template_length(&rr[r2_i]);
+            let r2_end = insert_size_end(&rr[r2_i]);
             let r2_mapq = fgumi_raw_bam::mapq(&rr[r2_i]);
             let r2_cigar_str = fgumi_raw_bam::cigar_to_string_from_raw(&rr[r2_i]);
             let r2_as =
@@ -530,7 +530,12 @@ impl Template {
                     fgumi_raw_bam::set_mate_ref_id(rec, r2_ref_id);
                     fgumi_raw_bam::set_mate_pos(rec, r2_pos);
                     set_mate_flags(rec, r2_is_reverse, r2_is_unmapped);
-                    fgumi_raw_bam::set_template_length(rec, -r2_tlen);
+                    // TLEN is computed from the supplementary's own alignment against the mate
+                    // primary, not copied from the mate primary's TLEN: a supplementary sits at a
+                    // different locus than its own primary, so the primary's value describes
+                    // coordinates this record does not occupy. See issue #673.
+                    let tlen = compute_insert_size_from_ends(insert_size_end(rec), r2_end);
+                    fgumi_raw_bam::set_template_length(rec, tlen);
 
                     let mq_val = if r2_mapq == 255 { 255 } else { i32::from(r2_mapq) };
                     fgumi_raw_bam::update_int_tag(rec.as_mut_vec(), SamTag::MQ, mq_val);
@@ -563,7 +568,7 @@ impl Template {
             let r1_flags = RawRecordView::new(&rr[r1_i]).flags();
             let r1_is_reverse = (r1_flags & fgumi_raw_bam::flags::REVERSE) != 0;
             let r1_is_unmapped = (r1_flags & fgumi_raw_bam::flags::UNMAPPED) != 0;
-            let r1_tlen = fgumi_raw_bam::template_length(&rr[r1_i]);
+            let r1_end = insert_size_end(&rr[r1_i]);
             let r1_mapq = fgumi_raw_bam::mapq(&rr[r1_i]);
             let r1_cigar_str = fgumi_raw_bam::cigar_to_string_from_raw(&rr[r1_i]);
             let r1_as =
@@ -575,7 +580,9 @@ impl Template {
                     fgumi_raw_bam::set_mate_ref_id(rec, r1_ref_id);
                     fgumi_raw_bam::set_mate_pos(rec, r1_pos);
                     set_mate_flags(rec, r1_is_reverse, r1_is_unmapped);
-                    fgumi_raw_bam::set_template_length(rec, -r1_tlen);
+                    // See the R1 supplemental loop above: computed, not copied. Issue #673.
+                    let tlen = compute_insert_size_from_ends(insert_size_end(rec), r1_end);
+                    fgumi_raw_bam::set_template_length(rec, tlen);
 
                     let mq_val = if r1_mapq == 255 { 255 } else { i32::from(r1_mapq) };
                     fgumi_raw_bam::update_int_tag(rec.as_mut_vec(), SamTag::MQ, mq_val);
@@ -813,41 +820,82 @@ fn set_mate_flags(record: &mut [u8], mate_is_reverse: bool, mate_is_unmapped: bo
     fgumi_raw_bam::set_flags(record, f);
 }
 
-/// Computes insert size (TLEN) from two raw BAM records.
+/// The fields of one record needed to compute an insert size against another.
+///
+/// Snapshotting these lets the supplementary fix-up loops compute a TLEN against the
+/// mate primary without holding a second borrow of `self.records` inside the loop.
+///
+/// This is also the shared input to [`compute_insert_size_from_ends`], the one copy of the
+/// htsjdk 5'-difference-plus-adjustment formula. `zipper` (through [`insert_size_end`]) and
+/// `clip` (through its `MateSnap`) reach it from different record representations — raw BAM
+/// bytes versus a pre-mutation snapshot — but must not each carry the arithmetic: a future
+/// tie-break or overflow fix applied to only one copy would silently diverge that command's
+/// output from fgbio/htsjdk.
+#[derive(Clone, Copy)]
+pub(crate) struct InsertSizeEnd {
+    ref_id: i32,
+    is_unmapped: bool,
+    /// 1-based 5' position: alignment start for forward reads, alignment end for reverse.
+    five_prime: i32,
+}
+
+impl InsertSizeEnd {
+    /// Builds an end from a 1-based 5' position, saturating one that does not fit in `i32`.
+    ///
+    /// A position past `i32::MAX` is reachable only from a malformed record; saturating keeps
+    /// [`compute_insert_size_from_ends`] from overflowing rather than wrapping.
+    pub(crate) fn new(ref_id: i32, is_unmapped: bool, five_prime: i64) -> Self {
+        Self { ref_id, is_unmapped, five_prime: i32::try_from(five_prime).unwrap_or(i32::MAX) }
+    }
+}
+
+/// Snapshots the insert-size-relevant fields of a raw BAM record.
 ///
 /// Uses 0-based pos from BAM; converts to 1-based for the calculation.
-fn compute_insert_size_raw(rec1: &[u8], rec2: &[u8]) -> i32 {
+fn insert_size_end(rec: &[u8]) -> InsertSizeEnd {
     use fgumi_raw_bam;
 
-    let f1 = RawRecordView::new(rec1).flags();
-    let f2 = RawRecordView::new(rec2).flags();
+    let flags = RawRecordView::new(rec).flags();
 
-    // If either read is unmapped, return 0
-    if (f1 & fgumi_raw_bam::flags::UNMAPPED) != 0 || (f2 & fgumi_raw_bam::flags::UNMAPPED) != 0 {
-        return 0;
-    }
-
-    // If reads are on different references, return 0
-    if fgumi_raw_bam::ref_id(rec1) != fgumi_raw_bam::ref_id(rec2) {
-        return 0;
-    }
-
-    // pos is 0-based in BAM; convert to 1-based for the calculation
-    let pos1 = fgumi_raw_bam::pos(rec1) + 1;
-    let pos2 = fgumi_raw_bam::pos(rec2) + 1;
-
+    // pos is 0-based in BAM; convert to 1-based for the calculation. Widened to i64 so a malformed
+    // record with an extreme POS cannot overflow before the unmapped/cross-reference guards run.
+    let start = i64::from(fgumi_raw_bam::pos(rec)) + 1;
     // alignment end (1-based inclusive) = pos_1based + ref_len - 1
-    let ref_len1 = fgumi_raw_bam::reference_length_from_raw_bam(rec1);
-    let ref_len2 = fgumi_raw_bam::reference_length_from_raw_bam(rec2);
-    let end1 = pos1 + ref_len1 - 1;
-    let end2 = pos2 + ref_len2 - 1;
+    let end = start + i64::from(fgumi_raw_bam::reference_length_from_raw_bam(rec)) - 1;
 
     // 5' position: forward=start, reverse=end
-    let first_5prime = if (f1 & fgumi_raw_bam::flags::REVERSE) != 0 { end1 } else { pos1 };
-    let second_5prime = if (f2 & fgumi_raw_bam::flags::REVERSE) != 0 { end2 } else { pos2 };
+    let five_prime = if (flags & fgumi_raw_bam::flags::REVERSE) != 0 { end } else { start };
 
-    let adjustment = if second_5prime >= first_5prime { 1 } else { -1 };
-    second_5prime - first_5prime + adjustment
+    InsertSizeEnd::new(
+        fgumi_raw_bam::ref_id(rec),
+        (flags & fgumi_raw_bam::flags::UNMAPPED) != 0,
+        five_prime,
+    )
+}
+
+/// Computes the insert size (TLEN) `first` should carry relative to `second`.
+///
+/// Returns 0 when either end is unmapped or the two are on different references, matching
+/// htsjdk `SamPairUtil.computeInsertSize`. For a primary pair the other end carries the negation
+/// of this value; supplementary alignments instead take their own value from a second call with
+/// the supplementary as `first`.
+///
+/// This is the single copy of the formula: `commands::clip::compute_insert_size_raw` delegates
+/// here rather than repeating it. See [`InsertSizeEnd`].
+pub(crate) fn compute_insert_size_from_ends(first: InsertSizeEnd, second: InsertSizeEnd) -> i32 {
+    if first.is_unmapped || second.is_unmapped || first.ref_id != second.ref_id {
+        return 0;
+    }
+
+    // Widen to i64 so a malformed record with an extreme POS cannot overflow the subtraction.
+    let (first_5p, second_5p) = (i64::from(first.five_prime), i64::from(second.five_prime));
+    let adjustment = if second_5p >= first_5p { 1 } else { -1 };
+    i32::try_from(second_5p - first_5p + adjustment).unwrap_or(0)
+}
+
+/// Computes insert size (TLEN) from two raw BAM records.
+fn compute_insert_size_raw(rec1: &[u8], rec2: &[u8]) -> i32 {
+    compute_insert_size_from_ends(insert_size_end(rec1), insert_size_end(rec2))
 }
 
 /// Determines the pair orientation for a paired read using raw BAM bytes.
@@ -1006,6 +1054,7 @@ impl MemoryEstimate for Template {
 mod tests {
     use super::*;
     use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags as raw_flags};
+    use rstest::rstest;
 
     // SAM flag constants
     const FLAG_PAIRED: u16 = 0x1;
@@ -1547,7 +1596,7 @@ mod tests {
     }
 
     /// Tests that `fix_mate_info` sets TLEN on R1 supplementary alignments.
-    /// TLEN should be set to negative of mate primary's (R2) TLEN.
+    /// TLEN is computed from the supplementary's own alignment against the mate primary.
     #[test]
     fn test_fix_mate_info_sets_tlen_on_r1_supplementals() -> Result<()> {
         let r1 = create_mapped_record_with_tlen(b"read1", FLAG_PAIRED | FLAG_READ1, 100, 30, 200);
@@ -1563,19 +1612,19 @@ mod tests {
         let mut template = Template::from_records(vec![r1, r2, r1_supp])?;
         template.fix_mate_info()?;
 
-        // R1(pos=100,forward) and R2(pos=200,forward) → insert_size = 101
-        // R1 supplementary TLEN = -(-101) = 101
+        // The supplementary (pos=300, forward) lies right of its mate primary R2 (pos=200), so it
+        // is the rightmost segment: TLEN = 200 - 300 - 1 = -101.
         assert_eq!(
             template.records()[2].template_length(),
-            101,
-            "R1 supplementary TLEN should be negative of R2's TLEN"
+            -101,
+            "R1 supplementary TLEN is computed against the mate primary, not copied from it"
         );
 
         Ok(())
     }
 
     /// Tests that `fix_mate_info` sets TLEN on R2 supplementary alignments.
-    /// TLEN should be set to negative of mate primary's (R1) TLEN.
+    /// TLEN is computed from the supplementary's own alignment against the mate primary.
     #[test]
     fn test_fix_mate_info_sets_tlen_on_r2_supplementals() -> Result<()> {
         let r1 = create_mapped_record_with_tlen(b"read1", FLAG_PAIRED | FLAG_READ1, 100, 30, 300);
@@ -1591,12 +1640,12 @@ mod tests {
         let mut template = Template::from_records(vec![r1, r2, r2_supp])?;
         template.fix_mate_info()?;
 
-        // R1(pos=100,forward) and R2(pos=200,forward) → insert_size = 101
-        // R2 supplementary TLEN = -(101) = -101
+        // The supplementary (pos=400, forward) lies right of its mate primary R1 (pos=100), so it
+        // is the rightmost segment: TLEN = 100 - 400 - 1 = -301.
         assert_eq!(
             template.records()[2].template_length(),
-            -101,
-            "R2 supplementary TLEN should be negative of R1's TLEN"
+            -301,
+            "R2 supplementary TLEN is computed against the mate primary, not copied from it"
         );
 
         Ok(())
@@ -1641,16 +1690,107 @@ mod tests {
             Template::from_records(vec![r1, r2, r1_supp1, r1_supp2, r2_supp1, r2_supp2])?;
         template.fix_mate_info()?;
 
-        // R1(pos=100,forward) and R2(pos=200,forward) → insert_size = 101
-        // R1 supplementaries should have TLEN = -(-101) = 101
-        assert_eq!(template.records()[2].template_length(), 101, "R1 supp1 TLEN");
-        assert_eq!(template.records()[3].template_length(), 101, "R1 supp2 TLEN");
+        // Each supplementary gets its own TLEN, computed against its mate primary — so unlike the
+        // old copy-the-mate's-TLEN behaviour, the two R1 supplementaries no longer share a value.
+        // R1 supplementaries are measured against primary R2 (pos=200); order is reversed.
+        assert_eq!(template.records()[2].template_length(), -201, "R1 supp@400 TLEN");
+        assert_eq!(template.records()[3].template_length(), -101, "R1 supp@300 TLEN");
 
-        // R2 supplementaries should have TLEN = -(101) = -101
-        assert_eq!(template.records()[4].template_length(), -101, "R2 supp1 TLEN");
-        assert_eq!(template.records()[5].template_length(), -101, "R2 supp2 TLEN");
+        // R2 supplementaries are measured against primary R1 (pos=100); order is reversed.
+        assert_eq!(template.records()[4].template_length(), -501, "R2 supp@600 TLEN");
+        assert_eq!(template.records()[5].template_length(), -401, "R2 supp@500 TLEN");
 
         Ok(())
+    }
+
+    /// Builds a mapped 100M record on an explicit reference at a 1-based position.
+    fn create_mapped_record_on_ref(name: &[u8], flags: u16, ref_id: i32, pos: usize) -> RawRecord {
+        let mut rec = create_mapped_record_with_tlen(name, flags, pos, 60, 0);
+        fgumi_raw_bam::set_ref_id(&mut rec, ref_id);
+        rec
+    }
+
+    /// A supplementary's TLEN is computed from its own alignment against the mate primary rather
+    /// than copied from the mate primary's TLEN. See issue #673 and samtools/htsjdk#1795.
+    ///
+    /// R1 and R2 primaries are forward 100M at 1-based 1000 and 1350; the R1 supplementary is
+    /// forward 100M and varies by reference and position.
+    #[rstest]
+    // Supplementary right of the mate primary: it is the rightmost segment, so TLEN is negative.
+    #[case::beyond_mate(0, 5_000, -3_651)]
+    // Supplementary left of the mate primary: it is the leftmost segment, so TLEN is positive.
+    #[case::before_mate(0, 500, 851)]
+    // Coincident 5' ends: the two ends must differ in sign, so the +1 adjustment applies.
+    #[case::coincident_five_prime(0, 1_350, 1)]
+    // Different reference: the information is unavailable, so TLEN is 0 rather than the mate's.
+    #[case::cross_reference(1, 5_000, 0)]
+    fn test_supplemental_tlen_is_computed_not_copied(
+        #[case] supp_ref_id: i32,
+        #[case] supp_pos: usize,
+        #[case] expected_tlen: i32,
+    ) -> Result<()> {
+        let r1 = create_mapped_record_on_ref(b"read1", FLAG_PAIRED | FLAG_READ1, 0, 1_000);
+        let r2 = create_mapped_record_on_ref(b"read1", FLAG_PAIRED | FLAG_READ2, 0, 1_350);
+        let r1_supp = create_mapped_record_on_ref(
+            b"read1",
+            FLAG_PAIRED | FLAG_READ1 | FLAG_SUPPLEMENTARY,
+            supp_ref_id,
+            supp_pos,
+        );
+
+        let mut template = Template::from_records(vec![r1, r2, r1_supp])?;
+        template.fix_mate_info()?;
+
+        assert_eq!(template.records()[2].template_length(), expected_tlen);
+
+        // The primaries are unaffected by where the supplementary landed.
+        assert_eq!(template.records()[0].template_length(), 351, "R1 primary TLEN");
+        assert_eq!(template.records()[1].template_length(), -351, "R2 primary TLEN");
+
+        Ok(())
+    }
+
+    /// `compute_insert_size_from_ends` is the one copy of the htsjdk formula — `zipper`'s
+    /// supplementary fix-up and `commands::clip::compute_insert_size_raw` both route through
+    /// it — so its contract is pinned directly against htsjdk
+    /// `SamPairUtil.computeInsertSize`: 0 if either end is unmapped or the ends are on
+    /// different references, otherwise `second5p - first5p + (second5p >= first5p ? 1 : -1)`.
+    #[rstest]
+    // Second end to the right: positive, with the +1 adjustment.
+    #[case::second_end_right(0, false, 1_000, 0, false, 1_350, 351)]
+    // Second end to the left: negative, with the -1 adjustment.
+    #[case::second_end_left(0, false, 1_350, 0, false, 1_000, -351)]
+    // Coincident 5' ends: `>=` selects +1, so the two ends of a pair still differ in sign.
+    #[case::coincident_five_prime(0, false, 1_000, 0, false, 1_000, 1)]
+    // One base apart in each direction, pinning the sign flip at the boundary.
+    #[case::one_base_right(0, false, 1_000, 0, false, 1_001, 2)]
+    #[case::one_base_left(0, false, 1_000, 0, false, 999, -2)]
+    // Either end unmapped, or the ends on different references: no insert size.
+    #[case::first_unmapped(0, true, 1_000, 0, false, 1_350, 0)]
+    #[case::second_unmapped(0, false, 1_000, 0, true, 1_350, 0)]
+    #[case::cross_reference(0, false, 1_000, 1, false, 1_350, 0)]
+    fn test_compute_insert_size_from_ends_matches_htsjdk(
+        #[case] first_ref_id: i32,
+        #[case] first_unmapped: bool,
+        #[case] first_five_prime: i64,
+        #[case] second_ref_id: i32,
+        #[case] second_unmapped: bool,
+        #[case] second_five_prime: i64,
+        #[case] expected_tlen: i32,
+    ) {
+        let first = InsertSizeEnd::new(first_ref_id, first_unmapped, first_five_prime);
+        let second = InsertSizeEnd::new(second_ref_id, second_unmapped, second_five_prime);
+        assert_eq!(compute_insert_size_from_ends(first, second), expected_tlen);
+    }
+
+    /// A 5' position past `i32::MAX` is only reachable from a malformed record.
+    /// `InsertSizeEnd::new` saturates it so the subtraction cannot overflow; the pair of
+    /// saturated ends then reads as coincident rather than wrapping to a bogus TLEN.
+    #[test]
+    fn test_insert_size_end_saturates_an_out_of_range_five_prime() {
+        let huge = InsertSizeEnd::new(0, false, i64::from(i32::MAX) + 10);
+        let at_max = InsertSizeEnd::new(0, false, i64::from(i32::MAX));
+        assert_eq!(compute_insert_size_from_ends(huge, at_max), 1);
     }
 
     /// Tests that `fix_mate_info` recalculates TLEN for supplementaries based on primary positions
@@ -1669,10 +1809,11 @@ mod tests {
         let mut template = Template::from_records(vec![r1, r2, r1_supp])?;
         template.fix_mate_info()?;
 
-        // R1(pos=100,forward) and R2(pos=200,forward) → insert_size = 101
+        // The stale TLEN of 999 is discarded and recomputed: the supplementary (pos=300) lies
+        // right of its mate primary R2 (pos=200), giving 200 - 300 - 1 = -101.
         assert_eq!(
             template.records()[2].template_length(),
-            101,
+            -101,
             "R1 supplementary TLEN should be recalculated from positions"
         );
 
@@ -1868,8 +2009,9 @@ mod tests {
         assert!(supp.is_mate_reverse(), "R1 supp should have mate_reverse since R2 is reverse");
         // Mate unmapped should NOT be set
         assert!(!supp.is_mate_unmapped(), "R1 supp should NOT have mate_unmapped");
-        // TLEN should be -(-200) = 200
-        assert_eq!(supp.template_length(), 200, "R1 supp TLEN should be -(-200) = 200");
+        // TLEN is computed against R2 (200..299 reverse, 5' = 299), not copied from it: the
+        // supplementary (500..599 forward, 5' = 500) is rightmost, so 299 - 500 - 1 = -202.
+        assert_eq!(supp.template_length(), -202, "R1 supp TLEN computed against R2");
         // MQ tag should be R2's mapq (40)
         assert_eq!(supp.tags().find_int(SamTag::MQ), Some(40), "R1 supp MQ should be R2's mapq");
         // MC tag should be present
@@ -1936,9 +2078,9 @@ mod tests {
             !supp.is_mate_reverse(),
             "R2 supp should NOT have mate_reverse since R1 is forward"
         );
-        // TLEN = -(101) = -101
-        // R1(pos=100,forward) and R2(pos=200,forward) → insert_size = 101
-        assert_eq!(supp.template_length(), -101, "R2 supp TLEN should be -101");
+        // TLEN is computed against R1 (forward, 5' = 100), not copied from it: the supplementary
+        // (600..699 forward, 5' = 600) is rightmost, so 100 - 600 - 1 = -501.
+        assert_eq!(supp.template_length(), -501, "R2 supp TLEN computed against R1");
         // MQ tag should be R1's mapq (35)
         assert_eq!(supp.tags().find_int(SamTag::MQ), Some(35), "R2 supp MQ should be R1's mapq");
         // MC tag should be present
@@ -2106,13 +2248,17 @@ mod tests {
         let mut template = Template::from_records(vec![r1, r2, r1_supp1, r1_supp2])?;
         template.fix_mate_info()?;
 
-        // R1(pos=100,forward) and R2(pos=300,100M,reverse) → 5' are 100 and 399 → insert_size = 300
+        // Mate info is shared by both supplementaries; TLEN is not, since each is computed from
+        // its own alignment against R2 (300..399 reverse, 5' = 399).
         for i in 2..=3 {
             let supp = &template.records()[i];
             assert_eq!(supp.mate_pos() + 1, 300, "Supp {i} should have mate pos 300");
             assert!(supp.is_mate_reverse(), "Supp {i} should have mate_reverse");
-            assert_eq!(supp.template_length(), 300, "Supp {i} TLEN should be 300");
         }
+
+        // Supplementaries are stored in reverse order: [2] is the one at 700, [3] at 500.
+        assert_eq!(template.records()[2].template_length(), -302, "supp@700: 399 - 700 - 1");
+        assert_eq!(template.records()[3].template_length(), -102, "supp@500: 399 - 500 - 1");
 
         Ok(())
     }

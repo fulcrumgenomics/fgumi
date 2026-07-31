@@ -13,7 +13,9 @@ use crate::metrics::writer::write_metrics as write_metrics_tsv;
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::reference::ReferenceReader;
 use crate::sam::SamTag;
-use crate::template::{TemplateBatch, TemplateIterator};
+use crate::template::{
+    InsertSizeEnd, TemplateBatch, TemplateIterator, compute_insert_size_from_ends,
+};
 use crate::unified_pipeline::{
     GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
 };
@@ -853,6 +855,23 @@ struct MateSnap {
 }
 
 impl MateSnap {
+    /// Snapshots only the fields `compute_insert_size_raw` reads, skipping the `cigar_to_string`
+    /// allocation. `cigar` and `mapq` are left empty/zero, so the result must not be used to write
+    /// a mate's MC or MQ tag.
+    fn coords_of(rec: &RawRecord) -> Self {
+        use fgumi_raw_bam::flags as rflags;
+        Self {
+            ref_id: rec.ref_id(),
+            pos: rec.pos(),
+            neg: rec.flags() & rflags::REVERSE != 0,
+            unmapped: rec.flags() & rflags::UNMAPPED != 0,
+            mapq: 0,
+            cigar: String::new(),
+            aln_start: rec.alignment_start_1based(),
+            aln_end: rec.alignment_end_1based(),
+        }
+    }
+
     fn of(rec: &RawRecord) -> Self {
         use fgumi_raw_bam::flags as rflags;
         Self {
@@ -902,17 +921,21 @@ fn clear_mate_mq_mc_raw(rec: &mut RawRecord) {
 /// Computes the TLEN (inferred insert size) for the first read of a pair, mirroring
 /// htsjdk `SamPairUtil.computeInsertSize`. Returns 0 unless both reads are mapped to
 /// the same reference; the second read's TLEN is the negation of this value.
+///
+/// Only the 5'-position extraction lives here — `MateSnap` caches the alignment ends, and a
+/// read whose CIGAR yields none has no insert size. The arithmetic itself is
+/// [`compute_insert_size_from_ends`], shared with `template`'s supplementary-TLEN fix-up so
+/// the two commands cannot drift apart on ties, overflow, or the htsjdk adjustment.
 fn compute_insert_size_raw(s1: &MateSnap, s2: &MateSnap) -> i32 {
-    if s1.unmapped || s2.unmapped || s1.ref_id != s2.ref_id {
-        return 0;
-    }
     let five_prime = |s: &MateSnap| if s.neg { s.aln_end } else { s.aln_start };
     let (Some(p1), Some(p2)) = (five_prime(s1), five_prime(s2)) else {
         return 0;
     };
-    let (p1, p2) = (p1 as i64, p2 as i64);
-    let adjustment = if p2 >= p1 { 1 } else { -1 };
-    i32::try_from(p2 - p1 + adjustment).unwrap_or(0)
+    let to_i64 = |p: usize| i64::try_from(p).unwrap_or(i64::MAX);
+    compute_insert_size_from_ends(
+        InsertSizeEnd::new(s1.ref_id, s1.unmapped, to_i64(p1)),
+        InsertSizeEnd::new(s2.ref_id, s2.unmapped, to_i64(p2)),
+    )
 }
 
 /// Sets full mate-pair information on a read pair, mirroring htsjdk
@@ -989,19 +1012,28 @@ fn set_mate_info_raw(r1: &mut RawRecord, r2: &mut RawRecord) {
 }
 
 /// Ports htsjdk 5.0.0 `SamPairUtil.setMateInformationOnSupplementalAlignment(supp, matePrimary,
-/// setMateCigar=true)`.
+/// setMateCigar=true)` **except for TLEN**, where it intentionally diverges.
 ///
-/// fgbio `ClipBam` calls this on every supplementary alignment after clipping the primary pair,
-/// so a supplemental's mate fields point at its mate *primary* read. It sets mate ref/pos/strand,
-/// the mate-unmapped flag, TLEN (the negation of the mate primary's already-updated TLEN), the
-/// mate CIGAR (MC, only when the mate is mapped) and — as of htsjdk 5.0.0 — the mate mapping
-/// quality (MQ, unconditionally). `mate` and `mate_tlen` are snapshotted from the post-clip
-/// primary so the caller can fix several supplementals without re-borrowing the primaries.
-fn set_supplemental_mate_info_raw(supp: &mut RawRecord, mate: &MateSnap, mate_tlen: i32) {
+/// htsjdk sets the supplementary's TLEN to the negation of the mate primary's. That assumes the
+/// supplementary sits where its own primary sits, which is false by construction for split
+/// alignments: the primary's TLEN describes coordinates this record does not occupy. Copying it
+/// yields a non-zero TLEN across references, and the wrong sign and magnitude when the
+/// supplementary lies beyond its mate. This computes TLEN from the supplementary's own alignment
+/// against the mate primary instead, matching bwa-mem and minibwa. See issue #673 and
+/// samtools/htsjdk#1795.
+///
+/// Everything else follows htsjdk: fgbio `ClipBam` calls this on every supplementary alignment
+/// after clipping the primary pair, so a supplemental's mate fields point at its mate *primary*
+/// read. It sets mate ref/pos/strand, the mate-unmapped flag, the mate CIGAR (MC, only when the
+/// mate is mapped) and — as of htsjdk 5.0.0 — the mate mapping quality (MQ, unconditionally).
+/// `mate` is snapshotted from the post-clip primary so the caller can fix several supplementals
+/// without re-borrowing the primaries.
+fn set_supplemental_mate_info_raw(supp: &mut RawRecord, mate: &MateSnap) {
+    let tlen = compute_insert_size_raw(&MateSnap::coords_of(supp), mate);
     supp.set_mate_ref_id(mate.ref_id);
     supp.set_mate_pos(mate.pos);
     set_mate_flags_raw(supp, mate.neg, mate.unmapped);
-    supp.set_template_length(-mate_tlen);
+    supp.set_template_length(tlen);
     let mut editor = supp.tags_editor();
     if mate.unmapped {
         editor.remove(SamTag::MC);
@@ -1054,9 +1086,7 @@ fn find_primary_pair_indices(records: &[RawRecord]) -> Result<(Option<usize>, Op
 fn fix_supplemental_mate_info(records: &mut [RawRecord], r1_idx: usize, r2_idx: usize) {
     // Snapshot the post-clip primaries so the per-supplemental updates don't re-borrow them.
     let r1_snap = MateSnap::of(&records[r1_idx]);
-    let r1_tlen = records[r1_idx].template_length();
     let r2_snap = MateSnap::of(&records[r2_idx]);
-    let r2_tlen = records[r2_idx].template_length();
 
     for rec in records.iter_mut() {
         if !rec.is_supplementary() {
@@ -1064,9 +1094,9 @@ fn fix_supplemental_mate_info(records: &mut [RawRecord], r1_idx: usize, r2_idx: 
         }
         // R1 supplementals (unpaired or first-of-pair) take R2 as their mate; R2 supplementals R1.
         if !rec.is_paired() || rec.is_first_segment() {
-            set_supplemental_mate_info_raw(rec, &r2_snap, r2_tlen);
+            set_supplemental_mate_info_raw(rec, &r2_snap);
         } else if rec.is_last_segment() {
-            set_supplemental_mate_info_raw(rec, &r1_snap, r1_tlen);
+            set_supplemental_mate_info_raw(rec, &r1_snap);
         }
     }
 }
@@ -1234,7 +1264,8 @@ mod tests {
     }
 
     // set_supplemental_mate_info_raw copies a mapped mate's coordinate/strand/MAPQ onto a
-    // supplementary read, writes MC from the mate CIGAR, sets MQ, and negates the mate TLEN.
+    // supplementary read, writes MC from the mate CIGAR, sets MQ, and computes TLEN from the
+    // supplementary's own alignment against the mate.
     #[test]
     fn test_set_supplemental_mate_info_raw_mapped_mate() {
         use fgumi_raw_bam::flags as rflags;
@@ -1243,11 +1274,13 @@ mod tests {
         let mate = raw_read(false, false, true, 301, 40);
         let mut supp = raw_read(true, true, false, 700, 30);
 
-        set_supplemental_mate_info_raw(&mut supp, &MateSnap::of(&mate), 120);
+        set_supplemental_mate_info_raw(&mut supp, &MateSnap::of(&mate));
 
         assert_eq!(supp.mate_ref_id(), 0);
         assert_eq!(supp.mate_pos(), 300);
-        assert_eq!(supp.template_length(), -120);
+        // The supplementary (700..749, forward, 5' = 700) is the rightmost segment; the mate
+        // (301..350, reverse, 5' = 350) is leftmost. TLEN = 350 - 700 - 1.
+        assert_eq!(supp.template_length(), -351);
         assert_ne!(supp.flags() & rflags::MATE_REVERSE, 0, "mate is reverse");
         assert_eq!(supp.flags() & rflags::MATE_UNMAPPED, 0, "mate is mapped");
         assert_eq!(supp.tags().find_mc(), Some("50M"));
@@ -1281,8 +1314,9 @@ mod tests {
         supp.tags_editor().update_string(SamTag::MC, b"10M");
         assert!(supp.tags().contains(SamTag::MC), "MC present before");
 
-        set_supplemental_mate_info_raw(&mut supp, &MateSnap::of(&mate), 0);
+        set_supplemental_mate_info_raw(&mut supp, &MateSnap::of(&mate));
 
+        assert_eq!(supp.template_length(), 0, "TLEN is 0 when the mate is unmapped");
         assert_ne!(supp.flags() & rflags::MATE_UNMAPPED, 0, "mate is unmapped");
         assert!(!supp.tags().contains(SamTag::MC), "MC dropped when mate unmapped");
         // MQ is set unconditionally to the mate's mapping quality, even for an unmapped mate.
@@ -1290,7 +1324,8 @@ mod tests {
     }
 
     // fix_supplemental_mate_info points R1 supplementals at the primary R2 and R2 supplementals
-    // at the primary R1, inheriting each primary's coordinate/strand/MAPQ and negated TLEN.
+    // at the primary R1, inheriting each primary's coordinate/strand/MAPQ and computing TLEN from
+    // the supplementary's own alignment.
     #[test]
     fn test_fix_supplemental_mate_info() {
         use fgumi_raw_bam::flags as rflags;
@@ -1311,14 +1346,62 @@ mod tests {
         assert_eq!(recs[2].mate_pos(), 300);
         assert_ne!(recs[2].flags() & rflags::MATE_REVERSE, 0, "primary R2 is reverse");
         assert_eq!(recs[2].tags().find_int(SamTag::MQ), Some(40));
-        assert_eq!(recs[2].template_length(), 200); // -(-200)
+        // Supp R1 (701..750, forward, 5' = 701) lies right of primary R2 (5' = 350): 350-701-1.
+        assert_eq!(recs[2].template_length(), -352);
 
         // Supp R2 (idx 3) takes primary R1 (idx 0) as its mate.
         assert_eq!(recs[3].mate_ref_id(), 0);
         assert_eq!(recs[3].mate_pos(), 100);
         assert_eq!(recs[3].flags() & rflags::MATE_REVERSE, 0, "primary R1 is forward");
         assert_eq!(recs[3].tags().find_int(SamTag::MQ), Some(60));
-        assert_eq!(recs[3].template_length(), -200);
+        // Supp R2 (901..950, forward, 5' = 901) lies right of primary R1 (5' = 101): 101-901-1.
+        assert_eq!(recs[3].template_length(), -801);
+    }
+
+    /// Builds a mapped record on an explicit reference for the supplementary-TLEN cases below.
+    ///
+    /// The builder validates `reference_sequence_id` against its single-contig test header, so the
+    /// record is built on reference 0 and the id is stamped onto the encoded record afterwards.
+    fn raw_read_on_ref(
+        first: bool,
+        supplementary: bool,
+        reverse: bool,
+        ref_id: i32,
+        start: usize,
+    ) -> RawRecord {
+        let mut rec = raw_read(first, supplementary, reverse, start, 60);
+        rec.set_ref_id(ref_id);
+        rec
+    }
+
+    /// A supplementary's TLEN is computed from its own alignment against the mate primary, not
+    /// copied from the mate primary's TLEN. See issue #673 and samtools/htsjdk#1795.
+    ///
+    /// The mate primary is always a reverse-strand read at 1-based 301 (50M, so 5' = 350).
+    #[rstest]
+    // Supplementary right of the mate: it is the rightmost segment, so TLEN is negative.
+    #[case::beyond_mate(0, 700, -351)]
+    // Supplementary left of the mate: it is the leftmost segment, so TLEN is positive.
+    #[case::before_mate(0, 100, 251)]
+    // Coincident 5' ends: htsjdk's convention gives the two ends differing signs via the +1/-1
+    // adjustment, so the leftmost-by-tie-break gets +1.
+    #[case::coincident_five_prime(0, 350, 1)]
+    // Different reference: the information is unavailable, so TLEN is 0.
+    #[case::cross_reference(1, 700, 0)]
+    fn test_supplemental_tlen_is_computed_not_copied(
+        #[case] supp_ref_id: i32,
+        #[case] supp_start: usize,
+        #[case] expected_tlen: i32,
+    ) {
+        let mate = raw_read_on_ref(false, false, true, 0, 301);
+        let mut supp = raw_read_on_ref(true, true, false, supp_ref_id, supp_start);
+        // Seed a value that the old copy-the-mate's-TLEN behaviour would have propagated, so a
+        // regression cannot pass by coincidence.
+        supp.set_template_length(-9999);
+
+        set_supplemental_mate_info_raw(&mut supp, &MateSnap::of(&mate));
+
+        assert_eq!(supp.template_length(), expected_tlen);
     }
 
     // The RecordBuf unsoftclipped_start/end helpers (used by the RecordBuf clip path) subtract or
