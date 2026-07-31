@@ -17,15 +17,24 @@ use crate::bitmask::FastqBitmask;
 /// This is the fast path for record boundary detection. Use [`lex_block_full`]
 /// when ACGT classification and 2-bit encoding are also needed.
 #[inline]
+#[allow(unsafe_code)]
 pub fn lex_block(block: &[u8; 64]) -> u64 {
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is architecturally mandatory on aarch64, so the
+        // `target_feature(enable = "neon")` precondition holds unconditionally
+        // on this branch. `block` is a `&[u8; 64]`, satisfying the callee's
+        // requirement that it may read exactly 64 bytes from `block.as_ptr()`.
         unsafe { lex_block_newlines_neon(block) }
     }
 
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
+            // SAFETY: guarded by the `is_x86_feature_detected!("avx2")` check
+            // immediately above, which is the callee's `target_feature`
+            // precondition. `block` is a `&[u8; 64]`, so the 64 bytes the
+            // callee reads from `block.as_ptr()` are all in bounds.
             unsafe { lex_block_newlines_avx2(block) }
         } else {
             lex_block_newlines_scalar(block)
@@ -44,15 +53,24 @@ pub fn lex_block(block: &[u8; 64]) -> u64 {
 /// (e.g., for UMI extraction in a fused pipeline).
 #[inline]
 #[must_use]
+#[allow(unsafe_code)]
 pub fn lex_block_full(block: &[u8; 64]) -> FastqBitmask {
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is architecturally mandatory on aarch64, so the
+        // `target_feature(enable = "neon")` precondition holds unconditionally
+        // on this branch. `block` is a `&[u8; 64]`, satisfying the callee's
+        // requirement that it may read exactly 64 bytes from `block.as_ptr()`.
         unsafe { lex_block_neon(block) }
     }
 
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
+            // SAFETY: guarded by the `is_x86_feature_detected!("avx2")` check
+            // immediately above, which is the callee's `target_feature`
+            // precondition. `block` is a `&[u8; 64]`, so the 64 bytes the
+            // callee reads from `block.as_ptr()` are all in bounds.
             unsafe { lex_block_avx2(block) }
         } else {
             lex_block_scalar(block)
@@ -151,12 +169,16 @@ use std::arch::aarch64::uint8x16_t;
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
+#[allow(unsafe_code)]
 unsafe fn neon_movemask(cmp: uint8x16_t) -> u64 {
     use std::arch::aarch64::{
         vaddv_u8, vcreate_u8, vget_high_u8, vget_low_u8, vmul_u8, vshrq_n_u8,
     };
 
-    // NEON intrinsics are safe to call inside a #[target_feature(enable = "neon")] function
+    // SAFETY: every intrinsic below is register-only -- none dereferences a
+    // pointer -- so the sole precondition is NEON availability, which the
+    // `target_feature(enable = "neon")` attribute makes the caller's obligation
+    // and which is architecturally guaranteed on aarch64.
     let shifted = vshrq_n_u8(cmp, 7);
     let weights = vcreate_u8(u64::from_le_bytes([1, 2, 4, 8, 16, 32, 64, 128]));
     let low = vget_low_u8(shifted);
@@ -173,9 +195,16 @@ unsafe fn neon_movemask(cmp: uint8x16_t) -> u64 {
 ///
 /// Requires NEON support (mandatory on aarch64).
 #[target_feature(enable = "neon")]
+#[allow(unsafe_code)]
 unsafe fn lex_block_newlines_neon(block: &[u8; 64]) -> u64 {
     use std::arch::aarch64::{vceqq_u8, vdupq_n_u8, vld1q_u8};
 
+    // SAFETY: NEON availability is the caller's obligation via `target_feature`.
+    // The only memory access is `vld1q_u8` at `block.as_ptr().add(chunk_idx * 16)`
+    // for `chunk_idx` in `0..4`, reading 16 bytes each: the last load starts at
+    // offset 48 and ends at 64, exactly the length of the `&[u8; 64]`, so every
+    // load is in bounds. `vld1q_u8` is an unaligned load, so no alignment is
+    // required beyond that of `u8`.
     unsafe {
         let newline = vdupq_n_u8(b'\n');
         let mut result: u64 = 0;
@@ -196,6 +225,7 @@ unsafe fn lex_block_newlines_neon(block: &[u8; 64]) -> u64 {
 ///
 /// Requires NEON support (mandatory on aarch64).
 #[target_feature(enable = "neon")]
+#[allow(unsafe_code)]
 unsafe fn lex_block_neon(block: &[u8; 64]) -> FastqBitmask {
     use std::arch::aarch64::{
         vandq_u8, vceqq_u8, vdupq_n_u8, vld1q_u8, vorrq_u8, vqtbl1q_u8, vshrq_n_u8,
@@ -280,11 +310,17 @@ const fn byte_as_i8(b: u8) -> i8 {
 ///
 /// Requires AVX2 support.
 #[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
 unsafe fn lex_block_newlines_avx2(block: &[u8; 64]) -> u64 {
     use std::arch::x86_64::{
         _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
     };
 
+    // SAFETY: AVX2 availability is the caller's obligation via `target_feature`,
+    // enforced at both call sites by `is_x86_feature_detected!("avx2")`. The two
+    // `_mm256_loadu_si256` loads read 32 bytes from offsets 0 and 32 of a
+    // `&[u8; 64]`, covering exactly the array and no more. The `loadu` form is
+    // an unaligned load, so the `__m256i` alignment requirement does not apply.
     unsafe {
         let newline = _mm256_set1_epi8(i8::from_ne_bytes([b'\n']));
         let v1 = _mm256_loadu_si256(block.as_ptr().cast());
@@ -302,6 +338,7 @@ unsafe fn lex_block_newlines_avx2(block: &[u8; 64]) -> u64 {
 ///
 /// Requires AVX2 support (checked by caller via `is_x86_feature_detected!`).
 #[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
 unsafe fn lex_block_avx2(block: &[u8; 64]) -> FastqBitmask {
     use std::arch::x86_64::{
         __m256i, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,

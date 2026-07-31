@@ -210,6 +210,45 @@ regresses `samtools sort -n`–style throughput.
     SAFETY: the buffers are `to_vec()` + push, so the pointer is valid and
     null-terminated for the call's lifetime.
 
+### Approved SIMD intrinsics (fgumi-simd-fastq)
+
+`crates/fgumi-simd-fastq/src/lexer.rs` classifies 64-byte FASTQ blocks through
+hand-written NEON (aarch64) and AVX2 (`x86_64`) intrinsics, with a scalar
+fallback. All `unsafe` in the crate is confined to this one file. It is approved
+because the lexer runs once per 64 bytes of every FASTQ processed (billions of
+blocks on production inputs) and the scalar fallback — retained and exercised in
+tests as the reference implementation — is materially slower.
+
+Calling a `#[target_feature]` function is `unsafe` because the caller must
+guarantee the CPU supports that feature; the intrinsics themselves are then safe
+within it. Two obligations therefore apply at every site, and both are recorded
+in `// SAFETY:` comments:
+
+- **Feature availability.** `lex_block` / `lex_block_full` dispatch on the
+  architecture. On aarch64 NEON is architecturally mandatory, so the precondition
+  is unconditional. On `x86_64` every AVX2 call is guarded by
+  `is_x86_feature_detected!("avx2")` with a scalar `else` branch.
+- **Load bounds.** The only memory accesses are vector loads from
+  `block.as_ptr()`, where `block: &[u8; 64]`. NEON issues four 16-byte
+  `vld1q_u8` loads at offsets 0/16/32/48; AVX2 issues two 32-byte
+  `_mm256_loadu_si256` loads at offsets 0 and 32. Both cover exactly 64 bytes and
+  no more. Both use unaligned load forms, so no alignment beyond `u8` is
+  required.
+
+Seven `#[allow(unsafe_code)]` sites: the two public dispatch functions
+(`lex_block`, `lex_block_full`), the NEON helpers (`neon_movemask`,
+`lex_block_newlines_neon`, `lex_block_neon`), and the AVX2 implementations
+(`lex_block_newlines_avx2`, `lex_block_avx2`). The nested `neon_two_bits` /
+`avx2_two_bits` helpers are covered by the lexically-enclosing allow.
+
+Note that Miri cannot execute these intrinsics, so `miri.yml` does not cover
+this crate. Correctness rests instead on the scalar-parity tests in `lexer.rs`,
+which assert the SIMD and scalar lexers agree:
+`test_simd_matches_scalar_newlines`, `test_simd_full_matches_scalar_all_fields`,
+`test_simd_full_matches_scalar_all_acgt`, and
+`test_simd_full_matches_scalar_every_position`. Any change to the intrinsic
+paths must keep these passing on both architectures.
+
 Any new `unsafe` site must extend this list and explain why the safe
 alternative is unacceptable. Do not introduce `unsafe` outside the crates
 listed in this section.

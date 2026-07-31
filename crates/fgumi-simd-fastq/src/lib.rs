@@ -26,6 +26,11 @@
 //! assert_eq!(records[0].sequence, b"ACGT");
 //! ```
 
+// Every `unsafe` in this crate is confined to the SIMD intrinsic paths in
+// `lexer.rs`, which carry a targeted `#[allow(unsafe_code)]` and a `// SAFETY:`
+// note; see the fgumi-simd-fastq section of CLAUDE.md for the allowlist.
+#![deny(unsafe_code)]
+
 mod bitmask;
 mod lexer;
 mod parser;
