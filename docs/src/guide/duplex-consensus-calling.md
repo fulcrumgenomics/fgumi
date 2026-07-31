@@ -71,16 +71,42 @@ The final duplex R1 and R2 are produced by merging the appropriate A and B reads
 
 ### For Duplex Consensus
 
-`fgumi duplex` and `fgumi filter` accept one, two, or three `--min-reads` values. If fewer than three values are supplied, the last is repeated (e.g. `80 40` becomes `80 40 40`, `10` becomes `10 10 10`).
+`fgumi duplex` and `fgumi filter` accept one, two, or three `--min-reads` values. If fewer than three values are supplied, the last is repeated (e.g. `80,40` becomes `80,40,40`, `10` becomes `10,10,10`).
 
 The values control:
 1. **First value**: minimum total raw reads across both single-strand consensuses for the final duplex read
 2. **Second value**: minimum reads for the single-strand consensus with *more* support
 3. **Third value**: minimum reads for the single-strand consensus with *less* support
 
-If values two and three differ, the more stringent value must come first.
+The values must be given high to low: no value may exceed the one before it, so the total is at least the more-supported strand's minimum, which is in turn at least the less-supported strand's. `--min-reads 1,2` is rejected for the same reason `--min-reads 3,1,2` is.
 
-**Example:** `--min-reads 7 3 1` requires:
+**Example:** `--min-reads 7,3,1` requires:
 - At least 7 total raw reads supporting the duplex consensus
 - At least 3 raw reads for the better-supported single-strand consensus
 - At least 1 raw read for the other single-strand consensus
+
+### Single-strand molecules
+
+Any of the values may be 0. A third value of 0 means the less-supported strand is allowed to
+have no reads at all, so a molecule observed on only one strand still yields a consensus read
+pair:
+
+```console
+fgumi duplex --input grouped.bam --output consensus.bam --min-reads 1,1,0
+```
+
+Every molecule is then collapsed regardless of whether it makes duplex, which is useful when
+the duplex consensus BAM is also meant to stand in for the simplex one. Molecules that made
+duplex are still distinguishable afterward: a single-strand consensus carries `bD:i:0`,
+meaning no reads on the second strand. Filter on `aD`/`bD` (or with `fgumi filter
+--min-reads`) if you need only true duplex molecules.
+
+This matches `fgbio CallDuplexConsensusReads --min-reads 1 1 0`, which produces the same
+consensus reads. Note that fgbio does not document a value of 0 — neither
+`CallDuplexConsensusReads` nor `FilterConsensusReads` describes it — but it does implement
+it, and fgumi's output for `1,1,0` is identical to fgbio's.
+
+A *first* value of 0 is accepted too, and behaves the same as 1: the check it controls is
+`total >= min-reads` over a group that already has at least one read. Unlike `fgumi simplex`
+and `fgumi codec`, which reject 0 because there it really would make the minimum-family-size
+filter a silent no-op, `fgumi duplex` applies no lower bound — as fgbio does not.

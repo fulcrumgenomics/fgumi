@@ -189,7 +189,12 @@ pub struct Duplex {
     pub compression: CompressionOptions,
 
     /// Minimum reads for consensus calling.
-    /// Can specify 1-3 values: \[duplex\] or \[duplex, AB/BA\] or \[duplex, AB, BA\]
+    ///
+    /// Can specify 1-3 values: \[duplex\] or \[duplex, AB/BA\] or \[duplex, AB, BA\]. The values
+    /// must be given high to low — no value may exceed the one before it — so `7,3,1` is
+    /// accepted and `1,2` is rejected. Values may be 0: `1,1,0` emits a consensus for a
+    /// molecule observed on only one strand, so every molecule is collapsed whether or not it
+    /// makes duplex.
     #[arg(short = 'M', long = "min-reads", value_delimiter = ',', default_value = "1")]
     pub min_reads: Vec<usize>,
 
@@ -480,6 +485,7 @@ impl Command for Duplex {
             .with_cell_tag(Some(*SamTag::CB));
         // Single-threaded processing
         // Create overlapping consensus caller for single-threaded mode
+        let single_strand_allowed = self.allows_single_strand_consensus();
         let mut overlapping_caller = if overlapping_enabled {
             Some(OverlappingBasesConsensusCaller::new(
                 AgreementStrategy::Consensus,
@@ -492,10 +498,10 @@ impl Command for Duplex {
         for group_result in mi_group_iter {
             let (_base_mi, mut records) = group_result.context("Failed to read MI group")?;
 
-            // Apply overlapping consensus if enabled (modifies raw bytes in-place)
-            // Skip if group doesn't have both strands - no duplex possible anyway
+            // Apply overlapping consensus if enabled (modifies raw bytes in-place).
+            // Skip single-strand groups only when they cannot produce a consensus anyway.
             if let Some(ref mut oc) = overlapping_caller
-                && has_both_strands_raw(&records)
+                && (single_strand_allowed || has_both_strands_raw(&records))
             {
                 apply_overlapping_consensus(&mut records, oc)?;
             }
@@ -585,14 +591,33 @@ impl Duplex {
         if self.consensus.error_rate_post_umi == 0 {
             bail!("error-rate-post-umi must be > 0");
         }
-        // Matches simplex and codec: 0 admits empty groups, making the
-        // minimum-family-size filter a silent no-op rather than an error.
-        // `DuplexConsensusCaller::new` validates emptiness and high-to-low
-        // ordering but never a lower bound.
-        if self.min_reads.contains(&0) {
-            bail!("--min-reads must be >= 1 (a value of 0 admits empty groups)");
-        }
+        // `--min-reads` is deliberately not bounded below, matching fgbio, which validates
+        // only the ordering -- each value no larger than the one before it
+        // (`total >= XY >= YX`). A 0 in the per-strand slots is fgbio's single-strand mode
+        // (`-M 1 1 0`), where a molecule observed on only one strand still yields a
+        // consensus. A total of 0 is equivalent to 1 rather than degenerate, because the
+        // check it feeds (`min_total <= num_xy + num_yx`) is only reached for a group that
+        // already has at least one read. This is why `duplex` differs from `simplex` and
+        // `codec`, where a 0 really would make the filter a silent no-op.
+        //
+        // The ordering rule itself is `DuplexConsensusCaller`'s, applied here so that both
+        // execution paths reject a bad value before any I/O. `--threads` mode builds its
+        // caller inside the pipeline's per-batch closure, i.e. after the output BAM has
+        // been created, so relying on the constructor alone would turn an argument error
+        // into a mid-run worker failure that leaves a partial output file behind.
+        DuplexConsensusCaller::validate_min_reads(&self.min_reads)?;
         Ok(())
+    }
+
+    /// Whether a molecule seen on only one strand can still yield a consensus, i.e. whether
+    /// the per-strand minimum for the less-covered strand is 0 (fgbio's `-M 1 1 0` mode).
+    ///
+    /// Delegates to `DuplexConsensusCaller`, which owns the `padTo(3, last)` rule, so this
+    /// gate cannot drift from the `min_yx_reads` the caller actually applies. The threaded
+    /// path needs the answer before a caller exists, which is why the delegate takes the
+    /// raw `min_reads` slice rather than reading it off a constructed caller.
+    fn allows_single_strand_consensus(&self) -> bool {
+        DuplexConsensusCaller::allows_single_strand_consensus(&self.min_reads)
     }
 
     /// Execute using 7-step unified pipeline with --threads.
@@ -633,6 +658,7 @@ impl Duplex {
         let collected_metrics_for_serialize = Arc::clone(&collected_metrics);
 
         // Capture configuration for closures
+        let single_strand_allowed = self.allows_single_strand_consensus();
         let min_reads = self.min_reads.clone();
         let min_input_base_quality = self.consensus.min_input_base_quality;
         let output_per_base_tags = self.consensus.output_per_base_tags;
@@ -725,11 +751,11 @@ impl Duplex {
                 caller.clear();
 
                 // Apply overlapping consensus if enabled (modifies raw bytes in-place).
-                // Skip if group doesn't have both strands — no duplex possible anyway.
+                // Skip single-strand groups only when they cannot produce a consensus anyway.
                 // Propagate errors to match single-threaded behavior; silent drops here
                 // would turn real failures into output gaps in --threads mode only.
                 if let Some(ref mut oc) = overlapping_caller
-                    && has_both_strands_raw(&group_reads)
+                    && (single_strand_allowed || has_both_strands_raw(&group_reads))
                 {
                     oc.reset_stats();
                     apply_overlapping_consensus(&mut group_reads, oc).map_err(|e| {
@@ -1184,20 +1210,45 @@ mod tests {
         assert_eq!(duplex.validate().is_ok(), expect_ok);
     }
 
+    /// `validate()` applies exactly the rule fgbio does to `--min-reads`: no lower bound,
+    /// but the values must be ordered high to low — each no larger than the one before it,
+    /// after fgbio's `padTo(3, last)` fills the missing slots.
+    ///
+    /// The accepted cases guard against reintroducing the lower-bound rejection
+    /// `validate()` used to apply. A 0 in the per-strand slots is fgbio's single-strand
+    /// mode (`-M 1 1 0`), where a molecule seen on only one strand still yields a
+    /// consensus; a total of 0 is equivalent to 1, since a group that reaches the check
+    /// has at least one read.
+    ///
+    /// The rejected cases pin the ordering rule to `validate()` rather than to
+    /// `DuplexConsensusCaller::new` alone. `--threads` mode builds its caller inside the
+    /// pipeline's per-batch closure, after the output BAM exists, so an ordering violation
+    /// caught only by the constructor would be a mid-run failure over a partial file
+    /// instead of an argument error.
     #[rstest]
-    #[case::single_zero(vec![0], false)]
-    #[case::zero_in_tail(vec![3, 0], false)]
-    #[case::all_zero(vec![0, 0, 0], false)]
+    #[case::single_zero(vec![0], true)]
+    #[case::all_zero(vec![0, 0, 0], true)]
+    #[case::zero_two_value_form(vec![0, 0], true)]
     #[case::single_one(vec![1], true)]
     #[case::descending(vec![3, 2, 1], true)]
-    fn test_validate_rejects_zero_min_reads(
-        #[case] min_reads: Vec<usize>,
-        #[case] expect_ok: bool,
-    ) {
+    #[case::single_strand_mode(vec![1, 1, 0], true)]
+    #[case::zero_both_strand_slots(vec![1, 0, 0], true)]
+    #[case::zero_in_two_value_form(vec![3, 0], true)]
+    #[case::equal_values(vec![2, 2, 2], true)]
+    #[case::xy_above_total(vec![1, 2, 3], false)]
+    #[case::yx_above_xy(vec![3, 1, 2], false)]
+    #[case::xy_above_total_in_two_value_form(vec![1, 2], false)]
+    #[case::empty(vec![], false)]
+    #[case::too_many_values(vec![4, 3, 2, 1], false)]
+    fn test_validate_min_reads(#[case] min_reads: Vec<usize>, #[case] expect_ok: bool) {
         let mut duplex =
             create_duplex_with_paths(PathBuf::from("test.bam"), PathBuf::from("output.bam"));
-        duplex.min_reads = min_reads;
-        assert_eq!(duplex.validate().is_ok(), expect_ok);
+        duplex.min_reads = min_reads.clone();
+        assert_eq!(
+            duplex.validate().is_ok(),
+            expect_ok,
+            "validate() disagreed with the --min-reads contract for {min_reads:?}"
+        );
     }
 
     #[test]
