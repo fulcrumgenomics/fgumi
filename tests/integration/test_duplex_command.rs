@@ -13,6 +13,7 @@ use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use rstest::rstest;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
@@ -382,6 +383,110 @@ fn test_duplex_command_with_stats() {
             "single-threaded duplex stats must emit the seeded KV row {key}:\n{stats}"
         );
     }
+}
+
+/// The reported `consensus_reads_emitted` must equal the number of consensus records
+/// actually written, in both the single-threaded and pipeline (`--threads N`) paths.
+///
+/// The duplex caller emits R1 and R2 per molecule, so a metric that counts templates
+/// rather than reads reports half the records in the output BAM.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::threaded(Some("2"))]
+fn test_duplex_stats_consensus_reads_matches_records_written(#[case] threads: Option<&str>) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let stats_path = temp_dir.path().join("stats.txt");
+
+    let molecule_ids: Vec<String> = (1..=3).map(|i: i32| i.to_string()).collect();
+    let molecules = (1..=3)
+        .map(|i| create_duplex_molecule(&i.to_string(), "ACGTACGT", 30, 100 + i * 1000, 3))
+        .collect();
+    create_duplex_bam(&input_bam, molecules);
+
+    let mut args = vec![
+        "duplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--stats",
+        stats_path.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ];
+    if let Some(threads) = threads {
+        args.extend_from_slice(&["--threads", threads]);
+    }
+    Duplex::try_parse_from(args)
+        .expect("failed to parse duplex args")
+        .execute("fgumi duplex")
+        .expect("Duplex command failed");
+
+    // Independent oracle: every input molecule must yield exactly one consensus R1 and one
+    // consensus R2, so the output holds 2 records per molecule and each molecule's identity
+    // survives. A bare `records_written > 0` would accept a dropped mate, a dropped molecule,
+    // or a duplicated record whenever `consensus_reads_emitted` is wrong in the same way.
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let _header = reader.read_header().unwrap();
+    let mut records_written = 0_usize;
+    // Per molecule: (R1 count, R2 count), keyed by the molecule ID trailing the consensus
+    // read name (`<read-group-prefix>:<base MI>`).
+    let mut ends_by_molecule: HashMap<String, (usize, usize)> = HashMap::new();
+    for result in reader.records() {
+        let record = result.expect("failed to read consensus record");
+        records_written += 1;
+        let name = String::from_utf8(
+            record.name().expect("consensus record must have a read name").to_vec(),
+        )
+        .expect("consensus read name must be UTF-8");
+        let (_prefix, molecule) = name
+            .rsplit_once(':')
+            .unwrap_or_else(|| panic!("consensus read name '{name}' must be '<prefix>:<MI>'"));
+        let flags = record.flags();
+        assert!(flags.is_segmented(), "consensus record '{name}' must be paired");
+        let ends = ends_by_molecule.entry(molecule.to_string()).or_default();
+        if flags.is_first_segment() {
+            ends.0 += 1;
+        } else if flags.is_last_segment() {
+            ends.1 += 1;
+        } else {
+            panic!("consensus record '{name}' is neither R1 nor R2");
+        }
+    }
+
+    assert_eq!(
+        records_written,
+        2 * molecule_ids.len(),
+        "each of the {} input molecules must emit exactly one consensus R1 and one R2",
+        molecule_ids.len()
+    );
+    for mi in &molecule_ids {
+        assert_eq!(
+            ends_by_molecule.get(mi.as_str()).copied(),
+            Some((1, 1)),
+            "molecule {mi} must emit exactly one consensus R1 and one consensus R2, \
+             got {:?}",
+            ends_by_molecule.get(mi.as_str())
+        );
+    }
+
+    let stats = fs::read_to_string(&stats_path).expect("read stats");
+    let emitted: usize = stats
+        .lines()
+        .find_map(|line| line.strip_prefix("consensus_reads_emitted\t"))
+        .and_then(|rest| rest.split('\t').next())
+        .expect("stats must contain a consensus_reads_emitted row")
+        .parse()
+        .expect("consensus_reads_emitted must be an integer");
+
+    assert_eq!(
+        emitted, records_written,
+        "consensus_reads_emitted must count consensus reads written to the output BAM"
+    );
 }
 
 /// Verifies that the duplex consensus output BAM advertises an *unmapped consensus*

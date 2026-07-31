@@ -252,7 +252,10 @@ pub trait ConsensusCaller: Send + Sync {
 pub struct ConsensusCallingStats {
     /// Total number of input reads processed
     pub total_reads: usize,
-    /// Number of consensus reads generated
+    /// Number of consensus *reads* generated — not templates. A caller that emits both ends
+    /// of a pair contributes two (see [`ConsensusCallingStats::record_consensus_pair`]); a
+    /// fragment contributes one. The count is meant to equal the records written to the
+    /// output BAM.
     pub consensus_reads: usize,
     /// Number of reads filtered/rejected
     pub filtered_reads: usize,
@@ -281,6 +284,14 @@ impl ConsensusCallingStats {
     /// Records that a consensus read was created
     pub fn record_consensus(&mut self) {
         self.consensus_reads += 1;
+    }
+
+    /// Records that a consensus read pair (R1 and R2) was created.
+    ///
+    /// `consensus_reads` counts emitted *reads*, not templates, so a caller that
+    /// emits both ends of a pair must record two.
+    pub fn record_consensus_pair(&mut self) {
+        self.consensus_reads += 2;
     }
 
     /// Records that input reads were processed

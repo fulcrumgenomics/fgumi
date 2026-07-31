@@ -2129,7 +2129,7 @@ impl DuplexConsensusCaller {
                             cell_tag,
                             cell_barcode.as_deref(),
                         )?;
-                        stats.record_consensus();
+                        stats.record_consensus_pair();
                         return Ok((output, stats, Vec::new()));
                     }
                     stats.record_rejection(
@@ -2183,7 +2183,7 @@ impl DuplexConsensusCaller {
                             cell_tag,
                             cell_barcode.as_deref(),
                         )?;
-                        stats.record_consensus();
+                        stats.record_consensus_pair();
                         return Ok((output, stats, Vec::new()));
                     }
                 }
@@ -2237,7 +2237,7 @@ impl DuplexConsensusCaller {
                             cell_tag,
                             cell_barcode.as_deref(),
                         )?;
-                        stats.record_consensus();
+                        stats.record_consensus_pair();
                         return Ok((output, stats, Vec::new()));
                     }
                 }

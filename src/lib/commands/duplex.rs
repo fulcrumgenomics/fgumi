@@ -544,10 +544,10 @@ impl Command for Duplex {
             log_overlapping_stats(&merged_overlapping_stats);
         }
 
-        // Convert stats to metrics and log
-        let mut metrics = merged_stats.to_metrics();
-        // Use local count since we tracked it during streaming
-        metrics.consensus_reads = consensus_count as u64;
+        // Convert stats to metrics and log. `consensus_reads` comes from the caller's own
+        // accounting rather than the locally tracked write count so both this path and
+        // `execute_threads_mode` report the same number for the same input.
+        let metrics = merged_stats.to_metrics();
         log_consensus_summary(&metrics);
 
         // Write statistics file if requested. Emit the same fgbio seeded key-value format as
