@@ -194,9 +194,21 @@ pub struct Zipper {
     /// sort key coordinates, which enables correct template-coordinate sorting and
     /// deduplication of these reads. Use this flag if you don't need this functionality.
     ///
-    /// The former name `--skip-pa-tags` is accepted as an alias. It described a `pa`
-    /// tag that this command has never written, so grepping the output for `pa`
-    /// found nothing; the tag is and always was `tc`.
+    /// The former name `--skip-pa-tags` is accepted as an alias. Releases before 0.2.0
+    /// wrote this sort key as a `pa` tag, which collided with bwa-mem's `pa:f`
+    /// (primary-alignment score fraction); 0.2.0 renamed the tag to `tc`, and the flag
+    /// kept its old spelling until 0.5.0. A BAM zippered by a release before 0.2.0
+    /// without this flag therefore carries `pa` and no `tc`, which `dedup` rejects:
+    /// re-zipper it before deduplicating. Renaming the tag in place also works, but
+    /// only the legacy sort key itself — the six-element `pa:B:i` array on secondary
+    /// and supplementary reads — may be renamed to `tc`; bwa-mem's `pa:f` on primary
+    /// reads is a different tag, and renaming it destroys alignment metadata and
+    /// leaves a `tc` of the wrong type. Passing this flag (or its pre-0.5.0 spelling)
+    /// only stops zipper from adding its own sort-key tag on any release; it does not
+    /// strip a tag the input already carries. Unless the input supplied one, the
+    /// secondary and supplementary reads come out with no `tc`, which is what
+    /// `dedup` checks on those reads, so it rejects that output too — re-zipper
+    /// without the flag.
     #[arg(long = "skip-tc-tags", alias = "skip-pa-tags", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub skip_tc_tags: bool,
 
@@ -1134,6 +1146,7 @@ mod tests {
 
     use anyhow::Result;
     use bstr::ByteSlice;
+    use clap::CommandFactory;
     use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags, testutil::encode_op};
     use noodles::sam::alignment::record::data::field::Tag;
     use noodles::sam::alignment::record_buf::RecordBuf;
@@ -3543,6 +3556,114 @@ mod tests {
     fn test_skip_tc_tags_parsing(#[case] args: &[&str], #[case] expected: bool) {
         let cmd = Zipper::try_parse_from(args).expect("failed to parse Zipper arguments");
         assert_eq!(cmd.skip_tc_tags, expected);
+    }
+
+    /// The rendered long help for `--skip-tc-tags`.
+    fn skip_tc_tags_long_help() -> String {
+        let command = Zipper::command();
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "skip_tc_tags")
+            .expect("Zipper should expose a `skip_tc_tags` argument");
+        arg.get_long_help()
+            .map(ToString::to_string)
+            .expect("`--skip-tc-tags` should have long help")
+    }
+
+    /// The rendered long help with runs of whitespace collapsed, so a phrase
+    /// assertion depends on the wording rather than on where the doc comment
+    /// happens to wrap.
+    ///
+    /// Case is deliberately preserved: the two tags the help has to keep apart
+    /// differ only by their SAM type marker, and that marker is case-sensitive
+    /// (`pa:B:i`, an array, versus `pa:f`, a float). Lowercasing here would let
+    /// the help name a `pa:b:i` that no SAM file can contain and still pass.
+    fn skip_tc_tags_long_help_normalized() -> String {
+        skip_tc_tags_long_help().split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Releases before 0.2.0 did write a `pa` tag (`let pa_tag = b"pa"` at
+    /// v0.1.3); 0.2.0 renamed it to `tc` to avoid bwa-mem's `pa:f`, and the flag
+    /// kept the old spelling until 0.5.0. A BAM zippered before 0.2.0 without this
+    /// flag therefore carries `pa` and no `tc`, so `dedup` counts `missing_tc_tag`
+    /// and bails; a BAM zippered *with* the flag has no sort-key tag added on any
+    /// release, so unless its input already carried a `tc`, `dedup` bails on it too.
+    /// The help is where a user holding one of those BAMs looks, so each clause of
+    /// that history — and every way out — has to be stated positively. Asserting
+    /// only the absence of a denial, as the companion test below does, cannot carry
+    /// the contract on its own: it would still pass after the history was deleted
+    /// outright.
+    ///
+    /// The rename-in-place escape hatch has to name what may be renamed. `pa` is
+    /// also bwa-mem's `pa:f` score tag on primary reads, so an unqualified "rename
+    /// the tag" points a user at the wrong tag: renaming `pa:f` destroys alignment
+    /// metadata and leaves a `tc:f` where a six-element `tc:B:i` belongs. That
+    /// failure is silent rather than loud — `dedup` only checks that `tc` is
+    /// *present* (`find_tag_type(..).is_none()`), so a wrong-typed `tc` clears
+    /// `missing_tc_tag` and then fails to parse in
+    /// `TemplateCoordinateInfo::from_tag_value`, which is why the help has to
+    /// steer the rename rather than rely on a downstream error.
+    #[rstest]
+    #[case::pre_0_2_0_wrote_a_pa_tag("wrote this sort key as a `pa` tag")]
+    #[case::collided_with_bwa_mem("collided with bwa-mem's `pa:f`")]
+    #[case::tag_renamed_in_0_2_0("0.2.0 renamed the tag to `tc`")]
+    #[case::flag_renamed_in_0_5_0("kept its old spelling until 0.5.0")]
+    #[case::pre_0_2_0_output_carries_pa_and_no_tc("carries `pa` and no `tc`")]
+    #[case::dedup_rejects_pre_0_2_0_output("which `dedup` rejects")]
+    #[case::way_out_re_zipper("re-zipper it")]
+    #[case::rename_scoped_to_the_legacy_array(
+        "only the legacy sort key itself — the six-element `pa:B:i` array on secondary and \
+         supplementary reads — may be renamed to `tc`"
+    )]
+    #[case::rename_must_spare_the_bwa_mem_score_tag(
+        "bwa-mem's `pa:f` on primary reads is a \
+         different tag"
+    )]
+    #[case::skipping_only_suppresses_the_tag_zipper_adds(
+        "only stops zipper from adding its own sort-key tag on any release"
+    )]
+    #[case::skipping_does_not_strip_an_input_tag(
+        "it does not strip a tag the input already carries"
+    )]
+    #[case::dedup_checks_the_secondary_and_supplementary_reads(
+        "the secondary and supplementary reads come out with no `tc`, which is what `dedup` \
+         checks on those reads"
+    )]
+    #[case::way_out_re_zipper_without_the_flag("re-zipper without the flag")]
+    fn test_skip_tc_tags_help_states_the_pa_tag_history(#[case] expected: &str) {
+        let help = skip_tc_tags_long_help_normalized();
+        assert!(
+            help.contains(expected),
+            "`--skip-tc-tags` help omits `{expected}`, so it does not tell a user holding \
+             pre-0.2.0 output what happened or how to migrate. Help was: {help}"
+        );
+    }
+
+    /// The complement to the assertions above: the help must not go back to
+    /// claiming the `pa` tag was never written.
+    ///
+    /// Each case names wording that can only be a denial, rather than the bare
+    /// word "never", which would be too blunt a guard on two counts: the help
+    /// legitimately warns against renaming bwa-mem's `pa:f`, and — with this flag
+    /// set — zipper genuinely never writes a sort-key tag, so accurate sentences
+    /// about the flag's own effect have to stay open. What may not return is the
+    /// claim that a `pa` tag was never written *at all*, which is #617's wording:
+    /// "a `pa` tag that this command has never written; the tag is and always was
+    /// `tc`".
+    #[rstest]
+    #[case::denies_ever_writing_a_pa_tag("has never written")]
+    #[case::denies_the_pa_spelling_ever_applied("never wrote a `pa`")]
+    #[case::claims_the_tag_was_always_tc("always was `tc`")]
+    fn test_skip_tc_tags_help_does_not_deny_the_pa_tag_history(#[case] forbidden: &str) {
+        // Lowercased here rather than in the helper: these assertions are about words,
+        // which may be capitalized at the start of a sentence, not about a
+        // case-sensitive SAM type marker.
+        let help = skip_tc_tags_long_help_normalized().to_lowercase();
+        assert!(
+            !help.contains(forbidden),
+            "`--skip-tc-tags` help says `{forbidden}`, denying that the `pa` tag was ever \
+             written; releases before 0.2.0 wrote it. Help was: {help}"
+        );
     }
 
     #[rstest]
