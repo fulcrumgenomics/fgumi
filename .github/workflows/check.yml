@@ -200,6 +200,26 @@ jobs:
             exit 1
           fi
 
+  coderabbit-config:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet --disable-pip-version-check pyyaml
+      - name: .coderabbit.yaml is valid and still aimed at code that exists
+        # CodeRabbit never reports a configuration error on the PR: when the
+        # file violates its schema the bot discards it wholesale and reviews
+        # with org-UI defaults instead, so the repo silently loses every path
+        # instruction. That has already happened here (a 293-character
+        # `tone_instructions` against a 250-character cap). This makes the
+        # failure loud, and additionally fails when a path instruction stops
+        # matching any tracked file -- a glob left behind by a rename keeps
+        # "working" while aiming the reviewer at nothing.
+        run: python3 scripts/check-coderabbit-config.py
+
   docs:
     runs-on: ubuntu-latest
     # Turn every rustdoc warning (broken intra-doc links, private-item links,
