@@ -1183,8 +1183,7 @@ impl VanillaUmiConsensusCaller {
 
         match (r1_ok, r2_ok) {
             (true, true) => {
-                self.stats.record_consensus();
-                self.stats.record_consensus();
+                self.stats.record_consensus_pair();
                 output.extend(&r1r2_output);
             }
             (true, false) => {
