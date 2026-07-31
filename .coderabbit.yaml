@@ -9,119 +9,478 @@
 # hot paths under an otherwise crate-wide `#![deny(unsafe_code)]`. The
 # `assertive` profile + the path instructions below aim the review at the failure
 # modes that actually bite here (output divergence vs fgbio, pipeline
-# deadlock/unbounded memory, FFI/`unsafe` unsoundness, doc/contract drift) rather
-# than generic style.
+# deadlock/unbounded memory, malformed-input panics, `unsafe` unsoundness,
+# doc/contract drift) rather than generic style.
+#
+# WHAT CI ALREADY ENFORCES — never spend a review comment re-deriving any of it.
+# `.github/workflows/check.yml` runs, on every PR: `cargo ci-lint` (clippy
+# `-D warnings -W clippy::pedantic`, all targets, all features), `cargo ci-fmt`,
+# `cargo ci-doc` with `RUSTDOCFLAGS=-D warnings` (broken intra-doc links fail),
+# `cargo ci-test` + doctests via nextest, llvm-cov with a 90% patch-coverage
+# gate, `cargo audit`, an MSRV-lockstep check, four feature-combination `cargo
+# check`s, a publish dry-run, and a samtools-backed sort-correctness suite.
+# What CI does NOT cover — and where review earns its keep — is fgbio output
+# parity (no CI job runs fgbio at all), `unsafe` soundness outside
+# `fgumi-raw-bam::sort` (the only Miri target), liveness and memory-bound
+# reasoning (stress tests are nightly-only, off the PR path), and whether a
+# test's oracle is genuinely independent.
 
 language: en-US
 
 # Terse, technical, no praise or filler — match the codebase's review style.
-# NB: CodeRabbit caps tone_instructions at 250 characters — keep this terse.
+#
+# !! HARD LIMIT: CodeRabbit caps tone_instructions at 250 characters. Exceeding
+# !! it does not truncate the field — it fails schema validation and silently
+# !! discards THIS ENTIRE FILE, falling back to org-UI defaults. That has already
+# !! happened once here (the original 293-char value, fixed in #392). Re-count
+# !! after any edit: the folded value below is 249 characters.
+#
+# The two clauses chosen are the repo's two highest-volume sources of declined
+# findings; both are restated at length in the path instructions below.
 tone_instructions: >-
-  Concise and technical. Skip praise and restating the code. Lead with the risk
-  and a one-line fix. Favor correctness, output identity vs fgbio/samtools,
-  concurrency soundness, and memory bounds over style. Skip clippy/rustfmt nits;
-  CI enforces them.
+  Concise, technical. Lead with the risk and a one-line fix; skip praise and
+  restating code. Never ask to reshape a passing test into rstest/proptest. Do
+  not re-demand an fgbio oracle when a test cites fgbio by file:line or uses
+  `fgumi sort --verify`.
 
 reviews:
   # Surface borderline correctness/soundness findings, not just high-confidence
   # ones. For a tool whose output is checked byte-for-byte against fgbio, a false
-  # positive is cheaper than a missed output divergence.
+  # positive is cheaper than a missed output divergence. Assertive is what
+  # produced the malformed-input panic findings in fgumi-raw-bam and the FASTQ
+  # pipeline that CI had no way to catch; the precision cost is real, and the
+  # path instructions below — not a lower profile — are the lever for it.
   profile: assertive
   high_level_summary: true
   poem: false
   collapse_walkthrough: false
-  # Review automatically on push; don't review draft PRs. `base_branches: .*`
-  # also auto-reviews PRs whose base is not the default branch (stacked PRs);
-  # without it CodeRabbit posts "auto reviews are disabled on base/target
-  # branches other than the default branch" and skips them.
+  # Aim the summary that is already being generated at the axes that decide
+  # whether this PR is risky, instead of a neutral change list.
+  high_level_summary_instructions: >-
+    Open with a one-line risk verdict covering, in order: (1) does this change
+    output for any command (grouping, consensus, sort order, corrected UMIs,
+    metrics) — and if so, what pins the new output; (2) does it add or modify
+    `unsafe`, and is CLAUDE.md's allowlist updated to match; (3) does it change
+    a memory bound, queue capacity, or thread/backpressure policy. State "none"
+    explicitly for each axis that does not apply. Do not restate the diff.
+  # Never auto-block merges on a review verdict; findings are advisory.
+  request_changes_workflow: false
+  # Two people work on this repo; reviewer suggestions are noise.
+  suggested_reviewers: false
+
   auto_review:
+    # Review automatically on push; don't review draft PRs. `base_branches: .*`
+    # also auto-reviews PRs whose base is not the default branch (stacked PRs);
+    # without it CodeRabbit posts "auto reviews are disabled on base/target
+    # branches other than the default branch" and skips them.
     enabled: true
     drafts: false
     base_branches:
       - ".*"
-  # Never auto-block merges on a review verdict; findings are advisory.
-  request_changes_workflow: false
+    # Dependency and release PRs are mechanical: they have not produced an
+    # actionable finding here, and `cargo audit` plus the `--locked`
+    # feature-combination checks in CI already gate them. Skipping them
+    # preserves review quota for PRs that carry logic — this repo runs into
+    # CodeRabbit's fair-use review limit regularly.
+    ignore_title_keywords:
+      - "chore(deps"
+      - "chore: release"
 
-  # Don't spend review budget on build output, fixtures, or vendored lockfiles.
+  # Don't spend review budget on build output, vendored lockfiles, generated
+  # artifacts, or surfaces that have not yielded a finding. NB: these patterns
+  # also drive CodeRabbit's `git sparse-checkout`, so an excluded path is absent
+  # from its working tree entirely, not merely skipped for comment. `Cargo.toml`
+  # is deliberately NOT excluded despite low yield — removing the workspace
+  # manifests would leave the tree unresolvable.
   path_filters:
     - "!**/target/**"
+    # Cargo.lock churn is large and mechanical; `cargo audit` in CI is the
+    # supply-chain gate, so nothing is lost by keeping it out of review. Because
+    # this also removes it from the reviewer's working tree, the repo-wide
+    # `**/*.rs` instruction below asks for the requirement declared in
+    # `Cargo.toml` rather than the resolved pin; keep the two in step.
     - "!**/*.lock"
+    # git-cliff generates every CHANGELOG.md, so they legitimately repeat
+    # `### Bug Fixes` / `### Features` headings once per release. That trips
+    # markdownlint MD024 on every release PR, permanently and unfixably (there
+    # is no markdownlint config in this repo to suppress it). Excluding the
+    # generated files is the surgical fix; markdownlint stays on for real docs.
+    - "!**/CHANGELOG.md"
+    # 2.2 MB, tracked, machine-generated on every dependency bump.
+    - "!THIRDPARTY.toml"
+    - "!**/benches/**"
+    - "!**/*.proptest-regressions"
+    - "!proptest-regressions/**"
+    - "!docs/book/**"
+    - "!docs/theme/**"
+    - "!docs/LAST_SYNCED"
+
+  # Suggest the per-command labels this repo already uses, so triage does not
+  # depend on the author remembering. Suggestion only — never auto-applied.
+  auto_apply_labels: false
+  labeling_instructions:
+    - label: "fgumi sort"
+      instructions: >-
+        Apply when the PR touches `crates/fgumi-sort/**` or
+        `src/lib/commands/sort.rs`.
+    - label: "fgumi group"
+      instructions: >-
+        Apply when the PR touches `crates/fgumi-umi/**`, `src/lib/umi/**`,
+        `src/lib/grouper.rs`, `src/lib/mi_group.rs`, or
+        `src/lib/commands/group.rs`.
+    - label: "raw-bam"
+      instructions: >-
+        Apply when the PR touches `crates/fgumi-raw-bam/**`.
+    - label: "continuous-integration"
+      instructions: >-
+        Apply when the PR touches `.github/workflows/**`, `.cargo/config.toml`,
+        `.config/nextest.toml`, or `scripts/**`.
+    - label: "documentation"
+      instructions: >-
+        Apply when the PR changes only Markdown, `docs/**`, or doc comments.
 
   # MAINTENANCE: these instructions name specific modules, invariants, and code
   # constructs. Re-read and update them whenever those modules are refactored or
-  # renamed — stale instructions silently misdirect the reviewer. (Both the
-  # `unified_pipeline` and `pipeline` paths are listed: issue #330 renames the
-  # former to the latter, so the same instructions apply to whichever is present.)
+  # renamed — a stale instruction silently misdirects the reviewer, and the
+  # reviewer will never tell you it is chasing a symbol that no longer exists.
+  # Every symbol named below was verified with `git grep` to resolve on `main`
+  # at the commit that introduced this revision; re-verify when touching these
+  # modules.
+  #
+  # Deliberately NOT listed, because they do not exist on `main` and a glob that
+  # matches nothing is exactly the failure mode above — add an entry in the same
+  # PR that lands the code:
+  #   - `crates/fgumi-pipeline-core/**`, `crates/fgumi-pipeline-io/**` (on
+  #     `feat-runall`; the byte-bound and unbounded-drain rules in the
+  #     `unified_pipeline` entry apply to them verbatim once merged)
+  #   - `crates/fgumi-fmt/**`, `crates/fgumi-cli-common/**`,
+  #     `crates/fgumi-cli-macros/**` (in flight)
+  # `src/lib/pipeline/**` is listed alongside `unified_pipeline` only because
+  # issue #330 renames the latter to the former; today it matches nothing.
   path_instructions:
     - path: "src/lib/{unified_pipeline,pipeline}/**/*.rs"
       instructions: >-
         This is the hand-rolled concurrent step pipeline; its bugs are deadlocks,
-        lost output, and unbounded memory, not style. Treat any change to the
-        reorder stage, queue push/pop, backpressure, or producer gating as
-        liveness- and memory-critical. Require that the must-accept `next_serial`
-        exemption is preserved (the producer of `next_serial` can never be
-        backpressured — refusing it can deadlock), and that no path lets a
-        transport queue or reorder overflow stash grow without a byte bound
-        (memory must be a function of config, not input size). Flag: a byte/size
-        cap that is checked only on one sub-condition (e.g. only when transport is
-        full) so a consumer relocation can bypass it; capping a consumer drain
-        loop (must stay unbounded — bound producers instead); a Parallel step
-        whose drain-counter / output-close accounting can leave the shared output
-        unclosed; error/cancel paths that don't propagate via the shared signal so
-        `is_done()` is observed; and any new `unsafe` in the typed-step dispatch
-        hot path not matching the documented `#[allow(unsafe_code)]` sites.
+        lost output, unbounded memory, and panics on malformed input — not style.
+        Treat any change to the reorder stage, queue push/pop, backpressure, or
+        producer gating as liveness- and memory-critical. Require that no path
+        lets a queue or reorder buffer grow without a byte bound, so steady-state
+        memory stays a function of config rather than input size: the per-queue
+        bound is `OrderedQueue::limit_bytes` (`queue.rs`), and the shared
+        pipeline budget is consulted through `MemoryTracker::is_at_limit` /
+        `MemoryTracker::is_below_drain_threshold` (`base.rs`). Flag a cap
+        checked on only one sub-condition so another code path bypasses it; flag
+        capping a consumer drain loop (consumers must stay unbounded — bound the
+        producers instead); and flag byte accounting that measures logical length
+        where the memory actually held is allocation capacity. Require error and
+        cancel paths to set the shared `shutdown_signal: Arc<AtomicBool>`
+        (`base.rs`) so every worker's `load()` loop observes the stop, and that
+        no worker can block forever on a channel whose peer has already exited.
+        Byte-level framing here parses length and offset fields out of the input
+        stream: require every such field to be validated against the remaining
+        buffer with checked arithmetic before it is used to slice — an
+        underflowing `offset + block_size - 4` on a corrupt or truncated block is
+        a real, previously-shipped crash on corruption-controlled input. This
+        module contains no `unsafe`; treat newly introduced `unsafe` here as out
+        of policy and require it to be justified in CLAUDE.md first.
     - path: "crates/fgumi-sort/**/*.rs"
       instructions: >-
         This is the sort engine, including approved `unsafe` hot paths (LSD radix
-        sort with `Vec::set_len` + raw-pointer ping-pong in inline.rs, and the
-        natural-order queryname comparator). For every `unsafe` block require a
-        `// SAFETY:` comment whose invariant actually holds (buffer written exactly
-        once before read; pointers disjoint and properly aligned; read names
-        null-terminated by construction) AND a corresponding entry in the unsafe
-        allowlist in CLAUDE.md — flag new `unsafe` that lacks either. Treat the
-        sort-order comparators (coordinate, queryname, template-coordinate) as
-        output-identity-critical vs `samtools sort`: a change to key extraction or
-        comparison needs a test pinning identity. Flag off-by-one in radix passes,
-        `usize`/`u64` narrowing in key math, and external-merge / spill logic that
-        can drop or duplicate records under memory pressure.
+        sort with `Vec::set_len` + raw-pointer ping-pong in `inline.rs` and
+        `radix.rs`, and the natural-order queryname comparator via
+        `RawQuerynameKey::cmp` in `keys.rs`). For every `unsafe` block require a
+        `// SAFETY:` comment whose invariant actually holds (buffer written
+        exactly once before read; pointers disjoint and properly aligned; read
+        names null-terminated by construction) AND a corresponding entry in the
+        unsafe allowlist in CLAUDE.md — flag new `unsafe` that lacks either.
+        Note this crate is NOT covered by the Miri job (`miri.yml` runs only
+        `-p fgumi-raw-bam sort`), so unsoundness here reaches main uncaught.
+        Treat the sort-order comparators (coordinate, queryname,
+        template-coordinate) as output-identity-critical vs `samtools sort`: a
+        change to key extraction or comparison needs a test pinning identity.
+        Flag off-by-one in radix passes, sentinel or `u64::MAX` key collisions
+        that make distinct records tie and silently fall back to input order,
+        `usize`/`u64` narrowing in key math, and external-merge / spill logic
+        that can drop or duplicate records under memory pressure.
     - path: "crates/fgumi-raw-bam/**/*.rs"
       instructions: >-
         This is zero-copy raw-BAM byte handling and the samtools-compatible
-        natural-order comparator (`natural_compare` / `natural_compare_nul`), which
-        use `get_unchecked` / raw `*const u8` walks under `#[allow(unsafe_code)]`.
-        Require each unchecked access to be bounded by a loop invariant
-        (`debug_assert!`-ed) or a caller-guaranteed null terminator, with a SAFETY
-        comment and an allowlist entry. Flag record field-offset / endianness
-        errors, and any parser that trusts a length or offset from the BAM bytes
-        without validating it against the record/block bounds (fail closed on
-        malformed input, never read past the buffer).
-    - path: "crates/{fgumi-consensus,fgumi-umi,fgumi-metrics}/**/*.rs"
+        natural-order comparator (`natural_compare` / `natural_compare_nul` in
+        `sort.rs`), which use `get_unchecked` / raw `*const u8` walks under
+        `#[allow(unsafe_code)]`. Require each unchecked access to be bounded by a
+        loop invariant (`debug_assert!`-ed) or a caller-guaranteed null
+        terminator, with a SAFETY comment and an allowlist entry. The highest-
+        value findings in this crate are accessors that read a fixed field offset
+        before the record length has been validated: require every parser and
+        accessor to fail closed on a short, truncated, or hostile record, and
+        check the ORDER of validation against use, not merely that a check exists
+        somewhere in the function. Flag field-offset and endianness errors, any
+        parser that trusts a length or offset from the BAM bytes without bounding
+        it, and integer accumulation over attacker-controlled CIGAR or tag values
+        that can overflow `i32`/`u32`. DO NOT propose clamping unclipped
+        coordinates. `unclipped_start_from_raw_cigar`, `unclipped_other_start` /
+        `unclipped_other_end`, and `mate_soft_unclipped_from_mc` produce
+        template-coordinate SORT-KEY LANES, not genomic positions: they may
+        legitimately go negative or exceed contig bounds, and a `.max(0)` or
+        contig-floor clamp on one side desynchronizes the two mates of a template
+        and diverges from both fgbio and `samtools sort --template-coordinate`.
+        Saturating arithmetic is the correct remedy, and the
+        `saturated_clip_does_not_wrap` case in `cigar.rs` already pins this —
+        check for a pinning test before flagging.
+    - path: "crates/{fgumi-bam-io,fgumi-bgzf}/**/*.rs"
       instructions: >-
-        These are the consensus callers, UMI assignment (identity / edit-distance /
-        adjacency / paired), and QC metrics — the output that is validated against
-        fgbio. Treat any change to consensus base/quality math, UMI grouping /
-        edit-distance / adjacency assignment, or a metric formula as
-        output-changing: require a test asserting identity (or documented,
-        intentional divergence) against the fgbio baseline, generated
-        programmatically. Flag silent behavior changes on the edge cases that
-        differ between tools: ties in adjacency/edit-distance, single-read or empty
-        families, min/max family-size thresholds, and quality-score capping /
-        rounding.
-    - path: "src/lib/umi/parallel_assigner.rs"
+        This is BAM/BGZF block framing, format sniffing, buffered readers and
+        writers, and the reorder buffer that restores serial order across worker
+        threads. Apply the same fail-closed standard as `fgumi-raw-bam`: a
+        truncated or malformed block must surface as an error, never as a silent
+        end-of-stream — flag any path that converts an `UnexpectedEof` or a short
+        read on a partial header into a clean `Ok(None)`/EOF, because that
+        silently drops the tail of the input. Flag format classification that
+        decides from a single `read()` without handling short reads, or that
+        checks a magic number without scanning the fields that actually
+        distinguish BGZF from plain gzip. Enforce the buffering invariant stated
+        at `crates/fgumi-bgzf/src/reader.rs` — every production caller wraps its
+        input in a `BufReader` — and flag any diff that removes one from a
+        production entry point; unbuffered block reads cost three syscalls per
+        BGZF block on the main record path of most commands. Relatedly, treat a
+        `#[cfg]`-gated import or helper, or an `#[allow(unused)]`, added to
+        silence a warning after production stopped using the thing, as a
+        REGRESSION SIGNAL rather than a cleanup, and say what stopped calling it.
+        Treat writer and reorder accounting as data-integrity-critical: a serial
+        or drain-counter mistake loses or duplicates records, and record loss is
+        invisible to any test asserting only an exit status or a record count.
+    - path: "crates/{fgumi-consensus,fgumi-umi,fgumi-metrics,fgumi-sam}/**/*.rs"
       instructions: >-
-        Parallel UMI-assignment strategies (identity / edit-distance / adjacency /
-        paired) that must produce output identical to the sequential assigners in
-        `crates/fgumi-umi`. Treat any change to grouping/assignment as
-        output-changing: require parity coverage (or documented, intentional
-        divergence) against both the sequential code path and the fgbio baseline,
-        generated programmatically. Flag tie-breaking, empty/single-read family,
-        and threshold-boundary behavior changes, plus correctness of the lock-free
-        union-find and partition-merge concurrency.
+        These are the consensus callers, UMI assignment (identity /
+        edit-distance / adjacency / paired), QC metrics, and the SAM/CIGAR and
+        read-pair clipping utilities — the output validated against fgbio. Treat
+        a change to consensus base/quality math, UMI grouping / edit-distance /
+        adjacency assignment, CIGAR or clipping arithmetic, or a metric formula
+        as output-changing: require a test pinning the new output, or a
+        documented intentional divergence. Flag silent behavior changes on the
+        edge cases that differ between tools: ties in adjacency/edit-distance,
+        single-read or empty families, min/max family-size thresholds, and
+        quality-score capping / rounding. SCOPE THIS ASK — it is the largest
+        source of rejected findings here. A diff that is provably NOT
+        output-changing (memoization, allocation removal, extracted helper,
+        renaming, docs, test refactor) does NOT need a new fgbio baseline test;
+        do not ask for one. An existing bitwise or byte-identical assertion is
+        STRONGER than an approximate fgbio comparison — never propose replacing
+        one with the other. fgbio is a JVM tool and is deliberately not a CI
+        dependency, so never ask for an inline `fgbio` invocation; repo-wide
+        parity is gated by the `fgumi compare` oracle and the runall parity
+        fixtures. Also note that apparent "missing" cases are often deliberate
+        parity: `ClipBam` matches on the `(r1, r2)` template shape and no-ops on
+        a lone R2 (`case _ => ()`), and N-containing UMIs are filtered upstream
+        before any assigner sees them. Before flagging a missing case or absent
+        guard, look for a test that already pins the behavior; if one exists, the
+        burden is to cite the fgbio source by file:line showing it differs.
+    - path: "crates/fgumi-simd-fastq/**/*.rs"
+      instructions: >-
+        SIMD-accelerated FASTQ lexing over hand-written NEON and AVX2 intrinsics
+        with runtime feature dispatch. This is the sharpest `unsafe` exposure in
+        the repo and is an exception on three counts: it is the only workspace
+        member without `#![deny(unsafe_code)]` at its crate root, its `unsafe`
+        sites are absent from CLAUDE.md's allowlist, and Miri cannot execute the
+        intrinsics so `miri.yml` does not cover it. It also parses untrusted
+        input. Require, for every intrinsic block: a `// SAFETY:` comment naming
+        the target feature it assumes, evidence that the runtime dispatch
+        actually gates that feature, and a bounds argument for every load/store
+        showing the vector width cannot read past the end of the buffer. Flag
+        tail/remainder handling that differs from the scalar path, lane-mask or
+        `movemask` index arithmetic that can point outside the chunk, and any
+        record-boundary decision reachable on malformed FASTQ that the scalar
+        fallback does not also cover.
+    - path: "src/lib/commands/**/*.rs"
+      instructions: >-
+        This is the CLI layer: argument contracts, defaults, validation, and
+        end-to-end orchestration. It is the largest module in the repo and its
+        characteristic failure is not style, it is a flag that silently does
+        nothing. Flag: an option accepted by the parser but never threaded to the
+        code path that would honor it — especially where a parallel or streaming
+        path reimplements a sequential one and drops a knob; `-`/stdin
+        special-casing that bypasses a guard the file path enforces, such as an
+        output-clobber or canonicalization check; a resource bound derived from a
+        CLI value with no upper limit, where a large value exhausts file
+        descriptors or memory; a zero or empty value that reaches division,
+        NaN, or an unbounded spin; and log or error text that contradicts the
+        branch that produced it. Treat a changed default as output-changing and
+        require it to be called out. Do NOT file wording-only nits on help text
+        or doc comments unless the text states a behavior the code does not
+        implement.
+    - path: "src/lib/{grouper,template,mi_group,read_info}.rs"
+      instructions: >-
+        Core read-grouping and template-assembly logic that sits outside the
+        crates but feeds the same fgbio-validated output as `fgumi-umi` and
+        `fgumi-consensus`. Apply the same output-identity standard: changes to
+        template assembly, mate pairing, molecule-id assignment, or grouping keys
+        are output-changing and need a test pinning the result. Flag tie-breaking
+        and ordering assumptions that hold only for one particular input sort
+        order, and any per-read state that must persist across families (a
+        molecule-id counter, for example) being reset or made thread-local.
+    - path: "src/lib/{fastq,fastq_parse,read_structure,validation}.rs"
+      instructions: >-
+        FASTQ text parsing, read-structure parsing, and input validation — all
+        operating on untrusted, possibly truncated input. Apply the fail-closed
+        standard: a degenerate record (missing or empty quality line, empty
+        sequence, header with no name, truncated final record) must produce an
+        error, never a panic and never a silently wrong record. Slice arithmetic
+        here has shipped a panic before, so require every computed range to be
+        ordered and bounded before indexing. GUARD-SET PARITY IS THE KEY CHECK:
+        these modules have sibling entry points that parse the same grammar
+        (single-record versus batched or cross-block stitched paths). When one
+        sibling validates a case, flag any sibling that does not — a guard
+        present in one and missing in the other is a real bug even when each
+        function reads correctly on its own. Note also that lenient behavior is
+        sometimes deliberate fgbio parity (trailing `\r` is stripped
+        unconditionally, matching fgbio's line reader); do not propose
+        tightening it without citing fgbio.
+    - path: "src/lib/{umi,simulate}/**/*.rs"
+      instructions: >-
+        Parallel UMI-assignment strategies and the synthetic-data generator.
+        The parallel assigners must produce output identical to the sequential
+        assigners in `crates/fgumi-umi`: treat any change to grouping or
+        assignment as output-changing, require parity coverage against the
+        sequential path, and check the lock-free union-find and partition-merge
+        concurrency. CRITICAL CONTRACT — the two sides take DIFFERENT key
+        formats, and conflating them has produced wrong fixes on both: the
+        SEQUENTIAL `PairedUmiAssigner` receives orientation-PREFIXED string keys
+        (`aa:ACGT-bb:TTTT`) built in `src/lib/commands/group.rs`, so those keys
+        are deliberately string-based and are NOT `BitEnc`-encodable; the
+        PARALLEL assigner receives CLEAN uppercase UMIs from a different call
+        site in the same file, so whole-string `BitEnc` encoding is correct
+        there. Verify which side a diff touches before proposing an encoding or
+        filtering change. The `simulate` module is the source of test data for
+        much of the suite, so a bug here silently weakens every test consuming
+        it: scrutinize its float math (family-size, insert-size, quality,
+        strand-bias distributions) for bias, off-by-one, and mis-seeded RNG, and
+        require its writers to propagate the FIRST error from a worker or I/O
+        thread rather than a later generic channel-closed error that masks it.
     - path: "**/tests/**/*.rs"
       instructions: >-
-        Generate test data programmatically (SamBuilder / fgpyo-style builders); do
-        not add committed BAM/fixture files. New correctness-critical behavior
-        needs an INDEPENDENT oracle (e.g. parity against the fgbio baseline or a
-        second code path), not just a self-consistency check. Flag assertions
-        weaker than the stated contract, and end-to-end tests that assert a record
-        count but not record identity.
+        Generate test data programmatically (SamBuilder / fgpyo-style builders);
+        do not add committed BAM/fixture files. The highest-value finding in this
+        repo's tests is an assertion weaker than the contract it claims to check:
+        flag tests that assert only an exit status, only a record count, or only
+        `path.exists()` when the contract is record identity — a transcode that
+        dropped or reordered every record passes all three. Flag a test whose
+        only oracle is the implementation under test, a regression test named for
+        an issue that asserts the buggy output instead of the fixed one, and a
+        case label that does not match what the case actually exercises. When you
+        flag one weak assertion, check the file for its siblings and list them
+        all rather than naming one. ORACLE POLICY — follow it exactly and do not
+        re-litigate it: fgbio is a JVM tool and is deliberately NOT a CI
+        dependency, so never ask for an inline `fgbio` invocation. Fixed expected
+        values derived from fgbio and cited by `file:line` ARE an acceptable
+        oracle. `fgumi sort --verify` IS an acceptable order oracle — it is
+        itself validated against `samtools sort` in `fgumi-sort`'s own suite — so
+        do not demand a duplicate inline samtools comparison in a test that is
+        deliberately hermetic. Coverage frequently lives in a different layer:
+        before claiming a case is untested, search the subprocess-level
+        `tests/integration/*` binaries as well as inline unit tests.
+    - path: "**/*.rs"
+      instructions: >-
+        Repo-wide rules, in addition to any more specific instruction that also
+        matches this file. TEST SHAPE IS NOT A FINDING: never suggest converting
+        a passing test to `#[rstest]` or `proptest`, splitting or consolidating
+        cases, or otherwise restyling tests — that is the single largest source
+        of noise here. `rstest`/`proptest` are conventions for NEW tests, not a
+        rule to enforce against existing ones; flag missing COVERAGE, never test
+        shape. Do not comment on formatting, import order, naming, or anything
+        clippy `--pedantic` already enforces (see the CI list at the top of this
+        file). VERIFY BEFORE YOU CLAIM — every one of these has produced a false
+        Major or Critical here: read the actual signature before asserting a type
+        or compile error (constructors in this repo often already return
+        `Arc<Self>`); check the version requirement declared in the relevant
+        `Cargo.toml` — `Cargo.lock` is excluded by `path_filters` above and is
+        therefore absent from your working tree, so the manifest requirement is
+        the only version evidence you have — and check per-crate `cfg` and
+        feature gating before asserting an external API shape or that a
+        dependency is available; check reachability from real call sites before
+        claiming a panic or a missing guard is live, since validation is
+        deliberately centralized at spec-construction and chain-building
+        boundaries rather than repeated per record; treat doc comments as
+        SUSPECT rather than authoritative, because the doc is usually what
+        drifted; and never propose a fix requiring `unsafe` in a
+        `#![deny(unsafe_code)]` crate, or a dependency the crate does not have.
+        If you rate a finding Trivial or low-value, don't post it. UNDER-COVERED
+        CLASSES worth actively hunting, because they have shipped bugs here:
+        guard-set parity between typed and raw, or checked and unchecked, sibling
+        implementations — if one guards a case, flag the sibling that does not;
+        degenerate records (empty CIGAR, empty SEQ, zero-length quality);
+        parsed-integer overflow on tag or CIGAR values; and atomicity of
+        multi-step writes, where a crash between steps leaves a phantom row or a
+        truncated-but-valid output file.
+
+  # `cargo ci-lint` runs clippy with `-D warnings -W clippy::pedantic` over all
+  # targets and all features, and `cargo audit` runs on every PR, so both of
+  # these tools can only restate a check that has already failed the build.
+  # zizmor is deliberately left ENABLED: nothing in fgumi CI lints workflows, and
+  # its findings here have been applied essentially without exception.
+  tools:
+    clippy:
+      enabled: false
+    osvScanner:
+      enabled: false
+    github-checks:
+      # Default is 90s, but this repo's PR checks (nextest across the workspace,
+      # llvm-cov, the samtools sort-correctness suite) run for minutes. At the
+      # default CodeRabbit stops waiting and reviews without the CI signal that
+      # matters most here. 900000ms (15 min) is the schema maximum.
+      timeout_ms: 900000
+
+  # Docstring coverage is already enforced by `clippy::pedantic` in CI, and the
+  # description check adds nothing on a repo with a PR template. The title check
+  # is the one worth keeping: CLAUDE.md mandates conventional commits and
+  # nothing else verifies the PR title.
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+    description:
+      mode: "off"
+    title:
+      mode: warning
+      requirements: >-
+        Conventional-commit format: `<type>[(scope)][!]: <description>`, where
+        type is one of feat, fix, build, chore, ci, config, docs, example, perf,
+        refactor, style, test. The description is lowercase imperative and does
+        not end with a period. Scope, when present, should name the affected
+        command or crate (for example `sort`, `group`, `raw-bam`).
+
+  # Docstring and unit-test generation offers are declined here as a matter of
+  # course — the repo's testing conventions (programmatic data, independent
+  # oracles, parity against fgbio) are too specific for generated stubs to land
+  # usefully, and the offers are a large fraction of each review's bulk.
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+
+# CodeRabbit reads `**/CLAUDE.md` as code guidelines by default; naming the
+# patterns explicitly also picks up CONTRIBUTING.md, which carries the commit
+# and branch conventions. NB: guideline ingestion is a double-edged tool — the
+# `rstest`/`proptest` line in CLAUDE.md is the origin of the test-restyling
+# noise that the repo-wide `**/*.rs` instruction above explicitly suppresses.
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "**/CLAUDE.md"
+      - "**/AGENTS.md"
+      - "CONTRIBUTING.md"
+
+# On-demand generation (chat-invoked) should follow the repo's test conventions
+# rather than producing generic `#[test]` stubs. This is generation guidance, not
+# a review rule — it does not license restyling findings against existing tests.
+code_generation:
+  unit_tests:
+    path_instructions:
+      - path: "**/*.rs"
+        instructions: >-
+          Use `#[rstest]` case tables with a descriptive `#[case::label(...)]`
+          per scenario rather than sequential asserts in one `#[test]`. Build
+          SAM/BAM inputs programmatically with the repo's builders; never emit a
+          committed fixture file. Assert record identity, not record counts or
+          exit status. Use `proptest` for invariant sweeps instead of
+          hand-rolled seed loops.
