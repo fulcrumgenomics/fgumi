@@ -20,8 +20,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use crossbeam_channel::{Receiver, bounded};
 use fgumi_bam_io::{RawBamReaderAuto, create_raw_bam_reader};
+use fgumi_raw_bam::RawRecord;
 use fgumi_raw_bam::fields as raw_fields;
-use fgumi_raw_bam::{RawRecord, find_int_tag, find_string_tag};
 use log::info;
 use noodles::sam::Header;
 use std::path::PathBuf;
@@ -516,10 +516,18 @@ impl std::fmt::Display for MiKey {
 /// yields `None`, matching the "missing MI" treatment used by the caller.
 pub(crate) fn get_mi_tag_raw(raw: &RawRecord) -> Option<MiKey> {
     let aux = raw_fields::aux_data_slice(raw.as_ref());
-    if let Some(v) = find_int_tag(aux, SamTag::MI) {
-        return Some(MiKey::Int(v));
-    }
-    let bytes = find_string_tag(aux, SamTag::MI)?;
+    // One scan of the aux data, not two. Probing `find_int_tag` and then falling
+    // back to `find_string_tag` walked every tag twice for the `MI:Z:` form that
+    // `fgumi group` actually writes, and `MI` is appended late so each walk covers
+    // nearly the whole tag block. This is per record on the grouping engine's
+    // critical path.
+    let bytes = match fgumi_raw_bam::RawTagsView::new(aux).get(SamTag::MI)? {
+        fgumi_raw_bam::TagValue::Int(v) => return Some(MiKey::Int(v)),
+        fgumi_raw_bam::TagValue::String(bytes) => bytes,
+        // Any other aux type is not a molecule id; treated as absent, exactly as
+        // the previous int-then-string probe did.
+        _ => return None,
+    };
     let s = std::str::from_utf8(bytes).ok()?;
     if let Some((base_str, strand_str)) = s.rsplit_once('/') {
         let base = base_str.parse::<i64>().ok()?;
