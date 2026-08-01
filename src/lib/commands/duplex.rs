@@ -25,7 +25,8 @@ use super::common::{
     AllowUnmappedOptions, BamIoOptions, CompressionOptions, ConsensusCallingOptions,
     OverlappingConsensusOptions, QueueMemoryOptions, ReadGroupOptions, RejectsOptions,
     SchedulerOptions, StatsOptions, ThreadingOptions, build_pipeline_config,
-    consensus_pregroup_keep_flags, consensus_pregroup_keep_raw, serialize_raw_bam_records,
+    consensus_pregroup_keep_flags, consensus_pregroup_keep_raw, reject_colliding_outputs,
+    serialize_raw_bam_records,
 };
 use crate::commands::consensus_runner::{
     ConsensusStatsOps, create_unmapped_consensus_header, log_overlapping_stats,
@@ -297,6 +298,7 @@ impl Command for Duplex {
         // Validate the input exists (stdin paths are exempt — the reader
         // streams them in a single pass).
         self.io.validate()?;
+        reject_colliding_outputs(&self.io.output, self.rejects_opts.rejects.as_ref(), "--rejects")?;
 
         // Validate consensus arguments (e.g. error rates must be > 0).
         self.validate()?;
