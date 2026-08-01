@@ -332,56 +332,49 @@ on it. In the `compare bams` work, the sampling profile and `tricorder` agreed
 that BGZF decode dominates (~61% self time; `mean_load=98%`), which is what made
 the conclusion trustworthy — not the profile alone.
 
-### `fgumi compare bams` baseline (recorded 2026-08-01, issue #686)
+### `fgumi compare bams` performance (issue #686, 2026-08-01)
 
-M2 Max (12 core), 20.1M records/file, ~2 GB BAMs, page-cached, `--threads 8`:
+Baseline on M2 Max (12 core), 20.1M records/file, ~2 GB BAMs, page-cached,
+`--threads 8`:
 
-| mode | wall | cpu | mean_load | cores busy | peak OS threads | max_rss |
-| --- | --- | --- | --- | --- | --- | --- |
-| `--command sort` (coordinate) | 23.7s | 23.2s | 98% | 0.98 / 12 | **1** | 20.3 MiB |
-| `--command group` | 24.7s | 24.3s | 98% | 0.98 / 12 | **1** | 21.2 MiB |
-| `--command simplex` (content) | 18.3s | 45.1s | 246% | 2.46 / 12 | 21 | 82.5 MiB |
+| mode | wall | cpu | mean_load | cores busy | peak OS threads |
+| --- | --- | --- | --- | --- | --- |
+| `--command sort` (coordinate) | 23.7s | 23.2s | 98% | 0.98 / 12 | **1** |
+| `--command group` | 24.7s | 24.3s | 98% | 0.98 / 12 | **1** |
+| `--command simplex` (content) | 18.3s | 45.1s | 246% | 2.46 / 12 | 21 |
 
-`sort` and `group` ignored `--threads` entirely: the tricorder `--trace`
+`sort` and `group` ignored `--threads` entirely — the tricorder `--trace`
 `n_threads` column stayed at **1** for the whole run, so the flag created no
-threads at all. `OpenedInput::open` took no thread count, so both inputs were
-decoded on the single main thread.
+threads at all. Sampling put ~55% of that single thread in
+`libdeflate_deflate_decompress_ex` and ~6% in
+`fgumi_bgzf::reader::verify_decompression` (the per-block CRC32): ~61% in BGZF
+decode, serialized. `content` reached only 2.46 cores and additionally traversed
+each input **twice**, because `verify_records_in_order` ran over both paths before
+`positional_compare` reopened and streamed them again.
 
-#### After round 1 (concurrent per-input readers)
+After the work on #686:
 
-`OpenedInput::open_pair` now gives each input its own read-ahead thread and a
-share of the `--threads` BGZF budget. Same host and corpus, interleaved arms with
-the page cache warmed identically before every run (minimum of 3 reps; the
-outliers are all slower, i.e. contention):
-
-| mode | baseline | round 1 | speedup |
+| mode | before | after | note |
 | --- | --- | --- | --- |
-| `--command sort` | 23.44s | 8.93s | 2.6x |
-| `--command group` | 24.36s | 9.92s | 2.5x |
+| `--command sort` `-t 8` | 23.44s | **4.14s** | 5.7x; scales `-t 1` 8.92s → `-t 4` 5.58s → `-t 8` 4.14s |
+| `--command group` `-t 8` | 24.36s | ~10s | reader concurrency only; its engine was not otherwise changed |
+| `--command simplex` (content) | 47.1 CPU-s | **27.4 CPU-s** | -42% CPU |
 
-`mean_load` rises 98% → 370% and peak threads 1 → 13.
+`compare --command sort` is now 2.0x *faster* than the `fgumi sort` it validates
+(4.14s vs 8.20s), having started 2.7x slower.
 
-**The win is from overlap, not from `--threads`.** Thread scaling is flat —
-`-t 1` 8.64s, `-t 2` 8.47s, `-t 4` 8.97s, `-t 8` 8.89s — because the single
-comparison thread is now the critical path. At `-t 1`: wall 8.67s, cpu 24.65s
-(2.84 cores); if the compare thread is saturated it accounts for 8.67s and the
-two readers share the remaining 15.98s, i.e. ~8.0s each. Per-file decode (~8.0s)
-and comparison (~8.7s) are balanced, with comparison the marginally longer leg,
-so adding BGZF workers cannot help until the comparison thread does less work.
+Two findings worth keeping:
 
-For reference, `fgumi sort` over the same data at `--threads 8` is 8.82s, so
-`compare --command sort` went from 2.7x slower than the sort it validates to
-roughly par (8.93s vs 8.82s) — close but not yet strictly faster, which is what
-issue #686 asks for. Closing it requires cutting comparison-thread work
-(`content_key_exact`'s per-record allocation in `RunCanceller::observe`), after
-which the already-wired BGZF parallelism should begin to matter. Sampling attributes ~55%
-of that single thread to `libdeflate_deflate_decompress_ex` and ~6% to
-`fgumi_bgzf::reader::verify_decompression` (the per-block CRC32), i.e. ~61% to
-BGZF decode. `content` reaches only 2.46 cores and additionally traverses each
-input **twice**: `bams.rs` runs `verify_records_in_order` over both paths before
-`positional_compare` reopens and streams them again — four full traversals for a
-comparison needing two. `sort_verify` already avoids this via its `OrderChecked`
-adapter, which folds the order check into the comparison read.
+- **Report content-mode results in CPU-seconds, not wall.** This host's wall time
+  is unreliable under interactive load — identical `-t 8` runs measured 3.56s and
+  16.56s — while total CPU stayed within 24–27s across the same sweep. Total CPU is
+  the metric the content conclusions rest on.
+- **Parallel BGZF decode costs ~40% more total CPU** than single-threaded decode
+  for the same work (19.3 CPU-s at `-t 1` vs ~27 CPU-s at `-t 4`+), spent in
+  `crossbeam_channel::recv` and thread parking. It buys wall-clock on an idle host
+  and costs throughput on a busy one. Raising the read-ahead batch from 256 to 4096
+  records did **not** reduce it (26.5 vs 27.0 CPU-s) but tripled peak RSS, so that
+  time is the consumer waiting on decode, not per-handoff overhead.
 
 ### samtools sort orders
 `samtools sort` supports `--template-coordinate` for template-coordinate sorting. When benchmarking sort orders:
