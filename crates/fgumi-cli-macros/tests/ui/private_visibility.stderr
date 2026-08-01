@@ -1,0 +1,12 @@
+error[E0603]: struct `MultiPrivateOpts` is private
+  --> tests/ui/private_visibility.rs:16:20
+   |
+16 |     let _ = inner::MultiPrivateOpts { probe_value: 1 };
+   |                    ^^^^^^^^^^^^^^^^ private struct
+   |
+note: the struct `MultiPrivateOpts` is defined here
+  --> tests/ui/private_visibility.rs:7:5
+   |
+ 7 |     #[multi_options("probe", "Probe Options")]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: this error originates in the attribute macro `multi_options` (in Nightly builds, run with -Z macro-backtrace for more info)
