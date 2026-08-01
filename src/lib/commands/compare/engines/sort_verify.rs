@@ -29,6 +29,12 @@
 //!    tolerates intra-run reordering while still catching a missing/extra record or any
 //!    content difference.
 //!
+//! The run comparison is exact — reporting the specific reads that went unmatched — for as
+//! long as the two files' orderings stay within [`EXACT_WINDOW_RECORDS`] of each other. Past
+//! that it degrades to an order-insensitive digest ([`MultisetDigest`]) that still decides
+//! the same question in constant memory, but can no longer name individual reads. See
+//! [`RunCanceller`] for why that fallback exists and what it costs.
+//!
 //! Reading each file once (rather than an order pass per file *plus* a reopened comparison
 //! pass — four full BAM traversals) roughly halves the BAM I/O + BGZF decode this
 //! benchmarking command spends on WGS-scale inputs. Because the comparison — including its
@@ -42,6 +48,7 @@
 
 use std::cmp::Ordering;
 use std::path::Path;
+use std::sync::LazyLock;
 
 use anyhow::{Result, anyhow, bail};
 
@@ -53,7 +60,7 @@ use fgumi_sort::{
 };
 use noodles::sam::Header;
 
-use ahash::AHashMap;
+use ahash::{AHashMap, RandomState};
 
 use super::{CheckedRecords, OpenedInput};
 use crate::sam::SamTag;
@@ -82,6 +89,17 @@ pub struct SortVerifyOutcome {
     /// Number of equal-core-sort-key runs whose record multiset differed between the two
     /// files (a content difference, or a missing/extra record within the run).
     pub run_mismatches: u64,
+    /// Number of runs whose comparison fell back from the exact canceller to the
+    /// order-insensitive digest because the two files' orderings diverged by more than
+    /// this engine's exact-cancellation window (`EXACT_WINDOW_RECORDS`, enforced by
+    /// `RunCanceller`). Both are private to this module, so they are named here rather
+    /// than linked — an intra-doc link from this public field would not resolve.
+    ///
+    /// Purely informational, and deliberately *not* part of [`Self::is_match`]: degrading is
+    /// not an error, and a run compared this way is still compared. It is reported so a
+    /// reader can tell that an `IDENTICAL` verdict rested on a digest rather than on an
+    /// exact multiset, and so a `DIFFER` verdict that names no reads is explicable.
+    pub runs_compared_by_digest: u64,
     /// `true` if the two files' run sequences desynchronized — one file's run boundaries
     /// don't line up with the other's (a whole run present on only one side), or one file
     /// ran out of records before the other. Once this happens, no further runs are
@@ -413,13 +431,14 @@ fn compare_run<K, ExtractKey, IsViolation>(
     next2: &mut Option<Keyed<K>>,
     key: &K,
     same_core: &impl Fn(&K, &K) -> bool,
+    exact_window: usize,
 ) -> Result<RunPairOutcome>
 where
     K: Clone,
     ExtractKey: Fn(&[u8]) -> K,
     IsViolation: Fn(&K, &K) -> bool,
 {
-    let mut canceller = RunCanceller::new(MAX_PENDING_RUN_RECORDS);
+    let mut canceller = RunCanceller::new(exact_window);
     let (mut count1, mut count2) = (0u64, 0u64);
 
     loop {
@@ -456,11 +475,11 @@ where
             continue;
         }
         if let Some(rec) = from1 {
-            canceller.observe_bam1(rec.as_ref())?;
+            canceller.observe(Side::Bam1, rec.as_ref());
             count1 += 1;
         }
         if let Some(rec) = from2 {
-            canceller.observe_bam2(rec.as_ref())?;
+            canceller.observe(Side::Bam2, rec.as_ref());
             count2 += 1;
         }
     }
@@ -468,17 +487,119 @@ where
     Ok(RunPairOutcome { residual: canceller.finish(), count1, count2 })
 }
 
-/// Cap on records held pending inside a single equal-core-key run comparison
-/// ([`RunCanceller`]), counted across both sides.
+/// Records a single equal-core-key run comparison ([`RunCanceller`]) will hold pending,
+/// across both sides, before it stops naming reads and switches to the digest.
 ///
 /// Not a tuning knob for run *length*: a run of any length costs O(1) pending as long as the
 /// two files list its records in the same order, because each record cancels against its
 /// counterpart on arrival. Pending grows only with the *displacement* between the two
-/// orderings, so this fires when the inputs disagree about intra-run order beyond this
-/// window — e.g. two independently-produced unmapped tails that were never re-sorted into a
-/// common order. Re-sorting both inputs (`samtools sort`/`fgbio SortBam`) makes the
-/// displacement zero.
-const MAX_PENDING_RUN_RECORDS: usize = 5_000_000;
+/// orderings, so this is reached when the inputs disagree about intra-run order beyond this
+/// window — two independently-produced unmapped tails being the case that motivated it
+/// (#699: a 77.3M-record both-ends-unmapped tail is one run under template-coordinate, and
+/// two sorters order it differently).
+///
+/// This window buys *diagnostics*, not correctness: within it a mismatched run names the
+/// reads that went unmatched, and past it [`RunCanceller`] still decides the same
+/// question — in constant memory — but can only report counts. It is therefore sized to
+/// cover any plausible genuine difference rather than any plausible displacement.
+const EXACT_WINDOW_RECORDS: usize = 1_000_000;
+
+/// Which input a record came from. Names the two symmetric halves of [`RunCanceller`] so
+/// one implementation serves both directions.
+#[derive(Debug, Clone, Copy)]
+enum Side {
+    Bam1,
+    Bam2,
+}
+
+/// Two independently-seeded hashers whose outputs form the low and high halves of the
+/// 128-bit per-record hash [`MultisetDigest`] accumulates.
+///
+/// The seeds are fixed constants rather than [`RandomState::new`]'s per-process random ones
+/// so that repeated invocations of one binary agree. The verdict is order-insensitive
+/// either way, since both sides are hashed by the same hashers within a run; what per-process
+/// seeds would add is a re-rolled residual collision risk, letting the oracle change its mind
+/// about the same pair of files between runs. Fixed seeds make that risk a property of the
+/// inputs rather than of the run. (The digits below are the fractional part of pi, the usual
+/// nothing-up-my-sleeve source; nothing depends on the particular values beyond the two
+/// hashers being distinct.)
+///
+/// This is determinism, not a stable-hash guarantee. `ahash` explicitly does not fix its
+/// output across releases or build configurations — its AES-backed and software paths are
+/// selected at compile time and produce different values — so the same key hashes differently
+/// under a different `ahash` version, target architecture, or feature set. Digest values are
+/// accordingly only ever compared with each other inside a single process, and must never be
+/// persisted, reported as an identity, or compared across builds.
+static DIGEST_HASHERS: LazyLock<(RandomState, RandomState)> = LazyLock::new(|| {
+    (
+        RandomState::with_seeds(
+            0x243f_6a88_85a3_08d3,
+            0x1319_8a2e_0370_7344,
+            0xa409_3822_299f_31d0,
+            0x082e_fa98_ec4e_6c89,
+        ),
+        RandomState::with_seeds(
+            0x4528_21e6_38d0_1377,
+            0xbe54_66cf_34e9_0c6c,
+            0xc0ac_29b7_c97c_50dd,
+            0x3f84_d5b5_b547_0917,
+        ),
+    )
+});
+
+/// Hash a canonical content key to 128 bits by concatenating two independently-seeded
+/// 64-bit hashes of it.
+fn hash_content_key(key: &[u8]) -> u128 {
+    let (low, high) = &*DIGEST_HASHERS;
+    (u128::from(high.hash_one(key)) << 64) | u128::from(low.hash_one(key))
+}
+
+/// An order-insensitive fingerprint of one side's uncancelled records, in constant space.
+///
+/// Every field is a commutative fold over the per-record 128-bit content-key hash, which is
+/// exactly what makes the accumulated value independent of the order records arrive in — the
+/// property the exact canceller pays O(displacement) memory to achieve.
+///
+/// All three fields are load-bearing, and none is redundant:
+///
+/// - `count` alone catches a missing or extra record.
+/// - `xor` alone does not: it is self-inverse, so `{A, A, B}` and `{B, C, C}` share both a
+///   count and an xor while being different multisets. (Pinned by
+///   `digest_distinguishes_xor_cancelling_multisets`.)
+/// - `sum` covers that case, since duplicates add rather than annihilate, and `xor` in turn
+///   covers sums that happen to coincide modulo 2¹²⁸.
+///
+/// Equality is therefore a probabilistic — not an exact — multiset equality: two genuinely
+/// different runs agreeing on all three fields would be reported as equal. For BAM records
+/// hashed this way that is a ~2⁻¹²⁸ event per run and is not reachable by construction from
+/// non-adversarial input, but it is not zero, and it is the price of comparing a 77M-record
+/// run at all rather than aborting on it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct MultisetDigest {
+    sum: u128,
+    xor: u128,
+    count: u64,
+}
+
+impl MultisetDigest {
+    /// Fold one record's canonical content key into the digest.
+    fn add(&mut self, key: &[u8]) {
+        self.add_n(key, 1);
+    }
+
+    /// Fold `multiplicity` copies of one canonical content key into the digest, without
+    /// hashing it more than once. Used when draining a pending map, whose entries already
+    /// carry their multiplicity.
+    fn add_n(&mut self, key: &[u8], multiplicity: usize) {
+        let hash = hash_content_key(key);
+        self.sum = self.sum.wrapping_add(hash.wrapping_mul(multiplicity as u128));
+        // XOR is self-inverse, so an even number of copies contributes nothing.
+        if multiplicity % 2 == 1 {
+            self.xor ^= hash;
+        }
+        self.count += multiplicity as u64;
+    }
+}
 
 /// One side's unmatched records for a single canonical content key, plus a read name for
 /// diagnostics. `count` is the multiplicity (a BAM may legitimately hold several records
@@ -490,12 +611,19 @@ struct PendingEntry {
     name: Vec<u8>,
 }
 
-/// Records left unmatched on each side once a run is fully consumed: the exact symmetric
-/// difference of the two sides' record multisets, by read name.
-#[derive(Debug, Default)]
-struct RunResidual {
-    only_in_bam1: Vec<Vec<u8>>,
-    only_in_bam2: Vec<Vec<u8>>,
+/// What a run comparison had left over, in whichever of the two representations
+/// [`RunCanceller`] finished in.
+#[derive(Debug)]
+enum RunResidual {
+    /// The run stayed within the canceller's exact window: the exact symmetric difference of
+    /// the two sides' record multisets, by read name.
+    Exact { only_in_bam1: Vec<Vec<u8>>, only_in_bam2: Vec<Vec<u8>> },
+    /// The run's displacement exceeded the window and it was finished by digest. The verdict
+    /// is still decided; the individual unmatched records are not recoverable, because
+    /// deciding this run at all meant not holding them. `window` is the window that was
+    /// actually in force ([`EXACT_WINDOW_RECORDS`] in production), carried so the diagnostic
+    /// quotes the threshold that fired rather than the production constant.
+    Digest { matched: bool, window: usize },
 }
 
 /// Read names listed per side in a residual diagnostic before truncating. A mismatched run
@@ -504,14 +632,36 @@ struct RunResidual {
 const RESIDUAL_NAMES_SHOWN: usize = 5;
 
 impl RunResidual {
-    /// `true` when the two sides' record multisets were equal (nothing left over).
-    fn is_empty(&self) -> bool {
-        self.only_in_bam1.is_empty() && self.only_in_bam2.is_empty()
+    /// `true` when the two sides held equal record multisets — exactly, or (in the
+    /// [`Self::Digest`] case) to the confidence [`MultisetDigest`] documents.
+    fn is_match(&self) -> bool {
+        match self {
+            Self::Exact { only_in_bam1, only_in_bam2 } => {
+                only_in_bam1.is_empty() && only_in_bam2.is_empty()
+            }
+            Self::Digest { matched, .. } => *matched,
+        }
     }
 
-    /// Render the unmatched read names per side, e.g.
-    /// `; only in bam1: lonely_read`. Empty when nothing is left over.
+    /// `true` when this run was finished by digest rather than by exact cancellation.
+    fn compared_by_digest(&self) -> bool {
+        matches!(self, Self::Digest { .. })
+    }
+
+    /// Render the unmatched read names per side, e.g. `; only in bam1: lonely_read`. Empty
+    /// when nothing is left over. A digest run names no reads and says so, rather than
+    /// rendering an empty string that would read as "nothing was left over".
     fn describe(&self) -> String {
+        let (only_in_bam1, only_in_bam2) = match self {
+            Self::Exact { only_in_bam1, only_in_bam2 } => (only_in_bam1, only_in_bam2),
+            Self::Digest { window, .. } => {
+                return format!(
+                    "; compared by order-insensitive digest (the two inputs' orderings \
+                     diverged by more than {window} records within this run), so the \
+                     unmatched records cannot be named"
+                );
+            }
+        };
         let side = |label: &str, names: &[Vec<u8>]| -> String {
             if names.is_empty() {
                 return String::new();
@@ -525,80 +675,43 @@ impl RunResidual {
             let suffix = if more > 0 { format!(" (+{more} more)") } else { String::new() };
             format!("; only in {label}: {}{suffix}", shown.join(", "))
         };
-        format!("{}{}", side("bam1", &self.only_in_bam1), side("bam2", &self.only_in_bam2))
+        format!("{}{}", side("bam1", only_in_bam1), side("bam2", only_in_bam2))
     }
 }
 
-/// Streaming multiset comparison of one equal-core-key run, in memory proportional to how
-/// far the two files' orderings diverge rather than to the run's length.
-///
-/// Each record that reaches the canceller is reduced to its canonical content key
-/// (byte-identical pairs are cancelled by [`compare_run`] before this point — see its
-/// docs) ([`content_key_exact`],
-/// whose byte-equality is *exactly* `Exact` content-equality) and cancelled against the
-/// opposite side's pending set if a counterpart is waiting; otherwise it joins its own
-/// side's pending set. Two files listing a run's records in the same order therefore never
-/// hold more than one record pending, however long the run — which is what keeps a BAM's
-/// unmapped tail (a single run spanning the whole file, since every `tid = -1` record packs
-/// to one constant coordinate key) from being materialized in full.
-///
-/// Whatever remains at [`finish`](Self::finish) is the exact symmetric difference, so a
-/// mismatch is reported as the specific reads involved instead of only a record count.
-struct RunCanceller {
+/// The exact half of [`RunCanceller`]: unmatched records held per side, keyed by canonical
+/// content key, so a residual can name the reads involved.
+#[derive(Debug, Default)]
+struct ExactPending {
     pending1: AHashMap<Vec<u8>, PendingEntry>,
     pending2: AHashMap<Vec<u8>, PendingEntry>,
     pending1_len: usize,
     pending2_len: usize,
-    peak_pending: usize,
-    max_pending: usize,
 }
 
-impl RunCanceller {
-    fn new(max_pending: usize) -> Self {
-        Self {
-            pending1: AHashMap::new(),
-            pending2: AHashMap::new(),
-            pending1_len: 0,
-            pending2_len: 0,
-            peak_pending: 0,
-            max_pending,
-        }
+impl ExactPending {
+    /// Records held across both sides.
+    fn len(&self) -> usize {
+        self.pending1_len + self.pending2_len
     }
 
-    /// Observe a record from bam1: cancel it against a waiting bam2 record, else hold it.
-    fn observe_bam1(&mut self, record: &[u8]) -> Result<()> {
-        Self::observe(
-            record,
-            &mut self.pending2,
-            &mut self.pending2_len,
-            &mut self.pending1,
-            &mut self.pending1_len,
-        );
-        self.after_observe()
-    }
-
-    /// Observe a record from bam2: cancel it against a waiting bam1 record, else hold it.
-    fn observe_bam2(&mut self, record: &[u8]) -> Result<()> {
-        Self::observe(
-            record,
-            &mut self.pending1,
-            &mut self.pending1_len,
-            &mut self.pending2,
-            &mut self.pending2_len,
-        );
-        self.after_observe()
-    }
-
-    /// Cancel `record` against `opposite` if a counterpart waits there, otherwise add it to
-    /// `own`. Side-agnostic so both directions share one implementation.
-    fn observe(
-        record: &[u8],
-        opposite: &mut AHashMap<Vec<u8>, PendingEntry>,
-        opposite_len: &mut usize,
-        own: &mut AHashMap<Vec<u8>, PendingEntry>,
-        own_len: &mut usize,
-    ) {
-        let key = content_key_exact(record);
+    /// Cancel `record` against a waiting counterpart on the opposite side if one is there,
+    /// otherwise hold it on its own side.
+    fn cancel_or_hold(&mut self, side: Side, key: Vec<u8>, record: &[u8]) {
+        let (opposite, opposite_len, own, own_len) = match side {
+            Side::Bam1 => (
+                &mut self.pending2,
+                &mut self.pending2_len,
+                &mut self.pending1,
+                &mut self.pending1_len,
+            ),
+            Side::Bam2 => (
+                &mut self.pending1,
+                &mut self.pending1_len,
+                &mut self.pending2,
+                &mut self.pending2_len,
+            ),
+        };
         if let Some(entry) = opposite.get_mut(&key) {
             entry.count -= 1;
             if entry.count == 0 {
@@ -614,32 +727,20 @@ impl RunCanceller {
         *own_len += 1;
     }
 
-    /// Refresh the peak watermark and enforce the pending cap.
-    fn after_observe(&mut self) -> Result<()> {
-        let pending = self.pending1_len + self.pending2_len;
-        self.peak_pending = self.peak_pending.max(pending);
-        if pending > self.max_pending {
-            bail!(
-                "sort-verify: more than {} records held pending while comparing one \
-                 equal-sort-key run — the two inputs disagree about the order of records \
-                 within that run by more than this window (an unmapped tail is one such \
-                 run). Re-sort both inputs into a common order and retry.",
-                self.max_pending
-            );
-        }
-        Ok(())
+    /// Fold each side's held records into that side's digest, releasing the maps.
+    fn into_digests(self) -> (MultisetDigest, MultisetDigest) {
+        let fold = |pending: AHashMap<Vec<u8>, PendingEntry>| {
+            let mut digest = MultisetDigest::default();
+            for (key, entry) in pending {
+                digest.add_n(&key, entry.count);
+            }
+            digest
+        };
+        (fold(self.pending1), fold(self.pending2))
     }
 
-    /// Highest number of records held pending at any point, across both sides. Exists so
-    /// tests can assert the bounded-memory contract directly (an in-order run must peak at
-    /// ~1 record however long it is) rather than inferring it from process RSS.
-    #[cfg(test)]
-    fn peak_pending(&self) -> usize {
-        self.peak_pending
-    }
-
-    /// Consume the canceller, reporting the records that never found a counterpart.
-    fn finish(self) -> RunResidual {
+    /// The unmatched read names per side, sorted for deterministic diagnostics.
+    fn into_residual(self) -> RunResidual {
         let names = |pending: AHashMap<Vec<u8>, PendingEntry>| -> Vec<Vec<u8>> {
             let mut names: Vec<Vec<u8>> = pending
                 .into_values()
@@ -650,7 +751,130 @@ impl RunCanceller {
             names.sort_unstable();
             names
         };
-        RunResidual { only_in_bam1: names(self.pending1), only_in_bam2: names(self.pending2) }
+        RunResidual::Exact {
+            only_in_bam1: names(self.pending1),
+            only_in_bam2: names(self.pending2),
+        }
+    }
+}
+
+/// Whether a run comparison is still tracking individual records or has fallen back to
+/// per-side digests.
+#[derive(Debug)]
+enum CancellerState {
+    Exact(ExactPending),
+    Digest { digest1: MultisetDigest, digest2: MultisetDigest },
+}
+
+/// Streaming multiset comparison of one equal-core-key run, in memory bounded by
+/// [`EXACT_WINDOW_RECORDS`] rather than by the run's length or by how far the two files'
+/// orderings diverge.
+///
+/// Each record that reaches the canceller is reduced to its canonical content key
+/// (byte-identical pairs are cancelled by [`compare_run`] before this point — see its docs)
+/// ([`content_key_exact`], whose byte-equality is *exactly* `Exact` content-equality) and
+/// cancelled against the opposite side's pending set if a counterpart is waiting; otherwise
+/// it joins its own side's pending set. Two files listing a run's records in the same order
+/// therefore never hold more than one record pending, however long the run.
+///
+/// # Degrading to the digest
+///
+/// Files that list a run's records in *different* orders hold records pending until their
+/// counterparts arrive, so pending grows with the displacement between the two orderings.
+/// A BAM's both-ends-unmapped tail is a single run — every such record packs to one constant
+/// coordinate key, and to one core template-coordinate key — and two independently-produced
+/// sorts of a whole-genome BAM order that tail arbitrarily differently: #699 reports 77.3M
+/// such records in one run of a 1.33B-record file. Holding that displacement exactly is not
+/// affordable, and re-sorting the inputs into a common order (the remedy this cap used to
+/// suggest) is *circular* when the two inputs are the outputs of the two sorters under
+/// comparison — there is no third order to normalize to.
+///
+/// So on the observation that pushes pending past [`EXACT_WINDOW_RECORDS`], both pending sets
+/// are folded into per-side [`MultisetDigest`]s, the maps are dropped, and the rest of the
+/// run accumulates directly into those digests. This is sound because the comparison decides
+/// the *symmetric difference* of the two sides' multisets: writing `A` and `B` for the two
+/// sides' records and `C` for the pairs already cancelled — each of which removed one element
+/// from `A` and an equal element from `B` — the digests cover exactly `A \ C` and `B \ C`, and
+/// `A == B` iff `A \ C == B \ C`. Work done before the fallback is carried across it rather
+/// than discarded, so a partial-displacement run still cancels everything it can exactly.
+///
+/// What is lost is *naming*: past the window a mismatched run can be reported only by count.
+/// What is gained is that it can be reported at all. See [`MultisetDigest`] for the residual
+/// (~2⁻¹²⁸) chance that a digest calls two different runs equal.
+#[derive(Debug)]
+struct RunCanceller {
+    state: CancellerState,
+    exact_window: usize,
+    peak_pending: usize,
+}
+
+impl RunCanceller {
+    fn new(exact_window: usize) -> Self {
+        Self {
+            state: CancellerState::Exact(ExactPending::default()),
+            exact_window,
+            peak_pending: 0,
+        }
+    }
+
+    /// Observe one record from `side`: cancel it against a waiting counterpart, hold it, or —
+    /// once this run has degraded — fold it into that side's digest.
+    fn observe(&mut self, side: Side, record: &[u8]) {
+        let key = content_key_exact(record);
+        match &mut self.state {
+            CancellerState::Exact(exact) => {
+                exact.cancel_or_hold(side, key, record);
+                self.peak_pending = self.peak_pending.max(exact.len());
+                if exact.len() > self.exact_window {
+                    self.degrade_to_digest();
+                }
+            }
+            CancellerState::Digest { digest1, digest2 } => match side {
+                Side::Bam1 => digest1.add(&key),
+                Side::Bam2 => digest2.add(&key),
+            },
+        }
+    }
+
+    /// Fold both pending sets into per-side digests and release the maps. A no-op if this
+    /// run has already degraded.
+    ///
+    /// The already-degraded arm has to hand the accumulated digests back, not let them
+    /// drop: the placeholder `mem::replace` installs is empty, and two empty digests
+    /// compare equal, so dropping them would turn a run of unmatched records into a
+    /// `matched: true` from [`finish`](Self::finish) — a silent false `IDENTICAL`.
+    fn degrade_to_digest(&mut self) {
+        let placeholder = CancellerState::Digest {
+            digest1: MultisetDigest::default(),
+            digest2: MultisetDigest::default(),
+        };
+        self.state = match std::mem::replace(&mut self.state, placeholder) {
+            CancellerState::Exact(exact) => {
+                let (digest1, digest2) = exact.into_digests();
+                CancellerState::Digest { digest1, digest2 }
+            }
+            already_degraded @ CancellerState::Digest { .. } => already_degraded,
+        };
+    }
+
+    /// Highest number of records held pending at any point, across both sides. Exists so
+    /// tests can assert the bounded-memory contract directly (an in-order run must peak at
+    /// ~1 record however long it is, and no run may exceed the window by more than the one
+    /// record that trips it) rather than inferring it from process RSS.
+    #[cfg(test)]
+    fn peak_pending(&self) -> usize {
+        self.peak_pending
+    }
+
+    /// Consume the canceller, reporting what never found a counterpart.
+    fn finish(self) -> RunResidual {
+        let window = self.exact_window;
+        match self.state {
+            CancellerState::Exact(exact) => exact.into_residual(),
+            CancellerState::Digest { digest1, digest2 } => {
+                RunResidual::Digest { matched: digest1 == digest2, window }
+            }
+        }
     }
 }
 
@@ -659,6 +883,7 @@ impl RunCanceller {
 #[derive(Debug, Default)]
 struct RunCompareOutcome {
     run_mismatches: u64,
+    runs_compared_by_digest: u64,
     presence_mismatch: bool,
     diff_details: Vec<String>,
 }
@@ -673,6 +898,7 @@ fn run_compare<K, ExtractKey, IsViolation>(
     stream2: &mut OrderChecked<'_, K, ExtractKey, IsViolation>,
     same_core: &impl Fn(&K, &K) -> bool,
     max_diffs: usize,
+    exact_window: usize,
 ) -> Result<RunCompareOutcome>
 where
     K: Clone,
@@ -731,8 +957,19 @@ where
                     break;
                 }
 
-                let pair = compare_run(stream1, &mut next1, stream2, &mut next2, &key1, same_core)?;
-                if !pair.residual.is_empty() {
+                let pair = compare_run(
+                    stream1,
+                    &mut next1,
+                    stream2,
+                    &mut next2,
+                    &key1,
+                    same_core,
+                    exact_window,
+                )?;
+                if pair.residual.compared_by_digest() {
+                    out.runs_compared_by_digest += 1;
+                }
+                if !pair.residual.is_match() {
                     out.run_mismatches += 1;
                     if out.diff_details.len() < max_diffs {
                         out.diff_details.push(format!(
@@ -774,6 +1011,10 @@ where
     same_core: SameCore,
     max_diffs: usize,
     order: SortOrder,
+    /// Records a single run comparison may hold pending before degrading to the digest —
+    /// [`EXACT_WINDOW_RECORDS`] in production, threaded through so tests can reach the
+    /// fallback with a handful of records instead of a million.
+    exact_window: usize,
 }
 
 /// Verify both files in a single synchronized streaming pass for a single key type `K` and
@@ -794,13 +1035,21 @@ where
     IsViolation: Fn(&K, &K) -> bool,
     SameCore: Fn(&K, &K) -> bool,
 {
-    let VerifyContext { reader1, reader2, extract_key, is_violation, same_core, max_diffs, order } =
-        ctx;
+    let VerifyContext {
+        reader1,
+        reader2,
+        extract_key,
+        is_violation,
+        same_core,
+        max_diffs,
+        order,
+        exact_window,
+    } = ctx;
 
     let mut stream1 = OrderChecked::new(reader1, &extract_key, &is_violation);
     let mut stream2 = OrderChecked::new(reader2, &extract_key, &is_violation);
 
-    let runs = run_compare(&mut stream1, &mut stream2, &same_core, max_diffs)?;
+    let runs = run_compare(&mut stream1, &mut stream2, &same_core, max_diffs, exact_window)?;
 
     Ok(SortVerifyOutcome {
         sort_order: order,
@@ -811,6 +1060,7 @@ where
         bam2_violations: stream2.tracker.violations,
         bam2_first_violation: stream2.tracker.first_violation,
         run_mismatches: runs.run_mismatches,
+        runs_compared_by_digest: runs.runs_compared_by_digest,
         presence_mismatch: runs.presence_mismatch,
         header_mismatch: false,
         diff_details: runs.diff_details,
@@ -859,6 +1109,26 @@ pub(crate) fn sort_verify_compare_opened(
     input2: OpenedInput,
     max_diffs: usize,
 ) -> Result<SortVerifyOutcome> {
+    sort_verify_compare_opened_with_window(input1, input2, max_diffs, EXACT_WINDOW_RECORDS)
+}
+
+/// [`sort_verify_compare_opened`] with an explicit exact-comparison window.
+///
+/// Exists so the digest fallback is reachable in a test: it is otherwise a million records
+/// of displacement away, which no test fixture can afford to build. Production callers use
+/// [`sort_verify_compare_opened`], which supplies [`EXACT_WINDOW_RECORDS`]; the window is
+/// deliberately *not* a CLI flag, since exceeding it is no longer an error the caller has to
+/// do anything about.
+///
+/// # Errors
+///
+/// As [`sort_verify_compare_opened`].
+pub(crate) fn sort_verify_compare_opened_with_window(
+    input1: OpenedInput,
+    input2: OpenedInput,
+    max_diffs: usize,
+    exact_window: usize,
+) -> Result<SortVerifyOutcome> {
     let OpenedInput { reader: reader1, header: header1, path: bam1 } = input1;
     let OpenedInput { reader: reader2, header: header2, path: bam2 } = input2;
     let (bam1, bam2) = (bam1.as_path(), bam2.as_path());
@@ -892,6 +1162,7 @@ pub(crate) fn sort_verify_compare_opened(
                 same_core: |a: &u64, b: &u64| a == b,
                 max_diffs,
                 order,
+                exact_window,
             })
         }
         SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
@@ -904,6 +1175,7 @@ pub(crate) fn sort_verify_compare_opened(
                 same_core: |a: &RawQuerynameLexKey, b: &RawQuerynameLexKey| a == b,
                 max_diffs,
                 order,
+                exact_window,
             })
         }
         SortOrder::Queryname(QuerynameComparator::Natural) => {
@@ -916,6 +1188,7 @@ pub(crate) fn sort_verify_compare_opened(
                 same_core: |a: &RawQuerynameKey, b: &RawQuerynameKey| a == b,
                 max_diffs,
                 order,
+                exact_window,
             })
         }
         SortOrder::TemplateCoordinate => {
@@ -936,6 +1209,7 @@ pub(crate) fn sort_verify_compare_opened(
                 same_core: |a: &TemplateKey, b: &TemplateKey| a.core_cmp(b) == Ordering::Equal,
                 max_diffs,
                 order,
+                exact_window,
             })
         }
     }?;
@@ -1214,11 +1488,11 @@ mod tests {
     /// pending never exceeds one record per side regardless of run length.
     #[test]
     fn identical_run_cancels_on_arrival_and_keeps_pending_bounded() {
-        let mut canceller = RunCanceller::new(MAX_PENDING_RUN_RECORDS);
+        let mut canceller = RunCanceller::new(EXACT_WINDOW_RECORDS);
         for i in 0..10_000u32 {
             let rec = named(format!("read{i}").as_bytes());
-            canceller.observe_bam1(rec.as_ref()).expect("bam1 observe within cap");
-            canceller.observe_bam2(rec.as_ref()).expect("bam2 observe within cap");
+            canceller.observe(Side::Bam1, rec.as_ref());
+            canceller.observe(Side::Bam2, rec.as_ref());
         }
         assert!(
             canceller.peak_pending() <= 1,
@@ -1226,7 +1500,11 @@ mod tests {
             canceller.peak_pending()
         );
         let residual = canceller.finish();
-        assert!(residual.is_empty(), "identical runs must leave no residual: {residual:?}");
+        assert!(residual.is_match(), "identical runs must leave no residual: {residual:?}");
+        assert!(
+            !residual.compared_by_digest(),
+            "an in-order run never approaches the window, so it must stay exact: {residual:?}"
+        );
     }
 
     /// Writes `records` to a temp BAM declaring `SO:coordinate`. All records are unmapped
@@ -1284,17 +1562,19 @@ mod tests {
         #[case] expected_only_in_bam1: usize,
         #[case] expected_only_in_bam2: usize,
     ) {
-        let mut canceller = RunCanceller::new(MAX_PENDING_RUN_RECORDS);
+        let mut canceller = RunCanceller::new(EXACT_WINDOW_RECORDS);
         let rec = named(b"duplicated");
         for _ in 0..copies_in_bam1 {
-            canceller.observe_bam1(rec.as_ref()).expect("within cap");
+            canceller.observe(Side::Bam1, rec.as_ref());
         }
         for _ in 0..copies_in_bam2 {
-            canceller.observe_bam2(rec.as_ref()).expect("within cap");
+            canceller.observe(Side::Bam2, rec.as_ref());
         }
-        let residual = canceller.finish();
-        assert_eq!(residual.only_in_bam1.len(), expected_only_in_bam1, "bam1 residual");
-        assert_eq!(residual.only_in_bam2.len(), expected_only_in_bam2, "bam2 residual");
+        let RunResidual::Exact { only_in_bam1, only_in_bam2 } = canceller.finish() else {
+            panic!("a handful of records is far inside the window; the run must stay exact");
+        };
+        assert_eq!(only_in_bam1.len(), expected_only_in_bam1, "bam1 residual");
+        assert_eq!(only_in_bam2.len(), expected_only_in_bam2, "bam2 residual");
     }
 
     /// Records the two files list in opposite order still cancel completely — the run's
@@ -1304,31 +1584,181 @@ mod tests {
     fn reversed_run_cancels_completely() {
         let records: Vec<RawRecord> =
             (0..256u32).map(|i| named(format!("read{i:03}").as_bytes())).collect();
-        let mut canceller = RunCanceller::new(MAX_PENDING_RUN_RECORDS);
+        let mut canceller = RunCanceller::new(EXACT_WINDOW_RECORDS);
         for rec in &records {
-            canceller.observe_bam1(rec.as_ref()).expect("within cap");
+            canceller.observe(Side::Bam1, rec.as_ref());
         }
         for rec in records.iter().rev() {
-            canceller.observe_bam2(rec.as_ref()).expect("within cap");
+            canceller.observe(Side::Bam2, rec.as_ref());
         }
-        assert!(canceller.finish().is_empty(), "a reversed run is still the same multiset");
+        assert!(canceller.finish().is_match(), "a reversed run is still the same multiset");
     }
 
-    /// The cap must fail with an actionable message rather than growing without bound. This
-    /// is the reversed-order worst case: nothing cancels until the second side arrives, so
-    /// pending grows to the run's length.
+    /// Feed `bam1`'s records then `bam2`'s (the reversed-order worst case: nothing cancels
+    /// until the second side arrives, so pending grows to the run's length), through a
+    /// canceller whose window is small enough to force the digest fallback.
+    fn compare_via_digest(bam1: &[RawRecord], bam2: &[RawRecord], window: usize) -> RunCanceller {
+        let mut canceller = RunCanceller::new(window);
+        for rec in bam1 {
+            canceller.observe(Side::Bam1, rec.as_ref());
+        }
+        for rec in bam2 {
+            canceller.observe(Side::Bam2, rec.as_ref());
+        }
+        canceller
+    }
+
+    /// Distinct records numbered `0..n`.
+    fn distinct_records(n: u32) -> Vec<RawRecord> {
+        (0..n).map(|i| named(format!("read{i:03}").as_bytes())).collect()
+    }
+
+    /// #699: a run whose two orderings diverge past the window must still be *compared*,
+    /// not aborted. The abort it replaced was unfixable in the case that motivated it —
+    /// the two inputs are the outputs of the two sorters under comparison, so "re-sort both
+    /// into a common order" destroys the very property being verified.
     #[test]
-    fn exceeding_the_pending_cap_reports_an_actionable_error() {
+    fn a_run_past_the_window_is_compared_by_digest_rather_than_aborting() {
+        let records = distinct_records(256);
+        let reversed: Vec<RawRecord> = records.iter().rev().cloned().collect();
+        let residual = compare_via_digest(&records, &reversed, 8).finish();
+
+        assert!(residual.compared_by_digest(), "a fully-displaced run must degrade: {residual:?}");
+        assert!(residual.is_match(), "a reversed run is still the same multiset: {residual:?}");
+    }
+
+    /// Degrading must not blind the comparison: the digest still decides the question a
+    /// mismatched run is asked. Covers a record missing from either side, and the equal
+    /// multiset that must still match. Every case here is settled by record count alone;
+    /// the content the digest is keyed on is pinned separately, below.
+    #[rstest]
+    #[case::record_missing_from_bam2(255, 256, false)]
+    #[case::record_missing_from_bam1(256, 255, false)]
+    #[case::equal_multisets(256, 256, true)]
+    fn the_digest_decides_a_mismatched_run(
+        #[case] records_in_bam1: u32,
+        #[case] records_in_bam2: u32,
+        #[case] expected_match: bool,
+    ) {
+        let bam1 = distinct_records(records_in_bam1);
+        let bam2: Vec<RawRecord> = distinct_records(records_in_bam2).into_iter().rev().collect();
+        let residual = compare_via_digest(&bam1, &bam2, 8).finish();
+
+        assert!(residual.compared_by_digest(), "the window must have been exceeded");
+        assert_eq!(residual.is_match(), expected_match, "digest verdict: {residual:?}");
+    }
+
+    /// Equal counts, equal read names, one record's *content* changed.
+    ///
+    /// The cases above are all decided by `MultisetDigest::count`, so none of them says
+    /// what the digest is keyed *on* — a digest that hashed the read name would pass every
+    /// one. Here the two sides hold the same 64 names, so only a digest over the canonical
+    /// content key can call it a mismatch, and a name-keyed one would report a false
+    /// `IDENTICAL`.
+    #[test]
+    fn the_digest_catches_a_content_change_under_an_unchanged_name() {
+        let bam1 = distinct_records(64);
+        let mut bam2: Vec<RawRecord> = bam1.iter().rev().cloned().collect();
+        // `named` builds a FIRST_SEGMENT record, so rebuilding `read000` as LAST_SEGMENT
+        // changes its bytes and nothing else — the name it is found under is unchanged.
+        let last = bam2.len() - 1;
+        bam2[last] = SamBuilder::new().read_name(b"read000").flags(flags::LAST_SEGMENT).build();
+
+        let residual = compare_via_digest(&bam1, &bam2, 8).finish();
+
+        assert!(residual.compared_by_digest(), "the window must have been exceeded");
+        assert!(
+            !residual.is_match(),
+            "equal counts and equal names, one record's content changed: {residual:?}"
+        );
+    }
+
+    /// Degrading a run that has already degraded is documented as a no-op, and must be one.
+    ///
+    /// `degrade_to_digest` installs an *empty* placeholder before it matches, so an
+    /// already-degraded arm that let the accumulated digests drop would leave two empty
+    /// digests behind — equal to each other, and therefore a `matched: true` for a run that
+    /// does not match. `observe` only ever calls it from `Exact`, so nothing reaches the
+    /// second call but a direct one.
+    #[test]
+    fn degrading_an_already_degraded_run_keeps_its_digests() {
+        let bam1 = distinct_records(64);
+        let bam2: Vec<RawRecord> = distinct_records(63).into_iter().rev().collect();
+        let mut canceller = compare_via_digest(&bam1, &bam2, 8);
+
+        canceller.degrade_to_digest();
+
+        let residual = canceller.finish();
+        assert!(residual.compared_by_digest(), "the window must have been exceeded");
+        assert!(
+            !residual.is_match(),
+            "the record missing from bam2 must survive a redundant degrade: {residual:?}"
+        );
+    }
+
+    /// The digest must distinguish `{A, A, B}` from `{B, C, C}`. Both have three records and
+    /// the *same* XOR, because XOR is self-inverse and each duplicated pair annihilates —
+    /// so a digest built on count and XOR alone would report these different runs as equal.
+    /// `MultisetDigest::sum` is what separates them, and this test is why it is there.
+    #[test]
+    fn digest_distinguishes_xor_cancelling_multisets() {
+        let (a, b, c) = (named(b"aaa"), named(b"bbb"), named(b"ccc"));
+        let bam1 = [a.clone(), a, b.clone()];
+        let bam2 = [b, c.clone(), c];
+
+        let residual = compare_via_digest(&bam1, &bam2, 1).finish();
+        assert!(residual.compared_by_digest(), "window of 1 must force the digest");
+        assert!(
+            !residual.is_match(),
+            "{{A,A,B}} and {{B,C,C}} share a count and an XOR but are different multisets"
+        );
+    }
+
+    /// The fallback is a change of representation mid-run, not a restart: pairs cancelled
+    /// exactly before the window is exceeded must stay cancelled after it. Here a prefix
+    /// arrives in lockstep and cancels on arrival, then the two sides diverge far enough to
+    /// degrade — and the run as a whole is still the same multiset.
+    #[test]
+    fn cancellations_made_before_degrading_survive_it() {
         let mut canceller = RunCanceller::new(8);
-        let err = (0..64u32)
-            .find_map(|i| {
-                let rec = named(format!("read{i:03}").as_bytes());
-                canceller.observe_bam1(rec.as_ref()).err()
-            })
-            .expect("feeding only one side past the cap must error");
-        let msg = err.to_string();
-        assert!(msg.contains("held pending"), "error should explain the cap: {msg}");
-        assert!(msg.contains("Re-sort both inputs"), "error should say how to fix it: {msg}");
+        for rec in &distinct_records(32) {
+            canceller.observe(Side::Bam1, rec.as_ref());
+            canceller.observe(Side::Bam2, rec.as_ref());
+        }
+        assert!(canceller.peak_pending() <= 1, "the lockstep prefix must cancel on arrival");
+
+        let tail: Vec<RawRecord> =
+            (0..64u32).map(|i| named(format!("tail{i:03}").as_bytes())).collect();
+        for rec in &tail {
+            canceller.observe(Side::Bam1, rec.as_ref());
+        }
+        for rec in tail.iter().rev() {
+            canceller.observe(Side::Bam2, rec.as_ref());
+        }
+
+        let residual = canceller.finish();
+        assert!(residual.compared_by_digest(), "the tail must have exceeded the window");
+        assert!(
+            residual.is_match(),
+            "records cancelled before the fallback must not resurface after it: {residual:?}"
+        );
+    }
+
+    /// The bounded-memory contract, asserted directly rather than inferred from RSS: however
+    /// far the two orderings diverge, pending never exceeds the window by more than the one
+    /// record whose arrival trips it. This is the whole point of #699 — a 77.3M-record
+    /// unmapped tail must not be materialized.
+    #[test]
+    fn pending_never_exceeds_the_window() {
+        const WINDOW: usize = 16;
+        let records = distinct_records(1024);
+        let reversed: Vec<RawRecord> = records.iter().rev().cloned().collect();
+        let canceller = compare_via_digest(&records, &reversed, WINDOW);
+        assert!(
+            canceller.peak_pending() <= WINDOW + 1,
+            "pending peaked at {} for a window of {WINDOW}",
+            canceller.peak_pending()
+        );
     }
 
     /// A mapped record at a given coordinate, so distinct positions form distinct runs.
@@ -1424,30 +1854,149 @@ mod tests {
         );
     }
 
-    // The residual is empty exactly when the two sides hold equal record multisets — the
-    // property the whole run comparison rests on. Checked against a straightforward sorted
-    // content-key reference over randomized inputs.
+    /// Feed both sides through a canceller with the given window, in the interleaved order a
+    /// run comparison would: one record from each side per step.
+    fn verdict_with_window(left: &[u32], right: &[u32], window: usize) -> bool {
+        let mut canceller = RunCanceller::new(window);
+        for i in 0..left.len().max(right.len()) {
+            if let Some(v) = left.get(i) {
+                canceller.observe(Side::Bam1, named(format!("read{v}").as_bytes()).as_ref());
+            }
+            if let Some(v) = right.get(i) {
+                canceller.observe(Side::Bam2, named(format!("read{v}").as_bytes()).as_ref());
+            }
+        }
+        canceller.finish().is_match()
+    }
+
     proptest::proptest! {
+        /// The residual is empty exactly when the two sides hold equal record multisets — the
+        /// property the whole run comparison rests on. Checked against a straightforward
+        /// sorted content-key reference over randomized inputs.
         #[test]
         fn residual_is_empty_iff_content_multisets_are_equal(
             left in proptest::collection::vec(0u32..6, 0..12),
             right in proptest::collection::vec(0u32..6, 0..12),
         ) {
-            let mut canceller = RunCanceller::new(MAX_PENDING_RUN_RECORDS);
-            for i in &left {
-                canceller.observe_bam1(named(format!("read{i}").as_bytes()).as_ref()).unwrap();
-            }
-            for i in &right {
-                canceller.observe_bam2(named(format!("read{i}").as_bytes()).as_ref()).unwrap();
-            }
             let (mut sorted_left, mut sorted_right) = (left.clone(), right.clone());
             sorted_left.sort_unstable();
             sorted_right.sort_unstable();
             proptest::prop_assert_eq!(
-                canceller.finish().is_empty(),
+                verdict_with_window(&left, &right, EXACT_WINDOW_RECORDS),
                 sorted_left == sorted_right
             );
         }
+
+        /// The correctness claim for the whole fallback: the digest reaches the *same*
+        /// verdict the exact canceller would, on arbitrary input. A window of 0 degrades on
+        /// the first held record, so every non-trivial case here runs entirely through the
+        /// digest; `usize::MAX` never degrades. Any disagreement — a digest collision, a
+        /// record lost across the fold, a multiplicity mishandled — fails this.
+        #[test]
+        fn digest_and_exact_verdicts_agree(
+            left in proptest::collection::vec(0u32..6, 0..12),
+            right in proptest::collection::vec(0u32..6, 0..12),
+        ) {
+            proptest::prop_assert_eq!(
+                verdict_with_window(&left, &right, 0),
+                verdict_with_window(&left, &right, usize::MAX)
+            );
+        }
+    }
+
+    /// [`sort_verify_compare`] against a deliberately tiny exact window, so the digest
+    /// fallback is reachable from a fixture of a few dozen records rather than a million.
+    fn compare_with_window(
+        bam1: &Path,
+        bam2: &Path,
+        exact_window: usize,
+    ) -> Result<SortVerifyOutcome> {
+        sort_verify_compare_opened_with_window(
+            OpenedInput::open(bam1)?,
+            OpenedInput::open(bam2)?,
+            20,
+            exact_window,
+        )
+    }
+
+    /// The #699 scenario end to end, through the real engine rather than the canceller alone:
+    /// two BAMs holding the same unmapped tail in opposite orders — one equal-key run, fully
+    /// displaced — must compare `IDENTICAL`, and must report that the verdict came from the
+    /// digest. Before this change the same inputs aborted with an error whose suggested
+    /// remedy could not be applied.
+    #[test]
+    fn a_reordered_unmapped_tail_compares_identical_via_the_digest() {
+        let records = distinct_records(64);
+        let reversed: Vec<RawRecord> = records.iter().rev().cloned().collect();
+        let bam1 = unmapped_tail_bam(&records);
+        let bam2 = unmapped_tail_bam(&reversed);
+
+        let outcome = compare_with_window(bam1.path(), bam2.path(), 4).expect("compare runs");
+        assert!(
+            outcome.is_match(),
+            "a reordered unmapped tail is the same multiset: {:?}",
+            outcome.diff_details
+        );
+        assert_eq!(outcome.runs_compared_by_digest, 1, "the tail run must be reported as degraded");
+        assert_eq!(outcome.bam1_count, 64, "both files must still be counted in full");
+        assert_eq!(outcome.bam2_count, 64);
+    }
+
+    /// A genuine difference inside a degraded run must still be caught, and the diagnostic
+    /// must say why it names no reads instead of reporting a bare count that reads as though
+    /// the reads were checked and found anonymous.
+    ///
+    /// It must also quote the window that actually fired. The window is a field, not the
+    /// constant, so a diagnostic built from [`EXACT_WINDOW_RECORDS`] would name a threshold
+    /// this comparison never reached.
+    #[test]
+    fn a_difference_inside_a_degraded_run_is_reported_without_names() {
+        const WINDOW: usize = 4;
+        let records = distinct_records(64);
+        let mut reversed: Vec<RawRecord> = records.iter().rev().cloned().collect();
+        reversed.pop();
+        let bam1 = unmapped_tail_bam(&records);
+        let bam2 = unmapped_tail_bam(&reversed);
+
+        let outcome = compare_with_window(bam1.path(), bam2.path(), WINDOW).expect("compare runs");
+        assert!(!outcome.is_match(), "a dropped record must DIFFER");
+        assert_eq!(outcome.run_mismatches, 1, "the tail run must be the mismatch");
+        assert!(
+            outcome.diff_details.iter().any(|d| d.contains("order-insensitive digest")),
+            "the diagnostic must explain why no reads are named, got: {:?}",
+            outcome.diff_details
+        );
+        assert!(
+            outcome.diff_details.iter().any(|d| d.contains(&format!("more than {WINDOW} records"))),
+            "the diagnostic must quote the window in force, not {EXACT_WINDOW_RECORDS}, got: {:?}",
+            outcome.diff_details
+        );
+    }
+
+    /// Runs that stay inside the window keep naming reads, even when another run in the same
+    /// file degrades. The fallback is per-run, so a huge unmapped tail must not cost the
+    /// mapped runs their diagnostics.
+    #[test]
+    fn a_degraded_run_does_not_cost_other_runs_their_diagnostics() {
+        // One mapped run with a named difference, plus a displaced unmapped tail. Unmapped
+        // records sort after mapped ones, so the tail is the file's last run either way.
+        let tail = distinct_records(64);
+        let mut bam1_records = vec![mapped(b"stationary", 100), mapped(b"only_in_bam1", 100)];
+        bam1_records.extend(tail.iter().cloned());
+        let mut bam2_records = vec![mapped(b"stationary", 100)];
+        bam2_records.extend(tail.iter().rev().cloned());
+
+        let bam1 = mapped_bam(&bam1_records);
+        let bam2 = mapped_bam(&bam2_records);
+
+        let outcome = compare_with_window(bam1.path(), bam2.path(), 4).expect("compare runs");
+        assert!(!outcome.is_match(), "the extra mapped record must DIFFER");
+        assert_eq!(outcome.runs_compared_by_digest, 1, "only the tail run should degrade");
+        assert!(
+            outcome.diff_details.iter().any(|d| d.contains("only_in_bam1")),
+            "the exact run must still name its unmatched read, got: {:?}",
+            outcome.diff_details
+        );
     }
 
     /// A header carrying a single reference sequence, so `ref_id = 0` records are

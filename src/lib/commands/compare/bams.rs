@@ -926,6 +926,17 @@ impl CompareBams {
             }
             println!();
             println!("Sort-key-run multiset mismatches: {}", outcome.run_mismatches);
+            // Printed only when it happened: on the overwhelmingly common in-order pair it
+            // would be a line of zero every time, and its whole purpose is to qualify a
+            // verdict that was reached without naming records.
+            if outcome.runs_compared_by_digest > 0 {
+                println!(
+                    "Runs compared by order-insensitive digest: {} (the two inputs' orderings \
+                     diverged within these runs by more than the exact window; the multiset \
+                     verdict still holds, but unmatched records in them cannot be named)",
+                    outcome.runs_compared_by_digest
+                );
+            }
             println!();
 
             if is_equal {
