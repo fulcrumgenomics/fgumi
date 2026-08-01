@@ -288,6 +288,10 @@ pub struct Sort {
     ///
     /// Used for parallel sorting of in-memory chunks and parallel temp-chunk
     /// (BGZF or zstd) compression.
+    ///
+    /// This is also the multiplier for `--max-memory --memory-per-thread`: the
+    /// sort runs on one global memory budget, so `--sort-threads` and
+    /// `--merge-threads` change scheduling only and never resize it.
     #[arg(short = '@', short_alias = 't', long = "threads", default_value = "1")]
     pub threads: usize,
 
@@ -299,7 +303,8 @@ pub struct Sort {
     /// still uses 8 because it cannot start until the input is exhausted, by
     /// which point the producer has finished writing.
     ///
-    /// This only changes scheduling; the output is byte-identical.
+    /// This only changes scheduling; the output is byte-identical, and the
+    /// memory budget stays sized from `--threads`.
     #[arg(long = "sort-threads")]
     pub sort_threads: Option<usize>,
 
@@ -534,6 +539,10 @@ impl Sort {
 
         let cell_tag = self.parse_cell_tag()?;
 
+        // Built before the config log so the log can report the sorter's own
+        // effective per-phase thread counts.
+        let mut sorter = self.build_sorter(effective_memory, command_line);
+
         debug!("Starting Sort");
         info!("Input: {}", self.input.display());
         info!("Output: {}", output.display());
@@ -544,8 +553,12 @@ impl Sort {
         }
         if let MemoryLimit::Fixed(per_thread) = self.max_memory {
             if self.memory_per_thread {
+                // The multiplier is `--threads`, not the per-phase counts logged
+                // below: `resolve_memory_budget` sizes one global budget for the
+                // whole run, so `--sort-threads`/`--merge-threads` do not change
+                // it. Name the flag so the two lines cannot be read as disagreeing.
                 info!(
-                    "Max memory: {} ({}/thread x {} threads)",
+                    "Max memory: {} ({}/thread x {} threads, from --threads)",
                     ByteSize(effective_memory as u64),
                     ByteSize(per_thread as u64),
                     self.threads
@@ -554,7 +567,13 @@ impl Sort {
                 info!("Max memory: {} (fixed)", ByteSize(effective_memory as u64));
             }
         }
-        info!("Threads: {}", self.threads);
+        // Read the counts off the sorter rather than off `--threads`, which is
+        // only where `--sort-threads`/`--merge-threads` default from: logging the
+        // flag alone reports 1 thread for a run that was asked for more.
+        info!(
+            "Threads: {}",
+            fgumi_sort::format_thread_counts(sorter.phase1_threads(), sorter.phase2_threads())
+        );
         info!("Temp compression level: {}", self.temp_compression);
         if self.write_index {
             info!("Write index: enabled");
@@ -569,9 +588,6 @@ impl Sort {
                 .join(", ");
             info!("Temp directories: {joined}");
         }
-
-        // Sort using raw-bytes sorter for optimal memory efficiency and speed
-        let mut sorter = self.build_sorter(effective_memory, command_line);
 
         // For auto mode, cap initial buffer pre-allocation at 768 MiB/thread
         // (matching samtools default) to avoid huge upfront allocations.
