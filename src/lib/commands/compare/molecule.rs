@@ -347,4 +347,78 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].members.len(), 2);
     }
+
+    /// A read failure must propagate as an error, never be mistaken for end-of-stream.
+    /// The record source hands back `io::Result`, so treating an `Err` like `None`
+    /// would silently turn a corrupt input into a file that simply held fewer
+    /// molecules — a wrong answer from a comparison oracle rather than a failure.
+    ///
+    /// The records already buffered when the failure arrives must not be emitted as a
+    /// complete run either: they are a partial molecule, and reporting them as whole
+    /// would be the same silent truncation one layer down.
+    #[test]
+    fn a_read_failure_propagates_instead_of_ending_the_stream() {
+        let records = vec![
+            Ok(rec(b"r_a", "1")),
+            Err(std::io::Error::other("simulated decompression failure")),
+        ];
+
+        let err = molecule_runs(records.into_iter())
+            .collect::<Result<Vec<_>>>()
+            .expect_err("a read failure must surface as an error, not a short file");
+        assert!(
+            err.to_string().contains("simulated decompression failure"),
+            "the underlying I/O failure must reach the caller: {err}"
+        );
+    }
+
+    /// Every error arm is terminal, and none may leave the partially accumulated molecule
+    /// behind. `std::iter::from_fn` is not fused, so a caller that polls past an error would
+    /// otherwise reach the end-of-stream arm and receive `pending` as a *complete*
+    /// [`MoleculeRun`] — a partial molecule reported as whole, which is exactly the silent
+    /// truncation these errors exist to prevent. `collect::<Result<Vec<_>>>` stops at the
+    /// first `Err`, so this is latent rather than live today; the cases below pin it at the
+    /// iterator rather than relying on every future caller to stop polling.
+    ///
+    /// One case per error arm — read failure, MI-less record, non-monotonic base, and the
+    /// per-run cap — because each breaks from a different point in the loop. Each case pins a
+    /// fragment unique to its arm, so a case cannot pass by tripping a *different* error than
+    /// the one it names.
+    #[rstest]
+    #[case::read_failure(
+        vec![Ok(rec(b"r_a", "1")), Err(std::io::Error::other("simulated decompression failure"))],
+        MAX_MOLECULE_RUN_RECORDS,
+        "simulated decompression failure"
+    )]
+    #[case::mi_less_record(
+        vec![Ok(rec(b"r_a", "1")), Ok(mi_less())],
+        MAX_MOLECULE_RUN_RECORDS,
+        "MI-tagged"
+    )]
+    #[case::non_monotonic_base(
+        vec![Ok(rec(b"r_a", "5")), Ok(rec(b"r_b", "1"))],
+        MAX_MOLECULE_RUN_RECORDS,
+        "not greater than"
+    )]
+    #[case::over_run_cap(vec![Ok(rec(b"r_a", "1")), Ok(rec(b"r_b", "1"))], 1, "single molecule")]
+    fn an_error_is_terminal_and_discards_the_partial_run(
+        #[case] records: Vec<std::io::Result<RawRecord>>,
+        #[case] max_run_records: usize,
+        #[case] expected_fragment: &str,
+    ) {
+        let mut runs = molecule_runs_capped(records.into_iter(), max_run_records);
+
+        let err = runs
+            .next()
+            .expect("the error must be yielded, not swallowed")
+            .expect_err("the first item must be the error, not a run");
+        assert!(
+            err.to_string().contains(expected_fragment),
+            "expected the {expected_fragment:?} arm to fire, got: {err}"
+        );
+        assert!(
+            runs.next().is_none(),
+            "polling past an error must not emit the buffered partial molecule as a run"
+        );
+    }
 }

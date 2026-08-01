@@ -709,7 +709,11 @@ impl Command for CompareBams {
         // and bought nothing: the comparison already drains both inputs to
         // completion, so it sees every record the standalone pass would have, and
         // reports the identical diagnostic.
-        let verify_order = declared_order.filter(|_| matches!(mode, CompareMode::Content));
+        // `declared_order` is `None` for genuinely orderless input (extract/fastq/
+        // zipper output), in which case there is nothing to verify. No mode filter
+        // is applied here: this value is consumed only by the `Content` arm below,
+        // so a filter on the mode could never remove anything at the point of use.
+        let verify_order = declared_order;
 
         // In `--quiet` mode only the exit code communicates the result, so suppress this
         // command's own informational stderr logging and timer (matching `compare metrics`).
@@ -1249,6 +1253,24 @@ mod tests {
     #[test]
     fn get_mi_tag_raw_rejects_unknown_strand_suffix() {
         let rec = raw_record_with_aux(&aux_mi_string(b"5/C"));
+        assert_eq!(get_mi_tag_raw(&rec), None);
+    }
+
+    /// An `MI` tag of any other aux type is not a molecule id and is treated as
+    /// absent — the same answer the previous int-then-string probe gave, now that a
+    /// single scan returns whatever type is actually there. Reading such a value as
+    /// a molecule id would silently join unrelated reads into one molecule.
+    #[rstest]
+    #[case::float(b'f', (1.5f32).to_le_bytes().to_vec())]
+    #[case::char(b'A', vec![b'x'])]
+    #[case::int_array(b'B', vec![b'i', 1, 0, 0, 0, 7, 0, 0, 0])]
+    fn get_mi_tag_raw_treats_a_non_id_aux_type_as_absent(
+        #[case] type_code: u8,
+        #[case] payload: Vec<u8>,
+    ) {
+        let mut aux = vec![b'M', b'I', type_code];
+        aux.extend_from_slice(&payload);
+        let rec = raw_record_with_aux(&aux);
         assert_eq!(get_mi_tag_raw(&rec), None);
     }
 

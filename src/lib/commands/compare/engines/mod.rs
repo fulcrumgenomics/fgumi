@@ -246,30 +246,47 @@ mod tests {
     /// Both damage modes are covered because they fail in different layers:
     /// truncation starves the block reader mid-record, while flipped payload bytes
     /// pass length checks and fail the per-block CRC32.
+    ///
+    /// Both thread counts are covered because they propagate the failure by
+    /// different routes. At one thread the decoder runs inline on the read-ahead
+    /// thread; above one it runs on a `MultithreadedReader` worker pool, so the
+    /// error has to travel worker -> read-ahead error slot -> `CheckedRecords`.
+    /// Testing only the single-threaded path would leave the route this type
+    /// exists to protect — the one `open_pair` actually uses — unexercised.
     #[rstest]
     #[case::truncated_mid_block(true)]
     #[case::corrupt_payload_crc(false)]
-    fn damaged_input_yields_err_not_clean_eof(#[case] truncate: bool) {
-        let records: Vec<RawRecord> = (0..2000)
+    fn damaged_input_yields_err_not_clean_eof(
+        #[case] truncate: bool,
+        #[values(1, 4)] threads: usize,
+    ) {
+        // Enough records, each carrying a sequence, to span many BGZF blocks. The
+        // damage is then placed at 90% of the file, so it lands deep in the record
+        // region: damaging a small file instead puts it in the block holding the
+        // header, and the open fails before a single record is read — which would
+        // leave this test passing without ever reaching the type it is testing.
+        let records: Vec<RawRecord> = (0..20_000)
             .map(|i| {
                 fgumi_raw_bam::SamBuilder::new()
                     .read_name(format!("read{i:06}").as_bytes())
+                    .sequence(&[b'A'; 100])
+                    .qualities(&[30; 100])
                     .flags(fgumi_raw_bam::flags::FIRST_SEGMENT)
                     .build()
             })
             .collect();
         let tmp = write_temp_bam(&records);
         let bytes = std::fs::read(tmp.path()).expect("read temp BAM");
+        let offset = bytes.len() * 9 / 10;
 
         let damaged = if truncate {
             // Cut mid-BGZF-block: no EOF marker and an incomplete final block.
-            bytes[..bytes.len() * 3 / 5].to_vec()
+            bytes[..offset].to_vec()
         } else {
             // Flip bytes deep inside a compressed block: still parses as a block,
             // cannot match its recorded CRC32.
             let mut v = bytes.clone();
-            let off = v.len() / 2;
-            for b in &mut v[off..off + 64] {
+            for b in &mut v[offset..offset + 64] {
                 *b ^= 0xFF;
             }
             v
@@ -277,24 +294,31 @@ mod tests {
         let dmg = tempfile::NamedTempFile::new().expect("create damaged BAM");
         std::fs::write(dmg.path(), &damaged).expect("write damaged BAM");
 
-        // Opening may already fail (the damage can land in the header region);
-        // that is an acceptable hard failure. What must never happen is a
-        // successful open whose stream then ends cleanly, hiding the damage.
-        let Ok(opened) = OpenedInput::open(dmg.path()) else {
-            return;
-        };
+        // The open must succeed for this test to mean anything: the contract under
+        // test is what the *record stream* does with damage, so an open that fails
+        // first would leave it unexercised.
+        let (opened, _) = OpenedInput::open_pair(dmg.path(), dmg.path(), threads)
+            .expect("damage past the header must not prevent opening the input");
         let mut saw_err = false;
+        let mut error_message = String::new();
         for item in opened.reader {
-            if item.is_err() {
+            if let Err(e) = item {
                 saw_err = true;
+                error_message = e.to_string();
                 break;
             }
         }
         assert!(
             saw_err,
-            "damaged input must report an error, not a clean EOF (truncate={truncate}): a \
-             silently-short stream turns a corrupt file into a record-count DIFFER, or a false \
-             IDENTICAL when both sides are damaged alike"
+            "damaged input must report an error, not a clean EOF (truncate={truncate}, \
+             threads={threads}): a silently-short stream turns a corrupt file into a \
+             record-count DIFFER, or a false IDENTICAL when both sides are damaged alike"
+        );
+        assert!(
+            error_message.contains(&dmg.path().display().to_string()),
+            "the error must name the input that failed, since a two-input comparison \
+             cannot tell from `failed to fill whole buffer` alone which side broke: \
+             {error_message}"
         );
     }
 

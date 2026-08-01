@@ -94,6 +94,14 @@ impl PositionalOutcome {
 /// (see `start_raw_batch_reader`); `max_diffs` caps the number of entries
 /// collected in `PositionalOutcome::diff_details`.
 ///
+/// `verify_order` names the sort order the records must actually honor, or `None`
+/// for genuinely orderless input. It is deliberately a required parameter rather
+/// than a defaulted one: this comparison pairs records purely by position, so an
+/// unverified order silently corrupts the pairing rather than surfacing as a diff.
+/// A convenience overload defaulting it to `None` would let a caller opt out of
+/// that check by omission, which is the failure this parameter exists to prevent —
+/// so callers state their intent explicitly, `None` included.
+///
 /// # Errors
 ///
 /// Returns an error if either BAM file cannot be opened, or if a read error
