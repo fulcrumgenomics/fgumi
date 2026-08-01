@@ -12,8 +12,9 @@ on:
     - cron: "0 7 * * *" # daily at 07:00 UTC
   workflow_dispatch: {}
 
-# Read-only by default: this workflow only builds and runs tests, so it needs no
-# write access to repo contents, issues, or the token's other scopes.
+# This workflow only builds and runs tests, so it needs no write access to repo
+# contents. `issues: write` is granted to the `report-failure` job alone, which is
+# the only thing here that writes anything.
 permissions:
   contents: read
 
@@ -53,3 +54,49 @@ jobs:
           tool: nextest
       - name: Concurrency stress tests
         run: cargo ci-test-stress
+
+  # Nothing watches a cron's result, so a failure has to announce itself. See the
+  # action for why it reuses one issue per workflow.
+  #
+  # A separate job rather than a final step in `stress-tests`, because the two
+  # failures most worth reporting are the ones a step could not report on. A step
+  # there `uses: ./...`, which only resolves once the repository is on disk, so a
+  # failed checkout takes the reporting down with it; and `timeout-minutes`
+  # *cancels* the job, which skips `if: failure()` steps entirely -- so the
+  # deadlock that bound exists to catch would go unreported. A separate job checks
+  # out for itself and reads the outcome from `needs`, which survives both.
+  report-failure:
+    needs: stress-tests
+    # `always()`, or this job is skipped along with its cancelled dependency --
+    # which would give back the timeout blind spot the job exists to close.
+    #
+    # `cancelled` as well as `failure` because GitHub documents a `timeout-minutes`
+    # overrun as cancelling the job, and does not state which of the two it then
+    # reports; matching both makes a hang reportable either way. That matters more
+    # here than in `miri.yml`: this suite exercises deadlock detection, so a hang
+    # is its characteristic failure rather than an unlikely one.
+    #
+    # Scheduled runs only: a `workflow_dispatch` failure is already in front of
+    # whoever dispatched it, and -- once a workflow also runs on `pull_request` --
+    # a PR failure is visible in that PR's checks. Filing an issue for either is
+    # noise; the silent trigger is the one that needs it.
+    if: >-
+      always()
+      && (needs.stress-tests.result == 'failure' || needs.stress-tests.result == 'cancelled')
+      && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    # The only write access in this workflow, scoped to the one job that writes.
+    permissions:
+      contents: read
+      issues: write
+    # A checkout and three `gh` calls; minutes here mean stuck, not busy.
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Report failure
+        uses: ./.github/actions/report-cron-failure
+        with:
+          token: ${{ github.token }}
