@@ -1164,15 +1164,63 @@ pub fn create_optional_bam_writer<P: AsRef<Path>>(
 }
 
 /// Open an output writer for a path, supporting stdout via `-` or `/dev/stdout`.
-pub(crate) fn open_output_writer<P: AsRef<Path>>(path: P) -> Result<Box<dyn Write + Send>> {
+///
+/// This is the single place the `-` convention is honoured, so anything writing
+/// a command's output must come through here (directly, or via one of the
+/// `create_*_bam_writer` helpers) rather than calling `File::create` itself. A
+/// writer that opens the path directly silently creates a regular file *named*
+/// `-` and exits zero with an empty pipe — see the stdout axis in
+/// `tests/integration/test_input_source_matrix.rs`.
+///
+/// A stdout path yields a block-buffered handle — fd 1 duplicated into a
+/// [`File`] — rather than [`std::io::Stdout`], whose `LineWriter` would tear
+/// every BGZF flush at each `0x0a`.
+///
+/// # Errors
+///
+/// Returns an error if `path` names a file that cannot be created, or if the
+/// stdout descriptor cannot be duplicated.
+pub fn open_output_writer<P: AsRef<Path>>(path: P) -> Result<Box<dyn Write + Send>> {
     let path_ref = path.as_ref();
     if is_stdout_path(path_ref) {
-        Ok(Box::new(std::io::stdout()))
+        block_buffered_stdout()
     } else {
         let file = File::create(path_ref)
             .with_context(|| format!("Failed to create output BAM: {}", path_ref.display()))?;
         Ok(Box::new(file))
     }
+}
+
+/// A block-buffered handle on this process's stdout.
+///
+/// [`std::io::Stdout`] wraps a `LineWriter`, which splits every write at the last
+/// `\n` in the buffer and issues the two halves separately. BGZF blocks carry
+/// `0x0a` at arbitrary offsets, so a single large flush from the caller's
+/// `BufWriter` would be torn into many small `write` calls on the hot output
+/// path. Duplicating the descriptor into a [`File`] bypasses the line buffering
+/// and leaves batching to the caller's buffer, where it belongs.
+///
+/// The descriptor is duplicated rather than taken, so dropping the returned
+/// handle closes only the duplicate; fd 1 stays open for the rest of the process.
+#[cfg(unix)]
+fn block_buffered_stdout() -> Result<Box<dyn Write + Send>> {
+    use std::os::fd::AsFd;
+
+    let stdout = std::io::stdout()
+        .as_fd()
+        .try_clone_to_owned()
+        .map(File::from)
+        .context("Failed to duplicate stdout for BAM output")?;
+    Ok(Box::new(stdout))
+}
+
+/// A block-buffered handle on this process's stdout.
+///
+/// Fallback for targets without file descriptors, where the line-buffering
+/// concern described on the Unix variant cannot be worked around this way.
+#[cfg(not(unix))]
+fn block_buffered_stdout() -> Result<Box<dyn Write + Send>> {
+    Ok(Box::new(std::io::stdout()))
 }
 
 #[cfg(test)]

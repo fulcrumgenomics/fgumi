@@ -1,27 +1,35 @@
-//! Every command declares — and is held to — its input-source contract.
+//! Every command declares — and is held to — its I/O contract.
 //!
-//! Two properties are easy to get wrong per-command and impossible to eyeball
+//! Three properties are easy to get wrong per-command and impossible to eyeball
 //! across the whole CLI:
 //!
 //! 1. **Uncompressed SAM** must be accepted anywhere BAM is, because input
 //!    format is a property of the data, not of the command.
 //! 2. **stdin** (`-i -`) must be accepted by anything that streams, so commands
 //!    compose in a pipeline.
+//! 3. **stdout** (`-o -`) must be written by anything that streams, for the same
+//!    reason — a pipeline needs both ends.
 //!
-//! Both were previously true of some commands and not others, and nothing
-//! failed when a new command picked the wrong reader. The table below is the
-//! contract: every command the binary advertises must appear in it with an
+//! All three were previously true of some commands and not others, and nothing
+//! failed when a new command picked the wrong reader or writer. The table below
+//! is the contract: every command the binary advertises must appear in it with an
 //! explicit stance, and [`every_command_declares_an_input_contract`] fails when
 //! one does not — so adding a command forces a decision rather than inheriting
-//! whichever default its reader happened to have.
+//! whichever default its reader or writer happened to have.
 //!
-//! Checking either property means running a command two ways and comparing what
-//! it wrote, which is only evidence if what it writes depends on what it read. A
+//! The stdout axis was added after `sort`, `fastq`, and `extract --threads N`
+//! were found to create a regular file *named* `-` instead of streaming: they
+//! reached for `File::create` directly rather than the stdout-aware writer the
+//! other commands share. Every one of them exited zero while doing it, which is
+//! why the check compares what arrived on the pipe rather than trusting a status.
+//!
+//! Checking any of these means running a command two ways and comparing what it
+//! wrote, which is only evidence if what it writes depends on what it read. A
 //! command handed input it cannot form a molecule from exits zero and writes a
-//! header-only file, so both comparisons pass however badly the reader behaved.
-//! That is why the table carries a third axis, `output_depends_on_input`, and
+//! header-only file, so the comparisons pass however badly the reader behaved.
+//! That is why the table carries a fourth axis, `output_depends_on_input`, and
 //! why [`every_command_output_depends_on_its_input`] drains each fixture and
-//! demands the output change: it is the assertion that keeps the other two
+//! demands the output change: it is the assertion that keeps the other three
 //! honest.
 
 use std::path::{Path, PathBuf};
@@ -46,7 +54,7 @@ enum Support {
 
 use Support::{NotApplicable, Required};
 
-/// One command's declared input-source contract.
+/// One command's declared I/O contract.
 struct InputContract {
     /// Subcommand name as it appears in `fgumi --help`.
     command: &'static str,
@@ -54,13 +62,19 @@ struct InputContract {
     sam: Support,
     /// Whether `-i -` must work.
     stdin: Support,
+    /// Whether `-o -` must stream to stdout rather than write a file named `-`.
+    ///
+    /// `NotApplicable` here is for commands whose `-o` is not a single stream:
+    /// the metrics commands and `review` take a *prefix* and write several files
+    /// from it, which no pipe can carry.
+    stdout: Support,
     /// Whether emptying the input must change the output.
     ///
-    /// This is what keeps the other two axes honest. A command handed input it
+    /// This is what keeps the other three axes honest. A command handed input it
     /// cannot form a molecule from exits zero and writes a header-only file, so
-    /// its SAM and stdin runs match the oracle no matter how badly the reader
-    /// behaved. Declaring `Required` here puts that failure mode under test —
-    /// see [`every_command_output_depends_on_its_input`].
+    /// its SAM, stdin and stdout runs match the oracle no matter how badly the
+    /// reader behaved. Declaring `Required` here puts that failure mode under
+    /// test — see [`every_command_output_depends_on_its_input`].
     output_depends_on_input: Support,
 }
 
@@ -74,24 +88,28 @@ const CONTRACTS: &[InputContract] = &[
         sam: NotApplicable("reads FASTQ, not alignment records"),
         // Only with a single input: one stdin cannot supply two FASTQs.
         stdin: Required,
+        stdout: Required,
         output_depends_on_input: Required,
     },
     InputContract {
         command: "correct",
         sam: Required,
         stdin: Required,
+        stdout: Required,
         output_depends_on_input: Required,
     },
     InputContract {
         command: "fastq",
         sam: Required,
         stdin: Required,
+        stdout: Required,
         output_depends_on_input: Required,
     },
     InputContract {
         command: "zipper",
         sam: Required,
         stdin: Required,
+        stdout: Required,
         output_depends_on_input: NotApplicable(
             "emits one output template per uBAM template, and the uBAM arrives on `-u`; an \
              empty `-i` yields the same templates, unmapped",
@@ -101,24 +119,28 @@ const CONTRACTS: &[InputContract] = &[
         command: "sort",
         sam: Required,
         stdin: Required,
+        stdout: Required,
         output_depends_on_input: Required,
     },
     InputContract {
         command: "merge",
         sam: Required,
         stdin: NotApplicable("merges N pre-sorted inputs named in a list file"),
+        stdout: Required,
         output_depends_on_input: Required,
     },
     InputContract {
         command: "group",
         sam: Required,
         stdin: Required,
+        stdout: Required,
         output_depends_on_input: Required,
     },
     InputContract {
         command: "dedup",
         sam: Required,
         stdin: Required,
+        stdout: Required,
         output_depends_on_input: Required,
     },
     #[cfg(feature = "simplex")]
@@ -126,6 +148,7 @@ const CONTRACTS: &[InputContract] = &[
         command: "simplex",
         sam: Required,
         stdin: Required,
+        stdout: Required,
         output_depends_on_input: Required,
     },
     #[cfg(feature = "duplex")]
@@ -133,6 +156,7 @@ const CONTRACTS: &[InputContract] = &[
         command: "duplex",
         sam: Required,
         stdin: Required,
+        stdout: Required,
         output_depends_on_input: Required,
     },
     #[cfg(feature = "codec")]
@@ -140,18 +164,21 @@ const CONTRACTS: &[InputContract] = &[
         command: "codec",
         sam: Required,
         stdin: Required,
+        stdout: Required,
         output_depends_on_input: Required,
     },
     InputContract {
         command: "filter",
         sam: Required,
         stdin: Required,
+        stdout: Required,
         output_depends_on_input: Required,
     },
     InputContract {
         command: "clip",
         sam: Required,
         stdin: Required,
+        stdout: Required,
         output_depends_on_input: Required,
     },
     #[cfg(feature = "duplex")]
@@ -159,6 +186,7 @@ const CONTRACTS: &[InputContract] = &[
         command: "duplex-metrics",
         sam: Required,
         stdin: Required,
+        stdout: NotApplicable("`-o` names a prefix for several metrics files, not one stream"),
         output_depends_on_input: Required,
     },
     #[cfg(feature = "simplex")]
@@ -166,18 +194,21 @@ const CONTRACTS: &[InputContract] = &[
         command: "simplex-metrics",
         sam: Required,
         stdin: Required,
+        stdout: NotApplicable("`-o` names a prefix for several metrics files, not one stream"),
         output_depends_on_input: Required,
     },
     InputContract {
         command: "review",
         sam: NotApplicable("requires BAI indexes and does random access, which needs BGZF"),
         stdin: NotApplicable("does random access against a BAI index"),
+        stdout: NotApplicable("`-o` names a prefix for a directory of BAMs and their indexes"),
         output_depends_on_input: NotApplicable("declares no axis this harness invokes"),
     },
     InputContract {
         command: "downsample",
         sam: Required,
         stdin: Required,
+        stdout: Required,
         output_depends_on_input: Required,
     },
     #[cfg(feature = "compare")]
@@ -185,6 +216,7 @@ const CONTRACTS: &[InputContract] = &[
         command: "compare",
         sam: Required,
         stdin: NotApplicable("compares two named files against each other"),
+        stdout: NotApplicable("writes its report to stdout already and takes no `--output`"),
         output_depends_on_input: Required,
     },
     #[cfg(feature = "simulate")]
@@ -192,6 +224,7 @@ const CONTRACTS: &[InputContract] = &[
         command: "simulate",
         sam: NotApplicable("generates data rather than reading it"),
         stdin: NotApplicable("generates data rather than reading it"),
+        stdout: NotApplicable("takes several named outputs, not one stream"),
         output_depends_on_input: NotApplicable("generates data rather than reading it"),
     },
 ];
@@ -239,7 +272,8 @@ fn advertised_commands() -> Vec<String> {
 /// The contract table must cover exactly the commands the binary advertises.
 ///
 /// This is the test that makes the rest of the file exhaustive: a new command
-/// fails here until someone states whether it takes SAM and stdin.
+/// fails here until someone states its position on every axis [`IoContract`]
+/// carries — SAM, stdin, stdout, and whether its output depends on its input.
 #[test]
 fn every_command_declares_an_input_contract() {
     let advertised: Vec<String> = advertised_commands()
@@ -253,15 +287,16 @@ fn every_command_declares_an_input_contract() {
         advertised.iter().filter(|name| !declared.contains(&name.as_str())).collect();
     assert!(
         undeclared.is_empty(),
-        "these commands are advertised by `fgumi --help` but declare no input contract in \
-         CONTRACTS: {undeclared:?}. Add an entry stating whether each accepts SAM and stdin."
+        "these commands are advertised by `fgumi --help` but declare no I/O contract in \
+         CONTRACTS: {undeclared:?}. Add an entry stating each command's stance on all four \
+         axes: sam, stdin, stdout, and output_depends_on_input."
     );
 
     let stale: Vec<&&str> =
         declared.iter().filter(|name| !advertised.contains(&(**name).to_string())).collect();
     assert!(
         stale.is_empty(),
-        "these commands declare an input contract but are no longer advertised by \
+        "these commands declare an I/O contract but are no longer advertised by \
          `fgumi --help`: {stale:?}. Remove their CONTRACTS entries."
     );
 }
@@ -522,11 +557,57 @@ fn run_command(
     pipe: Option<&Path>,
     run_tag: &str,
 ) -> std::process::Output {
+    run_command_writing(command, input, dir, fixture, pipe, run_tag, OutputSpec::NamedPath)
+}
+
+/// Where a run is told to put its output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputSpec {
+    /// `{output}` is a path inside the run directory — the normal case.
+    NamedPath,
+    /// `{output}` is the carried stdout spelling, so the run is expected to
+    /// stream to stdout.
+    ///
+    /// The spelling travels in the variant because `open_output_writer` honours
+    /// two of them, `-` and `/dev/stdout`, and a writer that special-cased only
+    /// `-` would pass a matrix that never asked for the other one.
+    ///
+    /// The child runs in a scratch working directory (see [`stray_file_dir`]), so
+    /// a command that mistakenly treats `-` as a filename creates its file there
+    /// rather than in the crate root: the repository stays clean and the stray
+    /// file is somewhere the test can look for it by name. That directory is
+    /// deliberately *not* the digested run directory, because a build with the
+    /// heap profiler enabled also drops a `dhat-heap.json` in the working
+    /// directory, which would otherwise read as an output difference.
+    Stdout(&'static str),
+}
+
+/// The working directory a [`OutputSpec::Stdout`] run is given.
+///
+/// Anything the command leaves here it created by writing to a path it should
+/// have streamed instead — see [`declared_stdout_support_holds`].
+fn stray_file_dir(dir: &Path, run_tag: &str) -> PathBuf {
+    dir.join(format!("{run_tag}-cwd"))
+}
+
+/// [`run_command`], with control over what `{output}` is substituted with.
+fn run_command_writing(
+    command: &str,
+    input: &str,
+    dir: &Path,
+    fixture: &Fixture,
+    pipe: Option<&Path>,
+    run_tag: &str,
+    output_spec: OutputSpec,
+) -> std::process::Output {
     let args = invocation(command).expect("command has an invocation");
 
     let run_dir = dir.join(run_tag);
     std::fs::create_dir_all(&run_dir).expect("create per-run output dir");
-    let output = run_dir.join(format!("{command}.out"));
+    let output = match output_spec {
+        OutputSpec::NamedPath => run_dir.join(format!("{command}.out")),
+        OutputSpec::Stdout(spelling) => PathBuf::from(spelling),
+    };
     let reference = create_test_reference(dir);
     let umis = dir.join("umis.txt");
     std::fs::write(&umis, "ACGTACGT\nTTTTGGGG\n").expect("write UMI list");
@@ -545,6 +626,11 @@ fn run_command(
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fgumi"));
     cmd.args(&substituted);
+    if matches!(output_spec, OutputSpec::Stdout(_)) {
+        let cwd = stray_file_dir(dir, run_tag);
+        std::fs::create_dir_all(&cwd).expect("create the stdout run's working dir");
+        cmd.current_dir(&cwd);
+    }
     if let Some(path) = pipe {
         cmd.stdin(Stdio::from(std::fs::File::open(path).expect("open input to pipe")));
     }
@@ -704,6 +790,8 @@ fn scrub_run_identity(text: &str) -> String {
         .replace("empty.list", "<LIST>")
         .replace(STDIN_SAM_RUN, "<RUN>")
         .replace(STDIN_RUN, "<RUN>")
+        .replace(STDOUT_DEV_RUN, "<RUN>")
+        .replace(STDOUT_RUN, "<RUN>")
         .replace(SAM_RUN, "<RUN>")
         .replace(BAM_RUN, "<RUN>")
         .replace(EMPTY_RUN, "<RUN>")
@@ -714,7 +802,16 @@ const BAM_RUN: &str = "bam-run";
 const SAM_RUN: &str = "sam-run";
 const STDIN_RUN: &str = "stdin-run";
 const STDIN_SAM_RUN: &str = "stdin-sam-run";
+const STDOUT_RUN: &str = "stdout-run";
+const STDOUT_DEV_RUN: &str = "stdout-dev-run";
 const EMPTY_RUN: &str = "empty-run";
+
+/// Every spelling of stdout `open_output_writer` honours, paired with the
+/// per-run output subdirectory that spelling's run is given.
+///
+/// Kept in lockstep with `is_stdout_path`: a spelling the writer accepts but
+/// this table omits is a spelling no command in the matrix is ever asked for.
+const STDOUT_SPELLINGS: [(&str, &str); 2] = [("-", STDOUT_RUN), ("/dev/stdout", STDOUT_DEV_RUN)];
 
 /// Describes the first way two runs' outputs differ, or `None` if they match.
 ///
@@ -894,6 +991,88 @@ fn declared_stdin_support_holds() {
             }
 
             compare_to_oracle(command, dir, &oracle_run, &piped, STDIN_RUN, "stdin")
+        },
+    );
+}
+
+/// Every command declaring `stdout: Required` must write **every** stdout
+/// spelling in [`STDOUT_SPELLINGS`] to stdout, and put the same bytes there as
+/// it would have put in a named file.
+///
+/// The failure this exists to catch is silent: a writer that reaches for
+/// `File::create` instead of the stdout-aware one creates a regular file *named*
+/// `-` in the working directory, writes the output into it, and exits zero. The
+/// pipe is simply empty, so a status check — or anything that only looks at the
+/// declared output path — sees a clean run. Two things are therefore asserted:
+/// that no file named after the spelling was created, and that what arrived on
+/// the pipe matches the named-path oracle byte for byte. See
+/// [`compare_to_oracle`].
+///
+/// Both spellings run for every command rather than only `-`, because they part
+/// company inside `is_stdout_path`: `/dev/stdout` reaching `File::create` still
+/// lands on the pipe on Linux and macOS, so the stray-file check alone cannot
+/// catch it — only the byte-for-byte comparison can.
+#[test]
+fn declared_stdout_support_holds() {
+    for_each_command_requiring(
+        |c| c.stdout,
+        |command, fixture, dir| {
+            let oracle_run = run_named_path_oracle(command, fixture, dir, "a stdout spelling")?;
+            let named_input = fixture.input_for(command, false).display().to_string();
+
+            // Both spellings, every command: the two differ only inside
+            // `is_stdout_path`, so a writer that special-cased `-` alone would
+            // pass a matrix that only ever asked for `-`.
+            for (spelling, run_tag) in STDOUT_SPELLINGS {
+                let label = format!("`-o {spelling}`");
+                let streamed = run_command_writing(
+                    command,
+                    &named_input,
+                    dir,
+                    fixture,
+                    None,
+                    run_tag,
+                    OutputSpec::Stdout(spelling),
+                );
+                if !streamed.status.success() {
+                    return Err(format!(
+                        "{command}: declares stdout support but rejected {label}: {}",
+                        String::from_utf8_lossy(&streamed.stderr)
+                    ));
+                }
+
+                // Checked before the digests, because this is the actual bug and
+                // deserves to say so rather than surfacing as an empty output.
+                // Only a relative spelling can land in the run's working
+                // directory; `/dev/stdout` names a path outside it either way.
+                let run_dir = dir.join(run_tag);
+                if Path::new(spelling).is_relative()
+                    && stray_file_dir(dir, run_tag).join(spelling).is_file()
+                {
+                    return Err(format!(
+                        "{command}: {label} created a regular file named `{spelling}` instead of \
+                         writing to stdout — its writer needs to go through `open_output_writer`"
+                    ));
+                }
+
+                // The oracle wrote `<command>.out`; this run wrote the same bytes
+                // to the pipe. Materializing them under that name is what lets the
+                // two runs digest under the same key, so the existing file-by-file
+                // comparison applies unchanged. Skipped when the pipe is empty, so
+                // that case reads as a missing file rather than an empty one.
+                if !streamed.stdout.is_empty() {
+                    std::fs::write(run_dir.join(format!("{command}.out")), &streamed.stdout)
+                        .expect("materialize the stdout run's stream");
+                }
+                let materialized = std::process::Output {
+                    status: streamed.status,
+                    stdout: Vec::new(),
+                    stderr: streamed.stderr.clone(),
+                };
+
+                compare_to_oracle(command, dir, &oracle_run, &materialized, run_tag, &label)?;
+            }
+            Ok(())
         },
     );
 }

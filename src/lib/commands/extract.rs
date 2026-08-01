@@ -34,7 +34,7 @@ use anyhow::{Context, Result, bail, ensure};
 use bstr::{BString, ByteSlice};
 use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::{RawBamWriter, create_raw_bam_writer};
+use fgumi_bam_io::{RawBamWriter, create_raw_bam_writer, open_output_writer};
 use fgumi_dna::dna::reverse_complement;
 use fgumi_raw_bam::UnmappedSamBuilder;
 use fgumi_raw_bam::fields::flags;
@@ -64,6 +64,11 @@ use std::str::FromStr;
 
 const BUFFER_SIZE: usize = 1024 * 1024;
 const QUALITY_DETECTION_SAMPLE_SIZE: usize = 400;
+
+/// Output buffer for the parallel (`--threads N`) pipeline, which writes whole
+/// compressed BGZF blocks. Sized well above `BGZF_MAX_BLOCK_SIZE` so a block
+/// lands in the buffer instead of passing straight through it.
+const PIPELINE_OUTPUT_BUF_CAPACITY: usize = 256 * 1024;
 
 /// Prefix marking a read-name UMI segment that must be reverse-complemented,
 /// matching fgbio `Umis.RevcompPrefix` (`Umis.scala:33`).
@@ -1628,8 +1633,18 @@ impl Command for Extract {
             // Unified 7-step pipeline mode (--threads N was specified)
             // Uses work-stealing for better CPU utilization with strict thread cap
             // The 7-step pipeline handles its own BGZF compression internally
+            // `open_output_writer`, not `File::create`: the single-threaded
+            // branch below reaches stdout through `create_raw_bam_writer`, and
+            // which of the two runs is a function of `--threads`, which has
+            // nothing to do with where the output goes.
+            // 256 KiB, not the 8 KiB default: the pipeline hands this writer
+            // whole compressed BGZF blocks, which run up to 64 KiB and so would
+            // bypass the default buffer entirely, one `write` syscall apiece.
             let output: Box<dyn std::io::Write + Send> =
-                Box::new(std::io::BufWriter::new(File::create(&self.output)?));
+                Box::new(std::io::BufWriter::with_capacity(
+                    PIPELINE_OUTPUT_BUF_CAPACITY,
+                    open_output_writer(&self.output)?,
+                ));
 
             self.process_with_pipeline(&header, output, encoding, &read_structures, stdin_reader)?
         } else {
