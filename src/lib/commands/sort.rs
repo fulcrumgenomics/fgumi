@@ -793,22 +793,19 @@ mod tests {
         // the loop below would check nothing.
         let bool_args: Vec<_> =
             command.get_arguments().filter(|arg| takes_optional_value(arg)).collect();
-        assert!(
-            bool_args.len() >= 3,
-            "expected Sort to expose its boolean flags, matched only {}",
-            bool_args.len()
-        );
+        let matched = bool_args.len();
+        assert!(matched >= 3, "expected Sort to expose its boolean flags, matched only {matched}");
 
         for arg in bool_args {
+            let flag = arg.get_id();
             let value_names = arg
                 .get_value_names()
                 .map(|names| names.iter().map(ToString::to_string).collect::<Vec<_>>());
             assert_eq!(
                 value_names.as_deref(),
                 Some(["true|false".to_string()].as_slice()),
-                "`--{}` must declare `value_name = \"true|false\"`; without it clap renders the \
-                 upper-cased field name, which reads as a value to supply rather than a boolean",
-                arg.get_id()
+                "`--{flag}` must declare `value_name = \"true|false\"`; without it clap renders \
+                 the upper-cased field name, which reads as a value to supply rather than a bool",
             );
         }
     }
