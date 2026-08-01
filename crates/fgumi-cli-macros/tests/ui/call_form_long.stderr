@@ -1,0 +1,6 @@
+error: multi_options: field `value` uses the call form #[arg(long(…))]. Use the `long = …` name-value form (or bare `long`) — the macro only classifies those spellings and would mishandle the call form.
+ --> tests/ui/call_form_long.rs:8:5
+  |
+8 | /     #[arg(long("renamed"))]
+9 | |     pub value: u32,
+  | |__________________^
