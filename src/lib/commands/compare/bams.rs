@@ -750,10 +750,11 @@ impl Command for CompareBams {
         };
 
         let total_records = match mode {
-            // Content mode makes two passes over each input — the order verification
-            // already done above and then the record comparison itself — so it cannot
-            // stream a one-shot input and reopens by path. Releasing the streams here
-            // keeps it from holding a pipe open for a read it will never make.
+            // Content mode reopens both inputs by path for its batched, double-
+            // buffered readers, so the streams opened here for the header check are
+            // released rather than held open for a read that will never come. (The
+            // order verification that once made this a genuine two-pass mode is now
+            // folded into the comparison pass itself.)
             CompareMode::Content => {
                 drop(input1);
                 drop(input2);

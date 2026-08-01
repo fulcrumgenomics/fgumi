@@ -32,6 +32,7 @@ use fgumi_sort::SortOrder;
 use super::super::bams::{RawBatchMessage, start_raw_batch_reader};
 use super::super::record_key::record_keys_match;
 use super::content::{ContentPredicate, content_diffs};
+use super::decompression_threads_per_input;
 use super::header::{compare_headers, fold_header_diffs};
 use super::sort_verify::OrderCheck;
 
@@ -108,8 +109,13 @@ pub fn positional_compare(
 ) -> Result<PositionalOutcome> {
     let mut outcome = PositionalOutcome::default();
 
-    let (rx1, header1) = start_raw_batch_reader(bam1.to_path_buf(), threads, batch_size)?;
-    let (rx2, header2) = start_raw_batch_reader(bam2.to_path_buf(), threads, batch_size)?;
+    // Split the decompression budget across the two inputs rather than giving each
+    // the full count: `--threads 8` previously started 8 BGZF workers per reader,
+    // 16 in total, oversubscribing a smaller host for no extra decode throughput.
+    // The sort and grouping engines already share this convention.
+    let per_input = decompression_threads_per_input(threads);
+    let (rx1, header1) = start_raw_batch_reader(bam1.to_path_buf(), per_input, batch_size)?;
+    let (rx2, header2) = start_raw_batch_reader(bam2.to_path_buf(), per_input, batch_size)?;
 
     // Sort-order verification rides along with this pass rather than costing a
     // dedicated traversal of each input beforehand. Every record this function
@@ -248,6 +254,17 @@ pub fn positional_compare(
         if outcome.key_mismatch_at.is_none() {
             for (offset, (a, b)) in cmp_batch1.iter().zip(cmp_batch2.iter()).enumerate() {
                 let index = current_index + offset as u64;
+
+                // Byte-identical records need neither check. A `RecordKey` is a pure
+                // function of the record's bytes, so identical bytes give identical
+                // keys; and `content_diffs` opens with this very comparison, since
+                // byte equality implies content equality under every predicate. This
+                // is the common case — two files that agree — and skipping straight
+                // past it avoids extracting flags and walking both read names only to
+                // conclude they are the same.
+                if a.as_ref() == b.as_ref() {
+                    continue;
+                }
 
                 if !record_keys_match(a, b) {
                     outcome.key_mismatch_at = Some(index);

@@ -122,7 +122,7 @@ pub(crate) struct OpenedInput {
 /// budget: it overlaps I/O rather than decompressing, and `content` mode has
 /// always spawned one reader thread per input regardless of `--threads` (see
 /// `start_raw_batch_reader`).
-fn decompression_threads_per_input(threads: usize) -> usize {
+pub(crate) fn decompression_threads_per_input(threads: usize) -> usize {
     (threads / 2).max(1)
 }
 
