@@ -48,7 +48,7 @@ use std::time::Instant;
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    build_pipeline_config, parse_bool, reject_colliding_outputs, serialize_raw_bam_records,
+    build_pipeline_config, reject_colliding_outputs, serialize_raw_bam_records,
 };
 
 /// Filters and masks consensus reads based on various quality metrics.
@@ -155,7 +155,7 @@ pub struct Filter {
     pub max_no_call_fraction: f64,
 
     /// Reverse per-base tags for negative strand reads
-    #[arg(short = 'R', long = "reverse-per-base-tags", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(short = 'R', long = "reverse-per-base-tags", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub reverse_per_base_tags: bool,
 
     /// Threading options for parallel processing
@@ -163,7 +163,7 @@ pub struct Filter {
     pub threading: ThreadingOptions,
 
     /// Filter templates together (all primary reads must pass)
-    #[arg(long = "filter-by-template", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "filter-by-template", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub filter_by_template: bool,
 
     /// Optional output BAM file for rejected reads
@@ -175,7 +175,7 @@ pub struct Filter {
     pub stats: Option<PathBuf>,
 
     /// Require single-strand agreement for duplex consensus (mask bases where AB and BA disagree)
-    #[arg(short = 's', long = "require-single-strand-agreement", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(short = 's', long = "require-single-strand-agreement", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub require_single_strand_agreement: bool,
 
     /// Minimum methylation depth (cu+ct) to keep a base call (EM-Seq/TAPs).
@@ -187,7 +187,7 @@ pub struct Filter {
     /// Require strand methylation agreement at CpG sites for duplex consensus (EM-Seq/TAPs).
     /// Masks both positions of a CpG dinucleotide when top and bottom strands disagree on
     /// methylation status. Requires --ref.
-    #[arg(long = "require-strand-methylation-agreement", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "require-strand-methylation-agreement", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub require_strand_methylation_agreement: bool,
 
     #[allow(clippy::doc_markdown)]

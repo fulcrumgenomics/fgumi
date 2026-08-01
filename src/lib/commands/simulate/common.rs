@@ -1,7 +1,7 @@
 //! Shared CLI arguments and utilities for simulation commands.
 
 use crate::commands::common::{
-    MemoryLimit, MemoryReserve, MethylationModeArg, parse_bool, parse_memory, parse_memory_reserve,
+    MemoryLimit, MemoryReserve, MethylationModeArg, parse_memory, parse_memory_reserve,
     resolve_memory_budget,
 };
 use crate::commands::sort::{TMP_DIRS_ENV, resolve_tmp_dirs};
@@ -550,7 +550,7 @@ pub struct SortResourceArgs {
     /// Scale the memory limit by thread count (samtools behavior).
     ///
     /// When enabled (default), --max-memory specifies memory per thread.
-    #[arg(long = "memory-per-thread", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "memory-per-thread", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub memory_per_thread: bool,
 
     /// Temporary directory for sort spill files. Repeatable.

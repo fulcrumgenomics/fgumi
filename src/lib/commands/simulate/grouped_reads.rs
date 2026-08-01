@@ -6,7 +6,7 @@
 //! `samtools sort --template-coordinate`.
 
 use crate::commands::command::Command;
-use crate::commands::common::{CompressionOptions, parse_bool};
+use crate::commands::common::CompressionOptions;
 use crate::commands::simulate::common::{
     FamilySizeArgs, InsertSizeArgs, MethylationArgs, MethylationConfig, PositionDistArgs,
     QualityArgs, RecordSink, ReferenceArgs, ReferenceGenome, SimulationCommon, SortResourceArgs,
@@ -54,7 +54,7 @@ pub struct GroupedReads {
     pub truth_output: PathBuf,
 
     /// Generate duplex-style MI tags (e.g., "1/A", "1/B")
-    #[arg(long = "duplex", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "duplex", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub duplex: bool,
 
     /// Mapping quality for aligned reads

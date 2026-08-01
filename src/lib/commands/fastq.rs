@@ -3,7 +3,6 @@
 //! This tool reads a BAM file and outputs interleaved FASTQ to stdout for piping to aligners.
 //! Input should be queryname-sorted or template-coordinate sorted.
 
-use crate::commands::common::parse_bool;
 use crate::logging::OperationTimer;
 use crate::sam::SamTag;
 use crate::validation::validate_input_exists;
@@ -102,7 +101,7 @@ pub struct Fastq {
     pub output: Option<PathBuf>,
 
     /// Don't append /1 and /2 to read names.
-    #[arg(short = 'n', long = "no-read-suffix", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(short = 'n', long = "no-read-suffix", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub no_suffix: bool,
 
     /// Exclude reads with any of these flags present [0x900 = secondary|supplementary].
@@ -126,7 +125,7 @@ pub struct Fastq {
     ///
     /// With the default delimiters this matches `samtools fastq -U`
     /// (`readname:AAAA+CCCC`), the layout DRAGEN expects.
-    #[arg(short = 'a', short_alias = 'U', long = "annotate-read-names", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(short = 'a', short_alias = 'U', long = "annotate-read-names", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub annotate_read_names: bool,
 
     /// Tags to read the UMI from, in priority order; the first present wins.

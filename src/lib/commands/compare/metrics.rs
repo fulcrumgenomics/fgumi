@@ -32,7 +32,6 @@
 //! string equality.
 
 use crate::commands::command::Command;
-use crate::commands::common::parse_bool;
 use crate::commands::compare::engines::push_diff;
 use crate::logging::OperationTimer;
 use crate::validation::validate_file_exists;
@@ -130,11 +129,11 @@ pub struct CompareMetrics {
     /// Quiet mode - the exit code is the only result signal (0=equal, 1=different):
     /// suppresses the stdout report and this command's own informational logging. Global
     /// startup logging stays under `RUST_LOG` control (like fgbio's `--log-level`).
-    #[arg(short = 'q', long = "quiet", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(short = 'q', long = "quiet", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub quiet: bool,
 
     /// Verbose mode - print success message when files match
-    #[arg(short = 'v', long = "verbose", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(short = 'v', long = "verbose", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub verbose: bool,
 }
 

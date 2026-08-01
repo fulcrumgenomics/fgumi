@@ -4,7 +4,6 @@
 //! raw reads to facilitate manual review of variant calls. It creates filtered
 //! BAM files and a detailed TSV report.
 
-use crate::commands::common::parse_bool;
 use crate::logging::OperationTimer;
 use crate::reference::find_dict_path;
 use crate::sam::SamTag;
@@ -171,7 +170,7 @@ pub struct Review {
     pub sample: Option<String>,
 
     /// Ignore N bases in consensus reads
-    #[arg(short = 'N', long = "ignore-ns", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(short = 'N', long = "ignore-ns", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub ignore_ns: bool,
 
     /// Only output detailed information for variants at or below this MAF

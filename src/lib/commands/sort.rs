@@ -36,7 +36,7 @@ use std::path::PathBuf;
 
 use crate::commands::command::Command;
 use crate::commands::common::{
-    CompressionOptions, MemoryLimit, MemoryReserve, parse_bool, parse_memory, parse_memory_reserve,
+    CompressionOptions, MemoryLimit, MemoryReserve, parse_memory, parse_memory_reserve,
     resolve_memory_budget,
 };
 
@@ -212,7 +212,7 @@ pub struct Sort {
     /// Reads records sequentially and checks that each record's sort key
     /// is >= the previous record's key. Exits 0 if sorted correctly,
     /// non-zero if any records are out of order.
-    #[arg(long = "verify", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "verify", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub verify: bool,
 
     /// Sort order.
@@ -269,7 +269,7 @@ pub struct Sort {
     /// memory = `max_memory` × the larger of --threads and --sort-threads, since
     /// the sort phase is what fills the in-memory buffer. Disable for fixed total
     /// memory.
-    #[arg(long = "memory-per-thread", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "memory-per-thread", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub memory_per_thread: bool,
 
     /// Temporary directory for intermediate files. Repeatable.
@@ -374,7 +374,7 @@ pub struct Sort {
     /// `<output>.bai`. Output BGZF compression stays multi-threaded (scales
     /// with `--threads`); the BAI virtual offsets are recovered from each BGZF
     /// block as it finalizes, so indexing does not serialize compression.
-    #[arg(long = "write-index", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "write-index", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub write_index: bool,
 
     /// Enable async userspace prefetch on the input BAM.
@@ -859,8 +859,9 @@ mod tests {
         }
     }
 
-    /// Whether `arg` takes an optional value, the shape every `parse_bool` flag
-    /// on `Sort` uses (`num_args = 0..=1`, so a bare `--flag` means `true`).
+    /// Whether `arg` takes an optional value, the shape every
+    /// `BoolishValueParser` flag on `Sort` uses (`num_args = 0..=1`, so a bare
+    /// `--flag` means `true`).
     fn takes_optional_value(arg: &clap::Arg) -> bool {
         arg.get_num_args().is_some_and(|range| range.min_values() == 0 && range.max_values() == 1)
     }

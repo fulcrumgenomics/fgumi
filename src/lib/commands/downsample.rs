@@ -23,9 +23,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use crate::commands::command::Command;
-use crate::commands::common::{
-    BamIoOptions, CompressionOptions, parse_bool, reject_colliding_outputs,
-};
+use crate::commands::common::{BamIoOptions, CompressionOptions, reject_colliding_outputs};
 
 /// Downsample a BAM file by UMI family using streaming.
 ///
@@ -88,7 +86,7 @@ pub struct Downsample {
     pub seed: Option<u64>,
 
     /// Validate that MI tags appear in consecutive groups (error if seen non-consecutively)
-    #[arg(long = "validate-mi-order", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "validate-mi-order", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub validate_mi_order: bool,
 
     /// Output file for kept family size histogram
