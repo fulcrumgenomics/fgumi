@@ -1,0 +1,5 @@
+error: multi_options does not support #[command(flatten)] / #[command(subcommand)] on field `inner`. The nested struct's fields cannot be reached to prefix them; inline them directly.
+  --> tests/ui/command_flatten.rs:14:5
+   |
+14 |     #[command(flatten)]
+   |     ^^^^^^^^^^^^^^^^^^^

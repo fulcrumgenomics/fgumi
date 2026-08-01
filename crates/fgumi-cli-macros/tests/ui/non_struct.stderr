@@ -1,0 +1,8 @@
+error: multi_options only supports structs with named fields
+ --> tests/ui/non_struct.rs:6:1
+  |
+6 | / pub enum NotAStruct {
+7 | |     First,
+8 | |     Second,
+9 | | }
+  | |_^
