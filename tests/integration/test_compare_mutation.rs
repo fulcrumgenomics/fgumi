@@ -173,7 +173,7 @@ fn positional_baseline_identical_records_match() {
     let bam2 = tmp.path().join("b.bam");
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, ContentPredicate::Exact)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, ContentPredicate::Exact, None)
         .expect("positional_compare should succeed");
     assert!(outcome.is_match(), "unmutated baseline must MATCH: {outcome:?}");
 }
@@ -203,7 +203,7 @@ fn positional_exact_core_field_mutation_differs(
     write_bam(&bam1, &header, &[rec_a]);
     write_bam(&bam2, &header, &[rec_b]);
 
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, ContentPredicate::Exact)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, ContentPredicate::Exact, None)
         .expect("positional_compare should succeed");
     assert_eq!(
         outcome.key_mismatch_at, None,
@@ -237,7 +237,7 @@ fn positional_exact_qname_change_is_caught_as_key_mismatch() {
     write_bam(&bam1, &header, &[rec_a]);
     write_bam(&bam2, &header, &[rec_b]);
 
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, ContentPredicate::Exact)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, ContentPredicate::Exact, None)
         .expect("positional_compare should succeed");
     assert_eq!(
         outcome.key_mismatch_at,
@@ -393,7 +393,7 @@ fn positional_exact_duplicated_record_differs() {
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, ContentPredicate::Exact)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, ContentPredicate::Exact, None)
         .expect("positional_compare should succeed");
     assert_eq!(outcome.bam1_count, 2);
     assert_eq!(outcome.bam2_count, 3);
@@ -419,7 +419,7 @@ fn positional_exact_swap_of_distinct_key_records_differs() {
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, ContentPredicate::Exact)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, ContentPredicate::Exact, None)
         .expect("positional_compare should succeed");
     assert_eq!(
         outcome.key_mismatch_at,
@@ -455,7 +455,7 @@ fn positional_exact_minus_mi_tolerates_mi_only_value_change() {
     write_bam(&bam1, &header, &[record_with_mi_and_nm(5, 1)]);
     write_bam(&bam2, &header, &[record_with_mi_and_nm(99, 1)]);
 
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, ContentPredicate::ExactMinusMi)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, ContentPredicate::ExactMinusMi, None)
         .expect("positional_compare should succeed");
     assert_eq!(outcome.content_diffs, 0, "{outcome:?}");
     assert!(
@@ -473,7 +473,7 @@ fn positional_exact_minus_mi_still_flags_non_mi_tag_change() {
     write_bam(&bam1, &header, &[record_with_mi_and_nm(5, 1)]);
     write_bam(&bam2, &header, &[record_with_mi_and_nm(5, 2)]);
 
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, ContentPredicate::ExactMinusMi)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, ContentPredicate::ExactMinusMi, None)
         .expect("positional_compare should succeed");
     assert_eq!(outcome.content_diffs, 1, "{outcome:?}");
     assert!(
@@ -530,7 +530,7 @@ fn positional_consensus_cd_compared_exactly(
     write_bam(&bam1, &header, &[consensus_record_cd(cd_a)]);
     write_bam(&bam2, &header, &[consensus_record_cd(cd_b)]);
 
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, pred)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, pred, None)
         .expect("positional_compare should succeed");
     assert_eq!(outcome.is_match(), expect_match, "cD {cd_a} vs {cd_b} under {pred:?}: {outcome:?}");
 }
@@ -560,7 +560,7 @@ fn positional_consensus_single_quality_tag_difference_is_flagged(
     write_bam(&bam1, &header, &[a]);
     write_bam(&bam2, &header, &[b]);
 
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, ContentPredicate::Exact)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, ContentPredicate::Exact, None)
         .expect("positional_compare should succeed");
     assert!(
         !outcome.is_match(),
@@ -599,7 +599,7 @@ fn positional_consensus_duplex_depth_compared_exactly(
     write_bam(&bam1, &header, &[consensus_record_with_tag(tag, value_a)]);
     write_bam(&bam2, &header, &[consensus_record_with_tag(tag, value_b)]);
 
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, pred)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, pred, None)
         .expect("positional_compare should succeed");
     assert!(
         !outcome.is_match(),
@@ -637,7 +637,7 @@ fn positional_per_base_consensus_tag_mutation_always_differs(
     write_bam(&bam1, &header, &[per_base_consensus_record(tag, &[10, 10, 10, 10])]);
     write_bam(&bam2, &header, &[per_base_consensus_record(tag, &[10, 10, 9, 10])]);
 
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, pred)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, pred, None)
         .expect("positional_compare should succeed");
     assert!(
         !outcome.is_match(),
@@ -1128,7 +1128,7 @@ fn verify_core_field_mutation_differs(mutate: fn(&mut SamBuilder)) -> bool {
     let bam2 = tmp.path().join("b.bam");
     write_bam(&bam1, &header, &[core_record_variant(|_| {})]);
     write_bam(&bam2, &header, &[core_record_variant(mutate)]);
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, ContentPredicate::Exact)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 10, ContentPredicate::Exact, None)
         .expect("positional_compare should succeed");
     outcome.key_mismatch_at.is_none() && outcome.content_diffs == 1 && !outcome.is_match()
 }
@@ -1146,7 +1146,7 @@ fn positional_differs(
     let bam2 = tmp.path().join("b.bam");
     write_bam(&bam1, header, recs_a);
     write_bam(&bam2, header, recs_b);
-    !positional_compare(&bam1, &bam2, 1, 64, 10, pred)
+    !positional_compare(&bam1, &bam2, 1, 64, 10, pred, None)
         .expect("positional_compare should succeed")
         .is_match()
 }

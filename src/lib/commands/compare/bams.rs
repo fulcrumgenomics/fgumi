@@ -689,17 +689,19 @@ impl Command for CompareBams {
         // (`Grouping` routes through the streaming molecule-join engine, which matches
         // molecules by MI-invariant canonical id — the lexicographically smallest read name
         // in each molecule — rather than by position, so it is order-INDEPENDENT ACROSS
-        // molecules and never needs `verify_records_in_order`'s stream-level check. That is
+        // molecules and never needs the stream-level order check. That is
         // not the same as "no validation needed", though: `molecule_runs` (see
         // `super::molecule`) enforces its own precondition — that each molecule's own
         // records are consecutive, i.e. same-MI-consecutive/grouped input — and returns an
         // `Err` if a base MI's run is found non-contiguous, rather than silently trusting it).
-        if let Some(order) = declared_order
-            && matches!(mode, CompareMode::Content)
-        {
-            super::engines::sort_verify::verify_records_in_order(&self.bam1, order)?;
-            super::engines::sort_verify::verify_records_in_order(&self.bam2, order)?;
-        }
+        // The check itself is folded into `positional_compare`'s own record pass
+        // (see its `verify_order` parameter) rather than run here as two dedicated
+        // traversals. Verifying up front cost a full read of each input *before*
+        // the comparison read them again — four traversals for a job needing two —
+        // and bought nothing: the comparison already drains both inputs to
+        // completion, so it sees every record the standalone pass would have, and
+        // reports the identical diagnostic.
+        let verify_order = declared_order.filter(|_| matches!(mode, CompareMode::Content));
 
         // In `--quiet` mode only the exit code communicates the result, so suppress this
         // command's own informational stderr logging and timer (matching `compare metrics`).
@@ -755,7 +757,7 @@ impl Command for CompareBams {
             CompareMode::Content => {
                 drop(input1);
                 drop(input2);
-                self.execute_content(predicate)?
+                self.execute_content(predicate, verify_order)?
             }
             CompareMode::Grouping => self.execute_grouping(input1, input2)?,
         };
@@ -804,7 +806,14 @@ impl CompareBams {
     /// [`PositionalOutcome`](super::engines::positional::PositionalOutcome) — this
     /// report now shows record counts, a content-diff count, and (if pairing
     /// desynced) the first `RecordKey` mismatch index instead.
-    fn execute_content(&self, predicate: ContentPredicate) -> Result<u64> {
+    /// `verify_order` carries the sort order the records must actually honor, or
+    /// `None` for genuinely orderless input. It is checked inside the comparison's
+    /// own pass rather than by re-reading both inputs first (see `execute`).
+    fn execute_content(
+        &self,
+        predicate: ContentPredicate,
+        verify_order: Option<fgumi_sort::SortOrder>,
+    ) -> Result<u64> {
         if !self.quiet {
             info!(
                 "Starting content comparison with {} threads, batch size {}",
@@ -819,6 +828,7 @@ impl CompareBams {
             self.batch_size,
             self.max_diffs,
             predicate,
+            verify_order,
         )?;
 
         let is_equal = outcome.is_match();

@@ -880,7 +880,7 @@ fn test_positional_compare_zero_batch_size_errors() {
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
 
-    let err = positional_compare(&bam1, &bam2, 1, 0, 100, ContentPredicate::Exact)
+    let err = positional_compare(&bam1, &bam2, 1, 0, 100, ContentPredicate::Exact, None)
         .expect_err("batch_size 0 must error at the engine boundary, not hang");
     assert!(
         err.to_string().contains("batch size must be at least 1"),
@@ -902,7 +902,7 @@ fn test_positional_compare_identical_bams_match() {
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
 
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 100, ContentPredicate::Exact)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 100, ContentPredicate::Exact, None)
         .expect("positional_compare should succeed");
 
     assert_eq!(outcome.bam1_count, 2);
@@ -935,7 +935,7 @@ fn test_positional_compare_seq_difference_is_one_content_diff() {
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 100, ContentPredicate::Exact)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 100, ContentPredicate::Exact, None)
         .expect("positional_compare should succeed");
 
     assert_eq!(outcome.bam1_count, 1);
@@ -965,7 +965,7 @@ fn test_positional_compare_swapped_records_is_key_mismatch() {
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 100, ContentPredicate::Exact)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 100, ContentPredicate::Exact, None)
         .expect("positional_compare should succeed");
 
     assert_eq!(outcome.bam1_count, 2);
@@ -994,7 +994,7 @@ fn test_positional_compare_extra_trailing_record_is_presence_differ() {
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 100, ContentPredicate::Exact)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 100, ContentPredicate::Exact, None)
         .expect("positional_compare should succeed");
 
     assert_eq!(outcome.bam1_count, 2);
@@ -1022,7 +1022,7 @@ fn test_positional_compare_header_sq_length_mismatch_is_a_diff() {
     write_bam(&bam1, &header1, &records);
     write_bam(&bam2, &header2, &records);
 
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 100, ContentPredicate::Exact)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 100, ContentPredicate::Exact, None)
         .expect("positional_compare should succeed");
 
     assert!(outcome.header_mismatch, "a @SQ length mismatch must be flagged: {outcome:?}");
