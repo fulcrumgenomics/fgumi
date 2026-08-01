@@ -23,6 +23,9 @@ CRATES=(
   fgumi-bgzf
   fgumi-simd-fastq
   fgumi-tag
+  fgumi-fmt
+  fgumi-cli-macros
+  fgumi-cli-common
   fgumi-raw-bam
   fgumi-bam-io
   fgumi-umi
