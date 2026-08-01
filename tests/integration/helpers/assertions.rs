@@ -53,6 +53,30 @@ pub fn int_tag(record: &noodles::bam::Record, tag: SamTag) -> i64 {
     }
 }
 
+/// Asserts that an in-memory BGZF stream ends with the standard 28-byte EOF block.
+///
+/// The byte-slice counterpart to [`assert_has_bgzf_eof`], for output captured
+/// from a pipe rather than written to a file. `label` names the run in the
+/// failure, since callers check several spellings of the same output.
+///
+/// # Panics
+///
+/// Panics if `bytes` is too small or is missing the BGZF EOF block.
+pub fn assert_bytes_have_bgzf_eof(bytes: &[u8], label: &str) {
+    let eof_len = BGZF_EOF.len();
+    assert!(
+        bytes.len() >= eof_len,
+        "{label}: too small to contain BGZF EOF ({} bytes)",
+        bytes.len()
+    );
+    assert_eq!(
+        &bytes[bytes.len() - eof_len..],
+        &BGZF_EOF,
+        "{label}: missing the BGZF EOF block — the stream reads as truncated \
+         (`samtools quickcheck` fails) even though its records parse"
+    );
+}
+
 /// Asserts that a file ends with the standard 28-byte BGZF EOF marker block.
 ///
 /// # Panics
@@ -60,13 +84,7 @@ pub fn int_tag(record: &noodles::bam::Record, tag: SamTag) -> i64 {
 /// Panics if the file cannot be read, is too small, or is missing the BGZF EOF block.
 pub fn assert_has_bgzf_eof(path: &std::path::Path) {
     let data = std::fs::read(path).expect("Failed to read file for EOF check");
-    assert!(data.len() >= 28, "File too small to contain BGZF EOF: {}", path.display());
-    assert_eq!(
-        &data[data.len() - 28..],
-        &BGZF_EOF,
-        "File missing BGZF EOF block: {}",
-        path.display()
-    );
+    assert_bytes_have_bgzf_eof(&data, &path.display().to_string());
 }
 
 /// Asserts that a rejects BAM's `@HD` sort-order fields (`SO`, `GO`, `SS`)

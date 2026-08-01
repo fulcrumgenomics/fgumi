@@ -1165,12 +1165,16 @@ pub fn create_optional_bam_writer<P: AsRef<Path>>(
 
 /// Open an output writer for a path, supporting stdout via `-` or `/dev/stdout`.
 ///
-/// This is the single place the `-` convention is honoured, so anything writing
-/// a command's output must come through here (directly, or via one of the
+/// This is the single place the `-` convention is honoured **for BAM output**,
+/// so any BAM writer must come through here (directly, or via one of the
 /// `create_*_bam_writer` helpers) rather than calling `File::create` itself. A
 /// writer that opens the path directly silently creates a regular file *named*
 /// `-` and exits zero with an empty pipe — see the stdout axis in
 /// `tests/integration/test_input_source_matrix.rs`.
+///
+/// Commands whose output is text rather than BAM (`fgumi fastq`) do not need the
+/// boxed writer and dispatch on [`is_stdout_path`] themselves, taking
+/// `stdout().lock()` directly.
 ///
 /// A stdout path yields a block-buffered handle — fd 1 duplicated into a
 /// [`File`] — rather than [`std::io::Stdout`], whose `LineWriter` would tear

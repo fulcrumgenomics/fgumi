@@ -94,8 +94,10 @@ pub struct Fastq {
     #[arg(short = 'i', long = "input")]
     pub input: PathBuf,
 
-    /// Output FASTQ file. If omitted, the FASTQ stream is written to stdout
-    /// (the default, intended for piping straight to an aligner).
+    /// Output FASTQ file, or `-` / `/dev/stdout` for stdout. If omitted, the
+    /// FASTQ stream is written to stdout (the default, intended for piping
+    /// straight to an aligner). A `.gz`/`.bgz` path is BGZF-compressed; stdout
+    /// is always plain text.
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
 

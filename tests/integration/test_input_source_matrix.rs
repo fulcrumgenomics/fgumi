@@ -13,7 +13,7 @@
 //! All three were previously true of some commands and not others, and nothing
 //! failed when a new command picked the wrong reader or writer. The table below
 //! is the contract: every command the binary advertises must appear in it with an
-//! explicit stance, and [`every_command_declares_an_input_contract`] fails when
+//! explicit stance, and [`every_command_declares_an_io_contract`] fails when
 //! one does not — so adding a command forces a decision rather than inheriting
 //! whichever default its reader or writer happened to have.
 //!
@@ -55,7 +55,7 @@ enum Support {
 use Support::{NotApplicable, Required};
 
 /// One command's declared I/O contract.
-struct InputContract {
+struct IoContract {
     /// Subcommand name as it appears in `fgumi --help`.
     command: &'static str,
     /// Whether `-i in.sam` must work.
@@ -82,8 +82,8 @@ struct InputContract {
 ///
 /// A `NotApplicable` reason is a claim about the command's design, not a
 /// to-do — if the reason stops being true, the entry should change.
-const CONTRACTS: &[InputContract] = &[
-    InputContract {
+const CONTRACTS: &[IoContract] = &[
+    IoContract {
         command: "extract",
         sam: NotApplicable("reads FASTQ, not alignment records"),
         // Only with a single input: one stdin cannot supply two FASTQs.
@@ -91,21 +91,21 @@ const CONTRACTS: &[InputContract] = &[
         stdout: Required,
         output_depends_on_input: Required,
     },
-    InputContract {
+    IoContract {
         command: "correct",
         sam: Required,
         stdin: Required,
         stdout: Required,
         output_depends_on_input: Required,
     },
-    InputContract {
+    IoContract {
         command: "fastq",
         sam: Required,
         stdin: Required,
         stdout: Required,
         output_depends_on_input: Required,
     },
-    InputContract {
+    IoContract {
         command: "zipper",
         sam: Required,
         stdin: Required,
@@ -115,28 +115,28 @@ const CONTRACTS: &[InputContract] = &[
              empty `-i` yields the same templates, unmapped",
         ),
     },
-    InputContract {
+    IoContract {
         command: "sort",
         sam: Required,
         stdin: Required,
         stdout: Required,
         output_depends_on_input: Required,
     },
-    InputContract {
+    IoContract {
         command: "merge",
         sam: Required,
         stdin: NotApplicable("merges N pre-sorted inputs named in a list file"),
         stdout: Required,
         output_depends_on_input: Required,
     },
-    InputContract {
+    IoContract {
         command: "group",
         sam: Required,
         stdin: Required,
         stdout: Required,
         output_depends_on_input: Required,
     },
-    InputContract {
+    IoContract {
         command: "dedup",
         sam: Required,
         stdin: Required,
@@ -144,7 +144,7 @@ const CONTRACTS: &[InputContract] = &[
         output_depends_on_input: Required,
     },
     #[cfg(feature = "simplex")]
-    InputContract {
+    IoContract {
         command: "simplex",
         sam: Required,
         stdin: Required,
@@ -152,7 +152,7 @@ const CONTRACTS: &[InputContract] = &[
         output_depends_on_input: Required,
     },
     #[cfg(feature = "duplex")]
-    InputContract {
+    IoContract {
         command: "duplex",
         sam: Required,
         stdin: Required,
@@ -160,21 +160,21 @@ const CONTRACTS: &[InputContract] = &[
         output_depends_on_input: Required,
     },
     #[cfg(feature = "codec")]
-    InputContract {
+    IoContract {
         command: "codec",
         sam: Required,
         stdin: Required,
         stdout: Required,
         output_depends_on_input: Required,
     },
-    InputContract {
+    IoContract {
         command: "filter",
         sam: Required,
         stdin: Required,
         stdout: Required,
         output_depends_on_input: Required,
     },
-    InputContract {
+    IoContract {
         command: "clip",
         sam: Required,
         stdin: Required,
@@ -182,7 +182,7 @@ const CONTRACTS: &[InputContract] = &[
         output_depends_on_input: Required,
     },
     #[cfg(feature = "duplex")]
-    InputContract {
+    IoContract {
         command: "duplex-metrics",
         sam: Required,
         stdin: Required,
@@ -190,21 +190,21 @@ const CONTRACTS: &[InputContract] = &[
         output_depends_on_input: Required,
     },
     #[cfg(feature = "simplex")]
-    InputContract {
+    IoContract {
         command: "simplex-metrics",
         sam: Required,
         stdin: Required,
         stdout: NotApplicable("`-o` names a prefix for several metrics files, not one stream"),
         output_depends_on_input: Required,
     },
-    InputContract {
+    IoContract {
         command: "review",
         sam: NotApplicable("requires BAI indexes and does random access, which needs BGZF"),
         stdin: NotApplicable("does random access against a BAI index"),
         stdout: NotApplicable("`-o` names a prefix for a directory of BAMs and their indexes"),
         output_depends_on_input: NotApplicable("declares no axis this harness invokes"),
     },
-    InputContract {
+    IoContract {
         command: "downsample",
         sam: Required,
         stdin: Required,
@@ -212,7 +212,7 @@ const CONTRACTS: &[InputContract] = &[
         output_depends_on_input: Required,
     },
     #[cfg(feature = "compare")]
-    InputContract {
+    IoContract {
         command: "compare",
         sam: Required,
         stdin: NotApplicable("compares two named files against each other"),
@@ -220,7 +220,7 @@ const CONTRACTS: &[InputContract] = &[
         output_depends_on_input: Required,
     },
     #[cfg(feature = "simulate")]
-    InputContract {
+    IoContract {
         command: "simulate",
         sam: NotApplicable("generates data rather than reading it"),
         stdin: NotApplicable("generates data rather than reading it"),
@@ -275,7 +275,7 @@ fn advertised_commands() -> Vec<String> {
 /// fails here until someone states its position on every axis [`IoContract`]
 /// carries — SAM, stdin, stdout, and whether its output depends on its input.
 #[test]
-fn every_command_declares_an_input_contract() {
+fn every_command_declares_an_io_contract() {
     let advertised: Vec<String> = advertised_commands()
         .into_iter()
         .filter(|name| !NOT_A_COMMAND.contains(&name.as_str()))
@@ -646,7 +646,7 @@ fn run_command_writing(
 /// and the coverage cannot drift apart. (Feature-gated commands compile out of
 /// `CONTRACTS` along with themselves, so they are simply absent here.)
 fn for_each_command_requiring(
-    axis: impl Fn(&InputContract) -> Support,
+    axis: impl Fn(&IoContract) -> Support,
     check: impl Fn(&str, &Fixture, &Path) -> Result<(), String>,
 ) {
     let mut failures = Vec::new();

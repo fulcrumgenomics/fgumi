@@ -366,7 +366,11 @@ pub struct Sort {
 
     /// Write BAM index (.bai) alongside output.
     ///
-    /// Only valid for coordinate sort. The index file will be written to
+    /// Only valid for coordinate sort, and not with output to stdout (`-` /
+    /// `/dev/stdout`): an index needs a seekable file and a sidecar path, so
+    /// that combination is rejected rather than silently skipped.
+    ///
+    /// The index file will be written to
     /// `<output>.bai`. Output BGZF compression stays multi-threaded (scales
     /// with `--threads`); the BAI virtual offsets are recovered from each BGZF
     /// block as it finalizes, so indexing does not serialize compression.
