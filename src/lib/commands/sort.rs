@@ -211,7 +211,7 @@ pub struct Sort {
     /// Reads records sequentially and checks that each record's sort key
     /// is >= the previous record's key. Exits 0 if sorted correctly,
     /// non-zero if any records are out of order.
-    #[arg(long = "verify", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "verify", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub verify: bool,
 
     /// Sort order.
@@ -266,7 +266,7 @@ pub struct Sort {
     ///
     /// When enabled (default), --max-memory specifies memory per thread.
     /// Total memory = `max_memory` × threads. Disable for fixed total memory.
-    #[arg(long = "memory-per-thread", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "memory-per-thread", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub memory_per_thread: bool,
 
     /// Temporary directory for intermediate files. Repeatable.
@@ -359,7 +359,7 @@ pub struct Sort {
     /// `<output>.bai`. Output BGZF compression stays multi-threaded (scales
     /// with `--threads`); the BAI virtual offsets are recovered from each BGZF
     /// block as it finalizes, so indexing does not serialize compression.
-    #[arg(long = "write-index", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "write-index", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub write_index: bool,
 
     /// Enable async userspace prefetch on the input BAM.
@@ -766,6 +766,48 @@ mod tests {
                 !names_the_binary(&help),
                 "help for `--{}` names the `fgumi` binary; describe the flag instead and put \
                  worked invocations in the command-level EXAMPLES block. Help was: {help}",
+                arg.get_id()
+            );
+        }
+    }
+
+    /// Whether `arg` takes an optional value, the shape every `parse_bool` flag
+    /// on `Sort` uses (`num_args = 0..=1`, so a bare `--flag` means `true`).
+    fn takes_optional_value(arg: &clap::Arg) -> bool {
+        arg.get_num_args().is_some_and(|range| range.min_values() == 0 && range.max_values() == 1)
+    }
+
+    /// Boolean flags must name their accepted values, because clap otherwise
+    /// derives the placeholder from the field name: `--memory-per-thread` renders
+    /// as `--memory-per-thread [<MEMORY_PER_THREAD>]`, which reads as a request
+    /// for a per-thread memory size and invites `--memory-per-thread 10G`.
+    ///
+    /// `Sort` is `#[command(flatten)]`-ed into other binaries, where short `-h`
+    /// output is often all a user sees, so the placeholder has to carry this on
+    /// its own.
+    #[test]
+    fn test_bool_args_name_their_accepted_values() {
+        let command = Sort::command();
+
+        // Guard against a vacuous pass: if the `num_args` probe stops matching,
+        // the loop below would check nothing.
+        let bool_args: Vec<_> =
+            command.get_arguments().filter(|arg| takes_optional_value(arg)).collect();
+        assert!(
+            bool_args.len() >= 3,
+            "expected Sort to expose its boolean flags, matched only {}",
+            bool_args.len()
+        );
+
+        for arg in bool_args {
+            let value_names = arg
+                .get_value_names()
+                .map(|names| names.iter().map(ToString::to_string).collect::<Vec<_>>());
+            assert_eq!(
+                value_names.as_deref(),
+                Some(["true|false".to_string()].as_slice()),
+                "`--{}` must declare `value_name = \"true|false\"`; without it clap renders the \
+                 upper-cased field name, which reads as a value to supply rather than a boolean",
                 arg.get_id()
             );
         }
