@@ -816,6 +816,20 @@ mod tests {
         assert_eq!(stats.consensus_reads, 1);
     }
 
+    /// `consensus_reads` counts emitted reads, not templates, so recording a pair must
+    /// add two — the whole reason callers that emit both ends use this instead of two
+    /// `record_consensus()` calls. Without this, the counter could be reverted to a
+    /// per-template increment and only an end-to-end record count would notice.
+    #[test]
+    fn test_record_consensus_pair_counts_two_reads() {
+        let mut stats = ConsensusCallingStats::new();
+        stats.record_consensus_pair();
+        assert_eq!(stats.consensus_reads, 2, "a consensus pair is two emitted reads");
+
+        stats.record_consensus();
+        assert_eq!(stats.consensus_reads, 3, "a fragment consensus is one more read");
+    }
+
     #[test]
     fn test_all_rejection_reason_codes() {
         assert_eq!(RejectionReason::FragmentRead.code(), 'F');
