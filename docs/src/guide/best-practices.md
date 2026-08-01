@@ -402,7 +402,7 @@ For production use where filtering parameters are established, combine steps for
 **Stage 1: Group and call consensus in a single pipe:**
 
 ```bash
-fgumi group --input aligned.bam --strategy adjacency --threads 4 --compression-level 1 \
+fgumi group --input aligned.bam --strategy adjacency --threads 4 --compression-level 1 --output - \
   | fgumi simplex --input /dev/stdin --min-reads 1 --output-per-base-tags true \
     --output consensus.bam --threads 4 --compression-level 1
 ```
@@ -413,7 +413,7 @@ fgumi group --input aligned.bam --strategy adjacency --threads 4 --compression-l
 fgumi fastq --input consensus.bam \
   | bwa mem -t 16 -p -K 150000000 -Y ref.fa - \
   | fgumi zipper --unmapped consensus.bam --reference ref.fa \
-  | fgumi filter --input /dev/stdin --ref ref.fa --min-reads 3 \
+  | fgumi filter --input /dev/stdin --ref ref.fa --min-reads 3 --output - \
   | fgumi sort --input /dev/stdin --output filtered.bam --order coordinate --threads 4
 ```
 
