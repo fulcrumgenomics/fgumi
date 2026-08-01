@@ -444,16 +444,20 @@ mod tests {
 
     #[test]
     fn test_long_sequence_spanning_multiple_blocks() {
-        // 200-base sequence spans 4 blocks
-        let seq = "A".repeat(200);
-        let qual = "I".repeat(200);
+        // 200-base sequence spans 4 blocks. The bases and qualities vary with position so
+        // the assertions below pin the bytes the parser hands back, not just how many:
+        // stitching the wrong block boundary preserves the length but not the content.
+        let seq: String = (0..200).map(|i| ['A', 'C', 'G', 'T'][i % 4]).collect();
+        let qual: String =
+            (0..200).map(|i| char::from(b'!' + u8::try_from(i % 60).unwrap())).collect();
         let data = format!("@r1\n{seq}\n+\n{qual}\n");
         let offsets = find_record_offsets(data.as_bytes());
         assert_eq!(offsets, vec![0, data.len()]);
 
         let records: Vec<_> = parse_records(data.as_bytes()).collect();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].sequence.len(), 200);
+        assert_eq!(records[0].sequence, seq.as_bytes(), "sequence mismatch across blocks");
+        assert_eq!(records[0].quality, qual.as_bytes(), "quality mismatch across blocks");
     }
 
     #[test]
