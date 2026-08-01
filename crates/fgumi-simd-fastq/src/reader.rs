@@ -393,8 +393,14 @@ mod tests {
 
     #[test]
     fn test_reader_long_records() {
-        let seq = "A".repeat(500);
-        let qual = "I".repeat(500);
+        // A record four times the reader's capacity, so it can only be produced by
+        // refilling the buffer mid-record. The bases and qualities vary with position
+        // rather than repeating one byte: a misplaced boundary that dropped, duplicated,
+        // or reordered a chunk would still yield 500 bytes, so only comparing the exact
+        // bytes back can catch it.
+        let seq: String = (0..500).map(|i| ['A', 'C', 'G', 'T'][i % 4]).collect();
+        let qual: String =
+            (0..500).map(|i| char::from(b'!' + u8::try_from(i % 60).unwrap())).collect();
         let data = format!("@longread\n{seq}\n+\n{qual}\n");
         let mut reader = SimdFastqReader::with_capacity(Cursor::new(data.as_bytes()), 256);
 
@@ -403,8 +409,8 @@ mod tests {
             .expect("reader should yield a record")
             .expect("record should parse successfully");
         assert_eq!(rec.name, b"longread");
-        assert_eq!(rec.sequence.len(), 500);
-        assert_eq!(rec.quality.len(), 500);
+        assert_eq!(rec.sequence, seq.as_bytes(), "sequence mismatch across buffer refills");
+        assert_eq!(rec.quality, qual.as_bytes(), "quality mismatch across buffer refills");
 
         assert!(reader.next().is_none());
     }
