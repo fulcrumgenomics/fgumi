@@ -62,25 +62,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          # All workspace crates share a single version (lockstep).
-          # Check the root crate to decide if publishing is needed.
+          # All workspace crates share a single version (lockstep), so the root
+          # crate's version is the target version for every crate.  Whether
+          # there is anything to publish is decided per crate in the loop below,
+          # not here: a crate added to the workspace after the current version
+          # was released is missing from crates.io even though the root crate is
+          # already at that version, so an early exit keyed on `fgumi` alone
+          # would silently skip it.
           VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r \
             '.packages[] | select(.name == "fgumi") | .version')
 
-          PUBLISHED_VERSION=$(curl -sSf \
-            -H "User-Agent: fgumi-ci (https://github.com/fulcrumgenomics/fgumi)" \
-            "https://crates.io/api/v1/crates/fgumi" | jq -r \
-            '.crate.max_version // "0.0.0"')
-
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-          if [ "$VERSION" = "$PUBLISHED_VERSION" ]; then
-            echo "All crates already at v$VERSION -- nothing to publish"
-            echo "published=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "Publishing all workspace crates (v$VERSION)..."
+          echo "Target version for all workspace crates: v$VERSION"
 
           # Workspace crates in topological (dependency) order.
           # Leaf crates first, root crate last.  Update this list when
@@ -90,6 +84,9 @@ jobs:
             fgumi-bgzf
             fgumi-simd-fastq
             fgumi-tag
+            fgumi-fmt
+            fgumi-cli-macros
+            fgumi-cli-common
             fgumi-raw-bam
             fgumi-bam-io
             fgumi-umi
@@ -169,6 +166,7 @@ jobs:
             exit 1
           fi
 
+          PUBLISHED_ANY=false
           for crate in "${CRATES[@]}"; do
             CRATE_MAX_VERSION=$(curl -sS \
               -H "User-Agent: fgumi-ci (https://github.com/fulcrumgenomics/fgumi)" \
@@ -183,9 +181,14 @@ jobs:
             echo "Publishing $crate v$VERSION..."
             cargo publish -p "$crate"
             echo "✓ Published $crate v$VERSION"
+            PUBLISHED_ANY=true
           done
 
-          echo "published=true" >> "$GITHUB_OUTPUT"
+          if [ "$PUBLISHED_ANY" = "false" ]; then
+            echo "All crates already at v$VERSION -- nothing to publish"
+          fi
+
+          echo "published=$PUBLISHED_ANY" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub release
         if: steps.publish.outputs.version != ''

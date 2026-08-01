@@ -1,0 +1,5 @@
+error: multi_options does not carry a struct-level #[command(...)] onto the generated Multi struct, so the standalone and re-exposed commands would silently diverge. Move the setting onto the individual #[arg(...)] attributes, or drop it.
+ --> tests/ui/struct_level_command.rs:8:1
+  |
+8 | #[command(next_help_heading = "Somewhere Else")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
