@@ -427,6 +427,31 @@ where
         if from1.is_none() && from2.is_none() {
             break;
         }
+        // Byte-identical pair: cancel it here without building either record's
+        // canonical content key.
+        //
+        // Sound because the run comparison decides on the symmetric difference of
+        // the two sides' record multisets, and removing one element from each side
+        // *with the same key* leaves that symmetric difference unchanged — whatever
+        // else is pending. Byte equality implies content-key equality, and strictly
+        // so: `content_key_exact` excludes `bin`, width-normalizes integer tags, and
+        // sorts the tag multiset, so any two byte-identical records necessarily
+        // share a key. The converse does not hold, which is why this is only a fast
+        // path: content-equal records that differ in tag order, integer tag width,
+        // or `bin` fall through to the key path below and still cancel there.
+        //
+        // Worth the special case because it is the overwhelmingly common one — two
+        // files that agree, record for record — and `content_key_exact` is the
+        // dominant remaining cost on the critical path (~32%: a `Vec` per aux tag,
+        // a sort, a concatenation, and an `AHashMap` hash + insert, per record).
+        // Here a `memcmp` replaces all of it.
+        if let (Some(a), Some(b)) = (&from1, &from2)
+            && a.as_ref() == b.as_ref()
+        {
+            count1 += 1;
+            count2 += 1;
+            continue;
+        }
         if let Some(rec) = from1 {
             canceller.observe_bam1(rec.as_ref())?;
             count1 += 1;
