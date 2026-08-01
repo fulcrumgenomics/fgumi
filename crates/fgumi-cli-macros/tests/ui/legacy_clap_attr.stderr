@@ -1,0 +1,5 @@
+error: multi_options does not support the legacy #[clap(...)] / #[structopt(...)] spelling: every classifier keys on #[arg(...)] and #[command(...)], so this attribute would be silently ignored and the field misclassified. Use the #[arg(...)] / #[command(...)] spelling.
+ --> tests/ui/legacy_clap_attr.rs:9:5
+  |
+9 |     #[clap(skip)]
+  |     ^^^^^^^^^^^^^

@@ -1,0 +1,11 @@
+error: multi_options: the prefix must not be empty (it would generate flags named `--::<flag>`)
+ --> tests/ui/bad_prefix.rs:6:17
+  |
+6 | #[multi_options("", "Probe Options")]
+  |                 ^^
+
+error: multi_options: the prefix must start with an ASCII letter, got `2fast` — it also becomes the leading segment of the generated field identifier `<prefix>_<field>`
+  --> tests/ui/bad_prefix.rs:13:17
+   |
+13 | #[multi_options("2fast", "Probe Options")]
+   |                 ^^^^^^^

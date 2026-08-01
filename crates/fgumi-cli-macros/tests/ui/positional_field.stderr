@@ -1,0 +1,12 @@
+error: multi_options: field `implicit_positional` declares neither `long` nor `short`, so clap treats it as a positional argument. A positional has no flag name to prefix, and several stages flattened into one runall command would have mutually ambiguous positionals. Add an explicit `#[arg(long)]` (or `#[arg(long = "...")]`) to the field.
+  --> tests/ui/positional_field.rs:10:5
+   |
+10 |     pub implicit_positional: u32,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: multi_options: field `explicit_positional` uses #[arg(index …)], which makes it a positional argument. The Multi struct gives every field a prefixed `long`, and clap panics when a positional has one ("is a positional argument and can't have short or long name versions"). A positional cannot be namespaced per stage — expose it as a flag with `#[arg(long)]` instead.
+  --> tests/ui/positional_field.rs:11:5
+   |
+11 | /     #[arg(index = 2)]
+12 | |     pub explicit_positional: u32,
+   | |________________________________^
