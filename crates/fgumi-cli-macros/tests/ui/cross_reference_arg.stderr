@@ -1,0 +1,6 @@
+error: multi_options: field `second` uses #[arg(requires …)], which references another argument by its unprefixed id. The Multi struct renames fields to `<prefix>_<field>`, so that id would dangle and clap would panic when it builds the runall command. Enforce this coupling in the command's validate()/resolve() instead (see AlignerOptions::resolve).
+  --> tests/ui/cross_reference_arg.rs:10:5
+   |
+10 | /     #[arg(long, requires = "first")]
+11 | |     pub second: u32,
+   | |___________________^

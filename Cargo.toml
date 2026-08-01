@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-fmt", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-tag", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/fgumi-bam-io", "crates/fgumi-sort", "crates/fgumi-cli-common", "crates/xtask"]
+members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-fmt", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-tag", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/fgumi-bam-io", "crates/fgumi-sort", "crates/fgumi-cli-common", "crates/fgumi-cli-macros", "crates/xtask"]
 resolver = "2"
 
 [workspace.package]
@@ -23,6 +23,7 @@ flate2 = { version = "1.1", features = ["zlib-rs"] }
 fgumi-bam-io = { version = "0.6.0", path = "crates/fgumi-bam-io" }
 fgumi-bgzf = { version = "0.6.0", path = "crates/fgumi-bgzf" }
 fgumi-cli-common = { version = "0.6.0", path = "crates/fgumi-cli-common" }
+fgumi-cli-macros = { version = "0.6.0", path = "crates/fgumi-cli-macros" }
 fgumi-fmt = { version = "0.6.0", path = "crates/fgumi-fmt" }
 fgumi-consensus = { version = "0.6.0", path = "crates/fgumi-consensus", default-features = false }
 fgumi-dna = { version = "0.6.0", path = "crates/fgumi-dna" }

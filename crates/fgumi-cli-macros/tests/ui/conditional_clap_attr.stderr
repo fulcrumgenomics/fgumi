@@ -1,0 +1,5 @@
+error: multi_options: field `knob` hides a clap attribute behind #[cfg_attr(…, arg(…))]. The macro classifies fields from their literal #[arg(...)] attributes and cannot evaluate a cfg predicate, so this one would be ignored and the field misclassified. Apply #[cfg] to the field and write the #[arg(...)] unconditionally.
+ --> tests/ui/conditional_clap_attr.rs:9:5
+  |
+9 |     #[cfg_attr(unix, arg(long, default_value_t = 3))]
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

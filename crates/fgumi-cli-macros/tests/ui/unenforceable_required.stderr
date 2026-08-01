@@ -1,0 +1,13 @@
+error: multi_options: field `defaulted` combines #[arg(required …)] with a default value or a bare `bool`. The generated field always holds a value — clap applies a declared default to `Option<T>` and `Vec<T>` as well — so the Multi side cannot distinguish "not supplied" from "supplied the default" and the requirement would be silently unenforceable. Drop `required`, or drop the default.
+  --> tests/ui/unenforceable_required.rs:9:5
+   |
+ 9 | /     #[arg(long, default_value_t = 3, required = true)]
+10 | |     pub defaulted: u32,
+   | |______________________^
+
+error: multi_options: field `toggled` combines #[arg(required …)] with a default value or a bare `bool`. The generated field always holds a value — clap applies a declared default to `Option<T>` and `Vec<T>` as well — so the Multi side cannot distinguish "not supplied" from "supplied the default" and the requirement would be silently unenforceable. Drop `required`, or drop the default.
+  --> tests/ui/unenforceable_required.rs:11:5
+   |
+11 | /     #[arg(long, required = true)]
+12 | |     pub toggled: bool,
+   | |_____________________^
