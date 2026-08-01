@@ -2224,7 +2224,7 @@ mod tests {
         assert_eq!(find_string_tag(&aux, b"XI"), None);
     }
 
-    // --- B:i array (the pa tag type) ---
+    // --- B:i array (the type the `tc` template-coordinate tag uses) ---
 
     #[test]
     fn test_find_string_tag_cannot_find_b_int_array() {
@@ -3535,7 +3535,9 @@ mod tests {
 
     #[test]
     fn test_dedup_pa_tag_check_fails_on_b_array() {
-        // Simulate the exact pa tag as produced by fgumi zipper: pa:B:i,0,27_056_961,0,207,60005,1
+        // The legacy `pa:B:i,0,27_056_961,0,207,60005,1` sort key that `fgumi zipper` wrote
+        // before 0.2.0, when the tag was renamed to `tc`. The name is incidental to the bug —
+        // what defeats the dedup check is the `B:i` array type, which `tc` still uses.
         let aux = make_b_int_array_tag(*b"pa", &[0, 27_056_961, 0, 207, 60005, 1]);
         let pa_tag_bytes: [u8; 2] = *b"pa";
 
