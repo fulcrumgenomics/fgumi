@@ -5,9 +5,8 @@
 //! the location of the first violation (if any).
 
 use anyhow::Result;
-use std::io::Read;
 
-use crate::reader::RawBamRecordReader;
+use fgumi_raw_bam::RawRecord;
 
 /// Summary of a sort-order verification pass: `(total_records, violations, first_violation)`.
 ///
@@ -15,27 +14,37 @@ use crate::reader::RawBamRecordReader;
 /// observed and `None` otherwise.
 pub type VerifySummary = (u64, u64, Option<(u64, String)>);
 
-/// Iterates the records read by `raw_reader` and verifies that consecutive
+/// Iterates the records read by `records` and verifies that consecutive
 /// extracted keys do not violate the sort invariant.
 ///
 /// `extract_key` produces a sort key from each record's raw bytes. `is_violation`
 /// returns `true` when the *current* key violates ordering relative to the
 /// *previous* key (typically `|cur, prev| cur < prev`).
 ///
+/// Takes any stream of `io::Result<RawRecord>` rather than a concrete
+/// [`RawBamRecordReader`](crate::reader::RawBamRecordReader) so callers can supply
+/// a multithreaded or read-ahead record source. The `Result` item type is
+/// deliberate: a read failure must stay distinguishable from end-of-stream, since
+/// treating a truncated stream as a clean EOF would report a corrupt file as
+/// correctly sorted.
+///
 /// # Errors
 ///
 /// Returns any I/O error from the underlying record stream.
-pub fn verify_sort_order<R: Read, K>(
-    raw_reader: RawBamRecordReader<R>,
+pub fn verify_sort_order<I, K>(
+    records: I,
     extract_key: impl Fn(&[u8]) -> K,
     is_violation: impl Fn(&K, &K) -> bool,
-) -> Result<VerifySummary> {
+) -> Result<VerifySummary>
+where
+    I: IntoIterator<Item = std::io::Result<RawRecord>>,
+{
     let mut total_records: u64 = 0;
     let mut violations: u64 = 0;
     let mut first_violation: Option<(u64, String)> = None;
     let mut prev_key: Option<K> = None;
 
-    for result in raw_reader {
+    for result in records {
         let record_bytes = result?;
         total_records += 1;
         let bam: &[u8] = &record_bytes;

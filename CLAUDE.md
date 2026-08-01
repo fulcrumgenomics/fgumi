@@ -265,6 +265,124 @@ listed in this section.
 
 ## Benchmarking Notes
 
+### Profiling fgumi: what works, in order
+
+Reach for these in order. The first two answer most questions and need no new
+code; only drop to sampling when you genuinely need per-function attribution.
+
+**1. `tricorder` — core utilization, memory, and I/O.** The fastest way to learn
+whether a command is CPU-bound, I/O-bound, or leaving cores idle:
+
+```sh
+tricorder --interval 0.25 --summary --out agg.tsv --trace trace.tsv -- fgumi <cmd> ...
+# tricorder: wall=23.68s cpu=23.22s mean_load=98% max_rss=20.3MiB io_in=4.5MiB
+```
+
+`mean_load` is the number to read first: **98% means one core busy**, so on a
+12-core box the command is single-threaded regardless of what `--threads` was
+passed. `--trace` gives cores-over-time, which distinguishes "parallel
+throughout" from "parallel phase followed by a serial tail". Note that `io_in`
+collapses to near zero once the input is in page cache — a low `io_in` means the
+run was CPU-bound *on that invocation*, not that the tool does little I/O.
+
+**2. In-tree phase timers — the primary attribution tool.** `fgumi sort` already
+carries `SortPhaseTimer` (`crates/fgumi-sort/src/external.rs`): per-phase `f64`
+accumulators, a `time()` helper wrapping each span, and a `log_summary()` that
+emits `=== Sort Phase Timing ===` at `info!` (read+decompress / in-memory sort /
+spill write / consolidation / k-way merge / write output, each with a percentage).
+Prior campaigns got full baseline phase attribution from this with **zero new
+code** — just `RUST_LOG=info`.
+
+Mirror that pattern when optimizing any other command: the phases you would name
+in a design doc are exactly the phases worth timing, it works identically on
+macOS and Linux, and it cannot be defeated by inlining or missing symbols the way
+a sampling profiler can. Prefer adding a phase timer over fighting a profiler.
+
+**3. `perf record` / `perf stat` on Linux (EC2)** when per-function or
+per-instruction attribution is genuinely required. This is the reliable path for
+function-level work; see the EC2 host recipe in the user-level CLAUDE.md.
+
+#### macOS sampling: pitfalls that produce confidently wrong profiles
+
+`samply` works on macOS but has three traps with this codebase. All three
+silently yield a plausible-looking, wrong profile:
+
+- **The release binary has no symbols.** `[profile.release]` builds get
+  `-C strip=debuginfo`, so everything symbolicates to raw addresses. Use the
+  existing `[profile.profiling]` (inherits release, `debug = "line-tables-only"`),
+  or `CARGO_PROFILE_PROFILING_DEBUG=2` for full DWARF.
+- **Blocked threads are counted as CPU.** samply samples every thread on a timer,
+  including ones parked on a channel or condvar. Counting raw samples credited an
+  idle BGZF worker pool the same CPU as the working thread and made an 18 s run
+  look like 285 s across 21 threads. Weight samples by `threadCPUDelta`
+  (microseconds of real CPU between samples) instead of counting them.
+- **`atos` mis-resolves addresses from other images.** Feeding every sampled
+  address to `atos -o target/profiling/fgumi` resolves `libsystem_kernel` /
+  `libsystem_pthread` / `libsystem_malloc` addresses against the fgumi image,
+  landing on whatever symbol happens to sit at that offset. This is where
+  nonsense like "38% of CPU in `clap_builder::error::Error::print`" on a
+  *successful* run comes from. Map each frame to its library first (Gecko
+  `funcTable.resource` → `resourceTable` → `libs`) and only symbolicate frames
+  belonging to the fgumi image. Under fat LTO, local symbols are gone, so even
+  in-image resolution can land on a neighbouring function — treat any
+  suspiciously hot dependency symbol as misattribution until corroborated.
+
+Corroborate a sampling result against `tricorder` or a phase timer before acting
+on it. In the `compare bams` work, the sampling profile and `tricorder` agreed
+that BGZF decode dominates (~61% self time; `mean_load=98%`), which is what made
+the conclusion trustworthy — not the profile alone.
+
+### `fgumi compare bams` baseline (recorded 2026-08-01, issue #686)
+
+M2 Max (12 core), 20.1M records/file, ~2 GB BAMs, page-cached, `--threads 8`:
+
+| mode | wall | cpu | mean_load | cores busy | peak OS threads | max_rss |
+| --- | --- | --- | --- | --- | --- | --- |
+| `--command sort` (coordinate) | 23.7s | 23.2s | 98% | 0.98 / 12 | **1** | 20.3 MiB |
+| `--command group` | 24.7s | 24.3s | 98% | 0.98 / 12 | **1** | 21.2 MiB |
+| `--command simplex` (content) | 18.3s | 45.1s | 246% | 2.46 / 12 | 21 | 82.5 MiB |
+
+`sort` and `group` ignored `--threads` entirely: the tricorder `--trace`
+`n_threads` column stayed at **1** for the whole run, so the flag created no
+threads at all. `OpenedInput::open` took no thread count, so both inputs were
+decoded on the single main thread.
+
+#### After round 1 (concurrent per-input readers)
+
+`OpenedInput::open_pair` now gives each input its own read-ahead thread and a
+share of the `--threads` BGZF budget. Same host and corpus, interleaved arms with
+the page cache warmed identically before every run (minimum of 3 reps; the
+outliers are all slower, i.e. contention):
+
+| mode | baseline | round 1 | speedup |
+| --- | --- | --- | --- |
+| `--command sort` | 23.44s | 8.93s | 2.6x |
+| `--command group` | 24.36s | 9.92s | 2.5x |
+
+`mean_load` rises 98% → 370% and peak threads 1 → 13.
+
+**The win is from overlap, not from `--threads`.** Thread scaling is flat —
+`-t 1` 8.64s, `-t 2` 8.47s, `-t 4` 8.97s, `-t 8` 8.89s — because the single
+comparison thread is now the critical path. At `-t 1`: wall 8.67s, cpu 24.65s
+(2.84 cores); if the compare thread is saturated it accounts for 8.67s and the
+two readers share the remaining 15.98s, i.e. ~8.0s each. Per-file decode (~8.0s)
+and comparison (~8.7s) are balanced, with comparison the marginally longer leg,
+so adding BGZF workers cannot help until the comparison thread does less work.
+
+For reference, `fgumi sort` over the same data at `--threads 8` is 8.82s, so
+`compare --command sort` went from 2.7x slower than the sort it validates to
+roughly par (8.93s vs 8.82s) — close but not yet strictly faster, which is what
+issue #686 asks for. Closing it requires cutting comparison-thread work
+(`content_key_exact`'s per-record allocation in `RunCanceller::observe`), after
+which the already-wired BGZF parallelism should begin to matter. Sampling attributes ~55%
+of that single thread to `libdeflate_deflate_decompress_ex` and ~6% to
+`fgumi_bgzf::reader::verify_decompression` (the per-block CRC32), i.e. ~61% to
+BGZF decode. `content` reaches only 2.46 cores and additionally traverses each
+input **twice**: `bams.rs` runs `verify_records_in_order` over both paths before
+`positional_compare` reopens and streams them again — four full traversals for a
+comparison needing two. `sort_verify` already avoids this via its `OrderChecked`
+adapter, which folds the order check into the comparison read.
+
 ### samtools sort orders
 `samtools sort` supports `--template-coordinate` for template-coordinate sorting. When benchmarking sort orders:
 - Coordinate: `samtools sort -@ 4 -m 50M input.bam -o output.bam`

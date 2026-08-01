@@ -633,8 +633,13 @@ impl Command for CompareBams {
         // reopening the paths, so `--command sort` and `--command group` accept an
         // input that can only be opened once (a FIFO, a process substitution). See
         // `engines::OpenedInput`.
-        let input1 = OpenedInput::open(&self.bam1)?;
-        let input2 = OpenedInput::open(&self.bam2)?;
+        // `--threads` reaches both inputs' BGZF decoders, and each input reads
+        // ahead on its own thread, so the two decodes overlap each other and the
+        // comparison. Previously both were decoded inline on this thread and the
+        // flag did nothing for `sort`/`grouping` (issue #686). `content` mode has
+        // always passed `threads` per input this way (`start_raw_batch_reader`),
+        // so the two paths now agree on what the flag means.
+        let (input1, input2) = OpenedInput::open_pair(&self.bam1, &self.bam2, self.threads)?;
         let declared_order = require_compatible_headers(&input1.header, &input2.header)
             .context("input BAM headers are incompatible")?;
 

@@ -40,8 +40,7 @@ const CHANNEL_BUFFER_SIZE: usize = 16;
 
 /// Background reader that reads raw BAM bytes ahead while main thread processes.
 ///
-/// This is similar to [`ReadAheadReader`] but yields [`RawRecord`] (raw bytes)
-/// instead of `noodles::bam::Record`. This enables:
+/// Yields [`RawRecord`] (raw bytes) instead of `noodles::bam::Record`. This enables:
 /// - Zero-copy field extraction using fixed byte offsets
 /// - Direct writes to output without re-encoding
 /// - No dependency on noodles' internal Record representation
@@ -61,6 +60,15 @@ pub struct RawReadAheadReader {
     /// The background thread stores its error here before sending the EOF sentinel,
     /// so callers can retrieve it via `take_error()` after iteration.
     error_slot: std::sync::Arc<std::sync::Mutex<Option<std::io::Error>>>,
+    /// Set once the reader thread's EOF sentinel has been received.
+    ///
+    /// Distinguishes the two ways `recv()` stops yielding records. The reader
+    /// thread sends the sentinel on every exit path it controls — clean EOF and
+    /// read error alike — so a sender dropped *without* one means the thread died
+    /// (a panic), leaving the stream truncated at an arbitrary record. Without
+    /// this flag both collapse to `None`, and a caller that trusts `take_error()`
+    /// reads a partial input as the whole thing.
+    saw_eof: bool,
 }
 
 impl RawReadAheadReader {
@@ -108,6 +116,7 @@ impl RawReadAheadReader {
             current_batch: Vec::new(),
             batch_index: 0,
             error_slot,
+            saw_eof: false,
         }
     }
 
@@ -172,9 +181,30 @@ impl RawReadAheadReader {
         self.error_slot.lock().ok()?.take()
     }
 
+    /// Park an error reporting that the reader thread stopped without reaching EOF.
+    ///
+    /// A real read error is stored by the reader thread itself before it sends the
+    /// sentinel, so an occupied slot always describes the underlying failure more
+    /// precisely than this does and is left alone.
+    fn park_reader_died_error(&self) {
+        if let Ok(mut slot) = self.error_slot.lock()
+            && slot.is_none()
+        {
+            *slot = Some(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "read-ahead reader thread stopped before the end of the input; \
+                 the records read so far are only part of it",
+            ));
+        }
+    }
+
     /// Get the next raw record from the read-ahead buffer.
     ///
     /// Returns `Some(record)` if a record is available, `None` on EOF or error.
+    ///
+    /// A `None` from a stream that never delivered its EOF sentinel parks an error
+    /// for [`take_error`](Self::take_error), so a caller cannot mistake a dead
+    /// reader thread for the end of the input.
     #[inline]
     #[must_use]
     pub fn next_record(&mut self) -> Option<RawRecord> {
@@ -193,7 +223,20 @@ impl RawReadAheadReader {
                 self.batch_index = 1; // We'll return index 0
                 Some(std::mem::take(&mut self.current_batch[0]))
             }
-            Ok(_) | Err(_) => None, // Empty batch = EOF, or channel closed
+            // Empty batch: the reader thread's EOF sentinel, sent on both its clean
+            // and its failing exit path.
+            Ok(_) => {
+                self.saw_eof = true;
+                None
+            }
+            // Channel closed. After the sentinel that is just a second poll of an
+            // exhausted stream; before it, the reader thread died mid-input.
+            Err(_) => {
+                if !self.saw_eof {
+                    self.park_reader_died_error();
+                }
+                None
+            }
         }
     }
 }
@@ -921,6 +964,76 @@ mod tests {
         assert_eq!(borrowed.len(), num, "read-ahead should yield exactly {num} records");
         assert_eq!(borrowed, owned, "borrowed and owned read-ahead iteration must agree");
         assert!(borrowed_source.take_error().is_none(), "clean EOF must not report an error");
+    }
+
+    /// A sender dropped without the EOF sentinel is a dead reader thread, not the
+    /// end of the input, and must not read as a clean EOF.
+    ///
+    /// The reader thread sends the sentinel on both exit paths it controls, so the
+    /// only way the channel closes without one is a panic — after which the batches
+    /// already sent are an arbitrary prefix of the input. `take_error()` returning
+    /// `None` there would let `CheckedRecords` report clean EOF, and a comparison
+    /// would call two inputs identical having read only part of one.
+    ///
+    /// The channel is driven directly rather than through a panicking reader: the
+    /// state under test is the receiver's, and a real panic would only add noise to
+    /// the test output.
+    #[test]
+    fn test_read_ahead_reports_a_reader_thread_that_died_before_eof() {
+        let (tx, rx) = bounded::<Vec<RawRecord>>(4);
+        tx.send(vec![raw_record_from(&[1u8; 8])]).expect("send one batch");
+        drop(tx); // The thread died here: no EOF sentinel follows.
+
+        let mut reader = RawReadAheadReader {
+            receiver: Some(rx),
+            handle: None,
+            current_batch: Vec::new(),
+            batch_index: 0,
+            error_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            saw_eof: false,
+        };
+
+        let seen: Vec<RawRecord> = std::iter::from_fn(|| reader.next()).collect();
+
+        assert_eq!(seen.len(), 1, "the batch already sent must still be yielded");
+        let err = reader.take_error().expect("a disconnect before EOF must park an error");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "a truncated stream is an unexpected EOF, got: {err}"
+        );
+    }
+
+    /// The sentinel ends the stream cleanly, and polling an already-ended stream
+    /// again must not manufacture the error above.
+    ///
+    /// Iterators are polled past their end routinely — `Iterator::count` and
+    /// `for` both do — and the channel is closed by then, so the disconnect arm
+    /// has to tell "closed after the sentinel" from "closed instead of it".
+    #[test]
+    fn test_read_ahead_polled_past_the_eof_sentinel_reports_no_error() {
+        let (tx, rx) = bounded::<Vec<RawRecord>>(4);
+        tx.send(vec![raw_record_from(&[1u8; 8])]).expect("send one batch");
+        tx.send(Vec::new()).expect("send the EOF sentinel");
+        drop(tx);
+
+        let mut reader = RawReadAheadReader {
+            receiver: Some(rx),
+            handle: None,
+            current_batch: Vec::new(),
+            batch_index: 0,
+            error_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            saw_eof: false,
+        };
+
+        let seen: Vec<RawRecord> = std::iter::from_fn(|| reader.next()).collect();
+        assert_eq!(seen.len(), 1, "one record precedes the sentinel");
+        assert!(reader.next().is_none(), "an ended stream keeps returning None");
+
+        assert!(
+            reader.take_error().is_none(),
+            "a stream that delivered its sentinel ended cleanly, however often it is polled"
+        );
     }
 
     #[test]

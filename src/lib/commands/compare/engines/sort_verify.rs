@@ -47,15 +47,15 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use fgumi_raw_bam::{RawRecord, RawRecordView};
 use fgumi_sort::{
-    LibraryLookup, OwnedRawBamRecordReader, QuerynameComparator, RawQuerynameKey,
-    RawQuerynameLexKey, RawSortKey, SortContext, SortOrder, TemplateKey, cb_hasher,
-    extract_coordinate_key_inline, extract_template_key_inline, verify_sort_order,
+    LibraryLookup, QuerynameComparator, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
+    SortContext, SortOrder, TemplateKey, cb_hasher, extract_coordinate_key_inline,
+    extract_template_key_inline, verify_sort_order,
 };
 use noodles::sam::Header;
 
 use ahash::AHashMap;
 
-use super::OpenedInput;
+use super::{CheckedRecords, OpenedInput};
 use crate::sam::SamTag;
 
 use super::super::raw_compare::content_key_exact;
@@ -288,7 +288,7 @@ where
     ExtractKey: Fn(&[u8]) -> K,
     IsViolation: Fn(&K, &K) -> bool,
 {
-    reader: OwnedRawBamRecordReader,
+    reader: CheckedRecords,
     extract_key: &'a ExtractKey,
     tracker: OrderTracker<'a, K, IsViolation>,
 }
@@ -300,7 +300,7 @@ where
     IsViolation: Fn(&K, &K) -> bool,
 {
     fn new(
-        reader: OwnedRawBamRecordReader,
+        reader: CheckedRecords,
         extract_key: &'a ExtractKey,
         is_violation: &'a IsViolation,
     ) -> Self {
@@ -736,9 +736,9 @@ where
 {
     /// Record reader over the first input, already past its header. Carried rather
     /// than the path so the input is opened exactly once — see [`OpenedInput`].
-    reader1: OwnedRawBamRecordReader,
+    reader1: CheckedRecords,
     /// Record reader over the second input, already past its header.
-    reader2: OwnedRawBamRecordReader,
+    reader2: CheckedRecords,
     extract_key: ExtractKey,
     is_violation: IsViolation,
     same_core: SameCore,
