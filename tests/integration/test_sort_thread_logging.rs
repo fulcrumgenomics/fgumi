@@ -1,8 +1,11 @@
-//! Integration tests for the thread counts `fgumi sort` reports.
+//! Integration tests for what `fgumi sort` reports about its thread counts and
+//! the memory budget they scale.
 //!
 //! `--sort-threads` and `--merge-threads` each default to `--threads`, so the
 //! flag alone does not describe a run that set only the per-phase overrides.
-//! These tests pin the reported counts to the ones the phases actually use.
+//! These tests pin the reported counts to the ones the phases actually use, and
+//! pin the reported per-thread memory budget to the sort-phase count that fills
+//! the buffer.
 
 use rstest::rstest;
 use std::fmt::Write as _;
@@ -85,4 +88,51 @@ fn reported_thread_counts_match_the_phases(#[case] extra_args: &[&str], #[case] 
     for counts in &reported {
         assert_eq!(counts, expected, "misreported thread counts:\n{stderr}");
     }
+}
+
+/// The `Max memory:` line names the multiplier the budget resolved with.
+///
+/// * `sort_threads_above_threads` — `--sort-threads 8` with `--threads` unset
+///   used to report (and resolve) a one-thread budget while sorting with eight.
+/// * `sort_threads_below_threads` — lowering only the sort phase is the
+///   documented way to cede cores to an upstream producer, and must not shrink
+///   the budget `--threads` already earned.
+///
+/// This pins the *reported* multiplier only. The line is printed from the same
+/// local that feeds `resolve_memory_budget`, so it cannot tell a correctly wired
+/// budget from one that logs the sort-phase count and resolves `--threads`; the
+/// resolved byte count is pinned independently by the unit test
+/// `test_memory_budget_threads_resolves_the_scaled_budget`.
+///
+/// `expected_multiplier` also pins the flag the line attributes the count to,
+/// and is asserted separately from `expected_line` because the total goes
+/// through `bytesize`'s `Display`: pinning only the fully rendered line would
+/// report "the budget did not scale" for a rounding or unit-style change in that
+/// crate.
+#[rstest]
+#[case::sort_threads_above_threads(
+    &["--max-memory", "100M", "--sort-threads", "8"],
+    "MiB/thread x 8 threads, from --sort-threads)",
+    "Max memory: 762.9 MiB (95.4 MiB/thread x 8 threads, from --sort-threads)"
+)]
+#[case::sort_threads_below_threads(
+    &["--max-memory", "100M", "--threads", "4", "--sort-threads", "2"],
+    "MiB/thread x 4 threads, from --threads)",
+    "Max memory: 381.5 MiB (95.4 MiB/thread x 4 threads, from --threads)"
+)]
+fn reported_memory_budget_scales_by_the_sort_phase(
+    #[case] extra_args: &[&str],
+    #[case] expected_multiplier: &str,
+    #[case] expected_line: &str,
+) {
+    let stderr = sort_and_capture_logs(extra_args);
+
+    assert!(
+        stderr.contains(expected_multiplier),
+        "budget did not scale by the sort-phase count:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(expected_line),
+        "unexpected rendering of the budget (bytesize formatting change?):\n{stderr}"
+    );
 }
