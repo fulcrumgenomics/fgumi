@@ -243,11 +243,21 @@ Seven `#[allow(unsafe_code)]` sites: the two public dispatch functions
 
 Note that Miri cannot execute these intrinsics, so `miri.yml` does not cover
 this crate. Correctness rests instead on the scalar-parity tests in `lexer.rs`,
-which assert the SIMD and scalar lexers agree:
-`test_simd_matches_scalar_newlines`, `test_simd_full_matches_scalar_all_fields`,
-`test_simd_full_matches_scalar_all_acgt`, and
-`test_simd_full_matches_scalar_every_position`. Any change to the intrinsic
-paths must keep these passing on both architectures.
+which assert the SIMD and scalar lexers agree. Fixed inputs pin specific shapes
+(`test_simd_matches_scalar_newlines`, `test_simd_full_matches_scalar_all_fields`,
+`test_simd_full_matches_scalar_all_acgt`,
+`test_simd_full_matches_scalar_every_position`), and `proptest` sweeps cover
+arbitrary lane combinations (`simd_newlines_match_scalar_on_arbitrary_blocks`,
+`simd_full_matches_scalar_on_arbitrary_blocks`,
+`newline_fast_path_matches_full_classifier`,
+`simd_matches_scalar_on_uniform_random_blocks`). Any change to the intrinsic
+paths must keep these passing on both architectures — note that a dev machine
+runs only one of the two, so the other is verified in CI.
+
+The sweeps compare `two_bits` only on lanes where `is_acgt` is set. That is the
+contract rather than a weakened assertion: `ENCODE_LUT` maps non-ACGT bytes to a
+don't-care value, which the SIMD paths write through unconditionally while the
+scalar path leaves those lanes zero.
 
 Any new `unsafe` site must extend this list and explain why the safe
 alternative is unacceptable. Do not introduce `unsafe` outside the crates
