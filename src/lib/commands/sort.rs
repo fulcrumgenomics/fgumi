@@ -264,8 +264,10 @@ pub struct Sort {
 
     /// Scale memory limit by thread count (samtools behavior).
     ///
-    /// When enabled (default), --max-memory specifies memory per thread.
-    /// Total memory = `max_memory` × threads. Disable for fixed total memory.
+    /// When enabled (default), --max-memory specifies memory per thread. Total
+    /// memory = `max_memory` × the larger of --threads and --sort-threads, since
+    /// the sort phase is what fills the in-memory buffer. Disable for fixed total
+    /// memory.
     #[arg(long = "memory-per-thread", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub memory_per_thread: bool,
 
@@ -289,9 +291,10 @@ pub struct Sort {
     /// Used for parallel sorting of in-memory chunks and parallel temp-chunk
     /// (BGZF or zstd) compression.
     ///
-    /// This is also the multiplier for `--max-memory --memory-per-thread`: the
-    /// sort runs on one global memory budget, so `--sort-threads` and
-    /// `--merge-threads` change scheduling only and never resize it.
+    /// This is also the floor for the `--max-memory --memory-per-thread`
+    /// multiplier: the sort runs on one global memory budget, sized by the larger
+    /// of this and `--sort-threads` (the phase that fills the buffer).
+    /// `--merge-threads` changes scheduling only and never resizes it.
     #[arg(short = '@', short_alias = 't', long = "threads", default_value = "1")]
     pub threads: usize,
 
@@ -303,8 +306,10 @@ pub struct Sort {
     /// still uses 8 because it cannot start until the input is exhausted, by
     /// which point the producer has finished writing.
     ///
-    /// This only changes scheduling; the output is byte-identical, and the
-    /// memory budget stays sized from `--threads`.
+    /// The output is byte-identical, but this is not purely a scheduling knob:
+    /// with --memory-per-thread enabled (default) the budget scales by the larger
+    /// of --threads and --sort-threads, so raising this above --threads raises
+    /// total memory by the same factor.
     #[arg(long = "sort-threads")]
     pub sort_threads: Option<usize>,
 
@@ -469,6 +474,60 @@ impl Command for Sort {
 }
 
 impl Sort {
+    /// Thread count that `--memory-per-thread` multiplies `--max-memory` by.
+    ///
+    /// The budget sizes the in-memory accumulation buffer, which the sort phase
+    /// fills, so `--sort-threads` is the count that should drive it. It is
+    /// combined with `--threads` rather than replacing it: lowering only the sort
+    /// phase (`-@ 32 --sort-threads 4`) is the documented way to cede cores to an
+    /// upstream producer, and letting that shrink the buffer 8x would turn a
+    /// scheduling hint into a throughput cliff. Taking the larger of the two
+    /// raises the budget when the sort phase is the wider one -- the case where
+    /// `--threads` alone under-counts -- and never lowers it.
+    fn memory_budget_threads(&self) -> usize {
+        // `--threads 0` has to keep reaching `resolve_memory_budget`'s rejection
+        // rather than being clamped up here.
+        if self.threads == 0 {
+            return 0;
+        }
+        // `unwrap_or(0)` leaves `--threads` as the floor when the override is
+        // unset, or is itself 0 (which the engine clamps to one worker).
+        self.threads.max(self.sort_threads.unwrap_or(0))
+    }
+
+    /// The flag [`memory_budget_threads`](Self::memory_budget_threads) took its
+    /// count from, for the `Max memory:` log line.
+    ///
+    /// `--threads` is the floor, so it is the source unless `--sort-threads` was
+    /// set strictly above it. Reported so that line and the per-phase `Threads:`
+    /// line below it cannot be read as disagreeing.
+    fn memory_budget_threads_flag(&self) -> &'static str {
+        if self.sort_threads.is_some_and(|n| n > self.threads) {
+            "--sort-threads"
+        } else {
+            "--threads"
+        }
+    }
+
+    /// Initial buffer pre-allocation for `--max-memory auto`, in bytes.
+    ///
+    /// Capped at 768 MiB per budget thread (matching the samtools default) so an
+    /// `auto` budget on a large host doesn't allocate the whole budget upfront;
+    /// the buffer still grows on demand up to `effective_memory`. Scales by
+    /// [`memory_budget_threads`](Self::memory_budget_threads) for the same reason
+    /// the budget does — the sort phase is what fills the buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the per-thread product overflows `usize`.
+    fn auto_initial_capacity(&self, effective_memory: usize) -> Result<usize> {
+        let init = 768_usize
+            .checked_mul(1024 * 1024)
+            .and_then(|b| b.checked_mul(self.memory_budget_threads()))
+            .ok_or_else(|| anyhow::anyhow!("initial auto buffer size overflowed"))?;
+        Ok(effective_memory.min(init))
+    }
+
     /// Construct the sorter from this command's options.
     ///
     /// Extracted from `execute` so the option-to-builder wiring is testable on
@@ -530,10 +589,11 @@ impl Sort {
         let timer = OperationTimer::new("Sorting BAM");
 
         // Resolve memory limit (auto-detect or fixed)
+        let budget_threads = self.memory_budget_threads();
         let effective_memory = resolve_memory_budget(
             self.max_memory,
             self.memory_reserve,
-            self.threads,
+            budget_threads,
             self.memory_per_thread,
         )?;
 
@@ -553,15 +613,17 @@ impl Sort {
         }
         if let MemoryLimit::Fixed(per_thread) = self.max_memory {
             if self.memory_per_thread {
-                // The multiplier is `--threads`, not the per-phase counts logged
-                // below: `resolve_memory_budget` sizes one global budget for the
-                // whole run, so `--sort-threads`/`--merge-threads` do not change
-                // it. Name the flag so the two lines cannot be read as disagreeing.
+                // `resolve_memory_budget` sizes one global budget for the whole
+                // run, and the multiplier is the larger of `--threads` and
+                // `--sort-threads` -- never `--merge-threads`. Name the flag it
+                // came from so this line and the per-phase counts logged below
+                // cannot be read as disagreeing.
                 info!(
-                    "Max memory: {} ({}/thread x {} threads, from --threads)",
+                    "Max memory: {} ({}/thread x {} threads, from {})",
                     ByteSize(effective_memory as u64),
                     ByteSize(per_thread as u64),
-                    self.threads
+                    budget_threads,
+                    self.memory_budget_threads_flag()
                 );
             } else {
                 info!("Max memory: {} (fixed)", ByteSize(effective_memory as u64));
@@ -593,11 +655,7 @@ impl Sort {
         // (matching samtools default) to avoid huge upfront allocations.
         // The buffer will grow on demand up to memory_limit.
         if matches!(self.max_memory, MemoryLimit::Auto) {
-            let init = 768_usize
-                .checked_mul(1024 * 1024)
-                .and_then(|b| b.checked_mul(self.threads))
-                .ok_or_else(|| anyhow::anyhow!("initial auto buffer size overflowed"))?;
-            sorter = sorter.initial_capacity(effective_memory.min(init));
+            sorter = sorter.initial_capacity(self.auto_initial_capacity(effective_memory)?);
         }
 
         if let Some(ct) = cell_tag {
@@ -962,6 +1020,157 @@ mod tests {
         let sorter = sort.build_sorter(512 * 1024 * 1024, "fgumi sort (test)");
         assert_eq!(sorter.phase1_threads(), expected_phase1);
         assert_eq!(sorter.phase2_threads(), expected_phase2);
+    }
+
+    /// The per-thread budget sizes the buffer the sort phase fills, so it follows
+    /// `--sort-threads` upward. `--sort-threads 8` with `--threads` unset used to
+    /// resolve a one-thread budget for an eight-thread sort.
+    ///
+    /// It never follows `--sort-threads` downward: `-@ 32 --sort-threads 4` is the
+    /// documented way to cede cores to an upstream producer, and must keep the
+    /// 32-thread budget it resolves today.
+    #[rstest]
+    #[case::defaults(1, None, 1)]
+    #[case::threads_only(4, None, 4)]
+    #[case::sort_above_threads(1, Some(8), 8)]
+    #[case::sort_below_threads(32, Some(4), 32)]
+    #[case::sort_equals_threads(4, Some(4), 4)]
+    #[case::zero_sort_override_keeps_threads(4, Some(0), 4)]
+    #[case::zero_threads_is_not_clamped(0, Some(8), 0)]
+    fn test_memory_budget_threads(
+        #[case] threads: usize,
+        #[case] sort_threads: Option<usize>,
+        #[case] expected: usize,
+    ) {
+        let mut sort = make_sort(SortOrderArg::Coordinate);
+        sort.threads = threads;
+        sort.sort_threads = sort_threads;
+
+        assert_eq!(sort.memory_budget_threads(), expected);
+    }
+
+    /// `memory_budget_threads` re-derives the sort-phase fallback that the engine
+    /// owns (the budget is needed before the sorter exists, so it cannot read
+    /// `phase1_threads` off it). Keep the two definitions in agreement.
+    ///
+    /// `expected_phase1` is spelled out per case rather than read back off the
+    /// sorter: asserting `threads.max(sorter.phase1_threads())` would re-apply the
+    /// implementation's own `max` and so could not detect an engine fallback that
+    /// resolves *below* `--threads`, which is the drift this test exists to catch.
+    ///
+    /// The two definitions intentionally diverge at `threads == 0`:
+    /// `memory_budget_threads` returns 0 so `resolve_memory_budget` can reject it,
+    /// while `phase1_threads` clamps to one worker. That case is covered by
+    /// `test_memory_budget_threads` and is excluded here.
+    #[rstest]
+    #[case::defaults(2, None, 2)]
+    #[case::sort_above_threads(1, Some(8), 8)]
+    #[case::sort_below_threads(32, Some(4), 4)]
+    #[case::zero_sort_override(4, Some(0), 1)]
+    fn test_memory_budget_threads_agrees_with_the_sorters_sort_phase(
+        #[case] threads: usize,
+        #[case] sort_threads: Option<usize>,
+        #[case] expected_phase1: usize,
+    ) {
+        let mut sort = make_sort(SortOrderArg::Coordinate);
+        sort.threads = threads;
+        sort.sort_threads = sort_threads;
+
+        let sorter = sort.build_sorter(512 * 1024 * 1024, "fgumi sort (test)");
+        assert_eq!(sorter.phase1_threads(), expected_phase1, "engine sort-phase fallback drifted");
+        assert_eq!(sort.memory_budget_threads(), threads.max(expected_phase1));
+    }
+
+    /// The `Max memory:` line names whichever flag supplied the multiplier.
+    ///
+    /// `--threads` is the floor, so it stays the attributed source whenever it
+    /// ties or wins — including the `--sort-threads 0` case the engine clamps.
+    #[rstest]
+    #[case::defaults(1, None, "--threads")]
+    #[case::threads_only(4, None, "--threads")]
+    #[case::sort_above_threads(1, Some(8), "--sort-threads")]
+    #[case::sort_below_threads(32, Some(4), "--threads")]
+    #[case::sort_equals_threads(4, Some(4), "--threads")]
+    #[case::zero_sort_override(4, Some(0), "--threads")]
+    fn test_memory_budget_threads_flag(
+        #[case] threads: usize,
+        #[case] sort_threads: Option<usize>,
+        #[case] expected: &str,
+    ) {
+        let mut sort = make_sort(SortOrderArg::Coordinate);
+        sort.threads = threads;
+        sort.sort_threads = sort_threads;
+
+        assert_eq!(sort.memory_budget_threads_flag(), expected);
+    }
+
+    /// The budget the sort-phase count actually resolves to, end to end through
+    /// `resolve_memory_budget`.
+    ///
+    /// The `Max memory:` log line is printed from the same local that feeds
+    /// `resolve_memory_budget`, so the integration tests that assert on it cannot
+    /// tell a correctly wired budget from one that logs `budget_threads` and
+    /// resolves `self.threads`. This pins the resolved byte count instead.
+    #[rstest]
+    #[case::sort_above_threads(1, Some(8), 800_000_000)]
+    #[case::sort_below_threads(4, Some(2), 400_000_000)]
+    #[case::threads_only(4, None, 400_000_000)]
+    #[case::zero_sort_override_keeps_threads(4, Some(0), 400_000_000)]
+    fn test_memory_budget_threads_resolves_the_scaled_budget(
+        #[case] threads: usize,
+        #[case] sort_threads: Option<usize>,
+        #[case] expected_bytes: usize,
+    ) {
+        let mut sort = make_sort(SortOrderArg::Coordinate);
+        sort.threads = threads;
+        sort.sort_threads = sort_threads;
+
+        let resolved = resolve_memory_budget(
+            MemoryLimit::Fixed(100_000_000),
+            MemoryReserve::Auto,
+            sort.memory_budget_threads(),
+            true,
+        )
+        .expect("budget should resolve");
+
+        assert_eq!(resolved, expected_bytes);
+    }
+
+    /// `--max-memory auto` pre-allocates 768 MiB per budget thread, so it follows
+    /// `--sort-threads` upward exactly as the budget does, and never exceeds the
+    /// resolved budget.
+    #[rstest]
+    #[case::sort_above_threads(1, Some(8), usize::MAX, 8 * 768 * 1024 * 1024)]
+    #[case::sort_below_threads(4, Some(2), usize::MAX, 4 * 768 * 1024 * 1024)]
+    #[case::threads_only(2, None, usize::MAX, 2 * 768 * 1024 * 1024)]
+    #[case::capped_by_effective_memory(8, Some(16), 1024, 1024)]
+    fn test_auto_initial_capacity(
+        #[case] threads: usize,
+        #[case] sort_threads: Option<usize>,
+        #[case] effective_memory: usize,
+        #[case] expected: usize,
+    ) {
+        let mut sort = make_sort(SortOrderArg::Coordinate);
+        sort.threads = threads;
+        sort.sort_threads = sort_threads;
+
+        assert_eq!(
+            sort.auto_initial_capacity(effective_memory).expect("capacity should resolve"),
+            expected
+        );
+    }
+
+    /// The per-thread product is checked, not wrapped.
+    #[test]
+    fn test_auto_initial_capacity_rejects_overflow() {
+        let mut sort = make_sort(SortOrderArg::Coordinate);
+        sort.threads = usize::MAX;
+
+        let err = sort.auto_initial_capacity(usize::MAX).expect_err("should overflow");
+        assert!(
+            err.to_string().contains("initial auto buffer size overflowed"),
+            "unexpected error: {err}"
+        );
     }
 
     /// `--max-temp-files` parses onto the struct and defaults to `None` (the
