@@ -8,6 +8,12 @@ This guide walks through a basic fgumi workflow from FASTQ files to filtered con
 - A reference genome FASTA (with BWA index)
 - Paired-end FASTQ files with UMI sequences
 
+## Boolean flags
+
+Flags that help renders as `[<true|false>]` take an optional value. Given with no value they mean `true`, so `--write-index` and `--write-index true` are the same. They accept `true`, `t`, `yes`, `y`, `on`, and `1` for true; `false`, `f`, `no`, `n`, `off`, and `0` for false; and any capitalization of those. Anything else is rejected.
+
+The placeholder names only `true|false` because spelling out all twelve in every help line would be unreadable — the other spellings are accepted but not advertised per flag.
+
 ## Basic Workflow
 
 ### 1. Extract UMIs from FASTQ
