@@ -92,6 +92,21 @@ fn should_spill_chunk(memory_used: usize, memory_limit: usize, chunk_records: us
     memory_used >= memory_limit || chunk_records >= MAX_CHUNK_RECORDS
 }
 
+/// Render the effective per-phase worker counts for a log line.
+///
+/// Collapses to a single number when the phases agree (the common case, where
+/// neither `--sort-threads` nor `--merge-threads` was overridden) and spells
+/// both out otherwise. Shared by the engine's end-of-run summary and the `sort`
+/// command's config dump so the two emitters cannot drift.
+#[must_use]
+pub fn format_thread_counts(sort_threads: usize, merge_threads: usize) -> String {
+    if sort_threads == merge_threads {
+        format!("{sort_threads}")
+    } else {
+        format!("sort {sort_threads}, merge {merge_threads}")
+    }
+}
+
 // ============================================================================
 // Per-Phase Timing for Sort Pipeline
 // ============================================================================
@@ -202,8 +217,13 @@ impl SortPhaseTimer {
     }
 
     /// Log the final summary.
+    ///
+    /// `sort_threads` and `merge_threads` are the *effective* per-phase worker
+    /// counts ([`RawExternalSorter::phase1_threads`] /
+    /// [`RawExternalSorter::phase2_threads`]), not the configured `threads`
+    /// they default from — the summary reports what the phases ran with.
     #[allow(clippy::cast_precision_loss)]
-    fn log_summary(&self, threads: usize) {
+    fn log_summary(&self, sort_threads: usize, merge_threads: usize) {
         let overall = self.overall_start.map_or(0.0, |s| s.elapsed().as_secs_f64());
         // Guard against division by zero when sort completes in negligible time.
         let overall_nonzero = if overall > 0.0 { overall } else { f64::EPSILON };
@@ -239,7 +259,7 @@ impl SortPhaseTimer {
             info!("  Write output:      {write_secs:.1}s ({write_pct:.0}%)");
         }
         info!("  Total wall clock:  {overall:.1}s");
-        info!("  Threads: {threads}");
+        info!("  Threads: {}", format_thread_counts(sort_threads, merge_threads));
         info!("=========================");
     }
 }
@@ -2205,7 +2225,7 @@ impl RawExternalSorter {
         debug!("Starting raw-bytes sort with order: {:?}", self.sort_order);
         debug!("Memory limit: {} MB", self.memory_limit / (1024 * 1024));
         debug!(
-            "Threads: {} (phase 1: {}, phase 2: {})",
+            "Threads: {} (default for both phases; phase 1: {}, phase 2: {})",
             self.threads,
             self.phase1_threads(),
             self.phase2_threads()
@@ -2657,7 +2677,7 @@ impl RawExternalSorter {
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
-        timer.log_summary(self.threads);
+        timer.log_summary(self.phase1_threads(), self.phase2_threads());
         debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -2848,7 +2868,7 @@ impl RawExternalSorter {
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
-        timer.log_summary(self.threads);
+        timer.log_summary(self.phase1_threads(), self.phase2_threads());
         debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -3118,7 +3138,7 @@ impl RawExternalSorter {
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
-        timer.log_summary(self.threads);
+        timer.log_summary(self.phase1_threads(), self.phase2_threads());
         debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -3443,7 +3463,7 @@ impl RawExternalSorter {
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
-        timer.log_summary(self.threads);
+        timer.log_summary(self.phase1_threads(), self.phase2_threads());
         debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -6373,7 +6393,7 @@ mod tests {
         assert!(timer.write_output_secs >= 0.0);
 
         // log_summary must not panic (output goes to log sink)
-        timer.log_summary(4);
+        timer.log_summary(4, 4);
     }
 
     // ========================================================================
