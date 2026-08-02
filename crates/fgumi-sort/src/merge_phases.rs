@@ -76,8 +76,14 @@ pub(crate) struct MergePhaseCounters {
     pub(crate) read: ComponentCounter,
     /// Decompressing spill blocks (BGZF or zstd, whichever the spill used).
     pub(crate) decompress: ComponentCounter,
-    /// Compressing output blocks (BGZF at `--compression-level`).
-    pub(crate) compress: ComponentCounter,
+    /// Compressing OUTPUT blocks (BGZF at `--compression-level`), during the
+    /// merge.
+    pub(crate) output_compress: ComponentCounter,
+    /// Compressing SPILL blocks during Phase 1. Counted separately because the
+    /// same worker step serves both targets: lumping them together attributes
+    /// Phase 1's spill compression to the merge, which overstates the merge's
+    /// compression cost by however much was spilled.
+    pub(crate) spill_compress: ComponentCounter,
 }
 
 /// A read-only view of the counters, for logging.
@@ -88,7 +94,10 @@ pub struct MergePhaseBreakdown {
     /// Busy seconds spent decompressing spill blocks, and block count.
     pub decompress: (f64, u64),
     /// Busy seconds spent compressing output blocks, and block count.
-    pub compress: (f64, u64),
+    pub output_compress: (f64, u64),
+    /// Busy seconds spent compressing Phase 1 spill blocks, and block count.
+    /// Not part of the merge -- reported for context, excluded from merge totals.
+    pub spill_compress: (f64, u64),
 }
 
 impl MergePhaseCounters {
@@ -96,26 +105,45 @@ impl MergePhaseCounters {
         MergePhaseBreakdown {
             read: self.read.snapshot(),
             decompress: self.decompress.snapshot(),
-            compress: self.compress.snapshot(),
+            output_compress: self.output_compress.snapshot(),
+            spill_compress: self.spill_compress.snapshot(),
         }
     }
 }
 
 impl MergePhaseBreakdown {
-    /// Total busy seconds across all four components.
+    /// Total worker busy seconds attributable to the merge.
     ///
-    /// Deliberately *not* comparable to merge wall clock — see the module doc.
-    /// Provided so each component can be expressed as a share of total merge
-    /// effort, which is the comparison that means something.
+    /// Excludes `spill_compress`, which happens in Phase 1. Deliberately *not*
+    /// a partition of merge wall clock — see the module doc — but it is the
+    /// numerator of a meaningful utilization figure: divided by
+    /// `merge_wall * num_workers` it says what fraction of the available worker
+    /// capacity the merge actually used.
     #[must_use]
     pub fn total_busy_secs(self) -> f64 {
-        self.read.0 + self.decompress.0 + self.compress.0
+        self.read.0 + self.decompress.0 + self.output_compress.0
+    }
+
+    /// Fraction of available worker capacity the merge consumed, in `[0, 1]`.
+    ///
+    /// `busy / (wall * workers)`. Well below 1 means workers idled -- the merge
+    /// was bound by something other than worker CPU (the consumer thread, lock
+    /// contention, or I/O latency), and adding compression threads would not
+    /// help. Near 1 means the pool was saturated and worker CPU is the wall.
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "thread counts are small integers; f64 represents them exactly"
+    )]
+    pub fn worker_utilization(self, merge_wall_secs: f64, num_workers: usize) -> Option<f64> {
+        let capacity = merge_wall_secs * num_workers as f64;
+        (capacity > 0.0).then(|| self.total_busy_secs() / capacity)
     }
 
     /// Whether anything was recorded, so a sort that never merged stays silent.
     #[must_use]
     pub fn is_empty(self) -> bool {
-        self.read.1 == 0 && self.decompress.1 == 0 && self.compress.1 == 0
+        self.read.1 == 0 && self.decompress.1 == 0 && self.output_compress.1 == 0
     }
 }
 

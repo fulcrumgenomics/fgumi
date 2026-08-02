@@ -1883,11 +1883,19 @@ impl SortWorkerPool {
         // Destructured so the BGZF compressor and the zstd one are borrowed as
         // disjoint fields rather than through `worker` twice.
         let SortWorkerState { compressor, output_compressor, zstd_compressor, .. } = worker;
+        let target = job.target;
         let bgzf_compressor = match job.target {
             CompressTarget::Spill => compressor,
             CompressTarget::Output => output_compressor,
         };
-        shared.merge_phases.compress.time(|| {
+        // Attributed by target, not lumped: this one step compresses both Phase 1
+        // spill blocks and merge output blocks, so a single counter would charge
+        // spill compression to the merge.
+        let counter = match target {
+            CompressTarget::Spill => &shared.merge_phases.spill_compress,
+            CompressTarget::Output => &shared.merge_phases.output_compress,
+        };
+        counter.time(|| {
             Self::handle_compress_job(shared, job, bgzf_compressor, zstd_compressor);
         });
         StepResult::Success

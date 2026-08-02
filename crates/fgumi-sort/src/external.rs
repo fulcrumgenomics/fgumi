@@ -3618,15 +3618,27 @@ impl RawExternalSorter {
             let pct = |secs: f64| if busy > 0.0 { 100.0 * secs / busy } else { 0.0 };
             let (read_s, read_n) = workers.read;
             let (dec_s, dec_n) = workers.decompress;
-            let (comp_s, comp_n) = workers.compress;
-            info!(
-                "  Workers ({} threads; busy time, overlaps the above and itself)",
-                pool.num_workers()
-            );
+            let (comp_s, comp_n) = workers.output_compress;
+            let (spill_s, spill_n) = workers.spill_compress;
+            let workers_n = pool.num_workers();
+            info!("  Workers ({workers_n} threads; busy time, overlaps the above and itself)");
             info!("    Spill disk read:   {read_s:.1}s ({:.0}%) [{read_n} batches]", pct(read_s));
             info!("    Spill decompress:  {dec_s:.1}s ({:.0}%) [{dec_n} blocks]", pct(dec_s));
             info!("    Output compress:   {comp_s:.1}s ({:.0}%) [{comp_n} blocks]", pct(comp_s));
             info!("    Total worker busy: {busy:.1}s  (NOT comparable to loop wall clock)");
+            // Utilization is the thread-efficiency question: well below 100%
+            // means the pool idled, the merge was bound by something other than
+            // worker CPU, and adding compression threads cannot help.
+            if let Some(util) = workers.worker_utilization(loop_total, workers_n) {
+                info!(
+                    "    Worker utilization: {:.0}% of {workers_n} threads x {loop_total:.1}s",
+                    100.0 * util
+                );
+            }
+            // Phase 1 spill compression rides the same worker step, so it is
+            // reported for context but excluded from the merge totals above.
+            info!("  Phase 1 (not part of the merge)");
+            info!("    Spill compress:    {spill_s:.1}s [{spill_n} blocks]");
         }
         info!("==============================");
     }
