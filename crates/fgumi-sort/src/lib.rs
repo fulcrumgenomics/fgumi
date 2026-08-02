@@ -167,7 +167,10 @@ pub use external::{
     KeyTypesSpec, LibraryLookup, RawExternalSorter, cb_hasher, extract_template_key_inline,
     format_thread_counts,
 };
-pub use fd_limit::{FALLBACK_MAX_TEMP_FILES, fits_fd_budget, resolve_temp_file_limit, soft_nofile};
+pub use fd_limit::{
+    FALLBACK_MAX_TEMP_FILES, fits_nofile_budget, resolve_temp_file_limit, soft_nofile,
+    temp_file_limit_from_nofile,
+};
 pub use inline::{
     PackedCoordinateKey, RecordRef, TemplateKey, extract_coordinate_key_inline,
     radix_sort_record_refs, radix_sort_record_refs_with_max,

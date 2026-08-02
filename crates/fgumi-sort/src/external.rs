@@ -2312,10 +2312,28 @@ impl RawExternalSorter {
     /// Returns the message rather than logging it so the threshold and the
     /// wording are assertable without a log capture; `merge_bams` emits it.
     fn fd_budget_warning(num_inputs: usize) -> Option<String> {
-        if crate::fd_limit::fits_fd_budget(num_inputs) {
+        // One reading of the budget answers both questions in the helper.
+        // Reading it per question would let the warning name a budget other
+        // than the one that tripped it.
+        Self::fd_budget_warning_from_nofile(crate::fd_limit::soft_nofile(), num_inputs)
+    }
+
+    /// [`Self::fd_budget_warning`] against a supplied budget rather than the
+    /// process's own.
+    ///
+    /// Split out for the reason `fd_limit::temp_file_limit_from_soft_nofile`
+    /// is: the arithmetic is then testable without the host's real
+    /// `RLIMIT_NOFILE` deciding the answer. Reading it inside made both tests
+    /// host-dependent — the silent case needs a soft limit of at least
+    /// `8 + FD_RESERVE`, so it failed under a `ulimit -n` below 40, and the
+    /// warning case only reached the branch because `usize::MAX` saturates the
+    /// comparison on a 64-bit target. The CLI's own `fd_budget_warning` already
+    /// takes the budget as a parameter; this makes the engine's match.
+    fn fd_budget_warning_from_nofile(soft: Option<u64>, num_inputs: usize) -> Option<String> {
+        if crate::fd_limit::fits_nofile_budget(soft, num_inputs) {
             return None;
         }
-        let budget = crate::fd_limit::soft_nofile().map_or_else(
+        let budget = soft.map_or_else(
             || "unknown".to_string(),
             |soft| soft.saturating_sub(crate::fd_limit::FD_RESERVE).to_string(),
         );
@@ -4708,26 +4726,65 @@ mod tests {
     }
 
     /// An ordinary merge width must not warn — every `fgumi merge` opens a
-    /// handful of inputs, so a warning there would be noise on every run.
-    #[test]
-    fn test_fd_budget_warning_is_silent_for_an_ordinary_merge() {
-        assert_eq!(RawExternalSorter::fd_budget_warning(8), None);
+    /// handful of inputs, so a warning there would be noise on every run —
+    /// while a merge past the budget must carry the two things that make the
+    /// warning actionable: how many inputs are being opened, and the
+    /// `ulimit -n` lever.
+    ///
+    /// The budget is supplied rather than read from the host, so every branch
+    /// is exercised on every target. Reading it made both assertions depend on
+    /// the machine: the silent case needs a soft limit of at least
+    /// `8 + FD_RESERVE` and failed under a `ulimit -n` below 40, and the
+    /// warning case reached its branch only because `usize::MAX` saturates the
+    /// comparison on a 64-bit target.
+    #[rstest]
+    #[case::ordinary_merge_fits(Some(1024), 8, None)]
+    // Exactly at the budget: 64 - FD_RESERVE is 32, and 32 inputs still fit.
+    #[case::exactly_at_the_budget(Some(64), 32, None)]
+    #[case::one_past_the_budget(Some(64), 33, Some(32))]
+    // A budget below the reserve saturates to zero, so any merge overruns it.
+    #[case::budget_below_the_reserve(Some(8), 1, Some(0))]
+    // Nothing to exceed where the limit cannot be read; silent by design.
+    #[case::unreadable_budget_never_warns(None, usize::MAX, None)]
+    fn test_fd_budget_warning_names_the_width_and_the_lever(
+        #[case] soft: Option<u64>,
+        #[case] num_inputs: usize,
+        #[case] expected_budget: Option<u64>,
+    ) {
+        let warning = RawExternalSorter::fd_budget_warning_from_nofile(soft, num_inputs);
+        match expected_budget {
+            None => assert_eq!(warning, None, "a merge within the budget must not warn"),
+            Some(budget) => {
+                let warning = warning.expect("a merge past the budget must warn");
+                assert!(
+                    warning.contains(&num_inputs.to_string()),
+                    "input count missing: {warning}"
+                );
+                assert!(
+                    warning.contains(&format!("budget of about {budget}")),
+                    "warning must name the budget it tripped: {warning}"
+                );
+                assert!(warning.contains("ulimit -n"), "remedy missing: {warning}");
+            }
+        }
     }
 
-    /// A merge wider than any descriptor budget must warn, and the warning has
-    /// to carry the two things that make it actionable: how many inputs are
-    /// being opened, and the `ulimit -n` lever. `usize::MAX` reaches the branch
-    /// regardless of this host's actual limit.
+    /// The production wrapper must be exactly the helper applied to the host's
+    /// own budget — the seam exists to make the arithmetic testable, not to let
+    /// the two paths answer differently.
     ///
-    /// Unix-only: where the descriptor budget cannot be read there is no budget
-    /// to exceed, and `fd_budget_warning` is silent by design.
+    /// Host-independent despite reading the real limit, because both sides read
+    /// the same one: whatever this machine reports, the answers must agree.
     #[test]
-    #[cfg(unix)]
-    fn test_fd_budget_warning_names_the_width_and_the_lever() {
-        let warning = RawExternalSorter::fd_budget_warning(usize::MAX)
-            .expect("a merge of usize::MAX inputs cannot fit any budget");
-        assert!(warning.contains(&usize::MAX.to_string()), "input count missing: {warning}");
-        assert!(warning.contains("ulimit -n"), "remedy missing: {warning}");
+    fn test_fd_budget_warning_reads_the_process_budget() {
+        let soft = crate::fd_limit::soft_nofile();
+        for num_inputs in [1_usize, 8, 1024, usize::MAX] {
+            assert_eq!(
+                RawExternalSorter::fd_budget_warning(num_inputs),
+                RawExternalSorter::fd_budget_warning_from_nofile(soft, num_inputs),
+                "wrapper and helper disagree at {num_inputs} inputs"
+            );
+        }
     }
 
     // ========================================================================
