@@ -69,19 +69,40 @@ reviews:
   suggested_reviewers: false
 
   auto_review:
-    # Review automatically on push; don't review draft PRs. `base_branches: .*`
-    # also auto-reviews PRs whose base is not the default branch (stacked PRs);
-    # without it CodeRabbit posts "auto reviews are disabled on base/target
-    # branches other than the default branch" and skips them.
-    enabled: true
+    # Reviews run on demand only. CodeRabbit's fair-use limit is a per-developer
+    # allowance shared across the whole org, and it counts REQUESTS, not
+    # delivered reviews — so a rejected auto-review costs exactly as much as a
+    # useful one. Auto-review on PR-open (`enabled`) and on every push
+    # (`auto_incremental_review`) both draw on that shared allowance without
+    # anyone asking for them.
+    #
+    # Measured across fulcrumgenomics on 2026-08-01: this repo produced 17 of
+    # the org's 23 "Review limit reached" rejections. Four cooldowns in one
+    # evening (21:14, 22:30, 23:03, 00:04 UTC) were armed by PR-open
+    # auto-reviews on #700/#702/#703/#704 — each arming a ~58-minute ORG-WIDE
+    # cooldown, and each overlapping the last, so the org sat in near-continuous
+    # cooldown and deliberate queued reviews on other repos were starved.
+    # ferro-hgvs, which already disables both settings, absorbed 31 requests the
+    # same day for 6 rejections (19%, vs 74% here). Pausing after the fact
+    # cannot fix this: the PR-open review fires 3-5 minutes before any tooling
+    # can post `@coderabbitai pause`.
+    #
+    # `@coderabbitai review` still works with `enabled: false`, and the
+    # assertive profile and path instructions still apply to those reviews.
+    # `base_branches` is dropped with them: it only widens which base branches
+    # are AUTO-reviewed (stacked PRs), which is moot once auto-review is off —
+    # on-demand reviews reach stacked PRs regardless of base.
+    enabled: false
+    auto_incremental_review: false
     drafts: false
-    base_branches:
-      - ".*"
     # Dependency and release PRs are mechanical: they have not produced an
     # actionable finding here, and `cargo audit` plus the `--locked`
     # feature-combination checks in CI already gate them. Skipping them
     # preserves review quota for PRs that carry logic — this repo runs into
-    # CodeRabbit's fair-use review limit regularly.
+    # CodeRabbit's fair-use review limit regularly. Inert while auto-review is
+    # disabled above (it gates auto-reviews only); kept so the intent survives
+    # if auto-review is ever re-enabled. The tooling that drives our on-demand
+    # reviews filters the same titles today.
     ignore_title_keywords:
       - "chore(deps"
       - "chore: release"
