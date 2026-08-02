@@ -37,7 +37,7 @@ pub const FALLBACK_MAX_TEMP_FILES: usize = 64;
 /// shares one input reader, spill files are written one at a time, and the
 /// temp-directory allocator holds paths rather than descriptors. 32 leaves
 /// substantial headroom over the observed peak.
-const FD_RESERVE: u64 = 32;
+pub(crate) const FD_RESERVE: u64 = 32;
 
 /// Smallest limit worth consolidating at.
 ///
@@ -199,5 +199,13 @@ mod tests {
     #[cfg(unix)]
     fn test_fits_fd_budget_rejects_an_oversized_explicit_limit() {
         assert!(!fits_fd_budget(usize::MAX));
+    }
+
+    /// `fits_fd_budget` is also the merge path's check, where the count is an
+    /// input-file count rather than a spill-file limit. A handful of inputs must
+    /// always pass, or every ordinary `fgumi merge` would warn.
+    #[test]
+    fn test_fits_fd_budget_accepts_an_ordinary_merge_width() {
+        assert!(fits_fd_budget(8));
     }
 }

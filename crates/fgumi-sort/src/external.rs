@@ -42,7 +42,7 @@ use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::create_raw_bam_reader;
 use fgumi_bam_io::{is_stdin_path, is_stdout_path};
 use fgumi_raw_bam::SamTag;
-use log::{debug, info};
+use log::{debug, info, warn};
 use noodles::sam::Header;
 use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
 use noodles_bgzf::io::{
@@ -2294,6 +2294,38 @@ impl RawExternalSorter {
         }
     }
 
+    /// Warn when a merge is about to ask for more descriptors than the process
+    /// has.
+    ///
+    /// A merge opens every input at once, so its descriptor cost is the input
+    /// count — user-controlled, and not bounded by `max_temp_files`, which the
+    /// merge path never consults. Without this the failure surfaces as a bare
+    /// "Too many open files" naming one path, which reads like a problem with
+    /// that file rather than with the size of the merge.
+    ///
+    /// Warns rather than refuses: the reserve is deliberately conservative, so a
+    /// merge slightly over the estimate may still succeed, and refusing it would
+    /// turn a working command into a broken one. The subsequent open fails
+    /// immediately anyway — every reader is opened before any merging starts —
+    /// so nothing long-running is wasted either way.
+    ///
+    /// Returns the message rather than logging it so the threshold and the
+    /// wording are assertable without a log capture; `merge_bams` emits it.
+    fn fd_budget_warning(num_inputs: usize) -> Option<String> {
+        if crate::fd_limit::fits_fd_budget(num_inputs) {
+            return None;
+        }
+        let budget = crate::fd_limit::soft_nofile().map_or_else(
+            || "unknown".to_string(),
+            |soft| soft.saturating_sub(crate::fd_limit::FD_RESERVE).to_string(),
+        );
+        Some(format!(
+            "Merging {num_inputs} inputs opens {num_inputs} files at once, which exceeds this \
+             process's open file budget of about {budget}. Raise it with `ulimit -n`, or merge in \
+             stages, if this fails with \"Too many open files\"."
+        ))
+    }
+
     /// Merge multiple pre-sorted BAM files into a single sorted BAM.
     ///
     /// Each input BAM must already be sorted in the order specified by
@@ -2310,6 +2342,9 @@ impl RawExternalSorter {
         };
 
         debug!("Starting k-way merge of {} BAM files", inputs.len());
+        if let Some(warning) = Self::fd_budget_warning(inputs.len()) {
+            warn!("{warning}");
+        }
 
         let mut readers = Self::open_bam_prefetch_readers(inputs)?;
         let output_header = self.create_output_header(header);
@@ -4670,6 +4705,29 @@ mod tests {
     fn test_raw_sorter_max_temp_files() {
         let sorter = RawExternalSorter::new(SortOrder::Coordinate).max_temp_files(0);
         assert_eq!(sorter.max_temp_files, 0);
+    }
+
+    /// An ordinary merge width must not warn — every `fgumi merge` opens a
+    /// handful of inputs, so a warning there would be noise on every run.
+    #[test]
+    fn test_fd_budget_warning_is_silent_for_an_ordinary_merge() {
+        assert_eq!(RawExternalSorter::fd_budget_warning(8), None);
+    }
+
+    /// A merge wider than any descriptor budget must warn, and the warning has
+    /// to carry the two things that make it actionable: how many inputs are
+    /// being opened, and the `ulimit -n` lever. `usize::MAX` reaches the branch
+    /// regardless of this host's actual limit.
+    ///
+    /// Unix-only: where the descriptor budget cannot be read there is no budget
+    /// to exceed, and `fd_budget_warning` is silent by design.
+    #[test]
+    #[cfg(unix)]
+    fn test_fd_budget_warning_names_the_width_and_the_lever() {
+        let warning = RawExternalSorter::fd_budget_warning(usize::MAX)
+            .expect("a merge of usize::MAX inputs cannot fit any budget");
+        assert!(warning.contains(&usize::MAX.to_string()), "input count missing: {warning}");
+        assert!(warning.contains("ulimit -n"), "remedy missing: {warning}");
     }
 
     // ========================================================================
