@@ -49,7 +49,7 @@ use std::fmt::Write as FmtWrite;
 use std::io::{BufReader, Read};
 use std::io::{Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 use zstd::bulk::{Compressor as ZstdCompressor, Decompressor as ZstdDecompressor};
@@ -713,6 +713,10 @@ pub struct SortWorkerPool {
 /// `push()`/`pop()` only). The compress result channel stays as `crossbeam_channel`
 /// because the I/O writer thread needs blocking `recv()`.
 pub(crate) struct SharedPipelineState {
+    /// Busy-time counters for the four components of the k-way merge. See
+    /// [`crate::merge_phases`] -- these overlap and do not partition wall time.
+    pub(crate) merge_phases: crate::merge_phases::MergePhaseCounters,
+
     /// Current phase: 0=shutdown, 1=Phase1, 2=Phase2, 255=Legacy.
     pub(crate) phase: AtomicU8,
 
@@ -812,6 +816,7 @@ impl SharedPipelineState {
         let compress_queue_cap = num_workers * 4;
 
         Self {
+            merge_phases: crate::merge_phases::MergePhaseCounters::default(),
             phase: AtomicU8::new(phase::LEGACY),
             active_worker_limit: AtomicUsize::new(num_workers),
 
@@ -1671,7 +1676,11 @@ impl SortWorkerPool {
                 let data = match file.codec {
                     SpillCodec::Bgzf => {
                         let raw_block = RawBgzfBlock { data: raw_bytes };
-                        match decompress_block(&raw_block, &mut worker.decompressor) {
+                        match shared
+                            .merge_phases
+                            .decompress
+                            .time(|| decompress_block(&raw_block, &mut worker.decompressor))
+                        {
                             Ok(d) => d,
                             Err(e) => {
                                 log::error!(
@@ -1691,10 +1700,11 @@ impl SortWorkerPool {
                         if worker.zstd_decompress_buf.len() < ZSTD_FRAME_DECOMP_CAP {
                             worker.zstd_decompress_buf.resize(ZSTD_FRAME_DECOMP_CAP, 0);
                         }
-                        match worker
-                            .zstd_decompressor
-                            .decompress_to_buffer(&raw_bytes, &mut worker.zstd_decompress_buf)
-                        {
+                        match shared.merge_phases.decompress.time(|| {
+                            worker
+                                .zstd_decompressor
+                                .decompress_to_buffer(&raw_bytes, &mut worker.zstd_decompress_buf)
+                        }) {
                             Ok(n) => {
                                 // Copy the `n` decompressed bytes (≤ one
                                 // staging-buffer's worth, typically ~65 KB)
@@ -1758,46 +1768,32 @@ impl SortWorkerPool {
                 continue;
             }
 
-            let raw_bytes: Vec<Vec<u8>> = match file.codec {
-                SpillCodec::Bgzf => {
-                    match read_raw_blocks(&mut reader_guard.inner, PHASE2_READ_BATCH) {
-                        Ok(blocks) => blocks.into_iter().map(|b| b.data).collect(),
-                        Err(e) => {
-                            log::error!("I/O error reading chunk file (source {i}): {e}");
-                            shared.chunk_read_error.store(true, Ordering::Release);
-                            file.mark_reader_eof(&mut reader_guard);
-                            drop(reader_guard);
-                            shared.main_thread_handle.unpark();
-                            Self::maybe_mark_all_eof(shared);
-                            worker.phase2_file_cursor = (i + 1) % n;
-                            return StepResult::Success;
-                        }
-                    }
-                }
-                SpillCodec::Zstd => {
-                    match read_raw_zstd_frames(&mut reader_guard.inner, PHASE2_READ_BATCH) {
-                        Ok(frames) => frames,
-                        Err(e) => {
-                            log::error!("I/O error reading zstd chunk file (source {i}): {e}");
-                            shared.chunk_read_error.store(true, Ordering::Release);
-                            file.mark_reader_eof(&mut reader_guard);
-                            drop(reader_guard);
-                            shared.main_thread_handle.unpark();
-                            Self::maybe_mark_all_eof(shared);
-                            worker.phase2_file_cursor = (i + 1) % n;
-                            return StepResult::Success;
-                        }
-                    }
+            // Both codecs read into the same `Vec<Vec<u8>>`, so the read is
+            // dispatched on the codec but the failure is handled once. The two
+            // arms previously carried identical error handling differing only
+            // in one word of the message, which had to be kept in step by hand.
+            let read = match file.codec {
+                SpillCodec::Bgzf => shared
+                    .merge_phases
+                    .read
+                    .time(|| read_raw_blocks(&mut reader_guard.inner, PHASE2_READ_BATCH))
+                    .map(|blocks| blocks.into_iter().map(|b| b.data).collect()),
+                SpillCodec::Zstd => shared
+                    .merge_phases
+                    .read
+                    .time(|| read_raw_zstd_frames(&mut reader_guard.inner, PHASE2_READ_BATCH)),
+            };
+            let raw_bytes: Vec<Vec<u8>> = match read {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    log::error!("I/O error reading {} chunk file (source {i}): {e}", file.codec);
+                    shared.chunk_read_error.store(true, Ordering::Release);
+                    return Self::retire_phase2_source(shared, worker, file, reader_guard, i, n);
                 }
             };
 
             if raw_bytes.is_empty() {
-                file.mark_reader_eof(&mut reader_guard);
-                drop(reader_guard);
-                shared.main_thread_handle.unpark();
-                Self::maybe_mark_all_eof(shared);
-                worker.phase2_file_cursor = (i + 1) % n;
-                return StepResult::Success;
+                return Self::retire_phase2_source(shared, worker, file, reader_guard, i, n);
             }
 
             // Acquire the raw_blocks lock BEFORE releasing the reader lock and
@@ -1891,13 +1887,47 @@ impl SortWorkerPool {
             CompressTarget::Spill => compressor,
             CompressTarget::Output => output_compressor,
         };
-        Self::handle_compress_job(shared, job, bgzf_compressor, zstd_compressor);
+        shared.merge_phases.compress.time(|| {
+            Self::handle_compress_job(shared, job, bgzf_compressor, zstd_compressor);
+        });
         StepResult::Success
     }
 
     // ========================================================================
     // Helper: EOF tracking for Phase 2
     // ========================================================================
+
+    /// Retire a phase-2 source: mark its reader EOF, wake the consumer, and
+    /// advance this worker's cursor past it.
+    ///
+    /// Shared by the two ways a source stops producing — a clean end of file
+    /// and an unreadable chunk — which differ only in whether the caller
+    /// latches `chunk_read_error` before calling. Both must retire the reader
+    /// rather than leave it live: a reader still marked readable is retried by
+    /// every worker forever, and a consumer parked on this source never wakes.
+    ///
+    /// Takes the guard by value so the reader lock is provably released before
+    /// the consumer is unparked; waking it while still holding the lock would
+    /// have it contend for a lock this thread has not dropped yet.
+    ///
+    /// Returns [`StepResult::Success`] because the *step* completed. A read
+    /// failure reaches the consumer through `chunk_read_error`, not through
+    /// this result.
+    fn retire_phase2_source(
+        shared: &SharedPipelineState,
+        worker: &mut SortWorkerState,
+        file: &Phase2FileState,
+        mut reader_guard: MutexGuard<'_, Phase2Reader>,
+        source: usize,
+        num_sources: usize,
+    ) -> StepResult {
+        file.mark_reader_eof(&mut reader_guard);
+        drop(reader_guard);
+        shared.main_thread_handle.unpark();
+        Self::maybe_mark_all_eof(shared);
+        worker.phase2_file_cursor = (source + 1) % num_sources;
+        StepResult::Success
+    }
 
     /// Check if all sources have reached EOF and set the global flag if so.
     fn maybe_mark_all_eof(shared: &SharedPipelineState) {
@@ -1916,6 +1946,14 @@ impl SortWorkerPool {
     /// Number of worker threads in the pool.
     pub fn num_workers(&self) -> usize {
         self.num_workers
+    }
+
+    /// Busy-time breakdown of worker-side merge work.
+    ///
+    /// Overlapping sums, not a partition of merge wall time -- see
+    /// [`crate::merge_phases`].
+    pub(crate) fn merge_phase_breakdown(&self) -> crate::merge_phases::MergePhaseBreakdown {
+        self.shared.merge_phases.snapshot()
     }
 
     /// Codec used to compress Phase 1 spill chunks.

@@ -3564,6 +3564,73 @@ impl RawExternalSorter {
     /// It provides `O(1)` comparisons during merge for fixed-size keys (coordinate, template)
     /// and `O(name_len)` for variable-size keys (queryname).
     #[allow(clippy::too_many_lines)]
+    /// Log the merge's component breakdown: main-thread work and worker work.
+    ///
+    /// The two halves are measured differently and must be read differently.
+    /// Consumer figures are sampled 1-in-N and scaled, so they estimate that one
+    /// thread's wall time and do partition `loop wall`. Worker figures are exact
+    /// busy-time sums across every pool thread, so they overlap each other AND
+    /// the consumer, and routinely exceed `loop wall` -- see
+    /// [`crate::merge_phases`]. Comparing a worker figure to `loop wall` is
+    /// meaningless; comparing worker figures to each other is the point.
+    #[allow(clippy::cast_precision_loss)]
+    fn log_merge_sub_phases(
+        loop_total: f64,
+        consumer: (f64, f64, f64),
+        sampling: (u64, u64),
+        pool: &Arc<SortWorkerPool>,
+    ) {
+        let (write_secs, read_secs, tree_secs) = consumer;
+        let (samples_taken, records_merged) = sampling;
+        if records_merged == 0 {
+            return;
+        }
+        let scale =
+            if samples_taken > 0 { records_merged as f64 / samples_taken as f64 } else { 1.0 };
+        let (est_write, est_read, est_tree) =
+            (write_secs * scale, read_secs * scale, tree_secs * scale);
+
+        info!("=== Merge Sub-Phase Timing ===");
+        info!(
+            "  Consumer (main thread; {samples_taken} samples of {records_merged} records, scaled {scale:.0}x)"
+        );
+        info!("    Fetch next record: {est_read:.1}s  (includes waiting on decompressed blocks)");
+        info!("    Loser tree:        {est_tree:.1}s");
+        info!(
+            "    Enqueue write:     {est_write:.1}s  (hands off to workers; excludes compression)"
+        );
+        info!("    Loop wall clock:   {loop_total:.1}s");
+        // These three estimates partition one thread's time, so they cannot
+        // legitimately exceed it. Saying so in the log beats leaving a reader to
+        // notice the arithmetic -- a biased sample is the failure mode here, and
+        // it is silent otherwise.
+        let consumer_est = est_read + est_tree + est_write;
+        if consumer_est > loop_total * 1.05 {
+            info!(
+                "    NOTE: rows sum to {consumer_est:.1}s > loop wall {loop_total:.1}s, so the \
+                 sample is biased; treat consumer rows as indicative only"
+            );
+        }
+
+        let workers = pool.merge_phase_breakdown();
+        if !workers.is_empty() {
+            let busy = workers.total_busy_secs();
+            let pct = |secs: f64| if busy > 0.0 { 100.0 * secs / busy } else { 0.0 };
+            let (read_s, read_n) = workers.read;
+            let (dec_s, dec_n) = workers.decompress;
+            let (comp_s, comp_n) = workers.compress;
+            info!(
+                "  Workers ({} threads; busy time, overlaps the above and itself)",
+                pool.num_workers()
+            );
+            info!("    Spill disk read:   {read_s:.1}s ({:.0}%) [{read_n} batches]", pct(read_s));
+            info!("    Spill decompress:  {dec_s:.1}s ({:.0}%) [{dec_n} blocks]", pct(dec_s));
+            info!("    Output compress:   {comp_s:.1}s ({:.0}%) [{comp_n} blocks]", pct(comp_s));
+            info!("    Total worker busy: {busy:.1}s  (NOT comparable to loop wall clock)");
+        }
+        info!("==============================");
+    }
+
     fn merge_chunks_generic<K: RawSortKey + Default + 'static>(
         &self,
         chunk_files: &[PathBuf],
@@ -3614,9 +3681,20 @@ impl RawExternalSorter {
 
         let mut merge_probe = MergeProbe::new();
 
-        // Sub-phase timing: only paid when debug logging is enabled.
-        let debug_timing = log::log_enabled!(log::Level::Debug);
-        let merge_sample_interval: u64 = 1024;
+        // Sub-phase timing. Sampled 1-in-`merge_sample_interval`, so on a
+        // billion-record merge this is a few million `Instant::now()` pairs
+        // rather than two billion -- cheap enough to run unconditionally. It
+        // used to be gated on debug logging, which meant the one breakdown that
+        // explains where a merge-dominated sort spends its time was absent from
+        // every benchmark log we actually collect.
+        // Prime, and deliberately NOT 1024. Records are ~100 bytes and spill
+        // blocks ~64 KB, so a power-of-two interval aliases against block
+        // boundaries: the sampled record keeps landing on the refill that blocks
+        // waiting for the next block, and scaling those up overestimated the
+        // consumer's cost by ~2x -- enough that the sub-phases summed to more
+        // than the loop wall clock they are supposed to partition. A prime
+        // interval decorrelates the sample from any block-size-derived period.
+        let merge_sample_interval: u64 = 1021;
         let mut merge_write_secs = 0.0f64;
         let mut merge_read_secs = 0.0f64;
         let mut merge_tree_secs = 0.0f64;
@@ -3626,7 +3704,7 @@ impl RawExternalSorter {
         while tree.winner_is_active() {
             let winner = tree.winner();
             let src_idx = source_map[winner];
-            let sample_this = debug_timing && records_merged.is_multiple_of(merge_sample_interval);
+            let sample_this = records_merged.is_multiple_of(merge_sample_interval);
 
             let record_bytes = winner_record_bytes(&sources[src_idx], guard.consumer_ref())?;
             if sample_this {
@@ -3669,18 +3747,12 @@ impl RawExternalSorter {
             }
         }
 
-        if debug_timing {
-            let loop_total = loop_start.elapsed().as_secs_f64();
-            #[allow(clippy::cast_precision_loss)]
-            let scale =
-                if samples_taken > 0 { records_merged as f64 / samples_taken as f64 } else { 1.0 };
-            let est_write = merge_write_secs * scale;
-            let est_read = merge_read_secs * scale;
-            let est_tree = merge_tree_secs * scale;
-            debug!(
-                "Merge sub-phases (sampled {samples_taken}/{records_merged}, scale={scale:.1}x): write={est_write:.2}s read={est_read:.2}s tree={est_tree:.2}s total={loop_total:.2}s records={records_merged}"
-            );
-        }
+        Self::log_merge_sub_phases(
+            loop_start.elapsed().as_secs_f64(),
+            (merge_write_secs, merge_read_secs, merge_tree_secs),
+            (samples_taken, records_merged),
+            pool,
+        );
 
         guard.finish_output(|| writer.finish())?;
         merge_progress.log_final();
