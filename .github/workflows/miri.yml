@@ -32,7 +32,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Keep the raw-pointer proptest agreement test tractable under Miri's interpreter.
+  # Keep the raw-pointer proptest agreement test tractable under Miri's
+  # interpreter. Note this only reaches proptest because the step below disables
+  # Miri's isolation: an isolated `env::vars_os()` sees none of the host
+  # environment, so every `PROPTEST_*` knob is silently ignored.
   PROPTEST_CASES: "32"
 
 jobs:
@@ -61,4 +64,18 @@ jobs:
         # cannot interpret, and the BAM encode/decode roundtrip tests are slow and
         # exercise no `unsafe` of ours. The `sort` tests (comparator + coordinate/
         # queryname raw-key tests) run clean under Miri in a few seconds.
+        env:
+          # `test_natural_compare_agrees_with_nul` is a `proptest`, and proptest
+          # resolves the path to its `.proptest-regressions` file through
+          # `std::env::current_dir()` before running a single case. `getcwd` is
+          # unsupported under Miri's default isolation, so that test aborted the
+          # whole step — this workflow had never once passed. Isolation is safe
+          # to drop here: these tests are pure comparator calls over in-memory
+          # byte buffers, so every host access it re-permits is proptest's, not
+          # theirs — that `current_dir()` lookup; the `env::vars_os()` read
+          # through which it picks up the `PROPTEST_*` knobs (here the
+          # `PROPTEST_CASES` cap set above, which isolation had been silently
+          # discarding); and reading — on failure, writing — the
+          # `.proptest-regressions` file the lookup resolves to.
+          MIRIFLAGS: -Zmiri-disable-isolation
         run: cargo +nightly miri test -p fgumi-raw-bam sort
