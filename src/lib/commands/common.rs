@@ -1022,6 +1022,22 @@ pub enum MemoryReserve {
     Fixed(usize),
 }
 
+/// How many spilled runs may accumulate before the oldest are consolidated.
+///
+/// Mirrors [`MemoryLimit`]: both are host-derived resource budgets, so both are
+/// spelled with an explicit `auto` rather than inferred from the flag's absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaxTempFiles {
+    /// Size the limit to the process's open-file budget (`ulimit -n`).
+    Auto,
+    /// Use a fixed limit.
+    Fixed(usize),
+}
+
+/// The smallest temp-file limit a merge can act on: it needs at least two
+/// inputs to merge.
+pub(crate) const MIN_MAX_TEMP_FILES: usize = 2;
+
 /// The minimum per-thread memory budget (256 MiB).
 pub(crate) const MIN_MEMORY_PER_THREAD: usize = 256 * 1024 * 1024;
 
@@ -1046,6 +1062,25 @@ pub(crate) fn parse_memory(s: &str) -> Result<MemoryLimit, String> {
         return Ok(MemoryLimit::Auto);
     }
     Ok(MemoryLimit::Fixed(parse_memory_bytes(s, "Memory size")?))
+}
+
+/// Parse a max-temp-files string (e.g. "64", "auto").
+///
+/// Rejects values below [`MIN_MAX_TEMP_FILES`] at parse time rather than
+/// clamping them, so a caller who asks for something the merge cannot do is told
+/// so instead of silently getting a different limit.
+pub(crate) fn parse_max_temp_files(s: &str) -> Result<MaxTempFiles, String> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("auto") {
+        return Ok(MaxTempFiles::Auto);
+    }
+    let limit: usize = s
+        .parse()
+        .map_err(|_| format!("invalid value '{s}': expected `auto` or a positive integer"))?;
+    if limit < MIN_MAX_TEMP_FILES {
+        return Err(format!("invalid value '{s}': must be at least {MIN_MAX_TEMP_FILES}"));
+    }
+    Ok(MaxTempFiles::Fixed(limit))
 }
 
 /// Parse a memory-reserve string (e.g. "10G", "auto").

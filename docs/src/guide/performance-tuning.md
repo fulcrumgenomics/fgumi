@@ -366,13 +366,13 @@ Requested memory 16GB exceeds 90% of system memory (14.4GB)
   consolidated into a single run. The final k-way merge opens every remaining run at once, so
   this limit is what bounds the sort's open file descriptors — and consolidation rewrites data
   that is already sorted, making it pure overhead whenever the descriptor budget could have
-  carried the runs. When unset, `fgumi sort` sizes the limit to the process's soft open-file
-  limit (`ulimit -n`), less a reserve for the input, output and index handles, and capped at a
-  tested maximum. On a host with a low `ulimit -n`, raising it lets the sort avoid consolidation
+  carried the runs. The default, `auto`, sizes the limit to the process's soft open-file limit
+  (`ulimit -n`), less a reserve for the input, output and index handles, and capped at a tested
+  maximum. On a host with a low `ulimit -n`, raising it lets the sort avoid consolidation
   entirely; a sort that consolidated reports the limit it hit in its phase-timing summary. Pass
-  an explicit value to override the sizing — if that value exceeds the open-file budget, the sort
-  says so at startup rather than failing partway through with "Too many open files". Must be at
-  least 2; the output is unchanged either way
+  an explicit value (`--max-temp-files 64`) to pin it instead — if that value exceeds the
+  open-file budget, the sort says so at startup rather than failing partway through with "Too
+  many open files". Must be at least 2; the output is unchanged either way
 - For template-coordinate sort with single-cell data, the `CB` tag is included automatically
 - `--async-reader` is supported and can improve Phase 1 (input reading) throughput when disk
   latency is high or the OS page cache readahead is small
