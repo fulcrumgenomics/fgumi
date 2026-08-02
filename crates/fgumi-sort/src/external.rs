@@ -222,8 +222,11 @@ impl SortPhaseTimer {
     /// counts ([`RawExternalSorter::phase1_threads`] /
     /// [`RawExternalSorter::phase2_threads`]), not the configured `threads`
     /// they default from — the summary reports what the phases ran with.
+    ///
+    /// `max_temp_files` is reported so a run that consolidated says which limit
+    /// it consolidated against.
     #[allow(clippy::cast_precision_loss)]
-    fn log_summary(&self, sort_threads: usize, merge_threads: usize) {
+    fn log_summary(&self, sort_threads: usize, merge_threads: usize, max_temp_files: usize) {
         let overall = self.overall_start.map_or(0.0, |s| s.elapsed().as_secs_f64());
         // Guard against division by zero when sort completes in negligible time.
         let overall_nonzero = if overall > 0.0 { overall } else { f64::EPSILON };
@@ -246,7 +249,14 @@ impl SortPhaseTimer {
             let cons_secs = self.consolidate_secs;
             let cons_pct = 100.0 * cons_secs / overall_nonzero;
             let cons_count = self.consolidate_count;
-            info!("  Consolidation:     {cons_secs:.1}s ({cons_pct:.0}%) [{cons_count} merges]");
+            // Report the limit that triggered it: consolidation rewrites data
+            // that is already sorted, so a run that consolidated wants to know
+            // what it was up against. Reporting the number and not what to do
+            // about it keeps the recommendation with the caller that chose the
+            // limit -- the engine cannot know whether it was requested.
+            info!(
+                "  Consolidation:     {cons_secs:.1}s ({cons_pct:.0}%) [{cons_count} merges, limit {max_temp_files}]"
+            );
         }
         if self.merge_secs > 0.0 {
             let merge_secs = self.merge_secs;
@@ -584,9 +594,10 @@ impl LibraryLookup {
 /// Larger buffer reduces I/O latency impact during merge.
 const MERGE_PREFETCH_SIZE: usize = 1024;
 
-/// Maximum number of temp files before consolidation (like samtools).
-/// When this limit is reached, oldest files are merged to reduce file count.
-const DEFAULT_MAX_TEMP_FILES: usize = 64;
+// A bare `RawExternalSorter` keeps the fixed, portable `FALLBACK_MAX_TEMP_FILES`
+// as its consolidation limit. Sizing that limit to the process's soft
+// `RLIMIT_NOFILE` is a policy decision left to the caller, which opts in through
+// [`crate::fd_limit`] — `fgumi sort` does, `fgumi merge` and `fgumi simulate` do not.
 
 /// Working estimate of the raw BAM bytes per template-coordinate record (excluding the
 /// inline header and the `TemplateRecordRef<K>` index entry).  Used by the capacity
@@ -1768,7 +1779,7 @@ impl RawExternalSorter {
             spill_codec: crate::codec::SpillCodec::default(),
             write_index: false,
             pg_info: None,
-            max_temp_files: DEFAULT_MAX_TEMP_FILES,
+            max_temp_files: crate::fd_limit::FALLBACK_MAX_TEMP_FILES,
             cell_tag: None,
             initial_capacity: None,
             async_reader: false,
@@ -1932,7 +1943,10 @@ impl RawExternalSorter {
     ///
     /// When the number of temp files exceeds this limit, the oldest files
     /// are merged together to reduce the count. Set to 0 for unlimited.
-    /// Default is 64 (matching samtools).
+    ///
+    /// The default is a fixed, portable value. To size it to the host's
+    /// descriptor budget instead — which is what `fgumi sort` does — pass
+    /// [`resolve_temp_file_limit`](crate::resolve_temp_file_limit).
     #[must_use]
     pub fn max_temp_files(mut self, max: usize) -> Self {
         self.max_temp_files = max;
@@ -2677,7 +2691,7 @@ impl RawExternalSorter {
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
-        timer.log_summary(self.phase1_threads(), self.phase2_threads());
+        timer.log_summary(self.phase1_threads(), self.phase2_threads(), self.max_temp_files);
         debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -2868,7 +2882,7 @@ impl RawExternalSorter {
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
-        timer.log_summary(self.phase1_threads(), self.phase2_threads());
+        timer.log_summary(self.phase1_threads(), self.phase2_threads(), self.max_temp_files);
         debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -3138,7 +3152,7 @@ impl RawExternalSorter {
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
-        timer.log_summary(self.phase1_threads(), self.phase2_threads());
+        timer.log_summary(self.phase1_threads(), self.phase2_threads(), self.max_temp_files);
         debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -3463,7 +3477,7 @@ impl RawExternalSorter {
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
-        timer.log_summary(self.phase1_threads(), self.phase2_threads());
+        timer.log_summary(self.phase1_threads(), self.phase2_threads(), self.max_temp_files);
         debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -4583,7 +4597,10 @@ mod tests {
         assert_eq!(sorter.temp_compression, 1);
         assert!(!sorter.write_index);
         assert!(sorter.pg_info.is_none());
-        assert_eq!(sorter.max_temp_files, DEFAULT_MAX_TEMP_FILES);
+        // Fixed, not derived: a bare sorter must behave the same on every host.
+        // Deriving from `ulimit -n` is a decision the command line makes, not
+        // one the engine imposes on every embedder.
+        assert_eq!(sorter.max_temp_files, crate::fd_limit::FALLBACK_MAX_TEMP_FILES);
     }
 
     #[test]
@@ -6392,8 +6409,9 @@ mod tests {
         timer.time_write_output(|| Ok(())).expect("write ok");
         assert!(timer.write_output_secs >= 0.0);
 
-        // log_summary must not panic (output goes to log sink)
-        timer.log_summary(4, 4);
+        // log_summary must not panic (output goes to log sink). `consolidate_count`
+        // is 1 here, so the consolidation branch is exercised too.
+        timer.log_summary(4, 4, 64);
     }
 
     // ========================================================================

@@ -69,6 +69,18 @@ noodles-csi = "0.56.0"
 parking_lot = "0.12"
 proptest = "1.10"
 rand = "0.10"
+# Chosen over the two syscall wrappers already in `fgumi-sort` on purpose:
+# `libc::getrlimit` is `unsafe` and the crate root is `#![deny(unsafe_code)]`,
+# and `nix` is scoped to `cfg(target_os = "linux")` there (its uses are
+# Linux-only APIs), so reaching for it would add a crate to macOS builds.
+# `rustix` is already compiled on every platform via `fs4` and `tempfile`, so it
+# costs nothing new. Declared here so the one member that calls it directly
+# cannot drift onto a different major version than those crates pull in. `std`
+# is named explicitly rather than inherited: it is on today only because `fs4`
+# and `tempfile` enable rustix's defaults, and a transitive change that stopped
+# doing so would break our build for reasons invisible in this file — the same
+# feature-unification trap documented on `flate2` above.
+rustix = { version = "1.1", default-features = false, features = ["std"] }
 rayon = "1.10"
 rstest = "0.26"
 serde = { version = "1.0.228", features = ["derive"] }

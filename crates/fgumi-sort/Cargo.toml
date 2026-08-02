@@ -39,6 +39,8 @@ zstd = "0.13"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# `process` adds `getrlimit`, used by `fd_limit`. See the workspace entry.
+rustix = { workspace = true, features = ["process"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = { workspace = true }

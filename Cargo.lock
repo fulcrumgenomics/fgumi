@@ -889,6 +889,7 @@ dependencies = [
  "proptest",
  "rayon",
  "rstest",
+ "rustix",
  "tempfile",
  "zstd",
 ]

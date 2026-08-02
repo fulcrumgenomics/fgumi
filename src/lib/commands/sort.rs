@@ -31,7 +31,7 @@ use fgumi_sort::{
     KeyTypesSpec, QuerynameComparator, RawExternalSorter, SortOrder, verify_sort_order,
 };
 
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::path::PathBuf;
 
 use crate::commands::command::Command;
@@ -154,9 +154,10 @@ PERFORMANCE:
   - Configurable temp file compression (--temp-compression)
   - Default 768M per-thread memory limit (samtools-compatible); pass
     `--max-memory auto` to detect system memory (opt-in)
-  - Spilled runs are consolidated once they reach `--max-temp-files`
-    (default 64, matching samtools); raise it to avoid repeated
-    consolidation passes on very large inputs
+  - Spilled runs are consolidated once they reach `--max-temp-files`,
+    which defaults to a value derived from the process's open-file limit
+    (`ulimit -n`); consolidation rewrites already-sorted data, so raising
+    that limit avoids it on very large inputs
 
 EXAMPLES:
 
@@ -353,14 +354,21 @@ pub struct Sort {
     ///
     /// Large inputs spill many sorted runs to disk. When the number of runs
     /// reaches this limit, the oldest are merged together in a single pass so
-    /// the final k-way merge opens fewer files at once. Raising it avoids
-    /// repeated consolidation passes on very large inputs (at the cost of more
-    /// open file descriptors during the final merge); lowering it keeps fewer
-    /// files open. Must be at least 2; to effectively disable consolidation,
-    /// pass a value larger than the number of runs you expect to spill.
+    /// the final k-way merge opens fewer files at once. That merge is the only
+    /// reason the limit exists: it opens every remaining run at once, so the
+    /// limit bounds how many file descriptors the sort needs.
     ///
-    /// When unset, a built-in default is used (see this command's help
-    /// overview for the default value).
+    /// Consolidation rewrites data that is already sorted, so it is pure
+    /// overhead whenever the descriptor budget could have carried the runs.
+    /// Raising this avoids it on very large inputs (at the cost of more open
+    /// file descriptors during the final merge); lowering it keeps fewer files
+    /// open. Must be at least 2; to effectively disable consolidation, pass a
+    /// value larger than the number of runs you expect to spill.
+    ///
+    /// When unset, the limit is sized to the process's soft open-file limit
+    /// (`ulimit -n`), less a reserve for the input, output and index handles,
+    /// and capped at a tested maximum. Pass an explicit value to override that;
+    /// a value larger than the open-file budget is reported at startup.
     #[arg(long = "max-temp-files", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(2..))]
     pub max_temp_files: Option<usize>,
 
@@ -566,11 +574,18 @@ impl Sort {
         if let Some(n) = self.merge_threads {
             sorter = sorter.merge_threads(n);
         }
-        // Optional; falls back to the engine default when unset.
-        if let Some(n) = self.max_temp_files {
-            sorter = sorter.max_temp_files(n);
-        }
+        sorter = sorter.max_temp_files(self.resolved_max_temp_files());
         sorter
+    }
+
+    /// The spill-file consolidation limit this command will use.
+    ///
+    /// The engine's own default is a fixed, portable value; sizing it to the
+    /// host's descriptor budget is a decision the command line makes, so it is
+    /// resolved here and passed down. Resolving in one place keeps the number
+    /// that gets logged identical to the number the engine is handed.
+    fn resolved_max_temp_files(&self) -> usize {
+        self.max_temp_files.unwrap_or_else(fgumi_sort::resolve_temp_file_limit)
     }
 
     /// Parse the cell tag for template-coordinate sort/verify, returning `None`
@@ -651,6 +666,29 @@ impl Sort {
             fgumi_sort::format_thread_counts(sorter.phase1_threads(), sorter.phase2_threads())
         );
         info!("Temp compression level: {}", self.temp_compression);
+        let max_temp_files = self.resolved_max_temp_files();
+        match (self.max_temp_files, fgumi_sort::soft_nofile()) {
+            (Some(_), _) => info!("Max temp files: {max_temp_files}"),
+            (None, Some(soft)) => info!(
+                "Max temp files: {max_temp_files} (derived from RLIMIT_NOFILE soft limit {soft})"
+            ),
+            (None, None) => info!("Max temp files: {max_temp_files} (default)"),
+        }
+        // Checked for explicit limits too, not just derived ones. A derived
+        // limit is clamped to the budget and can only fall short of it when the
+        // budget is below the floor; an explicit limit can overrun it outright,
+        // which makes it the case more likely to fail.
+        if !fgumi_sort::fits_fd_budget(max_temp_files) {
+            let advice = if self.max_temp_files.is_some() {
+                "lower --max-temp-files or raise the open file limit with `ulimit -n`"
+            } else {
+                "raise the open file limit with `ulimit -n`"
+            };
+            warn!(
+                "A spill-file limit of {max_temp_files} exceeds this process's open file budget; \
+                 {advice} if the sort fails with \"Too many open files\"."
+            );
+        }
         if self.write_index {
             info!("Write index: enabled");
         }
@@ -1226,20 +1264,24 @@ mod tests {
         assert!(Sort::try_parse_from(args).is_err(), "--max-temp-files {value} must be rejected");
     }
 
-    /// The flag reaches the sorter: `Some(n)` sets the limit; `None` leaves the
-    /// engine default (read from a fresh sorter rather than hardcoded, so this
-    /// test does not pin fgumi's default number).
+    /// The flag reaches the sorter: `Some(n)` sets the limit; `None` resolves it
+    /// from the host's descriptor budget. Compared against
+    /// `resolve_temp_file_limit` rather than a hardcoded number so the test does
+    /// not pin a value that depends on the machine it runs on — and *not*
+    /// against the engine's own default, which is deliberately a different
+    /// (fixed) value now that the derivation lives in the command.
     #[rstest]
     #[case::set(Some(256))]
     #[case::unset(None)]
     fn test_build_sorter_wires_max_temp_files(#[case] max_temp_files: Option<usize>) {
-        let engine_default =
-            RawExternalSorter::new(SortOrderArg::Coordinate.into()).temp_file_limit();
         let mut sort = make_sort(SortOrderArg::Coordinate);
         sort.max_temp_files = max_temp_files;
 
         let sorter = sort.build_sorter(512 * 1024 * 1024, "fgumi sort (test)");
-        assert_eq!(sorter.temp_file_limit(), max_temp_files.unwrap_or(engine_default));
+        assert_eq!(
+            sorter.temp_file_limit(),
+            max_temp_files.unwrap_or_else(fgumi_sort::resolve_temp_file_limit)
+        );
     }
 
     /// The accessor test above only proves the flag reaches the builder. This
@@ -1247,11 +1289,17 @@ mod tests {
     /// never changes *what* is written: with a 1 KiB memory budget (no floor in
     /// `Fixed` mode) and enough records to spill many runs, `Some(2)` forces the
     /// consolidation merge to fire repeatedly (oldest runs are merged once their
-    /// count reaches the limit), while the default engine limit (64) never
+    /// count reaches the limit), while a limit far above the spill count never
     /// consolidates and merges every run in the final k-way pass. Both paths
     /// must emit the same records in the same order — this guards the
     /// consolidation path against a stable-order or record-loss regression the
     /// accessor test cannot catch.
+    ///
+    /// The control arm pins an explicit large limit rather than passing `None`.
+    /// The engine default is derived from the host's `ulimit -n`, so a `None`
+    /// control arm could itself consolidate on a low-limit machine, quietly
+    /// turning this into a consolidation-vs-consolidation comparison that still
+    /// passes while no longer testing what it claims.
     ///
     /// We compare decoded records rather than the raw BGZF bytes on purpose:
     /// the two write paths flush BGZF blocks at different points, so the
@@ -1300,7 +1348,8 @@ mod tests {
             (stats, records)
         };
 
-        let (default_stats, default_records) = run(None, dir.path().join("default.bam"));
+        let (default_stats, default_records) =
+            run(Some(usize::MAX), dir.path().join("default.bam"));
         let (limited_stats, limited_records) = run(Some(2), dir.path().join("limited.bam"));
 
         // Precondition: the tiny budget really did spill multiple runs, so the
