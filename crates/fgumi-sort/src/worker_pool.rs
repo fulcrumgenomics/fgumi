@@ -569,6 +569,37 @@ pub(crate) const PHASE2_DECOMP_CAP: usize = 8;
 /// Number of raw blocks to read from disk per `ReadRawBlocks` call.
 pub(crate) const PHASE2_READ_BATCH: usize = 4;
 
+/// Read-ahead depth for the single merge source the consumer is draining while
+/// it has nothing buffered. See the read path in
+/// [`SortWorkerPool::try_phase2_file_work`].
+///
+/// Applies to one file at a time, so the extra read-ahead memory is this many
+/// compressed blocks — a few MB — not K times that.
+pub(crate) const PHASE2_STARVING_RAW_CAP: usize = 64;
+
+/// Blocks to read per call for that same file. Large enough that one read is a
+/// sequential run rather than a 256 KB pinprick, since only one worker may hold
+/// a given file's reader mutex and that read is therefore the whole refill rate.
+pub(crate) const PHASE2_STARVING_READ_BATCH: usize = 32;
+
+/// Blocks a read may fetch for a file whose raw FIFO holds `raw_len`, or `None`
+/// when the FIFO is already at its cap.
+///
+/// Admitting on "not yet full" and then reading a whole batch overshoots the
+/// cap by up to a batch: at the frontier allowance that is a FIFO admitted at
+/// 511 and left holding 543. `raw_cap` is a read-ahead *memory* bound, so it has
+/// to bound -- and the deep path, which raised the cap 64x and the batch 8x, is
+/// exactly where an unclamped overshoot is largest.
+///
+/// Pure so the bound is testable without a pool, following
+/// [`classify_scan`](crate::merge_stalls::classify_scan).
+fn admitted_read_batch(raw_len: usize, raw_cap: usize, read_batch: usize) -> Option<usize> {
+    match raw_cap.saturating_sub(raw_len) {
+        0 => None,
+        headroom => Some(read_batch.min(headroom)),
+    }
+}
+
 /// One compressed block in a file's raw FIFO, with when it got there.
 ///
 /// The timestamp is what turns "the pool did not decompress this yet" into a
@@ -1028,6 +1059,18 @@ pub(crate) struct SharedPipelineState {
     /// across the pool rather than always hitting worker 0.
     wake_cursor: AtomicUsize,
 
+    /// Read batches taken at the deep frontier allowance, and the blocks they
+    /// returned; and the same for batches taken at the uniform allowance.
+    ///
+    /// Blocks-per-batch is the number that says whether the deep path is
+    /// actually engaging. Without it, a gate that silently almost never fires
+    /// looks exactly like a change that did not help — which is precisely the
+    /// mistake this counter exists to prevent.
+    pub(crate) deep_read_batches: AtomicU64,
+    pub(crate) deep_read_blocks: AtomicU64,
+    pub(crate) shallow_read_batches: AtomicU64,
+    pub(crate) shallow_read_blocks: AtomicU64,
+
     /// Lowest merge source index that has not yet delivered all its records.
     ///
     /// Phase 1 chunks its input sequentially, so an input that is already in
@@ -1082,6 +1125,10 @@ impl SharedPipelineState {
             main_thread_handle,
             worker_threads: (0..num_workers).map(|_| std::sync::OnceLock::new()).collect(),
             wake_cursor: AtomicUsize::new(0),
+            deep_read_batches: AtomicU64::new(0),
+            deep_read_blocks: AtomicU64::new(0),
+            shallow_read_batches: AtomicU64::new(0),
+            shallow_read_blocks: AtomicU64::new(0),
             phase2_lowest_active: AtomicUsize::new(0),
         }
     }
@@ -2097,14 +2144,9 @@ impl SortWorkerPool {
         // frontier that is merely *active* is the common case in an interleaved
         // merge, and sending every worker to file 0 there would undo the spread
         // that makes that case fast.
-        let start = {
-            let frontier = shared.phase2_lowest_active.load(Ordering::Relaxed);
-            if frontier < n && files[frontier].is_starving() {
-                frontier
-            } else {
-                worker.phase2_file_cursor
-            }
-        };
+        let frontier = shared.phase2_lowest_active.load(Ordering::Relaxed);
+        let frontier_starving = frontier < n && files[frontier].is_starving();
+        let start = if frontier_starving { frontier } else { worker.phase2_file_cursor };
 
         for offset in 0..n {
             let i = (start + offset) % n;
@@ -2141,21 +2183,50 @@ impl SortWorkerPool {
                 continue;
             }
 
+            // The file the merge is draining gets a deeper allowance than the
+            // uniform per-file one.
+            //
+            // Uniform read-ahead is what makes the disjoint-run case slow. Only
+            // one worker may read a given file (its reader mutex), so at
+            // `PHASE2_READ_BATCH` = 4 blocks the hot file is refilled 4 blocks at
+            // a time by one thread, and the per-batch read latency is amortized
+            // over only those 4. Reading a larger run turns many small
+            // serialized reads into one sequential one, without needing more
+            // readers.
+            //
+            // Keyed on being the frontier alone, NOT on the file also looking
+            // starved. An earlier version required `is_starving()` here, which
+            // needs `decomp_in_flight == 0` -- but by the time a worker reaches
+            // the read path some other worker has usually already begun
+            // decompressing, so the file no longer looked starved and the deep
+            // path fired for only 6% of batches (5.6 blocks per read against the
+            // intended 32). Whether a worker happens to be mid-decompress says
+            // nothing about how far ahead the file should read.
+            //
+            // Still scoped to one file: at merge start every file is empty, and
+            // letting all K deepen at once would multiply read-ahead memory by K.
+            let (raw_cap, read_batch) = if i == frontier {
+                (PHASE2_STARVING_RAW_CAP, PHASE2_STARVING_READ_BATCH)
+            } else {
+                (PHASE2_RAW_CAP, PHASE2_READ_BATCH)
+            };
+
             // Bound disk read-ahead per file: don't keep pulling if the raw
             // FIFO is already full. Use try_lock so a momentarily contended
             // raw FIFO doesn't block the reader.
-            let read_skip = match file.raw_blocks.try_lock() {
-                Ok(g) if g.len() >= PHASE2_RAW_CAP => Some(ReadSkip::RawFull),
-                Ok(_) => None,
-                // Treated as full, as it always has been -- but recorded as
-                // contention, because a FIFO whose depth we could not read is
-                // not evidence that read-ahead depth is the constraint.
-                Err(_) => Some(ReadSkip::RawLockContended),
-            };
-            if let Some(read_skip) = read_skip {
-                tally.note(combine_skip(pop_skip, read_skip));
+            // Treated as full when contended, as it always has been -- but
+            // recorded as contention, because a FIFO whose depth we could not
+            // read is not evidence that read-ahead depth is the constraint.
+            let Ok(raw_guard) = file.raw_blocks.try_lock() else {
+                tally.note(combine_skip(pop_skip, ReadSkip::RawLockContended));
                 continue;
-            }
+            };
+            let admitted = admitted_read_batch(raw_guard.len(), raw_cap, read_batch);
+            drop(raw_guard);
+            let Some(read_batch) = admitted else {
+                tally.note(combine_skip(pop_skip, ReadSkip::RawFull));
+                continue;
+            };
 
             // Both codecs read into the same `Vec<Vec<u8>>`, so the read is
             // dispatched on the codec but the failure is handled once. The two
@@ -2165,12 +2236,12 @@ impl SortWorkerPool {
                 SpillCodec::Bgzf => shared
                     .merge_phases
                     .read
-                    .time(|| read_raw_blocks(&mut reader_guard.inner, PHASE2_READ_BATCH))
+                    .time(|| read_raw_blocks(&mut reader_guard.inner, read_batch))
                     .map(|blocks| blocks.into_iter().map(|b| b.data).collect()),
                 SpillCodec::Zstd => shared
                     .merge_phases
                     .read
-                    .time(|| read_raw_zstd_frames(&mut reader_guard.inner, PHASE2_READ_BATCH)),
+                    .time(|| read_raw_zstd_frames(&mut reader_guard.inner, read_batch)),
             };
             let raw_bytes: Vec<Vec<u8>> = match read {
                 Ok(bytes) => bytes,
@@ -2180,6 +2251,17 @@ impl SortWorkerPool {
                     return Self::retire_phase2_source(shared, worker, file, reader_guard, i, n);
                 }
             };
+
+            // Record which allowance this batch was taken at, and what it
+            // returned, so "the deep path did not help" can be told apart from
+            // "the deep path did not run".
+            let (batches, blocks) = if i == frontier {
+                (&shared.deep_read_batches, &shared.deep_read_blocks)
+            } else {
+                (&shared.shallow_read_batches, &shared.shallow_read_blocks)
+            };
+            batches.fetch_add(1, Ordering::Relaxed);
+            blocks.fetch_add(raw_bytes.len() as u64, Ordering::Relaxed);
 
             if raw_bytes.is_empty() {
                 return Self::retire_phase2_source(shared, worker, file, reader_guard, i, n);
@@ -2659,6 +2741,17 @@ impl SortWorkerPool {
     /// reorder buffers via this snapshot.
     pub(crate) fn phase2_files(&self) -> Arc<Vec<Phase2FileState>> {
         self.shared.phase2_files_snapshot()
+    }
+
+    /// Phase 2 read batches split by allowance:
+    /// `(frontier_batches, frontier_blocks, other_batches, other_blocks)`.
+    pub(crate) fn read_batch_split(&self) -> (u64, u64, u64, u64) {
+        (
+            self.shared.deep_read_batches.load(Ordering::Relaxed),
+            self.shared.deep_read_blocks.load(Ordering::Relaxed),
+            self.shared.shallow_read_batches.load(Ordering::Relaxed),
+            self.shared.shallow_read_blocks.load(Ordering::Relaxed),
+        )
     }
 
     /// Set the current pipeline phase.
@@ -3422,6 +3515,41 @@ mod tests {
         assert_eq!(pool.num_workers(), 8, "the pool is still eight threads wide");
         assert_eq!(pool.active_workers(), 3, "but only three may take Phase 2 work");
         pool.shutdown();
+    }
+
+    /// A read may never carry the raw FIFO past its cap.
+    ///
+    /// The cap is a read-ahead memory bound, and admitting on "not yet full"
+    /// and then reading a full batch breaks it by up to a batch. Every case
+    /// asserts the post-read depth against the cap rather than the returned
+    /// figure alone, because that bound is the property, not the arithmetic.
+    #[rstest]
+    // Well under the cap: the batch is what limits the read, not the headroom.
+    #[case::far_below_the_cap_reads_a_full_batch(0, 512, 32, Some(32))]
+    #[case::shallow_path_far_below_the_cap(0, 8, 4, Some(4))]
+    // One entry below the allowance -- the case that used to overshoot by 31.
+    #[case::one_below_the_frontier_cap_reads_one(511, 512, 32, Some(1))]
+    #[case::one_below_the_shallow_cap_reads_one(7, 8, 4, Some(1))]
+    // Partly full: headroom is what limits the read.
+    #[case::headroom_shorter_than_the_batch(500, 512, 32, Some(12))]
+    // At or past the cap: no read at all.
+    #[case::at_the_cap_declines(512, 512, 32, None)]
+    #[case::past_the_cap_declines(600, 512, 32, None)]
+    fn read_batch_never_overshoots_the_raw_fifo_cap(
+        #[case] raw_len: usize,
+        #[case] raw_cap: usize,
+        #[case] read_batch: usize,
+        #[case] expected: Option<usize>,
+    ) {
+        let admitted = admitted_read_batch(raw_len, raw_cap, read_batch);
+        assert_eq!(admitted, expected);
+        if let Some(n) = admitted {
+            assert!(n > 0, "an admitted read must fetch something");
+            assert!(
+                raw_len + n <= raw_cap,
+                "read of {n} on a FIFO of {raw_len} exceeds the cap of {raw_cap}"
+            );
+        }
     }
 
     /// A wait that straddles the Phase 1 -> Phase 2 boundary belongs to
