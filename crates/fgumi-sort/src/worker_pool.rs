@@ -565,6 +565,33 @@ pub(crate) const PHASE2_DECOMP_CAP: usize = 8;
 /// Number of raw blocks to read from disk per `ReadRawBlocks` call.
 pub(crate) const PHASE2_READ_BATCH: usize = 4;
 
+/// One compressed block in a file's raw FIFO, with when it got there.
+///
+/// The timestamp is what turns "the pool did not decompress this yet" into a
+/// measurement: `enqueued_nanos` to the moment a worker claims it is pure
+/// scheduling latency, work that was available and unclaimed.
+pub(crate) struct RawEntry {
+    /// Position in the file's block sequence.
+    pub(crate) serial: u64,
+    /// Raw block bytes: a whole BGZF block, or a whole zstd frame.
+    pub(crate) bytes: Vec<u8>,
+    /// When this entry was pushed, in pool-epoch nanoseconds.
+    pub(crate) enqueued_nanos: u64,
+}
+
+/// A decompressed block in a file's reorder buffer, with when it was published.
+///
+/// `inserted_nanos` to the moment the consumer takes it is how long the block
+/// spent as genuine lookahead. Near-zero across the run means the reorder
+/// buffer is a pass-through and its cap is not the constraint, however full the
+/// other files look.
+pub(crate) struct TimedBlock {
+    /// Decompressed payload.
+    pub(crate) data: Vec<u8>,
+    /// When this block was inserted, in pool-epoch nanoseconds.
+    pub(crate) inserted_nanos: u64,
+}
+
 /// Reader state for a single spill file. Locked when reading from disk.
 pub(crate) struct Phase2Reader {
     pub(crate) inner: BufReader<std::fs::File>,
@@ -591,15 +618,45 @@ pub(crate) struct Phase2FileState {
     /// Raw compressed blocks read from disk, in serial order. For BGZF, each
     /// entry is the raw block bytes (header + deflate + footer). For zstd,
     /// each entry is one complete zstd frame's bytes.
-    pub(crate) raw_blocks: Mutex<VecDeque<(u64, Vec<u8>)>>,
+    pub(crate) raw_blocks: Mutex<VecDeque<RawEntry>>,
     /// Decompressed blocks reordered by serial. Main thread pops the next-in-order
     /// block here when its parser exhausts the current buffer.
-    pub(crate) decompressed: Mutex<ReorderBuffer<Vec<u8>>>,
+    pub(crate) decompressed: Mutex<ReorderBuffer<TimedBlock>>,
     /// Number of raw blocks currently being decompressed (popped from
     /// `raw_blocks` but not yet inserted into `decompressed`). Used by
     /// `is_drained` to avoid a race where the consumer exits while a worker
     /// is mid-decompress.
     pub(crate) decomp_in_flight: AtomicUsize,
+
+    /// Lock-free mirror of `raw_blocks.len()`, maintained under that mutex.
+    ///
+    /// Reading a depth should not require taking the lock that a worker might
+    /// be holding to *change* it: the park path needs both depths on every
+    /// park, and acquiring two mutexes per park would both cost more than the
+    /// measurement is worth and perturb the contention it is trying to measure.
+    pub(crate) raw_len: AtomicUsize,
+    /// Lock-free mirror of `decompressed.len()`, maintained under that mutex.
+    pub(crate) decomp_len: AtomicUsize,
+    /// Pool-epoch nanoseconds at which the reorder buffer last drained to
+    /// nothing, or `0` if it currently holds something.
+    ///
+    /// The start of a refill cycle: the interval from here to the next claim,
+    /// and to the next insert, is what says whether a hungry file waits to be
+    /// noticed or waits to be served.
+    pub(crate) emptied_at_nanos: AtomicU64,
+    /// The [`EmptyCause`](crate::merge_trace::EmptyCause) of the current empty,
+    /// as a `u8`.
+    ///
+    /// Stored on the file rather than only tallied, because `read_lag` is
+    /// defined over the `Dry` empties alone: on a `RawReady` or
+    /// `Decompressing` empty there was already something in the pipeline, so
+    /// the next disk read was never what the consumer was waiting for, and
+    /// folding those cycles in makes a scheduling delay look like a storage
+    /// one. Meaningless while `emptied_at_nanos` is `0`.
+    pub(crate) emptied_cause: AtomicU8,
+    /// Whether some worker has already claimed a block since the buffer last
+    /// emptied, so `claim_lag` records the *first* response, not every one.
+    pub(crate) claimed_since_empty: AtomicBool,
 }
 
 impl Phase2FileState {
@@ -611,7 +668,112 @@ impl Phase2FileState {
             raw_blocks: Mutex::new(VecDeque::with_capacity(PHASE2_RAW_CAP)),
             decompressed: Mutex::new(ReorderBuffer::new()),
             decomp_in_flight: AtomicUsize::new(0),
+            raw_len: AtomicUsize::new(0),
+            decomp_len: AtomicUsize::new(0),
+            emptied_at_nanos: AtomicU64::new(0),
+            emptied_cause: AtomicU8::new(crate::merge_trace::EmptyCause::Dry.as_u8()),
+            claimed_since_empty: AtomicBool::new(false),
         }
+    }
+
+    /// The file's depths without taking either mutex: `(raw, decompressed,
+    /// in-flight)`.
+    ///
+    /// A momentarily inconsistent triple is fine here and a lock is not: these
+    /// feed diagnostics sampled at a park, never a correctness decision.
+    pub(crate) fn depths(&self) -> (usize, usize, usize) {
+        (
+            self.raw_len.load(Ordering::Relaxed),
+            self.decomp_len.load(Ordering::Relaxed),
+            self.decomp_in_flight.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Note that the reorder buffer just drained to nothing at `now`, for
+    /// `cause`.
+    ///
+    /// Opens a refill cycle. Called by the consumer, which is the only thing
+    /// that removes from the buffer. The cause is stored as well as tallied so
+    /// `read_lag` can be restricted to the empties it is defined over -- see
+    /// [`Self::emptied_while_dry`].
+    ///
+    /// **Must be called while holding the file's `decompressed` mutex.** That is
+    /// what makes opening a cycle mutually exclusive with
+    /// [`Self::mark_refilled`] closing one, so an insert cannot clear a cycle it
+    /// never observed. `now` is the pool epoch, which is monotonic, so a cycle's
+    /// open timestamp also serves as its identity for the two samples that
+    /// cannot take this mutex -- `claim_lag` and `read_lag`.
+    pub(crate) fn mark_emptied(&self, now: u64, cause: crate::merge_trace::EmptyCause) {
+        self.emptied_cause.store(cause.as_u8(), Ordering::Relaxed);
+        self.emptied_at_nanos.store(now, Ordering::Relaxed);
+        self.claimed_since_empty.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether the current refill cycle opened with the file holding nothing
+    /// anywhere -- no queued raw block, no decompression in flight.
+    ///
+    /// Only these cycles belong in `read_lag`: on the others a block was
+    /// already in the pipeline when the buffer drained, so the next disk read
+    /// completing was not what the consumer waited on.
+    pub(crate) fn emptied_while_dry(&self) -> bool {
+        matches!(
+            crate::merge_trace::EmptyCause::from_u8(self.emptied_cause.load(Ordering::Relaxed)),
+            crate::merge_trace::EmptyCause::Dry
+        )
+    }
+
+    /// Pool-epoch nanoseconds at which this file's buffer emptied, if it is
+    /// still empty.
+    pub(crate) fn emptied_at(&self) -> Option<u64> {
+        match self.emptied_at_nanos.load(Ordering::Relaxed) {
+            0 => None,
+            t => Some(t),
+        }
+    }
+
+    /// The open refill cycle, if an event observed at `event_nanos` could
+    /// belong to it.
+    ///
+    /// A cycle that opened *after* the event is not the cycle the event
+    /// answered, so timing the event against it would report a latency that
+    /// ran backwards -- which `saturating_sub` would then quietly render as a
+    /// zero rather than as the nonsense it is.
+    ///
+    /// The pairing for the two samples taken without the `decompressed` mutex;
+    /// close the window with [`Self::cycle_still_open`] once the sample is in
+    /// hand.
+    pub(crate) fn cycle_open_at(&self, event_nanos: u64) -> Option<u64> {
+        self.emptied_at().filter(|&emptied| emptied <= event_nanos)
+    }
+
+    /// Whether `cycle` is still the cycle this file has open.
+    ///
+    /// Re-read after taking a sample: a cycle that closed while the sample was
+    /// being taken cannot receive it. Cycle identity is the open timestamp,
+    /// which the pool epoch makes monotonic, so a reopened cycle never reuses
+    /// a value and this cannot be fooled by a close/reopen pair.
+    pub(crate) fn cycle_still_open(&self, cycle: u64) -> bool {
+        self.emptied_at() == Some(cycle)
+    }
+
+    /// Claim the "first response since the buffer emptied" flag.
+    ///
+    /// Returns `true` for exactly one caller per refill cycle, so several
+    /// workers piling onto the same hungry file record one claim latency
+    /// between them rather than one each.
+    pub(crate) fn take_first_claim_since_empty(&self) -> bool {
+        !self.claimed_since_empty.swap(true, Ordering::Relaxed)
+    }
+
+    /// Close the refill cycle: the buffer holds something again.
+    ///
+    /// **Must be called while holding the file's `decompressed` mutex**, and
+    /// only after observing an open cycle under that same hold -- see
+    /// [`Self::mark_emptied`]. Closing on an unsynchronized read would let this
+    /// clear a cycle opened after that read, which both discards a measurement
+    /// and books the wrong one.
+    pub(crate) fn mark_refilled(&self) {
+        self.emptied_at_nanos.store(0, Ordering::Relaxed);
     }
 
     /// Mark the disk reader as having reached EOF. Updates both the
@@ -632,7 +794,7 @@ impl Phase2FileState {
             self.raw_blocks.lock().expect("phase2 raw_blocks mutex poisoned").len() as u64;
         let decomp_guard = self.decompressed.lock().expect("phase2 decompressed mutex poisoned");
         let decomp_len = decomp_guard.len() as u64;
-        let decomp_bytes: u64 = decomp_guard.iter().map(|buf| buf.len() as u64).sum();
+        let decomp_bytes: u64 = decomp_guard.iter().map(|b| b.data.len() as u64).sum();
         drop(decomp_guard);
         let active = !self.reader_eof.load(Ordering::Relaxed);
         (raw_len + decomp_len, decomp_bytes, active)
@@ -727,6 +889,26 @@ pub(crate) struct SharedPipelineState {
     /// How deep workers were sleeping when they found work, which bounds how
     /// much of their idle time is discovery latency rather than absent work.
     pub(crate) wake_latency: crate::merge_stalls::WakeLatencyStats,
+
+    /// Start of the pool's monotonic clock. Every `*_nanos` field elsewhere is
+    /// an offset from here, so timestamps fit in a `u64` atomic instead of
+    /// needing a lock around an `Instant`.
+    pub(crate) epoch: Instant,
+    /// Per-stage dwell times for spill blocks -- see [`crate::merge_trace`].
+    pub(crate) block_lifecycle: crate::merge_trace::BlockLifecycleStats,
+    /// How long a file that ran dry takes to be refilled, and by which stage.
+    pub(crate) refill: crate::merge_trace::RefillStats,
+    /// What the merge consumer's access pattern looks like and what it costs.
+    pub(crate) consumer_trace: crate::merge_trace::ConsumerTraceStats,
+    /// How long a worker's *fruitless* scan of every spill file takes -- the
+    /// scans that found no work, which are the ones on the path by which a
+    /// hungry file gets noticed. A scan that finds work returns early and is
+    /// not timed.
+    pub(crate) fruitless_scan: crate::merge_trace::DurationHistogram,
+
+    /// `wake_latency` as it stood when the pool entered Phase 2, so the merge's
+    /// share can be reported without Phase 1's sleeps folded in.
+    pub(crate) wake_latency_at_merge_start: std::sync::OnceLock<WakeLatencyReport>,
 
     /// Current phase: 0=shutdown, 1=Phase1, 2=Phase2, 255=Legacy.
     pub(crate) phase: AtomicU8,
@@ -830,6 +1012,12 @@ impl SharedPipelineState {
             merge_phases: crate::merge_phases::MergePhaseCounters::default(),
             phase2_scans: crate::merge_stalls::Phase2ScanStats::default(),
             wake_latency: crate::merge_stalls::WakeLatencyStats::default(),
+            wake_latency_at_merge_start: std::sync::OnceLock::new(),
+            epoch: Instant::now(),
+            block_lifecycle: crate::merge_trace::BlockLifecycleStats::default(),
+            refill: crate::merge_trace::RefillStats::default(),
+            consumer_trace: crate::merge_trace::ConsumerTraceStats::default(),
+            fruitless_scan: crate::merge_trace::DurationHistogram::default(),
             phase: AtomicU8::new(phase::LEGACY),
             active_worker_limit: AtomicUsize::new(num_workers),
 
@@ -855,6 +1043,11 @@ impl SharedPipelineState {
             num_workers,
             main_thread_handle,
         }
+    }
+
+    /// Nanoseconds since the pool's epoch, the unit every `*_nanos` field uses.
+    pub(crate) fn now_nanos(&self) -> u64 {
+        crate::merge_trace::elapsed_nanos(self.epoch)
     }
 
     /// Snapshot the current Phase 2 file vector. Cheap (just clones the `Arc`).
@@ -915,13 +1108,10 @@ struct SortWorkerState {
     /// Monotonic counter incremented on each idle sleep; mixed with `worker_id` to
     /// produce per-worker jitter so all workers don't wake simultaneously.
     idle_iter: u64,
-    /// Backoff level of the sleep this worker just took, if the previous loop
-    /// iteration slept. Taken (and cleared) by the next iteration that finds
-    /// work, which is what makes that sleep "productive" — see
-    /// [`crate::merge_stalls::WakeLatencyStats`]. Distinguishing this from
-    /// `backoff_us` matters because `backoff_us` also holds `MIN_BACKOFF_US`
-    /// after a successful step, which is not a sleep at all.
-    last_sleep_us: Option<u64>,
+    /// The sleep the previous loop iteration took, if it slept. Taken (and
+    /// cleared) by the next iteration that finds work, which is what makes that
+    /// sleep "productive" — see [`crate::merge_stalls::WakeLatencyStats`].
+    last_sleep: Option<PendingSleep>,
 }
 
 impl SortWorkerState {
@@ -930,6 +1120,38 @@ impl SortWorkerState {
     fn has_any_held_items(&self) -> bool {
         !self.held_raw_input_blocks.is_empty() || self.held_decompressed_input.is_some()
     }
+}
+
+/// A sleep whose cost is not yet known, and the phase it ran in.
+///
+/// The backoff level is kept separately from `backoff_us` because that field
+/// also holds `MIN_BACKOFF_US` after a successful step, which is not a sleep at
+/// all. The phase travels with it because the sleep and the step that redeems it
+/// are separate loop iterations and the phase can change in between — see
+/// [`productive_sleep_micros`].
+#[derive(Debug, Clone, Copy)]
+struct PendingSleep {
+    /// Pipeline phase the sleep ran in (see [`phase`]).
+    phase: u8,
+    /// Backoff level the sleep was taken at, in microseconds.
+    backoff_us: u64,
+}
+
+/// The sleep to charge as productive, for a step that succeeded in `current_phase`.
+///
+/// `None` when nothing was pending, or when the sleep ran in a different phase.
+/// [`crate::merge_stalls::WakeLatencyStats`] runs for the pool's whole life and
+/// the merge's share is taken by subtracting a snapshot pinned at the Phase 1 ->
+/// Phase 2 boundary, so a Phase 1 sleep recorded after that snapshot lands inside
+/// the merge's window and reports discovery lag for a merge that had not started
+/// when the worker went to sleep. Nor can it be credited to Phase 1, whose
+/// snapshot is already taken. A sleep that straddles the boundary is therefore
+/// dropped rather than misattributed to whichever side happens to be reporting.
+///
+/// Pure so the rule is testable without running the pool through a phase
+/// transition, following [`classify_scan`](crate::merge_stalls::classify_scan).
+fn productive_sleep_micros(pending: Option<PendingSleep>, current_phase: u8) -> Option<u64> {
+    pending.filter(|sleep| sleep.phase == current_phase).map(|sleep| sleep.backoff_us)
 }
 
 // ============================================================================
@@ -1177,7 +1399,7 @@ impl SortWorkerPool {
                         held_decompressed_input: None,
                         backoff_us: MIN_BACKOFF_US,
                         idle_iter: 0,
-                        last_sleep_us: None,
+                        last_sleep: None,
                     };
 
                     // Publish a panic as soon as the worker unwinds, not at
@@ -1248,7 +1470,7 @@ impl SortWorkerPool {
                 }
                 // A capped worker is idle by policy, not because work was slow
                 // to appear, so its sleep must not count as discovery latency.
-                worker.last_sleep_us = None;
+                worker.last_sleep = None;
                 continue;
             }
 
@@ -1259,7 +1481,7 @@ impl SortWorkerPool {
                 worker.idle_iter = worker.idle_iter.wrapping_add(1);
                 worker.backoff_us = (worker.backoff_us * 2).min(MAX_BACKOFF_US);
                 // Waiting for the next phase, not for work — see above.
-                worker.last_sleep_us = None;
+                worker.last_sleep = None;
                 continue;
             }
 
@@ -1330,7 +1552,12 @@ impl SortWorkerPool {
                 // time the pipeline actually pays for, and it is invisible in
                 // the idle total, which counts the productive and unproductive
                 // sleeps alike.
-                if let Some(slept_us) = worker.last_sleep_us.take() {
+                //
+                // `take` unconditionally: a sleep from another phase is dropped,
+                // not carried forward to the next step in this one.
+                if let Some(slept_us) =
+                    productive_sleep_micros(worker.last_sleep.take(), current_phase)
+                {
                     shared.wake_latency.record_productive_sleep(slept_us);
                 }
                 worker.backoff_us = MIN_BACKOFF_US;
@@ -1343,7 +1570,8 @@ impl SortWorkerPool {
                 let idle_ns = Self::nanos_u64(idle_start.elapsed());
                 pstats.record_idle(worker.worker_id, idle_ns);
                 shared.wake_latency.record_sleep(slept_us, idle_ns);
-                worker.last_sleep_us = Some(slept_us);
+                worker.last_sleep =
+                    Some(PendingSleep { phase: current_phase, backoff_us: slept_us });
             }
         }
     }
@@ -1710,6 +1938,7 @@ impl SortWorkerPool {
         // increments; only the fall-through at the bottom — the path that is
         // about to sleep anyway — publishes it. See [`crate::merge_stalls`].
         let mut tally = Phase2ScanTally::default();
+        let scan_start = shared.now_nanos();
 
         for offset in 0..n {
             let i = (worker.phase2_file_cursor + offset) % n;
@@ -1725,11 +1954,10 @@ impl SortWorkerPool {
             // so the binding is why the decompress half declined.
             let pop_skip = match Self::try_pop_raw_for_decompress(file) {
                 Err(skip) => skip,
-                Ok((serial, raw_bytes)) => {
+                Ok(entry) => {
                     worker.phase2_file_cursor = (i + 1) % n;
-                    return Self::decompress_and_publish(
-                        shared, worker, file, i, serial, raw_bytes,
-                    );
+                    Self::note_claim(shared, file, &entry);
+                    return Self::decompress_and_publish(shared, worker, file, i, entry);
                 }
             };
 
@@ -1799,14 +2027,38 @@ impl SortWorkerPool {
             // consumer's gap-filler admission rule cannot recover from that
             // and would deadlock. Lock order `reader → raw_blocks` is the only
             // nested-lock path in this function.
+            let enqueued_nanos = shared.now_nanos();
             let mut raw_guard = file.raw_blocks.lock().expect("phase2 raw_blocks mutex poisoned");
             let start_serial = reader_guard.next_serial;
             reader_guard.next_serial += raw_bytes.len() as u64;
-            for (idx, b) in raw_bytes.into_iter().enumerate() {
-                raw_guard.push_back((start_serial + idx as u64, b));
+            for (idx, bytes) in raw_bytes.into_iter().enumerate() {
+                raw_guard.push_back(RawEntry {
+                    serial: start_serial + idx as u64,
+                    bytes,
+                    enqueued_nanos,
+                });
             }
+            file.raw_len.store(raw_guard.len(), Ordering::Relaxed);
             drop(raw_guard);
             drop(reader_guard);
+
+            // If this file was dry when its buffer emptied, the read is what
+            // the consumer has actually been waiting for -- the pool could not
+            // have decompressed anything sooner. Separating that from the
+            // claim/insert lags is what keeps a storage problem from reading as
+            // a scheduling one.
+            //
+            // Bound to its cycle the same way `claim_lag` is: a cycle that
+            // opened after this read completed is not the one the read served,
+            // and one that closed while the sample was being taken is not
+            // either. `emptied_while_dry` reads the cause of whichever cycle is
+            // open, so it has to be read inside the same guarded window.
+            if let Some(emptied) = file.cycle_open_at(enqueued_nanos)
+                && file.emptied_while_dry()
+                && file.cycle_still_open(emptied)
+            {
+                shared.refill.read_lag.record(enqueued_nanos.saturating_sub(emptied));
+            }
 
             worker.phase2_file_cursor = (i + 1) % n;
             return StepResult::Success;
@@ -1816,7 +2068,37 @@ impl SortWorkerPool {
         // reasons here costs nothing it was not already about to spend, and it
         // turns an entry in the idle total into an explanation of that entry.
         shared.phase2_scans.record_fruitless_scan(tally);
+        // A scan touches every spill file, so at 86 files and ~2M fruitless
+        // scans this is not obviously negligible -- and it sits directly on the
+        // path by which a hungry file gets noticed. Measure it rather than
+        // assume.
+        shared.fruitless_scan.record(shared.now_nanos().saturating_sub(scan_start));
         StepResult::InputEmpty
+    }
+
+    /// Record that a worker claimed `entry`, closing the scheduling half of a
+    /// refill cycle if this is the first claim since the file ran dry.
+    fn note_claim(shared: &SharedPipelineState, file: &Phase2FileState, entry: &RawEntry) {
+        let now = shared.now_nanos();
+        shared.block_lifecycle.raw_dwell.record(now.saturating_sub(entry.enqueued_nanos));
+        // Unlike `insert_lag`, this path holds no mutex that the consumer must
+        // take to open a cycle, so the cycle is bound to the sample by its own
+        // timestamp instead. `emptied <= now` rejects a cycle that opened after
+        // the claim -- it cannot be the one this claim answered -- and the
+        // re-read rejects one that closed during the claim. Both are cheap
+        // enough to sit on the per-block claim path: a comparison, and a load
+        // that only runs once a cycle is actually open.
+        //
+        // What survives is a claim that arrives while the cycle rolls over,
+        // which loses a sample rather than timing one against the wrong start.
+        // A histogram missing an observation still reads correctly; one holding
+        // a zero it never measured does not.
+        if let Some(emptied) = file.cycle_open_at(now)
+            && file.take_first_claim_since_empty()
+            && file.cycle_still_open(emptied)
+        {
+            shared.refill.claim_lag.record(now.saturating_sub(emptied));
+        }
     }
 
     /// Decompress one raw block and publish it into its file's reorder buffer.
@@ -1835,9 +2117,9 @@ impl SortWorkerPool {
         worker: &mut SortWorkerState,
         file: &Phase2FileState,
         source_idx: usize,
-        serial: u64,
-        raw_bytes: Vec<u8>,
+        entry: RawEntry,
     ) -> StepResult {
+        let RawEntry { serial, bytes: raw_bytes, .. } = entry;
         let data = match file.codec {
             SpillCodec::Bgzf => {
                 let raw_block = RawBgzfBlock { data: raw_bytes };
@@ -1888,12 +2170,34 @@ impl SortWorkerPool {
             }
         };
 
-        let now_poppable = {
+        let inserted_nanos = shared.now_nanos();
+        // Close the refill cycle this insert may have ended, under the same
+        // mutex the consumer opens one with. Reading `emptied_at` outside it
+        // would let the consumer drain and re-empty in between, so this insert
+        // would time itself against a cycle it did not end and then clear that
+        // cycle -- the next insert, the one that really ended it, would find
+        // nothing open and the cycle would go unmeasured.
+        //
+        // Only the sample is taken here; the histogram record happens outside,
+        // and the load costs one relaxed read on a path that already holds the
+        // lock to insert.
+        let (now_poppable, insert_lag) = {
             let mut dec_guard =
                 file.decompressed.lock().expect("phase2 decompressed mutex poisoned");
-            dec_guard.insert(serial, data);
-            dec_guard.can_pop()
+            dec_guard.insert(serial, TimedBlock { data, inserted_nanos });
+            file.decomp_len.store(dec_guard.len(), Ordering::Relaxed);
+            let insert_lag = file.emptied_at().map(|emptied| {
+                file.mark_refilled();
+                inserted_nanos.saturating_sub(emptied)
+            });
+            (dec_guard.can_pop(), insert_lag)
         };
+        // Recorded before the wake below so the latency excludes however long
+        // the consumer then takes to notice -- that delay is the consumer's,
+        // and it is measured separately as park time.
+        if let Some(lag) = insert_lag {
+            shared.refill.insert_lag.record(lag);
+        }
         // Decrement AFTER the insert is published. The unpark below wakes the
         // consumer in case it has been parked waiting on this specific file
         // (now_poppable=true) or is in the is_drained path waiting for
@@ -1924,11 +2228,11 @@ impl SortWorkerPool {
     /// (or on the decompression-error path).
     fn try_pop_raw_for_decompress(
         file: &Phase2FileState,
-    ) -> std::result::Result<(u64, Vec<u8>), PopSkip> {
+    ) -> std::result::Result<RawEntry, PopSkip> {
         let Ok(mut raw_guard) = file.raw_blocks.try_lock() else {
             return Err(PopSkip::RawLockContended);
         };
-        let Some(head_serial) = raw_guard.front().map(|(s, _)| *s) else {
+        let Some(head_serial) = raw_guard.front().map(|e| e.serial) else {
             return Err(PopSkip::RawEmpty);
         };
 
@@ -1951,6 +2255,7 @@ impl SortWorkerPool {
         // while a worker is still in the middle of decompressing this block.
         // The FIFO was non-empty above and is still held, so this cannot fail.
         let popped = raw_guard.pop_front().expect("raw FIFO emptied under its own lock");
+        file.raw_len.store(raw_guard.len(), Ordering::Relaxed);
         file.decomp_in_flight.fetch_add(1, Ordering::AcqRel);
         Ok(popped)
     }
@@ -2075,14 +2380,64 @@ impl SortWorkerPool {
         self.shared.merge_phases.snapshot()
     }
 
+    /// The pool's shared state, for the merge consumer's own instrumentation.
+    ///
+    /// The consumer runs on the main thread and is not a pool worker, but it is
+    /// one end of the same pipeline: it needs the shared clock so its
+    /// timestamps are comparable with the workers', and the trace counters so
+    /// both halves of a handoff are recorded against one another rather than
+    /// separately.
+    pub(crate) fn shared_state(&self) -> Arc<SharedPipelineState> {
+        Arc::clone(&self.shared)
+    }
+
+    /// A spill block's full journey through the merge -- see
+    /// [`crate::merge_trace`].
+    ///
+    /// The two working stages come from the merge phase counters the workers
+    /// already record into, and the two dwell stages from `block_lifecycle`.
+    /// This is the one place that holds both, which is why it is the only place
+    /// a complete report can be assembled.
+    pub(crate) fn block_lifecycle_report(&self) -> crate::merge_trace::BlockLifecycleReport {
+        let phases = &self.shared.merge_phases;
+        crate::merge_trace::BlockLifecycleReport {
+            read_batch: phases.read.histogram(),
+            decompress: phases.decompress.histogram(),
+            ..self.shared.block_lifecycle.snapshot()
+        }
+    }
+
+    /// How long files that ran dry took to be refilled.
+    pub(crate) fn refill_report(&self) -> crate::merge_trace::RefillReport {
+        self.shared.refill.snapshot()
+    }
+
+    /// The merge consumer's access pattern and what it cost.
+    pub(crate) fn consumer_trace_report(&self) -> crate::merge_trace::ConsumerTraceReport {
+        self.shared.consumer_trace.snapshot()
+    }
+
+    /// How long a worker's fruitless scan of every spill file takes.
+    pub(crate) fn fruitless_scan_report(&self) -> crate::merge_trace::HistogramReport {
+        self.shared.fruitless_scan.snapshot()
+    }
+
     /// Why Phase 2 file scans found no work -- see [`crate::merge_stalls`].
     pub(crate) fn phase2_scan_report(&self) -> Phase2ScanReport {
         self.shared.phase2_scans.snapshot()
     }
 
-    /// How deep workers were sleeping when they found work.
+    /// How deep workers were sleeping when they found work, during the merge.
+    ///
+    /// Scoped to Phase 2 by subtracting the snapshot taken at the phase
+    /// boundary; falls back to the running total only when the pool never
+    /// entered Phase 2, in which case there is no merge to misattribute to.
     pub(crate) fn wake_latency_report(&self) -> WakeLatencyReport {
-        self.shared.wake_latency.snapshot()
+        let now = self.shared.wake_latency.snapshot();
+        match self.shared.wake_latency_at_merge_start.get() {
+            Some(&baseline) => now.since(baseline),
+            None => now,
+        }
     }
 
     /// Codec used to compress Phase 1 spill chunks.
@@ -2142,6 +2497,15 @@ impl SortWorkerPool {
 
     /// Set the current pipeline phase.
     pub fn set_phase(&self, new_phase: u8) {
+        // Pin the wake-latency counters as they stand entering the merge. They
+        // run for the pool's whole life, so without a baseline to subtract, a
+        // merge-scoped report would include every Phase 1 sleep -- see
+        // `WakeLatencyReport::since`. `OnceLock` so a workflow that re-enters
+        // PHASE2 keeps the first boundary rather than silently rebasing.
+        if new_phase == phase::PHASE2 {
+            let _ =
+                self.shared.wake_latency_at_merge_start.set(self.shared.wake_latency.snapshot());
+        }
         self.shared.phase.store(new_phase, Ordering::Release);
     }
 
@@ -2887,6 +3251,37 @@ mod tests {
         pool.shutdown();
     }
 
+    /// A sleep that straddles the Phase 1 -> Phase 2 boundary belongs to
+    /// neither report.
+    ///
+    /// `wake_latency` runs for the pool's whole life and the merge's share is
+    /// taken by subtracting a snapshot pinned at the boundary, so a Phase 1
+    /// sleep recorded after that snapshot lands inside the merge's window —
+    /// booking discovery lag against a merge that had not started when the
+    /// worker went to sleep. The sleep cannot be credited to Phase 1 either,
+    /// since its snapshot is already taken, so it is dropped.
+    #[rstest]
+    #[case::same_phase_sleep_is_charged(
+        Some(PendingSleep { phase: phase::PHASE2, backoff_us: 80 }), phase::PHASE2, Some(80)
+    )]
+    #[case::phase1_sleep_is_not_charged_to_phase2(
+        Some(PendingSleep { phase: phase::PHASE1, backoff_us: 80 }), phase::PHASE2, None
+    )]
+    #[case::phase2_sleep_is_not_charged_to_phase1(
+        Some(PendingSleep { phase: phase::PHASE2, backoff_us: 80 }), phase::PHASE1, None
+    )]
+    #[case::a_phase1_sleep_within_phase1_is_charged(
+        Some(PendingSleep { phase: phase::PHASE1, backoff_us: 40 }), phase::PHASE1, Some(40)
+    )]
+    #[case::no_pending_sleep(None, phase::PHASE2, None)]
+    fn productive_sleep_is_scoped_to_the_phase_it_ran_in(
+        #[case] pending: Option<PendingSleep>,
+        #[case] current_phase: u8,
+        #[case] expected: Option<u64>,
+    ) {
+        assert_eq!(productive_sleep_micros(pending, current_phase), expected);
+    }
+
     #[test]
     fn active_worker_limit_caps_then_reactivates() {
         // Reactivation must be observable on the SAME pool: a fresh pool can never
@@ -3184,19 +3579,62 @@ mod tests {
         Phase2FileState::new(reader, SpillCodec::Bgzf)
     }
 
-    /// Build a tiny placeholder raw block whose contents we never decode.
-    fn dummy_raw_block(byte: u8) -> Vec<u8> {
-        vec![byte; 8]
+    /// Build a tiny placeholder raw entry whose contents we never decode.
+    fn raw_entry(serial: u64, byte: u8) -> RawEntry {
+        RawEntry { serial, bytes: vec![byte; 8], enqueued_nanos: 0 }
+    }
+
+    /// A placeholder decompressed block; the insert timestamp is irrelevant to
+    /// admission control, which is what these tests exercise.
+    fn timed_block(len: usize) -> TimedBlock {
+        TimedBlock { data: vec![0u8; len], inserted_nanos: 0 }
     }
 
     #[test]
     fn test_admission_under_cap_admits() {
         let file = empty_phase2_file();
-        file.raw_blocks.lock().expect("raw lock").push_back((0, dummy_raw_block(0)));
+        file.raw_blocks.lock().expect("raw lock").push_back(raw_entry(0, 0));
         let popped = SortWorkerPool::try_pop_raw_for_decompress(&file);
         assert!(popped.is_ok(), "under cap with empty reorder buffer should admit");
         assert_eq!(file.decomp_in_flight.load(Ordering::Acquire), 1);
         assert!(file.raw_blocks.lock().expect("raw lock").is_empty());
+    }
+
+    /// Seed the FIFO through the deque *and* the mirror, the way the read path
+    /// leaves them, then pop and assert both moved together.
+    ///
+    /// Seeding matters: the other admission tests push straight into the deque
+    /// and leave `raw_len` at zero, so asserting the mirror is zero after a pop
+    /// would pass even with the store deleted. Starting from a non-zero mirror is
+    /// what gives the assertion teeth.
+    ///
+    /// The mirror is what `EmptyCause::classify` and the consumer's park census
+    /// read instead of taking the lock, so a dropped store does not corrupt data
+    /// -- it silently reclassifies every `Dry` empty as `RawReady`, sending the
+    /// next investigation after a scheduling bug that is not there.
+    #[rstest]
+    #[case::pop_leaves_the_fifo_empty(1)]
+    #[case::pop_leaves_the_rest_behind(3)]
+    fn test_raw_len_mirror_tracks_the_deque_across_a_pop(#[case] seeded: usize) {
+        let file = empty_phase2_file();
+        {
+            let mut raw = file.raw_blocks.lock().expect("raw lock");
+            for serial in 0..seeded as u64 {
+                raw.push_back(raw_entry(serial, 0));
+            }
+            file.raw_len.store(raw.len(), Ordering::Relaxed);
+        }
+        assert_eq!(file.depths().0, seeded, "the mirror starts where the read path leaves it");
+
+        SortWorkerPool::try_pop_raw_for_decompress(&file).expect("under cap should admit");
+
+        let deque_len = file.raw_blocks.lock().expect("raw lock").len();
+        assert_eq!(deque_len, seeded - 1, "exactly one entry leaves the FIFO");
+        assert_eq!(
+            file.depths().0,
+            deque_len,
+            "the lock-free raw_len mirror must track the deque; EmptyCause::classify reads it"
+        );
     }
 
     #[test]
@@ -3207,7 +3645,7 @@ mod tests {
         {
             let mut dec = file.decompressed.lock().expect("dec lock");
             for s in 0..PHASE2_DECOMP_CAP as u64 {
-                dec.insert(s, vec![0u8; 4]);
+                dec.insert(s, timed_block(4));
             }
             assert_eq!(dec.len(), PHASE2_DECOMP_CAP);
             assert!(dec.can_pop());
@@ -3215,14 +3653,11 @@ mod tests {
         // Head raw is the next serial after the buffer's contents — not the
         // gap-filler, so admission should reject (consumer is supposed to
         // drain the buffer first).
-        file.raw_blocks
-            .lock()
-            .expect("raw lock")
-            .push_back((PHASE2_DECOMP_CAP as u64, dummy_raw_block(1)));
+        file.raw_blocks.lock().expect("raw lock").push_back(raw_entry(PHASE2_DECOMP_CAP as u64, 1));
         let popped = SortWorkerPool::try_pop_raw_for_decompress(&file);
         assert_eq!(
-            popped.expect_err("at cap and poppable should reject (apply backpressure)"),
-            PopSkip::DecompCapped,
+            popped.err(),
+            Some(PopSkip::DecompCapped),
             "rejecting at cap must be reported as backpressure, not as an empty file"
         );
         assert_eq!(file.decomp_in_flight.load(Ordering::Acquire), 0);
@@ -3237,14 +3672,14 @@ mod tests {
         {
             let mut dec = file.decompressed.lock().expect("dec lock");
             for s in 1..=PHASE2_DECOMP_CAP as u64 {
-                dec.insert(s, vec![0u8; 4]);
+                dec.insert(s, timed_block(4));
             }
             assert_eq!(dec.len(), PHASE2_DECOMP_CAP);
             assert!(!dec.can_pop(), "buffer should be stuck waiting for serial 0");
         }
         // The head raw is serial 0 — the gap-filler. Admission must take it
         // even though we're at cap, otherwise the consumer deadlocks.
-        file.raw_blocks.lock().expect("raw lock").push_back((0, dummy_raw_block(0)));
+        file.raw_blocks.lock().expect("raw lock").push_back(raw_entry(0, 0));
         let popped = SortWorkerPool::try_pop_raw_for_decompress(&file);
         assert!(popped.is_ok(), "at cap and stuck should admit gap-filler at next_seq");
         assert_eq!(file.decomp_in_flight.load(Ordering::Acquire), 1);
@@ -3259,19 +3694,110 @@ mod tests {
         {
             let mut dec = file.decompressed.lock().expect("dec lock");
             for s in 1..=PHASE2_DECOMP_CAP as u64 {
-                dec.insert(s, vec![0u8; 4]);
+                dec.insert(s, timed_block(4));
             }
         }
         file.raw_blocks
             .lock()
             .expect("raw lock")
-            .push_back((PHASE2_DECOMP_CAP as u64 + 1, dummy_raw_block(2)));
+            .push_back(raw_entry(PHASE2_DECOMP_CAP as u64 + 1, 2));
         let popped = SortWorkerPool::try_pop_raw_for_decompress(&file);
-        assert_eq!(
-            popped.expect_err("at cap, stuck, but head != next_seq should reject"),
-            PopSkip::DecompCapped
-        );
+        assert_eq!(popped.err(), Some(PopSkip::DecompCapped));
         assert_eq!(file.decomp_in_flight.load(Ordering::Acquire), 0);
+    }
+
+    /// `read_lag` is defined over the empties where the file held nothing
+    /// anywhere, so the cause must be readable back off the file. Recording it
+    /// for a `RawReady` or `Decompressing` empty would time a read that was
+    /// never on the critical path and make a scheduling delay read as a storage
+    /// one.
+    #[rstest]
+    #[case::nothing_anywhere(0, 0, true)]
+    #[case::raw_block_already_queued(1, 0, false)]
+    #[case::decompression_already_in_flight(0, 1, false)]
+    #[case::both(1, 1, false)]
+    fn test_emptied_while_dry_tracks_the_cause_the_cycle_opened_with(
+        #[case] raw_len: usize,
+        #[case] in_flight: usize,
+        #[case] expected_dry: bool,
+    ) {
+        let file = empty_phase2_file();
+        file.mark_emptied(42, crate::merge_trace::EmptyCause::classify(raw_len, in_flight));
+        assert_eq!(file.emptied_at(), Some(42));
+        assert_eq!(file.emptied_while_dry(), expected_dry);
+    }
+
+    /// `claim_lag` is one sample per refill cycle, not one per worker that
+    /// piles onto the same hungry file. Only the flag's take-once behaviour
+    /// enforces that; a plain load here would inflate `claim_lag`'s count and
+    /// shift `claim_share`, the most actionable number in the trace report.
+    #[test]
+    fn test_first_claim_since_empty_fires_once_per_refill_cycle() {
+        let file = empty_phase2_file();
+        file.mark_emptied(10, crate::merge_trace::EmptyCause::Dry);
+        assert!(file.take_first_claim_since_empty(), "the first responder records");
+        assert!(!file.take_first_claim_since_empty(), "a peer on the same cycle does not");
+
+        file.mark_refilled();
+        assert_eq!(file.emptied_at(), None, "the cycle is closed");
+
+        file.mark_emptied(20, crate::merge_trace::EmptyCause::RawReady);
+        assert!(file.take_first_claim_since_empty(), "a new cycle re-arms the flag");
+        assert!(!file.take_first_claim_since_empty(), "and only re-arms it once");
+    }
+
+    /// A sample may only be timed against the cycle it actually answered.
+    ///
+    /// `claim_lag` and `read_lag` are taken without the `decompressed` mutex
+    /// that makes a cycle's open and close mutually exclusive, so the cycle is
+    /// bound to the sample by its open timestamp instead. Both halves matter:
+    /// the `<=` rejects a cycle that opened after the event, and the re-read
+    /// rejects one that closed while the sample was being taken.
+    #[rstest]
+    // The event happened after the cycle opened, so it is a sample of it.
+    #[case::event_after_the_cycle_opened(100, 150, Some(100))]
+    // Same instant still counts -- a claim can land on the drain that caused it.
+    #[case::event_at_the_instant_it_opened(100, 100, Some(100))]
+    // A cycle that opened after the event cannot be the one the event answered;
+    // timing against it would run backwards and saturate to a fictitious zero.
+    #[case::cycle_opened_after_the_event(100, 50, None)]
+    fn test_a_sample_binds_only_to_a_cycle_that_preceded_it(
+        #[case] opened_at: u64,
+        #[case] event_nanos: u64,
+        #[case] expected: Option<u64>,
+    ) {
+        let file = empty_phase2_file();
+        file.mark_emptied(opened_at, crate::merge_trace::EmptyCause::Dry);
+        assert_eq!(file.cycle_open_at(event_nanos), expected);
+    }
+
+    #[test]
+    fn test_no_sample_binds_when_no_cycle_is_open() {
+        let file = empty_phase2_file();
+        assert_eq!(file.cycle_open_at(u64::MAX), None, "a file that never drained has no cycle");
+    }
+
+    /// The re-read is what catches the interleaving the mutex cannot: a cycle
+    /// that closes -- or closes and reopens -- while a sample is in flight.
+    /// Identity is the open timestamp and the pool epoch is monotonic, so a
+    /// reopened cycle never presents the old one's value.
+    #[test]
+    fn test_a_cycle_that_rolled_over_mid_sample_rejects_the_sample() {
+        let file = empty_phase2_file();
+        file.mark_emptied(10, crate::merge_trace::EmptyCause::Dry);
+        let observed = file.cycle_open_at(15).expect("the cycle is open");
+
+        assert!(file.cycle_still_open(observed), "unchanged, so the sample stands");
+
+        file.mark_refilled();
+        assert!(!file.cycle_still_open(observed), "closed, so the sample is dropped");
+
+        file.mark_emptied(20, crate::merge_trace::EmptyCause::Dry);
+        assert!(
+            !file.cycle_still_open(observed),
+            "reopened as a different cycle -- the sample belongs to neither"
+        );
+        assert_eq!(file.cycle_open_at(25), Some(20), "and the new cycle is the one now open");
     }
 
     #[test]
@@ -3281,8 +3807,8 @@ mod tests {
         // in_flight.
         let popped = SortWorkerPool::try_pop_raw_for_decompress(&file);
         assert_eq!(
-            popped.expect_err("an empty FIFO has nothing to admit"),
-            PopSkip::RawEmpty,
+            popped.err(),
+            Some(PopSkip::RawEmpty),
             "an empty FIFO must not be conflated with a file the pool declined"
         );
         assert_eq!(file.decomp_in_flight.load(Ordering::Acquire), 0);
@@ -3308,7 +3834,7 @@ mod tests {
     fn test_is_drained_blocks_on_pending_raw() {
         let file = empty_phase2_file();
         file.mark_reader_eof(&mut file.reader.lock().expect("reader lock"));
-        file.raw_blocks.lock().expect("raw lock").push_back((0, dummy_raw_block(0)));
+        file.raw_blocks.lock().expect("raw lock").push_back(raw_entry(0, 0));
         assert!(!file.is_drained(), "raw blocks pending must keep is_drained=false");
     }
 
@@ -3316,7 +3842,7 @@ mod tests {
     fn test_is_drained_blocks_on_pending_decompressed() {
         let file = empty_phase2_file();
         file.mark_reader_eof(&mut file.reader.lock().expect("reader lock"));
-        file.decompressed.lock().expect("dec lock").insert(0, vec![1, 2, 3]);
+        file.decompressed.lock().expect("dec lock").insert(0, timed_block(3));
         assert!(!file.is_drained(), "decompressed blocks pending must keep is_drained=false");
     }
 

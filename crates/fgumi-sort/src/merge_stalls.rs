@@ -421,6 +421,30 @@ impl WakeLatencyStats {
     }
 }
 
+impl WakeLatencyReport {
+    /// This report minus `baseline`, i.e. what accumulated between them.
+    ///
+    /// The pool exists for the whole sort, so these counters include Phase 1's
+    /// sleeps. Reporting the running total against merge wall clock overstates
+    /// the merge's share -- on a measured run, 1815s of "deep-sleep
+    /// worker-seconds" against a merge that only had 8 x 305s = 2442
+    /// worker-seconds of capacity in the first place. Subtracting a snapshot
+    /// taken at the phase boundary is what makes the figure comparable to the
+    /// numbers printed beside it.
+    #[must_use]
+    pub fn since(self, baseline: Self) -> Self {
+        Self {
+            idle_nanos: std::array::from_fn(|i| {
+                self.idle_nanos[i].saturating_sub(baseline.idle_nanos[i])
+            }),
+            sleeps: std::array::from_fn(|i| self.sleeps[i].saturating_sub(baseline.sleeps[i])),
+            productive_sleeps: std::array::from_fn(|i| {
+                self.productive_sleeps[i].saturating_sub(baseline.productive_sleeps[i])
+            }),
+        }
+    }
+}
+
 /// Read-only view of [`WakeLatencyStats`], for logging.
 #[derive(Debug, Clone, Copy)]
 pub struct WakeLatencyReport {
@@ -549,6 +573,45 @@ pub(crate) enum AwaitedState {
 impl AwaitedState {
     /// Number of variants, for fixed-size counter arrays.
     pub(crate) const COUNT: usize = 5;
+
+    /// Every variant, in declaration order.
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::ReorderGapFilling,
+        Self::ReorderGapStalled,
+        Self::Decompressing,
+        Self::RawQueued,
+        Self::Starved,
+    ];
+
+    /// Short label for log output.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ReorderGapFilling => "gap-filling",
+            Self::ReorderGapStalled => "gap-stalled",
+            Self::Decompressing => "decompressing",
+            Self::RawQueued => "raw-queued",
+            Self::Starved => "starved",
+        }
+    }
+
+    /// Classify from a file's depths, observed at a point where the consumer
+    /// has just failed to pop the serial it wants.
+    ///
+    /// That precondition is what makes a non-empty reorder buffer mean "holds
+    /// the wrong serials" rather than merely "holds something", so this must
+    /// only be called from the park path.
+    #[must_use]
+    pub(crate) fn classify(decomp_len: usize, in_flight: usize, raw_len: usize) -> Self {
+        if decomp_len > 0 {
+            if in_flight > 0 { Self::ReorderGapFilling } else { Self::ReorderGapStalled }
+        } else if in_flight > 0 {
+            Self::Decompressing
+        } else if raw_len > 0 {
+            Self::RawQueued
+        } else {
+            Self::Starved
+        }
+    }
 }
 
 // Keeps `COUNT` and `ALL` honest: the match is exhaustive, so a sixth variant
@@ -656,6 +719,48 @@ impl ConsumerStallTracker {
             census_awaited: [0; AwaitedState::COUNT],
             census_countdown: 0,
         }
+    }
+
+    /// Restart the counters, discarding everything observed so far.
+    ///
+    /// The tracker is built with the consumer, which happens before the merge
+    /// pulls one block per source to seed the loser tree. Those pulls are the
+    /// likeliest of any to park -- every file is cold at merge start -- and they
+    /// fall outside `loop_total`, which starts once the tree is built. Left in,
+    /// they put `park_fraction` and `classify_stall` on a longer interval than
+    /// the wall clock they are divided by, and on a short merge the K seeding
+    /// parks can be most of what the verdict sees.
+    ///
+    /// Keeps the per-source vectors allocated; only their contents reset.
+    pub(crate) fn restart(&mut self) {
+        let Self {
+            park_nanos_by_source,
+            parks_by_source,
+            block_pulls,
+            stalled_pulls,
+            parks,
+            park_nanos,
+            censuses,
+            census_capped,
+            census_starved,
+            census_contended,
+            census_live,
+            census_awaited,
+            census_countdown,
+        } = self;
+        park_nanos_by_source.fill(0);
+        parks_by_source.fill(0);
+        *block_pulls = 0;
+        *stalled_pulls = 0;
+        *parks = 0;
+        *park_nanos = 0;
+        *censuses = 0;
+        *census_capped = 0;
+        *census_starved = 0;
+        *census_contended = 0;
+        *census_live = 0;
+        census_awaited.fill(0);
+        *census_countdown = 0;
     }
 
     /// Note an attempt to pull the next block for a source.
@@ -1126,6 +1231,37 @@ mod tests {
         assert!((stats.snapshot().deep_sleep_wake_share() - 0.75).abs() < 1e-9);
     }
 
+    /// Phase 1's sleeps must not be charged to the merge.
+    #[test]
+    fn test_wake_report_subtracts_a_phase_boundary_baseline() {
+        let stats = WakeLatencyStats::default();
+        for _ in 0..100 {
+            stats.record_sleep(1000, 1_000_000);
+            stats.record_productive_sleep(1000);
+        }
+        let at_merge_start = stats.snapshot();
+        for _ in 0..10 {
+            stats.record_sleep(1000, 1_000_000);
+            stats.record_productive_sleep(1000);
+        }
+        let merge_only = stats.snapshot().since(at_merge_start);
+        assert_eq!(merge_only.sleeps[7], 10, "only the merge's sleeps may be counted");
+        assert!((merge_only.estimated_discovery_lag_secs() - 0.005).abs() < 1e-9);
+        // The running total is still 110; `since` must not mutate the source.
+        assert_eq!(stats.snapshot().sleeps[7], 110);
+    }
+
+    /// A counter that somehow went backwards must clamp rather than wrap into a
+    /// nonsensical multi-century total.
+    #[test]
+    fn test_wake_report_since_saturates() {
+        let stats = WakeLatencyStats::default();
+        stats.record_sleep(1000, 1_000_000);
+        let later = stats.snapshot();
+        let empty = WakeLatencyStats::default().snapshot();
+        assert_eq!(empty.since(later).sleeps[7], 0);
+    }
+
     #[test]
     fn test_empty_wake_report_is_reported_as_empty() {
         let report = WakeLatencyStats::default().snapshot();
@@ -1233,6 +1369,47 @@ mod tests {
         assert_eq!(report.censuses, 1);
         assert!((report.awaited.starved - 0.0).abs() < f64::EPSILON);
         assert!((report.awaited.unclaimed() - 0.0).abs() < f64::EPSILON);
+    }
+
+    /// Seeding the loser tree happens before the merge clock starts, so the
+    /// stalls it incurs must not survive into the merge's report -- they would
+    /// be divided by a wall time that never contained them. Those seeding pulls
+    /// are also the likeliest to park, since every file is cold at merge start,
+    /// so leaving them in biases the verdict in exactly one direction.
+    #[test]
+    fn test_restart_drops_everything_observed_before_the_merge_clock() {
+        let mut tracker = ConsumerStallTracker::new(3);
+        // One seeding pull per source, each parking on a cold file.
+        for source in 0..3 {
+            tracker.note_block_pull();
+            tracker.record_park(source, 5_000_000, true);
+        }
+        tracker.record_census(ParkCensus {
+            starved: 3,
+            awaited: Some(AwaitedState::Starved),
+            ..ParkCensus::default()
+        });
+        assert!(!tracker.snapshot().is_empty(), "the seeding stalls were recorded");
+
+        tracker.restart();
+
+        let report = tracker.snapshot();
+        assert!(report.is_empty(), "the merge starts from nothing");
+        assert_eq!(report.parks, 0);
+        assert_eq!(report.block_pulls, 0);
+        assert_eq!(report.stalled_pulls, 0);
+        assert_eq!(report.censuses, 0);
+        assert!((report.park_secs - 0.0).abs() < f64::EPSILON);
+        assert!((report.top_source_share() - 0.0).abs() < f64::EPSILON);
+
+        // And it still counts normally afterwards -- a reset that also broke
+        // collection would pass every assertion above.
+        tracker.note_block_pull();
+        tracker.record_park(1, 2_000_000, true);
+        let report = tracker.snapshot();
+        assert_eq!(report.parks, 1);
+        assert_eq!(report.block_pulls, 1);
+        assert!((report.park_secs - 0.002).abs() < 1e-9);
     }
 
     #[test]

@@ -1287,7 +1287,33 @@ pub(crate) struct MainThreadChunkConsumer<K: RawSortKey + 'static> {
     /// Where and for how long the merge loop blocked. Only this thread touches
     /// it -- see [`crate::merge_stalls::ConsumerStallTracker`].
     stalls: crate::merge_stalls::ConsumerStallTracker,
+    /// Shared pool state, for the epoch clock and the trace counters that
+    /// record both halves of a producer/consumer handoff.
+    shared: Arc<crate::worker_pool::SharedPipelineState>,
+    /// Source the previous block came from, and how many consecutive blocks
+    /// have now come from it. Says whether the merge dwells on one run at a
+    /// time -- in which case lookahead on that run would pay -- or hops.
+    current_run: Option<(usize, u64)>,
     _phantom: std::marker::PhantomData<K>,
+}
+
+/// Whether the merge block-lifecycle block has nothing to print.
+///
+/// Every report that block prints must appear here. A report missing from the
+/// gate is dropped whenever it is the only one populated -- which is exactly
+/// when it is the whole story. `scans` is the case that bit: the fruitless-scan
+/// cost is the figure the `WorkUnclaimed` verdict tells the reader to compare
+/// against, so a scans-only run lost the number its own verdict pointed at.
+///
+/// Pure so the coverage is testable without capturing log output, following
+/// [`classify_scan`](crate::merge_stalls::classify_scan).
+fn block_lifecycle_is_silent(
+    life: &crate::merge_trace::BlockLifecycleReport,
+    refill: &crate::merge_trace::RefillReport,
+    consumer: &crate::merge_trace::ConsumerTraceReport,
+    scans: &crate::merge_trace::HistogramReport,
+) -> bool {
+    life.is_empty() && refill.is_empty() && consumer.is_empty() && scans.is_empty()
 }
 
 impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
@@ -1298,6 +1324,7 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
         decompression_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
         chunk_read_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
         worker_panicked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        shared: Arc<crate::worker_pool::SharedPipelineState>,
     ) -> Self {
         let parser_state = (0..files.len()).map(|_| SourceParserState::new()).collect();
         let stalls = crate::merge_stalls::ConsumerStallTracker::new(files.len());
@@ -1308,8 +1335,44 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
             chunk_read_error,
             worker_panicked,
             stalls,
+            shared,
+            current_run: None,
             _phantom: std::marker::PhantomData,
         }
+    }
+
+    /// Note that the merge is taking a block from `source_id`, closing the
+    /// previous source's run if it switched.
+    fn note_source_run(&mut self, source_id: usize) {
+        match self.current_run {
+            Some((prev, blocks)) if prev == source_id => {
+                self.current_run = Some((prev, blocks + 1));
+            }
+            Some((_, blocks)) => {
+                self.shared.consumer_trace.record_source_run(blocks);
+                self.current_run = Some((source_id, 1));
+            }
+            None => self.current_run = Some((source_id, 1)),
+        }
+    }
+
+    /// Flush the run in progress, so the last one is not lost at end of merge.
+    pub(crate) fn finish_source_run(&mut self) {
+        if let Some((_, blocks)) = self.current_run.take() {
+            self.shared.consumer_trace.record_source_run(blocks);
+        }
+    }
+
+    /// Start the stall accounting from now, discarding what came before.
+    ///
+    /// Called once the loser tree is seeded, so the stall figures cover the same
+    /// interval as `loop_total` -- see
+    /// [`ConsumerStallTracker::restart`](crate::merge_stalls::ConsumerStallTracker::restart).
+    pub(crate) fn restart_stalls(&mut self) {
+        self.stalls.restart();
+        // The seeding pulls opened a run that belongs to the same discarded
+        // interval; drop it rather than let it extend the merge's first run.
+        self.current_run = None;
     }
 
     /// Where and for how long the merge loop blocked waiting for blocks.
@@ -1347,19 +1410,7 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
                 // non-empty reorder buffer is proof it holds serials other than
                 // the one wanted -- a gap, not merely "some data". That is what
                 // makes these five states a decision rather than an inference.
-                census.awaited = Some(if decomp_len > 0 {
-                    if in_flight > 0 {
-                        AwaitedState::ReorderGapFilling
-                    } else {
-                        AwaitedState::ReorderGapStalled
-                    }
-                } else if in_flight > 0 {
-                    AwaitedState::Decompressing
-                } else if raw_len > 0 {
-                    AwaitedState::RawQueued
-                } else {
-                    AwaitedState::Starved
-                });
+                census.awaited = Some(AwaitedState::classify(decomp_len, in_flight, raw_len));
             }
 
             if decomp_len >= PHASE2_DECOMP_CAP {
@@ -1428,18 +1479,68 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
         // would keep `self` immutably borrowed across the whole loop.
         loop {
             // Try to pop the next-in-order decompressed block.
+            //
+            // Whether a block was actually taken is carried out of the block
+            // scope rather than returned from inside it, because crediting the
+            // source's run needs `&mut self` and the borrow of `self.files`
+            // taken below is still live in there.
+            let mut popped = false;
             {
-                let mut guard = self.files[source_id]
-                    .decompressed
-                    .lock()
-                    .expect("phase2 decompressed mutex poisoned");
-                if let Some(data) = guard.try_pop_next() {
+                let file = &self.files[source_id];
+                let mut guard =
+                    file.decompressed.lock().expect("phase2 decompressed mutex poisoned");
+                if let Some(block) = guard.try_pop_next() {
+                    let remaining = guard.len();
+                    file.decomp_len.store(remaining, std::sync::atomic::Ordering::Relaxed);
+                    // This pop may have drained the file, which opens a refill
+                    // cycle. Opening it here, at the instant the buffer hits
+                    // zero rather than when the consumer next comes back for a
+                    // block, measures the pipeline's response time rather than
+                    // the consumer's round trip.
+                    //
+                    // Opened while this mutex is still held, because a worker
+                    // closes the cycle under the same mutex and the two must not
+                    // interleave: otherwise an insert could observe a cycle,
+                    // have this pop close it and open the next, and then record
+                    // its latency against the new cycle and clear it -- losing
+                    // that cycle's real measurement and booking a zero for it.
+                    //
+                    // Only a drain pays for the extra work in the critical
+                    // section, so the cost falls once per refill cycle rather
+                    // than once per block, and the clock read and the histogram
+                    // record both stay outside the lock on the common path.
+                    let emptied_cause = if remaining == 0 {
+                        let cause = crate::merge_trace::EmptyCause::classify(
+                            file.raw_len.load(std::sync::atomic::Ordering::Relaxed),
+                            file.decomp_in_flight.load(std::sync::atomic::Ordering::Relaxed),
+                        );
+                        file.mark_emptied(self.shared.now_nanos(), cause);
+                        Some(cause)
+                    } else {
+                        None
+                    };
                     drop(guard);
+                    if let Some(cause) = emptied_cause {
+                        self.shared.refill.record_empty(cause);
+                    }
+                    let now = self.shared.now_nanos();
+                    self.shared
+                        .block_lifecycle
+                        .reorder_dwell
+                        .record(now.saturating_sub(block.inserted_nanos));
                     let st = &mut self.parser_state[source_id];
-                    st.current_buf = data;
+                    st.current_buf = block.data;
                     st.current_pos = 0;
-                    return Ok(true);
+                    popped = true;
                 }
+            }
+            if popped {
+                // Only a block that was actually consumed extends the source's
+                // run. Crediting the call instead adds one phantom block to
+                // every completed run, because a source at EOF is pulled from
+                // once more and comes back empty.
+                self.note_source_run(source_id);
+                return Ok(true);
             }
 
             // No block ready. Check error flags first — they take precedence
@@ -1479,14 +1580,18 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
                 let census = self.census(source_id);
                 self.stalls.record_census(census);
             }
+            // Classify the awaited file on *every* park, not just the censused
+            // ones: the depths are plain atomics, so unlike the pool-wide
+            // census this costs three relaxed loads rather than 86 `try_lock`s.
+            // Park durations are heavy-tailed, so the per-state distribution is
+            // exactly the thing a sampled version would get wrong.
+            let (raw_len, decomp_len, in_flight) = self.files[source_id].depths();
+            let state = crate::merge_stalls::AwaitedState::classify(decomp_len, in_flight, raw_len);
             let park_start = Instant::now();
             std::thread::park();
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "a single park cannot approach 2^64 nanoseconds"
-            )]
-            let parked_ns = park_start.elapsed().as_nanos() as u64;
+            let parked_ns = crate::merge_trace::elapsed_nanos(park_start);
             self.stalls.record_park(source_id, parked_ns, !parked_yet);
+            self.shared.consumer_trace.record_park(state, parked_ns, in_flight);
             parked_yet = true;
         }
     }
@@ -3710,6 +3815,7 @@ impl RawExternalSorter {
                 pool.decompress_error_flag(),
                 pool.chunk_read_error_flag(),
                 pool.worker_panicked_flag(),
+                pool.shared_state(),
             )
         });
         pool.set_phase(crate::worker_pool::phase::PHASE2);
@@ -3934,6 +4040,106 @@ impl RawExternalSorter {
                  delays the merge only when every worker is asleep at once)"
             );
         }
+
+        // Close this block before delegating: `log_block_lifecycle` opens and
+        // closes its own, so without a terminator here the lifecycle block reads
+        // as nested inside the stall block rather than following it.
+        info!("====================");
+        Self::log_block_lifecycle(pool);
+    }
+
+    /// Log every stage of a spill block's journey, and the refill cycle.
+    ///
+    /// The stall block above says the consumer waits for a block that is being
+    /// produced. This says how long each step of producing it takes, and --
+    /// through the refill numbers -- how much of the wait is the pipeline
+    /// working versus the pipeline not having started. See
+    /// [`crate::merge_trace`].
+    #[allow(clippy::cast_precision_loss)]
+    fn log_block_lifecycle(pool: &Arc<SortWorkerPool>) {
+        use crate::merge_stalls::AwaitedState;
+        use crate::merge_trace::EmptyCause;
+
+        let life = pool.block_lifecycle_report();
+        let refill = pool.refill_report();
+        let consumer = pool.consumer_trace_report();
+        let scans = pool.fruitless_scan_report();
+        if block_lifecycle_is_silent(&life, &refill, &consumer, &scans) {
+            return;
+        }
+
+        info!("=== Merge Block Lifecycle ===");
+        info!("  disk read   -> {}", life.read_batch.summary());
+        info!("  raw dwell   -> {}   (queued, waiting for a worker)", life.raw_dwell.summary());
+        info!("  decompress  -> {}", life.decompress.summary());
+        info!(
+            "  reorder     -> {}   (decompressed, waiting for the consumer)",
+            life.reorder_dwell.summary()
+        );
+        if life.reorder_is_pass_through() {
+            info!(
+                "    NOTE: blocks are consumed almost as fast as they are inserted, so the \
+                 reorder buffer is a pass-through and PHASE2_DECOMP_CAP is not the binding \
+                 constraint -- however full the other files look"
+            );
+        }
+
+        if !refill.is_empty() {
+            info!("  Refill cycle ({} times a file's buffer ran dry)", refill.empties());
+            info!(
+                "    At the moment it emptied: {:.0}% had raw blocks unclaimed, {:.0}% already \
+                 decompressing, {:.0}% nothing at all",
+                100.0 * refill.cause_share(EmptyCause::RawReady),
+                100.0 * refill.cause_share(EmptyCause::Decompressing),
+                100.0 * refill.cause_share(EmptyCause::Dry)
+            );
+            info!("    empty -> claimed  {}", refill.claim_lag.summary());
+            info!("    empty -> inserted {}", refill.insert_lag.summary());
+            if !refill.read_lag.summary().is_empty() && !refill.read_lag.is_empty() {
+                info!("    empty -> read     {}", refill.read_lag.summary());
+            }
+            info!(
+                "    -> {:.0}% of refill latency is spent waiting for a worker to START, {:.0}% \
+                 doing the work",
+                100.0 * refill.claim_share(),
+                100.0 * (1.0 - refill.claim_share())
+            );
+        }
+
+        if !consumer.is_empty() {
+            info!("  Park duration by what the awaited file was doing");
+            for state in AwaitedState::ALL {
+                let hist = consumer.park_by_state[state as usize];
+                if !hist.is_empty() {
+                    info!("    {:<14} {}", state.label(), hist.summary());
+                }
+            }
+            let parks = consumer.parks();
+            if parks > 0 {
+                info!(
+                    "    Workers on the awaited file at a park: none {:.0}%, exactly one {:.0}%",
+                    100.0 * consumer.idle_file_parks() as f64 / parks as f64,
+                    100.0 * consumer.single_worker_parks() as f64 / parks as f64
+                );
+            }
+            if !consumer.source_run_length.is_empty() {
+                info!(
+                    "  Consecutive blocks per source: {}",
+                    consumer.source_run_length.summary_blocks()
+                );
+                if consumer.source_run_length.percentile_micros(0.90) <= 1 {
+                    info!(
+                        "    -> the merge switches source almost every block, so there is no hot \
+                         file to prioritise; demand is spread across all runs at once"
+                    );
+                }
+            }
+        }
+
+        if !scans.is_empty() {
+            info!("  Fruitless worker scan cost: {}", scans.summary());
+        }
+        info!("=============================");
     }
 
     /// Log where the merge loop blocked and what the other files were doing.
@@ -4099,6 +4305,15 @@ impl RawExternalSorter {
         // lets this run unconditionally instead of behind a flag nobody
         // remembers to set.
         let mut sample_countdown: u64 = 0;
+        // Seeding the loser tree pulled one block per source, and those pulls
+        // are the likeliest of the whole merge to park -- every file is cold.
+        // They precede this clock, so they must precede the stall counters too,
+        // or `park_fraction` covers a longer interval than the wall time it is
+        // divided by and `classify_stall` reads a merge that never stalled as
+        // one that did.
+        if let Some(consumer) = guard.consumer_mut() {
+            consumer.restart_stalls();
+        }
         let loop_start = Instant::now();
 
         while tree.winner_is_active() {
@@ -4165,7 +4380,14 @@ impl RawExternalSorter {
         // releases the merge sources and with them the consumer, and the report
         // describes the loop that has just ended rather than the output drain
         // that follows.
-        let stalls = guard.consumer_ref().map(MainThreadChunkConsumer::stall_report);
+        let stalls = {
+            // Close the run in progress first, or the last (and often longest)
+            // stretch on one source is dropped from the histogram.
+            if let Some(consumer) = guard.consumer_mut() {
+                consumer.finish_source_run();
+            }
+            guard.consumer_ref().map(MainThreadChunkConsumer::stall_report)
+        };
 
         // Finalize before logging. `finish` drains the output queue, and every
         // block still in it is compressed by the same workers this breakdown
@@ -4243,6 +4465,15 @@ impl RawExternalSorter {
             .with_interval(1_000_000)
             .with_total(total_records);
 
+        // Seeding the loser tree pulled one block per source, and those pulls
+        // are the likeliest of the whole merge to park -- every file is cold.
+        // They precede this clock, so they must precede the stall counters too,
+        // or `park_fraction` covers a longer interval than the wall time it is
+        // divided by and `classify_stall` reads a merge that never stalled as
+        // one that did.
+        if let Some(consumer) = guard.consumer_mut() {
+            consumer.restart_stalls();
+        }
         let loop_start = Instant::now();
         while tree.winner_is_active() {
             let winner = tree.winner();
@@ -4265,7 +4496,14 @@ impl RawExternalSorter {
         // coordinate sort, so that gap covers most production merges.
         Self::log_merge_stalls(
             loop_start.elapsed().as_secs_f64(),
-            guard.consumer_ref().map(MainThreadChunkConsumer::stall_report),
+            {
+                // Close the run in progress first, or the last (and often
+                // longest) stretch on one source is dropped from the histogram.
+                if let Some(consumer) = guard.consumer_mut() {
+                    consumer.finish_source_run();
+                }
+                guard.consumer_ref().map(MainThreadChunkConsumer::stall_report)
+            },
             pool,
         );
 
@@ -4791,6 +5029,72 @@ mod tests {
     use noodles::sam::header::record::value::Map;
     use noodles::sam::header::record::value::map::ReadGroup;
     use rstest::rstest;
+
+    // ========================================================================
+    // Merge diagnostics reporting
+    // ========================================================================
+
+    /// The block-lifecycle gate must name every report the block prints.
+    ///
+    /// Each case populates exactly one report and asserts the block still
+    /// speaks. A report left out of the gate passes every case but its own,
+    /// which is what makes one case per report the point rather than a
+    /// formality -- `scans` was the one that had been omitted.
+    #[rstest]
+    #[case::nothing_recorded_stays_silent("none", true)]
+    #[case::block_lifecycle_alone_speaks("life", false)]
+    #[case::refill_cycle_alone_speaks("refill", false)]
+    #[case::consumer_trace_alone_speaks("consumer", false)]
+    #[case::fruitless_scans_alone_speak("scans", false)]
+    fn block_lifecycle_gate_covers_every_report(#[case] populate: &str, #[case] silent: bool) {
+        use crate::merge_trace::{
+            BlockLifecycleStats, ConsumerTraceStats, DurationHistogram, EmptyCause, RefillStats,
+        };
+
+        let life = {
+            let stats = BlockLifecycleStats::default();
+            if populate == "life" {
+                stats.raw_dwell.record(1_000);
+            }
+            let mut report = stats.snapshot();
+            // `is_empty` keys off the working stages, which the pool fills in.
+            if populate == "life" {
+                report.decompress = {
+                    let h = DurationHistogram::default();
+                    h.record(1_000);
+                    h.snapshot()
+                };
+            }
+            report
+        };
+        let refill = {
+            let stats = RefillStats::default();
+            if populate == "refill" {
+                stats.record_empty(EmptyCause::Dry);
+            }
+            stats.snapshot()
+        };
+        let consumer = {
+            let stats = ConsumerTraceStats::default();
+            if populate == "consumer" {
+                stats.record_source_run(4);
+            }
+            stats.snapshot()
+        };
+        let scans = {
+            let hist = DurationHistogram::default();
+            if populate == "scans" {
+                hist.record(1_000);
+            }
+            hist.snapshot()
+        };
+
+        assert_eq!(
+            block_lifecycle_is_silent(&life, &refill, &consumer, &scans),
+            silent,
+            "gate disagreed with the only populated report ({populate})"
+        );
+    }
 
     // ========================================================================
     // Chunk spill triggers
