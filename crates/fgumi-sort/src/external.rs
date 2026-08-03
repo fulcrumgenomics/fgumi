@@ -1544,6 +1544,15 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
                         None
                     };
                     drop(guard);
+                    if emptied_cause.is_some() {
+                        // This file needs a worker now. Waking one here is the
+                        // difference between the pool learning that within a
+                        // microsecond and learning it whenever some worker's
+                        // backoff happens to expire. After the drop, so the
+                        // woken worker does not immediately block on the mutex
+                        // this thread would still be holding.
+                        self.shared.wake_one_worker();
+                    }
                     if let Some(cause) = emptied_cause {
                         self.shared.refill.record_empty(cause);
                     }
@@ -1586,6 +1595,9 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
 
             // Source produced everything it ever will?
             if self.files[source_id].is_drained() {
+                // Move the drain frontier past it, so workers scanning for the
+                // next hungry file start at one that still has records.
+                self.shared.advance_phase2_frontier(&self.files);
                 return Ok(false);
             }
 
@@ -2492,6 +2504,17 @@ impl RawExternalSorter {
         output: &Path,
         pool: Arc<SortWorkerPool>,
     ) -> Result<RawSortStats> {
+        // Say so when the input claims to be in the order being requested. This
+        // is checked before @PG is added so it reflects the input as given.
+        if crate::header_declares_order(header, self.sort_order) {
+            log::warn!(
+                "Input header already declares this sort order ({}); sorting it again. \
+                 Headers are not verified, so the sort still runs -- use `--verify` to \
+                 check an input's order without rewriting it.",
+                self.sort_order_flag_value()
+            );
+        }
+
         // Add @PG record if pg_info was provided
         let header = if let Some((ref version, ref command_line)) = self.pg_info {
             fgumi_bam_io::header::add_pg_record(header.clone(), version, command_line)?
@@ -4076,8 +4099,9 @@ impl RawExternalSorter {
                     100.0 * wake.deep_sleep_wake_share()
                 );
                 info!(
-                    "    (nothing unparks a worker, so this bounds how late work is noticed; it \
-                     delays the merge only when every worker is asleep at once)"
+                    "    (the consumer unparks one worker when a reorder buffer drains, so this \
+                     bounds how late work arriving any other way is noticed; it delays the merge \
+                     only when every worker is asleep at once)"
                 );
             }
 
@@ -5204,6 +5228,7 @@ mod tests {
     fn merge_stall_gate_covers_every_report(#[case] populate: &str, #[case] silent: bool) {
         use crate::merge_stalls::{
             ConsumerStallTracker, Phase2ScanStats, Phase2ScanTally, Phase2Skip, WakeLatencyStats,
+            WakePhase,
         };
 
         let stalls = {
@@ -5225,9 +5250,9 @@ mod tests {
         let wake = {
             let stats = WakeLatencyStats::default();
             if populate == "wake" {
-                stats.record_sleep(320, 1_000);
+                stats.record_sleep(WakePhase::Merge, 320, 1_000);
             }
-            stats.snapshot()
+            stats.snapshot(WakePhase::Merge)
         };
 
         // Mirrors the caller, which drops an all-zero stall report before the
@@ -5250,7 +5275,9 @@ mod tests {
     /// on exactly those runs.
     #[test]
     fn silent_stall_gate_does_not_silence_the_lifecycle_gate() {
-        use crate::merge_stalls::{ConsumerStallTracker, Phase2ScanStats, WakeLatencyStats};
+        use crate::merge_stalls::{
+            ConsumerStallTracker, Phase2ScanStats, WakeLatencyStats, WakePhase,
+        };
         use crate::merge_trace::{
             BlockLifecycleStats, ConsumerTraceStats, DurationHistogram, RefillStats,
         };
@@ -5259,7 +5286,7 @@ mod tests {
         // empty, no worker slept.
         let stalls = ConsumerStallTracker::new(1).snapshot();
         let scans = Phase2ScanStats::default().snapshot();
-        let wake = WakeLatencyStats::default().snapshot();
+        let wake = WakeLatencyStats::default().snapshot(WakePhase::Merge);
         assert!(
             merge_stalls_are_silent(Some(&stalls), &scans, &wake),
             "a merge with no stalls should leave the stall block silent"
