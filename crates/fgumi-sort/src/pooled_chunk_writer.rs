@@ -28,7 +28,7 @@ use crate::keys::RawSortKey;
 use crate::worker_pool::{CompressResult, CompressTarget, PermitPool, SortWorkerPool};
 use anyhow::Result;
 use crossbeam_channel::bounded;
-use fgumi_bgzf::BGZF_MAX_BLOCK_SIZE;
+use fgumi_bgzf::{BGZF_EOF, BGZF_MAX_BLOCK_SIZE};
 use std::io::BufWriter;
 use std::marker::PhantomData;
 use std::path::Path;
@@ -49,6 +49,46 @@ pub struct PooledChunkWriter<K: RawSortKey> {
     _phantom: PhantomData<K>,
 }
 
+/// Remove the BGZF end-of-stream marker from the end of a spill run.
+///
+/// Called before appending another chunk, so the finished run carries exactly one
+/// terminator. `read_raw_blocks` would in fact skip an interior marker
+/// (`fgumi-bgzf`), so this is not what makes appending correct — it keeps the run
+/// well-formed for anything else that reads it, htslib included, and avoids the
+/// edge where a read batch of nothing but markers looks like end-of-file.
+///
+/// Verifies the tail before truncating: silently lopping 28 bytes off a file that
+/// does not end the way we expect would corrupt a record instead of removing a
+/// marker.
+fn truncate_bgzf_terminator(path: &Path) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let len = file.metadata()?.len();
+    let marker_len = BGZF_EOF.len() as u64;
+    anyhow::ensure!(
+        len >= marker_len,
+        "cannot append to {}: file is {len} bytes, shorter than a BGZF terminator",
+        path.display()
+    );
+
+    // Seek from the end by the marker's length. `BGZF_EOF` is a 28-byte
+    // constant, so this conversion cannot wrap in practice; do it explicitly
+    // rather than silencing the lint.
+    let marker_offset = i64::try_from(marker_len).expect("BGZF terminator length fits in i64");
+    file.seek(SeekFrom::End(-marker_offset))?;
+    let mut tail = vec![0u8; BGZF_EOF.len()];
+    file.read_exact(&mut tail)?;
+    anyhow::ensure!(
+        tail == BGZF_EOF,
+        "cannot append to {}: it does not end with a BGZF terminator",
+        path.display()
+    );
+
+    file.set_len(len - marker_len)?;
+    Ok(())
+}
+
 impl<K: RawSortKey> PooledChunkWriter<K> {
     /// Create a new pooled chunk writer with an explicit spill codec.
     ///
@@ -61,9 +101,44 @@ impl<K: RawSortKey> PooledChunkWriter<K> {
     ///
     /// Returns an error if the output file cannot be created.
     pub fn new(pool: Arc<SortWorkerPool>, path: &Path, codec: SpillCodec) -> Result<Self> {
-        let file = std::fs::File::create(path)?;
+        Self::open(pool, path, codec, false)
+    }
+
+    /// Append another sorted chunk to an existing run.
+    ///
+    /// The caller must have established that every key in this chunk sorts at or
+    /// after the run's last key; this type does not and cannot check that.
+    ///
+    /// Two things differ from [`Self::new`]. The file is opened for append rather
+    /// than truncated, and the zstd format magic is written only when a run is
+    /// created — it identifies the file, not each chunk within it. For BGZF the
+    /// trailing end-of-stream marker left by the previous chunk is removed first,
+    /// so a finished run carries exactly one terminator, at its end.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be opened, or if a BGZF run does not
+    /// end with the terminator this writer would have written.
+    pub fn append(pool: Arc<SortWorkerPool>, path: &Path, codec: SpillCodec) -> Result<Self> {
+        Self::open(pool, path, codec, true)
+    }
+
+    fn open(
+        pool: Arc<SortWorkerPool>,
+        path: &Path,
+        codec: SpillCodec,
+        appending: bool,
+    ) -> Result<Self> {
+        let file = if appending {
+            if matches!(codec, SpillCodec::Bgzf) {
+                truncate_bgzf_terminator(path)?;
+            }
+            std::fs::OpenOptions::new().append(true).open(path)?
+        } else {
+            std::fs::File::create(path)?
+        };
         let mut writer = BufWriter::with_capacity(256 * 1024, file);
-        if matches!(codec, SpillCodec::Zstd) {
+        if matches!(codec, SpillCodec::Zstd) && !appending {
             use std::io::Write;
             writer.write_all(&ZSPILL_MAGIC)?;
         }
