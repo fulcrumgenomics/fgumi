@@ -517,6 +517,57 @@ const DEEP_SLEEP_FIRST_BUCKET: usize = 5;
 // Consumer side: where the merge loop blocks
 // ============================================================================
 
+/// What the file the consumer is actually waiting on was doing.
+///
+/// The pool-wide shares below say what the *other* files were doing, which
+/// turned out to answer a question nobody was asking: on a measured 780M-record
+/// merge, 98% of files sat at their cap while the awaited file was starved only
+/// 3% of the time. Knowing the rest of the pool is full says nothing about why
+/// the one file that matters has not produced its next block.
+///
+/// These five states are mutually exclusive and, crucially, are observed at a
+/// point where the consumer has *just* failed `try_pop_next`. So a non-empty
+/// reorder buffer is proof the buffer holds the wrong serials, not a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AwaitedState {
+    /// The buffer holds blocks, but not the next serial, and a decompression is
+    /// underway — the gap-filler is being produced right now.
+    ReorderGapFilling,
+    /// The buffer holds blocks, but not the next serial, and nothing is being
+    /// decompressed for this file. The work exists and no worker has claimed
+    /// it.
+    ReorderGapStalled,
+    /// Nothing buffered, but a decompression for this file is in flight.
+    Decompressing,
+    /// Nothing buffered and nothing in flight, but raw blocks are queued —
+    /// read from disk and waiting for a worker to pick them up.
+    RawQueued,
+    /// Nothing anywhere and the reader is not at EOF: waiting on disk.
+    Starved,
+}
+
+impl AwaitedState {
+    /// Number of variants, for fixed-size counter arrays.
+    pub(crate) const COUNT: usize = 5;
+}
+
+// Keeps `COUNT` and `ALL` honest: the match is exhaustive, so a sixth variant
+// fails to compile here instead of indexing past the end of `park_by_state`
+// inside [`ConsumerTraceStats::record_park`](crate::merge_trace::ConsumerTraceStats)
+// -- on a worker-facing path, where it surfaces only as a panic.
+const _: () = {
+    const fn assert_count(state: AwaitedState) -> usize {
+        match state {
+            AwaitedState::ReorderGapFilling => 0,
+            AwaitedState::ReorderGapStalled => 1,
+            AwaitedState::Decompressing => 2,
+            AwaitedState::RawQueued => 3,
+            AwaitedState::Starved => AwaitedState::COUNT - 1,
+        }
+    }
+    assert!(assert_count(AwaitedState::Starved) == 4);
+};
+
 /// The other files' states at the moment the consumer parked.
 ///
 /// Built by the caller, which owns the locks; keeping the observation out of
@@ -533,9 +584,8 @@ pub(crate) struct ParkCensus {
     pub(crate) drained: u32,
     /// Files whose state could not be read without blocking.
     pub(crate) contended: u32,
-    /// Whether the file the consumer is waiting on is itself starved — nothing
-    /// buffered, nothing in flight, reader not at EOF.
-    pub(crate) waited_on_starved: bool,
+    /// What the awaited file itself was doing, when it could be read.
+    pub(crate) awaited: Option<AwaitedState>,
 }
 
 impl ParkCensus {
@@ -571,7 +621,8 @@ pub(crate) struct ConsumerStallTracker {
     census_starved: u64,
     census_contended: u64,
     census_live: u64,
-    census_waited_on_starved: u64,
+    /// Awaited-file states observed, indexed by [`AwaitedState`] as `usize`.
+    census_awaited: [u64; AwaitedState::COUNT],
     /// Countdown to the next census.
     census_countdown: u64,
 }
@@ -602,7 +653,7 @@ impl ConsumerStallTracker {
             census_starved: 0,
             census_contended: 0,
             census_live: 0,
-            census_waited_on_starved: 0,
+            census_awaited: [0; AwaitedState::COUNT],
             census_countdown: 0,
         }
     }
@@ -652,7 +703,9 @@ impl ConsumerStallTracker {
         self.census_starved += u64::from(census.starved);
         self.census_contended += u64::from(census.contended);
         self.census_live += u64::from(census.live());
-        self.census_waited_on_starved += u64::from(census.waited_on_starved);
+        if let Some(state) = census.awaited {
+            self.census_awaited[state as usize] += 1;
+        }
     }
 
     #[allow(
@@ -676,11 +729,7 @@ impl ConsumerStallTracker {
             capped_share: share(self.census_capped),
             starved_share: share(self.census_starved),
             contended_share: share(self.census_contended),
-            waited_on_starved_share: if self.censuses > 0 {
-                self.census_waited_on_starved as f64 / self.censuses as f64
-            } else {
-                0.0
-            },
+            awaited: AwaitedShares::from_counts(self.census_awaited),
             censuses: self.censuses,
             top_source: top.0,
             top_source_park_secs: top.1 as f64 / 1e9,
@@ -714,8 +763,10 @@ pub struct ConsumerStallReport {
     /// Share of live-file observations whose state could not be read at a park,
     /// pooled the same way as [`Self::capped_share`].
     pub contended_share: f64,
-    /// Share of parks where the awaited file was itself starved.
-    pub waited_on_starved_share: f64,
+    /// What the awaited file was doing, as shares of the censuses that could
+    /// read it -- which is at most [`Self::censuses`], not necessarily all of
+    /// them. See [`AwaitedShares`].
+    pub awaited: AwaitedShares,
     /// Censuses taken.
     pub censuses: u64,
     /// Source the consumer parked on longest.
@@ -771,21 +822,88 @@ impl ConsumerStallReport {
     }
 }
 
+/// What the awaited file was doing, as shares of the censuses that could read
+/// it.
+///
+/// A census that found the awaited file unreadable is excluded from the
+/// denominator, so these sum to 1 whenever any observation was made -- and the
+/// count they are shares of can be below [`ConsumerStallReport::censuses`].
+/// Multiplying a share by `censuses` therefore does not recover a count.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AwaitedShares {
+    /// Buffer holds the wrong serials; the gap-filler is being decompressed.
+    pub reorder_gap_filling: f64,
+    /// Buffer holds the wrong serials and nothing is being decompressed.
+    pub reorder_gap_stalled: f64,
+    /// Nothing buffered; a decompression is in flight.
+    pub decompressing: f64,
+    /// Raw blocks queued with no worker on them.
+    pub raw_queued: f64,
+    /// Nothing anywhere, reader not at EOF.
+    pub starved: f64,
+}
+
+impl AwaitedShares {
+    /// Shares of `counts.iter().sum()` -- the censuses that read the awaited
+    /// file, which is what `counts` tallies. Censuses that could not read it
+    /// were never tallied here and so are not in the denominator.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "census counts stay far below 2^52 on any real sort"
+    )]
+    fn from_counts(counts: [u64; AwaitedState::COUNT]) -> Self {
+        let total: u64 = counts.iter().sum();
+        if total == 0 {
+            return Self::default();
+        }
+        let share = |state: AwaitedState| counts[state as usize] as f64 / total as f64;
+        Self {
+            reorder_gap_filling: share(AwaitedState::ReorderGapFilling),
+            reorder_gap_stalled: share(AwaitedState::ReorderGapStalled),
+            decompressing: share(AwaitedState::Decompressing),
+            raw_queued: share(AwaitedState::RawQueued),
+            starved: share(AwaitedState::Starved),
+        }
+    }
+
+    /// Share where the block the consumer needs exists but no worker is on it.
+    ///
+    /// Actionable: the pipeline has the data and is not applying capacity to
+    /// it, which is a scheduling or discovery problem.
+    #[must_use]
+    pub fn unclaimed(self) -> f64 {
+        self.reorder_gap_stalled + self.raw_queued
+    }
+
+    /// Share where a worker is already producing the needed block.
+    ///
+    /// Not actionable by scheduling: the wait is the per-block decompression
+    /// cost, and only running further ahead or decompressing faster removes it.
+    #[must_use]
+    pub fn in_progress(self) -> f64 {
+        self.reorder_gap_filling + self.decompressing
+    }
+}
+
 /// The shape of a consumer stall — which of the candidate causes it fits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StallShape {
     /// The consumer barely parked; whatever it spends its loop on, it is not
     /// waiting for blocks.
     NotStalled,
-    /// The consumer waits on a starved file while most others sit at their cap.
-    /// Read-ahead is allocated evenly across files while demand is not, so the
-    /// pool buffers work nobody needs yet and starves the one run that is next.
-    /// A uniformly bigger cap does not fix this; steering workers toward the
-    /// file the loser tree needs does.
+    /// The consumer waits on a file with nothing anywhere in its pipeline —
+    /// the block has not even been read from disk. The constraint is upstream
+    /// of the pool: disk, or read concurrency.
     HeadOfLine,
-    /// Most files are starved too, so the pool as a whole cannot keep the
-    /// consumer fed — the constraint is upstream of the caps.
-    PoolStarved,
+    /// The block the consumer needs already exists, in raw or partially
+    /// reordered form, and no worker is applying capacity to it. A scheduling
+    /// and discovery problem, not a capacity one: workers are idle, or looking
+    /// at the wrong file, or asleep.
+    WorkUnclaimed,
+    /// A worker is already producing the block the consumer needs. The wait is
+    /// the per-block decompression cost itself, so only running further ahead
+    /// (a deeper cap) or decompressing faster removes it.
+    DecompressLatency,
     /// Enough of the pipeline's state was lock-contended that contention is the
     /// first thing to fix; the other shares are unreliable until it is.
     Contended,
@@ -795,12 +913,8 @@ pub enum StallShape {
 
 /// Park share of the merge loop below which the consumer is not stalling.
 const NOT_STALLED_PARK_FRACTION: f64 = 0.05;
-/// Share of live files that must be at cap for head-of-line blocking.
-const HEAD_OF_LINE_CAPPED_SHARE: f64 = 0.50;
-/// Share of parks whose awaited file must be starved for head-of-line blocking.
-const HEAD_OF_LINE_WAITED_SHARE: f64 = 0.50;
-/// Share of live files that must be starved to blame the pool as a whole.
-const POOL_STARVED_SHARE: f64 = 0.50;
+/// Share of the awaited-file census one explanation must reach to be reported.
+const AWAITED_DOMINANT_SHARE: f64 = 0.50;
 /// Share of live files that must be unreadable to blame contention.
 const CONTENDED_FILE_SHARE: f64 = 0.25;
 
@@ -808,33 +922,36 @@ const CONTENDED_FILE_SHARE: f64 = 0.25;
 ///
 /// `park_fraction` is exact park time over merge loop wall clock, which makes
 /// the `NotStalled` gate trustworthy in a way the sampled fetch fraction is not.
-/// The remaining inputs come from the sampled park census.
+/// `awaited` comes from the sampled park census.
 ///
-/// The discriminating input is `waited_on_starved_share`. A high `capped_share`
-/// alone is ambiguous — it is exactly what a healthy, consumer-limited merge
-/// looks like. It only indicts the caps when the consumer is *simultaneously*
-/// blocked on a file that has nothing, which is what makes the buffering
-/// misallocated rather than merely full.
+/// # Why this classifies on the awaited file, not on the pool
 ///
-/// Thresholds are provisional; see the module doc.
+/// It used to key off "most files at cap while the awaited file is starved",
+/// on the theory that read-ahead was being misallocated across files. Measured
+/// on a 780M-record merge, 98% of files were at cap and the awaited file was
+/// starved 3% of the time — the pool-wide share was near-constant across arms
+/// that stalled 8x differently, so it discriminated nothing. What the consumer
+/// is waiting *for* does.
+///
+/// The useful split is whether the needed block exists yet, and if it does,
+/// whether anyone is working on it. Those three cases have three different
+/// fixes, and no pool-wide statistic distinguishes them.
 #[must_use]
 pub fn classify_stall(
     park_fraction: f64,
-    capped_share: f64,
-    starved_share: f64,
     contended_share: f64,
-    waited_on_starved_share: f64,
+    awaited: AwaitedShares,
 ) -> StallShape {
     if park_fraction < NOT_STALLED_PARK_FRACTION {
         StallShape::NotStalled
     } else if contended_share >= CONTENDED_FILE_SHARE {
         StallShape::Contended
-    } else if capped_share >= HEAD_OF_LINE_CAPPED_SHARE
-        && waited_on_starved_share >= HEAD_OF_LINE_WAITED_SHARE
-    {
+    } else if awaited.starved >= AWAITED_DOMINANT_SHARE {
         StallShape::HeadOfLine
-    } else if starved_share >= POOL_STARVED_SHARE {
-        StallShape::PoolStarved
+    } else if awaited.unclaimed() >= AWAITED_DOMINANT_SHARE {
+        StallShape::WorkUnclaimed
+    } else if awaited.in_progress() >= AWAITED_DOMINANT_SHARE {
+        StallShape::DecompressLatency
     } else {
         StallShape::Mixed
     }
@@ -1095,14 +1212,44 @@ mod tests {
             working: 1,
             drained: 90,
             contended: 2,
-            waited_on_starved: true,
+            awaited: Some(AwaitedState::Starved),
         });
         let report = tracker.snapshot();
         // 10 live files out of 100 observed: the 90 drained ones do not dilute.
         assert!((report.capped_share - 0.6).abs() < 1e-9);
         assert!((report.starved_share - 0.1).abs() < 1e-9);
         assert!((report.contended_share - 0.2).abs() < 1e-9);
-        assert!((report.waited_on_starved_share - 1.0).abs() < 1e-9);
+        assert!((report.awaited.starved - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_awaited_states_are_grouped_by_what_can_be_done_about_them() {
+        let mut tracker = ConsumerStallTracker::new(4);
+        for state in [
+            AwaitedState::ReorderGapStalled,
+            AwaitedState::RawQueued,
+            AwaitedState::ReorderGapFilling,
+            AwaitedState::Decompressing,
+        ] {
+            tracker.record_census(ParkCensus { awaited: Some(state), ..ParkCensus::default() });
+        }
+        let awaited = tracker.snapshot().awaited;
+        // Half the waits are on work nobody has claimed (fixable by scheduling)
+        // and half on work already underway (fixable only by getting ahead).
+        assert!((awaited.unclaimed() - 0.5).abs() < 1e-9);
+        assert!((awaited.in_progress() - 0.5).abs() < 1e-9);
+    }
+
+    /// A census that could not read the awaited file must not be counted as an
+    /// observation of it, or an unreadable file silently reads as a state.
+    #[test]
+    fn test_unreadable_awaited_file_is_not_counted() {
+        let mut tracker = ConsumerStallTracker::new(4);
+        tracker.record_census(ParkCensus { contended: 4, awaited: None, ..ParkCensus::default() });
+        let report = tracker.snapshot();
+        assert_eq!(report.censuses, 1);
+        assert!((report.awaited.starved - 0.0).abs() < f64::EPSILON);
+        assert!((report.awaited.unclaimed() - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1113,41 +1260,54 @@ mod tests {
         assert!((report.top_source_share() - 0.0).abs() < f64::EPSILON);
     }
 
+    /// Build shares in declaration order: filling, stalled, decompressing,
+    /// raw-queued, starved.
+    fn awaited_shares(s: [f64; AwaitedState::COUNT]) -> AwaitedShares {
+        AwaitedShares {
+            reorder_gap_filling: s[0],
+            reorder_gap_stalled: s[1],
+            decompressing: s[2],
+            raw_queued: s[3],
+            starved: s[4],
+        }
+    }
+
     #[rstest]
-    // The hypothesis under test: the consumer is blocked on an empty file while
-    // the pool has buffered every other file to its cap. Misallocated
-    // read-ahead, not insufficient read-ahead.
-    #[case::head_of_line_blocking(0.60, 0.85, 0.05, 0.02, 0.90, StallShape::HeadOfLine)]
-    // Same high capped share, but the consumer is never waiting on a starved
-    // file — this is just a consumer-limited merge, and the caps are innocent.
-    #[case::consumer_limited_but_not_misallocated(0.60, 0.85, 0.05, 0.02, 0.10, StallShape::Mixed)]
-    // Nothing buffered anywhere: the constraint is upstream of the caps, so
-    // raising them cannot help.
-    #[case::pool_cannot_keep_up(0.60, 0.05, 0.80, 0.02, 0.90, StallShape::PoolStarved)]
+    // The block has not been read from disk at all: nothing the pool does with
+    // its buffers or its scheduler can help.
+    #[case::block_not_read_yet(0.60, 0.02, [0.05, 0.05, 0.10, 0.10, 0.70], StallShape::HeadOfLine)]
+    // The block exists -- as raw bytes, or as a gap with nothing being
+    // decompressed -- and no worker has claimed it. Scheduling, not capacity.
+    #[case::work_sitting_unclaimed(0.60, 0.02, [0.10, 0.40, 0.10, 0.35, 0.05], StallShape::WorkUnclaimed)]
+    // A worker is already on it, so the wait is the decompression itself.
+    #[case::already_being_produced(0.60, 0.02, [0.45, 0.05, 0.40, 0.05, 0.05], StallShape::DecompressLatency)]
     // Contention is checked first: while a quarter of the census is unreadable,
     // the other shares are estimates of an unobserved population.
-    #[case::contention_masks_the_other_shares(0.60, 0.85, 0.05, 0.30, 0.90, StallShape::Contended)]
+    #[case::contention_masks_the_other_shares(0.60, 0.30, [0.45, 0.05, 0.40, 0.05, 0.05], StallShape::Contended)]
     // Measured on the storedout arm, where the consumer waits far less; the
     // gate has to be on exact park time, not the sampled fetch fraction.
-    #[case::consumer_not_waiting(0.01, 0.90, 0.05, 0.30, 0.90, StallShape::NotStalled)]
-    #[case::nothing_dominates(0.60, 0.30, 0.30, 0.10, 0.30, StallShape::Mixed)]
+    #[case::consumer_not_waiting(0.01, 0.30, [0.45, 0.05, 0.40, 0.05, 0.05], StallShape::NotStalled)]
+    // Unclaimed and in-progress each fall short of dominance; reporting either
+    // would be a guess.
+    #[case::nothing_dominates(0.60, 0.02, [0.25, 0.25, 0.20, 0.20, 0.10], StallShape::Mixed)]
     fn test_classify_stall(
         #[case] park_fraction: f64,
-        #[case] capped_share: f64,
-        #[case] starved_share: f64,
         #[case] contended_share: f64,
-        #[case] waited_on_starved_share: f64,
+        #[case] awaited: [f64; AwaitedState::COUNT],
         #[case] expected: StallShape,
     ) {
         assert_eq!(
-            classify_stall(
-                park_fraction,
-                capped_share,
-                starved_share,
-                contended_share,
-                waited_on_starved_share
-            ),
+            classify_stall(park_fraction, contended_share, awaited_shares(awaited)),
             expected
         );
+    }
+
+    /// The three groups partition the census, so a stall always has an answer
+    /// even when no single state dominates.
+    #[test]
+    fn test_awaited_groups_partition_the_census() {
+        let shares = awaited_shares([0.2, 0.3, 0.15, 0.25, 0.1]);
+        let total = shares.starved + shares.unclaimed() + shares.in_progress();
+        assert!((total - 1.0).abs() < 1e-9);
     }
 }

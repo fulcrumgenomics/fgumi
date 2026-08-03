@@ -1325,6 +1325,7 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
     /// `contended` rather than guessed at. The two locks are taken and released
     /// one at a time, so this introduces no lock ordering of its own.
     fn census(&self, waited_on: usize) -> crate::merge_stalls::ParkCensus {
+        use crate::merge_stalls::AwaitedState;
         use crate::worker_pool::PHASE2_DECOMP_CAP;
 
         let mut census = crate::merge_stalls::ParkCensus::default();
@@ -1341,15 +1342,32 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
             let at_eof = file.reader_eof.load(std::sync::atomic::Ordering::Relaxed);
             let empty = raw_len == 0 && decomp_len == 0 && in_flight == 0;
 
+            if idx == waited_on {
+                // The caller has just failed `try_pop_next` on this file, so a
+                // non-empty reorder buffer is proof it holds serials other than
+                // the one wanted -- a gap, not merely "some data". That is what
+                // makes these five states a decision rather than an inference.
+                census.awaited = Some(if decomp_len > 0 {
+                    if in_flight > 0 {
+                        AwaitedState::ReorderGapFilling
+                    } else {
+                        AwaitedState::ReorderGapStalled
+                    }
+                } else if in_flight > 0 {
+                    AwaitedState::Decompressing
+                } else if raw_len > 0 {
+                    AwaitedState::RawQueued
+                } else {
+                    AwaitedState::Starved
+                });
+            }
+
             if decomp_len >= PHASE2_DECOMP_CAP {
                 census.capped += 1;
             } else if empty && at_eof {
                 census.drained += 1;
             } else if empty {
                 census.starved += 1;
-                if idx == waited_on {
-                    census.waited_on_starved = true;
-                }
             } else {
                 census.working += 1;
             }
@@ -3951,31 +3969,46 @@ impl RawExternalSorter {
         );
         if s.censuses > 0 {
             info!(
-                "    At a park ({} sampled): {:.0}% of live files at cap, {:.0}% starved, {:.0}% \
-                 unreadable; the awaited file was starved {:.0}% of the time",
+                "    Other files at a park ({} parks sampled): {:.0}% at cap, {:.0}% starved, \
+                 {:.0}% unreadable",
                 s.censuses,
                 100.0 * s.capped_share,
                 100.0 * s.starved_share,
-                100.0 * s.contended_share,
-                100.0 * s.waited_on_starved_share
+                100.0 * s.contended_share
+            );
+            info!(
+                "    The awaited file: {:.0}% gap-filling, {:.0}% gap-stalled, {:.0}% \
+                 decompressing, {:.0}% raw-queued, {:.0}% starved",
+                100.0 * s.awaited.reorder_gap_filling,
+                100.0 * s.awaited.reorder_gap_stalled,
+                100.0 * s.awaited.decompressing,
+                100.0 * s.awaited.raw_queued,
+                100.0 * s.awaited.starved
+            );
+            info!(
+                "      -> block not read yet {:.0}%, exists but unclaimed {:.0}%, being produced \
+                 {:.0}%",
+                100.0 * s.awaited.starved,
+                100.0 * s.awaited.unclaimed(),
+                100.0 * s.awaited.in_progress()
             );
         }
-        match classify_stall(
-            park_fraction,
-            s.capped_share,
-            s.starved_share,
-            s.contended_share,
-            s.waited_on_starved_share,
-        ) {
+        match classify_stall(park_fraction, s.contended_share, s.awaited) {
             StallShape::NotStalled => info!("    Shape: the consumer is not waiting on blocks"),
             StallShape::HeadOfLine => info!(
-                "    Shape: head-of-line -- the consumer waits on a starved file while the rest \
-                 sit at their cap. Read-ahead is spread evenly across files but demand is not, so \
-                 a uniformly larger cap would buffer more of what is not needed next"
+                "    Shape: head-of-line -- the awaited file has nothing anywhere in its \
+                 pipeline, so the block has not been read from disk yet. The constraint is \
+                 upstream of the pool: storage, or read concurrency"
             ),
-            StallShape::PoolStarved => info!(
-                "    Shape: the pool cannot keep up -- most files are empty, so the constraint is \
-                 upstream of the per-file caps"
+            StallShape::WorkUnclaimed => info!(
+                "    Shape: work unclaimed -- the block the consumer needs already exists and no \
+                 worker is on it. Capacity is not the problem; scheduling and wake latency are. \
+                 Compare the discovery-lag line below"
+            ),
+            StallShape::DecompressLatency => info!(
+                "    Shape: decompression latency -- a worker is already producing the needed \
+                 block, so the consumer is paying the per-block cost serially. Only running \
+                 further ahead (a deeper PHASE2_DECOMP_CAP) or faster decompression removes it"
             ),
             StallShape::Contended => info!(
                 "    Shape: lock contention -- a large share of file state could not be read \
