@@ -3999,6 +3999,17 @@ impl RawExternalSorter {
                 "  Workers ({workers_n} active threads; busy time, overlaps the above and itself)"
             );
             info!("    Spill disk read:   {read_s:.1}s ({:.0}%) [{read_n} batches]", pct(read_s));
+            // Blocks-per-batch, split by allowance. A deep share near zero means
+            // the frontier gate is not firing, which reads identically to "the
+            // deeper read-ahead did not help" unless it is reported separately.
+            let (deep_b, deep_blk, shal_b, shal_blk) = pool.read_batch_split();
+            let per = |blk: u64, b: u64| if b == 0 { 0.0 } else { blk as f64 / b as f64 };
+            info!(
+                "      frontier {deep_b} batches / {deep_blk} blocks ({:.1} per batch), \
+                 other {shal_b} batches / {shal_blk} blocks ({:.1} per batch)",
+                per(deep_blk, deep_b),
+                per(shal_blk, shal_b)
+            );
             info!("    Spill decompress:  {dec_s:.1}s ({:.0}%) [{dec_n} blocks]", pct(dec_s));
             info!("    Output compress:   {comp_s:.1}s ({:.0}%) [{comp_n} blocks]", pct(comp_s));
             info!("    Total worker busy: {busy:.1}s  (NOT comparable to loop wall clock)");
