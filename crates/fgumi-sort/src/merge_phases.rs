@@ -32,14 +32,19 @@
 //! would mean an `Instant::now()` pair per record rather than per block, which
 //! on a billion-record sort is real overhead for a number we already have.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use crate::merge_trace::{DurationHistogram, HistogramReport};
 
 /// Nanosecond/operation counter pair for one merge component.
+///
+/// Backed by a [`DurationHistogram`], which already keeps an exact count and
+/// sum. Sharing the storage rather than incrementing a second set of atomics
+/// keeps the totals in this report and the distributions in
+/// [`crate::merge_trace`] describing literally the same observations — two
+/// parallel counters over one event are a divergence waiting to happen, and the
+/// divergence would be silent.
 #[derive(Debug, Default)]
 pub(crate) struct ComponentCounter {
-    nanos: AtomicU64,
-    ops: AtomicU64,
+    hist: DurationHistogram,
 }
 
 impl ComponentCounter {
@@ -49,23 +54,17 @@ impl ComponentCounter {
     /// relationship to the data they describe, and the merge hot path should not
     /// pay for fences to maintain them.
     pub(crate) fn time<R>(&self, f: impl FnOnce() -> R) -> R {
-        let start = Instant::now();
-        let result = f();
-        #[allow(clippy::cast_possible_truncation)]
-        let elapsed = start.elapsed().as_nanos() as u64;
-        self.nanos.fetch_add(elapsed, Ordering::Relaxed);
-        self.ops.fetch_add(1, Ordering::Relaxed);
-        result
+        self.hist.time(f)
     }
 
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "nanosecond totals stay far below 2^52; a sort would need ~52 days of busy time to lose a nanosecond of precision here"
-    )]
+    /// The distribution behind the totals, for [`crate::merge_trace`].
+    pub(crate) fn histogram(&self) -> HistogramReport {
+        self.hist.snapshot()
+    }
+
     fn snapshot(&self) -> (f64, u64) {
-        let nanos = self.nanos.load(Ordering::Relaxed);
-        let ops = self.ops.load(Ordering::Relaxed);
-        (nanos as f64 / 1e9, ops)
+        let report = self.hist.snapshot();
+        (report.total_secs(), report.count)
     }
 }
 
@@ -192,7 +191,7 @@ mod tests {
     use rstest::rstest;
     use std::sync::Arc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn test_counter_accumulates_time_and_ops() {
