@@ -38,6 +38,9 @@
 //!   growth when producers outpace consumers.
 
 use crate::codec::{SpillCodec, ZSPILL_MAGIC};
+use crate::merge_stalls::{
+    Phase2ScanReport, Phase2ScanTally, PopSkip, ReadSkip, WakeLatencyReport, combine_skip,
+};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use crossbeam_queue::ArrayQueue;
 use fgumi_bgzf::reader::read_raw_blocks;
@@ -717,6 +720,14 @@ pub(crate) struct SharedPipelineState {
     /// [`crate::merge_phases`] -- these overlap and do not partition wall time.
     pub(crate) merge_phases: crate::merge_phases::MergePhaseCounters,
 
+    /// Why Phase 2 file scans found no work. Complements the idle totals in
+    /// [`SortPipelineStats`], which say how long workers idled but not what for.
+    pub(crate) phase2_scans: crate::merge_stalls::Phase2ScanStats,
+
+    /// How deep workers were sleeping when they found work, which bounds how
+    /// much of their idle time is discovery latency rather than absent work.
+    pub(crate) wake_latency: crate::merge_stalls::WakeLatencyStats,
+
     /// Current phase: 0=shutdown, 1=Phase1, 2=Phase2, 255=Legacy.
     pub(crate) phase: AtomicU8,
 
@@ -817,6 +828,8 @@ impl SharedPipelineState {
 
         Self {
             merge_phases: crate::merge_phases::MergePhaseCounters::default(),
+            phase2_scans: crate::merge_stalls::Phase2ScanStats::default(),
+            wake_latency: crate::merge_stalls::WakeLatencyStats::default(),
             phase: AtomicU8::new(phase::LEGACY),
             active_worker_limit: AtomicUsize::new(num_workers),
 
@@ -902,6 +915,13 @@ struct SortWorkerState {
     /// Monotonic counter incremented on each idle sleep; mixed with `worker_id` to
     /// produce per-worker jitter so all workers don't wake simultaneously.
     idle_iter: u64,
+    /// Backoff level of the sleep this worker just took, if the previous loop
+    /// iteration slept. Taken (and cleared) by the next iteration that finds
+    /// work, which is what makes that sleep "productive" — see
+    /// [`crate::merge_stalls::WakeLatencyStats`]. Distinguishing this from
+    /// `backoff_us` matters because `backoff_us` also holds `MIN_BACKOFF_US`
+    /// after a successful step, which is not a sleep at all.
+    last_sleep_us: Option<u64>,
 }
 
 impl SortWorkerState {
@@ -980,9 +1000,14 @@ fn get_sort_priorities(bp: &SortBackpressureState) -> &'static [SortStep] {
 // ============================================================================
 
 /// Minimum backoff duration in microseconds.
-const MIN_BACKOFF_US: u64 = 10;
+pub(crate) const MIN_BACKOFF_US: u64 = 10;
 /// Maximum backoff duration in microseconds (1ms).
-const MAX_BACKOFF_US: u64 = 1000;
+///
+/// Nothing unparks a pool worker — the wake path runs one way, workers to main
+/// thread — so this is also the worst-case delay between work becoming
+/// available and an idle worker noticing it. [`crate::merge_stalls`] measures
+/// how often that delay is actually paid.
+pub(crate) const MAX_BACKOFF_US: u64 = 1000;
 
 /// Sleep for the given backoff duration with ±25% jitter.
 ///
@@ -1152,6 +1177,7 @@ impl SortWorkerPool {
                         held_decompressed_input: None,
                         backoff_us: MIN_BACKOFF_US,
                         idle_iter: 0,
+                        last_sleep_us: None,
                     };
 
                     // Publish a panic as soon as the worker unwinds, not at
@@ -1220,6 +1246,9 @@ impl SortWorkerPool {
                     worker.idle_iter = worker.idle_iter.wrapping_add(1);
                     worker.backoff_us = (worker.backoff_us * 2).min(MAX_BACKOFF_US);
                 }
+                // A capped worker is idle by policy, not because work was slow
+                // to appear, so its sleep must not count as discovery latency.
+                worker.last_sleep_us = None;
                 continue;
             }
 
@@ -1229,6 +1258,8 @@ impl SortWorkerPool {
                 sleep_with_jitter(worker.backoff_us, worker.worker_id, worker.idle_iter);
                 worker.idle_iter = worker.idle_iter.wrapping_add(1);
                 worker.backoff_us = (worker.backoff_us * 2).min(MAX_BACKOFF_US);
+                // Waiting for the next phase, not for work — see above.
+                worker.last_sleep_us = None;
                 continue;
             }
 
@@ -1293,13 +1324,26 @@ impl SortWorkerPool {
 
             // 7. Backoff with jitter (ported from unified pipeline)
             if did_work {
+                // The sleep that preceded this step was slept *through* work
+                // becoming available: nothing unparks a worker, so the work may
+                // have arrived at any point during it. That is the part of idle
+                // time the pipeline actually pays for, and it is invisible in
+                // the idle total, which counts the productive and unproductive
+                // sleeps alike.
+                if let Some(slept_us) = worker.last_sleep_us.take() {
+                    shared.wake_latency.record_productive_sleep(slept_us);
+                }
                 worker.backoff_us = MIN_BACKOFF_US;
             } else {
+                let slept_us = worker.backoff_us;
                 let idle_start = Instant::now();
-                sleep_with_jitter(worker.backoff_us, worker.worker_id, worker.idle_iter);
+                sleep_with_jitter(slept_us, worker.worker_id, worker.idle_iter);
                 worker.idle_iter = worker.idle_iter.wrapping_add(1);
                 worker.backoff_us = (worker.backoff_us * 2).min(MAX_BACKOFF_US);
-                pstats.record_idle(worker.worker_id, Self::nanos_u64(idle_start.elapsed()));
+                let idle_ns = Self::nanos_u64(idle_start.elapsed());
+                pstats.record_idle(worker.worker_id, idle_ns);
+                shared.wake_latency.record_sleep(slept_us, idle_ns);
+                worker.last_sleep_us = Some(slept_us);
             }
         }
     }
@@ -1661,6 +1705,12 @@ impl SortWorkerPool {
             return StepResult::InputEmpty;
         }
 
+        // Why each file was passed over. Lives on the stack and is thrown away
+        // the moment the scan finds work, so a productive scan pays a handful of
+        // increments; only the fall-through at the bottom — the path that is
+        // about to sleep anyway — publishes it. See [`crate::merge_stalls`].
+        let mut tally = Phase2ScanTally::default();
+
         for offset in 0..n {
             let i = (worker.phase2_file_cursor + offset) % n;
             let file = &files[i];
@@ -1671,100 +1721,45 @@ impl SortWorkerPool {
             // outstanding even after the raw FIFO becomes empty. We MUST
             // decrement after inserting into the reorder buffer (or on the
             // error path) to keep the counter balanced.
-            let popped = Self::try_pop_raw_for_decompress(file);
-            if let Some((serial, raw_bytes)) = popped {
-                let data = match file.codec {
-                    SpillCodec::Bgzf => {
-                        let raw_block = RawBgzfBlock { data: raw_bytes };
-                        match shared
-                            .merge_phases
-                            .decompress
-                            .time(|| decompress_block(&raw_block, &mut worker.decompressor))
-                        {
-                            Ok(d) => d,
-                            Err(e) => {
-                                log::error!(
-                                    "BGZF decompression error (chunk source {i} serial {serial}): {e}"
-                                );
-                                shared.decompression_error.store(true, Ordering::Release);
-                                file.decomp_in_flight.fetch_sub(1, Ordering::AcqRel);
-                                shared.main_thread_handle.unpark();
-                                worker.phase2_file_cursor = (i + 1) % n;
-                                return StepResult::Success;
-                            }
-                        }
-                    }
-                    SpillCodec::Zstd => {
-                        // Allocate the scratch buffer lazily so BGZF-only sorts
-                        // don't pay 256 KiB × num_workers of dead memory.
-                        if worker.zstd_decompress_buf.len() < ZSTD_FRAME_DECOMP_CAP {
-                            worker.zstd_decompress_buf.resize(ZSTD_FRAME_DECOMP_CAP, 0);
-                        }
-                        match shared.merge_phases.decompress.time(|| {
-                            worker
-                                .zstd_decompressor
-                                .decompress_to_buffer(&raw_bytes, &mut worker.zstd_decompress_buf)
-                        }) {
-                            Ok(n) => {
-                                // Copy the `n` decompressed bytes (≤ one
-                                // staging-buffer's worth, typically ~65 KB)
-                                // into a fresh Vec for the consumer. The
-                                // scratch buffer keeps its 256 KiB capacity
-                                // so the next frame on this worker reuses it
-                                // without reallocating.
-                                worker.zstd_decompress_buf[..n].to_vec()
-                            }
-                            Err(e) => {
-                                log::error!(
-                                    "zstd decompression error (chunk source {i} serial {serial}): {e}"
-                                );
-                                shared.decompression_error.store(true, Ordering::Release);
-                                file.decomp_in_flight.fetch_sub(1, Ordering::AcqRel);
-                                shared.main_thread_handle.unpark();
-                                worker.phase2_file_cursor = (i + 1) % n;
-                                return StepResult::Success;
-                            }
-                        }
-                    }
-                };
-                let now_poppable = {
-                    let mut dec_guard =
-                        file.decompressed.lock().expect("phase2 decompressed mutex poisoned");
-                    dec_guard.insert(serial, data);
-                    dec_guard.can_pop()
-                };
-                // Decrement AFTER the insert is published. The unpark below
-                // wakes the consumer in case it has been parked waiting on
-                // this specific file (now_poppable=true) or is in the
-                // is_drained path waiting for in_flight to reach zero.
-                file.decomp_in_flight.fetch_sub(1, Ordering::AcqRel);
-                if now_poppable || file.is_drained() {
-                    // Wake the consumer either because new data is available
-                    // or because the last in-flight decompression for this
-                    // file just completed and the file is now fully drained.
-                    shared.main_thread_handle.unpark();
+            // Diverges on success -- `decompress_and_publish` always returns --
+            // so the binding is why the decompress half declined.
+            let pop_skip = match Self::try_pop_raw_for_decompress(file) {
+                Err(skip) => skip,
+                Ok((serial, raw_bytes)) => {
+                    worker.phase2_file_cursor = (i + 1) % n;
+                    return Self::decompress_and_publish(
+                        shared, worker, file, i, serial, raw_bytes,
+                    );
                 }
-                worker.phase2_file_cursor = (i + 1) % n;
-                return StepResult::Success;
-            }
+            };
 
             // -- Try reading raw blocks from disk ----------------------------
             // Skip if disk reader is contended OR already at EOF.
             let Ok(mut reader_guard) = file.reader.try_lock() else {
-                continue; // another worker is reading this file
+                // Another worker is inside a disk read for this file. That is
+                // I/O in flight, not lock contention, and conflating the two
+                // would blame the mutex for the disk.
+                tally.note(combine_skip(pop_skip, ReadSkip::ReaderBusy));
+                continue;
             };
             if reader_guard.eof {
+                tally.note(combine_skip(pop_skip, ReadSkip::ReaderEof));
                 continue;
             }
 
             // Bound disk read-ahead per file: don't keep pulling if the raw
             // FIFO is already full. Use try_lock so a momentarily contended
             // raw FIFO doesn't block the reader.
-            let raw_full = match file.raw_blocks.try_lock() {
-                Ok(g) => g.len() >= PHASE2_RAW_CAP,
-                Err(_) => true,
+            let read_skip = match file.raw_blocks.try_lock() {
+                Ok(g) if g.len() >= PHASE2_RAW_CAP => Some(ReadSkip::RawFull),
+                Ok(_) => None,
+                // Treated as full, as it always has been -- but recorded as
+                // contention, because a FIFO whose depth we could not read is
+                // not evidence that read-ahead depth is the constraint.
+                Err(_) => Some(ReadSkip::RawLockContended),
             };
-            if raw_full {
+            if let Some(read_skip) = read_skip {
+                tally.note(combine_skip(pop_skip, read_skip));
                 continue;
             }
 
@@ -1817,46 +1812,147 @@ impl SortWorkerPool {
             return StepResult::Success;
         }
 
+        // Every file declined. This worker is about to sleep, so publishing the
+        // reasons here costs nothing it was not already about to spend, and it
+        // turns an entry in the idle total into an explanation of that entry.
+        shared.phase2_scans.record_fruitless_scan(tally);
         StepResult::InputEmpty
+    }
+
+    /// Decompress one raw block and publish it into its file's reorder buffer.
+    ///
+    /// Split out of [`Self::try_phase2_file_work`] so the scan loop reads as the
+    /// scan it is. Always returns [`StepResult::Success`]: a decompression
+    /// failure is still work done — it sets the error flag and wakes the
+    /// consumer, which must surface the failure rather than spin.
+    ///
+    /// The caller must have advanced `worker.phase2_file_cursor` already, and
+    /// must have obtained `entry` from [`Self::try_pop_raw_for_decompress`],
+    /// which reserved the matching `decomp_in_flight` slot this function is
+    /// responsible for releasing.
+    fn decompress_and_publish(
+        shared: &SharedPipelineState,
+        worker: &mut SortWorkerState,
+        file: &Phase2FileState,
+        source_idx: usize,
+        serial: u64,
+        raw_bytes: Vec<u8>,
+    ) -> StepResult {
+        let data = match file.codec {
+            SpillCodec::Bgzf => {
+                let raw_block = RawBgzfBlock { data: raw_bytes };
+                match shared
+                    .merge_phases
+                    .decompress
+                    .time(|| decompress_block(&raw_block, &mut worker.decompressor))
+                {
+                    Ok(d) => d,
+                    Err(e) => {
+                        log::error!(
+                            "BGZF decompression error (chunk source {source_idx} serial {serial}): {e}"
+                        );
+                        shared.decompression_error.store(true, Ordering::Release);
+                        file.decomp_in_flight.fetch_sub(1, Ordering::AcqRel);
+                        shared.main_thread_handle.unpark();
+                        return StepResult::Success;
+                    }
+                }
+            }
+            SpillCodec::Zstd => {
+                // Allocate the scratch buffer lazily so BGZF-only sorts don't
+                // pay 256 KiB × num_workers of dead memory.
+                if worker.zstd_decompress_buf.len() < ZSTD_FRAME_DECOMP_CAP {
+                    worker.zstd_decompress_buf.resize(ZSTD_FRAME_DECOMP_CAP, 0);
+                }
+                match shared.merge_phases.decompress.time(|| {
+                    worker
+                        .zstd_decompressor
+                        .decompress_to_buffer(&raw_bytes, &mut worker.zstd_decompress_buf)
+                }) {
+                    // Copy the `n` decompressed bytes (≤ one staging-buffer's
+                    // worth, typically ~65 KB) into a fresh Vec for the
+                    // consumer. The scratch buffer keeps its 256 KiB capacity so
+                    // the next frame on this worker reuses it without
+                    // reallocating.
+                    Ok(n) => worker.zstd_decompress_buf[..n].to_vec(),
+                    Err(e) => {
+                        log::error!(
+                            "zstd decompression error (chunk source {source_idx} serial {serial}): {e}"
+                        );
+                        shared.decompression_error.store(true, Ordering::Release);
+                        file.decomp_in_flight.fetch_sub(1, Ordering::AcqRel);
+                        shared.main_thread_handle.unpark();
+                        return StepResult::Success;
+                    }
+                }
+            }
+        };
+
+        let now_poppable = {
+            let mut dec_guard =
+                file.decompressed.lock().expect("phase2 decompressed mutex poisoned");
+            dec_guard.insert(serial, data);
+            dec_guard.can_pop()
+        };
+        // Decrement AFTER the insert is published. The unpark below wakes the
+        // consumer in case it has been parked waiting on this specific file
+        // (now_poppable=true) or is in the is_drained path waiting for
+        // in_flight to reach zero.
+        file.decomp_in_flight.fetch_sub(1, Ordering::AcqRel);
+        if now_poppable || file.is_drained() {
+            // Wake the consumer either because new data is available or because
+            // the last in-flight decompression for this file just completed and
+            // the file is now fully drained.
+            shared.main_thread_handle.unpark();
+        }
+        StepResult::Success
     }
 
     /// Try to pop a raw block from `file` for decompression, applying
     /// deadlock-free admission control against the file's reorder buffer.
     ///
-    /// Returns `Some((serial, raw_block))` if a block was popped, `None` otherwise.
-    /// `None` is returned when:
-    /// - either lock is contended (`try_lock` failed),
-    /// - the raw FIFO is empty,
-    /// - or the reorder buffer is at cap and the head raw block isn't a gap-filler.
+    /// Returns `Ok(RawEntry)` if a block was popped, and otherwise
+    /// the [`PopSkip`] saying why not: either lock was contended (`try_lock`
+    /// failed), the raw FIFO was empty, or the reorder buffer was at cap and the
+    /// head raw block was not a gap-filler. The caller records that reason —
+    /// "the pool declined this file" and "the pool had nothing to take" look
+    /// identical in an idle total and mean opposite things.
     ///
     /// On success, `decomp_in_flight` is incremented so the consumer's
     /// `is_drained()` check correctly reflects the in-progress decompression.
     /// The caller is responsible for the matching decrement after inserting
     /// (or on the decompression-error path).
-    fn try_pop_raw_for_decompress(file: &Phase2FileState) -> Option<(u64, Vec<u8>)> {
-        let mut raw_guard = file.raw_blocks.try_lock().ok()?;
-        let head_serial = raw_guard.front().map(|(s, _)| *s)?;
+    fn try_pop_raw_for_decompress(
+        file: &Phase2FileState,
+    ) -> std::result::Result<(u64, Vec<u8>), PopSkip> {
+        let Ok(mut raw_guard) = file.raw_blocks.try_lock() else {
+            return Err(PopSkip::RawLockContended);
+        };
+        let Some(head_serial) = raw_guard.front().map(|(s, _)| *s) else {
+            return Err(PopSkip::RawEmpty);
+        };
 
         // Cheap admission check using the per-file reorder buffer.
         // Two cases admit: (1) under cap (normal), (2) reorder buffer is stuck
         // and this serial is the gap-filler. Otherwise: backpressure.
         let admit = {
-            let dec_guard = file.decompressed.try_lock().ok()?;
+            let Ok(dec_guard) = file.decompressed.try_lock() else {
+                return Err(PopSkip::DecompLockContended);
+            };
             dec_guard.len() < PHASE2_DECOMP_CAP
                 || (!dec_guard.can_pop() && head_serial == dec_guard.next_seq())
         };
         if !admit {
-            return None;
+            return Err(PopSkip::DecompCapped);
         }
 
         // Reserve the in-flight slot under the raw_blocks lock so the consumer
         // can never observe (raw_empty && in_flight==0 && decompressed_empty)
         // while a worker is still in the middle of decompressing this block.
-        let popped = raw_guard.pop_front();
-        if popped.is_some() {
-            file.decomp_in_flight.fetch_add(1, Ordering::AcqRel);
-        }
-        popped
+        // The FIFO was non-empty above and is still held, so this cannot fail.
+        let popped = raw_guard.pop_front().expect("raw FIFO emptied under its own lock");
+        file.decomp_in_flight.fetch_add(1, Ordering::AcqRel);
+        Ok(popped)
     }
 
     // ========================================================================
@@ -1977,6 +2073,16 @@ impl SortWorkerPool {
     /// [`crate::merge_phases`].
     pub(crate) fn merge_phase_breakdown(&self) -> crate::merge_phases::MergePhaseBreakdown {
         self.shared.merge_phases.snapshot()
+    }
+
+    /// Why Phase 2 file scans found no work -- see [`crate::merge_stalls`].
+    pub(crate) fn phase2_scan_report(&self) -> Phase2ScanReport {
+        self.shared.phase2_scans.snapshot()
+    }
+
+    /// How deep workers were sleeping when they found work.
+    pub(crate) fn wake_latency_report(&self) -> WakeLatencyReport {
+        self.shared.wake_latency.snapshot()
     }
 
     /// Codec used to compress Phase 1 spill chunks.
@@ -3088,7 +3194,7 @@ mod tests {
         let file = empty_phase2_file();
         file.raw_blocks.lock().expect("raw lock").push_back((0, dummy_raw_block(0)));
         let popped = SortWorkerPool::try_pop_raw_for_decompress(&file);
-        assert!(popped.is_some(), "under cap with empty reorder buffer should admit");
+        assert!(popped.is_ok(), "under cap with empty reorder buffer should admit");
         assert_eq!(file.decomp_in_flight.load(Ordering::Acquire), 1);
         assert!(file.raw_blocks.lock().expect("raw lock").is_empty());
     }
@@ -3114,7 +3220,11 @@ mod tests {
             .expect("raw lock")
             .push_back((PHASE2_DECOMP_CAP as u64, dummy_raw_block(1)));
         let popped = SortWorkerPool::try_pop_raw_for_decompress(&file);
-        assert!(popped.is_none(), "at cap and poppable should reject (apply backpressure)");
+        assert_eq!(
+            popped.expect_err("at cap and poppable should reject (apply backpressure)"),
+            PopSkip::DecompCapped,
+            "rejecting at cap must be reported as backpressure, not as an empty file"
+        );
         assert_eq!(file.decomp_in_flight.load(Ordering::Acquire), 0);
         assert_eq!(file.raw_blocks.lock().expect("raw lock").len(), 1);
     }
@@ -3136,7 +3246,7 @@ mod tests {
         // even though we're at cap, otherwise the consumer deadlocks.
         file.raw_blocks.lock().expect("raw lock").push_back((0, dummy_raw_block(0)));
         let popped = SortWorkerPool::try_pop_raw_for_decompress(&file);
-        assert!(popped.is_some(), "at cap and stuck should admit gap-filler at next_seq");
+        assert!(popped.is_ok(), "at cap and stuck should admit gap-filler at next_seq");
         assert_eq!(file.decomp_in_flight.load(Ordering::Acquire), 1);
     }
 
@@ -3157,16 +3267,24 @@ mod tests {
             .expect("raw lock")
             .push_back((PHASE2_DECOMP_CAP as u64 + 1, dummy_raw_block(2)));
         let popped = SortWorkerPool::try_pop_raw_for_decompress(&file);
-        assert!(popped.is_none(), "at cap, stuck, but head != next_seq should reject");
+        assert_eq!(
+            popped.expect_err("at cap, stuck, but head != next_seq should reject"),
+            PopSkip::DecompCapped
+        );
         assert_eq!(file.decomp_in_flight.load(Ordering::Acquire), 0);
     }
 
     #[test]
-    fn test_admission_empty_raw_returns_none() {
+    fn test_admission_empty_raw_reports_raw_empty() {
         let file = empty_phase2_file();
-        // Empty raw FIFO — try_pop must return None without touching in_flight.
+        // Empty raw FIFO — try_pop must report RawEmpty without touching
+        // in_flight.
         let popped = SortWorkerPool::try_pop_raw_for_decompress(&file);
-        assert!(popped.is_none());
+        assert_eq!(
+            popped.expect_err("an empty FIFO has nothing to admit"),
+            PopSkip::RawEmpty,
+            "an empty FIFO must not be conflated with a file the pool declined"
+        );
         assert_eq!(file.decomp_in_flight.load(Ordering::Acquire), 0);
     }
 
