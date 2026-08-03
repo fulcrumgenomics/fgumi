@@ -569,6 +569,19 @@ pub(crate) const PHASE2_DECOMP_CAP: usize = 8;
 /// Number of raw blocks to read from disk per `ReadRawBlocks` call.
 pub(crate) const PHASE2_READ_BATCH: usize = 4;
 
+/// Read-ahead depth for the single merge source the consumer is draining while
+/// it has nothing buffered. See the read path in
+/// [`SortWorkerPool::try_phase2_file_work`].
+///
+/// Applies to one file at a time, so the extra read-ahead memory is this many
+/// compressed blocks — a few MB — not K times that.
+pub(crate) const PHASE2_STARVING_RAW_CAP: usize = 64;
+
+/// Blocks to read per call for that same file. Large enough that one read is a
+/// sequential run rather than a 256 KB pinprick, since only one worker may hold
+/// a given file's reader mutex and that read is therefore the whole refill rate.
+pub(crate) const PHASE2_STARVING_READ_BATCH: usize = 32;
+
 /// One compressed block in a file's raw FIFO, with when it got there.
 ///
 /// The timestamp is what turns "the pool did not decompress this yet" into a
@@ -990,6 +1003,18 @@ pub(crate) struct SharedPipelineState {
     /// across the pool rather than always hitting worker 0.
     wake_cursor: AtomicUsize,
 
+    /// Read batches taken at the deep frontier allowance, and the blocks they
+    /// returned; and the same for batches taken at the uniform allowance.
+    ///
+    /// Blocks-per-batch is the number that says whether the deep path is
+    /// actually engaging. Without it, a gate that silently almost never fires
+    /// looks exactly like a change that did not help — which is precisely the
+    /// mistake this counter exists to prevent.
+    pub(crate) deep_read_batches: AtomicU64,
+    pub(crate) deep_read_blocks: AtomicU64,
+    pub(crate) shallow_read_batches: AtomicU64,
+    pub(crate) shallow_read_blocks: AtomicU64,
+
     /// Lowest merge source index that has not yet delivered all its records.
     ///
     /// Phase 1 chunks its input sequentially, so an input that is already in
@@ -1044,6 +1069,10 @@ impl SharedPipelineState {
             main_thread_handle,
             worker_threads: (0..num_workers).map(|_| std::sync::OnceLock::new()).collect(),
             wake_cursor: AtomicUsize::new(0),
+            deep_read_batches: AtomicU64::new(0),
+            deep_read_blocks: AtomicU64::new(0),
+            shallow_read_batches: AtomicU64::new(0),
+            shallow_read_blocks: AtomicU64::new(0),
             phase2_lowest_active: AtomicUsize::new(0),
         }
     }
@@ -2059,14 +2088,9 @@ impl SortWorkerPool {
         // frontier that is merely *active* is the common case in an interleaved
         // merge, and sending every worker to file 0 there would undo the spread
         // that makes that case fast.
-        let start = {
-            let frontier = shared.phase2_lowest_active.load(Ordering::Relaxed);
-            if frontier < n && files[frontier].is_starving() {
-                frontier
-            } else {
-                worker.phase2_file_cursor
-            }
-        };
+        let frontier = shared.phase2_lowest_active.load(Ordering::Relaxed);
+        let frontier_starving = frontier < n && files[frontier].is_starving();
+        let start = if frontier_starving { frontier } else { worker.phase2_file_cursor };
 
         for offset in 0..n {
             let i = (start + offset) % n;
@@ -2103,11 +2127,39 @@ impl SortWorkerPool {
                 continue;
             }
 
+            // The file the merge is draining gets a deeper allowance than the
+            // uniform per-file one.
+            //
+            // Uniform read-ahead is what makes the disjoint-run case slow. Only
+            // one worker may read a given file (its reader mutex), so at
+            // `PHASE2_READ_BATCH` = 4 blocks the hot file is refilled 4 blocks at
+            // a time by one thread, and the per-batch read latency is amortized
+            // over only those 4. Reading a larger run turns many small
+            // serialized reads into one sequential one, without needing more
+            // readers.
+            //
+            // Keyed on being the frontier alone, NOT on the file also looking
+            // starved. An earlier version required `is_starving()` here, which
+            // needs `decomp_in_flight == 0` -- but by the time a worker reaches
+            // the read path some other worker has usually already begun
+            // decompressing, so the file no longer looked starved and the deep
+            // path fired for only 6% of batches (5.6 blocks per read against the
+            // intended 32). Whether a worker happens to be mid-decompress says
+            // nothing about how far ahead the file should read.
+            //
+            // Still scoped to one file: at merge start every file is empty, and
+            // letting all K deepen at once would multiply read-ahead memory by K.
+            let (raw_cap, read_batch) = if i == frontier {
+                (PHASE2_STARVING_RAW_CAP, PHASE2_STARVING_READ_BATCH)
+            } else {
+                (PHASE2_RAW_CAP, PHASE2_READ_BATCH)
+            };
+
             // Bound disk read-ahead per file: don't keep pulling if the raw
             // FIFO is already full. Use try_lock so a momentarily contended
             // raw FIFO doesn't block the reader.
             let read_skip = match file.raw_blocks.try_lock() {
-                Ok(g) if g.len() >= PHASE2_RAW_CAP => Some(ReadSkip::RawFull),
+                Ok(g) if g.len() >= raw_cap => Some(ReadSkip::RawFull),
                 Ok(_) => None,
                 // Treated as full, as it always has been -- but recorded as
                 // contention, because a FIFO whose depth we could not read is
@@ -2127,12 +2179,12 @@ impl SortWorkerPool {
                 SpillCodec::Bgzf => shared
                     .merge_phases
                     .read
-                    .time(|| read_raw_blocks(&mut reader_guard.inner, PHASE2_READ_BATCH))
+                    .time(|| read_raw_blocks(&mut reader_guard.inner, read_batch))
                     .map(|blocks| blocks.into_iter().map(|b| b.data).collect()),
                 SpillCodec::Zstd => shared
                     .merge_phases
                     .read
-                    .time(|| read_raw_zstd_frames(&mut reader_guard.inner, PHASE2_READ_BATCH)),
+                    .time(|| read_raw_zstd_frames(&mut reader_guard.inner, read_batch)),
             };
             let raw_bytes: Vec<Vec<u8>> = match read {
                 Ok(bytes) => bytes,
@@ -2142,6 +2194,17 @@ impl SortWorkerPool {
                     return Self::retire_phase2_source(shared, worker, file, reader_guard, i, n);
                 }
             };
+
+            // Record which allowance this batch was taken at, and what it
+            // returned, so "the deep path did not help" can be told apart from
+            // "the deep path did not run".
+            let (batches, blocks) = if i == frontier {
+                (&shared.deep_read_batches, &shared.deep_read_blocks)
+            } else {
+                (&shared.shallow_read_batches, &shared.shallow_read_blocks)
+            };
+            batches.fetch_add(1, Ordering::Relaxed);
+            blocks.fetch_add(raw_bytes.len() as u64, Ordering::Relaxed);
 
             if raw_bytes.is_empty() {
                 return Self::retire_phase2_source(shared, worker, file, reader_guard, i, n);
@@ -2589,6 +2652,17 @@ impl SortWorkerPool {
     /// reorder buffers via this snapshot.
     pub(crate) fn phase2_files(&self) -> Arc<Vec<Phase2FileState>> {
         self.shared.phase2_files_snapshot()
+    }
+
+    /// Phase 2 read batches split by allowance:
+    /// `(frontier_batches, frontier_blocks, other_batches, other_blocks)`.
+    pub(crate) fn read_batch_split(&self) -> (u64, u64, u64, u64) {
+        (
+            self.shared.deep_read_batches.load(Ordering::Relaxed),
+            self.shared.deep_read_blocks.load(Ordering::Relaxed),
+            self.shared.shallow_read_batches.load(Ordering::Relaxed),
+            self.shared.shallow_read_blocks.load(Ordering::Relaxed),
+        )
     }
 
     /// Set the current pipeline phase.
