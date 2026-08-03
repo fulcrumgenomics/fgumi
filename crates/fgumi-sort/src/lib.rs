@@ -89,6 +89,31 @@ pub struct SortStats {
     pub chunks_written: usize,
 }
 
+/// Whether `header` already declares the order a sort to `sort_order` would produce.
+///
+/// Used only to warn: re-sorting a file into the order it is already in is
+/// usually unintended, and it is also the shape the k-way merge handles worst,
+/// because chunking an already-ordered input spills disjoint runs that the merge
+/// must drain one at a time rather than interleave.
+///
+/// Deliberately conservative. `SO` must match, and when the order defines a
+/// sub-sort tag the input's `SS` must match too — so a `queryname` input with no
+/// `SS` does not warn for either queryname flavor, since the header does not say
+/// which one it is. A header that lies still gets sorted; nothing here skips work.
+pub(crate) fn header_declares_order(header: &Header, sort_order: keys::SortOrder) -> bool {
+    let Some(hd) = header.header() else {
+        return false;
+    };
+    let field = |tag| hd.other_fields().get(&tag).map(ToString::to_string);
+    if field(header_tag::SORT_ORDER).as_deref() != Some(sort_order.header_so_tag()) {
+        return false;
+    }
+    match sort_order.header_ss_tag() {
+        None => true,
+        Some(expected) => field(header_tag::SUBSORT_ORDER).as_deref() == Some(expected),
+    }
+}
+
 /// Create an output header with appropriate sort order tags (SO, GO, SS).
 ///
 /// Preserves all existing header content (reference sequences, read groups, programs,
@@ -213,6 +238,98 @@ mod tests {
         assert_eq!(stats.total_records, 0);
         assert_eq!(stats.output_records, 0);
         assert_eq!(stats.chunks_written, 0);
+    }
+
+    /// Build a header whose `@HD` carries the given SO/SS values.
+    fn header_with_sort_tags(so: Option<&str>, ss: Option<&str>) -> Header {
+        let mut builder = Map::<noodles::sam::header::record::value::map::Header>::builder();
+        if let Some(so) = so {
+            builder = builder.insert(header_tag::SORT_ORDER, BString::from(so));
+        }
+        if let Some(ss) = ss {
+            builder = builder.insert(header_tag::SUBSORT_ORDER, BString::from(ss));
+        }
+        Header::builder().set_header(builder.build().expect("valid header")).build()
+    }
+
+    #[test]
+    fn test_header_declares_order_matches_coordinate() {
+        let header = header_with_sort_tags(Some("coordinate"), None);
+        assert!(header_declares_order(&header, keys::SortOrder::Coordinate));
+    }
+
+    #[test]
+    fn test_header_declares_order_rejects_a_different_order() {
+        let header = header_with_sort_tags(Some("coordinate"), None);
+        assert!(!header_declares_order(&header, keys::SortOrder::TemplateCoordinate));
+        assert!(!header_declares_order(
+            &header,
+            keys::SortOrder::Queryname(keys::QuerynameComparator::Natural)
+        ));
+    }
+
+    #[test]
+    fn test_header_declares_order_needs_no_hd_line() {
+        let header = Header::builder().build();
+        assert!(!header_declares_order(&header, keys::SortOrder::Coordinate));
+    }
+
+    /// A `queryname` header with no `SS` does not say *which* queryname order it
+    /// is in, so neither flavor may claim it. Warning here would fire on every
+    /// `samtools sort -n` output regardless of which comparator was requested.
+    #[test]
+    fn test_header_declares_order_queryname_without_subsort_is_ambiguous() {
+        let header = header_with_sort_tags(Some("queryname"), None);
+        assert!(!header_declares_order(
+            &header,
+            keys::SortOrder::Queryname(keys::QuerynameComparator::Natural)
+        ));
+        assert!(!header_declares_order(
+            &header,
+            keys::SortOrder::Queryname(keys::QuerynameComparator::Lexicographic)
+        ));
+    }
+
+    #[test]
+    fn test_header_declares_order_discriminates_queryname_flavors() {
+        let natural = header_with_sort_tags(Some("queryname"), Some("queryname:natural"));
+        assert!(header_declares_order(
+            &natural,
+            keys::SortOrder::Queryname(keys::QuerynameComparator::Natural)
+        ));
+        assert!(!header_declares_order(
+            &natural,
+            keys::SortOrder::Queryname(keys::QuerynameComparator::Lexicographic)
+        ));
+    }
+
+    /// Template-coordinate shares `SO:unsorted` with plain unsorted input, so the
+    /// sub-sort tag is the only thing that distinguishes them.
+    #[test]
+    fn test_header_declares_order_template_coordinate_requires_subsort() {
+        let bare = header_with_sort_tags(Some("unsorted"), None);
+        assert!(!header_declares_order(&bare, keys::SortOrder::TemplateCoordinate));
+
+        let tagged = header_with_sort_tags(Some("unsorted"), Some("unsorted:template-coordinate"));
+        assert!(header_declares_order(&tagged, keys::SortOrder::TemplateCoordinate));
+    }
+
+    /// The predicate must agree with what `create_output_header` writes, or fgumi
+    /// would fail to recognise its own output as already sorted.
+    #[test]
+    fn test_header_declares_order_accepts_fgumi_own_output() {
+        for order in [
+            keys::SortOrder::Coordinate,
+            keys::SortOrder::TemplateCoordinate,
+            keys::SortOrder::Queryname(keys::QuerynameComparator::Natural),
+            keys::SortOrder::Queryname(keys::QuerynameComparator::Lexicographic),
+        ] {
+            let written = create_output_header(order, &Header::builder().build());
+            assert!(
+                header_declares_order(&written, order),
+                "fgumi's own {order:?} output header should be recognised"
+            );
+        }
     }
 
     #[test]
