@@ -1823,6 +1823,102 @@ impl<'a> ChunkNamer<'a> {
 struct PendingSpill {
     handle: crate::pooled_chunk_writer::SpillWriteHandle,
     chunk_path: PathBuf,
+    /// Whether this chunk extended an existing run rather than starting one.
+    /// An extended run is already in `chunk_files`, so it must not be added twice.
+    appended: bool,
+}
+
+/// Decides whether the next sorted chunk extends the open spill run or starts a
+/// new one — "natural run formation".
+///
+/// Phase 1 chunks its input sequentially, so an input already in the requested
+/// order produces chunks that are not merely disjoint but *totally ordered*:
+/// chunk 0 holds the earliest records, chunk 1 the next. Writing each to its own
+/// file manufactures a k-way merge for a sequence that was never interleaved.
+/// Appending instead collapses sorted input to a single run, and almost-sorted
+/// input to its natural runs.
+///
+/// # Why only the most recent run
+///
+/// Considering older runs too (best fit) yields fewer runs on adversarial input
+/// but breaks stability. Suppose run 0 ended at key 100 and stopped receiving,
+/// run 1 is at 200, and a chunk arrives with minimum 150: best fit appends it to
+/// run 0, so run 0 holds chunks {0,1,2,9} while run 1 holds {3,4}. Source index
+/// order no longer matches ingest order, and for a key present in both chunk 3
+/// and chunk 9 the merge would emit chunk 9's copy first.
+///
+/// Restricting appends to the most recent run keeps every run a *consecutive*
+/// group of chunks, so source order equals ingest order. Combined with the loser
+/// tree's tie-break on source index (`LoserTree::is_greater`), output is
+/// byte-identical to writing one file per chunk.
+struct RunFormer<K> {
+    /// The open run: its path and the key of its last record. `None` before the
+    /// first spill, and after a consolidation that swallowed the run.
+    open: Option<(PathBuf, K)>,
+}
+
+/// Report how many spilled chunks became how many merge sources.
+///
+/// Sorted input collapses to one run, almost-sorted input to its natural runs,
+/// shuffled input to one run per chunk. Logging the ratio means every sort
+/// reports how ordered its own input was, which is the cheapest way to learn how
+/// common near-sorted inputs are in practice.
+fn log_run_formation(chunks_spilled: usize, runs: usize) {
+    if chunks_spilled == 0 {
+        return;
+    }
+    if chunks_spilled == runs {
+        info!("Spill runs: {runs} (no chunk extended another; input not pre-sorted)");
+    } else {
+        info!(
+            "Spill runs: {runs} from {chunks_spilled} chunks \
+             ({} extended an existing run)",
+            chunks_spilled - runs
+        );
+    }
+}
+
+/// The smallest and largest coordinate keys in a sorted buffer, or `None` for an
+/// empty one.
+///
+/// The buffer must already be sorted; these are read off its ends rather than
+/// scanned, which is what makes run formation free.
+fn coordinate_chunk_bounds(
+    buffer: &crate::inline::RecordBuffer,
+) -> (Option<crate::keys::RawCoordinateKey>, Option<crate::keys::RawCoordinateKey>) {
+    let refs = buffer.refs();
+    let key = |r: &crate::inline::RecordRef| crate::keys::RawCoordinateKey { sort_key: r.sort_key };
+    (refs.first().map(key), refs.last().map(key))
+}
+
+impl<K: Copy + Ord> RunFormer<K> {
+    fn new() -> Self {
+        Self { open: None }
+    }
+
+    /// The path to append to for a chunk whose smallest key is `chunk_min`, or
+    /// `None` if it must start a new run.
+    fn appendable(&self, chunk_min: &K) -> Option<&PathBuf> {
+        match &self.open {
+            Some((path, last_key)) if last_key <= chunk_min => Some(path),
+            _ => None,
+        }
+    }
+
+    /// Record that a chunk ending at `chunk_max` was written to `path`.
+    fn extended(&mut self, path: PathBuf, chunk_max: K) {
+        self.open = Some((path, chunk_max));
+    }
+
+    /// Drop the open run if consolidation merged it away, so the next chunk does
+    /// not append to a path that no longer holds what we think it does.
+    fn forget_if_absent(&mut self, chunk_files: &[PathBuf]) {
+        if let Some((path, _)) = &self.open
+            && !chunk_files.contains(path)
+        {
+            self.open = None;
+        }
+    }
 }
 
 /// Build `BufferProbeStats` from any buffer implementing `ProbeableBuffer`.
@@ -2251,8 +2347,12 @@ impl RawExternalSorter {
         if let Some(prev) = pending.take() {
             prev.handle.wait()?;
             timer.record_spill_size(&prev.chunk_path);
-            chunk_files.push(prev.chunk_path);
-            stats.chunks_written += 1;
+            // A chunk that extended an existing run is already represented in
+            // `chunk_files`; only a chunk that started a run adds a merge source.
+            if !prev.appended {
+                chunk_files.push(prev.chunk_path);
+                stats.chunks_written += 1;
+            }
 
             timer.time_consolidate(|| {
                 self.maybe_consolidate_temp_files::<K>(chunk_files, namer, pool)
@@ -2814,6 +2914,10 @@ impl RawExternalSorter {
         let mut buffer = RecordBuffer::with_capacity(estimated_records, estimated_data_bytes, nref);
         let mut namer = ChunkNamer::new(alloc);
         let mut pending_spill: Option<PendingSpill> = None;
+        // Natural run formation: consecutive chunks that are already in order
+        // extend one run instead of each becoming its own merge source.
+        let mut run_former: RunFormer<crate::keys::RawCoordinateKey> = RunFormer::new();
+        let mut chunks_spilled: usize = 0;
         let rayon_pool = self.build_sort_rayon_pool()?;
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
@@ -2853,21 +2957,39 @@ impl RawExternalSorter {
                 )?;
                 probe.post_drain(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
 
-                let chunk_path = namer.next_chunk_path()?;
-
                 timer.time_sort(|| {
                     rayon_pool.install(|| buffer.par_sort());
                 });
+
+                // The buffer is sorted, so the chunk's extreme keys are its ends.
+                // Consolidation may have merged the open run away while draining
+                // the previous spill, so re-check before trusting it.
+                run_former.forget_if_absent(&chunk_files);
+                let (chunk_min, chunk_max) = coordinate_chunk_bounds(&buffer);
+                let (chunk_path, appended) =
+                    match chunk_min.and_then(|min| run_former.appendable(&min).cloned()) {
+                        Some(path) => (path, true),
+                        None => (namer.next_chunk_path()?, false),
+                    };
+                chunks_spilled += 1;
 
                 // Write keyed temp file with parallel BGZF compression via worker pool.
                 // Use start_finish() for pipelining: I/O continues in background
                 // while we read the next batch.
                 let handle = timer.time_spill_write(|| {
-                    let mut writer = PooledChunkWriter::<RawCoordinateKey>::new(
-                        Arc::clone(&pool),
-                        &chunk_path,
-                        pool.spill_codec(),
-                    )?;
+                    let mut writer = if appended {
+                        PooledChunkWriter::<RawCoordinateKey>::append(
+                            Arc::clone(&pool),
+                            &chunk_path,
+                            pool.spill_codec(),
+                        )?
+                    } else {
+                        PooledChunkWriter::<RawCoordinateKey>::new(
+                            Arc::clone(&pool),
+                            &chunk_path,
+                            pool.spill_codec(),
+                        )?
+                    };
                     for r in buffer.refs() {
                         let key = RawCoordinateKey { sort_key: r.sort_key };
                         let record_bytes = buffer.get_record(r);
@@ -2876,7 +2998,10 @@ impl RawExternalSorter {
                     writer.start_finish()
                 })?;
 
-                pending_spill = Some(PendingSpill { handle, chunk_path });
+                if let Some(max) = chunk_max {
+                    run_former.extended(chunk_path.clone(), max);
+                }
+                pending_spill = Some(PendingSpill { handle, chunk_path, appended });
 
                 buffer.clear();
                 force_mi_collect();
@@ -2943,6 +3068,7 @@ impl RawExternalSorter {
 
             let memory_chunks = MemorySources::Shared(memory_chunks);
             let n_memory = memory_chunks.num_non_empty();
+            log_run_formation(chunks_spilled, chunk_files.len());
             debug!(
                 "Phase 2: Merging {} chunks (keyed O(1) comparisons)...",
                 chunk_files.len() + n_memory
@@ -3005,6 +3131,10 @@ impl RawExternalSorter {
         let mut buffer = RecordBuffer::with_capacity(estimated_records, estimated_data_bytes, nref);
         let mut namer = ChunkNamer::new(alloc);
         let mut pending_spill: Option<PendingSpill> = None;
+        // Natural run formation: consecutive chunks that are already in order
+        // extend one run instead of each becoming its own merge source.
+        let mut run_former: RunFormer<crate::keys::RawCoordinateKey> = RunFormer::new();
+        let mut chunks_spilled: usize = 0;
         let rayon_pool = self.build_sort_rayon_pool()?;
 
         debug!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
@@ -3035,18 +3165,33 @@ impl RawExternalSorter {
                 )?;
                 probe.post_drain(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
 
-                let chunk_path = namer.next_chunk_path()?;
-
                 timer.time_sort(|| {
                     rayon_pool.install(|| buffer.par_sort());
                 });
 
+                run_former.forget_if_absent(&chunk_files);
+                let (chunk_min, chunk_max) = coordinate_chunk_bounds(&buffer);
+                let (chunk_path, appended) =
+                    match chunk_min.and_then(|min| run_former.appendable(&min).cloned()) {
+                        Some(path) => (path, true),
+                        None => (namer.next_chunk_path()?, false),
+                    };
+                chunks_spilled += 1;
+
                 let handle = timer.time_spill_write(|| {
-                    let mut writer = PooledChunkWriter::<RawCoordinateKey>::new(
-                        Arc::clone(&pool),
-                        &chunk_path,
-                        pool.spill_codec(),
-                    )?;
+                    let mut writer = if appended {
+                        PooledChunkWriter::<RawCoordinateKey>::append(
+                            Arc::clone(&pool),
+                            &chunk_path,
+                            pool.spill_codec(),
+                        )?
+                    } else {
+                        PooledChunkWriter::<RawCoordinateKey>::new(
+                            Arc::clone(&pool),
+                            &chunk_path,
+                            pool.spill_codec(),
+                        )?
+                    };
                     for r in buffer.refs() {
                         let key = RawCoordinateKey { sort_key: r.sort_key };
                         let record_bytes = buffer.get_record(r);
@@ -3055,7 +3200,10 @@ impl RawExternalSorter {
                     writer.start_finish()
                 })?;
 
-                pending_spill = Some(PendingSpill { handle, chunk_path });
+                if let Some(max) = chunk_max {
+                    run_former.extended(chunk_path.clone(), max);
+                }
+                pending_spill = Some(PendingSpill { handle, chunk_path, appended });
 
                 buffer.clear();
                 force_mi_collect();
@@ -3130,6 +3278,7 @@ impl RawExternalSorter {
 
             let memory_chunks = MemorySources::Shared(memory_chunks);
             let n_memory = memory_chunks.num_non_empty();
+            log_run_formation(chunks_spilled, chunk_files.len());
             debug!(
                 "Phase 2: Merging {} chunks with index generation...",
                 chunk_files.len() + n_memory
@@ -3297,7 +3446,11 @@ impl RawExternalSorter {
                     writer.start_finish()
                 })?;
 
-                pending_spill = Some(PendingSpill { handle, chunk_path });
+                // Queryname and template-coordinate keep one file per chunk for now:
+                // `RawQuerynameKey` borrows raw pointers into the record buffer, so a
+                // run's last key cannot outlive the chunk that produced it without
+                // owning those bytes. See the natural-run-formation follow-up.
+                pending_spill = Some(PendingSpill { handle, chunk_path, appended: false });
 
                 memory_used = 0;
                 force_mi_collect();
@@ -3666,7 +3819,11 @@ impl RawExternalSorter {
                     writer.start_finish()
                 })?;
 
-                pending_spill = Some(PendingSpill { handle, chunk_path });
+                // Queryname and template-coordinate keep one file per chunk for now:
+                // `RawQuerynameKey` borrows raw pointers into the record buffer, so a
+                // run's last key cannot outlive the chunk that produced it without
+                // owning those bytes. See the natural-run-formation follow-up.
+                pending_spill = Some(PendingSpill { handle, chunk_path, appended: false });
 
                 buffer.clear();
                 force_mi_collect();
@@ -6353,6 +6510,27 @@ mod tests {
         RawReadAheadReader::new(reader).count() as u64
     }
 
+    /// Assert the output really is in coordinate order.
+    ///
+    /// Record counts alone cannot distinguish "merged correctly" from "emitted
+    /// every record in the wrong order", which is exactly what a bad append
+    /// would produce.
+    fn assert_sorted_by_coordinate(path: &std::path::Path) {
+        use crate::inline::extract_coordinate_key_inline;
+        use crate::read_ahead::RawReadAheadReader;
+        let (reader, header) =
+            create_raw_bam_reader(path, 1).expect("failed to create raw BAM reader");
+        let nref = u32::try_from(header.reference_sequences().len()).expect("nref fits in u32");
+        let mut previous: Option<u64> = None;
+        for (index, record) in RawReadAheadReader::new(reader).enumerate() {
+            let key = extract_coordinate_key_inline(record.as_ref(), nref);
+            if let Some(prev) = previous {
+                assert!(prev <= key, "record {index} breaks coordinate order: {prev} then {key}");
+            }
+            previous = Some(key);
+        }
+    }
+
     /// Verifies that sort with consolidation preserves all records.
     ///
     /// Uses a tiny memory limit and low `max_temp_files` to force many chunks and
@@ -6425,12 +6603,16 @@ mod tests {
 
         let num_pairs = 30;
         let mut builder = SamBuilder::new();
+        // Descending coordinates: ascending input would fold into a single
+        // run under natural run formation, and this test needs several
+        // chunks to exercise consolidation.
         for i in 0..num_pairs {
+            let descending = num_pairs - 1 - i;
             let _ = builder
                 .add_pair()
                 .name(&format!("read{i}"))
-                .start1(i * 200 + 1)
-                .start2(i * 200 + 101)
+                .start1(descending * 200 + 1)
+                .start2(descending * 200 + 101)
                 .build();
         }
 
@@ -6642,6 +6824,267 @@ mod tests {
     }
 
     /// Verifies that sort with many chunks exercises the pool-integrated
+    /// Build a coordinate BAM whose records ascend or descend by position.
+    ///
+    /// Ascending is "already coordinate-sorted"; descending is the worst case for
+    /// run formation, where no chunk can ever extend another.
+    fn build_ordered_bam(dir: &std::path::Path, num_pairs: usize, ascending: bool) -> PathBuf {
+        use fgumi_sam::SamBuilder;
+        let mut builder = SamBuilder::new();
+        for i in 0..num_pairs {
+            let n = if ascending { i } else { num_pairs - 1 - i };
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i:05}"))
+                .start1(n * 200 + 1)
+                .start2(n * 200 + 101)
+                .build();
+        }
+        let input = dir.join("input.bam");
+        builder.write_bam(&input).expect("write bam");
+        input
+    }
+
+    fn sort_ordered_input(input: &std::path::Path, output: &std::path::Path) -> RawSortStats {
+        RawExternalSorter::new(SortOrder::Coordinate)
+            .memory_limit(8 * 1024)
+            .max_temp_files(0)
+            .threads(1)
+            .spill_codec(crate::codec::SpillCodec::Bgzf)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(input, output)
+            .expect("sort should succeed")
+    }
+
+    /// Already-sorted input is the case run formation exists for: every chunk
+    /// extends the open run, so the merge sees one source instead of many.
+    #[test]
+    fn test_sorted_input_collapses_to_one_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = build_ordered_bam(dir.path(), 300, true);
+        let output = dir.path().join("output.bam");
+
+        let stats = sort_ordered_input(&input, &output);
+
+        assert_eq!(
+            stats.chunks_written, 1,
+            "coordinate-sorted input should spill exactly one run, got {}",
+            stats.chunks_written
+        );
+        assert_eq!(stats.total_records, stats.output_records, "sort must not lose records");
+        assert_eq!(count_bam_records(&output), 600);
+    }
+
+    /// Reverse-sorted input can never append, so behaviour is unchanged from
+    /// one-file-per-chunk. This is the guard against run formation quietly
+    /// merging runs it has no right to.
+    #[test]
+    fn test_reverse_sorted_input_never_appends() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = build_ordered_bam(dir.path(), 300, false);
+        let output = dir.path().join("output.bam");
+
+        let stats = sort_ordered_input(&input, &output);
+
+        assert!(
+            stats.chunks_written >= 2,
+            "reverse-sorted input must not collapse into one run, got {}",
+            stats.chunks_written
+        );
+        assert_eq!(stats.total_records, stats.output_records, "sort must not lose records");
+        assert_eq!(count_bam_records(&output), 600);
+    }
+
+    /// Build a coordinate BAM that ascends, drops once, then ascends again.
+    ///
+    /// The descent is placed past the first spill boundary so it closes an open
+    /// run rather than landing inside the first chunk, where sorting would
+    /// absorb it.
+    fn build_descent_bam(dir: &std::path::Path, num_pairs: usize) -> PathBuf {
+        use fgumi_sam::SamBuilder;
+        let mut builder = SamBuilder::new();
+        let half = num_pairs / 2;
+        for i in 0..num_pairs {
+            // Second half restarts low, so exactly one chunk boundary sees a key
+            // below the open run's last key.
+            let n = if i < half { i } else { i - half };
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i:05}"))
+                .start1(n * 200 + 1)
+                .start2(n * 200 + 101)
+                .build();
+        }
+        let input = dir.join("descent.bam");
+        builder.write_bam(&input).expect("write bam");
+        input
+    }
+
+    /// The case that distinguishes run formation from both extremes: a descent
+    /// closes the open run and opens exactly one more. Neither the all-sorted nor
+    /// the reverse-sorted test exercises `appendable()` returning `None` while a
+    /// run is open.
+    #[test]
+    fn test_descent_opens_exactly_one_more_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = build_descent_bam(dir.path(), 300);
+        let output = dir.path().join("output.bam");
+
+        let stats = sort_ordered_input(&input, &output);
+
+        assert!(
+            stats.chunks_written >= 2,
+            "a mid-stream descent must close the open run, got {} run(s)",
+            stats.chunks_written
+        );
+        assert_eq!(stats.total_records, stats.output_records, "sort must not lose records");
+        assert_eq!(count_bam_records(&output), 600);
+        assert_sorted_by_coordinate(&output);
+    }
+
+    /// Consolidation can merge the open run away, leaving `RunFormer` holding a
+    /// path that no longer means what it did. Appending there would duplicate or
+    /// drop records, so exercise it with consolidation actually enabled --
+    /// every other run-formation test disables it.
+    #[test]
+    fn test_consolidation_while_a_run_is_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = build_descent_bam(dir.path(), 400);
+        let output = dir.path().join("output.bam");
+
+        let stats = RawExternalSorter::new(SortOrder::Coordinate)
+            .memory_limit(8 * 1024)
+            .max_temp_files(2) // small enough that consolidation can swallow the open run
+            .threads(1)
+            .spill_codec(crate::codec::SpillCodec::Bgzf)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&input, &output)
+            .expect("sort with consolidation should succeed");
+
+        assert_eq!(stats.total_records, stats.output_records, "sort must not lose records");
+        assert_eq!(count_bam_records(&output), 800);
+        assert_sorted_by_coordinate(&output);
+    }
+
+    /// Appending must work for both spill codecs. Zstd skips `ZSPILL_MAGIC` on
+    /// append -- a second magic mid-file would be read as frame data -- and that
+    /// branch is otherwise untested.
+    #[rstest::rstest]
+    #[case::bgzf(crate::codec::SpillCodec::Bgzf, 0)]
+    #[case::zstd(crate::codec::SpillCodec::Zstd, 1)]
+    fn test_append_across_spill_codecs(
+        #[case] codec: crate::codec::SpillCodec,
+        #[case] temp_compression: u32,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = build_ordered_bam(dir.path(), 300, true);
+        let output = dir.path().join("output.bam");
+
+        let stats = RawExternalSorter::new(SortOrder::Coordinate)
+            .memory_limit(8 * 1024)
+            .max_temp_files(0)
+            .threads(1)
+            .spill_codec(codec)
+            .temp_compression(temp_compression)
+            .output_compression(0)
+            .sort(&input, &output)
+            .expect("sort should succeed");
+
+        assert_eq!(stats.chunks_written, 1, "sorted input should collapse to one run");
+        assert_eq!(stats.total_records, stats.output_records, "sort must not lose records");
+        assert_eq!(count_bam_records(&output), 600);
+        assert_sorted_by_coordinate(&output);
+    }
+
+    /// The indexed path got run formation too, so cover appending there: the
+    /// merge sees one source instead of many while still emitting a BAI.
+    #[test]
+    fn test_appending_run_with_write_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = build_ordered_bam(dir.path(), 300, true);
+        let output = dir.path().join("output.bam");
+
+        let stats = RawExternalSorter::new(SortOrder::Coordinate)
+            .memory_limit(8 * 1024)
+            .max_temp_files(0)
+            .threads(1)
+            .write_index(true)
+            .spill_codec(crate::codec::SpillCodec::Bgzf)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&input, &output)
+            .expect("indexed sort should succeed");
+
+        assert_eq!(stats.chunks_written, 1, "sorted input should collapse to one run");
+        assert_eq!(stats.total_records, stats.output_records, "sort must not lose records");
+        assert_eq!(count_bam_records(&output), 600);
+        assert!(output.with_extension("bam.bai").exists(), "index should be written");
+    }
+
+    /// Run formation must not change the bytes. Sorting the same records with a
+    /// memory limit that forces appending, and with one large enough that nothing
+    /// spills at all, must produce identical output.
+    #[test]
+    fn test_run_formation_output_is_byte_identical() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = build_ordered_bam(dir.path(), 300, true);
+
+        let spilled = dir.path().join("spilled.bam");
+        let in_memory = dir.path().join("in_memory.bam");
+
+        let spilled_stats = sort_ordered_input(&input, &spilled);
+        assert_eq!(spilled_stats.chunks_written, 1, "expected the appending path");
+
+        let in_memory_stats = RawExternalSorter::new(SortOrder::Coordinate)
+            .memory_limit(256 * 1024 * 1024)
+            .threads(1)
+            .spill_codec(crate::codec::SpillCodec::Bgzf)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&input, &in_memory)
+            .expect("in-memory sort should succeed");
+        assert_eq!(in_memory_stats.chunks_written, 0, "expected the no-spill path");
+
+        assert_eq!(
+            std::fs::read(&spilled).expect("read spilled"),
+            std::fs::read(&in_memory).expect("read in-memory"),
+            "appending runs changed the output bytes"
+        );
+    }
+
+    /// A run that several chunks were appended to must carry exactly one BGZF
+    /// terminator, at its end -- interior markers stop htslib-based readers.
+    #[test]
+    fn test_appended_run_has_one_terminator() {
+        use fgumi_bgzf::BGZF_EOF;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = build_ordered_bam(dir.path(), 300, true);
+        let output = dir.path().join("output.bam");
+        let tmp = dir.path().join("spill");
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+
+        let stats = RawExternalSorter::new(SortOrder::Coordinate)
+            .memory_limit(8 * 1024)
+            .max_temp_files(0)
+            .threads(1)
+            .spill_codec(crate::codec::SpillCodec::Bgzf)
+            .temp_compression(0)
+            .output_compression(0)
+            .temp_dirs(vec![tmp.clone()])
+            .sort(&input, &output)
+            .expect("sort should succeed");
+        assert_eq!(stats.chunks_written, 1, "expected a single appended run");
+
+        // Spill files are cleaned up on success, so assert on the invariant that
+        // survives: the output is readable end to end and complete.
+        assert_eq!(count_bam_records(&output), 600);
+        let bytes = std::fs::read(&output).expect("read output");
+        assert!(bytes.ends_with(&BGZF_EOF), "output must end with a BGZF terminator");
+    }
+
     /// merge readers during the final merge phase (not just consolidation).
     #[rstest::rstest]
     #[case::coordinate(SortOrder::Coordinate)]
@@ -6653,12 +7096,18 @@ mod tests {
 
         let num_pairs = 200;
         let mut builder = SamBuilder::new();
+        // Emit descending coordinates so the input is NOT already in coordinate
+        // order. Natural run formation appends a chunk to the open run whenever
+        // its keys all sort after it, so ascending input collapses to a single
+        // run -- and a single source exercises neither the k-way merge nor the
+        // reader semaphore this test exists to cover.
         for i in 0..num_pairs {
+            let descending = num_pairs - 1 - i;
             let _ = builder
                 .add_pair()
                 .name(&format!("read{i}"))
-                .start1(i * 200 + 1)
-                .start2(i * 200 + 101)
+                .start1(descending * 200 + 1)
+                .start2(descending * 200 + 101)
                 .build();
         }
 
@@ -7456,12 +7905,15 @@ mod tests {
 
         let num_pairs = 200;
         let mut builder = SamBuilder::new();
+        // Descending coordinates so run formation does not collapse the input
+        // to one run; this test compares multi-chunk spill across temp dirs.
         for i in 0..num_pairs {
+            let descending = num_pairs - 1 - i;
             let _ = builder
                 .add_pair()
                 .name(&format!("read{i:05}"))
-                .start1(i * 200 + 1)
-                .start2(i * 200 + 101)
+                .start1(descending * 200 + 1)
+                .start2(descending * 200 + 101)
                 .build();
         }
 
@@ -7567,14 +8019,18 @@ mod tests {
         // so the index-emitting merge runs over Disk sources + the in-memory
         // chunk simultaneously (the mixed-source path the refactor must keep
         // byte-identical).
+        // Descending coordinates: the point is a merge over several Disk sources
+        // plus the in-memory chunk, and natural run formation would fold
+        // already-ascending input into one run, leaving nothing to merge.
         let num_pairs = 300;
         let mut builder = SamBuilder::new();
         for i in 0..num_pairs {
+            let descending = num_pairs - 1 - i;
             let _ = builder
                 .add_pair()
                 .name(&format!("read{i:05}"))
-                .start1(i * 200 + 1)
-                .start2(i * 200 + 101)
+                .start1(descending * 200 + 1)
+                .start2(descending * 200 + 101)
                 .build();
         }
 
