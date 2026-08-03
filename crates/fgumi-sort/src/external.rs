@@ -3711,12 +3711,24 @@ impl RawExternalSorter {
         let mut merge_read_secs = 0.0f64;
         let mut merge_tree_secs = 0.0f64;
         let mut samples_taken: u64 = 0;
+        // Countdown rather than `records_merged % interval`. A non-power-of-two
+        // modulo compiles to a multiply-shift, which is a few cycles per record
+        // -- ~0.1% of a billion-record merge. A decrement and a
+        // perfectly-predicted branch is not measurable at all, which is what
+        // lets this run unconditionally instead of behind a flag nobody
+        // remembers to set.
+        let mut sample_countdown: u64 = 0;
         let loop_start = Instant::now();
 
         while tree.winner_is_active() {
             let winner = tree.winner();
             let src_idx = source_map[winner];
-            let sample_this = records_merged.is_multiple_of(merge_sample_interval);
+            let sample_this = sample_countdown == 0;
+            if sample_this {
+                sample_countdown = merge_sample_interval - 1;
+            } else {
+                sample_countdown -= 1;
+            }
 
             let record_bytes = winner_record_bytes(&sources[src_idx], guard.consumer_ref())?;
             if sample_this {
