@@ -574,8 +574,17 @@ pub(crate) const PHASE2_READ_BATCH: usize = 4;
 /// [`SortWorkerPool::try_phase2_file_work`].
 ///
 /// Applies to one file at a time, so the extra read-ahead memory is this many
-/// compressed blocks — a few MB — not K times that.
-pub(crate) const PHASE2_STARVING_RAW_CAP: usize = 64;
+/// compressed blocks — at ~9 KB compressed that is ~4.7 MB for the one hot
+/// file, not K times that.
+///
+/// The value is empirical. Measured on a 780M-record coordinate re-sort, merge
+/// loop: 308s at the uniform cap of 8, 288s at 64, 280s at 512. It was chosen
+/// as "deep enough to cover a 2 MB buffer refill", and that reasoning turned out
+/// to be wrong — read duty cycle moved only 47.6% -> 48.8% across the 8x from 64
+/// to 512, so covering refills is demonstrably not the mechanism. The gain is
+/// real and reproducible; what produces it is not established. Do not tune this
+/// further on the strength of that story.
+pub(crate) const PHASE2_STARVING_RAW_CAP: usize = 512;
 
 /// Blocks to read per call for that same file. Large enough that one read is a
 /// sequential run rather than a 256 KB pinprick, since only one worker may hold
