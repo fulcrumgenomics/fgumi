@@ -549,7 +549,11 @@ const INPUT_READ_BATCH_SIZE: usize = 16;
 
 /// Number of raw BGZF blocks to keep read-ahead per spill file.
 ///
-/// Bounds disk read-ahead memory: K files × `PHASE2_RAW_CAP` × ~64 KB.
+/// Bounds disk read-ahead memory for every file except the one at the drain
+/// frontier, which is allowed [`PHASE2_STARVING_RAW_CAP`] instead: K files ×
+/// `PHASE2_RAW_CAP` × ~64 KB, plus that single deeper file. Still a function of
+/// config rather than input size, because the deep allowance is scoped to one
+/// file at a time.
 pub(crate) const PHASE2_RAW_CAP: usize = 8;
 
 /// Number of decompressed blocks the per-file reorder buffer may hold before
@@ -687,6 +691,17 @@ impl Phase2FileState {
             self.decomp_len.load(Ordering::Relaxed),
             self.decomp_in_flight.load(Ordering::Relaxed),
         )
+    }
+
+    /// Whether the consumer would block on this file right now: its reorder
+    /// buffer is empty and nothing is on its way into it.
+    ///
+    /// Two relaxed atomic loads, no mutex — cheap enough to consult on every
+    /// worker scan. Raw blocks may still be queued; that is precisely a file
+    /// that needs a worker's attention, not one that has it.
+    pub(crate) fn is_starving(&self) -> bool {
+        self.decomp_len.load(Ordering::Relaxed) == 0
+            && self.decomp_in_flight.load(Ordering::Relaxed) == 0
     }
 
     /// Note that the reorder buffer just drained to nothing at `now`, for
@@ -1001,6 +1016,29 @@ pub(crate) struct SharedPipelineState {
     /// buffer (Phase 2) so the main thread wakes immediately instead of
     /// spin-yielding.
     main_thread_handle: std::thread::Thread,
+
+    /// Worker thread handles, indexed by `worker_id`, so the consumer can wake
+    /// an idle worker instead of waiting out its backoff.
+    ///
+    /// Each worker publishes its own handle once, at the top of its loop; a
+    /// slot that is still empty simply cannot be woken yet, which is harmless
+    /// because a worker that has not reached its loop is not sleeping either.
+    worker_threads: Vec<std::sync::OnceLock<std::thread::Thread>>,
+    /// Rotates the target of [`Self::wake_one_worker`] so repeated wakes spread
+    /// across the pool rather than always hitting worker 0.
+    wake_cursor: AtomicUsize,
+
+    /// Lowest merge source index that has not yet delivered all its records.
+    ///
+    /// Phase 1 chunks its input sequentially, so an input that is already in
+    /// the requested order spills coordinate-*disjoint* runs: source 0 holds
+    /// the earliest records, source 1 the next, and the merge drains them one
+    /// at a time rather than interleaving. This is the frontier of that drain,
+    /// and [`SortWorkerPool::try_phase2_file_work`] uses it to look where the
+    /// work actually is. Only ever moves forward, and only a scan *hint* — the
+    /// scan still wraps over every file, so a stale value costs nothing but a
+    /// few microseconds of walking.
+    pub(crate) phase2_lowest_active: AtomicUsize,
 }
 
 impl SharedPipelineState {
@@ -1042,7 +1080,76 @@ impl SharedPipelineState {
 
             num_workers,
             main_thread_handle,
+            worker_threads: (0..num_workers).map(|_| std::sync::OnceLock::new()).collect(),
+            wake_cursor: AtomicUsize::new(0),
+            phase2_lowest_active: AtomicUsize::new(0),
         }
+    }
+
+    /// Publish a worker's thread handle so it can be woken by name.
+    fn register_worker_thread(&self, worker_id: usize) {
+        if let Some(slot) = self.worker_threads.get(worker_id) {
+            let _ = slot.set(std::thread::current());
+        }
+    }
+
+    /// Wake one idle worker, rotating which one.
+    ///
+    /// The consumer calls this the instant a reorder buffer drains. Without it
+    /// the wake path runs one way — workers to main thread — so a file that
+    /// runs dry waits out an idle worker's backoff (up to [`MAX_BACKOFF_US`])
+    /// before anyone even looks at it. That wait is pure latency: the work is
+    /// available and unclaimed.
+    ///
+    /// One worker, not all: the refill it needs to start is a disk read, which
+    /// is serialized by the file's reader mutex anyway, and a woken worker
+    /// resets its own backoff to [`MIN_BACKOFF_US`] on success and so stays hot
+    /// for the blocks that follow. Waking the whole pool would spend N fruitless
+    /// scans to get the one read that matters.
+    pub(crate) fn wake_one_worker(&self) {
+        if self.worker_threads.is_empty() {
+            return;
+        }
+        let idx = Self::wake_target(
+            self.wake_cursor.fetch_add(1, Ordering::Relaxed),
+            self.active_worker_limit.load(Ordering::Acquire),
+            self.worker_threads.len(),
+        );
+        if let Some(handle) = self.worker_threads[idx].get() {
+            handle.unpark();
+        }
+    }
+
+    /// Which worker slot the next wake should target.
+    ///
+    /// Rotates over the *active* workers, not the pool width. A pool sized to a
+    /// wide Phase 1 and capped to a narrower Phase 2 leaves workers with
+    /// `worker_id >= active_worker_limit` idle by policy, and unparking one of
+    /// those buys nothing: it re-enters its idle path without ever looking at
+    /// the starving file, while the workers that could refill it stay parked
+    /// for the rest of their backoff — exactly the latency this wake exists to
+    /// remove.
+    ///
+    /// Pure so the selection is testable without standing up a pool, following
+    /// [`classify_scan`](crate::merge_stalls::classify_scan). Clamped to at
+    /// least 1 so the modulo is always defined, however the limit was set.
+    fn wake_target(cursor: usize, active_limit: usize, pool_width: usize) -> usize {
+        cursor % active_limit.clamp(1, pool_width.max(1))
+    }
+
+    /// Advance the drain frontier past every source that is now fully drained.
+    ///
+    /// Called by the merge consumer when a source reports drained. Walks rather
+    /// than jumping to `source_id + 1` so the frontier stays truthful when
+    /// sources finish out of order — otherwise a single early finisher would
+    /// park the hint past files that are still live, and the hint would point at
+    /// the one place there is guaranteed to be no work.
+    pub(crate) fn advance_phase2_frontier(&self, files: &[Phase2FileState]) {
+        let mut frontier = self.phase2_lowest_active.load(Ordering::Relaxed);
+        while frontier < files.len() && files[frontier].is_drained() {
+            frontier += 1;
+        }
+        self.phase2_lowest_active.store(frontier, Ordering::Relaxed);
     }
 
     /// Nanoseconds since the pool's epoch, the unit every `*_nanos` field uses.
@@ -1108,10 +1215,10 @@ struct SortWorkerState {
     /// Monotonic counter incremented on each idle sleep; mixed with `worker_id` to
     /// produce per-worker jitter so all workers don't wake simultaneously.
     idle_iter: u64,
-    /// The sleep the previous loop iteration took, if it slept. Taken (and
+    /// The wait the previous loop iteration took, if it waited. Taken (and
     /// cleared) by the next iteration that finds work, which is what makes that
-    /// sleep "productive" — see [`crate::merge_stalls::WakeLatencyStats`].
-    last_sleep: Option<PendingSleep>,
+    /// wait "productive" — see [`crate::merge_stalls::WakeLatencyStats`].
+    last_wait: Option<PendingWait>,
 }
 
 impl SortWorkerState {
@@ -1122,36 +1229,39 @@ impl SortWorkerState {
     }
 }
 
-/// A sleep whose cost is not yet known, and the phase it ran in.
+/// A wait whose cost is not yet known, and the phase it ran in.
 ///
-/// The backoff level is kept separately from `backoff_us` because that field
-/// also holds `MIN_BACKOFF_US` after a successful step, which is not a sleep at
-/// all. The phase travels with it because the sleep and the step that redeems it
-/// are separate loop iterations and the phase can change in between — see
-/// [`productive_sleep_micros`].
+/// The duration is the *observed* one rather than the backoff level that was
+/// requested: waits are `park_timeout`, so a wake from
+/// [`SharedPipelineState::wake_one_worker`] ends one early, and the gap between
+/// requested and actual is precisely what that wake exists to create.
+///
+/// The phase travels with it because the wait and the step that redeems it are
+/// separate loop iterations and the phase can change in between — see
+/// [`productive_wait_nanos`].
 #[derive(Debug, Clone, Copy)]
-struct PendingSleep {
-    /// Pipeline phase the sleep ran in (see [`phase`]).
+struct PendingWait {
+    /// Pipeline phase the wait ran in (see [`phase`]).
     phase: u8,
-    /// Backoff level the sleep was taken at, in microseconds.
-    backoff_us: u64,
+    /// Observed duration of the wait, in nanoseconds.
+    nanos: u64,
 }
 
-/// The sleep to charge as productive, for a step that succeeded in `current_phase`.
+/// The wait to charge as productive, for a step that succeeded in `current_phase`.
 ///
-/// `None` when nothing was pending, or when the sleep ran in a different phase.
+/// `None` when nothing was pending, or when the wait ran in a different phase.
 /// [`crate::merge_stalls::WakeLatencyStats`] runs for the pool's whole life and
 /// the merge's share is taken by subtracting a snapshot pinned at the Phase 1 ->
-/// Phase 2 boundary, so a Phase 1 sleep recorded after that snapshot lands inside
+/// Phase 2 boundary, so a Phase 1 wait recorded after that snapshot lands inside
 /// the merge's window and reports discovery lag for a merge that had not started
 /// when the worker went to sleep. Nor can it be credited to Phase 1, whose
-/// snapshot is already taken. A sleep that straddles the boundary is therefore
+/// snapshot is already taken. A wait that straddles the boundary is therefore
 /// dropped rather than misattributed to whichever side happens to be reporting.
 ///
 /// Pure so the rule is testable without running the pool through a phase
-/// transition, following [`classify_scan`](crate::merge_stalls::classify_scan).
-fn productive_sleep_micros(pending: Option<PendingSleep>, current_phase: u8) -> Option<u64> {
-    pending.filter(|sleep| sleep.phase == current_phase).map(|sleep| sleep.backoff_us)
+/// transition, following [`jittered_wait_micros`].
+fn productive_wait_nanos(pending: Option<PendingWait>, current_phase: u8) -> Option<u64> {
+    pending.filter(|wait| wait.phase == current_phase).map(|wait| wait.nanos)
 }
 
 // ============================================================================
@@ -1225,28 +1335,58 @@ fn get_sort_priorities(bp: &SortBackpressureState) -> &'static [SortStep] {
 pub(crate) const MIN_BACKOFF_US: u64 = 10;
 /// Maximum backoff duration in microseconds (1ms).
 ///
-/// Nothing unparks a pool worker — the wake path runs one way, workers to main
-/// thread — so this is also the worst-case delay between work becoming
-/// available and an idle worker noticing it. [`crate::merge_stalls`] measures
-/// how often that delay is actually paid.
+/// This bounds how late an idle worker notices work that appeared while it was
+/// backing off. [`SharedPipelineState::wake_one_worker`] cuts that wait short
+/// for the case that measurably mattered — a merge source running dry — and
+/// [`crate::merge_stalls`] measures how often the full wait is still paid.
 pub(crate) const MAX_BACKOFF_US: u64 = 1000;
 
-/// Sleep for the given backoff duration with ±25% jitter.
+/// Wait out the given backoff with ±25% jitter, or until someone unparks us.
 ///
-/// Uses `yield_now()` at minimum backoff to avoid sleep syscall overhead.
-/// `worker_id` and `iter` are mixed into the seed so concurrent workers
-/// do not produce identical sleep durations and thundering-herd on wakeup.
-fn sleep_with_jitter(backoff_us: u64, worker_id: usize, iter: u64) {
+/// Uses `yield_now()` at minimum backoff to avoid a syscall on the hot path;
+/// above that it parks with a timeout rather than sleeping, so a wake from
+/// [`SharedPipelineState::wake_one_worker`] returns immediately instead of
+/// waiting out the full duration. `worker_id` and `iter` are mixed into the seed
+/// so concurrent workers do not produce identical durations and thundering-herd
+/// on wakeup.
+///
+/// A pending unpark token makes the next `park_timeout` return at once. That is
+/// a spurious early wake, which costs one scan and is harmless — the caller
+/// loops.
+fn idle_wait_with_jitter(backoff_us: u64, worker_id: usize, iter: u64) {
     if backoff_us <= MIN_BACKOFF_US {
         std::thread::yield_now();
     } else {
-        let jitter_range = backoff_us / 4;
-        // Cheap deterministic seed — no syscall, differs per worker and iteration.
-        let jitter_seed = (worker_id as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(iter);
-        let jitter_offset = (jitter_seed % (jitter_range * 2)).saturating_sub(jitter_range);
-        let actual_us = backoff_us.saturating_add(jitter_offset).max(MIN_BACKOFF_US);
-        std::thread::sleep(std::time::Duration::from_micros(actual_us));
+        let actual_us = jittered_wait_micros(backoff_us, worker_id, iter);
+        std::thread::park_timeout(std::time::Duration::from_micros(actual_us));
     }
+}
+
+/// `backoff_us` spread over ±25%, deterministically per `(worker_id, iter)`.
+///
+/// Pure so the spread is testable without parking a thread, following
+/// [`classify_scan`](crate::merge_stalls::classify_scan).
+///
+/// The two directions are computed separately because the offset is unsigned.
+/// Subtracting the half-range from `seed % (range * 2)` in `u64` — the obvious
+/// spelling — saturates every negative offset to zero, which silently turns
+/// ±25% into 0..+25%: no worker ever wakes *earlier* than nominal, so the pool
+/// keeps exactly the synchronized wake-ups the jitter exists to break up.
+///
+/// Callers must have already excluded `backoff_us <= MIN_BACKOFF_US`, which is
+/// what keeps `jitter_range` non-zero and the modulo defined.
+fn jittered_wait_micros(backoff_us: u64, worker_id: usize, iter: u64) -> u64 {
+    debug_assert!(backoff_us > MIN_BACKOFF_US, "caller must handle the yield_now case");
+    let jitter_range = (backoff_us / 4).max(1);
+    // Cheap deterministic seed — no syscall, differs per worker and iteration.
+    let jitter_seed = (worker_id as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(iter);
+    let jitter_offset = jitter_seed % (jitter_range * 2);
+    let actual_us = if jitter_offset < jitter_range {
+        backoff_us.saturating_sub(jitter_range - jitter_offset)
+    } else {
+        backoff_us.saturating_add(jitter_offset - jitter_range)
+    };
+    actual_us.max(MIN_BACKOFF_US)
 }
 
 // ============================================================================
@@ -1399,7 +1539,7 @@ impl SortWorkerPool {
                         held_decompressed_input: None,
                         backoff_us: MIN_BACKOFF_US,
                         idle_iter: 0,
-                        last_sleep: None,
+                        last_wait: None,
                     };
 
                     // Publish a panic as soon as the worker unwinds, not at
@@ -1445,6 +1585,8 @@ impl SortWorkerPool {
         worker: &mut SortWorkerState,
         pstats: &SortPipelineStats,
     ) {
+        // Publish this thread so the consumer can wake it out of a backoff.
+        shared.register_worker_thread(worker.worker_id);
         loop {
             // 1. Check shutdown
             let current_phase = shared.phase.load(Ordering::Acquire);
@@ -1464,24 +1606,24 @@ impl SortWorkerPool {
                 if Self::try_advance_all_held(shared, worker) {
                     worker.backoff_us = MIN_BACKOFF_US;
                 } else {
-                    sleep_with_jitter(worker.backoff_us, worker.worker_id, worker.idle_iter);
+                    idle_wait_with_jitter(worker.backoff_us, worker.worker_id, worker.idle_iter);
                     worker.idle_iter = worker.idle_iter.wrapping_add(1);
                     worker.backoff_us = (worker.backoff_us * 2).min(MAX_BACKOFF_US);
                 }
                 // A capped worker is idle by policy, not because work was slow
-                // to appear, so its sleep must not count as discovery latency.
-                worker.last_sleep = None;
+                // to appear, so its wait must not count as discovery latency.
+                worker.last_wait = None;
                 continue;
             }
 
             // 2. Check phase completion — wait for next phase, only exit on SHUTDOWN.
             //    Workers must survive across Phase 1 → Phase 2 transitions.
             if Self::is_phase_complete(shared, current_phase) && !worker.has_any_held_items() {
-                sleep_with_jitter(worker.backoff_us, worker.worker_id, worker.idle_iter);
+                idle_wait_with_jitter(worker.backoff_us, worker.worker_id, worker.idle_iter);
                 worker.idle_iter = worker.idle_iter.wrapping_add(1);
                 worker.backoff_us = (worker.backoff_us * 2).min(MAX_BACKOFF_US);
                 // Waiting for the next phase, not for work — see above.
-                worker.last_sleep = None;
+                worker.last_wait = None;
                 continue;
             }
 
@@ -1546,32 +1688,32 @@ impl SortWorkerPool {
 
             // 7. Backoff with jitter (ported from unified pipeline)
             if did_work {
-                // The sleep that preceded this step was slept *through* work
-                // becoming available: nothing unparks a worker, so the work may
-                // have arrived at any point during it. That is the part of idle
-                // time the pipeline actually pays for, and it is invisible in
-                // the idle total, which counts the productive and unproductive
-                // sleeps alike.
+                // The wait that preceded this step was slept *through* work
+                // becoming available, so the work may have arrived at any point
+                // during it. That is the part of idle time the pipeline actually
+                // pays for, and it is invisible in the idle total, which counts
+                // the productive and unproductive waits alike. `wake_one_worker`
+                // shortens the wait when the consumer knows work is coming; what
+                // is recorded here is what the wait actually cost.
                 //
-                // `take` unconditionally: a sleep from another phase is dropped,
+                // `take` unconditionally: a wait from another phase is dropped,
                 // not carried forward to the next step in this one.
-                if let Some(slept_us) =
-                    productive_sleep_micros(worker.last_sleep.take(), current_phase)
+                if let Some(waited_ns) =
+                    productive_wait_nanos(worker.last_wait.take(), current_phase)
                 {
-                    shared.wake_latency.record_productive_sleep(slept_us);
+                    shared.wake_latency.record_productive_sleep(waited_ns);
                 }
                 worker.backoff_us = MIN_BACKOFF_US;
             } else {
                 let slept_us = worker.backoff_us;
                 let idle_start = Instant::now();
-                sleep_with_jitter(slept_us, worker.worker_id, worker.idle_iter);
+                idle_wait_with_jitter(slept_us, worker.worker_id, worker.idle_iter);
                 worker.idle_iter = worker.idle_iter.wrapping_add(1);
                 worker.backoff_us = (worker.backoff_us * 2).min(MAX_BACKOFF_US);
                 let idle_ns = Self::nanos_u64(idle_start.elapsed());
                 pstats.record_idle(worker.worker_id, idle_ns);
                 shared.wake_latency.record_sleep(slept_us, idle_ns);
-                worker.last_sleep =
-                    Some(PendingSleep { phase: current_phase, backoff_us: slept_us });
+                worker.last_wait = Some(PendingWait { phase: current_phase, nanos: idle_ns });
             }
         }
     }
@@ -1940,8 +2082,32 @@ impl SortWorkerPool {
         let mut tally = Phase2ScanTally::default();
         let scan_start = shared.now_nanos();
 
+        // Where to start looking. Normally the worker's own round-robin cursor,
+        // which spreads N workers over the file set and is what keeps an
+        // interleaved merge — where every file is hot — saturated.
+        //
+        // But when the input was already in the requested order, the spill runs
+        // are disjoint and only one file is ever being consumed. Round-robin
+        // then spends most of a scan on files sitting at `PHASE2_DECOMP_CAP`
+        // with nothing to give, while the one file the merge is blocked on waits
+        // to be reached. So if the drain frontier is starving, start there: it
+        // is the file the consumer is either blocked on or about to be.
+        //
+        // Gated on `is_starving` rather than applied unconditionally, because a
+        // frontier that is merely *active* is the common case in an interleaved
+        // merge, and sending every worker to file 0 there would undo the spread
+        // that makes that case fast.
+        let start = {
+            let frontier = shared.phase2_lowest_active.load(Ordering::Relaxed);
+            if frontier < n && files[frontier].is_starving() {
+                frontier
+            } else {
+                worker.phase2_file_cursor
+            }
+        };
+
         for offset in 0..n {
-            let i = (worker.phase2_file_cursor + offset) % n;
+            let i = (start + offset) % n;
             let file = &files[i];
 
             // -- Try decompression first (highest-value work) ----------------
@@ -2585,6 +2751,13 @@ impl SortWorkerPool {
         // Reset EOF state
         self.shared.all_chunks_eof.store(false, Ordering::Release);
         self.shared.sources_at_eof.store(0, Ordering::Release);
+        // The drain frontier indexes the file vector being replaced, so a pool
+        // that merges twice would carry the prior set's frontier into the new
+        // one: at or past the old source count it disables frontier
+        // prioritization outright, and below it points at whichever file now
+        // happens to sit at that index. `advance_phase2_frontier` only walks
+        // forward, so neither is self-correcting.
+        self.shared.phase2_lowest_active.store(0, Ordering::Release);
 
         let mut states: Vec<Phase2FileState> = Vec::with_capacity(total_sources);
         for path in files {
@@ -3251,35 +3424,97 @@ mod tests {
         pool.shutdown();
     }
 
-    /// A sleep that straddles the Phase 1 -> Phase 2 boundary belongs to
+    /// A wait that straddles the Phase 1 -> Phase 2 boundary belongs to
     /// neither report.
     ///
     /// `wake_latency` runs for the pool's whole life and the merge's share is
-    /// taken by subtracting a snapshot pinned at the boundary, so a Phase 1
-    /// sleep recorded after that snapshot lands inside the merge's window —
-    /// booking discovery lag against a merge that had not started when the
-    /// worker went to sleep. The sleep cannot be credited to Phase 1 either,
-    /// since its snapshot is already taken, so it is dropped.
+    /// taken by subtracting a snapshot pinned at the boundary, so a Phase 1 wait
+    /// recorded after that snapshot lands inside the merge's window — booking
+    /// discovery lag against a merge that had not started when the worker went
+    /// to sleep. The wait cannot be credited to Phase 1 either, since its
+    /// snapshot is already taken, so it is dropped.
     #[rstest]
-    #[case::same_phase_sleep_is_charged(
-        Some(PendingSleep { phase: phase::PHASE2, backoff_us: 80 }), phase::PHASE2, Some(80)
+    #[case::same_phase_wait_is_charged(
+        Some(PendingWait { phase: phase::PHASE2, nanos: 5_000 }), phase::PHASE2, Some(5_000)
     )]
-    #[case::phase1_sleep_is_not_charged_to_phase2(
-        Some(PendingSleep { phase: phase::PHASE1, backoff_us: 80 }), phase::PHASE2, None
+    #[case::phase1_wait_is_not_charged_to_phase2(
+        Some(PendingWait { phase: phase::PHASE1, nanos: 5_000 }), phase::PHASE2, None
     )]
-    #[case::phase2_sleep_is_not_charged_to_phase1(
-        Some(PendingSleep { phase: phase::PHASE2, backoff_us: 80 }), phase::PHASE1, None
+    #[case::phase2_wait_is_not_charged_to_phase1(
+        Some(PendingWait { phase: phase::PHASE2, nanos: 5_000 }), phase::PHASE1, None
     )]
-    #[case::a_phase1_sleep_within_phase1_is_charged(
-        Some(PendingSleep { phase: phase::PHASE1, backoff_us: 40 }), phase::PHASE1, Some(40)
+    #[case::a_phase1_wait_within_phase1_is_charged(
+        Some(PendingWait { phase: phase::PHASE1, nanos: 7_000 }), phase::PHASE1, Some(7_000)
     )]
-    #[case::no_pending_sleep(None, phase::PHASE2, None)]
-    fn productive_sleep_is_scoped_to_the_phase_it_ran_in(
-        #[case] pending: Option<PendingSleep>,
+    #[case::no_pending_wait(None, phase::PHASE2, None)]
+    fn productive_wait_is_scoped_to_the_phase_it_ran_in(
+        #[case] pending: Option<PendingWait>,
         #[case] current_phase: u8,
         #[case] expected: Option<u64>,
     ) {
-        assert_eq!(productive_sleep_micros(pending, current_phase), expected);
+        assert_eq!(productive_wait_nanos(pending, current_phase), expected);
+    }
+
+    /// The jitter must spread waits in *both* directions.
+    ///
+    /// Its whole job is to desynchronize workers that backed off together, and a
+    /// one-sided spread cannot: if every wait is nominal-or-longer, the pool
+    /// keeps the alignment the jitter was added to break. The unsigned-subtract
+    /// spelling that produces exactly that failure is the one this pins against.
+    #[rstest]
+    fn jitter_spreads_waits_both_sides_of_the_backoff(
+        #[values(20u64, 40, 80, 160, 320, 640, 1000)] backoff_us: u64,
+    ) {
+        let range = backoff_us / 4;
+        let waits: Vec<u64> =
+            (0..512).map(|iter| jittered_wait_micros(backoff_us, 3, iter)).collect();
+
+        let min = *waits.iter().min().expect("non-empty");
+        let max = *waits.iter().max().expect("non-empty");
+        assert!(
+            min >= backoff_us.saturating_sub(range).max(MIN_BACKOFF_US),
+            "waits must stay within -25%: min {min} for backoff {backoff_us}"
+        );
+        assert!(max <= backoff_us + range, "waits must stay within +25%: max {max}");
+        assert!(
+            min < backoff_us,
+            "some wait must be SHORTER than nominal (backoff {backoff_us}, min {min}) -- \
+             a saturating unsigned subtract clamps these away and leaves 0..+25%"
+        );
+        assert!(max > backoff_us, "and some wait must be longer (max {max})");
+    }
+
+    /// The consumer wakes a worker the instant a merge source runs dry, so the
+    /// woken worker has to be one that may actually take Phase 2 work. Rotating
+    /// over the pool width instead sends most wakes to workers idled by the
+    /// Phase 2 cap, which re-park without looking at the starving file — and
+    /// the workers that could have refilled it wait out their full backoff.
+    #[rstest]
+    // A pool 8 wide capped to 3 must never select a worker above the cap, at
+    // any point in the rotation.
+    #[case::capped_pool_rotates_only_over_active_workers(0, 3, 8, 0)]
+    #[case::capped_pool_wraps_at_the_cap(2, 3, 8, 2)]
+    #[case::capped_pool_never_selects_a_capped_worker(3, 3, 8, 0)]
+    #[case::capped_pool_keeps_rotating_past_the_wrap(7, 3, 8, 1)]
+    // Uncapped, the cap equals the width and the rotation is unchanged.
+    #[case::uncapped_pool_rotates_over_the_whole_width(7, 8, 8, 7)]
+    #[case::uncapped_pool_wraps_at_the_width(8, 8, 8, 0)]
+    // A limit above the width cannot select a slot that does not exist.
+    #[case::limit_above_the_width_is_clamped(5, 99, 4, 1)]
+    // A zero limit must not divide by zero; slot 0 is always a real worker.
+    #[case::zero_limit_falls_back_to_one_worker(7, 0, 8, 0)]
+    fn wake_target_rotates_only_over_workers_that_can_take_phase2_work(
+        #[case] cursor: usize,
+        #[case] active_limit: usize,
+        #[case] pool_width: usize,
+        #[case] expected: usize,
+    ) {
+        let idx = SharedPipelineState::wake_target(cursor, active_limit, pool_width);
+        assert_eq!(idx, expected);
+        assert!(idx < pool_width, "the slot must exist in the pool");
+        if active_limit > 0 {
+            assert!(idx < active_limit, "a capped worker cannot refill the starving source");
+        }
     }
 
     #[test]
@@ -4017,5 +4252,99 @@ mod tests {
         );
         assert_eq!(phase2_file_position(&files[0]), 0);
         pool.shutdown();
+    }
+
+    /// A pool that merges twice must start the second merge's frontier at its
+    /// own first source.
+    ///
+    /// The frontier is an index into the file vector `set_phase2_files`
+    /// replaces, so carrying it across would leave the second merge pointing at
+    /// a file the number no longer describes — and `advance_phase2_frontier`
+    /// only walks forward, so nothing would ever pull it back.
+    #[test]
+    fn test_set_phase2_files_restarts_the_drain_frontier() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spill = |name: &str| {
+            let path = dir.path().join(name);
+            let mut file = std::fs::File::create(&path).expect("create");
+            file.write_all(&[0x1f, 0x8b, 0x00, 0x00]).expect("write magic");
+            path
+        };
+
+        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf);
+
+        // First merge: one source, drained to completion.
+        pool.set_phase2_files(std::slice::from_ref(&spill("first.spill")))
+            .expect("set_phase2_files");
+        let first = pool.phase2_files();
+        first[0].reader_eof.store(true, Ordering::Release);
+        assert!(first[0].is_drained(), "the lone source must read as fully consumed");
+        pool.shared.advance_phase2_frontier(&first);
+        assert_eq!(
+            pool.shared.phase2_lowest_active.load(Ordering::Relaxed),
+            1,
+            "a completed merge parks the frontier past its last source"
+        );
+
+        // Second merge: a fresh set, whose file 0 is live.
+        pool.set_phase2_files(&[spill("second-a.spill"), spill("second-b.spill")])
+            .expect("set_phase2_files");
+        assert_eq!(
+            pool.shared.phase2_lowest_active.load(Ordering::Relaxed),
+            0,
+            "the new source set must be prioritized from its own first file"
+        );
+
+        pool.shutdown();
+    }
+
+    /// Repeated wakes must rotate rather than always hitting worker 0:
+    /// re-waking one worker while the others sleep is the starvation the wake
+    /// path exists to avoid. Registered handles are all this thread, so the
+    /// observable contract here is the cursor advancing once per wake.
+    #[test]
+    fn test_wake_one_worker_rotates_across_the_pool() {
+        let shared = SharedPipelineState::new(4, std::thread::current());
+        for expected in 1..=8 {
+            shared.wake_one_worker();
+            assert_eq!(
+                shared.wake_cursor.load(Ordering::Relaxed),
+                expected,
+                "each wake must advance the cursor exactly once"
+            );
+        }
+    }
+
+    /// The rotation test above only proves the cursor moves; every slot it
+    /// rotates through is empty, so it passes with the `unpark` dispatch
+    /// deleted. This one registers a real worker and asserts the wake is
+    /// actually delivered, which is the behaviour the starving-source path
+    /// depends on.
+    ///
+    /// No sleep is needed to order the two threads: `unpark` on a thread that
+    /// has not parked yet leaves a token, so the next `park` returns
+    /// immediately. Failure surfaces as the `recv_timeout` below rather than as
+    /// a hang.
+    #[test]
+    fn test_wake_one_worker_unparks_a_registered_worker() {
+        let shared = Arc::new(SharedPipelineState::new(1, std::thread::current()));
+        let (registered_tx, registered_rx) = bounded::<()>(1);
+        let (woken_tx, woken_rx) = bounded::<()>(1);
+
+        let worker_shared = Arc::clone(&shared);
+        let worker = std::thread::spawn(move || {
+            worker_shared.register_worker_thread(0);
+            registered_tx.send(()).expect("main thread is still waiting");
+            std::thread::park();
+            woken_tx.send(()).expect("main thread is still waiting");
+        });
+
+        registered_rx.recv().expect("the worker must publish its handle");
+        shared.wake_one_worker();
+        woken_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("wake_one_worker must unpark the worker registered in slot 0");
+        worker.join().expect("worker thread must not panic");
     }
 }
