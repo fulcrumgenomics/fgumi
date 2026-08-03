@@ -3928,7 +3928,7 @@ impl RawExternalSorter {
                 if loop_total > 0.0 { est_read / loop_total } else { 0.0 },
             );
         }
-        Self::log_merge_stalls(loop_total, stalls, pool);
+        Self::log_merge_stalls(loop_total, merge_total, active_workers, stalls, pool);
         info!("==============================");
     }
 
@@ -3939,13 +3939,32 @@ impl RawExternalSorter {
     /// parked; why worker file-scans came back empty; and how much of the
     /// workers' idle time was spent asleep *through* work becoming available.
     /// See [`crate::merge_stalls`].
+    ///
+    /// `merge_total` and `active_workers` are the utilization denominators and
+    /// must be the same pair [`Self::log_merge_sub_phases`] divides by, because
+    /// `SATURATED_UTILIZATION` is shared between `classify_merge` and
+    /// `classify_stall` so the two verdicts agree about whether the pool was
+    /// busy. `loop_total` stays the denominator for the consumer's park
+    /// fraction, which is a fraction of the merge loop alone.
     #[allow(clippy::cast_precision_loss)]
     fn log_merge_stalls(
         loop_total: f64,
+        merge_total: f64,
+        active_workers: usize,
         stalls: Option<crate::merge_stalls::ConsumerStallReport>,
         pool: &Arc<SortWorkerPool>,
     ) {
         use crate::merge_stalls::{Phase2Skip, ScanVerdict};
+
+        // Utilization gates the stall shape: "no worker on it" means a
+        // scheduling defect on an idle pool and plain saturation on a busy one.
+        // The active cap, not the pool width -- a Phase 2 narrower than Phase 1
+        // otherwise charges the merge for workers that were never allowed to
+        // help, and reports a saturated pool as idle.
+        let utilization = pool
+            .merge_phase_breakdown()
+            .worker_utilization(merge_total, active_workers)
+            .unwrap_or(0.0);
 
         let scans = pool.phase2_scan_report();
         let wake = pool.wake_latency_report();
@@ -3957,7 +3976,7 @@ impl RawExternalSorter {
         info!("=== Merge Stalls ===");
 
         if let Some(s) = stalls {
-            Self::log_consumer_stalls(loop_total, s);
+            Self::log_consumer_stalls(loop_total, utilization, s);
         }
 
         if !scans.is_empty() {
@@ -4018,13 +4037,26 @@ impl RawExternalSorter {
             return;
         }
 
+        // Two audiences, one measurement. The distributions are what an
+        // investigation needs and are far too much for someone who just sorted a
+        // BAM, so the per-stage histograms go to debug while the numbers that
+        // change a decision stay at info. Collection is unconditional either
+        // way -- gating collection is what made the original question
+        // unanswerable from logs we had already collected.
         info!("=== Merge Block Lifecycle ===");
-        info!("  disk read   -> {}", life.read_batch.summary());
-        info!("  raw dwell   -> {}   (queued, waiting for a worker)", life.raw_dwell.summary());
-        info!("  decompress  -> {}", life.decompress.summary());
-        info!(
+        debug!("  disk read   -> {}", life.read_batch.summary());
+        debug!("  raw dwell   -> {}   (queued, waiting for a worker)", life.raw_dwell.summary());
+        debug!("  decompress  -> {}", life.decompress.summary());
+        debug!(
             "  reorder     -> {}   (decompressed, waiting for the consumer)",
             life.reorder_dwell.summary()
+        );
+        info!(
+            "  Per block: {:.0}us in the raw FIFO unclaimed, {:.0}us decompressing, {:.0}us \
+             buffered before use (p50)",
+            life.raw_dwell.percentile_micros(0.50),
+            life.decompress.percentile_micros(0.50),
+            life.reorder_dwell.percentile_micros(0.50)
         );
         if life.reorder_is_pass_through() {
             info!(
@@ -4043,10 +4075,10 @@ impl RawExternalSorter {
                 100.0 * refill.cause_share(EmptyCause::Decompressing),
                 100.0 * refill.cause_share(EmptyCause::Dry)
             );
-            info!("    empty -> claimed  {}", refill.claim_lag.summary());
-            info!("    empty -> inserted {}", refill.insert_lag.summary());
-            if !refill.read_lag.summary().is_empty() && !refill.read_lag.is_empty() {
-                info!("    empty -> read     {}", refill.read_lag.summary());
+            debug!("    empty -> claimed  {}", refill.claim_lag.summary());
+            debug!("    empty -> inserted {}", refill.insert_lag.summary());
+            if !refill.read_lag.is_empty() {
+                debug!("    empty -> read     {}", refill.read_lag.summary());
             }
             info!(
                 "    -> {:.0}% of refill latency is spent waiting for a worker to START, {:.0}% \
@@ -4057,11 +4089,11 @@ impl RawExternalSorter {
         }
 
         if !consumer.is_empty() {
-            info!("  Park duration by what the awaited file was doing");
+            debug!("  Park duration by what the awaited file was doing");
             for state in AwaitedState::ALL {
                 let hist = consumer.park_by_state[state as usize];
                 if !hist.is_empty() {
-                    info!("    {:<14} {}", state.label(), hist.summary());
+                    debug!("    {:<14} {}", state.label(), hist.summary());
                 }
             }
             let parks = consumer.parks();
@@ -4085,7 +4117,7 @@ impl RawExternalSorter {
         }
 
         if !scans.is_empty() {
-            info!("  Fruitless worker scan cost: {}", scans.summary());
+            debug!("  Fruitless worker scan cost: {}", scans.summary());
         }
         info!("=============================");
     }
@@ -4096,7 +4128,11 @@ impl RawExternalSorter {
     /// with the sampled "fetch next record" row above, this is the one to
     /// believe.
     #[allow(clippy::cast_precision_loss)]
-    fn log_consumer_stalls(loop_total: f64, s: crate::merge_stalls::ConsumerStallReport) {
+    fn log_consumer_stalls(
+        loop_total: f64,
+        utilization: f64,
+        s: crate::merge_stalls::ConsumerStallReport,
+    ) {
         use crate::merge_stalls::{StallShape, classify_stall};
 
         let park_fraction = if loop_total > 0.0 { s.park_secs / loop_total } else { 0.0 };
@@ -4147,8 +4183,13 @@ impl RawExternalSorter {
                 100.0 * s.awaited.in_progress()
             );
         }
-        match classify_stall(park_fraction, s.contended_share, s.awaited) {
+        match classify_stall(park_fraction, utilization, s.contended_share, s.awaited) {
             StallShape::NotStalled => info!("    Shape: the consumer is not waiting on blocks"),
+            StallShape::PoolSaturated => info!(
+                "    Shape: pool saturated -- the consumer waits because every worker is busy, \
+                 which is what a healthy CPU-bound merge looks like. Fewer bytes to compress or \
+                 more threads would help; nothing here is misscheduled"
+            ),
             StallShape::HeadOfLine => info!(
                 "    Shape: head-of-line -- the awaited file has nothing anywhere in its \
                  pipeline, so the block has not been read from disk yet. The constraint is \
@@ -4161,8 +4202,9 @@ impl RawExternalSorter {
             ),
             StallShape::DecompressLatency => info!(
                 "    Shape: decompression latency -- a worker is already producing the needed \
-                 block, so the consumer is paying the per-block cost serially. Only running \
-                 further ahead (a deeper PHASE2_DECOMP_CAP) or faster decompression removes it"
+                 block, so the consumer is paying the per-block cost serially. Check the reorder \
+                 dwell below before reaching for a deeper cap: if blocks are consumed as fast as \
+                 they are inserted, the buffer is not what the pipeline is running into"
             ),
             StallShape::Contended => info!(
                 "    Shape: lock contention -- a large share of file state could not be read \
@@ -4424,20 +4466,40 @@ impl RawExternalSorter {
         // but the stall counters need no sampling at all, so an indexed sort is
         // not left with nothing. `--write-index` is the default for a
         // coordinate sort, so that gap covers most production merges.
+        //
+        // The active cap is read while Phase 2 is still active, so teardown
+        // cannot change it, and the consumer's report is harvested before
+        // `finish_output` releases the merge sources and with them the
+        // consumer. Both describe the loop that has just ended.
+        let loop_total = loop_start.elapsed().as_secs_f64();
+        let active_workers = pool.active_workers();
+        let stalls = {
+            // Close the run in progress first, or the last (and often longest)
+            // stretch on one source is dropped from the histogram.
+            if let Some(consumer) = guard.consumer_mut() {
+                consumer.finish_source_run();
+            }
+            guard.consumer_ref().map(MainThreadChunkConsumer::stall_report)
+        };
+
+        // Finalize before logging, for the reason the generic path does: `finish`
+        // drains the output queue, and every block still in it is compressed by
+        // the same workers `log_merge_stalls` divides into `merge_total`. Logging
+        // first omits that tail of `output_compress` while still charging the
+        // window it was queued in, understating utilization -- and utilization is
+        // the input `classify_stall` uses to tell a saturated pool from a
+        // scheduling defect, so the bias flips a verdict rather than shading a
+        // number. `loop_total` stays the consumer's park-fraction denominator,
+        // which is a fraction of the merge loop alone.
+        let index = guard.finish_output(|| writer.finish_index())?;
         Self::log_merge_stalls(
+            loop_total,
             loop_start.elapsed().as_secs_f64(),
-            {
-                // Close the run in progress first, or the last (and often
-                // longest) stretch on one source is dropped from the histogram.
-                if let Some(consumer) = guard.consumer_mut() {
-                    consumer.finish_source_run();
-                }
-                guard.consumer_ref().map(MainThreadChunkConsumer::stall_report)
-            },
+            active_workers,
+            stalls,
             pool,
         );
 
-        let index = guard.finish_output(|| writer.finish_index())?;
         merge_progress.log_final();
         Ok(index)
     }

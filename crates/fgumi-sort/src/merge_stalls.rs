@@ -51,11 +51,18 @@
 //!
 //! # Calibration status
 //!
-//! [`classify_merge`](crate::merge_phases::classify_merge)'s thresholds were
-//! fitted to measured runs. [`classify_stall`]'s were not — they encode the
-//! hypotheses this instrumentation exists to test, and the first instrumented
-//! run should either confirm or replace them. The test cases are named for the
-//! hypothesis each one pins so that is not forgotten.
+//! Both [`classify_merge`](crate::merge_phases::classify_merge)'s thresholds and
+//! [`classify_stall`]'s are fitted to measured runs, and the `measured_*` test
+//! cases pin them to the specific merges that produced them — so moving a
+//! threshold means confronting the evidence rather than editing a number.
+//!
+//! Those runs cover two regimes that behave very differently: a merge of
+//! *disjoint* spill runs (which arises when the input is already sorted in the
+//! requested order, and which idles half the pool) and a merge of *interleaved*
+//! runs (which saturates it). A classifier calibrated on only one of them
+//! misreads the other — notably, "the awaited block exists and no worker is on
+//! it" describes a scheduling defect in the first regime and simple saturation
+//! in the second, which is why `classify_stall` takes worker utilization.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -84,9 +91,20 @@ pub(crate) enum Phase2Skip {
     /// not the gap-filler the consumer is stuck on. Backpressure working as
     /// intended: the consumer is behind, not the pool.
     DecompCapped,
-    /// The raw FIFO is at `PHASE2_RAW_CAP`, so no more disk read-ahead is
-    /// admitted. Blocks are arriving faster than they are being decompressed.
+    /// The raw FIFO is at `PHASE2_RAW_CAP` while the reorder buffer still has
+    /// room, so decompression — not the consumer — is what this file is waiting
+    /// on.
+    ///
+    /// Reported only when the decompress half is *not* capped; when both are
+    /// full the reason is [`FullyBuffered`](Self::FullyBuffered), because a full
+    /// raw FIFO is the downstream consequence of workers having stopped
+    /// decompressing. A zero count here therefore does **not** mean
+    /// `PHASE2_RAW_CAP` was never reached — only that it was never the root
+    /// reason. Misreading that cost real time once already.
     RawFull,
+    /// Both caps are full: the consumer is behind, and the read-ahead behind it
+    /// has backed up to its own limit. The file is as buffered as it can be.
+    FullyBuffered,
     /// Another worker holds this file's reader lock, i.e. a disk read for it is
     /// already underway. Not a defect — but a scan dominated by it means
     /// workers are queued behind in-flight reads, and more read concurrency,
@@ -99,13 +117,14 @@ pub(crate) enum Phase2Skip {
 
 impl Phase2Skip {
     /// Number of variants, for fixed-size counter arrays.
-    pub(crate) const COUNT: usize = 5;
+    pub(crate) const COUNT: usize = 6;
 
     /// Every variant, in declaration order, for iteration and display.
     pub(crate) const ALL: [Self; Self::COUNT] = [
         Self::Drained,
         Self::DecompCapped,
         Self::RawFull,
+        Self::FullyBuffered,
         Self::ReadInProgress,
         Self::LockContended,
     ];
@@ -116,6 +135,7 @@ impl Phase2Skip {
             Self::Drained => "drained",
             Self::DecompCapped => "decomp-capped",
             Self::RawFull => "raw-full",
+            Self::FullyBuffered => "fully-buffered",
             Self::ReadInProgress => "read-in-progress",
             Self::LockContended => "lock-contended",
         }
@@ -150,17 +170,22 @@ pub(crate) enum ReadSkip {
 
 /// Reduce a file's two half-scan outcomes to the one reason worth counting.
 ///
-/// Both halves decline independently and often for related reasons (a file at
-/// its decompress cap will usually also have a full raw FIFO), so the pair has
-/// to be collapsed rather than counted twice. Backpressure wins over everything
-/// else because it is the only outcome that says the pipeline is *working* —
-/// this file has data and the pool is deliberately not taking it.
+/// Both halves decline independently and often for causally related reasons: a
+/// file at its decompress cap has workers refusing to pull raw blocks, so its
+/// raw FIFO fills to its own cap shortly after. Counting both would double-count
+/// one condition, and reporting the downstream one would name the symptom.
+///
+/// So the reasons are ordered by causal depth, not severity. `DecompCapped`
+/// means the consumer is behind; `FullyBuffered` is the same thing after the
+/// read-ahead behind it has also backed up. Only when the decompress side has
+/// room does `RawFull` mean what it says — that decompression is the laggard.
 #[must_use]
 pub(crate) fn combine_skip(pop: PopSkip, read: ReadSkip) -> Phase2Skip {
     match (pop, read) {
-        (PopSkip::DecompCapped, _) => Phase2Skip::DecompCapped,
         (PopSkip::RawLockContended | PopSkip::DecompLockContended, _)
         | (_, ReadSkip::RawLockContended) => Phase2Skip::LockContended,
+        (PopSkip::DecompCapped, ReadSkip::RawFull) => Phase2Skip::FullyBuffered,
+        (PopSkip::DecompCapped, _) => Phase2Skip::DecompCapped,
         (_, ReadSkip::ReaderBusy) => Phase2Skip::ReadInProgress,
         (_, ReadSkip::RawFull) => Phase2Skip::RawFull,
         (PopSkip::RawEmpty, ReadSkip::ReaderEof) => Phase2Skip::Drained,
@@ -281,7 +306,11 @@ pub(crate) fn classify_scan(tally: Phase2ScanTally) -> ScanVerdict {
 
     if share(Phase2Skip::LockContended) >= CONTENDED_SHARE {
         ScanVerdict::Contended
-    } else if share(Phase2Skip::DecompCapped) + share(Phase2Skip::RawFull) >= DOMINANT_SHARE {
+    } else if share(Phase2Skip::DecompCapped)
+        + share(Phase2Skip::FullyBuffered)
+        + share(Phase2Skip::RawFull)
+        >= DOMINANT_SHARE
+    {
         ScanVerdict::Backpressured
     } else if share(Phase2Skip::ReadInProgress) >= DOMINANT_SHARE {
         ScanVerdict::IoWait
@@ -920,18 +949,30 @@ pub enum StallShape {
     /// The consumer barely parked; whatever it spends its loop on, it is not
     /// waiting for blocks.
     NotStalled,
+    /// The pool is saturated. The consumer waits because every worker is busy,
+    /// which is the expected shape of a healthy CPU-bound merge rather than a
+    /// defect. Checked before the awaited-file states, because those cannot
+    /// tell "nobody picked this up" from "nobody was free to pick it up" — on
+    /// two measured 780M-record merges at 98% utilization the awaited file read
+    /// as 79% unclaimed, which would otherwise be reported as a scheduling bug.
+    PoolSaturated,
     /// The consumer waits on a file with nothing anywhere in its pipeline —
     /// the block has not even been read from disk. The constraint is upstream
     /// of the pool: disk, or read concurrency.
     HeadOfLine,
     /// The block the consumer needs already exists, in raw or partially
-    /// reordered form, and no worker is applying capacity to it. A scheduling
-    /// and discovery problem, not a capacity one: workers are idle, or looking
-    /// at the wrong file, or asleep.
+    /// reordered form, and no worker is applying capacity to it *while capacity
+    /// is available*. A scheduling and discovery problem, not a capacity one:
+    /// workers are idle, or looking at the wrong file, or asleep.
     WorkUnclaimed,
-    /// A worker is already producing the block the consumer needs. The wait is
-    /// the per-block decompression cost itself, so only running further ahead
-    /// (a deeper cap) or decompressing faster removes it.
+    /// A worker is already producing the block the consumer needs, so the wait
+    /// is the per-block decompression cost paid serially.
+    ///
+    /// Deliberately does not prescribe a deeper cap. Whether running further
+    /// ahead is even possible depends on the reorder dwell measured alongside
+    /// this: if blocks are consumed as fast as they are inserted, the buffer is
+    /// a pass-through and its cap is not what the pipeline is running into. See
+    /// [`crate::merge_trace::BlockLifecycleReport::reorder_is_pass_through`].
     DecompressLatency,
     /// Enough of the pipeline's state was lock-contended that contention is the
     /// first thing to fix; the other shares are unreliable until it is.
@@ -942,6 +983,12 @@ pub enum StallShape {
 
 /// Park share of the merge loop below which the consumer is not stalling.
 const NOT_STALLED_PARK_FRACTION: f64 = 0.05;
+/// Worker utilization at or above which a stall is simply saturation.
+///
+/// Shared with [`crate::merge_phases::classify_merge`]'s `CpuBound` threshold on
+/// purpose: the two classifiers must not disagree about whether the pool is
+/// busy.
+const SATURATED_UTILIZATION: f64 = 0.85;
 /// Share of the awaited-file census one explanation must reach to be reported.
 const AWAITED_DOMINANT_SHARE: f64 = 0.50;
 /// Share of live files that must be unreadable to blame contention.
@@ -965,9 +1012,16 @@ const CONTENDED_FILE_SHARE: f64 = 0.25;
 /// The useful split is whether the needed block exists yet, and if it does,
 /// whether anyone is working on it. Those three cases have three different
 /// fixes, and no pool-wide statistic distinguishes them.
+///
+/// `utilization` is the one pool-wide figure that is still required, and it
+/// gates everything else. "The block exists and no worker is on it" describes
+/// both a scheduling defect and a fully-busy pool, and only utilization tells
+/// them apart. Two measured merges at 98% utilization show 79% of waits on
+/// unclaimed work; calling that a scheduling bug would be wrong.
 #[must_use]
 pub fn classify_stall(
     park_fraction: f64,
+    utilization: f64,
     contended_share: f64,
     awaited: AwaitedShares,
 ) -> StallShape {
@@ -975,6 +1029,8 @@ pub fn classify_stall(
         StallShape::NotStalled
     } else if contended_share >= CONTENDED_FILE_SHARE {
         StallShape::Contended
+    } else if utilization >= SATURATED_UTILIZATION {
+        StallShape::PoolSaturated
     } else if awaited.starved >= AWAITED_DOMINANT_SHARE {
         StallShape::HeadOfLine
     } else if awaited.unclaimed() >= AWAITED_DOMINANT_SHARE {
@@ -1006,10 +1062,14 @@ mod tests {
     }
 
     #[rstest]
+    // Both caps full is its own state: the consumer is behind AND the read-ahead
+    // behind it has backed up. Reporting this as plain `RawFull` would name the
+    // symptom; reporting it as `DecompCapped` would lose that the FIFO filled.
+    #[case(PopSkip::DecompCapped, ReadSkip::RawFull, Phase2Skip::FullyBuffered)]
     // Backpressure is the one outcome that says the pipeline is working, so it
-    // wins over the read half's (correlated) complaint.
-    #[case(PopSkip::DecompCapped, ReadSkip::RawFull, Phase2Skip::DecompCapped)]
+    // wins over the read half's other (correlated) complaints.
     #[case(PopSkip::DecompCapped, ReadSkip::ReaderBusy, Phase2Skip::DecompCapped)]
+    #[case(PopSkip::DecompCapped, ReadSkip::ReaderEof, Phase2Skip::DecompCapped)]
     // A lost try_lock on either side means this worker's view is unreliable,
     // which matters more than what the other half happened to see.
     #[case(PopSkip::RawLockContended, ReadSkip::RawFull, Phase2Skip::LockContended)]
@@ -1333,32 +1393,92 @@ mod tests {
     }
 
     #[rstest]
+    // Measured: the degenerate coord->coord cell (run f080bff). Half the pool
+    // idle, the awaited block already being produced.
+    #[case::measured_disjoint_runs(0.79, 0.55, 0.00, [0.11, 0.02, 0.73, 0.11, 0.03], StallShape::DecompressLatency)]
+    // Measured: the same records from interleaved runs, on a saturated pool.
+    // The awaited file reads as 79% unclaimed, which is NOT a scheduling defect
+    // -- there was simply no free worker. Utilization is the only input that
+    // separates this from `WorkUnclaimed`, which is why it is an argument.
+    #[case::measured_interleaved_saturated(0.34, 0.98, 0.00, [0.00, 0.00, 0.08, 0.79, 0.13], StallShape::PoolSaturated)]
+    #[case::measured_queryname_saturated(0.25, 0.98, 0.00, [0.00, 0.00, 0.07, 0.78, 0.15], StallShape::PoolSaturated)]
+    // Same awaited shares as the two above but with capacity to spare: now the
+    // unclaimed work really is a scheduling problem.
+    #[case::unclaimed_with_idle_capacity(0.60, 0.40, 0.02, [0.10, 0.40, 0.10, 0.35, 0.05], StallShape::WorkUnclaimed)]
     // The block has not been read from disk at all: nothing the pool does with
     // its buffers or its scheduler can help.
-    #[case::block_not_read_yet(0.60, 0.02, [0.05, 0.05, 0.10, 0.10, 0.70], StallShape::HeadOfLine)]
-    // The block exists -- as raw bytes, or as a gap with nothing being
-    // decompressed -- and no worker has claimed it. Scheduling, not capacity.
-    #[case::work_sitting_unclaimed(0.60, 0.02, [0.10, 0.40, 0.10, 0.35, 0.05], StallShape::WorkUnclaimed)]
-    // A worker is already on it, so the wait is the decompression itself.
-    #[case::already_being_produced(0.60, 0.02, [0.45, 0.05, 0.40, 0.05, 0.05], StallShape::DecompressLatency)]
-    // Contention is checked first: while a quarter of the census is unreadable,
-    // the other shares are estimates of an unobserved population.
-    #[case::contention_masks_the_other_shares(0.60, 0.30, [0.45, 0.05, 0.40, 0.05, 0.05], StallShape::Contended)]
-    // Measured on the storedout arm, where the consumer waits far less; the
-    // gate has to be on exact park time, not the sampled fetch fraction.
-    #[case::consumer_not_waiting(0.01, 0.30, [0.45, 0.05, 0.40, 0.05, 0.05], StallShape::NotStalled)]
-    // Unclaimed and in-progress each fall short of dominance; reporting either
-    // would be a guess.
-    #[case::nothing_dominates(0.60, 0.02, [0.25, 0.25, 0.20, 0.20, 0.10], StallShape::Mixed)]
+    #[case::block_not_read_yet(0.60, 0.40, 0.02, [0.05, 0.05, 0.10, 0.10, 0.70], StallShape::HeadOfLine)]
+    // Contention is checked before utilization: while a quarter of the census is
+    // unreadable, every other share is an estimate of an unobserved population.
+    #[case::contention_masks_the_other_shares(0.60, 0.98, 0.30, [0.45, 0.05, 0.40, 0.05, 0.05], StallShape::Contended)]
+    // Exact park time gates the whole thing, not the sampled fetch fraction.
+    #[case::consumer_not_waiting(0.01, 0.30, 0.30, [0.45, 0.05, 0.40, 0.05, 0.05], StallShape::NotStalled)]
+    #[case::nothing_dominates(0.60, 0.40, 0.02, [0.25, 0.25, 0.20, 0.20, 0.10], StallShape::Mixed)]
     fn test_classify_stall(
         #[case] park_fraction: f64,
+        #[case] utilization: f64,
         #[case] contended_share: f64,
         #[case] awaited: [f64; AwaitedState::COUNT],
         #[case] expected: StallShape,
     ) {
         assert_eq!(
-            classify_stall(park_fraction, contended_share, awaited_shares(awaited)),
+            classify_stall(park_fraction, utilization, contended_share, awaited_shares(awaited)),
             expected
+        );
+    }
+
+    /// The saturation threshold must agree with `classify_merge`'s, or the two
+    /// verdicts in one log can contradict each other.
+    #[test]
+    fn test_saturation_threshold_agrees_with_classify_merge() {
+        use crate::merge_phases::{MergeVerdict, classify_merge};
+        assert_eq!(classify_merge(SATURATED_UTILIZATION, 0.9), MergeVerdict::CpuBound);
+        assert_eq!(
+            classify_stall(
+                0.9,
+                SATURATED_UTILIZATION,
+                0.0,
+                awaited_shares([0.0, 0.0, 0.0, 1.0, 0.0])
+            ),
+            StallShape::PoolSaturated
+        );
+    }
+
+    /// Agreeing on the threshold is only half the contract -- both verdicts have
+    /// to be computed from the *same* utilization figure, which means both
+    /// loggers must divide worker busy time by the same pair.
+    ///
+    /// Dividing by the pool width instead of the Phase 2 active cap is not a
+    /// rounding difference: on a run whose Phase 1 is wider than its Phase 2 it
+    /// moves the number across `SATURATED_UTILIZATION`, so one log reports a
+    /// saturated pool while the other blames scheduling for the same stall.
+    #[test]
+    fn test_pool_width_denominator_contradicts_the_active_cap_verdict() {
+        use crate::merge_phases::{MergePhaseBreakdown, MergeVerdict, classify_merge};
+
+        // A pool 8 threads wide, capped to 3 for Phase 2, whose workers were
+        // busy 26s across a 10s merge -- 2.6x the wall clock, so the three
+        // threads allowed to help were saturated.
+        let breakdown = MergePhaseBreakdown {
+            read: (6.0, 100),
+            decompress: (20.0, 100),
+            output_compress: (0.0, 1),
+            spill_compress: (0.0, 0),
+        };
+        let (merge_wall, active_workers, pool_width) = (10.0, 3, 8);
+        let awaited = awaited_shares([0.0, 0.0, 0.08, 0.79, 0.13]);
+
+        let by_cap = breakdown.worker_utilization(merge_wall, active_workers).unwrap();
+        assert!(by_cap >= SATURATED_UTILIZATION, "26s over 3 x 10s is saturated, got {by_cap}");
+        assert_eq!(classify_merge(by_cap, 0.1), MergeVerdict::CpuBound);
+        assert_eq!(classify_stall(0.9, by_cap, 0.0, awaited), StallShape::PoolSaturated);
+
+        let by_width = breakdown.worker_utilization(merge_wall, pool_width).unwrap();
+        assert!(by_width < SATURATED_UTILIZATION, "the wrong denominator understates it");
+        assert_ne!(
+            classify_stall(0.9, by_width, 0.0, awaited),
+            StallShape::PoolSaturated,
+            "the pool width turns the same saturated merge into a scheduling defect"
         );
     }
 
