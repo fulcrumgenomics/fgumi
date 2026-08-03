@@ -421,6 +421,30 @@ impl WakeLatencyStats {
     }
 }
 
+impl WakeLatencyReport {
+    /// This report minus `baseline`, i.e. what accumulated between them.
+    ///
+    /// The pool exists for the whole sort, so these counters include Phase 1's
+    /// sleeps. Reporting the running total against merge wall clock overstates
+    /// the merge's share -- on a measured run, 1815s of "deep-sleep
+    /// worker-seconds" against a merge that only had 8 x 305s = 2442
+    /// worker-seconds of capacity in the first place. Subtracting a snapshot
+    /// taken at the phase boundary is what makes the figure comparable to the
+    /// numbers printed beside it.
+    #[must_use]
+    pub fn since(self, baseline: Self) -> Self {
+        Self {
+            idle_nanos: std::array::from_fn(|i| {
+                self.idle_nanos[i].saturating_sub(baseline.idle_nanos[i])
+            }),
+            sleeps: std::array::from_fn(|i| self.sleeps[i].saturating_sub(baseline.sleeps[i])),
+            productive_sleeps: std::array::from_fn(|i| {
+                self.productive_sleeps[i].saturating_sub(baseline.productive_sleeps[i])
+            }),
+        }
+    }
+}
+
 /// Read-only view of [`WakeLatencyStats`], for logging.
 #[derive(Debug, Clone, Copy)]
 pub struct WakeLatencyReport {
@@ -549,6 +573,45 @@ pub(crate) enum AwaitedState {
 impl AwaitedState {
     /// Number of variants, for fixed-size counter arrays.
     pub(crate) const COUNT: usize = 5;
+
+    /// Every variant, in declaration order.
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::ReorderGapFilling,
+        Self::ReorderGapStalled,
+        Self::Decompressing,
+        Self::RawQueued,
+        Self::Starved,
+    ];
+
+    /// Short label for log output.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ReorderGapFilling => "gap-filling",
+            Self::ReorderGapStalled => "gap-stalled",
+            Self::Decompressing => "decompressing",
+            Self::RawQueued => "raw-queued",
+            Self::Starved => "starved",
+        }
+    }
+
+    /// Classify from a file's depths, observed at a point where the consumer
+    /// has just failed to pop the serial it wants.
+    ///
+    /// That precondition is what makes a non-empty reorder buffer mean "holds
+    /// the wrong serials" rather than merely "holds something", so this must
+    /// only be called from the park path.
+    #[must_use]
+    pub(crate) fn classify(decomp_len: usize, in_flight: usize, raw_len: usize) -> Self {
+        if decomp_len > 0 {
+            if in_flight > 0 { Self::ReorderGapFilling } else { Self::ReorderGapStalled }
+        } else if in_flight > 0 {
+            Self::Decompressing
+        } else if raw_len > 0 {
+            Self::RawQueued
+        } else {
+            Self::Starved
+        }
+    }
 }
 
 /// The other files' states at the moment the consumer parked.
@@ -1107,6 +1170,37 @@ mod tests {
         }
         stats.record_productive_sleep(10);
         assert!((stats.snapshot().deep_sleep_wake_share() - 0.75).abs() < 1e-9);
+    }
+
+    /// Phase 1's sleeps must not be charged to the merge.
+    #[test]
+    fn test_wake_report_subtracts_a_phase_boundary_baseline() {
+        let stats = WakeLatencyStats::default();
+        for _ in 0..100 {
+            stats.record_sleep(1000, 1_000_000);
+            stats.record_productive_sleep(1000);
+        }
+        let at_merge_start = stats.snapshot();
+        for _ in 0..10 {
+            stats.record_sleep(1000, 1_000_000);
+            stats.record_productive_sleep(1000);
+        }
+        let merge_only = stats.snapshot().since(at_merge_start);
+        assert_eq!(merge_only.sleeps[7], 10, "only the merge's sleeps may be counted");
+        assert!((merge_only.estimated_discovery_lag_secs() - 0.005).abs() < 1e-9);
+        // The running total is still 110; `since` must not mutate the source.
+        assert_eq!(stats.snapshot().sleeps[7], 110);
+    }
+
+    /// A counter that somehow went backwards must clamp rather than wrap into a
+    /// nonsensical multi-century total.
+    #[test]
+    fn test_wake_report_since_saturates() {
+        let stats = WakeLatencyStats::default();
+        stats.record_sleep(1000, 1_000_000);
+        let later = stats.snapshot();
+        let empty = WakeLatencyStats::default().snapshot();
+        assert_eq!(empty.since(later).sleeps[7], 0);
     }
 
     #[test]
