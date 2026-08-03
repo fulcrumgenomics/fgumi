@@ -147,9 +147,49 @@ impl MergePhaseBreakdown {
     }
 }
 
+/// What limited the merge, inferred from worker utilization and consumer wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeVerdict {
+    /// The worker pool was saturated; worker CPU is the wall.
+    CpuBound,
+    /// Workers idled *and* the consumer waited -- neither side is the
+    /// bottleneck, which points at storage.
+    IoBound,
+    /// Neither condition clearly holds.
+    Mixed,
+}
+
+/// Worker utilization at or above which the pool counts as saturated.
+const SATURATED_UTILIZATION: f64 = 0.85;
+/// Worker utilization below which the pool counts as idle.
+const IDLE_UTILIZATION: f64 = 0.60;
+/// Consumer wait fraction above which the consumer counts as starved.
+const STARVED_FETCH_FRACTION: f64 = 0.50;
+
+/// Classify what limited the merge.
+///
+/// The discriminating case is *both* sides being unfavourable: an idle pool
+/// alone could just mean a cheap merge, and a waiting consumer alone could mean
+/// slow workers. Together they mean neither side is the constraint, which
+/// leaves storage.
+///
+/// Thresholds are calibrated from a handful of measured runs, not a model, so
+/// callers should present the result as a hint and show the numbers behind it.
+#[must_use]
+pub fn classify_merge(utilization: f64, fetch_fraction: f64) -> MergeVerdict {
+    if utilization >= SATURATED_UTILIZATION {
+        MergeVerdict::CpuBound
+    } else if utilization < IDLE_UTILIZATION && fetch_fraction > STARVED_FETCH_FRACTION {
+        MergeVerdict::IoBound
+    } else {
+        MergeVerdict::Mixed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
@@ -211,5 +251,36 @@ mod tests {
     #[test]
     fn test_empty_breakdown_is_reported_as_empty() {
         assert!(MergePhaseCounters::default().snapshot().is_empty());
+    }
+
+    /// The thresholds are pinned against the runs that calibrated them, so a
+    /// future tweak has to confront the evidence rather than just move a number.
+    #[rstest]
+    // Measured on a 780M-record WGS merge (EBS): workers half idle AND the
+    // consumer waiting three quarters of its loop. Both "optimized" arms of that
+    // experiment got slower, confirming storage was the constraint.
+    #[case::measured_ebs_merge(0.52, 0.74, MergeVerdict::IoBound)]
+    // Same code on a laptop with local NVMe: the pool saturates instead.
+    #[case::measured_local_nvme(0.93, 0.03, MergeVerdict::CpuBound)]
+    // Idle pool but a consumer that is NOT waiting: the merge is simply cheap,
+    // which must not be reported as an I/O problem.
+    #[case::idle_pool_busy_consumer(0.20, 0.05, MergeVerdict::Mixed)]
+    // Waiting consumer but a busy pool: workers are the constraint, not storage.
+    #[case::busy_pool_waiting_consumer(0.80, 0.90, MergeVerdict::Mixed)]
+    #[case::at_saturation_boundary(0.85, 0.99, MergeVerdict::CpuBound)]
+    #[case::just_below_saturation(0.84, 0.10, MergeVerdict::Mixed)]
+    fn test_classify_merge(
+        #[case] utilization: f64,
+        #[case] fetch_fraction: f64,
+        #[case] expected: MergeVerdict,
+    ) {
+        assert_eq!(classify_merge(utilization, fetch_fraction), expected);
+    }
+
+    /// A saturated pool is CPU-bound regardless of consumer wait, since the
+    /// saturation test is checked first.
+    #[test]
+    fn test_saturation_takes_precedence_over_consumer_wait() {
+        assert_eq!(classify_merge(0.95, 0.95), MergeVerdict::CpuBound);
     }
 }

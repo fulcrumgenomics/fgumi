@@ -125,7 +125,7 @@ pub(crate) fn read_length_prefix<R: std::io::Read + ?Sized>(
 const ZSTD_FRAME_DECOMP_CAP: usize = 256 * 1024;
 
 /// Hard cap on the `u32 LE` length prefix of any zstd spill frame. Frames are
-/// produced one per ~64 KiB of input by `handle_compress_job`; even
+/// produced one per ~64 KiB of input by `compress_job`; even
 /// pathological expansion can't reach this. Beyond it, we treat the value as
 /// corruption rather than allocate gigabytes.
 pub(crate) const MAX_ZSTD_FRAME_BYTES: usize = 2 * 1024 * 1024;
@@ -1895,9 +1895,11 @@ impl SortWorkerPool {
             CompressTarget::Spill => &shared.merge_phases.spill_compress,
             CompressTarget::Output => &shared.merge_phases.output_compress,
         };
-        counter.time(|| {
-            Self::handle_compress_job(shared, job, bgzf_compressor, zstd_compressor);
-        });
+        // Only the compression is timed; the handoff below can block on a full
+        // result channel, which is writer backpressure rather than CPU work.
+        let compressed =
+            counter.time(|| Self::compress_job(&job, bgzf_compressor, zstd_compressor));
+        Self::deliver_compress_result(shared, job, compressed);
         StepResult::Success
     }
 
@@ -1954,6 +1956,19 @@ impl SortWorkerPool {
     /// Number of worker threads in the pool.
     pub fn num_workers(&self) -> usize {
         self.num_workers
+    }
+
+    /// Number of workers currently eligible to run work, as last set by
+    /// [`Self::set_active_workers`].
+    ///
+    /// Not the same as [`Self::num_workers`]: the pool is sized to the wider of
+    /// the two phases and then capped per phase, so on a run whose Phase 1 is
+    /// wider than its Phase 2 the pool holds threads that cannot take Phase 2
+    /// work. Anything dividing by a thread count — utilization above all —
+    /// wants this number, or it charges the merge for workers that were never
+    /// allowed to help and reports a saturated pool as idle.
+    pub fn active_workers(&self) -> usize {
+        self.shared.active_worker_limit.load(Ordering::Acquire)
     }
 
     /// Busy-time breakdown of worker-side merge work.
@@ -2223,14 +2238,22 @@ impl SortWorkerPool {
         d.as_nanos() as u64
     }
 
-    /// Handle a compress job on a worker thread.
-    fn handle_compress_job(
-        shared: &SharedPipelineState,
-        job: CompressJob,
+    /// Compress one job's payload on a worker thread.
+    ///
+    /// Split from [`Self::deliver_compress_result`] so the merge-phase counters
+    /// can time compression alone. Delivery spins in a `try_send` retry loop
+    /// whenever the writer is behind, and timing the two together charges that
+    /// backpressure to `spill_compress` / `output_compress` — inflating worker
+    /// busy time, and with it the utilization the merge verdict reads, so an
+    /// I/O-bound merge reports as CPU-bound. That distinction is the entire
+    /// point of the breakdown, so the wait is measured nowhere rather than in
+    /// the wrong place.
+    fn compress_job(
+        job: &CompressJob,
         bgzf_compressor: &mut InlineBgzfCompressor,
         zstd_compressor: &mut ZstdCompressor<'static>,
-    ) {
-        let compressed: Vec<u8> = match job.codec {
+    ) -> Vec<u8> {
+        match job.codec {
             SpillCodec::Bgzf => {
                 bgzf_compressor
                     .write_all(&job.data)
@@ -2269,8 +2292,18 @@ impl SortWorkerPool {
                 out.extend_from_slice(&frame);
                 out
             }
-        };
+        }
+    }
 
+    /// Hand a finished compress job to the I/O writer, recycling its input
+    /// buffer.
+    ///
+    /// Deliberately untimed — see [`Self::compress_job`].
+    fn deliver_compress_result(
+        shared: &SharedPipelineState,
+        job: CompressJob,
+        compressed: Vec<u8>,
+    ) {
         let mut recycled = job.data;
         recycled.clear();
 
@@ -2618,7 +2651,7 @@ mod tests {
         pool.shutdown();
     }
 
-    /// zstd is spill-only, and `handle_compress_job` asserts that unconditionally.
+    /// zstd is spill-only, and `compress_job` asserts that unconditionally.
     ///
     /// The assert is the backstop for the one target/codec combination the
     /// per-job `CompressTarget` cannot express correctly: there is a single zstd
@@ -2628,7 +2661,7 @@ mod tests {
     /// test, a future output-zstd feature (or a mis-stamped call site) would only
     /// trip it in production.
     ///
-    /// `handle_compress_job` is called directly, on the test thread, rather than
+    /// `compress_job` is called directly, on the test thread, rather than
     /// through `submit_compress`: a panic on a pool worker unwinds only that
     /// worker — its guard publishes `worker_panicked` and the unwind stops at the
     /// thread boundary — so `#[should_panic]` would never observe it, and the
@@ -2637,14 +2670,12 @@ mod tests {
     #[test]
     #[should_panic(expected = "zstd is spill-only")]
     fn test_zstd_output_job_trips_the_spill_only_assert() {
-        let shared = SharedPipelineState::new(1, std::thread::current());
         let mut bgzf_compressor = InlineBgzfCompressor::new(0);
         let mut zstd_compressor = ZstdCompressor::new(1).expect("zstd compressor init");
         let (result_tx, _result_rx) = bounded(1);
 
-        SortWorkerPool::handle_compress_job(
-            &shared,
-            CompressJob {
+        SortWorkerPool::compress_job(
+            &CompressJob {
                 data: vec![b'A'; 64],
                 serial: 0,
                 result_tx,
@@ -2723,13 +2754,30 @@ mod tests {
     #[test]
     fn set_active_workers_clamps() {
         let pool = SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf);
+        // A fresh pool is fully active, so anything dividing by the active count
+        // before a cap is applied still gets the pool width.
+        assert_eq!(pool.active_workers(), 4, "a pool starts with every worker active");
         // Clamp to [1, num_workers].
         pool.set_active_workers(0);
-        assert_eq!(pool.shared.active_worker_limit.load(Ordering::Acquire), 1);
+        assert_eq!(pool.active_workers(), 1);
         pool.set_active_workers(100);
-        assert_eq!(pool.shared.active_worker_limit.load(Ordering::Acquire), 4);
+        assert_eq!(pool.active_workers(), 4);
         pool.set_active_workers(2);
-        assert_eq!(pool.shared.active_worker_limit.load(Ordering::Acquire), 2);
+        assert_eq!(pool.active_workers(), 2);
+        pool.shutdown();
+    }
+
+    /// The merge breakdown divides worker busy time by the *active* count, so a
+    /// pool sized to a wide Phase 1 and capped to a narrower Phase 2 must report
+    /// the narrower number — reporting the pool width there would understate
+    /// utilization and flip the merge verdict from CPU-bound to I/O-bound.
+    #[test]
+    fn active_workers_reports_the_phase2_cap_not_the_pool_width() {
+        let pool = SortWorkerPool::new(8, 1, 6, crate::codec::SpillCodec::Bgzf);
+        pool.set_active_workers(8);
+        pool.begin_phase2(3);
+        assert_eq!(pool.num_workers(), 8, "the pool is still eight threads wide");
+        assert_eq!(pool.active_workers(), 3, "but only three may take Phase 2 work");
         pool.shutdown();
     }
 

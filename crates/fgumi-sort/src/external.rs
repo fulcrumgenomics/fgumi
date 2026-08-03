@@ -3558,12 +3558,44 @@ impl RawExternalSorter {
         Ok((sources, guard))
     }
 
-    /// Generic merge for keyed chunks using `O(1)` key comparisons.
+    /// Say, in one line, what limited the merge.
     ///
-    /// This is the unified merge function that works with any `RawSortKey` type.
-    /// It provides `O(1)` comparisons during merge for fixed-size keys (coordinate, template)
-    /// and `O(name_len)` for variable-size keys (queryname).
-    #[allow(clippy::too_many_lines)]
+    /// Two numbers decide it. `utilization` is the worker pool's share of its
+    /// own capacity; `fetch_fraction` is how much of the consumer's loop went
+    /// into fetching the next record, which is where it blocks waiting for a
+    /// decompressed block. The interesting case is *both* being unfavourable:
+    /// if the pool is idle **and** the consumer is waiting, then neither side is
+    /// the bottleneck and the merge is waiting on storage.
+    ///
+    /// Deliberately hedged ("suggests", "likely"). These thresholds come from a
+    /// handful of measured runs, not a model, and the cost of a confident wrong
+    /// diagnosis -- someone raising `--threads` on an I/O-bound sort -- is worse
+    /// than the cost of a vague right one. The numbers above the verdict are the
+    /// evidence; this line only points at them.
+    fn log_merge_verdict(utilization: Option<f64>, fetch_fraction: f64) {
+        use crate::merge_phases::{MergeVerdict, classify_merge};
+
+        let Some(utilization) = utilization else { return };
+        let (util_pct, fetch_pct) = (100.0 * utilization, 100.0 * fetch_fraction);
+
+        match classify_merge(utilization, fetch_fraction) {
+            MergeVerdict::CpuBound => info!(
+                "  Verdict: worker pool saturated ({util_pct:.0}%); the merge is CPU-bound, so \
+                 more threads may help"
+            ),
+            MergeVerdict::IoBound => info!(
+                "  Verdict: workers idle ({util_pct:.0}% of capacity) while the consumer spent \
+                 {fetch_pct:.0}% of its loop waiting for data -- this suggests the merge is \
+                 I/O-bound. More threads are unlikely to help; faster storage, or spilling \
+                 fewer bytes, would."
+            ),
+            MergeVerdict::Mixed => info!(
+                "  Verdict: worker pool {util_pct:.0}% utilized, consumer {fetch_pct:.0}% \
+                 waiting on data -- neither clearly saturated"
+            ),
+        }
+    }
+
     /// Log the merge's component breakdown: main-thread work and worker work.
     ///
     /// The two halves are measured differently and must be read differently.
@@ -3573,11 +3605,21 @@ impl RawExternalSorter {
     /// the consumer, and routinely exceed `loop wall` -- see
     /// [`crate::merge_phases`]. Comparing a worker figure to `loop wall` is
     /// meaningless; comparing worker figures to each other is the point.
+    ///
+    /// The two wall clocks are therefore separate arguments, and each denominator
+    /// takes the one it belongs to. `loop_total` covers the consumer loop alone,
+    /// which is what the sampled consumer rows partition. `merge_total` runs
+    /// through output finalization, which is where the queued tail of
+    /// `output_compress` is actually done, so it is what worker utilization
+    /// divides by; using `loop_total` there would charge worker busy time to a
+    /// window that ended before some of it happened.
     #[allow(clippy::cast_precision_loss)]
     fn log_merge_sub_phases(
         loop_total: f64,
+        merge_total: f64,
         consumer: (f64, f64, f64),
         sampling: (u64, u64),
+        active_workers: usize,
         pool: &Arc<SortWorkerPool>,
     ) {
         let (write_secs, read_secs, tree_secs) = consumer;
@@ -3600,6 +3642,7 @@ impl RawExternalSorter {
             "    Enqueue write:     {est_write:.1}s  (hands off to workers; excludes compression)"
         );
         info!("    Loop wall clock:   {loop_total:.1}s");
+        info!("    Merge wall clock:  {merge_total:.1}s (loop plus output finalization)");
         // These three estimates partition one thread's time, so they cannot
         // legitimately exceed it. Saying so in the log beats leaving a reader to
         // notice the arithmetic -- a biased sample is the failure mode here, and
@@ -3620,8 +3663,10 @@ impl RawExternalSorter {
             let (dec_s, dec_n) = workers.decompress;
             let (comp_s, comp_n) = workers.output_compress;
             let (spill_s, spill_n) = workers.spill_compress;
-            let workers_n = pool.num_workers();
-            info!("  Workers ({workers_n} threads; busy time, overlaps the above and itself)");
+            let workers_n = active_workers;
+            info!(
+                "  Workers ({workers_n} active threads; busy time, overlaps the above and itself)"
+            );
             info!("    Spill disk read:   {read_s:.1}s ({:.0}%) [{read_n} batches]", pct(read_s));
             info!("    Spill decompress:  {dec_s:.1}s ({:.0}%) [{dec_n} blocks]", pct(dec_s));
             info!("    Output compress:   {comp_s:.1}s ({:.0}%) [{comp_n} blocks]", pct(comp_s));
@@ -3629,9 +3674,10 @@ impl RawExternalSorter {
             // Utilization is the thread-efficiency question: well below 100%
             // means the pool idled, the merge was bound by something other than
             // worker CPU, and adding compression threads cannot help.
-            if let Some(util) = workers.worker_utilization(loop_total, workers_n) {
+            if let Some(util) = workers.worker_utilization(merge_total, workers_n) {
                 info!(
-                    "    Worker utilization: {:.0}% of {workers_n} threads x {loop_total:.1}s",
+                    "    Worker utilization: {:.0}% of {workers_n} active threads x \
+                     {merge_total:.1}s",
                     100.0 * util
                 );
             }
@@ -3639,10 +3685,24 @@ impl RawExternalSorter {
             // reported for context but excluded from the merge totals above.
             info!("  Phase 1 (not part of the merge)");
             info!("    Spill compress:    {spill_s:.1}s [{spill_n} blocks]");
+
+            // Utilization over the full merge window; the fetch fraction stays
+            // relative to the consumer loop, which is the only thing it is a
+            // fraction of.
+            Self::log_merge_verdict(
+                workers.worker_utilization(merge_total, workers_n),
+                if loop_total > 0.0 { est_read / loop_total } else { 0.0 },
+            );
         }
         info!("==============================");
     }
 
+    /// Generic merge for keyed chunks using `O(1)` key comparisons.
+    ///
+    /// This is the unified merge function that works with any `RawSortKey` type.
+    /// It provides `O(1)` comparisons during merge for fixed-size keys (coordinate, template)
+    /// and `O(name_len)` for variable-size keys (queryname).
+    #[allow(clippy::too_many_lines)]
     fn merge_chunks_generic<K: RawSortKey + Default + 'static>(
         &self,
         chunk_files: &[PathBuf],
@@ -3771,14 +3831,31 @@ impl RawExternalSorter {
             }
         }
 
+        let loop_total = loop_start.elapsed().as_secs_f64();
+        // The active limit, not the pool width: Phase 2 caps the pool to
+        // `phase2_threads`, so on a run with a wider Phase 1 the extra threads
+        // cannot take merge work and must not sit in the utilization
+        // denominator -- a saturated pool would read as idle, and the verdict
+        // would call a CPU-bound merge I/O-bound. Read while Phase 2 is still
+        // active, so the number cannot depend on what teardown does to the cap.
+        let active_workers = pool.active_workers();
+
+        // Finalize before logging. `finish` drains the output queue, and every
+        // block still in it is compressed by the same workers this breakdown
+        // reports -- so a snapshot taken first omits the tail of
+        // `output_compress` and divides the rest by a wall clock that stops
+        // before the drain.
+        guard.finish_output(|| writer.finish())?;
+
         Self::log_merge_sub_phases(
+            loop_total,
             loop_start.elapsed().as_secs_f64(),
             (merge_write_secs, merge_read_secs, merge_tree_secs),
             (samples_taken, records_merged),
+            active_workers,
             pool,
         );
 
-        guard.finish_output(|| writer.finish())?;
         merge_progress.log_final();
         log_snapshot("phase2.end", 0);
 
