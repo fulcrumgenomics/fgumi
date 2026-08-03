@@ -574,8 +574,17 @@ pub(crate) const PHASE2_READ_BATCH: usize = 4;
 /// [`SortWorkerPool::try_phase2_file_work`].
 ///
 /// Applies to one file at a time, so the extra read-ahead memory is this many
-/// compressed blocks — a few MB — not K times that.
-pub(crate) const PHASE2_STARVING_RAW_CAP: usize = 64;
+/// compressed blocks — at ~9 KB compressed that is ~4.7 MB for the one hot
+/// file, not K times that.
+///
+/// The value is empirical. Measured on a 780M-record coordinate re-sort, merge
+/// loop: 308s at the uniform cap of 8, 288s at 64, 280s at 512. It was chosen
+/// as "deep enough to cover a 2 MB buffer refill", and that reasoning turned out
+/// to be wrong — read duty cycle moved only 47.6% -> 48.8% across the 8x from 64
+/// to 512, so covering refills is demonstrably not the mechanism. The gain is
+/// real and reproducible; what produces it is not established. Do not tune this
+/// further on the strength of that story.
+pub(crate) const PHASE2_STARVING_RAW_CAP: usize = 512;
 
 /// Blocks to read per call for that same file. Large enough that one read is a
 /// sequential run rather than a 256 KB pinprick, since only one worker may hold
@@ -593,6 +602,47 @@ pub(crate) const PHASE2_STARVING_READ_BATCH: usize = 32;
 ///
 /// Pure so the bound is testable without a pool, following
 /// [`classify_scan`](crate::merge_stalls::classify_scan).
+/// The file index a Phase 2 scan starts at.
+///
+/// The frontier -- the lowest source that has not delivered everything -- when
+/// it is starving, and the worker's own round-robin cursor otherwise. Gated on
+/// starving rather than applied always: a frontier that is merely *active* is
+/// the common case in an interleaved merge, and sending every worker to file 0
+/// there would undo the spread that makes that case fast.
+///
+/// `frontier` is only meaningful while it indexes a live file; past the end it
+/// names no source and the cursor stands.
+///
+/// Pure so both branches of the gate are testable without racing a live pool,
+/// following [`classify_scan`](crate::merge_stalls::classify_scan).
+fn phase2_scan_start(
+    frontier: usize,
+    num_files: usize,
+    frontier_starving: bool,
+    cursor: usize,
+) -> usize {
+    if frontier < num_files && frontier_starving { frontier } else { cursor }
+}
+
+/// The `(raw_cap, read_batch)` a file may read at.
+///
+/// The drain frontier gets the deep allowance so one read becomes a sequential
+/// run rather than a pinprick; every other file keeps the shallow one. Scoped to
+/// the frontier rather than to any starving file because at merge start *every*
+/// file is empty, and letting all K deepen at once would multiply read-ahead
+/// memory by K.
+fn phase2_read_allowance(is_frontier: bool) -> (usize, usize) {
+    // The deep allowance must actually be deeper, or scoping it to the frontier
+    // buys nothing and the two branches are the same read.
+    const _: () = assert!(PHASE2_STARVING_RAW_CAP > PHASE2_RAW_CAP);
+    const _: () = assert!(PHASE2_STARVING_READ_BATCH > PHASE2_READ_BATCH);
+    if is_frontier {
+        (PHASE2_STARVING_RAW_CAP, PHASE2_STARVING_READ_BATCH)
+    } else {
+        (PHASE2_RAW_CAP, PHASE2_READ_BATCH)
+    }
+}
+
 fn admitted_read_batch(raw_len: usize, raw_cap: usize, read_batch: usize) -> Option<usize> {
     match raw_cap.saturating_sub(raw_len) {
         0 => None,
@@ -2145,8 +2195,8 @@ impl SortWorkerPool {
         // merge, and sending every worker to file 0 there would undo the spread
         // that makes that case fast.
         let frontier = shared.phase2_lowest_active.load(Ordering::Relaxed);
-        let frontier_starving = frontier < n && files[frontier].is_starving();
-        let start = if frontier_starving { frontier } else { worker.phase2_file_cursor };
+        let frontier_starving = files.get(frontier).is_some_and(Phase2FileState::is_starving);
+        let start = phase2_scan_start(frontier, n, frontier_starving, worker.phase2_file_cursor);
 
         for offset in 0..n {
             let i = (start + offset) % n;
@@ -2205,11 +2255,7 @@ impl SortWorkerPool {
             //
             // Still scoped to one file: at merge start every file is empty, and
             // letting all K deepen at once would multiply read-ahead memory by K.
-            let (raw_cap, read_batch) = if i == frontier {
-                (PHASE2_STARVING_RAW_CAP, PHASE2_STARVING_READ_BATCH)
-            } else {
-                (PHASE2_RAW_CAP, PHASE2_READ_BATCH)
-            };
+            let (raw_cap, read_batch) = phase2_read_allowance(i == frontier);
 
             // Bound disk read-ahead per file: don't keep pulling if the raw
             // FIFO is already full. Use try_lock so a momentarily contended
@@ -3515,6 +3561,75 @@ mod tests {
         assert_eq!(pool.num_workers(), 8, "the pool is still eight threads wide");
         assert_eq!(pool.active_workers(), 3, "but only three may take Phase 2 work");
         pool.shutdown();
+    }
+
+    /// The scan-start gate: a starving frontier is served before the worker's
+    /// own cursor.
+    ///
+    /// This is the whole point of the frontier scheduling. When the merge is
+    /// draining one source at a time, round-robin spends most of a scan on
+    /// files that have nothing to give while the one file the consumer is
+    /// blocked on waits to be reached. Both branches matter: the gate must fire
+    /// when the frontier is starving *and* stay out of the way when it is not,
+    /// or an interleaved merge loses the spread that makes it fast.
+    #[rstest]
+    // Starving frontier wins over the cursor, wherever the cursor happens to be.
+    #[case::starving_frontier_is_served_first(0, 8, true, 5, 0)]
+    #[case::starving_frontier_mid_pool(3, 8, true, 7, 3)]
+    // An active frontier leaves the round-robin spread alone.
+    #[case::active_frontier_defers_to_the_cursor(0, 8, false, 5, 5)]
+    #[case::active_frontier_mid_pool(3, 8, false, 0, 0)]
+    // A frontier past the end names no live source, so it cannot be started at
+    // -- this is the guard that kept the old `frontier < n` from indexing out
+    // of bounds.
+    #[case::frontier_past_the_end_defers(8, 8, true, 2, 2)]
+    #[case::frontier_far_past_the_end_defers(99, 8, true, 2, 2)]
+    // A merge with no sources has nowhere to start but the cursor.
+    #[case::no_files_defers(0, 0, true, 0, 0)]
+    fn phase2_scan_starts_at_a_starving_frontier(
+        #[case] frontier: usize,
+        #[case] num_files: usize,
+        #[case] frontier_starving: bool,
+        #[case] cursor: usize,
+        #[case] expected: usize,
+    ) {
+        assert_eq!(phase2_scan_start(frontier, num_files, frontier_starving, cursor), expected);
+    }
+
+    /// Only the drain frontier gets the deep allowance.
+    ///
+    /// At merge start every file is empty and would qualify on starvation
+    /// alone, so scoping to the frontier is what keeps read-ahead memory from
+    /// being multiplied by K.
+    #[rstest]
+    #[case::frontier_reads_deep(true, PHASE2_STARVING_RAW_CAP, PHASE2_STARVING_READ_BATCH)]
+    #[case::every_other_file_reads_shallow(false, PHASE2_RAW_CAP, PHASE2_READ_BATCH)]
+    fn phase2_read_allowance_is_scoped_to_the_frontier(
+        #[case] is_frontier: bool,
+        #[case] expected_cap: usize,
+        #[case] expected_batch: usize,
+    ) {
+        assert_eq!(phase2_read_allowance(is_frontier), (expected_cap, expected_batch));
+    }
+
+    /// `is_starving` is what arms the scan-start gate, and it means "this file
+    /// can give the consumer nothing right now" -- neither buffered nor being
+    /// produced. A file with a decompression in flight is about to deliver, so
+    /// steering the pool at it would be wasted work.
+    #[rstest]
+    #[case::nothing_buffered_or_in_flight(0, 0, true)]
+    #[case::blocks_buffered(2, 0, false)]
+    #[case::decompression_in_flight(0, 1, false)]
+    #[case::both(2, 1, false)]
+    fn a_file_is_starving_only_with_nothing_buffered_and_nothing_coming(
+        #[case] decomp_len: usize,
+        #[case] in_flight: usize,
+        #[case] expected: bool,
+    ) {
+        let file = empty_phase2_file();
+        file.decomp_len.store(decomp_len, Ordering::Relaxed);
+        file.decomp_in_flight.store(in_flight, Ordering::Relaxed);
+        assert_eq!(file.is_starving(), expected);
     }
 
     /// A read may never carry the raw FIFO past its cap.
