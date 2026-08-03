@@ -777,6 +777,19 @@ impl Sort {
         let (total_records, output_records, chunks_written) =
             (stats.total_records, stats.output_records, stats.chunks_written);
 
+        // A sort is a permutation: every record read must be written. Both counts
+        // were already tracked and merely logged, so a bug that dropped records
+        // anywhere -- run formation, the merge, consolidation -- produced a
+        // silently short BAM and exited 0. Comparing them turns that whole class
+        // of corruption into a hard failure for the price of one branch.
+        anyhow::ensure!(
+            total_records == output_records,
+            "sort lost records: read {total_records} but wrote {output_records} \
+             ({} missing). The output at {} is incomplete and must not be used.",
+            total_records.saturating_sub(output_records),
+            output.display()
+        );
+
         // Summary
         info!("=== Summary ===");
         info!("Records processed: {total_records}");
