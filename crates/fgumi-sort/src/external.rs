@@ -1284,6 +1284,9 @@ pub(crate) struct MainThreadChunkConsumer<K: RawSortKey + 'static> {
     chunk_read_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Set by `do_shutdown` when a worker thread panicked unexpectedly.
     worker_panicked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Where and for how long the merge loop blocked. Only this thread touches
+    /// it -- see [`crate::merge_stalls::ConsumerStallTracker`].
+    stalls: crate::merge_stalls::ConsumerStallTracker,
     _phantom: std::marker::PhantomData<K>,
 }
 
@@ -1297,14 +1300,61 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
         worker_panicked: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         let parser_state = (0..files.len()).map(|_| SourceParserState::new()).collect();
+        let stalls = crate::merge_stalls::ConsumerStallTracker::new(files.len());
         Self {
             files,
             parser_state,
             decompression_error,
             chunk_read_error,
             worker_panicked,
+            stalls,
             _phantom: std::marker::PhantomData,
         }
+    }
+
+    /// Where and for how long the merge loop blocked waiting for blocks.
+    pub(crate) fn stall_report(&self) -> crate::merge_stalls::ConsumerStallReport {
+        self.stalls.snapshot()
+    }
+
+    /// Observe every file's buffering state, for attributing one park.
+    ///
+    /// `try_lock` throughout: this runs while the merge is stalled and must not
+    /// add to the stall it is measuring, nor perturb the very contention it is
+    /// trying to detect. A file whose locks are both held is reported as
+    /// `contended` rather than guessed at. The two locks are taken and released
+    /// one at a time, so this introduces no lock ordering of its own.
+    fn census(&self, waited_on: usize) -> crate::merge_stalls::ParkCensus {
+        use crate::worker_pool::PHASE2_DECOMP_CAP;
+
+        let mut census = crate::merge_stalls::ParkCensus::default();
+        for (idx, file) in self.files.iter().enumerate() {
+            let Ok(raw_len) = file.raw_blocks.try_lock().map(|g| g.len()) else {
+                census.contended += 1;
+                continue;
+            };
+            let Ok(decomp_len) = file.decompressed.try_lock().map(|g| g.len()) else {
+                census.contended += 1;
+                continue;
+            };
+            let in_flight = file.decomp_in_flight.load(std::sync::atomic::Ordering::Relaxed);
+            let at_eof = file.reader_eof.load(std::sync::atomic::Ordering::Relaxed);
+            let empty = raw_len == 0 && decomp_len == 0 && in_flight == 0;
+
+            if decomp_len >= PHASE2_DECOMP_CAP {
+                census.capped += 1;
+            } else if empty && at_eof {
+                census.drained += 1;
+            } else if empty {
+                census.starved += 1;
+                if idx == waited_on {
+                    census.waited_on_starved = true;
+                }
+            } else {
+                census.working += 1;
+            }
+        }
+        census
     }
 
     /// Get the next record from a specific source.
@@ -1353,12 +1403,18 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
     /// `Ok(false)` if the source has produced all its data, or an error if a
     /// worker reported a fatal failure.
     fn advance_to_next_block(&mut self, source_id: usize) -> Result<bool> {
-        let file = &self.files[source_id];
+        self.stalls.note_block_pull();
+        let mut parked_yet = false;
+        // The file is re-borrowed per iteration rather than held: the stall
+        // tracker below needs `&mut self`, and a long-lived `&self.files[..]`
+        // would keep `self` immutably borrowed across the whole loop.
         loop {
             // Try to pop the next-in-order decompressed block.
             {
-                let mut guard =
-                    file.decompressed.lock().expect("phase2 decompressed mutex poisoned");
+                let mut guard = self.files[source_id]
+                    .decompressed
+                    .lock()
+                    .expect("phase2 decompressed mutex poisoned");
                 if let Some(data) = guard.try_pop_next() {
                     drop(guard);
                     let st = &mut self.parser_state[source_id];
@@ -1386,7 +1442,7 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
             }
 
             // Source produced everything it ever will?
-            if file.is_drained() {
+            if self.files[source_id].is_drained() {
                 return Ok(false);
             }
 
@@ -1394,7 +1450,26 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
             // decompressed block, after setting reader.eof, and after error
             // flags. The loop re-checks all conditions on wake-up so spurious
             // wake-ups are harmless.
+            //
+            // This is where the merge loop actually blocks, and it is timed
+            // exactly rather than sampled: parks happen once per ~64 KB block
+            // instead of once per ~100-byte record, so an `Instant` pair here is
+            // three orders of magnitude cheaper than one per record -- and it
+            // separates *waiting* from the record copy that the sampled "fetch
+            // next record" figure folds in with it.
+            if self.stalls.should_census() {
+                let census = self.census(source_id);
+                self.stalls.record_census(census);
+            }
+            let park_start = Instant::now();
             std::thread::park();
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "a single park cannot approach 2^64 nanoseconds"
+            )]
+            let parked_ns = park_start.elapsed().as_nanos() as u64;
+            self.stalls.record_park(source_id, parked_ns, !parked_yet);
+            parked_yet = true;
         }
     }
 
@@ -3652,9 +3727,11 @@ impl RawExternalSorter {
             ),
             MergeVerdict::IoBound => info!(
                 "  Verdict: workers idle ({util_pct:.0}% of capacity) while the consumer spent \
-                 {fetch_pct:.0}% of its loop waiting for data -- this suggests the merge is \
-                 I/O-bound. More threads are unlikely to help; faster storage, or spilling \
-                 fewer bytes, would."
+                 {fetch_pct:.0}% of its loop waiting for data -- neither side is the constraint. \
+                 More threads are unlikely to help. Storage is one candidate; the pipeline's own \
+                 coordination -- per-file read-ahead depth, lock contention, how late idle \
+                 workers notice new work -- is another, and the Merge Stalls block below is what \
+                 separates them."
             ),
             MergeVerdict::Mixed => info!(
                 "  Verdict: worker pool {util_pct:.0}% utilized, consumer {fetch_pct:.0}% \
@@ -3688,6 +3765,7 @@ impl RawExternalSorter {
         sampling: (u64, u64),
         active_workers: usize,
         pool: &Arc<SortWorkerPool>,
+        stalls: Option<crate::merge_stalls::ConsumerStallReport>,
     ) {
         let (write_secs, read_secs, tree_secs) = consumer;
         let (samples_taken, records_merged) = sampling;
@@ -3719,6 +3797,21 @@ impl RawExternalSorter {
             info!(
                 "    NOTE: rows sum to {consumer_est:.1}s > loop wall {loop_total:.1}s, so the \
                  sample is biased; treat consumer rows as indicative only"
+            );
+        }
+        // Parking is a subset of "fetch next record", so exact park time cannot
+        // legitimately exceed the sampled estimate of it. When it does, the
+        // sample missed stalls: parks are rare per record and expensive when
+        // they happen, and a 1-in-1021 record sample of a heavy-tailed event has
+        // enough variance to land far off in either direction. The exact figure
+        // in the stall block below supersedes this row whenever they disagree.
+        if let Some(s) = stalls
+            && s.park_secs > est_read * 1.05
+        {
+            info!(
+                "    NOTE: exact park time is {:.1}s, above the sampled fetch estimate of \
+                 {est_read:.1}s -- the sample under-caught stalls; prefer the Merge Stalls block",
+                s.park_secs
             );
         }
 
@@ -3761,7 +3854,135 @@ impl RawExternalSorter {
                 if loop_total > 0.0 { est_read / loop_total } else { 0.0 },
             );
         }
+        Self::log_merge_stalls(loop_total, stalls, pool);
         info!("==============================");
+    }
+
+    /// Log why the merge stalled, as opposed to where its time went.
+    ///
+    /// The three blocks answer one question each, and only together: the
+    /// consumer's exact park time and the state of the other files when it
+    /// parked; why worker file-scans came back empty; and how much of the
+    /// workers' idle time was spent asleep *through* work becoming available.
+    /// See [`crate::merge_stalls`].
+    #[allow(clippy::cast_precision_loss)]
+    fn log_merge_stalls(
+        loop_total: f64,
+        stalls: Option<crate::merge_stalls::ConsumerStallReport>,
+        pool: &Arc<SortWorkerPool>,
+    ) {
+        use crate::merge_stalls::{Phase2Skip, ScanVerdict};
+
+        let scans = pool.phase2_scan_report();
+        let wake = pool.wake_latency_report();
+        let stalls = stalls.filter(|s| !s.is_empty());
+        if stalls.is_none() && scans.is_empty() && wake.is_empty() {
+            return;
+        }
+
+        info!("=== Merge Stalls ===");
+
+        if let Some(s) = stalls {
+            Self::log_consumer_stalls(loop_total, s);
+        }
+
+        if !scans.is_empty() {
+            let reasons = Phase2Skip::ALL
+                .iter()
+                .map(|&r| format!("{}={}", r.label(), scans.skips[r as usize]))
+                .collect::<Vec<_>>()
+                .join(" ");
+            info!("  Worker scans finding no work: {} ({reasons})", scans.scans);
+            info!(
+                "    Of those: {:.0}% backpressured, {:.0}% waiting on a peer's read, {:.0}% \
+                 contended",
+                100.0 * scans.verdict_share(ScanVerdict::Backpressured),
+                100.0 * scans.verdict_share(ScanVerdict::IoWait),
+                100.0 * scans.verdict_share(ScanVerdict::Contended)
+            );
+        }
+
+        if !wake.is_empty() {
+            info!(
+                "  Worker discovery lag: ~{:.1}s of {:.1}s deep-sleep worker-seconds; {} sleeps \
+                 ended in a find, {:.0}% of them after >=320us",
+                wake.estimated_discovery_lag_secs(),
+                wake.deep_sleep_idle_secs(),
+                wake.productive_sleep_count(),
+                100.0 * wake.deep_sleep_wake_share()
+            );
+            info!(
+                "    (nothing unparks a worker, so this bounds how late work is noticed; it \
+                 delays the merge only when every worker is asleep at once)"
+            );
+        }
+    }
+
+    /// Log where the merge loop blocked and what the other files were doing.
+    ///
+    /// Exact, not sampled -- see [`crate::merge_stalls`]. When this disagrees
+    /// with the sampled "fetch next record" row above, this is the one to
+    /// believe.
+    #[allow(clippy::cast_precision_loss)]
+    fn log_consumer_stalls(loop_total: f64, s: crate::merge_stalls::ConsumerStallReport) {
+        use crate::merge_stalls::{StallShape, classify_stall};
+
+        let park_fraction = if loop_total > 0.0 { s.park_secs / loop_total } else { 0.0 };
+        info!(
+            "  Consumer parked: {:.1}s ({:.0}% of loop wall, exact) over {} parks",
+            s.park_secs,
+            100.0 * park_fraction,
+            s.parks
+        );
+        info!(
+            "    Block pulls that had to wait: {}/{} ({:.0}%), {:.1} parks each (1.0 = no wasted \
+             wake-ups)",
+            s.stalled_pulls,
+            s.block_pulls,
+            100.0 * s.stall_rate(),
+            s.parks_per_stall()
+        );
+        info!(
+            "    Worst source: #{} at {:.1}s ({:.0}% of park time; {} sources parked on)",
+            s.top_source,
+            s.top_source_park_secs,
+            100.0 * s.top_source_share(),
+            s.sources_parked_on
+        );
+        if s.censuses > 0 {
+            info!(
+                "    At a park ({} sampled): {:.0}% of live files at cap, {:.0}% starved, {:.0}% \
+                 unreadable; the awaited file was starved {:.0}% of the time",
+                s.censuses,
+                100.0 * s.capped_share,
+                100.0 * s.starved_share,
+                100.0 * s.contended_share,
+                100.0 * s.waited_on_starved_share
+            );
+        }
+        match classify_stall(
+            park_fraction,
+            s.capped_share,
+            s.starved_share,
+            s.contended_share,
+            s.waited_on_starved_share,
+        ) {
+            StallShape::NotStalled => info!("    Shape: the consumer is not waiting on blocks"),
+            StallShape::HeadOfLine => info!(
+                "    Shape: head-of-line -- the consumer waits on a starved file while the rest \
+                 sit at their cap. Read-ahead is spread evenly across files but demand is not, so \
+                 a uniformly larger cap would buffer more of what is not needed next"
+            ),
+            StallShape::PoolStarved => info!(
+                "    Shape: the pool cannot keep up -- most files are empty, so the constraint is \
+                 upstream of the per-file caps"
+            ),
+            StallShape::Contended => info!(
+                "    Shape: lock contention -- a large share of file state could not be read \
+                 without blocking, so the shares above understate what was available"
+            ),
+            StallShape::Mixed => info!("    Shape: no single candidate dominates"),
+        }
     }
 
     /// Generic merge for keyed chunks using `O(1)` key comparisons.
@@ -3907,6 +4128,12 @@ impl RawExternalSorter {
         // active, so the number cannot depend on what teardown does to the cap.
         let active_workers = pool.active_workers();
 
+        // Harvest the consumer's stall report before finalizing: `finish_output`
+        // releases the merge sources and with them the consumer, and the report
+        // describes the loop that has just ended rather than the output drain
+        // that follows.
+        let stalls = guard.consumer_ref().map(MainThreadChunkConsumer::stall_report);
+
         // Finalize before logging. `finish` drains the output queue, and every
         // block still in it is compressed by the same workers this breakdown
         // reports -- so a snapshot taken first omits the tail of
@@ -3921,6 +4148,7 @@ impl RawExternalSorter {
             (samples_taken, records_merged),
             active_workers,
             pool,
+            stalls,
         );
 
         merge_progress.log_final();
@@ -3982,6 +4210,7 @@ impl RawExternalSorter {
             .with_interval(1_000_000)
             .with_total(total_records);
 
+        let loop_start = Instant::now();
         while tree.winner_is_active() {
             let winner = tree.winner();
             let src_idx = source_map[winner];
@@ -3995,6 +4224,17 @@ impl RawExternalSorter {
                 tree.remove_winner();
             }
         }
+
+        // This path has no sampled sub-phase breakdown -- adding the per-record
+        // sampling here would duplicate the merge loop rather than share it --
+        // but the stall counters need no sampling at all, so an indexed sort is
+        // not left with nothing. `--write-index` is the default for a
+        // coordinate sort, so that gap covers most production merges.
+        Self::log_merge_stalls(
+            loop_start.elapsed().as_secs_f64(),
+            guard.consumer_ref().map(MainThreadChunkConsumer::stall_report),
+            pool,
+        );
 
         let index = guard.finish_output(|| writer.finish_index())?;
         merge_progress.log_final();
