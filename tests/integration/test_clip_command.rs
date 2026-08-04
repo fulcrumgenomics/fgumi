@@ -866,10 +866,17 @@ fn test_clip_command_threads_mode_supplementary_mate_repair() {
     );
     assert_eq!(mate_cigar(supp).as_deref(), Some("98M2H"), "MC = primary R2 post-clip CIGAR");
     assert_eq!(mate_mapq(supp), Some(40), "MQ = primary R2 MAPQ");
+    // TLEN is computed from the supplementary's own alignment against the post-clip primary R2,
+    // not copied from R2's TLEN (see issue #673). Hand-derived from the inputs:
+    //   R1 primary  100..199 forward      -> 5' = 100
+    //   R2 primary  300..397 reverse      -> 5' = 397   => primaries are +298 / -298
+    //   R1 supp    5000..5049 forward     -> 5' = 5000
+    // The supplementary is the rightmost segment, so its TLEN is negative: 397 - 5000 - 1.
+    assert_eq!(r2.template_length(), -298, "primary R2 TLEN");
     assert_eq!(
         supp.template_length(),
-        -r2.template_length(),
-        "supplementary TLEN = negation of primary R2 TLEN"
+        -4604,
+        "supplementary TLEN is computed against primary R2, not copied from it"
     );
 
     // Cross-check: the repaired mate fields agree with the actual primary R2 record, proving the
