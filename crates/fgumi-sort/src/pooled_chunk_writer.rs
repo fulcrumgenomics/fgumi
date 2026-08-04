@@ -104,26 +104,24 @@ impl<K: RawSortKey> PooledChunkWriter<K> {
         Self::open(pool, path, codec, false)
     }
 
-    /// Append another sorted chunk to an existing run.
+    /// Create a run, or append another sorted chunk to an existing one.
     ///
-    /// The caller must have established that every key in this chunk sorts at or
-    /// after the run's last key; this type does not and cannot check that.
+    /// When `appending`, the caller must have established that every key in this
+    /// chunk sorts at or after the run's last key; this type does not and cannot
+    /// check that.
     ///
-    /// Two things differ from [`Self::new`]. The file is opened for append rather
-    /// than truncated, and the zstd format magic is written only when a run is
-    /// created — it identifies the file, not each chunk within it. For BGZF the
-    /// trailing end-of-stream marker left by the previous chunk is removed first,
-    /// so a finished run carries exactly one terminator, at its end.
+    /// Two things differ when appending. The file is opened for append rather than
+    /// truncated, and the zstd format magic is written only when a run is created —
+    /// it identifies the file, not each chunk within it. For BGZF the trailing
+    /// end-of-stream marker left by the previous chunk is removed first, so a
+    /// finished run carries exactly one terminator, at its end.
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be opened, or if a BGZF run does not
-    /// end with the terminator this writer would have written.
-    pub fn append(pool: Arc<SortWorkerPool>, path: &Path, codec: SpillCodec) -> Result<Self> {
-        Self::open(pool, path, codec, true)
-    }
-
-    fn open(
+    /// Returns an error if the file cannot be opened, or if a BGZF run being
+    /// appended to does not end with the terminator this writer would have
+    /// written.
+    pub fn open(
         pool: Arc<SortWorkerPool>,
         path: &Path,
         codec: SpillCodec,
@@ -317,6 +315,43 @@ mod tests {
     use crate::external::GenericKeyedChunkReader;
     use crate::inline::TemplateKey;
     use tempfile::TempDir;
+
+    /// A finished run carries exactly one BGZF terminator, at its end, however
+    /// many chunks were appended to it.
+    ///
+    /// Tested here rather than through a full sort, because a sort deletes its
+    /// spill files on success — the property is only observable at this level.
+    #[test]
+    fn test_appending_leaves_one_bgzf_terminator() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("run.keyed");
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, SpillCodec::Bgzf));
+
+        // Two chunks, the second appended to the first.
+        for (chunk, appending) in [(0u64, false), (1u64, true)] {
+            let mut writer = PooledChunkWriter::<TemplateKey>::open(
+                Arc::clone(&pool),
+                &path,
+                SpillCodec::Bgzf,
+                appending,
+            )
+            .expect("open run");
+            writer.write_record(&make_key(chunk), b"record-bytes").expect("write");
+            writer.finish().expect("finish");
+        }
+
+        let bytes = std::fs::read(&path).expect("read run");
+        assert!(bytes.ends_with(&BGZF_EOF), "a finished run must end with the terminator");
+        let interior = &bytes[..bytes.len() - BGZF_EOF.len()];
+        assert!(
+            !interior.windows(BGZF_EOF.len()).any(|w| w == BGZF_EOF),
+            "an appended run must not carry an interior terminator"
+        );
+
+        if let Ok(pool) = Arc::try_unwrap(pool) {
+            pool.shutdown();
+        }
+    }
 
     /// Create a test `TemplateKey` with distinct values for roundtrip verification.
     #[allow(clippy::cast_possible_truncation)]
