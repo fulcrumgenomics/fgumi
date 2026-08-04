@@ -12,10 +12,44 @@ name: Miri (undefined-behavior check)
 # so covering its radix-sort unsafe needs `#[cfg(not(miri))]` guards first
 # (tracked as a follow-up).
 #
-# Runs on a schedule (and on demand) rather than per-PR: Miri needs the nightly
-# toolchain (which can regress independently of this repo) and is much slower than
-# a normal test run, so a nightly-Miri hiccup should not block unrelated changes.
+# Two triggers, two jobs to do.
+#
+# **Per-PR, path-filtered — the gate.** A PR that touches `fgumi-raw-bam` gets
+# Miri before it merges, because the only thing Miri can tell you is which change
+# introduced the UB, and a nightly-only run answers that with "somewhere in
+# yesterday's merges." The filter is what keeps the original objection to per-PR
+# runs (a nightly-Miri regression should not block unrelated work) true: a PR that
+# does not touch the covered crate never starts this workflow, so it cannot be
+# blocked by it. The PRs it can block are exactly the ones that can introduce UB
+# here. Cost is not the constraint at this scope — the scoped `sort` tests run in
+# seconds, against a `test` job that takes minutes.
+#
+# Deliberately no `push:` on `main`: a `pull_request` run already tests the
+# simulated merge commit, so a merged PR was covered by construction, and the cron
+# below re-checks `main` daily anyway. Adding it would double every Miri run to buy
+# a few hours of latency on drift the cron already finds.
+#
+# **Daily cron — the canary.** Keeps covering two things a PR run cannot: a
+# nightly-Miri or toolchain regression against *unchanged* code, and `main` itself
+# between merges. It is also where scope can widen (the `fgumi-sort` FFI exclusion
+# above) without putting that cost on every PR. A failing cron files a tracking
+# issue; see the `report-failure` job, which is gated to the scheduled trigger so
+# a PR failure stays in that PR's checks.
 on:
+  pull_request:
+    # Server-side filtering, with one documented limit: GitHub evaluates `paths`
+    # against only the first 3,000 files of a diff, so a PR larger than that which
+    # touches the covered crate could fail to start this workflow. Accepted rather
+    # than worked around. The alternative -- trigger on every PR and re-derive the
+    # changed paths in a gating job -- puts a job on every PR in the repository to
+    # cover a diff shape (3,000+ files, including `crates/fgumi-raw-bam`) that
+    # would be a vendored-dependency dump, not a change to the comparator this
+    # gate protects. Revisit if that ever stops being true.
+    paths:
+      # The covered crate, and this workflow itself — editing the scope or the
+      # guards below should re-run them.
+      - "crates/fgumi-raw-bam/**"
+      - ".github/workflows/miri.yml"
   schedule:
     - cron: "0 8 * * *" # daily at 08:00 UTC
   workflow_dispatch: {}
@@ -26,8 +60,10 @@ on:
 permissions:
   contents: read
 
-# A manual dispatch overlapping (or a delayed) scheduled run adds no signal, so
-# keep only the newest run of this workflow alive.
+# Only the newest run per ref stays alive. `github.ref` is `refs/pull/N/merge` for
+# a PR, so a force-push to a PR cancels its own in-flight run without touching
+# anyone else's; a manual dispatch overlapping (or a delayed) scheduled run on the
+# same ref likewise adds no signal.
 concurrency:
   group: miri-${{ github.ref }}
   cancel-in-progress: true
@@ -44,8 +80,9 @@ jobs:
   miri:
     runs-on: ubuntu-latest
     # The scoped `sort` tests take seconds locally; anything near this cap means
-    # the interpreter (or a nightly regression) is hung, and on a daily cron that
-    # should fail fast rather than idle at GitHub's 6-hour default.
+    # the interpreter (or a nightly regression) is hung. Fail fast rather than idle
+    # at GitHub's 6-hour default — on a daily cron nobody is watching, and on a PR
+    # nobody wants to.
     timeout-minutes: 20
     steps:
       - name: Checkout code
