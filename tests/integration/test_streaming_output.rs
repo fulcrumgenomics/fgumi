@@ -198,7 +198,7 @@ fn the_spilling_fixture_spills() {
     );
     let log = String::from_utf8_lossy(&run.stderr);
     assert!(
-        log.contains("Temporary chunks:"),
+        log.contains("Spill runs:"),
         "20k records under `-m 1M` no longer spill, so the merge path is not being covered:\n{log}"
     );
 }

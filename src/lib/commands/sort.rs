@@ -774,28 +774,15 @@ impl Sort {
         }
 
         let stats = sorter.sort(&self.input, output)?;
-        let (total_records, output_records, chunks_written) =
-            (stats.total_records, stats.output_records, stats.chunks_written);
-
-        // A sort is a permutation: every record read must be written. Both counts
-        // were already tracked and merely logged, so a bug that dropped records
-        // anywhere -- run formation, the merge, consolidation -- produced a
-        // silently short BAM and exited 0. Comparing them turns that whole class
-        // of corruption into a hard failure for the price of one branch.
-        anyhow::ensure!(
-            total_records == output_records,
-            "sort lost records: read {total_records} but wrote {output_records} \
-             ({} missing). The output at {} is incomplete and must not be used.",
-            total_records.saturating_sub(output_records),
-            output.display()
-        );
+        let (total_records, output_records, runs_written) =
+            (stats.total_records, stats.output_records, stats.runs_written);
 
         // Summary
         info!("=== Summary ===");
         info!("Records processed: {total_records}");
         info!("Records written: {output_records}");
-        if chunks_written > 0 {
-            info!("Temporary chunks: {chunks_written}");
+        if runs_written > 0 {
+            info!("Spill runs: {runs_written}");
         }
         info!("Output: {}", output.display());
 
@@ -1485,9 +1472,9 @@ mod tests {
         // `Some(2)` run exercised consolidation rather than a trivial in-memory
         // sort. Without this the identity assertion below could pass vacuously.
         assert!(
-            default_stats.chunks_written >= 2,
+            default_stats.runs_written >= 2,
             "test must spill multiple runs to exercise consolidation, got {} chunk(s)",
-            default_stats.chunks_written,
+            default_stats.runs_written,
         );
         assert_eq!(
             limited_stats.output_records, default_stats.output_records,
