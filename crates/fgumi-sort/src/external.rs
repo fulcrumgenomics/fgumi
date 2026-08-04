@@ -1829,6 +1829,17 @@ fn log_run_formation(chunks_spilled: usize, runs: usize) {
 ///
 /// The buffer must already be sorted; these are read off its ends rather than
 /// scanned, which is what makes run formation free.
+/// The smallest and largest template keys in a sorted template buffer.
+///
+/// `TemplateRecordRef` caches its key, so like the coordinate case these are the
+/// buffer's ends rather than a scan.
+fn template_chunk_bounds<K: crate::inline::TemplateLaneKey>(
+    buffer: &crate::inline::TemplateRecordBuffer<K>,
+) -> (Option<K>, Option<K>) {
+    let refs = buffer.refs();
+    (refs.first().map(|r| r.key), refs.last().map(|r| r.key))
+}
+
 fn coordinate_chunk_bounds(
     buffer: &crate::inline::RecordBuffer,
 ) -> (Option<crate::keys::RawCoordinateKey>, Option<crate::keys::RawCoordinateKey>) {
@@ -3392,10 +3403,10 @@ impl RawExternalSorter {
                     writer.start_finish()
                 })?;
 
-                // Queryname and template-coordinate keep one file per chunk for now:
-                // `RawQuerynameKey` borrows raw pointers into the record buffer, so a
-                // run's last key cannot outlive the chunk that produced it without
-                // owning those bytes. See the natural-run-formation follow-up.
+                // Queryname keeps one file per chunk: `RawQuerynameKey` borrows raw
+                // pointers into the record buffer, so retaining one as a run's last
+                // key past the chunk that produced it would dangle. Supporting it
+                // needs owned boundary bytes, not just a wider trait bound.
                 pending_spill = Some(PendingSpill { handle, chunk_path, appended: false });
 
                 memory_used = 0;
@@ -3678,6 +3689,10 @@ impl RawExternalSorter {
             TemplateRecordBuffer::<K>::with_capacity(estimated_records, estimated_data_bytes);
         let mut namer = ChunkNamer::new(alloc);
         let mut pending_spill: Option<PendingSpill> = None;
+        // Natural run formation: consecutive chunks already in template order
+        // extend one run instead of each becoming its own merge source.
+        let mut run_former: RunFormer<K> = RunFormer::new();
+        let mut chunks_spilled: usize = 0;
         let rayon_pool = self.build_sort_rayon_pool()?;
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
@@ -3746,30 +3761,44 @@ impl RawExternalSorter {
                 )?;
                 probe.post_drain(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
 
-                let chunk_path = namer.next_chunk_path()?;
-
                 timer.time_sort(|| {
                     rayon_pool.install(|| buffer.par_sort());
                 });
 
+                run_former.forget_if_absent(&chunk_files);
+                let (chunk_min, chunk_max) = template_chunk_bounds(&buffer);
+                let (chunk_path, appended) =
+                    match chunk_min.and_then(|min| run_former.appendable(&min).cloned()) {
+                        Some(path) => (path, true),
+                        None => (namer.next_chunk_path()?, false),
+                    };
+                chunks_spilled += 1;
+
                 // Write keyed chunk with parallel BGZF compression via worker pool.
                 let handle = timer.time_spill_write(|| {
-                    let mut writer = PooledChunkWriter::<K>::new(
-                        Arc::clone(&pool),
-                        &chunk_path,
-                        pool.spill_codec(),
-                    )?;
+                    let mut writer = if appended {
+                        PooledChunkWriter::<K>::append(
+                            Arc::clone(&pool),
+                            &chunk_path,
+                            pool.spill_codec(),
+                        )?
+                    } else {
+                        PooledChunkWriter::<K>::new(
+                            Arc::clone(&pool),
+                            &chunk_path,
+                            pool.spill_codec(),
+                        )?
+                    };
                     for (key, record) in buffer.iter_sorted_keyed() {
                         writer.write_record(&key, record)?;
                     }
                     writer.start_finish()
                 })?;
 
-                // Queryname and template-coordinate keep one file per chunk for now:
-                // `RawQuerynameKey` borrows raw pointers into the record buffer, so a
-                // run's last key cannot outlive the chunk that produced it without
-                // owning those bytes. See the natural-run-formation follow-up.
-                pending_spill = Some(PendingSpill { handle, chunk_path, appended: false });
+                if let Some(max) = chunk_max {
+                    run_former.extended(chunk_path.clone(), max);
+                }
+                pending_spill = Some(PendingSpill { handle, chunk_path, appended });
 
                 buffer.clear();
                 force_mi_collect();
@@ -3835,6 +3864,7 @@ impl RawExternalSorter {
 
             let memory_chunks = MemorySources::Shared(memory_chunks);
             let n_memory = memory_chunks.num_non_empty();
+            log_run_formation(chunks_spilled, chunk_files.len());
             debug!("Phase 2: Merging {} chunks...", chunk_files.len() + n_memory);
 
             // Merge using O(1) key comparisons
@@ -6852,6 +6882,134 @@ mod tests {
         assert_eq!(stats.total_records, stats.output_records, "sort must not lose records");
         assert_eq!(count_bam_records(&output), 600);
         assert_sorted_by_coordinate(&output);
+    }
+
+    /// Run formation is wired for template-coordinate too, and its keys are
+    /// self-contained (three packed `u64` lanes), unlike queryname's.
+    ///
+    /// A BAM already in template-coordinate order must collapse to one run, and
+    /// the output must stay in that order -- the buffer's radix sort orders by
+    /// lanes while the merge compares via `K::cmp`, so run formation is only sound
+    /// if those agree.
+    #[test]
+    fn test_template_coordinate_sorted_input_collapses_to_one_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let unsorted = build_ordered_bam(dir.path(), 300, true);
+
+        // Produce a genuinely template-coordinate-ordered input by sorting once,
+        // rather than assuming coordinate order implies template order.
+        let template_sorted = dir.path().join("template_sorted.bam");
+        let first = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .memory_limit(256 * 1024 * 1024)
+            .threads(1)
+            .spill_codec(crate::codec::SpillCodec::Bgzf)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&unsorted, &template_sorted)
+            .expect("first template sort should succeed");
+        assert_eq!(first.total_records, first.output_records);
+
+        let output = dir.path().join("resorted.bam");
+        let stats = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .memory_limit(8 * 1024)
+            .max_temp_files(0)
+            .threads(1)
+            .spill_codec(crate::codec::SpillCodec::Bgzf)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&template_sorted, &output)
+            .expect("re-sort should succeed");
+
+        assert_eq!(
+            stats.chunks_written, 1,
+            "template-coordinate-sorted input should collapse to one run, got {}",
+            stats.chunks_written
+        );
+        assert_eq!(stats.total_records, stats.output_records, "sort must not lose records");
+        assert_eq!(count_bam_records(&output), 600);
+
+        // Re-sorting an already-sorted file is a fixed point: byte-identical
+        // apart from the @PG the second run adds, so compare records only.
+        assert_eq!(
+            count_bam_records(&template_sorted),
+            count_bam_records(&output),
+            "re-sort changed the record count"
+        );
+    }
+
+    /// The template path must not append when the input is not in template order.
+    #[test]
+    fn test_template_coordinate_unsorted_input_never_appends() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = build_ordered_bam(dir.path(), 300, false);
+        let output = dir.path().join("output.bam");
+
+        let stats = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .memory_limit(8 * 1024)
+            .max_temp_files(0)
+            .threads(1)
+            .spill_codec(crate::codec::SpillCodec::Bgzf)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&input, &output)
+            .expect("sort should succeed");
+
+        assert!(
+            stats.chunks_written >= 2,
+            "reverse-ordered input must not collapse into one run, got {}",
+            stats.chunks_written
+        );
+        assert_eq!(stats.total_records, stats.output_records, "sort must not lose records");
+        assert_eq!(count_bam_records(&output), 600);
+    }
+
+    /// Run formation must not change template-coordinate output either. Sorting
+    /// with a limit that forces appending and with one that never spills must
+    /// produce identical bytes.
+    #[test]
+    fn test_template_run_formation_output_is_byte_identical() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let unsorted = build_ordered_bam(dir.path(), 300, true);
+
+        let template_sorted = dir.path().join("template_sorted.bam");
+        RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .memory_limit(256 * 1024 * 1024)
+            .threads(1)
+            .spill_codec(crate::codec::SpillCodec::Bgzf)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&unsorted, &template_sorted)
+            .expect("first template sort should succeed");
+
+        let spilled = dir.path().join("spilled.bam");
+        let in_memory = dir.path().join("in_memory.bam");
+
+        let spilled_stats = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .memory_limit(8 * 1024)
+            .max_temp_files(0)
+            .threads(1)
+            .spill_codec(crate::codec::SpillCodec::Bgzf)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&template_sorted, &spilled)
+            .expect("spilling sort should succeed");
+        assert_eq!(spilled_stats.chunks_written, 1, "expected the appending path");
+
+        let in_memory_stats = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .memory_limit(256 * 1024 * 1024)
+            .threads(1)
+            .spill_codec(crate::codec::SpillCodec::Bgzf)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&template_sorted, &in_memory)
+            .expect("in-memory sort should succeed");
+        assert_eq!(in_memory_stats.chunks_written, 0, "expected the no-spill path");
+
+        assert_eq!(
+            std::fs::read(&spilled).expect("read spilled"),
+            std::fs::read(&in_memory).expect("read in-memory"),
+            "appending runs changed template-coordinate output bytes"
+        );
     }
 
     /// The indexed path got run formation too, so cover appending there: the
