@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-fmt", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-tag", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/fgumi-bam-io", "crates/fgumi-sort", "crates/fgumi-cli-common", "crates/fgumi-cli-macros", "crates/xtask"]
+members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-fmt", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-tag", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/fgumi-bam-io", "crates/fgumi-sort", "crates/fgumi-cli-common", "crates/fgumi-cli-macros", "crates/fgumi-pipeline-core", "crates/xtask"]
 resolver = "2"
 
 [workspace.package]
@@ -28,6 +28,7 @@ fgumi-fmt = { version = "0.6.0", path = "crates/fgumi-fmt" }
 fgumi-consensus = { version = "0.6.0", path = "crates/fgumi-consensus", default-features = false }
 fgumi-dna = { version = "0.6.0", path = "crates/fgumi-dna" }
 fgumi-metrics = { version = "0.6.0", path = "crates/fgumi-metrics" }
+fgumi-pipeline-core = { version = "0.6.0", path = "crates/fgumi-pipeline-core" }
 fgumi-raw-bam = { version = "0.6.0", path = "crates/fgumi-raw-bam" }
 fgumi-sam = { version = "0.6.0", path = "crates/fgumi-sam" }
 fgumi-simd-fastq = { version = "0.6.0", path = "crates/fgumi-simd-fastq" }
@@ -94,6 +95,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 tempfile = "3.3.0"
 thiserror = "2"
+trybuild = "1.0"
 wide = "1.5"
 
 [package]
