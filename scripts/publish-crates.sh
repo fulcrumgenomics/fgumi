@@ -26,6 +26,7 @@ CRATES=(
   fgumi-fmt
   fgumi-cli-macros
   fgumi-cli-common
+  fgumi-pipeline-core
   fgumi-raw-bam
   fgumi-bam-io
   fgumi-umi

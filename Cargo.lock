@@ -881,6 +881,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fgumi-pipeline-core"
+version = "0.6.0"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "crossbeam-queue",
+ "log",
+ "noodles",
+ "parking_lot",
+ "proptest",
+ "rstest",
+ "trybuild",
+]
+
+[[package]]
 name = "fgumi-raw-bam"
 version = "0.6.0"
 dependencies = [

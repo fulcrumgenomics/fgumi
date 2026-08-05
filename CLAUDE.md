@@ -274,6 +274,37 @@ contract rather than a weakened assertion: `ENCODE_LUT` maps non-ACGT bytes to a
 don't-care value, which the SIMD paths write through unconditionally while the
 scalar path leaves those lanes zero.
 
+### Approved typed-handle cache (fgumi-pipeline-core)
+
+The pipeline runtime hands each step its input/output handles as
+`&dyn Any`, so the `ErasedStep` adapter must `downcast_ref` them back to
+their concrete types. That downcast sits on the per-item dispatch path: a
+4-thread CODEC 8M run spends ≈1.6% of samples on `TypeId` compares alone.
+The adapter resolves the handles once and caches them, which requires
+storing a reference whose real lifetime the struct cannot name.
+
+- **`crates/fgumi-pipeline-core/src/erased.rs`** — four `#[allow(unsafe_code)]`
+  sites, two on `TypedStep<S>` (`resolve_input`, `resolve_outputs`) and two on
+  `TypedStep2<S>` (`resolve_inputs`, `resolve_outputs`). Each is a
+  `std::mem::transmute` that extends a `&'a Handle` to `&'static Handle` for
+  storage in the cache slot, and narrows it back to `&'a` on read. No pointer
+  is dereferenced through the `'static` form. SAFETY rests on three invariants
+  documented on `TypedStep` itself: the handle boxes are owned by
+  `ChainContexts` (alive for the whole `Pipeline::run`), every step instance is
+  dropped before those contexts are, and every dispatch passes the *same* box
+  for a given `step_idx`. The third is the one the compiler cannot check, so
+  each cache slot stores the address of the erased box it was resolved from and
+  every cached hit `assert!`s it — **unconditionally, release included**, so a
+  step reused across two *live* `ChainContexts` panics instead of reading
+  through the wrong one. The check is one load and one compare, not the
+  `downcast_ref` `TypeId` probe the cache exists to elide. A debug-only
+  `debug_assert!` keeps re-resolving the typed pointer as a second diagnostic.
+  Treat the assert as defence in depth, not as the safety argument: it compares
+  data addresses only, so an allocator that reuses a freed box's address defeats
+  it. Soundness rests on the second invariant — every step instance is dropped
+  before the contexts it cached from — which is what must be preserved by any
+  future change.
+
 Any new `unsafe` site must extend this list and explain why the safe
 alternative is unacceptable. Do not introduce `unsafe` outside the crates
 listed in this section.
