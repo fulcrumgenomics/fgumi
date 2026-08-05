@@ -12,12 +12,19 @@ pub mod reader;
 pub mod writer;
 
 // Re-export commonly used types
+
 pub use header::{
     BGZF_HEADER_SIZE, HeaderRejection, MIN_BLOCK_SIZE, block_size, block_size_checked,
     is_bgzf_header,
 };
+/// The libdeflater decompressor every `decompress_*` entry point here takes.
+///
+/// Re-exported so a consumer can name the type it must construct and reuse
+/// without also declaring a direct `libdeflater` dependency — and so the
+/// version it names is necessarily the one this crate decompresses with.
+pub use libdeflater::Decompressor;
 pub use reader::{
     BGZF_EOF, BGZF_FOOTER_SIZE, RawBgzfBlock, decompress_block, decompress_block_into,
-    decompress_block_slice_into, read_raw_blocks,
+    decompress_block_slice_into, decompress_into_slice, read_raw_blocks, uncompressed_size,
 };
 pub use writer::{BGZF_MAX_BLOCK_SIZE, CompressedBlock, InlineBgzfCompressor};
