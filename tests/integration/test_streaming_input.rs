@@ -1,20 +1,50 @@
 //! Integration tests for streaming input support (stdin/pipes).
 //!
-//! These tests spawn cat processes whose stdout is piped to fgumi commands.
-//! The child processes are properly cleaned up when their stdout is consumed.
-#![allow(clippy::zombie_processes)]
+//! These tests pipe a `cat` child's stdout into an fgumi command's stdin. Every
+//! such child is owned by a [`CatPipe`], which waits on it, so none outlives the
+//! test that spawned it.
 
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdout, Command, Stdio};
 
 use rstest::rstest;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, create_umi_family, to_record_buf};
+
+/// A `cat <path>` child whose stdout is piped, reaped when the guard drops.
+///
+/// `cat` inherits the test binary's stderr. Left unreaped, it can still hold
+/// that inherited pipe open after the test returns, which nextest reports as a
+/// leaky test. Tying the child's lifetime to a guard makes forgetting to wait
+/// impossible, which the previous open-coded form did at all five call sites.
+struct CatPipe(Child);
+
+impl CatPipe {
+    /// Spawn `cat <path>`, returning the guard and the piped stdout to hand to
+    /// the consuming command's `stdin`.
+    fn spawn(path: &Path) -> (Self, ChildStdout) {
+        let mut child = Command::new("cat")
+            .arg(path)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn cat");
+        let stdout = child.stdout.take().expect("cat stdout was piped");
+        (Self(child), stdout)
+    }
+}
+
+impl Drop for CatPipe {
+    fn drop(&mut self) {
+        // The consumer has exited by the time a guard drops, closing the read
+        // end, so `cat` sees EPIPE and exits rather than blocking this wait.
+        let _ = self.0.wait();
+    }
+}
 
 /// Test that the group command works correctly with piped input.
 #[test]
@@ -50,11 +80,7 @@ fn test_group_command_with_piped_input() {
     assert!(output_from_file.exists(), "Output BAM from file not created");
 
     // Run group command with piped input (cat file | fgumi group)
-    let cat_child = Command::new("cat")
-        .arg(input_bam.to_str().unwrap())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn cat");
+    let (_cat, cat_stdout) = CatPipe::spawn(&input_bam);
 
     let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
         .args([
@@ -72,11 +98,19 @@ fn test_group_command_with_piped_input() {
             "--threads",
             "2",
         ])
-        .stdin(cat_child.stdout.unwrap())
+        .stdin(cat_stdout)
         .status()
         .expect("Failed to run group command with piped input");
     assert!(status.success(), "Group command with piped input failed");
     assert!(output_from_pipe.exists(), "Output BAM from pipe not created");
+
+    // Guard against a vacuous pass: group must actually emit records, otherwise
+    // the file-vs-pipe comparison below is trivially true (0 == 0) even if stdin
+    // were dropped entirely.
+    assert!(
+        count_bam_records(&output_from_file) > 0,
+        "group produced no records — parity check would be vacuous"
+    );
 
     // Compare outputs - records should be identical (headers may differ due to @PG command line)
     compare_bam_records(&output_from_file, &output_from_pipe);
@@ -87,40 +121,51 @@ fn test_group_command_with_piped_input() {
 fn test_group_command_with_dev_stdin_path() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let input_bam = temp_dir.path().join("input.bam");
-    let output_bam = temp_dir.path().join("output.bam");
+    let output_from_file = temp_dir.path().join("output_file.bam");
+    let output_from_dev_stdin = temp_dir.path().join("output_dev_stdin.bam");
 
     // Create test BAM file
     create_test_input_bam(&input_bam);
 
+    let group_args = |input: &str, output: &str| {
+        vec![
+            s("group"),
+            s("--input"),
+            s(input),
+            s("--output"),
+            s(output),
+            s("--strategy"),
+            s("identity"),
+            s("--edits"),
+            s("0"),
+            s("--compression-level"),
+            s("1"),
+            s("--threads"),
+            s("2"),
+        ]
+    };
+
+    // Baseline: the same grouping read from the file directly.
+    run_fgumi_checked(
+        &group_args(input_bam.to_str().unwrap(), output_from_file.to_str().unwrap()),
+        None,
+    );
+
     // Run group command using /dev/stdin
-    let cat_child = Command::new("cat")
-        .arg(input_bam.to_str().unwrap())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn cat");
+    run_fgumi_checked(
+        &group_args("/dev/stdin", output_from_dev_stdin.to_str().unwrap()),
+        Some(&input_bam),
+    );
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "group",
-            "--input",
-            "/dev/stdin",
-            "--output",
-            output_bam.to_str().unwrap(),
-            "--strategy",
-            "identity",
-            "--edits",
-            "0",
-            "--compression-level",
-            "1",
-            "--threads",
-            "2",
-        ])
-        .stdin(cat_child.stdout.unwrap())
-        .status()
-        .expect("Failed to run group command with /dev/stdin");
+    // Guard against a vacuous pass: exiting zero and creating an output file
+    // proves nothing if the `cat` child's records never reached the command.
+    assert!(
+        count_bam_records(&output_from_file) > 0,
+        "group produced no records — parity check would be vacuous"
+    );
 
-    assert!(status.success(), "Group command with /dev/stdin failed");
-    assert!(output_bam.exists(), "Output BAM not created");
+    // Compare outputs - records should be identical (headers may differ due to @PG command line)
+    compare_bam_records(&output_from_file, &output_from_dev_stdin);
 }
 
 /// Test simplex command with piped input.
@@ -157,11 +202,7 @@ fn test_simplex_command_with_piped_input() {
     assert!(output_from_file.exists(), "Output BAM from file not created");
 
     // Run simplex with piped input
-    let cat_child = Command::new("cat")
-        .arg(input_bam.to_str().unwrap())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn cat");
+    let (_cat, cat_stdout) = CatPipe::spawn(&input_bam);
 
     let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
         .args([
@@ -179,7 +220,7 @@ fn test_simplex_command_with_piped_input() {
             "--threads",
             "2",
         ])
-        .stdin(cat_child.stdout.unwrap())
+        .stdin(cat_stdout)
         .status()
         .expect("Failed to run simplex command with piped input");
     assert!(status.success(), "Simplex command with piped input failed");
@@ -301,12 +342,8 @@ fn run_fgumi_checked(args: &[String], stdin_bam: Option<&std::path::Path>) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_fgumi"));
     command.args(args);
     let status = if let Some(bam) = stdin_bam {
-        let cat = Command::new("cat")
-            .arg(bam.to_str().unwrap())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("Failed to spawn cat");
-        command.stdin(cat.stdout.unwrap()).status()
+        let (_cat, cat_stdout) = CatPipe::spawn(bam);
+        command.stdin(cat_stdout).status()
     } else {
         command.status()
     };
@@ -413,14 +450,10 @@ fn test_sort_verify_streams_stdin(#[case] input_arg: &str) {
         .expect("run sort");
     assert!(sort.status.success(), "sort failed: {}", String::from_utf8_lossy(&sort.stderr));
 
-    let cat = Command::new("cat")
-        .arg(sorted.to_str().unwrap())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn cat");
+    let (_cat, cat_stdout) = CatPipe::spawn(&sorted);
     let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
         .args(["sort", "--verify", "--input", input_arg, "--order", "coordinate"])
-        .stdin(cat.stdout.unwrap())
+        .stdin(cat_stdout)
         .output()
         .unwrap_or_else(|e| panic!("run sort --verify -i {input_arg}: {e}"));
 
