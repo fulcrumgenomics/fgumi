@@ -49,11 +49,14 @@ reviews:
 
   # MAINTENANCE: these instructions name specific modules, invariants, and code
   # constructs. Re-read and update them whenever those modules are refactored or
-  # renamed — stale instructions silently misdirect the reviewer. (Both the
-  # `unified_pipeline` and `pipeline` paths are listed: issue #330 renames the
-  # former to the latter, so the same instructions apply to whichever is present.)
+  # renamed — stale instructions silently misdirect the reviewer. (All three
+  # pipeline paths are listed: issue #330 renames `src/lib/unified_pipeline` to
+  # `src/lib/pipeline` and extracts its engine into the `fgumi-pipeline-core`
+  # crate, so the same instructions apply to whichever is present. A glob that
+  # names only the `src/lib/` homes silently stops reviewing the engine the day
+  # it moves into the crate.)
   path_instructions:
-    - path: "src/lib/{unified_pipeline,pipeline}/**/*.rs"
+    - path: "{src/lib/unified_pipeline,src/lib/pipeline,crates/fgumi-pipeline-core/src}/**/*.rs"
       instructions: >-
         This is the hand-rolled concurrent step pipeline; its bugs are deadlocks,
         lost output, and unbounded memory, not style. Treat any change to the

@@ -19,7 +19,7 @@ proc-macro2 = "1"
 clap = { workspace = true }
 anyhow = { workspace = true }
 rstest = { workspace = true }
-trybuild = "1.0"
+trybuild = { workspace = true }
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }
