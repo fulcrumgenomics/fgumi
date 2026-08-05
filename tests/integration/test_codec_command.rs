@@ -14,10 +14,12 @@ use fgumi_lib::commands::command::Command;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
 use noodles::bam;
+use rstest::rstest;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
+use crate::helpers::assertions::{int_tag, string_tag};
 use crate::helpers::bam_generator::create_minimal_header;
 
 /// Creates a CODEC read pair (R1 forward, R2 reverse from opposite strand).
@@ -319,6 +321,131 @@ fn test_codec_command_with_stats() {
     // Verify stats file has content
     let stats_content = fs::read_to_string(&stats_file).expect("Failed to read stats");
     assert!(!stats_content.is_empty(), "Stats file should not be empty");
+}
+
+/// A codec consensus record reduced to the fields a caller cannot get right by accident:
+/// its name, flags, sequence, molecule identifier, and the raw-read depths it claims.
+#[derive(Debug, PartialEq, Eq)]
+struct CodecConsensusIdentity {
+    name: String,
+    flags: u16,
+    sequence: String,
+    mi: String,
+    total_depth: i64,
+    a_depth: i64,
+    b_depth: i64,
+}
+
+impl CodecConsensusIdentity {
+    /// Project an emitted BAM record onto the fields this test pins.
+    fn from_record(record: &bam::Record) -> Self {
+        Self {
+            name: String::from_utf8_lossy(
+                record.name().expect("consensus record must be named").as_ref(),
+            )
+            .into_owned(),
+            flags: record.flags().bits(),
+            sequence: record.sequence().iter().map(char::from).collect(),
+            mi: string_tag(record, SamTag::MI),
+            total_depth: int_tag(record, SamTag::CD),
+            a_depth: int_tag(record, SamTag::AD),
+            b_depth: int_tag(record, SamTag::BD),
+        }
+    }
+}
+
+/// The reported `consensus_reads_emitted` must equal the number of consensus records
+/// actually written, in both the single-threaded and pipeline (`--threads N`) paths.
+///
+/// `ConsensusCallingStats::consensus_reads` counts emitted reads, so a caller that counts
+/// molecules or templates instead reports a number that does not match its own output.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::threaded(Some("2"))]
+fn test_codec_stats_consensus_reads_matches_records_written(#[case] threads: Option<&str>) {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let stats_file = temp_dir.path().join("stats.tsv");
+
+    let mut pairs = Vec::new();
+    for molecule in 0..3 {
+        for read in 0..3 {
+            let (r1, r2) = create_codec_read_pair(
+                &format!("mol{molecule}_read{read}"),
+                b"ACGTACGT",
+                b"ACGTACGT",
+                &[30; 8],
+                &[30; 8],
+                100 + molecule * 100,
+                &format!("UMI00{molecule}"),
+                None,
+            );
+            pairs.push((r1, r2));
+        }
+    }
+    create_codec_test_bam(&input_bam, pairs);
+
+    let mut args = vec![
+        "codec",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--stats",
+        stats_file.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--min-duplex-length",
+        "1",
+        "--compression-level",
+        "1",
+    ];
+    if let Some(threads) = threads {
+        args.extend_from_slice(&["--threads", threads]);
+    }
+    Codec::try_parse_from(args)
+        .expect("failed to parse codec args")
+        .execute("fgumi codec")
+        .expect("Failed to run codec command");
+
+    // Identity, not just cardinality: every molecule is built from three identical read
+    // pairs, so each consensus record is fully determined -- one unmapped record per
+    // molecule, named and MI-tagged by its UMI, carrying the molecule's sequence and its
+    // six raw reads split evenly across the two strands.
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let _header = reader.read_header().unwrap();
+    let records =
+        reader.records().collect::<Result<Vec<_>, _>>().expect("failed to read the consensus BAM");
+    let observed = records.iter().map(CodecConsensusIdentity::from_record).collect::<Vec<_>>();
+    let expected = (0..3)
+        .map(|molecule| CodecConsensusIdentity {
+            name: format!(":UMI00{molecule}"),
+            flags: raw_flags::UNMAPPED,
+            sequence: "ACGTACGT".to_string(),
+            mi: format!("UMI00{molecule}"),
+            total_depth: 6,
+            a_depth: 3,
+            b_depth: 3,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(observed, expected, "codec must emit one fully determined consensus per molecule");
+
+    let records_written = records.len();
+
+    let stats = fs::read_to_string(&stats_file).expect("Failed to read stats");
+    let emitted: usize = stats
+        .lines()
+        .find_map(|line| line.strip_prefix("consensus_reads_emitted\t"))
+        .and_then(|rest| rest.split('\t').next())
+        .expect("stats must contain a consensus_reads_emitted row")
+        .parse()
+        .expect("consensus_reads_emitted must be an integer");
+
+    assert_eq!(
+        emitted, records_written,
+        "consensus_reads_emitted must count consensus reads written to the output BAM"
+    );
 }
 
 /// Test CODEC command with rejected reads output.

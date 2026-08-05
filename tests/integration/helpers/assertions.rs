@@ -17,6 +17,42 @@ const BGZF_EOF: [u8; 28] = [
     0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
+/// Reads a required string tag off an emitted BAM record.
+///
+/// The `bam::Record` counterpart to [`assert_mi_tag`] and friends, for tests that
+/// compare a whole emitted record against an expected one rather than checking a
+/// single field. Panics rather than returning an `Option`: a missing tag is a
+/// defect in the command under test, not a case the caller should handle.
+///
+/// # Panics
+///
+/// Panics if the tag is absent, unreadable, or not a string.
+pub fn string_tag(record: &noodles::bam::Record, tag: SamTag) -> String {
+    match record.data().get(&tag.to_noodles_tag()) {
+        Some(Ok(noodles::sam::alignment::record::data::field::Value::String(value))) => {
+            value.to_string()
+        }
+        other => panic!("record must carry a string {tag:?} tag, got {other:?}"),
+    }
+}
+
+/// Reads a required integer tag off an emitted BAM record.
+///
+/// Widens every SAM integer width to `i64`, so a caller's expectation does not
+/// have to predict whether a small count was encoded as `Int8` or `Int32`.
+///
+/// # Panics
+///
+/// Panics if the tag is absent, unreadable, or not an integer.
+pub fn int_tag(record: &noodles::bam::Record, tag: SamTag) -> i64 {
+    match record.data().get(&tag.to_noodles_tag()) {
+        Some(Ok(value)) => {
+            value.as_int().unwrap_or_else(|| panic!("{tag:?} must be an integer, got {value:?}"))
+        }
+        other => panic!("record must carry an integer {tag:?} tag, got {other:?}"),
+    }
+}
+
 /// Asserts that a file ends with the standard 28-byte BGZF EOF marker block.
 ///
 /// # Panics

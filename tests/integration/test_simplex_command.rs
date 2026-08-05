@@ -10,18 +10,23 @@ use clap::Parser;
 use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::simplex::Simplex;
 use fgumi_lib::sam::SamTag;
+use fgumi_raw_bam::flags as raw_flags;
 use noodles::bam;
 use noodles::sam::Header;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::header::record::value::Map;
 use noodles::sam::header::record::value::map::ReadGroup;
 use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
+use rstest::rstest;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use tempfile::TempDir;
 
-use crate::helpers::bam_generator::{create_minimal_header, create_umi_family, to_record_buf};
+use crate::helpers::assertions::{int_tag, string_tag};
+use crate::helpers::bam_generator::{
+    create_minimal_header, create_paired_umi_family, create_umi_family, to_record_buf,
+};
 
 /// Write grouped BAM file (reads grouped by MI tag).
 fn create_grouped_bam(path: &Path, families: Vec<(&str, Vec<fgumi_raw_bam::RawRecord>)>) {
@@ -112,6 +117,125 @@ fn test_simplex_command_with_stats() {
     .expect("failed to parse simplex args");
     cmd.execute("fgumi simplex").expect("Simplex command with stats failed");
     assert!(stats_path.exists(), "Stats file not created");
+}
+
+/// A simplex consensus record reduced to the fields a caller cannot get right by accident:
+/// its name, flags, sequence, molecule identifier, UMI, and the raw-read depth it claims.
+#[derive(Debug, PartialEq, Eq)]
+struct SimplexConsensusIdentity {
+    name: String,
+    flags: u16,
+    sequence: String,
+    mi: String,
+    rx: String,
+    depth: i64,
+}
+
+impl SimplexConsensusIdentity {
+    /// Project an emitted BAM record onto the fields this test pins.
+    fn from_record(record: &bam::Record) -> Self {
+        Self {
+            name: String::from_utf8_lossy(
+                record.name().expect("consensus record must be named").as_ref(),
+            )
+            .into_owned(),
+            flags: record.flags().bits(),
+            sequence: record.sequence().iter().map(char::from).collect(),
+            mi: string_tag(record, SamTag::MI),
+            rx: string_tag(record, SamTag::RX),
+            depth: int_tag(record, SamTag::CD),
+        }
+    }
+}
+
+/// The reported `consensus_reads_emitted` must equal the number of consensus records
+/// actually written, in both the single-threaded and pipeline (`--threads N`) paths.
+///
+/// `ConsensusCallingStats::consensus_reads` counts emitted reads, so a caller that counts
+/// molecules or templates instead reports a number that does not match its own output.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::threaded(Some("2"))]
+fn test_simplex_stats_consensus_reads_matches_records_written(#[case] threads: Option<&str>) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let stats_path = temp_dir.path().join("stats.txt");
+
+    // Paired families, so the caller's R1/R2 branch -- the one that must record two
+    // consensus reads per template -- is the branch under test.
+    let families = (1..=3)
+        .map(|i| {
+            create_paired_umi_family("ACGT", 3, &format!("fam{i}"), "ACGTACGT", "TTTTAAAA", 30)
+        })
+        .collect::<Vec<_>>();
+    create_grouped_bam(
+        &input_bam,
+        vec![("1", families[0].clone()), ("2", families[1].clone()), ("3", families[2].clone())],
+    );
+
+    let mut args = vec![
+        "simplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--stats",
+        stats_path.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ];
+    if let Some(threads) = threads {
+        args.extend_from_slice(&["--threads", threads]);
+    }
+    Simplex::try_parse_from(args)
+        .expect("failed to parse simplex args")
+        .execute("fgumi simplex")
+        .expect("Simplex command failed");
+
+    // Identity, not just cardinality: every family is built from three identical read
+    // pairs, so each consensus pair is fully determined -- an R1/R2 pair per family,
+    // named and MI-tagged by the family's molecule id, carrying that family's two
+    // sequences, its UMI, and its three raw reads per strand.
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let _header = reader.read_header().unwrap();
+    let records =
+        reader.records().collect::<Result<Vec<_>, _>>().expect("failed to read the consensus BAM");
+    let observed = records.iter().map(SimplexConsensusIdentity::from_record).collect::<Vec<_>>();
+    let unmapped_pair = raw_flags::PAIRED | raw_flags::UNMAPPED | raw_flags::MATE_UNMAPPED;
+    let expected = (1..=3)
+        .flat_map(|family| {
+            [(raw_flags::FIRST_SEGMENT, "ACGTACGT"), (raw_flags::LAST_SEGMENT, "TTTTAAAA")].map(
+                |(segment, sequence)| SimplexConsensusIdentity {
+                    name: format!(":{family}"),
+                    flags: unmapped_pair | segment,
+                    sequence: sequence.to_string(),
+                    mi: family.to_string(),
+                    rx: "ACGT".to_string(),
+                    depth: 3,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(observed, expected, "simplex must emit one fully determined R1/R2 pair per family");
+
+    let records_written = records.len();
+
+    let stats = fs::read_to_string(&stats_path).expect("read stats");
+    let emitted: usize = stats
+        .lines()
+        .find_map(|line| line.strip_prefix("consensus_reads_emitted\t"))
+        .and_then(|rest| rest.split('\t').next())
+        .expect("stats must contain a consensus_reads_emitted row")
+        .parse()
+        .expect("consensus_reads_emitted must be an integer");
+
+    assert_eq!(
+        emitted, records_written,
+        "consensus_reads_emitted must count consensus reads written to the output BAM"
+    );
 }
 
 /// Test simplex command with rejects output.
