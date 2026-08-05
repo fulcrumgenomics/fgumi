@@ -15,7 +15,7 @@ use noodles::sam::alignment::io::Write as AlignmentWrite;
 use rstest::rstest;
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
@@ -33,7 +33,30 @@ fn create_duplex_read_pair(
     ref_start: i32,
     is_b_strand: bool,
 ) -> (RawRecord, RawRecord) {
-    let seq = sequence.as_bytes();
+    create_duplex_read_pair_with_sequences(
+        name,
+        mi_tag,
+        sequence,
+        sequence,
+        quality,
+        ref_start,
+        is_b_strand,
+    )
+}
+
+/// As [`create_duplex_read_pair`], but with distinct (equal-length) R1 and R2 sequences so
+/// tests can tell which input read a consensus read was built from.
+fn create_duplex_read_pair_with_sequences(
+    name: &str,
+    mi_tag: &str,
+    r1_sequence: &str,
+    r2_sequence: &str,
+    quality: u8,
+    ref_start: i32,
+    is_b_strand: bool,
+) -> (RawRecord, RawRecord) {
+    assert_eq!(r1_sequence.len(), r2_sequence.len(), "R1 and R2 must be the same length");
+    let seq = r1_sequence.as_bytes();
     let read_len = seq.len();
     let cigar_op = u32::try_from(read_len).expect("read_len fits u32") << 4;
 
@@ -82,7 +105,7 @@ fn create_duplex_read_pair(
     let r2 = {
         let mut b = SamBuilder::new();
         b.read_name(name.as_bytes())
-            .sequence(seq)
+            .sequence(r2_sequence.as_bytes())
             .qualities(&vec![quality; read_len])
             .flags(r2_flags)
             .ref_id(0)
@@ -383,6 +406,501 @@ fn test_duplex_command_with_stats() {
             "single-threaded duplex stats must emit the seeded KV row {key}:\n{stats}"
         );
     }
+}
+
+/// Build a molecule observed on a single strand only: `depth` read pairs all carrying
+/// the same `/A` or `/B` MI suffix.
+fn create_single_strand_molecule(
+    mi_id: &str,
+    sequence: &str,
+    quality: u8,
+    ref_start: i32,
+    depth: usize,
+    is_b_strand: bool,
+) -> Vec<(RawRecord, RawRecord)> {
+    let strand = if is_b_strand { 'B' } else { 'A' };
+    (0..depth)
+        .map(|i| {
+            create_duplex_read_pair(
+                &format!("{strand}_{i}"),
+                &format!("{mi_id}/{strand}"),
+                sequence,
+                quality,
+                ref_start,
+                is_b_strand,
+            )
+        })
+        .collect()
+}
+
+/// A third `--min-reads` value of 0 is fgbio's single-strand mode: molecules seen on only
+/// one strand still yield a consensus. With a non-zero third value they are rejected.
+///
+/// The first two `--min-reads` values still apply in single-strand mode, and they count
+/// TEMPLATES, not read records: `has_minimum_number_of_reads` counts only the R1 of each
+/// pair, matching fgbio's `x.count(r => r.paired && r.firstOfPair)`. The threshold cases
+/// below straddle the molecule's template count to pin that — see `MOLECULE_DEPTH`.
+#[rstest]
+fn test_duplex_single_strand_mode_emits_one_strand_molecules(
+    #[values(None, Some("2"))] threads: Option<&str>,
+    #[values(true, false)] is_b_strand: bool,
+) {
+    /// Read pairs on the molecule's single strand: 3 templates, i.e. 6 read records.
+    const MOLECULE_DEPTH: usize = 3;
+
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+
+    let molecule =
+        create_single_strand_molecule("1", "ACGTACGT", 30, 100, MOLECULE_DEPTH, is_b_strand);
+    create_duplex_bam(&input_bam, vec![molecule]);
+
+    // Identity of one consensus record: `(is_r1, molecule id from the read name, bases)`. A
+    // bare record count cannot tell a correct R1/R2 pair from two empty, duplicated, or
+    // wrong-molecule records, so the assertions below work off this instead.
+    let run = |min_reads: &str, output_bam: &Path| -> Vec<(bool, String, String)> {
+        let mut args = vec![
+            "duplex",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--min-reads",
+            min_reads,
+            "--compression-level",
+            "1",
+        ];
+        if let Some(threads) = threads {
+            args.extend_from_slice(&["--threads", threads]);
+        }
+        Duplex::try_parse_from(args)
+            .expect("failed to parse duplex args")
+            .execute("fgumi duplex")
+            .expect("Duplex command failed");
+        let mut reader = bam::io::Reader::new(fs::File::open(output_bam).unwrap());
+        let _header = reader.read_header().unwrap();
+        reader
+            .records()
+            .map(|result| {
+                let record = result.expect("failed to read consensus record");
+                let name = String::from_utf8(
+                    record.name().expect("consensus record must have a read name").to_vec(),
+                )
+                .expect("consensus read name must be UTF-8");
+                // Consensus reads are named `<read-group-prefix>:<base MI>`, so the molecule
+                // identity survives in the name even though the `/A`-`/B` suffix does not.
+                let (_prefix, molecule) = name.rsplit_once(':').unwrap_or_else(|| {
+                    panic!("consensus read name '{name}' must be '<prefix>:<MI>'")
+                });
+                let flags = record.flags();
+                assert!(flags.is_segmented(), "consensus record '{name}' must be paired");
+                assert!(
+                    flags.is_first_segment() != flags.is_last_segment(),
+                    "consensus record '{name}' must be exactly one of R1/R2"
+                );
+                let bases: String = record.sequence().iter().map(char::from).collect();
+                assert_eq!(
+                    record.quality_scores().as_ref().len(),
+                    bases.len(),
+                    "consensus record '{name}' must carry one quality per base"
+                );
+                (flags.is_first_segment(), molecule.to_string(), bases)
+            })
+            .collect()
+    };
+
+    // The molecule's reads are `sequence` long, and a single-strand consensus over identical
+    // Q30 reads reproduces those bases (reverse-complemented on whichever end the strand puts
+    // in reverse orientation), so neither end may come back empty or N-masked.
+    let sequence = "ACGTACGT";
+    let expected_bases = [sequence.to_string(), reverse_complement(sequence)];
+
+    // The whole contract for an emitted pair: two records, exactly one R1, both carrying the
+    // input molecule's id and reproducing its bases. Every accepting case below asserts this,
+    // so none of them can pass on a bare record count.
+    let assert_is_the_molecules_pair = |reads: &[(bool, String, String)], context: &str| {
+        assert_eq!(reads.len(), 2, "{context}: expected an R1/R2 consensus pair, got {reads:?}");
+        assert_eq!(
+            reads.iter().filter(|(is_r1, _, _)| *is_r1).count(),
+            1,
+            "{context}: the pair must be exactly one consensus R1 and one consensus R2, got \
+             {reads:?}"
+        );
+        for (_, molecule, bases) in reads {
+            assert_eq!(
+                molecule, "1",
+                "{context}: consensus must carry the input molecule's id, got {molecule}"
+            );
+            assert!(
+                expected_bases.contains(bases),
+                "{context}: consensus bases {bases:?} must reproduce the molecule's reads (one \
+                 of {expected_bases:?})"
+            );
+        }
+    };
+
+    assert_is_the_molecules_pair(
+        &run("1,1,0", &temp_dir.path().join("single-strand.bam")),
+        "a one-strand molecule with a third --min-reads value of 0",
+    );
+
+    assert!(
+        run("1", &temp_dir.path().join("both-strands.bam")).is_empty(),
+        "a one-strand molecule must still be rejected when both strands are required"
+    );
+
+    // Template-count boundary. The molecule is MOLECULE_DEPTH templates but twice that many
+    // read records, so a threshold in between separates the two readings: at exactly
+    // MOLECULE_DEPTH the molecule must still be emitted, and one above it must be rejected.
+    // An implementation counting records instead of templates would emit in both cases.
+    let at_depth = format!("{MOLECULE_DEPTH},{MOLECULE_DEPTH},0");
+    assert_is_the_molecules_pair(
+        &run(&at_depth, &temp_dir.path().join("at-template-count.bam")),
+        &format!("--min-reads {at_depth} equals the molecule's {MOLECULE_DEPTH} templates"),
+    );
+    let above_depth = format!("{},{},0", MOLECULE_DEPTH + 1, MOLECULE_DEPTH + 1);
+    assert!(
+        run(&above_depth, &temp_dir.path().join("above-template-count.bam")).is_empty(),
+        "--min-reads {above_depth} exceeds the molecule's {MOLECULE_DEPTH} templates, so no \
+         consensus may be emitted -- the {} read records must not count toward the threshold",
+        MOLECULE_DEPTH * 2
+    );
+}
+
+/// An out-of-order `--min-reads` is an argument error, not a mid-run failure.
+///
+/// Both execution paths must reject it before touching the output. That is only
+/// automatic single-threaded, where the caller is constructed up front; `--threads`
+/// mode builds its caller inside the pipeline's per-batch closure, i.e. after the
+/// output BAM has been created, so without an up-front check the same bad value
+/// would surface as a wrapped worker I/O error over a partial file.
+#[rstest]
+fn test_duplex_rejects_out_of_order_min_reads_before_writing_output(
+    #[values(None, Some("2"))] threads: Option<&str>,
+    #[values("1,2,3", "3,1,2")] min_reads: &str,
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    create_duplex_bam(
+        &input_bam,
+        vec![create_single_strand_molecule("1", "ACGTACGT", 30, 100, 3, false)],
+    );
+
+    let mut args = vec![
+        "duplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        min_reads,
+        "--compression-level",
+        "1",
+    ];
+    if let Some(threads) = threads {
+        args.extend_from_slice(&["--threads", threads]);
+    }
+
+    let error = Duplex::try_parse_from(args)
+        .expect("failed to parse duplex args")
+        .execute("fgumi duplex")
+        .expect_err(&format!("--min-reads {min_reads} must be rejected"));
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("min-reads values must be specified high to low"),
+        "--min-reads {min_reads} must fail as an argument error, got: {message}"
+    );
+    assert!(
+        !output_bam.exists(),
+        "--min-reads {min_reads} must be rejected before the output BAM is created, but \
+         {} was left behind",
+        output_bam.display()
+    );
+}
+
+/// Reverse complement, for deriving the source-molecule orientation of a reverse-strand read.
+fn reverse_complement(sequence: &str) -> String {
+    sequence
+        .chars()
+        .rev()
+        .map(|base| match base {
+            'A' => 'T',
+            'C' => 'G',
+            'G' => 'C',
+            'T' => 'A',
+            other => other,
+        })
+        .collect()
+}
+
+/// In single-strand mode a consensus read must be built from the input read of the same
+/// end, for a `/B`-only molecule as much as for a `/A`-only one: consensus R1 from the
+/// molecule's R1s and consensus R2 from its R2s, each in source-molecule orientation.
+///
+/// This matches fgbio, which treats whichever strand group is present as the "AB" group.
+#[rstest]
+fn test_duplex_single_strand_consensus_reads_follow_input_read_ends(
+    #[values(true, false)] is_b_strand: bool,
+    #[values(None, Some("2"))] threads: Option<&str>,
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    // Deliberately not reverse complements of each other, so that "built from R1" and
+    // "built from R2" cannot produce the same bases.
+    let (r1_seq, r2_seq) = ("AAAACCCC", "ACACACAC");
+    let strand = if is_b_strand { 'B' } else { 'A' };
+    let molecule = (0..3)
+        .map(|i| {
+            create_duplex_read_pair_with_sequences(
+                &format!("{strand}_{i}"),
+                &format!("1/{strand}"),
+                r1_seq,
+                r2_seq,
+                30,
+                100,
+                is_b_strand,
+            )
+        })
+        .collect();
+    create_duplex_bam(&input_bam, vec![molecule]);
+
+    let mut args = vec![
+        "duplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1,1,0",
+        "--compression-level",
+        "1",
+    ];
+    if let Some(threads) = threads {
+        args.extend_from_slice(&["--threads", threads]);
+    }
+    Duplex::try_parse_from(args)
+        .expect("failed to parse duplex args")
+        .execute("fgumi duplex")
+        .expect("Duplex command failed");
+
+    // `/A` reads are R1-forward/R2-reverse and `/B` reads the reverse, so the source-molecule
+    // orientation of each end flips with the strand.
+    let (expected_r1, expected_r2) = if is_b_strand {
+        (reverse_complement(r1_seq), r2_seq.to_string())
+    } else {
+        (r1_seq.to_string(), reverse_complement(r2_seq))
+    };
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let _header = reader.read_header().unwrap();
+    let mut seen_r1 = None;
+    let mut seen_r2 = None;
+    for result in reader.records() {
+        let record = result.expect("Failed to read record");
+        let bases: String = record.sequence().iter().map(char::from).collect();
+        if record.flags().is_first_segment() {
+            seen_r1 = Some(bases);
+        } else {
+            seen_r2 = Some(bases);
+        }
+    }
+
+    assert_eq!(
+        seen_r1.as_deref(),
+        Some(expected_r1.as_str()),
+        "consensus R1 must be built from the molecule's R1 reads"
+    );
+    assert_eq!(
+        seen_r2.as_deref(),
+        Some(expected_r2.as_str()),
+        "consensus R2 must be built from the molecule's R2 reads"
+    );
+}
+
+/// Build a `/A` read pair whose mates align over exactly the same reference bases, so the
+/// overlapping-bases consensus has something to correct.
+fn create_fully_overlapping_pair(
+    name: &str,
+    mi_tag: &str,
+    r1_sequence: &str,
+    r2_sequence: &str,
+    quality: u8,
+    ref_start: i32,
+) -> (RawRecord, RawRecord) {
+    assert_eq!(r1_sequence.len(), r2_sequence.len(), "R1 and R2 must be the same length");
+    let read_len = r1_sequence.len();
+    let cigar_op = u32::try_from(read_len).expect("read_len fits u32") << 4;
+    let build = |sequence: &str, read_flags: u16| {
+        let mut b = SamBuilder::new();
+        b.read_name(name.as_bytes())
+            .sequence(sequence.as_bytes())
+            .qualities(&vec![quality; read_len])
+            .flags(read_flags)
+            .ref_id(0)
+            .pos(ref_start - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar_op])
+            .mate_ref_id(0)
+            .mate_pos(ref_start - 1)
+            .template_length(0)
+            .add_string_tag(SamTag::MI, mi_tag.as_bytes());
+        b.build()
+    };
+    (
+        build(r1_sequence, flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE),
+        build(r2_sequence, flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE),
+    )
+}
+
+/// R1's stored bases in the overlap fixture below.
+const OVERLAP_R1_BASES: &str = "ACGTACGT";
+/// R2's stored bases in the overlap fixture below. BAM `SEQ` is stored in reference
+/// orientation, so these ARE R2's reference bases: they disagree with `OVERLAP_R1_BASES`
+/// at the LAST reference base (offset 7), which is the base the overlapping consensus
+/// masks. R2 is `REVERSE`, so its sequencing orientation is the reverse complement
+/// `TCGTACGT` — what the uncorrected consensus emits for R2.
+const OVERLAP_R2_BASES: &str = "ACGTACGA";
+
+/// Write the single-strand overlapping-mates fixture: one `/A` pair whose mates align over
+/// exactly the same reference bases at equal quality but disagree at one of them.
+///
+/// One BAM builder serves both the assertion test and the `#[ignore]`d regen test below,
+/// so the bytes the offline fgbio run consumes are the bytes the command under test reads.
+fn write_overlapping_single_strand_fixture(path: &Path) {
+    let molecule = vec![create_fully_overlapping_pair(
+        "ab_0",
+        "1/A",
+        OVERLAP_R1_BASES,
+        OVERLAP_R2_BASES,
+        30,
+        100,
+    )];
+    create_duplex_bam(path, vec![molecule]);
+}
+
+/// Re-emit the single-strand overlapping-mates fixture BAM for a fresh fgbio capture.
+///
+/// Mirrors `fgumi_consensus`'s `regen_write` helper — writes to `FGUMI_ORACLE_BAM_OUT` when
+/// set, otherwise to a logged temp path — which that crate keeps `pub(crate)`, so it cannot
+/// be shared with this integration test.
+#[test]
+#[ignore = "regen: writes the fixture BAM (set FGUMI_ORACLE_BAM_OUT), then run fgbio on it"]
+fn regen_duplex_single_strand_overlap_fixture() {
+    let path = std::env::var_os("FGUMI_ORACLE_BAM_OUT").map_or_else(
+        || {
+            let (_file, path) = tempfile::NamedTempFile::new()
+                .expect("temp fixture BAM")
+                .keep()
+                .expect("persist temp fixture BAM");
+            path
+        },
+        PathBuf::from,
+    );
+    write_overlapping_single_strand_fixture(&path);
+    eprintln!("wrote fixture BAM to {}", path.display());
+}
+
+/// The overlapping-bases consensus is applied to single-strand molecules too.
+///
+/// It is skipped for groups without both strands on the grounds that no duplex consensus
+/// can be built from them — which stops being true once the third `--min-reads` value is 0.
+///
+/// Both the corrected and uncorrected outputs are pinned to a real fgbio run on this exact
+/// fixture rather than to a "contains an N" predicate, so a masking rule that differs from
+/// fgbio in WHICH base it masks, or in what it leaves behind, is caught. Oracle provenance
+/// — fgbio `4.1.0`, on the BAM `regen_duplex_single_strand_overlap_fixture` emits:
+///
+/// ```text
+/// fgbio CallDuplexConsensusReads -i <fixture>.bam -o out.bam -M 1 1 0 \
+///   --consensus-call-overlapping-bases {true,false}
+/// samtools view out.bam   # SEQ of the R1 (0x40) and R2 (0x80) records
+/// ```
+#[rstest]
+fn test_duplex_single_strand_mode_applies_overlapping_consensus(
+    #[values(None, Some("2"))] threads: Option<&str>,
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+
+    write_overlapping_single_strand_fixture(&input_bam);
+
+    // Each consensus record as `(is_r1, bases, qualities)`. Qualities are part of the pinned
+    // identity: the overlapping consensus combines the mates' evidence where they AGREE,
+    // which raises the consensus quality, so bases alone would not catch a correction that
+    // masked the right base but mis-weighted the rest.
+    let consensus_reads = |overlapping: &str, output_bam: &Path| -> Vec<(bool, String, String)> {
+        let mut args = vec![
+            "duplex",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--min-reads",
+            "1,1,0",
+            "--consensus-call-overlapping-bases",
+            overlapping,
+            "--compression-level",
+            "1",
+        ];
+        if let Some(threads) = threads {
+            args.extend_from_slice(&["--threads", threads]);
+        }
+        Duplex::try_parse_from(args)
+            .expect("failed to parse duplex args")
+            .execute("fgumi duplex")
+            .expect("Duplex command failed");
+
+        let mut reader = bam::io::Reader::new(fs::File::open(output_bam).unwrap());
+        let _header = reader.read_header().unwrap();
+        let mut reads: Vec<(bool, String, String)> = reader
+            .records()
+            .map(|result| {
+                let record = result.expect("Failed to read record");
+                let bases: String = record.sequence().iter().map(char::from).collect();
+                // Render qualities as the printable SAM characters the captured fgbio
+                // `samtools view` output shows, so expected and actual read alike.
+                let quals: String =
+                    record.quality_scores().as_ref().iter().map(|&q| char::from(q + 33)).collect();
+                (record.flags().is_first_segment(), bases, quals)
+            })
+            .collect();
+        reads.sort_by_key(|(is_r1, _, _)| !*is_r1);
+        reads
+    };
+
+    // fgbio's captured output. The mates disagree at the LAST reference base, which the
+    // overlapping consensus masks to N at qual 2 in both mates. In sequencing orientation
+    // that lands at the end of R1 (forward) and at the start of R2 (reverse), and fgbio
+    // treats the two ends differently: the leading no-call survives as an `N` with depth 0,
+    // while the trailing one is trimmed, leaving R1 one base shorter than R2. Confirmed by
+    // running the same fgbio command on a fixture that disagrees at the FIRST reference
+    // base instead, which swaps the two records' shapes exactly.
+    let corrected = consensus_reads("true", &temp_dir.path().join("corrected.bam"));
+    assert_eq!(
+        corrected,
+        vec![
+            (true, "ACGTACG".to_string(), "HHHHHHH".to_string()),
+            (false, "NCGTACGT".to_string(), "#HHHHHHH".to_string()),
+        ],
+        "corrected single-strand output must match the captured fgbio 4.1.0 run"
+    );
+
+    // Without the correction each mate is consensus-called on its own, so both keep all
+    // eight bases -- R2 reverse-complemented into sequencing orientation -- and the quality
+    // stays at what one Q30 read supports rather than the combined value above.
+    let uncorrected = consensus_reads("false", &temp_dir.path().join("uncorrected.bam"));
+    assert_eq!(
+        uncorrected,
+        vec![
+            (true, "ACGTACGT".to_string(), ">>>>>>>>".to_string()),
+            (false, "TCGTACGT".to_string(), ">>>>>>>>".to_string()),
+        ],
+        "uncorrected single-strand output must match the captured fgbio 4.1.0 run"
+    );
 }
 
 /// The reported `consensus_reads_emitted` must equal the number of consensus records

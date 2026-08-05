@@ -323,6 +323,76 @@ pub struct DuplexConsensusCaller {
     reason = "consensus calling uses numeric casts for quality/position math and has domain-specific variable names"
 )]
 impl DuplexConsensusCaller {
+    /// The `YX` (less-covered strand) minimum implied by `min_reads`.
+    ///
+    /// fgbio pads `--min-reads` to three values by repeating the last
+    /// (`padTo(3, last)`), so the `YX` threshold is the third value when one was
+    /// given and the last value otherwise. Returns `None` only for an empty
+    /// slice, which [`Self::new`] rejects.
+    #[must_use]
+    pub fn min_yx_reads_for(min_reads: &[usize]) -> Option<usize> {
+        min_reads.get(2).or_else(|| min_reads.last()).copied()
+    }
+
+    /// Whether `min_reads` lets a molecule observed on only one strand still
+    /// yield a consensus — fgbio's `-M 1 1 0` single-strand mode, i.e. a `YX`
+    /// minimum of 0.
+    ///
+    /// Callers that need this answer before a caller exists (the CLI's
+    /// overlapping-consensus gate, and the threaded path, which decides before
+    /// the per-batch caller is built) must go through here rather than
+    /// re-deriving the padding rule, so the gate cannot drift from the
+    /// `min_yx_reads` [`Self::new`] actually applies.
+    #[must_use]
+    pub fn allows_single_strand_consensus(min_reads: &[usize]) -> bool {
+        Self::min_yx_reads_for(min_reads) == Some(0)
+    }
+
+    /// Validates `min_reads` against the rule [`Self::new`] applies: 1-3 values,
+    /// ordered high to low (`total >= XY >= YX`) once fgbio's `padTo(3, last)`
+    /// has filled the missing slots. No lower bound is imposed, matching fgbio.
+    ///
+    /// [`Self::new`] delegates here, so a caller that must reject bad input
+    /// *before* a caller exists can fail fast without re-deriving the rule. The
+    /// CLI's `--threads` path is exactly that case: it builds its per-batch
+    /// caller inside the pipeline's process closure, i.e. after the output BAM
+    /// has already been created, so an ordering violation caught only there
+    /// surfaces as a wrapped I/O error from a worker and leaves a partial file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `min_reads` is empty, has more than 3 values, or the
+    /// values are not in decreasing order (`total >= XY >= YX`).
+    pub fn validate_min_reads(min_reads: &[usize]) -> Result<()> {
+        // `min_yx_reads_for` is `None` only for an empty slice, so binding it here rather
+        // than unwrapping below keeps the emptiness check in one place.
+        let (Some(&min_total_reads), Some(&last), Some(min_yx_reads)) =
+            (min_reads.first(), min_reads.last(), Self::min_yx_reads_for(min_reads))
+        else {
+            anyhow::bail!("min_reads parameter must have at least 1 value");
+        };
+        if min_reads.len() > 3 {
+            anyhow::bail!(
+                "min_reads parameter must have 1-3 values (total, [XY, [YX]]), got {} values",
+                min_reads.len()
+            );
+        }
+
+        // fgbio's `padTo(3, last)`: the missing slots repeat the last value given.
+        let min_xy_reads = min_reads.get(1).copied().unwrap_or(last);
+
+        // Validate min_reads ordering: yx <= xy <= total (matching fgbio)
+        // For depth thresholds it's required that yx <= xy <= total
+        if min_xy_reads > min_total_reads {
+            anyhow::bail!("min-reads values must be specified high to low (total >= XY)");
+        }
+        if min_yx_reads > min_xy_reads {
+            anyhow::bail!("min-reads values must be specified high to low (XY >= YX)");
+        }
+
+        Ok(())
+    }
+
     /// Creates a new duplex consensus caller
     ///
     /// # Arguments
@@ -370,31 +440,17 @@ impl DuplexConsensusCaller {
         error_rate_pre_umi: u8,
         error_rate_post_umi: u8,
     ) -> Result<Self> {
+        // Arity and ordering both live in `validate_min_reads` so the CLI can apply the
+        // same rule before any output exists.
+        Self::validate_min_reads(&min_reads)?;
+
         // Parse min_reads vector like fgbio: padTo(3, last)
         // [total, XY, YX] where XY >= YX (larger strand, smaller strand)
-        if min_reads.is_empty() {
-            anyhow::bail!("min_reads parameter must have at least 1 value");
-        }
-        if min_reads.len() > 3 {
-            anyhow::bail!(
-                "min_reads parameter must have 1-3 values (total, [XY, [YX]]), got {} values",
-                min_reads.len()
-            );
-        }
-
-        let last = *min_reads.last().expect("expected a last item");
+        let last = *min_reads.last().expect("min_reads was validated non-empty above");
         let min_total_reads = min_reads[0];
         let min_xy_reads = min_reads.get(1).copied().unwrap_or(last);
-        let min_yx_reads = min_reads.get(2).copied().unwrap_or(last);
-
-        // Validate min_reads ordering: yx <= xy <= total (matching fgbio)
-        // For depth thresholds it's required that yx <= xy <= total
-        if min_xy_reads > min_total_reads {
-            anyhow::bail!("min-reads values must be specified high to low (total >= XY)");
-        }
-        if min_yx_reads > min_xy_reads {
-            anyhow::bail!("min-reads values must be specified high to low (XY >= YX)");
-        }
+        let min_yx_reads =
+            Self::min_yx_reads_for(&min_reads).expect("min_reads was validated non-empty above");
 
         // Create single-strand consensus caller with min_reads=1 (matching fgbio)
         // Filtering happens at duplex level based on input read counts, not at SS level
@@ -2147,7 +2203,31 @@ impl DuplexConsensusCaller {
                     let duplex_r1 = Self::duplex_consensus(Some(r1_a), None, None);
                     let duplex_r2 = Self::duplex_consensus(Some(r2_a), None, None);
 
-                    if let (Some(dr1), Some(dr2)) = (duplex_r1, duplex_r2) {
+                    // Re-check the thresholds against the post-filter depths, as the
+                    // both-strand arm does: `has_minimum_number_of_reads` above ran on the
+                    // raw pre-filter counts, and `filter_by_alignment` can drop reads after
+                    // it passed. Without this a group whose surviving depth falls below
+                    // `--min-reads` still emits a consensus. Falls through to the rejection
+                    // at the end of the function, which records `InsufficientReads`.
+                    //
+                    // fgbio applies its equivalent (`duplexHasMinimumNumberOfReads`) to
+                    // every emitted consensus, single-strand included
+                    // (`DuplexConsensusCaller.scala:221`), for exactly this reason; before
+                    // this PR `min_yx_reads == 0` was unreachable, so the gap was dormant.
+                    if let (Some(dr1), Some(dr2)) = (duplex_r1, duplex_r2)
+                        && Self::duplex_consensus_has_minimum_reads(
+                            &dr1,
+                            min_total_reads,
+                            min_xy_reads,
+                            min_yx_reads,
+                        )
+                        && Self::duplex_consensus_has_minimum_reads(
+                            &dr2,
+                            min_total_reads,
+                            min_xy_reads,
+                            min_yx_reads,
+                        )
+                    {
                         let empty: &[&RawRecord] = &[];
                         Self::duplex_read_into(
                             &mut builder,
@@ -2191,17 +2271,37 @@ impl DuplexConsensusCaller {
             (None, None, Some(ref r1_b), Some(ref r2_b)) => {
                 // Only BA strand - check if single-strand consensus is allowed.
                 //
-                // Mirrors fgbio's mapping where full-duplex output R1 combines AB-R1
-                // with BA-R2 and output R2 combines AB-R2 with BA-R1 (AB-R1 and BA-R2
-                // sequence the same physical strand, as do AB-R2 and BA-R1). When AB
-                // is absent, output R1 therefore derives from BA-R2 and output R2 from
-                // BA-R1. BA is passed in the BA slot so is_ba_only=true is preserved
-                // and methylation tags are emitted as bm/bu/bt.
+                // Each consensus read is built from the input reads of the same end, as in
+                // the AB-only arm above and as fgbio does: with one strand group present it
+                // treats that group as "AB", so output R1 comes from its R1s and output R2
+                // from its R2s. Mapping output R1 from BA-R2 instead -- to keep output R1 on
+                // the physical strand that AB-R1 would have sequenced -- would be the more
+                // strand-consistent choice, but it puts the opposite end of the molecule in
+                // R1 for `/B`-only molecules than for every other molecule class, and it
+                // does not reproduce fgbio.
+                //
+                // BA is still passed in the BA slot so is_ba_only=true is preserved and the
+                // per-strand methylation tags are emitted as bm/bu/bt: that flag records
+                // which strand *group* the bases came from, which is unaffected by the end.
                 if min_yx_reads == 0 {
-                    let duplex_r1 = Self::duplex_consensus(None, Some(r2_b), None);
-                    let duplex_r2 = Self::duplex_consensus(None, Some(r1_b), None);
+                    let duplex_r1 = Self::duplex_consensus(None, Some(r1_b), None);
+                    let duplex_r2 = Self::duplex_consensus(None, Some(r2_b), None);
 
-                    if let (Some(dr1), Some(dr2)) = (duplex_r1, duplex_r2) {
+                    // Post-filter threshold re-check, as in the AB-only arm above.
+                    if let (Some(dr1), Some(dr2)) = (duplex_r1, duplex_r2)
+                        && Self::duplex_consensus_has_minimum_reads(
+                            &dr1,
+                            min_total_reads,
+                            min_xy_reads,
+                            min_yx_reads,
+                        )
+                        && Self::duplex_consensus_has_minimum_reads(
+                            &dr2,
+                            min_total_reads,
+                            min_xy_reads,
+                            min_yx_reads,
+                        )
+                    {
                         let empty: &[&RawRecord] = &[];
                         Self::duplex_read_into(
                             &mut builder,
@@ -2211,7 +2311,7 @@ impl DuplexConsensusCaller {
                             ReadType::R1,
                             &base_mi,
                             empty,
-                            &filtered_ba_r2_raws,
+                            &filtered_ba_r1_raws,
                             produce_per_base_tags,
                             read_name_prefix,
                             read_group_id,
@@ -2228,7 +2328,7 @@ impl DuplexConsensusCaller {
                             ReadType::R2,
                             &base_mi,
                             empty,
-                            &filtered_ba_r1_raws,
+                            &filtered_ba_r2_raws,
                             produce_per_base_tags,
                             read_name_prefix,
                             read_group_id,
@@ -3231,6 +3331,63 @@ mod tests {
         assert!(strand.is_none(), "Should return None for MI without /suffix");
     }
 
+    /// The CLI gates overlapping-base consensus on
+    /// `DuplexConsensusCaller::allows_single_strand_consensus` before any caller
+    /// exists, so that helper has to agree with the `min_yx_reads` a constructed
+    /// caller actually applies. Asserting against the built caller's field is
+    /// what makes the two impossible to drift apart: a change to either padding
+    /// rule alone fails here.
+    #[rstest]
+    #[case::one_value_padded(&[1], 1)]
+    #[case::one_value_zero_padded(&[0], 0)]
+    #[case::two_values_last_repeated(&[3, 1], 1)]
+    #[case::two_values_zero_repeated(&[1, 0], 0)]
+    #[case::three_values_single_strand(&[1, 1, 0], 0)]
+    #[case::three_values_both_strands(&[2, 1, 1], 1)]
+    fn test_min_yx_reads_for_matches_the_constructed_caller(
+        #[case] min_reads: &[usize],
+        #[case] expected_min_yx_reads: usize,
+    ) {
+        assert_eq!(
+            DuplexConsensusCaller::min_yx_reads_for(min_reads),
+            Some(expected_min_yx_reads),
+            "helper padded {min_reads:?} to the wrong YX threshold"
+        );
+
+        let caller = DuplexConsensusCaller::new(
+            "consensus".to_string(),
+            "RG1".to_string(),
+            min_reads.to_vec(),
+            20,
+            false,
+            false,
+            None,
+            None,
+            false,
+            45,
+            40,
+        )
+        .expect("valid min_reads");
+        assert_eq!(
+            caller.min_yx_reads, expected_min_yx_reads,
+            "caller's YX threshold diverged from the helper for {min_reads:?}"
+        );
+        assert_eq!(
+            DuplexConsensusCaller::allows_single_strand_consensus(min_reads),
+            caller.min_yx_reads == 0,
+            "single-strand gate disagrees with the caller's YX threshold for {min_reads:?}"
+        );
+    }
+
+    /// `min_reads` is rejected as empty by `new`, so the helper's only `None`
+    /// case is unreachable in production; pin it anyway so a future caller that
+    /// skips the emptiness check gets `None` rather than a panic.
+    #[test]
+    fn test_min_yx_reads_for_is_none_when_min_reads_is_empty() {
+        assert_eq!(DuplexConsensusCaller::min_yx_reads_for(&[]), None);
+        assert!(!DuplexConsensusCaller::allows_single_strand_consensus(&[]));
+    }
+
     /// Port of fgbio test: validation exception for invalid min-reads order
     /// Tests that `min_reads` values must be in decreasing order
     #[test]
@@ -3252,6 +3409,50 @@ mod tests {
 
         // fgbio throws ValidationException for invalid min_reads order
         assert!(result.is_err(), "Should fail with invalid min_reads order [1, 2, 3]");
+    }
+
+    /// `validate_min_reads` is what the CLI calls to fail fast, and `new` is what
+    /// actually applies the thresholds, so the two verdicts must never diverge —
+    /// otherwise the `--threads` path would accept a value the workers then reject
+    /// mid-pipeline, over an output BAM that already exists.
+    #[rstest]
+    #[case::single_value(&[1], true)]
+    #[case::single_zero(&[0], true)]
+    #[case::descending(&[3, 2, 1], true)]
+    #[case::equal_values(&[2, 2, 2], true)]
+    #[case::single_strand_mode(&[1, 1, 0], true)]
+    #[case::two_value_form(&[3, 2], true)]
+    #[case::zero_in_two_value_form(&[3, 0], true)]
+    #[case::empty(&[], false)]
+    #[case::too_many_values(&[4, 3, 2, 1], false)]
+    #[case::xy_above_total(&[1, 2, 3], false)]
+    #[case::yx_above_xy(&[3, 1, 2], false)]
+    #[case::xy_above_total_in_two_value_form(&[1, 2], false)]
+    fn test_validate_min_reads_agrees_with_new(#[case] min_reads: &[usize], #[case] valid: bool) {
+        assert_eq!(
+            DuplexConsensusCaller::validate_min_reads(min_reads).is_ok(),
+            valid,
+            "validate_min_reads gave the wrong verdict for {min_reads:?}"
+        );
+
+        let caller = DuplexConsensusCaller::new(
+            "consensus".to_string(),
+            "RG1".to_string(),
+            min_reads.to_vec(),
+            20,
+            false,
+            false,
+            None,
+            None,
+            false,
+            45,
+            40,
+        );
+        assert_eq!(
+            caller.is_ok(),
+            valid,
+            "new() disagreed with validate_min_reads for {min_reads:?}"
+        );
     }
 
     /// Port of fgbio test: "count errors against the actual consensus base, before it is masked to N"
@@ -6375,11 +6576,15 @@ mod tests {
         Ok(())
     }
 
-    /// Regression test: BA-only consensus must map output R1 to BA-R2 and output
-    /// R2 to BA-R1, matching the fgbio full-duplex pairing (AB-R1 + BA-R2 → R1,
-    /// AB-R2 + BA-R1 → R2). AB-R1 and BA-R2 sequence the same physical strand, as
-    /// do AB-R2 and BA-R1, so a BA-only group should emit BA-R2 under the R1 slot
-    /// and BA-R1 under the R2 slot.
+    /// Regression test: BA-only consensus must map output R1 to BA-R1 and output R2 to
+    /// BA-R2, i.e. each output read is built from the input reads of the same end.
+    ///
+    /// The full-duplex pairing (AB-R1 + BA-R2 → R1, AB-R2 + BA-R1 → R2) holds only while
+    /// both strand groups are present. fgbio does not extend it to a lone group: it takes
+    /// the sole group as its "AB" side, so output R1 comes from that group's R1s whether
+    /// it is `/A` or `/B`. Mapping BA-R2 → R1 keeps output R1 on a single physical strand
+    /// across molecules, but places the opposite end of the molecule in R1 for `/B`-only
+    /// molecules and does not reproduce fgbio.
     #[test]
     fn test_duplex_ba_only_mate_pair_mapping() -> Result<()> {
         let mut caller = DuplexConsensusCaller::new(
@@ -6456,13 +6661,169 @@ mod tests {
             .expect("Should have a LAST_SEGMENT record");
 
         assert_eq!(
-            r1.bases, b"AAAAAAAAAA",
-            "Output R1 bases should match BA-R2 consensus (AAAAAAAAAA)"
+            r1.bases, b"CCCCCCCCCC",
+            "Output R1 bases should match BA-R1 consensus (CCCCCCCCCC)"
         );
         assert_eq!(
-            r2.bases, b"CCCCCCCCCC",
-            "Output R2 bases should match BA-R1 consensus (CCCCCCCCCC)"
+            r2.bases, b"AAAAAAAAAA",
+            "Output R2 bases should match BA-R2 consensus (AAAAAAAAAA)"
         );
+
+        Ok(())
+    }
+
+    /// Builds `count` read pairs on one strand group, all with the same CIGAR.
+    ///
+    /// `mi` picks the strand group (`foo/A` or `foo/B`); the flags follow the
+    /// expected orientations (AB-R1 +, AB-R2 -, BA-R1 -, BA-R2 +).
+    fn single_strand_pairs(
+        b: &mut SamBuilder,
+        mi: &[u8],
+        cigar: &[u32],
+        name_prefix: u8,
+        count: u8,
+    ) -> Vec<RawRecord> {
+        let is_ab = mi.ends_with(b"/A");
+        let quals = &[30u8; 10];
+        (0..count)
+            .flat_map(|i| {
+                let name = [name_prefix, b'0' + i];
+                let (r1_flags, r2_flags) = if is_ab {
+                    (
+                        flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE,
+                        flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE,
+                    )
+                } else {
+                    (
+                        flags::PAIRED | flags::FIRST_SEGMENT | flags::REVERSE,
+                        flags::PAIRED | flags::LAST_SEGMENT | flags::MATE_REVERSE,
+                    )
+                };
+                [r1_flags, r2_flags]
+                    .into_iter()
+                    .map(|flg| {
+                        b.clear();
+                        b.ref_id(0)
+                            .pos(99)
+                            .flags(flg)
+                            .mate_ref_id(0)
+                            .mate_pos(99)
+                            .read_name(&name)
+                            .cigar_ops(cigar)
+                            .sequence(b"ACGTACGTAC")
+                            .qualities(quals);
+                        b.add_string_tag(SamTag::MI, mi);
+                        b.add_string_tag(SamTag::RG, b"A");
+                        b.build()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Regression test: the single-strand arms must re-check `--min-reads` against
+    /// the POST-alignment-filter depths, as the both-strand arm does and as fgbio
+    /// does for every molecule.
+    ///
+    /// `has_minimum_number_of_reads` runs on the raw pre-filter counts, and
+    /// `filter_by_alignment` (fgbio's `filterToMostCommonAlignment`) can drop reads
+    /// after it passed — the exact case fgbio's own comment calls out at
+    /// `DuplexConsensusCaller.scala:224` ("Even though we had enough reads going
+    /// into consensus calling, we can lose some in the process (e.g. to CIGAR
+    /// filtering)"). fgbio applies `duplexHasMinimumNumberOfReads` to every emitted
+    /// consensus, so single-strand molecules are not exempt there.
+    ///
+    /// Here five single-strand pairs clear a `5,3,0` threshold on the raw counts,
+    /// but two carry a `5M1I4M` CIGAR that is neither a prefix of nor prefixed by
+    /// `10M`, so the most-common-alignment group keeps only three — below
+    /// `min_total_reads = 5`. Without the re-check the molecule still emitted a
+    /// consensus pair, silently violating the configured threshold. The `3,3,0`
+    /// case is the control: the same three survivors clear that threshold and must
+    /// still be emitted, with `aD` pinning that the pair really was built from the
+    /// three filtered reads rather than all five.
+    #[rstest]
+    #[case::ab_only_below_threshold_after_filtering(b"foo/A", &[5, 3, 0], false)]
+    #[case::ba_only_below_threshold_after_filtering(b"foo/B", &[5, 3, 0], false)]
+    #[case::ab_only_survivors_clear_threshold(b"foo/A", &[3, 3, 0], true)]
+    #[case::ba_only_survivors_clear_threshold(b"foo/B", &[3, 3, 0], true)]
+    fn test_single_strand_rechecks_min_reads_after_alignment_filtering(
+        #[case] mi: &[u8],
+        #[case] min_reads: &[usize],
+        #[case] expect_consensus: bool,
+    ) -> Result<()> {
+        /// Reads surviving `filter_by_alignment`: the three pairs sharing `10M`.
+        const FILTERED_DEPTH: i32 = 3;
+
+        let mut caller = DuplexConsensusCaller::new(
+            "consensus".to_string(),
+            "RG1".to_string(),
+            min_reads.to_vec(),
+            0,
+            false,
+            false,
+            None,
+            None,
+            false,
+            45,
+            40,
+        )?;
+
+        // 10M: [(M, 10)]. 5M1I4M: [(M, 5), (I, 1), (M, 4)] -- neither simplified
+        // CIGAR is a prefix of the other, so they form two alignment groups.
+        let common_cigar = &[encode_op(0, 10)];
+        let odd_cigar = &[encode_op(0, 5), encode_op(1, 1), encode_op(0, 4)];
+        let mut b = SamBuilder::new();
+        let mut reads = single_strand_pairs(&mut b, mi, common_cigar, b'c', 3);
+        reads.extend(single_strand_pairs(&mut b, mi, odd_cigar, b'o', 2));
+
+        let result = caller.consensus_reads(reads)?;
+        let records = ParsedBamRecord::parse_all(&result.data);
+
+        if !expect_consensus {
+            assert_eq!(
+                result.count, 0,
+                "min_reads {min_reads:?} exceeds the alignment-filtered depth of \
+                 {FILTERED_DEPTH}, so the molecule must be rejected"
+            );
+            assert!(records.is_empty(), "rejected molecule must emit no records");
+            return Ok(());
+        }
+
+        assert_eq!(result.count, 2, "min_reads {min_reads:?} is met by the filtered reads");
+        assert_eq!(records.len(), 2);
+
+        let r1 = records
+            .iter()
+            .find(|r| r.flag & flags::FIRST_SEGMENT != 0)
+            .expect("Should have a FIRST_SEGMENT record");
+        let r2 = records
+            .iter()
+            .find(|r| r.flag & flags::LAST_SEGMENT != 0)
+            .expect("Should have a LAST_SEGMENT record");
+
+        for (label, rec) in [("R1", r1), ("R2", r2)] {
+            assert_eq!(
+                rec.get_string_tag(SamTag::MI).as_deref(),
+                Some(b"foo".as_slice()),
+                "{label} should carry the base molecule identifier"
+            );
+            assert_eq!(
+                rec.bases.len(),
+                10,
+                "{label} should span the 10bp the surviving 10M reads cover"
+            );
+            assert_eq!(
+                rec.get_int_tag(SamTag::AD),
+                Some(FILTERED_DEPTH),
+                "{label} aD should count only the alignment-filtered reads"
+            );
+            assert_eq!(
+                rec.get_int_tag(SamTag::BD),
+                Some(0),
+                "{label} bD should be 0: the molecule was observed on one strand"
+            );
+        }
+        assert_eq!(r1.name, r2.name, "both ends should share one consensus read name");
 
         Ok(())
     }
@@ -6567,10 +6928,16 @@ mod fgbio_oracle_tests {
     }
 
     fn duplex_caller() -> DuplexConsensusCaller {
+        duplex_caller_with_min_reads(vec![1])
+    }
+
+    /// The same caller as [`duplex_caller`] with an explicit `--min-reads`, so the
+    /// single-strand fixtures can run at fgbio's `-M 1 1 0`.
+    fn duplex_caller_with_min_reads(min_reads: Vec<usize>) -> DuplexConsensusCaller {
         DuplexConsensusCaller::new(
             "duplex".to_string(),
             "A".to_string(),
-            vec![1],
+            min_reads,
             10,    // min_input_base_quality (fgbio default)
             true,  // produce_per_base_tags (fgbio CLI always emits per-base arrays)
             false, // trim
@@ -6764,6 +7131,273 @@ mod fgbio_oracle_tests {
             ParsedBamRecord::parse_all(&output.data).is_empty(),
             "no consensus records may be emitted when one strand is empty",
         );
+    }
+
+    /// SINGLE-STRAND fixture: `SINGLE_STRAND_PAIRS` read pairs all carrying the SAME
+    /// `MI` strand suffix, so one of the two strand groups is empty and fgbio's
+    /// single-strand mode (`-M 1 1 0`) is what decides whether anything is emitted.
+    ///
+    /// Unlike [`build_duplex_fixture`], R1 and R2 carry DIFFERENT stored bases
+    /// (`R1_BASES` / `R2_BASES`, neither a reverse complement of the other). That is
+    /// what makes the read-end mapping observable: with a lone strand group, fgbio
+    /// treats it as its "AB" side and builds output R1 from that group's R1s
+    /// whichever suffix it carries, so both the `/A`-only and `/B`-only fixtures must
+    /// put `R1_BASES` in output R1. A BA-only arm that instead paired output R1 with
+    /// the group's R2s (the full-duplex `AB-R1 + BA-R2` rule, which does not extend
+    /// to a lone group) would swap the two, and the pinned bases below catch it.
+    ///
+    /// One pair's R1 carries `VARIANT_R1_BASES`, disagreeing at base 0, so the
+    /// per-strand error numerator (`aE`/`ae`) is exercised rather than pinned at 0.
+    /// R2 starts at [`NON_OVERLAP_R2_START`] so FR overlapping-base masking cannot
+    /// reach the injected base (see [`build_duplex_fixture`]). Every read carries an
+    /// `RX` tag so the emitted consensus `RX` is pinned too.
+    fn build_single_strand_fixture(strand_suffix: &str) -> SamBuilder {
+        let mut b = SamBuilder::new();
+        b.set_template_coordinate_sort_order();
+        let (strand1, strand2) = if strand_suffix == "A" {
+            (Strand::Plus, Strand::Minus)
+        } else {
+            (Strand::Minus, Strand::Plus)
+        };
+        let quals = vec![40u8; R1_BASES.len()];
+        for i in 0..SINGLE_STRAND_PAIRS {
+            let r1_bases = if i == 0 { VARIANT_R1_BASES } else { R1_BASES };
+            let _ = b
+                .add_pair()
+                .name(&format!("s{i:07}"))
+                .bases1(r1_bases)
+                .bases2(R2_BASES)
+                .quals1(&quals)
+                .quals2(&quals)
+                .contig(0)
+                .start1(100)
+                .start2(NON_OVERLAP_R2_START)
+                .strand1(strand1)
+                .strand2(strand2)
+                .attr("MI", format!("mol/{strand_suffix}"))
+                .attr("RX", SOURCE_RX)
+                .build();
+        }
+        b
+    }
+
+    /// Read pairs in each single-strand fixture. Three keeps the depths small enough
+    /// to read at a glance while leaving room for one disagreeing read.
+    const SINGLE_STRAND_PAIRS: usize = 3;
+    /// R1's stored bases in the single-strand fixtures.
+    const R1_BASES: &str = "ACGTACGT";
+    /// R2's stored bases: distinct from `R1_BASES` and not its reverse complement, so
+    /// a swapped read-end mapping is visible in the emitted bases.
+    const R2_BASES: &str = "TTGGCCAA";
+    /// One pair's R1 bases, disagreeing with `R1_BASES` at base 0.
+    const VARIANT_R1_BASES: &str = "CCGTACGT";
+    /// The `RX` every source read carries, so the consensus `RX` can be pinned.
+    const SOURCE_RX: &str = "AAAA-CCCC";
+
+    /// fgumi's SINGLE-STRAND duplex output must match a real fgbio run record for
+    /// record: not only the depth/error tags, but the flags, bases, qualities, `MI`
+    /// and `RX` that identify each emitted read, and which tags are emitted at all.
+    ///
+    /// Every other oracle case in this module has both strand groups populated, and
+    /// the remaining single-strand tests in this file either derive their
+    /// expectations from the fgumi input or compare two fgumi execution modes against
+    /// each other. Neither form can catch a single-strand read-end mapping,
+    /// post-filter threshold, or masking rule that differs from fgbio in the same way
+    /// in both places -- hence this independent, offline-pinned oracle.
+    ///
+    /// Oracle provenance -- fgbio `4.1.0`, on the fixture BAM the matching
+    /// `#[ignore]`d `regen_duplex_single_strand_*` test emits (CLI defaults for
+    /// `--error-rate-pre-umi 45 --error-rate-post-umi 40 --min-input-base-quality 10`,
+    /// which is what `duplex_caller_with_min_reads` passes):
+    ///
+    /// ```text
+    /// fgbio CallDuplexConsensusReads -i <fixture>.bam -o out.bam -M 1 1 0
+    /// samtools view out.bam
+    /// ```
+    ///
+    /// Captured output, identical for the `/A`-only and `/B`-only fixtures except for
+    /// the error position noted in the case table (read names elided -- fgbio derives
+    /// the prefix from the read group, fgumi from `--read-name-prefix`):
+    ///
+    /// ```text
+    /// 77  ACGTACGT INNNNNNN aD:i:3 bD:i:0 cD:i:3 aE:f:0.0416667 bE:f:0 cE:f:0.0416667
+    ///     MI:Z:mol aM:i:3 bM:i:0 cM:i:3 RX:Z:AAAA-CCCC ac:Z:ACGTACGT
+    ///     ad:B:s,3,3,3,3,3,3,3,3 ae:B:s,1,0,0,0,0,0,0,0 aq:Z:INNNNNNN
+    /// 141 TTGGCCAA NNNNNNNN aD:i:3 bD:i:0 cD:i:3 aE:f:0 bE:f:0 cE:f:0
+    ///     MI:Z:mol aM:i:3 bM:i:0 cM:i:3 RX:Z:AAAA-CCCC ac:Z:TTGGCCAA
+    ///     ad:B:s,3,3,3,3,3,3,3,3 ae:B:s,0,0,0,0,0,0,0,0 aq:Z:NNNNNNNN
+    /// ```
+    ///
+    /// Methylation tags (`au`/`at`, `bu`/`bt`) are not pinned here: fgbio emits them
+    /// only for a bisulfite/methylation run, which this fixture is not. The `/B`-only
+    /// methylation orientation is covered by
+    /// `test_duplex_ba_only_uses_bottom_strand_methylation_tags`.
+    #[rstest]
+    // The two cases pin the same bases in the same output slots: fgbio takes whichever
+    // lone strand group is present as its "AB" side, so a `/B`-only molecule yields
+    // the same read ends in the same slots a `/A`-only one does. An arm that paired
+    // output R1 with the group's R2s (the full-duplex `AB-R1 + BA-R2` rule, which does
+    // not extend to a lone group) would swap R1 and R2 in the `/B` case alone.
+    //
+    // Only the ERROR POSITION differs, and only because of strand orientation: the
+    // disagreeing base is stored at offset 0 of the variant R1 either way, but the
+    // `/B` fixture's R1s are REVERSE, so fgbio consensus-calls them in sequencing
+    // orientation and the disagreement lands at the far end.
+    #[case::ab_only("A", 0)]
+    #[case::ba_only("B", R1_BASES.len() - 1)]
+    fn duplex_single_strand_matches_fgbio_oracle(
+        #[case] strand_suffix: &str,
+        #[case] error_index: usize,
+    ) {
+        /// fgbio's per-base no-call quality (`N` in the captured `aq`/`SEQ` strings):
+        /// with one disagreeing read out of three the consensus quality is floored.
+        const NO_CALL_QUAL: u8 = b'N' - 33;
+        /// The quality fgbio emits at the one base the three reads disagree on.
+        const DISAGREEMENT_QUAL: u8 = b'I' - 33;
+        /// Reads on the single populated strand, i.e. the pinned `aD`/`aM`/`ad`.
+        const DEPTH: i16 = 3;
+        const _: () = assert!(SINGLE_STRAND_PAIRS == DEPTH as usize);
+        /// `aE` = 1 error / (depth 3 * 8 bases).
+        const AE: f32 = 0.041_666_7;
+
+        let builder = build_single_strand_fixture(strand_suffix);
+        let records = records_from_builder(&builder);
+        let mut caller = duplex_caller_with_min_reads(vec![1, 1, 0]);
+        let output = caller.consensus_reads(records).expect("duplex consensus succeeds");
+        let parsed = ParsedBamRecord::parse_all(&output.data);
+        assert_eq!(parsed.len(), 2, "single-strand duplex emits R1 and R2 consensus records");
+
+        let r1 = parsed
+            .iter()
+            .find(|r| r.flag & flags::FIRST_SEGMENT != 0)
+            .expect("R1 (first-of-pair) consensus present");
+        let r2 = parsed
+            .iter()
+            .find(|r| r.flag & flags::FIRST_SEGMENT == 0)
+            .expect("R2 (second-of-pair) consensus present");
+
+        // Flags 77 / 141: consensus reads are unmapped and in molecule orientation, so
+        // neither REVERSE nor MATE_REVERSE is set even for the `/B`-only fixture.
+        let unmapped_pair = flags::PAIRED | flags::UNMAPPED | flags::MATE_UNMAPPED;
+        assert_eq!(r1.flag, unmapped_pair | flags::FIRST_SEGMENT, "R1 flags (fgbio-pinned)");
+        assert_eq!(r2.flag, unmapped_pair | flags::LAST_SEGMENT, "R2 flags (fgbio-pinned)");
+
+        // Bases and qualities. The lone disagreeing R1 is outvoted, so R1 reproduces
+        // the majority `R1_BASES`; only its quality at `error_index` records the
+        // disagreement.
+        let mut expected_r1_quals = vec![NO_CALL_QUAL; R1_BASES.len()];
+        expected_r1_quals[error_index] = DISAGREEMENT_QUAL;
+        assert_eq!(r1.bases, R1_BASES.as_bytes(), "R1 bases (fgbio-pinned)");
+        assert_eq!(r1.quals, expected_r1_quals, "R1 qualities (fgbio-pinned)");
+        assert_eq!(r2.bases, R2_BASES.as_bytes(), "R2 bases (fgbio-pinned)");
+        assert_eq!(
+            r2.quals,
+            vec![NO_CALL_QUAL; R2_BASES.len()],
+            "R2 qualities (fgbio-pinned): the R2s all agree"
+        );
+
+        // Per-base error array: 1 at the disagreeing base on R1, all-zero on R2.
+        let mut expected_ae_bases = vec![0i16; R1_BASES.len()];
+        expected_ae_bases[error_index] = 1;
+
+        for (label, rec, bases, ae, ae_bases) in [
+            ("R1", r1, R1_BASES, AE, expected_ae_bases),
+            ("R2", r2, R2_BASES, 0.0, vec![0i16; R2_BASES.len()]),
+        ] {
+            assert_eq!(
+                rec.get_string_tag(SamTag::MI).as_deref(),
+                Some(b"mol".as_slice()),
+                "{label} MI (fgbio-pinned): the base molecule id, `/A`-`/B` suffix stripped"
+            );
+            assert_eq!(
+                rec.get_string_tag(SamTag::RX).as_deref(),
+                Some(SOURCE_RX.as_bytes()),
+                "{label} RX (fgbio-pinned): carried over from the source reads"
+            );
+
+            // The populated strand's depths, and the same values on the combined
+            // tags -- with one strand absent, `cD`/`cM` are just `aD`/`aM`.
+            for (tag, name) in
+                [(SamTag::AD, "aD"), (SamTag::AM, "aM"), (SamTag::CD, "cD"), (SamTag::CM, "cM")]
+            {
+                assert_eq!(
+                    rec.get_int_tag(tag),
+                    Some(i32::from(DEPTH)),
+                    "{label} {name} (fgbio-pinned)"
+                );
+            }
+            // The absent strand still gets zero-valued SCALAR tags, matching fgbio.
+            for (tag, name) in [(SamTag::BD, "bD"), (SamTag::BM, "bM")] {
+                assert_eq!(rec.get_int_tag(tag), Some(0), "{label} {name} (fgbio-pinned)");
+            }
+            for (tag, name) in [(SamTag::AE, "aE"), (SamTag::CE, "cE")] {
+                let got =
+                    rec.get_float_tag(tag).unwrap_or_else(|| panic!("{label} {name} present"));
+                assert!(
+                    (got - ae).abs() < 1e-6,
+                    "{label} {name} (fgbio-pinned): expected {ae}, got {got}"
+                );
+            }
+            assert_eq!(rec.get_float_tag(SamTag::BE), Some(0.0), "{label} bE (fgbio-pinned)");
+
+            assert_eq!(
+                rec.get_i16_array_tag(SamTag::AD_BASES),
+                Some(vec![DEPTH; bases.len()]),
+                "{label} ad (fgbio-pinned)"
+            );
+            assert_eq!(
+                rec.get_i16_array_tag(SamTag::AE_BASES),
+                Some(ae_bases),
+                "{label} ae (fgbio-pinned)"
+            );
+            assert_eq!(
+                rec.get_string_tag(SamTag::AC).as_deref(),
+                Some(bases.as_bytes()),
+                "{label} ac (fgbio-pinned): the single-strand consensus bases"
+            );
+            assert_eq!(
+                rec.get_string_tag(SamTag::AQ).as_deref(),
+                Some(rec.quals.iter().map(|q| q + 33).collect::<Vec<_>>().as_slice()),
+                "{label} aq (fgbio-pinned): the single-strand consensus qualities"
+            );
+
+            // Tag SHAPE, not just tag values: with one strand absent fgbio emits NO
+            // per-base array or per-strand string for it. Emitting zero-filled `bd`/
+            // `be`/`bc`/`bq` here would be a silent divergence that value-only
+            // assertions would miss.
+            //
+            // Each accessor matches one BAM aux type, so the absence check has to use
+            // the type the tag is WRITTEN as or it passes vacuously: `bd`/`be` are
+            // `B:s` arrays (`append_i16_array_tag`), `bc`/`bq` are `Z` strings
+            // (`append_string_tag` / `append_phred33_string_tag`).
+            for (tag, name) in [(SamTag::BD_BASES, "bd"), (SamTag::BE_BASES, "be")] {
+                assert!(
+                    rec.get_i16_array_tag(tag).is_none(),
+                    "{label} must NOT carry {name} (fgbio-pinned): the BA strand is absent"
+                );
+            }
+            for (tag, name) in [(SamTag::BC_BASES, "bc"), (SamTag::BQ, "bq")] {
+                assert!(
+                    rec.get_string_tag(tag).is_none(),
+                    "{label} must NOT carry {name} (fgbio-pinned): the BA strand is absent"
+                );
+            }
+        }
+        assert_eq!(r1.name, r2.name, "both ends share one consensus read name");
+    }
+
+    /// Re-emit the `/A`-only single-strand fixture BAM for fgbio.
+    #[test]
+    #[ignore = "regen: writes the fixture BAM (set FGUMI_ORACLE_BAM_OUT), then run fgbio on it"]
+    fn regen_duplex_single_strand_ab_only_fixture() {
+        regen_write(&build_single_strand_fixture("A"));
+    }
+
+    /// Re-emit the `/B`-only single-strand fixture BAM for fgbio.
+    #[test]
+    #[ignore = "regen: writes the fixture BAM (set FGUMI_ORACLE_BAM_OUT), then run fgbio on it"]
+    fn regen_duplex_single_strand_ba_only_fixture() {
+        regen_write(&build_single_strand_fixture("B"));
     }
 
     /// Re-emit the duplex open-interval depth-saturation fixture BAM for fgbio.
