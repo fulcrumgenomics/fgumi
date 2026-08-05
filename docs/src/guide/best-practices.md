@@ -7,9 +7,85 @@ This document describes the recommended best practice pipeline for processing FA
 This pipeline uses only fgumi and a read aligner:
 
 - **fgumi** (version 0.1 or higher)
-- **bwa mem** (version 0.7.17 or higher recommended)
+- a read aligner — one of:
+  - **[bwa-mem3](https://github.com/fg-labs/bwa-mem3)** (version 0.8.0 or higher), a drop-in
+    bwa-mem2 replacement that can write uncompressed BAM (`--bam`) straight into `fgumi zipper`
+  - **bwa mem** (version 0.7.19 or higher recommended)
 
 Unlike fgbio-based pipelines, **no samtools is required** - fgumi provides native `fastq`, `sort`, and `merge` commands.
+
+### Mate Information and Aligner Version
+
+No separate mate-fixing step (`samtools fixmate`, fgbio `SetMateInformation`) is required
+either, for any aligner or aligner version. `fgumi zipper` recomputes mate information for
+every template it emits — `RNEXT`, `PNEXT`, `TLEN`, and the `MC` (mate CIGAR), `MQ` (mate
+mapping quality), and `ms` (mate score) tags — from the alignments themselves, so it does not
+matter whether the aligner wrote those tags. (`ms` is the one exception to "from the alignments
+themselves": it carries the mate's `AS` value, so it is written only when the aligner scored the
+mate with `AS`, which every supported aligner does.)
+
+The version recommendations are primarily about what each aligner emits natively:
+
+- `bwa mem` has written `MC` since 0.7.16 but only added `MQ` in 0.7.18.
+- `bwa-mem3` writes both `MC` and `MQ` by default. `--compat=bwa-mem2`, which shapes output to
+  be byte-identical to bwa-mem2 v2.2.1, suppresses `MQ` (along with the `HN:i` tag and the
+  default `@HD` line); that is safe in this pipeline for the same reason — `fgumi zipper`
+  re-derives `MQ` — and it changes no alignments.
+
+The `bwa mem` floor of 0.7.19 is not about tags at all: 0.7.18 began emitting an internal `@HD`
+line but printed it *after* the `@SQ` block, whereas the SAM specification requires `@HD` to be
+the first header line. 0.7.19 moves it to the top. That is a pure header-correctness fix —
+0.7.19 produces alignments identical to 0.7.17 and 0.7.18 — and it applies whether or not you
+rely on bwa's native mate tags.
+
+Older aligners, and `--compat` runs, still work in the pipeline below, because `fgumi zipper`
+supplies the mate tags regardless.
+
+If you **skip `fgumi zipper`** and feed an externally aligned BAM into the rest of the
+pipeline, mate information must already be correct in that BAM. Of the mate tags, only a
+missing `MC` is caught up front; the rest degrade silently:
+
+- `fgumi group` and `fgumi dedup` **require** `MC` on paired primary reads where both the read
+  and its mate are mapped. A read whose mate position cannot be resolved from `MC` fails the run
+  with an error — *"requires MC tags on paired-end reads. Run `fgumi zipper` to add MC tags
+  before `fgumi group`"* — so a BAM missing `MC` stops at grouping rather than reaching consensus
+  calling.
+- `fgumi group` applies `--min-map-q` to each read's own MAPQ and, when the mate is mapped, to
+  the `MQ` tag. A read with no `MQ` tag skips the mate half of that check silently, so it is no
+  longer filtered on its mate's alignment quality.
+- `fgumi simplex` and `fgumi duplex` clip the bases at each read's 3' end that run past its
+  mate — read-through past the fragment boundary, which is adapter rather than template — and
+  they locate that boundary from the read's own `MC` tag. A read with no `MC` tag gets no clip,
+  so those read-through bases are called into the consensus, silently and without a warning.
+  (`fgumi codec` is unaffected: it reads the boundary from the mate record in hand.)
+
+Correct mate tags are necessary but not sufficient: `fgumi group` and `fgumi dedup` also
+constrain the sort order, and `fgumi dedup` requires a tag that no mate-fixing tool writes.
+
+- Both commands require **template-coordinate sorted** input — the header must advertise
+  `SO:unsorted`, `GO:query`, and `SS:template-coordinate` — so that a template's records are
+  adjacent and position grouping matches the grouping key. (`fgumi group --allow-unmapped` is
+  the one exception: it also accepts merely query-grouped input, since fully unmapped reads are
+  grouped by UMI alone.) Produce that ordering with `fgumi sort --order template-coordinate`.
+- `fgumi dedup` additionally **requires the `tc` tag on every secondary and supplementary
+  read**, and aborts at the end of the run reporting how many lacked it. `fgumi zipper` writes
+  `tc` during the merge of the unmapped and mapped BAMs, unless it is run with
+  `--skip-tc-tags`; `samtools fixmate` and fgbio `SetMateInformation` never write it at all.
+  `samtools sort --template-coordinate` is likewise not a substitute for `fgumi sort`, because
+  it does not consult `tc` when ordering secondary and supplementary reads.
+
+So repairing `MC` and `MQ` alone does not satisfy `fgumi dedup`'s contract: `tc` comes from
+`fgumi zipper`, and a `fgumi sort --order template-coordinate` step is still required afterwards.
+
+Align through `fgumi zipper` — the only route that covers both the mate tags and `tc` — or, if
+you only need grouping and consensus calling, repair the BAM with `samtools fixmate` or fgbio
+`SetMateInformation` instead. Both repair tools need every template's records adjacent in their
+input, so the BAM must be prepared first: name-sort or name-collate it (`samtools sort -n`,
+`samtools collate`) before `samtools fixmate`, and give fgbio `SetMateInformation`
+query-name-sorted or query-name-grouped input — it inspects the header and fails outright if the
+sort order is not `queryname` and the group order is not `query`. Coordinate-sorted input meets
+neither precondition and yields incorrect mate fields. Either way, sort the result with `fgumi
+sort --order template-coordinate` before grouping, deduplication, or consensus calling.
 
 ## Common Configuration Options
 
@@ -147,14 +223,26 @@ fgumi fastq --input unmapped.bam \
   | fgumi zipper --unmapped unmapped.bam --reference ref.fa --output aligned.bam
 ```
 
+With bwa-mem3, add `--bam` so the aligner hands `fgumi zipper` uncompressed BAM instead of SAM
+text:
+
+```bash
+fgumi fastq --input unmapped.bam \
+  | bwa-mem3 mem --bam -t 16 -p -K 150000000 -Y ref.fa - \
+  | fgumi zipper --unmapped unmapped.bam --reference ref.fa --output aligned.bam
+```
+
 Key points:
 - `fgumi fastq` converts BAM to interleaved FASTQ for the aligner
 - `-p` tells bwa mem to expect interleaved paired-end reads
 - `-K 150000000` sets batch size (improves reproducibility)
 - **`-Y` is critical**: Use soft-clipping for supplementary alignments to preserve bases
 - `fgumi zipper` transfers tags from unmapped BAM to aligned reads
+- `fgumi zipper` also recomputes mate information (`RNEXT`, `PNEXT`, `TLEN`, and the `MC`, `MQ`,
+  and `ms` tags), so no `samtools fixmate` / fgbio `SetMateInformation` step is needed even when
+  the aligner does not write those tags
 - `fgumi zipper` accepts SAM or BAM on stdin or `--input`. For best performance, pipe
-  uncompressed BAM from the aligner (e.g. `bwa-mem3 mem --bam=0`); SAM is fine for aligners
+  uncompressed BAM from the aligner (e.g. `bwa-mem3 mem --bam`); SAM is fine for aligners
   that can't emit BAM
 
 For large files, add threading:
