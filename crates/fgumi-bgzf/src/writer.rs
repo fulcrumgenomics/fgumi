@@ -16,6 +16,28 @@ use std::io;
 /// Maximum uncompressed size for a BGZF block (64KB - header/footer overhead).
 pub const BGZF_MAX_BLOCK_SIZE: usize = bgzf::BGZF_BLOCK_SIZE;
 
+/// Cap on the number of compression buffers [`InlineBgzfCompressor`] pools for
+/// reuse.
+///
+/// The pool only has to cover the *compress* side, which takes one buffer at a
+/// time: `compress_current_buffer` pops exactly one per block. The queue on the
+/// other side can be arbitrarily long — `write_all` appends a block per 64 KiB
+/// written — so a drain of many blocks hands back more buffers than the
+/// compressor will ever want at once. The surplus is dropped rather than parked
+/// for the compressor's lifetime, which is what keeps the pool's memory a
+/// function of this constant instead of of how much the caller buffered before
+/// draining.
+pub const MAX_POOLED_BUFFERS: usize = 4;
+
+/// Largest buffer [`InlineBgzfCompressor::recycle_buffer`] will pool.
+///
+/// A block buffer is sized by `Compressor::compress` to
+/// `header + deflate_compress_bound(input) + footer`. That bound exceeds the
+/// input for incompressible data, so a legitimate buffer can run somewhat over
+/// [`BGZF_MAX_BLOCK_SIZE`]; double it so no real block buffer is ever refused,
+/// while still rejecting a wildly oversized `Vec` a caller hands back.
+pub const MAX_POOLED_BUFFER_BYTES: usize = BGZF_MAX_BLOCK_SIZE * 2;
+
 // ============================================================================
 // Block types
 // ============================================================================
@@ -184,6 +206,36 @@ impl InlineBgzfCompressor {
         std::mem::take(&mut self.completed_blocks)
     }
 
+    /// Return a drained block buffer to the internal pool for reuse by a later
+    /// block compression.
+    ///
+    /// Consumers that drive the compressor with [`write_all`](Self::write_all) +
+    /// [`flush`](Self::flush) + [`take_blocks`](Self::take_blocks) (rather than
+    /// [`write_blocks_to`](Self::write_blocks_to), which recycles automatically)
+    /// otherwise leave `buffer_pool` empty, so every block compression allocates
+    /// a fresh output `Vec`. Such a consumer can hand back any block `Vec` it is
+    /// done with via this method to restore the recycling.
+    ///
+    /// The buffer is cleared — but not shrunk, since its capacity is the whole
+    /// point — before being pooled. A buffer is only pooled if the pool has
+    /// room ([`MAX_POOLED_BUFFERS`]) *and* the buffer is a plausible block
+    /// buffer ([`MAX_POOLED_BUFFER_BYTES`]); otherwise it is dropped. Bounding
+    /// the count alone would let one oversized `Vec` handed in by a caller sit
+    /// in the pool for the compressor's lifetime, so the pool's memory is
+    /// bounded on both axes.
+    ///
+    /// Not to be confused with the pipeline's `WorkerCoreState::recycle_buffer`,
+    /// which pools the *uncompressed* worker buffers under a different cap.
+    /// This one pools the compressor's own compressed-block output buffers.
+    pub fn recycle_buffer(&mut self, mut buffer: Vec<u8>) {
+        if self.buffer_pool.len() < MAX_POOLED_BUFFERS
+            && buffer.capacity() <= MAX_POOLED_BUFFER_BYTES
+        {
+            buffer.clear();
+            self.buffer_pool.push(buffer);
+        }
+    }
+
     /// Write all completed compressed blocks directly to output and recycle buffers.
     ///
     /// This is efficient for single-threaded use as it writes blocks directly
@@ -191,14 +243,39 @@ impl InlineBgzfCompressor {
     ///
     /// # Errors
     ///
-    /// Returns an error if writing to the output fails.
+    /// Returns an error if writing to the output fails. The block that failed
+    /// to write, and every block after it, is left in the queue, so they are
+    /// available to **inspect** rather than being silently discarded.
+    ///
+    /// They are *not* safe to replay. [`io::Write::write_all`] loops over
+    /// [`write`](io::Write::write), advancing past each `Ok(n)`, so it can
+    /// commit part of the failing block to `output` before an error surfaces —
+    /// and the whole block is re-queued, not the unwritten remainder. Writing
+    /// the queue again would repeat those bytes inside a gzip member and
+    /// produce a stream no BGZF reader can decode. Treat `output` as
+    /// unrecoverable after this returns an error: the queued blocks are for
+    /// diagnostics, or for writing somewhere new.
     pub fn write_blocks_to<W: io::Write + ?Sized>(&mut self, output: &mut W) -> io::Result<()> {
-        for block in self.completed_blocks.drain(..) {
-            output.write_all(&block.data)?;
-            // Recycle the buffer for reuse
-            let mut buf = block.data;
-            buf.clear();
-            self.buffer_pool.push(buf);
+        // Nothing queued is the common call (a flush with no pending blocks).
+        // Returning here keeps `completed_blocks`'s allocation, which the
+        // `mem::take` below would otherwise hand away and force a realloc on
+        // the next compression.
+        if self.completed_blocks.is_empty() {
+            return Ok(());
+        }
+        // Drain into a temporary so `recycle_buffer` (which borrows `self`
+        // mutably) can be called per block without holding a borrow on
+        // `self.completed_blocks`.
+        let mut remaining = std::mem::take(&mut self.completed_blocks).into_iter();
+        while let Some(block) = remaining.next() {
+            if let Err(e) = output.write_all(&block.data) {
+                self.completed_blocks.push(block);
+                self.completed_blocks.extend(remaining);
+                return Err(e);
+            }
+            // Route the drained buffer through the capped recycle path so the
+            // pool stays bounded, just like the steady-state recycle path.
+            self.recycle_buffer(block.data);
         }
         Ok(())
     }
@@ -209,9 +286,12 @@ impl InlineBgzfCompressor {
             return Ok(());
         }
 
-        // Get buffer from pool or allocate new
+        // Get buffer from pool or allocate new. No clear is needed: the only
+        // thing this buffer is handed to is `Compressor::compress`, which
+        // resizes it from zero before writing (bgzf 0.4's `resize_uninit`
+        // begins with `Vec::clear`). Capacity is what the pool is for, and that
+        // survives.
         let mut compressed_data = self.buffer_pool.pop().unwrap_or_default();
-        compressed_data.clear();
 
         // Compress using bgzf crate's Compressor
         self.compressor
@@ -442,5 +522,170 @@ mod tests {
     #[should_panic(expected = "outside 0..=12")]
     fn test_compress_level_out_of_range_panics() {
         let _ = InlineBgzfCompressor::new(13);
+    }
+
+    // ── Buffer recycling ────────────────────────────────────────────────────
+
+    /// Compress `payload` into one block and hand the compressor back.
+    fn compressor_with_one_block(payload: &[u8]) -> (InlineBgzfCompressor, Vec<CompressedBlock>) {
+        let mut compressor = InlineBgzfCompressor::new(6);
+        compressor.write_all(payload).expect("writing data should succeed");
+        compressor.flush().expect("flushing compressor should succeed");
+        let blocks = compressor.take_blocks();
+        (compressor, blocks)
+    }
+
+    /// A `take_blocks` consumer keeps ownership of every block buffer, so the
+    /// pool is left empty and each subsequent compression allocates afresh.
+    /// Handing a drained buffer back must restore the recycling.
+    #[test]
+    fn test_recycle_buffer_repopulates_the_pool() {
+        let (mut compressor, blocks) = compressor_with_one_block(b"payload for one block");
+        assert!(
+            compressor.buffer_pool.is_empty(),
+            "take_blocks should leave the pool empty, that is the gap recycle_buffer closes"
+        );
+
+        let buffer = blocks.into_iter().next().expect("one block").data;
+        let recycled_capacity = buffer.capacity();
+        // The identity of the allocation, not just of the `Vec`. Everything
+        // below is about this exact heap block being handed back to the next
+        // compression rather than freed and replaced.
+        let recycled_ptr = buffer.as_ptr();
+        compressor.recycle_buffer(buffer);
+        assert_eq!(compressor.buffer_pool.len(), 1);
+        // The allocation is what is being reused, so the capacity has to survive
+        // pooling -- a `shrink_to_fit` alongside the `clear` would satisfy every
+        // other assertion here while deleting the point of the method.
+        assert_eq!(
+            compressor.buffer_pool[0].capacity(),
+            recycled_capacity,
+            "pooling must retain the buffer's allocation, not just the buffer"
+        );
+
+        // The next compression must consume the pooled buffer rather than
+        // allocate. Asserting the pool merely drained would also pass for a
+        // pop-and-discard implementation, so pin the produced block to the
+        // recycled allocation instead.
+        compressor.write_all(b"a second block").expect("writing data should succeed");
+        compressor.flush().expect("flushing compressor should succeed");
+        assert!(compressor.buffer_pool.is_empty(), "the pooled buffer should have been taken");
+        let next = compressor.take_blocks();
+        assert_eq!(
+            next[0].data.as_ptr(),
+            recycled_ptr,
+            "the new block should be built in the recycled allocation, not a fresh one"
+        );
+    }
+
+    /// The pool is bounded on capacity as well as count: a caller handing back
+    /// an outsized `Vec` must not park that allocation for the compressor's
+    /// lifetime. A real block buffer (~64 KiB) is well under the limit, so this
+    /// rejects only what it is meant to.
+    #[test]
+    fn test_recycle_buffer_refuses_an_oversized_buffer() {
+        let (mut compressor, blocks) = compressor_with_one_block(b"payload for one block");
+        let real = blocks.into_iter().next().expect("one block").data;
+        assert!(
+            real.capacity() <= MAX_POOLED_BUFFER_BYTES,
+            "a real block buffer ({} bytes) must still be poolable",
+            real.capacity()
+        );
+
+        compressor.recycle_buffer(Vec::with_capacity(MAX_POOLED_BUFFER_BYTES + 1));
+        assert!(compressor.buffer_pool.is_empty(), "an oversized buffer should not be pooled");
+
+        compressor.recycle_buffer(real);
+        assert_eq!(compressor.buffer_pool.len(), 1, "a real block buffer should be pooled");
+    }
+
+    /// `write_blocks_to` is the other path into the pool, and the line this
+    /// change rewrote. It must recycle what it drains, and honour the same cap
+    /// as the explicit entry point -- a drain of many blocks cannot grow the
+    /// pool past it.
+    #[test]
+    fn test_write_blocks_to_recycles_up_to_the_cap() {
+        // More blocks than the cap, so both halves of the behaviour are visible.
+        let payload = vec![b'x'; BGZF_MAX_BLOCK_SIZE * (MAX_POOLED_BUFFERS + 2)];
+        let mut compressor = InlineBgzfCompressor::new(6);
+        compressor.write_all(&payload).expect("writing data should succeed");
+        compressor.flush().expect("flushing compressor should succeed");
+        let queued = compressor.completed_blocks.len();
+        assert!(queued > MAX_POOLED_BUFFERS, "need more than {MAX_POOLED_BUFFERS} blocks");
+        assert!(compressor.buffer_pool.is_empty(), "pool starts empty");
+
+        let mut sink = Vec::new();
+        compressor.write_blocks_to(&mut sink).expect("writing blocks should succeed");
+
+        assert!(compressor.completed_blocks.is_empty(), "every block should have been written");
+        assert_eq!(
+            compressor.buffer_pool.len(),
+            MAX_POOLED_BUFFERS,
+            "draining {queued} blocks should fill the pool to the cap and drop the surplus"
+        );
+    }
+
+    /// A consumer that hands back more buffers than the compressor can use
+    /// must not grow the pool without limit; surplus buffers are dropped.
+    #[test]
+    fn test_recycle_buffer_bounds_the_pool() {
+        let (mut compressor, _blocks) = compressor_with_one_block(b"payload for one block");
+        for _ in 0..32 {
+            compressor.recycle_buffer(vec![0u8; 1024]);
+        }
+        assert_eq!(
+            compressor.buffer_pool.len(),
+            MAX_POOLED_BUFFERS,
+            "pool should stop growing at the cap"
+        );
+    }
+
+    /// A sink that accepts `accept` bytes total and then fails, so a
+    /// multi-block `write_blocks_to` fails partway through.
+    struct ShortSink {
+        accept: usize,
+    }
+
+    impl io::Write for ShortSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if buf.len() > self.accept {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "sink is full"));
+            }
+            self.accept -= buf.len();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// On a write failure, the unwritten blocks must stay queued. Draining them
+    /// into the void would lose compressed output with no way for the caller to
+    /// notice, since the error says nothing about how far the write got.
+    #[test]
+    fn test_write_blocks_to_keeps_unwritten_blocks_on_error() {
+        // Two full blocks, then a sink that has room for the first one only.
+        let payload = vec![b'x'; BGZF_MAX_BLOCK_SIZE * 2];
+        let mut compressor = InlineBgzfCompressor::new(6);
+        compressor.write_all(&payload).expect("writing data should succeed");
+        compressor.flush().expect("flushing compressor should succeed");
+        let first_block_len = compressor.completed_blocks[0].data.len();
+        let queued = compressor.completed_blocks.len();
+        assert!(queued >= 2, "expected at least two blocks, got {queued}");
+
+        let mut sink = ShortSink { accept: first_block_len };
+        let err = compressor
+            .write_blocks_to(&mut sink)
+            .expect_err("the sink should reject the second block");
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+        // Identity, not just the count: a queue of the right length holding the
+        // wrong blocks (say, the tail restored but the failing block dropped)
+        // loses exactly the output this behaviour exists to preserve. Serials
+        // are contiguous from 0, so the retained queue must start at 1 and run
+        // to the end.
+        let retained: Vec<u64> = compressor.completed_blocks.iter().map(|b| b.serial).collect();
+        let expected: Vec<u64> = (1..u64::try_from(queued).expect("block count fits")).collect();
+        assert_eq!(retained, expected, "the failing block and its tail should still be queued");
     }
 }
