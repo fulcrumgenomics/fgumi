@@ -164,22 +164,26 @@ reviews:
   # constructs. Re-read and update them whenever those modules are refactored or
   # renamed — a stale instruction silently misdirects the reviewer, and the
   # reviewer will never tell you it is chasing a symbol that no longer exists.
-  # Every symbol named below was verified with `git grep` to resolve on `main`
-  # at the commit that introduced this revision; re-verify when touching these
-  # modules.
+  # Every symbol named below was verified with `git grep` to resolve at the
+  # commit that introduced this revision; re-verify when touching these modules.
   #
-  # Deliberately NOT listed, because they do not exist on `main` and a glob that
-  # matches nothing is exactly the failure mode above — add an entry in the same
-  # PR that lands the code:
-  #   - `crates/fgumi-pipeline-core/**`, `crates/fgumi-pipeline-io/**` (on
-  #     `feat-runall`; the byte-bound and unbounded-drain rules in the
-  #     `unified_pipeline` entry apply to them verbatim once merged)
+  # All three pipeline paths are listed together: issue #330 renames
+  # `src/lib/unified_pipeline` to `src/lib/pipeline` and extracts its engine into
+  # the `fgumi-pipeline-core` crate, so the same instructions apply to whichever
+  # is present. A glob naming only the `src/lib/` homes silently stops reviewing
+  # the engine the day it moves into the crate.
+  #
+  # Not yet listed, and a glob that matches nothing is exactly the failure mode
+  # above — add an entry in the same PR that lands the code:
+  #   - `crates/fgumi-pipeline-io/**` — does not exist here yet; the byte-bound
+  #     and unbounded-drain rules in the pipeline entry apply to it verbatim once
+  #     it lands.
   #   - `crates/fgumi-fmt/**`, `crates/fgumi-cli-common/**`,
-  #     `crates/fgumi-cli-macros/**` (in flight)
-  # `src/lib/pipeline/**` is listed alongside `unified_pipeline` only because
-  # issue #330 renames the latter to the former; today it matches nothing.
+  #     `crates/fgumi-cli-macros/**` — these DO exist here but still have no
+  #     instructions of their own, so they are reviewed by the generic themes
+  #     only.
   path_instructions:
-    - path: "src/lib/{unified_pipeline,pipeline}/**/*.rs"
+    - path: "{src/lib/unified_pipeline,src/lib/pipeline,crates/fgumi-pipeline-core/src}/**/*.rs"
       instructions: >-
         This is the hand-rolled concurrent step pipeline; its bugs are deadlocks,
         lost output, unbounded memory, and panics on malformed input — not style.
