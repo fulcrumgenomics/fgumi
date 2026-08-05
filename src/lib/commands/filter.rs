@@ -48,7 +48,7 @@ use std::time::Instant;
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    build_pipeline_config, parse_bool, serialize_raw_bam_records,
+    build_pipeline_config, parse_bool, reject_colliding_outputs, serialize_raw_bam_records,
 };
 
 /// Filters and masks consensus reads based on various quality metrics.
@@ -292,6 +292,7 @@ impl Command for Filter {
         // Validate the input exists (stdin paths are exempt — the reader
         // streams them in a single pass).
         self.io.validate()?;
+        reject_colliding_outputs(&self.io.output, self.rejects.as_ref(), "--rejects")?;
 
         if let Some(ref reference) = self.reference {
             validate_file_exists(reference, "Reference FASTA")?;

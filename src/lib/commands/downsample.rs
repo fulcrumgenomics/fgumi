@@ -23,7 +23,9 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use crate::commands::command::Command;
-use crate::commands::common::{BamIoOptions, CompressionOptions, parse_bool};
+use crate::commands::common::{
+    BamIoOptions, CompressionOptions, parse_bool, reject_colliding_outputs,
+};
 
 /// Downsample a BAM file by UMI family using streaming.
 ///
@@ -130,6 +132,7 @@ impl Command for Downsample {
         // is exempt from the file-existence check, matching every other streaming
         // command; the BAM reader already handles stdin.
         self.io.validate()?;
+        reject_colliding_outputs(&self.io.output, self.rejects.as_ref(), "--rejects")?;
 
         // Validate fraction
         Self::validate_fraction(self.fraction)?;

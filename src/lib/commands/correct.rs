@@ -90,7 +90,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, RejectsOptions, SchedulerOptions,
-    ThreadingOptions, build_pipeline_config, parse_bool, serialize_raw_bam_records,
+    ThreadingOptions, build_pipeline_config, parse_bool, reject_colliding_outputs,
+    serialize_raw_bam_records,
 };
 
 /// Which SAM tag `correct` operates on.
@@ -466,6 +467,7 @@ impl Command for CorrectUmis {
     /// ```
     fn execute(&self, command_line: &str) -> Result<()> {
         self.validate()?;
+        reject_colliding_outputs(&self.io.output, self.rejects_opts.rejects.as_ref(), "--rejects")?;
 
         let timer = OperationTimer::new("Correcting UMIs");
 

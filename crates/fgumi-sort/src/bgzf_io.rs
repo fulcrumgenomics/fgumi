@@ -174,8 +174,8 @@ impl StagingBuffer {
 /// `compressed_start` is captured *before* the write, so it is the on-disk byte
 /// offset at which this block begins. The BGZF EOF marker is written separately
 /// and is intentionally never passed here (no record references it).
-fn write_block_in_order(
-    writer: &mut BufWriter<std::fs::File>,
+fn write_block_in_order<W: Write>(
+    writer: &mut BufWriter<W>,
     serial: u64,
     data: &[u8],
     compressed_offset: &mut u64,
@@ -196,10 +196,14 @@ fn write_block_in_order(
 ///
 /// Uses a `BTreeMap` as a reorder buffer. When the next expected serial arrives,
 /// writes it immediately. Out-of-order blocks are buffered until their turn.
-/// Releases one permit to `permit_pool` after each block is written to disk,
+/// Releases one permit to `permit_pool` after each block is written out,
 /// unblocking the corresponding `StagingBuffer::flush()` call and bounding the
 /// number of in-flight compressed blocks to the pool capacity.
 /// Writes BGZF EOF marker and flushes when all blocks are received.
+///
+/// Generic over the sink rather than fixed to `File`: spill chunks are always
+/// files, but the sort's *output* may be stdout, which reaches here as the
+/// boxed writer `open_output_writer` hands back.
 ///
 /// When `block_offset_tx` is `Some`, each written block's `(serial,
 /// compressed_start)` is emitted on it (in strict block order) for BAI virtual
@@ -207,11 +211,11 @@ fn write_block_in_order(
 ///
 /// # Errors
 ///
-/// Returns an error if any disk write fails or if a compressed block is missing
+/// Returns an error if any write fails or if a compressed block is missing
 /// (which would silently truncate the output).
 #[allow(clippy::needless_pass_by_value)]
-pub(crate) fn io_writer_loop(
-    mut writer: BufWriter<std::fs::File>,
+pub(crate) fn io_writer_loop<W: Write>(
+    mut writer: BufWriter<W>,
     result_rx: Receiver<CompressResult>,
     buffer_pool: BufferPool,
     permit_pool: Arc<PermitPool>,
@@ -233,8 +237,8 @@ pub(crate) fn io_writer_loop(
     result
 }
 
-fn io_writer_loop_inner(
-    writer: &mut BufWriter<std::fs::File>,
+fn io_writer_loop_inner<W: Write>(
+    writer: &mut BufWriter<W>,
     result_rx: &Receiver<CompressResult>,
     buffer_pool: &BufferPool,
     permit_pool: &Arc<PermitPool>,

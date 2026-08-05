@@ -29,7 +29,7 @@ use fgumi_bam_io::{
 use super::common::{
     AllowUnmappedOptions, BamIoOptions, CompressionOptions, ConsensusCallingOptions,
     QueueMemoryOptions, ReadGroupOptions, RejectsOptions, SchedulerOptions, StatsOptions,
-    ThreadingOptions, build_pipeline_config, serialize_raw_bam_records,
+    ThreadingOptions, build_pipeline_config, reject_colliding_outputs, serialize_raw_bam_records,
 };
 use crate::consensus::codec_caller::{
     CodecConsensusCaller, CodecConsensusError, CodecConsensusOptions, CodecConsensusStats,
@@ -303,6 +303,7 @@ impl Command for Codec {
         // Validate the input exists (stdin paths are exempt — the reader
         // streams them in a single pass).
         self.io.validate()?;
+        reject_colliding_outputs(&self.io.output, self.rejects_opts.rejects.as_ref(), "--rejects")?;
 
         let timer = OperationTimer::new("Calling CODEC consensus");
 

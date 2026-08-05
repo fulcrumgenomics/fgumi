@@ -26,6 +26,7 @@ use crate::validation::validate_input_exists;
 use anyhow::{Result, bail};
 use bytesize::ByteSize;
 use clap::Parser;
+use fgumi_bam_io::is_stdout_path;
 use fgumi_sort::{
     KeyTypesSpec, QuerynameComparator, RawExternalSorter, SortOrder, verify_sort_order,
 };
@@ -365,7 +366,11 @@ pub struct Sort {
 
     /// Write BAM index (.bai) alongside output.
     ///
-    /// Only valid for coordinate sort. The index file will be written to
+    /// Only valid for coordinate sort, and not with output to stdout (`-` /
+    /// `/dev/stdout`): an index needs a seekable file and a sidecar path, so
+    /// that combination is rejected rather than silently skipped.
+    ///
+    /// The index file will be written to
     /// `<output>.bai`. Output BGZF compression stays multi-threaded (scales
     /// with `--threads`); the BAI virtual offsets are recovered from each BGZF
     /// block as it finalizes, so indexing does not serialize compression.
@@ -450,6 +455,15 @@ impl Command for Sort {
         }
         if self.verify && self.write_index {
             bail!("--write-index cannot be used with --verify");
+        }
+        // A BAI is written to a sidecar path beside a seekable file, and a pipe
+        // is neither. Rejected up front rather than at the writer, so the run
+        // fails before streaming a BAM it could never index.
+        if self.write_index && self.output.as_deref().is_some_and(is_stdout_path) {
+            bail!(
+                "--write-index cannot be used with output to stdout: an index requires a \
+                 seekable file, so give --output a path"
+            );
         }
 
         // Validate inputs. Exempt stdin paths (`-` / `/dev/stdin`): the sort

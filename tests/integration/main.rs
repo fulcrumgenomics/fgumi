@@ -51,4 +51,5 @@ mod test_sort_correctness;
 mod test_sort_thread_logging;
 mod test_sort_write_index;
 mod test_streaming_input;
+mod test_streaming_output;
 mod test_zipper_command;

@@ -9,7 +9,7 @@ use crate::sam::SamTag;
 use crate::validation::validate_input_exists;
 use anyhow::Result;
 use clap::Parser;
-use fgumi_bam_io::{create_raw_bam_reader, is_stdin_path};
+use fgumi_bam_io::{create_raw_bam_reader, is_stdin_path, is_stdout_path};
 use fgumi_raw_bam::{
     RawRecord, aux_data_slice, extract_sequence_into, find_string_tag, quality_scores_slice,
     read_name as raw_read_name,
@@ -94,8 +94,10 @@ pub struct Fastq {
     #[arg(short = 'i', long = "input")]
     pub input: PathBuf,
 
-    /// Output FASTQ file. If omitted, the FASTQ stream is written to stdout
-    /// (the default, intended for piping straight to an aligner).
+    /// Output FASTQ file, or `-` / `/dev/stdout` for stdout. If omitted, the
+    /// FASTQ stream is written to stdout (the default, intended for piping
+    /// straight to an aligner). A `.gz`/`.bgz` path is BGZF-compressed; stdout
+    /// is always plain text.
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
 
@@ -302,6 +304,13 @@ fn reject_output_clobbering_input(input: &Path, output: Option<&PathBuf>) -> Res
         return Ok(());
     }
 
+    // Likewise stdout: `-` names a stream, not a file, so it cannot clobber the
+    // input — and a stray `-` file left in the working directory must not make
+    // this guard canonicalise something that is not the destination.
+    if is_stdout_path(output) {
+        return Ok(());
+    }
+
     let same_path = output == input
         || (output.exists() && std::fs::canonicalize(output)? == std::fs::canonicalize(input)?);
     if same_path {
@@ -319,9 +328,12 @@ impl Command for Fastq {
         validate_input_exists(&self.input, "Input BAM")?;
         reject_output_clobbering_input(&self.input, self.output.as_ref())?;
 
-        // Use 64MB buffer for efficient pipe throughput.
-        const BUF_CAPACITY: usize = 64 * 1024 * 1024;
         match &self.output {
+            // `-` and `/dev/stdout` name the stream that omitting `--output`
+            // already writes. Spelling it out is what makes this command follow
+            // the same `-` convention as the rest of the CLI; before, `-o -`
+            // created a regular file called `-`.
+            Some(path) if is_stdout_path(path) => self.write_to_stdout(),
             // A `.gz`/`.bgz` output path must actually be compressed. Writing plain
             // text under a `.gz` name produces a file every downstream tool rejects.
             // BGZF is gzip-compatible, so `zcat`/`gzip -d` read it, and it stays
@@ -336,16 +348,40 @@ impl Command for Fastq {
             }
             Some(path) => {
                 let file = std::fs::File::create(path)?;
-                let mut writer = BufWriter::with_capacity(BUF_CAPACITY, file);
-                self.run_with_writer(&mut writer)
+                let mut writer = BufWriter::with_capacity(FASTQ_BUF_CAPACITY, file);
+                self.run_with_writer(&mut writer)?;
+                // `BufWriter`'s `Drop` flushes but discards the error, so a failed
+                // final write — a full disk here — would leave a truncated FASTQ
+                // behind an exit code of zero. Flush explicitly to report it, as
+                // the `.gz` arm's `finish` already does.
+                writer.flush()?;
+                Ok(())
             }
-            // stdout stays uncompressed: this stream is meant to be piped into an
-            // aligner, which wants plain FASTQ.
-            None => {
-                let mut writer = BufWriter::with_capacity(BUF_CAPACITY, stdout().lock());
-                self.run_with_writer(&mut writer)
-            }
+            None => self.write_to_stdout(),
         }
+    }
+}
+
+/// Output buffer size — 64MB, for efficient pipe throughput.
+const FASTQ_BUF_CAPACITY: usize = 64 * 1024 * 1024;
+
+impl Fastq {
+    /// Writes uncompressed FASTQ to stdout.
+    ///
+    /// Uncompressed regardless of how stdout was asked for: this stream is meant
+    /// to be piped into an aligner, which wants plain FASTQ.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a record cannot be written, or if the final flush
+    /// fails — `EPIPE` when the aligner on the other end exits early. Dropping
+    /// the [`BufWriter`] would swallow that flush error and report success on a
+    /// truncated stream.
+    fn write_to_stdout(&self) -> Result<()> {
+        let mut writer = BufWriter::with_capacity(FASTQ_BUF_CAPACITY, stdout().lock());
+        self.run_with_writer(&mut writer)?;
+        writer.flush()?;
+        Ok(())
     }
 }
 

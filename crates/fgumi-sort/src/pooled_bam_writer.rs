@@ -25,7 +25,7 @@ use crate::codec::SpillCodec;
 use crate::worker_pool::{CompressResult, CompressTarget, PermitPool, SortWorkerPool};
 use anyhow::Result;
 use crossbeam_channel::{Receiver, bounded, unbounded};
-use fgumi_bam_io::BaiBuilder;
+use fgumi_bam_io::{BaiBuilder, is_stdout_path, open_output_writer};
 use fgumi_bgzf::BGZF_MAX_BLOCK_SIZE;
 use noodles::bam::bai;
 use noodles::sam::Header;
@@ -65,13 +65,15 @@ struct IndexState {
 impl PooledBamWriter {
     /// Create a new pooled BAM writer.
     ///
-    /// Opens the output file, writes the BAM header into the initial staging buffer,
-    /// and spawns an I/O writer thread that receives compressed blocks and writes
-    /// them in serial order.
+    /// Opens the output sink through `open_output_writer`, so `-` and
+    /// `/dev/stdout` stream to the pipe rather than creating a regular file with
+    /// that name — a non-seekable sink is accepted here. Writes the BAM header
+    /// into the initial staging buffer, and spawns an I/O writer thread that
+    /// receives compressed blocks and writes them in serial order.
     ///
     /// # Errors
     ///
-    /// Returns an error if the output file cannot be created or the header cannot
+    /// Returns an error if the output sink cannot be opened or the header cannot
     /// be serialized.
     pub fn new(pool: Arc<SortWorkerPool>, path: &Path, header: &Header) -> Result<Self> {
         Self::new_inner(pool, path, header, false)
@@ -84,11 +86,24 @@ impl PooledBamWriter {
     /// [`finish_index`](Self::finish_index). Only meaningful for
     /// coordinate-sorted output.
     ///
+    /// Unlike [`new`](Self::new), `path` must name a regular file: an index is
+    /// only usable against a sink a reader can seek within, and its sidecar is
+    /// named after `path`, so a stdout spelling would build a BAI against a pipe
+    /// and write it to a file literally named `-.bai`. The command layer rejects
+    /// `--write-index` with stdout up front, with an error that names both; this
+    /// guard keeps the invariant attached to the writer that requires it.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the output file cannot be created or the header
-    /// cannot be serialized.
+    /// Returns an error if `path` is a stdout spelling, if the output file
+    /// cannot be created, or if the header cannot be serialized.
     pub fn new_indexing(pool: Arc<SortWorkerPool>, path: &Path, header: &Header) -> Result<Self> {
+        anyhow::ensure!(
+            !is_stdout_path(path),
+            "Cannot build a BAM index while streaming to stdout ({}): an index requires a \
+             seekable output file",
+            path.display()
+        );
         Self::new_inner(pool, path, header, true)
     }
 
@@ -100,8 +115,13 @@ impl PooledBamWriter {
         header: &Header,
         indexing: bool,
     ) -> Result<Self> {
-        let file = std::fs::File::create(path)?;
-        let writer = BufWriter::with_capacity(256 * 1024, file);
+        // `open_output_writer`, not `File::create`: this is the sort's *output*,
+        // so `-` and `/dev/stdout` have to reach the pipe rather than create a
+        // regular file with that name. Every one of the sort's write paths ends
+        // up here — the in-memory write, the k-way merge, and the indexing
+        // variant below — so this is the only place that dispatch is needed.
+        let sink = open_output_writer(path)?;
+        let writer = BufWriter::with_capacity(256 * 1024, sink);
 
         let reorder_capacity = pool.num_workers() * 4;
         let (result_tx, result_rx) = bounded::<CompressResult>(reorder_capacity);
@@ -303,6 +323,7 @@ mod tests {
     use super::*;
     use noodles::sam::header::record::value::Map;
     use noodles::sam::header::record::value::map::ReferenceSequence;
+    use rstest::rstest;
 
     /// Build a minimal test header with a few reference sequences.
     fn test_header() -> Header {
@@ -478,6 +499,43 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, num_records, "record count mismatch");
+
+        if let Ok(pool) = Arc::try_unwrap(pool) {
+            pool.shutdown();
+        }
+    }
+
+    /// `new_indexing` must refuse a stdout spelling rather than build a BAI
+    /// against a pipe and drop it in a file named after the spelling.
+    ///
+    /// The command layer rejects `--write-index` with stdout first, so this is a
+    /// second line of defence for any future caller of this crate: the writer
+    /// that requires a seekable sink is the one that states the requirement.
+    /// Both spellings `is_stdout_path` honours are covered, since a guard that
+    /// caught only `-` would leave `/dev/stdout` writing `/dev/stdout.bai`.
+    #[rstest]
+    #[case::dash("-")]
+    #[case::dev_stdout("/dev/stdout")]
+    fn test_pooled_bam_writer_indexing_rejects_stdout(#[case] spelling: &str) {
+        let header = test_header();
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
+
+        // Matched rather than `expect_err`: the writer is deliberately not
+        // `Debug`, so unwrapping the error out of the `Result` does not compile.
+        let message =
+            match PooledBamWriter::new_indexing(Arc::clone(&pool), Path::new(spelling), &header) {
+                Ok(_) => panic!("indexing must not accept the stdout spelling `{spelling}`"),
+                Err(error) => error.to_string(),
+            };
+        assert!(
+            message.contains("index") && message.contains(spelling),
+            "the error must name both the index and the offending path, got: {message}"
+        );
+
+        // That the *plain* writer still accepts these spellings is asserted by
+        // `declared_stdout_support_holds` in the integration matrix, not here:
+        // constructing one in-process would write BAM bytes to the test runner's
+        // own stdout.
 
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();

@@ -3,7 +3,7 @@
 //! This module provides shared argument structures that can be composed into
 //! command structs using `#[command(flatten)]`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(feature = "simplex")]
 use std::sync::Arc;
 
@@ -15,6 +15,7 @@ use crate::validation::validate_input_exists;
 use bytesize::ByteSize;
 use clap::Args;
 #[cfg(feature = "simplex")]
+use fgumi_bam_io::is_stdout_path;
 use fgumi_consensus::methylation::RefBaseProvider;
 use fgumi_umi::IndexThreshold;
 #[cfg(feature = "simplex")]
@@ -460,6 +461,138 @@ impl RejectsOptions {
     pub fn is_enabled(&self) -> bool {
         self.rejects.is_some()
     }
+}
+
+/// Refuse a secondary output that resolves to the same destination as `--output`.
+///
+/// A command's primary and secondary writers are both opened up front and
+/// written from the same loop, so pointing them at one destination does not make
+/// them take turns — it interleaves two BAMs. How that fails depends on the
+/// destination, and both ways are silent:
+///
+/// - **stdout.** `-` and `/dev/stdout` both resolve to fd 1, where the two
+///   writers share one file description. Every byte lands, but the stream
+///   carries two headers and two EOF blocks and no reader can parse it.
+/// - **A regular file.** Two `File::create` calls give two file *descriptions*
+///   with independent offsets, both starting at zero, so the streams overwrite
+///   each other byte for byte — the worse of the two, since bytes are destroyed
+///   rather than merely reordered. `fgumi correct -o same.bam --rejects same.bam`
+///   exited zero having logged "kept 400 and rejected 0", after which
+///   `samtools view` reported `Invalid BGZF header at offset 392`. The secondary
+///   writer is created eagerly and emits its header at offset 0 whether or not
+///   anything is ever written to it, so this needs no rejected reads to happen.
+///
+/// Both exit zero today, so the combination is rejected before any writer is
+/// opened — `File::create` truncates, and a guard that fired later would already
+/// have clobbered the primary output.
+///
+/// File identity is approximated deliberately. Paths are compared as
+/// `(canonicalized parent, file name)`, which catches `out.bam` against
+/// `./out.bam` or `sub/../out.bam` but not two symlinks onto one target, two
+/// hard links, or one name in two cases on a case-insensitive filesystem. A true
+/// `dev`+`ino` comparison needs both files to exist, and by the time they do both
+/// `File::create` calls have already truncated; closing that gap means moving the
+/// check into the writer layer. See #715, which also covers `--stats`/`--metrics`
+/// sharing a path with `--output`.
+///
+/// The null device is the one exempt destination: it discards every byte, so two
+/// writers on it cannot corrupt each other and `-o /dev/null --rejects /dev/null`
+/// is a legitimate compute-only run. Nothing else is exempt for merely not being
+/// a regular file — a FIFO or `/dev/fd/N` is a *shared* byte stream, where the
+/// two writers append through one file description and interleave two headers,
+/// two block sequences, and two EOF markers into a stream no reader can parse.
+/// That is the same failure as `-o - --rejects -`, so it is rejected the same way.
+///
+/// `secondary_flag` names the offending option in the error, since a command may
+/// have more than one secondary output.
+///
+/// # Errors
+///
+/// Returns an error if `output` and `secondary` both name stdout, or both resolve
+/// to the same destination and that destination is not the null device.
+pub fn reject_colliding_outputs(
+    output: &Path,
+    secondary: Option<&PathBuf>,
+    secondary_flag: &str,
+) -> anyhow::Result<()> {
+    let Some(secondary) = secondary else { return Ok(()) };
+
+    if is_stdout_path(output) || is_stdout_path(secondary) {
+        anyhow::ensure!(
+            !(is_stdout_path(output) && is_stdout_path(secondary)),
+            "--output and {secondary_flag} cannot both write to stdout: the two BAM streams \
+             would interleave into one unreadable stream; give {secondary_flag} a path"
+        );
+        return Ok(());
+    }
+
+    if is_null_device(output) && is_null_device(secondary) {
+        return Ok(());
+    }
+
+    if resolve_output_identity(output) == resolve_output_identity(secondary) {
+        anyhow::bail!(
+            "--output and {secondary_flag} both write to {}: the two BAM streams would \
+             interleave on a shared stream, or overwrite each other byte for byte on a \
+             regular file, and either way nothing can read the result; give \
+             {secondary_flag} a different path",
+            secondary.display()
+        );
+    }
+    Ok(())
+}
+
+/// Whether `path` is the null device, the one destination two writers can share.
+///
+/// Identity comes from `stat`, not from spelling: a path is the null device when
+/// it resolves to the same `(device, inode)` as `/dev/null`, which also accepts
+/// `/dev/./null` and a symlink onto it. A path that does not exist, or that
+/// cannot be stat'd, is not the null device — the usual case for an output — so
+/// the collision check below still runs rather than being skipped on a failed
+/// `stat`.
+///
+/// Off Unix there is no null device to compare against, so nothing is exempt.
+#[cfg(unix)]
+fn is_null_device(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let (Ok(candidate), Ok(null)) = (std::fs::metadata(path), std::fs::metadata(NULL_DEVICE_PATH))
+    else {
+        return false;
+    };
+    candidate.dev() == null.dev() && candidate.ino() == null.ino()
+}
+
+#[cfg(not(unix))]
+fn is_null_device(_path: &Path) -> bool {
+    false
+}
+
+/// The discard sink two output writers are allowed to share.
+#[cfg(unix)]
+const NULL_DEVICE_PATH: &str = "/dev/null";
+
+/// A path reduced to the identity that can be established before the file exists.
+///
+/// [`std::fs::canonicalize`] resolves `.`, `..`, and symlinks, but only for a
+/// path that already exists — which an output usually does not. Canonicalizing
+/// the *parent* and keeping the file name verbatim resolves as much as can be
+/// resolved up front.
+///
+/// Two fallbacks keep this from inventing failures. `Path::parent` is `Some("")`
+/// for a bare file name, which `canonicalize` rejects with `ENOENT`; the intent
+/// there is the current directory. And a parent that cannot be canonicalized at
+/// all falls back to the path as written rather than raising, because a run whose
+/// output directory does not exist should get the writer's message about that,
+/// not a collision error from a guard that only meant to compare two names.
+fn resolve_output_identity(path: &Path) -> (PathBuf, Option<&std::ffi::OsStr>) {
+    let parent = match path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
+        Some(parent) => parent,
+        None => return (path.to_path_buf(), None),
+    };
+    let resolved = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    (resolved, path.file_name())
 }
 
 /// Options for writing statistics to a file.
@@ -1301,6 +1434,160 @@ pub fn validate_index_threshold(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `reject_colliding_outputs` compares destinations, not the strings naming
+    /// them: `out.bam` and `./out.bam` are one file under two names, and two
+    /// writers on one file overwrite each other byte for byte.
+    ///
+    /// Each case names its two paths relative to a scratch directory the test
+    /// creates. `sub` exists and `missing` does not, which puts both sides of the
+    /// canonicalization fallback under test — the fallback must still catch the
+    /// spelling users actually type, and must not turn a run whose output
+    /// directory is absent into a collision error, since that run's real problem
+    /// is the missing directory and the writer reports it better.
+    #[rstest]
+    #[case::identical("out.bam", "out.bam", true)]
+    #[case::dot_prefixed("out.bam", "./out.bam", true)]
+    #[case::through_an_existing_parent("out.bam", "sub/../out.bam", true)]
+    #[case::distinct_names("out.bam", "rejects.bam", false)]
+    #[case::identical_under_a_missing_parent("missing/out.bam", "missing/out.bam", true)]
+    #[case::distinct_under_a_missing_parent("missing/out.bam", "missing/rejects.bam", false)]
+    fn reject_colliding_outputs_compares_resolved_files(
+        #[case] output: &str,
+        #[case] secondary: &str,
+        #[case] collides: bool,
+    ) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir_all(dir.path().join("sub")).expect("create subdirectory");
+        let output = dir.path().join(output);
+        let secondary = dir.path().join(secondary);
+
+        let result = reject_colliding_outputs(&output, Some(&secondary), "--rejects");
+
+        assert_eq!(
+            result.is_err(),
+            collides,
+            "`-o {}` against `--rejects {}`: got {result:?}",
+            output.display(),
+            secondary.display()
+        );
+        if let Err(error) = result {
+            let message = error.to_string();
+            assert!(
+                message.contains("--rejects") && message.contains("out.bam"),
+                "the error must name the colliding option and the path, got: {message}"
+            );
+        }
+    }
+
+    /// Stdout collides with itself under either spelling, and the null device is
+    /// the one destination two writers may share.
+    ///
+    /// `-` and `/dev/stdout` are the same fd, so the two must be caught in any
+    /// combination — comparing the paths as written would let the mixed pairs
+    /// through. `/dev/null` is the opposite case: it discards both streams, so
+    /// `-o /dev/null --rejects /dev/null` is a legitimate compute-only run that a
+    /// name-based check would wrongly reject.
+    #[rstest]
+    #[case::both_dash("-", "-", true)]
+    #[case::both_dev_stdout("/dev/stdout", "/dev/stdout", true)]
+    #[case::dash_then_dev_stdout("-", "/dev/stdout", true)]
+    #[case::dev_stdout_then_dash("/dev/stdout", "-", true)]
+    #[case::stdout_then_a_file("-", "rejects.bam", false)]
+    #[case::a_file_then_stdout("out.bam", "-", false)]
+    #[case::both_dev_null("/dev/null", "/dev/null", false)]
+    #[case::dev_null_then_a_file("/dev/null", "rejects.bam", false)]
+    fn reject_colliding_outputs_handles_stdout_and_the_null_device(
+        #[case] output: &str,
+        #[case] secondary: &str,
+        #[case] collides: bool,
+    ) {
+        let secondary = PathBuf::from(secondary);
+
+        let result = reject_colliding_outputs(Path::new(output), Some(&secondary), "--rejects");
+
+        assert_eq!(
+            result.is_err(),
+            collides,
+            "`-o {output}` against `--rejects {}`: got {result:?}",
+            secondary.display()
+        );
+        if let Err(error) = result {
+            let message = error.to_string();
+            assert!(
+                message.contains("--rejects") && message.contains("stdout"),
+                "the error must name the colliding option and the stream, got: {message}"
+            );
+        }
+    }
+
+    /// A command that was given no secondary output has nothing to collide with.
+    ///
+    /// The commands call this guard unconditionally, so the `None` path is the
+    /// one taken by nearly every real run — including `-o -`, which is the whole
+    /// point of the surrounding change and must not be caught by its own guard.
+    #[rstest]
+    #[case::stdout("-")]
+    #[case::dev_stdout("/dev/stdout")]
+    #[case::a_file("out.bam")]
+    fn reject_colliding_outputs_allows_an_absent_secondary(#[case] output: &str) {
+        let result = reject_colliding_outputs(Path::new(output), None, "--rejects");
+        assert!(result.is_ok(), "`-o {output}` with no --rejects must be allowed: {result:?}");
+    }
+
+    /// A FIFO named by both outputs is a collision, not an exemption.
+    ///
+    /// The guard used to exempt every destination that merely was not a regular
+    /// file, which let `-o pipe --rejects pipe` through. Both writers then append
+    /// through one file description, so the FIFO carries two headers, two block
+    /// sequences, and two EOF markers — the same unreadable stream that
+    /// `-o - --rejects -` produces, and which that pair is already rejected for.
+    /// Two *distinct* FIFOs are two streams and stay legal.
+    #[cfg(unix)]
+    #[rstest]
+    #[case::one_fifo_named_twice("primary", "primary", true)]
+    #[case::two_distinct_fifos("primary", "secondary", false)]
+    fn reject_colliding_outputs_rejects_a_shared_fifo(
+        #[case] output: &str,
+        #[case] secondary: &str,
+        #[case] collides: bool,
+    ) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let output = dir.path().join(output);
+        let secondary = dir.path().join(secondary);
+        make_fifo(&output);
+        if secondary != output {
+            make_fifo(&secondary);
+        }
+
+        let result = reject_colliding_outputs(&output, Some(&secondary), "--rejects");
+
+        assert_eq!(
+            result.is_err(),
+            collides,
+            "`-o {}` against `--rejects {}`: got {result:?}",
+            output.display(),
+            secondary.display()
+        );
+        if let Err(error) = result {
+            let message = error.to_string();
+            assert!(
+                message.contains("interleave"),
+                "two writers on one stream interleave rather than overwrite, got: {message}"
+            );
+        }
+    }
+
+    /// Create a FIFO at `path`.
+    ///
+    /// The standard library has no `mkfifo(3)` binding, and the crate's `nix`
+    /// dependency is gated to Linux, so the coreutils front end stands in — it is
+    /// present wherever this test compiles.
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo").arg(path).status().expect("run mkfifo");
+        assert!(status.success(), "mkfifo {} failed: {status}", path.display());
+    }
 
     /// `index_threshold_log_message` reports the threshold that is actually in effect,
     /// which is not always the raw `--index-threshold` value. `Edit` floors a numeric
