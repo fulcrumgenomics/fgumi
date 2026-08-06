@@ -8,7 +8,7 @@
 //!
 //! This module presents a [`Read`]-compatible view over the decompressed
 //! content of such a file, so the legacy
-//! [`GenericKeyedChunkReader`](crate::external::GenericKeyedChunkReader) record
+//! `GenericKeyedChunkReader` record
 //! parser can consume zstd-compressed spills without further changes. The
 //! worker-pool reader takes the faster, per-frame parallel-decompress path;
 //! this stream reader is the fallback used by the consolidation merge and the
