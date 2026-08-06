@@ -39,8 +39,10 @@ use noodles::sam::header::record::value::Map;
 use noodles::sam::header::record::value::map::header::tag as header_tag;
 use tempfile::TempDir;
 
-// All sub-modules are crate-private. Items intended for external consumers are
-// re-exported at the crate root below.
+// Sub-modules are crate-private except where a consumer needs to name the type
+// itself rather than just receive it (`arena_pool`, `segmented_buf`, `codec`).
+// Everything else is re-exported at the crate root below.
+pub mod arena_pool;
 pub(crate) mod bgzf_io;
 pub mod codec;
 pub(crate) mod external;
@@ -57,7 +59,7 @@ pub(crate) mod pooled_chunk_writer;
 pub(crate) mod radix;
 pub(crate) mod read_ahead;
 pub(crate) mod reader;
-pub(crate) mod segmented_buf;
+pub mod segmented_buf;
 pub(crate) mod tmp_dir_alloc;
 pub(crate) mod verify;
 pub(crate) mod worker_pool;
@@ -164,6 +166,7 @@ fn create_temp_dir(base: Option<&Path>) -> Result<TempDir> {
     }
 }
 
+pub use arena_pool::{ArenaPool, PooledSegmentedBuf};
 pub use codec::SpillCodec;
 pub use external::{
     KeyTypesSpec, LibraryLookup, RawExternalSorter, cb_hasher, extract_template_key_inline,
@@ -186,6 +189,7 @@ pub use reader::{
     OwnedRawBamRecordReader, RawBamRecordReader, open_raw_bam_record_reader,
     open_raw_bam_record_reader_with_header,
 };
+pub use segmented_buf::SegmentedBuf;
 pub use verify::{VerifySummary, verify_sort_order};
 
 #[cfg(test)]
