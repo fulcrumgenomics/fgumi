@@ -67,6 +67,9 @@ pub(crate) mod zspill_stream;
 /// `memory-debug` feature is enabled.
 #[cfg(feature = "memory-debug")]
 pub use memory_probe::print_mi_stats;
+/// Background read-ahead record reader, re-exported for `fgumi compare bams`,
+/// which reads two inputs concurrently and needs each decode off the main thread.
+pub use read_ahead::RawReadAheadReader;
 
 /// Buffer size for `BufReader` during merge phase.
 const MERGE_BUFFER_SIZE: usize = 64 * 1024;

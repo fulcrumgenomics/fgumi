@@ -46,3 +46,7 @@ docs/src/metrics/
 
 # Heap profiling output produced when binaries are built with the dhat-heap feature
 dhat-heap.json
+
+# Scratch space for local benchmark corpora, profiles, and campaign notes.
+# Never committed: the compare-bams benchmark corpus alone is ~20 GB of BAMs.
+/ephemeral/

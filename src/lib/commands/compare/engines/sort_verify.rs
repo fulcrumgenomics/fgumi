@@ -43,19 +43,19 @@
 use std::cmp::Ordering;
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 
 use fgumi_raw_bam::{RawRecord, RawRecordView};
 use fgumi_sort::{
-    LibraryLookup, OwnedRawBamRecordReader, QuerynameComparator, RawQuerynameKey,
-    RawQuerynameLexKey, RawSortKey, SortContext, SortOrder, TemplateKey, cb_hasher,
-    extract_coordinate_key_inline, extract_template_key_inline, verify_sort_order,
+    LibraryLookup, QuerynameComparator, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
+    SortContext, SortOrder, TemplateKey, cb_hasher, extract_coordinate_key_inline,
+    extract_template_key_inline,
 };
 use noodles::sam::Header;
 
 use ahash::AHashMap;
 
-use super::OpenedInput;
+use super::{CheckedRecords, OpenedInput};
 use crate::sam::SamTag;
 
 use super::super::raw_compare::content_key_exact;
@@ -288,7 +288,7 @@ where
     ExtractKey: Fn(&[u8]) -> K,
     IsViolation: Fn(&K, &K) -> bool,
 {
-    reader: OwnedRawBamRecordReader,
+    reader: CheckedRecords,
     extract_key: &'a ExtractKey,
     tracker: OrderTracker<'a, K, IsViolation>,
 }
@@ -300,7 +300,7 @@ where
     IsViolation: Fn(&K, &K) -> bool,
 {
     fn new(
-        reader: OwnedRawBamRecordReader,
+        reader: CheckedRecords,
         extract_key: &'a ExtractKey,
         is_violation: &'a IsViolation,
     ) -> Self {
@@ -390,9 +390,12 @@ struct RunPairOutcome {
 }
 
 /// Compare the two files' records for the run identified by `key`, consuming both sides in
-/// lockstep and cancelling each record against its counterpart as it arrives (see
-/// [`RunCanceller`]). Never materializes the run, so an unmapped tail spanning the whole
-/// file costs memory proportional only to how far the two orderings diverge.
+/// lockstep. A pair that is byte-identical is cancelled here directly and never reaches
+/// [`RunCanceller`] — the common case, and the reason no content key is built for it.
+/// Everything else (pairs that differ, and records arriving out of step) goes to the
+/// canceller, which matches them by canonical content key as they arrive. Never
+/// materializes the run, so an unmapped tail spanning the whole file costs memory
+/// proportional only to how far the two orderings diverge.
 ///
 /// Cancellation is confined to one run, but note *why* that is not what keeps it sound: a
 /// record's run membership is a function of its content ([`content_key_exact`] covers the
@@ -426,6 +429,31 @@ where
         let from2 = next_in_run(stream2, next2, key, same_core)?;
         if from1.is_none() && from2.is_none() {
             break;
+        }
+        // Byte-identical pair: cancel it here without building either record's
+        // canonical content key.
+        //
+        // Sound because the run comparison decides on the symmetric difference of
+        // the two sides' record multisets, and removing one element from each side
+        // *with the same key* leaves that symmetric difference unchanged — whatever
+        // else is pending. Byte equality implies content-key equality, and strictly
+        // so: `content_key_exact` excludes `bin`, width-normalizes integer tags, and
+        // sorts the tag multiset, so any two byte-identical records necessarily
+        // share a key. The converse does not hold, which is why this is only a fast
+        // path: content-equal records that differ in tag order, integer tag width,
+        // or `bin` fall through to the key path below and still cancel there.
+        //
+        // Worth the special case because it is the overwhelmingly common one — two
+        // files that agree, record for record — and `content_key_exact` is the
+        // dominant remaining cost on the critical path (~32%: a `Vec` per aux tag,
+        // a sort, a concatenation, and an `AHashMap` hash + insert, per record).
+        // Here a `memcmp` replaces all of it.
+        if let (Some(a), Some(b)) = (&from1, &from2)
+            && a.as_ref() == b.as_ref()
+        {
+            count1 += 1;
+            count2 += 1;
+            continue;
         }
         if let Some(rec) = from1 {
             canceller.observe_bam1(rec.as_ref())?;
@@ -504,7 +532,9 @@ impl RunResidual {
 /// Streaming multiset comparison of one equal-core-key run, in memory proportional to how
 /// far the two files' orderings diverge rather than to the run's length.
 ///
-/// Each arriving record is reduced to its canonical content key ([`content_key_exact`],
+/// Each record that reaches the canceller is reduced to its canonical content key
+/// (byte-identical pairs are cancelled by [`compare_run`] before this point — see its
+/// docs) ([`content_key_exact`],
 /// whose byte-equality is *exactly* `Exact` content-equality) and cancelled against the
 /// opposite side's pending set if a counterpart is waiting; otherwise it joins its own
 /// side's pending set. Two files listing a run's records in the same order therefore never
@@ -736,9 +766,9 @@ where
 {
     /// Record reader over the first input, already past its header. Carried rather
     /// than the path so the input is opened exactly once — see [`OpenedInput`].
-    reader1: OwnedRawBamRecordReader,
+    reader1: CheckedRecords,
     /// Record reader over the second input, already past its header.
-    reader2: OwnedRawBamRecordReader,
+    reader2: CheckedRecords,
     extract_key: ExtractKey,
     is_violation: IsViolation,
     same_core: SameCore,
@@ -849,8 +879,8 @@ pub(crate) fn sort_verify_compare_opened(
     let header_diffs = compare_headers(&header1, &header2);
 
     // IMPORTANT: The per-SortOrder extractor/comparator selection below must stay
-    // consistent with the matching arms in verify_records_in_order. Future changes
-    // to how an arm selects its key extractor or comparator must be applied to both sites.
+    // consistent with the matching arms in `OrderCheck::new`. Future changes to how an
+    // arm selects its key extractor or comparator must be applied to both sites.
     let mut outcome = match order {
         SortOrder::Coordinate => {
             let nref = header1.reference_sequences().len() as u32;
@@ -920,88 +950,122 @@ pub(crate) fn sort_verify_compare_opened(
     Ok(outcome)
 }
 
-/// Verify every record in `path` is non-decreasing under `order`'s comparator. Err names the
-/// first violating pair. Used as a universal precondition for order-dependent comparisons
-/// (`CompareBams::execute`'s content-mode gate: an `@HD`-declared order must not be trusted
-/// blindly — see `CompareMode::Content`'s doc comment).
+/// A per-file sort-order check folded into a comparison's own record pass, instead
+/// of costing a dedicated traversal of the file.
 ///
-/// This is a separate, fail-fast entry point from `sort_verify_compare`'s own per-file
-/// violation *counting* (`run_full_verify`'s [`OrderChecked`]/[`OrderTracker`] fold, part of
-/// the fuller `--command sort` report that also needs to keep going to compare run multisets
-/// even after finding violations). Both call sites route through the same underlying
-/// comparator machinery — the per-`SortOrder` key extractors
-/// (`extract_coordinate_key_inline`, `RawQuerynameKey`/`RawQuerynameLexKey::extract`,
-/// `extract_template_key_inline`) and their key comparisons (`<`, `TemplateKey::core_cmp`) —
-/// so no comparator logic is reimplemented here, only the per-order dispatch. This entry
-/// point calls [`verify_sort_order`] directly; the compare engine inlines that same
-/// per-record fold ([`OrderTracker::observe`]) so it can verify order within its single
-/// streaming pass.
+/// `content` mode used to answer this question by opening each input and reading it
+/// end to end *before* `positional_compare` streamed both files again — four full
+/// BAM traversals for a comparison that needs two. This type lets the comparison
+/// pass feed the records it is already decoding through the identical check.
 ///
-/// # Errors
+/// The violation *count* is why this accumulates rather than failing on the first
+/// bad record: the diagnostic reports how many records violated the order, which is
+/// only known once the whole file has been seen. `positional_compare` already
+/// drains both inputs to completion for its record counts, so the totals match a
+/// dedicated pass exactly, and evaluating bam1's result before bam2's preserves
+/// which file a mis-sorted pair names.
+/// Extracts a record's sort key and reports whether it regressed against the
+/// previous record, owning the previous key internally.
 ///
-/// Returns an error if `path` cannot be opened/read, or if any record violates `order`
-/// (naming the first violating record's 1-based position and read name).
-pub(crate) fn verify_records_in_order(path: &Path, order: SortOrder) -> Result<()> {
-    // One open, header and records from the same stream — see `OpenedInput::open`.
-    // The `path` field goes unused here: this entry point takes a single input and
-    // already has it, so there is nothing to disambiguate in its diagnostics.
-    let OpenedInput { reader, header, path: _ } = OpenedInput::open(path)
-        .with_context(|| format!("opening {} to verify sort order", path.display()))?;
+/// Boxed rather than generic so a comparison loop can hold one checker per input
+/// without the loop itself becoming generic over the four sort-key types.
+type OrderStep = Box<dyn FnMut(&[u8]) -> bool + Send>;
 
-    // IMPORTANT: The per-SortOrder extractor/comparator selection below must stay
-    // consistent with the matching arms in sort_verify_compare. Future changes
-    // to how an arm selects its key extractor or comparator must be applied to both sites.
-    let (_, violations, first_violation) = match order {
-        SortOrder::Coordinate => {
-            let nref = header.reference_sequences().len() as u32;
-            verify_sort_order(
-                reader,
-                |bam: &[u8]| extract_coordinate_key_inline(bam, nref),
-                |key: &u64, prev: &u64| key < prev,
-            )?
-        }
-        SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
-            let ctx = SortContext::from_header(&header);
-            verify_sort_order(
-                reader,
-                move |bam: &[u8]| RawQuerynameLexKey::extract(bam, &ctx),
-                |key: &RawQuerynameLexKey, prev: &RawQuerynameLexKey| key < prev,
-            )?
-        }
-        SortOrder::Queryname(QuerynameComparator::Natural) => {
-            let ctx = SortContext::from_header(&header);
-            verify_sort_order(
-                reader,
-                move |bam: &[u8]| RawQuerynameKey::extract(bam, &ctx),
-                |key: &RawQuerynameKey, prev: &RawQuerynameKey| key < prev,
-            )?
-        }
-        SortOrder::TemplateCoordinate => {
-            let lib_lookup = LibraryLookup::from_header(&header);
-            let hasher = cb_hasher();
-            // Matches `fgumi sort`'s own `--verify` (crate::commands::sort::parse_cell_tag):
-            // template-coordinate always hashes the CB tag into the sort key when present.
-            let cell_tag = Some(SamTag::CB);
-            verify_sort_order(
-                reader,
-                move |bam: &[u8]| extract_template_key_inline(bam, &lib_lookup, cell_tag, &hasher),
-                |key: &TemplateKey, prev: &TemplateKey| key.core_cmp(prev) == Ordering::Less,
-            )?
-        }
-    };
+pub(crate) struct OrderCheck {
+    order: SortOrder,
+    step: OrderStep,
+    total: u64,
+    violations: u64,
+    first_violation: Option<(u64, String)>,
+}
 
-    if violations > 0 {
-        let (record_num, name) = first_violation
-            .expect("verify_sort_order must report a first_violation when violations > 0");
-        bail!(
-            "{}: {violations} record(s) violate the declared {order:?} sort order (first at \
-             record {record_num}, read name '{name}'); records must actually be in {order:?} \
-             order, not merely declare it, for order-dependent comparison",
-            path.display()
-        );
+impl OrderCheck {
+    /// Build a checker for `order`, taking whatever context that order's key
+    /// extractor needs (reference count, read-group library lookup) from `header`.
+    ///
+    /// IMPORTANT: the per-`SortOrder` extractor/comparator selection here must stay
+    /// consistent with the matching arms in `sort_verify_compare`.
+    pub(crate) fn new(header: &Header, order: SortOrder) -> Self {
+        let step: OrderStep = match order {
+            SortOrder::Coordinate => {
+                let nref = header.reference_sequences().len() as u32;
+                let mut prev: Option<u64> = None;
+                Box::new(move |bam: &[u8]| {
+                    let key = extract_coordinate_key_inline(bam, nref);
+                    let violated = prev.is_some_and(|p| key < p);
+                    prev = Some(key);
+                    violated
+                })
+            }
+            SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
+                let ctx = SortContext::from_header(header);
+                let mut prev: Option<RawQuerynameLexKey> = None;
+                Box::new(move |bam: &[u8]| {
+                    let key = RawQuerynameLexKey::extract(bam, &ctx);
+                    let violated = prev.as_ref().is_some_and(|p| key < *p);
+                    prev = Some(key);
+                    violated
+                })
+            }
+            SortOrder::Queryname(QuerynameComparator::Natural) => {
+                let ctx = SortContext::from_header(header);
+                let mut prev: Option<RawQuerynameKey> = None;
+                Box::new(move |bam: &[u8]| {
+                    let key = RawQuerynameKey::extract(bam, &ctx);
+                    let violated = prev.as_ref().is_some_and(|p| key < *p);
+                    prev = Some(key);
+                    violated
+                })
+            }
+            SortOrder::TemplateCoordinate => {
+                let lib_lookup = LibraryLookup::from_header(header);
+                let hasher = cb_hasher();
+                let cell_tag = Some(SamTag::CB);
+                let mut prev: Option<TemplateKey> = None;
+                Box::new(move |bam: &[u8]| {
+                    let key = extract_template_key_inline(bam, &lib_lookup, cell_tag, &hasher);
+                    let violated = prev.as_ref().is_some_and(|p| key.core_cmp(p) == Ordering::Less);
+                    prev = Some(key);
+                    violated
+                })
+            }
+        };
+        Self { order, step, total: 0, violations: 0, first_violation: None }
     }
 
-    Ok(())
+    /// Observe one record, in file order.
+    pub(crate) fn observe(&mut self, bam: &[u8]) {
+        self.total += 1;
+        if (self.step)(bam) {
+            self.violations += 1;
+            if self.first_violation.is_none() {
+                let name = String::from_utf8_lossy(RawRecordView::new(bam).read_name()).to_string();
+                self.first_violation = Some((self.total, name));
+            }
+        }
+    }
+
+    /// Fail if any record violated the declared order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the violation count and the first violating record's
+    /// 1-based position and read name.
+    pub(crate) fn into_result(self, path: &Path) -> Result<()> {
+        if self.violations > 0 {
+            let (record_num, name) = self
+                .first_violation
+                .expect("a nonzero violation count must carry a first violation");
+            let (order, violations) = (self.order, self.violations);
+            bail!(
+                "{}: {violations} record(s) violate the declared {order:?} sort order (first at \
+                 record {record_num}, read name '{name}'); records must actually be in {order:?} \
+                 order, not merely declare it, for order-dependent comparison",
+                path.display()
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1384,5 +1448,120 @@ mod tests {
                 sorted_left == sorted_right
             );
         }
+    }
+
+    /// A header carrying a single reference sequence, so `ref_id = 0` records are
+    /// writable and `extract_coordinate_key_inline` sees a nonzero reference count.
+    fn single_reference_header(so: &str) -> Header {
+        use noodles::sam::header::record::value::map::ReferenceSequence;
+
+        let mut hd = Map::<HeaderRecord>::default();
+        hd.other_fields_mut().insert(hd_tag::SORT_ORDER, BString::from(so));
+        Header::builder()
+            .set_header(hd)
+            .add_reference_sequence(
+                BString::from("chr1"),
+                Map::<ReferenceSequence>::new(
+                    std::num::NonZeroUsize::new(100_000).expect("nonzero length"),
+                ),
+            )
+            .build()
+    }
+
+    /// [`OrderCheck`] must apply the comparator its [`SortOrder`] names, not merely
+    /// *a* comparator. The two queryname variants differ in nothing else, so picking
+    /// the wrong one silently accepts a file that violates the order it declares —
+    /// and content mode then pairs records positionally on that false assurance.
+    ///
+    /// Each queryname case is chosen so the *other* queryname comparator would
+    /// disagree with it: `r1 < r10 < r2` holds lexicographically and not naturally,
+    /// `r1 < r2 < r10` naturally and not lexicographically. A case table that only
+    /// listed sequences both comparators accept would pass with the arms swapped.
+    ///
+    /// Every order carries a rejecting case for the same reason. Equal keys never
+    /// violate under any comparator, so an accept-only entry — which is all
+    /// `TemplateCoordinate` had — passes whichever extractor its arm is wired to,
+    /// and that arm's extractor is the most involved of the four. An unpaired
+    /// mapped read keys on `(tid, unclipped_pos, ...)`, so descending positions
+    /// give it something to reject.
+    #[rstest]
+    #[case::coordinate_ascending(SortOrder::Coordinate, &[("a", 100), ("b", 200)], 0)]
+    #[case::coordinate_backwards(SortOrder::Coordinate, &[("a", 200), ("b", 100)], 1)]
+    #[case::coordinate_counts_every_violation(
+        SortOrder::Coordinate,
+        &[("a", 200), ("b", 100), ("c", 400), ("d", 300)],
+        2
+    )]
+    #[case::lexicographic_accepts_lexicographic_order(
+        SortOrder::Queryname(QuerynameComparator::Lexicographic),
+        &[("r1", 100), ("r10", 100), ("r2", 100)],
+        0
+    )]
+    #[case::lexicographic_rejects_natural_order(
+        SortOrder::Queryname(QuerynameComparator::Lexicographic),
+        &[("r2", 100), ("r10", 100)],
+        1
+    )]
+    #[case::natural_accepts_natural_order(
+        SortOrder::Queryname(QuerynameComparator::Natural),
+        &[("r1", 100), ("r2", 100), ("r10", 100)],
+        0
+    )]
+    #[case::natural_rejects_lexicographic_order(
+        SortOrder::Queryname(QuerynameComparator::Natural),
+        &[("r10", 100), ("r2", 100)],
+        1
+    )]
+    #[case::template_coordinate_accepts_equal_keys(
+        SortOrder::TemplateCoordinate,
+        &[("a", 100), ("b", 100)],
+        0
+    )]
+    #[case::template_coordinate_rejects_descending_positions(
+        SortOrder::TemplateCoordinate,
+        &[("a", 200), ("b", 100)],
+        1
+    )]
+    fn order_check_applies_the_comparator_its_sort_order_names(
+        #[case] order: SortOrder,
+        #[case] records: &[(&str, i32)],
+        #[case] expected_violations: u64,
+    ) {
+        let header = single_reference_header("coordinate");
+        let mut check = OrderCheck::new(&header, order);
+        for (name, pos) in records {
+            check.observe(mapped(name.as_bytes(), *pos).as_ref());
+        }
+
+        let result = check.into_result(Path::new("input.bam"));
+        if expected_violations == 0 {
+            result.unwrap_or_else(|e| panic!("{order:?} must accept {records:?}: {e}"));
+        } else {
+            let err = result.expect_err(&format!("{order:?} must reject {records:?}"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("{expected_violations} record(s) violate")),
+                "must report every violation, not stop at the first: {msg}"
+            );
+            assert!(msg.contains("input.bam"), "must name the offending input: {msg}");
+        }
+    }
+
+    /// The first violation names the record that broke the order, not merely the
+    /// count — the report is what tells a user *where* to look.
+    #[test]
+    fn order_check_names_the_first_violating_record() {
+        let header = single_reference_header("coordinate");
+        let mut check = OrderCheck::new(&header, SortOrder::Coordinate);
+        for (name, pos) in [("first", 100), ("second", 300), ("backwards", 200), ("last", 150)] {
+            check.observe(mapped(name.as_bytes(), pos).as_ref());
+        }
+
+        let msg = check
+            .into_result(Path::new("input.bam"))
+            .expect_err("a backwards record must be rejected")
+            .to_string();
+        assert!(msg.contains("record 3"), "must give the 1-based record position: {msg}");
+        assert!(msg.contains("backwards"), "must name the first violating read: {msg}");
     }
 }

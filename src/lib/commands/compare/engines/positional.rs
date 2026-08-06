@@ -27,10 +27,14 @@ use anyhow::{Result, bail};
 
 use fgumi_raw_bam::RawRecord;
 
+use fgumi_sort::SortOrder;
+
 use super::super::bams::{RawBatchMessage, start_raw_batch_reader};
 use super::super::record_key::record_keys_match;
 use super::content::{ContentPredicate, content_diffs};
+use super::decompression_threads_per_input;
 use super::header::{compare_headers, fold_header_diffs};
+use super::sort_verify::OrderCheck;
 
 /// Outcome of a [`positional_compare`] run.
 #[derive(Debug, Default, Clone)]
@@ -90,6 +94,14 @@ impl PositionalOutcome {
 /// (see `start_raw_batch_reader`); `max_diffs` caps the number of entries
 /// collected in `PositionalOutcome::diff_details`.
 ///
+/// `verify_order` names the sort order the records must actually honor, or `None`
+/// for genuinely orderless input. It is deliberately a required parameter rather
+/// than a defaulted one: this comparison pairs records purely by position, so an
+/// unverified order silently corrupts the pairing rather than surfacing as a diff.
+/// A convenience overload defaulting it to `None` would let a caller opt out of
+/// that check by omission, which is the failure this parameter exists to prevent —
+/// so callers state their intent explicitly, `None` included.
+///
 /// # Errors
 ///
 /// Returns an error if either BAM file cannot be opened, or if a read error
@@ -101,11 +113,24 @@ pub fn positional_compare(
     batch_size: usize,
     max_diffs: usize,
     pred: ContentPredicate,
+    verify_order: Option<SortOrder>,
 ) -> Result<PositionalOutcome> {
     let mut outcome = PositionalOutcome::default();
 
-    let (rx1, header1) = start_raw_batch_reader(bam1.to_path_buf(), threads, batch_size)?;
-    let (rx2, header2) = start_raw_batch_reader(bam2.to_path_buf(), threads, batch_size)?;
+    // Split the decompression budget across the two inputs rather than giving each
+    // the full count: `--threads 8` previously started 8 BGZF workers per reader,
+    // 16 in total, oversubscribing a smaller host for no extra decode throughput.
+    // The sort and grouping engines already share this convention.
+    let per_input = decompression_threads_per_input(threads);
+    let (rx1, header1) = start_raw_batch_reader(bam1.to_path_buf(), per_input, batch_size)?;
+    let (rx2, header2) = start_raw_batch_reader(bam2.to_path_buf(), per_input, batch_size)?;
+
+    // Sort-order verification rides along with this pass rather than costing a
+    // dedicated traversal of each input beforehand. Every record this function
+    // pulls — including the ones drained after pairing stops — is fed through its
+    // file's checker, so the totals match a standalone pass exactly.
+    let mut order1 = verify_order.map(|order| OrderCheck::new(&header1, order));
+    let mut order2 = verify_order.map(|order| OrderCheck::new(&header2, order));
 
     fold_header_diffs(
         compare_headers(&header1, &header2),
@@ -125,17 +150,24 @@ pub fn positional_compare(
             match rx1.recv() {
                 Ok(RawBatchMessage::Batch(batch)) => {
                     outcome.bam1_count += batch.len() as u64;
+                    if let Some(check) = order1.as_mut() {
+                        for record in &batch {
+                            check.observe(record.as_ref());
+                        }
+                    }
                     pending_batch1 = Some(batch);
                 }
                 Ok(RawBatchMessage::Eof) => bam1_eof = true,
-                Ok(RawBatchMessage::Error(e)) => bail!("Error reading BAM1: {e}"),
+                Ok(RawBatchMessage::Error(e)) => {
+                    bail!("reading records from {}: {e}", bam1.display())
+                }
                 // A clean end-of-stream is always signalled by an explicit `Eof`
                 // message (see `start_raw_batch_reader`); a bare channel
                 // disconnect therefore means the reader thread died (e.g.
                 // panicked) or the stream was truncated without an `Eof`. Treat
                 // it as fatal rather than silently accepting a short read as a
                 // clean comparison.
-                Err(_) => bail!("BAM1 reader disconnected before EOF"),
+                Err(_) => bail!("{}: reader disconnected before EOF", bam1.display()),
             }
         }
 
@@ -143,13 +175,20 @@ pub fn positional_compare(
             match rx2.recv() {
                 Ok(RawBatchMessage::Batch(batch)) => {
                     outcome.bam2_count += batch.len() as u64;
+                    if let Some(check) = order2.as_mut() {
+                        for record in &batch {
+                            check.observe(record.as_ref());
+                        }
+                    }
                     pending_batch2 = Some(batch);
                 }
                 Ok(RawBatchMessage::Eof) => bam2_eof = true,
-                Ok(RawBatchMessage::Error(e)) => bail!("Error reading BAM2: {e}"),
+                Ok(RawBatchMessage::Error(e)) => {
+                    bail!("reading records from {}: {e}", bam2.display())
+                }
                 // See the BAM1 branch above: a disconnect without a prior `Eof`
                 // is a dead/truncated reader, not a clean end-of-stream.
-                Err(_) => bail!("BAM2 reader disconnected before EOF"),
+                Err(_) => bail!("{}: reader disconnected before EOF", bam2.display()),
             }
         }
 
@@ -172,10 +211,17 @@ pub fn positional_compare(
                         match rx1.recv() {
                             Ok(RawBatchMessage::Batch(batch)) => {
                                 outcome.bam1_count += batch.len() as u64;
+                                if let Some(check) = order1.as_mut() {
+                                    for record in &batch {
+                                        check.observe(record.as_ref());
+                                    }
+                                }
                             }
-                            Ok(RawBatchMessage::Error(e)) => bail!("Error reading BAM1: {e}"),
+                            Ok(RawBatchMessage::Error(e)) => {
+                                bail!("reading records from {}: {e}", bam1.display())
+                            }
                             Ok(RawBatchMessage::Eof) => break,
-                            Err(_) => bail!("BAM1 reader disconnected before EOF"),
+                            Err(_) => bail!("{}: reader disconnected before EOF", bam1.display()),
                         }
                     }
                 }
@@ -184,10 +230,17 @@ pub fn positional_compare(
                         match rx2.recv() {
                             Ok(RawBatchMessage::Batch(batch)) => {
                                 outcome.bam2_count += batch.len() as u64;
+                                if let Some(check) = order2.as_mut() {
+                                    for record in &batch {
+                                        check.observe(record.as_ref());
+                                    }
+                                }
                             }
-                            Ok(RawBatchMessage::Error(e)) => bail!("Error reading BAM2: {e}"),
+                            Ok(RawBatchMessage::Error(e)) => {
+                                bail!("reading records from {}: {e}", bam2.display())
+                            }
                             Ok(RawBatchMessage::Eof) => break,
-                            Err(_) => bail!("BAM2 reader disconnected before EOF"),
+                            Err(_) => bail!("{}: reader disconnected before EOF", bam2.display()),
                         }
                     }
                 }
@@ -209,6 +262,17 @@ pub fn positional_compare(
         if outcome.key_mismatch_at.is_none() {
             for (offset, (a, b)) in cmp_batch1.iter().zip(cmp_batch2.iter()).enumerate() {
                 let index = current_index + offset as u64;
+
+                // Byte-identical records need neither check. A `RecordKey` is a pure
+                // function of the record's bytes, so identical bytes give identical
+                // keys; and `content_diffs` opens with this very comparison, since
+                // byte equality implies content equality under every predicate. This
+                // is the common case — two files that agree — and skipping straight
+                // past it avoids extracting flags and walking both read names only to
+                // conclude they are the same.
+                if a.as_ref() == b.as_ref() {
+                    continue;
+                }
 
                 if !record_keys_match(a, b) {
                     outcome.key_mismatch_at = Some(index);
@@ -240,6 +304,16 @@ pub fn positional_compare(
         if !remainder2.is_empty() {
             pending_batch2 = Some(remainder2.to_vec());
         }
+    }
+
+    // Both inputs have been read end to end, so the violation totals here equal
+    // what a dedicated pass over each file would report. bam1 is evaluated first
+    // to preserve which file is named when both are mis-sorted.
+    if let Some(check) = order1 {
+        check.into_result(bam1)?;
+    }
+    if let Some(check) = order2 {
+        check.into_result(bam2)?;
     }
 
     Ok(outcome)

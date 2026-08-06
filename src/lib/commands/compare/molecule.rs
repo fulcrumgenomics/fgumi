@@ -7,8 +7,6 @@
 
 use anyhow::{Result, anyhow};
 use fgumi_raw_bam::RawRecord;
-use fgumi_sort::RawBamRecordReader;
-use std::io::Read;
 
 use super::bams::get_mi_tag_raw;
 
@@ -33,8 +31,8 @@ impl MoleculeRun {
 
 /// Stream `reader` into per-molecule runs, cutting a run when the base MI (see
 /// [`super::bams::MiKey::base`]) changes. Assumes same-molecule reads are consecutive
-/// (guaranteed by grouped output; see the design doc) and *enforces* two grouping invariants
-/// in O(1) memory, yielding an `Err` on the first record that violates either:
+/// (guaranteed by grouped output; see the design doc) and *enforces* three grouping invariants
+/// in O(1) memory, yielding an `Err` on the first record that violates any of them:
 ///
 /// 1. **Every record is MI-tagged.** `fgumi group`/`fgbio GroupReadsByUmi` tag every emitted
 ///    read with an MI, so a record with a missing or unparseable MI base (`base == None`)
@@ -62,10 +60,15 @@ impl MoleculeRun {
 ///    A deliberately high per-run record ceiling ([`MAX_MOLECULE_RUN_RECORDS`]) turns that
 ///    pathological O(file) accumulation into a clear error instead of an eventual OOM; a
 ///    well-formed grouped input has bounded UMI families and never approaches it.
-pub(crate) fn molecule_runs<R: Read>(
-    reader: RawBamRecordReader<R>,
-) -> impl Iterator<Item = Result<MoleculeRun>> {
-    molecule_runs_capped(reader, MAX_MOLECULE_RUN_RECORDS)
+///
+/// Any `Err` — a violated invariant or an upstream read failure — is terminal: the iterator
+/// fuses and drops the partially accumulated run, so a caller that keeps polling sees `None`
+/// rather than that partial molecule handed back as a complete one.
+pub(crate) fn molecule_runs<I>(records: I) -> impl Iterator<Item = Result<MoleculeRun>>
+where
+    I: Iterator<Item = std::io::Result<RawRecord>>,
+{
+    molecule_runs_capped(records, MAX_MOLECULE_RUN_RECORDS)
 }
 
 /// Deliberately high last-resort ceiling on the number of records buffered for a *single*
@@ -78,19 +81,31 @@ pub(crate) const MAX_MOLECULE_RUN_RECORDS: usize = 100_000_000;
 /// [`molecule_runs`] with an explicit per-run record ceiling, so tests can exercise the
 /// over-cap error path without materializing 100M records. Production always calls through the
 /// public wrapper with [`MAX_MOLECULE_RUN_RECORDS`].
-pub(crate) fn molecule_runs_capped<R: Read>(
-    mut reader: RawBamRecordReader<R>,
+pub(crate) fn molecule_runs_capped<I>(
+    mut records: I,
     max_run_records: usize,
-) -> impl Iterator<Item = Result<MoleculeRun>> {
+) -> impl Iterator<Item = Result<MoleculeRun>>
+where
+    I: Iterator<Item = std::io::Result<RawRecord>>,
+{
     let mut pending: Vec<RawRecord> = Vec::new();
     let mut pending_base: Option<i64> = None;
     // The largest base MI of any run started so far — O(1), not an O(molecules) set (see
     // invariant 2 in the doc comment).
     let mut last_base: Option<i64> = None;
+    // Set once any arm below yields an `Err`. Every error here is terminal, and
+    // `std::iter::from_fn` is not fused: without this, a caller that polls again after an
+    // error would fall through to the end-of-stream arm and receive the records still in
+    // `pending` as a *complete* run — a partial molecule reported as whole, which is the
+    // silent truncation these errors exist to prevent.
+    let mut failed = false;
     std::iter::from_fn(move || {
-        loop {
-            match reader.next_record() {
-                Ok(Some(rec)) => {
+        if failed {
+            return None;
+        }
+        let item = loop {
+            match records.next() {
+                Some(Ok(rec)) => {
                     // Invariant 1: every record in a non-empty grouped input carries a
                     // parseable MI. `get_mi_tag_raw` returns `None` for both a missing tag and
                     // an unparseable one; reject the first such record (stricter than a
@@ -98,7 +113,7 @@ pub(crate) fn molecule_runs_capped<R: Read>(
                     let base = match get_mi_tag_raw(&rec).map(|mi| mi.base()) {
                         Some(b) => b,
                         None => {
-                            return Some(Err(anyhow!(
+                            break Some(Err(anyhow!(
                                 "input is not grouped: encountered a record with no (or an \
                                  unparseable) MI tag; grouping comparison requires every record \
                                  in a non-empty input to be MI-tagged (grouped output tags every \
@@ -112,7 +127,7 @@ pub(crate) fn molecule_runs_capped<R: Read>(
                         // rather than buffering O(file-size) records for a degenerate one-MI
                         // input.
                         if pending.len() >= max_run_records {
-                            return Some(Err(anyhow!(
+                            break Some(Err(anyhow!(
                                 "input is not grouped: a single molecule (MI base {base}) exceeds \
                                  {max_run_records} buffered records before yielding; a well-formed \
                                  grouped input has bounded UMI families, so this indicates \
@@ -129,7 +144,7 @@ pub(crate) fn molecule_runs_capped<R: Read>(
                     if let Some(m) = last_base
                         && base <= m
                     {
-                        return Some(Err(anyhow!(
+                        break Some(Err(anyhow!(
                             "input is not grouped: MI base {base} is not greater than a \
                              previously seen base {m}; grouping comparison requires \
                              same-MI-consecutive (grouped) input with monotonically \
@@ -144,18 +159,29 @@ pub(crate) fn molecule_runs_capped<R: Read>(
                         let done = std::mem::take(&mut pending);
                         pending_base = Some(base);
                         pending.push(rec);
-                        return Some(Ok(MoleculeRun::from_members(done)));
+                        break Some(Ok(MoleculeRun::from_members(done)));
                     }
                 }
-                Ok(None) => {
+                None => {
                     if pending.is_empty() {
-                        return None;
+                        break None;
                     }
-                    return Some(Ok(MoleculeRun::from_members(std::mem::take(&mut pending))));
+                    break Some(Ok(MoleculeRun::from_members(std::mem::take(&mut pending))));
                 }
-                Err(e) => return Some(Err(e.into())),
+                // A read failure must never be mistaken for end-of-stream: a
+                // corrupt input has to surface as an error, not as a file that
+                // simply held fewer molecules.
+                Some(Err(e)) => break Some(Err(e.into())),
             }
+        };
+        if matches!(item, Some(Err(_))) {
+            failed = true;
+            // Release the partial run rather than merely emptying it: the per-run cap fires
+            // only once `pending` is already enormous, and the iterator can outlive the error.
+            pending = Vec::new();
+            pending_base = None;
         }
+        item
     })
 }
 
@@ -206,7 +232,7 @@ mod tests {
         }
 
         let file = std::fs::File::open(tmp.path()).expect("open temp BAM");
-        let mut reader = RawBamRecordReader::new(file).expect("open raw reader");
+        let mut reader = fgumi_sort::RawBamRecordReader::new(file).expect("open raw reader");
         reader.skip_header().expect("skip header");
 
         molecule_runs_capped(reader, max_run_records).collect::<Result<Vec<_>>>()
@@ -320,5 +346,79 @@ mod tests {
         let runs = try_collect_runs_capped(recs, 2).expect("a run at the cap must be accepted");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].members.len(), 2);
+    }
+
+    /// A read failure must propagate as an error, never be mistaken for end-of-stream.
+    /// The record source hands back `io::Result`, so treating an `Err` like `None`
+    /// would silently turn a corrupt input into a file that simply held fewer
+    /// molecules — a wrong answer from a comparison oracle rather than a failure.
+    ///
+    /// The records already buffered when the failure arrives must not be emitted as a
+    /// complete run either: they are a partial molecule, and reporting them as whole
+    /// would be the same silent truncation one layer down.
+    #[test]
+    fn a_read_failure_propagates_instead_of_ending_the_stream() {
+        let records = vec![
+            Ok(rec(b"r_a", "1")),
+            Err(std::io::Error::other("simulated decompression failure")),
+        ];
+
+        let err = molecule_runs(records.into_iter())
+            .collect::<Result<Vec<_>>>()
+            .expect_err("a read failure must surface as an error, not a short file");
+        assert!(
+            err.to_string().contains("simulated decompression failure"),
+            "the underlying I/O failure must reach the caller: {err}"
+        );
+    }
+
+    /// Every error arm is terminal, and none may leave the partially accumulated molecule
+    /// behind. `std::iter::from_fn` is not fused, so a caller that polls past an error would
+    /// otherwise reach the end-of-stream arm and receive `pending` as a *complete*
+    /// [`MoleculeRun`] — a partial molecule reported as whole, which is exactly the silent
+    /// truncation these errors exist to prevent. `collect::<Result<Vec<_>>>` stops at the
+    /// first `Err`, so this is latent rather than live today; the cases below pin it at the
+    /// iterator rather than relying on every future caller to stop polling.
+    ///
+    /// One case per error arm — read failure, MI-less record, non-monotonic base, and the
+    /// per-run cap — because each breaks from a different point in the loop. Each case pins a
+    /// fragment unique to its arm, so a case cannot pass by tripping a *different* error than
+    /// the one it names.
+    #[rstest]
+    #[case::read_failure(
+        vec![Ok(rec(b"r_a", "1")), Err(std::io::Error::other("simulated decompression failure"))],
+        MAX_MOLECULE_RUN_RECORDS,
+        "simulated decompression failure"
+    )]
+    #[case::mi_less_record(
+        vec![Ok(rec(b"r_a", "1")), Ok(mi_less())],
+        MAX_MOLECULE_RUN_RECORDS,
+        "MI-tagged"
+    )]
+    #[case::non_monotonic_base(
+        vec![Ok(rec(b"r_a", "5")), Ok(rec(b"r_b", "1"))],
+        MAX_MOLECULE_RUN_RECORDS,
+        "not greater than"
+    )]
+    #[case::over_run_cap(vec![Ok(rec(b"r_a", "1")), Ok(rec(b"r_b", "1"))], 1, "single molecule")]
+    fn an_error_is_terminal_and_discards_the_partial_run(
+        #[case] records: Vec<std::io::Result<RawRecord>>,
+        #[case] max_run_records: usize,
+        #[case] expected_fragment: &str,
+    ) {
+        let mut runs = molecule_runs_capped(records.into_iter(), max_run_records);
+
+        let err = runs
+            .next()
+            .expect("the error must be yielded, not swallowed")
+            .expect_err("the first item must be the error, not a run");
+        assert!(
+            err.to_string().contains(expected_fragment),
+            "expected the {expected_fragment:?} arm to fire, got: {err}"
+        );
+        assert!(
+            runs.next().is_none(),
+            "polling past an error must not emit the buffered partial molecule as a run"
+        );
     }
 }

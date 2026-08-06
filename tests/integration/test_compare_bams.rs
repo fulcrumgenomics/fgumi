@@ -880,7 +880,7 @@ fn test_positional_compare_zero_batch_size_errors() {
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
 
-    let err = positional_compare(&bam1, &bam2, 1, 0, 100, ContentPredicate::Exact)
+    let err = positional_compare(&bam1, &bam2, 1, 0, 100, ContentPredicate::Exact, None)
         .expect_err("batch_size 0 must error at the engine boundary, not hang");
     assert!(
         err.to_string().contains("batch size must be at least 1"),
@@ -902,7 +902,7 @@ fn test_positional_compare_identical_bams_match() {
     write_bam(&bam1, &header, &records);
     write_bam(&bam2, &header, &records);
 
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 100, ContentPredicate::Exact)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 100, ContentPredicate::Exact, None)
         .expect("positional_compare should succeed");
 
     assert_eq!(outcome.bam1_count, 2);
@@ -935,7 +935,7 @@ fn test_positional_compare_seq_difference_is_one_content_diff() {
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 100, ContentPredicate::Exact)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 100, ContentPredicate::Exact, None)
         .expect("positional_compare should succeed");
 
     assert_eq!(outcome.bam1_count, 1);
@@ -965,7 +965,7 @@ fn test_positional_compare_swapped_records_is_key_mismatch() {
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 100, ContentPredicate::Exact)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 100, ContentPredicate::Exact, None)
         .expect("positional_compare should succeed");
 
     assert_eq!(outcome.bam1_count, 2);
@@ -994,7 +994,7 @@ fn test_positional_compare_extra_trailing_record_is_presence_differ() {
     write_bam(&bam1, &header, &records1);
     write_bam(&bam2, &header, &records2);
 
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 100, ContentPredicate::Exact)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 100, ContentPredicate::Exact, None)
         .expect("positional_compare should succeed");
 
     assert_eq!(outcome.bam1_count, 2);
@@ -1022,7 +1022,7 @@ fn test_positional_compare_header_sq_length_mismatch_is_a_diff() {
     write_bam(&bam1, &header1, &records);
     write_bam(&bam2, &header2, &records);
 
-    let outcome = positional_compare(&bam1, &bam2, 1, 64, 100, ContentPredicate::Exact)
+    let outcome = positional_compare(&bam1, &bam2, 1, 64, 100, ContentPredicate::Exact, None)
         .expect("positional_compare should succeed");
 
     assert!(outcome.header_mismatch, "a @SQ length mismatch must be flagged: {outcome:?}");
@@ -2297,14 +2297,21 @@ fn write_identical_orderless_pair(dir: &Path) -> (PathBuf, PathBuf) {
 }
 
 /// A BAM that DECLARES coordinate order but whose records are out of coordinate order must be
-/// rejected up-front (don't trust the @HD tag), independent of record content.
+/// rejected (don't trust the @HD tag), independent of record content.
+///
+/// Asserts the specific diagnostic rather than merely that the word "order" appears: the
+/// message must name the declared order that was violated and the offending input, so that a
+/// change to the order check cannot degrade the report while still "containing order".
 #[test]
 fn content_mode_rejects_records_not_in_declared_coordinate_order() {
     let tmp = TempDir::new().unwrap();
     let bad = write_bam_declaring_coordinate_but_unsorted(tmp.path()); // pos 500 then pos 100
     let good = write_sorted_coordinate_bam(tmp.path());
     let err = run_compare_content_expect_err(&good, &bad);
-    assert!(err.to_lowercase().contains("order"), "got: {err}");
+    assert!(err.contains("violate the declared"), "got: {err}");
+    assert!(err.contains("Coordinate"), "must name the declared order violated: {err}");
+    let bad_name = bad.file_name().unwrap().to_str().unwrap();
+    assert!(err.contains(bad_name), "must name the offending input {bad_name}: {err}");
 }
 
 /// An orderless (extract-style `SO:unsorted GO:query`, no SS) pair has no verifiable order:
@@ -3039,5 +3046,188 @@ fn test_compare_bams_cli_reads_a_non_reopenable_input(#[case] preset: &str) {
         stdout.contains(expected_result_line),
         "the same data over a FIFO must compare equal to itself: --command {preset} must print \
          {expected_result_line:?}, got:\n{stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Content mode: sort-order verification
+//
+// Content mode pairs records purely by position, so an `@HD`-declared order the
+// records do not actually honor would silently corrupt that pairing rather than
+// surfacing as an honest diff. The check runs inside the comparison's own record
+// pass (`OrderCheck`, folded into `positional_compare`) rather than as a separate
+// traversal of each input, and these tests pin the contract that fold has to
+// preserve: that a mis-sorted input is rejected, that the reported violation
+// *count* reflects the whole file rather than stopping at the first bad record,
+// and that bam1 is reported before bam2 when both are mis-sorted.
+// ---------------------------------------------------------------------------
+
+/// Writes a coordinate-declaring BAM whose records appear at `positions` in the
+/// given order — so a caller can declare `SO:coordinate` while emitting records
+/// that violate it.
+fn write_coordinate_declared_bam(path: &Path, positions: &[i32]) {
+    let header = create_coordinate_sorted_header("chr1", 100_000);
+    let records: Vec<RawRecord> = positions
+        .iter()
+        .enumerate()
+        .map(|(i, pos)| mapped_record(format!("read{i:04}").as_bytes(), *pos))
+        .collect();
+    write_bam(path, &header, &records);
+}
+
+/// The reported violation count covers the whole file, not just the first bad
+/// record. This is why the check accumulates instead of failing fast, and it is
+/// the property a "simplify to fail-fast" refactor would silently break.
+#[test]
+fn content_mode_reports_every_sort_order_violation_not_just_the_first() {
+    let tmp = TempDir::new().unwrap();
+    let sorted = tmp.path().join("sorted.bam");
+    let mis_sorted = tmp.path().join("mis_sorted.bam");
+
+    write_coordinate_declared_bam(&sorted, &[100, 200, 300, 400, 500, 600]);
+    // Two independent backwards steps: 150 after 200, and 350 after 400.
+    write_coordinate_declared_bam(&mis_sorted, &[100, 200, 150, 400, 350, 600]);
+
+    let (code, _stdout, stderr) = run_compare(&sorted, &mis_sorted, "content", &[]);
+    assert_eq!(code, Some(1), "a mis-sorted input must fail: {stderr}");
+    assert!(
+        stderr.contains("2 record(s) violate"),
+        "violation count must cover the whole file, not stop at the first: {stderr}"
+    );
+}
+
+/// When both inputs are mis-sorted, bam1 is reported. Pins the evaluation order,
+/// which is what keeps the diagnostic stable now that both files are checked in
+/// one pass rather than one-then-the-other.
+#[test]
+fn content_mode_reports_bam1_when_both_inputs_are_mis_sorted() {
+    let tmp = TempDir::new().unwrap();
+    let first = tmp.path().join("first.bam");
+    let second = tmp.path().join("second.bam");
+
+    write_coordinate_declared_bam(&first, &[100, 200, 150, 400]);
+    write_coordinate_declared_bam(&second, &[100, 200, 150, 400]);
+
+    let (code, _stdout, stderr) = run_compare(&first, &second, "content", &[]);
+    assert_eq!(code, Some(1), "mis-sorted inputs must fail: {stderr}");
+    assert!(
+        stderr.contains("first.bam") && !stderr.contains("second.bam"),
+        "bam1 must be the input reported when both are mis-sorted: {stderr}"
+    );
+}
+
+/// A correctly-sorted pair that declares its order must still compare normally —
+/// the order check must not reject well-formed input, at any thread count. The
+/// thread parameter covers the split decompression budget as well as the check.
+#[rstest]
+fn content_mode_accepts_input_that_honors_its_declared_sort_order(#[values(1, 4)] threads: usize) {
+    let tmp = TempDir::new().unwrap();
+    let a = tmp.path().join("a.bam");
+    let b = tmp.path().join("b.bam");
+
+    write_coordinate_declared_bam(&a, &[100, 200, 300, 400]);
+    write_coordinate_declared_bam(&b, &[100, 200, 300, 400]);
+
+    assert!(
+        run_compare_in_process(&a, &b, "content", &["-t", &threads.to_string()]),
+        "correctly sorted identical BAMs must match at --threads {threads}"
+    );
+}
+
+/// Once pairing stops because one input ran out, `positional_compare` keeps draining
+/// the longer side — and must keep checking its order while doing so. The drained
+/// records are the ones no counterpart ever forced it to look at, so an order check
+/// that stopped at the last paired record would report a violation count covering
+/// only part of the file, and miss a file whose *only* mis-sorted records are in its
+/// unpaired tail. The batch size is 1 so the tail genuinely arrives as extra batches
+/// through the drain loop rather than inside the last paired batch.
+///
+/// Both directions are covered because the two sides drain through separate loops.
+#[rstest]
+#[case::bam1_is_longer(true)]
+#[case::bam2_is_longer(false)]
+fn positional_compare_checks_sort_order_in_the_unpaired_tail(#[case] bam1_is_longer: bool) {
+    let tmp = TempDir::new().unwrap();
+    let short = tmp.path().join("short.bam");
+    let long = tmp.path().join("long.bam");
+
+    write_coordinate_declared_bam(&short, &[100, 200]);
+    // The tail (everything past record 2) steps backwards at 300 -> 250.
+    write_coordinate_declared_bam(&long, &[100, 200, 300, 250, 400]);
+
+    let (bam1, bam2) = if bam1_is_longer { (&long, &short) } else { (&short, &long) };
+    let err = positional_compare(
+        bam1,
+        bam2,
+        1,
+        1,
+        100,
+        ContentPredicate::Exact,
+        Some(fgumi_sort::SortOrder::Coordinate),
+    )
+    .expect_err("a violation in the unpaired tail must still be reported");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("1 record(s) violate"),
+        "the drained tail must be order-checked too: {msg}"
+    );
+    assert!(msg.contains("long.bam"), "must name the mis-sorted input: {msg}");
+}
+
+/// Truncating a BAM mid-BGZF-block makes its reader fail partway through. That must
+/// surface as an error naming the offending input, never as a short file: a
+/// silently-short read turns a corrupt input into a record-count DIFFER, or a false
+/// IDENTICAL when both sides are damaged alike, from the tool whose only job is
+/// deciding whether two files agree.
+///
+/// Both positions are covered because each input is received through its own branch,
+/// and both the paired phase and the drain phase are covered because they receive
+/// through separate loops. Which phase sees the failure is set by how many records
+/// the intact side holds, since the damaged side fails partway through 20,000:
+/// one record makes the intact side reach EOF first, so the failure arrives while
+/// the damaged side is being drained; 20,000 keeps both sides live, so it arrives
+/// while they are still being paired. A small intact count would put every case in
+/// the drain loop and leave the pairing loop untested.
+#[rstest]
+#[case::damaged_bam1_while_pairing(true, 20_000)]
+#[case::damaged_bam2_while_pairing(false, 20_000)]
+#[case::damaged_bam1_while_draining(true, 1)]
+#[case::damaged_bam2_while_draining(false, 1)]
+fn positional_compare_reports_a_damaged_input_rather_than_a_short_one(
+    #[case] damage_bam1: bool,
+    #[case] intact_records: i32,
+) {
+    let tmp = TempDir::new().unwrap();
+    let intact = tmp.path().join("intact.bam");
+    let damaged = tmp.path().join("damaged.bam");
+
+    let positions: Vec<i32> = (0..intact_records).map(|i| 100 + i).collect();
+    write_coordinate_declared_bam(&intact, &positions);
+
+    // Enough records to span several BGZF blocks, so the cut lands well past the
+    // header and the reader delivers batches before it fails.
+    let long_positions: Vec<i32> = (0..20_000).map(|i| 100 + i).collect();
+    let whole = tmp.path().join("whole.bam");
+    write_coordinate_declared_bam(&whole, &long_positions);
+    let bytes = fs::read(&whole).expect("read whole BAM");
+    fs::write(&damaged, &bytes[..bytes.len() * 3 / 5]).expect("write truncated BAM");
+
+    let (bam1, bam2) = if damage_bam1 { (&damaged, &intact) } else { (&intact, &damaged) };
+    let err = positional_compare(
+        bam1,
+        bam2,
+        1,
+        1,
+        100,
+        ContentPredicate::Exact,
+        Some(fgumi_sort::SortOrder::Coordinate),
+    )
+    .expect_err("a truncated input must error, not read as a shorter file");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("damaged.bam"),
+        "the error must name the input that failed to read: {msg}"
     );
 }

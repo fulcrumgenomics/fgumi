@@ -20,8 +20,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use crossbeam_channel::{Receiver, bounded};
 use fgumi_bam_io::{RawBamReaderAuto, create_raw_bam_reader};
+use fgumi_raw_bam::RawRecord;
 use fgumi_raw_bam::fields as raw_fields;
-use fgumi_raw_bam::{RawRecord, find_int_tag, find_string_tag};
 use log::info;
 use noodles::sam::Header;
 use std::path::PathBuf;
@@ -516,10 +516,18 @@ impl std::fmt::Display for MiKey {
 /// yields `None`, matching the "missing MI" treatment used by the caller.
 pub(crate) fn get_mi_tag_raw(raw: &RawRecord) -> Option<MiKey> {
     let aux = raw_fields::aux_data_slice(raw.as_ref());
-    if let Some(v) = find_int_tag(aux, SamTag::MI) {
-        return Some(MiKey::Int(v));
-    }
-    let bytes = find_string_tag(aux, SamTag::MI)?;
+    // One scan of the aux data, not two. Probing `find_int_tag` and then falling
+    // back to `find_string_tag` walked every tag twice for the `MI:Z:` form that
+    // `fgumi group` actually writes, and `MI` is appended late so each walk covers
+    // nearly the whole tag block. This is per record on the grouping engine's
+    // critical path.
+    let bytes = match fgumi_raw_bam::RawTagsView::new(aux).get(SamTag::MI)? {
+        fgumi_raw_bam::TagValue::Int(v) => return Some(MiKey::Int(v)),
+        fgumi_raw_bam::TagValue::String(bytes) => bytes,
+        // Any other aux type is not a molecule id; treated as absent, exactly as
+        // the previous int-then-string probe did.
+        _ => return None,
+    };
     let s = std::str::from_utf8(bytes).ok()?;
     if let Some((base_str, strand_str)) = s.rsplit_once('/') {
         let base = base_str.parse::<i64>().ok()?;
@@ -633,8 +641,13 @@ impl Command for CompareBams {
         // reopening the paths, so `--command sort` and `--command group` accept an
         // input that can only be opened once (a FIFO, a process substitution). See
         // `engines::OpenedInput`.
-        let input1 = OpenedInput::open(&self.bam1)?;
-        let input2 = OpenedInput::open(&self.bam2)?;
+        // `--threads` reaches both inputs' BGZF decoders, and each input reads
+        // ahead on its own thread, so the two decodes overlap each other and the
+        // comparison. Previously both were decoded inline on this thread and the
+        // flag did nothing for `sort`/`grouping` (issue #686). `content` mode has
+        // always passed `threads` per input this way (`start_raw_batch_reader`),
+        // so the two paths now agree on what the flag means.
+        let (input1, input2) = OpenedInput::open_pair(&self.bam1, &self.bam2, self.threads)?;
         let declared_order = require_compatible_headers(&input1.header, &input2.header)
             .context("input BAM headers are incompatible")?;
 
@@ -684,17 +697,23 @@ impl Command for CompareBams {
         // (`Grouping` routes through the streaming molecule-join engine, which matches
         // molecules by MI-invariant canonical id — the lexicographically smallest read name
         // in each molecule — rather than by position, so it is order-INDEPENDENT ACROSS
-        // molecules and never needs `verify_records_in_order`'s stream-level check. That is
+        // molecules and never needs the stream-level order check. That is
         // not the same as "no validation needed", though: `molecule_runs` (see
         // `super::molecule`) enforces its own precondition — that each molecule's own
         // records are consecutive, i.e. same-MI-consecutive/grouped input — and returns an
         // `Err` if a base MI's run is found non-contiguous, rather than silently trusting it).
-        if let Some(order) = declared_order
-            && matches!(mode, CompareMode::Content)
-        {
-            super::engines::sort_verify::verify_records_in_order(&self.bam1, order)?;
-            super::engines::sort_verify::verify_records_in_order(&self.bam2, order)?;
-        }
+        // The check itself is folded into `positional_compare`'s own record pass
+        // (see its `verify_order` parameter) rather than run here as two dedicated
+        // traversals. Verifying up front cost a full read of each input *before*
+        // the comparison read them again — four traversals for a job needing two —
+        // and bought nothing: the comparison already drains both inputs to
+        // completion, so it sees every record the standalone pass would have, and
+        // reports the identical diagnostic.
+        // `declared_order` is `None` for genuinely orderless input (extract/fastq/
+        // zipper output), in which case there is nothing to verify. No mode filter
+        // is applied here: this value is consumed only by the `Content` arm below,
+        // so a filter on the mode could never remove anything at the point of use.
+        let verify_order = declared_order;
 
         // In `--quiet` mode only the exit code communicates the result, so suppress this
         // command's own informational stderr logging and timer (matching `compare metrics`).
@@ -743,14 +762,15 @@ impl Command for CompareBams {
         };
 
         let total_records = match mode {
-            // Content mode makes two passes over each input — the order verification
-            // already done above and then the record comparison itself — so it cannot
-            // stream a one-shot input and reopens by path. Releasing the streams here
-            // keeps it from holding a pipe open for a read it will never make.
+            // Content mode reopens both inputs by path for its batched, double-
+            // buffered readers, so the streams opened here for the header check are
+            // released rather than held open for a read that will never come. (The
+            // order verification that once made this a genuine two-pass mode is now
+            // folded into the comparison pass itself.)
             CompareMode::Content => {
                 drop(input1);
                 drop(input2);
-                self.execute_content(predicate)?
+                self.execute_content(predicate, verify_order)?
             }
             CompareMode::Grouping => self.execute_grouping(input1, input2)?,
         };
@@ -799,7 +819,14 @@ impl CompareBams {
     /// [`PositionalOutcome`](super::engines::positional::PositionalOutcome) — this
     /// report now shows record counts, a content-diff count, and (if pairing
     /// desynced) the first `RecordKey` mismatch index instead.
-    fn execute_content(&self, predicate: ContentPredicate) -> Result<u64> {
+    /// `verify_order` carries the sort order the records must actually honor, or
+    /// `None` for genuinely orderless input. It is checked inside the comparison's
+    /// own pass rather than by re-reading both inputs first (see `execute`).
+    fn execute_content(
+        &self,
+        predicate: ContentPredicate,
+        verify_order: Option<fgumi_sort::SortOrder>,
+    ) -> Result<u64> {
         if !self.quiet {
             info!(
                 "Starting content comparison with {} threads, batch size {}",
@@ -814,6 +841,7 @@ impl CompareBams {
             self.batch_size,
             self.max_diffs,
             predicate,
+            verify_order,
         )?;
 
         let is_equal = outcome.is_match();
@@ -1225,6 +1253,24 @@ mod tests {
     #[test]
     fn get_mi_tag_raw_rejects_unknown_strand_suffix() {
         let rec = raw_record_with_aux(&aux_mi_string(b"5/C"));
+        assert_eq!(get_mi_tag_raw(&rec), None);
+    }
+
+    /// An `MI` tag of any other aux type is not a molecule id and is treated as
+    /// absent — the same answer the previous int-then-string probe gave, now that a
+    /// single scan returns whatever type is actually there. Reading such a value as
+    /// a molecule id would silently join unrelated reads into one molecule.
+    #[rstest]
+    #[case::float(b'f', (1.5f32).to_le_bytes().to_vec())]
+    #[case::char(b'A', vec![b'x'])]
+    #[case::int_array(b'B', vec![b'i', 1, 0, 0, 0, 7, 0, 0, 0])]
+    fn get_mi_tag_raw_treats_a_non_id_aux_type_as_absent(
+        #[case] type_code: u8,
+        #[case] payload: Vec<u8>,
+    ) {
+        let mut aux = vec![b'M', b'I', type_code];
+        aux.extend_from_slice(&payload);
+        let rec = raw_record_with_aux(&aux);
         assert_eq!(get_mi_tag_raw(&rec), None);
     }
 
