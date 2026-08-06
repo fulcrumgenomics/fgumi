@@ -61,6 +61,38 @@ jobs:
       - name: Clippy check
         run: cargo ci-lint
 
+  # `merge_slots.rs` swaps `std::sync` for `loom::sync` under `--cfg loom`, and
+  # `tests/loom_merge_slots.rs` is `#![cfg(loom)]`. Neither is built by any other
+  # job, so without this one a broken model — or a `cfg(loom)` build that stopped
+  # compiling — is invisible: the test target compiles to an empty binary under a
+  # normal build and reports success. That silence is the whole reason this job
+  # exists.
+  #
+  # Per-PR rather than on a schedule, unlike `miri.yml` and `stress.yml`. Those
+  # two are scheduled because they are non-deterministic in ways unrelated to a
+  # given change (a nightly-toolchain regression; timing sensitivity). Loom
+  # explores a bounded state space deterministically — four of the five models
+  # under a preemption bound, see the test's "Preemption-bounded exploration"
+  # note — so the same input yields the same verdict with no flake, which is
+  # what lets it gate a PR, and a gate is what stops it rotting.
+  loom:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Set up compilation cache (sccache)
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      # Release: the models explore enough interleavings that a debug build takes
+      # several times as long for the same verdict.
+      - name: Loom model check (SortMergeSlot)
+        run: cargo test -p fgumi-sort --test loom_merge_slots --release
+        env:
+          RUSTFLAGS: --cfg loom
+
   coverage:
     runs-on: ubuntu-latest
     timeout-minutes: 20
