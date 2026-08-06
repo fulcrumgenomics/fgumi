@@ -187,6 +187,46 @@ of records) and a safe rewrite measurably regresses sort throughput.
   `RawQuerynameKey::new`).
 - **`crates/fgumi-sort/src/radix.rs`** — internal radix-sort helpers; see file
   comments for the `SAFETY:` invariants.
+- **`crates/fgumi-sort/src/segmented_buf.rs`** — two `#[allow(unsafe_code)]`
+  sites backing the arena record buffer (a segmented, append-only `Vec<u8>` the
+  sort engine decompresses/frames records into without per-record allocation):
+  - `grow_uninit` — grows a segment's live `len` over
+    reserved-but-uninitialized bytes via `Vec::set_len` (after `reserve`), to skip
+    zero-filling the slot on the ingest hot path. SAFETY: after `reserve(additional)`,
+    `capacity() >= new_len`, so `set_len(new_len)` only extends `len` over
+    already-allocated bytes; `u8` has no drop glue and no validity invariant, so
+    growing `len` over uninitialized bytes is not itself UB — the documented contract
+    requires the caller to fully write the grown `[old_len, new_len)` region (via
+    `slice_mut`) before any read, and a read-before-write is the only UB, which the
+    contract forbids. Pointer stability is a *separate* invariant: this `reserve`
+    MAY reallocate and move the segment, so no `slice_mut` borrow may be live across
+    a `grow_uninit` — the borrow checker enforces this in the single-threaded case
+    (`&mut self`), and `reserve_full_capacity`, called once per fresh segment,
+    makes the per-slot `reserve` a no-op so it cannot move the inner buffer.
+    That covers the inner buffer ONLY. It is NOT sufficient to run `grow_uninit`
+    concurrently with a live `slice_mut` — that overlap is exactly what
+    `slice_mut`'s third precondition forbids, and Miri reports UB on it.
+    `grow_uninit` may reach `advance_segment`, which pushes to `self.segments`;
+    that push reallocates the OUTER `Vec<Vec<u8>>` whenever the vector is at
+    capacity, freeing the buffer a concurrent reader is indexing
+    (use-after-free), while its `set_len` races that reader's bounds check on
+    every call. Neither hazard is closed by pre-sizing, and neither can be:
+    the two methods take `&mut self` and `&self`, so overlapping them is an
+    aliasing violation whatever the caller does. That is why this is stated as
+    a precondition rather than engineered around. The supported concurrent shape
+    is to reserve every slot for a segment before handing any of them to workers.
+  - `slice_mut` — synthesizes a `&mut [u8]` slot from a shared `&self`
+    (so disjoint slots can be written concurrently by different workers). SAFETY:
+    the asserted `seg_offset + len <= seg.len()` keeps the range inside the
+    segment's live region (in-bounds pointer + length); the `&mut` is sound only
+    under the caller's disjointness contract — each call's range must not overlap
+    any other concurrently-borrowed range — so the produced `&mut` aliases no
+    other `&`/`&mut`, AND under the separate requirement that no `&mut self`
+    method runs while the borrow is live (see the `grow_uninit` note above).
+    Approved for the same reason as the other sort hot paths:
+    ingest runs once per record over millions-to-billions of records, and a safe
+    rewrite (zero-fill on grow, or an owning `Vec` per slot) measurably regresses
+    sort throughput.
 
 ### Approved natural-order comparator (fgumi-raw-bam)
 
@@ -198,16 +238,17 @@ path: the comparator runs once per sort-key comparison, and the safe form
 (re-bounds-checking every byte / re-validating the null terminator) measurably
 regresses `samtools sort -n`–style throughput.
 
-- **`crates/fgumi-raw-bam/src/sort.rs`** — four `#[allow(unsafe_code)]` sites:
-  - `natural_compare` (line ~80) — `get_unchecked` over `&[u8]` in the digit-run
+- **`crates/fgumi-raw-bam/src/sort.rs`** — two production `#[allow(unsafe_code)]`
+  sites plus two test sites (the `#[cfg(test)]` boundary sits between them):
+  - `natural_compare` — `get_unchecked` over `&[u8]` in the digit-run
     hot loop. SAFETY: indices are bounded by the loop invariants `pa < alen` /
     `pb < blen`, asserted in `debug_assert!` for the `at` helper.
-  - `natural_compare_nul` (line ~180) — raw `*const u8` walk that mirrors
+  - `natural_compare_nul` — raw `*const u8` walk that mirrors
     samtools' `strnum_cmp`. SAFETY: caller guarantees both pointers are
     null-terminated; `RawQuerynameKey::new` enforces this for every production
     call site.
-  - `compare_nul` test helper and the `proptest` agreement test (lines ~273 and
-    ~300) — push an explicit NUL into a `Vec<u8>` then take `as_ptr()`.
+  - `compare_nul` test helper and the `proptest` agreement test — push an
+    explicit NUL into a `Vec<u8>` then take `as_ptr()`.
     SAFETY: the buffers are `to_vec()` + push, so the pointer is valid and
     null-terminated for the call's lifetime.
 
@@ -294,6 +335,25 @@ storing a reference whose real lifetime the struct cannot name.
   it. Soundness rests on the second invariant — every step instance is dropped
   before the contexts it cached from — which is what must be preserved by any
   future change.
+
+### Test-only `#[allow(unsafe_code)]` sites
+
+The counts above are **production** sites. Tests carry their own
+`#[allow(unsafe_code)]` where they exercise an already-approved `unsafe` API
+directly — in `fgumi-sort` that is `segmented_buf.rs`, driving
+`SegmentedBuf::grow_uninit` / `slice_mut` to check reserve-then-write
+round-trips; in `fgumi-raw-bam` it is the `compare_nul` helper and the
+`proptest` agreement test in `src/sort.rs`, both already named above. They add
+no new `unsafe` *surface*: each calls a function already
+justified above, under that function's documented contract. A raw
+`grep -c 'allow(unsafe_code)'` therefore reports more sites than this document
+names, and the difference is entirely tests — when auditing, count sites outside
+`#[cfg(test)]`, and check each entry's own wording for whether it is quoting a
+production-only count.
+
+Entries name the function rather than a line number on purpose: approximate
+line numbers go stale the moment anything above them moves, and a confidently
+wrong pointer is worse than none.
 
 Any new `unsafe` site must extend this list and explain why the safe
 alternative is unacceptable. Do not introduce `unsafe` outside the crates
