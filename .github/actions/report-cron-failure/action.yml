@@ -1,0 +1,87 @@
+name: Report cron failure
+description: >-
+  Open (or update) a tracking issue when a scheduled workflow fails, so a red
+  cron is visible in the repository rather than only in per-user email.
+
+# A scheduled workflow that fails notifies nobody except the person who last
+# touched its file, by email, which is easy to filter and invisible to everyone
+# else. `miri.yml` failed on every run for two weeks before anyone noticed. This
+# action turns that silence into an issue in the repository.
+#
+# One issue per workflow, reused: a failure that persists for weeks comments on
+# the existing issue rather than filing a new one each night. Filing duplicates
+# would be just as easy to tune out as filing nothing.
+
+inputs:
+  token:
+    description: "Token with `issues: write` on this repository."
+    required: true
+  label:
+    description: Label applied to the tracking issue.
+    required: false
+    default: ci-failure
+
+runs:
+  using: composite
+  steps:
+    - name: Open or update the tracking issue
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        LABEL: ${{ inputs.label }}
+        REPO: ${{ github.repository }}
+        WORKFLOW: ${{ github.workflow }}
+        REF_NAME: ${{ github.ref_name }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -euo pipefail
+
+        title="Scheduled workflow failing: ${WORKFLOW}"
+
+        # Created on demand so the action is self-contained: a repository that
+        # has never had a cron failure needs no out-of-band setup for the first
+        # one to be reportable. Idempotent -- a second create is a no-op.
+        gh label create "$LABEL" --repo "$REPO" \
+          --description "A scheduled workflow is failing" --color d73a4a \
+          >/dev/null 2>&1 || true
+
+        # Match on the exact title rather than `--search`, whose full-text
+        # matching would also hit issues that merely mention the workflow.
+        #
+        # `--limit` because `gh issue list` returns only the first 30 otherwise.
+        # The label is shared by every workflow's tracking issue and by anything
+        # a human labels, so the one being looked for can be paged out -- and a
+        # miss files a duplicate, which is exactly what the dedupe exists to
+        # prevent. 100 is far above any plausible count of open `ci-failure`
+        # issues while still being a single request.
+        existing=$(
+          gh issue list --repo "$REPO" --label "$LABEL" --state open --limit 100 \
+            --json number,title \
+            | jq -r --arg t "$title" '[.[] | select(.title == $t)] | .[0].number // empty'
+        )
+
+        if [ -n "$existing" ]; then
+          # "not green" rather than "failed": the callers also report a run
+          # cancelled by its `timeout-minutes`, which is a hang, not a failure.
+          gh issue comment "$existing" --repo "$REPO" \
+            --body "Still not green on \`${REF_NAME}\` — [run](${RUN_URL})."
+          echo "Commented on existing issue #${existing}."
+        else
+          # Heredoc so the body reads as the Markdown it becomes. It must stay
+          # flush left: `<<EOF` does not strip indentation, and leading spaces
+          # would render as a code block.
+          body=$(cat <<EOF
+        The scheduled workflow \`${WORKFLOW}\` did not succeed on \`${REF_NAME}\`
+        -- it failed, or was cancelled after exceeding its timeout.
+
+        Failing run: ${RUN_URL}
+
+        This issue was opened automatically. Subsequent failures of this workflow
+        comment here rather than filing new issues, so the comment count is how long
+        it has been broken. Close it once the workflow is green again — the next
+        failure opens a fresh one.
+        EOF
+          )
+          gh issue create --repo "$REPO" --label "$LABEL" --title "$title" --body "$body"
+          echo "Opened a new tracking issue."
+        fi

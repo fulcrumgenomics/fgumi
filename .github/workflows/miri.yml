@@ -20,7 +20,9 @@ on:
     - cron: "0 8 * * *" # daily at 08:00 UTC
   workflow_dispatch: {}
 
-# The job only reads the repository and runs tests; it never writes back.
+# The job reads the repository and runs tests; it never writes back to contents.
+# `issues: write` is granted to the `report-failure` job alone, which is the only
+# thing here that writes anything.
 permissions:
   contents: read
 
@@ -79,3 +81,50 @@ jobs:
           # `.proptest-regressions` file the lookup resolves to.
           MIRIFLAGS: -Zmiri-disable-isolation
         run: cargo +nightly miri test -p fgumi-raw-bam sort
+
+  # Nothing watches a cron's result, so a failure has to announce itself. See the
+  # action for why it reuses one issue per workflow.
+  #
+  # A separate job rather than a final step in `miri`, because the two failures
+  # most worth reporting are the ones a step could not report on. A step there
+  # `uses: ./...`, which only resolves once the repository is on disk, so a failed
+  # checkout takes the reporting down with it; and `timeout-minutes` *cancels* the
+  # job, which skips `if: failure()` steps entirely -- so the hang that bound
+  # exists to catch would go unreported. A separate job checks out for itself and
+  # reads the outcome from `needs`, which survives both.
+  report-failure:
+    needs: miri
+    # `always()`, or this job is skipped along with its cancelled dependency --
+    # which would give back the timeout blind spot the job exists to close.
+    #
+    # `cancelled` as well as `failure` because GitHub documents a `timeout-minutes`
+    # overrun as cancelling the job, and does not state which of the two it then
+    # reports; matching both makes a hang reportable either way. The cost is that
+    # a deliberately cancelled scheduled run also files -- but a human cancelling
+    # a nightly cron was watching it, and the dedupe folds that into one issue
+    # they can close. A hang has nobody watching, which is the whole problem.
+    #
+    # Scheduled runs only: a `workflow_dispatch` failure is already in front of
+    # whoever dispatched it, and -- once a workflow also runs on `pull_request` --
+    # a PR failure is visible in that PR's checks. Filing an issue for either is
+    # noise; the silent trigger is the one that needs it.
+    if: >-
+      always()
+      && (needs.miri.result == 'failure' || needs.miri.result == 'cancelled')
+      && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    # The only write access in this workflow, scoped to the one job that writes.
+    permissions:
+      contents: read
+      issues: write
+    # A checkout and three `gh` calls; minutes here mean stuck, not busy.
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Report failure
+        uses: ./.github/actions/report-cron-failure
+        with:
+          token: ${{ github.token }}
