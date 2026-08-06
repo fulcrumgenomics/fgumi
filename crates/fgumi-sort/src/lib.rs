@@ -83,6 +83,7 @@ pub(crate) mod loser_tree;
 pub(crate) mod memory_probe;
 pub(crate) mod merge_headroom;
 pub(crate) mod merge_phases;
+pub(crate) mod merge_slots;
 pub(crate) mod merge_stalls;
 pub(crate) mod merge_trace;
 pub(crate) mod phase1_keys;
@@ -251,6 +252,7 @@ pub use keys::{
     QuerynameComparator, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
     SortContext, SortOrder, natural_compare, natural_compare_nul, normalize_natural_key,
 };
+pub use merge_slots::{PHASE2_DECOMP_CAP, SortMergeReader, SortMergeSlot};
 pub use reader::{
     OwnedRawBamRecordReader, RawBamRecordReader, open_raw_bam_record_reader,
     open_raw_bam_record_reader_with_header,
