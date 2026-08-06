@@ -13,6 +13,12 @@ keywords = ["bioinformatics", "bam", "sort", "sequencing", "ngs"]
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }
 
+[lints.rust]
+# `loom` is a config flag set only for the model-checking test target
+# (`tests/loom_merge_slots.rs`, run via `RUSTFLAGS="--cfg loom"`). Declare it so
+# the unexpected-cfg lint stays quiet under the normal `-D warnings` build.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [dependencies]
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
 fgumi-bgzf = { workspace = true }
@@ -60,3 +66,12 @@ rstest = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
+
+# loom is only compiled under `--cfg loom`. It is a *regular* (not dev)
+# dependency so `merge_slots.rs` itself can swap `std::sync` -> `loom::sync`
+# under `#[cfg(loom)]` and have its REAL atomics/locks model-checked by
+# `tests/loom_merge_slots.rs` (which drives the real `SortMergeSlot`). The test
+# is `#![cfg(loom)]` (empty under a normal build).
+# Run with:  RUSTFLAGS="--cfg loom" cargo test -p fgumi-sort --test loom_merge_slots --release
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
