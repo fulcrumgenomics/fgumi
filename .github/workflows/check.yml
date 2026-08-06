@@ -115,6 +115,30 @@ jobs:
       - name: Audit dependencies for known vulnerabilities
         run: cargo audit
 
+  # The publish ORDER check, run per-PR. `publish.yml` runs it too, but that
+  # workflow only triggers on push to `main` — so before this job existed, a
+  # crate missing from the publish list, or one listed before its dependency,
+  # was discovered mid-publish, on main, after earlier crates had already gone
+  # to crates.io. A published version cannot be deleted, only yanked, so the
+  # failure is not recoverable by re-running. Every check here is pure
+  # `cargo metadata` plus list arithmetic — no registry access, no secrets, a
+  # couple of seconds — so there is no reason for it to wait for release day.
+  #
+  # This is distinct from `publish-dry-run` below, which validates each crate's
+  # MANIFEST (declared versions on path deps, include paths, feature refs). That
+  # says nothing about whether the publish list is complete or correctly ordered.
+  publish-order:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Validate the crates.io publish list is complete and correctly ordered
+        run: ./scripts/publish-crates.sh --check
+
   publish-dry-run:
     runs-on: ubuntu-latest
     steps:
