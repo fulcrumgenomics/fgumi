@@ -1394,8 +1394,8 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
 
     /// Parse the next record from a source's byte stream.
     ///
-    /// Handles the format: for `EMBEDDED_IN_RECORD` keys, reads [len(4)][record(len)].
-    /// For keyed format, reads [key][len(4)][record(len)].
+    /// Handles the format: for `EMBEDDED_IN_RECORD` keys, reads `[len(4)][record(len)]`.
+    /// For keyed format, reads `[key][len(4)][record(len)]`.
     fn parse_next_record(&mut self, source_id: usize, buf: &mut Vec<u8>) -> Result<Option<K>> {
         let mut len_buf = [0u8; 4];
 
@@ -3618,7 +3618,7 @@ impl RawExternalSorter {
     /// Disk chunks become `PoolDisk` sources: the shared worker pool reads and
     /// decompresses them in the background while the main thread parses records,
     /// so no per-source threads are spawned. Both the plain
-    /// ([`merge_chunks_generic`]) and indexed ([`merge_chunks_with_index`])
+    /// ([`Self::merge_chunks_generic`]) and indexed ([`Self::merge_chunks_with_index`])
     /// merges go through this pool-integrated path.
     fn build_chunk_sources<K: RawSortKey + Default + 'static>(
         chunk_files: &[PathBuf],
@@ -3647,8 +3647,8 @@ impl RawExternalSorter {
 
     /// Build the pooled merge sources and activate Phase 2.
     ///
-    /// Shared by both the plain ([`merge_chunks_generic`]) and indexed
-    /// ([`merge_chunks_with_index`]) merges so the Phase-2 lifecycle is
+    /// Shared by both the plain ([`Self::merge_chunks_generic`]) and indexed
+    /// ([`Self::merge_chunks_with_index`]) merges so the Phase-2 lifecycle is
     /// single-sourced and the two paths cannot drift. Returns the sources plus
     /// an RAII [`Phase2Guard`] (borrowing `pool`); callers finish through
     /// [`Phase2Guard::finish_output`], and `Drop` resets Phase 2 on any path
@@ -3838,7 +3838,7 @@ impl RawExternalSorter {
     /// Identical input/output pipeline to `merge_chunks_generic` — the shared
     /// worker pool decompresses the input runs (`PoolDisk` sources) and
     /// compresses the output blocks — but the output goes through
-    /// [`PooledBamWriter::new_indexing`], which tracks each record's virtual
+    /// [`crate::pooled_bam_writer::PooledBamWriter::new_indexing`], which tracks each record's virtual
     /// file offset and returns the generated BAI index. A single pool of
     /// workers therefore serves both decompression and compression; there is no
     /// separate writer thread pool and no serialized single-reader input.
