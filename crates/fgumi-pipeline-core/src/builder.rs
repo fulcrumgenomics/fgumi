@@ -1389,7 +1389,7 @@ const DEADLOCK_FATAL_MULTIPLE: u64 = 6;
 /// backpressure is the internal `SortMergeSlot` slot table, not a pipeline
 /// `CountBounded` edge.) [`ensure_monitor_visible_transports`] enforces this
 /// invariant in **every** build (it returns
-/// [`PipelineError::MonitorBlindTransport`], not a debug assertion) whenever the
+/// [`crate::signal::PipelineError::MonitorBlindTransport`], not a debug assertion) whenever the
 /// monitor is armed, so a future step that declares a monitor-blind transport on
 /// a fail-fast pipeline fails at startup rather than silently losing the wedge
 /// verdict. Extending the probe to count-based queues for full defense-in-depth
@@ -1455,11 +1455,11 @@ fn first_monitor_blind_transport(
 /// `CountBounded`/`Unbounded` for `#[cfg(test)]` chains (which do not arm the
 /// monitor), so this only fires for a real fail-fast pipeline.
 ///
-/// Returns a [`PipelineError::MonitorBlindTransport`] (rather than panicking or
+/// Returns a [`crate::signal::PipelineError::MonitorBlindTransport`] (rather than panicking or
 /// being a debug-only check) so the guard runs in release builds — where the
 /// blind spot actually matters — yet a misconfigured chain fails gracefully at
 /// startup, consistent with the other build/run-time validations (e.g.
-/// [`PipelineError::NotEnoughThreads`]) rather than crashing the process.
+/// [`crate::signal::PipelineError::NotEnoughThreads`]) rather than crashing the process.
 fn ensure_monitor_visible_transports(
     steps: &[Box<dyn super::erased::ErasedStep>],
     graph: &super::topology::ChainGraph,
@@ -1480,7 +1480,7 @@ fn ensure_monitor_visible_transports(
 /// wedge from upstream starvation (mirrors legacy `check_deadlock_and_restore`):
 ///   - idle with nothing in flight → starvation, reset the clock, keep watching;
 ///   - stuck work past `warn_timeout` → `warn` snapshot, once per warn window;
-///   - stuck work past `fatal_timeout` → record [`PipelineError::TimedOut`] and
+///   - stuck work past `fatal_timeout` → record [`crate::signal::PipelineError::TimedOut`] and
 ///     `cancel()`, so workers observe `is_done()` and the run fails fast instead
 ///     of hanging forever.
 ///
@@ -1541,7 +1541,7 @@ struct StallMonitorState {
 
 /// React to one classified [`StallVerdict`], mutating the rolling monitor
 /// `mon_state` and performing the verdict's side effect (a warn snapshot, or
-/// recording a fatal [`PipelineError::TimedOut`] + `cancel`). Extracted from
+/// recording a fatal [`crate::signal::PipelineError::TimedOut`] + `cancel`). Extracted from
 /// [`run_deadlock_monitor`]'s poll loop so each per-verdict action is
 /// unit-testable without spawning a thread or waiting on wall-clock time —
 /// mirroring the pure `classify_stall` / `in_flight_bytes` split. Returns

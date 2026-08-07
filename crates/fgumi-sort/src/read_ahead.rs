@@ -399,7 +399,7 @@ impl PooledInputStream {
     /// Read the next raw BAM record, borrowing its bytes from the current
     /// decompressed block when possible.
     ///
-    /// This is the borrow-in-place counterpart to [`read_raw_record`]: it removes
+    /// This is the borrow-in-place counterpart to [`fgumi_raw_bam::read_raw_record`]: it removes
     /// the per-record `read_exact` copy into a `RawRecord` on the common path
     /// where the record body lies wholly within the current decompressed block.
     ///
@@ -414,7 +414,7 @@ impl PooledInputStream {
     /// The returned slice borrows `self`; it is invalidated by the next call to
     /// any method on this stream. Returns `Ok(None)` at clean EOF.
     ///
-    /// A `block_size` of 0 is treated as EOF, mirroring [`read_raw_record`].
+    /// A `block_size` of 0 is treated as EOF, mirroring [`fgumi_raw_bam::read_raw_record`].
     ///
     /// # Errors
     ///

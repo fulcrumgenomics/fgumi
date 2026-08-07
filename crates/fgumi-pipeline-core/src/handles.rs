@@ -358,7 +358,7 @@ pub(crate) struct Branch<T: Send + HeapSize + 'static> {
     pub(crate) metrics: Option<Arc<crate::runtime::metrics::EdgeMetrics>>,
 }
 
-/// Mint a per-edge [`EdgeMetrics`] when instrumentation is on, else `None`.
+/// Mint a per-edge [`crate::runtime::metrics::EdgeMetrics`] when instrumentation is on, else `None`.
 /// Called once per branch in the `build_branch*` constructors; the same handle
 /// is shared by the transport (push counts) and the input handle (pop counts).
 fn edge_metrics(
