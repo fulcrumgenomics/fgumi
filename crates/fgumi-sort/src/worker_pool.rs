@@ -138,38 +138,17 @@ pub(crate) fn read_length_prefix<R: std::io::Read + ?Sized>(
     Ok(Some(frame_len))
 }
 
-/// Cap on the uncompressed size of a zstd spill frame.
-///
-/// Derived from the writer's frame size rather than fixed, because a buffer
-/// smaller than the largest frame the writer can emit fails to decompress
-/// *every* frame at that size -- a total-failure mode, not a slow one.
-///
-/// The slack is **proportional** (4x), not a fixed addend, and that is
-/// load-bearing rather than tidiness. This buffer is per-worker scratch touched
-/// once per decompressed frame -- millions of times in a spill-heavy merge -- so
-/// its size is a cache-locality parameter, not just an allocation. A fixed
-/// `+ 4 MiB` of slack measured **249.5s against a 199.2s baseline (+25%)** at the
-/// default frame size, because it took 8 workers from 2 MiB of hot scratch to
-/// 32.5 MiB while peak RSS barely moved. At 4x it evaluates to exactly the 256
-/// KiB this constant held before it was derived, so the default path is
-/// unchanged and larger frames scale with it.
-///
-/// The 256 KiB floor matters because `BGZF_MAX_BLOCK_SIZE` is 65,280 -- not
-/// 65,536 -- so a bare 4x lands 1 KiB *under* the tuned value rather than on it.
-#[must_use]
-pub(crate) const fn zstd_decomp_cap() -> usize {
-    let scaled = 4 * crate::bgzf_io::SPILL_FRAME_BYTES;
-    if scaled > 256 * 1024 { scaled } else { 256 * 1024 }
-}
+/// Cap on uncompressed size of a zstd spill frame. Production frames are
+/// bounded by the staging buffer (`BGZF_MAX_BLOCK_SIZE` + padding ~= 68 KB);
+/// this leaves slack but stays small enough that per-frame allocations don't
+/// dominate the merge phase when there are many tens of thousands of frames.
+const ZSTD_FRAME_DECOMP_CAP: usize = 256 * 1024;
 
-/// Hard cap on the `u32 LE` length prefix of any zstd spill frame.
-///
-/// Scaled from the writer's frame size so the guard can never reject a frame
-/// this build is capable of emitting, while still refusing to allocate gigabytes
-/// on a corrupt prefix. Compressed frames are smaller than their input in
-/// practice, so the doubling is pure slack.
-pub(crate) const MAX_ZSTD_FRAME_BYTES: usize =
-    2 * 1024 * 1024 + 2 * crate::bgzf_io::SPILL_FRAME_BYTES;
+/// Hard cap on the `u32 LE` length prefix of any zstd spill frame. Frames are
+/// produced one per ~64 KiB of input by `compress_job`; even
+/// pathological expansion can't reach this. Beyond it, we treat the value as
+/// corruption rather than allocate gigabytes.
+pub(crate) const MAX_ZSTD_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
 /// Maximum zstd compression level recognized by the `zstd` crate.
 const ZSTD_MAX_CLEVEL: u32 = 22;
@@ -265,27 +244,11 @@ pub enum SortStep {
     Compress = 2,
     /// Read+decompress one unit of work for some Phase 2 spill file (work-stealing).
     Phase2FileWork = 3,
-    /// Extract the sort keys for one batch of already-ingested records.
-    ///
-    /// Phase 1 slack work: the ingest thread defers key extraction rather than
-    /// paying 120 ns/record for it serially, and any worker can pick a batch up.
-    /// It is scheduled *last* everywhere on purpose — a batch that waits costs
-    /// nothing until the chunk barrier, whereas displacing `DecompressInput`
-    /// would starve the very thread this step exists to unblock.
-    ExtractKeys = 4,
-    /// Read one byte slice of some reader's in-flight fill.
-    ///
-    /// Scheduled *first* everywhere, the mirror image of `ExtractKeys`: a
-    /// pending slice is what a thread holding an exclusive reader is blocked
-    /// on, so every moment it waits is a moment nothing downstream is fed. A
-    /// deferred key batch costs nothing until the chunk barrier; a deferred
-    /// slice costs the pipeline immediately.
-    FetchBytes = 5,
 }
 
 impl SortStep {
     /// Number of distinct sort steps.
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 4;
 
     /// Short label for display.
     #[must_use]
@@ -295,8 +258,6 @@ impl SortStep {
             Self::DecompressInput => "DecInp",
             Self::Compress => "Cmprs",
             Self::Phase2FileWork => "P2File",
-            Self::ExtractKeys => "ExtKey",
-            Self::FetchBytes => "Fetch",
         }
     }
 }
@@ -323,16 +284,6 @@ pub(crate) struct SortPipelineStats {
     pub per_thread_step_counts: Box<[[AtomicU64; SortStep::COUNT]; SORT_MAX_THREADS]>,
     /// Per-thread idle time in nanoseconds (time in backoff/yield).
     pub per_thread_idle_ns: Box<[AtomicU64; SORT_MAX_THREADS]>,
-    /// Nanoseconds each worker spent inside a successful step.
-    ///
-    /// The existing per-thread array counts steps but not their duration, so a
-    /// worker doing few expensive steps was indistinguishable from one doing
-    /// many cheap ones.
-    pub per_thread_busy_ns: Box<[AtomicU64; SORT_MAX_THREADS]>,
-    /// Times each worker was the *first* to claim the block the consumer was
-    /// parked on. Says whether critical-path service is spread across the pool
-    /// or concentrated on a few workers.
-    pub per_thread_awaited_claims: Box<[AtomicU64; SORT_MAX_THREADS]>,
 
     /// Number of worker threads (for display bounds).
     pub num_threads: usize,
@@ -347,8 +298,6 @@ impl SortPipelineStats {
             step_count: std::array::from_fn(|_| AtomicU64::new(0)),
             per_thread_step_counts: new_sort_2d_array(),
             per_thread_idle_ns: new_sort_1d_array(),
-            per_thread_busy_ns: new_sort_1d_array(),
-            per_thread_awaited_claims: new_sort_1d_array(),
             num_threads,
         }
     }
@@ -360,14 +309,6 @@ impl SortPipelineStats {
         self.step_count[step_idx].fetch_add(1, Ordering::Relaxed);
         if thread_id < SORT_MAX_THREADS {
             self.per_thread_step_counts[thread_id][step_idx].fetch_add(1, Ordering::Relaxed);
-            self.per_thread_busy_ns[thread_id].fetch_add(elapsed_ns, Ordering::Relaxed);
-        }
-    }
-
-    /// Credit a worker with first-claiming the consumer's awaited block.
-    pub fn record_awaited_claim(&self, thread_id: usize) {
-        if thread_id < SORT_MAX_THREADS {
-            self.per_thread_awaited_claims[thread_id].fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -390,8 +331,6 @@ impl SortPipelineStats {
             SortStep::DecompressInput,
             SortStep::Compress,
             SortStep::Phase2FileWork,
-            SortStep::ExtractKeys,
-            SortStep::FetchBytes,
         ];
 
         for &step in &all_steps {
@@ -556,17 +495,6 @@ pub(crate) struct PermitPool {
     /// finally surfaced. This never produced wrong output or a hang; it just
     /// wasted work on the failure path.
     closed: AtomicBool,
-    /// Writing one compressed block to the file.
-    ///
-    /// Lives here rather than on the pool because the I/O writer thread already
-    /// holds this `Arc`, and one pool per writer keeps the output writer's stats
-    /// from being mixed with a spill writer's.
-    pub(crate) write_dur: crate::merge_trace::DurationHistogram,
-    /// How long a block sat in the writer's reorder map waiting for an earlier
-    /// serial to arrive.
-    pub(crate) write_reorder_wait: crate::merge_trace::DurationHistogram,
-    /// Blocks held in that map, sampled on each arrival. Read "us" as "blocks".
-    pub(crate) write_reorder_depth: crate::merge_trace::DurationHistogram,
     /// Nanoseconds producers spent blocked waiting for a permit, and how many
     /// waits that was.
     ///
@@ -590,9 +518,6 @@ impl PermitPool {
             tx: std::sync::Mutex::new(Some(tx)),
             rx,
             closed: AtomicBool::new(false),
-            write_dur: crate::merge_trace::DurationHistogram::default(),
-            write_reorder_wait: crate::merge_trace::DurationHistogram::default(),
-            write_reorder_depth: crate::merge_trace::DurationHistogram::default(),
             blocked_nanos: AtomicU64::new(0),
             blocked_waits: AtomicU64::new(0),
         }
@@ -637,27 +562,6 @@ impl PermitPool {
         #[allow(clippy::cast_precision_loss, reason = "nanosecond totals stay far below 2^52")]
         let secs = nanos as f64 / 1e9;
         (secs, self.blocked_waits.load(Ordering::Relaxed))
-    }
-
-    /// Writer-side distributions: per-block write, reorder wait, reorder depth.
-    ///
-    /// Read from the pool rather than the writer's staging buffer because the
-    /// pool outlives `PooledBamWriter::finish`, which consumes the staging: the
-    /// output drain happens inside `finish`, so a snapshot taken through the
-    /// still-live writer would omit every block written and every reorder wait
-    /// incurred during the drain.
-    pub(crate) fn writer_stats(
-        &self,
-    ) -> (
-        crate::merge_trace::HistogramReport,
-        crate::merge_trace::HistogramReport,
-        crate::merge_trace::HistogramReport,
-    ) {
-        (
-            self.write_dur.snapshot(),
-            self.write_reorder_wait.snapshot(),
-            self.write_reorder_depth.snapshot(),
-        )
     }
 
     /// Release a permit back to the pool after a block has been written to disk.
@@ -710,37 +614,6 @@ pub(crate) const PHASE2_RAW_CAP: usize = 8;
 /// `ZSTD_FRAME_DECOMP_CAP` (256 KB) for zstd frames. This is a soft cap — the
 /// "always accept the next-expected serial" rule lets it transiently exceed by
 /// up to ~`num_workers` blocks per file.
-/// **Filling this cap was measured, and it is a large regression. Do not retry.**
-///
-/// The pool sits ~0.84 blocks deep on the awaited file while permitted 8, and
-/// `decomp-capped` is 2% at t8 -- an obvious invitation to make each claim serve
-/// several blocks from the file it already walked to, amortizing the 77.2
-/// fruitless file visits every claim pays. Measured on `1kg-wgs-HG00096`,
-/// template-coordinate, 89 spill runs, paired controls in one session:
-///
-/// | arm | grab depth | wasted visits/block | merge wall | util |
-/// | --- | --- | --- | --- | --- |
-/// | t8, one block per claim | 1.00 | 77.6 | 193.8s | 91% |
-/// | t8, up to 8 per claim | 6.07 (p50 8) | **10.6** | **263.7s (+36%)** | 66% |
-/// | t16, one block per claim | 1.00 | 41.5 | 169.5s | 52% |
-/// | t16, up to 8 per claim | 3.16 (p50 2) | 12.6 | 171.8s (+1.4%) | 51% |
-///
-/// The target metric moved 7.3x and the sort got 36% slower. **This cap is per
-/// file, so depth bought on file X does nothing for a consumer parked on file
-/// Y** -- and it consumes the pool capacity that would otherwise have issued Y's
-/// disk read. `fully-buffered` scan skips rose 10x (8.6M -> 83.6M): workers
-/// scan, find every buffer at cap, and sleep, while the awaited file sits
-/// `raw-empty` 98% of the times it is passed over (33% before). Utilization
-/// *falls* to 66% -- idle workers and a consumer waiting 158s for one.
-///
-/// At t16 the grab could not even deepen (3.16, p50 2) because `decomp-capped`
-/// is already 66% there. Raising the cap instead is also measured negative: 8 to
-/// 32 cost 1.3%. And `blocks ready on the awaited file at resume` -- the
-/// invariant no intervention in this campaign has moved -- stayed at 0.81.
-///
-/// The lesson generalizes past this knob: per-file depth is the wrong currency
-/// when the consumer needs one specific file's next serial. Breadth is what
-/// keeps that file served.
 pub(crate) const PHASE2_DECOMP_CAP: usize = 8;
 
 /// Number of raw blocks to read from disk per `ReadRawBlocks` call.
@@ -793,34 +666,13 @@ pub(crate) const NO_AWAITED_SOURCE: usize = usize::MAX;
 /// | --- | --- | --- | --- |
 /// | (none: 4 blocks) | 4 | 326.5s | 54% |
 /// | 1 MiB | 101 | 212.4s | 83% |
-/// | 2 MiB | 201 | 197.5s | 89% |
-/// | **4 MiB** | 402 | **194.5s** | 90% |
+/// | **2 MiB** | 201 | **197.5s** | 89% |
+/// | 4 MiB | 402 | 194.5s | 90% |
 ///
-/// Peak RSS was flat across that sweep (4793-4828 MB against a 4794 MB
-/// baseline), because the deep allowance is scoped to one file and fewer stalls
-/// mean less transient buffering elsewhere.
-///
-/// Re-measured later with paired controls in one session, which moved the
-/// default here from 2 MiB to 4 MiB and bounded it from above:
-///
-/// | threads | 2 MiB | 4 MiB | 32 MiB |
-/// | --- | --- | --- | --- |
-/// | t8 (89 spill runs) | 199.1s (mean of 5) | **193.5 / 193.8s** | 199.3s, **RSS +58%** |
-/// | t16 (44 spill runs) | 178.9s | **169.6s** | not run |
-///
-/// So -2.8% at t8 and -5.2% at t16. **Do not raise it further.** At 32 MiB the
-/// merge is *slower* than at 4 MiB and peak RSS goes 4793 -> 7562 MB, because
-/// `raw-lock` contention climbs with batch depth (29% -> 52% -> 38% of
-/// awaited-file skips): more workers collide on one file's `raw_blocks` mutex.
-/// A wall-clock-only reading would have called that arm harmless.
-///
-/// It helps t16 *more* than t8, and the mechanism is worth knowing because it is
-/// not a scheduling improvement. Critical-path worker discovery lag halves
-/// (98.5s -> 59.8s) and the share of finds arriving after 320us drops 23% ->
-/// 16%: deeper read-ahead does not make recruiting a worker faster, it just
-/// needs fewer recruitments. So it pays most where each recruitment is most
-/// expensive, which is the regime with the *most* idle capacity. See
-/// [`SharedPipelineState::wake_one_worker`] for why recruitment is slow there.
+/// 2 MiB is the knee; 4 MiB buys 3s for twice the read-ahead. Peak RSS was flat
+/// across the whole sweep (4793-4828 MB against a 4794 MB baseline), because
+/// the deep allowance is scoped to one file and fewer stalls mean less
+/// transient buffering elsewhere.
 ///
 /// The floor read-ahead is working against is total worker busy / threads:
 /// ~1400 worker-seconds over 8 threads is ~175s, and an uncorrelated merge of
@@ -829,13 +681,13 @@ pub(crate) const NO_AWAITED_SOURCE: usize = usize::MAX;
 /// compression is 68% of the worker total -- or shortening the serial limits
 /// read-ahead does not touch: the merge consumer's per-record cost, and the
 /// per-block decompress chain on the file the merge is blocked on.
-pub(crate) const PHASE2_STARVING_READ_TARGET_BYTES: u64 = 4 << 20;
+pub(crate) const PHASE2_STARVING_READ_TARGET_BYTES: u64 = 2 << 20;
 
 /// [`PHASE2_STARVING_READ_TARGET_BYTES`] as a `usize`, for the byte budgets that
 /// bound the deep FIFO and a single deep read (both of which count `usize`
 /// bytes). The const assert keeps the two spellings in step, so the target has a
 /// single source of truth without an `as` cast the pedantic lints reject.
-pub(crate) const PHASE2_STARVING_READ_TARGET_BYTES_USIZE: usize = 4 << 20;
+pub(crate) const PHASE2_STARVING_READ_TARGET_BYTES_USIZE: usize = 2 << 20;
 const _: () =
     assert!(PHASE2_STARVING_READ_TARGET_BYTES_USIZE as u64 == PHASE2_STARVING_READ_TARGET_BYTES);
 
@@ -899,51 +751,24 @@ fn awaited_allowance_for(mean_block_bytes: u64) -> (usize, usize) {
 
 /// The file index a Phase 2 scan starts at.
 ///
-/// Three candidates, in order of how well each predicts what the merge needs
-/// next:
+/// The frontier -- the lowest source that has not delivered everything -- when
+/// it is starving, and the worker's own round-robin cursor otherwise. Gated on
+/// starving rather than applied always: a frontier that is merely *active* is
+/// the common case in an interleaved merge, and sending every worker to file 0
+/// there would undo the spread that makes that case fast.
 ///
-/// 1. The **awaited source** when starving -- the file the consumer is actually
-///    parked on. This is measured demand.
-/// 2. The **frontier** when starving -- the lowest source that has not delivered
-///    everything. A *proxy* for demand, correct only while sources drain in index
-///    order, which is what an input already in the requested order produces.
-/// 3. The worker's own round-robin cursor, which spreads workers over the file
-///    set and is what keeps a genuinely interleaved merge saturated.
+/// `frontier` is only meaningful while it indexes a live file; past the end it
+/// names no source and the cursor stands.
 ///
-/// The awaited source outranks the frontier because the proxy is wrong exactly
-/// where it matters: on a partially-correlated input the merge parks on a source
-/// that is not the lowest undrained one, and pointing workers at the frontier
-/// sends them to a file nobody is waiting for. Measured on an 89-way merge, 71%
-/// of consumer park at 16 threads was spent waiting for *any* worker to claim
-/// the needed block while 94% of the other files sat at their buffer cap.
-///
-/// Both redirects are gated on starving rather than applied always. For the
-/// frontier, a merely *active* frontier is the common interleaved case and
-/// sending every worker to file 0 would undo the spread. For the awaited source
-/// the reason is sharper: it is never cleared between parks, so an ungated
-/// version would point every worker at one index permanently, trading a spread
-/// problem for a herd problem.
-///
-/// Neither index is meaningful past the end of the file set, where it names no
-/// source and the next candidate stands.
-///
-/// Pure so every branch of the gate is testable without racing a live pool,
+/// Pure so both branches of the gate are testable without racing a live pool,
 /// following [`classify_scan`](crate::merge_stalls::classify_scan).
 fn phase2_scan_start(
-    awaited: usize,
-    awaited_starving: bool,
     frontier: usize,
     num_files: usize,
     frontier_starving: bool,
     cursor: usize,
 ) -> usize {
-    if awaited < num_files && awaited_starving {
-        awaited
-    } else if frontier < num_files && frontier_starving {
-        frontier
-    } else {
-        cursor
-    }
+    if frontier < num_files && frontier_starving { frontier } else { cursor }
 }
 
 /// The `(raw_cap, read_batch)` a file may read at.
@@ -969,10 +794,8 @@ fn phase2_scan_start(
 ///
 /// [`NO_AWAITED_SOURCE`] means the consumer has not parked yet, and matches no
 /// index.
-fn phase2_deserves_deep_read(index: usize, frontier: usize, awaited: usize, next: usize) -> bool {
-    index == frontier
-        || (awaited != NO_AWAITED_SOURCE && index == awaited)
-        || (next != NO_AWAITED_SOURCE && index == next)
+fn phase2_deserves_deep_read(index: usize, frontier: usize, awaited: usize) -> bool {
+    index == frontier || (awaited != NO_AWAITED_SOURCE && index == awaited)
 }
 
 fn phase2_read_allowance(is_frontier: bool) -> (usize, usize) {
@@ -1050,7 +873,7 @@ pub(crate) struct TimedBlock {
 
 /// Reader state for a single spill file. Locked when reading from disk.
 pub(crate) struct Phase2Reader {
-    pub(crate) inner: crate::spill_reader::SpillSource,
+    pub(crate) inner: BufReader<std::fs::File>,
     pub(crate) next_serial: u64,
     pub(crate) eof: bool,
 }
@@ -1061,6 +884,34 @@ pub(crate) struct Phase2Reader {
 /// file. The locks here are deliberately fine-grained so different workers can
 /// be reading, decompressing, and the main thread can be popping records all
 /// concurrently as long as they touch different sub-states.
+///
+/// # Two Phase-2 merge implementations (production vs. the retained oracle)
+///
+/// **In this tree THIS pool path is the production sort.** `fgumi sort` and
+/// `fgumi merge` both construct a `RawExternalSorter`, so every real sort runs
+/// through here. The source branch's note said the opposite — that the buffer
+/// chain over `merge_slots.rs` had taken over and this path was reduced to a
+/// library entry point and parity oracle — but that end state needs the
+/// typed-step `SortMerge` consumer, which lands with `fgumi-pipeline-io` in a
+/// later phase. Read the paragraph below as describing why the two Phase-2
+/// implementations differ, not as a claim about which one runs.
+///
+/// The two implementations differ deliberately, and that difference is
+/// load-bearing for the oracle. This path keeps the `raw_blocks` FIFO,
+/// `decomp_in_flight`, the reorder buffer, and the gap-filler because its merge
+/// consumer is a parked OS thread (`external.rs::advance_to_next_block`, immune
+/// to the v4 framework-Skip deadlock) and its single-*reader* /
+/// multi-*decompressor* topology means completion order ≠ pop order. The
+/// slimmer `merge_slots.rs` needs only the *inline* subset of that machinery:
+/// its `decompressed` queue is a plain `VecDeque` with no gap-filler, because
+/// its inline consumer reads AND decompresses in one op so blocks decompress
+/// strictly in read order. It still declares `in_flight`, `reader_eof`, and
+/// `reorder` — inert on that inline path, live on its block-parallel one — so
+/// the difference is the gap-filler and the FIFO discipline, not the fields.
+/// Do NOT delete the gap-filler or the reorder buffer
+/// here to "match" `merge_slots` — it would reintroduce a real deadlock and/or
+/// out-of-order merge output. (History: commits `9d6d7e9` / `9c39dea`, PRs
+/// #389 / #395, `docs/design/sort-phase2-unification-deferral.md`.)
 pub(crate) struct Phase2FileState {
     /// Disk reader. Held only while popping bytes from disk.
     pub(crate) reader: Mutex<Phase2Reader>,
@@ -1129,7 +980,7 @@ pub(crate) struct Phase2FileState {
 }
 
 impl Phase2FileState {
-    pub(crate) fn new(reader: crate::spill_reader::SpillSource, codec: SpillCodec) -> Self {
+    pub(crate) fn new(reader: BufReader<std::fs::File>, codec: SpillCodec) -> Self {
         Self {
             reader: Mutex::new(Phase2Reader { inner: reader, next_serial: 0, eof: false }),
             reader_eof: AtomicBool::new(false),
@@ -1377,12 +1228,6 @@ pub struct SortWorkerPool {
     pub buffer_pool: BufferPool,
     num_workers: usize,
     pub(crate) spill_codec: SpillCodec,
-    /// How the merge reads each spill file. `Fixed(1)` keeps the sequential
-    /// `BufReader` a merge has always used.
-    pub(crate) read_streams: crate::external::ReadStreams,
-    /// Whether the `--sort-stats` diagnostics are enabled for this run (run-scoped copy of
-    /// [`crate::RawExternalSorter::sort_stats`]); consulted by this pool's `stat!` emitters.
-    sort_stats: bool,
 }
 
 /// Shared state visible to all workers and the main thread.
@@ -1458,14 +1303,6 @@ pub(crate) struct SharedPipelineState {
     /// `do_shutdown` checks join results and sets this flag so the main thread
     /// does not park forever waiting for work that will never arrive.
     pub(crate) worker_panicked: Arc<AtomicBool>,
-    /// What Phase 1's serial ingest thread waited for. Owned here because the
-    /// input stream records into it and the sorter reports from it, and neither
-    /// owns the other.
-    pub(crate) phase1_ingest: Arc<crate::phase1_stats::Phase1IngestStats>,
-    /// What the exclusively-owned input reader spends its time on. Shared with
-    /// the `TimedReader` wrapped around the input file, which is the only place
-    /// the refill syscalls are visible.
-    pub(crate) reader_stats: Arc<crate::phase1_stats::ReaderStats>,
     /// Next serial for input block reading (atomic increment for ordering).
     input_read_serial: AtomicU64,
     /// Raw input blocks: `ReadInputBlocks` → `DecompressInput`.
@@ -1509,23 +1346,6 @@ pub(crate) struct SharedPipelineState {
     /// Compress jobs: main thread → workers (`ArrayQueue`, non-blocking push).
     pub(crate) compress_queue: Arc<ArrayQueue<CompressJob>>,
 
-    /// Deferred key-extraction batches: ingest thread → workers.
-    ///
-    /// Bounded like every other queue here, and a full queue is *not* an error:
-    /// [`SortWorkerPool::submit_key_job`] hands the batch back and the ingest
-    /// thread runs it inline. That fallback is what makes the ingest thread's
-    /// barrier deadlock-free — it never waits on a batch no worker can reach.
-    pub(crate) key_jobs: Arc<ArrayQueue<Box<dyn crate::phase1_keys::KeyExtractionJob>>>,
-
-    /// Byte slices offered by whichever reader is filling: reader → workers.
-    ///
-    /// Shared by both phases because the job is identical -- read a range at an
-    /// offset into a waiting buffer. A full queue is not an error and neither is
-    /// an idle pool: the offering thread reclaims anything nobody started, which
-    /// is what keeps a fill from waiting on workers that are all themselves
-    /// filling. See [`crate::spill_reader`].
-    pub(crate) fetch_jobs: Arc<crate::spill_reader::FetchQueue>,
-
     /// Number of workers (for `low_water` threshold in backpressure).
     num_workers: usize,
 
@@ -1543,77 +1363,9 @@ pub(crate) struct SharedPipelineState {
     /// slot that is still empty simply cannot be woken yet, which is harmless
     /// because a worker that has not reached its loop is not sleeping either.
     worker_threads: Vec<std::sync::OnceLock<std::thread::Thread>>,
-    /// Per-stage latency distributions and wasted-scan accounting.
-    pub(crate) stage_latency: crate::merge_phases::StageLatency,
-    /// Wakes issued by [`Self::wake_one_worker`].
-    ///
-    /// The denominator for the targeting figures above it: a wake that lands on
-    /// an already-running worker does nothing, so the hit rate is only meaningful
-    /// against how many wakes were issued at all.
-    pub(crate) wakes_issued: AtomicU64,
-    /// When the first worker claimed a block for the awaited source during the
-    /// consumer's current park, or 0 if none has. Reset by the consumer at park.
-    pub(crate) awaited_claim_nanos: AtomicU64,
-    /// When the consumer was last woken, or 0 if not yet during this park.
-    pub(crate) awaited_publish_nanos: AtomicU64,
-    /// Where consumer park time goes, split into additive stages.
-    pub(crate) park_attribution: crate::merge_stalls::ParkAttribution,
     /// Rotates the target of [`Self::wake_one_worker`] so repeated wakes spread
     /// across the pool rather than always hitting worker 0.
     wake_cursor: AtomicUsize,
-    /// Whether each worker is currently inside `park_timeout`.
-    ///
-    /// Written by the worker around its own wait and read by the wake path, so a
-    /// stale read is possible and harmless -- it can only misclassify a wake in
-    /// the counters below, never lose one. Set before parking and cleared after,
-    /// so the window that reads "parked" is a superset of the real one.
-    worker_parked: Vec<AtomicBool>,
-    /// Wakes whose rotating target was not parked, so the unpark was a no-op.
-    ///
-    /// The consumer then waits for some *other* worker's backoff to expire, which
-    /// is bounded by [`MAX_BACKOFF_US`] rather than by wake cost. That is the
-    /// difference between recruitment costing microseconds and costing a
-    /// millisecond, and it is invisible in every other counter.
-    pub(crate) wakes_on_running_worker: AtomicU64,
-    /// The subset of those where a parked worker *did* exist and was passed over.
-    ///
-    /// The recoverable half: targeting a parked worker would have delivered these.
-    /// A wake with nobody parked at all is not the targeting rule's fault.
-    pub(crate) wakes_recoverable: AtomicU64,
-    /// Consumer parks split by what the pool looked like at the instant of the
-    /// park: a sleeper was available, everyone was busy compressing, or everyone
-    /// was busy merging. See [`crate::merge_stalls::ParkSupply`].
-    pub(crate) park_supply: crate::merge_stalls::ParkSupplyCensus,
-    /// Parks avoided because the consumer decompressed the block itself.
-    ///
-    /// The validity gate for that path: if this stays near zero the consumer never
-    /// found an unclaimed block and the change is inert, whatever the clock says.
-    pub(crate) consumer_self_served: AtomicU64,
-    /// The source the merge expects to consume *after* the current one, or
-    /// [`NO_AWAITED_SOURCE`].
-    ///
-    /// `phase2_awaited_source` is reactive -- it can only be set once the consumer
-    /// has already stalled. This is predictive, and the distinction is the whole
-    /// point: the merge starves at run transitions, where only 2,475 of 167,624
-    /// source switches starve but each costs ~20ms against an 8.4ms read latency,
-    /// because the read had not been *started* when the consumer arrived. Depth
-    /// cannot fix that -- doubling the read-ahead cap left the starved share of
-    /// park time at 99% -- but ~300 blocks of advance notice can.
-    pub(crate) phase2_next_source: AtomicUsize,
-    /// Predictions actually published to the pool.
-    ///
-    /// The validity gate for the predictive read-ahead path. `runner_up()` returns
-    /// `None` whenever fewer than two sources are active, and a version that
-    /// returned `None` always would look exactly like a null wall-clock result --
-    /// the deep-read path just never fires and nothing says so. A timing gain is
-    /// only attributable to prediction if this is non-zero.
-    pub(crate) phase2_predictions: AtomicU64,
-    /// Set while the merge consumer is parked on a specific spill file.
-    ///
-    /// `phase2_awaited_source` cannot serve this purpose: it is never cleared
-    /// between parks, so keying on it would rank Phase 2 work first permanently
-    /// and undo the compress-first policy entirely.
-    pub(crate) consumer_parked: AtomicBool,
 
     /// Read batches taken at the deep frontier allowance, and the blocks they
     /// returned; and the same for batches taken at the uniform allowance.
@@ -1659,11 +1411,6 @@ impl SharedPipelineState {
     fn new(num_workers: usize, main_thread_handle: std::thread::Thread) -> Self {
         let data_queue_cap = num_workers * 8;
         let compress_queue_cap = num_workers * 4;
-        // Deeper than the compress queue: batches are pure CPU with no
-        // downstream, so a backlog costs only memory, and a shallow queue would
-        // push the ingest thread onto the inline fallback exactly when the pool
-        // is busiest — reintroducing the serial cost this step removes.
-        let key_job_queue_cap = num_workers * 16;
 
         Self {
             merge_phases: crate::merge_phases::MergePhaseCounters::default(),
@@ -1683,8 +1430,6 @@ impl SharedPipelineState {
             decompression_error: Arc::new(AtomicBool::new(false)),
             chunk_read_error: Arc::new(AtomicBool::new(false)),
             worker_panicked: Arc::new(AtomicBool::new(false)),
-            phase1_ingest: Arc::new(crate::phase1_stats::Phase1IngestStats::default()),
-            reader_stats: Arc::new(crate::phase1_stats::ReaderStats::default()),
             input_read_serial: AtomicU64::new(0),
             raw_input_blocks: Arc::new(ArrayQueue::new(data_queue_cap)),
             decompressed_input: Arc::new(ArrayQueue::new(data_queue_cap)),
@@ -1697,32 +1442,17 @@ impl SharedPipelineState {
             total_sources: AtomicU64::new(0),
 
             compress_queue: Arc::new(ArrayQueue::new(compress_queue_cap)),
-            key_jobs: Arc::new(ArrayQueue::new(key_job_queue_cap)),
-            fetch_jobs: crate::spill_reader::FetchQueue::new(num_workers),
 
             num_workers,
             main_thread_handle,
             worker_threads: (0..num_workers).map(|_| std::sync::OnceLock::new()).collect(),
             wake_cursor: AtomicUsize::new(0),
-            worker_parked: (0..num_workers).map(|_| AtomicBool::new(false)).collect(),
-            wakes_on_running_worker: AtomicU64::new(0),
-            wakes_recoverable: AtomicU64::new(0),
-            park_supply: crate::merge_stalls::ParkSupplyCensus::default(),
-            phase2_next_source: AtomicUsize::new(NO_AWAITED_SOURCE),
-            phase2_predictions: AtomicU64::new(0),
-            consumer_self_served: AtomicU64::new(0),
-            consumer_parked: AtomicBool::new(false),
             deep_read_batches: AtomicU64::new(0),
             deep_read_blocks: AtomicU64::new(0),
             shallow_read_batches: AtomicU64::new(0),
             shallow_read_blocks: AtomicU64::new(0),
             phase2_lowest_active: AtomicUsize::new(0),
             phase2_awaited_source: AtomicUsize::new(NO_AWAITED_SOURCE),
-            stage_latency: crate::merge_phases::StageLatency::default(),
-            wakes_issued: AtomicU64::new(0),
-            awaited_claim_nanos: AtomicU64::new(0),
-            awaited_publish_nanos: AtomicU64::new(0),
-            park_attribution: crate::merge_stalls::ParkAttribution::default(),
             awaited_skips: std::array::from_fn(|_| AtomicU64::new(0)),
             phase2_read_bytes: AtomicU64::new(0),
             phase2_read_blocks: AtomicU64::new(0),
@@ -1734,26 +1464,6 @@ impl SharedPipelineState {
         if let Some(slot) = self.worker_threads.get(worker_id) {
             let _ = slot.set(std::thread::current());
         }
-    }
-
-    /// Wake the merge consumer, stamping when it became runnable.
-    ///
-    /// Every consumer wake goes through here so the park decomposition cannot
-    /// silently miss one of the six unpark sites. The stamp is the moment the
-    /// consumer *could* run, so the gap to it actually resuming is its own wake
-    /// latency rather than fetch time.
-    ///
-    /// Only the first wake in a park is stamped (compare-exchange from 0): a
-    /// park ends on the first wake, and later ones belong to the next park.
-    pub(crate) fn wake_consumer(&self) {
-        let now = self.now_nanos();
-        let _ = self.awaited_publish_nanos.compare_exchange(
-            0,
-            now,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
-        self.main_thread_handle.unpark();
     }
 
     /// Wake one idle worker, rotating which one.
@@ -1773,61 +1483,14 @@ impl SharedPipelineState {
         if self.worker_threads.is_empty() {
             return;
         }
-        self.wakes_issued.fetch_add(1, Ordering::Relaxed);
-        let cursor = self.wake_cursor.fetch_add(1, Ordering::Relaxed);
-        let limit = self.active_worker_limit.load(Ordering::Acquire);
-        let idx =
-            Self::wake_target_preferring_parked(cursor, limit, self.worker_threads.len(), |i| {
-                self.worker_parked[i].load(Ordering::Relaxed)
-            });
-        // The same accounting now doubles as this preference's validity gate: if
-        // it works, "hit an already-running worker" must fall and "recoverable"
-        // must go to roughly zero, because a passed-over sleeper is exactly what
-        // the preference removes. A `recoverable` share that stays high means the
-        // parked flags are going stale between the scan and the unpark.
-        if !self.worker_parked[idx].load(Ordering::Relaxed) {
-            self.wakes_on_running_worker.fetch_add(1, Ordering::Relaxed);
-            let width = limit.min(self.worker_parked.len());
-            if crate::merge_stalls::first_parked_from(cursor, width, |i| {
-                self.worker_parked[i].load(Ordering::Relaxed)
-            })
-            .is_some()
-            {
-                self.wakes_recoverable.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        let idx = Self::wake_target(
+            self.wake_cursor.fetch_add(1, Ordering::Relaxed),
+            self.active_worker_limit.load(Ordering::Acquire),
+            self.worker_threads.len(),
+        );
         if let Some(handle) = self.worker_threads[idx].get() {
             handle.unpark();
         }
-    }
-
-    /// Publish the source the merge expects to consume next, so the pool can start
-    /// its read before the consumer gets there.
-    pub(crate) fn set_phase2_next_source(&self, next: Option<usize>) {
-        if next.is_some() {
-            self.phase2_predictions.fetch_add(1, Ordering::Relaxed);
-        }
-        self.phase2_next_source.store(next.unwrap_or(NO_AWAITED_SOURCE), Ordering::Relaxed);
-    }
-
-    /// Predictions published to the pool. See [`Self::phase2_predictions`].
-    pub(crate) fn phase2_predictions(&self) -> u64 {
-        self.phase2_predictions.load(Ordering::Relaxed)
-    }
-
-    /// How many workers are parked right now, and whether output compression is
-    /// queued -- the two facts that say why nobody had already started on the
-    /// block the consumer is about to wait for.
-    ///
-    /// Scans the parked flags rather than keeping a running count: it runs once
-    /// per consumer park against at most `SORT_MAX_THREADS` relaxed loads, and a
-    /// counter would need an atomic add on both sides of every worker's wait --
-    /// the far hotter path.
-    pub(crate) fn park_supply_now(&self) -> crate::merge_stalls::ParkSupply {
-        let limit = self.active_worker_limit.load(Ordering::Acquire);
-        let width = limit.min(self.worker_parked.len());
-        let parked = (0..width).filter(|&i| self.worker_parked[i].load(Ordering::Relaxed)).count();
-        crate::merge_stalls::classify_park_supply(parked, self.compress_queue.len())
     }
 
     /// Which worker slot the next wake should target.
@@ -1845,33 +1508,6 @@ impl SharedPipelineState {
     /// least 1 so the modulo is always defined, however the limit was set.
     fn wake_target(cursor: usize, active_limit: usize, pool_width: usize) -> usize {
         cursor % active_limit.clamp(1, pool_width.max(1))
-    }
-
-    /// The worker a wake should target, preferring one that is actually parked.
-    ///
-    /// The rotating cursor alone is blind to park state, and at low utilization
-    /// that is where the merge's idle time comes from: a wake spent on a running
-    /// worker leaves an available sleeper asleep for up to `MAX_BACKOFF_US`.
-    /// Measured at t16, parks where a sleeper existed cost 190us against 30us
-    /// when every worker was genuinely busy -- 391,007 of them, 74.4s of a 92.1s
-    /// park. At t8, where workers are 91% busy and essentially never sleep, that
-    /// class is 0.1% of parks and this preference has nothing to act on.
-    ///
-    /// Falls back to the rotating target when nobody is parked, which keeps the
-    /// spread that a genuinely interleaved merge needs. The scan still starts at
-    /// the cursor, so it rotates too rather than concentrating on low indices.
-    fn wake_target_preferring_parked<F>(
-        cursor: usize,
-        active_limit: usize,
-        pool_width: usize,
-        is_parked: F,
-    ) -> usize
-    where
-        F: Fn(usize) -> bool,
-    {
-        let width = active_limit.clamp(1, pool_width.max(1));
-        crate::merge_stalls::first_parked_from(cursor, width, is_parked)
-            .unwrap_or_else(|| Self::wake_target(cursor, active_limit, pool_width))
     }
 
     /// Advance the drain frontier past every source that is now fully drained.
@@ -1911,40 +1547,6 @@ impl SharedPipelineState {
 
             compress_has_items: !self.compress_queue.is_empty(),
             phase: current_phase,
-            consumer_parked: self.consumer_parked.load(Ordering::Relaxed),
-        }
-    }
-}
-
-/// The decompression state one thread needs to turn a spill block into records.
-///
-/// Extracted from [`SortWorkerState`] so the merge consumer can run
-/// [`SortWorkerPool::decompress_and_publish`] itself instead of parking. A second
-/// copy of the codec branch would be the alternative, and a spill format that
-/// disagreed between the two paths is exactly the class of bug that passes the
-/// standard matrix and fails where spill volume is largest.
-pub(crate) struct DecompressorSet {
-    zstd: ZstdDecompressor<'static>,
-    /// Scratch for one zstd frame, sized by [`zstd_decomp_cap`]. Allocated lazily:
-    /// a BGZF-only sort must not pay for it.
-    zstd_buf: Vec<u8>,
-    bgzf: libdeflater::Decompressor,
-}
-
-impl DecompressorSet {
-    /// Sized for `codec`: the zstd scratch is pre-allocated only for zstd spills,
-    /// so a BGZF-only sort does not carry `zstd_decomp_cap()` per thread. The
-    /// decompress path still resizes on demand, so this is an optimization rather
-    /// than a precondition.
-    pub(crate) fn for_codec(codec: SpillCodec) -> Self {
-        let zstd_buf = match codec {
-            SpillCodec::Zstd => vec![0u8; zstd_decomp_cap()],
-            SpillCodec::Bgzf => Vec::new(),
-        };
-        Self {
-            zstd: ZstdDecompressor::new().expect("zstd decompressor init"),
-            zstd_buf,
-            bgzf: libdeflater::Decompressor::new(),
         }
     }
 }
@@ -1964,8 +1566,12 @@ struct SortWorkerState {
     output_compressor: InlineBgzfCompressor,
     /// Zstd compressor reused across spill frames when `SpillCodec::Zstd`.
     zstd_compressor: ZstdCompressor<'static>,
-    /// Decompression state, shared in shape with the merge consumer.
-    decomp: DecompressorSet,
+    /// Zstd decompressor reused across Phase 2 frames when `SpillCodec::Zstd`.
+    zstd_decompressor: ZstdDecompressor<'static>,
+    /// Scratch buffer reused across zstd frame decompressions to avoid
+    /// allocating a fresh Vec for every frame on the merge hot path.
+    zstd_decompress_buf: Vec<u8>,
+    decompressor: libdeflater::Decompressor,
     /// Phase 2 file scan cursor — starts at `worker_id` and advances on success
     /// for cache locality and reduced lock contention. Workers no longer own a
     /// fixed subset of files; any worker can do work on any file.
@@ -1986,23 +1592,6 @@ struct SortWorkerState {
     /// cleared) by the next iteration that finds work, which is what makes that
     /// wait "productive" — see [`crate::merge_stalls::WakeLatencyStats`].
     last_wait: Option<PendingWait>,
-    /// Whether the step this iteration completed produced for the file the merge
-    /// consumer was parked on.
-    ///
-    /// Set and read at the two Phase-2 claim sites, where the file index is in
-    /// hand: it gates the `stamp_awaited_claim` call, so only a worker that
-    /// served the awaited file can credit the first claim. The
-    /// productive-wait path reads `won_awaited_claim` instead, not this field.
-    /// Discovery lag is only paid in wall clock on the awaited file — a
-    /// late wake for any other file is absorbed by idle capacity — so without
-    /// this the aggregate lag cannot be told apart from free lag. Cleared at the
-    /// top of every iteration so a stale `true` cannot survive into a step that
-    /// served a different file.
-    served_awaited: bool,
-    /// Whether this worker won the race to first-claim the consumer's awaited
-    /// block this iteration. Credited per thread by the main loop, which is
-    /// where the stats handle is in scope.
-    won_awaited_claim: bool,
 }
 
 impl SortWorkerState {
@@ -2074,15 +1663,6 @@ struct SortBackpressureState {
     // Shared
     compress_has_items: bool,
     phase: u8,
-    /// Whether the merge consumer is parked right now, waiting on one specific
-    /// spill file.
-    ///
-    /// Output compression is throughput work any worker can do at any time; the
-    /// awaited block is the only thing that can unblock the merge. Measured at
-    /// t16 before this existed: only 10.8% of recruitments served the consumer as
-    /// the woken worker's first action, the rest completing a mean 3.5 other
-    /// steps first, ~2 of them output compress at 188us each.
-    consumer_parked: bool,
 }
 
 /// Backpressure-driven priority selection — the sort pipeline's equivalent
@@ -2099,29 +1679,15 @@ fn get_sort_priorities(bp: &SortBackpressureState) -> &'static [SortStep] {
     match bp.phase {
         phase::PHASE1 => {
             if bp.input_eof && !bp.compress_has_items && bp.decompressed_input_done {
-                // Input fully decompressed and no compress work — only leftover
-                // key batches remain, and eligibility drops the step when there
-                // are none.
-                &[SortStep::FetchBytes, SortStep::ExtractKeys]
+                // Input fully decompressed and no compress work — nothing productive to do
+                &[]
             } else if bp.compress_has_items && !bp.decompressed_input_low {
                 // Spill compression is the bottleneck (13.7s at t4). Drain compress
                 // while decompressed blocks are plentiful for the main thread.
-                &[
-                    SortStep::FetchBytes,
-                    SortStep::Compress,
-                    SortStep::DecompressInput,
-                    SortStep::ReadInputBlocks,
-                    SortStep::ExtractKeys,
-                ]
+                &[SortStep::Compress, SortStep::DecompressInput, SortStep::ReadInputBlocks]
             } else {
                 // Default/starving: feed the main thread first, compress if available
-                &[
-                    SortStep::FetchBytes,
-                    SortStep::DecompressInput,
-                    SortStep::ReadInputBlocks,
-                    SortStep::Compress,
-                    SortStep::ExtractKeys,
-                ]
+                &[SortStep::DecompressInput, SortStep::ReadInputBlocks, SortStep::Compress]
             }
         }
         phase::PHASE2 => {
@@ -2129,37 +1695,16 @@ fn get_sort_priorities(bp: &SortBackpressureState) -> &'static [SortStep] {
             // worker grabs whatever has work. We never gate on `all_chunks_eof`
             // — even after disk reads finish, decompression and parser drain
             // continue until all per-file reorder buffers empty.
-            if bp.consumer_parked {
-                // The merge is blocked on one specific file. Output compression
-                // is throughput work any worker can do at any time; this block is
-                // the only thing that can unblock the consumer, so it goes first
-                // even though the compress queue is the writer-side bottleneck.
-                &[
-                    SortStep::FetchBytes,
-                    SortStep::Phase2FileWork,
-                    SortStep::Compress,
-                    SortStep::ExtractKeys,
-                ]
-            } else if bp.compress_has_items {
+            if bp.compress_has_items {
                 // Drain output compression while we can; it's the writer-side bottleneck.
-                &[
-                    SortStep::FetchBytes,
-                    SortStep::Compress,
-                    SortStep::Phase2FileWork,
-                    SortStep::ExtractKeys,
-                ]
+                &[SortStep::Compress, SortStep::Phase2FileWork]
             } else {
-                &[
-                    SortStep::FetchBytes,
-                    SortStep::Phase2FileWork,
-                    SortStep::Compress,
-                    SortStep::ExtractKeys,
-                ]
+                &[SortStep::Phase2FileWork, SortStep::Compress]
             }
         }
         // Legacy/transition: compress only (drain any remaining jobs, of either
         // kind — each carries its own `CompressTarget`).
-        _ => &[SortStep::FetchBytes, SortStep::Compress, SortStep::ExtractKeys],
+        _ => &[SortStep::Compress],
     }
 }
 
@@ -2168,37 +1713,6 @@ fn get_sort_priorities(bp: &SortBackpressureState) -> &'static [SortStep] {
 // ============================================================================
 
 /// Minimum backoff duration in microseconds.
-/// Where the consumer's wakes went, and what recruited the worker that served
-/// the critical path.
-///
-/// **These numbers do not explain the merge's idle time. Measured, both regimes.**
-/// A wake aimed at an already-running worker does nothing, which looks like a
-/// defect worth fixing until both thread counts are measured:
-///
-/// | | t8 (fast) | t16 (slow) |
-/// | --- | --- | --- |
-/// | hit an already-running worker | **100%** | 88% |
-/// | a parked worker was available | **0%** | 27% |
-/// | consumer's wait for a worker | **10us** | 72us |
-///
-/// t8 scores worse on every count and waits 7x less, because at 91% utilization
-/// there is nobody parked to hit and a running worker reaches the awaited file
-/// almost at once. So "wakes land on busy workers" is what a *healthy* pool looks
-/// like, and targeting parked workers is not the fix for t16.
-///
-/// Kept because they are cheap and because rediscovering this costs a machine
-/// day. What does separate the regimes is
-/// [`crate::merge_stalls::ParkSupply`].
-#[derive(Debug, Clone, Copy)]
-pub struct WakeAccounting {
-    /// Wakes issued.
-    pub issued: u64,
-    /// Wakes whose target was not parked.
-    pub on_running: u64,
-    /// The subset of `on_running` where a parked worker existed and was skipped.
-    pub recoverable: u64,
-}
-
 pub(crate) const MIN_BACKOFF_US: u64 = 10;
 /// Maximum backoff duration in microseconds (1ms).
 ///
@@ -2220,7 +1734,6 @@ pub(crate) const MAX_BACKOFF_US: u64 = 1000;
 /// A pending unpark token makes the next `park_timeout` return at once. That is
 /// a spurious early wake, which costs one scan and is harmless — the caller
 /// loops.
-///
 fn idle_wait_with_jitter(backoff_us: u64, worker_id: usize, iter: u64) {
     if backoff_us <= MIN_BACKOFF_US {
         std::thread::yield_now();
@@ -2354,7 +1867,7 @@ impl Drop for WorkerPanicGuard {
         }
         // Reached only when the worker loop unwound.
         self.shared.worker_panicked.store(true, Ordering::Release);
-        self.shared.wake_consumer();
+        self.shared.main_thread_handle.unpark();
     }
 }
 
@@ -2367,15 +1880,12 @@ impl SortWorkerPool {
     /// - `temp_compression`: BGZF level for Phase 1 spill writes (typically 1 for speed).
     /// - `output_compression`: BGZF level for Phase 2 merge output (typically 6 for size).
     /// - `spill_codec`: codec used for spill chunks (BGZF or Zstd). Output is always BGZF.
-    /// - `sort_stats`: whether `--sort-stats` diagnostics are on for this run (the trailing
-    ///   `bool` at call sites; tests pass `false`).
     #[must_use]
     pub fn new(
         num_workers: usize,
         temp_compression: u32,
         output_compression: u32,
         spill_codec: SpillCodec,
-        sort_stats: bool,
     ) -> Self {
         let buffer_pool = BufferPool::new(num_workers * 4);
         let stats = PoolStats::default();
@@ -2391,19 +1901,24 @@ impl SortWorkerPool {
                 thread::spawn(move || {
                     let zstd_level =
                         i32::try_from(temp_compression.clamp(1, ZSTD_MAX_CLEVEL)).expect("clamped");
+                    let zstd_decompress_buf = if matches!(spill_codec, SpillCodec::Zstd) {
+                        vec![0u8; ZSTD_FRAME_DECOMP_CAP]
+                    } else {
+                        Vec::new()
+                    };
                     let mut worker = SortWorkerState {
                         worker_id,
                         compressor: InlineBgzfCompressor::new(temp_compression),
                         output_compressor: InlineBgzfCompressor::new(output_compression),
                         zstd_compressor: ZstdCompressor::new(zstd_level)
                             .expect("zstd compressor init"),
-                        decomp: DecompressorSet::for_codec(spill_codec),
+                        zstd_decompressor: ZstdDecompressor::new().expect("zstd decompressor init"),
+                        zstd_decompress_buf,
+                        decompressor: libdeflater::Decompressor::new(),
                         phase2_file_cursor: worker_id,
                         held_raw_input_blocks: Vec::new(),
                         held_decompressed_input: None,
                         backoff_us: MIN_BACKOFF_US,
-                        served_awaited: false,
-                        won_awaited_claim: false,
                         idle_iter: 0,
                         last_wait: None,
                     };
@@ -2429,32 +1944,7 @@ impl SortWorkerPool {
             buffer_pool,
             num_workers,
             spill_codec,
-            read_streams: crate::external::ReadStreams::Fixed(1),
-            sort_stats,
         }
-    }
-
-    /// Whether the `--sort-stats` diagnostics are enabled for the run that built this pool.
-    pub(crate) fn sort_stats(&self) -> bool {
-        self.sort_stats
-    }
-
-    /// Park for the current backoff, publish the parked state, and return the
-    /// elapsed park in nanoseconds.
-    ///
-    /// `worker_parked` is set before the wait and cleared after, so the window
-    /// the wake path reads as "parked" is a superset of the real one: a wake is
-    /// never withheld from a worker that is about to park. The reverse error --
-    /// reading "running" for a worker that has just parked -- would lose a wake,
-    /// so the asymmetry is deliberate.
-    fn park_and_measure(shared: &SharedPipelineState, worker: &mut SortWorkerState) -> u64 {
-        let idle_start = Instant::now();
-        shared.worker_parked[worker.worker_id].store(true, Ordering::Relaxed);
-        idle_wait_with_jitter(worker.backoff_us, worker.worker_id, worker.idle_iter);
-        shared.worker_parked[worker.worker_id].store(false, Ordering::Relaxed);
-        worker.idle_iter = worker.idle_iter.wrapping_add(1);
-        worker.backoff_us = (worker.backoff_us * 2).min(MAX_BACKOFF_US);
-        Self::nanos_u64(idle_start.elapsed())
     }
 
     // ========================================================================
@@ -2519,8 +2009,6 @@ impl SortWorkerPool {
             }
 
             let mut did_work = false;
-            worker.served_awaited = false;
-            worker.won_awaited_claim = false;
 
             // 3. Try to advance ALL held items first (deadlock prevention)
             did_work |= Self::try_advance_all_held(shared, worker);
@@ -2602,13 +2090,14 @@ impl SortWorkerPool {
                         .wake_latency
                         .record_productive_sleep(wake_phase(current_phase), waited_ns);
                 }
-                if worker.won_awaited_claim {
-                    pstats.record_awaited_claim(worker.worker_id);
-                }
                 worker.backoff_us = MIN_BACKOFF_US;
             } else {
                 let slept_us = worker.backoff_us;
-                let idle_ns = Self::park_and_measure(shared, worker);
+                let idle_start = Instant::now();
+                idle_wait_with_jitter(slept_us, worker.worker_id, worker.idle_iter);
+                worker.idle_iter = worker.idle_iter.wrapping_add(1);
+                worker.backoff_us = (worker.backoff_us * 2).min(MAX_BACKOFF_US);
+                let idle_ns = Self::nanos_u64(idle_start.elapsed());
                 pstats.record_idle(worker.worker_id, idle_ns);
                 shared.wake_latency.record_sleep(wake_phase(current_phase), slept_us, idle_ns);
                 worker.last_wait = Some(PendingWait { phase: current_phase, nanos: idle_ns });
@@ -2624,12 +2113,6 @@ impl SortWorkerPool {
             phase::PHASE1 => {
                 shared.decompressed_input_done.load(Ordering::Acquire)
                     && shared.compress_queue.is_empty()
-                    // Deferred key batches outlive the input: the last chunk's
-                    // barrier runs after the input is fully decompressed, so
-                    // without this the pool parks precisely when the ingest
-                    // thread is waiting on it and the final chunk's extraction
-                    // collapses back to serial.
-                    && shared.key_jobs.is_empty()
             }
             phase::PHASE2 => {
                 if !shared.all_chunks_eof.load(Ordering::Acquire) {
@@ -2672,19 +2155,6 @@ impl SortWorkerPool {
             phase::PHASE1 => Some(SortStep::ReadInputBlocks),
             _ => None,
         }
-    }
-
-    /// Whether a worker owning `owned_step` may also take key-extraction batches.
-    ///
-    /// The worker that exclusively owns [`SortStep::ReadInputBlocks`] may not.
-    /// A batch is ~0.5 ms of pure CPU, and for that long its worker is not
-    /// reading — and nobody else can read, because the step is exclusive. On the
-    /// production cell, letting the reader's owner take batches cost the reader
-    /// 358 → 345 MB/s and 125.2s → 129.8s, against a phase whose whole remaining
-    /// cost *is* the reader. Every other worker is free to extract, so this
-    /// gives up 1/16th of the extraction capacity to protect the critical path.
-    fn worker_may_extract_keys(owned_step: Option<SortStep>) -> bool {
-        owned_step != Some(SortStep::ReadInputBlocks)
     }
 
     /// Whether a step is exclusive (requires ownership).
@@ -2739,21 +2209,6 @@ impl SortWorkerPool {
             }
             SortStep::Compress => !shared.compress_queue.is_empty(),
             SortStep::Phase2FileWork => current_phase == phase::PHASE2,
-            // Deliberately not gated on the phase: a batch queued late in
-            // Phase 1 must still be reachable while the ingest thread drains at
-            // the chunk barrier, which can coincide with the phase flip.
-            // Not gated on the phase either: both phases fill through the
-            // same queue, and a slice offered as Phase 1 drains must stay
-            // reachable across the flip.
-            SortStep::FetchBytes => !shared.fetch_jobs.is_empty(),
-            SortStep::ExtractKeys => {
-                !shared.key_jobs.is_empty()
-                    && Self::worker_may_extract_keys(Self::exclusive_step_for(
-                        worker.worker_id,
-                        shared,
-                        current_phase,
-                    ))
-            }
         }
     }
 
@@ -2768,30 +2223,7 @@ impl SortWorkerPool {
             SortStep::DecompressInput => Self::try_decompress_input(shared, worker),
             SortStep::Compress => Self::try_compress(shared, worker),
             SortStep::Phase2FileWork => Self::try_phase2_file_work(shared, worker),
-            SortStep::ExtractKeys => Self::try_extract_keys(shared),
-            SortStep::FetchBytes => Self::try_fetch_bytes(shared),
         }
-    }
-
-    /// Read one offered byte slice, if any is still unclaimed.
-    ///
-    /// `InputEmpty` covers both "nothing queued" and "the offering thread
-    /// reclaimed this one first" -- neither did work, and reporting progress
-    /// for a no-op would keep a worker spinning on a queue of stale slices.
-    fn try_fetch_bytes(shared: &SharedPipelineState) -> StepResult {
-        if shared.fetch_jobs.run_one() { StepResult::Success } else { StepResult::InputEmpty }
-    }
-
-    /// Run one deferred key-extraction batch, if any is queued.
-    ///
-    /// Takes no worker state: a batch owns everything it needs and publishes its
-    /// own result, so there is nothing to hold and nothing to advance.
-    fn try_extract_keys(shared: &SharedPipelineState) -> StepResult {
-        let Some(job) = shared.key_jobs.pop() else {
-            return StepResult::InputEmpty;
-        };
-        job.run();
-        StepResult::Success
     }
 
     // ========================================================================
@@ -2818,7 +2250,7 @@ impl SortWorkerPool {
             let pushed =
                 try_advance_held(&shared.decompressed_input, &mut worker.held_decompressed_input);
             if pushed {
-                shared.wake_consumer();
+                shared.main_thread_handle.unpark();
                 advanced = true;
                 // This may have been the last block. Increment `input_blocks_queued` now
                 // that the block is actually in the queue (not held), then re-check the
@@ -2833,7 +2265,7 @@ impl SortWorkerPool {
                     && !shared.decompressed_input_done.load(Ordering::Acquire)
                 {
                     shared.decompressed_input_done.store(true, Ordering::Release);
-                    shared.wake_consumer();
+                    shared.main_thread_handle.unpark();
                 }
             }
         }
@@ -2866,21 +2298,14 @@ impl SortWorkerPool {
             return StepResult::InputEmpty; // No input file set
         };
 
-        // Read a batch of raw BGZF blocks.
-        //
-        // Timed as one region because that is the only honest boundary: the
-        // 2 MiB refill happens *inside* this call, on whichever block exhausts
-        // the buffer. Splitting disk from framing needs a timer below the
-        // buffer, which is what the `TimedReader` on the input file is for --
-        // `ReaderReport::framing_secs` is this span minus that one.
-        let framing_started = Instant::now();
+        // Read a batch of raw BGZF blocks
         let blocks = match read_raw_blocks(reader.as_mut(), INPUT_READ_BATCH_SIZE) {
             Ok(b) => b,
             Err(e) => {
                 log::error!("I/O error reading input BAM: {e}");
                 shared.input_read_error.store(true, Ordering::Release);
                 shared.input_eof.store(true, Ordering::Release);
-                shared.wake_consumer();
+                shared.main_thread_handle.unpark();
                 return StepResult::InputEmpty;
             }
         };
@@ -2889,13 +2314,6 @@ impl SortWorkerPool {
             shared.input_eof.store(true, Ordering::Release);
             return StepResult::InputEmpty;
         }
-
-        // Recorded only past the empty check, so the partition covers exactly the
-        // calls `record_step` charges to `ReadInputBlocks` -- that step is timed
-        // on `StepResult::Success` alone, and the EOF-detecting call returns
-        // `InputEmpty`. Counting it here would put time in the parts that is not
-        // in the total and drive the residual negative for no reason.
-        shared.reader_stats.record_batch(Self::nanos_u64(framing_started.elapsed()), blocks.len());
 
         // Reserve this batch's serial range while STILL HOLDING the input lock.
         //
@@ -2919,14 +2337,12 @@ impl SortWorkerPool {
         // Drop the lock before pushing to queue
         drop(guard);
 
-        let dispatch_started = Instant::now();
         dispatch_reserved_blocks(
             base_serial,
             blocks,
             &shared.raw_input_blocks,
             &mut worker.held_raw_input_blocks,
         );
-        shared.reader_stats.record_dispatch(Self::nanos_u64(dispatch_started.elapsed()));
 
         StepResult::Success
     }
@@ -2954,18 +2370,18 @@ impl SortWorkerPool {
                 let total = shared.input_read_serial.load(Ordering::Acquire);
                 if queued >= total {
                     shared.decompressed_input_done.store(true, Ordering::Release);
-                    shared.wake_consumer();
+                    shared.main_thread_handle.unpark();
                 }
             }
             return StepResult::InputEmpty;
         };
 
-        let data = match decompress_block(&block, &mut worker.decomp.bgzf) {
+        let data = match decompress_block(&block, &mut worker.decompressor) {
             Ok(d) => d,
             Err(e) => {
                 log::error!("BGZF decompression error (input block serial {serial}): {e}");
                 shared.decompression_error.store(true, Ordering::Release);
-                shared.wake_consumer();
+                shared.main_thread_handle.unpark();
                 return StepResult::InputEmpty;
             }
         };
@@ -2976,13 +2392,13 @@ impl SortWorkerPool {
         // Try to push to decompressed_input ArrayQueue
         let pushed = match shared.decompressed_input.push((serial, data)) {
             Ok(()) => {
-                shared.wake_consumer();
+                shared.main_thread_handle.unpark();
                 true
             }
             Err(item) => {
                 worker.held_decompressed_input = Some(item);
                 // Queue full — wake main thread to drain so we can push next time
-                shared.wake_consumer();
+                shared.main_thread_handle.unpark();
                 false
             }
         };
@@ -2997,7 +2413,7 @@ impl SortWorkerPool {
             let total = shared.input_read_serial.load(Ordering::Acquire);
             if input_eof && raw_empty && queued >= total {
                 shared.decompressed_input_done.store(true, Ordering::Release);
-                shared.wake_consumer();
+                shared.main_thread_handle.unpark();
             }
         }
 
@@ -3070,18 +2486,7 @@ impl SortWorkerPool {
         // that makes that case fast.
         let frontier = shared.phase2_lowest_active.load(Ordering::Relaxed);
         let frontier_starving = files.get(frontier).is_some_and(Phase2FileState::is_starving);
-        // The file the consumer is parked on, which the frontier only coincides
-        // with when sources drain in index order.
-        let awaited = shared.phase2_awaited_source.load(Ordering::Relaxed);
-        let awaited_starving = files.get(awaited).is_some_and(Phase2FileState::is_starving);
-        let start = phase2_scan_start(
-            awaited,
-            awaited_starving,
-            frontier,
-            n,
-            frontier_starving,
-            worker.phase2_file_cursor,
-        );
+        let start = phase2_scan_start(frontier, n, frontier_starving, worker.phase2_file_cursor);
 
         for offset in 0..n {
             let i = (start + offset) % n;
@@ -3107,24 +2512,9 @@ impl SortWorkerPool {
             let pop_skip = match Self::try_pop_raw_for_decompress(file) {
                 Err(skip) => skip,
                 Ok(entry) => {
-                    // `offset` files gave nothing before this one did. The scan
-                    // tally is published only on fruitless scans, so without this
-                    // the walk to a *successful* claim went uncounted.
-                    shared.stage_latency.record_claim(offset as u64);
                     worker.phase2_file_cursor = (i + 1) % n;
-                    worker.served_awaited =
-                        shared.phase2_awaited_source.load(Ordering::Relaxed) == i;
-                    if worker.served_awaited {
-                        worker.won_awaited_claim = Self::stamp_awaited_claim(shared);
-                    }
                     Self::note_claim(shared, file, &entry);
-                    return Self::decompress_and_publish(
-                        shared,
-                        &mut worker.decomp,
-                        file,
-                        i,
-                        entry,
-                    );
+                    return Self::decompress_and_publish(shared, worker, file, i, entry);
                 }
             };
 
@@ -3198,11 +2588,10 @@ impl SortWorkerPool {
             // entry-count allowances and an unbounded (`usize::MAX`) byte budget,
             // so they behave exactly as before.
             let awaited = shared.phase2_awaited_source.load(Ordering::Relaxed);
-            let next_source = shared.phase2_next_source.load(Ordering::Relaxed);
             let (raw_cap, read_batch, fifo_byte_budget, read_byte_budget) = if i == frontier {
                 let (cap, batch) = phase2_read_allowance(true);
                 (cap, batch, usize::MAX, usize::MAX)
-            } else if phase2_deserves_deep_read(i, frontier, awaited, next_source) {
+            } else if phase2_deserves_deep_read(i, frontier, awaited) {
                 let read_blocks = shared.phase2_read_blocks.load(Ordering::Relaxed);
                 let mean_block_bytes = if read_blocks == 0 {
                     0
@@ -3252,7 +2641,7 @@ impl SortWorkerPool {
             // dispatched on the codec but the failure is handled once. The two
             // arms previously carried identical error handling differing only
             // in one word of the message, which had to be kept in step by hand.
-            let read = shared.stage_latency.read.time(|| match file.codec {
+            let read = match file.codec {
                 SpillCodec::Bgzf => shared
                     .merge_phases
                     .read
@@ -3261,7 +2650,7 @@ impl SortWorkerPool {
                 SpillCodec::Zstd => shared.merge_phases.read.time(|| {
                     read_raw_zstd_frames(&mut reader_guard.inner, read_batch, read_byte_budget)
                 }),
-            });
+            };
             let raw_bytes: Vec<Vec<u8>> = match read {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -3277,8 +2666,7 @@ impl SortWorkerPool {
             // allowance selection uses, so an awaited non-frontier source --
             // which reads at the deep allowance via `awaited_allowance_for` --
             // is counted as deep, not shallow.
-            let (batches, blocks) = if phase2_deserves_deep_read(i, frontier, awaited, next_source)
-            {
+            let (batches, blocks) = if phase2_deserves_deep_read(i, frontier, awaited) {
                 (&shared.deep_read_batches, &shared.deep_read_blocks)
             } else {
                 (&shared.shallow_read_batches, &shared.shallow_read_blocks)
@@ -3344,16 +2732,7 @@ impl SortWorkerPool {
                 shared.refill.read_lag.record(enqueued_nanos.saturating_sub(emptied));
             }
 
-            shared.stage_latency.record_claim(offset as u64);
             worker.phase2_file_cursor = (i + 1) % n;
-            // Reading for the awaited file is on the critical path as much as
-            // decompressing for it: `raw-empty` is 47-70% of the reasons the pool
-            // passes that file over, so a late wake that ends in a read is a late
-            // wake the consumer paid for.
-            worker.served_awaited = shared.phase2_awaited_source.load(Ordering::Relaxed) == i;
-            if worker.served_awaited {
-                worker.won_awaited_claim = Self::stamp_awaited_claim(shared);
-            }
             return StepResult::Success;
         }
 
@@ -3407,7 +2786,7 @@ impl SortWorkerPool {
     /// responsible for releasing.
     fn decompress_and_publish(
         shared: &SharedPipelineState,
-        decomp: &mut DecompressorSet,
+        worker: &mut SortWorkerState,
         file: &Phase2FileState,
         source_idx: usize,
         entry: RawEntry,
@@ -3416,12 +2795,11 @@ impl SortWorkerPool {
         let data = match file.codec {
             SpillCodec::Bgzf => {
                 let raw_block = RawBgzfBlock { data: raw_bytes };
-                match shared.stage_latency.decompress.time(|| {
-                    shared
-                        .merge_phases
-                        .decompress
-                        .time(|| decompress_block(&raw_block, &mut decomp.bgzf))
-                }) {
+                match shared
+                    .merge_phases
+                    .decompress
+                    .time(|| decompress_block(&raw_block, &mut worker.decompressor))
+                {
                     Ok(d) => d,
                     Err(e) => {
                         log::error!(
@@ -3429,7 +2807,7 @@ impl SortWorkerPool {
                         );
                         shared.decompression_error.store(true, Ordering::Release);
                         file.decomp_in_flight.fetch_sub(1, Ordering::AcqRel);
-                        shared.wake_consumer();
+                        shared.main_thread_handle.unpark();
                         return StepResult::Success;
                     }
                 }
@@ -3437,28 +2815,27 @@ impl SortWorkerPool {
             SpillCodec::Zstd => {
                 // Allocate the scratch buffer lazily so BGZF-only sorts don't
                 // pay 256 KiB × num_workers of dead memory.
-                if decomp.zstd_buf.len() < zstd_decomp_cap() {
-                    decomp.zstd_buf.resize(zstd_decomp_cap(), 0);
+                if worker.zstd_decompress_buf.len() < ZSTD_FRAME_DECOMP_CAP {
+                    worker.zstd_decompress_buf.resize(ZSTD_FRAME_DECOMP_CAP, 0);
                 }
-                match shared.stage_latency.decompress.time(|| {
-                    shared
-                        .merge_phases
-                        .decompress
-                        .time(|| decomp.zstd.decompress_to_buffer(&raw_bytes, &mut decomp.zstd_buf))
+                match shared.merge_phases.decompress.time(|| {
+                    worker
+                        .zstd_decompressor
+                        .decompress_to_buffer(&raw_bytes, &mut worker.zstd_decompress_buf)
                 }) {
                     // Copy the `n` decompressed bytes (≤ one staging-buffer's
                     // worth, typically ~65 KB) into a fresh Vec for the
                     // consumer. The scratch buffer keeps its 256 KiB capacity so
                     // the next frame on this worker reuses it without
                     // reallocating.
-                    Ok(n) => decomp.zstd_buf[..n].to_vec(),
+                    Ok(n) => worker.zstd_decompress_buf[..n].to_vec(),
                     Err(e) => {
                         log::error!(
                             "zstd decompression error (chunk source {source_idx} serial {serial}): {e}"
                         );
                         shared.decompression_error.store(true, Ordering::Release);
                         file.decomp_in_flight.fetch_sub(1, Ordering::AcqRel);
-                        shared.wake_consumer();
+                        shared.main_thread_handle.unpark();
                         return StepResult::Success;
                     }
                 }
@@ -3502,23 +2879,9 @@ impl SortWorkerPool {
             // Wake the consumer either because new data is available or because
             // the last in-flight decompression for this file just completed and
             // the file is now fully drained.
-            shared.wake_consumer();
+            shared.main_thread_handle.unpark();
         }
         StepResult::Success
-    }
-
-    /// Stamp the first claim of the consumer's awaited block, and credit the
-    /// worker that made it.
-    ///
-    /// Compare-exchange from 0 so only the first claim in a park is recorded --
-    /// the consumer waits for whichever worker arrives first, so a sum over all
-    /// of them would overcount exactly the way the worker-side lag total does.
-    fn stamp_awaited_claim(shared: &SharedPipelineState) -> bool {
-        let now = shared.now_nanos();
-        shared
-            .awaited_claim_nanos
-            .compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
     }
 
     /// Try to pop a raw block from `file` for decompression, applying
@@ -3607,12 +2970,8 @@ impl SortWorkerPool {
         };
         // Only the compression is timed; the handoff below can block on a full
         // result channel, which is writer backpressure rather than CPU work.
-        let latency = match target {
-            CompressTarget::Spill => &shared.stage_latency.spill_compress,
-            CompressTarget::Output => &shared.stage_latency.output_compress,
-        };
-        let compressed = latency
-            .time(|| counter.time(|| Self::compress_job(&job, bgzf_compressor, zstd_compressor)));
+        let compressed =
+            counter.time(|| Self::compress_job(&job, bgzf_compressor, zstd_compressor));
         Self::deliver_compress_result(shared, job, compressed);
         StepResult::Success
     }
@@ -3647,7 +3006,7 @@ impl SortWorkerPool {
     ) -> StepResult {
         file.mark_reader_eof(&mut reader_guard);
         drop(reader_guard);
-        shared.wake_consumer();
+        shared.main_thread_handle.unpark();
         Self::maybe_mark_all_eof(shared);
         worker.phase2_file_cursor = (source + 1) % num_sources;
         StepResult::Success
@@ -3659,7 +3018,7 @@ impl SortWorkerPool {
         let total = shared.total_sources.load(Ordering::Acquire);
         if total > 0 && eof_count >= total {
             shared.all_chunks_eof.store(true, Ordering::Release);
-            shared.wake_consumer();
+            shared.main_thread_handle.unpark();
         }
     }
 
@@ -3693,44 +3052,6 @@ impl SortWorkerPool {
         self.shared.merge_phases.snapshot()
     }
 
-    /// Worker seconds spent feeding Phase 1's ingest thread: reading raw input
-    /// blocks off disk and decompressing them.
-    ///
-    /// Deliberately excludes `Compress`, which serves spill *and* output and so
-    /// cannot be attributed to the ingest span; the spill half is reported on its
-    /// own through [`crate::merge_phases`].
-    pub(crate) fn phase1_input_busy_secs(&self) -> f64 {
-        let ns = self.pipeline_stats.step_ns[SortStep::ReadInputBlocks as usize]
-            .load(Ordering::Relaxed)
-            + self.pipeline_stats.step_ns[SortStep::DecompressInput as usize]
-                .load(Ordering::Relaxed);
-        #[allow(clippy::cast_precision_loss, reason = "nanosecond totals stay far below 2^52")]
-        {
-            ns as f64 / 1_000_000_000.0
-        }
-    }
-
-    /// Counters for what Phase 1's ingest thread waited on.
-    pub(crate) fn phase1_ingest_stats(&self) -> Arc<crate::phase1_stats::Phase1IngestStats> {
-        Arc::clone(&self.shared.phase1_ingest)
-    }
-
-    /// Counters for the input reader, shared with the `TimedReader` that has to
-    /// be built before the pool is handed the file.
-    pub(crate) fn reader_stats(&self) -> Arc<crate::phase1_stats::ReaderStats> {
-        Arc::clone(&self.shared.reader_stats)
-    }
-
-    /// The input reader's partition, checked against the exact `ReadInputBlocks`
-    /// busy total it should add up to.
-    pub(crate) fn phase1_reader_report(&self) -> crate::phase1_stats::ReaderReport {
-        let ns =
-            self.pipeline_stats.step_ns[SortStep::ReadInputBlocks as usize].load(Ordering::Relaxed);
-        #[allow(clippy::cast_precision_loss, reason = "nanosecond totals stay far below 2^52")]
-        let step_secs = ns as f64 / 1_000_000_000.0;
-        self.shared.reader_stats.snapshot(step_secs)
-    }
-
     /// The pool's shared state, for the merge consumer's own instrumentation.
     ///
     /// The consumer runs on the main thread and is not a pool worker, but it is
@@ -3760,105 +3081,6 @@ impl SortWorkerPool {
         };
         let (cap, batch) = awaited_allowance_for(mean);
         (mean, cap, batch)
-    }
-
-    /// Where the merge consumer's park time went, split into additive stages.
-    pub(crate) fn park_attribution_report(&self) -> crate::merge_stalls::ParkAttributionReport {
-        self.shared.park_attribution.snapshot()
-    }
-
-    /// Per-worker busy time, idle time and critical-path claims, worker 0 first.
-    ///
-    /// Truncated to the workers this pool actually started, so a 16-thread merge
-    /// does not print 32 rows of zeros.
-    pub(crate) fn per_thread_report(&self) -> Vec<(u64, u64, u64)> {
-        let stats = &self.pipeline_stats;
-        (0..self.num_workers.min(SORT_MAX_THREADS))
-            .map(|w| {
-                (
-                    stats.per_thread_busy_ns[w].load(Ordering::Relaxed),
-                    stats.per_thread_idle_ns[w].load(Ordering::Relaxed),
-                    stats.per_thread_awaited_claims[w].load(Ordering::Relaxed),
-                )
-            })
-            .collect()
-    }
-
-    /// Per-stage latency distributions and wasted-scan accounting.
-    pub(crate) fn stage_latency(&self) -> &crate::merge_phases::StageLatency {
-        &self.shared.stage_latency
-    }
-
-    /// Publish the source the merge expects to consume next, so the pool can start
-    /// that file's read before the consumer arrives.
-    pub(crate) fn set_phase2_next_source(&self, next: Option<usize>) {
-        self.shared.set_phase2_next_source(next);
-    }
-
-    /// Consumer parks split by what the pool looked like when the park began.
-    pub(crate) fn park_supply_report(&self) -> crate::merge_stalls::ParkSupplyReport {
-        self.shared.park_supply.snapshot()
-    }
-
-    /// Decompress one already-read block for `source_idx` on the calling thread,
-    /// returning whether it published anything.
-    ///
-    /// For the merge consumer to call instead of parking. The block it needs is
-    /// sitting in the raw FIFO, read but unclaimed, in 12% of parks -- and parking
-    /// there trades ~53us of work for a ~190us wait on a worker that has to be
-    /// woken first.
-    ///
-    /// The deeper reason is that the consumer's exposed latency is **per block,
-    /// not per park**: raising `PHASE2_DECOMP_CAP` from 8 to 128 cut parks from
-    /// 978,325 to 400,487 and left total park time at 89.6s against 89.7s, while
-    /// wall clock got monotonically worse. A cost that survives a 16x change in
-    /// buffer depth is not a buffering problem and not a signalling one -- eight
-    /// scheduling interventions moved their own metrics and left the clock alone.
-    /// What is left is the producer-to-consumer handoff itself, and the only way
-    /// to remove a handoff is for one thread to do both halves.
-    ///
-    /// Goes through the same [`Self::try_pop_raw_for_decompress`] and
-    /// [`Self::decompress_and_publish`] as a worker, so the in-flight counter and
-    /// the reorder-buffer protocol cannot drift between the two paths. Publishing
-    /// rather than consuming the block directly is deliberate: the consumer then
-    /// picks it up through its ordinary path, and nothing about serial ordering
-    /// gets a second implementation.
-    ///
-    /// Safe to call while parked-pending: the consumer holds no locks, so it
-    /// cannot participate in a cycle with a worker.
-    pub(crate) fn consumer_decompress_one(
-        shared: &SharedPipelineState,
-        decomp: &mut DecompressorSet,
-        file: &Phase2FileState,
-        source_idx: usize,
-    ) -> bool {
-        let Ok(entry) = Self::try_pop_raw_for_decompress(file) else { return false };
-        let _ = Self::decompress_and_publish(shared, decomp, file, source_idx, entry);
-        true
-    }
-
-    /// Parks the consumer avoided by decompressing a block itself.
-    pub(crate) fn consumer_self_served(&self) -> u64 {
-        self.shared.consumer_self_served.load(Ordering::Relaxed)
-    }
-
-    /// Predictions published to the pool by the merge's loser tree.
-    pub(crate) fn phase2_predictions(&self) -> u64 {
-        self.shared.phase2_predictions()
-    }
-
-    /// Where the consumer's wakes landed.
-    pub(crate) fn wake_accounting(&self) -> WakeAccounting {
-        WakeAccounting {
-            issued: self.shared.wakes_issued.load(Ordering::Relaxed),
-            on_running: self.shared.wakes_on_running_worker.load(Ordering::Relaxed),
-            recoverable: self.shared.wakes_recoverable.load(Ordering::Relaxed),
-        }
-    }
-
-    /// Wakes issued by the consumer to cut a worker's backoff short.
-    pub(crate) fn wakes_issued(&self) -> u64 {
-        self.shared.wakes_issued.load(Ordering::Relaxed)
     }
 
     /// Why worker scans passed over the file the consumer was parked on,
@@ -4053,7 +3275,6 @@ impl SortWorkerPool {
     ///
     /// Panics if the `phase2_files` rwlock is poisoned.
     pub fn set_phase2_files(&self, files: &[std::path::PathBuf]) -> anyhow::Result<()> {
-        let scatter = Arc::clone(&self.shared.fetch_jobs);
         let total_sources = files.len();
         self.shared.total_sources.store(total_sources as u64, Ordering::Release);
 
@@ -4068,12 +3289,6 @@ impl SortWorkerPool {
         // forward, so neither is self-correcting.
         self.shared.phase2_lowest_active.store(0, Ordering::Release);
         self.shared.phase2_awaited_source.store(NO_AWAITED_SOURCE, Ordering::Release);
-        // The read-ahead prediction indexes the file vector being replaced, so a
-        // pool that merges twice would expose the prior merge's `runner_up`
-        // through `phase2_next_source` while the new merge seeds its sources --
-        // handing deep-read priority to an unrelated file until the new merge
-        // publishes its own prediction. Reset it to the sentinel here.
-        self.shared.phase2_next_source.store(NO_AWAITED_SOURCE, Ordering::Release);
         // The refill allowance is derived from `phase2_read_bytes /
         // phase2_read_blocks`, so these must describe only the set being
         // installed: mean spill-block size moves with the codec, the
@@ -4125,37 +3340,13 @@ impl SortWorkerPool {
             file.seek(SeekFrom::Start(body_start)).map_err(|e| {
                 anyhow::anyhow!("Failed to seek chunk file {}: {e}", path.display())
             })?;
-            let reader = if self.read_streams.is_sequential() {
-                crate::spill_reader::SpillSource::Sequential(BufReader::with_capacity(
-                    2 * 1024 * 1024,
-                    file,
-                ))
-            } else {
-                // Positional reads need no file position, so the seek above is
-                // irrelevant here -- `body_start` is passed explicitly instead.
-                crate::spill_reader::SpillSource::Scattered(
-                    crate::spill_reader::ScatterReader::for_streams(
-                        file,
-                        body_start,
-                        self.read_streams,
-                        Some(Arc::clone(&scatter)),
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to size chunk file {}: {e}", path.display())
-                    })?,
-                )
-            };
+            let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
             states.push(Phase2FileState::new(reader, codec));
         }
 
         let mut guard = self.shared.phase2_files.write().expect("phase2_files rwlock poisoned");
         *guard = Arc::new(states);
         Ok(())
-    }
-
-    /// The queue readers offer byte slices to. See [`crate::spill_reader`].
-    pub(crate) fn fetch_queue(&self) -> Arc<crate::spill_reader::FetchQueue> {
-        Arc::clone(&self.shared.fetch_jobs)
     }
 
     /// Clear the Phase 2 file vector. Call this after Phase 2 finishes (and
@@ -4191,51 +3382,6 @@ impl SortWorkerPool {
         }
     }
 
-    /// Offer a deferred key-extraction batch to the pool.
-    ///
-    /// Returns the batch unrun in `Err` when the queue is full or the pool has
-    /// shut down; the caller must run it inline rather than drop it. Unlike
-    /// [`submit_compress`](Self::submit_compress) this does **not** spin waiting
-    /// for room: the submitter is the ingest thread, and blocking it to hand off
-    /// work whose whole purpose is to unblock it would be self-defeating.
-    ///
-    /// # Errors
-    ///
-    /// Returns the batch when it could not be queued.
-    pub(crate) fn submit_key_job(
-        &self,
-        job: Box<dyn crate::phase1_keys::KeyExtractionJob>,
-    ) -> Result<(), Box<dyn crate::phase1_keys::KeyExtractionJob>> {
-        if self.shared.phase.load(Ordering::Acquire) == phase::SHUTDOWN {
-            return Err(job); // Workers have exited; no one will pop the queue
-        }
-        self.shared.key_jobs.push(job)?;
-        self.shared.wake_one_worker();
-        Ok(())
-    }
-
-    /// Whether any worker has published a panic.
-    pub(crate) fn worker_panicked(&self) -> bool {
-        self.shared.worker_panicked.load(Ordering::Acquire)
-    }
-
-    /// Run one queued key-extraction batch on the calling thread, if any is
-    /// queued. Returns whether a batch ran.
-    ///
-    /// The ingest thread's self-help path: at the chunk barrier it drains the
-    /// queue itself rather than waiting on workers that may already have parked
-    /// for the phase. Without it the barrier could wait on a batch nobody is
-    /// scheduled to run.
-    pub(crate) fn run_one_key_job(&self) -> bool {
-        match self.shared.key_jobs.pop() {
-            Some(job) => {
-                job.run();
-                true
-            }
-            None => false,
-        }
-    }
-
     /// Create a new result channel pair for compress results.
     ///
     /// The result channel stays as `crossbeam_channel::bounded()` because the
@@ -4261,19 +3407,6 @@ impl SortWorkerPool {
     /// Internal shutdown: signal workers and join them. Safe to call multiple times
     /// (idempotent via `Option::take`). Called by both `shutdown` and `Drop`.
     fn do_shutdown(&mut self) {
-        // The census for "did scattered reading engage at all". Zero taken means
-        // every fill was read by the thread that wanted it -- the pre-change
-        // behaviour, and something no output check would ever notice. Reported
-        // here because the queue spans both phases and this is the one point
-        // every sort passes through. Gated on the workers still being present so
-        // it prints once: `do_shutdown` runs from both `shutdown` and `Drop`,
-        // and only the join below is idempotent on its own.
-        if self.workers.is_some() {
-            let (offered, taken) = self.shared.fetch_jobs.census();
-            if offered > 0 {
-                log::info!("Byte fetch: {offered} slices offered, {taken} run by workers");
-            }
-        }
         self.shared.phase.store(phase::SHUTDOWN, Ordering::Release);
         if let Some(workers) = self.workers.take() {
             for w in workers {
@@ -4281,7 +3414,7 @@ impl SortWorkerPool {
                     // Worker panicked — set flag and wake main thread so it doesn't
                     // park forever waiting for work that will never arrive.
                     self.shared.worker_panicked.store(true, Ordering::Release);
-                    self.shared.wake_consumer();
+                    self.shared.main_thread_handle.unpark();
                 }
             }
         }
@@ -4676,7 +3809,7 @@ mod tests {
     fn test_compress_target_decides_level_regardless_of_phase(#[case] phase_under_test: u8) {
         // Compressible: 8 KiB of one byte shrinks to almost nothing at level 9.
         let data = vec![b'A'; 8192];
-        let pool = SortWorkerPool::new(2, 0, 9, crate::codec::SpillCodec::Bgzf, false);
+        let pool = SortWorkerPool::new(2, 0, 9, crate::codec::SpillCodec::Bgzf);
         pool.set_phase(phase_under_test);
 
         let compressed_len = |target: CompressTarget| {
@@ -4748,7 +3881,7 @@ mod tests {
 
     #[test]
     fn test_pool_compress_roundtrip() {
-        let pool = SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false);
+        let pool = SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf);
         let (result_tx, result_rx) = pool.compress_result_channel();
 
         // Submit a compress job
@@ -4774,102 +3907,8 @@ mod tests {
     }
 
     #[test]
-    fn test_the_pool_runs_every_submitted_key_job() {
-        // Deferred key extraction is only a win if the pool actually drains the
-        // batches; a batch the pool never picks up would stall the ingest
-        // thread's barrier instead. Submits more batches than the queue holds,
-        // so the full-queue path is exercised too.
-        use crate::phase1_keys::KeyExtractionJob;
-
-        struct CountingBatch(std::sync::mpsc::Sender<usize>, usize);
-        impl KeyExtractionJob for CountingBatch {
-            fn run(self: Box<Self>) {
-                // The receiver outlives every batch here; a closed channel would
-                // just mean the test already finished.
-                let _ = self.0.send(self.1);
-            }
-        }
-
-        let pool = SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf, false);
-        pool.set_phase(phase::PHASE1);
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        let num_jobs = 64usize;
-        for i in 0..num_jobs {
-            // A full queue hands the batch back rather than dropping it; the
-            // ingest thread runs those inline, so the test does the same.
-            if let Err(job) = pool.submit_key_job(Box::new(CountingBatch(tx.clone(), i))) {
-                job.run();
-            }
-        }
-        drop(tx);
-
-        let mut seen: Vec<usize> = rx.iter().collect();
-        seen.sort_unstable();
-        assert_eq!(seen, (0..num_jobs).collect::<Vec<_>>(), "every batch must run exactly once");
-    }
-
-    #[test]
-    fn test_the_worker_that_owns_the_reader_does_not_take_key_batches() {
-        // Measured on the production cell: adding key extraction to the pool
-        // slowed the input reader from 358 to 345 MB/s and its step from 125.2s
-        // to 129.8s. The reader is one exclusively-owned worker, and a key batch
-        // is ~0.5 ms during which that worker is not reading. Everyone else may
-        // take batches; the reader's owner may not.
-        assert!(
-            !SortWorkerPool::worker_may_extract_keys(Some(SortStep::ReadInputBlocks)),
-            "the reader's owner must stay on the reader"
-        );
-        assert!(
-            SortWorkerPool::worker_may_extract_keys(None),
-            "a worker owning no exclusive step is free to extract"
-        );
-        assert!(
-            SortWorkerPool::worker_may_extract_keys(Some(SortStep::Compress)),
-            "owning some other step does not bar extraction"
-        );
-    }
-
-    #[test]
-    fn test_workers_stay_awake_for_key_batches_after_the_input_is_drained() {
-        // The final chunk's barrier lands exactly here: the input is read and
-        // decompressed, so Phase 1 looks finished, but a chunk's worth of key
-        // batches is still queued. If the phase counts as complete the workers
-        // all park and the ingest thread drains them one at a time on its own —
-        // correct output, but the last chunk's extraction becomes fully serial,
-        // which is the cost this step exists to remove.
-        use crate::phase1_keys::KeyExtractionJob;
-
-        struct Ping(std::sync::mpsc::Sender<()>);
-        impl KeyExtractionJob for Ping {
-            fn run(self: Box<Self>) {
-                let _ = self.0.send(());
-            }
-        }
-
-        let pool = SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf, false);
-        pool.set_phase(phase::PHASE1);
-        // Everything the phase-completion check looks at is now satisfied.
-        pool.shared.decompressed_input_done.store(true, Ordering::Release);
-        pool.shared.input_eof.store(true, Ordering::Release);
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let submitted = 8usize;
-        for _ in 0..submitted {
-            pool.submit_key_job(Box::new(Ping(tx.clone()))).ok().expect("queue has room");
-        }
-        drop(tx);
-
-        for i in 0..submitted {
-            rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_else(|_| {
-                panic!("workers parked with key batches still queued; only {i} of {submitted} ran")
-            });
-        }
-    }
-
-    #[test]
     fn test_pool_many_jobs() {
-        let pool = SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf, false);
+        let pool = SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf);
         let (result_tx, result_rx) = pool.compress_result_channel();
 
         let num_jobs = 100usize;
@@ -4906,7 +3945,7 @@ mod tests {
 
     #[test]
     fn set_active_workers_clamps() {
-        let pool = SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf, false);
+        let pool = SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf);
         // A fresh pool is fully active, so anything dividing by the active count
         // before a cap is applied still gets the pool width.
         assert_eq!(pool.active_workers(), 4, "a pool starts with every worker active");
@@ -4926,7 +3965,7 @@ mod tests {
     /// utilization and flip the merge verdict from CPU-bound to I/O-bound.
     #[test]
     fn active_workers_reports_the_phase2_cap_not_the_pool_width() {
-        let pool = SortWorkerPool::new(8, 1, 6, crate::codec::SpillCodec::Bgzf, false);
+        let pool = SortWorkerPool::new(8, 1, 6, crate::codec::SpillCodec::Bgzf);
         pool.set_active_workers(8);
         pool.begin_phase2(3);
         assert_eq!(pool.num_workers(), 8, "the pool is still eight threads wide");
@@ -4964,63 +4003,7 @@ mod tests {
         #[case] cursor: usize,
         #[case] expected: usize,
     ) {
-        assert_eq!(
-            phase2_scan_start(
-                NO_AWAITED_SOURCE,
-                false,
-                frontier,
-                num_files,
-                frontier_starving,
-                cursor
-            ),
-            expected
-        );
-    }
-
-    /// A starving *awaited* source outranks the frontier, because it is measured
-    /// demand rather than a proxy for it.
-    ///
-    /// The frontier is only the file the merge reaches next when sources drain in
-    /// index order. On a partially-correlated input they do not, which is the
-    /// assumption that cost this merge 126s of read-ahead going to the wrong
-    /// file. The consumer knows which file it is parked on; this is what lets the
-    /// pool act on it.
-    ///
-    /// Gated on starving for the same reason the frontier is: `awaited` is never
-    /// cleared between parks, so an ungated version would send every worker to
-    /// one index permanently and trade a spread problem for a herd problem.
-    #[rstest]
-    // Measured demand beats the proxy, and beats the cursor.
-    #[case::starving_awaited_outranks_a_starving_frontier(5, true, 0, 8, true, 2, 5)]
-    #[case::starving_awaited_outranks_an_active_frontier(5, true, 0, 8, false, 2, 5)]
-    #[case::starving_awaited_beats_the_cursor(6, true, 9, 8, false, 2, 6)]
-    // An awaited file with data to give must not pull workers off the spread.
-    #[case::active_awaited_defers_to_a_starving_frontier(5, false, 3, 8, true, 2, 3)]
-    #[case::active_awaited_defers_to_the_cursor(5, false, 0, 8, false, 2, 2)]
-    // Unset, or past the end, names no live source.
-    #[case::unset_awaited_defers(NO_AWAITED_SOURCE, true, 3, 8, true, 2, 3)]
-    #[case::awaited_past_the_end_defers(8, true, 3, 8, true, 2, 3)]
-    #[case::no_files_defers(0, true, 0, 0, true, 0, 0)]
-    fn phase2_scan_prefers_a_starving_awaited_source(
-        #[case] awaited: usize,
-        #[case] awaited_starving: bool,
-        #[case] frontier: usize,
-        #[case] num_files: usize,
-        #[case] frontier_starving: bool,
-        #[case] cursor: usize,
-        #[case] expected: usize,
-    ) {
-        assert_eq!(
-            phase2_scan_start(
-                awaited,
-                awaited_starving,
-                frontier,
-                num_files,
-                frontier_starving,
-                cursor
-            ),
-            expected
-        );
+        assert_eq!(phase2_scan_start(frontier, num_files, frontier_starving, cursor), expected);
     }
 
     /// Only the drain frontier gets the deep allowance.
@@ -5140,24 +4123,17 @@ mod tests {
     /// shallow allowance: the pool sat 1.9 decompressions deep of a tracked 8
     /// while the consumer waited 73% of the merge loop.
     #[rstest]
-    #[case::frontier_only(0, usize::MAX, usize::MAX, 0, true)]
-    #[case::awaited_only(0, 5, usize::MAX, 5, true)]
-    #[case::neither(0, 5, usize::MAX, 3, false)]
-    #[case::no_awaited_source_yet(0, usize::MAX, usize::MAX, 7, false)]
-    // The predicted next source reads deep too: reactive signals fire only after
-    // the consumer has already stalled, and a run transition costs ~20ms because
-    // the read had not been started when it arrived.
-    #[case::predicted_next_source(0, usize::MAX, 9, 9, true)]
-    #[case::predicted_next_is_not_the_candidate(0, usize::MAX, 9, 4, false)]
-    #[case::no_prediction_yet(0, usize::MAX, usize::MAX, 4, false)]
+    #[case::frontier_only(0, usize::MAX, 0, true)]
+    #[case::awaited_only(0, 5, 5, true)]
+    #[case::neither(0, 5, 3, false)]
+    #[case::no_awaited_source_yet(0, usize::MAX, 7, false)]
     fn the_blocked_file_reads_deep_even_when_it_is_not_the_frontier(
         #[case] frontier: usize,
         #[case] awaited: usize,
-        #[case] next: usize,
         #[case] candidate: usize,
         #[case] expect_deep: bool,
     ) {
-        let deep = phase2_deserves_deep_read(candidate, frontier, awaited, next);
+        let deep = phase2_deserves_deep_read(candidate, frontier, awaited);
         assert_eq!(deep, expect_deep);
         let expected = if expect_deep {
             (PHASE2_STARVING_RAW_CAP, PHASE2_STARVING_READ_BATCH)
@@ -5307,84 +4283,6 @@ mod tests {
     /// over the pool width instead sends most wakes to workers idled by the
     /// Phase 2 cap, which re-park without looking at the starving file — and
     /// the workers that could have refilled it wait out their full backoff.
-    /// A published prediction must be counted, and "no prediction" must not be.
-    ///
-    /// Without this counter a `runner_up()` that returned `None` on every call
-    /// would be indistinguishable from a null result: the deep-read path simply
-    /// never fires, wall clock lands wherever it lands, and nothing in the log
-    /// says the mechanism was inert. The measured -2.7% is only attributable to
-    /// prediction if predictions were actually published.
-    #[test]
-    fn test_published_predictions_are_counted_and_absent_ones_are_not() {
-        let shared = SharedPipelineState::new(2, std::thread::current());
-        assert_eq!(shared.phase2_predictions(), 0, "nothing published yet");
-
-        shared.set_phase2_next_source(Some(3));
-        shared.set_phase2_next_source(Some(1));
-        assert_eq!(shared.phase2_predictions(), 2, "each published source counts once");
-
-        shared.set_phase2_next_source(None);
-        assert_eq!(shared.phase2_predictions(), 2, "clearing the prediction is not a prediction");
-    }
-
-    /// A wake spent on a running worker while a sleeper sits idle is the merge's
-    /// largest single idle cost at t16 -- 74.4s of a 92.1s park. The preference
-    /// must actually find the sleeper.
-    #[test]
-    fn test_wake_prefers_a_parked_worker_over_the_rotating_target() {
-        let parked = [false, false, true, false];
-        let at = |i: usize| parked[i];
-        assert_eq!(
-            SharedPipelineState::wake_target_preferring_parked(0, 4, 4, at),
-            2,
-            "the rotating target is 0 and running; worker 2 is asleep and gets the wake"
-        );
-    }
-
-    /// Falling back to the rotation is what preserves the spread an interleaved
-    /// merge needs, so a saturated pool must behave exactly as before.
-    #[test]
-    fn test_wake_falls_back_to_rotation_when_nobody_is_parked() {
-        for cursor in 0..8 {
-            assert_eq!(
-                SharedPipelineState::wake_target_preferring_parked(cursor, 4, 4, |_| false),
-                SharedPipelineState::wake_target(cursor, 4, 4),
-                "with nobody parked the target must be unchanged at cursor {cursor}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_wake_keeps_the_rotating_target_when_it_is_itself_parked() {
-        let parked = [true, true, true, true];
-        assert_eq!(SharedPipelineState::wake_target_preferring_parked(2, 4, 4, |i| parked[i]), 2);
-    }
-
-    /// Capped workers will not take Phase 2 work, so waking one is the same lost
-    /// wake by another route -- the preference must stay inside the active window.
-    #[test]
-    fn test_wake_preference_ignores_workers_outside_the_active_limit() {
-        let parked = [false, false, true, true];
-        let at = |i: usize| parked[i];
-        assert_eq!(
-            SharedPipelineState::wake_target_preferring_parked(0, 2, 4, at),
-            SharedPipelineState::wake_target(0, 2, 4),
-            "workers 2 and 3 are parked but capped out, so the rotation stands"
-        );
-    }
-
-    /// The scan starts at the cursor, so successive wakes with several sleepers
-    /// spread rather than piling onto the lowest index.
-    #[test]
-    fn test_wake_preference_rotates_across_several_sleepers() {
-        let parked = [true, false, true, false];
-        let at = |i: usize| parked[i];
-        let picks: Vec<usize> = (0..4)
-            .map(|c| SharedPipelineState::wake_target_preferring_parked(c, 4, 4, at))
-            .collect();
-        assert_eq!(picks, vec![0, 2, 2, 0], "each wake starts scanning from its own cursor");
-    }
-
     #[rstest]
     // A pool 8 wide capped to 3 must never select a worker above the cap, at
     // any point in the rotation.
@@ -5485,7 +4383,7 @@ mod tests {
             (pool, counts)
         };
 
-        let pool = SortWorkerPool::new(6, 1, 6, crate::codec::SpillCodec::Bgzf, false);
+        let pool = SortWorkerPool::new(6, 1, 6, crate::codec::SpillCodec::Bgzf);
 
         // Batch 1: capped at 2 — only workers 0..2 may run.
         pool.set_active_workers(2);
@@ -5521,7 +4419,7 @@ mod tests {
 
     #[test]
     fn test_pool_stats() {
-        let pool = SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false);
+        let pool = SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf);
         let (c_tx, c_rx) = pool.compress_result_channel();
 
         // Submit one compress job
@@ -5604,11 +4502,10 @@ mod tests {
             input_eof: false,
             decompressed_input_done: false,
             compress_has_items: false,
-            consumer_parked: false,
             phase: phase::PHASE1,
         };
         let priorities = get_sort_priorities(&bp);
-        assert!(rank(priorities, SortStep::DecompressInput) < rank(priorities, SortStep::Compress));
+        assert_eq!(priorities[0], SortStep::DecompressInput);
     }
 
     #[test]
@@ -5618,33 +4515,22 @@ mod tests {
             input_eof: false,
             decompressed_input_done: false,
             compress_has_items: true,
-            consumer_parked: false,
             phase: phase::PHASE1,
         };
         let priorities = get_sort_priorities(&bp);
-        assert!(rank(priorities, SortStep::Compress) < rank(priorities, SortStep::DecompressInput));
+        assert_eq!(priorities[0], SortStep::Compress);
     }
 
     #[test]
-    fn test_sort_priorities_phase1_all_done_offers_no_input_or_compress_work() {
-        // Once the input is read and decompressed and nothing is queued to
-        // compress, no worker should be offered work that produces more of it —
-        // that is what makes them back off instead of spinning. `ExtractKeys` is
-        // exempt and may appear: it self-gates on a non-empty batch queue, and a
-        // batch queued just before EOF must still be reachable while the ingest
-        // thread drains at the barrier.
+    fn test_sort_priorities_phase1_all_done_returns_empty() {
         let bp = SortBackpressureState {
             decompressed_input_low: false,
             input_eof: true,
             decompressed_input_done: true,
             compress_has_items: false,
-            consumer_parked: false,
             phase: phase::PHASE1,
         };
-        let priorities = get_sort_priorities(&bp);
-        for step in [SortStep::ReadInputBlocks, SortStep::DecompressInput, SortStep::Compress] {
-            assert!(!priorities.contains(&step), "{step:?} must not be offered once input is done");
-        }
+        assert!(get_sort_priorities(&bp).is_empty());
     }
 
     #[test]
@@ -5654,11 +4540,10 @@ mod tests {
             input_eof: false,
             decompressed_input_done: false,
             compress_has_items: false,
-            consumer_parked: false,
             phase: phase::PHASE2,
         };
         let priorities = get_sort_priorities(&bp);
-        assert!(rank(priorities, SortStep::Phase2FileWork) < rank(priorities, SortStep::Compress));
+        assert_eq!(priorities[0], SortStep::Phase2FileWork);
     }
 
     #[test]
@@ -5668,11 +4553,10 @@ mod tests {
             input_eof: false,
             decompressed_input_done: false,
             compress_has_items: true,
-            consumer_parked: false,
             phase: phase::PHASE2,
         };
         let priorities = get_sort_priorities(&bp);
-        assert!(rank(priorities, SortStep::Compress) < rank(priorities, SortStep::DecompressInput));
+        assert_eq!(priorities[0], SortStep::Compress);
     }
 
     #[test]
@@ -5684,135 +4568,29 @@ mod tests {
             input_eof: false,
             decompressed_input_done: false,
             compress_has_items: false,
-            consumer_parked: false,
             phase: phase::PHASE2,
         };
         let priorities = get_sort_priorities(&bp);
-        assert!(rank(priorities, SortStep::Phase2FileWork) < rank(priorities, SortStep::Compress));
+        assert_eq!(priorities[0], SortStep::Phase2FileWork);
     }
 
-    /// A pending byte slice is what some thread holding an exclusive reader is
-    /// blocked on, and that thread reclaims the slice if nobody takes it -- so
-    /// the whole benefit lives in the short window between offer and reclaim.
-    /// Anything scheduled above `FetchBytes` spends that window, which is why
-    /// it leads every list. This is the mirror image of `ExtractKeys`, which
-    /// goes last everywhere because a deferred key batch costs nothing until
-    /// the chunk barrier.
     #[test]
-    fn test_fetch_bytes_outranks_every_other_step_in_every_state() {
-        for phase in [phase::PHASE1, phase::PHASE2, phase::SHUTDOWN] {
-            for &(low, eof, done, compress, parked) in &[
-                (false, false, false, false, false),
-                (true, false, false, true, false),
-                (false, true, true, false, false),
-                (false, false, false, true, true),
-                (true, true, true, true, true),
-            ] {
-                let bp = SortBackpressureState {
-                    decompressed_input_low: low,
-                    input_eof: eof,
-                    decompressed_input_done: done,
-                    compress_has_items: compress,
-                    consumer_parked: parked,
-                    phase,
-                };
-                assert_eq!(
-                    get_sort_priorities(&bp)[0],
-                    SortStep::FetchBytes,
-                    "phase {phase} state {low}{eof}{done}{compress}{parked}"
-                );
-            }
-        }
-    }
-
-    /// Where `step` sits in a priority list, for tests that mean "A outranks B"
-    /// rather than "A is literally first". Index-based assertions broke the
-    /// moment `FetchBytes` was inserted above them, though nothing they were
-    /// asserting had changed.
-    fn rank(priorities: &[SortStep], step: SortStep) -> usize {
-        priorities.iter().position(|&s| s == step).unwrap_or(usize::MAX)
-    }
-
-    /// Output compression is throughput work any worker can do at any time. The
-    /// awaited block is the only thing that can unblock the merge, so a parked
-    /// consumer must outrank compression.
-    #[test]
-    fn test_sort_priorities_phase2_parked_consumer_outranks_compression() {
+    fn test_sort_priorities_legacy_returns_compress_only() {
         let bp = SortBackpressureState {
             decompressed_input_low: false,
             input_eof: false,
             decompressed_input_done: false,
             compress_has_items: true,
-            consumer_parked: true,
-            phase: phase::PHASE2,
-        };
-        let p = get_sort_priorities(&bp);
-        assert!(rank(p, SortStep::Phase2FileWork) < rank(p, SortStep::Compress));
-    }
-
-    /// With the consumer running, compress-first is preserved exactly: it is the
-    /// writer-side bottleneck and draining it is what keeps output moving.
-    #[test]
-    fn test_sort_priorities_phase2_keeps_compress_first_when_consumer_runs() {
-        let bp = SortBackpressureState {
-            decompressed_input_low: false,
-            input_eof: false,
-            decompressed_input_done: false,
-            compress_has_items: true,
-            consumer_parked: false,
-            phase: phase::PHASE2,
-        };
-        let p = get_sort_priorities(&bp);
-        assert!(rank(p, SortStep::Compress) < rank(p, SortStep::Phase2FileWork));
-    }
-
-    /// Both steps stay reachable either way -- dropping one would starve it
-    /// outright rather than deprioritize it, and output must keep draining even
-    /// while the consumer is blocked.
-    #[rstest]
-    #[case::consumer_parked(true)]
-    #[case::consumer_running(false)]
-    fn test_sort_priorities_phase2_always_offers_both_steps(#[case] consumer_parked: bool) {
-        let bp = SortBackpressureState {
-            decompressed_input_low: false,
-            input_eof: false,
-            decompressed_input_done: false,
-            compress_has_items: true,
-            consumer_parked,
-            phase: phase::PHASE2,
-        };
-        let p = get_sort_priorities(&bp);
-        assert!(p.contains(&SortStep::Compress), "compression must stay reachable");
-        assert!(p.contains(&SortStep::Phase2FileWork), "file work must stay reachable");
-    }
-
-    #[test]
-    fn test_sort_priorities_legacy_drains_compress_and_no_phased_work() {
-        // The legacy/transition phase exists to drain queued jobs, so compression
-        // must be reachable and the phase-specific steps must not be. As above,
-        // `ExtractKeys` self-gates and is exempt.
-        let bp = SortBackpressureState {
-            decompressed_input_low: false,
-            input_eof: false,
-            decompressed_input_done: false,
-            compress_has_items: true,
-            consumer_parked: false,
             phase: phase::LEGACY,
         };
         let priorities = get_sort_priorities(&bp);
-        assert!(
-            rank(priorities, SortStep::Compress) < rank(priorities, SortStep::Phase2FileWork),
-            "compression drains first"
-        );
-        for step in [SortStep::ReadInputBlocks, SortStep::DecompressInput, SortStep::Phase2FileWork]
-        {
-            assert!(!priorities.contains(&step), "{step:?} belongs to a real phase");
-        }
+        assert_eq!(priorities.len(), 1);
+        assert_eq!(priorities[0], SortStep::Compress);
     }
 
     #[test]
     fn test_worker_pool_num_workers() {
-        let pool = SortWorkerPool::new(3, 1, 6, crate::codec::SpillCodec::Bgzf, false);
+        let pool = SortWorkerPool::new(3, 1, 6, crate::codec::SpillCodec::Bgzf);
         assert_eq!(pool.num_workers(), 3);
         pool.shutdown();
     }
@@ -5827,7 +4605,7 @@ mod tests {
     fn empty_phase2_file() -> Phase2FileState {
         let tmp = tempfile::tempfile().expect("failed to create tempfile");
         let reader = BufReader::with_capacity(1024, tmp);
-        Phase2FileState::new(crate::spill_reader::SpillSource::Sequential(reader), SpillCodec::Bgzf)
+        Phase2FileState::new(reader, SpillCodec::Bgzf)
     }
 
     /// Build a tiny placeholder raw entry whose contents we never decode.
@@ -6330,12 +5108,13 @@ mod tests {
     // for BGZF (whose decoder reads the gzip header itself).
     // ========================================================================
 
-    /// Snapshot the position of the next byte the per-file reader will serve.
-    /// Both `SpillSource` arms account for whatever they have already buffered,
-    /// so on a reader nothing has read from this is where it will start.
+    /// Snapshot the file position by locking the per-file reader. `BufReader`'s
+    /// `stream_position` accounts for any buffered bytes — for a fresh
+    /// `BufReader` whose buffer hasn't been filled this equals the underlying
+    /// `File`'s seek position.
     fn phase2_file_position(state: &Phase2FileState) -> u64 {
         let mut guard = state.reader.lock().expect("reader lock");
-        guard.inner.position().expect("position")
+        guard.inner.stream_position().expect("stream_position")
     }
 
     #[test]
@@ -6348,26 +5127,17 @@ mod tests {
         file.write_all(&[0xAA, 0xBB, 0xCC]).expect("write body");
         drop(file);
 
-        // All three shapes: the sequential reader, a pinned scattered one, and
-        // the auto-tuning one that is now the default.
-        for read_streams in [
-            crate::external::ReadStreams::Fixed(1),
-            crate::external::ReadStreams::Fixed(4),
-            crate::external::ReadStreams::Auto,
-        ] {
-            let mut pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf, false);
-            pool.read_streams = read_streams;
-            pool.set_phase2_files(std::slice::from_ref(&path)).expect("set_phase2_files");
-            let files = pool.phase2_files();
-            assert_eq!(files.len(), 1);
-            assert_eq!(files[0].codec, SpillCodec::Zstd, "ZSPILL_MAGIC must select zstd codec");
-            assert_eq!(
-                phase2_file_position(&files[0]),
-                ZSPILL_MAGIC.len() as u64,
-                "zstd reader must start past the 4-byte magic at {read_streams:?}"
-            );
-            pool.shutdown();
-        }
+        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf);
+        pool.set_phase2_files(std::slice::from_ref(&path)).expect("set_phase2_files");
+        let files = pool.phase2_files();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].codec, SpillCodec::Zstd, "ZSPILL_MAGIC must select zstd codec");
+        assert_eq!(
+            phase2_file_position(&files[0]),
+            ZSPILL_MAGIC.len() as u64,
+            "zstd reader must be positioned past the 4-byte magic"
+        );
+        pool.shutdown();
     }
 
     #[test]
@@ -6381,26 +5151,17 @@ mod tests {
         file.write_all(&[0x1f, 0x8b, 0x00, 0x00, 0x55, 0x66]).expect("write magic");
         drop(file);
 
-        // All three shapes: the sequential reader, a pinned scattered one, and
-        // the auto-tuning one that is now the default.
-        for read_streams in [
-            crate::external::ReadStreams::Fixed(1),
-            crate::external::ReadStreams::Fixed(4),
-            crate::external::ReadStreams::Auto,
-        ] {
-            let mut pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Zstd, false);
-            pool.read_streams = read_streams;
-            pool.set_phase2_files(std::slice::from_ref(&path)).expect("set_phase2_files");
-            let files = pool.phase2_files();
-            assert_eq!(files.len(), 1);
-            assert_eq!(files[0].codec, SpillCodec::Bgzf, "BGZF magic must select bgzf codec");
-            assert_eq!(
-                phase2_file_position(&files[0]),
-                0,
-                "bgzf reader must start at byte 0 at {read_streams:?}, for the header"
-            );
-            pool.shutdown();
-        }
+        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Zstd);
+        pool.set_phase2_files(std::slice::from_ref(&path)).expect("set_phase2_files");
+        let files = pool.phase2_files();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].codec, SpillCodec::Bgzf, "BGZF magic must select bgzf codec");
+        assert_eq!(
+            phase2_file_position(&files[0]),
+            0,
+            "bgzf reader must be rewound to byte 0 so the decoder sees the header"
+        );
+        pool.shutdown();
     }
 
     #[test]
@@ -6409,7 +5170,7 @@ mod tests {
         let path = dir.path().join("empty.spill");
         std::fs::File::create(&path).expect("create empty");
 
-        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Zstd, false);
+        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Zstd);
         pool.set_phase2_files(std::slice::from_ref(&path)).expect("set_phase2_files");
         let files = pool.phase2_files();
         assert_eq!(files.len(), 1);
@@ -6440,7 +5201,7 @@ mod tests {
             path
         };
 
-        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf, false);
+        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf);
 
         // First merge: one source, drained to completion.
         pool.set_phase2_files(std::slice::from_ref(&spill("first.spill")))
@@ -6467,52 +5228,6 @@ mod tests {
         pool.shutdown();
     }
 
-    /// A pool that merges twice must not carry the first merge's read-ahead
-    /// prediction into the second.
-    ///
-    /// `phase2_next_source` indexes the file vector `set_phase2_files` replaces
-    /// and hands the named source deep-read priority. A value left from a
-    /// completed merge would give that priority to an unrelated file while the
-    /// new merge is still seeding its sources, before it has published a
-    /// prediction of its own -- so a fresh source set must reset it to the
-    /// sentinel.
-    #[test]
-    fn test_set_phase2_files_clears_the_read_ahead_prediction() {
-        use std::io::Write;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let spill = |name: &str| {
-            let path = dir.path().join(name);
-            let mut file = std::fs::File::create(&path).expect("create");
-            file.write_all(&[0x1f, 0x8b, 0x00, 0x00]).expect("write magic");
-            path
-        };
-
-        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf, false);
-
-        // First merge: install a source and publish a prediction, as the merge
-        // loop does when the winning run changes.
-        pool.set_phase2_files(std::slice::from_ref(&spill("first.spill")))
-            .expect("set_phase2_files");
-        pool.set_phase2_next_source(Some(0));
-        assert_eq!(
-            pool.shared.phase2_next_source.load(Ordering::Relaxed),
-            0,
-            "guard: the first merge's prediction is published"
-        );
-
-        // Second merge: a fresh set must start with no prediction so no
-        // unrelated file inherits the previous merge's deep-read priority.
-        pool.set_phase2_files(&[spill("second-a.spill"), spill("second-b.spill")])
-            .expect("set_phase2_files");
-        assert_eq!(
-            pool.shared.phase2_next_source.load(Ordering::Relaxed),
-            NO_AWAITED_SOURCE,
-            "a fresh source set must clear the read-ahead prediction"
-        );
-
-        pool.shutdown();
-    }
-
     /// A pool that merges twice must size the second merge's refill allowance
     /// from the second merge's own blocks.
     ///
@@ -6534,7 +5249,7 @@ mod tests {
             path
         };
 
-        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf, false);
+        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf);
         pool.set_phase2_files(std::slice::from_ref(&spill("first.spill")))
             .expect("set_phase2_files");
 
