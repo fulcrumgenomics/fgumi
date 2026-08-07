@@ -14,7 +14,14 @@ ci-publish-order = "run --package xtask -- check-publish-order"
 ci-doctest = "test --doc --workspace --features compare,simulate,profile-adjacency --locked"
 # Build the docs and fail on any rustdoc warning (e.g. broken intra-doc links).
 # RUSTDOCFLAGS="-D warnings" is set by the caller (CI job / pre-push).
-ci-doc = "doc --no-deps --workspace --features compare,simulate,profile-adjacency --locked"
+#
+# `--document-private-items` is load-bearing, not cosmetic. Without it rustdoc
+# only checks links on items it renders — i.e. public ones — so a broken link in
+# the doc comment of a private fn, a private field, or a `#[cfg(test)]` helper
+# passes silently. That is not hypothetical: several such links accumulated
+# undetected and had to be found by hand. The flag makes the docs job check every
+# doc comment in the workspace, which is what the job's name implies it does.
+ci-doc = "doc --no-deps --workspace --document-private-items --features compare,simulate,profile-adjacency --locked"
 # Run only the #[ignore]-d integration tests (the sort-correctness suites in
 # tests/integration/{test_sort_correctness,test_async_reader,test_sort_write_index}.rs).
 # They require the `samtools` binary on PATH — samtools builds the BAM fixtures,

@@ -2,7 +2,7 @@
 //! `PipelineBuilder::build()` to assert all-outputs-wired and by the
 //! runtime to construct queue topology.
 
-/// Static branch-index display names covering every branch up to [`MAX_ARITY`].
+/// Static branch-index display names covering every branch up to [`crate::outputs::MAX_ARITY`].
 /// Output branch counts are bounded by `MAX_ARITY` at registration, so a valid
 /// branch index always maps to a name and the build-error message never prints a
 /// placeholder. Out-of-range indices fall back to `"?"` (never hit in practice,
@@ -27,7 +27,7 @@ pub struct ChainGraph {
     /// Defaults to `0` for single-input consumers; multi-input
     /// consumers (`Step2` / future `StepN`) record their per-input
     /// slot explicitly so [`crate::runtime::contexts`]
-    /// can build the right [`TwoInputHandles`] wrapper.
+    /// can build the right [`crate::handles::TwoInputHandles`] wrapper.
     consumer_input_slots: Vec<Option<usize>>,
     /// `branch_count[step]` — number of output branches for that step.
     branch_counts: Vec<usize>,
