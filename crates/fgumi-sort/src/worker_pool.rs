@@ -884,6 +884,34 @@ pub(crate) struct Phase2Reader {
 /// file. The locks here are deliberately fine-grained so different workers can
 /// be reading, decompressing, and the main thread can be popping records all
 /// concurrently as long as they touch different sub-states.
+///
+/// # Two Phase-2 merge implementations (production vs. the retained oracle)
+///
+/// **In this tree THIS pool path is the production sort.** `fgumi sort` and
+/// `fgumi merge` both construct a `RawExternalSorter`, so every real sort runs
+/// through here. The source branch's note said the opposite — that the buffer
+/// chain over `merge_slots.rs` had taken over and this path was reduced to a
+/// library entry point and parity oracle — but that end state needs the
+/// typed-step `SortMerge` consumer, which lands with `fgumi-pipeline-io` in a
+/// later phase. Read the paragraph below as describing why the two Phase-2
+/// implementations differ, not as a claim about which one runs.
+///
+/// The two implementations differ deliberately, and that difference is
+/// load-bearing for the oracle. This path keeps the `raw_blocks` FIFO,
+/// `decomp_in_flight`, the reorder buffer, and the gap-filler because its merge
+/// consumer is a parked OS thread (`external.rs::advance_to_next_block`, immune
+/// to the v4 framework-Skip deadlock) and its single-*reader* /
+/// multi-*decompressor* topology means completion order ≠ pop order. The
+/// slimmer `merge_slots.rs` needs only the *inline* subset of that machinery:
+/// its `decompressed` queue is a plain `VecDeque` with no gap-filler, because
+/// its inline consumer reads AND decompresses in one op so blocks decompress
+/// strictly in read order. It still declares `in_flight`, `reader_eof`, and
+/// `reorder` — inert on that inline path, live on its block-parallel one — so
+/// the difference is the gap-filler and the FIFO discipline, not the fields.
+/// Do NOT delete the gap-filler or the reorder buffer
+/// here to "match" `merge_slots` — it would reintroduce a real deadlock and/or
+/// out-of-order merge output. (History: commits `9d6d7e9` / `9c39dea`, PRs
+/// #389 / #395, `docs/design/sort-phase2-unification-deferral.md`.)
 pub(crate) struct Phase2FileState {
     /// Disk reader. Held only while popping bytes from disk.
     pub(crate) reader: Mutex<Phase2Reader>,

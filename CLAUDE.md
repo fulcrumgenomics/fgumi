@@ -187,6 +187,30 @@ of records) and a safe rewrite measurably regresses sort throughput.
   `RawQuerynameKey::new`).
 - **`crates/fgumi-sort/src/radix.rs`** — internal radix-sort helpers; see file
   comments for the `SAFETY:` invariants.
+- **`crates/fgumi-sort/src/ref_sort.rs`** — one `#[allow(unsafe_code)]` site in
+  `sort_coordinate_refs`: a pointer cast reinterpreting `&mut [RecordRef]` as
+  `&mut [CoordSortRef]` to feed the parallel `voracious_mt_sort` radix on the
+  large-input / multi-thread coordinate path. SAFETY: `CoordSortRef` is
+  `#[repr(transparent)]` over `RecordRef`, so the two have identical size,
+  alignment, and layout; the pointer cast (clippy rejects a ref-to-ref
+  `transmute`) is sound. This is approved for the same reason as the other sort
+  hot paths — it runs once per coordinate sort over millions of record refs, and
+  the parallel radix is measurably (~4×) faster than the safe single-threaded
+  fallback. Two tests cover this, and they establish *different* things — do not
+  read either as proving both:
+  - `prop_ref_sort_matches_copy_sorter` runs `sort_threads = 1`, so it proves
+    **byte parity** of the *serial* path against the copy sorter. It never
+    reaches the cast.
+  - `parallel_coordinate_sort_matches_serial_radix_at_threshold` is the one that
+    exercises the cast — 4 threads at the parallel cutoff over deliberately tied
+    keys — but it asserts **ref order**, comparing `(sort_key, offset)` against
+    the serial radix. It does not compare serialized bytes.
+
+  Byte-identity of the parallel path therefore follows by construction rather
+  than by direct assertion: the chunk is materialized from the refs in order, so
+  identical ref order yields identical output bytes. That is a sound inference,
+  but it is an inference, and a change that broke the materialization step would
+  not be caught by either test.
 - **`crates/fgumi-sort/src/segmented_buf.rs`** — two `#[allow(unsafe_code)]`
   sites backing the arena record buffer (a segmented, append-only `Vec<u8>` the
   sort engine decompresses/frames records into without per-record allocation):
@@ -340,16 +364,21 @@ storing a reference whose real lifetime the struct cannot name.
 
 The counts above are **production** sites. Tests carry their own
 `#[allow(unsafe_code)]` where they exercise an already-approved `unsafe` API
-directly — in `fgumi-sort` that is `segmented_buf.rs`, driving
-`SegmentedBuf::grow_uninit` / `slice_mut` to check reserve-then-write
-round-trips; in `fgumi-raw-bam` it is the `compare_nul` helper and the
-`proptest` agreement test in `src/sort.rs`, both already named above. They add
-no new `unsafe` *surface*: each calls a function already
-justified above, under that function's documented contract. A raw
-`grep -c 'allow(unsafe_code)'` therefore reports more sites than this document
-names, and the difference is entirely tests — when auditing, count sites outside
-`#[cfg(test)]`, and check each entry's own wording for whether it is quoting a
-production-only count.
+directly. In `fgumi-sort` those are `segmented_buf.rs` (8), `ref_sort.rs` (3),
+and `chunk_sorter.rs` (2), all of them driving `SegmentedBuf::grow_uninit` /
+`slice_mut` to check a reserve-then-write round-trip, or that a sorted chunk
+matches its oracle. In `fgumi-raw-bam` they are the `compare_nul` helper and the
+`proptest` agreement test in `src/sort.rs`, both already named above. They add no
+new `unsafe` *surface*: each calls a function already justified above, under that
+function's documented contract.
+
+A raw `grep -c 'allow(unsafe_code)'` over either crate therefore reports more
+sites than this document names, and the difference is tests plus prose. When
+auditing, count **attributes**, not matches: exclude the production sites listed
+above, and exclude occurrences inside `///` / `//!` comments that merely *name*
+the attribute (`segmented_buf.rs` has one such mention, which is why a naive
+`grep -c` there over-counts the test sites by one). Then check each entry's own
+wording for whether it is quoting a production-only count.
 
 Entries name the function rather than a line number on purpose: approximate
 line numbers go stale the moment anything above them moves, and a confidently

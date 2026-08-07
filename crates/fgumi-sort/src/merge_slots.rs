@@ -76,13 +76,22 @@
 //!
 //! ## Status in this tree, and the OTHER Phase-2 implementation
 //!
-//! **`SortMergeSlot` currently has no callers.** It is landing ahead of
-//! the engine that drives it, as one slice of a phased port; the
-//! producer/consumer steps named above (`SortSpillDecompress`,
-//! `SortMerge`) and `external.rs::slot_try_load_block` arrive with the
-//! `worker_pool.rs` / `external.rs` rewrite in a later phase. Until then
-//! the crate's live Phase-2 is `worker_pool::Phase2FileState`, driven
-//! through `RawExternalSorter::sort` — the opposite of the end state.
+//! **`SortMergeSlot` has in-crate callers but no production caller.** The
+//! arena engine gave it two: `external.rs::open_spill_slot`, which opens a
+//! spill file as a slot, and `MergeDriver::from_slots`, which merges a set
+//! of them. Both are reachable only from tests in this tree — their
+//! production consumer is the typed-step `SortSpillDecompress` /
+//! `SortMerge` pair, which arrives with `fgumi-pipeline-io` in a later
+//! phase. Until then the crate's live Phase-2 is
+//! `worker_pool::Phase2FileState`, driven through `RawExternalSorter::sort`
+//! — which is what `fgumi sort` and `fgumi merge` actually call.
+//!
+//! That "no production driver yet" fact is now stated in four places — twice
+//! here, once on `worker_pool::Phase2FileState`, and once in
+//! `docs/design/sort-phase2-unification-deferral.md`, which is **canonical**.
+//! All four have to change together when the pipeline steps land, so start
+//! from the design doc. (This PR already had to correct that doc for a stale
+//! method name, which is the failure mode.)
 //!
 //! `worker_pool::Phase2FileState` keeps its own reorder buffer and
 //! in-flight counter because its single-reader/**multi-decompressor**
@@ -136,11 +145,16 @@ use crate::codec::SpillCodec;
 ///
 /// `worker_pool.rs` declares a *different* constant of the same name
 /// (`pub(crate) const PHASE2_DECOMP_CAP: usize = 8`) for its own Phase-2, and
-/// that is the one governing this crate's live merge path until the engine
-/// rewrite lands — this module has no callers yet. So `fgumi_sort::PHASE2_DECOMP_CAP`
-/// resolves to 32 while the merge that actually runs is bounded at 8. The two
-/// are deliberately unequal (see this constant's history above); the confusable
-/// part is only which is in force, and that flips when the rewrite lands.
+/// that is the one governing this crate's live merge path: `fgumi sort` and
+/// `fgumi merge` run through `RawExternalSorter`, i.e. the pool. This module's
+/// callers (`open_spill_slot`, `MergeDriver::from_slots`) are reachable only
+/// from tests until the typed-step `SortMerge` consumer lands. So
+/// `fgumi_sort::PHASE2_DECOMP_CAP` resolves to 32 while the merge that actually
+/// runs is bounded at 8. The two are deliberately unequal (see this constant's
+/// history above); the confusable part is only which is in force, and that
+/// flips when the pipeline steps land — see
+/// `docs/design/sort-phase2-unification-deferral.md`, the canonical statement
+/// of when that happens.
 pub const PHASE2_DECOMP_CAP: usize = 32;
 
 /// Disk reader state for a single spill file. Mutex'd separately

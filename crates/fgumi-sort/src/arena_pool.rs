@@ -174,6 +174,21 @@ impl PooledSegmentedBuf {
     }
 }
 
+impl Default for PooledSegmentedBuf {
+    /// An empty, NON-pooled buffer.
+    ///
+    /// This exists so `std::mem::take(&mut some_pooled_buf)` moves the WRAPPER
+    /// out. Without it, `take` deref-coerces through `DerefMut` and steals the
+    /// inner `SegmentedBuf`, leaving the wrapper holding a default-sized buffer
+    /// that it still believes belongs to the pool: the real arena is orphaned
+    /// (never returned) and a wrong-`segment_size` buffer is later pushed onto
+    /// the free list. Pooled-ness must travel with the arena, and it only does
+    /// if the whole wrapper moves.
+    fn default() -> Self {
+        Self::unpooled(SegmentedBuf::default())
+    }
+}
+
 impl DerefMut for PooledSegmentedBuf {
     /// Fill happens *through* the wrapper. Without this the caller would have to
     /// unwrap to write, which is exactly the window in which a dropped arena
