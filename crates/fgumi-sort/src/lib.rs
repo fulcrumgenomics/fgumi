@@ -40,10 +40,12 @@ use noodles::sam::header::record::value::map::header::tag as header_tag;
 use tempfile::TempDir;
 
 // Sub-modules are crate-private except where a consumer needs to name the type
-// itself rather than just receive it (`arena_pool`, `segmented_buf`, `codec`).
+// itself rather than just receive it (`arena_pool`, `segmented_buf`, `codec`,
+// `ref_sort`, `template_arena`).
 // Everything else is re-exported at the crate root below.
 pub mod arena_pool;
 pub(crate) mod bgzf_io;
+pub(crate) mod chunk_sorter;
 pub mod codec;
 pub(crate) mod external;
 pub(crate) mod fd_limit;
@@ -59,7 +61,17 @@ pub(crate) mod pooled_chunk_writer;
 pub(crate) mod radix;
 pub(crate) mod read_ahead;
 pub(crate) mod reader;
+pub mod ref_sort;
 pub mod segmented_buf;
+pub mod template_arena;
+// Block-granular spill compression kernel for the block-parallel spill steps
+// (`SpillGather`/`SpillCompress`/`SpillWrite`). Surfaced via the re-exports
+// below.
+pub(crate) mod spill_block;
+pub(crate) mod spill_block_reader;
+// Synchronous inline spill compress for the P6 `CompressSpill` step (retires the
+// `SortWorkerPool` compress path). Surfaced via `write_sorted_chunk` below.
+pub(crate) mod sync_spill_writer;
 pub(crate) mod tmp_dir_alloc;
 pub(crate) mod verify;
 pub(crate) mod worker_pool;
@@ -167,18 +179,21 @@ fn create_temp_dir(base: Option<&Path>) -> Result<TempDir> {
 }
 
 pub use arena_pool::{ArenaPool, PooledSegmentedBuf};
+pub use chunk_sorter::{CoordinateChunkSorter, TemplateChunkSorter};
 pub use codec::SpillCodec;
+pub use external::MemorySources;
 pub use external::{
-    KeyTypesSpec, LibraryLookup, RawExternalSorter, cb_hasher, extract_template_key_inline,
-    format_thread_counts,
+    KeyTypesSpec, LibraryLookup, MergeDriver, MergeDriverDyn, MergeStep, RawExternalSorter,
+    cb_hasher, extract_template_key_inline, format_thread_counts, open_spill_slot,
 };
 pub use fd_limit::{
     FALLBACK_MAX_TEMP_FILES, fits_nofile_budget, resolve_temp_file_limit, soft_nofile,
     temp_file_limit_from_nofile,
 };
 pub use inline::{
-    PackedCoordinateKey, RecordRef, TemplateKey, extract_coordinate_key_inline,
-    radix_sort_record_refs, radix_sort_record_refs_with_max,
+    CbKey32, InMemoryChunk, PackedCoordinateKey, RecordBuffer, RecordRef, SORT_SEGMENT_SIZE,
+    TemplateKey, TemplateKey24, TertKey32, extract_coordinate_key_inline, radix_sort_record_refs,
+    radix_sort_record_refs_with_max,
 };
 pub use keys::{
     QuerynameComparator, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
@@ -189,7 +204,17 @@ pub use reader::{
     OwnedRawBamRecordReader, RawBamRecordReader, open_raw_bam_record_reader,
     open_raw_bam_record_reader_with_header,
 };
+pub use ref_sort::{
+    coordinate_chunk_from_arena_refs, coordinate_chunk_from_refs, queryname_chunk_from_arena_refs,
+};
 pub use segmented_buf::SegmentedBuf;
+pub use spill_block::{SpillBlockCompressor, frame_keyed_record_into, spill_magic, spill_trailer};
+pub use spill_block_reader::SpillBlockDecompressor;
+pub use sync_spill_writer::{write_sorted_chunk, write_sorted_chunk_inmem};
+pub use template_arena::{
+    TemplateArenaAccumulator, TemplateMemChunk, template_chunk_from_arena_refs,
+};
+pub use tmp_dir_alloc::TmpDirAllocator;
 pub use verify::{VerifySummary, verify_sort_order};
 
 #[cfg(test)]

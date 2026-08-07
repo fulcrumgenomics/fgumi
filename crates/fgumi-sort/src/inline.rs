@@ -14,6 +14,7 @@
 
 #![allow(dead_code)]
 
+use crate::arena_pool::PooledSegmentedBuf;
 use crate::keys::{RawCoordinateKey, RawSortKey, SortContext};
 use crate::radix::bytes_needed_u64;
 use crate::segmented_buf::SegmentedBuf;
@@ -44,7 +45,7 @@ use std::sync::Arc;
 /// In exchange, materialization is allocation-free and the peak
 /// memory of the sort drops by ~1× (the materialization no longer
 /// transiently doubles the buffer).
-pub(crate) struct InMemoryChunk<K> {
+pub struct InMemoryChunk<K> {
     /// Shared backing store for record bytes (the original sort
     /// buffer's `SegmentedBuf`). All sibling chunks from one
     /// `par_sort_into_chunks` call share this Arc, so the segments
@@ -55,7 +56,11 @@ pub(crate) struct InMemoryChunk<K> {
     /// merge is slightly higher, but the materialization-peak
     /// memory drops by ~1× (pre-PR transiently held both the buffer
     /// and a full copy in per-record `Vec<u8>`s).
-    data: Arc<SegmentedBuf>,
+    /// Wrapped in [`PooledSegmentedBuf`] so a chunk drained from a pooled
+    /// coordinate arena returns its storage to the
+    /// [`ArenaPool`](crate::arena_pool::ArenaPool) when the last `Arc` clone
+    /// drops. Non-pooled constructors use `PooledSegmentedBuf::unpooled`.
+    data: Arc<PooledSegmentedBuf>,
     /// `(sort_key, byte_offset_in_data, len)` per record, in sorted
     /// order. `offset` is `u64` because a single `SegmentedBuf` can
     /// exceed 4 GiB at high `--max-memory` × `--threads`; `len` is
@@ -67,39 +72,79 @@ impl<K> InMemoryChunk<K> {
     /// Construct an empty chunk backed by an empty shared buffer.
     #[must_use]
     pub(crate) fn empty() -> Self {
-        Self { data: Arc::new(SegmentedBuf::default()), records: Vec::new() }
+        Self {
+            data: Arc::new(PooledSegmentedBuf::unpooled(SegmentedBuf::default())),
+            records: Vec::new(),
+        }
     }
 
     /// Construct a chunk holding the given records, all referencing
-    /// the same shared data buffer.
+    /// the same shared (possibly pooled) data buffer.
     #[must_use]
-    pub(crate) fn from_parts(data: Arc<SegmentedBuf>, records: Vec<(K, u64, u32)>) -> Self {
+    pub(crate) fn from_parts(data: Arc<PooledSegmentedBuf>, records: Vec<(K, u64, u32)>) -> Self {
         Self { data, records }
+    }
+
+    /// Build a chunk from owned `(key, bytes)` records by packing the bytes into
+    /// a fresh `SegmentedBuf`. This **copies** every record, so it is for callers
+    /// that already hold owned records (tests, or future owned→shared bridging) —
+    /// the production sort path uses `RecordBuffer::drain_into_single_chunk`,
+    /// which moves the arena without copying.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any record's length exceeds `u32::MAX`. BAM records are always
+    /// < 4 GiB, so this cannot happen for real records.
+    #[must_use]
+    pub fn from_owned_records(records: Vec<(K, Vec<u8>)>) -> Self {
+        let mut data = SegmentedBuf::new();
+        let records = records
+            .into_iter()
+            .map(|(key, bytes)| {
+                let offset = data.extend_from_slice(&bytes) as u64;
+                let len = u32::try_from(bytes.len())
+                    .expect("InMemoryChunk record length exceeds u32 (BAM records are < 4 GiB)");
+                (key, offset, len)
+            })
+            .collect();
+        Self { data: Arc::new(PooledSegmentedBuf::unpooled(data)), records }
     }
 
     /// Number of records in the chunk.
     #[must_use]
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.records.len()
     }
 
     /// Whether the chunk is empty.
     #[must_use]
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
 
+    /// Total record-payload bytes (the sum of record lengths; excludes keys and
+    /// index overhead). Used for byte-budget accounting at the chunk boundary.
+    #[must_use]
+    pub fn payload_bytes(&self) -> usize {
+        self.records.iter().map(|(_, _, len)| *len as usize).sum()
+    }
+
     /// Borrow the `i`th record's bytes from the shared data buffer.
+    ///
+    /// `pub` so out-of-crate consumers (e.g. the block-parallel spill serializer
+    /// in `fgumi-pipeline-io`) can iterate a chunk's records zero-copy.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // offset/len fit in usize on all supported targets
-    pub(crate) fn record_bytes(&self, i: usize) -> &[u8] {
+    pub fn record_bytes(&self, i: usize) -> &[u8] {
         let (_, offset, len) = &self.records[i];
         self.data.slice(*offset as usize, *len as usize)
     }
 
     /// Borrow the `i`th record's sort key.
+    ///
+    /// `pub` for the same reason as [`record_bytes`](Self::record_bytes).
     #[must_use]
-    pub(crate) fn key_at(&self, i: usize) -> &K {
+    pub fn key_at(&self, i: usize) -> &K {
         &self.records[i].0
     }
 
@@ -283,7 +328,14 @@ const _: () = assert!(
 /// Sorting only reorders the index; records stay in place.
 pub struct RecordBuffer {
     /// Segmented byte storage for all records (headers + BAM data).
-    data: SegmentedBuf,
+    ///
+    /// Held as the pool wrapper, not a bare `SegmentedBuf`: an arena acquired
+    /// from the [`ArenaPool`](crate::arena_pool::ArenaPool) lives here for its
+    /// whole fill, so if this were
+    /// bare, dropping the buffer on any error path would retire that pool slot
+    /// permanently. Non-pooled buffers hold an `unpooled` wrapper and drop
+    /// normally.
+    data: PooledSegmentedBuf,
     /// Index of record references for sorting.
     refs: Vec<RecordRef>,
     /// Number of reference sequences (for unmapped handling).
@@ -294,15 +346,21 @@ pub struct RecordBuffer {
 ///
 /// Both `RecordBuffer` and `TemplateRecordBuffer` use this segment size so that
 /// a single BAM record (≤128 MiB in practice) always fits within one segment.
-const SORT_SEGMENT_SIZE: usize = 256 * 1024 * 1024;
+pub const SORT_SEGMENT_SIZE: usize = 256 * 1024 * 1024;
 
 /// Shared implementation for `par_sort_into_chunks` on both buffer types.
 ///
 /// Sorts refs in place (parallel radix sort, partitioned by `chunk_size`),
-/// then drains `self.data` into a single `Arc<SegmentedBuf>` shared
+/// then drains `self.data` into a single `Arc<PooledSegmentedBuf>` shared
 /// across all produced chunks. Each chunk's `records` Vec is built from
 /// its refs' `(key, offset + header_size, len)` triples — no per-record
 /// allocation or memcpy.
+///
+/// The drain goes through each buffer's own `take_data_arc`, never through
+/// `mem::take` here: the two buffer types store `data` at different types
+/// (`PooledSegmentedBuf` vs bare `SegmentedBuf`), so a `take` written in the
+/// macro would deref-coerce past `RecordBuffer`'s pool wrapper and orphan a
+/// pooled arena. See `RecordBuffer::take_data_arc`.
 ///
 /// `$header_size` is the byte distance from each ref's `offset` field
 /// to the start of its actual record bytes inside `data`
@@ -318,7 +376,7 @@ macro_rules! par_sort_into_chunks_impl {
 
         if $threads <= 1 || n < RADIX_THRESHOLD * 2 || n <= 10_000 {
             $sort_fn(&mut $self.refs);
-            let data = Arc::new(std::mem::take(&mut $self.data));
+            let data = $self.take_data_arc();
             let records: Vec<_> =
                 $self.refs.iter().map(|r| ($key_fn(r), r.offset + header_size, r.len)).collect();
             // Clear refs to leave the buffer in a consistent drained
@@ -336,7 +394,7 @@ macro_rules! par_sort_into_chunks_impl {
             $sort_fn(chunk);
         });
 
-        let data = Arc::new(std::mem::take(&mut $self.data));
+        let data = $self.take_data_arc();
 
         let chunks: Vec<_> = $self
             .refs
@@ -364,10 +422,10 @@ impl RecordBuffer {
     #[must_use]
     pub fn with_capacity(estimated_records: usize, estimated_bytes: usize, nref: u32) -> Self {
         Self {
-            data: SegmentedBuf::with_capacity(
+            data: PooledSegmentedBuf::unpooled(SegmentedBuf::with_capacity(
                 estimated_bytes + estimated_records * HEADER_SIZE,
                 SORT_SEGMENT_SIZE,
-            ),
+            )),
             refs: Vec::with_capacity(estimated_records),
             nref,
         }
@@ -484,7 +542,7 @@ impl RecordBuffer {
     /// index-panic against the empty `SegmentedBuf`.
     #[must_use]
     pub(crate) fn drain_into_single_chunk(&mut self) -> InMemoryChunk<RawCoordinateKey> {
-        let data = Arc::new(std::mem::take(&mut self.data));
+        let data = self.take_data_arc();
         let records: Vec<_> = self
             .refs
             .iter()
@@ -495,6 +553,36 @@ impl RecordBuffer {
             .collect();
         self.refs.clear();
         InMemoryChunk::from_parts(data, records)
+    }
+
+    /// Take the backing arena out of the buffer as the shared store for the
+    /// chunks drained from it, leaving an empty placeholder behind.
+    ///
+    /// Moves the **wrapper**, not the inner `SegmentedBuf`, so whether this
+    /// arena is pool-managed travels with it: a pooled arena returns to its
+    /// [`ArenaPool`](crate::arena_pool::ArenaPool) when the chunk's last `Arc`
+    /// drops, an unpooled one just drops. Re-wrapping the inner buffer instead
+    /// would deref-coerce past the wrapper, orphan the arena, and leave a
+    /// wrong-sized default behind for the pool to reclaim — at the default
+    /// `capacity == 1` that retires the only slot permanently.
+    ///
+    /// Every drain on this type goes through here so that reasoning lives in
+    /// one place rather than being re-derived at each call site.
+    fn take_data_arc(&mut self) -> Arc<PooledSegmentedBuf> {
+        Arc::new(std::mem::take(&mut self.data))
+    }
+
+    /// Install a (pool-acquired) arena as this buffer's backing store, replacing
+    /// the empty placeholder left by `drain_into_single_chunk`. Requires the
+    /// buffer to be drained (no refs).
+    pub(crate) fn install_arena(&mut self, arena: PooledSegmentedBuf) {
+        // Unconditional (not `debug_assert!`): replacing `self.data` while stale
+        // `refs` still index the old arena is a silent data-corruption path for a
+        // bit-identical sort engine. This is a state-transition guard, not a
+        // hot-path bounds check — the `is_empty()` cost is negligible next to
+        // record processing.
+        assert!(self.refs.is_empty(), "install_arena over a non-drained buffer");
+        self.data = arena;
     }
 
     /// Get record bytes by reference.
@@ -821,7 +909,7 @@ impl RawSortKey for TemplateKey {
 
     /// # Panics
     ///
-    /// Always panics. `TemplateKey` extraction requires a [`LibraryLookup`](crate::external::LibraryLookup)
+    /// Always panics. `TemplateKey` extraction requires a [`LibraryLookup`](crate::LibraryLookup)
     /// context not available through the `RawSortKey` trait interface. All
     /// callers must use `extract_template_key_inline()` instead.
     fn extract(_bam: &[u8], _ctx: &SortContext) -> Self {
@@ -1568,21 +1656,74 @@ impl<K: TemplateLaneKey> TemplateRecordBuffer<K> {
         )
     }
 
+    /// Take the backing buffer out as the shared store for the chunks drained
+    /// from it, leaving an empty placeholder behind.
+    ///
+    /// Mirrors [`RecordBuffer::take_data_arc`] so both buffer types drain the
+    /// same way through `par_sort_into_chunks_impl!`. This buffer is never
+    /// pool-managed — `data` is a bare `SegmentedBuf`, not a wrapper — so the
+    /// shared handle is `unpooled` and simply drops with its last `Arc`.
+    fn take_data_arc(&mut self) -> Arc<PooledSegmentedBuf> {
+        Arc::new(PooledSegmentedBuf::unpooled(std::mem::take(&mut self.data)))
+    }
+
     /// Drain the (already-sorted) buffer into a single in-memory chunk
     /// whose records share an `Arc<SegmentedBuf>` backing store.
     ///
-    /// See [`RecordBuffer::drain_into_single_chunk`] for usage and
+    /// See `RecordBuffer::drain_into_single_chunk` for usage and
     /// lifetime notes — both `data` and `refs` are cleared after this
     /// call. `iter_sorted_keyed()` would yield zero records and
     /// `get_record()` called with a stale `TemplateRecordRef` would
     /// index-panic against the empty `SegmentedBuf`.
     #[must_use]
     pub(crate) fn drain_into_single_chunk(&mut self) -> InMemoryChunk<K> {
-        let data = Arc::new(std::mem::take(&mut self.data));
+        let data = self.take_data_arc();
         let records: Vec<_> = self
             .refs
             .iter()
             .map(|r| (r.key, r.offset + TEMPLATE_HEADER_SIZE as u64, r.len))
+            .collect();
+        self.refs.clear();
+        InMemoryChunk::from_parts(data, records)
+    }
+
+    /// Drain the (already-sorted) buffer into a single in-memory chunk keyed by
+    /// the **full** [`TemplateKey`] (re-extracted per record via `extract`),
+    /// whose records share an `Arc<SegmentedBuf>` backing store — NO record
+    /// bytes are copied (the arena is moved, not the bodies).
+    ///
+    /// This is the zero-copy analogue of the owned materialisation the legacy
+    /// `TemplateChunkSorter` performs: the narrow lane key `K` drove the sort,
+    /// and the full key is re-widened here for the downstream merge (whose
+    /// `MergeDriver<TemplateKey>` orders on the full key), but the record bodies
+    /// stay resident in the moved arena instead of being copied into owned
+    /// `RawRecord`s. `extract` receives each record's body bytes (the inline
+    /// header already skipped, exactly what [`get_record`](Self::get_record)
+    /// returns) and returns its full `TemplateKey`; it MUST be the same
+    /// extraction the owned path uses, so the produced chunk is byte-for-byte
+    /// identical to the owned `Vec<(TemplateKey, RawRecord)>` (same sorted order,
+    /// same keys, same bodies).
+    ///
+    /// Runs the per-record extraction in parallel (like the owned path's
+    /// `par_iter`), so call it inside the sorter's `rayon_pool.install`. Both
+    /// `data` and `refs` are cleared after this call (the arena is moved into the
+    /// returned chunk); see [`drain_into_single_chunk`](Self::drain_into_single_chunk).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // body_off/len fit usize on all supported targets (BAM < 4 GiB, arena < address space)
+    pub(crate) fn drain_into_full_key_chunk(
+        &mut self,
+        extract: impl Fn(&[u8]) -> TemplateKey + Sync,
+    ) -> InMemoryChunk<TemplateKey> {
+        use rayon::prelude::*;
+        let data = self.take_data_arc();
+        let records: Vec<(TemplateKey, u64, u32)> = self
+            .refs
+            .par_iter()
+            .map(|r| {
+                let body_off = r.offset + TEMPLATE_HEADER_SIZE as u64;
+                let body = data.slice(body_off as usize, r.len as usize);
+                (extract(body), body_off, r.len)
+            })
             .collect();
         self.refs.clear();
         InMemoryChunk::from_parts(data, records)
@@ -2610,6 +2751,49 @@ mod tests {
         }
     }
 
+    /// Parallel/serial parity at the arena dispatch cutoff. The arena front
+    /// (`template_chunk_from_arena_refs`) routes to `parallel_radix_sort_template_refs`
+    /// only when `refs.len() >= PARALLEL_SORT_THRESHOLD`; the arena-vs-owned parity
+    /// test runs far below that, so the parallel branch is never compared against a
+    /// reference there. Mirror `parallel_coordinate_sort_matches_serial_radix_at_threshold`:
+    /// build a threshold-sized input with deliberate key ties and pin the parallel
+    /// radix's ordering against the single-threaded stable radix. Since the
+    /// arena-vs-owned test already proves `radix_sort_template_refs` matches the
+    /// owned sorter, parallel-matches-serial here pins parallel-matches-owned at
+    /// threshold by transitivity.
+    #[test]
+    fn parallel_template_radix_matches_serial_at_threshold() {
+        let n = crate::ref_sort::PARALLEL_SORT_THRESHOLD; // crosses the arena cutoff
+        // Vary the library-name hash (a full-key radix lane) over a small modulus
+        // → ~260 ties per value across the input, so a stability or lane-ordering
+        // bug in the parallel path would reorder equal-key records relative to the
+        // serial radix. `offset` ascends with input order to witness stability.
+        let refs: Vec<TemplateRecordRef<TemplateKey>> = (0..n)
+            .map(|i| {
+                let hash = (i as u64).wrapping_mul(2_654_435_761) % 1009;
+                let key =
+                    TemplateKey::new(0, 100, false, 0, 200, false, 0, 0, (1, true), hash, false);
+                TemplateRecordRef { key, offset: i as u64, len: 10, padding: 0 }
+            })
+            .collect();
+
+        let mut parallel = refs.clone();
+        let mut serial = refs;
+        parallel_radix_sort_template_refs(&mut parallel); // n > 10_000 → real parallel path
+        radix_sort_template_refs(&mut serial); // single-threaded stable reference
+
+        assert_eq!(parallel.len(), serial.len());
+        for (i, (p, s)) in parallel.iter().zip(&serial).enumerate() {
+            assert!(
+                p.key == s.key && p.offset == s.offset,
+                "parallel template radix diverged from serial radix at index {i} \
+                 (parallel offset {}, serial offset {})",
+                p.offset,
+                s.offset,
+            );
+        }
+    }
+
     #[test]
     fn test_template_record_buffer_sort_stability() {
         // Test that TemplateRecordBuffer::sort() is stable
@@ -3307,7 +3491,7 @@ mod tests {
     fn test_in_memory_chunk_from_parts_reads_records() {
         let (buf, offsets) =
             build_segmented_buf_with_records(&[b"first", b"second-record", b"third"]);
-        let data = Arc::new(buf);
+        let data = Arc::new(PooledSegmentedBuf::unpooled(buf));
         let records = vec![
             (10u32, offsets[0].0, offsets[0].1),
             (20u32, offsets[1].0, offsets[1].1),
@@ -3329,7 +3513,7 @@ mod tests {
     fn test_in_memory_chunk_take_key_replaces_with_default() {
         let (buf, offsets) = build_segmented_buf_with_records(&[b"payload"]);
         let chunk = InMemoryChunk::<u32>::from_parts(
-            Arc::new(buf),
+            Arc::new(PooledSegmentedBuf::unpooled(buf)),
             vec![(42u32, offsets[0].0, offsets[0].1)],
         );
         let mut chunk = chunk;
@@ -3347,7 +3531,7 @@ mod tests {
         // Arc<SegmentedBuf>, so the data isn't duplicated and is freed
         // only when the last chunk drops.
         let (buf, offsets) = build_segmented_buf_with_records(&[b"alpha", b"beta", b"gamma"]);
-        let data = Arc::new(buf);
+        let data = Arc::new(PooledSegmentedBuf::unpooled(buf));
         let chunk_a = InMemoryChunk::<u32>::from_parts(
             Arc::clone(&data),
             vec![(1, offsets[0].0, offsets[0].1)],
@@ -3448,6 +3632,44 @@ mod tests {
         // Strong count = number of chunks (after the macro's local `data`
         // binding has been dropped).
         assert_eq!(Arc::strong_count(&chunks[0].data), chunks.len());
+    }
+
+    /// `par_sort_into_chunks` must move the pool WRAPPER out of the buffer, the
+    /// same way `drain_into_single_chunk` does. Re-wrapping the *inner*
+    /// `SegmentedBuf` deref-coerces past the wrapper: the real arena is orphaned
+    /// (the chunks drop it instead of returning it) while the buffer keeps a
+    /// wrong-sized default that still believes it is pooled. At the default
+    /// `capacity == 1` that retires the only slot, and since the documented
+    /// response to `try_acquire() == None` is to backpressure until an arena
+    /// returns, the caller hangs rather than errors.
+    ///
+    /// `buffer` is deliberately still alive at the assert: the arena must come
+    /// back from the dropped chunks, not from the drained buffer's leftover
+    /// wrapper. Both exits of `par_sort_into_chunks_impl!` are covered — the
+    /// single-chunk early return and the multi-chunk path.
+    #[rstest::rstest]
+    #[case::single_chunk_exit(1_000)]
+    #[case::multi_chunk_exit(10_500)]
+    fn par_sort_into_chunks_returns_the_pooled_arena_when_its_chunks_drop(#[case] n: usize) {
+        let arena_pool = crate::arena_pool::ArenaPool::new(1, SORT_SEGMENT_SIZE);
+        let mut buffer = RecordBuffer::with_capacity(n, n * 64, 4);
+        buffer.install_arena(arena_pool.try_acquire().expect("the fresh pool hands out its arena"));
+
+        for i in 0..n {
+            // Descending position so the sort is non-trivial. `#[allow]` on the
+            // test fn would not reach the per-case fns `rstest` generates, so
+            // the cast is done with `try_from` rather than suppressed.
+            let pos = i32::try_from(n - i).expect("test record count fits i32");
+            buffer.push_coordinate(&make_coordinate_bam_record(0, pos)).expect("push_coordinate");
+        }
+
+        let rayon_pool =
+            rayon::ThreadPoolBuilder::new().num_threads(4).build().expect("rayon pool build");
+        let chunks = rayon_pool.install(|| buffer.par_sort_into_chunks(4));
+        assert_eq!(arena_pool.free_len(), 0, "the arena is in flight while the chunks hold it");
+
+        drop(chunks);
+        assert_eq!(arena_pool.free_len(), 1, "dropping the chunks returns the arena to the pool");
     }
 
     mod template_key32 {
