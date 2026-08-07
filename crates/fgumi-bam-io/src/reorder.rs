@@ -48,7 +48,7 @@ pub struct ReorderBuffer<T> {
     /// Sparse buffer: index (seq - `next_seq`) maps to `Option<(T, usize)>` where
     /// usize is the pre-computed heap size (0 if not tracked).
     buffer: VecDeque<Option<(T, usize)>>,
-    /// Next sequence number to release (also the sequence number corresponding to buffer[0]).
+    /// Next sequence number to release (also the sequence number corresponding to `buffer[0]`).
     next_seq: u64,
     /// Number of items currently stored.
     count: usize,

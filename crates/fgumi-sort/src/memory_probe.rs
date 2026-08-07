@@ -488,7 +488,7 @@ impl MergeProbe {
     /// threshold.
     ///
     /// `pool_depths` is the `(raw_input, decompressed_input, buffer_pool)`
-    /// triple from [`SortWorkerPool::phase1_queue_depths`].
+    /// triple from [`crate::worker_pool::SortWorkerPool::phase1_queue_depths`].
     pub fn log_mid_with_depths(
         &mut self,
         pool_depths: (usize, usize, usize),

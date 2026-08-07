@@ -824,7 +824,7 @@ impl Extract {
     /// <https://support.illumina.com/help/BaseSpace_OLH_009008/Content/Source/Informatics/BS/FileFormat_FASTQ-files_swBS.htm>.
     ///
     /// An old-style Casava (<1.8) `/1` / `/2` read-number suffix is stripped from
-    /// the returned name (see [`strip_read_suffix`](crate::fastq_parse::strip_read_suffix))
+    /// the returned name (see [`strip_read_suffix`])
     /// so both mates of a pair share an identical QNAME, matching fgbio's `FastqSource`.
     /// Stripping happens before UMI extraction so a read-number digit never leaks into the UMI.
     ///
