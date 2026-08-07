@@ -629,11 +629,11 @@ pub struct ConsensusCallingOptions {
     /// Produce per-base tags (cd, ce) in addition to per-read tags. The default (true) matches
     /// fgbio, which always writes per-base tags; setting this to false drops per-base tags that
     /// fgbio emits unconditionally.
-    #[arg(short = 'B', long = "output-per-base-tags", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(short = 'B', long = "output-per-base-tags", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub output_per_base_tags: bool,
 
     /// Quality-trim reads before consensus calling (removes low-quality bases from ends)
-    #[arg(long = "trim", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "trim", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub trim: bool,
 
     /// Minimum consensus base quality (output consensus bases below this are masked to N). The
@@ -760,7 +760,7 @@ impl Default for ReadGroupOptions {
 #[derive(Debug, Clone, Args)]
 pub struct OverlappingConsensusOptions {
     /// Consensus call overlapping bases in read pairs before UMI consensus calling
-    #[arg(long = "consensus-call-overlapping-bases", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "consensus-call-overlapping-bases", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub consensus_call_overlapping_bases: bool,
 }
 
@@ -853,7 +853,7 @@ pub struct AllowUnmappedOptions {
     /// all secondary/supplementary alignments — are dropped before consensus
     /// calling. Enable for consensus on unmapped input (e.g. ribosome/protein
     /// display), mirroring `fgumi group --allow-unmapped`.
-    #[arg(long = "allow-unmapped", value_name = "ALLOW_UNMAPPED", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "allow-unmapped", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub enabled: bool,
 }
 
@@ -878,7 +878,7 @@ pub struct SchedulerOptions {
     ///
     /// Shows per-step timing, throughput, contention metrics, and
     /// per-thread work distribution.
-    #[arg(long = "pipeline-stats", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool, hide = true)]
+    #[arg(long = "pipeline-stats", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true, hide = true)]
     pub pipeline_stats: bool,
 
     /// Timeout in seconds for deadlock detection (default: 10, 0 = disabled).
@@ -892,7 +892,7 @@ pub struct SchedulerOptions {
     ///
     /// Uses progressive doubling: 2x -> 4x -> unbind, with restoration
     /// after 30s of sustained progress.
-    #[arg(long = "deadlock-recover", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool, hide = true)]
+    #[arg(long = "deadlock-recover", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true, hide = true)]
     pub deadlock_recover: bool,
 }
 
@@ -1200,7 +1200,7 @@ pub struct QueueMemoryOptions {
     /// When enabled (default), --max-memory is per thread, so total memory =
     /// `max_memory` × threads. Disable for a fixed total budget regardless of
     /// thread count (recommended on fixed-RAM hosts).
-    #[arg(long = "memory-per-thread", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "memory-per-thread", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub memory_per_thread: bool,
 }
 
@@ -1346,16 +1346,6 @@ pub(crate) fn is_r1_genomically_earlier_raw(r1: &[u8], r2: &[u8]) -> bool {
         return r1_pos < r2_pos;
     }
     (RawRecordView::new(r1).flags() & fgumi_raw_bam::flags::REVERSE) == 0
-}
-
-/// Parses a boolean value from a string, accepting: true/false, yes/no, y/n, t/f
-/// (case-insensitive). Matches sopt/fgbio behavior.
-pub(crate) fn parse_bool(s: &str) -> Result<bool, String> {
-    match s.to_ascii_lowercase().as_str() {
-        "true" | "t" | "yes" | "y" => Ok(true),
-        "false" | "f" | "no" | "n" => Ok(false),
-        _ => Err(format!("Invalid boolean value '{s}'. Expected: true|false|yes|no|y|n|t|f")),
-    }
 }
 
 // Re-export from the library crate for backward compatibility.
@@ -2286,50 +2276,57 @@ mod tests {
         assert_eq!(cmd.queue_memory.max_memory, expected);
     }
 
+    /// The accepted boolean spellings, asserted through the CLI rather than a
+    /// parser function, so the test survives a change of parser.
+    ///
+    /// `on`/`off`/`1`/`0` are accepted since the switch to clap's
+    /// `BoolishValueParser`; they were rejected by the previous hand-rolled
+    /// `parse_bool`, and the cases below moved up from the rejected table.
     #[rstest]
-    #[case("true", true)]
-    #[case("false", false)]
-    #[case("yes", true)]
-    #[case("no", false)]
-    #[case("t", true)]
-    #[case("f", false)]
-    #[case("y", true)]
-    #[case("n", false)]
-    #[case("True", true)]
-    #[case("TRUE", true)]
-    #[case("False", false)]
-    #[case("FALSE", false)]
-    #[case("Yes", true)]
-    #[case("YES", true)]
-    #[case("No", false)]
-    #[case("NO", false)]
-    #[case("T", true)]
-    #[case("F", false)]
-    #[case("Y", true)]
-    #[case("N", false)]
-    #[case("tRuE", true)]
-    #[case("fAlSe", false)]
-    #[case("yEs", true)]
-    fn test_parse_bool_valid(#[case] input: &str, #[case] expected: bool) {
-        assert_eq!(parse_bool(input).expect("should parse"), expected);
+    #[case::lower_true("true", true)]
+    #[case::lower_false("false", false)]
+    #[case::yes("yes", true)]
+    #[case::no("no", false)]
+    #[case::t("t", true)]
+    #[case::f("f", false)]
+    #[case::y("y", true)]
+    #[case::n("n", false)]
+    #[case::on("on", true)]
+    #[case::off("off", false)]
+    #[case::one("1", true)]
+    #[case::zero("0", false)]
+    #[case::mixed_case_true("TrUe", true)]
+    #[case::upper_false("FALSE", false)]
+    #[case::upper_yes("YES", true)]
+    #[case::mixed_case_no("No", false)]
+    #[case::upper_on("ON", true)]
+    #[case::mixed_case_off("oFf", false)]
+    fn bool_flag_accepts_spelling(#[case] value: &str, #[case] expected: bool) {
+        let cmd = TestBoolFlags::try_parse_from(["test", "--memory-per-thread", value])
+            .expect("boolean spelling should be accepted");
+        assert_eq!(cmd.queue_memory.memory_per_thread, expected);
     }
 
+    /// Anything outside that set is still rejected -- the parser widens what is
+    /// accepted, it does not fall back to `true` for unrecognized input.
     #[rstest]
-    #[case("")]
-    #[case("tru")]
-    #[case("fals")]
-    #[case("truee")]
-    #[case("noo")]
-    #[case("yess")]
-    #[case("maybe")]
-    #[case("0")]
-    #[case("1")]
-    #[case("on")]
-    #[case("off")]
-    #[case(" true")]
-    #[case("true ")]
-    fn test_parse_bool_invalid(#[case] input: &str) {
-        assert!(parse_bool(input).is_err(), "expected error for input: {input:?}");
+    #[case::empty("")]
+    #[case::truncated_true("tru")]
+    #[case::truncated_false("fals")]
+    #[case::overlong_true("truee")]
+    #[case::overlong_no("noo")]
+    #[case::overlong_yes("yess")]
+    #[case::not_a_bool("maybe")]
+    #[case::leading_space(" true")]
+    #[case::trailing_space("true ")]
+    #[case::numeric_two("2")]
+    #[case::negative_one("-1")]
+    #[case::size_suffix("10G")]
+    fn bool_flag_rejects_spelling(#[case] value: &str) {
+        assert!(
+            TestBoolFlags::try_parse_from(["test", "--memory-per-thread", value]).is_err(),
+            "expected rejection for input: {value:?}"
+        );
     }
 
     #[rstest]
@@ -2343,6 +2340,12 @@ mod tests {
     #[case(&["test", "--trim", "NO"], false)]
     #[case(&["test", "--trim=yes"], true)]
     #[case(&["test", "--trim=no"], false)]
+    // Accepted since the switch to clap's `BoolishValueParser`; these four
+    // moved up from the rejected table below.
+    #[case(&["test", "--trim", "on"], true)]
+    #[case(&["test", "--trim", "off"], false)]
+    #[case(&["test", "--trim", "1"], true)]
+    #[case(&["test", "--trim", "0"], false)]
     fn test_extended_bool_values_in_cli(#[case] args: &[&str], #[case] expected: bool) {
         let cmd = TestBoolFlags::try_parse_from(args).expect("valid CLI args should parse");
         assert_eq!(cmd.consensus.trim, expected);
@@ -2350,10 +2353,10 @@ mod tests {
 
     #[rstest]
     #[case(&["test", "--trim", "maybe"])]
-    #[case(&["test", "--trim", "0"])]
-    #[case(&["test", "--trim", "1"])]
-    #[case(&["test", "--trim", "on"])]
-    #[case(&["test", "--trim", "off"])]
+    #[case(&["test", "--trim", "2"])]
+    #[case(&["test", "--trim", "-1"])]
+    #[case(&["test", "--trim", "tru"])]
+    #[case(&["test", "--trim", "10G"])]
     fn test_extended_bool_values_in_cli_invalid(#[case] args: &[&str]) {
         assert!(TestBoolFlags::try_parse_from(args).is_err());
     }

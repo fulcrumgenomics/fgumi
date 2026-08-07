@@ -28,7 +28,6 @@ use std::path::PathBuf;
 use std::thread;
 
 use crate::commands::command::Command;
-use crate::commands::common::parse_bool;
 
 use super::engines::OpenedInput;
 use super::engines::content::ContentPredicate;
@@ -325,7 +324,7 @@ pub struct CompareBams {
     pub max_diffs: usize,
 
     /// Quiet mode - only exit code indicates result (0=equal, 1=different)
-    #[arg(short = 'q', long = "quiet", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(short = 'q', long = "quiet", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub quiet: bool,
 
     /// Ignore record order when comparing. Only valid with `--mode grouping`
@@ -336,7 +335,7 @@ pub struct CompareBams {
     /// backward compatibility.
     /// Overrides `--command` preset if both given. Defaults to false when
     /// neither `--ignore-order` nor `--command` is set.
-    #[arg(long = "ignore-order", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "ignore-order", value_name = "true|false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub ignore_order: Option<bool>,
 
     /// Initial buffer size for --ignore-order mode (number of records)

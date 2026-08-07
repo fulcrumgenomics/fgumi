@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::command::Command;
 use super::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    build_pipeline_config, parse_bool,
+    build_pipeline_config,
 };
 
 /// Clips reads in a BAM file to remove overlaps
@@ -91,18 +91,19 @@ pub struct Clip {
     pub clipping_mode: ClippingMode,
 
     /// Clip overlapping read pairs
-    #[arg(long = "clip-overlapping-reads", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "clip-overlapping-reads", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub clip_overlapping_reads: bool,
 
     /// Clip reads that extend past their mate's start position
     #[arg(
         long = "clip-bases-past-mate",
         alias = "clip-extending-past-mate",
+        value_name = "true|false",
         default_value = "false",
         num_args = 0..=1,
         default_missing_value = "true",
         action = clap::ArgAction::Set,
-        value_parser = parse_bool,
+        value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true,
     )]
     pub clip_extending_past_mate: bool,
 
@@ -123,11 +124,11 @@ pub struct Clip {
     pub read_two_three_prime: usize,
 
     /// Upgrade existing clipping to the specified clipping mode
-    #[arg(short = 'H', long = "upgrade-clipping", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(short = 'H', long = "upgrade-clipping", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub upgrade_clipping: bool,
 
     /// Automatically clip extended attributes that match read length
-    #[arg(short = 'a', long = "auto-clip-attributes", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(short = 'a', long = "auto-clip-attributes", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub auto_clip_attributes: bool,
 
     /// Output file for clipping metrics (only produced by the single-threaded path; cannot be

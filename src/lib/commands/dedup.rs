@@ -53,7 +53,7 @@ use serde::{Deserialize, Serialize};
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    build_pipeline_config, is_r1_genomically_earlier_raw, parse_bool,
+    build_pipeline_config, is_r1_genomically_earlier_raw,
 };
 use crate::sam::TC_TAG;
 use fgumi_raw_bam;
@@ -1082,7 +1082,7 @@ pub struct MarkDuplicates {
     pub family_size_histogram: Option<PathBuf>,
 
     /// Remove duplicates instead of just marking them
-    #[arg(short = 'r', long = "remove-duplicates", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(short = 'r', long = "remove-duplicates", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub remove_duplicates: bool,
 
     /// Minimum mapping quality for a read to be included
@@ -1090,14 +1090,14 @@ pub struct MarkDuplicates {
     pub min_map_q: Option<u8>,
 
     /// Include reads flagged as not passing QC
-    #[arg(short = 'n', long = "include-non-pf-reads", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(short = 'n', long = "include-non-pf-reads", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub include_non_pf_reads: bool,
 
     /// Emit templates with no mapped read (both mates unmapped) untouched instead of
     /// discarding them. Such templates carry no alignment coordinate and no duplicate
     /// signal; passing them through preserves a complete record set (like Picard
     /// `MarkDuplicates`). Truncated/corrupt records are still dropped.
-    #[arg(long = "include-unmapped", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "include-unmapped", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub include_unmapped: bool,
 
     /// UMI grouping strategy
@@ -1136,7 +1136,7 @@ pub struct MarkDuplicates {
     /// this mode, so F1R2 and F2R1 at the same coordinates are one molecule, matching
     /// Picard `MarkDuplicates`. Library and cell barcode still partition the grouping key
     /// (see "Grouping key" in --help).
-    #[arg(long = "no-umi", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "no-umi", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub no_umi: bool,
 
     /// Scheduler and pipeline options

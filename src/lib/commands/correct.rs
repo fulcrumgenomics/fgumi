@@ -90,8 +90,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, RejectsOptions, SchedulerOptions,
-    ThreadingOptions, build_pipeline_config, parse_bool, reject_colliding_outputs,
-    serialize_raw_bam_records,
+    ThreadingOptions, build_pipeline_config, reject_colliding_outputs, serialize_raw_bam_records,
 };
 
 /// Which SAM tag `correct` operates on.
@@ -293,11 +292,12 @@ pub struct CorrectUmis {
     #[arg(
         long = "dont-store-original",
         alias = "dont-store-original-umis",
+        value_name = "true|false",
         default_value = "false",
         num_args = 0..=1,
         default_missing_value = "true",
         action = clap::ArgAction::Set,
-        value_parser = parse_bool
+        value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true
     )]
     pub dont_store_original_umis: bool,
 
@@ -310,7 +310,7 @@ pub struct CorrectUmis {
     pub min_corrected: Option<f64>,
 
     /// Reverse complement UMIs before matching.
-    #[arg(long, default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long, value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub revcomp: bool,
 
     /// Threading options for parallel processing.

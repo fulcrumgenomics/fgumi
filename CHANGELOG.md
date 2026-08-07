@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Features
+
+- Boolean command-line flags now additionally accept `on`, `off`, `1`, and `0`, alongside the
+  existing `true`/`false`/`yes`/`no`/`y`/`n`/`t`/`f`. All spellings remain case-insensitive, and
+  values outside that set are still rejected.
+- Boolean command-line flags now render a `true|false` placeholder in help, so `fgumi filter -h`
+  shows `--memory-per-thread [<true|false>]` rather than `--memory-per-thread
+  [<MEMORY_PER_THREAD>]`, which read as a request for a per-thread memory size.
+
 ## [0.5.0] - 2026-07-28
 
 ### Bug Fixes

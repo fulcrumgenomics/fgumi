@@ -4,7 +4,7 @@ use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    build_pipeline_config, is_r1_genomically_earlier_raw, parse_bool,
+    build_pipeline_config, is_r1_genomically_earlier_raw,
 };
 use crate::grouper::{
     FilterMetrics, ProcessedPositionGroup, RawPositionGroup, RecordPositionGrouper,
@@ -772,7 +772,7 @@ pub struct GroupReadsByUmi {
     pub min_map_q: Option<u8>,
 
     /// Include non-PF reads
-    #[arg(short = 'n', long = "include-non-pf-reads", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(short = 'n', long = "include-non-pf-reads", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub include_non_pf_reads: bool,
 
     /// Allow fully unmapped templates (both reads unmapped). Input must be
@@ -793,7 +793,7 @@ pub struct GroupReadsByUmi {
     /// For paired UMIs (e.g., "ACGT-TGCA"), edit distance is computed on the
     /// concatenated sequence with dashes removed (30 bases for 15bp-15bp UMIs).
     /// With --edits 1, only 1 mismatch is allowed across ALL bases.
-    #[arg(long = "allow-unmapped", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "allow-unmapped", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub allow_unmapped: bool,
 
     /// Enable the parallel UMI assigner for position groups with at least this
@@ -875,7 +875,7 @@ pub struct GroupReadsByUmi {
     /// Skip UMI-based grouping; group by template coordinate and strand of origin. Forces
     /// identity strategy and ignores any existing UMI tags. An F1R2 and an F2R1 template at
     /// the same coordinates therefore remain separate molecules.
-    #[arg(long = "no-umi", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "no-umi", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub no_umi: bool,
 
     /// Scheduler and pipeline statistics options.
@@ -888,7 +888,7 @@ pub struct GroupReadsByUmi {
 
     /// Enable comprehensive memory debugging (reports every 1 second)
     #[cfg(feature = "memory-debug")]
-    #[arg(long, default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long, value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub debug_memory: bool,
 
     /// Memory report interval in seconds (default: 1, minimum: 1)

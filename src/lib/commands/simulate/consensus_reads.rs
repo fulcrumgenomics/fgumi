@@ -1,7 +1,7 @@
 //! Generate consensus BAM with tags for filter.
 
 use crate::commands::command::Command;
-use crate::commands::common::{CompressionOptions, parse_bool};
+use crate::commands::common::CompressionOptions;
 use crate::commands::simulate::common::{
     MethylationArgs, ReferenceGenome, StrandBiasArgs, join_writer_result,
 };
@@ -96,7 +96,7 @@ pub struct ConsensusReads {
     pub error_rate_stddev: f64,
 
     /// Generate duplex consensus tags (aD, bD, aM, bM, aE, bE)
-    #[arg(long = "duplex", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "duplex", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub duplex: bool,
 
     /// Base quality for consensus reads

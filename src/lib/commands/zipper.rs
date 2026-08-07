@@ -47,7 +47,7 @@
 //! - `TagInfo`: Holds sets of tags to remove/reverse/revcomp
 //! - `merge_raw()`: Core function that transfers metadata between templates using raw bytes
 use crate::commands::command::Command;
-use crate::commands::common::{CompressionOptions, parse_bool};
+use crate::commands::common::CompressionOptions;
 use crate::logging::OperationTimer;
 use crate::reference::{ReferenceReader, find_dict_path};
 use crate::sam::{SamTag, TemplateCoordinateInfo, check_sort};
@@ -186,7 +186,7 @@ pub struct Zipper {
 
     /// Exclude reads from the unmapped BAM that are not present in the aligned BAM.
     /// Useful when reads were intentionally removed (e.g., by adapter trimming) prior to alignment.
-    #[arg(long = "exclude-missing-reads", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "exclude-missing-reads", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub exclude_missing_reads: bool,
 
     /// Skip adding `tc` (template coordinate) tags to secondary/supplementary reads.
@@ -209,7 +209,7 @@ pub struct Zipper {
     /// secondary and supplementary reads come out with no `tc`, which is what
     /// `dedup` checks on those reads, so it rejects that output too — re-zipper
     /// without the flag.
-    #[arg(long = "skip-tc-tags", alias = "skip-pa-tags", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "skip-tc-tags", alias = "skip-pa-tags", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub skip_tc_tags: bool,
 
     /// Restore unconverted bases in EM-seq consensus reads after bwameth re-alignment.
@@ -222,7 +222,7 @@ pub struct Zipper {
     ///
     /// This produces a final BAM where the sequence shows the original (unconverted) bases,
     /// while methylation state is preserved in MM/ML tags and cu/ct count tags.
-    #[arg(long = "restore-unconverted-bases", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "restore-unconverted-bases", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub restore_unconverted_bases: bool,
 }
 
