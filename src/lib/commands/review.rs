@@ -722,7 +722,7 @@ impl Review {
         None
     }
 
-    /// Extracts the leading numeric value from a typed VCF sample [`Value`] (used to
+    /// Extracts the leading numeric value from a typed VCF sample `Value` (used to
     /// read `AF`). Scalars convert directly; arrays take the first present element;
     /// strings parse their first comma-separated token (fgbio does `AF.toDouble`).
     fn value_as_f64(

@@ -88,7 +88,7 @@ pub struct SortVerifyOutcome {
     /// compared (no resync), though both streams are still drained for accurate counts.
     pub presence_mismatch: bool,
     /// `true` if the two inputs' `@HD`/`@SQ`/`@RG` headers disagreed on a field
-    /// [`compare_headers`](super::header::compare_headers) considers significant (`@PG`/`@CO`
+    /// [`compare_headers`] considers significant (`@PG`/`@CO`
     /// are normalized and never contribute here). Note that `@HD` `SO`/`GO`/`SS` agreement is
     /// already implied by `detect_sort_order` succeeding on both inputs with a matching
     /// [`SortOrder`] (checked before this field is ever populated) *only when both writers use
@@ -822,7 +822,7 @@ where
 /// by maximal equal-core-sort-key run (see the module docs).
 ///
 /// Never re-sorts either input. Also compares the two inputs' headers via
-/// [`compare_headers`](super::header::compare_headers) (`@HD`/`@SQ`/`@RG`, normalizing away
+/// [`compare_headers`] (`@HD`/`@SQ`/`@RG`, normalizing away
 /// `@PG`/`@CO`); a significant divergence is folded into
 /// [`SortVerifyOutcome::header_mismatch`]/[`SortVerifyOutcome::is_match`] alongside the
 /// run-comparison findings. `max_diffs` caps the number of entries collected in

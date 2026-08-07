@@ -3177,7 +3177,7 @@ fn fastq_try_step_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
 /// Create templates by zipping records from synchronized FASTQ streams.
 ///
 /// For single-end: each record becomes its own template.
-/// For paired-end: R1[i] and R2[i] are zipped into a single template.
+/// For paired-end: `R1[i]` and `R2[i]` are zipped into a single template.
 fn create_templates_from_streams(
     mut streams: Vec<FastqParsedStream>,
 ) -> io::Result<Vec<FastqTemplate>> {
