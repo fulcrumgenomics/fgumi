@@ -15,8 +15,8 @@
 //!   coincidence, not evidence of parity, so it must never be allowed to mask
 //!   the desync.
 //! - If the keys agree, the pair is compared under a
-//!   [`ContentPredicate`](super::content::ContentPredicate) via
-//!   [`content_diffs`](super::content::content_diffs).
+//!   [`ContentPredicate`] via
+//!   [`content_diffs`].
 //!
 //! A record-count mismatch (one file longer than the other) is reported as a
 //! presence difference, independent of and in addition to any key mismatch.
@@ -53,7 +53,7 @@ pub struct PositionalOutcome {
     /// pairing stopped at the first desync rather than attempting to resync.
     pub key_mismatch_at: Option<u64>,
     /// `true` if the two inputs' `@HD`/`@SQ`/`@RG` headers disagreed on a field
-    /// [`compare_headers`](super::header::compare_headers) considers significant (`@PG`/`@CO`
+    /// [`compare_headers`] considers significant (`@PG`/`@CO`
     /// are normalized and never contribute here).
     pub header_mismatch: bool,
     /// Human-readable diff strings (header, key mismatch, content diffs, and/or the
@@ -85,7 +85,7 @@ impl PositionalOutcome {
 /// always reflect the true totals even after pairing has stopped.
 ///
 /// Also compares the two inputs' headers via
-/// [`compare_headers`](super::header::compare_headers) (`@HD`/`@SQ`/`@RG`, normalizing away
+/// [`compare_headers`] (`@HD`/`@SQ`/`@RG`, normalizing away
 /// `@PG`/`@CO`); a significant divergence is folded into
 /// `PositionalOutcome::header_mismatch`/`PositionalOutcome::is_match` alongside the
 /// record-level findings.

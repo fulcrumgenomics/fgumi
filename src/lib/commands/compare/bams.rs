@@ -151,7 +151,7 @@ impl CommandPreset {
     ///   `clip` rewrites CIGAR/SEQ/QUAL in the clipped span and, as a consequence, regenerates
     ///   the alignment tags (`NM`/`UQ`/`MD`) and repairs mate-pair metadata — but neither ever
     ///   recomputes the depth-tag values. All five compare positionally under
-    ///   [`ContentPredicate::Exact`](super::engines::content::ContentPredicate::Exact):
+    ///   [`ContentPredicate::Exact`]:
     ///   because fgumi clamps the depth tags to fgbio's `Short` ceiling at the source, the
     ///   tags are bit-identical and an exact comparison is both sound and complete — no
     ///   consensus-specific predicate is needed. Since `Exact` holds every core SAM field
@@ -167,7 +167,7 @@ impl CommandPreset {
     ///   ([`super::engines::molecule_join::molecule_join_compare`]): molecules are matched by
     ///   an MI-invariant canonical id (no re-sort — both inputs must already be grouped),
     ///   and each matched pair is checked for record membership, content under
-    ///   [`ContentPredicate::ExactMinusMi`](super::engines::content::ContentPredicate::ExactMinusMi)
+    ///   [`ContentPredicate::ExactMinusMi`]
     ///   (everything except the MI tag), and duplex `/A`/`/B` strand-partition equivalence —
     ///   the predicate excludes MI precisely because the canonical-id matching, not the
     ///   content predicate, is what verifies MI equivalence.
@@ -196,7 +196,7 @@ impl CommandPreset {
     /// The [`ContentPredicate`] to use for this preset's content comparison. See
     /// [`Self::resolve`] for the full resolution table and rationale. Note that for `Group`
     /// (resolved mode `CompareMode::Grouping`), this value is *not* consulted by the
-    /// molecule-join engine — [`engines::molecule_join::molecule_join_compare`] hardcodes
+    /// molecule-join engine — [`super::engines::molecule_join::molecule_join_compare`] hardcodes
     /// [`ContentPredicate::ExactMinusMi`] internally and is not configurable via
     /// `--command`/`--mode`. `Group` never reaches `execute_content`, but this method is
     /// still live for it (its resolved value is exercised only by the
@@ -970,7 +970,7 @@ impl CompareBams {
     ///
     /// This is the sole `CompareMode::Grouping` path (and what `--command group` uses). Both
     /// inputs are cut into per-molecule runs and matched across the two files by an
-    /// MI-invariant canonical id (see [`molecule_join_compare`]) — no re-sort, so both inputs
+    /// MI-invariant canonical id (see [`super::engines::molecule_join::molecule_join_compare`]) — no re-sort, so both inputs
     /// must already be grouped (same-MI reads consecutive, as `fgumi group`/`fgbio group`
     /// output is). This makes the comparison inherently order-independent at the molecule
     /// level — `--ignore-order` is therefore a no-op under `--mode grouping`. Each matched
@@ -982,7 +982,7 @@ impl CompareBams {
     ///
     /// # Errors
     ///
-    /// Returns an error if either input cannot be read (see [`molecule_join_compare`]), or
+    /// Returns an error if either input cannot be read (see [`super::engines::molecule_join::molecule_join_compare`]), or
     /// [`super::CompareMismatch`] if the two BAMs are found to differ (non-zero exit via the
     /// `Command` trait).
     fn execute_grouping(&self, input1: OpenedInput, input2: OpenedInput) -> Result<u64> {

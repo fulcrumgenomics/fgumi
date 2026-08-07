@@ -239,7 +239,7 @@ impl ClipParams {
     /// the template — including secondary/supplementary alignments — before the primary pair is
     /// clipped, matching fgbio `ClipBam`'s `template.allReads.foreach(upgradeAllClipping)`
     /// (`ClipBam.scala:123`). Doing this template-wide pre-pass here (rather than per-primary
-    /// inside [`clip_pair`]/[`clip_fragment`]) is what lets supplementary reads' clipping be
+    /// inside `clip_pair`/`clip_fragment`) is what lets supplementary reads' clipping be
     /// upgraded too, and keeps both threading paths in lockstep since both go through this method.
     ///
     /// This is the single shared implementation used by both the single-threaded and
