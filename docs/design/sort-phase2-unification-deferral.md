@@ -12,17 +12,22 @@ design:
   (`advance_to_next_block`). Keeps `--write-index`, `--verify`, zstd spill.
 - **Streaming / runall** (`crates/fgumi-sort/src/merge_slots.rs`,
   `external.rs::MergeDriver`) — drives the fused in-pipeline `runall` sort. A
-  cooperative `try_run` state machine that yields (`Stalled`/`WouldBlock`)
+  cooperative `MergeDriverDyn::try_step` state machine that yields
+  (`Stalled`/`WouldBlock`)
   instead of blocking, so it composes with the typed-step pipeline framework.
 
-> **Which of these exists in this tree.** Only the pool driver runs here. The
-> streaming driver is arriving in phases: `merge_slots.rs::SortMergeSlot` is its
-> first piece and has **no callers**, and `external.rs::MergeDriver` does not
-> exist on this branch at all. So read the streaming bullet — and every claim
-> below about the cooperative consumer, including the deadlock analysis — as
-> describing the end state this landing builds toward, not code you can run
-> today. In particular, none of it is a statement about `SortMergeSlot`, which
-> is a passive handoff slot and not a driver.
+> **Which of these runs in this tree.** Only the pool driver. Both halves of the
+> streaming driver now exist — `merge_slots.rs::SortMergeSlot` and
+> `external.rs::MergeDriver`, the latter arriving with the arena engine — but
+> nothing in production drives them: `MergeDriver::from_slots` and
+> `open_spill_slot` are reachable only from tests until the typed-step
+> `SortMerge` consumer lands with `fgumi-pipeline-io`. `fgumi sort` and
+> `fgumi merge` both go through `RawExternalSorter`, i.e. the pool path.
+>
+> So read the streaming bullet — and every claim below about the cooperative
+> consumer, including the deadlock analysis — as describing the end state this
+> landing builds toward. The analysis is about that consumer, not about
+> `SortMergeSlot`, which is a passive handoff slot rather than a driver.
 
 Unifying these onto a single driver is a deliberate **future** refactor with its
 own design + bench gate + deadlock re-analysis. It is intentionally NOT done in
@@ -71,7 +76,7 @@ consumer, and no one has shown the pool path deadlock-free in general.
 3. `--verify` ported (today a separate read-and-check path, designed to stay
    legacy).
 4. A consumer for the file-to-file case that is not exposed to the v4 drain
-   deadlock — the streaming consumer is the cooperative `try_run` model that hit
+   deadlock — the streaming consumer is the cooperative `try_step` model that hit
    it in production. "Not exposed to *this* deadlock" is the bar; general
    deadlock freedom is not something either driver has been shown to have.
 

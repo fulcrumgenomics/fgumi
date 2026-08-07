@@ -15,37 +15,8 @@ use std::collections::BTreeMap;
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
 
-/// Padding beyond the frame size for the staging buffer capacity.
+/// Padding beyond `BGZF_MAX_BLOCK_SIZE` for the staging buffer capacity.
 const STAGING_PADDING: usize = 4096;
-
-/// Uncompressed bytes per zstd **spill** frame.
-///
-/// BGZF mandates blocks of at most 64 KiB; zstd has no such limit, and spill
-/// files are a private temporary format that nothing outside this crate reads.
-/// Pinning zstd frames to the BGZF ceiling was therefore vestigial, and it set
-/// the merge's block count -- 5,368,249 blocks on a measured 89-way merge, of
-/// which the consumer takes roughly one per round trip. Fewer, larger frames cut
-/// round trips proportionally.
-///
-/// Raising this costs memory in two places, both worth watching: the per-worker
-/// zstd decompress buffer ([`crate::worker_pool::zstd_decomp_cap`]) and the
-/// per-file reorder buffer, which holds up to `PHASE2_DECOMP_CAP` *uncompressed*
-/// frames for each of K files. Read-ahead itself does not scale with it, because
-/// the refill allowance is sized in bytes rather than blocks.
-pub(crate) const SPILL_FRAME_BYTES: usize = BGZF_MAX_BLOCK_SIZE;
-
-/// Bytes a staging buffer accumulates before it submits a compress job.
-///
-/// Keyed on the codec so BAM output stays inside the BGZF format: output always
-/// uses [`SpillCodec::Bgzf`], so it cannot pick up a spill-only frame size by
-/// accident.
-#[must_use]
-pub(crate) const fn spill_frame_bytes(codec: SpillCodec) -> usize {
-    match codec {
-        SpillCodec::Bgzf => BGZF_MAX_BLOCK_SIZE,
-        SpillCodec::Zstd => SPILL_FRAME_BYTES,
-    }
-}
 
 /// Per-block position notification emitted by the I/O writer loop when index
 /// generation is enabled.
@@ -77,25 +48,14 @@ pub(crate) struct StagingBuffer {
 }
 
 impl StagingBuffer {
-    /// The permit pool that carries this writer's histograms.
-    ///
-    /// Exposed so a caller can retain the [`Arc`] and harvest
-    /// [`PermitPool::writer_stats`] *after* the output drain. The writer's own
-    /// `finish` consumes the staging to run that drain, so the pool is the only
-    /// handle that outlives it. See that method for why the drain must be
-    /// included.
-    pub(crate) fn permit_pool(&self) -> &Arc<PermitPool> {
-        &self.permit_pool
-    }
-
+    /// Create a new staging buffer.
+    #[must_use]
     /// Seconds this buffer's producer spent blocked waiting for an output
     /// permit, and the number of waits. See [`PermitPool::blocked`].
     pub(crate) fn write_backpressure(&self) -> (f64, u64) {
         self.permit_pool.blocked()
     }
 
-    /// Create a new staging buffer.
-    #[must_use]
     pub(crate) fn new(
         pool: Arc<SortWorkerPool>,
         result_tx: Sender<CompressResult>,
@@ -105,7 +65,7 @@ impl StagingBuffer {
     ) -> Self {
         Self {
             pool,
-            buf: Vec::with_capacity(spill_frame_bytes(codec) + STAGING_PADDING),
+            buf: Vec::with_capacity(BGZF_MAX_BLOCK_SIZE + STAGING_PADDING),
             next_serial: 0,
             result_tx,
             permit_pool,
@@ -125,7 +85,7 @@ impl StagingBuffer {
     /// Returns true if the staging buffer has reached the BGZF block size threshold.
     #[inline]
     pub(crate) fn is_full(&self) -> bool {
-        self.buf.len() >= spill_frame_bytes(self.codec)
+        self.buf.len() >= BGZF_MAX_BLOCK_SIZE
     }
 
     /// Current uncompressed length of the pending (not-yet-flushed) block.
@@ -165,9 +125,8 @@ impl StagingBuffer {
         self.permit_pool.acquire()?;
 
         let data = std::mem::replace(&mut self.buf, self.pool.buffer_pool.checkout());
-        let want = spill_frame_bytes(self.codec) + STAGING_PADDING;
-        if self.buf.capacity() < want {
-            self.buf.reserve(want - self.buf.capacity());
+        if self.buf.capacity() < BGZF_MAX_BLOCK_SIZE + STAGING_PADDING {
+            self.buf.reserve(BGZF_MAX_BLOCK_SIZE + STAGING_PADDING - self.buf.capacity());
         }
 
         let serial = self.next_serial;
@@ -204,7 +163,7 @@ impl StagingBuffer {
     pub(crate) fn write_chunked(&mut self, data: &[u8]) -> anyhow::Result<()> {
         let mut remaining = data;
         while !remaining.is_empty() {
-            let space = spill_frame_bytes(self.codec).saturating_sub(self.buf.len());
+            let space = BGZF_MAX_BLOCK_SIZE.saturating_sub(self.buf.len());
             let n = remaining.len().min(space);
             self.buf.extend_from_slice(&remaining[..n]);
             remaining = &remaining[n..];
@@ -233,7 +192,7 @@ fn write_block_in_order<W: Write>(
         // Best-effort: the indexing consumer keeps the receiver alive until finish.
         let _ = tx.send(BlockOffset { serial, compressed_start: *compressed_offset });
     }
-    permit_pool.write_dur.time(|| writer.write_all(data))?;
+    writer.write_all(data)?;
     *compressed_offset += data.len() as u64;
     permit_pool.release();
     Ok(())
@@ -293,10 +252,7 @@ fn io_writer_loop_inner<W: Write>(
     block_offset_tx: Option<&Sender<BlockOffset>>,
 ) -> Result<()> {
     let mut next_expected: u64 = 0;
-    // Value carries the arrival instant so the wait for an earlier serial is
-    // measurable; a block written straight through never enters the map and so
-    // records no wait, which is the correct reading.
-    let mut reorder_buf: BTreeMap<u64, (Vec<u8>, std::time::Instant)> = BTreeMap::new();
+    let mut reorder_buf: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     let mut compressed_offset: u64 = 0;
     let tx = block_offset_tx;
 
@@ -314,8 +270,7 @@ fn io_writer_loop_inner<W: Write>(
             )?;
             next_expected += 1;
 
-            while let Some((data, arrived)) = reorder_buf.remove(&next_expected) {
-                permit_pool.write_reorder_wait.record(crate::merge_trace::elapsed_nanos(arrived));
+            while let Some(data) = reorder_buf.remove(&next_expected) {
                 write_block_in_order(
                     writer,
                     next_expected,
@@ -327,22 +282,15 @@ fn io_writer_loop_inner<W: Write>(
                 next_expected += 1;
             }
         } else {
-            reorder_buf.insert(result.serial, (result.compressed, std::time::Instant::now()));
+            reorder_buf.insert(result.serial, result.compressed);
             // Permit held: released when this block is written in the cascade above.
         }
-        // Sampled on every arrival, in-order or not, so the depth reflects the
-        // queue the writer is actually carrying rather than only its bad moments.
-        // A block count rides a duration histogram, so `record_count` scales it
-        // into the microsecond lane; recording the raw count would bucket every
-        // depth below `BLOCKS_TO_NANOS` to zero and the report would read zero.
-        permit_pool.write_reorder_depth.record_count(reorder_buf.len() as u64);
     }
 
     // Drain remaining buffered blocks — any gap means a worker dropped a result.
     while let Some((&serial, _)) = reorder_buf.first_key_value() {
         if serial == next_expected {
-            let (data, arrived) = reorder_buf.remove(&serial).expect("key just checked");
-            permit_pool.write_reorder_wait.record(crate::merge_trace::elapsed_nanos(arrived));
+            let data = reorder_buf.remove(&serial).expect("key just checked");
             write_block_in_order(
                 writer,
                 next_expected,
@@ -387,7 +335,7 @@ mod tests {
     /// without the `ZSPILL_MAGIC` prefix (which a real chunk writer would write
     /// before invoking the loop).
     fn roundtrip_data(data: &[u8], codec: SpillCodec) -> Vec<u8> {
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, codec, false));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, codec));
         let (result_tx, result_rx) = pool.compress_result_channel();
         let buffer_pool = pool.buffer_pool.clone();
         let permit_pool = make_permit_pool(&pool);
@@ -425,7 +373,7 @@ mod tests {
     #[case(SpillCodec::Bgzf)]
     #[case(SpillCodec::Zstd)]
     fn test_staging_buffer_flush_empty_is_noop(#[case] codec: SpillCodec) {
-        let pool = Arc::new(SortWorkerPool::new(1, 1, 6, codec, false));
+        let pool = Arc::new(SortWorkerPool::new(1, 1, 6, codec));
         let (result_tx, _result_rx) = pool.compress_result_channel();
         let permit_pool = make_permit_pool(&pool);
 
@@ -453,7 +401,7 @@ mod tests {
     #[case(SpillCodec::Bgzf)]
     #[case(SpillCodec::Zstd)]
     fn test_staging_buffer_is_full(#[case] codec: SpillCodec) {
-        let pool = Arc::new(SortWorkerPool::new(1, 1, 6, codec, false));
+        let pool = Arc::new(SortWorkerPool::new(1, 1, 6, codec));
         let (result_tx, _result_rx) = pool.compress_result_channel();
         let permit_pool = make_permit_pool(&pool);
         let mut staging = StagingBuffer::new(
@@ -465,118 +413,12 @@ mod tests {
         );
 
         assert!(!staging.is_full(), "empty buffer should not be full");
-        staging.buf().extend(vec![0u8; spill_frame_bytes(codec)]);
-        assert!(staging.is_full(), "buffer at the codec's frame size should be full");
+        staging.buf().extend(vec![0u8; BGZF_MAX_BLOCK_SIZE]);
+        assert!(staging.is_full(), "buffer at BGZF_MAX_BLOCK_SIZE should be full");
 
         if let Ok(p) = Arc::try_unwrap(pool) {
             p.shutdown();
         }
-    }
-
-    /// BGZF's 64 KiB block ceiling is a *format* requirement; zstd has none.
-    ///
-    /// Spill files are a private temporary format, so pinning their zstd frames
-    /// to the BGZF limit is vestigial — and it sets the block count, which is
-    /// what the merge pays per round trip (measured: 5,368,249 blocks on an
-    /// 89-way merge, ~1 consumed per consumer round trip). BAM output must stay
-    /// at the BGZF size regardless, and it always uses the BGZF codec, so keying
-    /// the threshold on the codec keeps output correct by construction.
-    #[test]
-    fn test_only_zstd_spill_frames_escape_the_bgzf_block_ceiling() {
-        assert_eq!(
-            spill_frame_bytes(SpillCodec::Bgzf),
-            BGZF_MAX_BLOCK_SIZE,
-            "BGZF blocks are capped by the format and must not grow"
-        );
-        assert!(
-            spill_frame_bytes(SpillCodec::Zstd) >= BGZF_MAX_BLOCK_SIZE,
-            "zstd frames must never be smaller than the BGZF block they replace"
-        );
-        assert!(
-            crate::worker_pool::zstd_decomp_cap() >= spill_frame_bytes(SpillCodec::Zstd),
-            "the decompress buffer must hold the largest frame the writer can emit, or every \
-             frame at the new size fails to decompress"
-        );
-        assert!(
-            crate::worker_pool::MAX_ZSTD_FRAME_BYTES >= spill_frame_bytes(SpillCodec::Zstd),
-            "the read-side length guard must admit a frame the writer can emit"
-        );
-    }
-
-    /// Both zstd frame caps must admit the largest frame the writer can emit.
-    ///
-    /// There are two, on two different read paths: the pool's, used by the merge,
-    /// and `zspill_stream`'s, used by consolidation. They were previously held
-    /// equal by a comment saying "kept in sync", which is not enforcement -- and
-    /// the consolidation path is exercised only by the spill-heavy
-    /// configurations, so a mismatch would pass the standard matrix and fail
-    /// exactly where spill volume is largest.
-    #[test]
-    fn test_frame_caps_admit_the_largest_frame_the_writer_emits() {
-        let frame = spill_frame_bytes(SpillCodec::Zstd);
-        assert!(
-            crate::worker_pool::zstd_decomp_cap() >= frame,
-            "the merge path's decompress cap is below the writer's frame size"
-        );
-        assert!(
-            crate::zspill_stream::frame_decomp_cap() >= frame,
-            "the consolidation path's decompress cap is below the writer's frame size"
-        );
-    }
-
-    /// The spill writer's pre-flush budget must *be* the staging buffer's frame
-    /// size, not a copy of it.
-    ///
-    /// `PooledChunkWriter` pre-flushes so a record never straddles a frame
-    /// boundary -- which is what lets the merge borrow most records in place. That
-    /// budget was `BGZF_MAX_BLOCK_SIZE` outright, so it flushed at 64 KiB no
-    /// matter what the staging buffer was configured for, and raising the frame
-    /// size changed the block count *not at all*: 5,368,249 blocks measured at
-    /// both 64 KiB and 256 KiB. The sweep looked like a 4% regression rather than
-    /// a no-op, so nothing about the wall time revealed that the knob was inert.
-    ///
-    /// Third duplicated threshold found this way, after the two zstd decompress
-    /// caps. Derive, then pin.
-    #[rstest]
-    #[case(SpillCodec::Bgzf)]
-    #[case(SpillCodec::Zstd)]
-    fn test_spill_writer_pre_flushes_at_the_staging_frame_size(#[case] codec: SpillCodec) {
-        let pool = Arc::new(SortWorkerPool::new(1, 1, 6, codec, false));
-        let dir = tempfile::tempdir().expect("tempdir");
-        let writer =
-            crate::pooled_chunk_writer::PooledChunkWriter::<crate::keys::RawCoordinateKey>::new(
-                Arc::clone(&pool),
-                &dir.path().join("c.keyed"),
-                codec,
-            )
-            .expect("writer");
-        assert_eq!(
-            writer.frame_bytes(),
-            spill_frame_bytes(codec),
-            "the writer's pre-flush budget must equal the frame size the staging buffer              flushes at, or the frame size has no effect on the block count"
-        );
-        drop(writer);
-        if let Ok(p) = Arc::try_unwrap(pool) {
-            p.shutdown();
-        }
-    }
-
-    /// At the default frame size the derived cap must equal the 256 KiB constant
-    /// it replaced.
-    ///
-    /// This buffer is per-worker scratch touched once per decompressed frame, so
-    /// its size is a cache parameter. Deriving it with a *fixed* 4 MiB of slack
-    /// instead of a proportional 4x inflated it 16x at the default frame size and
-    /// cost 25% of merge wall (249.5s against a 199.2s baseline) with peak RSS
-    /// essentially unchanged -- a regression invisible to any memory check.
-    #[test]
-    fn test_default_frame_size_preserves_the_original_decompress_cap() {
-        assert_eq!(SPILL_FRAME_BYTES, BGZF_MAX_BLOCK_SIZE, "guard: default frame size");
-        assert_eq!(
-            crate::worker_pool::zstd_decomp_cap(),
-            256 * 1024,
-            "the derived cap must reproduce the tuned constant at the default frame size"
-        );
     }
 
     #[rstest]
@@ -585,7 +427,7 @@ mod tests {
     fn test_staging_buffer_write_chunked_large_data(#[case] codec: SpillCodec) {
         // Data larger than BGZF_MAX_BLOCK_SIZE must be split into multiple compress jobs.
         let large = vec![b'A'; BGZF_MAX_BLOCK_SIZE * 2 + 1000];
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, codec, false));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, codec));
         let (result_tx, result_rx) = pool.compress_result_channel();
         let buffer_pool = pool.buffer_pool.clone();
         let permit_pool = make_permit_pool(&pool);
@@ -631,7 +473,7 @@ mod tests {
         let data1 = b"first block data".to_vec();
         let data2 = b"second block data".to_vec();
 
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, codec, false));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, codec));
         let (result_tx, result_rx) = pool.compress_result_channel();
         let buffer_pool = pool.buffer_pool.clone();
         let permit_pool = Arc::new(PermitPool::new(4));
