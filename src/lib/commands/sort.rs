@@ -859,45 +859,9 @@ mod tests {
         }
     }
 
-    /// Whether `arg` takes an optional value, the shape every
-    /// `BoolishValueParser` flag on `Sort` uses (`num_args = 0..=1`, so a bare
-    /// `--flag` means `true`).
-    fn takes_optional_value(arg: &clap::Arg) -> bool {
-        arg.get_num_args().is_some_and(|range| range.min_values() == 0 && range.max_values() == 1)
-    }
-
-    /// Boolean flags must name their accepted values, because clap otherwise
-    /// derives the placeholder from the field name: `--memory-per-thread` renders
-    /// as `--memory-per-thread [<MEMORY_PER_THREAD>]`, which reads as a request
-    /// for a per-thread memory size and invites `--memory-per-thread 10G`.
-    ///
-    /// `Sort` is `#[command(flatten)]`-ed into other binaries, where short `-h`
-    /// output is often all a user sees, so the placeholder has to carry this on
-    /// its own.
-    #[test]
-    fn test_bool_args_name_their_accepted_values() {
-        let command = Sort::command();
-
-        // Guard against a vacuous pass: if the `num_args` probe stops matching,
-        // the loop below would check nothing.
-        let bool_args: Vec<_> =
-            command.get_arguments().filter(|arg| takes_optional_value(arg)).collect();
-        let matched = bool_args.len();
-        assert!(matched >= 3, "expected Sort to expose its boolean flags, matched only {matched}");
-
-        for arg in bool_args {
-            let flag = arg.get_id();
-            let value_names = arg
-                .get_value_names()
-                .map(|names| names.iter().map(ToString::to_string).collect::<Vec<_>>());
-            assert_eq!(
-                value_names.as_deref(),
-                Some(["true|false".to_string()].as_slice()),
-                "`--{flag}` must declare `value_name = \"true|false\"`; without it clap renders \
-                 the upper-cased field name, which reads as a value to supply rather than a bool",
-            );
-        }
-    }
+    // Boolean-flag help is guarded repo-wide in `src/main.rs`'s `mod tests`,
+    // which walks every command rather than `Sort` alone and identifies boolean
+    // flags by their parser's accepted set rather than by `num_args`.
 
     // ========================================================================
     // Temp-dir resolution tests
