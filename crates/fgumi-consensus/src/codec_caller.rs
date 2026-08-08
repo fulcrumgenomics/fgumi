@@ -76,7 +76,8 @@ use crate::base_builder::TieRule;
 use crate::caller::{
     ConsensusCaller, ConsensusCallingStats, ConsensusOutput,
     RejectionReason as CallerRejectionReason, clamp_combined_error_to_fgbio_short,
-    clamp_per_base_to_fgbio_short, consensus_read_name_too_long_context, write_consensus_read_name,
+    clamp_per_base_to_fgbio_short, consensus_read_name_too_long_context, select_lowest_ranking,
+    write_consensus_read_name,
 };
 use crate::phred::{MIN_PHRED, NO_CALL_BASE, NO_CALL_BASE_LOWER, PhredScore};
 use crate::simple_umi::consensus_umis;
@@ -86,13 +87,11 @@ use crate::vanilla_caller::{
 use crate::{IndexedSourceRead, SourceRead, select_most_common_alignment_group};
 use anyhow::{Context, Result};
 use fgumi_dna::dna::reverse_complement;
+use fgumi_raw_bam::hash::fgbio_read_name_rank;
 use fgumi_raw_bam::{
     self as bam_fields, RawRecord, RawRecordView, SamTag, UnmappedSamBuilder, flags,
 };
 use noodles::sam::alignment::record::data::field::Tag;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
 use std::cmp::{max, min};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -317,6 +316,10 @@ struct ClippedRecordInfo {
     adjusted_pos: usize,
     /// BAM flags.
     flags: u16,
+    /// fgbio-compatible rank of the record's read name (see
+    /// [`fgumi_raw_bam::hash::fgbio_read_name_rank`]). R1 and R2 of a template share
+    /// a name and so share a rank.
+    name_hash: i32,
 }
 
 /// CODEC consensus caller
@@ -335,9 +338,6 @@ pub struct CodecConsensusCaller {
 
     /// Statistics tracker
     stats: CodecConsensusStats,
-
-    /// Random number generator for downsampling
-    rng: StdRng,
 
     /// Counter for consensus read naming
     consensus_counter: u64,
@@ -380,8 +380,6 @@ impl CodecConsensusCaller {
         read_group_id: String,
         options: CodecConsensusOptions,
     ) -> Self {
-        let rng = StdRng::seed_from_u64(42);
-
         // Create VanillaUmiConsensusCaller for single-strand consensus building
         // Matches fgbio's ssCaller initialization in DuplexConsensusCaller:
         // - minReads = 1 (CODEC handles filtering itself)
@@ -395,7 +393,6 @@ impl CodecConsensusCaller {
             min_reads: 1, // CODEC handles read filtering
             max_reads: None,
             produce_per_base_tags: true,
-            seed: None,
             trim: false,
             min_consensus_base_quality: 0, // MIN - we handle quality masking
             cell_tag: None,
@@ -414,7 +411,6 @@ impl CodecConsensusCaller {
             read_group_id,
             options,
             stats: CodecConsensusStats::default(),
-            rng,
             consensus_counter: 0,
             ss_caller,
             bam_builder: UnmappedSamBuilder::new(),
@@ -536,6 +532,7 @@ impl CodecConsensusCaller {
             ref_id: rid,
             alignment_start: astart,
             original_cigar,
+            name_hash: fgbio_read_name_rank(view.read_name()),
         }
     }
 
@@ -706,14 +703,17 @@ impl CodecConsensusCaller {
             return Ok(ConsensusOutput::default());
         }
 
-        // Downsample if needed
+        // Downsample if needed, keeping the lowest-ranking read pairs. Rank is a
+        // Murmur3 hash of the read name (fgbio's rule, fulcrumgenomics/fgbio#1166), so
+        // selection is reproducible and independent of how work is divided across
+        // threads. R1 and R2 share a name and so are selected together; the shared
+        // index vector below keeps them aligned. The sort is stable so tied ranks keep
+        // input order.
         if let Some(max_reads) = self.options.max_reads_per_strand
             && r1_infos.len() > max_reads
         {
-            let mut indices: Vec<usize> = (0..r1_infos.len()).collect();
-            indices.shuffle(&mut self.rng);
-            indices.truncate(max_reads);
-            indices.sort_unstable();
+            let ranks: Vec<i32> = r1_infos.iter().map(|info| info.name_hash).collect();
+            let indices = select_lowest_ranking(&ranks, max_reads);
 
             let new_r1: Vec<_> = indices
                 .iter()
@@ -949,6 +949,7 @@ impl CodecConsensusCaller {
             clipped_cigar,
             adjusted_pos,
             flags: flg,
+            name_hash: fgbio_read_name_rank(view.read_name()),
         }
     }
 
@@ -962,6 +963,7 @@ impl CodecConsensusCaller {
             clipped_cigar: Vec::new(),
             adjusted_pos: 0,
             flags: 0,
+            name_hash: 0,
         }
     }
 
@@ -1737,22 +1739,25 @@ impl CodecConsensusCaller {
         Self::compute_consensus_length_raw(&info_pos, &info_neg, overlap_end)
     }
 
-    /// Test-only wrapper: downsample pairs using `max_reads_per_strand` option.
+    /// Test-only wrapper: downsample pairs using the `max_reads_per_strand` option.
+    ///
+    /// Delegates selection to [`select_lowest_ranking`] — the same function
+    /// `consensus_reads_raw` uses — so a change to the selection rule cannot pass here while
+    /// breaking production. It differs from the production path only in operating on
+    /// `RawRecord`s directly rather than on already-clipped `ClippedRecordInfo`s.
     pub fn downsample_pairs(
-        &mut self,
+        &self,
         r1s: Vec<RawRecord>,
         r2s: Vec<RawRecord>,
     ) -> (Vec<RawRecord>, Vec<RawRecord>) {
         let Some(max_reads) = self.options.max_reads_per_strand else {
             return (r1s, r2s);
         };
-        if r1s.len() <= max_reads {
-            return (r1s, r2s);
-        }
-        let mut indices: Vec<usize> = (0..r1s.len()).collect();
-        indices.shuffle(&mut self.rng);
-        indices.truncate(max_reads);
-        indices.sort_unstable();
+        let ranks: Vec<i32> = r1s
+            .iter()
+            .map(|r| fgbio_read_name_rank(RawRecordView::new(r.as_ref()).read_name()))
+            .collect();
+        let indices = select_lowest_ranking(&ranks, max_reads);
         let new_r1: Vec<_> = indices.iter().map(|&i| r1s[i].clone()).collect();
         let new_r2: Vec<_> = indices.iter().map(|&i| r2s[i].clone()).collect();
         (new_r1, new_r2)
@@ -4403,7 +4408,7 @@ mod tests {
         use noodles::sam::alignment::record::cigar::op::Kind;
 
         let options = CodecConsensusOptions { max_reads_per_strand: Some(2), ..Default::default() };
-        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+        let caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
 
         // Create 5 R1s and 5 R2s
         let r1s: Vec<RawRecord> = (0..5)
@@ -4446,7 +4451,7 @@ mod tests {
         use noodles::sam::alignment::record::cigar::op::Kind;
 
         let options = CodecConsensusOptions { max_reads_per_strand: None, ..Default::default() };
-        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+        let caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
 
         let r1s: Vec<RawRecord> = (0..5)
             .map(|i| {
@@ -4482,6 +4487,105 @@ mod tests {
         // No limit, so all reads should be kept
         assert_eq!(ds_r1s.len(), 5);
         assert_eq!(ds_r2s.len(), 5);
+    }
+
+    /// Codec downsampling keeps the lowest-hashing read pairs, not a shuffled sample, so the
+    /// retained subset is reproducible and matches fgbio's rule. Drives the real
+    /// `downsample_pairs` selection (same rank/sort/truncate/restore-order logic used inline in
+    /// `consensus_reads_raw`) with real read names, rather than re-deriving the ranking in the
+    /// test — see the task report for why that's preferred over a test-only reimplementation.
+    #[test]
+    fn codec_downsampling_retains_lowest_hashing_pairs() {
+        use noodles::sam::alignment::record::cigar::op::Kind;
+
+        let options = CodecConsensusOptions { max_reads_per_strand: Some(3), ..Default::default() };
+        let caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        // Ten templates named q0..q9; signed Murmur3(42) ranks (htsjdk-derived) put
+        // q3 (-1135430185) < q2 (-974105965) < q0 (-593808727) lowest, so a cap of 3 keeps
+        // exactly {q0, q2, q3}.
+        let names: Vec<String> = (0..10).map(|i| format!("q{i}")).collect();
+        let expected: Vec<String> = vec!["q3".to_string(), "q2".to_string(), "q0".to_string()];
+
+        let r1s: Vec<RawRecord> = names
+            .iter()
+            .map(|n| {
+                create_test_paired_read(
+                    n,
+                    &[b'A'; 20],
+                    &[30; 20],
+                    true,
+                    false,
+                    true,
+                    100,
+                    &[(Kind::Match, 20)],
+                )
+            })
+            .collect();
+        let r2s: Vec<RawRecord> = names
+            .iter()
+            .map(|n| {
+                create_test_paired_read(
+                    n,
+                    &[b'A'; 20],
+                    &[30; 20],
+                    false,
+                    true,
+                    false,
+                    110,
+                    &[(Kind::Match, 20)],
+                )
+            })
+            .collect();
+
+        let (ds_r1s, ds_r2s) = caller.downsample_pairs(r1s, r2s);
+        let names_of = |recs: &[RawRecord]| -> Vec<String> {
+            let mut names: Vec<String> = recs
+                .iter()
+                .map(|r| {
+                    String::from_utf8(RawRecordView::new(r.as_ref()).read_name().to_vec())
+                        .expect("read names are ASCII")
+                })
+                .collect();
+            names.sort();
+            names
+        };
+        let mut expected_sorted = expected;
+        expected_sorted.sort();
+
+        assert_eq!(names_of(&ds_r1s), expected_sorted);
+        // Both ends must survive together: R1 and R2 share a read name and therefore a rank,
+        // so a cap retains or discards a template as a unit.
+        assert_eq!(names_of(&ds_r2s), expected_sorted, "R2 must keep the same templates as R1");
+    }
+
+    /// [`select_lowest_ranking`] is the single selection primitive behind both the production
+    /// `consensus_reads_raw` cap and the `downsample_pairs` test wrapper, so these cases pin
+    /// the production rule directly.
+    #[rstest]
+    // Signed comparison: negative ranks sort below positive ones. Comparing as `u32` would
+    // instead keep [2, 7], and `wrapping_abs` would keep [7] over [-9].
+    #[case::signed_ranks_sort_below_positive(vec![7, -9, 2], 2, vec![1, 2])]
+    // Ties resolve to input order (stable sort), and the survivors come back in input order.
+    #[case::tied_ranks_keep_input_order(vec![5, 5, 5, 5], 2, vec![0, 1])]
+    // At or below the cap nothing is dropped.
+    #[case::at_cap_keeps_everything(vec![3, 1, 2], 3, vec![0, 1, 2])]
+    #[case::below_cap_keeps_everything(vec![3, 1], 9, vec![0, 1])]
+    // htsjdk-derived q0..q9 ranks: q3 < q2 < q0 are the three lowest.
+    #[case::htsjdk_q_names(
+        vec![
+            -593_808_727, 303_033_695, -974_105_965, -1_135_430_185, 1_999_667_023,
+            1_258_614_125, 1_143_495_474, -403_640_721, 680_071_392, 98_042_550,
+        ],
+        3,
+        vec![0, 2, 3]
+    )]
+    fn test_select_lowest_ranking(
+        #[case] ranks: Vec<i32>,
+        #[case] max_reads: usize,
+        #[case] expected: Vec<usize>,
+    ) {
+        assert_eq!(select_lowest_ranking(&ranks, max_reads), expected);
     }
 
     #[test]

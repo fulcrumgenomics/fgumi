@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** consensus downsampling now selects which reads to retain by a hash of the read
+  name rather than by shuffling a seeded random number generator. This affects `simplex
+  --max-reads`, `duplex --max-reads-per-strand`, and `codec --max-reads`.
+
+  The retained subset is now a pure function of the tag family, so it is reproducible across
+  runs, thread counts, and execution modes, and both ends of a template are retained or
+  discarded together. Previously the surviving reads depended on how many families the
+  consensus caller had already processed, so `--threads N` and the no-`--threads` path could
+  produce different consensus reads from the same input — measured at 566 of 77,804 records
+  (0.73%) on one library at `--max-reads-per-strand 2`.
+
+  **Which reads are retained differs from previous releases** for any run that sets a cap.
+  There is no way to fix the reproducibility bug while preserving the old selection, since the
+  old selection was the bug. Runs that do not set a cap are unaffected and remain
+  byte-identical. Ports [fgbio#1166](https://github.com/fulcrumgenomics/fgbio/pull/1166).
+
+### Bug Fixes
+
+- `duplex --max-reads-per-strand 0` is now rejected at startup. It previously exited 0 having
+  written an empty BAM, because a cap of zero empties every strand. `simplex` and `codec`
+  already validated their equivalents.
+
 ### Features
 
 - Boolean command-line flags now additionally accept `on`, `off`, `1`, and `0`, alongside the

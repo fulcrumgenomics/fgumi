@@ -14,7 +14,6 @@ approx = { workspace = true }
 bstr = { workspace = true }
 log = { workspace = true }
 noodles = { workspace = true, features = ["bam", "sam", "core"] }
-rand = { workspace = true }
 thiserror = { workspace = true }
 wide = { workspace = true }
 fgumi-dna = { workspace = true }

@@ -633,6 +633,33 @@ pub fn make_prefix_from_header(header: &Header) -> String {
     }
 }
 
+/// Selects which of `ranks` survive a cap of `max_reads`, returning their indices in
+/// ascending (input) order.
+///
+/// The lowest-ranking entries are kept, where rank is the fgbio-compatible Murmur3 hash of
+/// the read name (see [`fgumi_raw_bam::hash::fgbio_read_name_rank`]). Ranks are compared as
+/// **signed** `i32`, matching fgbio's Scala `Int` — about half of all read names rank
+/// negative, so an unsigned comparison would silently reorder them. The selection sort is
+/// **stable**, matching Scala's `sortInPlaceBy`, so tied ranks resolve to input order.
+///
+/// The returned indices are re-sorted ascending after truncation so callers emit records in
+/// input order. That second sort orders *indices*, not ranks, and is independent of the
+/// selection above.
+///
+/// Callers pass ranks already stamped on their records rather than hashing here: Rust's
+/// `sort_by_key` may evaluate its key closure more than once per element, so hashing inside
+/// it would re-hash per comparison.
+pub(crate) fn select_lowest_ranking(ranks: &[i32], max_reads: usize) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..ranks.len()).collect();
+    if ranks.len() <= max_reads {
+        return indices;
+    }
+    indices.sort_by_key(|&i| ranks[i]);
+    indices.truncate(max_reads);
+    indices.sort_unstable();
+    indices
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

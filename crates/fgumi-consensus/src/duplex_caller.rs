@@ -2738,7 +2738,6 @@ mod tests {
                 min_reads: 1,
                 max_reads: None,
                 produce_per_base_tags: true,
-                seed: Some(42),
                 trim: false,
                 min_consensus_base_quality: 40,
                 cell_tag: None,
