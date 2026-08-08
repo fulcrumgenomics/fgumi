@@ -22,6 +22,12 @@ All notable changes to this project will be documented in this file.
   old selection was the bug. Runs that do not set a cap are unaffected and remain
   byte-identical. Ports [fgbio#1166](https://github.com/fulcrumgenomics/fgbio/pull/1166).
 
+### Bug Fixes
+
+- `duplex --max-reads-per-strand 0` is now rejected at startup. It previously exited 0 having
+  written an empty BAM, because a cap of zero empties every strand. `simplex` and `codec`
+  already validated their equivalents.
+
 ### Features
 
 - Boolean command-line flags now additionally accept `on`, `off`, `1`, and `0`, alongside the
