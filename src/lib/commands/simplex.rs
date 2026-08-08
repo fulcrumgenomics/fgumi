@@ -209,10 +209,14 @@ pub struct Simplex {
     #[arg(short = 'M', long = "min-reads")]
     pub min_reads: usize,
 
-    /// Maximum reads to use per tag family (downsample if exceeded). Note: over-sized families are
-    /// downsampled with a different pseudo-random generator than fgbio's Scala `Random`, so which
-    /// reads survive (and therefore the consensus of a downsampled family) is not bit-identical to
-    /// fgbio, though it is deterministic within fgumi for a given input.
+    /// Maximum reads to use per tag family (downsample if exceeded).
+    ///
+    /// Which reads are retained is determined by a hash of the read names, so the selection is
+    /// reproducible across runs and independent of the number of threads used, and both ends of a
+    /// template are retained or discarded together.
+    ///
+    /// Note the cap applies to the whole tag family rather than to each end independently, unlike
+    /// fgbio (fgumi#723).
     #[arg(long = "max-reads")]
     pub max_reads: Option<usize>,
 
@@ -368,7 +372,6 @@ impl Command for Simplex {
             min_reads: self.min_reads,
             max_reads: self.max_reads,
             produce_per_base_tags: self.consensus.output_per_base_tags,
-            seed: Some(42), // Hard-coded seed for reproducible downsampling
             trim: self.consensus.trim,
             min_consensus_base_quality: self.consensus.min_consensus_base_quality,
             cell_tag: Some(cell_tag),
@@ -584,7 +587,6 @@ impl Simplex {
             min_reads,
             max_reads,
             produce_per_base_tags: output_per_base_tags,
-            seed: Some(42),
             trim,
             min_consensus_base_quality,
             cell_tag: Some(cell_tag),

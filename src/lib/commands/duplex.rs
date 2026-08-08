@@ -199,7 +199,14 @@ pub struct Duplex {
     #[arg(short = 'M', long = "min-reads", value_delimiter = ',', default_value = "1")]
     pub min_reads: Vec<usize>,
 
-    /// Maximum reads per strand (downsample if exceeded)
+    /// Maximum number of reads to use when building a single-strand consensus.
+    ///
+    /// If more than this many reads are present for a strand, that strand is downsampled to
+    /// exactly this many reads. The cap is applied independently to each end of each strand.
+    ///
+    /// Which reads are retained is determined by a hash of the read names, so the selection is
+    /// reproducible across runs and independent of the number of threads used, and both ends of a
+    /// template are retained or discarded together.
     #[arg(long = "max-reads-per-strand")]
     pub max_reads_per_strand: Option<usize>,
 

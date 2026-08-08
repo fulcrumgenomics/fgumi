@@ -235,7 +235,14 @@ pub struct Codec {
     #[arg(short = 'M', long = "min-reads", default_value = "1")]
     pub min_reads: usize,
 
-    /// Maximum read pairs per strand, downsample if exceeded (fgbio's `--max-read-pairs`)
+    /// Maximum read pairs per strand, downsample if exceeded (fgbio's `--max-read-pairs`).
+    ///
+    /// If more than this many read pairs are present in a tag family, the family is downsampled
+    /// to exactly this many read pairs.
+    ///
+    /// Which pairs are retained is determined by a hash of the read names, so the selection is
+    /// reproducible across runs and independent of the number of threads used, and both ends of a
+    /// template are retained or discarded together.
     #[arg(long = "max-reads")]
     pub max_reads: Option<usize>,
 

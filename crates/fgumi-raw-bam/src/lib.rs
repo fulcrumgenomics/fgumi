@@ -4,6 +4,7 @@ pub mod bin;
 pub mod builder;
 pub mod cigar;
 pub mod fields;
+pub mod hash;
 pub mod overlap;
 pub mod raw_bam_record;
 pub mod sequence;
@@ -60,6 +61,9 @@ pub use fields::{
 
 // -- bin (reg2bin) --
 pub use bin::{UNMAPPED_BIN, bin_from_raw_bam, reg2bin, set_bin_from_raw_bam};
+
+// -- hash --
+pub use hash::{fgbio_read_name_rank, htsjdk_murmur3_hash_unencoded_chars};
 
 // -- builder --
 pub use builder::{ReadNameTooLong, SamBuilder, UnmappedSamBuilder};
