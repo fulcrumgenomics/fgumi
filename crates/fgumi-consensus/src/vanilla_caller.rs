@@ -7,7 +7,7 @@
 use crate::base_builder::{ConsensusBaseBuilder, TieRule};
 use crate::caller::{
     ConsensusCaller, ConsensusCallingStats, ConsensusOutput, RejectionReason,
-    consensus_read_name_too_long_context, write_consensus_read_name,
+    consensus_read_name_too_long_context, select_lowest_ranking, write_consensus_read_name,
 };
 use crate::phred::{
     MIN_PHRED, NO_CALL_BASE, NO_CALL_BASE_LOWER, PhredScore, ln_error_prob_two_trials,
@@ -16,13 +16,11 @@ use crate::phred::{
 use crate::simple_umi::consensus_umis;
 use anyhow::{Context, Result, anyhow, bail};
 use fgumi_dna::dna::reverse_complement;
+use fgumi_raw_bam::hash::fgbio_read_name_rank;
 use fgumi_raw_bam::{RawRecord, RawRecordView, UnmappedSamBuilder, flags};
 use fgumi_sam::SamTag;
 use fgumi_sam::clipper::cigar_utils::{self, SimplifiedCigar};
 use noodles::sam::alignment::record::cigar::op::Kind;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
 use std::collections::HashSet;
 
 /// Indexed source read for alignment filtering: (index, length, `simplified_cigar`)
@@ -146,6 +144,13 @@ pub(crate) struct SourceRead {
     pub(crate) alignment_start: i64,
     /// Original (pre-reversal) simplified CIGAR (for reverse-strand ref position mapping)
     pub(crate) original_cigar: SimplifiedCigar,
+    /// fgbio-compatible rank of the record's read name, from
+    /// [`fgumi_raw_bam::hash::fgbio_read_name_rank`].
+    ///
+    /// Computed once here rather than at each comparison during downsampling,
+    /// which would re-hash the name on every comparison. Both ends of a template
+    /// share a read name and so share this rank.
+    pub(crate) name_hash: i32,
 }
 
 /// Vanilla consensus read - matches fgbio's `VanillaConsensusRead`
@@ -306,9 +311,6 @@ pub struct VanillaUmiConsensusOptions {
     /// Whether to produce per-base tags (cd, ce)
     pub produce_per_base_tags: bool,
 
-    /// Random seed for reproducible downsampling
-    pub seed: Option<u64>,
-
     /// Whether to quality-trim reads before consensus calling
     pub trim: bool,
 
@@ -341,7 +343,6 @@ impl Default for VanillaUmiConsensusOptions {
             min_reads: 2, // Match fgbio default
             max_reads: None,
             produce_per_base_tags: true, // Match fgbio default
-            seed: Some(42),              // Hard-coded seed for reproducible downsampling
             trim: false,
             min_consensus_base_quality: 40, // Match fgbio default
             cell_tag: None,
@@ -370,9 +371,6 @@ pub struct VanillaUmiConsensusCaller {
 
     /// Consensus base builder (reused across positions)
     consensus_builder: ConsensusBaseBuilder,
-
-    /// Random number generator for downsampling (seeded or thread-local)
-    rng: StdRng,
 
     /// Rejected reads as raw bytes (if tracking is enabled).
     ///
@@ -441,13 +439,6 @@ impl VanillaUmiConsensusCaller {
             ConsensusBaseBuilder::new(options.error_rate_pre_umi, options.error_rate_post_umi)
                 .with_tie_rule(options.tie_rule);
 
-        // Create RNG - either seeded or from OS entropy
-        let rng = if let Some(seed) = options.seed {
-            StdRng::seed_from_u64(seed)
-        } else {
-            rand::make_rng()
-        };
-
         // Pre-compute single-input consensus quals lookup table (matching fgbio)
         // For each input quality, compute the output quality when only one read contributes
         let single_input_consensus_quals = Self::compute_single_input_consensus_quals(&options);
@@ -458,7 +449,6 @@ impl VanillaUmiConsensusCaller {
             options,
             stats: ConsensusCallingStats::new(),
             consensus_builder,
-            rng,
             rejected_reads: Vec::new(),
             track_rejects,
             single_input_consensus_quals,
@@ -631,6 +621,9 @@ impl VanillaUmiConsensusCaller {
             ref_id: rid,
             alignment_start: astart,
             original_cigar,
+            // This bridge is test-only and no downsampling test exercises it; stamp the
+            // real rank anyway so it stays consistent with the raw-bytes path.
+            name_hash: read.name().map_or(0, |n| fgbio_read_name_rank(n)),
         })
     }
 
@@ -671,7 +664,8 @@ impl VanillaUmiConsensusCaller {
         };
 
         // Cap the reads contributing to the single-strand CONSENSUS, matching fgbio's
-        // `consensusCall` (`VanillaUmiConsensusCaller.scala:288`: `shuffle.take(maxReads)`).
+        // `consensusCall` (`VanillaUmiConsensusCaller.scala`, `downsample(maxReads)` since
+        // fulcrumgenomics/fgbio#1166 — previously `shuffle.take(maxReads)`).
         // The duplex and codec callers reach the single-strand consensus through
         // `consensus_call`, so without this cap `--max-reads-per-strand` is silently ignored
         // on those paths (DUPLEX3-01). The vanilla path caps raw records earlier in
@@ -814,47 +808,74 @@ impl VanillaUmiConsensusCaller {
     }
 
     /// Downsamples reads if there are more than `max_reads`
-    fn downsample_reads(&mut self, mut reads: Vec<RawRecord>) -> Vec<RawRecord> {
+    fn downsample_reads(&self, mut reads: Vec<RawRecord>) -> Vec<RawRecord> {
         if let Some(max_reads) = self.options.max_reads
             && reads.len() > max_reads
         {
-            reads.shuffle(&mut self.rng);
-            reads.truncate(max_reads);
+            // Rank once per record, not inside the sort key: `sort_by_key` may evaluate its
+            // closure more than once per element, which would re-hash on every comparison.
+            let ranks: Vec<i32> = reads
+                .iter()
+                .map(|raw| fgbio_read_name_rank(RawRecordView::new(raw.as_ref()).read_name()))
+                .collect();
+            let keep_indices = select_lowest_ranking(&ranks, max_reads);
+
+            // Drop the non-survivors in place. `retain` preserves input order and moves the
+            // retained records rather than cloning them — families reaching here can be large.
+            let mut keep = vec![false; reads.len()];
+            for i in keep_indices {
+                keep[i] = true;
+            }
+            let mut idx = 0;
+            reads.retain(|_| {
+                let keeping = keep[idx];
+                idx += 1;
+                keeping
+            });
         }
         reads
     }
 
-    /// Downsamples already-filtered `SourceReads` if there are more than `max_reads`.
+    /// Downsamples already-filtered `SourceReads` to at most `max_reads`, keeping the
+    /// lowest-ranking reads.
     ///
     /// This is the `SourceRead` analogue of [`Self::downsample_reads`], applied inside
     /// [`Self::consensus_call`] so the per-strand cap reaches the duplex and codec callers
-    /// (which build consensus from pre-filtered `SourceReads` rather than raw records). It
-    /// mirrors fgbio's `consensusCall` (`shuffle.take(maxReads)`): the retained subset is
-    /// selected by shuffling with the caller's seeded RNG (default seed 42) so the selection is
-    /// deterministic and unbiased, then keeping `max_reads`. When `max_reads` is unset or the
-    /// strand is at or below the cap this simply clones the input, preserving byte-identical
-    /// output for the default configuration.
+    /// (which build consensus from pre-filtered `SourceReads` rather than raw records).
     ///
-    /// To avoid deep-cloning the entire (potentially very large) family just to discard most of
-    /// it, this shuffles an *index* vector `[0, len)` and clones only the `max_reads` retained
-    /// reads. This is bit-identical to shuffling the reads themselves and truncating:
-    /// `SliceRandom::shuffle` is Fisher-Yates, and its RNG-call sequence depends only on the
-    /// slice LENGTH, not the element type. So shuffling `[0..len]` yields the SAME permutation as
-    /// shuffling the reads, hence `idxs[0..max_reads]` selects exactly the reads (in the same
-    /// order) that `reads.shuffle().truncate(max_reads)` would keep. Selection therefore stays
-    /// deterministic-per-seed and unchanged from the prior implementation.
+    /// Rank comes from [`SourceRead::name_hash`], a Murmur3 hash of the read name, so the
+    /// retained subset is a pure function of the family: independent of how many families this
+    /// caller has already downsampled, of how work is divided across threads or execution
+    /// modes, and of the order the reads arrive in. This mirrors fgbio's
+    /// `VanillaUmiConsensusCaller.downsampleRank` (fulcrumgenomics/fgbio#1166).
     ///
-    /// The *rule* matches fgbio, but the *selection* does not byte-match it when downsampling
-    /// actually triggers: fgumi shuffles with `StdRng` (`ChaCha`) while fgbio uses Scala's
-    /// `Random.shuffle` over `java.util.Random` (an LCG), so the same seed value yields a
-    /// different permutation and therefore a different surviving subset. Downsampled consensus
-    /// bases/quals/depths are thus deterministic within fgumi but not byte-identical to fgbio on
-    /// any strand that exceeds the cap.
-    fn downsample_source_reads(&mut self, source_reads: &[SourceRead]) -> Vec<SourceRead> {
+    /// Because both ends of a template share a read name they share a rank, so a template is
+    /// retained or discarded as a unit **when both ends are downsampled from the same
+    /// surviving-template set**. That holds for a single call over one shared list, but the
+    /// duplex caller downsamples R1 and R2 independently (`duplex_caller.rs`, after each end
+    /// runs its own `create_source_read`/`filter_by_alignment`): a template whose R1 survives
+    /// upstream filtering while its R2 does not shifts the cap boundary on the surviving end, so
+    /// the two ends' retained subsets can diverge for such templates. This matches fgbio's own
+    /// structure, so it is parity-faithful rather than a shortcoming of this function.
+    ///
+    /// The sort is **stable**, matching Scala's `sortInPlaceBy`, so tied ranks keep input
+    /// order. Ranks are compared as **signed** `i32`, matching fgbio's Scala `Int`.
+    ///
+    /// To avoid deep-cloning a potentially very large family just to discard most of it, this
+    /// orders an *index* vector and clones only the retained reads. When `max_reads` is unset
+    /// or the family is at or below the cap this simply clones the input, preserving
+    /// byte-identical output for the default configuration.
+    /// Deliberately does NOT use [`crate::caller::select_lowest_ranking`], which re-sorts the
+    /// survivors back into input order. fgbio's `downsample` returns them in *rank* order, and
+    /// these reads feed per-position consensus aggregation where order is immaterial — so
+    /// matching fgbio costs nothing and keeps the two implementations comparable. The
+    /// raw-record and codec paths use the shared helper because they emit records, where input
+    /// order is observable.
+    fn downsample_source_reads(&self, source_reads: &[SourceRead]) -> Vec<SourceRead> {
         match self.options.max_reads {
             Some(max_reads) if source_reads.len() > max_reads => {
                 let mut idxs: Vec<usize> = (0..source_reads.len()).collect();
-                idxs.shuffle(&mut self.rng);
+                idxs.sort_by_key(|&i| source_reads[i].name_hash);
                 idxs.truncate(max_reads);
                 idxs.into_iter().map(|i| source_reads[i].clone()).collect()
             }
@@ -1046,7 +1067,25 @@ impl VanillaUmiConsensusCaller {
             ref_id: rid,
             alignment_start: astart,
             original_cigar,
+            name_hash: self.source_read_name_rank(view.read_name()),
         })
+    }
+
+    /// The downsampling rank for a `SourceRead`, or `0` when no cap is configured.
+    ///
+    /// [`Self::downsample_source_reads`] is the only consumer and runs only when `max_reads` is
+    /// `Some`, so the hash is dead work otherwise — and uncapped is the default configuration,
+    /// i.e. every read of an ordinary run. Gating on the consumer's own guard rather than on a
+    /// caller-supplied flag is deliberate: a placeholder returned while downsampling was live
+    /// would tie every rank, and selection would silently fall back to input order — the exact
+    /// order dependence this ranking exists to remove.
+    ///
+    /// Standalone `simplex` still pays for ranks it never reads, because it caps raw records in
+    /// `process_group` and does not route through `consensus_call`. That residue is bounded by
+    /// `--max-reads` per family rather than by the size of the input, and removing it would need
+    /// exactly the caller-supplied flag this avoids.
+    fn source_read_name_rank(&self, name: &[u8]) -> i32 {
+        if self.options.max_reads.is_some() { fgbio_read_name_rank(name) } else { 0 }
     }
 
     /// Filters `SourceReads` to only include those with the most common alignment pattern.
@@ -1699,6 +1738,31 @@ mod tests {
         b.build()
     }
 
+    /// Like [`create_test_read`], but with an explicit `ref_id`/`pos`/`sequence` so a mate pair
+    /// can differ in every per-end field except the read name (which the two ends must share to
+    /// share a downsample rank). Used by [`downsampling_keeps_mate_pairs_together`] so that test
+    /// is sensitive to end-dependence flowing through position or sequence, not only `flags`.
+    fn create_test_read_at(
+        name: &str,
+        is_first: bool,
+        ref_id: i32,
+        pos: i32,
+        seq: &[u8],
+    ) -> RawRecord {
+        let quals = vec![b'I'; seq.len()];
+        let flg = flags::PAIRED | if is_first { flags::FIRST_SEGMENT } else { flags::LAST_SEGMENT };
+        let mut b = SamBuilder::new();
+        b.read_name(name.as_bytes())
+            .flags(flg)
+            .ref_id(ref_id)
+            .pos(pos)
+            .sequence(seq)
+            .qualities(&quals)
+            .cigar_ops(&[encode_op(0, seq.len())])
+            .add_string_tag(SamTag::MI, b"UMI123");
+        b.build()
+    }
+
     #[test]
     fn test_consensus_caller_creation() {
         let options = VanillaUmiConsensusOptions::default();
@@ -1901,89 +1965,15 @@ mod tests {
     }
 
     #[test]
-    fn test_deterministic_downsampling() {
-        // Test that downsampling with a seed produces deterministic results
-        let seed = 42u64;
-        let options = VanillaUmiConsensusOptions {
-            min_reads: 1,
-            max_reads: Some(3),
-            seed: Some(seed),
-            ..Default::default()
-        };
-
-        // Create 10 reads with different names
-        let mut reads: Vec<RawRecord> = Vec::new();
-        for i in 0..10 {
-            let name = format!("read{i}");
-            reads.push(create_test_read(&name, b"ACGT", b"####", false, false));
-        }
-
-        // Create two callers with the same seed
-        let mut caller1 = VanillaUmiConsensusCaller::new(
-            "consensus".to_string(),
-            "A".to_string(),
-            options.clone(),
-        );
-        let mut caller2 =
-            VanillaUmiConsensusCaller::new("consensus".to_string(), "A".to_string(), options);
-
-        // Downsample with both callers
-        let downsampled1 = caller1.downsample_reads(reads.clone());
-        let downsampled2 = caller2.downsample_reads(reads);
-
-        // Both should produce exactly 3 reads (max_reads)
-        assert_eq!(downsampled1.len(), 3);
-        assert_eq!(downsampled2.len(), 3);
-
-        // Both should select the same reads in the same order
-        for i in 0..3 {
-            assert_eq!(
-                RawRecordView::new(&downsampled1[i]).read_name(),
-                RawRecordView::new(&downsampled2[i]).read_name()
-            );
-        }
-    }
-
-    #[test]
-    fn test_nondeterministic_downsampling_without_seed() {
-        // Test that downsampling without a seed still works (even if not deterministic)
-        let options = VanillaUmiConsensusOptions {
-            min_reads: 1,
-            max_reads: Some(3),
-            seed: None,
-            ..Default::default()
-        };
-
-        // Create 10 reads
-        let mut reads: Vec<RawRecord> = Vec::new();
-        for i in 0..10 {
-            let name = format!("read{i}");
-            reads.push(create_test_read(&name, b"ACGT", b"####", false, false));
-        }
-
-        let mut caller =
-            VanillaUmiConsensusCaller::new("consensus".to_string(), "A".to_string(), options);
-
-        let downsampled = caller.downsample_reads(reads);
-
-        // Should produce exactly 3 reads (max_reads)
-        assert_eq!(downsampled.len(), 3);
-    }
-
-    #[test]
     fn test_consensus_call_caps_reads_per_strand() {
         // DUPLEX3-01: `consensus_call` is the single-strand consensus entry point used by the
         // duplex and codec callers (the vanilla path downsamples raw records earlier and never
         // reaches this method). fgbio caps the contributing reads inside `consensusCall`
-        // (`shuffle.take(maxReads)`), so `--max-reads-per-strand` must limit how many reads
+        // (`downsample(maxReads)`), so `--max-reads-per-strand` must limit how many reads
         // contribute here. Without the cap, every read contributes and the per-strand depth
         // exceeds the requested maximum.
-        let options = VanillaUmiConsensusOptions {
-            min_reads: 1,
-            max_reads: Some(3),
-            seed: Some(42),
-            ..Default::default()
-        };
+        let options =
+            VanillaUmiConsensusOptions { min_reads: 1, max_reads: Some(3), ..Default::default() };
         let mut caller =
             VanillaUmiConsensusCaller::new("consensus".to_string(), "A".to_string(), options);
 
@@ -2014,12 +2004,8 @@ mod tests {
     /// depth is capped, but the full uncapped read set survives in `source_reads`.
     #[test]
     fn consensus_call_caps_consensus_but_retains_full_source_reads() {
-        let options = VanillaUmiConsensusOptions {
-            min_reads: 1,
-            max_reads: Some(3),
-            seed: Some(42),
-            ..Default::default()
-        };
+        let options =
+            VanillaUmiConsensusOptions { min_reads: 1, max_reads: Some(3), ..Default::default() };
         let mut caller =
             VanillaUmiConsensusCaller::new("consensus".to_string(), "A".to_string(), options);
 
@@ -2046,47 +2032,296 @@ mod tests {
         );
     }
 
-    /// The per-strand downsampling is deterministic for a fixed seed: two `consensus_call`s over
-    /// the same reads from a caller seeded identically select the same subset and so produce a
-    /// byte-identical consensus. Reads carry a distinct base composition so *which* reads survive
-    /// the cap changes the consensus — the selection (not just the count) is what is pinned.
-    /// (Determinism only: the shuffle uses fgumi's `StdRng`, not fgbio's `java.util.Random`, so
-    /// the selection is not byte-parity with fgbio even at the same seed — see
-    /// `downsample_source_reads`.)
+    /// The retained subset must not depend on how many families the caller already
+    /// downsampled. This is the original fgbio bug (fulcrumgenomics/fgbio#1166) and,
+    /// in fgumi, the cause of `--threads N` disagreeing with the no-threads path.
     #[test]
-    fn consensus_call_downsampling_is_deterministic_for_a_fixed_seed() {
-        let make_reads = || -> Vec<SourceRead> {
-            (0..8)
-                .map(|i| {
-                    let mut sr = create_source_read_with_cigar("4M");
-                    // A third of the reads read 'C' instead of 'A', so the consensus base at each
-                    // position depends on which reads the cap keeps.
-                    if i % 3 == 0 {
-                        sr.bases = vec![b'C'; sr.bases.len()];
-                    }
-                    sr
-                })
-                .collect()
+    fn downsampling_ignores_caller_history() {
+        let options =
+            VanillaUmiConsensusOptions { min_reads: 1, max_reads: Some(3), ..Default::default() };
+        let reads = || -> Vec<SourceRead> {
+            (0..10).map(|i| create_source_read_with_rank("4M", i * 1000 - 4000)).collect()
         };
-        let call = || {
-            let options = VanillaUmiConsensusOptions {
-                min_reads: 1,
-                max_reads: Some(3),
-                seed: Some(42),
-                ..Default::default()
-            };
-            let mut caller =
-                VanillaUmiConsensusCaller::new("consensus".to_string(), "A".to_string(), options);
-            caller
-                .consensus_call("umi", make_reads())
-                .expect("consensus_call should succeed")
-                .expect("consensus should be produced")
+        let fresh =
+            VanillaUmiConsensusCaller::new("c".to_string(), "A".to_string(), options.clone());
+        let expected = fresh.downsample_source_reads(&reads());
+
+        let used = VanillaUmiConsensusCaller::new("c".to_string(), "A".to_string(), options);
+        let _ = used.downsample_source_reads(&reads()); // an unrelated family first
+        let actual = used.downsample_source_reads(&reads());
+
+        assert_eq!(
+            actual.iter().map(|sr| sr.name_hash).collect::<Vec<_>>(),
+            expected.iter().map(|sr| sr.name_hash).collect::<Vec<_>>(),
+            "a caller's downsampling history must not change which reads it keeps"
+        );
+    }
+
+    /// Ranks are compared as signed i32, matching fgbio's Scala `Int`. Under an unsigned
+    /// comparison the negative ranks would sort last instead of first; under any
+    /// absolute-value comparison (`.abs()`, `unsigned_abs()`, or — the form that actually
+    /// exists elsewhere in this repo, `src/lib/commands/shared_metrics.rs:151` —
+    /// `wrapping_abs()`) `-3` would sort AFTER `2` instead of before it, which the
+    /// `abs_order_diverges_from_signed` case below pins down.
+    #[rstest]
+    #[case::signed_extremes(vec![5, i32::MIN, -1, 1], 2, vec![i32::MIN, -1])]
+    #[case::abs_order_diverges_from_signed(vec![-3, 2], 1, vec![-3])]
+    fn downsampling_compares_ranks_as_signed(
+        #[case] ranks: Vec<i32>,
+        #[case] max_reads: usize,
+        #[case] expected: Vec<i32>,
+    ) {
+        let options = VanillaUmiConsensusOptions {
+            min_reads: 1,
+            max_reads: Some(max_reads),
+            ..Default::default()
         };
-        let first = call();
-        let second = call();
-        assert_eq!(first.bases, second.bases, "same seed must select the same reads → same bases");
-        assert_eq!(first.quals, second.quals, "same seed → identical quals");
-        assert_eq!(first.depths, second.depths, "same seed → identical depths");
+        let caller = VanillaUmiConsensusCaller::new("c".to_string(), "A".to_string(), options);
+        let reads: Vec<SourceRead> =
+            ranks.iter().map(|&rank| create_source_read_with_rank("4M", rank)).collect();
+        let kept: Vec<i32> =
+            caller.downsample_source_reads(&reads).iter().map(|s| s.name_hash).collect();
+        assert_eq!(kept, expected, "ranks must be compared as SIGNED i32, not by absolute value");
+    }
+
+    /// Equal ranks keep input order: fgbio sorts with Scala's stable `sortInPlaceBy`,
+    /// so ties resolve to arrival order. Guards against a later switch to
+    /// `sort_unstable_by_key`.
+    ///
+    /// An all-tied input can never distinguish stable from unstable sorting:
+    /// `sort_unstable_by_key` provably preserves input order when every key is equal, at any
+    /// length (insertion sort on tiny slices, an all-equal-partition fast path above that). So
+    /// this uses a MIXED tied/distinct key pattern (`rank = i % 3`) over `n = 30` elements —
+    /// large enough that pattern-defeating quicksort's partitioning actually reorders the tied
+    /// group of rank-0 elements (measured: at `n = 8` the two algorithms still agree; `n = 30`
+    /// is where they diverge).
+    #[test]
+    fn downsampling_is_stable_on_tied_ranks() {
+        let options =
+            VanillaUmiConsensusOptions { min_reads: 1, max_reads: Some(4), ..Default::default() };
+        let caller = VanillaUmiConsensusCaller::new("c".to_string(), "A".to_string(), options);
+        let n = 30;
+        let mut reads: Vec<SourceRead> =
+            (0..n).map(|i| create_source_read_with_rank("4M", i % 3)).collect();
+        for (i, sr) in reads.iter_mut().enumerate() {
+            sr.original_idx = i;
+        }
+        // The lowest rank (0) is tied among indices 0, 3, 6, 9, ...; a stable sort must keep
+        // the first `max_reads` of THOSE in arrival order.
+        let kept: Vec<usize> =
+            caller.downsample_source_reads(&reads).iter().map(|s| s.original_idx).collect();
+        assert_eq!(kept, vec![0, 3, 6, 9], "tied ranks must resolve to input order");
+    }
+
+    /// The subset is invariant to the order reads arrive in.
+    #[test]
+    fn downsampling_ignores_input_order() {
+        let options =
+            VanillaUmiConsensusOptions { min_reads: 1, max_reads: Some(3), ..Default::default() };
+        let reads: Vec<SourceRead> =
+            (0..10).map(|i| create_source_read_with_rank("4M", i * 977 - 5000)).collect();
+        let caller =
+            VanillaUmiConsensusCaller::new("c".to_string(), "A".to_string(), options.clone());
+        let forward: Vec<i32> =
+            caller.downsample_source_reads(&reads).iter().map(|s| s.name_hash).collect();
+
+        let mut reversed_input = reads;
+        reversed_input.reverse();
+        let caller2 = VanillaUmiConsensusCaller::new("c".to_string(), "A".to_string(), options);
+        let mut backward: Vec<i32> =
+            caller2.downsample_source_reads(&reversed_input).iter().map(|s| s.name_hash).collect();
+        backward.sort_unstable();
+        let mut forward_sorted = forward;
+        forward_sorted.sort_unstable();
+
+        assert_eq!(backward, forward_sorted, "input order must not change the retained SET");
+    }
+
+    /// Both ends of a template must be retained (or discarded) together. Rank is keyed by
+    /// read name alone (`SourceRead::name_hash`), never by end, so downsampling the R1 list
+    /// and the R2 list independently — exactly how the duplex caller reaches
+    /// `downsample_source_reads`, once per strand per end via `consensus_call` — must retain
+    /// the same set of templates. This routes R1 and R2 through the REAL production
+    /// `create_source_read` (not the `create_source_read_with_rank` test shortcut used by the
+    /// other tests here), and gives R1/R2 distinct `ref_id`, `pos`, and `sequence` (as real
+    /// mates have) so it is sensitive to end-dependence introduced anywhere in the
+    /// name-to-rank pipeline — through position or sequence, not only through `flags` — and
+    /// not only inside the sort key: in fgbio's original report, a per-end-keyed rank was
+    /// deterministic and passed every other downsampling test, yet kept R1 = {0, 3, 9} and
+    /// R2 = {2, 8, 9} — different templates on each end.
+    #[test]
+    fn downsampling_keeps_mate_pairs_together() {
+        let options =
+            VanillaUmiConsensusOptions { min_reads: 1, max_reads: Some(3), ..Default::default() };
+        let caller = VanillaUmiConsensusCaller::new("c".to_string(), "A".to_string(), options);
+
+        // 10 templates; R1 and R2 of the same template share a read name (as in a real BAM)
+        // but differ in ref_id, pos, and sequence, so only the name drives the shared rank.
+        let (r1_reads, r2_reads): (Vec<SourceRead>, Vec<SourceRead>) = (0..10)
+            .map(|i| {
+                let name = format!("read{i}");
+                let pos_r1 = i32::try_from(i * 100).expect("small test index fits in i32");
+                let pos_r2 = i32::try_from(i * 200 + 37).expect("small test index fits in i32");
+                let r1_raw = create_test_read_at(&name, true, 0, pos_r1, b"ACGTACGT");
+                let r2_raw = create_test_read_at(&name, false, 1, pos_r2, b"TTTTGGGGCCCC");
+                let sr1 = caller
+                    .create_source_read(r1_raw.as_ref(), i, 0)
+                    .expect("R1 source read should be created");
+                let sr2 = caller
+                    .create_source_read(r2_raw.as_ref(), i, 0)
+                    .expect("R2 source read should be created");
+                (sr1, sr2)
+            })
+            .unzip();
+
+        let mut r1_kept: Vec<usize> =
+            caller.downsample_source_reads(&r1_reads).iter().map(|sr| sr.original_idx).collect();
+        let mut r2_kept: Vec<usize> =
+            caller.downsample_source_reads(&r2_reads).iter().map(|sr| sr.original_idx).collect();
+        r1_kept.sort_unstable();
+        r2_kept.sort_unstable();
+
+        assert_eq!(
+            r1_kept, r2_kept,
+            "R1 and R2 of the same templates must be retained together, not independently \
+             per end"
+        );
+    }
+
+    /// The raw-record path ranks by read-name hash like the `SourceRead` path, so simplex's
+    /// group-level cap is reproducible across execution modes. Expected values are the same
+    /// htsjdk-derived oracle: signed ranks put q3 < q2 < q0 lowest, so a cap of 3 keeps
+    /// exactly those.
+    ///
+    /// (The cap here is still applied to the whole MI group rather than per end — see
+    /// fgumi#723 — but which reads it keeps is now deterministic.)
+    #[test]
+    fn downsample_reads_retains_lowest_hashing_names() {
+        let options =
+            VanillaUmiConsensusOptions { min_reads: 1, max_reads: Some(3), ..Default::default() };
+        let caller = VanillaUmiConsensusCaller::new("c".to_string(), "A".to_string(), options);
+        let reads: Vec<RawRecord> = (0..10)
+            .map(|i| create_test_read(&format!("q{i}"), b"ACGT", b"####", false, false))
+            .collect();
+
+        let mut names: Vec<String> = caller
+            .downsample_reads(reads)
+            .iter()
+            .map(|r| {
+                String::from_utf8(RawRecordView::new(r.as_ref()).read_name().to_vec())
+                    .expect("read names are ASCII")
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["q0", "q2", "q3"]);
+    }
+
+    /// Both ends of a template share a read name and therefore a rank, so they sort adjacently
+    /// and the cap keeps or drops them together — *unless* the truncation boundary falls inside
+    /// a pair. The simplex cap counts records, not templates (fgumi#723), so whether a template
+    /// splits depends on where the boundary lands in the rank-sorted list, not on the parity of
+    /// `max_reads`: a family mixing fragment and paired reads can split at an even cap and stay
+    /// whole at an odd one. The `--max-reads` help text documents this.
+    ///
+    /// Ranks for "q0".."q4" sort `q3 < q2 < q0 < q1 < q4`, so the rank-sorted record list is
+    /// `q3 q3 | q2 q2 | q0 q0 | q1 q1 | q4 q4`. A cap of 4 lands between blocks; a cap of 3
+    /// lands inside q2's block and keeps only the end that arrived first (the sort is stable).
+    ///
+    /// The expected column is the retained `(name, is_r1)` sequence in output order, which pins
+    /// membership, input-order preservation, and *which* end survives a split in one assertion.
+    #[rstest]
+    #[case::boundary_between_pairs(4, &[("q2", true), ("q2", false), ("q3", true), ("q3", false)])]
+    #[case::boundary_inside_a_pair(3, &[("q2", true), ("q3", true), ("q3", false)])]
+    fn downsample_reads_splits_a_template_only_at_the_cap_boundary(
+        #[case] max_reads: usize,
+        #[case] expected: &[(&str, bool)],
+    ) {
+        let options = VanillaUmiConsensusOptions {
+            min_reads: 1,
+            max_reads: Some(max_reads),
+            ..Default::default()
+        };
+        let caller = VanillaUmiConsensusCaller::new("c".to_string(), "A".to_string(), options);
+        let mut reads: Vec<RawRecord> = Vec::new();
+        for i in 0..5 {
+            let name = format!("q{i}");
+            reads.push(create_test_read(&name, b"ACGT", b"####", true, true));
+            reads.push(create_test_read(&name, b"ACGT", b"####", true, false));
+        }
+
+        let kept: Vec<(String, bool)> = caller
+            .downsample_reads(reads)
+            .iter()
+            .map(|r| {
+                let view = RawRecordView::new(r.as_ref());
+                let name =
+                    String::from_utf8(view.read_name().to_vec()).expect("read names are ASCII");
+                (name, view.flags() & flags::FIRST_SEGMENT != 0)
+            })
+            .collect();
+        let expected: Vec<(String, bool)> =
+            expected.iter().map(|&(n, r1)| (n.to_string(), r1)).collect();
+
+        assert_eq!(kept, expected);
+    }
+
+    /// Pins *which* reads a cap retains, with expected values derived from htsjdk's
+    /// `Murmur3(42)` rather than from fgumi. Without this, a deterministic-but-biased
+    /// rule — e.g. sorting by read name, which on Illumina names sorts by tile/x/y —
+    /// passes every other downsampling test.
+    ///
+    /// Signed ranks for "q0".."q9" put q3 < q2 < q0 below all others, so a cap of 3
+    /// keeps exactly those. fgbio#1166's own golden test asserts the same three,
+    /// derived independently.
+    ///
+    /// Goes through `create_source_read` (the production path that stamps the real rank,
+    /// not the `name_hash: 0` test shortcut) and `downsample_source_reads` (the production
+    /// selection path), rather than sorting the `SourceRead`s here and inspecting
+    /// `original_idx` directly, so the test exercises selection, not only ranking.
+    #[test]
+    fn downsampling_retains_the_lowest_hashing_names() {
+        let caller = VanillaUmiConsensusCaller::new(
+            "c".to_string(),
+            "A".to_string(),
+            VanillaUmiConsensusOptions { min_reads: 1, max_reads: Some(3), ..Default::default() },
+        );
+        let srcs: Vec<SourceRead> = (0..10)
+            .map(|i| {
+                let read = create_test_read(&format!("q{i}"), b"ACGT", b"####", false, false);
+                caller.create_source_read(read.as_ref(), i, 0).expect("source read")
+            })
+            .collect();
+
+        let mut kept: Vec<usize> =
+            caller.downsample_source_reads(&srcs).iter().map(|sr| sr.original_idx).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, vec![0, 2, 3], "a cap of 3 must retain q0, q2 and q3");
+    }
+
+    /// A cap really does shape the consensus, end to end through `consensus_reads`: the same
+    /// 10-read family capped at 3 and left uncapped must report different depths, not just
+    /// the same record count. `count == 1` alone (the previous version of this test) would
+    /// pass even if the cap were ignored entirely.
+    #[test]
+    fn capped_consensus_depth_reflects_the_cap() {
+        let build = |max_reads: Option<usize>| -> i32 {
+            let mut caller = VanillaUmiConsensusCaller::new(
+                "c".to_string(),
+                "A".to_string(),
+                VanillaUmiConsensusOptions { min_reads: 1, max_reads, ..Default::default() },
+            );
+            let reads: Vec<RawRecord> = (0..10)
+                .map(|i| create_test_read(&format!("q{i}"), b"ACGT", b"####", false, false))
+                .collect();
+            let output =
+                consensus_reads_from_raw(&mut caller, reads).expect("consensus_reads_from_raw");
+            assert_eq!(output.count, 1);
+            let records = ParsedBamRecord::parse_all(&output.data);
+            records[0].get_int_tag(SamTag::CD).expect("cD present")
+        };
+
+        assert_eq!(build(Some(3)), 3, "a cap of 3 must cap consensus depth at 3");
+        assert_eq!(build(None), 10, "uncapped, the full 10-read family must contribute");
     }
 
     #[rstest]
@@ -2105,12 +2340,7 @@ mod tests {
         #[case] max_reads: Option<usize>,
         #[case] expected_max_depth: u16,
     ) {
-        let options = VanillaUmiConsensusOptions {
-            min_reads: 1,
-            max_reads,
-            seed: Some(42),
-            ..Default::default()
-        };
+        let options = VanillaUmiConsensusOptions { min_reads: 1, max_reads, ..Default::default() };
         let mut caller =
             VanillaUmiConsensusCaller::new("consensus".to_string(), "A".to_string(), options);
 
@@ -2147,7 +2377,6 @@ mod tests {
             let options = VanillaUmiConsensusOptions {
                 min_reads,
                 max_reads: Some(max_reads),
-                seed: Some(42),
                 ..Default::default()
             };
             let mut caller = VanillaUmiConsensusCaller::new(
@@ -3061,7 +3290,16 @@ mod tests {
             ref_id: -1,
             alignment_start: -1,
             original_cigar: simplified_cigar,
+            // No backing record to hash a name from. Nothing in production constructs a
+            // recordless `SourceRead`, so this value is never used for real selection.
+            name_hash: 0,
         }
+    }
+
+    /// Like [`create_source_read_with_cigar`] but with an explicit downsample rank,
+    /// so tests can pin exactly which reads a cap retains.
+    fn create_source_read_with_rank(cigar_str: &str, name_hash: i32) -> SourceRead {
+        SourceRead { name_hash, ..create_source_read_with_cigar(cigar_str) }
     }
 
     /// Helper to format simplified cigar as string (for test assertions)
@@ -3273,6 +3511,33 @@ mod tests {
             vec![2, 30, 2, 21, 2, 20, 2, 30, 2, 30],
             "Low quality bases get qual 2"
         );
+    }
+
+    /// With a cap configured, `create_source_read` stamps the fgbio rank of the record's read
+    /// name, so downsampling never re-hashes and mates (which share a name) share a rank.
+    ///
+    /// With no cap it stamps nothing: `downsample_source_reads` is the only reader and does not
+    /// run, so hashing every read of an uncapped run — the default — would be pure waste. The
+    /// uncapped case pins that gate, since a rank of `0` is only safe while unread.
+    #[rstest]
+    #[case::q0_capped("q0", Some(3), -593_808_727)]
+    #[case::read0_capped("read0", Some(3), 916_970_908)]
+    #[case::q0_uncapped("q0", None, 0)]
+    #[case::read0_uncapped("read0", None, 0)]
+    fn create_source_read_stamps_the_fgbio_rank(
+        #[case] name: &str,
+        #[case] max_reads: Option<usize>,
+        #[case] expected: i32,
+    ) {
+        let caller = VanillaUmiConsensusCaller::new(
+            "consensus".to_string(),
+            "A".to_string(),
+            VanillaUmiConsensusOptions { min_reads: 1, max_reads, ..Default::default() },
+        );
+        let read = create_test_read(name, b"ACGT", b"####", false, false);
+        let sr =
+            caller.create_source_read(read.as_ref(), 0, 0).expect("source read should be created");
+        assert_eq!(sr.name_hash, expected);
     }
 
     /// Ported from fgbio: "trim the source read when the end is low-quality so that there are no trailing no-calls"
