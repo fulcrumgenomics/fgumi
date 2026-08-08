@@ -85,16 +85,23 @@ pub struct SortStats {
     pub total_records: u64,
     /// Records written to output.
     pub output_records: u64,
-    /// Number of temporary chunk files written.
-    pub chunks_written: usize,
+    /// Number of spill *runs* written.
+    ///
+    /// A run is one temp file, built from one or more sorted chunks: consecutive
+    /// chunks that are already in order extend the open run rather than each
+    /// starting a file. So an input already in the requested order spills a single
+    /// run, and this is below the number of chunks that were spilled.
+    pub runs_written: usize,
 }
 
 /// Whether `header` already declares the order a sort to `sort_order` would produce.
 ///
 /// Used only to warn: re-sorting a file into the order it is already in is
-/// usually unintended, and it is also the shape the k-way merge handles worst,
-/// because chunking an already-ordered input spills disjoint runs that the merge
-/// must drain one at a time rather than interleave.
+/// usually unintended. It is no longer the shape the merge handles *worst* --
+/// natural run formation collapses an already-ordered input to a single spill
+/// run, so there is effectively no k-way merge left to do -- but it is still a
+/// full read, sort, spill and rewrite of every record to reproduce the order the
+/// input already had.
 ///
 /// Deliberately conservative. `SO` must match, and when the order defines a
 /// sub-sort tag the input's `SS` must match too — so a `queryname` input with no
@@ -237,7 +244,7 @@ mod tests {
         let stats = SortStats::default();
         assert_eq!(stats.total_records, 0);
         assert_eq!(stats.output_records, 0);
-        assert_eq!(stats.chunks_written, 0);
+        assert_eq!(stats.runs_written, 0);
     }
 
     /// Build a header whose `@HD` carries the given SO/SS values.

@@ -774,15 +774,15 @@ impl Sort {
         }
 
         let stats = sorter.sort(&self.input, output)?;
-        let (total_records, output_records, chunks_written) =
-            (stats.total_records, stats.output_records, stats.chunks_written);
+        let (total_records, output_records, runs_written) =
+            (stats.total_records, stats.output_records, stats.runs_written);
 
         // Summary
         info!("=== Summary ===");
         info!("Records processed: {total_records}");
         info!("Records written: {output_records}");
-        if chunks_written > 0 {
-            info!("Temporary chunks: {chunks_written}");
+        if runs_written > 0 {
+            info!("Spill runs: {runs_written}");
         }
         info!("Output: {}", output.display());
 
@@ -1472,9 +1472,9 @@ mod tests {
         // `Some(2)` run exercised consolidation rather than a trivial in-memory
         // sort. Without this the identity assertion below could pass vacuously.
         assert!(
-            default_stats.chunks_written >= 2,
+            default_stats.runs_written >= 2,
             "test must spill multiple runs to exercise consolidation, got {} chunk(s)",
-            default_stats.chunks_written,
+            default_stats.runs_written,
         );
         assert_eq!(
             limited_stats.output_records, default_stats.output_records,

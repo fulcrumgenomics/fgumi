@@ -49,7 +49,7 @@ fn test_pool_integrated_reader_round_trip_coordinate() {
         expected, stats.total_records
     );
     assert_eq!(stats.output_records, expected);
-    assert_eq!(stats.chunks_written, 0, "tiny BAM should fit in memory");
+    assert_eq!(stats.runs_written, 0, "tiny BAM should fit in memory");
 }
 
 /// Same round-trip but with template-coordinate sort order to exercise the
